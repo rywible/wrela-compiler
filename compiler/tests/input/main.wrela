@@ -4,7 +4,7 @@
 // (compiler/tests/tests/suite/input.rs runs it in both).
 
 use std::hash::{StateHash, state_hash}
-use std::input::{Button, Event, Input, Key, events}
+use std::input::{Button, Event, Input, Key, PadAxis, PadButton, events}
 use std::io::print
 
 pub struct Log: Clone + StateHash {
@@ -71,12 +71,13 @@ pub fn typed(state: Game) -> vec2 {
     vec2(f32(sum), f32(n))
 }
 
-/// The script (script.json) reaches the program, each event in the frame it's for.
+/// The script (script.json) reaches the program, each event in the frame it's for; the pads'
+/// events reach each pad's state.
 @test(frames: 12, input: "script.json")
 fn every_event_arrives_in_its_frame(game: Game) {
     assert(game.log.frames == 12)
     let n = game.log.events.len()
-    assert(n == 23, f"{n} events")
+    assert(n == 28, f"{n} events")
     let first = game.log.events[0]
     assert(first.0 == 0)
     assert(first.1 == Event::PointerMove { at: vec2(100.0, 120.0), mods: std::input::Mods {} })
@@ -88,4 +89,17 @@ fn every_event_arrives_in_its_frame(game: Game) {
     let t = typed(game)
     assert(t.y == 9.0, f"{t.y} characters")
     assert(t.x == f32(71 + 114 + 252 + 223 + 101 + 44 + 32 + 255 + 33))
+    // Pad 0's left stick to the right, its right trigger half down and held; East pressed and
+    // let go in the frame; pad 1's left stick up.
+    let pad = game.input.pads[0]
+    assert(pad.left() == vec2(0.25, 0.0), f"pad 0's left stick at {pad.left()}")
+    assert(pad.held(PadButton::RightTrigger) && pad.value(PadButton::RightTrigger) == 0.5)
+    assert(!pad.held(PadButton::East))
+    assert(game.input.pads[1].axis(PadAxis::LeftY) == -0.75)
+    let last = game.log.events[n - 1]
+    assert(
+        last.0 == 11 &&
+            last.1 ==
+                Event::PadButton { pad: 0, button: PadButton::East, value: 0.0, pressed: false },
+    )
 }

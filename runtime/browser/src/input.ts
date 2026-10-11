@@ -3,7 +3,7 @@
 // worker. The ring is a SharedArrayBuffer, so an event written before a frame starts is in that
 // frame: it doesn't wait behind other messages.
 
-import { BUTTONS, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT } from "./abi.gen.ts";
+import { BUTTONS, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
 
 /** One event's EVENT_SIZE bytes: its kind, its modifiers, then four words. */
 export function encodeEvent(kind: number, modifiers: number, a: number, b: number, c: number, d: number): Uint8Array {
@@ -38,6 +38,17 @@ export function keyEvent(down: boolean, key: number, repeat: boolean, modifiers:
 }
 
 export const textEvent = (codepoint: number) => encodeEvent(EventKind.Text, 0, codepoint, 0, 0, 0);
+
+/** A gamepad's button (the standard mapping's number), its value (0 to 1) and whether it's
+ * pressed. */
+export function padButtonEvent(pad: number, button: number, value: number, pressed: boolean): Uint8Array {
+  return encodeEvent(EventKind.PadButton, 0, pad, button, bits(value), pressed ? 1 : 0);
+}
+
+/** A gamepad's axis (the standard mapping's number) and its value (-1 to 1). */
+export function padAxisEvent(pad: number, axis: number, value: number): Uint8Array {
+  return encodeEvent(EventKind.PadAxis, 0, pad, axis, bits(value), 0);
+}
 
 /** When a script's event arrives: before a frame, or as a tick's record (runtime/abi `input`). */
 export type At = { frame: number } | { tick: number };
@@ -134,6 +145,19 @@ export function parseScript(text: string): Scripted[] {
       if (k === 0) throw at(`\`${name}\` isn't a key (they're DOM codes, such as KeyA)`);
       return k;
     };
+    const pad = () => {
+      const v = o.pad;
+      if (v === undefined) return 0;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v >= PADS) throw at("`pad` is 0, 1, 2 or 3");
+      return v;
+    };
+    const named = (key: string, names: readonly string[]) => {
+      const name = o[key];
+      if (typeof name !== "string") throw at(`\`${key}\` is missing`);
+      const i = names.indexOf(name);
+      if (i < 0) throw at(`\`${name}\` isn't a pad's ${key} (${names.join(", ")})`);
+      return i;
+    };
     const push = (event: Uint8Array) => out.push({ at: when, event });
     switch (type) {
       case "move":
@@ -169,8 +193,31 @@ export function parseScript(text: string): Scripted[] {
         }
         break;
       }
+      case "padbutton": {
+        const [p, b] = [pad(), named("button", PAD_BUTTONS)];
+        if (o.pressed === undefined) throw at("`pressed` is missing");
+        if (typeof o.pressed !== "boolean") throw at("`pressed` must be true or false");
+        const value = o.value === undefined ? (o.pressed ? 1 : 0) : num("value");
+        if (!(value >= 0 && value <= 1)) throw at("a button's `value` is from 0 to 1");
+        push(padButtonEvent(p, b, value, o.pressed));
+        break;
+      }
+      case "padpress": {
+        const [p, b] = [pad(), named("button", PAD_BUTTONS)];
+        push(padButtonEvent(p, b, 1, true));
+        push(padButtonEvent(p, b, 0, false));
+        break;
+      }
+      case "padaxis": {
+        const [p, a] = [pad(), named("axis", PAD_AXES)];
+        if (o.value === undefined) throw at("`value` is missing");
+        const value = num("value");
+        if (!(value >= -1 && value <= 1)) throw at("an axis's `value` is from -1 to 1");
+        push(padAxisEvent(p, a, value));
+        break;
+      }
       default:
-        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key or text)`);
+        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)`);
     }
   });
   return out;

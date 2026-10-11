@@ -95,6 +95,8 @@ export const EventKind = {
   KeyDown: 5,
   KeyUp: 6,
   Text: 7,
+  PadButton: 8,
+  PadAxis: 9,
 } as const;
 export const MODIFIER_SHIFT = 1;
 export const MODIFIER_CONTROL = 2;
@@ -104,6 +106,11 @@ export const MODIFIER_META = 8;
 export const BUTTONS = ["primary", "middle", "secondary"] as const;
 /** The physical keys, by number: DOM's `KeyboardEvent.code` (0: one not listed). */
 export const KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", "KeyG", "KeyH", "KeyI", "KeyJ", "KeyK", "KeyL", "KeyM", "KeyN", "KeyO", "KeyP", "KeyQ", "KeyR", "KeyS", "KeyT", "KeyU", "KeyV", "KeyW", "KeyX", "KeyY", "KeyZ", "Digit0", "Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7", "Digit8", "Digit9", "Enter", "Escape", "Backspace", "Tab", "Space", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown", "Insert", "Delete", "ShiftLeft", "ShiftRight", "ControlLeft", "ControlRight", "AltLeft", "AltRight", "MetaLeft", "MetaRight", "CapsLock", "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "Semicolon", "Quote", "Backquote", "Comma", "Period", "Slash", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "NumpadEnter", "NumpadAdd", "NumpadSubtract", "NumpadMultiply", "NumpadDivide", "NumpadDecimal"] as const;
+/** How many gamepads a host reports, and a pad's buttons and axes by number: the W3C Gamepad
+ * API's standard mapping, as a script names them. */
+export const PADS = 4;
+export const PAD_BUTTONS = ["south", "east", "west", "north", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger", "select", "start", "leftstick", "rightstick", "up", "down", "left", "right", "home"] as const;
+export const PAD_AXES = ["leftx", "lefty", "rightx", "righty"] as const;
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [

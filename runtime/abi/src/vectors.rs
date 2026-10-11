@@ -1441,6 +1441,15 @@ fn input_scripts() -> Value {
   {"frame": 4, "type": "text", "text": "aéÿ"}
 ]"#,
         ),
+        (
+            "a pad's events",
+            r#"[
+  {"tick": 1, "type": "padaxis", "axis": "lefty", "value": -0.75},
+  {"tick": 2, "type": "padbutton", "pad": 2, "button": "righttrigger", "pressed": true, "value": 0.5},
+  {"tick": 3, "type": "padpress", "button": "east"},
+  {"tick": 4, "type": "padbutton", "button": "south", "pressed": false}
+]"#,
+        ),
         ("not an array", "{}"),
         ("not JSON", "[{"),
         ("no frame", r#"[{"type": "move"}]"#),
@@ -1458,6 +1467,16 @@ fn input_scripts() -> Value {
         ("a coordinate that isn't a number", r#"[{"frame": 0, "type": "move", "x": "1"}]"#),
         ("a modifier that isn't a bool", r#"[{"frame": 0, "type": "move", "shift": 1}]"#),
         ("text that's missing", r#"[{"frame": 0, "type": "text"}]"#),
+        ("an unknown pad button", r#"[{"frame": 0, "type": "padpress", "button": "a"}]"#),
+        (
+            "a pad past the fourth",
+            r#"[{"frame": 0, "type": "padpress", "button": "east", "pad": 4}]"#,
+        ),
+        (
+            "an axis past its range",
+            r#"[{"frame": 0, "type": "padaxis", "axis": "rightx", "value": -1.5}]"#,
+        ),
+        ("a button with no pressed", r#"[{"frame": 0, "type": "padbutton", "button": "north"}]"#),
     ];
     scripts
         .iter()

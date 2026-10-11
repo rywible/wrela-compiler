@@ -1,5 +1,5 @@
-// Input (language.md §6.15's polled requests' neighbour): the pointer and keyboard events the
-// host has queued since the program last read them. Reading them is `nondet` (§8): what a call
+// Input (language.md §6.15's polled requests' neighbour): the pointer, keyboard and gamepad
+// events the host has queued since the program last read them. Reading them is `nondet` (§8): what a call
 // reads depends on when a person moved the mouse, so `@deterministic` code takes input as data,
 // as it takes the time (`Input::update` is ordinary code over a run of events).
 //
@@ -126,6 +126,41 @@ pub enum Key: Copy + Eq + Ord + StateHash + Serialize {
     NumpadDecimal,
 }
 
+/// A gamepad's button, by where it is on the pad (the W3C Gamepad API's standard mapping, whose
+/// numbers are its discriminants): `South` is the bottom face button (A on an Xbox pad, Cross
+/// on a PlayStation one), and `Up` to `Right` the d-pad.
+pub enum PadButton: Copy + Eq + Ord + StateHash + Serialize + Fieldless {
+    South,
+    East,
+    West,
+    North,
+    LeftShoulder,
+    RightShoulder,
+    LeftTrigger,
+    RightTrigger,
+    Select,
+    Start,
+    LeftStick,
+    RightStick,
+    Up,
+    Down,
+    Left,
+    Right,
+    Home,
+}
+
+/// A gamepad's axis: each stick's x (right positive) and y (down positive), as the standard
+/// mapping has them.
+pub enum PadAxis: Copy + Eq + Ord + StateHash + Serialize + Fieldless {
+    LeftX,
+    LeftY,
+    RightX,
+    RightY,
+}
+
+/// How many gamepads a host reports: pads 0 to 3.
+pub const PADS: u32 = 4
+
 /// An input event. Positions are in pixels from the screen's top left, as `frame`'s width and
 /// height count them.
 pub enum Event: Copy + Eq + StateHash + Serialize {
@@ -139,6 +174,11 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     KeyUp { key: Key, mods: Mods },
     /// A character typed: a Unicode scalar value.
     Text { char: u32 },
+    /// A gamepad's button changed: its value (0 to 1: a trigger's travel) and whether it's
+    /// pressed. `pad` is 0 to 3.
+    PadButton { pad: u32, button: PadButton, value: f32, pressed: bool },
+    /// A gamepad's axis moved: its value, from -1 to 1. A host applies no dead zone.
+    PadAxis { pad: u32, axis: PadAxis, value: f32 },
 }
 
 /// An event as the host lays it out: its kind, its modifiers, then four words.
@@ -205,6 +245,23 @@ pub(package) fn event_of(r: RawEvent) -> Option<Event> {
         5 => Some(Event::KeyDown { key: key_of(r.a), repeat: r.b != 0, mods }),
         6 => Some(Event::KeyUp { key: key_of(r.a), mods }),
         7 => Some(Event::Text { char: r.a }),
+        8 => match PadButton::from_u32(r.b) {
+            Some(button) => {
+                Some(
+                    Event::PadButton {
+                        pad: r.a,
+                        button,
+                        value: bitcast_f32(r.c),
+                        pressed: r.d != 0,
+                    },
+                )
+            },
+            None => None,
+        },
+        9 => match PadAxis::from_u32(r.b) {
+            Some(axis) => Some(Event::PadAxis { pad: r.a, axis, value: bitcast_f32(r.c) }),
+            None => None,
+        },
         _ => None,
     }
 }
@@ -305,6 +362,60 @@ pub fn key_of(code: u32) -> Key {
     }
 }
 
+/// A gamepad as its events left it: which buttons are pressed (a bit each, by discriminant), each
+/// button's value, and each axis's.
+pub struct Pad: Copy + Eq + StateHash + Serialize {
+    pub pressed: u32 = 0,
+    pub values: [f32; 17] = [0.0; 17],
+    pub axes: [f32; 4] = [0.0; 4],
+}
+
+impl Pad {
+    /// After event `e`, if it's one of this pad's (`pad`).
+    pub fn update(mut self, pad: u32, e: Event) {
+        match e {
+            Event::PadButton { pad: p, button, value, pressed } => {
+                if p == pad {
+                    let bit = 1 << u32(button)
+                    self.pressed = if pressed { self.pressed | bit } else { self.pressed & !bit }
+                    self.values[u32(button)] = value
+                }
+            },
+            Event::PadAxis { pad: p, axis, value } => {
+                if p == pad {
+                    self.axes[u32(axis)] = value
+                }
+            },
+            _ => {},
+        }
+    }
+
+    /// Whether `button` is pressed.
+    pub fn held(self, button: PadButton) -> bool {
+        (self.pressed >> u32(button)) & 1 == 1
+    }
+
+    /// `button`'s value: 0 to 1 (a trigger's travel; 0 or 1 for most buttons).
+    pub fn value(self, button: PadButton) -> f32 {
+        self.values[u32(button)]
+    }
+
+    /// `axis`'s value, from -1 to 1.
+    pub fn axis(self, axis: PadAxis) -> f32 {
+        self.axes[u32(axis)]
+    }
+
+    /// The left stick: x right and y down, each from -1 to 1.
+    pub fn left(self) -> vec2 {
+        vec2(self.axes[0], self.axes[1])
+    }
+
+    /// The right stick: x right and y down, each from -1 to 1.
+    pub fn right(self) -> vec2 {
+        vec2(self.axes[2], self.axes[3])
+    }
+}
+
 /// What's held and where the pointer is, kept from the events a program reads: call `read` once
 /// per frame, or `update` with events from elsewhere (a tick's records, `std::tick::Ticked`, or
 /// a replay), then ask.
@@ -316,6 +427,8 @@ pub struct Input: Clone {
     buttons: u32,
     keys: [u32; 4],
     pub mods: Mods,
+    /// The gamepads, 0 to 3.
+    pub pads: [Pad; PADS],
 }
 
 impl Input {
@@ -327,6 +440,7 @@ impl Input {
             buttons: 0,
             keys: [0; 4],
             mods: Mods {},
+            pads: [Pad {}; PADS],
         }
     }
 
@@ -368,6 +482,16 @@ impl Input {
                     self.mods = mods
                 },
                 Event::Text { .. } => {},
+                Event::PadButton { pad, .. } => {
+                    if pad < PADS {
+                        self.pads[pad].update(pad, e)
+                    }
+                },
+                Event::PadAxis { pad, .. } => {
+                    if pad < PADS {
+                        self.pads[pad].update(pad, e)
+                    }
+                },
             }
         }
         self.events = take events

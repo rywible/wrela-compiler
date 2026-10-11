@@ -17,7 +17,7 @@ fn a_frame_test_plays_a_script() {
     assert_eq!(crate::tests_pass(&wrela_tests::repo_root().join("compiler/tests/input")), 1);
 }
 
-/// On the native host's CPU, the script's events reach the program: all 23, and the same
+/// On the native host's CPU, the script's events reach the program: all 28, and the same
 /// command-stream hash on two runs.
 #[test]
 fn the_native_host_plays_a_script() {
@@ -33,14 +33,14 @@ fn the_native_host_plays_a_script() {
             host.frame(wrela_host::frame_time(i, 60.0), 640, 480).expect("frame");
         }
         let n = host.call_export("event_count", &[]).expect("event_count");
-        assert_eq!(n, [Value::I32(23)]);
+        assert_eq!(n, [Value::I32(28)]);
         host.hash()
     };
     assert_eq!(run(), run());
 }
 
 /// The same script gives the same state hash in Chrome's test mode and in the native host:
-/// moves, clicks, a drag with Shift held, the wheel, keys, and text with Latin-1 letters.
+/// moves, clicks, a drag with Shift held, the wheel, keys, text with Latin-1 letters, and two pads.
 #[test]
 #[ignore = "long: needs Chrome, python3 and a GPU"]
 fn both_hosts_read_the_same_events() {

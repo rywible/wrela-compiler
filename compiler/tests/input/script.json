@@ -12,5 +12,9 @@
   { "frame": 8, "type": "key", "key": "Tab" },
   { "frame": 9, "type": "down", "x": 5, "y": 6, "button": "secondary", "ctrl": true },
   { "frame": 9, "type": "up", "x": 5, "y": 6, "button": "secondary" },
-  { "frame": 10, "type": "text", "text": "Grüße, ÿ!" }
+  { "frame": 10, "type": "text", "text": "Grüße, ÿ!" },
+  { "frame": 11, "type": "padaxis", "axis": "leftx", "value": 0.25 },
+  { "frame": 11, "type": "padaxis", "pad": 1, "axis": "lefty", "value": -0.75 },
+  { "frame": 11, "type": "padbutton", "button": "righttrigger", "pressed": true, "value": 0.5 },
+  { "frame": 11, "type": "padpress", "button": "east" }
 ]

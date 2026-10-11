@@ -1282,6 +1282,24 @@
       "script": "[\n  {\"frame\": 0, \"type\": \"move\", \"x\": 10.5, \"y\": 20},\n  {\"frame\": 1, \"type\": \"down\", \"x\": 10.5, \"y\": 20, \"button\": \"secondary\", \"shift\": true},\n  {\"frame\": 1, \"type\": \"up\", \"x\": 11, \"y\": 21, \"alt\": true},\n  {\"frame\": 2, \"type\": \"wheel\", \"x\": 1, \"y\": 2, \"dx\": -3, \"dy\": 120.25},\n  {\"frame\": 3, \"type\": \"key\", \"key\": \"Tab\", \"ctrl\": true, \"meta\": true},\n  {\"frame\": 3, \"type\": \"keydown\", \"key\": \"KeyA\", \"repeat\": true},\n  {\"frame\": 3, \"type\": \"keyup\", \"key\": \"KeyA\"},\n  {\"frame\": 4, \"type\": \"text\", \"text\": \"aéÿ\"}\n]"
     },
     {
+      "at": [
+        "tick 1",
+        "tick 2",
+        "tick 3",
+        "tick 3",
+        "tick 4"
+      ],
+      "events": [
+        "09000000000000000000000001000000000040bf00000000",
+        "080000000000000002000000070000000000003f01000000",
+        "080000000000000000000000010000000000803f01000000",
+        "080000000000000000000000010000000000000000000000",
+        "080000000000000000000000000000000000000000000000"
+      ],
+      "name": "a pad's events",
+      "script": "[\n  {\"tick\": 1, \"type\": \"padaxis\", \"axis\": \"lefty\", \"value\": -0.75},\n  {\"tick\": 2, \"type\": \"padbutton\", \"pad\": 2, \"button\": \"righttrigger\", \"pressed\": true, \"value\": 0.5},\n  {\"tick\": 3, \"type\": \"padpress\", \"button\": \"east\"},\n  {\"tick\": 4, \"type\": \"padbutton\", \"button\": \"south\", \"pressed\": false}\n]"
+    },
+    {
       "error": "a script is a JSON array of events",
       "name": "not an array",
       "script": "{}"
@@ -1333,7 +1351,7 @@
       "script": "[{\"frame\": 2, \"tick\": 1, \"type\": \"move\"}]"
     },
     {
-      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key or text)",
+      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)",
       "name": "an unknown type",
       "script": "[{\"frame\": 0, \"type\": \"jump\"}]"
     },
@@ -1361,6 +1379,26 @@
       "error": "event 0: `text` is missing",
       "name": "text that's missing",
       "script": "[{\"frame\": 0, \"type\": \"text\"}]"
+    },
+    {
+      "error": "event 0: `a` isn't a pad's button (south, east, west, north, leftshoulder, rightshoulder, lefttrigger, righttrigger, select, start, leftstick, rightstick, up, down, left, right, home)",
+      "name": "an unknown pad button",
+      "script": "[{\"frame\": 0, \"type\": \"padpress\", \"button\": \"a\"}]"
+    },
+    {
+      "error": "event 0: `pad` is 0, 1, 2 or 3",
+      "name": "a pad past the fourth",
+      "script": "[{\"frame\": 0, \"type\": \"padpress\", \"button\": \"east\", \"pad\": 4}]"
+    },
+    {
+      "error": "event 0: an axis's `value` is from -1 to 1",
+      "name": "an axis past its range",
+      "script": "[{\"frame\": 0, \"type\": \"padaxis\", \"axis\": \"rightx\", \"value\": -1.5}]"
+    },
+    {
+      "error": "event 0: `pressed` is missing",
+      "name": "a button with no pressed",
+      "script": "[{\"frame\": 0, \"type\": \"padbutton\", \"button\": \"north\"}]"
     }
   ],
   "joins": [

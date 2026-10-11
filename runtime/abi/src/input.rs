@@ -1,6 +1,6 @@
 //! # Input
 //!
-//! A program reads pointer and keyboard events through the import
+//! A program reads pointer, keyboard and gamepad events through the import
 //! `wrela.input(ptr: i32, cap: i32) -> i32` (language.md's `std::input`): the host copies up to
 //! `cap` events, oldest first, into the program's memory at `ptr`, [`EVENT_SIZE`] bytes each,
 //! and returns how many it copied. Events it didn't copy stay queued for the next call. A host
@@ -25,10 +25,17 @@
 //! | `KeyDown` | the key ([`KEYS`]), 1 if it's the key repeating | 0, 0 |
 //! | `KeyUp` | the key, 0 | 0, 0 |
 //! | `Text` | a Unicode scalar value typed, 0 | 0, 0 |
+//! | `PadButton` | the pad (0 to 3), the button ([`PAD_BUTTONS`]) | its value (f32, 0 to 1), 1 if it's pressed |
+//! | `PadAxis` | the pad, the axis ([`PAD_AXES`]) | its value (f32, -1 to 1), 0 |
 //!
 //! Positions are in the same pixels as `frame`'s width and height. A key is a physical key
 //! (DOM's `KeyboardEvent.code`), named as [`KEYS`] lists it; one the list doesn't name is 0.
 //! What a key types arrives separately, as `Text`.
+//!
+//! A gamepad's buttons and axes are the W3C Gamepad API's standard mapping, by number. A host
+//! sends an event when a button's value or pressed state changes, or an axis's value: a pad
+//! held still sends nothing. A stick's axes are as the pad gives them (right and down are
+//! positive); no dead zone is applied, which is the program's choice.
 //!
 //! ## Scripted input
 //!
@@ -47,8 +54,20 @@
 //! ```
 //!
 //! `type` is `move`, `down`, `up`, `wheel`, `keydown`, `keyup`, `key` (a key down then up),
-//! or `text` (a `Text` event for each character); `button` defaults to `primary`; `shift`,
-//! `ctrl`, `alt` and `meta` default to false. [`parse_script`] reads one.
+//! `text` (a `Text` event for each character), `padbutton`, `padaxis` or `padpress` (a pad's
+//! button pressed then let go); `button` defaults to `primary`; `shift`, `ctrl`, `alt` and
+//! `meta` default to false. A pad's events name its `pad` (0 to 3, default 0); a `padbutton`
+//! names its `button` (as [`PAD_BUTTONS`] does) and whether it's `pressed`, and its `value`
+//! defaults to 1 pressed and 0 not; a `padaxis` names its `axis` ([`PAD_AXES`]) and its
+//! `value`, from -1 to 1. [`parse_script`] reads one.
+//!
+//! ```json
+//! [
+//!   { "tick": 30, "type": "padaxis", "axis": "lefty", "value": -1 },
+//!   { "tick": 40, "type": "padpress", "button": "east" },
+//!   { "tick": 50, "type": "padbutton", "button": "righttrigger", "pressed": true, "value": 0.8 }
+//! ]
+//! ```
 //!
 //! An event has the frame it arrives before (`"frame": n`), or instead the tick it's a record
 //! of (`"tick": n`, language.md's `std::tick`); each kind's numbers don't decrease.
@@ -75,10 +94,12 @@ pub enum EventKind {
     KeyDown = 5,
     KeyUp = 6,
     Text = 7,
+    PadButton = 8,
+    PadAxis = 9,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 7] = [
+    pub const ALL: [EventKind; 9] = [
         EventKind::PointerMove,
         EventKind::PointerDown,
         EventKind::PointerUp,
@@ -86,6 +107,8 @@ impl EventKind {
         EventKind::KeyDown,
         EventKind::KeyUp,
         EventKind::Text,
+        EventKind::PadButton,
+        EventKind::PadAxis,
     ];
 
     pub fn name(self) -> &'static str {
@@ -97,6 +120,8 @@ impl EventKind {
             EventKind::KeyDown => "KeyDown",
             EventKind::KeyUp => "KeyUp",
             EventKind::Text => "Text",
+            EventKind::PadButton => "PadButton",
+            EventKind::PadAxis => "PadAxis",
         }
     }
 }
@@ -109,6 +134,36 @@ pub const META: u32 = 8;
 
 /// The buttons (`c` of a pointer down or up).
 pub const BUTTONS: [&str; 3] = ["primary", "middle", "secondary"];
+
+/// How many gamepads a host reports: pads 0 to 3.
+pub const PADS: u32 = 4;
+
+/// A gamepad's buttons, by number: the W3C Gamepad API's standard mapping (button `i` of a
+/// pad whose `mapping` is "standard"). Named by where they are, not by what a pad prints on
+/// them: `south` is the bottom face button (A on an Xbox pad, Cross on a PlayStation one).
+pub const PAD_BUTTONS: [&str; 17] = [
+    "south",
+    "east",
+    "west",
+    "north",
+    "leftshoulder",
+    "rightshoulder",
+    "lefttrigger",
+    "righttrigger",
+    "select",
+    "start",
+    "leftstick",
+    "rightstick",
+    "up",
+    "down",
+    "left",
+    "right",
+    "home",
+];
+
+/// A gamepad's axes, by number, as the standard mapping has them: each stick's x (right
+/// positive) and y (down positive).
+pub const PAD_AXES: [&str; 4] = ["leftx", "lefty", "rightx", "righty"];
 
 /// The physical keys, by number: index `i` is key `i` (DOM's `KeyboardEvent.code`). 0 is a key
 /// this list doesn't name. Numbers never change meaning; new keys go at the end.
@@ -238,6 +293,15 @@ impl Event {
         Event { kind: EventKind::Text, modifiers: 0, words: [c as u32, 0, 0, 0] }
     }
 
+    pub fn pad_button(pad: u32, button: u32, value: f32, pressed: bool) -> Event {
+        let words = [pad, button, value.to_bits(), u32::from(pressed)];
+        Event { kind: EventKind::PadButton, modifiers: 0, words }
+    }
+
+    pub fn pad_axis(pad: u32, axis: u32, value: f32) -> Event {
+        Event { kind: EventKind::PadAxis, modifiers: 0, words: [pad, axis, value.to_bits(), 0] }
+    }
+
     /// Its [`EVENT_SIZE`] bytes, as the program reads them.
     pub fn bytes(&self) -> [u8; EVENT_SIZE as usize] {
         let mut out = [0u8; EVENT_SIZE as usize];
@@ -343,6 +407,26 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 k => Ok(k),
             }
         };
+        let pad = || -> Result<u32, String> {
+            match o.get("pad") {
+                None => Ok(0),
+                Some(v) => v
+                    .as_u64()
+                    .filter(|&p| p < u64::from(PADS))
+                    .map(|p| p as u32)
+                    .ok_or_else(|| at("`pad` is 0, 1, 2 or 3")),
+            }
+        };
+        let named =
+            |key: &str, names: &[&str]| -> Result<u32, String> {
+                let name = o
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| at(&format!("`{key}` is missing")))?;
+                names.iter().position(|n| *n == name).map(|i| i as u32).ok_or_else(|| {
+                    at(&format!("`{name}` isn't a pad's {key} ({})", names.join(", ")))
+                })
+            };
         let mut push = |event| out.push(Scripted { at: when, event });
         match ty {
             "move" => {
@@ -367,9 +451,40 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     push(Event::text(c));
                 }
             }
+            "padbutton" => {
+                let (p, b) = (pad()?, named("button", &PAD_BUTTONS)?);
+                let pressed = match o.get("pressed") {
+                    Some(v) => v.as_bool().ok_or_else(|| at("`pressed` must be true or false"))?,
+                    None => return Err(at("`pressed` is missing")),
+                };
+                let value = match o.get("value") {
+                    None => f32::from(u8::from(pressed)),
+                    Some(_) => num("value")?,
+                };
+                if !(0.0..=1.0).contains(&value) {
+                    return Err(at("a button's `value` is from 0 to 1"));
+                }
+                push(Event::pad_button(p, b, value, pressed));
+            }
+            "padpress" => {
+                let (p, b) = (pad()?, named("button", &PAD_BUTTONS)?);
+                push(Event::pad_button(p, b, 1.0, true));
+                push(Event::pad_button(p, b, 0.0, false));
+            }
+            "padaxis" => {
+                let (p, a) = (pad()?, named("axis", &PAD_AXES)?);
+                if o.get("value").is_none() {
+                    return Err(at("`value` is missing"));
+                }
+                let value = num("value")?;
+                if !(-1.0..=1.0).contains(&value) {
+                    return Err(at("an axis's `value` is from -1 to 1"));
+                }
+                push(Event::pad_axis(p, a, value));
+            }
             other => {
                 return Err(at(&format!(
-                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key or text)"
+                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)"
                 )));
             }
         }
@@ -446,6 +561,14 @@ mod tests {
             (r#"[{"tick": 2, "type": "move"}, {"tick": 1, "type": "move"}]"#, "don't decrease"),
             (r#"[{"tick": 2, "frame": 1, "type": "move"}]"#, "not both"),
             (r#"[{"frame": 0, "type": "jump"}]"#, "isn't a type"),
+            (
+                r#"[{"frame": 0, "type": "padbutton", "button": "a", "pressed": true}]"#,
+                "isn't a pad's",
+            ),
+            (r#"[{"frame": 0, "type": "padbutton", "button": "south"}]"#, "`pressed` is missing"),
+            (r#"[{"frame": 0, "type": "padaxis", "axis": "leftx", "value": 2}]"#, "from -1 to 1"),
+            (r#"[{"frame": 0, "type": "padaxis", "axis": "leftx"}]"#, "`value` is missing"),
+            (r#"[{"frame": 0, "type": "padpress", "button": "east", "pad": 4}]"#, "`pad` is 0"),
             (r#"[{"frame": 0, "type": "key", "key": "A"}]"#, "isn't a key"),
             (r#"[{"frame": 0, "type": "down", "button": "left"}]"#, "`button` is primary"),
         ];
@@ -469,6 +592,25 @@ mod tests {
         assert_eq!(records_at(&s, 5).collect::<Vec<_>>(), [Event::text('z')]);
         assert_eq!(events_at(&s, 0).count(), 1);
         assert_eq!(events_at(&s, 3).count(), 0);
+    }
+
+    /// A pad's buttons and axes read back by number, with their values.
+    #[test]
+    fn pad_events_read_back() {
+        let script = r#"[
+            {"tick": 1, "type": "padaxis", "axis": "lefty", "value": -0.75},
+            {"tick": 2, "type": "padbutton", "pad": 2, "button": "righttrigger", "pressed": true, "value": 0.5},
+            {"tick": 3, "type": "padpress", "button": "east"},
+            {"tick": 4, "type": "padbutton", "button": "south", "pressed": false}
+        ]"#;
+        let s = parse_script(script).expect("a valid script");
+        assert_eq!(s.len(), 5);
+        assert_eq!(s[0].event, Event::pad_axis(0, 1, -0.75));
+        assert_eq!(s[1].event, Event::pad_button(2, 7, 0.5, true));
+        assert_eq!(s[2].event, Event::pad_button(0, 1, 1.0, true));
+        assert_eq!(s[3].event, Event::pad_button(0, 1, 0.0, false));
+        assert_eq!(s[4].event.words, [0, 0, 0, 0]);
+        assert_eq!(&s[1].event.bytes()[..4], &8u32.to_le_bytes());
     }
 
     #[test]

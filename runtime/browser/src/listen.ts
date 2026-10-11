@@ -1,8 +1,19 @@
 // The main thread's half of input (input.ts): the DOM's events, as the ABI's, into the ring the
 // render worker reads.
 
-import { EventKind } from "./abi.gen.ts";
-import { buttonOf, type InputRing, keyCode, keyEvent, modifiersOf, pointerEvent, textEvent, wheelEvent } from "./input.ts";
+import { EventKind, PADS } from "./abi.gen.ts";
+import {
+  buttonOf,
+  type InputRing,
+  keyCode,
+  keyEvent,
+  modifiersOf,
+  padAxisEvent,
+  padButtonEvent,
+  pointerEvent,
+  textEvent,
+  wheelEvent,
+} from "./input.ts";
 
 /**
  * Turns the DOM's pointer, wheel and keyboard events on `canvas` (keys anywhere on the page)
@@ -62,4 +73,79 @@ export function listen(
   window.addEventListener("keyup", (e) => {
     put(keyEvent(false, keyCode(e.code), false, modifiersOf(e)));
   });
+}
+
+/** A pad's buttons and axes as last sent: each button's value and pressed state, each axis's
+ * value. */
+export interface PadState {
+  values: number[];
+  pressed: boolean[];
+  axes: number[];
+}
+
+/** What a pad reports, as the Gamepad API has it (a `Gamepad`, or a test's stand-in). */
+export interface PadReading {
+  connected: boolean;
+  buttons: readonly { value: number; pressed: boolean }[];
+  axes: readonly number[];
+}
+
+/** A value as a pad's events carry it: in steps of 1/1024, so a stick's noise below that sends
+ * nothing. */
+const step = (v: number) => Math.round(v * 1024) / 1024;
+
+/**
+ * The events for what the pads changed since `last` (each pad as last sent, null if it wasn't
+ * there), which it updates: an event for each button whose value or pressed state changed, and
+ * each axis whose value did. Pads 0 to 3, in the standard mapping's numbers; a pad that goes
+ * lets go of what it held.
+ */
+export function padChanges(pads: readonly (PadReading | null)[], last: (PadState | null)[]): Uint8Array[] {
+  const out: Uint8Array[] = [];
+  for (let i = 0; i < PADS; i++) {
+    const pad = pads[i] ?? null;
+    const was = last[i] ?? null;
+    if (pad === null || !pad.connected) {
+      if (was !== null) {
+        for (let b = 0; b < was.pressed.length; b++) {
+          if (was.pressed[b] || was.values[b] !== 0) out.push(padButtonEvent(i, b, 0, false));
+        }
+        for (let a = 0; a < was.axes.length; a++) {
+          if (was.axes[a] !== 0) out.push(padAxisEvent(i, a, 0));
+        }
+        last[i] = null;
+      }
+      continue;
+    }
+    const state: PadState = was ?? { values: [], pressed: [], axes: [] };
+    pad.buttons.forEach((button, b) => {
+      const value = step(Math.min(Math.max(button.value, 0), 1));
+      if (value !== (state.values[b] ?? 0) || button.pressed !== (state.pressed[b] ?? false)) {
+        out.push(padButtonEvent(i, b, value, button.pressed));
+        state.values[b] = value;
+        state.pressed[b] = button.pressed;
+      }
+    });
+    pad.axes.forEach((raw, a) => {
+      const value = step(Math.min(Math.max(raw, -1), 1));
+      if (value !== (state.axes[a] ?? 0)) {
+        out.push(padAxisEvent(i, a, value));
+        state.axes[a] = value;
+      }
+    });
+    last[i] = state;
+  }
+  return out;
+}
+
+/** The gamepads' changes into `ring` (`padChanges`), polled each animation frame: the Gamepad
+ * API has no events for them. */
+export function pollPads(ring: InputRing, now: () => number): void {
+  if (typeof navigator.getGamepads !== "function") return;
+  const last: (PadState | null)[] = Array.from({ length: PADS }, () => null);
+  const poll = () => {
+    for (const event of padChanges(navigator.getGamepads(), last)) ring.write(event, now());
+    requestAnimationFrame(poll);
+  };
+  requestAnimationFrame(poll);
 }

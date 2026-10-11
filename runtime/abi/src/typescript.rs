@@ -52,6 +52,8 @@ pub fn typescript() -> String {
         input::EventKind::ALL.iter().map(|&k| format!("  {}: {},\n", k.name(), k as u32)).collect();
     let keys = list(input::KEYS.iter().map(|k| format!("{k:?}")));
     let buttons = list(input::BUTTONS.iter().map(|b| format!("{b:?}")));
+    let pad_buttons = list(input::PAD_BUTTONS.iter().map(|b| format!("{b:?}")));
+    let pad_axes = list(input::PAD_AXES.iter().map(|a| format!("{a:?}")));
     let texture_writable = stream::WRITABLE;
     let pass_join = stream::PASS_JOIN;
     let max_texture_3d = stream::MAX_TEXTURE_3D;
@@ -125,6 +127,11 @@ export const MODIFIER_META = {meta};
 export const BUTTONS = [{buttons}] as const;
 /** The physical keys, by number: DOM's `KeyboardEvent.code` (0: one not listed). */
 export const KEYS = [{keys}] as const;
+/** How many gamepads a host reports, and a pad's buttons and axes by number: the W3C Gamepad
+ * API's standard mapping, as a script names them. */
+export const PADS = {pads};
+export const PAD_BUTTONS = [{pad_buttons}] as const;
+export const PAD_AXES = [{pad_axes}] as const;
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [
@@ -236,6 +243,7 @@ export const PANIC_CAP = {panic_cap};
         control = input::CONTROL,
         alt = input::ALT,
         meta = input::META,
+        pads = input::PADS,
         export_audio = crate::EXPORT_AUDIO,
         audio_sample_rate = crate::AUDIO_SAMPLE_RATE,
         audio_quantum = crate::AUDIO_QUANTUM,

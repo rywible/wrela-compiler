@@ -4,7 +4,7 @@
 import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { epochNow, InputRing } from "./input.ts";
-import { listen } from "./listen.ts";
+import { listen, pollPads } from "./listen.ts";
 import { type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 
@@ -204,6 +204,8 @@ function start(): void {
     const { width, height } = devicePixels(canvas);
     const sized = { width, height };
     listen(canvas, ring, epochNow, () => sized);
+    // A test's input is its script: a pad on the machine that runs it isn't heard.
+    if (!test) pollPads(ring, epochNow);
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
     const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
     const live = mark === null ? null : Number(mark.content ?? "0") || 0;
