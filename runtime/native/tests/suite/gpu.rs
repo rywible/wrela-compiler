@@ -258,10 +258,13 @@ fn times_dispatches_and_passes_with_timestamps() {
         store_host("timestamps", &frames, &Options { timing: Timing::Span, ..Options::default() });
     let run = host.run_frames(&[0.0; 5], 64, 64).expect("runs");
     assert_eq!(run.timings.len(), 15, "{:?}", run.timings);
+    // A GPU's pass takes well under 0.1 s. On the CPU's Vulkan (a cloud machine, tools/cloud.sh)
+    // a pass's time is the CPU's, shared with the gate's other tests: up to 0.75 s was seen.
+    let most = if std::env::var_os("WRELA_SOFTWARE_GPU").is_some() { 1e10 } else { 1e8 };
     for (i, t) in run.timings.iter().enumerate() {
         assert_eq!(t.frame, i / 3);
         assert_eq!(t.label, if i % 3 == 2 { "screen pass" } else { "store" });
-        assert!(t.nanos > 0.0 && t.nanos < 1e8, "{} {i} took {} ns", t.label, t.nanos);
+        assert!(t.nanos > 0.0 && t.nanos < most, "{} {i} took {} ns", t.label, t.nanos);
     }
 }
 

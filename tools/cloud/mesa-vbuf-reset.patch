@@ -1,0 +1,94 @@
+--- a/src/gallium/auxiliary/draw/draw_pipe_vbuf.c
++++ b/src/gallium/auxiliary/draw/draw_pipe_vbuf.c
+@@ -68,6 +68,12 @@
+    unsigned max_vertices;
+    unsigned nr_vertices;
+ 
++   /** The post-transform vertices given an id since the last flush, whose
++    * ids the flush resets (rather than every vertex of the pipeline's run).
++    */
++   struct vertex_header **emitted;
++   unsigned emitted_cap;
++
+    /** Indices */
+    uint16_t *indices;
+    unsigned max_indices;
+@@ -131,6 +137,18 @@
+       if (0) draw_dump_emitted_vertex(vbuf->vinfo, (uint8_t *)vbuf->vertex_ptr);
+ 
+       vbuf->vertex_ptr += vbuf->vertex_size;
++      if (vbuf->nr_vertices >= vbuf->emitted_cap) {
++         unsigned cap = MAX2(vbuf->emitted_cap * 2, 1024);
++         struct vertex_header **e = REALLOC(vbuf->emitted,
++                                            vbuf->emitted_cap * sizeof(*e),
++                                            cap * sizeof(*e));
++         if (e) {
++            vbuf->emitted = e;
++            vbuf->emitted_cap = cap;
++         }
++      }
++      if (vbuf->nr_vertices < vbuf->emitted_cap)
++         vbuf->emitted[vbuf->nr_vertices] = vertex;
+       vertex->vertex_id = vbuf->nr_vertices++;
+    }
+ 
+@@ -302,6 +320,42 @@
+ 
+ 
+ /**
++ * Reset the ids of the vertices emitted since the last flush: the
++ * temporaries of each stage, and those of the pipeline's vertices that
++ * were emitted. Sweeping every vertex of the pipeline's run (as
++ * draw_reset_vertex_ids does) at each flush costs the run's size per flush.
++ */
++static void
++vbuf_reset_vertex_ids(struct vbuf_stage *vbuf)
++{
++   struct draw_context *draw = vbuf->stage.draw;
++   const char *verts = draw->pipeline.verts;
++   const char *end = verts + (size_t)draw->pipeline.vertex_count *
++                             draw->pipeline.vertex_stride;
++   unsigned n = MIN2(vbuf->nr_vertices, vbuf->emitted_cap);
++
++   if (n < vbuf->nr_vertices) {
++      draw_reset_vertex_ids(draw);
++      return;
++   }
++
++   for (struct draw_stage *stage = draw->pipeline.first; stage;
++        stage = stage->next) {
++      for (unsigned i = 0; i < stage->nr_tmps; i++)
++         stage->tmp[i]->vertex_id = UNDEFINED_VERTEX_ID;
++   }
++
++   if (verts) {
++      for (unsigned i = 0; i < n; i++) {
++         const char *v = (const char *)vbuf->emitted[i];
++         if (v >= verts && v < end)
++            vbuf->emitted[i]->vertex_id = UNDEFINED_VERTEX_ID;
++      }
++   }
++}
++
++
++/**
+  * Flush existing vertex buffer and allocate a new one.
+  */
+ static void
+@@ -320,7 +374,7 @@
+ 
+       /* Reset temporary vertices ids */
+       if (vbuf->nr_vertices)
+-         draw_reset_vertex_ids(vbuf->stage.draw);
++         vbuf_reset_vertex_ids(vbuf);
+ 
+       /* Free the vertex buffer */
+       vbuf->render->release_vertices(vbuf->render);
+@@ -402,6 +456,7 @@
+    if (vbuf->cache)
+       translate_cache_destroy(vbuf->cache);
+ 
++   FREE(vbuf->emitted);
+    FREE(stage);
+ }
+ 

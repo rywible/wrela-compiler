@@ -126,9 +126,10 @@ class HeadlessTest(PageDir, unittest.TestCase):
         for stale in ("DONE", "hash.txt"):
             with open(os.path.join(results, stale), "w") as f:
                 f.write("ok")
-        status, _, err = self.run_headless("hang", timeout="1")
+        # (3 s: under load, a shorter run can end before the fake Chrome has started.)
+        status, _, err = self.run_headless("hang", timeout="3")
         self.assertEqual(status, 1)
-        self.assertIn("timed out after 1s", err)
+        self.assertIn("timed out after 3s", err)
         # An earlier run's results are gone.
         self.assertFalse(os.path.exists(os.path.join(results, "hash.txt")))
         self.assert_chrome_gone()

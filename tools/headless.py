@@ -20,13 +20,16 @@ so concurrent runs don't need a server and can't collide on one.
 Exit status: 0 the page wrote `ok`; 1 it failed, timed out, or Chrome exited; 2 a setup error;
 3 the GPU lock (or the Chrome lock) wasn't free within an hour.
 
-Environment: WRELA_CHROME overrides the Chrome binary; WRELA_GPU_SHARED (2 or more) shares the
-GPU with native runs (below).
+Environment: WRELA_CHROME overrides the Chrome binary; WRELA_CHROME_ARGS adds arguments to its
+command line (split as a shell would: tools/cloud.sh's Chromium on a CPU's Vulkan); WRELA_GPU_SHARED (2 or more) shares the
+GPU with native runs (below); WRELA_THROTTLE (bits a second) slows the server's sending, every
+request sharing the rate (tools/serve.py).
 """
 
 import fcntl
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -250,6 +253,7 @@ def main(argv):
                     "--enable-logging=stderr",
                     "--v=0",
                     "--window-size=1920,1080",
+                    *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
                     url,
                 ],
                 stdin=subprocess.DEVNULL,
