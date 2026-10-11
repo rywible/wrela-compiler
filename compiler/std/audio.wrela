@@ -139,5 +139,8 @@ impl<T: Copy> RingReader<T> {
 /// falls 60 dB in `t60` seconds at `SAMPLE_RATE`.
 @audio
 pub fn decay_rate(t60: f32) -> f32 {
-    6.9078 / (t60 * f32(SAMPLE_RATE))
+    FALL_60_DB / (t60 * f32(SAMPLE_RATE))
 }
+
+/// A fall of 60 dB, as the natural log of the amplitude's ratio: ln(1000).
+pub const FALL_60_DB: f32 = 6.9078
