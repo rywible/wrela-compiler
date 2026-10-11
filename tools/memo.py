@@ -368,6 +368,7 @@ class Sources:
                     self.by_package[owner].add(rel)
         self.hashes = {}
         self.texts = {}
+        self.names = {}
 
     @staticmethod
     def metadata(root):
@@ -450,6 +451,17 @@ class Sources:
                 self.texts[rel] = ""
         return self.texts[rel]
 
+    def names_in(self, rel):
+        """The names a Rust file's code (its comments aside) uses as paths (`name::`) or imports
+        from its crate or its parent (`use crate::{.., name, ..}`): once a gate."""
+        if rel not in self.names:
+            code = "\n".join(l for l in self.text(rel).splitlines() if not l.lstrip().startswith("//"))
+            names = set(re.findall(r"\b(\w+)::", code))
+            for group in re.findall(r"use (?:super|crate)::\{([^}]*)", code):
+                names.update(re.findall(r"\b\w+\b", group))
+            self.names[rel] = names
+        return self.names[rel]
+
     def for_test(self, files, program_dir, test):
         """Of `files`, those a test's code can come from: all but the modules of its program (a
         test program of several files, `program_dir`) that neither its module nor the program's
@@ -474,11 +486,8 @@ class Sources:
                 continue
             wanted.add(name)
             for f in [prefix + "main.rs"] if name == "main" else modules.get(name, []):
-                code = "\n".join(l for l in self.text(f).splitlines() if not l.lstrip().startswith("//"))
-                for other in modules:
-                    if other not in wanted and re.search(
-                            rf"\b{re.escape(other)}::|use (?:super|crate)::\{{[^}}]*\b{re.escape(other)}\b", code):
-                        todo.append(other)
+                todo.extend(other for other in modules
+                            if other not in wanted and other in self.names_in(f))
         left_out = {f for name, fs in modules.items() if name not in wanted for f in fs}
         return [f for f in files if f not in left_out]
 
@@ -991,10 +1000,8 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
                              env=env_for(pkg), capture_output=True, text=True, check=True).stdout
         return [l[:-len(": test")] for l in out.splitlines() if l.endswith(": test")]
 
-    # Each program's tests; the slow ones (by their last time), remembered or to run alone. Those
-    # remembered by their builds' files once the builds are made again, all at once.
-    quick_runs, alone, remembered, maybe = [], [], [], []
-    for m in programs:
+    # Each program's tests (listed all at once); the slow ones (by their last time) apart.
+    def split(m):
         pkg = os.path.dirname(m["manifest_path"])
         exe = m["executable"]
         src = m["target"]["src_path"]
@@ -1009,15 +1016,37 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         # A skip holds a name, not only matches it: a test whose name holds a slow one's would be
         # skipped too, so it runs alone as well.
         kept = set(listed(exe, pkg, skips)) if slow else set(names)
-        aside = [n for n in names if n not in kept]
-        for n in aside:
-            test_id = prefix + n
-            if mode == "on" and n in slow and memo.remembered(test_id, program_dir, n, builds=False):
+        aside = [(prefix + n, n, n in slow) for n in names if n not in kept]
+        return m, pkg, exe, program_dir, prefix, skips, kept, aside
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
+        split_programs = list(pool.map(split, programs))
+
+    # The quick tests: every program at once, each test's time in libtest's JSON (`--report-time`,
+    # a stable libtest's unstable option: RUSTC_BOOTSTRAP). They start now, while the slow tests'
+    # memory is looked up beside them.
+    runs = []
+    for m, pkg, exe, _, prefix, skips, kept, _ in split_programs:
+        if not kept:
+            continue
+        out = open(f"{logs}/run-{len(runs)}", "w+")
+        name = f"{m['target']['name']} ({m['target']['kind'][0]})"
+        proc = subprocess.Popen(
+            [exe, *args, *skips, "-Z", "unstable-options", "--format", "json",
+             "--report-time"], cwd=pkg, env={**env_for(pkg), "RUSTC_BOOTSTRAP": "1"},
+            stdout=out, stderr=subprocess.STDOUT)
+        runs.append(("quick", name, proc, out, time.monotonic(), prefix))
+
+    # The slow tests remembered, or to run alone. Those remembered by their builds' files once the
+    # builds are made again, all at once.
+    alone, remembered, maybe = [], [], []
+    for _, pkg, exe, program_dir, _, _, _, aside in split_programs:
+        for test_id, n, slow in aside:
+            if mode == "on" and slow and memo.remembered(test_id, program_dir, n, builds=False):
                 remembered.append(n)
             else:
                 maybe.append((memo.store.timing(test_id) or 0, test_id, n, exe, pkg, program_dir))
-        if kept:
-            quick_runs.append((m, pkg, exe, skips, prefix))
     by_builds = []
     if mode == "on" and maybe:
         memo.rebuilds.prefetch([b for _, t, n, _, _, d in maybe for b in memo.builds_wanted(t, d, n)])
@@ -1028,18 +1057,6 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
             by_builds.append(n)
         else:
             alone.append(a)
-
-    # The quick tests: every program at once, each test's time in libtest's JSON (`--report-time`,
-    # a stable libtest's unstable option: RUSTC_BOOTSTRAP).
-    runs = []
-    for m, pkg, exe, skips, prefix in quick_runs:
-        out = open(f"{logs}/run-{len(runs)}", "w+")
-        name = f"{m['target']['name']} ({m['target']['kind'][0]})"
-        proc = subprocess.Popen(
-            [exe, *args, *skips, "-Z", "unstable-options", "--format", "json",
-             "--report-time"], cwd=pkg, env={**env_for(pkg), "RUSTC_BOOTSTRAP": "1"},
-            stdout=out, stderr=subprocess.STDOUT)
-        runs.append(("quick", name, proc, out, time.monotonic(), prefix))
 
     # The slow tests: the longest first, as many at once as the machine has cores.
     alone.sort(key=lambda a: -a[0])

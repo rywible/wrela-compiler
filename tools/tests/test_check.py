@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 
 
@@ -231,6 +232,16 @@ class FocusedCheck(unittest.TestCase):
                 self.assertEqual(scratch.parent, self.root / "target")
                 self.assertEqual(scratch.exists(), fail)
 
+
+    def test_a_failed_programs_scratch_is_removed_six_hours_later(self):
+        old, recent = self.root / "target/test-scratch-old", self.root / "target/test-scratch-new"
+        for path, age in ((old, 7 * 3600), (recent, 3600)):
+            (path / "inside").mkdir(parents=True)
+            then = time.time() - age
+            os.utime(path, (then, then))
+        self.assert_focused_success(self.check("--package=wrela-syntax", "normal_case"))
+        self.assertFalse(old.exists())
+        self.assertTrue(recent.exists())
 
 if __name__ == "__main__":
     unittest.main()
