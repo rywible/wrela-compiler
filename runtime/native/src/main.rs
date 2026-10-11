@@ -4,6 +4,9 @@
 //!   [--png out.png [--every K]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks]
 //!   [--workers N]`: frames on the GPU (in lockstep with the program's ticker, if it has one),
 //!   then the state hash; the phases the program timed (`std::time::phase`), if any, on stderr.
+//! - `wrela-host <build-dir> --until TEXT --input script.json [--input ...] [--frames N]
+//!   [--size WxH] --png out.png`: each script in turn, until the program prints TEXT: that
+//!   frame is the script's PNG (a capture's still).
 //! - `wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks]
 //!   [--workers N]`: the program's ticks alone, with no GPU and no frames: each tick's state
 //!   hash.
@@ -19,6 +22,7 @@ use wrela_host::{CpuBuild, TickLog};
 
 const USAGE: &str = "usage:
   wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json] [--png out.png [--every K]] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]
+  wrela-host <build-dir> --until TEXT --input script.json [--input ...] [--frames N] [--fps F] [--size WxH] --png out.png [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
 
@@ -28,6 +32,10 @@ over every submitted byte, 16 hex digits. --input gives the program a script of 
 (runtime/abi `input`). --png and --rgba write the last frame (raw RGBA8, rows top to bottom);
 with --every K, --png writes every Kth frame too, numbered (out-0000.png, out-0001.png, ...): a
 clip's frames.
+--until runs the scripts in turn (--input, given once or more), each until the program prints a
+line holding TEXT, and the frame that prints it is that script's PNG: out.png for one script,
+numbered for several (out-0000.png, ...). The next script's frames count from the frame after,
+and --frames caps the frames in all; it fails if a script never stopped.
 --timestamps prints each dispatch's and pass's GPU time to stderr, and each frame's span (its
 first start to its last end); --serial runs each pass and dispatch alone, so each time is its own.
 
@@ -45,7 +53,8 @@ struct Args {
     png: Option<PathBuf>,
     every: Option<u32>,
     rgba: Option<PathBuf>,
-    input: Option<PathBuf>,
+    input: Vec<PathBuf>,
+    until: Option<String>,
     timestamps: bool,
     serial: bool,
     no_gpu: bool,
@@ -65,7 +74,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         png: None,
         every: None,
         rgba: None,
-        input: None,
+        input: Vec::new(),
+        until: None,
         timestamps: false,
         serial: false,
         no_gpu: false,
@@ -100,7 +110,8 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--png" => args.png = Some(value("--png")?.into()),
             "--every" => args.every = Some(whole("--every", value("--every")?)?.max(1)),
             "--rgba" => args.rgba = Some(value("--rgba")?.into()),
-            "--input" => args.input = Some(value("--input")?.into()),
+            "--input" => args.input.push(value("--input")?.into()),
+            "--until" => args.until = Some(value("--until")?),
             "--log" => args.log = Some(value("--log")?.into()),
             "--replay" => args.replay = Some(value("--replay")?.into()),
             "--timestamps" => args.timestamps = true,
@@ -115,6 +126,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         }
     }
     args.dir = dir.ok_or_else(|| USAGE.to_string())?;
+    if args.input.len() > 1 && args.until.is_none() {
+        return Err(format!("--input is given more than once only with --until\n\n{USAGE}"));
+    }
+    if args.until.is_some() && (args.png.is_none() || args.every.is_some() || args.log.is_some()) {
+        return Err(format!("--until needs --png, and takes no --every or --log\n\n{USAGE}"));
+    }
     if args.every.is_some() && args.png.is_none() {
         return Err(format!("--every needs --png\n\n{USAGE}"));
     }
@@ -137,14 +154,16 @@ impl From<wrela_host::Error> for Failure {
 }
 
 fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
-    match &args.input {
-        Some(path) => {
-            let text = std::fs::read_to_string(path).map_err(|e| wrela_host::Error::io(path, e))?;
-            wrela_host::parse_script(&text)
-                .map_err(|why| wrela_host::Error::Program(format!("{}: {why}", path.display())))
-        }
+    match args.input.first() {
+        Some(path) => script_at(path),
         None => Ok(Vec::new()),
     }
+}
+
+fn script_at(path: &PathBuf) -> Result<Vec<wrela_host::Scripted>, wrela_host::Error> {
+    let text = std::fs::read_to_string(path).map_err(|e| wrela_host::Error::io(path, e))?;
+    wrela_host::parse_script(&text)
+        .map_err(|why| wrela_host::Error::Program(format!("{}: {why}", path.display())))
 }
 
 fn write_log(path: &PathBuf, log: &TickLog) -> Result<(), wrela_host::Error> {
@@ -177,9 +196,45 @@ fn ticks_alone(args: &Args) -> Result<(), Failure> {
     Ok(())
 }
 
+/// `--until`: each script's frames until the program prints the text, that frame its PNG.
+#[cfg(feature = "gpu")]
+fn stills(args: &Args, until: &str) -> Result<(), Failure> {
+    use wrela_host::{Host, Options};
+    let scripts = args.input.iter().map(script_at).collect::<Result<Vec<_>, _>>()?;
+    let scripts = if scripts.is_empty() { vec![Vec::new()] } else { scripts };
+    let options = Options { workers: args.workers, ..Options::default() };
+    let mut host = Host::load_with(&args.dir, &options)?;
+    let (w, h) = args.size;
+    let png = args.png.clone().unwrap_or_default();
+    let stem = png.with_extension("");
+    let one = scripts.len() == 1;
+    let (run, done) =
+        host.run_lockstep_until(args.frames, args.fps, w, h, &scripts, until, |k, i, rgba| {
+            eprintln!("script {k} stopped at frame {i}");
+            let path = if one {
+                png.clone()
+            } else {
+                PathBuf::from(format!("{}-{k:04}.png", stem.display()))
+            };
+            wrela_host::image::write_png(&path, w, h, rgba)
+        })?;
+    drop(host);
+    if done < scripts.len() {
+        return Err(Failure::Host(wrela_host::Error::Program(format!(
+            "script {done} didn't print {until:?} within {} frames",
+            args.frames
+        ))));
+    }
+    println!("{}", run.hash_hex());
+    Ok(())
+}
+
 #[cfg(feature = "gpu")]
 fn frames(args: &Args) -> Result<(), Failure> {
     use wrela_host::{Host, Options, Timing};
+    if let Some(until) = &args.until {
+        return stills(args, until);
+    }
     let script = read_script(args)?;
     let timing = match (args.timestamps, args.serial) {
         (true, true) => Timing::Serial,

@@ -236,6 +236,16 @@ impl std::fmt::Display for ReplayError {
 impl std::error::Error for ReplayError {}
 
 /// [`ReplayError::OtherBuild`] unless `log` is for the build whose WASM hash is `build`.
+/// `script`'s frame events `by` frames later ([`Host::run_lockstep_until`]).
+fn shifted(script: &[Scripted], by: u32) -> Vec<Scripted> {
+    use wrela_abi::input::At;
+    let later = |at| match at {
+        At::Frame(f) => At::Frame(f + by),
+        tick => tick,
+    };
+    script.iter().map(|s| Scripted { at: later(s.at), ..*s }).collect()
+}
+
 fn same_build(log: &TickLog, build: u64) -> Result<(), ReplayError> {
     if log.wasm_hash == build {
         Ok(())
@@ -505,6 +515,45 @@ impl Host {
             }
         }
         Ok((self.result(width, height)?, log))
+    }
+
+    /// Runs in lockstep script by script, each until the program prints a line holding `until`
+    /// (`std::io::print`): the frame that prints it is given to `stopped` with its script's
+    /// index and its frame's number, and the next script's frames count from the frame after
+    /// it (a capture's stills, one per shot, from one process). It ends when the last script
+    /// has stopped, or after `frames` frames in all, and gives the last frame's screen and how
+    /// many scripts stopped. A script's tick records keep their ticks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_lockstep_until(
+        &mut self,
+        frames: u32,
+        fps: f64,
+        width: u32,
+        height: u32,
+        scripts: &[Vec<Scripted>],
+        until: &str,
+        mut stopped: impl FnMut(usize, u32, &[u8]) -> Result<()>,
+    ) -> Result<(RunResult, usize)> {
+        program::valid_fps(fps)?;
+        self.p().executor().set_screen(width, height)?;
+        self.p().take_logs();
+        let mut done = 0;
+        let mut script = scripts.first().cloned().unwrap_or_default();
+        for i in 0..frames {
+            if done == scripts.len() {
+                break;
+            }
+            self.p().executor().set_frame(i as usize);
+            self.p().lockstep_frame(i, fps, width, height, &script, None)?;
+            self.settle_handing()?;
+            if self.p().take_logs().iter().any(|line| line.contains(until)) {
+                let screen = self.p().executor().read_screen()?;
+                stopped(done, i, &screen)?;
+                done += 1;
+                script = scripts.get(done).map(|s| shifted(s, i + 1)).unwrap_or_default();
+            }
+        }
+        Ok((self.result(width, height)?, done))
     }
 
     /// Frame `i` of a lockstep run ([`Host::run_lockstep`]), alone: for a test that looks at the
@@ -986,5 +1035,18 @@ impl CpuHost {
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
         self.program.ticks_beside_frames(ticks, frames, fps, width, height)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wrela_abi::input::At;
+
+    #[test]
+    fn a_later_script_s_frames_count_from_where_the_last_stopped() {
+        let key = |at| Scripted { at, event: Event::text('k') };
+        let later = shifted(&[key(At::Frame(1)), key(At::Tick(3))], 150);
+        assert_eq!(later, vec![key(At::Frame(151)), key(At::Tick(3))]);
     }
 }

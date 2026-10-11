@@ -3,8 +3,8 @@
 rendered settled at 1080p, as a still on the native host and as a 10 s clip in Chrome (its move),
 into a directory.
 
-    tools/lookbook.py <out-dir> [--stills] [--view clay|silhouette] [--size WxH] [--jobs N]
-                      [shot-number ...]
+    tools/lookbook.py <out-dir> [--stills] [--capture [--warm]] [--view clay|silhouette]
+                      [--size WxH] [--jobs N] [shot-number ...]
 
 The floor must be built (`wrela build examples/last-green`). A shot is chosen as a player would
 (L, its number, Enter); the still is the frame its move starts at (`lookbook::SETTLE` seconds in),
@@ -20,6 +20,12 @@ on a 4-core cloud machine lavapipe leaves cores idle in a still's load frames, a
 and 9 took 785 s at once, about 1400 s one by one. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
 `check.json`.
+
+`--capture` takes each still in capture mode (F7, `Floor::capture` in examples/last-green/main.wrela):
+the still is the frame the floor prints `still at frame N` on, a 16-frame resolve once the light
+round the eye is in, not the frame 5 s in (shot 2 at 1080p on a 4-core cloud machine: 244 s, not
+460 s). With `--warm`, one process takes every shot's still in turn, so the floor loads once:
+after a shot's still, the next shot is chosen (shots 2, 7 and 9: 383 s, the same pixels).
 """
 
 import json, os, re, shutil, subprocess, sys, tempfile
@@ -30,6 +36,9 @@ BUILD = os.path.join(ROOT, "examples/last-green/build")
 HOST = os.path.join(ROOT, "target/release/wrela-host")
 HEADLESS = os.path.join(ROOT, "tools/headless.py")
 SETTLE_FRAMES = 300
+# A capture's frames at most, its load and its resolve: it stops before, at `STILL`.
+CAPTURE_FRAMES = 900
+STILL = "still at frame"
 MOVE_FRAMES = 600
 
 
@@ -55,18 +64,53 @@ def stem(i, name):
     return f"{i:02d}-{name.replace(' ', '-').replace(chr(39), '')}"
 
 
-def still(i, name, out, view="look", size="1920x1080", jobs=1):
-    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(keys(i, view), f)
-        script = f.name
+def capture_keys(i, view="look", first=True):
+    """The keys that take shot `i`'s still in capture mode: F7 first (it toggles), then the shot."""
+    f7 = [{"frame": 1, "type": "key", "key": "F7"}] if first else []
+    return f7 + keys(i, view if first else "look")
+
+
+def run(scripts, png, size, capture, env=None):
+    """The host on `scripts` (each a list of events), its PNG at `png`: the frame 5 s in, or
+    with `capture`, each script's frame that prints `STILL`."""
+    tmp = tempfile.mkdtemp(prefix="lookbook-")
+    cmd = [HOST, BUILD, "--size", size, "--png", png]
+    for k, events in enumerate(scripts):
+        path = os.path.join(tmp, f"keys-{k}.json")
+        with open(path, "w") as f:
+            json.dump(events, f)
+        cmd += ["--input", path]
+    frames = CAPTURE_FRAMES * len(scripts) if capture else SETTLE_FRAMES + 1
+    cmd += ["--frames", str(frames)] + (["--until", STILL] if capture else [])
+    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    shutil.rmtree(tmp)
+    return r
+
+
+def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
     png = os.path.join(out, stem(i, name) + ".png")
     env = dict(os.environ, WRELA_GPU_SHARED=str(max(2, jobs))) if jobs > 1 else None
-    r = subprocess.run([HOST, BUILD, "--frames", str(SETTLE_FRAMES + 1), "--size", size,
-                        "--input", script, "--png", png], capture_output=True, text=True, env=env)
-    os.unlink(script)
+    events = capture_keys(i, view) if capture else keys(i, view)
+    r = run([events], png, size, capture, env)
     if r.returncode != 0:
         sys.exit(f"shot {i} ({name}) failed:\n{r.stderr[-2000:]}")
     return png
+
+
+def warm(pick, shots, out, view="look", size="1920x1080"):
+    """The capture stills of the shots `pick` from one process, in turn: the floor loads once."""
+    tmp = tempfile.mkdtemp(prefix="lookbook-")
+    scripts = [capture_keys(i, view, first=k == 0) for k, i in enumerate(pick)]
+    r = run(scripts, os.path.join(tmp, "w.png"), size, True)
+    if r.returncode != 0:
+        sys.exit(f"the warm run failed:\n{r.stderr[-2000:]}")
+    pngs = []
+    for k, i in enumerate(pick):
+        png = os.path.join(out, stem(i, shots[i]) + ".png")
+        shutil.move(os.path.join(tmp, "w.png" if len(pick) == 1 else f"w-{k:04d}.png"), png)
+        pngs.append(png)
+    shutil.rmtree(tmp)
+    return pngs
 
 
 def clip(i, name, out, view="look"):
@@ -92,7 +136,11 @@ def main():
     if not args:
         sys.exit(__doc__)
     stills_only = "--stills" in args
-    args = [a for a in args if a != "--stills"]
+    capture = "--capture" in args
+    warm_run = "--warm" in args
+    if warm_run and not capture:
+        sys.exit("--warm takes --capture")
+    args = [a for a in args if a not in ("--stills", "--capture", "--warm")]
     view = "look"
     if "--view" in args:
         k = args.index("--view")
@@ -125,10 +173,14 @@ def main():
         shutil.copyfile(numbers, os.path.join(out, "check.json"))
     # The stills at once, `jobs` at a time (each printed, in order, as it and those before it end);
     # then each clip in turn, as Chrome takes the GPU alone.
-    pool = ThreadPoolExecutor(jobs)
-    pngs = [pool.submit(still, i, shots[i], out, view, size, jobs) for i in pick]
+    if warm_run:
+        pngs = warm(pick, shots, out, view, size)
+    else:
+        pool = ThreadPoolExecutor(jobs)
+        runs = [pool.submit(still, i, shots[i], out, view, size, jobs, capture) for i in pick]
+        pngs = (r.result() for r in runs)
     for i, png in zip(pick, pngs):
-        print(png.result(), flush=True)
+        print(png, flush=True)
         if i < len(views):
             v = views[i]["view"]
             what = ", ".join(f"{d['pull']} {d['strength']:.2f}" for d in v["draws"][:4])
