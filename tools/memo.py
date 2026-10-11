@@ -37,6 +37,11 @@ What the entry leaves out, and why that is safe:
 - The other modules of a multi-file test program, which it doesn't name (`clearing.rs` doesn't
   name `last_green`): their code doesn't run in its process.
 
+Where the memory is (`stores`): WRELA_GATE_MEMO's directory; else, in a Claude project, one in
+~/.cache that the project's shared folder keeps in step with the other machines' (`sync`, in a
+process of its own: a read on the shared mount can stall for good, so the gate reads and writes
+only this machine's copy); else target/gate-memo.
+
 Linux only (strace; and `unshare`, which gives each process its own `target/tmp`, so that two
 processes of one test program don't build into the same scratch directory). Elsewhere the gate
 runs every test, as before.
@@ -486,10 +491,95 @@ class Sources:
 
 def write_atomically(path, data):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = f"{path}.{os.getpid()}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
+    # Unique across machines too, which share a folder but not their process ids.
+    tmp = f"{path}.{os.getpid()}-{time.time_ns() % 10**9}.tmp"
+    mode, how = ("w", {"encoding": "utf-8"}) if isinstance(data, str) else ("wb", {})
+    with open(tmp, mode, **how) as f:
         f.write(data)
     os.replace(tmp, path)
+
+
+def stores(environ=os.environ):
+    """The memory's directory on this machine, and the shared one it is kept in step with (None if
+    none): WRELA_GATE_MEMO's; else, where a Claude project's shared folder can be written, a
+    directory in ~/.cache and the folder's `.gate-memo`; else target/gate-memo."""
+    own = environ.get("WRELA_GATE_MEMO")
+    if own and own != "off":
+        return own, None
+    shared = environ.get("WRELA_SHARED_FOLDER") or "/mnt/project-files"
+    if os.path.isdir(shared) and os.access(shared, os.W_OK):
+        return os.path.join(os.path.expanduser("~"), ".cache", "wrela", "gate-memo"), \
+            os.path.join(shared, ".gate-memo")
+    return os.path.join(environ.get("CARGO_TARGET_DIR", "target"), "gate-memo"), None
+
+
+# How long a sync may take; what it hasn't copied by then waits for the next one.
+SYNC_FOR = 600
+
+
+def sync(src, dst, lock_dir, deadline=SYNC_FOR):
+    """Copies each file of the store `src` that `dst` lacks, or has older, to `dst`, with its time
+    kept. One sync from `src` to `dst` at a time (a lock in `lock_dir`, on this machine's disk).
+    A read on a shared mount can stall for good, so the files are listed and copied on threads,
+    several at once, and the sync ends at `deadline` (seconds) whatever is still stalled. Returns
+    how many files it copied."""
+    import fcntl
+    import threading
+
+    os.makedirs(lock_dir, exist_ok=True)
+    lock = open(os.path.join(lock_dir, f".sync-{sha(os.path.abspath(src) + chr(0) + os.path.abspath(dst))[:12]}"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return 0  # another sync of the same two is under way
+    end = time.monotonic() + deadline
+    todo, done, copied = [], threading.Event(), [0]
+
+    def listing():
+        for dirpath, _, names in os.walk(src):
+            todo.extend(os.path.join(dirpath, n) for n in names
+                        if not n.endswith(".tmp") and not n.startswith("."))
+        done.set()
+
+    def copy():
+        while time.monotonic() < end:
+            try:
+                path = todo.pop()
+            except IndexError:
+                if done.is_set():
+                    return
+                time.sleep(0.05)
+                continue
+            to = os.path.join(dst, os.path.relpath(path, src))
+            try:
+                when = os.path.getmtime(path)
+                if os.path.exists(to) and os.path.getmtime(to) >= when:
+                    continue
+                with open(path, "rb") as f:
+                    data = f.read()
+                write_atomically(to, data)
+                os.utime(to, (when, when))
+                copied[0] += 1
+            except OSError:
+                continue
+
+    threads = [threading.Thread(target=listing, daemon=True)] + \
+        [threading.Thread(target=copy, daemon=True) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads[1:]:
+        t.join(max(0, end - time.monotonic()))
+    return copied[0]
+
+
+def sync_later(src, dst, lock_dir, then=None):
+    """Starts a sync of `src` into `dst` (and then of `then`, a (src, dst) pair) in a process of
+    its own, and doesn't wait for it."""
+    pairs = [(src, dst)] + ([then] if then else [])
+    args = [a for pair in pairs for a in pair]
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "sync", lock_dir, *args],
+                     start_new_session=True, stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 class Store:
@@ -852,11 +942,25 @@ def run(logs, native_cache, mode, dir, args):
 
     for signum in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(signum, end)
+    # The shared store: what the other machines learned comes into this machine's copy, for the
+    # next gate (this one doesn't wait for it); what this one learns goes back once it ends.
+    if dir == "auto":
+        dir, shared = stores()
+    else:
+        shared = None
+    if shared:
+        sync_later(shared, dir, dir)
     try:
         return run_tests(logs, native_cache, mode, dir, args, parent)
     except KeyboardInterrupt:
         stop_all()
         return 130
+    except BaseException:
+        stop_all()
+        raise
+    finally:
+        if shared:
+            sync_later(dir, shared, dir, then=(shared, dir))
 
 
 def run_tests(logs, native_cache, mode, dir, args, parent):
@@ -1055,6 +1159,16 @@ if __name__ == "__main__":
         sys.exit(run(logs, native_cache, mode, dir, rest))
     if len(sys.argv) == 2 and sys.argv[1] == "available":
         sys.exit(0 if available() else 1)
-    print("usage: tools/memo.py run <logs> <native cache> on|fresh <dir> <test args>... | available",
-          file=sys.stderr)
+    if len(sys.argv) >= 5 and sys.argv[1] == "sync" and len(sys.argv) % 2 == 1:
+        _, _, lock_dir, *pairs = sys.argv
+        for i in range(0, len(pairs), 2):
+            sync(pairs[i], pairs[i + 1], lock_dir)
+        os._exit(0)  # not waiting for a read the mount stalled
+    if len(sys.argv) == 2 and sys.argv[1] == "pull":
+        own, shared = stores()
+        if shared:
+            sync_later(shared, own, own)
+        sys.exit(0)
+    print("usage: tools/memo.py run <logs> <native cache> on|fresh <dir>|auto <test args>... "
+          "| available | pull | sync <lock dir> <from> <to>...", file=sys.stderr)
     sys.exit(2)

@@ -314,8 +314,9 @@ step "wrela fmt --check"
 
 # The optional memory of slow tests that passed (tools/memo.py), where a test can be traced
 # and isolated (Linux: strace, mount namespaces). --fresh, --long and --full run every test.
-# WRELA_GATE_MEMO is the memory's directory, or `off`; in a Claude project's session it is in the
-# project's shared folder, so the project's sessions share what they learn.
+# WRELA_GATE_MEMO is the memory's directory, or `off`; in a Claude project's session it is on this
+# machine, kept in step with the project's shared folder, so the project's sessions share what
+# they learn (tools/memo.py's `stores`).
 memo=off
 if [ "${WRELA_GATE_MEMO:-}" = off ]; then
   echo "  test memo disabled (WRELA_GATE_MEMO=off); running every gate test"
@@ -323,13 +324,6 @@ elif python3 tools/memo.py available; then
   if [ "$fresh" = 1 ] || [ "$long" = 1 ]; then memo=fresh; else memo=on; fi
 else
   echo "  test memo unavailable (requires strace and mount namespaces); running every gate test"
-fi
-if [ -n "${WRELA_GATE_MEMO:-}" ] && [ "$WRELA_GATE_MEMO" != off ]; then
-  memo_dir=$WRELA_GATE_MEMO
-elif [ -d /mnt/project-files ] && [ -w /mnt/project-files ]; then
-  memo_dir=/mnt/project-files/.gate-memo
-else
-  memo_dir="${CARGO_TARGET_DIR:-target}/gate-memo"
 fi
 
 step "tests, on the CPU and the GPU, but the long ones and the measurements$( [ -n "${WRELA_SOFTWARE_GPU:-}" ] && [ "${#heavy_tests[@]}" -gt 0 ] && echo " (on this software GPU, the ${#heavy_tests[@]} heavy ones are long: tools/check.sh --long <name> runs one)"), with bounded CPU workers$( [ "$memo" != off ] && echo " (each slow test alone, the longest first$( [ "$memo" = on ] && echo ", unless it passed with the same inputs before"))"); beside them, the doc tests and the WGSL size budgets (every example's, sketch's and lens's pipelines)"
@@ -341,7 +335,7 @@ tests=0
 if [ "$memo" = off ]; then
   run_tests --include-ignored "${skips[@]}" || tests=1
 else
-  python3 tools/memo.py run "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "$memo" "$memo_dir" \
+  python3 tools/memo.py run "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "$memo" auto \
     --include-ignored "${skips[@]}" || tests=1
 fi
 side_results

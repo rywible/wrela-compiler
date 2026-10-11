@@ -328,5 +328,60 @@ print(escaped, len(memo.under(os.getpid())))
         self.assertEqual(out.split(), ["2", "0"])
 
 
+class Shared(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp)
+
+    def test_the_store_is_the_variables_else_this_machines_kept_with_the_projects(self):
+        folder = os.path.join(self.tmp, "project")
+        self.assertEqual(memo.stores({"WRELA_GATE_MEMO": "/m", "WRELA_SHARED_FOLDER": self.tmp}), ("/m", None))
+        self.assertEqual(memo.stores({"WRELA_SHARED_FOLDER": folder, "CARGO_TARGET_DIR": "/t"}),
+                         ("/t/gate-memo", None))
+        os.mkdir(folder)
+        own, shared = memo.stores({"WRELA_SHARED_FOLDER": folder})
+        self.assertEqual(shared, os.path.join(folder, ".gate-memo"))
+        self.assertTrue(own.startswith(os.path.expanduser("~")), own)
+
+    def test_a_sync_copies_what_is_new_or_newer_with_its_time_and_nothing_else(self):
+        src, dst = os.path.join(self.tmp, "src"), os.path.join(self.tmp, "dst")
+
+        def put(root, rel, text, when):
+            path = os.path.join(root, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write(text)
+            os.utime(path, (when, when))
+
+        put(src, "v1/entries/a/b/new.json", "new", 1000)
+        put(src, "v1/timings/t.json", "newer", 2000)
+        put(dst, "v1/timings/t.json", "older", 1000)
+        put(src, "v1/timings/u.json", "older", 1000)
+        put(dst, "v1/timings/u.json", "newer", 2000)
+        put(src, "v1/timings/half.json.1-2.tmp", "half", 3000)
+        self.assertEqual(memo.sync(src, dst, self.tmp), 2)
+        read = lambda rel: open(os.path.join(dst, rel)).read()
+        self.assertEqual((read("v1/entries/a/b/new.json"), read("v1/timings/t.json"),
+                          read("v1/timings/u.json")), ("new", "newer", "newer"))
+        self.assertEqual(os.path.getmtime(os.path.join(dst, "v1/timings/t.json")), 2000)
+        self.assertFalse(os.path.exists(os.path.join(dst, "v1/timings/half.json.1-2.tmp")))
+        self.assertEqual(memo.sync(src, dst, self.tmp), 0, "nothing new the second time")
+
+    def test_one_sync_of_the_same_two_at_a_time(self):
+        import fcntl
+        src, dst = os.path.join(self.tmp, "src"), os.path.join(self.tmp, "dst")
+        os.makedirs(os.path.join(src, "v1"))
+        with open(os.path.join(src, "v1", "x.json"), "w") as f:
+            f.write("x")
+        memo.sync(src, dst, self.tmp)  # makes the lock's file
+        lock = [n for n in os.listdir(self.tmp) if n.startswith(".sync-")]
+        self.assertEqual(len(lock), 1)
+        os.remove(os.path.join(dst, "v1", "x.json"))
+        with open(os.path.join(self.tmp, lock[0]), "w") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.assertEqual(memo.sync(src, dst, self.tmp), 0)
+        self.assertEqual(memo.sync(src, dst, self.tmp), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

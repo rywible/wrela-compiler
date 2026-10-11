@@ -200,6 +200,12 @@ def cloud(root, source):
         with open(path, "a", encoding="utf-8") as f:
             for key, value in env.items():
                 f.write(f"export {key}={shlex.quote(value)}\n")
+    # The gate's memory: what the project's other machines learned comes to this one's copy.
+    try:
+        subprocess.run([sys.executable, os.path.join(root, "tools", "memo.py"), "pull"], cwd=root,
+                       env={**os.environ, **env}, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
     provisioned = subprocess.run([script, "--check"]).returncode == 0
     if source != "startup" and provisioned:
         return CLOUD.format(warm="")
