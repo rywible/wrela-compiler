@@ -19,9 +19,10 @@
 //! changed, and the labels no longer run are listed.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
+use wrela_abi::input::Scripted;
 use wrela_host::{GpuTiming, Host, Options, Timing};
 
 struct Args {
@@ -88,17 +89,20 @@ impl Times {
     }
 }
 
-/// An earlier report (`--json`) that this one is compared with: how it ran, and its medians.
-struct Baseline {
-    frames: u64,
-    size: (u64, u64),
+/// An earlier report (`--json`): how it ran, and its medians. `--baseline` compares a run with
+/// one; `wrela estimate --pair` reads an M4's.
+pub(crate) struct Baseline {
+    pub(crate) frames: u64,
+    pub(crate) size: (u64, u64),
+    /// Whether it ran with `--serial`.
+    pub(crate) serial: bool,
     span: Option<f64>,
     frame: Option<f64>,
-    labels: BTreeMap<String, f64>,
+    pub(crate) labels: BTreeMap<String, f64>,
 }
 
 impl Baseline {
-    fn read(path: &std::path::Path) -> Result<Baseline, String> {
+    pub(crate) fn read(path: &std::path::Path) -> Result<Baseline, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -113,6 +117,7 @@ impl Baseline {
         Ok(Baseline {
             frames: v["frames"].as_u64().unwrap_or(0),
             size: (v["size"][0].as_u64().unwrap_or(0), v["size"][1].as_u64().unwrap_or(0)),
+            serial: v["serial"] == serde_json::Value::Bool(true),
             span: v["gpu"]["span_ms"].as_f64(),
             frame: v["cpu"]["frame_ms"].as_f64(),
             labels,
@@ -146,11 +151,19 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-fn profile(a: &Args) -> Result<Profile, String> {
-    let out = wrela_driver::build(&a.dir);
-    let built = a.dir.join("build").join("profile");
+/// A package built as `wrela build` builds it (into `build/<into>`) and loaded on the native
+/// host with `options`, not yet initialized, with its input script (`--input`) read: what
+/// `profile` and `estimate` run their frames on.
+pub(crate) fn load(
+    dir: &Path,
+    into: &str,
+    input: Option<&Path>,
+    options: &Options,
+) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
+    let out = wrela_driver::build(dir);
+    let built = dir.join("build").join(into);
     crate::write_build(&out, &built)?;
-    let script = match &a.input {
+    let script = match input {
         Some(p) => {
             let text = std::fs::read_to_string(p)
                 .map_err(|e| format!("can't read {}: {e}", p.display()))?;
@@ -158,9 +171,14 @@ fn profile(a: &Args) -> Result<Profile, String> {
         }
         None => Vec::new(),
     };
+    let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
+    Ok((host, script, built))
+}
+
+fn profile(a: &Args) -> Result<Profile, String> {
     let timing = if a.serial { Timing::Serial } else { Timing::Span };
     let options = Options { timing, quiet: true, defer_init: true, ..Options::default() };
-    let mut host = Host::load_with(&built, &options).map_err(|e| e.to_string())?;
+    let (mut host, script, built) = load(&a.dir, "profile", a.input.as_deref(), &options)?;
     host.init().map_err(|e| format!("in `init`: {e}"))?;
     let (w, h) = a.size;
     let mut calls = Vec::with_capacity(a.frames as usize);
@@ -229,7 +247,7 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
 
 /// The `p`th percentile of `xs`, by nearest rank: the smallest value that at least `p`% of
 /// them are at or under (of 120 frames, the 95th is the seventh slowest).
-fn percentile(xs: &[f64], p: u32) -> Option<f64> {
+pub(crate) fn percentile(xs: &[f64], p: u32) -> Option<f64> {
     let mut xs = xs.to_vec();
     xs.sort_by(f64::total_cmp);
     let rank = (xs.len() * p as usize).div_ceil(100);

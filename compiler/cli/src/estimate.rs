@@ -31,10 +31,11 @@
 //! `--size` and `--input`, and `--skip 0` here) and prints calibration points instead of a
 //! report: each label's M4 median beside its typical features here, for calibration.json.
 
+use crate::profile::{Baseline, percentile};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use wrela_host::{GpuTiming, GpuWork, Host, Options, Timing};
+use wrela_host::{GpuTiming, GpuWork, Options, Timing};
 
 struct Args {
     dir: PathBuf,
@@ -233,17 +234,6 @@ struct Measured {
 }
 
 fn measure(a: &Args) -> Result<Measured, String> {
-    let out = wrela_driver::build(&a.dir);
-    let built = a.dir.join("build").join("estimate");
-    crate::write_build(&out, &built)?;
-    let script = match &a.input {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("can't read {}: {e}", p.display()))?;
-            wrela_abi::input::parse_script(&text)?
-        }
-        None => Vec::new(),
-    };
     let options = Options {
         timing: Timing::Serial,
         counts: true,
@@ -251,7 +241,8 @@ fn measure(a: &Args) -> Result<Measured, String> {
         defer_init: true,
         ..Options::default()
     };
-    let mut host = Host::load_with(&built, &options).map_err(|e| e.to_string())?;
+    let (mut host, script, _) =
+        crate::profile::load(&a.dir, "estimate", a.input.as_deref(), &options)?;
     let adapter = host.adapter();
     host.init().map_err(|e| format!("in `init`: {e}"))?;
     let (w, h) = a.size;
@@ -299,35 +290,16 @@ fn work_json(a: &Args, m: &Measured) -> serde_json::Value {
 }
 
 /// An M4 profile (`wrela profile --serial --json`): each label's median ms, and how it ran.
-struct Profile {
-    frames: u64,
-    size: (u64, u64),
-    labels: Vec<(String, f64)>,
-}
-
-fn read_profile(path: &std::path::Path) -> Result<Profile, String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
-    let v: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("{} isn't a `wrela profile --json` report: {e}", path.display()))?;
-    if v["serial"] != serde_json::Value::Bool(true) {
+fn read_profile(path: &std::path::Path) -> Result<Baseline, String> {
+    let p = Baseline::read(path)?;
+    if !p.serial {
         return Err(format!("{} wasn't run with --serial", path.display()));
     }
-    let labels = v["gpu"]["labels"]
-        .as_array()
-        .ok_or_else(|| format!("{} has no `gpu.labels`", path.display()))?
-        .iter()
-        .filter_map(|l| Some((l["label"].as_str()?.to_string(), l["median_ms"].as_f64()?)))
-        .collect();
-    Ok(Profile {
-        frames: v["frames"].as_u64().unwrap_or(0),
-        size: (v["size"][0].as_u64().unwrap_or(0), v["size"][1].as_u64().unwrap_or(0)),
-        labels,
-    })
+    Ok(p)
 }
 
 /// Calibration points: each label the profile and this run share, run in most frames here.
-fn pair_points(a: &Args, m: &Measured, p: &Profile) -> serde_json::Value {
+fn pair_points(a: &Args, m: &Measured, p: &Baseline) -> serde_json::Value {
     if p.frames != u64::from(a.frames) || p.size != (u64::from(a.size.0), u64::from(a.size.1)) {
         eprintln!(
             "warning: the profile ran {} frames at {}×{}; this, {} at {}×{}",
@@ -531,6 +503,13 @@ pub(crate) fn leave_one_out(c: &Calibration) -> Vec<(String, f64, f64)> {
         .collect()
 }
 
+/// The leave-one-out relative errors' sizes: their median, and the largest.
+fn error(checks: &[(String, f64, f64)]) -> (f64, f64) {
+    let mut errs: Vec<f64> = checks.iter().map(|(_, r, p)| ((p - r) / r).abs()).collect();
+    errs.sort_by(f64::total_cmp);
+    (errs.get(errs.len() / 2).copied().unwrap_or(0.0), errs.last().copied().unwrap_or(0.0))
+}
+
 /// A report: the model, its error, and each label's and the frame's estimate.
 struct Report {
     model: Model,
@@ -562,22 +541,18 @@ impl Report {
         let all: Vec<&Point> = c.points.iter().collect();
         let model = Model::fit(&c.terms, &all);
         let checks = leave_one_out(c);
-        let mut errs: Vec<f64> = checks.iter().map(|(_, r, p)| ((p - r) / r).abs()).collect();
-        errs.sort_by(f64::total_cmp);
-        let error =
-            (errs.get(errs.len() / 2).copied().unwrap_or(0.0), errs.last().copied().unwrap_or(0.0));
+        let error = error(&checks);
         let n = m.frames.len().max(1) as f64;
         let mut labels: Vec<LabelEstimate> = (0..m.labels.len())
             .map(|i| {
                 let ran: Vec<Features> =
                     m.frames.iter().filter_map(|f| f.get(&i).copied()).collect();
                 let t = typical(&ran);
-                let mut per: Vec<f64> = ran.iter().map(|f| model.ms(f)).collect();
-                per.sort_by(f64::total_cmp);
+                let per: Vec<f64> = ran.iter().map(|f| model.ms(f)).collect();
                 LabelEstimate {
                     name: m.labels[i].clone(),
                     ms: model.ms(&t),
-                    p95: percentile(&per, 95),
+                    p95: percentile(&per, 95).unwrap_or(0.0),
                     lvp_ms: t.lvp_ms,
                     share: ran.len() as f64 / n,
                 }
@@ -596,14 +571,13 @@ impl Report {
             })
             .collect();
         let t = typical(&totals);
-        let mut per: Vec<f64> = totals.iter().map(|f| model.ms(f)).collect();
-        per.sort_by(f64::total_cmp);
+        let per: Vec<f64> = totals.iter().map(|f| model.ms(f)).collect();
         let ratios = c.chrome.iter().map(|(_, r)| *r);
         let chrome = (!c.chrome.is_empty())
             .then(|| ratios.fold((f64::INFINITY, 0.0f64), |(lo, hi), r| (lo.min(r), hi.max(r))));
         let here = machine();
         Report {
-            frame: (model.ms(&t), percentile(&per, 95)),
+            frame: (model.ms(&t), percentile(&per, 95).unwrap_or(0.0)),
             lvp_frame: t.lvp_ms,
             model,
             error,
@@ -708,14 +682,6 @@ impl Report {
     }
 }
 
-/// The `p`th percentile of sorted `xs`, by nearest rank.
-fn percentile(xs: &[f64], p: usize) -> f64 {
-    if xs.is_empty() {
-        return 0.0;
-    }
-    xs[(xs.len() * p).div_ceil(100).max(1) - 1]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +711,21 @@ mod tests {
         for (name, recorded, predicted) in leave_one_out(&c) {
             assert!((recorded - predicted).abs() < 1e-9, "{name}: {predicted} for {recorded}");
         }
+    }
+
+    /// The shipped calibration parses and gives the model and the error that language.md and
+    /// the report's readers were told: lavapipe's time alone, about 1/137 of it; leave-one-out
+    /// error median 21%, worst 69%. A new calibration changes these on purpose, here and there.
+    #[test]
+    fn the_shipped_calibration_gives_the_model_it_claims() {
+        let c = Calibration::parse(CALIBRATION).expect("calibration.json parses");
+        assert!(c.points.len() >= 10, "{} points", c.points.len());
+        let model = Model::fit(&c.terms, &c.points.iter().collect::<Vec<_>>());
+        let lvp_ms = FEATURES.iter().position(|f| *f == "lvp_ms").expect("a feature");
+        let lvp = c.terms.iter().position(|&t| t == lvp_ms).expect("lavapipe's time is a term");
+        assert_eq!((1.0 / model.weights[lvp]).round(), 137.0, "{:?}", model.weights);
+        let (median, worst) = error(&leave_one_out(&c));
+        assert_eq!(((median * 100.0).round(), (worst * 100.0).round()), (21.0, 69.0));
     }
 
     /// A weight the points would make negative is held at zero, and the rest refit.
