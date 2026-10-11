@@ -45,7 +45,7 @@ fn both_hosts_render_the_same_samples() {
 }
 
 /// engine::sound's mixer at its busiest (compiler/tests/mixer: the listener, the wind, four
-/// waters, both brushes, four steps, two impacts and two whooshes, all sounding): a second from
+/// waters, three brushes, four steps, two impacts and two whooshes, all sounding): a second from
 /// the native host.
 fn mixed(dir: &std::path::Path) -> Vec<f32> {
     let mut host = CpuBuild::load(dir).expect("load").start_with(1).expect("start");
@@ -77,7 +77,7 @@ fn the_mixer_mixes_the_same_samples_every_time() {
     assert_eq!(hash.hex(), MIXED_HASH);
 }
 
-const MIXED_HASH: &str = "de6dadb9571faaa1";
+const MIXED_HASH: &str = "6f33c8535e5a87db";
 
 /// Chrome's AudioWorklet, rendering the mixer offline, gives the native host's samples, bit for
 /// bit; and at its busiest it takes under a quarter of a core.
