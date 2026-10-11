@@ -1,0 +1,257 @@
+#!/usr/bin/env python3
+"""Small source worktrees, one scheduled Cargo cache, and safe disposable-output cleanup.
+
+    python3 tools/worktrees.py create NAME [--ref main]
+    python3 tools/worktrees.py status
+    python3 tools/worktrees.py remove NAME
+    python3 tools/worktrees.py prune [--build-cache]
+    python3 tools/worktrees.py env
+
+No build tree or node_modules is copied when creating a session. Removal refuses dirty trees
+and branches with commits not in main. Prune never deletes a worktree, source, or capture.
+"""
+
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+
+GIB = 1024**3
+MIN_FREE = 12 * GIB
+CACHE_BUDGET = 20 * GIB
+
+
+def common_dir(cwd):
+    result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            cwd=cwd, capture_output=True, text=True)
+    return Path(result.stdout.strip()) if result.returncode == 0 else None
+
+
+def environment(cwd):
+    common = common_dir(cwd)
+    if common is None:
+        return {"CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(Path(cwd) / "target"))}
+    cache = common / "wrela/cache"
+    # Explicit custom targets remain useful for fixtures and deliberate cold measurements.
+    return {"CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(cache / "cargo")),
+            "WRELA_NATIVE_CACHE": os.environ.get("WRELA_NATIVE_CACHE", str(cache / "native")),
+            "WRELA_CONST_CACHE": os.environ.get("WRELA_CONST_CACHE", str(cache / "const"))}
+
+
+def allocated(path):
+    """Allocated bytes, counting hard links once and never traversing symlinks."""
+    seen, total = set(), 0
+    for root, directories, files in os.walk(path):
+        directories[:] = [d for d in directories if not (Path(root) / d).is_symlink()]
+        for name in files:
+            try:
+                stat = (Path(root) / name).lstat()
+            except FileNotFoundError:
+                continue
+            key = stat.st_dev, stat.st_ino
+            if key not in seen:
+                seen.add(key)
+                total += stat.st_blocks * 512
+    return total
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def prune_scratch(root, now=None):
+    """Only failed/abandoned test scratch, after six hours and its owner has exited."""
+    now = time.time() if now is None else now
+    for path in Path(root).glob("test-scratch-*"):
+        if path.is_symlink() or not path.is_dir() or now - path.stat().st_mtime <= 6 * 3600:
+            continue
+        try:
+            if _alive(int((path / ".owner").read_text())):
+                continue
+        except (FileNotFoundError, ValueError):
+            # Old scratch without ownership is retained: age alone isn't an ownership proof.
+            continue
+        shutil.rmtree(path)
+
+
+def maintain(cwd, clear_build=False):
+    common = common_dir(cwd)
+    target = Path(environment(cwd)["CARGO_TARGET_DIR"])
+    target.mkdir(parents=True, exist_ok=True)
+    if common:
+        cache = common / "wrela/cache"
+        cache.mkdir(parents=True, exist_ok=True)
+        if clear_build:
+            cargo = cache / "cargo"
+            if cargo.exists():
+                shutil.rmtree(cargo)
+            cargo.mkdir()
+        # Shared content-keyed caches can be regenerated; captured evidence isn't a cache.
+        cutoff = time.time() - 7 * 86400
+        for directory in (cache / "native", cache / "const"):
+            if directory.is_symlink():
+                raise ValueError(f"cache directory must not be a symlink: {directory}")
+            for path in directory.glob("*"):
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                    path.unlink()
+        cargo = cache / "cargo"
+        # Incremental state is disposable, and costs less to rebuild than all dependencies.
+        if allocated(cache) > CACHE_BUDGET or shutil.disk_usage(target).free < MIN_FREE:
+            for path in cargo.glob("**/incremental"):
+                if path.is_dir() and not path.is_symlink():
+                    shutil.rmtree(path)
+        if allocated(cache) > CACHE_BUDGET:
+            raise ValueError("shared caches exceed 20 GiB; run tools/worktrees.py prune --build-cache")
+    prune_scratch(Path(cwd) / "target")
+    if shutil.disk_usage(target).free < MIN_FREE:
+        raise ValueError("less than 12 GiB free; inspect tools/worktrees.py status and prune disposable build output")
+
+
+def _registry(common):
+    path = common / "wrela/worktrees.json"
+    return path, json.loads(path.read_text()) if path.exists() else {}
+
+
+def _save(path, registry):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(f".{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(registry, indent=2) + "\n")
+    temporary.replace(path)
+
+
+@contextmanager
+def registry_lock(cwd):
+    common = common_dir(cwd)
+    if common is None:
+        raise ValueError("worktrees require a Git repository")
+    directory = common / "wrela"
+    directory.mkdir(exist_ok=True)
+    with open(directory / "worktrees.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def create(cwd, name, ref="main"):
+    with registry_lock(cwd):
+        return _create(cwd, name, ref)
+
+
+def _create(cwd, name, ref):
+    if not re.fullmatch(r"[a-z][a-z0-9-]{0,47}", name):
+        raise ValueError("use a lowercase name of up to 48 letters, digits and hyphens")
+    common = common_dir(cwd)
+    if common is None:
+        raise ValueError("worktrees require a Git repository")
+    path, registry = _registry(common)
+    if name in registry or len(registry) >= 10:
+        raise ValueError("name already exists or ten session worktrees are registered")
+    if shutil.disk_usage(common).free < MIN_FREE:
+        raise ValueError("less than 12 GiB free; prune disposable output before creating a worktree")
+    # Outside every checkout, and separate from Git's own worktree metadata.
+    root = common.parent.parent / f".{common.parent.name}-sessions"
+    root.mkdir(exist_ok=True)
+    destination = root / name
+    branch = f"codex/{name}"
+    subprocess.run(["git", "worktree", "add", "-b", branch, str(destination), ref], cwd=cwd, check=True)
+    registry[name] = {"path": str(destination), "branch": branch, "created": time.time()}
+    _save(path, registry)
+    return destination
+
+
+def remove(cwd, name):
+    with registry_lock(cwd):
+        _remove(cwd, name)
+
+
+def _remove(cwd, name):
+    common = common_dir(cwd)
+    if common is None:
+        raise ValueError("worktrees require a Git repository")
+    path, registry = _registry(common)
+    if name not in registry:
+        raise ValueError("only worktrees created by this tool can be removed")
+    item = registry[name]
+    destination = Path(item["path"])
+    if subprocess.check_output(["git", "status", "--porcelain"], cwd=destination).strip():
+        raise ValueError("worktree has local changes; preserve or commit them before removal")
+    ignored = subprocess.check_output(["git", "ls-files", "--others", "--ignored", "--exclude-standard", "-z"], cwd=destination)
+    for ignored_name in ignored.split(b"\0"):
+        if not ignored_name:
+            continue
+        relative = Path(os.fsdecode(ignored_name))
+        if "node_modules" in relative.parts:
+            continue
+        if len(relative.parts) > 1 and relative.parts[0] == "target" and relative.parts[1].startswith("test-scratch-"):
+            continue
+        raise ValueError(f"preserve ignored output before removal: {relative}")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", item["branch"], "main"], cwd=cwd).returncode:
+        raise ValueError("worktree has commits not in main; merge or preserve its branch before removal")
+    from jobs import entries, locked
+    from resources import resource_dir
+    resources = resource_dir()
+    with locked(resources):
+        if any(Path(job["cwd"]).resolve().is_relative_to(destination.resolve()) for job in entries(resources)):
+            raise ValueError("worktree has queued or running jobs")
+        subprocess.run(["git", "worktree", "remove", str(destination)], cwd=cwd, check=True)
+        registry.pop(name)
+        _save(path, registry)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="action", required=True)
+    creation = sub.add_parser("create")
+    creation.add_argument("name")
+    creation.add_argument("--ref", default="main")
+    removal = sub.add_parser("remove")
+    removal.add_argument("name")
+    cleanup = sub.add_parser("prune")
+    cleanup.add_argument("--build-cache", action="store_true")
+    sub.add_parser("status")
+    sub.add_parser("env")
+    args = parser.parse_args()
+    cwd = os.getcwd()
+    if args.action == "env":
+        for key, value in environment(cwd).items():
+            print(f"export {key}={shlex.quote(value)}")
+    elif args.action == "create":
+        print(create(cwd, args.name, args.ref))
+    elif args.action == "remove":
+        remove(cwd, args.name)
+    elif args.action == "prune":
+        from jobs import admitted, run
+        if not admitted():
+            return run("background", [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]], maintenance=False)
+        maintain(cwd, args.build_cache)
+    else:
+        common = common_dir(cwd)
+        if common:
+            print(f"shared caches: {allocated(common / 'wrela/cache') / GIB:.2f} GiB / 20 GiB")
+            worktrees = subprocess.check_output(["git", "worktree", "list", "--porcelain"], cwd=cwd).decode()
+            for line in worktrees.splitlines():
+                if line.startswith("worktree "):
+                    root = Path(line[9:])
+                    print(f"{root}: local target {allocated(root / 'target') / GIB:.2f} GiB")
+        print(f"free: {shutil.disk_usage(cwd).free / GIB:.1f} GiB (12 GiB admission reserve)")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+        sys.exit(f"worktrees: {error}")

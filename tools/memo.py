@@ -283,7 +283,7 @@ class Inputs:
         self.root = os.path.realpath(root)
         home = os.path.expanduser("~")
         self.ignore = [os.path.realpath(p) for p in (
-            target, "/proc", "/sys", "/dev", "/tmp", "/run", "/var/tmp",
+            target, os.path.join(self.root, "target"), "/proc", "/sys", "/dev", "/tmp", "/run", "/var/tmp",
             os.path.join(home, ".cache"), os.environ.get("TMPDIR") or "/tmp", *ignore)]
 
     def kept(self, path):
@@ -339,7 +339,7 @@ ENV_NAMES = [
 # Variables the GPU's driver and the Rust runtime read, by prefix.
 ENV_PREFIXES = ("LP_", "GALLIVM_", "MESA_", "VK_", "LIBGL_", "WGPU_", "RUST_MIN_STACK")
 # Variables the gate sets per run (a log's path, a cache's), not inputs.
-ENV_NOT = {"WRELA_GPU_WAITS", "WRELA_NATIVE_CACHE", "WRELA_GATE_MEMO", "WRELA_BUILD_RECORD"}
+ENV_NOT = {"WRELA_GPU_WAITS", "WRELA_NATIVE_CACHE", "WRELA_GATE_MEMO", "WRELA_BUILD_RECORD", "WRELA_JOB_ID"}
 
 
 def env_names(texts):
@@ -973,9 +973,9 @@ class Rebuilds:
     def prefetch(self, builds):
         """Makes `builds` ((package, args) pairs) not yet made, as many at once as there are cores."""
         from concurrent.futures import ThreadPoolExecutor
-        from resources import cpu_count
+        from resources import worker_count
         todo = sorted({(p, tuple(a)) for p, a in builds} - set(self.known))
-        with ThreadPoolExecutor(max_workers=cpu_count()) as pool:
+        with ThreadPoolExecutor(max_workers=worker_count()) as pool:
             for key, h in zip(todo, pool.map(lambda k: self.make(k[0], list(k[1])), todo)):
                 self.known[key] = h
 
@@ -1222,11 +1222,12 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
     memo = Memo(root, target, dir, cli)
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import runner
-    from resources import cpu_count
+    from resources import worker_count
 
-    cores = cpu_count()
+    cores = min(worker_count(), max(1, int(os.environ.get("WRELA_TEST_PROGRAMS", "1"))))
     # Each slow test's scratch directory (its target/tmp), kept after a failure to look at.
-    alone_root = os.path.join(target, "tmp-alone")
+    scratch_root = runner.scratch_root()
+    alone_root = os.path.join(scratch_root, "tmp-alone")
     shutil.rmtree(alone_root, ignore_errors=True)
 
     def env_for(pkg):
@@ -1234,6 +1235,7 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         # its own in its mount namespace).
         return {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache,
                 "WRELA_GPU_SHARED": str(runner.gpu_shared(cores)),
+                "WRELA_TEST_TMPDIR": os.path.join(scratch_root, "tmp"),
                 "WRELA_GPU_WAITS": f"{logs}/gpu-waits"}
 
     def listed(exe, pkg, more):
@@ -1269,7 +1271,7 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
     # RUSTC_BOOTSTRAP). They start now, while the slow tests' memory is looked up beside them.
     # This bounds processes, not every thread: runner.start keeps up to four test threads in
     # each program, so work can continue while a test waits for its shared GPU slot.
-    runs, scratch_root = [], runner.scratch_root()
+    runs = []
     scratches = {}
     quick = [p for p in sorted(split_programs, key=lambda p: not runner.is_first(p[0])) if p[6]]
 
@@ -1319,7 +1321,7 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         log = f"{logs}/trace-{i}"
         out = open(f"{logs}/alone-{i}", "w+")
         record = f"{logs}/builds-{i}.jsonl"
-        proc = subprocess.Popen(isolated_command(exe, n, scratch, os.path.join(target, "tmp"), log),
+        proc = subprocess.Popen(isolated_command(exe, n, scratch, os.path.join(scratch_root, "tmp"), log),
                                 cwd=pkg, env={**env_for(pkg), "WRELA_BUILD_RECORD": record},
                                 stdout=out, stderr=subprocess.STDOUT)
         started[test_id] = (n, program_dir, log, scratch, record)

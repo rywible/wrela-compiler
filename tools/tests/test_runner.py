@@ -113,6 +113,7 @@ class MemoWorkers(unittest.TestCase):
                 fake = types.SimpleNamespace(store=store, remember=lambda *a: "crates")
 
                 def isolate(exe, name, scratch, tmp, trace):
+                    self.assertEqual(pathlib.Path(tmp), root / "tmp")
                     pathlib.Path(scratch).mkdir(parents=True)
                     pathlib.Path(trace).write_text("")
                     return [exe, "--exact", name]
@@ -133,7 +134,7 @@ class MemoWorkers(unittest.TestCase):
 
     def test_rebuild_prefetch_respects_cpu_limits_and_deduplicates_work(self):
         rebuilds = memo.Rebuilds("unused", "/", "/tmp/unused")
-        with patch.object(resources, "cpu_count", return_value=3), \
+        with patch.object(resources, "worker_count", return_value=3), \
              patch("concurrent.futures.ThreadPoolExecutor") as pool, \
              patch.object(rebuilds, "make", return_value="hash"):
             pool.return_value.__enter__.return_value.map.side_effect = lambda f, items: map(f, items)

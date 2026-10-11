@@ -130,9 +130,14 @@ impl Options {
 }
 
 /// The threads a program's parallel jobs run on by default: one per core, at most
-/// `wrela_abi::memory::MAX_WORKERS + 1`.
+/// `wrela_abi::memory::MAX_WORKERS + 1`, bounded by an admitted job's `WRELA_CPU_WORKERS`.
 pub fn default_workers() -> u32 {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
+    let cores = std::env::var("WRELA_CPU_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map_or(cores, |n| cores.min(n));
     cores.min(wrela_abi::memory::MAX_WORKERS + 1)
 }
 

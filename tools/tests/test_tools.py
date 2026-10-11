@@ -79,6 +79,7 @@ class HeadlessTest(PageDir, unittest.TestCase):
         env = {
             **inherited,
             "TMPDIR": self.tmp,
+            "WRELA_RESOURCE_DIR": os.path.join(self.tmp, "resources"),
             "WRELA_CHROME": os.path.join(TESTS, "fake_chrome.py"),
             "FAKE_MODE": mode,
             "FAKE_CHILD_PID": self.child_pid_file,

@@ -34,8 +34,8 @@
 #                           a focused check that builds only the selected crate's tests and
 #                           dependencies; repeat --package to select more crates. --long and
 #                           --nocapture apply as above. This does not replace the merge gate.
-#   tools/check.sh --fmt    formats what the gate checks: rustfmt, and `wrela fmt` with the CLI
-#                           as last built (tools/hooks.py runs it before the gate).
+#   tools/check.sh --fmt    formats what the gate checks: rustfmt, then the current checkout's
+#                           rebuilt `wrela fmt` (tools/hooks.py runs it before the gate).
 #
 # Needs: the Rust toolchain in rust-toolchain.toml, bun, python3, a GPU; Chrome stable for --long.
 # A cloud machine can use software Vulkan (tools/cloud.sh); set WRELA_SOFTWARE_GPU=1 so the
@@ -43,7 +43,7 @@
 # pixel/buffer comparisons still execute their real shaders.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(python3 tools/resources.py)}"
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 
 # The gate runs everything, the same way each time: a variable that narrows the tests, rewrites
 # goldens or picks a fuzz seed (left set in the shell by an earlier run) doesn't apply here.
@@ -80,6 +80,10 @@ if { [ "${#packages[@]}" -gt 0 ] && { [ "$full" = 1 ] || [ "$fresh" = 1 ] || [ "
   exit 2
 fi
 
+if ! python3 tools/jobs.py admitted; then
+  exec python3 tools/jobs.py check "$@"
+fi
+
 step() { printf '\n== %s\n' "$*"; }
 
 # wrela sources the formatter owns. The conformance and diagnostics cases aren't here: some
@@ -88,17 +92,18 @@ WRELA_SOURCES=(examples engine compiler/std compiler/tests/fields compiler/tests
   compiler/tests/numerics compiler/tests/render compiler/tests/queries compiler/tests/simd
   compiler/tests/input compiler/tests/lift compiler/tests/texels compiler/tests/shader_params compiler/tests/unroll ui studio)
 
-# Formats what the gate checks, and names what it changed. `wrela fmt` is the CLI as last built:
-# the gate builds it afresh and checks again.
+# Formats what the gate checks, and names what it changed, with the selected checkout's CLI.
 if [ "$fmt" = 1 ]; then
   cargo fmt --all -- -l
+  cargo build -q --release -p wrela --bin wrela
   wrela="${CARGO_TARGET_DIR:-target}/release/wrela"
   if [ -x "$wrela" ]; then
     # The files it would change, on stdout (its count is on stderr); then only those, formatted.
     changed=$("$wrela" fmt --check "${WRELA_SOURCES[@]}" 2>/dev/null || true)
     if [ -n "$changed" ]; then
       printf '%s\n' "$changed"
-      mapfile -t files <<< "$changed"
+      files=()
+      while IFS= read -r file; do files+=("$file"); done <<< "$changed"
       "$wrela" fmt "${files[@]}"
     fi
   fi
@@ -145,22 +150,22 @@ tools_tests() {
   python3 tools/runner.py --tools-tests
 }
 
-# Runs at most one test program per available CPU, each with `args` (its tests filtered and
+# Runs one test program at a time, each with `args` (its tests filtered and
 # skipped), as tools/runner.py starts it (tools/memo.py's quick runs too). Prints each one's time and each failure's
-# output (with --nocapture, each that ran a test), and fails if no test ran. Up to four GPU
+# output (with --nocapture, each that ran a test), and fails if no test ran. Two GPU
 # tests share the GPU at a time: they check what the GPU computes, not how long it takes (the
 # measurements run alone, below). A program that waits for another process's hold on the GPU
 # notes how long in `gpu-waits` (`WRELA_GPU_WAITS`), for the gate's budget.
 run_tests() { # args...
-  python3 - "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "$@" <<'PY'
+  python3 - "$logs" "${WRELA_NATIVE_CACHE:-${CARGO_TARGET_DIR:-target}/native-cache}" "$@" <<'PY'
 import concurrent.futures, json, os, re, shutil, subprocess, sys, time
 sys.path.insert(0, "tools")
-from resources import cpu_count
+from resources import worker_count
 import runner
 logs, native_cache, *args = sys.argv[1:]
 native_cache = os.path.abspath(native_cache)
 scratch_root = runner.scratch_root()
-cores = cpu_count()
+cores = worker_count()
 programs = []
 for line in open(f"{logs}/tests.json"):
     m = json.loads(line)
@@ -178,7 +183,7 @@ def run(index, m):
         shutil.rmtree(scratch, ignore_errors=True)
     return runner.name_of(m), proc.returncode, text, time.monotonic() - start, scratch
 failed, ran = False, 0
-with concurrent.futures.ThreadPoolExecutor(max_workers=cores) as pool:
+with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
     waiting = [pool.submit(run, i, m) for i, m in enumerate(runner.in_order(programs))]
     for future in concurrent.futures.as_completed(waiting):
         name, code, text, took, scratch = future.result()
@@ -228,17 +233,20 @@ if [ "${#filters[@]}" -gt 0 ] || [ "${#packages[@]}" -gt 0 ]; then
   exit 0
 fi
 
-step "build the tests (release); beside it, rustfmt, clippy (warnings are errors), the tools' tests and the browser runtime's (tests, types, dist is current, size budget)"
+step "build the tests (release); then formatting, lints, tools and browser checks"
 started=$SECONDS
 side rustfmt cargo fmt --all -- --check
-side clippy cargo clippy -q --workspace --all-targets -- -D warnings
-side tools tools_tests
-side bun sh -c 'cd runtime/browser && bun run checks'
 # The CLI is built with the tests, which run it. (A `cargo build -p wrela` beside this build
 # would build the compiler's crates a second time: without the tests' dev-dependencies, some
 # of their dependencies' features differ.)
 cargo test -q --release --workspace --no-run --message-format=json > "$logs/tests.json"
 wrela="${CARGO_TARGET_DIR:-target}/release/wrela"
+tests=0
+side_results
+cargo clippy -q --workspace --all-targets -- -D warnings
+tools_tests
+(cd runtime/browser && bun run checks)
+[ "$tests" = 0 ] || exit 1
 
 step "wrela fmt --check"
 "$wrela" fmt --check "${WRELA_SOURCES[@]}"
@@ -260,17 +268,18 @@ fi
 step "tests, on the CPU and the GPU, but the long ones and the measurements$( [ -n "${WRELA_SOFTWARE_GPU:-}" ] && [ "${#heavy_tests[@]}" -gt 0 ] && echo " (on this software GPU, the ${#heavy_tests[@]} heavy ones are long: tools/check.sh --long <name> runs one)"), with bounded CPU workers$( [ "$memo" != off ] && echo " (each slow test alone, the longest first$( [ "$memo" = on ] && echo ", unless it passed with the same inputs before"))"); beside them, the doc tests and the WGSL size budgets (every example's, sketch's and lens's pipelines)"
 tests_started=$SECONDS
 ps -A -o pid=,ppid=,time= > "$logs/ps-before"
-side doc cargo test -q --release --workspace --doc
 # (Each build's sizes remembered, as the slow tests are: a build that reads what it read before,
 # with the same CLI, isn't made again.)
-side wgsl python3 tools/wgsl_budgets.py "$wrela" $( [ "$memo" = on ] && echo --memo)
 tests=0
 if [ "$memo" = off ]; then
   run_tests --include-ignored "${skips[@]}" || tests=1
 else
-  python3 tools/memo.py run "$logs" "${CARGO_TARGET_DIR:-target}/native-cache" "$memo" auto \
+  python3 tools/memo.py run "$logs" "${WRELA_NATIVE_CACHE:-${CARGO_TARGET_DIR:-target}/native-cache}" "$memo" auto \
     --include-ignored "${skips[@]}" || tests=1
 fi
+side doc cargo test -q --release --workspace --doc
+side_results
+side wgsl python3 tools/wgsl_budgets.py "$wrela" $( [ "$memo" = on ] && echo --memo)
 side_results
 ps -A -o pid=,ppid=,time= > "$logs/ps-after"
 [ "$tests" = 0 ] || exit 1
@@ -293,7 +302,7 @@ if [ "$took" -gt 60 ]; then
   budget=$(python3 - "$logs" "$$" "$took" <<'PY'
 import os, sys
 sys.path.insert(0, "tools")
-from resources import cpu_count
+from resources import cpu_count, worker_count
 logs, me, took = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 def read(name):
     ps = {}
@@ -315,7 +324,7 @@ def ours(pid):
 other = sum(after[p][1] - before[p][1] for p in after if p in before and not ours(p))
 cores = cpu_count()
 busy = min(other / max(took, 1), cores - 1)
-print(f"{busy:.1f} {60 * cores / (cores - busy):.0f}")
+print(f"{busy:.1f} {60 * cores / worker_count() * cores / (cores - busy):.0f}")
 PY
 )
   busy=${budget% *}; budget=${budget#* }

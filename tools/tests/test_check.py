@@ -20,7 +20,7 @@ class FocusedCheck(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.root = pathlib.Path(temporary.name)
+        self.root = pathlib.Path(temporary.name).resolve()
         target = tempfile.TemporaryDirectory()
         self.addCleanup(target.cleanup)
         self.target = pathlib.Path(target.name)
@@ -29,7 +29,10 @@ class FocusedCheck(unittest.TestCase):
         shutil.copyfile(CHECK, self.root / "tools/check.sh")
         shutil.copyfile(TOOLS / "ignored.py", self.root / "tools/ignored.py")
         shutil.copyfile(TOOLS / "runner.py", self.root / "tools/runner.py")
-        (self.root / "tools/resources.py").write_text(textwrap.dedent("""
+        for name in ("jobs.py", "worktrees.py", "resources.py"):
+            shutil.copyfile(TOOLS / name, self.root / "tools" / name)
+        with (self.root / "tools/resources.py").open("a") as resource:
+            resource.write(textwrap.dedent("""
             import errno, os
             if os.environ.get("FAKE_LINK_ERROR"):
                 def unavailable_link(*args, **kwargs):
@@ -37,6 +40,8 @@ class FocusedCheck(unittest.TestCase):
                 os.link = unavailable_link
             def cpu_count():
                 return int(os.environ.get("FAKE_CPUS", "2"))
+            def memory_pressure():
+                return 0
             if __name__ == "__main__":
                 print(cpu_count())
         """))
@@ -78,7 +83,7 @@ class FocusedCheck(unittest.TestCase):
                 "scratch": os.environ["WRELA_TEST_TMPDIR"],
                 "cache": os.environ["WRELA_NATIVE_CACHE"],
                 "const_cache": os.environ.get("WRELA_CONST_CACHE"),
-                "threads": os.environ["RUST_TEST_THREADS"]}))
+                "threads": next(a.split("=", 1)[1] for a in args if a.startswith("--test-threads="))}))
             if os.environ.get("FAKE_REPLACE_EXECUTABLE") == "1":
                 original = root / "fake-tests"
                 original.unlink()
@@ -105,8 +110,11 @@ class FocusedCheck(unittest.TestCase):
                "FAKE_REPLACE_EXECUTABLE": "1" if replace_executable else "0",
                "FAKE_LINK_ERROR": link_error,
                "FAKE_CPUS": str(cores), "TMPDIR": str(self.root / "tmp"),
+               "WRELA_RESOURCE_DIR": str(self.root / "resources"),
+               "WRELA_CPU_WORKERS": "2",
                "WRELA_CONST_CACHE": str(self.target / "stale-const-cache"),
                "CARGO_TARGET_DIR": str(self.target)}
+        env.pop("WRELA_NATIVE_CACHE", None)
         env.pop("WRELA_SOFTWARE_GPU", None)
         if software is not None:
             env["WRELA_SOFTWARE_GPU"] = software
@@ -208,8 +216,8 @@ class FocusedCheck(unittest.TestCase):
         self.assertFalse((self.root / "test.json").exists())
 
     def test_threads_follow_cpu_limits_on_any_gpu(self):
-        for cores, software, threads in ((1, None, 1), (2, None, 2), (16, None, 4),
-                                         (16, "1", 4), (2, "1", 2), (16, "", 4)):
+        for cores, software, threads in ((1, None, 1), (2, None, 2), (16, None, 2),
+                                         (16, "1", 2), (2, "1", 2), (16, "", 2)):
             with self.subTest(cores=cores, software=software):
                 result = self.check("--package=wrela-syntax", cores=cores, software=software)
                 self.assert_focused_success(result)
@@ -239,6 +247,7 @@ class FocusedCheck(unittest.TestCase):
         old, recent = self.root / "target/test-scratch-old", self.root / "target/test-scratch-new"
         for path, age in ((old, 7 * 3600), (recent, 3600)):
             (path / "inside").mkdir(parents=True)
+            (path / ".owner").write_text("2147483647")
             then = time.time() - age
             os.utime(path, (then, then))
         self.assert_focused_success(self.check("--package=wrela-syntax", "normal_case"))

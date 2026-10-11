@@ -12,7 +12,7 @@
 #   tools/cloud.sh --check  exits 0 if this version of the script provisioned the machine.
 #   tools/cloud.sh --warm   provisions the machine if it isn't, then builds what a session
 #                           builds first, slowly (nice): the CLI, the native host and the tests,
-#                           then the floor and its bake. tools/hooks.py starts it in the background
+#                           without baking the floor. tools/hooks.py starts it in the background
 #                           at a session's start; its log is /tmp/wrela-warm.log.
 #   tools/cloud.sh --env    prints the environment a session needs (KEY=VALUE lines): that the
 #                           GPU is software (tools/check.sh reports its time budget, not gates
@@ -49,6 +49,9 @@ case "${1:-}" in
     fi
     exit 0 ;;
   --warm)
+    if ! python3 tools/jobs.py admitted; then
+      exec python3 tools/jobs.py run background --key warm -- bash tools/cloud.sh --warm
+    fi
     # Each step is what a session's first build or render would do: a step that fails leaves
     # the session to find out, as it would have.
     exec > /tmp/wrela-warm.log 2>&1
@@ -59,7 +62,6 @@ case "${1:-}" in
     # compiler's crates would build twice (without the tests' dev-dependencies, some of their
     # dependencies' features differ).
     nice -n 10 cargo test -q --release --workspace --no-run 2> /dev/null && echo "built the CLI, the host and the tests: $((SECONDS - s))s"
-    nice -n 10 target/release/wrela build examples/last-green > /dev/null && echo "built the floor: $((SECONDS - s))s"
     echo "warm: $((SECONDS - s))s"
     exit 0 ;;
   "") ;;

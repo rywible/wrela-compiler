@@ -40,6 +40,7 @@ import tempfile
 import time
 
 import serve
+from resources import gpu_locks, resource_dir
 
 CHROME = os.environ.get(
     "WRELA_CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -114,10 +115,18 @@ def take_lock(path, what, page, shared):
 
 def acquire_gpu_lock(page):
     """The locks this run holds while Chrome runs (Chrome inherits them)."""
-    if sharing():
-        chrome = take_lock(CHROME_LOCK_PATH, "the Chrome lock", page, shared=False)
-        return (chrome, take_lock(LOCK_PATH, "the GPU lock", page, shared=True))
-    return (take_lock(LOCK_PATH, "the GPU lock", page, shared=False),)
+    locks = []
+    try:
+        if sharing():
+            locks.append(take_lock(CHROME_LOCK_PATH, "the Chrome lock", page, shared=False))
+            locks.append(take_lock(str(resource_dir() / "chrome.lock"), "the global Chrome lock", page, shared=False))
+        locks.append(take_lock(LOCK_PATH, "the GPU lock", page, shared=sharing()))
+        locks.extend(gpu_locks(shared=sharing()))
+        return tuple(locks)
+    except BaseException:
+        for fd in locks:
+            os.close(fd)
+        raise
 
 
 def start_server(page, done):

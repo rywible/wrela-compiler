@@ -1,0 +1,15 @@
+#!/usr/bin/env python3
+"""Run the current checkout's CLI through the shared build/job budget."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from jobs import admitted, run
+
+os.chdir(Path(__file__).resolve().parent.parent)
+if not admitted():
+    sys.exit(run("focused", [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]))
+subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela", "-p", "wrela-host", "--bins"], check=True)
+sys.exit(subprocess.call([str(Path(os.environ["CARGO_TARGET_DIR"]) / "release/wrela"), *sys.argv[1:]]))

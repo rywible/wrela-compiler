@@ -32,7 +32,13 @@ pub fn par_map_with<T: Sync, S, R: Send>(
     f: impl Fn(&mut S, &T) -> R + Sync,
 ) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
-    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(items.len());
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let budget = std::env::var("WRELA_CPU_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(cores);
+    let threads = cores.min(budget).min(items.len());
     let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {

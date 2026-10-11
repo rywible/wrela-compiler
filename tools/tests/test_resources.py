@@ -106,6 +106,40 @@ class CpuCount(unittest.TestCase):
         ):
             self.assertEqual(resources.cpu_count(), 1)
 
+    def test_memory_quota_overrides_a_large_host_and_respects_parents(self):
+        self.hierarchy("/team/task")
+        directory = self.mount / "team"
+        directory.mkdir()
+        (directory / "memory.max").write_text("1000")
+        (directory / "memory.current").write_text("960")
+        (directory / "task").mkdir()
+        (directory / "task/memory.max").write_text("max")
+        (directory / "task/memory.current").write_text("200")
+        self.assertEqual(resources._memory_quota_pressure(), 2)
+        (directory / "memory.current").write_text("910")
+        self.assertEqual(resources._memory_quota_pressure(), 1)
+
+    def test_inactive_file_cache_does_not_make_a_container_permanently_critical(self):
+        self.hierarchy()
+        (self.mount / "memory.current").write_text("980")
+        (self.mount / "memory.max").write_text("1000")
+        (self.mount / "memory.stat").write_text("inactive_file 500\n")
+        self.assertEqual(resources._memory_quota_pressure(), 0)
+        (self.mount / "memory.high").write_text("400")
+        self.assertEqual(resources._memory_quota_pressure(), 1)
+
+    def test_v1_memory_controller_and_missing_limits(self):
+        self.groups.write_text("5:memory:/task\n")
+        escaped = str(self.mount).replace(" ", r"\040")
+        self.mounts.write_text(f"29 23 0:26 / {escaped} rw - cgroup cgroup rw,memory\n")
+        directory = self.mount / "task"
+        directory.mkdir()
+        (directory / "memory.usage_in_bytes").write_text("960")
+        (directory / "memory.limit_in_bytes").write_text("1000")
+        self.assertEqual(resources._memory_quota_pressure(), 2)
+        (directory / "memory.limit_in_bytes").write_text("invalid")
+        self.assertEqual(resources._memory_quota_pressure(), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

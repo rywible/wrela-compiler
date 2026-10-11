@@ -3,7 +3,7 @@ runs both start each program this way, so the two can't drift.
 
 A program runs as cargo runs it (in its package's directory), from a link to its executable in a
 scratch directory of its own (`target/test-scratch-*`, its tests' WRELA_TEST_TMPDIR), with up to
-four test threads, its GPU tests sharing the GPU, and its compiled code kept across runs. The
+two test threads, its GPU tests sharing the GPU, and its compiled code kept across runs. The
 end-to-end suite (compiler/tests) is the longest program, so the gate's time: it starts first, and
 the others yield to it (`nice`: with all at one priority, it took half as long again as alone)."""
 
@@ -11,10 +11,6 @@ import errno
 import os
 import shutil
 import tempfile
-import time
-
-# A failed program's scratch is kept to look at for this long.
-KEEP_SCRATCH = 6 * 3600
 
 
 def _tool_test(test_id, directory):
@@ -42,7 +38,7 @@ def tools_tests(directory="tools/tests"):
     """
     from concurrent.futures import ProcessPoolExecutor
     import unittest
-    from resources import cpu_count
+    from resources import worker_count
 
     directory = os.path.abspath(directory)
     ids = []
@@ -56,7 +52,7 @@ def tools_tests(directory="tools/tests"):
 
     walk(unittest.TestLoader().discover(directory))
     failed = 0
-    with ProcessPoolExecutor(max_workers=min(8, cpu_count() * 2)) as pool:
+    with ProcessPoolExecutor(max_workers=min(2, worker_count())) as pool:
         results = pool.map(_tool_test, ids, [directory] * len(ids))
         for passed, output in results:
             if not passed:
@@ -72,13 +68,8 @@ def scratch_root():
     relative dependency paths). Old ones are removed."""
     root = os.path.abspath("target")
     os.makedirs(root, exist_ok=True)
-    for name in os.listdir(root):
-        path = os.path.join(root, name)
-        try:
-            if name.startswith("test-scratch-") and time.time() - os.stat(path).st_mtime > KEEP_SCRATCH:
-                shutil.rmtree(path, ignore_errors=True)
-        except OSError:
-            pass
+    from worktrees import prune_scratch
+    prune_scratch(root)
     return root
 
 
@@ -94,16 +85,17 @@ def in_order(programs):
 
 def gpu_shared(cores):
     """How many of a program's GPU tests share the GPU at a time."""
-    return max(2, min(4, cores))
+    return 2
 
 
 def start(program, root, logs, native_cache, cores):
     """(the command's start, its environment, its directory, its scratch) for `program`: append
-    its arguments to the command. Up to four test threads, bounded by the CPUs and the shared GPU
-    limit, on a software GPU too: one thread a program made the memo-off gate's tests take 460 s,
-    not 197 s (4 cores)."""
+    its arguments to the command. Two test threads, bounded by the admitted CPU allowance,
+    on a software GPU too."""
     pkg = os.path.dirname(program["manifest_path"])
     scratch = tempfile.mkdtemp(prefix="test-scratch-", dir=root)
+    with open(os.path.join(scratch, ".owner"), "w") as owner:
+        owner.write(str(os.getpid()))
     # A concurrent Cargo build may replace its test binary. Keep this run's executable reachable
     # so tests that spawn themselves (the fuzz workers) can still find it.
     executable = os.path.join(scratch, "test-program")
@@ -114,10 +106,10 @@ def start(program, root, logs, native_cache, cores):
             raise
         shutil.copy2(program["executable"], executable)
     env = {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache,
-           "WRELA_TEST_TMPDIR": scratch, "RUST_TEST_THREADS": str(max(1, min(4, cores))),
+           "WRELA_TEST_TMPDIR": scratch,
            "WRELA_GPU_SHARED": str(gpu_shared(cores)), "WRELA_GPU_WAITS": f"{logs}/gpu-waits"}
     command = [] if is_first(program) else ["nice", "-n", "10"]
-    return [*command, executable], env, pkg, scratch
+    return [*command, executable, f"--test-threads={max(1, min(2, cores))}"], env, pkg, scratch
 
 
 def name_of(program):

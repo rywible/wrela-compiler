@@ -685,7 +685,13 @@ impl Builder {
     /// (wgpu's error scopes, which catch a shader's errors, are each thread's own). The first
     /// failure in order, if any.
     fn build_many(&self, jobs: &[(&wrela_abi::manifest::Pipeline, &str)]) -> Result<Vec<Pipeline>> {
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len());
+        let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let budget = std::env::var("WRELA_CPU_WORKERS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(cores);
+        let threads = cores.min(budget).min(jobs.len());
         if threads <= 1 {
             return jobs.iter().map(|(p, source)| self.build(p, source)).collect();
         }

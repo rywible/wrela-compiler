@@ -42,6 +42,7 @@ def code(command):
     return QUOTED.sub("''", HEREDOC.sub("<<", command))
 
 CARGO_TEST = re.compile(START + r"cargo\s+(?:\+\S+\s+)?test\b")
+COSTLY = re.compile(START + r"cargo\s+(?:\+\S+\s+)?(?:build|check|clippy|run|test)\b")
 # Runs that check.sh can't make, or that don't use the GPU: setting `WRELA_GPU_SHARED` says the
 # GPU is shared (or, at 1, taken alone on purpose); goldens rewritten, run cases narrowed (check.sh
 # unsets both), fuzzing, builds, doc tests.
@@ -55,11 +56,10 @@ POLL_REASON = (
     "for a line in a log, use Monitor. (tools/hooks.py; CLAUDE.md, Checks)"
 )
 CARGO_TEST_REASON = (
-    "A test run with `cargo test` takes the GPU alone, so every other session's checks wait for "
-    "it, and it compiles the WASM again. Run it with `tools/check.sh <name> --nocapture` (add "
-    "`--long` for a long test): it shares the GPU and keeps compiled code. A measurement "
-    "(`measure:`) runs with cargo, alone; so does a run that sets `WRELA_GPU_SHARED` (=1 to take "
-    "the GPU alone on purpose). (tools/hooks.py; CLAUDE.md, Checks)"
+    "Use tools/check.sh <name> --nocapture for tests (add --long for a long test). "
+    "Wrap other costly commands with python3 tools/jobs.py run build -- <command>; "
+    "use run measure for timing evidence. This admits one costly job across sessions and "
+    "shares the build cache. Raw Cargo commands bypass that budget. (tools/hooks.py; CLAUDE.md, Checks)"
 )
 
 
@@ -137,6 +137,8 @@ def bash(event):
     if polls(command, tool_input.get("run_in_background")):
         return refuse(POLL_REASON)
     root = None
+    if COSTLY.search(command):
+        return refuse(CARGO_TEST_REASON)
     if CARGO_TEST.search(command):
         root = repo(event)
         if takes_the_gpu_alone(command, root):
@@ -216,6 +218,13 @@ def cloud(root, source):
 
 def session(event):
     root = repo(event)
+    if os.path.isfile(os.path.join(root, "tools/jobs.py")):
+        print("Ten sessions share one costly-job queue: use tools/check.sh for tests and "
+              "python3 tools/jobs.py run build -- <command> for builds or bakes; use capture or "
+              "measure for those jobs. Keep waiting jobs in the background. "
+              "Create source-only worktrees with python3 tools/worktrees.py create NAME; "
+              "inspect queue/storage with tools/jobs.py status and tools/worktrees.py status. "
+              "Do not copy target or node_modules between worktrees.")
     if os.environ.get("CLAUDE_CODE_REMOTE") == "true":
         print(cloud(root, event.get("source")))
     path = os.path.join(root, "TASKS.md")

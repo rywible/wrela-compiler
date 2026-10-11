@@ -19,10 +19,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(python3 tools/resources.py)}"
-# The throwaway tree's build keeps its own target, at the same path each run, so it stays warm.
+if ! python3 tools/jobs.py admitted; then
+  exec python3 tools/jobs.py run build --verify -- bash tools/premerge.sh
+fi
+# The throwaway tree shares the admitted build cache; only its sources are local.
 work="$root/target/premerge"
-export CARGO_TARGET_DIR="$work/target"
 # A package's constants come from the session's shared cache when there is one (a floor's history
 # bakes in minutes otherwise); it's keyed on the code that computes each, so a stale value can't
 # be served.
@@ -90,7 +91,7 @@ for d in sorted(roots):
 if [ -n "$packages" ]; then
   cargo build -q --release -p wrela --bin wrela
   # The packages at once, as many as the cores; each failure with its first diagnostics.
-  failures=$(echo "$packages" | xargs -P "$CARGO_BUILD_JOBS" -I{} sh -c \
+  failures=$(echo "$packages" | xargs -P "$WRELA_CPU_WORKERS" -I{} sh -c \
     '"$1" check "$2" > /dev/null 2>&1 || echo "$2"' _ "$CARGO_TARGET_DIR/release/wrela" {})
   echo "  wrela check: $(echo "$packages" | wc -l) packages, $((SECONDS - start))s"
   for p in $failures; do

@@ -70,6 +70,13 @@ class PollTest(unittest.TestCase):
 
 
 class CargoTestTest(Checkout, unittest.TestCase):
+    def test_raw_builds_are_refused_and_scheduled_builds_are_allowed(self):
+        for command in ("cargo build --release", "cargo check -p wrela-syntax", "cargo test --no-run"):
+            out = run("bash", {"cwd": self.root, "tool_input": {"command": command}})
+            self.assertEqual(out.returncode, 2, out.stderr)
+            self.assertIn("tools/jobs.py", out.stderr)
+        out = run("bash", {"cwd": self.root, "tool_input": {"command": "python3 tools/jobs.py run build -- cargo build --release"}})
+        self.assertEqual(out.returncode, 0, out.stderr)
     def setUp(self):
         super().setUp()
         self.write("compiler/tests/tests/suite/herd.rs", '#[test]\n#[ignore = "measure: alone"]\n'

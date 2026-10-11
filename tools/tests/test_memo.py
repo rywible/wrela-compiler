@@ -73,6 +73,12 @@ class Files(unittest.TestCase):
 
 
 class Inputs(Files):
+    def test_shared_cargo_target_keeps_checkout_scratch_out_of_inputs(self):
+        inputs = memo.Inputs(self.root, "/external/shared-cargo")
+        self.assertFalse(inputs.kept(os.path.join(self.root, "target/test-scratch-one/capture.png")))
+        self.assertFalse(inputs.kept("/external/shared-cargo/release/wrela"))
+        self.assertTrue(inputs.kept(os.path.join(self.root, "engine/source.wrela")))
+
     def test_outputs_and_the_machines_own_state_are_left_out(self):
         target = os.path.join(self.root, "target")
         inputs = memo.Inputs(self.root, target)
@@ -527,6 +533,7 @@ class Ending(unittest.TestCase):
         self.assertEqual(memo.tests_status(False, 0, [], []), 1)
         self.assertEqual(memo.tests_status(True, 1, [], []), 1)
 
+    @unittest.skipUnless(sys.platform == "linux", "Linux /proc and subreaper test")
     def test_stopping_kills_every_process_under_the_runner_and_the_ones_that_escaped(self):
         # A process orphaned under the runner (as a test is when strace, its parent, dies first)
         # comes back to it as its subreaper.

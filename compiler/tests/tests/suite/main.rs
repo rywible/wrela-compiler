@@ -217,7 +217,10 @@ fn x86_host() -> PathBuf {
         .status()
         .expect("cargo runs");
     assert!(status.success(), "building wrela-host for x86-64 failed");
-    root.join("target/x86_64-apple-darwin/release/wrela-host")
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"))
+        .join("x86_64-apple-darwin/release/wrela-host")
 }
 
 /// `wrela-host --replay <log> --no-gpu <build>` for x86-64, under Rosetta: its output, and

@@ -28,11 +28,11 @@ Each capture is kept as its frames (`<name>/NNNNN.png`, the frame's number), a c
 
 import json, os, shutil, subprocess, sys, tempfile
 
-from resources import cpu_count
+from resources import worker_count as cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
-HOST = os.path.join(ROOT, "target/release/wrela-host")
+HOST = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release/wrela-host")
 # A lookbook shot's move starts this many frames after it's chosen (tools/lookbook.py).
 SETTLE = 300
 
@@ -136,4 +136,10 @@ def main():
 
 
 if __name__ == "__main__":
+    os.chdir(ROOT)
+    from jobs import admitted, run
+    if len(sys.argv) > 1 and not admitted():
+        sys.exit(run("capture", [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]))
+    if len(sys.argv) > 1:
+        subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela-host", "--bin", "wrela-host"], cwd=ROOT, check=True)
     main()

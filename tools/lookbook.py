@@ -14,8 +14,8 @@ then for `lookbook::MOVE` seconds, paced as in play, recorded from Chrome's canv
 the look (F8 in the floor): `clay`, the scene's light on its forms all one matte grey, or
 `silhouette`, the sky white, the land light and the solid forms dark, a step lighter for each band
 of distance. `--size` renders the stills at another size than 1920x1080 (1280x720 while
-iterating). `--jobs` renders that many stills at once (by default up to 3 on a machine whose GPU
-is software, bounded by its available CPUs, else 1), each process sharing the GPU lock
+iterating). Stills run one at a time by default. `--jobs` can share the admitted CPU allowance
+between at most two stills, each process sharing the GPU lock
 (`WRELA_GPU_SHARED`), with the same pixels:
 on a 4-core cloud machine lavapipe leaves cores idle in a still's load frames, and shots 2, 7
 and 9 took 785 s at once, about 1400 s one by one. Each shot's numbers, the
@@ -33,11 +33,11 @@ the shots before it.)
 import json, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from resources import cpu_count
+from resources import worker_count as cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
-HOST = os.path.join(ROOT, "target/release/wrela-host")
+HOST = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release/wrela-host")
 HEADLESS = os.path.join(ROOT, "tools/headless.py")
 SETTLE_FRAMES = 300
 # A capture's frames at most, its load and its resolve: it stops before, at `STILL`.
@@ -86,10 +86,9 @@ def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
     cmd = [HOST, BUILD, "--frames", str(frames), "--size", size, "--input", script, "--png", png]
     if software:
         # Each concurrent shot gets a share of the CPU, including lavapipe's raster workers.
-        # Three processes keep the measured memory footprint; larger machines give each more
-        # workers instead of loading more copies of the scene. An explicit Mesa override wins.
+        # Bound Mesa's raster workers by this shot's share of the admitted CPU allowance.
         cores = max(1, cpu_count() // jobs)
-        env.setdefault("LP_NUM_THREADS", str(cores))
+        env["LP_NUM_THREADS"] = str(cores)
         cmd += ["--workers", str(min(9, cores))]  # native ABI: main thread plus eight helpers
     try:
         r = subprocess.run(cmd + (["--until", STILL] if capture else []), capture_output=True,
@@ -141,13 +140,12 @@ def main():
             sys.exit("--size takes WxH, as 1280x720")
         size = args[k + 1]
         del args[k:k + 2]
-    software = os.environ.get("WRELA_SOFTWARE_GPU") == "1"
-    jobs = min(3, cpu_count()) if software else 1
+    jobs = 1
     if "--jobs" in args:
         k = args.index("--jobs")
         if k + 1 >= len(args) or not args[k + 1].isdigit() or int(args[k + 1]) < 1:
             sys.exit("--jobs takes a whole number, 1 or more")
-        jobs = int(args[k + 1])
+        jobs = min(2, cpu_count(), int(args[k + 1]))
         del args[k:k + 2]
     out = args[0]
     os.makedirs(out, exist_ok=True)
@@ -175,4 +173,10 @@ def main():
 
 
 if __name__ == "__main__":
+    os.chdir(ROOT)
+    from jobs import admitted, run
+    if len(sys.argv) > 1 and not admitted():
+        sys.exit(run("capture", [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]))
+    if len(sys.argv) > 1:
+        subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela-host", "--bin", "wrela-host"], cwd=ROOT, check=True)
     main()

@@ -2,8 +2,7 @@
 //!
 //! On 2026-10-01, a dozen concurrent headless Chrome runs starved macOS's WindowServer of GPU
 //! time until its watchdog killed it. `tools/headless.py` therefore serializes GPU users with
-//! `flock(2)` on one lock file (see [`lock_path`]), and the native host takes the
-//! same lock, so a Chrome run and a native run queue instead of overlapping. The kernel releases
+//! `flock(2)`, and the native host takes the same permits. The kernel releases
 //! an `flock` when its holder exits, so a crashed run never leaves a stale lock.
 //!
 //! Within one process, the threads queue too: one test binary runs its GPU tests on parallel
@@ -16,9 +15,10 @@
 //!
 //! **Sharing.** Runs that check what the GPU computes, not how long it takes, can share it:
 //! with `WRELA_GPU_SHARED=n` (n ≥ 2), up to n of a process's threads hold the lock at once, and
-//! the process takes the `flock` shared, so other sharing processes hold it beside it (so does
-//! `tools/headless.py` with the variable, which runs one headless Chrome at a time by a lock of
-//! its own). A run that takes it alone (a process without the variable; a [`GpuLock::alone`])
+//! each thread also takes one of two machine-wide slots beneath `WRELA_RESOURCE_DIR`, or
+//! `~/.cache/wrela/resources`, independent of TMPDIR. Python's browser driver follows the same
+//! barrier/slot protocol and admits one Chrome at a time. The TMPDIR lock remains for older
+//! checkouts. A run that takes it alone (a process without the variable; a [`GpuLock::alone`])
 //! still waits for every sharer, and they for it. `tools/check.sh` shares the GPU in its tests
 //! and never in its timing runs.
 
@@ -72,6 +72,8 @@ struct Holder {
     thread: ThreadId,
     count: usize,
     sharers: usize,
+    /// Every thread holds its own machine-wide slot, not merely a process-local share.
+    global: Vec<File>,
 }
 
 /// The process's hold on the lock: the threads holding it, and the locked file (closed, which
@@ -162,10 +164,11 @@ impl GpuLock {
             h = RELEASED.wait_timeout(h, left).unwrap_or_else(|p| p.into_inner()).0;
         }
         h.alone_waiting -= usize::from(alone);
-        h.holders.push(Holder { thread: me, count: 1, sharers });
+        h.holders.push(Holder { thread: me, count: 1, sharers, global: Vec::new() });
         let lock = lock();
         if h.file.is_some() {
-            return Ok(lock);
+            drop(h);
+            return global_hold(lock, me, who, sharers > 1);
         }
         // The first holder takes the file, without holding the mutex, so other threads' waits
         // aren't blocked behind another process; those that would join wait for it (`taking`).
@@ -178,7 +181,8 @@ impl GpuLock {
         match taken {
             Ok(file) => {
                 h.file = Some(file);
-                Ok(lock)
+                drop(h);
+                global_hold(lock, me, who, sharers > 1)
             }
             Err(e) => {
                 // `lock` hasn't been handed out; its drop gives the hold back.
@@ -188,6 +192,83 @@ impl GpuLock {
             }
         }
     }
+}
+
+/// Take a global permit without the local mutex: another holder must be able to drop its slot
+/// while this thread waits. The legacy lock remains held for older checkouts on this machine.
+fn global_hold(lock: GpuLock, me: ThreadId, who: &str, shared: bool) -> Result<GpuLock> {
+    let files = global_permit(who, shared)?;
+    hold().holders.iter_mut().find(|h| h.thread == me).expect("this thread's hold").global = files;
+    Ok(lock)
+}
+
+fn global_permit(who: &str, shared: bool) -> Result<Vec<File>> {
+    let root = std::env::var_os("WRELA_RESOURCE_DIR")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::home_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join(".cache/wrela/resources")
+        });
+    global_permit_at(&root, who, shared)
+}
+
+fn global_permit_at(root: &Path, who: &str, shared: bool) -> Result<Vec<File>> {
+    if !root.is_absolute() {
+        return Err(Error::Lock("WRELA_RESOURCE_DIR must be absolute".into()));
+    }
+    std::fs::create_dir_all(root).map_err(|e| Error::Lock(format!("{}: {e}", root.display())))?;
+    let barrier = open(&root.join("gpu.lock"))?;
+    let started = Instant::now();
+    loop {
+        let result = if shared { barrier.try_lock_shared() } else { barrier.try_lock() };
+        match result {
+            Ok(()) => break,
+            Err(TryLockError::WouldBlock) if started.elapsed() < WAIT_LIMIT => {
+                std::thread::sleep(POLL)
+            }
+            Err(error) => {
+                return Err(Error::Lock(format!("waiting for the global GPU permit: {error}")));
+            }
+        }
+    }
+    let mut files = vec![barrier];
+    if shared {
+        let slots = [open(&root.join("gpu-slot-0.lock"))?, open(&root.join("gpu-slot-1.lock"))?];
+        loop {
+            let mut chosen = None;
+            for (index, slot) in slots.iter().enumerate() {
+                match slot.try_lock() {
+                    Ok(()) => {
+                        chosen = Some(index);
+                        break;
+                    }
+                    Err(TryLockError::WouldBlock) => {}
+                    Err(error) => return Err(Error::Lock(format!("global GPU slot: {error}"))),
+                }
+            }
+            if let Some(index) = chosen {
+                files.extend(
+                    slots
+                        .into_iter()
+                        .enumerate()
+                        .filter_map(|(i, slot)| (i == index).then_some(slot)),
+                );
+                break;
+            }
+            if started.elapsed() >= WAIT_LIMIT {
+                return Err(Error::Lock(
+                    "gave up waiting for a global GPU slot after an hour".into(),
+                ));
+            }
+            std::thread::sleep(POLL);
+        }
+    }
+    if started.elapsed() >= POLL {
+        note_wait(std::env::var_os("WRELA_GPU_WAITS"), started.elapsed(), who);
+    }
+    Ok(files)
 }
 
 impl Drop for GpuLock {
@@ -293,6 +374,66 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
+
+    #[test]
+    fn native_and_python_share_global_slots_and_exclusion() {
+        let root = std::env::temp_dir().join(format!("wrela-global-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("directory");
+        struct Probe {
+            child: std::process::Child,
+            root: PathBuf,
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+        let start = |shared: bool| {
+            let code = format!(
+                "import pathlib,time; from resources import gpu_locks; fds=gpu_locks({}); \
+                 root=pathlib.Path({:?}); (root/'ready').touch(); \
+                 exec(\"while not (root/'release').exists(): time.sleep(.02)\")",
+                if shared { "True" } else { "False" },
+                root.to_string_lossy()
+            );
+            let child = std::process::Command::new("python3")
+                .args(["-c", &code])
+                .env("PYTHONPATH", Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools"))
+                .env("WRELA_RESOURCE_DIR", &root)
+                .spawn()
+                .expect("Python lock probe");
+            Probe { child, root: root.clone() }
+        };
+        let wait_ready = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !root.join("ready").exists() {
+                assert!(Instant::now() < deadline, "Python never received its permit");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = global_permit_at(&root, "first native holder", true).expect("first");
+        let second = global_permit_at(&root, "second native holder", true).expect("second");
+        let mut probe = start(true);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!root.join("ready").exists(), "third global holder must wait");
+        drop(first);
+        wait_ready();
+        std::fs::write(root.join("release"), "").expect("release");
+        assert!(probe.child.wait().expect("probe exits").success());
+        drop(second);
+        drop(probe);
+
+        let alone = global_permit_at(&root, "native measurement", false).expect("exclusive");
+        let mut probe = start(true);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!root.join("ready").exists(), "exclusive holder blocks Python");
+        drop(alone);
+        wait_ready();
+        std::fs::write(root.join("release"), "").expect("release");
+        assert!(probe.child.wait().expect("probe exits").success());
+    }
 
     #[test]
     fn a_thread_shares_its_hold_and_others_wait() {
