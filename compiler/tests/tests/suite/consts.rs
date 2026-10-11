@@ -85,6 +85,85 @@ fn the_second_build_computes_no_constant() {
     assert_eq!(stats(&dir), (all, 0), "corrupt entries are computed again");
 }
 
+/// Waiting constants keep their round order, including a fan-in whose inputs become ready
+/// in different rounds. A cached build produces exactly the same files without tracing again.
+#[test]
+fn waiting_constants_keep_values_order_and_cache_hits() {
+    let dir = crate::package(
+        "consts/waiting",
+        r#"
+use std::io::print
+
+const TOTAL: u32 = step(C0 + FAST)
+const C0: u32 = step(C1)
+const C1: u32 = step(C2)
+const C2: u32 = step(C3)
+const FAST: u32 = step(10)
+const C3: u32 = step(0)
+
+fn step(x: u32) -> u32 {
+    print(f"{x}")
+    x + 1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    assert(TOTAL == 16)
+}
+"#,
+    );
+    let first = wrela_driver::build(&dir);
+    assert!(!first.has_errors(), "{:?}", first.diagnostics);
+    let traces: Vec<_> = first
+        .consts
+        .traced
+        .iter()
+        .map(|(name, trace)| (name.as_str(), trace.lines[0].as_str()))
+        .collect();
+    assert_eq!(
+        traces,
+        [("FAST", "10"), ("C3", "0"), ("C2", "1"), ("C1", "2"), ("C0", "3"), ("TOTAL", "15")]
+    );
+    let second = wrela_driver::build(&dir);
+    assert!(!second.has_errors(), "{:?}", second.diagnostics);
+    assert_eq!(second.consts.computed, 0);
+    assert_eq!(second.consts.cached, first.consts.computed);
+    assert!(second.consts.traced.is_empty());
+    assert_eq!(first.files, second.files);
+}
+
+#[test]
+fn waiting_constants_preserve_failures_and_cycles() {
+    let prefix = "fn step(x: u32) -> u32 { x + 1 }\n";
+    let failing = crate::package(
+        "consts/waiting-failure",
+        &format!(
+            "{prefix}\nconst GRAND: u32 = step(CHILD)\nconst CHILD: u32 = step(FAILED)\n\
+             const FAILED: u32 = fail()\nfn fail() -> u32 {{ panic(\"failed root\") }}\n\
+             const OK0: u32 = step(OK1)\nconst OK1: u32 = step(0)"
+        ),
+    );
+    let out = wrela_driver::build(&failing);
+    let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code.as_str(), "E0704");
+    assert!(errors[0].message.contains("failed root"), "{errors:?}");
+
+    let cyclic = crate::package(
+        "consts/waiting-cycle",
+        &format!(
+            "{prefix}\nconst A: u32 = step(b())\nconst B: u32 = step(a())\n\
+             fn a() -> u32 {{ A }}\nfn b() -> u32 {{ B }}\n\
+             const OK0: u32 = step(OK1)\nconst OK1: u32 = step(OK2)\n\
+             const OK2: u32 = step(0)"
+        ),
+    );
+    let out = wrela_driver::build(&cyclic);
+    let errors: Vec<_> = out.diagnostics.iter().filter(|d| d.is_error()).collect();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].code.as_str(), "E0328");
+    assert!(errors[0].message.contains("`A` → `B` → `A`"), "{errors:?}");
+}
+
 /// A constant that does more work than the build's own limit (2^34 units) is built when its
 /// declaration gives it the fuel, and fails without; its parallel job runs on the build's
 /// threads, and its value doesn't depend on how many.

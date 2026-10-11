@@ -4,7 +4,7 @@
 import { describe, expect, spyOn, test } from "bun:test";
 import { type BuiltPipeline, buildPipelines, GpuExecutor, type PipelineCache, ShaderError } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
-import { NONE } from "../src/abi.gen.ts";
+import { NONE, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
 import { Encoder, words } from "./encoder.ts";
 import { type Event, FakeDevice, fakeTexture } from "./fake-gpu.ts";
@@ -121,6 +121,82 @@ test("each dispatch and draw gets its own aligned uniform slice", async () => {
   const ring = (device.events[6] as Extract<Event, { kind: "writeBuffer" }>).data;
   offsets.forEach((offset, i) => expect(Array.from(ring.subarray(offset, offset + 16))).toEqual(Array.from(u(i))));
   expect(device.events[3]).toEqual({ kind: "renderPass", clear: { r: 0.25, g: 0.5, b: 0.75, a: 1 }, view: "screen" });
+});
+
+test("small texture writes keep their order in one submission, with aligned copies of packed rows", async () => {
+  for (const format of TEXTURE_FORMATS.filter((f) => !f.depth)) {
+    const { device, run, executor } = await setup();
+    const bytes = Uint8Array.from({ length: 3 * 2 * format.bytes }, (_, i) => i + 1);
+    const original = bytes.slice();
+    run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 5, 4, format.name));
+    run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(0)).writeBuffer(1, 0, words([7])));
+    executor.execute({ op: "WriteTexture", handle: 3, x: 1, y: 1, width: 3, height: 2, data: bytes });
+    bytes.fill(255); // The program may reuse its shared memory before the submission.
+    run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(1)));
+    executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 0, height: 4, data: new Uint8Array(0) });
+    executor.flush();
+    expect(kinds(device.events)).toEqual([
+      "dispatch", "copyBuffer", "copyBufferToTexture", "dispatch", "writeBuffer", "writeBuffer", "submit",
+    ]);
+    expect(device.events[2]).toEqual({
+      kind: "copyBufferToTexture", from: "upload ring", fromOffset: 256, texture: "texture 3",
+      origin: { x: 1, y: 1 }, bytesPerRow: 256, rowsPerImage: 2, size: { width: 3, height: 2 },
+    });
+    const upload = device.events[5] as Extract<Event, { kind: "writeBuffer" }>;
+    expect(upload.data.length).toBe(768);
+    expect(upload.data.subarray(0, 4)).toEqual(words([7]));
+    expect(upload.data.subarray(256, 256 + 3 * format.bytes)).toEqual(original.subarray(0, 3 * format.bytes));
+    expect(upload.data.subarray(512, 512 + 3 * format.bytes)).toEqual(original.subarray(3 * format.bytes));
+  }
+});
+
+test("texture writes flush and reuse a full upload ring", async () => {
+  const { device, run, executor } = await setup();
+  const data = new Uint8Array(UPLOAD_START / 2);
+  run(new Encoder().createTexture(3, 128, 256, "rgba8unorm"));
+  for (let i = 0; i < 3; i++) {
+    executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 128, height: 256, data });
+  }
+  executor.flush();
+  expect(kinds(device.events)).toEqual([
+    "copyBufferToTexture", "copyBufferToTexture", "writeBuffer", "submit", "copyBufferToTexture", "writeBuffer", "submit",
+  ]);
+  const offsets = device.events.flatMap((e) => e.kind === "copyBufferToTexture" ? [e.fromOffset] : []);
+  expect(offsets).toEqual([0, data.length, 0]);
+  expect(device.buffers.filter((b) => b.label === "upload ring").length).toBe(1);
+});
+
+test("a texture write grows the upload ring after earlier work is submitted", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 64).writeBuffer(1, 0, words([7])).createTexture(3, 64, 1025, "rgba8unorm"));
+  const data = new Uint8Array(256 * 1025);
+  executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 64, height: 1025, data });
+  executor.flush();
+  expect(kinds(device.events)).toEqual(["copyBuffer", "writeBuffer", "submit", "copyBufferToTexture", "writeBuffer", "submit"]);
+  expect(device.buffers.filter((b) => b.label === "upload ring").map((b) => [b.size, b.destroyed])).toEqual([
+    [UPLOAD_START, true], [2 * UPLOAD_START, false],
+  ]);
+});
+
+test("a texture with a staged write is destroyed only after its copy is submitted", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createTexture(3, 1, 1, "rgba8unorm").writeTexture(3, [0, 0], [1, 1], words([7])).destroyTexture(3));
+  expect(device.textures[0]!.destroyed).toBe(false);
+  executor.flush();
+  expect(kinds(device.events)).toEqual(["copyBufferToTexture", "writeBuffer", "submit"]);
+  expect(device.textures[0]!.destroyed).toBe(true);
+});
+
+test("texture uploads over the padded size cap still write through the queue after a flush", async () => {
+  const { device, run, executor } = await setup();
+  // The packed bytes fit the cap, but the padded rows don't.
+  const width = 2049;
+  const height = Math.floor(UPLOAD_MAX / 4352) + 1;
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, width, height, "r16float"));
+  run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(0)));
+  executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width, height, data: new Uint8Array(2 * width * height) });
+  expect(kinds(device.events)).toEqual(["dispatch", "writeBuffer", "submit", "writeTexture"]);
+  expect(device.events[3]).toMatchObject({ bytesPerRow: 2 * width, size: { width, height } });
 });
 
 test("bind groups are cached per pipeline and buffers", async () => {
@@ -329,11 +405,14 @@ test("textures and samplers are made as the stream says, and bound as views and 
   // A depth texture can't be written from the CPU.
   expect([depth!.format, depth!.usage]).toEqual(["depth32float", TEXTURE_BINDING | RENDER_ATTACHMENT | COPY_SRC]);
   expect(device.samplers[0]).toMatchObject({ magFilter: "linear", addressModeU: "repeat", compare: "less-equal" });
-  expect(device.events.find((e) => e.kind === "writeTexture")).toEqual({
-    kind: "writeTexture",
+  expect(device.events.find((e) => e.kind === "copyBufferToTexture")).toEqual({
+    kind: "copyBufferToTexture",
+    from: "upload ring",
+    fromOffset: 0,
     texture: "texture 3",
     origin: { x: 1, y: 0 },
-    bytesPerRow: 16,
+    bytesPerRow: 256,
+    rowsPerImage: 2,
     size: { width: 2, height: 2 },
   });
   const draw = device.events.find((e) => e.kind === "draw") as Extract<Event, { kind: "draw" }>;
@@ -643,6 +722,24 @@ test("a command that waited for a pipeline, then fails, fails the program", asyn
   later.resolve(compute!);
   expect(await caughtUp).toBe("host bug: resource 8 passed the checks but doesn't exist");
   expect(() => executor.waiting).toThrow("host bug: resource 8 passed the checks but doesn't exist");
+});
+
+test("a failed waiting queue does not submit recorded work when another pipeline finishes", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+  const first = Promise.withResolvers<BuiltPipeline>();
+  const unused = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, first.promise, unused.promise], { texture: () => fakeTexture("screen") });
+  const batch = new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).destroyBuffer(8);
+  for (const cmd of decode(batch.finish())) executor.execute(cmd);
+  const caughtUp = executor.caughtUp();
+  first.resolve(compute!);
+  await expect(caughtUp).rejects.toThrow("host bug: resource 8 passed the checks but doesn't exist");
+  expect(kinds(device.events)).toEqual(["dispatch"]);
+  unused.resolve(compute!);
+  await executor.built;
+  expect(kinds(device.events)).toEqual(["dispatch"]);
 });
 
 test("a hot reload keeps the pipelines whose entries and WGSL are the same, wherever their files are", async () => {

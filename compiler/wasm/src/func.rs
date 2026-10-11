@@ -147,6 +147,70 @@ mod tests {
             }
         }
     }
+
+    /// Nested uses keep a value alive through its enclosing statement, including both
+    /// branches and a loop's continuing block. Value IDs need not follow statement order,
+    /// and the optimizer can leave unused IDs behind.
+    #[test]
+    fn releases_follow_defining_scopes() {
+        use ir::{BinOp, Const, Expr, Stmt, ValueId as V};
+        let mut m = ir::Module::default();
+        let (float, boolean) = (m.types.f32(), m.types.bool());
+        let mut f = ir::Function::new("scopes", Vec::new(), Some(float));
+        for id in 0..11 {
+            f.new_value(if id == 9 { boolean } else { float });
+        }
+        let add = |out, a, b| Stmt::Let(V(out), Expr::Binary(BinOp::Add, V(a), V(b)));
+        f.body = vec![
+            Stmt::Let(V(10), Expr::Const(Const::F32(2.0))),
+            Stmt::Let(V(7), Expr::Const(Const::F32(1.0))),
+            Stmt::Let(V(9), Expr::Const(Const::Bool(true))),
+            add(3, 7, 7),
+            Stmt::If {
+                cond: V(9),
+                then: vec![
+                    Stmt::Let(V(5), Expr::Const(Const::F32(3.0))),
+                    Stmt::Loop {
+                        body: vec![
+                            add(1, 7, 5),
+                            Stmt::If {
+                                cond: V(9),
+                                then: vec![add(0, 1, 10)],
+                                else_: vec![add(6, 1, 5)],
+                            },
+                            Stmt::Break,
+                        ],
+                        continuing: vec![add(2, 7, 5)],
+                    },
+                ],
+                else_: vec![add(4, 7, 7)],
+            },
+            Stmt::Return(Some(V(7))),
+        ];
+        m.add_function(f);
+        ir::verify(&m).expect("valid IR");
+        let f = &m.functions[0];
+        let Stmt::If { then, else_, .. } = &f.body[4] else { unreachable!() };
+        let Stmt::Loop { body, continuing } = &then[1] else { unreachable!() };
+        let Stmt::If { then: inner_then, else_: inner_else, .. } = &body[1] else { unreachable!() };
+        let expected: HashMap<_, _> = [
+            (&f.body[3], vec![V(3)]),
+            (&f.body[4], vec![V(9), V(10)]),
+            (&f.body[5], vec![V(7)]),
+            (&then[1], vec![V(5)]),
+            (&body[1], vec![V(1)]),
+            (&inner_then[0], vec![V(0)]),
+            (&inner_else[0], vec![V(6)]),
+            (&continuing[0], vec![V(2)]),
+            (&else_[0], vec![V(4)]),
+        ]
+        .into_iter()
+        .map(|(s, values)| (std::ptr::from_ref(s), values))
+        .collect();
+        let mut actual = HashMap::new();
+        releases(f, &mut actual);
+        assert_eq!(actual, expected);
+    }
 }
 
 /// Zero, of WASM type `t`.
@@ -365,7 +429,7 @@ pub(crate) fn emit_function(
     for v in made {
         fe.value_slots[v.index()] = Some(fe.slot(f.value_ty(v)));
     }
-    releases(&f.body, &mut fe.release);
+    releases(f, &mut fe.release);
     fe.block(&f.body)?;
     // Falling off the end: only a function with no result can.
     fe.epilogue();
@@ -533,34 +597,39 @@ fn drop_restores(fe: &mut Fe) {
 /// block that defines it (`ir::verify` checks), so that's where it dies; a use in a nested loop
 /// counts as a use by the loop's whole statement, so a value read on every iteration lives
 /// until the loop ends.
-fn releases(b: &ir::Block, out: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>) {
-    fn uses(s: &ir::Stmt, f: &mut impl FnMut(ir::ValueId)) {
-        s.for_each_value(f);
-        for inner in s.blocks() {
-            for t in inner {
-                uses(t, f);
+fn releases(f: &ir::Function, out: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>) {
+    // Each value records its defining scope and the last statement there that uses it.
+    // A nested use belongs to that scope's current ancestor statement: a value used by a loop
+    // stays live for all its iterations. Visit each statement once, rather than scan its
+    // descendants again at every enclosing block. The verifier keeps each value in its scope.
+    fn block<'a>(
+        b: &'a ir::Block,
+        path: &mut Vec<&'a ir::Stmt>,
+        last: &mut [Option<(usize, &'a ir::Stmt)>],
+    ) {
+        for s in b {
+            path.push(s);
+            s.for_each_value(&mut |v| {
+                if let Some((depth, at)) = &mut last[v.index()] {
+                    *at = path[*depth];
+                }
+            });
+            if let ir::Stmt::Let(v, _) = s {
+                last[v.index()] = Some((path.len() - 1, s));
             }
+            for inner in s.blocks() {
+                block(inner, path, last);
+            }
+            path.pop();
         }
     }
-    let mut last = HashMap::new();
-    for (i, s) in b.iter().enumerate() {
-        uses(s, &mut |v| {
-            if let Some(l) = last.get_mut(&v) {
-                *l = i;
-            }
-        });
-        if let ir::Stmt::Let(v, _) = s {
-            last.insert(*v, i);
+    let mut last = vec![None; f.values.len()];
+    block(&f.body, &mut Vec::new(), &mut last);
+    // In value order, so local reuse and the generated code stay deterministic.
+    for (v, used) in last.into_iter().enumerate() {
+        if let Some((_, at)) = used {
+            out.entry(std::ptr::from_ref(at)).or_default().push(ir::ValueId(v as u32));
         }
-        for inner in s.blocks() {
-            releases(inner, out);
-        }
-    }
-    // In value order, so the build is the same every time.
-    let mut last: Vec<(ir::ValueId, usize)> = last.into_iter().collect();
-    last.sort_unstable_by_key(|&(v, _)| v.0);
-    for (v, i) in last {
-        out.entry(std::ptr::from_ref(&b[i])).or_default().push(v);
     }
 }
 

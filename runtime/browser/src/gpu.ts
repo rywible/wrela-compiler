@@ -2,12 +2,13 @@
 // commands with WebGPU. The same mapping as the native host (runtime/native/src/gpu.rs):
 //
 // - Work is recorded into one pending command encoder and submitted ("flushed") at the end of a
-//   pass on the screen, before a WriteTexture or a WriteBuffer over UPLOAD_MAX bytes (so earlier
-//   work sees the old contents), before a readback, and at the end of each call. Each dispatch
+//   pass on the screen, before an upload over UPLOAD_MAX bytes (so earlier work sees the old
+//   contents), before a readback, and at the end of each call. Each dispatch
 //   gets its own compute pass.
-// - Any other WriteBuffer is staged in an upload ring, written just before the flush, and a copy
-//   from there is recorded where the write is: it splits no work into submissions (as the native
-//   host's upload `Ring`).
+// - Other buffer and texture writes are staged in an upload ring, written just before the
+//   flush, and a copy from there is recorded where the write is: it splits no work into
+//   submissions (as the native host's upload `Ring`). Texture rows are padded to 256 bytes;
+//   their padded size counts against UPLOAD_MAX.
 // - A pass's draws are collected and recorded into one render pass when it ends (Present or
 //   EndPass), since a pass can span batches.
 // - A render pipeline is made at load for each of its manifest's `targets` (the passes the
@@ -538,7 +539,7 @@ export class GpuExecutor {
   readonly #doomed: (GPUBuffer | GPUTexture)[] = [];
   /** The uniform ring: this submission's uniform bytes. */
   readonly #uniforms: Ring;
-  /** The upload ring: this submission's buffer writes, a copy of each from there recorded where
+  /** The upload ring: this submission's buffer and texture writes, a copy of each recorded where
    * the write is, so a write splits no work into submissions (as the native host's upload
    * `Ring`). */
   readonly #uploads: Ring;
@@ -869,16 +870,7 @@ export class GpuExecutor {
         this.#write(cmd.handle, cmd.offset, cmd.data);
         return;
       case "WriteTexture": {
-        if (cmd.data.length === 0) return;
-        this.flush();
-        const t = this.#texture(cmd.handle);
-        // Rows of `width` texels, no padding (the checker checked the length).
-        this.device.queue.writeTexture(
-          { texture: t.texture, origin: { x: cmd.x, y: cmd.y } },
-          cmd.data,
-          { bytesPerRow: cmd.data.length / cmd.height, rowsPerImage: cmd.height },
-          { width: cmd.width, height: cmd.height },
-        );
+        this.#writeTexture(cmd);
         return;
       }
       case "CopyBuffer":
@@ -1057,16 +1049,53 @@ export class GpuExecutor {
       this.device.queue.writeBuffer(this.#buffer(handle), offset, data);
       return;
     }
+    const at = this.#reserveUpload(len, 4);
     const up = this.#uploads;
-    if (up.used + len > up.bytes.length) {
-      this.flush();
-      if (len > up.bytes.length) up.grow(len);
-    }
-    const at = up.used;
     // The bytes are a view into the program's memory: copied now.
     up.bytes.set(data, at);
-    up.used += len;
     this.#encoderNow().copyBufferToBuffer(up.buffer, at, this.#buffer(handle), offset, len);
+  }
+
+  /** An aligned slice of the upload ring; flushes or grows it before recording any copy. */
+  #reserveUpload(len: number, align: number): number {
+    const up = this.#uploads;
+    let at = alignTo(up.used, align);
+    if (at + len > up.bytes.length) {
+      this.flush();
+      if (len > up.bytes.length) up.grow(len);
+      at = 0;
+    }
+    up.used = at + len;
+    return at;
+  }
+
+  /** Texture copies share the buffer upload ring, with the row alignment WebGPU requires. */
+  #writeTexture(cmd: Extract<Command, { op: "WriteTexture" }>): void {
+    if (cmd.data.length === 0) return;
+    const t = this.#texture(cmd.handle);
+    const target = { texture: t.texture, origin: { x: cmd.x, y: cmd.y } };
+    const size = { width: cmd.width, height: cmd.height };
+    const row = cmd.data.length / cmd.height;
+    const padded = alignTo(row, 256);
+    const len = padded * cmd.height;
+    if (len > UPLOAD_MAX) {
+      this.flush();
+      this.device.queue.writeTexture(target, cmd.data, { bytesPerRow: row, rowsPerImage: cmd.height }, size);
+      return;
+    }
+    const at = this.#reserveUpload(len, 256);
+    const up = this.#uploads;
+    if (row === padded) up.bytes.set(cmd.data, at);
+    else {
+      for (let y = 0; y < cmd.height; y++) {
+        up.bytes.set(cmd.data.subarray(y * row, (y + 1) * row), at + y * padded);
+      }
+    }
+    this.#encoderNow().copyBufferToTexture(
+      { buffer: up.buffer, offset: at, bytesPerRow: padded, rowsPerImage: cmd.height },
+      target,
+      size,
+    );
   }
 
   #encoderNow(): GPUCommandEncoder {

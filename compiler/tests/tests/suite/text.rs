@@ -15,14 +15,21 @@ fn read(path: &str) -> Vec<u8> {
 }
 
 /// The build bakes each font from its file (ui/ttf.wrela), into at most 200 KB of fields:
-/// what a font adds to a build.
+/// what a font adds to a build. Every baked byte matches the original per-segment-distance
+/// baker: choosing the nearest squared distance must not change its output.
 #[test]
 fn the_fonts_are_baked_small() {
     let mut host = CpuHost::load(crate::built("../../ui/tests/text")).expect("load");
+    let hashes = [17_162_884_810_785_632_069u64, 7_364_730_740_798_196_822];
     for (face, ttf) in FONTS.iter().enumerate() {
         let bytes = wrela_tests::one_u32(&mut host, "field_bytes", &[Value::I32(face as i32)]);
         println!("{ttf}: {bytes} bytes of fields");
         assert!(bytes > 100 * 1024 && bytes <= 200 * 1024, "{ttf}: {bytes} bytes of fields");
+        let hash = host.call_export("field_hash", &[Value::I32(face as i32)]).expect("field hash");
+        assert!(
+            matches!(hash.as_slice(), [Value::I64(h)] if *h as u64 == hashes[face]),
+            "{ttf}: baked fields changed: {hash:?}"
+        );
     }
 }
 

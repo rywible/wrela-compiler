@@ -4,9 +4,9 @@
 //! back. How commands map to wgpu (the browser runtime's decoder does the same with WebGPU):
 //!
 //! - Work is recorded into one pending command encoder and submitted ("flushed") at the end of
-//!   a pass on the screen, before a `WriteBuffer` or `WriteTexture` (so earlier work sees the old
-//!   contents), before a readback, and at the end of each call. Each dispatch gets its own
-//!   compute pass.
+//!   a pass on the screen, before a large upload (so earlier work sees the old contents), before
+//!   a readback, and at the end of each call. Smaller buffer and texture writes use ordered
+//!   copies from an upload ring. Each dispatch gets its own compute pass.
 //! - A pass's draws are collected and recorded into one render pass when it ends (`Present` or
 //!   `EndPass`), since a pass can span batches. A pass that may join the one before (`join`), and
 //!   begins right after it ended on the same targets, keeping what's in them, runs as part of
@@ -279,9 +279,11 @@ struct Screen {
 /// A buffer whose bytes for this submission are staged on the CPU and written to it at the
 /// flush: the uniform ring, and the upload ring.
 ///
-/// The upload ring holds this submission's buffer writes (`WriteBuffer`): a copy of each from
-/// there is recorded where the write is, so a write splits no work into submissions. (A queue
-/// write would have to come between two: the work recorded before it must see the old
+/// The upload ring holds this submission's buffer and texture writes: a copy of each from
+/// there is recorded where the write is, so a write splits no work into submissions. Texture
+/// rows are padded to 256 bytes, as buffer-to-texture copies require, and their uploads start
+/// at that alignment too. (A queue write would have to come between two: the work recorded
+/// before it must see the old
 /// contents. Each submission waited for the GPU, which then started cold, and the pass after a
 /// write measured a third more, the herd's culling 15 times.)
 struct Ring {
@@ -1192,14 +1194,7 @@ impl Gpu {
             self.queue.write_buffer(self.buffer(handle), u64::from(offset), data);
             return Ok(());
         }
-        if self.upload.staging.len() as u64 + len > self.upload.capacity() {
-            self.flush()?;
-            if len > self.upload.capacity() {
-                let capacity = len.max(self.upload.capacity() * 2).next_power_of_two();
-                self.upload.grow(&self.device, capacity);
-            }
-        }
-        let at = self.upload.staging.len() as u64;
+        let at = self.reserve_upload(len, 1)?;
         self.upload.staging.extend_from_slice(data);
         let mut encoder = self.take_encoder();
         encoder.copy_buffer_to_buffer(
@@ -1213,6 +1208,21 @@ impl Gpu {
         Ok(())
     }
 
+    /// Makes room for an upload, flushing first if necessary. Texture copies need both their
+    /// rows and their starting offsets aligned; buffer copies already carry aligned lengths.
+    fn reserve_upload(&mut self, bytes: u64, alignment: u64) -> Result<u64> {
+        let at = align_to(self.upload.staging.len() as u64, alignment);
+        if at + bytes <= self.upload.capacity() {
+            return Ok(at);
+        }
+        self.flush()?;
+        if bytes > self.upload.capacity() {
+            let capacity = bytes.max(self.upload.capacity() * 2).next_power_of_two();
+            self.upload.grow(&self.device, capacity);
+        }
+        Ok(0)
+    }
+
     fn write_texture(
         &mut self,
         handle: u32,
@@ -1223,25 +1233,61 @@ impl Gpu {
         if data.is_empty() {
             return Ok(());
         }
-        self.flush()?;
-        let Resource::Texture { texture, format, .. } = &self.resources[&handle] else {
+        let Resource::Texture { format, .. } = &self.resources[&handle] else {
             unreachable!("the checker checked {handle} is a texture");
         };
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d { x: origin[0], y: origin[1], z: 0 },
-                aspect: wgpu::TextureAspect::All,
+        let row = u64::from(size[0]) * u64::from(format.bytes_per_texel());
+        let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let bytes = padded * u64::from(size[1]);
+        let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
+        let origin = wgpu::Origin3d { x: origin[0], y: origin[1], z: 0 };
+        if bytes > u64::from(stream::UPLOAD_MAX) {
+            self.flush()?;
+            let Resource::Texture { texture, .. } = &self.resources[&handle] else {
+                unreachable!("the checker checked {handle} is a texture");
+            };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo { origin, ..texture.as_image_copy() },
+                data,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row as u32),
+                    rows_per_image: Some(size[1]),
+                },
+                extent,
+            );
+            return Ok(());
+        }
+        let at = self.reserve_upload(bytes, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))?;
+        self.upload.staging.resize(at as usize, 0);
+        if row == padded {
+            self.upload.staging.extend_from_slice(data);
+        } else {
+            self.upload.staging.resize((at + bytes) as usize, 0);
+            for (source, target) in data
+                .chunks_exact(row as usize)
+                .zip(self.upload.staging[at as usize..].chunks_exact_mut(padded as usize))
+            {
+                target[..row as usize].copy_from_slice(source);
+            }
+        }
+        let mut encoder = self.take_encoder();
+        let Resource::Texture { texture, .. } = &self.resources[&handle] else {
+            unreachable!("the checker checked {handle} is a texture");
+        };
+        encoder.copy_buffer_to_texture(
+            wgpu::TexelCopyBufferInfo {
+                buffer: &self.upload.buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: at,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(size[1]),
+                },
             },
-            data,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(size[0] * format.bytes_per_texel()),
-                rows_per_image: Some(size[1]),
-            },
-            wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 },
+            wgpu::TexelCopyTextureInfo { origin, ..texture.as_image_copy() },
+            extent,
         );
+        self.encoder = Some(encoder);
         Ok(())
     }
 
@@ -2027,6 +2073,137 @@ fn resolve(
 mod tests {
     use super::*;
     use wrela_abi::manifest::Pipeline;
+
+    /// Small streaming texture updates interspersed with recorded GPU work. Include GPU
+    /// completion, but leave device creation and the first warm-up out of the samples.
+    #[test]
+    #[ignore = "measure: texture upload throughput, needs a GPU"]
+    fn texture_upload_throughput() {
+        let _lock = crate::lock::GpuLock::alone("texture upload throughput").expect("GPU lock");
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
+        eprintln!("{}", gpu.adapter());
+        gpu.create_buffer(2, 4);
+        gpu.create_buffer(3, 4);
+        for side in [32, 128] {
+            gpu.create_texture(1, [side, side, 0], TextureFormat::Rgba8, false);
+            let bytes = vec![127; (side * side * 4) as usize];
+            let mut samples = Vec::new();
+            for run in 0..8 {
+                let started = std::time::Instant::now();
+                for _ in 0..256 {
+                    gpu.write_texture(1, [0, 0], [side, side], &bytes).unwrap();
+                    gpu.copy_buffer(2, 0, 3, 0, 4);
+                }
+                gpu.read_buffer(3).unwrap();
+                gpu.check_errors().unwrap();
+                let millis = started.elapsed().as_secs_f64() * 1000.0;
+                if run > 0 {
+                    samples.push(millis);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "256 ordered {side}x{side} texture uploads: {:.3} ms median ({samples:?})",
+                samples[3]
+            );
+            gpu.destroy(1);
+        }
+    }
+
+    /// Copies a texture before a later write can replace it, leaving the copy in the current
+    /// encoder so the test checks ordering within and between submissions.
+    fn snapshot_texture(
+        gpu: &mut Gpu,
+        handle: u32,
+        width: u32,
+        height: u32,
+        format: TextureFormat,
+    ) -> wgpu::Buffer {
+        let row = align_to(width * format.bytes_per_texel(), wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let buffer = gpu.readback_buffer(u64::from(row) * u64::from(height));
+        let mut encoder = gpu.take_encoder();
+        let Resource::Texture { texture, .. } = &gpu.resources[&handle] else { unreachable!() };
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        gpu.encoder = Some(encoder);
+        buffer
+    }
+
+    /// A packed texture upload keeps every row and changes only its rectangle. Reads recorded
+    /// before another write keep the earlier texels, even beside buffer uploads whose lengths
+    /// don't meet texture-copy alignment.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn texture_uploads_preserve_rows_rectangles_and_order() {
+        let _lock = crate::lock::GpuLock::acquire("texture upload order").expect("GPU lock");
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
+        gpu.create_buffer(2, 4);
+        for format in [
+            TextureFormat::Rgba8,
+            TextureFormat::Rgba16Float,
+            TextureFormat::R16Float,
+            TextureFormat::Rg16Float,
+            TextureFormat::R32Float,
+            TextureFormat::R32Uint,
+        ] {
+            let texel = format.bytes_per_texel() as usize;
+            gpu.create_texture(1, [5, 4, 0], format, false);
+            let original: Vec<u8> = (0..5 * 4 * texel).map(|i| (i % 251) as u8).collect();
+            gpu.write_buffer(2, 0, &[1, 2, 3, 4]).unwrap();
+            gpu.write_texture(1, [0, 0], [5, 4], &original).unwrap();
+            let before = snapshot_texture(&mut gpu, 1, 5, 4, format);
+            let replacement: Vec<u8> = (0..3 * 2 * texel).map(|i| 255 - i as u8).collect();
+            gpu.write_buffer(2, 0, &[5, 6, 7, 8]).unwrap();
+            gpu.write_texture(1, [1, 1], [3, 2], &replacement).unwrap();
+            gpu.write_texture(1, [0, 0], [0, 4], &[]).unwrap();
+            let after = snapshot_texture(&mut gpu, 1, 5, 4, format);
+            gpu.flush().unwrap();
+            let read = |buffer: &wgpu::Buffer| {
+                map_read(&gpu.device, buffer)
+                    .unwrap()
+                    .chunks_exact(256)
+                    .flat_map(|row| row[..5 * texel].iter().copied())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(read(&before), original, "{format:?}: before overwrite");
+            let mut expected = original;
+            for row in 0..2 {
+                let at = ((row + 1) * 5 + 1) * texel;
+                expected[at..at + 3 * texel]
+                    .copy_from_slice(&replacement[row * 3 * texel..(row + 1) * 3 * texel]);
+            }
+            assert_eq!(read(&after), expected, "{format:?}: after overwrite");
+            assert_eq!(gpu.read_buffer(2).unwrap(), [5, 6, 7, 8]);
+            gpu.destroy(1);
+        }
+        // Padding makes a narrow upload larger than the ring's starting capacity. Growing
+        // it must first submit the buffer write already staged there.
+        let height = stream::UPLOAD_START / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT + 1;
+        gpu.create_texture(1, [1, height, 0], TextureFormat::Rgba8, false);
+        let original: Vec<u8> = (0..height * 4).map(|i| (i % 251) as u8).collect();
+        gpu.write_buffer(2, 0, &[9, 10, 11, 12]).unwrap();
+        gpu.write_texture(1, [0, 0], [1, height], &original).unwrap();
+        let snapshot = snapshot_texture(&mut gpu, 1, 1, height, TextureFormat::Rgba8);
+        gpu.flush().unwrap();
+        let read: Vec<u8> = map_read(&gpu.device, &snapshot)
+            .unwrap()
+            .chunks_exact(256)
+            .flat_map(|row| row[..4].iter().copied())
+            .collect();
+        assert_eq!(read, original);
+        assert_eq!(gpu.read_buffer(2).unwrap(), [9, 10, 11, 12]);
+        gpu.check_errors().unwrap();
+    }
 
     /// A hot reload keeps a pipeline wherever its WGSL file is: a pipeline added before it
     /// renumbers its file, not its entry or its code.

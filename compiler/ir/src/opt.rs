@@ -1717,30 +1717,38 @@ fn inert(m: &Module, f: &Function, e: &Expr) -> bool {
 /// Drops the values nothing uses that are `inert`, or loads of a local's own storage without an
 /// index (which is checked). Then the stores to locals nothing reads any more.
 fn drop_dead_values(m: &Module, f: &mut Function) {
-    loop {
-        let mut uses = vec![0u32; f.values.len()];
-        visit::walk(&f.body, &mut |s| s.for_each_value(&mut |v| uses[v.index()] += 1));
-        let removable = |e: &Expr| match e {
+    let mut uses = vec![0u32; f.values.len()];
+    let mut defs = vec![None; f.values.len()];
+    visit::walk(&f.body, &mut |s| {
+        s.for_each_value(&mut |v| uses[v.index()] += 1);
+        if let Stmt::Let(v, e) = s {
+            defs[v.index()] = Some(e);
+        }
+    });
+    // Removing a value removes its operand uses too. Follow those to the newly dead values,
+    // instead of recounting and sweeping the entire body once per link in a dead chain.
+    let mut work: Vec<usize> =
+        (0..uses.len()).filter(|&i| uses[i] == 0 && defs[i].is_some()).collect();
+    let mut used = vec![true; f.values.len()];
+    while let Some(v) = work.pop() {
+        let Some(e) = defs[v].take() else { continue };
+        let removable = match e {
             Expr::Load(p) => m.local_storage(f, p).is_some() && !p.has_index(),
             e => inert(m, f, e),
         };
-        let mut used = vec![true; f.values.len()];
-        let mut any = false;
-        visit::walk(&f.body, &mut |s| {
-            if let Stmt::Let(v, e) = s
-                && uses[v.index()] == 0
-                && removable(e)
-            {
-                used[v.index()] = false;
-                any = true;
-            }
-        });
-        if !any {
-            break;
+        if removable {
+            used[v] = false;
+            e.for_each_value(&mut |operand| {
+                let count = &mut uses[operand.index()];
+                *count -= 1;
+                if *count == 0 {
+                    work.push(operand.index());
+                }
+            });
         }
-        // A removable value has no effect, so `sweep` drops it; every store stays.
-        sweep(&mut f.body, &used, &vec![true; f.locals.len()]);
     }
+    // A removable value has no effect, so `sweep` drops it; every store stays.
+    sweep(&mut f.body, &used, &vec![true; f.locals.len()]);
     drop_dead_stores(m, f);
 }
 
@@ -3105,6 +3113,67 @@ mod tests {
         ];
         drop_dead_values(&m, &mut f);
         assert_eq!(f.body, vec![Stmt::Let(a, Expr::Zero(big)), Stmt::Return(None)]);
+    }
+
+    /// Dead chains can share operands, live inputs and nested blocks. Checked arithmetic,
+    /// indexed loads, branch conditions and returned values still keep everything they use.
+    #[test]
+    fn cpu_dead_chains_preserve_live_values_and_traps() {
+        let mut m = Module::default();
+        let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
+        let array = m.types.intern(TypeDef::Array(f32t, 4));
+        let params = vec![
+            Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false },
+            Param { name: "i".into(), ty: u32t, by_ref: false, mutable: false },
+        ];
+        let mut f = Function::new("f", params, Some(f32t));
+        let (x, i, cond, checked, indexed) = (
+            f.new_value(f32t),
+            f.new_value(u32t),
+            f.new_value(boolt),
+            f.new_value(u32t),
+            f.new_value(f32t),
+        );
+        let local = f.new_local("array", array);
+        let prefix = vec![
+            Stmt::Let(x, Expr::Param(0)),
+            Stmt::Let(i, Expr::Param(1)),
+            Stmt::Let(cond, Expr::Binary(BinOp::Eq, i, i)),
+            Stmt::Let(checked, Expr::Binary(BinOp::Add, i, i)),
+            Stmt::Let(indexed, Expr::Load(Place::local(local).with(Proj::Index(i)))),
+        ];
+        let mut dead = Vec::new();
+        let mut prev = x;
+        for _ in 0..2048 {
+            let v = f.new_value(f32t);
+            dead.push(Stmt::Let(v, Expr::Binary(BinOp::Mul, prev, prev)));
+            prev = v;
+        }
+        f.body = prefix.clone();
+        f.body.push(Stmt::If { cond, then: dead, else_: Vec::new() });
+        f.body.push(Stmt::Return(Some(x)));
+        drop_dead_values(&m, &mut f);
+        let mut expected = prefix;
+        expected.push(Stmt::If { cond, then: Vec::new(), else_: Vec::new() });
+        expected.push(Stmt::Return(Some(x)));
+        assert_eq!(f.body, expected);
+    }
+
+    #[test]
+    fn cpu_dead_float_values_still_check_nan_in_debug_builds() {
+        let mut m = Module { nan_message: Some((DataId(0), 0)), ..Module::default() };
+        let f32t = m.types.f32();
+        let mut f = Function::new("f", Vec::new(), None);
+        let (a, b, c) = (f.new_value(f32t), f.new_value(f32t), f.new_value(f32t));
+        f.body = vec![
+            Stmt::Let(a, Expr::Const(Const::F32(0.0))),
+            Stmt::Let(b, Expr::Binary(BinOp::Div, a, a)),
+            Stmt::Let(c, Expr::Binary(BinOp::Mul, b, b)),
+            Stmt::Return(None),
+        ];
+        let expected = f.body.clone();
+        drop_dead_values(&m, &mut f);
+        assert_eq!(f.body, expected);
     }
 
     /// A body too large to inline everywhere is inlined where it's called in a loop, and stays

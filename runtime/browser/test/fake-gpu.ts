@@ -32,6 +32,7 @@ export type Event =
   | { kind: "renderPass"; clear: GPUColor; view: string; depth?: string; load?: string }
   | { kind: "writeTexture"; texture: string; origin: unknown; bytesPerRow: number; size: unknown }
   | { kind: "copyBuffer"; from: string; fromOffset: number; to: string; toOffset: number; size: number }
+  | { kind: "copyBufferToTexture"; from: string; fromOffset: number; texture: string; origin: unknown; bytesPerRow: number; rowsPerImage: number; size: unknown }
   | { kind: "dispatchIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
@@ -254,6 +255,14 @@ export class FakeDevice {
       },
       copyBufferToBuffer: (from: FakeBuffer, fromOffset: number, to: FakeBuffer, toOffset: number, size: number) => {
         events.push({ kind: "copyBuffer", from: from.label, fromOffset, to: to.label, toOffset, size });
+      },
+      copyBufferToTexture: (from: GPUTexelCopyBufferInfo, to: GPUTexelCopyTextureInfo, size: GPUExtent3D) => {
+        const buffer = from.buffer as unknown as FakeBuffer;
+        const texture = to.texture as unknown as FakeTexture;
+        events.push({
+          kind: "copyBufferToTexture", from: buffer.label, fromOffset: from.offset ?? 0,
+          texture: texture.label, origin: to.origin, bytesPerRow: from.bytesPerRow!, rowsPerImage: from.rowsPerImage!, size,
+        });
       },
       copyTextureToTexture: (from: { texture: { label: string } }, to: { texture: { label: string } }) => {
         events.push({ kind: "copy", from: from.texture.label, to: to.texture.label });

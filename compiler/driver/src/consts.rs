@@ -89,9 +89,10 @@ pub fn compute(
 ) -> (Vec<Diagnostic>, ConstStats) {
     let mut diags = Vec::new();
     let mut stats = ConstStats::default();
-    let mut pending: Vec<ConstId> = (0..checked.program.consts.len())
+    let mut pending: Vec<(ConstId, BTreeSet<ConstId>)> = (0..checked.program.consts.len())
         .map(|i| ConstId(i as u32))
         .filter(|&c| wrela_lower::is_computed(checked, c))
+        .map(|c| (c, BTreeSet::new()))
         .collect();
     let mut failed = BTreeSet::new();
     let simd = !data.no_simd;
@@ -100,8 +101,17 @@ pub fn compute(
         // that need a constant still to compute wait for the next round.
         let mut ready = Vec::new();
         let mut rest = Vec::new();
-        for &c in &pending {
-            match wrela_lower::lower_consts(checked, &[c], data) {
+        for (c, needs) in pending {
+            // Lowering recorded every value it was missing. If none became available, it
+            // would do the same work again. Retry as soon as *any* is known: it may change
+            // which other constants are needed. Keep the rounds and their ordering intact.
+            let lowered = if !needs.is_empty() && needs.iter().all(|n| !data.values.contains_key(n))
+            {
+                (ConstLowering::Needs(needs), Vec::new())
+            } else {
+                wrela_lower::lower_consts(checked, &[c], data)
+            };
+            match lowered {
                 (ConstLowering::Ready(m), d) => ready.push((c, m, d)),
                 // One that needs a constant the build couldn't compute: that one's error says
                 // why.
@@ -178,7 +188,7 @@ pub fn compute(
                 }
             }
         }
-        pending = rest.into_iter().map(|(c, _)| c).collect();
+        pending = rest;
     }
     for dir in cache {
         const_cache::clean(dir);

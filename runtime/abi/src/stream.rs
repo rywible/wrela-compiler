@@ -88,9 +88,10 @@ pub const COMMAND_HEADER_LEN: usize = 8;
 pub const NONE: u32 = 0xFFFF_FFFF;
 /// A pass's colour attachment that is the screen.
 pub const SCREEN: u32 = 0xFFFF_FFFE;
-/// How both hosts carry out `WriteBuffer` without splitting a submission: its bytes go into an
-/// upload ring, [`UPLOAD_START`] bytes at first, and a copy from there is recorded in order. A
-/// write over [`UPLOAD_MAX`] bytes goes through the queue, between submissions.
+/// How both hosts carry out buffer and texture writes without splitting a submission: their
+/// bytes go into an upload ring, [`UPLOAD_START`] bytes at first, and a copy from there is
+/// recorded in order. Texture rows are padded to 256 bytes. A write over [`UPLOAD_MAX`] bytes
+/// (including row padding) goes through the queue, between submissions.
 pub const UPLOAD_START: u32 = 256 * 1024;
 pub const UPLOAD_MAX: u32 = 16 * 1024 * 1024;
 

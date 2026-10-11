@@ -416,7 +416,7 @@ impl Stmt {
 
 /// Calls `f` on every statement of `b` and of the blocks nested in it, each statement before
 /// those nested in it.
-pub fn walk(b: &[Stmt], f: &mut impl FnMut(&Stmt)) {
+pub fn walk<'a>(b: &'a [Stmt], f: &mut impl FnMut(&'a Stmt)) {
     for s in b {
         f(s);
         for inner in s.blocks() {

@@ -433,7 +433,7 @@ impl<'m> Cx<'m> {
             cx: self,
             f,
             func: &mut func,
-            values: HashMap::new(),
+            values: vec![None; f.values.len()],
             locals: Vec::new(),
             entry,
             io: None,
@@ -494,7 +494,7 @@ struct Fb<'a, 'm> {
     cx: &'a mut Cx<'m>,
     f: &'m ir::Function,
     func: &'a mut Function,
-    values: HashMap<ir::ValueId, Handle<Expression>>,
+    values: Vec<Option<Handle<Expression>>>,
     locals: Vec<Handle<LocalVariable>>,
     /// The entry point being written, or `None` for a function that stays a call.
     entry: Option<&'m ir::EntryPoint>,
@@ -739,8 +739,9 @@ impl<'a, 'm> Fb<'a, 'm> {
 
     fn val(&self, v: ir::ValueId) -> R<Handle<Expression>> {
         self.values
-            .get(&v)
+            .get(v.index())
             .copied()
+            .flatten()
             .ok_or_else(|| format!("internal: v{} has no naga expression", v.0))
     }
 
@@ -802,7 +803,7 @@ impl<'a, 'm> Fb<'a, 'm> {
         match s {
             ir::Stmt::Let(v, e) => {
                 let h = self.value(*v, e, out)?;
-                self.values.insert(*v, h);
+                self.values[v.index()] = Some(h);
                 // Arithmetic is written where it's used (naga binds what's used twice to a
                 // `let` of its own); what reads memory, calls or has an effect is bound where
                 // it is, so it runs in the IR's order.
@@ -1709,6 +1710,37 @@ mod tests {
             inputs: vec![ir::BuiltinInput::GlobalInvocationId],
         });
         m
+    }
+
+    #[test]
+    fn value_table_handles_sparse_and_missing_values() {
+        let mut m = kernel("sparse");
+        let expected = emit(&m).expect("emits").text;
+        let f = &mut m.functions[0];
+        let ty = f.value_ty(ir::ValueId(2));
+        let missing = f.new_value(ty);
+        let moved = f.new_value(ty);
+        for s in &mut f.body {
+            s.for_each_value_mut(&mut |v| {
+                if *v == ir::ValueId(2) {
+                    *v = moved;
+                }
+            });
+            if let ir::Stmt::Let(v, _) = s
+                && *v == ir::ValueId(2)
+            {
+                *v = moved;
+            }
+        }
+        assert_eq!(emit(&m).expect("sparse values emit").text, expected);
+        for v in [missing, ir::ValueId(100)] {
+            let ir::Stmt::Store(_, value) = &mut m.functions[0].body[3] else { unreachable!() };
+            *value = v;
+            assert_eq!(
+                to_naga(&m).expect_err("an undefined value"),
+                format!("internal: v{} has no naga expression", v.0)
+            );
+        }
     }
 
     /// The text has no indentation, and a struct's name is cut to 32 characters (#42 AC9's size
