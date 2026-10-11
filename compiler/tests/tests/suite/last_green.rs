@@ -922,20 +922,29 @@ fn the_trails_read_as_paths() {
     assert!(weak.is_empty(), "trails under 8/255 from the ground beside them: {weak:?}");
 }
 
-/// The look's flicker over the floor's walk's first 10 s at a run (the wind still): each frame
-/// warped into the one before it, by spike 12's measure (`camera::warp_error`: the earlier frame
-/// sampled bilinearly where it sees the same surface, the sky, the stand-in and water left out:
-/// water moves by design, #55's Method). `plain`: the same content drawn as plain rendering, at
-/// the output's size, with no temporal AA, no jitter and no look. The mean warp error (/255), the
-/// share of pixels over 8/255, and each class's mean. A frame and the next every 4 frames (every
-/// frame at full size).
-fn floor_flicker(plain: bool) -> (f64, f64, [f64; 9]) {
+/// How much a run of frames flickers (`floor_flicker`): the mean warp error (/255), the share of
+/// pixels over 8/255, and each class's mean; and the largest step in the screen's mean
+/// brightness from a frame to the next, as a share of it.
+struct Flicker {
+    mean: f64,
+    share: f64,
+    by: [f64; 9],
+    step: f64,
+}
+
+/// The look's flicker on the floor in motion, with the wind blowing: over the floor's walk's first
+/// 10 s at a run, and over the first second shown after a jump to the beech wood's lookbook shot
+/// (arriving somewhere: the frames are black until the light there is drawn). Each frame warped into the one before it, by spike 12's measure
+/// (`camera::warp_error`: the earlier frame sampled bilinearly where it sees the same surface,
+/// or the same sky); nothing left out, so the leaves in the wind, the water, the sky and the
+/// stand-in are in it, as they are in plain rendering's. `plain`: the same content drawn as plain
+/// rendering, at the output's size, with no temporal AA, no jitter and no look. On the walk, a
+/// frame and the next every 4 frames (every frame at full size); after the jump, every frame.
+fn floor_flicker(plain: bool) -> (Flicker, Flicker) {
     use wrela_tests::camera::{Seen, warp_error};
     let (w, h) = (960usize, 540usize);
-    let every = wrela_tests::sized(4, 1);
     let name = if plain { "last-green-flicker-plain" } else { "last-green-flicker" };
     let mut f = Floor::load_sized(name, (w as u32, h as u32));
-    f.call("test_wind", &[wrela_host::Value::I32(0)]);
     if plain {
         f.call("test_plain", &[wrela_host::Value::I32(1)]);
     }
@@ -949,69 +958,121 @@ fn floor_flicker(plain: bool) -> (f64, f64, [f64; 9]) {
         let tags = f.capture(CAPTURE_TAGS);
         (f.host.read_screen().expect("the screen"), depth, cam, tags)
     };
-    let mut last = grab(&mut f);
-    let (mut sum, mut over, mut motion, mut pairs) = (0.0, 0.0, 0.0, 0usize);
-    let mut worst = (0.0f64, 0u32);
-    let mut by = [(0.0f64, 0usize); 9];
-    let end = f.frame + 600;
-    while f.frame < end {
+    // `frames` frames from now, a pair every `every`.
+    let measure = |f: &mut Floor, frames: u32, every: u32, what: &str| {
+        let mut last = grab(f);
+        let (mut sum, mut over, mut motion, mut pairs) = (0.0, 0.0, 0.0, 0usize);
+        let mut step = 0.0f64;
+        let mut worst = (0.0f64, 0u32);
+        let mut by = [(0.0f64, 0usize); 9];
+        let end = f.frame + frames;
+        while f.frame < end {
+            f.step();
+            if !f.frame.is_multiple_of(every) {
+                // The first frame of the next pair.
+                if (f.frame + 1).is_multiple_of(every) {
+                    last = grab(f);
+                }
+                continue;
+            }
+            let now = grab(f);
+            let (a, b) = (brightness(&last.0), brightness(&now.0));
+            step = step.max((b - a).abs() / a.max(1.0));
+            let warp = warp_error(&Seen::of(&last), &Seen::of(&now), (w, h), &[], &mut by);
+            if warp.n > 10000 {
+                sum += warp.mean;
+                over += warp.over;
+                motion += warp.motion;
+                pairs += 1;
+                if warp.mean > worst.0 {
+                    worst = (warp.mean, f.frame);
+                }
+            }
+            last = now;
+        }
+        let p = pairs.max(1) as f64;
+        let (mean, share) = (sum / p, over / p);
+        println!(
+            "{}, {what}: flicker over {pairs} frames: mean warp error {mean:.3}/255, {:.2}% over 8/255, at {:.2} px a frame; worst {:.3}/255 at frame {}; brightness's largest step {:.1}%",
+            if plain { "plain" } else { "the look" },
+            share * 100.0,
+            motion / p,
+            worst.0,
+            worst.1,
+            step * 100.0
+        );
+        assert!(pairs * every as usize * 3 > frames as usize * 2, "only {pairs} frames compared");
+        Flicker { mean, share, by: by.map(|(s, n)| s / n.max(1) as f64), step }
+    };
+    let walk = measure(&mut f, 600, wrela_tests::sized(4, 1), "the walk");
+    // The walk stopped, and a jump to the beech wood's shot, dark after the open: its first
+    // second shown.
+    f.keys(f.frame + 1, &["KeyP", "KeyL", "Digit2", "Enter"]);
+    f.steps(2);
+    let from = f.frame;
+    while brightness(&f.host.read_screen().expect("the screen")) < 0.5 {
+        assert!(f.frame < from + 240, "the beech wood not shown 4 s after the jump");
         f.step();
-        if !f.frame.is_multiple_of(every) {
-            // The first frame of the next pair.
-            if (f.frame + 1).is_multiple_of(every) {
-                last = grab(&mut f);
-            }
-            continue;
-        }
-        let now = grab(&mut f);
-        let warp =
-            warp_error(&Seen::of(&last), &Seen::of(&now), (w, h), &[0, 5, CLASS_WATER], &mut by);
-        if warp.n > 10000 {
-            sum += warp.mean;
-            over += warp.over;
-            motion += warp.motion;
-            pairs += 1;
-            if warp.mean > worst.0 {
-                worst = (warp.mean, f.frame);
-            }
-        }
-        last = now;
     }
-    let p = pairs.max(1) as f64;
-    let (mean, share) = (sum / p, over / p);
-    println!(
-        "{}: flicker over {pairs} frames: mean warp error {mean:.3}/255, {:.2}% over 8/255, at {:.2} px a frame; worst {:.3}/255 at frame {}",
-        if plain { "plain" } else { "the look" },
-        share * 100.0,
-        motion / p,
-        worst.0,
-        worst.1
-    );
-    assert!(pairs > 400 / every as usize, "only {pairs} frames compared");
-    (mean, share, by.map(|(s, n)| s / n.max(1) as f64))
+    println!("arriving: black for {} frames", f.frame - from);
+    let arrival = measure(&mut f, 60, 1, "arriving");
+    (walk, arrival)
 }
 
-/// AC10's flicker on the floor's walk, by M5's criterion (#51 Q8): the look flickers no more
-/// than the same content drawn as plain rendering, by at most 0.5/255 of mean warp error and 0.5
-/// points of pixels over 8/255. Each class's means are printed.
+/// A screen's mean brightness (of 255: its RGB's mean).
+fn brightness(rgba: &[u8]) -> f64 {
+    let sum: u64 =
+        rgba.chunks_exact(4).map(|p| u64::from(p[0]) + u64::from(p[1]) + u64::from(p[2])).sum();
+    sum as f64 / (rgba.len() / 4 * 3) as f64
+}
+
+/// AC10's flicker on the floor in motion, by M5's criterion (#51 Q8): on the walk and after
+/// arriving somewhere, the look flickers no more than the same content drawn as plain
+/// rendering, by at most 0.5/255 of mean warp error and 0.5 points of pixels over 8/255; and
+/// arriving, the light comes with the first frame shown: the screen's brightness changes by at
+/// most 3% from a frame to the next (the near shadows and the probes, drawn after the jump, were
+/// steps of 50% and 80%). Each class's means are printed.
 #[test]
 #[ignore = "long: bakes the floor and walks it twice, needs a GPU"]
 fn the_floor_doesnt_flicker_on_its_walk() {
-    let (look, look_share, look_by) = floor_flicker(false);
-    let (plain, plain_share, plain_by) = floor_flicker(true);
-    let names = ["sky", "ground", "grass", "leaves", "bark", "stand-in", "rock", "flowers"];
-    for k in [1, 2, 3, 4, 6, 7] {
-        println!("  {}: the look {:.3}/255, plain {:.3}/255", names[k], look_by[k], plain_by[k]);
+    let (look_walk, look_arrival) = floor_flicker(false);
+    let (plain_walk, plain_arrival) = floor_flicker(true);
+    let arrival_step = look_arrival.step;
+    let names =
+        ["sky", "ground", "grass", "leaves", "bark", "stand-in", "rock", "flowers", "water"];
+    for (what, look, plain) in
+        [("the walk", look_walk, plain_walk), ("arriving", look_arrival, plain_arrival)]
+    {
+        for (k, name) in names.iter().enumerate() {
+            println!(
+                "  {what}, {name}: the look {:.3}/255, plain {:.3}/255",
+                look.by[k], plain.by[k]
+            );
+        }
+        println!(
+            "{what}, the look against plain: {:.3} against {:.3}/255, {:.2}% against {:.2}% over 8/255",
+            look.mean,
+            plain.mean,
+            look.share * 100.0,
+            plain.share * 100.0
+        );
+        assert!(
+            look.mean <= plain.mean + 0.5,
+            "{what}: the look's warp error is {}/255, plain's {}/255",
+            look.mean,
+            plain.mean
+        );
+        assert!(
+            look.share <= plain.share + 0.005,
+            "{what}: {} of the look's pixels over 8/255, {} of plain's",
+            look.share,
+            plain.share
+        );
     }
-    println!(
-        "the look against plain: {look:.3} against {plain:.3}/255, {:.2}% against {:.2}% over 8/255",
-        look_share * 100.0,
-        plain_share * 100.0
-    );
-    assert!(look <= plain + 0.5, "the look's warp error is {look}/255, plain's {plain}/255");
     assert!(
-        look_share <= plain_share + 0.005,
-        "{look_share} of the look's pixels over 8/255, {plain_share} of plain's"
+        arrival_step <= 0.03,
+        "arriving, the look's brightness steps {:.1}% from a frame to the next",
+        arrival_step * 100.0
     );
 }
 

@@ -126,8 +126,9 @@ pub struct Warp {
 
 /// Frame `b` warped into frame `a` (spike 12's flicker measure), on outputs `size` wide and
 /// high, every other pixel each way: each output pixel of `b`, at its depth (the scene's sample
-/// nearest it), seen by `a`'s camera, against `a` there, sampled bilinearly. Pixels of a class in
-/// `left_out` (in either frame), or disoccluded (a's depth not within 2%), are left out. Each
+/// nearest it; the sky's, a direction), seen by `a`'s camera, against `a` there, sampled
+/// bilinearly. Pixels of a class in `left_out` (in either frame), or disoccluded (a's depth not
+/// within 2%, or not the sky where b's is), are left out. Each
 /// class's sum and count are added to `by`.
 pub fn warp_error(
     a: &Seen,
@@ -153,9 +154,10 @@ pub fn warp_error(
             let (qx, qy) =
                 (((x as f64 + 0.5) / scale) as usize, ((y as f64 + 0.5) / scale) as usize);
             let z = f64::from(b.depth[qy.min(sh - 1) * sw + qx.min(sw - 1)]);
-            if z <= 0.0 {
-                continue;
-            }
+            // The sky (no depth): a direction, a million metres out, so only the camera's turn
+            // moves it.
+            let sky = z <= 0.0;
+            let z = if sky { ub.near * 1e-6 } else { z };
             let p = ub.world_at([(x as f64 + 0.5) / scale, (y as f64 + 0.5) / scale], z);
             let Some((pa, za)) = ua.project(p, [w as f64, h as f64]) else { continue };
             let (ax, ay) = (pa[0].floor(), pa[1].floor());
@@ -168,7 +170,7 @@ pub fn warp_error(
             // A sees the same surface there (its depth within 2%), as spike 12 asks.
             let (sx, sy) = ((pa[0] / scale) as usize, (pa[1] / scale) as usize);
             let zs = f64::from(a.depth[sy.min(sh - 1) * sw + sx.min(sw - 1)]);
-            if (zs - za).abs() > za * 0.02 {
+            if if sky { zs > 0.0 } else { (zs - za).abs() > za * 0.02 } {
                 continue;
             }
             // A sampled bilinearly, as spike 12 samples it: the measure includes resampling's
