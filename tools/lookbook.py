@@ -22,10 +22,13 @@ interest check's view at its eye (the build's `files/check/shots.json`), are pri
 `check.json`.
 
 `--capture` takes each still in capture mode (F7, `Floor::capture` in examples/last-green/main.wrela):
-the still is the frame the floor prints `still at frame N` on, a 16-frame resolve once the light
-round the eye is in, not the frame 5 s in (shot 2 at 1080p on a 4-core cloud machine: 244 s, not
-460 s). With `--warm`, one process takes every shot's still in turn, so the floor loads once:
-after a shot's still, the next shot is chosen (shots 2, 7 and 9: 383 s, the same pixels).
+the floor does its load in a few frames, and the still is the frame it prints `still at frame N` on,
+a 16-frame resolve once the light round the eye is in, not the frame 5 s in (shot 2 at 1080p on a
+4-core cloud machine: 136 s, not 460 s; 37 s of it is the host's start, lavapipe compiling the
+pipelines). With `--warm`, one process takes every shot's still in turn, so the floor loads once:
+after a shot's still, the next shot is chosen (shots 2, 7 and 9: 176 s, about 20 s a shot after
+the first). A warm shot can differ from the same shot taken cold (shot 7 after shot 2: the far
+shore lit, not shaded, 8/255 apart on average), as after a travel in play: take a baseline cold.
 """
 
 import json, os, re, shutil, subprocess, sys, tempfile
