@@ -547,14 +547,21 @@ impl Gpu {
             old_keys.into_iter().zip(std::mem::take(&mut self.pipelines)).collect();
         // The last build's spares go; those got ready for a build stay.
         self.spare.retain(|_, (_, prepared)| *prepared);
+        let mut kept = Vec::new();
+        let mut missing = Vec::new();
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
             let key = pipeline_key(p, source);
-            let pipeline = match old.remove(&key).or_else(|| self.spare.remove(&key).map(|s| s.0)) {
-                Some(kept) => kept,
-                None => self.builder().build(p, source)?,
-            };
-            self.pipelines.push(pipeline);
+            let have = old.remove(&key).or_else(|| self.spare.remove(&key).map(|s| s.0));
+            if have.is_none() {
+                missing.push((p, source.as_str()));
+            }
+            kept.push(have);
             self.pipeline_keys.push(key);
+        }
+        let mut built = self.builder().build_many(&missing)?.into_iter();
+        for have in kept {
+            self.pipelines
+                .push(have.unwrap_or_else(|| built.next().expect("one built for each missing")));
         }
         for (key, pipeline) in old {
             self.spare.entry(key).or_insert((pipeline, false));
@@ -658,14 +665,43 @@ impl Builder {
         shaders: &[String],
         have: &HashSet<u64>,
     ) -> Result<Ready> {
-        let mut out = Vec::new();
+        let mut keys = Vec::new();
+        let mut missing = Vec::new();
         for (p, source) in manifest.pipelines.iter().zip(shaders) {
             let key = pipeline_key(p, source);
-            if !have.contains(&key) && !out.iter().any(|(k, _)| *k == key) {
-                out.push((key, self.build(p, source)?));
+            if !have.contains(&key) && !keys.contains(&key) {
+                keys.push(key);
+                missing.push((p, source.as_str()));
             }
         }
-        Ok(out)
+        Ok(keys.into_iter().zip(self.build_many(&missing)?).collect())
+    }
+
+    /// Each of `jobs` built, in order, on as many threads as the machine has cores: a software
+    /// GPU (lavapipe) compiles a pipeline on the thread that makes it, and a floor has hundreds
+    /// (wgpu's error scopes, which catch a shader's errors, are each thread's own). The first
+    /// failure in order, if any.
+    fn build_many(&self, jobs: &[(&wrela_abi::manifest::Pipeline, &str)]) -> Result<Vec<Pipeline>> {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(jobs.len());
+        if threads <= 1 {
+            return jobs.iter().map(|(p, source)| self.build(p, source)).collect();
+        }
+        let next = AtomicUsize::new(0);
+        let mut results: Vec<Option<Result<Pipeline>>> = (0..jobs.len()).map(|_| None).collect();
+        let done = Mutex::new(&mut results);
+        std::thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((p, source)) = jobs.get(i) else { break };
+                        let r = self.build(p, source);
+                        done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+                    }
+                });
+            }
+        });
+        results.into_iter().map(|r| r.expect("every job ran")).collect()
     }
 
     fn build(&self, p: &wrela_abi::manifest::Pipeline, source: &str) -> Result<Pipeline> {
