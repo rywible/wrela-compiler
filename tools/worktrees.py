@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 
 GIB = 1024**3
 MIN_FREE = 12 * GIB
@@ -36,6 +37,12 @@ def common_dir(cwd):
     return Path(result.stdout.strip()) if result.returncode == 0 else None
 
 
+def checkout_root(cwd):
+    result = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                            cwd=cwd, capture_output=True, text=True)
+    return Path(result.stdout.strip()) if result.returncode == 0 else Path(cwd).resolve()
+
+
 def environment(cwd):
     common = common_dir(cwd)
     if common is None:
@@ -45,6 +52,99 @@ def environment(cwd):
     return {"CARGO_TARGET_DIR": os.environ.get("CARGO_TARGET_DIR", str(cache / "cargo")),
             "WRELA_NATIVE_CACHE": os.environ.get("WRELA_NATIVE_CACHE", str(cache / "native")),
             "WRELA_CONST_CACHE": os.environ.get("WRELA_CONST_CACHE", str(cache / "const"))}
+
+
+def cargo_workspace_root(cwd):
+    """Find the enclosing workspace, respecting a nested or excluded fixture package."""
+    nearest = None
+    for root in [Path(cwd).resolve(), *Path(cwd).resolve().parents]:
+        manifest = root / "Cargo.toml"
+        if not manifest.is_file():
+            continue
+        nearest = nearest or root
+        data = tomllib.loads(manifest.read_text())
+        if "workspace" in data:
+            excluded = [path for pattern in data["workspace"].get("exclude", [])
+                        for path in root.glob(pattern)]
+            return nearest if any(nearest.is_relative_to(path) for path in excluded) else root
+    return nearest
+
+
+def cargo_workspace_packages(cwd):
+    """Package names, not target names or a prefix shared by unrelated dependencies."""
+    root = cargo_workspace_root(cwd)
+    if root is None:
+        return []
+    manifest = root / "Cargo.toml"
+    workspace = tomllib.loads(manifest.read_text())
+    manifests = {manifest} if "package" in workspace else set()
+    for member in workspace.get("workspace", {}).get("members", []):
+        manifests.update(path / "Cargo.toml" for path in root.glob(member))
+    return sorted({tomllib.loads(path.read_text())["package"]["name"] for path in manifests})
+
+
+def cargo_workspace_fingerprints(target, packages):
+    """Workspace fingerprints in every profile, including cross-compiled targets."""
+    directories = [*target.glob("*/.fingerprint"), *target.glob("*/*/.fingerprint")]
+    return sorted(path for directory in directories for path in directory.iterdir()
+                  if path.is_dir() and not path.is_symlink()
+                  and path.name.rsplit("-", 1)[0] in packages)
+
+
+def cargo_artifact_signature(target, packages):
+    # Cargo can overwrite an entry with identical fingerprint bytes from another checkout.
+    # Its write times/inodes reveal this even when that checkout predates this guard.
+    result = {}
+    for directory in cargo_workspace_fingerprints(target, packages):
+        for path in sorted(directory.rglob("*")):
+            if path.is_file():
+                stat = path.stat()
+                result[str(path.relative_to(target))] = [stat.st_ino, stat.st_size, stat.st_mtime_ns]
+    return result
+
+
+def prepare_cargo_cache(cwd, target, source):
+    """Under job admission, reject workspace artifacts from different or unknown inputs.
+
+    Cargo's relative paths and mtime checks can accept an older checkout's different source.
+    Keep compiled dependencies and incremental data; remove only workspace freshness records
+    when changing inputs, checkout, or after an unrecorded writer touched those records.
+    """
+    packages = cargo_workspace_packages(cwd)
+    if not packages:
+        return None
+    target = Path(target)
+    target.mkdir(parents=True, exist_ok=True)
+    record = target / ".wrela-workspace.json"
+    try:
+        previous = json.loads(record.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        previous = {}
+    identity = {"checkout": str(cargo_workspace_root(cwd)), "source": source, "packages": packages}
+    # Include removed/renamed packages whose old records may still be in this shared target.
+    all_packages = set(packages) | set(previous.get("identity", {}).get("packages", []))
+    artifacts = cargo_artifact_signature(target, all_packages)
+    if source.get("inputs") is None or previous.get("identity") != identity \
+            or previous.get("artifacts") != artifacts:
+        for directory in cargo_workspace_fingerprints(target, all_packages):
+            shutil.rmtree(directory)
+    # A killed job must not leave a record that certifies artifacts it might have replaced.
+    record.unlink(missing_ok=True)
+    return {"target": target, "record": record, "identity": identity}
+
+
+def finish_cargo_cache(state, source):
+    """Record only a completed job's unchanged inputs; never record a test pass here."""
+    if state is None or source.get("inputs") is None or state["identity"]["source"] != source:
+        return
+    record = state["record"]
+    # A cache-prune job may have removed the target itself.
+    record.parent.mkdir(parents=True, exist_ok=True)
+    data = {"identity": state["identity"],
+            "artifacts": cargo_artifact_signature(state["target"], state["identity"]["packages"])}
+    temporary = record.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, sort_keys=True) + "\n")
+    temporary.replace(record)
 
 
 def allocated(path):

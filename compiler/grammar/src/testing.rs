@@ -5,7 +5,19 @@ use std::path::{Path, PathBuf};
 
 /// The repository's root.
 pub fn repo_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    // The test runner sets this for its checkout. A shared Cargo cache can retain a
+    // different checkout's manifest path in the compiled test executable.
+    let runtime = std::env::var_os("CARGO_MANIFEST_DIR");
+    repo_root_from(runtime.as_deref().map(Path::new), Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("the test manifest must be inside the Wrela repository")
+}
+
+fn repo_root_from(runtime: Option<&Path>, compiled: &Path) -> Option<PathBuf> {
+    runtime
+        .unwrap_or(compiled)
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("spec/grammar.ebnf").is_file())
+        .map(Path::to_path_buf)
 }
 
 /// The stack of each thread [`par_map_with`] and [`with_big_stack`] start: the oracle's
@@ -111,6 +123,31 @@ pub fn files_under(dir: &Path, exts: &[&str]) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repo_root_uses_the_running_checkout_and_rejects_an_unrelated_manifest() {
+        let dir = std::env::temp_dir().join(format!("wrela-repo-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let compiled = dir.join("compiled");
+        let runtime = dir.join("runtime");
+        for root in [&compiled, &runtime] {
+            std::fs::create_dir_all(root.join("spec")).expect("spec directory");
+            std::fs::create_dir_all(root.join("compiler/tests")).expect("test package");
+            std::fs::write(root.join("Cargo.toml"), "[workspace]").expect("workspace manifest");
+            std::fs::write(root.join("compiler/tests/Cargo.toml"), "[package]")
+                .expect("package manifest");
+            std::fs::write(root.join("spec/grammar.ebnf"), "").expect("grammar marker");
+        }
+        let compiled_manifest = compiled.join("compiler/tests");
+        assert_eq!(
+            repo_root_from(Some(&runtime.join("compiler/tests")), &compiled_manifest),
+            Some(runtime.clone())
+        );
+        assert_eq!(repo_root_from(None, &compiled_manifest), Some(compiled));
+        // An invalid runtime path must not silently redirect a run to the old checkout.
+        assert_eq!(repo_root_from(Some(&dir), &compiled_manifest), None);
+        std::fs::remove_dir_all(dir).expect("remove fixture");
+    }
 
     #[test]
     fn files_under_skips_hidden_directories_and_build_output() {

@@ -102,6 +102,12 @@ def admitted():
         # The command keeps its inherited lease if a supervisor is killed. Its descendants
         # must keep using that admission rather than queue behind their own live reservation.
         if pid in (job["owner"], job.get("worker")):
+            from worktrees import checkout_root, common_dir
+            expected = checkout_root(job["cwd"])
+            actual = checkout_root(os.getcwd())
+            if actual != expected and (common_dir(actual) is not None or not actual.is_relative_to(expected)):
+                raise ValueError(f"an admitted job must stay in checkout {expected}; "
+                                 f"queue work in {actual} separately")
             return True
         pid = parents.get(pid, 1)
     return False
@@ -109,6 +115,8 @@ def admitted():
 
 def fingerprint(cwd):
     """Include dirty tracked and untracked inputs, not merely the branch name."""
+    from worktrees import checkout_root
+    cwd = checkout_root(cwd)
     try:
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL).strip().decode()
         digest = hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=cwd))
@@ -229,10 +237,10 @@ def run(kind, command, timeout=None, key=None, verify=False, maintenance=True):
         if cancelled:
             print(f"{identifier[:8]}: cancelled before admission", file=sys.stderr)
             return 130
-        from worktrees import environment, maintain
+        from worktrees import checkout_root, environment, finish_cargo_cache, maintain, prepare_cargo_cache
         env = {**os.environ, **environment(cwd)}
         if maintenance:
-            maintain(cwd)
+            maintain(checkout_root(cwd))
         workers = cpu_count() if kind == "measure" else 1 if job["pressure_at_start"] else min(2, worker_count())
         env.update(WRELA_JOB_ID=identifier, WRELA_CPU_WORKERS=str(workers),
                    WRELA_TEST_PROGRAMS="1", RAYON_NUM_THREADS=str(workers),
@@ -245,6 +253,7 @@ def run(kind, command, timeout=None, key=None, verify=False, maintenance=True):
             env["LP_NUM_THREADS"] = "2"
         # The inputs checked are those at admission, after any wait and cache maintenance.
         job["source"] = fingerprint(cwd)
+        cargo_cache = prepare_cargo_cache(cwd, env["CARGO_TARGET_DIR"], job["source"])
         with locked(root):
             if cancelled or json.loads(path.read_text()).get("cancelled"):
                 print(f"{identifier[:8]}: cancelled before command start", file=sys.stderr)
@@ -291,6 +300,7 @@ def run(kind, command, timeout=None, key=None, verify=False, maintenance=True):
             # admission has been returned. Only descendants observed as ours are stopped.
             _stop(proc, descendants)
         after = fingerprint(cwd)
+        finish_cargo_cache(cargo_cache, after)
         if verify and status == 0 and after != job["source"]:
             status = 1
             print("source inputs changed during this job; its success does not verify the current tree", file=sys.stderr)
