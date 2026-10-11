@@ -5,10 +5,12 @@
 //! function it doesn't call leaves its module, and its key, as they were.
 //!
 //! The cache is a directory of files in the package's `build` directory (`build/consts`), one
-//! per key, each a constant's value ([`encode`]), or the directory `WRELA_CONST_CACHE` names,
-//! which every package and checkout that sets it share. A file is written whole to a temporary
-//! name and renamed into place, so two builds at once never read half of one. Files no build has
-//! used for a week are removed.
+//! per key, each a constant's value ([`encode`]); and, when `WRELA_CONST_CACHE` names one, a
+//! directory every package and checkout that set it share. A build reads the package's first,
+//! then the shared one (a hit there is kept in the package's too), and writes both: so the
+//! tests, which read only the package's, find what a session's builds computed or found. A file
+//! is written whole to a temporary name and renamed into place, so two builds at once never read
+//! half of one. Files no build has used for a week are removed.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -22,20 +24,38 @@ const MAGIC: &[u8; 8] = b"wrelac\x00\x02";
 /// How long an entry no build has used is kept.
 const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
-/// The cache's directory for the package at `root`: `WRELA_CONST_CACHE` when it's set, else
-/// its `build/consts`. One directory can serve every package and checkout, as a key is all a
-/// value depends on: a fresh checkout reads the constants another one computed.
-pub fn dir_of(root: &Path) -> Option<PathBuf> {
-    dir_in(root, std::env::var_os("WRELA_CONST_CACHE"))
+/// The cache's directories for the package at `root`, in the order a build reads them: its
+/// `build/consts`, then the one `WRELA_CONST_CACHE` names, if it's set. One directory can serve
+/// every package and checkout, as a key is all a value depends on: a fresh checkout reads the
+/// constants another one computed.
+pub fn dirs_of(root: &Path) -> Vec<PathBuf> {
+    dirs_in(root, std::env::var_os("WRELA_CONST_CACHE"))
 }
 
-fn dir_in(root: &Path, shared: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    let dir = match shared.filter(|d| !d.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => root.canonicalize().ok()?.join("build").join("consts"),
-    };
-    safe(&dir)?;
-    Some(dir)
+fn dirs_in(root: &Path, shared: Option<std::ffi::OsString>) -> Vec<PathBuf> {
+    let own = root.canonicalize().ok().map(|r| r.join("build").join("consts"));
+    let shared = shared.filter(|d| !d.is_empty()).map(PathBuf::from);
+    own.into_iter().chain(shared).filter(|d| safe(d).is_some()).collect()
+}
+
+/// The value cached under `key` in the first of `dirs` that has it, kept in each before it.
+pub fn get_in(dirs: &[PathBuf], key: &str) -> Option<Value> {
+    for (i, dir) in dirs.iter().enumerate() {
+        if let Some(v) = get(dir, key) {
+            for earlier in &dirs[..i] {
+                put(earlier, key, &v);
+            }
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Stores `value` under `key` in each of `dirs`.
+pub fn put_in(dirs: &[PathBuf], key: &str, value: &Value) {
+    for dir in dirs {
+        put(dir, key, value);
+    }
 }
 
 /// Refuses a link in a cache path. For the package-owned `<package>/build/consts`, checks from
@@ -401,13 +421,30 @@ mod tests {
     }
 
     #[test]
-    fn the_cache_is_the_shared_directory_else_the_packages() {
+    fn the_cache_is_the_packages_then_the_shared_directory() {
         let root = std::env::temp_dir();
-        let canonical = root.canonicalize().expect("temporary directory");
-        assert_eq!(dir_in(&root, None), Some(canonical.join("build/consts")));
-        assert_eq!(dir_in(&root, Some("".into())), Some(canonical.join("build/consts")));
-        assert_eq!(dir_in(&root, Some("/s/c".into())), Some(PathBuf::from("/s/c")));
-        assert_eq!(dir_in(Path::new("/no/such/package"), None), None);
+        let own = root.canonicalize().expect("temporary directory").join("build/consts");
+        assert_eq!(dirs_in(&root, None), std::slice::from_ref(&own));
+        assert_eq!(dirs_in(&root, Some("".into())), std::slice::from_ref(&own));
+        assert_eq!(dirs_in(&root, Some("/s/c".into())), [own, PathBuf::from("/s/c")]);
+        assert_eq!(dirs_in(Path::new("/no/such/package"), None), Vec::<PathBuf>::new());
+    }
+
+    #[test]
+    fn a_value_found_in_the_shared_directory_is_kept_in_the_packages() {
+        let base = std::env::temp_dir().join(format!("wrela-consts-two-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (own, shared) = (base.join("own"), base.join("shared"));
+        let dirs = [own.clone(), shared.clone()];
+        let (k, v) = (key(b"\0asm two", 1), Value::Bytes(vec![7]));
+        put(&shared, &k, &v);
+        assert!(get(&own, &k).is_none());
+        assert_eq!(get_in(&dirs, &k), Some(v.clone()));
+        assert_eq!(get(&own, &k), Some(v.clone()), "kept in the package's");
+        let k2 = key(b"\0asm three", 1);
+        put_in(&dirs, &k2, &v);
+        assert!(get(&own, &k2).is_some() && get(&shared, &k2).is_some(), "written to both");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -471,7 +508,7 @@ mod tests {
         let pkg = std::env::temp_dir().join(format!("wrela-consts-clean-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&pkg);
         std::fs::create_dir_all(&pkg).expect("package");
-        let dir = dir_in(&pkg, None).expect("cache path");
+        let dir = dirs_in(&pkg, None).into_iter().next().expect("cache path");
         std::fs::create_dir_all(&dir).expect("cache directory");
         let key = "1".repeat(64);
         let entry = dir.join(format!("{key}.wcv"));
@@ -507,8 +544,8 @@ mod tests {
         std::fs::write(outside.join("important.txt"), "keep").expect("outside file");
         symlink(&outside, pkg.join("build/consts")).expect("symlink");
 
-        assert!(dir_in(&pkg, None).is_none());
-        assert!(dir_in(&pkg, Some(pkg.join("build/consts").into_os_string())).is_none());
+        assert!(dirs_in(&pkg, None).is_empty());
+        assert!(dirs_in(&pkg, Some(pkg.join("build/consts").into_os_string())).is_empty());
         clean(&pkg.join("build/consts"));
         assert_eq!(
             std::fs::read_to_string(outside.join("important.txt")).expect("outside file remains"),

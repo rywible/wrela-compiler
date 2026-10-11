@@ -323,8 +323,8 @@ pub fn with_partial<T: Send>(
         let mut lowered = None;
         if lower && !has_errors(&diagnostics) {
             let mut data = wrela_lower::BuildData::default();
-            let cache = const_cache::dir_of(root);
-            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
+            let cache = const_cache::dirs_of(root);
+            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
             if !has_errors(&diagnostics) {
                 let roots = wrela_lower::Roots::every_fn(&checked);
                 lowered = Some(wrela_lower::lower(&checked, &roots, &data, false).0);
@@ -437,8 +437,8 @@ fn run_tests(
     // A debug build's checks, as `wrela build --debug` makes them (§11).
     let mut data = wrela_lower::BuildData { debug: true, testing: true, ..Default::default() };
     let mut filtered_out = 0;
-    let cache = const_cache::dir_of(root);
-    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
+    let cache = const_cache::dirs_of(root);
+    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
     let mut results = Vec::new();
     if !has_errors(&diagnostics) {
         // The package's tests, in the order written.
@@ -582,8 +582,8 @@ fn compile_loaded(
         testing: mode.testing,
         ..Default::default()
     };
-    let cache = const_cache::dir_of(root);
-    let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
+    let cache = const_cache::dirs_of(root);
+    let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
     if !lift.is_empty() && !has_errors(&diagnostics) {
         data.lift = Some(lift::table(&checked, &sources, &lifted_files));
     }
@@ -631,7 +631,7 @@ fn prepare(
     dirs: &[std::path::PathBuf],
     data: &mut wrela_lower::BuildData,
     diagnostics: &mut Vec<Diagnostic>,
-    cache: Option<&Path>,
+    cache: &[std::path::PathBuf],
 ) -> consts::ConstStats {
     if has_errors(diagnostics) {
         return consts::ConstStats::default();

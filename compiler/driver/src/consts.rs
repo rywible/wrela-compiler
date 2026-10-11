@@ -79,13 +79,13 @@ pub struct ConstStats {
 }
 
 /// Computes the program's computed constants into `data` (whose files `embed` reads are
-/// already there): the errors computing them. With `cache`, a directory, a constant whose inputs
-/// are unchanged since a build computed it is read from there ([`crate::const_cache`]).
+/// already there): the errors computing them. A constant whose inputs are unchanged since a build
+/// computed it is read from the `cache` directories ([`crate::const_cache`]).
 pub fn compute(
     checked: &Checked,
     sources: &SourceMap,
     data: &mut BuildData,
-    cache: Option<&std::path::Path>,
+    cache: &[std::path::PathBuf],
 ) -> (Vec<Diagnostic>, ConstStats) {
     let mut diags = Vec::new();
     let mut stats = ConstStats::default();
@@ -133,7 +133,7 @@ pub fn compute(
                 Err(msg) => Err(Diagnostic::internal(msg)),
                 Ok(out) => {
                     let key = const_cache::key(&out.wasm, fuel);
-                    match cache.and_then(|dir| const_cache::get(dir, &key)) {
+                    match const_cache::get_in(cache, &key) {
                         Some(v) => {
                             stats.cached += 1;
                             Ok(v)
@@ -160,8 +160,8 @@ pub fn compute(
                             if !traced.is_empty() {
                                 stats.traced.push((name, traced));
                             }
-                            if let (Ok(v), Some(dir)) = (&r, cache) {
-                                const_cache::put(dir, &key, v);
+                            if let Ok(v) = &r {
+                                const_cache::put_in(cache, &key, v);
                             }
                             r
                         }
@@ -180,7 +180,7 @@ pub fn compute(
         }
         pending = rest.into_iter().map(|(c, _)| c).collect();
     }
-    if let Some(dir) = cache {
+    for dir in cache {
         const_cache::clean(dir);
     }
     (diags, stats)
