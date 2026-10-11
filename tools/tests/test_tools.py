@@ -15,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -213,13 +214,28 @@ class HeadlessTest(PageDir, unittest.TestCase):
         proc.kill()  # SIGKILL: no cleanup runs, and Chrome is left behind holding the lock
         proc.communicate()
         os.remove(self.child_pid_file)
+        # The second run's stderr, read as it comes: it says when the run waits for the lock (a
+        # fixed sleep isn't enough under load, when a run can take seconds to reach the lock).
+        lines, waiting = [], threading.Event()
+
+        def read(stream):
+            for line in stream:
+                lines.append(line)
+                if "waiting for the GPU lock, held by: pid" in line:
+                    waiting.set()
+
         try:
             second = self.start("ok")
-            time.sleep(1)
+            reader = threading.Thread(target=read, args=(second.stderr,))
+            reader.start()
+            self.assertTrue(waiting.wait(30) or second.poll() is not None, "the run never waited")
             self.assertIsNone(second.poll(), "a run took the GPU while an orphaned Chrome held it")
         finally:
             os.killpg(chrome, signal.SIGKILL)
-        _, err = second.communicate(timeout=30)
+        second.wait(timeout=30)
+        reader.join(timeout=30)
+        second.stdout.close()
+        err = "".join(lines)
         self.assertEqual(second.returncode, 0, err)
         self.assertIn("waiting for the GPU lock, held by: pid", err)
         self.assertIn("got the GPU lock after", err)
