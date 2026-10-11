@@ -136,6 +136,8 @@ class GateTest(Checkout, unittest.TestCase):
             "tools/check.sh clearing:: lock",
             "tools/check.sh --long clearing:: --nocapture",
             "tools/check.sh --fmt",
+            "tools/check.sh --package=wrela-syntax",
+            "tools/check.sh --package=wrela-syntax lexer",
             "sed -n 1,60p tools/check.sh",
             'grep -n "budget" tools/check.sh',
         ]:

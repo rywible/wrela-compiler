@@ -6,6 +6,7 @@ code the bake runs) is left to the long checks, `tools/wgsl_budgets.py <wrela> -
 build only those."""
 
 import concurrent.futures, gzip, pathlib, shutil, subprocess, sys, tempfile
+from resources import cpu_count
 from subjects import SUBJECTS, lens
 wrela = sys.argv[1]
 baked_only = "--baked" in sys.argv[2:]
@@ -15,7 +16,7 @@ try:
     hello = "examples/hello-field"
     # The lens on each subject (tools/subjects.py).
     if not baked_only:
-        list(concurrent.futures.ThreadPoolExecutor().map(
+        list(concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()).map(
             lambda s: subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True), SUBJECTS))
     # Each package, where it's built, and how. A lens is built lifted, as `wrela studio` built it
     # just now (its page, beside the subject): its WGSL is read from there.
@@ -35,7 +36,7 @@ try:
     # creation time is budgeted by the long checks). Hello field keeps its own budget; every
     # other example's and sketch's pipelines are at most 256 KiB each.
     pipelines = 0
-    for pkg, built in concurrent.futures.ThreadPoolExecutor().map(build, packages):
+    for pkg, built in concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()).map(build, packages):
         raw_budget, gz_budget = (128 * 1024, 24 * 1024) if str(pkg) == hello else (256 * 1024, None)
         largest = 0
         for wgsl in sorted(built.glob("*.wgsl")):

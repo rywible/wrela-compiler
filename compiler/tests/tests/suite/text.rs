@@ -190,7 +190,7 @@ fn text_matches_a_reference_rasterizer() {
         }
     }
     // Both pictures, for looking at.
-    let dir = wrela_tests::repo_root().join("target/tmp/text");
+    let dir = crate::scratch_root().join("text");
     std::fs::create_dir_all(&dir).expect("dir");
     run.write_png(dir.join("gpu.png")).expect("png");
     let rgba: Vec<u8> = reference

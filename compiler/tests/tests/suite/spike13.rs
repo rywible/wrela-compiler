@@ -247,7 +247,7 @@ fn the_creature_derives_over_time() {
 fn the_gpu_certificate_is_small_quick_and_right() {
     let dir = built("spike13");
     // A copy whose shaders differ from any run before: cold.
-    let cold = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("spike13-cold");
+    let cold = crate::scratch_root().join("spike13-cold");
     let _ = std::fs::remove_dir_all(&cold);
     wrela_tests::copy_dir(&dir, &cold);
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("time");

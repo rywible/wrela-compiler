@@ -74,7 +74,11 @@ pub fn manifest(name: &str) -> String {
 /// text): the tests run at once, and one that shared a directory with another could remove it
 /// while the other built there.
 pub fn package(name: &str, files: &[(&str, &str)]) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let root = std::env::var_os("WRELA_TEST_TMPDIR")
+        .filter(|d| !d.is_empty())
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+    assert!(root.is_absolute(), "WRELA_TEST_TMPDIR must be an absolute path");
+    let dir = root.join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("mkdir");
     for (path, text) in files {

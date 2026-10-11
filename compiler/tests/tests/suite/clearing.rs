@@ -3,7 +3,7 @@
 //! how a frame is drawn and shown, and copy what a frame drew into buffers, which these read
 //! back. The frames run in lockstep with the clearing's ticker, so two runs draw the same.
 //!
-//! The source and WGSL checks need no GPU; the rest do:
+//! The source, WGSL and command-stream checks need no GPU; the rest do:
 //! `cargo test --release -p wrela-tests --test suite clearing:: -- --ignored --nocapture`.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -70,11 +70,6 @@ fn floats(v: &[Value]) -> Vec<f64> {
 impl Clearing {
     fn load(name: &str) -> Clearing {
         Clearing::load_with(name, &Options::default())
-    }
-
-    /// [`Clearing::load`], keeping each frame's command batch for [`Clearing::batches`].
-    fn load_recording(name: &str) -> Clearing {
-        Clearing::load_with(name, &Options { record: true, ..Options::default() })
     }
 
     /// [`Clearing::load`], run at `fps` frames a second from its first frame (a frame's time and
@@ -186,11 +181,6 @@ impl Clearing {
 
     fn screen(&mut self) -> Vec<u8> {
         self.host.read_screen().expect("read the screen")
-    }
-
-    /// The command batches since the last call (a frame's are one).
-    fn batches(&mut self) -> Vec<Vec<u8>> {
-        self.host.take_batches()
     }
 }
 
@@ -789,7 +779,7 @@ fn no_pixel_sees_through_the_terrain_between_levels() {
         }
         let (frame, t) = (c.frame, c.path_time());
         if !holes.is_empty() {
-            let at = repo_root().join(format!("target/tmp/clearing-crack-{frame}.png"));
+            let at = crate::scratch_root().join(format!("clearing-crack-{frame}.png"));
             wrela_host::image::write_png(&at, W, H, &s).expect("write the frame");
             println!("the frame: {}", at.display());
         }
@@ -1199,12 +1189,12 @@ fn a_crown_matches_where_its_levels_meet() {
                         _ => [0, 0, 0, 255],
                     })
                     .collect();
-                let at = repo_root()
-                    .join(format!("target/tmp/clearing-levels-{kind}-{distance}-mask.png"));
+                let at = crate::scratch_root()
+                    .join(format!("clearing-levels-{kind}-{distance}-mask.png"));
                 wrela_host::image::write_png(&at, W, H, &mask).expect("write");
             }
             if kind == 0 || mean > 4.0 {
-                let dir = repo_root().join("target/tmp");
+                let dir = crate::scratch_root();
                 let name = |w: &str| dir.join(format!("clearing-levels-{kind}-{distance}-{w}.png"));
                 wrela_host::image::write_png(&name("a"), W, H, &a).expect("write");
                 wrela_host::image::write_png(&name("b"), W, H, &b).expect("write");
@@ -1244,20 +1234,64 @@ fn draws_after(batch: &[u8], name: &str) -> usize {
     n
 }
 
+/// The clearing's commands and traps, under the same WASM and frame schedule as [`Clearing`].
+/// The CPU host validates and records every command without rasterizing the frames.
+struct RecordedClearing {
+    host: wrela_host::CpuHost,
+    frame: u32,
+}
+
+impl RecordedClearing {
+    fn load(name: &str) -> Self {
+        let (dir, _) = built(name);
+        let host = wrela_host::CpuBuild::load(dir)
+            .expect("load the clearing")
+            .recording()
+            .start()
+            .expect("start the clearing");
+        Self { host, frame: 0 }
+    }
+
+    fn steps(&mut self, count: u32) {
+        for _ in 0..count {
+            self.host
+                .lockstep_frame(self.frame, 60.0, W, H, &[])
+                .unwrap_or_else(|e| panic!("frame {}: {e}", self.frame));
+            self.frame += 1;
+        }
+    }
+
+    fn call(&mut self, name: &str, args: &[Value]) -> Vec<f64> {
+        floats(&self.host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}")))
+    }
+
+    fn until_ready(&mut self, settle: u32) {
+        while self.call("test_ready", &[])[0] < 0.5 {
+            assert!(self.frame < 600, "the clearing isn't ready after {} frames", self.frame);
+            self.steps(1);
+        }
+        self.steps(settle);
+    }
+
+    fn hold(&mut self, eye: [f32; 3], at: [f32; 3]) {
+        let args: Vec<Value> = eye.iter().chain(&at).map(|&x| Value::F32(x)).collect();
+        self.call("test_hold", &args);
+    }
+}
+
 /// AC5: static shadows are cached: once the forest and the boulders are cooked (a few at a
 /// frame, at load), one frame draws them into the static cascades, a steady frame draws nothing
 /// into them, and moving the sun draws them again (counted in the frames' command streams).
 #[test]
-#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
     // The draws into the static cascades in each batch since the last call.
-    let statics = |c: &mut Clearing| -> Vec<usize> {
-        c.batches().iter().map(|b| draws_after(b, "shadows static")).collect()
+    let statics = |c: &mut RecordedClearing| -> Vec<usize> {
+        c.host.take_batches().iter().map(|b| draws_after(b, "shadows static")).collect()
     };
-    let mut c = Clearing::load_recording("clearing-static");
+    let mut c = RecordedClearing::load("clearing-static");
     let mut drawn = Vec::new();
     for _ in 0..30 {
-        c.step();
+        c.steps(1);
         drawn.push(statics(&mut c).iter().sum::<usize>());
     }
     let frames: Vec<usize> = (0..drawn.len()).filter(|&i| drawn[i] > 0).collect();
@@ -1265,7 +1299,7 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
     let first = drawn[frames[0]];
     assert!(first > 10, "the load drew {first} times into the static cascades");
     c.until_ready(2);
-    c.batches();
+    c.host.take_batches();
     c.steps(30);
     let steady = statics(&mut c);
     assert!(steady.iter().all(|&n| n == 0), "steady frames draw static shadows: {steady:?}");
@@ -1274,7 +1308,7 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
         "test_sun",
         &[Value::F32(sun[0]), Value::F32(sun[1]), Value::F32(sun[2]), Value::F32(1.0)],
     );
-    c.step();
+    c.steps(1);
     let moved: usize = statics(&mut c).iter().sum();
     assert_eq!(moved, first, "moving the sun drew {moved} times, the first frame {first}");
     c.steps(5);
@@ -1284,12 +1318,11 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
 
 /// The camera held inside a crown, exactly at a plant's middle (where its levels' patterns are
 /// anchored, `lod::anchor`) and a step either side, looking each way, and inside a trunk: every
-/// frame draws (M6 AC4, AC15). Playing spike 17, a camera there made `engine::lod::packed`
+/// frame submits valid commands (M6 AC4, AC15). Playing spike 17, a camera there made `engine::lod::packed`
 /// convert an infinite pixel to an integer, which trapped (`lod.wrela:125`).
 #[test]
-#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_camera_inside_a_crown_draws_its_frames() {
-    let mut c = Clearing::load("clearing-inside-a-crown");
+    let mut c = RecordedClearing::load("clearing-inside-a-crown");
     c.until_ready(1);
     let trees = c.call("test_trees", &[]);
     assert!(trees[0] > 0.0, "the forest is drawn");
@@ -1753,7 +1786,7 @@ fn the_upscaled_frame_matches_the_native_one() {
             "{what}: upscaled against native, mean {mean:.2}/255, {:.1}% over 8/255",
             over * 100.0
         );
-        let dir = repo_root().join("target/tmp");
+        let dir = crate::scratch_root();
         wrela_host::image::write_png(
             &dir.join(format!("clearing-upscaled-{view}.png")),
             W,
@@ -1938,7 +1971,7 @@ fn what_the_wind_costs_the_leaves() {
                 sum / nf,
                 100.0 * over / nf
             );
-            let dir = repo_root().join("target/tmp");
+            let dir = crate::scratch_root();
             let name = format!("sway-{}-{d}", if wind { "wind" } else { "still" });
             wrela_host::image::write_png(&dir.join(format!("{name}-taa.png")), W, H, &taa[k][7].0)
                 .expect("write");
@@ -2158,7 +2191,7 @@ fn the_start_against_spike_15s_still() {
         .output()
         .expect("git");
     assert!(out.status.success(), "spike 15's still isn't in this repository's history");
-    let dir = repo_root().join("target/tmp");
+    let dir = crate::scratch_root();
     std::fs::create_dir_all(&dir).expect("target/tmp");
     let theirs_path = dir.join("clearing-spike-15-c.png");
     std::fs::write(&theirs_path, &out.stdout).expect("write");

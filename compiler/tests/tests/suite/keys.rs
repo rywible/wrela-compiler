@@ -2,10 +2,10 @@
 //! (#42 AC6; compiler/tests/sketches/03-keys). A scripted run of 2,000 ticks replays from its
 //! tick log to the same hashes with any number of helpers, and a log with one record changed
 //! fails at that tick. In Chrome (`--include-ignored`): the run is recorded as a tick log, which
-//! replays on the native host with no GPU, on arm64 and on x86-64 under Rosetta; and key presses
-//! sent through the DOM reach the screen, their latency measured.
+//! replays on the native host with no GPU (also on x86-64 under Rosetta on macOS); and key
+//! presses sent through the DOM reach the screen, their latency measured.
 
-use crate::{a_flipped_record_fails_at_its_tick, built, flipped, replays_with_any_helpers};
+use crate::{a_flipped_record_fails_at_its_tick, built, replays_with_any_helpers};
 use wrela_host::CpuBuild;
 
 const TICKS: u32 = 2000;
@@ -45,8 +45,8 @@ fn a_keyed_run_replays_and_a_changed_record_fails_at_its_tick() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3, a GPU and Rosetta"]
-fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
+#[ignore = "long: needs Chrome, python3 and a GPU; also Rosetta on macOS"]
+fn a_run_recorded_in_chrome_replays_natively_and_on_rosetta_where_available() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-chrome");
     // Lockstep at 60 frames a second: frame i follows i + 1 ticks, so 2,000 frames run 2,000.
     // The frames run back to back: in lockstep, the ticks and the script's events follow the
@@ -61,7 +61,7 @@ fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
     let log = chrome.ticks.and_then(|t| t.log).expect("the ticker's tick log");
     assert_eq!(log.ticks.len(), TICKS as usize);
     let built = CpuBuild::load(&dir).expect("load");
-    assert_eq!(built.replay(&log, 2).expect("arm64 replays Chrome's log"), TICKS);
+    assert_eq!(built.replay(&log, 2).expect("the native host replays Chrome's log"), TICKS);
     // The same ticks the native host records from the script.
     let script = wrela_host::parse_script(&script(TICKS)).expect("a script");
     let native = built.record_ticks(TICKS, &script, 1).expect("record");
@@ -71,17 +71,22 @@ fn a_run_recorded_in_chrome_replays_on_arm64_and_x86_64() {
     }
     // x86-64, under Rosetta: the log replays, and with one record changed it fails, naming the
     // tick.
-    let host = crate::x86_host();
-    let path = dir.join("results/ticks.log");
-    let (ok, text) = crate::replay_on_x86(&host, &path, &dir);
-    assert!(ok, "x86-64 didn't replay Chrome's log: {text}");
-    assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
-    let k = first_record(&log);
-    let bad = dir.join("results/changed.ticks");
-    std::fs::write(&bad, flipped(&log, k).encode()).expect("write the changed log");
-    let (ok, text) = crate::replay_on_x86(&host, &bad, &dir);
-    assert!(!ok, "a changed log replayed: {text}");
-    assert!(text.contains(&format!("tick {k} differs")), "{text}");
+    #[cfg(target_os = "macos")]
+    {
+        let host = crate::x86_host();
+        let path = dir.join("results/ticks.log");
+        let (ok, text) = crate::replay_on_x86(&host, &path, &dir);
+        assert!(ok, "x86-64 didn't replay Chrome's log: {text}");
+        assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
+        let k = first_record(&log);
+        let bad = dir.join("results/changed.ticks");
+        std::fs::write(&bad, crate::flipped(&log, k).encode()).expect("write the changed log");
+        let (ok, text) = crate::replay_on_x86(&host, &bad, &dir);
+        assert!(!ok, "a changed log replayed: {text}");
+        assert!(text.contains(&format!("tick {k} differs")), "{text}");
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("native/browser replay checked; cross-architecture Rosetta replay requires macOS");
 }
 
 /// The input latency through the sim (#42 AC6, measured, not gated): from a key's DOM event to

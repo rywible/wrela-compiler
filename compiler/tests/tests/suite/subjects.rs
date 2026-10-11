@@ -164,7 +164,7 @@ fn realized_in_one_piece(name: &str) {
     let mut host = Host::load(&dir).expect("load");
     let times: Vec<f32> = (0..30).map(|i| frame_time(i, 60.0)).collect();
     let run = host.run_frames(&times, 640, 400).expect("frames");
-    let png = repo_root().join(format!("target/tmp/subject-{name}.png"));
+    let png = crate::scratch_root().join(format!("subject-{name}.png"));
     std::fs::create_dir_all(png.parent().unwrap()).expect("target/tmp");
     run.write_png(&png).expect("png");
     let (verts, quads) = mesh(&mut host);

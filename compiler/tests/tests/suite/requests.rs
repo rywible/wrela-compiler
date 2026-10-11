@@ -234,7 +234,6 @@ fn shipped_native(dir: &Path) -> (String, [f32; 4]) {
 /// under the build's `files/data/`, not in its WASM; the program knows their names and sizes,
 /// fetches each, and gets its bytes; a constant computed from it read them in place.
 #[test]
-#[ignore = "needs a GPU"]
 fn shipped_files_are_beside_the_program_and_fetched() {
     let (dir, _) = page("compiler/tests/shipped", "shipped-native");
     let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
@@ -248,7 +247,13 @@ fn shipped_files_are_beside_the_program_and_fetched() {
         !wasm.windows(256).any(|w| w == &big[1000..1256]),
         "the program's WASM holds the shipped file's bytes"
     );
-    let (_, [small, fetched, counts, first]) = shipped_native(&dir);
+    // Fetching shipped files and reporting their sums runs entirely in WASM and host IO.
+    // The CPU host validates the buffer writes without creating a GPU device or pipelines.
+    let mut host = wrela_host::CpuHost::load(&dir).expect("load");
+    for frame in 0..SHIPPED_FRAMES {
+        host.frame(frame_time(frame, 60.0), 16, 16).expect("fetch shipped files");
+    }
+    let [small, fetched, counts, first] = wrela_tests::one_vec4(&mut host, "answers", &[]);
     assert_eq!(small, 15.0, "small.bin fetched: 1 + 3 + 1 + 4 + 1 + 5");
     let big_sum: u32 = big.iter().map(|&b| u32::from(b)).sum();
     assert_eq!(fetched, (1 + big_sum) as f32, "big.bin fetched");

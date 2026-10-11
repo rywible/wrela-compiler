@@ -1273,7 +1273,7 @@ fn the_herds_pipelines_load_cold_as_fast() {
 /// in lockstep, a frame's ticks follow its number, not the clock, so the schedule is a paced
 /// run's.
 #[test]
-#[ignore = "long: needs Chrome, python3, a GPU and Rosetta"]
+#[ignore = "long: needs Chrome, python3 and a GPU; also Rosetta on macOS"]
 fn the_herds_ticks_hash_the_same_everywhere() {
     const TICKS: u32 = 10_000;
     let part = wrela_tests::sized(1_000, TICKS);
@@ -1314,12 +1314,17 @@ fn the_herds_ticks_hash_the_same_everywhere() {
     assert!(gpu.len() >= TICKS as usize - 1, "only {} ticks with the GPU", gpu.len());
     eprintln!("the native host with the GPU agrees over {} ticks", gpu.len());
     // x86-64 under Rosetta: the log replays.
-    let path = dir.join("herd.ticks");
-    std::fs::write(&path, log.encode()).expect("write the log");
-    let (ok, text) = crate::replay_on_x86(&crate::x86_host(), &path, &dir);
-    assert!(ok, "x86-64 didn't replay the herd's log: {text}");
-    assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
-    eprintln!("x86-64 under Rosetta replays {TICKS} ticks");
+    #[cfg(target_os = "macos")]
+    {
+        let path = dir.join("herd.ticks");
+        std::fs::write(&path, log.encode()).expect("write the log");
+        let (ok, text) = crate::replay_on_x86(&crate::x86_host(), &path, &dir);
+        assert!(ok, "x86-64 didn't replay the herd's log: {text}");
+        assert!(text.contains(&format!("{TICKS} ticks replayed")), "{text}");
+        eprintln!("x86-64 under Rosetta replays {TICKS} ticks");
+    }
+    #[cfg(not(target_os = "macos"))]
+    eprintln!("cross-architecture Rosetta replay requires macOS; checking native/browser hashes");
     for (fps, delay) in [(60.0, 0), (30.0, 0), (144.0, 0), (60.0, 20)] {
         let n = if fps == 60.0 && delay == 0 { TICKS } else { part };
         let frames = (f64::from(n) * fps / 60.0).ceil() as u32 + 1;

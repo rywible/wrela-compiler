@@ -26,6 +26,29 @@ use wrela_host::{CpuHost, GpuTiming, Host, TickLog, Timing, Value, map_read};
 pub use wrela_grammar::rng::Rng;
 pub use wrela_grammar::testing::{files_under, par_each, par_map, repo_root, sized};
 
+/// Where this process writes its test files. The gate gives each isolated test an absolute
+/// `WRELA_TEST_TMPDIR`, so processes never remove or overwrite each other's builds. Outside
+/// the gate, the caller's usual scratch directory is used.
+pub fn scratch_root(default: impl AsRef<Path>) -> PathBuf {
+    scratch_root_in(std::env::var_os("WRELA_TEST_TMPDIR"), default.as_ref())
+}
+
+fn scratch_root_in(dir: Option<std::ffi::OsString>, default: &Path) -> PathBuf {
+    match dir.filter(|d| !d.is_empty()) {
+        Some(dir) => {
+            let dir = PathBuf::from(dir);
+            assert!(dir.is_absolute(), "WRELA_TEST_TMPDIR must be an absolute path");
+            dir
+        }
+        None => default.to_path_buf(),
+    }
+}
+
+/// The scratch directory for pages and images, normally under `target/tmp`.
+pub fn page_scratch_root() -> PathBuf {
+    scratch_root(repo_root().join("target/tmp"))
+}
+
 /// Work done once per process for each key: a second caller with a key waits for the first's
 /// work rather than racing it, and work for other keys runs at the same time.
 pub struct OncePerKey(Mutex<BTreeMap<String, Arc<OnceLock<()>>>>);
@@ -533,8 +556,15 @@ fn page_built_by(
     build: fn(&Path) -> wrela_driver::Output,
 ) -> (PathBuf, String) {
     let base = built_once(pkg, kind, build);
-    let rel = format!("target/tmp/{name}");
-    let dir = repo_root().join(&rel);
+    let dir = page_scratch_root().join(name);
+    std::fs::create_dir_all(&dir).expect("make the page's directory");
+    let dir = dir.canonicalize().expect("the page's directory");
+    let root = repo_root().canonicalize().expect("the repository's directory");
+    let rel = dir
+        .strip_prefix(root)
+        .expect("a browser page's scratch directory must be under the repository")
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_dir_all(&dir);
     copy_dir(&base, &dir);
     (dir, rel)
@@ -544,9 +574,8 @@ fn page_built_by(
 fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -> PathBuf {
     static BUILDS: OncePerKey = OncePerKey::new();
     // No host loads the build here (it would keep its compiled code beside it), only copies.
-    let base = repo_root()
-        .join("target/tmp/page-builds")
-        .join(format!("{}-{kind}", pkg.replace('/', "-")));
+    let base =
+        page_scratch_root().join("page-builds").join(format!("{}-{kind}", pkg.replace('/', "-")));
     BUILDS.run(&base.display().to_string(), || {
         let _ = std::fs::remove_dir_all(&base);
         // The `wrela build` that makes the same files (none makes a build without SIMD).
@@ -859,6 +888,24 @@ pub fn run_url_in_chrome(url: &str, page: &Path, timeout: u32) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_test_scratch_override_is_absolute_and_otherwise_keeps_the_default() {
+        let default = std::path::Path::new("/build/target/tmp");
+        assert_eq!(super::scratch_root_in(None, default), default);
+        assert_eq!(super::scratch_root_in(Some("".into()), default), default);
+        assert_eq!(
+            super::scratch_root_in(Some("/build/target/tmp-alone/7".into()), default),
+            std::path::Path::new("/build/target/tmp-alone/7")
+        );
+        assert!(
+            std::panic::catch_unwind(|| {
+                super::scratch_root_in(Some("../another-test".into()), default)
+            })
+            .is_err(),
+            "a relative override could put two programs' files in different directories"
+        );
+    }
+
     #[test]
     fn files_hash_is_tools_memos() {
         // The same files and hash as tools/tests/test_memo.py's `test_the_files_hash_is_compiler_tests`.

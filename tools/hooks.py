@@ -121,7 +121,7 @@ def runs_gate(command):
             if arg[0] in "<>" or re.match(r"\d?&?>", arg):
                 break
             words.append(arg)
-        if "--fmt" not in words and all(w.startswith("-") for w in words):
+        if "--fmt" not in words and all(w.startswith("-") and not w.startswith("--package=") for w in words):
             return True
     return False
 

@@ -1,9 +1,9 @@
-use std::path::PathBuf;
 use wrela_host::CpuHost;
 
 #[test]
 fn frontend_perf_string_append_preserves_bytes_growth_and_ownership() {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("frontend-perf-string-append");
+    let dir =
+        wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join("frontend-perf-string-append");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch package");
     std::fs::write(

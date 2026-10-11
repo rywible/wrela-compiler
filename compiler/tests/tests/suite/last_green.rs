@@ -147,7 +147,7 @@ fn floor() -> PathBuf {
                 "{}",
                 wrela_diag::render::render_all(&out.sources, &out.diagnostics)
             );
-            let build = repo_root().join("target/tmp/last-green-floor");
+            let build = crate::scratch_root().join("last-green-floor");
             let _ = std::fs::remove_dir_all(&build);
             for (path, bytes) in &out.files {
                 let to = build.join(path);
@@ -738,7 +738,7 @@ fn the_checks_sight_matches_the_renderers_depth() {
     let half = std::f64::consts::PI / views as f64;
     let mut f = Floor::load_sized("last-green-calibration", (960, 540));
     f.until_ready();
-    let shots = repo_root().join("target/tmp/last-green-calibration-views");
+    let shots = crate::scratch_root().join("last-green-calibration-views");
     std::fs::create_dir_all(&shots).expect("a directory for the views");
     let mut off = Vec::new();
     let mut sum = 0.0;
@@ -790,7 +790,7 @@ fn each_landmark_can_be_made_out_from_where_it_is_seen() {
     let (w, h) = (960usize, 540usize);
     let mut f = Floor::load_sized("last-green-landmarks", (w as u32, h as u32));
     f.until_ready();
-    let shots = repo_root().join("target/tmp/last-green-landmark-views");
+    let shots = crate::scratch_root().join("last-green-landmark-views");
     std::fs::create_dir_all(&shots).expect("a directory for the views");
     let mut small = Vec::new();
     for l in cal["landmarks"].as_array().expect("landmarks") {
@@ -853,7 +853,7 @@ fn the_trails_read_as_paths() {
     let (w, h) = (960usize, 540usize);
     let mut f = Floor::load_sized("last-green-trails", (w as u32, h as u32));
     f.until_ready();
-    let shots = repo_root().join("target/tmp/last-green-trail-views");
+    let shots = crate::scratch_root().join("last-green-trail-views");
     std::fs::create_dir_all(&shots).expect("a directory for the views");
     let places = cal["trails"].as_array().expect("trails");
     let (mut weak, mut measured) = (Vec::new(), 0usize);
@@ -1238,7 +1238,7 @@ fn the_floors_systems_keep_their_slices() {
     let shore = f.ground([207.0, -337.0]);
     f.look([235.0, shore + 1.5, -365.0], [270.0, shore - 3.0, -400.0], 60);
     let (mere, water) = timed_view(&mut f, 120);
-    f.save(&repo_root().join("target/tmp/last-green-mere-view.png"));
+    f.save(&crate::scratch_root().join("last-green-mere-view.png"));
     let of = |t: &[(&str, f64, f64)], n: &str| t.iter().find(|x| x.0 == n).map_or(0.0, |x| x.2);
     eprintln!("beech high forest: vegetation {:.3} ms (slice 4.0)", of(&beech, "vegetation"));
     eprintln!(

@@ -8,7 +8,8 @@ fn source(path: &str) -> String {
 }
 
 fn package(name: &str, main: &str) -> PathBuf {
-    let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("engine-perf-{name}"));
+    let dir =
+        wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("engine-perf-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("scratch package");
     std::fs::write(dir.join("main.wrela"), main).expect("write main");
