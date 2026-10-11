@@ -3,7 +3,7 @@
 rendered settled at 1080p, as a still on the native host and as a 10 s clip in Chrome (its move),
 into a directory.
 
-    tools/lookbook.py <out-dir> [--stills] [--capture [--warm]] [--view clay|silhouette]
+    tools/lookbook.py <out-dir> [--stills] [--capture] [--view clay|silhouette]
                       [--size WxH] [--jobs N] [shot-number ...]
 
 The floor must be built (`wrela build examples/last-green`). A shot is chosen as a player would
@@ -23,12 +23,10 @@ interest check's view at its eye (the build's `files/check/shots.json`), are pri
 
 `--capture` takes each still in capture mode (F7, `Floor::capture` in examples/last-green/main.wrela):
 the floor does its load in a few frames, and the still is the frame it prints `still at frame N` on,
-a 16-frame resolve once the light round the eye is in, not the frame 5 s in (shot 2 at 1080p on a
-4-core cloud machine: 136 s, not 460 s; 37 s of it is the host's start, lavapipe compiling the
-pipelines). With `--warm`, one process takes every shot's still in turn, so the floor loads once:
-after a shot's still, the next shot is chosen (shots 2, 7 and 9: 176 s, about 20 s a shot after
-the first). A warm shot can differ from the same shot taken cold (shot 7 after shot 2: the far
-shore lit, not shaded, 8/255 apart on average), as after a travel in play: take a baseline cold.
+a 16-frame resolve once the light round the eye is in, not the frame 5 s in. Shot 2 at 1080p on a
+4-core cloud machine: 104 s, not 460 s; shots 2, 7 and 9 at once: 180 s, each the same pixels as
+alone. (One process taking shot after shot was as fast for three, but a shot's still depended on
+the shots before it.)
 """
 
 import json, os, re, shutil, subprocess, sys, tempfile
@@ -67,53 +65,25 @@ def stem(i, name):
     return f"{i:02d}-{name.replace(' ', '-').replace(chr(39), '')}"
 
 
-def capture_keys(i, view="look", first=True):
-    """The keys that take shot `i`'s still in capture mode: F7 first (it toggles), then the shot."""
-    f7 = [{"frame": 1, "type": "key", "key": "F7"}] if first else []
-    return f7 + keys(i, view if first else "look")
-
-
-def run(scripts, png, size, capture, env=None):
-    """The host on `scripts` (each a list of events), its PNG at `png`: the frame 5 s in, or
-    with `capture`, each script's frame that prints `STILL`."""
-    tmp = tempfile.mkdtemp(prefix="lookbook-")
-    cmd = [HOST, BUILD, "--size", size, "--png", png]
-    for k, events in enumerate(scripts):
-        path = os.path.join(tmp, f"keys-{k}.json")
-        with open(path, "w") as f:
-            json.dump(events, f)
-        cmd += ["--input", path]
-    frames = CAPTURE_FRAMES * len(scripts) if capture else SETTLE_FRAMES + 1
-    cmd += ["--frames", str(frames)] + (["--until", STILL] if capture else [])
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    shutil.rmtree(tmp)
-    return r
-
-
 def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
+    """Shot `i`'s still: the frame 5 s in, or with `capture`, the frame that prints `STILL` (F7
+    first: it toggles capture mode)."""
+    events = keys(i, view)
+    if capture:
+        events = [{"frame": 1, "type": "key", "key": "F7"}] + events
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(events, f)
+        script = f.name
     png = os.path.join(out, stem(i, name) + ".png")
     env = dict(os.environ, WRELA_GPU_SHARED=str(max(2, jobs))) if jobs > 1 else None
-    events = capture_keys(i, view) if capture else keys(i, view)
-    r = run([events], png, size, capture, env)
+    frames = CAPTURE_FRAMES if capture else SETTLE_FRAMES + 1
+    cmd = [HOST, BUILD, "--frames", str(frames), "--size", size, "--input", script, "--png", png]
+    r = subprocess.run(cmd + (["--until", STILL] if capture else []), capture_output=True,
+                       text=True, env=env)
+    os.unlink(script)
     if r.returncode != 0:
         sys.exit(f"shot {i} ({name}) failed:\n{r.stderr[-2000:]}")
     return png
-
-
-def warm(pick, shots, out, view="look", size="1920x1080"):
-    """The capture stills of the shots `pick` from one process, in turn: the floor loads once."""
-    tmp = tempfile.mkdtemp(prefix="lookbook-")
-    scripts = [capture_keys(i, view, first=k == 0) for k, i in enumerate(pick)]
-    r = run(scripts, os.path.join(tmp, "w.png"), size, True)
-    if r.returncode != 0:
-        sys.exit(f"the warm run failed:\n{r.stderr[-2000:]}")
-    pngs = []
-    for k, i in enumerate(pick):
-        png = os.path.join(out, stem(i, shots[i]) + ".png")
-        shutil.move(os.path.join(tmp, "w.png" if len(pick) == 1 else f"w-{k:04d}.png"), png)
-        pngs.append(png)
-    shutil.rmtree(tmp)
-    return pngs
 
 
 def clip(i, name, out, view="look"):
@@ -140,10 +110,7 @@ def main():
         sys.exit(__doc__)
     stills_only = "--stills" in args
     capture = "--capture" in args
-    warm_run = "--warm" in args
-    if warm_run and not capture:
-        sys.exit("--warm takes --capture")
-    args = [a for a in args if a not in ("--stills", "--capture", "--warm")]
+    args = [a for a in args if a not in ("--stills", "--capture")]
     view = "look"
     if "--view" in args:
         k = args.index("--view")
@@ -176,14 +143,10 @@ def main():
         shutil.copyfile(numbers, os.path.join(out, "check.json"))
     # The stills at once, `jobs` at a time (each printed, in order, as it and those before it end);
     # then each clip in turn, as Chrome takes the GPU alone.
-    if warm_run:
-        pngs = warm(pick, shots, out, view, size)
-    else:
-        pool = ThreadPoolExecutor(jobs)
-        runs = [pool.submit(still, i, shots[i], out, view, size, jobs, capture) for i in pick]
-        pngs = (r.result() for r in runs)
+    pool = ThreadPoolExecutor(jobs)
+    pngs = [pool.submit(still, i, shots[i], out, view, size, jobs, capture) for i in pick]
     for i, png in zip(pick, pngs):
-        print(png, flush=True)
+        print(png.result(), flush=True)
         if i < len(views):
             v = views[i]["view"]
             what = ", ".join(f"{d['pull']} {d['strength']:.2f}" for d in v["draws"][:4])
