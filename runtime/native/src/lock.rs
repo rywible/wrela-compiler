@@ -279,18 +279,20 @@ fn note_wait(path: Option<OsString>, waited: Duration, holder: &str) {
         .and_then(|mut f| f.write_all(line.as_bytes()));
 }
 
+/// The crate's tests that take the GPU lock use the process's one hold, so they take turns: the
+/// tests here check the hold's state, and another test's hold beside them (a GPU test, slow on a
+/// software GPU) would be in it.
+#[cfg(test)]
+pub(crate) fn turn() -> MutexGuard<'static, ()> {
+    static TURNS: Mutex<()> = Mutex::new(());
+    TURNS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-
-    /// The tests here use the process's one hold, so they take turns.
-    static TURNS: Mutex<()> = Mutex::new(());
-
-    fn turn() -> MutexGuard<'static, ()> {
-        TURNS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 
     #[test]
     fn a_thread_shares_its_hold_and_others_wait() {

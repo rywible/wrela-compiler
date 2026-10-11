@@ -2079,6 +2079,7 @@ mod tests {
     #[test]
     #[ignore = "measure: texture upload throughput, needs a GPU"]
     fn texture_upload_throughput() {
+        let _turn = crate::lock::turn();
         let _lock = crate::lock::GpuLock::alone("texture upload throughput").expect("GPU lock");
         let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
         eprintln!("{}", gpu.adapter());
@@ -2145,6 +2146,7 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU"]
     fn texture_uploads_preserve_rows_rectangles_and_order() {
+        let _turn = crate::lock::turn();
         let _lock = crate::lock::GpuLock::acquire("texture upload order").expect("GPU lock");
         let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
         gpu.create_buffer(2, 4);
