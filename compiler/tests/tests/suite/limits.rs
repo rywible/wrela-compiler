@@ -25,9 +25,10 @@ fn compile(name: &str, body: &str) -> (Vec<String>, PathBuf) {
 }
 
 /// How long a check of a limit may take, wall-clock (s): each takes a few seconds alone, and
-/// what it guards against (exponential time) would take hours; the gate's machine is shared, and
-/// at a load of 30 a 2 s check took 11 s.
-const QUICK: u64 = 30;
+/// what it guards against (exponential time) would take hours; the gate's machine is shared: at
+/// a load of 30 a 2 s check took 11 s, and on a 4-core cloud machine beside another gate a 5 s
+/// one took 34 s.
+const QUICK: u64 = 120;
 
 /// Fails if `started` was more than `QUICK` seconds ago.
 fn quickly(started: std::time::Instant) {
