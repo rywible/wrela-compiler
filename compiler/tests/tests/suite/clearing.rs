@@ -1973,6 +1973,53 @@ fn the_motion_target_marks_the_creature() {
     }
 }
 
+/// The creature's line is drawn on the scene's own samples, before temporal AA (`paint::lines`),
+/// so temporal AA anti-aliases it as it does a silhouette: in the scene, the creature's pixels
+/// on its silhouette (a neighbour not the creature, well behind it) are under 0.3 of those well
+/// inside it (drawn: 0.19; with no line, its shading alone: 0.49).
+#[test]
+#[ignore = "long: loads the clearing and walks it 3 s, needs a GPU"]
+fn the_creatures_line_is_drawn_before_temporal_aa() {
+    let mut c = Clearing::load("clearing-lines");
+    c.until_ready(0);
+    c.walk();
+    c.steps(120);
+    let scene = c.scene();
+    let depth = c.depth();
+    let (w, h) = ((W / 2) as usize, (H / 2) as usize);
+    assert_eq!(scene.len(), w * h, "the scene isn't half the output's size");
+    let luma = |p: [f32; 4]| 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+    let (mut edge, mut inside) = (Vec::new(), Vec::new());
+    for y in 3..h - 3 {
+        for x in 3..w - 3 {
+            let o = y * w + x;
+            if class(scene[o][3]) != CREATURE {
+                continue;
+            }
+            let near = [o - 1, o + 1, o - w, o + w];
+            // Reversed depth: a neighbour well behind has a smaller one.
+            if near.iter().any(|&q| class(scene[q][3]) != CREATURE && depth[q] < 0.8 * depth[o]) {
+                edge.push(luma(scene[o]));
+            } else if [o - 3, o + 3, o - 3 * w, o + 3 * w]
+                .iter()
+                .all(|&q| class(scene[q][3]) == CREATURE)
+            {
+                inside.push(luma(scene[o]));
+            }
+        }
+    }
+    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len().max(1) as f32;
+    println!(
+        "the creature's silhouette: {} pixels, mean {:.4}; inside {} pixels, mean {:.4}",
+        edge.len(),
+        mean(&edge),
+        inside.len(),
+        mean(&inside)
+    );
+    assert!(edge.len() > 50 && inside.len() > 100, "the creature isn't in view");
+    assert!(mean(&edge) < 0.3 * mean(&inside), "the scene's silhouette isn't drawn darker");
+}
+
 /// AC7's ghosting: no trail behind the walking creature longer than 4 px at 1080p (5 since M6: see the bound). The same
 /// frames drawn twice, temporal AA's history on in both: with the creature, and without it (the
 /// ground it walks over as it is). A pixel the creature covered in the last 8 frames and
