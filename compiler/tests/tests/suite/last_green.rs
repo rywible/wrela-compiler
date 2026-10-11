@@ -133,7 +133,7 @@ const GROWN: u32 = grown()
 fn grown() -> u32 {{
     var m = map::map()
     {edit}
-    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, map::LO, map::HI, stones::stones(m), |land| Start::wild(land))
+    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, map::LO, map::HI, stones::stones(m), |land, year| Start::wild(land))
     h.trees.len()
 }}
 
@@ -177,6 +177,125 @@ fn an_opening_whose_keeper_stops_before_the_present_is_refused_by_name() {
     let edit = "m.openings[0].keeper = engine::place::Keeper::People { from: 300, to: map::PRESENT - 100 }";
     let dir = grown_from("last-green/keeper-gone", edit);
     refused(&dir, "the clearing's meadow", "left");
+}
+
+/// The elves (peoples.wrela) on a small land of good soil by a river: the two tribes come to the
+/// best places, far enough apart; each settlement tills the soil nearest it, grazes beyond, and
+/// leaves the land as it last used it, with old trees standing only in the pasture, about one in
+/// each `veteran` of it; land they left long before the plague has gone back to the wood.
+#[test]
+fn the_elves_settle_the_best_land_and_leave_it_as_they_used_it() {
+    let tests = r#"
+use engine::grow::{Grid, Land, Left, NEVER, NONE, UNBROWSED}
+use engine::soil::soil
+use peoples::{Culture, RECLAIMED, Use, left_by, settle}
+
+/// A level land 1200 m by 800 m of deep loam, a river along its south edge.
+fn land() -> Land {
+    let grid = Grid::over(vec2(0.0), vec2(1200.0, 800.0), 4.0)
+    let nn = grid.cells()
+    var water: Vec<bool> = Vec::new()
+    for c in 0..nn {
+        water.push(grid.centre(c).y < 12.0)
+    }
+    Land {
+        grid,
+        heights: Vec::filled(nn, 0.0),
+        habitable: Vec::filled(nn, value: true),
+        wet: Vec::filled(nn, 0.3),
+        thin: Vec::filled(nn, 0.0),
+        soil: Vec::filled(nn, soil(lap: 0.002, slope: 0.01, rock: 0.0, wet: 0.3)),
+        exposed: Vec::filled(nn, 0.0),
+        cap: Vec::filled(nn, 1.0e9),
+        capped_by: Vec::filled(nn, NONE),
+        lawn: Vec::filled(nn, value: false),
+        kept: Vec::filled(nn, NONE),
+        opened: Vec::filled(nn, NEVER),
+        browsed: Vec::filled(nn, UNBROWSED),
+        water,
+        region: Vec::filled(nn, 0),
+    }
+}
+
+const ELVES = Culture { apart: 250.0, tribes_apart: 500.0, field_reach: 300.0, pasture_reach: 450.0, reach: 600.0 }
+
+@test
+fn two_tribes_far_apart() {
+    let p = settle(land(), ELVES, 0, 300)
+    var tribes = [0, 0]
+    for s in p.settlements {
+        tribes[s.tribe] += 1
+    }
+    assert(tribes[0] >= 1 && tribes[1] >= 1, f"both tribes settle: {tribes[0]} and {tribes[1]}")
+    let a = p.grid.centre(p.settlements[0].at)
+    let b = p.grid.centre(p.settlements[1].at)
+    assert(length(a - b) >= 500.0, f"the tribes' first settlements stand apart: {length(a - b)} m")
+    assert(a.y < 260.0 && b.y < 260.0, f"near the river: {a.y} and {b.y} m from it")
+}
+
+@test
+fn fields_near_and_pasture_beyond() {
+    let p = settle(land(), ELVES, 0, 300)
+    var near = [0.0, 0.0]
+    var count = [0.0, 0.0]
+    for c in 0..p.grid.cells() {
+        let u = Use::from_u32(u32(p.last[c])).unwrap()
+        let k = if u == Use::Field { 0 } else if u == Use::Pasture { 1 } else { 2 }
+        if k == 2 {
+            continue
+        }
+        var d = 1.0e9
+        for s in p.settlements {
+            d = min(d, length(p.grid.centre(c) - p.grid.centre(s.at)))
+        }
+        near[k] += d
+        count[k] += 1.0
+    }
+    assert(count[0] > 0.0 && count[1] > 0.0, f"fields {count[0]} and pasture {count[1]}")
+    assert(near[0] / count[0] < near[1] / count[1], f"fields {near[0] / count[0]} m from home, pasture {near[1] / count[1]} m")
+}
+
+@test
+fn left_as_last_used_with_old_trees_in_the_pasture() {
+    let l = land()
+    let p = settle(l, ELVES, 0, 300)
+    let s = left_by(p, l, species::habits(), ELVES, 300)
+    var grazed = 0.0
+    for c in 0..l.grid.cells() {
+        let was = Left::from_u32(u32(s.left[c])).unwrap()
+        let pc = p.grid.cell_at(l.grid.centre(c))
+        let used = Use::from_u32(u32(p.last[pc])).unwrap()
+        let want = if p.last_year[pc] < 300 - RECLAIMED { Left::Wild } else if used == Use::Field { Left::Tilled } else if used == Use::Pasture { Left::Grazed } else if used == Use::Wood { Left::Cut } else if used == Use::Settled { Left::Built } else { Left::Wild }
+        assert(was == want, "each cell left as it was last used, if in the years before")
+        if was == Left::Grazed {
+            grazed += l.grid.cell * l.grid.cell
+        }
+    }
+    let want = grazed / ELVES.veteran
+    let n = f32(s.standing.len())
+    assert(n > 0.7 * want && n < 1.3 * want, f"about one old tree to each {ELVES.veteran} m² of pasture: {n} for {want}")
+    let habits = species::habits()
+    for t in s.standing {
+        let full = habits[t.kind].crown * t.tall
+        assert(t.reach > 0.99 * full, f"open-grown: crown {t.reach} m, its kind's {full} m")
+    }
+}
+
+@test
+fn left_long_before_the_plague_is_wood_again() {
+    let l = land()
+    let p = settle(l, ELVES, 0, 200)
+    let s = left_by(p, l, species::habits(), ELVES, 400)
+    for b in s.left {
+        assert(Left::from_u32(u32(b)).unwrap() == Left::Wild, "the wood has it back")
+    }
+    assert(s.standing.len() == 0, "no tree kept")
+}
+"#;
+    let dir = map_package("last-green/elves", tests);
+    let floor = repo_root().join("examples/last-green");
+    std::fs::copy(floor.join("peoples.wrela"), dir.join("peoples.wrela")).expect("copy the elves");
+    assert_eq!(super::tests_pass(&dir), 4);
 }
 
 // ---- the bake --------------------------------------------------------------------------------
@@ -433,7 +552,7 @@ fn previewed() -> Vec<(String, Vec<u8>)> {
     let lo = map::LO - vec2(64.0)
     let hi = map::HI + vec2(64.0)
     let st = stones::stones(m)
-    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, lo, hi, st, |land| history::past(m, land))
+    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, lo, hi, st, history::past)
     let o = obstacles_of(h.trees, species::habits(), h.streams, st, stones::walls(m), lo, hi)
     var e = Evidence::of(h)
     e.crowns = trees::drawn_crowns(e.trees)
@@ -2079,7 +2198,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let hi = map::HI + vec2(64.0)
     let st = stones::stones(m)
     let began = now()
-    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, lo, hi, st, |land| history::past(m, land))
+    let h = simulate(ground::ground(), m, species::habits(), PREVIEW, lo, hi, st, history::past)
     let grown = now()
     let o = obstacles_of(h.trees, species::habits(), h.streams, st, stones::walls(m), lo, hi)
     var e = Evidence::of(h)
