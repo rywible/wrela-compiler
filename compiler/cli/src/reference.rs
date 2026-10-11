@@ -1482,9 +1482,7 @@ pub fn write_package(
     out: &Path,
     engine: &Path,
 ) -> Result<(), String> {
-    if crate::is_symlink(out) {
-        return Err(format!("{} is a symbolic link, so it won't be used", out.display()));
-    }
+    wrela_driver::ensure_no_symlinks(out, []).map_err(|e| e.to_string())?;
     std::fs::create_dir_all(out).map_err(|e| format!("can't make {}: {e}", out.display()))?;
     let out_abs = out.canonicalize().map_err(|e| e.to_string())?;
     let engine = engine.canonicalize().map_err(|e| format!("{}: {e}", engine.display()))?;
@@ -1501,12 +1499,8 @@ pub fn write_package(
         ("subject.wrela", SUBJECT.to_string()),
         ("main.wrela", MAIN.to_string()),
     ];
-    if let Some(name) = crate::symlink_in(out, files.iter().map(|(name, _)| *name)) {
-        return Err(format!(
-            "{} is a symbolic link, so it won't be replaced",
-            out.join(name).display()
-        ));
-    }
+    wrela_driver::ensure_no_symlinks(out, files.iter().map(|(f, _)| *f))
+        .map_err(|e| e.to_string())?;
     for (f, text) in files {
         let formatted = if f.ends_with(".wrela") {
             wrela_driver::on_compiler_thread(|| crate::fmt::format_text(&text))

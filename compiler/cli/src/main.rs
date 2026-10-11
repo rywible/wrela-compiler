@@ -273,27 +273,7 @@ pub(crate) fn write_build(out: &wrela_driver::Output, to: &Path) -> Result<(), S
     if out.has_errors() {
         return Err(wrela_diag::render::render_all(&out.sources, &out.diagnostics));
     }
-    if is_symlink(to) {
-        return Err(format!("{} is a symbolic link, so it won't be used", to.display()));
-    }
-    if let Some(name) = symlink_in(to, out.files.iter().map(|(name, _)| name.as_str())) {
-        return Err(format!(
-            "{} is a symbolic link, so it won't be replaced",
-            to.join(name).display()
-        ));
-    }
     out.write_to(to).map_err(|e| e.to_string())
-}
-
-pub(crate) fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
-}
-
-pub(crate) fn symlink_in<'a>(
-    dir: &Path,
-    names: impl IntoIterator<Item = &'a str>,
-) -> Option<String> {
-    names.into_iter().find(|name| is_symlink(&dir.join(name))).map(String::from)
 }
 
 /// Checks a generated path below `<package>/build` without following a symbolic-link component.
@@ -342,20 +322,6 @@ mod tests {
         std::fs::write(dir.join("main.wrela"), "").expect("write");
         assert!(package_args(&args, true).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn build_paths_find_symbolic_links() {
-        use std::os::unix::fs::symlink;
-
-        let dir = std::env::temp_dir().join(format!("wrela-cli-links-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("mkdir");
-        symlink("missing", dir.join("game.wasm")).expect("symlink file");
-        assert_eq!(symlink_in(&dir, ["manifest.json", "game.wasm"]), Some("game.wasm".into()));
-        assert!(is_symlink(&dir.join("game.wasm")));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[cfg(unix)]

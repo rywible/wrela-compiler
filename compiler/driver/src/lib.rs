@@ -76,13 +76,13 @@ impl Output {
         has_errors(&self.diagnostics)
     }
 
-    /// Writes the build's files into `dir`, and makes the directories they need.
+    /// Writes the build's files into `dir`, and makes the directories they need. A symbolic
+    /// link at `dir` or on any file's path refuses the whole write before anything is written.
     pub fn write_to(&self, dir: &Path) -> std::io::Result<()> {
-        ensure_no_symlink_path(dir, dir)?;
+        ensure_no_symlinks(dir, self.files.iter().map(|(path, _)| path.as_str()))?;
         std::fs::create_dir_all(dir)?;
         for (path, bytes) in &self.files {
             let p = dir.join(path);
-            ensure_no_symlink_path(dir, &p)?;
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -116,6 +116,16 @@ pub fn ensure_no_symlink_path(root: &Path, path: &Path) -> std::io::Result<()> {
         reject_symlink(&at)?;
     }
     Ok(())
+}
+
+/// Refuses a symbolic link at `dir`, or on the path of any of `names` inside it: what a writer
+/// of generated files checks before it changes anything there.
+pub fn ensure_no_symlinks<'a>(
+    dir: &Path,
+    names: impl IntoIterator<Item = &'a str>,
+) -> std::io::Result<()> {
+    ensure_no_symlink_path(dir, dir)?;
+    names.into_iter().try_for_each(|name| ensure_no_symlink_path(dir, &dir.join(name)))
 }
 
 fn reject_symlink(path: &Path) -> std::io::Result<()> {
@@ -1034,6 +1044,26 @@ mod tests {
         assert!(ensure_no_symlink_path(&d, &d.join("ordinary/file")).is_ok());
         let _ = std::fs::remove_dir_all(d);
         let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// A symbolic link on any file's path refuses the whole write, before a file is written.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_with_a_linked_file_writes_nothing() {
+        let d =
+            std::env::temp_dir().join(format!("wrela-driver-write-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("output root");
+        std::fs::write(d.join("victim"), "keep").expect("victim");
+        std::os::unix::fs::symlink("victim", d.join("b.bin")).expect("symlink");
+        let mut out = check(&d);
+        out.files = vec![("a.bin".into(), vec![1]), ("b.bin".into(), vec![2])];
+        let refused = out.write_to(&d).expect_err("a symbolic link");
+        assert!(refused.to_string().contains("b.bin"), "{refused}");
+        assert!(!d.join("a.bin").exists(), "nothing is written");
+        assert_eq!(std::fs::read_to_string(d.join("victim")).expect("victim"), "keep");
+        assert!(ensure_no_symlinks(&d, ["a.bin"]).is_ok());
+        let _ = std::fs::remove_dir_all(d);
     }
 
     /// A module file that can't be read, or a file whose name can't be a module, is E0205.

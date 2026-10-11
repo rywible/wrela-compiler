@@ -33,15 +33,9 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
-    if crate::is_symlink(&out) {
-        eprintln!("error: `{}` is a symbolic link, so the build won't use it", out.display());
-        return ExitCode::from(2);
-    }
-    if let Some(name) = symlink_in_way(&out, &output.files) {
-        eprintln!(
-            "error: `{}` is a symbolic link, so the build won't replace it",
-            out.join(name).display()
-        );
+    // Before anything in `out` is removed or written.
+    if let Err(e) = symlinks_in_way(&out, &output.files) {
+        eprintln!("error: {e}");
         return ExitCode::from(2);
     }
     let owned = match owned(&out) {
@@ -118,8 +112,9 @@ const LIST: &str = ".wrela-build";
 
 /// A build output (or its ownership list) that's a symbolic link. Writing a symlink would
 /// replace its target, which isn't a file this build owns.
-fn symlink_in_way(out: &Path, files: &[(String, Vec<u8>)]) -> Option<String> {
-    crate::symlink_in(out, files.iter().map(|(name, _)| name.as_str()).chain(std::iter::once(LIST)))
+fn symlinks_in_way(out: &Path, files: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    let names = files.iter().map(|(name, _)| name.as_str()).chain(std::iter::once(LIST));
+    wrela_driver::ensure_no_symlinks(out, names)
 }
 
 /// The files in `out` that an earlier build wrote: those [`LIST`] names, or, in a directory a
@@ -220,7 +215,8 @@ mod tests {
         std::fs::write(dir.join("victim"), "keep").expect("write victim");
         symlink("victim", dir.join("game.wasm")).expect("symlink");
         let files = [("game.wasm".to_string(), Vec::new())];
-        assert_eq!(symlink_in_way(&dir, &files).as_deref(), Some("game.wasm"));
+        let refused = symlinks_in_way(&dir, &files).expect_err("a symbolic link");
+        assert!(refused.to_string().contains("game.wasm"), "{refused}");
         assert_eq!(std::fs::read_to_string(dir.join("victim")).unwrap(), "keep");
         let _ = std::fs::remove_dir_all(dir);
     }

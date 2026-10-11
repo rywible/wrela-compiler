@@ -174,16 +174,9 @@ fn solve(
         .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
     let glue_dir = dir.join("build").join("solve");
     crate::generated_path(dir, &glue_dir)?;
-    if crate::is_symlink(&glue_dir) {
-        return Err(format!("{} is a symbolic link, so it won't be used", glue_dir.display()));
-    }
+    wrela_driver::ensure_no_symlinks(&glue_dir, ["wrela.toml", "main.wrela"])
+        .map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
-    if let Some(name) = crate::symlink_in(&glue_dir, ["wrela.toml", "main.wrela"]) {
-        return Err(format!(
-            "{} is a symbolic link, so it won't be replaced",
-            glue_dir.join(name).display()
-        ));
-    }
     std::fs::write(
         glue_dir.join("wrela.toml"),
         format!(
