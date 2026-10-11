@@ -279,7 +279,9 @@ step "tests, on the CPU and the GPU, but the long ones and the measurements$( [ 
 tests_started=$SECONDS
 ps -A -o pid=,ppid=,time= > "$logs/ps-before"
 side doc cargo test -q --release --workspace --doc
-side wgsl python3 tools/wgsl_budgets.py "$wrela"
+# (Each build's sizes remembered, as the slow tests are: a build that reads what it read before,
+# with the same CLI, isn't made again.)
+side wgsl python3 tools/wgsl_budgets.py "$wrela" $( [ "$memo" = on ] && echo --memo)
 tests=0
 if [ "$memo" = off ]; then
   run_tests --include-ignored "${skips[@]}" || tests=1

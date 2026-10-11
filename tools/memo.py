@@ -57,6 +57,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 # A test that took this long, or longer, runs alone and is remembered: CPU seconds alone, or
@@ -942,41 +943,18 @@ class Rebuilds:
         before; else made, traced, and remembered."""
         if self.cli is None:
             return None
-        m = self.memo
-        if m is not None:
-            key = self.key(pkg, args)
-            path = os.path.join(m.store.dir, "builds", key[:24] + ".json")
-            try:
-                with open(path, encoding="utf-8") as f:
-                    entry = json.load(f)
-                if all(m.still(n, state) for n, state in entry["inputs"].items()):
-                    os.utime(path)  # used: kept by `prune`
-                    return entry["files"]
-            except (OSError, ValueError, KeyError, AttributeError):
-                pass
         dir = os.path.join(self.out, sha(json.dumps([pkg, args]))[:16])
-        shutil.rmtree(dir, ignore_errors=True)
-        os.makedirs(self.out, exist_ok=True)
         command = [self.cli, "build", pkg, "-o", dir, *args]
-        log = dir + ".trace"
-        if m is not None:
-            command = ["strace", "-f", "--seccomp-bpf", "-qq", "-y", "-e", "trace=%file", "-o",
-                       log, *command]
-        started = time.time()
-        r = subprocess.run(command, cwd=self.root, capture_output=True)
-        files = self.files_hash(dir) if r.returncode == 0 else None
-        if m is not None and files is not None:
-            try:
-                with open(log, encoding="utf-8", errors="surrogateescape") as f:
-                    seen = touched(f.read())
-                # Its inputs as they are after it (its `-o` is under target/, not kept), unless
-                # one changed while it ran.
-                if not unplaced(seen) and not m.inputs.changed_since(seen, started):
-                    inputs = m.inputs.of(seen, Digests())
-                    write_atomically(path, json.dumps({"inputs": inputs, "files": files}))
-            except OSError:
-                pass
-        return files
+
+        def build():
+            shutil.rmtree(dir, ignore_errors=True)
+            os.makedirs(self.out, exist_ok=True)
+            return command
+
+        if self.memo is None:
+            r = subprocess.run(build(), cwd=self.root, capture_output=True)
+            return self.files_hash(dir) if r.returncode == 0 else None
+        return self.memo.traced(self.key(pkg, args), build, self.root, lambda: self.files_hash(dir))
 
     def prefetch(self, builds):
         """Makes `builds` ((package, args) pairs) not yet made, as many at once as there are cores."""
@@ -1049,6 +1027,45 @@ class Memo:
     def still(self, name, state):
         how = "list" if state.startswith("list:") else "read"
         return self.digests.of(self.inputs.path(name), how) == state
+
+    def traced(self, key, command, cwd, result, output=None):
+        """`result()` after the command `command()` gives ran in `cwd` (None if it failed),
+        remembered in the store under `key`, the caller's for the command: when it read the same
+        files before, the result then, and it doesn't run. A run whose inputs changed while it
+        ran, or that read a path it can't place, isn't remembered. What it read in `output`,
+        the directory it writes its result in (listing it to clear it), isn't an input."""
+        path = os.path.join(self.store.dir, "builds", key[:24] + ".json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                entry = json.load(f)
+            if all(self.still(n, state) for n, state in entry["inputs"].items()):
+                os.utime(path)  # used: kept by `prune`
+                return entry["result"]
+        except (OSError, ValueError, KeyError, AttributeError):
+            pass
+        fd, log = tempfile.mkstemp(prefix="wrela-traced-")
+        os.close(fd)
+        started = time.time()
+        r = subprocess.run(["strace", "-f", "--seccomp-bpf", "-qq", "-y", "-e", "trace=%file",
+                            "-o", log, *command()], cwd=cwd, capture_output=True)
+        out = result() if r.returncode == 0 else None
+        try:
+            if out is not None:
+                with open(log, encoding="utf-8", errors="surrogateescape") as f:
+                    seen = touched(f.read())
+                if output is not None:
+                    mine = os.path.abspath(output)
+                    seen = {p: h for p, h in seen.items()
+                            if p != mine and not p.startswith(mine + os.sep)}
+                # Its inputs as they are after it (what it wrote isn't one), unless one changed
+                # while it ran.
+                if not unplaced(seen) and not self.inputs.changed_since(seen, started):
+                    inputs = self.inputs.of(seen, Digests())
+                    write_atomically(path, json.dumps({"inputs": inputs, "result": out}))
+            os.remove(log)
+        except OSError:
+            pass
+        return out
 
     def builds_of(self, entry):
         return [(self.inputs.path(b["pkg"]), b["args"]) for b in entry.get("builds", [])]

@@ -435,6 +435,71 @@ echo a.wasm > "$4/.wrela-build"
         self.assertNotEqual(second, first)
 
 
+@unittest.skipUnless(memo.available(), "needs strace and a mount namespace")
+class WgslBudgets(Files):
+    """tools/wgsl_budgets.py with the gate's memory: a build is made again only when its CLI or
+    a file it read changed, and a remembered build's sizes still meet the budget."""
+
+    def setUp(self):
+        super().setUp()
+        os.makedirs(os.path.join(self.root, "tools"))
+        for name in ("wgsl_budgets.py", "memo.py", "resources.py", "subjects.py"):
+            shutil.copy(os.path.join(TOOLS, name), os.path.join(self.root, "tools", name))
+        subprocess.run(["git", "init", "-q", self.root], check=True)
+        # What it made, outside the checkout (a file made there would change the checkout's
+        # listing, which a build read, while the others ran).
+        self.log = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.log)
+        self.cli = self.write("bin/wrela", f"""#!/bin/sh
+echo "$@" >> {self.log}/made
+if [ "$1" = studio ]; then out="$PWD/$2/build/studio/page"; else out="$4"; fi
+mkdir -p "$out" && head -c "$(cat "$PWD/$2/size" 2>/dev/null || echo 10)" /dev/zero > "$out/p.wgsl"
+""")
+        os.chmod(self.cli, 0o755)
+        for s in ("wolf", "grazer", "great-tree", "fawn"):
+            self.write(f"examples/{s}/main.wrela", "fn main() {}\n")
+            # As a checkout that ran the studio before has it: a build that made a directory
+            # changed what another build may have read (its parent), and isn't remembered.
+            self.write(f"examples/{s}/build/studio/page/p.wgsl", "")
+        self.write("examples/a/main.wrela", "fn main() {}\n")
+        self.write("examples/a/size", "100\n")
+        os.makedirs(os.path.join(self.root, "target"))
+
+    def budgets(self):
+        env = {**os.environ, "WRELA_GATE_MEMO": os.path.join(self.root, "store"),
+               "CARGO_TARGET_DIR": os.path.join(self.root, "target")}
+        return subprocess.run([sys.executable, "tools/wgsl_budgets.py", self.cli, "--memo"],
+                              cwd=self.root, env=env, capture_output=True, text=True)
+
+    def made(self):
+        path = os.path.join(self.log, "made")
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            made = f.read().splitlines()
+        os.remove(path)
+        return made
+
+    def test_a_build_is_made_again_only_when_what_it_read_changed(self):
+        r = self.budgets()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("examples/a: largest pipeline 0 KiB", r.stdout)
+        self.assertEqual(len(self.made()), 9)  # 4 lenses, 5 packages
+        r = self.budgets()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("9 pipelines in 9 packages", r.stdout)
+        self.assertEqual(self.made(), [], "none made again")
+        self.write("examples/a/size", str(300 * 1024))
+        r = self.budgets()
+        self.assertEqual(self.made(), ["build examples/a -o " + os.path.join(self.root, "target", "wgsl-budgets", "a")])
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("examples/a/p.wgsl is 300 KiB", r.stderr)
+        # Remembered, it is still over.
+        r = self.budgets()
+        self.assertEqual(self.made(), [])
+        self.assertIn("over its size budget", r.stderr)
+
+
 FILES_HASH = "8410ef328ec8af3db236a70a705c1c9c7746bdc9695323b3e5bb56ef647fdf28"
 
 
