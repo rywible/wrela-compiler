@@ -7,6 +7,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod audio;
 mod bounds;
 mod buffers;
+mod builders;
 mod channels;
 mod clearing;
 mod climber;
