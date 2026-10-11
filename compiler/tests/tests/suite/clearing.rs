@@ -859,10 +859,22 @@ fn the_walks_own_tests_pass() {
     assert_eq!(super::tests_pass(&repo_root().join("examples/clearing")), 2);
 }
 
-/// The engine's own tests (`@test`s in engine/), on the CPU.
+/// The engine's own tests (`@test`s in engine/), on the CPU: each one its files declare runs and
+/// passes (counted from the files, so a branch that adds one needn't change this test).
 #[test]
 fn the_engines_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("engine")), 4);
+    let engine = repo_root().join("engine");
+    let declared: usize = std::fs::read_dir(&engine)
+        .expect("engine/")
+        .map(|e| e.expect("an entry of engine/").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "wrela"))
+        .map(|p| {
+            let text = std::fs::read_to_string(&p).expect("an engine file");
+            text.lines().filter(|l| l.trim_start().starts_with("@test")).count()
+        })
+        .sum();
+    assert!(declared > 0, "engine/ declares no tests");
+    assert_eq!(super::tests_pass(&engine), declared);
 }
 
 /// AC4: the grass is placed on the GPU round the eye and follows it: over the camera's path
