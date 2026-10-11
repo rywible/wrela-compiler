@@ -13,7 +13,7 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("PAR_WAKE", PAR_WAKE, "Bumped whenever work appears: the helpers wait on it."),
     ("PAR_SHUTDOWN", PAR_SHUTDOWN, "Nonzero once the host wants its helpers to return."),
     ("PAR_HELPED", PAR_HELPED, "How many chunks the helpers have run, ever."),
-    ("PAR_HOLD", PAR_HOLD, "Microseconds a helper holds back each task's result (tests)."),
+    ("PAR_HOLD", PAR_HOLD, "Microseconds each task's result is held back, whoever ran it (tests)."),
     (
         "PAR_HELPERS",
         PAR_HELPERS,

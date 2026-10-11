@@ -83,8 +83,8 @@ pub const PAR_SHUTDOWN: u32 = PAR_STATE + 4;
 /// How many chunks the helpers (not the threads that started their jobs) have run, ever: a host
 /// reads it to show that they help.
 pub const PAR_HELPED: u32 = PAR_STATE + 8;
-/// Microseconds a helper holds back each task's result once it's ready: 0 normally. A
-/// test writes it to slow jobs down, so the threads that take them wait.
+/// Microseconds each task's result is held back once it's ready, whichever thread ran it: 0
+/// normally. A test writes it to slow jobs down, so the threads that take them wait.
 pub const PAR_HOLD: u32 = PAR_STATE + 12;
 /// How many helpers the host started for the program, before its `init`: the host writes it.
 /// With none (a page on a machine of two cores, a test run on one thread), std runs a task when

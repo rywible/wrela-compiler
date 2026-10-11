@@ -258,15 +258,16 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
 /// 2 for a job due at tick 10, and at tick 5 for one due at tick 20 whose work panics; the ticks
 /// before 20 run, and tick 20 traps with the job's message. With no helpers, one or seven, and
 /// with jobs slowed (each result held 100 ms, so tick 10 waits for its job: it ends no sooner
-/// than 100 ms after tick 2 asked for it, however long the ticks between took; a machine loaded
-/// by other work slowed them, and a bound on tick 10's own wait failed). The ticks are 2 ms
-/// apart, so a helper takes each job before its due tick does.
+/// than 100 ms after tick 2 asked for it). The bound holds on a loaded machine too: the result
+/// is held whichever thread ran the job, a helper or tick 10 itself when no helper took it in
+/// time (with no helpers, always: on a gate's loaded machine, tick 10 once ran it unheld), and
+/// load only makes the ticks slower.
 #[test]
 fn a_trapping_job_traps_at_the_tick_that_takes_it() {
     let dir = super::engine_package("threads-due-trap", "due", DUE_TRAP);
     wrela_tests::must_build(&dir, &dir);
     let build = CpuBuild::load(&dir).expect("load");
-    for (workers, hold) in [(1, 0), (2, 0), (8, 0), (2, 100_000), (8, 100_000)] {
+    for (workers, hold) in [(1, 0), (2, 0), (8, 0), (1, 100_000), (2, 100_000), (8, 100_000)] {
         let mut host = build.instantiate_in(workers, None).expect("instantiate");
         host.hold_jobs(hold);
         host.init().expect("init");

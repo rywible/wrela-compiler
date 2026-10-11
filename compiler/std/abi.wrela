@@ -13,7 +13,7 @@ pub(package) const PAR_SHUTDOWN: u32 = 260
 /// How many chunks the helpers have run, ever.
 pub(package) const PAR_HELPED: u32 = 264
 
-/// Microseconds a helper holds back each task's result (tests).
+/// Microseconds each task's result is held back, whoever ran it (tests).
 pub(package) const PAR_HOLD: u32 = 268
 
 /// How many helpers the host started: with none, `done` runs a task.

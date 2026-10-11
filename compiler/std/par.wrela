@@ -207,7 +207,7 @@ fn find_work() -> bool {
         for s in 0..TASK_SLOT_COUNT {
             let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
             if atomic_load(slot) == QUEUED && compare_swap(slot, QUEUED, STARTED) == QUEUED {
-                run_spawned(slot, held: true)
+                run_spawned(slot)
                 return true
             }
         }
@@ -215,9 +215,10 @@ fn find_work() -> bool {
     false
 }
 
-/// Runs the task in `slot`, which this thread has started, and marks it finished. A helper
-/// holds its result back for as long as the host asks (`PAR_HOLD`, microseconds: tests slow jobs).
-fn run_spawned(slot: u32, held: bool) {
+/// Runs the task in `slot`, which this thread has started, and marks it finished. It holds the
+/// result back for as long as the host asks (`PAR_HOLD`, microseconds: tests slow jobs), whichever
+/// thread ran it, so a slowed job is slow even when its join runs it.
+fn run_spawned(slot: u32) {
     unsafe {
         let me = thread_block()
         atomic_store(slot + SLOT_THREAD, (me - THREAD_BLOCKS) / THREAD_BLOCK_SIZE)
@@ -226,7 +227,7 @@ fn run_spawned(slot: u32, held: bool) {
         run_task(atomic_load(slot + SLOT_TASK), atomic_load(slot + SLOT_CONTEXT), 0)
         atomic_store(me + RUNNING, 0)
         let hold = atomic_load(PAR_HOLD)
-        if held && hold > 0 {
+        if hold > 0 {
             // Nothing notifies the slot while it's started: a sleep.
             let _ = wait_for(slot, STARTED, hold)
         }
@@ -328,7 +329,7 @@ impl<O> Task<O> {
             if self.slot != 0 &&
                 atomic_load(PAR_HELPERS) == 0 &&
                 compare_swap(self.slot, QUEUED, STARTED) == QUEUED {
-                run_spawned(self.slot, held: false)
+                run_spawned(self.slot)
             }
             self.slot == 0 || atomic_load(self.slot) >= FINISHED
         }
@@ -344,7 +345,7 @@ impl<O> Task<O> {
                     let state = atomic_load(self.slot)
                     if state == QUEUED {
                         if compare_swap(self.slot, QUEUED, STARTED) == QUEUED {
-                            run_spawned(self.slot, held: false)
+                            run_spawned(self.slot)
                         }
                     } else if state == STARTED {
                         // Counted for the hosts, which log a ticker's waits.

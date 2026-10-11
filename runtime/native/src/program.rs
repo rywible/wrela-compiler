@@ -1127,9 +1127,9 @@ impl<E: Executor> Program<E> {
         crate::shared::load_u32(&self.memory, memory::PAR_HELPED)
     }
 
-    /// Makes each helper hold back a task's result for `micros` microseconds once it's
-    /// ready (`wrela_abi::memory::PAR_HOLD`): for tests, which slow jobs down so the threads
-    /// that take them wait.
+    /// Holds back each task's result for `micros` microseconds once it's ready, whichever
+    /// thread ran it (`wrela_abi::memory::PAR_HOLD`): for tests, which slow jobs down so the
+    /// threads that take them wait.
     pub(crate) fn hold_jobs(&self, micros: u32) {
         crate::shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
     }
