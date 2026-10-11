@@ -1,5 +1,5 @@
 """Claude Code's hooks for this repository, which .claude/settings.json runs. Each makes a rule of
-CLAUDE.md that agents skipped into a check, or gives back what an agent loses to a compaction.
+AGENTS.md that agents skipped into a check, or gives back what an agent loses to a compaction.
 
     python3 tools/hooks.py bash      before each Bash command (PreToolUse). Refuses waiting in
                                      the foreground on a loop of `sleep`, and a `cargo test` that
@@ -52,13 +52,13 @@ CHECK = re.compile(START + r"[\w./-]*?tools/check\.sh\b([^;&|\n)]*)")
 POLL_REASON = (
     "Don't wait in the foreground on a loop of `sleep`. Run the command in the background "
     "(run_in_background): it wakes you when it exits, so keep working or end your turn. To wait "
-    "for a line in a log, use Monitor. (tools/hooks.py; CLAUDE.md, Checks)"
+    "for a line in a log, use Monitor. (tools/hooks.py; AGENTS.md, Checks)"
 )
 CARGO_TEST_REASON = (
     "Use tools/check.sh <name> for one test, or tools/check.sh for the suite. "
     "Wrap other costly commands with python3 tools/jobs.py run build -- <command>; "
     "use run measure for timing evidence. This admits one costly job across sessions and "
-    "shares the build cache. Raw Cargo commands bypass that budget. (tools/hooks.py; CLAUDE.md, Checks)"
+    "shares the build cache. Raw Cargo commands bypass that budget. (tools/hooks.py; AGENTS.md, Checks)"
 )
 
 
