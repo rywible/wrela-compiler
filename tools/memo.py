@@ -20,7 +20,9 @@ the compiler's crates (COMPILE_ONLY) or to wrela sources only the builds read ca
 the test does. A build tool's "early cutoff". That holds when the compiler did all its work for
 the test in those builds, so such an entry is made only when the test lexed no wrela text
 outside them (wrela-syntax says so in the record), read no wrela source outside them, ran none
-of the workspace's programs, and its code names no compiler crate.
+of the workspace's programs, and its code names no compiler crate. A build made again is traced
+too, and remembered by the same `wrela` CLI's bytes and the files it read: the gate after makes
+it again only when one of those changed.
 
     sources but the compiler's ─┐
     environment ────────────────┤
@@ -667,22 +669,22 @@ class Store:
         write_atomically(os.path.join(self.entries_dir(test, rust), sha(body)[:24] + ".json"), body)
 
     def prune(self):
-        """Removes the entries not used or made for KEEP_DAYS days."""
+        """Removes the entries and builds not used or made for KEEP_DAYS days."""
         old = time.time() - KEEP_DAYS * 86400
-        top = os.path.join(self.dir, "entries")
-        for dirpath, dirnames, filenames in os.walk(top, topdown=False):
-            for n in filenames:
-                p = os.path.join(dirpath, n)
-                try:
-                    if os.path.getmtime(p) < old:
-                        os.remove(p)
-                except OSError:
-                    pass
-            if dirpath != top:
-                try:
-                    os.rmdir(dirpath)
-                except OSError:
-                    pass
+        for top in (os.path.join(self.dir, "entries"), os.path.join(self.dir, "builds")):
+            for dirpath, dirnames, filenames in os.walk(top, topdown=False):
+                for n in filenames:
+                    p = os.path.join(dirpath, n)
+                    try:
+                        if os.path.getmtime(p) < old:
+                            os.remove(p)
+                    except OSError:
+                        pass
+                if dirpath != top:
+                    try:
+                        os.rmdir(dirpath)
+                    except OSError:
+                        pass
 
 
 # ---- one test, alone and traced -------------------------------------------------------------
@@ -753,9 +755,10 @@ class Rebuilds:
     (`wrela build <package> -o <dir> <args>`, the build `recorded_build` says makes the same
     files), each once per gate: each one's files' hash, or None if it failed."""
 
-    def __init__(self, cli, root, out):
-        self.cli, self.root, self.out = cli, root, out
+    def __init__(self, cli, root, out, memo=None):
+        self.cli, self.root, self.out, self.memo = cli, root, out, memo
         self.known = {}
+        self.cli_key = None
 
     @staticmethod
     def files_hash(dir):
@@ -773,14 +776,54 @@ class Rebuilds:
         except OSError:
             return None
 
+    def key(self, pkg, args):
+        """A build's key in the store: the CLI's bytes, the variables its code reads, the
+        package and the arguments."""
+        if self.cli_key is None:
+            m = self.memo
+            texts = [m.sources.text(f) for f in m.sources.files_of(m.sources.closure("compiler/cli"))
+                     if f.endswith(".rs")]
+            env = m.env_of(env_names(texts) - ENV_NOT)
+            self.cli_key = sha(json.dumps([MEANING, m.digests.of(self.cli, "read"), env]))
+        return sha(json.dumps([self.cli_key, self.memo.inputs.name(pkg), args]))
+
     def make(self, pkg, args):
+        """The build's files' hash: remembered, if the same CLI read the same files for it
+        before; else made, traced, and remembered."""
         if self.cli is None:
             return None
+        m = self.memo
+        if m is not None:
+            key = self.key(pkg, args)
+            path = os.path.join(m.store.dir, "builds", key[:24] + ".json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    entry = json.load(f)
+                if all(m.still(n, state) for n, state in entry["inputs"].items()):
+                    os.utime(path)  # used: kept by `prune`
+                    return entry["files"]
+            except (OSError, ValueError, KeyError, AttributeError):
+                pass
         dir = os.path.join(self.out, sha(json.dumps([pkg, args]))[:16])
         shutil.rmtree(dir, ignore_errors=True)
-        r = subprocess.run([self.cli, "build", pkg, "-o", dir, *args], cwd=self.root,
-                           capture_output=True)
-        return self.files_hash(dir) if r.returncode == 0 else None
+        os.makedirs(self.out, exist_ok=True)
+        command = [self.cli, "build", pkg, "-o", dir, *args]
+        log = dir + ".trace"
+        if m is not None:
+            command = ["strace", "-f", "--seccomp-bpf", "-qq", "-y", "-e", "trace=%file", "-o",
+                       log, *command]
+        r = subprocess.run(command, cwd=self.root, capture_output=True)
+        files = self.files_hash(dir) if r.returncode == 0 else None
+        if m is not None and files is not None:
+            try:
+                with open(log, encoding="utf-8", errors="surrogateescape") as f:
+                    seen = touched(f.read())
+                # What it wrote into its output aside (its `-o` is under target/, not kept).
+                inputs = m.inputs.of(seen, m.digests)
+                write_atomically(path, json.dumps({"inputs": inputs, "files": files}))
+            except OSError:
+                pass
+        return files
 
     def prefetch(self, builds):
         """Makes `builds` ((package, args) pairs) not yet made, as many at once as there are cores."""
@@ -813,7 +856,7 @@ class Memo:
         self.sources = sources or Sources(self.root, target)
         self.inputs = Inputs(self.root, target, ignore=[dir])
         self.digests = Digests()
-        self.rebuilds = Rebuilds(cli, self.root, os.path.join(target, "gate-memo-builds"))
+        self.rebuilds = Rebuilds(cli, self.root, os.path.join(target, "gate-memo-builds"), self)
 
     @staticmethod
     def package(test_id):

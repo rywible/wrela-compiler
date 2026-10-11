@@ -302,6 +302,36 @@ class Builds(Sources):
             f.write(b"fn main() {}")
         self.assertEqual(memo.Rebuilds.files_hash(d), FILES_HASH)
 
+    @unittest.skipUnless(memo.available(), "needs strace and mount namespaces")
+    def test_a_build_is_made_again_only_when_a_file_it_read_changed(self):
+        cli = os.path.join(self.root, "target", "release", "wrela")
+        count = os.path.join(self.root, "target", "count")
+        os.makedirs(os.path.dirname(cli), exist_ok=True)
+        with open(cli, "w") as f:
+            f.write(f"""#!/bin/sh
+echo made >> {count}
+mkdir -p "$4" && cat "$2/wrela.toml" {self.root}/engine/sky.wrela > "$4/a.wasm"
+echo a.wasm > "$4/.wrela-build"
+""")
+        os.chmod(cli, 0o755)
+
+        def make():  # one gate's
+            m = memo.Memo(self.root, os.path.join(self.root, "target"),
+                          os.path.join(self.root, "store"), cli, sources=self.sources())
+            return m.rebuilds.make(self.root + "/ex", ["--testing"])
+
+        def made():
+            with open(count) as f:
+                return len(f.readlines())
+
+        first = make()
+        self.assertIsNotNone(first)
+        self.assertEqual((make(), made()), (first, 1), "the same files read: not made again")
+        self.write("engine/sky.wrela", "fn sky() { changed() }\n")
+        second = make()
+        self.assertEqual(made(), 2)
+        self.assertNotEqual(second, first)
+
 
 FILES_HASH = "8410ef328ec8af3db236a70a705c1c9c7746bdc9695323b3e5bb56ef647fdf28"
 
