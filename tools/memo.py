@@ -33,7 +33,7 @@ What the entry leaves out, and why that is safe:
   files), which are in the key. So are the other programs a test runs (the `wrela` CLI).
 - What it wrote (its scratch files, `target/`): its outputs, not its inputs.
 - Caches whose entries are keyed by their content (the native host's compiled code, Mesa's
-  shader cache): a hit gives the same result as a miss.
+  shader cache, a package's constants in `build/consts`): a hit gives the same result as a miss.
 - The other modules of a multi-file test program, which it doesn't name (`clearing.rs` doesn't
   name `last_green`): their code doesn't run in its process.
 
@@ -267,8 +267,11 @@ class Inputs:
 
     def kept(self, path):
         under = lambda d: path == d or path.startswith(d + os.sep)
-        # The checkout's files are inputs wherever it is (in /tmp, say), its target/ aside.
+        # The checkout's files are inputs wherever it is (in /tmp, say), its target/ aside, and a
+        # package's constants cache (`build/consts`, keyed by each constant's code and inputs).
         if under(self.root):
+            if f"{os.sep}build{os.sep}consts" in path[len(self.root):] + os.sep:
+                return False
             return not any(under(i) for i in self.ignore if i.startswith(self.root + os.sep))
         return not any(under(i) for i in self.ignore)
 

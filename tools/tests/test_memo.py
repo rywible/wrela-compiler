@@ -77,6 +77,8 @@ class Inputs(Files):
         inputs = memo.Inputs(self.root, target)
         a = self.write("engine/a.wrela", "a")
         seen = {a: "read", os.path.join(target, "release/x"): "read", "/proc/self/maps": "read",
+                os.path.join(self.root, "ex/build/consts"): "list",
+                os.path.join(self.root, "ex/build/consts/ab12.wcv"): "read",
                 os.path.join(self.root, "out.png"): "write", os.path.join(self.root, "gone"): "read"}
         got = inputs.of(seen, memo.Digests())
         self.assertEqual(set(got), {"repo:engine/a.wrela", "repo:gone"})
