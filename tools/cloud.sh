@@ -11,8 +11,8 @@
 #                           a session's start).
 #   tools/cloud.sh --check  exits 0 if this version of the script provisioned the machine.
 #   tools/cloud.sh --warm   provisions the machine if it isn't, then builds what a session
-#                           builds first, slowly (nice): the CLI and the native host, the floor
-#                           and its bake, the tests. tools/hooks.py starts it in the background
+#                           builds first, slowly (nice): the CLI, the native host and the tests,
+#                           then the floor and its bake. tools/hooks.py starts it in the background
 #                           at a session's start; its log is /tmp/wrela-warm.log.
 #   tools/cloud.sh --env    prints the environment a session needs (KEY=VALUE lines): that the
 #                           GPU is software (tools/check.sh reports its time budget, not gates
@@ -30,11 +30,16 @@ cd "$(dirname "$0")/.."
 
 PREFIX=/opt/wrela-mesa
 PATCH=tools/cloud/mesa-vbuf-reset.patch
-# The marker names this script's and the patch's version: a change to either provisions again.
-STAMP="$PREFIX/provisioned-$(cat "$0" "$PATCH" | sha256sum | cut -c1-16)"
+# The marker names the version of the provisioning (this script from "One provisioning" on) and
+# of the patch: a change to either provisions again, and a change to the rest of it doesn't.
+STAMP="$PREFIX/provisioned-$(sed -n '/^# One provisioning at a time/,$p' "$0" | cat - "$PATCH" \
+  | sha256sum | cut -c1-16)"
+# The marker of the same provisioning, from when the whole script was hashed (until 2026-10-11).
+OLD_STAMP="$PREFIX/provisioned-2216f6ac067b17b5"
+provisioned() { [ -e "$STAMP" ] || [ -e "$OLD_STAMP" ]; }
 
 case "${1:-}" in
-  --check) [ -e "$STAMP" ]; exit ;;
+  --check) provisioned; exit ;;
   --env)
     echo "WRELA_SOFTWARE_GPU=1"
     chrome=$(ls -d /opt/pw-browsers/chromium-*/chrome-linux/chrome 2>/dev/null | sort -V | tail -1 || true)
@@ -50,9 +55,11 @@ case "${1:-}" in
     export CARGO_TERM_COLOR=never
     s=$SECONDS
     "$0" || exit 1
-    nice -n 10 cargo build -q --release -p wrela-host -p wrela && echo "built the CLI and the host: $((SECONDS - s))s"
+    # The CLI and the native host with the tests, as tools/check.sh builds them: built apart, the
+    # compiler's crates would build twice (without the tests' dev-dependencies, some of their
+    # dependencies' features differ).
+    nice -n 10 cargo test -q --release --workspace --no-run 2> /dev/null && echo "built the CLI, the host and the tests: $((SECONDS - s))s"
     nice -n 10 target/release/wrela build examples/last-green > /dev/null && echo "built the floor: $((SECONDS - s))s"
-    nice -n 10 cargo test -q --release --workspace --no-run 2> /dev/null && echo "built the tests: $((SECONDS - s))s"
     echo "warm: $((SECONDS - s))s"
     exit 0 ;;
   "") ;;
@@ -63,7 +70,7 @@ esac
 # for the first, then finds the marker.
 exec 9> /tmp/wrela-provision.lock
 flock 9
-[ -e "$STAMP" ] && exit 0
+provisioned && exit 0
 if [ "$(id -u)" != 0 ]; then echo "tools/cloud.sh provisions as root" >&2; exit 1; fi
 s=$SECONDS
 export DEBIAN_FRONTEND=noninteractive

@@ -94,9 +94,13 @@ if [ "$fmt" = 1 ]; then
   cargo fmt --all -- -l
   wrela="${CARGO_TARGET_DIR:-target}/release/wrela"
   if [ -x "$wrela" ]; then
-    # The files it would change, on stdout (its count is on stderr).
-    "$wrela" fmt --check "${WRELA_SOURCES[@]}" 2>/dev/null || true
-    "$wrela" fmt "${WRELA_SOURCES[@]}"
+    # The files it would change, on stdout (its count is on stderr); then only those, formatted.
+    changed=$("$wrela" fmt --check "${WRELA_SOURCES[@]}" 2>/dev/null || true)
+    if [ -n "$changed" ]; then
+      printf '%s\n' "$changed"
+      mapfile -t files <<< "$changed"
+      "$wrela" fmt "${files[@]}"
+    fi
   fi
   exit 0
 fi
@@ -111,36 +115,7 @@ while read -r kind name; do
     heavy) heavy_tests+=("$name") ;;
     *) long_tests+=("$name") ;;
   esac
-done < <(python3 - <<'PY'
-import pathlib, re
-for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime").rglob("*.rs")]):
-    if "target" in f.parts:
-        continue
-    lines = f.read_text().splitlines()
-    next_functions = [None] * len(lines)
-    name = None
-    for i in range(len(lines) - 1, -1, -1):
-        next_functions[i] = name
-        if m := re.search(r"fn (\w+)\(", lines[i]):
-            name = m.group(1)
-    inside = False
-    for i, line in enumerate(lines):
-        if m := re.search(r'#\[ignore = "(long|measure|heavy):', line):
-            name = next_functions[i]
-            # A test file at the top of `tests/` is a test program of its own (no module). A unit
-            # test in `src/` is in its file's module, under the directories it's in, and in its
-            # `mod tests` (a crate's root file names no module, nor does a `mod.rs`).
-            if f.parent.name == "tests":
-                print(m[1], name)
-            elif "src" in f.parts:
-                path = [*f.parts[f.parts.index("src") + 1 : -1], f.stem]
-                module = "".join(f"{p}::" for p in path if p not in ("lib", "main", "mod"))
-                print(m[1], f"{module}{'tests::' if inside else ''}{name}")
-            else:
-                print(m[1], f"{f.stem}::{name}")
-        inside |= bool(re.match(r"\s*mod tests\b", line))
-PY
-)
+done < <(python3 tools/ignored.py)
 # A heavy test takes seconds on a GPU but minutes on a software one (lavapipe): there, it is a
 # long test, which main's long run checks every six hours.
 if [ -n "${WRELA_SOFTWARE_GPU:-}" ]; then long_tests+=("${heavy_tests[@]}"); fi

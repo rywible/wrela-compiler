@@ -5,10 +5,11 @@
 #
 #   tools/premerge.sh       merges origin/main into the branch's last commit in a throwaway tree
 #                           (target/premerge/tree; nothing is pushed and the branch is unchanged),
-#                           then runs `cargo check --workspace --all-targets` there and `wrela
-#                           check` on every package whose files either side changed: its own
-#                           directory or a package it depends on. A change to the compiler or to
-#                           std checks every package. About a minute once warm (with the shared
+#                           then runs `cargo check --workspace --all-targets` there (if the
+#                           branch changed what the Rust builds from) and `wrela check` on every
+#                           package that reads a file the branch changed: in its own directory or
+#                           a package it depends on. A change to the compiler or to std checks
+#                           every package. About a minute once warm (with the shared
 #                           constants cache); the first run builds the CLI (several minutes),
 #                           and a change to std or the compiler can bake constants again.
 #
@@ -56,9 +57,10 @@ else
   echo "  cargo check: the branch changed nothing the Rust builds from"
 fi
 
-# Every package that reads a file either side changed (since the two diverged).
+# Every package of the merge that reads a file the branch changed. One that reads only files main
+# changed checks as it does on main: nothing of the branch's for it to check.
 start=$SECONDS
-packages=$(git diff --name-only "$base" "$merged" | python3 -c '
+packages=$(git -C "$root" diff --name-only "$base" HEAD | python3 -c '
 import pathlib, re, sys
 changed = [l.strip() for l in sys.stdin if l.strip()]
 # The compiler and std reach every package.

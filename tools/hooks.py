@@ -13,7 +13,6 @@ Each reads the hook's JSON on stdin. A refusal is its reason, for Claude, on std
 Anything else that goes wrong lets the command run: a hook mustn't stop work by its own fault.
 """
 
-import glob
 import json
 import os
 import re
@@ -88,22 +87,14 @@ def polls(command, background):
 
 
 def measures(root):
-    """The names of the tests whose `#[ignore]` reason starts `measure:`, as check.sh finds them."""
-    names = set()
-    for top in ("compiler", "runtime"):
-        for path in glob.glob(os.path.join(root, top, "**", "*.rs"), recursive=True):
-            if f"{os.sep}target{os.sep}" in path:
-                continue
-            with open(path, encoding="utf-8", errors="replace") as f:
-                lines = f.read().splitlines()
-            next_fn = None
-            for line in reversed(lines):
-                if '#[ignore = "measure:' in line:
-                    if next_fn:
-                        names.add(next_fn)
-                if m := re.search(r"fn (\w+)\(", line):
-                    next_fn = m.group(1)
-    return names
+    """The names of the tests whose `#[ignore]` reason starts `measure:` (tools/ignored.py), each
+    as its function's name."""
+    tools = os.path.join(root, "tools")
+    if tools not in sys.path:
+        sys.path.insert(0, tools)
+    import ignored
+
+    return {name.rsplit("::", 1)[-1] for kind, name in ignored.ignored(root) if kind == "measure"}
 
 
 def takes_the_gpu_alone(command, root):
