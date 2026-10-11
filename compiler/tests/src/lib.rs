@@ -6,7 +6,8 @@
 //! `tools/check.sh` runs them (four at a time share the GPU), but not those whose reason starts
 //! `long:` (headless Chrome, the clearing's camera path, soak runs), which `tools/check.sh
 //! --long` runs, nor `measure:` (time budgets and comparisons), which `tools/check.sh --full`
-//! runs one at a time, the GPU theirs alone.
+//! runs one at a time, the GPU theirs alone. On a software GPU (`WRELA_SOFTWARE_GPU`), those whose
+//! reason starts `heavy:` (seconds on a GPU, minutes on lavapipe) are long checks too.
 //!
 //! Sampled tests have two sizes: small by default, so `cargo test` and the long checks stay
 //! fast, and the size the acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as

@@ -13,6 +13,8 @@
 #                           slow test (5 s or more, last time) alone and remembers its pass with
 #                           what it read (tools/memo.py), and skips a slow test that passed before
 #                           with everything it read unchanged.
+#                           On a software GPU (WRELA_SOFTWARE_GPU, a cloud machine), the tests
+#                           whose `#[ignore]` reason starts `heavy:` are long tests instead.
 #   tools/check.sh --long   also the long checks, at their smaller sizes: the tests whose
 #                           `#[ignore]` reason starts `long:` (headless Chrome against the native
 #                           host, the clearing's camera path, soak runs, images against spike
@@ -72,11 +74,15 @@ fi
 step() { printf '\n== %s\n' "$*"; }
 
 # The long tests and the measurements, by name (`module::test`, or `test` in a test program of
-# one file): each test whose `#[ignore]` reason starts `long:` is in `long_tests`, and `measure:`
-# in `measures`.
-long_tests=() measures=()
+# one file): each test whose `#[ignore]` reason starts `long:` is in `long_tests`, `measure:` in
+# `measures`, and `heavy:` in `heavy_tests`.
+long_tests=() measures=() heavy_tests=()
 while read -r kind name; do
-  if [ "$kind" = measure ]; then measures+=("$name"); else long_tests+=("$name"); fi
+  case $kind in
+    measure) measures+=("$name") ;;
+    heavy) heavy_tests+=("$name") ;;
+    *) long_tests+=("$name") ;;
+  esac
 done < <(python3 - <<'PY'
 import pathlib, re
 for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime").rglob("*.rs")]):
@@ -84,7 +90,7 @@ for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime
         continue
     lines = f.read_text().splitlines()
     for i, line in enumerate(lines):
-        if m := re.search(r'#\[ignore = "(long|measure):', line):
+        if m := re.search(r'#\[ignore = "(long|measure|heavy):', line):
             name = next(re.search(r"fn (\w+)\(", l).group(1) for l in lines[i + 1:] if re.search(r"fn (\w+)\(", l))
             # A test file at the top of `tests/` is a test program of its own (no module). A unit
             # test in `src/` is in its file's `mod tests` (a crate's root file names no module).
@@ -98,6 +104,9 @@ for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime
                 print(m[1], f"{f.stem}::{name}")
 PY
 )
+# A heavy test takes seconds on a GPU but minutes on a software one (lavapipe): there, it is a
+# long test, which main's long run checks every six hours.
+if [ -n "${WRELA_SOFTWARE_GPU:-}" ]; then long_tests+=("${heavy_tests[@]}"); fi
 
 # wrela sources the formatter owns. The conformance and diagnostics cases aren't here: some
 # are malformed on purpose, and their annotations are part of their layout.
@@ -266,7 +275,7 @@ else
   memo_dir="${CARGO_TARGET_DIR:-target}/gate-memo"
 fi
 
-step "tests, on the CPU and the GPU, but the long ones and the measurements, every test program at once$( [ "$memo" != off ] && echo " (each slow test alone, the longest first$( [ "$memo" = on ] && echo ", unless it passed with the same inputs before"))"); beside them, the doc tests and the WGSL size budgets (every example's, sketch's and lens's pipelines)"
+step "tests, on the CPU and the GPU, but the long ones and the measurements$( [ -n "${WRELA_SOFTWARE_GPU:-}" ] && [ "${#heavy_tests[@]}" -gt 0 ] && echo " (on this software GPU, the ${#heavy_tests[@]} heavy ones are long: tools/check.sh --long <name> runs one)"), every test program at once$( [ "$memo" != off ] && echo " (each slow test alone, the longest first$( [ "$memo" = on ] && echo ", unless it passed with the same inputs before"))"); beside them, the doc tests and the WGSL size budgets (every example's, sketch's and lens's pipelines)"
 tests_started=$SECONDS
 ps -A -o pid=,ppid=,time= > "$logs/ps-before"
 side doc cargo test -q --release --workspace --doc

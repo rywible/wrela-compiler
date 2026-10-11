@@ -639,7 +639,7 @@ fn field(host: &mut wrela_host::CpuHost, x: f64, z: f64) -> (f64, f64) {
 /// within the same bounds. And one terrain: the sim's raycasts (the feet's) meet the field
 /// where the drawn clipmap is, within the same accuracy.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_clipmap_holds_the_fields_heights_and_the_raycasts_meet_it() {
     let mut c = Clearing::load("clearing-clipmap");
     c.until_ready(2);
@@ -1236,7 +1236,7 @@ fn draws_after(batch: &[u8], name: &str) -> usize {
 /// frame, at load), one frame draws them into the static cascades, a steady frame draws nothing
 /// into them, and moving the sun draws them again (counted in the frames' command streams).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
     // The draws into the static cascades in each batch since the last call.
     let statics = |c: &mut Clearing| -> Vec<usize> {
@@ -1275,7 +1275,7 @@ fn static_shadows_are_drawn_once_and_again_when_the_sun_moves() {
 /// frame draws (M6 AC4, AC15). Playing spike 17, a camera there made `engine::lod::packed`
 /// convert an infinite pixel to an integer, which trapped (`lod.wrela:125`).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_camera_inside_a_crown_draws_its_frames() {
     let mut c = Clearing::load("clearing-inside-a-crown");
     c.until_ready(1);
@@ -1338,7 +1338,7 @@ fn darkened(
 /// wind still) with the creature and without: the pixels of ground and grass it darkens; then
 /// again after it has walked.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_creatures_shadow_falls_on_terrain_and_grass_and_moves() {
     let mut c = Clearing::load("clearing-creature-shadow");
     c.until_ready(0);
@@ -1677,7 +1677,7 @@ fn longest_submission(timings: &[GpuTiming]) -> (f64, String) {
 /// map and with it all lit (the same jitter, the wind still): over 3% of the valley's ground
 /// (beyond 150 m) is darker by over 15% with it (the cumulus over it, as the sun casts them).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_clouds_shadows_fall_on_the_valley() {
     let mut c = Clearing::load("clearing-cloud-shadows");
     c.until_ready(0);
@@ -1944,7 +1944,7 @@ fn what_the_wind_costs_the_leaves() {
 /// AC7's motion: the creature's pixels are reprojected by its motion target, the rest by depth
 /// and the camera: as it walks, the motion target marks exactly the pixels that show it.
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_motion_target_marks_the_creature() {
     let mut c = Clearing::load("clearing-motion");
     c.until_ready(0);
@@ -2029,7 +2029,7 @@ fn the_creatures_line_is_drawn_before_temporal_aa() {
 /// pixel of the creature is within the box where temporal AA looks for what moved
 /// (`Resolve::moving`, from the creature's bounds).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn the_walking_creature_leaves_no_trail() {
     let frames = [150u32, 200, 250, 300, 350];
     let run = |name: &str, creature: bool| {

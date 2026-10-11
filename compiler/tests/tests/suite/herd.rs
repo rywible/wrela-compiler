@@ -949,7 +949,7 @@ fn moving_to_the_herd_keeps_the_frames_in_chrome() {
 /// first (`cull_blocks`) and its last (`skin_vertices`); and there are as many as the realizer
 /// counts for its room calibrations and overflow checks (#43 §7.8).
 #[test]
-#[ignore = "needs a GPU"]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
 fn realization_reads_nothing_back_between_its_passes() {
     use wrela_abi::stream::{Command, decode};
     let dir = herd();
