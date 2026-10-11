@@ -21,6 +21,8 @@ wrela-grammar.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
 serde_json.workspace = true
+# The hash of a build's files, for the gate's memory of slow tests (tools/memo.py).
+sha2 = "0.10"
 wasmtime.workspace = true
 # The reference rasterizer the ui package's text is compared with (AC2).
 ab_glyph = "0.2"

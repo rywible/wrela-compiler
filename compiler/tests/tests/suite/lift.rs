@@ -29,14 +29,24 @@ fn built(name: &str, lift: bool) -> PathBuf {
 /// mode if `debug`, into a scratch directory `name`.
 pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> PathBuf {
     let dir = super::scratch(name);
-    let out = if !lift.is_empty() {
-        let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
-        let kind = wrela_driver::BuildKind { debug, testing: false };
-        wrela_driver::build_lifted(pkg, &names, kind).expect("--lift")
-    } else {
-        // A test build: with the program's `@testing` exports.
-        wrela_driver::build_for_tests(pkg, debug)
-    };
+    // The `wrela build` that makes the same files.
+    let mut args: Vec<&str> = lift.iter().flat_map(|p| ["--lift", *p]).collect();
+    if lift.is_empty() {
+        args.push("--testing");
+    }
+    if debug {
+        args.push("--debug");
+    }
+    let out = wrela_tests::recorded_build(pkg, Some(&args), || {
+        if !lift.is_empty() {
+            let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
+            let kind = wrela_driver::BuildKind { debug, testing: false };
+            wrela_driver::build_lifted(pkg, &names, kind).expect("--lift")
+        } else {
+            // A test build: with the program's `@testing` exports.
+            wrela_driver::build_for_tests(pkg, debug)
+        }
+    });
     assert!(
         !out.has_errors(),
         "{}",

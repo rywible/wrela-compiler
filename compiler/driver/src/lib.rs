@@ -451,11 +451,16 @@ impl Mode {
 /// Runs `f` on a thread with the compiler's stack ([`STACK_SIZE`]), and gives back what it
 /// returns; a panic in it goes on in the caller. For anything that parses or walks syntax trees.
 pub fn on_compiler_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    // Part of the caller's recorded build, if it's in one (tools/memo.py).
+    let inside = wrela_syntax::recorded::inside();
     std::thread::scope(|s| {
         let worker = std::thread::Builder::new()
             .name("wrela".into())
             .stack_size(STACK_SIZE)
-            .spawn_scoped(s, f)
+            .spawn_scoped(s, move || {
+                wrela_syntax::recorded::enter(inside);
+                f()
+            })
             .expect("can't start the compiler's thread");
         worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
     })
