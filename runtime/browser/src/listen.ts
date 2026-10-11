@@ -83,9 +83,12 @@ export interface PadState {
   axes: number[];
 }
 
-/** What a pad reports, as the Gamepad API has it (a `Gamepad`, or a test's stand-in). */
+/** What a pad reports, as the Gamepad API has it (a `Gamepad`, or a test's stand-in): its
+ * `mapping` is "standard" when the browser gives its buttons and axes in the standard layout,
+ * "" when they're the device's own numbers. */
 export interface PadReading {
   connected: boolean;
+  mapping: string;
   buttons: readonly { value: number; pressed: boolean }[];
   axes: readonly number[];
 }
@@ -97,15 +100,16 @@ const step = (v: number) => Math.round(v * 1024) / 1024;
 /**
  * The events for what the pads changed since `last` (each pad as last sent, null if it wasn't
  * there), which it updates: an event for each button whose value or pressed state changed, and
- * each axis whose value did. Pads 0 to 3, in the standard mapping's numbers; a pad that goes
- * lets go of what it held.
+ * each axis whose value did. Pads 0 to 3, in the standard mapping's numbers; a pad the browser
+ * can't give in that mapping sends nothing (its own numbers would be other buttons), and a pad
+ * that goes lets go of what it held.
  */
 export function padChanges(pads: readonly (PadReading | null)[], last: (PadState | null)[]): Uint8Array[] {
   const out: Uint8Array[] = [];
   for (let i = 0; i < PADS; i++) {
     const pad = pads[i] ?? null;
     const was = last[i] ?? null;
-    if (pad === null || !pad.connected) {
+    if (pad === null || !pad.connected || pad.mapping !== "standard") {
       if (was !== null) {
         for (let b = 0; b < was.pressed.length; b++) {
           if (was.pressed[b] || was.values[b] !== 0) out.push(padButtonEvent(i, b, 0, false));

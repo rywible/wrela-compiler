@@ -67,7 +67,12 @@ test("keys are the ABI's numbers", () => {
 test("a pad sends what changed: a button, a stick past its noise, and a let-go when it goes", () => {
   const last: (PadState | null)[] = [null, null, null, null];
   const button = (value: number, pressed: boolean) => ({ value, pressed });
-  const pad = (buttons: { value: number; pressed: boolean }[], axes: number[]) => ({ connected: true, buttons, axes });
+  const pad = (buttons: { value: number; pressed: boolean }[], axes: number[]) => ({
+    connected: true,
+    mapping: "standard",
+    buttons,
+    axes,
+  });
   // Pad 1 arrives with East pressed and its left stick to the right.
   const first = padChanges([null, pad([button(0, false), button(1, true)], [0.5, 0])], last);
   expect(first).toEqual([padButtonEvent(1, 1, 1, true), padAxisEvent(1, 0, 0.5)]);
@@ -78,4 +83,11 @@ test("a pad sends what changed: a button, a stick past its noise, and a let-go w
   const gone = padChanges([null, null], last);
   expect(gone).toEqual([padButtonEvent(1, 0, 0, false), padButtonEvent(1, 1, 0, false), padAxisEvent(1, 0, 0)]);
   expect(last[1]).toBe(null);
+});
+
+test("a pad not in the standard mapping sends nothing", () => {
+  const last: (PadState | null)[] = [null, null, null, null];
+  const raw = { connected: true, mapping: "", buttons: [{ value: 1, pressed: true }], axes: [0.5] };
+  expect(padChanges([raw], last)).toEqual([]);
+  expect(last[0]).toBe(null);
 });

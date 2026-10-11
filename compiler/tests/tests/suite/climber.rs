@@ -4,7 +4,7 @@
 //! on a pad), recorded, replays to the same state hash at every tick; played in Chrome, its tick
 //! log replays on the native host, with no GPU, the same.
 //!
-//! `tools/check.sh --long climber::`.
+//! The package's tests run in the gate; the replays, `tools/check.sh --long climber::`.
 
 use wrela_host::CpuBuild;
 use wrela_tests::{page, repo_root};
@@ -16,11 +16,11 @@ fn script() -> String {
     std::fs::read_to_string(repo_root().join("examples/climber/fight.json")).expect("fight.json")
 }
 
-/// The fight's own tests (`wrela test examples/climber`, tests.wrela), on the CPU.
+/// The package's own tests (`wrela test examples/climber`: the fight's, the cape's, the
+/// darkness's, the figure's), on the CPU: about 2 s, so the gate runs them.
 #[test]
-#[ignore = "long: builds the fight and plays two minutes of it"]
 fn the_fights_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 12);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 15);
 }
 
 /// The fight recorded natively replays to the same hashes: the same presses, the same fight.
