@@ -144,3 +144,33 @@ fn the_doors_time_with_and_without_getting_ready() {
         }
     }
 }
+
+/// The Last Green behind the first door, and back: the player goes in from the stair, goes back
+/// through the floor's door (behind the gate, where they came in), and stands at the first door
+/// again. The floor's door is where it says and nowhere else.
+#[test]
+#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
+fn the_player_goes_into_the_last_green_and_back_down() {
+    wrela_tests::page("examples/last-green", "last-green-tour/last-green");
+    let dir = wrela_tests::page("examples/stair", "last-green-tour/stair").0;
+    let mut host = Host::load(dir).expect("load");
+    frames(&mut host, 2);
+    host.call_export("climb", &[Value::F32(16.0)]).expect("climb");
+    host.call_export("go_in", &[]).expect("go_in");
+    frames(&mut host, 2);
+    assert_eq!(running(&host), "last-green");
+    let leave = |host: &mut Host, x: f32, z: f32| match host
+        .call_export("test_leave", &[Value::F32(x), Value::F32(z)])
+        .expect("test_leave")[0]
+    {
+        Value::F32(v) => v,
+        ref other => panic!("{other:?}"),
+    };
+    // The gate is at (-1.5, -2.0); the door 5 m behind it.
+    assert_eq!(leave(&mut host, -1.5, -2.0), 0.0, "the gate isn't the door");
+    assert_eq!(leave(&mut host, -1.5, -7.0), 1.0, "the door goes back down");
+    frames(&mut host, 2);
+    assert_eq!(running(&host), "stair");
+    let r = report(&mut host);
+    assert_eq!(r[..2], [16.0, 1.0], "arrived back at the first door");
+}
