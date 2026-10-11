@@ -89,20 +89,19 @@ impl Times {
     }
 }
 
-/// An earlier report (`--json`): how it ran, and its medians. `--baseline` compares a run with
-/// one; `wrela estimate --pair` reads an M4's.
-pub(crate) struct Baseline {
-    pub(crate) frames: u64,
-    pub(crate) size: (u64, u64),
+/// An earlier report (`--json`): how it ran and its medians. `--baseline` compares a run with one.
+struct Baseline {
+    frames: u64,
+    size: (u64, u64),
     /// Whether it ran with `--serial`.
-    pub(crate) serial: bool,
+    serial: bool,
     span: Option<f64>,
     frame: Option<f64>,
-    pub(crate) labels: BTreeMap<String, f64>,
+    labels: BTreeMap<String, f64>,
 }
 
 impl Baseline {
-    pub(crate) fn read(path: &std::path::Path) -> Result<Baseline, String> {
+    fn read(path: &std::path::Path) -> Result<Baseline, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("can't read {}: {e}", path.display()))?;
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
@@ -169,16 +168,14 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
-/// A package built as `wrela build` builds it (into `build/<into>`) and loaded on the native
-/// host with `options`, not yet initialized, with its input script (`--input`) read: what
-/// `profile` and `estimate` run their frames on.
-pub(crate) fn load(
+/// A package built as `wrela build` builds it (into `build/profile`) and loaded on the native
+/// host with `options`, not yet initialized, with its input script (`--input`) read.
+fn load(
     dir: &Path,
-    into: &str,
     input: Option<&Path>,
     options: &Options,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let built = dir.join("build").join(into);
+    let built = dir.join("build").join("profile");
     crate::generated_path(dir, &built)?;
     let out = wrela_driver::build(dir);
     crate::write_build(&out, &built)?;
@@ -197,7 +194,7 @@ pub(crate) fn load(
 fn profile(a: &Args) -> Result<Profile, String> {
     let timing = if a.serial { Timing::Serial } else { Timing::Span };
     let options = Options { timing, quiet: true, defer_init: true, ..Options::default() };
-    let (mut host, script, built) = load(&a.dir, "profile", a.input.as_deref(), &options)?;
+    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options)?;
     host.init().map_err(|e| format!("in `init`: {e}"))?;
     let (w, h) = a.size;
     let mut calls = Vec::with_capacity(a.frames as usize);
@@ -266,7 +263,7 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
 
 /// The `p`th percentile of `xs`, by nearest rank: the smallest value that at least `p`% of
 /// them are at or under (of 120 frames, the 95th is the seventh slowest).
-pub(crate) fn percentile(xs: &[f64], p: u32) -> Option<f64> {
+fn percentile(xs: &[f64], p: u32) -> Option<f64> {
     let mut xs = xs.to_vec();
     xs.sort_by(f64::total_cmp);
     let rank = (xs.len() * p as usize).div_ceil(100);
@@ -489,7 +486,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn profile_and_estimate_refuse_a_linked_build_directory() {
+    fn profile_refuses_a_linked_build_directory() {
         let dir = std::env::temp_dir().join(format!("wrela-profile-link-{}", std::process::id()));
         let outside =
             std::env::temp_dir().join(format!("wrela-profile-outside-{}", std::process::id()));
@@ -498,9 +495,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("package");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, dir.join("build")).expect("linked build");
-        for name in ["profile", "estimate"] {
-            assert!(load(&dir, name, None, &Options::default()).is_err());
-        }
+        assert!(load(&dir, None, &Options::default()).is_err());
         assert!(std::fs::read_dir(&outside).expect("outside directory").next().is_none());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(outside);

@@ -51,15 +51,6 @@ const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 const RING_START: u64 = 64 * 1024;
 /// Timestamp queries per submission (two per timed pass).
 const TIMESTAMP_QUERIES: u32 = 512;
-/// Pipeline statistics queries per submission (one per counted draw or dispatch): wgpu's most
-/// in a query set.
-const COUNT_QUERIES: u32 = 4096;
-/// What each counted draw or dispatch reads, in this order (wgpu resolves them by bit).
-const COUNTED: wgpu::PipelineStatisticsTypes =
-    wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
-        .union(wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT)
-        .union(wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS)
-        .union(wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS);
 
 /// One timed piece of GPU work, from timestamp queries.
 #[derive(Clone, Debug, PartialEq)]
@@ -78,38 +69,6 @@ pub struct GpuTiming {
     /// Which submission it ran in, counted from 0 over the run (the serial mode submits each
     /// pass alone).
     pub submission: usize,
-}
-
-/// The work one timed pass or dispatch did, as the GPU counted it ([`crate::Options::counts`]),
-/// in the same order as the timings. The counts depend on the commands, not on the GPU that
-/// ran them (up to how a GPU rounds coverage at triangle edges), so a cost model can read them
-/// on one GPU and estimate the time on another.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GpuWork {
-    pub frame: usize,
-    pub label: String,
-    /// A pass's targets: their texels, and the bytes it moves between them and memory (each
-    /// target's texels written, and read first where the pass keeps what's in it). None for a
-    /// dispatch.
-    pub target_texels: u64,
-    pub target_bytes: u64,
-    /// Its draws (a pass) or its one dispatch, in order.
-    pub pieces: Vec<GpuPiece>,
-}
-
-/// One draw's or dispatch's counts.
-#[derive(Clone, Debug, PartialEq)]
-pub struct GpuPiece {
-    /// The pipeline's name in the manifest.
-    pub pipeline: String,
-    /// Vertex shader invocations.
-    pub vertices: u64,
-    /// Primitives left after clipping: the triangles rasterized (a GPU's clipper may split one).
-    pub primitives: u64,
-    /// Fragment shader invocations, helpers in 2×2 quads included.
-    pub fragments: u64,
-    /// Compute shader invocations.
-    pub invocations: u64,
 }
 
 /// Each frame's span in `timings` (ms): from its first timed piece's start to its last's end,
@@ -333,8 +292,6 @@ struct Timer {
     /// What each pair of queries in this submission times.
     pending: Vec<Timed>,
     results: Vec<GpuTiming>,
-    /// The work each one did, when it's counted.
-    counter: Option<Counter>,
     /// Each pass and dispatch submitted and waited for alone, so none overlaps another: each
     /// one's own time (the serial mode).
     serial: bool,
@@ -346,18 +303,6 @@ struct Timer {
 struct Timed {
     frame: usize,
     label: String,
-    /// A pass's targets: texels and bytes moved ([`GpuWork`]).
-    targets: (u64, u64),
-    /// The pipelines of its counted draws (or its dispatch), each one's query the next.
-    counted: Vec<String>,
-}
-
-/// Pipeline statistics, one query per draw or dispatch.
-struct Counter {
-    queries: wgpu::QuerySet,
-    /// Queries used in this submission.
-    used: u32,
-    results: Vec<GpuWork>,
 }
 
 pub(crate) struct Gpu {
@@ -460,21 +405,11 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
 
 impl Gpu {
     /// Opens the GPU and builds every pipeline. `shaders[i]` is pipeline `i`'s WGSL source.
-    /// `timing` says whether passes are timed, and how; `counts`, whether each timed one's work
-    /// is counted too ([`GpuWork`]).
-    pub(crate) fn new(
-        manifest: &Manifest,
-        shaders: &[String],
-        timing: Timing,
-        counts: bool,
-    ) -> Result<Gpu> {
+    /// `timing` says whether passes are timed, and how.
+    pub(crate) fn new(manifest: &Manifest, shaders: &[String], timing: Timing) -> Result<Gpu> {
         let timestamps = timing != Timing::Off;
-        let counts = counts && timestamps;
-        let mut features =
+        let features =
             if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
-        if counts {
-            features |= wgpu::Features::PIPELINE_STATISTICS_QUERY;
-        }
         let (device, queue) = open_device("wrela-host", features)?;
 
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -501,7 +436,7 @@ impl Gpu {
         let ring = Ring::new(&device, "uniform ring", usage, RING_START);
         let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
-        let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, counts));
+        let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial));
         let mut gpu = Gpu {
             device,
             queue,
@@ -589,7 +524,7 @@ impl Gpu {
         self.debug_flag = None;
         self.spare.clear();
         if let Some(timer) = &mut self.timer {
-            *timer = Timer::new(&self.device, timer.serial, timer.counter.is_some());
+            *timer = Timer::new(&self.device, timer.serial);
         }
         self.take_pipelines(manifest, shaders)
     }
@@ -942,34 +877,6 @@ impl Gpu {
         format!("{} ({}, {})", info.name, info.driver, info.driver_info)
     }
 
-    pub(crate) fn take_work(&mut self) -> Vec<GpuWork> {
-        let counter = self.timer.as_mut().and_then(|t| t.counter.as_mut());
-        counter.map(|c| std::mem::take(&mut c.results)).unwrap_or_default()
-    }
-
-    /// The pipeline statistics queries, when work is counted.
-    fn counter(&self) -> Option<&Counter> {
-        self.timer.as_ref().and_then(|t| t.counter.as_ref())
-    }
-
-    /// A target's texels and bytes per texel.
-    fn target_size(&self, h: u32) -> (u64, u64) {
-        match h {
-            stream::NONE => (0, 0),
-            stream::SCREEN => {
-                let s = self.screen.as_ref().expect("checked where the pass is recorded");
-                (u64::from(s.width) * u64::from(s.height), 4)
-            }
-            h => match &self.resources[&h] {
-                Resource::Texture { texture, format, .. } => (
-                    u64::from(texture.width()) * u64::from(texture.height()),
-                    u64::from(format.bytes_per_texel()),
-                ),
-                _ => unreachable!("the checker checked {h} is a texture"),
-            },
-        }
-    }
-
     /// Reports (and clears) errors the device raised outside an error scope.
     fn check_errors(&self) -> Result<()> {
         let mut errors = self.errors.lock().unwrap_or_else(|p| p.into_inner());
@@ -1133,18 +1040,8 @@ impl Gpu {
 
     /// Makes room for one timed pass's queries in this submission, flushing first if they're
     /// used up. Call before recording the pass (a flush submits what's recorded).
-    /// `pieces` is its draws (or 1, a dispatch), each counted with [`crate::Options::counts`].
-    fn reserve_timestamps(&mut self, pieces: u32) -> Result<()> {
-        let full = |t: &Timer| {
-            t.pending.len() as u32 * 2 >= TIMESTAMP_QUERIES
-                || t.counter.as_ref().is_some_and(|c| c.used + pieces > COUNT_QUERIES)
-        };
-        if pieces > COUNT_QUERIES && self.counter().is_some() {
-            return Err(Error::Gpu(format!(
-                "a pass of {pieces} draws: work is counted in passes of at most {COUNT_QUERIES}"
-            )));
-        }
-        if self.timer.as_ref().is_some_and(full) {
+    fn reserve_timestamps(&mut self) -> Result<()> {
+        if self.timer.as_ref().is_some_and(|t| t.pending.len() as u32 * 2 >= TIMESTAMP_QUERIES) {
             self.flush()?;
             self.collect()?;
         }
@@ -1357,14 +1254,13 @@ impl Gpu {
     ) -> Result<()> {
         // Everything that can flush happens before anything is recorded for this dispatch.
         self.reserve_uniforms(Opcode::Dispatch, self.aligned(uniforms.len()))?;
-        self.reserve_timestamps(1)?;
+        self.reserve_timestamps()?;
         let offset = self.push_uniforms(uniforms);
         let bind_group = self.bind_group(pipeline, bindings);
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label, (0, 0)));
-        let count = self.timer.as_mut().and_then(|t| t.count(&p.name));
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1380,17 +1276,11 @@ impl Gpu {
         });
         pass.set_pipeline(compute);
         pass.set_bind_group(0, &bind_group, offset.as_slice());
-        if let Some((i, c)) = count.zip(self.counter()) {
-            pass.begin_pipeline_statistics_query(&c.queries, i);
-        }
         match groups {
             Ok([x, y, z]) => pass.dispatch_workgroups(x, y, z),
             Err((buffer, at)) => {
                 pass.dispatch_workgroups_indirect(self.buffer(buffer), u64::from(at))
             }
-        }
-        if count.is_some() {
-            pass.end_pipeline_statistics_query();
         }
         drop(pass);
         self.encoder = Some(encoder);
@@ -1464,23 +1354,15 @@ impl Gpu {
         // Everything that can flush happens before anything is recorded for this pass.
         let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
         self.reserve_uniforms(op, total)?;
-        self.reserve_timestamps(open.draws.len() as u32)?;
+        self.reserve_timestamps()?;
         let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
-        let targets =
-            [(pass.color, pass.keep_color), (pass.depth, pass.keep_depth)].map(|(h, kept)| {
-                let (texels, bytes) = self.target_size(h);
-                (texels, texels * bytes * if kept { 2 } else { 1 })
-            });
-        let moved = (targets[0].0.max(targets[1].0), targets[0].1 + targets[1].1);
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label, moved));
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
-            let name = &self.pipelines[d.pipeline as usize].name;
-            let count = self.timer.as_mut().and_then(|t| t.count(name));
             let offset = self.push_uniforms(&d.uniforms);
             let bind_group = self.bind_group(d.pipeline, &d.bindings);
-            prepared.push((bind_group, offset, count));
+            prepared.push((bind_group, offset));
         }
         let mut encoder = self.take_encoder();
         let view_of = |gpu: &'_ Gpu, h: u32| -> wgpu::TextureView {
@@ -1535,13 +1417,10 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for (d, (bind_group, offset, count)) in open.draws.iter().zip(&prepared) {
+        for (d, (bind_group, offset)) in open.draws.iter().zip(&prepared) {
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
-            if let Some((i, c)) = count.zip(self.counter()) {
-                rp.begin_pipeline_statistics_query(&c.queries, i);
-            }
             rp.set_pipeline(&variants[&formats]);
             rp.set_bind_group(0, bind_group, offset.as_slice());
             match d.how {
@@ -1557,9 +1436,6 @@ impl Gpu {
                     );
                     rp.draw_indexed_indirect(self.buffer(buffer), u64::from(offset));
                 }
-            }
-            if count.is_some() {
-                rp.end_pipeline_statistics_query();
             }
         }
         drop(rp);
@@ -1959,7 +1835,7 @@ fn map_read_with<T>(
 }
 
 impl Timer {
-    fn new(device: &wgpu::Device, serial: bool, counts: bool) -> Timer {
+    fn new(device: &wgpu::Device, serial: bool) -> Timer {
         Timer {
             serial,
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -1969,73 +1845,24 @@ impl Timer {
             }),
             pending: Vec::new(),
             results: Vec::new(),
-            counter: counts.then(|| Counter {
-                queries: device.create_query_set(&wgpu::QuerySetDescriptor {
-                    label: Some("counts"),
-                    ty: wgpu::QueryType::PipelineStatistics(COUNTED),
-                    count: COUNT_QUERIES,
-                }),
-                used: 0,
-                results: Vec::new(),
-            }),
             submissions: 0,
         }
     }
 
-    /// Notes a pass about to be timed, and its targets (texels, bytes moved); returns the first
-    /// of its two query indices. [`Gpu::reserve_timestamps`] must have made room.
-    fn next(&mut self, frame: usize, label: &str, targets: (u64, u64)) -> u32 {
-        self.pending.push(Timed { frame, label: label.to_string(), targets, counted: Vec::new() });
+    /// Notes a pass about to be timed; returns the first of its two query indices.
+    /// [`Gpu::reserve_timestamps`] must have made room.
+    fn next(&mut self, frame: usize, label: &str) -> u32 {
+        self.pending.push(Timed { frame, label: label.to_string() });
         (self.pending.len() as u32 - 1) * 2
     }
 
-    /// Notes a draw or dispatch of the pass [`Timer::next`] last noted, by its pipeline's name:
-    /// its pipeline statistics query, if work is counted.
-    fn count(&mut self, pipeline: &str) -> Option<u32> {
-        let counter = self.counter.as_mut()?;
-        let timed = self.pending.last_mut().expect("`next` noted the pass");
-        timed.counted.push(pipeline.to_string());
-        counter.used += 1;
-        Some(counter.used - 1)
-    }
-
-    /// Reads back the timestamps of the submissions made since the last call, and the counts;
-    /// waits for the GPU. The span mode calls it at every flush, so it measures GPU durations,
-    /// not throughput; the serial mode, which waits after each pass anyway, once a frame.
+    /// Reads back the timestamps of the submissions made since the last call. The span mode
+    /// calls it at every flush, so it measures GPU durations, not throughput; the serial mode,
+    /// which waits after each pass anyway, once a frame.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
         let times = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
-        let mut counts = match &mut self.counter {
-            Some(c) => {
-                let n = std::mem::take(&mut c.used);
-                resolve(device, queue, &c.queries, n, COUNTED.bits().count_ones())?
-            }
-            None => Vec::new(),
-        };
-        let mut counts = counts.drain(..);
         for (timed, (start, end)) in self.pending.drain(..).zip(times) {
-            let Timed { frame, label, targets, counted } = timed;
-            if let Some(c) = &mut self.counter {
-                let pieces = counted
-                    .into_iter()
-                    .map(|pipeline| {
-                        let mut next = || counts.next().expect("a count for each query");
-                        GpuPiece {
-                            pipeline,
-                            vertices: next(),
-                            primitives: next(),
-                            fragments: next(),
-                            invocations: next(),
-                        }
-                    })
-                    .collect();
-                c.results.push(GpuWork {
-                    frame,
-                    label: label.clone(),
-                    target_texels: targets.0,
-                    target_bytes: targets.1,
-                    pieces,
-                });
-            }
+            let Timed { frame, label } = timed;
             let submission = self.submissions;
             self.results.push(GpuTiming {
                 frame,
@@ -2080,7 +1907,7 @@ fn read_timestamp_spans(
     queries: &wgpu::QuerySet,
     passes: u32,
 ) -> Result<Vec<(f64, f64)>> {
-    let ticks = resolve(device, queue, queries, passes * 2, 1)?;
+    let ticks = resolve(device, queue, queries, passes * 2)?;
     let period = f64::from(queue.get_timestamp_period());
     Ok(ticks
         .chunks_exact(2)
@@ -2088,20 +1915,19 @@ fn read_timestamp_spans(
         .collect())
 }
 
-/// The values of the first `n` queries of `queries` (`words` 64-bit values each), in a
-/// submission already made. Waits for the GPU.
+/// The values of the first `n` timestamp queries, in a submission already made. Waits for
+/// the GPU.
 fn resolve(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     queries: &wgpu::QuerySet,
     n: u32,
-    words: u32,
 ) -> Result<Vec<u64>> {
     if n == 0 {
         return Ok(Vec::new());
     }
     device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
-    let size = u64::from(n * words) * 8;
+    let size = u64::from(n) * 8;
     let buffer = |label, usage| {
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
@@ -2165,7 +1991,7 @@ mod tests {
     fn texture_uploads_preserve_rows_rectangles_and_order() {
         let _turn = crate::lock::turn();
         let _lock = crate::lock::GpuLock::acquire("texture upload order").expect("GPU lock");
-        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
         gpu.create_buffer(2, 4);
         for format in [
             TextureFormat::Rgba8,

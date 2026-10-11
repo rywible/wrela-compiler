@@ -609,10 +609,10 @@ fn screen_readback_removes_padding_and_keeps_region_rows_in_order() {
     }
 }
 
-/// Counter queries must follow each draw's pipeline and uniforms within the same pass.
+/// Three draws in one pass keep their pipeline and uniform order.
 #[test]
 #[ignore = "needs a GPU"]
-fn perf_counted_draws_keep_piece_and_uniform_order() {
+fn serial_draws_keep_pipeline_and_uniform_order() {
     let pipelines: Vec<_> = ["cell_a", "cell_b"]
         .into_iter()
         .map(|name| {
@@ -626,7 +626,7 @@ fn perf_counted_draws_keep_piece_and_uniform_order() {
         })
         .collect();
     let mut encoder = Encoder::new();
-    encoder.label("counted draws").begin_screen_pass([0.0, 0.0, 0.0, 1.0]);
+    encoder.label("ordered draws").begin_screen_pass([0.0, 0.0, 0.0, 1.0]);
     // Two whole cells, then the first cell's first triangle over its earlier colour.
     for (pipeline, vertices, cell, colour) in
         [(0, 6, 0, 0xff00_00ff), (1, 6, 1, 0xff00_ff00), (0, 3, 0, 0xffff_0000)]
@@ -636,40 +636,21 @@ fn perf_counted_draws_keep_piece_and_uniform_order() {
     let wasm = wat::parse_str(common::wat::program(&[vec![encoder.present().finish()]]))
         .expect("test program");
     let dir = common::build(
-        "multi-draw-counts",
+        "serial-draw-order",
         &common::manifest(&format!("[{}]", pipelines.join(","))),
         &[("cell.wgsl", CELL_WGSL)],
         &wasm,
     );
-    let options = Options { timing: Timing::Serial, counts: true, ..Options::default() };
-    let mut host = match Host::load_with(&dir, &options) {
-        Ok(host) => host,
-        Err(error) => {
-            assert!(error.to_string().contains("PIPELINE_STATISTICS_QUERY"), "{error}");
-            return;
-        }
-    };
-    host.frame(0.0, 8, 4).expect("three counted draws");
+    let options = Options { timing: Timing::Serial, ..Options::default() };
+    let mut host = Host::load_with(&dir, &options).expect("loads");
+    host.frame(0.0, 8, 4).expect("three ordered draws");
     let frame = host.read_screen().expect("the draws' output");
     assert_eq!(pixel(&frame, 8, 0, 0), [0, 0, 255, 255], "the last draw overwrote the first");
     assert_eq!(pixel(&frame, 8, 3, 3), [255, 0, 0, 255], "outside its triangle stays red");
     assert_eq!(pixel(&frame, 8, 7, 3), [0, 255, 0, 255], "the second draw's uniforms");
     let timings = host.take_timings().expect("timings");
-    let work = host.take_work().expect("pipeline statistics");
     assert_eq!(timings.len(), 1);
-    assert_eq!(work.len(), 1);
-    assert_eq!(work[0].label, "counted draws");
-    assert_eq!(work[0].label, timings[0].label);
-    assert_eq!((work[0].target_texels, work[0].target_bytes), (32, 128));
-    let pieces = &work[0].pieces;
-    assert_eq!(
-        pieces.iter().map(|p| p.pipeline.as_str()).collect::<Vec<_>>(),
-        ["cell_a", "cell_b", "cell_a"]
-    );
-    assert_eq!(pieces.iter().map(|p| p.vertices).collect::<Vec<_>>(), [6, 6, 3]);
-    // Vertex counts distinguish the three queries. Clipper counts vary by backend; software
-    // Vulkan reports zero for these full-cell quads in both the baseline and this host.
-    assert!(pieces.iter().all(|p| p.fragments > 0 && p.invocations == 0));
+    assert_eq!(timings[0].label, "ordered draws");
 }
 
 #[test]

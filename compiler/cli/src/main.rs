@@ -22,12 +22,6 @@
 //!                                         by label, the CPU's and its phases (medians and
 //!                                         95th percentiles), each pipeline's WGSL; with a
 //!                                         baseline, how each time changed
-//! wrela estimate <package-dir> [--frames n] [--skip n] [--size WxH] [--input <script.json>]
-//!     [--json] [--work <out.json>] [--pair <m4-profile.json>]
-//!                                         a frame's time on the MacBook Air M4, estimated
-//!                                         without its GPU: run on lavapipe, each label's
-//!                                         time through a model fitted to recorded M4 times,
-//!                                         with the model's own error
 //! wrela test <package-dir> [<filter>] [--json]
 //!                                         run the package's `@test` functions (§10), or
 //!                                         those whose names contain `filter`; exit 1 if one
@@ -78,7 +72,6 @@ mod build;
 mod compare;
 mod doc;
 mod edit;
-mod estimate;
 mod explain;
 mod fix;
 mod fmt;
@@ -107,7 +100,6 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela pipelines <package-dir> [--json]",
         "wrela profile <package-dir> [--frames n] [--size WxH] [--input <script.json>] [--serial] [--json] [--baseline <report.json>]",
-        "wrela estimate <package-dir> [--frames n] [--skip n] [--size WxH] [--input <script.json>] [--json] [--work <out.json>] [--pair <m4-profile.json>]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela primer [area]",
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
@@ -146,7 +138,6 @@ fn main() -> ExitCode {
         "doc" => doc::run(rest),
         "pipelines" => pipelines::run(rest),
         "profile" => profile::run(rest),
-        "estimate" => estimate::run(rest),
         "test" => test::run(rest),
         "studio" => studio::run(rest),
         "run" => run::run(rest),
