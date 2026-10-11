@@ -28,6 +28,7 @@ class FocusedCheck(unittest.TestCase):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         shutil.copyfile(CHECK, self.root / "tools/check.sh")
         shutil.copyfile(TOOLS / "ignored.py", self.root / "tools/ignored.py")
+        shutil.copyfile(TOOLS / "runner.py", self.root / "tools/runner.py")
         (self.root / "tools/resources.py").write_text(textwrap.dedent("""
             import errno, os
             if os.environ.get("FAKE_LINK_ERROR"):

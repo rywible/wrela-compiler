@@ -1057,15 +1057,21 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
             elif m["target"]["kind"] == ["bin"] and m["target"]["name"] == "wrela":
                 cli = m["executable"]  # built from the sources the tests are
     memo = Memo(root, target, dir, cli)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import runner
+    from resources import cpu_count
+
+    cores = cpu_count()
     # Each slow test's scratch directory (its target/tmp), kept after a failure to look at.
     alone_root = os.path.join(target, "tmp-alone")
     shutil.rmtree(alone_root, ignore_errors=True)
 
     def env_for(pkg):
-        # As cargo runs a test program: in its package's directory. Compiled code is kept across
-        # runs (wrela_host's cache). Four of a program's GPU tests share the GPU at a time.
+        # As tools/runner.py runs a program, for a slow test alone (its scratch is target/tmp,
+        # its own in its mount namespace).
         return {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache,
-                "WRELA_GPU_SHARED": "4", "WRELA_GPU_WAITS": f"{logs}/gpu-waits"}
+                "WRELA_GPU_SHARED": str(runner.gpu_shared(cores)),
+                "WRELA_GPU_WAITS": f"{logs}/gpu-waits"}
 
     def listed(exe, pkg, more):
         out = subprocess.run([exe, "--list", "--format", "terse", *args, *more], cwd=pkg,
@@ -1095,20 +1101,23 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
     with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as pool:
         split_programs = list(pool.map(split, programs))
 
-    # The quick tests: every program at once, each test's time in libtest's JSON (`--report-time`,
-    # a stable libtest's unstable option: RUSTC_BOOTSTRAP). They start now, while the slow tests'
-    # memory is looked up beside them.
-    runs = []
-    for m, pkg, exe, _, prefix, skips, kept, _ in split_programs:
+    # The quick tests: every program at once (tools/runner.py's way, the end-to-end suite first),
+    # each test's time in libtest's JSON (`--report-time`, a stable libtest's unstable option:
+    # RUSTC_BOOTSTRAP). They start now, while the slow tests' memory is looked up beside them.
+    runs, scratch_root = [], runner.scratch_root()
+    scratches = {}
+    for m, pkg, exe, _, prefix, skips, kept, _ in sorted(split_programs,
+                                                          key=lambda p: not runner.is_first(p[0])):
         if not kept:
             continue
+        command, env, _, scratch = runner.start(m, scratch_root, logs, native_cache, cores)
         out = open(f"{logs}/run-{len(runs)}", "w+")
-        name = f"{m['target']['name']} ({m['target']['kind'][0]})"
         proc = subprocess.Popen(
-            [exe, *args, *skips, "-Z", "unstable-options", "--format", "json",
-             "--report-time"], cwd=pkg, env={**env_for(pkg), "RUSTC_BOOTSTRAP": "1"},
+            [*command, *args, *skips, "-Z", "unstable-options", "--format", "json",
+             "--report-time"], cwd=pkg, env={**env, "RUSTC_BOOTSTRAP": "1"},
             stdout=out, stderr=subprocess.STDOUT)
-        runs.append(("quick", name, proc, out, time.monotonic(), prefix))
+        scratches[prefix] = scratch
+        runs.append(("quick", runner.name_of(m), proc, out, time.monotonic(), prefix))
 
     # The slow tests remembered, or to run alone. Those remembered by their builds' files once the
     # builds are made again, all at once.
@@ -1148,7 +1157,6 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
         started[test_id] = (n, program_dir, log, scratch, record)
         runs.append(("alone", n, proc, out, time.monotonic(), test_id))
 
-    cores = os.cpu_count() or 4
     failed, ran = False, 0
     waiting = list(runs)
     while todo and sum(1 for r in waiting if r[0] == "alone") < cores:
@@ -1204,9 +1212,11 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
                         print(f"test {e['name']} failed")
                     if not failures:
                         print("\n".join(other))
-                    print(f"{name} failed")
-                elif passed and took >= 1:
-                    print(f"  {name}: {took:.1f}s")
+                    print(f"{name} failed; scratch kept at {scratches[extra]} (for six hours)")
+                else:
+                    shutil.rmtree(scratches[extra], ignore_errors=True)
+                    if passed and took >= 1:
+                        print(f"  {name}: {took:.1f}s")
             else:
                 n, program_dir, log, scratch, record = started[extra]
                 passed = re.search(r"test result: ok\. 1 passed", text) is not None
