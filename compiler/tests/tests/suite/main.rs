@@ -39,6 +39,7 @@ mod measures;
 mod noise;
 mod numerics;
 mod parallel;
+mod piano;
 mod queries;
 mod reload;
 mod render;

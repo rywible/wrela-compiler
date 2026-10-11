@@ -201,7 +201,8 @@ pub const TICK_RECORDS: u32 = 0x12_C000;
 /// The most records a tick takes: a host keeps the rest for the next tick.
 pub const MAX_TICK_RECORDS: u32 = 256;
 
-/// The samples `__audio` renders: [`crate::AUDIO_QUANTUM`] `f32`s, mono.
+/// The samples `__audio` renders: [`crate::AUDIO_QUANTUM`] `f32`s of the left channel, then as
+/// many of the right ([`crate::AUDIO_CHANNELS`]).
 pub const AUDIO_OUT: u32 = 0x13_0000;
 
 /// The program's thread's shadow stack: from [`STACK_TOP`] down to [`STACK_LIMIT`], 16 MiB.
@@ -233,5 +234,5 @@ const _: () = assert!(CMD_BASE + crate::stream::HEADER_LEN as u32 + CMD_CAP <= T
 const _: () = assert!(THREAD_BLOCKS_END <= TASK_SLOTS);
 const _: () = assert!(TASK_SLOTS_END <= TICK_RECORDS);
 const _: () = assert!(TICK_RECORDS + 4 + MAX_TICK_RECORDS * crate::input::EVENT_SIZE <= AUDIO_OUT);
-const _: () = assert!(AUDIO_OUT + crate::AUDIO_QUANTUM * 4 <= STACK_LIMIT);
+const _: () = assert!(AUDIO_OUT + crate::AUDIO_CHANNELS * crate::AUDIO_QUANTUM * 4 <= STACK_LIMIT);
 const _: () = assert!(DATA_BASE.is_multiple_of(16));

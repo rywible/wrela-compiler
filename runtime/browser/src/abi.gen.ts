@@ -131,9 +131,11 @@ export const HOST_FUNCTIONS = [
   ["phase", "(i32, i32) -> ()"],
 ] as const;
 export const EXPORT_AUDIO = "__audio";
-/** The audio thread's rate and render quantum, and where `__audio` leaves a quantum's samples. */
+/** The audio thread's rate, render quantum and channels, and where `__audio` leaves a quantum's
+ * samples: the left channel's, then the right's. */
 export const AUDIO_SAMPLE_RATE = 48000;
 export const AUDIO_QUANTUM = 128;
+export const AUDIO_CHANNELS = 2;
 export const AUDIO_OUT = 1245184;
 /** The threads (runtime/abi `memory`): their numbers, their blocks, and the words of a block and
  * of a job slot a host reads and writes. */

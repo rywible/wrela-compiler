@@ -9,6 +9,6 @@ struct Synth {
 
 pub fn init() -> u32 {
     let gain = 0.5
-    play(Synth { phase: 0.0 }, |s, out| { out[0] = gain * s.phase })
+    play(Synth { phase: 0.0 }, |s, left, right| { left[0] = gain * s.phase })
     0
 }

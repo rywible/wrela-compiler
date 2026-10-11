@@ -1,7 +1,7 @@
 // The main-thread shim: hands the canvas to the render worker, forwards its size (in device
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
-import { AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
+import { AUDIO_CHANNELS, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { epochNow, InputRing } from "./input.ts";
 import { listen, pollPads } from "./listen.ts";
@@ -72,7 +72,7 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     const n = new AudioWorkletNode(ctx, VOICE_PROCESSOR, {
       numberOfInputs: 0,
       numberOfOutputs: 1,
-      outputChannelCount: [1],
+      outputChannelCount: [AUDIO_CHANNELS],
       processorOptions: voice,
     });
     n.port.onmessage = (e: MessageEvent<{ message: string }>) => {
@@ -82,13 +82,40 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     n.connect(ctx.destination);
     return n;
   };
-  if (test) {
-    if (test.audio === 0) return;
-    const ctx = new OfflineAudioContext({ numberOfChannels: 1, length: test.audio * AUDIO_QUANTUM, sampleRate: AUDIO_SAMPLE_RATE });
+  if (test && test.live > 0) {
+    // Real time: the voice plays for `live` seconds, then the browser's playback statistics
+    // (Chrome's `AudioContext.playbackStats`, where it has them) say whether it kept up.
+    const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
     await ctx.audioWorklet.addModule(url);
     node(ctx);
-    const samples = (await ctx.startRendering()).getChannelData(0);
-    await putResult(document.baseURI, "audio.f32", samples.slice().buffer);
+    await ctx.resume();
+    await new Promise((resolve) => setTimeout(resolve, test.live * 1000));
+    const stats = (ctx as unknown as { playbackStats?: Record<string, unknown> }).playbackStats;
+    const reported = stats ? Object.fromEntries(Object.keys(Object.getPrototypeOf(stats)).concat(Object.keys(stats)).map((k) => [k, (stats as Record<string, unknown>)[k]]).filter(([, v]) => typeof v === "number")) : null;
+    await putResult(document.baseURI, "live.json", JSON.stringify({ seconds: test.live, played: ctx.currentTime, state: ctx.state, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency, playbackStats: reported }));
+    await ctx.close();
+    worker.postMessage({ type: "audio-rendered" } satisfies ToWorker);
+    return;
+  }
+  if (test) {
+    if (test.audio === 0) return;
+    const ctx = new OfflineAudioContext({ numberOfChannels: AUDIO_CHANNELS, length: test.audio * AUDIO_QUANTUM, sampleRate: AUDIO_SAMPLE_RATE });
+    await ctx.audioWorklet.addModule(url);
+    node(ctx);
+    const started = performance.now();
+    const rendered = await ctx.startRendering();
+    const ms = performance.now() - started;
+    // The channels interleaved, as the native host gives them.
+    const left = rendered.getChannelData(0);
+    const right = rendered.getChannelData(1);
+    const samples = new Float32Array(2 * left.length);
+    for (let i = 0; i < left.length; i++) {
+      samples[2 * i] = left[i]!;
+      samples[2 * i + 1] = right[i]!;
+    }
+    await putResult(document.baseURI, "audio.f32", samples.buffer);
+    // How long the render took, for the voice's speed (spike 14).
+    await putResult(document.baseURI, "audio-ms.json", JSON.stringify({ ms }));
     worker.postMessage({ type: "audio-rendered" } satisfies ToWorker);
     return;
   }

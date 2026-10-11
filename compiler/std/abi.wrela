@@ -115,14 +115,17 @@ pub(package) const MAX_TICK_RECORDS: u32 = 256
 /// The bytes of an input event.
 pub(package) const EVENT_SIZE: u32 = 24
 
-/// Where `__audio` leaves a quantum's samples.
+/// Where `__audio` leaves a quantum's samples: the left channel's, then the right's.
 pub(package) const AUDIO_OUT: u32 = 1245184
 
 /// The audio thread's sample rate, in hertz.
 pub(package) const AUDIO_SAMPLE_RATE: u32 = 48000
 
-/// How many samples one `__audio` call renders.
+/// How many samples one `__audio` call renders, in each channel.
 pub(package) const AUDIO_QUANTUM: u32 = 128
+
+/// The voice's channels: left, then right.
+pub(package) const AUDIO_CHANNELS: u32 = 2
 
 /// The widest, tallest and deepest 3D texture.
 pub(package) const MAX_TEXTURE_3D: u32 = 2048

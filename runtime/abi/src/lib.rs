@@ -82,8 +82,8 @@ pub const IMPORT_MEMORY: &str = "memory";
 /// `__worker(thread)`: a helper's thread entry (`memory`'s threads and helpers).
 pub const EXPORT_WORKER: &str = "__worker";
 /// `__audio(thread, task, context)`: renders one quantum of the voice `wrela.audio` started, at
-/// [`memory::AUDIO_OUT`], on the audio thread ([`memory::THREAD_AUDIO`]), on its own instance
-/// of the module, with the same memory.
+/// [`memory::AUDIO_OUT`] (its left channel, then its right), on the audio thread
+/// ([`memory::THREAD_AUDIO`]), on its own instance of the module, with the same memory.
 pub const EXPORT_AUDIO: &str = "__audio";
 /// `__tick(thread, task, context, tick)`: runs tick `tick` of the ticker `wrela.tick` started,
 /// with the records at [`memory::TICK_RECORDS`], on the ticker's thread
@@ -116,6 +116,8 @@ pub const IMPORT_PHASE: &str = "phase";
 /// device's.
 pub const AUDIO_SAMPLE_RATE: u32 = 48000;
 pub const AUDIO_QUANTUM: u32 = 128;
+/// The voice's channels: left, then right.
+pub const AUDIO_CHANNELS: u32 = 2;
 /// What `request_status` says of a request that isn't answered yet, and of one that failed.
 pub const REQUEST_PENDING: i32 = -1;
 pub const REQUEST_FAILED: i32 = -2;

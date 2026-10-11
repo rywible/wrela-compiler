@@ -51,9 +51,18 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("TICK_RECORDS", TICK_RECORDS, "The next tick's records: a `u32` count, then input events."),
     ("MAX_TICK_RECORDS", MAX_TICK_RECORDS, "The most records a tick takes."),
     ("EVENT_SIZE", crate::input::EVENT_SIZE, "The bytes of an input event."),
-    ("AUDIO_OUT", AUDIO_OUT, "Where `__audio` leaves a quantum's samples."),
+    (
+        "AUDIO_OUT",
+        AUDIO_OUT,
+        "Where `__audio` leaves a quantum's samples: the left channel's, then the right's.",
+    ),
     ("AUDIO_SAMPLE_RATE", crate::AUDIO_SAMPLE_RATE, "The audio thread's sample rate, in hertz."),
-    ("AUDIO_QUANTUM", crate::AUDIO_QUANTUM, "How many samples one `__audio` call renders."),
+    (
+        "AUDIO_QUANTUM",
+        crate::AUDIO_QUANTUM,
+        "How many samples one `__audio` call renders, in each channel.",
+    ),
+    ("AUDIO_CHANNELS", crate::AUDIO_CHANNELS, "The voice's channels: left, then right."),
     (
         "MAX_TEXTURE_3D",
         crate::stream::MAX_TEXTURE_3D,

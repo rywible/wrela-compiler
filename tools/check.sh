@@ -96,11 +96,13 @@ for f in sorted([*pathlib.Path("compiler").rglob("*.rs"), *pathlib.Path("runtime
         if m := re.search(r'#\[ignore = "(long|measure|heavy):', line):
             name = next(re.search(r"fn (\w+)\(", l).group(1) for l in lines[i + 1:] if re.search(r"fn (\w+)\(", l))
             # A test file at the top of `tests/` is a test program of its own (no module). A unit
-            # test in `src/` is in its file's `mod tests` (a crate's root file names no module).
+            # test in `src/` is in its file's module, under the directories it's in, and in its
+            # `mod tests` (a crate's root file names no module, nor does a `mod.rs`).
             if f.parent.name == "tests":
                 print(m[1], name)
             elif "src" in f.parts:
-                module = "" if f.stem in ("lib", "main") else f"{f.stem}::"
+                path = [*f.parts[f.parts.index("src") + 1 : -1], f.stem]
+                module = "".join(f"{p}::" for p in path if p not in ("lib", "main", "mod"))
                 inside = any(re.match(r"\s*mod tests\b", l) for l in lines[:i])
                 print(m[1], f"{module}{'tests::' if inside else ''}{name}")
             else:

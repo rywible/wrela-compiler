@@ -623,7 +623,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);
-  if (params.audio > 0) {
+  if (params.audio > 0 || params.live > 0) {
     if (!program.hasVoice) throw new Error("the test asks for audio, but the program started no voice");
     await audioRendered.promise;
   }

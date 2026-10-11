@@ -48,13 +48,14 @@ struct Hooves {
 }
 
 @audio
-fn ring_hooves(h: mut Hooves, out: mut [f32]) {
+fn ring_hooves(h: mut Hooves, left: mut [f32], right: mut [f32]) {
     loop {
         let Some(c) = h.strikes.pop() else { break }
         h.bank.strike(hoof_strike(c))
     }
-    for i in 0..out.len() {
-        out[i] = 0.1 * h.bank.sample()
+    for i in 0..left.len() {
+        left[i] = 0.1 * h.bank.sample()
+        right[i] = left[i]
     }
 }
 

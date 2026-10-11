@@ -12,12 +12,12 @@ struct Synth {
 }
 
 @audio
-fn allocates(s: mut Synth, out: mut [f32]) {
+fn allocates(s: mut Synth, left: mut [f32], right: mut [f32]) {
     s.names.push(1.0) //~ E0600
 }
 
 @audio
-fn reads(s: mut Synth, out: mut [f32]) {
+fn reads(s: mut Synth, left: mut [f32], right: mut [f32]) {
     let _ = load("a.wav") //~ E0600
 }
 
@@ -26,25 +26,24 @@ fn ring_down(n: u32) -> u32 {
 }
 
 @audio
-fn recurses(s: mut Synth, out: mut [f32]) {
+fn recurses(s: mut Synth, left: mut [f32], right: mut [f32]) {
     s.phase += f32(ring_down(3))
 }
 
 @audio
-fn records(s: mut Synth, out: mut [f32]) {
+fn records(s: mut Synth, left: mut [f32], right: mut [f32]) {
     let b: GpuBuffer<f32> = buffer(4) //~ E0600
 }
 
-fn plain(s: mut Synth, out: mut [f32]) {
+fn plain(s: mut Synth, left: mut [f32], right: mut [f32]) {
     var label = f"phase {s.phase}" //~ E0600
 }
 
 pub fn init() -> u32 {
     let gain = 0.5
     play(Synth { phase: 0.0, names: Vec::new() }, plain)
-    play(Synth { phase: 0.0, names: Vec::new() }, |s, out| { out[0] = gain * s.phase }) //~ E0510
+    play(Synth { phase: 0.0, names: Vec::new() }, |s, left, right| { left[0] = gain * s.phase }) //~ E0510
     0
 }
 
-pub fn frame(time: f32, width: u32, height: u32) {
-}
+pub fn frame(time: f32, width: u32, height: u32) {}

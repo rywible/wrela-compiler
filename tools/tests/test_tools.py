@@ -1,11 +1,14 @@
-"""Tests for tools/headless.py and tools/serve.py, with a fake Chrome (no browser, no GPU).
+"""Tests for tools/headless.py, tools/serve.py and tools/listening.py, with a fake Chrome (no
+browser, no GPU).
 
     python3 -m unittest discover -s tools/tests
 """
 
 import fcntl
 import json
+import math
 import os
+import random
 import shutil
 import signal
 import subprocess
@@ -23,6 +26,7 @@ ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, TOOLS)
 
 import headless  # noqa: E402
+import listening  # noqa: E402
 import serve  # noqa: E402
 
 
@@ -402,6 +406,57 @@ class ServeTest(PageDir, unittest.TestCase):
             self.assertEqual(r.headers["Cross-Origin-Opener-Policy"], "same-origin")
             self.assertEqual(r.headers["Cross-Origin-Embedder-Policy"], "require-corp")
             self.assertEqual(r.headers["Content-Type"], "application/wasm")
+
+
+class ListeningTest(unittest.TestCase):
+    """listening.py's blind set: matched in loudness and length, shuffled, the key apart."""
+
+    def test_a_blind_set_gives_nothing_away_but_the_sound(self):
+        rate = 48000
+        tone = lambda amp, n: [amp * math.sin(2 * math.pi * 440 * i / rate) for i in range(n)]
+        # Stereo, interleaved: one loud and short, one quiet and long, one with a spike.
+        loud = [x for s in tone(0.9, 4800) for x in (s, s)]
+        quiet = [x for s in tone(0.05, 9600) for x in (s, s)]
+        spiky = [x for s in tone(0.1, 9600) for x in (s, s)]
+        spiky[100] = 1.0
+        loaded = {"loud": (loud, 2, rate), "quiet": (quiet, 2, rate), "spiky": (spiky, 2, rate)}
+        with tempfile.TemporaryDirectory() as out:
+            key = listening.blind(loaded, out, "ABC", "key.json", rng=random.Random(7))
+            self.assertEqual(sorted(v["render"] for v in key.values()), ["loud", "quiet", "spiky"])
+            self.assertEqual(json.loads(open(os.path.join(out, "key.json")).read()), key)
+            levels = []
+            for letter in "ABC":
+                samples, channels, r = listening.read_wav(os.path.join(out, f"{letter}.wav"))
+                self.assertEqual((channels, r, len(samples)), (2, rate, 2 * 9600))
+                # No peak past -1 dBFS (and a 16-bit step for rounding).
+                self.assertLessEqual(max(abs(x) for x in samples), 10 ** (-1 / 20) + 1 / 32768)
+                levels.append(listening.rms(samples))
+            # One level for all, set by the spike's peak.
+            self.assertLess(max(levels) / min(levels), 1.001)
+
+    def test_the_gate_counts_wrelas_pairs_and_passes_at_12_of_16(self):
+        key = {f"{n:02}": {"wrela": "A" if n % 3 else "B"} for n in range(1, 17)}
+        right = "".join(f"{n} {v['wrela']}\n" for n, v in key.items())
+        self.assertEqual(listening.score(key, right), {"wrela": 16, "of": 16, "p": 0.0, "passes": True})
+        # Four wrong: 12 of 16, p = 0.0384.
+        flip = {"A": "B", "B": "A"}
+        some = "".join(f"{n} {flip[v['wrela']] if int(n) <= 4 else v['wrela']}\n" for n, v in key.items())
+        self.assertEqual(listening.score(key, some), {"wrela": 12, "of": 16, "p": 0.0384, "passes": True})
+        five = "".join(f"{n} {flip[v['wrela']] if int(n) <= 5 else v['wrela']}\n" for n, v in key.items())
+        self.assertFalse(listening.score(key, five)["passes"])
+        with self.assertRaises(SystemExit):
+            listening.score(key, "01 A\n")
+
+    def test_an_excerpt_is_its_bars_faded_in_and_out(self):
+        described = {"bars": 2, "beats": [0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0]}
+        self.assertEqual(listening.excerpt_times(described, 2, 2), (1.5, 3.0))
+        rate = 1000
+        samples = [1.0] * (2 * 4 * rate)
+        out = listening.cut(samples, 2, rate, 1.0, 2.0)
+        self.assertEqual(len(out), 2 * rate)
+        self.assertEqual((out[0], out[1]), (0.0, 0.0))
+        self.assertEqual(out[2 * 500], 1.0)
+        self.assertEqual(out[-1], 0.0)
 
 
 if __name__ == "__main__":

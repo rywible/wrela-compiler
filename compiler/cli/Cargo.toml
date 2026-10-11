@@ -19,6 +19,7 @@ wrela-abi.workspace = true
 serde_json.workspace = true
 # A faster allocator than macOS's: the compiler allocates a great deal.
 mimalloc.workspace = true
+png = "0.18"
 
 [lints]
 workspace = true

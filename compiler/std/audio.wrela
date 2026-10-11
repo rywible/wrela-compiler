@@ -7,31 +7,36 @@
 // makes the voice a task (`std::mem::task`), with the voice's address as its context, which
 // the host's audio thread runs a quantum at a time through `audio` (wrela_abi's `__audio`).
 
-use std::abi::{AUDIO_OUT, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE}
+use std::abi::{AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE}
 use std::alloc::{alloc, place}
 use std::mem::{atomic_load, atomic_store, read, run_task, size_of, store_u32, task, write}
 
 /// The audio thread's sample rate, in hertz: 48000.
 pub const SAMPLE_RATE: u32 = AUDIO_SAMPLE_RATE
 
-/// How many samples a voice renders per call: one Web Audio render quantum, 128.
+/// How many samples a voice renders per call, in each channel: one Web Audio render quantum, 128.
 pub const QUANTUM: u32 = AUDIO_QUANTUM
+
+/// The voice's channels: left and right.
+pub const CHANNELS: u32 = AUDIO_CHANNELS
 
 /// A voice's state, how it renders, and its quantum's samples: what the audio thread owns.
 pub(package) struct Voice<S, R> {
     state: S,
     render: R,
-    out: [f32; QUANTUM],
+    left: [f32; QUANTUM],
+    right: [f32; QUANTUM],
 }
 
-/// Starts the program's voice. From now on the audio thread calls `render(mut state, mut out)`
-/// for each quantum: `out` holds `QUANTUM` samples at `SAMPLE_RATE`, mono, to fill. `state`
-/// moves to the audio thread for good, and `render` with it, so it's a function, or a closure
-/// that captures nothing; send the voice events through a `ring`, whose reader it holds. A
-/// program has one voice: a second `play` traps.
-pub fn play<S, R: @audio fn(mut S, mut [f32])>(state: take S, render: R) {
+/// Starts the program's voice. From now on the audio thread calls
+/// `render(mut state, mut left, mut right)` for each quantum: `left` and `right` each hold
+/// `QUANTUM` samples at `SAMPLE_RATE`, to fill. `state` moves to the audio thread for good, and
+/// `render` with it, so it's a function, or a closure that captures nothing; send the voice
+/// events through a `ring`, whose reader it holds. A program has one voice: a second `play`
+/// traps.
+pub fn play<S, R: @audio fn(mut S, mut [f32], mut [f32])>(state: take S, render: R) {
     unsafe {
-        let voice = place(Voice { state, render, out: [0.0; QUANTUM] })
+        let voice = place(Voice { state, render, left: [0.0; QUANTUM], right: [0.0; QUANTUM] })
         start_voice(task(render_quantum::<S, R>), voice)
     }
 }
@@ -42,14 +47,18 @@ pub fn play<S, R: @audio fn(mut S, mut [f32])>(state: take S, render: R) {
 @effects(io)
 pub(package) fn start_voice(task: u32, voice: u32) {}
 
-/// One quantum of the voice: its samples, rendered and left at `AUDIO_OUT`. (`quantum` is the
-/// task's chunk, unused.)
-fn render_quantum<S, R: @audio fn(mut S, mut [f32])>(quantum: u32, voice: mut Voice<S, R>) {
+/// One quantum of the voice: its samples, rendered and left at `AUDIO_OUT`, the left channel's
+/// and then the right's. (`quantum` is the task's chunk, unused.)
+fn render_quantum<S, R: @audio fn(mut S, mut [f32], mut [f32])>(
+    quantum: u32,
+    voice: mut Voice<S, R>,
+) {
     borrow render = voice.render
-    render(mut voice.state, mut voice.out)
+    render(mut voice.state, mut voice.left, mut voice.right)
     unsafe {
         for i in 0..QUANTUM {
-            write(AUDIO_OUT + 4 * i, voice.out[i])
+            write(AUDIO_OUT + 4 * i, voice.left[i])
+            write(AUDIO_OUT + 4 * (QUANTUM + i), voice.right[i])
         }
     }
 }

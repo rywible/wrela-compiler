@@ -9,7 +9,7 @@ struct Synth {
 }
 
 @audio
-fn render(s: mut Synth, out: mut [f32]) {
+fn render(s: mut Synth, left: mut [f32], right: mut [f32]) {
     s.notes.push(s.phase)
 }
 

@@ -2040,6 +2040,7 @@ name = "wrela"
 version = "0.1.0"
 dependencies = [
  "mimalloc",
+ "png",
  "serde_json",
  "wrela-abi",
  "wrela-diag",

@@ -11,12 +11,13 @@ struct Tone {
 }
 
 @audio
-fn tone(t: mut Tone, out: mut [f32]) {
+fn tone(t: mut Tone, left: mut [f32], right: mut [f32]) {
     if let Some(p) = t.pitches.pop() {
         t.pitch = p
     }
-    for i in 0..out.len() {
-        out[i] = 0.1 * sin(t.phase)
+    for i in 0..left.len() {
+        left[i] = 0.1 * sin(t.phase)
+        right[i] = left[i]
         t.phase += 6.2831853 * t.pitch / f32(SAMPLE_RATE)
         if t.phase > 6.2831853 {
             t.phase -= 6.2831853

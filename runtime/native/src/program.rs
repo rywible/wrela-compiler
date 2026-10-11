@@ -1039,7 +1039,8 @@ impl<E: Executor> Program<E> {
     /// FNV-1a 64 of every byte submitted since the program loaded.
     /// Renders `quanta` quanta of the program's voice ([`wrela_abi::AUDIO_QUANTUM`] samples
     /// each, at [`wrela_abi::AUDIO_SAMPLE_RATE`]) on an instance of its own, as the audio
-    /// thread does, here and now: an offline run. The voice goes on where the last call
+    /// thread does, here and now: an offline run. The samples are the two channels
+    /// interleaved: left, right, left, and so on. The voice goes on where the last call
     /// stopped. Errors if the program hasn't started one.
     pub(crate) fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
         let Some((task, context)) = self.store.data().voice else {
@@ -1057,14 +1058,23 @@ impl<E: Executor> Program<E> {
         }
         let (store, render) = self.audio.as_mut().expect("made above");
         let n = AUDIO_QUANTUM as usize;
-        let mut out = Vec::with_capacity(n * quanta as usize);
+        let channels = wrela_abi::AUDIO_CHANNELS as usize;
+        let mut out = Vec::with_capacity(channels * n * quanta as usize);
         for _ in 0..quanta {
             render
                 .call(&mut *store, (memory::THREAD_AUDIO, task, context))
                 .map_err(|e| Error::Trap(format!("the voice trapped: {}", e.root_cause())))?;
-            let bytes = shared::read(&self.memory, wrela_abi::memory::AUDIO_OUT as usize, n * 4)
+            let at = wrela_abi::memory::AUDIO_OUT as usize;
+            let bytes = shared::read(&self.memory, at, channels * n * 4)
                 .ok_or_else(|| Error::Program("the samples are past the memory's end".into()))?;
-            out.extend(bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+            let sample = |i: usize| {
+                let b = &bytes[4 * i..4 * i + 4];
+                f32::from_le_bytes([b[0], b[1], b[2], b[3]])
+            };
+            for i in 0..n {
+                out.push(sample(i));
+                out.push(sample(n + i));
+            }
         }
         Ok(out)
     }

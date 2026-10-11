@@ -16,11 +16,11 @@
       "severity": "error",
       "span": {
         "column": 5,
-        "end": 231,
+        "end": 250,
         "end_column": 26,
         "end_line": 13,
         "line": 13,
-        "start": 210
+        "start": 229
       },
       "title": "an effect a context forbids"
     }

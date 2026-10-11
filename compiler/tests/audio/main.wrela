@@ -76,8 +76,8 @@ fn excite(modes: mut [Mode; 24], s: Strike) {
 }
 
 @audio
-fn render(bars: mut Bars, out: mut [f32]) {
-    for i in 0..out.len() {
+fn render(bars: mut Bars, left: mut [f32], right: mut [f32]) {
+    for i in 0..left.len() {
         // The strikes due by now.
         loop {
             if bars.next.is_none() {
@@ -99,7 +99,9 @@ fn render(bars: mut Bars, out: mut [f32]) {
             m.im = im
             y += im
         }
-        out[i] = 0.2 * y
+        // The bars are to the left of centre.
+        left[i] = 0.2 * y
+        right[i] = 0.1 * y
         bars.sample += 1
     }
 }

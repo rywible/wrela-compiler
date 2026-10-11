@@ -53,6 +53,9 @@
 //!                                         rename, move, add-param, change-mode: checked
 //!                                         before written, refused on a stale plan
 //! wrela studio <package-dir> [...]        the lens (§22)
+//! wrela audio <package-dir> <action> [...] a piece's voice as files and numbers: wav,
+//!                                         describe, numbers, midi, sheet, speed; and
+//!                                         `wrela audio partials <wav> --key k`
 //! wrela reference replica <parts> -o <dir> [--engine <dir>] [--harmonics k]
 //!     [--sections-every m] [--seam m]     a reference mesh as a package of lofts, maybe
 //!                                         compressed
@@ -70,6 +73,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+mod audio;
 mod build;
 mod compare;
 mod doc;
@@ -115,6 +119,10 @@ pub(crate) fn usage() -> ExitCode {
         "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
         "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela audio <package-dir> (wav <out.wav> | describe | numbers | midi <out.mid> | sheet <out.png> [--bars a-b] | speed) [--take n] [--seconds s]",
+        "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
+        "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",
+        "wrela audio clicks <file.wav> [--notes <take.json>]",
         "wrela studio <package-dir> [serve [--port N] | build | run <script> | look | beside <manifest> | variants <package-dir>... | sweep <literal> <value>... | <action> [args...]] [--png FILE] [--view F] [--size WxH] [--reference PNG] [--debug]",
     ];
     eprintln!("usage:\n  {}\nqueries: {}", lines.join("\n  "), wrela_driver::query::KINDS);
@@ -142,6 +150,7 @@ fn main() -> ExitCode {
         "test" => test::run(rest),
         "studio" => studio::run(rest),
         "run" => run::run(rest),
+        "audio" => audio::run(rest),
         "reference" => reference::run(rest),
         "solve" => solve::run(rest),
         "primer" => primer::run(rest),

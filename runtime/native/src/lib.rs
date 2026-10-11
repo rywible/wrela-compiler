@@ -810,7 +810,8 @@ impl CpuHost {
     }
 
     /// Renders `quanta` quanta of the program's voice offline: `wrela_abi::AUDIO_QUANTUM`
-    /// samples each, mono, at `wrela_abi::AUDIO_SAMPLE_RATE`. Each call goes on from the last.
+    /// samples each, at `wrela_abi::AUDIO_SAMPLE_RATE`, the two channels interleaved (left,
+    /// right, left, ...). Each call goes on from the last.
     pub fn render_audio(&mut self, quanta: u32) -> Result<Vec<f32>> {
         self.program.render_audio(quanta)
     }

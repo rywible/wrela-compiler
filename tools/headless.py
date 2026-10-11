@@ -248,6 +248,8 @@ def main(argv):
                     "--disable-extensions",
                     "--disable-background-timer-throttling",
                     "--disable-renderer-backgrounding",
+                    # A test page plays its voice without a click (test mode's `live`).
+                    "--autoplay-policy=no-user-gesture-required",
                     # Timestamp queries at full resolution, not quantized to 100 µs.
                     "--enable-webgpu-developer-features",
                     "--enable-logging=stderr",

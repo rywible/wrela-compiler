@@ -650,6 +650,9 @@ pub struct ChromeRun {
     pub workers: u32,
     /// Quanta of the program's voice to render offline (0: none).
     pub audio: u32,
+    /// Seconds to play the voice in real time instead; the page saves what the browser says of
+    /// the playback in `results/live.json` (0: none).
+    pub live: u32,
     /// Time each pass on the GPU (`timestamps=1`), or each pass and dispatch run alone, one at a
     /// time, so each time is its own (`timestamps=2`).
     pub timing: Timing,
@@ -682,10 +685,11 @@ impl ChromeRun {
         ChromeRun { frames, width, height, fps, workers: 1, ..ChromeRun::default() }
     }
 
-    /// Seconds the run may take: 300, or three times its frames' paced time and two minutes
-    /// more, for a long run.
+    /// Seconds the run may take: 300, or three times its frames' paced time, twice its live
+    /// voice's and two minutes more, for a long run.
     fn timeout(&self) -> u32 {
-        (f64::from(self.frames) / self.fps * 3.0 + 120.0).max(300.0) as u32
+        (f64::from(self.frames) / self.fps * 3.0 + 2.0 * f64::from(self.live) + 120.0).max(300.0)
+            as u32
     }
 
     /// The page's URL fragment that asks for this run.
@@ -697,6 +701,7 @@ impl ChromeRun {
             fps,
             workers,
             audio,
+            live,
             timing,
             script,
             latency,
@@ -722,6 +727,7 @@ impl ChromeRun {
         };
         for (name, n) in [
             ("audio", *audio),
+            ("live", *live),
             ("timestamps", timestamps),
             ("latency", *latency),
             ("keylatency", *keylatency),

@@ -12,13 +12,14 @@ test("only #test fragments ask for test mode", () => {
 });
 
 test("reads every parameter", () => {
-  expect(parseTestParams("#test&frames=3&width=640&height=360&fps=29.97&workers=4&audio=750")).toEqual({
+  expect(parseTestParams("#test&frames=3&width=640&height=360&fps=29.97&workers=4&audio=750&live=9")).toEqual({
     frames: 3,
     width: 640,
     height: 360,
     fps: 29.97,
     workers: 4,
     audio: 750,
+    live: 9,
     timestamps: 0,
     input: "",
     latency: 0,
