@@ -21,7 +21,7 @@ fn script() -> String {
 /// them.
 #[test]
 fn the_fights_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 19);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 20);
 }
 
 /// The fight recorded natively replays to the same hashes: the same presses, the same fight.
