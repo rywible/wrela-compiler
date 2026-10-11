@@ -206,9 +206,9 @@ native_cache = os.path.abspath(native_cache)
 scratch_root = os.path.abspath("target")
 os.makedirs(scratch_root, exist_ok=True)
 cores = cpu_count()
-# Software Vulkan competes for CPU time, so default to one test thread per program.
-# Hardware uses up to four, bounded by available CPUs and the shared GPU limit.
-test_threads = 1 if os.environ.get("WRELA_SOFTWARE_GPU") else max(1, min(4, cores))
+# Up to four test threads a program, bounded by the CPUs and the shared GPU limit, on a software
+# GPU too: one thread a program made the memo-off gate's tests take 460 s, not 197 s (4 cores).
+test_threads = max(1, min(4, cores))
 programs = []
 for line in open(f"{logs}/tests.json"):
     m = json.loads(line)

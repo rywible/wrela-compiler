@@ -204,9 +204,9 @@ class FocusedCheck(unittest.TestCase):
         self.assertIn("fake link failure", result.stdout + result.stderr)
         self.assertFalse((self.root / "test.json").exists())
 
-    def test_threads_follow_cpu_and_software_gpu_limits(self):
+    def test_threads_follow_cpu_limits_on_any_gpu(self):
         for cores, software, threads in ((1, None, 1), (2, None, 2), (16, None, 4),
-                                         (16, "1", 1), (16, "0", 1), (16, "", 4)):
+                                         (16, "1", 4), (2, "1", 2), (16, "", 4)):
             with self.subTest(cores=cores, software=software):
                 result = self.check("--package=wrela-syntax", cores=cores, software=software)
                 self.assert_focused_success(result)
