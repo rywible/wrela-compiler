@@ -67,7 +67,8 @@ def capture(name, out, size):
     frames = os.path.join(out, name)
     shutil.rmtree(frames, ignore_errors=True)
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-        json.dump(events, f)
+        # (The host takes events in frame order.)
+        json.dump(sorted(events, key=lambda e: e["frame"]), f)
         script = f.name
     os.makedirs(frames)
     r = subprocess.run([HOST, BUILD, "--frames", str(last + 1), "--size", size, "--input", script,
