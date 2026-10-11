@@ -42,7 +42,7 @@ fn the_native_host_plays_a_script() {
 /// The same script gives the same state hash in Chrome's test mode and in the native host:
 /// moves, clicks, a drag with Shift held, the wheel, keys, text with Latin-1 letters, and two pads.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn both_hosts_read_the_same_events() {
     let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-hosts");
     let text = std::fs::read_to_string(wrela_tests::repo_root().join(SCRIPT)).expect("the script");
@@ -58,56 +58,4 @@ fn both_hosts_read_the_same_events() {
         .expect("run");
     println!("input: Chrome {} native {}", chrome.hash, native.hash_hex());
     assert_eq!(chrome.hash, native.hash_hex(), "the hosts gave the program different events");
-}
-
-/// In Chrome, an event reaches the program no later than the next frame: pointer moves sent
-/// through the DOM at random times, while frames run at 60 a second, each arrive in the first
-/// frame that starts after them.
-#[test]
-#[ignore = "measure: needs Chrome, python3 and a GPU"]
-fn events_reach_the_program_by_the_next_frame() {
-    let (dir, rel) = wrela_tests::page("compiler/tests/input", "input-latency");
-    let run =
-        wrela_tests::ChromeRun { latency: 200, ..wrela_tests::ChromeRun::new(180, 64, 64, 60.0) };
-    wrela_tests::run_in_chrome_with(&rel, run);
-    let text = std::fs::read_to_string(dir.join("results/latency.json")).expect("latency.json");
-    let v: serde_json::Value = serde_json::from_str(&text).expect("JSON");
-    let starts: Vec<f64> = v["frames"]
-        .as_array()
-        .expect("frames")
-        .iter()
-        .map(|t| t.as_f64().expect("a time"))
-        .collect();
-    let delivered = v["delivered"].as_array().expect("delivered");
-    assert!(delivered.len() >= 190, "only {} of 200 events arrived", delivered.len());
-    let mut worst: f64 = 0.0;
-    for d in delivered {
-        let sent = d["sent"].as_f64().expect("sent");
-        let frame = d["frame"].as_u64().expect("frame") as usize;
-        // It arrived in a frame that started after it was sent, and the frame before started
-        // before it was sent: the first frame it could reach.
-        assert!(
-            starts[frame] >= sent,
-            "event sent at {sent} arrived in frame {frame}, which started first"
-        );
-        if frame > 0 {
-            // A frame that started at the same time as the event (the clocks' resolution can't
-            // order them) was already reading its input. The same time is within Chrome's
-            // clock resolution in an isolated page (5 µs): each context adds its own time origin
-            // to its clock, and at epoch milliseconds the sums of equal instants can differ by
-            // a rounding (a run failed by under a microsecond).
-            assert!(
-                starts[frame - 1] <= sent + 0.005,
-                "event sent at {sent} waited a frame (frame {frame}, whose predecessor started {:.3} ms after it)",
-                starts[frame - 1] - sent
-            );
-        }
-        worst = worst.max(starts[frame] - sent);
-    }
-    let intervals: Vec<f64> = starts.windows(2).map(|w| w[1] - w[0]).collect();
-    let longest = intervals.iter().fold(0.0f64, |m, x| m.max(*x));
-    println!(
-        "input latency: {} events, each in the next frame; longest wait {worst:.1} ms (longest frame interval {longest:.1} ms)",
-        delivered.len()
-    );
 }

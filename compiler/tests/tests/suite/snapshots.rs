@@ -2,9 +2,8 @@
 //! with `clone_into`, checksums are the derived `StateHash`, and rollback restores a keyframe
 //! and replays the inputs since.
 
-use std::time::Instant;
 use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::{median, one_u32, page};
+use wrela_tests::{one_u32, page};
 
 fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
     host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}"))
@@ -90,36 +89,4 @@ fn replayed_ticks_give_the_same_hashes() {
         }
     }
     assert!(restores > 100 && replayed > 1000, "{restores} restores, {replayed} ticks replayed");
-}
-
-/// Measured, not gated (§6.11 estimates 0.3 ms for a copy and about the same for a hash): a
-/// copy with `clone_into`, a `clone`, and a whole-state hash, of 10,000 entities of 256 bytes,
-/// in wasmtime. `cargo test --release -p wrela-tests --test suite snapshot_costs -- --ignored
-/// --nocapture` prints them.
-#[test]
-#[ignore = "measure: reported, not gated; run it with --release"]
-fn snapshot_costs() {
-    let (dir, _) = page("compiler/tests/snapshots", "snapshots-costs");
-    let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");
-    const N: i32 = 20;
-    let mut time = |name: &str| {
-        let args = [Value::I32(N)];
-        call(&mut host, name, &args); // warm-up, not counted
-        let runs: Vec<f64> = (0..9)
-            .map(|_| {
-                let t = Instant::now();
-                call(&mut host, name, &args);
-                t.elapsed().as_secs_f64() * 1e3 / f64::from(N)
-            })
-            .collect();
-        median(&runs)
-    };
-    let copy = time("copy_big");
-    let clone = time("clone_big");
-    let hash = time("hash_big");
-    println!("10,000 entities of 256 bytes (2.56 MB), median of 9 runs of {N}:");
-    println!("  clone_into  {copy:.3} ms");
-    println!("  clone       {clone:.3} ms");
-    println!("  state_hash  {hash:.3} ms");
-    assert!(matches!(call(&mut host, "spare_matches", &[])[..], [Value::I32(1)]));
 }

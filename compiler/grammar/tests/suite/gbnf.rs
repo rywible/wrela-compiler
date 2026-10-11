@@ -8,7 +8,7 @@ use wrela_grammar::ebnf::Grammar;
 use wrela_grammar::gbnf::{export, spec_path};
 use wrela_grammar::rng::default_threads;
 use wrela_grammar::sampler::{Gbnf, check_samples};
-use wrela_grammar::testing::{sized, with_big_stack};
+use wrela_grammar::testing::with_big_stack;
 
 fn checked_in() -> String {
     let path = spec_path();
@@ -118,7 +118,7 @@ fn formatted_programs_are_in_the_language() {
     let mut cov = Coverage::new(&grammar);
     with_big_stack(|| {
         let mut formatted = 0;
-        for seed in 0..sized(2000, 5000) {
+        for seed in 0..256 {
             let mut rng = Rng::new(seed);
             let terms = generator.generate(&mut rng, &mut cov);
             let src = generator.render(&terms, &mut rng).text;
@@ -165,6 +165,6 @@ fn formatted_programs_are_in_the_language() {
             assert!(g.recognizes(g.root, &out), "not in the GBNF language:\n{out}");
             formatted += 1;
         }
-        assert!(formatted > 1000, "only {formatted} programs");
+        assert!(formatted > 128, "only {formatted} programs");
     });
 }

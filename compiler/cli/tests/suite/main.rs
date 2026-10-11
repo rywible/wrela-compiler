@@ -10,4 +10,5 @@ mod query;
 mod refactor;
 mod solve;
 mod studio;
+mod test;
 mod trace;

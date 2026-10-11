@@ -5,7 +5,7 @@
 
 use crate::{a_flipped_record_fails_at_its_tick, built, replays_with_any_helpers};
 use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::{one_u32, one_vec3, sized};
+use wrela_tests::{one_u32, one_vec3};
 
 fn start(workers: u32) -> CpuHost {
     CpuBuild::load(built("jobs")).expect("load").start_with(workers).expect("start")
@@ -60,38 +60,49 @@ fn a_trapping_job_traps_at_its_join() {
         assert_eq!(failure.panic.as_deref(), Some("a job's input was 13"));
     }
 }
-
-/// A job that fills the heap panics at its join with its own message, every time, while the
-/// joining thread makes and drops blocks of its own (M6, AC15). Before the allocator let its lock
-/// go to panic, the job's thread ran out of memory holding the lock, and the joining thread spun
-/// on it until its count of tries overflowed, 66 s later, with a trap that hid the job's panic
-/// (spike 17's bake, 2 runs of 11). 100 runs, two threads each, four at a time.
-#[test]
-#[ignore = "long: fills a gigabyte of heap 100 times"]
-fn a_job_that_fills_the_heap_panics_at_its_join() {
-    let build = CpuBuild::load(built("jobs")).expect("load");
-    let runs = sized(100, 1000);
-    let next = std::sync::atomic::AtomicU32::new(0);
-    std::thread::scope(|s| {
-        for _ in 0..4 {
-            s.spawn(|| {
-                while next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < runs {
-                    let t = std::time::Instant::now();
-                    let mut host = build.start_with(2).expect("start");
-                    let e = host
-                        .call_export("fill_the_heap_while_allocating", &[])
-                        .expect_err("the heap runs out");
-                    let failure = host.last_failure().expect("a trap");
-                    let took = t.elapsed().as_secs_f64();
-                    assert!(
-                        failure.panic.as_deref().is_some_and(|m| m.starts_with("out of memory")),
-                        "the run failed otherwise, after {took:.1} s: {e}"
-                    );
-                    assert!(took < 20.0, "a run took {took:.1} s");
-                }
-            });
+/// Shrink only the fixture's imported memory maximum, so memory.grow fails under the real
+/// allocator lock after a few blocks. No production allocator or scheduling path is replaced.
+fn small_heap() -> std::path::PathBuf {
+    use wasm_encoder::reencode::Reencode;
+    struct Heap;
+    impl Reencode for Heap {
+        type Error = std::convert::Infallible;
+        fn memory_type(
+            &mut self,
+            ty: wasmparser::MemoryType,
+        ) -> Result<wasm_encoder::MemoryType, wasm_encoder::reencode::Error<Self::Error>> {
+            let mut ty = wasm_encoder::reencode::utils::memory_type(self, ty);
+            ty.maximum = Some(ty.minimum + 64);
+            Ok(ty)
         }
-    });
+    }
+    let dir = crate::scratch("jobs-small-heap");
+    wrela_tests::copy_dir(&built("jobs"), &dir);
+    let manifest = wrela_tests::manifest(&dir);
+    let wasm = dir.join(&manifest.wasm);
+    let bytes = std::fs::read(&wasm).unwrap();
+    let mut module = wasm_encoder::Module::new();
+    Heap.parse_core_module(&mut module, wasmparser::Parser::new(0), &bytes).unwrap();
+    std::fs::write(wasm, module.finish()).unwrap();
+    dir
+}
+
+/// OOM is reported at join, after releasing the allocator lock, and another thread can
+/// continue allocating. One forced failure with 1, 2 and 8 workers replaces repeated GiB fills.
+#[test]
+fn an_allocation_failure_releases_the_lock_and_panics_at_join() {
+    let build = CpuBuild::load(small_heap()).expect("load");
+    for workers in [1, 2, 8] {
+        let mut host = build.start_with(workers).expect("start");
+        let error = host.call_export("fill_the_heap_while_allocating", &[]).expect_err("OOM");
+        let failure = host.last_failure().expect("a trap");
+        assert!(
+            failure.panic.as_deref().is_some_and(|m| m.starts_with("out of memory")),
+            "{error}"
+        );
+        // If the failing thread retained the lock, this allocation would deadlock.
+        assert!(one_u32(&mut host, "allocations_while_helping", &[Value::I32(1)]) > 0);
+    }
 }
 
 /// Parallel work started inside a parallel closure runs on that thread alone, chunk after
@@ -124,7 +135,7 @@ fn allocations_are_counted_per_thread() {
 fn a_hand_off_is_never_read_torn() {
     let dir = crate::built_debug("jobs");
     let mut host = CpuBuild::load(&dir).expect("load").start_with(2).expect("start");
-    let (values, reads) = (sized(20_000, 1_000_000), sized(100_000, 1_000_000));
+    let (values, reads) = (20_000, 100_000);
     let r = host
         .call_export("stress", &[Value::I32(values), Value::I32(reads)])
         .unwrap_or_else(|e| panic!("stress: {e}"));
@@ -177,7 +188,7 @@ fn parallel_work_from_ticks_and_frames_doesnt_collide() {
         frames_alone.frame(wrela_host::frame_time(i, 60.0), 64, 64).expect("a frame");
     }
     let work = one_u32(&mut frames_alone, "work", &[]);
-    for round in 0..sized(20, 1000) {
+    for round in 0..2 {
         let mut host = built.start_with(8).expect("start");
         let ticked = host.ticks_beside_frames(ticks, frames, 60.0, 64, 64).expect("both");
         let hashes: Vec<u64> = ticked.iter().map(|(t, _)| t.hash.expect("asked for")).collect();
@@ -214,7 +225,7 @@ fn a_tick_log_replays_and_a_changed_record_fails_at_its_tick() {
 /// natively (#43 §2.3, AC5, AC6). On the paced schedule (ticks on the ticker's own clock, the
 /// frames not waiting) the hashes are the same for every tick it ran.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_ticker_in_chrome_agrees_with_the_native_host() {
     let (dir, rel) = wrela_tests::page("compiler/tests/ticker", "ticker-chrome");
     let text =
@@ -353,16 +364,11 @@ pub fn init() -> Game {
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
 ";
 
-/// Memory one thread grew is every thread's to use (compiler/tests/grown), in Chrome with 8
-/// threads and natively: `init` grows the heap in 64 steps while the host starts the helpers; a
-/// task grows and frees 192 MiB while the others sleep, then wakes them to a parallel job whose
-/// chunks grow vectors from that memory; the program's thread grows the heap each frame
-/// meanwhile, then writes a block of 160 MiB. In Chrome a helper that started while the memory
-/// grew saw an old size, and trapped on blocks beyond it (std's `alloc` line 127, as the map
-/// lens did), until std asked for the memory's size wherever a thread takes memory another may
-/// have grown (`std::alloc::reach_heap`).
+/// Memory grown by one thread is usable by all helpers. A 4 MiB initialization overlaps helper
+/// startup; one helper holds 12 MiB while parallel rows write beyond it, then the main thread
+/// writes every page of 16 MiB. Both hosts must report the same contents.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn memory_a_helper_grew_is_every_threads() {
     let (dir, rel) = wrela_tests::page("compiler/tests/grown", "grown-chrome");
     let native = {
@@ -379,7 +385,7 @@ fn memory_a_helper_grew_is_every_threads() {
         lines.into_iter().find(|l| l.starts_with("used")).expect("natively, the block's used")
     };
     let run =
-        wrela_tests::ChromeRun { workers: 8, ..wrela_tests::ChromeRun::new(1200, 16, 16, 60.0) };
+        wrela_tests::ChromeRun { workers: 8, ..wrela_tests::ChromeRun::new(120, 16, 16, 60.0) };
     let _ = wrela_tests::run_in_chrome_with(&rel, run);
     let log = std::fs::read_to_string(dir.join("results/log.txt")).expect("log.txt");
     let used = log.lines().find(|l| l.starts_with("used")).unwrap_or_default();

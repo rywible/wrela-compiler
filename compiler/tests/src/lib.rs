@@ -2,16 +2,8 @@
 //! program's exports, reading case files, and running hand-written WGSL (the spike's kernels) on
 //! the same GPU for comparison.
 //!
-//! The GPU tests are `#[ignore]`d: they need a GPU and take the GPU lock (`wrela_host::lock`).
-//! `tools/check.sh` runs them (four at a time share the GPU), but not those whose reason starts
-//! `long:` (headless Chrome, the clearing's camera path, soak runs), which `tools/check.sh
-//! --long` runs, nor `measure:` (time budgets and comparisons), which `tools/check.sh --full`
-//! runs one at a time, the GPU theirs alone. On a software GPU (`WRELA_SOFTWARE_GPU`), those whose
-//! reason starts `heavy:` (seconds on a GPU, minutes on lavapipe) are long checks too.
-//!
-//! Sampled tests have two sizes: small by default, so `cargo test` and the long checks stay
-//! fast, and the size the acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as
-//! `tools/check.sh --full` does.
+//! The one check runs every retained CPU, GPU and browser regression. Samples have one bounded
+//! size; historical milestone benchmarks and full-scene tours are not part of verification.
 
 pub mod camera;
 pub mod spike01;
@@ -24,7 +16,7 @@ use wrela_host::{CpuHost, GpuTiming, Host, TickLog, Timing, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
-pub use wrela_grammar::testing::{files_under, par_each, par_map, repo_root, sized};
+pub use wrela_grammar::testing::{files_under, par_each, par_map, repo_root};
 
 /// Where this process writes its test files. The gate gives each isolated test an absolute
 /// `WRELA_TEST_TMPDIR`, so processes never remove or overwrite each other's builds. Outside
@@ -72,69 +64,17 @@ impl Default for OncePerKey {
     }
 }
 
-/// A build of the package in `pkg` by `build`, which `wrela build <pkg> <args>` makes the same
-/// (`args` None: no command makes it), for the gate's memory of slow tests (tools/memo.py).
-///
-/// When `WRELA_BUILD_RECORD` names a file, this adds a line to it: the package, `args`, and the
-/// hash of the build's files. The memory then keys a slow test on what its builds produced, not
-/// on the compiler's sources and the program's: a change to either that leaves the files as they
-/// were (an engine module the program doesn't use, a compiler change it doesn't reach) doesn't
-/// run the test again. The build's start and end are marked in the test's trace by a look at
-/// [`BUILD_BEGIN`] and [`BUILD_END`] (which don't exist), so the memory can tell the files the
-/// build read from those the test read itself.
-pub fn recorded_build(
-    pkg: &Path,
-    args: Option<&[&str]>,
-    build: impl FnOnce() -> wrela_driver::Output,
-) -> wrela_driver::Output {
-    let Some(record) = std::env::var_os("WRELA_BUILD_RECORD") else {
-        return build();
-    };
-    let _ = std::fs::metadata(BUILD_BEGIN);
-    let out = wrela_syntax::recorded::build(build);
-    let _ = std::fs::metadata(BUILD_END);
-    let line = serde_json::json!({
-        "pkg": pkg.canonicalize().unwrap_or_else(|_| pkg.to_path_buf()),
-        "args": args,
-        "files": files_hash(&out.files),
-    });
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(record)
-        .expect("open WRELA_BUILD_RECORD");
-    // One write a line: the builds of other threads append to the same file.
-    std::io::Write::write_all(&mut f, format!("{line}\n").as_bytes())
-        .expect("write WRELA_BUILD_RECORD");
-    out
-}
-
-/// The paths [`recorded_build`] looks at to mark a build's start and end in a trace.
-pub const BUILD_BEGIN: &str = "/wrela-gate-memo/build-begin";
-pub const BUILD_END: &str = "/wrela-gate-memo/build-end";
-
-/// A build's files' hash, as tools/memo.py computes it from a build's directory: SHA-256 of each
-/// file, by path, as its path, a zero byte, its length (8 bytes, little-endian) and its bytes.
-pub fn files_hash(files: &[(String, Vec<u8>)]) -> String {
-    use sha2::Digest;
-    let mut sorted: Vec<&(String, Vec<u8>)> = files.iter().collect();
-    sorted.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut h = sha2::Sha256::new();
-    for (path, bytes) in sorted {
-        h.update(path.as_bytes());
-        h.update([0]);
-        h.update((bytes.len() as u64).to_le_bytes());
-        h.update(bytes);
-    }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Builds the package in `pkg` as `wrela build --testing` does (with its `@testing` exports),
 /// without writing its files: the output, or the errors rendered.
 pub fn build(pkg: &Path) -> Result<wrela_driver::Output, String> {
     let built = wrela_driver::build_for_tests(pkg, false);
     if built.has_errors() {
         return Err(wrela_diag::render::render_all(&built.sources, &built.diagnostics));
+    }
+    for (name, bytes) in &built.files {
+        if name.ends_with(".wgsl") && bytes.len() > 256 * 1024 {
+            return Err(format!("{name}: {} bytes, over the 256 KiB shader budget", bytes.len()));
+        }
     }
     Ok(built)
 }
@@ -578,15 +518,8 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
         page_scratch_root().join("page-builds").join(format!("{}-{kind}", pkg.replace('/', "-")));
     BUILDS.run(&base.display().to_string(), || {
         let _ = std::fs::remove_dir_all(&base);
-        // The `wrela build` that makes the same files (none makes a build without SIMD).
-        let args: Option<&[&str]> = match kind {
-            "release" => Some(&["--testing"]),
-            "debug" => Some(&["--testing", "--debug"]),
-            "shipped" => Some(&[]),
-            _ => None,
-        };
         let dir = repo_root().join(pkg);
-        let built = recorded_build(&dir, args, || build(&dir));
+        let built = build(&dir);
         if built.has_errors() {
             panic!(
                 "{pkg} doesn't build:\n{}",
@@ -903,19 +836,6 @@ mod tests {
             })
             .is_err(),
             "a relative override could put two programs' files in different directories"
-        );
-    }
-
-    #[test]
-    fn files_hash_is_tools_memos() {
-        // The same files and hash as tools/tests/test_memo.py's `test_the_files_hash_is_compiler_tests`.
-        let files = vec![
-            ("sub/b.wgsl".to_string(), b"fn main() {}".to_vec()),
-            ("a.wasm".to_string(), b"\0asm".to_vec()),
-        ];
-        assert_eq!(
-            super::files_hash(&files),
-            "8410ef328ec8af3db236a70a705c1c9c7746bdc9695323b3e5bb56ef647fdf28"
         );
     }
 }

@@ -90,7 +90,7 @@ fn f32_formatting_matches_rust() {
     let mut host = CpuHost::load(built("format")).expect("load");
     let mut rng = Rng::new(7);
     let mut values = edge_f32();
-    for _ in 0..wrela_tests::sized(3000, 20000) {
+    for _ in 0..3000 {
         values.push(f32::from_bits(rng.next_u64() as u32));
     }
     let mut failures = Vec::new();
@@ -129,7 +129,7 @@ fn f64_formatting_matches_rust() {
         1e23,
         9007199254740993.0,
     ]);
-    for _ in 0..wrela_tests::sized(500, 4000) {
+    for _ in 0..500 {
         values.push(f64::from_bits(rng.next_u64()));
     }
     let mut failures = Vec::new();

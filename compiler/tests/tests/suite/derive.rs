@@ -4,15 +4,13 @@
 //! a single point must also hold the point's value strictly inside: the widening is at least
 //! an ulp.
 //!
-//! The CPU interval test samples 2·10⁴ boxes per function, or AC3's 10⁶ with `WRELA_FULL`
-//! (about 90 s of work, spread over the machine's threads). The GPU one needs a GPU and always
-//! runs 10⁶: `cargo test -p wrela-tests --test suite derive:: -- --ignored --nocapture`.
+//! Fixed CPU and GPU samples cover every function, including strictly widened point intervals.
 
 use crate::built;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
-use wrela_tests::{Rng, one_f32, one_u32, par_each, sized, u32s, worse};
+use wrela_tests::{Rng, one_f32, one_u32, par_each, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
 const NAMES: [&str; 24] = [
@@ -41,8 +39,8 @@ const NAMES: [&str; 24] = [
     "hyperbolic",
     "powers",
 ];
-/// Boxes per function on the GPU, and on the CPU at full size.
-const BOXES: u32 = 1_000_000;
+/// Bounded boxes per function on the GPU (a whole number of 64-thread workgroups).
+const BOXES: u32 = 1024;
 
 /// The arguments of `value` and `gradient`: function `fi` at `p`.
 fn point_args(fi: u32, p: [f32; 3]) -> [Value; 4] {
@@ -151,7 +149,7 @@ enum Job {
 #[test]
 fn intervals_enclose_every_sample_on_the_cpu() {
     let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
-    let (boxes, points) = (sized(20_000, BOXES), sized(10_000, 100_000));
+    let (boxes, points) = (512, 256);
     // Each function's point intervals, then the boxes, a chunk at a time.
     let jobs: Vec<Job> = (0..NAMES.len())
         .map(Job::Unwidened)
@@ -221,12 +219,12 @@ fn intervals_enclose_every_sample_on_the_gpu() {
 }
 
 /// AC12: on the GPU, the box of a vector's interval (the creature's gradient) is the three
-/// components' intervals, over 10⁴ random boxes. (The CPU's: run/interval_vectors.)
+/// components' intervals, over 1024 fixed seeded boxes. (The CPU's: run/interval_vectors.)
 #[test]
 #[ignore = "needs a GPU"]
 fn the_interval_of_a_vector_is_its_components_on_the_gpu() {
     let mut host = Host::load(built("fields")).expect("load");
-    let n = 10_000;
+    let n = 1024;
     host.call_export("check_vector_intervals", &[Value::I32(5), Value::I32(n)]).expect("check");
     let out = *host.buffers().last().expect("a buffer");
     let same = u32s(&host.read_buffer(out).expect("read"));

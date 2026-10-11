@@ -401,19 +401,32 @@ pub fn test(root: &Path, filter: Option<&str>) -> TestOutput {
 /// [`test`], each test stopped after `fuel` (wasmtime's, about a WASM instruction each) rather
 /// than [`consts::TEST_FUEL`]: for the compiler's own tests of tests that never end.
 pub fn test_with_fuel(root: &Path, filter: Option<&str>, fuel: u64) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, fuel, false))
+    on_compiler_thread(|| {
+        run_tests(root, filter, PackageKind::Program, fuel, false, false).unwrap()
+    })
 }
 
 /// [`test`], writing each GPU frame test's golden (`golden: "frame.png"`, §10) from this
 /// machine's screen before comparing with it: `wrela test --bless`.
 pub fn test_blessing(root: &Path, filter: Option<&str>) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, consts::TEST_FUEL, true))
+    on_compiler_thread(|| {
+        run_tests(root, filter, PackageKind::Program, consts::TEST_FUEL, true, false).unwrap()
+    })
 }
 
 /// [`test`] for std's own tests, with the package at `root` as the program: how std's
 /// tests run (the suite's `std_tests_pass`), since only a program package's tests run.
 pub fn test_std(root: &Path, filter: Option<&str>) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Std, consts::TEST_FUEL, false))
+    on_compiler_thread(|| {
+        run_tests(root, filter, PackageKind::Std, consts::TEST_FUEL, false, false).unwrap()
+    })
+}
+
+/// Runs exactly one named test. Rejects zero or ambiguous matches before any tests execute.
+/// `standard_library` selects std's tests with `root` as an otherwise empty program.
+pub fn test_exact(root: &Path, name: &str, standard_library: bool) -> Result<TestOutput, usize> {
+    let kind = if standard_library { PackageKind::Std } else { PackageKind::Program };
+    on_compiler_thread(|| run_tests(root, Some(name), kind, consts::TEST_FUEL, false, true))
 }
 
 fn run_tests(
@@ -422,11 +435,12 @@ fn run_tests(
     kind: PackageKind,
     fuel: u64,
     bless: bool,
-) -> TestOutput {
+    exact: bool,
+) -> Result<TestOutput, usize> {
     let (sources, mut diagnostics, loaded) = load(root);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
         split_std_warnings(&sources, &mut diagnostics);
-        return TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 };
+        return Ok(TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 });
     };
     // std's own tests memory-check its bodies, which other programs leave out.
     let checked = if kind == PackageKind::Std {
@@ -452,7 +466,16 @@ fn run_tests(
             .collect();
         tests.sort_by_key(|&f| (p.func(f).span.file, p.func(f).span.start));
         let all = tests.len();
-        tests.retain(|&f| filter.is_none_or(|w| p.func(f).name.contains(w)));
+        tests.retain(|&f| {
+            filter.is_none_or(
+                |w| {
+                    if exact { p.func(f).name == w } else { p.func(f).name.contains(w) }
+                },
+            )
+        });
+        if exact && tests.len() != 1 {
+            return Err(tests.len());
+        }
         filtered_out = all - tests.len();
         // Tests of code run as constants are computed; frame tests run the program first.
         let (framed, plain): (Vec<_>, Vec<_>) =
@@ -478,7 +501,7 @@ fn run_tests(
     }
     sort_and_dedup(&mut diagnostics);
     split_std_warnings(&sources, &mut diagnostics);
-    TestOutput { sources, diagnostics, results, filtered_out }
+    Ok(TestOutput { sources, diagnostics, results, filtered_out })
 }
 
 /// What a compile makes: diagnostics only, or a build (`emit`), of these kinds (as
@@ -501,16 +524,11 @@ impl Mode {
 /// Runs `f` on a thread with the compiler's stack ([`STACK_SIZE`]), and gives back what it
 /// returns; a panic in it goes on in the caller. For anything that parses or walks syntax trees.
 pub fn on_compiler_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
-    // Part of the caller's recorded build, if it's in one (tools/memo.py).
-    let inside = wrela_syntax::recorded::inside();
     std::thread::scope(|s| {
         let worker = std::thread::Builder::new()
             .name("wrela".into())
             .stack_size(STACK_SIZE)
-            .spawn_scoped(s, move || {
-                wrela_syntax::recorded::enter(inside);
-                f()
-            })
+            .spawn_scoped(s, f)
             .expect("can't start the compiler's thread");
         worker.join().unwrap_or_else(|p| std::panic::resume_unwind(p))
     })

@@ -362,7 +362,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "long: compares deferred view controls with separately rendered GPU frames"]
+    #[ignore = "needs the runtime"]
     fn deferred_view_controls_keep_the_same_pixels_after_literal_changes() {
         let dir =
             std::env::temp_dir().join(format!("wrela-compare-batching-{}", std::process::id()));

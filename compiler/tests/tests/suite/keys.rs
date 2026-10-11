@@ -45,7 +45,7 @@ fn a_keyed_run_replays_and_a_changed_record_fails_at_its_tick() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU; also Rosetta on macOS"]
+#[ignore = "needs the runtime"]
 fn a_run_recorded_in_chrome_replays_natively_and_on_rosetta_where_available() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-chrome");
     // Lockstep at 60 frames a second: frame i follows i + 1 ticks, so 2,000 frames run 2,000.
@@ -87,51 +87,4 @@ fn a_run_recorded_in_chrome_replays_natively_and_on_rosetta_where_available() {
     }
     #[cfg(not(target_os = "macos"))]
     eprintln!("native/browser replay checked; cross-architecture Rosetta replay requires macOS");
-}
-
-/// The input latency through the sim (#42 AC6, measured, not gated): from a key's DOM event to
-/// the first frame that draws its effect, in Chrome at 60 frames a second, paced. Each press
-/// is matched with the first frame after it that printed `moved`.
-#[test]
-#[ignore = "measure: the input latency through the sim, paced in real time; needs Chrome, python3 and a GPU"]
-fn key_presses_reach_the_screen_through_the_sim() {
-    let (dir, rel) = wrela_tests::page("compiler/tests/sketches/03-keys", "keys-latency");
-    let presses = 40;
-    let run = wrela_tests::ChromeRun {
-        workers: 4,
-        paced: true,
-        keylatency: presses,
-        nohash: true,
-        ..wrela_tests::ChromeRun::new(900, 64, 64, 60.0)
-    };
-    let chrome = wrela_tests::run_in_chrome_with(&rel, run);
-    let latency = wrela_tests::result_json(&dir.join("results"), "latency.json");
-    // The key-downs, by when they were sent (every other event the page saw).
-    let sent: Vec<f64> = latency["delivered"]
-        .as_array()
-        .expect("delivered")
-        .iter()
-        .map(|d| d["sent"].as_f64().expect("a time"))
-        .collect::<Vec<_>>()
-        .chunks(2)
-        .map(|pair| pair[0])
-        .collect();
-    let moved: Vec<f64> = chrome
-        .printed
-        .iter()
-        .filter(|(_, line)| line == "moved")
-        .map(|(frame, _)| chrome.began_ms[*frame])
-        .collect();
-    let ms: Vec<f64> =
-        sent.iter().filter_map(|&t| moved.iter().find(|&&f| f >= t).map(|f| f - t)).collect();
-    assert!(
-        ms.len() as u32 >= presses * 3 / 4,
-        "only {} of {presses} presses moved the player",
-        ms.len()
-    );
-    let (median, p99) = (wrela_tests::median(&ms), wrela_tests::percentile(&ms, 0.99));
-    eprintln!(
-        "key to screen through the sim, {} presses: median {median:.1} ms, 99th percentile {p99:.1} ms (#43 §6's estimate: about 37 ms more than the frame's own latency)",
-        ms.len()
-    );
 }

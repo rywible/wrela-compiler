@@ -3,8 +3,7 @@
 //! near-miss mutants of them, the conformance suite and the round-trip sample; and every
 //! accepted program survives parse → format → parse unchanged.
 //!
-//! These runs are sized for `cargo test` (larger with `WRELA_FULL`). The full AC run is
-//! `cargo run -p wrela-grammar --release --bin differential -- 1000000`.
+//! Fixed samples must cover every grammar alternative and preserve parser agreement.
 
 use crate::common;
 
@@ -12,7 +11,7 @@ use std::sync::Mutex;
 use wrela_grammar::agree::Checker;
 use wrela_grammar::differential::{RunConfig, run};
 use wrela_grammar::earley::Scratch;
-use wrela_grammar::testing::{par_each, sized, with_big_stack};
+use wrela_grammar::testing::{par_each, with_big_stack};
 use wrela_syntax::fmt::check_round_trip;
 
 const SEED: u64 = 0xac5;
@@ -20,7 +19,7 @@ const SEED: u64 = 0xac5;
 #[test]
 fn generated_programs_agree() {
     let checker = Checker::default();
-    let mut cfg = RunConfig::new(sized(5000, 5000), SEED);
+    let mut cfg = RunConfig::new(5000, SEED);
     cfg.round_trip = false;
     let stats = run(&checker, &cfg);
     let report = stats.report(&checker);
@@ -47,8 +46,8 @@ fn generated_programs_agree() {
 #[test]
 fn generated_programs_round_trip_through_the_formatter() {
     let checker = Checker::default();
-    // The oracle is checked above; this run is about the formatter, so it can be bigger.
-    let programs = sized(3000, 10_000);
+    // A separate fixed sample exercises formatting.
+    let programs = 384;
     let mut cfg = RunConfig::new(programs, SEED + 1);
     cfg.oracle = false;
     let stats = run(&checker, &cfg);

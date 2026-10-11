@@ -148,12 +148,13 @@ CONSOLE_END = re.compile(r'^(.*)", source: .* \(\d+\)$')
 LOG_RECORD = re.compile(r"^\[\d+:\d+:\d{4}/\d{6}\.\d+:")
 
 
-def extract_console(chrome_log, console_log):
+def extract_console(chrome_log, console_log, offset=0):
     """Writes every line of every console message in Chrome's log to `console_log`; returns them."""
     lines = []
     message = None  # the lines so far of a message whose end isn't read yet
     try:
         with open(chrome_log, errors="replace") as f:
+            f.seek(offset)
             for line in f:
                 line = line.rstrip("\n")
                 if message is not None and LOG_RECORD.match(line):
@@ -280,35 +281,44 @@ def main(argv):
     start = time.monotonic()
     status, reason = 1, None
     proc = None
+    tab = None
+    shared = None
+    offset = 0
     try:
-        adopt_chrome_children()
-        with open(chrome_log, "wb") as log:
-            proc = subprocess.Popen(
-                [
-                    CHROME,
-                    "--headless=new",
-                    f"--user-data-dir={profile}",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--disable-extensions",
-                    "--disable-background-timer-throttling",
-                    "--disable-renderer-backgrounding",
-                    # A test page plays its voice without a click (test mode's `live`).
-                    "--autoplay-policy=no-user-gesture-required",
-                    # Timestamp queries at full resolution, not quantized to 100 µs.
-                    "--enable-webgpu-developer-features",
-                    "--enable-logging=stderr",
-                    "--v=0",
-                    "--window-size=1920,1080",
-                    *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
-                    url,
-                ],
-                stdin=subprocess.DEVNULL,
-                stdout=log,
-                stderr=log,
-                pass_fds=locks,
-                start_new_session=True,
-            )
+        shared = os.environ.get("WRELA_TEST_CHROME")
+        if shared:
+            from chrome_session import request
+            tab = request(shared, "start", {"url": url})
+            chrome_log, offset = tab["log"], tab["offset"]
+        else:
+            adopt_chrome_children()
+            with open(chrome_log, "wb") as log:
+                proc = subprocess.Popen(
+                    [
+                        CHROME,
+                        "--headless=new",
+                        f"--user-data-dir={profile}",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-extensions",
+                        "--disable-background-timer-throttling",
+                        "--disable-renderer-backgrounding",
+                        # A test page plays its voice without a click (test mode's `live`).
+                        "--autoplay-policy=no-user-gesture-required",
+                        # Timestamp queries at full resolution, not quantized to 100 µs.
+                        "--enable-webgpu-developer-features",
+                        "--enable-logging=stderr",
+                        "--v=0",
+                        "--window-size=1920,1080",
+                        *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
+                        url,
+                    ],
+                    stdin=subprocess.DEVNULL,
+                    stdout=log,
+                    stderr=log,
+                    pass_fds=locks,
+                    start_new_session=True,
+                )
         while True:
             if server is None and not done and os.path.exists(done_file):
                 with open(done_file, errors="replace") as f:
@@ -316,22 +326,28 @@ def main(argv):
             if done:
                 status, reason = (0, None) if done[0] == "ok" else (1, f"page failed: {done[0]}")
                 break
-            if proc.poll() is not None:
-                reason = f"chrome exited early (status {proc.returncode})"
+            if (shared and not request(shared, "alive", {})["alive"]) or (proc is not None and proc.poll() is not None):
+                reason = "chrome exited early" if shared else f"chrome exited early (status {proc.returncode})"
                 break
             if time.monotonic() - start >= timeout:
                 reason = f"timed out after {timeout:.0f}s"
                 break
+            extract_console(chrome_log, os.path.join(results, "console.log"), offset)
             time.sleep(0.1)
     except KeyboardInterrupt:
         status, reason = 1, "interrupted"
     finally:
+        if tab is not None:
+            try:
+                request(shared, "close", {"target": tab["target"]})
+            except Exception as error:
+                status, reason = 1, f"could not close the browser test tab: {error}"
         if proc is not None:
             stop(proc)
         if server is not None:
             server.shutdown()
             server.server_close()
-        lines = extract_console(chrome_log, os.path.join(results, "console.log"))
+        lines = extract_console(chrome_log, os.path.join(results, "console.log"), offset)
         shutil.rmtree(profile, ignore_errors=True)
         for fd in locks:
             os.close(fd)

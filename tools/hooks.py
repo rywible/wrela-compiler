@@ -3,8 +3,7 @@ CLAUDE.md that agents skipped into a check, or gives back what an agent loses to
 
     python3 tools/hooks.py bash      before each Bash command (PreToolUse). Refuses waiting in
                                      the foreground on a loop of `sleep`, and a `cargo test` that
-                                     takes the GPU alone; formats what the gate checks before the
-                                     gate runs (`tools/check.sh --fmt`).
+                                     bypasses the shared job queue.
     python3 tools/hooks.py session   at a session's start (SessionStart): names TASKS.md,
                                      the open work, and after a compaction gives its text.
                                      On a cloud machine, also makes it a dev machine (cloud).
@@ -56,7 +55,7 @@ POLL_REASON = (
     "for a line in a log, use Monitor. (tools/hooks.py; CLAUDE.md, Checks)"
 )
 CARGO_TEST_REASON = (
-    "Use tools/check.sh <name> --nocapture for tests (add --long for a long test). "
+    "Use tools/check.sh <name> for one test, or tools/check.sh for the suite. "
     "Wrap other costly commands with python3 tools/jobs.py run build -- <command>; "
     "use run measure for timing evidence. This admits one costly job across sessions and "
     "shares the build cache. Raw Cargo commands bypass that budget. (tools/hooks.py; CLAUDE.md, Checks)"
@@ -86,49 +85,9 @@ def polls(command, background):
     return bool(POLL.search(command) or (nap and int(nap.group(1)) >= 5))
 
 
-def measures(root):
-    """The names of the tests whose `#[ignore]` reason starts `measure:` (tools/ignored.py), each
-    as its function's name."""
-    tools = os.path.join(root, "tools")
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    import ignored
-
-    return {name.rsplit("::", 1)[-1] for kind, name in ignored.ignored(root) if kind == "measure"}
-
-
 def takes_the_gpu_alone(command, root):
-    """Whether a command runs tests with cargo that check.sh should run instead."""
-    if not CARGO_TEST.search(command) or CARGO_TEST_OK.search(command):
-        return False
-    return not measures(root) & set(re.findall(r"\w+", command))
-
-
-def runs_gate(command):
-    """Whether a command runs the gate: check.sh with no filter (--long and --full run it too)."""
-    for m in CHECK.finditer(command):
-        words = []
-        for arg in m.group(1).split():
-            if arg[0] in "<>" or re.match(r"\d?&?>", arg):
-                break
-            words.append(arg)
-        if "--fmt" not in words and all(w.startswith("-") and not w.startswith("--package=") for w in words):
-            return True
-    return False
-
-
-def format_for_gate(root):
-    """Formats what the gate checks; returns the files it changed, relative to the checkout."""
-    out = subprocess.run(
-        [os.path.join(root, "tools", "check.sh"), "--fmt"],
-        cwd=root, capture_output=True, text=True, timeout=110,
-    )
-    files = []
-    for line in out.stdout.splitlines():
-        line = line.strip()
-        if line:
-            files.append(os.path.relpath(line, root) if os.path.isabs(line) else line)
-    return files
+    """Raw test runs bypass the one check and the shared job queue."""
+    return bool(CARGO_TEST.search(command) and not CARGO_TEST_OK.search(command))
 
 
 def bash(event):
@@ -136,25 +95,8 @@ def bash(event):
     command = code(tool_input.get("command") or "")
     if polls(command, tool_input.get("run_in_background")):
         return refuse(POLL_REASON)
-    root = None
     if COSTLY.search(command):
         return refuse(CARGO_TEST_REASON)
-    if CARGO_TEST.search(command):
-        root = repo(event)
-        if takes_the_gpu_alone(command, root):
-            return refuse(CARGO_TEST_REASON)
-    if runs_gate(command):
-        files = format_for_gate(root or repo(event))
-        if files:
-            said = ", ".join(files)
-            print(json.dumps({
-                "systemMessage": f"Formatted before the gate: {said}",
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "additionalContext": f"tools/hooks.py formatted these files before the gate "
-                                         f"ran (read them again before you edit them): {said}",
-                },
-            }))
     return 0
 
 
@@ -170,7 +112,7 @@ def shared_folder():
 # What a session on a cloud machine is told.
 CLOUD = """This is a Claude Code cloud machine: 4 cores, no GPU. Its GPU is the CPU (Mesa's lavapipe, \
 patched and built by tools/cloud.sh): a floor frame at 1080p takes about 0.6 s, a lookbook still \
-(`tools/lookbook.py <out> --stills <n>`, 301 frames) about 3 minutes, the gate about 20 minutes. \
+(`tools/lookbook.py <out> --stills <n>`, 301 frames) about 3 minutes, checks execute real shaders; cold builds and software rendering take longer. \
 Headless Chrome runs WebGPU on SwiftShader, many times slower again: prefer the native host's \
 stills. {warm}"""
 
@@ -193,12 +135,6 @@ def cloud(root, source):
         with open(path, "a", encoding="utf-8") as f:
             for key, value in env.items():
                 f.write(f"export {key}={shlex.quote(value)}\n")
-    # The gate's memory: what the project's other machines learned comes to this one's copy.
-    try:
-        subprocess.run([sys.executable, os.path.join(root, "tools", "memo.py"), "pull"], cwd=root,
-                       env={**os.environ, **env}, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
     provisioned = subprocess.run([script, "--check"]).returncode == 0
     if source != "startup" and provisioned:
         return CLOUD.format(warm="")
@@ -206,7 +142,7 @@ def cloud(root, source):
                      env={**os.environ, **env},
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
-    warm = ("The CLI, the native host, the floor's bake and the tests are building in the "
+    warm = ("The CLI, the native host and the tests are building in the "
             "background (`tools/cloud.sh --warm`, log /tmp/wrela-warm.log): a cargo command waits "
             "for its lock meanwhile.")
     if not provisioned:

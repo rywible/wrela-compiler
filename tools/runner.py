@@ -1,11 +1,8 @@
-"""How the gate runs one of its test programs: tools/check.sh's runner and tools/memo.py's quick
-runs both start each program this way, so the two can't drift.
+"""Run test programs with isolated scratch, bounded threads and shared compiled artifacts.
 
-A program runs as cargo runs it (in its package's directory), from a link to its executable in a
-scratch directory of its own (`target/test-scratch-*`, its tests' WRELA_TEST_TMPDIR), with up to
-two test threads, its GPU tests sharing the GPU, and its compiled code kept across runs. The
-end-to-end suite (compiler/tests) is the longest program, so the gate's time: it starts first, and
-the others yield to it (`nice`: with all at one priority, it took half as long again as alone)."""
+Each Rust executable is hard-linked into its own scratch directory, so another checkout's
+build cannot replace the program while it is spawning workers. Test results are never cached.
+"""
 
 import errno
 import os
@@ -27,14 +24,14 @@ def _tool_test(test_id, directory):
     with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
         suite = unittest.defaultTestLoader.loadTestsFromName(test_id)
         result = unittest.TextTestRunner(stream=output, verbosity=0).run(suite)
-    return result.wasSuccessful(), output.getvalue()
+    return result.wasSuccessful() and result.testsRun == 1 and not result.skipped, output.getvalue()
 
 
 def tools_tests(directory="tools/tests"):
     """Run the tools' tests with bounded processes and import each module once per worker.
 
     Each test still runs its setup and cleanup, and different tests never share a worker at the
-    same time. Reusing workers avoids paying Python startup and the memo's AST scan per test.
+    same time. Reusing workers avoids paying Python startup per test.
     """
     from concurrent.futures import ProcessPoolExecutor
     import unittest

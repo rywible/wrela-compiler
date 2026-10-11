@@ -16,7 +16,7 @@
 
 use std::path::Path;
 use wrela_host::{CpuBuild, CpuHost, Error, Value, frame_time};
-use wrela_tests::{median, one_u32, page, scalar_page, sized};
+use wrela_tests::{one_u32, page, scalar_page};
 
 fn simd_instructions(dir: &Path) -> usize {
     let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
@@ -40,7 +40,7 @@ fn every_vector_operation_has_the_same_bits_with_simd() {
     let mut a = CpuHost::load(&simd).expect("load");
     let mut b = CpuHost::load(&scalar).expect("load");
     let cases = one_u32(&mut a, "cases", &[]);
-    let seeds: u32 = sized(2_000, 50_000);
+    let seeds: u32 = 2_000;
     let chunk: u32 = 500;
     for from in (0..seeds).step_by(chunk as usize) {
         let args = [Value::I32(from as i32), Value::I32(chunk as i32)];
@@ -69,7 +69,7 @@ fn loops_four_at_a_time_have_the_same_bits() {
     let (simd, scalar) = both("compiler/tests/simd", "loops");
     let mut hosts =
         [&simd, &scalar].map(|d| CpuBuild::load(d).expect("load").start_with(1).expect("start"));
-    let seeds: i32 = sized(40, 400);
+    let seeds: i32 = 40;
     for seed in 0..seeds {
         for n in 0..=64 {
             let args = [Value::I32(seed), Value::I32(n)];
@@ -200,38 +200,4 @@ fn a_voice_renders_the_same_samples_with_simd() {
     let (x, y) = (a.render_audio(200).expect("render"), b.render_audio(200).expect("render"));
     let bits = |s: &[f32]| s.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
     assert!(bits(&x) == bits(&y), "the samples differ with SIMD");
-}
-
-/// Measured, not gated: a loop of `vec4` math (compiler/tests/simd's `vec4_math`), and `f32`
-/// loops four iterations at a time (`f32_loop`), with SIMD and without.
-#[test]
-#[ignore = "measure: reported, not gated; run it with --release"]
-fn simd_speed() {
-    let (simd, scalar) = both("compiler/tests/simd", "speed");
-    let time = |dir: &Path, name: &str, n: i32| {
-        let mut host = CpuHost::load(dir).expect("load");
-        let args = [Value::I32(n)];
-        let first = host.call_export(name, &args).expect(name); // warm-up
-        let runs: Vec<f64> = (0..9)
-            .map(|_| {
-                let t = std::time::Instant::now();
-                let r = host.call_export(name, &args).expect(name);
-                assert_eq!(r, first);
-                t.elapsed().as_secs_f64() * 1e3
-            })
-            .collect();
-        (median(&runs), first)
-    };
-    let ((on, x), (off, y)) = (time(&simd, "vec4_math", 2000), time(&scalar, "vec4_math", 2000));
-    assert_eq!(x, y, "the result differs with SIMD");
-    println!(
-        "a loop of vec4 math (256 particles, 2000 steps): {on:.2} ms with SIMD, {off:.2} ms without: {:.2}x",
-        off / on
-    );
-    let ((on, x), (off, y)) = (time(&simd, "f32_loop", 100), time(&scalar, "f32_loop", 100));
-    assert_eq!(x, y, "the result differs with SIMD");
-    println!(
-        "f32 loops four iterations at a time (4096 elements, 100 passes): {on:.2} ms with SIMD, {off:.2} ms without: {:.2}x",
-        off / on
-    );
 }

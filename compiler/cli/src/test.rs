@@ -1,5 +1,7 @@
 //! `wrela test <package-dir> [<filter>] [--bless] [--json]`: runs the package's `@test`
-//! functions (language.md §10), or those whose names contain `filter`. Each runs as a debug
+//! functions (language.md §10), or those whose names contain `filter`. `--exact` chooses
+//! exactly one name, rejecting missing or ambiguous names before any tests run. `--std`
+//! chooses std's tests with an empty program package. Each runs as a debug
 //! build's constants are computed, on memory of its own; a test passes unless it panics, and a
 //! GPU frame test with a golden unless its screen is too far from it. `--bless` writes each
 //! golden from this machine's screen first. Exit status 1 if a test failed or the package has
@@ -23,13 +25,34 @@ pub fn run(args: &[String]) -> ExitCode {
         })
     };
     let bless = rest.iter().any(|a| *a == "--bless");
-    let rest: Vec<String> = rest.into_iter().filter(|a| *a != "--bless").cloned().collect();
+    let exact = rest.iter().any(|a| *a == "--exact");
+    let standard_library = rest.iter().any(|a| *a == "--std");
+    if (exact && (filter.is_empty() || bless)) || (standard_library && bless) {
+        eprintln!("error: --exact needs a test name and cannot bless; --std cannot bless");
+        return ExitCode::from(1);
+    }
+    let rest: Vec<String> = rest
+        .into_iter()
+        .filter(|a| !matches!(a.as_str(), "--bless" | "--exact" | "--std"))
+        .cloned()
+        .collect();
     let args = match crate::package_args(&rest, false) {
         Ok(a) => a,
         Err(status) => return status,
     };
     let filter = filter.first().map(|f| f.as_str());
-    let out = if bless {
+    let out = if exact {
+        let name = filter.expect("--exact needs a name");
+        match wrela_driver::test_exact(&args.dir, name, standard_library) {
+            Ok(out) => out,
+            Err(count) => {
+                eprintln!("error: exact test `{name}` has {count} matches; expected one");
+                return ExitCode::from(1);
+            }
+        }
+    } else if standard_library {
+        wrela_driver::test_std(&args.dir, filter)
+    } else if bless {
         wrela_driver::test_blessing(&args.dir, filter)
     } else {
         wrela_driver::test(&args.dir, filter)

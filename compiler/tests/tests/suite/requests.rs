@@ -46,7 +46,7 @@ fn requests_are_answered_on_later_frames() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_gives_the_same_answers() {
     let (dir, rel) = page("compiler/tests/requests", "requests-browser");
     with_level(&dir);
@@ -212,7 +212,7 @@ fn a_command_over_the_buffer_is_split_or_named() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome and a GPU"]
+#[ignore = "needs the runtime"]
 fn chrome_splits_or_names_a_command_over_the_buffer() {
     let (_, rel) = page("compiler/tests/large-commands", "large-commands-chrome");
     let failure = wrela_tests::chrome_failure(&rel, wrela_tests::ChromeRun::new(4, 4, 4, 60.0));
@@ -262,7 +262,7 @@ fn shipped_files_are_beside_the_program_and_fetched() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn chrome_fetches_shipped_files_alike() {
     let (dir, rel) = page("compiler/tests/shipped", "shipped-browser");
     let browser = run_in_chrome(&rel, SHIPPED_FRAMES, 16, 16, 60.0);

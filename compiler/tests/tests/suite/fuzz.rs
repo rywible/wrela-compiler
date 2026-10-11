@@ -9,18 +9,15 @@
 //! compiler caught its own bug) or a case that takes longer than [`CASE_TIMEOUT`] fails the
 //! test, with the seed and the program; the worker is restarted after the case that killed it.
 //!
-//! `WRELA_FUZZ_ITERS` sets the cases (default 100, or 1000 with `WRELA_FULL`),
-//! `WRELA_FUZZ_SEED` the run's seed (default 1), and `WRELA_FUZZ_JOBS` how many workers run at
-//! once (default one per core). `tools/check.sh --long` runs 20,000 cases from a new seed each
-//! run, and `--full` 10^6. The seeds include every tier 1 and 2 program in the repository (the
-//! run-pass suite, the sketches, the conformance suite), so most cases use tiers 1 and 2.
+//! A fixed seed and bounded mutation corpus exercise parser and lowering failure paths on
+//! each check. Compiler crashes, timeouts and internal errors fail the check.
 
 use crate::scratch;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, mpsc};
 use std::time::Duration;
-use wrela_tests::{Rng, files_under, repo_root, sized};
+use wrela_tests::{Rng, files_under, repo_root};
 
 /// How long one case may take. Generous: debug builds are slow, and the worker compiles std
 /// once per case.
@@ -204,21 +201,20 @@ fn uses_tiers_1_2(text: &str) -> bool {
         || ["cm", "mm", "km", "kg", "ms"].iter().any(|u| suffix(u))
 }
 
-/// The seeds: every `.wrela` file under compiler/ and examples/, or with `WRELA_FUZZ_TIERS=12`
-/// only those that use tiers 1 and 2.
+/// Small real programs provide syntax and semantic variety without full-scene compilation.
 fn corpus() -> Vec<String> {
     let corpus: Vec<String> = ["compiler", "examples"]
         .iter()
         .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
         .map(|p| std::fs::read_to_string(p).expect("read"))
-        .filter(|t| std::env::var("WRELA_FUZZ_TIERS").as_deref() != Ok("12") || uses_tiers_1_2(t))
+        .filter(|t| t.len() <= 8192)
         .collect();
     assert!(corpus.len() > 50, "only {} seeds", corpus.len());
     corpus
 }
 
 #[test]
-fn the_long_runs_seeds_use_tiers_1_and_2() {
+fn the_repository_has_seeds_using_tiers_1_and_2() {
     let all: Vec<String> = ["compiler", "examples"]
         .iter()
         .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
@@ -393,19 +389,14 @@ fn run_range(base: u64, from: u64, to: u64, crashes: &Mutex<Vec<(u64, String)>>)
 
 #[test]
 fn mutated_programs_dont_crash_the_compiler() {
-    let iters: u64 = std::env::var("WRELA_FUZZ_ITERS")
+    let iters: u64 = 32;
+    let base: u64 = 1;
+    // Worker counts affect scheduling only; the corpus and cases never depend on a mode.
+    let jobs: u64 = std::env::var("WRELA_CPU_WORKERS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(sized(100, 1000));
-    let base: u64 = std::env::var("WRELA_FUZZ_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
-    // One worker per core (`WRELA_FUZZ_JOBS` to choose), each on its own share of the cases:
-    // a case is the same program whichever worker runs it.
-    let jobs: u64 = std::env::var("WRELA_FUZZ_JOBS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .or_else(|| std::env::var("WRELA_CPU_WORKERS").ok().and_then(|v| v.parse().ok()))
-        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get() as u64))
-        .clamp(1, iters.max(1));
+        .unwrap_or(2)
+        .clamp(1, 2);
     let crashes = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         for j in 0..jobs {

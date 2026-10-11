@@ -21,9 +21,10 @@ wrela-grammar.workspace = true
 wrela-host.workspace = true
 wrela-abi.workspace = true
 serde_json.workspace = true
-# The hash of a build's files, for the gate's memory of slow tests (tools/memo.py).
-sha2 = "0.10"
 wasmtime.workspace = true
+# Re-encode a tiny test program with a small heap to force the allocator's real failure path.
+wasm-encoder = { version = "0.261", features = ["wasmparser"] }
+wasmparser = "0.261"
 # The reference rasterizer the ui package's text is compared with (AC2).
 ab_glyph = "0.2"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }

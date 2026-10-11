@@ -100,59 +100,26 @@ fn the_tower_is_saved_over_a_reload() {
     let r = report(&mut host);
     assert_eq!([r[0], r[2]], [32.0, SECOND_GONE], "at the last door, the world freed");
 }
-
-/// The door's time, from the frame the player goes through to the next build's first frame
-/// drawn: the stair's last frame, the hand-over and the new build's first frame. `ready`: the
-/// build was got ready on the stair first, as the stair does while the player climbs; else the
-/// hand-over gets it ready itself (the player went through before it was).
-fn door_time(stair: &std::path::Path, world: u32, ready: bool) -> Duration {
-    // A new tower each time: no save from the last.
-    let _ = std::fs::remove_dir_all(stair.join("storage"));
-    let mut host = Host::load(stair).expect("load");
-    if world == 1 {
-        host.call_export("test_decide", &[Value::I32(0), Value::I32(1)]).expect("decide");
-    }
-    host.call_export("climb", &[Value::F32(16.0 * (world + 1) as f32)]).expect("climb");
-    if ready {
-        let end = Instant::now() + Duration::from_secs(600);
-        while report(&mut host)[3] != 1.0 && Instant::now() < end {
-            frames(&mut host, 1);
-        }
-        assert_eq!(report(&mut host)[3], 1.0, "the build got ready");
-    }
-    host.call_export("go_in", &[]).expect("go_in");
-    let start = Instant::now();
-    frames(&mut host, 2);
-    let took = start.elapsed();
-    assert_ne!(running(&host), "stair", "the hand-over was made");
-    took
-}
-
-/// The door's time to each world on the native host, got ready first and not: the Last Green
-/// (behind the first door) and the test floor (behind the second). Printed, not gated.
+/// The first floor's real gate/door declarations and exit operation, on the small test floor.
+/// This exercises the stair's first landing and round trip without baking the floor's world.
 #[test]
-#[ignore = "measure: needs a GPU, and builds the Last Green (its bake, when its cache is cold)"]
-fn the_doors_time_with_and_without_getting_ready() {
-    let name = "tower-door";
-    wrela_tests::page("examples/last-green", &format!("{name}/last-green"));
-    let stair = tower(name);
-    for (world, what) in [(1, "the test floor"), (0, "the Last Green")] {
-        for ready in [true, false] {
-            let took = door_time(&stair, world, ready);
-            let how = if ready { "got ready first" } else { "not got ready" };
-            println!("door to {what}, {how}: {:.0} ms", took.as_secs_f64() * 1000.0);
-        }
-    }
-}
-
-/// The Last Green behind the first door, and back: the player goes in from the stair, goes back
-/// through the floor's door (behind the gate, where they came in), and stands at the first door
-/// again. The floor's door is where it says and nowhere else.
-#[test]
-#[ignore = "heavy: needs a GPU; minutes on a software GPU"]
-fn the_player_goes_into_the_last_green_and_back_down() {
-    wrela_tests::page("examples/last-green", "last-green-tour/last-green");
-    let dir = wrela_tests::page("examples/stair", "last-green-tour/stair").0;
+#[ignore = "needs the runtime"]
+fn the_first_floor_door_returns_to_its_stair_landing() {
+    let root = wrela_tests::repo_root();
+    let floor = std::fs::read_to_string(root.join("examples/last-green/main.wrela")).unwrap();
+    let world = std::fs::read_to_string(root.join("examples/last-green/world.wrela")).unwrap();
+    let gate = world.lines().find(|l| l.starts_with("pub const GATE =")).unwrap();
+    let door = floor.lines().find(|l| l.starts_with("const DOOR =")).unwrap();
+    let leave = floor.split("pub fn test_leave(").nth(1).unwrap().split_once("\n}").unwrap().0;
+    let source = std::fs::read_to_string(root.join("examples/test-floor/main.wrela"))
+        .unwrap()
+        .replace("const WORLD: u32 = 1", "const WORLD: u32 = 0")
+        .replace("const DOOR = Doorway { at: vec2(0.0, 0.6), reach: 1.2 }", door);
+    let source = format!("{gate}\n{source}\n@testing\npub fn test_leave({leave}\n}}\n");
+    let package = super::engine_package("first-floor-source", "first_floor", &source);
+    let output = wrela_tests::page_scratch_root().join("first-floor-tour/last-green");
+    wrela_tests::must_build(&package, &output);
+    let dir = wrela_tests::page("examples/stair", "first-floor-tour/stair").0;
     let mut host = Host::load(dir).expect("load");
     frames(&mut host, 2);
     host.call_export("climb", &[Value::F32(16.0)]).expect("climb");

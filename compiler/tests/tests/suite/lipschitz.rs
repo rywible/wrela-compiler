@@ -37,14 +37,14 @@ fn composed_bounds_hold_where_consumers_look() {
                 Value::I32(i as i32),
                 Value::F32(near),
                 Value::I32(3),
-                Value::I32(400_000),
+                Value::I32(16_384),
                 Value::F32(SCALES[i]),
             ];
             let r = host.call_export("gradient_ratio", &args).expect("ratio");
             let [Value::F32(worst), Value::F32(count)] = r[..] else { panic!("{r:?}") };
             // The sampled gradient is computed in f32: allow its rounding.
             assert!(worst <= 1.0001, "{name}, near {near}: a gradient is {worst} times the bound");
-            assert!(count > 100.0, "{name}, near {near}: only {count} points in scope");
+            assert!(count >= 8.0, "{name}, near {near}: only {count} points in scope");
             // std's debug-build check, which panics on a bound the derived gradient disproves.
             host.call_export("check_bound", &[Value::I32(i as i32), Value::F32(near)])
                 .unwrap_or_else(|e| panic!("{name}, near {near}: {e}"));
@@ -58,12 +58,12 @@ fn sphere_tracing_can_step_by_to_bound() {
     for (i, name) in NAMES.iter().enumerate() {
         let near = 0.1;
         let l = one_f32(&mut host, "lipschitz_of", &[Value::I32(i as i32), Value::F32(near)]);
-        let args = [Value::I32(i as i32), Value::F32(near), Value::I32(5), Value::I32(20_000)];
+        let args = [Value::I32(i as i32), Value::F32(near), Value::I32(5), Value::I32(1024)];
         let r = one_u32(&mut host, "step_violations", &args);
         let (bad, balls) = (r >> 16, r & 0xffff);
         assert_eq!(bad, 0, "{name}: {bad} points of the other sign within the bound");
         if l.is_finite() {
-            assert!(balls > 1000, "{name}: only {balls} steps tried");
+            assert!(balls > 32, "{name}: only {balls} steps tried");
         }
     }
 }

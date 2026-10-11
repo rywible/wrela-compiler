@@ -148,7 +148,7 @@ pub fn drawn(state: Game) -> vec2 {
 
 /// Sketch 01 §4: the physique is computed by `@deterministic` code from the field. The mass is
 /// the grazer's volume times its tissue's density (hide 1050 kg/m³, hooves 1300): about a
-/// tonne, a bison's. The 1 cm integration and capsule fit take seconds (two octrees, each about
+/// tonne, a bison's. The bounded 2 cm integration and capsule fit take seconds (two octrees, each about
 /// 60,000 derived intervals of the 20-part creature): far over a spawn's budget, which `wrela
 /// test` shows as the phase's time. The sketch estimated 100,000 cells and left the
 /// measurement to the D-067 spike.

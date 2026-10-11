@@ -92,28 +92,17 @@ class RoundSummaryTest(unittest.TestCase):
 
 class WgslBudgetTest(unittest.TestCase):
     def run_budgets(self, shaders):
-        script = os.path.join(TOOLS, "wgsl_budgets.py")
-
+        import subprocess
+        import wgsl_budgets
         def build(args, **kwargs):
             built = pathlib.Path(args[args.index("-o") + 1])
             built.mkdir(parents=True)
             (built / "pipeline_0.wgsl").write_bytes(shaders[args[2]])
-
-        with tempfile.TemporaryDirectory() as tmp:
-            for package in shaders:
-                source = pathlib.Path(tmp, package, "main.wrela")
-                source.parent.mkdir(parents=True)
-                source.write_text("")
-            previous = os.getcwd()
-            try:
-                os.chdir(tmp)
-                with mock.patch.object(sys, "argv", [script, "fake-wrela"]), \
-                     mock.patch.object(subjects, "SUBJECTS", ()), \
-                     mock.patch("subprocess.run", side_effect=build), \
-                     contextlib.redirect_stdout(io.StringIO()):
-                    runpy.run_path(script, run_name="__main__")
-            finally:
-                os.chdir(previous)
+            return subprocess.CompletedProcess(args, 0, "", "")
+        with mock.patch.object(wgsl_budgets, "PACKAGES", tuple(shaders)), \
+                mock.patch("subprocess.run", side_effect=build), \
+                contextlib.redirect_stdout(io.StringIO()):
+            wgsl_budgets.main("fake-wrela")
 
     def test_only_compressed_budgets_compress_successful_shaders(self):
         original = gzip.compress
@@ -129,7 +118,7 @@ class WgslBudgetTest(unittest.TestCase):
             with self.subTest(package=package), self.assertRaises(SystemExit) as error:
                 self.run_budgets({package: shader})
             self.assertIn(package + "/pipeline_0.wgsl", str(error.exception))
-            self.assertIn("gzipped), over its size budget", str(error.exception))
+            self.assertIn("bytes over", str(error.exception))
 
 
 if __name__ == "__main__":

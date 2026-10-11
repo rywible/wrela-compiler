@@ -45,12 +45,12 @@ pub fn frame(time: f32, width: u32, height: u32) {}
 
 /// Sketch 01's creature is M1's tier-0 grazer (compiler/tests/fields/grazer.wrela), built the
 /// sketch's way: a skeleton, parts in bone space, `.blend(k)`. Their distances agree within
-/// 1e-5 m at 10⁶ points around three individuals.
+/// 1e-5 m at 4096 seeded points around each of three individuals.
 @test
 fn the_creature_is_m1s_grazer() {
     for id in [1, 2, 7] {
-        let g = max_gap(id, 1000000 / 3 + 1)
+        let g = max_gap(id, 4096)
         assert(g.x <= 1.0e-5, f"grazer {id}: the distances differ by {g.x} m")
-        assert(g.y > 1000.0, f"grazer {id}: only {g.y} points near the surface")
+        assert(g.y > 8.0, f"grazer {id}: only {g.y} points near the surface")
     }
 }

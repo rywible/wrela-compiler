@@ -21,7 +21,6 @@ const TYPE_SUFFIXES: &[&str] =
     &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"];
 
 pub fn lex(file: FileId, text: &str) -> Lexed {
-    crate::recorded::lexing();
     let mut lx = Lexer {
         file,
         src: text.as_bytes(),

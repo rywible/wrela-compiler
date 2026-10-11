@@ -73,20 +73,17 @@ class Processes(unittest.TestCase):
 
 
 class QueueTests(Processes):
-    def test_long_tier_preserves_fresh_gate_and_every_stage_with_separate_admissions(self):
-        calls = []
-        def record(kind, command, **kwargs):
-            calls.append((kind, command, kwargs))
-            return 0
-        with patch.object(jobs, "run", side_effect=record), patch.object(jobs, "fingerprint", return_value={}), \
-                patch("ignored.ignored", return_value=[("long", "a"), ("heavy", "b"), ("measure", "c")]), \
-                patch.dict(os.environ, {"WRELA_SOFTWARE_GPU": "1"}):
-            self.assertEqual(jobs.check(["--long"]), 0)
-        self.assertEqual([kind for kind, _, _ in calls], ["gate", *["long"] * 6])
-        self.assertIn("--fresh", calls[0][1])
-        self.assertEqual([command[-1] for _, command, _ in calls[1:3]], ["a", "b"])
-        self.assertEqual([command[-2] for _, command, _ in calls[3:]], ["differential", "gbnf", "baked", "fuzz"])
-        self.assertTrue(all(options["verify"] for _, _, options in calls))
+    def test_check_uses_one_verified_admission_and_rejects_modes(self):
+        with patch.object(jobs, "run", return_value=0) as run:
+            self.assertEqual(jobs.check([]), 0)
+            self.assertEqual(run.call_args.args[0], "gate")
+            self.assertTrue(run.call_args.kwargs["verify"])
+            self.assertEqual(jobs.check(["renderer::agreement"]), 0)
+            self.assertEqual(run.call_args.args[0], "focused")
+            self.assertEqual(run.call_args.args[1][-1], "renderer::agreement")
+            for args in (["--long"], ["--full"], ["--fresh"], ["a", "b"]):
+                with self.assertRaises(ValueError): jobs.check(args)
+            self.assertEqual(run.call_count, 2)
 
     def test_ten_sessions_use_one_job_and_inherit_worker_limits(self):
         first = self.holding()

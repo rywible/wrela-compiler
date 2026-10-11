@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 use wrela_host::{CpuHost, Host, Value, frame_time, image};
-use wrela_tests::{one_f32, one_u32, repo_root, sized};
+use wrela_tests::{one_f32, one_u32, repo_root};
 
 fn package() -> PathBuf {
     repo_root().join("compiler/tests/lift")
@@ -29,15 +29,7 @@ fn built(name: &str, lift: bool) -> PathBuf {
 /// mode if `debug`, into a scratch directory `name`.
 pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> PathBuf {
     let dir = super::scratch(name);
-    // The `wrela build` that makes the same files.
-    let mut args: Vec<&str> = lift.iter().flat_map(|p| ["--lift", *p]).collect();
-    if lift.is_empty() {
-        args.push("--testing");
-    }
-    if debug {
-        args.push("--debug");
-    }
-    let out = wrela_tests::recorded_build(pkg, Some(&args), || {
+    let out = {
         if !lift.is_empty() {
             let names: Vec<String> = lift.iter().map(|s| s.to_string()).collect();
             let kind = wrela_driver::BuildKind { debug, testing: false };
@@ -46,7 +38,7 @@ pub(crate) fn build_into(name: &str, pkg: &Path, lift: &[&str], debug: bool) -> 
             // A test build: with the program's `@testing` exports.
             wrela_driver::build_for_tests(pkg, debug)
         }
-    });
+    };
     assert!(
         !out.has_errors(),
         "{}",
@@ -129,7 +121,7 @@ fn a_lifted_build_computes_what_the_normal_build_does() {
     assert_eq!(one_u32(&mut normal, "literals", &[]), 0);
     let n = one_u32(&mut lifted, "literals", &[]);
     assert!(n > 60, "{n} literals");
-    let points = sized(256, 4096);
+    let points = 256;
     for i in 0..points {
         let p = sample(&mut normal, i);
         assert_eq!(p, sample(&mut lifted, i), "the sample points");

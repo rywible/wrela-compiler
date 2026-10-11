@@ -23,7 +23,7 @@ fn answer(pkg: &Path, args: &[&str]) -> serde_json::Value {
 }
 
 #[test]
-#[ignore = "long: builds and runs a small lens on the CPU"]
+#[ignore = "needs the runtime"]
 fn literals_answer_without_a_gpu_or_rendered_frame() {
     let pkg = package("studio-cpu-literals");
     let missing_driver = pkg.join("no-vulkan-driver.json");
@@ -53,7 +53,7 @@ fn literals_answer_without_a_gpu_or_rendered_frame() {
 }
 
 #[test]
-#[ignore = "long: builds a small lens and runs its CPU queries"]
+#[ignore = "needs the runtime"]
 fn synchronous_answers_need_no_gpu_or_rendered_frame() {
     let pkg = package("studio-cpu-queries");
     let missing_driver = pkg.join("no-vulkan-driver.json");
@@ -114,7 +114,7 @@ fn artifacts(page: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 #[test]
-#[ignore = "long: compares a small lens's browser and native builds"]
+#[ignore = "needs the runtime"]
 fn artifacts_only_matches_the_regular_build_without_native_compilation() {
     let pkg = package("studio-artifacts");
     common::stdout(
@@ -170,7 +170,7 @@ fn invalid_actions_are_rejected_before_building() {
 }
 
 #[test]
-#[ignore = "long: compares metadata with and without a rendered lens, needs a GPU"]
+#[ignore = "needs the runtime"]
 fn literals_with_a_png_keeps_the_same_answer_and_draws() {
     let pkg = package("studio-literals-png");
     let metadata = answer(&pkg, &["literals"]);

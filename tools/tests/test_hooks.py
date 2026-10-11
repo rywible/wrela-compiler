@@ -77,11 +77,6 @@ class CargoTestTest(Checkout, unittest.TestCase):
             self.assertIn("tools/jobs.py", out.stderr)
         out = run("bash", {"cwd": self.root, "tool_input": {"command": "python3 tools/jobs.py run build -- cargo build --release"}})
         self.assertEqual(out.returncode, 0, out.stderr)
-    def setUp(self):
-        super().setUp()
-        self.write("compiler/tests/tests/suite/herd.rs", '#[test]\n#[ignore = "measure: alone"]\n'
-                   "fn the_herd_keeps_its_frames() {}\n")
-
     def test_a_test_run_with_cargo_is_refused(self):
         for command in [
             "cargo test --release -p wrela-tests --test suite clearing::no_field 2>&1 | tail",
@@ -91,16 +86,15 @@ class CargoTestTest(Checkout, unittest.TestCase):
         ]:
             self.assertTrue(hooks.takes_the_gpu_alone(command, self.root), command)
 
-    def test_measurements_and_runs_check_sh_cant_make_go_through(self):
+    def test_compile_only_and_non_test_cargo_commands_go_through(self):
         for command in [
-            "cargo test --release --workspace -- --ignored --exact herd::the_herd_keeps_its_frames",
-            "WRELA_GPU_SHARED=1 cargo test --release -p wrela-tests --test suite clearing::x",
+                        "WRELA_GPU_SHARED=1 cargo test --release -p wrela-tests --test suite clearing::x",
             "WRELA_BLESS=1 cargo test -q --release -p wrela-tests --test suite diagnostics::",
             "WRELA_RUN_ONLY=jobs cargo test -q --release -p wrela-tests --test suite -- run_pass",
             "cargo test -q --release --workspace --no-run --message-format=json > t.json",
             "cargo test -q --release --workspace --doc",
             'grep -rn "cargo test" tools/check.sh',
-            "tools/check.sh clearing:: --nocapture",
+            "tools/check.sh clearing::the_walks_own_tests_pass",
         ]:
             self.assertFalse(hooks.takes_the_gpu_alone(command, self.root), command)
 
@@ -124,54 +118,16 @@ class CargoTestTest(Checkout, unittest.TestCase):
         out = run("bash", {"cwd": self.root,
                            "tool_input": {"command": "cargo test -p wrela-tests clearing::x"}})
         self.assertEqual(out.returncode, 2)
-        self.assertIn("tools/check.sh <name> --nocapture", out.stderr)
+        self.assertIn("tools/check.sh <name>", out.stderr)
         self.assertEqual(out.stdout, "")
 
 
-class GateTest(Checkout, unittest.TestCase):
-    def test_what_runs_the_gate(self):
-        for command in [
-            "tools/check.sh",
-            "tools/check.sh > $S/gate.log 2>&1; echo \"exit $?\" >> $S/gate.log",
-            "./tools/check.sh 2>&1 | tail -3",
-            "cargo fmt --all && tools/check.sh --long > $S/long.txt 2>&1",
-            "(tools/check.sh > $S/gate.log 2>&1; echo done)",
-            "cd /Users/x/wrela && /Users/x/wrela/tools/check.sh --full",
-        ]:
-            self.assertTrue(hooks.runs_gate(command), command)
-        for command in [
-            "tools/check.sh clearing:: lock",
-            "tools/check.sh --long clearing:: --nocapture",
-            "tools/check.sh --fmt",
-            "tools/check.sh --package=wrela-syntax",
-            "tools/check.sh --package=wrela-syntax lexer",
-            "sed -n 1,60p tools/check.sh",
-            'grep -n "budget" tools/check.sh',
-        ]:
-            self.assertFalse(hooks.runs_gate(command), command)
-
-    def test_the_gate_is_formatted_first_and_the_files_named(self):
-        # check.sh --fmt prints what it formatted: rustfmt absolute paths, wrela fmt relative.
-        self.write("tools/check.sh", f'#!/bin/sh\n[ "$1" = --fmt ] || exit 9\n'
-                   f'echo "{self.root}/compiler/a.rs"\necho engine/b.wrela\n', 0o755)
-        out = run("bash", {"cwd": self.root, "tool_input": {"command": "tools/check.sh"}})
-        self.assertEqual(out.returncode, 0, out.stderr)
-        said = json.loads(out.stdout)
-        self.assertEqual(said["systemMessage"],
-                         "Formatted before the gate: compiler/a.rs, engine/b.wrela")
-        self.assertEqual(said["hookSpecificOutput"]["hookEventName"], "PreToolUse")
-        self.assertIn("compiler/a.rs, engine/b.wrela",
-                      said["hookSpecificOutput"]["additionalContext"])
-
-    def test_nothing_formatted_says_nothing(self):
-        self.write("tools/check.sh", "#!/bin/sh\nexit 0\n", 0o755)
-        out = run("bash", {"cwd": self.root, "tool_input": {"command": "tools/check.sh --long"}})
-        self.assertEqual((out.returncode, out.stdout), (0, ""))
-
-    def test_a_formatter_that_fails_lets_the_gate_run(self):
-        out = run("bash", {"cwd": self.root, "tool_input": {"command": "tools/check.sh"}})
-        self.assertEqual((out.returncode, out.stdout), (1, ""))  # no check.sh: an error, not "no"
-        self.assertIn("tools/hooks.py bash", out.stderr)
+class CheckHookTest(Checkout, unittest.TestCase):
+    def test_checks_do_not_format_or_run_other_commands_in_a_hook(self):
+        self.write("tools/check.sh", "#!/bin/sh\nexit 9\n", 0o755)
+        for command in ("tools/check.sh", "tools/check.sh renderer::agreement"):
+            out = run("bash", {"cwd": self.root, "tool_input": {"command": command}})
+            self.assertEqual((out.returncode, out.stdout, out.stderr), (0, "", ""))
 
 
 class SessionTest(Checkout, unittest.TestCase):

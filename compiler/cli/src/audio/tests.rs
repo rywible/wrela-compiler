@@ -3,9 +3,8 @@
 //! stages), and a sine with a click in it. The tools that render a piece (`wav`, `describe`,
 //! `numbers`, `midi`, `sheet`, `speed`) are tested on `examples/piano` by the command's tests.
 
-use super::{clicks, measure, model};
+use super::{clicks, measure};
 use std::f64::consts::{PI, TAU};
-use std::path::PathBuf;
 
 const RATE: f64 = 48000.0;
 
@@ -48,15 +47,6 @@ fn string(m: Made, seconds: f64) -> Vec<f32> {
     }
     out.into_iter().map(|x| x as f32).collect()
 }
-
-/// A scratch directory of the tests' own, `name`, empty.
-fn scratch(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("wrela-audio-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("mkdir");
-    dir
-}
-
 #[test]
 fn partials_finds_a_strings_tuning_and_stretch() {
     let made = Made { key: 48, b: 3e-4, x0: 0.12, velocity: 0.8 };
@@ -156,35 +146,4 @@ fn two_stage_recovers_known_decay_and_ignores_the_floor() {
     assert!((fit.after_db - 10.0 * (0.1f64 / 0.9).log10()).abs() < 0.5);
     assert!(fit.error < 0.1, "error {}", fit.error);
     assert!(measure::two_stage(&[-120.0; 20], dt).is_none());
-}
-
-#[test]
-#[ignore = "long: 80 notes made and fitted, about 20 s"]
-fn model_fits_a_piano_to_its_notes() {
-    // 16 keys at 5 velocities, as the model wants, each B a grand's at its key.
-    let dir = scratch("model-notes");
-    let keys: Vec<u32> = (0..16).map(|i| 24 + 5 * i).collect();
-    let b_of = |key: u32| 1.1e-4 * (0.0693 * (f64::from(key) - 40.0)).exp().max(1.0);
-    for key in &keys {
-        for v in [24u32, 48, 72, 96, 120] {
-            let made = Made { key: *key, b: b_of(*key), x0: 0.12, velocity: f64::from(v) / 127.0 };
-            let path = dir.join(format!("{key}-{v}.wav"));
-            super::dsp::write_wav(&path, &string(made, 2.0), 1).expect("write");
-        }
-    }
-    let out = scratch("model-out").join("grand.wrela");
-    model::run(&dir, &out, None).expect("the fit");
-    let source = std::fs::read_to_string(&out).expect("the model");
-    let b = model::array(&source, "inharmonicity").expect("inharmonicity");
-    let cents = model::array(&source, "tuning").expect("tuning");
-    let strike = model::array(&source, "strike").expect("strike");
-    assert_eq!((b.len(), cents.len(), strike.len()), (16, 16, 16));
-    for (i, key) in keys.iter().enumerate().filter(|(_, k)| (40..=84).contains(*k)) {
-        assert!((b[i] / b_of(*key) - 1.0).abs() < 0.25, "key {key}: B {} for {}", b[i], b_of(*key));
-        assert!(cents[i].abs() < 3.0, "key {key}: {} cents", cents[i]);
-    }
-    // Where the hammer strikes, from the partials it leaves quiet, in the keys with many.
-    for (i, key) in keys.iter().enumerate().filter(|(_, k)| (40..=60).contains(*k)) {
-        assert!((strike[i] - 0.12).abs() < 0.015, "key {key}: struck at {}", strike[i]);
-    }
 }

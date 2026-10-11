@@ -689,7 +689,7 @@ impl Spike {
         }
     }
 
-    /// main.js's `extractHerd`: seeds 1 to `count` at `cell`, sized by a calibration on the
+    /// main.js's `extractHerd`: seeds 1 to `count` at `cell` by a calibration on the
     /// largest grid, extracted three times, each run's counts and times read back at once; the
     /// last run's.
     pub fn extract_herd(&self, cell: f64, count: usize) -> (Vec<Extracted>, Vec<Individual>) {

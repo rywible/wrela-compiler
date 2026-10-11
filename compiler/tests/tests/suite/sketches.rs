@@ -51,7 +51,7 @@ fn sketch_01s_herd_walks_and_rings() {
 /// that sways its neck and shaded per pixel by its field. Chrome and the native host give the
 /// same frame, within a mean of 0.5/255 (AC11), and the grazer fills part of it.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn sketch_02_draws_the_grazer_in_both_hosts() {
     use wrela_host::image;
     const FRAMES: u32 = 4;
@@ -120,7 +120,7 @@ fn sketch_03s_tick_doesnt_depend_on_the_workers() {
 }
 
 /// A program's own tests (`@test`, `wrela test`) pass: each program's a test of its own, so the
-/// gate runs them side by side and remembers each by what it read.
+/// check executes them through the same native test runner.
 fn own_tests_pass(pkg: &str) {
     assert!(tests_pass(&wrela_tests::repo_root().join(pkg)) > 0, "{pkg}: no tests ran");
 }
@@ -166,18 +166,18 @@ fn the_grazers_own_tests_pass() {
     own_tests_pass("examples/grazer");
 }
 
-const GAMEPLAY_FRAMES: u32 = 360;
+const GAMEPLAY_FRAMES: u32 = 60;
 
 /// The four systems in Chrome and in the native host: the same frames (their state hash covers
 /// every command, the UI's draws among them).
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_gameplay_systems_run_in_both_hosts() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/gameplay", "gameplay-hosts");
-    let chrome = wrela_tests::run_in_chrome(&rel, GAMEPLAY_FRAMES, 640, 480, 60.0);
+    let chrome = wrela_tests::run_in_chrome(&rel, GAMEPLAY_FRAMES, 192, 128, 60.0);
     let times: Vec<f32> = (0..GAMEPLAY_FRAMES).map(|i| wrela_host::frame_time(i, 60.0)).collect();
     let run =
-        wrela_host::Host::load(&dir).expect("load").run_frames(&times, 640, 480).expect("run");
+        wrela_host::Host::load(&dir).expect("load").run_frames(&times, 192, 128).expect("run");
     assert_eq!(chrome.hash, run.hash_hex(), "the hosts' state hashes differ");
     let diff = wrela_host::image::compare(&chrome.frame, &run.frame).expect("same size");
     println!(

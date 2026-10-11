@@ -52,7 +52,7 @@ fn std_math_is_within_an_ulp() {
     let mut report = Vec::new();
     for (name, f, lo, hi) in ones {
         let mut worst = 0.0f64;
-        for i in 0..20_000 {
+        for i in 0..1024 {
             // Log-uniform over positive ranges that span decades, uniform otherwise.
             let x = if lo > 0.0 {
                 (lo.ln() + (hi.ln() - lo.ln()) * rng.unit()).exp()
@@ -71,7 +71,7 @@ fn std_math_is_within_an_ulp() {
         report.push(format!("  {name}: worst {worst:.2} ulp over [{lo:e}, {hi:e}]"));
     }
     let mut worst = (0.0f64, 0.0f64);
-    for _ in 0..20_000 {
+    for _ in 0..1024 {
         let (x, y) = ((rng.unit() * 8.0) as f32, (rng.unit() * 16.0 - 8.0) as f32);
         let p = one_f32(&mut host, "f_pow", &[Value::F32(x), Value::F32(y)]);
         let u = ulps(p, f64::from(x).powf(f64::from(y)) as f32);

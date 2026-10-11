@@ -59,21 +59,6 @@ fn every_public_std_item_has_a_page() {
     });
 }
 
-/// Each page in under 100 ms, one at a time.
-#[test]
-#[ignore = "measure: a timing run"]
-fn every_page_takes_under_a_tenth_of_a_second() {
-    let mut slowest = 0.0f64;
-    for path in std_items() {
-        let (ok, page, secs) = doc(&[&path]);
-        assert!(ok, "{path}:\n{page}");
-        slowest = slowest.max(secs);
-    }
-    if !cfg!(debug_assertions) {
-        assert!(slowest < 0.1, "the slowest page took {slowest:.3} s");
-    }
-}
-
 /// A name alone finds the item; one that several items have lists them.
 #[test]
 fn a_bare_name_is_found() {

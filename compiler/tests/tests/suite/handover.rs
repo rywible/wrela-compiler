@@ -191,7 +191,7 @@ fn a_tour_of_hand_overs_runs_by_itself() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome and a GPU"]
+#[ignore = "needs the runtime"]
 fn chrome_runs_the_tour_of_hand_overs_alike() {
     // The builds side by side, as pages beside each other.
     let mut rel = String::new();
@@ -202,7 +202,7 @@ fn chrome_runs_the_tour_of_hand_overs_alike() {
         )
         .1;
     }
-    let run = wrela_tests::run_in_chrome(&rel, 300, SIZE, SIZE, 60.0);
+    let run = wrela_tests::run_in_chrome(&rel, 90, SIZE, SIZE, 60.0);
     let (tour, said) = tour_lines(run.printed.into_iter().map(|(_, l)| l));
     assert_eq!(tour, TOUR);
     assert!(said, "the page says `broken` failed and `tour` starts again");

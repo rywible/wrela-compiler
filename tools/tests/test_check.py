@@ -1,258 +1,167 @@
-"""Exercise focused checks without compiling Rust or running the real gate."""
-
+"""The one check runs all retained tests or exactly one, and fails closed on bad selection."""
+import contextlib
+import io
 import json
 import os
-import pathlib
-import shutil
+from pathlib import Path
 import subprocess
 import sys
 import tempfile
-import textwrap
-import time
 import unittest
+from unittest.mock import patch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import check
+import runner
 
 
-TOOLS = pathlib.Path(__file__).resolve().parents[1]
-CHECK = TOOLS / "check.sh"
+class Selection(unittest.TestCase):
+    def test_only_zero_or_one_name_is_valid(self):
+        self.assertIsNone(check.selection([]))
+        self.assertEqual(check.selection(['a::test']), 'a::test')
+        for args in (['a', 'b'], ['--long'], ['--full'], ['--fresh'], ['--fmt'],
+                     ['--package=x'], ['--nocapture'], ['']):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                check.selection(args)
+
+    def test_complete_suite_runs_every_step_and_program_without_memo(self):
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(check, 'ROOT', Path(temp)), \
+                patch.object(check.jobs, 'admitted', return_value=True), \
+                patch.object(check, 'build_tests', return_value=['one', 'two']), \
+                patch.object(check, 'listed', return_value=['test']), \
+                patch.object(check, 'step') as step, \
+                patch.object(check, 'rust_run', return_value=1) as run, \
+                patch.dict(os.environ, {'WRELA_FULL': '1', 'WRELA_BLESS': '1',
+                                        'WRELA_RUN_ONLY': 'missing', 'WRELA_FUZZ_ITERS': '1000000'}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cwd = Path.cwd()
+            try:
+                self.assertEqual(check.main([]), 0)
+                self.assertEqual([c.args[0] for c in step.call_args_list], list(check.STEPS))
+                self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two'])
+                self.assertFalse(set(check.CONTROLS) & os.environ.keys())
+            finally:
+                os.chdir(cwd)
 
 
-class FocusedCheck(unittest.TestCase):
+class RustChecks(unittest.TestCase):
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = pathlib.Path(temporary.name).resolve()
-        target = tempfile.TemporaryDirectory()
-        self.addCleanup(target.cleanup)
-        self.target = pathlib.Path(target.name)
-        for directory in ("tools", "bin", "compiler/tests", "runtime", "tmp"):
-            (self.root / directory).mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(CHECK, self.root / "tools/check.sh")
-        shutil.copyfile(TOOLS / "ignored.py", self.root / "tools/ignored.py")
-        shutil.copyfile(TOOLS / "runner.py", self.root / "tools/runner.py")
-        for name in ("jobs.py", "worktrees.py", "resources.py"):
-            shutil.copyfile(TOOLS / name, self.root / "tools" / name)
-        with (self.root / "tools/resources.py").open("a") as resource:
-            resource.write(textwrap.dedent("""
-            import errno, os
-            if os.environ.get("FAKE_LINK_ERROR"):
-                def unavailable_link(*args, **kwargs):
-                    raise OSError(getattr(errno, os.environ["FAKE_LINK_ERROR"]), "fake link failure")
-                os.link = unavailable_link
-            def cpu_count():
-                return int(os.environ.get("FAKE_CPUS", "2"))
-            def memory_pressure():
-                return 0
-            if __name__ == "__main__":
-                print(cpu_count())
-        """))
-        (self.root / "compiler/tests/cases.rs").write_text(
-            '#[ignore = "long: extended check"]\nfn long_case() {}\n'
-            '#[ignore = "measure: timing"]\nfn measure_case() {}\n'
-        )
-        self.script("bin/cargo", """
-            import json, os, pathlib, sys
-            root = pathlib.Path(os.environ["FAKE_ROOT"])
-            with (root / "cargo.jsonl").open("a") as output:
-                output.write(json.dumps(sys.argv[1:]) + "\\n")
-            if sys.argv[1] != "test" or "--no-run" not in sys.argv:
-                sys.exit(97)
-            print(json.dumps({"reason": "compiler-artifact", "profile": {"test": True},
-                "executable": str(root / "fake-tests"),
-                "manifest_path": str(root / "compiler/tests/Cargo.toml"),
-                "target": {"name": "fake-tests", "kind": ["test"]}}))
-        """)
-        self.script("fake-tests", """
-            import json, os, pathlib, subprocess, sys
-            if "--worker" in sys.argv:
-                print("reexecuted original test program")
-                sys.exit(0)
-            args = sys.argv[1:]
-            skips, filters = [], []
-            remaining = iter(args)
-            for arg in remaining:
-                if arg == "--skip":
-                    skips.append(next(remaining))
-                elif not arg.startswith("-"):
-                    filters.append(arg)
-            selected = [name for name in ["normal_case", "long_case", "measure_case"]
-                        if not any(skip in name for skip in skips)
-                        and (not filters or any(f in name for f in filters))
-                        and (name == "normal_case" or "--include-ignored" in args)]
-            root = pathlib.Path(os.environ["FAKE_ROOT"])
-            (root / "test.json").write_text(json.dumps({"args": args, "selected": selected,
-                "scratch": os.environ["WRELA_TEST_TMPDIR"],
-                "cache": os.environ["WRELA_NATIVE_CACHE"],
-                "const_cache": os.environ.get("WRELA_CONST_CACHE"),
-                "threads": next(a.split("=", 1)[1] for a in args if a.startswith("--test-threads="))}))
-            if os.environ.get("FAKE_REPLACE_EXECUTABLE") == "1":
-                original = root / "fake-tests"
-                original.unlink()
-                original.write_text("#!/bin/sh\\nexit 99\\n")
-                original.chmod(0o755)
-                subprocess.run([sys.argv[0], "--worker"], check=True)
-            print("fake test output")
-            if os.environ.get("FAKE_TEST_FAIL") == "1":
-                print("test result: FAILED. 0 passed; 1 failed")
-                sys.exit(1)
-            print(f"test result: ok. {len(selected)} passed; 0 failed")
-        """)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.pkg = self.root / 'compiler/tests'
+        self.pkg.mkdir(parents=True)
+        (self.pkg / 'Cargo.toml').write_text('[package]\nname = "wrela-fixture"\n')
+        self.logs = self.root / 'logs'
+        self.logs.mkdir()
+        self.exe = self.root / 'fixture'
+        self.exe.write_text(f'#!{sys.executable}\n' + '''
+import json, os, pathlib, sys
+names = ['alpha', 'alphabet', 'gpu']
+if '--list' in sys.argv:
+    print('\\n'.join(n + ': test' for n in names))
+    sys.exit(0)
+if '--worker' in sys.argv: sys.exit(0)
+args = sys.argv[1:]
+selected = [args[args.index('--exact') + 1]] if '--exact' in args else names
+if '--include-ignored' not in args: selected.remove('gpu')
+pathlib.Path(os.environ['CHECK_RECORD']).write_text(json.dumps({
+    'selected': selected, 'args': args, 'gpu': os.environ['WRELA_GPU_SHARED'],
+    'scratch': os.environ['WRELA_TEST_TMPDIR']}))
+if os.environ.get('REPLACE_EXE'):
+    p = pathlib.Path(os.environ['ORIGINAL_EXE']); p.unlink(); p.write_text('broken')
+    import subprocess
+    subprocess.run([sys.argv[0], '--worker'], check=True)
+mode = os.environ.get('FAIL_MODE', '')
+count = 0 if mode in ['zero', 'failure'] else len(selected)
+print(f'test result: ok. {count} passed; 0 failed; {1 if mode == "skip" else 0} ignored; 0 measured; 0 filtered out')
+if mode == 'failure': sys.exit(1)
+''')
+        self.exe.chmod(0o755)
+        self.program = {'manifest_path': str(self.pkg / 'Cargo.toml'), 'executable': str(self.exe),
+                        'target': {'name': 'suite', 'kind': ['test']}}
+        env = patch.dict(os.environ, {'CHECK_RECORD': str(self.root / 'record'),
+                                     'CARGO_TARGET_DIR': str(self.root / 'cargo'),
+                                     'WRELA_CPU_WORKERS': '2'})
+        env.start(); self.addCleanup(env.stop)
+        scratch = patch.object(runner, 'scratch_root', return_value=str(self.root))
+        scratch.start(); self.addCleanup(scratch.stop)
 
-    def script(self, name, source):
-        path = self.root / name
-        path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(source))
-        path.chmod(0o755)
+    def test_exact_selection_never_runs_a_substring_match(self):
+        program, name = check.matching([self.program], 'alpha')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(check.rust_run(program, self.logs, name), 1)
+        got = json.loads((self.root / 'record').read_text())
+        self.assertEqual(got['selected'], ['alpha'])
+        self.assertIn('--exact', got['args'])
+        self.assertFalse(Path(got['scratch']).exists())
 
-    def check(self, *args, fail=False, cores=2, software=None, replace_executable=False, link_error=""):
-        for name in ("cargo.jsonl", "test.json"):
-            (self.root / name).unlink(missing_ok=True)
-        env = {**os.environ, "PATH": f"{self.root / 'bin'}:{os.environ['PATH']}",
-               "FAKE_ROOT": str(self.root), "FAKE_TEST_FAIL": "1" if fail else "0",
-               "FAKE_REPLACE_EXECUTABLE": "1" if replace_executable else "0",
-               "FAKE_LINK_ERROR": link_error,
-               "FAKE_CPUS": str(cores), "TMPDIR": str(self.root / "tmp"),
-               "WRELA_RESOURCE_DIR": str(self.root / "resources"),
-               "WRELA_CPU_WORKERS": "2",
-               "WRELA_CONST_CACHE": str(self.target / "stale-const-cache"),
-               "CARGO_TARGET_DIR": str(self.target)}
-        env.pop("WRELA_NATIVE_CACHE", None)
-        env.pop("WRELA_SOFTWARE_GPU", None)
-        if software is not None:
-            env["WRELA_SOFTWARE_GPU"] = software
-        return subprocess.run(
-            ["bash", str(self.root / "tools/check.sh"), *args],
-            cwd=self.root / "tmp", capture_output=True, text=True, timeout=10,
-            env=env,
-        )
+    def test_all_tests_include_gpu_and_never_have_skip_arguments(self):
+        self.assertEqual(check.rust_run(self.program, self.logs), 3)
+        got = json.loads((self.root / 'record').read_text())
+        self.assertEqual(got['selected'], ['alpha', 'alphabet', 'gpu'])
+        self.assertEqual(got['gpu'], '2')
+        self.assertNotIn('--skip', got['args'])
 
-    def recorded_test(self):
-        return json.loads((self.root / "test.json").read_text())
+    def test_unknown_and_ambiguous_names_fail_before_running(self):
+        with self.assertRaises(ValueError): check.matching([self.program], 'alph')
+        other = {**self.program, 'target': {'name': 'other', 'kind': ['test']}}
+        with self.assertRaisesRegex(ValueError, '2 matches'):
+            check.matching([self.program, other], 'alpha')
+        self.assertEqual(check.matching([self.program, other], 'wrela-fixture::other::alpha'),
+                         (other, 'alpha'))
+        self.assertFalse((self.root / 'record').exists())
 
-    def assert_focused_success(self, result):
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("focused check", result.stdout.lower())
-        self.assertNotIn("all checks passed", result.stdout.lower())
+    def test_failure_zero_tests_and_skips_are_failures_and_keep_scratch(self):
+        for mode in ['failure', 'zero', 'skip']:
+            with patch.dict(os.environ, {'FAIL_MODE': mode}), \
+                    contextlib.redirect_stdout(io.StringIO()), \
+                    self.assertRaises(ValueError):
+                check.rust_run(self.program, self.logs)
+            got = json.loads((self.root / 'record').read_text())
+            self.assertTrue(Path(got['scratch']).exists())
 
-    def test_packages_limit_build_and_accept_nocapture_without_a_filter(self):
-        result = self.check("--package=wrela-syntax", "--package=wrela-abi", "--nocapture")
-        self.assert_focused_success(result)
-        calls = [json.loads(line) for line in (self.root / "cargo.jsonl").read_text().splitlines()]
-        self.assertEqual(len(calls), 1)
-        self.assertNotIn("--workspace", calls[0])
-        packages = []
-        remaining = iter(calls[0])
-        for arg in remaining:
-            if arg in ("--package", "-p"):
-                packages.append(next(remaining))
-            elif arg.startswith("--package="):
-                packages.append(arg.split("=", 1)[1])
-        self.assertEqual(packages, ["wrela-syntax", "wrela-abi"])
-        recorded = self.recorded_test()
-        self.assertIn("--nocapture", recorded["args"])
-        self.assertEqual(recorded["selected"], ["normal_case"])
-        self.assertEqual(pathlib.Path(recorded["cache"]), self.target / "native-cache")
-        scratch = pathlib.Path(recorded["scratch"])
-        self.assertEqual(scratch.parent, self.root / "target")
-        self.assertFalse(scratch.exists())
-        self.assertIn("fake test output", result.stdout)
-
-    def test_package_filter_and_nocapture_reach_the_test_program(self):
-        for prefix in (("--package=wrela-syntax",), ()):
-            with self.subTest(prefix=prefix):
-                result = self.check(*prefix, "normal_case", "--nocapture")
-                self.assert_focused_success(result)
-                calls = [json.loads(line) for line in (self.root / "cargo.jsonl").read_text().splitlines()]
-                self.assertEqual(len(calls), 1)
-                self.assertEqual("--workspace" in calls[0], not prefix)
-                self.assertIn("normal_case", self.recorded_test()["args"])
-                self.assertIn("--nocapture", self.recorded_test()["args"])
-                self.assertEqual(self.recorded_test()["selected"], ["normal_case"])
-                self.assertIn("fake test output", result.stdout)
-
-    def test_long_includes_long_cases_but_never_measurements(self):
-        result = self.check("--package=wrela-syntax", "--long")
-        self.assert_focused_success(result)
-        self.assertEqual(self.recorded_test()["selected"], ["normal_case", "long_case"])
-
-    def test_heavy_cases_run_on_hardware_and_in_the_software_long_tier(self):
-        source = self.root / "compiler/tests/cases.rs"
-        source.write_text(source.read_text() + '#[ignore = "heavy: rendering"]\nfn heavy_case() {}\n')
-        program = self.root / "fake-tests"
-        program.write_text(program.read_text().replace(
-            '"long_case", "measure_case"', '"long_case", "measure_case", "heavy_case"'))
-        for software, flags, selected in (
-            (None, (), ["normal_case", "heavy_case"]),
-            ("1", (), ["normal_case"]),
-            ("1", ("--long",), ["normal_case", "long_case", "heavy_case"]),
-        ):
-            with self.subTest(software=software, flags=flags):
-                result = self.check("--package=wrela-syntax", *flags, software=software)
-                self.assert_focused_success(result)
-                self.assertEqual(self.recorded_test()["selected"], selected)
-                self.assertIsNone(self.recorded_test()["const_cache"])
-
-    def test_scratch_keeps_copied_fixtures_relative_dependencies_valid(self):
-        result = self.check("--package=wrela-syntax")
-        self.assert_focused_success(result)
-        scratch = pathlib.Path(self.recorded_test()["scratch"])
-        fixture = scratch / "diagnostics" / "a-case"
-        self.assertEqual((fixture / "../../../../engine").resolve(), self.root / "engine")
-
-    def test_workers_reexecute_the_original_program_after_cargo_replaces_it(self):
-        original = self.root / "fake-tests"
-        source = original.read_bytes()
-        for link_error in ("", "EXDEV"):
-            with self.subTest(link_error=link_error):
-                original.write_bytes(source)
-                result = self.check("--package=wrela-syntax", "--nocapture",
-                                    replace_executable=True, link_error=link_error)
-                self.assert_focused_success(result)
-                self.assertNotEqual(original.read_bytes(), source)
-                self.assertIn("reexecuted original test program", result.stdout)
-
-    def test_executable_link_permission_errors_fail_the_check(self):
-        result = self.check("--package=wrela-syntax", link_error="EACCES")
-        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("fake link failure", result.stdout + result.stderr)
-        self.assertFalse((self.root / "test.json").exists())
-
-    def test_threads_follow_cpu_limits_on_any_gpu(self):
-        for cores, software, threads in ((1, None, 1), (2, None, 2), (16, None, 2),
-                                         (16, "1", 2), (2, "1", 2), (16, "", 2)):
-            with self.subTest(cores=cores, software=software):
-                result = self.check("--package=wrela-syntax", cores=cores, software=software)
-                self.assert_focused_success(result)
-                self.assertEqual(self.recorded_test()["threads"], str(threads))
-
-    def test_invalid_modes_are_rejected_before_cargo_runs(self):
-        for args in (("--package=",), *(("--package=wrela-syntax", mode)
-                                       for mode in ("--fresh", "--full", "--fmt"))):
-            with self.subTest(args=args):
-                result = self.check(*args)
-                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-                self.assertFalse((self.root / "cargo.jsonl").exists())
-
-    def test_failed_tests_and_unmatched_filters_do_not_pass(self):
-        for filter_name, fail in (("normal_case", True), ("missing_case", False)):
-            with self.subTest(filter=filter_name, fail=fail):
-                result = self.check("--package=wrela-syntax", filter_name, fail=fail)
-                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertTrue((self.root / "test.json").exists())
-                self.assertNotIn("all checks passed", result.stdout.lower())
-                scratch = pathlib.Path(self.recorded_test()["scratch"])
-                self.assertEqual(scratch.parent, self.root / "target")
-                self.assertEqual(scratch.exists(), fail)
+    def test_replaced_executable_can_still_spawn_its_worker(self):
+        with patch.dict(os.environ, {'REPLACE_EXE': '1', 'ORIGINAL_EXE': str(self.exe)}):
+            self.assertEqual(check.rust_run(self.program, self.logs), 3)
 
 
-    def test_a_failed_programs_scratch_is_removed_six_hours_later(self):
-        old, recent = self.root / "target/test-scratch-old", self.root / "target/test-scratch-new"
-        for path, age in ((old, 7 * 3600), (recent, 3600)):
-            (path / "inside").mkdir(parents=True)
-            (path / ".owner").write_text("2147483647")
-            then = time.time() - age
-            os.utime(path, (then, then))
-        self.assert_focused_success(self.check("--package=wrela-syntax", "normal_case"))
-        self.assertFalse(old.exists())
-        self.assertTrue(recent.exists())
+class WrelaSelection(unittest.TestCase):
+    def test_exact_results_required_and_package_paths_confined(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'engine').mkdir()
+            logs = root / 'logs'; logs.mkdir()
+            for tests in [[], [{'name': 'alphabet', 'passed': True}],
+                          [{'name': 'alpha', 'passed': True}] * 2,
+                          [{'name': 'alpha', 'passed': False}]]:
+                with patch.object(check, 'ROOT', root), \
+                        patch.object(check, 'call', return_value=subprocess.CompletedProcess(
+                            [], 0, json.dumps({'tests': tests}))), self.assertRaises(ValueError):
+                    check.wrela_test('wrela::engine::alpha', Path('wrela'), logs)
+            with patch.object(check, 'ROOT', root), patch.object(check, 'call') as run:
+                for name in ['wrela::../::alpha', 'wrela::engine::', 'wrela::engine::alpha::extra']:
+                    with self.assertRaises(ValueError): check.wrela_test(name, Path('wrela'), logs)
+                run.assert_not_called()
 
-if __name__ == "__main__":
+
+class BrowserSelection(unittest.TestCase):
+    def test_no_tests_and_multiple_tests_fail_exact_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'runtime/browser/test'
+            directory.mkdir(parents=True)
+            (directory / 'x.test.ts').write_text('')
+            logs = root / 'logs'; logs.mkdir()
+            for xml in ['<testsuites/>', '<testsuites><testcase/><testcase/></testsuites>']:
+                (logs / 'browser.xml').write_text(xml)
+                with patch.object(check, 'ROOT', root), patch.object(check, 'call'), \
+                        self.assertRaises(ValueError):
+                    check.browser_test('browser::x.test.ts::a', logs)
+            with patch.object(check, 'ROOT', root), self.assertRaises(ValueError):
+                check.browser_test('browser::../../outside::a', logs)
+
+
+if __name__ == '__main__':
     unittest.main()

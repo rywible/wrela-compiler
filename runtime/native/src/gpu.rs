@@ -2128,43 +2128,6 @@ mod tests {
     use super::*;
     use wrela_abi::manifest::Pipeline;
 
-    /// Small streaming texture updates interspersed with recorded GPU work. Include GPU
-    /// completion, but leave device creation and the first warm-up out of the samples.
-    #[test]
-    #[ignore = "measure: texture upload throughput, needs a GPU"]
-    fn texture_upload_throughput() {
-        let _turn = crate::lock::turn();
-        let _lock = crate::lock::GpuLock::alone("texture upload throughput").expect("GPU lock");
-        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off, false).unwrap();
-        eprintln!("{}", gpu.adapter());
-        gpu.create_buffer(2, 4);
-        gpu.create_buffer(3, 4);
-        for side in [32, 128] {
-            gpu.create_texture(1, [side, side, 0], TextureFormat::Rgba8, false);
-            let bytes = vec![127; (side * side * 4) as usize];
-            let mut samples = Vec::new();
-            for run in 0..8 {
-                let started = std::time::Instant::now();
-                for _ in 0..256 {
-                    gpu.write_texture(1, [0, 0], [side, side], &bytes).unwrap();
-                    gpu.copy_buffer(2, 0, 3, 0, 4);
-                }
-                gpu.read_buffer(3).unwrap();
-                gpu.check_errors().unwrap();
-                let millis = started.elapsed().as_secs_f64() * 1000.0;
-                if run > 0 {
-                    samples.push(millis);
-                }
-            }
-            samples.sort_by(f64::total_cmp);
-            eprintln!(
-                "256 ordered {side}x{side} texture uploads: {:.3} ms median ({samples:?})",
-                samples[3]
-            );
-            gpu.destroy(1);
-        }
-    }
-
     /// Copies a texture before a later write can replace it, leaving the copy in the current
     /// encoder so the test checks ordering within and between submissions.
     fn snapshot_texture(

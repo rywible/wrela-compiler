@@ -313,53 +313,11 @@ def run(kind, command, timeout=None, key=None, verify=False, maintenance=True):
 
 
 def check(arguments):
-    """Long checks release admission between tests, so another session's edit loop can run."""
+    """One verified admission for the suite or one named check."""
+    from check import selection
+    name = selection(arguments)
     script = str(Path(__file__).with_name("check.sh").resolve())
-    filters = [a for a in arguments if not a.startswith("-")]
-    if "--long" not in arguments or filters or any(a.startswith("--package=") for a in arguments) or "--full" in arguments:
-        kind = "measure" if "--full" in arguments else "focused" if filters or "--fmt" in arguments or any(a.startswith("--package=") for a in arguments) else "gate"
-        if "--long" in arguments:
-            kind = "long"
-        if "--full" in arguments:
-            kind = "measure"
-        return run(kind, ["bash", script, *arguments], verify="--fmt" not in arguments)
-    before = fingerprint(os.getcwd())
-    gate_arguments = [a for a in arguments if a not in ("--long", "--fresh")]
-    status = run("gate", ["bash", script, "--fresh", *gate_arguments], verify=True)
-    if status:
-        return status
-    from ignored import ignored
-    names = [name for kind, name in ignored(os.getcwd())
-             if kind == "long" or (kind == "heavy" and os.environ.get("WRELA_SOFTWARE_GPU"))]
-    for name in names:
-        status = run("long", ["bash", script, "--long", name], verify=True)
-        if status:
-            return status
-    seed = str(int.from_bytes(os.urandom(4), "little"))
-    for stage in ("differential", "gbnf", "baked", "fuzz"):
-        status = run("long", [sys.executable, str(Path(__file__).resolve()), "_long-extra", stage, seed], verify=True)
-        if status:
-            return status
-    if before != fingerprint(os.getcwd()):
-        print("source inputs changed between long jobs; rerun the tier for the current tree", file=sys.stderr)
-        return 1
-    print("all long checks passed")
-    return 0
-
-
-def long_extra(stage, seed):
-    commands = {
-        "differential": ["cargo", "run", "-q", "--release", "-p", "wrela-grammar", "--bin", "differential", "--", "1000000", "--seed", seed],
-        "gbnf": ["cargo", "run", "-q", "--release", "-p", "wrela-grammar", "--bin", "gbnf-sample", "--", "200000", "--seed", seed],
-        "fuzz": ["cargo", "test", "-q", "--release", "-p", "wrela-tests", "--test", "suite", "fuzz::", "--", "--test-threads=1"],
-    }
-    if stage == "baked":
-        subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"], check=True)
-        return subprocess.call([sys.executable, "tools/wgsl_budgets.py", str(Path(os.environ["CARGO_TARGET_DIR"]) / "release/wrela"), "--baked"])
-    env = dict(os.environ)
-    if stage == "fuzz":
-        env.update(WRELA_FUZZ_ITERS="20000", WRELA_FUZZ_TIERS="12", WRELA_FUZZ_SEED=seed)
-    return subprocess.call(commands[stage], env=env)
+    return run("focused" if name else "gate", ["bash", script, *arguments], verify=True)
 
 
 def main():
@@ -367,10 +325,6 @@ def main():
         return 0 if admitted() else 1
     if sys.argv[1:2] == ["check"]:
         return check(sys.argv[2:])
-    if sys.argv[1:2] == ["_long-extra"]:
-        if not admitted():
-            raise ValueError("long stages need a live queue admission")
-        return long_extra(*sys.argv[2:])
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="action", required=True)
     execution = sub.add_parser("run")

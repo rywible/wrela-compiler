@@ -79,7 +79,7 @@ fn native(dir: &std::path::Path, workers: u32) -> String {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn both_hosts_agree_with_any_workers() {
     let (dir, rel) = page("compiler/tests/parallel", "parallel-hosts");
     let want = native(&dir, 1);

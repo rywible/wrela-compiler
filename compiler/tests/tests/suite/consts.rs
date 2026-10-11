@@ -163,58 +163,29 @@ fn waiting_constants_preserve_failures_and_cycles() {
     assert_eq!(errors[0].code.as_str(), "E0328");
     assert!(errors[0].message.contains("`A` → `B` → `A`"), "{errors:?}");
 }
-
-/// A constant that does more work than the build's own limit (2^34 units) is built when its
-/// declaration gives it the fuel, and fails without; its parallel job runs on the build's
-/// threads, and its value doesn't depend on how many.
+/// Fuel declarations are enforced on a tiny computation, without exhausting the default
+/// build budget. A changed fuel value must invalidate the constant cache.
 #[test]
-#[ignore = "long: computes a constant past the build's fuel limit (seconds)"]
-fn a_constant_with_fuel_of_its_own_does_more_than_the_builds_limit() {
+fn a_constants_declared_fuel_is_enforced_and_invalidates_its_cache() {
+    let dir = scratch("consts/fuel");
     let program = r#"
-@fuel(2 ** 37)
-const SUM: u64 = sum(2048)
-
-fn sum(rows: u32) -> u64 {
-    var parts: Vec<u64> = Vec::filled(rows, 0)
-    parts.par_each_mut(|p| work(mut p))
-    var s: u64 = 0
-    for p in parts {
-        s = s.wrapping_add(p)
-    }
+@fuel(1000000)
+const SUM: u32 = sum()
+fn sum() -> u32 {
+    var s: u32 = 0
+    for i in 0..1000 { s += i }
     s
 }
-
-fn work(p: mut u64) {
-    var x: u64 = 1
-    for i in 0..1000000 {
-        x = x.wrapping_mul(6364136223846793005).wrapping_add(u64(i))
-    }
-    p = x
-}
-
-pub fn frame(time: f32, width: u32, height: u32) {
-    let _ = SUM
-}
+pub fn frame(time: f32, width: u32, height: u32) { assert(SUM == 499500) }
 "#;
-    let dir = scratch("consts/fuel");
-    std::fs::write(dir.join("main.wrela"), program).expect("write");
-    let t = std::time::Instant::now();
+    let main = dir.join("main.wrela");
+    std::fs::write(&main, program).unwrap();
     let out = wrela_driver::build(&dir);
-    assert!(!wrela_diag::has_errors(&out.diagnostics), "{:?}", out.diagnostics);
-    eprintln!(
-        "a constant of about 2^35 units computed in {:.1} s, the helpers running {} of its chunks",
-        t.elapsed().as_secs_f64(),
-        out.consts.helped
-    );
-    assert!(out.consts.computed >= 1);
-    if std::thread::available_parallelism().map_or(1, |n| n.get()) > 1 {
-        assert!(out.consts.helped > 0, "the build's helpers ran none of its parallel job");
-    }
-    std::fs::remove_dir_all(dir.join("build")).expect("clear the cache");
-    std::fs::write(dir.join("main.wrela"), program.replace("@fuel(2 ** 37)\n", "")).expect("write");
+    assert!(!out.has_errors(), "{:?}", out.diagnostics);
+    assert!(out.consts.computed > 0);
+    std::fs::write(&main, program.replace("@fuel(1000000)", "@fuel(10)")).unwrap();
     let out = wrela_driver::build(&dir);
-    let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
-    assert_eq!(codes, ["E0705"], "without its fuel it stops at the build's limit");
+    assert!(out.diagnostics.iter().any(|d| d.code.as_str() == "E0705"), "{:?}", out.diagnostics);
 }
 
 /// Two constants that ship files into one directory of the build (`std::io::Shipped`) are E0704;

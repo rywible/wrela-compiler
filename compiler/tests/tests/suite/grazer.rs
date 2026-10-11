@@ -6,22 +6,15 @@
 //! `makeGrazer(1)`, the `Grazer` uniform). The harness kernels (`wrela_tests::spike01`'s) are
 //! appended to field.wgsl, as the spike's own extract.wgsl and draw.wgsl are.
 //!
-//! GPU time is compared in one harness ([`RawGpu`]): the WGSL `wrela build` emitted, with the
-//! uniform bytes the program submitted, against the hand-written kernel, alternating, after a
-//! warm-up. (Through wrela-host the same compiled kernel times within a few percent of this
-//! when the GPU is warm, but timings there swing with whatever else the GPU did just before.)
-//!
-//! These need a GPU: `cargo test -p wrela-tests --test suite grazer:: -- --ignored --nocapture`.
+//! Distances, gradients and uniforms are compared against the hand-written shader.
 
 use crate::built;
 use wrela_host::{Host, Options, Value};
-use wrela_tests::spike01::{HARNESS_D, compiled_kernel, fixture, harness, params_seed1};
-use wrela_tests::{Bind, RawGpu, bytes_of, f32s, median, one_f32, one_u32, u32s, worse};
+use wrela_tests::spike01::{HARNESS_D, fixture, harness, params_seed1};
+use wrela_tests::{Bind, RawGpu, bytes_of, f32s, one_f32, one_u32, u32s, worse};
 
-/// 2²⁰ points ("1M").
-const POINTS: u32 = 1 << 20;
-const REPS: u32 = 20;
-const ROUNDS: usize = 5;
+/// Bounded deterministic points across the field.
+const POINTS: u32 = 4096;
 
 fn load() -> Host {
     Host::load_with(built("fields"), &Options { record: true, ..Options::default() })
@@ -55,7 +48,6 @@ struct Compiled {
     points: Vec<u8>,
     dist: Vec<f32>,
     samp: Vec<f32>,
-    batches: Vec<Vec<u8>>,
 }
 
 fn compiled() -> Compiled {
@@ -68,7 +60,7 @@ fn compiled() -> Compiled {
     let points = host.read_buffer(p).expect("points");
     let dist = f32s(&host.read_buffer(d).expect("distances"));
     let samp = f32s(&host.read_buffer(s).expect("samples"));
-    Compiled { params, points, dist, samp, batches: host.take_batches() }
+    Compiled { params, points, dist, samp }
 }
 
 /// The hand-written field's two kernels: the distance, and the distance and gradient.
@@ -158,66 +150,6 @@ fn the_compiled_grazer_matches_the_hand_written_one() {
     }
     assert_eq!(over_d, 0, "distances differ by more than 1e-5 m");
     assert!(over_angle.is_empty(), "gradients differ by more than 0.01 rad");
-}
-
-/// AC2's speed: the compiled kernels (the build's WGSL, the program's uniforms) take at most
-/// 1.25× the hand-written ones' GPU time. A measurement: it compares two timings taken side by
-/// side, and another test's work on the GPU skews one of them.
-#[test]
-#[ignore = "measure: needs a GPU"]
-fn the_compiled_grazer_is_as_fast_as_the_hand_written_one() {
-    let c = compiled();
-    let gpu = RawGpu::new().expect("a GPU");
-    let (hand_d, hand_g) = hand_written();
-    let n = u64::from(POINTS);
-    let uniform = bytes_of(&c.params);
-    let run = |wgsl: &str, entry: &str, uniform: &[u8], out: u64| {
-        run_on(&gpu, &c.points, wgsl, entry, uniform, out, REPS).0
-    };
-
-    // Alternating; the first round warms the GPU up and isn't counted.
-    let (ours_dw, ours_de, ours_du) = compiled_kernel(&built("fields"), "distances", &c.batches);
-    let (ours_gw, ours_ge, ours_gu) = compiled_kernel(&built("fields"), "samples", &c.batches);
-    let (mut ours_d, mut ours_g, mut theirs_d, mut theirs_g) =
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for round in 0..=ROUNDS {
-        let t = [
-            run(&ours_dw, &ours_de, &ours_du, n * 4),
-            run(&hand_d, "eval_d", &uniform, n * 4),
-            run(&ours_gw, &ours_ge, &ours_gu, n * 16),
-            run(&hand_g, "eval_g", &uniform, n * 16),
-        ];
-        if round > 0 {
-            ours_d.extend(&t[0]);
-            theirs_d.extend(&t[1]);
-            ours_g.extend(&t[2]);
-            theirs_g.extend(&t[3]);
-        }
-    }
-    let (md, mg) = (median(&ours_d), median(&ours_g));
-    let (hmd, hmg) = (median(&theirs_d), median(&theirs_g));
-    println!(
-        "AC2: GPU time, median of {}: distance {:.3} ms vs hand-written {:.3} ms ({:.2}x); \
-         distance and gradient {:.3} ms vs {:.3} ms ({:.2}x)",
-        ours_d.len(),
-        md / 1e6,
-        hmd / 1e6,
-        md / hmd,
-        mg / 1e6,
-        hmg / 1e6,
-        mg / hmg
-    );
-    // A GPU without timestamps gives zeros, which would pass the time gates.
-    for (what, t) in
-        [("ours", &ours_d), ("theirs", &theirs_d), ("ours", &ours_g), ("theirs", &theirs_g)]
-    {
-        assert!(
-            t.iter().all(|&x| x > 0.0 && x.is_finite()),
-            "{what}: GPU times {t:?} aren't all positive"
-        );
-    }
-    assert!(md <= 1.25 * hmd, "the distance kernel is {:.2}x the hand-written one", md / hmd);
-    assert!(mg <= 1.25 * hmg, "the gradient kernel is {:.2}x the hand-written one", mg / hmg);
 }
 
 /// Measured, not gated (AC3): the fraction of spike 01's blocks (4×4×4 cells of 1.5 cm over

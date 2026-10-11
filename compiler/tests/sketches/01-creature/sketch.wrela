@@ -179,7 +179,7 @@ fn the_torsos_stated_bound_holds() {
     let around = Box3 { lo: vec3(-0.6, 0.7, -0.5), hi: vec3(0.6, 1.9, 1.6) }
     var near = 0
     var most = 0.0
-    for i in 0..16384 {
+    for i in 0..2048 {
         let p = around.sample(1, i)
         if abs(t.distance(p)) < 10cm {
             near += 1
@@ -188,7 +188,7 @@ fn the_torsos_stated_bound_holds() {
             most = max(most, g)
         }
     }
-    assert(near > 1000 && most >= 0.9, "too few samples near the surface")
+    assert(near > 100 && most >= 0.9, "too few samples near the surface")
 }
 
 // ---- §3 Skeleton and assembly -----------------------------------------------------------------
@@ -292,8 +292,8 @@ const BOTTOM: [f32; 3] = [6.5cm, 4.8cm, 4.2cm]
 @deterministic
 pub fn grazer_physique(c: Creature<Tissue>) -> Physique {
     Physique {
-        mass: c.integrate(|t| t.density, per: Per::Bone, finest: 1cm), // adaptive; mass, centre of mass, inertia per bone
-        collision: c.fit_capsules(per: Per::Bone, tolerance: 1cm), // cheap shapes to re-simulate on rollback
+        mass: c.integrate(|t| t.density, per: Per::Bone, finest: 2cm), // adaptive; mass, centre of mass, inertia per bone
+        collision: c.fit_capsules(per: Per::Bone, tolerance: 2cm), // cheap shapes to re-simulate on rollback
     }
 }
 

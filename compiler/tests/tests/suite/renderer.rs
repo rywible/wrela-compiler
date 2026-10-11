@@ -82,7 +82,7 @@ fn each_capability_draws_what_it_should() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_draws_the_native_hosts_frame() {
     hosts_agree_on("compiler/tests/renderer", "renderer-browser");
 }
@@ -164,7 +164,7 @@ fn a_kernel_writes_a_3d_textures_texels() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_writes_3d_texels_as_the_native_host_does() {
     hosts_agree_on("compiler/tests/volume", "volume-browser");
 }
@@ -184,7 +184,7 @@ fn each_shader_reads_its_own_parameters() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_writes_texels_as_the_native_host_does() {
     hosts_agree_on("compiler/tests/texels", "texels-browser");
 }
@@ -214,7 +214,7 @@ fn bands_green(frame: &[u8], n: u32) {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_holds_each_format_as_the_native_host_does() {
     let (dir, rel) = page("compiler/tests/formats", "formats-browser");
     let (chrome, _) = both_hosts(&dir, &rel, SIZE, SIZE);
@@ -233,7 +233,7 @@ fn a_dispatch_over_a_domain_covers_it_exactly() {
 }
 
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn the_browser_covers_a_domain_as_the_native_host_does() {
     let (dir, rel) = page("compiler/tests/domains", "domains-browser");
     let (chrome, _) = both_hosts(&dir, &rel, SIZE, SIZE);
@@ -243,7 +243,7 @@ fn the_browser_covers_a_domain_as_the_native_host_does() {
 /// Chrome's test mode times each pass on the GPU, as the native host does: the same passes, in
 /// the same frames, with the same labels.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn both_hosts_time_each_pass() {
     let (dir, rel) = page("compiler/tests/renderer", "renderer-timings");
     let run = wrela_tests::ChromeRun {
@@ -267,7 +267,7 @@ fn both_hosts_time_each_pass() {
 /// (compiler/tests/indexed): the left half green, the right red, in the native host and in
 /// Chrome, which agree on the frame and the state hash. Its three draws are three pipelines.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn indexed_draws_cull_and_bias_in_both_hosts() {
     let (dir, rel) = page("compiler/tests/indexed", "indexed-hosts");
     let states: Vec<String> = wrela_tests::manifest(&dir)
@@ -296,7 +296,7 @@ fn indexed_draws_cull_and_bias_in_both_hosts() {
 /// it, so whether the quad wrote its depth. The native host draws what each case should, and
 /// Chrome draws the same frame with the same state hash.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
     use wrela_abi::manifest::{Compare, DepthState, Stage};
     let (dir, rel) = page("compiler/tests/depth-state", "depth-state");
@@ -385,118 +385,4 @@ fn the_host_counts_each_pieces_work() {
     assert_eq!((work[1].target_texels, work[1].target_bytes), (0, 0));
     assert_eq!((work[3].target_texels, work[3].target_bytes), (64 * 32, 64 * 32 * 4), "show");
     assert!(work[3].pieces[0].fragments.abs_diff(64 * 32) * 100 <= 64 * 32, "show's fragments");
-}
-
-/// The labelled pieces of compiler/tests/timing.
-const PIECES: [&str; 3] = ["shade", "simulate", "blur"];
-
-/// Each piece's median GPU time (ms) over a run's second half, by label: the GPU's clocks
-/// settle over its first frames (the same kernel took 8 ms, then 2 ms from frame 20 on).
-fn medians(timings: &[GpuTiming]) -> std::collections::BTreeMap<String, f64> {
-    let half = timings.iter().map(|t| t.frame).max().unwrap_or(0) / 2;
-    let mut by: std::collections::BTreeMap<String, Vec<f64>> = Default::default();
-    for t in timings.iter().filter(|t| t.frame >= half) {
-        by.entry(t.label.clone()).or_default().push(t.nanos / 1e6);
-    }
-    by.into_iter().map(|(l, v)| (l, wrela_tests::median(&v))).collect()
-}
-
-/// A key's press at frame 0, as a script.
-fn press(key: &str) -> String {
-    format!(r#"[{{"frame":0,"type":"key","key":"{key}"}}]"#)
-}
-
-/// #28 §10.3 (AC10 of #51): both hosts time each pass and dispatch, with the name the program
-/// gave it (`std::gpu::label`), its start and its end, so a frame's span is its first start to
-/// its last end; and the serial mode runs them one at a time, so each one's time is within 10%
-/// of the same piece drawn alone (compiler/tests/timing: three independent pieces, which an
-/// Apple GPU runs side by side otherwise).
-///
-/// The GPU sets its clocks by its load and its heat, so frames run back to back (paced at 60 Hz,
-/// a light frame lets the clocks fall: the same pass took 1.0 ms, then 4.3, then 5.4 in Chrome),
-/// and the serial frame and each piece alone are measured alternately, twice each, the better
-/// of each kept: after a minute of full load the same pass took 4.8 ms, then 3.4 ms. Each piece
-/// alone is timed in the serial mode too: the mode waits for the GPU after each pass, which
-/// lowers its clock, so like is measured against like, and what's compared is whether the
-/// frame's other pieces change a piece's time.
-///
-/// In Chrome the wait goes through the GPU process, and the clock falls further and by more
-/// from run to run: the same pass 2% to 31% over its time alone in runs of the same build. So
-/// Chrome's are held to what the spec says of them: from 10% under to 40% over the piece alone,
-/// a serial mode that ran pieces side by side (under) or timed another's work in one (over)
-/// still caught. (Chrome's serial mode had matched within 1% only while the next frame's passes
-/// could start before the last frame's were run, which kept the GPU busy, and could run a
-/// frame's commands out of order: no longer.)
-#[test]
-#[ignore = "measure: needs Chrome, python3 and a GPU"]
-fn each_pass_times_as_it_does_alone_in_both_hosts() {
-    use std::collections::BTreeMap;
-    let (dir, rel) = page("compiler/tests/timing", "timing");
-    let frames = 160;
-    let times: Vec<f32> = (0..frames).map(|i| wrela_host::frame_time(i, 1000.0)).collect();
-    let native = |script: &str, timing: Timing| {
-        let options = wrela_host::Options { timing, ..Default::default() };
-        let mut host = Host::load_with(&dir, &options).expect("load");
-        let script = wrela_host::parse_script(script).expect("a script");
-        host.run_frames_with(&times, 256, 256, &script).expect("run").timings
-    };
-    let chrome = |script: &str, timing: Timing| {
-        let run = wrela_tests::ChromeRun {
-            timing,
-            script: Some(script.into()),
-            ..wrela_tests::ChromeRun::new(frames, 256, 256, 1000.0)
-        };
-        wrela_tests::run_in_chrome_with(&rel, run).timings
-    };
-    let mut report = Vec::new();
-    for (h, host) in ["the native host", "Chrome"].into_iter().enumerate() {
-        let run = |script: &str, timing: Timing| {
-            let timings = if h == 0 { native(script, timing) } else { chrome(script, timing) };
-            (medians(&timings), wrela_host::frame_spans(&timings), timings)
-        };
-        // A span for every frame, at least as long as any piece in it; each piece named.
-        let (_, spans, timings) = run("[]", Timing::Span);
-        assert_eq!(spans.len(), frames as usize, "{host}: a span for every frame");
-        for (f, span) in &spans {
-            let longest =
-                timings.iter().filter(|t| t.frame == *f).map(|t| t.nanos).fold(0.0, f64::max);
-            assert!(
-                *span >= longest / 1e6 - 1e-6,
-                "{host}, frame {f}: span {span} ms, a piece {longest} ns"
-            );
-        }
-        for p in PIECES {
-            assert!(timings.iter().any(|t| t.label == p), "{host} timed no `{p}`");
-        }
-        let mut serial: BTreeMap<String, f64> = BTreeMap::new();
-        let mut alone: BTreeMap<String, f64> = BTreeMap::new();
-        for _ in 0..2 {
-            for (k, piece) in PIECES.iter().enumerate() {
-                let (s, _, _) = run("[]", Timing::Serial);
-                let e = serial.entry(piece.to_string()).or_insert(f64::INFINITY);
-                *e = e.min(s[*piece]);
-                let (a, _, _) = run(&press(&format!("Digit{}", k + 1)), Timing::Serial);
-                let e = alone.entry(piece.to_string()).or_insert(f64::INFINITY);
-                *e = e.min(a[*piece]);
-            }
-        }
-        for piece in PIECES {
-            let (s, a) = (serial[piece], alone[piece]);
-            let line = format!(
-                "{host}: `{piece}` {s:.3} ms in the serial mode, {a:.3} ms alone ({:+.1}%)",
-                (s / a - 1.0) * 100.0
-            );
-            eprintln!("{line}");
-            let ratio = s / a;
-            let within =
-                if h == 0 { (0.9..=1.1).contains(&ratio) } else { (0.9..=1.4).contains(&ratio) };
-            report.push((within, line));
-        }
-    }
-    for (ok, line) in report {
-        assert!(
-            ok,
-            "outside the bound from the piece alone (natively 10%, in Chrome 10% under to 40% over): {line}"
-        );
-    }
 }

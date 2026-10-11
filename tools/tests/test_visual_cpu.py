@@ -71,9 +71,9 @@ class MotionCpuTest(unittest.TestCase):
 
 class LookbookCpuTest(unittest.TestCase):
     def test_default_jobs_follow_quota_and_requested_shot_count(self):
-        cases = [(1, True, [], 1), (2, True, [], 2), (4, True, [], 3),
-                 (16, True, [], 3), (16, False, [], 1), (4, True, ["0"], 1),
-                 (4, True, ["--jobs", "4"], 4)]
+        cases = [(1, True, [], 1), (2, True, [], 1), (4, True, [], 1),
+                 (16, True, [], 1), (16, False, [], 1), (4, True, ["0"], 1),
+                 (4, True, ["--jobs", "4"], 2)]
         for cores, software, options, jobs in cases:
             with self.subTest(cores=cores, software=software, options=options), \
                  tempfile.TemporaryDirectory() as out, \
@@ -88,7 +88,7 @@ class LookbookCpuTest(unittest.TestCase):
                 self.assertTrue(still.called)
                 self.assertEqual({call.args[5] for call in still.call_args_list}, {jobs})
 
-    def test_software_shots_share_cpu_budget_and_keep_explicit_mesa_override(self):
+    def test_software_shots_bound_mesa_by_each_shots_cpu_budget(self):
         for cores, jobs, override, expected in [(2, 2, None, 1), (4, 1, None, 4),
                                                 (16, 3, None, 5), (16, 3, "7", 5)]:
             with self.subTest(cores=cores, jobs=jobs, override=override), \
@@ -103,7 +103,7 @@ class LookbookCpuTest(unittest.TestCase):
                 args = run.call_args.args[0]
                 env = run.call_args.kwargs["env"]
                 self.assertEqual(args[args.index("--workers") + 1], str(expected))
-                self.assertEqual(env["LP_NUM_THREADS"], override or str(expected))
+                self.assertEqual(env["LP_NUM_THREADS"], str(expected))
                 self.assertEqual(args[args.index("--until") + 1], lookbook.STILL)
                 self.assertFalse(Path(args[args.index("--input") + 1]).exists())
 

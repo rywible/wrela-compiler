@@ -8,16 +8,6 @@ pub fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-/// Whether sampled tests run at full size: `WRELA_FULL` is set (as `tools/check.sh --full` does).
-pub fn full() -> bool {
-    std::env::var_os("WRELA_FULL").is_some()
-}
-
-/// `small` normally, `full_size` when [`full`] is set.
-pub fn sized<T>(small: T, full_size: T) -> T {
-    if full() { full_size } else { small }
-}
-
 /// The stack of each thread [`par_map_with`] and [`with_big_stack`] start: the oracle's
 /// derivation counting recurses once per nested rule and repetition, which can be deep for whole
 /// files.

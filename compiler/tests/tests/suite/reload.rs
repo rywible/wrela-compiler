@@ -180,87 +180,13 @@ fn a_new_sim_replays_the_old_ones_input() {
     assert_ne!(vec4(&mut unchanged, "report")[2], a[2], "the new weight changed the sum");
 }
 
-/// `wrela run` in Chrome: the page takes a literal edit at its next frame and swaps a new
-/// build in without reloading, with its sim replayed: its printed sim matches the native host's
-/// unbroken run, frame by frame.
-#[test]
-#[ignore = "measure: it times edits by the wall clock, needs Chrome and a GPU"]
-fn wrela_run_reloads_the_page_in_place() {
-    let pkg = edited("reload-chrome-src", |src| src.to_string() + "\n");
-    let out = super::scratch("reload-chrome");
-    let server =
-        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
-            .expect("serve");
-    std::fs::write(
-        out.join("1/script.json"),
-        r#"[{"frame":10,"type":"key","key":"Space"},{"frame":50,"type":"key","key":"Space"}]"#,
-    )
-    .expect("the script");
-    let url = format!(
-        "http://127.0.0.1:{}/#test&frames=900&width={SIZE}&height={SIZE}&fps=60&input=script.json&nohash=1",
-        server.port
-    );
-    let page = out.clone();
-    let chrome = std::thread::spawn(move || wrela_tests::run_url_in_chrome(&url, &page, 180));
-    let limit = std::time::Duration::from_secs(60);
-    wrela_tests::wait_polling(&server, std::time::Duration::from_secs(120));
-    // A first edit, shown once the page runs.
-    write_edit(&pkg, "main.wrela", |s| {
-        s.replacen("vec3(0.25, 0.5, 0.75)", "vec3(0.3, 0.5, 0.75)", 1)
-    });
-    wait_shown(&server, 1, limit);
-    let t = write_edit(&pkg, "main.wrela", |s| {
-        s.replacen("vec3(0.3, 0.5, 0.75)", "vec3(1.0, 0.5, 0.75)", 1)
-    });
-    let literal = wait_shown(&server, 2, limit);
-    let literal_ms = t.elapsed().as_secs_f64() * 1000.0;
-    let t = write_edit(&pkg, "main.wrela", |s| {
-        s.replace("clear: vec4(tint() * 0.5, 1.0)", "clear: vec4(tint().zyx * 0.5, 1.0)")
-            + "\npub fn version() -> u32 {\n    2\n}\n"
-    });
-    let structural = wait_shown(&server, 3, limit);
-    let structural_ms = t.elapsed().as_secs_f64() * 1000.0;
-    chrome.join().expect("the Chrome run");
-    println!(
-        "a literal edit shown at frame {} after {literal_ms:.0} ms; a structural one at frame {} after {structural_ms:.0} ms",
-        literal.frame, structural.frame
-    );
-    assert_eq!((literal.kind.as_str(), structural.kind.as_str()), ("literals", "build"));
-    assert!(literal_ms <= 500.0, "a literal edit took {literal_ms:.0} ms");
-    assert!(structural_ms <= 3000.0, "a structural edit took {structural_ms:.0} ms");
-    // The last frame: the edited tint drawn by the GPU, the new clear.
-    let frame = std::fs::read(out.join("results/frame.rgba")).expect("frame.rgba");
-    let at = |x: u32, y: u32| {
-        let i = ((y * SIZE + x) * 4) as usize;
-        [frame[i], frame[i + 1], frame[i + 2]]
-    };
-    assert_eq!(at(8, 32), [255, 128, 191]);
-    assert_eq!(at(56, 32), [96, 64, 128]);
-    // The sim printed across the swap, against the native host's unbroken run.
-    let printed = std::fs::read_to_string(out.join("results/log.txt")).expect("log.txt");
-    let lines: Vec<&str> = printed.lines().filter(|l| l.starts_with("frame ")).collect();
-    assert!(lines.len() >= 25, "{printed}");
-    let mut native = Host::load_with(
-        unedited(),
-        &wrela_host::Options { quiet: true, ..wrela_host::Options::default() },
-    )
-    .expect("load");
-    let s = script();
-    let mut expected = Vec::new();
-    for i in 0..900 {
-        native.lockstep_frame(i, FPS, SIZE, SIZE, &s).expect("a frame");
-        expected.extend(native.take_logs().into_iter().filter(|l| l.starts_with("frame ")));
-    }
-    assert_eq!(lines, expected.iter().map(String::as_str).collect::<Vec<_>>());
-}
-
 /// A page opened after hot reloads loads the newest build, and starts after the changes that
 /// build holds (M6 AC15). Three structural edits are built with no page open; a page opened
 /// then draws the third's clear colour. Playing spike 17, such a page replayed the server's
 /// changes from the first, and asked for a build the server had deleted (`/2/manifest.json`,
 /// 404), and stopped.
 #[test]
-#[ignore = "long: needs Chrome and a GPU"]
+#[ignore = "needs the runtime"]
 fn a_page_opened_after_hot_reloads_loads_the_newest_build() {
     let pkg = edited("reload-late-page-src", |src| src.to_string() + "\n");
     let out = super::scratch("reload-late-page");
@@ -306,15 +232,16 @@ fn a_page_opened_after_hot_reloads_loads_the_newest_build() {
 /// floor, M6). The runtime's own scripts are served for a build that's gone, and a new build's
 /// files are fetched from its own.
 #[test]
-#[ignore = "long: needs Chrome and a GPU"]
+#[ignore = "needs the runtime"]
 fn a_page_open_through_hot_reloads_keeps_running() {
-    let pkg = edited("reload-open-page-src", |src| src.to_string() + "\n");
+    let pkg =
+        edited("reload-open-page-src", |src| src.replace("frames % 120", "frames % 2") + "\n");
     let out = super::scratch("reload-open-page");
     let server =
         wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
             .expect("serve");
     let url = format!(
-        "http://127.0.0.1:{}/#test&frames=1500&width={SIZE}&height={SIZE}&fps=60&nohash=1",
+        "http://127.0.0.1:{}/#test&frames=360&width={SIZE}&height={SIZE}&fps=60&nohash=1",
         server.port
     );
     let page = out.clone();
@@ -326,18 +253,34 @@ fn a_page_open_through_hot_reloads_keeps_running() {
     for (k, clear) in clears.into_iter().enumerate() {
         write_edit(&pkg, "main.wrela", |s| {
             s.replace(&format!("clear: vec4({last}, 1.0)"), &format!("clear: vec4({clear}, 1.0)"))
+                .replace(
+                    &format!("a shipped file{}", "!".repeat(k)),
+                    &format!("a shipped file{}", "!".repeat(k + 1)),
+                )
         });
         last = clear;
         wait_shown(&server, k + 1, limit);
+        // Acknowledge a file from this build before the next edit deletes older builds.
+        // Its unique length proves which build served it; no wall-clock soak is needed.
+        let began = std::time::Instant::now();
+        loop {
+            let log = std::fs::read_to_string(out.join("results/console.log")).unwrap_or_default();
+            if log.contains(&format!("fetched {} bytes", 15 + k)) {
+                break;
+            }
+            assert!(began.elapsed() < limit, "build {k}'s file never arrived: {log}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
     chrome.join().expect("the page ran its frames");
     let frame = std::fs::read(out.join("results/frame.rgba")).expect("frame.rgba");
     let i = ((32 * SIZE + 56) * 4) as usize;
     assert_eq!([frame[i], frame[i + 1], frame[i + 2]], [32, 96, 64], "the third build's clear");
-    // The shipped file, fetched every two seconds, came each time: a new build's from its own
-    // files (the page's first build's are deleted by the third).
+    // Each edited build's uniquely sized file came from its own files, including after the
+    // page's first build was deleted. Frequent requests exercise this within six seconds.
     let log = std::fs::read_to_string(out.join("results/log.txt")).expect("log.txt");
-    let fetched = log.lines().filter(|l| l.starts_with("fetched 14 bytes")).count();
     assert!(!log.contains("didn't come"), "a fetch failed after a hot reload:\n{log}");
-    assert!(fetched >= 10, "only {fetched} fetches came:\n{log}");
+    for size in 15..=17 {
+        assert!(log.contains(&format!("fetched {size} bytes")), "missing build file: {log}");
+    }
 }

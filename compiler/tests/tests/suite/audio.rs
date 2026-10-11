@@ -32,7 +32,7 @@ fn the_voice_sounds() {
 
 /// Chrome's AudioWorklet, rendering offline, gives the native host's samples, bit for bit.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn both_hosts_render_the_same_samples() {
     let (dir, rel) = page("compiler/tests/audio", "audio-hosts");
     let want = native(&dir);
@@ -82,7 +82,7 @@ const MIXED_HASH: &str = "6f33c8535e5a87db";
 /// Chrome's AudioWorklet, rendering the mixer offline, gives the native host's samples, bit for
 /// bit; and at its busiest it takes under a quarter of a core.
 #[test]
-#[ignore = "long: needs Chrome, python3 and a GPU"]
+#[ignore = "needs the runtime"]
 fn both_hosts_mix_the_same_samples() {
     let (dir, rel) = page("compiler/tests/mixer", "mixer-hosts");
     let want = mixed(&dir);
