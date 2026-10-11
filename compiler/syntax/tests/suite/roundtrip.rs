@@ -112,12 +112,6 @@ fn blocks_nested_on_one_line_format_quickly() {
 }
 
 #[test]
-#[ignore]
-fn show_sample() {
-    println!("{}", round_trip(SAMPLE));
-}
-
-#[test]
 fn long_lists_and_chains_break_to_fit() {
     let src = "fn f() {\n    let v = compute(first_argument_value, second_argument_value, third_argument, fourth_argument_value)\n    let w = items.filter(is_good_enough_for_us).map(transform_each_one).fold(starting_value, combine_two)\n    let t = alpha_value_one + beta_value_two * gamma + delta_value_three + epsilon_value_four_five_six\n}\n";
     let out = round_trip(src);
