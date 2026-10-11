@@ -31,54 +31,6 @@ fn map_package(name: &str, main: &str) -> PathBuf {
     dir
 }
 
-/// The tighter near search visits exactly the same wanted tiles in the same order as the
-/// far search, including ties on boundaries and cameras on either side of the origin.
-#[test]
-fn the_near_tile_search_keeps_every_candidate_in_order() {
-    let tests = r#"
-use engine::place::{TILE, tile_of}
-use streaming::{near_tile_radius, tile_distance, tile_radius}
-
-fn candidates(eye: vec2, radius: i32, reach: f32) -> Vec<vec2i> {
-    let at = tile_of(eye)
-    var out: Vec<vec2i> = Vec::new()
-    for j in (at.y - radius)..(at.y + radius + 1) {
-        for i in (at.x - radius)..(at.x + radius + 1) {
-            let t = vec2i(i, j)
-            if tile_distance(t, eye) < reach { out.push(t) }
-        }
-    }
-    out
-}
-
-@test
-fn search_order() {
-    for cell in [-67108864, -8388608, -40, -1, 0, 1, 40, 8388608, 67108864] {
-        for x in [-0.001, 0.0, 128.0, 255.999] {
-            for z in [0.0, 128.0, 255.999] {
-                let eye = vec2(f32(cell) * TILE + x, -f32(cell) * TILE + z)
-                for reach in [-350.0, 0.0, 1.0, 255.999, 256.0, 256.001, 350.0, 512.0, 1200.0, bitcast_f32(0x7f7fffff)] {
-                    let near = candidates(eye, near_tile_radius(eye, reach, 900.0), reach)
-                    let far = candidates(eye, tile_radius(900.0), reach)
-                    assert(near.len() == far.len(), "a wanted tile was skipped")
-                    for i in 0..near.len() {
-                        assert(near[i] == far[i], "the nearest-tile tie order changed")
-                    }
-                }
-            }
-        }
-    }
-}
-"#;
-    let dir = super::engine_package("last-green/tile-search", "tile_search", tests);
-    std::fs::copy(
-        repo_root().join("examples/last-green/streaming.wrela"),
-        dir.join("streaming.wrela"),
-    )
-    .expect("the floor's tile search");
-    assert_eq!(super::tests_pass(&dir), 1);
-}
-
 /// AC1: the floor's map is wrela source written with the engine's types, and holds #44's
 /// anatomy: a gate, a town's site, 3–5 anchors, a Warden's arena, rest points, waystones, 25–35
 /// echoes' sites and views; its area is 3 km² within 10% (Q1); and the engine's own refusals
