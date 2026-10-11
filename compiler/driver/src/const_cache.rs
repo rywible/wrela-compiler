@@ -56,12 +56,13 @@ fn package_root(dir: &Path) -> Option<&Path> {
     (dir.file_name()? == "consts" && build.file_name()? == "build").then(|| build.parent())?
 }
 
-/// A constant's key: its module's WASM and the fuel it may use, with the compiler's version.
+/// A constant's key: its module's WASM and the fuel it may use, with the identity of the code
+/// that runs it and reads its value back (build.rs: those sources' hash, and wasmtime's version).
 /// How many threads computed it isn't part of it: results don't depend on them (§6.12).
 pub fn key(wasm: &[u8], fuel: u64) -> String {
     let mut h = Sha256::new();
     h.update(MAGIC);
-    h.update(env!("CARGO_PKG_VERSION").as_bytes());
+    h.update(env!("WRELA_CONST_IDENTITY").as_bytes());
     h.update(fuel.to_le_bytes());
     h.update((wasm.len() as u64).to_le_bytes());
     h.update(wasm);
@@ -414,7 +415,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wrela-consts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let k = key(b"\0asm module", 1 << 34);
-        assert_eq!(k, "9055858743647bc9bcd49a719c4b94f48e6d263cb84cbc0ded2af72ebfd714b8");
+        // The same every time, for one build of the compiler (its code's hash is in it).
+        assert_eq!(k, key(b"\0asm module", 1 << 34));
+        assert!(k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit()), "{k}");
         assert_ne!(k, key(b"\0asm module", 1 << 35), "the fuel is part of the key");
         assert_ne!(k, key(b"\0asm modulf", 1 << 34));
         let v = Value::Bytes(vec![1, 2, 3]);

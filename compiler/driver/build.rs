@@ -1,7 +1,9 @@
 //! Embeds the explanations `wrela explain` prints (explain/<code>.wrela), one per diagnostic
 //! code, as a table: `src/explain.rs` reads them. Also embeds the conformance suite's cases, for
-//! `wrela primer`, and the packages `wrela studio` writes beside the lens's program.
+//! `wrela primer`, and the packages `wrela studio` writes beside the lens's program; and the
+//! identity of the code that computes a constant, for the constants cache's keys.
 
+use sha2::{Digest, Sha256};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +39,43 @@ fn main() {
         packages.push_str(&table(name, "&[u8]", "include_bytes", &files));
     }
     out("packages.rs", &packages);
+    // What a computed constant's value depends on beside its WASM, the fuel and the format
+    // (const_cache.rs's key): the code that runs it and reads it back, and the host it runs
+    // in. Their sources' hash is in each key, so a cache shared by checkouts of other commits
+    // never serves a value they computed differently.
+    let mut sources: Vec<PathBuf> = [
+        "compiler/driver/src/consts.rs",
+        "compiler/driver/src/const_cache.rs",
+        "compiler/lower/src/eval.rs",
+        "runtime/native/src/program.rs",
+        "runtime/native/src/trace.rs",
+    ]
+    .iter()
+    .map(|p| root.join(p))
+    .collect();
+    sources.extend(
+        walk(&root.join("runtime/abi/src"), &|_| true, &|n| n.ends_with(".rs"))
+            .into_iter()
+            .map(|(_, p)| p),
+    );
+    let mut h = Sha256::new();
+    for path in &sources {
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        h.update((text.len() as u64).to_le_bytes());
+        h.update(&text);
+    }
+    // And the WASM engine's version.
+    let lock = root.join("Cargo.lock");
+    println!("cargo:rerun-if-changed={}", lock.display());
+    let lock = std::fs::read_to_string(&lock).expect("Cargo.lock");
+    let wasmtime = lock
+        .split("[[package]]")
+        .find(|p| p.contains("\nname = \"wasmtime\"\n"))
+        .expect("wasmtime in Cargo.lock");
+    h.update(wasmtime.as_bytes());
+    let id: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    println!("cargo:rustc-env=WRELA_CONST_IDENTITY={id}");
 }
 
 /// The files under `base` whose names `keep` takes, in the directories `enter` takes (at any

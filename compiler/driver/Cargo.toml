@@ -37,3 +37,7 @@ gpu = ["wrela-host/gpu"]
 
 [lints]
 workspace = true
+
+[build-dependencies]
+# The identity of the code that computes a constant (build.rs, const_cache.rs).
+sha2 = "0.10"
