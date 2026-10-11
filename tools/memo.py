@@ -66,10 +66,10 @@ SLOW = 5.0
 KEEP_DAYS = 14
 
 VERSION = "v1"
-# Part of every entry's key. Change it with any change to what an entry keeps or how it is
-# matched (what a trace gives, which inputs and sources count, the keys, the builds' check), so
-# that the entries made before are not used; a change to anything else here keeps them.
-MEANING = "2026-10-11.1"
+# Part of every entry's key: the code that decides what an entry keeps and how it is matched
+# (`meaning`, set once this file is read), so the entries made before a change to it are not
+# used, and a change to anything else here keeps them.
+MEANING = None
 
 
 def sha(data):
@@ -213,6 +213,13 @@ def touched(log):
     return seen
 
 
+def unplaced(seen):
+    """Whether a run read a relative path its trace doesn't say the directory of (a call with no
+    directory descriptor, after a `chdir`, as `mkdir -p` does): such a path can't be checked
+    again. (What it wrote isn't an input.)"""
+    return any(how != "write" and not os.path.isabs(p) for p, how in seen.items())
+
+
 class Trace:
     """What a test's trace says beyond the paths it touched: the programs it ran, and the paths
     touched only while one of its builds ran (between `recorded_build`'s marks; builds on other
@@ -283,7 +290,7 @@ class Inputs:
         # The checkout's files are inputs wherever it is (in /tmp, say), its target/ aside, and a
         # package's constants cache (`build/consts`, keyed by each constant's code and inputs).
         if under(self.root):
-            if f"{os.sep}build{os.sep}consts" in path[len(self.root):] + os.sep:
+            if f"{os.sep}build{os.sep}consts{os.sep}" in path[len(self.root):] + os.sep:
                 return False
             return not any(under(i) for i in self.ignore if i.startswith(self.root + os.sep))
         return not any(under(i) for i in self.ignore)
@@ -297,6 +304,19 @@ class Inputs:
 
     def path(self, name):
         return os.path.join(self.root, name[5:]) if name.startswith("repo:") else name
+
+    def changed_since(self, seen, since):
+        """Whether a path touched and not written was changed at or after `since` (a time): while
+        a run that read it ran, so what it read may not be what it is now."""
+        for path, how in seen.items():
+            if how == "write" or not self.kept(path):
+                continue
+            try:
+                if os.stat(path).st_mtime >= since:
+                    return True
+            except OSError:
+                pass
+        return False
 
     def of(self, seen, digests):
         """The entry's inputs: {name: state} for each path touched and not written."""
@@ -812,15 +832,18 @@ class Rebuilds:
         if m is not None:
             command = ["strace", "-f", "--seccomp-bpf", "-qq", "-y", "-e", "trace=%file", "-o",
                        log, *command]
+        started = time.time()
         r = subprocess.run(command, cwd=self.root, capture_output=True)
         files = self.files_hash(dir) if r.returncode == 0 else None
         if m is not None and files is not None:
             try:
                 with open(log, encoding="utf-8", errors="surrogateescape") as f:
                     seen = touched(f.read())
-                # What it wrote into its output aside (its `-o` is under target/, not kept).
-                inputs = m.inputs.of(seen, m.digests)
-                write_atomically(path, json.dumps({"inputs": inputs, "files": files}))
+                # Its inputs as they are after it (its `-o` is under target/, not kept), unless
+                # one changed while it ran.
+                if not unplaced(seen) and not m.inputs.changed_since(seen, started):
+                    inputs = m.inputs.of(seen, Digests())
+                    write_atomically(path, json.dumps({"inputs": inputs, "files": files}))
             except OSError:
                 pass
         return files
@@ -955,8 +978,13 @@ class Memo:
         return "built", builds
 
     def remember(self, test_id, program_dir, test, log_text, seconds, record_text=""):
-        """Keeps a passing run's entry, from its strace log and its builds' record."""
+        """Keeps a passing run's entry, from its strace log and its builds' record: unless a file
+        it read changed while it ran, or it named one the trace can't place. Its scope, or None
+        when it keeps none."""
+        started = time.time() - seconds
         trace = Trace(log_text)
+        if unplaced(trace.seen) or self.inputs.changed_since(trace.seen, started):
+            return None
         record = [json.loads(l) for l in record_text.splitlines() if l.strip()]
         scope, builds = self.scope_of(test_id, program_dir, test, trace, record)
         seen = trace.seen
@@ -964,7 +992,8 @@ class Memo:
             # What only the builds read is the builds' inputs: their files stand for them.
             seen = {p: h for p, h in seen.items()
                     if not (p in trace.in_builds_only and (is_wrela(p) or h in ("list", "stat")))}
-        inputs = self.inputs.of(seen, self.digests)
+        # As they are after it ran, not when the gate began.
+        inputs = self.inputs.of(seen, Digests())
         rust = self.rust(scope, test_id, program_dir, test)
         env = self.env_of(self.code_env_names(test_id, program_dir, test, inputs))
         self.store.save(test_id, rust, env, inputs, seconds, builds=builds)
@@ -1194,10 +1223,11 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
                             built = f.read()
                     except OSError:
                         built = ""
-                    memo.remember(extra, program_dir, n, text, took, built)
+                    kept = memo.remember(extra, program_dir, n, text, took, built)
                     memo.store.set_timing(extra, cpu[extra], alone=True)
                     shutil.rmtree(scratch, ignore_errors=True)
-                    print(f"  {name}: {took:.1f}s, alone ({cpu[extra]:.0f}s of CPU)")
+                    print(f"  {name}: {took:.1f}s, alone ({cpu[extra]:.0f}s of CPU)"
+                          + ("" if kept else "; not remembered: a file it read changed as it ran"))
                 if todo:
                     start_alone()
                     waiting.append(runs[-1])
@@ -1211,6 +1241,34 @@ def run_tests(logs, native_cache, mode, dir, args, parent):
     print(f"  {ran} tests passed")
     memo.store.prune()
     return 1 if failed or ran + len(remembered) == 0 else 0
+
+
+def meaning():
+    """A hash of the code that decides what an entry keeps and how it is matched: what a trace
+    gives, which inputs and sources count, the keys, the builds' check. Its syntax tree, without
+    comments or docstrings, so that a change to how it reads alone doesn't drop every entry."""
+    import ast
+    import inspect
+    import textwrap
+
+    deciding = [unescape, lines, events, touched, unplaced, Trace, Digests, Inputs, env_names,
+                Sources, Store.entries_dir, Store.find, Store.save, Rebuilds, Memo, is_wrela]
+    constants = [CALLS, WRITE_FLAGS, LINE.pattern, UNFINISHED.pattern, RESUMED.pattern,
+                 STRING.pattern, RESULT_PATH.pattern, BUILD_BEGIN, BUILD_END, ENV_NAMES,
+                 ENV_PREFIXES, ENV_NOT, COMPILE_ONLY, NAMES_COMPILER.pattern, SCOPES]
+    parts = [repr(sorted(c) if isinstance(c, (set, dict)) else c) for c in constants]
+    for o in deciding:
+        tree = ast.parse(textwrap.dedent(inspect.getsource(o)))
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.Expr) and \
+                    isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+                node.body = body[1:] or [ast.Pass()]
+        parts.append(ast.dump(tree))
+    return sha("\n".join(parts))[:16]
+
+
+MEANING = meaning()
 
 
 if __name__ == "__main__":

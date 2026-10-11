@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -93,6 +94,49 @@ class Inputs(Files):
         self.write("pkg/b.wrela", "b")
         self.assertNotEqual(d.compute(os.path.join(self.root, "pkg"), "list"), before)
         self.assertEqual(d.compute(os.path.join(self.root, "pkg"), "stat"), "dir")
+
+    def test_only_the_constants_cache_itself_is_left_out(self):
+        inputs = memo.Inputs(self.root, os.path.join(self.root, "target"))
+        self.assertFalse(inputs.kept(os.path.join(self.root, "ex/build/consts/ab12.wcv")))
+        self.assertTrue(inputs.kept(os.path.join(self.root, "ex/build/consts.json")))
+        self.assertTrue(inputs.kept(os.path.join(self.root, "ex/build/consts-old/a")))
+
+    def test_a_file_changed_while_a_run_ran_is_found(self):
+        inputs = memo.Inputs(self.root, os.path.join(self.root, "target"))
+        a = self.write("engine/a.wrela", "a")
+        old = time.time() - 60
+        os.utime(a, (old, old))
+        started = time.time() - 30
+        self.assertFalse(inputs.changed_since({a: "read"}, started))
+        self.write("engine/a.wrela", "b")
+        self.assertTrue(inputs.changed_since({a: "read"}, started))
+        self.assertFalse(inputs.changed_since({a: "write"}, started), "its own output")
+
+    def test_a_relative_path_cant_be_placed(self):
+        self.assertTrue(memo.unplaced({"rel/a.wrela": "read", "/abs/b": "read"}))
+        self.assertFalse(memo.unplaced({"/abs/b": "read", "made/here": "write"}))
+
+
+class Meaning(unittest.TestCase):
+    def meaning_of(self, text):
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "memo_copy.py"), "w") as f:
+                f.write(text)
+            out = subprocess.run([sys.executable, "-c", "import memo_copy; print(memo_copy.MEANING)"],
+                                 cwd=d, capture_output=True, text=True, check=True)
+            return out.stdout.strip()
+
+    def test_the_key_follows_the_matching_code_not_its_comments(self):
+        with open(os.path.join(TOOLS, "memo.py")) as f:
+            text = f.read()
+        anchor = "    def changed_since(self, seen, since):\n"
+        self.assertIn(anchor, text)
+        base = self.meaning_of(text)
+        self.assertEqual(len(base), 16)
+        commented = text.replace(anchor, "    # a comment\n" + anchor)
+        self.assertEqual(self.meaning_of(commented), base)
+        changed = text.replace("st_mtime >= since", "st_mtime > since")
+        self.assertNotEqual(self.meaning_of(changed), base)
 
 
 class Store(Files):
@@ -247,6 +291,11 @@ class Builds(Sources):
         self.record = json.dumps({"pkg": self.root + "/ex", "args": ["--testing"], "files": "h1"}) + "\n"
 
     def remember(self, trace=None, record=None, test="a::x"):
+        # Its files as they were before the run (a file changed while it ran keeps no entry).
+        old = time.time() - 60
+        for dirpath, _, names in os.walk(self.root):
+            for path in [dirpath, *(os.path.join(dirpath, n) for n in names)]:
+                os.utime(path, (old, old))
         return self.memo.remember("t:suite:test:" + test, "t/tests/suite", test,
                                   trace or self.trace, 1.0, self.record if record is None else record)
 
