@@ -1,0 +1,76 @@
+// run: a job in a simulation's state is cloned, hashed, saved and loaded mid-way, and each
+// copy goes on as the original does
+// expect: roundtrip() = 22
+// expect: cloned() = 22
+// expect: hashes_agree() = 1
+
+use std::hash::{StateHash, state_hash}
+use std::job::{Job, Step}
+use std::serialize::{Serialize, load, save}
+
+/// A boss whose attack runs over several ticks: a job in the simulation's state.
+struct Boss: Clone + StateHash + Serialize {
+    hp: u32,
+    attack: Job<attack>,
+}
+
+/// Three swings a tick apart, a pause, then the damage dealt.
+@job
+fn attack(power: take u32) -> u32 {
+    var swings: Vec<u32> = Vec::new()
+    let base = Box::new(power)
+    for i in 0..3 {
+        swings.push(i + 1)
+        yield
+    }
+    let finisher = Box::new(10)
+    yield
+    var total = 0
+    for s in swings {
+        total += s * base.get()
+    }
+    total + finisher.get()
+}
+
+@deterministic
+fn tick(b: mut Boss) -> u32 {
+    match b.attack.resume() {
+        Step::Done(d) => d,
+        Step::Yielded => 0,
+    }
+}
+
+pub fn roundtrip() -> u32 {
+    var boss = Boss { hp: 100, attack: attack.start(2) }
+    let _ = tick(mut boss)
+    let bytes = save(boss)
+    var loaded: Boss = load(take bytes).unwrap()
+    var last = 0
+    for _ in 0..4 {
+        last = tick(mut loaded)
+    }
+    last
+}
+
+pub fn cloned() -> u32 {
+    var boss = Boss { hp: 100, attack: attack.start(2) }
+    let _ = tick(mut boss)
+    var copy = boss.clone()
+    var last = 0
+    for _ in 0..4 {
+        last = tick(mut copy)
+    }
+    last
+}
+
+pub fn hashes_agree() -> u32 {
+    var boss = Boss { hp: 100, attack: attack.start(2) }
+    let _ = tick(mut boss)
+    let _ = tick(mut boss)
+    let copy = boss.clone()
+    let bytes = save(boss)
+    let loaded: Boss = load(take bytes).unwrap()
+    if state_hash(copy) == state_hash(boss) && state_hash(loaded) == state_hash(boss) { 1 } else {
+        0
+    }
+}

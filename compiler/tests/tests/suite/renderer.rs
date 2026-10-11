@@ -345,6 +345,48 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
     frames_match(&chrome, &native);
 }
 
+/// `Options::counts` (`wrela estimate`'s features): with a timing, each timed pass's and
+/// dispatch's work, as the GPU counted it, in the timings' order. compiler/tests/timing's frame:
+/// `shade` and `blur` each cover a 1024 × 1024 `Rgba16Float` target with one triangle (three
+/// vertices, a fragment a texel, 8 MB written); `simulate` runs 262,144 invocations; `show`
+/// covers the screen. A GPU that can't count (wgpu's Metal) refuses the load and says why.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_host_counts_each_pieces_work() {
+    let (dir, _) = page("compiler/tests/timing", "timing-counts");
+    let options =
+        wrela_host::Options { timing: Timing::Serial, counts: true, ..Default::default() };
+    let mut host = match Host::load_with(&dir, &options) {
+        Ok(host) => host,
+        Err(e) => {
+            assert!(e.to_string().contains("PIPELINE_STATISTICS_QUERY"), "{e}");
+            return;
+        }
+    };
+    host.lockstep_frame(0, 60.0, 64, 32, &[]).expect("a frame");
+    let timings = host.take_timings().expect("timings");
+    let work = host.take_work().expect("work");
+    let labels: Vec<&str> = timings.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(labels, ["shade", "simulate", "blur", "show"]);
+    assert_eq!(work.iter().map(|w| w.label.as_str()).collect::<Vec<_>>(), labels);
+    let side = 1024 * 1024;
+    for w in [&work[0], &work[2]] {
+        assert_eq!((w.target_texels, w.target_bytes), (side, side * 8), "{}: its target", w.label);
+        let [p] = &w.pieces[..] else { panic!("{}: one draw, not {:?}", w.label, w.pieces) };
+        assert_eq!((p.vertices, p.invocations), (3, 0), "{}", w.label);
+        // Clipping is the GPU's: the triangle, twice the target's size, may leave as several
+        // (lavapipe's clipper makes three), and coverage at its edges is the GPU's too: a
+        // fragment a texel, within 1%.
+        assert!((1..=4).contains(&p.primitives), "{}: {} primitives", w.label, p.primitives);
+        assert!(p.fragments.abs_diff(side) * 100 <= side, "{}: {} fragments", w.label, p.fragments);
+    }
+    let [p] = &work[1].pieces[..] else { panic!("simulate: one dispatch") };
+    assert_eq!((p.pipeline.as_str(), p.invocations, p.fragments), ("simulate", 262_144, 0));
+    assert_eq!((work[1].target_texels, work[1].target_bytes), (0, 0));
+    assert_eq!((work[3].target_texels, work[3].target_bytes), (64 * 32, 64 * 32 * 4), "show");
+    assert!(work[3].pieces[0].fragments.abs_diff(64 * 32) * 100 <= 64 * 32, "show's fragments");
+}
+
 /// The labelled pieces of compiler/tests/timing.
 const PIECES: [&str; 3] = ["shade", "simulate", "blur"];
 

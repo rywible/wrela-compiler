@@ -1666,8 +1666,8 @@ fn the_wolfs_description_agrees_with_its_diagnosis() {
         "wolf",
         "describe-moved",
         &[(
-            "Lipschitz {\n    wolf().field()",
-            "Lipschitz {\n    wolf().field().translate(vec3(0.010, 0.0, 0.0))",
+            "Field<Coat> {\n    wolf().field()",
+            "Field<Coat> {\n    wolf().field().translate(vec3(0.010, 0.0, 0.0))",
         )],
     );
     let b = describe_agrees_with_the_diagnosis(&moved);
@@ -2020,9 +2020,9 @@ fn a_pointer_drag_moves_the_surface_under_it() {
 const BALL: [(&str, &str); 3] = [
     (
         "subject.wrela",
-        "use std::field::{Lipschitz, sphere}
+        "use std::field::{Surface, sphere}
 
-pub fn subject() -> Lipschitz {
+pub fn subject() -> Surface {
     sphere(0.30).translate(vec3(0.0, 0.30, 0.0))
 }
 ",

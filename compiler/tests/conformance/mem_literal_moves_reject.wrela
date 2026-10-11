@@ -1,0 +1,24 @@
+// rejects: mem.literal-moves
+struct Log {
+    lines: Vec<u32>,
+}
+
+struct Archive {
+    log: Log,
+}
+
+fn twice() -> u32 {
+    let log = Log { lines: Vec::new() }
+    let a = Archive { log }
+    let b = Archive { log } //~ E0500
+    a.log.lines.len() + b.log.lines.len()
+}
+
+// A borrowed parameter isn't owned: its fields aren't the literal's to take.
+fn borrowed(log: Log) -> Archive {
+    Archive { log } //~ E0502
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = twice()
+}

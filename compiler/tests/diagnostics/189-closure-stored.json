@@ -5,23 +5,23 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "to keep work for later, store an enum of actions and `match` on it"
+        "copy what it needs into a local first (`let x = count.clone()`), or pass the closure straight to a parameter"
       ],
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "a function type can only be a parameter's type",
+      "message": "a closure that captures `count`, a projection, can't be stored in a struct or enum",
       "notes": [
-        "a closure that captures only values can be stored, but its type is its own and inferred (§6.7)"
+        "a closure that captures only `Copy` values holds copies of them, and can be stored; one that borrows or changes what it uses can only be passed down (§6.7)"
       ],
       "severity": "error",
       "span": {
-        "column": 15,
-        "end": 110,
-        "end_column": 19,
-        "end_line": 5,
-        "line": 5,
-        "start": 106
+        "column": 11,
+        "end": 245,
+        "end_column": 49,
+        "end_line": 14,
+        "line": 14,
+        "start": 207
       },
       "title": "a closure that escapes"
     }

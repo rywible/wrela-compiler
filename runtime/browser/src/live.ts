@@ -24,8 +24,14 @@ export class Live {
   /** The newest change applied that no frame has shown yet. */
   #unshown: number | null = null;
 
-  /** `base`: the page's URL, which the server's paths resolve against. */
-  constructor(readonly base: string) {}
+  /** `base`: the page's URL, which the server's paths resolve against; `after`: the last change
+   * the page's build already holds (the server marks the page with it). */
+  constructor(
+    readonly base: string,
+    after = 0,
+  ) {
+    this.#seq = after;
+  }
 
   /** Asks the server for what's new, again and again, until the page goes away. */
   start(): void {

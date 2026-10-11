@@ -5,6 +5,11 @@ struct Button {
     on_click: fn(),
 }
 
-fn make(count: mut u32) -> Button {
-    Button { on_click: || { count += 1 } }
+fn press(b: Button) {
+    let f = b.on_click
+    f()
+}
+
+fn wire(count: mut u32) {
+    press(Button { on_click: || { count += 1 } })
 }

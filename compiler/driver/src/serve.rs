@@ -171,7 +171,7 @@ fn watch(state: &Shared, stopping: &AtomicBool, mut seen: Files) {
 fn literal_values(pkg: &Path, page: &Path, now: &Files, built: &Files) -> Option<Vec<f32>> {
     let r = studio::report(page).ok()?;
     // The build's report names its files from the lens.
-    let lifted = studio::lifted_files(&studio::dir(pkg).join("lens"), &r, built)?;
+    let lifted = studio::lifted_files(&studio::program_dir(pkg), &r, built)?;
     studio::literal_values(&lifted, &r.literals, now, built)
 }
 

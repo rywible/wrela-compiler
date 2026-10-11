@@ -145,11 +145,6 @@ export class Encoder {
     return this.#command(Opcode.Post, [request, u.length, body.length], bytes);
   }
 
-  log(text: string): this {
-    const t = utf8(text);
-    return this.#command(Opcode.Log, [t.length], pad(t));
-  }
-
   label(name: string): this {
     const t = utf8(name);
     return this.#command(Opcode.Label, [t.length], pad(t));

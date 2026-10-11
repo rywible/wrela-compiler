@@ -1165,6 +1165,20 @@ impl<'a> Builder<'a> {
                 let l = List { open: "[", close: "]", multiline, fill, ..PARENS };
                 self.list(items, |_, x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
+            ExprKind::ArrayFill { items, fill } => {
+                let multiline = items.first().is_some_and(|x| {
+                    self.text[e.span.start as usize..x.span.start as usize].contains('\n')
+                });
+                let mut parts: Vec<(&Expr, bool)> = items.iter().map(|x| (x, false)).collect();
+                parts.push((fill, true));
+                let start =
+                    |b: &Self, p: &(&Expr, bool)| if p.1 { b.next_pos() } else { p.0.span.start };
+                let item = |b: &mut Self, p: &(&Expr, bool)| {
+                    if p.1 { concat([b.tok(".."), b.expr(p.0)]) } else { b.expr(p.0) }
+                };
+                let l = List { open: "[", close: "]", multiline, ..PARENS };
+                self.list(&parts, start, item, e.span.end, l)
+            }
             ExprKind::ArrayRepeat { value, count } => concat([
                 self.tok("["),
                 self.expr(value),

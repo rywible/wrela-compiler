@@ -119,6 +119,7 @@ pub struct Watch {
     literals: Vec<Literal>,
     values: Vec<f32>,
     generation: u32,
+    changes: u32,
 }
 
 impl Watch {
@@ -128,7 +129,14 @@ impl Watch {
             literals: Vec::from(literals),
             values: Vec::from_fn(literals.len(), |i| literals[i].value()),
             generation: generation(),
+            changes: 0,
         }
+    }
+
+    /// How many times a literal it watches has had a new value, as of its last `changed`: a
+    /// key for what's cooked from them (`std::cache::Stale`), which a change makes stale.
+    pub fn version(self) -> u32 {
+        self.changes
     }
 
     /// Whether a literal it watches has a new value since it was made or last changed: then it
@@ -146,6 +154,9 @@ impl Watch {
                 self.values[i] = v
                 any = true
             }
+        }
+        if any {
+            self.changes += 1
         }
         any
     }
@@ -241,6 +252,299 @@ impl Checks for Report {
         let line = f"{{\"name\":\"{name}\",\"check\":\"{kind}\",\"value\":{value},\"target\":{target},\"miss\":{miss},\"within\":{within},\"holds\":{ok}}}"
         self.json.push_str(line.as_str())
     }
+}
+
+// ---- minimizing (`wrela solve`) ---------------------------------------------------------------
+
+/// A function of the literals made as small as it gets by changing some of them (`wrela solve`,
+/// §22): BFGS from their values now, each step along a line searched until the value falls
+/// enough (Armijo's rule), the derivatives from `gradient`, 16 literals at a time. Then each is
+/// rounded to its source's decimals, the one that changed most first and the rest solved again
+/// with it held; a literal gets more decimals while rounding would cost more than 5% of the
+/// value (the last one, against the solved value; each before it, up to three more, against the
+/// value before rounding it).
+pub struct Minimize {
+    free: Vec<Literal>,
+    decimals: Vec<u32>,
+    units: Vec<f64>,
+    start: Vec<f32>,
+    finish: Vec<f32>,
+    before: f32,
+    solved: f32,
+    after: f32,
+    steps: u32,
+}
+
+impl Minimize {
+    /// Nothing free yet.
+    pub fn new() -> Minimize {
+        Minimize {
+            free: Vec::new(),
+            decimals: Vec::new(),
+            units: Vec::new(),
+            start: Vec::new(),
+            finish: Vec::new(),
+            before: 0.0,
+            solved: 0.0,
+            after: 0.0,
+            steps: 0,
+        }
+    }
+
+    /// Lets `l` change. Its text has `decimals` decimals of `unit` (`15cm`: 0 decimals of 0.01;
+    /// `0.25`: 2 of 1), which rounding keeps.
+    pub fn free(mut self, l: Literal, decimals: u32, unit: f64) {
+        self.free.push(l)
+        self.decimals.push(decimals)
+        self.units.push(unit)
+    }
+
+    /// Makes `f` as small as it gets over the free literals, in `steps` steps of BFGS at most,
+    /// then rounds them to their decimals unless `exact`. The literals are left where it ends.
+    pub fn run(mut self, f: fn() -> f32, steps: u32, exact: bool) {
+        let n = self.free.len()
+        self.start = Vec::from_fn(n, |i| self.free[i].value())
+        self.before = f32(loss_at(self.free, f, self.start))
+        let (x, taken) = bfgs(
+            self.free,
+            f,
+            self.start,
+            moves: Vec::filled(n, value: true),
+            steps: steps,
+        )
+        self.steps = taken
+        self.solved = f32(loss_at(self.free, f, x))
+        self.finish = if exact { take x } else { self.rounded(f, x, steps) }
+        self.after = f32(loss_at(self.free, f, self.finish))
+    }
+
+    /// `f` at the literals' values before.
+    pub fn before(self) -> f32 {
+        self.before
+    }
+
+    /// `f` where BFGS stopped, before rounding.
+    pub fn solved(self) -> f32 {
+        self.solved
+    }
+
+    /// `f` where it ended, rounded.
+    pub fn after(self) -> f32 {
+        self.after
+    }
+
+    /// The steps BFGS took before rounding.
+    pub fn steps(self) -> u32 {
+        self.steps
+    }
+
+    /// Free literal `i`'s value before (in the order they were freed).
+    pub fn start(self, i: u32) -> f32 {
+        self.start[i]
+    }
+
+    /// Free literal `i`'s value where it ended.
+    pub fn finish(self, i: u32) -> f32 {
+        self.finish[i]
+    }
+
+    /// The solution `x` rounded, a literal at a time.
+    fn rounded(self, f: fn() -> f32, solved_x: [f32], steps: u32) -> Vec<f32> {
+        let n = solved_x.len()
+        borrow start = self.start
+        var x = Vec::from(solved_x)
+        // A literal the solve didn't move keeps its value.
+        var held = Vec::from_fn(n, |i| {
+            abs(f64(x[i]) - f64(start[i])) <= 1.0e-7 * max(abs(f64(start[i])), 1.0)
+        })
+        var left = 0
+        for i in 0..n {
+            if held[i] {
+                x[i] = start[i]
+            } else {
+                left += 1
+            }
+        }
+        let solved = f64(self.solved)
+        while left > 0 {
+            left -= 1
+            // The one that changed most (the last of those that changed as much).
+            var k = n
+            for i in 0..n {
+                let change = abs(f64(x[i]) - f64(start[i]))
+                if !held[i] && (k == n || change >= abs(f64(x[k]) - f64(start[k]))) {
+                    k = i
+                }
+            }
+            if k == n {
+                break
+            }
+            var d = self.decimals[k]
+            let unit = self.units[k]
+            var v = round_to(x[k], d, unit)
+            let (enough, most) = if left == 0 {
+                (solved * 1.05 + 1.0e-9, 7)
+            } else {
+                (loss_at(self.free, f, x) * 1.05 + 1.0e-9, min(self.decimals[k] + 3, 7))
+            }
+            while d < most {
+                var trial = x.clone()
+                trial[k] = v
+                if loss_at(self.free, f, trial) <= enough {
+                    break
+                }
+                d += 1
+                v = round_to(x[k], d, unit)
+            }
+            x[k] = v
+            held[k] = true
+            if left > 0 {
+                let moves = Vec::from_fn(n, |i| !held[i])
+                let (again, _) = bfgs(self.free, f, x, moves, steps)
+                x = take again
+            }
+        }
+        x
+    }
+}
+
+/// Sets the literals `free` to `x`, and gives `f` there.
+fn loss_at(free: [Literal], f: fn() -> f32, x: [f32]) -> f64 {
+    for i in 0..free.len() {
+        free[i].set(x[i])
+    }
+    f64(f())
+}
+
+/// `f`'s derivative by each of the literals `free` at `x`, 16 at a time; 0 for those `moves`
+/// holds still.
+fn gradient_at(free: [Literal], f: fn() -> f32, x: [f32], moves: [bool]) -> Vec<f64> {
+    for i in 0..free.len() {
+        free[i].set(x[i])
+    }
+    let n = free.len()
+    var g: Vec<f64> = Vec::new()
+    var k = 0
+    while k < n {
+        var which = [free[k]; 16]
+        for j in 1..min(16, n - k) {
+            which[j] = free[k + j]
+        }
+        let (_, d) = gradient(f, which)
+        for j in 0..min(16, n - k) {
+            g.push(if moves[k + j] { f64(d[j]) } else { 0.0 })
+        }
+        k += 16
+    }
+    g
+}
+
+/// BFGS from `x0` over the literals `moves` lets change, `steps` steps at most: where it
+/// stopped, and the steps it took.
+fn bfgs(free: [Literal], f: fn() -> f32, x0: [f32], moves: [bool], steps: u32) -> (Vec<f32>, u32) {
+    let n = x0.len()
+    var x: Vec<f64> = Vec::from_fn(n, |i| f64(x0[i]))
+    var fx = loss_at(free, f, narrowed(x))
+    var g = gradient_at(free, f, narrowed(x), moves)
+    // The inverse Hessian's estimate, row-major: the identity to begin with.
+    var h = identity(n)
+    var taken = 0
+    for _ in 0..steps {
+        let gg = dot(g, g)
+        if gg < 1.0e-24 || !(gg - gg == 0.0) {
+            break
+        }
+        var p: Vec<f64> = Vec::from_fn(n, |i| -row_dot(h, i, g))
+        var slope = dot(p, g)
+        if slope >= 0.0 {
+            // Not a way down: the steepest one, and the estimate starts again.
+            p = Vec::from_fn(n, |i| -g[i])
+            slope = -gg
+            h = identity(n)
+        }
+        // Armijo's rule, halving the step from 1.
+        var t: f64 = 1.0
+        var x1: Vec<f64> = Vec::new()
+        var f1: f64 = 0.0
+        for _ in 0..40 {
+            let trial: Vec<f64> = Vec::from_fn(n, |i| x[i] + t * p[i])
+            let ft = loss_at(free, f, narrowed(trial))
+            if ft - ft == 0.0 && ft <= fx + 1.0e-4 * t * slope {
+                x1 = take trial
+                f1 = ft
+                break
+            }
+            t *= 0.5
+        }
+        if x1.len() == 0 {
+            break
+        }
+        let g1 = gradient_at(free, f, narrowed(x1), moves)
+        let s: Vec<f64> = Vec::from_fn(n, |i| x1[i] - x[i])
+        let y: Vec<f64> = Vec::from_fn(n, |i| g1[i] - g[i])
+        let sy = dot(s, y)
+        taken += 1
+        let improved = fx - f1
+        x = take x1
+        fx = f1
+        g = take g1
+        if sy > 1.0e-20 {
+            // H ← (I − ρ s yᵀ) H (I − ρ y sᵀ) + ρ s sᵀ
+            let rho = 1.0 / sy
+            let hy: Vec<f64> = Vec::from_fn(n, |i| row_dot(h, i, y))
+            let yhy = dot(y, hy)
+            for i in 0..n {
+                for j in 0..n {
+                    h[i * n + j] += rho *
+                        ((1.0 + rho * yhy) * s[i] * s[j] - hy[i] * s[j] - s[i] * hy[j])
+                }
+            }
+        }
+        if abs(improved) <= 1.0e-12 * max(abs(fx), 1.0e-30) {
+            break
+        }
+    }
+    (narrowed(x), taken)
+}
+
+fn narrowed(x: [f64]) -> Vec<f32> {
+    Vec::from_fn(x.len(), |i| f32(x[i]))
+}
+
+fn dot(a: [f64], b: [f64]) -> f64 {
+    var sum: f64 = 0.0
+    for i in 0..a.len() {
+        sum += a[i] * b[i]
+    }
+    sum
+}
+
+/// Row `i` of the square matrix `m` (row-major) times `v`.
+fn row_dot(m: [f64], i: u32, v: [f64]) -> f64 {
+    let n = v.len()
+    var sum: f64 = 0.0
+    for j in 0..n {
+        sum += m[i * n + j] * v[j]
+    }
+    sum
+}
+
+/// The `n` by `n` identity, row-major.
+fn identity(n: u32) -> Vec<f64> {
+    Vec::from_fn(n * n, |k| if k % (n + 1) == 0 { 1.0 } else { 0.0 })
+}
+
+/// `v` rounded to `decimals` decimals of `unit`, halves away from 0 (`15cm`'s 0 decimals are
+/// whole centimetres).
+fn round_to(v: f32, decimals: u32, unit: f64) -> f32 {
+    var k: f64 = 1.0
+    for _ in 0..decimals {
+        k *= 10.0
+    }
+    let scaled = f64(v) / unit * k
+    let whole = if scaled < 0.0 { -floor(-scaled + 0.5) } else { floor(scaled + 0.5) }
+    let r = f32(whole / k * unit)
+    if r == 0.0 { 0.0 } else { r }
 }
 
 @intrinsic

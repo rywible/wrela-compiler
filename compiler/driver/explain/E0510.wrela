@@ -1,27 +1,48 @@
-// A closure that outlives what it captures: stored in a struct, returned, or passed where it's
-// kept. A closure is called where it's made; it can't be stored. Store the data, and pass a
-// function, or make the closure capture nothing (a plain `fn`).
+// A closure that would outlive what it borrows: one that captures a projection (a borrowed
+// parameter, or a place it changes), stored in a struct's field, returned, or passed where
+// it's kept (a `take` parameter of a function type). A closure that captures only copies of
+// values can be kept; one that borrows is called only while what it borrows lives. Capture a
+// copy (`let k = c.k`), or pass the closure down to a parameter that calls it and lets it go.
 // ---- wrong
+struct Config {
+    k: f32,
+}
+
 struct Holder {
     f: fn(f32) -> f32,
 }
 
-fn make(k: f32) -> Holder {
-    Holder { f: |x| x * k }
+fn apply(h: Holder, x: f32) -> f32 {
+    let f = h.f
+    f(x)
 }
 
-pub fn frame(time: f32, width: u32, height: u32) {}
+fn scaled(c: Config, x: f32) -> f32 {
+    apply(Holder { f: |y| y * c.k }, x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = scaled(Config { k: 2.0 }, time)
+}
 // ---- fixed
-struct Holder {
+struct Config {
     k: f32,
 }
 
-fn make(k: f32) -> Holder {
-    Holder { k }
+struct Holder {
+    f: fn(f32) -> f32,
 }
 
 fn apply(h: Holder, x: f32) -> f32 {
-    x * h.k
+    let f = h.f
+    f(x)
 }
 
-pub fn frame(time: f32, width: u32, height: u32) {}
+fn scaled(c: Config, x: f32) -> f32 {
+    let k = c.k
+    apply(Holder { f: |y| y * k }, x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = scaled(Config { k: 2.0 }, time)
+}

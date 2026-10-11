@@ -16,10 +16,11 @@ import {
   JOB_DONE,
   JOB_DONE_FAILED,
   JOB_FAILED,
-  JOB_SLOTS,
-  JOB_SLOTS_END,
+  TASK_SLOTS,
+  TASK_SLOTS_END,
   MAX_WORKERS,
   PAR_HELPED,
+  PAR_HELPERS,
   PAR_SHUTDOWN,
   PAR_WAKE,
   RUNNING,
@@ -37,6 +38,9 @@ import {
   IMPORT_INPUT,
   IMPORT_KEEP,
   IMPORT_KEPT,
+  IMPORT_CLOCK,
+  IMPORT_PHASE,
+  IMPORT_PRINT,
   IMPORT_LIMIT,
   IMPORT_MODULE,
   IMPORT_REQUEST_STATUS,
@@ -52,7 +56,7 @@ import {
 import { type Checker, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { refusingImports } from "./imports.ts";
+import { clockImport, ignorePhase, printed, refusingImports } from "./imports.ts";
 import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
@@ -210,7 +214,10 @@ export async function runWorker(module: WebAssembly.Module, memory: WebAssembly.
   try {
     const instance = await otherInstance(module, memory, "a helper");
     (instance.exports[EXPORT_WORKER] as (thread: number) => void)(thread);
-  } catch {
+  } catch (e) {
+    // The program reports the trap where it's joined; a trap outside a job or a task would
+    // otherwise go unseen.
+    console.error(`a helper (thread ${thread}) trapped: ${describeTrap(e, Lines.of(module))}`);
     helperTrapped(memory, thread);
   }
 }
@@ -224,12 +231,13 @@ function helperTrapped(memory: WebAssembly.Memory, thread: number): void {
   const words = new Int32Array(memory.buffer);
   const running = Atomics.load(words, (threadBlock(thread) + RUNNING) / 4) >>> 0;
   if (running >= THREAD_BLOCKS && running < THREAD_BLOCKS_END) {
-    // A thread's parallel job: its starting thread waits on its count of done chunks.
-    Atomics.store(words, (running + JOB_FAILED) / 4, thread + 1);
+    // A thread's parallel job: its starting thread waits on its count of done chunks. The first
+    // helper to trap is the one whose message the program reports.
+    Atomics.compareExchange(words, (running + JOB_FAILED) / 4, 0, thread + 1);
     Atomics.or(words, (running + JOB_DONE) / 4, JOB_DONE_FAILED | 0);
     Atomics.notify(words, (running + JOB_DONE) / 4);
-  } else if (running >= JOB_SLOTS && running < JOB_SLOTS_END) {
-    // A long job: whoever joins it waits on its state.
+  } else if (running >= TASK_SLOTS && running < TASK_SLOTS_END) {
+    // A task: whoever joins it waits on its state.
     Atomics.store(words, (running + SLOT_THREAD) / 4, thread);
     Atomics.store(words, (running + SLOT_STATE) / 4, SLOT_FAILED);
     Atomics.notify(words, (running + SLOT_STATE) / 4);
@@ -364,6 +372,13 @@ export class Program {
         [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
         [IMPORT_KEEP]: (ptr: number, len: number) => program.#keepImport(ptr >>> 0, len >>> 0),
         [IMPORT_KEPT]: (ptr: number, cap: number) => program.#keptImport(ptr >>> 0, cap >>> 0),
+        [IMPORT_CLOCK]: clockImport(memory),
+        // `std::io::print`: a line for whoever runs the program, shown as it's made.
+        [IMPORT_PRINT]: (ptr: number, len: number) => {
+          const line = printed(memory, ptr, len);
+          program.#onPrint?.(line);
+        },
+        [IMPORT_PHASE]: ignorePhase,
       },
     };
     // As the native host words it: a module that can't be instantiated isn't a valid program.
@@ -379,9 +394,12 @@ export class Program {
     program.#reserved = (compiled.memory.maximum ?? compiled.memory.initial) * 65536;
     program.#frame = instance.exports[EXPORT_FRAME] as FrameFn;
     // The helpers: each its own instance of the module on its own thread, with the memory.
-    if (EXPORT_WORKER in instance.exports && options.spawnWorker) {
-      const n = Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1;
-      for (let i = 0; i < n; i++) options.spawnWorker(module, memory, THREAD_HELPER0 + i);
+    if (EXPORT_WORKER in instance.exports) {
+      const spawn = options.spawnWorker;
+      const helpers = spawn ? Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1 : 0;
+      for (let i = 0; i < helpers; i++) spawn!(module, memory, THREAD_HELPER0 + i);
+      // How many helpers there are: with none, std runs a task when asked if it's done.
+      new DataView(memory.buffer).setUint32(PAR_HELPERS, helpers, true);
     }
     if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
     // A program with state makes it once, before anything else runs (language.md §12).
@@ -445,11 +463,6 @@ export class Program {
         this.#requests.start(cmd.op, cmd.request, io ? () => io.post(cmd.url, body) : none("server to post to"));
         return;
       }
-      case "Log":
-        // `std::io::print`: a line for whoever runs the program, prefixed so it's found.
-        console.log(`wrela: ${cmd.text}`);
-        this.#onPrint?.(cmd.text);
-        return;
       default:
         return;
     }

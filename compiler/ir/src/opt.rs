@@ -37,6 +37,7 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         crate::unroll::unroll(&mut f);
         forward(m, &mut f);
         promote(m, &mut f);
+        forward_stores(m, &mut f);
         dce(&mut f);
         // An inlined function given a constant `bool` keeps only the branch it takes (the lens's
         // `isolate: false`), as the CPU's inlining does.
@@ -504,6 +505,132 @@ fn cse_block(b: &mut Block, rename: &mut [Option<ValueId>], seen: &mut HashMap<C
     }
     for k in added {
         seen.remove(&k);
+    }
+}
+
+// ---- forwarding stores to the loads after them -------------------------------------------
+
+/// Reads each local written whole as the value last stored, where that store is in the same
+/// straight-line run of code or one around it: a local written more than once is a value
+/// between its writes (an accumulator, `n += part.items()`, as a walk over a type's fields or an
+/// unrolled loop leaves it), so what's computed from it folds as values do, and the stores no
+/// load reads go (`dce`). A branch or a loop that writes the local ends what's known of it. A
+/// local whose address is taken, or that's written in part, isn't read this way.
+fn forward_stores(m: &Module, f: &mut Function) {
+    let mut excluded = vec![false; f.locals.len()];
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::Store(p, _) if !p.path.is_empty() => {
+            if let Some(l) = p.root_local() {
+                excluded[l.index()] = true;
+            }
+        }
+        Stmt::Let(_, Expr::Addr(p) | Expr::Run(p)) => {
+            if let Some(l) = p.root_local() {
+                excluded[l.index()] = true;
+            }
+        }
+        _ => {}
+    });
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    let mut body = std::mem::take(&mut f.body);
+    store_block(m, f, &mut body, &excluded, &mut HashMap::new(), &mut rename);
+    f.body = body;
+}
+
+/// The locals a block writes whole, anywhere in it.
+fn stored_locals(b: &Block, out: &mut HashSet<LocalId>) {
+    visit::walk(b, &mut |s| {
+        if let Stmt::Store(p, _) = s
+            && let Some(l) = p.root_local()
+        {
+            out.insert(l);
+        }
+    });
+}
+
+/// `known`: each local's value as last stored, where every statement from here on in this run
+/// sees it.
+fn store_block(
+    m: &Module,
+    f: &mut Function,
+    b: &mut Block,
+    excluded: &[bool],
+    known: &mut HashMap<LocalId, ValueId>,
+    rename: &mut Vec<Option<ValueId>>,
+) {
+    let renamed = |rename: &[Option<ValueId>], x: ValueId| {
+        rename.get(x.index()).copied().flatten().unwrap_or(x)
+    };
+    let old = std::mem::take(b);
+    for mut s in old {
+        s.for_each_value_mut(&mut |x| *x = renamed(rename, *x));
+        match s {
+            Stmt::Store(ref p, v) if p.path.is_empty() => {
+                if let Some(l) = p.root_local() {
+                    if excluded[l.index()] {
+                        known.remove(&l);
+                    } else {
+                        known.insert(l, v);
+                    }
+                }
+                b.push(s);
+            }
+            Stmt::Let(v, Expr::Load(ref p))
+                if !p.has_index() && p.root_local().is_some_and(|l| known.contains_key(&l)) =>
+            {
+                let l = p.root_local().expect("a local");
+                let mut at = known[&l];
+                if p.path.is_empty() {
+                    if rename.len() < f.values.len() {
+                        rename.resize(f.values.len(), None);
+                    }
+                    rename[v.index()] = Some(at);
+                    continue;
+                }
+                for (k, proj) in p.path.iter().enumerate() {
+                    let i = match proj {
+                        Proj::Field(i) => *i,
+                        Proj::Comp(c) => u32::from(*c),
+                        Proj::Index(_) => unreachable!("checked above"),
+                    };
+                    let t = m.proj_ty(f.value_ty(at), proj).unwrap_or(f.value_ty(v));
+                    let w = if k + 1 == p.path.len() { v } else { f.new_value(t) };
+                    b.push(Stmt::Let(w, Expr::Extract(at, i)));
+                    at = w;
+                }
+                if rename.len() < f.values.len() {
+                    rename.resize(f.values.len(), None);
+                }
+            }
+            Stmt::If { cond, mut then, mut else_ } => {
+                let mut in_then = known.clone();
+                store_block(m, f, &mut then, excluded, &mut in_then, rename);
+                let mut in_else = known.clone();
+                store_block(m, f, &mut else_, excluded, &mut in_else, rename);
+                let mut written = HashSet::new();
+                stored_locals(&then, &mut written);
+                stored_locals(&else_, &mut written);
+                for l in written {
+                    known.remove(&l);
+                }
+                b.push(Stmt::If { cond, then, else_ });
+            }
+            Stmt::Loop { mut body, mut continuing } => {
+                // What the loop writes is what an earlier pass left, not what's known here.
+                let mut written = HashSet::new();
+                stored_locals(&body, &mut written);
+                stored_locals(&continuing, &mut written);
+                for l in &written {
+                    known.remove(l);
+                }
+                let mut inside = known.clone();
+                store_block(m, f, &mut body, excluded, &mut inside, rename);
+                let mut cont = known.clone();
+                store_block(m, f, &mut continuing, excluded, &mut cont, rename);
+                b.push(Stmt::Loop { body, continuing });
+            }
+            s => b.push(s),
+        }
     }
 }
 
@@ -2845,7 +2972,7 @@ mod tests {
         let v3 = m.types.vector(3);
         let pair = m.types.intern(TypeDef::Struct {
             name: "(vec3, bool)".into(),
-            fields: vec![("_0".into(), v3), ("_1".into(), boolt)],
+            fields: vec![(element_name(0), v3), (element_name(1), boolt)],
         });
         let mut f = Function::new("f", Vec::new(), Some(f32t));
         let l = f.new_local("q", pair);

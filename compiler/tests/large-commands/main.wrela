@@ -1,0 +1,36 @@
+// Commands larger than the host's command buffer (1 MiB, M6 AC15): a texture or a buffer written
+// whole goes in pieces; a request too large panics naming its call; and the backstop (any other
+// command over it, here a label 2 MB long) panics with its message, never a bare trap. Frame 0
+// writes a 4 MB texture and a 4 MB buffer (in pieces); frame 2 stores 2 MB.
+use std::gpu::{GpuBuffer, Rgba8, Texture, buffer, label, texture, write}
+use std::io::store
+
+pub struct State {
+    tex: Texture<Rgba8>,
+    buf: GpuBuffer<u32>,
+    frames: u32,
+}
+
+pub fn init() -> State {
+    State { tex: texture::<Rgba8>(width: 1024, height: 1024), buf: buffer(1048576), frames: 0 }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frames == 0 {
+        let bytes: Vec<u8> = Vec::filled(4194304, 7)
+        s.tex.write(x: 0, y: 0, width: 1024, height: 1024, bytes: bytes)
+        write(mut s.buf, 0, Vec::filled(1048576, 3))
+    } else if s.frames == 2 {
+        let _ = store("big.bin", Vec::filled(2097152, 1))
+    }
+    s.frames += 1
+}
+
+/// A label 2 MB long: no std call refuses it, so it's the command buffer's backstop.
+pub fn big_label() {
+    var name = String::new()
+    for _ in 0..2097152 {
+        name.push_str("x")
+    }
+    label(name)
+}

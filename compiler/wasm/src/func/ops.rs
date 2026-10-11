@@ -1408,6 +1408,16 @@ pub(super) fn host(
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
             fe.ins.push(I::Call(h.keep));
         }
+        ir::HostOp::Clock => {
+            let h = fe.at.helpers;
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::Call(h.clock)]);
+        }
+        ir::HostOp::Print | ir::HostOp::Phase => {
+            let h = fe.at.helpers;
+            let helper = if matches!(op, ir::HostOp::Print) { h.print } else { h.phase };
+            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
+            fe.ins.push(I::Call(helper));
+        }
         ir::HostOp::Input | ir::HostOp::Kept => {
             let h = fe.at.helpers;
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
@@ -1875,7 +1885,10 @@ fn fmod(f: Fw) -> Function {
 
 /// The helpers' bodies, in `Helpers` order after the import: flush, reserve, write and the two
 /// `fmod`s.
-pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
+pub(crate) fn helper_bodies(
+    h: &Helpers,
+    command_message: Option<(u32, u32)>,
+) -> Vec<(Vec<ValType>, Vec<ValType>, Function)> {
     use memory::{CMD_BASE, CMD_CAP};
     // flush(): header, then submit(CMD_BASE, 12 + len); len = 0.
     let magic = u32::from_le_bytes(wrela_abi::stream::MAGIC) as i32;
@@ -1904,7 +1917,27 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::End,
     ];
     // reserve(n) -> addr
-    let reserve = vec![
+    // A command larger than the buffer panics with the backstop's message (the program's
+    // thread's block's panic message), or traps if there's none.
+    let too_large: Vec<I<'static>> = match command_message {
+        Some((at, n)) => {
+            let n = n.min(memory::PANIC_CAP);
+            vec![
+                I::GlobalGet(globals::THREAD),
+                I::I32Const(n as i32),
+                I::I32Store(mem(memory::PANIC, 2)),
+                I::GlobalGet(globals::THREAD),
+                I::I32Const(memory::PANIC as i32 + 4),
+                I::I32Add,
+                I::I32Const(at as i32),
+                I::I32Const(n as i32),
+                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
+                I::Unreachable,
+            ]
+        }
+        None => vec![I::Unreachable],
+    };
+    let mut reserve = vec![
         I::GlobalGet(globals::CMD_LEN),
         I::LocalGet(0),
         I::I32Add,
@@ -1916,7 +1949,9 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::I32Const(CMD_CAP as i32),
         I::I32GtU,
         I::If(BlockType::Empty),
-        I::Unreachable,
+    ];
+    reserve.extend(too_large);
+    reserve.extend([
         I::End,
         I::End,
         I::I32Const((CMD_BASE + BATCH_HEADER) as i32),
@@ -1927,7 +1962,7 @@ pub(crate) fn helper_bodies(h: &Helpers) -> Vec<(Vec<ValType>, Vec<ValType>, Fun
         I::I32Add,
         I::GlobalSet(globals::CMD_LEN),
         I::End,
-    ];
+    ]);
     // write(handle, offset, ptr, n): WriteBuffer commands of at most CHUNK bytes each.
     let chunk_max = (CMD_CAP - 64) & !3;
     let (handle, offset, ptr, n, chunk, a) = (0, 1, 2, 3, 4, 5);

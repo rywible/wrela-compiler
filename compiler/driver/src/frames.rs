@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceMap, codes, has_errors};
 use wrela_lower::BuildData;
 use wrela_sema::Checked;
-use wrela_sema::defs::TestRun;
+use wrela_sema::defs::{Golden, TestRun};
 use wrela_sema::ty::FnId;
 
 /// Frames a second, and the screen's size in pixels, that a frame test's frames get.
@@ -33,7 +33,8 @@ pub fn run(
     tests: &[FnId],
     root: &Path,
     fuel: u64,
-) -> (Vec<(FnId, Option<Diagnostic>)>, Vec<Diagnostic>) {
+    bless: bool,
+) -> (Vec<crate::consts::Ran>, Vec<Diagnostic>) {
     let mut roots = wrela_lower::Roots::of(checked);
     roots.tests = tests.to_vec();
     let (lowered, mut diags) = wrela_lower::lower(checked, &roots, data, true);
@@ -76,43 +77,54 @@ pub fn run(
                         format!("the test's input `{path}` {why}"),
                     )
                     .with_note("a script is a JSON array of input events, by the frame each arrives before or the tick it's a record of (runtime/abi `input`); a tick test's input may be a tick log instead (runtime/abi `ticks`)");
-                    results.push((f, Some(d)));
+                    results.push((f, Some(d), wrela_host::Traced::default()));
                     continue;
                 }
             },
         };
         let storage = dir.0.join(format!("storage.{i}"));
-        let ran = match (attrs.test_gpu, run, &input) {
+        let (ran, traced) = match (attrs.test_gpu, run, &input) {
             (true, TestRun::Frames(n), Input::Script(script)) => {
-                run_gpu(&mut gpu, &dir.0, &storage, i, n, script)
+                let golden = attrs.test_golden.as_ref().map(|g| (g, root, bless));
+                run_gpu(&mut gpu, &dir.0, &storage, i, n, script, golden)
             }
             _ => run_one(&built, &storage, i, run, &input),
         };
-        let failed = ran.map(|Failed { error, fault, phase }| {
-            match fault {
-                Some(fault) => {
-                    failure(checked, sources, &out.lines, Item::Test(f, fuel), &fault, Some(&phase))
-                }
-                // Not a trap: a command the host can't carry out, say.
-                None => Diagnostic::new(
-                    codes::E0706,
-                    checked.program.func(f).span,
-                    format!("the test `{}` failed {phase}: {error}", checked.program.func(f).name),
-                )
-                .with_note("a frame test passes unless its frames or the test fail (§10)"),
+        let name = &checked.program.func(f).name;
+        let failed = ran.map(|Failed { why, fault, phase }| match (fault, why) {
+            (Some(fault), _) => {
+                failure(checked, sources, &out.lines, Item::Test(f, fuel), &fault, Some(&phase))
             }
+            (None, Why::Golden(why)) => Diagnostic::new(
+                codes::E0706,
+                attrs.test_golden.as_ref().map_or(checked.program.func(f).span, |g| g.span),
+                format!("the test `{name}` failed {phase}: {why}"),
+            )
+            .with_note("a GPU's results differ a little from another's (§11): `within` is how far its screen may be from the golden, a mean in 8-bit steps, 0.5 unless the test says"),
+            // Not a trap: a command the host can't carry out, say.
+            (None, Why::Host(error)) => Diagnostic::new(
+                codes::E0706,
+                checked.program.func(f).span,
+                format!("the test `{name}` failed {phase}: {error}"),
+            )
+            .with_note("a frame test passes unless its frames or the test fail (§10)"),
         });
-        results.push((f, failed));
+        results.push((f, failed, traced));
     }
     (results, diags)
 }
 
-/// Why a test failed: the host's error, the fault behind it if it was a trap, and in which
-/// call.
+/// Why a test failed (the fault behind it, if it was a trap), and in which call.
 struct Failed {
-    error: wrela_host::Error,
+    why: Why,
     fault: Option<Fault>,
     phase: String,
+}
+
+/// The host's error, or its screen too far from its golden.
+enum Why {
+    Host(wrela_host::Error),
+    Golden(String),
 }
 
 /// A test failed `phase` (where in its run) with `error`, the host's last failure `failure`
@@ -128,7 +140,7 @@ fn failed(
         panic: f.panic.clone(),
         text: String::new(),
     });
-    Some(Failed { error, fault, phase })
+    Some(Failed { why: Why::Host(error), fault, phase })
 }
 
 /// What a test's runs get: a script of input events, or (a tick test) a tick log.
@@ -162,7 +174,9 @@ struct GpuHost(#[cfg(feature = "gpu")] Option<wrela_host::Host>);
 /// `init`, its `frames` with `script`'s events, each frame's readbacks answered before the next,
 /// then the test. Why it failed, if it did. The GPU host meters no fuel: it runs the program as
 /// `wrela run` does. Each test is a new program, nothing of the last one's left; the host is
-/// `gpu`'s, loaded for the first, and loaded again after one that failed.
+/// `gpu`'s, loaded for the first, and loaded again after one that failed. What it printed and
+/// timed comes with it. With a golden (and the package's root, and whether to bless it), the
+/// screen after the frames is compared with it.
 #[cfg(feature = "gpu")]
 fn run_gpu(
     gpu: &mut GpuHost,
@@ -171,7 +185,8 @@ fn run_gpu(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
-) -> Option<Failed> {
+    golden: Option<(&Golden, &Path, bool)>,
+) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
     let options = wrela_host::Options {
         storage: Some(storage.to_path_buf()),
@@ -186,13 +201,14 @@ fn run_gpu(
     };
     let mut host = match started {
         Ok(h) => h,
-        Err(e) => return failed(e, None, "as it started".to_string()),
+        Err(e) => return (failed(e, None, "as it started".to_string()), Default::default()),
     };
-    let ran = run_gpu_frames(&mut host, i, frames, script);
+    let ran = run_gpu_frames(&mut host, i, frames, script, golden);
+    let traced = host.trace().take();
     if ran.is_none() {
         gpu.0 = Some(host);
     }
-    ran
+    (ran, traced)
 }
 
 /// [`run_gpu`]'s test, on its host.
@@ -202,6 +218,7 @@ fn run_gpu_frames(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
+    golden: Option<(&Golden, &Path, bool)>,
 ) -> Option<Failed> {
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
@@ -211,10 +228,56 @@ fn run_gpu_frames(
             return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
     }
+    if let Some((g, root, bless)) = golden {
+        let after = format!("after {frames} frames");
+        let screen = match host.read_screen() {
+            Ok(s) => s,
+            Err(e) => return failed(e, None, after),
+        };
+        if let Err(why) = against_golden(g, root, &screen, bless) {
+            return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
+        }
+    }
     match host.call_export(&format!("test.{i}"), &[]) {
         Ok(_) => None,
         Err(e) => failed(e, host.last_failure(), format!("after {frames} frames")),
     }
+}
+
+/// The screen after a GPU frame test's frames against its golden (§10): within its mean
+/// difference, or why not. With `bless`, the golden is written from the screen first.
+#[cfg(feature = "gpu")]
+fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result<(), String> {
+    let path = &g.path;
+    if wrela_abi::check::path_problem(path).is_some() {
+        return Err(format!(
+            "its golden `{path}` must be a path inside the package, with `/` between its parts"
+        ));
+    }
+    let full = root.join(path);
+    if bless {
+        if let Some(dir) = full.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        wrela_host::image::write_png(&full, WIDTH, HEIGHT, screen)
+            .map_err(|e| format!("writing its golden `{path}`: {e}"))?;
+    }
+    let (w, h, want) = wrela_host::image::read_png(&full).map_err(|_| {
+        format!("it has no golden `{path}` to compare the screen with: `wrela test --bless` writes it from this machine's")
+    })?;
+    if (w, h) != (WIDTH, HEIGHT) {
+        return Err(format!(
+            "its golden `{path}` is {w}×{h}, and a frame test's screen is {WIDTH}×{HEIGHT}"
+        ));
+    }
+    let d = wrela_host::image::compare(screen, &want)?;
+    if d.mean > g.within {
+        return Err(format!(
+            "the screen is {:.3}/255 from its golden `{path}` on average, more than the {} it may be (a channel differs by {}/255 at most; {} of {} channels differ)",
+            d.mean, g.within, d.max, d.differing, d.channels
+        ));
+    }
+    Ok(())
 }
 
 /// [`run_gpu`], in a compiler built without the GPU host: the test can't run.
@@ -226,30 +289,39 @@ fn run_gpu(
     _: usize,
     _: u32,
     _: &[wrela_host::Scripted],
-) -> Option<Failed> {
+    _: Option<(&Golden, &Path, bool)>,
+) -> (Option<Failed>, wrela_host::Traced) {
     let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
-    Some(Failed {
-        error: wrela_host::Error::Program(why.into()),
+    let failed = Failed {
+        why: Why::Host(wrela_host::Error::Program(why.into())),
         fault: None,
         phase: String::new(),
-    })
+    };
+    (Some(failed), Default::default())
 }
 
 /// Runs test `i`: `init`, its frames (and ticks in lockstep) or its ticks, with `input`, then
-/// the test. Why it failed, if it did.
+/// the test. Why it failed, if it did, and what it printed and timed.
 fn run_one(
     built: &wrela_host::CpuBuild,
     storage: &Path,
     i: usize,
     run: TestRun,
     input: &Input,
-) -> Option<Failed> {
+) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
     // One thread: a parallel job's chunks all run on it, and the result is the same (§6.12).
-    let mut host = match built.instantiate_in(1, Some(storage)) {
-        Ok(h) => h,
-        Err(e) => return failed(e, None, "as it started".to_string()),
-    };
+    match built.instantiate_in(1, Some(storage)) {
+        Ok(mut host) => {
+            let failed = run_on(&mut host, i, run, input);
+            (failed, host.trace().take())
+        }
+        Err(e) => (failed(e, None, "as it started".to_string()), Default::default()),
+    }
+}
+
+/// [`run_one`] on its host.
+fn run_on(host: &mut wrela_host::CpuHost, i: usize, run: TestRun, input: &Input) -> Option<Failed> {
     let (log, script): (_, &[wrela_host::Scripted]) = match input {
         Input::Log(log) => (Some(log), &[]),
         Input::Script(s) => (None, s),
@@ -259,7 +331,11 @@ fn run_one(
         return failed(e, host.last_failure(), "in `init`".to_string());
     }
     let mismatch = |why: String| {
-        Some(Failed { error: wrela_host::Error::Program(why), fault: None, phase: String::new() })
+        Some(Failed {
+            why: Why::Host(wrela_host::Error::Program(why)),
+            fault: None,
+            phase: String::new(),
+        })
     };
     let after = match run {
         TestRun::Frames(frames) => {

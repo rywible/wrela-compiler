@@ -97,6 +97,59 @@ fn one_check_answers_every_kind_of_query() {
     assert!(a[13]["error"].as_str().is_some_and(|e| e.contains("nothing is named")), "{}", a[13]);
 }
 
+/// A program with an error is answered too: what doesn't depend on the function with the error
+/// is answered as it would be, an answer it could change lists the error as `unsure`, and a
+/// query of that function's code says why it can't be answered. The errors are on standard
+/// error, and the exit status is 1.
+#[test]
+fn a_program_with_errors_is_answered_where_it_can_be() {
+    let text = format!(
+        "{}\nfn broken(g: Grid) -> f32 {{\n    let wrong: bool = 3\n    first(g)\n}}\n",
+        common::SHAPES
+    );
+    let line = text.lines().position(|l| l.contains("let wrong")).expect("the error") + 1;
+    let dir = common::package(
+        "query-shapes-broken",
+        &[("wrela.toml", &common::manifest("shapes")), ("main.wrela", &text)],
+    );
+    let inside = format!("type main.wrela:{line}:9");
+    let out = common::wrela()
+        .arg("query")
+        .arg(&dir)
+        .arg("--json")
+        .args(["type main.wrela:50:13", "callers first", "effects frame", &inside])
+        .args(["instantiations total"])
+        .output()
+        .expect("run wrela");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("E0300"));
+    let a: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).expect("answers");
+    assert_eq!(a[0]["type"], "f32", "{}", a[0]);
+    assert!(a[0].get("unsure").is_none(), "`frame` has no error: {}", a[0]);
+    // `broken` calls `first`, but its code isn't known.
+    assert_eq!(a[1]["callers"].as_array().map(Vec::len), Some(1), "{}", a[1]);
+    let unsure = &a[1]["unsure"][0];
+    assert_eq!(
+        (unsure["code"].as_str(), unsure["in"].as_str()),
+        (Some("E0300"), Some("main::broken")),
+        "{}",
+        a[1]
+    );
+    assert!(a[2].get("unsure").is_none(), "`frame` doesn't reach `broken`: {}", a[2]);
+    assert!(
+        a[3]["error"].as_str().is_some_and(|e| e.contains("`main::broken` has errors")),
+        "{}",
+        a[3]
+    );
+    assert!(a[4]["error"].as_str().is_some_and(|e| e.contains("lowering")), "{}", a[4]);
+    let context = common::wrela().args(["context", "broken"]).arg(&dir).output().unwrap();
+    let text = String::from_utf8_lossy(&context.stdout);
+    assert!(
+        text.contains("fn broken") && text.contains("What `main::broken` calls isn't known"),
+        "{text}"
+    );
+}
+
 #[test]
 fn queries_come_from_standard_input_too() {
     let dir = package("stdin");

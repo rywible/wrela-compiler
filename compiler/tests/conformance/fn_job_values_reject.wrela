@@ -1,0 +1,19 @@
+// rejects: fn.job-values
+use std::job::Job
+
+/// A log that isn't `Clone`.
+struct Log {
+    lines: Vec<u32>,
+}
+
+@job
+fn record(log: take Log) -> u32 {
+    yield
+    log.lines.len()
+}
+
+struct Recorder: Clone {
+    job: Job<record>, //~ E0407
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

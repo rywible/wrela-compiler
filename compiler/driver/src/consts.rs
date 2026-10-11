@@ -8,12 +8,13 @@
 //! first, in one module, then those that read them, and so on. Constants that read each other
 //! are an error (E0328).
 
+use crate::const_cache;
 use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use wrela_diag::{Diagnostic, SourceMap, Span, codes};
-use wrela_lower::{BuildData, ConstLowering, ConstModule, Embeds, Memory};
+use wrela_lower::{BuildData, ConstLowering, Embeds, Memory};
 use wrela_sema::Checked;
 use wrela_sema::ty::ConstId;
 
@@ -64,54 +65,109 @@ pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, V
     (files, diags)
 }
 
+/// What computing the constants did: how many the build computed, and how many it read from
+/// the cache (§10).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConstStats {
+    pub computed: u32,
+    pub cached: u32,
+    /// How many chunks of the computed constants' parallel jobs the build's helpers ran.
+    pub helped: u64,
+    /// What each computed constant that printed or timed a phase did (§8's `trace`), by name:
+    /// its lines were shown as they were made.
+    pub traced: Vec<(String, wrela_host::Traced)>,
+}
+
 /// Computes the program's computed constants into `data` (whose files `embed` reads are
-/// already there): the errors computing them.
-pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> Vec<Diagnostic> {
+/// already there): the errors computing them. With `cache`, a directory, a constant whose inputs
+/// are unchanged since a build computed it is read from there ([`crate::const_cache`]).
+pub fn compute(
+    checked: &Checked,
+    sources: &SourceMap,
+    data: &mut BuildData,
+    cache: Option<&std::path::Path>,
+) -> (Vec<Diagnostic>, ConstStats) {
     let mut diags = Vec::new();
+    let mut stats = ConstStats::default();
     let mut pending: Vec<ConstId> = (0..checked.program.consts.len())
         .map(|i| ConstId(i as u32))
         .filter(|&c| wrela_lower::is_computed(checked, c))
         .collect();
     let mut failed = BTreeSet::new();
+    let simd = !data.no_simd;
     while !pending.is_empty() {
-        let (lowering, d) = wrela_lower::lower_consts(checked, &pending, data);
-        let (module, d, rest) = match lowering {
-            ConstLowering::Ready(m) => (m, d, Vec::new()),
-            ConstLowering::Needs(_) => {
-                // Which can be computed now: those that need no constant still to compute.
-                let mut ready = Vec::new();
-                let mut rest = Vec::new();
-                for &c in &pending {
-                    match wrela_lower::lower_consts(checked, &[c], data).0 {
-                        ConstLowering::Ready(_) => ready.push(c),
-                        // One that needs a constant the build couldn't compute: that one's error
-                        // says why.
-                        ConstLowering::Needs(n) if n.iter().any(|x| failed.contains(x)) => {
-                            failed.insert(c);
-                        }
-                        ConstLowering::Needs(n) => rest.push((c, n)),
-                    }
+        // Each constant in a module of its own, which holds only what it reads: its key. Those
+        // that need a constant still to compute wait for the next round.
+        let mut ready = Vec::new();
+        let mut rest = Vec::new();
+        for &c in &pending {
+            match wrela_lower::lower_consts(checked, &[c], data) {
+                (ConstLowering::Ready(m), d) => ready.push((c, m, d)),
+                // One that needs a constant the build couldn't compute: that one's error says
+                // why.
+                (ConstLowering::Needs(n), _) if n.iter().any(|x| failed.contains(x)) => {
+                    failed.insert(c);
                 }
-                if ready.is_empty() {
-                    if let Some(d) = cycle(checked, &rest) {
-                        diags.push(d);
-                    }
-                    break;
-                }
-                let (lowering, d) = wrela_lower::lower_consts(checked, &ready, data);
-                let ConstLowering::Ready(m) = lowering else {
-                    diags.push(Diagnostic::internal("a constant ready to compute needs another"));
-                    break;
-                };
-                (m, d, rest.into_iter().map(|(c, _)| c).collect())
+                (ConstLowering::Needs(n), _) => rest.push((c, n)),
             }
-        };
-        let errors = wrela_diag::has_errors(&d);
-        diags.extend(d);
+        }
+        if ready.is_empty() {
+            if let Some(d) = cycle(checked, &rest) {
+                diags.push(d);
+            }
+            break;
+        }
+        let mut errors = false;
+        for (_, _, d) in &mut ready {
+            errors |= wrela_diag::has_errors(d);
+            diags.append(d);
+        }
         if errors {
             break;
         }
-        for (c, result) in run(engine(), checked, sources, &module, !data.no_simd) {
+        for (c, module, _) in ready {
+            let fuel = checked.program.const_(c).fuel.unwrap_or(FUEL);
+            // The key is the module's WASM, so the cache is read before wasmtime compiles it:
+            // a constant read from the cache isn't compiled at all.
+            let result = match emit(&module.module, simd, true) {
+                Err(msg) => Err(Diagnostic::internal(msg)),
+                Ok(out) => {
+                    let key = const_cache::key(&out.wasm, fuel);
+                    match cache.and_then(|dir| const_cache::get(dir, &key)) {
+                        Some(v) => {
+                            stats.cached += 1;
+                            Ok(v)
+                        }
+                        None => {
+                            stats.computed += 1;
+                            let export = &module.exports[0].1;
+                            let name = checked.program.const_(c).name.clone();
+                            let trace = wrela_host::Trace::new(Some(format!("{name}: ")));
+                            let r = Compiled::of(engine(), out)
+                                .map_err(|msg| Box::new(Diagnostic::internal(msg)))
+                                .and_then(|compiled| {
+                                    run_one(checked, sources, &compiled, export, c, fuel, &trace)
+                                })
+                                .map(|(v, helped)| {
+                                    stats.helped += u64::from(helped);
+                                    v
+                                })
+                                .map_err(|d| *d);
+                            let traced = trace.take();
+                            if !traced.phases.is_empty() {
+                                eprintln!("{name}'s phases: {}", traced.phases_line());
+                            }
+                            if !traced.is_empty() {
+                                stats.traced.push((name, traced));
+                            }
+                            if let (Ok(v), Some(dir)) = (&r, cache) {
+                                const_cache::put(dir, &key, v);
+                            }
+                            r
+                        }
+                    }
+                }
+            };
             match result {
                 Ok(v) => {
                     data.values.insert(c, Rc::new(v));
@@ -122,9 +178,12 @@ pub fn compute(checked: &Checked, sources: &SourceMap, data: &mut BuildData) -> 
                 }
             }
         }
-        pending = rest;
+        pending = rest.into_iter().map(|(c, _)| c).collect();
     }
-    diags
+    if let Some(dir) = cache {
+        const_cache::clean(dir);
+    }
+    (diags, stats)
 }
 
 /// The engine for the code builds run (constants and tests): the native host's that counts
@@ -170,12 +229,19 @@ fn cycle(checked: &Checked, blocked: &[(ConstId, BTreeSet<ConstId>)]) -> Option<
     Some(d.with_help("compute one of them without reading the others"))
 }
 
-/// A module of the build's code, running in wasmtime on memory of its own, with the host's
-/// functions refusing: what computes constants and runs tests.
+/// A module of the build's code, running in wasmtime, with the host's functions refusing: what
+/// computes constants and runs tests. A constant's runs on memory its helpers share (§6.12).
 struct Running {
     store: wasmtime::Store<()>,
     instance: wasmtime::Instance,
-    memory: wasmtime::Memory,
+    memory: Mem,
+}
+
+/// The memory build-time code runs on: its own (a test's), or shared with helpers (a
+/// constant's).
+enum Mem {
+    Own(wasmtime::Memory),
+    Shared(wasmtime::SharedMemory),
 }
 
 /// The build's code, compiled for wasmtime: started once to compute constants, and once for
@@ -186,50 +252,87 @@ struct Compiled {
     lines: Vec<(u32, Option<Span>)>,
 }
 
+/// The build's code as WASM, with where each offset is in the source. With `shared`, its memory
+/// is shared and imported, so helpers can run its parallel jobs.
+fn emit(m: &wrela_ir::Module, simd: bool, shared: bool) -> Result<wrela_wasm::Emitted, String> {
+    let options = wrela_wasm::Options { shared_memory: shared, simd };
+    wrela_wasm::emit_with(m, options)
+        .map_err(|e| format!("the WASM back end failed on the build's code: {e}"))
+}
+
+/// The build's code, compiled for wasmtime ([`emit`]'s options).
 fn compile(
     engine: &wasmtime::Engine,
     m: &wrela_ir::Module,
     simd: bool,
+    shared: bool,
 ) -> Result<Compiled, String> {
-    // Its own memory, unshared: it runs on this one thread.
-    let options = wrela_wasm::Options { shared_memory: false, simd };
-    let out = wrela_wasm::emit_with(m, options)
-        .map_err(|e| format!("the WASM back end failed on the build's code: {e}"))?;
-    let module = wasmtime::Module::new(engine, &out.wasm)
-        .map_err(|e| format!("wasmtime refused the build's code: {e:#}"))?;
-    Ok(Compiled { module, lines: out.lines })
+    Compiled::of(engine, emit(m, simd, shared)?)
+}
+
+fn refusal(results: u32) -> &'static str {
+    if results == 0 {
+        "build-time code can't call the host"
+    } else {
+        "build-time code can't make requests"
+    }
 }
 
 impl Compiled {
-    /// An instance on new memory.
-    fn start(&self, engine: &wasmtime::Engine) -> Result<Running, String> {
+    /// `out`'s WASM, compiled for wasmtime: the costly step, which a constant read from the
+    /// cache skips.
+    fn of(engine: &wasmtime::Engine, out: wrela_wasm::Emitted) -> Result<Compiled, String> {
+        let module = wasmtime::Module::new(engine, &out.wasm)
+            .map_err(|e| format!("wasmtime refused the build's code: {e:#}"))?;
+        Ok(Compiled { module, lines: out.lines })
+    }
+
+    /// An instance on new memory: its own, or (`shared`) memory it shares with helpers. What
+    /// it prints and times goes to `trace`.
+    fn start(
+        &self,
+        engine: &wasmtime::Engine,
+        shared: bool,
+        trace: &wrela_host::Trace,
+    ) -> Result<Running, String> {
         let mut linker = wasmtime::Linker::new(engine);
-        // Effects keep constants and tests from recording GPU work and making requests (§8):
-        // nothing calls these. Only a program that starts a voice imports `audio`, and they
-        // can't.
-        let host = wrela_abi::HOST_FUNCTIONS.iter().filter(|f| f.name != wrela_abi::IMPORT_AUDIO);
-        for f in host {
-            let why = if f.results == 0 {
-                "build-time code can't call the host"
-            } else {
-                "build-time code can't make requests"
-            };
-            let i32s = |n| std::iter::repeat_n(wasmtime::ValType::I32, n);
-            let ty = wasmtime::FuncType::new(engine, i32s(f.params), i32s(f.results));
-            linker
-                .func_new(wrela_abi::IMPORT_MODULE, f.name, ty, move |_, _, _| {
-                    Err(wasmtime::format_err!("{why}"))
-                })
-                .map_err(|e| format!("{e:#}"))?;
-        }
         let mut store = wasmtime::Store::new(engine, ());
         store.set_fuel(FUEL).map_err(|e| format!("{e:#}"))?;
+        let mut shared_memory = None;
+        if shared {
+            let ty = self
+                .module
+                .imports()
+                .find_map(|i| i.ty().memory().cloned())
+                .ok_or_else(|| "the build's code imports no memory".to_string())?;
+            let m = wasmtime::SharedMemory::new(engine, ty).map_err(|e| format!("{e:#}"))?;
+            linker
+                .define(&store, wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_MEMORY, m.clone())
+                .map_err(|e| format!("{e:#}"))?;
+            shared_memory = Some(m);
+        }
+        // Effects keep constants and tests from recording GPU work and making requests (§8):
+        // nothing calls these. Only a program that starts a voice imports `audio`, and they
+        // can't. A line printed and a phase timed go to the trace.
+        wrela_host::refuse_host_functions(
+            &mut linker,
+            engine,
+            refusal,
+            trace,
+            shared_memory.as_ref(),
+        )
+        .map_err(|e| format!("{e:#}"))?;
         let instance = linker
             .instantiate(&mut store, &self.module)
             .map_err(|e| format!("the build's code didn't start: {e:#}"))?;
-        let memory = instance
-            .get_memory(&mut store, wrela_abi::EXPORT_MEMORY)
-            .ok_or_else(|| "the build's code has no memory".to_string())?;
+        let memory = match shared_memory {
+            Some(m) => Mem::Shared(m),
+            None => Mem::Own(
+                instance
+                    .get_memory(&mut store, wrela_abi::EXPORT_MEMORY)
+                    .ok_or_else(|| "the build's code has no memory".to_string())?,
+            ),
+        };
         Ok(Running { store, instance, memory })
     }
 }
@@ -244,9 +347,28 @@ impl Running {
             .get_typed_func::<(), u32>(&mut self.store, name)
             .map_err(CallError::Internal)?;
         f.call(&mut self.store, ()).map_err(|e| {
-            let panic = take_panic_message(self.memory.data_mut(&mut self.store));
+            let panic = match &self.memory {
+                Mem::Own(m) => take_panic_message(m.data_mut(&mut self.store)),
+                // A constant's memory isn't used again: its message is read, not cleared.
+                Mem::Shared(_) => self.read(read_panic_message),
+            };
             CallError::Failed(e, panic)
         })
+    }
+
+    /// The fuel the last call used of the `fuel` it was given.
+    fn used(&self, fuel: u64) -> u64 {
+        fuel - self.store.get_fuel().unwrap_or(0)
+    }
+
+    /// `f` of the memory's bytes, read in place.
+    fn read<T>(&mut self, f: impl FnOnce(&[u8]) -> T) -> T {
+        match &self.memory {
+            Mem::Own(m) => f(m.data(&self.store)),
+            Mem::Shared(m) => {
+                f(wrela_host::build_memory::slice(m, 0, m.data().len()).unwrap_or(&[]))
+            }
+        }
     }
 }
 
@@ -255,83 +377,138 @@ enum CallError {
     Failed(wasmtime::Error, Option<String>),
 }
 
-fn run(
-    engine: &wasmtime::Engine,
+/// How many threads compute a constant: this one and helpers, one a core.
+fn const_threads() -> u32 {
+    std::thread::available_parallelism().map_or(1, |n| n.get() as u32)
+}
+
+/// Computes constant `c` with `compiled` (its module, built with shared memory), on this thread
+/// and helpers, with `fuel` for their work together: its value, or why it failed.
+fn run_one(
     checked: &Checked,
     sources: &SourceMap,
-    m: &ConstModule,
-    simd: bool,
-) -> Vec<(ConstId, Result<wrela_lower::Value, Diagnostic>)> {
-    let started = compile(engine, &m.module, simd).and_then(|c| Ok((c.start(engine)?, c)));
-    let (mut running, compiled) = match started {
-        Ok(r) => r,
-        Err(msg) => {
-            return m
-                .exports
-                .iter()
-                .map(|&(c, _)| (c, Err(Diagnostic::internal(msg.clone()))))
-                .collect();
-        }
+    compiled: &Compiled,
+    export: &str,
+    c: ConstId,
+    fuel: u64,
+    trace: &wrela_host::Trace,
+) -> Result<(wrela_lower::Value, u32), Box<Diagnostic>> {
+    let mut running =
+        compiled.start(engine(), true, trace).map_err(|m| Box::new(Diagnostic::internal(m)))?;
+    let Mem::Shared(shared) = &running.memory else {
+        return Err(Box::new(Diagnostic::internal("a constant's code runs on shared memory")));
     };
-    let mut results = Vec::new();
-    for (c, name) in &m.exports {
-        let result = match running.call(name, FUEL) {
-            Ok(addr) => {
-                let mem = Memory { bytes: running.memory.data(&running.store) };
-                wrela_lower::read_value(checked, *c, &mem, addr).map_err(|e| {
-                    Diagnostic::internal(format!(
-                        "reading the value of `{}`: {e}",
-                        checked.program.const_(*c).name
-                    ))
-                })
+    let helpers =
+        wrela_host::BuildHelpers::start(&compiled.module, shared, const_threads() - 1, fuel, trace);
+    let result = running.call(export, fuel);
+    let main_used = running.used(fuel);
+    let ran = helpers.finish();
+    let helped = running.read(|bytes| {
+        let at = wrela_abi::memory::PAR_HELPED as usize;
+        bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    });
+    let used: u64 = main_used + ran.iter().map(|r| r.used).sum::<u64>();
+    let helper_out_of_fuel = ran.iter().any(|r| r.out_of_fuel);
+    let out_of_fuel = |frames| Fault {
+        frames,
+        trap: Some(wasmtime::Trap::OutOfFuel),
+        panic: None,
+        text: "out of fuel".into(),
+    };
+    match result {
+        Ok(addr) if used <= fuel => running.read(|bytes| {
+            let mem = Memory { bytes };
+            wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
+                Box::new(Diagnostic::internal(format!(
+                    "reading the value of `{}`: {e}",
+                    checked.program.const_(c).name
+                )))
+            })
+        }),
+        // Its threads' work together was past its fuel.
+        Ok(_) => {
+            let fault = out_of_fuel(Vec::new());
+            Err(Box::new(failure(
+                checked,
+                sources,
+                &compiled.lines,
+                Item::Const(c, fuel),
+                &fault,
+                None,
+            )))
+        }
+        Err(CallError::Internal(e)) => Err(Box::new(Diagnostic::internal(format!("{e:#}")))),
+        Err(CallError::Failed(e, panic)) => {
+            let mut fault = Fault::of(&e, panic);
+            // A helper that ran out of fuel stops the job it ran, and its join traps: the
+            // constant ran out of fuel.
+            if helper_out_of_fuel {
+                fault = out_of_fuel(fault.frames);
             }
-            Err(CallError::Internal(e)) => Err(Diagnostic::internal(format!("{e:#}"))),
-            Err(CallError::Failed(e, panic)) => {
-                let fault = Fault::of(&e, panic);
-                Err(failure(checked, sources, &compiled.lines, Item::Const(*c), &fault, None))
-            }
-        };
-        results.push((*c, result));
+            Err(Box::new(failure(
+                checked,
+                sources,
+                &compiled.lines,
+                Item::Const(c, fuel),
+                &fault,
+                None,
+            )))
+        }
     }
-    results
 }
 
 /// Runs the program package's `@test` functions (§10), after its constants are computed into
-/// `data`: each test's name and, if it failed, why (E0706, E0705), with the errors lowering
-/// them found. Each test runs on new memory, so one test can't change what another sees.
+/// A test that ran: which, why it failed if it did, and what it printed and timed.
+pub type Ran = (wrela_sema::ty::FnId, Option<Diagnostic>, wrela_host::Traced);
+
+/// `data`: each test that ran (what it printed shown as it was made), with the errors lowering
+/// them found. A failure is E0706 or E0705. Each test runs on new memory, so one test can't
+/// change what another sees.
 pub fn run_tests(
     checked: &Checked,
     sources: &SourceMap,
     data: &BuildData,
     tests: &[wrela_sema::ty::FnId],
     fuel: u64,
-) -> (Vec<(wrela_sema::ty::FnId, Option<Diagnostic>)>, Vec<Diagnostic>) {
+) -> (Vec<Ran>, Vec<Diagnostic>) {
     let (module, diags) = wrela_lower::lower_tests(checked, tests, data);
     let Some(module) = module.filter(|_| !wrela_diag::has_errors(&diags)) else {
         return (Vec::new(), diags);
     };
-    let compiled = match compile(engine(), &module.module, !data.no_simd) {
+    // Its own memory, unshared: each test runs on one thread.
+    let compiled = match compile(engine(), &module.module, !data.no_simd, false) {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
     };
-    let names: Vec<&str> = module.exports.iter().map(|(_, name)| name.as_str()).collect();
-    let ran = each_at_once(&names, |name| compiled.start(engine()).map(|mut r| r.call(name, fuel)));
+    // Each test's fuel: its own (`@fuel`), or a test's.
+    let fuel_of =
+        |f: wrela_sema::ty::FnId| checked.program.func(f).attrs.fuel.map_or(fuel, |(v, _)| v);
+    let exports: Vec<(&str, String, u64)> = module
+        .exports
+        .iter()
+        .map(|(f, name)| (name.as_str(), checked.program.func(*f).name.clone(), fuel_of(*f)))
+        .collect();
+    let ran = each_at_once(&exports, |(export, test, fuel)| {
+        let trace = wrela_host::Trace::new(Some(format!("{test}: ")));
+        let ran = compiled.start(engine(), false, &trace).map(|mut r| r.call(export, *fuel));
+        (ran, trace.take())
+    });
     let results = module
         .exports
         .iter()
         .zip(ran)
-        .map(|((f, _), ran)| {
+        .map(|((f, _), (ran, traced))| {
             let failed = match ran {
                 Ok(Ok(_)) => None,
                 Err(msg) => Some(Diagnostic::internal(msg)),
                 Ok(Err(CallError::Internal(e))) => Some(Diagnostic::internal(format!("{e:#}"))),
                 Ok(Err(CallError::Failed(e, panic))) => {
                     let fault = Fault::of(&e, panic);
-                    let item = Item::Test(*f, fuel);
+                    let item = Item::Test(*f, fuel_of(*f));
                     Some(failure(checked, sources, &compiled.lines, item, &fault, None))
                 }
             };
-            (*f, failed)
+            (*f, failed, traced)
         })
         .collect();
     (results, diags)
@@ -360,10 +537,10 @@ fn each_at_once<T: Sync, R: Send>(items: &[T], run: impl Fn(&T) -> R + Sync) -> 
     done.into_iter().map(|(_, r)| r).collect()
 }
 
-/// What failed: computing a constant, or a test (with the fuel it ran with).
+/// What failed: computing a constant, or a test (each with the fuel it ran with).
 #[derive(Clone, Copy)]
 pub(crate) enum Item {
-    Const(ConstId),
+    Const(ConstId, u64),
     Test(wrela_sema::ty::FnId, u64),
 }
 
@@ -379,7 +556,7 @@ fn instructions(n: u64) -> String {
 impl Item {
     fn span(self, p: &wrela_sema::program::Program) -> Span {
         match self {
-            Item::Const(c) => p.const_(c).span,
+            Item::Const(c, _) => p.const_(c).span,
             Item::Test(f, _) => p.func(f).span,
         }
     }
@@ -387,7 +564,7 @@ impl Item {
     /// "computing the constant `X`", "the test `t`".
     fn what(self, p: &wrela_sema::program::Program) -> String {
         match self {
-            Item::Const(c) => format!("computing {}", p.const_(c).shown()),
+            Item::Const(c, _) => format!("computing {}", p.const_(c).shown()),
             Item::Test(f, _) => format!("the test `{}`", p.func(f).name),
         }
     }
@@ -395,10 +572,15 @@ impl Item {
     /// The label where the code that failed was called from the item.
     fn within(self, p: &wrela_sema::program::Program) -> String {
         match self {
-            Item::Const(c) => format!("while the build computes {}", p.const_(c).short()),
+            Item::Const(c, _) => format!("while the build computes {}", p.const_(c).short()),
             Item::Test(f, _) => format!("in the test `{}`", p.func(f).name),
         }
     }
+}
+
+fn read_panic_message(data: &[u8]) -> Option<String> {
+    let at = wrela_abi::memory::panic_at(wrela_abi::memory::THREAD_MAIN) as usize;
+    wrela_abi::memory::panic_message(data.get(at..)?)
 }
 
 fn take_panic_message(data: &mut [u8]) -> Option<String> {
@@ -471,7 +653,11 @@ pub(crate) fn failure(
     let failed = if matches!(item, Item::Test(..)) { codes::E0706 } else { codes::E0704 };
     let (code, verb, detail) = match (fault.trap, &fault.panic) {
         (Some(wasmtime::Trap::OutOfFuel), _) => {
-            let limit = if matches!(item, Item::Test(..)) { "a test's" } else { "the build's" };
+            let limit = match item {
+                Item::Test(..) => "a test's",
+                Item::Const(c, _) if p.const_(c).fuel.is_some() => "its",
+                Item::Const(..) => "the build's",
+            };
             (codes::E0705, format!("ran past {limit} fuel limit"), None)
         }
         (_, Some(msg)) => (failed, "panicked".to_string(), Some(msg.clone())),
@@ -506,7 +692,11 @@ pub(crate) fn failure(
     if code == codes::E0705 {
         d = d
             .with_note(match item {
-                Item::Const(_) => format!(
+                Item::Const(c, fuel) if p.const_(c).fuel.is_some() => format!(
+                    "its `@fuel` stops it after about {} WASM instructions, its threads' together (§10)",
+                    instructions(fuel)
+                ),
+                Item::Const(..) => format!(
                     "the build stops a constant after about {} WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)",
                     instructions(FUEL)
                 ),
@@ -516,7 +706,12 @@ pub(crate) fn failure(
                 ),
             })
             .with_help(match item {
-                Item::Const(_) => "check that its loops end, or compute the value at load instead",
+                Item::Const(c, _) if p.const_(c).fuel.is_some() => {
+                    "check that its loops end, or give it more `@fuel`"
+                }
+                Item::Const(..) => {
+                    "check that its loops end, give it more with `@fuel(n)`, or compute the value at load instead"
+                }
                 Item::Test(..) => "check that its loops end, or test less at once",
             });
     } else if code == codes::E0706 {

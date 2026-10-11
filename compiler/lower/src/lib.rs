@@ -194,7 +194,7 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
 /// uses, by any of the module's other functions (std's `std::par` for the helpers' `worker`,
 /// `std::audio` for `audio`, `std::tick` for `tick`). Each is lowered and exported as `__` and
 /// its name (wrela_abi `memory`'s threads).
-fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
+pub(crate) fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
     let p = &cx.checked.program;
     let entries: Vec<(FnId, String, wrela_sema::ty::ModuleId)> = (0..p.fns.len() as u32)
         .map(FnId)
@@ -238,6 +238,11 @@ fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
 
 /// What a debug build's NaN check panics with (§11).
 pub(crate) const NAN_MESSAGE: &str = "debug build: a float operation created a NaN";
+
+/// What a command too large for the host's command buffer panics with: std writes buffers and
+/// textures in pieces, and refuses a request over it by name, so this is the backstop.
+pub(crate) const COMMAND_MESSAGE: &str =
+    "a GPU or IO command larger than the host's command buffer (1 MiB): send its bytes in pieces";
 
 /// Shared state while lowering every module of one program.
 pub(crate) struct Cx<'a> {
@@ -418,6 +423,7 @@ pub fn lower(
         // Checked where floats are computed, by the back end.
         cpu.m.nan_message = Some(cx.text_data(&mut cpu, NAN_MESSAGE));
     }
+    cpu.m.command_message = Some(cx.text_data(&mut cpu, COMMAND_MESSAGE));
     // Inlining finds no mistakes in the program, only makes its code faster, so a check (no
     // code emitted) skips it.
     if emit

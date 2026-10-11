@@ -1,0 +1,36 @@
+// accepts: fn.fields
+/// A simulation's step and what it shows, kept together: the struct is generic over each
+/// function, as a function is over a trait in parameter position.
+struct Driver<W: Copy> {
+    world: W,
+    step: @deterministic fn(mut W, f32),
+    show: fn(W) -> f32,
+}
+
+@deterministic
+fn fall(y: mut f32, dt: f32) {
+    y -= 9.8 * dt
+}
+
+fn height(y: f32) -> f32 {
+    y
+}
+
+/// `d: mut Driver<f32>` makes `tick` generic over the driver's functions.
+fn tick(d: mut Driver<f32>, dt: f32) -> f32 {
+    let step = d.step
+    step(mut d.world, dt)
+    let show = d.show
+    show(d.world)
+}
+
+/// A `take` parameter of a function type is kept: the function is generic over it.
+fn driver(start: f32, step: take @deterministic fn(mut f32, f32)) -> f32 {
+    var d = Driver { world: start, step, show: height }
+    tick(mut d, 0.5)
+}
+
+pub fn frame(time: f32, width: u32, height_px: u32) {
+    var d = Driver { world: 10.0, step: fall, show: height }
+    let _ = tick(mut d, 1.0 / 60.0) + driver(1.0, fall)
+}

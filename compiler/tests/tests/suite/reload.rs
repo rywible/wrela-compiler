@@ -203,6 +203,7 @@ fn wrela_run_reloads_the_page_in_place() {
     let page = out.clone();
     let chrome = std::thread::spawn(move || wrela_tests::run_url_in_chrome(&url, &page, 180));
     let limit = std::time::Duration::from_secs(60);
+    wrela_tests::wait_polling(&server, std::time::Duration::from_secs(120));
     // A first edit, shown once the page runs.
     write_edit(&pkg, "main.wrela", |s| {
         s.replacen("vec3(0.25, 0.5, 0.75)", "vec3(0.3, 0.5, 0.75)", 1)
@@ -251,4 +252,92 @@ fn wrela_run_reloads_the_page_in_place() {
         expected.extend(native.take_logs().into_iter().filter(|l| l.starts_with("frame ")));
     }
     assert_eq!(lines, expected.iter().map(String::as_str).collect::<Vec<_>>());
+}
+
+/// A page opened after hot reloads loads the newest build, and starts after the changes that
+/// build holds (M6 AC15). Three structural edits are built with no page open; a page opened
+/// then draws the third's clear colour. Playing spike 17, such a page replayed the server's
+/// changes from the first, and asked for a build the server had deleted (`/2/manifest.json`,
+/// 404), and stopped.
+#[test]
+#[ignore = "long: needs Chrome and a GPU"]
+fn a_page_opened_after_hot_reloads_loads_the_newest_build() {
+    let pkg = edited("reload-late-page-src", |src| src.to_string() + "\n");
+    let out = super::scratch("reload-late-page");
+    let server =
+        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
+            .expect("serve");
+    let builds = |server: &wrela_driver::live::Server| {
+        server.changes().iter().filter(|c| c["kind"] == "build").count()
+    };
+    let clears = ["tint().zyx * 0.5", "tint().yzx * 0.5", "tint().xzy * 0.5"];
+    let mut last = "tint() * 0.5";
+    for (k, clear) in clears.into_iter().enumerate() {
+        write_edit(&pkg, "main.wrela", |s| {
+            s.replace(&format!("clear: vec4({last}, 1.0)"), &format!("clear: vec4({clear}, 1.0)"))
+        });
+        last = clear;
+        let began = std::time::Instant::now();
+        while builds(&server) < k + 1 {
+            assert!(
+                began.elapsed().as_secs() < 60,
+                "edit {k} wasn't built: {:?}",
+                server.changes()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+    let url = format!(
+        "http://127.0.0.1:{}/#test&frames=20&width={SIZE}&height={SIZE}&fps=60&nohash=1",
+        server.port
+    );
+    wrela_tests::run_url_in_chrome(&url, &out, 120);
+    // The last frame's clear: the third edit's, `tint().xzy * 0.5` of (0.25, 0.5, 0.75).
+    let frame = std::fs::read(out.join("results/frame.rgba")).expect("frame.rgba");
+    let i = ((32 * SIZE + 56) * 4) as usize;
+    assert_eq!([frame[i], frame[i + 1], frame[i + 2]], [32, 96, 64], "the newest build's clear");
+}
+
+/// A page kept open through three structural hot reloads keeps running, draws the third's clear
+/// colour, and fetches the file its build ships each time. Each new build's ticker starts from
+/// the script the page's render worker came from (`/1/worker.js`), and the program fetched its
+/// files from the page's build; the server keeps only two builds: a page open through three
+/// stopped, "the ticker's thread couldn't start", and the floor's tiles didn't come (playing the
+/// floor, M6). The runtime's own scripts are served for a build that's gone, and a new build's
+/// files are fetched from its own.
+#[test]
+#[ignore = "long: needs Chrome and a GPU"]
+fn a_page_open_through_hot_reloads_keeps_running() {
+    let pkg = edited("reload-open-page-src", |src| src.to_string() + "\n");
+    let out = super::scratch("reload-open-page");
+    let server =
+        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
+            .expect("serve");
+    let url = format!(
+        "http://127.0.0.1:{}/#test&frames=1500&width={SIZE}&height={SIZE}&fps=60&nohash=1",
+        server.port
+    );
+    let page = out.clone();
+    let chrome = std::thread::spawn(move || wrela_tests::run_url_in_chrome(&url, &page, 180));
+    let limit = std::time::Duration::from_secs(60);
+    wrela_tests::wait_polling(&server, std::time::Duration::from_secs(120));
+    let clears = ["tint().zyx * 0.5", "tint().yzx * 0.5", "tint().xzy * 0.5"];
+    let mut last = "tint() * 0.5";
+    for (k, clear) in clears.into_iter().enumerate() {
+        write_edit(&pkg, "main.wrela", |s| {
+            s.replace(&format!("clear: vec4({last}, 1.0)"), &format!("clear: vec4({clear}, 1.0)"))
+        });
+        last = clear;
+        wait_shown(&server, k + 1, limit);
+    }
+    chrome.join().expect("the page ran its frames");
+    let frame = std::fs::read(out.join("results/frame.rgba")).expect("frame.rgba");
+    let i = ((32 * SIZE + 56) * 4) as usize;
+    assert_eq!([frame[i], frame[i + 1], frame[i + 2]], [32, 96, 64], "the third build's clear");
+    // The shipped file, fetched every two seconds, came each time: a new build's from its own
+    // files (the page's first build's are deleted by the third).
+    let log = std::fs::read_to_string(out.join("results/log.txt")).expect("log.txt");
+    let fetched = log.lines().filter(|l| l.starts_with("fetched 14 bytes")).count();
+    assert!(!log.contains("didn't come"), "a fetch failed after a hot reload:\n{log}");
+    assert!(fetched >= 10, "only {fetched} fetches came:\n{log}");
 }

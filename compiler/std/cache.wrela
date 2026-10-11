@@ -1,0 +1,127 @@
+// Results cooked from inputs, cooked again when the inputs change (language.md §6.19): where a
+// program kept a flag a cache, and passed a change on to each cache cooked from what changed by
+// hand. A cache names what it's cooked from as a key: the inputs themselves, or the versions of
+// the caches and the literals (`std::lift::Watch::version`) they come from, so a change reaches
+// every cache cooked from it, through as many steps as there are.
+
+/// What a result was cooked from: stale while its inputs are other than they were. The result
+/// itself is the program's (a texture cooked in place, a buffer): this says when to cook it.
+///
+/// ```wrela
+/// use std::cache::Stale
+///
+/// struct Sky {
+///     tables: Stale<f32>,
+///     dome: Stale<u32>,
+///     cooks: u32,
+/// }
+///
+/// fn cook(s: mut Sky, sun: f32) {
+///     if s.tables.stale(sun) {
+///         s.cooks += 1
+///         s.tables.cooked(sun)
+///     }
+///     // The dome is cooked from the tables: their version is its key.
+///     let k = s.tables.version()
+///     if s.dome.stale(k) {
+///         s.cooks += 1
+///         s.dome.cooked(k)
+///     }
+/// }
+/// ```
+pub struct Stale<K>: Clone {
+    key: Option<K>,
+    version: u32,
+}
+
+impl<K: Eq + Clone> Stale<K> {
+    /// Never cooked: stale for every key.
+    pub fn new() -> Stale<K> {
+        Stale { key: None, version: 0 }
+    }
+
+    /// Whether what's cooked is out of date for inputs `key`: never cooked, cooked from other
+    /// inputs, or forgotten.
+    pub fn stale(self, key: K) -> bool {
+        match self.key {
+            Some(k) => k != key,
+            None => true,
+        }
+    }
+
+    /// What's cooked is `key`'s now. Its version counts its cooks: what's cooked from this
+    /// names the version in its own key.
+    pub fn cooked(mut self, key: take K) {
+        self.key = Some(take key)
+        self.version += 1
+    }
+
+    /// How many times it's been cooked: what's cooked from it names it in its key.
+    pub fn version(self) -> u32 {
+        self.version
+    }
+
+    /// Whether it's been cooked, from any key.
+    pub fn ready(self) -> bool {
+        self.key.is_some()
+    }
+
+    /// Forgets what it was cooked from: stale for every key until it's cooked again (the program
+    /// changed an input by hand, which no key names).
+    pub fn forget(mut self) {
+        self.key = None
+    }
+}
+
+/// A value cooked from inputs, kept until they change: `get` gives it, cooking it first if it's
+/// stale.
+///
+/// ```wrela
+/// use std::cache::Cached
+///
+/// fn table(n: u32) -> Vec<f32> {
+///     Vec::from_fn(n, |i| sin(f32(i)))
+/// }
+///
+/// fn sum(c: mut Cached<u32, Vec<f32>>, n: u32) -> f32 {
+///     var total = 0.0
+///     for x in c.get(n, table) {
+///         total += x
+///     }
+///     total
+/// }
+/// ```
+pub struct Cached<K, V> {
+    key: Stale<K>,
+    value: Option<V>,
+}
+
+impl<K: Eq + Clone, V> Cached<K, V> {
+    /// Nothing cooked yet.
+    pub fn new() -> Cached<K, V> {
+        Cached { key: Stale::new(), value: None }
+    }
+
+    /// The value for inputs `key`: `make(key)`'s, made again only when `key` isn't what the value
+    /// kept was made from.
+    pub fn get(mut self, key: K, make: fn(K) -> V) -> borrow V {
+        if self.key.stale(key) || self.value.is_none() {
+            self.value = Some(make(key))
+            self.key.cooked(key.clone())
+        }
+        match self.value {
+            Some(v) => v,
+            None => panic("a cached value is made before it's read"),
+        }
+    }
+
+    /// How many times its value has been made: what's cooked from it names it in its key.
+    pub fn version(self) -> u32 {
+        self.key.version()
+    }
+
+    /// Forgets the value's key: it's made again at the next `get`.
+    pub fn forget(mut self) {
+        self.key.forget()
+    }
+}

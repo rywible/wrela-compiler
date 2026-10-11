@@ -160,7 +160,7 @@ unsafe_block     ::= "unsafe" block
 path_expr        ::= expr_segment ("::" expr_segment)*
 expr_segment     ::= IDENT ("::" generic_args)? | "Self" | "self"
 paren_expr       ::= "(" (expr ("," expr)* ","?)? ")"
-array_expr       ::= "[" (expr (";" expr | ("," expr)* ","?))? "]"
+array_expr       ::= "[" (expr (";" expr | ("," expr)* ("," ".." expr)? ","?) | ".." expr ","?)? "]"
 
 # `S { time }` is short for `S { time: time }`; `..base` fills the remaining fields.
 struct_literal   ::= path_expr "{" (field_init ("," field_init)* ("," ".." expr)? ","? | ".." expr ","?)? NEWLINE? "}"

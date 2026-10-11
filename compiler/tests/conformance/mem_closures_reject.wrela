@@ -1,6 +1,7 @@
 // rejects: mem.closures
-struct Holder {
-    f: fn(f32) -> f32, //~ E0510
+// A struct's field may be a function type (`fn.fields`); an enum's payload may not.
+enum Holder {
+    F(fn(f32) -> f32), //~ E0510
 }
 
 fn make(k: f32) -> fn(f32) -> f32 { //~ E0510

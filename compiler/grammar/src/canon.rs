@@ -524,6 +524,10 @@ impl AstWalker {
                 self.expr(value);
                 self.expr(count);
             }
+            ExprKind::ArrayFill { items, fill } => {
+                items.iter().for_each(|x| self.expr(x));
+                self.expr(fill);
+            }
             ExprKind::Block(b) => self.block(b),
             ExprKind::If { pat, cond, then, else_ } => {
                 if let Some(p) = pat {

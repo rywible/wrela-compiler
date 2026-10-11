@@ -1,13 +1,14 @@
 //! `wrela studio` (AC8–AC10 of #39): the lens's program around a subject package. The lens is
-//! the `studio` package (wrela, generic over any surface); this writes the small program that
-//! instantiates it with the subject's `subject()` (the glue), and builds it, lifting the
-//! subject's literals so an edit is a write to the table.
+//! the `studio` package (wrela, generic over any surface), and its program is studio/glue
+//! (wrela too): its exports, one for each action, on what its module `subject` gives. This
+//! writes that module for the subject's `subject()` (studio/glue's own shows a sphere), and
+//! builds the program, lifting the subject's literals so an edit is a write to the table.
 //!
-//! The glue goes in `<subject>/build/studio/lens/`, beside copies of the `studio` and `ui`
+//! The program goes in `<subject>/build/studio/lens/`, beside copies of the `studio` and `ui`
 //! packages (embedded in the compiler, so the command works from any directory); the build in
 //! `<subject>/build/studio/page/`. A subject package has a module `subject.wrela` with
-//! `pub fn subject()`, which returns a `Surface + Lipschitz`; if it's a `Field<C>` too, the glue
-//! writes each of the channels' public float fields into the lens's probes.
+//! `pub fn subject()`, which returns a `Surface`; if it's a `Field<C>` too, the `subject`
+//! module writes each of the channels' public float fields into the lens's probes.
 
 use crate::live::Files;
 use std::collections::BTreeMap;
@@ -43,7 +44,7 @@ struct Subject {
 }
 
 /// The lens's exported actions: each one's name and arguments (`f`: an `f32`, `u`: a `u32`).
-/// The glue exports each, and the headless runner calls them by this table.
+/// studio/glue exports each, and the headless runner calls them by this table.
 pub const ACTIONS: &[(&str, &str)] = &[
     ("view", "u"),
     ("zoom", "ffff"),
@@ -91,12 +92,12 @@ fn subject(pkg: &Path) -> Result<Subject, String> {
             .map(|(i, _)| wrela_sema::ty::FnId(i as u32))
             .ok_or_else(|| {
                 format!(
-                    "`{}` has no `pub fn subject()` in a module `subject` (subject.wrela): the lens shows what it returns, a `Surface + Lipschitz`",
+                    "`{}` has no `pub fn subject()` in a module `subject` (subject.wrela): the lens shows what it returns, a `Surface`",
                     pkg.display()
                 )
             })?;
         let ty = checked.reveal(p.func(f).ret);
-        // The channels' type: as `subject()` declares it (`-> Field<Coat> + Lipschitz`), or as
+        // The channels' type: as `subject()` declares it (`-> Field<Coat>`), or as
         // its type implements `Field`.
         // std's `Field<C>`: an ordinary trait, found by its path.
         let field_trait = p
@@ -204,29 +205,31 @@ fn floats(checked: &Checked, t: TyId, path: String, depth: u32, out: &mut Vec<(S
     }
 }
 
-/// The glue: the lens's program around `s`.
+/// The lens program's module `subject` for `s`: what the lens needs of it (studio/glue's own
+/// module is a sphere's).
 fn glue(s: &Subject) -> String {
     let mut g = String::new();
     let name = &s.name;
     let _ = write!(
         g,
-        "// Written by `wrela studio`: the lens (the `studio` package) on the package `{name}`.\n\
-         // Each action is an export, and a command the lens reads as typed text.\n\n\
+        "// Written by `wrela studio`: what the lens needs of the package `{name}` (studio/glue's\n\
+         // own `subject.wrela` is a sphere's).\n\n\
          use std::collections::Vec\n\
          use std::lift::{{Literal, gradient, reads}}\n\
          use std::string::String\n\
          use studio::json::obj\n\
-         use studio::lens::Lens\n\
          use {name}::subject::subject\n"
     );
     if !s.channels.is_empty() {
         g.push_str("use std::field::Field\n");
     }
-    g.push_str("use std::field::Lipschitz\nuse studio::paint::Colours\n");
+    g.push_str("use studio::paint::Colours\n");
     // The subject as the views see it: coloured by its channels' albedo where they hold one.
     match &s.albedo {
         Some((ty, prefix)) => {
-            let at = |c: &str| if prefix.is_empty() { format!("c.{c}") } else { format!("c.{prefix}.{c}") };
+            let at = |c: &str| {
+                if prefix.is_empty() { format!("c.{c}") } else { format!("c.{prefix}.{c}") }
+            };
             let _ = write!(
                 g,
                 "use std::field::{{PartName, Surface}}\n\n\
@@ -238,38 +241,37 @@ fn glue(s: &Subject) -> String {
                  fn parts(self) -> u32 {{\n        self.field.parts()\n    }}\n\n    \
                  fn part_at(self, p: vec3) -> (f32, u32) {{\n        self.field.part_at(p)\n    }}\n\n    \
                  fn part_distance(self, p: vec3, i: u32) -> f32 {{\n        self.field.part_distance(p, i)\n    }}\n\n    \
-                 fn part_name(self, i: u32) -> PartName {{\n        self.field.part_name(i)\n    }}\n}}\n\n\
-                 impl<F: Field<{ty}> + Lipschitz> Lipschitz for Painted<F> {{\n    \
+                 fn part_name(self, i: u32) -> PartName {{\n        self.field.part_name(i)\n    }}\n\n    \
                  fn lipschitz(self, near: f32) -> f32 {{\n        self.field.lipschitz(near)\n    }}\n}}\n\n\
                  impl<F: Field<{ty}>> Colours for Painted<F> {{\n    \
                  fn colour_at(self, p: vec3) -> vec3 {{\n        let c = self.field.channels(p)\n        vec3({}, {}, {})\n    }}\n}}\n\n\
-                 fn painted() -> Colours + Lipschitz {{\n    Painted {{ field: subject() }}\n}}\n",
+                 pub fn painted() -> Colours {{\n    Painted {{ field: subject() }}\n}}\n",
                 at("r"),
                 at("g"),
                 at("b")
             );
         }
         None => g.push_str(
-            "\nfn painted() -> Colours + Lipschitz {\n    studio::paint::Clay { field: subject() }\n}\n",
+            "\npub fn painted() -> Colours {\n    studio::paint::Clay { field: subject() }\n}\n",
         ),
     }
     g.push_str(
-        "\nfn grad(p: vec3, which: [Literal; 16]) -> (f32, [f32; 16]) {\n    \
+        "\npub fn grad(p: vec3, which: [Literal; 16]) -> (f32, [f32; 16]) {\n    \
          gradient(|| subject().distance(p), which)\n}\n\n\
-         fn grad8(p: vec3, which: [Literal; 8]) -> (f32, [f32; 8]) {\n    \
+         pub fn grad8(p: vec3, which: [Literal; 8]) -> (f32, [f32; 8]) {\n    \
          gradient(|| subject().distance(p), which)\n}\n\n\
-         fn reached() -> Vec<Literal> {\n    var out: Vec<Literal> = Vec::new()\n    \
+         pub fn reached() -> Vec<Literal> {\n    var out: Vec<Literal> = Vec::new()\n    \
          for l in reads(|| subject().distance(vec3(0.0))) {\n        out.push(l)\n    }\n    \
          out\n}\n\n\
-         fn part_reads(p: vec3, part: u32) -> Vec<Literal> {\n    var out: Vec<Literal> = Vec::new()\n    \
+         pub fn part_reads(p: vec3, part: u32) -> Vec<Literal> {\n    var out: Vec<Literal> = Vec::new()\n    \
          for l in reads(|| subject().part_distance(p, part)) {\n        out.push(l)\n    }\n    \
          out\n}\n\n",
     );
     if s.channels.is_empty() {
-        g.push_str("fn channels(p: vec3) -> String {\n    String::new()\n}\n\n");
+        g.push_str("pub fn channels(p: vec3) -> String {\n    String::new()\n}\n\n");
     } else {
         g.push_str(
-            "fn channels(p: vec3) -> String {\n    let c = subject().channels(p)\n    obj()",
+            "pub fn channels(p: vec3) -> String {\n    let c = subject().channels(p)\n    obj()",
         );
         for (path, n) in &s.channels {
             match n {
@@ -292,15 +294,15 @@ fn glue(s: &Subject) -> String {
     if s.spec {
         let _ = write!(
             g,
-            "fn spec_report() -> String {{\n    var r = std::lift::Report::new()\n    {name}::spec::spec(mut r)\n    r.done()\n}}\n\n"
+            "pub fn spec_report() -> String {{\n    var r = std::lift::Report::new()\n    {name}::spec::spec(mut r)\n    r.done()\n}}\n\n"
         );
     } else {
         g.push_str(
-            "fn spec_report() -> String {\n    String::from(\"{\\\"error\\\":\\\"the package has no spec: write `pub fn spec<C: Checks>(c: mut C)` in spec.wrela\\\"}\")\n}\n\n",
+            "pub fn spec_report() -> String {\n    String::from(\"{\\\"error\\\":\\\"the package has no spec: write `pub fn spec<C: Checks>(c: mut C)` in spec.wrela\\\"}\")\n}\n\n",
         );
     }
     // The blueprint's outlines, by facing (0 side, 1 front, 2 top).
-    g.push_str("fn outline(facing: u32) -> Vec<vec2> {\n");
+    g.push_str("pub fn outline(facing: u32) -> Vec<vec2> {\n");
     for (i, f) in ["side", "front", "top"].iter().enumerate() {
         if s.outlines[i] {
             let _ = writeln!(
@@ -309,50 +311,7 @@ fn glue(s: &Subject) -> String {
             );
         }
     }
-    g.push_str("    Vec::new()\n}\n\n");
-    g.push_str(
-        "pub fn init() -> Lens {\n    studio::lens::open(painted)\n}\n\n\
-         pub fn frame(state: mut Lens, time: f32, width: u32, height: u32) {\n    \
-         studio::lens::frame(mut state, painted, grad, grad8, reached, part_reads, channels, spec_report, outline, width, height)\n}\n\n\
-         pub fn busy(state: Lens) -> u32 {\n    if studio::lens::busy(state) { 1 } else { 0 }\n}\n\n\
-         pub fn view(state: mut Lens, facing: u32) {\n    studio::lens::show(mut state, facing)\n}\n\n\
-         pub fn zoom(state: mut Lens, x: f32, y: f32, z: f32, half: f32) {\n    \
-         studio::lens::zoom(mut state, vec3(x, y, z), half)\n}\n\n\
-         pub fn spec(state: mut Lens) {\n    studio::lens::spec_answer(mut state, spec_report)\n}\n\n\
-         pub fn blueprint(state: mut Lens, facing: u32) {\n    \
-         studio::lens::show_blueprint(mut state, painted, outline, facing)\n}\n\n\
-         pub fn fit_blueprint(state: mut Lens, facing: u32, res: u32) {\n    \
-         studio::lens::fit_blueprint(mut state, outline, facing, res)\n}\n\n\
-         pub fn mode(state: mut Lens, mode: u32, part: u32) {\n    \
-         studio::lens::set_mode(mut state, mode, part)\n}\n\n\
-         pub fn parts(state: mut Lens) {\n    studio::lens::parts(mut state, painted)\n}\n\n\
-         pub fn probe(state: mut Lens, x: f32, y: f32, z: f32) {\n    \
-         studio::lens::probe(mut state, painted, channels, vec3(x, y, z))\n}\n\n\
-         pub fn project(state: mut Lens, x: f32, y: f32, z: f32) {\n    \
-         studio::lens::project(mut state, vec3(x, y, z))\n}\n\n\
-         pub fn ray(state: mut Lens, x: f32, y: f32, z: f32, dx: f32, dy: f32, dz: f32) {\n    \
-         studio::lens::ray(mut state, painted, vec3(x, y, z), vec3(dx, dy, dz))\n}\n\n\
-         pub fn measure(state: mut Lens, x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) {\n    \
-         studio::lens::measure(mut state, vec3(x0, y0, z0), vec3(x1, y1, z1))\n}\n\n\
-         pub fn diagnose(state: mut Lens, x: f32, y: f32, z: f32, radius: f32) {\n    \
-         studio::lens::diagnose(mut state, painted, vec3(x, y, z), radius)\n}\n\n\
-         pub fn literals(state: mut Lens) {\n    studio::lens::literals(mut state)\n}\n\n\
-         pub fn describe(state: mut Lens) {\n    studio::lens::describe_subject(mut state, painted)\n}\n\n\
-         pub fn set(state: mut Lens, literal: u32, value: f32) {\n    \
-         studio::lens::set(mut state, literal, value)\n}\n\n\
-         pub fn click(state: mut Lens, x: f32, y: f32) {\n    \
-         studio::lens::click(mut state, painted, grad, reached, part_reads, x, y)\n}\n\n\
-         pub fn write(state: mut Lens) {\n    studio::lens::write(mut state)\n}\n\n\
-         pub fn move(state: mut Lens, x0: f32, y0: f32, z0: f32, x1: f32, y1: f32, z1: f32) {\n    \
-         studio::lens::move_point(mut state, painted, vec3(x0, y0, z0), vec3(x1, y1, z1))\n}\n\n\
-         pub fn choose(state: mut Lens, literal: u32) {\n    \
-         studio::lens::choose(mut state, literal, none: false)\n}\n\n\
-         pub fn choose_none(state: mut Lens) {\n    studio::lens::choose(mut state, 0, none: true)\n}\n\n\
-         pub fn silhouette(state: mut Lens, facing: u32, x: f32, y: f32, z: f32, half: f32, res: u32) {\n    \
-         studio::lens::silhouette(mut state, facing, vec3(x, y, z), half, res)\n}\n\n\
-         pub fn fit(state: mut Lens, facing: u32, x: f32, y: f32, z: f32, half: f32, res: u32) {\n    \
-         studio::lens::fit_reference(mut state, facing, vec3(x, y, z), half, res)\n}\n",
-    );
+    g.push_str("    Vec::new()\n}\n");
     g
 }
 
@@ -361,22 +320,145 @@ pub fn dir(pkg: &Path) -> PathBuf {
     pkg.join("build").join("studio")
 }
 
-/// Writes the lens's program for the subject at `pkg` (the glue, and the `studio` and `ui`
-/// packages beside it), leaving files that are already as they'd be: the program's directory.
-fn write_lens(pkg: &Path, s: &Subject) -> std::io::Result<PathBuf> {
+/// Whether the package at `pkg` is a floor, which the map lens shows (#55 AC13): a module
+/// `lens` (lens.wrela) with `pub fn map()` and `pub fn preview()`.
+pub fn is_floor(pkg: &Path) -> bool {
+    std::fs::read_to_string(pkg.join("lens.wrela"))
+        .is_ok_and(|t| t.contains("pub fn map(") && t.contains("pub fn preview("))
+}
+
+/// The map lens's exported actions, as `ACTIONS` lists the field lens's.
+pub const MAP_ACTIONS: &[(&str, &str)] = &[
+    ("show", "u"),
+    ("zoom", "fff"),
+    ("items", ""),
+    ("click", "ff"),
+    ("move", "ffff"),
+    ("check", ""),
+    ("write", ""),
+    ("walk", ""),
+    ("point", "ff"),
+];
+
+/// The actions of the lens on the package at `pkg`: the map lens's on a floor, else the field
+/// lens's.
+pub fn actions(pkg: &Path) -> &'static [(&'static str, &'static str)] {
+    if is_floor(pkg) { MAP_ACTIONS } else { ACTIONS }
+}
+
+/// The lens's program's directory for the package at `pkg`: the map lens's (`map`) on a floor,
+/// the field lens's (`lens`) on a subject.
+pub fn program_dir(pkg: &Path) -> PathBuf {
+    dir(pkg).join(if is_floor(pkg) { "map" } else { "lens" })
+}
+
+/// The dependencies the floor's manifest at `pkg` gives, each path made absolute.
+fn dependencies(pkg: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    let text = std::fs::read_to_string(pkg.join("wrela.toml"))
+        .map_err(|e| format!("can't read {}/wrela.toml: {e}", pkg.display()))?;
+    let m = crate::manifest::parse(wrela_diag::FileId(0), &text)
+        .map_err(|_| format!("{}/wrela.toml doesn't read", pkg.display()))?;
+    m.deps
+        .iter()
+        .map(|d| {
+            let path = pkg.join(&d.path).canonicalize().map_err(|e| format!("{}: {e}", d.path))?;
+            Ok((d.name.clone(), path))
+        })
+        .collect()
+}
+
+/// A manifest's `[dependencies]` lines: `deps` in order.
+fn dependency_lines(deps: &[(String, String)]) -> String {
+    deps.iter().map(|(n, p)| format!("{n} = {{ path = {p:?} }}\n")).collect()
+}
+
+/// Writes the map lens's program for the floor at `pkg` (studio/maplens/glue with a `floor`
+/// module for the floor's `lens`, and the `maplens`, `studio` and `ui` packages beside it): the
+/// program's directory. The lens's packages read the floor's own dependencies (whatever the
+/// floor is built on), so the compiler names none of them: the embedded `floor.wrela` is the
+/// Last Green's, with the floor's name put in its place.
+fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
+    let io = |e: std::io::Error| format!("can't write the map lens's program: {e}");
+    let floor_deps = dependencies(pkg)?;
     let base = dir(pkg);
-    for (sub, files) in [("studio", embedded::STUDIO), ("ui", embedded::UI)] {
-        for (rel, bytes) in files {
-            write_if_changed(&base.join(sub).join(rel), bytes)?;
+    let program = base.join("map");
+    let mut maplens_deps = vec![("studio".to_string(), "../studio".to_string())];
+    maplens_deps.push(("ui".to_string(), "../ui".to_string()));
+    for (rel, bytes) in embedded::STUDIO {
+        if let Some(rest) = rel.strip_prefix("maplens/") {
+            match rest {
+                "glue/main.wrela" => {
+                    write_if_changed(&program.join("main.wrela"), bytes).map_err(io)?
+                }
+                "glue/floor.wrela" => {
+                    let text = String::from_utf8_lossy(bytes).replace("last_green", name);
+                    write_if_changed(&program.join("floor.wrela"), text.as_bytes()).map_err(io)?
+                }
+                "wrela.toml" => {
+                    // The maplens package's own dependencies, beyond studio and ui, as the floor
+                    // gives them.
+                    let m = crate::manifest::parse(
+                        wrela_diag::FileId(0),
+                        &String::from_utf8_lossy(bytes),
+                    )
+                    .map_err(|_| "studio/maplens/wrela.toml doesn't read".to_string())?;
+                    for d in m.deps.iter().filter(|d| d.name != "studio" && d.name != "ui") {
+                        let (_, path) = floor_deps
+                            .iter()
+                            .find(|(n, _)| *n == d.name)
+                            .ok_or_else(|| format!("the floor doesn't depend on `{}`", d.name))?;
+                        maplens_deps.push((d.name.clone(), path.display().to_string()));
+                    }
+                }
+                _ if rest.starts_with("glue/") => {}
+                _ => write_if_changed(&base.join("maplens").join(rest), bytes).map_err(io)?,
+            }
+        } else if !rel.starts_with("glue/") {
+            write_if_changed(&base.join("studio").join(rel), bytes).map_err(io)?;
         }
     }
+    for (rel, bytes) in embedded::UI {
+        write_if_changed(&base.join("ui").join(rel), bytes).map_err(io)?;
+    }
+    let maplens = format!(
+        "# Written by `wrela studio`: the map lens, for the floor `{name}`.\n[package]\nname = \"maplens\"\n\n[dependencies]\n{}",
+        dependency_lines(&maplens_deps)
+    );
+    write_if_changed(&base.join("maplens").join("wrela.toml"), maplens.as_bytes()).map_err(io)?;
+    let mut deps = vec![("maplens".to_string(), "../maplens".to_string())];
+    deps.extend(floor_deps.iter().map(|(n, p)| (n.clone(), p.display().to_string())));
+    deps.push((name.to_string(), "../../..".to_string()));
+    let manifest = format!(
+        "# Written by `wrela studio`: the map lens on `{name}`.\n[package]\nname = \"map\"\n\n[dependencies]\n{}",
+        dependency_lines(&deps)
+    );
+    write_if_changed(&program.join("wrela.toml"), manifest.as_bytes()).map_err(io)?;
+    Ok(program)
+}
+
+/// Writes the lens's program for the subject at `pkg` (studio/glue with the subject's `subject`
+/// module, and the `studio` and `ui` packages beside it), leaving files that are already as
+/// they'd be: the program's directory.
+fn write_lens(pkg: &Path, s: &Subject) -> std::io::Result<PathBuf> {
+    let base = dir(pkg);
     let lens = base.join("lens");
+    for (sub, files) in [("studio", embedded::STUDIO), ("ui", embedded::UI)] {
+        for (rel, bytes) in files {
+            match rel.strip_prefix("glue/") {
+                // The program: its main module as it is; its manifest and `subject` are the
+                // subject's (below).
+                Some("main.wrela") => write_if_changed(&lens.join("main.wrela"), bytes)?,
+                Some(_) => {}
+                None => write_if_changed(&base.join(sub).join(rel), bytes)?,
+            }
+        }
+    }
     let manifest = format!(
         "# Written by `wrela studio`: the lens on `{}`.\n[package]\nname = \"lens\"\n\n[dependencies]\nstudio = {{ path = \"../studio\" }}\n{} = {{ path = \"../../..\" }}\n",
         s.name, s.name
     );
     write_if_changed(&lens.join("wrela.toml"), manifest.as_bytes())?;
-    write_if_changed(&lens.join("main.wrela"), glue(s).as_bytes())?;
+    write_if_changed(&lens.join("subject.wrela"), glue(s).as_bytes())?;
     Ok(lens)
 }
 
@@ -393,10 +475,21 @@ fn write_if_changed(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// Builds the lens on the subject at `pkg`, lifting the subject's literals, into
 /// `<pkg>/build/studio/page/`: the build's output, and that directory.
 pub fn build(pkg: &Path, debug: bool) -> Result<(crate::Output, PathBuf), String> {
-    let s = subject(pkg)?;
-    let lens = write_lens(pkg, &s).map_err(|e| format!("can't write the lens's program: {e}"))?;
     let kind = crate::BuildKind { debug, testing: false };
-    let out = crate::build_lifted(&lens, std::slice::from_ref(&s.name), kind)?;
+    let out = if is_floor(pkg) {
+        let name = crate::manifest::name_in(pkg).unwrap_or_else(|| {
+            pkg.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+        });
+        let program = write_map_lens(pkg, &name)?;
+        // The map's literals alone: what a drag moves. (The ground's, the species' and the
+        // rest are built into the code, so the preview runs at the speed of the game's build.)
+        crate::build_lifted(&program, &[format!("{name}/map.wrela")], kind)?
+    } else {
+        let s = subject(pkg)?;
+        let lens =
+            write_lens(pkg, &s).map_err(|e| format!("can't write the lens's program: {e}"))?;
+        crate::build_lifted(&lens, std::slice::from_ref(&s.name), kind)?
+    };
     let page = dir(pkg).join("page");
     if !out.has_errors() {
         let wasm = out.files.iter().find(|(p, _)| p == "game.wasm").map(|(_, w)| w.as_slice());
@@ -575,7 +668,7 @@ fn plan_edits(
     let r = report(page).map_err(refused)?;
     // The lens's build is of the program around the subject, so paths are from the lens's
     // package: `../../..` is the subject's.
-    let lens = dir(pkg).join("lens");
+    let lens = program_dir(pkg);
     // Each file an edit is in, by its index in the build: its text then and now, each lexed once.
     let mut lexed: BTreeMap<u32, (Numbers, Numbers)> = BTreeMap::new();
     let mut out = Vec::new();
@@ -643,7 +736,7 @@ pub fn apply(pkg: &Path, page: &Path, body: &[u8]) -> serde_json::Value {
         return serde_json::json!({ "written": false, "why": "the edits aren't [[literal, value], ...]" });
     };
     match plan_edits(pkg, page, &edits) {
-        Ok(planned) => match crate::edit::write(&dir(pkg).join("lens"), &planned) {
+        Ok(planned) => match crate::edit::write(&program_dir(pkg), &planned) {
             Ok(_) => crate::edit::to_value(&planned, true),
             Err(e) => serde_json::json!({ "written": false, "why": e.to_string() }),
         },
@@ -691,6 +784,30 @@ mod tests {
 
     fn same_but_numbers(a: &str, b: &str) -> bool {
         Numbers::new(a).same_but_numbers(&Numbers::new(b))
+    }
+
+    /// studio/glue, the lens's program, checks alone (on its sphere), and exports each action of
+    /// [`ACTIONS`], with the state and then its arguments, which the headless runner passes.
+    #[test]
+    fn the_lens_program_exports_each_action() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../studio/glue");
+        let out = crate::check(&dir);
+        assert!(!out.has_errors(), "{:?}", out.diagnostics);
+        let text = std::fs::read_to_string(dir.join("main.wrela")).expect("main.wrela");
+        for (name, args) in ACTIONS {
+            let at = text
+                .find(&format!("pub fn {name}(state: mut Lens"))
+                .unwrap_or_else(|| panic!("studio/glue exports no `{name}`"));
+            let line = &text[at..text[at..].find('\n').map_or(text.len(), |n| at + n)];
+            let kinds: String = line
+                .split(", ")
+                .skip(1)
+                .map(|p| if p.contains(": f32") { 'f' } else { 'u' })
+                .collect();
+            assert_eq!(kinds, *args, "`{name}`'s arguments: {line}");
+        }
+        let exports = text.matches("\npub fn ").count() + usize::from(text.starts_with("pub fn "));
+        assert_eq!(exports, ACTIONS.len() + 3, "init, frame and busy, and each action");
     }
 
     #[test]

@@ -1,0 +1,28 @@
+// rejects: eff.trace
+// GPU code can't call the host, the audio thread mustn't wait on it, and what's derived runs in
+// another form: none of them prints or times a phase.
+use std::derive::gradient
+use std::gpu::{GlobalId, Slots}
+use std::io::print
+use std::time::phase
+
+@compute(64)
+fn kernel(out: mut Slots<f32>, id: GlobalId) {
+    phase("kernel") //~ E0600
+    out[id] = 1.0
+}
+
+@audio
+fn render(level: mut f32, out: mut [f32]) {
+    print("quantum") //~ E0600
+    level *= 0.5
+}
+
+fn shouted(x: f32) -> f32 {
+    print("asked") //~ E0700
+    x * x
+}
+
+pub fn slope(x: f32) -> f32 {
+    gradient(shouted, x)
+}

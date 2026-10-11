@@ -1,0 +1,71 @@
+// Constants that hold `Text`, read by GPU code (M6, AC15): a site's name beside its place, as a
+// map's tables hold them. GPU code has no addresses, so a text there is its length alone; the
+// kernel reads the other fields, and a text's length. Spike 17 found this an internal error
+// (I0001) and kept names out of what the GPU reads.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read}
+use std::io::Pending
+
+struct Site: Copy {
+    at: vec2,
+    tall: f32,
+    name: Text,
+}
+
+const SITES = [
+    Site { at: vec2(1.0, 2.0), tall: 3.0, name: "the tower" },
+    Site { at: vec2(4.0, 5.0), tall: 6.0, name: "the ring" },
+]
+
+/// Computed by the build: three more, the names made.
+const MADE: [Site; 3] = made()
+
+fn made() -> [Site; 3] {
+    var v = [Site { at: vec2(0.0), tall: 0.0, name: "" }; 3]
+    for i in 0..3 {
+        v[i] = Site { at: vec2(f32(i)), tall: 10.0 + f32(i), name: "the crag" }
+    }
+    v
+}
+
+@compute(64)
+fn read_sites(out: mut Slots<f32>, id: GlobalId) {
+    let s = SITES[id.x % 2]
+    out[id] = s.tall + s.at.y + f32(s.name.len()) + MADE[id.x % 3].tall + f32(MADE[0].name.len())
+}
+
+pub struct State {
+    out: GpuBuffer<f32>,
+    pending: Option<Pending<f32>>,
+    got: Vec<f32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64), pending: None, got: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.got.len() > 0 {
+        return
+    }
+    match mut s.pending {
+        Some(p) => {
+            if let Some(Ok(v)) = p.poll() {
+                s.got = take v
+            }
+        },
+        None => {
+            dispatch(read_sites.bind(mut s.out), over: 64)
+            s.pending = Some(read(s.out.items()))
+        },
+    }
+}
+
+@test(frames: 4, gpu: true)
+fn the_gpu_reads_constants_that_hold_text(s: State) {
+    assert(s.got.len() == 64)
+    for i in 0..64 {
+        let site = SITES[i % 2]
+        let want = site.tall + site.at.y + f32(site.name.len()) + MADE[i % 3].tall + 8.0
+        assert(s.got[i] == want)
+    }
+}

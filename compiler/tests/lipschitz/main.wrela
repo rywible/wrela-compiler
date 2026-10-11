@@ -1,7 +1,7 @@
 // A primitive whose stated bound is wrong (compiler/tests/tests/suite/lipschitz.rs): a sphere's
 // gradient has length 1, but `Understated` says 0.5. A release build trusts it; a debug build
 // checks it against the derived gradient when `to_bound` uses it, and panics.
-use std::field::{Lipschitz, Surface}
+use std::field::Surface
 
 struct Understated: Copy + GpuData {
     radius: f32,
@@ -11,13 +11,12 @@ impl Surface for Understated {
     fn distance(self, p: vec3) -> f32 {
         length(p) - self.radius
     }
-}
 
-impl Lipschitz for Understated {
     fn lipschitz(self, near: f32) -> f32 {
         0.5
     }
 }
+
 
 /// The bound field's value at a point two radii out: 0.1 held, divided by 0.5.
 pub fn bound_at() -> f32 {

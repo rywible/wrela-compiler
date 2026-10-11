@@ -3,7 +3,7 @@
 // suffixes, negated literals, a table of more than 16 numbers (`LEGS`), and noise.
 
 use std::derive::Box3
-use std::field::{Lipschitz, Surface, ellipsoid, fbm, round_cone, sphere}
+use std::field::{Surface, ellipsoid, fbm, round_cone, sphere}
 use std::units::{cm, mm}
 
 /// The head's place.
@@ -22,12 +22,12 @@ const LEGS: [vec3; 6] = [
     vec3(-0.06, 0.02, -0.55),
 ]
 
-fn leg(top: vec3, foot: vec3, r: f32 = 4cm) -> Surface + Lipschitz {
+fn leg(top: vec3, foot: vec3, r: f32 = 4cm) -> Surface {
     round_cone(top, foot, r_top: r * 1.4, r_bottom: r)
 }
 
 /// The blob: a body, a head, six legs and a tail, smoothly joined, with a little noise.
-pub fn blob() -> Surface + Lipschitz {
+pub fn blob() -> Surface {
     let body = ellipsoid(radii: vec3(0.22, 0.2, 0.45)).translate(vec3(0, 55cm, 0))
     let head = sphere(radius: R).translate(HEAD)
     let neck = round_cone(vec3(0.0, 0.6, 0.3), HEAD, r_top: R, r_bottom: 0.08)

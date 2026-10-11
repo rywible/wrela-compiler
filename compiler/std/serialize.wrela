@@ -76,7 +76,7 @@ pub struct Reader: Clone {
 impl Reader {
     /// A reader at the start of `bytes`.
     pub fn new(bytes: take Vec<u8>) -> Reader {
-        Reader { bytes: take bytes, at: 0 }
+        Reader { bytes, at: 0 }
     }
 
     /// How many bytes are left.
@@ -552,11 +552,19 @@ impl<T: Serialize + Copy, const N: u32> Serialize for Bounded<T, N> {
 }
 
 impl<T: Serialize> Serialize for Box<T> {
+    /// An empty box (a job's local not yet set) is saved as `false`; a box with a value as
+    /// `true` and the value.
     fn serialize(self, w: mut Writer) {
-        self.get().serialize(mut w)
+        (!self.is_empty()).serialize(mut w)
+        if !self.is_empty() {
+            self.get().serialize(mut w)
+        }
     }
 
     fn deserialize(r: mut Reader) -> Result<Box<T>, LoadError> {
+        if !bool::deserialize(mut r)? {
+            return Ok(Box::empty())
+        }
         Ok(Box::new(T::deserialize(mut r)?))
     }
 }

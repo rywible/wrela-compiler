@@ -1,5 +1,5 @@
 // Parallel work (language.md §6.12, §6.17, D-062). A parallel job's chunks run on the thread that
-// starts it and on the program's helpers; a long job (`job`) runs on a helper, or on the thread
+// starts it and on the program's helpers; a task (`spawn`) runs on a helper, or on the thread
 // that takes it. Every thread runs its own instance of the program, and they share memory
 // (wrela_abi::memory's threads).
 //
@@ -10,25 +10,26 @@
 // - Results don't depend on the helpers: a job's chunks are fixed by its size alone, each
 //   writes only its own part, and what's reduced is combined in chunk order.
 // - A parallel job started inside a chunk runs on that thread alone, chunk after chunk.
-// - A long job waits in a slot until a helper starts it, or the thread that joins it does. A
-//   trap in a long job on a helper is kept in its slot, and `join` raises it.
+// - A task waits in a slot until a helper starts it, or the thread that joins it does; with no
+//   helpers (the host's count, `PAR_HELPERS`), the thread that asks whether it's `done` does. A
+//   trap in a task on a helper is kept in its slot, and `join` raises it.
 //
 // The words hosts use are wrela_abi's (`std::abi`).
 
 use std::abi::{
     DEPTH, JOB_CHUNKS, JOB_CONTEXT, JOB_DONE, JOB_DONE_FAILED, JOB_FAILED, JOB_GENERATION,
-    JOB_SLOTS, JOB_SLOT_COUNT, JOB_SLOT_SIZE, JOB_TASK, JOB_TICKET, JOIN_WAITS, PAR_HELPED,
-    PAR_HOLD, PAR_SHUTDOWN, PAR_WAKE, RUNNING, SLOT_FAILED, SLOT_FREE, SLOT_THREAD, THREADS,
-    THREAD_BLOCKS, THREAD_BLOCK_SIZE,
+    TASK_SLOTS, TASK_SLOT_COUNT, TASK_SLOT_SIZE, JOB_TASK, JOB_TICKET, JOIN_WAITS, PAR_HELPED,
+    PAR_HELPERS, PAR_HOLD, PAR_SHUTDOWN, PAR_WAKE, RUNNING, SLOT_FAILED, SLOT_FREE, SLOT_THREAD,
+    THREADS, THREAD_BLOCKS, THREAD_BLOCK_SIZE,
 }
-use std::alloc::{free, place}
+use std::alloc::{free, place, reach_heap}
 use std::collections::replace
 use std::mem::{
     abort_from, atomic_add, atomic_load, atomic_store, compare_swap, count, load_u32, notify, read,
     run_task, size_of, store_u32, task, thread_block, wait, wait_for, write,
 }
 
-// A long job's slot: its words and states that are std's own (the state is its first word).
+// A task's slot: its words and states that are std's own (the state is its first word).
 const SLOT_TASK: u32 = 4
 const SLOT_CONTEXT: u32 = 8
 const FILLING: u32 = 1
@@ -130,6 +131,8 @@ pub(package) fn run_chunks(task: u32, ctx: u32, n: u32) {
                 abort_from(atomic_load(me + JOB_FAILED) - 1)
             }
             if done >= n {
+                // The chunks may have left blocks in memory a helper grew.
+                reach_heap()
                 return
             }
             let _ = wait(me + JOB_DONE, done)
@@ -153,6 +156,7 @@ fn claim(owner: u32, helping: bool) -> bool {
                 // Only this thread writes its own depth.
                 store_u32(me + DEPTH, load_u32(me + DEPTH) + 1)
                 atomic_store(me + RUNNING, owner)
+                reach_heap()
                 run_task(atomic_load(owner + JOB_TASK), atomic_load(owner + JOB_CONTEXT), t & 65535)
                 atomic_store(me + RUNNING, 0)
                 store_u32(me + DEPTH, load_u32(me + DEPTH) - 1)
@@ -190,7 +194,7 @@ pub(package) fn worker(thread: u32) {
 }
 
 /// Runs work that's waiting: chunks of any thread's parallel job first (a frame or a tick waits
-/// for them), else one long job. Whether there was any.
+/// for them), else one task. Whether there was any.
 fn find_work() -> bool {
     var ran = false
     for t in 0..THREADS {
@@ -200,10 +204,10 @@ fn find_work() -> bool {
         return true
     }
     unsafe {
-        for s in 0..JOB_SLOT_COUNT {
-            let slot = JOB_SLOTS + s * JOB_SLOT_SIZE
+        for s in 0..TASK_SLOT_COUNT {
+            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
             if atomic_load(slot) == QUEUED && compare_swap(slot, QUEUED, STARTED) == QUEUED {
-                run_job(slot, held: true)
+                run_spawned(slot, held: true)
                 return true
             }
         }
@@ -211,13 +215,14 @@ fn find_work() -> bool {
     false
 }
 
-/// Runs the long job in `slot`, which this thread has started, and marks it finished. A helper
+/// Runs the task in `slot`, which this thread has started, and marks it finished. A helper
 /// holds its result back for as long as the host asks (`PAR_HOLD`, microseconds: tests slow jobs).
-fn run_job(slot: u32, held: bool) {
+fn run_spawned(slot: u32, held: bool) {
     unsafe {
         let me = thread_block()
         atomic_store(slot + SLOT_THREAD, (me - THREAD_BLOCKS) / THREAD_BLOCK_SIZE)
         atomic_store(me + RUNNING, slot)
+        reach_heap()
         run_task(atomic_load(slot + SLOT_TASK), atomic_load(slot + SLOT_CONTEXT), 0)
         atomic_store(me + RUNNING, 0)
         let hold = atomic_load(PAR_HOLD)
@@ -230,15 +235,15 @@ fn run_job(slot: u32, held: bool) {
     }
 }
 
-/// A long job's input, its function and where its result goes, on the heap.
-struct JobContext<I, O, F> {
+/// A task's input, its function and where its result goes, on the heap.
+struct TaskContext<I, O, F> {
     input: Option<I>,
     f: Option<F>,
     out: u32,
 }
 
-/// A long job: `f(input)`, running on a helper. `join` gives its result.
-pub struct Job<O> {
+/// A task: `f(input)`, running on a helper. `join` gives its result.
+pub struct Task<O> {
     /// Its slot's address, or 0 if it ran when it was made (every slot was taken).
     slot: u32,
     context: u32,
@@ -247,13 +252,13 @@ pub struct Job<O> {
     out: u32,
 }
 
-/// Starts `f(input)` on a helper: a long job, which holds that helper while it runs. Its result
+/// Starts `f(input)` on a helper: a task, which holds that helper while it runs. Its result
 /// is a function of `input` alone (`f` is `@deterministic`), whichever thread runs it and
-/// whenever; `join` it. A job no helper has started yet runs inside `join`, so with no helpers
-/// every job runs there, and a job that joins another can't deadlock.
+/// whenever; `join` it. A task no helper has started yet runs inside `join`, so with no helpers
+/// every task runs there, and a task that joins another can't deadlock.
 ///
 /// ```wrela
-/// use std::par::job
+/// use std::par::spawn
 ///
 /// fn checksum(data: take Vec<u32>) -> u32 {
 ///     var h: u32 = 2166136261
@@ -268,39 +273,39 @@ pub struct Job<O> {
 ///     for i in 0..100000 {
 ///         data.push(i)
 ///     }
-///     let pending = job(take data, checksum)   // a helper hashes while this thread goes on
+///     let pending = spawn(take data, checksum)   // a helper hashes while this thread goes on
 ///     take pending.join()
 /// }
 /// ```
-pub fn job<I, O, F: @deterministic fn(take I) -> O>(input: take I, f: F) -> Job<O> {
+pub fn spawn<I, O, F: @deterministic fn(take I) -> O>(input: take I, f: F) -> Task<O> {
     unsafe {
         let none: Option<O> = None
         let out = place(take none)
-        let c: JobContext<I, O, F> = JobContext { input: Some(take input), f: Some(f), out }
+        let c: TaskContext<I, O, F> = TaskContext { input: Some(take input), f: Some(f), out }
         let context = place(take c)
-        let size = size_of::<JobContext<I, O, F>>()
-        let t = task(run_job_context::<I, O, F>)
-        for s in 0..JOB_SLOT_COUNT {
-            let slot = JOB_SLOTS + s * JOB_SLOT_SIZE
+        let size = size_of::<TaskContext<I, O, F>>()
+        let t = task(run_task_context::<I, O, F>)
+        for s in 0..TASK_SLOT_COUNT {
+            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
             if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
                 atomic_store(slot + SLOT_TASK, t)
                 atomic_store(slot + SLOT_CONTEXT, context)
                 atomic_store(slot, QUEUED)
                 wake()
-                return Job { slot, context, context_size: size, out }
+                return Task { slot, context, context_size: size, out }
             }
         }
         // Every slot is taken: it runs now, here.
         run_task(t, context, 0)
-        Job { slot: 0, context, context_size: size, out }
+        Task { slot: 0, context, context_size: size, out }
     }
 }
 
-/// A long job's task: its function on its input, the result where it goes. Its input and
+/// A task's work: its function on its input, the result where it goes. Its input and
 /// function are dropped here, so its context owns nothing after.
-fn run_job_context<I, O, F: @deterministic fn(take I) -> O>(
+fn run_task_context<I, O, F: @deterministic fn(take I) -> O>(
     chunk: u32,
-    c: mut JobContext<I, O, F>,
+    c: mut TaskContext<I, O, F>,
 ) {
     let Some(input) = replace(mut c.input, None) else {
         panic("a job ran twice")
@@ -314,15 +319,23 @@ fn run_job_context<I, O, F: @deterministic fn(take I) -> O>(
     }
 }
 
-impl<O> Job<O> {
-    /// Whether the job has finished. It's `nondet` (§8): it depends on when a helper ran it.
+impl<O> Task<O> {
+    /// Whether the task has finished. It's `nondet` (§8): it depends on when a helper ran it.
+    /// With no helpers (`PAR_HELPERS`), nothing else would start it: it runs here, now.
     @effects(nondet)
     pub fn done(self) -> bool {
-        unsafe { self.slot == 0 || atomic_load(self.slot) >= FINISHED }
+        unsafe {
+            if self.slot != 0 &&
+                atomic_load(PAR_HELPERS) == 0 &&
+                compare_swap(self.slot, QUEUED, STARTED) == QUEUED {
+                run_spawned(self.slot, held: false)
+            }
+            self.slot == 0 || atomic_load(self.slot) >= FINISHED
+        }
     }
 
-    /// The job's result, once it's finished: this thread waits for it, and runs it here if no
-    /// helper has started it. Its value doesn't depend on timing. A trap in the job is the
+    /// The task's result, once it's finished: this thread waits for it, and runs it here if no
+    /// helper has started it. Its value doesn't depend on timing. A trap in the task is the
     /// program's panic, here.
     pub fn join(take self) -> O {
         unsafe {
@@ -331,7 +344,7 @@ impl<O> Job<O> {
                     let state = atomic_load(self.slot)
                     if state == QUEUED {
                         if compare_swap(self.slot, QUEUED, STARTED) == QUEUED {
-                            run_job(self.slot, held: false)
+                            run_spawned(self.slot, held: false)
                         }
                     } else if state == STARTED {
                         // Counted for the hosts, which log a ticker's waits.
@@ -347,6 +360,8 @@ impl<O> Job<O> {
                 }
                 atomic_store(self.slot, SLOT_FREE)
             }
+            // Its result may hold blocks in memory a helper grew.
+            reach_heap()
             let result = read::<Option<O>>(self.out)
             free(self.out, size_of::<Option<O>>())
             free(self.context, self.context_size)

@@ -5,7 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "check that its loops end, or compute the value at load instead"
+        "check that its loops end, give it more with `@fuel(n)`, or compute the value at load instead"
       ],
       "internal": false,
       "label": null,

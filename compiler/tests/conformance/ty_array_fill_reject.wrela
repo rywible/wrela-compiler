@@ -1,0 +1,14 @@
+// rejects: ty.array-fill
+struct Log {
+    lines: Vec<u32>,
+}
+
+fn logs() -> [Log; 2] {
+    [..Log { lines: Vec::new() }] //~ E0400
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let xs = [time, ..1.0] //~ E0306
+    let ys: [f32; 1] = [time, 2.0, ..1.0] //~ E0300
+    let _ = logs()
+}

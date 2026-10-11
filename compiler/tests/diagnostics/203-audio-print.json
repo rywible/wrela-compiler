@@ -8,19 +8,19 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "`print` does IO, and `tick` is `@deterministic`, which can't `io`",
+      "message": "`print` writes to the host's trace, and `render` is `@audio` code, on the audio thread, which can't `trace`",
       "notes": [
-        "the call chain: tick → print",
-        "reading or writing outside the program is the `io` effect; see language.md §8 for what each context forbids"
+        "the call chain: render → print",
+        "printing a line or timing a phase is the `trace` effect; see language.md §8 for what each context forbids"
       ],
       "severity": "error",
       "span": {
         "column": 5,
         "end": 164,
-        "end_column": 26,
+        "end_column": 23,
         "end_line": 8,
         "line": 8,
-        "start": 143
+        "start": 146
       },
       "title": "an effect a context forbids"
     }

@@ -1,0 +1,36 @@
+// accepts: fn.job-values
+use std::hash::{StateHash, state_hash}
+use std::job::{Job, Step}
+use std::serialize::{Serialize, save}
+
+/// A boss whose attack runs over several ticks: a job in a simulation's state.
+struct Boss: Clone + StateHash + Serialize {
+    hp: u32,
+    attack: Job<swing>,
+}
+
+@job
+fn swing(power: take u32) -> u32 {
+    var hits: Vec<u32> = Vec::new()
+    for i in 0..3 {
+        hits.push(i * power)
+        yield
+    }
+    hits.len()
+}
+
+@deterministic
+fn tick(b: mut Boss) -> u32 {
+    match b.attack.resume() {
+        Step::Done(n) => n,
+        Step::Yielded => 0,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var boss = Boss { hp: 10, attack: swing.start(2) }
+    let _ = tick(mut boss)
+    let copy = boss.clone()
+    let _ = state_hash(copy)
+    let _ = save(boss)
+}

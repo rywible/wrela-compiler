@@ -375,6 +375,8 @@ impl<'d, 'u> Collector<'d, 'u> {
             ast::ItemKind::Struct(_) | ast::ItemKind::Enum(_) => {
                 self.type_attrs(&item.attrs, false)
             }
+            // A constant's only attribute is its fuel, read with it.
+            ast::ItemKind::Const(_) => (false, None),
             _ => {
                 self.attrs_not_on_fn(&item.attrs);
                 (false, None)
@@ -400,10 +402,20 @@ impl<'d, 'u> Collector<'d, 'u> {
                 // The variants' names now, for imports (`use E::B`); their fields come with
                 // the signatures. A name declared twice is reported then; the first one counts.
                 let mut variants: Vec<VariantDef> = Vec::new();
+                // Each discriminant as written, or one past the one before (§3): checked with
+                // the signatures, and known now for an enum that's an array's length (`[T; E]`).
+                let mut next: u32 = 0;
                 for v in &e.variants {
                     if variants.iter().any(|p| p.name == v.name.name) {
                         continue;
                     }
+                    let discriminant = match v.discriminant.as_ref().map(|l| &l.kind) {
+                        Some(ast::LitKind::Int(v)) => {
+                            v.ok().and_then(|n| u32::try_from(n).ok()).unwrap_or(u32::MAX)
+                        }
+                        _ => next,
+                    };
+                    next = discriminant.saturating_add(1);
                     let shape = match &v.kind {
                         ast::VariantKind::Unit => VariantShape::Unit,
                         ast::VariantKind::Tuple(_) => VariantShape::Tuple,
@@ -415,7 +427,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         shape,
                         fields: Vec::new(),
                         span: v.span,
-                        discriminant: 0,
+                        discriminant,
                     });
                 }
                 let kind = AdtKind::Enum(variants);
@@ -446,7 +458,21 @@ impl<'d, 'u> Collector<'d, 'u> {
                     lang: None,
                     fieldwise,
                     diagnostic,
+                    field_param: None,
                 });
+                // A field a method's walk visits: any type with this trait (its bound is set
+                // with the trait's header).
+                if fieldwise {
+                    let g = self.p.new_param(ParamDef {
+                        name: "field".into(),
+                        bounds: Vec::new(),
+                        span: t.name.span,
+                        is_self: false,
+                        is_const: false,
+                        fn_bound: None,
+                    });
+                    self.p.traits[id.index()].field_param = Some(g);
+                }
                 let mut methods = Vec::new();
                 for member in &t.members {
                     if let ast::TraitMemberKind::Type { .. } = &member.kind {
@@ -506,6 +532,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             ast::ItemKind::Const(c) => {
                 let id = ConstId(self.p.consts.len() as u32);
+                let fuel = self.const_attrs(&item.attrs);
                 // Its type, once it's known, is the function's result (`check_program`).
                 self.p.fns.push(FnDef {
                     name: c.name.name.clone(),
@@ -536,6 +563,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     span: item.span,
                     eval,
                     default: false,
+                    fuel,
                 });
                 self.bind(m, &c.name, Res::Const(id), vis);
                 self.pending.push((m, PendingItem::Const(id, c)));
@@ -639,6 +667,47 @@ impl<'d, 'u> Collector<'d, 'u> {
         (fieldwise, diagnostic)
     }
 
+    /// A constant's attributes: `@fuel(n)`, the work its computation may do (§10), at most
+    /// once; any other is E0108.
+    fn const_attrs(&mut self, attrs: &[ast::Attribute]) -> Option<u64> {
+        let mut fuel = None;
+        for a in attrs {
+            if a.name.name != "fuel" {
+                self.attrs_not_on_fn(std::slice::from_ref(a));
+                continue;
+            }
+            self.fuel_attr(a, &mut fuel, "a constant's");
+        }
+        fuel
+    }
+
+    /// `@fuel(n)` into `fuel`, once (`whose`: "a constant's"); else E0108.
+    fn fuel_attr(&mut self, a: &ast::Attribute, fuel: &mut Option<u64>, whose: &str) {
+        if fuel.is_some() {
+            self.diags.push(
+                Diagnostic::new(codes::E0108, a.span, format!("{whose} fuel is set once"))
+                    .with_fix("remove it", a.span, ""),
+            );
+            return;
+        }
+        let value = match a.args.as_deref() {
+            Some([arg]) if arg.name.is_none() => fuel_value(&arg.value),
+            _ => None,
+        };
+        match value {
+            Some(v) if (1..=MAX_FUEL).contains(&v) => *fuel = Some(v),
+            _ => self.diags.push(
+                Diagnostic::new(
+                    codes::E0108,
+                    a.span,
+                    "`@fuel` takes one whole number of fuel units, at most 2 ** 46",
+                )
+                .with_note("a unit is about one WASM instruction; the build's own limit is 2 ** 34, a test's 2 ** 37 (§10)")
+                .with_help("write it as a literal or a power of two: `@fuel(2 ** 40)`"),
+            ),
+        }
+    }
+
     /// E0108 for each attribute on something that isn't a function: an item, or an associated
     /// type.
     fn attrs_not_on_fn(&mut self, attrs: &[ast::Attribute]) {
@@ -679,7 +748,29 @@ impl<'d, 'u> Collector<'d, 'u> {
             diagnostic: None,
             borrow: matches!(&item.kind, ast::ItemKind::Struct(s) if s.borrow),
             entry: None,
+            fn_fields: Vec::new(),
         });
+        // Each field of a function type is a value of a parameter of its own, after those
+        // written (`fn.fields`).
+        if let ast::ItemKind::Struct(s) = &item.kind {
+            for f in &s.fields {
+                if matches!(f.ty.kind, ast::TypeExprKind::Fn(_))
+                    && !self.p.adts[id.index()].fn_fields.iter().any(|(n, _)| *n == f.name.name)
+                {
+                    let g = self.p.new_param(ParamDef {
+                        name: format!("fn {}", f.name.name),
+                        bounds: Vec::new(),
+                        span: f.ty.span,
+                        is_self: false,
+                        is_const: false,
+                        fn_bound: None,
+                    });
+                    let def = &mut self.p.adts[id.index()];
+                    def.generics.push(g);
+                    def.fn_fields.push((f.name.name.clone(), g));
+                }
+            }
+        }
         self.bind(m, name, Res::Adt(id), vis);
         self.pending.push((m, PendingItem::Adt(id, item)));
         id
@@ -754,7 +845,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                 "intrinsic" if is_std => out.intrinsic = true,
                 "test" => {
                     if let Some(args) = &a.args {
-                        (out.test_run, out.test_input, out.test_gpu) = self.test_run(a, args);
+                        (out.test_run, out.test_input, out.test_gpu, out.test_golden) =
+                            self.test_run(a, args);
                     }
                     out.test = Some(a.span);
                 }
@@ -773,6 +865,11 @@ impl<'d, 'u> Collector<'d, 'u> {
                     } else {
                         out.audio = Some(a.span);
                     }
+                }
+                "fuel" => {
+                    let mut fuel = out.fuel.map(|(v, _)| v);
+                    self.fuel_attr(a, &mut fuel, "a test's");
+                    out.fuel = fuel.map(|v| (v, a.span));
                 }
                 "fieldwise" | "diagnostic" => {
                     self.diags.push(
@@ -828,6 +925,21 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
             }
         }
+        // A test of code may set its fuel; a frame test's calls each get a test's.
+        if let Some((_, at)) = out.fuel
+            && (out.test.is_none() || out.test_run.is_some())
+        {
+            out.fuel = None;
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0108,
+                    at,
+                    "`@fuel` goes on a `const` or a `@test` of code, not this function",
+                )
+                .with_note("a frame test's calls each get a test's fuel, 2 ** 37 (§10)")
+                .with_fix("remove it", at, ""),
+            );
+        }
         out
     }
 
@@ -875,18 +987,24 @@ impl<'d, 'u> Collector<'d, 'u> {
 
     /// `@test(frames: n)` or `@test(ticks: n)` (§10), `n` from 1 to [`MAX_TEST_FRAMES`], and,
     /// with `input: "path"`, the script of input events (or the tick log) they get; with
-    /// `gpu: true`, frames that run on the native host's GPU. Anything else is E0222.
+    /// `gpu: true`, frames that run on the native host's GPU, and with `golden: "frame.png"`
+    /// too, the PNG the screen after them is compared with, `within` a mean difference.
+    /// Anything else is E0222.
+    #[allow(clippy::type_complexity)]
     fn test_run(
         &mut self,
         a: &ast::Attribute,
         args: &[ast::Arg],
-    ) -> (Option<TestRun>, Option<(String, Span)>, bool) {
+    ) -> (Option<TestRun>, Option<(String, Span)>, bool, Option<Golden>) {
         let named =
             |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
         let others = args.iter().any(|x| {
-            !x.name
-                .as_ref()
-                .is_some_and(|n| matches!(n.name.as_str(), "frames" | "ticks" | "input" | "gpu"))
+            !x.name.as_ref().is_some_and(|n| {
+                matches!(
+                    n.name.as_str(),
+                    "frames" | "ticks" | "input" | "gpu" | "golden" | "within"
+                )
+            })
         });
         let count = |name: &str| match named(name).map(|x| &x.value.kind) {
             Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })) => {
@@ -900,7 +1018,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             (false, true) => count("ticks"),
             _ => None,
         };
-        let input = match named("input") {
+        let path = |name: &str| match named(name) {
             None => Ok(None),
             Some(x) => match &x.value.kind {
                 ast::ExprKind::Lit(l @ ast::Lit { kind: ast::LitKind::Str, .. }) => {
@@ -909,6 +1027,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 _ => Err(()),
             },
         };
+        let input = path("input");
         // `gpu: true`: frames on the GPU (not ticks, which draw nothing).
         let gpu = match named("gpu").map(|x| &x.value.kind) {
             None => Ok(false),
@@ -917,10 +1036,29 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             Some(_) => Err(()),
         };
-        match (n, input, gpu) {
-            (Some(n), Ok(input), Ok(gpu)) if !others => {
+        // `golden: "frame.png"` on a GPU frame test, `within` a mean difference from 0 to 255.
+        let within = match named("within").map(|x| &x.value.kind) {
+            None => Ok(GOLDEN_WITHIN),
+            Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(v), .. })) => {
+                Some(*v).filter(|v| (0.0..=255.0).contains(v)).ok_or(())
+            }
+            Some(ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. })) => {
+                v.ok().filter(|&v| v <= 255).map(|v| v as f64).ok_or(())
+            }
+            Some(_) => Err(()),
+        };
+        let golden = match (path("golden"), within, gpu) {
+            (Ok(None), _, _) if named("within").is_none() => Ok(None),
+            (Ok(Some((path, span))), Ok(within), Ok(true)) => {
+                Ok(Some(Golden { path, span, within }))
+            }
+            _ => Err(()),
+        };
+        match (n, input, gpu, golden) {
+            (Some(n), Ok(input), Ok(gpu), Ok(golden)) if !others => {
                 let n = n as u32;
-                (Some(if frames { TestRun::Frames(n) } else { TestRun::Ticks(n) }), input, gpu)
+                let run = if frames { TestRun::Frames(n) } else { TestRun::Ticks(n) };
+                (Some(run), input, gpu, golden)
             }
             _ => {
                 self.diags.push(
@@ -929,9 +1067,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: \"script.json\"`, a script of input events for them (or, with `ticks`, a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§10)"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§10), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps"),
                 );
-                (None, None, false)
+                (None, None, false, None)
             }
         }
     }
@@ -1334,6 +1472,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 diagnostic: None,
                 borrow: true,
                 entry: Some(f),
+                fn_fields: Vec::new(),
             });
             self.p.bound_types.insert(f, id);
         }
@@ -1616,6 +1755,15 @@ impl<'d, 'u> Collector<'d, 'u> {
     fn testing_export(&mut self, id: FnId) {
         let def = self.p.func(id);
         let Some(at) = def.attrs.testing else { return };
+        // A dependency's own program's test exports (in its `main.wrela`) are about that program,
+        // checked when it's the package checked: here they're functions no test build exports
+        // (the map lens depends on a floor, a program).
+        let module = self.p.module(def.module);
+        if self.p.package_of(def.module).kind != PackageKind::Program
+            && module.path.last().is_some_and(|m| m == "main")
+        {
+            return;
+        }
         let export = Some(def.module) == self.p.main
             && def.public
             && def.owner == FnOwner::Free
@@ -1791,6 +1939,10 @@ impl<'d, 'u> Collector<'d, 'u> {
             TraitRef { trait_: id, args: gens.iter().map(|&g| self.p.types.param(g)).collect() };
         let mut self_bounds = vec![own];
         self_bounds.extend(supers);
+        // A field a walk visits has the trait, as `Self` does (`trait.fieldwise-walk`).
+        if let Some(g) = self.p.trait_(id).field_param {
+            self.p.params[g.index()].bounds = self_bounds.clone();
+        }
         self.p.params[self_param.index()].bounds = self_bounds;
         let mut assoc = Vec::new();
         for member in &t.members {
@@ -1869,6 +2021,14 @@ impl<'d, 'u> Collector<'d, 'u> {
             _ => return,
         };
         self.set_param_bounds(&scope, &gens, ast_generics);
+        // A function field's type bounds its parameter: what the field holds is called as it.
+        if let ast::ItemKind::Struct(s) = &item.kind {
+            for (name, g) in self.p.adt(id).fn_fields.clone() {
+                let Some(f) = s.fields.iter().find(|f| f.name.name == name) else { continue };
+                let t = resolve::resolve_type(&self.p, self.diags, &scope, &f.ty, TyPos::FnBound);
+                self.p.params[g.index()].fn_bound = Some(t);
+            }
+        }
     }
 
     fn adt_body(&mut self, m: ModuleId, id: AdtId, item: &ast::Item) {
@@ -2060,6 +2220,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             span: d.span,
             eval,
             default: true,
+            fuel: None,
         });
         self.bind(m, &name, Res::Const(id), Vis::PRIVATE);
         let segment = ast::PathSegment { ident: name, generics: None };
@@ -2092,7 +2253,21 @@ impl<'d, 'u> Collector<'d, 'u> {
             // A borrow struct's field may be a run or a projection (§6.6).
             let borrow = scope.self_ty.is_some_and(|t| self.p.is_borrow_struct(t));
             let pos = if borrow { TyPos::Local } else { TyPos::Normal };
-            let ty = resolve::resolve_type(&self.p, self.diags, scope, &f.ty, pos);
+            // A function field holds a value of its own parameter (`fn.fields`).
+            let fn_param = match scope.self_ty.map(|t| self.p.types.kind(t)) {
+                Some(TyKind::Adt(a, _)) => self
+                    .p
+                    .adt(*a)
+                    .fn_fields
+                    .iter()
+                    .find(|(n, _)| *n == f.name.name)
+                    .map(|&(_, g)| g),
+                _ => None,
+            };
+            let ty = match fn_param {
+                Some(g) if matches!(f.ty.kind, ast::TypeExprKind::Fn(_)) => self.p.types.param(g),
+                _ => resolve::resolve_type(&self.p, self.diags, scope, &f.ty, pos),
+            };
             if f.mode != RetMode::Owned && !borrow {
                 let mode = if f.mode == RetMode::Mut { "mut" } else { "borrow" };
                 self.diags.push(
@@ -2223,13 +2398,29 @@ impl<'d, 'u> Collector<'d, 'u> {
                         );
                         continue;
                     }
-                    let t = resolve::resolve_type(
-                        &self.p,
-                        self.diags,
-                        &scope,
-                        ty,
-                        TyPos::Param(&mut implicit),
-                    );
+                    // A `take` parameter of a function type is kept, so it's a generic
+                    // parameter's value, as a struct's function field is (`fn.fields`).
+                    let t = if *mode == Mode::Take && matches!(ty.kind, ast::TypeExprKind::Fn(_)) {
+                        let bound =
+                            resolve::resolve_type(&self.p, self.diags, &scope, ty, TyPos::FnBound);
+                        let g = implicit.add_def(ParamDef {
+                            name: format!("take {}", name.name),
+                            bounds: Vec::new(),
+                            span: ty.span,
+                            is_self: false,
+                            is_const: false,
+                            fn_bound: Some(bound),
+                        });
+                        self.p.types.param(g)
+                    } else {
+                        resolve::resolve_type(
+                            &self.p,
+                            self.diags,
+                            &scope,
+                            ty,
+                            TyPos::Param(&mut implicit),
+                        )
+                    };
                     let default = default
                         .as_ref()
                         .map(|d| self.default_value(scope.module, &name.name, d, t));
@@ -2501,8 +2692,25 @@ impl<'d, 'u> Collector<'d, 'u> {
             {
                 continue;
             }
+            // An impl written for arrays, or for tuples of an arity, replaces the derived one:
+            // a list can say better than a walk how to find its element (an array's, by
+            // dividing).
+            let written = |p: &Program, arity: Option<usize>| {
+                p.impls.iter().any(|imp| {
+                    !imp.from_opt_in
+                        && imp.trait_ref.as_ref().is_some_and(|r| r.trait_ == TraitId(t as u32))
+                        && match (p.types.kind(imp.self_ty), arity) {
+                            (TyKind::ArrayN(..) | TyKind::Array(..), None) => true,
+                            (TyKind::Tuple(ts), Some(k)) => ts.len() == k,
+                            _ => false,
+                        }
+                })
+            };
             // `None` for the array.
             for arity in std::iter::once(None).chain((2..=MAX_DERIVED_TUPLE).map(Some)) {
+                if written(&self.p, arity) {
+                    continue;
+                }
                 let param = |p: &mut Program, name: String, is_const: bool| {
                     p.new_param(ParamDef {
                         name,
@@ -2612,7 +2820,31 @@ impl<'d, 'u> Collector<'d, 'u> {
                 });
             }
         }
+        // A job's value's traits are its parts', which depend on the job: `Job<F>` declares
+        // them, and each `@job fn` gets an impl of its own, derived from its parts
+        // (`fn.job-values`).
+        let job = self.p.lang_adt(Lang::Job);
+        let mut each_job = Vec::new();
         for imp in implied {
+            let of_job =
+                matches!(self.p.types.kind(imp.self_ty), TyKind::Adt(a, _) if Some(*a) == job);
+            if !of_job {
+                self.push_derived_impl(imp);
+                continue;
+            }
+            for f in 0..self.p.fns.len() as u32 {
+                let f = FnId(f);
+                if self.p.func(f).attrs.job.is_none() {
+                    continue;
+                }
+                let generics = self.p.fn_all_generics(f);
+                let args = generics.iter().map(|&g| self.p.types.param(g)).collect();
+                let fn_ty = self.p.types.intern(TyKind::FnDef(f, args));
+                let self_ty = self.p.types.adt(job.expect("a job"), vec![fn_ty]);
+                each_job.push(ImplDef { generics, self_ty, ..imp.clone() });
+            }
+        }
+        for imp in each_job {
             self.push_derived_impl(imp);
         }
         self.tuple_and_array_impls();
@@ -2945,7 +3177,21 @@ fn check_members(
     for &tm in &tr.methods {
         let tdef = p.func(tm);
         let found = imp.methods.iter().copied().find(|&f| p.func(f).name == tdef.name);
+        // A method that walks the fields is derived for a type that declares the trait; an impl
+        // written by hand gives it (`trait.fieldwise-walk`).
+        let walks = tr.fieldwise && crate::fieldwise::walks_fields(p, tm);
         match found {
+            None if walks && !imp.from_opt_in => {
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0401,
+                        imp.span,
+                        format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
+                    )
+                    .with_secondary(tdef.sig_span, "declared here")
+                    .with_note("its body walks the fields of a type that declares the trait, so an impl written by hand gives its own (§3)"),
+                );
+            }
             None if tdef.body.is_none() && !imp.from_opt_in => {
                 diags.push(
                     Diagnostic::new(
@@ -3189,6 +3435,11 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
         if p.types.has_params(f.ty) {
             continue; // conditional on the arguments; checked where it's used
         }
+        // A job's value: its parts are its locals, checked once its body is
+        // (`check_job_fields`).
+        if is_job(p, f.ty) {
+            continue;
+        }
         let ok = crate::traits::implements_builtin(p, f.ty, lang.unwrap_or(Lang::Clone));
         if !ok {
             let why = match lang {
@@ -3213,6 +3464,62 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
             );
         }
     }
+}
+
+/// Whether `t` is a job's value (`Job<f>`), whose parts are known once its body is checked.
+fn is_job(p: &Program, t: TyId) -> bool {
+    matches!(p.types.kind(t), TyKind::Adt(a, _) if p.is_lang_adt(*a, Lang::Job))
+}
+
+/// E0407 for a struct that declares `Clone` or a `@fieldwise` trait whose field is a job's value
+/// without it: a part of the job (a local it holds) lacks it. Checked once the jobs' bodies
+/// are, since a job's parts are its locals (`fn.job-values`).
+pub fn check_job_fields(p: &Program) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for imp in &p.impls {
+        let Some(r) = &imp.trait_ref else { continue };
+        if !imp.from_opt_in {
+            continue;
+        }
+        let tr = p.trait_(r.trait_);
+        let structural = tr.lang == Some(Lang::Clone);
+        if !structural && !tr.fieldwise {
+            continue;
+        }
+        let TyKind::Adt(a, _) = *p.types.kind(imp.self_ty) else { continue };
+        for f in p.adt(a).all_fields() {
+            let TyKind::Adt(j, args) = p.types.kind(f.ty) else { continue };
+            if !p.is_lang_adt(*j, Lang::Job) || p.types.has_params(f.ty) {
+                continue;
+            }
+            let Some(parts) = p.job_parts(*j, args) else { continue };
+            let lacks = parts.iter().skip(1).find(|&&(_, t)| {
+                if structural {
+                    !crate::traits::implements_builtin(p, t, Lang::Clone)
+                } else {
+                    !crate::traits::implements(p, t, r)
+                }
+            });
+            if let Some((name, t)) = lacks {
+                out.push(
+                    Diagnostic::new(
+                        codes::E0407,
+                        f.span,
+                        format!(
+                            "`{}` can't be `{}`: the field `{}` is a job, which holds `{name}`, a `{}`, and that isn't",
+                            p.adt(a).name,
+                            tr.name,
+                            f.name,
+                            p.display_ty(*t)
+                        ),
+                    )
+                    .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
+                    .with_note("a job's value holds its body's locals, and has a trait when they do (§6.18)"),
+                );
+            }
+        }
+    }
+    out
 }
 
 /// A declared `@fieldwise` trait is derived from the fields, so every field must have it too
@@ -3422,5 +3729,29 @@ fn alias_refs(p: &Program, m: ModuleId, t: &ast::TypeExpr, f: &mut impl FnMut(Al
             }
         }
         ast::TypeExprKind::Int(_) | ast::TypeExprKind::Error => {}
+    }
+}
+
+/// The most fuel a constant may set (`@fuel`, §10): 2 ** 46 units, some hours of one core.
+pub const MAX_FUEL: u64 = 1 << 46;
+
+/// The value of `@fuel`'s argument: a whole number written as a literal, a power (`2 ** 40`) or
+/// a product of them.
+fn fuel_value(e: &ast::Expr) -> Option<u64> {
+    match &e.kind {
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => v.ok(),
+        ast::ExprKind::Paren(inner) => fuel_value(inner),
+        ast::ExprKind::Binary(op, a, b) => {
+            let (a, b) = (fuel_value(a)?, fuel_value(b)?);
+            match op {
+                ast::BinOp::Pow => a.checked_pow(u32::try_from(b).ok()?),
+                ast::BinOp::Mul => a.checked_mul(b),
+                ast::BinOp::Shl => {
+                    u32::try_from(b).ok().and_then(|b| a.checked_shl(b)).filter(|_| b < 64)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

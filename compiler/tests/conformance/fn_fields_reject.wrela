@@ -1,0 +1,33 @@
+// rejects: fn.fields
+struct Driver {
+    step: fn(f32) -> f32,
+}
+
+// Not yet: a struct that holds functions is named as a parameter's type, where the function is
+// generic over them, or built by a literal.
+struct Holder {
+    driver: Driver, //~ E0410
+}
+
+fn make() -> Driver { //~ E0410
+    Driver { step: |x| x }
+}
+
+fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+// A function that's `@deterministic` is what the field asks for.
+struct Ticker {
+    step: @deterministic fn(f32) -> f32,
+}
+
+fn noisy(x: f32) -> f32 {
+    let _ = std::io::load("tick") //~ E0600
+    x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _t = Ticker { step: noisy }
+    let _ = Driver { step: double }
+}

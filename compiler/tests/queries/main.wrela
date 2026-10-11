@@ -122,7 +122,7 @@ pub fn init() -> Bench {
     write(mut gpu_points, 0, points)
     var gpu_starts: GpuBuffer<u32> = buffer(CELLS + 1)
     write(mut gpu_starts, 0, starts)
-    Bench { points: take points, starts: take starts, gpu_points, gpu_starts, out: buffer(N) }
+    Bench { points, starts, gpu_points, gpu_starts, out: buffer(N) }
 }
 
 /// Every point's neighbours within 6 m, `reps` times: with the closure.

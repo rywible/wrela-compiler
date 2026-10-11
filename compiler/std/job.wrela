@@ -3,10 +3,15 @@
 // `job.resume(...)` takes its `borrow` and `mut` parameters, runs it to its next `yield` or its
 // end, and says which (`Step`).
 
+use std::hash::StateHash
+use std::serialize::Serialize
+
 /// A job of the `@job fn` `F` (`Job<realize>`, from `realize.start(...)`): where it stopped, and
 /// the locals it needs after that point. An owned value with no projections in it, which a
-/// field of the program's state holds.
-pub struct Job<F> {}
+/// field of the program's state holds. Its parts are where it stopped and each local it holds:
+/// it's `Clone`, `StateHash` and `Serialize` when they are, derived from them as a struct's are
+/// from its fields (§6.18's job values), so a simulation's state can hold one.
+pub struct Job<F>: StateHash + Serialize {}
 
 /// What a job's `resume` did: it stopped at a `yield` (its work for this frame), or it ran to
 /// its end, and gave its result.

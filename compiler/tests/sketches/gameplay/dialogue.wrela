@@ -207,7 +207,7 @@ fn parse_dialogue(file: String) -> Vec<Node> {
                 let n = last(nodes.len(), row, "choice")
                 targets.push((n, nodes[n].choices.len(), target.clone(), row))
                 nodes[n].choices.push(
-                    Choice { text: take text, cond: take c, effects: Vec::new(), next: Next::End },
+                    Choice { text, cond: c, effects: Vec::new(), next: Next::End },
                 )
             },
             "do" => {

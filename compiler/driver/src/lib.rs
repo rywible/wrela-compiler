@@ -9,6 +9,7 @@
 //! the deepest tree the parser accepts (`wrela_syntax::MAX_NESTING`, `MAX_EXPR_DEPTH`).
 
 pub mod build;
+pub mod const_cache;
 pub mod consts;
 pub mod edit;
 pub mod explain;
@@ -22,6 +23,7 @@ pub mod primer;
 pub mod query;
 pub mod refactor;
 pub mod serve;
+pub mod shipped;
 pub mod studio;
 
 /// std's modules: each one's path and source.
@@ -52,6 +54,8 @@ pub struct Output {
     /// The program package's own files (not std's or a dependency's), and where each is: what
     /// `wrela fix` may edit.
     pub program_files: ProgramFiles,
+    /// How many constants the build computed, and how many it read from the cache (§10).
+    pub consts: consts::ConstStats,
 }
 
 /// One pipeline: an instantiation of its entry points, and why it exists.
@@ -157,7 +161,7 @@ pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Out
         let loaded = load(root);
         if let Some(l) = &loaded.2 {
             let names: Vec<&str> = l.packages.iter().skip(1).map(|p| p.name.as_str()).collect();
-            if let Some(bad) = lift.iter().find(|n| !names.contains(&n.as_str())) {
+            if let Some(bad) = lift.iter().map(|n| lift_package(n)).find(|n| !names.contains(n)) {
                 return Err(format!(
                     "--lift: the program has no package named `{bad}` (it has {})",
                     names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
@@ -166,6 +170,25 @@ pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Out
         }
         let mode = Mode { debug: kind.debug, testing: kind.testing, ..Mode::RELEASE };
         Ok(compile_loaded(root, mode, wrela_lower::Roots::of, lift, loaded))
+    })
+}
+
+/// The package a `--lift` entry names: `name`, or `name/file.wrela` (one file of it).
+fn lift_package(entry: &str) -> &str {
+    entry.split_once('/').map_or(entry, |(p, _)| p)
+}
+
+/// Whether the `--lift` entries `lift` lift the file at `path` of package `pkg` (in `dir`): the
+/// package is named whole, or the file is, by its path in the package.
+fn lifts_file(lift: &[String], pkg: &str, dir: &Path, path: &Path) -> bool {
+    lift.iter().any(|e| match e.split_once('/') {
+        None => e == pkg,
+        Some((p, file)) => {
+            p == pkg
+                && path
+                    .canonicalize()
+                    .is_ok_and(|c| c.strip_prefix(dir).is_ok_and(|r| r == Path::new(file)))
+        }
     })
 }
 
@@ -212,15 +235,54 @@ pub fn with_checked<T: Send>(
     with_checked_in(root, &Overlay::new(), f)
 }
 
-/// [`with_checked`], and if `lower`, with what lowering every function of the package that
-/// can be lowered on its own instantiates (`wrela query`'s instantiations): lowering's own
-/// errors (a library package has no `frame`) don't stop it.
-pub fn with_lowered<T: Send>(
+/// What checking a program with errors still knows, for the tools that answer what they can
+/// (`wrela query`, `wrela context`): the checked program, its sources, its errors (none when it
+/// checks), and, if asked for and the program has no errors, what lowering every function of
+/// the package that can be lowered on its own instantiates.
+pub struct Partial<'a> {
+    pub checked: &'a wrela_sema::Checked,
+    pub sources: &'a SourceMap,
+    pub errors: Vec<&'a Diagnostic>,
+    pub lowered: Option<&'a wrela_lower::Lowered>,
+}
+
+impl Partial<'_> {
+    /// The errors, rendered as `wrela check` shows them; `None` if there are none.
+    pub fn rendered(&self) -> Option<String> {
+        let errors: Vec<Diagnostic> = self.errors.iter().map(|d| (*d).clone()).collect();
+        (!errors.is_empty()).then(|| wrela_diag::render::render_all(self.sources, &errors))
+    }
+}
+
+/// Loads and checks the package at `root`, and runs `f` on what checking found, errors or not.
+/// A function whose body has an error has no memory IR (`Checked::mir`), so what it calls,
+/// borrows and does isn't known; the rest of the program is. With `lower`, a program with no
+/// errors is lowered too (`wrela query`'s instantiations): lowering's own errors (a library
+/// package has no `frame`) don't stop it. The rendered errors if the package doesn't load.
+pub fn with_partial<T: Send>(
     root: &Path,
     lower: bool,
-    f: impl FnOnce(&wrela_sema::Checked, &SourceMap, Option<&wrela_lower::Lowered>) -> T + Send,
+    f: impl FnOnce(Partial<'_>) -> T + Send,
 ) -> Result<T, String> {
-    with_lowered_in(root, &Overlay::new(), lower, f)
+    on_compiler_thread(|| {
+        let (sources, mut diagnostics, loaded) = load_with(root, &Overlay::new());
+        let Some(Loaded { units, packages, dirs, .. }) = loaded else {
+            return Err(wrela_diag::render::render_all(&sources, &diagnostics));
+        };
+        let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+        let mut lowered = None;
+        if lower && !has_errors(&diagnostics) {
+            let mut data = wrela_lower::BuildData::default();
+            let cache = const_cache::dir_of(root);
+            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
+            if !has_errors(&diagnostics) {
+                let roots = wrela_lower::Roots::every_fn(&checked);
+                lowered = Some(wrela_lower::lower(&checked, &roots, &data, false).0);
+            }
+        }
+        let errors = diagnostics.iter().filter(|d| d.is_error()).collect();
+        Ok(f(Partial { checked: &checked, sources: &sources, errors, lowered: lowered.as_ref() }))
+    })
 }
 
 /// [`with_checked`], with `overlay`'s texts in place of those files' on disk.
@@ -229,35 +291,16 @@ pub fn with_checked_in<T: Send>(
     overlay: &Overlay,
     f: impl FnOnce(&wrela_sema::Checked, &SourceMap) -> T + Send,
 ) -> Result<T, String> {
-    with_lowered_in(root, overlay, false, |c, s, _| f(c, s))
-}
-
-fn with_lowered_in<T: Send>(
-    root: &Path,
-    overlay: &Overlay,
-    lower: bool,
-    f: impl FnOnce(&wrela_sema::Checked, &SourceMap, Option<&wrela_lower::Lowered>) -> T + Send,
-) -> Result<T, String> {
     on_compiler_thread(|| {
         let (sources, mut diagnostics, loaded) = load_with(root, overlay);
-        let Some(Loaded { units, packages, dirs, .. }) = loaded else {
+        let Some(Loaded { units, packages, .. }) = loaded else {
             return Err(wrela_diag::render::render_all(&sources, &diagnostics));
         };
         let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
         if has_errors(&diagnostics) {
             return Err(wrela_diag::render::render_all(&sources, &diagnostics));
         }
-        if !lower {
-            return Ok(f(&checked, &sources, None));
-        }
-        let mut data = wrela_lower::BuildData::default();
-        prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);
-        if has_errors(&diagnostics) {
-            return Err(wrela_diag::render::render_all(&sources, &diagnostics));
-        }
-        let roots = wrela_lower::Roots::every_fn(&checked);
-        let (lowered, _) = wrela_lower::lower(&checked, &roots, &data, false);
-        Ok(f(&checked, &sources, Some(&lowered)))
+        Ok(f(&checked, &sources))
     })
 }
 
@@ -288,6 +331,8 @@ pub struct TestResult {
     pub name: String,
     pub at: String,
     pub failure: Option<Diagnostic>,
+    /// What it printed (each line shown as it was made) and the phases it timed (§8's `trace`).
+    pub traced: wrela_host::Traced,
 }
 
 impl TestOutput {
@@ -306,16 +351,28 @@ pub fn test(root: &Path, filter: Option<&str>) -> TestOutput {
 /// [`test`], each test stopped after `fuel` (wasmtime's, about a WASM instruction each) rather
 /// than [`consts::TEST_FUEL`]: for the compiler's own tests of tests that never end.
 pub fn test_with_fuel(root: &Path, filter: Option<&str>, fuel: u64) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, fuel))
+    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, fuel, false))
+}
+
+/// [`test`], writing each GPU frame test's golden (`golden: "frame.png"`, §10) from this
+/// machine's screen before comparing with it: `wrela test --bless`.
+pub fn test_blessing(root: &Path, filter: Option<&str>) -> TestOutput {
+    on_compiler_thread(|| run_tests(root, filter, PackageKind::Program, consts::TEST_FUEL, true))
 }
 
 /// [`test`] for std's own tests, with the package at `root` as the program: how std's
 /// tests run (the suite's `std_tests_pass`), since only a program package's tests run.
 pub fn test_std(root: &Path, filter: Option<&str>) -> TestOutput {
-    on_compiler_thread(|| run_tests(root, filter, PackageKind::Std, consts::TEST_FUEL))
+    on_compiler_thread(|| run_tests(root, filter, PackageKind::Std, consts::TEST_FUEL, false))
 }
 
-fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) -> TestOutput {
+fn run_tests(
+    root: &Path,
+    filter: Option<&str>,
+    kind: PackageKind,
+    fuel: u64,
+    bless: bool,
+) -> TestOutput {
     let (sources, mut diagnostics, loaded) = load(root);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
         split_std_warnings(&sources, &mut diagnostics);
@@ -330,7 +387,8 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) ->
     // A debug build's checks, as `wrela build --debug` makes them (§11).
     let mut data = wrela_lower::BuildData { debug: true, testing: true, ..Default::default() };
     let mut filtered_out = 0;
-    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);
+    let cache = const_cache::dir_of(root);
+    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
     let mut results = Vec::new();
     if !has_errors(&diagnostics) {
         // The package's tests, in the order written.
@@ -356,16 +414,16 @@ fn run_tests(root: &Path, filter: Option<&str>, kind: PackageKind, fuel: u64) ->
             diagnostics.extend(d);
         }
         if !framed.is_empty() && !has_errors(&diagnostics) {
-            let (r, d) = frames::run(&checked, &sources, &data, &framed, root, fuel);
+            let (r, d) = frames::run(&checked, &sources, &data, &framed, root, fuel, bless);
             ran.extend(r);
             diagnostics.extend(d);
         }
         // In the order written.
-        ran.sort_by_key(|&(f, _)| tests.iter().position(|&t| t == f));
-        for (f, failure) in ran {
+        ran.sort_by_key(|&(f, _, _)| tests.iter().position(|&t| t == f));
+        for (f, failure, traced) in ran {
             let def = p.func(f);
             let at = sources.file(def.name_span.file).location(def.name_span.start);
-            results.push(TestResult { name: def.name.clone(), at, failure });
+            results.push(TestResult { name: def.name.clone(), at, failure, traced });
         }
     }
     sort_and_dedup(&mut diagnostics);
@@ -439,6 +497,7 @@ fn compile_loaded(
             files: Vec::new(),
             pipelines: Vec::new(),
             program_files: Vec::new(),
+            consts: consts::ConstStats::default(),
         };
     };
     // The program package's own files: package 1's (std is 0).
@@ -448,12 +507,15 @@ fn compile_loaded(
         .map(|(f, _, path)| (*f, path.clone()))
         .collect();
     for p in packages.iter_mut().skip(1) {
-        p.lifted = lift.contains(&p.name);
+        p.lifted = lift.iter().any(|e| lift_package(e) == p.name);
     }
-    // The lifted packages' files, each with its path from the program's package.
+    // The lifted files (each of a package named whole, or one named alone), each with its path
+    // from the program's package.
     let lifted_files: Vec<(wrela_diag::FileId, String)> = all_files
         .iter()
-        .filter(|(_, pkg, _)| packages[*pkg].lifted)
+        .filter(|(_, pkg, path)| {
+            *pkg > 0 && lifts_file(lift, &packages[*pkg].name, &dirs[*pkg], path)
+        })
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
     let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
@@ -465,9 +527,18 @@ fn compile_loaded(
         testing: mode.testing,
         ..Default::default()
     };
-    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics);
+    let cache = const_cache::dir_of(root);
+    let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, cache.as_deref());
     if !lift.is_empty() && !has_errors(&diagnostics) {
         data.lift = Some(lift::table(&checked, &sources, &lifted_files));
+    }
+    // A build that's emitted ships its shipped constants' files; one that's only checked, or run
+    // as tests, keeps their bytes.
+    let mut shipped_files = Vec::new();
+    if mode.emit && !has_errors(&diagnostics) {
+        let (f, d) = shipped::take(&checked, &mut data);
+        shipped_files = f;
+        diagnostics.extend(d);
     }
     if !has_errors(&diagnostics) {
         let roots = roots(&checked);
@@ -482,6 +553,7 @@ fn compile_loaded(
             let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
             diagnostics.extend(out.diagnostics);
             files = out.files;
+            files.append(&mut shipped_files);
             if let Some(t) = &data.lift {
                 files.push(("lift.json".into(), lift::report(&checked, &sources, t).into_bytes()));
             }
@@ -492,27 +564,32 @@ fn compile_loaded(
         files.clear();
     }
     let std_warnings = split_std_warnings(&sources, &mut diagnostics);
-    Output { sources, diagnostics, std_warnings, files, pipelines, program_files }
+    Output { sources, diagnostics, std_warnings, files, pipelines, program_files, consts: stats }
 }
 
 /// Reads the files `embed` reads, then computes the constants the build computes, into `data`,
-/// before what reads them is lowered (§10): each step only if no errors came before it.
+/// before what reads them is lowered (§10): each step only if no errors came before it. With
+/// `cache`, constants whose inputs are unchanged are read from it ([`const_cache`]).
 fn prepare(
     checked: &wrela_sema::Checked,
     sources: &SourceMap,
     dirs: &[std::path::PathBuf],
     data: &mut wrela_lower::BuildData,
     diagnostics: &mut Vec<Diagnostic>,
-) {
+    cache: Option<&Path>,
+) -> consts::ConstStats {
     if has_errors(diagnostics) {
-        return;
+        return consts::ConstStats::default();
     }
     let (embeds, d) = consts::read_embeds(checked, dirs);
     data.embeds = embeds;
     diagnostics.extend(d);
-    if !has_errors(diagnostics) {
-        diagnostics.extend(consts::compute(checked, sources, data));
+    if has_errors(diagnostics) {
+        return consts::ConstStats::default();
     }
+    let (d, stats) = consts::compute(checked, sources, data, cache);
+    diagnostics.extend(d);
+    stats
 }
 
 /// Takes the warnings in std's own code out of `diags`, and returns them.

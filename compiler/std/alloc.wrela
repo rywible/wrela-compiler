@@ -1,8 +1,13 @@
 // std's allocator: the heap that `Vec`, `String` and `Box` live in (language.md §6.9).
 //
 // Blocks of up to 1 MiB come in size classes, the powers of two from 16 bytes, each with a list
-// of freed blocks to reuse. Larger blocks are whole multiples of 64 KiB, on a list of their own,
-// reused first fit. Fresh memory comes from a bump pointer, which grows the memory as it needs.
+// of freed blocks to reuse. Larger blocks are whole multiples of 64 KiB, on a list of their own
+// in address order: a request takes the best fit, split if it's bigger (its rest stays freed),
+// and a freed block is joined to the freed blocks it touches, or given back to the bump pointer
+// when it ends there. So a long run that frees large blocks and asks for others of other sizes
+// reuses them (whole, a freed block's tail was lost each time a smaller request took it: the
+// floor's walk into the wildwood ran out of memory). Fresh memory comes from a bump pointer,
+// which grows the memory as it needs.
 // Every block is 16-byte aligned. Callers say a block's size when they free it, so blocks carry
 // no header. Addresses never reach a program's results, so where a block lands can't change
 // what a program computes.
@@ -13,10 +18,10 @@
 // what one thread counts doesn't depend on another's timing. So are the times a thread found the
 // lock taken, and the tries it spun before it got it: hosts measure the waits with them.
 
-use std::abi::{ALLOCATIONS, ALLOC_STATE, LOCK_SPINS, LOCK_WAITS}
+use std::abi::{ALLOCATIONS, ALLOC_STATE, LOCK_SPINS, LOCK_WAITS, SEEN_END}
 use std::mem::{
-    align_of, compare_swap, copy, count, heap_base, load_u32, memory_grow, memory_pages, size_of,
-    store_u32, thread_block, write,
+    align_of, atomic_load, atomic_store, compare_swap, copy, count, heap_base, load_u32,
+    memory_grow, memory_pages, notify, size_of, store_u32, thread_block, wait, write,
 }
 
 // The allocator's words, from ALLOC_STATE on.
@@ -28,15 +33,26 @@ const HEADS: u32 = ALLOC_STATE + 16
 const CLASSES: u32 = 17
 const SMALLEST: u32 = 16
 const PAGE: u32 = 65536
+/// The largest block there can be: the memory's most (1 GiB), so a size's rounding to a page
+/// can't overflow.
+const MOST: u32 = 1073741824
 
 /// A block of at least `size` bytes, aligned to `align` (at most 16), or 0 when `size` is 0.
 /// Running out of memory panics.
+///
+/// Nothing panics or traps while the lock is held: a thread that did would hold it for good,
+/// and every other thread would wait on it forever (spike 17's bake: a job ran out of memory,
+/// and the thread that would have joined it spun until its count of tries overflowed, which hid
+/// the job's panic). A request that can't be met is found under the lock and panics after it.
 pub fn alloc(size: u32, align: u32) -> u32 {
     if size == 0 {
         return 0
     }
     if align > SMALLEST {
         panic("std's allocator aligns blocks to at most 16 bytes")
+    }
+    if size > MOST {
+        panic("out of memory: a block larger than the heap can grow to (1 GiB)")
     }
     lock()
     let k = class(size)
@@ -54,10 +70,31 @@ pub fn alloc(size: u32, align: u32) -> u32 {
         large(round_up(size, PAGE))
     }
     unlock()
+    if block == 0 {
+        panic("out of memory: the heap can't grow past 1 GiB")
+    }
     unsafe {
+        reach_heap()
         count(ALLOCATIONS, 1)
     }
     block
+}
+
+/// Makes sure this thread can reach all the memory the heap has grown to. A thread that didn't
+/// grow a shared memory may go on seeing its old size for a while (Chrome's engine: a helper
+/// woken from a wait trapped on a block another thread had just carved), and asking for the
+/// memory's size by growing it by nothing brings its view up to date. Only when the heap has
+/// grown since this thread last asked (`SEEN_END`, its own word): two loads otherwise. std
+/// calls it wherever a thread takes memory another may have grown.
+pub(package) fn reach_heap() {
+    unsafe {
+        let end = atomic_load(END)
+        let seen = thread_block() + SEEN_END
+        if load_u32(seen) < end {
+            let _ = memory_grow(0)
+            store_u32(seen, end)
+        }
+    }
 }
 
 /// Moves `value` to a block of its own: the block's address. Whoever frees the block, with
@@ -90,10 +127,7 @@ pub fn free(addr: u32, size: u32) {
             store_u32(addr, load_u32(HEADS + 4 * k))
             store_u32(HEADS + 4 * k, addr)
         } else {
-            // A large block's list node: the next block, then this one's size.
-            store_u32(addr, load_u32(LARGE))
-            store_u32(addr + 4, round_up(size, PAGE))
-            store_u32(LARGE, addr)
+            free_large(addr, round_up(size, PAGE))
         }
     }
     unlock()
@@ -129,62 +163,152 @@ fn round_up(n: u32, to: u32) -> u32 {
     (n + to - 1) / to * to
 }
 
-/// A large block of `n` bytes, a multiple of 64 KiB: the first freed one big enough, else
-/// fresh.
+/// A large block of `n` bytes, a multiple of 64 KiB: the smallest freed one big enough (if it's
+/// bigger, its rest stays freed in its place), else fresh. A freed large block's list node is
+/// its first two words: the next freed block, then its size.
 fn large(n: u32) -> u32 {
     unsafe {
-        var prev = LARGE
+        var best = 0
+        var best_link = LARGE
+        var best_size = 4294967295
+        var link = LARGE
         var at = load_u32(LARGE)
         while at != 0 {
-            if load_u32(at + 4) >= n {
-                store_u32(prev, load_u32(at))
-                return at
+            let size = load_u32(at + 4)
+            if size >= n && size < best_size {
+                best = at
+                best_link = link
+                best_size = size
             }
-            prev = at
+            link = at
             at = load_u32(at)
+        }
+        if best != 0 {
+            if best_size > n {
+                // Its rest keeps its place in the list: it's after `best`, and before the next.
+                let rest = best + n
+                store_u32(rest, load_u32(best))
+                store_u32(rest + 4, best_size - n)
+                store_u32(best_link, rest)
+            } else {
+                store_u32(best_link, load_u32(best))
+            }
+            return best
         }
     }
     carve(n)
 }
 
-/// `n` fresh bytes from the bump pointer, growing the memory if it must.
+/// Puts a large block of `size` bytes back on the freed list (in address order), joined to the
+/// freed blocks either side that it touches; or, if it then ends where fresh memory starts, gives
+/// it back to the bump pointer.
+fn free_large(addr: u32, size: u32) {
+    unsafe {
+        // The freed blocks before and after it, and the word that points at the one before.
+        var prev = 0
+        var prev_link = LARGE
+        var next = load_u32(LARGE)
+        while next != 0 && next < addr {
+            prev_link = if prev == 0 { LARGE } else { prev }
+            prev = next
+            next = load_u32(next)
+        }
+        var start = addr
+        var len = size
+        if next != 0 && addr + size == next {
+            len += load_u32(next + 4)
+            next = load_u32(next)
+        }
+        // The word that points at the block: the list's head, or the freed block before it.
+        var link = if prev == 0 { LARGE } else { prev }
+        if prev != 0 && prev + load_u32(prev + 4) == addr {
+            start = prev
+            len += load_u32(prev + 4)
+            link = prev_link
+        }
+        if start + len == load_u32(BUMP) {
+            store_u32(link, next)
+            store_u32(BUMP, start)
+        } else {
+            store_u32(start, next)
+            store_u32(start + 4, len)
+            store_u32(link, start)
+        }
+    }
+}
+
+/// `n` fresh bytes from the bump pointer, growing the memory if it must; 0 if it can't grow (the
+/// caller panics, once it has let the lock go).
 fn carve(n: u32) -> u32 {
     unsafe {
         var bump = load_u32(BUMP)
         if bump == 0 {
             bump = heap_base()
-            store_u32(END, memory_pages() * PAGE)
+            atomic_store(END, memory_pages() * PAGE)
         }
         let end = load_u32(END)
         if n > end - bump {
             let pages = (n - (end - bump) + PAGE - 1) / PAGE
             if memory_grow(pages) == 4294967295 {
-                panic("out of memory: the heap can't grow past 1 GiB")
+                return 0
             }
-            store_u32(END, end + pages * PAGE)
+            atomic_store(END, end + pages * PAGE)
         }
         store_u32(BUMP, bump + n)
         bump
     }
 }
 
-/// Takes the allocator's lock: workers share the heap. A thread that finds it taken counts the
-/// wait and its tries (only this thread writes its counts).
+/// Takes the allocator's lock: workers share the heap. The lock's word is 0 when it's free, 1
+/// when a thread holds it, and 2 when a thread holds it and another may be asleep on it. A thread
+/// that finds it taken spins a while (holds are short), then marks it 2 and sleeps until the
+/// holder lets go (`unlock` wakes a sleeper). It counts the wait and its tries (only this thread
+/// writes its counts, wrapping).
 fn lock() {
     unsafe {
-        if compare_swap(LOCK, expected: 0, new: 1) != 0 {
-            var spins: u32 = 1
-            while compare_swap(LOCK, expected: 0, new: 1) != 0 {
-                spins += 1
+        if compare_swap(LOCK, expected: 0, new: 1) == 0 {
+            return
+        }
+        var spins: u32 = 1
+        loop {
+            if spins < SPINS_BEFORE_SLEEPING {
+                if compare_swap(LOCK, expected: 0, new: 1) == 0 {
+                    break
+                }
+            } else {
+                // Taken with the mark of a sleeper on it: whoever lets it go wakes one.
+                if exchange_lock(2) == 0 {
+                    break
+                }
+                let _ = wait(LOCK, 2)
             }
-            count(LOCK_WAITS, 1)
-            count(LOCK_SPINS, spins)
+            spins = spins.wrapping_add(1)
+        }
+        count(LOCK_WAITS, 1)
+        count(LOCK_SPINS, spins)
+    }
+}
+
+/// Lets the allocator's lock go, waking a thread asleep on it if one may be.
+fn unlock() {
+    unsafe {
+        if exchange_lock(0) == 2 {
+            let _ = notify(LOCK, 1)
         }
     }
 }
 
-fn unlock() {
+/// Puts `new` in the lock's word, atomically: what was there.
+fn exchange_lock(new: u32) -> u32 {
     unsafe {
-        store_u32(LOCK, 0)
+        loop {
+            let old = atomic_load(LOCK)
+            if compare_swap(LOCK, expected: old, new: new) == old {
+                return old
+            }
+        }
     }
 }
+
+/// How many tries a thread spins on the lock before it sleeps on it.
+const SPINS_BEFORE_SLEEPING: u32 = 2048

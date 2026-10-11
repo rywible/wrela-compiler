@@ -13,8 +13,11 @@ pub(package) const PAR_SHUTDOWN: u32 = 260
 /// How many chunks the helpers have run, ever.
 pub(package) const PAR_HELPED: u32 = 264
 
-/// Microseconds a helper holds back each long job's result (tests).
+/// Microseconds a helper holds back each task's result (tests).
 pub(package) const PAR_HOLD: u32 = 268
+
+/// How many helpers the host started: with none, `done` runs a task.
+pub(package) const PAR_HELPERS: u32 = 272
 
 /// Nonzero when the host wants the ticker's state hash.
 pub(package) const TICK_WANT_HASH: u32 = 512
@@ -76,17 +79,23 @@ pub(package) const LOCK_WAITS: u32 = 44
 /// How many tries a thread spun on the allocator's lock.
 pub(package) const LOCK_SPINS: u32 = 48
 
+/// The heap's end as far as a thread has made sure it can reach it.
+pub(package) const SEEN_END: u32 = 52
+
+/// Where `wrela.clock` writes a thread's clock: an `f64`, seconds.
+pub(package) const CLOCK: u32 = 56
+
 /// Where in a block a panic's message is: a `u32` byte count, then UTF-8.
 pub(package) const PANIC: u32 = 4096
 
-/// The long jobs' slots.
-pub(package) const JOB_SLOTS: u32 = 1212416
+/// The tasks' slots.
+pub(package) const TASK_SLOTS: u32 = 1212416
 
 /// How many slots there are.
-pub(package) const JOB_SLOT_COUNT: u32 = 256
+pub(package) const TASK_SLOT_COUNT: u32 = 256
 
 /// The bytes of each slot.
-pub(package) const JOB_SLOT_SIZE: u32 = 16
+pub(package) const TASK_SLOT_SIZE: u32 = 16
 
 /// The thread a slot's job ran on: the host writes it on a trap.
 pub(package) const SLOT_THREAD: u32 = 12

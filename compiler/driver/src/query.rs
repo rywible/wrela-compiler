@@ -14,11 +14,18 @@
 //!
 //! A function or type is named by its path (`main::step`, `std::field::sphere`, `Grid::at`) or
 //! its last parts (`step`, `at`); a name with several matches is an error that lists them.
+//!
+//! A program with errors is answered too, since an agent spends most of its time between
+//! programs that check. A function whose body has an error has no memory IR, so what it calls,
+//! borrows and does isn't known; the rest of the program is. An answer that such a function, or
+//! an error outside every body (a type's declaration, an impl), could change lists those errors
+//! as `unsure`; a query about the inside of such a function is an `error` that says so.
 
 use crate::SourceMap;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::Path;
-use wrela_diag::{FileId, SourceFile, Span};
+use wrela_diag::{Diagnostic, FileId, SourceFile, Span};
 use wrela_sema::Checked;
 use wrela_sema::defs::{AdtKind, FnOwner};
 use wrela_sema::mir::{
@@ -85,39 +92,209 @@ pub fn parse(text: &str) -> Result<Query, String> {
     })
 }
 
+/// What [`answer`] found: each query's answer, and the program's errors, rendered as `wrela
+/// check` shows them (`None` if it checks).
+pub struct Answered {
+    pub answers: Vec<Value>,
+    pub errors: Option<String>,
+}
+
 /// Answers `queries` on the package at `root`, in order: each answer has the query's text as
-/// `query`, and `error` if it couldn't be answered. `Err` if the package doesn't check.
-pub fn run(root: &Path, queries: &[(String, Query)]) -> Result<Vec<Value>, String> {
+/// `query`, `error` if it couldn't be answered, and `unsure` if an error in the program could
+/// change it (see the top of this file). `Err` if the package doesn't load.
+pub fn answer(root: &Path, queries: &[(String, Query)]) -> Result<Answered, String> {
     let lower = queries.iter().any(|(_, q)| matches!(q, Query::Instantiations(_)));
-    crate::with_lowered(root, lower, |checked, sources, lowered| {
-        let ix = Index::new(checked, sources);
+    crate::with_partial(root, lower, |part| {
+        let checked = part.checked;
+        let ix = Index::new(checked, part.sources);
+        let gaps = Gaps::new(ix.p, &part.errors);
         let effects = std::cell::OnceCell::new();
-        queries
+        let answers = queries
             .iter()
             .map(|(text, q)| {
-                let answer = match q {
-                    Query::Type { file, line, column } => ix.type_at(file, *line, *column),
-                    Query::Callers(name) => ix.callers(name),
-                    Query::Callees(name) => ix.callees(name),
-                    Query::Impls(name) => ix.impls(name),
-                    Query::Effects(name) => {
+                let (unknown, unsure) = gaps.of(&ix, q);
+                let answer = match (unknown, q) {
+                    (Some(why), _) => Err(why),
+                    (None, Query::Type { file, line, column }) => ix.type_at(file, *line, *column),
+                    (None, Query::Callers(name)) => ix.callers(name),
+                    (None, Query::Callees(name)) => ix.callees(name),
+                    (None, Query::Impls(name)) => ix.impls(name),
+                    (None, Query::Effects(name)) => {
                         let fx = effects.get_or_init(|| {
                             wrela_sema::effects::Effects::build(ix.p, &checked.mir)
                         });
                         ix.effects(name, fx)
                     }
-                    Query::Borrows { file, line } => ix.borrows(file, *line),
-                    Query::Instantiations(name) => ix.instantiations(name, lowered),
-                    Query::Search(sig) => ix.search(sig),
+                    (None, Query::Borrows { file, line }) => ix.borrows(file, *line),
+                    (None, Query::Instantiations(name)) => ix.instantiations(name, part.lowered),
+                    (None, Query::Search(sig)) => ix.search(sig),
                 };
                 let mut v = answer.unwrap_or_else(|e| json!({ "error": e }));
                 if let Value::Object(m) = &mut v {
                     m.insert("query".into(), Value::String(text.clone()));
+                    if !unsure.is_empty() {
+                        let unsure = unsure.iter().map(|&(f, d)| show(&ix, f, d)).collect();
+                        m.insert("unsure".into(), Value::Array(unsure));
+                    }
                 }
                 v
             })
-            .collect()
+            .collect();
+        Answered { answers, errors: part.rendered() }
     })
+}
+
+/// [`answer`], for a program that must check: `Err` with its errors, rendered, if it doesn't.
+pub fn run(root: &Path, queries: &[(String, Query)]) -> Result<Vec<Value>, String> {
+    let a = answer(root, queries)?;
+    match a.errors {
+        Some(errors) => Err(errors),
+        None => Ok(a.answers),
+    }
+}
+
+/// What a program's errors leave unknown: each function whose source holds an error (the
+/// innermost, for a closure), with those errors, and the errors outside every function. A
+/// function whose body didn't type has no memory IR: nothing is known of what it calls,
+/// borrows or does. An error outside every function may change any answer.
+struct Gaps<'a> {
+    fns: BTreeMap<FnId, Vec<&'a Diagnostic>>,
+    outside: Vec<&'a Diagnostic>,
+}
+
+/// An error that could change an answer, and the function it's in (`None` outside every one).
+type Unsure<'a> = (Option<FnId>, &'a Diagnostic);
+
+impl<'a> Gaps<'a> {
+    fn new(p: &Program, errors: &[&'a Diagnostic]) -> Gaps<'a> {
+        let mut gaps = Gaps { fns: BTreeMap::new(), outside: Vec::new() };
+        for &d in errors {
+            match d.primary.as_ref().and_then(|l| innermost_fn(p, l.span.file, l.span.start)) {
+                Some(f) => gaps.fns.entry(f).or_default().push(d),
+                None => gaps.outside.push(d),
+            }
+        }
+        gaps
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fns.is_empty() && self.outside.is_empty()
+    }
+
+    /// Whether `f` has an error and no memory IR: what its code does isn't known.
+    fn unknown(&self, ix: &Index, f: FnId) -> bool {
+        self.fns.contains_key(&f) && !ix.checked.mir.contains_key(&f)
+    }
+
+    /// The functions whose code isn't known.
+    fn unknown_fns(&self, ix: &Index) -> Vec<FnId> {
+        self.fns.keys().copied().filter(|&f| self.unknown(ix, f)).collect()
+    }
+
+    /// The errors of `fs`, then those outside every function.
+    fn with_outside(&self, fs: impl IntoIterator<Item = FnId>) -> Vec<Unsure<'a>> {
+        let mut out: Vec<Unsure> = Vec::new();
+        for f in fs {
+            for &d in self.fns.get(&f).into_iter().flatten() {
+                out.push((Some(f), d));
+            }
+        }
+        out.extend(self.outside.iter().map(|&d| (None, d)));
+        out
+    }
+
+    /// Why `q` can't be answered while the program has these errors (`None` if it can), and
+    /// the errors that could change its answer.
+    fn of(&self, ix: &Index, q: &Query) -> (Option<String>, Vec<Unsure<'a>>) {
+        if self.is_empty() {
+            return (None, Vec::new());
+        }
+        // A query about the inside of a function whose code isn't known.
+        let inside = |f: FnId| {
+            let why = format!(
+                "`{}` has errors, so what its code does isn't known until they're fixed",
+                ix.fn_path(f)
+            );
+            (Some(why), self.with_outside([f]))
+        };
+        // The function a query of a place is about: the innermost whose source holds it.
+        let at = |file: &str, line: u32, column: u32| {
+            let file = ix.file(file).ok()?;
+            innermost_fn(ix.p, file, ix.offset(file, line, column).ok()?)
+        };
+        // A function a query names, unless the name names none (that's the query's own error).
+        let named = |name: &str| ix.one_fn(name).ok().map(|(f, _)| f);
+        match q {
+            Query::Type { file, line, column } => match at(file, *line, *column) {
+                Some(f) if self.unknown(ix, f) => inside(f),
+                f => (None, self.with_outside(f)),
+            },
+            Query::Borrows { file, line } => match at(file, *line, 1) {
+                Some(f) if self.unknown(ix, f) => inside(f),
+                f => (None, self.with_outside(f)),
+            },
+            Query::Callees(name) => match named(name) {
+                Some(f) if self.unknown(ix, f) => inside(f),
+                f => (None, self.with_outside(f)),
+            },
+            Query::Effects(name) => match named(name) {
+                Some(f) if self.unknown(ix, f) => inside(f),
+                // Its effects are those of what it reaches: one whose code isn't known may
+                // have effects that aren't listed.
+                Some(f) => (None, self.with_outside(self.reached(ix, f))),
+                None => (None, self.with_outside(None)),
+            },
+            // A call from a function whose code isn't known isn't listed.
+            Query::Callers(_) => (None, self.with_outside(self.unknown_fns(ix))),
+            Query::Instantiations(_) => (
+                Some("lowering needs a program without errors, so instantiations wait until they're fixed".into()),
+                Vec::new(),
+            ),
+            Query::Impls(_) | Query::Search(_) => (None, self.with_outside(None)),
+        }
+    }
+
+    /// `f`, and each function with errors that `f` reaches through the calls known.
+    fn reached(&self, ix: &Index, f: FnId) -> Vec<FnId> {
+        let mut seen = std::collections::BTreeSet::from([f]);
+        let mut todo = vec![f];
+        while let Some(g) = todo.pop() {
+            let Some(body) = ix.checked.mir.get(&g) else { continue };
+            for (u, _) in uses(ix.p, body) {
+                if seen.insert(u.func()) {
+                    todo.push(u.func());
+                }
+            }
+        }
+        seen.into_iter().filter(|&g| g == f || self.fns.contains_key(&g)).collect()
+    }
+}
+
+/// An error in an answer's `unsure`: its code, its message, where it is, and the function it's
+/// in.
+fn show(ix: &Index, f: Option<FnId>, d: &Diagnostic) -> Value {
+    let mut v = json!({ "code": d.code.as_str(), "message": d.message });
+    if let Some(l) = &d.primary {
+        v["at"] = Value::String(ix.at(l.span));
+    }
+    if let Some(f) = f {
+        v["in"] = Value::String(ix.fn_path(f));
+    }
+    v
+}
+
+/// The innermost function whose source holds byte `offset` of `file`, whether it checked or not.
+fn innermost_fn(p: &Program, file: FileId, offset: u32) -> Option<FnId> {
+    (0..p.fns.len() as u32)
+        .map(FnId)
+        .filter(|&f| {
+            let s = p.func(f).span;
+            s.file == file && s.start <= offset && offset < s.end
+        })
+        .min_by_key(|&f| {
+            let s = p.func(f).span;
+            s.end - s.start
+        })
 }
 
 /// How a use is named in the queries' answers.
@@ -895,9 +1072,12 @@ impl<'a> Index<'a> {
 /// `budget` tokens (a token is taken as 4 characters): the item's source with its doc comment;
 /// the types its signature names; the signatures of what it calls; where it's called; its
 /// impls. Each part goes in whole, in that order, while it fits; what didn't fit is listed.
-pub fn context(root: &Path, item: &str, budget: usize) -> Result<String, String> {
-    crate::with_checked(root, |checked, sources| {
-        let ix = Index::new(checked, sources);
+/// A program with errors gets it too, with the program's errors rendered: what isn't known
+/// because of them (see the top of this file) is said at the end.
+pub fn context(root: &Path, item: &str, budget: usize) -> Result<(String, Option<String>), String> {
+    crate::with_partial(root, false, |part| {
+        let ix = Index::new(part.checked, part.sources);
+        let gaps = Gaps::new(ix.p, &part.errors);
         let (it, path) = ix.one(item)?;
         let mut parts: Vec<(String, String)> = Vec::new();
         let span = it.decl(ix.p).span;
@@ -969,8 +1149,59 @@ pub fn context(root: &Path, item: &str, budget: usize) -> Result<String, String>
                 left.join(", ")
             ));
         }
-        Ok(out)
+        out.push_str(&gaps.context_note(&ix, it));
+        Ok((out, part.rendered()))
     })?
+}
+
+impl Gaps<'_> {
+    /// What `wrela context` of `item` can't know because of the program's errors, as comment
+    /// lines: empty if nothing.
+    fn context_note(&self, ix: &Index, item: Item) -> String {
+        let errors = |us: &[Unsure]| {
+            let shown: Vec<String> = us
+                .iter()
+                .map(|(_, d)| match &d.primary {
+                    Some(l) => format!("{} at {}", d.code.as_str(), ix.at(l.span)),
+                    None => d.code.as_str().to_string(),
+                })
+                .collect();
+            shown.join(", ")
+        };
+        let mut out = String::new();
+        let item_fn = match item {
+            Item::Fn(f) => Some(f),
+            _ => None,
+        };
+        if let Some(f) = item_fn.filter(|&f| self.unknown(ix, f)) {
+            let own: Vec<Unsure> = self.fns[&f].iter().map(|&d| (Some(f), d)).collect();
+            out.push_str(&format!(
+                "// What `{}` calls isn't known: it has errors ({}).\n",
+                ix.fn_path(f),
+                errors(&own)
+            ));
+        }
+        let others: Vec<String> = self
+            .unknown_fns(ix)
+            .into_iter()
+            .filter(|&g| item_fn.is_some_and(|f| f != g))
+            .map(|g| format!("`{}`", ix.fn_path(g)))
+            .collect();
+        if !others.is_empty() {
+            out.push_str(&format!(
+                "// Calls from functions with errors aren't listed: {}.\n",
+                others.join(", ")
+            ));
+        }
+        let outside: Vec<Unsure> = self.outside.iter().map(|&d| (None, d)).collect();
+        if !outside.is_empty() {
+            out.push_str(&format!(
+                "// Errors outside every function may change this: {}.\n",
+                errors(&outside)
+            ));
+        }
+        out
+    }
 }
 
 #[cfg(test)]

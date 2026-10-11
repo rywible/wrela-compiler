@@ -5,14 +5,14 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "to keep work for later, store an enum of actions and `match` on it"
+        "hold it in a struct's field, or keep work for later as an enum of actions you `match` on"
       ],
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "a function type can only be a parameter's type",
+      "message": "a function type can only be a parameter's type or a struct field's",
       "notes": [
-        "a closure that captures only values can be stored, but its type is its own and inferred (§6.7)"
+        "a struct with a field of a function type is generic over it, and so is a function with a `take` parameter of one (§6.7)"
       ],
       "severity": "error",
       "span": {

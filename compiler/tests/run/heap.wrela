@@ -11,6 +11,7 @@
 // expect: reuse(100) = 100
 // expect: no_leak(2048) = 2048
 // expect: drop_on_exits(1000) = 1000
+// expect: large_blocks_reused(40) = 40
 
 pub fn sum_vec(n: u32) -> u32 {
     var v = Vec::new()
@@ -132,6 +133,25 @@ pub fn drop_on_exits(n: u32) -> u32 {
     var count = 0
     for i in 0..n {
         count += early(i)
+    }
+    count
+}
+
+fn one_large(bytes: u32) -> u32 {
+    var v: Vec<u8> = Vec::with_capacity(bytes)
+    v.push(1)
+    v.len()
+}
+
+/// A large block freed and asked for again in other sizes is split and joined again: 64 MiB,
+/// then 2 MiB, round after round. Kept whole when a smaller request took it, its tail was lost
+/// each round, and each round's 64 MiB was fresh: past 1 GiB by the 16th.
+pub fn large_blocks_reused(n: u32) -> u32 {
+    var count = 0
+    for _ in 0..n {
+        let big = one_large(67108864)
+        let small = one_large(2097152)
+        count += big * small
     }
     count
 }

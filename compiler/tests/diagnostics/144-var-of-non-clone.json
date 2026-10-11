@@ -5,6 +5,7 @@
       "file": "main.wrela",
       "fixes": [
         {
+          "choice": true,
           "edits": [
             {
               "end": 196,

@@ -355,7 +355,7 @@ if [ "$full" = 1 ]; then
   step "full: every test of the gate at full size"
   WRELA_FULL=1 run_tests --include-ignored "${skips[@]}"
 
-  step "full: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's, the clearing's and the lens's (on each subject) < 500 ms and < 5 s"
+  step "full: the CLI's speed, cold processes: hello field's check < 200 ms and build < 2 s, sketch 03's, the herd's, the clearing's, the floor's (its bake cached) and the lens's (on each subject) < 500 ms and < 5 s"
   python3 - "$wrela" <<'PY'
 import shutil, subprocess, sys, tempfile, time
 sys.path.insert(0, "tools")
@@ -387,6 +387,9 @@ try:
         ("build the herd", ["build", "examples/herd", "-o", f"{out}/speed-herd"], 5.0),
         ("check the clearing", ["check", "examples/clearing"], 0.5),
         ("build the clearing", ["build", "examples/clearing", "-o", f"{out}/speed-clearing"], 5.0),
+        # The floor with its bake from the constants' cache (#55 AC16).
+        ("check the floor", ["check", "examples/last-green"], 0.5),
+        ("build the floor", ["build", "examples/last-green", "-o", f"{out}/speed-floor"], 5.0),
     ]
     for s in SUBJECTS:
         runs += [

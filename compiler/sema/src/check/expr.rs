@@ -34,6 +34,7 @@ impl<'p> Checker<'p> {
             ast::ExprKind::Tuple(_)
                 | ast::ExprKind::Array(_)
                 | ast::ExprKind::ArrayRepeat { .. }
+                | ast::ExprKind::ArrayFill { .. }
                 | ast::ExprKind::StructLit { .. }
                 | ast::ExprKind::Call { .. }
                 | ast::ExprKind::MethodCall { .. }
@@ -129,6 +130,56 @@ impl<'p> Checker<'p> {
                 }
                 let ty = self.p.types.array(elem, xs.len() as u32);
                 Expr { ty, span, kind: ExprKind::Array(xs) }
+            }
+            ast::ExprKind::ArrayFill { items, fill } => {
+                // The length is the expected array's: `[a, b, ..fill]` fills it out.
+                let (elem_exp, len) = match expected.map(|t| self.kind(t)) {
+                    Some(TyKind::Array(t, n)) => (Some(*t), Some(*n)),
+                    Some(TyKind::ArrayN(t, _)) => (Some(*t), None),
+                    _ => (None, None),
+                };
+                let elem = elem_exp.unwrap_or_else(|| self.new_var(VarKind::General, span));
+                let xs: Vec<Expr> = items.iter().map(|x| self.check_expect(x, elem)).collect();
+                let f = self.check_expect(fill, elem);
+                let n = match len {
+                    Some(n) if (xs.len() as u32) <= n => n,
+                    Some(n) => {
+                        self.err(Diagnostic::new(
+                            codes::E0300,
+                            span,
+                            format!("this array is `[_; {n}]`, and {} elements are written before its fill", xs.len()),
+                        ));
+                        xs.len() as u32
+                    }
+                    None => {
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0306,
+                                span,
+                                "`..fill` fills an array to its length, and no length is known here",
+                            )
+                            .with_note("the length comes from the type the array is used as: a field's, a parameter's or a binding's `[T; N]`, with `N` a number")
+                            .with_help("write the type: `let xs: [T; N] = [a, b, ..fill]`, or the elements in full"),
+                        );
+                        xs.len() as u32
+                    }
+                };
+                let ft = self.infer.resolve(&self.p.types, f.ty);
+                if self.p.types.has_vars(ft) {
+                    if let Some(copy) = self.p.lang_trait(Lang::Copy) {
+                        let r = crate::defs::TraitRef { trait_: copy, args: Vec::new() };
+                        self.obligation(ft, r, f.span, "`..fill`, which copies the fill,".into());
+                    }
+                } else if !crate::traits::implements_builtin(self.p, ft, Lang::Copy) {
+                    let shown = self.display(f.ty);
+                    self.err(Diagnostic::new(
+                        codes::E0400,
+                        f.span,
+                        format!("`..fill` copies the fill to each place left, so it must be `Copy`, and `{shown}` isn't"),
+                    ));
+                }
+                let ty = self.p.types.array(elem, n);
+                Expr { ty, span, kind: ExprKind::ArrayFill(xs, Box::new(f), n) }
             }
             ast::ExprKind::ArrayRepeat { value, count } => {
                 let elem_exp = match expected.map(|t| self.kind(t)) {
@@ -1005,6 +1056,7 @@ impl<'p> Checker<'p> {
                 fields: Vec::new(),
                 order: Vec::new(),
                 base: None,
+                literal: false,
             },
         };
         Ok(Expr { ty: bool_ty, span, kind: ExprKind::Binary(test, Box::new(call), Box::new(k)) })
@@ -1549,7 +1601,16 @@ impl<'p> Checker<'p> {
             }
             return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
         }
-        let i = self.check_expr(index, None);
+        let mut i = self.check_expr(index, None);
+        // An enum that can be an array's length indexes by its discriminant: `xs[Species::Oak]`
+        // for a `[T; Species]` (`ty.enum-arrays`).
+        if let &TyKind::Adt(a, _) = self.kind(i.ty)
+            && resolve::enum_length(self.p, a).is_some()
+        {
+            let u = self.p.types.u32;
+            let at = i.span;
+            i = Expr { ty: u, span: at, kind: ExprKind::Discriminant(Box::new(i)) };
+        }
         // An integer literal is a `u32` index. A value whose literal type isn't settled yet
         // (`let i = 1`) can be either index type: it's checked once it's settled.
         let open = self.infer.var_kind(&self.p.types, i.ty) == Some(VarKind::Int);
@@ -1568,7 +1629,9 @@ impl<'p> Checker<'p> {
             let d = Diagnostic::new(
                 codes::E0312,
                 i.span,
-                format!("an index must be a `u32` or `i32`, not `{shown}`"),
+                format!(
+                    "an index must be a `u32`, an `i32` or an enum whose variants are numbered 0, 1, 2 and on, not `{shown}`"
+                ),
             );
             // A number converts; a vector has components to choose from.
             self.err(match self.kind(i.ty) {
@@ -1865,6 +1928,7 @@ impl<'p> Checker<'p> {
             fields: vec![word],
             order: vec![0],
             base: None,
+            literal: false,
         };
         Expr { ty, span, kind }
     }
@@ -2005,17 +2069,38 @@ impl<'p> Checker<'p> {
                 continue;
             }
             let fty = field_tys[i];
+            // A function field takes a closure or a function of its type, as a parameter of a
+            // function type does (`fn.fields`).
+            let fn_bound = match self.p.types.kind(decls[i].ty) {
+                TyKind::Param(g) if self.p.adt(adt).fn_fields.iter().any(|(_, h)| h == g) => {
+                    let gens = self.p.adt(adt).generics.clone();
+                    self.p
+                        .param(*g)
+                        .fn_bound
+                        .map(|b| self.p.types.subst(b, &crate::ty::Subst::from_pairs(&gens, &args)))
+                }
+                _ => None,
+            };
+            let expect = fn_bound.unwrap_or(fty);
             let value = match &f.value {
-                Some(v) => self.check_expr(v, Some(fty)),
+                Some(v) => self.check_expr(v, Some(expect)),
                 None => {
                     // `S { time }`: the local `time`.
                     let p = ast::Path {
                         segments: vec![ast::PathSegment { ident: f.name.clone(), generics: None }],
                         span: f.name.span,
                     };
-                    self.check_path_expr(&p, Some(fty), f.name.span)
+                    self.check_path_expr(&p, Some(expect), f.name.span)
                 }
             };
+            if let Some(b) = fn_bound {
+                match *self.kind(value.ty) {
+                    TyKind::Param(g) if let Some(have) = self.p.param(g).fn_bound => {
+                        self.pass_bounded(have, b, value.span);
+                    }
+                    _ => self.coerce_arg(&value, b),
+                }
+            }
             if self.p.adt(adt).borrow {
                 self.borrow_field(&decls[i], &value);
             }
@@ -2074,7 +2159,11 @@ impl<'p> Checker<'p> {
             self.err(d);
         }
         let base = base_expr.map(Box::new);
-        Expr { ty, span, kind: ExprKind::Adt { adt, args, variant, fields: out, order, base } }
+        Expr {
+            ty,
+            span,
+            kind: ExprKind::Adt { adt, args, variant, fields: out, order, base, literal: true },
+        }
     }
 
     /// The source text of a zero of a scalar or vector type, for fixes.
@@ -2321,6 +2410,7 @@ impl<'p> Checker<'p> {
                             ],
                             order: (0..6).collect(),
                             base: None,
+                            literal: false,
                         },
                     };
                     let callee = Callee::TraitMethod {
@@ -2499,6 +2589,7 @@ impl<'p> Checker<'p> {
                 fields: ret_fields,
                 order,
                 base: None,
+                literal: false,
             },
         };
         let never = self.p.types.never;
@@ -2652,7 +2743,15 @@ pub(super) fn variant_expr(
     Expr {
         ty,
         span,
-        kind: ExprKind::Adt { adt, args, variant: Some(v), fields, order, base: None },
+        kind: ExprKind::Adt {
+            adt,
+            args,
+            variant: Some(v),
+            fields,
+            order,
+            base: None,
+            literal: false,
+        },
     }
 }
 

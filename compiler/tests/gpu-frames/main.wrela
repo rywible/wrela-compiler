@@ -1,8 +1,13 @@
 // Frame tests on the GPU (language.md §10, `@test(frames: n, gpu: true)`): the first frame has
 // a kernel square 64 numbers and reads them back; later frames take what came back, and the
-// tests check it. `squares_come_back` passes; `a_wrong_square_fails` fails, as a test that
-// finds a mistake should (compiler/tests/tests/suite/test_items.rs).
-use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read, write}
+// tests check it. Each frame draws a ramp on the screen, which two tests compare with a golden
+// PNG. `squares_come_back` and `the_ramp_is_its_golden` pass; `a_wrong_square_fails` and
+// `a_ramp_is_not_black` fail, as a test that finds a mistake should
+// (compiler/tests/tests/suite/test_items.rs).
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
+    dispatch, draw, read, write,
+}
 use std::io::Pending
 
 @compute(64)
@@ -17,6 +22,21 @@ pub struct State {
     got: Vec<u32>,
 }
 
+/// One triangle that covers the screen.
+@vertex
+fn cover(vertex: VertexIndex) -> ClipPosition {
+    let x = f32(vertex.index % 2) * 4.0 - 1.0
+    let y = f32(vertex.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// Red to blue, left to right.
+@fragment
+fn ramp(pixel: FragCoord) -> vec4 {
+    let u = pixel.position.x / 640.0
+    vec4(u, 0.5, 1.0 - u, 1.0)
+}
+
 pub fn init() -> State {
     var xs: GpuBuffer<u32> = buffer(64)
     write(mut xs, 0, Vec::from_fn(64, |i| i))
@@ -24,6 +44,9 @@ pub fn init() -> State {
 }
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, ramp, vertices: 3)
+    screen.present()
     if s.got.len() > 0 {
         return
     }
@@ -52,3 +75,9 @@ fn squares_come_back(s: State) {
 fn a_wrong_square_fails(s: State) {
     assert(s.got[3] == 10)
 }
+
+@test(frames: 2, gpu: true, golden: "goldens/ramp.png", within: 0.5)
+fn the_ramp_is_its_golden(s: State) {}
+
+@test(frames: 2, gpu: true, golden: "goldens/black.png")
+fn a_ramp_is_not_black(s: State) {}

@@ -171,27 +171,26 @@ class SessionTest(Checkout, unittest.TestCase):
         self.assertEqual((out.returncode, out.stdout), (0, ""))
 
     def test_a_new_session_is_told_where_the_task_file_is(self):
-        self.write("M7-TASKS.md", "# M7\n\n## Status\n\n| AC1 | done |\n")
+        self.write("TASKS.md", "# The open work\n\n## Status\n\n| AC1 | done |\n")
         for source in ("startup", "resume", "clear"):
             out = run("session", {"cwd": self.root, "source": source})
-            self.assertEqual(out.stdout, "M7-TASKS.md is the open milestone's task file: read it "
-                             "before milestone work.\n")
+            self.assertEqual(out.stdout, "TASKS.md has the open work: read it before you start.\n")
 
     def test_after_a_compaction_the_task_file_is_given(self):
-        text = "# M7\n\n## Status\n\n| AC1 | done |\n"
-        self.write("M7-TASKS.md", text)
+        text = "# The open work\n\n## Status\n\n| AC1 | done |\n"
+        self.write("TASKS.md", text)
         out = run("session", {"cwd": self.root, "source": "compact"})
-        self.assertIn("M7-TASKS.md, as it is now", out.stdout)
+        self.assertIn("The open work, TASKS.md, as it is now", out.stdout)
         self.assertIn(text, out.stdout)
 
     def test_a_long_task_file_is_cut_at_a_heading(self):
-        head = "# M7\n\n## Status\n\n" + "| AC | state |\n" * 200
-        self.write("M7-TASKS.md", head + "\n## Decisions\n\n" + "a decision\n" * 1000)
+        head = "# The open work\n\n## Status\n\n" + "| AC | state |\n" * 200
+        self.write("TASKS.md", head + "\n## Decisions\n\n" + "a decision\n" * 1000)
         out = run("session", {"cwd": self.root, "source": "compact"}).stdout
         self.assertLess(len(out), 10000)
         self.assertIn(head, out)
         self.assertNotIn("## Decisions", out)
-        self.assertTrue(out.endswith("(The rest is in M7-TASKS.md.)\n"))
+        self.assertTrue(out.endswith("(The rest is in TASKS.md.)\n"))
 
 
 class CloudTest(Checkout, unittest.TestCase):

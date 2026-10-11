@@ -1,12 +1,14 @@
 //! `wrela fix <package-dir> [--json]`: makes every fix a tool can make, and reports each one.
 //!
-//! A diagnostic with exactly one fix gets it: that fix is what the compiler would do. One with
-//! several fixes offers choices (`borrow`, `.clone()` or `take`), which only a person can make,
-//! so they're listed and left. Fixes go in rounds, since one fix can let checking reach code it
-//! didn't before: each round checks the package and makes the fixes it can, and the rounds stop
-//! when one makes none. Then each changed file is formatted, and the report comes from a check
-//! of the files as they are now, so every place it names is in them. Only the package's own
-//! files change, and running it again changes nothing.
+//! A diagnostic with exactly one fix gets it, unless the fix is the author's choice: the others
+//! are what the compiler would do. One with several fixes offers choices (`borrow`, `.clone()`
+//! or `take`), and so does a fix that changes what the program owns or costs (`.clone()` copies
+//! heap memory, and an index, `remove` or a parameter that borrows may be what was meant): only
+//! the author can make those, so they're listed and left. Fixes go in rounds, since one fix can
+//! let checking reach code it didn't before: each round checks the package and makes the fixes
+//! it can, and the rounds stop when one makes none. Then each changed file is formatted, and
+//! the report comes from a check of the files as they are now, so every place it names is in
+//! them. Only the package's own files change, and running it again changes nothing.
 //!
 //! A diagnostic's one fix isn't made when it edits std's files or a dependency's (reported:
 //! that package's authors fix it), when it replaces code that has another error with no fix of
@@ -161,6 +163,9 @@ fn plan<'a>(out: &'a Output, paths: &BTreeMap<FileId, PathBuf>) -> Plan<'a> {
     let mut plan = Plan { make: Vec::new(), skip: Vec::new() };
     for d in &out.diagnostics {
         let [fix] = d.fixes.as_slice() else { continue };
+        if fix.choice {
+            continue;
+        }
         let skip =
             if let Some(e) = fix.edits.iter().find(|e| !paths.contains_key(&e.span.file)) {
                 Some(Skip::Elsewhere(e.span.file))
@@ -288,8 +293,16 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
         };
         println!("{at}: fixed {}: {}", m.code, m.message);
     }
-    for d in out.diagnostics.iter().filter(|d| d.fixes.len() > 1) {
-        println!("{}: {} has fixes to choose from:", where_(out, d), d.code);
+    for d in out.diagnostics.iter() {
+        match d.fixes.as_slice() {
+            [f] if f.choice => println!(
+                "{}: {}'s fix is yours to choose, since it changes what the program owns or costs:",
+                where_(out, d),
+                d.code
+            ),
+            [] | [_] => continue,
+            _ => println!("{}: {} has fixes to choose from:", where_(out, d), d.code),
+        }
         for f in &d.fixes {
             println!("  - {}", f.message);
         }
@@ -348,7 +361,7 @@ mod tests {
     }
 
     fn fix(edits: Vec<Edit>) -> Fix {
-        Fix { message: "fix it".into(), edits }
+        Fix { message: "fix it".into(), edits, choice: false }
     }
 
     /// A fix that `apply_edits` would panic on, or that would change nothing in every round,

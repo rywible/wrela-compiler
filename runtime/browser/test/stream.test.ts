@@ -31,7 +31,6 @@ test("the test encoder writes the vectors' golden batch", () => {
     .storageRead(2, "saves/slot1")
     .storageWrite(3, "saves/a", Uint8Array.of(1, 2, 3, 4, 5))
     .fetch(4, "data/level.bin")
-    .log("frame 3: 2 grazers, é")
     .post(5, "studio/edit", Uint8Array.of(123, 125))
     .drawIndexedIndirect(1, [3, 0, 12], 3, 16, [], new Uint8Array(0))
     .label("terrain")

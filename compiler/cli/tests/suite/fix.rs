@@ -155,6 +155,39 @@ fn fix_leaves_choices_alone() {
     assert_eq!(read(&dir.join("main.wrela")), CHOICE);
 }
 
+/// An element moved out of an array has one fix, `.clone()`, but it's still the author's
+/// choice: it copies heap memory, and an index, `remove` or a parameter that borrows may be
+/// what was meant. It's listed, and marked a choice in the JSON, and not made; the mechanical
+/// fix beside it is.
+#[test]
+fn fix_leaves_a_lone_clone_alone() {
+    let text = "fn keep(take v: Vec<u32>) -> u32 {
+    v.len()
+}
+
+fn go(v: Vec<Vec<u32>>) -> u32 {
+    keep(v[0])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+";
+    let dir = package("fix-lone-clone", text);
+    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("fixed E0100"), "the mode's place is mechanical:\n{report}");
+    assert!(report.contains("E0502's fix is yours to choose"), "{report}");
+    let fixed = read(&dir.join("main.wrela"));
+    assert!(fixed.contains("keep(v[0])") && !fixed.contains(".clone()"), "{fixed}");
+    let (_, json, _) = wrela(&["check", "--json", s(&dir)]);
+    let v: serde_json::Value = serde_json::from_str(&json).expect(&json);
+    let fix = &v["diagnostics"][0]["fixes"][0];
+    assert_eq!(
+        (fix["message"].as_str(), &fix["choice"]),
+        (Some("copy it: `.clone()`"), &true.into()),
+        "{json}"
+    );
+}
+
 /// With `--json`, the report names each fix made and each file changed, and every place in it
 /// is in the files as they are after: a choice's edits can be made from it as they are.
 #[test]

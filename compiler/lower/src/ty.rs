@@ -118,7 +118,7 @@ impl<'a> Cx<'a> {
                 let mut fields = Vec::new();
                 for (i, &e) in ts.iter().enumerate() {
                     if let Some(f) = self.lower_ty(mb, e, span) {
-                        fields.push((format!("_{i}"), f));
+                        fields.push((ir::element_name(i), f));
                     }
                 }
                 // Like a struct, a tuple none of whose elements has a value (`()`, `((), ())`)
@@ -225,7 +225,7 @@ impl<'a> Cx<'a> {
                 let parts: Vec<(String, ir::TypeId)> = fields
                     .into_iter()
                     .enumerate()
-                    .map(|(i, (_, t))| (format!("_{i}"), t))
+                    .map(|(i, (_, t))| (ir::element_name(i), t))
                     .collect();
                 if parts.is_empty() {
                     None

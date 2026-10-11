@@ -32,12 +32,25 @@ pub mod image;
 pub mod lock;
 mod program;
 mod shared;
+mod trace;
 
 pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
-pub use program::{Failure, PostHandler, Ticked, Value, metered_engine};
+pub use gpu::{
+    GpuPiece, GpuTiming, GpuWork, frame_spans, map_read, open_device, read_timestamps,
+    submission_spans,
+};
+pub use trace::{Phase, Trace, Traced};
+/// Build-time code's shared memory (constants, language.md §10), read and written by the
+/// build's thread while its helpers wait or have stopped.
+pub mod build_memory {
+    pub use crate::shared::{slice, write};
+}
+pub use program::{
+    BuildHelpers, Failure, HelperRun, PostHandler, Ticked, Value, metered_engine,
+    refuse_host_functions,
+};
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
 
@@ -70,6 +83,10 @@ pub enum Timing {
 pub struct Options {
     /// Whether every dispatch and pass is timed on the GPU, and how.
     pub timing: Timing,
+    /// With a timing: each timed dispatch and pass's work is counted too, by the GPU's pipeline
+    /// statistics ([`Host::take_work`]): for a cost model, such as `wrela estimate`'s. A load
+    /// fails if the adapter can't count.
+    pub counts: bool,
     /// Keep a copy of every batch the program submits ([`Host::take_batches`]): for tests
     /// that look at what a program recorded, such as a dispatch's uniform bytes.
     pub record: bool,
@@ -346,7 +363,7 @@ impl Host {
         // Everything that can be checked without the GPU is, before taking it.
         let Build { manifest, shaders, wasm_hash, compiled } = compile_build(dir, None)?;
         let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
-        let gpu = Gpu::new(&manifest, &shaders, options.timing)?;
+        let gpu = Gpu::new(&manifest, &shaders, options.timing, options.counts)?;
         let n = workers(options.workers);
         let mut program = Program::instantiate_with(
             &compiled,
@@ -522,6 +539,12 @@ impl Host {
         self.p().take_logs()
     }
 
+    /// What the program printed and timed (`std::io::print`, `std::time::phase`), which its
+    /// threads share.
+    pub fn trace(&mut self) -> Trace {
+        self.p().trace()
+    }
+
     /// The handles of the GPU buffers the program holds, oldest first: for tests, to find a
     /// buffer to read back. A buffer the program dropped is gone.
     pub fn buffers(&mut self) -> Vec<u32> {
@@ -545,6 +568,20 @@ impl Host {
         let gpu = self.p().executor();
         gpu.flush()?;
         Ok(gpu.take_timings())
+    }
+
+    /// The GPU this host runs on: its adapter's name and driver.
+    pub fn adapter(&mut self) -> String {
+        self.p().executor().adapter()
+    }
+
+    /// The work each dispatch and pass did, counted since the last call (or load), with
+    /// [`Options::counts`]: in the order of [`Host::take_timings`]' timings, so take both after
+    /// the same frames. It waits for the GPU.
+    pub fn take_work(&mut self) -> Result<Vec<GpuWork>> {
+        let gpu = self.p().executor();
+        gpu.flush()?;
+        Ok(gpu.take_work())
     }
 }
 
@@ -725,6 +762,12 @@ impl CpuHost {
         self.program.take_logs()
     }
 
+    /// What the program printed and timed (`std::io::print`, `std::time::phase`), which its
+    /// threads share.
+    pub fn trace(&self) -> Trace {
+        self.program.trace()
+    }
+
     /// How many chunks of parallel jobs the workers (not the program's own thread) have run.
     pub fn worker_chunks(&self) -> u32 {
         self.program.helped()
@@ -806,7 +849,7 @@ impl CpuHost {
         self.program.lockstep_frame(i, fps, width, height, script, None)
     }
 
-    /// Makes each helper hold back a long job's result for `micros` microseconds once it's
+    /// Makes each helper hold back a task's result for `micros` microseconds once it's
     /// ready: tests slow jobs down, so the threads that take them wait.
     pub fn hold_jobs(&self, micros: u32) {
         self.program.hold_jobs(micros);

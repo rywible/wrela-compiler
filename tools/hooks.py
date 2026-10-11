@@ -5,8 +5,8 @@ CLAUDE.md that agents skipped into a check, or gives back what an agent loses to
                                      the foreground on a loop of `sleep`, and a `cargo test` that
                                      takes the GPU alone; formats what the gate checks before the
                                      gate runs (`tools/check.sh --fmt`).
-    python3 tools/hooks.py session   at a session's start (SessionStart): names the open
-                                     milestone's task file, and after a compaction gives its text.
+    python3 tools/hooks.py session   at a session's start (SessionStart): names TASKS.md,
+                                     the open work, and after a compaction gives its text.
                                      On a cloud machine, also makes it a dev machine (cloud).
 
 Each reads the hook's JSON on stdin. A refusal is its reason, for Claude, on stderr, and exit 2.
@@ -209,18 +209,19 @@ def session(event):
     root = repo(event)
     if os.environ.get("CLAUDE_CODE_REMOTE") == "true":
         print(cloud(root, event.get("source")))
-    for path in sorted(glob.glob(os.path.join(root, "M*-TASKS.md"))):
-        name = os.path.basename(path)
-        if event.get("source") != "compact":
-            print(f"{name} is the open milestone's task file: read it before milestone work.")
-            continue
-        with open(path, encoding="utf-8") as f:
-            text = f.read()
-        if len(text) > LIMIT:
-            # Cut at a heading, and say where the rest is.
-            cut = text.rfind("\n## ", 0, LIMIT)
-            text = text[: cut if cut > 0 else LIMIT] + f"\n\n(The rest is in {name}.)"
-        print(f"The open milestone's task file, {name}, as it is now:\n\n{text}")
+    path = os.path.join(root, "TASKS.md")
+    if not os.path.isfile(path):
+        return 0
+    if event.get("source") != "compact":
+        print("TASKS.md has the open work: read it before you start.")
+        return 0
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    if len(text) > LIMIT:
+        # Cut at a heading, and say where the rest is.
+        cut = text.rfind("\n## ", 0, LIMIT)
+        text = text[: cut if cut > 0 else LIMIT] + "\n\n(The rest is in TASKS.md.)"
+    print(f"The open work, TASKS.md, as it is now:\n\n{text}")
     return 0
 
 

@@ -1,0 +1,89 @@
+// Memory one thread grew, used by the others. In Chrome, a helper whose instance started while
+// the program's thread was growing the shared memory went on seeing an old size, so a block std's
+// allocator gave it from memory grown since was out of bounds to it (the map lens: its `init`
+// grew the heap for its fonts and renderer while the helpers started, and the helpers that ran
+// its preview's parallel jobs trapped). compiler/tests/tests/suite/threads.rs runs it.
+
+use std::io::print
+use std::par::{Task, spawn}
+
+pub struct State {
+    pub job: Option<Task<u32>>,
+    pub done: bool,
+    pub frames: u32,
+}
+
+/// Rounds of fresh memory on a helper while the others sleep, then work for them all at once:
+/// the helper grows the heap by 192 MiB in blocks of 4 MiB and frees them (they go back to the
+/// bump pointer, so the memory is grown and free), then a parallel job wakes the others, and
+/// each grows vectors a push at a time, from the memory the helper grew.
+@deterministic
+fn grow(n: take u32) -> u32 {
+    var sum: u32 = 0
+    for k in 0..n {
+        {
+            var blocks: Vec<Vec<u8>> = Vec::new()
+            for b in 0..48 {
+                blocks.push(Vec::filled(4 << 20, u8((k + b) % 256)))
+            }
+            for b in blocks {
+                sum += u32(b[7])
+            }
+        }
+        var rows: Vec<Vec<u32>> = Vec::from_fn(256, |_| Vec::new())
+        rows.par_each_mut(|r| {
+            for i in 0..65536 {
+                r.push(i)
+            }
+        })
+        for r in rows {
+            sum += r[65535] % 7
+        }
+    }
+    sum
+}
+
+/// The heap grown at the start, in 64 steps of 4 MiB, while the host starts the helpers (the
+/// lens's fonts and renderer did so), then the task.
+pub fn init() -> State {
+    var blocks: Vec<Vec<u8>> = Vec::new()
+    for b in 0..64 {
+        blocks.push(Vec::filled(4 << 20, u8(b)))
+    }
+    State { job: Some(spawn(4, grow)), done: false, frames: 0 }
+}
+
+/// Until the helper's done, a block each frame; then: a block of 160 MiB on this thread, fresh memory, each page written and
+/// read.
+pub fn frame(state: mut State, time: f32, width: u32, height: u32) {
+    if state.done {
+        return
+    }
+    let ready = match state.job {
+        Some(j) => j.done(),
+        None => false,
+    }
+    if !ready {
+        // While the helpers work, this thread grows the heap too, a block larger each frame,
+        // freed: the helpers' blocks come from memory it grew.
+        state.frames += 1
+        let big: Vec<u8> = Vec::filled((state.frames % 64 + 1) << 20, 3)
+        if big[5] != 3 {
+            print("the block lost its bytes")
+        }
+        return
+    }
+    let job = std::collections::replace(mut state.job, None)
+    let Some(j) = take job else { return }
+    let grown = take j.join()
+    var b: Vec<u8> = Vec::filled(160 << 20, 1)
+    var sum: u32 = 0
+    var i: u32 = 0
+    while i < b.len() {
+        b[i] = 2
+        sum += u32(b[i])
+        i += 65536
+    }
+    print(f"used {grown} {sum}")
+    state.done = true
+}

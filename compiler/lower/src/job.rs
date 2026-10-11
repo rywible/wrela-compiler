@@ -87,7 +87,8 @@ impl Cx<'_> {
         }
     }
 
-    /// The fields of `Job<f>`, as `field_map` gives a struct's: `at`, then each local it holds.
+    /// The parts of `Job<f>`, as `field_map` gives a struct's fields: `at`, then each local it
+    /// holds (`JobHeld`'s order, `fn.job-values`, the layout's), each with its field.
     pub(crate) fn job_fields(
         &mut self,
         mb: &mut ModuleBuilder,
@@ -96,11 +97,12 @@ impl Cx<'_> {
     ) -> Vec<(Option<u32>, TyId)> {
         let Some(layout) = self.job_layout(mb, f, substs) else { return Vec::new() };
         let checked = self.checked;
-        let Some(body) = checked.mir.get(&f) else { return Vec::new() };
+        let Some(held) = checked.program.job_held.get(&f) else { return Vec::new() };
         let subst = self.job_subst(f, substs);
         let mut out = vec![(Some(0), checked.program.types.u32)];
-        for &(l, k) in &layout.fields {
-            out.push((Some(k), self.concrete(body.local(l).ty, &subst)));
+        for (_, l, t) in &held.locals {
+            let k = layout.fields.iter().find(|(m, _)| m.index() == *l as usize).map(|&(_, k)| k);
+            out.push((k, self.concrete(*t, &subst)));
         }
         out
     }

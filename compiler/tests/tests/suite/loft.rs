@@ -12,7 +12,7 @@ fn the_loft_is_a_distance_its_bound_and_interval_hold() {
 
 const PROGRAM: &str = "use engine::loft::{Loft, loft}
 use std::derive::{Box3, interval}
-use std::field::{Lipschitz, Surface}
+use std::field::Surface
 use std::math::TAU
 
 fn cylinder() -> Loft<96> {

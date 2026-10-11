@@ -51,9 +51,7 @@ case "${1:-}" in
     s=$SECONDS
     "$0" || exit 1
     nice -n 10 cargo build -q --release -p wrela-host -p wrela && echo "built the CLI and the host: $((SECONDS - s))s"
-    if [ -d examples/last-green ]; then
-      nice -n 10 target/release/wrela build examples/last-green > /dev/null && echo "built the floor: $((SECONDS - s))s"
-    fi
+    nice -n 10 target/release/wrela build examples/last-green > /dev/null && echo "built the floor: $((SECONDS - s))s"
     nice -n 10 cargo test -q --release --workspace --no-run 2> /dev/null && echo "built the tests: $((SECONDS - s))s"
     echo "warm: $((SECONDS - s))s"
     exit 0 ;;

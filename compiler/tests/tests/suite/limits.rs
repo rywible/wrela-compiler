@@ -24,6 +24,16 @@ fn compile(name: &str, body: &str) -> (Vec<String>, PathBuf) {
     (codes, build)
 }
 
+/// How long a check of a limit may take, wall-clock (s): each takes a few seconds alone, and
+/// what it guards against (exponential time) would take hours; the gate's machine is shared, and
+/// at a load of 30 a 2 s check took 11 s.
+const QUICK: u64 = 30;
+
+/// Fails if `started` was more than `QUICK` seconds ago.
+fn quickly(started: std::time::Instant) {
+    assert!(started.elapsed().as_secs() < QUICK, "took {:?}", started.elapsed());
+}
+
 fn returns(build: &Path, name: &str, want: i32) {
     let mut host = CpuHost::load(build).expect("load");
     assert_eq!(host.call_export(name, &[]).expect("call"), [Value::I32(want)]);
@@ -166,7 +176,7 @@ pub fn poly() -> u32 {
     let started = std::time::Instant::now();
     let (codes, _) = compile("poly_tuple", src);
     assert_eq!(codes, ["E0412"]);
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
 }
 
 #[test]
@@ -179,7 +189,7 @@ fn a_type_that_doubles_is_an_error_quickly() {
     let started = std::time::Instant::now();
     let (codes, _) = compile("doubling", &src);
     assert_eq!(codes, ["E0329"]);
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
 }
 
 #[test]
@@ -200,7 +210,7 @@ fn moves_on_many_paths_check_quickly() {
     let started = std::time::Instant::now();
     let (codes, build) = compile("many_moves", &src);
     assert!(codes.is_empty(), "{codes:?}");
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
     returns(&build, "moves", 500);
 }
 
@@ -219,7 +229,7 @@ fn many_temporaries_given_places_lower_quickly() {
     let started = std::time::Instant::now();
     let (codes, _) = compile("many_spills", &src);
     assert!(codes.is_empty(), "{codes:?}");
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
 }
 
 #[test]
@@ -280,7 +290,7 @@ fn matches_hard_to_check_are_checked_quickly() {
     assert_eq!(codes, ["E0309"]);
     let (codes, _) = compile("hard_match_wild", &hard("        _ => 0,\n"));
     assert!(codes.is_empty(), "{codes:?}");
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
 }
 
 #[test]
@@ -299,7 +309,7 @@ fn a_type_that_doubles_through_later_bindings_is_an_error_quickly() {
     let started = std::time::Instant::now();
     let (codes, _) = compile("doubling_later", &src);
     assert_eq!(codes, ["E0329"]);
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
 }
 
 #[test]
@@ -320,7 +330,7 @@ fn values_too_large_for_memory_trap_on_entry() {
     let started = std::time::Instant::now();
     let (codes, build) = compile("too_large", &src);
     assert!(codes.is_empty(), "{codes:?}");
-    assert!(started.elapsed().as_secs() < 10, "took {:?}", started.elapsed());
+    quickly(started);
     let mut host = CpuHost::load(&build).expect("load");
     for name in ["nested", "array"] {
         assert!(host.call_export(name, &[]).is_err(), "`{name}` didn't trap");

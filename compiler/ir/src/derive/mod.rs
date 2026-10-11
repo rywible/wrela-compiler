@@ -49,9 +49,9 @@ pub fn value_and_gradient(
 /// with the type `T` of `with`, `(f32, X, T)`.
 pub fn value_gradient_ty(types: &mut Types, x: TypeId, with: Option<TypeId>) -> TypeId {
     let f32 = types.f32();
-    let mut fields = vec![("_0".into(), f32), ("_1".into(), x)];
+    let mut fields = vec![(element_name(0), f32), (element_name(1), x)];
     if let Some(t) = with {
-        fields.push(("_2".into(), t));
+        fields.push((element_name(2), t));
     }
     let names: Vec<String> = fields.iter().map(|(_, t)| types.display(*t)).collect();
     types.intern(TypeDef::Struct { name: format!("({})", names.join(", ")), fields })

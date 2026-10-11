@@ -1,0 +1,83 @@
+// Files a build ships (compiler/tests/tests/suite/requests.rs, M6): a constant of
+// `std::io::Shipped` is two files under `files/data/`, which the program fetches on its first
+// frame and polls on every frame after; it keeps their names and sizes, not their bytes. A
+// constant computed from it reads the bytes in place. Frame 40 writes the answers into a buffer.
+use std::gpu::{GpuBuffer, buffer, write}
+use std::io::{Pending, Shipped, ship}
+
+const FILES: Shipped = ship("data", files())
+
+/// The sum of the first file's bytes, read in place by build-time code.
+const FIRST_SUM: u32 = sum8(FILES.bytes(0))
+
+fn files() -> Vec<(String, Vec<u8>)> {
+    var big: Vec<u8> = Vec::new()
+    for i in 0..5000 {
+        big.push(u8(i % 251))
+    }
+    Vec::from(
+        [
+            (String::from("small.bin"), Vec::from([3, 1, 4, 1, 5])),
+            (String::from("big.bin"), take big),
+        ],
+    )
+}
+
+fn sum8(xs: [u8]) -> u32 {
+    var s = 0
+    for x in xs {
+        s += u32(x)
+    }
+    s
+}
+
+pub struct Fetches {
+    frame: u32,
+    report: GpuBuffer<u32>,
+    small: Option<Pending<u8>>,
+    big: Option<Pending<u8>>,
+    small_sum: u32,
+    big_sum: u32,
+}
+
+pub fn init() -> Fetches {
+    Fetches { frame: 0, report: buffer(4), small: None, big: None, small_sum: 0, big_sum: 0 }
+}
+
+pub fn frame(state: mut Fetches, time: f32, width: u32, height: u32) {
+    state.frame += 1
+    if state.frame == 1 {
+        state.small = Some(FILES.fetch(FILES.find("small.bin").unwrap()))
+        state.big = Some(FILES.fetch(1))
+    }
+    match mut state.small {
+        Some(p) => {
+            if let Some(Ok(bytes)) = p.poll() {
+                state.small_sum = 1 + sum8(bytes)
+            }
+        },
+        None => {},
+    }
+    match mut state.big {
+        Some(p) => {
+            if let Some(Ok(bytes)) = p.poll() {
+                state.big_sum = 1 + sum8(bytes)
+            }
+        },
+        None => {},
+    }
+    if state.frame == 40 {
+        write(mut state.report, 0, [state.small_sum, state.big_sum, FILES.len(), FIRST_SUM])
+    }
+}
+
+/// The answers: the fetched files' sums (1 + each), the files' count and their sizes together,
+/// and the sum build-time code read.
+pub fn answers(state: Fetches) -> vec4 {
+    vec4(
+        f32(state.small_sum),
+        f32(state.big_sum),
+        f32(FILES.len() * 100000 + FILES.size(0) + FILES.size(1)),
+        f32(FIRST_SUM),
+    )
+}

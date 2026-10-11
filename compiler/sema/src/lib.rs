@@ -46,9 +46,11 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::handoff", include_str!("../../std/handoff.wrela")),
     ("std::io", include_str!("../../std/io.wrela")),
     ("std::input", include_str!("../../std/input.wrela")),
+    ("std::time", include_str!("../../std/time.wrela")),
     ("std::lift", include_str!("../../std/lift.wrela")),
     ("std::reload", include_str!("../../std/reload.wrela")),
     ("std::job", include_str!("../../std/job.wrela")),
+    ("std::cache", include_str!("../../std/cache.wrela")),
     ("std::gpu", include_str!("../../std/gpu.wrela")),
     ("std::derive", include_str!("../../std/derive.wrela")),
     ("std::field", include_str!("../../std/field.wrela")),
@@ -162,7 +164,6 @@ fn check(
         for t in 0..p.traits.len() {
             diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
         }
-        diags.extend(check::check_declared_types(p));
         check::check_consts(p, diags)
     };
     // A constant's type is the result of the function the build runs to compute it.
@@ -170,6 +171,28 @@ fn check(
         let f = program.const_(c).eval;
         program.fns[f.index()].ret = t;
     }
+    // What each job holds across its `yield`s, a field each of its value's (§6.18): its traits
+    // are its locals', so they're known before the code that uses them is checked. (A job's
+    // body is checked again below, with its diagnostics.)
+    let jobs: Vec<ty::FnId> = (0..program.fns.len() as u32)
+        .map(ty::FnId)
+        .filter(|&f| program.func(f).attrs.job.is_some())
+        .collect();
+    for f in jobs {
+        if let Some(b) = check::check_fn(&program, &consts.tys, f).body {
+            let (m, _) = mir::build::build(&program, &consts.values, f, &b);
+            let held = defs::JobHeld::of(&program, f, &m);
+            program.job_held.insert(f, held);
+        }
+    }
+    // What the trait solver decided about a job's value before it knew the job's locals.
+    if !program.job_held.is_empty() {
+        program.builtin_impls.borrow_mut().clear();
+        program.fieldwise_impls.borrow_mut().clear();
+    }
+    // A type's declared traits, each a job's value's among them.
+    diags.extend(check::check_declared_types(&program));
+    diags.extend(collect::check_job_fields(&program));
     // From here on the definitions are read-only.
     let p = &program;
     let memory_check = |f: ty::FnId| {
@@ -197,8 +220,11 @@ fn check(
                 hidden.push((f, h));
             }
             // The memory checker needs a well-typed, whole body; it would only add noise
-            // otherwise.
-            if typed && !incomplete {
+            // otherwise. A `@fieldwise` trait's walk has no memory IR of its own: each type that
+            // declares the trait has it unrolled, and that's checked (`trait.fieldwise-walk`).
+            let walk = matches!(p.func(f).owner, defs::FnOwner::Trait(t) if p.trait_(t).fieldwise)
+                && fieldwise::walks_fields(p, f);
+            if typed && !incomplete && !walk {
                 let (m, d) = mir::build::build(p, &consts, f, &b);
                 diags.extend(d);
                 if memory_check(f) {

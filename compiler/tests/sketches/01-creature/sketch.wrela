@@ -23,8 +23,7 @@ use std::arena::Arena
 use std::derive::Box3
 use std::serialize::Serialize
 use std::field::{
-    Blend, Cat, Color, Field, Lipschitz, Surface, cat, ellipsoid, fbm, half_space, rgb, round_cone,
-    value_noise,
+    Blend, Cat, Color, Field, cat, ellipsoid, fbm, half_space, rgb, round_cone, value_noise,
 }
 use std::hash::StateHash
 use std::units::{cm, kg, m, mm}
@@ -108,7 +107,7 @@ fn dapple(p: vec3, s: Seed) -> Color {
 ///   grazer. In the chest's space the noise would see points shifted by the chest's position,
 ///   and with its offsets near 100 m, rounding would move it by up to about 2e-5 m.
 /// - The kinds are gone (Q8): its `lipschitz` exceeds 1 and says so; `assert` checks it.
-fn torso(chest: vec3, bulk: f32, size: f32, bark: vec3, s: Seed) -> Field<Tissue> + Lipschitz {
+fn torso(chest: vec3, bulk: f32, size: f32, bark: vec3, s: Seed) -> Field<Tissue> {
     let r = size * bulk
     ellipsoid(radii: vec3(0.42m, 0.48m, 0.80m) * r)
         .translate(chest + vec3(0, 5cm, -15cm) * size)
@@ -125,12 +124,12 @@ fn torso(chest: vec3, bulk: f32, size: f32, bark: vec3, s: Seed) -> Field<Tissue
 /// The neck, spanning its whole chain from the chain's first bone.
 ///
 /// Changed: the sketch called `neck_tube` without writing it; this is spike 01's round cone.
-fn neck_tube(span: vec3, r_base: f32, r_tip: f32) -> Field<Tissue> + Lipschitz {
+fn neck_tube(span: vec3, r_base: f32, r_tip: f32) -> Field<Tissue> {
     round_cone(vec3(), span, r_base, r_tip).with(HIDE)
 }
 
 /// The head, in its bone's space. (The sketch's `head(seed)`, written; spike 01's numbers.)
-fn head(size: f32) -> Field<Tissue> + Lipschitz {
+fn head(size: f32) -> Field<Tissue> {
     ellipsoid(radii: vec3(12cm, 15cm, 24cm) * size)
         .translate(vec3(0, -4cm, 10cm) * size)
         .smooth_union(
@@ -146,7 +145,7 @@ fn head(size: f32) -> Field<Tissue> + Lipschitz {
 }
 
 /// The tail, spanning its chain. (The sketch's `tail()`, written; spike 01's numbers.)
-fn tail(span: vec3, size: f32) -> Field<Tissue> + Lipschitz {
+fn tail(span: vec3, size: f32) -> Field<Tissue> {
     round_cone(vec3(), span, 7cm * size, 2.5cm * size).with(HIDE)
 }
 
@@ -154,7 +153,7 @@ fn tail(span: vec3, size: f32) -> Field<Tissue> + Lipschitz {
 ///
 /// Changed: a segment runs to its next joint (`seg.end`), not straight down `-y`: bones have
 /// no rotation at rest, and spike 01's legs bend.
-fn leg_segment(end: vec3, r_top: f32, r_bottom: f32) -> Field<Tissue> + Lipschitz {
+fn leg_segment(end: vec3, r_top: f32, r_bottom: f32) -> Field<Tissue> {
     round_cone(vec3(), end, r_top, r_bottom).with(HIDE)
 }
 
@@ -163,7 +162,7 @@ fn leg_segment(end: vec3, r_top: f32, r_bottom: f32) -> Field<Tissue> + Lipschit
 /// Changed: the sole's half-space faces down, keeping what's above it (`dot(p, n) < offset`);
 /// the sketch's faced up, which kept only the cone's tip below the sole. Sizes scale with the
 /// individual, as spike 01's do.
-fn hoof(size: f32) -> Field<Tissue> + Lipschitz {
+fn hoof(size: f32) -> Field<Tissue> {
     round_cone(vec3(), vec3(y: -8cm * size), r_top: 6cm * size, r_bottom: 7cm * size)
         .intersect(half_space(normal: vec3(y: -1), offset: 7cm * size)) // flat sole
         .with(HOOF)

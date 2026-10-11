@@ -46,6 +46,13 @@ pub trait Ord: Eq {
 
 // The leaves: numbers and `bool` compare as the operators do.
 
+/// `()` equals itself: a key for what's cooked from nothing (`std::cache::Stale<()>`).
+impl Eq for () {
+    fn eq(self, other: ()) -> bool {
+        true
+    }
+}
+
 impl Eq for bool {
     fn eq(self, other: bool) -> bool {
         self == other

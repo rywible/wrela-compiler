@@ -58,6 +58,12 @@ pub fn apply_edits<'e>(text: &str, edits: impl IntoIterator<Item = &'e Edit>) ->
 pub struct Fix {
     pub message: String,
     pub edits: Vec<Edit>,
+    /// Whether making it is the author's choice: it changes what the program owns or what it
+    /// costs (`.clone()` copies heap memory; `take` moves a value out of a place), and the only
+    /// fix the compiler can offer isn't always the one meant (an index, `remove`, or a parameter
+    /// that borrows). A tool makes a fix that isn't a choice by itself, and lists one that is
+    /// (`wrela fix`).
+    pub choice: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,7 +145,20 @@ impl Diagnostic {
     }
 
     pub fn with_fix_edits(mut self, message: impl Into<String>, edits: Vec<Edit>) -> Diagnostic {
-        self.fixes.push(Fix { message: message.into(), edits });
+        self.fixes.push(Fix { message: message.into(), edits, choice: false });
+        self
+    }
+
+    /// A fix that replaces `span` with `replacement`, and that's the author's choice
+    /// ([`Fix::choice`]).
+    pub fn with_choice(
+        mut self,
+        message: impl Into<String>,
+        span: Span,
+        replacement: impl Into<String>,
+    ) -> Diagnostic {
+        let edits = vec![Edit { span, replacement: replacement.into() }];
+        self.fixes.push(Fix { message: message.into(), edits, choice: true });
         self
     }
 

@@ -24,3 +24,17 @@ fn takes_more(game: Game, n: u32) { //~ E0222
 @test(frames: 10)
 fn takes_another_type(n: u32) { //~ E0222
 }
+
+// A golden is a GPU frame test's: the screen it's compared with is the GPU's.
+@test(frames: 10, golden: "frame.png") //~ E0222
+fn golden_on_the_cpu() {
+}
+
+// `within` is a mean difference from 0 to 255, beside a golden.
+@test(frames: 10, gpu: true, golden: "frame.png", within: 300.0) //~ E0222
+fn too_far() {
+}
+
+@test(frames: 10, gpu: true, within: 1.0) //~ E0222
+fn within_nothing() {
+}

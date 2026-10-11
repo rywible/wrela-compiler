@@ -15,15 +15,15 @@ use sketch::{
 }
 use std::arena::Arena
 use std::audio::{RingReader, RingWriter, play, ring}
-use std::field::Lipschitz
 use std::hash::state_hash
+use std::time::phase
 use std::units::cm
 
 // ---- §2, §4 and §7 as numbers -----------------------------------------------------------------
 
 /// Grazer `id`'s physique: its mass (kg), the number of bones with mass, the capsules' count,
 /// and the first capsule's radius.
-pub fn physique(id: u32) -> vec4 {
+fn physique(id: u32) -> vec4 {
     let p = grazer_physique(grazer(seed(id)))
     var bones = 0
     for m in p.mass.per {
@@ -94,13 +94,13 @@ pub fn init() -> Game {
         )
     }
     let (writer, reader) = ring::<Contact>(64)
-    play(Hooves { bank: bank(), strikes: take reader }, ring_hooves)
+    play(Hooves { bank: bank(), strikes: reader }, ring_hooves)
     let terrain = Terrain { hill: vec3(4, 0, 6), height: 0.8, width: 3.0 }
     Game {
         world: World { terrain, grazers },
         looks,
         frame: Frame::new(),
-        strikes: take writer,
+        strikes: writer,
         ticks: 0,
         planted: 0,
     }
@@ -143,4 +143,20 @@ pub fn world_hash(state: Game) -> u64 {
 /// How many creatures the last frame drew, and how many hooves struck the ground.
 pub fn drawn(state: Game) -> vec2 {
     vec2(f32(state.frame.items.len()), f32(state.planted))
+}
+
+/// Sketch 01 §4: the physique is computed by `@deterministic` code from the field. The mass is
+/// the grazer's volume times its tissue's density (hide 1050 kg/m³, hooves 1300): about a
+/// tonne, a bison's. The 1 cm integration and capsule fit take seconds (two octrees, each about
+/// 60,000 derived intervals of the 20-part creature): far over a spawn's budget, which `wrela
+/// test` shows as the phase's time. The sketch estimated 100,000 cells and left the
+/// measurement to the D-067 spike.
+@test
+@fuel(2 ** 40)
+fn the_physique_is_a_bisons() {
+    phase("physique")
+    let p = physique(1)
+    phase("")
+    assert(p.x > 500.0 && p.x < 2000.0, f"a grazer of {p.x} kg")
+    assert(p.y >= 10.0 && p.z == p.y, f"{p.y} bones with mass, {p.z} capsules")
 }

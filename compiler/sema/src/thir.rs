@@ -179,12 +179,16 @@ pub enum ExprKind {
         fields: Vec<Expr>,
         order: Vec<u32>,
         base: Option<Box<Expr>>,
+        /// Written as a struct literal, `S { .. }`, where a local named moves (§6.1).
+        literal: bool,
     },
     /// A field of the enclosing struct literal that its `..base` supplies.
     FromBase,
     Tuple(Vec<Expr>),
     Array(Vec<Expr>),
     ArrayRepeat(Box<Expr>, u32),
+    /// `[a, b, ..fill]`: the elements, then `fill`, evaluated once, to the length.
+    ArrayFill(Vec<Expr>, Box<Expr>, u32),
     /// A vector or matrix built from components; the type says which.
     Construct(Vec<Expr>),
     /// A scalar conversion to this expression's type.
@@ -356,6 +360,16 @@ pub enum StmtKind {
         mutable: bool,
         body: Block,
     },
+    /// `for f in fields(self)` in a `@fieldwise` trait's method: `var` projects each field of
+    /// `self` in turn, of the trait's field type (`trait.fieldwise-walk`). Only in the trait's
+    /// own body: each type that declares the trait gets the loop unrolled over its fields.
+    ForFields {
+        var: LocalId,
+        mutable: bool,
+        /// `fields(self).rev()`: the last field first.
+        reverse: bool,
+        body: Block,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -515,6 +529,10 @@ impl Expr {
             }
             ExprKind::Tuple(xs) | ExprKind::Array(xs) | ExprKind::Construct(xs) => {
                 xs.iter().for_each(|x| f(Child::Expr(x)))
+            }
+            ExprKind::ArrayFill(xs, fill, _) => {
+                xs.iter().for_each(|x| f(Child::Expr(x)));
+                f(Child::Expr(fill));
             }
             ExprKind::Block(b) => f(Child::Block(b)),
             ExprKind::If { cond, then, else_ } => {

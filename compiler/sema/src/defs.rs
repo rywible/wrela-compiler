@@ -204,19 +204,23 @@ macro_rules! lang_items {
                 )
             }
 
-            /// Whether it's a request to the host for IO, or a line for its console (the `io`
-            /// effect, §6.15).
+            /// Whether it's a request to the host for IO (the `io` effect, §6.15).
             pub fn requests_io(self) -> bool {
                 matches!(
                     self,
                     Lang::StorageReadCommand
                         | Lang::StorageWriteCommand
                         | Lang::FetchCommand
-                        | Lang::PrintCommand
                         | Lang::PostCommand
                         | Lang::Keep
                         | Lang::Kept
                 )
+            }
+
+            /// Whether it's an output the program never reads back: a line for the host's
+            /// console, or a phase of its time (the `trace` effect, §8).
+            pub fn traces(self) -> bool {
+                matches!(self, Lang::PrintCommand | Lang::PhaseCommand)
             }
 
             /// Whether what it gives depends on when the host answers (the `nondet` effect):
@@ -230,6 +234,7 @@ macro_rules! lang_items {
                         | Lang::Limit
                         | Lang::InputTake
                         | Lang::Kept
+                        | Lang::ReadClock
                 )
             }
 
@@ -354,11 +359,14 @@ lang_items! {
     InputTake = "std::mem::take_input",
     Keep = "std::mem::keep_bytes",
     Kept = "std::mem::kept_bytes",
+    ReadClock = "std::mem::read_clock",
     StorageReadCommand = "std::io::storage_read_command",
     StorageWriteCommand = "std::io::storage_write_command",
     FetchCommand = "std::io::fetch_command",
     PrintCommand = "std::io::print_command",
+    PhaseCommand = "std::time::phase_command",
     PostCommand = "std::io::post_command",
+    Shipped = "std::io::Shipped",
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     Atomics = "std::gpu::Atomics",
@@ -518,9 +526,18 @@ pub struct AdtDef {
     /// which the compiler makes. Its generics are the entry point's, and its fields its
     /// parameters that a command binds (`gpu::bound_fields`), in order.
     pub entry: Option<FnId>,
+    /// The fields of a function type (`step: fn(mut W, f32)`), each with the generic parameter
+    /// it's a value of: the last of `generics`, which a use of the type never writes. Where
+    /// the type is a parameter's, the function is generic over them (`fn.fields`).
+    pub fn_fields: Vec<(String, ParamId)>,
 }
 
 impl AdtDef {
+    /// How many of its generic parameters are written where it's named: all but its
+    /// function fields'.
+    pub fn written_generics(&self) -> usize {
+        self.generics.len() - self.fn_fields.len()
+    }
     pub fn is_enum(&self) -> bool {
         matches!(self.kind, AdtKind::Enum(_))
     }
@@ -579,6 +596,9 @@ pub struct TraitDef {
     pub fieldwise: bool,
     /// `@diagnostic("...")`: the message when a type doesn't have it (§7).
     pub diagnostic: Option<String>,
+    /// A `@fieldwise` trait's field: the type of `f` in a method's `for f in fields(self)`,
+    /// any type with the trait (`trait.fieldwise-walk`).
+    pub field_param: Option<ParamId>,
 }
 
 #[derive(Clone, Debug)]
@@ -637,6 +657,18 @@ impl Entry {
 /// The most frames a frame test runs (§10): ten minutes at 60 frames a second.
 pub const MAX_TEST_FRAMES: u32 = 36_000;
 
+/// A GPU frame test's golden (§10): a PNG in the package, by its path, where the path is
+/// written, and how far the screen may be from it: a mean difference, in 8-bit steps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Golden {
+    pub path: String,
+    pub span: Span,
+    pub within: f64,
+}
+
+/// A golden's `within` unless the test says: half an 8-bit step, on average.
+pub const GOLDEN_WITHIN: f64 = 0.5;
+
 #[derive(Clone, Debug, Default)]
 pub struct FnAttrs {
     pub entry: Option<(Entry, Span)>,
@@ -663,6 +695,12 @@ pub struct FnAttrs {
     /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
     /// their readbacks (§10).
     pub test_gpu: bool,
+    /// `@fuel(n)` on a `@test` of code: the work it may do, in place of a test's limit, and
+    /// where it's written (§10).
+    pub fuel: Option<(u64, Span)>,
+    /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
+    /// frames is within a mean difference `m` of that PNG in the package (§10).
+    pub test_golden: Option<Golden>,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
     pub thread_entry: Option<Span>,
@@ -671,6 +709,48 @@ pub struct FnAttrs {
     pub effects: Vec<crate::effects::Effect>,
     /// `@job`: a job, whose body runs over several frames, to each `yield` (§6.18).
     pub job: Option<Span>,
+}
+
+/// What a job's value holds (§6.18): where it stopped, and each local of its memory IR that owns
+/// a value (its body's owned locals, its `take` parameters, and the temporaries a loop or an
+/// expression keeps, such as a range's bound): its fields to the traits derived field by field
+/// (`fn.job-values`), as they're the job's value's fields in lowering.
+#[derive(Clone, Debug, Default)]
+pub struct JobHeld {
+    /// Each local: its name (made unique with `#2`, `#3`, ... where two share one), its index
+    /// in the memory IR, and its type (in the job's generics).
+    pub locals: Vec<(String, u32, TyId)>,
+    /// A hash of the job's code: a saved job loads only into a build whose job is the same,
+    /// since where it stopped is a place in that code.
+    pub code: u64,
+}
+
+impl JobHeld {
+    /// What job `f`'s value holds, from its memory IR.
+    pub fn of(p: &crate::program::Program, f: FnId, body: &crate::mir::Body) -> JobHeld {
+        let mut seen: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+        let mut locals = Vec::new();
+        for (i, d) in body.locals.iter().enumerate() {
+            // A value with nothing in it (`()`, a function named as a value) has no field.
+            let empty =
+                matches!(p.types.kind(d.ty), TyKind::Never | TyKind::Error | TyKind::FnDef(..))
+                    || matches!(p.types.kind(d.ty), TyKind::Tuple(ts) if ts.is_empty());
+            if !d.kind.owns_value() || d.closure.is_some() || empty {
+                continue;
+            }
+            let n = seen.entry(d.name.clone()).or_insert(0);
+            *n += 1;
+            let name = if *n == 1 { d.name.clone() } else { format!("{}#{n}", d.name) };
+            locals.push((name, i as u32, d.ty));
+        }
+        // FNV-1a 64 of the job's text: its signature and its body.
+        let text = p.text(p.func(f).span).unwrap_or("");
+        let mut code: u64 = 0xcbf29ce484222325;
+        for b in text.bytes() {
+            code = (code ^ u64::from(b)).wrapping_mul(0x100000001b3);
+        }
+        JobHeld { locals, code }
+    }
 }
 
 /// What of the program a test runs before it (§10).
@@ -685,7 +765,7 @@ pub enum TestRun {
 /// std's unsafe core (language.md §17, §6.14): the only modules that use `unsafe`, and the
 /// only ones whose functions may state `@effects` or be a `@thread_entry`.
 pub const UNSAFE_CORE: &[&str] =
-    &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff"];
+    &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff", "time"];
 
 #[derive(Clone, Debug)]
 pub struct FnDef {
@@ -767,6 +847,9 @@ pub struct ConstDef {
     pub eval: FnId,
     /// Whether it's a parameter's or field's default (named by `name`), not a `const` item.
     pub default: bool,
+    /// The fuel its computation may use, if its declaration sets it (`@fuel(n)`, §10): in place
+    /// of the build's limit.
+    pub fuel: Option<u64>,
 }
 
 impl ConstDef {

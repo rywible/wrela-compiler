@@ -1,0 +1,16 @@
+// accepts: ty.array-fill
+struct Land: Copy {
+    hills: [vec4; 8],
+}
+
+// Two hills, then six of nothing: the length is the field's.
+const LAND = Land { hills: [vec4(1.0, 2.0, 30.0, 4.0), vec4(5.0, 6.0, 70.0, 8.0), ..vec4(0.0)] }
+
+fn zeros() -> [u32; 4] {
+    [..0]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let xs: [f32; 3] = [time, ..1.0]
+    let _ = xs[2] + LAND.hills[7].x + f32(zeros()[3])
+}

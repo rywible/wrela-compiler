@@ -1,0 +1,58 @@
+// The clock (M6): how long the program's work takes, read while it runs. It's `nondet` (§8): what
+// it reads depends on the machine and when the code runs, so `@deterministic` code, a constant
+// and a test can't read it (D-052). A simulation takes its time as data, a tick's length.
+//
+// Timing work is an output instead (`phase`): the host reads the clock, and the program never
+// reads what it read, so a constant, a test and `@deterministic` code time their phases too.
+//
+// The hosts give it through `wrela.clock` (runtime/abi): seconds on the host's clock, an `f64`
+// that never goes back, the same clock on every thread. Where it starts is the host's: a time is
+// for comparing with another time the program read.
+
+use std::abi::CLOCK
+use std::mem::{read, read_clock, thread_block}
+
+/// Seconds on the host's clock, which never goes back: for timing a phase of work, `let t =
+/// now()` before it and `since(t)` after.
+pub fn now() -> f64 {
+    unsafe {
+        let at = thread_block() + CLOCK
+        read_clock(at)
+        read::<f64>(at)
+    }
+}
+
+/// The seconds since `start` (a time `now` gave), as an `f32`: a phase's length, for a report.
+pub fn since(start: f64) -> f32 {
+    f32(now() - start)
+}
+
+/// Starts phase `name` of this thread's work: the time from here to the thread's next `phase`,
+/// or to the end of what the host called (a frame, a tick, a constant, a test), counts under
+/// `name`, summed over every time it's timed. An empty name times nothing until the next.
+///
+/// The host reads the clock and reports the sums, and the program never reads them: it's the
+/// `trace` effect, as a line printed is (§8). `wrela build` shows each constant's phases,
+/// `wrela test` each test's, and the native host a program's when it ends; the browser host
+/// times none (a page has its browser's profiler).
+///
+/// ```wrela
+/// use std::time::phase
+///
+/// fn history(years: u32) -> u32 {
+///     var trees = 0
+///     for y in 0..years {
+///         phase("growth")
+///         trees += y % 7
+///         phase("census")
+///         trees -= trees / 100
+///     }
+///     trees
+/// }
+/// ```
+pub fn phase(name: str) {
+    phase_command(name)
+}
+
+@intrinsic
+fn phase_command(name: str) {}

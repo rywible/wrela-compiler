@@ -52,11 +52,15 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(ur
 
 /**
  * Where a program in this browser keeps its requests' bytes: `Fetch` reads a file of the build
- * at `base`, and storage is the origin's private file system, under `wrela/` and the build's
- * path (so two games on one origin don't share it). Paths are checked before they get here
- * (`pathProblem`).
+ * at `files` (the page's build, `base`, unless a hot reload swapped another in), and storage is
+ * the origin's private file system, under `wrela/` and the page's path (so two games on one
+ * origin don't share it). Paths are checked before they get here (`pathProblem`).
  */
-export function browserIo(base: string, fetchFn: Fetch = (url, init) => fetch(url, init)): Io {
+export function browserIo(
+  base: string,
+  fetchFn: Fetch = (url, init) => fetch(url, init),
+  files: string = base,
+): Io {
   const root = ["wrela", ...new URL(base).pathname.split("/").filter((p) => p !== "")];
   const dir = async (parts: string[], create: boolean) => {
     let d = await navigator.storage.getDirectory();
@@ -70,7 +74,7 @@ export function browserIo(base: string, fetchFn: Fetch = (url, init) => fetch(ur
   };
   return {
     async fetch(url) {
-      const response = await get(fetchFn, new URL(url, base));
+      const response = await get(fetchFn, new URL(url, files));
       return new Uint8Array(await response.arrayBuffer());
     },
     async storageRead(path) {

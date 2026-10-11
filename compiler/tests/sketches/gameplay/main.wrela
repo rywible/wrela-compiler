@@ -185,7 +185,7 @@ pub fn init() -> Game {
             pos: vec3(0.0),
             health: 80.0,
             max_carry: 40.0,
-            bag: take bag,
+            bag,
             worn: [None; 6],
         },
         flags: Flags::new(),
@@ -193,9 +193,9 @@ pub fn init() -> Game {
         quests: fresh(),
         timers: engine::timers::Timers::new(),
         events: Vec::new(),
-        gates: take gates,
-        levers: take levers,
-        pickups: take pickups,
+        gates,
+        levers,
+        pickups,
     }
     var steps: Vec<Step> = Vec::new()
     steps.push(Step::Escape)
@@ -236,7 +236,7 @@ pub fn init() -> Game {
         world,
         menus,
         renderer: Renderer::new(fonts),
-        ui: take ui,
+        ui,
         script: Script { steps, at: 0, phase: 0, waited: 0, stuck: 0 },
     }
 }
@@ -254,7 +254,7 @@ pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
         input,
     )
     state.ui.end()
-    tick(mut state.world, TickInput { commands: take cmds, dt: 1.0 / 60.0 })
+    tick(mut state.world, TickInput { commands: cmds, dt: 1.0 / 60.0 })
     state.renderer.upload(state.ui.draw)
     let screen_pass = begin_screen_pass(clear: vec4(0.2, 0.25, 0.2, 1.0))
     state.renderer.draw(screen_pass, screen)

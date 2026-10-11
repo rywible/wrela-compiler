@@ -1,0 +1,35 @@
+// A walk over `fields(self)` the compiler can't unroll: one outside a `@fieldwise` trait's
+// methods, where no type declares what its fields have, or one that holds a closure (the walk's
+// body is written again for each field, each of its own type). A walk is the fields one after
+// another: use `return` to leave the method part way.
+// ---- wrong
+trait Total {
+    fn total(self) -> u32 {
+        var n = 0
+        for part in fields(self) {
+            n += 1
+        }
+        n
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+@fieldwise
+trait Total {
+    fn total(self) -> u32 {
+        var n = 0
+        for part in fields(self) {
+            n += part.total()
+        }
+        n
+    }
+}
+
+impl Total for f32 {
+    fn total(self) -> u32 {
+        1
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

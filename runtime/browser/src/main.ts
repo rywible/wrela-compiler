@@ -118,6 +118,33 @@ async function sendKeyPresses(n: number, ms: number): Promise<void> {
   }
 }
 
+/** Test mode, `clip`: the canvas recorded (MediaRecorder, VP9), from `clip-start` to
+ * `clip-stop`, then saved as `results/clip.webm`. */
+class Clip {
+  private recorder: MediaRecorder | null = null;
+  private readonly chunks: Blob[] = [];
+
+  start(canvas: HTMLCanvasElement): void {
+    const stream = canvas.captureStream(60);
+    const mimeType = ["video/webm;codecs=vp9", "video/webm"].find((t) => MediaRecorder.isTypeSupported(t)) ?? "";
+    this.recorder = new MediaRecorder(stream, { mimeType, videoBitsPerSecond: 16_000_000 });
+    this.recorder.ondataavailable = (e) => this.chunks.push(e.data);
+    this.recorder.start(1000);
+  }
+
+  /** Stops the recording and saves it (none if it never started). */
+  async save(): Promise<void> {
+    const r = this.recorder;
+    if (r === null) throw new Error("the clip was never started (clipfrom past the test's frames?)");
+    this.recorder = null;
+    const stopped = new Promise<void>((resolve) => (r.onstop = () => resolve()));
+    r.stop();
+    await stopped;
+    const bytes = await new Blob(this.chunks, { type: "video/webm" }).arrayBuffer();
+    await putResult(document.baseURI, "clip.webm", bytes);
+  }
+}
+
 function start(): void {
   const testing = isLoopback(location.hostname) && asksForTest(location.hash);
   try {
@@ -137,6 +164,7 @@ function start(): void {
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
     const ring = InputRing.create();
+    const clip = new Clip();
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
       if (msg.type === "audio") {
@@ -145,6 +173,17 @@ function start(): void {
         worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded(["navigation", "resource"]) } satisfies ToWorker);
       } else if (msg.type === "reload") {
         location.reload();
+      } else if (msg.type === "clip-start") {
+        try {
+          clip.start(canvas);
+        } catch (e) {
+          failEarly(e, testing);
+        }
+      } else if (msg.type === "clip-stop") {
+        clip.save().then(
+          () => worker.postMessage({ type: "clip-saved" } satisfies ToWorker),
+          (e: unknown) => failEarly(e, testing),
+        );
       } else if (msg.type === "latency-start") {
         const sent = test?.keylatency ? sendKeyPresses(test.keylatency, msg.ms) : sendLatencyEvents(canvas, test?.latency ?? 0, msg.ms);
         sent.then(
@@ -166,7 +205,8 @@ function start(): void {
     const sized = { width, height };
     listen(canvas, ring, epochNow, () => sized);
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
-    const live = document.querySelector('meta[name="wrela-live"]') !== null;
+    const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
+    const live = mark === null ? null : Number(mark.content ?? "0") || 0;
     const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer, live };
     worker.postMessage(msg, [offscreen]);
     if (!test) {

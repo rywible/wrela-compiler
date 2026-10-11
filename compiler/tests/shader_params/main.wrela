@@ -29,7 +29,7 @@ pub fn init() -> State {
     write(mut scale, 0, [1.0])
     var red: GpuBuffer<f32> = buffer(1)
     write(mut red, 0, [0.25])
-    State { scale: take scale, red: take red }
+    State { scale, red }
 }
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {

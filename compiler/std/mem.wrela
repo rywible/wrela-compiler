@@ -118,6 +118,11 @@ pub fn take_input(addr: u32, cap: u32) -> u32 {}
 @intrinsic
 pub fn keep_bytes(bytes: [u8]) {}
 
+/// Writes the seconds on the host's clock to `addr`, an `f64` that never goes back
+/// (`wrela.clock`).
+@intrinsic
+pub fn read_clock(addr: u32) {}
+
 /// Copies up to `cap` of the bytes the build this one replaced kept to `addr`
 /// (`wrela.kept`): how many it kept, all of them, which may be more than `cap`.
 @intrinsic

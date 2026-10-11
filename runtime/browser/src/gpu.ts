@@ -886,7 +886,6 @@ export class GpuExecutor {
       case "StorageRead":
       case "StorageWrite":
       case "Fetch":
-      case "Log":
         return;
     }
   }

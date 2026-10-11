@@ -1,0 +1,16 @@
+// rejects: eff.clock
+// Reading the clock is `nondet`: `@deterministic` code takes its time as data, a tick's length.
+use std::time::{now, since}
+
+@deterministic
+fn stamp() -> f64 {
+    now() //~ E0600
+}
+
+@deterministic
+fn elapsed(start: f64) -> f32 {
+    since(start) //~ E0600
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+}

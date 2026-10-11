@@ -17,7 +17,7 @@ const PROGRAM: &str = "use engine::creature::crease
 use engine::digits::{Digits, digits}
 use engine::sweep::{Section, Sweep, round, section, sweep}
 use std::derive::{Box3, gradient, interval}
-use std::field::{Lipschitz, Surface}
+use std::field::Surface
 use std::math::{PI, TAU}
 
 /// Round sections 0.1 from a straight path along z from -0.2 to 0.3: a capped cylinder.

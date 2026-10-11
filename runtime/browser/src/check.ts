@@ -268,7 +268,6 @@ export class Checker {
         if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
         return;
       }
-      case "Log":
       case "Label":
         return;
     }

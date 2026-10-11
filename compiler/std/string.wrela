@@ -200,7 +200,7 @@ impl String {
         if !is_utf8(bytes) {
             return None
         }
-        Some(String { bytes: take bytes })
+        Some(String { bytes })
     }
 }
 

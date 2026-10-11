@@ -102,6 +102,11 @@ impl ImplicitParams {
     }
 
     fn add(&mut self, def: ParamDef) -> ParamId {
+        self.add_def(def)
+    }
+
+    /// A parameter of the signature's own: a `take` parameter's function type's.
+    pub fn add_def(&mut self, def: ParamDef) -> ParamId {
         self.defs.push(def);
         ParamId(self.first + self.defs.len() as u32 - 1)
     }
@@ -679,9 +684,9 @@ pub fn resolve_type(
             // Only a written type; a body's inferred types are checked once it's finished.
             if !matches!(pos, TyPos::Param(_) | TyPos::FnBound) {
                 diags.push(
-                    Diagnostic::new(codes::E0510, te.span, "a function type can only be a parameter's type")
-                        .with_note("a closure that captures only values can be stored, but its type is its own and inferred (§6.7)")
-                        .with_help("to keep work for later, store an enum of actions and `match` on it"),
+                    Diagnostic::new(codes::E0510, te.span, "a function type can only be a parameter's type or a struct field's")
+                        .with_note("a struct with a field of a function type is generic over it, and so is a function with a `take` parameter of one (§6.7)")
+                        .with_help("hold it in a struct's field, or keep work for later as an enum of actions you `match` on"),
                 );
                 return p.types.error;
             }
@@ -782,6 +787,25 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
         }
         ast::ExprKind::Path(path) => {
             let name = &path.segments[0].ident.name;
+            if let Some(Res::Adt(a)) = lookup_name(p, module, name) {
+                let def = p.adt(a);
+                return if def.is_enum() {
+                    Diagnostic::new(
+                        codes::E0325,
+                        len.span,
+                        format!("`{name}` can't be an array's length: an enum is one when its variants hold nothing and its discriminants are 0, 1, 2 and on"),
+                    )
+                    .with_note("each variant's discriminant is its element's index (§4)")
+                } else {
+                    Diagnostic::new(
+                        codes::E0325,
+                        len.span,
+                        format!(
+                            "`{name}` is a struct; an array's length is a number, a constant holding one, or an enum (one element a variant)"
+                        ),
+                    )
+                };
+            }
             if lookup_name(p, module, name).is_none() && !is_broken(p, module, name) {
                 return Diagnostic::new(
                     codes::E0200,
@@ -805,6 +829,19 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
         "an array length is an integer literal or a constant holding one",
     )
     .with_note("evaluating expressions at compile time is tier 1")
+}
+
+/// How many variants enum `a` has, when it can be an array's length: its variants hold nothing
+/// and their discriminants are 0, 1, 2 and on, so each is its own element's index.
+pub fn enum_length(p: &Program, a: AdtId) -> Option<u32> {
+    let def = p.adt(a);
+    let dense = def.is_enum()
+        && def
+            .variants()
+            .iter()
+            .enumerate()
+            .all(|(i, v)| v.shape == VariantShape::Unit && v.discriminant == i as u32);
+    dense.then_some(def.variants().len() as u32)
 }
 
 /// The value of an array length: an integer literal, or a constant holding one, resolved in
@@ -833,7 +870,12 @@ fn length(
         }
         ast::ExprKind::Paren(inner) => length(p, module, inner, visiting),
         ast::ExprKind::Path(path) => {
-            let Res::Const(c) = resolve_value_item(p, module, path)? else { return None };
+            let c = match resolve_value_item(p, module, path)? {
+                Res::Const(c) => c,
+                // `[T; E]`: one element for each of an enum's variants (`ty.enum-arrays`).
+                Res::Adt(a) => return enum_length(p, a),
+                _ => return None,
+            };
             if visiting.contains(&c) {
                 return None;
             }
@@ -1035,12 +1077,44 @@ fn resolve_type_path(
             b.ty(&p.types)
         }
         Res::Adt(a) => {
-            let want = p.adt(a).generics.len();
+            let def = p.adt(a);
+            let want = def.written_generics();
             if args.len() != want {
-                diags.push(wrong_generic_count(te.span, &p.adt(a).name, want, args.len()));
+                diags.push(wrong_generic_count(te.span, &def.name, want, args.len()));
                 return p.types.error;
             }
-            p.types.adt(a, args)
+            if def.fn_fields.is_empty() {
+                return p.types.adt(a, args);
+            }
+            // Its function fields' parameters: a parameter's type makes the function generic
+            // over each, bounded by the field's function type (`fn.fields`).
+            let TyPos::Param(implicit) = pos else {
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0410,
+                        te.span,
+                        format!("`{}` holds functions, so it's named here only as a parameter's type", def.name),
+                    )
+                    .with_note("a field of a function type makes its struct generic over the function, and a parameter's type makes the function generic over it, as a trait does (§6.7); a field's or a result's type would need the function written, which nothing names")
+                    .with_help("pass it as a parameter, or build it where it's used"),
+                );
+                return p.types.error;
+            };
+            let written = Subst::from_pairs(&def.generics[..want], &args);
+            let mut all = args;
+            for (field, g) in &def.fn_fields {
+                let bound = p.param(*g).fn_bound.map(|b| p.types.subst(b, &written));
+                let id = implicit.add(ParamDef {
+                    name: format!("{}.{field}", def.name),
+                    bounds: Vec::new(),
+                    span: te.span,
+                    is_self: false,
+                    is_const: false,
+                    fn_bound: bound,
+                });
+                all.push(p.types.param(id));
+            }
+            p.types.adt(a, all)
         }
         Res::Alias(a) => {
             let def = &p.aliases[a.index()];

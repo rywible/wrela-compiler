@@ -1,4 +1,5 @@
-// Sketch 01's creature against M1's tier-0 grazer (compiler/tests/tests/suite/sketches.rs).
+// Sketch 01's creature against M1's tier-0 grazer: `wrela test` (the suite's
+// `the_programs_own_tests_pass`).
 
 use engine::creature::Creature
 use engine::rng::seed
@@ -17,7 +18,7 @@ fn mix(x: u64) -> u64 {
 
 /// The largest difference between this grazer's distance and M1's, at `n` points in a box
 /// around it (its bounds, grown by 30 cm), and how many of them are within 1 cm of the surface.
-pub fn max_gap(id: u32, n: u32) -> vec2 {
+fn max_gap(id: u32, n: u32) -> vec2 {
     let ours = grazer(seed(id)).field()
     let theirs = m1::grazer::grazer(id)
     let b = m1::grazer::bounds(m1::grazer::params(id))
@@ -41,3 +42,15 @@ pub fn max_gap(id: u32, n: u32) -> vec2 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}
+
+/// Sketch 01's creature is M1's tier-0 grazer (compiler/tests/fields/grazer.wrela), built the
+/// sketch's way: a skeleton, parts in bone space, `.blend(k)`. Their distances agree within
+/// 1e-5 m at 10⁶ points around three individuals.
+@test
+fn the_creature_is_m1s_grazer() {
+    for id in [1, 2, 7] {
+        let g = max_gap(id, 1000000 / 3 + 1)
+        assert(g.x <= 1.0e-5, f"grazer {id}: the distances differ by {g.x} m")
+        assert(g.y > 1000.0, f"grazer {id}: only {g.y} points near the surface")
+    }
+}

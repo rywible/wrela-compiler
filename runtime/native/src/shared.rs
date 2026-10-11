@@ -15,7 +15,7 @@ use wasmtime::SharedMemory;
 
 /// Bytes `at..at + len`, if they're inside the memory: read in place, so only while no other
 /// thread writes them (above).
-pub(crate) fn slice(m: &SharedMemory, at: usize, len: usize) -> Option<&[u8]> {
+pub fn slice(m: &SharedMemory, at: usize, len: usize) -> Option<&[u8]> {
     let data = m.data();
     let end = at.checked_add(len).filter(|&e| e <= data.len())?;
     let cells = &data[at..end];
@@ -30,7 +30,7 @@ pub(crate) fn read(m: &SharedMemory, at: usize, len: usize) -> Option<Vec<u8>> {
 }
 
 /// Writes `bytes` at `at`: whether they fit.
-pub(crate) fn write(m: &SharedMemory, at: usize, bytes: &[u8]) -> bool {
+pub fn write(m: &SharedMemory, at: usize, bytes: &[u8]) -> bool {
     let data = m.data();
     let Some(end) = at.checked_add(bytes.len()).filter(|&e| e <= data.len()) else {
         return false;
@@ -74,4 +74,9 @@ pub(crate) fn or_u32(m: &SharedMemory, at: u32, bits: u32) {
 /// Adds `v` to the word at `at` atomically.
 pub(crate) fn add_u32(m: &SharedMemory, at: u32, v: u32) {
     word(m, at as usize).fetch_add(v, Ordering::SeqCst);
+}
+
+/// Stores `new` at `at` atomically if the word there is `expected`: whether it did.
+pub(crate) fn cas_u32(m: &SharedMemory, at: u32, expected: u32, new: u32) -> bool {
+    word(m, at as usize).compare_exchange(expected, new, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 }

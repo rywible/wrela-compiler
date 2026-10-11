@@ -1,0 +1,10 @@
+// mistake: printing from the audio thread
+// expect: E0600
+// fix: no
+use std::io::print
+
+@audio
+fn render(phase: mut f32, out: mut [f32]) {
+    print("a quantum")
+    phase += 0.01
+}

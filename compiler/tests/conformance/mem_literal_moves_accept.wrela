@@ -1,0 +1,24 @@
+// accepts: mem.literal-moves
+struct Log {
+    lines: Vec<u32>,
+}
+
+struct Archive {
+    log: Log,
+    count: u32,
+}
+
+// The literal moves `log`, and `..old` moves the fields it gives: no `take` is written.
+fn archive(count: u32) -> Archive {
+    let log = Log { lines: Vec::new() }
+    Archive { log, count }
+}
+
+fn renumbered(old: take Archive) -> Archive {
+    Archive { count: old.count + 1, ..old }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let a = renumbered(archive(1))
+    let _ = a.count
+}

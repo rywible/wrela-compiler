@@ -232,6 +232,9 @@ impl Watcher {
 
 // ---- the server ---------------------------------------------------------------------------------
 
+/// The browser runtime's scripts a build holds, the same in every build.
+const RUNTIME_SCRIPTS: [&str; 3] = ["main.js", "worker.js", "worklet.js"];
+
 /// A change as the page gets it, numbered (its `seq`, from 1: its place in [`Live::events`]).
 struct Event {
     json: serde_json::Value,
@@ -265,6 +268,20 @@ struct Live {
     version: u64,
     events: Vec<Event>,
     shown: Vec<Shown>,
+    /// How many long polls pages have made: a page asks as soon as it runs.
+    polls: u64,
+}
+
+impl Live {
+    /// The number (`seq`) of the change that made build `version`; 0 for the first build. A
+    /// page of that build holds every change up to it.
+    fn built_at(&self, version: u64) -> u64 {
+        let base = format!("/{version}/");
+        self.events
+            .iter()
+            .position(|e| e.json["kind"] == "build" && e.json["base"] == base.as_str())
+            .map_or(0, |i| i as u64 + 1)
+    }
 }
 
 /// A running `wrela run` server: its port, and its threads, which stop when it's dropped.
@@ -285,6 +302,13 @@ impl Server {
     /// Each change the page has shown so far.
     pub fn shown(&self) -> Vec<Shown> {
         self.state.live.lock().expect("the state").shown.clone()
+    }
+
+    /// How many times pages have asked for changes (`/live/next`): one is running once it's
+    /// asked (a test edits after that, so the page sees its edits as changes, not as part of
+    /// the build it loaded).
+    pub fn polls(&self) -> u64 {
+        self.state.live.lock().expect("the state").polls
     }
 
     /// The changes so far, as the page gets them.
@@ -327,6 +351,7 @@ pub fn serve(
             version: watcher.version(),
             events: Vec::new(),
             shown: Vec::new(),
+            polls: 0,
         }),
         changed: Condvar::new(),
     });
@@ -375,7 +400,24 @@ pub fn serve(
 }
 
 /// What `/` and a build's `index.html` get: the mark that tells the runtime the page is live.
-const MARK: &str = r#"<meta name="wrela-live" content="1">"#;
+/// What marks a served page as live: the changes it already holds (the newest build's, and the
+/// literals before it), after which it asks for more, and the build's directory, which its
+/// files are fetched from. A page opened after hot reloads starts from the newest build, not from
+/// the server's first change (playing spike 17: it replayed old builds' changes and asked for a
+/// build the server had deleted, `/2/manifest.json`, 404).
+fn mark(seq: u64, version: u64) -> String {
+    format!(r#"<meta name="wrela-live" content="{seq}"><base href="/{version}/">"#)
+}
+
+/// The file a PUT of a page's results names: `/results/<file>`, or `/<version>/results/<file>`.
+fn results_file(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix('/')?;
+    let rest = match rest.split_once('/') {
+        Some((v, r)) if v.parse::<u64>().is_ok() => r,
+        _ => rest,
+    };
+    rest.strip_prefix("results/")
+}
 
 /// How long a long poll waits for a change before it answers that there's none.
 const LONG_POLL: Duration = Duration::from_secs(15);
@@ -393,6 +435,7 @@ fn handle(
             let after: u64 = req.param("after").and_then(|v| v.parse().ok()).unwrap_or(0);
             let deadline = Instant::now() + LONG_POLL;
             let mut s = state.live.lock().expect("the state");
+            s.polls += 1;
             while s.events.len() as u64 <= after && !stopping.load(Ordering::SeqCst) {
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
@@ -435,23 +478,41 @@ fn handle(
             }
             http::respond(&mut out, 200, "text/plain", b"")
         }
-        ("PUT", path) if path.starts_with("/results/") => http::put_result(
+        // A page's results, from the server's root or (a page pinned to its build's directory,
+        // `mark`) the build's.
+        ("PUT", path) if results_file(path).is_some() => http::put_result(
             &mut out,
             &state.out.join("results"),
-            &path["/results/".len()..],
+            results_file(path).unwrap_or_default(),
             &req.body,
         ),
         ("GET", path) => {
-            // `/<version>/file` is that build's; any other path, the newest build's.
+            // `/<version>/file` is that build's; any other path, the newest build's. A page is
+            // marked with the changes its build holds (`mark`), read with the build's number.
             let trimmed = path.trim_start_matches('/');
-            let version = state.live.lock().expect("the state").version;
-            let (dir, rel) = match trimmed.split_once('/') {
-                Some((v, rest)) if v.parse::<u64>().is_ok() => (state.out.join(v), rest),
-                _ => (state.out.join(version.to_string()), trimmed),
+            let (version, seq) = {
+                let s = state.live.lock().expect("the state");
+                (s.version, s.events.len() as u64)
+            };
+            let (dir, rel, version, seq) = match trimmed.split_once('/') {
+                // The runtime's own scripts are the same in every build, and a page's threads
+                // start from the script its render worker came from: a build the server has
+                // since deleted (it keeps two) still gives them, from the newest. (A page open
+                // through three hot reloads stopped: its next ticker's script was gone.)
+                Some((v, rest)) if v.parse::<u64>().is_ok() && RUNTIME_SCRIPTS.contains(&rest) => {
+                    (state.out.join(version.to_string()), rest, version, seq)
+                }
+                Some((v, rest)) if v.parse::<u64>().is_ok() => {
+                    let v: u64 = v.parse().unwrap_or(0);
+                    // The change that made build `v`, or none (the first build).
+                    let made = state.live.lock().expect("the state").built_at(v);
+                    (state.out.join(v.to_string()), rest, v, made)
+                }
+                _ => (state.out.join(version.to_string()), trimmed, version, seq),
             };
             let rel = if rel.is_empty() { "index.html" } else { rel };
             http::get_file(&mut out, &dir, rel, |html| {
-                html.replacen("<head>", &format!("<head>{MARK}"), 1)
+                html.replacen("<head>", &format!("<head>{}", mark(seq, version)), 1)
             })
         }
         _ => http::respond(&mut out, 405, "text/plain", b"not allowed"),

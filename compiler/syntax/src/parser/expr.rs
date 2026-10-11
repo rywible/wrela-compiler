@@ -358,6 +358,12 @@ impl<'a> Parser<'a> {
         self.nested(|p| p.parse_expr_inner(ctx))
     }
 
+    /// An array literal's element, and whether it's the fill: `x` or `..x`.
+    fn array_elem(&mut self) -> PResult<(Expr, bool)> {
+        let fill = self.eat(T::DotDot);
+        Ok((self.parse_expr()?, fill))
+    }
+
     fn parse_expr_inner(&mut self, ctx: Ctx) -> PResult<Expr> {
         if ctx == Ctx::Full {
             match self.kind() {
@@ -993,31 +999,55 @@ impl<'a> Parser<'a> {
             }
             T::LBracket => {
                 self.bump();
-                let mut items = Vec::new();
+                // The elements, the last of which may be `..fill` (`[a, b, ..fill]`), or the
+                // value and count of `[x; n]`.
+                let mut elems: Vec<(Expr, bool)> = Vec::new();
                 if !self.at(T::RBracket) {
-                    let first = self.within(T::RBracket, Self::parse_expr)?;
-                    if self.eat(T::Semi) {
+                    let first = self.within(T::RBracket, Self::array_elem)?;
+                    if !first.1 && self.eat(T::Semi) {
                         let count = self.within(T::RBracket, Self::parse_expr)?;
                         self.expect(T::RBracket, "`]`")?;
                         let span = t.span.to(self.prev_span());
                         return Ok(Expr::new(
                             ExprKind::ArrayRepeat {
-                                value: Box::new(first),
+                                value: Box::new(first.0),
                                 count: Box::new(count),
                             },
                             span,
                         ));
                     }
-                    items.push(first);
+                    elems.push(first);
                     if self.eat(T::Comma) {
-                        items.extend(self.list(T::RBracket, Self::parse_expr, |_, _, span| {
-                            Some(Expr::error(span))
+                        elems.extend(self.list(T::RBracket, Self::array_elem, |_, _, span| {
+                            Some((Expr::error(span), false))
                         }));
                     }
                 }
                 self.close_list(T::RBracket, "`,` or `]`");
                 let span = t.span.to(self.prev_span());
-                Ok(Expr::new(ExprKind::Array(items), span))
+                let fill = match elems.iter().position(|e| e.1) {
+                    Some(i) if i + 1 == elems.len() => elems.pop().map(|e| e.0),
+                    Some(i) => {
+                        self.error(
+                            Diagnostic::new(
+                                codes::E0100,
+                                elems[i].0.span,
+                                "the fill `..x` is an array literal's last element",
+                            )
+                            .with_help("write the elements first, then `..fill` once"),
+                        );
+                        None
+                    }
+                    None => None,
+                };
+                let items = elems.into_iter().map(|e| e.0).collect();
+                Ok(Expr::new(
+                    match fill {
+                        Some(f) => ExprKind::ArrayFill { items, fill: Box::new(f) },
+                        None => ExprKind::Array(items),
+                    },
+                    span,
+                ))
             }
             T::LBrace => {
                 let b = self.parse_block()?;
@@ -1363,6 +1393,7 @@ fn let_else_shaped(e: &Expr) -> bool {
                     | ExprKind::Tuple(_)
                     | ExprKind::Array(_)
                     | ExprKind::ArrayRepeat { .. }
+                    | ExprKind::ArrayFill { .. }
             )
         }
     }

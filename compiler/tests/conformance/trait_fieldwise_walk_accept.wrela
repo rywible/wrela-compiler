@@ -1,0 +1,62 @@
+// accepts: trait.fieldwise-walk
+@fieldwise
+trait Parts: Copy {
+    fn count(self) -> u32 {
+        var n = 0
+        for part in fields(self) {
+            n += part.count()
+        }
+        n
+    }
+
+    /// Item `i`'s own value, counted in this list: the walk finds the field that holds it.
+    fn item(self, i: u32) -> f32 {
+        var i = i
+        for part in fields(self) {
+            let n = part.count()
+            if i < n {
+                return part.item(i)
+            }
+            i -= n
+        }
+        0.0
+    }
+
+    /// A fold from the right: the last field first.
+    fn reach(self, near: f32) -> f32 {
+        var r = near
+        for part in fields(self).rev() {
+            r = part.reach(r)
+        }
+        r
+    }
+}
+
+struct Ball: Copy {
+    r: f32,
+}
+
+impl Parts for Ball {
+    fn count(self) -> u32 {
+        1
+    }
+
+    fn item(self, i: u32) -> f32 {
+        self.r
+    }
+
+    fn reach(self, near: f32) -> f32 {
+        near + self.r
+    }
+}
+
+struct Pair: Copy + Parts {
+    a: Ball,
+    b: Ball,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let pair = Pair { a: Ball { r: 1.0 }, b: Ball { r: 2.0 } }
+    let all = (pair, [Ball { r: 3.0 }, Ball { r: 4.0 }])
+    let _ = all.count() + u32(all.item(3)) + u32(all.reach(1.0))
+}

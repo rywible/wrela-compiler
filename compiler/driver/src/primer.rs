@@ -32,8 +32,16 @@ pub const RULES: &[(&str, &str)] = &[
     ("fn.return-trait", "a trait in return position names one inferred concrete type"),
     ("fn.values", "a named function is a value, and so is a type's associated function: `W::work`"),
     (
+        "fn.fields",
+        "a struct's field of a function type, or a `take` parameter of one, makes the struct or the function generic over it",
+    ),
+    (
         "fn.jobs",
         "a `@job fn` runs over several frames, to each `yield`: `f.start(...)` takes its `take` parameters, `job.resume(...)` its `borrow` and `mut` ones",
+    ),
+    (
+        "fn.job-values",
+        "a job's value is `Clone`, `StateHash` and `Serialize` when the locals it holds are, so a simulation's state can hold one",
     ),
     ("struct.defaults", "struct fields may have constant defaults a literal may omit"),
     ("struct.opt-in", "a struct opts in to Copy, Clone and GpuData in its declaration"),
@@ -57,6 +65,10 @@ pub const RULES: &[(&str, &str)] = &[
         "trait.fieldwise",
         "a `@fieldwise` trait is derived field by field for each type that declares it",
     ),
+    (
+        "trait.fieldwise-walk",
+        "a `@fieldwise` trait's method can walk `for f in fields(self)`: derived from that body, the walk unrolled over each declaring type's fields",
+    ),
     ("trait.eq-ord", "`==` and `<` come from declared `Eq` and `Ord`"),
     (
         "trait.sets",
@@ -65,6 +77,10 @@ pub const RULES: &[(&str, &str)] = &[
     (
         "const.build",
         "the build computes a `const`; a panic, a trap or running past its fuel is an error",
+    ),
+    (
+        "const.fuel",
+        "`@fuel(n)` on a `const` sets the work its computation may do, its threads' together",
     ),
     ("const.places", "a constant is a place: read and projected, never moved out of or changed"),
     (
@@ -83,6 +99,14 @@ pub const RULES: &[(&str, &str)] = &[
     ("ty.cpu-only", "f64, i64, u64 and the small integers are CPU only"),
     ("ty.vectors", "vectors and matrices: constructors and swizzles"),
     ("ty.arrays", "fixed-size arrays `[T; N]` with constant lengths"),
+    (
+        "ty.enum-arrays",
+        "`[T; E]` has an element for each variant of an enum numbered 0, 1, 2 and on, indexed by it",
+    ),
+    (
+        "ty.array-fill",
+        "`[a, b, ..fill]` fills an array to the length its type gives, with a `Copy` fill",
+    ),
     (
         "ty.opaque-alias",
         "an alias that names traits names the type the first function in its module to return it returns",
@@ -111,6 +135,10 @@ pub const RULES: &[(&str, &str)] = &[
     // §6 memory
     ("mem.copy", "Copy types copy implicitly; other values move only with `take`"),
     ("mem.take", "moving out of a named place is `take`; a moved value can't be used"),
+    (
+        "mem.literal-moves",
+        "a struct literal moves an owned local it names, without `take`; a use after it is a use after a move",
+    ),
     ("mem.clone", "deep copies are `.clone()` of a `Clone` type"),
     ("mem.modes", "`mut` and `take` parameters are marked at the call site"),
     ("mem.receivers", "a `mut self` call isn't marked; a `take self` call on a named place is"),
@@ -151,6 +179,11 @@ pub const RULES: &[(&str, &str)] = &[
     ),
     ("eff.derived", "a derived interpretation needs a function with no host effect"),
     ("eff.input", "reading input is `nondet`, so `@deterministic` code takes events as data"),
+    ("eff.clock", "reading the clock is `nondet`, so `@deterministic` code takes its time as data"),
+    (
+        "eff.trace",
+        "a line printed or a phase timed is `trace`: everywhere but GPU, `@audio` and derived code",
+    ),
     (
         "eff.requests",
         "`@deterministic` code neither makes requests (`io`) nor polls them (`nondet`)",

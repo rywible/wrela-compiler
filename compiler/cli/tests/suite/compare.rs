@@ -6,9 +6,9 @@ use crate::common;
 
 use std::path::{Path, PathBuf};
 
-const BALL: &str = "use std::field::{Lipschitz, sphere}
+const BALL: &str = "use std::field::{Surface, sphere}
 
-pub fn subject() -> Lipschitz {
+pub fn subject() -> Surface {
     sphere(0.30).translate(vec3(0.0, 0.30, 0.0))
 }
 ";

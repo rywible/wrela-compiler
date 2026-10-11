@@ -8,6 +8,9 @@
 //! Version 2: an internal compiler error (`"internal": true`, code `I0001`) has `null` for
 //! `file`, `span` and `label`; every other diagnostic has all three, as in version 1.
 //!
+//! A fix that's the author's choice (it changes what the program owns or costs, such as
+//! `.clone()`) has `"choice": true`; a tool makes a fix without it by itself.
+//!
 //! ```json
 //! {"version": 2, "diagnostics": [{
 //!   "code": "E0500", "severity": "error", "title": "a use of a moved value", "internal": false,
@@ -54,14 +57,18 @@ pub fn diagnostic_json(map: &SourceMap, d: &Diagnostic) -> Value {
         .fixes
         .iter()
         .map(|f| {
-            json!({
+            let mut v = json!({
                 "message": f.message,
                 "edits": f.edits.iter().map(|e| json!({
                     "file": map.file(e.span.file).name,
                     "start": e.span.start, "end": e.span.end,
                     "replacement": e.replacement,
                 })).collect::<Vec<_>>(),
-            })
+            });
+            if f.choice {
+                v["choice"] = Value::Bool(true);
+            }
+            v
         })
         .collect();
     let (file, span, label) = match &d.primary {

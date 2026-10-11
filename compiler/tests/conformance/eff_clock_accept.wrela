@@ -1,0 +1,19 @@
+// accepts: eff.clock
+// The clock is read outside `@deterministic` code: how long a phase of the program's work took.
+use std::io::print
+use std::time::{now, since}
+
+@deterministic
+fn work(n: u32) -> u32 {
+    var s: u32 = 0
+    for i in 0..n {
+        s = s.wrapping_add(i * i)
+    }
+    s
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let t = now()
+    let s = work(1000)
+    print(f"{s} in {since(t) * 1000.0:.3} ms")
+}

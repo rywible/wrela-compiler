@@ -17,46 +17,8 @@ fn vec2_of(v: &[Value]) -> [f32; 2] {
     }
 }
 
-/// Sketch 01's creature is M1's tier-0 grazer (compiler/tests/fields/grazer.wrela), built the
-/// sketch's way: a skeleton, parts in bone space, `.blend(k)`. Their distances agree within
-/// 1e-5 m at 10⁶ points around each of three individuals.
-#[test]
-fn sketch_01s_creature_is_m1s_grazer() {
-    let mut host = cpu("sketches/01-check");
-    for id in [1, 2, 7] {
-        let n = 1_000_000 / 3 + 1;
-        let r = host.call_export("max_gap", &[Value::I32(id), Value::I32(n)]).expect("max_gap");
-        let [gap, near] = vec2_of(&r);
-        println!(
-            "grazer {id}: {n} points ({near} within 1 cm of the surface), largest gap {gap:e} m"
-        );
-        assert!(gap <= 1e-5, "grazer {id}: the distances differ by {gap} m");
-        assert!(near > 1000.0, "grazer {id}: only {near} points near the surface");
-    }
-}
-
 fn one(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
     host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}"))
-}
-
-/// Sketch 01 §4: the physique is computed by `@deterministic` code from the field. The mass is
-/// the grazer's volume times its tissue's density (hide 1050 kg/m³, hooves 1300): about a
-/// tonne, a bison's. Measured: the 1 cm integration and capsule fit take about 10 s in
-/// wasmtime (two octrees, each about 60,000 derived intervals of the 20-part creature, at about
-/// 17 µs each): far over a spawn's budget. The sketch estimated 100,000 cells and left the
-/// measurement to the D-067 spike.
-#[test]
-fn sketch_01s_physique() {
-    let mut host = cpu("sketches/01-creature");
-    let started = std::time::Instant::now();
-    let [mass, bones, capsules, radius] =
-        wrela_tests::one_vec4(&mut host, "physique", &[Value::I32(1)]);
-    println!(
-        "grazer 1: {mass:.1} kg over {bones} bones, {capsules} capsules (the first {radius:.3} m); {:.2} s",
-        started.elapsed().as_secs_f64()
-    );
-    assert!((500.0..2000.0).contains(&mass), "a grazer of {mass} kg");
-    assert!(bones >= 10.0 && capsules == bones, "{bones} bones with mass, {capsules} capsules");
 }
 
 /// Sketch 01 §6 and §7 running: three grazers stepped (`@deterministic`), animated and drawn
@@ -157,14 +119,15 @@ fn sketch_03s_tick_doesnt_depend_on_the_workers() {
     assert_eq!(run(4), one_thread);
 }
 
-/// The programs' own tests (`@test`, `wrela test`): sketch 01's torso bound and hoof modes,
-/// sketch 03's timeline replays and saves, the gameplay paper test's scripted player (a frame
+/// The programs' own tests (`@test`, `wrela test`): sketch 01's torso bound, hoof modes and
+/// physique, and its creature against M1's grazer, sketch 03's timeline replays and saves, the gameplay paper test's scripted player (a frame
 /// test of 360 frames), the examples': hello field's, and the wolf's and the grazer's walks
 /// (frame tests of 120 frames, AC7).
 #[test]
 fn the_programs_own_tests_pass() {
     let programs = [
         "compiler/tests/sketches/01-creature",
+        "compiler/tests/sketches/01-check",
         "compiler/tests/sketches/03-simulation",
         "compiler/tests/sketches/gameplay",
         "examples/hello-field",

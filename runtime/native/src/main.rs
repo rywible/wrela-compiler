@@ -2,7 +2,8 @@
 //!
 //! - `wrela-host <build-dir> [--frames N] [--fps F] [--size WxH] [--input script.json]
 //!   [--png out.png] [--rgba out.rgba] [--timestamps [--serial]] [--log out.ticks] [--workers N]`: frames
-//!   on the GPU (in lockstep with the program's ticker, if it has one), then the state hash.
+//!   on the GPU (in lockstep with the program's ticker, if it has one), then the state hash;
+//!   the phases the program timed (`std::time::phase`), if any, on stderr.
 //! - `wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks]
 //!   [--workers N]`: the program's ticks alone, with no GPU and no frames: each tick's state
 //!   hash.
@@ -185,7 +186,12 @@ fn frames(args: &Args) -> Result<(), Failure> {
     host.init()?;
     let (w, h) = args.size;
     let (run, log) = host.run_lockstep(args.frames, args.fps, w, h, &script, logging)?;
+    // The phases the program timed (`std::time::phase`), over every frame and tick.
+    let traced = host.trace().take();
     drop(host); // release the GPU (and its lock) before writing files
+    if !traced.phases.is_empty() {
+        eprintln!("phases: {}", traced.phases_line());
+    }
     if let Some(path) = &args.png {
         run.write_png(path)?;
     }

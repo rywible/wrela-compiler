@@ -9,7 +9,7 @@ use corpus::{
 }
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::{Box3, interval}
-use std::field::{Lipschitz, Surface, check_lipschitz, hash_u32}
+use std::field::{Surface, check_lipschitz, hash_u32}
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
     dispatch, draw,
@@ -586,7 +586,7 @@ pub fn blob_tape_len() -> u32 {
 trait VisitLipschitz {
     type Out
 
-    fn visit<F: Lipschitz>(self, f: F) -> Self::Out
+    fn visit<F: Surface>(self, f: F) -> Self::Out
 }
 
 /// The corpus's `Lipschitz` surfaces: 0 sphere, 1 ellipsoid, 2 round cone, 3 hoof, 4 blob,
@@ -613,7 +613,7 @@ struct Bound: Copy {
 impl VisitLipschitz for Bound {
     type Out = f32
 
-    fn visit<F: Lipschitz>(self, f: F) -> f32 {
+    fn visit<F: Surface>(self, f: F) -> f32 {
         f.lipschitz(self.near)
     }
 }
@@ -637,7 +637,7 @@ struct Ratio: Copy {
 impl VisitLipschitz for Ratio {
     type Out = vec2
 
-    fn visit<F: Lipschitz>(self, f: F) -> vec2 {
+    fn visit<F: Surface>(self, f: F) -> vec2 {
         let l = f.lipschitz(self.near)
         var worst = 0.0
         var count = 0.0
@@ -665,7 +665,7 @@ struct Check: Copy {
 impl VisitLipschitz for Check {
     type Out = u32
 
-    fn visit<F: Lipschitz>(self, f: F) -> u32 {
+    fn visit<F: Surface>(self, f: F) -> u32 {
         check_lipschitz(f, self.near, f.lipschitz(self.near))
         0
     }
@@ -687,7 +687,7 @@ struct Steps: Copy {
 impl VisitLipschitz for Steps {
     type Out = u32
 
-    fn visit<F: Lipschitz>(self, f: F) -> u32 {
+    fn visit<F: Surface>(self, f: F) -> u32 {
         let b = f.to_bound(self.near)
         var bad = 0
         var balls = 0

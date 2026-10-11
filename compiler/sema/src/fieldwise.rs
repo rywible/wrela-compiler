@@ -47,6 +47,90 @@ pub enum Shape {
     Order,
     Build,
     TryBuild,
+    /// Its default body walks the fields (`for f in fields(self)`), and says how their
+    /// results combine: derived from that body, the walk unrolled (`trait.fieldwise-walk`).
+    Walk,
+}
+
+/// Whether `e` is a walk's fields, and whether it goes backwards: `fields(self)`, or
+/// `fields(self).rev()` (the last field first).
+pub fn fields_walk(e: &wrela_syntax::ast::Expr) -> Option<bool> {
+    use wrela_syntax::ast::ExprKind as A;
+    if is_fields_of_self(e) {
+        return Some(false);
+    }
+    match &e.kind {
+        A::MethodCall { receiver, name, generics: None, args, .. }
+            if name.name == "rev" && args.is_empty() && is_fields_of_self(receiver) =>
+        {
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `e` is `fields(self)`: the fields of `self`, which a `@fieldwise` trait's method
+/// walks (`for f in fields(self)`, `trait.fieldwise-walk`).
+pub fn is_fields_of_self(e: &wrela_syntax::ast::Expr) -> bool {
+    use wrela_syntax::ast::ExprKind as A;
+    let single = |e: &wrela_syntax::ast::Expr, name: &str| matches!(&e.kind, A::Path(p) if p.is_single() && p.segments[0].ident.name == name && p.segments[0].generics.is_none());
+    match &e.kind {
+        A::Call { callee, args, .. } => {
+            single(callee, "fields")
+                && args.len() == 1
+                && args[0].name.is_none()
+                && single(&args[0].value, "self")
+        }
+        _ => false,
+    }
+}
+
+/// Where block `b` makes a closure, if it does.
+pub fn closure_in(b: &Block) -> Option<Span> {
+    fn expr(e: &Expr) -> Option<Span> {
+        if matches!(e.kind, ExprKind::Closure(_)) {
+            return Some(e.span);
+        }
+        let mut found = None;
+        e.for_each_child(&mut |c| {
+            if found.is_none() {
+                found = match c {
+                    Child::Expr(x) => expr(x),
+                    Child::Block(b) => closure_in(b),
+                };
+            }
+        });
+        found
+    }
+    for s in &b.stmts {
+        let found = match &s.kind {
+            StmtKind::Bind { init, else_, .. } => {
+                expr(init).or_else(|| else_.as_ref().and_then(closure_in))
+            }
+            StmtKind::Assign { place, value, .. } => expr(place).or_else(|| expr(value)),
+            StmtKind::Expr(e) => expr(e),
+            StmtKind::While { cond, body } => expr(cond).or_else(|| closure_in(body)),
+            StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => closure_in(body),
+            StmtKind::ForRange { start, end, body, .. } => {
+                expr(start).or_else(|| expr(end)).or_else(|| closure_in(body))
+            }
+            StmtKind::ForEach { array, body, .. } => expr(array).or_else(|| closure_in(body)),
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    b.tail.as_deref().and_then(expr)
+}
+
+/// Whether method `m`'s default body walks `self`'s fields anywhere.
+pub fn walks_fields(p: &Program, m: FnId) -> bool {
+    let Some(body) = &p.func(m).body else { return false };
+    let mut found = false;
+    body.for_each_expr(&mut |e| {
+        e.walk(&mut |x| found |= is_fields_of_self(x));
+    });
+    found
 }
 
 impl Shape {
@@ -78,6 +162,10 @@ pub fn shape(p: &Program, t: TraitId, m: FnId) -> Result<Shape, String> {
     let self_ty = p.types.param(tr.self_param);
     let mentions_self = |ty: TyId| p.types.any(ty, &mut |k| *k == TyKind::Param(tr.self_param));
     let receiver = def.has_self();
+    // A body that walks the fields decides how their results combine.
+    if receiver && walks_fields(p, m) {
+        return Ok(Shape::Walk);
+    }
     for (k, ps) in def.params.iter().enumerate() {
         if ps.is_self || ps.ty == self_ty {
             if !receiver && k > 0 {
@@ -263,7 +351,11 @@ fn bad_hook(p: &Program, h: FnId, want: &str) -> Diagnostic {
 }
 
 /// The derived body of `f`, a method of a type's `@fieldwise` impl.
-pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
+pub fn derive(
+    p: &Program,
+    consts: &crate::check::ConstTypes,
+    f: FnId,
+) -> (Option<Body>, Vec<Diagnostic>) {
     let def = p.func(f);
     let Some(d) = &def.derived else { return (None, Vec::new()) };
     let FnOwner::Impl(imp) = def.owner else { return (None, Vec::new()) };
@@ -273,6 +365,9 @@ pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
         Ok(s) => s,
         Err(_) => return (None, Vec::new()), // reported at the trait
     };
+    if shape == Shape::Walk {
+        return derive_walk(p, consts, f);
+    }
     let self_ty = p.impl_(imp).self_ty;
     let of = match p.types.kind(self_ty) {
         TyKind::Adt(a, args) => Of::Adt(*a, args.clone()),
@@ -313,6 +408,459 @@ pub fn derive(p: &Program, f: FnId) -> (Option<Body>, Vec<Diagnostic>) {
         hidden_ret: None,
     });
     (body, b.diags)
+}
+
+/// A walk method's body for `f`, a method of a type's `@fieldwise` impl: the trait's own body,
+/// checked once against its field type, with this impl's types, and each walk over
+/// `fields(self)` unrolled over the type's fields; an array's is a loop over its elements
+/// (`trait.fieldwise-walk`).
+fn derive_walk(
+    p: &Program,
+    consts: &crate::check::ConstTypes,
+    f: FnId,
+) -> (Option<Body>, Vec<Diagnostic>) {
+    let def = p.func(f);
+    let Some(d) = &def.derived else { return (None, Vec::new()) };
+    let FnOwner::Impl(imp) = def.owner else { return (None, Vec::new()) };
+    let span = p.impl_(imp).span;
+    let tr = p.trait_(d.trait_ref.trait_);
+    let Some(field) = tr.field_param else { return (None, Vec::new()) };
+    // Errors in the trait's body are the trait's, reported where it's checked: a body with
+    // any derives nothing.
+    let checked = crate::check::check_fn(p, consts, d.method);
+    if wrela_diag::has_errors(&checked.diags) || checked.incomplete {
+        return (None, Vec::new());
+    }
+    let Some(body) = checked.body else { return (None, Vec::new()) };
+    let self_ty = p.impl_(imp).self_ty;
+    let of = match p.types.kind(self_ty) {
+        TyKind::Adt(a, args) if !p.adt(*a).is_enum() => Of::Adt(*a, args.clone()),
+        TyKind::Tuple(ts) => Of::Tuple(ts.clone()),
+        &TyKind::ArrayN(e, n) if let &TyKind::Param(g) = p.types.kind(n) => Of::Array(e, g),
+        _ => {
+            let d = Diagnostic::new(
+                codes::E0337,
+                span,
+                format!(
+                    "`{}` walks the fields of `self`, so it's derived for structs, tuples and arrays, not `{}`",
+                    p.func(d.method).name,
+                    p.display_ty(self_ty)
+                ),
+            );
+            return (None, vec![d]);
+        }
+    };
+    // The trait's generics, as this impl has them: `Self`, the trait's parameters, and the
+    // method's own (the derived method's are the trait method's).
+    let all = p.fn_all_generics(d.method);
+    let args: Vec<TyId> = all
+        .iter()
+        .map(|&g| {
+            if g == tr.self_param {
+                self_ty
+            } else if let Some(i) = tr.generics.iter().position(|&x| x == g) {
+                d.trait_ref.args[i]
+            } else {
+                p.types.param(g)
+            }
+        })
+        .collect();
+    let subst = Subst::from_pairs(&all, &args);
+    let mut w = Walker { p, field, locals: body.locals.clone(), of, self_ty };
+    for l in &mut w.locals {
+        l.ty = p.types.subst(l.ty, &subst);
+    }
+    let mut value = body.value.clone();
+    crate::check::zonk::walk_tys(&mut value, &mut |t| *t = p.types.subst(*t, &subst));
+    let self_local = body.params[0];
+    w.expand_expr(&mut value, self_local);
+    let out = Body {
+        params: body.params.clone(),
+        locals: w.locals,
+        closures: Vec::new(),
+        value,
+        hidden_ret: None,
+    };
+    (Some(out), Vec::new())
+}
+
+/// Unrolls the walks of a derived walk method's body over its type's fields.
+struct Walker<'p> {
+    p: &'p Program,
+    /// The trait's field type, which each field's own type replaces.
+    field: ParamId,
+    locals: Vec<LocalDecl>,
+    of: Of,
+    self_ty: TyId,
+}
+
+impl Walker<'_> {
+    fn expand_expr(&mut self, e: &mut Expr, me: LocalId) {
+        match &mut e.kind {
+            ExprKind::Block(b) => self.expand_block(b, me),
+            ExprKind::If { cond, then, else_ } => {
+                self.expand_expr(cond, me);
+                self.expand_block(then, me);
+                if let Some(x) = else_ {
+                    self.expand_expr(x, me);
+                }
+            }
+            ExprKind::Match { scrutinee, arms, .. } => {
+                self.expand_expr(scrutinee, me);
+                for a in arms {
+                    if let Some(g) = &mut a.guard {
+                        self.expand_expr(g, me);
+                    }
+                    self.expand_expr(&mut a.body, me);
+                }
+            }
+            _ => crate::check::zonk::for_each_child_mut(e, &mut |x| self.expand_expr(x, me)),
+        }
+    }
+
+    fn expand_block(&mut self, b: &mut Block, me: LocalId) {
+        let stmts = std::mem::take(&mut b.stmts);
+        for mut s in stmts {
+            match s.kind {
+                StmtKind::ForFields { var, mutable, reverse, body } => {
+                    for one in self.unroll(var, mutable, reverse, body, me, s.span) {
+                        b.stmts.push(one);
+                    }
+                }
+                ref mut k => {
+                    match k {
+                        StmtKind::Bind { init, else_, .. } => {
+                            self.expand_expr(init, me);
+                            if let Some(eb) = else_ {
+                                self.expand_block(eb, me);
+                            }
+                        }
+                        StmtKind::Assign { place, value, .. } => {
+                            self.expand_expr(place, me);
+                            self.expand_expr(value, me);
+                        }
+                        StmtKind::Expr(x) => self.expand_expr(x, me),
+                        StmtKind::While { cond, body } => {
+                            self.expand_expr(cond, me);
+                            self.expand_block(body, me);
+                        }
+                        StmtKind::Loop { body } => self.expand_block(body, me),
+                        StmtKind::ForRange { start, end, body, .. } => {
+                            self.expand_expr(start, me);
+                            self.expand_expr(end, me);
+                            self.expand_block(body, me);
+                        }
+                        StmtKind::ForEach { array, body, .. } => {
+                            self.expand_expr(array, me);
+                            self.expand_block(body, me);
+                        }
+                        StmtKind::ForFields { .. } => unreachable!(),
+                    }
+                    b.stmts.push(s);
+                }
+            }
+        }
+        if let Some(t) = &mut b.tail {
+            self.expand_expr(t, me);
+        }
+    }
+
+    /// One walk's statements: for each field, its projection bound and the body for its type.
+    #[allow(clippy::too_many_arguments)]
+    fn unroll(
+        &mut self,
+        var: LocalId,
+        mutable: bool,
+        reverse: bool,
+        body: Block,
+        me: LocalId,
+        span: Span,
+    ) -> Vec<Stmt> {
+        let p = self.p;
+        let me_expr = Expr { ty: self.self_ty, span, kind: ExprKind::Local(me) };
+        // A walk whose body always returns returns from its first field: that field's body
+        // alone (an array's first element's), since nothing after it runs.
+        let first_only = matches!(p.types.kind(body.ty), TyKind::Never);
+        if first_only && let &Of::Array(elem, _) = &self.of {
+            let u = p.types.u32;
+            let (v, mut b) = self.instance(var, &body, elem, me);
+            let zero = Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(0)) };
+            let init =
+                Expr { ty: elem, span, kind: ExprKind::Index(Box::new(me_expr), Box::new(zero)) };
+            let pat = Pat { ty: elem, kind: PatKind::Bind(v), span };
+            b.stmts.insert(0, Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span });
+            let ty = b.ty;
+            return vec![Stmt {
+                kind: StmtKind::Expr(Expr { ty, span, kind: ExprKind::Block(b) }),
+                span,
+            }];
+        }
+        let fields: Vec<TyId> = match &self.of {
+            Of::Adt(a, args) => p.fields_of(*a, args, None),
+            Of::Tuple(ts) => ts.clone(),
+            &Of::Array(elem, n) if !reverse => {
+                // An array's elements are of one type: a loop over them.
+                let _ = n;
+                let (v, b) = self.instance(var, &body, elem, me);
+                return vec![Stmt {
+                    kind: StmtKind::ForEach { var: v, array: me_expr, mutable, body: b },
+                    span,
+                }];
+            }
+            &Of::Array(elem, n) => {
+                // Backwards: `for j in 0..N`, element `N - 1 - j`.
+                let u = p.types.u32;
+                let j = LocalId(self.locals.len() as u32);
+                self.locals.push(LocalDecl {
+                    name: "j".into(),
+                    ty: u,
+                    kind: LocalKind::Owned { mutable: false },
+                    span,
+                    keyword: None,
+                    shorthand: false,
+                    closure: None,
+                });
+                let (v, mut b) = self.instance(var, &body, elem, me);
+                let lit = |x: i128| Expr { ty: u, span, kind: ExprKind::Lit(Lit::Int(x)) };
+                let len = Expr { ty: u, span, kind: ExprKind::ConstParam(n) };
+                let last = Expr {
+                    ty: u,
+                    span,
+                    kind: ExprKind::Binary(
+                        wrela_syntax::ast::BinOp::Sub,
+                        Box::new(len.clone()),
+                        Box::new(lit(1)),
+                    ),
+                };
+                let at = Expr {
+                    ty: u,
+                    span,
+                    kind: ExprKind::Binary(
+                        wrela_syntax::ast::BinOp::Sub,
+                        Box::new(last),
+                        Box::new(Expr { ty: u, span, kind: ExprKind::Local(j) }),
+                    ),
+                };
+                let elem_at =
+                    Expr { ty: elem, span, kind: ExprKind::Index(Box::new(me_expr), Box::new(at)) };
+                let pat = Pat { ty: elem, kind: PatKind::Bind(v), span };
+                b.stmts.insert(
+                    0,
+                    Stmt { kind: StmtKind::Bind { pat, init: elem_at, else_: None }, span },
+                );
+                return vec![Stmt {
+                    kind: StmtKind::ForRange {
+                        var: j,
+                        start: lit(0),
+                        end: len,
+                        inclusive: false,
+                        body: b,
+                    },
+                    span,
+                }];
+            }
+        };
+        let mut out = Vec::new();
+        let mut order: Vec<(usize, TyId)> = fields.into_iter().enumerate().collect();
+        if reverse {
+            order.reverse();
+        }
+        if first_only {
+            order.truncate(1);
+        }
+        for (i, fty) in order {
+            let (v, b) = self.instance(var, &body, fty, me);
+            let init =
+                Expr { ty: fty, span, kind: ExprKind::Field(Box::new(me_expr.clone()), i as u32) };
+            let pat = Pat { ty: fty, kind: PatKind::Bind(v), span };
+            out.push(Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span });
+            let ty = b.ty;
+            out.push(Stmt {
+                kind: StmtKind::Expr(Expr { ty, span, kind: ExprKind::Block(b) }),
+                span,
+            });
+        }
+        out
+    }
+
+    /// The walk's body for one field of type `fty`: its own locals (the walk's variable and
+    /// each local it declares), of their types with `fty` for the field's, and its own walks
+    /// unrolled.
+    fn instance(&mut self, var: LocalId, body: &Block, fty: TyId, me: LocalId) -> (LocalId, Block) {
+        let p = self.p;
+        let subst = Subst::from_pairs(&[self.field], &[fty]);
+        let mut declared = vec![var];
+        declared_in_block(body, &mut declared);
+        let mut map = std::collections::HashMap::new();
+        for l in declared {
+            let mut d = self.locals[l.index()].clone();
+            d.ty = p.types.subst(d.ty, &subst);
+            let id = LocalId(self.locals.len() as u32);
+            self.locals.push(d);
+            map.insert(l, id);
+        }
+        let mut b = body.clone();
+        remap_block(&mut b, &map);
+        let mut e = Expr { ty: b.ty, span: b.span, kind: ExprKind::Block(b) };
+        crate::check::zonk::walk_tys(&mut e, &mut |t| *t = p.types.subst(*t, &subst));
+        let ExprKind::Block(mut b) = e.kind else { unreachable!() };
+        self.expand_block(&mut b, me);
+        (map[&var], b)
+    }
+}
+
+/// The locals declared in `b`: bound by its patterns and loops.
+fn declared_in_block(b: &Block, out: &mut Vec<LocalId>) {
+    fn pat(p: &Pat, out: &mut Vec<LocalId>) {
+        match &p.kind {
+            PatKind::Bind(l) => out.push(*l),
+            PatKind::Adt { fields, .. } => fields.iter().for_each(|(_, q)| pat(q, out)),
+            PatKind::Tuple(ps) | PatKind::Or(ps) => ps.iter().for_each(|q| pat(q, out)),
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Text(_) => {}
+        }
+    }
+    fn expr(e: &Expr, out: &mut Vec<LocalId>) {
+        if let ExprKind::Match { arms, .. } = &e.kind {
+            for a in arms {
+                pat(&a.pat, out);
+            }
+        }
+        e.for_each_child(&mut |c| match c {
+            Child::Expr(x) => expr(x, out),
+            Child::Block(b) => declared_in_block(b, out),
+        });
+    }
+    for s in &b.stmts {
+        match &s.kind {
+            StmtKind::Bind { pat: q, init, else_ } => {
+                pat(q, out);
+                expr(init, out);
+                if let Some(eb) = else_ {
+                    declared_in_block(eb, out);
+                }
+            }
+            StmtKind::Assign { place, value, .. } => {
+                expr(place, out);
+                expr(value, out);
+            }
+            StmtKind::Expr(e) => expr(e, out),
+            StmtKind::While { cond, body } => {
+                expr(cond, out);
+                declared_in_block(body, out);
+            }
+            StmtKind::Loop { body } => declared_in_block(body, out),
+            StmtKind::ForRange { var, start, end, body, .. } => {
+                out.push(*var);
+                expr(start, out);
+                expr(end, out);
+                declared_in_block(body, out);
+            }
+            StmtKind::ForEach { var, array, body, .. } => {
+                out.push(*var);
+                expr(array, out);
+                declared_in_block(body, out);
+            }
+            StmtKind::ForFields { var, body, .. } => {
+                out.push(*var);
+                declared_in_block(body, out);
+            }
+        }
+    }
+    if let Some(t) = &b.tail {
+        expr(t, out);
+    }
+}
+
+/// `b` with each local in `map` replaced by its image.
+fn remap_block(b: &mut Block, map: &std::collections::HashMap<LocalId, LocalId>) {
+    fn id(l: &mut LocalId, map: &std::collections::HashMap<LocalId, LocalId>) {
+        if let Some(n) = map.get(l) {
+            *l = *n;
+        }
+    }
+    fn pat(p: &mut Pat, map: &std::collections::HashMap<LocalId, LocalId>) {
+        match &mut p.kind {
+            PatKind::Bind(l) => id(l, map),
+            PatKind::Adt { fields, .. } => fields.iter_mut().for_each(|(_, q)| pat(q, map)),
+            PatKind::Tuple(ps) | PatKind::Or(ps) => ps.iter_mut().for_each(|q| pat(q, map)),
+            PatKind::Wild | PatKind::Lit(_) | PatKind::Text(_) => {}
+        }
+    }
+    fn expr(e: &mut Expr, map: &std::collections::HashMap<LocalId, LocalId>) {
+        match &mut e.kind {
+            ExprKind::Local(l) => id(l, map),
+            ExprKind::Call(c) => {
+                if let Callee::Local(l) = &mut c.callee {
+                    id(l, map);
+                }
+            }
+            ExprKind::Match { arms, .. } => {
+                for a in arms {
+                    pat(&mut a.pat, map);
+                }
+            }
+            _ => {}
+        }
+        match &mut e.kind {
+            ExprKind::Block(b) => remap_block(b, map),
+            ExprKind::If { cond, then, else_ } => {
+                expr(cond, map);
+                remap_block(then, map);
+                if let Some(x) = else_ {
+                    expr(x, map);
+                }
+            }
+            ExprKind::Match { scrutinee, arms, .. } => {
+                expr(scrutinee, map);
+                for a in arms {
+                    if let Some(g) = &mut a.guard {
+                        expr(g, map);
+                    }
+                    expr(&mut a.body, map);
+                }
+            }
+            _ => crate::check::zonk::for_each_child_mut(e, &mut |x| expr(x, map)),
+        }
+    }
+    for s in &mut b.stmts {
+        match &mut s.kind {
+            StmtKind::Bind { pat: q, init, else_ } => {
+                pat(q, map);
+                expr(init, map);
+                if let Some(eb) = else_ {
+                    remap_block(eb, map);
+                }
+            }
+            StmtKind::Assign { place, value, .. } => {
+                expr(place, map);
+                expr(value, map);
+            }
+            StmtKind::Expr(e) => expr(e, map),
+            StmtKind::While { cond, body } => {
+                expr(cond, map);
+                remap_block(body, map);
+            }
+            StmtKind::Loop { body } => remap_block(body, map),
+            StmtKind::ForRange { var, start, end, body, .. } => {
+                id(var, map);
+                expr(start, map);
+                expr(end, map);
+                remap_block(body, map);
+            }
+            StmtKind::ForEach { var, array, body, .. } => {
+                id(var, map);
+                expr(array, map);
+                remap_block(body, map);
+            }
+            StmtKind::ForFields { var, body, .. } => {
+                id(var, map);
+                remap_block(body, map);
+            }
+        }
+    }
+    if let Some(t) = &mut b.tail {
+        expr(t, map);
+    }
 }
 
 /// What a derivation takes apart: a struct or an enum, a tuple, or an array.
@@ -537,6 +1085,7 @@ impl Builder<'_> {
                 fields: vec![self.moved(self.var(x))],
                 order: vec![0],
                 base: None,
+                literal: false,
             },
         );
         let never = self.p.types.never;
@@ -571,6 +1120,7 @@ impl Builder<'_> {
                 fields: vec![x],
                 order: vec![0],
                 base: None,
+                literal: false,
             },
         )
     }
@@ -586,6 +1136,7 @@ impl Builder<'_> {
                     fields: Vec::new(),
                     order: Vec::new(),
                     base: None,
+                    literal: false,
                 },
             ),
             None => self.e(self.p.types.error, ExprKind::Error),
@@ -603,6 +1154,11 @@ impl Builder<'_> {
     fn body(&mut self) -> Option<Expr> {
         let (fields, names) = match &self.of {
             Of::Adt(a, _) if self.p.adt(*a).is_enum() => return self.enum_body(),
+            // A job's parts: where it stopped, and each local it holds (`fn.job-values`).
+            Of::Adt(a, args) if let Some(parts) = self.p.job_parts(*a, args) => {
+                let (names, tys) = parts.into_iter().unzip();
+                (tys, Some(names))
+            }
             Of::Adt(a, args) => {
                 let names: Vec<String> =
                     self.p.adt_fields(*a, None).iter().map(|f| f.name.clone()).collect();
@@ -648,6 +1204,7 @@ impl Builder<'_> {
         }
         let bool_ty = self.p.types.bool;
         match self.shape {
+            Shape::Walk => unreachable!("a walk is derived from its body (`derive_walk`)"),
             Shape::Unit | Shape::TryUnit => {
                 let mut stmts = Vec::new();
                 for (hk, call) in calls {
@@ -728,6 +1285,7 @@ impl Builder<'_> {
                             fields: vals,
                             order: (0..n).collect(),
                             base: None,
+                            literal: false,
                         }
                     }
                 };
@@ -779,6 +1337,7 @@ impl Builder<'_> {
         };
         let at_i = self.var(i);
         match self.shape {
+            Shape::Walk => unreachable!("a walk is derived from its body (`derive_walk`)"),
             Shape::Unit | Shape::TryUnit => {
                 let call = call_at(self, &at_i);
                 let call = if self.shape.tries() { self.try_(call) } else { call };

@@ -1,9 +1,9 @@
-// Long jobs (`std::par::job`), parallel work started inside parallel work, and hand-offs
+// Tasks (`std::par::spawn`), parallel work started inside parallel work, and hand-offs
 // (`std::handoff`), run by compiler/tests/tests/suite/threads.rs with 1, 2 and 8 threads.
 
 use std::alloc::allocations
 use std::handoff::handoff
-use std::par::{Job, job}
+use std::par::{Task, spawn}
 
 /// A value a job computes: FNV-1a of `n` numbers from `seed`, slowly enough to keep a helper
 /// busy for a while.
@@ -19,9 +19,9 @@ fn churn(input: take (u32, u32)) -> u32 {
 
 /// `jobs` jobs at once, each joined: their results folded in the order they were made.
 pub fn many(jobs: u32, n: u32) -> u32 {
-    var pending: Vec<Job<u32>> = Vec::new()
+    var pending: Vec<Task<u32>> = Vec::new()
     for k in 0..jobs {
-        pending.push(job((k, n), churn))
+        pending.push(spawn((k, n), churn))
     }
     var h: u32 = 0
     while pending.len() > 0 {
@@ -35,13 +35,26 @@ pub fn many(jobs: u32, n: u32) -> u32 {
 /// outer's `join`, so neither waits for the other.
 @deterministic
 fn outer(n: take u32) -> u32 {
-    let inner = job((7, n), churn)
+    let inner = spawn((7, n), churn)
     take inner.join() ^ 1
 }
 
 pub fn nested_jobs(n: u32) -> u32 {
-    let j = job(n, outer)
+    let j = spawn(n, outer)
     take j.join()
+}
+
+/// A job polled until it's done, as a frame polls a long one, then joined: how many polls found
+/// it not done, at most `most`. With no helpers the first poll runs it (nothing else would start
+/// it), so it's done then.
+pub fn polled(n: u32, most: u32) -> u32 {
+    let j = spawn((3, n), churn)
+    var polls: u32 = 0
+    while !j.done() && polls < most {
+        polls += 1
+    }
+    let _ = take j.join()
+    polls
 }
 
 /// A job that traps when its input says so.
@@ -54,7 +67,7 @@ fn checked(n: take u32) -> u32 {
 /// Starts a job of `n`, does other work, then joins it: a trap in the job is the program's
 /// panic here.
 pub fn trap_at_join(n: u32) -> u32 {
-    let j = job(n, checked)
+    let j = spawn(n, checked)
     let other = churn((1, 1000))
     take j.join() + other % 2
 }
@@ -114,7 +127,7 @@ pub fn stress(n: u32, reads: u32) -> vec2 {
     let (done_out, done_latest) = handoff(0)
     var latest = take latest
     var done = take done_latest
-    let j = job((take out, take done_out, n), publish_all)
+    let j = spawn((take out, take done_out, n), publish_all)
     var count: u32 = 0
     var last: u32 = 0
     loop {
@@ -141,3 +154,26 @@ pub fn allocations_while_helping(n: u32) -> u32 {
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}
+
+/// Fills the heap with blocks of 4 MB until it runs out (a job's panic), as long as `n` blocks.
+@deterministic
+fn fill_heap(n: take u32) -> u32 {
+    var held: Vec<Vec<u8>> = Vec::new()
+    for _ in 0..n {
+        held.push(Vec::filled(4000000, 1))
+    }
+    held.len()
+}
+
+/// A job fills the heap while this thread makes and drops small blocks, until the job is done,
+/// then joins it: the job's panic (the heap is full) is the program's, whichever thread ran
+/// out first (`threads::a_job_that_fills_the_heap_panics_at_its_join`).
+pub fn fill_the_heap_while_allocating() -> u32 {
+    let j = spawn(1000, fill_heap)
+    var made: u32 = 0
+    while !j.done() {
+        let v: Vec<u32> = Vec::filled(16, made)
+        made = made.wrapping_add(v.len())
+    }
+    take j.join()
+}

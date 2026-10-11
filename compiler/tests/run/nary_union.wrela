@@ -6,7 +6,7 @@
 // expect: smooth_gap(-0.2) = 0.0
 // expect: empty() = 1e30
 // expect: bound(0.1) = 1.0
-use std::field::{Lipschitz, Sphere, Surface, Translate, sphere}
+use std::field::{Sphere, Translate, sphere}
 
 fn leg(at: f32) -> Translate<Sphere> {
     sphere(0.1).translate(vec3(at, 0.0, 0.0))

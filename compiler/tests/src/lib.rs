@@ -12,6 +12,7 @@
 //! fast, and the size the acceptance criteria name when `WRELA_FULL` is set ([`sized`]), as
 //! `tools/check.sh --full` does.
 
+pub mod camera;
 pub mod spike01;
 
 use std::collections::BTreeMap;
@@ -106,6 +107,17 @@ pub fn write_edit(pkg: &Path, file: &str, edit: impl Fn(&str) -> String) -> std:
 
 /// Waits until the `wrela run` server has had `n` changes shown: the `n`th. Panics after
 /// `limit`.
+/// Waits until a page is running on the `wrela run` server: it has asked for changes. Panics
+/// after `limit`. A test edits after this, so its page sees each edit as a change, not as part of
+/// the build it loaded (Chrome opens after the machine's Chrome lock, and a build is quicker).
+pub fn wait_polling(server: &wrela_driver::live::Server, limit: std::time::Duration) {
+    let began = std::time::Instant::now();
+    while server.polls() == 0 {
+        assert!(began.elapsed() < limit, "no page asked for changes in {}s", limit.as_secs());
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
 pub fn wait_shown(
     server: &wrela_driver::live::Server,
     n: usize,
@@ -494,13 +506,21 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
 /// Runs tools/headless.py, from the repo root, with `args`: whether the run passed. It empties
 /// the page's `results/` first.
 fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> bool {
-    std::process::Command::new("python3")
-        .arg(repo_root().join("tools/headless.py"))
-        .args(args)
-        .current_dir(repo_root())
-        .status()
-        .expect("python3 runs tools/headless.py")
-        .success()
+    headless_with(args, None)
+}
+
+/// [`headless`], the test server slowed to `throttle` bits a second if given.
+fn headless_with<S: AsRef<std::ffi::OsStr>>(
+    args: impl IntoIterator<Item = S>,
+    throttle: Option<String>,
+) -> bool {
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(repo_root().join("tools/headless.py")).args(args).current_dir(repo_root());
+    match throttle {
+        Some(bits) => cmd.env("WRELA_THROTTLE", bits),
+        None => cmd.env_remove("WRELA_THROTTLE"),
+    };
+    cmd.status().expect("python3 runs tools/headless.py").success()
 }
 
 /// Runs a plain page (no wrela build) at `rel` in headless Chrome with URL fragment
@@ -586,6 +606,9 @@ pub struct ChromeRun {
     pub salt: u32,
     /// Each frame as soon as the last is done, not at its time.
     pub saturate: bool,
+    /// The network slowed to this many bits a second (the test server's `WRELA_THROTTLE`: every
+    /// request shares the rate); 0 for full speed.
+    pub throttle: u64,
 }
 
 impl ChromeRun {
@@ -618,6 +641,8 @@ impl ChromeRun {
             nohash,
             salt,
             saturate,
+            // The server's, not the page's.
+            throttle: _,
         } = self;
         let mut fragment = format!(
             "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}"
@@ -657,7 +682,10 @@ impl ChromeRun {
         if let Some(script) = &self.script {
             std::fs::write(repo_root().join(rel).join(SCRIPT), script).expect("write the script");
         }
-        headless([rel, &self.fragment(), &self.timeout().to_string()])
+        headless_with(
+            [rel, &self.fragment(), &self.timeout().to_string()],
+            (self.throttle > 0).then(|| self.throttle.to_string()),
+        )
     }
 }
 

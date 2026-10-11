@@ -1,0 +1,25 @@
+// rejects: const.fuel
+// `@fuel` is a whole number of units, at most 2^46, on a `const` or a `@test` of code, set
+// once (§10).
+@fuel(0) //~ E0108
+const ZERO: u32 = 1
+
+@fuel(2 ** 50) //~ E0108
+const TOO_MUCH: u32 = 2
+
+@fuel(2 ** 20)
+@fuel(2 ** 21) //~ E0108
+const TWICE: u32 = 3
+
+@fuel(2 ** 20) //~ E0108
+fn not_a_constant() -> u32 {
+    4
+}
+
+// A frame test's calls each get a test's fuel.
+@test(frames: 2)
+@fuel(2 ** 40) //~ E0108
+fn framed() {
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

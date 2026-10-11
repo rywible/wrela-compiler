@@ -362,7 +362,7 @@ impl Checker {
                     return err(format!("the URL `{url}` {why}"));
                 }
             }
-            Command::Log { .. } | Command::Label { .. } => {}
+            Command::Label { .. } => {}
         }
         Ok(())
     }

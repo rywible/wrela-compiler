@@ -125,7 +125,6 @@ fn command(c: &Command) -> Value {
         Command::Post { request, url, body } => {
             json!({ "op": "Post", "request": request, "url": url, "body": body })
         }
-        Command::Log { text } => json!({ "op": "Log", "text": text }),
         Command::Label { name } => json!({ "op": "Label", "name": name }),
     }
 }
@@ -176,7 +175,6 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .storage_read(2, "saves/slot1")
         .storage_write(3, "saves/a", &[1, 2, 3, 4, 5])
         .fetch(4, "data/level.bin")
-        .log("frame 3: 2 grazers, é")
         .post(5, "studio/edit", &[123, 125])
         .draw_indexed_indirect(1, [3, 0, 12], 3, 16, &[], &[])
         .label("terrain")
@@ -291,10 +289,7 @@ fn batches() -> Vec<Value> {
             "a post body length that disagrees with the payload",
             &edit(Encoder::new().post(1, "x", &[1, 2]).finish(), h + 16, 9),
         ),
-        batch(
-            "a log line that isn't UTF-8",
-            &edit(Encoder::new().log("ok").finish(), h + 12, 0xFF),
-        ),
+        batch("a label that isn't UTF-8", &edit(Encoder::new().label("ok").finish(), h + 12, 0xFF)),
         batch(
             "an unaligned indirect offset",
             &edit(Encoder::new().draw_indirect(0, 1, 0, &[], &[]).finish(), h + 8 + 8, 2),

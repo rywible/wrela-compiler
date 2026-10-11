@@ -1,0 +1,17 @@
+// rejects: ty.enum-arrays
+enum Layer: Copy + Fieldless {
+    Ground = 1,
+    Canopy,
+}
+
+enum Shape {
+    Ball { r: f32 },
+    Flat,
+}
+
+struct Tables {
+    layers: [f32; Layer], //~ E0325
+    shapes: [f32; Shape], //~ E0325
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -7,7 +7,7 @@ pub mod infer;
 pub mod job;
 mod pat;
 mod units;
-mod zonk;
+pub(crate) mod zonk;
 
 pub use zonk::opaque_cycles;
 
@@ -419,6 +419,8 @@ impl<'p> Checker<'p> {
         match &s.kind {
             StmtKind::Expr(e) => matches!(self.kind(e.ty), TyKind::Never),
             StmtKind::Loop { body } => !has_break(body),
+            // A walk whose body always returns returns from its first field (§3).
+            StmtKind::ForFields { body, .. } => matches!(self.kind(body.ty), TyKind::Never),
             _ => false,
         }
     }
@@ -689,6 +691,71 @@ impl<'p> Checker<'p> {
     }
 
     /// A loop's body: `break` and `continue` are allowed in it, and it has no value.
+    /// `for f in fields(self)` in a `@fieldwise` trait's method: `f` projects each field in
+    /// turn, any type with the trait (`trait.fieldwise-walk`). The body is checked once, here;
+    /// each type that declares the trait unrolls it over its own fields.
+    #[allow(clippy::too_many_arguments)]
+    fn check_walk(
+        &mut self,
+        name: Option<&ast::Ident>,
+        mutable: bool,
+        reverse: bool,
+        pat: &ast::Pat,
+        e: &ast::Expr,
+        body: &ast::Block,
+    ) -> Option<StmtKind> {
+        let owner = self.fn_id.map(|f| self.p.func(f).owner);
+        let walk = match owner {
+            Some(crate::defs::FnOwner::Trait(t)) => self.p.trait_(t).field_param.map(|g| (t, g)),
+            _ => None,
+        };
+        let Some((_, field)) = walk else {
+            self.err(
+                Diagnostic::new(
+                    codes::E0337,
+                    e.span,
+                    "`fields(self)` walks the fields of a type that declares a `@fieldwise` trait, in that trait's methods",
+                )
+                .with_note("each type that declares the trait runs the method with the loop unrolled over its own fields (§3)"),
+            );
+            return None;
+        };
+        if !matches!(pat.kind, ast::PatKind::Ident(_) | ast::PatKind::Wild) {
+            self.err(Diagnostic::new(
+                codes::E0337,
+                pat.span,
+                "a walk over the fields binds each to one name: fields have types of their own",
+            ));
+            return None;
+        }
+        let self_mut = self.fn_id.is_some_and(|f| {
+            self.p.func(f).params.first().is_some_and(|ps| ps.is_self && ps.mode == Mode::Mut)
+        });
+        if mutable && !self_mut {
+            self.err(Diagnostic::new(
+                codes::E0505,
+                pat.span,
+                "`for mut` walks the fields mutably, which needs `mut self`",
+            ));
+        }
+        let ty = self.p.types.param(field);
+        let var = self.declare_binder(name, ty, LocalKind::Projection { mutable }, pat.span);
+        // The walk isn't a loop: it's the fields one after another, so `break` and `continue`
+        // inside it would leave it half done (`return` leaves the method).
+        let depth = std::mem::replace(&mut self.loop_depth, 0);
+        let b = self.check_block(body, None);
+        self.loop_depth = depth;
+        self.expect_unit_block(&b);
+        if let Some(at) = crate::fieldwise::closure_in(&b) {
+            self.err(
+                Diagnostic::new(codes::E0337, at, "a walk over the fields can't hold a closure")
+                    .with_note("its body is written again for each field, each of its own type")
+                    .with_help("call a function, or do the work in the walk's body"),
+            );
+        }
+        Some(StmtKind::ForFields { var, mutable, reverse, body: b })
+    }
+
     fn check_loop_body(&mut self, body: &ast::Block) -> Block {
         self.loop_depth += 1;
         let b = self.check_block(body, None);
@@ -843,6 +910,15 @@ impl<'p> Checker<'p> {
                     self.declare_binder(name, s.ty, LocalKind::Owned { mutable: false }, pat.span);
                 let b = self.check_loop_body(body);
                 StmtKind::ForRange { var, start: s, end: e, inclusive: *inclusive, body: b }
+            }
+            ast::ForIter::Expr(e) if let Some(reverse) = crate::fieldwise::fields_walk(e) => {
+                match self.check_walk(name, mutable, reverse, pat, e, body) {
+                    Some(k) => k,
+                    None => {
+                        self.env.truncate(env_len);
+                        return None;
+                    }
+                }
             }
             ast::ForIter::Expr(e) => {
                 // `for x in xs.iter()` (or `.iter_mut()`), as in Rust: the loop goes over `xs`.
@@ -1151,6 +1227,7 @@ fn has_break(b: &Block) -> bool {
         StmtKind::While { .. } | StmtKind::Loop { .. } => false,
         StmtKind::ForRange { start, end, .. } => in_expr(start) || in_expr(end),
         StmtKind::ForEach { array, .. } => in_expr(array),
+        StmtKind::ForFields { .. } => false,
     }) || b.tail.as_ref().is_some_and(|t| in_expr(t))
 }
 
@@ -1320,7 +1397,7 @@ fn check_borrow_structs(p: &Program) -> Vec<Diagnostic> {
 pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let def = p.func(f);
     if def.derived.is_some() {
-        let (body, diags) = crate::fieldwise::derive(p, f);
+        let (body, diags) = crate::fieldwise::derive(p, consts, f);
         return FnCheck { body, diags, incomplete: false };
     }
     let none = FnCheck { body: None, diags: Vec::new(), incomplete: false };

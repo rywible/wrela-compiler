@@ -101,7 +101,6 @@ export type Command =
   | { op: "StorageRead"; request: number; path: string }
   | { op: "StorageWrite"; request: number; path: string; data: Bytes }
   | { op: "Fetch"; request: number; url: string }
-  | { op: "Log"; text: string }
   | { op: "Label"; name: string }
   | { op: "Post"; request: number; url: string; body: Bytes };
 
@@ -374,13 +373,11 @@ export function decode(batch: Bytes): Command[] {
         cmd = name === "Fetch" ? { op: name, request: w(0), url: t } : { op: name, request: w(0), path: t };
         break;
       }
-      case "Log":
       case "Label": {
         if (words < 1) throw bad("expected at least 1 word");
         const n = w(0);
         if (padded(n) !== len - 4) throw bad("the text's length doesn't match the payload");
-        const t = text(4, n, "text");
-        cmd = name === "Log" ? { op: name, text: t } : { op: name, name: t };
+        cmd = { op: name, name: text(4, n, "text") };
         break;
       }
       case "StorageWrite": {

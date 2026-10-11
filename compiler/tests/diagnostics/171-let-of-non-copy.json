@@ -16,6 +16,7 @@
           "message": "read it in place: `borrow`"
         },
         {
+          "choice": true,
           "edits": [
             {
               "end": 219,
@@ -27,6 +28,7 @@
           "message": "copy it: `.clone()`"
         },
         {
+          "choice": true,
           "edits": [
             {
               "end": 214,

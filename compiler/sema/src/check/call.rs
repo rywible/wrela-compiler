@@ -949,7 +949,7 @@ impl<'p> Checker<'p> {
     /// A value of a parameter's type bounded by `have` (`G: fn(..)`) passed where a function
     /// of type `want` is expected: the same parameters, modes and result, and each attribute
     /// `want` asks for (`@deterministic`, `@parallel`, `@audio`) in `have` too.
-    fn pass_bounded(&mut self, have: TyId, want: TyId, span: Span) {
+    pub(super) fn pass_bounded(&mut self, have: TyId, want: TyId, span: Span) {
         let (TyKind::FnPtr(hp, hr, hf), TyKind::FnPtr(wp, wr, wf)) =
             (self.kind(have).clone(), self.kind(want).clone())
         else {
@@ -983,7 +983,7 @@ impl<'p> Checker<'p> {
     /// Argument coercions: an array or a `Vec` passes as a run (`[T; N]` and `Vec<T>` to
     /// `[T]`), a `GpuSpan<T>` too (in GPU code, where it's its buffer's elements, §12; CPU code
     /// can't read them, E0607), and a `Text` or a `String` as a `str`; otherwise unify.
-    fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
+    pub(super) fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
         if matches!(self.kind(param_ty), TyKind::Str) && self.is_stringy(e.ty) {
             return;
         }
@@ -2728,7 +2728,15 @@ impl<'p> Checker<'p> {
         let fields: Vec<Expr> =
             held.into_iter().map(|x| x.unwrap_or_else(|| self.error_expr(span))).collect();
         let ty = self.p.types.adt(adt, gen_args.clone());
-        let kind = ExprKind::Adt { adt, args: gen_args, variant: None, fields, order, base: None };
+        let kind = ExprKind::Adt {
+            adt,
+            args: gen_args,
+            variant: None,
+            fields,
+            order,
+            base: None,
+            literal: false,
+        };
         Expr { ty, span, kind }
     }
 

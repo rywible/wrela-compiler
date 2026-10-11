@@ -284,7 +284,14 @@ impl<T: StateHash> StateHash for Vec<T> {
 }
 
 impl<T: StateHash> StateHash for Box<T> {
+    /// An empty box (a job's local not yet set) hashes as a 0; a box with a value as a 1 and
+    /// the value.
     fn state_hash(self, h: mut Hasher) {
-        self.get().state_hash(mut h)
+        if self.is_empty() {
+            h.write_u32(0)
+        } else {
+            h.write_u32(1)
+            self.get().state_hash(mut h)
+        }
     }
 }

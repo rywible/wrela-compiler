@@ -1490,9 +1490,9 @@ const SUBJECT: &str = "// What the lens shows of this package: the replica.
 
 use engine::creature::Creature
 use replica::replica
-use std::field::{Color, Field, Lipschitz}
+use std::field::{Color, Field}
 
-pub fn subject() -> Field<Color> + Lipschitz {
+pub fn subject() -> Field<Color> {
     replica().field()
 }
 ";

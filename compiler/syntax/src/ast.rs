@@ -731,6 +731,11 @@ pub enum ExprKind {
         value: Box<Expr>,
         count: Box<Expr>,
     },
+    /// `[a, b, ..fill]`: the elements written, then `fill` to the array's length.
+    ArrayFill {
+        items: Vec<Expr>,
+        fill: Box<Expr>,
+    },
     Paren(Box<Expr>),
     Block(Block),
     /// `if cond { }`, or `if let pat = cond { }` when `pat` is there.
@@ -868,6 +873,10 @@ impl Expr {
                 }
             }
             ExprKind::Tuple(xs) | ExprKind::Array(xs) => xs.iter().for_each(f),
+            ExprKind::ArrayFill { items, fill } => {
+                items.iter().for_each(&mut *f);
+                f(fill);
+            }
             ExprKind::Block(b) | ExprKind::Unsafe(b) => b.for_each_expr(f),
             ExprKind::FString(parts) => {
                 for p in parts {

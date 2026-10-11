@@ -1,0 +1,37 @@
+// accepts: const.fuel
+// A constant may set its own fuel, above the build's 2^34 units or below: a literal, a power or
+// a product of them (§10). So may a test of code, above a test's 2^37.
+@fuel(2 ** 40)
+const TABLE: Vec<u32> = squares(4096)
+
+@fuel(4 * 2 ** 30)
+const SUM: u32 = sum(TABLE)
+
+@fuel(1 << 36)
+const SMALL: u32 = 7
+
+fn squares(n: u32) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new()
+    for i in 0..n {
+        out.push((i * i) % 1000)
+    }
+    out
+}
+
+fn sum(xs: [u32]) -> u32 {
+    var s: u32 = 0
+    for x in xs {
+        s += x
+    }
+    s
+}
+
+fn f() -> u32 {
+    SUM + SMALL
+}
+
+@test
+@fuel(2 ** 40)
+fn sums_a_long_table() {
+    assert(sum(squares(1 << 16)) > 0)
+}

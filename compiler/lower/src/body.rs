@@ -2037,6 +2037,22 @@ impl<'c, 'a> Fl<'c, 'a> {
             }
         }
         let it = it?;
+        // A job's value (loaded, `fn.job-values`): its parts in their fields, zeros in its
+        // temporaries'.
+        if variant.is_none() && self.cx.job_of(ct).is_some() {
+            let out = self.new_local("job", it);
+            let z = self.value(it, ir::Expr::Zero(it));
+            self.emit(ir::Stmt::Store(ir::Place::local(out), z));
+            let mut vals = vals.into_iter();
+            for (k, _) in map.iter() {
+                if let Some(k) = k
+                    && let Some(v) = vals.next()
+                {
+                    self.emit(ir::Stmt::Store(ir::Place::local(out).with(ir::Proj::Field(*k)), v));
+                }
+            }
+            return Some(self.load(ir::Place::local(out), it));
+        }
         match variant {
             None => Some(self.value(it, ir::Expr::Construct(it, vals))),
             Some(v) => {

@@ -1,0 +1,53 @@
+// run: a struct literal moves the locals it names, and `..base` gives its fields to the value
+// built (a base that's a parameter, a local or a temporary, its heap fields read after)
+// expect: field_moves() = 3
+// expect: from_param() = 5
+// expect: from_local() = 5
+// expect: from_temp() = 5
+// expect: kept_count() = 2
+
+struct Log {
+    lines: Vec<u32>,
+}
+
+struct Archive {
+    log: Log,
+    count: u32,
+}
+
+fn made() -> Archive {
+    var log = Log { lines: Vec::new() }
+    log.lines.push(5)
+    Archive { log, count: 0 }
+}
+
+fn renumbered(a: take Archive) -> Archive {
+    Archive { count: 2, ..a }
+}
+
+pub fn field_moves() -> u32 {
+    var log = Log { lines: Vec::new() }
+    log.lines.push(3)
+    let a = Archive { log, count: 1 }
+    a.log.lines[0]
+}
+
+pub fn from_param() -> u32 {
+    renumbered(made()).log.lines[0]
+}
+
+pub fn from_local() -> u32 {
+    let a = made()
+    let b = Archive { count: 2, ..a }
+    b.log.lines[0]
+}
+
+pub fn from_temp() -> u32 {
+    let b = Archive { count: 2, ..made() }
+    b.log.lines[0]
+}
+
+pub fn kept_count() -> u32 {
+    let a = Archive { count: 2, ..made() }
+    a.count
+}

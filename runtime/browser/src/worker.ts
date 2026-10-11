@@ -49,6 +49,9 @@ class GpuError extends Error {
 }
 
 let base = "";
+/** The build that's running's base: the page's, until a hot reload swaps another in. Its files
+ * are fetched from there (the server deletes old builds, the page's among them). */
+let buildBase = "";
 let testing = false;
 let failed = false;
 /** Input events from the main thread (input.ts). */
@@ -176,7 +179,7 @@ interface Carried {
  * on (`carried`). */
 function programOptions(b: Build, ticks: TickSettings, carried: Carried | null): ProgramOptions {
   return {
-    io: browserIo(base),
+    io: browserIo(base, undefined, buildBase),
     spawnWorker,
     startVoice,
     startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
@@ -195,6 +198,7 @@ async function swap(
   start: (build: Build, carried: Carried) => Promise<Program>,
 ): Promise<Program> {
   const build = await loadBuild(base);
+  buildBase = base;
   let replay: Replay | null = null;
   if (old.ticker !== null && ticker.report !== null) {
     const stopped = ticker.report;
@@ -360,6 +364,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   const script: Scripted[] = params.input ? parseScript(await (await fetch(new URL(params.input, base))).text()) : [];
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
+  // The tick log needs only the ticks' hashes (the sim's state, cheap), not the frames'.
+  const tickHashes = hashes || params.ticklog > 0;
   let pipelinesMs: number | null = null;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
   const target = {
@@ -380,10 +386,14 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       b,
       target,
       {
-        ...programOptions(b, { script, hashes, timing: true, delay: params.tickdelay, replayable: live !== null }, carried),
+        ...programOptions(
+          b,
+          { script, hashes: tickHashes, timing: true, delay: params.tickdelay, replayable: live !== null },
+          carried,
+        ),
         hash: hashes,
         workers: params.workers,
-        tickHashes: hashes,
+        tickHashes,
         onPrint: (line) => {
           printed.push(line);
           printed_in.push(frameNow);
@@ -447,6 +457,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       if (control.failed) return;
     }
     for (const e of frameEvents.get(i) ?? []) program.queueInput(e);
+    if (params.clip > 0 && i === params.clipfrom) self.postMessage({ type: "clip-start" } satisfies FromWorker);
+    if (params.clip > 0 && i === params.clipfrom + params.clip) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     latency.frames.push(epochNow());
     for (const sent of deliverInput(program)) latency.delivered.push({ sent, frame: i });
     const began = performance.now();
@@ -467,13 +479,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       drains.push(draining);
       if (drains.length > 2) await drains.shift()!.catch(() => {});
     }
-    if (params.saturate > 0) {
+    if (params.saturate > 0 || params.inflight > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
-      if (inFlight.length > 2) await inFlight.shift();
+      if (inFlight.length > (params.saturate > 0 ? 2 : params.inflight)) await inFlight.shift();
     } else await device.queue.onSubmittedWorkDone();
     await executor.checkDebugFlag();
     if (executor.presented) live?.drawn(i);
     executor.presented = false;
+    // `snap=n`: the screen every n frames from `snapfrom`, a PNG each (`snap-<frame>.png`).
+    if (params.snap > 0 && i >= params.snapfrom && (i - params.snapfrom) % params.snap === 0) {
+      await putResult(base, `snap-${i}.png`, encodePng(width, height, await readTexture(device, screen)));
+    }
   }
   await draining;
   // Where the pipelines' time went: each built again alone, from code no cache has seen.
@@ -508,6 +524,10 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     await latencySent.promise;
     await putResult(base, "latency.json", JSON.stringify(latency));
   }
+  if (params.clip > 0) {
+    if (params.clipfrom + params.clip >= frames) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
+    await clipSaved.promise;
+  }
   self.postMessage({ type: "load-query" } satisfies FromWorker);
   const page = await pageLoaded.promise;
   const resources = [...page.resources, ...loaded(["resource"])];
@@ -530,6 +550,9 @@ const audioRendered = Promise.withResolvers<void>();
 /** Test mode, `latency`: resolved when the main thread has sent its events. */
 const latencySent = Promise.withResolvers<void>();
 
+/** Test mode, `clip`: resolved when the main thread has saved the clip. */
+const clipSaved = Promise.withResolvers<void>();
+
 /** Test mode: resolved with what the page loaded, when the main thread answers. */
 const pageLoaded = Promise.withResolvers<{ opened_ms: number; resources: Loaded[] }>();
 
@@ -551,18 +574,22 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
     case "latency-sent":
       latencySent.resolve();
       return;
+    case "clip-saved":
+      clipSaved.resolve();
+      return;
     case "thread":
       // It runs until the program shuts it down, or the page goes away.
       void runWorker(msg.module, msg.memory, msg.index);
       return;
     case "start": {
       base = msg.base;
+      buildBase = msg.base;
       testing = msg.test !== null;
       ring = new InputRing(msg.input);
       size = { width: msg.width, height: msg.height };
       const test = msg.test;
       // The device and the build are fetched at once.
-      const live = msg.live ? new Live(base) : null;
+      const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       Promise.all([openDevice((test?.timestamps ?? 0) > 0), loadBuild(base)])
         .then(([device, build]) => (test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live)))

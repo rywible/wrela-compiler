@@ -81,7 +81,7 @@ pub fn start<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> 
         if load_u32(TICK_WANT_HASH) != 0 {
             report(hash(state))
         }
-        let at = place(Ticker { state: take state, step, hash, hz })
+        let at = place(Ticker { state, step, hash, hz })
         start_ticker(task(run_tick::<S, F, H>), at, hz)
     }
 }
@@ -135,6 +135,7 @@ fn records() -> Vec<Event> {
 @thread_entry
 pub(package) fn tick(thread: u32, task: u32, ticker: u32, k: u32) {
     unsafe {
+        std::alloc::reach_heap()
         run_task(task, ticker, k)
     }
 }

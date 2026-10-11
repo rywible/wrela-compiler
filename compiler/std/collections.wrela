@@ -746,6 +746,17 @@ impl<T> Box<T> {
         unsafe { mut at_mut::<T, Box<T>>(mut self, self.addr) }
     }
 
+    /// Whether it holds nothing: it was moved out, or it's a job's local not yet set (a job's
+    /// value is zeros where it holds nothing, §6.18), which clones, hashes and saves as itself.
+    pub fn is_empty(self) -> bool {
+        self.addr == 0
+    }
+
+    /// A box that holds nothing, as a job's local not yet set is: what loading one gives.
+    pub(package) fn empty() -> Box<T> {
+        Box { addr: 0 }
+    }
+
     /// The value, moved off the heap.
     pub fn into_inner(take self) -> T {
         var b = take self
@@ -771,11 +782,18 @@ impl<T> Drop for Box<T> {
 
 impl<T: Clone> Clone for Box<T> {
     fn clone(self) -> Box<T> {
+        if self.is_empty() {
+            return Box::empty()
+        }
         Box::new(self.get().clone())
     }
 
     /// Reuses `into`'s block, and what its value owns.
     fn clone_into(self, into: mut Box<T>) {
+        if self.is_empty() || into.is_empty() {
+            into = self.clone()
+            return
+        }
         self.get().clone_into(mut into.get_mut())
     }
 }
@@ -809,7 +827,7 @@ fn a_vec_sorts_stably_whatever_its_length() {
             s = s.wrapping_mul(1664525).wrapping_add(1013904223)
             var owned = Vec::new()
             owned.push(i)
-            v.push(Keyed { key: (s >> 16) % 50, order: i, owned: take owned })
+            v.push(Keyed { key: (s >> 16) % 50, order: i, owned })
         }
         v.sort_by(|a, b| a.key < b.key)
         assert(v.len() == n)

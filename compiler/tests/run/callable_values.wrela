@@ -177,17 +177,16 @@ pub fn closure_rebound() -> i32 {
     d(1)
 }
 
-fn apply_take(f: take fn(i32), x: i32) {
+fn apply_take(f: take fn(i32) -> i32, x: i32) -> i32 {
     f(x)
 }
 
-// A callable moved with `take` is still called: through a `take` parameter, and through a local
-// it was moved into.
+// A callable moved with `take` is still called: through a `take` parameter (which keeps it, so
+// it captures values: `fn.fields`), and through a local it was moved into.
 pub fn taken_closure() -> i32 {
-    var n = 0
-    let c = |x: i32| { n += x }
-    apply_take(take c, 7)
-    n
+    let k = 3
+    let c = |x: i32| x + k
+    apply_take(take c, 4)
 }
 
 pub fn taken_fn() -> i32 {

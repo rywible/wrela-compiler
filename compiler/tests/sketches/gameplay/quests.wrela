@@ -79,7 +79,7 @@ fn parse_quests(file: String) -> Vec<QuestDef> {
                 }
                 let q = quests.len() - 1
                 quests[q].stages.push(
-                    Stage { journal: c[1].clone(), goal: take goal, reward: take reward },
+                    Stage { journal: c[1].clone(), goal: take goal, reward },
                 )
             },
             _ => w.stop(f"unknown line `{keyword}`"),

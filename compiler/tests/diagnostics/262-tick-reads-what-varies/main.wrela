@@ -5,7 +5,7 @@ use engine::run::{Asks, TickInput, run}
 use engine::sim::{Sim, Tick}
 use std::gpu::{GpuBuffer, read}
 use std::handoff::{Latest, handoff}
-use std::par::{Job, job}
+use std::par::{Task, spawn}
 use std::tick::origin
 
 pub struct World: Sim {
@@ -38,7 +38,7 @@ fn peek(seen: mut Latest<u32>) -> u32 {
 }
 
 @deterministic
-fn finished(pending: Job<u32>) -> bool {
+fn finished(pending: Task<u32>) -> bool {
     pending.done()
 }
 
@@ -68,7 +68,7 @@ pub fn init() -> u32 {
     var latest = take first
     let _ = peek(mut latest)
     let _ = clock()
-    let pending = job(4, twice)
+    let pending = spawn(4, twice)
     let _ = finished(pending)
     let _ = take pending.join()
     let _ = run(World { tick: 0 }, hz: 60, step: step, present: snap)

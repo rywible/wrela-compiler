@@ -4,34 +4,25 @@
 //! glyphs at the same places, and its drawing is timed.
 
 use std::path::Path;
-use wrela_host::{GpuTiming, Timing};
-use wrela_wfont::{Font, Options};
+use wrela_host::{CpuHost, GpuTiming, Timing, Value};
 
-const FONTS: [(&str, &str); 2] = [
-    ("ui/fonts/Inter-Regular-Latin1.ttf", "ui/fonts/inter.wfont"),
-    ("ui/fonts/JetBrainsMono-Regular-Latin1.ttf", "ui/fonts/mono.wfont"),
-];
+/// The fonts' files, in the order of ui's faces (`Sans`, `Mono`).
+const FONTS: [&str; 2] =
+    ["ui/fonts/Inter-Regular-Latin1.ttf", "ui/fonts/JetBrainsMono-Regular-Latin1.ttf"];
 
 fn read(path: &str) -> Vec<u8> {
     std::fs::read(wrela_tests::repo_root().join(path)).unwrap_or_else(|e| panic!("{path}: {e}"))
 }
 
-/// The checked-in `.wfont` files are what tools/wfont makes from the fonts, each is at most
-/// 200 KB, and a build holds each one's bytes once: what a font adds to a build.
+/// The build bakes each font from its file (ui/ttf.wrela), into at most 200 KB of fields:
+/// what a font adds to a build.
 #[test]
-fn the_fonts_are_current_and_small() {
-    let built = crate::built("../../ui/tests/text");
-    let wasm = std::fs::read(built.join("game.wasm")).expect("game.wasm");
-    for (ttf, wfont) in FONTS {
-        let made = wrela_wfont::make(&read(ttf), &Options::default()).expect("makes");
-        assert!(
-            made == read(wfont),
-            "{wfont} is stale: run `cargo run -p wrela-wfont -- {ttf} {wfont}`"
-        );
-        println!("{wfont}: {} bytes", made.len());
-        assert!(made.len() <= 200 * 1024, "{wfont} is {} bytes, over 200 KB", made.len());
-        let found = wasm.windows(made.len()).filter(|w| *w == made.as_slice()).count();
-        assert_eq!(found, 1, "the build holds {wfont} {found} times");
+fn the_fonts_are_baked_small() {
+    let mut host = CpuHost::load(crate::built("../../ui/tests/text")).expect("load");
+    for (face, ttf) in FONTS.iter().enumerate() {
+        let bytes = wrela_tests::one_u32(&mut host, "field_bytes", &[Value::I32(face as i32)]);
+        println!("{ttf}: {bytes} bytes of fields");
+        assert!(bytes > 100 * 1024 && bytes <= 200 * 1024, "{ttf}: {bytes} bytes of fields");
     }
 }
 
@@ -58,12 +49,15 @@ fn line_top(face: usize, i: usize) -> f32 {
 }
 
 /// Draws `text` with ab_glyph into `img` (RGB floats, `w` wide) at `size` pixels per em, its
-/// glyphs at the pens `font` lays them out at, white over what's there.
+/// glyphs at the pens the program lays them out at (`pens`, its font's `ascender` in ems),
+/// white over what's there.
+#[allow(clippy::too_many_arguments)]
 fn reference_line(
     img: &mut [f32],
     w: usize,
     ttf: &[u8],
-    font: &Font,
+    pens: &[f32],
+    ascender: f32,
     text: &str,
     size: f32,
     top: f32,
@@ -73,9 +67,9 @@ fn reference_line(
     let upem = face.units_per_em().expect("units per em");
     // ab_glyph's scale is the height from descender to ascender, in pixels.
     let scale = PxScale::from(size * face.height_unscaled() / upem);
-    let baseline = (top + font.ascender * size + 0.5).floor();
+    let baseline = (top + ascender * size + 0.5).floor();
     let h = img.len() / (3 * w);
-    for (c, (_, pen)) in text.chars().zip(font.layout(text, size, 10.0)) {
+    for (c, &pen) in text.chars().zip(pens) {
         let id = face.glyph_id(if face.glyph_id(c).0 == 0 { '-' } else { c });
         let glyph = id.with_scale_and_position(scale, point(pen, baseline));
         if let Some(o) = face.outline_glyph(glyph) {
@@ -128,12 +122,21 @@ fn text_matches_a_reference_rasterizer() {
         px.copy_from_slice(&bg);
     }
     let mut worst_checked: f64 = 0.0;
-    for (f, (ttf, wfont)) in FONTS.iter().enumerate() {
-        let ttf = read(ttf);
-        let font = Font::parse(&read(wfont)).expect("a .wfont");
+    // Where the program lays each glyph out, and its fonts' ascenders.
+    let mut layout = CpuHost::load(&built).expect("load");
+    for (f, file) in FONTS.iter().enumerate() {
+        let ttf = read(file);
+        let face = Value::I32(f as i32);
+        let ascender = wrela_tests::one_f32(&mut layout, "ascender", &[face]);
         for i in 0..14 {
             let (text, size) = (if i % 2 == 0 { LATIN } else { MORE }, SIZES[i / 2]);
-            reference_line(&mut reference, w, &ttf, &font, text, size, line_top(f, i));
+            let pens: Vec<f32> = (0..text.chars().count())
+                .map(|k| {
+                    let at = [face, Value::I32(i as i32), Value::I32(k as i32)];
+                    wrela_tests::one_f32(&mut layout, "pen", &at)
+                })
+                .collect();
+            reference_line(&mut reference, w, &ttf, &pens, ascender, text, size, line_top(f, i));
         }
         for i in 0..14 {
             let size = SIZES[i / 2];
@@ -141,13 +144,13 @@ fn text_matches_a_reference_rasterizer() {
             let checked = [16.0, 24.0, 48.0].contains(&size);
             println!(
                 "{} {size} px, line {}: mean {mean:.2}/255{}",
-                Path::new(wfont).file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
+                Path::new(file).file_stem().and_then(|s| s.to_str()).unwrap_or("?"),
                 i % 2,
                 if checked { "" } else { " (measured)" }
             );
             if checked {
                 worst_checked = worst_checked.max(mean);
-                assert!(mean <= 4.0, "{wfont} at {size} px: a mean of {mean:.2}/255");
+                assert!(mean <= 4.0, "{file} at {size} px: a mean of {mean:.2}/255");
             }
         }
     }

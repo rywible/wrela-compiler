@@ -21,3 +21,9 @@ fn counts_its_frames(game: Game) {
 @test(frames: 1)
 fn runs_a_frame() {
 }
+
+// A GPU frame test may compare the screen after its frames with a PNG in the package, within a
+// mean difference (0.5 unless it says); `wrela test --bless` writes the PNG.
+@test(frames: 10, gpu: true, golden: "goldens/frame.png", within: 1.5)
+fn looks_as_it_did(game: Game) {
+}

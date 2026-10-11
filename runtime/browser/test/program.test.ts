@@ -9,7 +9,7 @@ import { type Command, StreamError } from "../src/stream.ts";
 import { wasmOffsets } from "../src/lines.ts";
 import { Encoder } from "./encoder.ts";
 import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
-import { batchProgram, buildModule, FRAME_TYPE, op, SUBMIT } from "./wasm-builder.ts";
+import { batchProgram, buildModule, FRAME_TYPE, type Import, op, SUBMIT } from "./wasm-builder.ts";
 
 const U16 = new Uint8Array(16);
 
@@ -336,7 +336,7 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("21cf54db42e693e6");
+  expect(program.hash!.hex()).toBe("b0550120310e39f1");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -448,12 +448,29 @@ describe("the voice", () => {
   });
 });
 
-test("a logged line goes to the console, prefixed", async () => {
+test("a printed line goes to the console as it's made, prefixed, and a phase is ignored", async () => {
+  const PRINT: Import = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const PHASE: Import = { ...PRINT, name: "phase" };
+  const line = new TextEncoder().encode("frame 1 é");
+  // phase("x"); print(line); then a trap: the line is shown though the frame never ends.
+  const body = [...op.i32(16), ...op.i32(1), ...op.call(1), ...op.i32(32), ...op.i32(line.length), ...op.call(0), ...op.unreachable];
+  const printedLines: string[] = [];
   const log = spyOn(console, "log").mockImplementation(() => {});
   try {
-    const { error } = await run([[new Encoder().log("frame 1 é").finish()]]);
-    expect(error).toBeNull();
+    const program = await Program.load(
+      buildModule({
+        imports: [PRINT, PHASE],
+        memory: 1,
+        funcs: [{ type: FRAME_TYPE, body, export: "frame" }],
+        data: [{ offset: 16, bytes: Uint8Array.of(120) }, { offset: 32, bytes: line }],
+      }),
+      checker(),
+      new Recorder(),
+      { onPrint: (l) => printedLines.push(l) },
+    );
+    expect(() => program.frame(0, 64, 64)).toThrow();
     expect(log).toHaveBeenCalledWith("wrela: frame 1 é");
+    expect(printedLines).toEqual(["frame 1 é"]);
   } finally {
     log.mockRestore();
   }

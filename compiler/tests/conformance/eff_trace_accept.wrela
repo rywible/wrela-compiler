@@ -1,0 +1,43 @@
+// accepts: eff.trace
+// A line printed and a phase timed are outputs the program never reads back (the `trace`
+// effect): a constant, a test, `@deterministic` code and a parallel job's chunk print and time
+// their phases too.
+use std::io::print
+use std::time::phase
+
+fn summed(n: u32) -> u32 {
+    var total = 0
+    for i in 0..n {
+        phase("sum")
+        total += i
+        if i % 4 == 0 {
+            print(f"{i}: {total}")
+        }
+    }
+    phase("")
+    total
+}
+
+const SUMMED: u32 = summed(10)
+
+@deterministic
+fn tick(turn: u32) -> u32 {
+    print(f"turn {turn}")
+    turn + 1
+}
+
+@test
+fn sums() {
+    phase("checking")
+    assert(SUMMED == 45)
+    assert(tick(1) == 2)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var counts: Vec<u32> = Vec::filled(8, 0)
+    counts.par_each_mut(|c| {
+        phase("chunk")
+        c += 1
+    })
+    print(f"{counts.len()} counted")
+}

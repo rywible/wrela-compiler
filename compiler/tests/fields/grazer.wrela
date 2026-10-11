@@ -10,8 +10,8 @@
 // - `Grazer` is the field (spike 01's field.wgsl, `grazer_d`): twenty parts smooth-unioned in a
 //   fixed order, built from those numbers. Its structure is its type; the numbers are data.
 use std::field::{
-    Displace, Ellipsoid, Fbm, HalfSpace, Intersect, Lipschitz, RoundCone, SmoothUnion, Surface,
-    Translate, ellipsoid, fbm, half_space, round_cone, smin,
+    Displace, Ellipsoid, Fbm, HalfSpace, Intersect, Surface, RoundCone, SmoothUnion, Translate,
+    ellipsoid, fbm, half_space, round_cone, smin,
 }
 
 /// The spike's `Grazer` uniform: 8 header floats, then 20 parts of 16.
@@ -247,9 +247,7 @@ impl Surface for Grazer {
         }
         d
     }
-}
 
-impl Lipschitz for Grazer {
     /// The fold's gradient mixes its parts' with weights that add up to 1. A part keeps a
     /// weight only while each later blend lowers the running value by at most 1.25 k, so where
     /// the grazer is within `near`, part `i` of the fold's twenty is within `near + 1.25 k (21

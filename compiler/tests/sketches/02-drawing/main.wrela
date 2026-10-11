@@ -39,7 +39,7 @@ pub fn init() -> Scene {
         meshes,
         palettes: buffer(2 * MAX_BONES),
         depth: depth_texture(width: 1, height: 1),
-        shadow: take shadow,
+        shadow,
         shadow_sampler: comparison_sampler(),
         width: 1,
         height: 1,

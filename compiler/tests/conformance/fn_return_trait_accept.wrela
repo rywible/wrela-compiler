@@ -3,17 +3,17 @@
 // with `+`, which the type has every one of; in parameter position, `x: A + B` is any type
 // with them all. A generic parameter that only a bound mentions (`C` in `F: Field<C>`) is
 // inferred from the one way the argument has that trait.
-use std::field::{Color, Field, Lipschitz, Surface, rgb, sphere}
+use std::field::{Color, Field, Surface, rgb, sphere}
 
 fn ball(r: f32) -> Surface {
     sphere(r).translate(vec3(y: r))
 }
 
-fn red_ball(r: f32) -> Field<Color> + Lipschitz {
+fn red_ball(r: f32) -> Field<Color> {
     sphere(r).with(rgb(r: 1.0, g: 0.0, b: 0.0))
 }
 
-fn reach(f: Field<Color> + Lipschitz) -> f32 {
+fn reach(f: Field<Color>) -> f32 {
     f.lipschitz(0.1) + f.channels(vec3()).r
 }
 

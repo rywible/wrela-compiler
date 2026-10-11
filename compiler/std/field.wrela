@@ -3,9 +3,10 @@
 // `SmoothUnion<Sphere, RoundCone>`, whose value is a few floats that reach the GPU as a uniform.
 //
 // A `Surface` is a signed distance. A `Field<C>` is a surface whose points also carry channels
-// `C` (D-002), which the combinators blend where surfaces blend (`Blend`). A `Lipschitz`
-// surface states a bound on its gradient, near the surface (D-092), so sphere tracing can step
-// by it (`to_bound`). A `Noise` states its range, its gradient's bound and its bandlimit.
+// `C` (D-002), which the combinators blend where surfaces blend (`Blend`). A surface states a
+// bound on its gradient near itself (`lipschitz`, D-092), so sphere tracing can step by it
+// (`to_bound`); a closure of a point states none. A `Noise` states its range, its gradient's
+// bound and its bandlimit.
 //
 // A surface's parts are the leaves of its tree of combinators (language.md §22): each knows
 // which part decides its distance at a point (`part_at`), each part's own distance, and its
@@ -65,6 +66,47 @@ pub trait Surface: Copy + GpuData {
         interval(|q| self.distance(q), over)
     }
 
+    /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§17,
+    /// D-092), so sphere tracing can step by it: primitives state theirs, combinators compose
+    /// their parts' in ordinary code and pass the scope on. A consumer passes the scope it
+    /// needs: a step of at most `near` (`to_bound`), or an interval test over a block that
+    /// straddles the surface, at least the block's radius. A surface that states none (a
+    /// closure of a point) is unbounded: infinite.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0 / 0.0
+    }
+
+    /// A range holding its distance over `b`: the derived interval, narrowed by the distance
+    /// at `b`'s centre and the bound (spike 01's culling interval). The derived interval says
+    /// how far from the surface `b` can be, which is the scope the bound needs; along the
+    /// segment from the centre to any point of `b`, the distance then changes by at most the
+    /// bound times the half-diagonal. Each narrows the other: a culling test keeps fewer boxes
+    /// with both. A displacement narrows its surface's and adds its noise's range, which is
+    /// tighter than its noise's steepness allows and needs no noise at the centre.
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.interval(b)
+        let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
+        if l >= 1.0e30 {
+            return x
+        }
+        let r = l * 0.5 * length(b.hi - b.lo)
+        let d = self.distance(0.5 * (b.lo + b.hi))
+        Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
+    }
+
+    /// The distance, held within ±`near` and divided by `lipschitz(near)`: never more than the
+    /// distance to the surface, so sphere tracing can step by it. A debug build checks the
+    /// bound against the derived gradient first (`check_lipschitz`). An unbounded surface (a
+    /// closure's, or an ellipsoid's with its centre in scope) gives 0: nothing a tracer can step
+    /// by.
+    fn to_bound(self, near: f32) -> ToBound<Self> {
+        let l = self.lipschitz(near)
+        if debug_build() {
+            check_lipschitz(self, near, l)
+        }
+        ToBound { inner: self, near, scale: 1.0 / l }
+    }
+
     /// Every point inside either surface: the smaller distance.
     fn union<B: Surface>(self, b: B) -> Union<Self, B> {
         Union { a: self, b }
@@ -82,7 +124,7 @@ pub trait Surface: Copy + GpuData {
 
     /// The same surface, moved by `by`.
     fn translate(self, by: vec3) -> Translate<Self> {
-        Translate { inner: self, by }
+        Warp { inner: self, map: Shift { by } }
     }
 
     /// Adds `amp` times a noise to the distance: wrinkles, bark, terrain.
@@ -114,12 +156,12 @@ pub trait Surface: Copy + GpuData {
 
     /// The same surface, turned by `by` about the origin.
     fn rotate(self, by: Quat) -> Rotate<Self> {
-        Rotate { inner: self, to_local: by.inverse().to_mat3() }
+        Warp { inner: self, map: Turn { to_local: by.inverse().to_mat3() } }
     }
 
     /// The same surface, `by` times the size, about the origin.
     fn scale(self, by: f32) -> Scale<Self> {
-        Scale { inner: self, by }
+        Warp { inner: self, map: Size { by } }
     }
 
     /// The surface and its mirror image in the plane x = 0: what it is at `p`, it is at
@@ -561,6 +603,11 @@ impl Surface for Sphere {
     fn bound(self) -> Bound {
         Bound { centre: vec3(), radius: self.radius, slope: 1.0 }
     }
+
+    /// Exact: its gradient is a unit vector.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
 }
 
 /// An ellipsoid centred at the origin. No exact distance exists; this is the usual bound.
@@ -596,6 +643,22 @@ impl Surface for Ellipsoid {
             slope: 0.5,
         }
     }
+
+    /// The bound k0 (k0 − 1) / k1, with k0 = |p / r| and k1 = |p / r²|, has a gradient that
+    /// grows without bound at the centre. Where |distance| < near, |k0 − 1| < e = near /
+    /// min(r), and its gradient is at most max(2 − 1 / (1 + e), 1 / (1 − e) − 2) +
+    /// e (max(r) / min(r))² / (1 − e). Infinite from e = 1 on, where the centre is in scope.
+    fn lipschitz(self, near: f32) -> f32 {
+        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
+        let e = max(near, 0.0) / lo
+        if e >= 1.0 {
+            return 1.0 / 0.0
+        }
+        let first = max(2.0 - 1.0 / (1.0 + e), 1.0 / (1.0 - e) - 2.0)
+        let r = hi / lo
+        (first + e * r * r / (1.0 - e)) * 1.001
+    }
 }
 
 /// An ellipsoid whose distance stays well behaved: outside it's `Ellipsoid`'s, which is near
@@ -623,6 +686,17 @@ impl Surface for Oval {
 
     fn bound(self) -> Bound {
         ellipsoid(self.radii).bound()
+    }
+
+    /// Inside, 1. Outside, within `near` (e = near / min(r)): the first term of `Ellipsoid`'s
+    /// gradient is at most 2 − 1 / (1 + e), and the second, from k1's change, e (max(r) /
+    /// min(r))² / (1 + e).
+    fn lipschitz(self, near: f32) -> f32 {
+        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
+        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
+        let e = max(near, 0.0) / lo
+        let r = hi / lo
+        max(1.0, 2.0 - 1.0 / (1.0 + e) + e * r * r / (1.0 + e)) * 1.001
     }
 }
 
@@ -653,6 +727,11 @@ impl<const N: u32> Surface for Tube<N> {
             d = min(d, c.distance(p))
         }
         d
+    }
+
+    /// A union of exact distances: 1.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
     }
 }
 
@@ -707,6 +786,11 @@ impl Surface for RoundCone {
         let half = 0.5 * length(self.b - self.a)
         Bound { centre: 0.5 * (self.a + self.b), radius: half + max(self.r1, self.r2), slope: 1.0 }
     }
+
+    /// Exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
 }
 
 /// A box centred at the origin, with half-extents `half`. Exact.
@@ -732,6 +816,11 @@ impl Surface for Cuboid {
     fn bound(self) -> Bound {
         Bound { centre: vec3(), radius: length(self.half), slope: 1.0 }
     }
+
+    /// Exact.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
 }
 
 /// Everything on the negative side of a plane: `dot(p, normal) < offset`. The distance is
@@ -754,6 +843,11 @@ pub fn half_space(normal: vec3, offset: f32) -> HalfSpace {
 impl Surface for HalfSpace {
     fn distance(self, p: vec3) -> f32 {
         dot(p, self.normal) - self.offset
+    }
+
+    /// Exact: `half_space` makes its normal a unit vector.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
     }
 }
 
@@ -887,6 +981,11 @@ impl<A: Surface, B: Surface> Surface for Union<A, B> {
     fn part_name(self, i: u32) -> PartName {
         pair_part_name(self.a, self.b, i)
     }
+
+    /// The smaller distance's: where it's within `near`, so is the part's.
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
 }
 
 /// Two surfaces joined by a rounded seam: `a.smooth_union(b, k)`.
@@ -931,6 +1030,14 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
 
     fn part_name(self, i: u32) -> PartName {
         pair_part_name(self.a, self.b, i)
+    }
+
+    /// `smin`'s gradient mixes its parts' with weights that add up to 1. Where it's within
+    /// `near`, the parts are within `near + 1.25 k`: the smaller is at most `k / 4` above it,
+    /// and they blend only where they're less than `k` apart.
+    fn lipschitz(self, near: f32) -> f32 {
+        let scope = near + 1.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(scope), self.b.lipschitz(scope))
     }
 }
 
@@ -1011,6 +1118,14 @@ impl<S: Surface, const N: u32> Surface for UnionAll<S, N> {
     fn part_name(self, i: u32) -> PartName {
         array_part_name(self.parts, i)
     }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        var l = 0.0
+        for i in 0..N {
+            l = max(l, self.parts[i].lipschitz(near))
+        }
+        l
+    }
 }
 
 /// A fixed array of surfaces joined by rounded seams: `parts.smooth_union(k)`.
@@ -1087,6 +1202,17 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
     fn part_name(self, i: u32) -> PartName {
         array_part_name(self.parts, i)
     }
+
+    /// As `SmoothUnion`'s, with the scope widened by `1.25 k` for each `smin` a part goes
+    /// through: at most `N - 1`.
+    fn lipschitz(self, near: f32) -> f32 {
+        let scope = near + 1.25 * max(self.k, 0.0) * f32(max(N, 1) - 1)
+        var l = 0.0
+        for i in 0..N {
+            l = max(l, self.parts[i].lipschitz(scope))
+        }
+        l
+    }
 }
 
 /// The distance of a union of no parts: farther than anything a scene holds.
@@ -1136,29 +1262,66 @@ impl<A: Surface, B: Surface> Surface for Intersect<A, B> {
     fn part_name(self, i: u32) -> PartName {
         pair_part_name(self.a, self.b, i)
     }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.a.lipschitz(near), self.b.lipschitz(near))
+    }
 }
 
-/// A surface moved: `s.translate(by)`.
-pub struct Translate<S>: Copy + GpuData {
+/// How a warp takes a point into its surface's own space (`translate`, `rotate`, `scale`), and
+/// its distances back: what each combinator that moves the point does, while the warp passes
+/// every method of the surface on through it, once for all of them.
+pub trait PointMap: Copy + GpuData {
+    /// `p` in the surface's own space.
+    fn local(self, p: vec3) -> vec3
+
+    /// A distance in the surface's own space, in this one.
+    fn distance_out(self, d: f32) -> f32 {
+        d
+    }
+
+    /// A distance in this space, in the surface's own.
+    fn distance_in(self, d: f32) -> f32 {
+        d
+    }
+
+    /// A length in this space (a footprint, a bound's scope), in the surface's own.
+    fn length_in(self, x: f32) -> f32 {
+        x
+    }
+
+    /// The surface's bound (`Surface::bound`), in this space: by default, none.
+    fn bound(self, b: Bound) -> Bound {
+        UNBOUNDED
+    }
+}
+
+/// A surface whose points are moved before it's asked about them: `s.translate(by)`,
+/// `s.rotate(by)` and `s.scale(by)`, each a `PointMap`.
+pub struct Warp<S, M>: Copy + GpuData {
     pub inner: S,
-    pub by: vec3,
+    pub map: M,
 }
 
-impl<S: Surface> Surface for Translate<S> {
+impl<S: Surface, M: PointMap> Surface for Warp<S, M> {
     fn distance(self, p: vec3) -> f32 {
-        self.inner.distance(p - self.by)
+        self.map.distance_out(self.inner.distance(self.map.local(p)))
     }
 
     fn bound(self) -> Bound {
-        self.inner.bound().moved(self.by)
+        self.map.bound(self.inner.bound())
     }
 
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
-        self.inner.filtered(p - self.by, footprint)
+        self.map.distance_out(self.inner.filtered(self.map.local(p), self.map.length_in(footprint)))
     }
 
+    /// `by` is in this surface's units: the inner surface's part is raised by as much in its
+    /// own.
     fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
-        self.inner.part_offset(p - self.by, i, by)
+        self.map.distance_out(
+            self.inner.part_offset(self.map.local(p), i, self.map.distance_in(by)),
+        )
     }
 
     fn parts(self) -> u32 {
@@ -1166,15 +1329,86 @@ impl<S: Surface> Surface for Translate<S> {
     }
 
     fn part_at(self, p: vec3) -> (f32, u32) {
-        self.inner.part_at(p - self.by)
+        let (d, i) = self.inner.part_at(self.map.local(p))
+        (self.map.distance_out(d), i)
     }
 
     fn part_distance(self, p: vec3, i: u32) -> f32 {
-        self.inner.part_distance(p - self.by, i)
+        self.map.distance_out(self.inner.part_distance(self.map.local(p), i))
     }
 
     fn part_name(self, i: u32) -> PartName {
         self.inner.part_name(i)
+    }
+
+    /// Moving, turning and scaling keep a gradient's length; the scope is the inner surface's.
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(self.map.length_in(near))
+    }
+}
+
+/// A surface moved by `by`: `s.translate(by)`.
+pub type Translate<S> = Warp<S, Shift>
+
+/// A surface turned about the origin: `s.rotate(by)`.
+pub type Rotate<S> = Warp<S, Turn>
+
+/// A surface scaled about the origin: `s.scale(by)`. Distances scale with it, so a distance
+/// stays a distance.
+pub type Scale<S> = Warp<S, Size>
+
+/// Moved by `by`.
+pub struct Shift: Copy + GpuData {
+    pub by: vec3,
+}
+
+impl PointMap for Shift {
+    fn local(self, p: vec3) -> vec3 {
+        p - self.by
+    }
+
+    fn bound(self, b: Bound) -> Bound {
+        b.moved(self.by)
+    }
+}
+
+/// Turned about the origin: `to_local` takes a point into the surface's own space.
+pub struct Turn: Copy + GpuData {
+    pub to_local: mat3,
+}
+
+impl PointMap for Turn {
+    /// Column by column, as a derived interval needs (it has no matrix arithmetic).
+    fn local(self, p: vec3) -> vec3 {
+        let m = self.to_local
+        m[0] * p.x + m[1] * p.y + m[2] * p.z
+    }
+}
+
+/// Scaled by `by` about the origin.
+pub struct Size: Copy + GpuData {
+    pub by: f32,
+}
+
+impl PointMap for Size {
+    fn local(self, p: vec3) -> vec3 {
+        p / self.by
+    }
+
+    fn distance_out(self, d: f32) -> f32 {
+        d * self.by
+    }
+
+    fn distance_in(self, d: f32) -> f32 {
+        d / self.by
+    }
+
+    fn length_in(self, x: f32) -> f32 {
+        x / abs(self.by)
+    }
+
+    fn bound(self, b: Bound) -> Bound {
+        Bound { centre: b.centre * self.by, radius: b.radius * abs(self.by), slope: b.slope }
     }
 }
 
@@ -1218,6 +1452,27 @@ impl<S: Surface, N: Noise> Surface for Displace<S, N> {
 
     fn part_name(self, i: u32) -> PartName {
         self.inner.part_name(i)
+    }
+
+    /// The inner surface's bound, where it's within `near` plus the displacement's reach, and
+    /// the noise's, scaled by the amplitude.
+    fn lipschitz(self, near: f32) -> f32 {
+        let r = self.noise.range()
+        let reach = abs(self.amp) * max(abs(r.lo), abs(r.hi))
+        self.inner.lipschitz(near + reach) + abs(self.amp) * self.noise.lipschitz()
+    }
+
+    /// The inner surface's, plus the noise's range scaled by the amplitude: no noise evaluated,
+    /// and narrower than the noise's steepness allows. Widened by the rounding of the noise's
+    /// sum and of this one.
+    fn interval_near(self, b: Box3) -> Interval {
+        let x = self.inner.interval_near(b)
+        let r = self.noise.range()
+        let e = 1.0e-5 * max(abs(r.lo), abs(r.hi))
+        let (a, c) = (self.amp * (r.lo - e), self.amp * (r.hi + e))
+        let lo = x.lo + min(a, c)
+        let hi = x.hi + max(a, c)
+        Interval { lo: lo - 1.0e-6 * abs(lo), hi: hi + 1.0e-6 * abs(hi) }
     }
 }
 
@@ -1267,6 +1522,13 @@ impl<A: Surface, B: Surface> Surface for SmoothSubtract<A, B> {
     fn part_name(self, i: u32) -> PartName {
         pair_part_name(self.a, self.b, i)
     }
+
+    /// A smooth maximum's gradient is a weighted mean of its operands', so the larger bound,
+    /// each within `near` plus the blend's reach (`k / 4`).
+    fn lipschitz(self, near: f32) -> f32 {
+        let n = near + 0.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(n), self.b.lipschitz(n))
+    }
 }
 
 /// What two surfaces hold in common, rounded: `a.smooth_intersect(b, k)`.
@@ -1308,95 +1570,10 @@ impl<A: Surface, B: Surface> Surface for SmoothIntersect<A, B> {
     fn part_name(self, i: u32) -> PartName {
         pair_part_name(self.a, self.b, i)
     }
-}
 
-/// A surface turned about the origin: `s.rotate(by)`. It keeps the rotation that takes a point
-/// into the surface's own space.
-pub struct Rotate<S>: Copy + GpuData {
-    pub inner: S,
-    pub to_local: mat3,
-}
-
-impl<S> Rotate<S> {
-    /// `p` in the surface's own space: column by column, as a derived interval needs (it has
-    /// no matrix arithmetic).
-    fn local(self, p: vec3) -> vec3 {
-        let m = self.to_local
-        m[0] * p.x + m[1] * p.y + m[2] * p.z
-    }
-}
-
-impl<S: Surface> Surface for Rotate<S> {
-    fn distance(self, p: vec3) -> f32 {
-        self.inner.distance(self.local(p))
-    }
-
-    fn filtered(self, p: vec3, footprint: f32) -> f32 {
-        self.inner.filtered(self.local(p), footprint)
-    }
-
-    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
-        self.inner.part_offset(self.local(p), i, by)
-    }
-
-    fn parts(self) -> u32 {
-        self.inner.parts()
-    }
-
-    fn part_at(self, p: vec3) -> (f32, u32) {
-        self.inner.part_at(self.local(p))
-    }
-
-    fn part_distance(self, p: vec3, i: u32) -> f32 {
-        self.inner.part_distance(self.local(p), i)
-    }
-
-    fn part_name(self, i: u32) -> PartName {
-        self.inner.part_name(i)
-    }
-}
-
-/// A surface scaled about the origin: `s.scale(by)`. Distances scale with it, so a distance
-/// stays a distance.
-pub struct Scale<S>: Copy + GpuData {
-    pub inner: S,
-    pub by: f32,
-}
-
-impl<S: Surface> Surface for Scale<S> {
-    fn distance(self, p: vec3) -> f32 {
-        self.inner.distance(p / self.by) * self.by
-    }
-
-    fn bound(self) -> Bound {
-        let b = self.inner.bound()
-        Bound { centre: b.centre * self.by, radius: b.radius * abs(self.by), slope: b.slope }
-    }
-
-    fn filtered(self, p: vec3, footprint: f32) -> f32 {
-        self.inner.filtered(p / self.by, footprint / abs(self.by)) * self.by
-    }
-
-    /// `by` is in this surface's units: the inner surface's part is raised by `by / self.by`.
-    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
-        self.inner.part_offset(p / self.by, i, by / self.by) * self.by
-    }
-
-    fn parts(self) -> u32 {
-        self.inner.parts()
-    }
-
-    fn part_at(self, p: vec3) -> (f32, u32) {
-        let (d, i) = self.inner.part_at(p / self.by)
-        (d * self.by, i)
-    }
-
-    fn part_distance(self, p: vec3, i: u32) -> f32 {
-        self.inner.part_distance(p / self.by, i) * self.by
-    }
-
-    fn part_name(self, i: u32) -> PartName {
-        self.inner.part_name(i)
+    fn lipschitz(self, near: f32) -> f32 {
+        let n = near + 0.25 * max(self.k, 0.0)
+        max(self.a.lipschitz(n), self.b.lipschitz(n))
     }
 }
 
@@ -1459,6 +1636,10 @@ impl<S: Surface> Surface for Mirror<S> {
             name
         }
     }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
 }
 
 /// A surface that is one part, named: `s.named(name)`.
@@ -1482,6 +1663,14 @@ impl<S: Surface> Surface for Named<S> {
 
     fn part_name(self, i: u32) -> PartName {
         PartName { name: self.name, group: "", frame: "", mirrored: false }
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
     }
 }
 
@@ -1672,45 +1861,6 @@ pub const VALUE_NOISE_LIPSCHITZ: f32 = 6.5
 
 // ---- Lipschitz bounds ---------------------------------------------------------------------------
 
-/// A surface that bounds its own gradient near itself, so sphere tracing can step by it (§17,
-/// D-092). Primitives state their bound; combinators compose their parts' in ordinary code, and
-/// pass the scope on.
-pub trait Lipschitz: Surface {
-    /// A bound on the length of `distance`'s gradient wherever |distance| < `near`. A consumer
-    /// passes the scope it needs: a step of at most `near` (`to_bound`), or an interval test
-    /// over a block that straddles the surface, at least the block's radius.
-    fn lipschitz(self, near: f32) -> f32
-
-    /// A range holding its distance over `b`: the derived interval, narrowed by the distance
-    /// at `b`'s centre and the bound (spike 01's culling interval). The derived interval says
-    /// how far from the surface `b` can be, which is the scope the bound needs; along the
-    /// segment from the centre to any point of `b`, the distance then changes by at most the
-    /// bound times the half-diagonal. Each narrows the other: a culling test keeps fewer boxes
-    /// with both. A displacement narrows its surface's and adds its noise's range, which is
-    /// tighter than its noise's steepness allows and needs no noise at the centre.
-    fn interval_near(self, b: Box3) -> Interval {
-        let x = self.interval(b)
-        let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
-        if l >= 1.0e30 {
-            return x
-        }
-        let r = l * 0.5 * length(b.hi - b.lo)
-        let d = self.distance(0.5 * (b.lo + b.hi))
-        Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
-    }
-
-    /// The distance, held within ±`near` and divided by `lipschitz(near)`: never more than the
-    /// distance to the surface, so sphere tracing can step by it. A debug build checks the
-    /// bound against the derived gradient first (`check_lipschitz`).
-    fn to_bound(self, near: f32) -> ToBound<Self> {
-        let l = self.lipschitz(near)
-        if debug_build() {
-            check_lipschitz(self, near, l)
-        }
-        ToBound { inner: self, near, scale: 1.0 / l }
-    }
-}
-
 /// A surface divided by its Lipschitz bound: `.to_bound(near)`.
 pub struct ToBound<S>: Copy + GpuData {
     pub inner: S,
@@ -1747,9 +1897,7 @@ impl<S: Surface> Surface for ToBound<S> {
     fn part_name(self, i: u32) -> PartName {
         self.inner.part_name(i)
     }
-}
 
-impl<S: Surface> Lipschitz for ToBound<S> {
     fn lipschitz(self, near: f32) -> f32 {
         1.0
     }
@@ -1763,216 +1911,6 @@ impl<C, S: Field<C>> Field<C> for ToBound<S> {
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
         let (d, c) = self.inner.distance_and_channels(p)
         (clamp(d, -self.near, self.near) * self.scale, c)
-    }
-}
-
-impl Lipschitz for Sphere {
-    /// Exact: its gradient is a unit vector.
-    fn lipschitz(self, near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Lipschitz for RoundCone {
-    /// Exact.
-    fn lipschitz(self, near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Lipschitz for Cuboid {
-    /// Exact.
-    fn lipschitz(self, near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Lipschitz for HalfSpace {
-    /// Exact: `half_space` makes its normal a unit vector.
-    fn lipschitz(self, near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Lipschitz for Oval {
-    /// Inside, 1. Outside, within `near` (e = near / min(r)): the first term of `Ellipsoid`'s
-    /// gradient is at most 2 − 1 / (1 + e), and the second, from k1's change, e (max(r) /
-    /// min(r))² / (1 + e).
-    fn lipschitz(self, near: f32) -> f32 {
-        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
-        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
-        let e = max(near, 0.0) / lo
-        let r = hi / lo
-        max(1.0, 2.0 - 1.0 / (1.0 + e) + e * r * r / (1.0 + e)) * 1.001
-    }
-}
-
-impl<const N: u32> Lipschitz for Tube<N> {
-    /// A union of exact distances: 1.
-    fn lipschitz(self, near: f32) -> f32 {
-        1.0
-    }
-}
-
-impl Lipschitz for Ellipsoid {
-    /// The bound k0 (k0 − 1) / k1, with k0 = |p / r| and k1 = |p / r²|, has a gradient that
-    /// grows without bound at the centre. Where |distance| < near, |k0 − 1| < e = near /
-    /// min(r), and its gradient is at most max(2 − 1 / (1 + e), 1 / (1 − e) − 2) +
-    /// e (max(r) / min(r))² / (1 − e). Infinite from e = 1 on, where the centre is in scope.
-    fn lipschitz(self, near: f32) -> f32 {
-        let lo = min(self.radii.x, min(self.radii.y, self.radii.z))
-        let hi = max(self.radii.x, max(self.radii.y, self.radii.z))
-        let e = max(near, 0.0) / lo
-        if e >= 1.0 {
-            return 1.0 / 0.0
-        }
-        let first = max(2.0 - 1.0 / (1.0 + e), 1.0 / (1.0 - e) - 2.0)
-        let r = hi / lo
-        (first + e * r * r / (1.0 - e)) * 1.001
-    }
-}
-
-impl<A: Lipschitz, B: Lipschitz> Lipschitz for Union<A, B> {
-    /// The smaller distance's: where it's within `near`, so is the part's.
-    fn lipschitz(self, near: f32) -> f32 {
-        max(self.a.lipschitz(near), self.b.lipschitz(near))
-    }
-}
-
-impl<S: Lipschitz, const N: u32> Lipschitz for UnionAll<S, N> {
-    fn lipschitz(self, near: f32) -> f32 {
-        var l = 0.0
-        for i in 0..N {
-            l = max(l, self.parts[i].lipschitz(near))
-        }
-        l
-    }
-}
-
-impl<S: Lipschitz, const N: u32> Lipschitz for SmoothUnionAll<S, N> {
-    /// As `SmoothUnion`'s, with the scope widened by `1.25 k` for each `smin` a part goes
-    /// through: at most `N - 1`.
-    fn lipschitz(self, near: f32) -> f32 {
-        let scope = near + 1.25 * max(self.k, 0.0) * f32(max(N, 1) - 1)
-        var l = 0.0
-        for i in 0..N {
-            l = max(l, self.parts[i].lipschitz(scope))
-        }
-        l
-    }
-}
-
-impl<A: Lipschitz, B: Lipschitz> Lipschitz for Intersect<A, B> {
-    fn lipschitz(self, near: f32) -> f32 {
-        max(self.a.lipschitz(near), self.b.lipschitz(near))
-    }
-}
-
-impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothUnion<A, B> {
-    /// `smin`'s gradient mixes its parts' with weights that add up to 1. Where it's within
-    /// `near`, the parts are within `near + 1.25 k`: the smaller is at most `k / 4` above it,
-    /// and they blend only where they're less than `k` apart.
-    fn lipschitz(self, near: f32) -> f32 {
-        let scope = near + 1.25 * max(self.k, 0.0)
-        max(self.a.lipschitz(scope), self.b.lipschitz(scope))
-    }
-}
-
-impl<S: Lipschitz> Lipschitz for Translate<S> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-
-    fn interval_near(self, b: Box3) -> Interval {
-        self.inner.interval_near(Box3 { lo: b.lo - self.by, hi: b.hi - self.by })
-    }
-}
-
-impl<S: Lipschitz, N: Noise> Lipschitz for Displace<S, N> {
-    /// The inner surface's bound, where it's within `near` plus the displacement's reach, and
-    /// the noise's, scaled by the amplitude.
-    fn lipschitz(self, near: f32) -> f32 {
-        let r = self.noise.range()
-        let reach = abs(self.amp) * max(abs(r.lo), abs(r.hi))
-        self.inner.lipschitz(near + reach) + abs(self.amp) * self.noise.lipschitz()
-    }
-
-    /// The inner surface's, plus the noise's range scaled by the amplitude: no noise evaluated,
-    /// and narrower than the noise's steepness allows. Widened by the rounding of the noise's
-    /// sum and of this one.
-    fn interval_near(self, b: Box3) -> Interval {
-        let x = self.inner.interval_near(b)
-        let r = self.noise.range()
-        let e = 1.0e-5 * max(abs(r.lo), abs(r.hi))
-        let (a, c) = (self.amp * (r.lo - e), self.amp * (r.hi + e))
-        let lo = x.lo + min(a, c)
-        let hi = x.hi + max(a, c)
-        Interval { lo: lo - 1.0e-6 * abs(lo), hi: hi + 1.0e-6 * abs(hi) }
-    }
-}
-
-impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothSubtract<A, B> {
-    /// A smooth maximum's gradient is a weighted mean of its operands', so the larger bound,
-    /// each within `near` plus the blend's reach (`k / 4`).
-    fn lipschitz(self, near: f32) -> f32 {
-        let n = near + 0.25 * max(self.k, 0.0)
-        max(self.a.lipschitz(n), self.b.lipschitz(n))
-    }
-}
-
-impl<A: Lipschitz, B: Lipschitz> Lipschitz for SmoothIntersect<A, B> {
-    fn lipschitz(self, near: f32) -> f32 {
-        let n = near + 0.25 * max(self.k, 0.0)
-        max(self.a.lipschitz(n), self.b.lipschitz(n))
-    }
-}
-
-impl<S: Lipschitz> Lipschitz for Rotate<S> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-}
-
-impl<S: Lipschitz> Lipschitz for Scale<S> {
-    /// Scaling keeps a gradient's length; `near` is the inner surface's `near / by`.
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near / abs(self.by))
-    }
-}
-
-impl<S: Lipschitz> Lipschitz for Mirror<S> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-}
-
-impl<S: Lipschitz> Lipschitz for Named<S> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-
-    fn interval_near(self, b: Box3) -> Interval {
-        self.inner.interval_near(b)
-    }
-}
-
-impl<S: Lipschitz, C: Copy + GpuData> Lipschitz for With<S, C> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-
-    fn interval_near(self, b: Box3) -> Interval {
-        self.inner.interval_near(b)
-    }
-}
-
-impl<S: Lipschitz, F: Copy + GpuData> Lipschitz for WithAt<S, F> {
-    fn lipschitz(self, near: f32) -> f32 {
-        self.inner.lipschitz(near)
-    }
-
-    fn interval_near(self, b: Box3) -> Interval {
-        self.inner.interval_near(b)
     }
 }
 
@@ -2168,6 +2106,14 @@ impl<S: Surface, C: Copy + GpuData> Surface for With<S, C> {
     fn part_name(self, i: u32) -> PartName {
         self.inner.part_name(i)
     }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
+    }
 }
 
 impl<S: Surface, C: Copy + GpuData> Field<C> for With<S, C> {
@@ -2217,6 +2163,14 @@ impl<S: Surface, F: Copy + GpuData> Surface for WithAt<S, F> {
 
     fn part_name(self, i: u32) -> PartName {
         self.inner.part_name(i)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        self.inner.lipschitz(near)
+    }
+
+    fn interval_near(self, b: Box3) -> Interval {
+        self.inner.interval_near(b)
     }
 }
 
@@ -2293,13 +2247,14 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for Intersect<A, B> {
     }
 }
 
-impl<C, S: Field<C>> Field<C> for Translate<S> {
+impl<C, S: Field<C>, M: PointMap> Field<C> for Warp<S, M> {
     fn channels(self, p: vec3) -> C {
-        self.inner.channels(p - self.by)
+        self.inner.channels(self.map.local(p))
     }
 
     fn distance_and_channels(self, p: vec3) -> (f32, C) {
-        self.inner.distance_and_channels(p - self.by)
+        let (d, c) = self.inner.distance_and_channels(self.map.local(p))
+        (self.map.distance_out(d), c)
     }
 }
 
@@ -2384,27 +2339,6 @@ impl<C: Blend, A: Field<C>, B: Field<C>> Field<C> for SmoothIntersect<A, B> {
     }
 }
 
-impl<C, S: Field<C>> Field<C> for Rotate<S> {
-    fn channels(self, p: vec3) -> C {
-        self.inner.channels(self.local(p))
-    }
-
-    fn distance_and_channels(self, p: vec3) -> (f32, C) {
-        self.inner.distance_and_channels(self.local(p))
-    }
-}
-
-impl<C, S: Field<C>> Field<C> for Scale<S> {
-    fn channels(self, p: vec3) -> C {
-        self.inner.channels(p / self.by)
-    }
-
-    fn distance_and_channels(self, p: vec3) -> (f32, C) {
-        let (d, c) = self.inner.distance_and_channels(p / self.by)
-        (d * self.by, c)
-    }
-}
-
 impl<C, S: Field<C>> Field<C> for Mirror<S> {
     fn channels(self, p: vec3) -> C {
         self.inner.channels(mirrored(p))
@@ -2429,7 +2363,7 @@ impl<C, S: Field<C>> Field<C> for Named<S> {
 
 /// A blob of every primitive, smooth-unioned, and displaced by noise: what std's field tests
 /// check.
-fn test_blob() -> Lipschitz {
+fn test_blob() -> Surface {
     let body = ellipsoid(vec3(1.0, 0.6, 0.8))
     let limb = round_cone(vec3(0.5, -0.2, 0.0), vec3(1.4, 0.6, 0.2), r_top: 0.15, r_bottom: 0.3)
     let block = cuboid(vec3(0.3)).translate(vec3(-0.9, 0.4, 0.1))

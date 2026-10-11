@@ -1,4 +1,4 @@
-//! The program's threads (#43 §2–§3, AC6): long jobs (`std::par::job`), parallel work started
+//! The program's threads (#43 §2–§3, AC6): tasks (`std::par::spawn`), parallel work started
 //! inside parallel work, hand-offs (`std::handoff`) and per-thread allocation counts, natively
 //! with 1, 2 and 8 threads (the program's own and its helpers). compiler/tests/jobs is the
 //! program.
@@ -29,6 +29,21 @@ fn jobs_give_the_same_results_with_any_helpers() {
     }
 }
 
+/// A job a program polls (`done`) is done before long, with no helpers too: then the first poll
+/// runs it, since no helper would ever start it (a page on a two-core machine has none; the map
+/// lens, which polls its preview, waited forever in test mode's one thread).
+#[test]
+fn a_polled_job_is_done_with_any_helpers() {
+    const MOST: u32 = 2_000_000_000;
+    let mut host = start(1);
+    assert_eq!(one_u32(&mut host, "polled", &[Value::I32(200_000), Value::I32(MOST as i32)]), 0);
+    for workers in [2, 8] {
+        let mut host = start(workers);
+        let polls = one_u32(&mut host, "polled", &[Value::I32(200_000), Value::I32(MOST as i32)]);
+        assert!(polls < MOST, "{workers} threads: the job was never done");
+    }
+}
+
 /// A trap in a job is the program's panic at its `join`, with the job's message, whichever
 /// thread ran it: with no helpers, one or seven, and with each job's result held back (slowed)
 /// so the joining thread waits for it.
@@ -44,6 +59,39 @@ fn a_trapping_job_traps_at_its_join() {
         let failure = host.last_failure().expect("a trap");
         assert_eq!(failure.panic.as_deref(), Some("a job's input was 13"));
     }
+}
+
+/// A job that fills the heap panics at its join with its own message, every time, while the
+/// joining thread makes and drops blocks of its own (M6, AC15). Before the allocator let its lock
+/// go to panic, the job's thread ran out of memory holding the lock, and the joining thread spun
+/// on it until its count of tries overflowed, 66 s later, with a trap that hid the job's panic
+/// (spike 17's bake, 2 runs of 11). 100 runs, two threads each, four at a time.
+#[test]
+#[ignore = "long: fills a gigabyte of heap 100 times"]
+fn a_job_that_fills_the_heap_panics_at_its_join() {
+    let build = CpuBuild::load(built("jobs")).expect("load");
+    let runs = sized(100, 1000);
+    let next = std::sync::atomic::AtomicU32::new(0);
+    std::thread::scope(|s| {
+        for _ in 0..4 {
+            s.spawn(|| {
+                while next.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < runs {
+                    let t = std::time::Instant::now();
+                    let mut host = build.start_with(2).expect("start");
+                    let e = host
+                        .call_export("fill_the_heap_while_allocating", &[])
+                        .expect_err("the heap runs out");
+                    let failure = host.last_failure().expect("a trap");
+                    let took = t.elapsed().as_secs_f64();
+                    assert!(
+                        failure.panic.as_deref().is_some_and(|m| m.starts_with("out of memory")),
+                        "the run failed otherwise, after {took:.1} s: {e}"
+                    );
+                    assert!(took < 20.0, "a run took {took:.1} s");
+                }
+            });
+        }
+    });
 }
 
 /// Parallel work started inside a parallel closure runs on that thread alone, chunk after
@@ -209,7 +257,9 @@ fn the_ticker_in_chrome_agrees_with_the_native_host() {
 /// A job that traps does so at the tick that takes it (AC6): `engine::run`'s world asks at tick
 /// 2 for a job due at tick 10, and at tick 5 for one due at tick 20 whose work panics; the ticks
 /// before 20 run, and tick 20 traps with the job's message. With no helpers, one or seven, and
-/// with jobs slowed (each result held 100 ms, so tick 10 waits for its job). The ticks are 2 ms
+/// with jobs slowed (each result held 100 ms, so tick 10 waits for its job: it ends no sooner
+/// than 100 ms after tick 2 asked for it, however long the ticks between took; a machine loaded
+/// by other work slowed them, and a bound on tick 10's own wait failed). The ticks are 2 ms
 /// apart, so a helper takes each job before its due tick does.
 #[test]
 fn a_trapping_job_traps_at_the_tick_that_takes_it() {
@@ -220,12 +270,18 @@ fn a_trapping_job_traps_at_the_tick_that_takes_it() {
         let mut host = build.instantiate_in(workers, None).expect("instantiate");
         host.hold_jobs(hold);
         host.init().expect("init");
+        let mut asked = std::time::Instant::now();
         for k in 0..20 {
-            let t = std::time::Instant::now();
+            if k == 2 {
+                asked = std::time::Instant::now();
+            }
             host.tick().unwrap_or_else(|e| panic!("{workers} threads, held {hold}: tick {k}: {e}"));
             if k == 10 && hold > 0 {
-                let waited = t.elapsed().as_secs_f64() * 1000.0;
-                assert!(waited > 50.0, "{workers} threads: tick 10 took {waited:.1} ms");
+                let since = asked.elapsed().as_secs_f64() * 1000.0;
+                assert!(
+                    since >= 95.0,
+                    "{workers} threads: tick 10 ended {since:.1} ms after the ask"
+                );
             }
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -295,3 +351,36 @@ pub fn init() -> Game {
 
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
 ";
+
+/// Memory one thread grew is every thread's to use (compiler/tests/grown), in Chrome with 8
+/// threads and natively: `init` grows the heap in 64 steps while the host starts the helpers; a
+/// task grows and frees 192 MiB while the others sleep, then wakes them to a parallel job whose
+/// chunks grow vectors from that memory; the program's thread grows the heap each frame
+/// meanwhile, then writes a block of 160 MiB. In Chrome a helper that started while the memory
+/// grew saw an old size, and trapped on blocks beyond it (std's `alloc` line 127, as the map
+/// lens did), until std asked for the memory's size wherever a thread takes memory another may
+/// have grown (`std::alloc::reach_heap`).
+#[test]
+#[ignore = "long: needs Chrome, python3 and a GPU"]
+fn memory_a_helper_grew_is_every_threads() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/grown", "grown-chrome");
+    let native = {
+        let mut host = wrela_host::Host::load(&dir).expect("load");
+        let (mut lines, began) = (Vec::new(), std::time::Instant::now());
+        for i in 0.. {
+            assert!(began.elapsed().as_secs() < 60, "natively, the helper never finished");
+            host.frame(i as f32 / 60.0, 16, 16).expect("a frame");
+            lines.extend(host.take_logs());
+            if lines.iter().any(|l| l.starts_with("used")) {
+                break;
+            }
+        }
+        lines.into_iter().find(|l| l.starts_with("used")).expect("natively, the block's used")
+    };
+    let run =
+        wrela_tests::ChromeRun { workers: 8, ..wrela_tests::ChromeRun::new(1200, 16, 16, 60.0) };
+    let _ = wrela_tests::run_in_chrome_with(&rel, run);
+    let log = std::fs::read_to_string(dir.join("results/log.txt")).expect("log.txt");
+    let used = log.lines().find(|l| l.starts_with("used")).unwrap_or_default();
+    assert_eq!(used, native, "in Chrome, the block carved from what a helper grew: {log}");
+}

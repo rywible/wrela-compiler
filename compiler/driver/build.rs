@@ -21,12 +21,18 @@ fn main() {
         walk(&root.join("compiler/tests/conformance"), &|_| true, &|n| n.ends_with(".wrela"));
     out("conformance.rs", &table("CASES", "&str", "include_str", &cases));
     // The studio's packages (studio/ and ui/), so the command works from any directory: each
-    // package's modules, manifest and fonts, not its tests or build output, by path from it.
+    // package's modules, manifest, fonts and their licences, not its tests or build output, by
+    // path from it.
     let mut packages = String::new();
     for (name, dir) in [("STUDIO", "studio"), ("UI", "ui")] {
         let skip =
             |n: &str| ["tests", "build", "results", "target"].contains(&n) || n.starts_with('.');
-        let keep = |n: &str| n.ends_with(".wrela") || n == "wrela.toml" || n.ends_with(".wfont");
+        let keep = |n: &str| {
+            n.ends_with(".wrela")
+                || n == "wrela.toml"
+                || n.ends_with(".ttf")
+                || (n.starts_with("OFL") && n.ends_with(".txt"))
+        };
         let files = walk(&root.join(dir), &|n| !skip(n), &keep);
         packages.push_str(&table(name, "&[u8]", "include_bytes", &files));
     }

@@ -1,0 +1,37 @@
+// `take` before a local in a struct literal, which needs none: a struct literal moves a local
+// it names whose type isn't `Copy`, as `take` would, so the word adds nothing. A use of the
+// local after the literal is a use after a move, as after `take`.
+// ---- wrong
+struct Log {
+    lines: Vec<u32>,
+}
+
+struct Archive {
+    log: Log,
+}
+
+fn archive() -> Archive {
+    let log = Log { lines: Vec::new() }
+    Archive { log: take log }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = archive()
+}
+// ---- fixed
+struct Log {
+    lines: Vec<u32>,
+}
+
+struct Archive {
+    log: Log,
+}
+
+fn archive() -> Archive {
+    let log = Log { lines: Vec::new() }
+    Archive { log }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = archive()
+}

@@ -1,0 +1,28 @@
+// accepts: ty.enum-arrays
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+enum Species: Copy + Eq + Fieldless {
+    Oak,
+    Beech,
+    Birch,
+}
+
+struct Heights: Copy + GpuData {
+    of: [f32; Species],
+}
+
+const HEIGHTS = Heights { of: [30.0, 25.0, 18.0] }
+
+// A table indexed by its enum, on the GPU too.
+@compute(64)
+fn tallest(h: Heights, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = max(h.of[Species::Oak], max(h.of[Species::Beech], h.of[Species::Birch]))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var seen: [u32; Species] = [..0]
+    seen[Species::Birch] += 1
+    let _ = HEIGHTS.of[Species::Beech] + f32(seen[2])
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(tallest.bind(HEIGHTS, mut out), groups: 1)
+}

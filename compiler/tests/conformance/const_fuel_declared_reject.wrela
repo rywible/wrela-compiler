@@ -1,0 +1,12 @@
+// rejects: const.fuel
+// A constant stops at the fuel it sets, as a compile error (§10).
+fn count(n: u32) -> u32 {
+    var s: u32 = 0
+    for i in 0..n { //~ E0705
+        s = s.wrapping_add(i)
+    }
+    s
+}
+
+@fuel(2 ** 12)
+const N = count(1000000)

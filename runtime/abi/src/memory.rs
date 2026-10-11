@@ -11,7 +11,7 @@
 //! | [`TICK_STATE`] – 4095 | the ticker's words, which hosts and std's `std::tick` share |
 //! | [`CMD_BASE`] – | the command buffer: a batch header, then up to [`CMD_CAP`] bytes |
 //! | [`THREAD_BLOCKS`] – | a block for each thread ([`THREADS`] of them, [`THREAD_BLOCK_SIZE`] bytes each) |
-//! | [`JOB_SLOTS`] – | the long jobs in flight (`std::par::job`), [`JOB_SLOT_COUNT`] slots |
+//! | [`TASK_SLOTS`] – | the tasks in flight (`std::par::spawn`), [`TASK_SLOT_COUNT`] slots |
 //! | [`TICK_RECORDS`] – | the records of the tick about to run: a `u32` count, then up to [`MAX_TICK_RECORDS`] events |
 //! | [`AUDIO_OUT`] – | a render quantum's samples, from the audio thread |
 //! | [`STACK_LIMIT`] – [`STACK_TOP`] | the program's thread's shadow stack, which grows down |
@@ -53,7 +53,7 @@
 //!
 //! A program that uses parallelism exports `__worker`. A host calls it once on each helper,
 //! with numbers from [`THREAD_HELPER0`], after instantiating the module there. It runs chunks of
-//! any thread's parallel job and long jobs until the host sets [`PAR_SHUTDOWN`] and wakes it
+//! any thread's parallel job and tasks until the host sets [`PAR_SHUTDOWN`] and wakes it
 //! (`memory.atomic.notify` on [`PAR_WAKE`]). If a helper traps, its host reads the helper's
 //! [`RUNNING`] word and tells the thread that waits:
 //! - a thread block's job ([`JOB_GENERATION`]'s address): it stores the helper's number plus 1 in
@@ -75,7 +75,7 @@ pub const ALLOC_STATE: u32 = 16;
 
 /// The helpers' shared words.
 pub const PAR_STATE: u32 = 256;
-/// Bumped whenever work appears (a parallel job starts, a long job is queued): helpers wait on
+/// Bumped whenever work appears (a parallel job starts, a task is queued): helpers wait on
 /// it.
 pub const PAR_WAKE: u32 = PAR_STATE;
 /// Nonzero once the host wants its helpers to return: the host writes it.
@@ -83,9 +83,13 @@ pub const PAR_SHUTDOWN: u32 = PAR_STATE + 4;
 /// How many chunks the helpers (not the threads that started their jobs) have run, ever: a host
 /// reads it to show that they help.
 pub const PAR_HELPED: u32 = PAR_STATE + 8;
-/// Microseconds a helper holds back each long job's result once it's ready: 0 normally. A
+/// Microseconds a helper holds back each task's result once it's ready: 0 normally. A
 /// test writes it to slow jobs down, so the threads that take them wait.
 pub const PAR_HOLD: u32 = PAR_STATE + 12;
+/// How many helpers the host started for the program, before its `init`: the host writes it.
+/// With none (a page on a machine of two cores, a test run on one thread), std runs a task when
+/// it's first asked whether it's done, since no helper would ever start it.
+pub const PAR_HELPERS: u32 = PAR_STATE + 16;
 
 /// The ticker's words.
 pub const TICK_STATE: u32 = 512;
@@ -144,7 +148,7 @@ pub const RUNNING: u32 = 32;
 /// How many blocks this thread has allocated (`std::alloc::allocations`).
 pub const ALLOCATIONS: u32 = 36;
 /// How many times this thread has waited at a `Job::join` for a job a helper was still running:
-/// on the ticker's thread, the sim waiting for an answer due (`std::par::Job::join`). Hosts log
+/// on the ticker's thread, the sim waiting for an answer due (`std::par::Task::join`). Hosts log
 /// it.
 pub const JOIN_WAITS: u32 = 40;
 /// How many times this thread found the allocator's lock taken (`std::alloc`): hosts measure
@@ -152,6 +156,14 @@ pub const JOIN_WAITS: u32 = 40;
 pub const LOCK_WAITS: u32 = 44;
 /// How many tries this thread spun on the allocator's lock, over all its waits.
 pub const LOCK_SPINS: u32 = 48;
+/// The heap's end as far as this thread has made sure it can reach it (std's own). A thread
+/// that didn't grow a shared memory may go on seeing its old size until it asks (Chrome's
+/// engine), so std asks (`memory.grow(0)`) wherever a thread takes memory another may have
+/// grown: a block from the allocator, a chunk or a task to run, a task's result.
+pub const SEEN_END: u32 = 52;
+/// The clock as `wrela.clock` last wrote it for this thread: an `f64`, seconds since the host
+/// started the program (`std::time::now`).
+pub const CLOCK: u32 = 56;
 /// A panic's message: a `u32` byte count, then the message's UTF-8, cut to [`PANIC_CAP`] bytes.
 /// A host reads it after a trap on the thread; the count is 0 when the trap wasn't a panic.
 pub const PANIC: u32 = 4096;
@@ -170,12 +182,12 @@ pub const fn panic_at(thread: u32) -> u32 {
     thread_block(thread) + PANIC
 }
 
-/// The long jobs in flight (`std::par::job`): a slot each, [`JOB_SLOT_SIZE`] bytes.
-pub const JOB_SLOTS: u32 = 0x12_8000;
-pub const JOB_SLOT_COUNT: u32 = 256;
-pub const JOB_SLOT_SIZE: u32 = 16;
+/// The tasks in flight (`std::par::spawn`): a slot each, [`TASK_SLOT_SIZE`] bytes.
+pub const TASK_SLOTS: u32 = 0x12_8000;
+pub const TASK_SLOT_COUNT: u32 = 256;
+pub const TASK_SLOT_SIZE: u32 = 16;
 /// The end of the job slots.
-pub const JOB_SLOTS_END: u32 = JOB_SLOTS + JOB_SLOT_COUNT * JOB_SLOT_SIZE;
+pub const TASK_SLOTS_END: u32 = TASK_SLOTS + TASK_SLOT_COUNT * TASK_SLOT_SIZE;
 /// A slot's state: [`SLOT_FREE`], being filled, queued, running, done or [`SLOT_FAILED`].
 pub const SLOT_STATE: u32 = 0;
 /// The thread a job ran on: the host writes it when the job trapped.
@@ -218,8 +230,8 @@ pub fn panic_message(bytes: &[u8]) -> Option<String> {
 // The regions don't overlap, and each fits below the next.
 const _: () = assert!(TICK_STATE + 24 <= CMD_BASE);
 const _: () = assert!(CMD_BASE + crate::stream::HEADER_LEN as u32 + CMD_CAP <= THREAD_BLOCKS);
-const _: () = assert!(THREAD_BLOCKS_END <= JOB_SLOTS);
-const _: () = assert!(JOB_SLOTS_END <= TICK_RECORDS);
+const _: () = assert!(THREAD_BLOCKS_END <= TASK_SLOTS);
+const _: () = assert!(TASK_SLOTS_END <= TICK_RECORDS);
 const _: () = assert!(TICK_RECORDS + 4 + MAX_TICK_RECORDS * crate::input::EVENT_SIZE <= AUDIO_OUT);
 const _: () = assert!(AUDIO_OUT + crate::AUDIO_QUANTUM * 4 <= STACK_LIMIT);
 const _: () = assert!(DATA_BASE.is_multiple_of(16));

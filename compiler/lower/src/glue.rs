@@ -411,6 +411,22 @@ impl G<'_, '_> {
                 });
                 Some(self.load(&ir::Place::local(out), ty))
             }
+            // A job's value: its parts cloned into their fields, zeros in its temporaries'
+            // (`fn.job-values`).
+            TyKind::Adt(..) if self.cx.job_of(t).is_some() => {
+                let out = self.f.new_local("clone", ty);
+                let z = self.value(ty, ir::Expr::Zero(ty));
+                self.emit(ir::Stmt::Store(ir::Place::local(out), z));
+                let map = self.cx.field_map(self.mb, t, None, self.span);
+                for (k, ft) in map {
+                    let Some(k) = k else { continue };
+                    let ft = self.cx.checked.reveal(ft);
+                    let fty = self.cx.lower_ty(self.mb, ft, self.span)?;
+                    let x = self.clone_of(ft, fty, &p.with(ir::Proj::Field(k)))?;
+                    self.emit(ir::Stmt::Store(ir::Place::local(out).with(ir::Proj::Field(k)), x));
+                }
+                Some(self.load(&ir::Place::local(out), ty))
+            }
             TyKind::Adt(..) | TyKind::Tuple(_) => {
                 let mut vals = Vec::new();
                 for (fp, ft) in self.parts(t, p, None) {

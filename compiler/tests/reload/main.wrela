@@ -1,13 +1,15 @@
 // Hot reload (language.md §22), run by compiler/tests/tests/suite/reload.rs: a literal the CPU
 // and the GPU read each frame (the screen's colour); a value cooked from literals at load and
 // cooked again when one it reads changes (`std::lift::Watch`); what the program carries across a
-// reload (`std::reload`); and a ticker, whose ticks a new build runs again with their records.
+// reload (`std::reload`); a ticker, whose ticks a new build runs again with their records; and a
+// file the build ships, fetched every two seconds (a new build's from its own files).
 
 use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
 use std::handoff::{Latest, Publisher, handoff}
 use std::hash::{StateHash, state_hash}
 use std::input::{Event, Key}
-use std::io::print
+use std::io::{Pending, Shipped, print, ship}
+use std::string::String
 use std::lift::{Watch, generation, reads}
 use std::reload::{keep, kept}
 use std::serialize::{LoadError, Serialize, load, save}
@@ -53,6 +55,13 @@ fn hash(sim: Sim) -> u64 {
     state_hash(sim.world)
 }
 
+/// A file the build ships, fetched now and then.
+const NOTES: Shipped = ship("notes", notes())
+
+fn notes() -> Vec<(String, Vec<u8>)> {
+    Vec::from([(String::from("note.txt"), Vec::from(String::from("a shipped file").as_bytes()))])
+}
+
 /// What the program carries across a reload.
 struct Carried: Clone + Serialize {
     frames: u32,
@@ -68,6 +77,8 @@ pub struct Game {
     cooked: f32,
     cooks: u32,
     watch: Watch,
+    /// The shipped file on its way, if it's being fetched.
+    fetching: Option<Pending<u8>>,
 }
 
 /// The screen's colour: the CPU clears to it, and the GPU draws its left half with it.
@@ -90,7 +101,15 @@ pub fn init() -> Game {
         Ok(c) => c.clone(),
         Err(_) => Carried { frames: 0, mark: 0.0 },
     }
-    Game { latest, carried, restored, cooked: cook(), cooks: 1, watch: Watch::new(reads(cook)) }
+    Game {
+        latest,
+        carried,
+        restored,
+        cooked: cook(),
+        cooks: 1,
+        watch: Watch::new(reads(cook)),
+        fetching: None,
+    }
 }
 
 @vertex
@@ -115,6 +134,25 @@ pub fn frame(g: mut Game, time: f32, width: u32, height: u32) {
     if g.carried.frames % 30 == 0 {
         borrow s = g.latest.read()
         print(f"frame {g.carried.frames}: ticks {s.ticks}, spaces {s.spaces}, sum {s.sum}")
+    }
+    // The shipped file, every 120 frames: whether it came.
+    if g.carried.frames % 120 == 0 && g.fetching.is_none() {
+        g.fetching = Some(NOTES.fetch(0))
+    }
+    let came = match mut g.fetching {
+        Some(p) => p.poll(),
+        None => None,
+    }
+    match take came {
+        Some(Ok(b)) => {
+            print(f"fetched {b.len()} bytes")
+            g.fetching = None
+        },
+        Some(Err(_)) => {
+            print("a shipped file didn't come")
+            g.fetching = None
+        },
+        None => {},
     }
     let bytes = save(g.carried)
     keep(bytes)

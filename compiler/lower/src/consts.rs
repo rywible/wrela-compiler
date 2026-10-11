@@ -69,6 +69,14 @@ impl<'a> Cx<'a> {
     }
 }
 
+/// A run's value in GPU code, which has no addresses: no address, and its length.
+fn gpu_run(len: u32) -> ir::ConstValue {
+    ir::ConstValue::Parts(vec![
+        ir::ConstValue::Scalar(ir::Const::U32(0)),
+        ir::ConstValue::Scalar(ir::Const::U32(len)),
+    ])
+}
+
 /// How [`walk`] builds a literal value: as constant data ([`Data`]), or in code (an [`Fl`]),
 /// with a lifted build's `f32` literals read from the table.
 trait Build<'a> {
@@ -118,6 +126,19 @@ fn walk<'a, B: Build<'a>>(b: &mut B, e: &wrela_sema::thir::Expr) -> Option<B::V>
                     parts.push(walk(b, x)?);
                 }
             }
+            b.parts(t, parts)
+        }
+        ExprKind::ArrayFill(xs, fill, n) => {
+            let mut parts = Vec::new();
+            let (cx, mb) = b.cx();
+            if cx.lower_ty(mb, fill.ty, fill.span).is_none() {
+                return Some(b.parts(t, parts));
+            }
+            for x in xs {
+                parts.push(walk(b, x)?);
+            }
+            let f = walk(b, fill)?;
+            parts.resize(*n as usize, f);
             b.parts(t, parts)
         }
         ExprKind::ArrayRepeat(x, n) => {
@@ -180,9 +201,13 @@ impl<'a> Build<'a> for Data<'_, 'a> {
                 scalar(self.mb, l)?
             }
             ExprKind::Const(c) => self.cx.const_value(self.mb, *c)?.1,
-            // Data's address and length (GPU code has no addresses).
-            ExprKind::Text(_) | ExprKind::Embed(_) if self.mb.target() == ir::Target::Gpu => {
-                return None;
+            // GPU code has no addresses: a text or an embed there is its length alone, so a
+            // constant that holds one (a site's name beside its place) is built, and GPU code
+            // reads its other fields (M6). Its bytes are the CPU's.
+            ExprKind::Text(s) if self.mb.target() == ir::Target::Gpu => gpu_run(s.len() as u32),
+            ExprKind::Embed(path) if self.mb.target() == ir::Target::Gpu => {
+                let n = self.cx.embed_data(self.mb, path)?.1;
+                gpu_run(n)
             }
             ExprKind::Text(s) => run(self.cx.text_data(self.mb, s)),
             ExprKind::Embed(path) => run(self.cx.embed_data(self.mb, path)?),

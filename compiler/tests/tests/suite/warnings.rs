@@ -1,8 +1,9 @@
 //! Warnings: W0001 (a local bound and never used), W0002 (an arm that can't match), W0004
 //! (`Clone` declared beside `Copy`), W0005 (a bare literal by position where a swap would
 //! compile, or a `select` by position), W0006 (a `var` that never changes), W0007 (a `GpuData`
-//! struct's padding that another order saves) and W0008 (a private function or constant that
-//! nothing uses). The conformance suite checks errors only.
+//! struct's padding that another order saves), W0008 (a private function or constant that
+//! nothing uses) and W0009 (`take` before a local in a struct literal). The conformance suite
+//! checks errors only.
 
 use crate::package;
 
@@ -87,6 +88,48 @@ fn f() -> f32 {
     let fixed = wrela_tests::apply_fixes(src, file, &out.diagnostics);
     assert!(fixed.contains("    let same = 1.0"), "{fixed}");
     assert!(warnings("var-fixed-again", &fixed).is_empty());
+}
+
+/// `take` before a local in a struct literal is W0009: the literal moves it anyway. The fix
+/// removes the word, and writes the shorthand where the field and the local share a name.
+/// `take` before a field of a local, or in a call, is needed, and isn't reported.
+#[test]
+fn take_in_a_struct_literal_is_reported_and_fixed() {
+    let src = "struct Log {
+    lines: Vec<u32>,
+}
+
+struct Pair {
+    log: Log,
+    other: Log,
+}
+
+fn keep(l: take Log) -> Log {
+    l
+}
+
+fn f() -> Pair {
+    let both = Pair { log: keep(Log { lines: Vec::new() }), other: Log { lines: Vec::new() } }
+    let log = Log { lines: Vec::new() }
+    let spare = Log { lines: Vec::new() }
+    let _kept = keep(take spare)
+    Pair { log: take log, other: take both.other }
+}
+
+fn g() -> Pair {
+    let a = Log { lines: Vec::new() }
+    let b = Log { lines: Vec::new() }
+    Pair { log: take a, other: take b }
+}";
+    let w = warnings("literal-take", src);
+    let at = |line| ("W0009".to_string(), line);
+    assert_eq!(w, [at(19), at(25), at(25)], "{w:?}");
+    let out = wrela_driver::check(&package("warnings/literal-take-fixed", src));
+    let file = out.diagnostics.iter().find_map(|d| d.span()).expect("a span").file;
+    let fixed = wrela_tests::apply_fixes(src, file, &out.diagnostics);
+    assert!(fixed.contains("Pair { log, other: take both.other }"), "{fixed}");
+    assert!(fixed.contains("Pair { log: a, other: b }"), "{fixed}");
+    assert!(warnings("literal-take-fixed-again", &fixed).is_empty());
 }
 
 #[test]
@@ -353,7 +396,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
     screen.present()
 }
 ";
-    let w = all_warnings("unused", src);
+    let w = all_warnings("unused-items", src);
     let found: Vec<(&str, usize)> =
         w.iter().filter(|(c, _)| c == "W0008").map(|(c, l)| (c.as_str(), *l)).collect();
     assert_eq!(found, [("W0008", 2), ("W0008", 12), ("W0008", 16)], "{w:?}");

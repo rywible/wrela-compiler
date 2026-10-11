@@ -103,9 +103,18 @@ pub fn load(path: str) -> Pending<u8> {
 }
 
 /// Stores `bytes` at `path` in the program's storage, replacing what was there. The answer is
+/// The most bytes a request's path and data (or URL and body) hold together: a command is at most
+/// the host's command buffer (1 MiB, wrela_abi `CMD_CAP`), less its words.
+const MOST_BYTES: u32 = 1048576 - 64
+
 /// no bytes.
 pub fn store(path: str, bytes: [u8]) -> Pending<u8> {
     check_path("store", path)
+    if bytes.len() + path.len() > MOST_BYTES {
+        panic(
+            "store: the bytes and the path are more than one request carries (1 MiB): store the file in pieces",
+        )
+    }
     let request = next_request()
     storage_write_command(request, path, bytes)
     Pending::new(request)
@@ -124,14 +133,22 @@ pub fn fetch(url: str) -> Pending<u8> {
 /// answers with what its user gives it, and fails the request otherwise.
 pub fn post(url: str, bytes: [u8]) -> Pending<u8> {
     check_path("post", url)
+    if bytes.len() + url.len() > MOST_BYTES {
+        panic(
+            "post: the body and the URL are more than one request carries (1 MiB): post it in pieces",
+        )
+    }
     let request = next_request()
     post_command(request, url, bytes)
     Pending::new(request)
 }
 
-/// Shows `line` on the host's console: the terminal that runs the native host, the browser's
-/// developer console. For finding out what a program does while writing it; a player doesn't
-/// see it. It's the `io` effect, so `@deterministic` code doesn't print.
+/// Shows `line` on the host's console now: the terminal that runs the native host or the build,
+/// the browser's developer console. For finding out what a program does while writing it; a
+/// player doesn't see it. The program never reads it back, so it's the `trace` effect, not `io`
+/// (§8): a constant, a test, `@deterministic` code and a parallel job's chunk print too (a tick
+/// run again prints again), and GPU and `@audio` code don't. A constant's lines are shown as it
+/// runs, after its name: the progress of a computation that takes hours.
 ///
 /// ```wrela
 /// use std::io::print
@@ -165,3 +182,103 @@ fn print_command(line: str) {}
 
 @intrinsic
 fn post_command(request: u32, url: str, bytes: [u8]) {}
+
+// ---- files a build ships (M6) -------------------------------------------------------------------
+
+/// Files a build ships beside the program, for data too large to load before the first frame (a
+/// world streamed in tiles): a constant of this type is written as files of the build, under
+/// `files/<dir>/`, and the program fetches each as it needs it (`fetch`). The program's copy of
+/// the constant keeps each file's name and size, not its bytes: build-time code (another constant,
+/// a test) reads them in place (`bytes`).
+pub struct Shipped: Clone {
+    // The build reads these four fields, in this order (`wrela_driver`'s shipping).
+    dir: String,
+    names: Vec<String>,
+    sizes: Vec<u32>,
+    bytes: Vec<Vec<u8>>,
+}
+
+/// Files to ship under `dir` (`files/<dir>/` of the build): each a name and its bytes. A name is
+/// letters, digits, `_`, `-` and `.`, and `dir` the same, so a file lands where it says; another
+/// panics, which fails the build that computes the constant.
+pub fn ship(dir: str, files: take Vec<(String, Vec<u8>)>) -> Shipped {
+    check_name("ship", dir)
+    var names: Vec<String> = Vec::new()
+    var sizes: Vec<u32> = Vec::new()
+    var bytes: Vec<Vec<u8>> = Vec::new()
+    var rest = take files
+    while !rest.is_empty() {
+        let (name, b) = rest.remove(0)
+        check_name("ship", name.as_str())
+        sizes.push(b.len())
+        names.push(take name)
+        bytes.push(take b)
+    }
+    Shipped { dir: String::from(dir), names, sizes, bytes }
+}
+
+/// Panics unless `name` is a file's name a build can ship: letters, digits, `_`, `-` and `.`, not
+/// empty, and not `.` or `..`.
+fn check_name(what: str, name: str) {
+    let n = name.len()
+    if n == 0 || name == "." || name == ".." {
+        panic(f"{what}: `{name}` isn't a file's name")
+    }
+    for i in 0..n {
+        let b = name.byte(i)
+        let ok = (b >= 48 && b <= 57) ||
+            (b >= 65 && b <= 90) ||
+            (b >= 97 && b <= 122) ||
+            b == 95 ||
+            b == 45 ||
+            b == 46
+        if !ok {
+            panic(
+                f"{what}: `{name}` has a character a shipped file's name can't: letters, digits, `_`, `-` and `.`",
+            )
+        }
+    }
+}
+
+impl Shipped {
+    /// How many files it ships.
+    pub fn len(self) -> u32 {
+        self.names.len()
+    }
+
+    /// File `i`'s name.
+    pub fn name(self, i: u32) -> str {
+        self.names[i].as_str()
+    }
+
+    /// File `i`'s size in bytes.
+    pub fn size(self, i: u32) -> u32 {
+        self.sizes[i]
+    }
+
+    /// The index of the file named `name`, if it ships one.
+    pub fn find(self, name: str) -> Option<u32> {
+        var i = 0
+        for n in self.names {
+            if n.as_str() == name {
+                return Some(i)
+            }
+            i += 1
+        }
+        None
+    }
+
+    /// Fetches file `i` from the build.
+    pub fn fetch(self, i: u32) -> Pending<u8> {
+        fetch(f"files/{self.dir}/{self.names[i]}".as_str())
+    }
+
+    /// File `i`'s bytes, where they're in hand: in the build's own code (a constant computed from
+    /// this one, a test). A program a build ships has fetched them (`fetch`): this panics there.
+    pub fn bytes(self, i: u32) -> borrow [u8] {
+        if self.bytes.len() <= i {
+            panic("Shipped::bytes: the build shipped this file: fetch it")
+        }
+        self.bytes[i]
+    }
+}

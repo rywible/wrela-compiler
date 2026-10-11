@@ -49,6 +49,11 @@ pub(crate) struct Helpers {
     /// `wrela.keep` and `wrela.kept`, when the program keeps bytes across a hot reload.
     pub keep: u32,
     pub kept: u32,
+    /// `wrela.clock`, when the program reads the clock.
+    pub clock: u32,
+    /// `wrela.print` and `wrela.phase`, when the program prints or times a phase.
+    pub print: u32,
+    pub phase: u32,
     /// The import `wrela.tick(task, context, hz)`, in a module that starts a ticker.
     pub tick: u32,
     /// The type of a task function ([`ir::MemOp::RunTask`]): (context, chunk) -> ().
@@ -233,6 +238,17 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         let ty = EntityType::Function(input_ty);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_KEPT, ty);
     }
+    let clock = imports.len();
+    if m.clock {
+        let ty = types.get(vec![ValType::I32], vec![]);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_CLOCK, EntityType::Function(ty));
+    }
+    let print = imports.len();
+    if m.trace {
+        let ty = EntityType::Function(submit_ty);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_PRINT, ty);
+        imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_PHASE, ty);
+    }
     let tick = imports.len();
     if m.tick {
         let ty = types.get(vec![ValType::I32; 3], vec![]);
@@ -263,6 +279,9 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         input,
         keep,
         kept: keep + 1,
+        clock,
+        print,
+        phase: print + 1,
         tick,
         flush: nimports,
         reserve: nimports + 1,
@@ -271,7 +290,10 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         fmod_f64: nimports + 4,
         task_type: submit_ty,
     };
-    let helper_bodies = func::helper_bodies(&helpers);
+    // The backstop's message (`ir::Module::command_message`), where it is in the data.
+    let command_message =
+        m.command_message.and_then(|(d, n)| data_at.get(d.index()).map(|&at| (at, n)));
+    let helper_bodies = func::helper_bodies(&helpers, command_message);
     // The code section: the helpers, the program's functions, then the export wrappers.
     let nhelpers = helper_bodies.len();
     let first_fn = nimports + nhelpers as u32;
