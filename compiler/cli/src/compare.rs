@@ -301,24 +301,17 @@ pub fn variants(
 ) -> Result<(), String> {
     let mut panels = Vec::new();
     let mut legend = Vec::new();
-    let mut framing: Option<Framing> = None;
+    // Each panel starts afresh, but the lens's unchanged pipelines need preparing only once
+    // for the whole comparison. Render before the next build: a package can occur twice.
+    let mut lens = Lens::start(pkg, page, (n, n), None)?;
+    let f = own_framing(&mut lens)?;
     let dirs = std::iter::once(pkg).chain(others.iter().map(PathBuf::as_path));
     for (k, dir) in dirs.enumerate() {
-        // The first package's lens is built already.
-        let built = if k == 0 {
-            page.to_path_buf()
-        } else {
-            build(dir, false).map_err(|_| format!("{} doesn't build", dir.display()))?
-        };
-        let mut lens = Lens::start(dir, &built, (n, n), None)?;
-        let f = match framing {
-            Some(f) => f,
-            None => {
-                let f = own_framing(&mut lens)?;
-                framing = Some(f);
-                f
-            }
-        };
+        if k > 0 {
+            let built =
+                build(dir, false).map_err(|_| format!("{} doesn't build", dir.display()))?;
+            lens.restart(dir, &built)?;
+        }
         let calls =
             if facing == 0 { vec![zoom_call(f), view_call(0)] } else { vec![view_call(facing)] };
         panels.push(screen(&mut lens, &calls)?);

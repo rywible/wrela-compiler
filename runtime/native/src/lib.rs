@@ -359,16 +359,36 @@ impl Host {
     /// one's (its buffers and textures released; nothing kept, no ticks carried). The pipelines
     /// are kept. For tests that each start fresh on one host (`wrela test`'s GPU frame tests).
     pub fn restart_with(&mut self, options: &Options) -> Result<()> {
-        let options = &options.homed(&self.dir);
-        let build = compile_build(&self.dir, None)?;
+        self.restart_in(self.dir.clone(), options)
+    }
+
+    /// Starts the build in `dir` afresh, keeping the device and unchanged pipelines. Nothing
+    /// of the old program is carried: its resources, screen, requests and recorded state go;
+    /// the new program reads files and, by default, storage from `dir`. The GPU lock stays
+    /// held. Changing the timing or counting options opens a device with those capabilities.
+    pub fn restart_in(&mut self, dir: impl AsRef<Path>, options: &Options) -> Result<()> {
+        let dir = dir.as_ref();
+        let options = &options.homed(dir);
+        let build = compile_build(dir, None)?;
+        // A preparation belongs to the retiring program. Let its GPU work finish before
+        // resetting the device's resources and dropping its prepared pipelines.
+        for prepared in std::mem::take(&mut self.prepared).into_values() {
+            if let handover::Prepared::Going(job, _) = prepared {
+                let _ = job.join();
+            }
+        }
         let old = self.program.take().expect("the host has a program");
         let mut executor = old.retire().executor;
-        program::Executor::reload(&mut executor, &build.manifest, &build.shaders)?;
+        if options.timing == self.options.timing && options.counts == self.options.counts {
+            executor.restart_build(&build.manifest, &build.shaders)?;
+        } else {
+            executor = Gpu::new(&build.manifest, &build.shaders, options.timing, options.counts)?;
+        }
         let mut program = Program::instantiate_with(
             &build.compiled,
             &build.manifest,
             executor,
-            options.io(&self.dir),
+            options.io(dir),
             options.record,
             workers(options.workers),
             !options.defer_init,
@@ -378,6 +398,8 @@ impl Host {
         }
         program.hand_over_here();
         self.program = Some(program);
+        self.wasm_hash = build.wasm_hash;
+        self.dir = dir.to_path_buf();
         self.options = options.clone();
         Ok(())
     }
@@ -589,8 +611,8 @@ impl Host {
         &self.dir
     }
 
-    /// How many pipelines the host has built since it loaded: what a hand-over or a reload
-    /// built, by the difference.
+    /// How many pipelines the current device has built: what a hand-over, reload or restart
+    /// built, by the difference. Restarts that change GPU capabilities open a new device.
     pub fn pipelines_built(&mut self) -> usize {
         self.p().executor().pipelines_built()
     }
@@ -690,6 +712,8 @@ pub struct CpuBuild {
     wasm_hash: u64,
     /// Whether its hosts keep a copy of every batch ([`CpuHost::take_batches`]).
     record: bool,
+    /// Whether the caller shows the program's printed lines itself.
+    quiet: bool,
 }
 
 impl CpuBuild {
@@ -710,13 +734,26 @@ impl CpuBuild {
 
     fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
         let Build { manifest, wasm_hash, compiled, .. } = compile_build(dir, fuel)?;
-        Ok(CpuBuild { compiled, manifest, dir: dir.to_path_buf(), wasm_hash, record: false })
+        Ok(CpuBuild {
+            compiled,
+            manifest,
+            dir: dir.to_path_buf(),
+            wasm_hash,
+            record: false,
+            quiet: false,
+        })
     }
 
     /// Its hosts keep a copy of every batch the program submits ([`CpuHost::take_batches`]):
     /// for tests that look at what a program recorded. A long run keeps none.
     pub fn recording(mut self) -> CpuBuild {
         self.record = true;
+        self
+    }
+
+    /// Keeps printed lines for [`CpuHost::take_logs`] without also showing them on stderr.
+    pub fn quiet(mut self) -> CpuBuild {
+        self.quiet = true;
         self
     }
 
@@ -777,7 +814,7 @@ impl CpuBuild {
     /// `storage` (by default, `storage/` in the build's directory), and without running
     /// `init`: call [`CpuHost::init`] next, which says why it failed if it does.
     pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
-        let io = io(&self.dir, storage, None, false);
+        let io = io(&self.dir, storage, None, self.quiet);
         let n = self::workers(workers);
         let (compiled, manifest) = (&self.compiled, &self.manifest);
         let program =

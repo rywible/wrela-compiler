@@ -9,4 +9,5 @@ mod profile;
 mod query;
 mod refactor;
 mod solve;
+mod studio;
 mod trace;

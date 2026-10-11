@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use wrela_driver::studio;
-use wrela_host::{Event, Host, Value};
+use wrela_host::{CpuBuild, Event, Host, Value};
 
 /// The screen a headless run uses unless told: under 900 pixels wide, so the views fill it
 /// (wider, the lens draws its panel for people beside them).
@@ -23,6 +23,7 @@ const WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 pub fn run(args: &[String]) -> ExitCode {
     let mut rest = Vec::new();
     let (mut png, mut size, mut port, mut debug) = (None, SIZE, 8417u16, false);
+    let mut artifacts_only = false;
     let mut reference: Option<PathBuf> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -40,6 +41,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 None => return crate::usage(),
             },
             "--debug" => debug = true,
+            "--artifacts-only" => artifacts_only = true,
             "--reference" => match it.next() {
                 Some(p) => reference = Some(PathBuf::from(p)),
                 None => return crate::usage(),
@@ -52,7 +54,11 @@ pub fn run(args: &[String]) -> ExitCode {
         return code;
     }
     let action = rest.get(1).cloned().unwrap_or_else(|| "serve".into());
-    let page = match build(&pkg, debug) {
+    if artifacts_only && action != "build" {
+        eprintln!("error: `--artifacts-only` is only for `studio build`");
+        return crate::usage();
+    }
+    let page = match build_with_precompile(&pkg, debug, !artifacts_only) {
         Ok(p) => p,
         Err(code) => return code,
     };
@@ -165,6 +171,11 @@ pub(crate) fn read_reference(path: &Path) -> Result<Vec<u8>, String> {
 
 /// Builds the lens on `pkg`: its page's directory, or the exit status after printing why not.
 pub(crate) fn build(pkg: &Path, debug: bool) -> Result<PathBuf, ExitCode> {
+    build_with_precompile(pkg, debug, true)
+}
+
+/// Artifact checks need the browser build, without compiling WASM they will never execute.
+fn build_with_precompile(pkg: &Path, debug: bool, precompile: bool) -> Result<PathBuf, ExitCode> {
     match studio::build(pkg, debug) {
         Ok((out, page)) => {
             if out.has_errors() {
@@ -183,7 +194,7 @@ pub(crate) fn build(pkg: &Path, debug: bool) -> Result<PathBuf, ExitCode> {
                 );
             }
             // The lens's compiled code, kept beside the build: each action loads it.
-            if let Err(e) = wrela_host::precompile(&page) {
+            if precompile && let Err(e) = wrela_host::precompile(&page) {
                 eprintln!("error: can't compile the lens: {e}");
                 return Err(ExitCode::from(1));
             }
@@ -220,6 +231,15 @@ impl Lens {
             Host::load_with(page, &options).map_err(|e| format!("can't run the lens: {e}"))?;
         host.frame(0.0, size.0, size.1).map_err(|e| e.to_string())?;
         Ok(Lens { host, size, frame: 0 })
+    }
+
+    /// A fresh lens for another package, reusing the previous one's unchanged pipelines.
+    pub(crate) fn restart(&mut self, pkg: &Path, page: &Path) -> Result<(), String> {
+        let post = studio::post_handler(pkg, page, None);
+        let options = wrela_host::Options { post: Some(post), quiet: true, ..Default::default() };
+        self.host.restart_in(page, &options).map_err(|e| format!("can't run the lens: {e}"))?;
+        self.frame = 0;
+        self.host.frame(0.0, self.size.0, self.size.1).map_err(|e| e.to_string())
     }
 
     /// The next frame.
@@ -441,6 +461,21 @@ fn one_action(
     png: Option<&Path>,
     mask: Option<Vec<u8>>,
 ) -> Result<(), String> {
+    if a.name == "literals" && png.is_none() {
+        // This export reads the lifted table and prints its answer immediately. It does not
+        // need a frame, a screen, or GPU readbacks; keep using the program's own action.
+        let mut host = CpuBuild::load(page)
+            .map_err(|e| format!("can't run the lens: {e}"))?
+            .quiet()
+            .start()
+            .map_err(|e| format!("can't run the lens: {e}"))?;
+        let _ = host.take_logs();
+        host.call_export(a.name, &a.args).map_err(|e| e.to_string())?;
+        for line in host.take_logs() {
+            println!("{line}");
+        }
+        return Ok(());
+    }
     let mut lens = Lens::start(pkg, page, size, mask)?;
     for l in &a.literals {
         lens.host.call_export("choose", std::slice::from_ref(l)).map_err(|e| e.to_string())?;

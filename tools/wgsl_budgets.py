@@ -14,10 +14,11 @@ BAKED = {pathlib.Path("examples/last-green")}
 out = tempfile.mkdtemp()
 try:
     hello = "examples/hello-field"
-    # The lens on each subject (tools/subjects.py).
+    # The lens on each subject (tools/subjects.py): inspect its shader artifacts without
+    # compiling the WASM for the native host, since this check never runs it.
     if not baked_only:
         list(concurrent.futures.ThreadPoolExecutor(max_workers=cpu_count()).map(
-            lambda s: subprocess.run([wrela, "studio", f"examples/{s}", "build"], check=True, capture_output=True), SUBJECTS))
+            lambda s: subprocess.run([wrela, "studio", f"examples/{s}", "build", "--artifacts-only"], check=True, capture_output=True), SUBJECTS))
     # Each package, where it's built, and how. A lens is built lifted, as `wrela studio` built it
     # just now (its page, beside the subject): its WGSL is read from there.
     packages = [(p, pathlib.Path(out) / p.name, True)

@@ -564,6 +564,26 @@ impl Gpu {
     /// Hot reload: finishes the old build's work, forgets its resources, and takes the new
     /// build's pipelines. The device, the screen and the rings stay.
     fn reload_build(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
+        self.finish_build()?;
+        self.take_pipelines(manifest, shaders)
+    }
+
+    /// A fresh program on the same device: only immutable pipelines and upload allocations
+    /// survive. In particular, a program that doesn't draw mustn't see the last one's screen.
+    pub(crate) fn restart_build(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
+        self.finish_build()?;
+        self.screen = None;
+        self.frame = 0;
+        self.debug_flag = None;
+        self.spare.clear();
+        if let Some(timer) = &mut self.timer {
+            *timer = Timer::new(&self.device, timer.serial, timer.counter.is_some());
+        }
+        self.take_pipelines(manifest, shaders)
+    }
+
+    /// Finishes the retiring build's commands before releasing the resources they used.
+    fn finish_build(&mut self) -> Result<()> {
         self.pass = None;
         self.label = None;
         self.flush()?;
@@ -571,7 +591,7 @@ impl Gpu {
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
         self.resources.clear();
         self.bound_in.clear();
-        self.take_pipelines(manifest, shaders)
+        Ok(())
     }
 
     /// What builds pipelines on this device, on any thread.

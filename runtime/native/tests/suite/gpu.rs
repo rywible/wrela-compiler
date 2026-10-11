@@ -191,6 +191,80 @@ fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDi
     (dir, host)
 }
 
+/// A comparison's next package starts as a cold load would, without preparing its unchanged
+/// pipelines again. Even its first frame's empty screen and its IO directory must be fresh.
+#[test]
+#[ignore = "needs a GPU"]
+fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
+    let (w, h) = (4, 4);
+    let old = Encoder::new()
+        .create_buffer(1, 16)
+        .write_buffer(1, 0, &words(&[99; 4]))
+        .storage_write(4, "save", b"old")
+        .begin_screen_pass([1.0, 0.0, 0.0, 1.0])
+        .present()
+        .finish();
+    let options = Options { record: true, ..Default::default() };
+    let (old_dir, mut host) = store_host("restart-old", &[vec![old]], &options);
+    host.run_frames(&[0.0, 1.0], w, h).expect("old program runs");
+    let pipelines = host.pipelines_built();
+    assert_eq!(pipelines, 2);
+
+    let next = Encoder::new()
+        .create_buffer(1, 16)
+        .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[1, 42, 0, 0]))
+        .storage_write(4, "save", b"next")
+        .begin_screen_pass([0.0, 0.0, 0.0, 1.0])
+        .draw(1, 6, 1, &[], &words(&[1, 2, w, h, 0xff00_ff00, 0, 0, 0]))
+        .present()
+        .finish();
+    // The first frame submits nothing; the second exercises fresh WASM globals, resources
+    // and request IDs (the previous program already used buffer 1 and request 4).
+    let wasm = wat::parse_str(common::wat::program(&[vec![], vec![next]])).expect("compiles");
+    let next_dir = common::build(
+        "restart-next",
+        &common::manifest(STORE_PIPELINES),
+        &[("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)],
+        &wasm,
+    );
+    host.restart_in(&next_dir, &options).expect("restarts in the next directory");
+    assert_eq!(host.pipelines_built(), pipelines, "unchanged pipelines are reused");
+    assert!(host.take_batches().is_empty(), "old recorded commands are gone");
+    assert!(host.read_buffer(1).is_err(), "old resources are gone");
+    let blank = host.run_frames(&[0.0], w, h).expect("empty first frame");
+    assert!(blank.frame.iter().all(|b| *b == 0), "the old screen is gone");
+    let restarted = host.run_frames(&[1.0], w, h).expect("new program runs");
+    let buffer = host.read_buffer(1).expect("new buffer");
+    assert_eq!(buffer, words(&[0, 42, 0, 0]));
+    assert_eq!(pixel(&restarted.frame, w, 1, 2), [0, 255, 0, 255]);
+    assert_eq!(std::fs::read(old_dir.join("storage/save")).expect("old storage"), b"old");
+    assert_eq!(std::fs::read(next_dir.join("storage/save")).expect("new storage"), b"next");
+    let batches = host.take_batches();
+
+    let mut cold = Host::load_with(&next_dir, &options).expect("cold load of the next build");
+    let cold_blank = cold.run_frames(&[0.0], w, h).expect("cold empty first frame");
+    let cold_run = cold.run_frames(&[1.0], w, h).expect("cold program runs");
+    assert_eq!(blank.hash, cold_blank.hash, "initial command state");
+    assert!(blank.frame == cold_blank.frame, "initial pixels");
+    assert_eq!(restarted.hash, cold_run.hash, "fresh command state");
+    assert!(restarted.frame == cold_run.frame, "fresh pixels");
+    assert_eq!(buffer, cold.read_buffer(1).expect("cold buffer"));
+    assert_eq!(batches, cold.take_batches(), "fresh recording");
+    drop(cold);
+
+    // The same-directory wrapper now refers to the new package, and a changed shader is
+    // rebuilt while its companion compute pipeline is kept.
+    std::fs::write(
+        next_dir.join("cell.wgsl"),
+        CELL_WGSL.replace("unpack4x8unorm(c.colour)", "vec4f(0, 0, 1, 1)"),
+    )
+    .expect("change one shader");
+    host.restart_with(&options).expect("restarts the new package");
+    assert_eq!(host.pipelines_built(), pipelines + 1, "only the changed pipeline is built");
+    let changed = host.run_frames(&[0.0, 1.0], w, h).expect("changed shader runs");
+    assert_eq!(pixel(&changed.frame, w, 1, 2), [0, 0, 255, 255]);
+}
+
 /// More dispatches and draws in one submission than the uniform ring starts with room for
 /// (64 KiB at 256 bytes a slice): each must still see its own uniform bytes.
 #[test]
