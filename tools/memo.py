@@ -689,7 +689,17 @@ class Store:
         write_atomically(os.path.join(self.entries_dir(test, rust), sha(body)[:24] + ".json"), body)
 
     def prune(self):
-        """Removes the entries and builds not used or made for KEEP_DAYS days."""
+        """Removes the entries and builds not used or made for KEEP_DAYS days: once a day (a walk
+        of the store takes half a second)."""
+        mark = os.path.join(self.dir, ".pruned")
+        try:
+            if time.time() - os.path.getmtime(mark) < 86400:
+                return
+        except OSError:
+            pass
+        os.makedirs(self.dir, exist_ok=True)
+        with open(mark, "w"):
+            pass
         old = time.time() - KEEP_DAYS * 86400
         for top in (os.path.join(self.dir, "entries"), os.path.join(self.dir, "builds")):
             for dirpath, dirnames, filenames in os.walk(top, topdown=False):

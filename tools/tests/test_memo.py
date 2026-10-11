@@ -182,6 +182,17 @@ class Store(Files):
         os.utime(os.path.join(d, name), (old, old))
         store.prune()
         self.assertFalse(os.path.exists(d))
+        # Once a day: a second old entry waits for the next day's prune.
+        store.save("u", "rust", {}, {}, 1.0)
+        d = store.entries_dir("u", "rust")
+        (name,) = os.listdir(d)
+        os.utime(os.path.join(d, name), (old, old))
+        store.prune()
+        self.assertTrue(os.path.exists(d))
+        day_ago = time.time() - 86401
+        os.utime(os.path.join(store.dir, ".pruned"), (day_ago, day_ago))
+        store.prune()
+        self.assertFalse(os.path.exists(d))
 
 
 class Sources(Files):
