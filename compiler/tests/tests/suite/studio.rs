@@ -169,16 +169,56 @@ impl Subject {
         let _ = host.take_logs();
         Lens { host, frame: 0, times: Vec::new() }
     }
+
+    /// The lens on the CPU host: its actions' answers, with no frame drawn (nor a post
+    /// handler: no fit or write).
+    fn cpu_lens(&self) -> Lens<CpuHost> {
+        let mut host = CpuHost::load(&self.page).expect("the lens loads");
+        host.frame(0.0, SIZE.0, SIZE.1).expect("a frame");
+        let _ = host.take_logs();
+        Lens { host, frame: 0, times: Vec::new() }
+    }
 }
 
-struct Lens {
-    host: Host,
+/// What a lens's actions need of its host: the GPU's, which draws its frames, or the CPU's.
+trait LensHost {
+    fn call_export(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>>;
+    fn frame(&mut self, time: f32, width: u32, height: u32) -> wrela_host::Result<()>;
+    fn take_logs(&mut self) -> Vec<String>;
+}
+
+impl LensHost for Host {
+    fn call_export(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>> {
+        Host::call_export(self, name, args)
+    }
+    fn frame(&mut self, time: f32, width: u32, height: u32) -> wrela_host::Result<()> {
+        Host::frame(self, time, width, height)
+    }
+    fn take_logs(&mut self) -> Vec<String> {
+        Host::take_logs(self)
+    }
+}
+
+impl LensHost for CpuHost {
+    fn call_export(&mut self, name: &str, args: &[Value]) -> wrela_host::Result<Vec<Value>> {
+        CpuHost::call_export(self, name, args)
+    }
+    fn frame(&mut self, time: f32, width: u32, height: u32) -> wrela_host::Result<()> {
+        CpuHost::frame(self, time, width, height)
+    }
+    fn take_logs(&mut self) -> Vec<String> {
+        CpuHost::take_logs(self)
+    }
+}
+
+struct Lens<H = Host> {
+    host: H,
     frame: u32,
     /// Each frame's wall time since the last action began, in ms.
     times: Vec<f64>,
 }
 
-impl Lens {
+impl<H: LensHost> Lens<H> {
     /// Runs an action: calls its export, frames until the lens isn't busy, and returns its
     /// answer (the last JSON line it printed).
     fn act(&mut self, name: &str, args: &[f32]) -> serde_json::Value {
@@ -1010,7 +1050,9 @@ const GRAZER_MARKS: [Landmark; 10] = [
 /// with its source line.
 fn clicks(name: &'static str, marks: &[Landmark]) {
     let subject = Subject::shared(name, "as-is", &[]);
-    let mut lens = subject.lens();
+    // What a click finds is the lens's code's (its rays, parts and derivatives run in its WASM),
+    // so the CPU host answers as the GPU's would.
+    let mut lens = subject.cpu_lens();
     lens.act_with("view", &[Value::I32(0)]);
     let (mut parts, mut owns, mut times) = (0, 0, Vec::new());
     for m in marks {
@@ -1048,20 +1090,20 @@ fn clicks(name: &'static str, marks: &[Landmark]) {
     }
     let (median, most) = median_and_most(&times);
     eprintln!(
-        "{name}: {parts}/10 parts right, {owns}/10 top literals the part's own; a click {median:.1} ms median, {most:.1} most (native)"
+        "{name}: {parts}/10 parts right, {owns}/10 top literals the part's own; a click {median:.1} ms median, {most:.1} most (the CPU host)"
     );
     assert!(parts >= 9, "{name}: {parts} of 10 parts right");
     assert!(owns >= 8, "{name}: {owns} of 10 top literals the part's own");
 }
 
 #[test]
-#[ignore = "long: needs a GPU"]
+#[ignore = "long: builds the wolf's lens"]
 fn clicks_on_the_wolfs_landmarks_find_their_parts_and_source() {
     clicks("wolf", &WOLF_MARKS);
 }
 
 #[test]
-#[ignore = "long: needs a GPU"]
+#[ignore = "long: builds the grazer's lens"]
 fn clicks_on_the_grazers_landmarks_find_their_parts_and_source() {
     clicks("grazer", &GRAZER_MARKS);
 }
