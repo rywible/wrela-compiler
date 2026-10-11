@@ -360,6 +360,109 @@ NAMES_COMPILER = re.compile(r"\bwrela_(?:sema|ir|lower|wasm|wgsl)\b")
 ROOT_FILES = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/")
 
 
+def rust_code(text, tests=True):
+    """A Rust file's code as rustc builds it: its comments left out and, without `tests`, each
+    item marked `#[cfg(test)]` (rustc builds those only into the crate's own unit tests, never
+    into a crate built with it), and its spacing as one space. A change to what's left out can't
+    change a test built with the file, so it doesn't change the file's key. An item it can't place the end of exactly stays
+    (in part): that only keeps a key changing."""
+    toks, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if text.startswith("//", i):
+            i = text.find("\n", i)
+            i = n if i < 0 else i
+        elif text.startswith("/*", i):
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if text.startswith("/*", i):
+                    depth, i = depth + 1, i + 2
+                elif text.startswith("*/", i):
+                    depth, i = depth - 1, i + 2
+                else:
+                    i += 1
+        elif c.isspace():
+            j = i
+            while j < n and text[j].isspace():
+                j += 1
+            toks.append(("ws", text[i:j]))
+            i = j
+        elif c.isalpha() or c == "_":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            word, hashes = text[i:j], 0
+            while j + hashes < n and text[j + hashes] == "#":
+                hashes += 1
+            if word in ("r", "br", "cr") and j + hashes < n and text[j + hashes] == '"':
+                close = '"' + "#" * hashes
+                end = text.find(close, j + hashes + 1)
+                end = n if end < 0 else end + len(close)
+                toks.append(("lit", text[i:end]))
+                i = end
+            else:
+                toks.append(("word", word))
+                i = j
+        elif c == '"':
+            j = i + 1
+            while j < n and text[j] != '"':
+                j += 2 if text[j] == "\\" else 1
+            toks.append(("lit", text[i:j + 1]))
+            i = j + 1
+        elif c == "'" and (text.startswith("\\", i + 1) or text.startswith("'", i + 2)):
+            j = i + 2 if text[i + 1] == "\\" else i + 1
+            j = text.find("'", j + 1)
+            j = n - 1 if j < 0 else j
+            toks.append(("lit", text[i:j + 1]))
+            i = j + 1
+        else:
+            toks.append(("p", c))
+            i += 1
+    if not tests:
+        code = [k for k, t in enumerate(toks) if t[0] != "ws"]
+        marker = [("p", "#"), ("p", "["), ("word", "cfg"), ("p", "("), ("word", "test"),
+                  ("p", ")"), ("p", "]")]
+        drop, at = set(), 0
+        while at < len(code):
+            if [toks[k] for k in code[at:at + len(marker)]] != marker:
+                at += 1
+                continue
+            # Generics' `<..>` count as brackets in a signature or a type: not after its `=`.
+            start, at, depth, angle, value = code[at], at + len(marker), 0, 0, False
+            while at < len(code):
+                kind, t = toks[code[at]]
+                if kind == "p" and t == "=" and depth == 0:
+                    value = True
+                elif kind == "p" and t == "<" and not value:
+                    angle += 1
+                elif kind == "p" and t == ">" and not value and toks[code[at - 1]] != ("p", "-"):
+                    angle -= 1
+                elif kind == "p" and t in "([{":
+                    depth += 1
+                elif kind == "p" and t in ")]}":
+                    if depth == 0:
+                        break  # the end of what holds the item: not the item's
+                    depth -= 1
+                    if depth == 0 and t == "}":
+                        at += 1
+                        break
+                elif kind == "p" and (t == ";" or t == "," and angle <= 0) and depth == 0:
+                    at += 1
+                    break
+                at += 1
+            end = code[at - 1] if at > 0 else start
+            drop.update(range(start, end + 1))
+        toks = [t for k, t in enumerate(toks) if k not in drop]
+    # Space between tokens only parts them (no code reads its own lines: `line!()` is unused).
+    out = []
+    for kind, t in toks:
+        if kind != "ws":
+            out.append(t)
+        elif out and out[-1] != " ":
+            out.append(" ")
+    return "".join(out).strip()
+
+
 class Sources:
     """The files the test programs are built from, by crate: each crate's files (`git ls-files`
     under its directory, and those rustc's dep-info says it read elsewhere, by `include_str!`),
@@ -389,6 +492,7 @@ class Sources:
                 if not rel.startswith(owner + "/"):
                     self.by_package[owner].add(rel)
         self.hashes = {}
+        self.code_hashes = {}
         self.texts = {}
         self.names = {}
 
@@ -464,6 +568,19 @@ class Sources:
                 self.hashes[rel] = "absent"
         return self.hashes[rel]
 
+    def code_hash(self, rel, tests):
+        """The hash of a file's code: a Rust file's by `rust_code`, any other's bytes."""
+        if not rel.endswith(".rs"):
+            return self.hash(rel)
+        if (rel, tests) not in self.code_hashes:
+            try:
+                with open(os.path.join(self.root, rel), encoding="utf-8") as f:
+                    code = sha(rust_code(f.read(), tests).encode())
+            except (OSError, ValueError):
+                code = self.hash(rel)
+            self.code_hashes[(rel, tests)] = code
+        return self.code_hashes[(rel, tests)]
+
     def text(self, rel):
         if rel not in self.texts:
             try:
@@ -513,8 +630,11 @@ class Sources:
         left_out = {f for name, fs in modules.items() if name not in wanted for f in fs}
         return [f for f in files if f not in left_out]
 
-    def key(self, files):
-        return sha("\n".join(f"{f} {self.hash(f)}" for f in files))
+    def key(self, files, own=None):
+        """The files' key, by their code: a Rust file outside `own` (the directory of the package
+        whose test runs) without its tests. None for `own` keeps every file's tests."""
+        tests = lambda f: own is None or f.startswith(own.rstrip("/") + "/")
+        return sha("\n".join(f"{f} {self.code_hash(f, tests(f))}" for f in files))
 
 
 # ---- the store ------------------------------------------------------------------------------
@@ -906,7 +1026,7 @@ class Memo:
     def rust(self, scope, test_id, program_dir, test):
         # MEANING too: what an entry keeps and how it is matched are part of its meaning.
         return sha(f"{scope}\n{MEANING}\n" + self.sources.key(
-            self.files(scope, test_id, program_dir, test)))
+            self.files(scope, test_id, program_dir, test), own=self.package(test_id)))
 
     def env_of(self, names):
         return {n: os.environ.get(n) for n in sorted(names)}
@@ -1272,7 +1392,7 @@ def meaning():
     import textwrap
 
     deciding = [unescape, lines, events, touched, unplaced, Trace, Digests, Inputs, env_names,
-                Sources, Store.entries_dir, Store.find, Store.save, Rebuilds, Memo, is_wrela]
+                rust_code, Sources, Store.entries_dir, Store.find, Store.save, Rebuilds, Memo, is_wrela]
     constants = [CALLS, WRITE_FLAGS, LINE.pattern, UNFINISHED.pattern, RESUMED.pattern,
                  STRING.pattern, RESULT_PATH.pattern, BUILD_BEGIN, BUILD_END, ENV_NAMES,
                  ENV_PREFIXES, ENV_NOT, COMPILE_ONLY, NAMES_COMPILER.pattern, SCOPES]

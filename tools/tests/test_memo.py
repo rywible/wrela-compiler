@@ -139,6 +139,37 @@ class Meaning(unittest.TestCase):
         self.assertNotEqual(self.meaning_of(changed), base)
 
 
+class RustCode(unittest.TestCase):
+    CODE = """pub struct S { a: u8, #[cfg(test)] b: Vec<u8, A>, c: u8 }
+const U: &str = "// a string"; /* a /* nested */ comment */
+fn h<'a>(x: &'a str) -> char { let _ = r#"/* raw */"#; '"' } // a comment
+#[cfg(test)]
+pub(crate) fn turn() -> MutexGuard<'static, ()> { TURNS.lock() }
+#[cfg(test)]
+mod tests { fn g() { let x = [1; 2]; } }
+fn after() {}
+"""
+
+    def test_comments_and_spacing_are_left_out_and_strings_kept(self):
+        code = memo.rust_code(self.CODE)
+        self.assertNotIn("comment", code)
+        for kept in ['"// a string"', 'r#"/* raw */"#', "'\"'", "mod tests"]:
+            self.assertIn(kept, code)
+        self.assertEqual(memo.rust_code("fn  f() {\n  // x\n  1 }"), memo.rust_code("fn f() { 1 }"))
+
+    def test_without_tests_each_test_item_is_left_out_and_nothing_beside_it(self):
+        code = memo.rust_code(self.CODE, tests=False)
+        self.assertTrue(code.startswith("pub struct S { a: u8, c: u8 } const"))
+        for gone in ["turn", "mod tests", "Vec<u8, A>"]:
+            self.assertNotIn(gone, code)
+        self.assertTrue(code.endswith("fn after() {}"))
+        self.assertEqual(memo.rust_code("#[cfg(test)] impl<A, B> X for Y<A, B> {} fn k() {}",
+                                        tests=False), "fn k() {}")
+        # Only exactly `cfg(test)`: `cfg(not(test))` and `cfg(any(test, ..))` are built in.
+        for other in ["#[cfg(not(test))] fn f() {}", "#[cfg(any(test, feature = \"x\"))] fn f() {}"]:
+            self.assertEqual(memo.rust_code(other, tests=False), memo.rust_code(other))
+
+
 class Store(Files):
     def test_an_entry_matches_only_with_the_same_key_environment_and_inputs(self):
         store = memo.Store(self.root)
@@ -235,6 +266,17 @@ class Sources(Files):
         self.assertEqual(self.sources().key(files), key)
         self.write("lib/src/lib.rs", "pub fn f() {}\n")
         self.assertNotEqual(self.sources().key(files), key)
+
+    def test_a_crate_built_with_the_test_counts_without_its_tests_and_the_tests_own_with(self):
+        s = self.sources()
+        files = s.files_of(s.closure("t"))
+        key = s.key(files, own="t")
+        self.write("lib/src/lib.rs", 'pub fn f() { std::env::var("WRELA_FULL"); }\n'
+                   "// a note\n#[cfg(test)]\nmod tests { fn t() {} }\n")
+        self.assertEqual(self.sources().key(files, own="t"), key)
+        self.assertNotEqual(self.sources().key(files, own="lib"), key)
+        self.write("t/tests/suite/c.rs", "pub fn help() {}\n#[cfg(test)]\nfn more() {}\n")
+        self.assertNotEqual(self.sources().key(files, own="t"), key)
 
     def test_a_test_in_the_root_keeps_what_the_root_names_and_an_unknown_module_all(self):
         s = self.sources()
