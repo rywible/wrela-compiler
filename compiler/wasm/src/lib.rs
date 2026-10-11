@@ -351,10 +351,13 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         code.function(&body);
         next
     });
-    // The tasks a parallel job's chunks run, by index.
+    // The tasks a parallel job's chunks run, by index. A thread entry calls its task by index,
+    // so a module with one has the table even with no task in it (`std::audio`'s entry comes
+    // with any of the module's functions, `play` or not).
+    let has_table = !m.tasks.is_empty() || !m.thread_entries.is_empty();
     let mut tables = TableSection::new();
     let mut elements = ElementSection::new();
-    if !m.tasks.is_empty() {
+    if has_table {
         let n = m.tasks.len() as u64;
         tables.table(TableType {
             element_type: RefType::FUNCREF,
@@ -387,7 +390,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     module.section(&types.section);
     module.section(&imports);
     module.section(&functions);
-    if !m.tasks.is_empty() {
+    if has_table {
         module.section(&tables);
     }
     if !shared_memory {

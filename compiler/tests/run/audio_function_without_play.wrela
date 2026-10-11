@@ -1,0 +1,15 @@
+// run: a function of std::audio, with no voice started: the module still has the task table
+// that std::audio's thread entry calls through
+// expect: per_rate() = 6948
+// expect: per_rate_const() = 6948
+
+const RATE: f32 = std::audio::decay_rate(1.0)
+
+/// Samples per unit of decay rate, as a whole number: 48,000 / 6.9078.
+pub fn per_rate() -> u32 {
+    u32(1.0 / std::audio::decay_rate(1.0))
+}
+
+pub fn per_rate_const() -> u32 {
+    u32(1.0 / RATE)
+}
