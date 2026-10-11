@@ -47,6 +47,9 @@ cd "$(dirname "$0")/.."
 # goldens or picks a fuzz seed (left set in the shell by an earlier run) doesn't apply here.
 unset WRELA_RUN_ONLY WRELA_BLESS WRELA_FUZZ_ITERS WRELA_FUZZ_SEED WRELA_FUZZ_WORKER WRELA_FUZZ_JOBS \
   WRELA_FUZZ_TIERS WRELA_FULL WRELA_GPU_SHARED WRELA_GPU_WAITS
+# The tests count the constants their builds compute: each package keeps its own cache here, not
+# the one a session shares with other checkouts.
+unset WRELA_CONST_CACHE
 
 usage="usage: tools/check.sh [--fresh | --long | --full] | [--long] [--nocapture] <filter>... | --fmt"
 long=0 full=0 fmt=0 fresh=0 nocapture=() filters=()

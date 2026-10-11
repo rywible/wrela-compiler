@@ -168,6 +168,10 @@ def bash(event):
 LIMIT = 9000
 
 
+# A Claude project's shared folder: every thread's machine sees it.
+SHARED = "/mnt/project-files"
+
+
 # What a session on a cloud machine is told.
 CLOUD = """This is a Claude Code cloud machine: 4 cores, no GPU. Its GPU is the CPU (Mesa's lavapipe, \
 patched and built by tools/cloud.sh): a floor frame at 1080p takes about 0.6 s, a lookbook still \
@@ -182,17 +186,22 @@ def cloud(root, source):
     provision) starts `tools/cloud.sh --warm` in the background: it provisions the machine if it
     isn't, then builds what a session builds first. Returns what the session is told."""
     script = os.path.join(root, "tools", "cloud.sh")
-    env = subprocess.run([script, "--env"], capture_output=True, text=True, timeout=10).stdout
+    out = subprocess.run([script, "--env"], capture_output=True, text=True, timeout=10).stdout
+    env = dict(line.partition("=")[::2] for line in out.splitlines())
+    # In a Claude project, one constants cache for every thread's checkouts: a fresh one reads
+    # the floor's bake another made (compiler/driver/src/const_cache.rs).
+    if os.path.isdir(SHARED) and os.access(SHARED, os.W_OK):
+        env.setdefault("WRELA_CONST_CACHE", os.path.join(SHARED, ".wrela-consts"))
     path = os.environ.get("CLAUDE_ENV_FILE")
     if path:
         with open(path, "a", encoding="utf-8") as f:
-            for line in env.splitlines():
-                key, _, value = line.partition("=")
+            for key, value in env.items():
                 f.write(f"export {key}={shlex.quote(value)}\n")
     provisioned = subprocess.run([script, "--check"]).returncode == 0
     if source != "startup" and provisioned:
         return CLOUD.format(warm="")
     subprocess.Popen([script, "--warm"], cwd=root, start_new_session=True,
+                     env={**os.environ, **env},
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL)
     warm = ("The CLI, the native host, the floor's bake and the tests are building in the "

@@ -5,9 +5,10 @@
 //! function it doesn't call leaves its module, and its key, as they were.
 //!
 //! The cache is a directory of files in the package's `build` directory (`build/consts`), one
-//! per key, each a constant's value ([`encode`]). A file is written whole to a temporary name
-//! and renamed into place, so two builds at once never read half of one. Files no build has used
-//! for a week are removed.
+//! per key, each a constant's value ([`encode`]), or the directory `WRELA_CONST_CACHE` names,
+//! which every package and checkout that sets it share. A file is written whole to a temporary
+//! name and renamed into place, so two builds at once never read half of one. Files no build has
+//! used for a week are removed.
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -20,9 +21,18 @@ const MAGIC: &[u8; 8] = b"wrelac\x00\x02";
 /// How long an entry no build has used is kept.
 const KEEP_FOR: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
-/// The cache's directory for the package at `root`: its `build/consts`.
+/// The cache's directory for the package at `root`: `WRELA_CONST_CACHE` when it's set, else
+/// its `build/consts`. One directory can serve every package and checkout, as a key is all a
+/// value depends on: a fresh checkout reads the constants another one computed.
 pub fn dir_of(root: &Path) -> Option<PathBuf> {
-    root.is_dir().then(|| root.join("build").join("consts"))
+    dir_in(root, std::env::var_os("WRELA_CONST_CACHE"))
+}
+
+fn dir_in(root: &Path, shared: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match shared.filter(|d| !d.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => root.is_dir().then(|| root.join("build").join("consts")),
+    }
 }
 
 /// A constant's key: its module's WASM and the fuel it may use, with the compiler's version.
@@ -57,7 +67,11 @@ pub fn put(dir: &Path, key: &str, value: &Value) {
         return;
     }
     let bytes = encode(value);
-    let tmp = dir.join(format!("{key}.{}.tmp", std::process::id()));
+    // Unique across machines too, which share a directory but not their process ids.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    let tmp = dir.join(format!("{key}.{}-{nanos}.tmp", std::process::id()));
     if std::fs::write(&tmp, &bytes).is_ok()
         && std::fs::rename(&tmp, dir.join(format!("{key}.wcv"))).is_err()
     {
@@ -323,6 +337,15 @@ mod tests {
         let mut longer = bytes.clone();
         longer.push(0);
         assert!(decode(&longer).is_none());
+    }
+
+    #[test]
+    fn the_cache_is_the_shared_directory_else_the_packages() {
+        let root = std::env::temp_dir();
+        assert_eq!(dir_in(&root, None), Some(root.join("build/consts")));
+        assert_eq!(dir_in(&root, Some("".into())), Some(root.join("build/consts")));
+        assert_eq!(dir_in(&root, Some("/s/c".into())), Some(PathBuf::from("/s/c")));
+        assert_eq!(dir_in(Path::new("/no/such/package"), None), None);
     }
 
     #[test]
