@@ -1,0 +1,58 @@
+// Real reflection shader sampling, without a full scene or temporal history. A thin red
+// far surface lies beside a blue foreground occluder; a second panel is a continuous ramp.
+use engine::floor::fullscreen
+use engine::view::{Camera, first_camera}
+use engine::water::reflected_on_screen
+use std::gpu::{FragCoord, Rgba16Float, Texture, begin_pass, begin_screen_pass, texture}
+
+@fragment
+fn source(p: FragCoord, cam: Camera, ramp: bool) -> vec4 {
+    let shift = cam.jitter.x * cam.screen.x * 0.5
+    if ramp {
+        return vec4((p.position.x - shift) / 64.0, 0.0, 0.0, 4.25)
+    }
+    let column = i32(floor(32.0 + shift))
+    if i32(p.position.x) == column {
+        vec4(1.0, 0.0, 0.0, 4.25)
+    } else {
+        vec4(0.0, 0.0, 1.0, 1.0)
+    }
+}
+
+@fragment
+fn report(
+    p: FragCoord,
+    cam: Camera,
+    thin: Texture<Rgba16Float>,
+    ramp: Texture<Rgba16Float>,
+) -> vec4 {
+    let world = vec3(0.0, 0.0, 4.0)
+    let ray = normalize(vec3(0.0, 0.2, 1.0))
+    let c = if p.position.x < 32.0 {
+        reflected_on_screen(cam, thin, world, ray, rough: 0.0)
+    } else { reflected_on_screen(cam, ramp, world, ray, rough: 0.5) }
+    // Green makes the confidence observable, rather than losing it in target alpha.
+    vec4(c.r, c.a, c.b, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let base = first_camera(
+        vec3(0.0, 1.0, 0.0),
+        vec3(0.0, 1.0, 1.0),
+        1.0,
+        width: 64,
+        height: 64,
+    ).unjittered()
+    let cam = Camera { jitter: vec2(time * 2.0 / 64.0, 0.0), ..base }
+    var thin = texture::<Rgba16Float>(width: 64, height: 64)
+    let p = begin_pass(mut thin)
+    fullscreen(p, source.bind(cam, ramp: false))
+    p.end()
+    var ramp = texture::<Rgba16Float>(width: 64, height: 64)
+    let p = begin_pass(mut ramp)
+    fullscreen(p, source.bind(cam, ramp: true))
+    p.end()
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(p, report.bind(cam, thin, ramp))
+    p.present()
+}

@@ -333,9 +333,19 @@ fn the_wind_is_a_function_of_time_and_place() {
         .iter()
         .map(|c| c["caller"].as_str().unwrap_or_default().to_string())
         .collect();
-    for want in ["blade_point", "flower", "card_corner"] {
+    for want in ["blade_point", "flower_head", "card_corner"] {
         assert!(callers.iter().any(|c| c.ends_with(want)), "{want} doesn't sway: {callers:?}");
     }
+    let heads = query(&["callers engine::grass::flower_head".into()]);
+    assert!(
+        heads[0]["callers"]
+            .as_array()
+            .expect("flower-head callers")
+            .iter()
+            .any(|c| { c["caller"].as_str().is_some_and(|name| name == "engine::grass::flower") }),
+        "the flower vertex no longer uses the shared moving stem tip: {}",
+        heads[0]
+    );
     let (dir, _) = built("clearing-wind");
     let mut host = wrela_host::CpuHost::load(&dir).expect("load");
     let mut sway = |t: f32, p: [f32; 3], h: f32| {

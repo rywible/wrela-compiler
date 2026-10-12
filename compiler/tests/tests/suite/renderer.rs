@@ -467,6 +467,53 @@ fn temporal_current_reconstruction_stays_continuous_when_reducing_resolution() {
     }
 }
 
+/// Real volume projection preserves horizontal instance scale, vertical extent and hit depth.
+#[test]
+#[ignore = "needs a GPU"]
+fn volume_width_changes_coverage_without_stretching_tree_height() {
+    let (dir, rel) = page("compiler/tests/volume-width", "volume-width");
+    let (chrome, native) = both_hosts(&dir, &rel, 192, 128);
+    for (host, frame) in [("Chrome", &chrome), ("native", &native)] {
+        for row in 0..2 {
+            let mut widths = [0usize; 3];
+            let mut heights = [0usize; 3];
+            for col in 0..3 {
+                let (mut x0, mut x1, mut y0, mut y1) = (64, 0, 64, 0);
+                for y in 0..64 {
+                    for x in 0..64 {
+                        let at = 4 * ((row * 64 + y) * 192 + col * 64 + x);
+                        assert_eq!(
+                            frame[at], 0,
+                            "{host}: volume depth leaves scaled bounds at {row}/{col}/{x}/{y}"
+                        );
+                        if frame[at + 1] > 200 {
+                            x0 = x0.min(x);
+                            x1 = x1.max(x);
+                            y0 = y0.min(y);
+                            y1 = y1.max(y);
+                        }
+                    }
+                }
+                assert!(x1 > x0 && y1 > y0, "{host}: empty volume {row}/{col}");
+                widths[col] = x1 - x0 + 1;
+                heights[col] = y1 - y0 + 1;
+            }
+            assert!(
+                widths[0] * 3 < widths[1] * 2,
+                "{host}: narrow volume kept full width {widths:?}"
+            );
+            assert!(widths[2] * 4 > widths[1] * 5, "{host}: broad volume did not widen {widths:?}");
+            if row == 0 {
+                assert!(
+                    heights[2].abs_diff(heights[0]) <= 3,
+                    "{host}: width stretched vertical height {heights:?}"
+                );
+            }
+        }
+    }
+    frames_match(&chrome, &native);
+}
+
 /// Real atlas filtering through the production impostor cut/depth/shade entrypoints.
 #[test]
 #[ignore = "needs a GPU"]
@@ -494,11 +541,11 @@ fn impostor_samples_stay_in_their_cells_and_filter_only_covered_surfaces() {
             (20..110).contains(&partial),
             "{host}: quarter-covered texel kept {partial}/256 pixels"
         );
-        let up = frame[4 * (8 * 192 + 152)];
-        let down = frame[4 * (8 * 192 + 184)];
+        let right = frame[4 * (8 * 192 + 152)];
+        let left = frame[4 * (8 * 192 + 184)];
         assert!(
-            up > down + 40,
-            "{host}: fixture lighting does not distinguish folded normals ({up}, {down})"
+            right > left + 40,
+            "{host}: fixture lighting does not distinguish folded normals ({right}, {left})"
         );
     }
     frames_match(&chrome, &native);
@@ -631,4 +678,41 @@ fn character_materials_reflect_by_view_roughness_and_metallicity() {
     let clay = sample(3.0);
     assert_eq!(clay[0], clay[1], "rough metal remains glossy in clay view");
     assert_eq!(clay[0], clay[2], "metal loses diffuse clay light");
+}
+
+/// A moving sampling grid must not borrow an occluder's colour or detach from its depth.
+#[test]
+#[ignore = "needs a GPU"]
+fn water_reflections_follow_raster_jitter_without_foreground_colour_leaks() {
+    let (dir, _) = page("compiler/tests/water-reflection", "water-reflection");
+    let mut host = Host::load(&dir).expect("load");
+    let mut ramp_reference = None;
+    for shift in [-0.49, -0.2, 0.0, 0.2, 0.49] {
+        let frame = host.run_frames(&[shift], 64, 16).expect("reflection frame").frame;
+        for y in 0..16 {
+            for x in 0..64 {
+                let i = 4 * (y * 64 + x);
+                let c = &frame[i..i + 3];
+                if x < 32 {
+                    assert!(
+                        c[0] >= 254 && c[1] > 20 && c[2] <= 1,
+                        "jitter {shift}: red surface lost or blue occluder leaked at ({x},{y}): {c:?}"
+                    );
+                } else {
+                    assert!(
+                        c[0].abs_diff(128) <= 1 && c[1] >= 254 && c[2] == 0,
+                        "jitter {shift}: planar reflection shifted or lost confidence: {c:?}"
+                    );
+                    if let Some(reference) = ramp_reference {
+                        assert!(
+                            c[0].abs_diff(reference) <= 1,
+                            "reflection ramp changes with jitter"
+                        );
+                    } else {
+                        ramp_reference = Some(c[0]);
+                    }
+                }
+            }
+        }
+    }
 }

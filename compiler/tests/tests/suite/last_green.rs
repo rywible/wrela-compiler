@@ -25,6 +25,43 @@ fn map_package(name: &str, main: &str) -> PathBuf {
     dir
 }
 
+/// Map modules can carry their own focused regressions. They are copied into each scratch
+/// package and must run too; the fixture's own expected count remains separate below.
+fn copied_map_test_count(dir: &Path) -> usize {
+    MAP_FILES.iter().map(|file| declared_tests(&dir.join(file))).sum()
+}
+
+fn declared_tests(file: &Path) -> usize {
+    std::fs::read_to_string(file)
+        .expect("read copied fixture module")
+        .lines()
+        .filter(|line| line.trim() == "@test")
+        .count()
+}
+
+/// Terrain, trees and masonry use bounded fields and small seeded fixtures. Copy only their
+/// modules, so discovering their tests cannot prepare the full game's history constants.
+#[test]
+fn the_environments_bounded_art_and_collision_regressions_pass() {
+    let dir = map_package(
+        "last-green/environment-art",
+        "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+    );
+    let floor = repo_root().join("examples/last-green");
+    let extra = ["trees.wrela", "blockouts.wrela"];
+    for file in extra {
+        std::fs::copy(floor.join(file), dir.join(file)).expect("copy environment fixture module");
+    }
+    let manifest = dir.join("wrela.toml");
+    let mut text = std::fs::read_to_string(&manifest).expect("read map fixture manifest");
+    let great_tree = repo_root().join("examples/great-tree").display().to_string();
+    text.push_str(&format!("great_tree = {{ path = {great_tree:?} }}\n"));
+    std::fs::write(manifest, text).expect("add great tree dependency");
+    let declared = copied_map_test_count(&dir)
+        + extra.iter().map(|file| declared_tests(&dir.join(file))).sum::<usize>();
+    assert_eq!(super::tests_pass(&dir), declared);
+}
+
 /// AC1: the floor's map is wrela source written with the engine's types, and holds #44's
 /// anatomy: a gate, a town's site, 3–5 anchors, a Warden's arena, rest points, waystones, 25–35
 /// echoes' sites and views; its area is 3 km² within 10% (Q1); and the engine's own refusals
@@ -64,7 +101,7 @@ fn nothing_to_refuse() {
 pub fn frame(time: f32, width: u32, height: u32) {}
 "#;
     let dir = map_package("last-green/anatomy", tests);
-    assert_eq!(super::tests_pass(&dir), 3);
+    assert_eq!(super::tests_pass(&dir), 3 + copied_map_test_count(&dir));
 }
 
 /// A package that grows the floor's map changed by `edit` (its `map()` bound to `m`, mutable),
@@ -241,7 +278,7 @@ fn left_long_before_the_plague_is_wood_again() {
     let dir = map_package("last-green/elves", tests);
     let floor = repo_root().join("examples/last-green");
     std::fs::copy(floor.join("peoples.wrela"), dir.join("peoples.wrela")).expect("copy the elves");
-    assert_eq!(super::tests_pass(&dir), 4);
+    assert_eq!(super::tests_pass(&dir), 4 + copied_map_test_count(&dir));
 }
 
 /// A world's seed (`Map::seed`): the same map grown with another seed is another world, and with
@@ -279,5 +316,5 @@ fn seeds() {
 }
 "#;
     let dir = map_package("last-green/seeds", tests);
-    assert_eq!(super::tests_pass(&dir), 1);
+    assert_eq!(super::tests_pass(&dir), 1 + copied_map_test_count(&dir));
 }
