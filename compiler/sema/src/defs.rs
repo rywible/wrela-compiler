@@ -212,6 +212,7 @@ macro_rules! lang_items {
                         | Lang::StorageWriteCommand
                         | Lang::FetchCommand
                         | Lang::PostCommand
+                        | Lang::HostCommand
                         | Lang::PrepareCommand
                         | Lang::UnprepareCommand
                         | Lang::HandOverCommand
@@ -369,6 +370,7 @@ lang_items! {
     PrintCommand = "std::io::print_command",
     PhaseCommand = "std::time::phase_command",
     PostCommand = "std::io::post_command",
+    HostCommand = "std::host::host_command",
     Shipped = "std::io::Shipped",
     PrepareCommand = "std::reload::prepare_command",
     UnprepareCommand = "std::reload::unprepare_command",

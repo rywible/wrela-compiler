@@ -11,7 +11,7 @@ import sys
 import tempfile
 
 PACKAGES = ('examples/hello-field', 'compiler/tests/renderer', 'compiler/tests/workgroup',
-            'compiler/tests/texels', 'compiler/tests/groups', 'compiler/tests/domains')
+            'compiler/tests/texels', 'compiler/tests/groups', 'compiler/tests/domains', 'console')
 
 
 def main(wrela):

@@ -122,6 +122,9 @@ fn command(c: &Command) -> Value {
             json!({ "op": "StorageWrite", "request": request, "path": path, "data": data })
         }
         Command::Fetch { request, url } => json!({ "op": "Fetch", "request": request, "url": url }),
+        Command::HostRequest { request, service, body } => {
+            json!({ "op": "HostRequest", "request": request, "service": service, "body": body })
+        }
         Command::Post { request, url, body } => {
             json!({ "op": "Post", "request": request, "url": url, "body": body })
         }
@@ -188,6 +191,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .prepare(6, "../floor")
         .unprepare("../floor")
         .hand_over(7, "next")
+        .host_request(8, "test/echo", &[3, 2, 1])
         .finish()
 }
 

@@ -199,6 +199,7 @@ pub(crate) struct Io {
     pub build: Option<PathBuf>,
     pub storage: Option<PathBuf>,
     pub post: Option<PostHandler>,
+    pub host: Option<HostHandler>,
     /// Don't show printed lines on stderr: the caller shows them ([`crate::Options::quiet`]).
     pub quiet: bool,
 }
@@ -217,6 +218,24 @@ impl PostHandler {
         f: impl Fn(&str, &[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync + 'static,
     ) -> PostHandler {
         PostHandler(Arc::new(f))
+    }
+}
+
+/// Application-host capabilities: named services receive opaque bytes and answer requests.
+#[derive(Clone)]
+pub struct HostHandler(pub Arc<Answer>);
+
+impl HostHandler {
+    pub fn new(
+        f: impl Fn(&str, &[u8]) -> std::result::Result<Vec<u8>, String> + Send + Sync + 'static,
+    ) -> HostHandler {
+        HostHandler(Arc::new(f))
+    }
+}
+
+impl std::fmt::Debug for HostHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HostHandler")
     }
 }
 
@@ -300,6 +319,14 @@ impl Requests {
                     .and_then(|f| std::fs::read(f).map_err(|e| e.to_string()));
                 (*request, a)
             }
+            Command::HostRequest { request, service, body } => {
+                self.start(*request, cmd.opcode())?;
+                let a = match &self.io.host {
+                    Some(h) => (h.0)(service, body),
+                    None => Err("this host has no capability handler".to_string()),
+                };
+                (*request, a)
+            }
             Command::Post { request, url, body } => {
                 self.start(*request, cmd.opcode())?;
                 let a = match &self.io.post {
@@ -356,7 +383,8 @@ impl<E: Executor> State<E> {
                 Command::StorageRead { .. }
                 | Command::StorageWrite { .. }
                 | Command::Fetch { .. }
-                | Command::Post { .. } => self.requests.io(&cmd)?,
+                | Command::Post { .. }
+                | Command::HostRequest { .. } => self.requests.io(&cmd)?,
                 Command::Prepare { request, path } | Command::HandOver { request, path } => {
                     self.requests.start(*request, cmd.opcode())?;
                     let path = path.to_string();

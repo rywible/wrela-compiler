@@ -147,11 +147,12 @@ export function padChanges(pads: readonly (PadReading | null)[], last: (PadState
 
 /** The gamepads' changes into `ring` (`padChanges`), polled each animation frame: the Gamepad
  * API has no events for them. */
-export function pollPads(ring: InputRing, now: () => number): void {
+export function pollPads(ring: InputRing, now: () => number, active: () => boolean = () => true): void {
   if (typeof navigator.getGamepads !== "function") return;
   const last: (PadState | null)[] = Array.from({ length: PADS }, () => null);
   const poll = () => {
-    for (const event of padChanges(navigator.getGamepads(), last)) ring.write(event, now());
+    const changes = padChanges(navigator.getGamepads(), last);
+    if (active()) for (const event of changes) ring.write(event, now());
     requestAnimationFrame(poll);
   };
   requestAnimationFrame(poll);

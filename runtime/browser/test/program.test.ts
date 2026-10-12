@@ -430,7 +430,8 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  expect(program.hash!.hex()).toBe("5c298bf6dfaa0338");
+  // Stream v10 changes the batch headers; the native reference encoder checks the same bytes.
+  expect(program.hash!.hex()).toBe("8e2f6b0e68d2873b");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);
@@ -562,6 +563,25 @@ describe("requests", () => {
   test("a build's path stays on its site", async () => {
     const p = await program(new Encoder().handOver(4, "https://example.com/floor").finish());
     expect(() => p.call("ask")).toThrow("HandOver failed: the build path `https://example.com/floor`");
+  });
+
+  test("host capabilities answer opaque bytes later and fail without a handler", async () => {
+    const io = { fetch: async () => new Uint8Array(), storageRead: async () => new Uint8Array(), storageWrite: async () => {}, post: async () => new Uint8Array(),
+      hostRequest: async (service: string, body: Uint8Array) => { expect(service).toBe("test/echo"); expect(body).toEqual(Uint8Array.of(1, 2, 3, 4)); return body.slice().reverse(); } };
+    const command = new Encoder().hostRequest(4, "test/echo", Uint8Array.of(1, 2, 3, 4)).finish();
+    const p = await program(command, { io });
+    p.call("ask");
+    expect(p.call("status")).toBe(-1);
+    await later();
+    expect(p.call("status")).toBe(4);
+    expect(p.call("take")).toBe(0x01020304);
+    expect(p.call("status")).toBe(-1);
+    const absent = await program(command);
+    absent.call("ask");
+    await later();
+    expect(absent.call("status")).toBe(-2);
+    const invalid = await program(new Encoder().hostRequest(4, "../escape", new Uint8Array()).finish(), { io });
+    expect(() => invalid.call("ask")).toThrow("HostRequest failed");
   });
 
   test("storage paths stay inside the program's storage", async () => {

@@ -81,3 +81,29 @@ test("fetches and posts literal percent escapes inside the build", async () => {
     { url: "http://localhost/game/.%252E/admin", method: "POST" },
   ]);
 });
+
+
+test("stable storage survives release paths while default page storage stays separate", async () => {
+  const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");
+  const saved = new Map<string, Uint8Array>();
+  const directory = (path: string[]): unknown => ({
+    getDirectoryHandle: async (name: string) => directory([...path, name]),
+    getFileHandle: async (name: string) => ({
+      createWritable: async () => ({ write: async (data: Uint8Array) => saved.set([...path, name].join("/"), data.slice()), close: async () => {} }),
+      getFile: async () => ({ arrayBuffer: async () => { const bytes = saved.get([...path, name].join("/")); if (!bytes) throw new Error("missing"); return bytes.slice().buffer; } }),
+    }),
+  });
+  Object.defineProperty(globalThis, "navigator", { configurable: true, value: { storage: { getDirectory: async () => directory([]) } } });
+  try {
+    const first = browserIo("https://game.example/releases/old/session/", undefined, undefined, undefined, "game");
+    const next = browserIo("https://game.example/releases/new/floor/", undefined, undefined, undefined, "game");
+    await first.storageWrite("tower/save", Uint8Array.of(3, 7));
+    expect(await next.storageRead("tower/save")).toEqual(Uint8Array.of(3, 7));
+    expect([...saved.keys()]).toEqual(["wrela/game/tower/save"]);
+    await expect(browserIo(BASE).storageRead("tower/save")).rejects.toThrow("missing");
+    expect(() => browserIo(BASE, undefined, undefined, undefined, "../game")).toThrow("namespace");
+  } finally {
+    if (previous) Object.defineProperty(globalThis, "navigator", previous);
+    else Reflect.deleteProperty(globalThis, "navigator");
+  }
+});

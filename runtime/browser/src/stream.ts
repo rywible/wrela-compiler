@@ -103,6 +103,7 @@ export type Command =
   | { op: "Fetch"; request: number; url: string }
   | { op: "Label"; name: string }
   | { op: "Post"; request: number; url: string; body: Bytes }
+  | { op: "HostRequest"; request: number; service: string; body: Bytes }
   | { op: "Prepare"; request: number; path: string }
   | { op: "Unprepare"; path: string }
   | { op: "HandOver"; request: number; path: string };
@@ -390,6 +391,11 @@ export function decode(batch: Bytes): Command[] {
       case "StorageWrite": {
         const [path, data] = twoRuns("path", "the path's and data's lengths don't match the payload");
         cmd = { op: name, request: w(0), path, data };
+        break;
+      }
+      case "HostRequest": {
+        const [service, body] = twoRuns("service", "the service and body lengths do not match the payload");
+        cmd = { op: name, request: w(0), service, body };
         break;
       }
       case "Post": {

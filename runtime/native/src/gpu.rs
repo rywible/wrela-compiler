@@ -1694,6 +1694,7 @@ impl Executor for Gpu {
             | Command::StorageWrite { .. }
             | Command::Fetch { .. }
             | Command::Post { .. }
+            | Command::HostRequest { .. }
             | Command::Prepare { .. }
             | Command::Unprepare { .. }
             | Command::HandOver { .. } => {}

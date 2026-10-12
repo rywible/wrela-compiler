@@ -80,6 +80,17 @@ function fatal(e: unknown): void {
   }
 }
 
+let storageNamespace: string | null = null;
+let nextHostRequest = 1;
+const hostRequests = new Map<number, { resolve: (bytes: Uint8Array<ArrayBuffer>) => void; reject: (e: Error) => void }>();
+function requestHost(service: string, bytes: Uint8Array<ArrayBuffer>): Promise<Uint8Array<ArrayBuffer>> {
+  const id = nextHostRequest++;
+  return new Promise((resolve, reject) => {
+    hostRequests.set(id, { resolve, reject });
+    self.postMessage({ type: "host-request", id, service, bytes } satisfies FromWorker);
+  });
+}
+
 /** The device, with timestamp queries when `timestamps` asks for them and the adapter has
  * them. */
 async function openDevice(timestamps: boolean): Promise<GPUDevice> {
@@ -189,7 +200,7 @@ interface Carried {
  * on (`carried`). */
 function programOptions(b: Build, ticks: TickSettings, carried: Carried | null): ProgramOptions {
   return {
-    io: browserIo(base, undefined, buildBase),
+    io: browserIo(base, undefined, buildBase, requestHost, storageNamespace),
     builds: handOvers ?? undefined,
     spawnWorker,
     startVoice,
@@ -341,6 +352,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
   const max = device.limits.maxTextureDimension2D;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
   let checking = false;
+  let firstPresented: Program | null = null;
   // Hot reload and hand-over: the frames drawn, and whether a new build is being swapped in (the
   // canvas keeps the last frame meanwhile).
   let frames = 0;
@@ -383,7 +395,10 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         executor.frame = frames;
         program.frame(time, width, height);
         // A change is shown by the first frame that draws after it.
-        if (executor.presented) live?.drawn(frames);
+        if (executor.presented) {
+          live?.drawn(frames);
+          if (firstPresented !== program) { firstPresented = program; self.postMessage({ type: "presented" } satisfies FromWorker); }
+        }
         frames++;
         if (!checking) {
           checking = true;
@@ -758,6 +773,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       return;
     case "start": {
       base = msg.base;
+      storageNamespace = msg.storage;
       buildBase = msg.base;
       testing = msg.test !== null;
       ring = new InputRing(msg.input);
@@ -772,6 +788,11 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
           return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live);
         })
         .catch(fatal);
+      return;
+    }
+    case "host-reply": {
+      const waiting = hostRequests.get(msg.id);
+      if (waiting) { hostRequests.delete(msg.id); if (msg.error === null) waiting.resolve(msg.bytes); else waiting.reject(new Error(msg.error)); }
       return;
     }
     case "resize":

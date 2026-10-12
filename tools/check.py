@@ -27,7 +27,7 @@ SOURCES = ("examples", "engine", "compiler/std", "compiler/tests/fields", "compi
            "compiler/tests/sketches", "compiler/tests/numerics", "compiler/tests/render",
            "compiler/tests/queries", "compiler/tests/simd", "compiler/tests/input",
            "compiler/tests/lift", "compiler/tests/texels", "compiler/tests/shader_params",
-           "compiler/tests/unroll", "ui", "studio")
+           "compiler/tests/unroll", "ui", "studio", "platform", "console")
 STEPS = ("rustfmt", "clippy", "wrela-fmt", "tools", "browser-types", "browser-dist",
          "browser-size", "browser", "doc", "wgsl")
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_ITERS", "WRELA_FUZZ_SEED",

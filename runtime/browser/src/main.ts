@@ -1,3 +1,4 @@
+import { BrowserPlatform } from "./platform.ts";
 // The main-thread shim: hands the canvas to the render worker, forwards its size (in device
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
@@ -260,10 +261,18 @@ function start(): void {
     const workerUrl = "worker.js";
     const worker = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: "wrela render" });
     const ring = InputRing.create();
+    const platform = new BrowserPlatform(canvas, visible => worker.postMessage({ type: "visibility", visible: visible && document.visibilityState === "visible" } satisfies ToWorker));
     const clip = new Clip();
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
-      if (msg.type === "audio") {
+      if (msg.type === "host-request") {
+        platform.request(msg.service, msg.bytes).then(
+          bytes => worker.postMessage({ type: "host-reply", id: msg.id, bytes, error: null } satisfies ToWorker),
+          error => worker.postMessage({ type: "host-reply", id: msg.id, bytes: new Uint8Array(), error: errorMessage(error) } satisfies ToWorker),
+        );
+      } else if (msg.type === "presented") {
+        platform.presented();
+      } else if (msg.type === "audio") {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));
       } else if (msg.type === "load-query") {
         worker.postMessage({ type: "load", opened_ms: performance.timeOrigin, resources: loaded(["navigation", "resource"]) } satisfies ToWorker);
@@ -289,11 +298,13 @@ function start(): void {
           (e: unknown) => failEarly(e, testing),
         );
       } else {
+        platform.failed();
         showFatal(msg.message);
       }
     };
     worker.onerror = (event) => {
       event.preventDefault();
+      platform.failed();
       failEarly(new Error(`the render worker failed: ${event.message || "it couldn't start"}`), testing);
     };
     // The canvas keeps its size in device pixels for input positions; the worker owns its
@@ -303,11 +314,12 @@ function start(): void {
     const sized = { width, height };
     listen(canvas, ring, epochNow, () => sized);
     // A test's input is its script: a pad on the machine that runs it isn't heard.
-    if (!test) pollPads(ring, epochNow);
+    if (!test) pollPads(ring, epochNow, () => platform.active);
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
     const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
     const live = mark === null ? null : Number(mark.content ?? "0") || 0;
-    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, width, height, test, input: ring.buffer, live };
+    const storage = document.querySelector<HTMLMetaElement>('meta[name="wrela-storage"]')?.content ?? null;
+    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, storage, width, height, test, input: ring.buffer, live };
     worker.postMessage(msg, [offscreen]);
     if (!test) {
       const resize = (entry?: ResizeObserverEntry) => {
@@ -325,7 +337,7 @@ function start(): void {
         onPixelRatioChange(() => resize());
       }
       const visibility = () =>
-        worker.postMessage({ type: "visibility", visible: document.visibilityState === "visible" } satisfies ToWorker);
+        worker.postMessage({ type: "visibility", visible: platform.active && document.visibilityState === "visible" } satisfies ToWorker);
       document.addEventListener("visibilitychange", visibility);
       visibility(); // the page may open hidden, in a background tab
     }

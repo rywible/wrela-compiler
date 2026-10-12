@@ -100,6 +100,7 @@ export interface Io {
   storageWrite(path: string, data: Bytes): Promise<void>;
   fetch(url: string): Promise<Bytes>;
   post(url: string, body: Bytes): Promise<Bytes>;
+  hostRequest?(service: string, body: Bytes): Promise<Bytes>;
 }
 
 /** The other builds a program may hand its place to (`std::reload`), each named by its path from
@@ -556,6 +557,12 @@ export class Program {
         // The body is a view into the program's memory: copy it.
         const body = cmd.body.slice();
         this.#requests.start(cmd.op, cmd.request, io ? () => io.post(cmd.url, body) : none("server to post to"));
+        return;
+      }
+      case "HostRequest": {
+        const body = cmd.body.slice();
+        const host = io?.hostRequest;
+        this.#requests.start(cmd.op, cmd.request, host ? () => host(cmd.service, body) : none("host capabilities"));
         return;
       }
       case "Prepare": {

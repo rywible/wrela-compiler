@@ -117,6 +117,11 @@ fn the_first_floor_door_returns_to_its_stair_landing() {
         .replace("const DOOR = Doorway { at: vec2(0.0, 0.6), reach: 1.2 }", door);
     let source = format!("{gate}\n{source}\n@testing\npub fn test_leave({leave}\n}}\n");
     let package = super::engine_package("first-floor-source", "first_floor", &source);
+    let manifest = package.join("wrela.toml");
+    let mut text = std::fs::read_to_string(&manifest).expect("manifest");
+    let platform = root.join("platform").display().to_string();
+    text.push_str(&format!("platform = {{ path = {platform:?} }}\n"));
+    std::fs::write(manifest, text).expect("platform dependency");
     let output = wrela_tests::page_scratch_root().join("first-floor-tour/last-green");
     wrela_tests::must_build(&package, &output);
     let dir = wrela_tests::page("examples/stair", "first-floor-tour/stair").0;

@@ -145,6 +145,11 @@ export class Encoder {
     return this.#command(Opcode.Post, [request, u.length, body.length], bytes);
   }
 
+  hostRequest(request: number, service: string, body: Uint8Array): this {
+    const u = utf8(service);
+    return this.#command(Opcode.HostRequest, [request, u.length, body.length], new Uint8Array([...pad(u), ...pad(body)]));
+  }
+
   prepare(request: number, path: string): this {
     const p = utf8(path);
     return this.#command(Opcode.Prepare, [request, p.length], pad(p));

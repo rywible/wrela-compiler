@@ -758,8 +758,10 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
     std::fs::create_dir_all(build.join("data")).expect("dir");
     std::fs::write(build.join("data/level.bin"), [1, 2, 3, 4, 5]).expect("write");
     let batch = Encoder::new().fetch(4, "data/level.bin").finish();
-    let mut p =
-        requester(&batch, Io { build: Some(build), storage: None, post: None, quiet: false });
+    let mut p = requester(
+        &batch,
+        Io { build: Some(build), storage: None, post: None, host: None, quiet: false },
+    );
     p.call("ask", &[]).expect("ask");
     assert_eq!(call_i32(&mut p, "status"), 5);
     assert_eq!(call_i32(&mut p, "take"), 0x0403_0201);
@@ -784,7 +786,8 @@ fn failed_request_take_keeps_the_answer_for_a_valid_destination() {
 fn storage_keeps_bytes_at_paths() {
     let storage = scratch_dir("storage");
     assert!(!storage.join("saves").exists(), "the write must create missing parents");
-    let io = Io { build: None, storage: Some(storage.clone()), post: None, quiet: false };
+    let io =
+        Io { build: None, storage: Some(storage.clone()), post: None, host: None, quiet: false };
     let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
     let mut p = requester(&write, io.clone());
     p.call("ask", &[]).expect("ask");
@@ -869,6 +872,25 @@ fn posts_go_to_the_handler_and_fail_without_one() {
     let elsewhere = Encoder::new().post(4, "https://example.com/x", &[]).finish();
     let err = requester(&elsewhere, Io::default()).call("ask", &[]).expect_err("rejected");
     assert!(err.to_string().contains("must be relative"), "{err}");
+}
+
+#[test]
+fn host_capabilities_answer_opaque_bytes_and_fail_without_a_handler() {
+    let batch = Encoder::new().host_request(4, "test/echo", &[1, 2, 3, 4]).finish();
+    let echo = HostHandler::new(|service, body| {
+        assert_eq!(service, "test/echo");
+        Ok(body.iter().rev().copied().collect())
+    });
+    let mut p = requester(&batch, Io { host: Some(echo), ..Io::default() });
+    p.call("ask", &[]).expect("capability request");
+    assert_eq!(call_i32(&mut p, "status"), 4);
+    assert_eq!(call_i32(&mut p, "take"), 0x0102_0304);
+    let mut p = requester(&batch, Io::default());
+    p.call("ask", &[]).expect("unsupported capability arrives as a failure");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED);
+    let bad = Encoder::new().host_request(4, "../privileged", &[]).finish();
+    let err = requester(&bad, Io::default()).call("ask", &[]).expect_err("invalid service");
+    assert!(err.to_string().contains("host service"), "{err}");
 }
 
 /// A program whose `take(cap)` reads up to `cap` input events to address 1024, and whose

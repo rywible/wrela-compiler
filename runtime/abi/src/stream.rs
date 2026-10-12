@@ -1,4 +1,4 @@
-//! # The command stream, version 9
+//! # The command stream, version 10
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -46,6 +46,7 @@
 //! | 26 | `Prepare` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: gets the build at the path, relative to the program's build, ready to start (its WASM compiled, its pipelines built), in the background; answered with no bytes when it is, a request |
 //! | 27 | `Unprepare` | `path length`, then the path's UTF-8, padded to 4 bytes: lets go of what `Prepare` got ready for that build (its pipelines that the running build doesn't use) |
 //! | 28 | `HandOver` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: after this call, the build at the path takes this program's place, with what it kept (`std::reload`). The request is answered only if the hand-over fails, and then this program goes on |
+//! | 29 | `HostRequest` | `request`, `service length`, `body length`, then UTF-8 service and opaque bytes, each padded to 4 bytes: a host capability request |
 //!
 //! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -78,7 +79,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -126,10 +127,11 @@ pub enum Opcode {
     Prepare = 26,
     Unprepare = 27,
     HandOver = 28,
+    HostRequest = 29,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 27] = [
+    pub const ALL: [Opcode; 28] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -157,6 +159,7 @@ impl Opcode {
         Opcode::Prepare,
         Opcode::Unprepare,
         Opcode::HandOver,
+        Opcode::HostRequest,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -192,6 +195,7 @@ impl Opcode {
             Opcode::Prepare => "Prepare",
             Opcode::Unprepare => "Unprepare",
             Opcode::HandOver => "HandOver",
+            Opcode::HostRequest => "HostRequest",
         }
     }
 }
@@ -529,6 +533,11 @@ pub enum Command<'a> {
         body: &'a [u8],
     },
     /// Another build made ready to start (`std::reload::prepare`).
+    HostRequest {
+        request: u32,
+        service: &'a str,
+        body: &'a [u8],
+    },
     Prepare {
         request: u32,
         path: &'a str,
@@ -573,6 +582,7 @@ impl Command<'_> {
             Command::Prepare { .. } => Opcode::Prepare,
             Command::Unprepare { .. } => Opcode::Unprepare,
             Command::HandOver { .. } => Opcode::HandOver,
+            Command::HostRequest { .. } => Opcode::HostRequest,
         }
     }
 }
@@ -967,6 +977,13 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 )?;
                 Command::StorageWrite { request: w(0), path, data }
             }
+            Opcode::HostRequest => {
+                let (service, body) = two_runs(
+                    "the service and body lengths do not match the payload",
+                    "the service is not UTF-8",
+                )?;
+                Command::HostRequest { request: w(0), service, body }
+            }
             Opcode::Post => {
                 let (url, body) = two_runs(
                     "the URL's and body's lengths don't match the payload",
@@ -1349,6 +1366,12 @@ impl Encoder {
     pub fn post(&mut self, request: u32, url: &str, body: &[u8]) -> &mut Self {
         let words = [request, url.len() as u32, body.len() as u32];
         self.padded_command(Opcode::Post, &words, &[url.as_bytes(), body]);
+        self
+    }
+
+    pub fn host_request(&mut self, request: u32, service: &str, body: &[u8]) -> &mut Self {
+        let words = [request, service.len() as u32, body.len() as u32];
+        self.padded_command(Opcode::HostRequest, &words, &[service.as_bytes(), body]);
         self
     }
 

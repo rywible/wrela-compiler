@@ -1,0 +1,21 @@
+// Asynchronous capabilities supplied by the application host. The shared command stream
+// carries a service name and opaque bytes; policy and message schemas belong to Wrela code.
+
+use std::io::{Pending, next_request, path_problem}
+
+/// Calls a host capability. Unsupported services fail as an ordinary IO request.
+/// A service name is a relative path; request/reply bytes belong to that service's protocol.
+pub fn request(service: str, bytes: [u8]) -> Pending<u8> {
+    if let Some(why) = path_problem(service) {
+        panic(f"host service `{service}` {why}")
+    }
+    if service.len() + bytes.len() > 1048576 - 128 {
+        panic("host request is larger than the command buffer permits")
+    }
+    let id = next_request()
+    host_command(id, service, bytes)
+    Pending::new(id)
+}
+
+@intrinsic
+fn host_command(request: u32, service: str, bytes: [u8]) {}

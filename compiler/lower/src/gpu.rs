@@ -1192,6 +1192,7 @@ pub(crate) fn intrinsic(
             | Lang::FetchCommand
             | Lang::LabelCommand
             | Lang::PostCommand
+            | Lang::HostCommand
             | Lang::PrepareCommand
             | Lang::UnprepareCommand
             | Lang::HandOverCommand),
@@ -1204,6 +1205,7 @@ pub(crate) fn intrinsic(
                 Lang::StorageWriteCommand => (Opcode::StorageWrite, 1),
                 Lang::LabelCommand => (Opcode::Label, 0),
                 Lang::PostCommand => (Opcode::Post, 1),
+                Lang::HostCommand => (Opcode::HostRequest, 1),
                 Lang::PrepareCommand => (Opcode::Prepare, 1),
                 Lang::UnprepareCommand => (Opcode::Unprepare, 0),
                 Lang::HandOverCommand => (Opcode::HandOver, 1),

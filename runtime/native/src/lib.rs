@@ -47,7 +47,7 @@ pub mod build_memory {
     pub use crate::shared::{slice, write};
 }
 pub use program::{
-    BuildHelpers, Failure, HelperRun, PostHandler, Ticked, Value, metered_engine,
+    BuildHelpers, Failure, HelperRun, HostHandler, PostHandler, Ticked, Value, metered_engine,
     refuse_host_functions,
 };
 pub use wrela_abi::input::{Event, Scripted, parse_script};
@@ -94,6 +94,8 @@ pub struct Options {
     pub workers: u32,
     /// What answers the program's posts (`std::io::post`); without it, they fail.
     pub post: Option<PostHandler>,
+    /// Named application-host capabilities (`std::host::request`); unsupported without this.
+    pub host: Option<HostHandler>,
     /// Don't show the program's printed lines on stderr (`wrela: ...`): for a caller that
     /// shows them itself ([`Host::take_logs`]), such as `wrela studio`'s headless runner.
     pub quiet: bool,
@@ -109,7 +111,7 @@ impl Options {
     /// Where a build in `dir` loaded this way reads and writes ([`io`]).
     #[cfg(feature = "gpu")]
     fn io(&self, dir: &Path) -> program::Io {
-        io(dir, self.storage.as_deref(), self.post.clone(), self.quiet)
+        io(dir, self.storage.as_deref(), self.post.clone(), self.host.clone(), self.quiet)
     }
 
     /// These options with their storage in the build in `dir`'s, unless they name it: the
@@ -140,11 +142,18 @@ fn workers(n: u32) -> u32 {
 
 /// Where a build in `dir` reads and writes, with `storage` overriding its storage directory,
 /// and what answers its posts.
-fn io(dir: &Path, storage: Option<&Path>, post: Option<PostHandler>, quiet: bool) -> program::Io {
+fn io(
+    dir: &Path,
+    storage: Option<&Path>,
+    post: Option<PostHandler>,
+    host: Option<HostHandler>,
+    quiet: bool,
+) -> program::Io {
     program::Io {
         build: Some(dir.to_path_buf()),
         storage: Some(storage.map_or_else(|| dir.join("storage"), Path::to_path_buf)),
         post,
+        host,
         quiet,
     }
 }
@@ -974,7 +983,7 @@ impl CpuBuild {
     /// `storage` (by default, `storage/` in the build's directory), and without running
     /// `init`: call [`CpuHost::init`] next, which says why it failed if it does.
     pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
-        let io = io(&self.dir, storage, None, self.quiet);
+        let io = io(&self.dir, storage, None, None, self.quiet);
         let n = self::workers(workers);
         let (compiled, manifest) = (&self.compiled, &self.manifest);
         let program =

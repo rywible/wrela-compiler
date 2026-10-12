@@ -1,7 +1,7 @@
 // Loads a build (manifest.json, the WASM, each pipeline's WGSL) and assembles a running program:
 // pipelines built up front, then the WASM instantiated against the decoder.
 
-import { Checker, limitsOf } from "./check.ts";
+import { Checker, limitsOf, pathProblem } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
@@ -60,8 +60,12 @@ export function browserIo(
   base: string,
   fetchFn: Fetch = (url, init) => fetch(url, init),
   files: string = base,
+  hostRequest?: (service: string, body: Bytes) => Promise<Bytes>,
+  storage: string | null = null,
 ): Io {
-  const root = ["wrela", ...new URL(base).pathname.split("/").filter((p) => p !== "")];
+  if (storage !== null && pathProblem(storage) !== undefined) throw new Error("invalid storage namespace");
+  const parts = storage === null ? new URL(base).pathname.split("/").filter(p => p !== "") : storage.split("/");
+  const root = ["wrela", ...parts];
   // `pathProblem` permits a literal `%`, as the native host's file paths do. URL parsing would
   // interpret percent escapes before resolving dot segments (`%2e%2e` is `..`), so quote each
   // percent first: the server receives the program's path literally, still under the build.
@@ -77,6 +81,7 @@ export function browserIo(
     return (await dir(parts, create)).getFileHandle(name, { create });
   };
   return {
+    ...(hostRequest ? { hostRequest } : {}),
     async fetch(url) {
       const response = await get(fetchFn, relativeUrl(url, files));
       return new Uint8Array(await response.arrayBuffer());

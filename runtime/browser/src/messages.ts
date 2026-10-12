@@ -10,6 +10,8 @@ export type ToWorker =
       canvas: OffscreenCanvas;
       /** The page's URL: the build's files and `results/` resolve against it. */
       base: string;
+      /** Stable logical storage namespace, independent of immutable build URLs. */
+      storage: string | null;
       /** The canvas's size in device pixels. */
       width: number;
       height: number;
@@ -24,6 +26,7 @@ export type ToWorker =
     }
   | { type: "resize"; width: number; height: number }
   | { type: "visibility"; visible: boolean }
+  | { type: "host-reply"; id: number; bytes: Uint8Array<ArrayBuffer>; error: string | null }
   /** To a worker thread the render worker starts: run the program's jobs (`runWorker`). */
   | { type: "thread"; module: WebAssembly.Module; memory: WebAssembly.Memory; index: number }
   /** Test mode: the main thread has rendered the voice and saved its samples. */
@@ -51,6 +54,8 @@ export interface Loaded {
 
 export type FromWorker =
   | { type: "fatal"; message: string }
+  | { type: "host-request"; id: number; service: string; bytes: Uint8Array<ArrayBuffer> }
+  | { type: "presented" }
   /** Test mode, `latency` or `keylatency`: the frames have started; send the events over `ms`
    * milliseconds. */
   | { type: "latency-start"; ms: number }

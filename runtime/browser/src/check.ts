@@ -347,6 +347,11 @@ export class Checker {
         if (why !== undefined) throw err(`the build path \`${cmd.path}\` ${why}`);
         return;
       }
+      case "HostRequest": {
+        const why = pathProblem(cmd.service);
+        if (why !== undefined) throw err(`the host service \`${cmd.service}\` ${why}`);
+        return;
+      }
       case "Label":
         return;
     }

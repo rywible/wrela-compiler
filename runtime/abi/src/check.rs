@@ -467,6 +467,11 @@ impl Checker {
                     return err(format!("the build path `{path}` {why}"));
                 }
             }
+            Command::HostRequest { service, .. } => {
+                if let Some(why) = path_problem(service) {
+                    return err(format!("the host service `{service}` {why}"));
+                }
+            }
             Command::Label { .. } => {}
         }
         Ok(())

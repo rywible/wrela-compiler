@@ -14,6 +14,7 @@ mod climber;
 mod closed_list;
 mod codes;
 mod conformance;
+mod console;
 mod consts;
 mod derive;
 mod diagnostics;
