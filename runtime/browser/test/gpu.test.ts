@@ -2,7 +2,7 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { type BuiltPipeline, buildPipelines, GpuExecutor, type PipelineCache, ShaderError } from "../src/gpu.ts";
+import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, ShaderError } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
@@ -1008,4 +1008,44 @@ test("destroying a texture releases it after the work before it is submitted", a
   expect(device.textures[0]!.destroyed).toBe(false);
   executor.flush();
   expect(device.textures[0]!.destroyed).toBe(true);
+});
+
+test("background preparations share a bounded queue and a failed shader cannot poison it", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  m.pipelines = [0, 1, 2].map(i => ({ ...m.pipelines[1]!, name: `background ${i}`, shader: `${i}.wgsl` }));
+  const started = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  const create = device.createComputePipelineAsync.bind(device);
+  const seen: string[] = [];
+  const spy = spyOn(device, "createComputePipelineAsync").mockImplementation(async descriptor => {
+    seen.push(descriptor.label!);
+    if (descriptor.label === "background 0") {
+      started.resolve();
+      await finish.promise;
+      throw new Error("failed background shader");
+    }
+    return create(descriptor);
+  });
+  try {
+    const first = preparePipelines(device.gpu, { ...m, pipelines: m.pipelines.slice(0, 2) }, [SHADER, SHADER], []);
+    const second = preparePipelines(device.gpu, { ...m, pipelines: m.pipelines.slice(1) }, [SHADER, SHADER], [first]);
+    const result = Promise.allSettled([...first.values(), ...second.values()]);
+    expect([...first.values()][1]).toBe([...second.values()][0]);
+    await started.promise;
+    expect(seen).toEqual(["background 0"]);
+    finish.resolve();
+    const outcomes = await result;
+    expect(outcomes.map(o => o.status)).toEqual(["rejected", "fulfilled", "fulfilled", "fulfilled"]);
+    expect(seen).toEqual(["background 0", "background 1", "background 2"]);
+    const failure = outcomes[0];
+    expect(failure?.status === "rejected" && failure.reason.message).toContain("failed background shader");
+    // A later call after the queue drains also works, with all held entries reused.
+    const third = preparePipelines(device.gpu, { ...m, pipelines: m.pipelines.slice(1) }, [SHADER, SHADER], [second]);
+    await Promise.all(third.values());
+    expect(seen).toHaveLength(3);
+  } finally {
+    finish.resolve();
+    spy.mockRestore();
+  }
 });

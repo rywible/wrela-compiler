@@ -300,8 +300,26 @@ function biggestFirst(shaders: string[]): number[] {
   return shaders.map((_, i) => i).sort((a, b) => shaders[b]!.length - shaders[a]!.length);
 }
 
-/** Starts building the pipelines of a build got ready for a hand-over (`std::reload::prepare`)
- * that none of `have` holds: the build's pipelines by key, those `have` holds taken from it. */
+// Background preparation shares the GPU process with the visible program, even across
+// embedded pages. Submitting every shader at once can block that process for hundreds of
+// milliseconds. Keep one compilation in flight per device and leave a frame-sized gap for
+// drawing between shaders. Foreground startup still builds its pipelines together.
+const preparations = new WeakMap<GPUDevice, Promise<void>>();
+
+function preparePipeline(device: GPUDevice, pipeline: Pipeline, shader: string): Promise<BuiltPipeline> {
+  const previous = preparations.get(device) ?? Promise.resolve();
+  const built = previous
+    .then(() => new Promise<void>((resolve) => setTimeout(resolve, 16)))
+    .then(() => buildPipeline(device, pipeline, shader));
+  // A bad shader fails its caller, but must not poison the next preparation on this device.
+  const settled = built.then(() => {}, () => {});
+  preparations.set(device, settled);
+  void settled.then(() => { if (preparations.get(device) === settled) preparations.delete(device); });
+  return built;
+}
+
+/** Queues the pipelines of a build got ready for a hand-over (`std::reload::prepare`)
+ * that none of `have` holds: the build's pipelines by key, including pending preparations. */
 export function preparePipelines(device: GPUDevice, manifest: Manifest, shaders: string[], have: readonly PipelineCache[]): PipelineCache {
   const out: PipelineCache = new Map();
   for (const i of biggestFirst(shaders)) {
@@ -309,7 +327,7 @@ export function preparePipelines(device: GPUDevice, manifest: Manifest, shaders:
     const key = pipelineKey(p, shaders[i]!);
     if (out.has(key)) continue;
     const held = have.map((c) => c.get(key)).find((b) => b !== undefined);
-    out.set(key, held ?? buildPipeline(device, p, shaders[i]!));
+    out.set(key, held ?? preparePipeline(device, p, shaders[i]!));
   }
   return out;
 }
