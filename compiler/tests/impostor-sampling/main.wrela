@@ -1,0 +1,241 @@
+// Deterministic atlas samples through the production impostor fragment shaders. Each
+// 16×16 panel fixes its atlas coordinate; no world bake, scene or temporal history.
+use engine::floor::fullscreen
+use engine::impostor::{ATLAS, CELL, VIEWS, Bake, FarVertex, far_cut, far_cut_flat, far_shade}
+use engine::light::Light
+use engine::lit::Lighting
+use engine::plant::{Bark, Leaves}
+use engine::shadow::{Cascade, shadows}
+use engine::sky::Clouds
+use engine::terrain::{Levels, MAX_LEVELS}
+use engine::view::{Camera, first_camera}
+use std::gpu::{
+    ClipPosition, Compare, Depth, DepthTexture, Flat, FragCoord, GlobalId, InstanceIndex, R32Uint,
+    Rgba8, Rgba16Float, Texels, Texels3d, Texture, VertexIndex, begin_depth_pass, begin_pass,
+    begin_pass_with_depth, begin_screen_pass, buffer_of, comparison_sampler, depth_texture,
+    dispatch, draw, sampler, texture, texture3d, writable_texture,
+}
+
+const WIDTH: u32 = 192
+const SIDE: u32 = 16
+
+@compute(8, 8)
+fn atlas(colour: mut Texels<Rgba8>, normal: mut Texels<Rgba16Float>, p: GlobalId) {
+    let cell = p.y / CELL * VIEWS + p.x / CELL
+    let local = vec2u(p.x % CELL, p.y % CELL)
+    var c = if cell == 17 || cell == 0 || cell == 255 { vec4(0.8, 0.0, 0.0, 1.0) } else {
+        vec4(0.0, 0.0, 0.8, 1.0)
+    }
+    var n = vec4(0.0, 0.0, 0.75, 0.0)
+    if cell == 5 {
+        // One covered sample; the other three carry adversarial normal/depth values.
+        let covered = local.x == 31 && local.y == 31
+        c = if covered { vec4(1.0) } else { vec4(0.0) }
+        n = if covered { vec4(0.0, 0.0, 0.75, 0.025) } else { vec4(1.0, 1.0, 0.0, 0.9) }
+    }
+    if cell == 6 {
+        c = vec4(1.0)
+        n = vec4(0.0, 0.0, 0.75, 0.025)
+    }
+    if cell == 7 {
+        // (-.6,-.8,0) and (+.6,-.8,0) lie on opposite folded sides. Decoded mean is down;
+        // interpolating their encoded coordinates instead points upward and forward.
+        c = vec4(1.0)
+        n = if local.x <= 31 { vec4(-1.0, 4.0 / 7.0, 0.25, 0.05) } else {
+            vec4(1.0, 4.0 / 7.0, 0.75, 0.0)
+        }
+    }
+    if cell == 8 {
+        c = vec4(1.0)
+        n = vec4(1.0, 1.0, 0.5, 0.025)
+    }
+    colour.store(p, c)
+    normal.store(p, n)
+}
+
+@compute(1)
+fn clear_volume(out: mut Texels3d<Rgba16Float>, value: vec4, p: GlobalId) {
+    out.store(p, value)
+}
+
+@vertex
+fn sample_quad(v: VertexIndex, i: InstanceIndex) -> FarVertex {
+    let xs = [0.0, 1.0, 1.0, 0.0, 1.0, 0.0]
+    let ys = [0.0, 0.0, 1.0, 0.0, 1.0, 1.0]
+    let q = vec2(xs[v.index % 6], ys[v.index % 6])
+    let k = i.index
+    let cell: u32 = if k < 4 { 17 } else if k < 6 { 0 } else if k < 8 { 255 } else { k - 3 }
+    let base = vec2(f32(cell % VIEWS), f32(cell / VIEWS)) * f32(CELL)
+    let x = if k == 0 || k == 4 { 0.25 } else if k == 1 || k == 5 { -0.25 } else if k == 2 ||
+        k == 6 {
+        f32(CELL) - 0.25
+    } else if k == 3 || k == 7 { f32(CELL) + 0.25 } else { 32.0 }
+    let uv = (base + vec2(x, if k == 10 { 31.5 } else { 32.0 })) / f32(ATLAS)
+    FarVertex {
+        clip: ClipPosition {
+            position: vec4((f32(k) + q.x) / 6.0 - 1.0, 1.0 - 2.0 * q.y, 0.5, 1.0),
+        },
+        world: vec3(0.0),
+        uv: q * 2.0 - vec2(1.0),
+        centre: vec3(0.0),
+        yaw_scale: Flat { value: vec3(0.0, 1.0, 0.0) },
+        tint: vec3(0.0),
+        id: Flat { value: k + 1 },
+        views: vec4(uv, uv),
+        views2: vec4(uv, uv),
+        weights: Flat { value: vec4(1.0, 0.0, 0.0, 0.0) },
+        cells: Flat { value: vec4u(cell) },
+        keep: Flat { value: 16383 << 14 },
+        seed: Flat { value: 71 },
+    }
+}
+
+@fragment
+fn report(
+    p: FragCoord,
+    shade: Texture<Rgba16Float>,
+    flat: Texture<R32Uint>,
+    surface: Texture<R32Uint>,
+    depth: DepthTexture,
+    cam: Camera,
+) -> vec4 {
+    let pixel = vec2u(p.position.xy)
+    let at = vec2u(pixel.x, pixel.y % SIDE)
+    let k = at.x / SIDE
+    let id = flat.load(x: at.x, y: at.y)
+    let c = shade.load(x: at.x, y: at.y)
+    if pixel.y < SIDE {
+        return vec4(c.rgb, 1.0)
+    }
+    let outside = k == 1 || k == 3 || k == 5 || k == 7
+    var ok = surface.load(x: at.x, y: at.y) == id
+    if outside {
+        ok = ok && id == 0 && max(c.r, max(c.g, c.b)) == 0.0
+    } else if k != 8 {
+        ok = ok && id == k + 1
+    }
+    if id != 0 {
+        // Leaf depth must use covered samples, not clear neighbours. Cases 10/11 average
+        // two depths to the centre; all other visible cases lie half a metre forward.
+        let toward = if k >= 10 { 0.0 } else { 0.5 }
+        let point = cam.clip(vec3(0.0, 0.0, toward))
+        ok = ok && abs(depth.load(x: at.x, y: at.y) - point.z / point.w) < 1.0e-5
+        if k < 8 {
+            // No blue cell contamination, no shading-only displacement into another leaf.
+            // The leaf shader deliberately keeps zero channels at a 0.005 albedo floor.
+            ok = ok && c.r > 0.1 && abs(c.g) < 0.005 && abs(c.b) < 0.005
+        }
+        if k == 8 || k == 10 {
+            let reference = shade.load(x: at.x + SIDE, y: at.y)
+            ok = ok && length(c.rgb - reference.rgb) < 0.003
+        }
+    }
+    // Blue records the coverage mask for the fractional-coverage count in the host test.
+    vec4(if ok { 0.0 } else { 1.0 }, if ok { 1.0 } else { 0.0 }, if id != 0 { 1.0 } else {
+        0.0
+    }, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var colour = writable_texture::<Rgba8>(width: ATLAS, height: ATLAS)
+    var normal = writable_texture::<Rgba16Float>(width: ATLAS, height: ATLAS)
+    dispatch(atlas.bind(mut colour, mut normal), over: colour)
+    let cam = first_camera(
+        vec3(0.0, 0.0, 10.0),
+        vec3(0.0),
+        1.0,
+        width: WIDTH,
+        height: SIDE,
+    ).unjittered()
+    let b = Bake { mid: vec3(0.0), half: 1.0, leaves: Leaves { through: vec3(0.0) }, bark: Bark {} }
+    let s = sampler()
+    var flat = texture::<R32Uint>(width: WIDTH, height: SIDE)
+    let p = begin_pass(mut flat)
+    draw(
+        p,
+        sample_quad.bind(),
+        far_cut_flat.bind(b, colour, s, cell: 1.0),
+        vertices: 6,
+        instances: 12,
+    )
+    p.end()
+    var surface = texture::<R32Uint>(width: WIDTH, height: SIDE)
+    var depth = depth_texture(width: WIDTH, height: SIDE)
+    let p = begin_pass_with_depth(mut surface, mut depth)
+    draw(
+        p,
+        sample_quad.bind(),
+        far_cut.bind(cam, b, colour, normal, s, cell: 1.0),
+        vertices: 6,
+        instances: 12,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    p.end()
+    var empty = depth_texture(width: 1, height: 1)
+    let p = begin_depth_pass(mut empty)
+    p.end()
+    var cloud = texture::<Rgba16Float>(width: 1, height: 1)
+    let p = begin_pass(mut cloud, clear: vec4(1.0))
+    p.end()
+    var air = texture3d::<Rgba16Float>(width: 1, height: 1, depth: 1)
+    var volume = texture3d::<Rgba16Float>(width: 1, height: 1, depth: 1)
+    dispatch(clear_volume.bind(mut air, value: vec4(0.0, 0.0, 0.0, 1.0)), groups: 1)
+    dispatch(clear_volume.bind(mut volume, value: vec4(0.0)), groups: 1)
+    let cmp = comparison_sampler()
+    let grounds = buffer_of([0.0])
+    let cascade = Cascade { centre: vec3(0.0), span: 20.0, reach: 20.0, side: 1 }
+    let sun = normalize(vec3(1.0, 1.0, 1.0))
+    let lt = Lighting {
+        cam,
+        light: Light {
+            sun,
+            exposure: 1.0,
+            sun_colour: vec3(0.0),
+            eye: 0.0,
+            horizon: 0.0,
+            sky_test: 1,
+            sky_sh: vec4(0.5 / 0.282095, 0.0, 0.2 / 0.488603, 0.0),
+        },
+        shadows: shadows(
+            sun,
+            cascade,
+            cascade,
+            moving_at: vec3(0.0),
+            moving_span: 20.0,
+            moving_side: 1,
+            frame: 0,
+        ),
+        grid: engine::probes::grid(
+            vec2(0.0),
+            cols: 2,
+            spacing: 1.0,
+            low: 0.0,
+            high: 1.0,
+            voxel: 1.0,
+        ),
+        clouds: Clouds { eye: cam.eye, phase: 0, sun, blend: 0.0, drift: vec2(0.0), seed: 0 },
+        levels: Levels { at: [vec4(0.0); MAX_LEVELS], count: 0, eye: vec2(0.0) },
+        near: empty,
+        far: empty,
+        moving: empty,
+        cmp,
+        probes: cloud,
+        grounds: grounds.items(),
+        cloud,
+        air,
+        s,
+    }
+    var shade = texture::<Rgba16Float>(width: WIDTH, height: SIDE)
+    let p = begin_pass(mut shade)
+    draw(
+        p,
+        sample_quad.bind(),
+        far_shade.bind(lt, ids: flat, b: b, colour: colour, normal: normal, grid: volume),
+        vertices: 6,
+        instances: 12,
+    )
+    p.end()
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(p, report.bind(shade, flat, surface, depth, cam))
+    p.present()
+}

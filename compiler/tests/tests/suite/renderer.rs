@@ -418,3 +418,88 @@ fn temporal_keeps_partial_leaf_and_sky_coverage_across_depth_changes() {
         assert!(accumulated > 500, "{surface} did not accumulate history: {accumulated}");
     }
 }
+
+/// Reconstruction must reproduce an exactly aligned scene sample, and remain continuous
+/// when the sample crosses the boundary of its four-tap footprint.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_current_reconstruction_interpolates_samples_without_a_boundary_jump() {
+    let (dir, _) = page("compiler/tests/temporal-reconstruction", "temporal-reconstruction");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 64, 16).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 64 + x)..4 * (y * 64 + x) + 3] };
+    for y in 2..14 {
+        for x in 2..14 {
+            let source = px(x, y);
+            for (offset, what) in [(16, "aligned"), (32, "before boundary"), (48, "after boundary")]
+            {
+                let actual = px(x + offset, y);
+                assert!(
+                    source.iter().zip(actual).all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "{what} at ({x}, {y}): source {source:?}, resolved {actual:?}"
+                );
+            }
+        }
+    }
+}
+
+/// A scene larger than its output still has a four-tap reconstruction footprint. Its
+/// support must end at the adjacent source sample rather than retaining a nonzero
+/// weight that disappears when that sample leaves the footprint. This checks resampling
+/// continuity, not the low-pass filtering needed for a general-purpose downsampler.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_current_reconstruction_stays_continuous_when_reducing_resolution() {
+    let (dir, _) = page("compiler/tests/temporal-reconstruction", "temporal-reduction");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 64, 24).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 64 + x)..4 * (y * 64 + x) + 3] };
+    for y in 17..23 {
+        for x in 1..7 {
+            let source = px(x, y);
+            for (offset, what) in [(8, "aligned"), (16, "before boundary"), (24, "after boundary")]
+            {
+                let actual = px(x + offset, y);
+                assert!(
+                    source.iter().zip(actual).all(|(a, b)| a.abs_diff(*b) <= 1),
+                    "reduced {what} at ({x}, {y}): source {source:?}, resolved {actual:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Real atlas filtering through the production impostor cut/depth/shade entrypoints.
+#[test]
+#[ignore = "needs a GPU"]
+fn impostor_samples_stay_in_their_cells_and_filter_only_covered_surfaces() {
+    let (dir, rel) = page("compiler/tests/impostor-sampling", "impostor-sampling");
+    let (chrome, native) = both_hosts(&dir, &rel, 192, 32);
+    for (host, frame) in [("Chrome", &chrome), ("native", &native)] {
+        let mut partial = 0usize;
+        for y in 16..32 {
+            for x in 0..192 {
+                let i = 4 * (y * 192 + x);
+                let rgb = &frame[i..i + 3];
+                assert!(
+                    rgb[0] <= 1 && rgb[1] >= 254,
+                    "{host}: atlas invariant at ({x},{y}): {rgb:?}"
+                );
+                if (128..144).contains(&x) && rgb[2] >= 254 {
+                    partial += 1;
+                }
+            }
+        }
+        // Coverage remains fractional: neither clamping it opaque nor rejecting all edge
+        // samples can satisfy this check. The filter is sampled at exactly quarter coverage.
+        assert!(
+            (20..110).contains(&partial),
+            "{host}: quarter-covered texel kept {partial}/256 pixels"
+        );
+        let up = frame[4 * (8 * 192 + 152)];
+        let down = frame[4 * (8 * 192 + 184)];
+        assert!(
+            up > down + 40,
+            "{host}: fixture lighting does not distinguish folded normals ({up}, {down})"
+        );
+    }
+    frames_match(&chrome, &native);
+}
