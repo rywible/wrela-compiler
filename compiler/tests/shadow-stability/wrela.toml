@@ -1,0 +1,5 @@
+[package]
+name = "shadow_stability"
+
+[dependencies]
+engine = { path = "../../../engine" }

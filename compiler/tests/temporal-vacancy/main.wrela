@@ -1,0 +1,129 @@
+// The left half held dark moving cloth; it now shows the same striped ground as the right.
+// Matching depths and a dark neighbour keep ordinary rejection from hiding a motion error.
+use engine::floor::fullscreen
+use engine::plant::full
+use engine::temporal::{Resolve, neighbourhoods, resolve}
+use engine::view::first_camera
+use std::gpu::{
+    Compare, Depth, FragCoord, Rgba16Float, Texture, WithDepth, begin_pass, begin_pass_with_depth,
+    begin_screen_pass, depth_texture, dispatch, draw, sampler, texture, writable_texture,
+}
+
+@fragment
+fn ground(p: FragCoord) -> WithDepth<vec4> {
+    let bright = u32(p.position.x) % 2 == 0
+    let colour = if bright { 0.8 } else { 0.04 }
+    WithDepth { color: vec4(vec3(colour), 64.0), depth: 0.25 }
+}
+
+@fragment
+fn old_colour(p: FragCoord) -> vec4 {
+    let tag = if p.position.x < 8.0 { 320.0 } else { 64.0 }
+    vec4(vec3(0.04), tag)
+}
+
+@fragment
+fn old_motion(p: FragCoord) -> vec4 {
+    if p.position.x < 8.0 { vec4(0.0, 0.0, 1.0, 1.0) } else { vec4(0.0) }
+}
+
+@fragment
+fn show(
+    p: FragCoord,
+    fresh: Texture<Rgba16Float>,
+    enabled: Texture<Rgba16Float>,
+    disabled: Texture<Rgba16Float>,
+) -> vec4 {
+    let at = vec2u(p.position.xy)
+    let x = at.x % 16
+    let c = if at.x < 16 { fresh.load(x, at.y) } else if at.x < 32 {
+        enabled.load(x, at.y)
+    } else { disabled.load(x, at.y) }
+    vec4(c.rgb, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var scene = texture::<Rgba16Float>(width: 16, height: 16)
+    var depth = depth_texture(width: 16, height: 16)
+    let p = begin_pass_with_depth(mut scene, mut depth)
+    draw(
+        p,
+        full.bind(z: 0.5),
+        ground,
+        vertices: 3,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    p.end()
+    var motion = texture::<Rgba16Float>(width: 16, height: 16)
+    let p = begin_pass(mut motion, clear: vec4(0.0))
+    p.end()
+    var last_motion = texture::<Rgba16Float>(width: 16, height: 16)
+    let p = begin_pass(mut last_motion)
+    draw(p, full.bind(z: 0.5), old_motion, vertices: 3)
+    p.end()
+    var history = texture::<Rgba16Float>(width: 16, height: 16)
+    let p = begin_pass(mut history)
+    draw(p, full.bind(z: 0.5), old_colour, vertices: 3)
+    p.end()
+    var means = writable_texture::<Rgba16Float>(width: 16, height: 16)
+    var spreads = writable_texture::<Rgba16Float>(width: 16, height: 16)
+    dispatch(neighbourhoods.bind(scene, mut means, mut spreads), over: scene)
+    let cam = first_camera(vec3(0.0), vec3(0.0, 0.0, -1.0), 1.0, width: 16, height: 16).unjittered()
+    let r = Resolve {
+        cam,
+        out: vec2(16.0),
+        blend: 0.12,
+        fresh: 0,
+        jitter: vec2(0.0),
+        last_jitter: vec2(0.0),
+        moving: vec4(0.0, 0.0, 16.0, 16.0),
+        settled: 100.0,
+    }
+    let s = sampler()
+    var fresh = texture::<Rgba16Float>(width: 16, height: 16)
+    var enabled = texture::<Rgba16Float>(width: 16, height: 16)
+    var disabled = texture::<Rgba16Float>(width: 16, height: 16)
+    let p = begin_pass(mut fresh)
+    fullscreen(
+        p,
+        resolve.bind(
+            Resolve { fresh: 1, ..r },
+            scene,
+            depth,
+            depth,
+            motion,
+            last_motion,
+            history,
+            means,
+            spreads,
+            s,
+        ),
+    )
+    p.end()
+    let p = begin_pass(mut enabled)
+    fullscreen(
+        p,
+        resolve.bind(r, scene, depth, depth, motion, last_motion, history, means, spreads, s),
+    )
+    p.end()
+    let p = begin_pass(mut disabled)
+    fullscreen(
+        p,
+        resolve.bind(
+            Resolve { moving: vec4(0.0, 0.0, -1.0, -1.0), ..r },
+            scene,
+            depth,
+            depth,
+            motion,
+            last_motion,
+            history,
+            means,
+            spreads,
+            s,
+        ),
+    )
+    p.end()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(screen, show.bind(fresh, enabled, disabled))
+    screen.present()
+}

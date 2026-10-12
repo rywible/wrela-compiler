@@ -1,0 +1,216 @@
+// Three small material panels through the production character vertex and fragment shaders:
+// polished metal, rough metal, matte dielectric. No scene bake or temporal history.
+use engine::character::{Material, PartOf, character, character_shade, cook_materials}
+use engine::creature::{PartMask, Skeleton, creature}
+use engine::light::Light
+use engine::lit::Lighting
+use engine::realize::{SkinVertex, Tally}
+use engine::render::{ByChannels, Shaded}
+use std::field::{Blend, sphere}
+use std::transform::translate
+use engine::shadow::{Cascade, shadows}
+use engine::sky::Clouds
+use engine::terrain::{Levels, MAX_LEVELS}
+use engine::view::first_camera
+use engine::floor::fullscreen
+use std::gpu::{
+    DrawArgs, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Texels, Texels3d, Texture,
+    begin_depth_pass, begin_pass, begin_screen_pass, buffer, buffer_of, comparison_sampler,
+    depth_texture, dispatch, draw, sampler, texture, texture3d, writable_texture,
+}
+
+pub struct Paint: Copy + GpuData + Blend {
+    pub albedo: vec3,
+    pub rough: f32,
+    pub metal: f32,
+}
+
+impl Shaded for Paint {
+    fn albedo(self) -> vec3 {
+        self.albedo
+    }
+    fn roughness(self) -> f32 {
+        self.rough
+    }
+    fn metallic(self) -> f32 {
+        self.metal
+    }
+}
+
+@compute(1)
+fn atmosphere(out: mut Texels3d<Rgba16Float>, p: GlobalId) {
+    out.store(p, vec4(0.0, 0.0, 0.0, 1.0))
+}
+
+@compute(1)
+fn environment(out: mut Texels<Rgba16Float>, enabled: bool, p: GlobalId) {
+    // A directional, neutral environment; the last two planes contain no sun bounce.
+    out.store(p, if enabled && p.x < 3 {
+        vec4(3.14159265 * 0.5 / 0.282095, 0.0, 0.0, 3.14159265 * 0.4 / 0.488603)
+    } else { vec4(0.0) })
+}
+
+fn rendered(
+    verts: GpuBuffer<SkinVertex>,
+    materials: GpuBuffer<Material>,
+    palettes: GpuBuffer<mat4>,
+    args: GpuBuffer<DrawArgs>,
+    index: u32,
+    lt: Lighting,
+) -> Texture<Rgba16Float> {
+    var out = texture::<Rgba16Float>(width: 17, height: 17)
+    let p = begin_pass(mut out, clear: vec4(0.0))
+    draw(
+        p,
+        character.bind(verts, materials, palettes, parts: PartOf { of: [0; 64] }, cam: lt.cam),
+        character_shade.bind(lt),
+        indirect: args.at(index),
+    )
+    p.end()
+    out
+}
+
+@fragment
+fn shown(
+    p: FragCoord,
+    polished: Texture<Rgba16Float>,
+    rough: Texture<Rgba16Float>,
+    matte: Texture<Rgba16Float>,
+) -> vec4 {
+    let x = u32(p.position.x)
+    let y = u32(p.position.y)
+    let lit = if x < 17 { polished.load(x, y).rgb } else if x < 34 {
+        rough.load(x - 17, y).rgb
+    } else { matte.load(x - 34, y).rgb }
+    vec4(lit / (vec3(1.0) + lit), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let env = time >= 1.0 && time < 3.0
+    let angle = if env { time - 1.0 } else if time >= 3.0 { 0.0 } else { time }
+    let cam = first_camera(
+        vec3(sin(angle), 0.0, cos(angle)) * 10.0,
+        vec3(0.0),
+        0.4,
+        width: 17,
+        height: 17,
+    ).unjittered()
+    let xs = [-3.0, 3.0, 3.0, -3.0, 3.0, -3.0]
+    let ys = [-3.0, -3.0, 3.0, -3.0, 3.0, 3.0]
+    let verts = buffer_of(
+        Vec::from_fn(
+            18,
+            |i| SkinVertex {
+                pos: vec3(f32(i / 6) * 20.0 + xs[i % 6], ys[i % 6], 0.0),
+                bones: i / 6,
+                normal: vec3(0.0, 0.0, 1.0),
+                weights: 255,
+                mask: PartMask { lo: 7, hi: 0 },
+            },
+        ),
+    )
+    let paint = Paint { albedo: vec3(0.55, 0.28, 0.07), rough: 0.2, metal: 1.0 }
+    var skeleton = Skeleton::new()
+    let root = skeleton.root("surface", vec3(0.0))
+    let object = creature(skeleton)
+        .join("polished", root, sphere(5.0).with(paint))
+        .join(
+            "rough",
+            root,
+            sphere(5.0).translate(vec3(20.0, 0.0, 0.0)).with(Paint { rough: 0.65, ..paint }),
+        )
+        .join(
+            "matte",
+            root,
+            sphere(5.0)
+                .translate(vec3(40.0, 0.0, 0.0))
+                .with(Paint { rough: 1.0, metal: 0.0, ..paint }),
+        )
+    let tally = buffer_of(
+        [
+            Tally {
+                vertices: 18,
+                holes: 0,
+                flags: 0,
+                pushed_vertices: 18,
+                pushed_quads: 0,
+                live_blocks: 0,
+            },
+        ],
+    )
+    var materials = buffer::<Material>(18)
+    dispatch(
+        cook_materials.bind(
+            field: object.field(),
+            look: ByChannels {},
+            fp: 0.01,
+            tally: tally,
+            verts: verts,
+            materials: mut materials,
+        ),
+        over: 18,
+    )
+    let palettes = buffer_of(
+        [translate(vec3(0.0)), translate(vec3(-20.0, 0.0, 0.0)), translate(vec3(-40.0, 0.0, 0.0))],
+    )
+    let args = buffer_of(
+        Vec::from_fn(
+            3,
+            |i| DrawArgs {
+                vertices: 6,
+                instances: 1,
+                first_vertex: i * 6,
+                first_instance: 0,
+            },
+        ),
+    )
+    var empty = depth_texture(width: 1, height: 1)
+    begin_depth_pass(mut empty, clear_depth: 1.0).end()
+    var cloud = texture::<Rgba16Float>(width: 1, height: 1)
+    begin_pass(mut cloud, clear: vec4(1.0)).end()
+    var air = texture3d::<Rgba16Float>(width: 1, height: 1, depth: 1)
+    dispatch(atmosphere.bind(mut air), groups: 1)
+    var probes = writable_texture::<Rgba16Float>(width: 5, height: 1)
+    dispatch(environment.bind(mut probes, enabled: env), over: probes)
+    let cmp = comparison_sampler()
+    let s = sampler()
+    let grounds = buffer_of([0.0])
+    let cascade = Cascade { centre: vec3(0.0), span: 20.0, reach: 20.0, side: 1 }
+    let sun = vec3(0.0, 0.0, 1.0)
+    let grid = engine::probes::ProbeGrid {
+        cols: 0,
+        ..engine::probes::grid(vec2(0.0), cols: 2, spacing: 1.0, low: 0.0, high: 1.0, voxel: 1.0),
+    }
+    let lt = Lighting {
+        cam,
+        light: Light { sun, sun_colour: if env { vec3(0.0) } else {
+            vec3(0.2)
+        }, exposure: 1.0, eye: 0.0, horizon: 0.0, clay: if time >= 3.0 { 1 } else { 0 } },
+        shadows: shadows(
+            sun,
+            cascade,
+            cascade,
+            moving_at: vec3(0.0),
+            moving_span: 20.0,
+            moving_side: 1,
+        ),
+        grid,
+        clouds: Clouds { eye: cam.eye, phase: 0, sun, blend: 0.0, drift: vec2(0.0), seed: 0 },
+        levels: Levels { at: [vec4(0.0); MAX_LEVELS], count: 0, eye: vec2(0.0) },
+        near: empty,
+        far: empty,
+        moving: empty,
+        cmp,
+        probes,
+        grounds: grounds.items(),
+        cloud,
+        air,
+        s,
+    }
+    let polished = rendered(verts, materials, palettes, args, 0, lt)
+    let rough = rendered(verts, materials, palettes, args, 1, lt)
+    let matte = rendered(verts, materials, palettes, args, 2, lt)
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(p, shown.bind(polished, rough, matte))
+    p.present()
+}

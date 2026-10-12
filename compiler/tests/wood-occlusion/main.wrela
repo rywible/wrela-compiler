@@ -1,0 +1,40 @@
+// Three eight-pixel blocks: opaque, one uncovered pixel, and empty. Even the single gap
+// must leave the block open so a distant crown behind it is not removed.
+use engine::floor::fullscreen
+use engine::plant::full
+use engine::wood::occluders
+use std::gpu::{
+    Compare, Depth, FragCoord, WithDepth, begin_depth_pass, begin_screen_pass, buffer,
+    depth_texture, dispatch, draw,
+}
+
+@fragment
+fn surface(p: FragCoord) -> WithDepth<vec4> {
+    let x = u32(p.position.x)
+    let y = u32(p.position.y)
+    let covered = x < 8 || (x < 16 && !(x == 8 && y == 0))
+    WithDepth { color: vec4(0.0), depth: if covered { 0.5 } else { 0.0 } }
+}
+
+@fragment
+fn report(p: FragCoord, blocks: [f32]) -> vec4 {
+    vec4(vec3(blocks[u32(p.position.x) / 8]), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var map = depth_texture(width: 24, height: 8)
+    let p = begin_depth_pass(mut map, clear_depth: 0.0)
+    draw(
+        p,
+        full.bind(z: 0.5),
+        surface,
+        vertices: 3,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    p.end()
+    var blocks = buffer::<f32>(3)
+    dispatch(occluders.bind(depth: map, cols: 3, rows: 1, out: mut blocks), over: 3)
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(p, report.bind(blocks))
+    p.present()
+}

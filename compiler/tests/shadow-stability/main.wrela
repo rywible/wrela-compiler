@@ -1,0 +1,75 @@
+// A small diagonal shadow edge, sampled by the production filter without temporal AA.
+// Move the receiver across the screen and the dynamic cascade through the world while
+// preserving the static receiver points. Their light must not depend on either movement.
+use engine::floor::fullscreen
+use engine::plant::full
+use engine::shadow::{Cascade, Shadows, shadows, sunlit}
+use std::gpu::{
+    Compare, ComparisonSampler, Depth, DepthTexture, FragCoord, WithDepth, begin_depth_pass,
+    begin_screen_pass, comparison_sampler, depth_texture, draw,
+}
+
+@fragment
+fn caster(p: FragCoord) -> WithDepth<vec4> {
+    WithDepth { color: vec4(0.0), depth: if p.position.x + p.position.y < 64.0 { 0.25 } else {
+        1.0
+    } }
+}
+
+@fragment
+fn receiver(
+    p: FragCoord,
+    sh: Shadows,
+    map: DepthTexture,
+    empty: DepthTexture,
+    cmp: ComparisonSampler,
+    shift: f32,
+) -> vec4 {
+    let world = vec3((p.position.x - shift - 32.0) / 128.0, (p.position.y - 8.0) / 64.0, 0.5)
+    let lit = sunlit(sh, world, vec3(0.0), map, map, empty, cmp, soft: 1.5)
+    vec4(vec3(lit), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var map = depth_texture(width: 64, height: 64)
+    let p = begin_depth_pass(mut map, clear_depth: 1.0)
+    draw(
+        p,
+        full.bind(z: 0.5),
+        caster,
+        vertices: 3,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    p.end()
+    var empty = depth_texture(width: 1, height: 1)
+    begin_depth_pass(mut empty, clear_depth: 1.0).end()
+    let cascade = Cascade { centre: vec3(0.0), span: 2.0, reach: 20.0, side: 64 }
+    let shift = f32(u32(round(time * 60.0)) % 7)
+    let sh = shadows(
+        normalize(vec3(1.0, 1.0, 1.0)),
+        cascade,
+        cascade,
+        moving_at: vec3(time * 0.7, 0.0, -time),
+        moving_span: 10.0,
+        moving_side: 64,
+    )
+    let identity = mat4(
+        vec4(1.0, 0.0, 0.0, 0.0),
+        vec4(0.0, 1.0, 0.0, 0.0),
+        vec4(0.0, 0.0, 1.0, 0.0),
+        vec4(0.0, 0.0, 0.0, 1.0),
+    )
+    let cmp = comparison_sampler()
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(
+        p,
+        receiver.bind(
+            sh: Shadows { near: identity, far: identity, ..sh },
+            map: map,
+            empty: empty,
+            cmp: cmp,
+            shift: shift,
+        ),
+    )
+    p.present()
+}

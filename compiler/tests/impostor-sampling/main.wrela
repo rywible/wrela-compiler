@@ -203,7 +203,6 @@ pub fn frame(time: f32, width: u32, height: u32) {
             moving_at: vec3(0.0),
             moving_span: 20.0,
             moving_side: 1,
-            frame: 0,
         ),
         grid: engine::probes::grid(
             vec2(0.0),

@@ -503,3 +503,132 @@ fn impostor_samples_stay_in_their_cells_and_filter_only_covered_surfaces() {
     }
     frames_match(&chrome, &native);
 }
+
+/// Static shadow detail follows its receiver, without relying on history to hide sampling noise.
+#[test]
+#[ignore = "needs a GPU"]
+fn static_shadow_edges_keep_their_light_across_frames_and_view_motion() {
+    let (dir, _) = page("compiler/tests/shadow-stability", "shadow-stability");
+    let mut host = Host::load(&dir).expect("load");
+    let reference = host.run_frames(&[0.0], 64, 16).expect("reference").frame;
+    let mut partial = 0;
+    let mut dark = 0;
+    let mut lit = 0;
+    for pixel in reference.chunks_exact(4) {
+        partial += usize::from(pixel[0] > 0 && pixel[0] < 255);
+        dark += usize::from(pixel[0] == 0);
+        lit += usize::from(pixel[0] == 255);
+    }
+    assert!(
+        partial > 50 && dark > 100 && lit > 100,
+        "filter lost its soft edge or contrast: {partial} partial, {dark} dark, {lit} lit"
+    );
+    for frame in 1..16 {
+        let current = host.run_frames(&[frame as f32 / 60.0], 64, 16).expect("frame").frame;
+        let shift = frame % 7;
+        for y in 0..16 {
+            for x in 0..64 - shift {
+                let before = 4 * (y * 64 + x);
+                let after = 4 * (y * 64 + x + shift);
+                assert_eq!(
+                    &reference[before..before + 3],
+                    &current[after..after + 3],
+                    "static shadow changed at ({x}, {y}) in frame {frame}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn foliage_occlusion_preserves_even_a_single_pixel_gap() {
+    let (dir, _) = page("compiler/tests/wood-occlusion", "wood-occlusion");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 24, 8).expect("run");
+    for y in 0..8 {
+        for x in 0..24 {
+            let actual = run.frame[4 * (y * 24 + x)];
+            let expected = if x < 8 { 128 } else { 0 };
+            assert!(
+                actual.abs_diff(expected) <= 1,
+                "block at ({x}, {y}) gave {actual}, expected {expected}"
+            );
+        }
+    }
+}
+
+/// A dark moving surface can leave history that still fits the revealed background's
+/// neighbourhood and depth. Previous motion must remove it only where the surface left.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_vacated_pixels_drop_cloth_history_without_resetting_unchanged_ground() {
+    let (dir, _) = page("compiler/tests/temporal-vacancy", "temporal-vacancy");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 48, 16).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 48 + x)..4 * (y * 48 + x) + 3] };
+    for y in 2..14 {
+        for x in [2, 4, 6] {
+            let fresh = px(x, y);
+            let resolved = px(x + 16, y);
+            let disabled = px(x + 32, y);
+            assert!(
+                fresh.iter().zip(resolved).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "vacated cloth at ({x}, {y}): fresh {fresh:?}, resolved {resolved:?}"
+            );
+            assert!(
+                fresh.iter().zip(disabled).all(|(a, b)| *a > b.saturating_add(32)),
+                "fixture no longer exposes dark cloth history at ({x}, {y}): fresh {fresh:?}, disabled {disabled:?}"
+            );
+        }
+        for x in [10, 12, 14] {
+            let fresh = px(x, y);
+            let resolved = px(x + 16, y);
+            let disabled = px(x + 32, y);
+            assert!(
+                resolved.iter().zip(disabled).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "unchanged ground reset at ({x}, {y}): enabled {resolved:?}, disabled {disabled:?}"
+            );
+            assert!(
+                fresh.iter().zip(resolved).all(|(a, b)| *a > b.saturating_add(32)),
+                "unchanged ground lost accumulation at ({x}, {y}): fresh {fresh:?}, resolved {resolved:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn character_materials_reflect_by_view_roughness_and_metallicity() {
+    let (dir, _) = page("compiler/tests/character-material", "character-material");
+    let mut host = Host::load(&dir).expect("load");
+    let mut sample = |time| {
+        let frame = host.run_frames(&[time], 51, 17).expect("material frame").frame;
+        [8, 25, 42].map(|x| {
+            let i = 4 * (8 * 51 + x);
+            <[u8; 3]>::try_from(&frame[i..i + 3]).expect("RGB")
+        })
+    };
+    let peak = sample(0.0);
+    let shoulder = sample(0.35);
+    let away = sample(0.75);
+    eprintln!("material peak {peak:?}, shoulder {shoulder:?}, away {away:?}");
+    assert!(peak[0][0] > shoulder[0][0] + 40, "polished metal has no moving highlight");
+    assert!(peak[0][0] > peak[1][0] + 100, "roughness did not broaden the peak");
+    assert!(away[1][0] > away[0][0] + 2, "rough metal lost its broad highlight shoulder");
+    assert!(
+        peak[0][0] > peak[0][1] && peak[0][1] > peak[0][2],
+        "metal reflectance lost its colour"
+    );
+    for c in 0..3 {
+        assert!(peak[2][c].abs_diff(away[2][c]) <= 2, "matte material changed with the view");
+    }
+    let env_front = sample(1.0);
+    let env_side = sample(2.4);
+    assert!(env_front[0][0] > 30, "metal has no environment reflection away from direct sun");
+    assert!(
+        env_front[0][0].abs_diff(env_side[0][0]) > 5,
+        "environment reflection ignores view direction"
+    );
+    let clay = sample(3.0);
+    assert_eq!(clay[0], clay[1], "rough metal remains glossy in clay view");
+    assert_eq!(clay[0], clay[2], "metal loses diffuse clay light");
+}

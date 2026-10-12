@@ -1,0 +1,5 @@
+[package]
+name = "temporal_vacancy"
+
+[dependencies]
+engine = { path = "../../../engine" }
