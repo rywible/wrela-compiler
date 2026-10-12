@@ -169,8 +169,6 @@ def package(config, output, covers, previous=None):
         (home / filename).write_bytes(pixels)
         catalog.append("\t".join([game["id"], game["title"], child + "/" + game["session"] + "/",
                                    filename, str(width), str(height)]))
-    page = home / "index.html"
-    page.write_text(page.read_text().replace("background: #000;", "background: #14223A;"))
     for project in [console, *config["games"]]:
         directory = output / project["project"]
         namespace = "console" if project is console else project["id"]
