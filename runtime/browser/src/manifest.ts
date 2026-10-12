@@ -8,6 +8,7 @@ import {
   BINDING_KINDS,
   COMPARES,
   MANIFEST_VERSION,
+  MAX_BINDINGS_PER_GROUP,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
   MAX_WORKGROUP_INVOCATIONS,
   MAX_WORKGROUP_SIZE,
@@ -381,6 +382,11 @@ export function validateManifest(m: Manifest): void {
     }
     if (p.debug_flag !== null) bindings.push(p.debug_flag);
     if (new Set(bindings).size !== bindings.length) throw err(`pipeline ${i} uses a binding twice`);
+    for (const binding of bindings.sort((a, b) => a - b)) {
+      if (binding >= MAX_BINDINGS_PER_GROUP) {
+        throw err(`pipeline ${i} uses binding ${binding}; WebGPU's default limit is ${MAX_BINDINGS_PER_GROUP}`);
+      }
+    }
     const render = p.kind === "render";
     for (const b of p.bindings) {
       if (!render && b.stage !== "both") {
@@ -435,7 +441,9 @@ export function validateManifest(m: Manifest): void {
                 ? "its fragment shader returns a colour, which an r32uint target isn't"
                 : format?.depth
                   ? "a colour target's format isn't a depth one"
-                  : null;
+                  : p.blend && t.color !== null && !format?.filterable
+                    ? "its colour is blended, which this format doesn't support"
+                    : null;
         if (why !== null) throw err(`pipeline ${i}'s target ${name} can't be one: ${why}`);
       });
     }

@@ -226,6 +226,8 @@ struct OpenPass {
     pass: Pass,
     draws: Vec<PendingDraw>,
     label: Option<Arc<str>>,
+    /// Built only when another pass asks to join; extended with each compatible join.
+    uses: Option<HashMap<u32, bool>>,
 }
 
 struct Screen {
@@ -538,6 +540,7 @@ impl Gpu {
         self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
         self.resources.clear();
         self.bound_in.clear();
+        self.debug_flag = None;
         Ok(())
     }
 
@@ -867,8 +870,10 @@ impl Gpu {
         self.label = None;
     }
 
-    pub(crate) fn take_timings(&mut self) -> Vec<GpuTiming> {
-        self.timer.as_mut().map(|t| std::mem::take(&mut t.results)).unwrap_or_default()
+    pub(crate) fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
+        self.flush()?;
+        self.collect()?;
+        Ok(self.timer.as_mut().map(|t| std::mem::take(&mut t.results)).unwrap_or_default())
     }
 
     /// The adapter's name and driver, as wgpu reports them ("llvmpipe (LLVM 20.1.2, 256 bits)").
@@ -1305,15 +1310,75 @@ impl Gpu {
         self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(draw);
     }
 
+    /// Joining keeps WebGPU's resource usage scope too. Two individually valid passes may
+    /// disagree on whether a buffer is read-only or read-write, including indirect arguments
+    /// and indices, which are read-only. Decide after both passes' draws are known.
+    fn can_join(&self, ended: &mut OpenPass, next: &OpenPass) -> bool {
+        if !next.pass.joins(&ended.pass) {
+            return false;
+        }
+        if ended.uses.is_none() {
+            let mut uses = HashMap::new();
+            if !self.add_uses(&ended.draws, &mut uses) {
+                return false;
+            }
+            ended.uses = Some(uses);
+        }
+        self.add_uses(&next.draws, ended.uses.as_mut().expect("built above"))
+    }
+
+    fn add_uses(&self, draws: &[PendingDraw], uses: &mut HashMap<u32, bool>) -> bool {
+        let mut compatible = |handle, write| match uses.insert(handle, write) {
+            Some(before) => before == write,
+            None => true,
+        };
+        for draw in draws {
+            for (binding, slot) in
+                draw.bindings.iter().zip(&self.pipelines[draw.pipeline as usize].bindings)
+            {
+                if !matches!(slot.kind, BindingKind::Sampler | BindingKind::ComparisonSampler)
+                    && !compatible(
+                        binding.handle,
+                        slot.kind == BindingKind::ReadWrite || slot.kind.is_storage(),
+                    )
+                {
+                    return false;
+                }
+            }
+            match draw.how {
+                DrawHow::Direct { .. } => {}
+                DrawHow::Indirect { buffer, .. } => {
+                    if !compatible(buffer, false) {
+                        return false;
+                    }
+                }
+                DrawHow::IndexedIndirect { indices, buffer, .. } => {
+                    if !compatible(indices, false) || !compatible(buffer, false) {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
+    }
+
     /// Ends the open pass: on the screen (`Present`) it's recorded; into textures (`EndPass`),
     /// it waits for the next command, which may continue it (`Pass::joins`), unless the timing is
     /// serial.
     fn end_pass(&mut self, op: Opcode) -> Result<()> {
-        let Some(open) = self.pass.take() else {
+        let Some(mut open) = self.pass.take() else {
             unreachable!("the sequencer checked a pass is open");
         };
         let serial = self.timer.as_ref().is_some_and(|t| t.serial);
         if op == Opcode::EndPass && !serial {
+            if let Some(mut ended) = self.ended.take() {
+                if self.can_join(&mut ended, &open) {
+                    ended.draws.append(&mut open.draws);
+                    self.ended = Some(ended);
+                    return Ok(());
+                }
+                self.record_pass(Opcode::EndPass, ended)?;
+            }
             self.ended = Some(open);
             return Ok(());
         }
@@ -1598,15 +1663,21 @@ impl Gpu {
 }
 
 impl Executor for Gpu {
+    fn begin_frame(&mut self) {
+        self.label = None;
+    }
+
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
         if let Some(ended) = &self.ended {
             match cmd {
                 // A label names the passes after it, the next of which may yet continue this one.
                 Command::Label { .. } => {}
-                Command::BeginPass(next) if next.joins(&ended.pass) => {
-                    self.pass = self.ended.take();
-                    return Ok(());
-                }
+                Command::BeginPass(next) if next.joins(&ended.pass) => {}
+                Command::Draw { .. }
+                | Command::DrawIndirect { .. }
+                | Command::DrawIndexedIndirect { .. }
+                | Command::EndPass
+                    if self.pass.is_some() => {}
                 _ => self.record_ended()?,
             }
         }
@@ -1650,11 +1721,11 @@ impl Executor for Gpu {
                     clear_depth: 1.0,
                 };
                 let label = self.label.clone();
-                self.pass = Some(OpenPass { pass, draws: Vec::new(), label });
+                self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None });
             }
             Command::BeginPass(pass) => {
                 let label = self.label.clone();
-                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new(), label })
+                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new(), label, uses: None })
             }
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };

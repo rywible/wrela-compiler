@@ -148,7 +148,7 @@ const EXPECTED: Readonly<Record<number, string>> = {
 /** `n` rounded up to a multiple of 4: text and data in a payload are padded to whole words. */
 const padded = (n: number) => Math.ceil(n / 4) * 4;
 
-const utf8 = new TextDecoder("utf-8", { fatal: true });
+const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * Decodes one batch: its header, then every command. Byte payloads are views into `batch`, so
@@ -331,8 +331,8 @@ export function decode(batch: Bytes): Command[] {
       }
       case "WriteTexture": {
         if (words < 6) throw bad("expected at least 6 words");
-        if (w(5) !== len - 24) throw bad("data length doesn't match the payload");
-        const data = batch.subarray(start + 24, start + len);
+        if (padded(w(5)) !== len - 24) throw bad("data length doesn't match the payload");
+        const data = batch.subarray(start + 24, start + 24 + w(5));
         cmd = { op: name, handle: w(0), x: w(1), y: w(2), width: w(3), height: w(4), data };
         break;
       }

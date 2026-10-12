@@ -155,10 +155,13 @@ fn claim(owner: u32, helping: bool) -> bool {
             if compare_swap(owner + JOB_TICKET, t, t + 1) == t {
                 // Only this thread writes its own depth.
                 store_u32(me + DEPTH, load_u32(me + DEPTH) + 1)
-                atomic_store(me + RUNNING, owner)
+                let outer = atomic_load(me + RUNNING)
+                if outer == 0 {
+                    atomic_store(me + RUNNING, owner)
+                }
                 reach_heap()
                 run_task(atomic_load(owner + JOB_TASK), atomic_load(owner + JOB_CONTEXT), t & 65535)
-                atomic_store(me + RUNNING, 0)
+                atomic_store(me + RUNNING, outer)
                 store_u32(me + DEPTH, load_u32(me + DEPTH) - 1)
                 if helping {
                     let _ = atomic_add(PAR_HELPED, 1)
@@ -222,10 +225,15 @@ fn run_spawned(slot: u32) {
     unsafe {
         let me = thread_block()
         atomic_store(slot + SLOT_THREAD, (me - THREAD_BLOCKS) / THREAD_BLOCK_SIZE)
-        atomic_store(me + RUNNING, slot)
+        // A nested trap unwinds this thread's outer task or chunk too. Its waiter is the one
+        // the host must fail, both during this work and after it returns.
+        let outer = atomic_load(me + RUNNING)
+        if outer == 0 {
+            atomic_store(me + RUNNING, slot)
+        }
         reach_heap()
         run_task(atomic_load(slot + SLOT_TASK), atomic_load(slot + SLOT_CONTEXT), 0)
-        atomic_store(me + RUNNING, 0)
+        atomic_store(me + RUNNING, outer)
         let hold = atomic_load(PAR_HOLD)
         if hold > 0 {
             // Nothing notifies the slot while it's started: a sleep.
@@ -379,4 +387,53 @@ impl<O> Task<O> {
 pub(package) fn chunks_for(n: u32) -> u32 {
     let k = (n + 63) / 64
     if k > MAX_CHUNKS { MAX_CHUNKS } else { k }
+}
+
+fn marker_chunk(chunk: u32, context: mut u32) {
+    unsafe {
+        context = atomic_load(thread_block() + RUNNING)
+    }
+}
+
+@test
+fn nested_work_restores_the_outer_failure_marker() {
+    unsafe {
+        let me = thread_block()
+        let previous = atomic_load(me + RUNNING)
+        let outer = TASK_SLOTS + TASK_SLOT_SIZE
+        let context = place::<u32>(0)
+        let work = task(marker_chunk)
+        let slot = TASK_SLOTS
+        atomic_store(slot + SLOT_TASK, work)
+        atomic_store(slot + SLOT_CONTEXT, context)
+        // Already started: no helper can take this test's task.
+        atomic_store(slot, STARTED)
+        atomic_store(me + RUNNING, outer)
+        run_spawned(slot)
+        let during_task = read::<u32>(context)
+        let after_task = atomic_load(me + RUNNING)
+        atomic_store(slot, SLOT_FREE)
+
+        // A descriptor of its own, outside the blocks helpers scan, makes the direct claim
+        // deterministic while it uses the real chunk runner.
+        let words: [u32; 16] = [0; 16]
+        let owner = place(take words)
+        atomic_store(owner + JOB_GENERATION, 1)
+        atomic_store(owner + JOB_TICKET, 65536)
+        atomic_store(owner + JOB_TASK, work)
+        atomic_store(owner + JOB_CONTEXT, context)
+        atomic_store(owner + JOB_CHUNKS, 1)
+        atomic_store(me + RUNNING, outer)
+        let ran = claim(owner, helping: false)
+        let after_chunk = atomic_load(me + RUNNING)
+        let during_chunk = read::<u32>(context)
+        atomic_store(me + RUNNING, previous)
+        free(owner, size_of::<[u32; 16]>())
+        free(context, size_of::<u32>())
+        assert(ran)
+        assert(during_task == outer, "a nested task hid its outer task's failure marker")
+        assert(during_chunk == outer, "a nested chunk hid its outer task's failure marker")
+        assert(after_task == outer, "a nested task lost its outer task's failure marker")
+        assert(after_chunk == outer, "a nested chunk lost its outer task's failure marker")
+    }
 }

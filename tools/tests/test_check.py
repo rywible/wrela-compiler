@@ -29,6 +29,7 @@ class Selection(unittest.TestCase):
                 patch.object(check, 'ROOT', Path(temp)), \
                 patch.object(check.jobs, 'admitted', return_value=True), \
                 patch.object(check, 'build_tests', return_value=['one', 'two']), \
+                patch.object(check, 'call'), \
                 patch.object(check, 'listed', return_value=['test']), \
                 patch.object(check, 'step') as step, \
                 patch.object(check, 'rust_run', return_value=1) as run, \
@@ -43,6 +44,41 @@ class Selection(unittest.TestCase):
                 self.assertFalse(set(check.CONTROLS) & os.environ.keys())
             finally:
                 os.chdir(cwd)
+
+    def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
+        original = Path.cwd()
+        try:
+            for arguments in ([], ['wrela::engine::alpha']):
+                with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    target = root / 'target'
+                    executable = target / 'release/wrela'
+                    executable.parent.mkdir(parents=True)
+                    executable.write_text('stale CLI')
+
+                    def build(command, **kwargs):
+                        self.assertEqual(command, ['cargo', 'build', '-q', '--release', '-p', 'wrela', '--bin', 'wrela'])
+                        executable.write_text('current CLI')
+
+                    def selected(name, cli, logs):
+                        self.assertEqual(cli, executable)
+                        self.assertEqual(cli.read_text(), 'current CLI')
+
+                    with patch.object(check, 'ROOT', root), \
+                            patch.dict(os.environ, {'CARGO_TARGET_DIR': str(target)}), \
+                            patch.object(check.jobs, 'admitted', return_value=True), \
+                            patch.object(check, 'build_tests', return_value=['one']), \
+                            patch.object(check, 'call', side_effect=build) as build_cli, \
+                            patch.object(check, 'step', side_effect=selected), \
+                            patch.object(check, 'wrela_test', side_effect=selected), \
+                            patch.object(check, 'listed', return_value=['test']), \
+                            patch.object(check, 'rust_run', return_value=1), \
+                            patch.object(check, 'ChromeSession', side_effect=lambda _: contextlib.nullcontext()), \
+                            contextlib.redirect_stdout(io.StringIO()):
+                        self.assertEqual(check.main(arguments), 0)
+                        build_cli.assert_called_once()
+        finally:
+            os.chdir(original)
 
 
 class RustChecks(unittest.TestCase):

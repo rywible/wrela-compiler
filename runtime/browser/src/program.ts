@@ -20,6 +20,7 @@ import {
   JOB_DONE_FAILED,
   JOB_FAILED,
   TASK_SLOTS,
+  TASK_SLOT_SIZE,
   TASK_SLOTS_END,
   MAX_WORKERS,
   MAX_TICK_RECORDS,
@@ -287,15 +288,19 @@ const threadBlock = (thread: number) => THREAD_BLOCKS + thread * THREAD_BLOCK_SI
 /** A helper, `thread`, trapped: the thread waiting for what it ran learns it, and traps with its
  * panic message (wrela_abi memory's helpers), as the native host does. */
 function helperTrapped(memory: WebAssembly.Memory, thread: number): void {
+  const at = threadBlock(thread) + RUNNING;
+  if (at + 4 > memory.buffer.byteLength) return;
   const words = new Int32Array(memory.buffer);
-  const running = Atomics.load(words, (threadBlock(thread) + RUNNING) / 4) >>> 0;
-  if (running >= THREAD_BLOCKS && running < THREAD_BLOCKS_END) {
+  const running = Atomics.load(words, at / 4) >>> 0;
+  if (running >= THREAD_BLOCKS && running < THREAD_BLOCKS_END &&
+      (running - THREAD_BLOCKS) % THREAD_BLOCK_SIZE === 0 && running + JOB_FAILED + 4 <= memory.buffer.byteLength) {
     // A thread's parallel job: its starting thread waits on its count of done chunks. The first
     // helper to trap is the one whose message the program reports.
     Atomics.compareExchange(words, (running + JOB_FAILED) / 4, 0, thread + 1);
     Atomics.or(words, (running + JOB_DONE) / 4, JOB_DONE_FAILED | 0);
     Atomics.notify(words, (running + JOB_DONE) / 4);
-  } else if (running >= TASK_SLOTS && running < TASK_SLOTS_END) {
+  } else if (running >= TASK_SLOTS && running < TASK_SLOTS_END &&
+      (running - TASK_SLOTS) % TASK_SLOT_SIZE === 0 && running + SLOT_THREAD + 4 <= memory.buffer.byteLength) {
     // A task: whoever joins it waits on its state.
     Atomics.store(words, (running + SLOT_THREAD) / 4, thread);
     Atomics.store(words, (running + SLOT_STATE) / 4, SLOT_FAILED);
@@ -481,6 +486,10 @@ export class Program {
     try {
       // The helpers: each its own instance of the module on its own thread, with the memory.
       if (EXPORT_WORKER in instance.exports) {
+        const controls = PAR_HELPERS + 4;
+        if (memory.buffer.byteLength < controls) {
+          throw new ProgramError(`it exports \`${EXPORT_WORKER}\` but its memory is ${memory.buffer.byteLength} bytes; the helpers need at least ${controls}`);
+        }
         const spawn = options.spawnWorker;
         const helpers = spawn ? Math.min(Math.max(options.workers ?? 1, 1), MAX_WORKERS + 1) - 1 : 0;
         for (let i = 0; i < helpers; i++) {
@@ -562,7 +571,7 @@ export class Program {
       case "HostRequest": {
         const body = cmd.body.slice();
         const host = io?.hostRequest;
-        this.#requests.start(cmd.op, cmd.request, host ? () => host(cmd.service, body) : none("host capabilities"));
+        this.#requests.start(cmd.op, cmd.request, host ? () => host.call(io, cmd.service, body) : none("host capabilities"));
         return;
       }
       case "Prepare": {
@@ -792,8 +801,6 @@ export class Program {
   frame(time: number, width: number, height: number): void {
     this.checker.setScreenSize(width, height);
     this.#call(() => this.#frame!(time, width, height));
-    this.#sequencer.endFrame();
-    this.executor.flush();
   }
 
   /** Its memory, in bytes: the maximum it reserves, and what it has grown to. */
@@ -803,7 +810,7 @@ export class Program {
 
   /** How many chunks of parallel jobs the workers (not the program's own thread) have run. */
   workerChunks(): number {
-    if (!this.#memory) return 0;
+    if (!this.#memory || this.#memory.buffer.byteLength < PAR_HELPED + 4) return 0;
     return Atomics.load(new Uint32Array(this.#memory.buffer), PAR_HELPED / 4);
   }
 
@@ -831,6 +838,8 @@ export class Program {
     const failure = this.#failure;
     this.#failure = null;
     if (failure !== null) throw failure;
+    this.#sequencer.endFrame();
+    this.executor.flush();
     return result;
   }
 }

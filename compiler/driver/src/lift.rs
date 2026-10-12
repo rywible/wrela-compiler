@@ -41,19 +41,19 @@ pub fn table(checked: &Checked, sources: &SourceMap, files: &[(FileId, String)])
         .collect();
     let mut t = LiftTable::default();
     let mut file_index = std::collections::HashMap::new();
-    for (file, start, end, value, negated) in cands {
-        let fi = *file_index.entry(file).or_insert_with(|| {
-            let src = sources.file(file);
-            let path = files.iter().find(|f| f.0 == file).map(|f| f.1.clone()).unwrap_or_default();
-            t.files.push(LiftedFile {
-                id: file,
-                name: src.name.clone(),
-                path,
-                text: src.text.clone(),
-                hash: file_hash(src.text.as_bytes()),
-            });
-            t.files.len() as u32 - 1
+    for (file, path) in files {
+        let src = sources.file(*file);
+        file_index.insert(*file, t.files.len() as u32);
+        t.files.push(LiftedFile {
+            id: *file,
+            name: src.name.clone(),
+            path: path.clone(),
+            text: src.text.clone(),
+            hash: file_hash(src.text.as_bytes()),
         });
+    }
+    for (file, start, end, value, negated) in cands {
+        let fi = file_index[&file];
         let lc = sources.file(file).line_col(start);
         let i = t.literals.len() as u32;
         t.literals.push(LiftedLiteral {
@@ -186,4 +186,38 @@ pub fn relative(path: &Path, base: &Path) -> String {
     let mut out: Vec<String> = vec!["..".into(); bc.len() - common];
     out.extend(pc[common..].iter().map(|c| c.as_os_str().to_string_lossy().into_owned()));
     out.join("/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_without_lifted_candidates_still_reports_its_float_literals() {
+        let root = std::env::temp_dir().join(format!("wrela-lift-unlifted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("package directory");
+        std::fs::write(
+            root.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("program");
+        std::fs::write(root.join("wide.wrela"), "pub fn value() -> f64 { 0.125 }\n")
+            .expect("non-lifted function");
+        crate::with_checked(&root, |checked, sources| {
+            let files: Vec<_> = sources
+                .files()
+                .filter(|(_, f)| !f.name.starts_with('<'))
+                .map(|(id, f)| (id, f.name.clone()))
+                .collect();
+            let table = table(checked, sources, &files);
+            let report: serde_json::Value =
+                serde_json::from_str(&report(checked, sources, &table)).expect("report");
+            assert!(table.literals.is_empty());
+            assert_eq!(report["not_lifted"].as_array().expect("not lifted").len(), 1);
+            assert_eq!(report["not_lifted"][0]["text"], "0.125");
+        })
+        .expect("checked");
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

@@ -12,6 +12,7 @@
 import { errorMessage } from "./errors.ts";
 import { type PipelineCache, preparePipelines } from "./gpu.ts";
 import { type Build, type Fetch, loadBuild } from "./loader.ts";
+import { pathUrl } from "./path.ts";
 import { type Builds, type Compiled, Program } from "./program.ts";
 
 /** A build got ready: fetched, compiled, and every pipeline built. */
@@ -54,9 +55,7 @@ export class HandOvers implements Builds {
 
   /** The base of the build at `path`, from the running build's. */
   baseOf(path: string): string {
-    // The checked build path permits literal percent signs. Keep percent escapes from turning
-    // into `..` when URL parsing resolves the path.
-    return new URL(`${path.replaceAll("%", "%25")}/`, this.base()).href;
+    return pathUrl(this.base(), `${path}/`).href;
   }
 
   prepare(path: string): Promise<void> {

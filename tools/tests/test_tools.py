@@ -573,6 +573,23 @@ class ServeTest(PageDir, unittest.TestCase):
         finally:
             shutil.rmtree(outside)
 
+    def test_get_and_head_refuse_symlink_aliases_outside_the_repo_and_into_git(self):
+        with tempfile.TemporaryDirectory() as outside:
+            with open(os.path.join(outside, "secret"), "w") as f:
+                f.write("private")
+            os.symlink(outside, os.path.join(self.page_dir, "outside"))
+            os.mkdir(os.path.join(self.page_dir, ".git"))
+            with open(os.path.join(self.page_dir, ".git", "secret"), "w") as f:
+                f.write("history")
+            os.symlink(".git", os.path.join(self.page_dir, "history"))
+            for method in ["GET", "HEAD"]:
+                for name in ["outside", "history"]:
+                    req = urllib.request.Request(f"{self.base}/{self.page}/{name}/secret", method=method)
+                    with self.assertRaises(urllib.error.HTTPError) as error:
+                        urllib.request.urlopen(req)
+                    self.assertEqual(error.exception.code, 404)
+                    error.exception.close()
+
     def test_only_this_machine_and_not_git(self):
         # A page elsewhere that rebinds its name to 127.0.0.1 sends its own name as the Host.
         req = urllib.request.Request(f"{self.base}/LICENSE", headers={"Host": "evil.example"})

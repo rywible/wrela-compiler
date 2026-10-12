@@ -385,6 +385,12 @@ impl Checker {
                 if !pass.clear_depth.is_finite() {
                     return err("the clear depth isn't a finite number".into());
                 }
+                if pass.depth != NONE
+                    && !pass.keep_depth
+                    && !(0.0..=1.0).contains(&pass.clear_depth)
+                {
+                    return err("the clear depth isn't from 0 to 1".into());
+                }
                 self.scope.clear();
                 self.attachments.clear();
                 let mut size = if pass.color == SCREEN { self.screen_size } else { None };
@@ -737,6 +743,50 @@ mod tests {
     use super::*;
 
     use crate::stream::Pass;
+
+    #[test]
+    fn used_depth_clear_is_from_zero_to_one() {
+        let mut checker = Checker::new(&Manifest::new("game.wasm"));
+        checker
+            .check(&Command::CreateTexture {
+                handle: 1,
+                width: 8,
+                height: 8,
+                format: TextureFormat::Depth32Float,
+                writable: false,
+                depth: 0,
+            })
+            .expect("depth texture");
+        let pass = Pass {
+            color: SCREEN,
+            keep_color: false,
+            join: false,
+            clear: [0.0; 4],
+            depth: 1,
+            keep_depth: false,
+            clear_depth: 1.0,
+        };
+        for clear_depth in [-0.01, 1.01, f32::MIN, f32::MAX] {
+            assert_eq!(
+                checker
+                    .check(&Command::BeginPass(Pass { clear_depth, ..pass }))
+                    .expect_err("depth clear outside range")
+                    .why,
+                "the clear depth isn't from 0 to 1"
+            );
+        }
+        for clear_depth in [0.0, 1.0] {
+            checker.check(&Command::BeginPass(Pass { clear_depth, ..pass })).expect("depth clear");
+            checker.check(&Command::Present).expect("end pass");
+        }
+        for pass in [
+            Pass { clear_depth: 2.0, keep_depth: true, ..pass },
+            Pass { clear_depth: 2.0, depth: NONE, ..pass },
+        ] {
+            checker.check(&Command::BeginPass(pass)).expect("unused finite depth clear");
+            checker.check(&Command::Present).expect("end pass");
+        }
+    }
 
     #[test]
     fn screen_pass_depth_must_match_the_current_frame_size() {

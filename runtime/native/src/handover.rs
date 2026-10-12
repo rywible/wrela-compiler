@@ -18,10 +18,12 @@ use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
 
+pub(crate) type Preparation = JoinHandle<std::result::Result<(Build, Ready), String>>;
+
 /// A build got ready, or being got ready, for a hand-over.
 pub(crate) enum Prepared {
     /// Its thread, and the requests to answer when it ends.
-    Going(JoinHandle<std::result::Result<(Build, Ready), String>>, Vec<u32>),
+    Going(Preparation, Vec<u32>),
     /// Ready: the build, and the keys of all its pipelines.
     Ready(Build, Vec<u64>),
     Failed(String),
@@ -47,11 +49,7 @@ fn beside(dir: &Path, path: &str) -> PathBuf {
 
 /// Compiles the build in `dir` and builds the pipelines `builder`'s device doesn't hold
 /// (`have`): on a thread of its own.
-fn prepare(
-    dir: PathBuf,
-    builder: Builder,
-    have: std::collections::HashSet<u64>,
-) -> JoinHandle<std::result::Result<(Build, Ready), String>> {
+fn prepare(dir: PathBuf, builder: Builder, have: std::collections::HashSet<u64>) -> Preparation {
     std::thread::spawn(move || {
         let build = compile_build(&dir, None).map_err(|e| e.to_string())?;
         let ready =
@@ -91,9 +89,10 @@ impl Host {
                     let dir = beside(&self.dir, &path);
                     match self.prepared.remove(&dir) {
                         Some(Prepared::Ready(_, keys)) => self.p().executor().let_go(&keys),
-                        // The thread is left to end, and what it builds is dropped with it;
-                        // the requests waiting on it fail, as in the browser.
-                        Some(Prepared::Going(_, waiting)) => {
+                        // Let the thread finish without blocking this call, but retain it so
+                        // the host's GPU lock cannot be released before its work ends.
+                        Some(Prepared::Going(job, waiting)) => {
+                            self.cancelled_preparations.push(job);
                             let why = format!(
                                 "the build in {} was let go before it was ready",
                                 dir.display()
@@ -134,6 +133,7 @@ impl Host {
     /// Takes what each preparing thread that has ended made, and answers its requests; with
     /// `wait`, waits for that build's thread first.
     fn poll_prepared(&mut self, wait: Option<&Path>) {
+        self.cancelled_preparations.retain(|job| !job.is_finished());
         let ended: Vec<PathBuf> = self
             .prepared
             .iter()
@@ -206,7 +206,7 @@ impl Host {
         self.install_program(program);
         self.build = build;
         self.dir = dir;
-        Ok(())
+        self.settle_handing()
     }
 
     fn resume_failed_hand_over(
@@ -231,5 +231,82 @@ impl Host {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::program::{Io, Program};
+    use crate::{Options, Timing};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use wrela_abi::Manifest;
+    use wrela_abi::stream::Encoder;
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn unprepared_work_finishes_before_the_host_releases_its_gpu() {
+        let _turn = crate::lock::turn();
+        let lock = crate::lock::GpuLock::acquire("preparation lifetime").unwrap();
+        let batch = Encoder::new().unprepare("next").finish();
+        let escaped: String = batch.iter().map(|b| format!("\\{b:02x}")).collect();
+        let wasm = wat::parse_str(format!(
+            r#"(module
+                (import "wrela" "submit" (func $submit (param i32 i32)))
+                (import "wrela" "memory" (memory 1 16384 shared))
+                (export "memory" (memory 0))
+                (data (i32.const 0) "{escaped}")
+                (func (export "frame") (param f32 i32 i32)
+                    (call $submit (i32.const 0) (i32.const {}))))"#,
+            batch.len()
+        ))
+        .unwrap();
+        let compiled = crate::program::compile_with(&wasm, None).unwrap();
+        let manifest = Manifest::new("game.wasm");
+        let gpu = Gpu::new(&manifest, &[], Timing::Off).unwrap();
+        let mut program =
+            Program::instantiate(&compiled, &manifest, gpu, Io::default(), false, 1).unwrap();
+        program.hand_over_here();
+        let mut host = Host {
+            program: Some(program),
+            build: Build { manifest, shaders: Vec::new(), wasm_hash: 0, compiled },
+            dir: PathBuf::from("preparation-lifetime"),
+            options: Options::default(),
+            prepared: PreparedBuilds::new(),
+            cancelled_preparations: Vec::new(),
+            _lock: lock,
+        };
+        let builder = host.p().executor().builder();
+        let (entered, release, finished) = (mpsc::channel(), mpsc::channel(), mpsc::channel());
+        let job = std::thread::spawn(move || {
+            entered.0.send(()).unwrap();
+            release.1.recv().unwrap();
+            drop(builder);
+            finished.0.send(()).unwrap();
+            Err("the test discarded this preparation".to_string())
+        });
+        host.prepared.insert(host.dir.join("next"), Prepared::Going(job, Vec::new()));
+        entered.1.recv_timeout(Duration::from_secs(5)).unwrap();
+        let dropping = mpsc::channel();
+        let returned = mpsc::channel();
+        let controller = std::thread::spawn(move || {
+            let frame_returned = dropping.1.recv_timeout(Duration::from_secs(5)).is_ok();
+            let returned_early =
+                frame_returned && returned.1.recv_timeout(Duration::from_millis(200)).is_ok();
+            release.0.send(()).unwrap();
+            (frame_returned, returned_early)
+        });
+        host.frame(0.0, 4, 4).expect("unprepare returns while its worker is still blocked");
+        let _ = dropping.0.send(());
+        drop(host);
+        let _ = returned.0.send(());
+        let (frame_returned, returned_early) = controller.join().unwrap();
+        finished.1.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(frame_returned, "unprepare blocked its frame until preparation finished");
+        assert!(
+            !returned_early,
+            "the host released its GPU while preparation still held the device"
+        );
     }
 }

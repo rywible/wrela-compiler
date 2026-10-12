@@ -60,7 +60,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // A filter that chose nothing is an error, so a misspelt name can't look like a pass.
     if let Some(f) = filter
         && out.results.is_empty()
-        && out.filtered_out > 0
+        && !wrela_diag::has_errors(&out.diagnostics)
     {
         eprintln!("error: no test's name contains `{f}`");
         return ExitCode::from(1);

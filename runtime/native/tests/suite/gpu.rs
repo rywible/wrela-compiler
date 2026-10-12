@@ -467,6 +467,69 @@ fn failed_hand_over_keeps_the_old_build_usable_with_fresh_request_numbers() {
     );
 }
 
+#[test]
+#[ignore = "needs a GPU"]
+fn init_and_export_handovers_take_effect_when_the_call_returns() {
+    let program = |batch: &[u8], init: bool, marker: u32| {
+        let submit = format!("(call $submit (i32.const 0) (i32.const {}))", batch.len());
+        let init = if init { submit.as_str() } else { "" };
+        wat::parse_str(format!(
+            r#"(module
+                (import "wrela" "submit" (func $submit (param i32 i32)))
+                (import "wrela" "memory" (memory 1 16384 shared))
+                (export "memory" (memory 0))
+                (data (i32.const 0) "{}")
+                (func (export "init") {init})
+                (func (export "frame") (param f32 i32 i32))
+                (func (export "switch") {submit})
+                (func (export "marker") (result i32) (i32.const {marker})))"#,
+            common::wat::escape(batch),
+        ))
+        .unwrap()
+    };
+    let target = common::build(
+        "init-handover-target",
+        &common::manifest("[]"),
+        &[],
+        &program(&Encoder::new().finish(), false, 42),
+    );
+    let path = format!("../{}", target.file_name().unwrap().to_string_lossy());
+    let batch = Encoder::new().hand_over(1, &path).finish();
+    let source = common::build(
+        "init-handover-source",
+        &common::manifest("[]"),
+        &[],
+        &program(&batch, false, 11),
+    );
+    let next = common::build(
+        "init-handover-next",
+        &common::manifest("[]"),
+        &[],
+        &program(&batch, true, 22),
+    );
+    for trigger in ["load", "deferred", "export", "reload", "restart", "new-device"] {
+        let options =
+            Options { defer_init: trigger == "deferred", reloadable: true, ..Options::default() };
+        let dir = if matches!(trigger, "load" | "deferred") { &next } else { &source };
+        let mut host = Host::load_with(dir, &options).unwrap();
+        match trigger {
+            "load" => {}
+            "deferred" => host.init().unwrap(),
+            "export" => {
+                host.call_export("switch", &[]).unwrap();
+            }
+            "reload" => host.reload(Some(&next)).unwrap(),
+            "restart" => host.restart_in(&next, &options).unwrap(),
+            "new-device" => host
+                .restart_in(&next, &Options { timing: Timing::Span, ..options.clone() })
+                .unwrap(),
+            _ => unreachable!(),
+        }
+        assert_eq!(host.build_dir(), target.as_ref(), "{trigger}");
+        assert_eq!(host.call_export("marker", &[]).unwrap(), [Value::I32(42)], "{trigger}");
+    }
+}
+
 /// More dispatches and draws in one submission than the uniform ring starts with room for
 /// (64 KiB at 256 bytes a slice): each must still see its own uniform bytes.
 #[test]
@@ -651,6 +714,181 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
     let timings = host.take_timings().expect("timings");
     assert_eq!(timings.len(), 1);
     assert_eq!(timings[0].label, "ordered draws");
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn export_timings_are_collected_without_running_a_frame() {
+    for timing in [Timing::Span, Timing::Serial] {
+        let batch = Encoder::new()
+            .create_buffer(1, 16)
+            .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[0, 42, 0, 0]))
+            .finish();
+        let (_dir, mut host) =
+            store_host("export-timings", &[vec![batch]], &Options { timing, ..Options::default() });
+        host.call_export("frame", &[Value::F32(0.0), Value::I32(4), Value::I32(4)])
+            .expect("the export dispatches");
+        let timings = host.take_timings().expect("collects the export's GPU work");
+        assert_eq!(timings.len(), 1, "{timing:?}");
+        assert_eq!(timings[0].label, "store");
+        assert!(host.take_timings().unwrap().is_empty(), "a timing is taken once");
+        assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn manual_frames_do_not_inherit_the_previous_frames_gpu_label() {
+    let first = Encoder::new()
+        .create_buffer(1, 16)
+        .label("first frame")
+        .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[0, 11, 0, 0]))
+        .finish();
+    let second = Encoder::new()
+        .dispatch(0, [1, 1, 1], &[Binding::range(1, 0, 16)], &words(&[0, 42, 0, 0]))
+        .finish();
+    let (_dir, mut host) = store_host(
+        "manual-frame-labels",
+        &[vec![first], vec![second]],
+        &Options { timing: Timing::Span, ..Options::default() },
+    );
+    host.frame(0.0, 4, 4).unwrap();
+    host.frame(1.0, 4, 4).unwrap();
+    let timings = host.take_timings().unwrap();
+    assert_eq!(
+        timings.iter().map(|t| t.label.as_str()).collect::<Vec<_>>(),
+        ["first frame", "store"]
+    );
+    assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn a_two_byte_texture_upload_reaches_the_shader() {
+    let shader = r#"
+        @group(0) @binding(0) var source: texture_2d<f32>;
+        @group(0) @binding(1) var<storage, read_write> out: array<f32>;
+        @compute @workgroup_size(1) fn read_texel() {
+            out[0] = textureLoad(source, vec2i(0, 0), 0).x;
+        }
+    "#;
+    let pipelines = r#"[{ "name": "read_texel", "shader": "read.wgsl", "kind": "compute",
+        "entry": "read_texel", "workgroup_size": [1, 1, 1],
+        "bindings": [{ "binding": 0, "kind": "texture", "format": "r16float" },
+                     { "binding": 1, "kind": "read_write" }] }]"#;
+    let batch = Encoder::new()
+        .create_buffer(2, 4)
+        .create_texture(1, 1, 1, TextureFormat::R16Float, false)
+        .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
+        .dispatch(0, [1, 1, 1], &[Binding::of(1), Binding::range(2, 0, 4)], &[])
+        .finish();
+    let wasm = wat::parse_str(common::wat::program(&[vec![batch]])).unwrap();
+    let dir = common::build(
+        "two-byte-texture",
+        &common::manifest(pipelines),
+        &[("read.wgsl", shader)],
+        &wasm,
+    );
+    let mut host = Host::load(&dir).unwrap();
+    host.frame(0.0, 4, 4).expect("the two-byte half-float texel uploads");
+    assert_eq!(host.read_buffer(2).unwrap(), 1.0f32.to_le_bytes());
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn hot_reload_clears_the_retired_builds_debug_flag() {
+    let pipelines = r#"[{ "name": "flag", "shader": "flag.wgsl", "kind": "compute",
+        "entry": "flag_error", "workgroup_size": [1, 1, 1], "bindings": [], "debug_flag": 0 }]"#;
+    let shader = r#"
+        @group(0) @binding(0) var<storage, read_write> flag: atomic<u32>;
+        @compute @workgroup_size(1) fn flag_error() { atomicStore(&flag, 1u); }
+    "#;
+    let failing = Encoder::new().dispatch(0, [1, 1, 1], &[], &[]).finish();
+    let wasm = wat::parse_str(common::wat::program(&[vec![failing]])).unwrap();
+    let old = common::build(
+        "reload-debug-old",
+        &common::manifest(pipelines),
+        &[("flag.wgsl", shader)],
+        &wasm,
+    );
+    let clean = Encoder::new().begin_screen_pass([0.0, 1.0, 0.0, 1.0]).present().finish();
+    let wasm = wat::parse_str(common::wat::program(&[vec![clean]])).unwrap();
+    let next = common::build("reload-debug-next", &common::manifest("[]"), &[], &wasm);
+    let options = Options { reloadable: true, ..Options::default() };
+    let mut host = Host::load_with(&old, &options).unwrap();
+    assert!(host.frame(0.0, 4, 4).unwrap_err().to_string().contains("indexed an array"));
+    host.reload(Some(&next)).expect("loads the next build");
+    host.frame(0.0, 4, 4).expect("the retired build's error does not poison its replacement");
+    assert_eq!(pixel(&host.read_screen().unwrap(), 4, 0, 0), [0, 255, 0, 255]);
+}
+
+#[test]
+#[ignore = "needs a GPU"]
+fn adjacent_passes_with_different_buffer_access_do_not_join() {
+    let vertex = r#"
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+            let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+            return vec4f(corners[i], 0, 1);
+        }
+    "#;
+    let read = format!(
+        r#"{vertex}
+        @group(0) @binding(0) var<storage, read> data: array<u32>;
+        @fragment fn fs() -> @location(0) vec4f {{ return unpack4x8unorm(data[0]); }}"#
+    );
+    let write = format!(
+        r#"{vertex}
+        @group(0) @binding(0) var<storage, read_write> data: array<atomic<u32>>;
+        @fragment fn fs() -> @location(0) vec4f {{
+            atomicStore(&data[0], 42u);
+            return vec4f(0, 1, 0, 1);
+        }}"#
+    );
+    let pipelines = r#"[
+        { "name": "read", "shader": "read.wgsl", "kind": "render",
+          "vertex_entry": "vs", "fragment_entry": "fs",
+          "targets": [{ "color": "rgba8unorm", "depth": false }],
+          "bindings": [{ "binding": 0, "kind": "read", "stage": "fragment" }] },
+        { "name": "write", "shader": "write.wgsl", "kind": "render",
+          "vertex_entry": "vs", "fragment_entry": "fs",
+          "targets": [{ "color": "rgba8unorm", "depth": false }],
+          "bindings": [{ "binding": 0, "kind": "read_write", "stage": "fragment" }] }
+    ]"#;
+    let pass = Pass {
+        color: 2,
+        keep_color: false,
+        join: false,
+        clear: [0.0; 4],
+        depth: stream::NONE,
+        keep_depth: false,
+        clear_depth: 1.0,
+    };
+    let batch = Encoder::new()
+        .create_buffer(1, 16)
+        .write_buffer(1, 0, &words(&[0xffff_ffff, 0, 0, 0]))
+        .create_texture(2, 4, 4, TextureFormat::Rgba8, false)
+        .begin_pass(pass)
+        .draw(0, 3, 1, &[Binding::range(1, 0, 16)], &[])
+        .end_pass()
+        .begin_pass(Pass { keep_color: true, join: true, ..pass })
+        .draw(0, 3, 1, &[Binding::range(1, 0, 16)], &[])
+        .end_pass()
+        .begin_pass(Pass { keep_color: true, join: true, ..pass })
+        .draw(1, 3, 1, &[Binding::range(1, 0, 16)], &[])
+        .end_pass()
+        .finish();
+    let wasm = wat::parse_str(common::wat::program(&[vec![batch]])).unwrap();
+    let dir = common::build(
+        "incompatible-pass-join",
+        &common::manifest(pipelines),
+        &[("read.wgsl", &read), ("write.wgsl", &write)],
+        &wasm,
+    );
+    let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
+        .expect("both render pipelines are valid");
+    host.frame(0.0, 4, 4).expect("individually valid usage scopes stay separate");
+    assert_eq!(host.take_timings().unwrap().len(), 2, "only compatible passes join");
+    assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
 }
 
 #[test]

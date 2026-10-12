@@ -187,26 +187,35 @@ impl<'p> Checker<'p> {
                     _ => None,
                 };
                 let v = self.check_expr(value, elem_exp);
+                let mut local_len = false;
+                count.walk(&mut |e| {
+                    if let ast::ExprKind::Path(path) = &e.kind
+                        && path.is_single()
+                        && self.env.lookup(&path.segments[0].ident.name).is_some()
+                    {
+                        local_len = true;
+                    }
+                });
                 // `[x; N]` with `const N: u32`: its length is known once it's instantiated.
                 let param_len = match &count.kind {
-                    ast::ExprKind::Path(p) if p.is_single() => self
+                    ast::ExprKind::Path(p) if p.is_single() && !local_len => self
                         .scope
                         .param(&p.segments[0].ident.name)
                         .filter(|&g| self.p.param(g).is_const),
                     _ => None,
                 };
-                let n = if param_len.is_some() { Some(0) } else { self.const_u32(count) };
+                let n = if local_len {
+                    None
+                } else if param_len.is_some() {
+                    Some(0)
+                } else {
+                    self.const_u32(count)
+                };
                 let n = match n {
                     Some(n) => n,
                     None => {
-                        let local = match &count.kind {
-                            ast::ExprKind::Path(p) if p.is_single() => {
-                                self.env.lookup(&p.segments[0].ident.name).is_some()
-                            }
-                            _ => false,
-                        };
                         // A variable isn't a constant; anything else says why it isn't a length.
-                        self.err(if local {
+                        self.err(if local_len {
                             Diagnostic::new(codes::E0325, count.span, "an array length is an integer literal or a constant holding one, not a variable")
                         } else {
                             resolve::length_error(self.p, self.scope.module, count)
@@ -2863,4 +2872,26 @@ fn decimal(text: &str) -> Option<(u128, i32)> {
         digits = digits.checked_mul(10)?.checked_add(u128::from(c.to_digit(10)?))?;
     }
     Some((digits, exp.checked_sub(i32::try_from(frac.len()).ok()?)?))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn array_repeats_respect_local_shadowing_of_constant_lengths() {
+        for count in ["LENGTH", "(LENGTH)", "LENGTH + 1"] {
+            let source = format!(
+                "const LENGTH = 2\n\
+                 pub fn inspect(LENGTH: u32) -> u32 {{\n\
+                     let values = [0; {count}]\n\
+                     values.len()\n\
+                 }}\n"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0325"),
+                "used the shadowed constant in {source}: {diagnostics:#?}"
+            );
+        }
+    }
 }

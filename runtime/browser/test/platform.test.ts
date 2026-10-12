@@ -59,6 +59,57 @@ test("parent channels reject a different origin and dispose a waiting receive", 
   }
 });
 
+test("reloading an embedded program closes its surface and restores the console", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const ports: MessagePort[] = [];
+  const visibility: boolean[] = [];
+  let removed = false;
+  let focused = 0;
+  const frame = {
+    style: {},
+    onload: null as (() => void) | null,
+    onerror: null as (() => void) | null,
+    contentWindow: {
+      postMessage: (_message: unknown, _origin: string, transferred: MessagePort[]) => {
+        ports.push(transferred[0]!);
+        transferred[0]!.postMessage({ type: "connected" });
+      },
+      focus: () => {},
+    },
+    remove: () => { removed = true; },
+  };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {} } });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: {
+    baseURI: "https://console.example/",
+    createElement: () => frame,
+    body: { append: () => queueMicrotask(() => frame.onload?.()) },
+  } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => { focused++; } } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, visible => visibility.push(visible));
+  try {
+    const handle = await platform.request("surface/open", new TextEncoder().encode("https://game.example/session/"));
+    await platform.request("surface/show", handle);
+    const closed = platform.request("surface/closed", handle);
+    expect(platform.active).toBe(false);
+    expect(canvas.style.visibility).toBe("hidden");
+    frame.onload?.();
+    expect(platform.active).toBe(true);
+    expect(removed).toBe(true);
+    expect(canvas.style.visibility).toBe("visible");
+    expect(visibility).toEqual([false, true]);
+    expect(focused).toBe(1);
+    expect(await closed).toEqual(new Uint8Array());
+    await expect(platform.request("surface/call", handle)).rejects.toThrow("closed");
+    expect(ports).toHaveLength(1);
+  } finally {
+    platform.dispose();
+    for (const port of ports) port.close();
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (oldDocument) Object.defineProperty(globalThis, "document", oldDocument); else Reflect.deleteProperty(globalThis, "document");
+  }
+});
+
 
 test("export filenames fit full session keys and reject traversal or truncation", () => {
   const body = (name: string) => { const text = new TextEncoder().encode(name); const b = new Uint8Array(4 + text.length); b.set(wordBytes(text.length)); b.set(text, 4); return b; };

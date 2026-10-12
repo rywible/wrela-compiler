@@ -96,21 +96,12 @@ impl Runner {
         .map_err(|e| e.to_string())
     }
 
-    fn call(&mut self, name: &str) -> Result<Vec<f64>, String> {
-        let out = match self {
+    fn call(&mut self, name: &str) -> Result<Vec<Value>, String> {
+        match self {
             Runner::Gpu(h) => h.call_export(name, &[]),
             Runner::Cpu(h) => h.call_export(name, &[]),
         }
-        .map_err(|e| format!("`{name}`: {e}"))?;
-        Ok(out
-            .iter()
-            .map(|v| match *v {
-                Value::I32(x) => f64::from(x),
-                Value::I64(x) => x as f64,
-                Value::F32(x) => f64::from(x),
-                Value::F64(x) => x,
-            })
-            .collect())
+        .map_err(|e| format!("`{name}`: {e}"))
     }
 
     fn push(&mut self, e: wrela_abi::input::Event) {
@@ -183,9 +174,39 @@ fn columns(name: &str, n: usize) -> Vec<String> {
     }
 }
 
-/// Values as an export's are shown, each as an `f32`, with `sep` between.
-fn shown(v: &[f64], sep: &str) -> String {
-    v.iter().map(|x| format!("{}", *x as f32)).collect::<Vec<_>>().join(sep)
+/// Each value keeps its own numeric type when printed: integers and `f64`s must not narrow,
+/// while an `f32` keeps its short decimal spelling.
+fn shown(v: &[Value], sep: &str) -> String {
+    v.iter()
+        .map(|&value| match value {
+            Value::I32(x) => x.to_string(),
+            Value::I64(x) => x.to_string(),
+            Value::F32(x) => x.to_string(),
+            Value::F64(x) => x.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+fn number(value: Value) -> f64 {
+    match value {
+        Value::I32(x) => f64::from(x),
+        Value::I64(x) => x as f64,
+        Value::F32(x) => f64::from(x),
+        Value::F64(x) => x,
+    }
+}
+
+fn values_json(values: &[Value]) -> Vec<serde_json::Value> {
+    values
+        .iter()
+        .map(|&value| match value {
+            Value::I32(x) => serde_json::json!(x),
+            Value::I64(x) => serde_json::json!(x),
+            Value::F32(x) => serde_json::json!(x),
+            Value::F64(x) => serde_json::json!(x),
+        })
+        .collect()
 }
 
 /// The exit status a run returns, or 2 after printing why it failed.
@@ -218,7 +239,7 @@ fn run_trace(a: &Args) -> Result<ExitCode, String> {
                 println!("frame,time,{}", cols.join(","));
                 header = true;
             }
-            let cells: Vec<f64> = values.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+            let cells: Vec<Value> = values.iter().flat_map(|(_, v)| v.iter().copied()).collect();
             println!("{i},{},{}", t as f32, shown(&cells, ","));
         } else {
             let parts: Vec<String> =
@@ -303,11 +324,11 @@ fn run_bisect(a: &Args, until: &Until, text: &str) -> Result<ExitCode, String> {
         let Some(&x) = v.get(until.component) else {
             return Err(format!("`{}` gives {} values", until.export, v.len()));
         };
-        if until.holds(x) {
+        if until.holds(number(x)) {
             if a.json {
                 println!(
                     "{}",
-                    serde_json::json!({ "held": true, "until": text, "frame": i, "time": t, "values": v })
+                    serde_json::json!({ "held": true, "until": text, "frame": i, "time": t, "values": values_json(&v) })
                 );
             } else {
                 println!(
@@ -330,6 +351,22 @@ fn run_bisect(a: &Args, until: &Until, text: &str) -> Result<ExitCode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trace_keeps_integer_and_f64_precision_in_its_text() {
+        let values = [
+            Value::I32(16_777_217),
+            Value::F64(0.1),
+            Value::F64(1e40),
+            Value::I64(9_007_199_254_740_993),
+        ];
+        assert_eq!(
+            shown(&values, ","),
+            "16777217,0.1,10000000000000000000000000000000000000000,9007199254740993"
+        );
+        assert_eq!(shown(&[Value::F32(0.1)], ","), "0.1");
+        assert_eq!(values_json(&values)[3].as_i64(), Some(9_007_199_254_740_993));
+    }
 
     #[test]
     fn trace_rejects_non_positive_and_non_finite_frame_rates() {

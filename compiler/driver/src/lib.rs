@@ -842,10 +842,20 @@ impl Loader {
                     "the dependency `{what}` isn't there: `{}` isn't a directory",
                     dir.display()
                 );
-                let d = Diagnostic::new(codes::E0220, at?, msg);
-                self.diags.push(d.with_help(
-                    "fix its `path`, which is relative to the `wrela.toml` that declares it",
-                ));
+                if let Some(at) = at {
+                    let d = Diagnostic::new(codes::E0220, at, msg);
+                    self.diags.push(d.with_help(
+                        "fix its `path`, which is relative to the `wrela.toml` that declares it",
+                    ));
+                } else {
+                    let file = self.sources.add(dir.display().to_string(), "");
+                    self.diags.push(Diagnostic::new(
+                        codes::E0205,
+                        Span::new(file, 0, 0),
+                        format!("the package `{}` isn't a directory", dir.display()),
+                    ));
+                    self.layout_failed = true;
+                }
                 return None;
             }
         };
@@ -1064,6 +1074,23 @@ fn optional_file(path: &Path) -> Option<Result<String, std::io::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_missing_or_file_package_root_is_e0205() {
+        let d = std::env::temp_dir().join(format!("wrela-driver-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_file(&d);
+        for is_file in [false, true] {
+            if is_file {
+                std::fs::write(&d, "not a directory").expect("file root");
+            }
+            let out = check(&d);
+            assert!(out.has_errors(), "invalid root cannot pass: {:?}", out.diagnostics);
+            assert_eq!(out.diagnostics[0].code, codes::E0205);
+            assert!(out.diagnostics[0].message.contains("isn't a directory"));
+        }
+        let _ = std::fs::remove_file(&d);
+    }
 
     #[cfg(unix)]
     #[test]

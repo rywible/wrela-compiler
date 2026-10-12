@@ -2,14 +2,86 @@
 from pathlib import Path
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import console
 
 
 class StaticRelease(unittest.TestCase):
+    def test_build_names_cannot_collide_with_release_directories(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            for package in ["console", "session"]:
+                (root / package).mkdir()
+                (root / package / "wrela.toml").write_text('name = "fixture"\n')
+            config = root / "release.toml"
+            config.write_text('''[console]
+package = "console"
+project = "console-host"
+domain = "console.example"
+[[games]]
+id = "game"
+title = "Game"
+project = "game-host"
+domain = "game.example"
+session = "releases"
+builds = { releases = "session" }
+''')
+            with patch.object(console, "ROOT", root):
+                with self.assertRaisesRegex(ValueError, "reserved"):
+                    console.read_config(config)
+                config.write_text(config.read_text().replace("releases", "session"))
+                self.assertEqual(console.read_config(config)["games"][0]["session"], "session")
+
+    def test_every_console_bootstrap_has_the_same_storage_namespace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cover = root / "cover.png"
+            cover.write_bytes(b"rendered cover fixture")
+            config = {
+                "console": {
+                    "package": "console", "project": "console-host", "domain": "console.example",
+                },
+                "games": [{
+                    "id": "game", "title": "Game", "project": "game-host", "domain": "game.example",
+                    "session": "session", "builds": {"session": "session"},
+                }],
+            }
+
+            def build(package, output):
+                output.mkdir(parents=True)
+                (output / "index.html").write_text("<html><head></head><body></body></html>")
+                (output / "game.wasm").write_bytes(b"wasm")
+
+            image = MagicMock()
+            image.__enter__.return_value = image
+            image.convert.return_value = image
+            image.size = (1, 1)
+            image.tobytes.return_value = bytes(4)
+            pillow = SimpleNamespace(Image=SimpleNamespace(
+                open=lambda path: image, Resampling=SimpleNamespace(LANCZOS=0),
+            ))
+            output = root / "release"
+            with (
+                patch.object(console, "build_package", build),
+                patch.object(console, "copy_licenses"),
+                patch.object(console.subprocess, "check_output", return_value="fixture\n"),
+                patch.dict(sys.modules, {"PIL": pillow}),
+            ):
+                report = console.package(config, output, {"game": cover})
+            release = report["release"]
+            console_paths = [
+                output / "console-host/index.html",
+                output / f"console-host/releases/{release}/index.html",
+            ]
+            for document in console_paths:
+                self.assertIn('<meta name="wrela-storage" content="console">', document.read_text())
+            game_document = output / f"game-host/releases/{release}/session/index.html"
+            self.assertIn('<meta name="wrela-storage" content="game">', game_document.read_text())
+
     def test_private_storage_and_symlinks_cannot_be_uploaded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

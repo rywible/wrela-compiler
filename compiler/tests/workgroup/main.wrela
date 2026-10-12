@@ -56,6 +56,71 @@ fn count_keys(values: [u32], map: mut AtomicMap, id: GlobalId) {
     }
 }
 
+/// A stored value may be any `u32`, including the number used for an empty key.
+@compute(1)
+fn map_edge_values(map: mut AtomicMap, out: mut Slots<[u32; 12]>, id: GlobalId) {
+    var report = [0; 12]
+    report[0] = u32(map.insert(1, 4294967295))
+    report[1] = match map.get(1) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    report[2] = u32(map.insert(1, 7))
+    report[3] = match map.get(1) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    report[4] = u32(map.add(2, 4294967295))
+    report[5] = match map.get(2) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    report[6] = u32(map.add(2, 1))
+    report[7] = match map.get(2) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    report[8] = u32(map.insert(3, 4294967294))
+    report[9] = u32(map.add(3, 1))
+    report[10] = match map.get(3) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    let _ = map.add(3, 1)
+    report[11] = match map.get(3) {
+        Some(v) => v,
+        None => 4294967293,
+    }
+    let _ = map.insert(4, 4294967232)
+    out[id] = report
+}
+
+@compute(64)
+fn map_contended_wrap(map: mut AtomicMap, id: GlobalId) {
+    let _ = map.add(4, 1)
+    let inserted = map.insert(5, 4294967295)
+    let _ = map.add(5, 1)
+    let _ = map.add(6, u32(inserted))
+}
+
+@compute(1)
+fn map_wrapped_value(map: mut AtomicMap, out: mut Slots<[u32; 3]>, id: GlobalId) {
+    out[id] = [
+        match map.get(4) {
+            Some(v) => v,
+            None => 4294967293,
+        },
+        match map.get(5) {
+            Some(v) => v,
+            None => 4294967293,
+        },
+        match map.get(6) {
+            Some(v) => v,
+            None => 4294967293,
+        },
+    ]
+}
+
 pub struct Work {
     frame: u32,
     cells: GpuBuffer<f32>,
@@ -63,6 +128,9 @@ pub struct Work {
     evens: AppendBuffer<u32>,
     map: AtomicMapBuffer,
     report: GpuBuffer<u32>,
+    edge_map: AtomicMapBuffer,
+    edge_report: GpuBuffer<[u32; 12]>,
+    wrapped_report: GpuBuffer<[u32; 3]>,
     cells_back: Pending<f32>,
     bins_back: Pending<u32>,
     evens_back: Pending<u32>,
@@ -103,13 +171,23 @@ pub fn init() -> Work {
     let evens_back = read(evens_out.items())
     let count_back = read(evens_out.count())
     let map_back = read(map.entries())
+    let report = buffer(6)
+    var edge_map = atomic_map_buffer(8)
+    var edge_report = buffer(1)
+    var wrapped_report = buffer(1)
+    dispatch(map_edge_values.bind(map: mut edge_map, out: mut edge_report), groups: 1)
+    dispatch(map_contended_wrap.bind(map: mut edge_map), groups: 1)
+    dispatch(map_wrapped_value.bind(map: mut edge_map, out: mut wrapped_report), groups: 1)
     Work {
         frame: 0,
         cells: corner_sums,
         bins,
         evens: evens_out,
         map,
-        report: buffer(6),
+        report,
+        edge_map,
+        edge_report,
+        wrapped_report,
         cells_back,
         bins_back,
         evens_back,

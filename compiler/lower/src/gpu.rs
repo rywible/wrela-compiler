@@ -955,6 +955,10 @@ fn draw_target(
         Some(format!(
             "its fragment shader returns a colour, which an `R32Uint` texture doesn't take, and a `{pass}` draws into one"
         ))
+    } else if output.blends() && target.color.is_some_and(|format| !format.filterable()) {
+        Some(format!(
+            "its fragment shader returns an `Over` colour to blend, and a `{pass}` draws into a format that doesn't support alpha blending"
+        ))
     } else {
         None
     };
@@ -2852,6 +2856,130 @@ mod tests {
     use wrela_diag::FileId;
     use wrela_sema::SourceUnit;
 
+    fn lower_source(source: &str) -> (crate::Lowered, Vec<Diagnostic>) {
+        let mut diags = Vec::new();
+        let units: Vec<_> = wrela_sema::STD_SOURCES
+            .iter()
+            .map(|(name, text)| (0, *name, *text))
+            .chain(std::iter::once((1, "main", source)))
+            .enumerate()
+            .map(|(i, (package, name, text))| {
+                let parsed = wrela_syntax::parse(FileId(i as u32), text);
+                diags.extend(parsed.diagnostics);
+                SourceUnit {
+                    path: name.split("::").map(str::to_owned).collect(),
+                    ast: Arc::new(parsed.file),
+                    package,
+                    syntax_errors: Vec::new(),
+                    text: Arc::from(text),
+                }
+            })
+            .collect();
+        assert!(!wrela_diag::has_errors(&diags), "syntax: {diags:?}");
+        let checked = wrela_sema::check_program(units, &mut diags);
+        assert!(!wrela_diag::has_errors(&diags), "semantics: {diags:?}");
+        let roots = crate::Roots::of(&checked);
+        crate::lower(&checked, &roots, &crate::BuildData::default(), false)
+    }
+
+    #[test]
+    fn signed_vector_shifts_accept_scalar_u32_amounts() {
+        let source = r#"
+use std::gpu::{GlobalId, Slots, buffer, dispatch}
+
+@compute(1)
+fn shift(out: mut Slots<vec3i>, id: GlobalId) {
+    let a = vec3i(1, -2, 3)
+    out[id] = (a << 2) + (a >> 1)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out = buffer(1)
+    dispatch(shift.bind(out: mut out), groups: 1)
+}
+"#;
+        let (_, errors) = lower_source(source);
+        assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+    }
+
+    #[test]
+    fn erased_projection_results_return_without_a_pointer_or_trap() {
+        let source = r#"
+fn project(value: ()) -> borrow () { value }
+
+pub fn inspect() -> u32 {
+    let unit = ()
+    borrow held = project(unit)
+    let _ = held
+    1
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (lowered, errors) = lower_source(source);
+        assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+        let project = lowered
+            .cpu
+            .functions
+            .iter()
+            .find(|f| f.name.starts_with("project_"))
+            .expect("lowered projection function");
+        assert!(matches!(project.body.last(), Some(ir::Stmt::Return(None))), "{:?}", project.body);
+    }
+
+    #[test]
+    fn erased_run_lengths_report_the_unsupported_type_once() {
+        let source = r#"
+struct Tag: Copy {}
+
+fn count<T: Copy>(xs: [T]) -> u32 { xs.len() }
+
+pub fn tags() -> u32 {
+    count([Tag {}, Tag {}, Tag {}]) + count([(), ()])
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, codes::E0702);
+    }
+
+    #[test]
+    fn alpha_blending_requires_a_blendable_target() {
+        let source = r#"
+use std::gpu::{ClipPosition, Over, FORMAT, VertexIndex, begin_pass, draw, texture}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.5, 1.0) }
+}
+
+@fragment
+fn blend() -> Over {
+    Over { color: vec4(1.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var target = texture::<FORMAT>(width: 4, height: 4)
+    let pass = begin_pass(mut target)
+    draw(pass, cover, blend, vertices: 3)
+    pass.end()
+}
+"#;
+        for format in ["Rgba8", "Rgba16Float", "R16Float", "Rg16Float", "R32Float"] {
+            let (_, errors) = lower_source(&source.replace("FORMAT", format));
+            let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+            if format == "R32Float" {
+                assert_eq!(errors.len(), 1, "{format}: {errors:?}");
+                assert_eq!(errors[0].code, codes::E0603);
+            } else {
+                assert!(errors.is_empty(), "{format}: {errors:?}");
+            }
+        }
+    }
+
     /// Evaluate the constant group-count expression in the lowered CPU function. This fixture
     /// never submits the oversized dispatch to a GPU; it checks the arithmetic before the host
     /// applies its device limits.
@@ -2894,29 +3022,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
     run()
 }
 "#;
-        let mut diags = Vec::new();
-        let units: Vec<_> = wrela_sema::STD_SOURCES
-            .iter()
-            .map(|(name, text)| (0, *name, *text))
-            .chain(std::iter::once((1, "main", source)))
-            .enumerate()
-            .map(|(i, (package, name, text))| {
-                let parsed = wrela_syntax::parse(FileId(i as u32), text);
-                diags.extend(parsed.diagnostics);
-                SourceUnit {
-                    path: name.split("::").map(str::to_owned).collect(),
-                    ast: Arc::new(parsed.file),
-                    package,
-                    syntax_errors: Vec::new(),
-                    text: Arc::from(text),
-                }
-            })
-            .collect();
-        assert!(!wrela_diag::has_errors(&diags), "syntax: {diags:?}");
-        let checked = wrela_sema::check_program(units, &mut diags);
-        assert!(!wrela_diag::has_errors(&diags), "semantics: {diags:?}");
-        let roots = crate::Roots::of(&checked);
-        let (lowered, errors) = crate::lower(&checked, &roots, &crate::BuildData::default(), false);
+        let (lowered, errors) = lower_source(source);
         assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
         let run =
             lowered.cpu.functions.iter().find(|f| f.name.starts_with("run_")).expect("lowered run");

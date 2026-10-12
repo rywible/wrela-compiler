@@ -5,6 +5,7 @@ import { Checker, limitsOf, pathProblem } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
+import { pathUrl } from "./path.ts";
 import { type Compiled, type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
 import { UTF8 } from "./wasm.ts";
@@ -66,10 +67,6 @@ export function browserIo(
   if (storage !== null && pathProblem(storage) !== undefined) throw new Error("invalid storage namespace");
   const parts = storage === null ? new URL(base).pathname.split("/").filter(p => p !== "") : storage.split("/");
   const root = ["wrela", ...parts];
-  // `pathProblem` permits a literal `%`, as the native host's file paths do. URL parsing would
-  // interpret percent escapes before resolving dot segments (`%2e%2e` is `..`), so quote each
-  // percent first: the server receives the program's path literally, still under the build.
-  const relativeUrl = (path: string, at: string) => new URL(path.replaceAll("%", "%25"), at);
   const dir = async (parts: string[], create: boolean) => {
     let d = await navigator.storage.getDirectory();
     for (const p of parts) d = await d.getDirectoryHandle(p, { create });
@@ -83,7 +80,7 @@ export function browserIo(
   return {
     ...(hostRequest ? { hostRequest } : {}),
     async fetch(url) {
-      const response = await get(fetchFn, relativeUrl(url, files));
+      const response = await get(fetchFn, pathUrl(files, url));
       return new Uint8Array(await response.arrayBuffer());
     },
     async storageRead(path) {
@@ -92,12 +89,18 @@ export function browserIo(
     },
     async storageWrite(path, data) {
       const w = await (await file(path, true)).createWritable();
-      await w.write(data);
-      await w.close();
+      try {
+        await w.write(data);
+        await w.close();
+      } catch (error) {
+        // Release the writer even when its write or close failed, preserving that first error.
+        await w.abort().catch(() => {});
+        throw error;
+      }
     },
     async post(url, body) {
       // Only to the build's own origin: the path is relative (`pathProblem`).
-      const response = await fetchFn(relativeUrl(url, base), { method: "POST", body });
+      const response = await fetchFn(pathUrl(base, url), { method: "POST", body });
       if (!response.ok) throw new Error(`POST ${url} failed: ${response.status} ${response.statusText}`);
       return new Uint8Array(await response.arrayBuffer());
     },

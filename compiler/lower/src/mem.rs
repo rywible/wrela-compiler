@@ -420,7 +420,7 @@ impl Fl<'_, '_> {
                 Some(self.u32c(n))
             }
             Lang::MemZeroed => {
-                let t = elem(self, 0)?;
+                let Some(t) = elem(self, 0) else { return Some(None) };
                 Some(self.value(t, ir::Expr::Zero(t)))
             }
             Lang::MemNeedsDrop => {
@@ -453,14 +453,14 @@ impl Fl<'_, '_> {
                 None
             }
             Lang::MemAt | Lang::MemAtMut => {
-                let et = elem(self, 0)?;
+                let Some(et) = elem(self, 0) else { return Some(None) };
                 let addr = arg(self, 1)?;
                 let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(et));
                 Some(self.value(pt, ir::Expr::Mem(M::Ptr, vec![addr])))
             }
             Lang::MemAtMutPair => {
                 // A `Pair<T>`: a pointer to each.
-                let et = elem(self, 0)?;
+                let Some(et) = elem(self, 0) else { return Some(None) };
                 let (a, b) = (arg(self, 1)?, arg(self, 2)?);
                 let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(et));
                 let pa = self.value(pt, ir::Expr::Mem(M::Ptr, vec![a]));

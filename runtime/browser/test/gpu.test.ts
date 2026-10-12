@@ -505,6 +505,32 @@ test("a pass that may join the one before, on the same targets kept, runs as par
   expect(device.events.filter((e) => e.kind === "draw").length).toBe(3);
 });
 
+test("passes with conflicting buffer access stay separate even when their targets may join", async () => {
+  const { device, run, executor } = await setup();
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 8, 8, "rgba8unorm")
+    .beginPass(offscreen(3, NONE)).draw(0, 3, 1, [1, 2], u(0)).endPass()
+    .beginPass({ ...offscreen(3, NONE, true), join: true }).draw(0, 3, 1, [2, 1], u(1)).endPass());
+  executor.flush();
+  expect(device.events.filter((e) => e.kind === "renderPass")).toHaveLength(2);
+  expect(device.events.filter((e) => e.kind === "draw")).toHaveLength(2);
+});
+
+test("pass joining includes indirect argument and index reads in its buffer access checks", async () => {
+  for (const indexed of [false, true]) {
+    const { device, run, executor } = await setup();
+    const commands = new Encoder().createBuffer(1, 64).createBuffer(2, 64).createBuffer(3, 64).createBuffer(4, 64)
+      .createTexture(5, 8, 8, "rgba8unorm").beginPass(offscreen(5, NONE));
+    if (indexed) commands.drawIndexedIndirect(0, [1, 0, 64], 4, 0, [2, 3], u(0));
+    else commands.drawIndirect(0, 1, 0, [2, 3], u(0));
+    run(commands.endPass().beginPass({ ...offscreen(5, NONE, true), join: true })
+      .draw(0, 3, 1, [2, 1], u(1)).endPass());
+    executor.flush();
+    expect(device.events.filter((e) => e.kind === "renderPass")).toHaveLength(2);
+    const indirect = device.events.find((e) => e.kind === (indexed ? "drawIndexedIndirect" : "drawIndirect"));
+    expect(indirect).toBeDefined();
+  }
+});
+
 test("a label names the passes and dispatches after it, until the next label or frame", async () => {
   const { device, run, executor } = await setup();
   run(
@@ -839,6 +865,97 @@ test("a retired executor runs no commands when a pipeline finishes late", async 
   await executor.built;
   await Promise.resolve();
   expect(kinds(device.events)).toEqual([]);
+});
+
+test("retiring an executor records an ended texture pass before releasing its resources", async () => {
+  const { device, executor, run } = await setup();
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 8, 8, "rgba8unorm")
+    .beginPass(offscreen(3, NONE)).draw(0, 3, 1, [1, 2], u(0)).endPass());
+  executor.destroyAll();
+  expect(device.events.filter((e) => e.kind === "draw")).toHaveLength(1);
+  expect(device.events.at(-1)?.kind).toBe("submit");
+  expect(device.textures.every((t) => t.destroyed)).toBe(true);
+  expect(executor.memory.bytes).toBe(0);
+});
+
+test("retiring an executor releases its upload uniform and debug buffers", () => {
+  const device = new FakeDevice();
+  const executor = new GpuExecutor(device.gpu, [], { texture: () => fakeTexture("screen") }, "off", true);
+  expect(device.buffers.map((b) => b.label).sort()).toEqual(["debug flag", "readback", "uniform ring", "upload ring"]);
+  executor.destroyAll();
+  expect(device.buffers.every((b) => b.destroyed)).toBe(true);
+  executor.destroyAll();
+});
+
+test("retiring an executor waits for a debug read before releasing its mapped buffer", async () => {
+  const device = new FakeDevice();
+  const executor = new GpuExecutor(device.gpu, [], { texture: () => fakeTexture("screen") }, "off", true);
+  const readback = device.buffers.find((buffer) => buffer.label === "readback")!;
+  const mapped = Promise.withResolvers<void>();
+  readback.mapAsync = () => mapped.promise;
+  const checked = executor.checkDebugFlag();
+  executor.destroyAll();
+  expect(readback.destroyed).toBe(false);
+  mapped.resolve();
+  await checked;
+  expect(device.buffers.every((buffer) => buffer.destroyed)).toBe(true);
+});
+
+test("a failed timestamp read releases its staging buffer and retirement releases its queries", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER]));
+  const executor = new GpuExecutor(device.gpu, pipelines, { texture: () => fakeTexture("screen") }, "span");
+  const create = device.createBuffer.bind(device);
+  device.createBuffer = (descriptor) => {
+    const buffer = create(descriptor);
+    if ((descriptor.usage & GPUBufferUsage.MAP_READ) !== 0) {
+      buffer.mapAsync = async () => { throw new Error("timestamps couldn't map"); };
+    }
+    return buffer;
+  };
+  for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
+    .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
+  executor.flush();
+  await expect(executor.timings()).rejects.toThrow("timestamps couldn't map");
+  expect(device.buffers.filter((buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0)
+    .every((buffer) => buffer.destroyed)).toBe(true);
+  executor.destroyAll();
+  expect(device.buffers.every((buffer) => buffer.destroyed)).toBe(true);
+  expect(device.querySets.every((queries) => queries.destroyed)).toBe(true);
+});
+
+test("a pipeline failure rejects readbacks already taken by a serial drain", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [draw] = await Promise.all(buildPipelines(device.gpu, m, [SHADER, SHADER]));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { texture: () => fakeTexture("screen") }, "serial");
+  void executor.built.catch(() => {});
+  for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
+    .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
+  const rejected = executor.readBack(2, 0, 4).then(() => "readback succeeded", (error: Error) => error.message);
+  const drained = executor.drain();
+  later.reject(new Error("serial pipeline failed"));
+  await expect(drained).rejects.toThrow("serial pipeline failed");
+  expect(await Promise.race([rejected, Promise.resolve("readback still pending")])).toBe("serial pipeline failed");
+  executor.destroyAll();
+});
+
+test("retirement cancels readbacks and commands already taken by a serial drain", async () => {
+  const device = new FakeDevice();
+  const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER]));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [pipelines[0]!, later.promise], { texture: () => fakeTexture("screen") }, "serial");
+  for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
+    .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
+  const answer = executor.readBack(2, 0, 4).catch((error: Error) => error.message);
+  const drained = executor.drain();
+  executor.destroyAll();
+  expect(await answer).toBe("the GPU executor was retired");
+  later.resolve(pipelines[1]!);
+  await drained;
+  expect(device.events.filter((event) => event.kind === "dispatch")).toHaveLength(0);
 });
 
 test.each(["failed", "retired"] as const)("a partly drained backlog rejects readbacks when its executor is %s", async (mode) => {

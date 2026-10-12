@@ -13,6 +13,7 @@ let shown = false;
 
 /** Shows a fatal error over the canvas and logs it. */
 function showFatal(text: string): void {
+  stopVoice();
   console.error(`wrela: ${text}`);
   if (shown) return;
   shown = true;
@@ -314,7 +315,7 @@ function start(): void {
     const sized = { width, height };
     listen(canvas, ring, epochNow, () => sized);
     // A test's input is its script: a pad on the machine that runs it isn't heard.
-    if (!test) pollPads(ring, epochNow, () => platform.active);
+    if (!test) pollPads(ring, epochNow, () => platform.active && document.visibilityState === "visible" && document.hasFocus());
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).
     const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
     const live = mark === null ? null : Number(mark.content ?? "0") || 0;

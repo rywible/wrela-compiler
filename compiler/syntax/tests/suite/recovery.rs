@@ -159,6 +159,22 @@ fn print_fix_keeps_a_leading_bom_first() {
 }
 
 #[test]
+fn print_fix_does_not_call_a_local_binding() {
+    for source in [
+        "fn f(print: i32) { println!(\"hello\") }\n",
+        "fn f() { let print = 1; println!(\"hello\") }\n",
+        "use std::io::print\nfn f(print: i32) { println!(\"hello\") }\n",
+    ] {
+        let parsed = parse(FileId(0), source);
+        let diagnostic =
+            parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+        let fixed = wrela_diag::apply_edits(source, &diagnostic.fixes[0].edits);
+        assert!(fixed.contains("std::io::print(\"hello\")"), "{fixed}");
+        assert!(!parse(FileId(0), &fixed).has_errors());
+    }
+}
+
+#[test]
 fn macro_fix_does_not_change_debug_formatting_or_emit_an_unclosed_hole() {
     for source in
         ["fn f(x: str) { println!(\"{:?}\", x) }\n", "fn f(x: str) { format!(\"value {\", x) }\n"]
@@ -167,6 +183,85 @@ fn macro_fix_does_not_change_debug_formatting_or_emit_an_unclosed_hole() {
         let diagnostic =
             parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
         assert!(diagnostic.fixes.is_empty(), "{source}: {diagnostic:#?}");
+    }
+}
+
+#[test]
+fn comparison_macro_fix_preserves_operand_grouping() {
+    for (macro_name, op) in [("assert_eq", BinOp::Eq), ("assert_ne", BinOp::Ne)] {
+        let source = format!("fn f(a: bool, b: bool, c: bool) {{ {macro_name}!(a || b, c) }}\n");
+        let parsed = parse(FileId(0), &source);
+        let diagnostic =
+            parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+        let fixed = wrela_diag::apply_edits(&source, &diagnostic.fixes[0].edits);
+        let reparsed = parse(FileId(0), &fixed);
+        assert!(!reparsed.has_errors(), "{fixed}: {:#?}", reparsed.diagnostics);
+        let body = fn_named(&reparsed.file, "f").body.as_ref().expect("a body");
+        let StmtKind::Expr(Expr { kind: ExprKind::Call { args, .. }, .. }) = &body.stmts[0].kind
+        else {
+            panic!("not an assertion: {fixed}")
+        };
+        assert!(
+            matches!(args[0].value.kind, ExprKind::Binary(actual, ..) if actual == op),
+            "{fixed}"
+        );
+    }
+}
+
+#[test]
+fn format_macro_fix_preserves_argument_evaluation() {
+    for expression in [
+        "format!(\"{0} {0}\", next())",
+        "format!(\"{1} {0}\", first(), second())",
+        "format!(\"{0}\", first(), second())",
+        "format!(\"hello\", next())",
+        "format!(\"{:4}\", first(), second())",
+    ] {
+        let source = format!("fn f() {{ {expression} }}\n");
+        let parsed = parse(FileId(0), &source);
+        let diagnostic =
+            parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+        assert!(diagnostic.fixes.is_empty(), "{expression}: {diagnostic:#?}");
+    }
+    // Numbered holes are safe when every argument is used once, in order.
+    let source = "fn f() { format!(\"{0:4} {1}\", first(), second()) }\n";
+    let parsed = parse(FileId(0), source);
+    let diagnostic =
+        parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+    let fixed = wrela_diag::apply_edits(source, &diagnostic.fixes[0].edits);
+    assert!(fixed.contains("f\"{first():4} {second()}\""), "{fixed}");
+    assert!(!parse(FileId(0), &fixed).has_errors());
+}
+
+#[test]
+fn format_macro_fix_decodes_escaped_closing_braces() {
+    let source = "fn f() { format!(\"before}}after\") }\n";
+    let parsed = parse(FileId(0), source);
+    let diagnostic =
+        parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0115").expect("macro error");
+    let fixed = wrela_diag::apply_edits(source, &diagnostic.fixes[0].edits);
+    let reparsed = parse(FileId(0), &fixed);
+    assert!(!reparsed.has_errors(), "{fixed}");
+    let body = fn_named(&reparsed.file, "f").body.as_ref().expect("a body");
+    let StmtKind::Expr(Expr { kind: ExprKind::FString(parts), .. }) = &body.stmts[0].kind else {
+        panic!("the brace escape needs an f-string: {fixed}")
+    };
+    assert!(matches!(parts.as_slice(), [FPart::Text(text)] if text == "before}after"));
+}
+
+#[test]
+fn reference_fix_in_a_borrow_struct_keeps_a_projection() {
+    for (written, expected) in [("&T", "borrow T"), ("&mut T", "mut T")] {
+        let source = format!("borrow struct S {{ value: {written} }}\n");
+        let parsed = parse(FileId(0), &source);
+        let diagnostic = parsed
+            .diagnostics
+            .iter()
+            .find(|d| d.code.as_str() == "E0106")
+            .expect("reference error");
+        let fixed = wrela_diag::apply_edits(&source, &diagnostic.fixes[0].edits);
+        assert!(fixed.contains(&format!("value: {expected}")), "{fixed}");
+        assert!(!parse(FileId(0), &fixed).has_errors());
     }
 }
 

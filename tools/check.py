@@ -233,6 +233,8 @@ def main(arguments):
             step(name, wrela, logs)
         elif name and name.startswith("wrela::"):
             build_tests()  # The same dependency features and executable as the full suite.
+            # `cargo test --no-run` builds the CLI's test harness, not its normal executable.
+            call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
             wrela_test(name, wrela, logs)
         else:
             programs = build_tests(name)
@@ -241,6 +243,7 @@ def main(arguments):
                 with ChromeSession(logs):
                     rust_run(program, logs, test)
             else:
+                call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
                 for check in STEPS:
                     print(f"== {check}", flush=True)
                     step_started = time.monotonic()

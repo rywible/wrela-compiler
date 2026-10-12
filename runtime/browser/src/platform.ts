@@ -144,6 +144,7 @@ export class BrowserPlatform {
     let removed = false;
     const surface: Surface = { frame, rpc, firstFrame, closed, close: () => {
       if (removed) return; removed = true;
+      frame.onload = null; frame.onerror = null;
       rpc.close(); frame.remove(); this.#surfaces.delete(id); resolveClosed();
       if (this.#shown === id) { this.#shown = null; this.canvas.style.visibility = "visible"; this.visible(true); this.canvas.focus(); }
     } };
@@ -163,7 +164,7 @@ export class BrowserPlatform {
       })]);
       return wordBytes(id);
     } catch (e) { connection.port2.close(); surface.close(); throw e; }
-    finally { clearTimeout(timer); if (connected) connection.port1.removeEventListener("message", connected); frame.onload = null; frame.onerror = null; }
+    finally { clearTimeout(timer); if (connected) connection.port1.removeEventListener("message", connected); frame.onload = removed ? null : () => surface.close(); frame.onerror = null; }
   }
   async request(service: string, body: Bytes): Promise<Bytes> {
     checked(body);

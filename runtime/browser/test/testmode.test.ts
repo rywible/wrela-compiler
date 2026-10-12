@@ -67,6 +67,20 @@ test("an input script's percent escapes stay literal and under the page", () => 
   expect(inputUrl("http://localhost/game/index.html", path).href).toBe("http://localhost/game/%252e%252e/keys.json");
 });
 
+test("an input script's whitespace stays literal and under the page", () => {
+  for (const [path, escaped] of [[" /keys.json", "%20/keys.json"], ["\t/keys.json", "%09/keys.json"]]) {
+    const parsed = parseTestParams(`#test&input=${path}`)!.input;
+    expect(inputUrl("http://localhost/game/index.html", parsed).href).toBe(`http://localhost/game/${escaped}`);
+  }
+});
+
+test("parameter values retain equals signs instead of silently truncating them", () => {
+  const input = parseTestParams("#test&input=keys=demo.json")!.input;
+  expect(input).toBe("keys=demo.json");
+  expect(inputUrl("http://localhost/game/index.html", input).href).toBe("http://localhost/game/keys%3Ddemo.json");
+  expect(() => parseTestParams("#test&fps=60=extra")).toThrow("must be a positive number");
+});
+
 test("frame times are i / fps, rounded to f32 like the native host's", () => {
   expect(frameTime(30, 60)).toBe(0.5);
   // f64 division then f32 rounding: what the WASM call does to the argument.

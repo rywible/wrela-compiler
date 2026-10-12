@@ -415,10 +415,9 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
         let pad = || -> Result<u32, String> {
             match o.get("pad") {
                 None => Ok(0),
-                Some(v) => v
-                    .as_u64()
-                    .filter(|&p| p < u64::from(PADS))
-                    .map(|p| p as u32)
+                Some(_) => number("pad")
+                    .flatten()
+                    .filter(|&p| p < PADS)
                     .ok_or_else(|| at("`pad` is 0, 1, 2 or 3")),
             }
         };
@@ -589,6 +588,26 @@ mod tests {
             let script = format!(r#"[{{"frame": {number}, "type": "text", "text": "x"}}]"#);
             let events = parse_script(&script).expect("a whole JSON number");
             assert_eq!(events[0].at, At::Frame(1));
+        }
+    }
+
+    #[test]
+    fn pad_numbers_neednt_use_integer_syntax() {
+        for number in ["1", "1.0", "1e0"] {
+            let script = format!(
+                r#"[{{"tick": 0, "type": "padpress", "button": "east", "pad": {number}}}]"#
+            );
+            let events = parse_script(&script).expect("a whole pad number");
+            assert_eq!(events[0].event, Event::pad_button(1, 1, 1.0, true));
+        }
+        for number in ["-1", "1.5", "4", "4294967297", "null", "true", "\"1\""] {
+            let script = format!(
+                r#"[{{"tick": 0, "type": "padpress", "button": "east", "pad": {number}}}]"#
+            );
+            assert_eq!(
+                parse_script(&script).expect_err("invalid pad"),
+                "event 0: `pad` is 0, 1, 2 or 3"
+            );
         }
     }
 

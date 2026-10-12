@@ -1356,13 +1356,7 @@ impl<'a> FnCheck<'a> {
     ) {
         // The callee's parameter types and result type, to see which arguments the result can
         // point into.
-        let sig = match &c.callee {
-            Callee::Fn { func, .. } | Callee::TraitMethod { method: func, .. } => {
-                let def = self.p.func(*func);
-                Some((def.params.iter().map(|ps| ps.ty).collect::<Vec<_>>(), def.ret))
-            }
-            _ => None,
-        };
+        let sig = self.call_signature(c);
         for (k, a) in c.args.iter().enumerate() {
             if let Some((params, ret)) = &sig
                 && let Some(&pt) = params.get(k)
@@ -1385,6 +1379,26 @@ impl<'a> FnCheck<'a> {
         }
     }
 
+    /// A call's signature with the types chosen at this call: a result of `T = String`
+    /// can't borrow an unrelated `i32` argument just because `T` was generic at its definition.
+    fn call_signature(&self, c: &Call) -> Option<(Vec<crate::ty::TyId>, crate::ty::TyId)> {
+        let (func, args) = match &c.callee {
+            Callee::Fn { func, args } => (*func, args.clone()),
+            Callee::TraitMethod { method, self_ty, trait_args, method_args } => (
+                *method,
+                std::iter::once(*self_ty)
+                    .chain(trait_args.iter().copied())
+                    .chain(method_args.iter().copied())
+                    .collect(),
+            ),
+            _ => return None,
+        };
+        let subst = crate::ty::Subst::from_pairs(&self.p.fn_all_generics(func), &args);
+        let resolved = |ty| crate::traits::normalize(self.p, self.p.types.subst(ty, &subst), None);
+        let def = self.p.func(func);
+        Some((def.params.iter().map(|ps| resolved(ps.ty)).collect(), resolved(def.ret)))
+    }
+
     /// What a call that returns a borrow struct returned (§6.6): each field borrows what the
     /// call's arguments could give it, as a projection-returning call's result does (§6.4). A
     /// `mut` field borrows the `mut` arguments, mutably; any other projection or run field
@@ -1401,12 +1415,7 @@ impl<'a> FnCheck<'a> {
         let ty = self.local(holder).ty;
         let crate::ty::TyKind::Adt(a, args) = self.p.types.kind(ty) else { return };
         let (a, args) = (*a, args.clone());
-        let params: Option<Vec<crate::ty::TyId>> = match &c.callee {
-            Callee::Fn { func, .. } | Callee::TraitMethod { method: func, .. } => {
-                Some(self.p.func(*func).params.iter().map(|ps| ps.ty).collect())
-            }
-            _ => None,
-        };
+        let params = self.call_signature(c).map(|(params, _)| params);
         let modes: Vec<RetMode> = self.p.adt_fields(a, None).iter().map(|f| f.mode).collect();
         let tys = self.p.fields_of(a, &args, None);
         for (i, (mode, fty)) in modes.into_iter().zip(tys).enumerate() {
@@ -1458,6 +1467,9 @@ impl<'a> FnCheck<'a> {
         }
         let (OperandKind::Copy(p) | OperandKind::Move(p, _)) = &o.kind else { return };
         for (loan, _) in self.resolve_loans(st, p) {
+            if self.reject_swizzle_return(&loan.place, o.span) {
+                return;
+            }
             let decl = self.local(loan.place.local);
             // A `mut` loan on a read-only place is E0512 where it's taken.
             let ok = matches!(
@@ -1479,6 +1491,29 @@ impl<'a> FnCheck<'a> {
                 return;
             }
         }
+    }
+
+    /// A call borrows several swizzled components through a copy in the current frame.
+    /// Returning a projection of that copy would let the result outlive its storage.
+    fn reject_swizzle_return(&mut self, place: &Place, span: Span) -> bool {
+        if !place.proj.iter().any(|p| matches!(p, Proj::Swizzle(cs) if cs.len() > 1)) {
+            return false;
+        }
+        if !self
+            .diags
+            .iter()
+            .any(|d| d.code == codes::E0702 && d.primary.as_ref().is_some_and(|l| l.span == span))
+        {
+            self.err(
+                Diagnostic::new(
+                    codes::E0702,
+                    span,
+                    "a function can't return a projection of several vector components yet",
+                )
+                .with_help("return a projection of the whole vector, and pick the components at the call site"),
+            );
+        }
+        true
     }
 
     /// A closure borrows its captures while the local holding it is live: mutably those it
@@ -1935,6 +1970,9 @@ impl<'a> FnCheck<'a> {
             return;
         }
         for t in self.resolve(st, place) {
+            if self.reject_swizzle_return(&t.place, ret_span) {
+                continue;
+            }
             let decl = self.local(t.place.local);
             match decl.kind {
                 LocalKind::User(thir::LocalKind::Param(Mode::Mut)) => {}
@@ -2199,4 +2237,91 @@ fn unused_locals(p: &Program, body: &Body) -> Vec<Diagnostic> {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn swizzle_projection_call_results_cannot_escape_copied_arguments() {
+        for source in [
+            "fn project(v: vec2) -> borrow vec2 { v }\n\
+             fn bad(v: vec3) -> borrow vec2 { project(v.yx) }\n",
+            "fn project(v: mut vec2) -> mut vec2 { mut v }\n\
+             fn bad(v: mut vec3) -> mut vec2 { mut project(mut v.yx) }\n",
+            "borrow struct View { value: borrow vec2 }\n\
+             fn project(v: vec2) -> View { View { value: v } }\n\
+             fn bad(v: vec3) -> View { project(v.yx) }\n",
+            "borrow struct View { value: mut vec2 }\n\
+             fn project(v: mut vec2) -> View { View { value: mut v } }\n\
+             fn bad(v: mut vec3) -> View { project(mut v.yx) }\n",
+            "fn project(v: vec2) -> borrow vec2 { v }\n\
+             fn bad(v: vec3) -> borrow vec2 {\n\
+                 borrow parts = v.yx\n\
+                 project(parts)\n\
+             }\n",
+        ] {
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0702"),
+                "accepted a result pointing into copied swizzle storage: {source}\n{diagnostics:#?}"
+            );
+        }
+        for source in [
+            "fn project(v: f32) -> borrow f32 { v }\n\
+             fn valid(v: vec3) -> borrow f32 { project(v.y) }\n",
+            "fn project(v: vec2) -> borrow vec2 { v }\n\
+             fn valid(v: vec3) -> vec2 {\n\
+                 borrow parts = project(v.yx)\n\
+                 parts\n\
+             }\n",
+        ] {
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(source), &mut diagnostics);
+            assert!(!wrela_diag::has_errors(&diagnostics), "{source}\n{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn generic_projection_results_borrow_only_arguments_that_can_hold_the_result() {
+        let source = "
+fn first<T>(value: T, marker: i32) -> borrow T { value }
+
+fn inspect(value: String, marker: mut i32) -> u32 {
+    borrow held = first(value, marker)
+    marker += 1
+    held.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+
+        let conflicting = source
+            .replace("value: String", "value: mut String")
+            .replace("marker += 1", "value = String::new()");
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(&conflicting), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| d.code.as_str() == "E0507"),
+            "the result must still borrow its String argument: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn generic_borrow_struct_results_borrow_only_arguments_that_can_hold_the_fields() {
+        let source = "
+borrow struct View<T> { value: borrow T }
+fn view<T, M>(value: T, marker: M) -> View<T> { View { value } }
+
+fn inspect(value: String, marker: mut i32) -> u32 {
+    let held = view(value, marker)
+    marker += 1
+    held.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
 }

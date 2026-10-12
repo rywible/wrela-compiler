@@ -103,6 +103,39 @@ fn decodes_what_it_encodes() {
     }
 }
 
+#[test]
+fn texture_write_pads_only_the_command_payload() {
+    let batch = Encoder::new()
+        .create_texture(1, 1, 1, TextureFormat::R16Float, false)
+        .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
+        .destroy_texture(1)
+        .finish();
+    let cmds = decode(&batch).expect("a two-byte texture write is word-aligned");
+    assert_eq!(
+        cmds[1],
+        Command::WriteTexture { handle: 1, x: 0, y: 0, width: 1, height: 1, data: &[0x00, 0x3c] }
+    );
+    assert_eq!(cmds[2], Command::DestroyTexture { handle: 1 });
+    let mut checker = crate::check::Checker::new(&crate::Manifest::new("game.wasm"));
+    for cmd in cmds {
+        checker.check(&cmd).expect("exact texel bytes reach the checker");
+    }
+}
+
+#[test]
+fn malformed_host_service_has_the_browser_decoder_error() {
+    let mut batch = Encoder::new().host_request(1, "x", &[1, 2, 3]).finish();
+    batch[HEADER_LEN + COMMAND_HEADER_LEN + 12] = 0xff;
+    assert_eq!(
+        decode(&batch).expect_err("a service isn't UTF-8"),
+        StreamError::BadPayload {
+            opcode: Opcode::HostRequest,
+            at: HEADER_LEN,
+            why: "the service isn't UTF-8",
+        }
+    );
+}
+
 /// Every command the golden batch holds decodes to what was encoded.
 #[test]
 fn the_golden_batch_round_trips() {

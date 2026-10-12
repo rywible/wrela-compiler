@@ -3375,6 +3375,15 @@ fn compare_signatures(
         )));
     }
     for (&tp, &ip) in b.generics.iter().zip(&a.generics) {
+        if p.param(tp).is_const != p.param(ip).is_const {
+            let kind = |g| if p.param(g).is_const { "constant" } else { "type" };
+            return diags.push(mismatch(format!(
+                "`{}` is a {} parameter here, but a {} parameter in the trait",
+                p.param(ip).name,
+                kind(ip),
+                kind(tp),
+            )));
+        }
         subst.insert(tp, p.types.param(ip));
     }
     // A generic parameter can't need more than the trait's does: callers check the trait's.
@@ -3394,6 +3403,34 @@ fn compare_signatures(
                 p.param(ip).name,
                 p.display_trait_ref(extra)
             )));
+        }
+        if let Some(needed) = p.param(ip).fn_bound {
+            let accepts = p.param(tp).fn_bound.is_some_and(|allowed| {
+                let allowed =
+                    crate::traits::normalize(p, p.types.subst(allowed, &subst), Some(imp));
+                let needed = crate::traits::normalize(p, needed, Some(imp));
+                match (p.types.kind(allowed), p.types.kind(needed)) {
+                    (TyKind::FnPtr(ap, ar, af), TyKind::FnPtr(np, nr, nf)) => {
+                        ap == np
+                            && ar == nr
+                            && af.modes == nf.modes
+                            && nf
+                                .attrs()
+                                .into_iter()
+                                .zip(af.attrs())
+                                .all(|((_, need), (_, allowed))| !need || allowed)
+                    }
+                    (TyKind::Error, _) | (_, TyKind::Error) => true,
+                    _ => false,
+                }
+            });
+            if !accepts {
+                return diags.push(mismatch(format!(
+                    "`{}` needs `{}` here, but the trait's bound does not require it",
+                    p.param(ip).name,
+                    p.display_ty(needed),
+                )));
+            }
         }
     }
     if a.params.len() != b.params.len() {
@@ -3832,6 +3869,57 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use wrela_diag::FileId;
+
+    fn collect_source(text: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        collect(crate::test_units(text), &PackageInfo::std_and_program(), &mut diagnostics);
+        diagnostics
+    }
+
+    #[test]
+    fn trait_method_impl_cannot_add_or_change_a_function_bound() {
+        for (trait_bound, impl_bound) in [
+            ("", ": fn() -> u32"),
+            (": fn() -> u32", ": fn(i32) -> u32"),
+            (": fn() -> u32", ": @deterministic fn() -> u32"),
+        ] {
+            let source = format!(
+                "trait Call {{ fn call<T{trait_bound}>(value: T) -> u32 }}\n\
+                 struct Caller {{}}\n\
+                 impl Call for Caller {{ fn call<T{impl_bound}>(value: T) -> u32 {{ 0 }} }}\n"
+            );
+            let diagnostics = collect_source(&source);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0405"),
+                "accepted the stronger bound in {source}: {diagnostics:#?}"
+            );
+        }
+        for impl_bound in ["", ": fn() -> u32"] {
+            let source = format!(
+                "trait Call {{ fn call<T: @deterministic fn() -> u32>(value: T) -> u32 }}\n\
+                 struct Caller {{}}\n\
+                 impl Call for Caller {{ fn call<T{impl_bound}>(value: T) -> u32 {{ 0 }} }}\n"
+            );
+            let diagnostics = collect_source(&source);
+            assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn trait_method_impl_preserves_constant_parameter_kinds() {
+        for (trait_param, impl_param) in [("T", "const T: u32"), ("const T: u32", "T")] {
+            let source = format!(
+                "trait Call {{ fn call<{trait_param}>() -> u32 }}\n\
+                 struct Caller {{}}\n\
+                 impl Call for Caller {{ fn call<{impl_param}>() -> u32 {{ 0 }} }}\n"
+            );
+            let diagnostics = collect_source(&source);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0405"),
+                "accepted different generic parameter kinds in {source}: {diagnostics:#?}"
+            );
+        }
+    }
 
     #[test]
     fn import_alias_cannot_share_a_module_name() {

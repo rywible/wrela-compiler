@@ -201,6 +201,10 @@ impl Watcher {
 
     /// Builds the program as its files are now, into the next version's directory.
     fn build(&mut self) -> Change {
+        if let Ok(packages) = crate::packages(&self.pkg) {
+            self.dirs = packages.into_iter().map(|(_, dir)| dir).collect();
+            self.seen = scan(&self.dirs, &self.seen);
+        }
         let out = match crate::build_lifted(&self.pkg, &self.lift, self.kind) {
             Ok(out) => out,
             Err(why) => return Change::Failed(why),
@@ -410,6 +414,15 @@ pub fn serve(
 /// A live build owned below `<pkg>/build` must not escape through a link in that path. Other
 /// callers may choose an unrelated output directory; its final component is still never a link.
 fn check_output_path(pkg: &Path, out: &Path) -> Result<(), String> {
+    if let (Ok(package), Ok(output)) = (pkg.canonicalize(), out.canonicalize())
+        && package.starts_with(&output)
+    {
+        return Err(format!(
+            "the live output {} contains the source package {}; choose a directory of its own",
+            out.display(),
+            pkg.display()
+        ));
+    }
     let build = pkg.join("build");
     let root = if out.starts_with(&build) { build.as_path() } else { out };
     crate::ensure_no_symlink_path(root, out)
@@ -542,6 +555,56 @@ fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_output_cannot_contain_the_source_package() {
+        let root = std::env::temp_dir().join(format!("wrela-live-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("program");
+        std::fs::create_dir_all(&pkg).expect("package");
+        for out in [&root, &pkg] {
+            assert!(
+                check_output_path(&pkg, out).is_err(),
+                "starting the server would delete its package at {}",
+                out.display()
+            );
+        }
+        assert!(check_output_path(&pkg, &pkg.join("build/live")).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_rebuild_watches_new_dependencies() {
+        let root = std::env::temp_dir().join(format!("wrela-live-new-dep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("program");
+        let dep = root.join("library");
+        std::fs::create_dir_all(&pkg).expect("program directory");
+        std::fs::create_dir_all(&dep).expect("dependency directory");
+        std::fs::write(
+            pkg.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("program");
+        std::fs::write(dep.join("value.wrela"), "pub fn value() -> f32 { 0.5 }\n")
+            .expect("dependency");
+        let mut watcher =
+            Watcher::start(&pkg, &pkg.join("build/live"), &[], crate::BuildKind::default())
+                .expect("watcher");
+        std::fs::write(
+            pkg.join("wrela.toml"),
+            "[dependencies]\nlibrary = { path = \"../library\" }\n",
+        )
+        .expect("new dependency");
+        assert!(matches!(watcher.poll(), Some(Change::Built { .. })));
+        std::fs::write(dep.join("value.wrela"), "pub fn value() -> f32 { 0.75 }\n")
+            .expect("dependency edit");
+        assert!(
+            matches!(watcher.poll(), Some(Change::Built { .. })),
+            "the dependency edit must rebuild"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
     use std::io::{Read, Write};
 
     /// A page opened after a literal-only edit loads the newest build, then receives that edit:

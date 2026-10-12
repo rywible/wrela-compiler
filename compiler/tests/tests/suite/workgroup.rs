@@ -26,6 +26,22 @@ fn get(host: &mut Host, name: &str) -> u32 {
 
 #[test]
 #[ignore = "needs a GPU"]
+fn atomic_map_keeps_all_u32_payloads_and_wrapping_sums() {
+    let buffers = crate::first_frame_buffers("workgroup", 2);
+    assert_eq!(
+        wrela_tests::u32s(&buffers[0]),
+        [1, u32::MAX, 0, u32::MAX, 1, u32::MAX, 1, 0, 1, 1, u32::MAX, 0],
+        "insert/get and add must preserve a value equal to the empty-key sentinel",
+    );
+    assert_eq!(
+        wrela_tests::u32s(&buffers[1]),
+        [0, 63, 1],
+        "64 adds wrap once; one winning insert of MAX and 64 adds commute to 63",
+    );
+}
+
+#[test]
+#[ignore = "needs a GPU"]
 fn shared_memory_atomics_appends_and_maps_give_what_they_should() {
     let (dir, _) = page("compiler/tests/workgroup", "workgroup-native");
     let (_, mut host) = native(&dir);

@@ -35,6 +35,7 @@ export type Event =
   | { kind: "copyBufferToTexture"; from: string; fromOffset: number; texture: string; origin: unknown; bytesPerRow: number; rowsPerImage: number; size: unknown }
   | { kind: "dispatchIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
+  | { kind: "drawIndexedIndirect"; pipeline: string; buffer: string; offset: number; indices: string }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
   | { kind: "copy"; from: string; to: string };
 
@@ -53,6 +54,7 @@ export class FakeDevice {
   readonly passLabels: string[] = [];
   readonly buffers: FakeBuffer[] = [];
   readonly textures: FakeTexture[] = [];
+  readonly querySets: { destroyed: boolean; destroy(): void }[] = [];
   readonly samplers: GPUSamplerDescriptor[] = [];
   /** Render pipelines made on demand (not at load), by label and target formats. */
   /** The render pipelines made at a draw (`createRenderPipeline`), and those made at load
@@ -128,6 +130,12 @@ export class FakeDevice {
     };
     this.textures.push(texture);
     return texture;
+  }
+
+  createQuerySet() {
+    const queries = { destroyed: false, destroy() { this.destroyed = true; } };
+    this.querySets.push(queries);
+    return queries;
   }
 
   createSampler(desc: GPUSamplerDescriptor) {
@@ -214,6 +222,7 @@ export class FakeDevice {
       let pipeline = "";
       let bindGroup: FakeBindGroup | null = null;
       let offsets: number[] = [];
+      let indices = "";
       return {
         setPipeline(p: { label: string }) {
           pipeline = p.label;
@@ -234,10 +243,17 @@ export class FakeDevice {
         drawIndirect(b: FakeBuffer, offset: number) {
           events.push({ kind: "drawIndirect", pipeline, buffer: b.label, offset });
         },
+        setIndexBuffer(b: FakeBuffer) {
+          indices = b.label;
+        },
+        drawIndexedIndirect(b: FakeBuffer, offset: number) {
+          events.push({ kind: "drawIndexedIndirect", pipeline, buffer: b.label, offset, indices });
+        },
         end() {},
       };
     };
     return {
+      resolveQuerySet() {},
       beginComputePass: (desc?: GPUComputePassDescriptor) => {
         labels.push(desc?.label ?? "");
         return pass();

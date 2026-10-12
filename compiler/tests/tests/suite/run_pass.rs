@@ -83,6 +83,10 @@ fn same(a: &Value, b: &Value) -> bool {
 
 fn run_case(path: &Path) -> Result<usize, String> {
     let name = path.file_stem().expect("name").to_string_lossy().into_owned();
+    run_case_named(path, &name)
+}
+
+fn run_case_named(path: &Path, name: &str) -> Result<usize, String> {
     let dir = scratch(&format!("run-pass/{name}"));
     let main = if path.is_dir() {
         copy_dir(path, &dir);
@@ -155,6 +159,25 @@ fn run_case(path: &Path) -> Result<usize, String> {
         }
     }
     if problems.is_empty() { Ok(expects.len()) } else { Err(problems.join("\n")) }
+}
+
+#[test]
+fn enum_clones_preserve_discriminants() {
+    let path = repo_root().join("compiler/tests/run/enum_discriminants.wrela");
+    run_case_named(&path, "enum-clone-discriminants").expect("enum clones keep their variant");
+}
+
+#[test]
+fn closures_write_back_mutable_swizzle_arguments() {
+    let path = repo_root().join("compiler/tests/run/swizzles.wrela");
+    run_case_named(&path, "closure-swizzle-arguments")
+        .expect("closures write their arguments back");
+}
+
+#[test]
+fn erased_array_accesses_still_check_bounds() {
+    let path = repo_root().join("compiler/tests/run/erased_array_bounds.wrela");
+    run_case_named(&path, "erased-array-bounds").expect("erased elements still check bounds");
 }
 
 #[test]

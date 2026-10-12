@@ -44,6 +44,7 @@
 // tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
 import type { Loaded } from "./messages.ts";
+import { pathUrl } from "./path.ts";
 
 export interface TestParams {
   frames: number;
@@ -132,7 +133,9 @@ export function parseTestParams(hash: string): TestParams | null {
   const [, ...pairs] = hash.replace(/^#/, "").split("&");
   const params = { ...TEST_DEFAULTS };
   for (const pair of pairs) {
-    const [key, value = ""] = pair.split("=", 2);
+    const separator = pair.indexOf("=");
+    const key = separator < 0 ? pair : pair.slice(0, separator);
+    const value = separator < 0 ? "" : pair.slice(separator + 1);
     if (key === "input") {
       if (
         value === "" ||
@@ -158,7 +161,7 @@ export function parseTestParams(hash: string): TestParams | null {
 }
 
 /** A script's literal path under the page, including percent signs that look like URL escapes. */
-export const inputUrl = (base: string, path: string): URL => new URL(path.replaceAll("%", "%25"), base);
+export const inputUrl = pathUrl;
 
 /** The time of frame `i`, as both hosts compute it (runtime/abi `ticks`' `frame_time`, which the
  * vectors check): `i / fps` (the WASM call rounds it to f32). */

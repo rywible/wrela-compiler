@@ -133,9 +133,9 @@ pub fn format_like(old: &str, v: f32) -> Option<String> {
     let reads = |s: &str| literal_value(&format!("{s}{suffix}")) == Some(v);
     if let Some(e) = exp_text {
         // Keep the exponent: the mantissa carries the change.
-        let k: i32 = e[1..].parse().ok()?;
+        let k: i32 = e[1..].replace('_', "").parse().ok()?;
         let m = target / 10f64.powi(k);
-        for d in decimals.max(1)..=17 {
+        for d in decimals.max(1)..=decimal_limit(m, decimals) {
             let s = format!("{m:.d$}{e}");
             if reads(&s) {
                 return Some(format!("{s}{suffix}"));
@@ -150,13 +150,20 @@ pub fn format_like(old: &str, v: f32) -> Option<String> {
             return Some(format!("{s}{suffix}"));
         }
     }
-    for d in decimals.max(1)..=17 {
+    for d in decimals.max(1)..=decimal_limit(target, decimals) {
         let s = format!("{target:.d$}");
         if reads(&s) {
             return Some(format!("{s}{suffix}"));
         }
     }
     None
+}
+
+/// Seventeen significant decimal digits round-trip an `f64`; fixed-point text also needs
+/// the zeroes before those digits, and never drops the source literal's decimal places.
+fn decimal_limit(value: f64, decimals: usize) -> usize {
+    let zeroes = if value > 0.0 && value < 1.0 { (-value.log10()).ceil() as usize } else { 0 };
+    decimals.max(zeroes + 17)
 }
 
 /// The tokens of `text` but its line breaks and its end.
@@ -364,8 +371,19 @@ fn changed_lines(old: &str, new: &str) -> Vec<(u32, String, String)> {
         .collect()
 }
 
-/// Writes each file's new text (atomically: a whole file replaces the old). The paths written.
+/// Refuses all writes if a file's planned hash is stale, then writes each new text atomically
+/// (a whole file replaces the old). The paths written.
 pub fn write(root: &Path, planned: &[FileEdit]) -> std::io::Result<Vec<PathBuf>> {
+    for f in planned {
+        let path = root.join(&f.file);
+        let text = std::fs::read(&path)?;
+        if crate::lift::file_hash(&text) != f.old_hash {
+            return Err(std::io::Error::other(format!(
+                "{} changed since the edits were planned: nothing is written",
+                f.file
+            )));
+        }
+    }
     let mut out = Vec::new();
     for f in planned {
         let path = root.join(&f.file);
@@ -454,6 +472,50 @@ pub fn parse_edits(text: &str) -> Result<Vec<LiteralEdit>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tiny_values_and_long_decimal_styles_read_back_exactly() {
+        for (old, value) in [
+            ("0.5", f32::from_bits(1)),
+            ("0.5cm", f32::MIN_POSITIVE),
+            ("1e3", 1e-30),
+            ("0.50000000000000000000", 0.75),
+        ] {
+            let text = format_like(old, value).expect("every finite f32 has a literal");
+            assert_eq!(literal_value(&text), Some(value), "{old} as {value}: {text}");
+        }
+        assert_eq!(
+            format_like("0.50000000000000000000", 0.75),
+            Some("0.75000000000000000000".into())
+        );
+    }
+
+    #[test]
+    fn a_stale_file_refuses_all_planned_writes() {
+        let dir = std::env::temp_dir().join(format!("wrela-edit-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let text = "fn f() -> f32 { 0.5 }\n";
+        for file in ["a.wrela", "b.wrela"] {
+            std::fs::write(dir.join(file), text).expect("source");
+        }
+        let start = text.find("0.5").expect("literal") as u32;
+        let edits = ["a.wrela", "b.wrela"].map(|file| LiteralEdit {
+            file: file.into(),
+            start,
+            end: start + 3,
+            text: "0.5".into(),
+            hash: crate::lift::file_hash(text.as_bytes()),
+            value: 0.75,
+        });
+        let planned = plan(&dir, &edits).expect("plans");
+        let changed = "fn f() -> f32 { 1.0 }\n";
+        std::fs::write(dir.join("b.wrela"), changed).expect("concurrent edit");
+        assert!(write(&dir, &planned).is_err(), "a stale plan cannot overwrite sources");
+        assert_eq!(std::fs::read_to_string(dir.join("a.wrela")).expect("first source"), text);
+        assert_eq!(std::fs::read_to_string(dir.join("b.wrela")).expect("changed source"), changed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn styles_are_kept() {

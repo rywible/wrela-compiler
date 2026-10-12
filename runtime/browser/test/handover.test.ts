@@ -58,6 +58,13 @@ test("a build path's percent escapes stay literal during resolution", () => {
   expect(handOvers.baseOf("../%2e%2e/second")).toBe("http://localhost/tower/%252e%252e/second/");
 });
 
+test("build paths keep spaces and controls literal while allowing one parent", () => {
+  const handOvers = new HandOvers(new FakeDevice().gpu, () => RUNNING, () => []);
+  expect(handOvers.baseOf(" /admin")).toBe("http://localhost/tower/first/%20/admin/");
+  expect(handOvers.baseOf("\t/admin")).toBe("http://localhost/tower/first/%09/admin/");
+  expect(handOvers.baseOf("../next ")).toBe("http://localhost/tower/next%20/");
+});
+
 test("a build that isn't there fails, each time it's asked for", async () => {
   const { handOvers } = await running();
   const why = "the build at http://localhost/tower/missing/ isn't ready: can't fetch http://localhost/tower/missing/manifest.json: 404";

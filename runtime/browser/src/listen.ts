@@ -34,21 +34,42 @@ export function listen(
     return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy] as const;
   };
   const put = (event: Uint8Array) => ring.write(event, now());
+  const keys = new Set<number>();
+  const pointers = new Map<number, { x: number; y: number; buttons: Set<number> }>();
+  const releasePointer = (id: number) => {
+    const pointer = pointers.get(id);
+    if (!pointer) return;
+    for (const button of pointer.buttons) put(pointerEvent(EventKind.PointerUp, pointer.x, pointer.y, button, 0));
+    pointers.delete(id);
+  };
   canvas.addEventListener("pointermove", (e) => {
     // Coalesced moves arrive as one: the program needs where the pointer is, not each step.
     const [x, y] = at(e);
+    const pointer = pointers.get(e.pointerId);
+    if (pointer) Object.assign(pointer, { x, y });
     put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
   });
   canvas.addEventListener("pointerdown", (e) => {
     canvas.setPointerCapture(e.pointerId);
     const [x, y] = at(e);
-    put(pointerEvent(EventKind.PointerDown, x, y, buttonOf(e.button), modifiersOf(e)));
+    const button = buttonOf(e.button);
+    const pointer = pointers.get(e.pointerId) ?? { x, y, buttons: new Set<number>() };
+    Object.assign(pointer, { x, y });
+    pointer.buttons.add(button);
+    pointers.set(e.pointerId, pointer);
+    put(pointerEvent(EventKind.PointerDown, x, y, button, modifiersOf(e)));
     e.preventDefault();
   });
   canvas.addEventListener("pointerup", (e) => {
     const [x, y] = at(e);
-    put(pointerEvent(EventKind.PointerUp, x, y, buttonOf(e.button), modifiersOf(e)));
+    const button = buttonOf(e.button);
+    const pointer = pointers.get(e.pointerId);
+    pointer?.buttons.delete(button);
+    if (pointer?.buttons.size === 0) pointers.delete(e.pointerId);
+    put(pointerEvent(EventKind.PointerUp, x, y, button, modifiersOf(e)));
   });
+  canvas.addEventListener("pointercancel", (e) => releasePointer(e.pointerId));
+  canvas.addEventListener("lostpointercapture", (e) => releasePointer(e.pointerId));
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
   canvas.addEventListener(
     "wheel",
@@ -62,7 +83,9 @@ export function listen(
     { passive: false },
   );
   window.addEventListener("keydown", (e) => {
-    put(keyEvent(true, keyCode(e.code), e.repeat, modifiersOf(e)));
+    const key = keyCode(e.code);
+    keys.add(key);
+    put(keyEvent(true, key, e.repeat, modifiersOf(e)));
     // A printable key types its text, unless Control or Meta make it a shortcut.
     if (e.key.length > 0 && [...e.key].length === 1 && !e.ctrlKey && !e.metaKey) {
       put(textEvent(e.key.codePointAt(0)!));
@@ -71,7 +94,14 @@ export function listen(
     if (["Tab", "Space", "Backspace", "ArrowUp", "ArrowDown", "PageUp", "PageDown"].includes(e.code)) e.preventDefault();
   });
   window.addEventListener("keyup", (e) => {
-    put(keyEvent(false, keyCode(e.code), false, modifiersOf(e)));
+    const key = keyCode(e.code);
+    keys.delete(key);
+    put(keyEvent(false, key, false, modifiersOf(e)));
+  });
+  window.addEventListener("blur", () => {
+    for (const key of keys) put(keyEvent(false, key, false, 0));
+    keys.clear();
+    for (const id of pointers.keys()) releasePointer(id);
   });
 }
 
@@ -112,10 +142,10 @@ export function padChanges(pads: readonly (PadReading | null)[], last: (PadState
     if (pad === null || !pad.connected || pad.mapping !== "standard") {
       if (was !== null) {
         for (let b = 0; b < was.pressed.length; b++) {
-          if (was.pressed[b] || was.values[b] !== 0) out.push(padButtonEvent(i, b, 0, false));
+          if (was.pressed[b] || (was.values[b] ?? 0) !== 0) out.push(padButtonEvent(i, b, 0, false));
         }
         for (let a = 0; a < was.axes.length; a++) {
-          if (was.axes[a] !== 0) out.push(padAxisEvent(i, a, 0));
+          if ((was.axes[a] ?? 0) !== 0) out.push(padAxisEvent(i, a, 0));
         }
         last[i] = null;
       }
@@ -151,8 +181,7 @@ export function pollPads(ring: InputRing, now: () => number, active: () => boole
   if (typeof navigator.getGamepads !== "function") return;
   const last: (PadState | null)[] = Array.from({ length: PADS }, () => null);
   const poll = () => {
-    const changes = padChanges(navigator.getGamepads(), last);
-    if (active()) for (const event of changes) ring.write(event, now());
+    if (active()) for (const event of padChanges(navigator.getGamepads(), last)) ring.write(event, now());
     requestAnimationFrame(poll);
   };
   requestAnimationFrame(poll);

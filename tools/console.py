@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -13,6 +14,8 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 MAX_FILE = 25 * 1024 * 1024
 MAX_FILES = 20_000
+# The project wrapper owns these paths beside its game build directories.
+RESERVED_BUILD_NAMES = {"releases", "_headers", "_redirects", "index.html", "LICENSE"}
 
 
 def component(value):
@@ -50,6 +53,8 @@ def read_config(path):
         if game["session"] not in game["builds"]:
             raise ValueError("the session build is missing")
         for name, package in game["builds"].items():
+            if name in RESERVED_BUILD_NAMES:
+                raise ValueError(f"reserved build name: {name!r}")
             component(name)
             source = (ROOT / package).resolve()
             if not source.is_relative_to(ROOT) or not (source / "wrela.toml").is_file():
@@ -164,6 +169,14 @@ def package(config, output, covers, previous=None):
         (home / filename).write_bytes(pixels)
         catalog.append("\t".join([game["id"], game["title"], child + "/" + game["session"] + "/",
                                    filename, str(width), str(height)]))
+    page = home / "index.html"
+    page.write_text(page.read_text().replace("background: #000;", "background: #14223A;"))
+    for project in [console, *config["games"]]:
+        directory = output / project["project"]
+        namespace = "console" if project is console else project["id"]
+        for document in directory.rglob("index.html"):
+            document.write_text(document.read_text().replace(
+                "<head>", f'<head>\n<meta name="wrela-storage" content="{namespace}">'))
     # Fingerprint complete compiled output. Game URLs remain immutable across deployments,
     # while a generic storage namespace in each bootstrap stays stable across releases.
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode())
@@ -182,19 +195,13 @@ def package(config, output, covers, previous=None):
         catalog[index] = "\t".join(parts)
     (home / "catalog.tsv").write_text("\n".join(catalog) + "\n")
     (home / "_headers").write_text(headers(parent, [origin(g["domain"]) for g in config["games"]]))
-    page = home / "index.html"
-    page.write_text(page.read_text().replace("background: #000;", "background: #14223A;"))
     for project in [console, *config["games"]]:
         directory = output / project["project"]
-        namespace = "console" if project is console else project["id"]
         if project is console:
             entry = (directory / "index.html").read_text()
             entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">')
-            entry = entry.replace("<head>", '<head>\n<meta name="wrela-storage" content="console">')
         else:
             entry = None
-            for document in directory.rglob("index.html"):
-                document.write_text(document.read_text().replace("<head>", f'<head>\n<meta name="wrela-storage" content="{namespace}">'))
         versioned = directory / "releases" / release
         versioned.mkdir(parents=True)
         for asset in list(directory.iterdir()):
@@ -225,18 +232,28 @@ def main():
     parser.add_argument("--previous", type=Path, help="prior verified release bundle, to retain pinned assets")
     parser.add_argument("--cover", action="append", default=[], metavar="GAME=PNG")
     args = parser.parse_args()
-    # Admission covers all builds and packaging; nested tools/wrela sees the same lease.
-    from jobs import admitted, run
-    if not admitted():
-        return run("build", [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+    # Keep paths relative to the caller while admission belongs to this script's checkout.
+    args.config = args.config.resolve()
+    args.output = args.output.resolve()
+    args.previous = args.previous.resolve() if args.previous else None
     covers = {}
     for value in args.cover:
         key, sep, path = value.partition("=")
         if not sep:
             parser.error("--cover must be GAME=PNG")
         covers[component(key)] = Path(path).resolve()
+    os.chdir(ROOT)
+    # Admission covers all builds and packaging; nested tools/wrela sees the same lease.
+    from jobs import admitted, run
+    if not admitted():
+        arguments = ["--config", str(args.config), "--output", str(args.output)]
+        if args.previous is not None:
+            arguments += ["--previous", str(args.previous)]
+        for key, path in covers.items():
+            arguments += ["--cover", f"{key}={path}"]
+        return run("build", [sys.executable, str(Path(__file__).resolve()), *arguments])
     try:
-        report = package(read_config(args.config), args.output.resolve(), covers, args.previous.resolve() if args.previous else None)
+        report = package(read_config(args.config), args.output, covers, args.previous)
     except (ValueError, KeyError, OSError, ImportError, subprocess.CalledProcessError) as error:
         print(f"console release: {error}", file=sys.stderr)
         return 1

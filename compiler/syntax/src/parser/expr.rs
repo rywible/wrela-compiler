@@ -892,7 +892,7 @@ impl<'a> Parser<'a> {
                 Some([a, b]) => {
                     let op = if name == "assert_eq" { "==" } else { "!=" };
                     let msg = format!("{a} {op} {b} is false");
-                    d.with_fix("call `assert`", span, format!("assert({a} {op} {b}, {msg:?})"))
+                    d.with_fix("call `assert`", span, format!("assert(({a}) {op} ({b}), {msg:?})"))
                 }
                 _ => d.with_help("call `assert(a == b, message)`"),
             },
@@ -1423,7 +1423,8 @@ fn is_postfix_shaped(e: &Expr) -> bool {
 
 /// A Rust format string and its arguments (as written) as a wrela f-string: `{}` takes the
 /// next argument, `{name}` and `{0}` name one, and a spec wrela has is kept. `None` when it
-/// doesn't fit an f-string (another format spec, an argument with quotes or braces).
+/// doesn't fit an f-string (another format spec, an argument with quotes or braces), or the
+/// holes would duplicate, reorder or discard an argument's evaluation.
 fn f_string(literal: &str, args: &[String]) -> Option<String> {
     let inner = literal.strip_prefix('"')?.strip_suffix('"')?;
     if args.iter().any(|a| a.contains(['"', '{', '}', '\n'])) {
@@ -1431,6 +1432,7 @@ fn f_string(literal: &str, args: &[String]) -> Option<String> {
     }
     let mut out = String::from("f\"");
     let mut next = 0;
+    let mut used = Vec::new();
     let mut chars = inner.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -1461,12 +1463,16 @@ fn f_string(literal: &str, args: &[String]) -> Option<String> {
                 };
                 let value = if what.is_empty() {
                     let v = args.get(next)?.clone();
+                    used.push(next);
                     next += 1;
                     v
                 } else if let Ok(i) = what.parse::<usize>() {
+                    used.push(i);
                     args.get(i)?.clone()
-                } else {
+                } else if crate::lexer::is_name(what) {
                     what.to_string()
+                } else {
+                    return None;
                 };
                 let spec = match spec {
                     None | Some("") => String::new(),
@@ -1482,12 +1488,14 @@ fn f_string(literal: &str, args: &[String]) -> Option<String> {
             c => out.push(c),
         }
     }
-    if next < args.len() && inner.contains("{}") {
+    // A macro evaluates its arguments once in source order; f-string holes evaluate their
+    // expressions in hole order. Only offer a direct replacement when those orders match.
+    if !used.into_iter().eq(0..args.len()) {
         return None;
     }
     out.push('"');
     // A plain string needs no `f`.
-    if !out.contains('{') {
+    if !out.contains(['{', '}']) {
         out.remove(0);
     }
     Some(out)

@@ -309,11 +309,12 @@ impl G<'_, '_> {
 
     /// Runs `body` for the variant the enum at `p` holds: `if tag == v { body(v) }` for each.
     fn each_variant(&mut self, t: TyId, p: &ir::Place, mut body: impl FnMut(&mut Self, u32)) {
+        let Some(ty) = self.cx.lower_ty(self.mb, t, self.span) else { return };
         let u = self.mb.m.types.u32();
         let b = self.mb.m.types.bool();
         let tag = self.load(&p.with(ir::Proj::Field(0)), u);
         for v in 0..self.variants(t) {
-            let k = self.u32c(v);
+            let k = self.u32c(self.mb.m.types.tag(ty, v));
             let is = self.value(b, ir::Expr::Binary(ir::BinOp::Eq, tag, k));
             self.when(is, |g| body(g, v));
         }

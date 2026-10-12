@@ -281,6 +281,9 @@ export class Checker {
         const pass = cmd.pass;
         this.#clearColour(op, pass.clear);
         if (!Number.isFinite(pass.clearDepth)) throw err("the clear depth isn't a finite number");
+        if (pass.depth !== NONE && !pass.keepDepth && !(pass.clearDepth >= 0 && pass.clearDepth <= 1)) {
+          throw err("the clear depth isn't from 0 to 1");
+        }
         this.#scope.clear();
         this.#attachments = [];
         for (const t of [pass.color, pass.depth]) {

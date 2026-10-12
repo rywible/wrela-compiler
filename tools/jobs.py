@@ -114,22 +114,40 @@ def admitted():
 
 
 def fingerprint(cwd):
-    """Include dirty tracked and untracked inputs, not merely the branch name."""
+    """Include input content and file revisions, so editing then restoring still invalidates a pass."""
     from worktrees import checkout_root
     cwd = checkout_root(cwd)
     try:
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL).strip().decode()
-        digest = hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=cwd))
+        digest = hashlib.sha256()
+        def include(value):
+            digest.update(len(value).to_bytes(8, "big"))
+            digest.update(value)
+        include(subprocess.check_output(["git", "diff", "HEAD", "--binary"], cwd=cwd))
         names = subprocess.check_output(["git", "ls-files", "--others", "--exclude-standard", "-z"], cwd=cwd)
         for name in names.split(b"\0"):
             if name:
                 path = Path(cwd) / os.fsdecode(name)
-                digest.update(name)
+                include(name)
                 if path.is_symlink():
-                    digest.update(os.fsencode(os.readlink(path)))
+                    include(os.fsencode(os.readlink(path)))
                 elif path.is_file():
-                    digest.update(path.read_bytes())
-        return {"commit": head, "inputs": digest.hexdigest()}
+                    include(path.read_bytes())
+        # Contents alone cannot prove a frozen source tree: a command may have compiled an
+        # intermediate edit that was restored before it finished. ctime also records a write
+        # whose mtime was restored. Keep this separate from the input content digest.
+        revisions = hashlib.sha256()
+        tracked = subprocess.check_output(["git", "ls-files", "--cached", "-z"], cwd=cwd)
+        for name in sorted(set((tracked + names).split(b"\0")) - {b""}):
+            revisions.update(len(name).to_bytes(8, "big"))
+            revisions.update(name)
+            try:
+                stat = (Path(cwd) / os.fsdecode(name)).lstat()
+                revision = [stat.st_ino, stat.st_mode, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns]
+            except FileNotFoundError:
+                revision = None
+            revisions.update(json.dumps(revision).encode())
+        return {"commit": head, "inputs": digest.hexdigest(), "revisions": revisions.hexdigest()}
     except subprocess.CalledProcessError:
         return {"commit": None, "inputs": None}
 

@@ -332,8 +332,13 @@ fn numbers(a: &Args) -> Result<(), String> {
             break;
         };
         let bpm = 60.0 * per as f64 / (end - start);
-        let window = &samples
-            [(2.0 * start * RATE) as usize..((2.0 * end * RATE) as usize).min(samples.len())];
+        let from = (2.0 * start * RATE) as usize;
+        if from >= samples.len() {
+            break;
+        }
+        let to = ((2.0 * end * RATE) as usize).min(samples.len());
+        let window =
+            samples.get(from..to).ok_or("the take's beat times must be in increasing order")?;
         let mut voices = serde_json::Map::new();
         for (i, name) in t.voices.iter().enumerate() {
             let v: Vec<f64> = t

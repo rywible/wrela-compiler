@@ -9,6 +9,25 @@ use std::f64::consts::{PI, TAU};
 const RATE: f64 = 48000.0;
 
 #[test]
+fn invalid_sheet_bar_ranges_return_errors() {
+    let take = super::Take {
+        title: String::new(),
+        name: String::new(),
+        bars: 2,
+        beats_per_bar: 1,
+        seconds: 1.0,
+        voices: Vec::new(),
+        notes: Vec::new(),
+        sustain: Vec::new(),
+        soft: Vec::new(),
+        beats: vec![0.0, 0.5, 1.0],
+    };
+    for bars in [(0, 1), (2, 1), (1, 3), (1, u32::MAX)] {
+        assert!(super::sheet::draw(&take, &[], Some(bars)).is_err(), "accepted {bars:?}");
+    }
+}
+
+#[test]
 fn malformed_wav_chunks_return_errors_instead_of_panicking() {
     let path = std::env::temp_dir().join(format!("wrela-audio-bad-wav-{}.wav", std::process::id()));
     let header = b"RIFF\0\0\0\0WAVE";

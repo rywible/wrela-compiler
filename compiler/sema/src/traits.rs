@@ -721,8 +721,12 @@ pub fn can_hold(p: &Program, holder: TyId, target: TyId) -> bool {
             }
             TyKind::Tuple(ts) => ts.iter().any(|&t| go(p, t, target, seen)),
             TyKind::Adt(a, args) => {
-                // What it owns on the heap is in its type arguments.
-                if args.iter().any(|&t| go(p, t, target, seen)) {
+                // Std's core owners and GPU memory parameters hold data outside their
+                // fields. Ordinary generic types hold only their fields: `Handle<T>` names
+                // a `T`, but does not own one.
+                let indirect = explicit_drop(p, *a).is_some()
+                    || p.adt(*a).lang.is_some_and(Lang::is_invocation_safe);
+                if indirect && args.iter().any(|&t| go(p, t, target, seen)) {
                     return true;
                 }
                 p.field_lists(*a)
@@ -851,7 +855,8 @@ fn resolve_projections_in(p: &Program, ty: TyId, active: &mut Vec<TyId>) -> TyId
     p.types.map(ty, &mut |types, t| match types.kind(t) {
         TyKind::Projection { self_ty, trait_, trait_args, name } => {
             let self_ty = resolve_projections_in(p, *self_ty, active);
-            let r = TraitRef { trait_: *trait_, args: trait_args.clone() };
+            let args = trait_args.iter().map(|&a| resolve_projections_in(p, a, active)).collect();
+            let r = TraitRef { trait_: *trait_, args };
             let this = types.intern(TyKind::Projection {
                 self_ty,
                 trait_: r.trait_,
@@ -964,4 +969,108 @@ pub fn resolve_trait_method(
         subst.insert(*g, a);
     }
     Some((method, subst))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_resolves_associated_types_in_trait_arguments() {
+        let source = "
+trait Source { type Item }
+struct Inner {}
+impl Source for Inner { type Item = i32 }
+trait Transform<T> { type Item }
+struct Outer {}
+impl Transform<i32> for Outer { type Item = bool }
+";
+        let mut diagnostics = Vec::new();
+        let p = crate::collect::collect(
+            crate::test_units(source),
+            &crate::collect::PackageInfo::std_and_program(),
+            &mut diagnostics,
+        );
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        let adt = |name| {
+            AdtId(p.adts.iter().position(|a| a.name == name).expect("the declared type") as u32)
+        };
+        let trait_ = |name| {
+            TraitId(p.traits.iter().position(|t| t.name == name).expect("the declared trait") as u32)
+        };
+        let inner = p.types.intern(TyKind::Projection {
+            self_ty: p.types.adt(adt("Inner"), Vec::new()),
+            trait_: trait_("Source"),
+            trait_args: Vec::new(),
+            name: "Item".into(),
+        });
+        let outer = p.types.intern(TyKind::Projection {
+            self_ty: p.types.adt(adt("Outer"), Vec::new()),
+            trait_: trait_("Transform"),
+            trait_args: vec![inner],
+            name: "Item".into(),
+        });
+        assert_eq!(normalize(&p, outer, None), p.types.bool);
+    }
+
+    #[test]
+    fn associated_trait_arguments_normalize_after_a_generic_call() {
+        let source = "
+trait Source { type Item }
+struct Inner {}
+impl Source for Inner { type Item = i32 }
+trait Transform<T> {
+    type Item
+    fn item(self) -> Self::Item
+}
+struct Outer {}
+impl Transform<i32> for Outer {
+    type Item = bool
+    fn item(self) -> bool { true }
+}
+fn pick<S: Source, T: Transform<S::Item>>(value: T) -> T::Item { value.item() }
+pub fn inspect() -> bool { pick::<Inner, Outer>(Outer {}) }
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn can_hold_uses_storage_instead_of_phantom_type_arguments() {
+        let source = "
+struct Key<T> { index: u32 }
+struct Stored<T> { value: T }
+";
+        let mut diagnostics = Vec::new();
+        let p = crate::collect::collect(
+            crate::test_units(source),
+            &crate::collect::PackageInfo::std_and_program(),
+            &mut diagnostics,
+        );
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        let named = |name| {
+            let a = p.adts.iter().position(|a| a.name == name).expect("the declared type");
+            p.types.adt(AdtId(a as u32), vec![p.types.f32])
+        };
+        assert!(!can_hold(&p, named("Key"), p.types.f32));
+        assert!(can_hold(&p, named("Stored"), p.types.f32));
+        for (lang, expected) in
+            [(Lang::Handle, false), (Lang::Vec, true), (Lang::Box, true), (Lang::Arena, true)]
+        {
+            let a = p.lang_adt(lang).expect("the std type");
+            assert_eq!(can_hold(&p, p.types.adt(a, vec![p.types.f32]), p.types.f32), expected);
+        }
+        let source = "
+fn item(values: Arena<f32>, key: Handle<f32>) -> borrow f32 { values[key] }
+fn inspect(values: Arena<f32>, key: mut Handle<f32>, replacement: Handle<f32>) -> f32 {
+    borrow held = item(values, key)
+    key = replacement
+    held
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
 }

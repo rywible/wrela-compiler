@@ -207,6 +207,29 @@ fn batches() -> Vec<Value> {
     vec![
         batch("golden", &golden_batch()),
         batch(
+            "text runs preserve a leading Unicode BOM",
+            &Encoder::new()
+                .label("\u{feff}terrain")
+                .host_request(1, "\u{feff}test/echo", &[1, 2, 3])
+                .finish(),
+        ),
+        batch(
+            "a host service that isn't UTF-8",
+            &edit(
+                Encoder::new().host_request(1, "x", &[1, 2, 3]).finish(),
+                h + stream::COMMAND_HEADER_LEN + 12,
+                0xff,
+            ),
+        ),
+        batch(
+            "a texture write with a two-byte texel",
+            &Encoder::new()
+                .create_texture(1, 1, 1, TextureFormat::R16Float, false)
+                .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
+                .destroy_texture(1)
+                .finish(),
+        ),
+        batch(
             "decodes what it encodes",
             &Encoder::new()
                 .create_buffer(1, 64)
@@ -537,6 +560,15 @@ fn checks() -> Value {
     let max = crate::Limits::DEFAULT.max_buffer_size;
     let cases = vec![
         check(
+            "a texture write with a two-byte texel",
+            &m,
+            &Encoder::new()
+                .create_texture(1, 1, 1, TextureFormat::R16Float, false)
+                .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
+                .destroy_texture(1)
+                .finish(),
+        ),
+        check(
             "every command, used rightly",
             &m,
             &with_textures(&|e| {
@@ -705,6 +737,36 @@ fn checks() -> Value {
             "a clear colour that isn't finite",
             &m,
             &with_buffers(&|e| _ = e.begin_screen_pass([0.0, 0.0, f32::INFINITY, f32::NAN])),
+        ),
+        check(
+            "a depth clear below zero",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { clear_depth: -0.01, ..pass })),
+        ),
+        check(
+            "a depth clear above one",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { clear_depth: 1.01, ..pass })),
+        ),
+        check(
+            "a depth clear at zero",
+            &m,
+            &with_textures(&|e| _ = e.begin_pass(Pass { clear_depth: 0.0, ..pass }).end_pass()),
+        ),
+        check("a depth clear at one", &m, &with_textures(&|e| _ = e.begin_pass(pass).end_pass())),
+        check(
+            "an unused depth clear with a kept depth attachment",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { clear_depth: 2.0, keep_depth: true, ..pass }).end_pass();
+            }),
+        ),
+        check(
+            "an unused depth clear with no depth attachment",
+            &m,
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { clear_depth: 2.0, depth: stream::NONE, ..pass }).end_pass();
+            }),
         ),
         check(
             "each dispatch is its own scope",
@@ -1083,8 +1145,25 @@ fn manifests() -> Vec<Value> {
             ),
         ),
         manifest("too wide a workgroup", edited(&|m| compute(m, [512, 1, 1]))),
+        manifest("a workgroup product over u64", edited(&|m| compute(m, [u32::MAX; 3]))),
         manifest("too many invocations", edited(&|m| compute(m, [16, 16, 2]))),
         manifest("a binding used twice", edited(&|m| m.pipelines[0].bindings[0].binding = 0)),
+        manifest(
+            "the last binding in a bind group",
+            edited(&|m| m.pipelines[0].bindings[0].binding = 999),
+        ),
+        manifest(
+            "a resource binding over the bind group limit",
+            edited(&|m| m.pipelines[0].bindings[0].binding = 1000),
+        ),
+        manifest(
+            "a uniform binding over the bind group limit",
+            edited(&|m| m.pipelines[0].uniform.as_mut().expect("uniform").binding = 1000),
+        ),
+        manifest(
+            "a debug flag binding over the bind group limit",
+            edited(&|m| m.pipelines[0].debug_flag = Some(1000)),
+        ),
         manifest("a debug build's flag", edited(&|m| m.pipelines[0].debug_flag = Some(2))),
         manifest("a debug flag on a binding", edited(&|m| m.pipelines[0].debug_flag = Some(1))),
         manifest("a debug flag as a string", golden.replace("\"bindings\": [", "\"debug_flag\": \"2\",\n      \"bindings\": [")),
@@ -1094,6 +1173,34 @@ fn manifests() -> Vec<Value> {
                 if let Stage::Render { cull, depth_bias, .. } = &mut m.pipelines[1].stage {
                     *cull = Cull::Back;
                     *depth_bias = DepthBias { constant: 4, slope_scale: 2.0, clamp: 0.0 };
+                }
+            }),
+        ),
+        manifest(
+            "an unblendable integer target",
+            edited(&|m| {
+                if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
+                    *blend = true;
+                    *uint = true;
+                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Uint), depth: false }];
+                }
+            }),
+        ),
+        manifest(
+            "an unblendable float32 target",
+            edited(&|m| {
+                if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
+                    *blend = true;
+                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Float), depth: false }];
+                }
+            }),
+        ),
+        manifest(
+            "a blend with only a depth target",
+            edited(&|m| {
+                if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
+                    *blend = true;
+                    *targets = vec![RenderTarget { color: None, depth: true }];
                 }
             }),
         ),
@@ -1487,6 +1594,13 @@ fn input_scripts() -> Value {
   {"tick": 2, "type": "padbutton", "pad": 2, "button": "righttrigger", "pressed": true, "value": 0.5},
   {"tick": 3, "type": "padpress", "button": "east"},
   {"tick": 4, "type": "padbutton", "button": "south", "pressed": false}
+]"#,
+        ),
+        (
+            "whole pad numbers with decimal and exponent syntax",
+            r#"[
+  {"tick": 0, "type": "padpress", "button": "east", "pad": 1.0},
+  {"tick": 1, "type": "padaxis", "axis": "lefty", "value": -1, "pad": 2e0}
 ]"#,
         ),
         ("not an array", "{}"),

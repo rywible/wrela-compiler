@@ -33,6 +33,19 @@ fn join(a: &mut State, b: &State) {
     }
 }
 
+fn join_exit(a: &mut Option<State>, b: &State) {
+    match a {
+        Some(a) => join(a, b),
+        None => *a = Some(b.clone()),
+    }
+}
+
+#[derive(Default)]
+struct LoopExits {
+    breaks: Option<State>,
+    continues: Option<State>,
+}
+
 /// The hazards of the kernel whose entry point's function is `entry`.
 pub fn hazards(m: &Module, entry: FuncId) -> Vec<Hazard> {
     let wg: Vec<bool> = m.resources.iter().map(|r| r.kind == ResourceKind::Workgroup).collect();
@@ -61,12 +74,15 @@ impl Analysis<'_> {
         // On the GPU there's no recursion; this keeps a malformed module from looping.
         self.memo.insert((f, st.clone()), st.clone());
         // What it may have done by its `return`s, joined with what it does by its end.
-        let mut walk = Walk { an: self, func: f, at: None, ret: vec![0; st.len()] };
+        let mut walk =
+            Walk { an: self, func: f, at: None, ret: vec![0; st.len()], loops: Vec::new() };
         let mut s = st.clone();
         let body = &walk.an.m.functions[f.index()].body;
-        walk.block(body, &mut s);
+        let falls_through = walk.block(body, &mut s);
         let mut end = walk.ret;
-        join(&mut end, &s);
+        if falls_through {
+            join(&mut end, &s);
+        }
         self.memo.insert((f, st), end.clone());
         end
     }
@@ -84,13 +100,19 @@ struct Walk<'a, 'm> {
     at: Option<Span>,
     /// What the function may have done by any `return`.
     ret: State,
+    loops: Vec<LoopExits>,
 }
 
 impl Walk<'_, '_> {
-    fn block(&mut self, b: &[Stmt], st: &mut State) {
+    /// Whether this path reaches the end of the block. Exits keep the state at the exit,
+    /// before any barrier in the skipped part of the block.
+    fn block(&mut self, b: &[Stmt], st: &mut State) -> bool {
         for s in b {
-            self.stmt(s, st);
+            if !self.stmt(s, st) {
+                return false;
+            }
         }
+        true
     }
 
     /// A workgroup resource a place is in, if it's in one.
@@ -127,7 +149,7 @@ impl Walk<'_, '_> {
         }
     }
 
-    fn stmt(&mut self, s: &Stmt, st: &mut State) {
+    fn stmt(&mut self, s: &Stmt, st: &mut State) -> bool {
         match s {
             Stmt::Let(_, e) | Stmt::Eval(e) => self.expr(e, st),
             Stmt::Store(p, _) => {
@@ -137,33 +159,127 @@ impl Walk<'_, '_> {
             }
             Stmt::If { then, else_, .. } => {
                 let mut b = st.clone();
-                self.block(then, st);
-                self.block(else_, &mut b);
-                join(st, &b);
+                let a_next = self.block(then, st);
+                let b_next = self.block(else_, &mut b);
+                match (a_next, b_next) {
+                    (true, true) => join(st, &b),
+                    (false, true) => *st = b,
+                    _ => {}
+                }
+                return a_next || b_next;
             }
             Stmt::Loop { body, continuing } => {
-                // Until what the loop's head may have seen stops growing; it leaves with all of
-                // it (a `break` leaves from part way).
+                // A continue reaches the continuing block; a break skips it and everything
+                // after the break. Keep each exit separately until the loop head stops growing.
+                self.loops.push(LoopExits::default());
                 let mut head = st.clone();
-                let mut seen = st.clone();
                 loop {
                     let mut s = head.clone();
-                    self.block(body, &mut s);
-                    join(&mut seen, &s);
-                    self.block(continuing, &mut s);
-                    join(&mut seen, &s);
+                    let falls_through = self.block(body, &mut s);
+                    let exits = self.loops.last().expect("in a loop");
+                    let mut back = exits.continues.clone();
+                    if falls_through {
+                        join_exit(&mut back, &s);
+                    }
                     let mut next = head.clone();
-                    join(&mut next, &s);
+                    if let Some(mut s) = back
+                        && self.block(continuing, &mut s)
+                    {
+                        join(&mut next, &s);
+                    }
                     if next == head {
                         break;
                     }
                     head = next;
                 }
-                *st = seen;
+                let exits = self.loops.pop().unwrap_or_default();
+                if let Some(breaks) = exits.breaks {
+                    *st = breaks;
+                    return true;
+                }
+                return false;
             }
-            Stmt::Return(_) => join(&mut self.ret, st),
+            Stmt::Return(_) => {
+                join(&mut self.ret, st);
+                return false;
+            }
             Stmt::At(span) => self.at = Some(*span),
-            Stmt::Break | Stmt::Continue | Stmt::Trap => {}
+            Stmt::Break | Stmt::Continue => {
+                if let Some(exits) = self.loops.last_mut() {
+                    let into = if matches!(s, Stmt::Break) {
+                        &mut exits.breaks
+                    } else {
+                        &mut exits.continues
+                    };
+                    join_exit(into, st);
+                }
+                return false;
+            }
+            // The WGSL back end emits nothing for a trap: valid GPU code never reaches it.
+            Stmt::Trap => {}
+        }
+        true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loop_exits_keep_accesses_before_skipped_barriers() {
+        for (continue_, barrier_before_exit) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let mut m = Module::default();
+            let u = m.types.u32();
+            let b = m.types.bool();
+            let array = m.types.intern(TypeDef::Array(u, 1));
+            let shared = m.add_resource(Resource {
+                name: "shared".into(),
+                binding: 0,
+                kind: ResourceKind::Workgroup,
+                ty: array,
+            });
+            let mut f = Function::new("kernel", Vec::new(), None);
+            let zero = f.new_value(u);
+            let cond = f.new_value(b);
+            let at = Place::root(PlaceRoot::Resource(shared)).with(Proj::Index(zero));
+            let read = f.new_value(u);
+            let mut body = Vec::new();
+            if continue_ {
+                body.push(Stmt::Let(read, Expr::Load(at.clone())));
+                body.push(Stmt::Eval(Expr::Barrier));
+            }
+            body.push(Stmt::Store(at.clone(), zero));
+            if barrier_before_exit {
+                body.push(Stmt::Eval(Expr::Barrier));
+            }
+            body.extend([
+                Stmt::If {
+                    cond,
+                    then: vec![if continue_ { Stmt::Continue } else { Stmt::Break }],
+                    else_: Vec::new(),
+                },
+                Stmt::Eval(Expr::Barrier),
+            ]);
+            f.body = vec![
+                Stmt::Let(zero, Expr::Const(Const::U32(0))),
+                Stmt::Let(cond, Expr::Const(Const::Bool(true))),
+                Stmt::Loop { body, continuing: Vec::new() },
+            ];
+            if !continue_ {
+                f.body.push(Stmt::Let(read, Expr::Load(at)));
+            }
+            f.body.push(Stmt::Return(None));
+            let entry = m.add_function(f);
+            crate::verify(&m).expect("valid IR");
+            assert_eq!(
+                hazards(&m, entry).iter().any(|h| h.resource == shared && !h.write),
+                !barrier_before_exit,
+                "a {} must retain only accesses after the last barrier it reached",
+                if continue_ { "continue" } else { "break" },
+            );
         }
     }
 }

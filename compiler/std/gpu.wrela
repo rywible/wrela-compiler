@@ -1464,27 +1464,31 @@ pub struct AtomicMap {
 pub const EMPTY: u32 = 4294967295
 
 impl AtomicMap {
-    /// Where key `key` is, or would go: its slot, or `EMPTY` if the map is full of other keys.
-    fn slot(mut self, key: u32, claim: bool) -> u32 {
+    /// Where key `key` is, or would go: its slot, and whether this call claimed it; `EMPTY`
+    /// if the map is full of other keys.
+    fn slot(mut self, key: u32, claim: bool) -> (u32, bool) {
         let cap = atomic_len(self) / 2
         var at = hash_key(key) % cap
         for _ in 0..cap {
             let there = atomic_load(self, 2 * at)
             if there == key {
-                return at
+                return (at, false)
             }
             if there == EMPTY {
                 if !claim {
-                    return EMPTY
+                    return (EMPTY, false)
                 }
                 let old = strong_compare_exchange(mut self, 2 * at, EMPTY, key)
-                if old == EMPTY || old == key {
-                    return at
+                if old == EMPTY {
+                    return (at, true)
+                }
+                if old == key {
+                    return (at, false)
                 }
             }
             at = (at + 1) % cap
         }
-        EMPTY
+        (EMPTY, false)
     }
 
     /// Sets `key`'s value if it has none yet: whether it had none (and the map had room).
@@ -1492,11 +1496,14 @@ impl AtomicMap {
         if key == EMPTY {
             return false
         }
-        let at = self.slot(key, claim: true)
-        if at == EMPTY {
+        let (at, claimed) = self.slot(key, claim: true)
+        if at == EMPTY || !claimed {
             return false
         }
-        strong_compare_exchange(mut self, 2 * at + 1, EMPTY, value) == EMPTY
+        // A claimed slot starts at 0. Addition keeps increments from other invocations that
+        // reach the same key while its initial value is being added.
+        atomic_add(mut self, 2 * at + 1, value)
+        true
     }
 
     /// Adds `delta` to `key`'s value (from 0 if it had none): whether the map had room.
@@ -1504,27 +1511,25 @@ impl AtomicMap {
         if key == EMPTY {
             return false
         }
-        let at = self.slot(key, claim: true)
+        let (at, _) = self.slot(key, claim: true)
         if at == EMPTY {
             return false
         }
-        // A new key's value is `EMPTY` until its first add makes it 0.
-        let _ = strong_compare_exchange(mut self, 2 * at + 1, EMPTY, 0)
         atomic_add(mut self, 2 * at + 1, delta)
         true
     }
 
-    /// `key`'s value, if it has one.
+    /// `key`'s value, if it has one. A new key starts at 0 while an `insert` in another
+    /// invocation adds its initial value; read in a later dispatch to see completed inserts.
     pub fn get(mut self, key: u32) -> Option<u32> {
         if key == EMPTY {
             return None
         }
-        let at = self.slot(key, claim: false)
+        let (at, _) = self.slot(key, claim: false)
         if at == EMPTY {
             return None
         }
-        let v = atomic_load(self, 2 * at + 1)
-        if v == EMPTY { None } else { Some(v) }
+        Some(atomic_load(self, 2 * at + 1))
     }
 }
 
@@ -1542,12 +1547,16 @@ pub struct AtomicMapBuffer {
 /// An empty `AtomicMapBuffer` with room for `capacity` keys.
 pub fn atomic_map_buffer(capacity: u32) -> AtomicMapBuffer {
     var entries: GpuBuffer<u32> = buffer(2 * capacity)
-    write(mut entries, 0, Vec::filled(2 * capacity, EMPTY))
+    var initial: Vec<u32> = Vec::filled(2 * capacity, 0)
+    for i in 0..capacity {
+        initial[2 * i] = EMPTY
+    }
+    write(mut entries, 0, initial)
     AtomicMapBuffer { entries }
 }
 
 impl AtomicMapBuffer {
-    /// Its entries, key then value, `EMPTY` where none is: to read back.
+    /// Its entries, key then value: an unused slot's key is `EMPTY`, its value 0. To read back.
     pub fn entries(self) -> GpuSpan<u32> {
         self.entries.span(0, self.entries.len())
     }

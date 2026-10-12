@@ -27,7 +27,7 @@
 //! | 7 | `DestroyBuffer` | `handle`. Later commands can't use the buffer; work already recorded still can. |
 //! | 8 | `CopyBuffer` | `source`, `source offset`, `destination`, `destination offset`, `size` (bytes, multiples of 4) |
 //! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, a storage texture too, of a format [`TextureFormat::storable`]), and for a 3D texture its `depth` (a fifth word, at least 1). It starts zeroed. |
-//! | 10 | `WriteTexture` | `handle`, `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels, top to bottom, no padding |
+//! | 10 | `WriteTexture` | `handle`, `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels, top to bottom, no row padding; the byte run is padded to 4 bytes |
 //! | 11 | `DestroyTexture` | `handle` |
 //! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare) |
 //! | 13 | `DestroySampler` | `handle` |
@@ -884,7 +884,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("expected at least 6 words"));
                 }
                 let n = w(5) as usize;
-                if n != len - 24 {
+                if padded(n) != len - 24 {
                     return Err(bad("data length doesn't match the payload"));
                 }
                 Command::WriteTexture {
@@ -893,7 +893,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     y: w(2),
                     width: w(3),
                     height: w(4),
-                    data: &p[24..],
+                    data: &p[24..24 + n],
                 }
             }
             Opcode::CreateSampler => {
@@ -980,7 +980,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
             Opcode::HostRequest => {
                 let (service, body) = two_runs(
                     "the service and body lengths do not match the payload",
-                    "the service is not UTF-8",
+                    "the service isn't UTF-8",
                 )?;
                 Command::HostRequest { request: w(0), service, body }
             }
@@ -1244,7 +1244,7 @@ impl Encoder {
         data: &[u8],
     ) -> &mut Self {
         let words = [handle, origin[0], origin[1], size[0], size[1], data.len() as u32];
-        self.command(Opcode::WriteTexture, &words, data);
+        self.padded_command(Opcode::WriteTexture, &words, &[data]);
         self
     }
 

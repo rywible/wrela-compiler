@@ -68,6 +68,8 @@ pub struct Failure {
 /// Carries out commands that have already been decoded, sequenced and checked.
 pub(crate) trait Executor: 'static {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()>;
+    /// Begins every frame, including frames driven one at a time by a caller.
+    fn begin_frame(&mut self) {}
     /// Called after each call of `frame` returns: finish (submit) the frame's work.
     fn end_frame(&mut self) -> Result<()>;
     /// A buffer's bytes `offset..offset + size`, for a `ReadBuffer` request: the GPU's work
@@ -1014,6 +1016,13 @@ impl<E: Executor> Program<E> {
         };
         // The helpers: each its own instance on its own thread, sharing the memory.
         let has_worker = compiled.module.get_export(EXPORT_WORKER).is_some();
+        let controls = memory::PAR_HELPERS as usize + 4;
+        if has_worker && memory.data().len() < controls {
+            fail_after_store!(Error::Program(format!(
+                "it exports `{EXPORT_WORKER}` but its memory is {} bytes; the helpers need at least {controls}",
+                memory.data().len()
+            )));
+        }
         let n = if has_worker { workers.clamp(1, MAX_WORKERS + 1) - 1 } else { 0 };
         let threads = (0..n)
             .map(|i| {
@@ -1025,7 +1034,7 @@ impl<E: Executor> Program<E> {
             crate::shared::store_u32(&memory, memory::PAR_HELPERS, n);
         }
         let helpers = Helpers { memory: memory.clone(), threads };
-        let mut program = Program {
+        let program = Program {
             store,
             instance,
             frame,
@@ -1045,13 +1054,19 @@ impl<E: Executor> Program<E> {
                 .then(|| Replay { upto: ticks, records: ran.into_iter().flatten().collect() }),
             tick_from,
         };
-        if run_init {
-            let kept = program.store.data().kept.clone();
-            if let Err(e) = program.init() {
-                return Err((e, Box::new(program.retire().with_kept(kept))));
-            }
+        if run_init { program.init_recover() } else { Ok(program) }
+    }
+
+    /// Runs init after its host has registered its capabilities. A failed replacement gives
+    /// its carried state back, with the original kept bytes, as instantiation does.
+    pub(crate) fn init_recover(
+        mut self,
+    ) -> std::result::Result<Program<E>, (Error, Box<Retired<E>>)> {
+        let kept = self.store.data().kept.clone();
+        match self.init() {
+            Ok(()) => Ok(self),
+            Err(error) => Err((error, Box::new(self.retire().with_kept(kept)))),
         }
-        Ok(program)
     }
 
     /// Keeps each tick's records from now on (before any tick runs): what a build that
@@ -1144,7 +1159,7 @@ impl<E: Executor> Program<E> {
         };
         self.refuel()?;
         let result = init.call(&mut self.store, ());
-        self.settle(result)?;
+        self.finish_call(result)?;
         self.init_done = true;
         Ok(())
     }
@@ -1164,13 +1179,11 @@ impl<E: Executor> Program<E> {
 
     /// Calls `frame(time, width, height)`, then ends the frame.
     pub(crate) fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
+        self.store.data_mut().executor.begin_frame();
         self.store.data_mut().checker.set_screen_size(width, height);
         self.refuel()?;
         let result = self.frame.call(&mut self.store, (time, width, height));
-        self.settle(result)?;
-        let state = self.store.data_mut();
-        state.sequencer.end_frame()?;
-        state.executor.end_frame()
+        self.finish_call(result)
     }
 
     /// Calls another export with numeric arguments.
@@ -1192,7 +1205,7 @@ impl<E: Executor> Program<E> {
         let mut results: Vec<Val> = ty.results().map(|_| Val::I32(0)).collect();
         self.refuel()?;
         let result = func.call(&mut self.store, &args, &mut results);
-        self.settle(result)?;
+        self.finish_call(result)?;
         results
             .iter()
             .map(|v| {
@@ -1219,6 +1232,14 @@ impl<E: Executor> Program<E> {
     }
 
     /// Turns a call's outcome into ours, preferring the typed error `submit` recorded.
+    fn finish_call(&mut self, result: wasmtime::Result<()>) -> Result<()> {
+        self.settle(result)?;
+        let state = self.store.data_mut();
+        state.sequencer.end_frame()?;
+        state.executor.end_frame()
+    }
+
+    /// Settles requests and traces, preserving a Wasm trap before checking command completion.
     fn settle(&mut self, result: wasmtime::Result<()>) -> Result<()> {
         // What the call's requests got, the program sees from its next call on. The call's
         // phase ends with it.
@@ -1329,7 +1350,11 @@ impl<E: Executor> Program<E> {
 
     /// How many chunks of parallel jobs the helpers have run (`wrela_abi::memory::PAR_HELPED`).
     pub(crate) fn helped(&self) -> u32 {
-        crate::shared::load_u32(&self.memory, memory::PAR_HELPED)
+        if self.memory.data().len() < memory::PAR_HELPED as usize + 4 {
+            0
+        } else {
+            crate::shared::load_u32(&self.memory, memory::PAR_HELPED)
+        }
     }
 
     /// Holds back each task's result for `micros` microseconds once it's ready, whichever
@@ -1740,16 +1765,27 @@ fn spawn_worker(
 /// A helper, `thread`, trapped: the thread waiting for what it ran learns it, and traps with
 /// its panic message (wrela_abi `memory`'s helpers).
 fn helper_trapped(m: &SharedMemory, thread: u32) {
-    let running = shared::load_u32(m, memory::thread_block(thread) + memory::RUNNING);
+    let at = memory::thread_block(thread) + memory::RUNNING;
+    let len = m.data().len();
+    if at as usize + 4 > len {
+        return;
+    }
+    let running = shared::load_u32(m, at);
     let blocks = memory::THREAD_BLOCKS..memory::THREAD_BLOCKS_END;
     let slots = memory::TASK_SLOTS..memory::TASK_SLOTS_END;
-    if blocks.contains(&running) {
+    if blocks.contains(&running)
+        && (running - memory::THREAD_BLOCKS).is_multiple_of(memory::THREAD_BLOCK_SIZE)
+        && (running + memory::JOB_FAILED + 4) as usize <= len
+    {
         // A thread's parallel job: its starting thread waits on DONE. The first helper to trap
         // is the one whose message the program reports.
         shared::cas_u32(m, running + memory::JOB_FAILED, 0, thread + 1);
         shared::or_u32(m, running + memory::JOB_DONE, memory::JOB_DONE_FAILED);
         let _ = m.atomic_notify(u64::from(running + memory::JOB_DONE), u32::MAX);
-    } else if slots.contains(&running) {
+    } else if slots.contains(&running)
+        && (running - memory::TASK_SLOTS).is_multiple_of(memory::TASK_SLOT_SIZE)
+        && (running + memory::SLOT_THREAD + 4) as usize <= len
+    {
         // A task: whoever takes it waits on its state.
         shared::store_u32(m, running + memory::SLOT_THREAD, thread);
         shared::store_u32(m, running + memory::SLOT_STATE, memory::SLOT_FAILED);

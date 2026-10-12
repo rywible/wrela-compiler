@@ -28,7 +28,7 @@ import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen
 import { bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { is3d, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
+import { is3d, isStorage, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
 import { type Binding, type Bytes, type Command, joins, type OpcodeName, type Pass, type TextureFormat } from "./stream.ts";
 
 const RING_START = 64 * 1024;
@@ -497,22 +497,28 @@ class Timer {
     encoder.resolveQuerySet(this.#queries, 0, 2 * passes.length, this.#resolve, 0);
     encoder.copyBufferToBuffer(this.#resolve, 0, staging, 0, bytes);
     return () => {
-      this.#reading.push(
-        staging.mapAsync(GPUMapMode.READ).then(() => {
-          const t = new BigUint64Array(staging.getMappedRange());
-          passes.forEach((p, i) => {
-            const [a, b] = [t[2 * i]!, t[2 * i + 1]!];
-            this.#origin ??= a;
-            const start = Number(a - this.#origin);
-            // An end before its start (a clock that wrapped) is taken as the start.
-            const end = Math.max(start, Number(b - this.#origin));
-            this.results.push({ ...p, nanos: end - start, start, end, submission });
-          });
-          staging.unmap();
-          staging.destroy();
-        }),
-      );
+      const reading = staging.mapAsync(GPUMapMode.READ).then(() => {
+        const t = new BigUint64Array(staging.getMappedRange());
+        passes.forEach((p, i) => {
+          const [a, b] = [t[2 * i]!, t[2 * i + 1]!];
+          this.#origin ??= a;
+          const start = Number(a - this.#origin);
+          // An end before its start (a clock that wrapped) is taken as the start.
+          const end = Math.max(start, Number(b - this.#origin));
+          this.results.push({ ...p, nanos: end - start, start, end, submission });
+        });
+        staging.unmap();
+      }).finally(() => staging.destroy());
+      // A failed map may arrive before timings() waits for it.
+      void reading.catch(() => {});
+      this.#reading.push(reading);
     };
+  }
+
+  /** All uses have been submitted; their readbacks own separate staging buffers. */
+  destroy(): void {
+    this.#queries.destroy();
+    this.#resolve.destroy();
   }
 
   /** Every timing read back so far, once the readbacks under way are done. */
@@ -552,6 +558,7 @@ export class GpuExecutor {
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
+  #debugReading = false;
   #frame = 0;
   /** How many times `frame` has been set: a command's label is its own frame's. */
   #generation = 0;
@@ -578,6 +585,8 @@ export class GpuExecutor {
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
    * alone; null in the other modes, which run each command as it comes. */
   readonly #deferred: Deferred[] | null;
+  /** Commands a serial drain has taken, including readbacks still waiting their turn. */
+  readonly #draining = new Set<Deferred[]>();
   /** Each pipeline once it's built; `undefined` until then. The program starts while its
    * pipelines build: a command that needs one not built yet waits for it in `#waiting`, and
    * every command after it waits behind it, so they run in order. */
@@ -655,9 +664,18 @@ export class GpuExecutor {
    * 1, is in the flag), once the GPU's work so far is done. One read at a time. As the native
    * host's `check_debug_flag`. */
   async checkDebugFlag(): Promise<void> {
-    if (this.#debugFlag === null) return;
-    this.flush();
-    const bytes = await this.#copyBack(this.#debugFlag.buffer, 0, 4, this.#debugFlag.readback);
+    if (this.#debugFlag === null || this.#retired) return;
+    this.#debugReading = true;
+    let bytes: Bytes;
+    try {
+      this.flush();
+      bytes = await this.#copyBack(this.#debugFlag.buffer, 0, 4, this.#debugFlag.readback);
+    } finally {
+      this.#debugReading = false;
+      // Retiring must leave a mapping in flight alive until its reader has finished.
+      if (this.#retired) this.#debugFlag.readback.destroy();
+    }
+    if (this.#retired) return;
     const code = new DataView(bytes.buffer).getUint32(0, true);
     if (code === 0) return;
     const p = this.#pipelines[code - 1];
@@ -712,6 +730,7 @@ export class GpuExecutor {
     this.#failed = e;
     this.#rejectDeferred(this.#waiting, e);
     if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, e);
+    for (const batch of this.#draining) this.#rejectDeferred(batch, e);
     this.#idle?.reject(e);
     this.#idle = null;
   }
@@ -769,27 +788,40 @@ export class GpuExecutor {
    * dispatch alone and waiting for the GPU to finish it before the next. */
   async drain(): Promise<void> {
     if (this.#deferred === null) return;
-    for (const d of this.#deferred.splice(0)) {
-      if ("cmd" in d && "pipeline" in d.cmd) await this.#building[d.cmd.pipeline];
-      if ("cmd" in d) {
-        // Its timings and its label are the frame's that recorded it, which may have been
-        // before the one being recorded now.
-        this.#running = d.at;
-        try {
-          this.#run(d.cmd, true);
-        } catch (e) {
-          throw new Error(`serial mode, ${d.cmd.op}: ${errorMessage(e)}`);
-        } finally {
-          this.#running = null;
+    const batch = this.#deferred.splice(0);
+    this.#draining.add(batch);
+    try {
+      for (const d of batch) {
+        if (this.#retired) return;
+        if (this.#failed !== null) throw this.#failed;
+        if ("cmd" in d && "pipeline" in d.cmd) await this.#building[d.cmd.pipeline];
+        if (this.#retired) return;
+        if (this.#failed !== null) throw this.#failed;
+        if ("cmd" in d) {
+          // Its timings and its label are the frame's that recorded it, which may have been
+          // before the one being recorded now.
+          this.#running = d.at;
+          try {
+            this.#run(d.cmd, true);
+          } catch (e) {
+            throw new Error(`serial mode, ${d.cmd.op}: ${errorMessage(e)}`);
+          } finally {
+            this.#running = null;
+          }
+          const op = d.cmd.op;
+          if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {
+            this.flush();
+            await this.device.queue.onSubmittedWorkDone();
+          }
+        } else {
+          this.readBack(d.handle, d.offset, d.size, true).then(d.answer.resolve, d.answer.reject);
         }
-        const op = d.cmd.op;
-        if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {
-          this.flush();
-          await this.device.queue.onSubmittedWorkDone();
-        }
-      } else {
-        this.readBack(d.handle, d.offset, d.size, true).then(d.answer.resolve, d.answer.reject);
       }
+    } catch (error) {
+      this.#fail(error);
+      throw error;
+    } finally {
+      this.#draining.delete(batch);
     }
   }
 
@@ -802,13 +834,12 @@ export class GpuExecutor {
       this.#labelGeneration = generation;
     }
     if (this.#ended !== null) {
-      if (cmd.op === "BeginPass" && joins(cmd.pass, this.#ended.pass)) {
-        this.#pass = this.#ended;
-        this.#ended = null;
-        return;
+      const mayJoin = cmd.op === "BeginPass" && joins(cmd.pass, this.#ended.pass);
+      // Keep both passes until their draws say whether their resource usage scopes can
+      // share one WebGPU pass. A kept target alone doesn't make read/write uses compatible.
+      if (!mayJoin && this.#pass === null && cmd.op !== "Label") {
+        this.#recordEnded();
       }
-      // A label names the passes after it, the next of which may yet continue this one.
-      if (cmd.op !== "Label") this.#recordEnded();
     }
     switch (cmd.op) {
       case "CreateBuffer":
@@ -994,11 +1025,21 @@ export class GpuExecutor {
     const retired = new Error("the GPU executor was retired");
     this.#rejectDeferred(this.#waiting, retired);
     if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, retired);
+    for (const batch of this.#draining) this.#rejectDeferred(batch, retired);
     this.#idle?.reject(retired);
     this.#idle = null;
     this.#pass = null;
+    // An ended pass still needs the live attachment and binding handles to be recorded.
+    this.#recordEnded();
     for (const handle of [...this.#resources.keys()]) this.#destroy(handle);
     this.flush();
+    this.#uniforms.buffer.destroy();
+    this.#uploads.buffer.destroy();
+    this.#timer?.destroy();
+    if (this.#debugFlag !== null) {
+      this.#debugFlag.buffer.destroy();
+      if (!this.#debugReading) this.#debugFlag.readback.destroy();
+    }
   }
 
   #destroy(handle: number): void {
@@ -1235,11 +1276,44 @@ export class GpuExecutor {
     const open = this.#pass;
     this.#pass = null;
     if (open === null) throw new Error(`host bug: ${op} without a pass`);
+    const ended = this.#ended;
+    if (ended !== null) {
+      if (op === "EndPass" && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
+        for (const draw of open.draws) ended.draws.push(draw);
+        return;
+      }
+      this.#recordEnded();
+    }
     if (op === "EndPass" && this.#deferred === null) {
       this.#ended = open;
       return;
     }
     this.#recordPass(op, open);
+  }
+
+  /** A combined render pass cannot use a resource both read-only and read-write, including
+   * reads of indirect arguments and indices. Each individual pass was already checked. */
+  #compatible(earlier: OpenPass, next: OpenPass): boolean {
+    const usage = earlier.uses ?? new Map<number, number>();
+    const use = (handle: number, access: number) => {
+      const combined = (usage.get(handle) ?? 0) | access;
+      usage.set(handle, combined);
+      return combined !== 3;
+    };
+    const lists = earlier.uses ? [next.draws] : [earlier.draws, next.draws];
+    for (const draws of lists) for (const draw of draws) {
+      const pipeline = this.#pipeline(draw.pipeline);
+      for (const [i, binding] of draw.bindings.entries()) {
+        const kind = pipeline.bindings[i]!.kind;
+        if (kind !== "sampler" && kind !== "comparison_sampler") {
+          if (!use(binding.handle, kind === "read_write" || isStorage(kind) ? 2 : 1)) return false;
+        }
+      }
+      if (draw.op !== "Draw" && !use(draw.arguments, 1)) return false;
+      if (draw.op === "DrawIndexedIndirect" && !use(draw.indices, 1)) return false;
+    }
+    earlier.uses = usage;
+    return true;
   }
 
   /** Records the pass that ended and waits, if there is one. */
@@ -1326,4 +1400,4 @@ export class GpuExecutor {
 }
 
 /** A pass between its beginning and `Present` or `EndPass`, and the name the program gave it. */
-type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null };
+type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null; uses?: Map<number, number> };

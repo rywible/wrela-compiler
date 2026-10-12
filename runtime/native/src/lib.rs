@@ -318,8 +318,17 @@ pub struct Host {
     options: Options,
     /// The builds the program got ready to hand over to (`std::reload::prepare`).
     prepared: handover::PreparedBuilds,
+    /// Preparations let go before they finished: dropped only after their threads end.
+    cancelled_preparations: Vec<handover::Preparation>,
     // Declared last: dropped after the GPU.
     _lock: lock::GpuLock,
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for Host {
+    fn drop(&mut self) {
+        self.clear_prepared();
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -350,10 +359,10 @@ impl Host {
             carried,
             self.options.io(dir),
             workers(self.options.workers),
-            run_init,
+            false,
         )?;
         program.hand_over_here();
-        Ok(program)
+        if run_init { program.init_recover() } else { Ok(program) }
     }
 
     /// Starts the old build again after a candidate failed, preserving the host for another call.
@@ -415,6 +424,9 @@ impl Host {
                 let _ = job.join();
             }
         }
+        for job in self.cancelled_preparations.drain(..) {
+            let _ = job.join();
+        }
     }
 
     /// Hot reload: replaces the running program with the build in `dir` (by default the one
@@ -445,7 +457,7 @@ impl Host {
         self.install_program(program);
         self.build = build;
         self.dir = dir;
-        Ok(())
+        self.settle_handing()
     }
 
     /// The same build again from its start, on the same device, as `options` says (its
@@ -478,14 +490,19 @@ impl Host {
             if let Err(error) = fresh.executor.restart_build(&build.manifest, &build.shaders) {
                 return Err(self.recover_failed(saved.restore(fresh), old_init_done, error));
             }
-            match Program::instantiate_carrying_recover(
+            let started = Program::instantiate_carrying_recover(
                 &build.compiled,
                 &build.manifest,
                 fresh,
                 options.io(dir),
                 workers(options.workers),
-                !options.defer_init,
-            ) {
+                false,
+            )
+            .and_then(|mut program| {
+                program.hand_over_here();
+                if options.defer_init { Ok(program) } else { program.init_recover() }
+            });
+            match started {
                 Ok(program) => program,
                 Err((error, failed)) => {
                     return Err(self.recover_failed(saved.restore(*failed), old_init_done, error));
@@ -493,15 +510,21 @@ impl Host {
             }
         } else {
             let executor = Gpu::new(&build.manifest, &build.shaders, options.timing)?;
-            Program::instantiate_with(
+            let mut program = Program::instantiate_with(
                 &build.compiled,
                 &build.manifest,
                 executor,
                 options.io(dir),
                 options.record,
                 workers(options.workers),
-                !options.defer_init,
-            )?
+                false,
+            )?;
+            program.hand_over_here();
+            if options.defer_init {
+                program
+            } else {
+                program.init_recover().map_err(|(error, _)| error)?
+            }
         };
         if !same_device {
             self.clear_prepared();
@@ -514,7 +537,7 @@ impl Host {
         self.build = build;
         self.dir = dir.to_path_buf();
         self.options = options.clone();
-        Ok(())
+        self.settle_handing()
     }
 
     /// Hot reload of a literal: in a lifted build (`wrela build --lift`), literal `i` takes
@@ -545,20 +568,25 @@ impl Host {
             options.io(dir),
             options.record,
             n,
-            !options.defer_init,
+            false,
         )?;
         if options.reloadable {
             program.keep_ticks();
         }
         program.hand_over_here();
-        Ok(Host {
+        let mut host = Host {
             program: Some(program),
             build,
             dir: dir.to_path_buf(),
             options: options.clone(),
             prepared: handover::PreparedBuilds::new(),
+            cancelled_preparations: Vec::new(),
             _lock: lock,
-        })
+        };
+        if !options.defer_init {
+            host.init()?;
+        }
+        Ok(host)
     }
 
     /// Calls `frame(times[i], width, height)` for each time in order, then reads the screen
@@ -690,12 +718,15 @@ impl Host {
         height: u32,
     ) -> Result<Vec<(Ticked, f64)>> {
         self.p().executor().set_screen(width, height)?;
-        self.p().ticks_beside_frames(ticks, frames, fps, width, height)
+        let ticked = self.p().ticks_beside_frames(ticks, frames, fps, width, height)?;
+        self.settle_handing()?;
+        Ok(ticked)
     }
 
     /// Runs the program's `init`, for a host loaded with [`Options::defer_init`].
     pub fn init(&mut self) -> Result<()> {
-        self.p().run_init()
+        self.p().run_init()?;
+        self.settle_handing()
     }
 
     /// The last trap or panic, where it happened: [`CpuHost::last_failure`], on the GPU.
@@ -733,7 +764,7 @@ impl Host {
     fn result(&mut self, width: u32, height: u32) -> Result<RunResult> {
         let gpu = self.p().executor();
         let frame = gpu.read_screen()?;
-        let timings = gpu.take_timings();
+        let timings = gpu.take_timings()?;
         let hash = self.p().hash().value();
         Ok(RunResult { hash, width, height, frame, timings })
     }
@@ -741,7 +772,9 @@ impl Host {
     /// Calls one of the program's other exports with numeric arguments: CPU evaluation for
     /// tests. Anything it submits runs (and counts toward the hash).
     pub fn call_export(&mut self, name: &str, args: &[Value]) -> Result<Vec<Value>> {
-        self.p().call(name, args)
+        let values = self.p().call(name, args)?;
+        self.settle_handing()?;
+        Ok(values)
     }
 
     /// Renders `quanta` quanta of the program's voice offline (as [`CpuHost::render_audio`]).
@@ -823,8 +856,7 @@ impl Host {
     /// for timing work an export submits. It waits for the GPU.
     pub fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
         let gpu = self.p().executor();
-        gpu.flush()?;
-        Ok(gpu.take_timings())
+        gpu.take_timings()
     }
 
     /// The GPU this host runs on: its adapter's name and driver.

@@ -758,10 +758,10 @@ impl<'p> Effects<'p> {
     }
 }
 
-/// The function values that can reach a read. An unused `fn` value does not run its body, so
-/// merely naming an effectful function cannot give its maker that function's effects. We keep
-/// the usual conservative effect link for every value that may be read, passed or called.
-fn used_fn_refs(
+/// Function and closure values that can reach a use beyond copying into an unused binding.
+/// Constructing an unused callable does not execute its body. Values that may be passed or
+/// called keep the usual conservative effect link.
+fn used_callables(
     p: &Program,
     body: &Body,
     code: &mir::FnBody,
@@ -769,13 +769,29 @@ fn used_fn_refs(
     use std::collections::HashSet;
 
     if !code.blocks.iter().any(|b| {
-        b.stmts.iter().any(|s| matches!(&s.kind, StatementKind::Assign(_, Rvalue::FnRef(..))))
+        b.stmts.iter().any(|s| {
+            matches!(&s.kind, StatementKind::Assign(_, Rvalue::FnRef(..) | Rvalue::Closure(_)))
+        })
     }) {
         return HashSet::new();
     }
     let n = code.blocks.len();
     let mut live_in: Vec<HashSet<mir::Local>> = vec![HashSet::new(); n];
     let mut uses = Vec::new();
+    let step = |s: &mir::Statement, live: &mut HashSet<mir::Local>, uses: &mut Vec<mir::Local>| {
+        if let StatementKind::Assign(place, r) = &s.kind
+            && place.proj.is_empty()
+            && !live.contains(&place.local)
+            && (matches!(r, Rvalue::FnRef(..) | Rvalue::Closure(_))
+                || matches!(r, Rvalue::Use(o) if mir::is_callable(&p.types, o.ty)))
+        {
+            return;
+        }
+        if let Some(d) = borrowck::stmt_uses_defs(p, body, s, uses) {
+            live.remove(&d);
+        }
+        live.extend(uses.drain(..));
+    };
     loop {
         let mut changed = false;
         for b in (0..n).rev() {
@@ -785,11 +801,7 @@ fn used_fn_refs(
             borrowck::term_uses(&code.blocks[b].term, &mut uses);
             live.extend(uses.drain(..));
             for s in code.blocks[b].stmts.iter().rev() {
-                let def = borrowck::stmt_uses_defs(p, body, s, &mut uses);
-                if let Some(d) = def {
-                    live.remove(&d);
-                }
-                live.extend(uses.drain(..));
+                step(s, &mut live, &mut uses);
             }
             if live != live_in[b] {
                 live_in[b] = live;
@@ -809,16 +821,12 @@ fn used_fn_refs(
         borrowck::term_uses(&code.blocks[b].term, &mut uses);
         live.extend(uses.drain(..));
         for (i, s) in code.blocks[b].stmts.iter().enumerate().rev() {
-            if let StatementKind::Assign(place, Rvalue::FnRef(..)) = &s.kind
+            if let StatementKind::Assign(place, Rvalue::FnRef(..) | Rvalue::Closure(_)) = &s.kind
                 && (!place.proj.is_empty() || live.contains(&place.local))
             {
                 retained.insert((b, i));
             }
-            let def = borrowck::stmt_uses_defs(p, body, s, &mut uses);
-            if let Some(d) = def {
-                live.remove(&d);
-            }
-            live.extend(uses.drain(..));
+            step(s, &mut live, &mut uses);
         }
     }
     retained
@@ -833,7 +841,7 @@ fn node(
     hidden: &HashMap<FnId, TyId>,
 ) -> Node {
     let mut n = Node::default();
-    let used_fn_refs = used_fn_refs(p, body, code);
+    let used_callables = used_callables(p, body, code);
     let std_module = |g: FnId| p.module(p.func(g).module).path.get(1).cloned();
     let call_to = |n: &mut Node, g: FnId, span: Span| {
         let def = p.func(g);
@@ -979,12 +987,13 @@ fn node(
                 Rvalue::Draw(_) => {
                     n.direct.push((Effect::Host, s.span, "`draw` records GPU work".into()));
                 }
-                Rvalue::Closure(id) => {
+                Rvalue::Closure(id) if used_callables.contains(&(block_idx, stmt_idx)) => {
                     n.calls.push((BodyId { func: f, closure: Some(*id) }, s.span));
                 }
+                Rvalue::Closure(_) => {}
                 // Naming a function does not run it. Keep its effects only if the value can
                 // reach a use; then the usual call and higher-order checks remain conservative.
-                Rvalue::FnRef(g, _) if used_fn_refs.contains(&(block_idx, stmt_idx)) => {
+                Rvalue::FnRef(g, _) if used_callables.contains(&(block_idx, stmt_idx)) => {
                     call_to(&mut n, *g, s.span)
                 }
                 Rvalue::FnRef(..) => {}
@@ -1134,6 +1143,48 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use wrela_diag::FileId;
+
+    #[test]
+    fn unused_closures_do_not_execute_their_body_effects() {
+        for (binding, value) in
+            [("_", "|| now()"), ("unused", "|| now()"), ("_", "now"), ("unused", "now")]
+        {
+            let source = format!(
+                "use std::time::now\n\
+                 @deterministic\n\
+                 pub fn inspect() -> u32 {{\n\
+                     let {binding} = {value}\n\
+                     1\n\
+                 }}\n"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        }
+        let source = "
+use std::time::now
+@deterministic
+pub fn inspect() -> u32 {
+    let clock = now
+    let _ = || clock()
+    1
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        let source = "
+use std::time::now
+@deterministic
+pub fn inspect() -> f64 {
+    let clock = || now()
+    clock()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0600"), "{diagnostics:#?}");
+    }
 
     #[test]
     fn frontend_perf_effect_propagation_matches_reachability() {

@@ -190,6 +190,35 @@ fn checks_optional_thread_entry_export_types() {
     }
 }
 
+#[test]
+fn workers_need_memory_for_their_control_words() {
+    let error = load_wat(
+        r#"(module
+            (import "wrela" "memory" (memory 0 16384 shared))
+            (export "memory" (memory 0))
+            (func (export "__worker") (param i32))
+            (func (export "frame") (param f32 i32 i32)))"#,
+    )
+    .err()
+    .expect("the missing helper words are a program error");
+    assert!(
+        matches!(&error, Error::Program(message) if message.contains("helpers need at least")),
+        "{error}"
+    );
+}
+
+#[test]
+fn worker_metrics_without_control_words_are_zero() {
+    let program = load_wat(
+        r#"(module
+            (import "wrela" "memory" (memory 0 16384 shared))
+            (export "memory" (memory 0))
+            (func (export "frame") (param f32 i32 i32)))"#,
+    )
+    .unwrap();
+    assert_eq!(program.helped(), 0);
+}
+
 /// The ABI's default limits are WebGPU's, as wgpu has them (`wrela_abi` can't see wgpu).
 #[test]
 fn the_default_limits_are_webgpus() {
@@ -373,6 +402,36 @@ fn runtime_helpers_end_phases_on_success_and_trap() {
 }
 
 #[test]
+fn helper_traps_do_not_panic_or_write_through_invalid_job_addresses() {
+    let thread = memory::THREAD_HELPER0;
+    let small = SharedMemory::new(&ENGINE, wasmtime::MemoryType::shared(1, 1)).unwrap();
+    helper_trapped(&small, thread);
+    let memory = SharedMemory::new(&ENGINE, wasmtime::MemoryType::shared(20, 20)).unwrap();
+    let running = memory::thread_block(thread) + memory::RUNNING;
+    for invalid in [
+        memory::THREAD_BLOCKS + 1,
+        memory::THREAD_BLOCKS_END - 4,
+        memory::TASK_SLOTS + 1,
+        memory::TASK_SLOTS_END - 4,
+    ] {
+        shared::store_u32(&memory, running, invalid);
+        let before = shared::read(&memory, 0, memory.data().len()).unwrap();
+        helper_trapped(&memory, thread);
+        assert_eq!(shared::slice(&memory, 0, memory.data().len()).unwrap(), before, "{invalid}");
+    }
+    let job = memory::thread_block(memory::THREAD_MAIN);
+    shared::store_u32(&memory, running, job);
+    helper_trapped(&memory, thread);
+    assert_eq!(shared::load_u32(&memory, job + memory::JOB_FAILED), thread + 1);
+    assert_eq!(shared::load_u32(&memory, job + memory::JOB_DONE), memory::JOB_DONE_FAILED);
+    let slot = memory::TASK_SLOTS + memory::TASK_SLOT_SIZE;
+    shared::store_u32(&memory, running, slot);
+    helper_trapped(&memory, thread);
+    assert_eq!(shared::load_u32(&memory, slot + memory::SLOT_THREAD), thread);
+    assert_eq!(shared::load_u32(&memory, slot + memory::SLOT_STATE), memory::SLOT_FAILED);
+}
+
+#[test]
 fn build_helpers_end_phases_on_success_and_trap() {
     for traps in [false, true] {
         let wasm = wat::parse_str(worker_phase_wat(traps)).expect("test WAT compiles");
@@ -430,6 +489,30 @@ fn hashes_every_submitted_byte() {
         program.executor().log,
         ["CreateBuffer", "BeginScreenPass", "Present", "end", "end"]
     );
+}
+
+#[test]
+fn init_and_other_exports_must_close_their_passes() {
+    let batch = Encoder::new().begin_screen_pass([0.0; 4]).finish();
+    for export in ["init", "open"] {
+        let wat = format!(
+            r#"(module
+                (import "wrela" "submit" (func $submit (param i32 i32)))
+                (import "wrela" "memory" (memory 1 16384 shared))
+                (export "memory" (memory 0))
+                (data (i32.const 0) "{}")
+                (func (export "frame") (param f32 i32 i32))
+                (func (export "{export}") (call $submit (i32.const 0) (i32.const {}))))"#,
+            wat_gen::escape(&batch),
+            batch.len(),
+        );
+        let error = if export == "init" {
+            load_wat(&wat).err().expect("init must close its pass")
+        } else {
+            load_wat(&wat).unwrap().call(export, &[]).expect_err("an export must close its pass")
+        };
+        assert!(matches!(error, Error::Stream(StreamError::UnclosedPass)), "{error}");
+    }
 }
 
 #[test]

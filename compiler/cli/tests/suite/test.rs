@@ -2,6 +2,14 @@
 use super::common::{answer, package, wrela};
 
 #[test]
+fn a_test_filter_cannot_pass_a_package_without_tests() {
+    let dir = package("filter-without-tests", &[("main.wrela", super::common::FRAME)]);
+    let out = wrela().args(["test", dir.to_str().unwrap(), "missing"]).output().unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("no test's name contains `missing`"));
+}
+
+#[test]
 fn exact_selection_rejects_substrings_missing_names_and_ambiguous_names() {
     let dir = package(
         "exact-tests",

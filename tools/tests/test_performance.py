@@ -64,6 +64,20 @@ class GzipCacheTest(unittest.TestCase):
             with serve._GZIPPED_LOCK:
                 del serve._GZIPPED[path]
 
+    def test_atomic_replacement_with_matching_size_and_mtime_replaces_cached_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "game.wasm"
+            path.write_bytes(b"first")
+            stamp = path.stat().st_mtime_ns
+            self.assertEqual(gzip.decompress(serve.gzipped(str(path))), b"first")
+            replacement = pathlib.Path(tmp) / "replacement"
+            replacement.write_bytes(b"other")
+            os.utime(replacement, ns=(stamp, stamp))
+            replacement.replace(path)
+            self.assertEqual(gzip.decompress(serve.gzipped(str(path))), b"other")
+            with serve._GZIPPED_LOCK:
+                del serve._GZIPPED[str(path)]
+
 
 class RoundSummaryTest(unittest.TestCase):
     def test_nearest_report_keeps_original_ties_and_duplicate_frames(self):

@@ -1,5 +1,6 @@
 """CPU worker limits must follow the container's quota, not the host's CPU count."""
 
+import os
 import pathlib
 import sys
 import tempfile
@@ -139,6 +140,32 @@ class CpuCount(unittest.TestCase):
         self.assertEqual(resources._memory_quota_pressure(), 2)
         (directory / "memory.limit_in_bytes").write_text("invalid")
         self.assertEqual(resources._memory_quota_pressure(), 0)
+
+
+class GpuLocks(unittest.TestCase):
+    def test_a_slot_open_failure_closes_every_descriptor_already_opened(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            outside = root / "outside"
+            outside.write_text("keep")
+            (root / "gpu-slot-1.lock").symlink_to(outside)
+            opened = []
+            original = os.open
+
+            def tracked_open(path, *args):
+                descriptor = original(path, *args)
+                opened.append(descriptor)
+                return descriptor
+
+            with patch.object(resources, "resource_dir", return_value=root), \
+                    patch.object(resources.os, "open", side_effect=tracked_open), \
+                    self.assertRaises(OSError):
+                resources.gpu_locks(True)
+            self.assertEqual(len(opened), 2)
+            for descriptor in opened:
+                with self.assertRaises(OSError):
+                    os.fstat(descriptor)
+            self.assertEqual(outside.read_text(), "keep")
 
 
 if __name__ == "__main__":

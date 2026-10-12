@@ -1,0 +1,146 @@
+// run: arrays without stored elements still check every evaluated index
+// expect: read(1) = 7
+// expect: read(2) traps
+// expect: signed_read(-1) traps
+// expect: write(1) = 7
+// expect: write(2) traps
+// expect: borrowed(1) = 7
+// expect: borrowed(2) traps
+// expect: argument(1) = 7
+// expect: argument(2) traps
+// expect: closure_argument(1) = 7
+// expect: closure_argument(2) traps
+// expect: projected(1) = 7
+// expect: projected(2) traps
+// expect: nested(1, 2) = 7
+// expect: nested(2, 0) traps
+// expect: nested(0, 3) traps
+// expect: nested_len(1) = 3
+// expect: nested_len(2) traps
+// expect: field_array(1) = 7
+// expect: field_array(2) traps
+// expect: stored_nested_len(1) = 3
+// expect: stored_nested_len(2) traps
+// expect: indexed_callback(1) = 7
+// expect: indexed_callback(2) traps
+// expect: zero_read(0) traps
+// expect: zero_write(0) traps
+// expect: zero_borrow(0) traps
+// expect: zero_projected(0) traps
+
+pub fn read(index: u32) -> u32 {
+    let values = [(); 2]
+    let _ = values[index]
+    7
+}
+
+pub fn signed_read(index: i32) -> u32 {
+    let values = [(); 2]
+    let _ = values[index]
+    7
+}
+
+pub fn write(index: u32) -> u32 {
+    var values = [(); 2]
+    values[index] = ()
+    7
+}
+
+pub fn borrowed(index: u32) -> u32 {
+    let values = [(); 2]
+    borrow _unit = values[index]
+    let _ = _unit
+    7
+}
+
+fn inspect(unit: ()) -> u32 {
+    7
+}
+
+pub fn argument(index: u32) -> u32 {
+    let values = [(); 2]
+    inspect(values[index])
+}
+
+fn invoke(callback: fn(mut ()) -> u32, value: mut ()) -> u32 {
+    callback(mut value)
+}
+
+pub fn closure_argument(index: u32) -> u32 {
+    var values = [(); 2]
+    invoke(|_| 7, mut values[index])
+}
+
+fn project(values: [(); 2], index: u32) -> borrow () {
+    values[index]
+}
+
+pub fn projected(index: u32) -> u32 {
+    let values = [(); 2]
+    borrow _unit = project(values, index)
+    let _ = _unit
+    7
+}
+
+pub fn nested(first: u32, second: u32) -> u32 {
+    let values = [[(); 3]; 2]
+    let _ = values[first][second]
+    7
+}
+
+pub fn nested_len(index: u32) -> u32 {
+    let values = [[(); 3]; 2]
+    values[index].len()
+}
+
+struct Row: Copy {
+    stored: u32,
+    units: [(); 2],
+}
+
+pub fn field_array(index: u32) -> u32 {
+    let row = Row { stored: 7, units: [(); 2] }
+    let _ = row.units[index]
+    row.stored
+}
+
+pub fn stored_nested_len(index: u32) -> u32 {
+    let values = [[1; 3]; 2]
+    values[index].len()
+}
+
+fn invoke_indexed(callback: fn(mut ()) -> u32, index: u32) -> u32 {
+    var values = [(); 2]
+    callback(mut values[index])
+}
+
+pub fn indexed_callback(index: u32) -> u32 {
+    invoke_indexed(|_| 7, index)
+}
+
+pub fn zero_read(index: u32) -> u32 {
+    let values: [u32; 0] = [0; 0]
+    values[index]
+}
+
+pub fn zero_write(index: u32) -> u32 {
+    var values: [u32; 0] = [0; 0]
+    values[index] = 7
+    7
+}
+
+pub fn zero_borrow(index: u32) -> u32 {
+    let values: [u32; 0] = [0; 0]
+    borrow held = values[index]
+    let _ = held
+    7
+}
+
+fn project_zero(values: [u32; 0], index: u32) -> borrow u32 {
+    values[index]
+}
+
+pub fn zero_projected(index: u32) -> u32 {
+    let values: [u32; 0] = [0; 0]
+    project_zero(values, index)
+}

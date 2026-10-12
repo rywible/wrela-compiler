@@ -31,6 +31,7 @@ struct Mixed: Copy + GpuData {
     quot: vec3u,
     rem: vec3u,
     shifted: vec3u,
+    signed_shifted: vec3i,
     bits: vec3u,
     least: vec3i,
     clamped: vec3i,
@@ -54,6 +55,7 @@ fn mixed(i: u32) -> Mixed {
         quot: a / b,
         rem: a % b,
         shifted: (a << vec3u(1, 2, 3)) + (b >> 2),
+        signed_shifted: (s << 2) + (t >> 1),
         bits: (a & b) | (a ^ vec3u(255)),
         least: min(s, t) + max(s, vec3i(0)),
         clamped: clamp(s, vec3i(-100), vec3i(100)),
@@ -108,6 +110,7 @@ fn integer_vectors() {
     assert(abs(a) == vec3i(1, 2, 3) && min(a, b) == vec3i(1, -2, -6) && -a == vec3i(-1, 2, -3))
     let u = vec3u(7, 8, 9)
     assert((u >> 1) == vec3u(3, 4, 4) && (u & vec3u(1)) == vec3u(1, 0, 1))
+    assert((a << 2) == vec3i(4, -8, 12) && (a >> 1) == vec3i(0, -1, 1))
     assert(u % 4 == vec3u(3, 0, 1) && u / 2 == vec3u(3, 4, 4))
     // Float to integer truncates; integer to integer keeps the low bits.
     let cell = vec3u(vec3(2.7, 0.2, 5.9))

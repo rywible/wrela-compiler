@@ -78,3 +78,45 @@ fn audio_renders_describes_and_measures_a_take() {
     assert_eq!(c["seconds"], 1.0);
     assert!(c["clicks"].is_u64(), "{c}");
 }
+#[test]
+fn a_short_numbers_render_does_not_slice_past_its_samples() {
+    let dir = super::common::package(
+        "audio-short-numbers",
+        &[(
+            "main.wrela",
+            r#"
+@audio
+fn silent(state: mut u32, left: mut [f32], right: mut [f32]) {}
+struct State { ready: u32 }
+pub fn init() -> State {
+    std::audio::play(0, silent)
+    State { ready: 0 }
+}
+pub fn frame(state: mut State, time: f32, width: u32, height: u32) {}
+pub fn seconds() -> f32 { 0.5 }
+pub fn describe() {
+    std::io::print("{\"title\":\"short\",\"bars\":2,\"beats_per_bar\":1,\"seconds\":0.5}")
+    std::io::print("{\"beat\":0.0}")
+    std::io::print("{\"beat\":0.2}")
+    std::io::print("{\"beat\":0.4}")
+}
+"#,
+        )],
+    );
+    let out = super::common::wrela()
+        .args(["audio", dir.to_str().unwrap(), "numbers", "--seconds", "0.1"])
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).expect("numbers JSON");
+    assert_eq!(
+        report["bars"].as_array().expect("bars").len(),
+        1,
+        "only one bar has rendered audio"
+    );
+}

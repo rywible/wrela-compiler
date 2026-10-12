@@ -298,9 +298,10 @@ export class InputRing {
   read(): { events: Uint8Array; times: readonly number[] } {
     const written = Atomics.load(this.#counts, 0) >>> 0;
     let read = Atomics.load(this.#counts, 1) >>> 0;
-    // A margin, so the slot the writer fills next isn't one this reads.
-    const room = InputRing.CAPACITY - 64;
-    if (Atomics.load(this.#counts, 3) !== 0 && ((written - read) >>> 0) > room) read = (written - room) >>> 0;
+    // With a ticker, leave a margin so the slot the writer fills next isn't one this reads.
+    // After it detaches, frames may still be behind events already overwritten by the ticker.
+    const room = InputRing.CAPACITY - (Atomics.load(this.#counts, 3) !== 0 ? 64 : 0);
+    if (((written - read) >>> 0) > room) read = (written - room) >>> 0;
     const n = (written - read) >>> 0;
     if (n === 0) return NO_EVENTS;
     const events = new Uint8Array(n * EVENT_SIZE);

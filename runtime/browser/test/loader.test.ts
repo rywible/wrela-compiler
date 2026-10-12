@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MANIFEST_VERSION } from "../src/abi.gen.ts";
+import { pathProblem } from "../src/check.ts";
 import { browserIo, type Fetch, loadBuild } from "../src/loader.ts";
 import { ManifestError } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
@@ -82,6 +83,66 @@ test("fetches and posts literal percent escapes inside the build", async () => {
   ]);
 });
 
+test("checked URL paths keep spaces and controls literal inside the build", async () => {
+  const paths = [" /admin", "\t/admin", "sa\nve.bin", "folder/name "];
+  const requested: string[] = [];
+  const io = browserIo(BASE, async (url) => { requested.push(url.href); return new Response(""); });
+  for (const path of paths) {
+    expect(pathProblem(path)).toBeUndefined();
+    await io.fetch(path);
+    await io.post(path, new Uint8Array());
+  }
+  const expected = ["%20/admin", "%09/admin", "sa%0Ave.bin", "folder/name%20"];
+  expect(requested).toEqual(expected.flatMap((path) => [`http://localhost/game/${path}`, `http://localhost/game/${path}`]));
+});
+
+test("failed storage writes and closes abort their stream so a retry can take the file lock", async () => {
+  const original = Object.getOwnPropertyDescriptor(navigator, "storage");
+  try {
+    for (const failed of ["write", "close"]) {
+      const calls: string[] = [];
+      let locked = false;
+      let fail = true;
+      const file = {
+        async createWritable() {
+          if (locked) throw new Error("the file is locked");
+          locked = true;
+          return {
+            async write() {
+              calls.push("write");
+              if (failed === "write" && fail) throw new Error("write failed");
+            },
+            async close() {
+              calls.push("close");
+              if (failed === "close" && fail) throw new Error("close failed");
+              locked = false;
+            },
+            async abort() {
+              calls.push("abort");
+              locked = false;
+              // Cleanup's failure must not replace the error that failed the request.
+              throw new Error("abort failed");
+            },
+          };
+        },
+      };
+      const dir: { getDirectoryHandle(): Promise<object>; getFileHandle(): Promise<typeof file> } = {
+        async getDirectoryHandle() { return dir; }, async getFileHandle() { return file; },
+      };
+      Object.defineProperty(navigator, "storage", { value: { getDirectory: async () => dir }, configurable: true });
+      const io = browserIo(BASE);
+      await expect(io.storageWrite("save.bin", Uint8Array.of(1))).rejects.toThrow(`${failed} failed`);
+      expect(locked).toBe(false);
+      fail = false;
+      await io.storageWrite("save.bin", Uint8Array.of(2));
+      expect(calls).toEqual(failed === "write" ? ["write", "abort", "write", "close"] : ["write", "close", "abort", "write", "close"]);
+      expect(locked).toBe(false);
+    }
+  } finally {
+    if (original) Object.defineProperty(navigator, "storage", original);
+    else delete (navigator as unknown as Record<string, unknown>)["storage"];
+  }
+});
 
 test("stable storage survives release paths while default page storage stays separate", async () => {
   const previous = Object.getOwnPropertyDescriptor(globalThis, "navigator");

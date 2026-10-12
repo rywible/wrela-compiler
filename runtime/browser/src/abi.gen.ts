@@ -153,6 +153,7 @@ export const JOB_FAILED = 24;
 export const JOB_DONE_FAILED = 2147483648;
 export const RUNNING = 32;
 export const TASK_SLOTS = 1212416;
+export const TASK_SLOT_SIZE = 16;
 export const TASK_SLOTS_END = 1216512;
 export const SLOT_STATE = 0;
 export const SLOT_THREAD = 12;
@@ -211,6 +212,7 @@ export const MAX_WORKGROUP_SIZE = [256, 256, 64];
 export const MAX_WORKGROUP_INVOCATIONS = 256;
 export const MAX_STORAGE_BUFFERS_PER_STAGE = 8;
 export const MAX_UNIFORM_BUFFER_BINDING_SIZE = 65536;
+export const MAX_BINDINGS_PER_GROUP = 1000;
 /** WebGPU's default limits, in `wrela.limit`'s order (runtime/abi `Limits`). */
 export const DEFAULT_LIMITS = [8192, 134217728, 8, 65536, 16384, 256, 256, 256, 64, 65535];
 

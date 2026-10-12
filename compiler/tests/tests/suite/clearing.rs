@@ -385,6 +385,56 @@ fn the_engines_own_tests_pass() {
     assert!(declared > 0, "engine/ declares no tests");
     assert_eq!(super::tests_pass(&engine), declared);
 }
+
+/// Replacing a wrapped field block invalidates the level over the evicted tile as well as
+/// the incoming tile, even when the new tile lies outside every visible level. A tile at
+/// a level's final row or column also invalidates its sampled endpoint.
+#[test]
+fn replacing_a_field_block_recooks_the_evicted_tile() {
+    let source = r#"use engine::terrain::{Clipmap, Cover, Terrain}
+
+struct Flat: Copy + GpuData {}
+
+impl Terrain for Flat {
+    fn height(self, x: f32, z: f32) -> f32 {
+        0.0
+    }
+
+    fn cover(self, at: vec3, n: vec3) -> Cover {
+        Cover { albedo: vec3(0.5), grass: 0.0 }
+    }
+}
+
+pub struct State {
+    clip: Clipmap,
+}
+
+pub fn init() -> State {
+    State { clip: Clipmap::new(1, 1.0) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    s.clip.fields_on(tile: 256.0, side: 1, blocks: 1)
+    s.clip.write_fields(vec2i(0), [255, 0, 0, 0])
+    assert(s.clip.follow(Flat {}, vec3(64.0, 0.0, 64.0), again: false) == 1)
+    assert(s.clip.follow(Flat {}, vec3(64.0, 0.0, 64.0), again: false) == 0)
+    s.clip.write_fields(vec2i(100), [0, 0, 0, 0])
+    assert(s.clip.follow(Flat {}, vec3(64.0, 0.0, 64.0), again: false) == 1,
+        "replacing the wrapped field block left the old tile cooked")
+    assert(s.clip.follow(Flat {}, vec3(-64.0, 0.0, 64.0), again: false) == 1)
+    s.clip.write_fields(vec2i(0), [255, 0, 0, 0])
+    assert(s.clip.follow(Flat {}, vec3(-64.0, 0.0, 64.0), again: false) == 1,
+        "writing the final texel at the tile's low boundary left the level cooked")
+}
+
+@test(frames: 1)
+fn the_old_fields_were_invalidated(s: State) {
+    assert(s.clip.cooks == 4)
+}
+"#;
+    let package = super::engine_package("clearing/field-eviction", "field_eviction", source);
+    assert_eq!(super::tests_pass(&package), 1);
+}
 // ---- light (AC5) -----------------------------------------------------------------------------
 
 /// How many draws a frame's batch makes after the label `name` (to the next label).

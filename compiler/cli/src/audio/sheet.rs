@@ -112,9 +112,12 @@ const LABEL: [u8; 3] = [200, 200, 205];
 
 /// The sheet, as PNG bytes, for the whole take or bars `bars` (first and last, from 1).
 pub fn draw(t: &Take, samples: &[f32], bars: Option<(u32, u32)>) -> Result<Vec<u8>, String> {
+    let (first, last) = bars.unwrap_or((1, t.bars));
+    if first == 0 || last < first || last > t.bars || last == u32::MAX {
+        return Err(format!("bars {first}-{last} must be within 1-{} and in order", t.bars));
+    }
     let per = t.beats_per_bar.max(1) as usize;
     let bar_time = |b: u32| t.beats.get((b as usize - 1) * per).copied();
-    let (first, last) = bars.unwrap_or((1, t.bars));
     let t0 = bar_time(first).ok_or(format!("the take has no bar {first}"))?;
     let t1 = bar_time(last + 1).unwrap_or(t.seconds.max(t0 + 1.0));
     let x_of = |s: f64| LEFT as f64 + (s - t0) / (t1 - t0) * PLOT as f64;

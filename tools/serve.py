@@ -50,6 +50,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         if ".git" in (part.casefold() for part in path.split("/")):
             self.send_error(404, "the repository's history isn't served")
             return True
+        root = os.path.realpath(ROOT)
+        resolved = os.path.realpath(self.translate_path(self.path))
+        outside = os.path.commonpath([root, resolved]) != root
+        if (outside and self.command in ("GET", "HEAD")) or ".git" in (
+                part.casefold() for part in os.path.relpath(resolved, root).split(os.sep)):
+            self.send_error(404, "the path is outside the served source files")
+            return True
         return False
 
     def do_GET(self):
@@ -189,7 +196,7 @@ def gzipped(path):
     # its old bytes after a rebuild rather than keeping every version for the whole session.
     with cached.lock:
         st = os.stat(path)
-        version = (st.st_size, st.st_mtime_ns)
+        version = (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
         if cached.version != version:
             with open(path, "rb") as f:
                 body = gzip.compress(f.read(), compresslevel=6)

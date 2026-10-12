@@ -715,32 +715,34 @@ struct CallSite {
 
 /// The offsets of the `(` and `)` of the parameter list after a function's name.
 fn param_list(text: &str, after: usize) -> Option<(u32, u32)> {
-    let bytes = text.as_bytes();
-    let mut i = after;
-    let mut angle = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'<' => angle += 1,
-            b'>' => angle -= 1,
-            b'(' if angle == 0 => break,
-            _ => {}
-        }
-        i += 1;
-    }
-    let open = i;
-    let mut depth = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((open as u32, i as u32));
+    use wrela_syntax::token::TokenKind;
+    let mut angle = 0usize;
+    let mut depth = 0usize;
+    let mut open = None;
+    for token in crate::edit::lex(text.get(after..)?) {
+        if open.is_none() {
+            match token.kind {
+                TokenKind::Lt => angle += 1,
+                TokenKind::Gt => angle = angle.saturating_sub(1),
+                TokenKind::Shr => angle = angle.saturating_sub(2),
+                TokenKind::LParen if angle == 0 => {
+                    open = Some(after as u32 + token.span.start);
+                    depth = 1;
                 }
+                _ => {}
             }
-            _ => {}
+        } else {
+            match token.kind {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((open?, after as u32 + token.span.start));
+                    }
+                }
+                _ => {}
+            }
         }
-        i += 1;
     }
     None
 }
@@ -814,25 +816,22 @@ fn calls_of(root: &Path, func: &str) -> Result<Calls, Refusal> {
 
 /// The `(` that the `)` at `close` closes.
 fn opening(text: &str, close: u32) -> u32 {
-    let bytes = text.as_bytes();
+    use wrela_syntax::token::TokenKind;
     let mut depth = 0;
-    let mut i = close as usize;
-    loop {
-        match bytes[i] {
-            b')' => depth += 1,
-            b'(' => {
+    let tokens: Vec<_> = crate::edit::lex(text).take_while(|t| t.span.start <= close).collect();
+    for token in tokens.into_iter().rev() {
+        match token.kind {
+            TokenKind::RParen => depth += 1,
+            TokenKind::LParen if depth > 0 => {
                 depth -= 1;
                 if depth == 0 {
-                    return i as u32;
+                    return token.span.start;
                 }
             }
             _ => {}
         }
-        if i == 0 {
-            return close;
-        }
-        i -= 1;
     }
+    close
 }
 
 /// Where to add `item` (an argument or a parameter) before the `)` at `close`: after a
@@ -907,8 +906,9 @@ pub fn add_param(
                 ));
             }
             let close = call.span.end - 1;
-            let (s, e, new) =
-                before_close(text, opening(text, close), close, &format!("{name}: {v}"));
+            let call_text = &text[call.span.range()];
+            let open = call.span.start + opening(call_text, call.span.end - call.span.start - 1);
+            let (s, e, new) = before_close(text, open, close, &format!("{name}: {v}"));
             edits.push((call.file.clone(), s, e, new));
         }
     }
@@ -1161,7 +1161,8 @@ pub fn read_plan(root: &Path, text: &str) -> Result<Plan, Refusal> {
 /// more that each is as the plan found it.
 pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
     for f in &plan.files {
-        let now = std::fs::read_to_string(root.join(&f.file)).unwrap_or_default();
+        let now = std::fs::read_to_string(root.join(&f.file))
+            .map_err(|e| format!("can't read {} before writing the plan: {e}", f.file))?;
         if now != f.old {
             return refuse(format!(
                 "{} changed while the plan was made: nothing is written",
@@ -1179,6 +1180,45 @@ pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_delimiters_ignore_strings_and_comments() {
+        for text in [
+            "fn f(s: String = \"(\") {}",
+            "fn f(s: String = \")\") {}",
+            "fn f(// )\n s: String) {}",
+        ] {
+            let open = text.find('(').expect("parameter list");
+            let close = text.rfind(')').expect("closing delimiter");
+            assert_eq!(param_list(text, 4), Some((open as u32, close as u32)), "{text}");
+            assert_eq!(opening(text, close as u32), open as u32, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_deleted_empty_file_makes_a_plan_stale() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-refactor-deleted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        std::fs::write(dir.join("empty.wrela"), "").expect("empty module");
+        let plan = Plan {
+            op: "move an item into an empty module".into(),
+            files: vec![FileChange {
+                file: "empty.wrela".into(),
+                old: String::new(),
+                new: "fn f() {}\n".into(),
+            }],
+            notes: Vec::new(),
+        };
+        std::fs::remove_file(dir.join("empty.wrela")).expect("concurrent deletion");
+        assert!(
+            write(&dir, &plan).is_err(),
+            "a deleted module cannot be recreated by a stale plan"
+        );
+        assert!(!dir.join("empty.wrela").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn hunks_are_the_lines_that_changed() {

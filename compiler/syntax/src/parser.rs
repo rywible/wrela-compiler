@@ -85,8 +85,8 @@ pub(crate) struct Parser<'a> {
     print_fixes: Vec<usize>,
     /// Where the lexer found lifetimes (E0114).
     lifetimes: Vec<Span>,
-    /// While a struct's fields are parsed: whether it had a lifetime, which makes it a
-    /// `borrow struct` once fixed. A `&` in a field's type is fixed to fit.
+    /// While a struct's fields are parsed: whether it is a `borrow struct`, explicitly or
+    /// after fixing a lifetime. A `&` in a field's type is fixed to fit.
     field_of: Option<bool>,
 }
 
@@ -741,7 +741,8 @@ impl<'a> Parser<'a> {
     /// Completes each fix of `println!` and its kin, which calls `print`, from the module's
     /// names. A module that imports `std::io::print` already needs nothing more. In one that
     /// declares or imports another `print`, the call names `std::io::print` in full. Any other
-    /// module gets the import.
+    /// module gets the import. A `print` name outside imports may be local to a function or
+    /// closure, so those files use the full path too.
     fn settle_print_fixes(&mut self, file: &File) {
         if self.print_fixes.is_empty() {
             return;
@@ -758,6 +759,17 @@ impl<'a> Parser<'a> {
                 k => k.name().into_iter().for_each(|n| name(&[], &n.name)),
             }
         }
+        let imports: Vec<Span> = file
+            .items
+            .iter()
+            .filter(|i| matches!(i.kind, ItemKind::Use(_)))
+            .map(|i| i.span)
+            .collect();
+        taken |= self.tokens.head.iter().any(|t| {
+            t.kind == T::Ident
+                && self.text_of(t.span) == "print"
+                && !imports.iter().any(|s| s.start <= t.span.start && t.span.end <= s.end)
+        });
         // L2 permits a UTF-8 BOM only at the start of a file. Imports inserted by a fix belong
         // after it; inserting at byte zero would make the BOM an invalid character on line two.
         let start = if self.text.starts_with('\u{feff}') { 3 } else { 0 };
@@ -1179,7 +1191,7 @@ impl<'a> Parser<'a> {
         // holding references, which is a `borrow struct`'s projections.
         let (from, to) = (name.span.end, self.span().start);
         let had_lifetime = self.lifetimes.iter().any(|l| l.start >= from && l.end <= to);
-        let outer = self.field_of.replace(had_lifetime);
+        let outer = self.field_of.replace(borrow || had_lifetime);
         let block = self.parse_field_block(borrow);
         self.field_of = outer;
         let (fields, multiline) = block?;

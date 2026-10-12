@@ -2,7 +2,7 @@
 // `replace`. A collection owns its elements, frees them when it's dropped, and iterates in an
 // order that doesn't depend on addresses (D-015).
 
-use std::alloc::{free, place, realloc}
+use std::alloc::{alloc, free, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
     Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, keep_bytes, kept_bytes, read, size_of,
@@ -746,7 +746,12 @@ pub struct Box<T>: Clone {
 impl<T> Box<T> {
     /// Moves `value` to the heap.
     pub fn new(value: take T) -> Box<T> {
-        Box { addr: unsafe { place(take value) } }
+        unsafe {
+            // Address 0 means no value, so even a value with no bytes owns a nonzero block.
+            let addr = alloc(max(size_of::<T>(), 1), align_of::<T>())
+            write(addr, take value)
+            Box { addr }
+        }
     }
 
     /// The value, in place. Panics if the box is empty.
@@ -784,7 +789,7 @@ impl<T> Box<T> {
         }
         unsafe {
             let value = read::<T>(b.addr)
-            free(b.addr, size_of::<T>())
+            free(b.addr, max(size_of::<T>(), 1))
             b.addr = 0
             value
         }
@@ -796,7 +801,7 @@ impl<T> Drop for Box<T> {
         if self.addr != 0 {
             unsafe {
                 drop_at::<T>(self.addr)
-                free(self.addr, size_of::<T>())
+                free(self.addr, max(size_of::<T>(), 1))
             }
         }
     }
@@ -845,6 +850,34 @@ impl<T: Ord> Ord for Box<T> {
 }
 
 // ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn a_box_holds_a_zero_sized_value() {
+    var unit = Box::new(())
+    assert(!unit.is_empty())
+    assert(unit.get() == ())
+    let _ = unit.get_mut()
+    let copied = unit.clone()
+    assert(!copied.is_empty() && copied.get() == ())
+    let unit_addr = unit.addr
+    let unit_value = take unit.into_inner()
+    assert(unit_value == ())
+    let reused = Box::new(())
+    assert(reused.addr == unit_addr)
+
+    let dropped_addr = {
+        let temporary = Box::new(())
+        temporary.addr
+    }
+    let after_drop = Box::new(())
+    assert(after_drop.addr == dropped_addr)
+
+    let empty: [u32; 0] = [0; 0]
+    let boxed = Box::new(empty)
+    assert(!boxed.is_empty() && boxed.get().len() == 0)
+    let array_value = take boxed.into_inner()
+    assert(array_value.len() == 0)
+}
 
 struct Keyed {
     key: u32,

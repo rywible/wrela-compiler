@@ -1,10 +1,10 @@
 // The program ABI without a GPU, mirroring runtime/native/src/program/tests.rs.
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, SCREEN, STREAM_VERSION, THREAD_BLOCKS, TICK_RECORDS } from "../src/abi.gen.ts";
+import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, RUNNING, SCREEN, STREAM_VERSION, TASK_SLOTS, THREAD_BLOCK_SIZE, THREAD_BLOCKS, THREAD_HELPER0, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, otherInstance, Program, ProgramError, TrapError } from "../src/program.ts";
+import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { type Command, StreamError } from "../src/stream.ts";
 import { wasmOffsets } from "../src/lines.ts";
@@ -193,6 +193,79 @@ test("rejects out-of-order commands; a pass may span batches", async () => {
   expect(((await runError([[open]])) as StreamError).kind).toBe("UnclosedPass");
   const end = new Encoder().present().finish();
   expect((await run([[open, end]])).error).toBeNull();
+});
+
+test("initialization and other exports cannot return with an open pass", async () => {
+  const batch = new Encoder().beginScreenPass([0, 0, 0, 1]).finish();
+  const body = [...op.i32(16), ...op.i32(batch.length), ...op.call(0)];
+  const module = (name: string) => buildModule({
+    imports: [SUBMIT], memory: 1,
+    funcs: [frameOnly, { type: { params: [], results: [] }, body, export: name }],
+    data: [{ offset: 16, bytes: batch }],
+  });
+  await expect(load(module("init"))).rejects.toThrow("a call returned with a pass still open");
+  const program = await load(module("open"));
+  expect(() => program.call("open")).toThrow("a call returned with a pass still open");
+});
+
+test("initialization and other exports flush their completed command work", async () => {
+  const created = new Encoder().createBuffer(1, 4).finish();
+  const written = new Encoder().writeBuffer(1, 0, new Uint8Array(4)).finish();
+  const submit = (offset: number, length: number) => [...op.i32(offset), ...op.i32(length), ...op.call(0)];
+  const executor = new Recorder();
+  const program = await Program.load(buildModule({
+    imports: [SUBMIT], memory: 1,
+    funcs: [frameOnly,
+      { type: { params: [], results: [] }, body: submit(16, created.length), export: "init" },
+      { type: { params: [], results: [] }, body: submit(16 + created.length, written.length), export: "write" },
+    ],
+    data: [{ offset: 16, bytes: created }, { offset: 16 + created.length, bytes: written }],
+  }), checker(), executor);
+  expect(executor.log).toEqual(["CreateBuffer", "end"]);
+  program.call("write");
+  expect(executor.log).toEqual(["CreateBuffer", "end", "WriteBuffer", "end"]);
+});
+
+test("a helper trap ignores absent controls and interior job pointers", async () => {
+  const wasm = buildModule({ memory: 0, funcs: [frameOnly,
+    { type: { params: ["i32"], results: [] }, body: op.unreachable, export: "__worker" },
+  ] });
+  const module = await WebAssembly.compile(wasm);
+  const logged = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    for (const initial of [0, 1]) {
+      const memory = new WebAssembly.Memory({ initial, maximum: 20, shared: true });
+      await expect(runWorker(module, memory, THREAD_HELPER0)).resolves.toBeUndefined();
+    }
+    for (const base of [THREAD_BLOCKS, TASK_SLOTS]) {
+      const memory = new WebAssembly.Memory({ initial: 20, maximum: 20, shared: true });
+      new DataView(memory.buffer).setUint32(THREAD_BLOCKS + THREAD_HELPER0 * THREAD_BLOCK_SIZE + RUNNING, base + 4, true);
+      const bytes = new Uint8Array(memory.buffer, base, 32);
+      const before = bytes.slice();
+      await runWorker(module, memory, THREAD_HELPER0);
+      expect(bytes).toEqual(before);
+    }
+  } finally {
+    logged.mockRestore();
+  }
+});
+
+test("a program without helper control memory reports no helper work", async () => {
+  const program = await load(buildModule({ memory: 0, funcs: [frameOnly] }));
+  expect(program.workerChunks()).toBe(0);
+  program.frame(0, 1, 1);
+  expect(program.workerChunks()).toBe(0);
+});
+
+test("a helper export needs control memory before any helper is started", async () => {
+  let spawned = 0;
+  const wasm = buildModule({ memory: 0, funcs: [frameOnly,
+    { type: { params: ["i32"], results: [] }, body: [], export: "__worker" },
+  ] });
+  await expect(Program.load(wasm, checker(), new Recorder(), {
+    workers: 3, spawnWorker: () => { spawned++; },
+  })).rejects.toThrow("it exports `__worker` but its memory is 0 bytes; the helpers need at least 276");
+  expect(spawned).toBe(0);
 });
 
 test("rejects submits outside memory", async () => {
@@ -582,6 +655,20 @@ describe("requests", () => {
     expect(absent.call("status")).toBe(-2);
     const invalid = await program(new Encoder().hostRequest(4, "../escape", new Uint8Array()).finish(), { io });
     expect(() => invalid.call("ask")).toThrow("HostRequest failed");
+  });
+
+  test("host capability methods retain their IO receiver", async () => {
+    const io = {
+      answer: Uint8Array.of(9, 8, 7, 6),
+      fetch: async () => new Uint8Array(), storageRead: async () => new Uint8Array(),
+      storageWrite: async () => {}, post: async () => new Uint8Array(),
+      async hostRequest() { return this.answer.slice(); },
+    };
+    const p = await program(new Encoder().hostRequest(4, "test/echo", new Uint8Array()).finish(), { io });
+    p.call("ask");
+    await later();
+    expect(p.call("status")).toBe(4);
+    expect(p.call("take")).toBe(0x06070809);
   });
 
   test("storage paths stay inside the program's storage", async () => {

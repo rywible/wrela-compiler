@@ -603,6 +603,27 @@ impl Numbers {
                 k == l && self.text[s as usize..e as usize] == other.text[t as usize..u as usize]
             })
     }
+
+    /// The tokens outside the literal ranges; unlike `shape`, this keeps unlifted numbers
+    /// and operators, so those changes require a new build.
+    fn outside_literals(&self, mut ranges: Vec<(u32, u32)>) -> Vec<(TokenKind, &str)> {
+        ranges.sort_unstable();
+        let mut next = 0;
+        crate::edit::lex(&self.text)
+            .filter_map(|token| {
+                while next < ranges.len() && ranges[next].1 <= token.span.start {
+                    next += 1;
+                }
+                if ranges
+                    .get(next)
+                    .is_some_and(|&(s, e)| s <= token.span.start && token.span.end <= e)
+                {
+                    return None;
+                }
+                Some((token.kind, &self.text[token.span.range()]))
+            })
+            .collect()
+    }
 }
 
 /// Where literal `start..end` of the build's text (`then`) is in the file's text `now`: the
@@ -664,9 +685,23 @@ pub(crate) fn literal_values(
     }
     // Every file the build lifted, as it is now, each lexed once.
     let mut texts = Vec::with_capacity(lifted.len());
-    for (path, then) in lifted {
+    for (file, (path, then)) in lifted.iter().enumerate() {
         let current = Numbers::new(Arc::clone(&now[path].text));
         if !then.same_but_numbers(&current) {
+            return None;
+        }
+        let mut before_ranges = Vec::new();
+        let mut now_ranges = Vec::new();
+        for l in literals.iter().filter(|l| l.file as usize == file) {
+            let (start, end) = moved(then, &current, l.start, l.end)?;
+            let with_minus = |text: &str, start: u32| {
+                crate::edit::minus_before(text.as_bytes(), start as usize)
+                    .map_or(start, |minus| minus as u32)
+            };
+            before_ranges.push((with_minus(then.text(), l.start), l.end));
+            now_ranges.push((with_minus(current.text(), start), end));
+        }
+        if then.outside_literals(before_ranges) != current.outside_literals(now_ranges) {
             return None;
         }
         texts.push(current);
@@ -805,6 +840,34 @@ pub fn reference_mask(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlifted_numbers_and_binary_minus_changes_require_a_rebuild() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-studio-unlifted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let text = "fn f() { let n: u32 = 2; let x = n - 0.5 }\n";
+        let file = dir.join("main.wrela");
+        std::fs::write(&file, text).expect("source");
+        let built = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+        let lifted = vec![(file.clone(), Numbers::new(text))];
+        let start = text.find("0.5").expect("lifted literal") as u32;
+        let literals =
+            vec![crate::lift::ReportLiteral { file: 0, start, end: start + 3, value: 0.5 }];
+        for changed in [text.replace("= 2", "= 3"), text.replace("n - 0.5", "n 0.5")] {
+            std::fs::write(&file, changed).expect("changed source");
+            let now = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+            assert!(
+                literal_values(&lifted, &literals, &now, &built).is_none(),
+                "a non-lifted change cannot update only the table"
+            );
+        }
+        std::fs::write(&file, text.replace("0.5", "-0.25")).expect("lifted edit");
+        let now = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+        assert_eq!(literal_values(&lifted, &literals, &now, &built), Some(vec![-0.25]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     fn same_but_numbers(a: &str, b: &str) -> bool {
         Numbers::new(a).same_but_numbers(&Numbers::new(b))

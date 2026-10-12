@@ -62,6 +62,28 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::abi", include_str!("../../std/abi.wrela")),
 ];
 
+#[cfg(test)]
+pub(crate) fn test_units(source: &str) -> Vec<SourceUnit> {
+    let unit = |file, name: &str, text: &str, package| {
+        let parsed = wrela_syntax::parse(wrela_diag::FileId(file), text);
+        assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
+        SourceUnit {
+            path: name.split("::").map(str::to_string).collect(),
+            ast: std::sync::Arc::new(parsed.file),
+            package,
+            syntax_errors: Vec::new(),
+            text: std::sync::Arc::from(text),
+        }
+    };
+    let mut units: Vec<SourceUnit> = STD_SOURCES
+        .iter()
+        .enumerate()
+        .map(|(i, &(name, text))| unit(i as u32, name, text, 0))
+        .collect();
+    units.push(unit(units.len() as u32, "main", source, 1));
+    units
+}
+
 /// A checked program: its definitions, every function body's MIR, and every constant.
 #[derive(Debug)]
 pub struct Checked {

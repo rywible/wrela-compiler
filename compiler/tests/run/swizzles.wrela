@@ -14,6 +14,9 @@
 // expect: index_select(0, false) = 3.0
 // expect: index_select(2, true) = 9.0
 // expect: arg_copy(1) = 2.0
+// expect: closure_swizzle() = (21.0, 12.0, 3.0)
+// expect: named_swizzle() = (21.0, 12.0, 3.0)
+// expect: erased_mutable_closure() = 7
 
 pub fn bind_assign(a: f32) -> f32 {
     var v = vec3(1.0, 2.0, 3.0)
@@ -90,4 +93,33 @@ fn get(v: vec3, i: u32) -> f32 {
 pub fn arg_copy(i: u32) -> f32 {
     let v = vec3(1.0, 2.0, 3.0)
     get(v.zyx, i)
+}
+
+fn apply_swizzle(v: mut vec3, update: fn(mut vec2)) {
+    update(mut v.yx)
+}
+
+fn update_components(v: mut vec2) {
+    v += vec2(10.0, 20.0)
+}
+
+pub fn closure_swizzle() -> vec3 {
+    var v = vec3(1.0, 2.0, 3.0)
+    apply_swizzle(mut v, |p| { p += vec2(10.0, 20.0) })
+    v
+}
+
+pub fn named_swizzle() -> vec3 {
+    var v = vec3(1.0, 2.0, 3.0)
+    apply_swizzle(mut v, update_components)
+    v
+}
+
+fn invoke_unit(value: mut (), callback: fn(mut ()) -> u32) -> u32 {
+    callback(mut value)
+}
+
+pub fn erased_mutable_closure() -> u32 {
+    var unit = ()
+    invoke_unit(mut unit, |_| 7)
 }

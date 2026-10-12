@@ -19,6 +19,12 @@
 // expect: generic(9) = 100
 // expect: packed(1027) = 515
 // expect: picked() = 30
+// expect: cloned(0) = 4
+// expect: cloned(1) = 9
+// expect: cloned(2) = 17
+// expect: cloned_into(0) = 4
+// expect: cloned_into(1) = 9
+// expect: cloned_into(2) = 17
 use std::collections::Flags
 
 enum Way: Copy + Eq + Fieldless {
@@ -45,7 +51,7 @@ pub fn back(n: u32) -> u32 {
                 i += 1
             }
             i
-        }
+        },
         None => 100,
     }
 }
@@ -102,4 +108,31 @@ const PICKED: Way = pick()
 
 pub fn picked() -> u32 {
     u32(PICKED)
+}
+
+// `Clone` without `Copy` uses fieldwise glue, which must still compare discriminants.
+enum Choice: Clone {
+    First = 4,
+    Second = 9,
+    Third = 17,
+}
+
+fn choice(i: u32) -> Choice {
+    match i {
+        0 => Choice::First,
+        1 => Choice::Second,
+        _ => Choice::Third,
+    }
+}
+
+pub fn cloned(i: u32) -> u32 {
+    let original = choice(i)
+    u32(original.clone())
+}
+
+pub fn cloned_into(i: u32) -> u32 {
+    let original = choice(i)
+    var into = Choice::First
+    original.clone_into(mut into)
+    u32(into)
 }

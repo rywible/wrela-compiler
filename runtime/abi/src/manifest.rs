@@ -59,6 +59,8 @@ pub const MAX_WORKGROUP_INVOCATIONS: u32 = Limits::DEFAULT.max_workgroup_invocat
 pub const MAX_STORAGE_BUFFERS_PER_STAGE: usize =
     Limits::DEFAULT.max_storage_buffers_per_stage as usize;
 pub const MAX_UNIFORM_BUFFER_BINDING_SIZE: u32 = Limits::DEFAULT.max_uniform_buffer_binding_size;
+/// WebGPU's default `maxBindingsPerBindGroup`: every binding number is below this.
+pub const MAX_BINDINGS_PER_GROUP: u32 = 1000;
 /// WebGPU's default limits on what one shader stage binds (`maxSampledTexturesPerShaderStage`,
 /// `maxSamplersPerShaderStage`, `maxStorageTexturesPerShaderStage`).
 pub const MAX_SAMPLED_TEXTURES_PER_STAGE: usize = 16;
@@ -511,6 +513,13 @@ impl Manifest {
             if bindings.len() != n {
                 return err(format!("pipeline {i} uses a binding twice"));
             }
+            if let Some(binding) =
+                bindings.iter().find(|&&binding| binding >= MAX_BINDINGS_PER_GROUP)
+            {
+                return err(format!(
+                    "pipeline {i} uses binding {binding}; WebGPU's default limit is {MAX_BINDINGS_PER_GROUP}"
+                ));
+            }
             let render = matches!(p.stage, Stage::Render { .. });
             for b in &p.bindings {
                 if !render && !b.stage.is_both() {
@@ -566,12 +575,12 @@ impl Manifest {
                     if entry.is_empty() {
                         return err(format!("pipeline {i} has no entry point"));
                     }
-                    let total: u64 = workgroup_size.iter().map(|&x| x as u64).product();
                     let ok = workgroup_size
                         .iter()
                         .zip(MAX_WORKGROUP_SIZE)
                         .all(|(&s, m)| s >= 1 && s <= m)
-                        && total <= MAX_WORKGROUP_INVOCATIONS as u64;
+                        && workgroup_size.iter().map(|&x| u64::from(x)).product::<u64>()
+                            <= u64::from(MAX_WORKGROUP_INVOCATIONS);
                     if !ok {
                         return err(format!(
                             "pipeline {i}'s workgroup size {workgroup_size:?} is outside WebGPU's limits"
@@ -579,7 +588,13 @@ impl Manifest {
                     }
                 }
                 Stage::Render {
-                    vertex_entry, fragment_entry, writes_depth, uint, targets, ..
+                    vertex_entry,
+                    fragment_entry,
+                    writes_depth,
+                    uint,
+                    blend,
+                    targets,
+                    ..
                 } => {
                     if vertex_entry.is_empty() || fragment_entry.is_empty() {
                         return err(format!("pipeline {i} is missing an entry point"));
@@ -609,6 +624,8 @@ impl Manifest {
                             )
                         } else if t.color.is_some_and(|c| c.is_depth()) {
                             Some("a colour target's format isn't a depth one")
+                        } else if *blend && t.color.is_some_and(|c| !c.filterable()) {
+                            Some("its colour is blended, which this format doesn't support")
                         } else {
                             None
                         };
@@ -1023,5 +1040,81 @@ mod tests {
         m.pipelines[0].uniform =
             Some(UniformBlock { binding: 0, size: 20, space: UniformSpace::Uniform });
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_workgroup_sizes_whose_product_overflows_u64() {
+        let mut m = sample();
+        if let Stage::Compute { workgroup_size, .. } = &mut m.pipelines[0].stage {
+            *workgroup_size = [u32::MAX; 3];
+        }
+        let error = Manifest::parse(&m.to_json()).expect_err("oversized workgroup");
+        assert_eq!(
+            error.0,
+            "pipeline 0's workgroup size [4294967295, 4294967295, 4294967295] is outside WebGPU's limits"
+        );
+    }
+
+    #[test]
+    fn binding_numbers_are_below_the_bind_group_limit() {
+        for slot in 0..3 {
+            for binding in [MAX_BINDINGS_PER_GROUP - 1, MAX_BINDINGS_PER_GROUP, u32::MAX] {
+                let mut m = sample();
+                let p = &mut m.pipelines[0];
+                match slot {
+                    0 => p.bindings[0].binding = binding,
+                    1 => p.uniform.as_mut().expect("uniform").binding = binding,
+                    _ => p.debug_flag = Some(binding),
+                }
+                let result = Manifest::parse(&m.to_json());
+                if binding < MAX_BINDINGS_PER_GROUP {
+                    result.expect("last binding within the limit");
+                } else {
+                    assert_eq!(
+                        result.expect_err("binding over the limit").0,
+                        format!(
+                            "pipeline 0 uses binding {binding}; WebGPU's default limit is {MAX_BINDINGS_PER_GROUP}"
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn blended_targets_support_blending() {
+        for (format, blendable) in [
+            (TextureFormat::Rgba8, true),
+            (TextureFormat::Rgba16Float, true),
+            (TextureFormat::R16Float, true),
+            (TextureFormat::Rg16Float, true),
+            (TextureFormat::R32Float, false),
+            (TextureFormat::R32Uint, false),
+        ] {
+            let mut m = sample();
+            if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
+                *blend = true;
+                *uint = format.is_uint();
+                *targets = vec![RenderTarget { color: Some(format), depth: false }];
+            }
+            let result = Manifest::parse(&m.to_json());
+            if blendable {
+                result.expect("blendable colour target");
+            } else {
+                assert_eq!(
+                    result.expect_err("unblendable target").0,
+                    format!(
+                        "pipeline 1's target {format} can't be one: its colour is blended, which this format doesn't support",
+                        format = format.name()
+                    )
+                );
+            }
+        }
+        let mut m = sample();
+        if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
+            *blend = true;
+            *targets = vec![RenderTarget { color: None, depth: true }];
+        }
+        Manifest::parse(&m.to_json()).expect("a depth-only variant has no colour blend");
     }
 }

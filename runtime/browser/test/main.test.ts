@@ -1,6 +1,7 @@
 // The main-thread shim (src/main.ts) on a fake page: each test loads a fresh copy of it.
 
 import { afterEach, expect, test } from "bun:test";
+import { InputRing, padButtonEvent } from "../src/input.ts";
 import type { FromVoice, FromWorker, ToWorker, VoiceOptions } from "../src/messages.ts";
 
 const saved = new Map<string, PropertyDescriptor | undefined>();
@@ -36,7 +37,7 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean } = {}): Promise<Page> {
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null };
   const canvas = {
     style: {},
@@ -51,6 +52,7 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
   fake("document", {
     baseURI: `${u.origin}${u.pathname}`,
     visibilityState: options.hidden ? "hidden" : "visible",
+    hasFocus: () => options.focused ?? true,
     querySelector: () => canvas,
     createElement: () => ({ setAttribute() {}, textContent: "" }),
     body: { append: (el: { textContent: string }) => page.shown.push(el.textContent) },
@@ -114,6 +116,25 @@ test("the worker learns the page's visibility at once, and on each change", asyn
   (document as { visibilityState: string }).visibilityState = "visible";
   for (const f of page.visibilityListeners) f();
   expect(page.posted.at(-1)).toEqual({ type: "visibility", visible: true });
+});
+
+test("an unfocused embedded document defers gamepad input until it gains focus", async () => {
+  const pending: FrameRequestCallback[] = [];
+  fake("requestAnimationFrame", (callback: FrameRequestCallback) => pending.push(callback));
+  fake("getGamepads", () => [{ connected: true, mapping: "standard", buttons: [{ value: 1, pressed: true }], axes: [] }], navigator);
+  const options = { focused: false };
+  const page = await load("https://example.com/game/", options);
+  const start = page.posted.find(msg => msg.type === "start")!;
+  const ring = new InputRing(start.input);
+  pending.shift()!(0);
+  expect(ring.read().events.length).toBe(0);
+  options.focused = true;
+  (document as { visibilityState: string }).visibilityState = "hidden";
+  pending.shift()!(0);
+  expect(ring.read().events.length).toBe(0);
+  (document as { visibilityState: string }).visibilityState = "visible";
+  pending.shift()!(0);
+  expect(ring.read().events).toEqual(padButtonEvent(0, 0, 1, true));
 });
 
 test("the canvas is watched in device pixels, so a pixel ratio change resizes it", async () => {
@@ -198,6 +219,51 @@ test("stopping a voice while its worklet loads keeps it from starting later", as
   page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice } satisfies FromWorker }));
   await Bun.sleep(1);
   expect(nodes).toBe(1);
+});
+
+test("a fatal render worker error stops the voice already playing", async () => {
+  let connected = false;
+  fake("AudioContext", class {
+    readonly audioWorklet = { addModule: async () => {} };
+    readonly destination = {};
+    readonly state = "running";
+  });
+  fake("AudioWorkletNode", class {
+    readonly port = { onmessage: null };
+    onprocessorerror = null;
+    connect() { connected = true; }
+    disconnect() { connected = false; }
+  });
+  const page = await load("https://example.com/game/");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  await Bun.sleep(1);
+  expect(connected).toBe(true);
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed" } satisfies FromWorker }));
+  expect(connected).toBe(false);
+  expect(page.shown).toEqual(["wrela stopped: frame failed"]);
+});
+
+test("a fatal render worker error keeps a loading voice from starting later", async () => {
+  const loaded = Promise.withResolvers<void>();
+  let nodes = 0;
+  fake("AudioContext", class {
+    readonly audioWorklet = { addModule: () => loaded.promise };
+    readonly destination = {};
+    readonly state = "running";
+  });
+  fake("AudioWorkletNode", class {
+    readonly port = { onmessage: null };
+    onprocessorerror = null;
+    constructor() { nodes++; }
+    connect() {}
+    disconnect() {}
+  });
+  const page = await load("https://example.com/game/");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed" } satisfies FromWorker }));
+  loaded.resolve();
+  await Bun.sleep(1);
+  expect(nodes).toBe(0);
 });
 
 test("offline audio waits for the worklet's print marker before reporting it rendered", async () => {

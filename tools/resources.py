@@ -156,9 +156,10 @@ def gpu_locks(shared):
         descriptors.append(barrier)
         fcntl.flock(barrier, fcntl.LOCK_SH if shared else fcntl.LOCK_EX)
         if shared:
-            slots = [os.open(root / f"gpu-slot-{n}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
-                     for n in range(2)]
+            slots = []
             try:
+                for n in range(2):
+                    slots.append(os.open(root / f"gpu-slot-{n}.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600))
                 while True:
                     for slot in slots:
                         try:

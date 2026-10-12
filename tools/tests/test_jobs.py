@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import runpy
 import shutil
 import subprocess
 import sys
@@ -17,6 +18,32 @@ sys.path.insert(0, str(TOOLS))
 import jobs
 import resources
 import worktrees
+
+
+class CliAdmission(unittest.TestCase):
+    def test_profile_and_build_receive_their_own_admission_policy(self):
+        original = os.getcwd()
+        try:
+            for arguments, expected in [(["profile", "examples/last-green"], "measure"),
+                                        (["build", "examples/last-green"], "build"),
+                                        (["context", "examples/last-green"], "focused"),
+                                        (["test", "examples/last-green"], "focused"),
+                                        (["audio", "examples/chords", "speed"], "measure"),
+                                        (["audio", "--take", "2", "examples/chords", "speed"], "measure"),
+                                        (["audio", "examples/chords", "--take", "2", "speed"], "measure"),
+                                        (["audio", "speed", "wav"], "focused"),
+                                        (["audio", "partials", "speed"], "focused")]:
+                with self.subTest(arguments=arguments), \
+                        patch.object(sys, "argv", ["tools/wrela", *arguments]), \
+                        patch.object(jobs, "admitted", return_value=False), \
+                        patch.object(jobs, "run", return_value=17) as run, \
+                        self.assertRaises(SystemExit) as status:
+                    runpy.run_path(str(TOOLS / "wrela"), run_name="__main__")
+                self.assertEqual(status.exception.code, 17)
+                self.assertEqual(run.call_args.args[0], expected)
+                self.assertEqual(run.call_args.args[1][2:], arguments)
+        finally:
+            os.chdir(original)
 
 
 def until(predicate, timeout=8):
@@ -234,6 +261,29 @@ class QueueTests(Processes):
         code, output = self.result(self.queued("open('source','w').write('after')", "focused", "--verify"))
         self.assertEqual(code, 1, output)
         self.assertIn("source inputs changed", output)
+
+    def test_restored_source_still_invalidates_a_verification_pass(self):
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
+        (self.root / "source").write_text("before")
+        (self.root / ".gitignore").write_text("resources/\ntarget/\n")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"], cwd=self.root, check=True)
+        script = "import os; from pathlib import Path; p=Path('source'); old=p.read_text(); stamp=p.stat(); p.write_text('after'); p.write_text(old); os.utime(p, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))"
+        code, output = self.result(self.queued(script, "focused", "--verify"))
+        self.assertEqual(code, 1, output)
+        self.assertIn("source inputs changed", output)
+
+    def test_untracked_input_names_and_contents_have_separate_boundaries(self):
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=self.root, check=True)
+        (self.root / "source").write_text("tracked")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        subprocess.run(["git", "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"], cwd=self.root, check=True)
+        (self.root / "a").write_text("bc")
+        before = jobs.fingerprint(self.root)
+        (self.root / "a").unlink()
+        (self.root / "ab").write_text("c")
+        after = jobs.fingerprint(self.root)
+        self.assertNotEqual(before["inputs"], after["inputs"])
 
 
 class RendererTests(Processes):

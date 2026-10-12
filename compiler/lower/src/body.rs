@@ -763,6 +763,12 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                     return;
                 }
+                TerminatorKind::ReturnPlace(p) if self.f.ret.is_none() => {
+                    // A projection of an erased value, such as `()`, has no pointer to return.
+                    self.check_array_indices(p);
+                    self.emit(ir::Stmt::Return(None));
+                    return;
+                }
                 TerminatorKind::ReturnPlace(p)
                     if self
                         .f
@@ -1051,7 +1057,10 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         // A store into a place (or through a projection).
         let ty = mir::place_ty(&self.cx.checked.program, &self.mir.locals, place);
-        let Some(v) = self.rvalue(r, Some(ty), span) else { return };
+        let Some(v) = self.rvalue(r, Some(ty), span) else {
+            self.check_array_indices(place);
+            return;
+        };
         self.store(place, v);
     }
 
@@ -1285,6 +1294,36 @@ impl<'c, 'a> Fl<'c, 'a> {
 
     // ---- places ----------------------------------------------------------------------------
 
+    /// Array indices still evaluate when their element, or a static length, has no stored
+    /// value. With no IR address for the back end to check, retain the source array's bound.
+    fn check_array_indices(&mut self, p: &mir::Place) {
+        if self.is_gpu() {
+            return;
+        }
+        let mut ty = self.concrete(self.local_ty(p.local));
+        let mut variant = None;
+        for proj in &p.proj {
+            if let mir::Proj::Index(index) = proj
+                && let TyKind::Array(_, len) = self.types().kind(ty)
+            {
+                let len = *len;
+                if let Some(index) = self.local_value(*index) {
+                    let index = self.index_u32(index);
+                    let len = self.u32c(len);
+                    let b = self.mb.m.types.bool();
+                    let past = self.value(b, ir::Expr::Binary(ir::BinOp::Ge, index, len));
+                    self.emit(ir::Stmt::If {
+                        cond: past,
+                        then: vec![ir::Stmt::Trap],
+                        else_: Vec::new(),
+                    });
+                }
+            }
+            let next = mir::proj_ty(&self.cx.checked.program, ty, &mut variant, proj);
+            ty = self.concrete(next);
+        }
+    }
+
     /// Moves a temporary's value into an IR local, so it has a place. The local is stored
     /// where the value is defined, which encloses every use of the temporary: the first use
     /// that needs a place may be in a branch (a `match` arm), and later uses outside it.
@@ -1303,6 +1342,13 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// The IR place of a MIR place, its type, and a trailing swizzle (which no IR place can
     /// name). `None` when it has no runtime value.
     fn place_parts(&mut self, p: &mir::Place) -> Option<(ir::Place, TyId, Option<Vec<u8>>)> {
+        if !self.is_gpu()
+            && p.proj.iter().any(|p| matches!(p, mir::Proj::Index(_)))
+            && !self.has_value(p)
+        {
+            self.check_array_indices(p);
+            return None;
+        }
         let (base, mut ty, skip) = self.base_of(p);
         let mut swizzle = None;
         let ir::Place { mut root, mut path } = match base {
@@ -1929,6 +1975,16 @@ impl<'c, 'a> Fl<'c, 'a> {
             BinOp::Or => ir::BinOp::Or,
             BinOp::Pow => unreachable!("handled above"),
         };
+        // A vector's shift amounts are unsigned even when its components are signed.
+        let bv = if matches!(iop, ir::BinOp::Shl | ir::BinOp::Shr)
+            && let &ir::TypeDef::Vector(_, n) = self.mb.m.types.get(self.f.value_ty(av))
+            && self.mb.m.types.as_scalar(self.f.value_ty(bv)) == Some(ir::Scalar::U32)
+        {
+            let amounts = self.mb.m.types.vector_of(ir::Scalar::U32, n);
+            self.value(amounts, ir::Expr::Splat(bv, n))
+        } else {
+            bv
+        };
         // A scalar with a vector is splatted to the vector's size: the IR's elementwise
         // operations take operands of one type.
         let (av, bv) = (self.splat_to(av, bv), self.splat_to(bv, av));
@@ -2131,6 +2187,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         let t = self.place_src_ty(p);
         if let TyKind::Array(_, n) = self.types().kind(t) {
             let n = *n;
+            self.check_array_indices(p);
             return Some(self.value(u, ir::Expr::Const(ir::Const::U32(n))));
         }
         if let Some(n) = self.container_len(p) {
@@ -2489,15 +2546,33 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         // A closure takes its `mut` parameters as places, the others by value.
         let mut out = self.capture_args(srcs)?;
+        let mut write_back = Vec::new();
         for a in args {
             if let mir::Arg::Mut(pl, _) = a {
-                out.push(ir::Arg::Place(self.place_or_copy(pl)?));
+                if !self.has_value(pl) {
+                    continue;
+                }
+                let place = match self.place(pl) {
+                    Some(place) => place,
+                    None => {
+                        let copy = self.place_or_copy(pl)?;
+                        write_back.push((pl, copy.clone()));
+                        copy
+                    }
+                };
+                out.push(ir::Arg::Place(place));
             } else if let Some(v) = self.arg_value(a) {
                 out.push(ir::Arg::Value(v));
             }
         }
         let callee = self.cx.instance(self.mb, callable.instance_key(), Some((self.id, span)));
-        self.emit_call(callee, out)
+        let result = self.emit_call(callee, out);
+        for (original, copy) in write_back {
+            let ty = self.place_ty(&copy)?;
+            let value = self.load(copy, ty);
+            self.store(original, value);
+        }
+        result
     }
 
     // ---- built-ins -------------------------------------------------------------------------

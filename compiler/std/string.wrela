@@ -497,6 +497,9 @@ impl str {
         }
         if i < n && (self.byte(i) == 101 || self.byte(i) == 69) {
             let e = if i + 1 < n && self.byte(i + 1) == 43 {
+                if i + 2 < n && self.byte(i + 2) == 45 {
+                    return None
+                }
                 self.slice(i + 2, n).parse_i32()?
             } else {
                 self.slice(i + 1, n).parse_i32()?
@@ -611,6 +614,15 @@ fn float_parser_accepts_positive_exponent_sign() {
     assert("1e+2".parse_f32() == Some(100.0))
     assert("1.5E+3".parse_f32() == Some(1500.0))
     assert("1e+".parse_f32() == None)
+}
+
+@test
+fn float_parser_rejects_multiple_exponent_signs() {
+    for text in ["1e+-2", "1e++2", "1e--2", "1e-+2", "1E+-0"] {
+        assert(text.parse_f32() == None, f"accepted `{text}`")
+    }
+    assert("1e-2".parse_f32() == Some(0.01))
+    assert("1e+2".parse_f32() == Some(100.0))
 }
 
 impl Eq for str {
