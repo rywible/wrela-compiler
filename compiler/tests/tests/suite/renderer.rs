@@ -344,3 +344,77 @@ fn each_depth_test_and_write_draws_the_same_in_both_hosts() {
     }
     frames_match(&chrome, &native);
 }
+
+/// Colour bounds do not distinguish two surfaces with the same palette. A changed depth
+/// must reject that history for newly hidden geometry, revealed geometry, and revealed sky.
+/// A matching depth keeps temporal accumulation, so rejecting all history cannot pass.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_depth_rejects_occluded_history_and_keeps_matching_surfaces() {
+    let (dir, _) = page("compiler/tests/temporal-depth", "temporal-depth");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 96, 40).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 96 + x)..4 * (y * 96 + x) + 3] };
+    // Four-times-distant blue samples next to near red samples cannot bleed through the
+    // foreground, nor can the foreground expand over the visible background beside it.
+    for (x, expected) in [(4, [204u8, 13, 13]), (6, [13u8, 13, 204])] {
+        let actual = px(x, 3);
+        assert!(
+            actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+            "opaque edge at {x}: {actual:?}, expected {expected:?}"
+        );
+    }
+    let mut retained_difference = 0usize;
+    for y in [3, 11, 19] {
+        for x in 3..29 {
+            let reference = px(x, y);
+            let rejected = px(x + 32, y);
+            assert!(
+                reference.iter().zip(rejected).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "stale depth at ({x}, {y}): fresh {reference:?}, resolved {rejected:?}"
+            );
+            retained_difference += reference
+                .iter()
+                .zip(px(x + 64, y))
+                .map(|(a, b)| usize::from(a.abs_diff(*b)))
+                .sum::<usize>();
+        }
+    }
+    assert!(
+        retained_difference > 1000,
+        "matching surfaces lost their history: {retained_difference}"
+    );
+}
+
+/// Leaves and a solid silhouette against sky are partial coverage. Their stored depth can
+/// change with jitter without the history becoming invalid. Keep that history and the
+/// spatial background contribution, while the opaque rows above retain depth rejection.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_keeps_partial_leaf_and_sky_coverage_across_depth_changes() {
+    let (dir, _) = page("compiler/tests/temporal-depth", "temporal-coverage");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 96, 40).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 96 + x)..4 * (y * 96 + x) + 3] };
+    for (y, surface) in [(27, "leaf coverage"), (35, "sky silhouette")] {
+        // The red and blue surfaces share an output pixel's reconstruction footprint.
+        let edge = px(4, y);
+        assert!(
+            edge[0] < 202 && edge[0] > 150 && edge[2] > 14,
+            "{surface} lost spatial coverage: {edge:?}"
+        );
+        let mut accumulated = 0usize;
+        for x in 3..29 {
+            let changed_depth = px(x + 32, y);
+            let same_depth = px(x + 64, y);
+            assert!(
+                changed_depth.iter().zip(same_depth).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "{surface} discarded coverage history at {x}: {changed_depth:?} vs {same_depth:?}"
+            );
+            accumulated += px(x, y)
+                .iter()
+                .zip(changed_depth)
+                .map(|(a, b)| usize::from(a.abs_diff(*b)))
+                .sum::<usize>();
+        }
+        assert!(accumulated > 500, "{surface} did not accumulate history: {accumulated}");
+    }
+}
