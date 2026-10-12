@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -307,6 +308,93 @@ class LockPathTest(unittest.TestCase):
 
 
 class ConsoleTest(unittest.TestCase):
+    def test_appended_chunks_keep_live_partial_messages_without_rereading(self):
+        prefix = b'[84636:49385518:1002/224334.934267:INFO:CONSOLE:2] "'
+        older = prefix + b'older tab", source: file:///old.html (2)\n'
+        chunks = [
+            (prefix[:30], ""),
+            (prefix[30:] + b'first\n', "first\n"),
+            (b'second \xe2', "first\nsecond \ufffd\n"),
+            (b'\x82\xac\nlast", source: file:///', "first\nsecond \u20ac\nlast\", source: file:///\n"),
+            (b'p.html (2)', "first\nsecond \u20ac\nlast\n"),
+            (b'\r', "first\nsecond \u20ac\nlast\n"),
+            (b'\n[84636:49385518:1002/224335.934267:ERROR:other] ignored\n' + prefix + b'cut off',
+             "first\nsecond \u20ac\nlast\ncut off\n"),
+            (b' here', "first\nsecond \u20ac\nlast\ncut off here\n"),
+            (b'\n' + prefix + b'next", source: file:///p.html (2)\n',
+             "first\nsecond \u20ac\nlast\ncut off here\nnext\n"),
+            (prefix + b'bare\rending", source: p (2)\r',
+             "first\nsecond \u20ac\nlast\ncut off here\nnext\nbare\nending\n"),
+            (prefix + b'after CR", source: p (2)',
+             "first\nsecond \u20ac\nlast\ncut off here\nnext\nbare\nending\nafter CR\n"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            log, out = os.path.join(tmp, "chrome.log"), os.path.join(tmp, "console.log")
+            with open(log, "wb") as source:
+                source.write(older)
+            console = headless.ConsoleTail(log, out, len(older))
+            original = open
+            read_at, read_sizes, writes = [], [], []
+
+            class Source:
+                def __init__(self, source):
+                    self.source = source
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    self.source.close()
+
+                def seek(self, offset):
+                    read_at.append(offset)
+                    return self.source.seek(offset)
+
+                def tell(self):
+                    return self.source.tell()
+
+                def read(self):
+                    data = self.source.read()
+                    read_sizes.append(len(data))
+                    return data
+
+            def tracked_open(path, mode, *args, **kwargs):
+                source = original(path, mode, *args, **kwargs)
+                if path == log:
+                    return Source(source)
+                writes.append(mode)
+                return source
+
+            offset = len(older)
+            with patch.object(headless, "open", side_effect=tracked_open, create=True):
+                for chunk, expected in chunks:
+                    with original(log, "ab") as source:
+                        source.write(chunk)
+                    console.read()
+                    self.assertEqual(read_at[-1], offset)
+                    offset += len(chunk)
+                    with original(out) as output:
+                        self.assertEqual(output.read(), expected)
+                    before = len(writes)
+                    console.read()  # an unchanged log never rewrites the live console
+                    self.assertEqual(len(writes), before)
+            self.assertEqual(sum(read_sizes), sum(len(chunk) for chunk, _ in chunks))
+            self.assertEqual(console.read(), chunks[-1][1].splitlines())
+
+    def test_missing_log_then_arrival_and_final_twenty_lines(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log, out = os.path.join(tmp, "chrome.log"), os.path.join(tmp, "console.log")
+            console = headless.ConsoleTail(log, out)
+            self.assertEqual(console.read(), [])
+            with open(out) as output:
+                self.assertEqual(output.read(), "")
+            with open(log, "w") as source:
+                source.writelines(f'[1:2:1002/224334.934267:INFO:CONSOLE:2] "line {n}", source: p (2)\n'
+                                  for n in range(30))
+            self.assertEqual(console.read(), [f"line {n}" for n in range(10, 30)])
+            with open(out) as output:
+                self.assertEqual(output.read(), "".join(f"line {n}\n" for n in range(30)))
+
     def test_every_line_of_each_message_is_kept(self):
         # As Chrome 141 writes them, with another record between.
         chrome_log = (

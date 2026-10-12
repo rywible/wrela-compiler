@@ -211,11 +211,16 @@ def maintain(cwd, clear_build=False):
                     path.unlink()
         cargo = cache / "cargo"
         # Incremental state is disposable, and costs less to rebuild than all dependencies.
-        if allocated(cache) > CACHE_BUDGET or shutil.disk_usage(target).free < MIN_FREE:
+        allocated_bytes = allocated(cache)
+        if allocated_bytes > CACHE_BUDGET or shutil.disk_usage(target).free < MIN_FREE:
+            removed = False
             for path in cargo.glob("**/incremental"):
                 if path.is_dir() and not path.is_symlink():
                     shutil.rmtree(path)
-        if allocated(cache) > CACHE_BUDGET:
+                    removed = True
+            if removed:
+                allocated_bytes = allocated(cache)
+        if allocated_bytes > CACHE_BUDGET:
             raise ValueError("shared caches exceed 20 GiB; run tools/worktrees.py prune --build-cache")
     prune_scratch(Path(cwd) / "target")
     if shutil.disk_usage(target).free < MIN_FREE:

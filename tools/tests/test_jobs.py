@@ -578,6 +578,46 @@ assert jobs.admitted(), "rejecting another checkout must preserve the original l
         self.assertEqual(evidence.read_bytes(), b"pixels")
         self.assertEqual((self.root / "source").read_text(), "source")
 
+    def test_cache_scan_is_reused_until_pruning_and_budget_still_fails_closed(self):
+        self.init_repo()
+        cache = self.root / ".git/wrela/cache/cargo"
+        cache.mkdir(parents=True)
+        incremental = cache / "debug/incremental"
+        for amounts, prune, fails in (([5], False, False), ([11], False, True),
+                                      ([11, 5], True, False), ([11, 11], True, True)):
+            with self.subTest(amounts=amounts, prune=prune):
+                if prune:
+                    incremental.mkdir(parents=True)
+                    (incremental / "disposable").write_text("cache")
+                with patch.dict(os.environ, self.env), \
+                        patch.object(worktrees, "CACHE_BUDGET", 10), \
+                        patch.object(worktrees, "allocated", side_effect=amounts) as scan, \
+                        patch.object(worktrees.shutil, "disk_usage", return_value=type("Disk", (), {"free": 100 * worktrees.GIB})()):
+                    if fails:
+                        with self.assertRaisesRegex(ValueError, "shared caches exceed"):
+                            worktrees.maintain(self.root)
+                    else:
+                        worktrees.maintain(self.root)
+                    self.assertEqual(scan.call_count, len(amounts))
+                self.assertFalse(incremental.exists())
+        self.assertEqual((self.root / "source").read_text(), "source")
+
+    def test_low_disk_pruning_rechecks_under_budget_cache_and_retains_disk_guard(self):
+        self.init_repo()
+        incremental = self.root / ".git/wrela/cache/cargo/debug/incremental"
+        incremental.mkdir(parents=True)
+        (incremental / "disposable").write_text("cache")
+        with patch.dict(os.environ, self.env), \
+                patch.object(worktrees, "MIN_FREE", 12 * worktrees.GIB), \
+                patch.object(worktrees, "CACHE_BUDGET", 10), \
+                patch.object(worktrees, "allocated", side_effect=[5, 1]) as scan, \
+                patch.object(worktrees.shutil, "disk_usage", return_value=type("Disk", (), {"free": 2 * worktrees.GIB})()):
+            with self.assertRaisesRegex(ValueError, "12 GiB"):
+                worktrees.maintain(self.root)
+            self.assertEqual(scan.call_count, 2)
+        self.assertFalse(incremental.exists())
+        self.assertEqual((self.root / "source").read_text(), "source")
+
 
 if __name__ == "__main__":
     unittest.main()

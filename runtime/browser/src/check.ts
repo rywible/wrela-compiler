@@ -104,7 +104,9 @@ export class Checker {
   /** The current usage scope, a dispatch or the open pass: each buffer's or texture's use so
    * far, bit 1 read-only and bit 2 read-write. Dispatches happen only outside a pass (the `Sequencer`
    * checks), so the two kinds of scope never overlap and share this map. */
-  readonly #scope = new Map<number, number>();
+  #scope = new Map<number, number>();
+  /** An empty map for the next fresh scope; a rejected command restores the current one. */
+  #spareScope = new Map<number, number>();
   /** Read-write buffers in this command, reused across draws and dispatches. */
   readonly #written: number[] = [];
   /** The open pass's attachments. */
@@ -143,42 +145,48 @@ export class Checker {
   check(cmd: Command): void {
     // A rejected command leaves no trace. Binding checks add uses as they go, and a later
     // binding (or an indirect range) may still reject the command.
-    // A draw can only change the entries it names, so don't clone a pass's whole (possibly
-    // large) scope for every draw. Commands that start a fresh scope keep the old small scope.
-    const clearsScope = cmd.op === "Dispatch" || cmd.op === "DispatchIndirect" || cmd.op === "BeginPass";
-    const scope = new Map<number, number>();
-    if (clearsScope) {
-      for (const [handle, used] of this.#scope) scope.set(handle, used);
+    if (cmd.op === "Dispatch" || cmd.op === "DispatchIndirect" || cmd.op === "BeginPass") {
+      // A fresh scope can use the empty spare; the old map needn't be copied to roll back.
+      const scope = this.#scope;
+      const attachments = this.#attachments;
+      const targets = this.#targets;
+      this.#scope = this.#spareScope;
+      this.#spareScope = scope;
+      try {
+        this.#check(cmd);
+      } catch (e) {
+        this.#spareScope = this.#scope;
+        this.#scope = scope;
+        if (cmd.op === "BeginPass") {
+          // BeginPass replaces these before adding attachments; the old values stay intact.
+          this.#attachments = attachments;
+          this.#targets = targets;
+        }
+        throw e;
+      } finally {
+        this.#spareScope.clear();
+      }
+      return;
     }
-    const passState =
-      cmd.op === "BeginPass"
-        ? { attachments: [...this.#attachments], targets: { ...this.#targets } }
-        : undefined;
+    if (cmd.op !== "Draw" && cmd.op !== "DrawIndirect" && cmd.op !== "DrawIndexedIndirect") {
+      this.#check(cmd);
+      return;
+    }
+    // A draw can only change the entries it names, so keep only those prior uses.
     const entries = new Map<number, number | undefined>();
     const remember = (handle: number) => {
       if (entries.has(handle)) return;
       entries.set(handle, this.#scope.get(handle));
     };
-    if (cmd.op === "Draw" || cmd.op === "DrawIndirect" || cmd.op === "DrawIndexedIndirect") {
-      for (const binding of cmd.bindings) remember(binding.handle);
-      if (cmd.op !== "Draw") remember(cmd.arguments);
-      if (cmd.op === "DrawIndexedIndirect") remember(cmd.indices);
-    }
+    for (const binding of cmd.bindings) remember(binding.handle);
+    if (cmd.op !== "Draw") remember(cmd.arguments);
+    if (cmd.op === "DrawIndexedIndirect") remember(cmd.indices);
     try {
       this.#check(cmd);
     } catch (e) {
-      if (clearsScope) {
-        this.#scope.clear();
-        for (const [handle, used] of scope) this.#scope.set(handle, used);
-      } else {
-        for (const [handle, used] of entries) {
-          if (used === undefined) this.#scope.delete(handle);
-          else this.#scope.set(handle, used);
-        }
-      }
-      if (passState !== undefined) {
-        this.#attachments = passState.attachments;
-        this.#targets = passState.targets;
+      for (const [handle, used] of entries) {
+        if (used === undefined) this.#scope.delete(handle);
+        else this.#scope.set(handle, used);
       }
       throw e;
     }

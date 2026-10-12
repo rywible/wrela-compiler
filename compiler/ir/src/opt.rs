@@ -2437,18 +2437,17 @@ fn dce(f: &mut Function) {
             }
         });
     };
-    // What a pure value, or a store to a local, needs in turn; and what must stay needs.
-    let mut by_value = vec![Vec::new(); f.values.len()];
+    // Keep the definitions themselves: an operand list allocates for each expression with
+    // dependencies, even for dead expressions no root ever needs.
+    let mut by_value = vec![None; f.values.len()];
     let mut by_local = vec![Vec::new(); f.locals.len()];
     let mut work = Vec::new();
     visit::walk(&f.body, &mut |s| match s {
         Stmt::Let(v, e) if !e.has_effect() => {
-            reads(e, &mut by_value[v.index()]);
+            by_value[v.index()] = Some(e);
         }
         Stmt::Store(p @ Place { root: PlaceRoot::Local(l), .. }, v) => {
-            let into = &mut by_local[l.index()];
-            into.push(Need::Value(*v));
-            p.for_each_value(&mut |x| into.push(Need::Value(x)));
+            by_local[l.index()].push((p, *v));
         }
         s => {
             s.for_each_value(&mut |v| work.push(Need::Value(v)));
@@ -2460,12 +2459,19 @@ fn dce(f: &mut Function) {
     let mut used = vec![false; f.values.len()];
     let mut read = vec![false; f.locals.len()];
     while let Some(n) = work.pop() {
-        let (seen, more) = match n {
-            Need::Value(v) => (&mut used[v.index()], &mut by_value[v.index()]),
-            Need::Local(l) => (&mut read[l.index()], &mut by_local[l.index()]),
-        };
-        if !std::mem::replace(seen, true) {
-            work.append(more);
+        match n {
+            Need::Value(v) if !std::mem::replace(&mut used[v.index()], true) => {
+                if let Some(e) = by_value[v.index()] {
+                    reads(e, &mut work);
+                }
+            }
+            Need::Local(l) if !std::mem::replace(&mut read[l.index()], true) => {
+                for &(p, v) in &by_local[l.index()] {
+                    work.push(Need::Value(v));
+                    p.for_each_value(&mut |x| work.push(Need::Value(x)));
+                }
+            }
+            _ => {}
         }
     }
     sweep(&mut f.body, &used, &read);
@@ -2611,6 +2617,75 @@ mod tests {
         dce(&mut f);
         assert_eq!(f.body, vec![Stmt::Let(x, Expr::Param(0)), Stmt::Return(Some(x))]);
         assert!(f.locals.is_empty());
+    }
+
+    /// Reaching a value through a local follows every store and its indices, including stores
+    /// in branches and loops. Effects and control flow keep their operands independently.
+    #[test]
+    fn gpu_dead_graph_keeps_effects_control_and_index_dependencies() {
+        let mut m = Module::default();
+        let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
+        let array = m.types.intern(TypeDef::Array(f32t, 4));
+        let mut f = Function::new("f", Vec::new(), Some(f32t));
+        let dead = f.new_local("dead", array);
+        let live = f.new_local("live", array);
+        let held = f.new_local("held", f32t);
+        let [x, spare, branch, loop_value, result, called] = [(); 6].map(|_| f.new_value(f32t));
+        let [index, one, stored_index, dead_index] = [(); 4].map(|_| f.new_value(u32t));
+        let cond = f.new_value(boolt);
+        let at = |l, i| Place::local(l).with(Proj::Index(i));
+        let branch_live = vec![
+            Stmt::Let(branch, Expr::Binary(BinOp::Add, x, x)),
+            Stmt::Store(at(live, one), branch),
+        ];
+        let loop_live = vec![
+            Stmt::Let(loop_value, Expr::Load(at(live, index))),
+            Stmt::Store(Place::local(held), loop_value),
+            Stmt::Eval(Expr::Call(FuncId(0), vec![Arg::Place(Place::local(held))])),
+            Stmt::Break,
+        ];
+        let retained = vec![
+            Stmt::Let(x, Expr::Const(Const::F32(2.0))),
+            Stmt::Let(index, Expr::Const(Const::U32(0))),
+            Stmt::Let(one, Expr::Const(Const::U32(1))),
+            Stmt::Let(cond, Expr::Binary(BinOp::Lt, index, one)),
+            Stmt::Let(stored_index, Expr::Binary(BinOp::WrappingAdd, index, one)),
+            Stmt::Store(at(live, stored_index), x),
+            Stmt::If { cond, then: branch_live, else_: Vec::new() },
+            Stmt::Loop { body: loop_live, continuing: Vec::new() },
+            Stmt::Let(called, Expr::Call(FuncId(0), vec![Arg::Value(x)])),
+            Stmt::Store(Place::root(PlaceRoot::Resource(ResourceId(0))), x),
+            Stmt::Let(result, Expr::Load(at(live, index))),
+            Stmt::Return(Some(result)),
+        ];
+        f.body = retained.clone();
+        f.body.splice(
+            4..4,
+            [
+                Stmt::Let(spare, Expr::Binary(BinOp::Mul, x, x)),
+                Stmt::Let(dead_index, Expr::Binary(BinOp::WrappingAdd, index, one)),
+                Stmt::Store(at(dead, dead_index), spare),
+            ],
+        );
+        let Some(Stmt::If { else_, .. }) = f.body.iter_mut().find(|s| matches!(s, Stmt::If { .. }))
+        else {
+            panic!("the branch")
+        };
+        else_.push(Stmt::Store(at(dead, dead_index), spare));
+        dce(&mut f);
+        // The dead local is removed, so the other locals' indices each shift by one.
+        let mut expected = retained;
+        visit::walk_mut(&mut expected, &mut |s| {
+            s.for_each_place_mut(&mut |p| {
+                if let PlaceRoot::Local(l) = &mut p.root {
+                    l.0 -= 1;
+                }
+            });
+        });
+        assert_eq!(f.body, expected);
+        assert_eq!(f.locals.len(), 2);
+        assert_eq!(f.locals[0].name, "live");
+        assert_eq!(f.locals[1].name, "held");
     }
 
     /// A `bool` local the loop's body stores late isn't known in its continuing block, which a

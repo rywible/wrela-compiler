@@ -130,6 +130,8 @@ pub struct Checker {
     /// so far, (read-only, read-write). Dispatches happen only outside a pass (the sequencer
     /// checks), so the two kinds of scope never overlap and share this map.
     scope: HashMap<u32, (bool, bool)>,
+    /// An empty map for a new scope: the previous scope stays intact until the command passes.
+    spare_scope: HashMap<u32, (bool, bool)>,
     /// The open pass's attachments.
     attachments: Vec<u32>,
     /// Read-write buffers in this command: reused across draws and dispatches.
@@ -171,6 +173,7 @@ impl Checker {
             pipelines,
             resources: HashMap::new(),
             scope: HashMap::new(),
+            spare_scope: HashMap::new(),
             attachments: Vec::new(),
             written: Vec::new(),
             targets: (None, false),
@@ -189,13 +192,16 @@ impl Checker {
         // A rejected command leaves no trace. Binding checks add uses as they go, and a later
         // binding (or an indirect range) may still reject the command.
         // A draw can only change the entries it names, so don't clone a pass's whole (possibly
-        // large) scope for every draw. Commands that start a fresh scope keep the old small
-        // scope wholesale.
+        // large) scope for every draw. Commands that start a fresh scope swap in an empty,
+        // reusable map and keep the previous scope intact until they pass.
         let whole_scope = matches!(
             cmd,
             Command::Dispatch { .. } | Command::DispatchIndirect { .. } | Command::BeginPass(_)
-        )
-        .then(|| self.scope.clone());
+        );
+        if whole_scope {
+            debug_assert!(self.spare_scope.is_empty());
+            std::mem::swap(&mut self.scope, &mut self.spare_scope);
+        }
         let pass_state =
             matches!(cmd, Command::BeginPass(_)).then(|| (self.attachments.clone(), self.targets));
         let mut entries = Vec::new();
@@ -229,8 +235,8 @@ impl Checker {
         }
         let result = self.check_in_place(cmd);
         if result.is_err() {
-            if let Some(scope) = whole_scope {
-                self.scope = scope;
+            if whole_scope {
+                std::mem::swap(&mut self.scope, &mut self.spare_scope);
             } else {
                 for (handle, used) in entries {
                     match used {
@@ -247,6 +253,9 @@ impl Checker {
                 self.attachments = attachments;
                 self.targets = targets;
             }
+        }
+        if whole_scope {
+            self.spare_scope.clear();
         }
         result
     }
@@ -774,6 +783,49 @@ mod tests {
         let error = checker.check(&dispatch(vec![a, a])).expect_err("a duplicate output");
         assert_eq!(error.why, "buffer 1 is bound read-write twice in one dispatch");
         checker.check(&dispatch(vec![a, b])).expect("a rejected command does not retain outputs");
+    }
+
+    #[test]
+    fn rejected_dispatches_restore_the_previous_scope_after_partial_checks() {
+        let mut checker = Checker::new(&crate::vectors::check_manifest());
+        for handle in 1..=4 {
+            checker.check(&Command::CreateBuffer { handle, size: 64 }).expect("buffer");
+        }
+        let dispatch = |groups, a, b| Command::Dispatch {
+            pipeline: 1,
+            groups,
+            bindings: vec![Binding::range(a, 0, 64), Binding::range(b, 0, 64)],
+            uniforms: &[0; 16],
+        };
+        checker.check(&dispatch([1; 3], 1, 2)).expect("initial scope");
+        let previous = checker.scope.clone();
+        for _ in 0..4 {
+            let indirect = Command::DispatchIndirect {
+                pipeline: 1,
+                arguments: 99,
+                offset: 0,
+                bindings: vec![Binding::range(3, 0, 64), Binding::range(4, 0, 64)],
+                uniforms: &[0; 16],
+            };
+            assert_eq!(
+                checker.check(&indirect).expect_err("missing arguments after binding checks").why,
+                "there's no buffer 99"
+            );
+            assert_eq!(checker.scope, previous);
+            let max = checker.limits.max_workgroups_per_dimension;
+            assert_eq!(
+                checker.check(&dispatch([max + 1, 1, 1], 3, 4)).expect_err("too many groups").why,
+                format!("{}x1x1 workgroups is over the limit of {max} per dimension", max + 1)
+            );
+            assert_eq!(checker.scope, previous);
+        }
+        checker.check(&dispatch([1; 3], 3, 4)).expect("a new scope after rejected dispatches");
+        assert_eq!(checker.scope.len(), 2);
+        assert_eq!(checker.scope.get(&3), Some(&(true, false)));
+        assert_eq!(checker.scope.get(&4), Some(&(false, true)));
+        checker.check(&dispatch([1; 3], 2, 1)).expect("the next dispatch can reverse uses");
+        assert_eq!(checker.scope.get(&1), Some(&(false, true)));
+        assert_eq!(checker.scope.get(&2), Some(&(true, false)));
     }
 
     #[test]

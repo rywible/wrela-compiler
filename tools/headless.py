@@ -26,6 +26,7 @@ GPU with native runs (below); WRELA_THROTTLE (bits a second) slows the server's 
 request sharing the rate (tools/serve.py).
 """
 
+from collections import deque
 import fcntl
 import math
 import os
@@ -148,34 +149,73 @@ CONSOLE_END = re.compile(r'^(.*)", source: .* \(\d+\)$')
 LOG_RECORD = re.compile(r"^\[\d+:\d+:\d{4}/\d{6}\.\d+:")
 
 
+class ConsoleTail:
+    """Tail Chrome's appended records while keeping incomplete console lines live."""
+
+    def __init__(self, chrome_log, console_log, offset=0):
+        self.chrome_log, self.console_log = chrome_log, console_log
+        self.offset, self.written = offset, 0
+        self.pending = b""
+        self.message = False
+        self.lines = deque(maxlen=20)
+        self.preview = None
+        with open(console_log, "wb"):
+            pass
+
+    @staticmethod
+    def parse(line, message):
+        if message and LOG_RECORD.match(line):
+            message = False  # the preceding message ended without a source
+        if not message:
+            start = CONSOLE_START.search(line)
+            if not start:
+                return None, False
+            line = start.group(1)
+        end = CONSOLE_END.match(line)
+        return end.group(1) if end else line, end is None
+
+    def read(self):
+        try:
+            with open(self.chrome_log, "rb") as source:
+                source.seek(self.offset)
+                added = source.read()
+                self.offset = source.tell()
+        except FileNotFoundError:
+            added = b""
+        if added:
+            data = self.pending + added
+            complete = []
+            at = 0
+            for end in re.finditer(br"\r\n|\r|\n", data):
+                # A CR at EOF may become CRLF on the next write. Its live preview still
+                # appears now; wait to consume it so the LF cannot create a blank line.
+                if end.group() == b"\r" and end.end() == len(data):
+                    break
+                line, self.message = self.parse(data[at:end.start()].decode(errors="replace"), self.message)
+                if line is not None:
+                    complete.append(line)
+                at = end.end()
+            self.pending = data[at:]
+            self.preview = self.parse(self.pending.rstrip(b"\r").decode(errors="replace"), self.message)[0] \
+                if self.pending else None
+            body = "".join(line + "\n" for line in complete).encode()
+            preview = (self.preview + "\n").encode() if self.preview is not None else b""
+            # Only the incomplete last line can change. Complete lines stay on disk.
+            with open(self.console_log, "r+b") as output:
+                output.seek(self.written)
+                output.truncate()
+                output.write(body + preview)
+            self.written += len(body)
+            self.lines.extend(complete)
+        lines = [*self.lines, *([self.preview] if self.preview is not None else [])]
+        return lines[-20:]
+
+
 def extract_console(chrome_log, console_log, offset=0):
-    """Writes every line of every console message in Chrome's log to `console_log`; returns them."""
-    lines = []
-    message = None  # the lines so far of a message whose end isn't read yet
-    try:
-        with open(chrome_log, errors="replace") as f:
-            f.seek(offset)
-            for line in f:
-                line = line.rstrip("\n")
-                if message is not None and LOG_RECORD.match(line):
-                    lines += message  # a new record: the message ended without a source
-                    message = None
-                if message is None:
-                    m = CONSOLE_START.search(line)
-                    if not m:
-                        continue
-                    message, line = [], m.group(1)
-                end = CONSOLE_END.match(line)
-                message.append(end.group(1) if end else line)
-                if end:
-                    lines += message
-                    message = None
-    except FileNotFoundError:
-        pass
-    lines += message or []
-    with open(console_log, "w") as f:
-        f.writelines(line + "\n" for line in lines)
-    return lines
+    """Write a snapshot of every console message; return all its lines."""
+    ConsoleTail(chrome_log, console_log, offset).read()
+    with open(console_log) as output:
+        return [line.rstrip("\n") for line in output]
 
 
 def adopt_chrome_children():
@@ -284,6 +324,7 @@ def main(argv):
     tab = None
     shared = None
     offset = 0
+    console = None
     try:
         shared = os.environ.get("WRELA_TEST_CHROME")
         if shared:
@@ -319,6 +360,7 @@ def main(argv):
                     pass_fds=locks,
                     start_new_session=True,
                 )
+        console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset)
         while True:
             if server is None and not done and os.path.exists(done_file):
                 with open(done_file, errors="replace") as f:
@@ -332,7 +374,7 @@ def main(argv):
             if time.monotonic() - start >= timeout:
                 reason = f"timed out after {timeout:.0f}s"
                 break
-            extract_console(chrome_log, os.path.join(results, "console.log"), offset)
+            console.read()
             time.sleep(0.1)
     except KeyboardInterrupt:
         status, reason = 1, "interrupted"
@@ -347,7 +389,9 @@ def main(argv):
         if server is not None:
             server.shutdown()
             server.server_close()
-        lines = extract_console(chrome_log, os.path.join(results, "console.log"), offset)
+        if console is None:
+            console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset)
+        lines = console.read()
         shutil.rmtree(profile, ignore_errors=True)
         for fd in locks:
             os.close(fd)
