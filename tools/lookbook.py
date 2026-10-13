@@ -14,9 +14,8 @@ then for `lookbook::MOVE` seconds, paced as in play, recorded from Chrome's canv
 the look (F8 in the floor): `clay`, the scene's light on its forms all one matte grey, or
 `silhouette`, the sky white, the land light and the solid forms dark, a step lighter for each band
 of distance. `--size` renders the stills at another size than 1920x1080 (1280x720 while
-iterating). Stills run one at a time by default. `--jobs` can share the admitted CPU allowance
-between at most two stills, each process sharing the GPU lock
-(`WRELA_GPU_SHARED`), with the same pixels:
+iterating). Stills run one at a time by default. `--jobs` renders the requested number of
+stills concurrently, with the same pixels:
 on a 4-core cloud machine lavapipe leaves cores idle in a still's load frames, and shots 2, 7
 and 9 took 785 s at once, about 1400 s one by one. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
@@ -33,7 +32,7 @@ the shots before it.)
 import json, os, re, shutil, subprocess, sys, tempfile
 from concurrent.futures import ThreadPoolExecutor
 
-from resources import worker_count as cpu_count
+from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -79,15 +78,13 @@ def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
         script = f.name
     png = os.path.join(out, stem(i, name) + ".png")
     software = os.environ.get("WRELA_SOFTWARE_GPU") == "1"
-    env = dict(os.environ) if jobs > 1 or software else None
-    if jobs > 1:
-        env["WRELA_GPU_SHARED"] = str(jobs)
+    env = dict(os.environ) if software else None
     frames = CAPTURE_FRAMES if capture else SETTLE_FRAMES + 1
     cmd = [HOST, BUILD, "--frames", str(frames), "--size", size, "--input", script, "--png", png]
     if software:
         # Each concurrent shot gets a share of the CPU, including lavapipe's raster workers.
-        # Bound Mesa's raster workers by this shot's share of the admitted CPU allowance.
-        cores = max(1, cpu_count() // jobs)
+        # Bound Mesa's raster workers by this shot's share of the available CPUs.
+        cores = max(1, (cpu_count() or 1) // jobs)
         env["LP_NUM_THREADS"] = str(cores)
         cmd += ["--workers", str(min(9, cores))]  # native ABI: main thread plus eight helpers
     try:
@@ -106,7 +103,7 @@ def clip(i, name, out, view="look"):
     with open(script, "w") as f:
         json.dump(keys(i, view), f)
     frames = SETTLE_FRAMES + MOVE_FRAMES + 30
-    workers = min(8, cpu_count())
+    workers = min(8, cpu_count() or 1)
     hash = (f"#test&frames={frames}&width=1920&height=1080&fps=60&workers={workers}&paced=1&nohash=1"
             f"&input=lookbook-keys.json&clipfrom={SETTLE_FRAMES}&clip={MOVE_FRAMES}")
     r = subprocess.run([sys.executable, HEADLESS, os.path.relpath(BUILD, ROOT), hash, "600"],
@@ -145,7 +142,7 @@ def main():
         k = args.index("--jobs")
         if k + 1 >= len(args) or not args[k + 1].isdigit() or int(args[k + 1]) < 1:
             sys.exit("--jobs takes a whole number, 1 or more")
-        jobs = min(2, cpu_count(), int(args[k + 1]))
+        jobs = int(args[k + 1])
         del args[k:k + 2]
     out = args[0]
     os.makedirs(out, exist_ok=True)
@@ -157,7 +154,7 @@ def main():
     if views:
         shutil.copyfile(numbers, os.path.join(out, "check.json"))
     # The stills at once, `jobs` at a time (each printed, in order, as it and those before it end);
-    # then each clip in turn, as Chrome takes the GPU alone.
+    # then each clip in turn.
     pool = ThreadPoolExecutor(jobs)
     pngs = [pool.submit(still, i, shots[i], out, view, size, jobs, capture) for i in pick]
     for i, png in zip(pick, pngs):
@@ -174,9 +171,6 @@ def main():
 
 if __name__ == "__main__":
     os.chdir(ROOT)
-    from jobs import admitted, run
-    if len(sys.argv) > 1 and not admitted():
-        sys.exit(run("capture", [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]))
     if len(sys.argv) > 1:
         subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela-host", "--bin", "wrela-host"], cwd=ROOT, check=True)
     main()

@@ -70,10 +70,10 @@ class MotionCpuTest(unittest.TestCase):
 
 
 class LookbookCpuTest(unittest.TestCase):
-    def test_default_jobs_follow_quota_and_requested_shot_count(self):
+    def test_requested_jobs_and_shot_count_are_respected(self):
         cases = [(1, True, [], 1), (2, True, [], 1), (4, True, [], 1),
                  (16, True, [], 1), (16, False, [], 1), (4, True, ["0"], 1),
-                 (4, True, ["--jobs", "4"], 2)]
+                 (4, True, ["--jobs", "4"], 4)]
         for cores, software, options, jobs in cases:
             with self.subTest(cores=cores, software=software, options=options), \
                  tempfile.TemporaryDirectory() as out, \
@@ -107,7 +107,7 @@ class LookbookCpuTest(unittest.TestCase):
                 self.assertEqual(args[args.index("--until") + 1], lookbook.STILL)
                 self.assertFalse(Path(args[args.index("--input") + 1]).exists())
 
-    def test_browser_workers_follow_quota(self):
+    def test_browser_workers_follow_available_cpus(self):
         for cores in (1, 2, 4, 16):
             with self.subTest(cores=cores), tempfile.TemporaryDirectory() as out, \
                  mock.patch.object(lookbook, "BUILD", out), \

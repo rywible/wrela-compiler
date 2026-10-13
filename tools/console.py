@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build static Wrela console/game releases through shared admission; requires Pillow."""
+"""Build static Wrela console/game releases; requires Pillow."""
 import argparse
 import hashlib
 import json
@@ -230,7 +230,7 @@ def main():
     parser.add_argument("--previous", type=Path, help="prior verified release bundle, to retain pinned assets")
     parser.add_argument("--cover", action="append", default=[], metavar="GAME=PNG")
     args = parser.parse_args()
-    # Keep paths relative to the caller while admission belongs to this script's checkout.
+    # Resolve caller-relative paths before building from this checkout.
     args.config = args.config.resolve()
     args.output = args.output.resolve()
     args.previous = args.previous.resolve() if args.previous else None
@@ -241,15 +241,6 @@ def main():
             parser.error("--cover must be GAME=PNG")
         covers[component(key)] = Path(path).resolve()
     os.chdir(ROOT)
-    # Admission covers all builds and packaging; nested tools/wrela sees the same lease.
-    from jobs import admitted, run
-    if not admitted():
-        arguments = ["--config", str(args.config), "--output", str(args.output)]
-        if args.previous is not None:
-            arguments += ["--previous", str(args.previous)]
-        for key, path in covers.items():
-            arguments += ["--cover", f"{key}={path}"]
-        return run("build", [sys.executable, str(Path(__file__).resolve()), *arguments])
     try:
         report = package(read_config(args.config), args.output, covers, args.previous)
     except (ValueError, KeyError, OSError, ImportError, subprocess.CalledProcessError) as error:

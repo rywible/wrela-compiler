@@ -624,12 +624,7 @@ impl Builder {
     /// failure in order, if any.
     fn build_many(&self, jobs: &[(&wrela_abi::manifest::Pipeline, &str)]) -> Result<Vec<Pipeline>> {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-        let budget = std::env::var("WRELA_CPU_WORKERS")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|&n| n > 0)
-            .unwrap_or(cores);
-        let threads = cores.min(budget).min(jobs.len());
+        let threads = cores.min(jobs.len());
         if threads <= 1 {
             return jobs.iter().map(|(p, source)| self.build(p, source)).collect();
         }
@@ -2061,8 +2056,6 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU"]
     fn texture_uploads_preserve_rows_rectangles_and_order() {
-        let _turn = crate::lock::turn();
-        let _lock = crate::lock::GpuLock::acquire("texture upload order").expect("GPU lock");
         let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
         gpu.create_buffer(2, 4);
         for format in [

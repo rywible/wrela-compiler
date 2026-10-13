@@ -28,7 +28,7 @@ Each capture is kept as its frames (`<name>/NNNNN.png`, the frame's number), a c
 
 import json, os, shutil, subprocess, sys, tempfile
 
-from resources import worker_count as cpu_count
+from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -95,7 +95,7 @@ def capture(name, out, size):
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-threads", "1",
                     "-framerate", "60", "-start_number",
                     str(first), "-i", os.path.join(frames, "%05d.png"), "-c:v", "libx264",
-                    "-threads", str(cpu_count()), "-crf", "12", "-pix_fmt", "yuv420p", clip],
+                    "-threads", str(cpu_count() or 1), "-crf", "12", "-pix_fmt", "yuv420p", clip],
                    check=True)
     sheet(frames, first, last, os.path.join(out, name + "-sheet.jpg"))
     return clip
@@ -112,9 +112,9 @@ def sheet(frames, first, last, path):
         f"box=1:boxcolor=black@0.5[v{k}]" for k, p in enumerate(picks))
     grid = "".join(f"[v{k}]" for k in range(6))
     subprocess.run(["ffmpeg", "-y", "-loglevel", "error", *inputs,
-                    "-filter_complex_threads", str(cpu_count()), "-filter_complex",
+                    "-filter_complex_threads", str(cpu_count() or 1), "-filter_complex",
                     f"{labelled};{grid}xstack=inputs=6:layout=0_0|w0_0|w0+w1_0|0_h0|w0_h0|w0+w1_h0",
-                    "-threads", str(cpu_count()), "-q:v", "3", path], check=True)
+                    "-threads", str(cpu_count() or 1), "-q:v", "3", path], check=True)
 
 
 def main():
@@ -137,9 +137,6 @@ def main():
 
 if __name__ == "__main__":
     os.chdir(ROOT)
-    from jobs import admitted, run
-    if len(sys.argv) > 1 and not admitted():
-        sys.exit(run("capture", [sys.executable, os.path.abspath(__file__), *sys.argv[1:]]))
     if len(sys.argv) > 1:
         subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela-host", "--bin", "wrela-host"], cwd=ROOT, check=True)
     main()

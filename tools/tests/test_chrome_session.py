@@ -19,8 +19,7 @@ class Session(PageDir, unittest.TestCase):
             root = Path(temporary)
             fake = Path(__file__).with_name('fake_cdp.py')
             with patch.dict(os.environ, {'TMPDIR': temporary,
-                                         'WRELA_RESOURCE_DIR': str(root / 'resources'),
-                                         'WRELA_CHROME': str(fake), 'WRELA_GPU_SHARED': '2'}), \
+                                         'WRELA_CHROME': str(fake)}), \
                     patch.object(headless, 'CHROME', str(fake)):
                 previous = os.environ.get('WRELA_TEST_CHROME')
                 with chrome_session.ChromeSession(root) as session:

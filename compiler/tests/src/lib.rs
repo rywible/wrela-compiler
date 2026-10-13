@@ -318,22 +318,18 @@ pub enum Bind<'a> {
     Write(u64),
 }
 
-/// A GPU device for running WGSL directly, with timestamps. It holds the GPU lock, like a
-/// `wrela_host::Host` (one thread can hold both; other threads wait).
+/// A GPU device for running WGSL directly, with timestamps.
 pub struct RawGpu {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    // Declared last: dropped after the device.
-    _lock: wrela_host::lock::GpuLock,
 }
 
 impl RawGpu {
     pub fn new() -> Result<RawGpu, String> {
-        let lock = wrela_host::lock::GpuLock::acquire("wrela-tests").map_err(|e| e.to_string())?;
         let (device, queue) =
             wrela_host::open_device("hand-written", wgpu::Features::TIMESTAMP_QUERY)
                 .map_err(|e| e.to_string())?;
-        Ok(RawGpu { device, queue, _lock: lock })
+        Ok(RawGpu { device, queue })
     }
 
     pub fn device(&self) -> &wgpu::Device {

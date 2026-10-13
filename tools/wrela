@@ -1,28 +1,14 @@
 #!/usr/bin/env python3
-"""Run the current checkout's CLI through the shared build/job budget."""
+"""Build and run the current checkout's CLI."""
 import os
 from pathlib import Path
 import subprocess
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from jobs import admitted, run
-
 os.chdir(Path(__file__).resolve().parent.parent)
-if not admitted():
-    command = sys.argv[1] if len(sys.argv) > 1 else ""
-    audio = []
-    if command == "audio":
-        arguments = iter(sys.argv[2:])
-        for argument in arguments:
-            # Every audio option takes one value; the package and action may follow them.
-            if argument.startswith("--"):
-                next(arguments, None)
-            else:
-                audio.append(argument)
-    timing = command == "profile" or command == "audio" and \
-        audio[:1] not in (["partials"], ["model"], ["clicks"]) and audio[1:2] == ["speed"]
-    kind = "measure" if timing else "build" if command == "build" else "focused"
-    sys.exit(run(kind, [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]))
-subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela", "-p", "wrela-host", "--bins"], check=True)
-sys.exit(subprocess.call([str(Path(os.environ["CARGO_TARGET_DIR"]) / "release/wrela"), *sys.argv[1:]]))
+try:
+    subprocess.run(["cargo", "build", "-q", "--release", "-p", "wrela", "-p", "wrela-host", "--bins"], check=True)
+    target = Path(os.environ.get("CARGO_TARGET_DIR", "target")).resolve()
+    sys.exit(subprocess.call([str(target / "release/wrela"), *sys.argv[1:]]))
+except subprocess.CalledProcessError as error:
+    sys.exit(error.returncode)

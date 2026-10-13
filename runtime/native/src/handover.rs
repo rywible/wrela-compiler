@@ -90,7 +90,7 @@ impl Host {
                     match self.prepared.remove(&dir) {
                         Some(Prepared::Ready(_, keys)) => self.p().executor().let_go(&keys),
                         // Let the thread finish without blocking this call, but retain it so
-                        // the host's GPU lock cannot be released before its work ends.
+                        // the host's GPU device stays alive until its work ends.
                         Some(Prepared::Going(job, waiting)) => {
                             self.cancelled_preparations.push(job);
                             let why = format!(
@@ -247,8 +247,6 @@ mod tests {
     #[test]
     #[ignore = "needs a GPU"]
     fn unprepared_work_finishes_before_the_host_releases_its_gpu() {
-        let _turn = crate::lock::turn();
-        let lock = crate::lock::GpuLock::acquire("preparation lifetime").unwrap();
         let batch = Encoder::new().unprepare("next").finish();
         let escaped: String = batch.iter().map(|b| format!("\\{b:02x}")).collect();
         let wasm = wat::parse_str(format!(
@@ -275,7 +273,6 @@ mod tests {
             options: Options::default(),
             prepared: PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
-            _lock: lock,
         };
         let builder = host.p().executor().builder();
         let (entered, release, finished) = (mpsc::channel(), mpsc::channel(), mpsc::channel());

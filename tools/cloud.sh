@@ -7,16 +7,13 @@
 #                           the system's Vulkan driver, the browser runtime's packages. A second
 #                           run checks the marker and exits; while another run provisions, it
 #                           waits for it. About 3 minutes; the cloud environment's setup script
-#                           runs it, so the environment's cache keeps it (else --warm does, at
-#                           a session's start).
+#                           can run it before work starts; --warm also provisions if needed.
 #   tools/cloud.sh --check  exits 0 if this version of the script provisioned the machine.
 #   tools/cloud.sh --warm   provisions the machine if it isn't, then builds what a session
-#                           builds first, slowly (nice): the CLI, the native host and the tests,
-#                           without baking the floor. tools/hooks.py starts it in the background
-#                           at a session's start; its log is /tmp/wrela-warm.log.
+#                           builds first: the CLI, the native host and the tests,
+#                           without baking the floor; its log is /tmp/wrela-warm.log.
 #   tools/cloud.sh --env    prints the environment a session needs (KEY=VALUE lines): that the
-#                           GPU is software (tools/check.sh reports its time budget, not gates
-#                           it), and Chromium for tools/headless.py, on SwiftShader's WebGPU
+#                           GPU is software, and Chromium for tools/headless.py uses SwiftShader's WebGPU
 #                           (Chrome doesn't offer lavapipe as a WebGPU adapter).
 #
 # Why patched: in llvmpipe, each flush of the draw module's vertex buffer reset the id of every
@@ -49,9 +46,6 @@ case "${1:-}" in
     fi
     exit 0 ;;
   --warm)
-    if ! python3 tools/jobs.py admitted; then
-      exec python3 tools/jobs.py run background --key warm -- bash tools/cloud.sh --warm
-    fi
     # Each step is what a session's first build or render would do: a step that fails leaves
     # the session to find out, as it would have.
     exec > /tmp/wrela-warm.log 2>&1
@@ -61,14 +55,15 @@ case "${1:-}" in
     # The CLI and the native host with the tests, as tools/check.sh builds them: built apart, the
     # compiler's crates would build twice (without the tests' dev-dependencies, some of their
     # dependencies' features differ).
-    nice -n 10 cargo test -q --release --workspace --no-run 2> /dev/null && echo "built the CLI, the host and the tests: $((SECONDS - s))s"
+    cargo test -q --release --workspace --no-run
+    echo "built the CLI, the host and the tests: $((SECONDS - s))s"
     echo "warm: $((SECONDS - s))s"
     exit 0 ;;
   "") ;;
   *) echo "usage: tools/cloud.sh [--check | --warm | --env]" >&2; exit 2 ;;
 esac
 
-# One provisioning at a time: a second run (a session's command while the hook's runs) waits
+# One provisioning at a time: a second run waits
 # for the first, then finds the marker.
 exec 9> /tmp/wrela-provision.lock
 flock 9

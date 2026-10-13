@@ -23,7 +23,6 @@ fn native_at(dir: &Path, w: u32, h: u32) -> RunResult {
 /// Two frames of the build in `dir` (its page at `rel`), `w` × `h`, in Chrome and in the native
 /// host, which give the same state hash: Chrome's last frame and the native host's.
 fn both_hosts(dir: &Path, rel: &str, w: u32, h: u32) -> (Vec<u8>, Vec<u8>) {
-    // The browser first: this thread holds no GPU lock while Chrome runs.
     let browser = run_in_chrome(rel, 2, w, h, 60.0);
     let run = native_at(dir, w, h);
     assert_eq!(browser.hash, run.hash_hex(), "the hosts' state hashes differ");

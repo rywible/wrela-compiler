@@ -102,8 +102,6 @@ fn the_native_frame_matches_the_golden_and_the_cpu() {
 #[ignore = "needs the runtime"]
 fn the_browser_matches_the_golden_and_the_native_host() {
     let (dir, rel) = page("browser");
-    // The browser first: this thread holds no GPU lock while Chrome runs (Chrome waits for
-    // another thread's).
     let browser = wrela_tests::run_in_chrome_with(
         &rel,
         wrela_tests::ChromeRun {

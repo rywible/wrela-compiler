@@ -53,18 +53,10 @@ pub fn mix(a: u64, b: u64) -> u64 {
     r.next_u64() ^ b
 }
 
-/// The admitted CPU worker count, bounded by the machine's thread count (1 if unknown).
+/// The machine's available thread count (1 if unknown).
 /// This is the default for [`par_seeded`] runs.
 pub fn default_threads() -> usize {
-    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
-    admitted_threads(cores, std::env::var("WRELA_CPU_WORKERS").ok().as_deref())
-}
-
-fn admitted_threads(cores: usize, budget: Option<&str>) -> usize {
-    budget
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|count| *count > 0)
-        .map_or(cores, |count| count.min(cores))
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 /// Calls `f(state, i, rng)` for each `i` in `0..n`, with `rng` seeded by `mix(seed, i)`, on
@@ -158,15 +150,6 @@ pub type FxHashSet<K> = std::collections::HashSet<K, FxBuild>;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_threads_respect_the_admitted_cpu_budget() {
-        assert_eq!(admitted_threads(16, Some("2")), 2);
-        assert_eq!(admitted_threads(1, Some("2")), 1);
-        for budget in [None, Some("0"), Some("invalid")] {
-            assert_eq!(admitted_threads(4, budget), 4);
-        }
-    }
 
     #[test]
     fn splitmix_is_deterministic_and_spread() {

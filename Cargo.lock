@@ -2096,7 +2096,6 @@ dependencies = [
 name = "wrela-host"
 version = "0.1.0"
 dependencies = [
- "libc",
  "png",
  "pollster",
  "wasmtime",

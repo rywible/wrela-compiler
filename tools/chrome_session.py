@@ -1,7 +1,7 @@
 """One lazy, disposable Chrome for a check, with a fresh tab for each test scenario.
 
-headless.py retains its per-scenario server, results, timeout and renderer permits. Only the
-browser process is reused; tabs close before the next scenario receives the Chrome permit.
+headless.py retains its per-scenario server, results and timeout. Only the
+browser process is reused; tabs close before the next scenario starts.
 """
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json

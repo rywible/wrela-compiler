@@ -8,7 +8,7 @@ use wrela_abi::stream::{Opcode, StreamError};
 
 /// Everything the host can report. Each variant says whose fault it is: the build directory
 /// (`Io`, `Manifest`, `Program`, `Shader`), the program at run time (`Stream`, `Command`, `Trap`),
-/// or the machine (`Gpu`, `Lock`).
+/// or the machine (`Gpu`).
 #[derive(Debug)]
 pub enum Error {
     /// A file in the build directory couldn't be read, or an output couldn't be written.
@@ -34,8 +34,6 @@ pub enum Error {
     Trap(String),
     /// The GPU, its adapter or device failed, or reported a validation error.
     Gpu(String),
-    /// The GPU lock (see [`crate::lock`]) couldn't be taken.
-    Lock(String),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -53,7 +51,6 @@ impl fmt::Display for Error {
             Error::Command(e) => write!(f, "{e}"),
             Error::Trap(why) => write!(f, "the program trapped: {why}"),
             Error::Gpu(why) => write!(f, "GPU error: {why}"),
-            Error::Lock(why) => write!(f, "GPU lock: {why}"),
         }
     }
 }

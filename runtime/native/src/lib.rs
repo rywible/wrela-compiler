@@ -19,9 +19,8 @@
 //! # Ok::<(), wrela_host::Error>(())
 //! ```
 //!
-//! A [`Host`] holds the GPU lock ([`lock`]) for its lifetime. A [`CpuHost`] runs only the WASM:
-//! it checks what the program submits but executes none of it, so it needs neither a GPU nor
-//! the lock, for tests that call exports.
+//! A [`CpuHost`] runs only the WASM: it checks what the program submits but executes none
+//! of it, so export tests need no GPU.
 
 mod cache;
 mod error;
@@ -31,7 +30,6 @@ mod gpu;
 mod handover;
 #[cfg(feature = "gpu")]
 pub mod image;
-pub mod lock;
 mod program;
 mod shared;
 mod trace;
@@ -125,14 +123,9 @@ impl Options {
 }
 
 /// The threads a program's parallel jobs run on by default: one per core, at most
-/// `wrela_abi::memory::MAX_WORKERS + 1`, bounded by an admitted job's `WRELA_CPU_WORKERS`.
+/// `wrela_abi::memory::MAX_WORKERS + 1`.
 pub fn default_workers() -> u32 {
     let cores = std::thread::available_parallelism().map_or(1, |n| n.get() as u32);
-    let cores = std::env::var("WRELA_CPU_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        .filter(|&n| n > 0)
-        .map_or(cores, |n| cores.min(n));
     cores.min(wrela_abi::memory::MAX_WORKERS + 1)
 }
 
@@ -320,8 +313,6 @@ pub struct Host {
     prepared: handover::PreparedBuilds,
     /// Preparations let go before they finished: dropped only after their threads end.
     cancelled_preparations: Vec<handover::Preparation>,
-    // Declared last: dropped after the GPU.
-    _lock: lock::GpuLock,
 }
 
 #[cfg(feature = "gpu")]
@@ -470,8 +461,8 @@ impl Host {
 
     /// Starts the build in `dir` afresh, keeping the device and unchanged pipelines. Nothing
     /// of the old program is carried: its resources, screen, requests and recorded state go;
-    /// the new program reads files and, by default, storage from `dir`. The GPU lock stays
-    /// held. Changing the timing option opens a device with that capability.
+    /// the new program reads files and, by default, storage from `dir`. Changing the timing
+    /// option opens a device with that capability.
     pub fn restart_in(&mut self, dir: impl AsRef<Path>, options: &Options) -> Result<()> {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
@@ -556,9 +547,7 @@ impl Host {
     pub fn load_with(dir: impl AsRef<Path>, options: &Options) -> Result<Host> {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
-        // Everything that can be checked without the GPU is, before taking it.
         let build = compile_build(dir, None)?;
-        let lock = lock::GpuLock::acquire(&format!("wrela-host {}", dir.display()))?;
         let gpu = Gpu::new(&build.manifest, &build.shaders, options.timing)?;
         let n = workers(options.workers);
         let mut program = Program::instantiate_with(
@@ -581,7 +570,6 @@ impl Host {
             options: options.clone(),
             prepared: handover::PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
-            _lock: lock,
         };
         if !options.defer_init {
             host.init()?;

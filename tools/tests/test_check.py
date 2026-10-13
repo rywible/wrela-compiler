@@ -27,7 +27,6 @@ class Selection(unittest.TestCase):
     def test_complete_suite_runs_every_step_and_program_without_memo(self):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(check, 'ROOT', Path(temp)), \
-                patch.object(check.jobs, 'admitted', return_value=True), \
                 patch.object(check, 'build_tests', return_value=['one', 'two']), \
                 patch.object(check, 'call'), \
                 patch.object(check, 'listed', return_value=['test']), \
@@ -66,7 +65,6 @@ class Selection(unittest.TestCase):
 
                     with patch.object(check, 'ROOT', root), \
                             patch.dict(os.environ, {'CARGO_TARGET_DIR': str(target)}), \
-                            patch.object(check.jobs, 'admitted', return_value=True), \
                             patch.object(check, 'build_tests', return_value=['one']), \
                             patch.object(check, 'call', side_effect=build) as build_cli, \
                             patch.object(check, 'step', side_effect=selected), \
@@ -103,7 +101,7 @@ args = sys.argv[1:]
 selected = [args[args.index('--exact') + 1]] if '--exact' in args else names
 if '--include-ignored' not in args: selected.remove('gpu')
 pathlib.Path(os.environ['CHECK_RECORD']).write_text(json.dumps({
-    'selected': selected, 'args': args, 'gpu': os.environ['WRELA_GPU_SHARED'],
+    'selected': selected, 'args': args,
     'scratch': os.environ['WRELA_TEST_TMPDIR']}))
 if os.environ.get('REPLACE_EXE'):
     p = pathlib.Path(os.environ['ORIGINAL_EXE']); p.unlink(); p.write_text('broken')
@@ -118,8 +116,7 @@ if mode == 'failure': sys.exit(1)
         self.program = {'manifest_path': str(self.pkg / 'Cargo.toml'), 'executable': str(self.exe),
                         'target': {'name': 'suite', 'kind': ['test']}}
         env = patch.dict(os.environ, {'CHECK_RECORD': str(self.root / 'record'),
-                                     'CARGO_TARGET_DIR': str(self.root / 'cargo'),
-                                     'WRELA_CPU_WORKERS': '2'})
+                                     'CARGO_TARGET_DIR': str(self.root / 'cargo')})
         env.start(); self.addCleanup(env.stop)
         scratch = patch.object(runner, 'scratch_root', return_value=str(self.root))
         scratch.start(); self.addCleanup(scratch.stop)
@@ -137,7 +134,6 @@ if mode == 'failure': sys.exit(1)
         self.assertEqual(check.rust_run(self.program, self.logs), 3)
         got = json.loads((self.root / 'record').read_text())
         self.assertEqual(got['selected'], ['alpha', 'alphabet', 'gpu'])
-        self.assertEqual(got['gpu'], '2')
         self.assertNotIn('--skip', got['args'])
 
     def test_unknown_and_ambiguous_names_fail_before_running(self):

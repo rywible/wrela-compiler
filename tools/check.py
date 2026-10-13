@@ -2,7 +2,6 @@
 
 Every retained test runs, including GPU and browser tests. There are no tiers, remembered
 passes or environment-selected sizes. Compiled artifacts are cached; test results are not.
-The job queue supplies the CPU allowance, source verification and process cleanup.
 """
 
 import json
@@ -17,10 +16,8 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 
-import jobs
 from chrome_session import ChromeSession
 import runner
-from resources import worker_count
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCES = ("examples", "engine", "compiler/std", "compiler/tests/fields", "compiler/tests/math",
@@ -32,7 +29,7 @@ STEPS = ("rustfmt", "clippy", "wrela-fmt", "tools", "browser-types", "browser-di
          "browser-size", "browser", "doc", "wgsl")
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_ITERS", "WRELA_FUZZ_SEED",
             "WRELA_FUZZ_WORKER", "WRELA_FUZZ_JOBS", "WRELA_FUZZ_TIERS", "WRELA_FULL",
-            "WRELA_GPU_SHARED", "WRELA_GPU_WAITS", "WRELA_CONST_CACHE")
+            "WRELA_CONST_CACHE")
 
 
 def selection(arguments):
@@ -123,8 +120,7 @@ def matching(programs, name):
 
 def rust_run(program, logs, name=None):
     cache = os.environ.get("WRELA_NATIVE_CACHE", str(Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "native-cache"))
-    command, env, cwd, scratch = runner.start(program, runner.scratch_root(), str(logs),
-                                             os.path.abspath(cache), worker_count())
+    command, env, cwd, scratch = runner.start(program, runner.scratch_root(), os.path.abspath(cache))
     args = ["--include-ignored"]
     if name:
         args += ["--exact", name, "--nocapture"]
@@ -219,8 +215,6 @@ def wrela_test(name, executable, logs):
 def main(arguments):
     name = selection(arguments)
     os.chdir(ROOT)
-    if not jobs.admitted():
-        return jobs.check(arguments)
     for key in CONTROLS:
         os.environ.pop(key, None)
     started = time.monotonic()

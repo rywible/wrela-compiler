@@ -5,8 +5,7 @@ use std::path::{Path, PathBuf};
 
 /// The repository's root.
 pub fn repo_root() -> PathBuf {
-    // The test runner sets this for its checkout. A shared Cargo cache can retain a
-    // different checkout's manifest path in the compiled test executable.
+    // The test runner can supply the checkout that owns the fixtures.
     let runtime = std::env::var_os("CARGO_MANIFEST_DIR");
     repo_root_from(runtime.as_deref().map(Path::new), Path::new(env!("CARGO_MANIFEST_DIR")))
         .expect("the test manifest must be inside the Wrela repository")
@@ -35,12 +34,7 @@ pub fn par_map_with<T: Sync, S, R: Send>(
 ) -> Vec<R> {
     let next = std::sync::atomic::AtomicUsize::new(0);
     let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-    let budget = std::env::var("WRELA_CPU_WORKERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .unwrap_or(cores);
-    let threads = cores.min(budget).min(items.len());
+    let threads = cores.min(items.len());
     let mut done: Vec<(usize, R)> = std::thread::scope(|s| {
         let workers: Vec<_> = (0..threads)
             .map(|_| {

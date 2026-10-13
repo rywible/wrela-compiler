@@ -51,7 +51,6 @@ fn browser_and_native_agree_on_first_light() {
     let page = root.join(page_rel);
     stage(&build, &root.join("runtime/browser/dist"), &page);
 
-    // The browser first; this process holds no GPU lock while Chrome runs.
     let fragment = format!("#test&frames={FRAMES}&width={WIDTH}&height={HEIGHT}&fps={FPS}");
     let status = Command::new("python3")
         .arg(root.join("tools/headless.py"))

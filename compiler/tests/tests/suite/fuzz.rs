@@ -392,11 +392,7 @@ fn mutated_programs_dont_crash_the_compiler() {
     let iters: u64 = 32;
     let base: u64 = 1;
     // Worker counts affect scheduling only; the corpus and cases never depend on a mode.
-    let jobs: u64 = std::env::var("WRELA_CPU_WORKERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2)
-        .clamp(1, 2);
+    let jobs: u64 = 2;
     let crashes = Mutex::new(Vec::new());
     std::thread::scope(|s| {
         for j in 0..jobs {

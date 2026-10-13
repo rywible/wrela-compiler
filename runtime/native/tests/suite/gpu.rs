@@ -1,5 +1,4 @@
-//! End to end on the real GPU. Ignored by default: they take the GPU lock (shared with
-//! tools/headless.py) and need a GPU. Run them with
+//! End to end on the real GPU. `tools/check.sh` includes these tests. Run them directly with
 //!
 //!     cargo test -p wrela-host --test suite gpu:: -- --ignored
 

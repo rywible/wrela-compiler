@@ -29,7 +29,7 @@ wildwood (travel, Y) for 10 minutes, and the floor's walk again. It saves:
 
 import bisect, json, os, shutil, subprocess, sys
 
-from resources import cpu_count
+from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD = os.path.join(ROOT, "examples/last-green/build")
@@ -193,7 +193,7 @@ def main():
         json.dump(events, f)
     timeout = frames // FPS * 2 + 600
     snap = f"&snap={SNAP}&snapfrom={SNAP}" if quick else ""
-    workers = min(8, cpu_count())
+    workers = min(8, cpu_count() or 1)
     hash_ = (f"#test&frames={frames}&width=1920&height=1080&fps={FPS}&workers={workers}&paced=1&nohash=1&ticklog=1&inflight=2{snap}"
              f"&input=round-keys.json")
     print(f"round {n}: {frames} frames ({frames / FPS / 60:.1f} min) in Chrome", flush=True)
