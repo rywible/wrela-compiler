@@ -28,6 +28,7 @@ class Selection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp, \
                 patch.object(check, 'ROOT', Path(temp)), \
                 patch.object(check, 'build_tests', return_value=['one', 'two']), \
+                patch.object(check, 'program_name', side_effect=str), \
                 patch.object(check, 'call'), \
                 patch.object(check, 'listed', return_value=['test']), \
                 patch.object(check, 'step') as step, \
@@ -44,6 +45,53 @@ class Selection(unittest.TestCase):
             finally:
                 os.chdir(cwd)
 
+    def test_a_failure_neither_stops_nor_hides_the_other_checks(self):
+        def failing_step(name, *args):
+            if name in ('clippy', 'rustfmt', 'browser'):
+                raise subprocess.CalledProcessError(1, [name], 'step output for ' + name)
+
+        def failing_run(program, out):
+            if program == 'one':
+                out.write('program output for one')
+                raise ValueError('one failed')
+            return 2
+        output = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(check, 'ROOT', Path(temp)), \
+                patch.object(check, 'build_tests', return_value=['one', 'two', 'three']), \
+                patch.object(check, 'program_name', side_effect=str), \
+                patch.object(check, 'call'), \
+                patch.object(check, 'listed', return_value=['test']), \
+                patch.object(check, 'step', side_effect=failing_step) as step, \
+                patch.object(check, 'rust_run', side_effect=failing_run) as run, \
+                contextlib.redirect_stdout(output):
+            cwd = Path.cwd()
+            try:
+                self.assertEqual(check.main([]), 1)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual([c.args[0] for c in step.call_args_list], list(check.STEPS))
+        self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two', 'three'])
+        text = output.getvalue()
+        for shown in ['step output for clippy', 'step output for rustfmt', 'step output for browser',
+                      'program output for one', 'one failed', '4 of 13 checks failed']:
+            self.assertIn(shown, text)
+        self.assertIn('all checks failed', text)
+
+    def test_tests_run_two_to_six_at_a_time(self):
+        for cores, expected in [(None, 2), (1, 2), (4, 2), (10, 5), (12, 6), (64, 6)]:
+            with patch.object(os, 'cpu_count', return_value=cores):
+                self.assertEqual(check.threads(), expected)
+
+    def test_tools_run_in_their_own_process_away_from_the_checks_browser(self):
+        with patch.dict(os.environ, {'WRELA_TEST_CHROME': 'http://127.0.0.1:1/token', 'KEPT': '1'}), \
+                patch.object(check, 'call') as run:
+            check.step('tools', Path('wrela'), Path('logs'))
+        self.assertEqual(run.call_args.args[0], [sys.executable, 'tools/runner.py', '--tools-tests'])
+        self.assertEqual(run.call_args.kwargs['cwd'], check.ROOT)
+        self.assertNotIn('WRELA_TEST_CHROME', run.call_args.kwargs['env'])
+        self.assertEqual(run.call_args.kwargs['env']['KEPT'], '1')
+
     def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
         original = Path.cwd()
         try:
@@ -59,13 +107,14 @@ class Selection(unittest.TestCase):
                         self.assertEqual(command, ['cargo', 'build', '-q', '--release', '-p', 'wrela', '--bin', 'wrela'])
                         executable.write_text('current CLI')
 
-                    def selected(name, cli, logs):
+                    def selected(name, cli, logs, *rest):
                         self.assertEqual(cli, executable)
                         self.assertEqual(cli.read_text(), 'current CLI')
 
                     with patch.object(check, 'ROOT', root), \
                             patch.dict(os.environ, {'CARGO_TARGET_DIR': str(target)}), \
                             patch.object(check, 'build_tests', return_value=['one']), \
+                            patch.object(check, 'program_name', side_effect=str), \
                             patch.object(check, 'call', side_effect=build) as build_cli, \
                             patch.object(check, 'step', side_effect=selected), \
                             patch.object(check, 'wrela_test', side_effect=selected), \
@@ -92,13 +141,14 @@ class RustChecks(unittest.TestCase):
         self.exe = self.root / 'fixture'
         self.exe.write_text(f'#!{sys.executable}\n' + '''
 import json, os, pathlib, sys
-names = ['alpha', 'alphabet', 'gpu']
+names = json.loads(os.environ.get('FIXTURE_NAMES', '["alpha", "alphabet", "gpu"]'))
 if '--list' in sys.argv:
     print('\\n'.join(n + ': test' for n in names))
     sys.exit(0)
 if '--worker' in sys.argv: sys.exit(0)
 args = sys.argv[1:]
-selected = [args[args.index('--exact') + 1]] if '--exact' in args else names
+selected = [a for a in args[args.index('--exact') + 1:] if not a.startswith('--')] \\
+    if '--exact' in args else names
 if '--include-ignored' not in args: selected.remove('gpu')
 pathlib.Path(os.environ['CHECK_RECORD']).write_text(json.dumps({
     'selected': selected, 'args': args,
@@ -124,14 +174,14 @@ if mode == 'failure': sys.exit(1)
     def test_exact_selection_never_runs_a_substring_match(self):
         program, name = check.matching([self.program], 'alpha')
         with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(check.rust_run(program, self.logs, name), 1)
+            self.assertEqual(check.rust_run(program, names=[name]), 1)
         got = json.loads((self.root / 'record').read_text())
         self.assertEqual(got['selected'], ['alpha'])
         self.assertIn('--exact', got['args'])
         self.assertFalse(Path(got['scratch']).exists())
 
     def test_all_tests_include_gpu_and_never_have_skip_arguments(self):
-        self.assertEqual(check.rust_run(self.program, self.logs), 3)
+        self.assertEqual(check.rust_run(self.program), 3)
         got = json.loads((self.root / 'record').read_text())
         self.assertEqual(got['selected'], ['alpha', 'alphabet', 'gpu'])
         self.assertNotIn('--skip', got['args'])
@@ -150,13 +200,33 @@ if mode == 'failure': sys.exit(1)
             with patch.dict(os.environ, {'FAIL_MODE': mode}), \
                     contextlib.redirect_stdout(io.StringIO()), \
                     self.assertRaises(ValueError):
-                check.rust_run(self.program, self.logs)
+                check.rust_run(self.program)
             got = json.loads((self.root / 'record').read_text())
             self.assertTrue(Path(got['scratch']).exists())
 
+    def test_a_group_is_the_tests_under_a_path_in_one_program(self):
+        names = ['alpha', 'renderer::a', 'renderer::b', 'renderer_extra::a', 'outer::renderer::a']
+        with patch.dict(os.environ, {'FIXTURE_NAMES': json.dumps(names)}):
+            for prefix in ['renderer::', 'wrela-fixture::suite::renderer::']:
+                program, tests = check.group([self.program], prefix)
+                self.assertEqual(tests, ['renderer::a', 'renderer::b'])
+                self.assertEqual(check.rust_run(program, names=tests), 2)
+                got = json.loads((self.root / 'record').read_text())
+                self.assertEqual(got['selected'], ['renderer::a', 'renderer::b'])
+                self.assertIn('--exact', got['args'])
+                self.assertNotIn('--nocapture', got['args'])
+            self.assertEqual(check.group([self.program], 'wrela-fixture::suite::')[1], names)
+            for prefix in ['missing::', 'renderer::c::']:
+                with self.assertRaisesRegex(ValueError, 'none has any'):
+                    check.group([self.program], prefix)
+            other = {**self.program, 'target': {'name': 'other', 'kind': ['test']}}
+            with self.assertRaisesRegex(ValueError, '2 have them'):
+                check.group([self.program, other], 'renderer::')
+            self.assertEqual(check.group([self.program, other], 'wrela-fixture::other::renderer::')[0], other)
+
     def test_replaced_executable_can_still_spawn_its_worker(self):
         with patch.dict(os.environ, {'REPLACE_EXE': '1', 'ORIGINAL_EXE': str(self.exe)}):
-            self.assertEqual(check.rust_run(self.program, self.logs), 3)
+            self.assertEqual(check.rust_run(self.program), 3)
 
 
 class WrelaSelection(unittest.TestCase):
@@ -173,9 +243,28 @@ class WrelaSelection(unittest.TestCase):
                             [], 0, json.dumps({'tests': tests}))), self.assertRaises(ValueError):
                     check.wrela_test('wrela::engine::alpha', Path('wrela'), logs)
             with patch.object(check, 'ROOT', root), patch.object(check, 'call') as run:
-                for name in ['wrela::../::alpha', 'wrela::engine::', 'wrela::engine::alpha::extra']:
+                for name in ['wrela::../::alpha', 'wrela::::alpha', 'wrela::engine::alpha::extra',
+                             'wrela::engine::not-a-name']:
                     with self.assertRaises(ValueError): check.wrela_test(name, Path('wrela'), logs)
                 run.assert_not_called()
+
+    def test_a_package_group_runs_every_test_and_fails_on_none_or_any_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'engine').mkdir()
+            logs = root / 'logs'; logs.mkdir()
+            def report(tests):
+                return subprocess.CompletedProcess([], 0, json.dumps({'tests': tests}))
+            passed = [{'name': n, 'passed': True, 'at': 'engine/a.wrela:1'} for n in ['a', 'b']]
+            for tests in [[], [*passed, {'name': 'c', 'passed': False, 'at': 'engine/a.wrela:9'}]]:
+                with patch.object(check, 'ROOT', root), patch.object(check, 'call', return_value=report(tests)), \
+                        self.assertRaises(ValueError):
+                    check.wrela_test('wrela::engine::', Path('wrela'), logs)
+            with patch.object(check, 'ROOT', root), patch.object(check, 'call', return_value=report(passed)) as run, \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                check.wrela_test('wrela::engine::', Path('wrela'), logs)
+            self.assertEqual(run.call_args.args[0], ['wrela', 'test', str(root / 'engine'), '--json'])
+            self.assertIn('ok wrela::engine::b', output.getvalue())
 
 
 class BrowserSelection(unittest.TestCase):
@@ -194,6 +283,25 @@ class BrowserSelection(unittest.TestCase):
             with patch.object(check, 'ROOT', root), self.assertRaises(ValueError):
                 check.browser_test('browser::../../outside::a', logs)
 
+    def test_a_file_group_runs_every_test_in_the_file(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            directory = root / 'runtime/browser/test'
+            directory.mkdir(parents=True)
+            (directory / 'x.test.ts').write_text('')
+            logs = root / 'logs'; logs.mkdir()
+            for xml, ok in [('<testsuites><testcase/><testcase/></testsuites>', True),
+                            ('<testsuites><testcase/><testcase><skipped/></testcase></testsuites>', False),
+                            ('<testsuites/>', False)]:
+                (logs / 'browser.xml').write_text(xml)
+                with patch.object(check, 'ROOT', root), patch.object(check, 'call') as run:
+                    if ok:
+                        self.assertEqual(check.browser_test('browser::x.test.ts::', logs), 2)
+                        self.assertEqual(run.call_args.args[0][-1], str(directory / 'x.test.ts'))
+                    else:
+                        with self.assertRaises(ValueError):
+                            check.browser_test('browser::x.test.ts::', logs)
+
 
 class BrowserPackages(unittest.TestCase):
     def test_browser_steps_install_the_locked_packages_first(self):
@@ -207,7 +315,7 @@ class BrowserPackages(unittest.TestCase):
         with patch.object(check, 'call') as run, patch.object(check, 'browser_test') as test:
             check.step('browser', Path('wrela'), Path('logs'))
             self.assertEqual(run.call_args.args[0], ['bun', 'install', '--frozen-lockfile', '--silent'])
-            test.assert_called_once_with(None, Path('logs'))
+            test.assert_called_once_with(None, Path('logs'), None)
 
 
 if __name__ == '__main__':

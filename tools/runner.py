@@ -55,9 +55,9 @@ def in_order(programs):
     return sorted(programs, key=lambda m: not is_first(m))
 
 
-def start(program, root, native_cache):
-    """(the command's start, its environment, its directory, its scratch) for `program`: append
-    its arguments to the command. GPU fixtures run sequentially within each executable."""
+def start(program, root, native_cache, threads):
+    """(the command's start, its environment, its directory, its scratch) for `program`, which
+    runs `threads` tests at a time: append its arguments to the command."""
     pkg = os.path.dirname(program["manifest_path"])
     scratch = tempfile.mkdtemp(prefix="test-scratch-", dir=root)
     # A concurrent Cargo build may replace its test binary. Keep this run's executable reachable
@@ -71,7 +71,7 @@ def start(program, root, native_cache):
         shutil.copy2(program["executable"], executable)
     env = {**os.environ, "CARGO_MANIFEST_DIR": pkg, "WRELA_NATIVE_CACHE": native_cache,
            "WRELA_TEST_TMPDIR": scratch}
-    return [executable, "--test-threads=1"], env, pkg, scratch
+    return [executable, f"--test-threads={threads}"], env, pkg, scratch
 
 
 def name_of(program):

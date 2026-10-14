@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
-"""A minimal Chrome debugging endpoint for session lifecycle tests; no browser or GPU."""
+"""A minimal Chrome debugging endpoint for session lifecycle tests; no browser or GPU.
+
+FAKE_CDP_DELAY delays its port file; FAKE_CDP_MODE `exit` exits before writing it, `hang`
+never writes it and `garbage` writes no port. Each launch appends a line to `launches` in the profile."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import os
 from pathlib import Path
 import sys
 import threading
+import time
 from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
 profile = Path(next(a.split('=', 1)[1] for a in sys.argv if a.startswith('--user-data-dir=')))
+with open(profile / 'launches', 'a') as launches:
+    launches.write(f'{os.getpid()}\n')
+mode = os.environ.get('FAKE_CDP_MODE', '')
+if mode == 'exit':
+    sys.exit(3)
 targets = set()
 serial = 0
 
@@ -48,5 +58,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
-(profile / 'DevToolsActivePort').write_text(str(server.server_port) + '\n')
+time.sleep(float(os.environ.get('FAKE_CDP_DELAY', '0')))
+if mode != 'hang':
+    port = 'no port' if mode == 'garbage' else str(server.server_port)
+    (profile / 'DevToolsActivePort').write_text(port + '\n')
 server.serve_forever()

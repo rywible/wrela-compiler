@@ -39,6 +39,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from urllib.parse import urlsplit
 
 import serve
 
@@ -84,18 +85,30 @@ def start_server(page, done):
 # Chrome logs a console message as one record, `[...:INFO:CONSOLE:7] "<text>", source: <url> (7)`,
 # and the text keeps its line breaks: a WGSL error or a stack trace spans several lines.
 CONSOLE_START = re.compile(r'CONSOLE[^\]]*\] "(.*)$')
-CONSOLE_END = re.compile(r'^(.*)", source: .* \(\d+\)$')
+CONSOLE_END = re.compile(r'^(.*)", source: (.*) \(\d+\)$')
 LOG_RECORD = re.compile(r"^\[\d+:\d+:\d{4}/\d{6}\.\d+:")
 
 
-class ConsoleTail:
-    """Tail Chrome's appended records while keeping incomplete console lines live."""
+def origin(url):
+    """The `scheme://host:port` a page or console source belongs to; a blob's is its creator's."""
+    parts = urlsplit(url[len("blob:"):] if url.startswith("blob:") else url)
+    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
 
-    def __init__(self, chrome_log, console_log, offset=0):
+
+class ConsoleTail:
+    """Tail Chrome's appended records while keeping incomplete console lines live.
+
+    With `page_origin`, the log is a Chrome shared by several pages: only complete records
+    whose source has that origin are kept, and nothing is shown before a record's source is
+    known."""
+
+    def __init__(self, chrome_log, console_log, offset=0, page_origin=None):
         self.chrome_log, self.console_log = chrome_log, console_log
         self.offset, self.written = offset, 0
+        self.page_origin = page_origin
         self.pending = b""
         self.message = False
+        self.record = []  # the open record's lines, while its source is unknown
         self.lines = deque(maxlen=20)
         self.preview = None
         with open(console_log, "wb"):
@@ -103,15 +116,34 @@ class ConsoleTail:
 
     @staticmethod
     def parse(line, message):
+        """(the console text on `line` or None, whether its message continues, its source)."""
         if message and LOG_RECORD.match(line):
             message = False  # the preceding message ended without a source
         if not message:
             start = CONSOLE_START.search(line)
             if not start:
-                return None, False
+                return None, False, None
             line = start.group(1)
         end = CONSOLE_END.match(line)
-        return end.group(1) if end else line, end is None
+        return (end.group(1), False, end.group(2)) if end else (line, True, None)
+
+    def keep(self, text, complete):
+        """Adds the console text on `text` to `complete` once its page is known to be this one."""
+        if self.page_origin is None:
+            line, self.message, _ = self.parse(text, self.message)
+            if line is not None:
+                complete.append(line)
+            return
+        if self.message and LOG_RECORD.match(text):
+            self.record = []  # the open record ended without a source: no page to give it to
+        line, self.message, source = self.parse(text, self.message)
+        if line is None:
+            return
+        self.record.append(line)
+        if not self.message:
+            if origin(source) == self.page_origin:
+                complete.extend(self.record)
+            self.record = []
 
     def read(self):
         try:
@@ -130,13 +162,11 @@ class ConsoleTail:
                 # appears now; wait to consume it so the LF cannot create a blank line.
                 if end.group() == b"\r" and end.end() == len(data):
                     break
-                line, self.message = self.parse(data[at:end.start()].decode(errors="replace"), self.message)
-                if line is not None:
-                    complete.append(line)
+                self.keep(data[at:end.start()].decode(errors="replace"), complete)
                 at = end.end()
             self.pending = data[at:]
             self.preview = self.parse(self.pending.rstrip(b"\r").decode(errors="replace"), self.message)[0] \
-                if self.pending else None
+                if self.pending and self.page_origin is None else None
             body = "".join(line + "\n" for line in complete).encode()
             preview = (self.preview + "\n").encode() if self.preview is not None else b""
             # Only the incomplete last line can change. Complete lines stay on disk.
@@ -262,13 +292,14 @@ def main(argv):
     tab = None
     shared = None
     offset = 0
+    page_origin = None  # a Chrome of its own logs only this page
     console = None
     try:
         shared = os.environ.get("WRELA_TEST_CHROME")
         if shared:
             from chrome_session import request
             tab = request(shared, "start", {"url": url})
-            chrome_log, offset = tab["log"], tab["offset"]
+            chrome_log, offset, page_origin = tab["log"], tab["offset"], origin(url)
         else:
             adopt_chrome_children()
             with open(chrome_log, "wb") as log:
@@ -298,7 +329,7 @@ def main(argv):
                     stderr=log,
                     start_new_session=True,
                 )
-        console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset)
+        console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset, page_origin)
         while True:
             if server is None and not done and os.path.exists(done_file):
                 with open(done_file, errors="replace") as f:
@@ -328,7 +359,7 @@ def main(argv):
             server.shutdown()
             server.server_close()
         if console is None:
-            console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset)
+            console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset, page_origin)
         lines = console.read()
         shutil.rmtree(profile, ignore_errors=True)
 
