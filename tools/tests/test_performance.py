@@ -8,7 +8,6 @@ import json
 import os
 import pathlib
 import random
-import runpy
 import sys
 import tempfile
 import threading
@@ -20,7 +19,6 @@ sys.path.insert(0, TOOLS)
 
 import round as rounds  # noqa: E402
 import serve  # noqa: E402
-import subjects  # noqa: E402
 
 
 class GzipCacheTest(unittest.TestCase):

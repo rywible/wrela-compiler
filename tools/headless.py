@@ -19,8 +19,10 @@ so concurrent runs don't need a server and can't collide on one.
 
 Exit status: 0 the page wrote `ok`; 1 it failed, timed out, or Chrome exited; 2 a setup error.
 
-Environment: WRELA_CHROME overrides the Chrome binary; WRELA_CHROME_ARGS adds arguments to its
-command line (split as a shell would). Rendering requires a hardware WebGPU adapter.
+Environment: WRELA_CHROME overrides the Chrome binary (by default the macOS app, or on Linux the
+first Chrome on PATH, with the flags that expose its hardware WebGPU adapter); WRELA_CHROME_ARGS
+adds arguments to its command line (split as a shell would). Rendering requires a hardware
+WebGPU adapter.
 WRELA_THROTTLE (bits a second) slows the server's sending, every request sharing the rate
 (tools/serve.py).
 """
@@ -40,9 +42,28 @@ import time
 
 import serve
 
-CHROME = os.environ.get(
-    "WRELA_CHROME", "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-)
+LINUX_CHROMES = ("google-chrome-stable", "google-chrome", "chromium", "chromium-browser")
+
+
+def chrome_binary(environ=os.environ, platform=sys.platform, which=shutil.which):
+    """WRELA_CHROME, else the platform's Chrome: the macOS app, or the first on PATH."""
+    if environ.get("WRELA_CHROME"):
+        return environ["WRELA_CHROME"]
+    if platform == "darwin":
+        return "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    return next(filter(None, map(which, LINUX_CHROMES)), LINUX_CHROMES[0])
+
+
+def platform_args(platform=sys.platform):
+    """Linux Chrome keeps WebGPU behind flags, and without Vulkan through ANGLE it offers only
+    its software adapter, which the runtime refuses."""
+    if platform.startswith("linux"):
+        return ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=vulkan",
+                "--ignore-gpu-blocklist"]
+    return []
+
+
+CHROME = chrome_binary()
 def fail(status, message):
     print(message, file=sys.stderr)
     sys.exit(status)
@@ -268,6 +289,7 @@ def main(argv):
                         "--enable-logging=stderr",
                         "--v=0",
                         "--window-size=1920,1080",
+                        *platform_args(),
                         *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
                         url,
                     ],

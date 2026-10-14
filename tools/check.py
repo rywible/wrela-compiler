@@ -27,9 +27,7 @@ SOURCES = ("examples", "engine", "compiler/std", "compiler/tests/fields", "compi
            "compiler/tests/unroll", "ui", "studio", "platform", "console")
 STEPS = ("rustfmt", "clippy", "wrela-fmt", "tools", "browser-types", "browser-dist",
          "browser-size", "browser", "doc", "wgsl")
-CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_ITERS", "WRELA_FUZZ_SEED",
-            "WRELA_FUZZ_WORKER", "WRELA_FUZZ_JOBS", "WRELA_FUZZ_TIERS", "WRELA_FULL",
-            "WRELA_CONST_CACHE")
+CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_WORKER", "WRELA_CONST_CACHE")
 
 
 def selection(arguments):
@@ -162,6 +160,11 @@ def browser_test(name, logs):
     return len(ran)
 
 
+def browser_packages():
+    """The browser runtime's locked packages (TypeScript, the WebGPU types): a fresh checkout has none."""
+    call(["bun", "install", "--frozen-lockfile", "--silent"], cwd=ROOT / "runtime/browser")
+
+
 def step(name, wrela, logs):
     commands = {
         "rustfmt": ["cargo", "fmt", "--all", "--", "--check"],
@@ -182,9 +185,11 @@ def step(name, wrela, logs):
         if not passed:
             raise ValueError(f"{name} failed")
     elif name == "browser" or name.startswith("browser::"):
+        browser_packages()
         browser_test(None if name == "browser" else name, logs)
     elif name.startswith("browser-"):
         script = {"browser-types": "typecheck", "browser-dist": "check-dist", "browser-size": "size"}[name]
+        browser_packages()
         call(["bun", "run", script], cwd=ROOT / "runtime/browser")
     else:
         call(commands[name])

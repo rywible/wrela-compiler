@@ -395,7 +395,7 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
     require_hardware(&info.name, info.device_type)?;
     let missing = features - adapter.features();
     if !missing.is_empty() {
-        return Err(Error::Gpu(format!("{} doesn't support {missing:?}", adapter.get_info().name)));
+        return Err(Error::Gpu(format!("{} doesn't support {missing:?}", info.name)));
     }
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
@@ -2036,22 +2036,22 @@ fn resolve(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use wrela_abi::manifest::Pipeline;
+
     #[test]
     fn hardware_rendering_rejects_software_virtual_and_unknown_adapters() {
         for kind in [wgpu::DeviceType::Cpu, wgpu::DeviceType::VirtualGpu, wgpu::DeviceType::Other] {
-            let error = super::require_hardware("test adapter", kind).unwrap_err().to_string();
+            let error = require_hardware("test adapter", kind).unwrap_err().to_string();
             assert!(
                 error.contains("hardware GPU required") && error.contains("test adapter"),
                 "{error}"
             );
         }
         for kind in [wgpu::DeviceType::IntegratedGpu, wgpu::DeviceType::DiscreteGpu] {
-            assert!(super::require_hardware("hardware", kind).is_ok());
+            assert!(require_hardware("hardware", kind).is_ok());
         }
     }
-
-    use super::*;
-    use wrela_abi::manifest::Pipeline;
 
     /// Copies a texture before a later write can replace it, leaving the copy in the current
     /// encoder so the test checks ordering within and between submissions.

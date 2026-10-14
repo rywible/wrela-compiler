@@ -47,3 +47,14 @@ class Session(PageDir, unittest.TestCase):
                     self.assertFalse(chrome_session.request(os.environ['WRELA_TEST_CHROME'], 'alive', {})['alive'])
                 self.assertEqual(os.environ.get('WRELA_TEST_CHROME'), previous)
                 self.assertIsNotNone(proc.poll())
+
+
+class ChromeDiscovery(unittest.TestCase):
+    def test_platform_chrome_and_flags(self):
+        found = {'google-chrome': '/usr/bin/google-chrome', 'chromium': '/usr/bin/chromium'}.get
+        self.assertEqual(headless.chrome_binary({'WRELA_CHROME': '/x/chrome'}, 'linux', found), '/x/chrome')
+        self.assertEqual(headless.chrome_binary({}, 'linux', found), '/usr/bin/google-chrome')
+        self.assertEqual(headless.chrome_binary({}, 'linux', lambda name: None), 'google-chrome-stable')
+        self.assertTrue(headless.chrome_binary({}, 'darwin', found).startswith('/Applications/'))
+        self.assertIn('--use-angle=vulkan', headless.platform_args('linux'))
+        self.assertEqual(headless.platform_args('darwin'), [])

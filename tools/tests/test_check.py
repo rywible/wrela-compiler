@@ -32,8 +32,8 @@ class Selection(unittest.TestCase):
                 patch.object(check, 'listed', return_value=['test']), \
                 patch.object(check, 'step') as step, \
                 patch.object(check, 'rust_run', return_value=1) as run, \
-                patch.dict(os.environ, {'WRELA_FULL': '1', 'WRELA_BLESS': '1',
-                                        'WRELA_RUN_ONLY': 'missing', 'WRELA_FUZZ_ITERS': '1000000'}), \
+                patch.dict(os.environ, {'WRELA_BLESS': '1', 'WRELA_RUN_ONLY': 'missing',
+                                        'WRELA_CONST_CACHE': '0'}), \
                 contextlib.redirect_stdout(io.StringIO()):
             cwd = Path.cwd()
             try:
@@ -193,6 +193,21 @@ class BrowserSelection(unittest.TestCase):
                     check.browser_test('browser::x.test.ts::a', logs)
             with patch.object(check, 'ROOT', root), self.assertRaises(ValueError):
                 check.browser_test('browser::../../outside::a', logs)
+
+
+class BrowserPackages(unittest.TestCase):
+    def test_browser_steps_install_the_locked_packages_first(self):
+        for name, last in [('browser-types', ['bun', 'run', 'typecheck']),
+                           ('browser-dist', ['bun', 'run', 'check-dist']),
+                           ('browser-size', ['bun', 'run', 'size'])]:
+            with self.subTest(name=name), patch.object(check, 'call') as run:
+                check.step(name, Path('wrela'), Path('logs'))
+                self.assertEqual([c.args[0] for c in run.call_args_list],
+                                 [['bun', 'install', '--frozen-lockfile', '--silent'], last])
+        with patch.object(check, 'call') as run, patch.object(check, 'browser_test') as test:
+            check.step('browser', Path('wrela'), Path('logs'))
+            self.assertEqual(run.call_args.args[0], ['bun', 'install', '--frozen-lockfile', '--silent'])
+            test.assert_called_once_with(None, Path('logs'))
 
 
 if __name__ == '__main__':

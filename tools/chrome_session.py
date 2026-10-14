@@ -46,7 +46,8 @@ class ChromeSession:
                 '--disable-extensions', '--disable-background-timer-throttling',
                 '--disable-renderer-backgrounding', '--autoplay-policy=no-user-gesture-required',
                 '--enable-webgpu-developer-features', '--enable-logging=stderr', '--v=0',
-                '--window-size=1920,1080', *shlex.split(os.environ.get('WRELA_CHROME_ARGS', '')),
+                '--window-size=1920,1080', *headless.platform_args(),
+                *shlex.split(os.environ.get('WRELA_CHROME_ARGS', '')),
                 'about:blank'], stdin=subprocess.DEVNULL, stdout=self.log, stderr=self.log,
                 start_new_session=True)
             deadline = time.monotonic() + 15
