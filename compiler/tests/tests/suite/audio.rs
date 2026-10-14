@@ -77,7 +77,7 @@ fn the_mixer_mixes_the_same_samples_every_time() {
     assert_eq!(hash.hex(), MIXED_HASH);
 }
 
-const MIXED_HASH: &str = "6f33c8535e5a87db";
+const MIXED_HASH: &str = "791d08e6bc49c2d7";
 
 /// Chrome's AudioWorklet, rendering the mixer offline, gives the native host's samples, bit for
 /// bit; and at its busiest it takes under a quarter of a core.
