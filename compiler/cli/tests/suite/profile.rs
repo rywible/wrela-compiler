@@ -21,6 +21,7 @@ pub fn init() -> Work {
 }
 
 pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
+    assert(abs(time - f32(w.frames) / 60.0) < 0.000001, \"frame clock did not reset\")
     phase(\"record\")
     if w.frames == 0 {
         label(\"setup\")
@@ -41,7 +42,7 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
     );
     let d = dir.to_str().unwrap();
     let out = common::wrela()
-        .args(["profile", d, "--frames", "4", "--json"])
+        .args(["profile", d, "--frames", "4", "--warmup", "0", "--json"])
         .output()
         .expect("run wrela");
     let text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -83,7 +84,7 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
     std::fs::write(&baseline, before.to_string()).unwrap();
     let b = baseline.to_str().unwrap();
     let out = common::wrela()
-        .args(["profile", d, "--frames", "4", "--json", "--baseline", b])
+        .args(["profile", d, "--frames", "4", "--warmup", "0", "--json", "--baseline", b])
         .output()
         .expect("run wrela");
     let compared: serde_json::Value = serde_json::from_slice(&out.stdout).expect("JSON");
@@ -98,7 +99,87 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
     assert_eq!(compared["cpu"]["was_frame_ms"], p["cpu"]["frame_ms"]);
     assert_eq!(compared["baseline"]["gone"], serde_json::json!(["removed since"]));
     let report = common::stdout(
-        common::wrela().args(["profile", d, "--frames", "4"]).args(["--baseline", b]),
+        common::wrela()
+            .args(["profile", d, "--frames", "4", "--warmup", "0"])
+            .args(["--baseline", b]),
     );
     assert!(report.contains("was ") && report.contains("no longer run: removed since"), "{report}");
+
+    for field in ["environment", "workload", "schema"] {
+        let mut incompatible = before.clone();
+        incompatible[field] = serde_json::json!({"different": true});
+        std::fs::write(&baseline, incompatible.to_string()).unwrap();
+        let out = common::wrela()
+            .args(["profile", d, "--frames", "4", "--warmup", "0", "--baseline", b])
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "accepted different {field}");
+    }
+
+    let saved = dir.join("saved-build");
+    common::stdout(common::wrela().args(["build", d, "-o", saved.to_str().unwrap()]));
+    std::fs::write(dir.join("main.wrela"), WORK.replace("each frame", "candidate frame")).unwrap();
+    let out = common::wrela()
+        .args([
+            "profile",
+            d,
+            "--frames",
+            "4",
+            "--warmup",
+            "2",
+            "--workers",
+            "1",
+            "--compare",
+            saved.to_str().unwrap(),
+            "--pairs",
+            "3",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let comparison: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        comparison["order"],
+        serde_json::json!([
+            "baseline",
+            "candidate",
+            "candidate",
+            "baseline",
+            "baseline",
+            "candidate"
+        ])
+    );
+    assert_ne!(comparison["baseline_build_sha256"], comparison["candidate_build_sha256"]);
+    for side in comparison["samples"].as_object().unwrap().values() {
+        assert_eq!(side.as_array().unwrap().len(), 3);
+        for sample in side.as_array().unwrap() {
+            // Every restarted program discards setup work and phases from warmup.
+            let labels = sample["gpu"]["labels"].as_array().unwrap();
+            assert_eq!(labels.len(), 1, "warmup leaked: {sample}");
+            assert_eq!(labels[0]["frames"], 4);
+            assert_eq!(sample["cpu"]["phases"][0]["times"], 4);
+            assert_eq!(sample["warmup"], 2);
+            assert_eq!(sample["workload"]["workers"], 1);
+        }
+    }
+    let labels = comparison["labels"].as_array().unwrap();
+    assert_eq!(
+        labels.iter().find(|l| l["label"] == "each frame").unwrap()["comparison"]["status"],
+        "removed"
+    );
+    assert_eq!(
+        labels.iter().find(|l| l["label"] == "candidate frame").unwrap()["comparison"]["status"],
+        "added"
+    );
+
+    let generated = dir.join("build/profile");
+    let manifest = std::fs::read(generated.join("manifest.json")).unwrap();
+    let out = common::wrela()
+        .args(["profile", d, "--compare", generated.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("would be overwritten"));
+    assert_eq!(std::fs::read(generated.join("manifest.json")).unwrap(), manifest);
 }

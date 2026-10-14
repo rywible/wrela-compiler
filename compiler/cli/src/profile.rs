@@ -1,7 +1,7 @@
 //! `wrela profile <package-dir> [--frames n] [--size WxH] [--input script.json] [--serial]
 //! [--json] [--baseline report.json]`: where a frame's time goes, on this machine. It builds the
 //! program as `wrela build` does, runs its frames on the native host's GPU (in lockstep with its
-//! ticker, 60 a second; 120 frames unless said), and reports:
+//! ticker, 60 a second; 60 warmup frames and 120 measured frames unless said), and reports:
 //! - the GPU's time: each label's median a frame and its 95th percentile (a pass or a dispatch,
 //!   named by `std::gpu::label`, else by its pipeline), and the frame's span, its first start
 //!   to its last end. Passes overlap on some GPUs, so labels can add up to more than the span;
@@ -16,7 +16,13 @@
 //! it. The first frames make the GPU's pipelines, so a run of a few frames says less. Times are
 //! this machine's: compare a change with a profile from before it, on the same machine.
 //! `--baseline` does: given an earlier `--json` report, each time says what it was and how it
-//! changed, and the labels no longer run are listed.
+//! changed, and the labels no longer run are listed. Reports must match machine, adapter,
+//! driver and workload; host/build hashes identify the measured implementation.
+//! `--compare <built-baseline>` alternates five pairs on
+//! one device, resetting state each time, and reports run variation without timing gates.
+//! Use `--scenario` to name the scene; seeds and quality remain fixed by its program/input.
+//! `--warmup`, `--workers` and `--pairs` control the replay; `--warmup 0` includes startup frames.
+//! Run benchmarks with other builds and GPU workloads idle.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -24,6 +30,8 @@ use std::process::ExitCode;
 use std::time::Instant;
 use wrela_abi::input::Scripted;
 use wrela_host::{GpuTiming, Host, Options, Timing};
+
+mod comparison;
 
 struct Args {
     dir: PathBuf,
@@ -33,6 +41,11 @@ struct Args {
     serial: bool,
     json: bool,
     baseline: Option<PathBuf>,
+    compare: Option<PathBuf>,
+    warmup: u32,
+    workers: u32,
+    pairs: u32,
+    scenario: String,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -44,11 +57,27 @@ fn parse(args: &[String]) -> Option<Args> {
         serial: false,
         json: false,
         baseline: None,
+        compare: None,
+        warmup: 60,
+        workers: wrela_host::default_workers(),
+        pairs: 5,
+        scenario: String::new(),
     };
     let mut dir = None;
     let mut it = args.iter();
     while let Some(x) = it.next() {
         match x.as_str() {
+            "--warmup" => a.warmup = it.next()?.parse().ok()?,
+            "--workers" => {
+                a.workers = it
+                    .next()?
+                    .parse()
+                    .ok()
+                    .filter(|&n| n > 0 && n <= wrela_abi::memory::MAX_WORKERS + 1)?
+            }
+            "--pairs" => a.pairs = it.next()?.parse().ok().filter(|&n| n >= 3)?,
+            "--scenario" => a.scenario = it.next()?.clone(),
+            "--compare" => a.compare = Some(PathBuf::from(it.next()?)),
             "--frames" => a.frames = it.next()?.parse().ok().filter(|&n| n > 0)?,
             "--size" => a.size = crate::parse_size(it.next()?)?,
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
@@ -60,11 +89,29 @@ fn parse(args: &[String]) -> Option<Args> {
         }
     }
     a.dir = dir?;
+    a.frames.checked_add(a.warmup)?;
+    if a.baseline.is_some() && a.compare.is_some() {
+        return None;
+    }
+    if a.compare.is_none() && args.iter().any(|x| x == "--pairs") {
+        return None;
+    }
+    if a.scenario.is_empty() {
+        a.scenario = a
+            .dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| a.dir.display().to_string());
+    }
     Some(a)
 }
 
 /// What a profile found.
 struct Profile {
+    environment: serde_json::Value,
+    workload: serde_json::Value,
+    build_sha256: String,
+    init_warmup_ms: f64,
     /// Each label's time: the longest first.
     labels: Vec<Label>,
     /// A frame's span on the GPU, ms: the median and the 95th percentile.
@@ -91,6 +138,8 @@ impl Times {
 
 /// An earlier report (`--json`): how it ran and its medians. `--baseline` compares a run with one.
 struct Baseline {
+    environment: serde_json::Value,
+    workload: serde_json::Value,
     frames: u64,
     size: (u64, u64),
     /// Whether it ran with `--serial`.
@@ -107,6 +156,12 @@ impl Baseline {
         let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
             format!("{} isn't a `wrela profile --json` report: {e}", path.display())
         })?;
+        if v["schema"] != 2 || !v["environment"].is_object() || !v["workload"].is_object() {
+            return Err(
+                "baseline lacks hardware/workload identity; record it again with this profiler"
+                    .into(),
+            );
+        }
         let labels = v["gpu"]["labels"]
             .as_array()
             .ok_or_else(|| format!("{} has no `gpu.labels`", path.display()))?
@@ -114,6 +169,8 @@ impl Baseline {
             .filter_map(|l| Some((l["label"].as_str()?.to_string(), l["median_ms"].as_f64()?)))
             .collect();
         Ok(Baseline {
+            environment: v["environment"].clone(),
+            workload: v["workload"].clone(),
             frames: v["frames"].as_u64().unwrap_or(0),
             size: (v["size"][0].as_u64().unwrap_or(0), v["size"][1].as_u64().unwrap_or(0)),
             serial: v["serial"] == serde_json::Value::Bool(true),
@@ -140,25 +197,9 @@ fn baseline_problem(serial: bool, baseline: &Baseline) -> Option<String> {
 
 pub fn run(args: &[String]) -> ExitCode {
     let Some(a) = parse(args) else { return crate::usage() };
-    // The baseline is read first, so a wrong path doesn't wait for a profile.
-    let baseline = match a.baseline.as_deref().map(Baseline::read).transpose() {
-        Ok(b) => b,
-        Err(why) => {
-            eprintln!("error: {why}");
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(why) = baseline.as_ref().and_then(|b| baseline_problem(a.serial, b)) {
-        eprintln!("error: {why}");
-        return ExitCode::from(2);
-    }
-    match profile(&a) {
-        Ok(p) => {
-            if a.json {
-                print!("{}", json(&a, &p, baseline.as_ref()));
-            } else {
-                print!("{}", text(&a, &p, baseline.as_ref()));
-            }
+    match run_report(&a) {
+        Ok(report) => {
+            print!("{report}");
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -166,6 +207,43 @@ pub fn run(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn run_report(a: &Args) -> Result<String, String> {
+    let baseline = a.baseline.as_deref().map(Baseline::read).transpose()?;
+    if let Some(why) = baseline.as_ref().and_then(|b| baseline_problem(a.serial, b)) {
+        return Err(why);
+    }
+    if let Some(before) = &a.compare {
+        comparison::validate_saved_build(&a.dir, before)?;
+    }
+    // A lock coordinates profiler instances on this machine; ordinary builds must be idle too.
+    let _lease = comparison::lease(&std::env::temp_dir().join("wrela-profile.lock"))?;
+    let storage = comparison::Storage::new()?;
+    let options = Options {
+        storage: Some(storage.0.clone()),
+        timing: if a.serial { Timing::Serial } else { Timing::Span },
+        quiet: true,
+        defer_init: true,
+        workers: a.workers,
+        ..Options::default()
+    };
+    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options)?;
+    let environment = comparison::environment(&mut host)?;
+    let workload = comparison::workload(a, &script);
+    let frozen = comparison::build_hash(&built)?;
+    if let Some(b) = &baseline {
+        comparison::compatible_hardware(&b.environment, &environment)?;
+        comparison::compatible(&b.workload, &workload, "workload")?;
+    }
+    if a.compare.is_some() {
+        return comparison::run(a, &mut host, &options, &script, &built, &environment, &workload);
+    }
+    let p = measure(a, &mut host, &script, &built, &environment, &workload)?;
+    if p.build_sha256 != frozen {
+        return Err("build changed during measurement; discard this run".into());
+    }
+    Ok(if a.json { json(a, &p, baseline.as_ref()) } else { text(a, &p, baseline.as_ref()) })
 }
 
 /// A package built as `wrela build` builds it (into `build/profile`) and loaded on the native
@@ -191,28 +269,43 @@ fn load(
     Ok((host, script, built))
 }
 
-fn profile(a: &Args) -> Result<Profile, String> {
-    let timing = if a.serial { Timing::Serial } else { Timing::Span };
-    let options = Options { timing, quiet: true, defer_init: true, ..Options::default() };
-    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options)?;
+fn measure(
+    a: &Args,
+    host: &mut Host,
+    script: &[Scripted],
+    built: &Path,
+    environment: &serde_json::Value,
+    workload: &serde_json::Value,
+) -> Result<Profile, String> {
+    let started = Instant::now();
     host.init().map_err(|e| format!("in `init`: {e}"))?;
     let (w, h) = a.size;
+    for k in 0..a.warmup {
+        host.lockstep_frame(k, 60.0, w, h, script)
+            .map_err(|e| format!("in warmup frame {k}: {e}"))?;
+    }
+    host.take_timings().map_err(|e| e.to_string())?;
+    host.trace().take();
+    let init_warmup_ms = started.elapsed().as_secs_f64() * 1e3;
     let mut calls = Vec::with_capacity(a.frames as usize);
-    for k in 0..a.frames {
+    for k in a.warmup..a.warmup + a.frames {
         let t = Instant::now();
-        host.lockstep_frame(k, 60.0, w, h, &script).map_err(|e| format!("in frame {k}: {e}"))?;
+        host.lockstep_frame(k, 60.0, w, h, script).map_err(|e| format!("in frame {k}: {e}"))?;
         calls.push(t.elapsed().as_secs_f64() * 1e3);
     }
     let timings = host.take_timings().map_err(|e| e.to_string())?;
     let phases = host.trace().take();
-    drop(host);
     let spans: Vec<f64> = wrela_host::frame_spans(&timings).into_iter().map(|(_, ms)| ms).collect();
     Ok(Profile {
+        environment: environment.clone(),
+        workload: workload.clone(),
+        build_sha256: comparison::build_hash(built)?,
+        init_warmup_ms,
         labels: by_label(&timings),
         span: Times::of(spans),
         frame: Times::of(calls).unwrap_or_default(),
         phases,
-        wgsl: wgsl(&built)?,
+        wgsl: wgsl(built)?,
     })
 }
 
@@ -308,6 +401,12 @@ fn was(baseline: Option<&Baseline>, then: Option<f64>, now: f64) -> String {
 fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     let (w, h) = a.size;
     let mut s = format!("`{}`: {} frames at {w}×{h}\n", a.dir.display(), a.frames);
+    s.push_str(&format!(
+        "{}\nwarmup: {} frames; init and warmup: {:.3} ms\n",
+        p.environment["adapter"].as_str().unwrap_or(""),
+        a.warmup,
+        p.init_warmup_ms
+    ));
     if let Some(b) = baseline {
         let path = a.baseline.as_deref().unwrap_or(std::path::Path::new("")).display();
         let (bw, bh) = b.size;
@@ -356,7 +455,7 @@ fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     }
     s.push_str("\nCPU\n");
     s.push_str(&format!(
-        "  {:<32} {:>9.3} ms {:>9.3} ms{} (the host's work included)\n",
+        "  {:<32} {:>9.3} ms {:>9.3} ms{} (host work and GPU waits included; not browser FPS)\n",
         "a frame's call",
         p.frame.median,
         p.frame.p95,
@@ -413,6 +512,12 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
         p.wgsl.iter().map(|(n, b)| serde_json::json!({ "pipeline": n, "bytes": b })).collect();
     let span = p.span.filter(|_| !a.serial);
     let mut all = serde_json::json!({
+        "schema": 2,
+        "environment": p.environment,
+        "workload": p.workload,
+        "build_sha256": p.build_sha256,
+        "init_warmup_ms": p.init_warmup_ms,
+        "warmup": a.warmup,
         "frames": a.frames,
         "size": [a.size.0, a.size.1],
         "serial": a.serial,
@@ -446,6 +551,8 @@ mod tests {
 
     fn baseline(serial: bool) -> Baseline {
         Baseline {
+            environment: serde_json::json!({}),
+            workload: serde_json::json!({}),
             frames: 120,
             size: (1280, 720),
             serial,

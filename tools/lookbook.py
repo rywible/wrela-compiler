@@ -15,18 +15,13 @@ the look (F8 in the floor): `clay`, the scene's light on its forms all one matte
 `silhouette`, the sky white, the land light and the solid forms dark, a step lighter for each band
 of distance. `--size` renders the stills at another size than 1920x1080 (1280x720 while
 iterating). Stills run one at a time by default. `--jobs` renders the requested number of
-stills concurrently, with the same pixels:
-on a 4-core cloud machine lavapipe leaves cores idle in a still's load frames, and shots 2, 7
-and 9 took 785 s at once, about 1400 s one by one. Each shot's numbers, the
+stills concurrently, with the same pixels. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
 `check.json`.
 
 `--capture` takes each still in capture mode (F7, `Floor::capture` in examples/last-green/main.wrela):
 the floor does its load in a few frames, and the still is the frame it prints `still at frame N` on,
-a 16-frame resolve once the light round the eye is in, not the frame 5 s in. Shot 2 at 1080p on a
-4-core cloud machine: 104 s, not 460 s; shots 2, 7 and 9 at once: 180 s, each the same pixels as
-alone. (One process taking shot after shot was as fast for three, but a shot's still depended on
-the shots before it.)
+a 16-frame resolve once the light round the eye is in, not the frame 5 s in.
 """
 
 import json, os, re, shutil, subprocess, sys, tempfile
@@ -77,19 +72,11 @@ def still(i, name, out, view="look", size="1920x1080", jobs=1, capture=False):
         json.dump(events, f)
         script = f.name
     png = os.path.join(out, stem(i, name) + ".png")
-    software = os.environ.get("WRELA_SOFTWARE_GPU") == "1"
-    env = dict(os.environ) if software else None
     frames = CAPTURE_FRAMES if capture else SETTLE_FRAMES + 1
     cmd = [HOST, BUILD, "--frames", str(frames), "--size", size, "--input", script, "--png", png]
-    if software:
-        # Each concurrent shot gets a share of the CPU, including lavapipe's raster workers.
-        # Bound Mesa's raster workers by this shot's share of the available CPUs.
-        cores = max(1, (cpu_count() or 1) // jobs)
-        env["LP_NUM_THREADS"] = str(cores)
-        cmd += ["--workers", str(min(9, cores))]  # native ABI: main thread plus eight helpers
     try:
         r = subprocess.run(cmd + (["--until", STILL] if capture else []), capture_output=True,
-                           text=True, env=env)
+                           text=True)
     finally:
         os.unlink(script)
     if r.returncode != 0:

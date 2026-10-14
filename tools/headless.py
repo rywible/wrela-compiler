@@ -20,7 +20,7 @@ so concurrent runs don't need a server and can't collide on one.
 Exit status: 0 the page wrote `ok`; 1 it failed, timed out, or Chrome exited; 2 a setup error.
 
 Environment: WRELA_CHROME overrides the Chrome binary; WRELA_CHROME_ARGS adds arguments to its
-command line (split as a shell would: tools/cloud.sh's Chromium on a CPU's Vulkan).
+command line (split as a shell would). Rendering requires a hardware WebGPU adapter.
 WRELA_THROTTLE (bits a second) slows the server's sending, every request sharing the rate
 (tools/serve.py).
 """

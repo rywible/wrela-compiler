@@ -71,14 +71,12 @@ class MotionCpuTest(unittest.TestCase):
 
 class LookbookCpuTest(unittest.TestCase):
     def test_requested_jobs_and_shot_count_are_respected(self):
-        cases = [(1, True, [], 1), (2, True, [], 1), (4, True, [], 1),
-                 (16, True, [], 1), (16, False, [], 1), (4, True, ["0"], 1),
-                 (4, True, ["--jobs", "4"], 4)]
-        for cores, software, options, jobs in cases:
-            with self.subTest(cores=cores, software=software, options=options), \
+        cases = [(1, [], 1), (2, [], 1), (4, [], 1), (16, [], 1),
+                 (4, ["0"], 1), (4, ["--jobs", "4"], 4)]
+        for cores, options, jobs in cases:
+            with self.subTest(cores=cores, options=options), \
                  tempfile.TemporaryDirectory() as out, \
                  mock.patch.object(sys, "argv", ["lookbook.py", out, "--stills", *options]), \
-                 mock.patch.dict(os.environ, {"WRELA_SOFTWARE_GPU": "1" if software else "0"}), \
                  mock.patch.object(lookbook, "BUILD", out), \
                  mock.patch.object(lookbook, "cpu_count", return_value=cores), \
                  mock.patch.object(lookbook, "names", return_value=["shot"] * 6), \
@@ -87,25 +85,6 @@ class LookbookCpuTest(unittest.TestCase):
                 lookbook.main()
                 self.assertTrue(still.called)
                 self.assertEqual({call.args[5] for call in still.call_args_list}, {jobs})
-
-    def test_software_shots_bound_mesa_by_each_shots_cpu_budget(self):
-        for cores, jobs, override, expected in [(2, 2, None, 1), (4, 1, None, 4),
-                                                (16, 3, None, 5), (16, 3, "7", 5)]:
-            with self.subTest(cores=cores, jobs=jobs, override=override), \
-                 tempfile.TemporaryDirectory() as out, \
-                 mock.patch.dict(os.environ, {"WRELA_SOFTWARE_GPU": "1"}, clear=True), \
-                 mock.patch.object(lookbook, "cpu_count", return_value=cores), \
-                 mock.patch.object(lookbook.subprocess, "run", return_value=
-                                   subprocess.CompletedProcess([], 0, "", "")) as run:
-                if override:
-                    os.environ["LP_NUM_THREADS"] = override
-                lookbook.still(0, "shot", out, jobs=jobs, capture=True)
-                args = run.call_args.args[0]
-                env = run.call_args.kwargs["env"]
-                self.assertEqual(args[args.index("--workers") + 1], str(expected))
-                self.assertEqual(env["LP_NUM_THREADS"], str(expected))
-                self.assertEqual(args[args.index("--until") + 1], lookbook.STILL)
-                self.assertFalse(Path(args[args.index("--input") + 1]).exists())
 
     def test_browser_workers_follow_available_cpus(self):
         for cores in (1, 2, 4, 16):

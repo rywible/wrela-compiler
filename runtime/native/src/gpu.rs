@@ -391,6 +391,8 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
         ..Default::default()
     }))
     .map_err(|e| Error::Gpu(format!("no GPU adapter: {e}")))?;
+    let info = adapter.get_info();
+    require_hardware(&info.name, info.device_type)?;
     let missing = features - adapter.features();
     if !missing.is_empty() {
         return Err(Error::Gpu(format!("{} doesn't support {missing:?}", adapter.get_info().name)));
@@ -403,6 +405,14 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
         ..Default::default()
     }))
     .map_err(|e| Error::Gpu(format!("can't open the device: {e}")))
+}
+
+fn require_hardware(name: &str, kind: wgpu::DeviceType) -> Result<()> {
+    if matches!(kind, wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::DiscreteGpu) {
+        Ok(())
+    } else {
+        Err(Error::Gpu(format!("hardware GPU required; {name} reports {kind:?}")))
+    }
 }
 
 impl Gpu {
@@ -618,10 +628,9 @@ impl Builder {
         Ok(keys.into_iter().zip(self.build_many(&missing)?).collect())
     }
 
-    /// Each of `jobs` built, in order, on as many threads as the machine has cores: a software
-    /// GPU (lavapipe) compiles a pipeline on the thread that makes it, and a floor has hundreds
-    /// (wgpu's error scopes, which catch a shader's errors, are each thread's own). The first
-    /// failure in order, if any.
+    /// Each of `jobs` built, in order, on as many threads as the machine has cores.
+    /// wgpu's error scopes, which catch a shader's errors, are each thread's own.
+    /// Returns the first failure in order, if any.
     fn build_many(&self, jobs: &[(&wrela_abi::manifest::Pipeline, &str)]) -> Result<Vec<Pipeline>> {
         let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
         let threads = cores.min(jobs.len());
@@ -871,10 +880,19 @@ impl Gpu {
         Ok(self.timer.as_mut().map(|t| std::mem::take(&mut t.results)).unwrap_or_default())
     }
 
-    /// The adapter's name and driver, as wgpu reports them ("llvmpipe (LLVM 20.1.2, 256 bits)").
+    /// The adapter's name, backend, device type, PCI IDs and driver, as wgpu reports them.
     pub(crate) fn adapter(&self) -> String {
         let info = self.device.adapter_info();
-        format!("{} ({}, {})", info.name, info.driver, info.driver_info)
+        format!(
+            "{} ({:?}, {:?}, {:04x}:{:04x}; {}, {})",
+            info.name,
+            info.backend,
+            info.device_type,
+            info.vendor,
+            info.device,
+            info.driver,
+            info.driver_info
+        )
     }
 
     /// Reports (and clears) errors the device raised outside an error scope.
@@ -2018,6 +2036,20 @@ fn resolve(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hardware_rendering_rejects_software_virtual_and_unknown_adapters() {
+        for kind in [wgpu::DeviceType::Cpu, wgpu::DeviceType::VirtualGpu, wgpu::DeviceType::Other] {
+            let error = super::require_hardware("test adapter", kind).unwrap_err().to_string();
+            assert!(
+                error.contains("hardware GPU required") && error.contains("test adapter"),
+                "{error}"
+            );
+        }
+        for kind in [wgpu::DeviceType::IntegratedGpu, wgpu::DeviceType::DiscreteGpu] {
+            assert!(super::require_hardware("hardware", kind).is_ok());
+        }
+    }
+
     use super::*;
     use wrela_abi::manifest::Pipeline;
 

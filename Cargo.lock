@@ -2042,6 +2042,7 @@ dependencies = [
  "mimalloc",
  "png",
  "serde_json",
+ "sha2",
  "wrela-abi",
  "wrela-diag",
  "wrela-driver",

@@ -4,7 +4,7 @@
 /// <reference lib="webworker" />
 
 import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
-import { LIMIT_SOURCES } from "./check.ts";
+import { GpuError, openDevice } from "./device.ts";
 import { errorMessage } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
@@ -42,13 +42,6 @@ function salt(build: Build, n: number): Build {
   return { ...build, shaders };
 }
 
-/** The GPU, its adapter or device failed, or reported an error. */
-class GpuError extends Error {
-  constructor(why: string) {
-    super(`GPU error: ${why}`);
-    this.name = "GpuError";
-  }
-}
 
 let base = "";
 /** The build that's running's base: the page's, until a hot reload swaps another in. Its files
@@ -91,24 +84,6 @@ function requestHost(service: string, bytes: Uint8Array<ArrayBuffer>): Promise<U
   });
 }
 
-/** The device, with timestamp queries when `timestamps` asks for them and the adapter has
- * them. */
-async function openDevice(timestamps: boolean): Promise<GPUDevice> {
-  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
-  if (!adapter) throw new GpuError("WebGPU isn't available here (no adapter)");
-  // The adapter's own limits, as the native host requests them: a program asks for them
-  // (`wrela.limit`), both hosts check its commands against them, and WebGPU checks what they
-  // bound against them.
-  const requiredLimits: Record<string, number> = {};
-  for (const name of LIMIT_SOURCES.flat()) requiredLimits[name] = adapter.limits[name];
-  const requiredFeatures: GPUFeatureName[] = timestamps && adapter.features.has("timestamp-query") ? ["timestamp-query"] : [];
-  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
-  device.addEventListener("uncapturederror", (e) => fatal(new GpuError(e.error.message)));
-  device.lost.then((info) => {
-    if (info.reason !== "destroyed") fatal(new GpuError(`device lost: ${info.message}`));
-  });
-  return device;
-}
 
 function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPUCanvasContext {
   const ctx = canvas.getContext("webgpu");
@@ -782,7 +757,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       // The device and the build are fetched at once.
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
-      Promise.all([openDevice((test?.timestamps ?? 0) > 0), loadBuild(base)])
+      Promise.all([openDevice((test?.timestamps ?? 0) > 0, fatal), loadBuild(base)])
         .then(([device, build]) => {
           handOvers = new HandOvers(device, () => buildBase, () => [pipelineCache, leftovers]);
           return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live);
