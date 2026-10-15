@@ -157,6 +157,38 @@ struct RoomState {
     dropped: u64,
     /// The events (and messages' bytes) the room hasn't read.
     input: Queue,
+    /// The network commands of the current call (`platform::net`), in order: never answered.
+    commands: Vec<Net>,
+}
+
+/// A room's network command (`platform::net`): what the host does with a call's, once it
+/// returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Net {
+    /// Keep a record at the end of the journal (`net/keep`).
+    Keep(Vec<u8>),
+    /// Replace the journal with this snapshot record (`net/compact`).
+    Compact(Vec<u8>),
+    /// Send bytes on a connection, once the call's records are kept (`net/send`).
+    Send(u32, Vec<u8>),
+    /// Close a connection, after the call's sends (`net/close`).
+    Close(u32),
+}
+
+/// A network command from a host request's service and body, if it's one.
+fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
+    let conn = |b: &[u8]| -> Result<u32, String> {
+        b.get(..4)
+            .map(|w| u32::from_le_bytes(w.try_into().expect("four bytes")))
+            .ok_or_else(|| format!("`{service}` needs a connection's number"))
+    };
+    Some(match service {
+        "net/keep" => Ok(Net::Keep(body.to_vec())),
+        "net/compact" => Ok(Net::Compact(body.to_vec())),
+        "net/send" => conn(body).map(|c| Net::Send(c, body[4..].to_vec())),
+        "net/close" => conn(body).map(Net::Close),
+        _ => return None,
+    })
 }
 
 impl wasmtime::ResourceLimiter for RoomState {
@@ -211,6 +243,7 @@ impl Room {
             printed: Vec::new(),
             dropped: 0,
             input: Queue::default(),
+            commands: Vec::new(),
         };
         let mut store = Store::new(&ENGINE, state);
         store.limiter(|s| s);
@@ -247,6 +280,16 @@ impl Room {
     /// Queues that connection `conn` opened, or closed.
     pub fn push_connection(&mut self, conn: u32, open: bool) {
         self.store.data_mut().input.push(Event::connection(conn, open));
+    }
+
+    /// How many events wait for its next call.
+    pub fn queued(&self) -> usize {
+        self.store.data().input.len()
+    }
+
+    /// The network commands of its calls since the last call to this, in order.
+    pub fn take_commands(&mut self) -> Vec<Net> {
+        std::mem::take(&mut self.store.data_mut().commands)
     }
 
     /// The lines it printed since the last call to this, and how many more it printed than were
@@ -355,6 +398,18 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                 let s = c.data_mut();
                 match cmd {
                     Command::HostRequest { request, service, body } => {
+                        // A network command is the host's to carry out after the call: never
+                        // answered, so it holds nothing for the program to take.
+                        if let Some(net) = net_command(service, body) {
+                            match net {
+                                Ok(n) => s.commands.push(n),
+                                Err(why) => {
+                                    s.refused = Some(why.clone());
+                                    return Err(wasmtime::format_err!(why));
+                                }
+                            }
+                            continue;
+                        }
                         let answer = match &s.answers {
                             Some(answer) => answer(service, body),
                             None => Err("this host has no capability handler".to_string()),

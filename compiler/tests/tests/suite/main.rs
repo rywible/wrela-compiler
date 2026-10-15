@@ -49,6 +49,7 @@ mod renderer;
 mod reproducible;
 mod requests;
 mod roles;
+mod rooms;
 mod run_pass;
 mod simd;
 mod sketches;
