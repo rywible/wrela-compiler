@@ -86,6 +86,14 @@ class LookbookCpuTest(unittest.TestCase):
                 self.assertTrue(still.called)
                 self.assertEqual({call.args[5] for call in still.call_args_list}, {jobs})
 
+    def test_the_bare_view_names_the_shots_the_build_found(self):
+        with tempfile.TemporaryDirectory() as out, mock.patch.object(lookbook, "BUILD", out):
+            Path(out, "files", "geology").mkdir(parents=True)
+            Path(out, "files", "geology", "shots.json").write_text('["from the north tor"]')
+            self.assertEqual(lookbook.names("bare"), ["from the north tor"])
+        presses = [e["key"] for e in lookbook.keys(2, "bare")]
+        self.assertEqual(presses, ["F8", "F8", "F8", "KeyL", "Digit2", "Enter"])
+
     def test_browser_workers_follow_available_cpus(self):
         for cores in (1, 2, 4, 16):
             with self.subTest(cores=cores), tempfile.TemporaryDirectory() as out, \

@@ -30,6 +30,7 @@ mod hello_field;
 mod herd;
 mod input;
 mod keys;
+mod landform;
 mod language;
 mod last_green;
 mod lift;

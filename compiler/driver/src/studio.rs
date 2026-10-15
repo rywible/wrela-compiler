@@ -327,6 +327,12 @@ pub fn is_floor(pkg: &Path) -> bool {
         .is_ok_and(|t| t.contains("pub fn map(") && t.contains("pub fn preview("))
 }
 
+/// Whether the floor at `pkg` surveys its geology for the map lens: its `lens` module has
+/// `pub fn geology()`.
+pub fn has_geology(pkg: &Path) -> bool {
+    std::fs::read_to_string(pkg.join("lens.wrela")).is_ok_and(|t| t.contains("pub fn geology("))
+}
+
 /// The map lens's exported actions, as `ACTIONS` lists the field lens's.
 pub const MAP_ACTIONS: &[(&str, &str)] = &[
     ("show", "u"),
@@ -338,6 +344,7 @@ pub const MAP_ACTIONS: &[(&str, &str)] = &[
     ("write", ""),
     ("walk", ""),
     ("point", "ff"),
+    ("geology", "u"),
 ];
 
 /// The actions of the lens on the package at `pkg`: the map lens's on a floor, else the field
@@ -395,7 +402,10 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
             match rest {
                 "glue/main.wrela" => write(&program.join("main.wrela"), bytes)?,
                 "glue/floor.wrela" => {
-                    let text = String::from_utf8_lossy(bytes).replace("last_green", name);
+                    let mut text = String::from_utf8_lossy(bytes).replace("last_green", name);
+                    if !has_geology(pkg) {
+                        text = text.replace(&format!("Some({name}::lens::geology())"), "None");
+                    }
                     write(&program.join("floor.wrela"), text.as_bytes())?
                 }
                 "wrela.toml" => {

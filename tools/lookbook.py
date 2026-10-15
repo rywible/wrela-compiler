@@ -13,7 +13,8 @@ then for `lookbook::MOVE` seconds, paced as in play, recorded from Chrome's canv
 `clip`: a WebM). `--stills` makes the stills alone. `--view` draws a debug view of form instead of
 the look (F8 in the floor): `clay`, the scene's light on its forms all one matte grey, or
 `silhouette`, the sky white, the land light and the solid forms dark, a step lighter for each band
-of distance. `--size` renders the stills at another size than 1920x1080 (1280x720 while
+of distance; or `bare`, the world's land as its geology made it, alone, whose shots are of the
+places found in it (the build's `files/geology/shots.json`, numbered as there). `--size` renders the stills at another size than 1920x1080 (1280x720 while
 iterating). Stills run one at a time by default. `--jobs` renders the requested number of
 stills concurrently, with the same pixels. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
@@ -40,13 +41,17 @@ STILL = "still at frame"
 MOVE_FRAMES = 600
 
 
-def names():
+def names(view="look"):
+    """The shots' names: the lookbook's, or the bare view's, which the build found."""
+    if view == "bare":
+        with open(os.path.join(BUILD, "files", "geology", "shots.json")) as f:
+            return json.load(f)
     text = open(os.path.join(ROOT, "games/last-green/lookbook.wrela")).read()
     return re.findall(r'Shot \{\s*name: "([^"]+)"', text)
 
 
 # How many presses of F8 draw each debug view of form (`view` in games/last-green/main.wrela).
-VIEWS = {"look": 0, "clay": 1, "silhouette": 2}
+VIEWS = {"look": 0, "clay": 1, "silhouette": 2, "bare": 3}
 
 
 def keys(i, view="look"):
@@ -133,11 +138,11 @@ def main():
         del args[k:k + 2]
     out = args[0]
     os.makedirs(out, exist_ok=True)
-    shots = names()
+    shots = names(view)
     pick = [int(a) for a in args[1:]] or range(len(shots))
     jobs = min(jobs, max(1, len(pick)))
     numbers = os.path.join(BUILD, "files", "check", "shots.json")
-    views = json.load(open(numbers)) if os.path.exists(numbers) else []
+    views = json.load(open(numbers)) if os.path.exists(numbers) and view != "bare" else []
     if views:
         shutil.copyfile(numbers, os.path.join(out, "check.json"))
     # The stills at once, `jobs` at a time (each printed, in order, as it and those before it end);

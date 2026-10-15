@@ -285,10 +285,14 @@ impl Lens {
     }
 
     /// Export `name` called with `args`, the lens's lines before it dropped, and the frames
-    /// after until it settles.
+    /// after until it settles (one frame, for an action that waits for nothing: `settles`).
     pub(crate) fn call(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
         self.invoke(name, args)?;
-        self.settle()
+        self.finish(name)
+    }
+
+    fn finish(&mut self, name: &str) -> Result<(), String> {
+        if settles(self.field, name) { self.settle() } else { self.step() }
     }
 
     fn invoke(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
@@ -301,7 +305,11 @@ impl Lens {
     /// reach the GPU) and every map action still settle normally.
     pub(crate) fn call_without_frame(&mut self, name: &str, args: &[Value]) -> Result<(), String> {
         self.invoke(name, args)?;
-        if self.field && matches!(name, "zoom" | "mode" | "view") { Ok(()) } else { self.settle() }
+        if self.field && matches!(name, "zoom" | "mode" | "view") {
+            Ok(())
+        } else {
+            self.finish(name)
+        }
     }
 
     /// The answer to a deferred view control, before its image is needed.
@@ -582,9 +590,25 @@ fn session(
     Ok(())
 }
 
+/// Whether an action of a lens (the field lens's, or the map lens's) waits for the lens to
+/// settle: every one but the map lens's `geology`, which answers at once, reading nothing of the
+/// preview the lens may still be waiting for, and draws in the next frame.
+fn settles(field: bool, name: &str) -> bool {
+    field || name != "geology"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_map_lenss_geology_answers_without_waiting_for_its_preview() {
+        assert!(!settles(false, "geology"));
+        for name in ["show", "zoom", "check", "move", "write"] {
+            assert!(settles(false, name), "{name} didn't wait");
+        }
+        assert!(settles(true, "geology"));
+    }
 
     #[test]
     fn action_arguments_fit_the_values_the_host_receives() {
