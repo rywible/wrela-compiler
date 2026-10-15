@@ -14,6 +14,7 @@ members = [
     "compiler/tests",
     "runtime/abi",
     "runtime/native",
+    "runtime/serve",
 ]
 
 [workspace.package]
@@ -29,6 +30,7 @@ wrela-sema = { path = "compiler/sema" }
 wrela-driver = { path = "compiler/driver" }
 wrela-abi = { path = "runtime/abi" }
 wrela-host = { path = "runtime/native" }
+wrela-serve = { path = "runtime/serve" }
 wrela-ir = { path = "compiler/ir" }
 wrela-lower = { path = "compiler/lower" }
 wrela-wasm = { path = "compiler/wasm" }

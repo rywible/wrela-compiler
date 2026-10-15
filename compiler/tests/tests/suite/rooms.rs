@@ -73,7 +73,7 @@ impl Read<'_> {
     }
 }
 
-fn hello(token: u64, session: u32, acked: u32, have: u64) -> Vec<u8> {
+pub(crate) fn hello(token: u64, session: u32, acked: u32, have: u64) -> Vec<u8> {
     let mut b = Bits::default();
     for v in [0, token, u64::from(session), u64::from(acked), have] {
         b.varint(v);
@@ -88,7 +88,7 @@ fn ack(acked: u32) -> Vec<u8> {
     b.finish()
 }
 
-fn propose(peer: u32, session: u32, counter: u32, value: u32) -> Vec<u8> {
+pub(crate) fn propose(peer: u32, session: u32, counter: u32, value: u32) -> Vec<u8> {
     let mut b = Bits::default();
     for v in [1, peer, session, counter, value] {
         b.varint(u64::from(v));
@@ -98,7 +98,7 @@ fn propose(peer: u32, session: u32, counter: u32, value: u32) -> Vec<u8> {
 
 /// What a room sends, as these tests read it.
 #[derive(Debug, PartialEq, Eq)]
-enum Down {
+pub(crate) enum Down {
     Welcome { peer: u32, seq: u64 },
     State { seq: u64, tags: Vec<u32> },
     Committed { seq: u64, counter: u32, value: u32 },
@@ -107,7 +107,7 @@ enum Down {
     Refused { why: u32 },
 }
 
-fn down(bytes: &[u8]) -> Down {
+pub(crate) fn down(bytes: &[u8]) -> Down {
     let mut r = Read { bytes, at: 0 };
     match r.varint() {
         0 => {
@@ -181,7 +181,7 @@ pub fn serve(room: mut Room<Tags, u32>, time: f32) {
 "#;
 
 /// The server program's module, built once for every test here.
-fn wasm() -> &'static [u8] {
+pub(crate) fn wasm() -> &'static [u8] {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     WASM.get_or_init(|| {
         let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join("rooms-program");
@@ -205,10 +205,10 @@ fn wasm() -> &'static [u8] {
 }
 
 /// The server build, its WASM's hash, and a fresh directory for the test's rooms.
-fn build(name: &str) -> (ServerBuild, u64, PathBuf) {
+fn build(name: &str) -> (std::sync::Arc<ServerBuild>, u64, PathBuf) {
     let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("rooms-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
-    let build = ServerBuild::from_wasm(wasm()).expect("a server build");
+    let build = std::sync::Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build"));
     (build, wrela_abi::ticks::wasm_hash(wasm()), dir)
 }
 
@@ -222,7 +222,7 @@ fn limits() -> Limits {
 fn what_a_room_commits_survives_a_restart() {
     let (build, hash, dir) = build("restart");
     {
-        let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+        let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.receive(1, propose(1, 1, 1, 3));
@@ -242,7 +242,7 @@ fn what_a_room_commits_survives_a_restart() {
     }
     // A new host process: the journal is read back first, and a peer that has nothing gets
     // the log; the proposals go on from where they were.
-    let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("reopen");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("reopen");
     room.connect(2);
     room.receive(2, hello(5, 1, 3, 0));
     room.receive(2, propose(1, 1, 4, 8));
@@ -262,7 +262,7 @@ fn what_a_room_commits_survives_a_restart() {
 #[test]
 fn nothing_is_sent_before_its_records_are_kept() {
     let (build, hash, dir) = build("unkept");
-    let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -291,7 +291,7 @@ fn nothing_is_sent_before_its_records_are_kept() {
 fn a_torn_last_record_is_cut_from_the_journal() {
     let (build, hash, dir) = build("torn");
     {
-        let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+        let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.receive(1, propose(1, 1, 1, 3));
@@ -307,7 +307,7 @@ fn a_torn_last_record_is_cut_from_the_journal() {
         .expect("open")
         .set_len(len - 3)
         .expect("cut");
-    let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("reopen");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("reopen");
     assert_eq!(room.journal().expect("journal").len(), 3, "the torn commit is gone");
     room.connect(2);
     room.receive(2, hello(9, 1, 0, 0));
@@ -323,12 +323,12 @@ fn a_torn_last_record_is_cut_from_the_journal() {
 fn another_builds_journal_isnt_read() {
     let (build, hash, dir) = build("other");
     {
-        let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+        let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.wake(0.1).expect("wake");
     }
-    match RoomHost::open(&build, hash ^ 1, &dir, "a", limits()) {
+    match RoomHost::open(build.clone(), hash ^ 1, &dir, "a", limits()) {
         Err(Failure::Host(why)) => assert!(why.contains("isn't this room's journal"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("another build's journal was read"),
@@ -338,7 +338,7 @@ fn another_builds_journal_isnt_read() {
 #[test]
 fn a_proposal_that_traps_the_room_is_refused_and_the_rest_go_on() {
     let (build, hash, dir) = build("poison");
-    let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.receive(1, propose(1, 1, 1, 3));
@@ -367,7 +367,7 @@ fn a_proposal_that_traps_the_room_is_refused_and_the_rest_go_on() {
 fn a_proposal_past_its_deadline_keeps_nothing() {
     let (build, hash, dir) = build("deadline");
     let fast = Limits { memory: 64 << 20, deadline: std::time::Duration::from_millis(100) };
-    let mut room = RoomHost::open(&build, hash, &dir, "a", fast).expect("open");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", fast).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -386,7 +386,7 @@ fn a_proposal_past_its_deadline_keeps_nothing() {
 #[test]
 fn a_compaction_that_fails_leaves_the_old_journal() {
     let (build, hash, dir) = build("compact");
-    let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -427,7 +427,7 @@ fn a_compaction_that_fails_leaves_the_old_journal() {
 fn a_journal_its_program_cant_read_quarantines_the_room() {
     let (build, hash, dir) = build("quarantine");
     {
-        let mut room = RoomHost::open(&build, hash, &dir, "a", limits()).expect("open");
+        let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.wake(0.1).expect("wake");
@@ -440,7 +440,7 @@ fn a_journal_its_program_cant_read_quarantines_the_room() {
     bytes.extend_from_slice(&wrela_host::rooms::crc32c(&record).to_le_bytes());
     bytes.extend_from_slice(&record);
     std::fs::write(&path, bytes).expect("write");
-    match RoomHost::open(&build, hash, &dir, "a", limits()) {
+    match RoomHost::open(build.clone(), hash, &dir, "a", limits()) {
         Err(Failure::Program(why)) => assert!(why.contains("journal record"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("it opened"),

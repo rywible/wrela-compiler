@@ -19,6 +19,10 @@ wrela-sema.workspace = true
 wrela-syntax.workspace = true
 wrela-grammar.workspace = true
 wrela-host.workspace = true
+# The server host and a WebTransport client, for the rooms over the network.
+wrela-serve.workspace = true
+wtransport = { version = "0.7", features = ["self-signed"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 wrela-abi.workspace = true
 serde_json.workspace = true
 wasmtime.workspace = true

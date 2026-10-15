@@ -206,8 +206,8 @@ enum Fail {
 }
 
 /// A room of a server build, kept durably in a directory of its own.
-pub struct RoomHost<'b> {
-    build: &'b ServerBuild,
+pub struct RoomHost {
+    build: std::sync::Arc<ServerBuild>,
     build_hash: u64,
     name: String,
     limits: Limits,
@@ -222,17 +222,17 @@ pub struct RoomHost<'b> {
     failures: u32,
 }
 
-impl<'b> RoomHost<'b> {
+impl RoomHost {
     /// Opens room `name` of `build` (whose WASM hash is `build_hash`) in `dir`: its journal is
     /// read back into a new instance, within `limits`. A journal of another build or room isn't
     /// read, and a room its own journal traps is quarantined.
     pub fn open(
-        build: &'b ServerBuild,
+        build: std::sync::Arc<ServerBuild>,
         build_hash: u64,
         dir: &Path,
         name: &str,
         limits: Limits,
-    ) -> Result<RoomHost<'b>, Failure> {
+    ) -> Result<RoomHost, Failure> {
         std::fs::create_dir_all(dir).map_err(host)?;
         let (journal, _) = Journal::open(&dir.join(format!("{name}.journal")), build_hash, name)?;
         let mut room = RoomHost {
@@ -271,7 +271,7 @@ impl<'b> RoomHost<'b> {
     fn start(&mut self) -> Result<(), Failure> {
         self.room = None;
         let (_, records) = Journal::open(&self.journal.path, self.build_hash, &self.name)?;
-        let mut room = Room::start(self.build, self.limits, None)?;
+        let mut room = Room::start(&self.build, self.limits, None)?;
         for r in records {
             room.push_message(JOURNAL, r);
         }
