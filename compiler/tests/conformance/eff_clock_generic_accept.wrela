@@ -1,0 +1,27 @@
+// accepts: eff.clock
+// The same through a trait method that takes its time as data: deterministic.
+trait Reduce {
+    fn apply(mut self, x: u32, at: f64)
+}
+
+struct Board {
+    n: f64,
+}
+
+impl Reduce for Board {
+    fn apply(mut self, x: u32, at: f64) {
+        self.n = f64(x) + at
+    }
+}
+
+@deterministic
+fn replay<S: Reduce>(s: mut S, xs: [u32], at: f64) {
+    for x in xs {
+        s.apply(x, at)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var b = Board { n: 0.0 }
+    replay(mut b, [1, 2], f64(time))
+}

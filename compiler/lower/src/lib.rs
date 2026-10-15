@@ -447,6 +447,7 @@ fn lower_in(
     cx.drain(&mut cpu);
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
+    check_deterministic(&mut cx, &cpu);
     thread_entries(&mut cx, &mut cpu);
     mark_counted(&mut cx, &mut cpu);
     if data.debug {
@@ -919,6 +920,120 @@ impl<'a> Cx<'a> {
 
     pub fn entry_of(&self, f: FnId) -> Option<Entry> {
         self.checked.program.func(f).attrs.entry.map(|e| e.0)
+    }
+}
+
+/// E0600 for what a `@deterministic` function reaches through a call whose target only its
+/// instantiation knows (a trait method of a generic parameter): sema checked every call it could
+/// resolve, and this checks, instance by instance, each body the function's instances reach for
+/// `io`, `nondet` or `host` (§14). Reported once for each place the effect happens.
+fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
+    use wrela_sema::effects::{BodyId, DETERMINISTIC};
+    let p = &cx.checked.program;
+    let mut keys: HashMap<ir::FuncId, &InstanceKey> = HashMap::new();
+    for (k, &id) in &mb.instances {
+        keys.insert(id, k);
+    }
+    let body_of = |k: &InstanceKey| -> Option<BodyId> {
+        match k {
+            InstanceKey::Fn { func, .. } | InstanceKey::JobResume { func, .. } => {
+                Some(BodyId { func: *func, closure: None })
+            }
+            InstanceKey::Closure { owner, id } => {
+                owner.source_fn().map(|func| BodyId { func, closure: Some(*id) })
+            }
+            InstanceKey::Derived { .. } | InstanceKey::Glue { .. } => None,
+        }
+    };
+    let mut calls: HashMap<ir::FuncId, Vec<ir::FuncId>> = HashMap::new();
+    for &(from, to, _) in &mb.edges {
+        calls.entry(from).or_default().push(to);
+    }
+    let mut roots: Vec<(ir::FuncId, FnId)> = mb
+        .instances
+        .iter()
+        .filter_map(|(k, &id)| match k {
+            InstanceKey::Fn { func, .. } if p.func(*func).attrs.deterministic.is_some() => {
+                Some((id, *func))
+            }
+            _ => None,
+        })
+        .collect();
+    roots.sort();
+    let mut reported: std::collections::HashSet<Span> = std::collections::HashSet::new();
+    let mut diags = Vec::new();
+    for (root, root_fn) in roots {
+        // Breadth first, so each body's chain from the root is a shortest one.
+        let mut parent: HashMap<ir::FuncId, ir::FuncId> = HashMap::new();
+        let mut queue = std::collections::VecDeque::from([root]);
+        let mut seen = std::collections::HashSet::from([root]);
+        while let Some(at) = queue.pop_front() {
+            if let Some(body) = keys.get(&at).and_then(|k| body_of(k))
+                && let Some(direct) = cx.checked.direct.get(&body)
+            {
+                for (e, span, what) in direct {
+                    if !DETERMINISTIC.contains(e) || !reported.insert(*span) {
+                        continue;
+                    }
+                    // The instances from the root to here.
+                    let mut path = vec![at];
+                    while let Some(&up) = parent.get(path.last().expect("not empty")) {
+                        path.push(up);
+                    }
+                    path.reverse();
+                    // As sema reports: where it happens in the program's own code, the effect
+                    // or the call into std that does it; the chain stops at std.
+                    let in_std = |id: &ir::FuncId| {
+                        keys.get(id)
+                            .and_then(|k| k.source_fn())
+                            .is_some_and(|f| p.is_std(p.func(f).module))
+                    };
+                    let first_std = path.iter().position(in_std);
+                    let (primary, here, shown) = match first_std {
+                        Some(j) if j > 0 => {
+                            let call = mb
+                                .edges
+                                .iter()
+                                .find(|&&(from, to, _)| from == path[j - 1] && to == path[j])
+                                .map_or(*span, |&(_, _, s)| s);
+                            let name = mb.display_name(path[j]);
+                            (call, format!("`{name}` {}", e.verb()), j + 1)
+                        }
+                        _ => (*span, format!("this {what}"), path.len()),
+                    };
+                    let mut chain: Vec<String> = Vec::new();
+                    for &id in &path[..shown] {
+                        let name = mb.display_name(id);
+                        if chain.last() != Some(&name) {
+                            chain.push(name);
+                        }
+                    }
+                    let root_name = p.fn_display_name(root_fn);
+                    let mut d = Diagnostic::new(
+                        wrela_diag::codes::E0600,
+                        primary,
+                        format!(
+                            "{here}, and `{root_name}` is `@deterministic`, which can't `{}`",
+                            e.name()
+                        ),
+                    );
+                    if chain.len() > 1 {
+                        d = d.with_note(format!("the call chain: {}", chain.join(" → ")));
+                    }
+                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§14)");
+                    diags.push(d);
+                }
+            }
+            for &next in calls.get(&at).map_or(&[][..], Vec::as_slice) {
+                if seen.insert(next) {
+                    parent.insert(next, at);
+                    queue.push_back(next);
+                }
+            }
+        }
+    }
+    for d in diags {
+        cx.err(d);
     }
 }
 

@@ -1,0 +1,30 @@
+// rejects: eff.clock
+// A `@deterministic` function reaching the clock through a trait method of a generic parameter:
+// which method runs is known only where the function is instantiated, and checked there.
+use std::time::now
+
+trait Reduce {
+    fn apply(mut self, x: u32)
+}
+
+struct Board {
+    n: f64,
+}
+
+impl Reduce for Board {
+    fn apply(mut self, x: u32) {
+        self.n = f64(x) + now() //~ E0600
+    }
+}
+
+@deterministic
+fn replay<S: Reduce>(s: mut S, xs: [u32]) {
+    for x in xs {
+        s.apply(x)
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var b = Board { n: 0.0 }
+    replay(mut b, [1, 2])
+}

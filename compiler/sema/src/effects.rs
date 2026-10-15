@@ -61,7 +61,7 @@ impl Effect {
     }
 
     /// What doing it is, as a verb phrase: `allocates`.
-    fn verb(self) -> &'static str {
+    pub fn verb(self) -> &'static str {
         match self {
             Effect::Alloc => "allocates",
             Effect::Io => "does IO",
@@ -99,6 +99,28 @@ pub struct Effects<'p> {
     all: HashMap<BodyId, Vec<Effect>>,
     /// The bodies that reach a call whose effects aren't known here ([`Node::open`]).
     open: std::collections::HashSet<BodyId>,
+}
+
+/// Each body's own effects: where each happens, and what it is. Lowering checks them again for
+/// what a `@deterministic` function reaches through calls whose targets only instantiation knows
+/// (a trait method of a generic parameter), which [`check`] can't see.
+pub fn direct_effects(
+    p: &Program,
+    mir: &BTreeMap<FnId, Body>,
+) -> BTreeMap<BodyId, Vec<(Effect, Span, String)>> {
+    let hidden: HashMap<FnId, TyId> =
+        mir.iter().filter_map(|(&f, b)| b.hidden_ret.map(|h| (f, h))).collect();
+    let mut out = BTreeMap::new();
+    for (&f, body) in mir {
+        for (k, code) in body.fns.iter().enumerate() {
+            let closure = (k > 0).then(|| ClosureId(k as u32 - 1));
+            let direct = node(p, f, body, code, &hidden).direct;
+            if !direct.is_empty() {
+                out.insert(BodyId { func: f, closure }, direct);
+            }
+        }
+    }
+    out
 }
 
 /// Checks every context's effects (E0600).
@@ -475,7 +497,7 @@ const AUDIO: &[Effect] =
     &[Effect::Io, Effect::Trace, Effect::Host, Effect::Recursion, Effect::Alloc];
 /// `@deterministic` code, a constant, and what runs on several workers at once. A replayed tick
 /// mustn't touch storage either: requests are `io` (§6.15).
-const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
+pub const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
 /// What's derived can't allocate, do IO, be non-deterministic or call the host (§13).
 const DERIVED: &[Effect] =
     &[Effect::Alloc, Effect::Io, Effect::Trace, Effect::Nondet, Effect::Host];

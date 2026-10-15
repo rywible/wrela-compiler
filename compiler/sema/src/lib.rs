@@ -94,6 +94,8 @@ pub struct Checked {
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
     /// The type each function that returns by naming its traits (`-> Creature<Coat>`) returns.
     pub hidden: HashMap<ty::FnId, ty::TyId>,
+    /// Each body's own effects ([`effects::direct_effects`]), for lowering's checks.
+    pub direct: BTreeMap<effects::BodyId, Vec<(effects::Effect, wrela_diag::Span, String)>>,
 }
 
 impl Checked {
@@ -267,7 +269,8 @@ fn check(
         diags.extend(unused_items(p, &mir));
     }
     let hidden = hidden.into_iter().collect();
-    Checked { program, mir, consts, hidden }
+    let direct = effects::direct_effects(&program, &mir);
+    Checked { program, mir, consts, hidden, direct }
 }
 
 /// W0008: a private function or constant that no other code uses (a function that only calls

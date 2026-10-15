@@ -1062,6 +1062,7 @@ They're `std::derive::{gradient, value_and_gradient, value_gradient_with, interv
 
 - **Inside it:** strict floats (always true on the CPU), stdlib transcendentals, canonical NaNs at observation points.
 - **Forbidden:** the clock, ambient randomness, GPU readback, unordered iteration, relaxed SIMD, anything that depends on memory addresses (D-015, D-052), and recursion deeper than 256 calls (§8), because stack limits differ between engines (D-015, D-094).
+- **Checked through every call, instantiation included:** a call whose target only instantiation decides (a trait method of a generic parameter) is checked where the function is instantiated, each body its instance reaches for `io`, `nondet` and `host`, with the call chain (`eff.clock`'s generic case).
 - **A panic is a deterministic trap:** every client traps on the same tick (D-061).
 - **Parallelism is data-parallel only** (D-062), through stdlib combinators (`par_each_mut`, `par_map_reduce`). Exclusivity proves disjointness, and captured data can only be read (§6.12). Reductions combine in a fixed order, which the length alone decides, so results don't depend on the workers or how they're scheduled. Per-entity RNG streams keep randomness independent of scheduling too. T2.
 
