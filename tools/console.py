@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Build static Wrela console/game releases; requires Pillow and Binaryen's wasm-opt."""
+"""Build static Wrela console/game releases for Cloudflare Workers static assets; requires Pillow
+and Binaryen's wasm-opt. tools/deploy.py deploys one."""
 import argparse
 import hashlib
 import json
@@ -15,7 +16,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MAX_FILE = 25 * 1024 * 1024
 MAX_FILES = 20_000
 # The project wrapper owns these paths beside its game build directories.
-RESERVED_BUILD_NAMES = {"releases", "_headers", "_redirects", "index.html", "LICENSE"}
+RESERVED_BUILD_NAMES = {"releases", "_headers", "_redirects", "index.html", "LICENSE", "deploys.json",
+                        "files.json"}
+# The project's own hosts beside the console's domain, which no game may take.
+RESERVED_HOSTS = {"www", "docs", "api", "studio"}
+# The Workers runtime each release's Workers run on.
+COMPATIBILITY_DATE = "2026-10-12"
 
 
 def component(value):
@@ -35,7 +41,8 @@ def origin(domain):
 def read_config(path):
     data = tomllib.loads(Path(path).read_text())
     seen = set()
-    component(data["console"]["project"])
+    workers = {component(data["console"]["worker"])}
+    domains = {data["console"]["domain"]}
     origin(data["console"]["domain"])
     source = (ROOT / data["console"]["package"]).resolve()
     if not source.is_relative_to(ROOT) or not (source / "wrela.toml").is_file():
@@ -45,8 +52,13 @@ def read_config(path):
         if key in seen:
             raise ValueError("duplicate game id")
         seen.add(key)
-        component(game["project"])
+        if component(game["worker"]) in workers or game["domain"] in domains:
+            raise ValueError(f"{key} shares a worker or a domain")
+        workers.add(game["worker"])
+        domains.add(game["domain"])
         origin(game["domain"])
+        if game["domain"].split(".")[0] in RESERVED_HOSTS:
+            raise ValueError(f"{game['domain']} is one of the project's own hosts")
         component(game["session"])
         if any(c in game["title"] for c in "\t\r\n") or not game["title"]:
             raise ValueError("invalid catalog title")
@@ -82,6 +94,8 @@ def headers(parent, children=(), embedded=False):
   Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob:; frame-src {frame_src}; frame-ancestors {ancestors}; object-src 'none'; base-uri 'self'
 /*.wasm
   Content-Type: application/wasm
+/*.wgsl
+  Content-Type: text/plain; charset=utf-8
 """
 
 
@@ -117,41 +131,34 @@ def build_package(package, output):
                     "--optimize"], cwd=ROOT, check=True)
 
 
-def retain_releases(previous, target):
-    """Keep pinned assets for clients that still hold an older console/catalog."""
-    if not previous.exists():
-        return
-    release_files(previous)
-    source = previous / "releases"
-    if not source.exists():
-        return
-    for version in source.iterdir():
-        if not version.is_dir() or not re.fullmatch(r"[a-f0-9]{20}", version.name):
-            raise ValueError("invalid retained release")
-        destination = target / "releases" / version.name
-        if destination.exists():
-            old = {str(p.relative_to(version)): p.read_bytes() for p in release_files(version)}
-            new = {str(p.relative_to(destination)): p.read_bytes() for p in release_files(destination)}
-            if old != new:
-                raise ValueError("an immutable release cannot change")
-        else:
-            shutil.copytree(version, destination)
+def file_list(directory):
+    """Each file under `directory` and its SHA-256, by path: what a later deploy fetches to keep it."""
+    return {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in release_files(directory)}
 
 
-def package(config, output, previous=None):
+def wrangler_config(project):
+    """A worker's Wrangler configuration: its release's assets, on its custom domain only."""
+    return {"name": project["worker"], "compatibility_date": COMPATIBILITY_DATE,
+            "assets": {"directory": "./" + project["worker"]},
+            "routes": [{"pattern": project["domain"], "custom_domain": True}],
+            "workers_dev": False, "preview_urls": False}
+
+
+def package(config, output):
     """Only this invocation's empty output is populated; never copy game storage/captures."""
     if output.exists() and any(output.iterdir()):
         raise ValueError("release output must be empty; choose a new directory")
     output.mkdir(parents=True, exist_ok=True)
     console = config["console"]
-    home = output / console["project"]
+    home = output / console["worker"]
     build_package(console["package"], home)
     copy_licenses(console["package"], home)
     parent = origin(console["domain"])
     catalog = []
     packages = [home]
     for game in config["games"]:
-        game_output = output / game["project"]
+        game_output = output / game["worker"]
         game_output.mkdir()
         copy_licenses("", game_output)
         for name, source in game["builds"].items():
@@ -171,7 +178,7 @@ def package(config, output, previous=None):
         catalog.append("\t".join([game["id"], game["title"], child + "/" + game["session"] + "/",
                                    filename, str(width), str(height)]))
     for project in [console, *config["games"]]:
-        directory = output / project["project"]
+        directory = output / project["worker"]
         namespace = "console" if project is console else project["id"]
         for document in directory.rglob("index.html"):
             document.write_text(document.read_text().replace(
@@ -195,7 +202,7 @@ def package(config, output, previous=None):
     (home / "catalog.tsv").write_text("\n".join(catalog) + "\n")
     (home / "_headers").write_text(headers(parent, [origin(g["domain"]) for g in config["games"]]))
     for project in [console, *config["games"]]:
-        directory = output / project["project"]
+        directory = output / project["worker"]
         if project is console:
             entry = (directory / "index.html").read_text()
             entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">')
@@ -208,18 +215,19 @@ def package(config, output, previous=None):
                 asset.rename(versioned / asset.name)
         if entry is not None:
             (directory / "index.html").write_text(entry)
+        (versioned / "files.json").write_text(json.dumps(file_list(versioned), sort_keys=True))
         header_file = directory / "_headers"
-        header_file.write_text(header_file.read_text() + "/releases/*\n  Cache-Control: public, max-age=31536000, immutable\n/\n  Cache-Control: no-cache\n/index.html\n  Cache-Control: no-cache\n")
+        header_file.write_text(header_file.read_text() + "/releases/*\n  Cache-Control: public, max-age=31536000, immutable\n/\n  Cache-Control: no-cache\n/index.html\n  Cache-Control: no-cache\n/deploys.json\n  Cache-Control: no-cache\n")
+        (output / f"{project['worker']}.wrangler.json").write_text(
+            json.dumps(wrangler_config(project), indent=2) + "\n")
     reports = []
     for project in [console, *config["games"]]:
-        target = output / project["project"]
-        if previous is not None:
-            retain_releases(previous / project["project"], target)
-        files = release_files(target)
-        reports.append({"project": project["project"], "domain": project["domain"],
-                        "files": len(files), "bytes": sum(p.stat().st_size for p in files)})
+        files = release_files(output / project["worker"])
+        reports.append({"worker": project["worker"], "domain": project["domain"],
+                        "console": project is console, "files": len(files),
+                        "bytes": sum(p.stat().st_size for p in files)})
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    report = {"source": commit, "release": release, "projects": reports}
+    report = {"source": commit, "release": release, "workers": reports}
     (output / "release.json").write_text(json.dumps(report, indent=2) + "\n")
     return report
 
@@ -228,15 +236,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "games/console.toml")
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--previous", type=Path, help="prior verified release bundle, to retain pinned assets")
     args = parser.parse_args()
     # Resolve caller-relative paths before building from this checkout.
     args.config = args.config.resolve()
     args.output = args.output.resolve()
-    args.previous = args.previous.resolve() if args.previous else None
     os.chdir(ROOT)
     try:
-        report = package(read_config(args.config), args.output, args.previous)
+        report = package(read_config(args.config), args.output)
     except (ValueError, KeyError, OSError, ImportError, subprocess.CalledProcessError) as error:
         print(f"console release: {error}", file=sys.stderr)
         return 1

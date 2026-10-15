@@ -1,4 +1,6 @@
 """Release failure boundaries, without building a scene or contacting Cloudflare."""
+import hashlib
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -21,12 +23,12 @@ class StaticRelease(unittest.TestCase):
             config = root / "release.toml"
             config.write_text('''[console]
 package = "console"
-project = "console-host"
+worker = "console-host"
 domain = "console.example"
 [[games]]
 id = "game"
 title = "Game"
-project = "game-host"
+worker = "game-host"
 domain = "game.example"
 session = "releases"
 builds = { releases = "session" }
@@ -37,6 +39,13 @@ cover = "cover.png"
                     console.read_config(config)
                 config.write_text(config.read_text().replace("releases", "session"))
                 self.assertEqual(console.read_config(config)["games"][0]["session"], "session")
+                config.write_text(config.read_text().replace("game.example", "www.example"))
+                with self.assertRaisesRegex(ValueError, "own hosts"):
+                    console.read_config(config)
+                config.write_text(config.read_text().replace("www.example", "console.example"))
+                with self.assertRaisesRegex(ValueError, "shares"):
+                    console.read_config(config)
+                config.write_text(config.read_text().replace('domain = "console.example"\n[[games]]', 'domain = "c.example"\n[[games]]'))
                 config.write_text(config.read_text().replace("cover.png", "missing.png"))
                 with self.assertRaisesRegex(ValueError, "cover"):
                     console.read_config(config)
@@ -55,10 +64,10 @@ cover = "cover.png"
             cover.write_bytes(b"rendered cover fixture")
             config = {
                 "console": {
-                    "package": "console", "project": "console-host", "domain": "console.example",
+                    "package": "console", "worker": "console-host", "domain": "console.example",
                 },
                 "games": [{
-                    "id": "game", "title": "Game", "project": "game-host", "domain": "game.example",
+                    "id": "game", "title": "Game", "worker": "game-host", "domain": "game.example",
                     "session": "session", "builds": {"session": "session"}, "cover": "cover.png",
                 }],
             }
@@ -94,6 +103,16 @@ cover = "cover.png"
                 self.assertIn('<meta name="wrela-storage" content="console">', document.read_text())
             game_document = output / f"game-host/releases/{release}/session/index.html"
             self.assertIn('<meta name="wrela-storage" content="game">', game_document.read_text())
+            # Each release lists its files for a later deploy to keep, and each Worker has its config.
+            listed = json.loads((output / f"game-host/releases/{release}/files.json").read_text())
+            self.assertEqual(listed["session/game.wasm"], hashlib.sha256(b"wasm").hexdigest())
+            self.assertNotIn("files.json", listed)
+            wrangler = json.loads((output / "game-host.wrangler.json").read_text())
+            self.assertEqual(wrangler["assets"], {"directory": "./game-host"})
+            self.assertEqual(wrangler["routes"], [{"pattern": "game.example", "custom_domain": True}])
+            self.assertFalse(wrangler["workers_dev"])
+            self.assertIn("/*.wgsl\n  Content-Type: text/plain", (output / "game-host/_headers").read_text())
+            self.assertEqual([w["console"] for w in report["workers"]], [True, False])
 
     def test_private_storage_and_symlinks_cannot_be_uploaded(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -124,20 +143,6 @@ cover = "cover.png"
         child = console.headers("https://games.wrela.dev", embedded=True)
         self.assertIn("frame-ancestors https://games.wrela.dev", child)
         self.assertIn("Cross-Origin-Embedder-Policy: require-corp", child)
-
-
-    def test_retained_release_assets_cannot_change_under_an_immutable_url(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            source = root / "previous/releases" / ("a" * 20)
-            source.mkdir(parents=True)
-            (source / "game.wasm").write_bytes(b"old version")
-            target = root / "next"
-            console.retain_releases(root / "previous", target)
-            self.assertEqual((target / "releases" / ("a" * 20) / "game.wasm").read_bytes(), b"old version")
-            (source / "game.wasm").write_bytes(b"changed")
-            with self.assertRaisesRegex(ValueError, "immutable"):
-                console.retain_releases(root / "previous", target)
 
 
     def test_redistributed_releases_include_software_and_font_licenses(self):
