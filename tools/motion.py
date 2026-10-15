@@ -5,7 +5,7 @@ saved as they're drawn (`wrela-host --png --every`), into a directory.
 
     tools/motion.py <out-dir> [--size WxH] [capture ...]
 
-The floor must be built (`wrela build examples/last-green`). Each capture is a script of the
+The floor must be built (`wrela build games/last-green`). Each capture is a script of the
 player's keys (a lookbook shot chosen as a player would: L, its number, Enter) and the frames it
 keeps, at 60 a second:
 
@@ -31,7 +31,7 @@ import json, os, shutil, subprocess, sys, tempfile
 from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = os.path.join(ROOT, "examples/last-green/build")
+BUILD = os.path.join(ROOT, "games/last-green/build")
 HOST = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release/wrela-host")
 # A lookbook shot's move starts this many frames after it's chosen (tools/lookbook.py).
 SETTLE = 300

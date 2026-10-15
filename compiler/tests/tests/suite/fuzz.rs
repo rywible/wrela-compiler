@@ -203,7 +203,7 @@ fn uses_tiers_1_2(text: &str) -> bool {
 
 /// Small real programs provide syntax and semantic variety without full-scene compilation.
 fn corpus() -> Vec<String> {
-    let corpus: Vec<String> = ["compiler", "examples"]
+    let corpus: Vec<String> = ["compiler", "examples", "games"]
         .iter()
         .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
         .map(|p| std::fs::read_to_string(p).expect("read"))
@@ -215,7 +215,7 @@ fn corpus() -> Vec<String> {
 
 #[test]
 fn the_repository_has_seeds_using_tiers_1_and_2() {
-    let all: Vec<String> = ["compiler", "examples"]
+    let all: Vec<String> = ["compiler", "examples", "games"]
         .iter()
         .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
         .map(|p| std::fs::read_to_string(p).expect("read"))

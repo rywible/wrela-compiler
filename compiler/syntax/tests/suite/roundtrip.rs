@@ -210,7 +210,8 @@ impl XorShift {
 fn comments_anywhere_survive_formatting() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for dir in ["examples", "compiler/std", "compiler/tests/fields", "compiler/tests/run"] {
+    for dir in ["examples", "games", "compiler/std", "compiler/tests/fields", "compiler/tests/run"]
+    {
         collect(&root.join(dir), &mut files);
     }
     assert!(files.len() > 10, "only {} files", files.len());

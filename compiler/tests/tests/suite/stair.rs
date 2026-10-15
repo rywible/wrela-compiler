@@ -1,4 +1,4 @@
-//! The stair and its doors (examples/stair, examples/test-floor, engine::tower), in the native
+//! The stair and its doors (games/last-green/stair, games/last-green/test-floor, engine::tower), in the native
 //! host: the builds side by side, as a game ships them. The player climbs to the second door,
 //! which opens once the first world is decided, walks through to the test floor, frees it, and
 //! walks back out; the freed world's door is gone, from then on and over a reload.
@@ -12,8 +12,8 @@ const SIZE: u32 = 64;
 /// The stair's build, with the test floor's beside it, under `target/tmp/<name>/`: fresh, with
 /// no save.
 fn tower(name: &str) -> PathBuf {
-    wrela_tests::page("examples/test-floor", &format!("{name}/test-floor"));
-    wrela_tests::page("examples/stair", &format!("{name}/stair")).0
+    wrela_tests::page("games/last-green/test-floor", &format!("{name}/test-floor"));
+    wrela_tests::page("games/last-green/stair", &format!("{name}/stair")).0
 }
 
 fn frames(host: &mut Host, n: u32) {
@@ -106,12 +106,12 @@ fn the_tower_is_saved_over_a_reload() {
 #[ignore = "needs the runtime"]
 fn the_first_floor_door_returns_to_its_stair_landing() {
     let root = wrela_tests::repo_root();
-    let floor = std::fs::read_to_string(root.join("examples/last-green/main.wrela")).unwrap();
-    let world = std::fs::read_to_string(root.join("examples/last-green/world.wrela")).unwrap();
+    let floor = std::fs::read_to_string(root.join("games/last-green/main.wrela")).unwrap();
+    let world = std::fs::read_to_string(root.join("games/last-green/world.wrela")).unwrap();
     let gate = world.lines().find(|l| l.starts_with("pub const GATE =")).unwrap();
     let door = floor.lines().find(|l| l.starts_with("const DOOR =")).unwrap();
     let leave = floor.split("pub fn test_leave(").nth(1).unwrap().split_once("\n}").unwrap().0;
-    let source = std::fs::read_to_string(root.join("examples/test-floor/main.wrela"))
+    let source = std::fs::read_to_string(root.join("games/last-green/test-floor/main.wrela"))
         .unwrap()
         .replace("const WORLD: u32 = 1", "const WORLD: u32 = 0")
         .replace("const DOOR = Doorway { at: vec2(0.0, 0.6), reach: 1.2 }", door);
@@ -124,7 +124,7 @@ fn the_first_floor_door_returns_to_its_stair_landing() {
     std::fs::write(manifest, text).expect("platform dependency");
     let output = wrela_tests::page_scratch_root().join("first-floor-tour/last-green");
     wrela_tests::must_build(&package, &output);
-    let dir = wrela_tests::page("examples/stair", "first-floor-tour/stair").0;
+    let dir = wrela_tests::page("games/last-green/stair", "first-floor-tour/stair").0;
     let mut host = Host::load(dir).expect("load");
     frames(&mut host, 2);
     host.call_export("climb", &[Value::F32(16.0)]).expect("climb");

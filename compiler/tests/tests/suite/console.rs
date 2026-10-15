@@ -1,7 +1,7 @@
 //! Console policy is Wrela; these small fixtures exercise data, input and save validation.
 #[test]
 fn console_and_platform_policy_tests_pass() {
-    for package in ["console", "platform", "examples/last-green/session", "ui"] {
+    for package in ["console", "platform", "games/last-green/session", "ui"] {
         assert!(super::tests_pass(&wrela_tests::repo_root().join(package)) > 0, "{package}");
     }
 }
@@ -10,7 +10,7 @@ fn console_and_platform_policy_tests_pass() {
 fn exporting_a_recovered_save_acknowledges_only_a_successful_reply() {
     let root = wrela_tests::repo_root();
     let dir = super::scratch("console-recovery-export");
-    wrela_tests::copy_package(&root.join("examples/last-green/session"), &dir);
+    wrela_tests::copy_package(&root.join("games/last-green/session"), &dir);
     let mut source = std::fs::read_to_string(dir.join("main.wrela")).expect("session source");
     source.push_str(
         r#"

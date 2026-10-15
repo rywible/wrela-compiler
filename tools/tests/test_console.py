@@ -17,6 +17,7 @@ class StaticRelease(unittest.TestCase):
             for package in ["console", "session"]:
                 (root / package).mkdir()
                 (root / package / "wrela.toml").write_text('name = "fixture"\n')
+            (root / "cover.png").write_bytes(b"rendered cover fixture")
             config = root / "release.toml"
             config.write_text('''[console]
 package = "console"
@@ -29,12 +30,16 @@ project = "game-host"
 domain = "game.example"
 session = "releases"
 builds = { releases = "session" }
+cover = "cover.png"
 ''')
             with patch.object(console, "ROOT", root):
                 with self.assertRaisesRegex(ValueError, "reserved"):
                     console.read_config(config)
                 config.write_text(config.read_text().replace("releases", "session"))
                 self.assertEqual(console.read_config(config)["games"][0]["session"], "session")
+                config.write_text(config.read_text().replace("cover.png", "missing.png"))
+                with self.assertRaisesRegex(ValueError, "cover"):
+                    console.read_config(config)
 
     def test_every_console_bootstrap_has_the_same_storage_namespace(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -47,7 +52,7 @@ builds = { releases = "session" }
                 },
                 "games": [{
                     "id": "game", "title": "Game", "project": "game-host", "domain": "game.example",
-                    "session": "session", "builds": {"session": "session"},
+                    "session": "session", "builds": {"session": "session"}, "cover": "cover.png",
                 }],
             }
 
@@ -66,12 +71,13 @@ builds = { releases = "session" }
             ))
             output = root / "release"
             with (
+                patch.object(console, "ROOT", root),
                 patch.object(console, "build_package", build),
                 patch.object(console, "copy_licenses"),
                 patch.object(console.subprocess, "check_output", return_value="fixture\n"),
                 patch.dict(sys.modules, {"PIL": pillow}),
             ):
-                report = console.package(config, output, {"game": cover})
+                report = console.package(config, output)
             release = report["release"]
             console_paths = [
                 output / "console-host/index.html",

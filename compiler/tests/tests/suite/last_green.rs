@@ -12,7 +12,7 @@ const MAP_FILES: [&str; 4] = ["map.wrela", "ground.wrela", "species.wrela", "sto
 /// depending on the engine.
 fn map_package(name: &str, main: &str) -> PathBuf {
     let dir = scratch(name);
-    let floor = repo_root().join("examples/last-green");
+    let floor = repo_root().join("games/last-green");
     for f in MAP_FILES {
         std::fs::copy(floor.join(f), dir.join(f)).expect("copy the floor's map");
     }
@@ -47,7 +47,7 @@ fn the_environments_bounded_art_and_collision_regressions_pass() {
         "last-green/environment-art",
         "pub fn frame(time: f32, width: u32, height: u32) {}\n",
     );
-    let floor = repo_root().join("examples/last-green");
+    let floor = repo_root().join("games/last-green");
     let extra = ["trees.wrela", "blockouts.wrela"];
     for file in extra {
         std::fs::copy(floor.join(file), dir.join(file)).expect("copy environment fixture module");
@@ -276,7 +276,7 @@ fn left_long_before_the_plague_is_wood_again() {
 }
 "#;
     let dir = map_package("last-green/elves", tests);
-    let floor = repo_root().join("examples/last-green");
+    let floor = repo_root().join("games/last-green");
     std::fs::copy(floor.join("peoples.wrela"), dir.join("peoples.wrela")).expect("copy the elves");
     assert_eq!(super::tests_pass(&dir), 4 + copied_map_test_count(&dir));
 }

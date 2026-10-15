@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A play round of the floor (#55 AC5): examples/last-green played in headless Chrome stable at
+"""A play round of the floor (#55 AC5): games/last-green played in headless Chrome stable at
 1080p, paced at 60 Hz as in play, up to eight threads, through the play harness's keys, then its
 lookbook rendered again. Everything goes to target/rounds/round-<n>/.
 
@@ -10,7 +10,7 @@ region's), at each a run of 2 s and a look round, then six lookbook shots held, 
 at each (`snaps/`); no lookbook render after. `--every 1` travels to every site (every region:
 about five minutes), as the last round does.
 
-The floor must be built (`wrela build examples/last-green`). The round plays, as a player would
+The floor must be built (`wrela build games/last-green`). The round plays, as a player would
 through the harness's taps: the floor's walk (P: from the gate, along the critical path, through
 every region and the water, past each lookbook place: 25 minutes at a run); then each lookbook
 shot held 15 s (L, its number, Enter; Escape); with `--minutes 60`, then the egg's road in the
@@ -32,7 +32,7 @@ import bisect, json, os, shutil, subprocess, sys
 from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = os.path.join(ROOT, "examples/last-green/build")
+BUILD = os.path.join(ROOT, "games/last-green/build")
 HEADLESS = os.path.join(ROOT, "tools/headless.py")
 LOOKBOOK = os.path.join(ROOT, "tools/lookbook.py")
 FPS = 60
@@ -43,13 +43,13 @@ ROAD_FRAMES = 10 * 60 * FPS
 
 def shot_names():
     import re
-    text = open(os.path.join(ROOT, "examples/last-green/lookbook.wrela")).read()
+    text = open(os.path.join(ROOT, "games/last-green/lookbook.wrela")).read()
     return re.findall(r'Shot \{\s*name: "([^"]+)"', text)
 
 
 def sites():
     """How many sites the floor's map has (the travels past them: the egg's place, its road)."""
-    return open(os.path.join(ROOT, "examples/last-green/map.wrela")).read().count("sites.push")
+    return open(os.path.join(ROOT, "games/last-green/map.wrela")).read().count("sites.push")
 
 
 def keys_at(frame, keys):

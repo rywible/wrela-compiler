@@ -24,7 +24,7 @@ class ConsoleEntrypoint(unittest.TestCase):
             try:
                 os.chdir(caller)
                 arguments = ["console.py", "--config", "settings.toml", "--output", "dist",
-                             "--previous", "old", "--cover", "game=cover.png"]
+                             "--previous", "old"]
                 with patch.object(sys, "argv", arguments), patch.object(console, "ROOT", checkout), \
                         patch.object(console, "read_config", return_value={}) as read, \
                         patch.object(console, "package", return_value={}) as package, \
@@ -32,8 +32,7 @@ class ConsoleEntrypoint(unittest.TestCase):
                     self.assertEqual(console.main(), 0)
                 self.assertEqual(Path.cwd(), checkout)
                 read.assert_called_once_with(caller / "settings.toml")
-                package.assert_called_once_with({}, caller / "dist",
-                                                {"game": caller / "cover.png"}, caller / "old")
+                package.assert_called_once_with({}, caller / "dist", caller / "old")
             finally:
                 os.chdir(original)
 

@@ -26,11 +26,12 @@ from chrome_session import ChromeSession
 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = ("examples", "engine", "compiler/std", "compiler/tests/fields", "compiler/tests/math",
-           "compiler/tests/sketches", "compiler/tests/numerics", "compiler/tests/render",
-           "compiler/tests/queries", "compiler/tests/simd", "compiler/tests/input",
-           "compiler/tests/lift", "compiler/tests/texels", "compiler/tests/shader_params",
-           "compiler/tests/unroll", "ui", "studio", "platform", "console")
+SOURCES = ("examples", "games", "engine", "compiler/std", "compiler/tests/fields",
+           "compiler/tests/math", "compiler/tests/sketches", "compiler/tests/numerics",
+           "compiler/tests/render", "compiler/tests/queries", "compiler/tests/simd",
+           "compiler/tests/input", "compiler/tests/lift", "compiler/tests/texels",
+           "compiler/tests/shader_params", "compiler/tests/unroll", "ui", "studio", "platform",
+           "console")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")
 LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",

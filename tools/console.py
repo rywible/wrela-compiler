@@ -52,6 +52,9 @@ def read_config(path):
             raise ValueError("invalid catalog title")
         if game["session"] not in game["builds"]:
             raise ValueError("the session build is missing")
+        cover = (ROOT / game["cover"]).resolve()
+        if not cover.is_relative_to(ROOT) or not cover.is_file():
+            raise ValueError(f"missing Wrela-rendered cover for {key}")
         for name, package in game["builds"].items():
             if name in RESERVED_BUILD_NAMES:
                 raise ValueError(f"reserved build name: {name!r}")
@@ -134,7 +137,7 @@ def retain_releases(previous, target):
             shutil.copytree(version, destination)
 
 
-def package(config, output, covers, previous=None):
+def package(config, output, previous=None):
     """Only this invocation's empty output is populated; never copy game storage/captures."""
     if output.exists() and any(output.iterdir()):
         raise ValueError("release output must be empty; choose a new directory")
@@ -156,11 +159,8 @@ def package(config, output, covers, previous=None):
         packages.append(game_output)
         (game_output / "_headers").write_text(headers(parent, embedded=True))
         (game_output / "_redirects").write_text(f"/ {parent}/ 302\n")
-        cover = covers.get(game["id"])
-        if not cover or not cover.is_file():
-            raise ValueError(f"missing Wrela-rendered cover for {game['id']}")
         from PIL import Image
-        with Image.open(cover) as image:
+        with Image.open(ROOT / game["cover"]) as image:
             image = image.convert("RGBA")
             image.thumbnail((960, 540), Image.Resampling.LANCZOS)
             width, height = image.size
@@ -225,24 +225,17 @@ def package(config, output, covers, previous=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=Path, default=ROOT / "examples/console.toml")
+    parser.add_argument("--config", type=Path, default=ROOT / "games/console.toml")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--previous", type=Path, help="prior verified release bundle, to retain pinned assets")
-    parser.add_argument("--cover", action="append", default=[], metavar="GAME=PNG")
     args = parser.parse_args()
     # Resolve caller-relative paths before building from this checkout.
     args.config = args.config.resolve()
     args.output = args.output.resolve()
     args.previous = args.previous.resolve() if args.previous else None
-    covers = {}
-    for value in args.cover:
-        key, sep, path = value.partition("=")
-        if not sep:
-            parser.error("--cover must be GAME=PNG")
-        covers[component(key)] = Path(path).resolve()
     os.chdir(ROOT)
     try:
-        report = package(read_config(args.config), args.output, covers, args.previous)
+        report = package(read_config(args.config), args.output, args.previous)
     except (ValueError, KeyError, OSError, ImportError, subprocess.CalledProcessError) as error:
         print(f"console release: {error}", file=sys.stderr)
         return 1

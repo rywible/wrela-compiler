@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The floor's lookbook (#54 §9, #55 AC10): each shot of examples/last-green/lookbook.wrela
+"""The floor's lookbook (#54 §9, #55 AC10): each shot of games/last-green/lookbook.wrela
 rendered settled at 1080p, as a still on the native host and as a 10 s clip in Chrome (its move),
 into a directory.
 
     tools/lookbook.py <out-dir> [--stills] [--capture] [--view clay|silhouette]
                       [--size WxH] [--jobs N] [shot-number ...]
 
-The floor must be built (`wrela build examples/last-green`). A shot is chosen as a player would
+The floor must be built (`wrela build games/last-green`). A shot is chosen as a player would
 (L, its number, Enter); the still is the frame its move starts at (`lookbook::SETTLE` seconds in),
 when the tiles round it have streamed in and its caches have settled; the clip is its move, from
 then for `lookbook::MOVE` seconds, paced as in play, recorded from Chrome's canvas (test mode's
@@ -19,7 +19,7 @@ stills concurrently, with the same pixels. Each shot's numbers, the
 interest check's view at its eye (the build's `files/check/shots.json`), are printed beside it and saved as
 `check.json`.
 
-`--capture` takes each still in capture mode (F7, `Floor::capture` in examples/last-green/main.wrela):
+`--capture` takes each still in capture mode (F7, `Floor::capture` in games/last-green/main.wrela):
 the floor does its load in a few frames, and the still is the frame it prints `still at frame N` on,
 a 16-frame resolve once the light round the eye is in, not the frame 5 s in.
 """
@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor
 from os import cpu_count
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUILD = os.path.join(ROOT, "examples/last-green/build")
+BUILD = os.path.join(ROOT, "games/last-green/build")
 HOST = os.path.join(os.environ.get("CARGO_TARGET_DIR", os.path.join(ROOT, "target")), "release/wrela-host")
 HEADLESS = os.path.join(ROOT, "tools/headless.py")
 SETTLE_FRAMES = 300
@@ -41,11 +41,11 @@ MOVE_FRAMES = 600
 
 
 def names():
-    text = open(os.path.join(ROOT, "examples/last-green/lookbook.wrela")).read()
+    text = open(os.path.join(ROOT, "games/last-green/lookbook.wrela")).read()
     return re.findall(r'Shot \{\s*name: "([^"]+)"', text)
 
 
-# How many presses of F8 draw each debug view of form (`view` in examples/last-green/main.wrela).
+# How many presses of F8 draw each debug view of form (`view` in games/last-green/main.wrela).
 VIEWS = {"look": 0, "clay": 1, "silhouette": 2}
 
 
