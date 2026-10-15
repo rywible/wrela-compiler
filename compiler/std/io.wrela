@@ -268,9 +268,15 @@ impl Shipped {
         None
     }
 
+    /// File `i`'s path in the build, relative to the program: what `fetch` fetches, and what a
+    /// host can be handed for it (a page's icon).
+    pub fn path(self, i: u32) -> String {
+        f"files/{self.dir}/{self.names[i]}"
+    }
+
     /// Fetches file `i` from the build.
     pub fn fetch(self, i: u32) -> Pending<u8> {
-        fetch(f"files/{self.dir}/{self.names[i]}".as_str())
+        fetch(self.path(i).as_str())
     }
 
     /// File `i`'s bytes, where they're in hand: in the build's own code (a constant computed from
@@ -281,4 +287,13 @@ impl Shipped {
         }
         self.bytes[i]
     }
+}
+
+@test
+fn a_shipped_file_is_at_its_path_under_files() {
+    var files: Vec<(String, Vec<u8>)> = Vec::new()
+    files.push((String::from("a.bin"), Vec::new()))
+    files.push((String::from("icon-32.png"), Vec::new()))
+    let shipped = ship("data", take files)
+    assert(shipped.path(0) == "files/data/a.bin" && shipped.path(1) == "files/data/icon-32.png")
 }

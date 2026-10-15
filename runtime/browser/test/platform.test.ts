@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { BrowserPlatform, exportName, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
+import { BrowserPlatform, exportName, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
   const channel = new MessageChannel();
@@ -119,6 +119,19 @@ test("export filenames fit full session keys and reject traversal or truncation"
   expect(() => exportName(wordBytes(10))).toThrow("filename");
 });
 
+test("icons are square PNGs the build shipped, linked from the page", () => {
+  const body = (s: string) => new TextEncoder().encode(s);
+  const base = "https://play.example/console/";
+  expect(iconLink(body("icon 32 files/icons/icon-32.png"), base))
+    .toEqual({ rel: "icon", sizes: "32x32", href: "https://play.example/console/files/icons/icon-32.png" });
+  expect(iconLink(body("apple-touch-icon 180 files/icons/icon-180.png"), base).rel).toBe("apple-touch-icon");
+  for (const bad of [
+    "icon 32 https://x.example/i.png", "icon 32 files/../secret.png", "icon 32 files/icons/../x.png",
+    "icon 32 files/icons/i.svg", "icon 32 icons/i.png", "manifest 32 files/icons/i.png", "icon 0 files/icons/i.png",
+    "icon 4096 files/icons/i.png", "icon 32 files/icons/i.png extra", "icon 32 files/.icons/i.png",
+  ]) expect(() => iconLink(body(bad), base)).toThrow("invalid icon");
+});
+
 test("a program sets the canvas cursor only to a listed shape", async () => {
   const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
   Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {} } });
@@ -136,5 +149,84 @@ test("a program sets the canvas cursor only to a listed shape", async () => {
   } finally {
     platform.dispose();
     if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+  }
+});
+
+test("a shown program is named in the address, and Back asks it to return", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const oldHistory = Object.getOwnPropertyDescriptor(globalThis, "history");
+  const oldLocation = Object.getOwnPropertyDescriptor(globalThis, "location");
+  const ports: MessagePort[] = [];
+  const heard: unknown[] = [];
+  const frame = {
+    style: {},
+    onload: null as (() => void) | null,
+    onerror: null as (() => void) | null,
+    contentWindow: {
+      postMessage: (_message: unknown, _origin: string, transferred: MessagePort[]) => {
+        const port = transferred[0]!;
+        ports.push(port);
+        port.onmessage = ({ data }) => heard.push(data);
+        port.postMessage({ type: "connected" });
+      },
+      focus: () => {},
+    },
+    remove: () => {},
+  };
+  const listeners = new Map<string, () => void>();
+  const page: { parent?: unknown; addEventListener: (type: string, listener: () => void) => void } = {
+    addEventListener: (type, listener) => listeners.set(type, listener),
+  };
+  page.parent = page;
+  // The session history: entries of state and address, and the one shown.
+  const entries: { state: unknown; url: string }[] = [{ state: null, url: "/" }];
+  let at = 0;
+  const pages = {
+    get state() { return entries[at]!.state; },
+    pushState: (state: unknown, _title: string, url: string) => { entries.splice(at + 1); entries.push({ state, url }); at++; },
+    replaceState: (state: unknown, _title: string, url: string) => { entries[at] = { state, url }; },
+    back: () => { at--; queueMicrotask(() => listeners.get("popstate")!()); },
+  };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: page });
+  Object.defineProperty(globalThis, "history", { configurable: true, value: pages });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { hash: "", pathname: "/", search: "" } });
+  Object.defineProperty(globalThis, "document", { configurable: true, value: {
+    baseURI: "https://console.example/",
+    createElement: () => frame,
+    body: { append: () => queueMicrotask(() => frame.onload?.()) },
+  } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, () => {});
+  const show = (handle: Uint8Array, name: string) => {
+    const body = new Uint8Array(handle.length + name.length);
+    body.set(handle); body.set(new TextEncoder().encode(name), handle.length);
+    return platform.request("surface/show", body);
+  };
+  try {
+    const first = await platform.request("surface/open", new TextEncoder().encode("https://game.example/session/"));
+    await expect(show(first, "../evil")).rejects.toThrow("invalid program name");
+    await show(first, "leapling");
+    expect(entries.map(e => e.url)).toEqual(["/", "#leapling"]);
+    // Back: the program is asked to return, and the page is the console's again.
+    pages.back();
+    await new Promise(r => setTimeout(r, 0));
+    expect(heard).toContainEqual({ type: "leave" });
+    expect(platform.active).toBe(false);
+    frame.onload?.();
+    expect(platform.active).toBe(true);
+    expect(at).toBe(0);
+    // A program that returns by itself takes its entry with it.
+    const second = await platform.request("surface/open", new TextEncoder().encode("https://game.example/session/"));
+    await show(second, "last-green");
+    expect(at).toBe(1);
+    frame.onload?.();
+    expect(at).toBe(0);
+  } finally {
+    platform.dispose();
+    for (const port of ports) port.close();
+    for (const [name, old] of [["window", oldWindow], ["document", oldDocument], ["history", oldHistory], ["location", oldLocation]] as const) {
+      if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name);
+    }
   }
 });
