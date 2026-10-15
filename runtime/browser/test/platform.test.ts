@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { BrowserPlatform, exportName, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
+import { BrowserPlatform, environment, exportName, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
   const channel = new MessageChannel();
@@ -14,6 +14,16 @@ test("program channels correlate replies and close outstanding requests", async 
     await expect(waiting).rejects.toThrow("closed");
     await expect(left.call(new Uint8Array())).rejects.toThrow("closed");
   } finally { left.close(); right.close(); }
+});
+
+test("the environment says whether this page load reloaded the tab", () => {
+  const load = (type: string) => [{ type } as unknown as PerformanceEntry];
+  const b = environment(true, 1_700_000_000_999, 2, load("navigate"));
+  expect([b[0], wordAt(b.subarray(1)), wordAt(b.subarray(5)), b[9]]).toEqual([1, 1_700_000_000, 2048, 0]);
+  expect(environment(false, 0, 1, load("reload"))[9]).toBe(1);
+  // Back and forward are visits, and so is a page whose navigation the browser didn't record.
+  expect(environment(false, 0, 1, load("back_forward"))[9]).toBe(0);
+  expect(environment(false, 0, 1, [])[9]).toBe(0);
 });
 
 test("program channels reject oversized requests before transmission", () => {

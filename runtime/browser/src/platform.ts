@@ -35,6 +35,18 @@ const checked = (body: unknown): Bytes => {
 };
 
 /** A bounded request/reply channel. Closing it rejects every outstanding request. */
+/** The environment a program asks for (platform/host.wrela): whether the system asks for reduced
+ * motion, the seconds since 1970, the device pixel ratio × 1024, and whether this page load is a
+ * reload of the tab (its navigation's type), rather than a visit. */
+export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: number, navigations: PerformanceEntryList): Bytes {
+  const b = new Uint8Array(10);
+  b[0] = Number(reducedMotion);
+  b.set(wordBytes(Math.floor(nowMs / 1000)), 1);
+  b.set(wordBytes(Math.round(pixelRatio * 1024)), 5);
+  b[9] = Number(navigations.some((n) => (n as PerformanceNavigationTiming).type === "reload"));
+  return b;
+}
+
 export class PortRpc {
   #next = 1;
   #closed = false;
@@ -214,7 +226,7 @@ export class BrowserPlatform {
   async request(service: string, body: Bytes): Promise<Bytes> {
     checked(body);
     if (service === "environment") {
-      const b = new Uint8Array(9); b[0] = Number(matchMedia("(prefers-reduced-motion: reduce)").matches); b.set(wordBytes(Math.floor(Date.now() / 1000)), 1); b.set(wordBytes(Math.round((window.devicePixelRatio || 1) * 1024)), 5); return b;
+      return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"));
     }
     if (service === "cursor") {
       // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
