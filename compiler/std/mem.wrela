@@ -113,6 +113,12 @@ pub fn take_answer(request: u32, addr: u32) {}
 @intrinsic
 pub fn take_input(addr: u32, cap: u32) -> u32 {}
 
+/// Copies the bytes of the message whose serial is `serial_lo` and `serial_hi`, up to `cap` of
+/// them, to `addr` (`wrela.payload`): the message's length, or -1 if the current call wasn't given
+/// it (runtime/abi `input`'s Messages).
+@intrinsic
+pub fn take_payload(serial_lo: u32, serial_hi: u32, addr: u32, cap: u32) -> i32 {}
+
 /// Gives the host `bytes` to keep for the build that replaces this one (`wrela.keep`,
 /// `std::reload`): they replace what it kept before.
 @intrinsic

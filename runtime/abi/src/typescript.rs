@@ -102,6 +102,7 @@ export const IMPORT_MEMORY = {import_memory:?};
 export const EXPORT_WORKER = {export_worker:?};
 export const IMPORT_AUDIO = {import_audio:?};
 export const IMPORT_INPUT = {import_input:?};
+export const IMPORT_PAYLOAD = {import_payload:?};
 export const IMPORT_TICK = {import_tick:?};
 export const EXPORT_TICK = {export_tick:?};
 /** Hot reload: what a host calls to change a lifted literal, and keeps for the next build. */
@@ -234,6 +235,7 @@ export const PANIC_CAP = {panic_cap};
         export_worker = crate::EXPORT_WORKER,
         import_audio = crate::IMPORT_AUDIO,
         import_input = input::IMPORT_INPUT,
+        import_payload = input::IMPORT_PAYLOAD,
         import_tick = crate::IMPORT_TICK,
         export_tick = crate::EXPORT_TICK,
         export_lift_set = crate::EXPORT_LIFT_SET,

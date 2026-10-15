@@ -41,6 +41,7 @@ import {
   EXPORT_LIFT_SET,
   IMPORT_AUDIO,
   IMPORT_INPUT,
+  IMPORT_PAYLOAD,
   IMPORT_KEEP,
   IMPORT_KEPT,
   IMPORT_CLOCK,
@@ -444,6 +445,12 @@ export class Program {
         },
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
         [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
+        // A message's bytes (runtime/abi `input`'s Messages): this host has no connections yet,
+        // so it gives no message, and every serial is unknown.
+        [IMPORT_PAYLOAD]: (_lo: number, _hi: number, _ptr: number, _cap: number) => {
+          program.#starting();
+          return -1;
+        },
         [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
         [IMPORT_KEEP]: (ptr: number, len: number) => program.#keepImport(ptr >>> 0, len >>> 0),
         [IMPORT_KEPT]: (ptr: number, cap: number) => program.#keptImport(ptr >>> 0, cap >>> 0),

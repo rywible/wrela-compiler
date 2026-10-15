@@ -27,6 +27,19 @@
 //! | `Text` | a Unicode scalar value typed, 0 | 0, 0 |
 //! | `PadButton` | the pad (0 to 3), the button ([`PAD_BUTTONS`]) | its value (f32, 0 to 1), 1 if it's pressed |
 //! | `PadAxis` | the pad, the axis ([`PAD_AXES`]) | its value (f32, -1 to 1), 0 |
+//! | `Message` | the connection, the serial's low word | the serial's high word, the bytes' length |
+//! | `Connection` | the connection, 1 if it's open (0: closed) | 0, 0 |
+//!
+//! ## Messages
+//!
+//! A `Message` is bytes from a connection (language.md §12). Its event says how many; the
+//! program copies them with `wrela.payload(serial_lo, serial_hi, ptr, cap) -> length` ([`IMPORT_PAYLOAD`]),
+//! during the call that gave it the event and no later: the host keeps a message's bytes while
+//! its event is queued and during that call, then lets them go. A serial is never used twice
+//! by a host, so an old event's serial reads as unknown (-1), never as another message's bytes.
+//! A call is given messages until their bytes reach [`PAYLOAD_PER_CALL`] (the first whatever its
+//! size); the rest wait for the next call. Messages and connections never become a tick's
+//! records: v1 gives the network to frames and a server's `serve`, not to ticks.
 //!
 //! Positions are in the same pixels as `frame`'s width and height. A key is a physical key
 //! (DOM's `KeyboardEvent.code`), named as [`KEYS`] lists it; one the list doesn't name is 0.
@@ -80,6 +93,10 @@ use serde_json::Value;
 
 /// `wrela.input(ptr, cap) -> count`.
 pub const IMPORT_INPUT: &str = "input";
+/// `wrela.payload(serial_lo, serial_hi, ptr, cap) -> length`: a message's bytes ([Messages](self#messages)).
+pub const IMPORT_PAYLOAD: &str = "payload";
+/// The payload bytes one call is given at most, past its first message.
+pub const PAYLOAD_PER_CALL: usize = 1 << 20;
 /// Bytes per event: six words.
 pub const EVENT_SIZE: u32 = 24;
 
@@ -96,10 +113,13 @@ pub enum EventKind {
     Text = 7,
     PadButton = 8,
     PadAxis = 9,
+    // 10 to 12 are the platform's (an input method's text, a paste, an assistive action).
+    Message = 13,
+    Connection = 14,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 9] = [
+    pub const ALL: [EventKind; 11] = [
         EventKind::PointerMove,
         EventKind::PointerDown,
         EventKind::PointerUp,
@@ -109,6 +129,8 @@ impl EventKind {
         EventKind::Text,
         EventKind::PadButton,
         EventKind::PadAxis,
+        EventKind::Message,
+        EventKind::Connection,
     ];
 
     pub fn name(self) -> &'static str {
@@ -122,7 +144,14 @@ impl EventKind {
             EventKind::Text => "Text",
             EventKind::PadButton => "PadButton",
             EventKind::PadAxis => "PadAxis",
+            EventKind::Message => "Message",
+            EventKind::Connection => "Connection",
         }
+    }
+
+    /// Whether it's the network's: never a tick's record.
+    pub fn is_network(self) -> bool {
+        matches!(self, EventKind::Message | EventKind::Connection)
     }
 }
 
@@ -302,6 +331,17 @@ impl Event {
         Event { kind: EventKind::PadAxis, modifiers: 0, words: [pad, axis, value.to_bits(), 0] }
     }
 
+    /// A message of `len` bytes from connection `conn`, its serial `serial`.
+    pub fn message(conn: u32, serial: u64, len: u32) -> Event {
+        let words = [conn, serial as u32, (serial >> 32) as u32, len];
+        Event { kind: EventKind::Message, modifiers: 0, words }
+    }
+
+    /// Connection `conn` opened, or closed.
+    pub fn connection(conn: u32, open: bool) -> Event {
+        Event { kind: EventKind::Connection, modifiers: 0, words: [conn, u32::from(open), 0, 0] }
+    }
+
     /// Its [`EVENT_SIZE`] bytes, as the program reads them.
     pub fn bytes(&self) -> [u8; EVENT_SIZE as usize] {
         let mut out = [0u8; EVENT_SIZE as usize];
@@ -320,21 +360,26 @@ pub enum At {
     Tick(u32),
 }
 
-/// A script's event, and when it arrives.
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// A script's event, and when it arrives; a message's bytes (its serial is the host's to give,
+/// when it's queued).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Scripted {
     pub at: At,
     pub event: Event,
+    pub payload: Vec<u8>,
 }
 
-/// The events of `script` that arrive before frame `frame`.
-pub fn events_at(script: &[Scripted], frame: u32) -> impl Iterator<Item = Event> + '_ {
-    script.iter().filter(move |s| s.at == At::Frame(frame)).map(|s| s.event)
+/// The events of `script` that arrive before frame `frame`, for [`Queue::push_scripted`].
+pub fn events_at(script: &[Scripted], frame: u32) -> impl Iterator<Item = &Scripted> + '_ {
+    script.iter().filter(move |s| s.at == At::Frame(frame))
 }
 
-/// The events of `script` that are tick `tick`'s records.
+/// The events of `script` that are tick `tick`'s records. A tick has no network events.
 pub fn records_at(script: &[Scripted], tick: u32) -> impl Iterator<Item = Event> + '_ {
-    script.iter().filter(move |s| s.at == At::Tick(tick)).map(|s| s.event)
+    script
+        .iter()
+        .filter(move |s| s.at == At::Tick(tick) && !s.event.kind.is_network())
+        .map(|s| s.event)
 }
 
 /// Reads a script ([the format](self#scripted-input)): its events, in order, or why it isn't
@@ -431,7 +476,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     at(&format!("`{name}` isn't a pad's {key} ({})", names.join(", ")))
                 })
             };
-        let mut push = |event| out.push(Scripted { at: when, event });
+        let mut push = |event| out.push(Scripted { at: when, event, payload: Vec::new() });
         match ty {
             "move" => {
                 push(Event::pointer(EventKind::PointerMove, num("x")?, num("y")?, 0, modifiers))
@@ -454,6 +499,42 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 for c in t.chars() {
                     push(Event::text(c));
                 }
+            }
+            "message" | "connection" if matches!(when, At::Tick(_)) => {
+                return Err(at(
+                    "a tick has no network events: give a message or a connection a `frame`",
+                ));
+            }
+            "message" => {
+                let conn = number("conn")
+                    .unwrap_or(Some(0))
+                    .ok_or_else(|| at("`conn` must be a whole number"))?;
+                let payload = match (o.get("bytes"), o.get("text")) {
+                    (Some(b), None) => b
+                        .as_array()
+                        .and_then(|a| {
+                            a.iter()
+                                .map(|x| x.as_u64().filter(|&v| v < 256).map(|v| v as u8))
+                                .collect::<Option<Vec<u8>>>()
+                        })
+                        .ok_or_else(|| at("`bytes` is an array of numbers from 0 to 255"))?,
+                    (None, Some(t)) => {
+                        t.as_str().ok_or_else(|| at("`text` must be a string"))?.as_bytes().to_vec()
+                    }
+                    _ => return Err(at("a message has `bytes` or `text`")),
+                };
+                let len = payload.len() as u32;
+                out.push(Scripted { at: when, event: Event::message(conn, 0, len), payload });
+            }
+            "connection" => {
+                let conn = number("conn")
+                    .unwrap_or(Some(0))
+                    .ok_or_else(|| at("`conn` must be a whole number"))?;
+                let open = match o.get("open") {
+                    Some(v) => v.as_bool().ok_or_else(|| at("`open` must be true or false"))?,
+                    None => return Err(at("`open` is missing")),
+                };
+                push(Event::connection(conn, open));
             }
             "padbutton" => {
                 let (p, b) = (pad()?, named("button", &PAD_BUTTONS)?);
@@ -496,15 +577,45 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
     Ok(out)
 }
 
-/// A host's queue of events not yet read: [`Queue::take`] gives `wrela.input` its events.
+/// A host's queue of events not yet read: [`Queue::take`] gives `wrela.input` its events, and
+/// [`Queue::payload`] gives `wrela.payload` the bytes of the messages the current call was
+/// given ([Messages](self#messages)).
 #[derive(Clone, Debug, Default)]
 pub struct Queue {
     events: std::collections::VecDeque<Event>,
+    /// Each message's bytes, by serial: while its event is queued, and during the call given it.
+    payloads: std::collections::HashMap<u64, Vec<u8>>,
+    /// The serials of the messages the current call was given.
+    delivered: Vec<u64>,
+    /// The last serial given; the first is 1.
+    serial: u64,
+    /// The pair id of the build it serves ([`crate::read_pair`]).
+    pair: Option<u64>,
 }
 
 impl Queue {
+    /// Queues an event that isn't a message (a message has bytes: [`Queue::push_message`]).
     pub fn push(&mut self, e: Event) {
+        debug_assert!(e.kind != EventKind::Message, "a message is queued with its bytes");
         self.events.push_back(e);
+    }
+
+    /// Queues a message of `bytes` from connection `conn`: its serial.
+    pub fn push_message(&mut self, conn: u32, bytes: Vec<u8>) -> u64 {
+        self.serial += 1;
+        let serial = self.serial;
+        self.events.push_back(Event::message(conn, serial, bytes.len() as u32));
+        self.payloads.insert(serial, bytes);
+        serial
+    }
+
+    /// Queues a script's event: a message with its bytes.
+    pub fn push_scripted(&mut self, s: &Scripted) {
+        if s.event.kind == EventKind::Message {
+            self.push_message(s.event.words[0], s.payload.clone());
+        } else {
+            self.push(s.event);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -515,10 +626,55 @@ impl Queue {
         self.events.is_empty()
     }
 
-    /// Up to `cap` events, oldest first, as bytes; the rest stay queued.
+    /// Up to `cap` events, oldest first, as bytes; the rest stay queued. Messages stop once the
+    /// call's bytes reach [`PAYLOAD_PER_CALL`] (the first is given whatever its size).
     pub fn take(&mut self, cap: u32) -> Vec<u8> {
-        let n = (cap as usize).min(self.events.len());
-        self.events.drain(..n).flat_map(|e| e.bytes()).collect()
+        let mut given: usize =
+            self.delivered.iter().map(|s| self.payloads.get(s).map_or(0, Vec::len)).sum();
+        let mut out = Vec::new();
+        while out.len() / (EVENT_SIZE as usize) < (cap as usize) {
+            let Some(&e) = self.events.front() else { break };
+            if e.kind == EventKind::Message {
+                let len = e.words[3] as usize;
+                if given > 0 && given + len > PAYLOAD_PER_CALL {
+                    break;
+                }
+                given += len;
+                self.delivered.push(u64::from(e.words[1]) | (u64::from(e.words[2]) << 32));
+            }
+            self.events.pop_front();
+            out.extend_from_slice(&e.bytes());
+        }
+        out
+    }
+
+    /// The bytes of message `serial`, if the current call was given it.
+    pub fn payload(&self, serial: u64) -> Option<&[u8]> {
+        self.delivered.contains(&serial).then(|| self.payloads.get(&serial).map(Vec::as_slice))?
+    }
+
+    /// The call has returned (or trapped): the bytes of the messages it was given go.
+    pub fn end_call(&mut self) {
+        for serial in self.delivered.drain(..) {
+            self.payloads.remove(&serial);
+        }
+    }
+
+    /// It now serves the build whose pair id is `pair`: if that's another program's build than
+    /// the one it served (a reload that changed it), its network events go ([`Queue::drop_network`]).
+    pub fn for_build(&mut self, pair: Option<u64>) {
+        if self.pair.is_some() && self.pair != pair {
+            self.drop_network();
+        }
+        self.pair = pair;
+    }
+
+    /// The build changed (a reload to another pair, language.md §12): queued messages and
+    /// connection events go, as their bytes were for the old build's types; the rest stay.
+    pub fn drop_network(&mut self) {
+        self.events.retain(|e| !e.kind.is_network());
+        self.end_call();
+        self.payloads.clear();
     }
 }
 
@@ -554,6 +710,77 @@ mod tests {
         let bytes = s[3].event.bytes();
         assert_eq!(&bytes[..4], &4u32.to_le_bytes());
         assert_eq!(&bytes[20..], &120.0f32.to_bits().to_le_bytes());
+    }
+
+    /// A message's bytes are the call's that was given it, and no other's; a call stops taking
+    /// messages at its bytes' limit; a serial is never answered twice.
+    #[test]
+    fn messages_bytes_live_for_the_call_that_reads_them() {
+        let mut q = Queue::default();
+        let first = q.push_message(3, vec![1, 2, 3]);
+        q.push(Event::text('x'));
+        let big = q.push_message(4, vec![9; PAYLOAD_PER_CALL]);
+        assert_ne!(first, big);
+        // Queued, not yet given: unknown.
+        assert_eq!(q.payload(first), None);
+        // The first call takes the small message and the text, and stops before the big one
+        // (its bytes would pass the limit).
+        let bytes = q.take(16);
+        assert_eq!(bytes.len(), 2 * EVENT_SIZE as usize);
+        assert_eq!(&bytes[..4], &(EventKind::Message as u32).to_le_bytes());
+        assert_eq!(q.payload(first), Some(&[1u8, 2, 3][..]));
+        assert_eq!(q.payload(big), None);
+        q.end_call();
+        // The next call: the first message's bytes are gone; the big one is given, whole.
+        assert_eq!(q.payload(first), None);
+        assert_eq!(q.take(16).len(), EVENT_SIZE as usize);
+        assert_eq!(q.payload(big).map(<[u8]>::len), Some(PAYLOAD_PER_CALL));
+        q.end_call();
+        assert!(q.is_empty() && q.payloads.is_empty());
+        // A new message never reuses a serial.
+        assert!(q.push_message(3, vec![]) > big);
+    }
+
+    /// A reload to another program's build drops the network's events, and keeps the rest.
+    #[test]
+    fn another_builds_queue_drops_the_network() {
+        let mut q = Queue::default();
+        q.for_build(Some(1));
+        q.push_message(0, vec![5]);
+        q.push(Event::connection(0, true));
+        q.push(Event::text('a'));
+        // The same build, reloaded: everything stays.
+        q.for_build(Some(1));
+        assert_eq!(q.len(), 3);
+        // Another build: only the text stays.
+        q.for_build(Some(2));
+        assert_eq!(q.len(), 1);
+        assert!(q.payloads.is_empty());
+        assert_eq!(&q.take(4)[..4], &(EventKind::Text as u32).to_le_bytes());
+    }
+
+    #[test]
+    fn scripts_give_messages_and_connections_to_frames_only() {
+        let script = r#"[
+            {"frame": 1, "type": "connection", "conn": 2, "open": true},
+            {"frame": 1, "type": "message", "conn": 2, "bytes": [1, 255]},
+            {"frame": 2, "type": "message", "text": "hi"},
+            {"tick": 3, "type": "key", "key": "KeyA"}
+        ]"#;
+        let s = parse_script(script).expect("a valid script");
+        assert_eq!(s[0].event, Event::connection(2, true));
+        assert_eq!(s[1].event.kind, EventKind::Message);
+        assert_eq!(s[1].payload, [1, 255]);
+        assert_eq!(s[2].payload, b"hi");
+        let mut q = Queue::default();
+        for e in events_at(&s, 1) {
+            q.push_scripted(e);
+        }
+        assert_eq!(q.len(), 2);
+        // A tick takes none.
+        let bad = r#"[{"tick": 0, "type": "message", "text": "x"}]"#;
+        assert!(parse_script(bad).expect_err("a tick's message").contains("a tick has no network"));
+        assert_eq!(records_at(&s, 3).count(), 2);
     }
 
     #[test]

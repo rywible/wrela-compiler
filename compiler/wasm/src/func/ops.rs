@@ -1418,6 +1418,17 @@ pub(super) fn host(
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
             fe.ins.push(I::Call(helper));
         }
+        ir::HostOp::Payload => {
+            let h = fe.at.helpers;
+            for &a in &args[..4] {
+                fe.ins.push(I::LocalGet(fe.v(a)));
+            }
+            fe.ins.push(I::Call(h.payload));
+            match result {
+                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
+                None => fe.ins.push(I::Drop),
+            }
+        }
         ir::HostOp::Input | ir::HostOp::Kept => {
             let h = fe.at.helpers;
             fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);

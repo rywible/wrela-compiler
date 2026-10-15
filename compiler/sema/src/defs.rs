@@ -237,6 +237,7 @@ macro_rules! lang_items {
                         | Lang::ReadBufferCommand
                         | Lang::Limit
                         | Lang::InputTake
+                        | Lang::PayloadTake
                         | Lang::Kept
                         | Lang::ReadClock
                 )
@@ -361,6 +362,7 @@ lang_items! {
     RequestStatus = "std::io::request_status",
     RequestTake = "std::mem::take_answer",
     InputTake = "std::mem::take_input",
+    PayloadTake = "std::mem::take_payload",
     Keep = "std::mem::keep_bytes",
     Kept = "std::mem::kept_bytes",
     ReadClock = "std::mem::read_clock",

@@ -24,8 +24,8 @@ use wrela_abi::ticks::{Tick, TickLog, frame_time, lockstep_ticks};
 use wrela_abi::{
     AUDIO_QUANTUM, EXPORT_AUDIO, EXPORT_FRAME, EXPORT_INIT, EXPORT_MEMORY, EXPORT_TICK,
     EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_CLOCK, IMPORT_INPUT, IMPORT_KEEP,
-    IMPORT_KEPT, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT,
-    IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK, Manifest,
+    IMPORT_KEPT, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PAYLOAD, IMPORT_PHASE,
+    IMPORT_PRINT, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK, Manifest,
     REQUEST_FAILED, REQUEST_PENDING,
 };
 
@@ -796,6 +796,8 @@ pub(crate) struct Compiled {
     /// Its memory's type: shared.
     memory: wasmtime::MemoryType,
     lines: Option<Arc<Lines>>,
+    /// Its pair id (`wrela_abi::PAIR_SECTION`), if it has one.
+    pair: Option<u64>,
 }
 
 /// The engine a program compiles for: [`METERED`] with `fuel`, else [`ENGINE`].
@@ -831,7 +833,7 @@ fn compiled(module: Module, wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> 
         })?)),
         None => None,
     };
-    Ok(Compiled { module, fuel, memory, lines })
+    Ok(Compiled { module, fuel, memory, lines, pair: wrela_abi::read_pair(wasm) })
 }
 
 impl<E: Executor> Program<E> {
@@ -925,14 +927,17 @@ impl<E: Executor> Program<E> {
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_LIMIT, limit::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_AUDIO, audio::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_INPUT, self::input::<E>));
+        link!(linker.func_wrap(IMPORT_MODULE, IMPORT_PAYLOAD, payload::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_TICK, tick::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_KEEP, keep::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_KEPT, self::kept::<E>));
         link!(linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, clock::<E>));
         link!(prepared_trace.link_checked(&mut linker, Some(&memory), check_started::<E>));
 
-        let Retired { executor, kept, ticks, ran, input, records, trace, batches, tick_from } =
+        let Retired { executor, kept, ticks, ran, mut input, records, trace, batches, tick_from } =
             carried;
+        // A reload to another program's build drops the network's events (language.md §12).
+        input.for_build(compiled.pair);
         let trace = trace.unwrap_or(prepared_trace);
         let state = State {
             memory: memory.clone(),
@@ -1244,6 +1249,8 @@ impl<E: Executor> Program<E> {
         // What the call's requests got, the program sees from its next call on. The call's
         // phase ends with it.
         self.store.data_mut().requests.settle();
+        // The messages it was given: their bytes go with the call.
+        self.store.data_mut().input.end_call();
         self.store.data().trace.end_phase();
         self.last_failure = None;
         let failure = self.store.data_mut().failure.take();
@@ -1469,10 +1476,13 @@ impl<E: Executor> Program<E> {
         mut log: Option<&mut TickLog>,
     ) -> Result<()> {
         valid_fps(fps)?;
-        let events: Vec<Event> = wrela_abi::input::events_at(script, i).collect();
-        for &e in &events {
-            self.push_input(e);
+        let arriving: Vec<&Scripted> = wrela_abi::input::events_at(script, i).collect();
+        for s in &arriving {
+            self.push_scripted(s);
         }
+        // A tick takes no network events.
+        let events: Vec<Event> =
+            arriving.iter().map(|s| s.event).filter(|e| !e.kind.is_network()).collect();
         let from = *self.tick_from.get_or_insert(i);
         if let Some(hz) = self.ticker_hz() {
             self.push_records(events);
@@ -1559,6 +1569,16 @@ impl<E: Executor> Program<E> {
     /// Queues an input event: the program reads it (`wrela.input`) from its next call on.
     pub(crate) fn push_input(&mut self, e: Event) {
         self.store.data_mut().input.push(e);
+    }
+
+    /// Queues a script's event (a message with its bytes).
+    pub(crate) fn push_scripted(&mut self, s: &Scripted) {
+        self.store.data_mut().input.push_scripted(s);
+    }
+
+    /// Queues a message of `bytes` from connection `conn`.
+    pub(crate) fn push_message(&mut self, conn: u32, bytes: Vec<u8>) {
+        self.store.data_mut().input.push_message(conn, bytes);
     }
 
     /// The lines printed since the last call.
@@ -1926,9 +1946,32 @@ fn input<E: Executor>(
             "input({ptr}, {cap}) reaches past the end of the program's memory"
         ));
     }
+    // Fewer than `n` when the call's messages reach their bytes' limit.
     let bytes = state.input.take(cap);
     shared::write(&state.memory, ptr as usize, &bytes);
-    Ok(n as i32)
+    Ok((bytes.len() / EVENT_SIZE as usize) as i32)
+}
+
+/// `wrela.payload(serial_lo, serial_hi, ptr, cap) -> length`: copies the bytes of a message the
+/// current call was given, up to `cap` of them, to `ptr`; -1 for another serial.
+fn payload<E: Executor>(
+    mut caller: wasmtime::Caller<'_, State<E>>,
+    serial_lo: u32,
+    serial_hi: u32,
+    ptr: u32,
+    cap: u32,
+) -> wasmtime::Result<i32> {
+    let state = caller.data_mut();
+    check_started(state)?;
+    let serial = u64::from(serial_lo) | (u64::from(serial_hi) << 32);
+    let Some(bytes) = state.input.payload(serial) else { return Ok(-1) };
+    let n = bytes.len().min(cap as usize);
+    if !shared::write(&state.memory, ptr as usize, &bytes[..n]) {
+        return Err(wasmtime::format_err!(
+            "payload(.., {ptr}, {cap}) reaches past the end of the program's memory"
+        ));
+    }
+    Ok(bytes.len() as i32)
 }
 
 /// `wrela.keep(ptr, len)`: keeps those bytes for the build that replaces this one (hot reload).

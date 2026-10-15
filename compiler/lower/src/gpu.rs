@@ -1116,6 +1116,7 @@ pub(crate) fn intrinsic(
             | Lang::RequestTake
             | Lang::Limit
             | Lang::InputTake
+            | Lang::PayloadTake
             | Lang::Keep
             | Lang::Kept
             | Lang::ReadClock
@@ -1182,6 +1183,15 @@ pub(crate) fn intrinsic(
             fl.mb.m.input = true;
             let u = fl.mb.m.types.u32();
             Some(fl.value(u, ir::Expr::Host(ir::HostOp::Input, vec![at, cap])))
+        }
+        Some(Lang::PayloadTake) => {
+            let mut args = Vec::new();
+            for a in &c.args[..4] {
+                args.push(fl.arg_value(a)?);
+            }
+            fl.mb.m.payload = true;
+            let i = fl.mb.m.types.scalar(ir::Scalar::I32);
+            Some(fl.value(i, ir::Expr::Host(ir::HostOp::Payload, args)))
         }
         Some(Lang::RequestTake) => {
             let r = fl.arg_value(&c.args[0])?;

@@ -38,6 +38,7 @@ mod lipschitz;
 mod loft;
 mod math;
 mod measures;
+mod messages;
 mod noise;
 mod numerics;
 mod parallel;

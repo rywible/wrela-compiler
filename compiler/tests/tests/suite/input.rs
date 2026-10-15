@@ -28,7 +28,7 @@ fn the_native_host_plays_a_script() {
         let script = script();
         for i in 0..12u32 {
             for e in wrela_abi::input::events_at(&script, i) {
-                host.push_input(e);
+                host.push_scripted(e);
             }
             host.frame(wrela_host::frame_time(i, 60.0), 640, 480).expect("frame");
         }

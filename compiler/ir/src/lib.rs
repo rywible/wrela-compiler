@@ -320,6 +320,9 @@ pub enum HostOp {
     /// `wrela.input(address, cap)`: copies up to `cap` queued input events to the address
     /// (`u32`s); how many, a `u32`.
     Input,
+    /// `wrela.payload(serial_lo, serial_hi, address, cap)`: copies a message's bytes, up to
+    /// `cap`, to the address; its length, or -1 if the call wasn't given it (an `i32`).
+    Payload,
     /// `wrela.keep(address, length)`: the host keeps those bytes for the build that replaces
     /// this one (hot reload).
     Keep,
@@ -799,6 +802,9 @@ pub struct Module {
     /// CPU only: whether the program reads input (`std::input`), so the module imports
     /// `wrela.input`.
     pub input: bool,
+    /// CPU only: whether the program reads messages' bytes (`std::input::payload`), so the
+    /// module imports `wrela.payload`.
+    pub payload: bool,
     /// CPU only: whether the program keeps bytes across a hot reload (`std::reload`), so the
     /// module imports `wrela.keep` and `wrela.kept`.
     pub reload: bool,

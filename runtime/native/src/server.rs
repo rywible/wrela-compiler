@@ -12,10 +12,12 @@ use std::path::Path;
 use std::sync::LazyLock;
 use std::time::Duration;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, TypedFunc};
+use wrela_abi::input::{EVENT_SIZE, Event, Queue};
 use wrela_abi::stream::{self, Command};
 use wrela_abi::{
-    EXPORT_MEMORY, EXPORT_SERVE, EXPORT_SERVE_INIT, IMPORT_LIMIT, IMPORT_MODULE, IMPORT_PHASE,
-    IMPORT_PRINT, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT,
+    EXPORT_MEMORY, EXPORT_SERVE, EXPORT_SERVE_INIT, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MODULE,
+    IMPORT_PAYLOAD, IMPORT_PHASE, IMPORT_PRINT, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE,
+    IMPORT_SUBMIT,
 };
 
 /// How often the engines' epoch advances: a deadline is a whole number of these.
@@ -153,6 +155,8 @@ struct RoomState {
     refused: Option<String>,
     printed: Vec<String>,
     dropped: u64,
+    /// The events (and messages' bytes) the room hasn't read.
+    input: Queue,
 }
 
 impl wasmtime::ResourceLimiter for RoomState {
@@ -206,6 +210,7 @@ impl Room {
             refused: None,
             printed: Vec::new(),
             dropped: 0,
+            input: Queue::default(),
         };
         let mut store = Store::new(&ENGINE, state);
         store.limiter(|s| s);
@@ -233,6 +238,17 @@ impl Room {
         self.call(|store| serve.call(store, time))
     }
 
+    /// Queues a message of `bytes` from connection `conn`: the room reads it (`std::input`) from
+    /// its next call on.
+    pub fn push_message(&mut self, conn: u32, bytes: Vec<u8>) {
+        self.store.data_mut().input.push_message(conn, bytes);
+    }
+
+    /// Queues that connection `conn` opened, or closed.
+    pub fn push_connection(&mut self, conn: u32, open: bool) {
+        self.store.data_mut().input.push(Event::connection(conn, open));
+    }
+
     /// The lines it printed since the last call to this, and how many more it printed than were
     /// kept.
     pub fn take_printed(&mut self) -> (Vec<String>, u64) {
@@ -255,10 +271,12 @@ impl Room {
         s.refused = None;
         let memory = self.memory;
         let result = f(&mut self.store).map_err(|e| classify(&mut self.store, Some(memory), &e));
-        // Requests made during the call are answered now, for the next call to read.
+        // Requests made during the call are answered now, for the next call to read; the
+        // messages it was given lose their bytes.
         let s = self.store.data_mut();
         let arriving = std::mem::take(&mut s.arriving);
         s.answered.extend(arriving);
+        s.input.end_call();
         result
     }
 }
@@ -402,6 +420,43 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                 s.dropped += 1;
             }
             Ok(())
+        },
+    )?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_INPUT,
+        |mut c: Caller<'_, RoomState>, at: u32, cap: u32| -> wasmtime::Result<i32> {
+            let bytes = c.data_mut().input.take(cap);
+            let m = memory(&mut c)?;
+            m.write(&mut c, at as usize, &bytes).map_err(|_| {
+                wasmtime::format_err!(
+                    "input({at}, {cap}) reaches past the end of the program's memory"
+                )
+            })?;
+            Ok((bytes.len() / EVENT_SIZE as usize) as i32)
+        },
+    )?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_PAYLOAD,
+        |mut c: Caller<'_, RoomState>,
+         lo: u32,
+         hi: u32,
+         at: u32,
+         cap: u32|
+         -> wasmtime::Result<i32> {
+            let serial = u64::from(lo) | (u64::from(hi) << 32);
+            let Some(bytes) = c.data().input.payload(serial).map(<[u8]>::to_vec) else {
+                return Ok(-1);
+            };
+            let n = bytes.len().min(cap as usize);
+            let m = memory(&mut c)?;
+            m.write(&mut c, at as usize, &bytes[..n]).map_err(|_| {
+                wasmtime::format_err!(
+                    "payload(.., {at}, {cap}) reaches past the end of the program's memory"
+                )
+            })?;
+            Ok(bytes.len() as i32)
         },
     )?;
     // A phase's timing is for frames; a room ignores it (§6.15's `trace`).

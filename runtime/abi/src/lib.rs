@@ -57,7 +57,7 @@ pub mod typescript;
 pub mod vectors;
 pub mod wrela;
 
-pub use input::IMPORT_INPUT;
+pub use input::{IMPORT_INPUT, IMPORT_PAYLOAD};
 pub use manifest::Manifest;
 pub use typescript::typescript;
 
@@ -140,13 +140,14 @@ impl HostFunction {
 }
 
 /// Every function a program may import besides its memory ([`IMPORT_MEMORY`]).
-pub const HOST_FUNCTIONS: [HostFunction; 12] = [
+pub const HOST_FUNCTIONS: [HostFunction; 13] = [
     HostFunction { name: IMPORT_SUBMIT, params: 2, results: 0 },
     HostFunction { name: IMPORT_REQUEST_STATUS, params: 1, results: 1 },
     HostFunction { name: IMPORT_REQUEST_TAKE, params: 2, results: 0 },
     HostFunction { name: IMPORT_LIMIT, params: 1, results: 1 },
     HostFunction { name: IMPORT_AUDIO, params: 2, results: 0 },
     HostFunction { name: IMPORT_INPUT, params: 2, results: 1 },
+    HostFunction { name: IMPORT_PAYLOAD, params: 4, results: 1 },
     HostFunction { name: IMPORT_TICK, params: 3, results: 0 },
     HostFunction { name: IMPORT_KEEP, params: 2, results: 0 },
     HostFunction { name: IMPORT_KEPT, params: 2, results: 1 },

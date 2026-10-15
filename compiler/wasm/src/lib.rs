@@ -46,6 +46,9 @@ pub(crate) struct Helpers {
     pub audio: u32,
     /// The import `wrela.input(ptr, cap) -> i32`, in a module that reads input.
     pub input: u32,
+    /// The import `wrela.payload(serial_lo, serial_hi, ptr, cap) -> i32`, in a module that reads
+    /// messages' bytes.
+    pub payload: u32,
     /// `wrela.keep` and `wrela.kept`, when the program keeps bytes across a hot reload.
     pub keep: u32,
     pub kept: u32,
@@ -231,6 +234,15 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         let ty = EntityType::Function(input_ty);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_INPUT, ty);
     }
+    let payload = imports.len();
+    if m.payload {
+        let ty = types.get(vec![ValType::I32; 4], vec![ValType::I32]);
+        imports.import(
+            wrela_abi::IMPORT_MODULE,
+            wrela_abi::IMPORT_PAYLOAD,
+            EntityType::Function(ty),
+        );
+    }
     let keep = imports.len();
     if m.reload {
         let ty = EntityType::Function(submit_ty);
@@ -277,6 +289,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         limit: 3,
         audio,
         input,
+        payload,
         keep,
         kept: keep + 1,
         clock,

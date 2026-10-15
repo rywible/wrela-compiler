@@ -104,10 +104,10 @@ impl Runner {
         .map_err(|e| format!("`{name}`: {e}"))
     }
 
-    fn push(&mut self, e: wrela_abi::input::Event) {
+    fn push(&mut self, e: &wrela_abi::input::Scripted) {
         match self {
-            Runner::Gpu(h) => h.push_input(e),
-            Runner::Cpu(h) => h.push_input(e),
+            Runner::Gpu(h) => h.push_scripted(e),
+            Runner::Cpu(h) => h.push_scripted(e),
         }
     }
 }

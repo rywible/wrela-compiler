@@ -76,6 +76,7 @@ export const IMPORT_MEMORY = "memory";
 export const EXPORT_WORKER = "__worker";
 export const IMPORT_AUDIO = "audio";
 export const IMPORT_INPUT = "input";
+export const IMPORT_PAYLOAD = "payload";
 export const IMPORT_TICK = "tick";
 export const EXPORT_TICK = "__tick";
 /** Hot reload: what a host calls to change a lifted literal, and keeps for the next build. */
@@ -101,6 +102,8 @@ export const EventKind = {
   Text: 7,
   PadButton: 8,
   PadAxis: 9,
+  Message: 13,
+  Connection: 14,
 } as const;
 export const MODIFIER_SHIFT = 1;
 export const MODIFIER_CONTROL = 2;
@@ -124,6 +127,7 @@ export const HOST_FUNCTIONS = [
   ["limit", "(i32) -> (i32)"],
   ["audio", "(i32, i32) -> ()"],
   ["input", "(i32, i32) -> (i32)"],
+  ["payload", "(i32, i32, i32, i32) -> (i32)"],
   ["tick", "(i32, i32, i32) -> ()"],
   ["keep", "(i32, i32) -> ()"],
   ["kept", "(i32, i32) -> (i32)"],
