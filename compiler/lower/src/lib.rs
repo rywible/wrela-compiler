@@ -378,7 +378,8 @@ fn lower_in(
     cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
     let mut cpu = ModuleBuilder::default();
     cx.make_table(&mut cpu);
-    let mut has_frame = false;
+    let server = data.role == wrela_sema::defs::Role::Server;
+    let mut has_entry = false;
     for &f in &roots.also {
         // A job's body is lowered as its `resume` (§6.18).
         let key = if checked.program.func(f).attrs.job.is_some() {
@@ -388,8 +389,9 @@ fn lower_in(
         };
         cx.instance(&mut cpu, key, None);
     }
-    // The program's state (§12): what `init` returns, which the other exports take first.
-    let state = state_type(checked);
+    // The program's state (§12): what `init` returns (a server's `serve_init`), which the
+    // other exports take first.
+    let state = state_type(checked, data.role);
     if let Some((init, s)) = state {
         let span = checked.program.func(init).sig_span;
         if let Some(t) = cx.lower_ty(&mut cpu, s, span) {
@@ -402,6 +404,12 @@ fn lower_in(
         if checked.program.func(f).attrs.testing.is_some() && !data.testing {
             continue;
         }
+        // A server build exports `serve_init` and `serve` alone; a client build every other
+        // export (§12).
+        let name = &checked.program.func(f).name;
+        if server != (name == wrela_abi::EXPORT_SERVE_INIT || name == wrela_abi::EXPORT_SERVE) {
+            continue;
+        }
         if !checked.program.fn_all_generics(f).is_empty() {
             // Reported; it has no types to be lowered with.
             cx.check_export(f, state.map(|s| s.1));
@@ -410,7 +418,7 @@ fn lower_in(
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         let name = cx.checked.program.func(f).name.clone();
-        has_frame |= name == wrela_abi::EXPORT_FRAME;
+        has_entry |= name == if server { wrela_abi::EXPORT_SERVE } else { wrela_abi::EXPORT_FRAME };
         if cx.check_export(f, state.map(|s| s.1)) {
             let id = enum_wrapper(&cx, &mut cpu, f, id);
             let id = match (cpu.m.state, state) {
@@ -433,7 +441,7 @@ fn lower_in(
         };
         cpu.m.exports.push((format!("test.{i}"), id));
     }
-    if !has_frame {
+    if !has_entry && !server {
         cx.no_frame();
     }
     cx.drain(&mut cpu);
@@ -706,6 +714,9 @@ impl<'a> Cx<'a> {
             return false;
         }
         use wrela_sema::defs::{Mode, RetMode};
+        if def.name == wrela_abi::EXPORT_SERVE_INIT || def.name == wrela_abi::EXPORT_SERVE {
+            return self.check_server_export(f, state);
+        }
         if def.name == wrela_abi::EXPORT_INIT {
             let t = &self.checked.program.types;
             let ok = def.params.is_empty()
@@ -814,6 +825,52 @@ impl<'a> Cx<'a> {
         ok
     }
 
+    /// A server build's export (§12): `serve_init() -> State`, then `serve(state: mut State,
+    /// time: f32)` (`serve(time: f32)` without state). E0703 otherwise.
+    fn check_server_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
+        use wrela_sema::defs::{Mode, RetMode};
+        let def = self.checked.program.func(f);
+        let t = &self.checked.program.types;
+        let generic = !self.checked.program.fn_all_generics(f).is_empty();
+        if def.name == wrela_abi::EXPORT_SERVE_INIT {
+            let ok = def.params.is_empty()
+                && !t.is_unit(def.ret)
+                && def.ret_mode == RetMode::Owned
+                && !generic;
+            if !ok {
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`serve_init`'s signature is `serve_init() -> State`: it makes the server's state, which the host keeps")
+                        .with_note("the server host calls `serve_init` once, then passes its result to `serve` (§12)"),
+                );
+            }
+            return ok;
+        }
+        let takes_state = state.is_some_and(|s| def.params.first().is_some_and(|p| p.ty == s));
+        let rest = if takes_state { &def.params[1..] } else { &def.params[..] };
+        let ok = rest.len() == 1
+            && rest[0].ty == t.f32
+            && rest[0].mode == Mode::Borrow
+            && (takes_state || state.is_none())
+            && (!takes_state || def.params[0].mode == Mode::Mut)
+            && def.ret == t.unit
+            && def.ret_mode == RetMode::Owned
+            && !generic;
+        if !ok {
+            let msg = match state {
+                Some(s) => format!(
+                    "`serve`'s signature is `serve(state: mut {}, time: f32)`, with no result: the server host calls it when something happens",
+                    self.checked.program.display_ty(s)
+                ),
+                None => "`serve`'s signature is `serve(time: f32)`, with no result: the server host calls it when something happens".into(),
+            };
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
+                    .with_note("a server program exports `serve`, and `serve_init` for its state; it reads what happened as events (§12)"),
+            );
+        }
+        ok
+    }
+
     /// E0703 for a program that doesn't export `frame`, which every host calls: at a private
     /// `frame`, else at the start of main.wrela.
     fn no_frame(&mut self) {
@@ -872,15 +929,20 @@ const MAX_INSTANCE_DEPTH: u32 = 256;
 
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
-/// The program's `init` (§12): `pub fn init() -> S` in main.wrela, and its state type `S`.
-fn state_type(checked: &Checked) -> Option<(FnId, TyId)> {
+/// The program's `init` (§12): `pub fn init() -> S` in main.wrela, and its state type `S`; for
+/// a server build, its `serve_init`.
+fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
     let p = &checked.program;
     let main = p.main?;
+    let init = match role {
+        wrela_sema::defs::Role::Client => wrela_abi::EXPORT_INIT,
+        wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE_INIT,
+    };
     p.fns.iter().enumerate().find_map(|(i, f)| {
         (f.module == main
             && f.public
             && f.owner == wrela_sema::defs::FnOwner::Free
-            && f.name == wrela_abi::EXPORT_INIT
+            && f.name == init
             && f.params.is_empty()
             && f.generics.is_empty()
             && !p.types.is_unit(f.ret))

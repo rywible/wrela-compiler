@@ -32,13 +32,41 @@ pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
 /// `MAX_WGSL_BYTES`.
 pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
-    emit_in(l, sources, simd, budgets, true)
+    emit_in(l, sources, simd, budgets, true, true)
+}
+
+/// A server build's files (language.md §12): `server/game.wasm` alone, with a memory of its
+/// own (not shared: a server build runs on one thread, and its host caps the memory of each
+/// instance). It has no pipelines and no browser runtime.
+pub fn emit_server(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
+    let mut out = emit_in(l, sources, simd, false, false, false);
+    out.files.retain(|(path, _)| path == "game.wasm");
+    for (path, _) in &mut out.files {
+        *path = SERVER_WASM.to_string();
+    }
+    out
+}
+
+/// Where a server build's module is, in the build's directory.
+pub const SERVER_WASM: &str = "server/game.wasm";
+
+/// Puts the program's pair id ([`wrela_abi::pair_id`]) into each of its builds' modules, as
+/// the custom section [`wrela_abi::PAIR_SECTION`]: `client` and `server` are their bytes.
+pub fn pair(client: Option<&mut Vec<u8>>, server: Option<&mut Vec<u8>>) {
+    let id = wrela_abi::pair_id(
+        client.as_deref().map(|w| w.as_slice()),
+        server.as_deref().map(|w| w.as_slice()),
+    );
+    for wasm in [client, server].into_iter().flatten() {
+        let bytes = std::mem::take(wasm);
+        *wasm = wrela_wasm::with_custom_section(bytes, wrela_abi::PAIR_SECTION, &id.to_le_bytes());
+    }
 }
 
 /// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    emit_in(l, sources, simd, false, false)
+    emit_in(l, sources, simd, false, false, true)
 }
 
 fn emit_in(
@@ -47,11 +75,12 @@ fn emit_in(
     simd: bool,
     budgets: bool,
     shaders: bool,
+    shared_memory: bool,
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
-    let options = wrela_wasm::Options { simd, ..wrela_wasm::Options::default() };
+    let options = wrela_wasm::Options { simd, shared_memory };
     match wrela_wasm::emit_with(&l.cpu, options) {
         Ok(out) => {
             // Where each part of the code came from, as `file:line:column`, for trap messages.

@@ -645,6 +645,25 @@ pub struct ParamSig {
     pub is_self: bool,
 }
 
+/// Which host runs a build (language.md §12): a client's (the browser's, with a screen) or a
+/// server's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Role {
+    #[default]
+    Client,
+    Server,
+}
+
+impl Role {
+    /// As diagnostics name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Role::Client => "client",
+            Role::Server => "server",
+        }
+    }
+}
+
 /// A GPU entry point (§12).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Entry {
@@ -719,6 +738,8 @@ pub struct FnAttrs {
     pub effects: Vec<crate::effects::Effect>,
     /// `@job`: a job, whose body runs over several frames, to each `yield` (§6.18).
     pub job: Option<Span>,
+    /// `@client` or `@server`: only that role's build may run it (§12).
+    pub role: Option<(Role, Span)>,
 }
 
 /// What a job's value holds (§6.18): where it stopped, and each local of its memory IR that owns

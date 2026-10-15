@@ -1,0 +1,27 @@
+// Code that only one role's build may run, reached from the other role's entries. A program's
+// client build runs `init` and `frame` and what they reach; its server build runs `serve_init`
+// and `serve` and what they reach. `@client` and `@server` mark what belongs to one role (std's
+// screen passes, `present`, audio and the ticker are the client's), and a server records no GPU
+// work. Move the call to the role it belongs to.
+// ---- wrong
+@server
+fn save(n: u32) -> u32 {
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = save(width)
+}
+
+pub fn serve(time: f32) {}
+// ---- fixed
+@server
+fn save(n: u32) -> u32 {
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+pub fn serve(time: f32) {
+    let _ = save(3)
+}

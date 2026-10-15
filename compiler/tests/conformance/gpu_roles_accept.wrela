@@ -1,0 +1,27 @@
+// accepts: gpu.roles
+// A client and a server in one program: each build runs its own entries, and code both call
+// is in both.
+struct Room: Clone {
+    edits: u32,
+}
+
+fn next(n: u32) -> u32 {
+    n + 1
+}
+
+@server
+fn keep(room: mut Room) {
+    room.edits = next(room.edits)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = next(width)
+}
+
+pub fn serve_init() -> Room {
+    Room { edits: 0 }
+}
+
+pub fn serve(room: mut Room, time: f32) {
+    keep(mut room)
+}

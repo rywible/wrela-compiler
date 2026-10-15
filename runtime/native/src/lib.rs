@@ -31,6 +31,7 @@ mod handover;
 #[cfg(feature = "gpu")]
 pub mod image;
 mod program;
+pub mod server;
 mod shared;
 mod trace;
 

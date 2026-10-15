@@ -212,6 +212,10 @@ pub const RULES: &[(&str, &str)] = &[
     ),
     ("gpu.discard", "`discard()` drops a fragment, in fragment shaders only"),
     (
+        "gpu.roles",
+        "a client build runs `init` and `frame`, a server build `serve_init` and `serve`; `@client` and `@server` code stays in its role",
+    ),
+    (
         "gpu.buffer-modes",
         "a buffer the GPU writes is passed `mut`; buffers and spans bound together don't overlap",
     ),

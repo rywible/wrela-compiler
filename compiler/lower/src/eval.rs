@@ -57,6 +57,8 @@ pub struct BuildData {
     pub no_simd: bool,
     /// A lifted build's literals (language.md §22).
     pub lift: Option<crate::LiftTable>,
+    /// Which host runs the build (§12): its entries, and what it may reach.
+    pub role: wrela_sema::defs::Role,
 }
 
 /// The module the build runs to compute some constants.

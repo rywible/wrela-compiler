@@ -69,6 +69,7 @@ struct Ticker<S, F, H> {
 ///
 /// pub fn frame(state: mut u32, time: f32, width: u32, height: u32) {}
 /// ```
+@client
 pub fn start<S, F: @deterministic fn(mut S, Ticked), H: @deterministic fn(S) -> u64>(
     state: take S,
     hz: u32,

@@ -615,21 +615,46 @@ fn compile_loaded(
     }
     if !has_errors(&diagnostics) {
         let roots = roots(&checked);
-        let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
-        let ok = !has_errors(&d);
-        diagnostics.extend(d);
-        pipelines = summarize(&checked, &sources, &lowered);
-        if ok && mode.emit {
+        // Each role the program has is a build of its own, from that role's entries (§12).
+        for role in roles(&checked) {
+            data.role = role;
+            let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
+            let ok = !has_errors(&d);
+            diagnostics.extend(d);
+            if role == wrela_sema::defs::Role::Client {
+                pipelines = summarize(&checked, &sources, &lowered);
+            }
+            if !ok || !mode.emit {
+                continue;
+            }
+            if role == wrela_sema::defs::Role::Server {
+                let out = build::emit_server(&lowered, &sources, !data.no_simd);
+                diagnostics.extend(out.diagnostics);
+                files.extend(out.files);
+                continue;
+            }
             // A shipped build keeps its budgets; a test's, a debug, a lifted or a SIMD-less
             // one may go over.
             let budgets = !(mode.debug || mode.no_simd || mode.testing) && lift.is_empty();
             let out = build::emit(&lowered, &sources, !data.no_simd, budgets);
             diagnostics.extend(out.diagnostics);
-            files = out.files;
+            files.extend(out.files);
             files.append(&mut shipped_files);
             if let Some(t) = &data.lift {
                 files.push(("lift.json".into(), lift::report(&checked, &sources, t).into_bytes()));
             }
+        }
+        let mut client = None;
+        let mut server = None;
+        for (path, bytes) in &mut files {
+            match path.as_str() {
+                "game.wasm" => client = Some(bytes),
+                build::SERVER_WASM => server = Some(bytes),
+                _ => {}
+            }
+        }
+        if client.is_some() || server.is_some() {
+            build::pair(client, server);
         }
     }
     sort_and_dedup(&mut diagnostics);
@@ -638,6 +663,31 @@ fn compile_loaded(
     }
     let std_warnings = split_std_warnings(&sources, &mut diagnostics);
     Output { sources, diagnostics, std_warnings, files, pipelines, program_files, consts: stats }
+}
+
+/// The roles a program has (§12): a server's if main.wrela exports `serve`, a client's if it
+/// exports `frame`, or if it doesn't export `serve` (so a program with neither is told it needs
+/// `frame`).
+fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
+    use wrela_sema::defs::{FnOwner, Role};
+    let p = &checked.program;
+    let exports = |name: &str| {
+        p.main.is_some_and(|main| {
+            p.fns
+                .iter()
+                .any(|f| f.module == main && f.public && f.owner == FnOwner::Free && f.name == name)
+        })
+    };
+    let server = exports(wrela_abi::EXPORT_SERVE);
+    let client = exports(wrela_abi::EXPORT_FRAME) || !server;
+    let mut out = Vec::new();
+    if client {
+        out.push(Role::Client);
+    }
+    if server {
+        out.push(Role::Server);
+    }
+    out
 }
 
 /// Reads the files `embed` reads, then computes the constants the build computes, into `data`,

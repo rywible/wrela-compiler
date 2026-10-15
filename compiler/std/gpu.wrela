@@ -380,7 +380,8 @@ pub struct Depth: Copy {
 @intrinsic
 pub fn discard() {}
 
-/// Starts drawing to the screen, cleared to `clear`.
+/// Starts drawing to the screen, cleared to `clear`. A client's only: a server has no screen.
+@client
 pub fn begin_screen_pass(clear: vec4) -> ScreenPass {
     begin_screen_pass_command(clear)
     ScreenPass { open: true }
@@ -391,6 +392,7 @@ fn begin_screen_pass_command(clear: vec4) {}
 
 /// Ends the screen pass and shows it.
 @intrinsic
+@client
 pub fn present() {}
 
 /// An open pass: what a `draw` draws into (§12). Each kind of pass has it: `Pass<F>`,
@@ -991,7 +993,8 @@ pub fn begin_depth_pass(
 }
 
 /// Starts drawing to the screen, cleared to `clear`, with `depth` as its depth target (the
-/// screen's size).
+/// screen's size). A client's only.
+@client
 pub fn begin_screen_pass_with_depth(
     depth: mut DepthTexture,
     clear: vec4 = vec4(0.0, 0.0, 0.0, 1.0),

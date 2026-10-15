@@ -859,6 +859,23 @@ impl<'d, 'u> Collector<'d, 'u> {
                     self.no_args(a, codes::E0336);
                     out.job = Some(a.span);
                 }
+                "client" | "server" => {
+                    self.no_args(a, codes::E0204);
+                    let role = if name == "client" { Role::Client } else { Role::Server };
+                    if let Some((other, _)) = out.role
+                        && other != role
+                    {
+                        self.diags.push(
+                            Diagnostic::new(
+                                codes::E0204,
+                                a.name.span,
+                                "a function is `@client` or `@server`, not both",
+                            )
+                            .with_note("each marks what only that role's build may run (§12)"),
+                        );
+                    }
+                    out.role = Some((role, a.span));
+                }
                 "deterministic" | "audio" => {
                     self.no_args(a, codes::E0204);
                     if name == "deterministic" {
@@ -912,6 +929,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                         "test",
                         "testing",
                         "job",
+                        "client",
+                        "server",
                     ];
                     let mut d = Diagnostic::new(
                         codes::E0204,

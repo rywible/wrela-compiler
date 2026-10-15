@@ -1366,7 +1366,7 @@ fn host_effect(fl: &mut Fl, what: &str, span: Span) {
 
 /// `d`, with a note naming the call chain from the entry point down to the current function
 /// (`fill → helper → scratch`) when the current function isn't the entry point itself.
-fn with_call_chain(fl: &Fl, d: Diagnostic) -> Diagnostic {
+pub(crate) fn with_call_chain(fl: &Fl, d: Diagnostic) -> Diagnostic {
     let mut names = vec![fl.mb.display_name(fl.id)];
     let mut at = fl.id;
     while let Some(&(caller, _)) = fl.mb.callers.get(&at) {

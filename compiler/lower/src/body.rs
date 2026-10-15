@@ -1905,11 +1905,15 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
             }
             Rvalue::Dispatch(d) => {
-                crate::gpu::lower_dispatch(self, d, span);
+                if !self.gpu_in_server(span) {
+                    crate::gpu::lower_dispatch(self, d, span);
+                }
                 None
             }
             Rvalue::Draw(d) => {
-                crate::gpu::lower_draw(self, d, span);
+                if !self.gpu_in_server(span) {
+                    crate::gpu::lower_draw(self, d, span);
+                }
                 None
             }
         }
@@ -2278,6 +2282,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 self.call_callable(&callable, &srcs, &c.args, span)
             }
             mir::Callee::Fn { func, args } => {
+                self.check_role(*func, span);
                 let substs: Vec<TyId> = args.iter().map(|&a| self.concrete(a)).collect();
                 if self.cx.checked.program.func(*func).attrs.intrinsic {
                     if let Some(l) = self.cx.checked.program.func(*func).lang
@@ -2320,11 +2325,55 @@ impl<'c, 'a> Fl<'c, 'a> {
                     return None;
                 };
                 if program.func(func).attrs.intrinsic {
+                    self.check_role(func, span);
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);
                 }
+                self.check_role(func, span);
                 self.call_fn(func, substs, &c.args, span)
             }
         }
+    }
+
+    /// E0708 for a call, in a CPU module, to what only the other role's build may run (§12):
+    /// a function marked `@client` or `@server`, wherever the call chain from the build's
+    /// entries reaches it (through generics and closures too, as it's checked per instance).
+    fn check_role(&mut self, func: FnId, span: Span) {
+        if self.mb.gpu.is_some() {
+            return;
+        }
+        let role = self.cx.data.role;
+        let Some((only, _)) = self.cx.checked.program.func(func).attrs.role else { return };
+        if only == role {
+            return;
+        }
+        let name = self.cx.checked.program.fn_display_name(func);
+        let d = Diagnostic::new(
+            wrela_diag::codes::E0708,
+            span,
+            format!(
+                "`{name}` runs only in a {} build, and this is the {} build's code",
+                only.name(),
+                role.name()
+            ),
+        )
+        .with_note("a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve` and what they reach (§12)");
+        self.cx.err(crate::gpu::with_call_chain(self, d));
+    }
+
+    /// E0708 for GPU work recorded by a server build's code, which runs where there's no GPU
+    /// (§12): whether it was.
+    fn gpu_in_server(&mut self, span: Span) -> bool {
+        if self.mb.gpu.is_some() || self.cx.data.role != wrela_sema::defs::Role::Server {
+            return false;
+        }
+        let d = Diagnostic::new(
+            wrela_diag::codes::E0708,
+            span,
+            "GPU work in the server build's code: a server has no GPU",
+        )
+        .with_note("a server build runs `serve_init` and `serve` and what they reach (§12)");
+        self.cx.err(crate::gpu::with_call_chain(self, d));
+        true
     }
 
     /// A callee's result: its type, and whether it's a pointer to a place. The function being

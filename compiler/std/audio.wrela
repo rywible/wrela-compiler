@@ -33,7 +33,8 @@ pub(package) struct Voice<S, R> {
 /// `QUANTUM` samples at `SAMPLE_RATE`, to fill. `state` moves to the audio thread for good, and
 /// `render` with it, so it's a function, or a closure that captures nothing; send the voice
 /// events through a `ring`, whose reader it holds. A program has one voice: a second `play`
-/// traps.
+/// traps. A client's only (§12).
+@client
 pub fn play<S, R: @audio fn(mut S, mut [f32], mut [f32])>(state: take S, render: R) {
     unsafe {
         let voice = place(Voice { state, render, left: [0.0; QUANTUM], right: [0.0; QUANTUM] })

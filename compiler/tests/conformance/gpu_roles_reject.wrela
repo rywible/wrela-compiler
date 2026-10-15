@@ -1,0 +1,12 @@
+// rejects: gpu.roles
+// What only the server runs, reached from the client's `frame`.
+@server
+fn keep(n: u32) -> u32 {
+    n
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = keep(width) //~ E0708
+}
+
+pub fn serve(time: f32) {}
