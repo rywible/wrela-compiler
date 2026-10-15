@@ -41,6 +41,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::hash", include_str!("../../std/hash.wrela")),
     ("std::serialize", include_str!("../../std/serialize.wrela")),
     ("std::pack", include_str!("../../std/pack.wrela")),
+    ("std::net", include_str!("../../std/net.wrela")),
     ("std::par", include_str!("../../std/par.wrela")),
     ("std::audio", include_str!("../../std/audio.wrela")),
     ("std::tick", include_str!("../../std/tick.wrela")),
