@@ -12,6 +12,7 @@ import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./inp
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
 import { Live } from "./live.ts";
+import { type Inbox, Net } from "./net.ts";
 import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
@@ -52,9 +53,20 @@ let failed = false;
 /** Input events from the main thread (input.ts). */
 let ring: InputRing | null = null;
 
-/** Gives the program the events the main thread has written: it reads them in its next call.
- * Their times, for the latency test. */
+/** The program's connections: one set for the page, which a reload to another program closes.
+ * Its server is in `net.json` beside the running build. */
+const net = new Net(
+  () => buildBase,
+  (line) => {
+    console.warn(`wrela: ${line}`);
+    hostLine?.(line);
+  },
+);
+
+/** Gives the program the events the main thread has written, and what its connections had: it
+ * reads them in its next call. The input's times, for the latency test. */
 function deliverInput(program: Program): readonly number[] {
+  net.deliver(program.inbox);
   if (!ring) return [];
   const { events, times } = ring.read();
   program.queueInput(events);
@@ -166,7 +178,7 @@ const helpers: Worker[] = [];
  * and its ticks to run again. */
 interface Carried {
   kept: Uint8Array;
-  input: Uint8Array[];
+  inbox: Inbox;
   replay: Replay | null;
 }
 
@@ -181,7 +193,8 @@ function programOptions(b: Build, ticks: TickSettings, carried: Carried | null):
     startVoice,
     startTicker: tickerStarter(b.wasm, ticks, carried?.replay ?? null),
     kept: carried?.kept,
-    input: carried?.input,
+    inbox: carried?.inbox,
+    net,
   };
 }
 
@@ -203,7 +216,7 @@ async function stop(old: Program, frames: number, replaying: boolean): Promise<C
   stopHelpers();
   (old.executor as GpuExecutor).destroyAll();
   newTicker(frames);
-  return { kept: old.keeping, input: old.unreadInput, replay };
+  return { kept: old.keeping, inbox: old.inbox, replay };
 }
 
 function stopHelpers(): void {
@@ -585,7 +598,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       // The ticker's thread reports its trap (`tickerStarter`).
       if (control.failed) return;
     }
-    for (const e of frameEvents.get(i) ?? []) r.program.queueInput(e);
+    for (const e of frameEvents.get(i) ?? []) r.program.queueScripted(e);
     if (params.clip > 0 && i === params.clipfrom) self.postMessage({ type: "clip-start" } satisfies FromWorker);
     if (params.clip > 0 && i === params.clipfrom + params.clip) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
     record.latency.frames.push(epochNow());

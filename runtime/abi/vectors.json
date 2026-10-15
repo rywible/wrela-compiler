@@ -1446,6 +1446,19 @@
         "0700000000000000ff000000000000000000000000000000"
       ],
       "name": "every kind",
+      "payloads": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
       "script": "[\n  {\"frame\": 0, \"type\": \"move\", \"x\": 10.5, \"y\": 20},\n  {\"frame\": 1, \"type\": \"down\", \"x\": 10.5, \"y\": 20, \"button\": \"secondary\", \"shift\": true},\n  {\"frame\": 1, \"type\": \"up\", \"x\": 11, \"y\": 21, \"alt\": true},\n  {\"frame\": 2, \"type\": \"wheel\", \"x\": 1, \"y\": 2, \"dx\": -3, \"dy\": 120.25},\n  {\"frame\": 3, \"type\": \"key\", \"key\": \"Tab\", \"ctrl\": true, \"meta\": true},\n  {\"frame\": 3, \"type\": \"keydown\", \"key\": \"KeyA\", \"repeat\": true},\n  {\"frame\": 3, \"type\": \"keyup\", \"key\": \"KeyA\"},\n  {\"frame\": 4, \"type\": \"text\", \"text\": \"aéÿ\"}\n]"
     },
     {
@@ -1464,6 +1477,13 @@
         "080000000000000000000000000000000000000000000000"
       ],
       "name": "a pad's events",
+      "payloads": [
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
       "script": "[\n  {\"tick\": 1, \"type\": \"padaxis\", \"axis\": \"lefty\", \"value\": -0.75},\n  {\"tick\": 2, \"type\": \"padbutton\", \"pad\": 2, \"button\": \"righttrigger\", \"pressed\": true, \"value\": 0.5},\n  {\"tick\": 3, \"type\": \"padpress\", \"button\": \"east\"},\n  {\"tick\": 4, \"type\": \"padbutton\", \"button\": \"south\", \"pressed\": false}\n]"
     },
     {
@@ -1478,7 +1498,59 @@
         "09000000000000000200000001000000000080bf00000000"
       ],
       "name": "whole pad numbers with decimal and exponent syntax",
+      "payloads": [
+        "",
+        "",
+        ""
+      ],
       "script": "[\n  {\"tick\": 0, \"type\": \"padpress\", \"button\": \"east\", \"pad\": 1.0},\n  {\"tick\": 1, \"type\": \"padaxis\", \"axis\": \"lefty\", \"value\": -1, \"pad\": 2e0}\n]"
+    },
+    {
+      "at": [
+        "frame 0",
+        "frame 1",
+        "frame 1",
+        "frame 2"
+      ],
+      "events": [
+        "0e0000000000000003000000010000000000000000000000",
+        "0d0000000000000003000000000000000000000003000000",
+        "0d0000000000000000000000000000000000000003000000",
+        "0e0000000000000003000000000000000000000000000000"
+      ],
+      "name": "a connection's events",
+      "payloads": [
+        "",
+        "00ff07",
+        "68c3a9",
+        ""
+      ],
+      "script": "[\n  {\"frame\": 0, \"type\": \"connection\", \"conn\": 3, \"open\": true},\n  {\"frame\": 1, \"type\": \"message\", \"conn\": 3, \"bytes\": [0, 255, 7.0]},\n  {\"frame\": 1, \"type\": \"message\", \"text\": \"hé\"},\n  {\"frame\": 2, \"type\": \"connection\", \"conn\": 3, \"open\": false}\n]"
+    },
+    {
+      "error": "event 0: a tick has no network events: give a message or a connection a `frame`",
+      "name": "a tick's message",
+      "script": "[{\"tick\": 0, \"type\": \"message\", \"bytes\": []}]"
+    },
+    {
+      "error": "event 0: a message has `bytes` or `text`",
+      "name": "a message with no bytes or text",
+      "script": "[{\"frame\": 0, \"type\": \"message\"}]"
+    },
+    {
+      "error": "event 0: `bytes` is an array of numbers from 0 to 255",
+      "name": "a byte past 255",
+      "script": "[{\"frame\": 0, \"type\": \"message\", \"bytes\": [256]}]"
+    },
+    {
+      "error": "event 0: `open` is missing",
+      "name": "a connection with no open",
+      "script": "[{\"frame\": 0, \"type\": \"connection\", \"conn\": 1}]"
+    },
+    {
+      "error": "event 0: `conn` must be a whole number",
+      "name": "a fractional connection",
+      "script": "[{\"frame\": 0, \"type\": \"connection\", \"conn\": 0.5, \"open\": true}]"
     },
     {
       "error": "a script is a JSON array of events",
@@ -1519,6 +1591,12 @@
         "070000000000000071000000000000000000000000000000"
       ],
       "name": "ticks and frames",
+      "payloads": [
+        "",
+        "",
+        "",
+        ""
+      ],
       "script": "[{\"tick\": 3, \"type\": \"key\", \"key\": \"Space\"}, {\"frame\": 0, \"type\": \"move\"}, {\"tick\": 3, \"type\": \"text\", \"text\": \"q\"}]"
     },
     {
@@ -1532,7 +1610,7 @@
       "script": "[{\"frame\": 2, \"tick\": 1, \"type\": \"move\"}]"
     },
     {
-      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)",
+      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)",
       "name": "an unknown type",
       "script": "[{\"frame\": 0, \"type\": \"jump\"}]"
     },

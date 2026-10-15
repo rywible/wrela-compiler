@@ -1,0 +1,80 @@
+// A room's client and its server in one program (language.md §12): the client proposes a tag,
+// joins room `chrome` of its server, and prints the room's tags once it has two (the server has
+// another peer's, from before it joined).
+use platform::net::{send, serve_room}
+use std::input::{Event, events, payload}
+use std::io::print
+use std::net::{Entry, Log, Reduce, Room, Verdict}
+use std::pack::Pack
+
+struct Tags: Clone + Pack {
+    all: Vec<u32>,
+}
+
+impl Reduce<u32> for Tags {
+    fn check(self, entry: Entry<u32>) -> Verdict {
+        if entry.value % 7 == 0 { Verdict::Reject(7) } else { Verdict::Accept }
+    }
+
+    fn apply(mut self, entry: Entry<u32>) {
+        self.all.push(entry.value)
+    }
+}
+
+pub struct State {
+    log: Log<Tags, u32>,
+    frames: u32,
+    told: bool,
+}
+
+pub fn init() -> State {
+    var log: Log<Tags, u32> = Log::new(Tags { all: Vec::new() }, 77)
+    let _ = log.propose(10)
+    State { log, frames: 0, told: false }
+}
+
+fn send_all(conn: u32, out: Vec<Vec<u8>>) {
+    for m in out {
+        send(conn, m)
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frames == 0 {
+        platform::net::open(1, "chrome")
+    }
+    s.frames += 1
+    for e in events() {
+        match e {
+            Event::Connection { conn, open } => {
+                if open {
+                    send_all(conn, s.log.connect())
+                } else {
+                    s.log.disconnect()
+                    print("closed")
+                }
+            },
+            Event::Message { conn, .. } => {
+                let Some(bytes) = payload(e) else { continue }
+                match s.log.receive(take bytes) {
+                    Ok(out) => send_all(conn, out),
+                    Err(why) => print(f"refused {why}"),
+                }
+            },
+            _ => {},
+        }
+    }
+    borrow all = s.log.committed().all
+    if !s.told && all.len() == 2 {
+        print(f"tags {all[0]} {all[1]}")
+        s.told = true
+    }
+}
+
+pub fn serve_init() -> Room<Tags, u32> {
+    Room::new(Tags { all: Vec::new() })
+}
+
+pub fn serve(room: mut Room<Tags, u32>, time: f32) {
+    serve_room(mut room, u64(time * 1000.0))
+}

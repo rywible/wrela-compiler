@@ -53,29 +53,45 @@ export function padAxisEvent(pad: number, axis: number, value: number): Uint8Arr
 /** When a script's event arrives: before a frame, or as a tick's record (runtime/abi `input`). */
 export type At = { frame: number } | { tick: number };
 
-/** A script's event and when it arrives. */
+/** A message from connection `conn`, of `length` bytes, its serial `serial` (runtime/abi
+ * `input`'s Messages). */
+export const messageEvent = (conn: number, serial: number, length: number) =>
+  encodeEvent(EventKind.Message, 0, conn, serial % 2 ** 32, Math.floor(serial / 2 ** 32), length);
+
+/** Connection `conn` opened, or closed. */
+export const connectionEvent = (conn: number, open: boolean) => encodeEvent(EventKind.Connection, 0, conn, open ? 1 : 0, 0, 0);
+
+/** Whether an event (its bytes) is a network event: a message or a connection's. */
+export function isNetwork(event: Uint8Array): boolean {
+  const kind = new DataView(event.buffer, event.byteOffset, 4).getUint32(0, true);
+  return kind === EventKind.Message || kind === EventKind.Connection;
+}
+
+/** A script's event and when it arrives; a message's bytes (its serial is given when it's
+ * queued). */
 export interface Scripted {
   at: At;
   event: Uint8Array;
+  payload?: Uint8Array;
 }
 
 /** A script's events by when they arrive, each list oldest first: by the frame they arrive
  * before, and by the tick whose records they are. */
 export interface Arrivals {
-  frames: Map<number, Uint8Array[]>;
-  ticks: Map<number, Uint8Array[]>;
+  frames: Map<number, Scripted[]>;
+  ticks: Map<number, Scripted[]>;
 }
 
 /** The events of `script` by when they arrive: grouped once, so a frame or tick finds its own at
  * once. */
 export function arrivals(script: Scripted[]): Arrivals {
-  const frames = new Map<number, Uint8Array[]>();
-  const ticks = new Map<number, Uint8Array[]>();
-  for (const { at, event } of script) {
-    const [map, key] = "frame" in at ? [frames, at.frame] : [ticks, at.tick];
+  const frames = new Map<number, Scripted[]>();
+  const ticks = new Map<number, Scripted[]>();
+  for (const s of script) {
+    const [map, key] = "frame" in s.at ? [frames, s.at.frame] : [ticks, s.at.tick];
     const list = map.get(key);
-    if (list === undefined) map.set(key, [event]);
-    else list.push(event);
+    if (list === undefined) map.set(key, [s]);
+    else list.push(s);
   }
   return { frames, ticks };
 }
@@ -159,6 +175,15 @@ export function parseScript(text: string): Scripted[] {
       return i;
     };
     const push = (event: Uint8Array) => out.push({ at: when, event });
+    // A connection's number: 0 if it's left out.
+    const conn = () => {
+      if (o.conn === undefined) return 0;
+      if (!whole(o.conn)) throw at("`conn` must be a whole number");
+      return o.conn as number;
+    };
+    if ((type === "message" || type === "connection") && "tick" in when) {
+      throw at("a tick has no network events: give a message or a connection a `frame`");
+    }
     switch (type) {
       case "move":
         push(pointerEvent(EventKind.PointerMove, num("x"), num("y"), 0, modifiers));
@@ -216,8 +241,33 @@ export function parseScript(text: string): Scripted[] {
         push(padAxisEvent(p, a, value));
         break;
       }
+      case "message": {
+        const c = conn();
+        let payload: Uint8Array;
+        if (o.bytes !== undefined && o.text === undefined) {
+          const b = o.bytes;
+          if (!Array.isArray(b) || !b.every((x) => typeof x === "number" && Number.isInteger(x) && x >= 0 && x < 256)) {
+            throw at("`bytes` is an array of numbers from 0 to 255");
+          }
+          payload = new Uint8Array(b as number[]);
+        } else if (o.text !== undefined && o.bytes === undefined) {
+          if (typeof o.text !== "string") throw at("`text` must be a string");
+          payload = new TextEncoder().encode(o.text);
+        } else {
+          throw at("a message has `bytes` or `text`");
+        }
+        out.push({ at: when, event: messageEvent(c, 0, payload.length), payload });
+        break;
+      }
+      case "connection": {
+        const c = conn();
+        if (o.open === undefined) throw at("`open` is missing");
+        if (typeof o.open !== "boolean") throw at("`open` must be true or false");
+        push(connectionEvent(c, o.open));
+        break;
+      }
       default:
-        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)`);
+        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)`);
     }
   });
   return out;

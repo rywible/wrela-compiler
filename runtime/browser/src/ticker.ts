@@ -15,7 +15,7 @@
 import { EVENT_SIZE, EXPORT_TICK, MAX_TICK_RECORDS, THREAD_TICK, TICK_HASH, TICK_ORIGIN, TICK_RECORDS } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
 import { VisibleClock } from "./frame.ts";
-import { type Arrivals, arrivals, epochNow, InputRing } from "./input.ts";
+import { type Arrivals, arrivals, epochNow, InputRing, isNetwork, type Scripted } from "./input.ts";
 import type { FromTicker, Replay, TickerStart, TickReport } from "./messages.ts";
 import { Lines } from "./lines.ts";
 import { otherInstance, TrapError, trapMessage } from "./program.ts";
@@ -202,7 +202,7 @@ export async function runTicker(start: TickerStart, post: (msg: FromTicker) => v
 /** Where a tick's records are, after their count. */
 const RECORDS = TICK_RECORDS + 4;
 /** A frame's or tick's script events, when the script has none. */
-const NONE: readonly Uint8Array[] = [];
+const NONE: readonly Scripted[] = [];
 
 class Ticker {
   readonly clock: VisibleClock;
@@ -361,8 +361,10 @@ class Ticker {
 
   /** Stamps `events` into this tick's records after the first `n`, as many as fit; the rest are
    * queued for the next tick. Returns how many records the tick has now. */
-  #stamp(events: readonly Uint8Array[], n: number): number {
-    for (const e of events) {
+  #stamp(events: readonly Scripted[], n: number): number {
+    for (const { event: e } of events) {
+      // The network is the frames', not the ticks' (runtime/abi `input`).
+      if (isNetwork(e)) continue;
       if (n < MAX_TICK_RECORDS) this.#bytes.set(e, RECORDS + n++ * EVENT_SIZE);
       else this.queue.push(e);
     }

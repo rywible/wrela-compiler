@@ -42,6 +42,7 @@ import {
   IMPORT_AUDIO,
   IMPORT_INPUT,
   IMPORT_PAYLOAD,
+  PAIR_SECTION,
   IMPORT_KEEP,
   IMPORT_KEPT,
   IMPORT_CLOCK,
@@ -65,6 +66,8 @@ import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { CALLED_WHILE_STARTING, clockImport, phaseImport, printed, refusingImports } from "./imports.ts";
 import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
+import { Inbox, type Net } from "./net.ts";
+import type { Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
 import { functionTypes, type MemoryLimits } from "./wasm.ts";
@@ -339,7 +342,23 @@ export interface ProgramOptions {
   /** Hot reload: what the build this one replaces kept (`wrela.kept`), and its input not yet
    * read. */
   kept?: Uint8Array | undefined;
-  input?: Uint8Array[] | undefined;
+  inbox?: Inbox | undefined;
+  /** Its connections (`platform::net`): without them, `net/` requests fail as any request this
+   * host can't answer. */
+  net?: Pick<Net, "open" | "send" | "close" | "closeAll"> | undefined;
+}
+
+/** The pair id in a module's PAIR_SECTION, if it has one. */
+export function pairOf(module: WebAssembly.Module): bigint | null {
+  const [section] = WebAssembly.Module.customSections(module, PAIR_SECTION);
+  if (section === undefined || section.byteLength !== 8) return null;
+  return new DataView(section).getBigUint64(0, true);
+}
+
+/** A connection's number: the first word of a `net/` request's body. */
+function connOf(service: string, body: Bytes): number {
+  if (body.length < 4) throw new TrapError(`\`${service}\` needs a connection's number`);
+  return new DataView(body.buffer, body.byteOffset, 4).getUint32(0, true);
 }
 
 /** A loaded program and everything that happens to its batches. */
@@ -373,8 +392,9 @@ export class Program {
   readonly #io: Io | null;
   readonly #builds: Builds | null;
   readonly #onPrint: PrintSink | null;
-  /** Input events not yet read (`wrela.input`), EVENT_SIZE bytes each, oldest first. */
-  #input: Uint8Array[] = [];
+  /** Input events not yet read (`wrela.input`), with messages' bytes. */
+  readonly #inbox: Inbox;
+  readonly #net: ProgramOptions["net"] | null;
   /** What the replaced build kept (`wrela.kept`), and what this one keeps (`wrela.keep`). */
   readonly #kept: Uint8Array;
   #keeping = new Uint8Array(0);
@@ -391,7 +411,8 @@ export class Program {
     this.#startTicker = options.startTicker ?? null;
     this.#onPrint = options.onPrint ?? null;
     this.#kept = options.kept ?? new Uint8Array(0);
-    this.#input = options.input ? [...options.input] : [];
+    this.#inbox = options.inbox ?? new Inbox();
+    this.#net = options.net ?? null;
   }
 
   static async load(wasm: Bytes, checker: Checker, executor: Executor, options: ProgramOptions = {}): Promise<Program> {
@@ -425,6 +446,8 @@ export class Program {
       throw new ProgramError(`can't make its memory: ${errorMessage(e)}`);
     }
     const program = new Program(checker, executor, options);
+    // Network events queued for another program's build go, and so do its connections.
+    if (program.#inbox.forBuild(pairOf(module))) program.#net?.closeAll();
     const clock = clockImport(memory);
     const phase = phaseImport(memory);
     try {
@@ -445,12 +468,7 @@ export class Program {
         },
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),
         [IMPORT_INPUT]: (ptr: number, cap: number) => program.#inputImport(ptr >>> 0, cap >>> 0),
-        // A message's bytes (runtime/abi `input`'s Messages): this host has no connections yet,
-        // so it gives no message, and every serial is unknown.
-        [IMPORT_PAYLOAD]: (_lo: number, _hi: number, _ptr: number, _cap: number) => {
-          program.#starting();
-          return -1;
-        },
+        [IMPORT_PAYLOAD]: (lo: number, hi: number, ptr: number, cap: number) => program.#payloadImport(lo >>> 0, hi >>> 0, ptr >>> 0, cap >>> 0),
         [IMPORT_TICK]: (task: number, context: number, hz: number) => program.#tickImport(task >>> 0, context >>> 0, hz >>> 0),
         [IMPORT_KEEP]: (ptr: number, len: number) => program.#keepImport(ptr >>> 0, len >>> 0),
         [IMPORT_KEPT]: (ptr: number, cap: number) => program.#keptImport(ptr >>> 0, cap >>> 0),
@@ -576,6 +594,10 @@ export class Program {
         return;
       }
       case "HostRequest": {
+        if (this.#net && cmd.service.startsWith("net/")) {
+          this.#netCommand(cmd.service, cmd.body);
+          return;
+        }
         const body = cmd.body.slice();
         const host = io?.hostRequest;
         this.#requests.start(cmd.op, cmd.request, host ? () => host.call(io, cmd.service, body) : none("host capabilities"));
@@ -598,6 +620,37 @@ export class Program {
       }
       default:
         return;
+    }
+  }
+
+  /** A network command (`platform::net`): carried out at once and never answered, so it holds
+   * nothing for the program to take. */
+  #netCommand(service: string, body: Bytes): void {
+    const net = this.#net!;
+    switch (service) {
+      case "net/open": {
+        let room: string;
+        try {
+          // A copy: the body is a view into the program's shared memory, which a decoder refuses.
+          room = new TextDecoder("utf-8", { fatal: true }).decode(body.slice(4));
+        } catch {
+          throw new TrapError("`net/open`'s room isn't UTF-8");
+        }
+        try {
+          net.open(connOf(service, body), room);
+        } catch (e) {
+          throw new TrapError(errorMessage(e));
+        }
+        return;
+      }
+      case "net/send":
+        net.send(connOf(service, body), body.slice(4));
+        return;
+      case "net/close":
+        net.close(connOf(service, body));
+        return;
+      default:
+        throw new TrapError(`\`${service}\` isn't a network command this host has`);
     }
   }
 
@@ -650,21 +703,40 @@ export class Program {
    * on (runtime/abi `input`). */
   queueInput(events: Uint8Array): void {
     for (let at = 0; at + EVENT_SIZE <= events.length; at += EVENT_SIZE) {
-      this.#input.push(events.slice(at, at + EVENT_SIZE));
+      this.#inbox.push(events.slice(at, at + EVENT_SIZE));
     }
+  }
+
+  /** Queues a script's event: a message with its bytes. */
+  queueScripted(s: Scripted): void {
+    if (s.payload === undefined) this.#inbox.push(s.event);
+    else this.#inbox.pushMessage(new DataView(s.event.buffer, s.event.byteOffset, EVENT_SIZE).getUint32(8, true), s.payload);
   }
 
   /** `wrela.input(ptr, cap) -> count`: copies up to `cap` queued events to `ptr`. */
   #inputImport(ptr: number, cap: number): number {
     this.#starting();
-    const n = Math.min(cap, this.#input.length);
+    const n = Math.min(cap, this.#inbox.length);
     const memory = new Uint8Array(this.#memory!.buffer);
     if (ptr + n * EVENT_SIZE > memory.length) {
       throw new TrapError(`input(${ptr}, ${cap}) reaches past the end of the program's memory`);
     }
-    for (let i = 0; i < n; i++) memory.set(this.#input[i]!, ptr + i * EVENT_SIZE);
-    this.#input.splice(0, n);
-    return n;
+    const events = this.#inbox.take(n);
+    events.forEach((e, i) => memory.set(e, ptr + i * EVENT_SIZE));
+    return events.length;
+  }
+
+  /** `wrela.payload(serial_lo, serial_hi, ptr, cap) -> length`: copies up to `cap` of a message's
+   * bytes to `ptr`, if this call was given it; -1 if it wasn't. */
+  #payloadImport(lo: number, hi: number, ptr: number, cap: number): number {
+    this.#starting();
+    const bytes = this.#inbox.payload(lo + hi * 2 ** 32);
+    if (bytes === undefined) return -1;
+    const n = Math.min(bytes.length, cap);
+    const memory = new Uint8Array(this.#memory!.buffer);
+    if (ptr + n > memory.length) throw new TrapError(`payload(.., ${ptr}, ${cap}) reaches past the end of the program's memory`);
+    memory.set(bytes.subarray(0, n), ptr);
+    return bytes.length;
   }
 
   /** `wrela.keep(ptr, len)`: keeps those bytes for the build that replaces this one. */
@@ -694,8 +766,8 @@ export class Program {
     return this.#keeping;
   }
 
-  get unreadInput(): Uint8Array[] {
-    return this.#input;
+  get inbox(): Inbox {
+    return this.#inbox;
   }
 
   /** Hot reload of a literal: in a lifted build, literal `i` takes `value` from the next call
@@ -835,11 +907,13 @@ export class Program {
     try {
       result = f();
     } catch (e) {
+      this.#inbox.endCall();
       const failure = this.#failure;
       this.#failure = null;
       if (failure !== null) throw failure;
       throw new TrapError(trapMessage(e, this.#memory, THREAD_MAIN, this.#lines));
     }
+    this.#inbox.endCall();
     // A module can catch the exception a failed submit throws (WASM exception handling) and
     // return as if nothing happened: the call fails anyway.
     const failure = this.#failure;

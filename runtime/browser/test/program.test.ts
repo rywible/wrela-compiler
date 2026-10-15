@@ -657,6 +657,31 @@ describe("requests", () => {
     expect(() => invalid.call("ask")).toThrow("HostRequest failed");
   });
 
+  test("network commands go to the connections at once, and are never answered", async () => {
+    const word = (x: number) => Uint8Array.of(x & 255, (x >> 8) & 255, (x >> 16) & 255, x >>> 24);
+    const done: string[] = [];
+    const net = {
+      open: (conn: number, room: string) => void done.push(`open ${conn} ${room}`),
+      send: (conn: number, bytes: Uint8Array) => void done.push(`send ${conn} ${[...bytes].join(",")}`),
+      close: (conn: number) => void done.push(`close ${conn}`),
+      closeAll: () => void done.push("all"),
+    };
+    const batch = new Encoder()
+      .hostRequest(4, "net/open", Uint8Array.of(...word(7), ...new TextEncoder().encode("board-1")))
+      .hostRequest(5, "net/send", Uint8Array.of(...word(7), 1, 2, 3))
+      .hostRequest(6, "net/close", word(7))
+      .finish();
+    const p = await program(batch, { net });
+    p.call("ask");
+    expect(done).toEqual(["open 7 board-1", "send 7 1,2,3", "close 7"]);
+    await later();
+    expect(p.call("status")).toBe(-1);
+    const short = await program(new Encoder().hostRequest(4, "net/send", Uint8Array.of(1, 2)).finish(), { net });
+    expect(() => short.call("ask")).toThrow("`net/send` needs a connection's number");
+    const other = await program(new Encoder().hostRequest(4, "net/listen", word(1)).finish(), { net });
+    expect(() => other.call("ask")).toThrow("`net/listen` isn't a network command this host has");
+  });
+
   test("host capability methods retain their IO receiver", async () => {
     const io = {
       answer: Uint8Array.of(9, 8, 7, 6),
@@ -1100,5 +1125,42 @@ describe("input", () => {
     expect(p.call("take", 8)).toBe(0);
     p.queueInput(textEvent(120));
     expect(() => p.call("pastTheEnd")).toThrow("past the end of the program's memory");
+  });
+  const PAYLOAD = { module: "wrela", name: "payload", kind: "func" as const, type: { params: ["i32" as const, "i32" as const, "i32" as const, "i32" as const], results: ["i32" as const] } };
+  // `read(cap)` takes one event to 1024 and reads its message's bytes, up to `cap`, to 2048, in
+  // the same call; `again()` reads the same serial in a call of its own.
+  const serial = [...op.i32(1036), 0x28, 0x02, 0x00, ...op.i32(1040), 0x28, 0x02, 0x00];
+  const messages = buildModule({
+    imports: [INPUT, PAYLOAD],
+    memory: 1,
+    funcs: [
+      { type: FRAME_TYPE, body: [], export: "frame" },
+      { type: { params: ["i32"], results: ["i32"] }, body: [...op.i32(1024), ...op.i32(1), ...op.call(0), 0x1a, ...serial, ...op.i32(2048), 0x20, 0x00, ...op.call(1)], export: "read" },
+      { type: { params: [], results: ["i32"] }, body: [...serial, ...op.i32(2048), ...op.i32(64), ...op.call(1)], export: "again" },
+      { type: { params: ["i32"], results: ["i32"] }, body: [0x20, 0x00, 0x28, 0x02, 0x00], export: "word" },
+    ],
+  });
+
+  test("a message's bytes are read in the call given it, and no later", async () => {
+    const p = await Program.load(messages, checker(), new Recorder());
+    p.inbox.pushMessage(3, Uint8Array.of(9, 8, 7, 6, 5));
+    // Its length, whatever it copied.
+    expect(p.call("read", 2)).toBe(5);
+    expect(p.call("word", 1024)).toBe(13);
+    expect(p.call("word", 1028 + 4)).toBe(3);
+    // Two bytes copied, and no more.
+    expect(p.call("word", 2048)).toBe(0x0809);
+    expect(p.call("again")).toBe(-1);
+  });
+
+  test("a call is given messages up to a budget of bytes, the first whatever its size", async () => {
+    const { PAYLOAD_PER_CALL } = await import("../src/abi.gen.ts");
+    const { Inbox } = await import("../src/net.ts");
+    const inbox = new Inbox();
+    inbox.pushMessage(1, new Uint8Array(PAYLOAD_PER_CALL + 1));
+    inbox.pushMessage(1, new Uint8Array(1));
+    expect(inbox.take(8).length).toBe(1);
+    inbox.endCall();
+    expect(inbox.take(8).length).toBe(1);
   });
 });

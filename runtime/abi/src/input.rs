@@ -514,7 +514,12 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                         .as_array()
                         .and_then(|a| {
                             a.iter()
-                                .map(|x| x.as_u64().filter(|&v| v < 256).map(|v| v as u8))
+                                // As every number here: `1.0` is 1.
+                                .map(|x| {
+                                    x.as_f64()
+                                        .filter(|f| f.fract() == 0.0 && (0.0..256.0).contains(f))
+                                        .map(|f| f as u8)
+                                })
                                 .collect::<Option<Vec<u8>>>()
                         })
                         .ok_or_else(|| at("`bytes` is an array of numbers from 0 to 255"))?,
@@ -569,7 +574,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             }
             other => {
                 return Err(at(&format!(
-                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress or padaxis)"
+                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)"
                 )));
             }
         }

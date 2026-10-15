@@ -77,6 +77,10 @@ export const EXPORT_WORKER = "__worker";
 export const IMPORT_AUDIO = "audio";
 export const IMPORT_INPUT = "input";
 export const IMPORT_PAYLOAD = "payload";
+/** The payload bytes one call is given at most, past its first message. */
+export const PAYLOAD_PER_CALL = 1048576;
+/** The custom section that holds a program's pair id, which a client and its server share. */
+export const PAIR_SECTION = "wrela.pair";
 export const IMPORT_TICK = "tick";
 export const EXPORT_TICK = "__tick";
 /** Hot reload: what a host calls to change a lifted literal, and keeps for the next build. */

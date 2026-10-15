@@ -1,0 +1,5 @@
+[package]
+name = "rooms_client"
+
+[dependencies]
+platform = { path = "../../../platform" }

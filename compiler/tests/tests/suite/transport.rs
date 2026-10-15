@@ -1,6 +1,7 @@
 //! Rooms over the network (language.md §12, `wrela-serve`): WebTransport sessions at
 //! `/room/<name>`, one stream each, its messages framed by their length. The peers here are Rust
-//! WebTransport clients that trust the server's development certificate by its hash.
+//! WebTransport clients that trust the server's development certificate by its hash, and a
+//! program's client build in headless Chrome, which finds its server in `net.json`.
 
 use crate::rooms::{Down, down, hello, propose, wasm};
 use std::sync::Arc;
@@ -11,6 +12,11 @@ use wtransport::{ClientConfig, Endpoint};
 /// A server of the rooms' test program on a free port, its data in a fresh directory: the port
 /// and its certificate's hash.
 fn start(name: &str, runtime: &tokio::runtime::Runtime) -> (u16, [u8; 32]) {
+    start_build(name, wasm(), runtime)
+}
+
+/// A server of the server build `server` (its WASM), as [`start`] starts one.
+fn start_build(name: &str, server: &[u8], runtime: &tokio::runtime::Runtime) -> (u16, [u8; 32]) {
     let data =
         wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("transport-{name}"));
     let _ = std::fs::remove_dir_all(&data);
@@ -21,8 +27,8 @@ fn start(name: &str, runtime: &tokio::runtime::Runtime) -> (u16, [u8; 32]) {
         .port();
     let (identity, hash) = wrela_serve::dev_identity().expect("a certificate");
     let config = wrela_serve::Config {
-        build: Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build")),
-        build_hash: wrela_abi::ticks::wasm_hash(wasm()),
+        build: Arc::new(ServerBuild::from_wasm(server).expect("a server build")),
+        build_hash: wrela_abi::ticks::wasm_hash(server),
         data,
         port,
         identity,
@@ -136,4 +142,25 @@ fn a_frame_too_long_closes_the_connection_and_a_wrong_path_is_refused() {
         // A path that isn't a room's: refused.
         assert!(connect(port, hash, "/rooms/../x").await.is_err());
     });
+}
+
+#[test]
+fn a_browser_joins_a_room_over_webtransport() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/rooms-client", "rooms-client-chrome");
+    let server = std::fs::read(dir.join("server/game.wasm")).expect("the program's server build");
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash) = start_build("chrome", &server, &runtime);
+    std::fs::write(dir.join("net.json"), wrela_serve::net_json(port, Some(&hash)))
+        .expect("net.json");
+    // Another peer's tag is in the room first: the browser catches up to it.
+    runtime.block_on(async {
+        let mut a = connect(port, hash, "/room/chrome").await.expect("connects");
+        a.put(&hello(5, 1, 0, 0)).await;
+        assert_eq!(a.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+        a.put(&propose(1, 1, 1, 11)).await;
+        assert_eq!(a.next().await, Some(Down::Committed { seq: 1, counter: 1, value: 11 }));
+    });
+    let run = wrela_tests::run_in_chrome(&rel, 240, 16, 16, 60.0);
+    let printed: Vec<&str> = run.printed.iter().map(|(_, line)| line.as_str()).collect();
+    assert_eq!(printed, ["tags 11 10"], "the browser's log has the room's tags, its own committed");
 }

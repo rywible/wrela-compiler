@@ -212,6 +212,7 @@ describe("input scripts", () => {
       const events = parseScript(v.script);
       expect(events.map((e) => ("frame" in e.at ? `frame ${e.at.frame}` : `tick ${e.at.tick}`))).toEqual(v.at!);
       expect(events.map((e) => hex(e.event))).toEqual(v.events!);
+      expect(events.map((e) => hex(e.payload ?? new Uint8Array(0)))).toEqual(v.payloads!);
     });
   }
 });

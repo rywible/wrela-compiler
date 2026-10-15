@@ -1603,6 +1603,23 @@ fn input_scripts() -> Value {
   {"tick": 1, "type": "padaxis", "axis": "lefty", "value": -1, "pad": 2e0}
 ]"#,
         ),
+        (
+            "a connection's events",
+            r#"[
+  {"frame": 0, "type": "connection", "conn": 3, "open": true},
+  {"frame": 1, "type": "message", "conn": 3, "bytes": [0, 255, 7.0]},
+  {"frame": 1, "type": "message", "text": "hé"},
+  {"frame": 2, "type": "connection", "conn": 3, "open": false}
+]"#,
+        ),
+        ("a tick's message", r#"[{"tick": 0, "type": "message", "bytes": []}]"#),
+        ("a message with no bytes or text", r#"[{"frame": 0, "type": "message"}]"#),
+        ("a byte past 255", r#"[{"frame": 0, "type": "message", "bytes": [256]}]"#),
+        ("a connection with no open", r#"[{"frame": 0, "type": "connection", "conn": 1}]"#),
+        (
+            "a fractional connection",
+            r#"[{"frame": 0, "type": "connection", "conn": 0.5, "open": true}]"#,
+        ),
         ("not an array", "{}"),
         ("not JSON", "[{"),
         ("no frame", r#"[{"type": "move"}]"#),
@@ -1645,6 +1662,7 @@ fn input_scripts() -> Value {
                     })
                     .collect::<Vec<_>>(),
                 "events": events.iter().map(|e| hex(&e.event.bytes())).collect::<Vec<_>>(),
+                "payloads": events.iter().map(|e| hex(&e.payload)).collect::<Vec<_>>(),
             }),
             Err(e) => json!({ "name": name, "script": text, "error": e }),
         })

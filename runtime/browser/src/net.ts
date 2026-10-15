@@ -1,0 +1,288 @@
+// The network (language.md §12): the events a program reads, with messages' bytes, and its
+// connections to its server's rooms over WebTransport. A connection is one session at
+// `/room/<name>` of the server that `net.json` beside the build names, with one bidirectional
+// stream; each message on it is a frame: its length (a varint, at most MAX_FRAME), then its bytes.
+
+import { EVENT_SIZE, EventKind, PAYLOAD_PER_CALL } from "./abi.gen.ts";
+import { errorMessage } from "./errors.ts";
+import { connectionEvent, isNetwork, messageEvent } from "./input.ts";
+
+/** The largest frame, in bytes: as the server host's (`wrela-serve`). */
+export const MAX_FRAME = 64 * 1024;
+
+/**
+ * The events a program hasn't read, as the native host's `Queue` keeps them (runtime/abi
+ * `input`): a message's bytes are kept while its event is queued and during the call given it,
+ * then go; a serial is never given twice, so an old event's reads as unknown.
+ */
+export class Inbox {
+  readonly #events: Uint8Array[] = [];
+  readonly #payloads = new Map<number, Uint8Array>();
+  /** The serials of the messages the current call was given. */
+  #delivered: number[] = [];
+  #serial = 0;
+  /** The pair id of the build it serves, once it serves one. */
+  #pair: bigint | null | undefined = undefined;
+
+  /** Queues an event that isn't a message. */
+  push(event: Uint8Array): void {
+    this.#events.push(event);
+  }
+
+  /** Queues a message of `bytes` from connection `conn`: its serial. */
+  pushMessage(conn: number, bytes: Uint8Array): number {
+    const serial = ++this.#serial;
+    this.#events.push(messageEvent(conn, serial, bytes.length));
+    this.#payloads.set(serial, bytes);
+    return serial;
+  }
+
+  get length(): number {
+    return this.#events.length;
+  }
+
+  /** The events not read, oldest first. */
+  get events(): readonly Uint8Array[] {
+    return this.#events;
+  }
+
+  /** Up to `cap` events, oldest first; the rest stay queued. Messages stop once the call's bytes
+   * reach PAYLOAD_PER_CALL (the first is given whatever its size). */
+  take(cap: number): Uint8Array[] {
+    let given = 0;
+    for (const s of this.#delivered) given += this.#payloads.get(s)?.length ?? 0;
+    let n = 0;
+    for (; n < cap && n < this.#events.length; n++) {
+      const view = new DataView(this.#events[n]!.buffer, this.#events[n]!.byteOffset, EVENT_SIZE);
+      if (view.getUint32(0, true) !== EventKind.Message) continue;
+      const length = view.getUint32(20, true);
+      if (given > 0 && given + length > PAYLOAD_PER_CALL) break;
+      given += length;
+      // Words 3 and 4: the serial's low and high words.
+      this.#delivered.push(view.getUint32(12, true) + view.getUint32(16, true) * 2 ** 32);
+    }
+    return this.#events.splice(0, n);
+  }
+
+  /** The bytes of message `serial`, if the current call was given it. */
+  payload(serial: number): Uint8Array | undefined {
+    return this.#delivered.includes(serial) ? this.#payloads.get(serial) : undefined;
+  }
+
+  /** The call has returned (or trapped): the bytes of the messages it was given go. */
+  endCall(): void {
+    for (const s of this.#delivered) this.#payloads.delete(s);
+    this.#delivered = [];
+  }
+
+  /** It now serves the build whose pair id is `pair` (null: a build of no pair): if it served
+   * another program's build, its network events go, as their bytes were for that build's types.
+   * Whether they went. */
+  forBuild(pair: bigint | null): boolean {
+    const changed = this.#pair !== undefined && this.#pair !== pair;
+    if (changed) {
+      for (let i = this.#events.length - 1; i >= 0; i--) if (isNetwork(this.#events[i]!)) this.#events.splice(i, 1);
+      this.#delivered = [];
+      this.#payloads.clear();
+    }
+    this.#pair = pair;
+    return changed;
+  }
+}
+
+/** Whether `name` names a room: 1 to 64 of a-z, 0-9, `-` and `_`, as the server takes them. */
+export const roomName = (name: string) => /^[a-z0-9_-]{1,64}$/.test(name);
+
+/** A frame: `bytes`' length, then them. */
+export function frame(bytes: Uint8Array): Uint8Array {
+  const out = new Uint8Array(bytes.length + 3);
+  let at = 0;
+  for (let x = bytes.length; ; ) {
+    const group = x & 127;
+    x >>>= 7;
+    out[at++] = x === 0 ? group : group | 128;
+    if (x === 0) break;
+  }
+  out.set(bytes, at);
+  return out.subarray(0, at + bytes.length);
+}
+
+/** Reads frames from a stream's chunks, however they're split. */
+export class Frames {
+  #buffer = new Uint8Array(0);
+
+  /** The whole frames `chunk` completes, oldest first; an error for a frame too long, or whose
+   * length isn't a varint of at most three bytes. */
+  push(chunk: Uint8Array): Uint8Array[] {
+    const b = new Uint8Array(this.#buffer.length + chunk.length);
+    b.set(this.#buffer);
+    b.set(chunk, this.#buffer.length);
+    const out: Uint8Array[] = [];
+    let at = 0;
+    for (;;) {
+      let length = 0;
+      let k = 0;
+      for (; k < 3 && at + k < b.length; k++) {
+        length |= (b[at + k]! & 127) << (7 * k);
+        if (b[at + k]! < 128) break;
+      }
+      if (k === 3) throw new Error("a frame's length isn't a varint of at most three bytes");
+      if (at + k >= b.length) break;
+      if (length > MAX_FRAME) throw new Error(`a frame of ${length} bytes, past ${MAX_FRAME}`);
+      const start = at + k + 1;
+      if (start + length > b.length) break;
+      out.push(b.slice(start, start + length));
+      at = start + length;
+    }
+    this.#buffer = b.slice(at);
+    return out;
+  }
+}
+
+/** Where a build's server is (`net.json` beside it): its address, and a development
+ * certificate's SHA-256 hash, which the browser takes in place of a trusted one. */
+export interface Server {
+  url: string;
+  certificateHash?: number[];
+}
+
+/** What `net.json` says, checked. */
+export function parseServer(text: string): Server {
+  const v: unknown = JSON.parse(text);
+  if (typeof v !== "object" || v === null) throw new Error("net.json isn't an object");
+  const { url, certificateHash } = v as Record<string, unknown>;
+  if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error("net.json's `url` isn't an https URL");
+  if (certificateHash === undefined) return { url };
+  const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
+  if (!whole) throw new Error("net.json's `certificateHash` isn't 32 bytes");
+  return { url, certificateHash: certificateHash as number[] };
+}
+
+/** One connection: its session and its stream's writer, once it's open. */
+interface Session {
+  transport: WebTransport | null;
+  writer: WritableStreamDefaultWriter<Uint8Array> | null;
+  closed: boolean;
+}
+
+/**
+ * A program's connections (`platform::net`'s `open`, `send`, `close`). Each opened connection
+ * gives exactly one `Connection` event that it's open (if it opens), then exactly one that it's
+ * closed, whatever closes it; its messages come between. What arrives waits in `arrived` for the
+ * frame that takes it.
+ */
+export class Net {
+  readonly #sessions = new Map<number, Session>();
+  #server: Promise<Server> | null = null;
+  /** What arrived: a message's bytes, or a connection's opening or closing. */
+  arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean })[] = [];
+
+  /** `base`: where `net.json` is; `print`: a line for whoever runs the program. */
+  constructor(
+    readonly base: () => string,
+    readonly print: (line: string) => void,
+  ) {}
+
+  #fetchServer(): Promise<Server> {
+    this.#server ??= fetch(new URL("net.json", this.base()))
+      .then((r) => {
+        if (!r.ok) throw new Error(`net.json: ${r.status}`);
+        return r.text();
+      })
+      .then(parseServer);
+    return this.#server;
+  }
+
+  /** Opens connection `conn` to room `room`. A number already open is the program's mistake. */
+  open(conn: number, room: string): void {
+    if (this.#sessions.has(conn)) throw new Error(`connection ${conn} is open`);
+    const session: Session = { transport: null, writer: null, closed: false };
+    this.#sessions.set(conn, session);
+    if (!roomName(room)) {
+      this.print(`connection ${conn}: \`${room}\` isn't a room's name`);
+      this.#end(conn, session);
+      return;
+    }
+    void this.#connect(conn, room, session);
+  }
+
+  async #connect(conn: number, room: string, session: Session): Promise<void> {
+    try {
+      const server = await this.#fetchServer();
+      if (session.closed) return;
+      const options: WebTransportOptions = {};
+      if (server.certificateHash) {
+        options.serverCertificateHashes = [{ algorithm: "sha-256", value: new Uint8Array(server.certificateHash) }];
+      }
+      const transport = new WebTransport(`${server.url.replace(/\/$/, "")}/room/${room}`, options);
+      session.transport = transport;
+      // Its end, however it comes, ends the connection.
+      transport.closed.then(
+        () => this.#end(conn, session),
+        () => this.#end(conn, session),
+      );
+      await transport.ready;
+      const stream = await transport.createBidirectionalStream();
+      if (session.closed) return;
+      session.writer = stream.writable.getWriter();
+      this.arrived.push({ conn, open: true });
+      const reader = stream.readable.getReader();
+      const frames = new Frames();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done || session.closed) break;
+        for (const bytes of frames.push(value)) this.arrived.push({ conn, bytes });
+      }
+    } catch (e) {
+      if (!session.closed) this.print(`connection ${conn}: ${errorMessage(e)}`);
+    }
+    this.#end(conn, session);
+  }
+
+  /** Sends `bytes` on connection `conn`: nothing if it isn't open (it may have closed since the
+   * program last heard). A message past MAX_FRAME closes it. */
+  send(conn: number, bytes: Uint8Array): void {
+    const session = this.#sessions.get(conn);
+    if (!session?.writer || session.closed) return;
+    if (bytes.length > MAX_FRAME) {
+      this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_FRAME}`);
+      this.close(conn);
+      return;
+    }
+    session.writer.write(frame(bytes)).catch(() => this.#end(conn, session));
+  }
+
+  /** Closes connection `conn`. */
+  close(conn: number): void {
+    const session = this.#sessions.get(conn);
+    if (session) this.#end(conn, session);
+  }
+
+  /** Closes every connection, giving no events: the build changed, and its program goes. */
+  closeAll(): void {
+    for (const [conn, session] of [...this.#sessions]) this.#end(conn, session, false);
+    this.arrived = [];
+  }
+
+  /** Ends a connection once: its session closes, and the program hears (if `tell`). */
+  #end(conn: number, session: Session, tell = true): void {
+    if (session.closed) return;
+    session.closed = true;
+    if (this.#sessions.get(conn) === session) this.#sessions.delete(conn);
+    try {
+      session.transport?.close();
+    } catch {
+      // It's closed already.
+    }
+    if (tell) this.arrived.push({ conn, open: false });
+  }
+
+  /** Queues what arrived since the last call into `inbox`. */
+  deliver(inbox: Inbox): void {
+    for (const a of this.arrived) {
+      if ("bytes" in a) inbox.pushMessage(a.conn, a.bytes);
+      else inbox.push(connectionEvent(a.conn, a.open));
+    }
+    this.arrived = [];
+  }
+}

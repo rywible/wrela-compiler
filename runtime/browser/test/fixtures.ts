@@ -27,7 +27,7 @@ export interface Vectors {
   /** `malformed`: JSON that doesn't parse, which each host rejects in its own words. */
   manifests: { name: string; json: string; error: string | null; malformed?: boolean }[];
   lines: { name: string; bytes: string; at: [number, string | null][]; error: string | null }[];
-  input: { name: string; script: string; at?: string[]; events?: string[]; error?: string }[];
+  input: { name: string; script: string; at?: string[]; events?: string[]; payloads?: string[]; error?: string }[];
   tick_logs: { wasm_hash: string; hz: number; first: string; ticks: { records: string[]; hash: string }[]; bytes: string }[];
   lockstep: { hz: number; fps: number; frames: number[]; ticks: number[]; times: number[] }[];
   carried: {
