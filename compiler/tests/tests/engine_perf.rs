@@ -327,7 +327,7 @@ fn typed_runs_and_keys_match_the_previous_editor() {
     std::fs::write(dir.join("widgets.wrela"), widgets).expect("UI tests");
     // The two focused cases plus every retained production UI regression.
     // Includes the caller-selected font atlas regression copied from text.wrela.
-    passes(&dir, 19);
+    passes(&dir, 20);
 }
 
 #[test]

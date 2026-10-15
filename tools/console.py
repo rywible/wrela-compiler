@@ -3,6 +3,7 @@
 and Binaryen's wasm-opt. tools/deploy.py deploys one."""
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,8 @@ RESERVED_BUILD_NAMES = {"releases", "_headers", "_redirects", "index.html", "LIC
                         "files.json"}
 # The project's own hosts beside the console's domain, which no game may take.
 RESERVED_HOSTS = {"www", "docs", "api", "studio"}
+# Covers ship as WebP at this quality: a 960x540 cover is 30 to 110 KB, not 2 MB of pixels.
+COVER_QUALITY = 90
 # The Workers runtime each release's Workers run on.
 COMPATIBILITY_DATE = "2026-10-12"
 
@@ -137,6 +140,23 @@ def file_list(directory):
             for path in release_files(directory)}
 
 
+def prefetch_list(game, output, release):
+    """What the console fetches of a game ahead of time, once it is idle: each build's page,
+    runtime, WASM and shaders, the session first. Not the files a game streams as it plays, nor
+    its trap locations, which only a crash reads."""
+    root = origin(game["domain"]) + "/releases/" + release + "/"
+    builds = sorted(game["builds"], key=lambda name: name != game["session"])
+    urls = []
+    for name in builds:
+        directory = output / game["worker"] / name
+        for path in sorted(release_files(directory)):
+            relative = path.relative_to(directory)
+            if relative.parts[0] == "files" or path.suffix == ".lines":
+                continue
+            urls.append(root + name + "/" + relative.as_posix())
+    return "\n".join(urls) + "\n"
+
+
 def wrangler_config(project):
     """A worker's Wrangler configuration: its release's assets, on its custom domain only."""
     return {"name": project["worker"], "compatibility_date": COMPATIBILITY_DATE,
@@ -169,12 +189,15 @@ def package(config, output):
         (game_output / "_redirects").write_text(f"/ {parent}/ 302\n")
         from PIL import Image
         with Image.open(ROOT / game["cover"]) as image:
-            image = image.convert("RGBA")
+            image = image.convert("RGB")
             image.thumbnail((960, 540), Image.Resampling.LANCZOS)
             width, height = image.size
-            pixels = image.tobytes()
-        filename = "cover-" + hashlib.sha256(pixels).hexdigest()[:16] + ".rgba"
-        (home / filename).write_bytes(pixels)
+            # The console has the host decode it (platform/host.wrela `decode_image`).
+            encoded = io.BytesIO()
+            image.save(encoded, "WEBP", quality=COVER_QUALITY, method=6)
+        art = encoded.getvalue()
+        filename = "cover-" + hashlib.sha256(art).hexdigest()[:16] + ".webp"
+        (home / filename).write_bytes(art)
         catalog.append("\t".join([game["id"], game["title"], child + "/" + game["session"] + "/",
                                    filename, str(width), str(height)]))
     for project in [console, *config["games"]]:
@@ -200,6 +223,8 @@ def package(config, output):
         parts[2] = origin(game["domain"]) + "/releases/" + release + "/" + game["session"] + "/"
         catalog[index] = "\t".join(parts)
     (home / "catalog.tsv").write_text("\n".join(catalog) + "\n")
+    for game in config["games"]:
+        (home / f"prefetch-{game['id']}.txt").write_text(prefetch_list(game, output, release))
     (home / "_headers").write_text(headers(parent, [origin(g["domain"]) for g in config["games"]]))
     for project in [console, *config["games"]]:
         directory = output / project["worker"]

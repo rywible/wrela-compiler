@@ -76,6 +76,10 @@ cover = "cover.png"
                 output.mkdir(parents=True)
                 (output / "index.html").write_text("<html><head></head><body></body></html>")
                 (output / "game.wasm").write_bytes(b"wasm")
+                # What a game streams as it plays, and its trap locations: never prefetched.
+                (output / "files").mkdir()
+                (output / "files/tile.bin").write_bytes(b"tile")
+                (output / "game.lines").write_bytes(b"lines")
 
             image = MagicMock()
             image.__enter__.return_value = image
@@ -113,6 +117,14 @@ cover = "cover.png"
             self.assertFalse(wrangler["workers_dev"])
             self.assertIn("/*.wgsl\n  Content-Type: text/plain", (output / "game-host/_headers").read_text())
             self.assertEqual([w["console"] for w in report["workers"]], [True, False])
+            # The console prefetches the game's pages, runtime and WASM from its own origin.
+            prefetch = (output / f"console-host/releases/{release}/prefetch-game.txt").read_text()
+            base = f"https://game.example/releases/{release}/session/"
+            self.assertEqual(prefetch.split(), [base + "game.wasm", base + "index.html"])
+            # The cover ships compressed, named by its bytes, for the host to decode.
+            catalog = (output / f"console-host/releases/{release}/catalog.tsv").read_text().split("\t")
+            self.assertRegex(catalog[3], r"^cover-[0-9a-f]{16}\.webp$")
+            self.assertEqual(image.save.call_args.args[1:], ("WEBP",))
 
     def test_private_storage_and_symlinks_cannot_be_uploaded(self):
         with tempfile.TemporaryDirectory() as temporary:

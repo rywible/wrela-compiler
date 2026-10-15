@@ -47,6 +47,55 @@ export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: n
   return b;
 }
 
+/** How many prefetches run at once. */
+const PREFETCHES = 3;
+
+/** `prefetch` (platform/host.wrela): fetches each URL of `list`, one a line, into the browser's
+ * cache at low priority, a few at a time, until `signal` aborts. A URL that fails is skipped:
+ * the program fetches it again when it needs it. Answers once all are done or it is aborted. */
+export async function prefetch(list: string, base: string, signal: AbortSignal, fetchFn: typeof fetch): Promise<Bytes> {
+  const urls = list.split("\n").map(line => line.trim()).filter(line => line !== "").map(line => programUrl(line, base));
+  let next = 0;
+  const run = async () => {
+    while (next < urls.length && !signal.aborted) {
+      const url = urls[next++]!;
+      try { await (await fetchFn(url, { mode: "no-cors", credentials: "omit", priority: "low", signal })).arrayBuffer(); } catch { /* skipped */ }
+    }
+  };
+  await Promise.all(Array.from({ length: PREFETCHES }, run));
+  return new Uint8Array();
+}
+
+/** Decoded pixels: RGBA8, rows top to bottom. */
+export interface Decoded { width: number; height: number; pixels: Uint8ClampedArray }
+
+/** The most pixels a decoded image may have. */
+const IMAGE_PIXELS = 4096 * 4096;
+
+/** `image/decode` (platform/host.wrela): the width and height the program expects (words), then
+ * a compressed image, which `decode` turns into its pixels. Another size fails. */
+export async function decodeImage(body: Bytes, decode: (image: Bytes) => Promise<Decoded>): Promise<Bytes> {
+  const width = wordAt(body), height = wordAt(body.subarray(4));
+  if (width === 0 || height === 0 || width * height > IMAGE_PIXELS) throw new Error("invalid image size");
+  const image = await decode(body.slice(8));
+  if (image.width !== width || image.height !== height) throw new Error(`the image is ${image.width}x${image.height}, not ${width}x${height}`);
+  return new Uint8Array(image.pixels.buffer, image.pixels.byteOffset, image.pixels.byteLength) as Bytes;
+}
+
+/** The browser's own decoder, without colour conversion, so the pixels are the file's. */
+async function browserDecode(image: Bytes): Promise<Decoded> {
+  const bitmap = await createImageBitmap(new Blob([image]), { colorSpaceConversion: "none", premultiplyAlpha: "none" });
+  try {
+    const { width, height } = bitmap;
+    if (width * height > IMAGE_PIXELS) throw new Error("the image is too large");
+    const canvas = new OffscreenCanvas(width, height);
+    const g = canvas.getContext("2d", { willReadFrequently: true });
+    if (!g) throw new Error("no canvas to decode on");
+    g.drawImage(bitmap, 0, 0);
+    return { width, height, pixels: g.getImageData(0, 0, width, height).data };
+  } finally { bitmap.close(); }
+}
+
 export class PortRpc {
   #next = 1;
   #closed = false;
@@ -133,6 +182,8 @@ export class BrowserPlatform {
   // or that it was asked before any waited.
   #leaving = new Set<() => void>();
   #asked = false;
+  // Prefetches in flight, which an opening program cancels.
+  #prefetching = new AbortController();
   constructor(readonly canvas: HTMLCanvasElement, readonly visible: (v: boolean) => void) {
     canvas.style.position = "relative"; canvas.style.zIndex = "1"; canvas.style.outline = "none"; canvas.tabIndex = 0;
     window.addEventListener("message", (e: MessageEvent<unknown>) => {
@@ -179,6 +230,8 @@ export class BrowserPlatform {
   }
   async #open(text: string): Promise<Bytes> {
     if (this.#surfaces.size >= 4) throw new Error("too many embedded programs");
+    // The program opening takes the network: what was fetched ahead of time stops.
+    this.#prefetching.abort(); this.#prefetching = new AbortController();
     const url = programUrl(text, document.baseURI);
     const frame = document.createElement("iframe");
     frame.src = url.href;
@@ -228,6 +281,7 @@ export class BrowserPlatform {
     if (service === "environment") {
       return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"));
     }
+    if (service === "image/decode") return decodeImage(body, browserDecode);
     if (service === "cursor") {
       // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
       const name = DECODER.decode(body);
@@ -246,6 +300,7 @@ export class BrowserPlatform {
       link.href = href; return new Uint8Array();
     }
     if (service === "surface/open") return this.#open(DECODER.decode(body));
+    if (service === "prefetch") return prefetch(DECODER.decode(body), document.baseURI, this.#prefetching.signal, fetch);
     if (service === "channel/receive") {
       if (!this.#parent) throw new Error("this program has no parent channel");
       if (this.#receiving) throw new Error("a channel receive is already pending");

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { BrowserPlatform, environment, exportName, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
+import { BrowserPlatform, decodeImage, environment, exportName, prefetch, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
   const channel = new MessageChannel();
@@ -24,6 +24,42 @@ test("the environment says whether this page load reloaded the tab", () => {
   // Back and forward are visits, and so is a page whose navigation the browser didn't record.
   expect(environment(false, 0, 1, load("back_forward"))[9]).toBe(0);
   expect(environment(false, 0, 1, [])[9]).toBe(0);
+});
+
+test("an image decodes only at the size the program expects", async () => {
+  const pixels = new Uint8ClampedArray(3 * 2 * 4).fill(7);
+  const decoder = async (image: Uint8Array) => {
+    expect([...image]).toEqual([9, 9]);
+    return { width: 3, height: 2, pixels };
+  };
+  const body = (w: number, h: number) => { const b = new Uint8Array(10); b.set(wordBytes(w)); b.set(wordBytes(h), 4); b.set([9, 9], 8); return b; };
+  expect([...await decodeImage(body(3, 2), decoder)]).toEqual([...pixels]);
+  await expect(decodeImage(body(2, 3), decoder)).rejects.toThrow("not 2x3");
+  await expect(decodeImage(body(0, 2), decoder)).rejects.toThrow("invalid image size");
+  await expect(decodeImage(body(5000, 5000), decoder)).rejects.toThrow("invalid image size");
+  await expect(decodeImage(new Uint8Array(3), decoder)).rejects.toThrow();
+});
+
+test("prefetching fetches each URL at low priority until it is stopped", async () => {
+  const seen: { url: string; init: RequestInit | undefined }[] = [];
+  const controller = new AbortController();
+  const fetchFn = (async (url: URL, init?: RequestInit) => {
+    seen.push({ url: url.href, init });
+    if (url.pathname.endsWith("/missing")) throw new Error("offline");
+    if (url.pathname.endsWith("/stop")) controller.abort();
+    return new Response("x");
+  }) as unknown as typeof fetch;
+  const list = "https://a.example/one\n\nhttps://a.example/missing\nhttps://a.example/two\n";
+  await prefetch(list, "https://console.example/", new AbortController().signal, fetchFn);
+  expect(seen.map(s => s.url).sort()).toEqual(["https://a.example/missing", "https://a.example/one", "https://a.example/two"]);
+  expect(seen[0]!.init).toMatchObject({ mode: "no-cors", credentials: "omit", priority: "low" });
+  // Stopped (a program opening), nothing more starts.
+  seen.length = 0;
+  const many = ["stop", ...Array.from({ length: 20 }, (_, i) => `f${i}`)].map(n => `https://a.example/${n}`).join("\n");
+  await prefetch(many, "https://console.example/", controller.signal, fetchFn);
+  expect(seen.length).toBeLessThanOrEqual(3);
+  // A URL that isn't a secure, plain address is refused before anything is fetched.
+  await expect(prefetch("javascript:alert(1)", "https://console.example/", new AbortController().signal, fetchFn)).rejects.toThrow();
 });
 
 test("program channels reject oversized requests before transmission", () => {
