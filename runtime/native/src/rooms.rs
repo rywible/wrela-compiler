@@ -3,13 +3,16 @@
 //! host (`platform::net`'s `keep` and `compact`); the host keeps a call's records, flushed to
 //! disk, before it releases anything the call sent or closed, so what any peer saw committed is
 //! in the journal. A room that starts reads its journal back first, as messages from connection
-//! `JOURNAL` (0), before any live event.
+//! `JOURNAL` (0), before any live event, and then hears of its open connections again, each with
+//! the tag the program gave it (`platform::net::tag`). A call is given what waits a call's worth
+//! at a time ([`wrela_abi::input::within_call`]), and must read all of it.
 //!
 //! A call that fails says whose the failure is ([`Failure`]):
-//! - the program's own trap: the room starts again from its journal, then takes the call's
-//!   events again one at a time; the one that traps alone is given back with `POISONED` set on
-//!   its connection, so the program refuses it durably without running it. A trap while reading
-//!   the journal back quarantines the room: it's never skipped past.
+//! - the program's own trap (or a `serve` that returns with events unread): the room starts
+//!   again from its journal, then takes the call's events again one at a time; the one that
+//!   traps alone is given back with `POISONED` set on its connection, so the program refuses it
+//!   durably without running it. A trap while reading the journal back quarantines the room:
+//!   it's never skipped past.
 //! - the host's limits (the deadline, the memory cap, the stack): nothing is kept or sent; the
 //!   room starts again and the events wait, and after [`RETRIES`] failures in a row its
 //!   connections are closed, so its peers come back later.
@@ -32,6 +35,8 @@ pub const JOURNAL: u32 = 0;
 pub const POISONED: u32 = 1 << 31;
 /// How many times in a row a room may fail at the host's limits before its connections close.
 pub const RETRIES: u32 = 3;
+/// Why a call that returned without reading all its events failed.
+const UNREAD: &str = "`serve` returned without reading all its events";
 /// The journal format's version.
 const VERSION: u32 = 1;
 const MAGIC: &[u8; 4] = b"WRJ1";
@@ -57,6 +62,8 @@ pub enum Fault {
     Append,
     /// The next compaction fails after writing its new journal, before renaming it into place.
     Compact,
+    /// The next compaction fails after renaming its new journal into place, before opening it.
+    AfterRename,
 }
 
 /// A room's journal on disk.
@@ -152,6 +159,10 @@ impl Journal {
             return Err(std::io::Error::other("an injected fault"));
         }
         std::fs::rename(&tmp, &self.path)?;
+        if self.fault == Some(Fault::AfterRename) {
+            self.fault = None;
+            return Err(std::io::Error::other("an injected fault"));
+        }
         sync_dir(&self.path)?;
         self.file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
         Ok(())
@@ -214,8 +225,8 @@ pub struct RoomHost {
     journal: Journal,
     room: Option<Room>,
     status: Status,
-    /// Its open connections, which a new instance is told of again.
-    conns: Vec<u32>,
+    /// Its open connections and their tags, which a new instance is told of again.
+    conns: Vec<(u32, u32)>,
     incoming: VecDeque<Incoming>,
     outbox: Vec<Out>,
     /// How many calls in a row failed at the host's limits.
@@ -267,19 +278,26 @@ impl RoomHost {
     }
 
     /// Starts a new instance: `serve_init`, then the journal read back, then the open
-    /// connections told of again. A trap while reading the journal quarantines the room.
+    /// connections told of again, with their tags. The journal is opened again, so a rewrite
+    /// that failed past its rename leaves no stale file behind. A trap while reading the journal
+    /// back quarantines the room.
     fn start(&mut self) -> Result<(), Failure> {
         self.room = None;
-        let (_, records) = Journal::open(&self.journal.path, self.build_hash, &self.name)?;
+        let (mut journal, records) =
+            Journal::open(&self.journal.path, self.build_hash, &self.name)?;
+        journal.fault = self.journal.fault.take();
+        self.journal = journal;
         let mut room = Room::start(&self.build, self.limits, None)?;
-        for r in records {
-            room.push_message(JOURNAL, r);
+        for r in &records {
+            room.push_message(JOURNAL, r.clone());
         }
         // `serve` reads it back, a call's worth of bytes at a time, before any live event.
-        let mut calls = 0;
         while room.queued() > 0 {
-            calls += 1;
-            match room.serve(0.0) {
+            let before = room.queued();
+            let read = room.serve(0.0).and_then(|()| {
+                if room.queued() < before { Ok(()) } else { Err(Failure::Program(UNREAD.into())) }
+            });
+            match read {
                 Ok(()) => {}
                 Err(f) if f.is_program() => {
                     self.status = Status::Quarantined(format!("its journal traps it: {f}"));
@@ -290,16 +308,19 @@ impl RoomHost {
                     return Err(f);
                 }
             }
-            // Reading back keeps nothing new but a compaction, which it carries out.
+            // Reading back keeps nothing new but a compaction, which it carries out: the
+            // snapshot, then the records not read yet, which it doesn't hold.
             for c in room.take_commands() {
                 if let Net::Compact(snapshot) = c {
-                    self.journal.rewrite(&[snapshot]).map_err(host)?;
+                    let unread = &records[records.len() - room.queued()..];
+                    let kept: Vec<Vec<u8>> =
+                        std::iter::once(snapshot).chain(unread.iter().cloned()).collect();
+                    self.journal.rewrite(&kept).map_err(host)?;
                 }
             }
-            assert!(calls < 1 << 20, "a journal that never ends");
         }
-        for &c in &self.conns {
-            room.push_connection(c, true);
+        for &(c, tag) in &self.conns {
+            room.push_connection(c, true, tag);
         }
         self.room = Some(room);
         self.status = Status::Live;
@@ -313,7 +334,7 @@ impl RoomHost {
             // It can't get through what's waiting: its peers go, and come back later.
             self.failures = 0;
             self.incoming.clear();
-            for c in self.conns.drain(..) {
+            for (c, _) in self.conns.drain(..) {
                 self.outbox.push(Out::Close(c));
             }
             self.status = Status::Unavailable(0);
@@ -325,13 +346,13 @@ impl RoomHost {
     /// Connection `conn` opened.
     pub fn connect(&mut self, conn: u32) {
         assert!(conn != JOURNAL && conn < POISONED, "connection {conn} is reserved");
-        self.conns.push(conn);
+        self.conns.push((conn, 0));
         self.incoming.push_back(Incoming::Opened(conn));
     }
 
     /// Connection `conn` closed.
     pub fn disconnect(&mut self, conn: u32) {
-        self.conns.retain(|&c| c != conn);
+        self.conns.retain(|&(c, _)| c != conn);
         self.incoming.push_back(Incoming::Closed(conn));
     }
 
@@ -345,30 +366,52 @@ impl RoomHost {
         std::mem::take(&mut self.outbox)
     }
 
-    /// Gives the room what's waiting, at time `time` (seconds), and carries out what it does:
-    /// its records kept, then its sends and closes released.
+    /// Gives the room what's waiting, at time `time` (seconds), a call's worth at a time (the
+    /// payload bytes a call is given, `wrela_abi::input::within_call`), and carries out what
+    /// each call does: its records kept, then its sends and closes released.
     pub fn wake(&mut self, time: f32) -> Result<(), Failure> {
         if let Status::Quarantined(why) = &self.status {
             return Err(Failure::Host(format!("the room is quarantined: {why}")));
         }
-        if self.room.is_none() {
-            self.start()?;
-        }
-        let batch: Vec<Incoming> = self.incoming.drain(..).collect();
-        match self.call(&batch, time) {
-            Ok(()) => Ok(()),
-            // The journal failed: its peers were let go, and send again what wasn't settled.
-            Err(Fail::Journal(f)) => Err(f),
-            Err(Fail::Room(f)) if f.is_program() => self.isolate(batch, time),
-            Err(Fail::Room(f)) => {
-                // The host's limits: nothing was kept or sent, and the events wait.
-                for e in batch.into_iter().rev() {
-                    self.incoming.push_front(e);
+        loop {
+            if self.room.is_none() {
+                self.start()?;
+            }
+            let batch = self.next_batch();
+            match self.call(&batch, time) {
+                Ok(()) => {}
+                // The journal failed: its peers were let go, and send again what wasn't settled.
+                Err(Fail::Journal(f)) => return Err(f),
+                Err(Fail::Room(f)) if f.is_program() => self.isolate(batch, time)?,
+                Err(Fail::Room(f)) => {
+                    // The host's limits: nothing was kept or sent, and the events wait.
+                    for e in batch.into_iter().rev() {
+                        self.incoming.push_front(e);
+                    }
+                    self.fail_at_limits();
+                    return Err(f);
                 }
-                self.fail_at_limits();
-                Err(f)
+            }
+            if self.incoming.is_empty() {
+                return Ok(());
             }
         }
+    }
+
+    /// The events one call is given: messages up to its payload bytes, and what's between them.
+    fn next_batch(&mut self) -> Vec<Incoming> {
+        let mut given = 0;
+        let mut batch = Vec::new();
+        while let Some(e) = self.incoming.front() {
+            if let Incoming::Message(_, bytes) = e {
+                if !wrela_abi::input::within_call(given, bytes.len()) {
+                    break;
+                }
+                given += bytes.len();
+            }
+            batch.extend(self.incoming.pop_front());
+        }
+        batch
     }
 
     /// One call with `batch`, its commands carried out if it returns.
@@ -376,12 +419,17 @@ impl RoomHost {
         let room = self.room.as_mut().expect("a live room");
         for e in batch {
             match e {
-                Incoming::Opened(c) => room.push_connection(*c, true),
-                Incoming::Closed(c) => room.push_connection(*c, false),
+                Incoming::Opened(c) => room.push_connection(*c, true, 0),
+                Incoming::Closed(c) => room.push_connection(*c, false, 0),
                 Incoming::Message(c, b) => room.push_message(*c, b.clone()),
             }
         }
-        if let Err(f) = room.serve(time) {
+        // A call is given the whole batch, so one that returns without reading it all is the
+        // program's failure: what it left would wait for nothing.
+        let served = room.serve(time).and_then(|()| {
+            if room.queued() == 0 { Ok(()) } else { Err(Failure::Program(UNREAD.into())) }
+        });
+        if let Err(f) = served {
             // What the failed call asked for is dropped with its instance.
             self.room = None;
             return Err(Fail::Room(f));
@@ -397,6 +445,7 @@ impl RoomHost {
     fn carry_out(&mut self, commands: Vec<Net>) -> Result<(), Failure> {
         let mut records = Vec::new();
         let mut held = Vec::new();
+        let mut tags = Vec::new();
         let mut kept = Ok(());
         for c in commands {
             match c {
@@ -409,6 +458,7 @@ impl RoomHost {
                 }
                 Net::Send(conn, bytes) => held.push(Out::Send(conn, bytes)),
                 Net::Close(conn) => held.push(Out::Close(conn)),
+                Net::Tag(conn, tag) => tags.push((conn, tag)),
             }
         }
         if !records.is_empty() {
@@ -420,14 +470,21 @@ impl RoomHost {
             self.room = None;
             self.status = Status::Unavailable(0);
             self.incoming.clear();
-            for c in self.conns.drain(..) {
+            for (c, _) in self.conns.drain(..) {
                 self.outbox.push(Out::Close(c));
             }
             return Err(host(format!("the journal: {e}")));
         }
+        for (conn, tag) in tags {
+            for c in &mut self.conns {
+                if c.0 == conn {
+                    c.1 = tag;
+                }
+            }
+        }
         for o in &held {
             if let Out::Close(c) = o {
-                self.conns.retain(|x| x != c);
+                self.conns.retain(|x| x.0 != *c);
             }
         }
         self.outbox.extend(held);

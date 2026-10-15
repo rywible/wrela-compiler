@@ -1,15 +1,22 @@
 //! The server host (language.md §12): a server build's rooms, over WebTransport. A session at
-//! `/room/<name>` is a connection of room `<name>`; it opens one bidirectional stream, on which
-//! each message is a frame: its length (a varint, at most [`MAX_FRAME`] bytes), then its bytes.
-//! Each room runs on a thread of its own ([`wrela_host::rooms::RoomHost`]), which keeps it
-//! durably in the data directory and releases what it sends only once its records are kept.
+//! `/room/<name>?pair=<id>` is a connection of room `<name>`, from a client build whose pair id
+//! is `<id>` (16 hex digits): one of another pair is refused before it reaches a room. It opens
+//! one bidirectional stream, on which each message is a frame: its length (a varint, at most
+//! [`MAX_FRAME`] bytes), then its bytes. Each room runs on a thread of its own
+//! ([`wrela_host::rooms::RoomHost`]), which keeps it durably in the data directory and releases
+//! what it sends only once its records are kept; a room with no connections for
+//! [`Bounds::idle`] stops, and starts again from its journal when one comes.
 //!
-//! Every queue is bounded: a connection whose messages the room can't take fast enough, or that
-//! can't take the room's fast enough, is closed, and its peer comes back.
+//! What it holds is bounded ([`Bounds`]): the sessions open or opening, the rooms running, and
+//! the bytes every queue holds together, each message counted with [`OVERHEAD`] more. A
+//! connection that sends faster than its room takes ([`CONN_IN`] waiting), or takes what its
+//! room sends slower than the room sends it ([`CONN_OUT`] waiting, or a write that takes
+//! [`WRITE`]), is closed, and its peer comes back.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wrela_host::rooms::{Out, RoomHost, Status};
@@ -19,10 +26,41 @@ use wtransport::{Endpoint, Identity, ServerConfig};
 
 /// The largest frame, in bytes.
 pub const MAX_FRAME: usize = 64 * 1024;
-/// How many messages may wait for a room, and for a connection, before it's closed.
+/// How many messages may wait for a room, and for a connection.
 pub const QUEUE: usize = 1024;
-/// How long a session may take to open its stream.
+/// The bytes a message is counted as past its own: what holding it costs.
+pub const OVERHEAD: usize = 64;
+/// The bytes a connection's messages may hold waiting for its room.
+pub const CONN_IN: usize = 1 << 20;
+/// The bytes a room's messages may hold waiting for a connection: a welcome's catch-up
+/// (`std::net::CATCH_UP` entries) fits.
+pub const CONN_OUT: usize = 16 << 20;
+/// How long a session may take to open, and to open its stream.
 const OPENING: Duration = Duration::from_secs(10);
+/// How long a write to a connection may take.
+pub const WRITE: Duration = Duration::from_secs(10);
+/// How often a room with nothing to do looks at its connections and whether to stop.
+const TICK: Duration = Duration::from_millis(250);
+
+/// How much the server holds at most.
+#[derive(Clone, Copy, Debug)]
+pub struct Bounds {
+    /// Sessions open or opening.
+    pub sessions: usize,
+    /// Rooms running.
+    pub rooms: usize,
+    /// The bytes every queue holds together.
+    pub queued: usize,
+    /// How long a room with no connections runs before it stops.
+    pub idle: Duration,
+}
+
+impl Default for Bounds {
+    /// 256 sessions, 64 rooms, 64 MiB queued, and 30 s idle.
+    fn default() -> Bounds {
+        Bounds { sessions: 256, rooms: 64, queued: 64 << 20, idle: Duration::from_secs(30) }
+    }
+}
 
 /// What the server runs.
 pub struct Config {
@@ -34,25 +72,85 @@ pub struct Config {
     pub port: u16,
     pub identity: Identity,
     pub limits: Limits,
+    pub bounds: Bounds,
+}
+
+/// A share of a bound: `n` of what `count` counts, given back when it's dropped.
+struct Share {
+    n: usize,
+    counts: Vec<Arc<AtomicUsize>>,
+}
+
+impl Share {
+    /// `n` of each counter, if none passes its cap.
+    fn take(n: usize, counters: &[(&Arc<AtomicUsize>, usize)]) -> Option<Share> {
+        let mut share = Share { n, counts: Vec::new() };
+        for &(count, cap) in counters {
+            count
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |x| {
+                    (x + n <= cap).then_some(x + n)
+                })
+                .ok()?;
+            share.counts.push(Arc::clone(count));
+        }
+        Some(share)
+    }
+}
+
+impl Drop for Share {
+    fn drop(&mut self) {
+        for c in &self.counts {
+            c.fetch_sub(self.n, Ordering::AcqRel);
+        }
+    }
+}
+
+/// What carries a room's messages to a connection, and the bytes they hold.
+struct Link {
+    tx: tokio::sync::mpsc::Sender<(Out, Option<Share>)>,
+    held: Arc<AtomicUsize>,
 }
 
 /// What a room's thread is told.
 enum ToRoom {
-    Opened(u32, tokio::sync::mpsc::Sender<Out>),
+    Opened(u32, Link),
     Closed(u32),
-    Message(u32, Vec<u8>),
+    Message(u32, Vec<u8>, Share),
     /// The server has a new build: close every connection, and stop.
     Stop,
 }
 
+/// A running room: its queue, and whether it's told to stop.
+struct Running {
+    tx: SyncSender<ToRoom>,
+    stop: Arc<AtomicBool>,
+}
+
+/// The build new rooms run, and the rooms running it.
+struct State {
+    build: Arc<ServerBuild>,
+    hash: u64,
+    rooms: HashMap<String, Running>,
+}
+
 /// The server's rooms, each a thread, started when its first connection comes.
 struct Rooms {
-    /// The build new rooms run, and its WASM's hash.
-    build: Mutex<(Arc<ServerBuild>, u64)>,
+    state: Mutex<State>,
     data: PathBuf,
     limits: Limits,
-    rooms: Mutex<HashMap<String, std::sync::mpsc::SyncSender<ToRoom>>>,
+    bounds: Bounds,
     next_conn: AtomicU32,
+    sessions: Arc<AtomicUsize>,
+    running: Arc<AtomicUsize>,
+    queued: Arc<AtomicUsize>,
+}
+
+/// Why a session isn't let in.
+enum Refusal {
+    /// Its client is another program's build.
+    Pair,
+    /// The server holds all it may.
+    Busy,
 }
 
 /// Whether `name` names a room: 1 to 64 of a-z, 0-9, `-` and `_`.
@@ -63,110 +161,227 @@ pub fn room_name(name: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
 }
 
+/// A session's path: its room, and its client's pair id (none if it's missing or isn't 16 hex
+/// digits). None if it isn't a room's.
+pub fn session_path(path: &str) -> Option<(&str, Option<u64>)> {
+    let rest = path.strip_prefix("/room/")?;
+    let (name, query) = rest.split_once('?').unwrap_or((rest, ""));
+    if !room_name(name) {
+        return None;
+    }
+    let pair = query.split('&').find_map(|kv| kv.strip_prefix("pair=")).and_then(|hex| {
+        (hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| u64::from_str_radix(hex, 16).ok())
+            .flatten()
+    });
+    Some((name, pair))
+}
+
 impl Rooms {
-    /// The queue to room `name`'s thread, started if it isn't running.
-    fn room(&self, name: &str) -> std::sync::mpsc::SyncSender<ToRoom> {
-        let mut rooms = self.rooms.lock().expect("the rooms' lock");
-        if let Some(tx) = rooms.get(name) {
-            return tx.clone();
+    /// Lets connection `conn` of a client of pair `pair` into room `name`, started if it isn't
+    /// running: the room's queue. The build is the room's, under the same lock as a new build.
+    fn join(
+        self: &Arc<Self>,
+        name: &str,
+        pair: Option<u64>,
+        conn: u32,
+        link: Link,
+    ) -> Result<SyncSender<ToRoom>, Refusal> {
+        let mut state = self.state.lock().expect("the rooms' lock");
+        if pair.is_none() || state.build.pair != pair {
+            return Err(Refusal::Pair);
         }
-        let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
-        rooms.insert(name.to_string(), tx.clone());
-        let (build, hash) = self.build.lock().expect("the build's lock").clone();
-        let (data, limits) = (self.data.join(format!("{hash:016x}")), self.limits);
-        let name = name.to_string();
-        std::thread::Builder::new()
-            .name(format!("room {name}"))
-            .spawn(move || run(build, hash, &data, limits, &name, &rx))
-            .expect("can't start a room's thread");
-        tx
+        let tx = match state.rooms.get(name) {
+            Some(r) => r.tx.clone(),
+            None => {
+                let permit =
+                    Share::take(1, &[(&self.running, self.bounds.rooms)]).ok_or(Refusal::Busy)?;
+                let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
+                let stop = Arc::new(AtomicBool::new(false));
+                let (rooms, build, hash) = (Arc::clone(self), state.build.clone(), state.hash);
+                let (room, halt) = (name.to_string(), Arc::clone(&stop));
+                std::thread::Builder::new()
+                    .name(format!("room {name}"))
+                    .spawn(move || {
+                        let _permit = permit;
+                        run(&rooms, build, hash, &room, &rx, &halt);
+                    })
+                    .map_err(|_| Refusal::Busy)?;
+                state.rooms.insert(name.to_string(), Running { tx: tx.clone(), stop });
+                tx
+            }
+        };
+        tx.try_send(ToRoom::Opened(conn, link)).map_err(|_| Refusal::Busy)?;
+        Ok(tx)
     }
 
     /// From now on, rooms run `build`: each room running closes its connections and stops.
     fn set_build(&self, build: Arc<ServerBuild>, hash: u64) {
-        *self.build.lock().expect("the build's lock") = (build, hash);
-        for (_, tx) in self.rooms.lock().expect("the rooms' lock").drain() {
-            // A room whose queue is full stops once its connections, failing to reach it, have
-            // gone: each holds the room's only other senders.
-            let _ = tx.try_send(ToRoom::Stop);
+        let mut state = self.state.lock().expect("the rooms' lock");
+        state.build = build;
+        state.hash = hash;
+        for (_, r) in state.rooms.drain() {
+            // The flag stops it even if its queue is full; the message wakes it at once.
+            r.stop.store(true, Ordering::Release);
+            let _ = r.tx.try_send(ToRoom::Stop);
+        }
+    }
+
+    /// Whether room `name`'s thread, told to stop by `stop`, may stop for want of connections:
+    /// nothing waits in its queue, and nothing can, as a session joins under the same lock. What
+    /// did wait goes to `carried`.
+    fn retire(
+        &self,
+        name: &str,
+        stop: &Arc<AtomicBool>,
+        rx: &Receiver<ToRoom>,
+        carried: &mut Vec<ToRoom>,
+    ) -> bool {
+        let mut state = self.state.lock().expect("the rooms' lock");
+        match rx.try_recv() {
+            Ok(e) => {
+                carried.push(e);
+                false
+            }
+            Err(_) => {
+                if state.rooms.get(name).is_some_and(|r| Arc::ptr_eq(&r.stop, stop)) {
+                    state.rooms.remove(name);
+                }
+                true
+            }
         }
     }
 }
 
 /// Room `name`'s thread: it takes what has come, wakes the room, and gives each connection what
-/// the room released, until it's told to stop or nothing can reach it.
+/// the room released, until it's told to stop, has had no connection for the idle time, or
+/// nothing can reach it.
 fn run(
+    rooms: &Rooms,
     build: Arc<ServerBuild>,
     hash: u64,
-    data: &std::path::Path,
-    limits: Limits,
     name: &str,
-    rx: &std::sync::mpsc::Receiver<ToRoom>,
+    rx: &Receiver<ToRoom>,
+    stop: &Arc<AtomicBool>,
 ) {
     let started = Instant::now();
-    let mut room = match RoomHost::open(build, hash, data, name, limits) {
+    let data = rooms.data.join(format!("{hash:016x}"));
+    let mut room = match RoomHost::open(build, hash, &data, name, rooms.limits) {
         Ok(room) => Some(room),
         Err(e) => {
             eprintln!("wrela-serve: room {name} doesn't open: {e}");
             None
         }
     };
-    let mut outs: HashMap<u32, tokio::sync::mpsc::Sender<Out>> = HashMap::new();
-    while let Ok(first) = rx.recv() {
-        let mut batch = vec![first];
-        while let Ok(more) = rx.try_recv() {
-            batch.push(more);
+    let mut outs: HashMap<u32, Link> = HashMap::new();
+    let mut carried: Vec<ToRoom> = Vec::new();
+    let mut last_conn = Instant::now();
+    loop {
+        let mut batch = std::mem::take(&mut carried);
+        if batch.is_empty() {
+            match rx.recv_timeout(TICK) {
+                Ok(e) => batch.push(e),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
         }
-        if batch.iter().any(|e| matches!(e, ToRoom::Stop)) {
-            for tx in outs.values() {
-                let _ = tx.try_send(Out::Close(0));
+        while batch.len() < QUEUE {
+            match rx.try_recv() {
+                Ok(e) => batch.push(e),
+                Err(_) => break,
+            }
+        }
+        if stop.load(Ordering::Acquire) || batch.iter().any(|e| matches!(e, ToRoom::Stop)) {
+            for link in outs.values() {
+                let _ = link.tx.try_send((Out::Close(0), None));
             }
             for e in batch {
-                if let ToRoom::Opened(_, tx) = e {
-                    let _ = tx.try_send(Out::Close(0));
+                if let ToRoom::Opened(_, link) = e {
+                    let _ = link.tx.try_send((Out::Close(0), None));
                 }
             }
             return;
         }
         let Some(host) = room.as_mut() else {
-            // A room that didn't open closes what comes to it.
+            // A room that didn't open closes what comes to it, and stops once nothing does.
+            let mut joined = false;
             for e in batch {
-                if let ToRoom::Opened(_, tx) = e {
-                    let _ = tx.try_send(Out::Close(0));
+                if let ToRoom::Opened(_, link) = e {
+                    let _ = link.tx.try_send((Out::Close(0), None));
+                    joined = true;
                 }
+            }
+            if !joined && rooms.retire(name, stop, rx, &mut carried) {
+                return;
             }
             continue;
         };
+        // The bytes of what it reads are held until the room has read it.
+        let mut shares = Vec::new();
+        let mut woken = !batch.is_empty();
         for e in batch {
             match e {
-                ToRoom::Opened(conn, tx) => {
-                    outs.insert(conn, tx);
+                ToRoom::Opened(conn, link) => {
+                    outs.insert(conn, link);
                     host.connect(conn);
                 }
                 ToRoom::Closed(conn) => {
-                    outs.remove(&conn);
-                    host.disconnect(conn);
+                    if outs.remove(&conn).is_some() {
+                        host.disconnect(conn);
+                    }
                 }
-                ToRoom::Message(conn, bytes) => host.receive(conn, bytes),
+                ToRoom::Message(conn, bytes, share) => {
+                    host.receive(conn, bytes);
+                    shares.push(share);
+                }
                 ToRoom::Stop => {}
             }
         }
-        if let Err(e) = host.wake(started.elapsed().as_secs_f32()) {
-            eprintln!("wrela-serve: room {name}: {e}");
+        // A session that ended without telling the room (its queue was full) has dropped its
+        // end of the link.
+        let gone: Vec<u32> =
+            outs.iter().filter(|(_, l)| l.tx.is_closed()).map(|(&c, _)| c).collect();
+        for conn in gone {
+            outs.remove(&conn);
+            host.disconnect(conn);
+            woken = true;
         }
-        for o in host.take_outbox() {
-            let conn = match &o {
-                Out::Send(c, _) | Out::Close(c) => *c,
-            };
-            let Some(tx) = outs.get(&conn) else { continue };
-            if tx.try_send(o).is_err() {
-                // It can't take what it's sent fast enough: it goes, and comes back.
-                outs.remove(&conn);
-                host.disconnect(conn);
+        if woken {
+            if let Err(e) = host.wake(started.elapsed().as_secs_f32()) {
+                eprintln!("wrela-serve: room {name}: {e}");
+            }
+            drop(shares);
+            for o in host.take_outbox() {
+                let conn = match &o {
+                    Out::Send(c, _) | Out::Close(c) => *c,
+                };
+                let Some(link) = outs.get(&conn) else { continue };
+                let sent = match o {
+                    Out::Send(c, bytes) => Share::take(
+                        bytes.len() + OVERHEAD,
+                        &[(&link.held, CONN_OUT), (&rooms.queued, rooms.bounds.queued)],
+                    )
+                    .is_some_and(|share| {
+                        link.tx.try_send((Out::Send(c, bytes), Some(share))).is_ok()
+                    }),
+                    close => link.tx.try_send((close, None)).is_ok(),
+                };
+                if !sent {
+                    // It can't take what it's sent fast enough: it goes, and comes back.
+                    outs.remove(&conn);
+                    host.disconnect(conn);
+                }
+            }
+            if let Status::Quarantined(why) = host.status() {
+                eprintln!("wrela-serve: room {name} is quarantined: {why}");
             }
         }
-        if let Status::Quarantined(why) = host.status() {
-            eprintln!("wrela-serve: room {name} is quarantined: {why}");
+        if !outs.is_empty() {
+            last_conn = Instant::now();
+        } else if last_conn.elapsed() >= rooms.bounds.idle
+            && rooms.retire(name, stop, rx, &mut carried)
+        {
+            return;
         }
     }
 }
@@ -212,42 +427,50 @@ async fn read_frame(recv: &mut wtransport::RecvStream) -> Option<Vec<u8>> {
     None
 }
 
-/// One session: a connection of the room its path names.
-async fn session(incoming: IncomingSession, rooms: Arc<Rooms>) {
-    let Ok(request) = incoming.await else { return };
-    let Some(name) = request.path().strip_prefix("/room/").map(str::to_string) else {
+/// One session: a connection of the room its path names. `_permit` is its share of the
+/// sessions the server may hold.
+async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
+    let Ok(Ok(request)) = tokio::time::timeout(OPENING, incoming).await else { return };
+    let Some((name, pair)) = session_path(request.path()).map(|(n, p)| (n.to_string(), p)) else {
         request.not_found().await;
         return;
     };
-    if !room_name(&name) {
-        request.not_found().await;
-        return;
-    }
-    let Ok(connection) = request.accept().await else { return };
     let conn = rooms.next_conn.fetch_add(1, Ordering::Relaxed);
-    let to_room = rooms.room(&name);
-    let (tx, mut from_room) = tokio::sync::mpsc::channel::<Out>(QUEUE);
-    if to_room.try_send(ToRoom::Opened(conn, tx)).is_err() {
-        return;
-    }
+    let (tx, mut from_room) = tokio::sync::mpsc::channel(QUEUE);
+    let link = Link { tx, held: Arc::new(AtomicUsize::new(0)) };
+    let to_room = match rooms.join(&name, pair, conn, link) {
+        Ok(to_room) => to_room,
+        Err(Refusal::Pair) => return request.forbidden().await,
+        Err(Refusal::Busy) => return request.too_many_requests().await,
+    };
+    // From here, however it ends, the room hears: from `Closed`, or, if its queue is full, as
+    // it finds this end of the link dropped.
+    let Ok(connection) = request.accept().await else { return };
     let Ok(Ok((mut send, mut recv))) = tokio::time::timeout(OPENING, connection.accept_bi()).await
     else {
         let _ = to_room.try_send(ToRoom::Closed(conn));
         return;
     };
+    let held = Arc::new(AtomicUsize::new(0));
     let reading = async {
         while let Some(bytes) = read_frame(&mut recv).await {
-            if to_room.try_send(ToRoom::Message(conn, bytes)).is_err() {
-                // The room can't take this connection's messages fast enough.
+            let share = Share::take(
+                bytes.len() + OVERHEAD,
+                &[(&held, CONN_IN), (&rooms.queued, rooms.bounds.queued)],
+            );
+            // The room can't take this connection's messages fast enough.
+            let Some(share) = share else { break };
+            if to_room.try_send(ToRoom::Message(conn, bytes, share)).is_err() {
                 break;
             }
         }
     };
     let writing = async {
-        while let Some(o) = from_room.recv().await {
+        while let Some((o, _share)) = from_room.recv().await {
             match o {
                 Out::Send(_, bytes) => {
-                    if send.write_all(&frame(&bytes)).await.is_err() {
+                    let wrote = tokio::time::timeout(WRITE, send.write_all(&frame(&bytes))).await;
+                    if !matches!(wrote, Ok(Ok(()))) {
                         break;
                     }
                 }
@@ -259,6 +482,9 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>) {
         () = reading => {}
         () = writing => {}
     }
+    // What waited for it goes now, and with it the bytes it held.
+    from_room.close();
+    while from_room.try_recv().is_ok() {}
     let _ = to_room.try_send(ToRoom::Closed(conn));
     connection.close(0u32.into(), b"");
 }
@@ -274,6 +500,12 @@ impl Server {
     pub fn set_build(&self, build: Arc<ServerBuild>, hash: u64) {
         self.rooms.set_build(build, hash);
     }
+
+    /// How many rooms are running, and how many bytes every queue holds: what a test checks
+    /// the bounds by.
+    pub fn held(&self) -> (usize, usize) {
+        (self.rooms.running.load(Ordering::Acquire), self.rooms.queued.load(Ordering::Acquire))
+    }
 }
 
 /// Starts serving `config`'s rooms on `runtime`, until it ends: the server, or why its port can't
@@ -287,17 +519,28 @@ pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Resu
         .build();
     let endpoint = Endpoint::server(server)?;
     let rooms = Arc::new(Rooms {
-        build: Mutex::new((config.build, config.build_hash)),
+        state: Mutex::new(State {
+            build: config.build,
+            hash: config.build_hash,
+            rooms: HashMap::new(),
+        }),
         data: config.data,
         limits: config.limits,
-        rooms: Mutex::new(HashMap::new()),
+        bounds: config.bounds,
         next_conn: AtomicU32::new(1),
+        sessions: Arc::new(AtomicUsize::new(0)),
+        running: Arc::new(AtomicUsize::new(0)),
+        queued: Arc::new(AtomicUsize::new(0)),
     });
     let accepting = Arc::clone(&rooms);
     runtime.spawn(async move {
         loop {
             let incoming = endpoint.accept().await;
-            tokio::spawn(session(incoming, Arc::clone(&accepting)));
+            // Past the sessions it may hold, a session is dropped before its handshake.
+            let permit = Share::take(1, &[(&accepting.sessions, accepting.bounds.sessions)]);
+            if let Some(permit) = permit {
+                tokio::spawn(session(incoming, Arc::clone(&accepting), permit));
+            }
         }
     });
     Ok(Server { rooms })
@@ -330,6 +573,17 @@ pub fn net_json(port: u16, certificate_hash: Option<&[u8; 32]>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sessions_path_names_its_room_and_pair() {
+        let path = super::session_path;
+        assert_eq!(path("/room/a?pair=00000000000000ff"), Some(("a", Some(255))));
+        assert_eq!(path("/room/a"), Some(("a", None)));
+        assert_eq!(path("/room/a?pair=ff"), Some(("a", None)));
+        assert_eq!(path("/room/a?pair=zz00000000000000"), Some(("a", None)));
+        assert_eq!(path("/room/A?pair=00000000000000ff"), None);
+        assert_eq!(path("/other/a"), None);
+    }
+
     #[test]
     fn room_names_are_plain() {
         assert!(super::room_name("board-7f3a_1"));

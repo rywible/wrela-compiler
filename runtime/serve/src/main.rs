@@ -80,6 +80,7 @@ fn main() -> ExitCode {
             port,
             identity,
             limits: Limits::default(),
+            bounds: wrela_serve::Bounds::default(),
         };
         let _server = wrela_serve::start(config, &runtime)?;
         eprintln!("wrela-serve: rooms of {} on port {port}", dir.display());

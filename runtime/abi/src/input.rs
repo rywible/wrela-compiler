@@ -28,7 +28,7 @@
 //! | `PadButton` | the pad (0 to 3), the button ([`PAD_BUTTONS`]) | its value (f32, 0 to 1), 1 if it's pressed |
 //! | `PadAxis` | the pad, the axis ([`PAD_AXES`]) | its value (f32, -1 to 1), 0 |
 //! | `Message` | the connection, the serial's low word | the serial's high word, the bytes' length |
-//! | `Connection` | the connection, 1 if it's open (0: closed) | 0, 0 |
+//! | `Connection` | the connection, 1 if it's open (0: closed) | its tag (below), 0 |
 //!
 //! ## Messages
 //!
@@ -40,6 +40,11 @@
 //! A call is given messages until their bytes reach [`PAYLOAD_PER_CALL`] (the first whatever its
 //! size); the rest wait for the next call. Messages and connections never become a tick's
 //! records: v1 gives the network to frames and a server's `serve`, not to ticks.
+//!
+//! A server program may tag a connection with a number (`platform::net::tag`, a host command
+//! carried out once the call's records are kept). When its host starts it again on a fresh
+//! instance, the `Connection` events that tell it of its open connections carry their tags, so
+//! what it knew of each connection survives the restart; a client's are 0.
 //!
 //! Positions are in the same pixels as `frame`'s width and height. A key is a physical key
 //! (DOM's `KeyboardEvent.code`), named as [`KEYS`] lists it; one the list doesn't name is 0.
@@ -97,6 +102,12 @@ pub const IMPORT_INPUT: &str = "input";
 pub const IMPORT_PAYLOAD: &str = "payload";
 /// The payload bytes one call is given at most, past its first message.
 pub const PAYLOAD_PER_CALL: usize = 1 << 20;
+
+/// Whether a call already given `given` payload bytes is given a message of `len` more: the
+/// first whatever its size, then up to [`PAYLOAD_PER_CALL`].
+pub fn within_call(given: usize, len: usize) -> bool {
+    given == 0 || given + len <= PAYLOAD_PER_CALL
+}
 /// Bytes per event: six words.
 pub const EVENT_SIZE: u32 = 24;
 
@@ -337,9 +348,10 @@ impl Event {
         Event { kind: EventKind::Message, modifiers: 0, words }
     }
 
-    /// Connection `conn` opened, or closed.
-    pub fn connection(conn: u32, open: bool) -> Event {
-        Event { kind: EventKind::Connection, modifiers: 0, words: [conn, u32::from(open), 0, 0] }
+    /// Connection `conn` opened, or closed; `tag` is the tag its server program gave it (0:
+    /// none).
+    pub fn connection(conn: u32, open: bool, tag: u32) -> Event {
+        Event { kind: EventKind::Connection, modifiers: 0, words: [conn, u32::from(open), tag, 0] }
     }
 
     /// Its [`EVENT_SIZE`] bytes, as the program reads them.
@@ -539,7 +551,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     Some(v) => v.as_bool().ok_or_else(|| at("`open` must be true or false"))?,
                     None => return Err(at("`open` is missing")),
                 };
-                push(Event::connection(conn, open));
+                push(Event::connection(conn, open, 0));
             }
             "padbutton" => {
                 let (p, b) = (pad()?, named("button", &PAD_BUTTONS)?);
@@ -641,7 +653,7 @@ impl Queue {
             let Some(&e) = self.events.front() else { break };
             if e.kind == EventKind::Message {
                 let len = e.words[3] as usize;
-                if given > 0 && given + len > PAYLOAD_PER_CALL {
+                if !within_call(given, len) {
                     break;
                 }
                 given += len;
@@ -752,7 +764,7 @@ mod tests {
         let mut q = Queue::default();
         q.for_build(Some(1));
         q.push_message(0, vec![5]);
-        q.push(Event::connection(0, true));
+        q.push(Event::connection(0, true, 0));
         q.push(Event::text('a'));
         // The same build, reloaded: everything stays.
         q.for_build(Some(1));
@@ -773,7 +785,7 @@ mod tests {
             {"tick": 3, "type": "key", "key": "KeyA"}
         ]"#;
         let s = parse_script(script).expect("a valid script");
-        assert_eq!(s[0].event, Event::connection(2, true));
+        assert_eq!(s[0].event, Event::connection(2, true, 0));
         assert_eq!(s[1].event.kind, EventKind::Message);
         assert_eq!(s[1].payload, [1, 255]);
         assert_eq!(s[2].payload, b"hi");

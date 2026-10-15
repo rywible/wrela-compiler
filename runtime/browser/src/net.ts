@@ -1,7 +1,9 @@
 // The network (language.md §12): the events a program reads, with messages' bytes, and its
 // connections to its server's rooms over WebTransport. A connection is one session at
-// `/room/<name>` of the server that `net.json` beside the build names, with one bidirectional
-// stream; each message on it is a frame: its length (a varint, at most MAX_FRAME), then its bytes.
+// `/room/<name>?pair=<id>` of the server that `net.json` beside the build names, with one
+// bidirectional stream; each message on it is a frame: its length (a varint, at most MAX_FRAME),
+// then its bytes. What a connection holds is bounded: past HELD bytes waiting for the program,
+// or past PENDING bytes waiting to be written, it's closed, and its peer comes back.
 
 import { EVENT_SIZE, EventKind, PAYLOAD_PER_CALL } from "./abi.gen.ts";
 import { errorMessage } from "./errors.ts";
@@ -9,6 +11,12 @@ import { connectionEvent, isNetwork, messageEvent } from "./input.ts";
 
 /** The largest frame, in bytes: as the server host's (`wrela-serve`). */
 export const MAX_FRAME = 64 * 1024;
+/** The bytes a message is counted as past its own: what holding it costs. */
+export const OVERHEAD = 64;
+/** The bytes messages may hold waiting for the program: in what arrived, and in an inbox. */
+export const HELD = 16 << 20;
+/** The bytes a connection's messages may hold waiting to be written. */
+export const PENDING = 1 << 20;
 
 /**
  * The events a program hasn't read, as the native host's `Queue` keeps them (runtime/abi
@@ -21,6 +29,8 @@ export class Inbox {
   /** The serials of the messages the current call was given. */
   #delivered: number[] = [];
   #serial = 0;
+  /** The bytes its messages hold, each counted with OVERHEAD more. */
+  #held = 0;
   /** The pair id of the build it serves, once it serves one. */
   #pair: bigint | null | undefined = undefined;
 
@@ -34,7 +44,13 @@ export class Inbox {
     const serial = ++this.#serial;
     this.#events.push(messageEvent(conn, serial, bytes.length));
     this.#payloads.set(serial, bytes);
+    this.#held += bytes.length + OVERHEAD;
     return serial;
+  }
+
+  /** The bytes its messages hold, each counted with OVERHEAD more. */
+  get held(): number {
+    return this.#held;
   }
 
   get length(): number {
@@ -71,8 +87,15 @@ export class Inbox {
 
   /** The call has returned (or trapped): the bytes of the messages it was given go. */
   endCall(): void {
-    for (const s of this.#delivered) this.#payloads.delete(s);
+    for (const s of this.#delivered) this.#drop(s);
     this.#delivered = [];
+  }
+
+  #drop(serial: number): void {
+    const bytes = this.#payloads.get(serial);
+    if (bytes === undefined) return;
+    this.#held -= bytes.length + OVERHEAD;
+    this.#payloads.delete(serial);
   }
 
   /** It now serves the build whose pair id is `pair` (null: a build of no pair): if it served
@@ -84,6 +107,7 @@ export class Inbox {
       for (let i = this.#events.length - 1; i >= 0; i--) if (isNetwork(this.#events[i]!)) this.#events.splice(i, 1);
       this.#delivered = [];
       this.#payloads.clear();
+      this.#held = 0;
     }
     this.#pair = pair;
     return changed;
@@ -158,12 +182,17 @@ export function parseServer(text: string): Server {
   return { url, certificateHash: certificateHash as number[] };
 }
 
-/** One connection: its session and its stream's writer, once it's open. */
+/** One connection: its session and its stream's writer, once it's open, and the bytes waiting
+ * to be written on it. */
 interface Session {
   transport: WebTransport | null;
   writer: WritableStreamDefaultWriter<Uint8Array> | null;
   closed: boolean;
+  pending: number;
 }
+
+/** The pair id in a session's path: 16 hex digits. */
+export const pairParam = (pair: bigint) => pair.toString(16).padStart(16, "0");
 
 /**
  * A program's connections (`platform::net`'s `open`, `send`, `close`). Each opened connection
@@ -176,6 +205,8 @@ export class Net {
   #server: Promise<Server> | null = null;
   /** What arrived: a message's bytes, or a connection's opening or closing. */
   arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean })[] = [];
+  /** The bytes the messages in `arrived` hold, each counted with OVERHEAD more. */
+  #held = 0;
 
   /** `base`: where `net.json` is; `print`: a line for whoever runs the program. */
   constructor(
@@ -193,17 +224,23 @@ export class Net {
     return this.#server;
   }
 
-  /** Opens connection `conn` to room `room`. A number already open is the program's mistake. */
-  open(conn: number, room: string): void {
+  /** Opens connection `conn` to room `room`, for the build of pair id `pair` (a build of none
+   * can't join a room). A number already open is the program's mistake. */
+  open(conn: number, room: string, pair: bigint | null): void {
     if (this.#sessions.has(conn)) throw new Error(`connection ${conn} is open`);
-    const session: Session = { transport: null, writer: null, closed: false };
+    const session: Session = { transport: null, writer: null, closed: false, pending: 0 };
     this.#sessions.set(conn, session);
     if (!roomName(room)) {
       this.print(`connection ${conn}: \`${room}\` isn't a room's name`);
       this.#end(conn, session);
       return;
     }
-    void this.#connect(conn, room, session);
+    if (pair === null) {
+      this.print(`connection ${conn}: this build has no pair id, so no server takes it`);
+      this.#end(conn, session);
+      return;
+    }
+    void this.#connect(conn, `${room}?pair=${pairParam(pair)}`, session);
   }
 
   async #connect(conn: number, room: string, session: Session): Promise<void> {
@@ -231,7 +268,13 @@ export class Net {
       for (;;) {
         const { value, done } = await reader.read();
         if (done || session.closed) break;
-        for (const bytes of frames.push(value)) this.arrived.push({ conn, bytes });
+        for (const bytes of frames.push(value)) {
+          if (this.#held + bytes.length + OVERHEAD > HELD) {
+            throw new Error(`more than ${HELD} bytes wait for the program`);
+          }
+          this.#held += bytes.length + OVERHEAD;
+          this.arrived.push({ conn, bytes });
+        }
       }
     } catch (e) {
       if (!session.closed) this.print(`connection ${conn}: ${errorMessage(e)}`);
@@ -240,7 +283,8 @@ export class Net {
   }
 
   /** Sends `bytes` on connection `conn`: nothing if it isn't open (it may have closed since the
-   * program last heard). A message past MAX_FRAME closes it. */
+   * program last heard). A message past MAX_FRAME closes it, and so does one past PENDING bytes
+   * not yet written. */
   send(conn: number, bytes: Uint8Array): void {
     const session = this.#sessions.get(conn);
     if (!session?.writer || session.closed) return;
@@ -249,7 +293,18 @@ export class Net {
       this.close(conn);
       return;
     }
-    session.writer.write(frame(bytes)).catch(() => this.#end(conn, session));
+    const framed = frame(bytes);
+    const cost = framed.length + OVERHEAD;
+    if (session.pending + cost > PENDING) {
+      this.print(`connection ${conn}: more than ${PENDING} bytes wait to be written`);
+      this.close(conn);
+      return;
+    }
+    session.pending += cost;
+    session.writer.write(framed).then(
+      () => (session.pending -= cost),
+      () => this.#end(conn, session),
+    );
   }
 
   /** Closes connection `conn`. */
@@ -262,6 +317,7 @@ export class Net {
   closeAll(): void {
     for (const [conn, session] of [...this.#sessions]) this.#end(conn, session, false);
     this.arrived = [];
+    this.#held = 0;
   }
 
   /** Ends a connection once: its session closes, and the program hears (if `tell`). */
@@ -277,12 +333,25 @@ export class Net {
     if (tell) this.arrived.push({ conn, open: false });
   }
 
-  /** Queues what arrived since the last call into `inbox`. */
+  /** Queues what arrived since the last call into `inbox`. A message past what the inbox may
+   * hold (HELD) closes its connection: its later messages go, and its closing comes next. */
   deliver(inbox: Inbox): void {
-    for (const a of this.arrived) {
-      if ("bytes" in a) inbox.pushMessage(a.conn, a.bytes);
-      else inbox.push(connectionEvent(a.conn, a.open));
-    }
+    const arrived = this.arrived;
     this.arrived = [];
+    this.#held = 0;
+    const full = new Set<number>();
+    for (const a of arrived) {
+      if (!("bytes" in a)) {
+        inbox.push(connectionEvent(a.conn, a.open));
+      } else if (full.has(a.conn)) {
+        continue;
+      } else if (inbox.held + a.bytes.length + OVERHEAD > HELD) {
+        full.add(a.conn);
+        this.print(`connection ${a.conn}: more than ${HELD} bytes wait for the program`);
+        this.close(a.conn);
+      } else {
+        inbox.pushMessage(a.conn, a.bytes);
+      }
+    }
   }
 }

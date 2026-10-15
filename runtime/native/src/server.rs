@@ -90,12 +90,16 @@ pub struct Limits {
     pub memory: usize,
     /// How long one call into it may run.
     pub deadline: Duration,
+    /// The bytes one call's network commands may hold (what it keeps and sends): past them, the
+    /// call fails at the host's limits.
+    pub commands: usize,
 }
 
 impl Default for Limits {
-    /// 64 MiB, and 50 ms a call.
+    /// 64 MiB, 50 ms a call, and 16 MiB of commands a call (a 64 KiB message to 256
+    /// connections).
     fn default() -> Limits {
-        Limits { memory: 64 << 20, deadline: Duration::from_millis(50) }
+        Limits { memory: 64 << 20, deadline: Duration::from_millis(50), commands: 16 << 20 }
     }
 }
 
@@ -157,8 +161,11 @@ struct RoomState {
     dropped: u64,
     /// The events (and messages' bytes) the room hasn't read.
     input: Queue,
-    /// The network commands of the current call (`platform::net`), in order: never answered.
+    /// The network commands of the calls since they were last taken (`platform::net`), in
+    /// order: never answered. And their bytes, and the most they may hold.
     commands: Vec<Net>,
+    command_bytes: usize,
+    command_cap: usize,
 }
 
 /// A room's network command (`platform::net`): what the host does with a call's, once it
@@ -173,6 +180,9 @@ pub enum Net {
     Send(u32, Vec<u8>),
     /// Close a connection, after the call's sends (`net/close`).
     Close(u32),
+    /// Tag a connection, once the call's records are kept (`net/tag`): its `Connection` event
+    /// carries the tag when the room starts again.
+    Tag(u32, u32),
 }
 
 /// A network command from a host request's service and body, if it's one.
@@ -187,6 +197,12 @@ fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
         "net/compact" => Ok(Net::Compact(body.to_vec())),
         "net/send" => conn(body).map(|c| Net::Send(c, body[4..].to_vec())),
         "net/close" => conn(body).map(Net::Close),
+        "net/tag" => match body.get(4..8) {
+            Some(t) if body.len() == 8 => {
+                conn(body).map(|c| Net::Tag(c, u32::from_le_bytes(t.try_into().expect("four"))))
+            }
+            _ => Err("`net/tag` needs a connection's number and a tag".to_string()),
+        },
         _ => return None,
     })
 }
@@ -244,6 +260,8 @@ impl Room {
             dropped: 0,
             input: Queue::default(),
             commands: Vec::new(),
+            command_bytes: 0,
+            command_cap: limits.commands,
         };
         let mut store = Store::new(&ENGINE, state);
         store.limiter(|s| s);
@@ -277,9 +295,9 @@ impl Room {
         self.store.data_mut().input.push_message(conn, bytes);
     }
 
-    /// Queues that connection `conn` opened, or closed.
-    pub fn push_connection(&mut self, conn: u32, open: bool) {
-        self.store.data_mut().input.push(Event::connection(conn, open));
+    /// Queues that connection `conn` opened, or closed; `tag` is the tag the program gave it.
+    pub fn push_connection(&mut self, conn: u32, open: bool, tag: u32) {
+        self.store.data_mut().input.push(Event::connection(conn, open, tag));
     }
 
     /// How many events wait for its next call.
@@ -289,6 +307,7 @@ impl Room {
 
     /// The network commands of its calls since the last call to this, in order.
     pub fn take_commands(&mut self) -> Vec<Net> {
+        self.store.data_mut().command_bytes = 0;
         std::mem::take(&mut self.store.data_mut().commands)
     }
 
@@ -401,6 +420,15 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                         // A network command is the host's to carry out after the call: never
                         // answered, so it holds nothing for the program to take.
                         if let Some(net) = net_command(service, body) {
+                            s.command_bytes += body.len();
+                            if s.command_bytes > s.command_cap {
+                                let why = format!(
+                                    "a call's network commands past {} bytes",
+                                    s.command_cap
+                                );
+                                s.refused = Some(why.clone());
+                                return Err(wasmtime::format_err!(why));
+                            }
                             match net {
                                 Ok(n) => s.commands.push(n),
                                 Err(why) => {

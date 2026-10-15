@@ -395,6 +395,8 @@ export class Program {
   /** Input events not yet read (`wrela.input`), with messages' bytes. */
   readonly #inbox: Inbox;
   readonly #net: ProgramOptions["net"] | null;
+  /** Its build's pair id, which its connections give its server. */
+  #pair: bigint | null = null;
   /** What the replaced build kept (`wrela.kept`), and what this one keeps (`wrela.keep`). */
   readonly #kept: Uint8Array;
   #keeping = new Uint8Array(0);
@@ -447,7 +449,8 @@ export class Program {
     }
     const program = new Program(checker, executor, options);
     // Network events queued for another program's build go, and so do its connections.
-    if (program.#inbox.forBuild(pairOf(module))) program.#net?.closeAll();
+    program.#pair = pairOf(module);
+    if (program.#inbox.forBuild(program.#pair)) program.#net?.closeAll();
     const clock = clockImport(memory);
     const phase = phaseImport(memory);
     try {
@@ -637,7 +640,7 @@ export class Program {
           throw new TrapError("`net/open`'s room isn't UTF-8");
         }
         try {
-          net.open(connOf(service, body), room);
+          net.open(connOf(service, body), room, this.#pair);
         } catch (e) {
           throw new TrapError(errorMessage(e));
         }

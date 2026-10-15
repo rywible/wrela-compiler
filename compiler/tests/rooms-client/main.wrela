@@ -46,7 +46,7 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     s.frames += 1
     for e in events() {
         match e {
-            Event::Connection { conn, open } => {
+            Event::Connection { conn, open, .. } => {
                 if open {
                     send_all(conn, s.log.connect())
                 } else {

@@ -122,6 +122,7 @@ impl Rooms {
             port: self.port,
             identity,
             limits: wrela_host::server::Limits::default(),
+            bounds: wrela_serve::Bounds::default(),
         };
         let server = wrela_serve::start(config, &runtime)
             .map_err(|e| format!("can't serve on port {}: {e}", self.port))?;

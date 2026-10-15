@@ -116,7 +116,7 @@ pub fn serve(time: f32) {
                 Some(bytes) => print(f"{conn}: {bytes.len()} bytes, last {bytes[bytes.len() - 1]}"),
                 None => print("no bytes"),
             },
-            Event::Connection { conn, open } => print(f"{conn} open {open}"),
+            Event::Connection { conn, open, .. } => print(f"{conn} open {open}"),
             _ => {},
         }
     }
@@ -128,10 +128,10 @@ fn a_room_reads_messages_in_serve() {
     let dir = built("room", ROOM);
     let build = ServerBuild::load(&dir).expect("a server build");
     let mut room = Room::start(&build, Limits::default(), None).expect("started");
-    room.push_connection(5, true);
+    room.push_connection(5, true, 0);
     room.push_message(5, vec![1, 2, 3, 4]);
     room.serve(0.0).expect("serve");
-    room.push_connection(5, false);
+    room.push_connection(5, false, 0);
     room.serve(0.1).expect("serve");
     let (printed, _) = room.take_printed();
     assert_eq!(printed, ["5 open true", "5: 4 bytes, last 4", "5 open false"]);

@@ -307,7 +307,11 @@ fn a_room_keeps_its_state_and_reads_answers_on_the_next_call() {
 #[test]
 fn a_room_that_loops_fails_at_its_deadline_and_others_go_on() {
     let build = server_build("rooms_loop", ROOMS);
-    let limits = Limits { memory: 64 << 20, deadline: std::time::Duration::from_millis(200) };
+    let limits = Limits {
+        memory: 64 << 20,
+        deadline: std::time::Duration::from_millis(200),
+        ..Limits::default()
+    };
     let mut bad = Room::start(&build, limits, None).expect("started");
     let mut good = Room::start(&build, limits, None).expect("started");
     bad.serve(0.0).expect("serve 1");
@@ -334,13 +338,21 @@ pub fn serve(time: f32) {
 #[test]
 fn a_room_past_its_memory_cap_fails_as_the_hosts() {
     let build = server_build("rooms_grow", GROWS);
-    let limits = Limits { memory: 64 << 20, deadline: std::time::Duration::from_secs(20) };
+    let limits = Limits {
+        memory: 64 << 20,
+        deadline: std::time::Duration::from_secs(20),
+        ..Limits::default()
+    };
     let mut room = Room::start(&build, limits, None).expect("started");
     let grew = room.serve(0.0).expect_err("it outgrows its cap");
     assert_eq!(grew, Failure::Memory);
     assert!(!grew.is_program());
     // With room to grow, the same call succeeds: the cap was the host's, not the program's.
-    let roomy = Limits { memory: 1 << 30, deadline: std::time::Duration::from_secs(20) };
+    let roomy = Limits {
+        memory: 1 << 30,
+        deadline: std::time::Duration::from_secs(20),
+        ..Limits::default()
+    };
     let mut room = Room::start(&build, roomy, None).expect("started");
     room.serve(0.0).expect("it fits");
 }
@@ -375,7 +387,11 @@ pub fn serve(state: mut u32, time: f32) {}
 #[test]
 fn starting_a_room_has_a_deadline_too() {
     let build = server_build("rooms_init", LOOPS_AT_INIT);
-    let limits = Limits { memory: 64 << 20, deadline: std::time::Duration::from_millis(100) };
+    let limits = Limits {
+        memory: 64 << 20,
+        deadline: std::time::Duration::from_millis(100),
+        ..Limits::default()
+    };
     match Room::start(&build, limits, None) {
         Err(Failure::Deadline) => {}
         Err(other) => panic!("{other:?}"),

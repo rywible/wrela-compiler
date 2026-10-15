@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
 import { connectionEvent, isNetwork, textEvent } from "../src/input.ts";
-import { Frames, frame, Inbox, MAX_FRAME, Net, parseServer, roomName } from "../src/net.ts";
+import { Frames, frame, HELD, Inbox, MAX_FRAME, Net, PENDING, parseServer, roomName } from "../src/net.ts";
 
 const word = (e: Uint8Array, i: number) => new DataView(e.buffer, e.byteOffset, EVENT_SIZE).getUint32(4 * i, true);
 
@@ -74,11 +74,11 @@ describe("connections", () => {
     const lines: string[] = [];
     // Nothing listens on the discard port: the server's address can't be fetched.
     const net = new Net(() => "http://127.0.0.1:9/", (l) => lines.push(l));
-    net.open(1, "Not A Room");
+    net.open(1, "Not A Room", 1n);
     expect(lines).toEqual(["connection 1: `Not A Room` isn't a room's name"]);
     net.close(1);
-    net.open(2, "lobby");
-    expect(() => net.open(2, "lobby")).toThrow("connection 2 is open");
+    net.open(2, "lobby", 1n);
+    expect(() => net.open(2, "lobby", 1n)).toThrow("connection 2 is open");
     // Sending on what isn't open does nothing.
     net.send(3, Uint8Array.of(1));
     const inbox = new Inbox();
@@ -87,9 +87,107 @@ describe("connections", () => {
     expect(inbox.events.map((e) => [word(e, 0), word(e, 2), word(e, 3)])).toEqual([[14, 1, 0], [14, 2, 0]]);
     expect(lines.length).toBe(2);
     // Its number is free again; closing every connection tells the program nothing.
-    net.open(2, "lobby");
+    net.open(2, "lobby", 1n);
     net.closeAll();
     await new Promise((r) => setTimeout(r, 50));
     expect(net.arrived).toEqual([]);
+  });
+
+  test("a build of no pair id joins no room", () => {
+    const lines: string[] = [];
+    const net = new Net(() => "http://127.0.0.1:9/", (l) => lines.push(l));
+    net.open(1, "lobby", null);
+    expect(lines).toEqual(["connection 1: this build has no pair id, so no server takes it"]);
+    expect(net.arrived).toEqual([{ conn: 1, open: false }]);
+  });
+});
+
+/** Runs `body` with a server whose stream's writes never finish and whose reads are `reads`'s
+ * chunks; the URLs the sessions opened. */
+async function withServer(reads: Uint8Array[], body: (urls: string[]) => Promise<void>): Promise<void> {
+  const urls: string[] = [];
+  const saved = { fetch: globalThis.fetch, transport: globalThis.WebTransport };
+  globalThis.fetch = (async () => new Response('{"url": "https://localhost:1"}')) as unknown as typeof fetch;
+  globalThis.WebTransport = class {
+    ready = Promise.resolve();
+    closed = new Promise(() => {});
+    constructor(url: string) {
+      urls.push(url);
+    }
+    close() {}
+    async createBidirectionalStream() {
+      const readable = new ReadableStream<Uint8Array>({
+        start(c) {
+          for (const r of reads) c.enqueue(r);
+        },
+      });
+      return { readable, writable: new WritableStream<Uint8Array>({ write: () => new Promise(() => {}) }) };
+    }
+  } as unknown as typeof WebTransport;
+  try {
+    await body(urls);
+  } finally {
+    globalThis.fetch = saved.fetch;
+    globalThis.WebTransport = saved.transport;
+  }
+}
+
+const settle = async (until: () => boolean) => {
+  for (let i = 0; i < 200 && !until(); i++) await new Promise((r) => setTimeout(r, 5));
+};
+
+describe("what a connection holds", () => {
+  test("it gives its build's pair id, and writes waiting past PENDING bytes close it", async () => {
+    await withServer([], async (urls) => {
+      const lines: string[] = [];
+      const net = new Net(() => "http://x/", (l) => lines.push(l));
+      net.open(1, "lobby", 0xabcn);
+      await settle(() => net.arrived.length > 0);
+      expect(urls).toEqual(["https://localhost:1/room/lobby?pair=0000000000000abc"]);
+      expect(net.arrived).toEqual([{ conn: 1, open: true }]);
+      for (let i = 0; i < 40; i++) net.send(1, new Uint8Array(60_000));
+      expect(lines).toEqual([`connection 1: more than ${PENDING} bytes wait to be written`]);
+      expect(net.arrived).toEqual([{ conn: 1, open: true }, { conn: 1, open: false }]);
+    });
+  });
+
+  test("messages waiting past HELD bytes close their connection, once", async () => {
+    // More than HELD bytes of messages arrive, faster than the program reads them.
+    const reads = Array.from({ length: 300 }, () => frame(new Uint8Array(60_000)));
+    await withServer(reads, async () => {
+      const lines: string[] = [];
+      const net = new Net(() => "http://x/", (l) => lines.push(l));
+      net.open(1, "lobby", 1n);
+      await settle(() => net.arrived.some((a) => "open" in a && !a.open));
+      expect(lines).toEqual([`connection 1: more than ${HELD} bytes wait for the program`]);
+      const inbox = new Inbox();
+      net.deliver(inbox);
+      expect(inbox.held).toBeLessThanOrEqual(HELD);
+      const kinds = inbox.events.map((e) => (word(e, 0) === 14 ? `connection ${word(e, 3)}` : "message"));
+      expect(kinds[0]).toBe("connection 1");
+      expect(kinds.at(-1)).toBe("connection 0");
+      expect(kinds.filter((k) => k.startsWith("connection")).length).toBe(2);
+    });
+  });
+
+  test("an inbox past HELD bytes closes the connection its messages come from", async () => {
+    await withServer([], async () => {
+      const lines: string[] = [];
+      const net = new Net(() => "http://x/", (l) => lines.push(l));
+      net.open(1, "lobby", 1n);
+      await settle(() => net.arrived.length > 0);
+      for (let i = 0; i < 300; i++) net.arrived.push({ conn: 1, bytes: new Uint8Array(60_000) });
+      const inbox = new Inbox();
+      net.deliver(inbox);
+      expect(inbox.held).toBeLessThanOrEqual(HELD);
+      expect(lines).toEqual([`connection 1: more than ${HELD} bytes wait for the program`]);
+      expect(net.arrived).toEqual([{ conn: 1, open: false }]);
+      // What the program reads gives its bytes back.
+      while (inbox.length > 0) {
+        inbox.take(64);
+        inbox.endCall();
+      }
+      expect(inbox.held).toBe(0);
+    });
   });
 });

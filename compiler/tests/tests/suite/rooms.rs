@@ -3,7 +3,7 @@
 //! a proposal that traps the room or one that runs past its deadline leave. The peers are played
 //! here, in Rust, by their packed messages (`std::pack`'s rules).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use wrela_host::rooms::{Fault, Out, RoomHost, Status};
 use wrela_host::server::{Failure, Limits, ServerBuild};
 
@@ -133,6 +133,14 @@ pub(crate) fn down(bytes: &[u8]) -> Down {
     }
 }
 
+/// A refusal's bytes: `Down::Refused { why }`.
+fn refused(why: u32) -> Vec<u8> {
+    let mut b = Bits::default();
+    b.varint(5);
+    b.varint(u64::from(why));
+    b.finish()
+}
+
 /// What a room released to connection `conn`, read.
 fn sent_to(out: &[Out], conn: u32) -> Vec<Down> {
     out.iter()
@@ -183,8 +191,19 @@ pub fn serve(room: mut Room<Tags, u32>, time: f32) {
 /// The server program's module, built once for every test here.
 pub(crate) fn wasm() -> &'static [u8] {
     static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    WASM.get_or_init(|| {
-        let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join("rooms-program");
+    WASM.get_or_init(|| server_wasm("rooms-program", PROGRAM))
+}
+
+/// A server program that never reads its events.
+const DEAF: &str = r#"
+pub fn serve(time: f32) {}
+"#;
+
+/// The server build of `program` (a package's main.wrela, beside the platform), in scratch
+/// directory `name`.
+fn server_wasm(name: &str, program: &str) -> Vec<u8> {
+    {
+        let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&root);
         let pkg = root.join("pkg");
         std::fs::create_dir_all(&pkg).expect("scratch package");
@@ -197,11 +216,11 @@ pub(crate) fn wasm() -> &'static [u8] {
             ),
         )
         .expect("manifest");
-        std::fs::write(pkg.join("main.wrela"), PROGRAM).expect("main");
+        std::fs::write(pkg.join("main.wrela"), program).expect("main");
         let out = root.join("build");
         wrela_tests::must_build(&pkg, &out);
         std::fs::read(out.join("server/game.wasm")).expect("the server build")
-    })
+    }
 }
 
 /// The server build, its WASM's hash, and a fresh directory for the test's rooms.
@@ -213,7 +232,11 @@ fn build(name: &str) -> (std::sync::Arc<ServerBuild>, u64, PathBuf) {
 }
 
 fn limits() -> Limits {
-    Limits { memory: 64 << 20, deadline: std::time::Duration::from_millis(500) }
+    Limits {
+        memory: 64 << 20,
+        deadline: std::time::Duration::from_millis(500),
+        ..Limits::default()
+    }
 }
 
 // ---- the tests ---------------------------------------------------------------------------------
@@ -366,7 +389,11 @@ fn a_proposal_that_traps_the_room_is_refused_and_the_rest_go_on() {
 #[test]
 fn a_proposal_past_its_deadline_keeps_nothing() {
     let (build, hash, dir) = build("deadline");
-    let fast = Limits { memory: 64 << 20, deadline: std::time::Duration::from_millis(100) };
+    let fast = Limits {
+        memory: 64 << 20,
+        deadline: std::time::Duration::from_millis(100),
+        ..Limits::default()
+    };
     let mut room = RoomHost::open(build.clone(), hash, &dir, "a", fast).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
@@ -445,4 +472,151 @@ fn a_journal_its_program_cant_read_quarantines_the_room() {
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("it opened"),
     }
+}
+
+/// `n` proposals of peer 1 from connection `conn`, from counter `from`, acknowledging as they go
+/// so its window moves on.
+fn proposals(room: &mut RoomHost, conn: u32, from: u32, n: u32) {
+    for c in from..from + n {
+        room.receive(conn, propose(1, 1, c, c * 7 + 3));
+        if c % 100 == 0 {
+            room.receive(conn, ack(c));
+        }
+    }
+}
+
+/// How many entries room `dir`/`a` has, read back by a new host process.
+fn entries_after_a_restart(build: &std::sync::Arc<ServerBuild>, hash: u64, dir: &Path) -> u64 {
+    let mut room = RoomHost::open(build.clone(), hash, dir, "a", roomy()).expect("reopen");
+    room.connect(9);
+    room.receive(9, hello(77, 1, 0, 0));
+    room.wake(9.0).expect("wake");
+    match sent_to(&room.take_outbox(), 9).first() {
+        Some(Down::Welcome { seq, .. }) => *seq,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Limits for a call that takes a hundred thousand proposals.
+fn roomy() -> Limits {
+    Limits { deadline: std::time::Duration::from_secs(20), commands: 1 << 30, ..limits() }
+}
+
+#[test]
+fn a_journal_compacted_while_its_read_back_keeps_what_it_hadnt_read() {
+    let (build, hash, dir) = build("long-journal");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", roomy()).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    room.take_outbox();
+    // A call's worth of proposals (a megabyte of them), whose compaction fails: the journal
+    // keeps every record, more than a call reads back.
+    room.inject(Fault::Compact);
+    proposals(&mut room, 1, 1, 77_600);
+    assert!(matches!(room.wake(0.2), Err(Failure::Host(_))));
+    let long = room.journal().expect("journal");
+    let bytes: usize = long.iter().map(Vec::len).sum();
+    assert!(bytes > wrela_abi::input::PAYLOAD_PER_CALL, "{bytes} bytes");
+    // The room starts again: it compacts after the first call's worth it reads back, and the
+    // records after that stay in the journal behind the snapshot.
+    room.connect(2);
+    room.receive(2, hello(5, 1, 0, 0));
+    room.wake(0.3).expect("wake");
+    let seq = match sent_to(&room.take_outbox(), 2).first() {
+        Some(Down::Welcome { seq, .. }) => *seq,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(seq, 77_600);
+    assert!(room.journal().expect("journal").len() < long.len(), "it compacted");
+    drop(room);
+    assert_eq!(entries_after_a_restart(&build, hash, &dir), seq);
+    assert_eq!(entries_after_a_restart(&build, hash, &dir), seq);
+}
+
+#[test]
+fn a_wake_past_a_calls_bytes_gives_the_room_all_of_it() {
+    let (build, hash, dir) = build("long-wake");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
+    room.connect(1);
+    room.connect(2);
+    room.receive(1, hello(5, 1, 0, 0));
+    // Twenty messages of 60 KiB, more than a call is given, before the proposal.
+    for _ in 0..20 {
+        room.receive(2, vec![255; 60 << 10]);
+    }
+    room.receive(1, propose(1, 1, 1, 3));
+    room.wake(0.1).expect("wake");
+    let got = sent_to(&room.take_outbox(), 1);
+    assert_eq!(
+        got,
+        [Down::Welcome { peer: 1, seq: 0 }, Down::Committed { seq: 1, counter: 1, value: 3 }]
+    );
+}
+
+#[test]
+fn a_journal_renamed_but_not_reopened_is_reopened() {
+    let (build, hash, dir) = build("renamed");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    room.take_outbox();
+    // The compaction's new journal is renamed into place, then the host fails before it holds
+    // the new file: the room starts again, and what it keeps from then on is on the disk.
+    room.inject(Fault::AfterRename);
+    proposals(&mut room, 1, 1, 1030);
+    assert!(matches!(room.wake(0.2), Err(Failure::Host(_))));
+    room.connect(2);
+    room.receive(2, hello(5, 1, 0, 0));
+    room.receive(2, propose(1, 1, 1031, 2));
+    room.wake(0.3).expect("wake");
+    let seq = match sent_to(&room.take_outbox(), 2).last() {
+        Some(Down::Committed { seq, counter: 1031, .. }) => *seq,
+        other => panic!("{other:?}"),
+    };
+    drop(room);
+    assert_eq!(entries_after_a_restart(&build, hash, &dir), seq);
+}
+
+#[test]
+fn a_connection_is_its_peers_only_through_its_hello() {
+    let (build, hash, dir) = build("tags");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    room.take_outbox();
+    // Another connection names peer 1, whose id every entry shows, without its token: refused,
+    // and the peer keeps its connection.
+    room.connect(2);
+    room.receive(2, propose(1, 1, 1, 3));
+    room.wake(0.2).expect("stranger");
+    assert_eq!(room.take_outbox(), [Out::Send(2, refused(2)), Out::Close(2)]);
+    // A proposal that traps the room, in a later call than the hello: the fresh instance
+    // knows connection 1 is peer 1's by its tag, and refuses the proposal durably.
+    room.receive(1, propose(1, 1, 1, 13));
+    room.receive(1, propose(1, 1, 2, 4));
+    room.wake(0.3).expect("isolated");
+    assert_eq!(
+        sent_to(&room.take_outbox(), 1),
+        [
+            Down::Rejected { counter: 1, reason: u32::MAX },
+            Down::Committed { seq: 1, counter: 2, value: 4 },
+        ]
+    );
+}
+
+#[test]
+fn a_server_that_doesnt_read_its_events_is_quarantined() {
+    let wasm = server_wasm("deaf-program", DEAF);
+    let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join("rooms-deaf");
+    let _ = std::fs::remove_dir_all(&dir);
+    let build = std::sync::Arc::new(ServerBuild::from_wasm(&wasm).expect("a server build"));
+    let hash = wrela_abi::ticks::wasm_hash(&wasm);
+    let mut room = RoomHost::open(build, hash, &dir, "a", limits()).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    assert!(matches!(room.wake(0.1), Err(Failure::Program(_))));
+    assert!(matches!(room.status(), Status::Quarantined(_)), "{:?}", room.status());
 }
