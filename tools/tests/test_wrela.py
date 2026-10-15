@@ -12,7 +12,9 @@ import unittest
 class DirectCli(unittest.TestCase):
     def test_checkout_local_build_arguments_and_exit_statuses(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            # Resolved: macOS keeps temporary files behind a symbolic link (/var is /private/var),
+            # and a process's working directory is the real path.
+            root = Path(temporary).resolve()
             checkout, caller, binaries = root / "checkout", root / "caller", root / "bin"
             (checkout / "tools").mkdir(parents=True)
             caller.mkdir()

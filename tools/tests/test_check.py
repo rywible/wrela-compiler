@@ -250,7 +250,8 @@ class WrelaSelection(unittest.TestCase):
 
     def test_a_package_group_runs_every_test_and_fails_on_none_or_any_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            # Resolved, as the checkout's ROOT is: macOS's /var is a link to /private/var.
+            root = Path(temporary).resolve()
             (root / 'engine').mkdir()
             logs = root / 'logs'; logs.mkdir()
             def report(tests):

@@ -7,16 +7,17 @@ pub use std::arena::{Arena, Handle, SortedMap}
 pub use std::quat::Quat
 use std::hash::StateHash
 use std::serialize::Serialize
+use std::pack::Pack
 
 /// A value that may be absent. There's no null (language.md §6.1).
-pub enum Option<T>: Copy + Eq + Ord + StateHash + Serialize + Plain {
+pub enum Option<T>: Copy + Eq + Ord + StateHash + Serialize + Pack + Plain {
     None,
     Some(T),
 }
 
 /// The outcome of something that can fail: its value, or an error (§15). `x?` is `x`'s value,
 /// or returns its `Err` from the function.
-pub enum Result<T, E>: Copy + Eq + Ord + StateHash + Serialize {
+pub enum Result<T, E>: Copy + Eq + Ord + StateHash + Serialize + Pack {
     Ok(T),
     Err(E),
 }

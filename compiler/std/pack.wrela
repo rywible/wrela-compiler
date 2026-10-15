@@ -1,0 +1,841 @@
+// Packing (language.md §6.11): `Pack`, derived field by field, as small as the values allow, for
+// bytes that both ends read with the same build: a network message, a durable log record. No
+// names: fields come in order, a variant as its index. Unlike `Serialize`, packed bytes don't
+// survive a change to their type: what reads them must be the build that wrote them.
+//
+// The bits, lowest first within each byte, bytes in order:
+// - `bool`: one bit. `u8` and `i8`: eight bits.
+// - `u16`, `u32`, `u64`: a varint: 7-bit groups, lowest first, each followed by a bit that's 1
+//   when another group follows. The shortest form only (a last group of 0 is refused unless
+//   it's the only one), and at most the groups the width needs (3, 5, 10), the last holding no
+//   bit past the width.
+// - `i16`, `i32`, `i64`: zigzag (0, -1, 1, -2, ... as 0, 1, 2, 3, ...), then a varint.
+// - `f32`, `f64`: their 32 or 64 bits. A NaN is written as the quiet NaN with no payload, and
+//   reading any other NaN fails.
+// - `String`: a varint byte count, then the bytes, eight bits each; reading fails unless they're
+//   UTF-8. `Vec`: a varint count, then the elements. `Box`: a bit, 1 if it holds a value, then
+//   the value. An enum: its variant's index, as a varint, then its fields.
+// - The value's last byte is padded with zero bits. Reading a value fails if any byte is left
+//   after it, or a padding bit is 1: a value has exactly one packing.
+//
+// Reading never traps: bytes that don't hold a value give a `PackError`. It also stays within a
+// `Budget`: how many elements the value may hold (strings' bytes, vectors' elements, whatever
+// their size, so elements of no bits can't make it loop), and how deeply vectors and boxes may
+// nest.
+
+/// Bits being written.
+pub struct BitWriter: Clone {
+    bytes: Vec<u8>,
+    /// Bits written but not yet a whole byte in `bytes`, lowest first, and how many.
+    pending: u64,
+    filled: u32,
+}
+
+impl BitWriter {
+    /// A writer that holds no bits.
+    pub fn new() -> BitWriter {
+        BitWriter { bytes: Vec::new(), pending: 0, filled: 0 }
+    }
+
+    /// How many bits are written.
+    pub fn bits(self) -> u32 {
+        8 * self.bytes.len() + self.filled
+    }
+
+    /// The bytes, the last padded with zero bits, moved out.
+    pub fn into_bytes(take self) -> Vec<u8> {
+        var w = take self
+        if w.filled > 0 {
+            w.bytes.push(u8(w.pending & 255))
+        }
+        replace(mut w.bytes, Vec::new())
+    }
+
+    /// Writes the low `n` bits of `x` (`n` from 0 to 32), lowest first.
+    pub fn write_bits(mut self, x: u32, n: u32) {
+        if n == 0 {
+            return
+        }
+        let low = if n >= 32 { x } else { x & ((1 << n) - 1) }
+        self.pending = self.pending | (u64(low) << self.filled)
+        self.filled += n
+        while self.filled >= 8 {
+            self.bytes.push(u8(self.pending & 255))
+            self.pending = self.pending >> 8
+            self.filled -= 8
+        }
+    }
+
+    /// Writes a bit.
+    pub fn write_bool(mut self, b: bool) {
+        self.write_bits(if b { 1 } else { 0 }, 1)
+    }
+
+    /// Writes `x` as a varint.
+    pub fn write_varint(mut self, x: u32) {
+        var rest = x
+        loop {
+            let group = rest & 127
+            rest = rest >> 7
+            if rest == 0 {
+                self.write_bits(group, 8)
+                return
+            }
+            self.write_bits(group | 128, 8)
+        }
+    }
+
+    /// Writes `x` as a varint.
+    pub fn write_varint64(mut self, x: u64) {
+        var rest = x
+        loop {
+            let group = u32(rest & 127)
+            rest = rest >> 7
+            if rest == 0 {
+                self.write_bits(group, 8)
+                return
+            }
+            self.write_bits(group | 128, 8)
+        }
+    }
+}
+
+/// Why bits couldn't be read: the bit where it went wrong, and what was wrong.
+pub struct PackError: Copy + Eq {
+    /// The bit offset, from the first byte's lowest bit.
+    pub at: u32,
+    pub what: Text,
+}
+
+/// What reading a value may hold: how many elements (strings' bytes and vectors' elements) and
+/// how deeply vectors and boxes may nest.
+pub struct Budget: Copy + Eq {
+    pub elements: u32,
+    pub depth: u32,
+}
+
+impl Budget {
+    /// A million elements, nested 64 deep.
+    pub fn new() -> Budget {
+        Budget { elements: 1048576, depth: 64 }
+    }
+}
+
+/// Bits being read.
+pub struct BitReader: Clone {
+    bytes: Vec<u8>,
+    /// The next bit's offset.
+    at: u32,
+    /// What's left of the budget.
+    left: Budget,
+}
+
+impl BitReader {
+    /// A reader at the start of `bytes`, within `budget`.
+    pub fn new(bytes: take Vec<u8>, budget: Budget) -> BitReader {
+        BitReader { bytes, at: 0, left: budget }
+    }
+
+    /// How many bits are left.
+    pub fn bits_left(self) -> u32 {
+        8 * self.bytes.len() - self.at
+    }
+
+    /// An error at the reader's position: for a hand-written `unpack`.
+    pub fn error(self, what: Text) -> PackError {
+        PackError { at: self.at, what }
+    }
+
+    /// The next `n` bits (`n` from 0 to 32), lowest first.
+    pub fn read_bits(mut self, n: u32) -> Result<u32, PackError> {
+        if n > self.bits_left() {
+            return Err(self.error("the bytes end in the middle of a value"))
+        }
+        var x: u64 = 0
+        var got = 0
+        while got < n {
+            let shift = self.at % 8
+            let width = min(8 - shift, n - got)
+            let byte = u64(self.bytes[self.at / 8]) >> shift
+            x = x | ((byte & ((1 << width) - 1)) << got)
+            got += width
+            self.at += width
+        }
+        Ok(u32(x))
+    }
+
+    /// The next bit.
+    pub fn read_bool(mut self) -> Result<bool, PackError> {
+        Ok(self.read_bits(1)? == 1)
+    }
+
+    /// A varint of at most `bits` bits (16 or 32).
+    fn read_varint_of(mut self, bits: u32) -> Result<u32, PackError> {
+        let start = self.at
+        var x: u32 = 0
+        var shift = 0
+        loop {
+            let byte = self.read_bits(8)?
+            let group = byte & 127
+            if shift + 7 > bits && (group >> (bits - shift)) != 0 {
+                return Err(PackError { at: start, what: "a varint is larger than its type" })
+            }
+            x = x | (group << shift)
+            if byte < 128 {
+                if group == 0 && shift > 0 {
+                    return Err(PackError { at: start, what: "a varint isn't in its shortest form" })
+                }
+                return Ok(x)
+            }
+            shift += 7
+            if shift >= bits {
+                return Err(PackError { at: start, what: "a varint is larger than its type" })
+            }
+        }
+    }
+
+    /// A varint.
+    pub fn read_varint(mut self) -> Result<u32, PackError> {
+        self.read_varint_of(32)
+    }
+
+    /// A varint.
+    pub fn read_varint64(mut self) -> Result<u64, PackError> {
+        let start = self.at
+        var x: u64 = 0
+        var shift: u32 = 0
+        loop {
+            let byte = self.read_bits(8)?
+            let group = u64(byte & 127)
+            if shift + 7 > 64 && (group >> (64 - shift)) != 0 {
+                return Err(PackError { at: start, what: "a varint is larger than its type" })
+            }
+            x = x | (group << shift)
+            if byte < 128 {
+                if group == 0 && shift > 0 {
+                    return Err(PackError { at: start, what: "a varint isn't in its shortest form" })
+                }
+                return Ok(x)
+            }
+            shift += 7
+            if shift >= 64 {
+                return Err(PackError { at: start, what: "a varint is larger than its type" })
+            }
+        }
+    }
+
+    /// Counts `n` elements against the budget, before they're read or allocated.
+    pub fn count(mut self, n: u32) -> Result<(), PackError> {
+        if n > self.left.elements {
+            return Err(self.error("more elements than the budget allows"))
+        }
+        self.left.elements -= n
+        Ok(())
+    }
+
+    /// Goes a level deeper (into a vector's elements or a box's value): `leave` comes back.
+    pub fn enter(mut self) -> Result<(), PackError> {
+        if self.left.depth == 0 {
+            return Err(self.error("values nest more deeply than the budget allows"))
+        }
+        self.left.depth -= 1
+        Ok(())
+    }
+
+    /// Comes back from `enter`.
+    pub fn leave(mut self) {
+        self.left.depth += 1
+    }
+
+    /// Whether the value read so far is all the bytes held: at most seven bits left, all zero.
+    pub fn finish(mut self) -> Result<(), PackError> {
+        let rest = self.bits_left()
+        if rest >= 8 {
+            return Err(self.error("bytes are left after the value"))
+        }
+        if self.read_bits(rest)? != 0 {
+            return Err(self.error("a padding bit isn't zero"))
+        }
+        Ok(())
+    }
+}
+
+/// Packing, field by field: `x.pack(mut w)` writes `x`'s bits, and `T::unpack(mut r)` reads a `T`
+/// back. Declare it on a type, `struct Move: Pack { ... }`, and both are derived.
+@fieldwise
+pub trait Pack {
+    /// Writes the value's bits into `w`.
+    fn pack(self, w: mut BitWriter)
+
+    /// Reads a value from `r`, or an error if the bits don't hold one.
+    fn unpack(r: mut BitReader) -> Result<Self, PackError>
+
+    /// What the derived `pack` writes before a field: nothing.
+    fn pack_field(name: Text, w: mut BitWriter) {}
+
+    /// What the derived `pack` writes for an enum value's variant: its index, as a varint.
+    fn pack_variant(index: u32, name: Text, w: mut BitWriter) {
+        w.write_varint(index)
+    }
+
+    /// What the derived `unpack` reads before a field: nothing.
+    fn unpack_field(name: Text, r: mut BitReader) -> Result<(), PackError> {
+        Ok(())
+    }
+
+    /// Reads which variant comes next: its index, which must be one of `names`'.
+    fn unpack_variant(names: [Text], r: mut BitReader) -> Result<u32, PackError> {
+        let at = r.at
+        let index = r.read_varint()?
+        if index >= names.len() {
+            return Err(PackError { at, what: "a variant's index is past the enum's" })
+        }
+        Ok(index)
+    }
+}
+
+/// `x`'s packed bytes.
+///
+/// ```wrela
+/// use std::pack::{Pack, pack, unpack}
+///
+/// enum Edit: Pack {
+///     Move { id: u32, x: i32, y: i32 },
+///     Delete { id: u32 },
+/// }
+///
+/// let bytes = pack(Edit::Move { id: 7, x: -3, y: 40 })
+/// assert(bytes.len() == 4)
+/// match unpack::<Edit>(take bytes) {
+///     Ok(Edit::Move { id, x, y }) => assert(id == 7 && x == -3 && y == 40),
+///     _ => panic("it read back as another edit"),
+/// }
+/// ```
+pub fn pack<T: Pack>(x: T) -> Vec<u8> {
+    var w = BitWriter::new()
+    x.pack(mut w)
+    take w.into_bytes()
+}
+
+/// A `T` from `bytes`, which must hold exactly one, within the default `Budget`.
+pub fn unpack<T: Pack>(bytes: take Vec<u8>) -> Result<T, PackError> {
+    unpack_within(take bytes, Budget::new())
+}
+
+/// A `T` from `bytes`, which must hold exactly one, within `budget`.
+pub fn unpack_within<T: Pack>(bytes: take Vec<u8>, budget: Budget) -> Result<T, PackError> {
+    var r = BitReader::new(take bytes, budget)
+    let x = T::unpack(mut r)?
+    r.finish()?
+    Ok(x)
+}
+
+// The leaves.
+
+impl Pack for bool {
+    fn pack(self, w: mut BitWriter) {
+        w.write_bool(self)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<bool, PackError> {
+        r.read_bool()
+    }
+}
+
+impl Pack for u8 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_bits(u32(self), 8)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<u8, PackError> {
+        Ok(u8(r.read_bits(8)?))
+    }
+}
+
+impl Pack for i8 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_bits(u32(u8(self)), 8)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<i8, PackError> {
+        Ok(i8(u8(r.read_bits(8)?)))
+    }
+}
+
+impl Pack for u16 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(u32(self))
+    }
+
+    fn unpack(r: mut BitReader) -> Result<u16, PackError> {
+        Ok(u16(r.read_varint_of(16)?))
+    }
+}
+
+impl Pack for u32 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(self)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<u32, PackError> {
+        r.read_varint()
+    }
+}
+
+impl Pack for u64 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint64(self)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<u64, PackError> {
+        r.read_varint64()
+    }
+}
+
+/// 0, -1, 1, -2, ... as 0, 1, 2, 3, ...
+fn zigzag(x: i32) -> u32 {
+    if x >= 0 { 2 * u32(x) } else { 2 * u32(-(x + 1)) + 1 }
+}
+
+fn unzigzag(z: u32) -> i32 {
+    if z % 2 == 0 { i32(z / 2) } else { -i32(z / 2) - 1 }
+}
+
+impl Pack for i16 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(zigzag(i32(self)))
+    }
+
+    fn unpack(r: mut BitReader) -> Result<i16, PackError> {
+        Ok(i16(unzigzag(r.read_varint_of(16)?)))
+    }
+}
+
+impl Pack for i32 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(zigzag(self))
+    }
+
+    fn unpack(r: mut BitReader) -> Result<i32, PackError> {
+        Ok(unzigzag(r.read_varint()?))
+    }
+}
+
+impl Pack for i64 {
+    fn pack(self, w: mut BitWriter) {
+        let z = if self >= 0 { 2 * u64(self) } else { 2 * u64(-(self + 1)) + 1 }
+        w.write_varint64(z)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<i64, PackError> {
+        let z = r.read_varint64()?
+        Ok(if z % 2 == 0 { i64(z / 2) } else { -i64(z / 2) - 1 })
+    }
+}
+
+/// The quiet NaN with no payload: the only NaN packed.
+const NAN32: u32 = 0x7FC00000
+const NAN64: u64 = 0x7FF8000000000000
+
+impl Pack for f32 {
+    fn pack(self, w: mut BitWriter) {
+        w.write_bits(if self != self { NAN32 } else { bitcast_u32(self) }, 32)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<f32, PackError> {
+        let at = r.at
+        let bits = r.read_bits(32)?
+        let x = bitcast_f32(bits)
+        if x != x && bits != NAN32 {
+            return Err(PackError { at, what: "a NaN isn't the quiet one with no payload" })
+        }
+        Ok(x)
+    }
+}
+
+impl Pack for f64 {
+    fn pack(self, w: mut BitWriter) {
+        let bits = if self != self { NAN64 } else { bitcast_u64(self) }
+        w.write_bits(u32(bits & 0xFFFFFFFF), 32)
+        w.write_bits(u32(bits >> 32), 32)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<f64, PackError> {
+        let at = r.at
+        let low = u64(r.read_bits(32)?)
+        let high = u64(r.read_bits(32)?)
+        let bits = low | (high << 32)
+        let x = bitcast_f64(bits)
+        if x != x && bits != NAN64 {
+            return Err(PackError { at, what: "a NaN isn't the quiet one with no payload" })
+        }
+        Ok(x)
+    }
+}
+
+impl Pack for vec2 {
+    fn pack(self, w: mut BitWriter) {
+        Pack::pack([self.x, self.y], mut w)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<vec2, PackError> {
+        let x = f32::unpack(mut r)?
+        let y = f32::unpack(mut r)?
+        Ok(vec2(x, y))
+    }
+}
+
+impl Pack for vec3 {
+    fn pack(self, w: mut BitWriter) {
+        Pack::pack([self.x, self.y, self.z], mut w)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<vec3, PackError> {
+        let x = f32::unpack(mut r)?
+        let y = f32::unpack(mut r)?
+        let z = f32::unpack(mut r)?
+        Ok(vec3(x, y, z))
+    }
+}
+
+impl Pack for vec4 {
+    fn pack(self, w: mut BitWriter) {
+        Pack::pack([self.x, self.y, self.z, self.w], mut w)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<vec4, PackError> {
+        let x = f32::unpack(mut r)?
+        let y = f32::unpack(mut r)?
+        let z = f32::unpack(mut r)?
+        let w = f32::unpack(mut r)?
+        Ok(vec4(x, y, z, w))
+    }
+}
+
+impl Pack for vec2i {
+    fn pack(self, w: mut BitWriter) {
+        Pack::pack([self.x, self.y], mut w)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<vec2i, PackError> {
+        let x = i32::unpack(mut r)?
+        let y = i32::unpack(mut r)?
+        Ok(vec2i(x, y))
+    }
+}
+
+impl Pack for vec2u {
+    fn pack(self, w: mut BitWriter) {
+        Pack::pack([self.x, self.y], mut w)
+    }
+
+    fn unpack(r: mut BitReader) -> Result<vec2u, PackError> {
+        let x = u32::unpack(mut r)?
+        let y = u32::unpack(mut r)?
+        Ok(vec2u(x, y))
+    }
+}
+
+impl Pack for String {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(self.len())
+        for i in 0..self.len() {
+            w.write_bits(u32(self.byte(i)), 8)
+        }
+    }
+
+    fn unpack(r: mut BitReader) -> Result<String, PackError> {
+        let at = r.at
+        let n = r.read_varint()?
+        if n > r.bits_left() / 8 {
+            return Err(PackError { at, what: "the text is longer than the bytes left" })
+        }
+        r.count(n)?
+        var bytes: Vec<u8> = Vec::with_capacity(n)
+        for _ in 0..n {
+            bytes.push(u8(r.read_bits(8)?))
+        }
+        let Some(s) = String::from_utf8(take bytes) else {
+            return Err(PackError { at, what: "the text isn't UTF-8" })
+        }
+        Ok(s)
+    }
+}
+
+impl<T: Pack> Pack for Vec<T> {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(self.len())
+        for x in self {
+            x.pack(mut w)
+        }
+    }
+
+    fn unpack(r: mut BitReader) -> Result<Vec<T>, PackError> {
+        let n = r.read_varint()?
+        // Counted first: elements of no bits can't make it loop, and the allocation is bounded
+        // by the bits left too.
+        r.count(n)?
+        r.enter()?
+        var out = Vec::with_capacity(min(n, r.bits_left()))
+        for _ in 0..n {
+            out.push(T::unpack(mut r)?)
+        }
+        r.leave()
+        Ok(out)
+    }
+}
+
+/// The elements in use, as a `Vec`'s are: a varint count, then each.
+impl<T: Pack + Copy, const N: u32> Pack for Bounded<T, N> {
+    fn pack(self, w: mut BitWriter) {
+        w.write_varint(self.len())
+        for x in self {
+            x.pack(mut w)
+        }
+    }
+
+    fn unpack(r: mut BitReader) -> Result<Bounded<T, N>, PackError> {
+        let at = r.at
+        let n = r.read_varint()?
+        if n > N {
+            return Err(PackError { at, what: "more elements than the `Bounded` holds" })
+        }
+        r.count(n)?
+        var out = Bounded::new()
+        for _ in 0..n {
+            out.push(T::unpack(mut r)?)
+        }
+        Ok(out)
+    }
+}
+
+impl<T: Pack> Pack for Box<T> {
+    /// A bit, 1 if it holds a value, then the value.
+    fn pack(self, w: mut BitWriter) {
+        w.write_bool(!self.is_empty())
+        if !self.is_empty() {
+            self.get().pack(mut w)
+        }
+    }
+
+    fn unpack(r: mut BitReader) -> Result<Box<T>, PackError> {
+        if !r.read_bool()? {
+            return Ok(Box::empty())
+        }
+        r.enter()?
+        let x = T::unpack(mut r)?
+        r.leave()
+        Ok(Box::new(take x))
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+use std::serialize::Serialize
+
+struct Sample: Pack + Eq + Clone {
+    on: bool,
+    tag: u8,
+    small: u32,
+    big: u64,
+    signed: i32,
+    wide: i64,
+    half: u16,
+    short: i16,
+    x: f32,
+    y: f64,
+    at: vec2,
+    name: String,
+    list: Vec<u32>,
+    boxed: Box<u32>,
+    maybe: Option<i32>,
+    kind: Kind,
+}
+
+enum Kind: Pack + Serialize + Eq + Copy {
+    Empty,
+    One(u32),
+    Two { a: bool, b: i32 },
+}
+
+fn sample(seed: u32) -> Sample {
+    // A cheap, fixed sequence of numbers, so every run checks the same values.
+    var s = u32((u64(seed) * 2654435761 + 1) & 0xFFFFFFFF)
+    var next = || -> u32 {
+        s = s ^ (s << 13)
+        s = s ^ (s >> 17)
+        s = s ^ (s << 5)
+        s
+    }
+    let a = next()
+    let b = next()
+    let c = next()
+    let d = next()
+    var list: Vec<u32> = Vec::new()
+    for i in 0..(a % 6) {
+        list.push(next() >> (i * 5))
+    }
+    let kinds = [
+        Kind::Empty,
+        Kind::One(b >> (c % 32)),
+        Kind::Two { a: c % 2 == 0, b: i32(d >> 1) - 1073741824 },
+    ]
+    Sample {
+        on: a % 2 == 1,
+        tag: u8(b & 255),
+        small: a >> (b % 32),
+        big: (u64(c) << 32) | u64(d),
+        signed: (i32(b >> 1) - 1073741824) >> (a % 31),
+        wide: -i64(c) * 65536,
+        half: u16(a & 65535),
+        short: i16(i32(b & 65535) - 32768),
+        x: f32(i32(c % 2000)) / 8.0 - 100.0,
+        y: f64(d) / 3.0,
+        at: vec2(f32(a % 640), f32(b % 480)),
+        name: if a % 3 == 0 { String::from("é note") } else { String::new() },
+        list,
+        boxed: if b % 2 == 0 { Box::new(c) } else { Box::empty() },
+        maybe: if c % 2 == 0 { Some(i32(d >> 2)) } else { None },
+        kind: kinds[a % 3],
+    }
+}
+
+@test
+fn packed_values_round_trip() {
+    for seed in 0..500 {
+        let v = sample(seed)
+        let bytes = pack(v.clone())
+        match unpack::<Sample>(take bytes) {
+            Ok(back) => assert(back == v, f"seed {seed}"),
+            Err(e) => panic(f"seed {seed}: {e.what} at bit {e.at}"),
+        }
+    }
+}
+
+@test
+fn bits_go_lowest_first_and_the_last_byte_is_padded() {
+    var w = BitWriter::new()
+    w.write_bool(true)
+    w.write_bits(x: 5, n: 3)
+    w.write_bits(x: 0x1FF, n: 9)
+    assert(w.bits() == 13)
+    let bytes = take w.into_bytes()
+    // 1, then 101, then 111111111: 1101 1111 | 1111 1 and three zero bits.
+    assert(bytes.len() == 2 && bytes[0] == 0xFB && bytes[1] == 0x1F, f"{bytes[0]} {bytes[1]}")
+}
+
+@test
+fn varints_take_the_shortest_form_only() {
+    assert(pack(u32(0)).len() == 1 && pack(u32(127)).len() == 1 && pack(u32(128)).len() == 2)
+    assert(pack(u32(4294967295)).len() == 5 && pack(u64(18446744073709551615)).len() == 10)
+    assert(pack(i32(-1))[0] == 1 && pack(i32(1))[0] == 2 && pack(i32(-2147483648)).len() == 5)
+    // 0 in two groups: not the shortest form.
+    assert(unpack::<u32>(Vec::from([0x80, 0x00])).is_err())
+    // Six groups, or a fifth group past 32 bits.
+    assert(unpack::<u32>(Vec::from([0x80, 0x80, 0x80, 0x80, 0x80, 0x01])).is_err())
+    assert(unpack::<u32>(Vec::from([0xFF, 0xFF, 0xFF, 0xFF, 0x1F])).is_err())
+    assert(unpack::<u32>(Vec::from([0xFF, 0xFF, 0xFF, 0xFF, 0x0F])).unwrap() == 4294967295)
+    // A u16 past 65535.
+    assert(unpack::<u16>(Vec::from([0xFF, 0xFF, 0x04])).is_err())
+    assert(unpack::<u16>(Vec::from([0xFF, 0xFF, 0x03])).unwrap() == 65535)
+    let extremes: [i64; 3] = [-9223372036854775807 - 1, 9223372036854775807, -1]
+    for x in extremes {
+        assert(unpack::<i64>(pack(x)).unwrap() == x)
+    }
+}
+
+@test
+fn a_value_has_exactly_one_packing() {
+    let bytes = pack(true)
+    assert(bytes.len() == 1 && bytes[0] == 1)
+    // A padding bit set, or a byte left over.
+    assert(unpack::<bool>(Vec::from([3])).is_err())
+    assert(unpack::<bool>(Vec::from([1, 0])).is_err())
+    // NaN: only the quiet one with no payload.
+    // A NaN with a payload is written as the one without.
+    let packed = pack(bitcast_f32(0x7FC00001))
+    assert(packed.len() == 4 && packed[0] == 0 && packed[2] == 0xC0 && packed[3] == 0x7F)
+    let back = unpack::<f32>(packed.clone()).unwrap()
+    assert(bitcast_u32(back) == 0x7FC00000)
+    assert(unpack::<f32>(Vec::from([1, 0, 0xC0, 0x7F])).is_err())
+    // Text that isn't UTF-8.
+    assert(unpack::<String>(Vec::from([1, 0xFF])).is_err())
+}
+
+@test
+fn truncated_bytes_fail_at_every_length() {
+    for seed in 0..40 {
+        let bytes = pack(sample(seed))
+        for n in 0..bytes.len() {
+            var cut: Vec<u8> = Vec::new()
+            for i in 0..n {
+                cut.push(bytes[i])
+            }
+            assert(unpack::<Sample>(take cut).is_err(), f"seed {seed}, {n} of {bytes.len()} bytes")
+        }
+    }
+}
+
+@test
+fn values_read_at_every_bit_offset() {
+    // A value after 0 to 7 bits of something else reads the same.
+    for offset in 0..8 {
+        for seed in 0..20 {
+            let v = sample(seed)
+            var w = BitWriter::new()
+            w.write_bits(0x55, offset)
+            v.pack(mut w)
+            var r = BitReader::new(take w.into_bytes(), Budget::new())
+            assert(r.read_bits(offset).unwrap() == 0x55 & ((1 << offset) - 1))
+            match Sample::unpack(mut r) {
+                Ok(back) => assert(back == v),
+                Err(e) => panic(f"offset {offset}, seed {seed}: {e.what}"),
+            }
+            assert(r.finish().is_ok())
+        }
+    }
+}
+
+@test
+fn hostile_counts_stay_within_the_budget() {
+    // A count of four billion empty arrays: refused before anything loops.
+    let refused = unpack::<Vec<[u32; 0]>>(Vec::from([0xFF, 0xFF, 0xFF, 0xFF, 0x0F]))
+    match refused {
+        Ok(_) => panic("a hostile count was accepted"),
+        Err(e) => assert(e.at == 0 || e.at == 40, f"{e.at}: {e.what}"),
+    }
+    // Within the budget, empty elements are fine; past it, they aren't.
+    let three: Vec<[u32; 0]> = Vec::filled(3, [0; 0])
+    assert(unpack::<Vec<[u32; 0]>>(pack(three.clone())).unwrap().len() == 3)
+    assert(unpack_within::<Vec<[u32; 0]>>(pack(three), Budget { elements: 2, depth: 64 }).is_err())
+    // Nesting past the depth.
+    let nested: Vec<Vec<Vec<u32>>> = Vec::from([Vec::from([Vec::from([1])])])
+    assert(
+        unpack_within::<Vec<Vec<Vec<u32>>>>(
+            pack(nested.clone()),
+            Budget { elements: 100, depth: 3 },
+        ).is_ok(),
+    )
+    assert(
+        unpack_within::<Vec<Vec<Vec<u32>>>>(
+            pack(nested),
+            Budget { elements: 100, depth: 2 },
+        ).is_err(),
+    )
+    // A text longer than the bytes left.
+    assert(unpack::<String>(Vec::from([0x7F, 0x41])).is_err())
+    // A variant past the enum's.
+    assert(unpack::<Kind>(Vec::from([3])).is_err())
+}
+
+@test
+fn packing_is_smaller_than_saving() {
+    // A whiteboard-like edit: Serialize writes names; Pack writes what's needed.
+    let v = Kind::Two { a: true, b: -40 }
+    let packed = pack(v)
+    let saved = std::serialize::save(v)
+    // A 2-bit index in its 8-bit varint, a bit, and -40 zigzagged to 79: 17 bits.
+    assert(packed.len() == 3, f"{packed.len()}")
+    // Its name (a count and 3 bytes), then each field's name and value: 7 + 6 + 9.
+    assert(saved.len() == 22, f"{saved.len()}")
+}
