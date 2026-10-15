@@ -3,7 +3,7 @@
 //! are Rust WebTransport clients that trust the server's development certificate by its hash, and
 //! a program's client build in headless Chrome, which finds its server in `net.json`.
 
-use crate::rooms::{Down, down, hello, propose, wasm};
+use crate::rooms::{DEAF, Down, down, hello, propose, server_wasm, wasm};
 use std::sync::Arc;
 use std::time::Duration;
 use wrela_host::server::{Limits, ServerBuild};
@@ -93,6 +93,12 @@ impl Peer {
         self.send.write_all(&wrela_serve::frame(bytes)).await.expect("write");
     }
 
+    /// Whether the stream ends within `within`, with no message before: not a wait that runs out.
+    async fn ends(&mut self, within: Duration) -> bool {
+        let mut b = [0u8];
+        matches!(tokio::time::timeout(within, self.recv.read_exact(&mut b)).await, Ok(Err(_)))
+    }
+
     /// The next message, or `None` if the stream ends.
     async fn next(&mut self) -> Option<Down> {
         let mut len = 0usize;
@@ -139,9 +145,9 @@ fn a_frame_too_long_closes_the_connection_and_a_wrong_path_is_refused() {
         let mut a = connect(port, hash, &room("limits")).await.expect("connects");
         a.put(&hello(5, 1, 0, 0)).await;
         assert_eq!(a.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
-        // A frame's length past 64 KiB: the server stops reading and closes.
+        // A frame's length past what a client may send: the server stops reading and closes.
         let mut too_long = Vec::new();
-        let mut x = wrela_serve::MAX_FRAME + 1;
+        let mut x = wrela_serve::MAX_UP + 1;
         loop {
             let g = (x & 127) as u8;
             x >>= 7;
@@ -269,5 +275,43 @@ fn rooms_and_sessions_are_bounded_and_an_idle_room_stops() {
         let mut d = connect(port, hash, &room("one")).await.expect("d");
         d.put(&hello(5, 2, 0, 0)).await;
         assert_eq!(d.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+    });
+}
+
+#[test]
+fn a_quarantined_room_closes_its_sessions_and_stops() {
+    let deaf = server_wasm("deaf-transport", DEAF);
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let bounds = wrela_serve::Bounds { idle: Duration::from_millis(300), ..Default::default() };
+    let (port, hash, server) = start_build("deaf", &deaf, &runtime, bounds);
+    let path = format!("/room/deaf?pair={:016x}", wrela_abi::read_pair(&deaf).expect("pair"));
+    runtime.block_on(async {
+        let mut a = connect(port, hash, &path).await.expect("connects");
+        a.put(&hello(5, 1, 0, 0)).await;
+        assert!(a.ends(Duration::from_secs(5)).await, "the session closed");
+        let mut stopped = false;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if server.held() == (0, 0) {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(stopped, "held {:?}", server.held());
+    });
+}
+
+#[test]
+fn a_room_past_its_limits_tries_again_and_lets_its_peer_go() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash) = start("limits-again", &runtime);
+    runtime.block_on(async {
+        let mut a = connect(port, hash, &room("limits-again")).await.expect("connects");
+        a.put(&hello(5, 1, 0, 0)).await;
+        assert_eq!(a.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+        // 99 runs past every call's deadline. The peer sends nothing more: the room tries again
+        // on its own, and after the retries lets the peer go.
+        a.put(&propose(1, 1, 1, 99)).await;
+        assert!(a.ends(Duration::from_secs(5)).await, "the session closed");
     });
 }

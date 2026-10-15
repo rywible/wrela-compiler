@@ -120,6 +120,8 @@ pub const PAST_WINDOW: u32 = 6
 pub const BAD_ACK: u32 = 7
 /// Another connection of the same peer said hello.
 pub const REPLACED: u32 = 8
+/// A second hello on one connection.
+pub const HELLO_AGAIN: u32 = 9
 
 /// What a room's host keeps durably, in order: the room is rebuilt from these.
 pub enum Record<S, T>: Clone + Pack {
@@ -440,6 +442,11 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         var i = 0
         if token == 0 {
             self.refuse(mut out, conn, UNKNOWN_PEER)
+            return
+        }
+        // A connection says hello once: each hello's answer may be the room's whole state.
+        if self.peer_of(conn).is_some() {
+            self.refuse(mut out, conn, HELLO_AGAIN)
             return
         }
         if let Some(k) = self.token_at(token) {
@@ -1473,4 +1480,21 @@ fn a_replay_keeps_at_most_a_window_of_outcomes() {
     let outcomes = again.peers[0].outcomes.len()
     assert(outcomes == WINDOW, f"{outcomes} outcomes")
     assert(again.peers[0].acked == 1000 - WINDOW)
+}
+
+@test
+fn a_connection_says_hello_once() {
+    var room: Room<Tags, u32> = Room::new(Tags { all: Vec::new() })
+    let first = room.receive(
+        1,
+        pack(Up::<u32>::Hello { token: 9, session: 1, acked: 0, have: 0 }),
+        0,
+    )
+    assert(first.closes.is_empty())
+    let again = room.receive(
+        1,
+        pack(Up::<u32>::Hello { token: 9, session: 1, acked: 0, have: 0 }),
+        0,
+    )
+    assert(again.closes == Vec::from([1]) && again.records.is_empty())
 }

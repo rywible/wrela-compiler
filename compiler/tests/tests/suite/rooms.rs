@@ -195,13 +195,13 @@ pub(crate) fn wasm() -> &'static [u8] {
 }
 
 /// A server program that never reads its events.
-const DEAF: &str = r#"
+pub(crate) const DEAF: &str = r#"
 pub fn serve(time: f32) {}
 "#;
 
 /// The server build of `program` (a package's main.wrela, beside the platform), in scratch
 /// directory `name`.
-fn server_wasm(name: &str, program: &str) -> Vec<u8> {
+pub(crate) fn server_wasm(name: &str, program: &str) -> Vec<u8> {
     {
         let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&root);
@@ -619,4 +619,103 @@ fn a_server_that_doesnt_read_its_events_is_quarantined() {
     room.receive(1, hello(5, 1, 0, 0));
     assert!(matches!(room.wake(0.1), Err(Failure::Program(_))));
     assert!(matches!(room.status(), Status::Quarantined(_)), "{:?}", room.status());
+    // Its connections close, and it takes no more: what comes goes nowhere.
+    assert_eq!(room.take_outbox(), [Out::Close(1)]);
+    room.connect(2);
+    room.receive(2, hello(6, 1, 0, 0));
+    assert_eq!(room.take_outbox(), [Out::Close(2)]);
+    assert_eq!(room.waiting(), 0);
+}
+
+#[test]
+fn an_event_past_the_hosts_limits_while_isolating_waits_with_those_after_it() {
+    let (build, hash, dir) = build("isolate-limits");
+    let fast = Limits { deadline: std::time::Duration::from_millis(100), ..limits() };
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", fast).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    room.take_outbox();
+    // 13 traps the room, so the call is taken one event at a time: 13 is refused, then 99 runs
+    // past its deadline, and it and 4 wait.
+    room.receive(1, propose(1, 1, 1, 13));
+    room.receive(1, propose(1, 1, 2, 99));
+    room.receive(1, propose(1, 1, 3, 4));
+    assert_eq!(room.wake(0.2), Err(Failure::Deadline));
+    assert_eq!(sent_to(&room.take_outbox(), 1), [Down::Rejected { counter: 1, reason: u32::MAX }]);
+    assert_eq!(room.waiting(), 2);
+    // They're tried again, and after the retries the peer is let go, to send them again later.
+    assert_eq!(room.wake(0.3), Err(Failure::Deadline));
+    assert_eq!(room.wake(0.4), Err(Failure::Deadline));
+    assert_eq!(room.take_outbox(), [Out::Close(1)]);
+    assert_eq!(room.waiting(), 0);
+}
+
+#[test]
+fn a_call_past_the_command_cap_is_taken_one_event_at_a_time() {
+    let (build, hash, dir) = build("command-cap");
+    let capped = Limits { commands: 8 << 10, ..limits() };
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", capped).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    proposals(&mut room, 1, 1, 50);
+    room.wake(0.2).expect("50");
+    proposals(&mut room, 1, 51, 50);
+    room.wake(0.3).expect("100");
+    room.take_outbox();
+    // Twenty peers join at once: each is sent the hundred entries, more together than one
+    // call's commands may hold, but each alone fits.
+    for c in 2..22 {
+        room.connect(c);
+        room.receive(c, hello(100 + u64::from(c), 1, 0, 0));
+    }
+    room.wake(0.4).expect("one at a time");
+    let out = room.take_outbox();
+    for c in 2..22 {
+        let got = sent_to(&out, c);
+        assert_eq!(got.len(), 101, "connection {c}");
+        assert!(matches!(got[0], Down::Welcome { seq: 100, .. }), "{:?}", got[0]);
+    }
+    assert!(!out.contains(&Out::Close(1)));
+    assert_eq!(room.status(), &Status::Live);
+}
+
+#[test]
+fn one_room_host_at_a_time_holds_a_journal() {
+    let (build, hash, dir) = build("held");
+    let mut first = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
+    first.connect(1);
+    first.receive(1, hello(5, 1, 0, 0));
+    first.receive(1, propose(1, 1, 1, 3));
+    first.wake(0.1).expect("wake");
+    // Another host of the same room waits for the first to close, then reads what it kept.
+    let (b, d) = (build.clone(), dir.clone());
+    let second = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let mut room = RoomHost::open(b, hash, &d, "a", limits()).expect("opens once free");
+        room.connect(2);
+        room.receive(2, hello(5, 2, 1, 0));
+        room.wake(0.2).expect("wake");
+        (started.elapsed(), sent_to(&room.take_outbox(), 2))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    drop(first);
+    let (waited, got) = second.join().expect("the second host");
+    assert!(waited >= std::time::Duration::from_millis(250), "it waited {waited:?}");
+    assert_eq!(
+        got,
+        [Down::Welcome { peer: 1, seq: 1 }, Down::Committed { seq: 1, counter: 1, value: 3 }]
+    );
+}
+
+#[test]
+fn a_room_that_keeps_nothing_leaves_no_journal() {
+    let (build, hash, dir) = build("nothing");
+    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
+    room.connect(1);
+    room.receive(1, vec![255; 3]);
+    room.wake(0.1).expect("wake");
+    drop(room);
+    assert!(!dir.join("a.journal").exists());
 }

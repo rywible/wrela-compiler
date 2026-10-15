@@ -2,16 +2,20 @@
 //! `/room/<name>?pair=<id>` is a connection of room `<name>`, from a client build whose pair id
 //! is `<id>` (16 hex digits): one of another pair is refused before it reaches a room. It opens
 //! one bidirectional stream, on which each message is a frame: its length (a varint, at most
-//! [`MAX_FRAME`] bytes), then its bytes. Each room runs on a thread of its own
+//! [`MAX_FRAME`] bytes, and [`MAX_UP`] from a client), then its bytes. Each room runs on a
+//! thread of its own
 //! ([`wrela_host::rooms::RoomHost`]), which keeps it durably in the data directory and releases
 //! what it sends only once its records are kept; a room with no connections for
 //! [`Bounds::idle`] stops, and starts again from its journal when one comes.
 //!
 //! What it holds is bounded ([`Bounds`]): the sessions open or opening, the rooms running, and
-//! the bytes every queue holds together, each message counted with [`OVERHEAD`] more. A
-//! connection that sends faster than its room takes ([`CONN_IN`] waiting), or takes what its
+//! the bytes queued, each message counted with [`OVERHEAD`] more. Each connection may hold
+//! [`RESERVED`] bytes each way whatever the others hold; past that, its messages draw on what
+//! every queue shares ([`Bounds::queued`]), so a few slow connections can't crowd out the rest.
+//! A connection that sends faster than its room takes ([`CONN_IN`] waiting), or takes what its
 //! room sends slower than the room sends it ([`CONN_OUT`] waiting, or a write that takes
-//! [`WRITE`]), is closed, and its peer comes back.
+//! [`WRITE`]), is closed, and its peer comes back. At most, then, the queues hold
+//! `2 × sessions × RESERVED + queued` bytes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -26,6 +30,11 @@ use wtransport::{Endpoint, Identity, ServerConfig};
 
 /// The largest frame, in bytes.
 pub const MAX_FRAME: usize = 64 * 1024;
+/// The largest frame a client sends: a room's answer to a message adds a header to it (an
+/// entry's number and time, say), and must still fit a frame.
+pub const MAX_UP: usize = MAX_FRAME - 64;
+/// The bytes each connection may hold each way whatever the others hold.
+pub const RESERVED: usize = 128 << 10;
 /// How many messages may wait for a room, and for a connection.
 pub const QUEUE: usize = 1024;
 /// The bytes a message is counted as past its own: what holding it costs.
@@ -97,6 +106,24 @@ impl Share {
     }
 }
 
+impl Share {
+    /// `n` bytes for a connection whose messages hold `conn` (at most `cap`): from its reserve
+    /// while it holds less than [`RESERVED`], else from what every queue shares too (`shared`,
+    /// at most `shared_cap`).
+    fn bytes(
+        n: usize,
+        (conn, cap): (&Arc<AtomicUsize>, usize),
+        (shared, shared_cap): (&Arc<AtomicUsize>, usize),
+    ) -> Option<Share> {
+        // Only this connection's one sender adds to `conn`, so what it reads can only fall.
+        if conn.load(Ordering::Acquire) + n <= RESERVED {
+            Share::take(n, &[(conn, cap)])
+        } else {
+            Share::take(n, &[(conn, cap), (shared, shared_cap)])
+        }
+    }
+}
+
 impl Drop for Share {
     fn drop(&mut self) {
         for c in &self.counts {
@@ -140,6 +167,8 @@ struct Rooms {
     limits: Limits,
     bounds: Bounds,
     next_conn: AtomicU32,
+    /// When it started: its rooms' time, which a room that stops and starts again goes on with.
+    started: Instant,
     sessions: Arc<AtomicUsize>,
     running: Arc<AtomicUsize>,
     queued: Arc<AtomicUsize>,
@@ -264,7 +293,6 @@ fn run(
     rx: &Receiver<ToRoom>,
     stop: &Arc<AtomicBool>,
 ) {
-    let started = Instant::now();
     let data = rooms.data.join(format!("{hash:016x}"));
     let mut room = match RoomHost::open(build, hash, &data, name, rooms.limits) {
         Ok(room) => Some(room),
@@ -275,6 +303,8 @@ fn run(
     };
     let mut outs: HashMap<u32, Link> = HashMap::new();
     let mut carried: Vec<ToRoom> = Vec::new();
+    // The bytes of the messages waiting in the room, held until it has none waiting.
+    let mut shares: Vec<Share> = Vec::new();
     let mut last_conn = Instant::now();
     loop {
         let mut batch = std::mem::take(&mut carried);
@@ -303,7 +333,8 @@ fn run(
             return;
         }
         let Some(host) = room.as_mut() else {
-            // A room that didn't open closes what comes to it, and stops once nothing does.
+            // A room that didn't open, or was quarantined, closes what comes to it, and stops
+            // once nothing does.
             let mut joined = false;
             for e in batch {
                 if let ToRoom::Opened(_, link) = e {
@@ -316,9 +347,8 @@ fn run(
             }
             continue;
         };
-        // The bytes of what it reads are held until the room has read it.
-        let mut shares = Vec::new();
-        let mut woken = !batch.is_empty();
+        // A room with events waiting (a call past the host's limits) tries again each tick.
+        let mut woken = !batch.is_empty() || host.waiting() > 0;
         for e in batch {
             match e {
                 ToRoom::Opened(conn, link) => {
@@ -330,9 +360,12 @@ fn run(
                         host.disconnect(conn);
                     }
                 }
+                // A message from a connection the room let go goes nowhere.
                 ToRoom::Message(conn, bytes, share) => {
-                    host.receive(conn, bytes);
-                    shares.push(share);
+                    if outs.contains_key(&conn) {
+                        host.receive(conn, bytes);
+                        shares.push(share);
+                    }
                 }
                 ToRoom::Stop => {}
             }
@@ -347,19 +380,22 @@ fn run(
             woken = true;
         }
         if woken {
-            if let Err(e) = host.wake(started.elapsed().as_secs_f32()) {
+            if let Err(e) = host.wake(rooms.started.elapsed().as_secs_f32()) {
                 eprintln!("wrela-serve: room {name}: {e}");
             }
-            drop(shares);
+            if host.waiting() == 0 {
+                shares.clear();
+            }
             for o in host.take_outbox() {
                 let conn = match &o {
                     Out::Send(c, _) | Out::Close(c) => *c,
                 };
                 let Some(link) = outs.get(&conn) else { continue };
                 let sent = match o {
-                    Out::Send(c, bytes) => Share::take(
+                    Out::Send(c, bytes) => Share::bytes(
                         bytes.len() + OVERHEAD,
-                        &[(&link.held, CONN_OUT), (&rooms.queued, rooms.bounds.queued)],
+                        (&link.held, CONN_OUT),
+                        (&rooms.queued, rooms.bounds.queued),
                     )
                     .is_some_and(|share| {
                         link.tx.try_send((Out::Send(c, bytes), Some(share))).is_ok()
@@ -373,7 +409,14 @@ fn run(
                 }
             }
             if let Status::Quarantined(why) = host.status() {
+                // Its connections were closed (above): it takes no more, until it opens again.
                 eprintln!("wrela-serve: room {name} is quarantined: {why}");
+                for link in outs.values() {
+                    let _ = link.tx.try_send((Out::Close(0), None));
+                }
+                outs.clear();
+                shares.clear();
+                room = None;
             }
         }
         if !outs.is_empty() {
@@ -407,8 +450,8 @@ pub fn frame(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reads one frame from `recv`: `None` at the stream's end, or for a frame too long or whose
-/// length isn't a varint.
+/// Reads one frame from a client: `None` at the stream's end, or for a frame past [`MAX_UP`]
+/// or whose length isn't a varint.
 async fn read_frame(recv: &mut wtransport::RecvStream) -> Option<Vec<u8>> {
     let mut len = 0usize;
     for k in 0..3 {
@@ -416,7 +459,7 @@ async fn read_frame(recv: &mut wtransport::RecvStream) -> Option<Vec<u8>> {
         recv.read_exact(&mut byte).await.ok()?;
         len |= usize::from(byte[0] & 127) << (7 * k);
         if byte[0] < 128 {
-            if len > MAX_FRAME {
+            if len > MAX_UP {
                 return None;
             }
             let mut bytes = vec![0u8; len];
@@ -445,7 +488,9 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
     };
     // From here, however it ends, the room hears: from `Closed`, or, if its queue is full, as
     // it finds this end of the link dropped.
-    let Ok(connection) = request.accept().await else { return };
+    let Ok(Ok(connection)) = tokio::time::timeout(OPENING, request.accept()).await else {
+        return;
+    };
     let Ok(Ok((mut send, mut recv))) = tokio::time::timeout(OPENING, connection.accept_bi()).await
     else {
         let _ = to_room.try_send(ToRoom::Closed(conn));
@@ -454,9 +499,10 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
     let held = Arc::new(AtomicUsize::new(0));
     let reading = async {
         while let Some(bytes) = read_frame(&mut recv).await {
-            let share = Share::take(
+            let share = Share::bytes(
                 bytes.len() + OVERHEAD,
-                &[(&held, CONN_IN), (&rooms.queued, rooms.bounds.queued)],
+                (&held, CONN_IN),
+                (&rooms.queued, rooms.bounds.queued),
             );
             // The room can't take this connection's messages fast enough.
             let Some(share) = share else { break };
@@ -528,6 +574,7 @@ pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Resu
         limits: config.limits,
         bounds: config.bounds,
         next_conn: AtomicU32::new(1),
+        started: Instant::now(),
         sessions: Arc::new(AtomicUsize::new(0)),
         running: Arc::new(AtomicUsize::new(0)),
         queued: Arc::new(AtomicUsize::new(0)),
@@ -582,6 +629,27 @@ mod tests {
         assert_eq!(path("/room/a?pair=zz00000000000000"), Some(("a", None)));
         assert_eq!(path("/room/A?pair=00000000000000ff"), None);
         assert_eq!(path("/other/a"), None);
+    }
+
+    #[test]
+    fn a_connection_holds_its_reserve_whatever_the_others_hold() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (shared, cap) = (Arc::new(AtomicUsize::new(0)), 1 << 20);
+        let (hog, other) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // One connection takes its reserve, then all that's shared.
+        let mut held = Vec::new();
+        while let Some(s) = super::Share::bytes(4096, (&hog, 16 << 20), (&shared, cap)) {
+            held.push(s);
+        }
+        assert_eq!(hog.load(Ordering::Acquire), super::RESERVED + cap);
+        // Another still has its reserve, and no more.
+        let mine = super::Share::bytes(super::RESERVED, (&other, 16 << 20), (&shared, cap));
+        assert!(mine.is_some());
+        assert!(super::Share::bytes(1, (&other, 16 << 20), (&shared, cap)).is_none());
+        // Every byte comes back.
+        drop((held, mine));
+        assert_eq!((hog.load(Ordering::Acquire), shared.load(Ordering::Acquire)), (0, 0));
     }
 
     #[test]

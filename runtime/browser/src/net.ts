@@ -11,6 +11,9 @@ import { connectionEvent, isNetwork, messageEvent } from "./input.ts";
 
 /** The largest frame, in bytes: as the server host's (`wrela-serve`). */
 export const MAX_FRAME = 64 * 1024;
+/** The largest message a client sends: a room's answer adds a header to it, and must still fit
+ * a frame. */
+export const MAX_UP = MAX_FRAME - 64;
 /** The bytes a message is counted as past its own: what holding it costs. */
 export const OVERHEAD = 64;
 /** The bytes messages may hold waiting for the program: in what arrived, and in an inbox. */
@@ -283,13 +286,13 @@ export class Net {
   }
 
   /** Sends `bytes` on connection `conn`: nothing if it isn't open (it may have closed since the
-   * program last heard). A message past MAX_FRAME closes it, and so does one past PENDING bytes
+   * program last heard). A message past MAX_UP closes it, and so does one past PENDING bytes
    * not yet written. */
   send(conn: number, bytes: Uint8Array): void {
     const session = this.#sessions.get(conn);
     if (!session?.writer || session.closed) return;
-    if (bytes.length > MAX_FRAME) {
-      this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_FRAME}`);
+    if (bytes.length > MAX_UP) {
+      this.print(`connection ${conn}: a message of ${bytes.length} bytes, past ${MAX_UP}`);
       this.close(conn);
       return;
     }

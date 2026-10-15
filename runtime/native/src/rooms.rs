@@ -7,15 +7,21 @@
 //! the tag the program gave it (`platform::net::tag`). A call is given what waits a call's worth
 //! at a time ([`wrela_abi::input::within_call`]), and must read all of it.
 //!
-//! A call that fails says whose the failure is ([`Failure`]):
-//! - the program's own trap (or a `serve` that returns with events unread): the room starts
-//!   again from its journal, then takes the call's events again one at a time; the one that
-//!   traps alone is given back with `POISONED` set on its connection, so the program refuses it
-//!   durably without running it. A trap while reading the journal back quarantines the room:
-//!   it's never skipped past.
-//! - the host's limits (the deadline, the memory cap, the stack): nothing is kept or sent; the
-//!   room starts again and the events wait, and after [`RETRIES`] failures in a row its
-//!   connections are closed, so its peers come back later.
+//! A call that fails keeps nothing and sends nothing, and the room starts again from its journal
+//! and takes the call's events again one at a time, so one event can't fail the rest. Alone, an
+//! event's failure says whose it is ([`Failure`]):
+//! - the program's own trap (or a `serve` that returns with events unread): the event, if it's
+//!   a message, is given back with `POISONED` set on its connection, so the program refuses it
+//!   durably without running it. A trap on a poisoned message, or while reading the journal
+//!   back, quarantines the room: it's never skipped past, what waits goes, and its connections
+//!   close.
+//! - the host's limits (the deadline, the memory cap, the stack, a call's commands): the event
+//!   waits, with those after it, for the next wake, and after [`RETRIES`] failures in a row the
+//!   room's connections are closed, so its peers come back later.
+//!
+//! One room host at a time in a process holds a room's journal; another of the same room (a
+//! build swapped away and back, say) waits for it to close. The journal is made with its first
+//! record.
 //!
 //! The journal: a header (`WRJ1`, the format's version, the server build's WASM hash, the room's
 //! name), then records, each its length, its CRC-32C and its bytes. A journal of another build,
@@ -66,11 +72,12 @@ pub enum Fault {
     AfterRename,
 }
 
-/// A room's journal on disk.
+/// A room's journal on disk: made with its first record, so a room that keeps nothing leaves
+/// nothing behind.
 struct Journal {
     path: PathBuf,
     header: Vec<u8>,
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     fault: Option<Fault>,
 }
 
@@ -89,14 +96,12 @@ impl Journal {
     }
 
     /// The journal at `path` for the room `room` of the build whose hash is `build`, and its
-    /// records: made if it isn't there, truncated after its last whole record.
+    /// records (none if it isn't there yet), truncated after its last whole record.
     fn open(path: &Path, build: u64, room: &str) -> Result<(Journal, Vec<Vec<u8>>), Failure> {
         let header = Journal::header(build, room);
         if !path.exists() {
-            let tmp = path.with_extension("new");
-            write_synced(&tmp, &header).map_err(host)?;
-            std::fs::rename(&tmp, path).map_err(host)?;
-            sync_dir(path).map_err(host)?;
+            let journal = Journal { path: path.to_path_buf(), header, file: None, fault: None };
+            return Ok((journal, Vec::new()));
         }
         let mut bytes = Vec::new();
         std::fs::File::open(path).and_then(|mut f| f.read_to_end(&mut bytes)).map_err(host)?;
@@ -124,7 +129,7 @@ impl Journal {
             file.set_len(at as u64).map_err(host)?;
             file.sync_all().map_err(host)?;
         }
-        Ok((Journal { path: path.to_path_buf(), header, file, fault: None }, records))
+        Ok((Journal { path: path.to_path_buf(), header, file: Some(file), fault: None }, records))
     }
 
     fn framed(records: &[Vec<u8>]) -> Vec<u8> {
@@ -143,8 +148,19 @@ impl Journal {
             self.fault = None;
             return Err(std::io::Error::other("an injected fault"));
         }
-        self.file.write_all(&Journal::framed(records))?;
-        self.file.sync_data()
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => {
+                // Its header, written whole beside it and renamed into place.
+                let tmp = self.path.with_extension("new");
+                write_synced(&tmp, &self.header)?;
+                std::fs::rename(&tmp, &self.path)?;
+                sync_dir(&self.path)?;
+                self.file.insert(std::fs::OpenOptions::new().append(true).open(&self.path)?)
+            }
+        };
+        file.write_all(&Journal::framed(records))?;
+        file.sync_data()
     }
 
     /// Replaces the journal with `records` (a snapshot first): written whole beside it, flushed,
@@ -164,7 +180,7 @@ impl Journal {
             return Err(std::io::Error::other("an injected fault"));
         }
         sync_dir(&self.path)?;
-        self.file = std::fs::OpenOptions::new().append(true).open(&self.path)?;
+        self.file = Some(std::fs::OpenOptions::new().append(true).open(&self.path)?);
         Ok(())
     }
 }
@@ -216,7 +232,40 @@ enum Fail {
     Journal(Failure),
 }
 
-/// A room of a server build, kept durably in a directory of its own.
+/// The journals a room host has open in this process: one room at a time keeps each.
+static OPEN: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+static CLOSED: std::sync::Condvar = std::sync::Condvar::new();
+/// How long a room waits for the room host before it, of the same journal, to close.
+const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// A room's hold on its journal, given up when it's dropped.
+struct Held(PathBuf);
+
+impl Held {
+    /// The journal at `path`, once no other room host in this process holds it (within
+    /// [`WAIT`]).
+    fn take(path: &Path) -> Result<Held, Failure> {
+        let open = OPEN.lock().expect("the open journals' lock");
+        let (mut open, waited) = CLOSED
+            .wait_timeout_while(open, WAIT, |open| open.iter().any(|p| p == path))
+            .expect("the open journals' lock");
+        if waited.timed_out() {
+            return Err(host(format!("{} is held by another room", path.display())));
+        }
+        open.push(path.to_path_buf());
+        Ok(Held(path.to_path_buf()))
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        OPEN.lock().expect("the open journals' lock").retain(|p| *p != self.0);
+        CLOSED.notify_all();
+    }
+}
+
+/// A room of a server build, kept durably in a directory of its own. One room host at a time
+/// holds a journal in a process: another of the same room waits for it to close.
 pub struct RoomHost {
     build: std::sync::Arc<ServerBuild>,
     build_hash: u64,
@@ -231,6 +280,7 @@ pub struct RoomHost {
     outbox: Vec<Out>,
     /// How many calls in a row failed at the host's limits.
     failures: u32,
+    _held: Held,
 }
 
 impl RoomHost {
@@ -245,7 +295,9 @@ impl RoomHost {
         limits: Limits,
     ) -> Result<RoomHost, Failure> {
         std::fs::create_dir_all(dir).map_err(host)?;
-        let (journal, _) = Journal::open(&dir.join(format!("{name}.journal")), build_hash, name)?;
+        let path = dir.join(format!("{name}.journal"));
+        let held = Held::take(&path)?;
+        let (journal, _) = Journal::open(&path, build_hash, name)?;
         let mut room = RoomHost {
             build,
             build_hash,
@@ -258,6 +310,7 @@ impl RoomHost {
             incoming: VecDeque::new(),
             outbox: Vec::new(),
             failures: 0,
+            _held: held,
         };
         room.start()?;
         Ok(room)
@@ -300,13 +353,10 @@ impl RoomHost {
             match read {
                 Ok(()) => {}
                 Err(f) if f.is_program() => {
-                    self.status = Status::Quarantined(format!("its journal traps it: {f}"));
+                    self.quarantine(format!("its journal traps it: {f}"));
                     return Err(f);
                 }
-                Err(f) => {
-                    self.fail_at_limits();
-                    return Err(f);
-                }
+                Err(f) => return Err(f),
             }
             // Reading back keeps nothing new but a compaction, which it carries out: the
             // snapshot, then the records not read yet, which it doesn't hold.
@@ -327,6 +377,25 @@ impl RoomHost {
         Ok(())
     }
 
+    /// The room can't go on: what waits for it goes, and its connections close.
+    fn quarantine(&mut self, why: String) {
+        self.room = None;
+        self.status = Status::Quarantined(why);
+        self.incoming.clear();
+        for (c, _) in self.conns.drain(..) {
+            self.outbox.push(Out::Close(c));
+        }
+    }
+
+    fn quarantined(&self) -> bool {
+        matches!(self.status, Status::Quarantined(_))
+    }
+
+    /// How many events wait for it.
+    pub fn waiting(&self) -> usize {
+        self.incoming.len()
+    }
+
     fn fail_at_limits(&mut self) {
         self.room = None;
         self.failures += 1;
@@ -344,8 +413,13 @@ impl RoomHost {
     }
 
     /// Connection `conn` opened.
+    /// Connection `conn` opened: a quarantined room closes it.
     pub fn connect(&mut self, conn: u32) {
         assert!(conn != JOURNAL && conn < POISONED, "connection {conn} is reserved");
+        if self.quarantined() {
+            self.outbox.push(Out::Close(conn));
+            return;
+        }
         self.conns.push((conn, 0));
         self.incoming.push_back(Incoming::Opened(conn));
     }
@@ -356,9 +430,12 @@ impl RoomHost {
         self.incoming.push_back(Incoming::Closed(conn));
     }
 
-    /// A message from connection `conn`.
+    /// A message from connection `conn`: one from a connection it doesn't have (closed, or
+    /// let go), or for a quarantined room, goes nowhere.
     pub fn receive(&mut self, conn: u32, bytes: Vec<u8>) {
-        self.incoming.push_back(Incoming::Message(conn, bytes));
+        if self.conns.iter().any(|&(c, _)| c == conn) {
+            self.incoming.push_back(Incoming::Message(conn, bytes));
+        }
     }
 
     /// What it has released to send or close, in order.
@@ -374,23 +451,26 @@ impl RoomHost {
             return Err(Failure::Host(format!("the room is quarantined: {why}")));
         }
         loop {
-            if self.room.is_none() {
-                self.start()?;
+            if self.room.is_none()
+                && let Err(f) = self.start()
+            {
+                if !self.quarantined() {
+                    self.fail_at_limits();
+                }
+                return Err(f);
             }
             let batch = self.next_batch();
             match self.call(&batch, time) {
                 Ok(()) => {}
                 // The journal failed: its peers were let go, and send again what wasn't settled.
                 Err(Fail::Journal(f)) => return Err(f),
-                Err(Fail::Room(f)) if f.is_program() => self.isolate(batch, time)?,
-                Err(Fail::Room(f)) => {
-                    // The host's limits: nothing was kept or sent, and the events wait.
-                    for e in batch.into_iter().rev() {
-                        self.incoming.push_front(e);
-                    }
+                Err(Fail::Room(f)) if batch.len() == 1 && !f.is_program() => {
+                    // The host's limits, on one event: nothing was kept or sent, and it waits.
+                    self.wait(batch.into_iter());
                     self.fail_at_limits();
                     return Err(f);
                 }
+                Err(Fail::Room(_)) => self.one_by_one(batch, time)?,
             }
             if self.incoming.is_empty() {
                 return Ok(());
@@ -491,40 +571,54 @@ impl RoomHost {
         Ok(())
     }
 
-    /// The program trapped on `batch`: a new instance takes its events one at a time, and the
-    /// message that traps alone is given back poisoned, for the program to refuse. A new
-    /// instance follows each trap; the rest go on in the same one.
-    fn isolate(&mut self, batch: Vec<Incoming>, time: f32) -> Result<(), Failure> {
-        for e in batch {
-            if self.room.is_none() {
-                self.start()?;
-            }
-            match self.call(std::slice::from_ref(&e), time) {
-                Ok(()) => {}
+    /// The call on `batch` failed: a fresh instance takes its events one at a time, so one
+    /// event can't fail the rest. One the program traps on alone is given back poisoned, for the
+    /// program to refuse without running it; if even that traps, the room can't go on. One past
+    /// the host's limits alone waits for the next wake, with those after it.
+    fn one_by_one(&mut self, batch: Vec<Incoming>, time: f32) -> Result<(), Failure> {
+        let mut rest = batch.into_iter();
+        while let Some(e) = rest.next() {
+            let failed = match self.alone(&e, time) {
+                Ok(()) => continue,
                 Err(Fail::Journal(f)) => return Err(f),
-                Err(Fail::Room(f)) if f.is_program() => {
-                    self.start()?;
-                    if let Incoming::Message(c, bytes) = e {
-                        // Refused without running it; if even that traps, the room can't go on.
-                        match self.call(&[Incoming::Message(c | POISONED, bytes)], time) {
-                            Ok(()) => {}
-                            Err(Fail::Journal(f)) => return Err(f),
-                            Err(Fail::Room(f)) => {
-                                self.status = Status::Quarantined(format!(
-                                    "a poisoned message traps it: {f}"
-                                ));
-                                return Err(f);
-                            }
-                        }
-                    }
-                }
-                Err(Fail::Room(f)) => {
-                    self.fail_at_limits();
-                    return Err(f);
-                }
+                Err(Fail::Room(f)) => f,
+            };
+            if !self.quarantined() {
+                self.wait(std::iter::once(e).chain(rest));
+                self.fail_at_limits();
             }
+            return Err(failed);
         }
         Ok(())
+    }
+
+    /// One event on a fresh instance, given back poisoned if the program traps on it: a failure
+    /// past the host's limits, or one that quarantines the room.
+    fn alone(&mut self, e: &Incoming, time: f32) -> Result<(), Fail> {
+        if self.room.is_none() {
+            self.start().map_err(Fail::Room)?;
+        }
+        match self.call(std::slice::from_ref(e), time) {
+            Err(Fail::Room(f)) if f.is_program() => {
+                let Incoming::Message(c, bytes) = e else { return Ok(()) };
+                self.start().map_err(Fail::Room)?;
+                match self.call(&[Incoming::Message(c | POISONED, bytes.clone())], time) {
+                    Err(Fail::Room(f)) if f.is_program() => {
+                        self.quarantine(format!("a poisoned message traps it: {f}"));
+                        Err(Fail::Room(f))
+                    }
+                    other => other,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// `events` wait for the next wake, before what came since.
+    fn wait(&mut self, events: impl DoubleEndedIterator<Item = Incoming>) {
+        for e in events.rev() {
+            self.incoming.push_front(e);
+        }
     }
 }
 

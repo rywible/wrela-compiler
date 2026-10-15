@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
 import { connectionEvent, isNetwork, textEvent } from "../src/input.ts";
-import { Frames, frame, HELD, Inbox, MAX_FRAME, Net, PENDING, parseServer, roomName } from "../src/net.ts";
+import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, PENDING, parseServer, roomName } from "../src/net.ts";
 
 const word = (e: Uint8Array, i: number) => new DataView(e.buffer, e.byteOffset, EVENT_SIZE).getUint32(4 * i, true);
 
@@ -148,6 +148,20 @@ describe("what a connection holds", () => {
       for (let i = 0; i < 40; i++) net.send(1, new Uint8Array(60_000));
       expect(lines).toEqual([`connection 1: more than ${PENDING} bytes wait to be written`]);
       expect(net.arrived).toEqual([{ conn: 1, open: true }, { conn: 1, open: false }]);
+    });
+  });
+
+  test("a message past MAX_UP closes its connection: the room's answer to it wouldn't fit a frame", async () => {
+    await withServer([], async () => {
+      const lines: string[] = [];
+      const net = new Net(() => "http://x/", (l) => lines.push(l));
+      net.open(1, "lobby", 1n);
+      await settle(() => net.arrived.length > 0);
+      net.send(1, new Uint8Array(MAX_UP));
+      expect(lines).toEqual([]);
+      net.send(1, new Uint8Array(MAX_UP + 1));
+      expect(lines).toEqual([`connection 1: a message of ${MAX_UP + 1} bytes, past ${MAX_UP}`]);
+      expect(net.arrived.at(-1)).toEqual({ conn: 1, open: false });
     });
   });
 
