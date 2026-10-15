@@ -16,6 +16,9 @@ wrela-syntax.workspace = true
 wrela-driver = { workspace = true, features = ["gpu"] }
 wrela-host.workspace = true
 wrela-abi.workspace = true
+# `wrela run`'s rooms, for a program with a server role.
+wrela-serve.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread"] }
 serde_json.workspace = true
 sha2 = "0.10"
 # A faster allocator than macOS's: the compiler allocates a great deal.

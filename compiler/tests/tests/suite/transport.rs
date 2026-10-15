@@ -12,11 +12,16 @@ use wtransport::{ClientConfig, Endpoint};
 /// A server of the rooms' test program on a free port, its data in a fresh directory: the port
 /// and its certificate's hash.
 fn start(name: &str, runtime: &tokio::runtime::Runtime) -> (u16, [u8; 32]) {
-    start_build(name, wasm(), runtime)
+    let (port, hash, _) = start_build(name, wasm(), runtime);
+    (port, hash)
 }
 
-/// A server of the server build `server` (its WASM), as [`start`] starts one.
-fn start_build(name: &str, server: &[u8], runtime: &tokio::runtime::Runtime) -> (u16, [u8; 32]) {
+/// A server of the server build `server` (its WASM), as [`start`] starts one; and the server.
+fn start_build(
+    name: &str,
+    server: &[u8],
+    runtime: &tokio::runtime::Runtime,
+) -> (u16, [u8; 32], wrela_serve::Server) {
     let data =
         wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("transport-{name}"));
     let _ = std::fs::remove_dir_all(&data);
@@ -34,10 +39,7 @@ fn start_build(name: &str, server: &[u8], runtime: &tokio::runtime::Runtime) -> 
         identity,
         limits: Limits::default(),
     };
-    runtime.spawn(async move {
-        let _ = wrela_serve::serve(config).await;
-    });
-    (port, hash)
+    (port, hash, wrela_serve::start(config, runtime).expect("the server starts"))
 }
 
 /// A peer's session and its stream.
@@ -149,7 +151,7 @@ fn a_browser_joins_a_room_over_webtransport() {
     let (dir, rel) = wrela_tests::page("compiler/tests/rooms-client", "rooms-client-chrome");
     let server = std::fs::read(dir.join("server/game.wasm")).expect("the program's server build");
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-    let (port, hash) = start_build("chrome", &server, &runtime);
+    let (port, hash, _server) = start_build("chrome", &server, &runtime);
     std::fs::write(dir.join("net.json"), wrela_serve::net_json(port, Some(&hash)))
         .expect("net.json");
     // Another peer's tag is in the room first: the browser catches up to it.
@@ -163,4 +165,32 @@ fn a_browser_joins_a_room_over_webtransport() {
     let run = wrela_tests::run_in_chrome(&rel, 240, 16, 16, 60.0);
     let printed: Vec<&str> = run.printed.iter().map(|(_, line)| line.as_str()).collect();
     assert_eq!(printed, ["tags 11 10"], "the browser's log has the room's tags, its own committed");
+}
+
+#[test]
+fn a_new_build_closes_the_rooms_and_keeps_each_builds_apart() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash, server) = start_build("builds", wasm(), &runtime);
+    let build = || Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build"));
+    let first = wrela_abi::ticks::wasm_hash(wasm());
+    runtime.block_on(async {
+        let mut a = connect(port, hash, "/room/builds").await.expect("connects");
+        a.put(&hello(5, 1, 0, 0)).await;
+        assert_eq!(a.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+        a.put(&propose(1, 1, 1, 10)).await;
+        assert_eq!(a.next().await, Some(Down::Committed { seq: 1, counter: 1, value: 10 }));
+        // Another build (its hash says so): the connection closes, and the room it comes back
+        // to is the new build's, with nothing in it.
+        server.set_build(build(), first ^ 1);
+        assert_eq!(a.next().await, None, "the connection closed");
+        let mut b = connect(port, hash, "/room/builds").await.expect("connects again");
+        b.put(&hello(5, 1, 0, 0)).await;
+        assert_eq!(b.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+        // Back to the first: its room has what it had.
+        server.set_build(build(), first);
+        assert_eq!(b.next().await, None, "the connection closed");
+        let mut c = connect(port, hash, "/room/builds").await.expect("connects again");
+        c.put(&hello(5, 2, 1, 1)).await;
+        assert_eq!(c.next().await, Some(Down::Welcome { peer: 1, seq: 1 }));
+    });
 }

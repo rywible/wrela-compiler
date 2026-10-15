@@ -5,7 +5,8 @@
 //!   address and hash it writes to `<build-dir>/net.json` for the client build beside it.
 //!
 //! `<build-dir>` is a `wrela build` of a program with a server role: its `server/game.wasm`.
-//! Rooms' journals go in `--data` (default `<build-dir>/rooms`). The port defaults to 4433.
+//! Rooms' journals go in `--data` (default `<build-dir>/rooms`), each server build's in a
+//! directory of its own. The port defaults to 4433.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,11 +61,11 @@ fn main() -> ExitCode {
         }
     };
     let runtime = tokio::runtime::Runtime::new().expect("an async runtime");
-    let result: std::io::Result<()> = runtime.block_on(async {
+    let result: std::io::Result<()> = (|| {
         let identity = match (cert, key, dev) {
-            (Some(c), Some(k), false) => {
-                wtransport::Identity::load_pemfiles(c, k).await.map_err(std::io::Error::other)?
-            }
+            (Some(c), Some(k), false) => runtime
+                .block_on(wtransport::Identity::load_pemfiles(c, k))
+                .map_err(std::io::Error::other)?,
             (None, None, true) => {
                 let (identity, hash) = wrela_serve::dev_identity()?;
                 std::fs::write(dir.join("net.json"), wrela_serve::net_json(port, Some(&hash)))?;
@@ -72,17 +73,19 @@ fn main() -> ExitCode {
             }
             _ => return Err(std::io::Error::other("give --cert and --key, or --dev")),
         };
-        eprintln!("wrela-serve: rooms of {} on port {port}", dir.display());
-        wrela_serve::serve(wrela_serve::Config {
+        let config = wrela_serve::Config {
             build,
             build_hash: wrela_abi::ticks::wasm_hash(&wasm),
             data,
             port,
             identity,
             limits: Limits::default(),
-        })
-        .await
-    });
+        };
+        let _server = wrela_serve::start(config, &runtime)?;
+        eprintln!("wrela-serve: rooms of {} on port {port}", dir.display());
+        runtime.block_on(std::future::pending::<()>());
+        Ok(())
+    })();
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

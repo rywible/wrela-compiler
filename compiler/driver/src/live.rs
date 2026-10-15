@@ -343,7 +343,8 @@ impl Drop for Server {
 
 /// Builds the program at `pkg` lifted (`lift`, by default its own package), as `kind` says,
 /// into `out`, serves it on 127.0.0.1:`port` (0: a free port), and watches its files: the
-/// server, or why it couldn't start. `quiet`: print nothing.
+/// server, or why it couldn't start. `quiet`: print nothing. `built` is given each build's
+/// directory before any page hears of it, the first build's too.
 pub fn serve(
     pkg: &Path,
     out: &Path,
@@ -351,10 +352,12 @@ pub fn serve(
     lift: &[String],
     kind: crate::BuildKind,
     quiet: bool,
+    mut built: impl FnMut(&Path) + Send + 'static,
 ) -> Result<Server, String> {
     check_output_path(pkg, out)?;
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
+    built(&watcher.dir());
     let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
         out: out.to_path_buf(),
@@ -381,7 +384,8 @@ pub fn serve(
                     }
                     serde_json::json!({ "kind": "literals", "values": values })
                 }
-                Change::Built { version, .. } => {
+                Change::Built { version, dir } => {
+                    built(dir);
                     if !quiet {
                         println!("built version {version}");
                     }
@@ -605,6 +609,42 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(root);
     }
+    /// Each build's directory is given to `serve`'s `built` before any page hears of the build
+    /// (so a file written there, as `wrela run` writes a program's `net.json`, is there when the
+    /// page asks), the first build's too.
+    #[test]
+    fn each_build_is_given_to_built_before_a_page_hears_of_it() {
+        let root = std::env::temp_dir().join(format!("wrela-live-built-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("program");
+        std::fs::create_dir_all(&pkg).expect("program directory");
+        // Each version has another function: an edit of the code, not only of its literals.
+        let frame = |n: usize| {
+            format!("pub fn frame(time: f32, width: u32, height: u32) {{}}\nfn f{n}() {{}}\n")
+        };
+        std::fs::write(pkg.join("wrela.toml"), "[package]\nname = \"program\"\n")
+            .expect("manifest");
+        std::fs::write(pkg.join("main.wrela"), frame(1)).expect("program");
+        let built = |dir: &Path| std::fs::write(dir.join("marked"), b"").expect("mark");
+        let out = root.join("out");
+        let server =
+            serve(&pkg, &out, 0, &[], crate::BuildKind::default(), true, built).expect("serve");
+        assert!(out.join("1/marked").exists(), "the first build is given to `built`");
+        std::fs::write(pkg.join("main.wrela"), frame(2)).expect("edit");
+        let began = Instant::now();
+        while !server.changes().iter().any(|c| c["kind"] == "build") {
+            assert!(
+                began.elapsed() < Duration::from_secs(20),
+                "the edit wasn't built: {:?}",
+                server.changes()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(out.join("2/marked").exists(), "a build is given to `built` before it's shown");
+        server.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     use std::io::{Read, Write};
 
     /// A page opened after a literal-only edit loads the newest build, then receives that edit:

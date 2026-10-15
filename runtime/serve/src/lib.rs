@@ -41,12 +41,14 @@ enum ToRoom {
     Opened(u32, tokio::sync::mpsc::Sender<Out>),
     Closed(u32),
     Message(u32, Vec<u8>),
+    /// The server has a new build: close every connection, and stop.
+    Stop,
 }
 
 /// The server's rooms, each a thread, started when its first connection comes.
 struct Rooms {
-    build: Arc<ServerBuild>,
-    build_hash: u64,
+    /// The build new rooms run, and its WASM's hash.
+    build: Mutex<(Arc<ServerBuild>, u64)>,
     data: PathBuf,
     limits: Limits,
     rooms: Mutex<HashMap<String, std::sync::mpsc::SyncSender<ToRoom>>>,
@@ -63,84 +65,108 @@ pub fn room_name(name: &str) -> bool {
 
 impl Rooms {
     /// The queue to room `name`'s thread, started if it isn't running.
-    fn room(self: &Arc<Self>, name: &str) -> std::sync::mpsc::SyncSender<ToRoom> {
+    fn room(&self, name: &str) -> std::sync::mpsc::SyncSender<ToRoom> {
         let mut rooms = self.rooms.lock().expect("the rooms' lock");
         if let Some(tx) = rooms.get(name) {
             return tx.clone();
         }
         let (tx, rx) = std::sync::mpsc::sync_channel(QUEUE);
         rooms.insert(name.to_string(), tx.clone());
-        let me = Arc::clone(self);
+        let (build, hash) = self.build.lock().expect("the build's lock").clone();
+        let (data, limits) = (self.data.join(format!("{hash:016x}")), self.limits);
         let name = name.to_string();
         std::thread::Builder::new()
             .name(format!("room {name}"))
-            .spawn(move || me.run(&name, &rx))
+            .spawn(move || run(build, hash, &data, limits, &name, &rx))
             .expect("can't start a room's thread");
         tx
     }
 
-    /// Room `name`'s thread: it takes what has come, wakes the room, and gives each connection
-    /// what the room released.
-    fn run(&self, name: &str, rx: &std::sync::mpsc::Receiver<ToRoom>) {
-        let started = Instant::now();
-        let mut room = match RoomHost::open(
-            Arc::clone(&self.build),
-            self.build_hash,
-            &self.data,
-            name,
-            self.limits,
-        ) {
-            Ok(room) => Some(room),
-            Err(e) => {
-                eprintln!("wrela-serve: room {name} doesn't open: {e}");
-                None
+    /// From now on, rooms run `build`: each room running closes its connections and stops.
+    fn set_build(&self, build: Arc<ServerBuild>, hash: u64) {
+        *self.build.lock().expect("the build's lock") = (build, hash);
+        for (_, tx) in self.rooms.lock().expect("the rooms' lock").drain() {
+            // A room whose queue is full stops once its connections, failing to reach it, have
+            // gone: each holds the room's only other senders.
+            let _ = tx.try_send(ToRoom::Stop);
+        }
+    }
+}
+
+/// Room `name`'s thread: it takes what has come, wakes the room, and gives each connection what
+/// the room released, until it's told to stop or nothing can reach it.
+fn run(
+    build: Arc<ServerBuild>,
+    hash: u64,
+    data: &std::path::Path,
+    limits: Limits,
+    name: &str,
+    rx: &std::sync::mpsc::Receiver<ToRoom>,
+) {
+    let started = Instant::now();
+    let mut room = match RoomHost::open(build, hash, data, name, limits) {
+        Ok(room) => Some(room),
+        Err(e) => {
+            eprintln!("wrela-serve: room {name} doesn't open: {e}");
+            None
+        }
+    };
+    let mut outs: HashMap<u32, tokio::sync::mpsc::Sender<Out>> = HashMap::new();
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            batch.push(more);
+        }
+        if batch.iter().any(|e| matches!(e, ToRoom::Stop)) {
+            for tx in outs.values() {
+                let _ = tx.try_send(Out::Close(0));
             }
-        };
-        let mut outs: HashMap<u32, tokio::sync::mpsc::Sender<Out>> = HashMap::new();
-        while let Ok(first) = rx.recv() {
-            let mut batch = vec![first];
-            while let Ok(more) = rx.try_recv() {
-                batch.push(more);
-            }
-            let Some(host) = room.as_mut() else {
-                // A room that didn't open closes what comes to it.
-                for e in batch {
-                    if let ToRoom::Opened(_, tx) = e {
-                        let _ = tx.try_send(Out::Close(0));
-                    }
-                }
-                continue;
-            };
             for e in batch {
-                match e {
-                    ToRoom::Opened(conn, tx) => {
-                        outs.insert(conn, tx);
-                        host.connect(conn);
-                    }
-                    ToRoom::Closed(conn) => {
-                        outs.remove(&conn);
-                        host.disconnect(conn);
-                    }
-                    ToRoom::Message(conn, bytes) => host.receive(conn, bytes),
+                if let ToRoom::Opened(_, tx) = e {
+                    let _ = tx.try_send(Out::Close(0));
                 }
             }
-            if let Err(e) = host.wake(started.elapsed().as_secs_f32()) {
-                eprintln!("wrela-serve: room {name}: {e}");
+            return;
+        }
+        let Some(host) = room.as_mut() else {
+            // A room that didn't open closes what comes to it.
+            for e in batch {
+                if let ToRoom::Opened(_, tx) = e {
+                    let _ = tx.try_send(Out::Close(0));
+                }
             }
-            for o in host.take_outbox() {
-                let conn = match &o {
-                    Out::Send(c, _) | Out::Close(c) => *c,
-                };
-                let Some(tx) = outs.get(&conn) else { continue };
-                if tx.try_send(o).is_err() {
-                    // It can't take what it's sent fast enough: it goes, and comes back.
+            continue;
+        };
+        for e in batch {
+            match e {
+                ToRoom::Opened(conn, tx) => {
+                    outs.insert(conn, tx);
+                    host.connect(conn);
+                }
+                ToRoom::Closed(conn) => {
                     outs.remove(&conn);
                     host.disconnect(conn);
                 }
+                ToRoom::Message(conn, bytes) => host.receive(conn, bytes),
+                ToRoom::Stop => {}
             }
-            if let Status::Quarantined(why) = host.status() {
-                eprintln!("wrela-serve: room {name} is quarantined: {why}");
+        }
+        if let Err(e) = host.wake(started.elapsed().as_secs_f32()) {
+            eprintln!("wrela-serve: room {name}: {e}");
+        }
+        for o in host.take_outbox() {
+            let conn = match &o {
+                Out::Send(c, _) | Out::Close(c) => *c,
+            };
+            let Some(tx) = outs.get(&conn) else { continue };
+            if tx.try_send(o).is_err() {
+                // It can't take what it's sent fast enough: it goes, and comes back.
+                outs.remove(&conn);
+                host.disconnect(conn);
             }
+        }
+        if let Status::Quarantined(why) = host.status() {
+            eprintln!("wrela-serve: room {name} is quarantined: {why}");
         }
     }
 }
@@ -233,12 +259,27 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>) {
         () = reading => {}
         () = writing => {}
     }
-    let _ = rooms.room(&name).try_send(ToRoom::Closed(conn));
+    let _ = to_room.try_send(ToRoom::Closed(conn));
     connection.close(0u32.into(), b"");
 }
 
-/// Serves `config`'s rooms until the process ends.
-pub async fn serve(config: Config) -> std::io::Result<()> {
+/// A running server: what changes the build its rooms run.
+pub struct Server {
+    rooms: Arc<Rooms>,
+}
+
+impl Server {
+    /// From now on, rooms run `build` (its WASM's hash `hash`), kept apart from the last build's:
+    /// each room running closes its connections, and its peers come back to the new build's.
+    pub fn set_build(&self, build: Arc<ServerBuild>, hash: u64) {
+        self.rooms.set_build(build, hash);
+    }
+}
+
+/// Starts serving `config`'s rooms on `runtime`, until it ends: the server, or why its port can't
+/// be had.
+pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Result<Server> {
+    let _entered = runtime.enter();
     let server = ServerConfig::builder()
         .with_bind_default(config.port)
         .with_identity(config.identity)
@@ -246,17 +287,20 @@ pub async fn serve(config: Config) -> std::io::Result<()> {
         .build();
     let endpoint = Endpoint::server(server)?;
     let rooms = Arc::new(Rooms {
-        build: config.build,
-        build_hash: config.build_hash,
+        build: Mutex::new((config.build, config.build_hash)),
         data: config.data,
         limits: config.limits,
         rooms: Mutex::new(HashMap::new()),
         next_conn: AtomicU32::new(1),
     });
-    loop {
-        let incoming = endpoint.accept().await;
-        tokio::spawn(session(incoming, Arc::clone(&rooms)));
-    }
+    let accepting = Arc::clone(&rooms);
+    runtime.spawn(async move {
+        loop {
+            let incoming = endpoint.accept().await;
+            tokio::spawn(session(incoming, Arc::clone(&accepting)));
+        }
+    });
+    Ok(Server { rooms })
 }
 
 /// A development certificate (self-signed, valid under 14 days, as browsers take one by its hash)

@@ -190,9 +190,16 @@ fn a_new_sim_replays_the_old_ones_input() {
 fn a_page_opened_after_hot_reloads_loads_the_newest_build() {
     let pkg = edited("reload-late-page-src", |src| src.to_string() + "\n");
     let out = super::scratch("reload-late-page");
-    let server =
-        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
-            .expect("serve");
+    let server = wrela_driver::live::serve(
+        &pkg,
+        &out,
+        0,
+        &["main".into()],
+        Default::default(),
+        true,
+        |_| {},
+    )
+    .expect("serve");
     let builds = |server: &wrela_driver::live::Server| {
         server.changes().iter().filter(|c| c["kind"] == "build").count()
     };
@@ -237,9 +244,16 @@ fn a_page_open_through_hot_reloads_keeps_running() {
     let pkg =
         edited("reload-open-page-src", |src| src.replace("frames % 120", "frames % 2") + "\n");
     let out = super::scratch("reload-open-page");
-    let server =
-        wrela_driver::live::serve(&pkg, &out, 0, &["main".into()], Default::default(), true)
-            .expect("serve");
+    let server = wrela_driver::live::serve(
+        &pkg,
+        &out,
+        0,
+        &["main".into()],
+        Default::default(),
+        true,
+        |_| {},
+    )
+    .expect("serve");
     let url = format!(
         "http://127.0.0.1:{}/#test&frames=360&width={SIZE}&height={SIZE}&fps=60&nohash=1",
         server.port

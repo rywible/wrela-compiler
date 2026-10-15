@@ -2941,10 +2941,12 @@ dependencies = [
  "png",
  "serde_json",
  "sha2 0.10.9",
+ "tokio",
  "wrela-abi",
  "wrela-diag",
  "wrela-driver",
  "wrela-host",
+ "wrela-serve",
  "wrela-syntax",
 ]
 
