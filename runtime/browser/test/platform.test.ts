@@ -118,3 +118,23 @@ test("export filenames fit full session keys and reject traversal or truncation"
   for (const name of ["../save", "save/path", "", "x".repeat(241)]) expect(() => exportName(body(name))).toThrow("filename");
   expect(() => exportName(wordBytes(10))).toThrow("filename");
 });
+
+test("a program sets the canvas cursor only to a listed shape", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {} } });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, () => {});
+  const encode = (s: string) => new TextEncoder().encode(s);
+  try {
+    expect(await platform.request("cursor", encode("pointer"))).toEqual(new Uint8Array());
+    expect(canvas.style.cursor).toBe("pointer");
+    await expect(platform.request("cursor", encode("url(https://x.example/c.png), auto"))).rejects.toThrow("unsupported cursor");
+    await expect(platform.request("cursor", new Uint8Array([255]))).rejects.toThrow();
+    expect(canvas.style.cursor).toBe("pointer");
+    await platform.request("cursor", encode("default"));
+    expect(canvas.style.cursor).toBe("default");
+  } finally {
+    platform.dispose();
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+  }
+});

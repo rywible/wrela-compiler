@@ -4,6 +4,7 @@ import type { Bytes } from "./stream.ts";
 
 export const MESSAGE_LIMIT = 1024 * 1024 - 512;
 const DECODER = new TextDecoder("utf-8", { fatal: true });
+const CURSORS = new Set(["default", "pointer", "text"]);
 export const wordBytes = (n: number): Bytes => {
   const b = new Uint8Array(4);
   new DataView(b.buffer).setUint32(0, n, true);
@@ -170,6 +171,12 @@ export class BrowserPlatform {
     checked(body);
     if (service === "environment") {
       const b = new Uint8Array(9); b[0] = Number(matchMedia("(prefers-reduced-motion: reduce)").matches); b.set(wordBytes(Math.floor(Date.now() / 1000)), 1); b.set(wordBytes(Math.round((window.devicePixelRatio || 1) * 1024)), 5); return b;
+    }
+    if (service === "cursor") {
+      // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
+      const name = DECODER.decode(body);
+      if (!CURSORS.has(name)) throw new Error(`unsupported cursor: ${name.slice(0, 32)}`);
+      this.canvas.style.cursor = name; return new Uint8Array();
     }
     if (service === "surface/open") return this.#open(DECODER.decode(body));
     if (service === "channel/receive") {
