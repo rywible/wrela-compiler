@@ -4,6 +4,7 @@
 import { Checker, limitsOf, pathProblem } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
+import { Lines, LINES_SIDECAR } from "./lines.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
 import { pathUrl } from "./path.ts";
 import { type Compiled, type Io, Program, type ProgramOptions } from "./program.ts";
@@ -49,6 +50,17 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(ur
     Promise.all(manifest.pipelines.map((p) => getText(fetchFn, new URL(p.shader, base)))),
   ]);
   return { manifest, wasm, shaders };
+}
+
+/** An optimized build's trap locations, from beside its WASM (`game.lines` for `game.wasm`);
+ * null if it has none or they don't arrive. */
+export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = (url) => fetch(url)): Promise<Lines | null> {
+  const name = manifest.wasm.replace(/\.wasm$/, "") + "." + LINES_SIDECAR;
+  try {
+    return Lines.decode(new Uint8Array(await (await get(fetchFn, new URL(name, base))).arrayBuffer()));
+  } catch {
+    return null;
+  }
 }
 
 /**

@@ -8,11 +8,21 @@
 //! Encoding, all integers unsigned LEB128: the number of locations, then each as a length and
 //! UTF-8 bytes; then the number of entries, then each as an offset and a location number (0 for
 //! none, `k` for the `k`-th location).
+//!
+//! An optimized build ([`SIDECAR`]) keeps the table in a file of its own beside the WASM, with
+//! the same encoding, which a host reads only when a trap needs it. The optimizer moves code, so
+//! the table goes through it as a source map ([`Lines::source_map`], [`Lines::from_source_map`]).
 
 use std::collections::HashMap;
 
 /// The custom section's name.
 pub const SECTION: &str = "wrela.lines";
+
+/// The extension of an optimized build's table, beside its WASM: `game.lines` for `game.wasm`.
+pub const SIDECAR: &str = "lines";
+
+/// The base64 digits of a source map's VLQs.
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// A decoded table.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -51,6 +61,100 @@ impl Lines {
         let i = self.entries.partition_point(|(o, _)| *o <= offset).checked_sub(1)?;
         let k = self.entries[i].1;
         (k > 0).then(|| self.locations[k as usize - 1].as_str())
+    }
+
+    /// The table as a source map (version 3) of the module: one line, whose columns are module
+    /// offsets. An entry with no location is a segment of its column alone. Errors on a location
+    /// that isn't `file:line:column`.
+    pub fn source_map(&self) -> Result<String, String> {
+        let mut sources: Vec<&str> = Vec::new();
+        let mut parsed = Vec::with_capacity(self.locations.len());
+        for l in &self.locations {
+            let bad = || format!("the location `{l}` isn't `file:line:column`");
+            let (rest, column) = l.rsplit_once(':').ok_or_else(bad)?;
+            let (file, line) = rest.rsplit_once(':').ok_or_else(bad)?;
+            let number = |n: &str| n.parse::<i64>().ok().filter(|&n| n >= 1).ok_or_else(bad);
+            let (line, column) = (number(line)?, number(column)?);
+            let source = match sources.iter().position(|s| *s == file) {
+                Some(i) => i,
+                None => {
+                    sources.push(file);
+                    sources.len() - 1
+                }
+            };
+            parsed.push([source as i64, line - 1, column - 1]);
+        }
+        let mut mappings = String::new();
+        let mut last = [0i64; 4];
+        for (i, &(offset, k)) in self.entries.iter().enumerate() {
+            if i > 0 {
+                mappings.push(',');
+            }
+            vlq(&mut mappings, i64::from(offset) - last[0]);
+            last[0] = i64::from(offset);
+            if k > 0 {
+                for (field, value) in parsed[k as usize - 1].iter().enumerate() {
+                    vlq(&mut mappings, value - last[field + 1]);
+                    last[field + 1] = *value;
+                }
+            }
+        }
+        Ok(serde_json::json!({ "version": 3, "sources": sources, "names": [], "mappings": mappings })
+            .to_string())
+    }
+
+    /// Reads a source map of a module, as [`Lines::source_map`] writes it or an optimizer
+    /// rewrites it: a segment's location is `file:line:column`, and a segment of a column alone
+    /// has none.
+    pub fn from_source_map(text: &str) -> Result<Lines, String> {
+        let map: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("the source map isn't JSON: {e}"))?;
+        if map["version"] != 3 {
+            return Err("the source map isn't version 3".into());
+        }
+        let sources: Vec<&str> = map["sources"]
+            .as_array()
+            .ok_or("the source map has no `sources`")?
+            .iter()
+            .map(|s| s.as_str().ok_or("a source isn't a string"))
+            .collect::<Result<_, _>>()?;
+        let mappings = map["mappings"].as_str().ok_or("the source map has no `mappings`")?;
+        if mappings.contains(';') {
+            return Err("a module's source map has one line".into());
+        }
+        let mut entries = Vec::new();
+        let mut last = [0i64; 4];
+        for segment in mappings.split(',').filter(|s| !s.is_empty()) {
+            let mut fields = Vec::new();
+            let mut bytes = segment.bytes();
+            while bytes.len() > 0 {
+                fields.push(unvlq(&mut bytes)?);
+            }
+            if !matches!(fields.len(), 1 | 4 | 5) {
+                return Err(format!("the segment `{segment}` has {} fields", fields.len()));
+            }
+            for (field, value) in fields.iter().take(4).enumerate() {
+                last[field] += value;
+            }
+            let offset = u32::try_from(last[0]).map_err(|_| format!("the offset {}", last[0]))?;
+            if entries.last().is_some_and(|&(o, _)| offset < o) {
+                return Err(format!("the segments aren't in order at {offset}"));
+            }
+            let location = if fields.len() == 1 {
+                None
+            } else {
+                let file = usize::try_from(last[1])
+                    .ok()
+                    .and_then(|i| sources.get(i))
+                    .ok_or_else(|| format!("the segment `{segment}` names no source"))?;
+                if last[2] < 0 || last[3] < 0 {
+                    return Err(format!("the segment `{segment}` is before its source's start"));
+                }
+                Some(format!("{file}:{}:{}", last[2] + 1, last[3] + 1))
+            };
+            entries.push((offset, location));
+        }
+        Ok(Lines::new(entries))
     }
 
     /// The section's payload.
@@ -111,6 +215,33 @@ fn leb(out: &mut Vec<u8>, mut x: u32) {
         }
         out.push(b | 0x80);
     }
+}
+
+/// `value` as a source map's base64 VLQ: sign in the lowest bit, five bits a digit.
+fn vlq(out: &mut String, value: i64) {
+    let mut v = if value < 0 { ((-value) << 1) | 1 } else { value << 1 };
+    loop {
+        let digit = (v & 31) as usize;
+        v >>= 5;
+        out.push(BASE64[digit | if v > 0 { 32 } else { 0 }] as char);
+        if v == 0 {
+            return;
+        }
+    }
+}
+
+/// The next base64 VLQ of a segment.
+fn unvlq(bytes: &mut std::str::Bytes) -> Result<i64, String> {
+    let mut v: i64 = 0;
+    for shift in (0..60).step_by(5) {
+        let b = bytes.next().ok_or("a segment ends in the middle of a number")?;
+        let digit = BASE64.iter().position(|&d| d == b).ok_or("a segment isn't base64")? as i64;
+        v |= (digit & 31) << shift;
+        if digit & 32 == 0 {
+            return Ok(if v & 1 == 1 { -(v >> 1) } else { v >> 1 });
+        }
+    }
+    Err("a number in a segment is too long".into())
 }
 
 struct Reader<'a> {
@@ -186,5 +317,41 @@ mod tests {
         let bytes = lines.encode();
         assert_eq!(Lines::decode(&bytes), Ok(lines));
         assert!(Lines::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn a_table_survives_its_source_map() {
+        let lines = Lines::new([
+            (3, None),
+            (12, Some("main.wrela:3:5".into())),
+            (40, Some("engine/sky.wrela:120:17".into())),
+            (41, None),
+            (70_000, Some("main.wrela:1:1".into())),
+            (70_001, Some("main.wrela:3:5".into())),
+        ]);
+        let map = lines.source_map().expect("map");
+        assert!(map.contains(r#""sources":["main.wrela","engine/sky.wrela"]"#), "{map}");
+        assert_eq!(Lines::from_source_map(&map), Ok(lines));
+        // A source map's own segments: a column alone, and five fields (the fifth a name).
+        let theirs =
+            r#"{"version":3,"sources":["a.wrela"],"names":["f"],"mappings":"C,EAEEA,CAAC"}"#;
+        assert_eq!(
+            Lines::from_source_map(theirs),
+            Ok(Lines::new([
+                (1, None),
+                (3, Some("a.wrela:3:3".into())),
+                (4, Some("a.wrela:3:4".into())),
+            ]))
+        );
+        assert!(Lines::new([(1, Some("main.wrela".into()))]).source_map().is_err());
+        for bad in [
+            r#"{"version":3,"sources":[],"mappings":"CAAA"}"#,
+            r#"{"version":3,"sources":["a"],"mappings":"C;C"}"#,
+            r#"{"version":3,"sources":["a"],"mappings":"E,D"}"#,
+            r#"{"version":3,"sources":["a"],"mappings":"CA"}"#,
+            r#"{"version":2,"sources":["a"],"mappings":"C"}"#,
+        ] {
+            assert!(Lines::from_source_map(bad).is_err(), "{bad}");
+        }
     }
 }

@@ -1,0 +1,21 @@
+// Traps in an optimized build (compiler/tests/tests/suite/optimize.rs). Each happens in a small
+// function the optimizer inlines into its caller: the trap still says the callee's line.
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = divide(width, height - height)
+}
+
+pub fn divide(a: u32, b: u32) -> u32 {
+    ratio(a, b) + 1
+}
+
+fn ratio(a: u32, b: u32) -> u32 {
+    a / b
+}
+
+pub fn grow_twice(a: i32) -> i32 {
+    grow(a) * 2
+}
+
+fn grow(a: i32) -> i32 {
+    a + 1
+}

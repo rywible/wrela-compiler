@@ -2,10 +2,12 @@
 //!
 //! ```text
 //! wrela check <package-dir> [--json]      check a package; exit 1 if it has errors
-//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--lift <package>]...
+//! wrela build <package-dir> [-o <dir>] [--debug] [--testing] [--optimize] [--lift <package>]...
 //!                                         check and build; writes <dir> (default
 //!                                         <package>/build); --debug adds checks (§11);
 //!                                         --testing keeps the `@testing` exports (§9);
+//!                                         --optimize makes the WASM smaller with
+//!                                         Binaryen, its trap locations in game.lines;
 //!                                         --lift reads that package's literals from a
 //!                                         table the program can change (§22)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
@@ -92,7 +94,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--lift <package>]... [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--json]",
         "wrela edit <package-dir> [--edits <file.json>] [--dry-run] [--json]",
@@ -183,6 +185,9 @@ pub(crate) struct PackageArgs {
     /// `--lift <package>`, which only `build` takes: the packages whose literals a lifted
     /// build lifts.
     pub lift: Vec<String>,
+    /// `--optimize`, which only `build` takes: the WASM through `wasm-opt`
+    /// (`wrela_driver::optimize`).
+    pub optimize: bool,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
@@ -190,6 +195,7 @@ pub(crate) struct PackageArgs {
 /// returned.
 pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageArgs, ExitCode> {
     let (mut dir, mut out, mut json, mut debug, mut testing) = (None, None, false, false, false);
+    let mut optimize = false;
     let mut lift = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -201,6 +207,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--json" => json = true,
             "--debug" if takes_out => debug = true,
             "--testing" if takes_out => testing = true,
+            "--optimize" if takes_out => optimize = true,
             "--lift" if takes_out => match it.next() {
                 Some(p) => lift.extend(p.split(',').map(String::from)),
                 None => return Err(usage()),
@@ -226,7 +233,7 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
         );
         return Err(ExitCode::from(2));
     }
-    Ok(PackageArgs { dir, json, out, debug, testing, lift })
+    Ok(PackageArgs { dir, json, out, debug, testing, lift, optimize })
 }
 
 /// Checks that the package `dir` is a directory. If it isn't, the message is printed and the

@@ -41,6 +41,7 @@ mod measures;
 mod messages;
 mod noise;
 mod numerics;
+mod optimize;
 mod parallel;
 mod piano;
 mod reload;

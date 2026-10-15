@@ -41,6 +41,13 @@ cover = "cover.png"
                 with self.assertRaisesRegex(ValueError, "cover"):
                     console.read_config(config)
 
+    def test_released_builds_are_optimized(self):
+        with patch.object(console.subprocess, "run") as run:
+            console.build_package("games/leapling", Path("/tmp/out"))
+        command = run.call_args.args[0]
+        self.assertEqual(command[1:3], ["build", str(console.ROOT / "games/leapling")])
+        self.assertIn("--optimize", command)
+
     def test_every_console_bootstrap_has_the_same_storage_namespace(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

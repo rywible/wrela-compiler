@@ -811,26 +811,39 @@ fn engine_for(fuel: Option<u64>) -> &'static Engine {
 pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
     let module =
         Module::new(engine_for(fuel), wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
-    compiled(module, wasm, fuel)
+    compiled(module, wasm, fuel, None)
 }
 
 /// [`compile_with`], the compiled code kept beside the build in `dir`, if given
-/// (`crate::cache`); `hash` is the WASM's ([`wrela_abi::ticks::wasm_hash`]).
+/// (`crate::cache`); `hash` is the WASM's ([`wrela_abi::ticks::wasm_hash`]). `sidecar` is an
+/// optimized build's trap locations, read from beside its WASM ([`lines::SIDECAR`]).
 pub(crate) fn compile_cached(
     wasm: &[u8],
     hash: u64,
     dir: Option<&std::path::Path>,
     fuel: Option<u64>,
+    sidecar: Option<&[u8]>,
 ) -> Result<Compiled> {
-    compiled(crate::cache::module(engine_for(fuel), wasm, hash, dir)?, wasm, fuel)
+    compiled(crate::cache::module(engine_for(fuel), wasm, hash, dir)?, wasm, fuel, sidecar)
 }
 
-fn compiled(module: Module, wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
+fn compiled(
+    module: Module,
+    wasm: &[u8],
+    fuel: Option<u64>,
+    sidecar: Option<&[u8]>,
+) -> Result<Compiled> {
     let memory = check_abi(&module)?;
-    let lines = match lines::custom_section(wasm, lines::SECTION) {
-        Some(payload) => Some(Arc::new(Lines::decode(payload).map_err(|e| {
-            Error::Program(format!("its `{}` section is malformed: {e}", lines::SECTION))
-        })?)),
+    // A build's own section, else an optimized build's file beside it.
+    let (payload, from) = match lines::custom_section(wasm, lines::SECTION) {
+        Some(payload) => (Some(payload), format!("`{}` section", lines::SECTION)),
+        None => (sidecar, format!("`.{}` file", lines::SIDECAR)),
+    };
+    let lines = match payload {
+        Some(payload) => Some(Arc::new(
+            Lines::decode(payload)
+                .map_err(|e| Error::Program(format!("its {from} is malformed: {e}")))?,
+        )),
         None => None,
     };
     Ok(Compiled { module, fuel, memory, lines, pair: wrela_abi::read_pair(wasm) })
@@ -1292,16 +1305,19 @@ impl<E: Executor> Program<E> {
     }
 
     /// What trapped, and where in the source if the program says: the location of the
-    /// innermost frame that has one.
+    /// innermost frame that has one. A build without its trap locations (an optimized build
+    /// whose `game.lines` is missing) gives the innermost frame's module offset instead.
     fn describe_trap(&self, trap: &wasmtime::Error) -> String {
         let what = match trap.downcast_ref::<wasmtime::Trap>() {
             Some(t) => t.to_string(),
             None => format!("{trap:#}"),
         };
-        let at = self.lines.as_ref().and_then(|lines| {
-            let bt = trap.downcast_ref::<wasmtime::WasmBacktrace>()?;
-            bt.frames().iter().find_map(|f| lines.at(f.module_offset()? as u32))
-        });
+        let frames = trap.downcast_ref::<wasmtime::WasmBacktrace>().map(|bt| bt.frames());
+        let offsets = frames.into_iter().flatten().filter_map(|f| f.module_offset());
+        let at = match &self.lines {
+            Some(lines) => offsets.into_iter().find_map(|o| lines.at(o as u32)).map(String::from),
+            None => offsets.into_iter().next().map(|o| format!("code offset {o:#x}")),
+        };
         match at {
             Some(loc) => format!("{what} at {loc}"),
             None => what,

@@ -1,6 +1,7 @@
-//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--lift <package>]... [--json]`: checks and builds a package, writing
+//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]`: checks and builds a package, writing
 //! `game.wasm`, the WGSL, `manifest.json` and the runtime into the output directory (default
-//! `<package>/build`). The output is the same bytes for the same input (AC9). A file an earlier
+//! `<package>/build`). With `--optimize`, `game.wasm` goes through Binaryen and its trap
+//! locations are written beside it, as `game.lines` (`wrela_driver::optimize`). The output is the same bytes for the same input (AC9). A file an earlier
 //! build wrote there and this one doesn't (every one, when the build fails) is removed; other
 //! files are left alone, and the build stops rather than replace one. `.wrela-build` there
 //! lists the files the last build wrote.
@@ -33,6 +34,14 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
+    let mut output = output;
+    if args.optimize
+        && !failed
+        && let Err(e) = optimized(&mut output.files)
+    {
+        eprintln!("error: {e}");
+        return ExitCode::from(2);
+    }
     // Before anything in `out` is removed or written.
     if let Err(e) = symlinks_in_way(&out, &output.files) {
         eprintln!("error: {e}");
@@ -87,6 +96,19 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 }
 
+/// The build's files with `game.wasm` optimized, and its trap locations beside it.
+fn optimized(files: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
+    let wasm =
+        files.iter_mut().find(|(f, _)| f == "game.wasm").ok_or("the build has no game.wasm")?;
+    let (code, lines) = wrela_driver::optimize::optimize(&wasm.1)?;
+    wasm.1 = code;
+    files.push((LINES.to_string(), lines));
+    Ok(())
+}
+
+/// An optimized build's trap locations, beside `game.wasm` (`wrela_abi::lines::SIDECAR`).
+const LINES: &str = "game.lines";
+
 /// Whether a build writes a file with this name: `game.wasm`, `manifest.json`, a pipeline's
 /// `pipeline_<n>.wgsl`, a file of the runtime, or a server build's `server/game.wasm`.
 fn written_by_build(name: &str) -> bool {
@@ -102,6 +124,7 @@ fn written_by_build(name: &str) -> bool {
     pipeline
         || shipped
         || name == "game.wasm"
+        || name == LINES
         || name == "manifest.json"
         || name == "lift.json"
         || name == wrela_driver::build::SERVER_WASM

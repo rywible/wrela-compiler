@@ -274,7 +274,11 @@ fn compile_build_with_shaders(dir: &Path, fuel: Option<u64>, shaders: bool) -> R
     let (manifest, wasm, shaders) = read_build(dir, shaders)?;
     let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
     let beside = fuel.is_none().then_some(dir);
-    let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel)?;
+    // An optimized build keeps its trap locations beside its WASM; without them, a trap gives
+    // its code offset.
+    let sidecar = Path::new(&manifest.wasm).with_extension(wrela_abi::lines::SIDECAR);
+    let sidecar = std::fs::read(dir.join(sidecar)).ok();
+    let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel, sidecar.as_deref())?;
     Ok(Build { manifest, shaders, wasm_hash, compiled })
 }
 

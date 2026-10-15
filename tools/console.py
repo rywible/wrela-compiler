@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build static Wrela console/game releases; requires Pillow."""
+"""Build static Wrela console/game releases; requires Pillow and Binaryen's wasm-opt."""
 import argparse
 import hashlib
 import json
@@ -112,8 +112,9 @@ def copy_licenses(package, output):
 
 
 def build_package(package, output):
-    subprocess.run([str(ROOT / "tools/wrela"), "build", str(ROOT / package), "-o", str(output)],
-                   cwd=ROOT, check=True)
+    # Released WASM goes through Binaryen; its trap locations go beside it, as game.lines.
+    subprocess.run([str(ROOT / "tools/wrela"), "build", str(ROOT / package), "-o", str(output),
+                    "--optimize"], cwd=ROOT, check=True)
 
 
 def retain_releases(previous, target):

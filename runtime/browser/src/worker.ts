@@ -10,7 +10,8 @@ import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
-import { browserIo, type Build, loadBuild, startProgram } from "./loader.ts";
+import { browserIo, type Build, loadBuild, loadLines, startProgram } from "./loader.ts";
+import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
 import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
@@ -73,16 +74,20 @@ function deliverInput(program: Program): readonly number[] {
   return times;
 }
 
-/** Stops everything and reports `e`: to the page, and in test mode to `results/DONE`. */
+/** Stops everything and reports `e`: to the page, and in test mode to `results/DONE`. A trap in
+ * an optimized build is reported once its location is fetched (`locate`). */
 function fatal(e: unknown): void {
   if (failed) return;
   failed = true;
   ticker.control.stop();
-  const text = errorMessage(e);
-  self.postMessage({ type: "fatal", message: text } satisfies FromWorker);
-  if (testing) {
-    putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
-  }
+  const build = running;
+  const at = buildBase;
+  void locate(errorMessage(e), async () => (build ? loadLines(at, build.manifest) : null)).then((text) => {
+    self.postMessage({ type: "fatal", message: text } satisfies FromWorker);
+    if (testing) {
+      putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
+    }
+  });
 }
 
 let storageNamespace: string | null = null;

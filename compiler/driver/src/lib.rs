@@ -18,6 +18,7 @@ mod http;
 pub mod lift;
 pub mod live;
 pub mod manifest;
+pub mod optimize;
 pub mod package;
 pub mod primer;
 pub mod query;

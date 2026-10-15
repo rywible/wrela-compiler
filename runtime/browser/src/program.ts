@@ -65,7 +65,7 @@ import { type Checker, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { CALLED_WHILE_STARTING, clockImport, phaseImport, printed, refusingImports } from "./imports.ts";
-import { Lines, LINES_SECTION, wasmOffsets } from "./lines.ts";
+import { Lines, LINES_SECTION, unlocated, wasmOffsets } from "./lines.ts";
 import { Inbox, type Net } from "./net.ts";
 import type { Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
@@ -937,16 +937,17 @@ export function trapMessage(e: unknown, memory: WebAssembly.Memory | null, threa
 }
 
 /** What trapped, and where in the source if the program says (`lines`) and the engine's stack
- * trace gives offsets: the location of the innermost frame that has one. */
+ * trace gives offsets: the location of the innermost frame that has one. Without the table (an
+ * optimized build's is beside it), the frames' offsets, which the page looks up (`locate`). */
 function describeTrap(e: unknown, lines: Lines | null): string {
   // A host import's TrapError crosses the Wasm boundary unchanged. Its prefix is this class's
   // presentation, not part of the trap reason that the outer TrapError presents again.
   const prefix = "the program trapped: ";
   const what = e instanceof TrapError && e.message.startsWith(prefix) ? e.message.slice(prefix.length) : errorMessage(e);
   const stack = e instanceof Error ? (e.stack ?? "") : "";
-  const at = wasmOffsets(stack)
-    .map((offset) => lines?.at(offset) ?? null)
-    .find((loc) => loc !== null);
+  const offsets = wasmOffsets(stack);
+  if (lines === null) return offsets.length > 0 ? `${what} at ${unlocated(offsets)}` : what;
+  const at = offsets.map((offset) => lines.at(offset)).find((loc) => loc !== null);
   return at ? `${what} at ${at}` : what;
 }
 

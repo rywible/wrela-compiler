@@ -1,6 +1,8 @@
 // The `wrela.lines` custom section of a program's WASM: where in the source each part of its
 // code came from, so a trap can say where it happened. Mirrors runtime/abi/src/lines.rs (the
-// format is described there).
+// format is described there). An optimized build keeps the table in a file beside its WASM
+// (`game.lines`), fetched only when a trap needs it: the trap's message carries its code
+// offsets (`unlocated`) until the page reports it (`locate`).
 
 import { ByteReader, UTF8 } from "./wasm.ts";
 
@@ -58,6 +60,37 @@ export class Lines {
     const [section] = WebAssembly.Module.customSections(module, LINES_SECTION);
     return section ? Lines.decode(new Uint8Array(section)) : null;
   }
+}
+
+export const LINES_SIDECAR = "lines";
+
+/** How many frames' offsets a trap without its table carries, innermost first. */
+const UNLOCATED_FRAMES = 16;
+
+/** Where a trap happened, in a message, when the program's table isn't at hand: its frames'
+ * module offsets, innermost first, for `locate` to look up. */
+export function unlocated(offsets: number[]): string {
+  return `wasm ${offsets.slice(0, UNLOCATED_FRAMES).map((o) => `0x${o.toString(16)}`).join(",")}`;
+}
+
+/**
+ * `text` with the offsets a trap carries (`unlocated`) replaced by the location of the
+ * innermost that has one in the table `load` gives; with the innermost offset alone, if it
+ * gives none or fails.
+ */
+export async function locate(text: string, load: () => Promise<Lines | null>): Promise<string> {
+  const found = / at wasm (0x[0-9a-f]+(?:,0x[0-9a-f]+)*)/.exec(text);
+  if (found === null) return text;
+  const offsets = found[1]!.split(",").map((o) => Number.parseInt(o, 16));
+  let lines: Lines | null = null;
+  try {
+    lines = await load();
+  } catch {
+    // The report goes on without the locations.
+  }
+  const at = offsets.map((o) => lines?.at(o) ?? null).find((loc) => loc !== null);
+  const where = at ?? `code offset 0x${offsets[0]!.toString(16)}`;
+  return text.slice(0, found.index) + ` at ${where}` + text.slice(found.index + found[0].length);
 }
 
 /**

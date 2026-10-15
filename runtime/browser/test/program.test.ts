@@ -4,10 +4,10 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, RUNNING, SCREEN, STREAM_VERSION, TASK_SLOTS, THREAD_BLOCK_SIZE, THREAD_BLOCKS, THREAD_HELPER0, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError } from "../src/program.ts";
+import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError, trapMessage } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { type Command, StreamError } from "../src/stream.ts";
-import { wasmOffsets } from "../src/lines.ts";
+import { Lines, locate, wasmOffsets } from "../src/lines.ts";
 import { Encoder } from "./encoder.ts";
 import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, type Import, op, SUBMIT } from "./wasm-builder.ts";
@@ -359,6 +359,27 @@ test("a failed audio or ticker start fails the call even if the module catches i
 test("reports program traps", async () => {
   const program = await load(buildModule({ memory: 1, funcs: [{ type: FRAME_TYPE, body: op.unreachable, export: "frame" }] }));
   expect(() => program.frame(0, 1, 1)).toThrow(TrapError);
+});
+
+test("a trap without its table carries its offsets until the page locates it", async () => {
+  // An optimized build's table is beside it (`game.lines`), not in its module. V8's stack (Bun's
+  // engine writes no offsets; compiler/tests' optimize.rs traps in Chrome itself).
+  const trap = new Error("divide by zero");
+  trap.stack = "RuntimeError: divide by zero\n    at div (wasm://wasm/0a1b2c3d:wasm-function[7]:0x2f1)\n    at run (wasm://wasm/0a1b2c3d:wasm-function[9]:0x340)";
+  const message = trapMessage(trap, null, 0, null);
+  expect(message).toBe("divide by zero at wasm 0x2f1,0x340");
+  // The innermost frame has no location; the next one has `main.wrela:3:5`.
+  const location = new TextEncoder().encode("main.wrela:3:5");
+  const table = Lines.decode(new Uint8Array([1, location.length, ...location, 2, 0, 0, 0x80, 0x06, 1]));
+  expect(await locate(`the program trapped: ${message}`, async () => table)).toBe("the program trapped: divide by zero at main.wrela:3:5");
+  // When the table doesn't arrive, the innermost offset alone.
+  for (const load of [async () => null, async () => Promise.reject(new Error("offline"))]) {
+    expect(await locate(message, load)).toBe("divide by zero at code offset 0x2f1");
+  }
+  // A message without offsets is left as it is, and nothing is fetched.
+  let fetched = false;
+  expect(await locate("can't fetch game.wasm", async () => ((fetched = true), table))).toBe("can't fetch game.wasm");
+  expect(fetched).toBe(false);
 });
 
 test("a host TrapError has one prefix and still yields to the program's panic message", async () => {

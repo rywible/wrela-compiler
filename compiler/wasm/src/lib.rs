@@ -545,6 +545,48 @@ pub fn with_custom_section(mut wasm: Vec<u8>, name: &str, payload: &[u8]) -> Vec
     wasm
 }
 
+/// `wasm` without its custom section `name`, and that section's payload, if it had one. Errors
+/// if the module's sections don't read.
+pub fn without_custom_section(
+    wasm: &[u8],
+    name: &str,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    // An unsigned LEB128 at `*at`, which it moves past.
+    fn leb(bytes: &[u8], at: &mut usize) -> Result<usize, String> {
+        let mut value = 0usize;
+        for shift in (0..35).step_by(7) {
+            let b = *bytes.get(*at).ok_or("a section ends early")?;
+            *at += 1;
+            value |= usize::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err("a section's size is too long".into())
+    }
+    let mut out = wasm.get(..8).ok_or("the module is shorter than its header")?.to_vec();
+    let mut payload = None;
+    let mut at = 8;
+    while at < wasm.len() {
+        let start = at;
+        let id = wasm[at];
+        at += 1;
+        let size = leb(wasm, &mut at)?;
+        let body = wasm.get(at..at + size).ok_or("a section ends early")?;
+        at += size;
+        if id == 0 {
+            let mut name_at = 0;
+            let n = leb(body, &mut name_at)?;
+            if body.get(name_at..name_at + n) == Some(name.as_bytes()) {
+                payload = Some(body[name_at + n..].to_vec());
+                continue;
+            }
+        }
+        out.extend_from_slice(&wasm[start..at]);
+    }
+    Ok((out, payload))
+}
+
 /// Fails if a WASM module uses any relaxed-SIMD instruction (AC7): those are the only WASM
 /// instructions whose results may differ between engines, including fused multiply-add.
 pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
@@ -628,6 +670,19 @@ mod tests {
         // Plain SIMD is deterministic, and fine.
         let plain = module("local.get 0 local.get 1 f32x4.mul");
         assert_eq!(check_no_relaxed_simd(&plain), Ok(()));
+    }
+
+    #[test]
+    fn a_custom_section_comes_out_whole() {
+        let bare = module("local.get 0");
+        let with = with_custom_section(bare.clone(), "a", b"first");
+        let both = with_custom_section(with.clone(), "b", b"second");
+        assert_eq!(
+            without_custom_section(&both, "a"),
+            Ok((with_custom_section(bare.clone(), "b", b"second"), Some(b"first".to_vec())))
+        );
+        assert_eq!(without_custom_section(&with, "b"), Ok((with.clone(), None)));
+        assert!(without_custom_section(&with[..with.len() - 1], "a").is_err());
     }
 
     #[test]

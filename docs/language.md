@@ -1074,7 +1074,7 @@ The sim/presentation split is an engine pattern built on this, not a language fe
 ## 15. Errors (T1)
 
 - **Recoverable failures are `Result<T, E>`, propagated with `?`** (D-061).
-- **Bugs panic.** On the CPU, a panic is a trap, and its message says where in the source it happened (from the `wrela.lines` section of the program's WASM). GPU code can't panic; out-of-bounds access sets a debug flag or clamps (D-074).
+- **Bugs panic.** On the CPU, a panic is a trap, and its message says where in the source it happened (from the `wrela.lines` section of the program's WASM). An optimized build (`wrela build --optimize`) keeps that table beside its WASM, in `game.lines`, which a browser fetches only when a trap needs it; without the file, the message gives the trap's code offset. GPU code can't panic; out-of-bounds access sets a debug flag or clamps (D-074).
 - **What happens after a trap** is the program's policy. The engine restores its last snapshot and writes a repro bundle (D-087).
 
 ---
