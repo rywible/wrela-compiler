@@ -2588,15 +2588,20 @@ impl<'c, 'a> Fl<'c, 'a> {
         args: &[mir::Arg],
         span: Span,
     ) -> Option<ir::ValueId> {
-        if let Callable::Func { func, substs } = callable {
+        let (owner, id) = match callable {
             // Its parameters are passed as a direct call passes them (borrowed aggregates by
             // reference on the CPU).
-            return self.call_fn(*func, substs.clone(), args, span);
-        }
-        // A closure takes its `mut` parameters as places, the others by value.
+            Callable::Func { func, substs } => {
+                return self.call_fn(*func, substs.clone(), args, span);
+            }
+            Callable::Closure { owner, id } => (owner, id),
+        };
+        // A closure takes its `mut` parameters as places, the others by value: a `str` or `[T]`
+        // one as a run, as `call_fn` passes a function's.
+        let tys = self.cx.closure_param_tys(self.mb, owner, *id);
         let mut out = self.capture_args(srcs)?;
         let mut write_back = Vec::new();
-        for a in args {
+        for (k, a) in args.iter().enumerate() {
             if let mir::Arg::Mut(pl, _) = a {
                 if !self.has_value(pl) {
                     continue;
@@ -2610,7 +2615,18 @@ impl<'c, 'a> Fl<'c, 'a> {
                     }
                 };
                 out.push(ir::Arg::Place(place));
-            } else if let Some(v) = self.arg_value(a) {
+                continue;
+            }
+            let run = tys
+                .get(k)
+                .copied()
+                .flatten()
+                .filter(|&t| matches!(self.mb.m.types.get(t), ir::TypeDef::Run(_)));
+            let v = match (a.place(), run) {
+                (Some(pl), Some(rt)) => self.run_arg(pl, rt),
+                _ => self.arg_value(a),
+            };
+            if let Some(v) = v {
                 out.push(ir::Arg::Value(v));
             }
         }

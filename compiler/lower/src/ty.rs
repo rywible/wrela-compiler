@@ -380,6 +380,30 @@ impl<'a> Cx<'a> {
         mb.m.types.field(it, 1 + variant).map(|_| 1 + variant)
     }
 
+    /// The IR type of each parameter of closure `id` in `owner`'s body, in order; `None` for
+    /// one with no runtime value.
+    pub fn closure_param_tys(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        owner: &InstanceKey,
+        id: ClosureId,
+    ) -> Vec<Option<ir::TypeId>> {
+        let checked = self.checked;
+        let Some(body) = owner.source_fn().and_then(|f| checked.mir.get(&f)) else {
+            return Vec::new();
+        };
+        let subst = self.instance_subst(owner);
+        let params = &body.closures[id.0 as usize].params;
+        params
+            .iter()
+            .map(|&l| {
+                let decl = body.local(l);
+                let t = self.concrete(decl.ty, &subst);
+                self.lower_ty(mb, t, decl.span)
+            })
+            .collect()
+    }
+
     /// The captures of closure `id` in `owner`'s body that its lifted function takes as
     /// parameters, in order: each one's local, IR type, and whether the closure writes it. A
     /// captured closure travels as its value, and a capture with no runtime value isn't
@@ -557,27 +581,21 @@ impl<'a> Cx<'a> {
                 let info = &body.closures[id.0 as usize];
                 let c = Callable::Closure { owner: owner.clone(), id: *id };
                 let mut params = self.callable_params(mb, &c);
-                let subst = self.instance_subst(owner);
-                for &l in &info.params {
+                let tys = self.closure_param_tys(mb, owner, *id);
+                for (&l, ty) in info.params.iter().zip(tys) {
+                    let Some(ty) = ty else { continue };
                     let decl = body.local(l);
-                    let t = self.concrete(decl.ty, &subst);
-                    if let Some(ty) = self.lower_ty(mb, t, decl.span) {
-                        // A `mut` parameter (its mode from the function type the closure is
-                        // passed as, §6.7) is the caller's place; the others are values.
-                        let by_ref = matches!(
-                            decl.kind,
-                            wrela_sema::mir::LocalKind::User(wrela_sema::thir::LocalKind::Param(
-                                Mode::Mut
-                            ))
-                        );
-                        params.push(ir::Param {
-                            name: decl.name.clone(),
-                            ty,
-                            by_ref,
-                            mutable: by_ref,
-                        });
-                    }
+                    // A `mut` parameter (its mode from the function type the closure is passed
+                    // as, §6.7) is the caller's place; the others are values.
+                    let by_ref = matches!(
+                        decl.kind,
+                        wrela_sema::mir::LocalKind::User(wrela_sema::thir::LocalKind::Param(
+                            Mode::Mut
+                        ))
+                    );
+                    params.push(ir::Param { name: decl.name.clone(), ty, by_ref, mutable: by_ref });
                 }
+                let subst = self.instance_subst(owner);
                 let rt = self.concrete(info.ret, &subst);
                 let ret = self.lower_ty(mb, rt, info.span);
                 let name = format!("{}_closure{}", self.checked.program.func(f).name, id.0);

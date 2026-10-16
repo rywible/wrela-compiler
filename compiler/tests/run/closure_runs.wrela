@@ -1,0 +1,40 @@
+// run: a closure's `str` and `[T]` parameters take a run, as a function's do: of text, a
+// `String` or an array
+// expect: found() = 5
+// expect: lengths() = 7
+// expect: summed() = 6.0
+// expect: passed_down() = 4
+
+pub fn found() -> u32 {
+    let page = "abcabc"
+    let at = |t: str| -> u32 { page.find(t).unwrap_or(page.len()) }
+    let b = "b"
+    at("c") + at(b) + at("z") - 4
+}
+
+pub fn lengths() -> u32 {
+    let len = |t: str| -> u32 { t.len() }
+    let s = String::from("four")
+    len(s) + len("abc")
+}
+
+pub fn summed() -> f32 {
+    let sum = |v: [f32]| -> f32 {
+        var s = 0.0
+        for x in v {
+            s += x
+        }
+        s
+    }
+    let xs = [1.0, 2.0, 3.0]
+    sum(xs)
+}
+
+fn call_with(f: fn(str) -> u32) -> u32 {
+    f("abcd")
+}
+
+pub fn passed_down() -> u32 {
+    let k = 0
+    call_with(|t: str| -> u32 { t.len() + k })
+}
