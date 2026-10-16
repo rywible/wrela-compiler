@@ -411,6 +411,31 @@ fn temporal_resolve_gathering_its_neighbourhood_matches_the_shared_one() {
     assert!(clipped > 24 * 24 / 2, "the history wasn't clipped: {clipped} pixels");
 }
 
+/// Grass the wind moves keeps its blades through temporal AA when its motion is in the motion
+/// target (`deforming_of`): after 12 frames of blades sliding 1.5 pixels a frame, the resolve
+/// with their motion is at most three quarters as far from a fresh resolve (no history) as the
+/// one without, which fades them toward the ground. (Not half: at a blade's leading edge its
+/// motion can point at the ground's history, and there the camera reprojects it, as before.)
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_keeps_swaying_grass_that_draws_its_motion() {
+    let (dir, _) = page("compiler/tests/temporal-sway", "temporal-sway");
+    let times: Vec<f32> = (0..12).map(|i| i as f32 / 60.0).collect();
+    let frame = Host::load(&dir).expect("load").run_frames(&times, 192, 32).expect("run").frame;
+    let px = |x: usize, y: usize, c: usize| i32::from(frame[4 * (y * 192 + x) + c]);
+    let (mut with, mut without) = (0, 0);
+    for y in 0..32 {
+        for x in 0..64 {
+            for c in 0..3 {
+                with += (px(x, y, c) - px(x + 128, y, c)).abs();
+                without += (px(x + 64, y, c) - px(x + 128, y, c)).abs();
+            }
+        }
+    }
+    eprintln!("distance from a fresh resolve: {with} with motion, {without} without");
+    assert!(4 * with <= 3 * without, "with motion {with}, without {without}");
+}
+
 /// Leaves and a solid silhouette against sky are partial coverage. Their stored depth can
 /// change with jitter without the history becoming invalid. Keep that history and the
 /// spatial background contribution, while the opaque rows above retain depth rejection.

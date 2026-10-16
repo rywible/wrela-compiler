@@ -1,0 +1,5 @@
+[package]
+name = "temporal_sway"
+
+[dependencies]
+engine = { path = "../../../engine" }
