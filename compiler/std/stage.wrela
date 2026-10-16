@@ -1,5 +1,5 @@
-// Fields built at runtime (language.md §7, D-029, D-053): a tape of operations, which
-// `interpret` evaluates. A field the program assembles while it runs, from an edit log or a
+// Fields built while the program runs, as a tape of operations that `interpret` evaluates
+// (language.md §7). A field the program assembles while it runs, from an edit log or a
 // sculpting tool, has no code of its own to compile; its tape is data. A `Tape` is a `Surface`
 // like any compiled field, on the CPU and the GPU, and its gradient and interval are derived
 // from `interpret`'s own code, as any function's are (§13).
@@ -232,9 +232,8 @@ impl Tape {
 
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
     /// intervals over `over` don't overlap (by the smooth minimum's width, for one) becomes the
-    /// operand it always picks, then the operations the value no longer uses are dropped (D-029:
-    /// Keeter's interval pruning). Inside `over`, the result is the same as the original at
-    /// every point; outside, it may not be.
+    /// operand it always picks, then the operations the value no longer uses are dropped. Inside
+    /// `over`, the result is the same as the original at every point; outside, it may not be.
     pub fn prune(self, over: Box3) -> Tape {
         var ops = self.ops
         for i in 0..self.len {

@@ -1,8 +1,12 @@
-// Requests to the host (language.md §6.15): the program's storage ("bytes at a path") and
-// fetching files of its build. A request is made at once and answered on a later call: the
-// `Pending` it gives is polled, as is a GPU readback's (`std::gpu::read`). Making a request is
-// the `io` effect, and polling one `nondet`, so `@deterministic` code does neither: an answer
-// reaches the simulation only through a tick's input.
+// Requests to the host: the program's storage ("bytes at a path"), fetching the build's files,
+// and posting to the host that serves the program (language.md §6.15). The module also has
+// `print`, which shows a line on the host's console, and `Shipped`, files a build ships beside
+// the program.
+//
+// A request is made at once and answered on a later call: the `Pending` it gives is polled, as
+// is a GPU readback's (`std::gpu::read`). Making a request is the `io` effect, and polling one
+// `nondet`, so `@deterministic` code does neither: an answer reaches the simulation only
+// through a tick's input.
 
 use std::abi::{REQUEST_FAILED, REQUEST_PENDING}
 
@@ -102,12 +106,12 @@ pub fn load(path: str) -> Pending<u8> {
     Pending::new(request)
 }
 
-/// Stores `bytes` at `path` in the program's storage, replacing what was there. The answer is
 /// The most bytes a request's path and data (or URL and body) hold together: a command is at most
 /// the host's command buffer (1 MiB, wrela_abi `CMD_CAP`), less its words.
 const MOST_BYTES: u32 = 1048576 - 64
 
-/// no bytes.
+/// Stores `bytes` at `path` in the program's storage, replacing what was there. The answer is
+/// no bytes. The path and the bytes together hold at most 1 MiB less 64 bytes; more panics.
 pub fn store(path: str, bytes: [u8]) -> Pending<u8> {
     check_path("store", path)
     if bytes.len() + path.len() > MOST_BYTES {
@@ -183,7 +187,7 @@ fn print_command(line: str) {}
 @intrinsic
 fn post_command(request: u32, url: str, bytes: [u8]) {}
 
-// ---- files a build ships (M6) -------------------------------------------------------------------
+// ---- files a build ships ------------------------------------------------------------------------
 
 /// Files a build ships beside the program, for data too large to load before the first frame (a
 /// world streamed in tiles): a constant of this type is written as files of the build, under

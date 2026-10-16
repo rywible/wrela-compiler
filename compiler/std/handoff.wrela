@@ -1,11 +1,11 @@
-// Hand-offs (language.md §6.17): the latest value from one thread to another. One thread
-// publishes whole values; another reads the newest complete one. Neither waits, and a value is
-// never read half-written. It's a triple buffer: three slots, of which the publisher owns one
-// (its back), the reader one (its front), and the third (the middle) holds the newest complete
-// value. One atomic word holds the middle slot's index, and a bit that says whether the reader
-// has seen it. Publishing writes the back slot, then swaps it with the middle; reading swaps
-// the front with the middle when the bit says there's something new. Two slots wouldn't do:
-// one side would have to wait or retry.
+// Hand-offs: the latest value from one thread to another, without waiting (language.md §6.17).
+// One thread publishes whole values; another reads the newest complete one. Neither waits, and
+// a value is never read half-written. It's a triple buffer: three slots, of which the publisher
+// owns one (its back), the reader one (its front), and the third (the middle) holds the newest
+// complete value. One atomic word holds the middle slot's index, and a bit that says whether
+// the reader has seen it. Publishing writes the back slot, then swaps it with the middle;
+// reading swaps the front with the middle when the bit says there's something new. Two slots
+// wouldn't do: one side would have to wait or retry.
 //
 // The value is `Plain`, so it's a copy of bytes: nothing in a slot points into the
 // publisher's heap. In a debug build (and so a test), each slot also carries how many values

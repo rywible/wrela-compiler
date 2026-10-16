@@ -1,5 +1,5 @@
-// Rotations as unit quaternions (language.md §4: `Quat`, tier 1), on the CPU and the GPU alike.
-// The prelude puts `Quat` in scope everywhere, beside the vector and matrix types.
+// Rotations as unit quaternions, on the CPU and the GPU alike (`Quat`, language.md §4). The
+// prelude puts `Quat` in scope everywhere, beside the vector and matrix types.
 
 use std::hash::StateHash
 use std::serialize::Serialize

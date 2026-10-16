@@ -61,7 +61,7 @@ pub struct PackageInfo {
     pub deps: Vec<(String, usize)>,
     /// Its manifest declares `unsafe`.
     pub unsafe_ok: bool,
-    /// A lifted build lifts its literals (language.md §22): its literal tables are built where
+    /// A lifted build lifts its literals (language.md §20): its literal tables are built where
     /// they're used, from their literals, rather than kept as data.
     pub lifted: bool,
 }

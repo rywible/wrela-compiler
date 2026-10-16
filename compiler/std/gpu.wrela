@@ -1,5 +1,6 @@
-// GPU resources, entry-point builtins, and the CPU calls that record GPU work (language.md
-// §12, §6.13, D-102). Every function here that CPU code calls carries the `host` effect.
+// GPU buffers, textures and passes, the builtins of GPU entry points, and the CPU calls that
+// record GPU work: dispatches, draws, copies and readbacks (language.md §12, §6.13). Every
+// function here that CPU code calls carries the `host` effect.
 
 use std::abi::{
     COMPARE_ALWAYS, COMPARE_EQUAL, COMPARE_GREATER, COMPARE_GREATER_EQUAL, COMPARE_LESS,
@@ -13,7 +14,7 @@ use std::io::{Pending, next_request}
 use std::mem::{Drop, size_of}
 
 /// A buffer of `T`s on the GPU: an owned value, which CPU code creates, writes into and passes
-/// to kernels and shaders, but can't read through (D-102). Dropping it releases it; the host
+/// to kernels and shaders, but can't read through. Dropping it releases it; the host
 /// waits for work already recorded with it. A buffer in the program's state lasts with it.
 pub struct GpuBuffer<T> {
     // The compiler binds a buffer by these two fields, in this order.
@@ -36,13 +37,13 @@ impl<T: GpuData> GpuBuffer<T> {
     }
 
     /// All its elements, read-only: a `GpuSpan<T>` of them. A bound entry point holds a buffer
-    /// given for a `[T]` so (§12).
+    /// given for a `[T]` parameter as this span (§12).
     pub fn items(self) -> GpuSpan<T> {
         GpuSpan { buffer: self, start: 0, count: self.count }
     }
 
     /// All its elements, to change: a `GpuSpanMut<T>` of them. A bound entry point holds a
-    /// buffer given `mut` for a `mut Slots<T>` so (§12).
+    /// buffer given `mut` for a `mut Slots<T>` parameter as this span (§12).
     pub fn items_mut(mut self) -> GpuSpanMut<T> {
         let count = self.count
         GpuSpanMut { buffer: mut self, start: 0, count }
@@ -917,8 +918,9 @@ impl ScreenDepthPass {
 
 impl RenderPass for ScreenDepthPass {}
 
-/// The pass attachment that isn't there, and the one that's the screen (stream v3).
+/// The pass attachment that isn't there.
 const NO_TARGET: u32 = 4294967295
+/// The pass attachment that is the screen.
 const SCREEN_TARGET: u32 = 4294967294
 
 /// Starts a pass that draws into `target`: cleared to `clear` (its first channels, for a
@@ -1640,7 +1642,7 @@ fn strong_compare_exchange<A, T: Eq + Copy>(a: mut A, i: u32, expected: T, new: 
 @intrinsic
 fn append_push<T>(a: mut Append<T>, value: T) -> u32 {}
 
-// ---- lossy encodings (D-049) --------------------------------------------------------------------
+// ---- lossy encodings ----------------------------------------------------------------------------
 // A layout never loses precision on its own: a type that does says so in its name. Each packs
 // into one `u32`, which every GPU buffer can hold, and decodes with the same code on both
 // targets.
@@ -1739,7 +1741,7 @@ impl Half2 {
 }
 
 /// A unit vector, octahedral, 16 bits a coordinate: normals. It decodes within 1.5 × 10⁻⁴
-/// radians of the direction encoded (`encodings.rs` measures the worst case).
+/// radians of the direction encoded, in the worst case.
 pub struct Oct32: Copy + GpuData + Eq {
     pub bits: u32,
 }

@@ -391,11 +391,12 @@ pub fn run(dir: &Path, out: &Path, against: Option<&Path>) -> Result<(), String>
     let keys_f: Vec<f64> = reference.keys.iter().map(|k| f64::from(*k)).collect();
     let vels_f: Vec<f64> = reference.velocities.iter().map(|v| f64::from(*v) / 127.0).collect();
     let source = format!(
-        "// Written by `wrela audio model {dir}` (spike 14, #48); edit the tool, not this file.\n\
+        "// A grand piano for engine::piano: the model's numbers, fitted to the recordings in {dir}\n\
+         // ({n} notes, {k} keys at {v} velocities each). They are measurements of those\n\
+         // recordings, moved by rounds of the model's own notes measured against them. The\n\
+         // recordings' source and licence are in docs/process.md.\n\
          //\n\
-         // engine::piano's model fitted to the recordings in {dir}: {n} notes, {k} keys at {v}\n\
-         // velocities each. The numbers are measurements of those recordings, moved by rounds\n\
-         // of the model's own notes measured against them.\n\
+         // Written by `wrela audio model {dir}`; edit the tool, not this file.\n\
          \n\
          use piano::Model\n\
          \n\

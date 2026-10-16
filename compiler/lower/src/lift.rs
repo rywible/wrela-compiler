@@ -1,4 +1,4 @@
-//! Lifted builds (language.md §22): each `f32` literal of the chosen packages is read from a
+//! Lifted builds (language.md §20): each `f32` literal of the chosen packages is read from a
 //! table rather than built into the code, so a tool can change it while the program runs.
 //!
 //! - **Which literals.** Every operand the MIR has for an `f32` literal written in a lifted
@@ -309,7 +309,7 @@ fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u
     mb.m.add_function(f)
 }
 
-/// `std::lift`'s table intrinsics (§22), on the CPU.
+/// `std::lift`'s table intrinsics (§20), on the CPU.
 pub(crate) fn intrinsic(
     fl: &mut Fl,
     lang: wrela_sema::defs::Lang,

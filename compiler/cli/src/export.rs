@@ -107,9 +107,10 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     for p in &pages {
         sections.extend(sections_of(p));
     }
+    let source = format!("{REPOSITORY}/blob/{}/", commit.unwrap_or("main"));
     let mut items: Vec<Value> = Vec::new();
     for m in 0..index.modules.len() {
-        let (page, mut records) = module_page(&index, m);
+        let (page, mut records) = module_page(&index, m, &source);
         if page.text.is_empty() {
             continue;
         }
@@ -120,6 +121,10 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     // The spec in its own order, then the modules by path.
     let spec = pages.iter().filter(|p| p.kind == "spec").count();
     pages[spec..].sort_by(|a, b| a.path.cmp(&b.path));
+    let places = spec_places(&pages);
+    for p in &mut pages {
+        p.text = link_sections(&p.text, &p.path, &places);
+    }
     let version = env!("CARGO_PKG_VERSION");
     let index_json = json!({
         "version": version,
@@ -256,18 +261,18 @@ fn spec_pages() -> Vec<Page> {
     });
     pages.push(Page {
         path: "spec/grammar.md".to_string(),
-        title: "wrela grammar".to_string(),
+        title: "Wrela's grammar".to_string(),
         summary: "The language's syntax, normative, in EBNF over spec/lexical.md's tokens."
             .to_string(),
         kind: "spec",
-        text: format!("# wrela grammar\n\n```ebnf\n{}\n```\n", GRAMMAR.trim_end()),
+        text: format!("# Wrela's grammar\n\n```ebnf\n{}\n```\n", GRAMMAR.trim_end()),
     });
     pages
 }
 
-/// A Markdown body's first sentence of prose, on one line, for a summary: the first paragraph
-/// that is a sentence, not a table, code, a heading, a rule, a lead-in (`Goals:`) or an aside
-/// in brackets. A list item reads as its text.
+/// A Markdown body's first sentence of prose, on one line, for a summary: the first one of a
+/// paragraph that is not a table, code, a heading, a rule, a lead-in (`Goals:`) or an aside in
+/// brackets. A list item reads as its text.
 fn first_sentence(body: &str) -> String {
     let mut fenced = false;
     let mut paragraphs: Vec<Vec<&str>> = vec![Vec::new()];
@@ -293,11 +298,12 @@ fn first_sentence(body: &str) -> String {
     for para in paragraphs {
         let text = para.join(" ").replace("**", "");
         let text = text.trim_matches('*').trim();
-        if text.len() < 25 || text.ends_with(':') || text.starts_with('(') {
+        let end = text.find(". ").map_or(text.len(), |i| i + 1);
+        let sentence = text[..end].trim();
+        if sentence.len() < 25 || sentence.ends_with(':') || sentence.starts_with('(') {
             continue;
         }
-        let end = text.find(". ").map_or(text.len(), |i| i + 1);
-        return text[..end].trim().to_string();
+        return sentence.to_string();
     }
     String::new()
 }
@@ -344,7 +350,7 @@ fn sections_of(page: &Page) -> Vec<Section> {
 
 /// Module `m`'s page and the index's records of its items. A module with no public items has an
 /// empty page, which isn't written.
-fn module_page(index: &Index, m: usize) -> (Page, Vec<Value>) {
+fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
     let module = &index.modules[m];
     let name = module.path.join("::");
     let path = format!("{}.md", module.path.join("/"));
@@ -379,14 +385,14 @@ fn module_page(index: &Index, m: usize) -> (Page, Vec<Value>) {
         let heading = e.path.last().cloned().unwrap_or_default();
         let anchor = anchors.of(&heading);
         text.push_str(&format!("## {heading}\n\n"));
-        write_entry(&mut text, e);
+        write_entry(&mut text, e, source);
         records.push(record(e, &path, &anchor));
         for &mi in &e.methods {
             let me = &index.entries[mi];
             let heading = me.path[me.path.len() - 2..].join("::");
             let anchor = anchors.of(&heading);
             text.push_str(&format!("### {heading}\n\n"));
-            write_entry(&mut text, me);
+            write_entry(&mut text, me, source);
             records.push(record(me, &path, &anchor));
         }
     }
@@ -394,9 +400,13 @@ fn module_page(index: &Index, m: usize) -> (Page, Vec<Value>) {
     (page, records)
 }
 
-/// An item's kind, source, signature, doc and the traits it implements.
-fn write_entry(text: &mut String, e: &Entry) {
-    text.push_str(&format!("`{}` · `{}:{}`\n\n", e.kind, e.source, e.line));
+/// An item's kind, source (a link to its line at `source`, the repository's files at the
+/// release's commit), signature, doc and the traits it implements.
+fn write_entry(text: &mut String, e: &Entry, source: &str) {
+    text.push_str(&format!(
+        "`{}` · [`{}:{}`]({source}{}#L{})\n\n",
+        e.kind, e.source, e.line, e.source, e.line
+    ));
     text.push_str(&format!("```wrela\n{}\n```\n\n", e.signature.trim_end()));
     if !e.doc.is_empty() {
         text.push_str(&format!("{}\n\n", e.doc.trim_end()));
@@ -415,7 +425,7 @@ fn record(e: &Entry, page: &str, anchor: &str) -> Value {
         "path": e.path.join("::"),
         "kind": e.kind,
         "signature": e.signature,
-        "summary": doc::first_line(&e.doc),
+        "summary": doc::first_sentence(&e.doc),
         "doc": e.doc,
         "page": page,
         "anchor": anchor,
@@ -447,6 +457,97 @@ fn builtins_page() -> Page {
         kind: "module",
         text,
     }
+}
+
+/// Where each numbered part of the spec is: `6` and `6.15` to their page and the anchor on it
+/// (none for a page's top).
+fn spec_places(pages: &[Page]) -> BTreeMap<String, (String, String)> {
+    let mut places = BTreeMap::new();
+    for p in pages.iter().filter(|p| p.path.starts_with("spec/language/")) {
+        for s in sections_of(p) {
+            let Some(heading) = s.headings.last() else { continue };
+            let number: String =
+                heading.chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+            let number = number.trim_end_matches('.');
+            if number.is_empty() {
+                continue;
+            }
+            let anchor = if s.headings.len() == 1 { String::new() } else { s.anchor };
+            places.entry(number.to_string()).or_insert((p.path.clone(), anchor));
+        }
+    }
+    places
+}
+
+/// The path from page `from` to page `to`, both relative to the export's root.
+fn relative(from: &str, to: &str) -> String {
+    let dir: Vec<&str> = from.split('/').collect();
+    let dir = &dir[..dir.len() - 1];
+    let parts: Vec<&str> = to.split('/').collect();
+    let common = dir.iter().zip(&parts[..parts.len() - 1]).take_while(|(a, b)| a == b).count();
+    let mut out = "../".repeat(dir.len() - common);
+    out.push_str(&parts[common..].join("/"));
+    out
+}
+
+/// `text`, on page `from`, with each reference to a numbered part of the spec (`§6.15`, or
+/// `language.md §6.15`) a link to it. Code, links, and references to other documents
+/// (`vision.md §2`, `#28 §5`) stay as they are.
+fn link_sections(text: &str, from: &str, places: &BTreeMap<String, (String, String)>) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut fenced = false;
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            out.push_str(line);
+            continue;
+        }
+        if fenced {
+            out.push_str(line);
+            continue;
+        }
+        let mut code = false;
+        let mut i = 0;
+        while i < line.len() {
+            let c = line[i..].chars().next().expect("a char");
+            if c == '`' {
+                code = !code;
+            } else if c == '[' && !code {
+                // An existing link, to its target's end.
+                if let Some(end) = line[i..]
+                    .find("](")
+                    .and_then(|k| line[i + k..].find(')').map(|e| i + k + e + 1))
+                {
+                    out.push_str(&line[i..end]);
+                    i = end;
+                    continue;
+                }
+            } else if c == '§' && !code {
+                let at = i + c.len_utf8();
+                let digits: String =
+                    line[at..].chars().take_while(|c| c.is_ascii_digit() || *c == '.').collect();
+                let number = digits.trim_end_matches('.');
+                let before = line[..i].trim_end();
+                let word = before.rsplit([' ', '(', '[']).next().unwrap_or("");
+                let other = (word.ends_with(".md") && word != "language.md")
+                    || (word.starts_with('#') && word.len() > 1);
+                if let Some((page, anchor)) = places.get(number).filter(|_| !other) {
+                    if word == "language.md" {
+                        out.truncate(out.len() - (line[..i].len() - before.len()) - word.len());
+                    }
+                    let path = if page == from { String::new() } else { relative(from, page) };
+                    let target = if anchor.is_empty() { path } else { format!("{path}#{anchor}") };
+                    let target = if target.is_empty() { "#".to_string() } else { target };
+                    out.push_str(&format!("[§{number}]({target})"));
+                    i = at + number.len();
+                    continue;
+                }
+            }
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
 }
 
 /// `llms.txt`: what the docs are, then each page by its group, with its summary.
@@ -513,6 +614,46 @@ mod tests {
             .collect();
         assert_eq!(found, [("p", vec!["P"]), ("a", vec!["P", "A"]), ("b", vec!["P", "A", "B"])]);
         assert_eq!(s[1].text, "first\n\n```\n# not a heading\n```");
+    }
+
+    #[test]
+    fn references_to_the_spec_are_links_but_not_in_code_or_to_other_documents() {
+        let page = |path: &str, text: &str| Page {
+            path: path.into(),
+            title: String::new(),
+            summary: String::new(),
+            kind: "spec",
+            text: text.into(),
+        };
+        let pages = [
+            page("spec/language/6-memory.md", "# 6. Memory\n\n## 6.15 Requests, not async\n"),
+            page("spec/language/4-types.md", "# 4. Types\n"),
+        ];
+        let places = spec_places(&pages);
+        let text = "Requests (language.md §6.15), types (§4, §9) and `§6.15`; vision.md §2, #28 §5.\n\
+                    ```\n§4\n```\n[§4](x.md)\n";
+        assert_eq!(
+            link_sections(text, "std/io.md", &places),
+            "Requests ([§6.15](../spec/language/6-memory.md#6-15-requests-not-async)), types \
+             ([§4](../spec/language/4-types.md), §9) and `§6.15`; vision.md §2, #28 §5.\n\
+             ```\n§4\n```\n[§4](x.md)\n"
+        );
+        assert_eq!(
+            link_sections("§6 and §4", "spec/language/6-memory.md", &places),
+            "[§6](#) and [§4](4-types.md)"
+        );
+    }
+
+    #[test]
+    fn a_summary_is_the_first_sentence_that_is_not_a_lead_in() {
+        assert_eq!(
+            first_sentence("This section says what tools there are. Three of them:\n\n- one\n"),
+            "This section says what tools there are."
+        );
+        assert_eq!(
+            first_sentence("Goals:\n\n- **Memory-safe** without a collector, always.\n"),
+            "Memory-safe without a collector, always."
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Hot reload (#28 §9, language.md §22): `wrela run <package>` builds the program lifted, serves
+//! Hot reload (#28 §9, language.md §20): `wrela run <package>` builds the program lifted, serves
 //! it to Chrome on 127.0.0.1, and watches its files and its dependencies'. A change that touches
 //! only lifted literals goes to the running program as their new values (no build); any other
 //! change builds the program again, and the page swaps the new build in where the old one was,

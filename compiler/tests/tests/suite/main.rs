@@ -142,7 +142,7 @@ fn built(pkg: &str) -> PathBuf {
     built_as(pkg, &[], false)
 }
 
-/// [`built`], lifting the packages `lift` names (language.md §22; none: a normal build).
+/// [`built`], lifting the packages `lift` names (language.md §20; none: a normal build).
 fn built_lifted(pkg: &str, lift: &[&str]) -> PathBuf {
     built_as(pkg, lift, false)
 }

@@ -1,4 +1,4 @@
-// Lifted builds (language.md §22): the blob (shapes/blob.wrela), its distance and its parameter
+// Lifted builds (language.md §20): the blob (shapes/blob.wrela), its distance and its parameter
 // gradients on the CPU, and drawn on the GPU, so a test can compare a lifted build with a
 // normal one and change literals while it runs.
 

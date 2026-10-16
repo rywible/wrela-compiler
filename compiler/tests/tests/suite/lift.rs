@@ -1,4 +1,4 @@
-//! AC4 and AC5: lifted builds (language.md §22). compiler/tests/lift draws the blob of its
+//! AC4 and AC5: lifted builds (language.md §20). compiler/tests/lift draws the blob of its
 //! dependency `shapes` (std shapes, with literals in every form a lifted build lifts) and
 //! exports its distance, the lifted literals and parameter gradients.
 //!

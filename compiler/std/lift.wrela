@@ -1,4 +1,5 @@
-// Lifted literals (language.md §22): in a lifted build (`wrela build --lift <package>`), each
+// Lifted literals: a program's `f32` literals, read and changed while it runs, and solved for
+// against specs (language.md §20). In a lifted build (`wrela build --lift <package>`), each
 // `f32` literal of the chosen packages is read from a table, not built into the code, so a tool
 // can change a number while the program runs: a write to the table, never a rebuild. The
 // program's CPU code reads the table from memory, and its GPU code from a storage buffer that
@@ -163,7 +164,7 @@ impl Watch {
     }
 }
 
-// ---- specs (§22) ---------------------------------------------------------------------------
+// ---- specs (§20) ---------------------------------------------------------------------------
 //
 // A spec is what a program's numbers should come to, written as code: `near(name, value,
 // target)` and its kin, in a function generic over `Checks`. Run with a `Report`, it says how
@@ -276,7 +277,7 @@ impl Checks for Report {
 // ---- minimizing (`wrela solve`) ---------------------------------------------------------------
 
 /// A function of the literals made as small as it gets by changing some of them (`wrela solve`,
-/// §22): BFGS from their values now, each step along a line searched until the value falls
+/// §20): BFGS from their values now, each step along a line searched until the value falls
 /// enough (Armijo's rule), the derivatives from `gradient`, 16 literals at a time. Then each is
 /// rounded to its source's decimals, the one that changed most first and the rest solved again
 /// with it held; a literal gets more decimals while rounding would cost more than 5% of the

@@ -150,7 +150,7 @@ fn case(corpus: &[String], seed: u64) -> String {
     mutate(&mut rng, corpus[pick].clone())
 }
 
-/// What a tier 1 or 2 program uses that a tier-0 one can't (language.md §20): any of these.
+/// What a tier 1 or 2 program uses that a tier-0 one can't: any of these.
 const TIER_1_2: &[&str] = &[
     "f\"",
     "if let ",

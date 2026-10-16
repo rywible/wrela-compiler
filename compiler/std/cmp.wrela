@@ -1,7 +1,7 @@
-// Comparison (language.md §3): `==` and `!=` for types that declare `Eq`, and `<`, `<=`, `>`
-// and `>=` for types that declare `Ord`. Both are fieldwise: fields compare in order, and an
-// enum's variants compare in the order they're declared. Numbers, `bool`, vectors and enums
-// whose variants hold nothing compare without declaring them.
+// Equality and order: `==` and `!=` for types that declare `Eq`, and `<`, `<=`, `>` and `>=`
+// for types that declare `Ord` (language.md §3). Both are fieldwise: fields compare in order,
+// and an enum's variants compare in the order they're declared. Numbers, `bool`, vectors and
+// enums whose variants hold nothing compare without declaring them.
 
 /// How two values compare.
 pub enum Ordering: Copy + Eq + Ord {

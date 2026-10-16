@@ -1,7 +1,11 @@
-// Input (language.md §6.15's polled requests' neighbour): the pointer, keyboard and gamepad
-// events the host has queued since the program last read them. Reading them is `nondet` (§8): what a call
-// reads depends on when a person moved the mouse, so `@deterministic` code takes input as data,
-// as it takes the time (`Input::update` is ordinary code over a run of events).
+// Keyboard, pointer and gamepad input: the events the host queued since the program last read
+// them. A program reads them once a frame with `Input::read`, then asks what's held and what
+// was pressed; `events()` gives the events themselves. The events also carry text, an input
+// method's composition, pastes, semantic nodes' actions and network messages.
+//
+// Reading events is `nondet` (language.md §8): what a call reads depends on when a person moved
+// the mouse. So `@deterministic` code takes input as data, as it takes the time:
+// `Input::update` is ordinary code over a run of events.
 //
 // The hosts deliver events through `wrela.input` (runtime/abi `input`): the same events in the
 // same order in Chrome and in the native host, which plays a script of them for tests.
@@ -169,7 +173,7 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     PointerUp { at: vec2, button: Button, mods: Mods },
     /// A scroll: right and down are positive, in pixels.
     Wheel { at: vec2, delta: vec2, mods: Mods },
-    /// `repeat` is true when the key is held and the keyboard repeats it.
+    /// A key went down. `repeat` is true when the key is held and the keyboard repeats it.
     KeyDown { key: Key, repeat: bool, mods: Mods },
     KeyUp { key: Key, mods: Mods },
     /// A character typed: a Unicode scalar value.
@@ -208,8 +212,9 @@ pub enum Assist: Copy + Eq + StateHash + Serialize + Fieldless {
     Select,
     /// The focus moved to it (node 0: to the canvas).
     Focus,
-    /// Step a slider's value up, or down.
+    /// Step a slider's value up.
     Increment,
+    /// Step a slider's value down.
     Decrement,
     /// Close a dialog or a menu.
     Dismiss,
@@ -366,9 +371,9 @@ pub(package) fn event_of(r: RawEvent) -> Option<Event> {
     }
 }
 
-/// The bytes of a message (`Event::Message`), read during the call that was given it: `None`
-/// for another event, or for a message an earlier call was given, whose bytes are gone. It's
-/// `nondet` (§8), as reading input is.
+/// The bytes of a message (`Event::Message`), read during the call that was given it. It gives
+/// `None` for another event, or for a message an earlier call was given, whose bytes are gone.
+/// It's `nondet` (§8), as reading input is.
 ///
 /// ```wrela
 /// use std::input::{Event, events, payload}

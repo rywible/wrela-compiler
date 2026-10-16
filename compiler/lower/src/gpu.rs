@@ -97,7 +97,7 @@ pub(crate) struct GpuCx {
     pub uniform_fields: Vec<Option<u32>>,
     /// Over a domain: the block's field holding the domain's size.
     pub domain_field: Option<u32>,
-    /// A lifted build's literal table (§22): the storage buffer every pipeline binds last.
+    /// A lifted build's literal table (§20): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
 }
 
@@ -1935,7 +1935,7 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         }
         bind(&mut resources, leaf, id);
     }
-    // A lifted build's literals: a buffer every pipeline binds, after the others (§22).
+    // A lifted build's literals: a buffer every pipeline binds, after the others (§20).
     let literals = crate::lift::len(cx);
     if literals > 0 {
         let binding = 1 + bindings.len() as u32;

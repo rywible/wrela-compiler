@@ -784,7 +784,7 @@ pub struct Module {
     /// program changes, unlike the rest, which is constant.
     pub state: Option<DataId>,
     /// CPU only: other data the program changes: a lifted build's table of literals, and what
-    /// keeps its GPU copy (language.md §22).
+    /// keeps its GPU copy (language.md §20).
     pub writable: Vec<DataId>,
     /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks, a
     /// voice's quanta, a ticker's ticks. Each takes a context address and a chunk index.

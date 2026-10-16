@@ -1,13 +1,17 @@
-// Text (language.md §4): `Text`, the type of string literals, a `Copy` handle to UTF-8 in the
-// build; `String`, UTF-8 on the heap, which can grow; and `str`, a borrowed run of UTF-8, which
-// either passes as. Every string is UTF-8, and is measured and indexed in bytes.
+// Strings, all UTF-8, and `Bytes`, data known when the program is built (language.md §4). There
+// are three kinds of string:
+// - `Text`, the type of string literals: a `Copy` handle to UTF-8 in the build.
+// - `String`: UTF-8 on the heap, which can grow.
+// - `str`: a borrowed run of UTF-8, which a `Text` or a `String` passes as.
+//
+// Every string is measured and indexed in bytes. `Bytes` holds a file that `embed` read.
 
 use std::collections::Vec
 use std::mem::{load_u32, load_u8}
 
 /// Text known when the program is built: a string literal, or text a build-time constant made.
 /// A `Copy` handle to read-only UTF-8, so it can be stored anywhere: in GPU data too, where it
-/// travels as its handle (a field names its parts with it, §22), and only the CPU reads it.
+/// travels as its handle (a field names its parts with it, §20), and only the CPU reads it.
 pub struct Text: Copy + GpuData {
     // The compiler builds literals as these two fields, in this order.
     addr: u32,

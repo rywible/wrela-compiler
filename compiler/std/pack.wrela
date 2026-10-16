@@ -1,7 +1,8 @@
-// Packing (language.md §6.11): `Pack`, derived field by field, as small as the values allow, for
-// bytes that both ends read with the same build: a network message, a durable log record. No
-// names: fields come in order, a variant as its index. Unlike `Serialize`, packed bytes don't
-// survive a change to their type: what reads them must be the build that wrote them.
+// Packing values into as few bits as they allow: `Pack`, derived field by field, for bytes that
+// both ends read with the same build, such as a network message or a durable log record
+// (language.md §6.11). No names: fields come in order, a variant as its index. Unlike
+// `Serialize`, packed bytes don't survive a change to their type: what reads them must be the
+// build that wrote them.
 //
 // The bits, lowest first within each byte, bytes in order:
 // - `bool`: one bit. `u8` and `i8`: eight bits.

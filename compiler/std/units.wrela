@@ -1,8 +1,9 @@
-// Units (language.md §5): constants in SI. A number with a unit suffix is the number times the
-// unit's constant, folded when the program is built: `15cm` is `15 * cm`, which is 0.15. Every
-// physical quantity is SI: metres, kilograms, seconds and radians. Compound units are
-// arithmetic on these: `1050 * kg/m**3`. A suffix finds its unit here whatever is in scope; to
-// use a unit as a value, import it: `use std::units::{kg, m}`.
+// Units of measure as constants in SI, for unit suffixes such as `15cm` (language.md §5). A
+// number with a unit suffix is the number times the unit's constant, folded when the program is
+// built: `15cm` is `15 * cm`, which is 0.15. Every physical quantity is SI: metres, kilograms,
+// seconds and radians. Compound units are arithmetic on these: `1050 * kg/m**3`. A suffix finds
+// its unit here whatever is in scope; to use a unit as a value, import it:
+// `use std::units::{kg, m}`.
 
 // Length, in metres.
 /// A kilometre: 1000 m.

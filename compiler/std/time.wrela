@@ -1,6 +1,6 @@
-// The clock (M6): how long the program's work takes, read while it runs. It's `nondet` (§8): what
-// it reads depends on the machine and when the code runs, so `@deterministic` code, a constant
-// and a test can't read it (D-052). A simulation takes its time as data, a tick's length.
+// The clock, for timing the program's work while it runs. Reading it is `nondet` (language.md
+// §8): what it reads depends on the machine and when the code runs, so `@deterministic` code, a
+// constant and a test can't read it. A simulation takes its time as data, a tick's length.
 //
 // Timing work is an output instead (`phase`): the host reads the clock, and the program never
 // reads what it read, so a constant, a test and `@deterministic` code time their phases too.

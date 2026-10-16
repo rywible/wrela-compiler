@@ -1,5 +1,5 @@
-// Formatting (language.md §4): `Format`, which `f"…"` calls for each `{value}` or
-// `{value:spec}`. Numbers, `bool`, vectors and text implement it.
+// Writing values as text for `f"…"` strings: `Format`, which `f"…"` calls for each `{value}` or
+// `{value:spec}` (language.md §4). Numbers, `bool`, vectors and text implement it.
 //
 // A spec is `[align][0][width][.precision][x]`: `align` is `<`, `>` or `^`; `0` pads a number
 // with zeros after its sign; `width` is the least number of characters; `.precision` is how
@@ -8,8 +8,7 @@
 // Floats are exact. Without a precision, a float is written with the fewest digits that read
 // back as the same float (the nearer of two, the higher if both are as near), never with an
 // exponent: `0.1`, `1.5`, `100`, `0.000001`. With one, it's the exact value rounded to that
-// many places, ties to even: `{0.125:.2}` is `0.12`. Both agree with Rust's `{}` and `{:.p}`,
-// which the tests check.
+// many places, ties to even: `{0.125:.2}` is `0.12`. Both agree with Rust's `{}` and `{:.p}`.
 // NaN is `NaN`, infinities are `inf` and `-inf`.
 //
 // `json_text` and `json_number` write text and floats as JSON, for tools that read a program's
@@ -382,8 +381,8 @@ fn positional(out: mut String, d: Vec<u8>, k: i32, places: u32) {
     }
 }
 
-/// The fewest digits that read back as the float `f × 2^e` (Steele and White's free-format
-/// algorithm, with Burger and Dybvig's fixes): `(digits, k)` meaning `0.digits × 10^k`.
+/// The fewest digits that read back as the float `f × 2^e`: `(digits, k)` meaning
+/// `0.digits × 10^k`.
 fn shortest(f: u64, e: i32, p: u32, min_e: i32) -> (Vec<u8>, i32) {
     // `value = r / s`, and the halfway points to the neighbouring floats are `(r ± m) / s`.
     let even = f % 2 == 0

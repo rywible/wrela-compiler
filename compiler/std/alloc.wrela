@@ -1,13 +1,12 @@
-// std's allocator: the heap that `Vec`, `String` and `Box` live in (language.md §6.9).
+// The heap that `Vec`, `String` and `Box` live in: std's allocator, with `alloc`, `free` and
+// `realloc` (language.md §6.9).
 //
 // Blocks of up to 1 MiB come in size classes, the powers of two from 16 bytes, each with a list
 // of freed blocks to reuse. Larger blocks are whole multiples of 64 KiB, on a list of their own
 // in address order: a request takes the best fit, split if it's bigger (its rest stays freed),
 // and a freed block is joined to the freed blocks it touches, or given back to the bump pointer
 // when it ends there. So a long run that frees large blocks and asks for others of other sizes
-// reuses them (whole, a freed block's tail was lost each time a smaller request took it: the
-// floor's walk into the wildwood ran out of memory). Fresh memory comes from a bump pointer,
-// which grows the memory as it needs.
+// reuses them. Fresh memory comes from a bump pointer, which grows the memory as it needs.
 // Every block is 16-byte aligned. Callers say a block's size when they free it, so blocks carry
 // no header. Addresses never reach a program's results, so where a block lands can't change
 // what a program computes.
@@ -41,9 +40,8 @@ const MOST: u32 = 1073741824
 /// Running out of memory panics.
 ///
 /// Nothing panics or traps while the lock is held: a thread that did would hold it for good,
-/// and every other thread would wait on it forever (spike 17's bake: a job ran out of memory,
-/// and the thread that would have joined it spun until its count of tries overflowed, which hid
-/// the job's panic). A request that can't be met is found under the lock and panics after it.
+/// and every other thread would wait on it forever. A request that can't be met is found under
+/// the lock and panics after it.
 pub fn alloc(size: u32, align: u32) -> u32 {
     if size == 0 {
         return 0
@@ -81,11 +79,10 @@ pub fn alloc(size: u32, align: u32) -> u32 {
 }
 
 /// Makes sure this thread can reach all the memory the heap has grown to. A thread that didn't
-/// grow a shared memory may go on seeing its old size for a while (Chrome's engine: a helper
-/// woken from a wait trapped on a block another thread had just carved), and asking for the
-/// memory's size by growing it by nothing brings its view up to date. Only when the heap has
-/// grown since this thread last asked (`SEEN_END`, its own word): two loads otherwise. std
-/// calls it wherever a thread takes memory another may have grown.
+/// grow a shared memory may go on seeing its old size for a while (in Chrome, for one), and
+/// asking for the memory's size by growing it by nothing brings its view up to date. It asks only
+/// when the heap has grown since this thread last asked (`SEEN_END`, its own word); otherwise it
+/// costs two loads. std calls it wherever a thread takes memory another may have grown.
 pub(package) fn reach_heap() {
     unsafe {
         let end = atomic_load(END)

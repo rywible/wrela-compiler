@@ -1,8 +1,8 @@
-// Arenas and handles (language.md §6.8): how long-lived relationships are written. An
-// `Arena<T>` owns values; a `Handle<T>` names one of them by index and generation, is `Copy`
-// and `Plain`, and can be stored anywhere, saved and hashed. `arena[h]` projects the value
-// (borrow or `mut`, by context), and a handle whose value was removed panics there;
-// `arena.contains(h)` checks first.
+// Arenas and handles, for long-lived relationships between values, and `SortedMap`, a map in
+// key order (language.md §6.8). An `Arena<T>` owns values; a `Handle<T>` names one of them by
+// index and generation, is `Copy` and `Plain`, and can be stored anywhere, saved and hashed.
+// `arena[h]` projects the value (borrow or `mut`, by context), and a handle whose value was
+// removed panics there; `arena.contains(h)` checks first.
 //
 // The values are kept one after another, so `for x in arena` walks them in a deterministic
 // order: the order they were inserted, except that removing one moves the last into its place.
@@ -54,7 +54,7 @@ struct Slot: Copy + Eq + StateHash + Serialize {
     at: u32,
 }
 
-/// Values with handles. Iterates in a deterministic order (D-015).
+/// Values with handles. Iterates in a deterministic order.
 ///
 /// ```wrela
 /// struct Grazer: Clone {

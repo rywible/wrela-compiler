@@ -3,7 +3,7 @@
 //! file, with no lines) until the function (a `pub fn` of no arguments returning `f32`, in a
 //! module of the package, not its main) is as small as it gets, or with `--spec` until the
 //! package's spec holds (its checks' `std::lift::Loss`, from `pub fn spec<C: Checks>(c: mut C)`
-//! in `spec.wrela`), reporting each check before and after (language.md §22).
+//! in `spec.wrela`), reporting each check before and after (language.md §20).
 //!
 //! It writes a program around the function (`<package>/build/solve/`), builds it with the
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS

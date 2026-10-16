@@ -1,4 +1,4 @@
-//! `wrela edit` (language.md §22): writes new values into literals in the source, each in its
+//! `wrela edit` (language.md §20): writes new values into literals in the source, each in its
 //! literal's own style, so the diff is the literals' characters and nothing else.
 //!
 //! - **Style.** A literal keeps its form: its decimals (at least as many as it had, more only

@@ -73,7 +73,7 @@ pub struct PackageDef {
     pub deps: BTreeMap<String, PackageId>,
     /// Its manifest declares that it uses `unsafe` (std's core does).
     pub unsafe_ok: bool,
-    /// A lifted build lifts its literals (language.md §22).
+    /// A lifted build lifts its literals (language.md §20).
     pub lifted: bool,
 }
 

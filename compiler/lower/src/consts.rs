@@ -232,7 +232,7 @@ impl<'a> Build<'a> for Data<'_, 'a> {
     }
 }
 
-/// Builds a literal value in code: a lifted build's `f32` literals read from the table (§22).
+/// Builds a literal value in code: a lifted build's `f32` literals read from the table (§20).
 impl<'a> Build<'a> for Fl<'_, 'a> {
     type V = ir::ValueId;
 
@@ -295,7 +295,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     /// A lifted build's constant `c` of a lifted package, built here from its literals, each
-    /// read from the table (§22); `None` for any other constant, which is data.
+    /// read from the table (§20); `None` for any other constant, which is data.
     pub(crate) fn lifted_const(&mut self, c: ConstId) -> Option<ir::ValueId> {
         self.cx.lift?;
         let checked = self.cx.checked;

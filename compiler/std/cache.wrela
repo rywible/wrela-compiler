@@ -1,8 +1,8 @@
-// Results cooked from inputs, cooked again when the inputs change (language.md §6.19): where a
-// program kept a flag a cache, and passed a change on to each cache cooked from what changed by
-// hand. A cache names what it's cooked from as a key: the inputs themselves, or the versions of
-// the caches and the literals (`std::lift::Watch::version`) they come from, so a change reaches
-// every cache cooked from it, through as many steps as there are.
+// Results cooked from inputs and kept, then cooked again only when those inputs change
+// (language.md §6.19). A cache names what it's cooked from as a key: the inputs themselves, or
+// the versions of the caches and the literals (`std::lift::Watch::version`) they come from. So
+// a change reaches every cache cooked from it, through as many steps as there are, and the
+// program passes nothing on by hand.
 
 /// What a result was cooked from: stale while its inputs are other than they were. The result
 /// itself is the program's (a texture cooked in place, a buffer): this says when to cook it.

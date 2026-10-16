@@ -46,7 +46,7 @@ pub struct Tissue: Copy + GpuData + Blend {
 
 // Changed: `Absorption::SOFT_TISSUE` is `SOFT_TISSUE`, a constant of the engine's module: types
 // have no associated constants. `Cat(Material::Hide)` is `cat(Material::Hide)`: there are no
-// tuple structs (§21's small conveniences).
+// tuple structs (§18).
 const HIDE = Tissue {
     albedo: rgb(r: 0.42, g: 0.33, b: 0.24),
     roughness: 0.7,

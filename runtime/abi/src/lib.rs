@@ -89,7 +89,7 @@ pub const EXPORT_AUDIO: &str = "__audio";
 /// with the records at [`memory::TICK_RECORDS`], on the ticker's thread
 /// ([`memory::THREAD_TICK`]), on its own instance of the module, with the same memory.
 pub const EXPORT_TICK: &str = "__tick";
-/// `__lift_set(literal, value)`: in a lifted build (language.md §22), changes a literal's value,
+/// `__lift_set(literal, value)`: in a lifted build (language.md §20), changes a literal's value,
 /// as `std::lift::set` does: code reads the new one from its next call, on the CPU and the GPU.
 /// A host calls it on the program's thread, between calls (a tool's edit, hot reload).
 pub const EXPORT_LIFT_SET: &str = "__lift_set";

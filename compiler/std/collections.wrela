@@ -1,6 +1,6 @@
-// Collections (language.md §6.9, §17): `Vec`, and moving values out of places with `swap` and
-// `replace`. A collection owns its elements, frees them when it's dropped, and iterates in an
-// order that doesn't depend on addresses (D-015).
+// Collections: `Vec`, `Box`, `Bounded` and `Flags`, sorting, and `swap` and `replace`, which
+// move values out of places (language.md §6.9, §17). A collection owns its elements, frees them
+// when it's dropped, and iterates in an order that doesn't depend on addresses.
 
 use std::alloc::{alloc, free, realloc}
 use std::par::{chunks_for, par_each}
@@ -12,7 +12,7 @@ pub use std::mem::Pair
 use std::serialize::Serialize
 use std::string::str_addr
 
-/// The runs a sort sorts by insertion before it merges them.
+/// The length of the runs that a sort sorts by insertion before it merges them.
 const SORT_RUN: u32 = 16
 
 /// A growable array of `T`s on the heap. `v[i]` projects element `i`, and an index past the end
@@ -574,9 +574,9 @@ impl<T: Eq, const N: u32> Eq for Bounded<T, N> {
 }
 
 /// A set of an enum's variants, whose variants hold nothing (`Fieldless`, §3): one bit a
-/// variant, bit `u32(e)` for `e`, so an enum whose discriminants are below 32 (one past it traps
-/// on the CPU). One `u32`, which crosses to a host or the GPU as itself (`bits()`, `of_bits`)
-/// and is saved as one (`Serialize`), and GPU code reads and changes it as CPU code does.
+/// variant, bit `u32(e)` for `e`, so the enum's discriminants must be below 32 (one past it
+/// traps on the CPU). It's one `u32`, which crosses to a host or the GPU as itself (`bits()`,
+/// `of_bits`) and is saved as one (`Serialize`); GPU code reads and changes it as CPU code does.
 ///
 /// ```wrela
 /// use std::collections::Flags

@@ -1,9 +1,10 @@
-# wrela lexical structure
+# Wrela's lexical structure
 
-Normative (D-104). `spec/grammar.ebnf` is written over the tokens defined here, and the compiler's
-lexer (`compiler/syntax/src/lexer.rs`) implements exactly these rules; the oracle parser in
-`compiler/grammar` uses that same lexer. Rules are numbered (L1, L2, …) so tests and diagnostics
-can cite them. A number is never reused; new rules are appended.
+This file defines Wrela's tokens: source text, whitespace and newlines, comments, identifiers,
+keywords, literals, operators and punctuation. It is normative. `spec/grammar.ebnf` is written over
+these tokens, and the compiler's lexer (`compiler/syntax/src/lexer.rs`) implements exactly these
+rules. Each rule has a number (L1, L2, …) that tests and diagnostics cite; a number is never
+reused, and a new rule gets the next number.
 
 Error codes come from the lexical range E0001–E0099.
 
@@ -74,8 +75,8 @@ Error codes come from the lexical range E0001–E0099.
 
   - **A type suffix** (`i8 u8 i16 u16 i32 u32 i64 u64 f32 f64`, as in `1.0f32`) is E0003. A
     literal takes its type from context; convert with `f32(x)` where it can't.
-  - **A suffix starting with `e` or `E`** is a malformed exponent, E0004. No unit is named `e`
-    (D-025), so `1e5` is always a float.
+  - **A suffix starting with `e` or `E`** is a malformed exponent, E0004. No unit is named `e`,
+    so `1e5` is always a float.
   - **Any other suffix that is an identifier** makes the token SUFFIXED: a unit suffix, as in
     `15cm`, which means `15 * cm` (language.md §5).
   - **Anything else** (`0x`, `0b2`, `0X1F`, `1.5e`) is E0004.
@@ -102,7 +103,7 @@ Error codes come from the lexical range E0001–E0099.
   (  )  [  ]  {  }  ,  ;  :  .  @  =  +  -  *  /  %  ^  &  |  !  <  >  ?  _
   ```
 
-  `**` is exponentiation and `^` is XOR (D-076). `?` propagates an error (language.md §15).
+  `**` is exponentiation and `^` is XOR. `?` propagates an error (language.md §15).
   `#`, `$`, `~` and `` ` `` are E0001.
 - **L16.** Where the grammar expects a `>` that closes a generic argument list (`GT_CLOSE` in
   the grammar), a `>>`, `>=` or `>>=` token is split: its first `>` closes the list, and the rest
@@ -127,7 +128,7 @@ Error codes come from the lexical range E0001–E0099.
   its kind changes nothing (the parser reports it).
 - **L20.** Consequences of L17, for readers (not extra rules):
   - Only a leading `.` continues a line that could have ended. A line that starts with `(`, `[`,
-    `-` or `|` begins a new statement: there's no JavaScript-style continuation (D-038, D-079).
+    `-` or `|` begins a new statement: there's no JavaScript-style continuation.
   - A binary operator that continues an expression trails its line: `a +`, then `b` on the next
     line. `>` and `>>` can't, because they may close a generic argument list: break a comparison
     inside parentheses instead.

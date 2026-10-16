@@ -1096,7 +1096,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// A table's value (`mir::Rvalue::Const`): on the CPU its constant data, read in place; GPU
     /// code builds it.
     fn table(&mut self, c: ConstId) -> Repr {
-        // A lifted build's constant of a lifted package is built from its literals (§22).
+        // A lifted build's constant of a lifted package is built from its literals (§20).
         if let Some(v) = self.lifted_const(c) {
             return Repr::Value(v);
         }
@@ -1823,7 +1823,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// The index of the lifted literal an operand is, in a lifted build (§22): an `f32`
+    /// The index of the lifted literal an operand is, in a lifted build (§20): an `f32`
     /// literal written in a lifted package.
     fn lifted_index(&self, o: &mir::Operand) -> Option<u32> {
         let lift = self.cx.lift?;

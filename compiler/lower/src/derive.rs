@@ -240,7 +240,7 @@ fn reached(m: &ir::Module, from: ir::FuncId, waiting: &[ir::FuncId]) -> Vec<ir::
     reach.into_iter().filter(|f| waiting.contains(f)).collect()
 }
 
-/// `reads(f)` (§22): a run of the lifted literals `inner` can read through every call, in index
+/// `reads(f)` (§20): a run of the lifted literals `inner` can read through every call, in index
 /// order, laid out as constant data.
 fn build_reads(mb: &mut ModuleBuilder, id: ir::FuncId, inner: ir::FuncId) {
     if let Some(t) = mb.lift {

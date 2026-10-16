@@ -1,4 +1,7 @@
-// The prelude: in scope in every module, with the built-in types and functions.
+// The prelude: the types and traits every module has without an import. It defines `Option`,
+// `Result`, `Clone`, `Copy`, `GpuData`, `Fieldless`, `Packed` and `Plain`, and brings in
+// `Vec`, `Box`, `String`, `Arena`, `Quat`, `Eq`, `Ord` and others from their modules. The
+// built-in types and functions are in scope too.
 
 pub use std::cmp::{Eq, Ord, Ordering}
 pub use std::collections::{Bounded, Box, Vec, replace, swap}

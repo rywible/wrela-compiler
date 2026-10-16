@@ -267,7 +267,7 @@ pub(crate) struct Cx<'a> {
     /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
     /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
     pub pipeline_targets: Vec<Vec<ir::RenderTarget>>,
-    /// A lifted build's literals (§22): only the program's own modules read them, never the
+    /// A lifted build's literals (§20): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
 }

@@ -1,10 +1,13 @@
-// Asynchronous capabilities supplied by the application host. The shared command stream
-// carries a service name and opaque bytes; policy and message schemas belong to Wrela code.
+// Requests to a named service of the host, such as the clipboard or the page's address: bytes
+// out, bytes back. A request carries a service name and bytes that only the service reads; the
+// host knows nothing more of them. What each service's bytes mean is Wrela code's
+// (`platform::host`). The answer comes on a `Pending`, as any request's does (`std::io`).
 
 use std::io::{Pending, next_request, path_problem}
 
-/// Calls a host capability. Unsupported services fail as an ordinary IO request.
-/// A service name is a relative path; request/reply bytes belong to that service's protocol.
+/// Sends `bytes` to the host's service `service`, a relative path such as `clipboard/offer`. The
+/// request and answer bytes are the service's own. A host without the service fails the request,
+/// as any failed request fails.
 pub fn request(service: str, bytes: [u8]) -> Pending<u8> {
     if let Some(why) = path_problem(service) {
         panic(f"host service `{service}` {why}")

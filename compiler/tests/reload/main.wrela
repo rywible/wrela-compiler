@@ -1,4 +1,4 @@
-// Hot reload (language.md §22), run by compiler/tests/tests/suite/reload.rs: a literal the CPU
+// Hot reload (language.md §20), run by compiler/tests/tests/suite/reload.rs: a literal the CPU
 // and the GPU read each frame (the screen's colour); a value cooked from literals at load and
 // cooked again when one it reads changes (`std::lift::Watch`); what the program carries across a
 // reload (`std::reload`); a ticker, whose ticks a new build runs again with their records; and a

@@ -1,11 +1,11 @@
-// What a program's drawing means, for a host that gives it the platform's own behaviour (language.md
-// §6.15): a tree of nodes, each a kind of thing (a heading, a link, a field, a dialog), its state
-// and its place on the screen. A browser host makes each node the element that carries that
-// behaviour, over the canvas: screen readers, the keyboard, password managers, autofill and a
-// link's menu work as on any page, and what a person does to a node comes back as an event by its
-// number (`Event::Assist`, `Event::Field`). The program says what exists; the host owns how each
-// kind behaves. The tree's structure and its geometry are sent apart: the structure when it
-// changes, the rectangles each frame they move.
+// The semantic tree: what the program's drawing means, so a host can give it the platform's own
+// behaviour (language.md §6.15). The tree is made of nodes, each a kind of thing (a heading, a
+// link, a field, a dialog), its state and its place on the screen. A browser host makes each
+// node the element that carries that behaviour, over the canvas: screen readers, the keyboard,
+// password managers, autofill and a link's menu work as on any page. What a person does to a
+// node comes back as an event by its number (`Event::Assist`, `Event::Field`). The program says
+// what exists; the host owns how each kind behaves. The tree's structure and its geometry are
+// sent apart: the structure when it changes, the rectangles each frame they move.
 use std::input::Assist
 use std::serialize::{LoadError, Reader, Writer}
 
@@ -14,13 +14,17 @@ pub enum Role: Copy + Eq {
     /// Nodes that belong together, or none in particular.
     Group,
     Button,
-    /// A list to choose from, and one of its options.
+    /// A list to choose from.
     ListBox,
+    /// One of a list's options.
     Option,
-    /// A heading of a document (its `level`, 1 to 6), a paragraph, a link (`href`), code.
+    /// A heading of a document, at its `level`, 1 to 6.
     Heading,
+    /// A paragraph.
     Text,
+    /// A link to `href`.
     Link,
+    /// Code.
     Code,
     /// A text field: the host keeps a real one, so input methods, autofill and password managers
     /// work (`field`).
@@ -29,9 +33,11 @@ pub enum Role: Copy + Eq {
     Switch,
     /// A value in a range (`value`, `min`, `max`, `step`).
     Slider,
-    /// Tabs and the panel each shows (a tab `controls` its panel).
+    /// A row of tabs.
     TabList,
+    /// A tab, which `controls` the panel it shows.
     Tab,
+    /// The panel a tab shows.
     TabPanel,
     /// A dialog (`modal`: the rest can't be reached while it's open).
     Dialog,

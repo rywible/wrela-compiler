@@ -1,4 +1,4 @@
-// Hashing (language.md §6.11): `StateHash`, a whole value's checksum, derived field by field.
+// Checksums of whole values: `StateHash`, derived field by field (language.md §6.11).
 // It hashes what a value holds, never where it's stored: a value's bytes are a function of its
 // fields (§6.10), with NaNs canonical, so equal states hash equally on every client.
 

@@ -5,7 +5,7 @@
 //   rebuilt it, `slot = Some(ItemStack { count: s.count + n, ..s })`.
 // - Ids compare with `==` (F6); `let … else` and `if let` replace `match`es with an empty arm
 //   (F8); kinds order with `<` (`Ord`), not a `kind_rank` match.
-// - Still a `match` for an enum's integer value, and a `while` for a reverse range (§21's
+// - Still a `match` for an enum's integer value, and a `while` for a reverse range (§18's
 //   small conveniences, left out).
 
 use engine::sim::{Sim, SimState, SimValue}
@@ -221,7 +221,7 @@ pub fn unequip(p: mut Player, at: u32) -> Result<(), EquipError> {
     Ok(())
 }
 
-/// An enum has no integer value (§21), so each conversion is a `match`.
+/// Written as if an enum had no integer value (§3 now gives one), so each conversion is a `match`.
 pub fn slot_index(s: EquipSlot) -> u32 {
     match s {
         EquipSlot::Head => 0,

@@ -1,5 +1,6 @@
-// Derived interpretations (language.md §13): the compiler derives them from the body of any
-// function that qualifies. Nothing here is specific to fields.
+// Gradients and interval bounds of functions, which the compiler derives from each function's
+// body (language.md §13), and the ranges and boxes they work over. Any function that qualifies
+// has them; nothing here is specific to fields.
 
 /// A closed range `[lo, hi]` of `f32` values.
 pub struct Interval: Copy + GpuData {
@@ -78,8 +79,8 @@ impl Box3 {
 /// Point `i` of Sobol's sequence on `axis` (0, 1 or 2), in [0, 1), with the axis shifted by
 /// XOR with a hash of `seed` (a digital shift, which keeps how evenly the points spread). The
 /// first 2ⁿ points split evenly among the cells of a box cut in halves along each axis, as
-/// many times as the sequence allows: 4096 points put 8 in each of 8 × 8 × 8 cells
-/// (`samples_spread_evenly_through_their_box`). The same bits on the CPU and the GPU.
+/// many times as the sequence allows: 4096 points put 8 in each of 8 × 8 × 8 cells. The same
+/// bits on the CPU and the GPU.
 fn sobol(seed: u32, axis: u32, i: u32) -> f32 {
     var x: u32 = 0
     // Direction number b is m(b) << (31 - b), m from the axis's primitive polynomial: none
@@ -107,7 +108,7 @@ fn sobol(seed: u32, axis: u32, i: u32) -> f32 {
     f32((x ^ scramble(seed.wrapping_mul(4).wrapping_add(axis))) >> 8) * (1.0 / 16777216.0)
 }
 
-/// A 32-bit hash (Chris Wellons's `lowbias32`).
+/// A 32-bit integer hash (`lowbias32`).
 fn scramble(x: u32) -> u32 {
     var h = x ^ (x >> 16)
     h = h.wrapping_mul(2146121005)
@@ -153,15 +154,13 @@ pub fn value_and_gradient<X: Domain>(f: fn(X) -> f32, at: X) -> (f32, X) {}
 
 /// `f(at)`'s value, its gradient, and the rest of what `f` returns, from one derived
 /// evaluation: a field's channels beside its distance and normal, where computing them apart
-/// would compute the distance twice (a creature's shading, #43 §8.3). Only the value is
-/// differentiated.
+/// would compute the distance twice. Only the value is differentiated.
 @intrinsic
 pub fn value_gradient_with<X: Domain, T>(f: fn(X) -> (f32, T), at: X) -> (f32, X, T) {}
 
 /// A range that contains `f(x)` for every `x` in `over`, by interval arithmetic over `f`'s
 /// body: an `Interval` for an `f32`, and a box for a vector, each component's range from one
-/// derived function. On the GPU each operation widens its result outward by its error bound
-/// (D-075).
+/// derived function. On the GPU each operation widens its result outward by its error bound.
 @intrinsic
 pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
 

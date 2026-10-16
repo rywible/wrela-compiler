@@ -1,7 +1,8 @@
-// Parallel work (language.md §6.12, §6.17, D-062). A parallel job's chunks run on the thread that
-// starts it and on the program's helpers; a task (`spawn`) runs on a helper, or on the thread
-// that takes it. Every thread runs its own instance of the program, and they share memory
-// (wrela_abi::memory's threads).
+// Parallel work on the program's helper threads: parallel jobs, which split a collection's
+// elements into chunks, and tasks (`spawn`), which run one function each (language.md §6.12,
+// §6.17). A parallel job's chunks run on the thread that starts it and on the program's helpers;
+// a task runs on a helper, or on the thread that takes it. Every thread runs its own instance of
+// the program, and they share memory (wrela_abi::memory's threads).
 //
 // - Each thread that starts a parallel job has its own descriptor, in its block, so the jobs
 //   that the program's thread and its ticker start at once don't collide. Helpers claim a job's

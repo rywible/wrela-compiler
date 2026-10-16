@@ -1,7 +1,7 @@
-// Saving and loading (language.md §6.11): `Serialize`, derived field by field, with each field's
-// name and each variant's name in the bytes. A save doesn't depend on how a type is laid out,
-// and loading a save that doesn't fit its type, or is cut short, gives a `LoadError`, never a
-// trap.
+// Saving values as bytes and loading them back: `Serialize`, derived field by field, with each
+// field's name and each variant's name in the bytes (language.md §6.11). A save doesn't depend
+// on how a type is laid out, and loading a save that doesn't fit its type, or is cut short,
+// gives a `LoadError`, never a trap.
 //
 // The bytes: numbers little-endian at their own widths, `bool` as one byte, floats as their
 // bits, text as a `u32` byte count then UTF-8, a `Vec` as a `u32` count then its elements. A

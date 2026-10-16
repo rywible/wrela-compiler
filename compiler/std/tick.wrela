@@ -1,9 +1,9 @@
-// The ticker (language.md §6.17): a fixed-rate step on a thread of its own. `start` moves a state,
-// a step and a hash to the ticker's thread (wrela_abi::memory's threads), where the host steps
+// The ticker: a simulation step at a fixed rate, on a thread of its own (language.md §6.17).
+// `start` moves a state, a step and a hash to the ticker's thread, where the host steps
 // the state `hz` times a second. Each tick gets its number, its length and the input events
 // the host stamped at its start (its records), and nothing else: no clock, and nothing that
 // depends on timing. So given the first state and every tick's records, every tick's state is
-// fixed, on any host (D-052). The host can ask for the state's hash after each step: to record
+// fixed, on any host. The host can ask for the state's hash after each step: to record
 // a tick log, or to check one.
 //
 // The host runs each tick through the thread entry `tick` (wrela_abi's `__tick`), with the

@@ -9,11 +9,11 @@
 //!                                         --optimize makes the WASM smaller with
 //!                                         Binaryen, its trap locations in game.lines;
 //!                                         --lift reads that package's literals from a
-//!                                         table the program can change (§22)
+//!                                         table the program can change (§20)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
 //! wrela fix <package-dir> [--json]        make every fix a tool can make, and report each
 //! wrela edit <package-dir> [--edits <file>] [--dry-run] [--json]
-//!                                         write new values into literals (§22), from
+//!                                         write new values into literals (§20), from
 //!                                         JSON edits; refuses a file that has changed
 //! wrela explain <code>                    what a diagnostic code means, with a program that
 //!                                         has it and the program fixed
@@ -32,7 +32,7 @@
 //!                                         keeps it and one that breaks it
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
-//!                                         make the package's spec hold (§22)
+//!                                         make the package's spec hold (§20)
 //! wrela trace <package-dir> --watch <export>,...
 //!                                         run frames and print what exports say after each
 //! wrela bisect <package-dir> --until "<export> <op> <number>"
@@ -48,7 +48,7 @@
 //! wrela refactor <package-dir> <change> [--dry-run] [--json]
 //!                                         rename, move, add-param, change-mode: checked
 //!                                         before written, refused on a stale plan
-//! wrela studio <package-dir> [...]        the lens (§22)
+//! wrela studio <package-dir> [...]        the lens (§20)
 //! wrela audio <package-dir> <action> [...] a piece's voice as files and numbers: wav,
 //!                                         describe, numbers, midi, sheet, speed; and
 //!                                         `wrela audio partials <wav> --key k`

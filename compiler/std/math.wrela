@@ -1,13 +1,16 @@
-// The transcendental functions for CPU code (language.md §11): compiled to WASM with the
-// program, never taken from the host, so every host computes the same bits (D-015, D-074).
-// GPU code uses WGSL's own.
+// Trigonometric, hyperbolic, exponential and logarithmic functions, their inverses and powers,
+// for CPU code, with the constants π and 2π. They are compiled to WASM with the program, never
+// taken from the host, so every host computes the same bits (language.md §11). GPU code uses
+// WGSL's own.
 //
-// Each function widens its f32 argument to f64, works there, and rounds once to f32. The
-// algorithms and coefficients follow musl's libm (MIT licence; FreeBSD msun before it):
-// __sindf, __cosdf and __tandf for sin, cos and tan; atan's table and polynomial; and textbook
-// series for exp and log; for sin, cos and tan of |x| >= 2^20, the integer range reduction of
-// ARM's optimized-routines (MIT licence), with 192 bits of 4/π. Accuracy (an estimate, not
-// proved): within 1 ulp of the true f32 result.
+// Each function widens its f32 argument to f64, works there, and rounds once to f32. Sine,
+// cosine and tangent of |x| >= 2^20 use an integer range reduction with 192 bits of 4/π.
+// Accuracy (an estimate, not proved): within 1 ulp of the true f32 result.
+
+// Credit (MIT licence): the algorithms and coefficients follow musl's libm (FreeBSD msun before
+// it): __sindf, __cosdf and __tandf for sin, cos and tan; atan's table and polynomial; and
+// textbook series for exp and log. The range reduction for |x| >= 2^20 is ARM's
+// optimized-routines'.
 
 const INV_PIO2: f64 = 0.636619772367581382433
 // pi/2 split in two: the first 33 bits, then the rest.
@@ -164,7 +167,7 @@ pub fn sin(x: f32) -> f32 {
     sin_quadrant(y, n)
 }
 
-/// cos(x) = sin(x + π/2): one quadrant on.
+/// The cosine of `x`, in radians: sin(x + π/2), one quadrant on.
 pub fn cos(x: f32) -> f32 {
     if is_nan(x) || is_inf(x) {
         return x - x
@@ -374,7 +377,7 @@ fn is_odd(y: f32) -> bool {
     abs(y) < 16777216.0 && floor(y) == y && (i32(y) & 1) == 1
 }
 
-/// x^y, with C's (and IEEE 754's) values at zeros, infinities and NaNs.
+/// `x` to the power `y`, with the values C and IEEE 754 give at zeros, infinities and NaNs.
 pub fn pow(x: f32, y: f32) -> f32 {
     if y == 0.0 || x == 1.0 {
         return 1.0
@@ -407,7 +410,7 @@ pub fn pow(x: f32, y: f32) -> f32 {
     }
 }
 
-/// atan of an f64, by musl's reduction to |a| < 7/16 and an odd polynomial.
+/// atan of an f64, by a reduction to |a| < 7/16 and an odd polynomial.
 fn atan_f64(x: f64) -> f64 {
     if x != x {
         return x

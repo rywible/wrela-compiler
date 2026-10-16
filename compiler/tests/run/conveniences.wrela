@@ -1,4 +1,4 @@
-// run: the gameplay paper test's small conveniences that are in (language.md §21): an enum's
+// run: the gameplay paper test's small conveniences that are in (language.md §2, §4): an enum's
 // integer value is its variant's index, an index is a `u32` or an `i32` (a negative one is out
 // of range, so it traps), an assignment is a `match` arm, and text is matched by string patterns
 // expect: index_of(0) = 0

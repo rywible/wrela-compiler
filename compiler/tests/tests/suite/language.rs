@@ -646,7 +646,7 @@ fn every_example_in_std_docs_compiles_and_runs() {
 #[test]
 fn the_tier_0_program_in_language_md_builds() {
     let doc = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
-    let section = &doc[doc.find("## 19. A tier-0 program").expect("§19")..];
+    let section = &doc[doc.find("## 19. A complete program").expect("§19")..];
     let code = &section[section.find("```wrela\n").expect("a wrela block") + 9..];
     let code = &code[..code.find("```").expect("the block ends")];
     if let Err(e) = build(&package("language-md", code)) {

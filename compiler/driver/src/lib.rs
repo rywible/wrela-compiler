@@ -201,7 +201,7 @@ pub struct BuildKind {
     pub testing: bool,
 }
 
-/// A lifted build (language.md §22): [`build`], with each `f32` literal of the packages named
+/// A lifted build (language.md §20): [`build`], with each `f32` literal of the packages named
 /// `lift` (the program's own, or its dependencies', by the names their manifests give) read
 /// from a table the program can change while it runs. The build's files include `lift.json`,
 /// which says where each literal is and why any float literal of those packages isn't lifted.

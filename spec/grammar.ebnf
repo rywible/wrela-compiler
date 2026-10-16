@@ -1,4 +1,4 @@
-# wrela grammar. Normative (D-104): it covers all of the language's syntax.
+# wrela grammar. Normative: it covers all of the language's syntax.
 #
 # This grammar is written over the token stream spec/lexical.md defines, not over characters.
 # The newline rules (L17-L19) are context-dependent, so the lexer applies them and hands the
@@ -145,7 +145,7 @@ index            ::= "[" expr "]"
 method_call      ::= "." IDENT ("::" generic_args)? call_args
 field_access     ::= "." (IDENT | INT)
 
-# Positional arguments come first; once one is named, the rest are named too (D-039).
+# Positional arguments come first; once one is named, the rest are named too.
 call_args        ::= "(" args? ")"
 args             ::= expr ("," expr)* ("," named_arg)* ","? | named_arg ("," named_arg)* ","?
 named_arg        ::= IDENT ":" expr

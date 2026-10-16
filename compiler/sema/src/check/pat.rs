@@ -154,7 +154,7 @@ impl<'p> Checker<'p> {
                 }
             }
             ast::PatKind::Lit { neg: false, lit } if lit.kind == ast::LitKind::Str => {
-                // A string matches text: a `str`, `Text` or `String` (§21's string patterns).
+                // A string matches text: a `str`, `Text` or `String` (§2's string patterns).
                 if !self.is_stringy(ty) && !matches!(self.kind(ty), TyKind::Error) {
                     let shown = self.display(ty);
                     self.err(Diagnostic::new(

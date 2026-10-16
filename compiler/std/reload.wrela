@@ -1,11 +1,11 @@
-// One build in place of another, in the same page or process (language.md §22). A tool does it
-// in a hot reload; a program does it itself with `hand_over`, to give its place to another
-// build: a game made of several builds, each loaded when the player reaches it. Either way the
-// new build starts with `init`, as any program does. What the old build kept with `keep` is
-// what the new one's `kept` gives, so a program carries across what it wants to: where the
-// camera is, what the player chose. Bytes, so a program says how (`std::serialize`'s `save`
-// and `load`, which fail cleanly when the type has changed). A program started anew kept
-// nothing.
+// Replacing the running build with another in the same page or process, and the bytes that pass
+// from one to the next (language.md §20). A tool replaces a build in a hot reload; a program
+// replaces itself with `hand_over`, to give its place to another build: a game made of several
+// builds, each loaded when the player reaches it. Either way the new build starts with `init`,
+// as any program does. What the old build kept with `keep` is what the new one's `kept` gives,
+// so a program carries across what it wants to: where the camera is, what the player chose.
+// These are bytes, so the program chooses how to write them, such as `std::serialize`'s `save`
+// and `load`, which fail cleanly when the type has changed. A program started anew kept nothing.
 //
 // ```wrela
 // use std::reload::{keep, kept}

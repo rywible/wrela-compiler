@@ -78,7 +78,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 println!(
                     "  {:<40} {}",
                     index.entries[i].path.join("::"),
-                    first_line(&index.entries[i].doc)
+                    first_sentence(&index.entries[i].doc)
                 );
             }
             return ExitCode::SUCCESS;
@@ -123,7 +123,7 @@ pub fn run(args: &[String]) -> ExitCode {
             .iter()
             .filter(|e| e.path.len() == q.len() + 1 && e.path.starts_with(&m.path))
         {
-            println!("  {:<8} {:<28} {}", e.kind, e.path[q.len()], first_line(&e.doc));
+            println!("  {:<8} {:<28} {}", e.kind, e.path[q.len()], first_sentence(&e.doc));
         }
         return ExitCode::SUCCESS;
     }
@@ -148,8 +148,13 @@ fn q_owned(q: &[&str]) -> Vec<String> {
     q.iter().map(|s| s.to_string()).collect()
 }
 
-pub(crate) fn first_line(doc: &str) -> &str {
-    doc.lines().next().unwrap_or("")
+pub(crate) fn first_sentence(doc: &str) -> String {
+    let lines: Vec<&str> = doc.lines().map(str::trim).take_while(|l| !l.is_empty()).collect();
+    let text = lines.join(" ");
+    match text.find(". ") {
+        Some(i) => text[..=i].to_string(),
+        None => text,
+    }
 }
 
 fn print_entry(index: &Index, i: usize) {
@@ -168,7 +173,7 @@ fn print_entry(index: &Index, i: usize) {
             let m = &index.entries[m];
             println!("  {}", one_line(&m.signature));
             if !m.doc.is_empty() {
-                println!("      {}", first_line(&m.doc));
+                println!("      {}", first_sentence(&m.doc));
             }
         }
     }
@@ -267,7 +272,7 @@ pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
     for s in &sources {
         index.modules.push(Module {
             path: s.module.clone(),
-            summary: summary(&s.text),
+            summary: first_sentence(&intro(&s.text)),
             intro: intro(&s.text),
         });
         for item in &s.parsed.file.items {
@@ -514,8 +519,8 @@ fn doc_before(s: &Source, start: u32) -> String {
     lines.join("\n")
 }
 
-/// The `//` comment a file opens with, its lines joined into paragraphs: what the module is for,
-/// at length.
+/// The `//` comment a file opens with, line for line, as Markdown: what the module is for, at
+/// length. Its lists and indented lines stay as written.
 fn intro(text: &str) -> String {
     let mut out = String::new();
     for line in text.lines() {
@@ -528,7 +533,7 @@ fn intro(text: &str) -> String {
             out.push_str("\n\n");
         } else {
             if !out.is_empty() && !out.ends_with('\n') {
-                out.push(' ');
+                out.push('\n');
             }
             out.push_str(l.trim_end());
         }
@@ -536,11 +541,18 @@ fn intro(text: &str) -> String {
     out.trim().to_string()
 }
 
-/// A file's first `//` comment line: what the module is for.
-fn summary(text: &str) -> String {
-    text.lines()
-        .next()
-        .and_then(|l| l.strip_prefix("//"))
-        .map(|l| l.trim().to_string())
-        .unwrap_or_default()
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_intro_keeps_its_lines_and_a_summary_is_its_first_sentence() {
+        let text = "// What it is: one thing. And more\n// on two lines.\n//\n// - a list\n// - of two\n//   indented\n\nfn x() {}\n";
+        assert_eq!(
+            intro(text),
+            "What it is: one thing. And more\non two lines.\n\n- a list\n- of two\n  indented"
+        );
+        assert_eq!(first_sentence(&intro(text)), "What it is: one thing.");
+        assert_eq!(first_sentence("One line\nthat wraps.\n\nNext."), "One line that wraps.");
+    }
 }

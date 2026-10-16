@@ -1,14 +1,16 @@
-// Fields: functions over space (language.md §17). A field's structure is its type and its
-// numbers are data (D-070): `sphere(1.0).smooth_union(round_cone(...), k: 0.1)` has the type
+// Fields, functions over space: signed-distance surfaces, the combinators that join, cut, move
+// and displace them, noise, channels such as colour, and measures and certified checks of a
+// surface (language.md §17). A field's structure is its type and its numbers are data:
+// `sphere(1.0).smooth_union(round_cone(...), k: 0.1)` has the type
 // `SmoothUnion<Sphere, RoundCone>`, whose value is a few floats that reach the GPU as a uniform.
 //
 // A `Surface` is a signed distance. A `Field<C>` is a surface whose points also carry channels
-// `C` (D-002), which the combinators blend where surfaces blend (`Blend`). A surface states a
-// bound on its gradient near itself (`lipschitz`, D-092), so sphere tracing can step by it
-// (`to_bound`); a closure of a point states none. A `Noise` states its range, its gradient's
-// bound and its bandlimit.
+// `C`, which the combinators blend where surfaces blend (`Blend`). A surface states a bound on
+// its gradient near itself (`lipschitz`), so sphere tracing can step by it (`to_bound`); a
+// closure of a point states none. A `Noise` states its range, its gradient's bound and its
+// bandlimit.
 //
-// A surface's parts are the leaves of its tree of combinators (language.md §22): each knows
+// A surface's parts are the leaves of its tree of combinators (language.md §20): each knows
 // which part decides its distance at a point (`part_at`), each part's own distance, and its
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
@@ -47,10 +49,10 @@ pub trait Surface: Copy + GpuData {
     }
 
     /// Its distance at `p` as something `footprint` wide sees it (a pixel's or a cell's span):
-    /// detail finer than the footprint fades to its mean instead of aliasing (D-077). A
-    /// displacement filters its noise (`Noise::filtered`), and every combinator passes the
-    /// footprint on, so detail anywhere in a surface's tree is filtered. The default is the
-    /// distance itself: a surface with no detail finer than the footprints it's seen at.
+    /// detail finer than the footprint fades to its mean instead of aliasing. A displacement
+    /// filters its noise (`Noise::filtered`), and every combinator passes the footprint on, so
+    /// detail anywhere in a surface's tree is filtered. The default is the distance itself: a
+    /// surface with no detail finer than the footprints it's seen at.
     fn filtered(self, p: vec3, footprint: f32) -> f32 {
         self.distance(p)
     }
@@ -66,23 +68,23 @@ pub trait Surface: Copy + GpuData {
         interval(|q| self.distance(q), over)
     }
 
-    /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§17,
-    /// D-092), so sphere tracing can step by it: primitives state theirs, combinators compose
-    /// their parts' in ordinary code and pass the scope on. A consumer passes the scope it
-    /// needs: a step of at most `near` (`to_bound`), or an interval test over a block that
-    /// straddles the surface, at least the block's radius. A surface that states none (a
-    /// closure of a point) is unbounded: infinite.
+    /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§17), so
+    /// sphere tracing can step by it: primitives state theirs, combinators compose their parts'
+    /// in ordinary code and pass the scope on. A consumer passes the scope it needs: a step of at
+    /// most `near` (`to_bound`), or an interval test over a block that straddles the surface, at
+    /// least the block's radius. A surface that states none (a closure of a point) is unbounded:
+    /// infinite.
     fn lipschitz(self, near: f32) -> f32 {
         1.0 / 0.0
     }
 
     /// A range holding its distance over `b`: the derived interval, narrowed by the distance
-    /// at `b`'s centre and the bound (spike 01's culling interval). The derived interval says
-    /// how far from the surface `b` can be, which is the scope the bound needs; along the
-    /// segment from the centre to any point of `b`, the distance then changes by at most the
-    /// bound times the half-diagonal. Each narrows the other: a culling test keeps fewer boxes
-    /// with both. A displacement narrows its surface's and adds its noise's range, which is
-    /// tighter than its noise's steepness allows and needs no noise at the centre.
+    /// at `b`'s centre and the bound. The derived interval says how far from the surface `b` can
+    /// be, which is the scope the bound needs; along the segment from the centre to any point of
+    /// `b`, the distance then changes by at most the bound times the half-diagonal. Each narrows
+    /// the other: a culling test keeps fewer boxes with both. A displacement narrows its
+    /// surface's and adds its noise's range, which is tighter than its noise's steepness allows
+    /// and needs no noise at the centre.
     fn interval_near(self, b: Box3) -> Interval {
         let x = self.interval(b)
         let l = self.lipschitz(max(abs(x.lo), abs(x.hi)) * 1.001 + 0.000001)
@@ -175,12 +177,12 @@ pub trait Surface: Copy + GpuData {
         Mirror { inner: self }
     }
 
-    /// The same surface, one part with a name: tools say where a point is by it (§22).
+    /// The same surface, one part with a name: tools say where a point is by it (§20).
     fn named(self, name: Text) -> Named<Self> {
         Named { inner: self, name }
     }
 
-    // ---- provenance (§22) ----
+    // ---- provenance (§20) ----
 
     /// How many parts it has: the leaves of its tree of combinators. A primitive, a closure
     /// and a `named` surface are one part each.
@@ -219,7 +221,7 @@ pub trait Surface: Copy + GpuData {
 /// Where a surface is: a sphere, and how fast its distance grows outside it. Its distance at
 /// `p` is at least `slope` times `p`'s distance from the sphere: exactly so for a surface whose
 /// distance is exact (slope 1); for one whose distance is a bound, `slope` is what the surface
-/// states (the ellipsoid's 0.5 is spike 01's assumption, not a proof).
+/// states (the ellipsoid's 0.5 is an assumption, not a proof).
 pub struct Bound: Copy + GpuData {
     pub centre: vec3,
     pub radius: f32,
@@ -273,7 +275,7 @@ pub fn part_share<S: Surface>(field: S, p: vec3, i: u32) -> f32 {
     (field.part_offset(p, i, by: 0.0001) - field.distance(p)) / 0.0001
 }
 
-// ---- measures (§22) ----------------------------------------------------------------------
+// ---- measures (§20) ----------------------------------------------------------------------
 //
 // Where a surface is, as numbers a spec can hold it to (std::lift's `Checks`). Each searches
 // with values, then takes one Newton step along its ray, so its derivative by anything the
@@ -461,7 +463,7 @@ pub fn part_image<S: Surface>(field: S, i: u32) -> u32 {
     i
 }
 
-// ---- certified checks (§22) ------------------------------------------------------------
+// ---- certified checks (§20) ------------------------------------------------------------
 
 /// What a certified check of a region found: the property holds at every point of it (proved by
 /// derived intervals, §13), it fails at a point (a counterexample), or the intervals couldn't
@@ -541,7 +543,7 @@ pub fn certify_apart<S: Surface>(field: S, a: u32, b: u32, region: Box3, depth: 
     )
 }
 
-/// A part's name, for tools (§22): the name its author gave it, the name of the group it's in,
+/// A part's name, for tools (§20): the name its author gave it, the name of the group it's in,
 /// the name of the space it's placed in (an engine's creature places parts on bones), and
 /// whether it's the mirror image of the part as written. Each name is empty where nothing gives
 /// one.
@@ -569,12 +571,12 @@ pub trait Noise: Copy + GpuData {
     fn lipschitz(self) -> f32
 
     /// Its highest frequency, in cycles per unit: detail finer than `1 / bandlimit()` is all
-    /// there is above it (D-077).
+    /// there is above it.
     fn bandlimit(self) -> f32
 
     /// Its value averaged over the box `p ± footprint / 2`, each component a width (0 samples
     /// that axis): what a pixel whose footprint spans that box sees. Detail finer than the
-    /// footprint fades to its mean instead of aliasing (D-077). The default is the value itself,
+    /// footprint fades to its mean instead of aliasing. The default is the value itself,
     /// which is right for a noise with no detail finer than the footprints it's seen at.
     fn filtered(self, p: vec3, footprint: vec3) -> f32 {
         self.value(p)
@@ -642,8 +644,8 @@ impl Surface for Ellipsoid {
     }
 
     fn bound(self) -> Bound {
-        // The usual bound's distance: spike 01 assumed it falls off at least half as fast as the
-        // true distance does.
+        // The usual bound's distance, assumed to fall off at least half as fast as the true
+        // distance does.
         Bound {
             centre: vec3(),
             radius: max(self.radii.x, max(self.radii.y, self.radii.z)),
@@ -813,7 +815,7 @@ pub fn cuboid(half: vec3) -> Cuboid {
 impl Surface for Cuboid {
     /// Outside, the distance to the nearest point of the box; inside, minus the distance to
     /// the nearest face. One branch on which, so what's derived from it knows the side: on a
-    /// face, the interval of the gradient is the face's normal (spike 13).
+    /// face, the interval of the gradient is the face's normal.
     fn distance(self, p: vec3) -> f32 {
         let q = abs(p) - self.half
         let m = max(q.x, max(q.y, q.z))
@@ -869,7 +871,7 @@ impl Surface for HalfSpace {
 /// terms that cancel, and its interval is the smaller distance's, less at most `k / 4`. It
 /// chooses the smaller distance once, with one branch, so an interval that can't decide which
 /// runs each side knowing it, and the interval of its gradient stays between its parts' on a
-/// blend's seam (spike 13).
+/// blend's seam.
 pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     // The smallest normal f32 keeps `0.25 / k` finite, and `m` is 0 for `k <= 0`. `m` times
     // at most a quarter doesn't overflow where `m * m` would. (A derived interval with `k = 0`
@@ -890,7 +892,7 @@ pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     }
 }
 
-// Provenance (§22) through a combinator of two surfaces, whose parts are `a`'s then `b`'s, and
+// Provenance (§20) through a combinator of two surfaces, whose parts are `a`'s then `b`'s, and
 // through one of an array of surfaces: what the combinators share. Each has its own `part_at`.
 
 /// The distances of `a` and `b` at `p`, part `i` of the two raised by `by` (`part_offset`).
@@ -1971,7 +1973,7 @@ fn least_abs(i: Interval) -> f32 {
 
 // ---- channels -----------------------------------------------------------------------------------
 
-/// A surface whose points carry channels `C` besides their distance (D-002): what a point knows
+/// A surface whose points carry channels `C` besides their distance: what a point knows
 /// about itself, such as its colour or its density. `.with(...)` and `.with_at(...)` give a
 /// surface channels, and the combinators blend them where they blend the surfaces.
 pub trait Field<C>: Surface {
@@ -1988,7 +1990,7 @@ pub trait Field<C>: Surface {
 }
 
 /// How channels mix where surfaces blend. A channel struct declares it and gets it field by
-/// field, so each member's type decides how it mixes (D-026).
+/// field, so each member's type decides how it mixes.
 @fieldwise
 pub trait Blend {
     /// `self` where `t` is 0, `other` where it's 1, and a mix between.
@@ -2060,7 +2062,7 @@ impl Blend for UnitVec3 {
 }
 
 /// A categorical channel, such as a material: never averaged, but taken whole from whichever
-/// surface weighs more where two blend (D-026).
+/// surface weighs more where two blend.
 pub struct Cat<T>: Copy + GpuData + StateHash {
     pub value: T,
 }
@@ -2196,9 +2198,9 @@ pub fn smin_weight(a: f32, b: f32, k: f32) -> f32 {
     if a < b { w } else { 1.0 - w }
 }
 
-/// `smin(a, b, k)` and `smin_weight(a, b, k)` at once, as spike 01's `smin_h` gives them: the
-/// two share `max(k - |a - b|, 0)`. The same numbers as theirs, bit for bit: for `k` up to
-/// 2^124, `0.5 / k` is exactly twice `0.25 / k`.
+/// `smin(a, b, k)` and `smin_weight(a, b, k)` at once: the two share `max(k - |a - b|, 0)`.
+/// The same numbers as theirs, bit for bit: for `k` up to 2^124, `0.5 / k` is exactly twice
+/// `0.25 / k`.
 pub fn smin_and_weight(a: f32, b: f32, k: f32) -> (f32, f32) {
     let s = 0.25 / max(k, 1.1754944e-38)
     let d = b - a

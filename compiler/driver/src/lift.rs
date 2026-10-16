@@ -1,4 +1,4 @@
-//! Lifted builds (language.md §22): the table of literals a build lifts, with what tools need
+//! Lifted builds (language.md §20): the table of literals a build lifts, with what tools need
 //! to show and edit them, and the build's report of every float literal in the lifted packages,
 //! lifted or not and why (`lift.json`).
 

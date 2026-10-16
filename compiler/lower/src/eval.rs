@@ -55,7 +55,7 @@ pub struct BuildData {
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,
-    /// A lifted build's literals (language.md §22).
+    /// A lifted build's literals (language.md §20).
     pub lift: Option<crate::LiftTable>,
     /// Which host runs the build (§12): its entries, and what it may reach.
     pub role: wrela_sema::defs::Role,
