@@ -18,11 +18,13 @@ test("program channels correlate replies and close outstanding requests", async 
   } finally { left.close(); right.close(); }
 });
 
-test("the environment says whether this page load reloaded the tab, then what the host has", () => {
+test("the environment says whether this page load reloaded the tab, what the host has, then the colour scheme", () => {
   const load = (type: string) => [{ type } as unknown as PerformanceEntry];
   const b = environment(true, 1_700_000_000_999, 2, load("navigate"), PASTE_EVENTS | SEMANTICS);
   expect([b[0], wordAt(b.subarray(1)), wordAt(b.subarray(5)), b[9], wordAt(b.subarray(10))]).toEqual([1, 1_700_000_000, 2048, 0, PASTE_EVENTS | SEMANTICS]);
-  expect(b.length).toBe(14);
+  expect(b.length).toBe(15);
+  expect(b[14]).toBe(0);
+  expect(environment(false, 0, 1, [], 0, true)[14]).toBe(1);
   expect(environment(false, 0, 1, load("reload"), 0)[9]).toBe(1);
   // Back and forward are visits, and so is a page whose navigation the browser didn't record.
   expect(environment(false, 0, 1, load("back_forward"), 0)[9]).toBe(0);

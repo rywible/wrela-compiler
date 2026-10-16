@@ -1,7 +1,7 @@
 # Wrela's lexical structure
 
-This file defines Wrela's tokens: source text, whitespace and newlines, comments, identifiers,
-keywords, literals, operators and punctuation. It is normative. `spec/grammar.ebnf` is written over
+Wrela source is read as tokens: whitespace and newlines, comments, identifiers, keywords,
+literals, operators and punctuation. These rules are normative. `spec/grammar.ebnf` is written over
 these tokens, and the compiler's lexer (`compiler/syntax/src/lexer.rs`) implements exactly these
 rules. Each rule has a number (L1, L2, …) that tests and diagnostics cite; a number is never
 reused, and a new rule gets the next number.

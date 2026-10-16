@@ -69,14 +69,16 @@ const checked = (body: unknown): Bytes => {
 /** A bounded request/reply channel. Closing it rejects every outstanding request. */
 /** The environment a program asks for (platform/host.wrela): whether the system asks for reduced
  * motion, the seconds since 1970, the device pixel ratio × 1024, whether this page load is a
- * reload of the tab (its navigation's type), rather than a visit, and what this host has. */
-export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: number, navigations: PerformanceEntryList, capabilities: number): Bytes {
-  const b = new Uint8Array(14);
+ * reload of the tab (its navigation's type), rather than a visit, what this host has, and whether
+ * the system asks for a light colour scheme. */
+export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: number, navigations: PerformanceEntryList, capabilities: number, light = false): Bytes {
+  const b = new Uint8Array(15);
   b[0] = Number(reducedMotion);
   b.set(wordBytes(Math.floor(nowMs / 1000)), 1);
   b.set(wordBytes(Math.round(pixelRatio * 1024)), 5);
   b[9] = Number(navigations.some((n) => (n as PerformanceNavigationTiming).type === "reload"));
   b.set(wordBytes(capabilities), 10);
+  b[14] = Number(light);
   return b;
 }
 
@@ -337,7 +339,7 @@ export class BrowserPlatform {
   async request(service: string, body: Bytes): Promise<Bytes> {
     checked(body);
     if (service === "environment") {
-      return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"), this.#capabilities());
+      return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"), this.#capabilities(), matchMedia("(prefers-color-scheme: light)").matches);
     }
     if (service === "image/decode") return decodeImage(body, browserDecode);
     if (service === "cursor") {

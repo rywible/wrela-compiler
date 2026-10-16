@@ -1,6 +1,6 @@
 # The Wrela language
 
-This is the reference for the Wrela language: its syntax, types, memory model, effects, GPU code and the boundary with its standard library.
+The language's syntax, types, memory model, effects and GPU code, and its boundary with its standard library, as rules that the compiler's tests check.
 
 - **Syntax:** `spec/lexical.md` and `spec/grammar.ebnf` are the normative syntax.
 - **Rules:** each rule names its ID (`area.rule`, for example `mem.take`). The conformance suite in `compiler/tests/conformance` has a program for each ID: one that the compiler accepts, and one that it rejects with the rule's diagnostic code.
@@ -13,7 +13,7 @@ Where this text and the tests disagree, the tests are right.
 
 Wrela looks like Rust but has no references, lifetimes, macros or async; unlike TypeScript, every value has a static type, and there is no garbage collector, `null` or exception.
 
-**From Rust:**
+### From Rust
 - No references and no lifetimes. A parameter reads its argument in place, and `mut` marks a change at the call site: `step(mut g)` (§6.2).
 - `let` owns a value; `borrow x = place` reads a place in place, and `mut x = place` changes it (§6.3).
 - `take x` moves a value out of a named place; `.clone()` copies a value that isn't `Copy` (§6.1).
@@ -30,7 +30,7 @@ Wrela looks like Rust but has no references, lifetimes, macros or async; unlike 
 - One language for CPU and GPU: `@compute`, `@vertex` and `@fragment` functions compile to WGSL (§12).
 - `pub fn` in `main.wrela` is an export to the host. Its parameters are numbers, bools or vectors, and its result can also be a struct, tuple or array of them (§12).
 
-**From TypeScript:**
+### From TypeScript
 - Every value has a static type. There's no `any`, `null` or `undefined`: an absent value is `Option<T>` (§4).
 - Values aren't shared. Assigning a struct copies it if it's `Copy`; otherwise it needs `.clone()` or `take` (§6.1).
 - No classes or inheritance: structs, enums and traits (§3, §7).
@@ -69,7 +69,7 @@ The compiler knows exactly three execution targets:
 
 ## 2. Lexical structure and statements
 
-Wrela source is lines of statements in `.wrela` files; this section gives the lexical rules, the keywords, control flow and the limits on nesting.
+Wrela source is lines of statements in `.wrela` files, made of tokens and keywords, with control flow and limits on nesting.
 
 - Files use the `.wrela` extension.
 - A newline ends a statement, unless it's inside open brackets or the next line starts with `.` (`lex.newline`).
@@ -284,7 +284,7 @@ The optimizer never decides staging: work that must happen early is written as a
 
 A program is one package: a directory with a `main.wrela`, in which each file is a module, and which can depend on other packages.
 
-**Modules:**
+#### Modules
 - A file is a module and a directory is a module tree: `shapes/blob.wrela` is `shapes::blob`. `use` imports names; `pub` makes an item visible outside its file (`mod.use`). In `main.wrela`, `pub` also makes a function an export (§12).
 - At the package's top level, `build`, `results`, `node_modules` and `target` hold outputs, and are never modules.
 - A `use` path starts at the package root, or at `std::`; there's no `super::`.
@@ -377,7 +377,7 @@ let reach   = 15cm + 0.3          // 0.45 m: both are metres
 
 Memory in Wrela is values, moves and projections, with handles into arenas for long-lived links; there is no garbage collector and no lifetime annotation.
 
-**Goals:**
+### Goals
 
 - **Memory safety without a garbage collector.** Frame times stay predictable.
 - **Every transfer is visible.** A copy, a move or a change shows at the point where it happens. The one exception: a call to a `mut self` method doesn't repeat `mut`, because the method's name says what it does (§2).
@@ -385,7 +385,7 @@ Memory in Wrela is values, moves and projections, with handles into arenas for l
 - **Determinism.** Behavior never depends on memory addresses, and a snapshot is a clone.
 - **A direct map onto the targets:** WASM linear memory, WebGPU buffer bindings and the audio worklet.
 
-**The rules at a glance:**
+### The rules at a glance
 
 - **Everything is a value.** `&T` isn't a type (`ty.no-ref`).
 - **Parameters have modes:** borrow (the default), `mut` and `take`. Callers write `mut x` and `take x`. A `mut self` receiver isn't marked; a consuming `take self` method on a named place is (`take b.finish()`).
@@ -519,7 +519,7 @@ Exclusivity is the rule that, while a `mut` access to a place is live, no other 
 - **Every element of a container overlaps every other element of that container.** The checker doesn't compare indices.
 - **An access is live** from where it is created to its last use.
 
-**In a call:**
+#### In a call
 - Arguments may not overlap if any of them is `mut`.
 - The arguments are evaluated before the call's `mut` access begins. A `Copy` argument passed by borrow is copied then, so it may read a place that a `mut` argument overlaps: `v.push(v.len())`, `s.add(s.count)`.
 - An argument that is a projection still conflicts (E0513).
@@ -608,7 +608,7 @@ A closure's captures decide where it can go: a closure that captures a projectio
 - It can be returned and stored, for example in a field: `.with_at(|p| dapple(p, seed))`.
 - Its type is its own and is inferred, as `impl Trait` is (§7).
 
-**Function types and function values:**
+#### Function types and function values
 - A function type, `fn(f32) -> f32`, is the type of a parameter or a struct field (`mem.closures`).
 - A named function is a value of its own type, which passes where a function type is expected: `apply(triple, 3.0)`.
 - A type's associated function, its own or a trait's, is a value too: `Herd::of`, and `R::per_second` in a function generic over `R: Rate`, which calls `R`'s implementation (`fn.values`). A trait's function needs that type: `Rate::per_second` alone is E0212.
@@ -625,7 +625,7 @@ A closure's captures decide where it can go: a closure that captures a projectio
 - Each function that a value holds is a type argument, so a call through it is static, on the CPU and the GPU. No generic parameter is written for it.
 - Such a struct is named only as a parameter's type, and built only by a literal. As the type of a field, a result or a binding, it is E0410: naming it there would need its functions written, and no syntax names them.
 
-**More rules:**
+#### More rules
 - **Escapability comes from the captures.** There is no annotation (§18).
 - **Closures of different types can't share a container,** because there is no `dyn`. Deferred work, such as a timer or an event handler, is an enum of actions that one `match` applies. Unlike a closure, an action can be saved.
 
@@ -1093,7 +1093,7 @@ Generic code in Wrela is always monomorphized, and every trait that a type has i
   - In `fn red<C, F: Field<C>>(f: F)`, a `Field<Color>` argument makes `C` a `Color` (`fn.return-trait`).
   - An impl's parameters are inferred the same way. `impl<C, F: Field<C>> Field<C> for Masked<F>` is found for a `Masked<Ball>` whose `Ball` is a `Field<Tint>`.
 
-**Traits:**
+### Traits
 - **Every trait a type has is declared.** `Plain` and `GpuData` are declared like `Copy`. The compiler checks them by structure: every field must have the trait. There are no auto traits (§18).
   - Declaring `Copy` implies `Clone`.
   - A generic type's declared trait holds for the instantiations whose type arguments have it (§3).
@@ -1105,7 +1105,7 @@ Generic code in Wrela is always monomorphized, and every trait that a type has i
   - A set isn't a trait. So it can't be implemented (E0419) or used as a type (E0410).
 - **Library-authored diagnostics:** `@diagnostic(...)` attaches a message to a trait or a type. The compiler shows it when a bound isn't met. (`trait.diagnostic`)
 
-**GPU pipelines:**
+### GPU pipelines
 - **The pipeline-count query** reports how many instantiations each GPU entry point has, and why. `wrela pipelines <package>` lists each entry point's pipelines, their type arguments, and where CPU code dispatches or draws each. `--json` gives the same list for tools.
 - **A shipped build keeps a budget for its shaders:** at most 256 KiB of WGSL for each pipeline. A browser compiles each pipeline while the scene loads, and the GPU's compile time grows faster than the shader's size.
   - A release build over the budget is E0707, at the command that records the large pipeline (`build.budget`).
@@ -1142,7 +1142,7 @@ An effect is something a function does besides computing its result, such as usi
 - **`host`:** the code records GPU work. Releasing a GPU buffer is `host` too.
 - **`panic`:** an explicit panic, a failed `assert`, a failed unwrap, or an index past the end of a `Vec` or an arena. A target's trap isn't a `panic`. §11's table says what each target does on overflow, division by zero and an index out of range, so GPU code can index.
 
-**How the compiler finds effects:**
+### How the compiler finds effects
 - **Effects are inferred everywhere, and never written.** The compiler infers a function's effects from its body and everything it calls. The compiler sees the whole program, and packages are local, so effects aren't written at a package boundary either (§18). The one exception is std's unsafe core, which states effects that inference can't see (§17).
 - **Attributes only assert.** The compiler checks the inferred effects against a context attribute such as `@gpu` or `@deterministic`.
 - **Errors show the call chain:** `extract → foo → bar allocates at line 42`.
@@ -1369,7 +1369,7 @@ CPU code uses strict IEEE floats, the stdlib's own transcendentals and integer a
 
 **GPU code follows WGSL semantics,** and its results are for presentation only: GPU results can't reach `@deterministic` code (§14).
 
-**Numeric semantics:**
+### Numeric semantics
 
 | Case | CPU | GPU |
 |---|---|---|
@@ -1411,7 +1411,7 @@ An entry point is a kernel or shader, marked `@compute(x, y, z)`, `@vertex` or `
   - `ClipPosition` is a vertex shader's output, and `Flat<T>` holds a value that is not interpolated.
 - **GPU-only operations:** builtins, derivatives and texture sampling exist only in GPU code (`gpu.cpu`, E0607).
 
-**What an entry point returns:**
+#### What an entry point returns
 
 - A kernel returns nothing.
 - A vertex shader returns a `ClipPosition`, or a struct with one `ClipPosition` field. It passes the other fields to the fragment shader.
@@ -1423,7 +1423,7 @@ An entry point is a kernel or shader, marked `@compute(x, y, z)`, `@vertex` or `
 
 **What passes from the vertex shader to the fragment shader:** numbers and vectors of `f32`s, `i32`s and `u32`s, matrices, and structs and tuples of those. Each value is interpolated, or held in a `Flat<T>`; integers are never interpolated. WGSL gives each number or vector a location of its own, each matrix column one, and each struct field one. At most 16 locations pass.
 
-**What an entry point takes as parameters:**
+#### What an entry point takes as parameters
 
 - builtins;
 - `GpuData` values, passed together as one uniform block;
@@ -1586,7 +1586,7 @@ The draw state is part of the draw's pipeline, which the host makes when the pro
 
 Textures and samplers are owned GPU values that shaders read and passes draw into; a texture's format is a type (`gpu.textures`).
 
-**Making textures and samplers:**
+#### Making textures and samplers
 
 - `texture::<F>(width, height)` makes a colour texture of format `F`.
 - `writable_texture::<F>(width, height)` makes a colour texture that can also be a kernel's `Texels<F>`. The hosts give a texture storage usage only then, because storage can cost a drawn texture its compression.
@@ -1596,7 +1596,7 @@ Textures and samplers are owned GPU values that shaders read and passes draw int
 
 Each is an owned value, released when dropped, like a buffer. `tex.write(x, y, width, height, bytes)` copies texels in. A shader takes textures and samplers as parameters, and CPU code passes them by name. CPU code cannot read texels (E0607).
 
-**Reading textures:**
+#### Reading textures
 
 - `tex.sample(s, uv)` and `depth.sample_compare(s, uv, reference)` pick their detail from neighbouring pixels. So they are for fragment shaders, in uniform control flow, as derivatives are (E0607, E0608).
 - `sample_level`, `sample_compare_level`, `load`, `width()` and `height()` work in any GPU code.
@@ -1713,7 +1713,7 @@ Every peer applies the committed entries in the room's order, with the same code
 
 **Who may propose:** a room takes a proposal only from its peer's connection, whose hello carried the peer's token. The room tags that connection with the peer (`platform::net::tag`), so a room that its host starts again knows it. A peer's id, which every entry shows, proves nothing. A connection says hello once; the room refuses a second hello (`HELLO_AGAIN`).
 
-**Catching up and compaction:**
+#### Catching up and compaction
 
 - A peer that rejoins more than `CATCH_UP` (128) entries behind gets the state, not the entries.
 - A room compacts once its journal holds `COMPACT_AFTER` (1024) records past its snapshot, refusals and joins included.
@@ -1753,7 +1753,7 @@ A journal that the program traps on, or a poisoned message that it traps on, qua
 
 **Clients:** a client opens connection `conn` to a room with `platform::net::open(conn, room)` (`@client`), and uses `send` and `close` as a server does. Each connection it opens gives one `Connection` event when it is open, and exactly one when it is closed, whatever closes it.
 
-**Finding and running the server:**
+#### Finding and running the server
 
 - The browser host finds the server in `net.json` beside the build: its address and, for a development certificate, the certificate's hash, which the browser trusts in place of a certificate authority's signature. `wrela-serve --dev` writes both.
 - Each server build's rooms are kept apart (`<data>/<build hash>/`), because only the build that wrote a journal reads it. A server given a new build closes its rooms' connections, and their peers come back to the new build's rooms.
@@ -1888,7 +1888,7 @@ Concurrency in Wrela is threads that share only read-only data, and polled reque
 
 ## 17. The stdlib boundary
 
-This section says what the compiler knows of the standard library (std), which modules std has, and how fields are ordinary std code.
+The compiler knows the language, a closed list of standard library (std) items and its targets; the rest of std, fields included, is ordinary Wrela code.
 
 - **The compiler knows three things:** the language, a closed list of std items, and the execution targets.
 - **The closed list** is every std item that the compiler knows by its path, and nothing else. It holds the traits that the compiler derives or checks by structure, the types that its code has a shape for, the GPU, IO and memory operations that it lowers itself (`@intrinsic` in std), and the transcendentals that it compiles from std's code. A program cannot add to the list. `Plain`, `StateHash`, `Serialize`, `Blend` and `Surface` are not on it: they are ordinary std traits, `@fieldwise` or written by hand. The list, by module:
@@ -2011,9 +2011,9 @@ A field is ordinary std code: its trait, its primitives and its combinators are 
 
 ## 18. What Wrela leaves out
 
-This section lists the features that Wrela does not have, each with what a program uses instead.
+Wrela has no references as types, null, garbage collector, `async` or macros; for each feature it leaves out, a program uses something else, given here.
 
-**Memory and types:**
+### Memory and types
 - **References as types,** and with them lifetime parameters, variance, `'static` and higher-ranked bounds. Use parameter modes (§6.2) and projections (§6.4).
 - **Projections inside other types:** general non-escaping structs, projection types as type arguments, iterator types and adapter chains. The one exception is a borrow struct, whose fields are fixed once it is built (§6.6). Loops walk runs and arenas; queries take closures or return a `Vec` (§6.6).
 - **`Span<T>`.** Runs, `[T]`, are the one view type (§4).
@@ -2028,14 +2028,14 @@ This section lists the features that Wrela does not have, each with what a progr
 - **Unit types.** Unit suffixes are SI constants (§5).
 - **Angle as its own dimension.** Angles are dimensionless, as in SI, so `sin` takes a plain number (§5).
 
-**Control flow and concurrency:**
+### Control flow and concurrency
 - **Labelled `break`.** `break` leaves the innermost loop; to leave more, return from a function or set a flag (E0114).
 - **Reverse ranges.** A range counts up: write `for k in 0..n` with `let i = n - 1 - k` (§2). The parser rejects `(0..n).rev()` and says so.
 - **`async` and `await`, and `Pin`.** IO and readback are polled requests, and a request's handle is an ordinary value (§6.15).
 - **`Sendable` and `Shareable`.** Without interior mutability or shared ownership, nothing needs them (§6.12).
 - **A general `schedule` construct** for a function's evaluation. GPU work is kernels, dispatches and draws, written in the program (§12).
 
-**Traits, attributes and metaprogramming:**
+### Traits, attributes and metaprogramming
 - **`dyn Trait`.** Enums cover structure chosen from a finite set, generics cover static structure, and `stage::interpret` covers fields built at runtime (§7, §13). `dyn` stays a reserved word, so the compiler can say what to use instead.
 - **Auto traits.** A type declares every trait it has (§7), so no guarantee depends on an author who remembers to opt out.
 - **Procedural macros.** Use fieldwise traits (§3).
@@ -2044,7 +2044,7 @@ This section lists the features that Wrela does not have, each with what a progr
 - **`@escaping`.** A closure's captures decide whether it can be stored (§6.7).
 - **Stated effects at package boundaries.** The compiler infers effects everywhere (§8).
 
-**Numerics and fields:**
+### Numerics and fields
 - **Fast-math on the CPU.** CPU code uses strict IEEE floats (§11).
 - **Field kinds** `Exact`, `Bound` and `Lipschitz`. `Surface`'s `lipschitz` method states the bound (§17), and the derived interval of the gradient checks it.
 - **Facts as compiler attributes,** `@assume` and `@assert`. A field's bound depends on data for each individual, so it is a std method (§13, §17). The compiler does only what it alone can do: it derives the bound that checks the stated one.
@@ -2113,7 +2113,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
 
 ## 20. Lifted builds, provenance and the tools
 
-This section describes how a person or an agent changes a field by its numbers while the program runs, and the tools built for that. Three features make this a tool's job, not a guess:
+A person or an agent changes a field by its numbers while the program runs, with tools built for that. Three features make this a tool's job, not a guess:
 
 - **Lifted builds:** a tool changes a number while the program runs.
 - **Provenance:** the part of a field that decides a point, and the numbers that move the surface there.

@@ -262,7 +262,7 @@ fn spec_pages() -> Vec<Page> {
     pages.push(Page {
         path: "spec/grammar.md".to_string(),
         title: "Wrela's grammar".to_string(),
-        summary: "The language's syntax, normative, in EBNF over spec/lexical.md's tokens."
+        summary: "All of Wrela's syntax, in EBNF over the tokens of its lexical structure."
             .to_string(),
         kind: "spec",
         text: format!("# Wrela's grammar\n\n```ebnf\n{}\n```\n", GRAMMAR.trim_end()),
