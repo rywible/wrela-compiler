@@ -1539,7 +1539,7 @@
       "script": "[{\"frame\": 0, \"type\": \"assist\"}]"
     },
     {
-      "error": "event 0: `action` is activate, select or focus",
+      "error": "event 0: `action` is activate, select, focus, increment, decrement or dismiss",
       "name": "an unknown assist action",
       "script": "[{\"frame\": 0, \"type\": \"assist\", \"node\": 1, \"action\": \"poke\"}]"
     },
@@ -1658,7 +1658,7 @@
       "script": "[{\"frame\": 2, \"tick\": 1, \"type\": \"move\"}]"
     },
     {
-      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)",
+      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, field, padbutton, padpress, padaxis, message or connection)",
       "name": "an unknown type",
       "script": "[{\"frame\": 0, \"type\": \"jump\"}]"
     },

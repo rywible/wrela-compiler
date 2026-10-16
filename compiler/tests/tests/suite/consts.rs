@@ -58,9 +58,12 @@ fn the_second_build_computes_no_constant() {
     let dir = scratch("consts/cached");
     let main = dir.join("main.wrela");
     std::fs::write(&main, PROGRAM).expect("write");
-    let (computed, cached) = stats(&dir);
-    assert!(computed >= 3 && cached == 0, "the first build computes them: {computed}, {cached}");
-    let all = computed;
+    // A first build can read what it wrote a moment before: constants with the same code (two
+    // fields' `String::new()` defaults in std, say) share one entry.
+    let first = stats(&dir);
+    let (computed, cached) = first;
+    assert!(computed >= 3, "the first build computes them: {computed}, {cached}");
+    let all = computed + cached;
     assert_eq!(stats(&dir), (0, all), "the second build computes none");
 
     // A function `HALF` calls: it alone is computed again.
@@ -82,7 +85,7 @@ fn the_second_build_computes_no_constant() {
     for e in std::fs::read_dir(&cache).expect("the cache is in build/consts") {
         std::fs::write(e.expect("entry").path(), b"not a value").expect("write");
     }
-    assert_eq!(stats(&dir), (all, 0), "corrupt entries are computed again");
+    assert_eq!(stats(&dir), first, "corrupt entries are computed again");
 }
 
 /// Waiting constants keep their round order, including a fan-in whose inputs become ready
@@ -126,7 +129,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
     let second = wrela_driver::build(&dir);
     assert!(!second.has_errors(), "{:?}", second.diagnostics);
     assert_eq!(second.consts.computed, 0);
-    assert_eq!(second.consts.cached, first.consts.computed);
+    assert_eq!(second.consts.cached, first.consts.computed + first.consts.cached);
     assert!(second.consts.traced.is_empty());
     assert_eq!(first.files, second.files);
 }

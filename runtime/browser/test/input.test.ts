@@ -3,7 +3,7 @@
 import { expect, test } from "bun:test";
 import { EVENT_SIZE, EventKind } from "../src/abi.gen.ts";
 import { composeEvents, InputRing, keyCode, keyEvent, padAxisEvent, padButtonEvent, parseScript, pasteEvent, pointerEvent, textEvent } from "../src/input.ts";
-import { listen, type PadState, padChanges, pollPads } from "../src/listen.ts";
+import { type Forward, listen, type PadState, padChanges, pollPads } from "../src/listen.ts";
 import { domEvent, onPage } from "./page.ts";
 
 test("the ring gives what was written, once, in order, with when", () => {
@@ -192,7 +192,7 @@ test("a paste is kept by its serial, and a copy takes what the program offers", 
 test("F6 hands the keys to the overlay, letting go of held keys first", () => onPage((page) => {
   const canvas = page.createElement("canvas");
   const control = page.createElement("button");
-  const overlay = { contains: (e: Element | null) => e === (control as unknown), enter: () => (control.focus(), true) };
+  const overlay = { contains: (e: Element | null) => e === (control as unknown), enter: () => (control.focus(), true), focusAt: () => false, connect() {} };
   const ring = InputRing.create();
   listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }), overlay);
   page.dispatchEvent(domEvent("keydown", { code: "Space", key: " " }));
@@ -320,3 +320,25 @@ test("a standard pad sends only ABI controls and releases controls missing from 
     padAxisEvent(0, 3, 0),
   ]);
 });
+
+test("a press on a field the overlay draws gives it the keys; the keys it hands on reach the program", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const field = page.createElement("input");
+  let forward: Forward | null = null;
+  const overlay = {
+    contains: (e: Element | null) => e === (field as unknown),
+    enter: () => false,
+    focusAt: (x: number, y: number) => x < 10 && y < 10 && (field.focus(), true),
+    connect: (f: Forward) => { forward = f; },
+  };
+  const ring = InputRing.create();
+  listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }), overlay);
+  canvas.dispatchEvent(domEvent("pointerdown", { clientX: 5, clientY: 5, button: 0, pointerId: 1 }));
+  expect(page.activeElement).toBe(field);
+  canvas.dispatchEvent(domEvent("pointerdown", { clientX: 50, clientY: 50, button: 0, pointerId: 1 }));
+  expect(page.activeElement).toBe(canvas);
+  ring.read();
+  forward!.key(domEvent("keydown", { code: "Enter", key: "Enter" }) as KeyboardEvent, true);
+  forward!.key(domEvent("keyup", { code: "Enter", key: "Enter" }) as KeyboardEvent, false);
+  expect(ring.read().events).toEqual(new Uint8Array([...keyEvent(true, keyCode("Enter"), false, 0), ...keyEvent(false, keyCode("Enter"), false, 0)]));
+}));

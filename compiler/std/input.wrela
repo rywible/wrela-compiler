@@ -185,7 +185,8 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     Compose { char: u32, index: u32, length: u32 },
     /// A person pasted: the host keeps what by `serial` (`clipboard/pasted`).
     Paste { serial: u32 },
-    /// An assistive technology acted on the program's accessibility node `node` (`a11y/tree`).
+    /// A person, or an assistive technology, acted on the program's semantic node `node`
+    /// (`std::semantics`). A focus on node 0: the focus left the program's nodes for the canvas.
     Assist { node: u32, action: Assist },
     /// `len` bytes from connection `conn` (language.md §12): `payload(e)` reads them, in the call
     /// that was given the event. `serial` is the host's and is never used twice.
@@ -193,6 +194,10 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     /// Connection `conn` opened, or closed. On a server, `tag` is the tag the program gave it
     /// (`platform::net::tag`), when the host tells a room it started again of it; else 0.
     Connection { conn: u32, open: bool, tag: u32 },
+    /// The field the host keeps for semantic node `node` changed (`std::semantics`): its newest
+    /// revision. The program reads the field by the node (`field/state`); the host says so again
+    /// until it has.
+    Field { node: u32, revision: u32 },
 }
 
 /// What an assistive technology does to a node.
@@ -201,8 +206,13 @@ pub enum Assist: Copy + Eq + StateHash + Serialize + Fieldless {
     Activate,
     /// Make it the selection.
     Select,
-    /// Move the focus to it.
+    /// The focus moved to it (node 0: to the canvas).
     Focus,
+    /// Step a slider's value up, or down.
+    Increment,
+    Decrement,
+    /// Close a dialog or a menu.
+    Dismiss,
 }
 
 /// The text an input method is composing, put together from `Compose` events: a change counts
@@ -351,6 +361,7 @@ pub(package) fn event_of(r: RawEvent) -> Option<Event> {
         },
         13 => Some(Event::Message { conn: r.a, serial: u64(r.b) | (u64(r.c) << 32), len: r.d }),
         14 => Some(Event::Connection { conn: r.a, open: r.b != 0, tag: r.c }),
+        15 => Some(Event::Field { node: r.a, revision: r.b }),
         _ => None,
     }
 }
@@ -600,7 +611,7 @@ impl Input {
                     let _ = self.composer.apply(e)
                 },
                 // A paste, an assistive action and the network's events hold nothing down.
-                Event::Paste { .. } | Event::Assist { .. } => {},
+                Event::Paste { .. } | Event::Assist { .. } | Event::Field { .. } => {},
                 Event::Message { .. } | Event::Connection { .. } => {},
                 Event::PadButton { pad, .. } => {
                     if pad < PADS {

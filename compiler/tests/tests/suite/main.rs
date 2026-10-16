@@ -55,6 +55,7 @@ mod requests;
 mod roles;
 mod rooms;
 mod run_pass;
+mod semantics;
 mod simd;
 mod sketches;
 mod snapshots;

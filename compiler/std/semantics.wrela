@@ -1,0 +1,395 @@
+// What a program's drawing means, for a host that gives it the platform's own behaviour (language.md
+// §6.15): a tree of nodes, each a kind of thing (a heading, a link, a field, a dialog), its state
+// and its place on the screen. A browser host makes each node the element that carries that
+// behaviour, over the canvas: screen readers, the keyboard, password managers, autofill and a
+// link's menu work as on any page, and what a person does to a node comes back as an event by its
+// number (`Event::Assist`, `Event::Field`). The program says what exists; the host owns how each
+// kind behaves. The tree's structure and its geometry are sent apart: the structure when it
+// changes, the rectangles each frame they move.
+use std::input::Assist
+use std::serialize::{LoadError, Reader, Writer}
+
+/// What a node is.
+pub enum Role: Copy + Eq {
+    /// Nodes that belong together, or none in particular.
+    Group,
+    Button,
+    /// A list to choose from, and one of its options.
+    ListBox,
+    Option,
+    /// A heading of a document (its `level`, 1 to 6), a paragraph, a link (`href`), code.
+    Heading,
+    Text,
+    Link,
+    Code,
+    /// A text field: the host keeps a real one, so input methods, autofill and password managers
+    /// work (`field`).
+    Field,
+    Checkbox,
+    Switch,
+    /// A value in a range (`value`, `min`, `max`, `step`).
+    Slider,
+    /// Tabs and the panel each shows (a tab `controls` its panel).
+    TabList,
+    Tab,
+    TabPanel,
+    /// A dialog (`modal`: the rest can't be reached while it's open).
+    Dialog,
+    Menu,
+    MenuItem,
+    Table,
+    Row,
+    Cell,
+    Separator,
+}
+
+/// What a field holds: the host shows the matching keyboard, and fills it from what it knows.
+pub enum FieldKind: Copy + Eq {
+    Text,
+    Password,
+    Email,
+    Search,
+    Url,
+    Tel,
+    /// Numbers, typed as text with a numeric keyboard; the program checks them.
+    Numeric,
+    /// Several lines.
+    Multiline,
+}
+
+/// A field's settings, and what the program asks of it. While a person edits a field, the host's
+/// field holds the text; each change (the text, the selection, a composition) is a new revision,
+/// which the program reads (`FieldState`) after `Event::Field`. The program sets the text only by
+/// a replacement: it raises `replace`, and the host applies `text` and `selection` if the field's
+/// revision is still `seen`, the newest the program read, and nothing is being composed.
+pub struct Field: Clone + Eq {
+    pub kind: FieldKind = FieldKind::Text,
+    /// The form it belongs to (0: none): a password manager saves a form's fields together.
+    pub form: u32 = 0,
+    /// The names a browser fills it by: `name`, and `autocomplete` (`username`,
+    /// `current-password`, `email`, `one-time-code`...).
+    pub name: String = String::new(),
+    pub autocomplete: String = String::new(),
+    pub spellcheck: bool = false,
+    pub text: String = String::new(),
+    /// Byte offsets of the selection to set with the text (start = end: a caret).
+    pub start: u32 = 0,
+    pub end: u32 = 0,
+    pub replace: u32 = 0,
+    pub seen: u32 = 0,
+}
+
+/// A node: its number (unique in the tree, not 0), its parent's (0: the root; only a group, a
+/// list, tabs, a panel, a dialog, a menu, a table or a row holds nodes), what it is, its name and
+/// its rectangle (device pixels of the canvas; empty: not on screen), then what its role uses.
+pub struct Node: Clone + Eq {
+    pub id: u32,
+    pub parent: u32 = 0,
+    pub role: Role,
+    pub label: String = String::new(),
+    pub rect: vec4 = vec4(0.0),
+    pub pressed: bool = false,
+    pub selected: bool = false,
+    pub disabled: bool = false,
+    pub checked: bool = false,
+    pub expanded: bool = false,
+    pub modal: bool = false,
+    /// The program's keyboard focus: the host moves the focus here when this changes.
+    pub focused: bool = false,
+    pub level: u32 = 0,
+    pub value: f32 = 0.0,
+    pub min: f32 = 0.0,
+    pub max: f32 = 0.0,
+    pub step: f32 = 0.0,
+    pub controls: u32 = 0,
+    pub href: String = String::new(),
+    pub field: Option<Field> = None,
+}
+
+/// What a person has done to a field, as the host's field has it: its revision, its text, the
+/// selection (byte offsets, and whether it runs backward) if the field has one, and what an input
+/// method is composing (empty when nothing is).
+pub struct FieldState: Clone + Eq {
+    pub node: u32,
+    pub revision: u32,
+    pub text: String,
+    pub start: u32,
+    pub end: u32,
+    pub backward: bool,
+    pub composing: bool,
+    pub compose_start: u32,
+    pub compose_end: u32,
+}
+
+fn role_byte(r: Role) -> u8 {
+    match r {
+        Role::Group => 0,
+        Role::Button => 1,
+        Role::ListBox => 2,
+        Role::Option => 3,
+        Role::Heading => 4,
+        Role::Text => 5,
+        Role::Link => 6,
+        Role::Code => 7,
+        Role::Field => 8,
+        Role::Checkbox => 9,
+        Role::Switch => 10,
+        Role::Slider => 11,
+        Role::TabList => 12,
+        Role::Tab => 13,
+        Role::TabPanel => 14,
+        Role::Dialog => 15,
+        Role::Menu => 16,
+        Role::MenuItem => 17,
+        Role::Table => 18,
+        Role::Row => 19,
+        Role::Cell => 20,
+        Role::Separator => 21,
+    }
+}
+
+fn kind_byte(k: FieldKind) -> u8 {
+    match k {
+        FieldKind::Text => 0,
+        FieldKind::Password => 1,
+        FieldKind::Email => 2,
+        FieldKind::Search => 3,
+        FieldKind::Url => 4,
+        FieldKind::Tel => 5,
+        FieldKind::Numeric => 6,
+        FieldKind::Multiline => 7,
+    }
+}
+
+/// The tree's structure as the host reads it (`semantics/tree`): its name, then each node in
+/// reading order, a parent before its children.
+pub fn structure(name: str, nodes: [Node]) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_str(name)
+    w.write_u32(nodes.len())
+    for n in nodes {
+        w.write_u32(n.id)
+        w.write_u32(n.parent)
+        w.write_u8(role_byte(n.role))
+        var flags = 0
+        if n.pressed { flags = flags | 1 }
+        if n.selected { flags = flags | 2 }
+        if n.disabled { flags = flags | 4 }
+        if n.checked { flags = flags | 8 }
+        if n.expanded { flags = flags | 16 }
+        if n.modal { flags = flags | 32 }
+        if n.focused { flags = flags | 64 }
+        w.write_u8(u8(flags))
+        w.write_u8(u8(min(n.level, 6)))
+        for x in [n.value, n.min, n.max, n.step] { w.write_u32(bitcast_u32(x)) }
+        w.write_u32(n.controls)
+        w.write_str(n.label.as_str())
+        w.write_str(n.href.as_str())
+        match n.field {
+            Some(f) => {
+                w.write_u8(1)
+                w.write_u8(kind_byte(f.kind))
+                w.write_u8(if f.spellcheck { 1 } else { 0 })
+                for x in [f.form, f.replace, f.seen, f.start, f.end] { w.write_u32(x) }
+                w.write_str(f.name.as_str())
+                w.write_str(f.autocomplete.as_str())
+                w.write_str(f.text.as_str())
+            },
+            None => w.write_u8(0),
+        }
+    }
+    take w.into_bytes()
+}
+
+/// Where each node is now (`semantics/geometry`), clipped to `view` (x, y, width, height): a node
+/// outside it, or under something drawn over it, is sent empty, and can't be pressed.
+pub fn geometry(nodes: [Node], view: vec4) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_u32(nodes.len())
+    for n in nodes {
+        w.write_u32(n.id)
+        let r = clip(n.rect, view)
+        for x in [r.x, r.y, r.z, r.w] { w.write_u32(bitcast_u32(x)) }
+    }
+    take w.into_bytes()
+}
+
+/// `r` cut to `view`; empty if they don't overlap.
+pub fn clip(r: vec4, view: vec4) -> vec4 {
+    let x0 = max(r.x, view.x)
+    let y0 = max(r.y, view.y)
+    let x1 = min(r.x + r.z, view.x + view.z)
+    let y1 = min(r.y + r.w, view.y + view.w)
+    if x1 <= x0 || y1 <= y0 { return vec4(0.0) }
+    vec4(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// What a program last sent of its tree, so each part goes again only when it changes.
+pub struct Sent: Clone + Eq {
+    pub structure: Vec<u8> = Vec::new(),
+    pub geometry: Vec<u8> = Vec::new(),
+}
+
+/// What to send of the tree `nodes` (`semantics/tree`, then `semantics/geometry`), each only if it
+/// changed since `sent`, which it updates. A new structure brings its geometry: its new nodes need
+/// their places.
+pub fn changes(
+    sent: mut Sent,
+    name: str,
+    nodes: [Node],
+    view: vec4,
+) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+    let s = structure(name, nodes)
+    let g = geometry(nodes, view)
+    let changed = s != sent.structure
+    var tree: Option<Vec<u8>> = None
+    if changed {
+        tree = Some(s.clone())
+        sent.structure = take s
+    }
+    var places: Option<Vec<u8>> = None
+    if changed || g != sent.geometry {
+        places = Some(g.clone())
+        sent.geometry = take g
+    }
+    (tree, places)
+}
+
+/// The host's answer to `field/state`.
+pub fn read_field_state(bytes: take Vec<u8>) -> Result<FieldState, LoadError> {
+    var r = Reader::new(take bytes)
+    let node = r.read_u32()?
+    let revision = r.read_u32()?
+    let start = r.read_u32()?
+    let end = r.read_u32()?
+    let backward = r.read_u8()? != 0
+    let composing = r.read_u8()? != 0
+    let compose_start = r.read_u32()?
+    let compose_end = r.read_u32()?
+    let text = r.read_string()?
+    Ok(
+        FieldState {
+            node,
+            revision,
+            text,
+            start,
+            end,
+            backward,
+            composing,
+            compose_start,
+            compose_end,
+        },
+    )
+}
+
+/// The actions an assistive technology or the keyboard takes on a node, as a role uses them: a
+/// button's or a link's activation, an option's or a tab's selection, a slider's step, a dialog's
+/// or a menu's dismissal.
+pub fn steps(action: Assist) -> i32 {
+    match action {
+        Assist::Increment => 1,
+        Assist::Decrement => -1,
+        _ => 0,
+    }
+}
+
+@test
+fn a_tree_and_its_geometry_have_the_hosts_layout() {
+    let link = Node {
+        id: 7,
+        parent: 2,
+        role: Role::Link,
+        label: String::from("io"),
+        href: String::from("/std/io"),
+        focused: true,
+    }
+    let field = Node {
+        id: 9,
+        role: Role::Field,
+        label: String::from("Password"),
+        field: Some(
+            Field {
+                kind: FieldKind::Password,
+                autocomplete: String::from("current-password"),
+                form: 1,
+                replace: 2,
+            },
+        ),
+    }
+    let b = structure("T", [take link, take field])
+    // "T" (4 + 1), the count (4); the link: id, parent, role, flags, level, four numbers, controls.
+    assert(b.len() > 9 + 4 + 4 + 1 + 1 + 1 + 16 + 4, f"{b.len()} bytes")
+    assert(b[9] == 7 && b[13] == 2 && b[17] == 6 && b[18] == 64, f"{b[9]} {b[13]} {b[17]} {b[18]}")
+    let g = geometry(
+        [Node { id: 3, role: Role::Text, rect: vec4(10.0, -5.0, 20.0, 10.0) }],
+        vec4(0.0, 0.0, 100.0, 100.0),
+    )
+    // Clipped to the view: 10, 0, 20 by 5.
+    assert(g.len() == 4 + 4 + 16)
+    assert(
+        clip(vec4(10.0, -5.0, 20.0, 10.0), vec4(0.0, 0.0, 100.0, 100.0)) ==
+            vec4(10.0, 0.0, 20.0, 5.0),
+    )
+    assert(
+        clip(vec4(200.0, 0.0, 5.0, 5.0), vec4(0.0, 0.0, 100.0, 100.0)) == vec4(0.0),
+        "outside: empty",
+    )
+}
+
+@test
+fn only_what_changed_is_sent() {
+    var sent = Sent {}
+    let view = vec4(0.0, 0.0, 100.0, 100.0)
+    let a = [
+        Node {
+            id: 1,
+            role: Role::Button,
+            label: String::from("OK"),
+            rect: vec4(1.0, 1.0, 9.0, 9.0),
+        },
+    ]
+    let (t, g) = changes(mut sent, "T", a, view)
+    assert(t.is_some() && g.is_some(), "the first tree and its places")
+    let (t, g) = changes(mut sent, "T", a, view)
+    assert(t.is_none() && g.is_none(), "nothing changed")
+    let moved = [
+        Node {
+            id: 1,
+            role: Role::Button,
+            label: String::from("OK"),
+            rect: vec4(5.0, 1.0, 9.0, 9.0),
+        },
+    ]
+    let (t, g) = changes(mut sent, "T", moved, view)
+    assert(t.is_none() && g.is_some(), "it moved")
+    let renamed = [
+        Node {
+            id: 1,
+            role: Role::Button,
+            label: String::from("Done"),
+            rect: vec4(5.0, 1.0, 9.0, 9.0),
+        },
+    ]
+    let (t, g) = changes(mut sent, "T", renamed, view)
+    assert(t.is_some() && g.is_some(), "a new structure brings its places")
+}
+
+@test
+fn a_fields_state_reads_back() {
+    var w = Writer::new()
+    for x in [9, 4, 1, 3] { w.write_u32(x) }
+    w.write_u8(1)
+    w.write_u8(0)
+    w.write_u32(0)
+    w.write_u32(0)
+    w.write_str("héllo")
+    let state = read_field_state(take w.into_bytes())
+    let Ok(s) = state else { panic("it reads") }
+    assert(
+        s.node == 9 && s.revision == 4 && s.start == 1 && s.end == 3 && s.backward && !s.composing,
+    )
+    let text = s.text.clone()
+    assert(text.as_str() == "héllo")
+    assert(read_field_state(Vec::from([u8(1), 0])).is_err(), "a short answer")
+    assert(steps(Assist::Increment) == 1 && steps(Assist::Activate) == 0)
+}

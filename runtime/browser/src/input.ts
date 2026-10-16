@@ -54,6 +54,9 @@ export const pasteEvent = (serial: number) => encodeEvent(EventKind.Paste, 0, se
 /** An assistive technology's action (ASSIST_ACTIONS' number) on the program's node `node`. */
 export const assistEvent = (node: number, action: number) => encodeEvent(EventKind.Assist, 0, node, action, 0, 0);
 
+/** The field the host keeps for node `node` changed: its newest revision (`field/state` reads it). */
+export const fieldEvent = (node: number, revision: number) => encodeEvent(EventKind.Field, 0, node, revision, 0, 0);
+
 /** A gamepad's button (the standard mapping's number), its value (0 to 1) and whether it's
  * pressed. */
 export function padButtonEvent(pad: number, button: number, value: number, pressed: boolean): Uint8Array {
@@ -255,9 +258,15 @@ export function parseScript(text: string): Scripted[] {
         let action = 0;
         if (o.action !== undefined) {
           action = ASSIST_ACTIONS.findIndex((a) => a === o.action);
-          if (action < 0) throw at("`action` is activate, select or focus");
+          if (action < 0) throw at("`action` is activate, select, focus, increment, decrement or dismiss");
         }
         push(assistEvent(o.node as number, action));
+        break;
+      }
+      case "field": {
+        if (!whole(o.node)) throw at("`node` must be a whole number");
+        if (!whole(o.revision)) throw at("`revision` must be a whole number");
+        push(fieldEvent(o.node as number, o.revision as number));
         break;
       }
       case "padbutton": {
@@ -309,7 +318,7 @@ export function parseScript(text: string): Scripted[] {
         break;
       }
       default:
-        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)`);
+        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, field, padbutton, padpress, padaxis, message or connection)`);
     }
   });
   return out;

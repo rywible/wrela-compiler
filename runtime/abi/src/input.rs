@@ -32,6 +32,7 @@
 //! | `Assist` | the node ([`ASSIST_ACTIONS`]' target), the action | 0, 0 |
 //! | `Message` | the connection, the serial's low word | the serial's high word, the bytes' length |
 //! | `Connection` | the connection, 1 if it's open (0: closed) | its tag (below), 0 |
+//! | `Field` | the node, the field's revision | 0, 0 |
 //!
 //! ## Messages
 //!
@@ -62,9 +63,13 @@
 //! as `Text`, after the `Compose` that clears it.
 //!
 //! `Paste` says a person pasted: the program asks its host for what was pasted by the serial
-//! (a host service, `clipboard/pasted`). `Assist` is an action an assistive technology took on
-//! one of the program's accessibility nodes (a host service, `a11y/tree`): activate it, select
-//! it or focus it ([`ASSIST_ACTIONS`]), by the node's number, whatever is drawn where.
+//! (a host service, `clipboard/pasted`). `Assist` is an action an assistive technology or the
+//! keyboard took on one of the program's semantic nodes (a host service, `semantics/tree`):
+//! activate, select or focus it, step a slider's value up or down, or dismiss a dialog or a menu
+//! ([`ASSIST_ACTIONS`]), by the node's number, whatever is drawn where. `Field` says a field the
+//! host keeps for a node changed (its text, selection or composition): the program reads it by the
+//! node (`field/state`); the revision is the field's newest, and the host says so again until the
+//! program has read it.
 //!
 //! A gamepad's buttons and axes are the W3C Gamepad API's standard mapping, by number. A host
 //! sends an event when a button's value or pressed state changes, or an axis's value: a pad
@@ -147,10 +152,11 @@ pub enum EventKind {
     Assist = 12,
     Message = 13,
     Connection = 14,
+    Field = 15,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 14] = [
+    pub const ALL: [EventKind; 15] = [
         EventKind::PointerMove,
         EventKind::PointerDown,
         EventKind::PointerUp,
@@ -165,6 +171,7 @@ impl EventKind {
         EventKind::Assist,
         EventKind::Message,
         EventKind::Connection,
+        EventKind::Field,
     ];
 
     pub fn name(self) -> &'static str {
@@ -183,6 +190,7 @@ impl EventKind {
             EventKind::Assist => "Assist",
             EventKind::Message => "Message",
             EventKind::Connection => "Connection",
+            EventKind::Field => "Field",
         }
     }
 
@@ -205,7 +213,8 @@ pub const BUTTONS: [&str; 3] = ["primary", "middle", "secondary"];
 pub const COMPOSE_MAX: u32 = 64;
 
 /// What an `Assist` does to its node (word `b`), by number.
-pub const ASSIST_ACTIONS: [&str; 3] = ["activate", "select", "focus"];
+pub const ASSIST_ACTIONS: [&str; 6] =
+    ["activate", "select", "focus", "increment", "decrement", "dismiss"];
 
 /// How many gamepads a host reports: pads 0 to 3.
 pub const PADS: u32 = 4;
@@ -388,6 +397,11 @@ impl Event {
 
     pub fn assist(node: u32, action: u32) -> Event {
         Event { kind: EventKind::Assist, modifiers: 0, words: [node, action, 0, 0] }
+    }
+
+    /// The field the host keeps for `node` changed: its newest revision.
+    pub fn field(node: u32, revision: u32) -> Event {
+        Event { kind: EventKind::Field, modifiers: 0, words: [node, revision, 0, 0] }
     }
 
     pub fn pad_button(pad: u32, button: u32, value: f32, pressed: bool) -> Event {
@@ -597,9 +611,19 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                         .as_str()
                         .and_then(|a| ASSIST_ACTIONS.iter().position(|x| *x == a))
                         .map(|a| a as u32)
-                        .ok_or_else(|| at("`action` is activate, select or focus"))?,
+                        .ok_or_else(|| {
+                            at("`action` is activate, select, focus, increment, decrement or dismiss")
+                        })?,
                 };
                 push(Event::assist(node, action));
+            }
+            "field" => {
+                let node =
+                    number("node").flatten().ok_or_else(|| at("`node` must be a whole number"))?;
+                let revision = number("revision")
+                    .flatten()
+                    .ok_or_else(|| at("`revision` must be a whole number"))?;
+                push(Event::field(node, revision));
             }
             "message" | "connection" if matches!(when, At::Tick(_)) => {
                 return Err(at(
@@ -675,7 +699,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             }
             other => {
                 return Err(at(&format!(
-                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)"
+                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, field, padbutton, padpress, padaxis, message or connection)"
                 )));
             }
         }

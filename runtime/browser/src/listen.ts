@@ -46,6 +46,24 @@ export interface Listener {
   claimFind(on: boolean): void;
 }
 
+/** What a host's semantic overlay (semantics.ts) gives the listener, and takes from it. */
+export interface Overlay {
+  contains(e: Element | null): boolean;
+  /** Moves the keys into the overlay; false if nothing there takes them. */
+  enter(): boolean;
+  /** Gives the keys to the field drawn at page point (x, y), if one is; whether one is. */
+  focusAt(x: number, y: number): boolean;
+  connect(forward: Forward): void;
+}
+
+/** What the overlay hands on to the program as if it happened over the canvas: the wheel and the
+ * pointer's moves over a link, and the keys a field doesn't use. */
+export interface Forward {
+  wheel(e: WheelEvent): void;
+  move(e: PointerEvent): void;
+  key(e: KeyboardEvent, down: boolean): void;
+}
+
 /** Whether `e` is one of the browser's find keys. */
 export const isFindKey = (e: KeyboardEvent): boolean =>
   e.code === "F3" || ((e.ctrlKey || e.metaKey) && (e.code === "KeyF" || e.code === "KeyG"));
@@ -72,15 +90,16 @@ const EDITING = new Set([
  *   composition's changes as Compose groups, and committed text as a group that clears the
  *   composing first; editing keys (Enter, Backspace, the arrows) are KeyDowns the field doesn't
  *   act on, and keys an input method is using aren't sent at all;
- * - **the overlay** (`overlay`, the accessibility tree, assist.ts): its own elements take the keys
- *   and none reach the program. F6 from the canvas enters it, letting go of held keys first.
+ * - **the overlay** (`overlay`, the semantic tree, semantics.ts): its own elements take the keys,
+ *   and only those a field doesn't use reach the program (`Forward`). F6 from the canvas enters it,
+ *   letting go of held keys first; a press on a field's drawn rectangle gives that field the keys.
  */
 export function listen(
   canvas: HTMLCanvasElement,
   ring: InputRing,
   now: () => number,
   size: () => { width: number; height: number },
-  overlay: { contains(e: Element | null): boolean; enter(): boolean } | null = null,
+  overlay: Overlay | null = null,
 ): Listener {
   const at = (e: MouseEvent) => {
     const r = canvas.getBoundingClientRect();
@@ -178,13 +197,14 @@ export function listen(
   window.addEventListener("copy", copy);
   window.addEventListener("cut", copy);
 
-  canvas.addEventListener("pointermove", (e) => {
+  const move = (e: PointerEvent) => {
     // Coalesced moves arrive as one: the program needs where the pointer is, not each step.
     const [x, y] = at(e);
     const pointer = pointers.get(e.pointerId);
     if (pointer) Object.assign(pointer, { x, y });
     put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
-  });
+  };
+  canvas.addEventListener("pointermove", move);
   canvas.addEventListener("pointerdown", (e) => {
     canvas.setPointerCapture(e.pointerId);
     const [x, y] = at(e);
@@ -195,8 +215,9 @@ export function listen(
     pointers.set(e.pointerId, pointer);
     put(pointerEvent(EventKind.PointerDown, x, y, button, modifiersOf(e)));
     e.preventDefault();
-    // A press on the canvas gives it the keys back from the overlay; text mode keeps its field.
-    if (!texting()) canvas.focus({ preventScroll: true });
+    // A press on the canvas gives it the keys back from the overlay, or to the field drawn there;
+    // text mode keeps its field.
+    if (!texting() && !overlay?.focusAt(e.clientX, e.clientY)) canvas.focus({ preventScroll: true });
   });
   canvas.addEventListener("pointerup", (e) => {
     const [x, y] = at(e);
@@ -209,17 +230,14 @@ export function listen(
   canvas.addEventListener("pointercancel", (e) => releasePointer(e.pointerId));
   canvas.addEventListener("lostpointercapture", (e) => releasePointer(e.pointerId));
   canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-  canvas.addEventListener(
-    "wheel",
-    (e) => {
-      const [x, y] = at(e);
-      // Lines and pages become pixels: a line is 16 px, a page the canvas's height.
-      const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? size().height : 1;
-      put(wheelEvent(x, y, e.deltaX * k, e.deltaY * k, modifiersOf(e)));
-      e.preventDefault();
-    },
-    { passive: false },
-  );
+  const wheel = (e: WheelEvent) => {
+    const [x, y] = at(e);
+    // Lines and pages become pixels: a line is 16 px, a page the canvas's height.
+    const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? size().height : 1;
+    put(wheelEvent(x, y, e.deltaX * k, e.deltaY * k, modifiersOf(e)));
+    e.preventDefault();
+  };
+  canvas.addEventListener("wheel", wheel, { passive: false });
   let findClaimed = false;
   window.addEventListener("keydown", (e) => {
     if (inOverlay()) return;
@@ -258,6 +276,16 @@ export function listen(
     put(keyEvent(false, key, false, modifiersOf(e)));
   });
   window.addEventListener("blur", release);
+  overlay?.connect({
+    wheel,
+    move,
+    key(e, down) {
+      const key = keyCode(e.code);
+      if (down) keys.add(key);
+      else keys.delete(key);
+      put(keyEvent(down, key, down && e.repeat, modifiersOf(e)));
+    },
+  });
 
   return {
     release,
