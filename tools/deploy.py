@@ -10,7 +10,9 @@ the archive: each kept release's files are fetched from the Worker that serves t
 against the SHA-256 its `files.json` lists, and uploaded again with the new release. A file that
 doesn't arrive, or doesn't match, stops the deploy, and so does a Worker over the file limits:
 nothing is dropped to make room. With `--require-main-head`, a deploy whose commit is no longer
-the head of `main` stops before it changes anything. The games deploy first and then the console,
+the head of `main` stops before it changes anything. The docs are the one exception to keeping:
+nothing pins their releases, and they deploy last, so a kept release the docs Worker doesn't serve
+(it answers 404, or its host doesn't exist yet) never went live there, and no reader holds it. The games deploy first and then the console,
 so a console never offers a game release its Worker doesn't serve yet; the docs, which no other
 Worker depends on, go last, so a failure there leaves the console and games up to date. Each Worker
 must serve the new release before the deploy passes.
@@ -22,6 +24,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import re
+import socket
 import subprocess
 import sys
 import time
@@ -84,6 +87,22 @@ def next_history(deploys, release, source, workers, now):
 
 def parse(stamp):
     return datetime.fromisoformat(stamp)
+
+
+def served(release, domain, get=fetch):
+    """Whether the Worker at `domain` serves `release`: false if it answers 404 for its listing, or
+    its host doesn't exist; any other failure is raised."""
+    try:
+        get(f"https://{domain}/releases/{release}/files.json")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+        raise
+    except urllib.error.URLError as e:
+        if isinstance(e.reason, socket.gaierror):
+            return False
+        raise
+    return True
 
 
 def restore(release, domain, target, get=fetch):
@@ -152,8 +171,12 @@ def deploy(output, require_main_head=False, dry_run=False, get=fetch, now=None,
     for d in kept(deploys, now, release):
         for w in workers:
             # A Worker the kept release didn't have (a game added since) has nothing to keep.
-            if w["worker"] in d["workers"]:
-                restore(d["release"], w["domain"], output / w["worker"], get)
+            if w["worker"] not in d["workers"]:
+                continue
+            if w.get("docs") and not served(d["release"], w["domain"], get):
+                print(f"{w['worker']} never served {d['release']}: nothing to keep", flush=True)
+                continue
+            restore(d["release"], w["domain"], output / w["worker"], get)
     for w in workers:
         files = console.release_files(output / w["worker"])
         print(f"{w['worker']} ({w['domain']}): {len(files)} files", flush=True)

@@ -117,6 +117,7 @@ class ChromeDiscovery(unittest.TestCase):
         self.assertEqual(headless.chrome_binary({}, 'linux', lambda name: None), 'google-chrome-stable')
         self.assertTrue(headless.chrome_binary({}, 'darwin', found).startswith('/Applications/'))
         self.assertIn('--use-angle=vulkan', headless.platform_args('linux'))
+        self.assertIn('--password-store=basic', headless.platform_args('linux'))
         self.assertEqual(headless.platform_args('darwin'), [])
 
 

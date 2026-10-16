@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 from pathlib import Path
+import socket
 import sys
 import tempfile
 import unittest
@@ -122,6 +123,41 @@ class Deploy(unittest.TestCase):
             (game / "game.wasm").write_bytes(b"different")
             with self.assertRaisesRegex(ValueError, "immutable"):
                 deploy.deploy(output, dry_run=True, get=live_site().get, now=NOW)
+
+    def test_a_kept_release_the_docs_never_served_is_skipped_but_a_game_s_is_not(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = built(Path(temporary))
+            report = json.loads((output / "release.json").read_text())
+            report["workers"].append({"worker": "docs-host", "domain": "docs.example", "console": False, "docs": True})
+            (output / "release.json").write_text(json.dumps(report))
+            (output / "docs-host" / "releases" / D).mkdir(parents=True)
+            site = live_site()
+            site.deploys = [dict(d, workers=[*WORKERS, "docs-host"]) for d in HISTORY]
+            # B never reached the docs (404); C's docs host didn't exist (no such host).
+            original = site.get
+
+            def get(url):
+                if url.startswith("https://docs.example/releases/" + C):
+                    raise urllib.error.URLError(socket.gaierror(-2, "Name or service not known"))
+                return original(url)
+
+            deploy.deploy(output, dry_run=True, get=get, now=NOW)
+            self.assertFalse((output / "docs-host" / "releases" / B).exists())
+            self.assertTrue((output / "game-host" / "releases" / B / "session/game.wasm").exists())
+            # A game's missing release still stops the deploy, and so does a docs failure that
+            # isn't a release it never served.
+            del site.files[f"https://game.example/releases/{B}/files.json"]
+            with self.assertRaises(urllib.error.HTTPError):
+                deploy.deploy(output, dry_run=True, get=get, now=NOW)
+
+            def broken(url):
+                if url.startswith("https://docs.example/"):
+                    raise urllib.error.HTTPError(url, 503, "Unavailable", {}, None)
+                return original(url)
+
+            site.serve("game.example", B, {"session/game.wasm": B.encode(), "session/files/floor/t1_-1.bin": b"tile"})
+            with self.assertRaises(urllib.error.HTTPError):
+                deploy.deploy(output, dry_run=True, get=broken, now=NOW)
 
     def test_a_worker_over_its_file_limit_fails_rather_than_drops_a_release(self):
         with tempfile.TemporaryDirectory() as temporary:

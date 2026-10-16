@@ -65,10 +65,12 @@ def chrome_binary(environ=os.environ, platform=sys.platform, which=shutil.which)
 
 def platform_args(platform=sys.platform):
     """Linux Chrome keeps WebGPU behind flags, and without Vulkan through ANGLE it offers only
-    its software adapter, which the runtime refuses."""
+    its software adapter, which the runtime refuses. It also reads cookies only after the
+    system keyring answers, which can take 25 s; a test profile is thrown away and needs no
+    keyring."""
     if platform.startswith("linux"):
         return ["--enable-unsafe-webgpu", "--enable-features=Vulkan", "--use-angle=vulkan",
-                "--ignore-gpu-blocklist"]
+                "--ignore-gpu-blocklist", "--password-store=basic"]
     return []
 
 
