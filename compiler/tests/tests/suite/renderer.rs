@@ -384,6 +384,33 @@ fn temporal_depth_rejects_occluded_history_and_keeps_matching_surfaces() {
     );
 }
 
+/// At the output's size, a resolve that gathers its nearest sample's neighbourhood itself gives
+/// what one reading the shared neighbourhoods gives: the same samples, held in 32 bits rather than
+/// stored in half floats, so within a step of 8 bits. The history is clipped (it's a blue the
+/// scene doesn't hold), so the clip reads the neighbourhoods too.
+#[test]
+#[ignore = "needs a GPU"]
+fn temporal_resolve_gathering_its_neighbourhood_matches_the_shared_one() {
+    let (dir, _) = page("compiler/tests/temporal-gathered", "temporal-gathered");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 48, 24).expect("run");
+    let px = |x: usize, y: usize| -> &[u8] { &run.frame[4 * (y * 48 + x)..4 * (y * 48 + x) + 3] };
+    let mut clipped = 0;
+    for y in 0..24 {
+        for x in 0..24 {
+            let (shared, gathered) = (px(x, y), px(x + 24, y));
+            assert!(
+                shared.iter().zip(gathered).all(|(a, b)| a.abs_diff(*b) <= 1),
+                "({x}, {y}): shared {shared:?}, gathered {gathered:?}"
+            );
+            // The history's blue, 204 in 8 bits: clipped toward the scene wherever it differs.
+            if shared[2] < 190 {
+                clipped += 1;
+            }
+        }
+    }
+    assert!(clipped > 24 * 24 / 2, "the history wasn't clipped: {clipped} pixels");
+}
+
 /// Leaves and a solid silhouette against sky are partial coverage. Their stored depth can
 /// change with jitter without the history becoming invalid. Keep that history and the
 /// spatial background contribution, while the opaque rows above retain depth rejection.

@@ -1,0 +1,85 @@
+// A scene at its output's size resolved both ways: through the shared neighbourhoods
+// (`neighbourhoods`, `resolve`; left) and gathering its own (`resolve_gathered`; right). The
+// scene varies a pixel at a time in colour and class (thin geometry, sky and ground), and its
+// history is a blue that the neighbourhoods clip, so both the reconstruction and the clip read
+// them.
+use engine::floor::fullscreen
+use engine::plant::full
+use engine::temporal::{Resolve, neighbourhoods, resolve, resolve_gathered}
+use engine::view::first_camera
+use std::gpu::{
+    Compare, Depth, FragCoord, Rgba16Float, Texture, WithDepth, begin_pass, begin_pass_with_depth,
+    begin_screen_pass, depth_texture, dispatch, draw, sampler, texture, writable_texture,
+}
+
+const SIDE: u32 = 24
+
+@fragment
+fn surface(p: FragCoord) -> WithDepth<vec4> {
+    let at = vec2u(p.position.xy)
+    let h = (at.x * 7 + at.y * 13 + at.x * at.y * 5) % 17
+    let colour = vec3(f32(h) / 16.0, f32((h * 5) % 17) / 16.0, f32((h * 11) % 17) / 16.0) * 1.5
+    // Ground, grass, leaves and sky, in patches, so some neighbourhoods are thin and some are
+    // against the sky.
+    let tag = f32(((at.x / 3 + at.y / 5) % 4) * 64)
+    WithDepth { color: vec4(colour, tag), depth: 0.3 + 0.02 * f32(at.y % 4) }
+}
+
+@fragment
+fn show(p: FragCoord, shared: Texture<Rgba16Float>, gathered: Texture<Rgba16Float>) -> vec4 {
+    let at = vec2u(p.position.xy)
+    let c = if at.x < SIDE { shared.load(at.x, at.y) } else { gathered.load(at.x - SIDE, at.y) }
+    vec4(c.rgb, 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var scene = texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    var depth = depth_texture(width: SIDE, height: SIDE)
+    let p = begin_pass_with_depth(mut scene, mut depth)
+    draw(
+        p,
+        full.bind(z: 0.5),
+        surface,
+        vertices: 3,
+        depth: Depth { compare: Compare::Always, write: true },
+    )
+    p.end()
+    var motion = texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    let p = begin_pass(mut motion, clear: vec4(0.0))
+    p.end()
+    var history = texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    let p = begin_pass(mut history, clear: vec4(0.05, 0.05, 0.8, 64.0))
+    p.end()
+    var means = writable_texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    var spreads = writable_texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    dispatch(neighbourhoods.bind(scene, mut means, mut spreads), over: scene)
+    let cam = first_camera(
+        vec3(0.0),
+        vec3(0.0, 0.0, -1.0),
+        1.0,
+        width: SIDE,
+        height: SIDE,
+    ).unjittered()
+    let r = Resolve {
+        cam,
+        out: vec2(f32(SIDE)),
+        blend: 0.12,
+        fresh: 0,
+        jitter: vec2(0.0),
+        last_jitter: vec2(0.0),
+        moving: vec4(0.0),
+        settled: 0.0,
+    }
+    let s = sampler()
+    var shared = texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    var gathered = texture::<Rgba16Float>(width: SIDE, height: SIDE)
+    let p = begin_pass(mut shared)
+    fullscreen(p, resolve.bind(r, scene, depth, depth, motion, motion, history, means, spreads, s))
+    p.end()
+    let p = begin_pass(mut gathered)
+    fullscreen(p, resolve_gathered.bind(r, scene, depth, depth, motion, motion, history, s))
+    p.end()
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(screen, show.bind(shared, gathered))
+    screen.present()
+}
