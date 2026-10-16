@@ -796,9 +796,10 @@ A game already has a suspension point, the tick or the frame, so the language do
 - The command buffer bounds a request. Reading an answer has the same `nondet` effect as the other requests.
 - Examples are an embedded application's message channel and a file that the user selects. These mechanisms are not specific to games.
 
-**Input** (`std::input`) is the pointer and the keyboard. `events()` gives the events that the host has queued since the program last read them, oldest first:
+**Input** (`std::input`) is the pointer, the keyboard and up to four gamepads. `events()` gives the events that the host has queued since the program last read them, oldest first:
 - The pointer moves, a button goes down or up, or the wheel turns.
 - A key goes down or up (a physical key, `Key::A`), or types text (`Event::Text`, a Unicode scalar value).
+- A gamepad's button moves (`Event::PadButton`) or its stick moves (`Event::PadAxis`), named by where it is on the pad (`PadButton::South`, the W3C standard mapping), for pads 0 to 3.
 - `Event::Compose` is one character of the text an input method is composing. Each time that text changes, all of it comes again, one event a character. A `Composer` puts each change together, and ignores a change that a reader fell behind on and saw only part of. Committed text comes as `Text`.
 - `Event::Paste` is a paste. It carries a serial, and the program asks its host for the pasted data by that serial.
 - `Event::Assist` is what a person or an assistive technology does to a node of the program's semantic tree (`std::semantics`), by the node's number.
@@ -2358,6 +2359,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela query <package> <query>...` | Answers a batch of queries with one check (below) |
 | `wrela context <item> [<package>] --budget n` | Gives the item's source, the types it names, what it calls, where it is called and its impls, in about `n` tokens. On a program with errors, it says at the end what the errors keep from being known |
 | `wrela refactor <package> <change>` | Makes a change across the package: `rename`, `move`, `add-param` or `change-mode` (below) |
+| `wrela fix <package-dir> [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.16) |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§20, Hot reload): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames and prints what the exports say after each frame (`--csv`) |
