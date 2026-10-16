@@ -198,7 +198,7 @@ cover = "cover.png"
             self.assertIn('<noscript>', page)
             self.assertIn('<meta name="wrela-storage" content="docs">', page)
             docs = next(w for w in report["workers"] if w["worker"] == "docs-host")
-            self.assertEqual((docs["domain"], docs["console"]), ("docs.example", False))
+            self.assertEqual((docs["domain"], docs["console"], docs["docs"]), ("docs.example", False, True))
             wrangler = json.loads((output / "docs-host.wrangler.json").read_text())
             self.assertEqual(wrangler["routes"], [{"pattern": "docs.example", "custom_domain": True}])
 

@@ -139,10 +139,15 @@ class Deploy(unittest.TestCase):
                               run=lambda *a, **k: ran.append(a))
             self.assertEqual(ran, [])
 
-    def test_the_games_deploy_before_the_console_and_each_serves_the_release(self):
+    def test_the_games_deploy_before_the_console_the_docs_after_and_each_serves_the_release(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = built(Path(temporary))
-            for worker in WORKERS:
+            # The docs, listed first, still go last: a failure there leaves the console live.
+            report = json.loads((output / "release.json").read_text())
+            report["workers"].insert(0, {"worker": "docs-host", "domain": "docs.example", "console": False, "docs": True})
+            (output / "release.json").write_text(json.dumps(report))
+            (output / "docs-host" / "releases" / D).mkdir(parents=True)
+            for worker in [*WORKERS, "docs-host"]:
                 listing = output / worker / "releases" / D / "files.json"
                 listing.write_text(json.dumps(console.file_list(listing.parent)))
             site = live_site()
@@ -151,7 +156,7 @@ class Deploy(unittest.TestCase):
             def wrangler(command, **_):
                 # What `wrangler deploy` makes live: the Worker's release, and the console's history.
                 worker = Path(command[-1]).name.removesuffix(".wrangler.json")
-                domain = {"console-host": "console.example", "game-host": "game.example"}[worker]
+                domain = {"console-host": "console.example", "game-host": "game.example", "docs-host": "docs.example"}[worker]
                 listing = output / worker / "releases" / D / "files.json"
                 site.files[f"https://{domain}/releases/{D}/files.json"] = listing.read_bytes()
                 if worker == "console-host":
@@ -160,7 +165,7 @@ class Deploy(unittest.TestCase):
 
             with patch.object(deploy, "main_head", return_value="head"):
                 deploy.deploy(output, require_main_head=True, get=site.get, now=NOW, run=wrangler)
-            self.assertEqual(ran, ["game-host", "console-host"])
+            self.assertEqual(ran, ["game-host", "console-host", "docs-host"])
 
     def test_a_worker_that_does_not_serve_the_release_fails_the_deploy(self):
         with tempfile.TemporaryDirectory() as temporary:

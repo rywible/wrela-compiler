@@ -377,7 +377,7 @@ def package(config, output):
     for project in projects:
         files = release_files(output / project["worker"])
         reports.append({"worker": project["worker"], "domain": project["domain"],
-                        "console": project is console, "files": len(files),
+                        "console": project is console, "docs": project is docs, "files": len(files),
                         "bytes": sum(p.stat().st_size for p in files)})
     report = {"source": commit, "release": release, "workers": reports}
     (output / "release.json").write_text(json.dumps(report, indent=2) + "\n")

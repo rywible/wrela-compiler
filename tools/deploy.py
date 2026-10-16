@@ -10,9 +10,10 @@ the archive: each kept release's files are fetched from the Worker that serves t
 against the SHA-256 its `files.json` lists, and uploaded again with the new release. A file that
 doesn't arrive, or doesn't match, stops the deploy, and so does a Worker over the file limits:
 nothing is dropped to make room. With `--require-main-head`, a deploy whose commit is no longer
-the head of `main` stops before it changes anything. The games deploy first and the console last,
-so a console never offers a game release its Worker doesn't serve yet; then each Worker must serve
-the new release before the deploy passes.
+the head of `main` stops before it changes anything. The games deploy first and then the console,
+so a console never offers a game release its Worker doesn't serve yet; the docs, which no other
+Worker depends on, go last, so a failure there leaves the console and games up to date. Each Worker
+must serve the new release before the deploy passes.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -163,8 +164,8 @@ def deploy(output, require_main_head=False, dry_run=False, get=fetch, now=None,
         raise ValueError(f"{report['source']} is no longer the head of main; a newer push deploys")
     if dry_run:
         return after
-    # The games first: the console that pins their releases goes live last.
-    for w in sorted(workers, key=lambda w: w["console"]):
+    # The games first, then the console that pins their releases, then the docs.
+    for w in sorted(workers, key=lambda w: 2 if w.get("docs") else 1 if w["console"] else 0):
         run([*WRANGLER, "deploy", "--config", str(output / f"{w['worker']}.wrangler.json")],
             cwd=output, check=True)
     verify(output, get)
