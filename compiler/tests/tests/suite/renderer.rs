@@ -707,6 +707,28 @@ fn character_materials_reflect_by_view_roughness_and_metallicity() {
 }
 
 /// A moving sampling grid must not borrow an occluder's colour or detach from its depth.
+/// The reflection's march reads every third step's texel and, where that lands behind a surface,
+/// tests the two before it first. Over walls thick enough that no surface lies between its reads,
+/// it meets each where one step at a time met it: the same step, distance and pixel, for walls
+/// met at every step of the march.
+#[test]
+#[ignore = "needs a GPU"]
+fn water_reflections_marched_in_threes_meet_what_single_steps_meet() {
+    let (dir, _) = page("compiler/tests/water-steps", "water-steps");
+    let frame = Host::load(&dir).expect("load").run_frames(&[0.0], 192, 32).expect("run").frame;
+    let mut steps = std::collections::BTreeSet::new();
+    for y in 0..32 {
+        for x in 0..96 {
+            let (i, j) = (4 * (y * 192 + x), 4 * (y * 192 + x + 96));
+            assert_eq!(frame[i..i + 4], frame[j..j + 4], "({x}, {y}): threes against single steps");
+            if frame[i + 3] > 0 {
+                steps.insert(frame[i]);
+            }
+        }
+    }
+    assert!(steps.len() >= 15, "walls met at too few of the march's steps: {steps:?}");
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn water_reflections_follow_raster_jitter_without_foreground_colour_leaks() {

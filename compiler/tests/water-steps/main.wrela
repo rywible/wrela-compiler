@@ -1,0 +1,80 @@
+// The water's reflection marched in threes (`reflection_march`; left) and one step at a time
+// (`single`, the march as it was; right), where each meets a surface: its step's distance and
+// length and the surface's distance, over walls thick enough that no surface is thin
+// between the threes' reads: each column a wall at its own distance, from 0.3 m to 120 m, so the
+// rays meet them at every one of the march's steps, and each row a ray tilted a little more.
+use engine::floor::fullscreen
+use engine::view::{Camera, first_camera}
+use engine::water::{Met, reflection_march}
+use std::gpu::{FragCoord, Rgba16Float, Texture, begin_pass, begin_screen_pass, texture}
+
+const W: u32 = 96
+const H: u32 = 32
+
+/// Each column's wall: its distance (m) in alpha, its colour the column's.
+@fragment
+fn walls(p: FragCoord) -> vec4 {
+    let column = floor(p.position.x)
+    let d = 0.3 * pow(400.0, column / f32(W - 1))
+    vec4(column / f32(W), 1.0 - column / f32(W), 0.5, d)
+}
+
+/// The march as it was, one step at a time, for the threes to agree with.
+fn single(cam: Camera, below: Texture<Rgba16Float>, world: vec3, r: vec3) -> Met {
+    var len = 0.4
+    var at = world
+    let none = Met { hit: false, px: vec2(0.0), seen: 0.0, d: 0.0, len: 0.0 }
+    for _ in 0..24 {
+        at += r * len
+        if at.y < world.y {
+            return none
+        }
+        let px = cam.pixel(at) + cam.jitter * cam.screen * vec2(0.5, -0.5)
+        if px.x < 0.0 || px.y < 0.0 || px.x >= cam.screen.x || px.y >= cam.screen.y {
+            return none
+        }
+        let seen = below.load(x: u32(px.x), y: u32(px.y)).a
+        let d = dot(at - cam.eye, cam.forward)
+        if d <= cam.near {
+            return none
+        }
+        if seen < d && d - seen < len * 1.5 + 0.2 {
+            return Met { hit: true, px, seen, d, len }
+        }
+        len *= 1.18
+    }
+    none
+}
+
+/// A hit as 8-bit colours: none black; else its step's length (which step it was), its
+/// distance and where on the screen, each far enough from the next step's to differ.
+fn shown(m: Met) -> vec4 {
+    if !m.hit {
+        return vec4(0.0)
+    }
+    vec4(m.len / 30.0, m.d / 150.0, m.px.x / f32(W), 1.0)
+}
+
+@fragment
+fn report(p: FragCoord, cam: Camera, below: Texture<Rgba16Float>) -> vec4 {
+    let x = p.position.x % f32(W)
+    // From the water under the eye, toward the wall at this column, rising more each row.
+    let world = vec3(0.0, cam.eye.y - 1.0, 3.0)
+    let target = cam.eye + cam.unjittered().ray(vec2(x, f32(H) * 0.5)) * 50.0
+    let flat = normalize(vec3(target.x - world.x, 0.0, target.z - world.z))
+    let r = normalize(flat + vec3(0.0, 0.02 + 0.01 * floor(p.position.y), 0.0))
+    if p.position.x < f32(W) { shown(reflection_march(cam, below, world, r)) } else {
+        shown(single(cam, below, world, r))
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let cam = first_camera(vec3(0.0, 1.0, 0.0), vec3(0.0, 1.0, 1.0), 1.4, width: W, height: H)
+    var below = texture::<Rgba16Float>(width: W, height: H)
+    let p = begin_pass(mut below)
+    fullscreen(p, walls.bind())
+    p.end()
+    let p = begin_screen_pass(clear: vec4(0.0))
+    fullscreen(p, report.bind(cam, below))
+    p.present()
+}
