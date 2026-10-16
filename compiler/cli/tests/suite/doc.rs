@@ -109,3 +109,136 @@ fn a_dependency_is_read() {
     let (ok, listing, _) = doc(&["kit::shapes", d]);
     assert!(ok && items(&listing) == ["Size"], "{listing}");
 }
+
+/// A package for the export's tests: a struct with a method and a function, each documented.
+fn shapes(name: &str) -> std::path::PathBuf {
+    common::package(
+        name,
+        &[
+            ("fixture/wrela.toml", &common::manifest("fixture")),
+            (
+                "fixture/shapes.wrela",
+                "// Shapes: a fixture for the export.\n\n/// A disc.\npub struct Disc {\n    pub r: f32,\n}\n\nimpl Disc {\n    /// Its area.\n    pub fn area(self) -> f32 {\n        3.0 * self.r * self.r\n    }\n}\n\n/// A disc of radius one.\npub fn unit() -> Disc {\n    Disc { r: 1.0 }\n}\n",
+            ),
+        ],
+    )
+}
+
+/// Exports `fixture` from `root` (so its files are named from there) into `root/out`.
+fn export(root: &std::path::Path, out: &str, extra: &[&str]) -> std::process::Output {
+    common::wrela()
+        .current_dir(root)
+        .args(["doc", "--export", out, "fixture"])
+        .args(extra)
+        .output()
+        .expect("run wrela")
+}
+
+/// Every file under `dir`, by its path there, with its bytes.
+fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read the export") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let name = path.strip_prefix(dir).expect("inside").to_string_lossy().into_owned();
+                out.insert(name, std::fs::read(&path).expect("read"));
+            }
+        }
+    }
+    out
+}
+
+/// The export writes a page per module, an index of every item and every section of the spec,
+/// and a map of the pages: each item with its page, its anchor there and its source, and the
+/// spec's prose searchable by its words.
+#[test]
+fn the_export_writes_pages_an_index_and_a_map() {
+    let root = shapes("doc-export");
+    let out = export(&root, "out", &["--commit", "abcdef1"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let page =
+        std::fs::read_to_string(root.join("out/fixture/shapes.md")).expect("the module's page");
+    assert!(page.starts_with("# fixture::shapes\n\nShapes: a fixture for the export.\n"), "{page}");
+    for part in
+        ["## Disc\n", "### Disc::area\n", "Its area.", "`fixture/shapes.wrela:10`", "## unit\n"]
+    {
+        assert!(page.contains(part), "{part:?} isn't on the page:\n{page}");
+    }
+    let index: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("out/index.json")).expect("index.json"))
+            .expect("JSON");
+    assert_eq!(index["commit"], "abcdef1");
+    let area = index["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["path"] == "fixture::shapes::Disc::area");
+    let area = area.expect("the method is indexed");
+    assert_eq!(
+        (&area["page"], &area["anchor"], &area["source"], &area["line"], &area["kind"]),
+        (
+            &"fixture/shapes.md".into(),
+            &"disc-area".into(),
+            &"fixture/shapes.wrela".into(),
+            &10.into(),
+            &"method".into()
+        )
+    );
+    // std is there too, and the spec's prose is found by words only it has.
+    assert!(index["items"].as_array().unwrap().iter().any(|i| i["path"] == "std::arena::Arena"));
+    let sections = index["sections"].as_array().expect("sections");
+    let found = sections
+        .iter()
+        .find(|s| s["text"].as_str().is_some_and(|t| t.contains("garbage collector")));
+    let found = found.expect("a section of the spec mentions the garbage collector");
+    let page = found["page"].as_str().unwrap();
+    assert!(page.starts_with("spec/") && root.join("out").join(page).is_file(), "{found}");
+    let llms = std::fs::read_to_string(root.join("out/llms.txt")).expect("llms.txt");
+    assert!(
+        llms.contains(
+            "- [fixture::shapes](fixture/shapes.md): Shapes: a fixture for the export.\n"
+        ),
+        "{llms}"
+    );
+    assert!(llms.contains("commit abcdef1"), "{llms}");
+    let full = std::fs::read_to_string(root.join("out/llms-full.txt")).expect("llms-full.txt");
+    assert!(full.contains("<!-- fixture/shapes.md -->") && full.contains("### Disc::area"));
+}
+
+/// The same input gives the same bytes; an export never writes over another, and a commit is
+/// a commit's name.
+#[test]
+fn the_export_is_the_same_each_time_and_writes_only_into_a_new_directory() {
+    let root = shapes("doc-export-again");
+    assert!(export(&root, "a", &[]).status.success());
+    assert!(export(&root, "b", &[]).status.success());
+    let (a, b) = (files(&root.join("a")), files(&root.join("b")));
+    assert!(a.len() > 30, "{} files", a.len());
+    assert!(a == b, "two exports of the same sources differ");
+    let again = export(&root, "a", &[]);
+    assert!(
+        !again.status.success() && String::from_utf8_lossy(&again.stderr).contains("isn't empty")
+    );
+    let bad = export(&root, "c", &["--commit", "main; rm"]);
+    assert!(!bad.status.success() && !root.join("c").exists());
+}
+
+/// A lookup reads the package as it is now, not an export: an edited doc comment shows at once.
+#[test]
+fn a_lookup_reads_the_package_as_it_is_now() {
+    let root = shapes("doc-fresh");
+    let dir = root.join("fixture");
+    let d = dir.to_str().unwrap();
+    let (ok, page, _) = doc(&["Disc::area", d]);
+    assert!(ok && page.contains("Its area."), "{page}");
+    let file = dir.join("shapes.wrela");
+    let text =
+        std::fs::read_to_string(&file).unwrap().replace("Its area.", "How much room it covers.");
+    std::fs::write(&file, text).unwrap();
+    let (ok, page, _) = doc(&["Disc::area", d]);
+    assert!(ok && page.contains("How much room it covers."), "{page}");
+}

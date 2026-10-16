@@ -13,29 +13,33 @@ use wrela_diag::{FileId, Span};
 use wrela_syntax::ast::{self, ImplMemberKind, ItemKind, TraitMemberKind};
 
 /// One documented item.
-struct Entry {
+pub(crate) struct Entry {
     /// Its module's path, then its name (then a method's name).
-    path: Vec<String>,
+    pub(crate) path: Vec<String>,
     /// `fn`, `struct`, `enum`, `trait`, `const`, `type` or `method`.
-    kind: &'static str,
-    signature: String,
-    doc: String,
-    /// `file:line` of its declaration.
+    pub(crate) kind: &'static str,
+    pub(crate) signature: String,
+    pub(crate) doc: String,
+    /// `file:line` of its declaration, as a diagnostic names the file.
     at: String,
+    /// Its declaration's file in the repository (`compiler/std/io.wrela`) and line.
+    pub(crate) source: String,
+    pub(crate) line: usize,
     /// For a type or a trait: its methods' paths, and the traits it implements.
-    methods: Vec<usize>,
-    implements: Vec<String>,
+    pub(crate) methods: Vec<usize>,
+    pub(crate) implements: Vec<String>,
 }
 
-/// A module: its path, its file's first comment line, and its items.
-struct Module {
-    path: Vec<String>,
-    summary: String,
+/// A module: its path, its file's first comment line, and the whole comment its file opens with.
+pub(crate) struct Module {
+    pub(crate) path: Vec<String>,
+    pub(crate) summary: String,
+    pub(crate) intro: String,
 }
 
-struct Index {
-    entries: Vec<Entry>,
-    modules: Vec<Module>,
+pub(crate) struct Index {
+    pub(crate) entries: Vec<Entry>,
+    pub(crate) modules: Vec<Module>,
 }
 
 pub fn run(args: &[String]) -> ExitCode {
@@ -144,7 +148,7 @@ fn q_owned(q: &[&str]) -> Vec<String> {
     q.iter().map(|s| s.to_string()).collect()
 }
 
-fn first_line(doc: &str) -> &str {
+pub(crate) fn first_line(doc: &str) -> &str {
     doc.lines().next().unwrap_or("")
 }
 
@@ -170,58 +174,102 @@ fn print_entry(index: &Index, i: usize) {
     }
 }
 
-/// A parsed file: its module path, display name, text, items and doc comments.
+/// A parsed file: its module path, display name, file in the repository, text, items and doc
+/// comments.
 struct Source {
     module: Vec<String>,
     name: String,
+    file: String,
     text: String,
     parsed: wrela_syntax::Parsed,
 }
 
-fn build_index(dir: Option<&Path>) -> Result<Index, String> {
+/// A file to index: its module path, display name, file in the repository and text.
+pub(crate) type SourceFile = (Vec<String>, String, String, String);
+
+/// std's files, as the compiler holds them.
+pub(crate) fn std_sources() -> Vec<SourceFile> {
+    wrela_driver::STD_SOURCES
+        .iter()
+        .map(|(name, text)| {
+            let module: Vec<String> = name.split("::").map(String::from).collect();
+            let display = format!("std/{}.wrela", module[1]);
+            let file = format!("compiler/std/{}.wrela", module[1]);
+            (module, display, file, text.to_string())
+        })
+        .collect()
+}
+
+/// The files of the package at `dir`, each module under `prefix` (`engine::creature`) if one is
+/// given, and named as `[prefix] file` then.
+pub(crate) fn package_sources(dir: &Path, prefix: Option<&str>) -> Result<Vec<SourceFile>, String> {
+    let files = wrela_driver::package::find_files(dir).map_err(|errs| {
+        errs.iter().map(|e| format!("{}: {}", e.path, e.message)).collect::<Vec<_>>().join("; ")
+    })?;
     let mut sources = Vec::new();
-    for (name, text) in wrela_driver::STD_SOURCES {
-        let module: Vec<String> = name.split("::").map(String::from).collect();
-        let file = format!("std/{}.wrela", module[1]);
-        sources.push((module, file, text.to_string()));
-    }
-    if let Some(dir) = dir {
-        let files = wrela_driver::package::find_files(dir).map_err(|errs| {
-            errs.iter().map(|e| format!("{}: {}", e.path, e.message)).collect::<Vec<_>>().join("; ")
-        })?;
-        for f in files {
-            let text = std::fs::read_to_string(&f.path)
-                .map_err(|e| format!("can't read `{}`: {e}", f.path.display()))?;
-            sources.push((f.module, f.display, text));
+    for f in files {
+        let text = std::fs::read_to_string(&f.path)
+            .map_err(|e| format!("can't read `{}`: {e}", f.path.display()))?;
+        let file = repository_path(&f.path);
+        match prefix {
+            Some(p) => {
+                let mut module = vec![p.to_string()];
+                module.extend(f.module);
+                sources.push((module, format!("[{p}] {}", f.display), file, text));
+            }
+            None => sources.push((f.module, f.display, file, text)),
         }
+    }
+    Ok(sources)
+}
+
+/// `path` as the repository names it: relative to the current directory, `/`-separated.
+fn repository_path(path: &Path) -> String {
+    let here = std::env::current_dir().ok();
+    let relative = here.as_deref().and_then(|h| path.strip_prefix(h).ok()).unwrap_or(path);
+    let parts: Vec<String> = relative
+        .components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.join("/")
+}
+
+fn build_index(dir: Option<&Path>) -> Result<Index, String> {
+    let mut sources = std_sources();
+    if let Some(dir) = dir {
+        sources.extend(package_sources(dir, None)?);
         // The packages it depends on, each module under its package's name (`engine::creature`).
         if let Ok(text) = std::fs::read_to_string(dir.join("wrela.toml"))
             && let Ok(m) = wrela_driver::manifest::parse(FileId(0), &text)
         {
             for dep in m.deps {
-                let Ok(files) = wrela_driver::package::find_files(&dir.join(&dep.path)) else {
-                    continue;
-                };
-                for f in files {
-                    let Ok(text) = std::fs::read_to_string(&f.path) else { continue };
-                    let mut module = vec![dep.name.clone()];
-                    module.extend(f.module);
-                    sources.push((module, format!("[{}] {}", dep.name, f.display), text));
+                if let Ok(files) = package_sources(&dir.join(&dep.path), Some(&dep.name)) {
+                    sources.extend(files);
                 }
             }
         }
     }
+    Ok(index_of(sources))
+}
+
+/// The documented items of `sources`.
+pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
     let sources: Vec<Source> = sources
         .into_iter()
         .enumerate()
-        .map(|(i, (module, name, text))| {
+        .map(|(i, (module, name, file, text))| {
             let parsed = wrela_syntax::parse(FileId(i as u32), &text);
-            Source { module, name, text, parsed }
+            Source { module, name, file, text, parsed }
         })
         .collect();
     let mut index = Index { entries: Vec::new(), modules: Vec::new() };
     for s in &sources {
-        index.modules.push(Module { path: s.module.clone(), summary: summary(&s.text) });
+        index.modules.push(Module {
+            path: s.module.clone(),
+            summary: summary(&s.text),
+            intro: intro(&s.text),
+        });
         for item in &s.parsed.file.items {
             add_item(&mut index, s, item);
         }
@@ -257,7 +305,7 @@ fn build_index(dir: Option<&Path>) -> Result<Index, String> {
             }
         }
     }
-    Ok(index)
+    index
 }
 
 /// A type's name as an impl names it: `Arena<T>` is `Arena`.
@@ -356,6 +404,8 @@ fn entry(
         signature,
         doc: doc_before(s, span.start),
         at: format!("{}:{line}", s.name),
+        source: s.file.clone(),
+        line,
         methods: Vec::new(),
         implements: Vec::new(),
     }
@@ -392,7 +442,7 @@ fn struct_signature(s: &Source, item: &ast::Item, st: &ast::StructDecl) -> Strin
 }
 
 /// A signature on one line.
-fn one_line(sig: &str) -> String {
+pub(crate) fn one_line(sig: &str) -> String {
     let joined: Vec<&str> = sig.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     joined.join(" ").replace("( ", "(").replace(", )", ")")
 }
@@ -462,6 +512,28 @@ fn doc_before(s: &Source, start: u32) -> String {
         })
         .collect();
     lines.join("\n")
+}
+
+/// The `//` comment a file opens with, its lines joined into paragraphs: what the module is for,
+/// at length.
+fn intro(text: &str) -> String {
+    let mut out = String::new();
+    for line in text.lines() {
+        let Some(l) = line.strip_prefix("//") else { break };
+        if l.starts_with('/') {
+            break;
+        }
+        let l = l.strip_prefix(' ').unwrap_or(l);
+        if l.trim().is_empty() {
+            out.push_str("\n\n");
+        } else {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push(' ');
+            }
+            out.push_str(l.trim_end());
+        }
+    }
+    out.trim().to_string()
 }
 
 /// A file's first `//` comment line: what the module is for.

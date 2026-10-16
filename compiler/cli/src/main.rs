@@ -75,6 +75,7 @@ mod compare;
 mod doc;
 mod edit;
 mod explain;
+mod export;
 mod fix;
 mod fmt;
 mod mesh;
@@ -100,6 +101,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela edit <package-dir> [--edits <file.json>] [--dry-run] [--json]",
         "wrela explain <code>",
         "wrela doc <item> [<package-dir>]",
+        "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
@@ -137,6 +139,7 @@ fn main() -> ExitCode {
         "fix" => fix::run(rest),
         "edit" => edit::run(rest),
         "explain" => explain::run(rest),
+        "doc" if rest.iter().any(|a| a == "--export") => export::run(rest),
         "doc" => doc::run(rest),
         "pipelines" => pipelines::run(rest),
         "profile" => profile::run(rest),
