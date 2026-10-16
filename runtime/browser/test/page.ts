@@ -8,6 +8,7 @@ export class FakeElement extends EventTarget {
   readonly children: FakeElement[] = [];
   readonly style: Record<string, string> & { cssText?: string } = {};
   readonly classes = new Set<string>();
+  readonly dataset: Record<string, string> = {};
   parent: FakeElement | null = null;
   id = "";
   className = "";
@@ -59,6 +60,7 @@ export class FakeElement extends EventTarget {
   }
   focus(): void {
     this.page.activeElement = this;
+    this.dispatchEvent(new Event("focus"));
   }
   click(): void {
     this.dispatchEvent(new Event("click"));

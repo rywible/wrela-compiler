@@ -5,9 +5,12 @@
 // canvas: what a node is doesn't depend on what's drawn over it, or on the program's mode.
 //
 // Controls are buttons; items are the options of one listbox, which keeps the focus and moves
-// the active option with the arrow keys (selecting it, as a single choice does). The elements
-// are invisible but where the program draws them, and a focused one shows a ring, for a person
-// who moves through them by keyboard (F6 from the canvas; Escape back).
+// the active option with the arrow keys (selecting it, as a single choice does). A document's
+// parts (headings, paragraphs, links and code) are a document region in the tree's order, its
+// reading order, whether or not they are on screen: a link takes the focus, and its focus and
+// its activation go to the program, which may scroll it into view. The elements are invisible
+// but where the program draws them, and a focused one shows a ring, for a person who moves
+// through them by keyboard (F6 from the canvas; Escape back).
 
 import { assistEvent } from "./input.ts";
 import { Reader } from "./wire.ts";
@@ -15,10 +18,26 @@ import { Reader } from "./wire.ts";
 /** A node's role in the tree (its byte on the wire). */
 export const ROLE_BUTTON = 0;
 export const ROLE_ITEM = 1;
-/** A node's flags. */
+export const ROLE_HEADING = 2;
+export const ROLE_TEXT = 3;
+export const ROLE_LINK = 4;
+export const ROLE_CODE = 5;
+/** A node's flags. A heading's level, 1 to 6, is in bits 4 to 6. */
 export const PRESSED = 1;
 export const SELECTED = 2;
 export const DISABLED = 4;
+const LEVEL_SHIFT = 4;
+
+/** The element a node of each role is, and where it goes: controls, the items' list, or the
+ * document. */
+const KINDS: { tag: string; role: string | null; part: "controls" | "list" | "doc" }[] = [
+  { tag: "button", role: null, part: "controls" },
+  { tag: "div", role: "option", part: "list" },
+  { tag: "div", role: "heading", part: "doc" },
+  { tag: "p", role: null, part: "doc" },
+  { tag: "span", role: "link", part: "doc" },
+  { tag: "pre", role: null, part: "doc" },
+];
 
 /** A node of the tree: its number, role, flags, rectangle (device pixels of the canvas) and name. */
 export interface Node {
@@ -46,7 +65,9 @@ export function readTree(body: Uint8Array): { name: string; items: string; nodes
     const flags = r.u8();
     const [x, y, w, h] = [r.f32(), r.f32(), r.f32(), r.f32()];
     const label = r.str();
-    if (role !== ROLE_BUTTON && role !== ROLE_ITEM) throw new Error(`no accessibility role ${role}`);
+    if (KINDS[role] === undefined) throw new Error(`no accessibility role ${role}`);
+    const level = (flags >> LEVEL_SHIFT) & 7;
+    if (role === ROLE_HEADING && (level < 1 || level > 6)) throw new Error(`a heading's level is 1 to 6, not ${level}`);
     nodes.push({ id, role, flags, x, y, w, h, label });
   }
   return { name, items, nodes };
@@ -54,11 +75,11 @@ export function readTree(body: Uint8Array): { name: string; items: string; nodes
 
 const STYLE = `
 .wrela-a11y { position: fixed; pointer-events: none; z-index: 1; }
-.wrela-a11y button, .wrela-a11y [role=option] {
+.wrela-a11y button, .wrela-a11y [role=option], .wrela-a11y .wrela-doc > * {
   position: absolute; margin: 0; padding: 0; border: 0; background: transparent;
   color: transparent; font-size: 1px; overflow: hidden; pointer-events: none; }
 .wrela-a11y [role=listbox] { position: absolute; inset: 0; outline: none; }
-.wrela-a11y button:focus-visible, .wrela-a11y [role=listbox]:focus .wrela-active {
+.wrela-a11y button:focus-visible, .wrela-a11y [role=link]:focus-visible, .wrela-a11y [role=listbox]:focus .wrela-active {
   outline: 3px solid #4766ff; outline-offset: 2px; border-radius: 4px; }
 .wrela-a11y .wrela-live { position: absolute; width: 1px; height: 1px; overflow: hidden;
   clip-path: inset(50%); white-space: nowrap; }
@@ -69,6 +90,7 @@ interface Parts {
   root: HTMLDivElement;
   controls: HTMLDivElement;
   list: HTMLDivElement;
+  doc: HTMLDivElement;
   live: HTMLDivElement;
 }
 
@@ -93,12 +115,14 @@ export class Overlay {
     style.textContent = STYLE;
     document.head.append(style);
     const make = (cls: string) => Object.assign(document.createElement("div"), { className: cls });
-    const parts = { root: make("wrela-a11y"), controls: make(""), list: make(""), live: make("wrela-live") };
+    const parts = { root: make("wrela-a11y"), controls: make(""), list: make(""), doc: make("wrela-doc"), live: make("wrela-live") };
     parts.controls.setAttribute("role", "group");
     parts.list.setAttribute("role", "listbox");
     parts.list.tabIndex = 0;
+    parts.doc.setAttribute("role", "document");
+    parts.doc.tabIndex = -1;
     parts.live.setAttribute("aria-live", "polite");
-    parts.root.append(parts.controls, parts.list, parts.live);
+    parts.root.append(parts.controls, parts.list, parts.doc, parts.live);
     document.body.append(parts.root);
     parts.list.addEventListener("keydown", (e) => this.#key(e));
     parts.root.addEventListener("keydown", (e) => {
@@ -119,12 +143,14 @@ export class Overlay {
     return e !== null && this.#parts !== null && this.#parts.root.contains(e);
   }
 
-  /** Moves the keyboard's focus into the overlay: its first control, else its items. */
+  /** Moves the keyboard's focus into the overlay: its first control, else its items, else its
+   * document. */
   enter(): boolean {
     if (this.#parts === null) return false;
     const first = this.#parts.controls.querySelector("button");
     if (first) first.focus();
     else if (this.#order.length > 0) this.#parts.list.focus();
+    else if (this.#parts.doc.childElementCount > 0) this.#parts.doc.focus();
     else return false;
     return true;
   }
@@ -140,9 +166,11 @@ export class Overlay {
   /** The tree is now `body`'s: elements are kept by node number, so focus stays where it was. */
   tree(body: Uint8Array): void {
     const { name, items, nodes } = readTree(body);
-    const { root, controls, list } = this.#dom;
+    const parts = this.#dom;
+    const { root, controls, list, doc } = parts;
     controls.setAttribute("aria-label", name);
     list.setAttribute("aria-label", items);
+    doc.setAttribute("aria-label", name);
     const { rect, width, height } = this.place();
     Object.assign(root.style, { left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
     const sx = width > 0 ? rect.width / width : 1;
@@ -151,33 +179,45 @@ export class Overlay {
     for (const n of nodes) {
       seen.add(n.id);
       let el = this.#nodes.get(n.id);
-      const role = n.role === ROLE_BUTTON ? "button" : "option";
-      if (el && (el.tagName === "BUTTON") !== (role === "button")) {
+      const kind = KINDS[n.role]!;
+      if (el && el.dataset.role !== String(n.role)) {
         el.remove();
         el = undefined;
       }
       if (!el) {
-        el = role === "button" ? document.createElement("button") : document.createElement("div");
+        el = document.createElement(kind.tag);
         el.id = `wrela-node-${n.id}`;
-        if (role === "button") {
+        el.dataset.role = String(n.role);
+        if (kind.role) el.setAttribute("role", kind.role);
+        if (n.role === ROLE_BUTTON) {
           el.tabIndex = 0;
           el.addEventListener("click", () => this.write(assistEvent(n.id, 0)));
-        } else {
-          el.setAttribute("role", "option");
+        } else if (n.role === ROLE_ITEM) {
           el.addEventListener("click", () => this.#choose(n.id, 1));
+        } else if (n.role === ROLE_LINK) {
+          el.tabIndex = 0;
+          el.addEventListener("click", () => this.write(assistEvent(n.id, 0)));
+          el.addEventListener("keydown", (e) => {
+            if (e.key !== "Enter") return;
+            this.write(assistEvent(n.id, 0));
+            e.preventDefault();
+          });
+          el.addEventListener("focus", () => this.write(assistEvent(n.id, 2)));
         }
         this.#nodes.set(n.id, el);
       }
-      (role === "button" ? controls : list).append(el);
-      el.setAttribute("aria-label", n.label);
+      parts[kind.part].append(el);
       el.textContent = n.label;
+      if (kind.part !== "doc") el.setAttribute("aria-label", n.label);
       Object.assign(el.style, { left: `${n.x * sx}px`, top: `${n.y * sy}px`, width: `${n.w * sx}px`, height: `${n.h * sy}px` });
-      if (role === "button") {
+      if (n.role === ROLE_BUTTON) {
         if (n.flags & PRESSED) el.setAttribute("aria-pressed", "true");
         else el.removeAttribute("aria-pressed");
         el.setAttribute("aria-disabled", String((n.flags & DISABLED) !== 0));
-      } else {
+      } else if (n.role === ROLE_ITEM) {
         el.setAttribute("aria-selected", String((n.flags & SELECTED) !== 0));
+      } else if (n.role === ROLE_HEADING) {
+        el.setAttribute("aria-level", String((n.flags >> LEVEL_SHIFT) & 7));
       }
     }
     // Nodes that went: a focused one hands the focus to the items, or back to the canvas.
@@ -186,7 +226,7 @@ export class Overlay {
       const focused = el === document.activeElement;
       el.remove();
       this.#nodes.delete(id);
-      if (focused) (list.childElementCount > 0 ? list : this.canvas).focus();
+      if (focused) (list.childElementCount > 0 ? list : doc.childElementCount > 0 ? doc : this.canvas).focus();
     }
     this.#order = nodes.filter((n) => n.role === ROLE_ITEM).map((n) => n.id);
     if (this.#active !== null && !this.#nodes.has(this.#active)) this.#active = this.#order[0] ?? null;

@@ -207,6 +207,26 @@ test("F6 hands the keys to the overlay, letting go of held keys first", () => on
   expect(ring.read().events.length).toBe(0);
 }));
 
+test("the browser's find keys are the program's only while it claims them; the program hears them either way", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const ring = InputRing.create();
+  const input = listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
+  const find = (fields: Record<string, unknown>) => {
+    const e = domEvent("keydown", fields);
+    page.dispatchEvent(e);
+    return e.defaultPrevented;
+  };
+  expect(find({ code: "KeyF", key: "f", ctrlKey: true })).toBe(false);
+  input.claimFind(true);
+  expect([find({ code: "KeyF", key: "f", ctrlKey: true }), find({ code: "KeyG", key: "g", metaKey: true }), find({ code: "F3", key: "F3" })]).toEqual([true, true, true]);
+  // Not a find: F alone types, and Ctrl+S is the page's.
+  expect([find({ code: "KeyF", key: "f" }), find({ code: "KeyS", key: "s", ctrlKey: true })]).toEqual([false, false]);
+  input.claimFind(false);
+  expect(find({ code: "KeyF", key: "f", metaKey: true })).toBe(false);
+  const keys = ring.read().events;
+  expect(keys.length / EVENT_SIZE).toBeGreaterThanOrEqual(7);
+}));
+
 test("a pad sends what changed: a button, a stick past its noise, and a let-go when it goes", () => {
   const last: (PadState | null)[] = [null, null, null, null];
   const button = (value: number, pressed: boolean) => ({ value, pressed });

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Overlay } from "../src/assist.ts";
-import { ACCESSIBILITY, BrowserPlatform, decodeImage, environment, exportName, iconLink, MESSAGE_LIMIT, PASTE_EVENTS, PortRpc, prefetch, programUrl, TEXT_INPUT, wordAt, wordBytes } from "../src/platform.ts";
+import { ACCESSIBILITY, BrowserPlatform, decodeImage, environment, exportName, iconLink, linkUrl, MESSAGE_LIMIT, PASTE_EVENTS, PortRpc, prefetch, programUrl, sameOriginAddress, TEXT_INPUT, wordAt, wordBytes } from "../src/platform.ts";
 import { Reader, Writer } from "../src/wire.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
@@ -223,6 +223,7 @@ test("the environment says which input services the host has, and they reach the
       textInput: (on: boolean, caret: unknown) => calls.push(["text", on, caret]),
       pasted: (n: number) => (n === 3 ? { text: "hi", html: "" } : null),
       offer: (text: string, html: string) => calls.push(["offer", text, html]),
+      claimFind: (on: boolean) => calls.push(["find", on]),
     };
     const overlay = { tree: (b: Uint8Array) => calls.push(["tree", b.length]), announce: (t: string) => calls.push(["say", t]) };
     platform.attach(input, overlay as unknown as Overlay);
@@ -233,7 +234,8 @@ test("the environment says which input services the host has, and they reach the
     expect([pasted.str(), pasted.str()]).toEqual(["hi", ""]);
     await expect(platform.request("clipboard/pasted", wordBytes(4))).rejects.toThrow("isn't kept");
     await platform.request("a11y/announce", new TextEncoder().encode("3 items selected"));
-    expect(calls).toEqual([["text", true, { x: 1, y: 2, w: 3, h: 4 }], ["offer", "a", "<b>a</b>"], ["say", "3 items selected"]]);
+    await platform.request("keys/find", new Uint8Array([1]));
+    expect(calls).toEqual([["text", true, { x: 1, y: 2, w: 3, h: 4 }], ["offer", "a", "<b>a</b>"], ["say", "3 items selected"], ["find", true]]);
   } finally {
     platform.dispose();
     names.forEach((n, i) => { const d = saved[i]; if (d) Object.defineProperty(globalThis, n, d); else Reflect.deleteProperty(globalThis, n); });
@@ -317,5 +319,69 @@ test("a shown program is named in the address, and Back asks it to return", asyn
     for (const [name, old] of [["window", oldWindow], ["document", oldDocument], ["history", oldHistory], ["location", oldLocation]] as const) {
       if (old) Object.defineProperty(globalThis, name, old); else Reflect.deleteProperty(globalThis, name);
     }
+  }
+});
+
+test("a program's address stays on its page's origin, and a link is an http or https URL", () => {
+  const here = "https://docs.example/v0.1/#std/io";
+  expect(sameOriginAddress("#std/net", here)).toBe("/v0.1/#std/net");
+  expect(sameOriginAddress("/v0.2/?q=arena#std/arena", here)).toBe("/v0.2/?q=arena#std/arena");
+  expect(sameOriginAddress("../latest/", here)).toBe("/latest/");
+  for (const bad of ["https://elsewhere.example/", "//elsewhere.example/x", "javascript:alert(1)", "a\\b", "#a\nb", "", "#".repeat(3000)]) {
+    expect(() => sameOriginAddress(bad, here)).toThrow();
+  }
+  expect(linkUrl("https://github.com/rywible/wrela")).toBe("https://github.com/rywible/wrela");
+  for (const bad of ["/relative", "javascript:alert(1)", "data:text/html,x", "https://user:pass@example.com/", "file:///etc/passwd"]) {
+    expect(() => linkUrl(bad)).toThrow();
+  }
+});
+
+test("a top-level program moves through its own addresses, and hears Back and Forward", async () => {
+  const names = ["window", "history", "location"] as const;
+  const saved = names.map((n) => Object.getOwnPropertyDescriptor(globalThis, n));
+  const listeners = new Map<string, () => void>();
+  const page: { parent?: unknown; addEventListener: (type: string, f: () => void) => void } = { addEventListener: (type, f) => listeners.set(type, f) };
+  page.parent = page;
+  // The session history, and the location it shows.
+  const entries = ["/v0.1/"];
+  let at = 0;
+  const location = {
+    get pathname() { return new URL(entries[at]!, "https://docs.example").pathname; },
+    get search() { return new URL(entries[at]!, "https://docs.example").search; },
+    get hash() { return new URL(entries[at]!, "https://docs.example").hash; },
+    get href() { return new URL(entries[at]!, "https://docs.example").href; },
+  };
+  const pages = {
+    state: null,
+    pushState: (_s: unknown, _t: string, url: string) => { entries.splice(at + 1); entries.push(url); at++; },
+    replaceState: (_s: unknown, _t: string, url: string) => { entries[at] = url; },
+  };
+  Object.defineProperty(globalThis, "window", { configurable: true, value: page });
+  Object.defineProperty(globalThis, "history", { configurable: true, value: pages });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: location });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, () => {});
+  const text = async (service: string, body = "") => new TextDecoder().decode(await platform.request(service, new TextEncoder().encode(body)));
+  const back = () => { at--; listeners.get("popstate")!(); };
+  try {
+    await text("nav/push", "#std/io");
+    await text("nav/push", "#std/net");
+    await text("nav/replace", "#std/net?x");
+    expect(entries).toEqual(["/v0.1/", "/v0.1/#std/io", "/v0.1/#std/net?x"]);
+    expect(await text("nav/location")).toBe("/v0.1/#std/net?x");
+    // Back while the program waits: it hears the address it's at now.
+    const heard = text("nav/changed");
+    back();
+    expect(await heard).toBe("/v0.1/#std/io");
+    // Back before it waits: its next wait answers at once.
+    back();
+    expect(await text("nav/changed")).toBe("/v0.1/");
+    await expect(text("nav/push", "https://elsewhere.example/")).rejects.toThrow("own origin");
+    // A program in a frame has no address of its own.
+    page.parent = {};
+    await expect(text("nav/push", "#x")).rejects.toThrow("no address of its own");
+  } finally {
+    platform.dispose();
+    names.forEach((n, i) => { const d = saved[i]; if (d) Object.defineProperty(globalThis, n, d); else Reflect.deleteProperty(globalThis, n); });
   }
 });

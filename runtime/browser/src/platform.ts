@@ -8,6 +8,29 @@ import { Reader, Writer } from "./wire.ts";
 
 export const MESSAGE_LIMIT = 1024 * 1024 - 512;
 const DECODER = new TextDecoder("utf-8", { fatal: true });
+const ENCODER = new TextEncoder();
+
+/** The longest address or link a program may give (`nav/*`). */
+const ADDRESS_LIMIT = 2048;
+
+/** `text` as an address on the page's own origin (`#std/io`, `/v0.1/?q=x`), resolved against
+ * the page's address `here`: its path, query and fragment. Another origin, another scheme, or
+ * text with control characters fails. */
+export function sameOriginAddress(text: string, here: string): string {
+  if (text.length === 0 || text.length > ADDRESS_LIMIT || /[\u0000-\u001f\u007f\\]/.test(text)) throw new Error("invalid address");
+  const base = new URL(here);
+  const url = new URL(text, base);
+  if (url.origin !== base.origin) throw new Error("an address stays on the page's own origin");
+  return url.pathname + url.search + url.hash;
+}
+
+/** `text` as a link to follow: an absolute http or https URL without credentials. */
+export function linkUrl(text: string): string {
+  if (text.length === 0 || text.length > ADDRESS_LIMIT || /[\u0000-\u001f\u007f]/.test(text)) throw new Error("invalid link");
+  const url = new URL(text);
+  if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) throw new Error("a link is an http or https URL");
+  return url.href;
+}
 const CURSORS = new Set(["default", "pointer", "text", "grab", "grabbing", "crosshair", "move", "nwse-resize", "nesw-resize"]);
 /** What `environment`'s capabilities word says this host has (runtime/browser): its bits. */
 export const PASTE_EVENTS = 1;
@@ -201,6 +224,10 @@ export class BrowserPlatform {
   #asked = false;
   // Prefetches in flight, which an opening program cancels.
   #prefetching = new AbortController();
+  // Requests waiting to hear that Back or Forward changed the page's address (`nav/changed`), or
+  // that it changed before any waited.
+  #navigating = new Set<() => void>();
+  #navigated = false;
   constructor(readonly canvas: HTMLCanvasElement, readonly visible: (v: boolean) => void) {
     canvas.style.position = "relative"; canvas.style.zIndex = "1"; canvas.style.outline = "none"; canvas.tabIndex = 0;
     window.addEventListener("message", (e: MessageEvent<unknown>) => {
@@ -222,12 +249,17 @@ export class BrowserPlatform {
     });
     window.addEventListener("pagehide", () => this.dispose());
     // A top-level page names the program it shows in its address, so the browser's Back asks
-    // that program to return, as its own return shortcut does. A reload drops the stale name.
-    // The name goes after the page's own path: a relative address would resolve against the
-    // page's <base>, a release's directory, which a later deploy removes.
+    // that program to return, as its own return shortcut does. Otherwise Back and Forward move
+    // through the addresses the program gave (`nav/push`), and it hears of each (`nav/changed`).
+    // A shown program's name goes after the page's own path: a relative address would resolve
+    // against the page's <base>, a release's directory, which a later deploy removes.
     if (window.parent === window && typeof history !== "undefined") {
-      if (location.hash && history.state?.wrela === undefined) history.replaceState(null, "", location.pathname + location.search);
-      window.addEventListener("popstate", () => this.#back());
+      window.addEventListener("popstate", () => {
+        if (this.#shown !== null) { this.#back(); return; }
+        if (this.#navigating.size === 0) this.#navigated = true;
+        for (const resolve of this.#navigating) resolve();
+        this.#navigating.clear();
+      });
     }
   }
   #back(): void {
@@ -362,6 +394,30 @@ export class BrowserPlatform {
     if (service === "surface/failed") { this.#parent?.signal("failed"); return new Uint8Array(); }
     if (service === "surface/ready") { this.#parent?.signal("ready"); return new Uint8Array(); }
     if (service === "surface/return") { this.#parent?.signal("return"); return new Uint8Array(); }
+    if (service === "nav/location") return ENCODER.encode(location.pathname + location.search + location.hash);
+    if (service === "nav/push" || service === "nav/replace" || service === "nav/changed") {
+      if (window.parent !== window) throw new Error("an embedded program has no address of its own");
+      if (service === "nav/changed") {
+        const here = () => ENCODER.encode(location.pathname + location.search + location.hash);
+        if (this.#navigated) { this.#navigated = false; return here(); }
+        return new Promise<Bytes>(resolve => { this.#navigating.add(() => resolve(here())); });
+      }
+      const address = sameOriginAddress(DECODER.decode(body), location.href);
+      if (service === "nav/push") history.pushState(null, "", address);
+      else history.replaceState(null, "", address);
+      return new Uint8Array();
+    }
+    if (service === "nav/open") {
+      // A new tab with no way back to this page.
+      window.open(linkUrl(DECODER.decode(body)), "_blank", "noopener,noreferrer"); return new Uint8Array();
+    }
+    if (service === "nav/go") {
+      location.assign(sameOriginAddress(DECODER.decode(body), location.href)); return new Uint8Array();
+    }
+    if (service === "keys/find") {
+      if (!this.#input) throw new Error("this host has no keys to claim yet");
+      this.#input.claimFind(body[0] === 1); return new Uint8Array();
+    }
     if (service === "surface/leave") {
       // Answers once the parent asks this program to return.
       if (!this.#parent) throw new Error("this program has no parent channel");

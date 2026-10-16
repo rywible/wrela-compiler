@@ -41,7 +41,14 @@ export interface Listener {
   pasted(serial: number): Pasted | null;
   /** What a copy or cut puts on the clipboard from now on (empty texts: nothing). */
   offer(text: string, html: string): void;
+  /** Whether the program takes the browser's find keys (Ctrl or Cmd with F or G, and F3) for a
+   * find of its own: the browser's finds nothing in a canvas. */
+  claimFind(on: boolean): void;
 }
+
+/** Whether `e` is one of the browser's find keys. */
+export const isFindKey = (e: KeyboardEvent): boolean =>
+  e.code === "F3" || ((e.ctrlKey || e.metaKey) && (e.code === "KeyF" || e.code === "KeyG"));
 
 /** How many pastes are kept for the program to ask for. */
 const PASTES_KEPT = 8;
@@ -213,8 +220,11 @@ export function listen(
     },
     { passive: false },
   );
+  let findClaimed = false;
   window.addEventListener("keydown", (e) => {
     if (inOverlay()) return;
+    // The program's own find, rather than the browser's.
+    if (findClaimed && isFindKey(e)) e.preventDefault();
     if (texting()) {
       // An input method's keys are its own.
       if (e.isComposing || e.keyCode === 229) return;
@@ -251,6 +261,9 @@ export function listen(
 
   return {
     release,
+    claimFind(on) {
+      findClaimed = on;
+    },
     textInput(active, caret) {
       if (active) {
         field ??= makeField();

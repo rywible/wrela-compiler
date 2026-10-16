@@ -3,7 +3,7 @@
 
 import { expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
-import { DISABLED, Overlay, PRESSED, readTree, ROLE_BUTTON, ROLE_ITEM, SELECTED } from "../src/assist.ts";
+import { DISABLED, Overlay, PRESSED, readTree, ROLE_BUTTON, ROLE_CODE, ROLE_HEADING, ROLE_ITEM, ROLE_LINK, ROLE_TEXT, SELECTED } from "../src/assist.ts";
 import { assistEvent } from "../src/input.ts";
 import { Writer } from "../src/wire.ts";
 import { domEvent, type FakeElement, onPage } from "./page.ts";
@@ -71,3 +71,37 @@ test("an update keeps each node's element, so the focus stays; a focused node th
   o.root.dispatchEvent(domEvent("keydown", { key: "Escape" }));
   expect(page.activeElement).toBe(canvas);
 }));
+
+test("a document is a region in the tree's order: headings with levels, paragraphs, links and code", () => onPage((page) => {
+  const { o, events } = overlay(page);
+  const h2 = 2 << 4;
+  o.tree(tree([[1, ROLE_HEADING, h2, "Arena"], [2, ROLE_TEXT, 0, "Arenas hold values by handle."], [3, ROLE_LINK, 0, "Arena::push"], [4, ROLE_CODE, 0, "pub fn push(mut self)"]]));
+  const doc = (o.root.children as unknown as FakeElement[])[2]!;
+  expect(doc.getAttribute("role")).toBe("document");
+  expect(doc.children.map((c) => [c.tagName, c.getAttribute("role"), c.textContent])).toEqual([
+    ["DIV", "heading", "Arena"], ["P", null, "Arenas hold values by handle."], ["SPAN", "link", "Arena::push"], ["PRE", null, "pub fn push(mut self)"],
+  ]);
+  expect(doc.children[0]!.getAttribute("aria-level")).toBe("2");
+  // With no controls or items, F6 lands on the document, for a screen reader to read from.
+  expect(o.enter()).toBe(true);
+  expect(page.activeElement).toBe(doc);
+  // A link's focus and activation go to the program by its node: it may scroll it into view.
+  const link = doc.children[2]!;
+  expect(link.tabIndex).toBe(0);
+  link.focus();
+  link.dispatchEvent(domEvent("keydown", { key: "Enter" }));
+  link.click();
+  expect(events).toEqual([assistEvent(3, 2), assistEvent(3, 0), assistEvent(3, 0)]);
+  // The reading order is the tree's: a new order moves the elements, and a node that changes
+  // role is made again.
+  o.tree(tree([[4, ROLE_CODE, 0, "pub fn push(mut self)"], [1, ROLE_HEADING, 1 << 4, "Arena"], [3, ROLE_TEXT, 0, "Arena::push"]]));
+  expect(doc.children.map((c) => c.tagName)).toEqual(["PRE", "DIV", "P"]);
+  expect(doc.children[1]!.getAttribute("aria-level")).toBe("1");
+}));
+
+test("a heading has a level from 1 to 6, and a role past the last is refused", () => {
+  expect(() => readTree(tree([[1, ROLE_HEADING, 0, "x"]]))).toThrow("level is 1 to 6");
+  expect(() => readTree(tree([[1, ROLE_HEADING, 7 << 4, "x"]]))).toThrow("level is 1 to 6");
+  expect(readTree(tree([[1, ROLE_HEADING, 6 << 4, "x"]])).nodes[0]!.flags).toBe(6 << 4);
+  expect(() => readTree(tree([[1, ROLE_CODE + 1, 0, "x"]]))).toThrow(`no accessibility role ${ROLE_CODE + 1}`);
+});
