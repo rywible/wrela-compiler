@@ -13,6 +13,7 @@ mod channels;
 mod clearing;
 mod climber;
 mod closed_list;
+mod clusters;
 mod codes;
 mod conformance;
 mod console;
