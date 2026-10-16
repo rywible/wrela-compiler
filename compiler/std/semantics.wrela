@@ -299,6 +299,57 @@ pub fn steps(action: Assist) -> i32 {
     }
 }
 
+/// Why a host would refuse `nodes`, if it would: a node numbered 0 (the root's number) or twice,
+/// one whose parent isn't before it or holds no nodes, or a field without its `field`. A host
+/// refuses such a tree whole.
+pub fn problem(nodes: [Node]) -> Option<String> {
+    var roles: SortedMap<u32, Role> = SortedMap::new()
+    for n in nodes {
+        if n.id == 0 { return Some(String::from("a node is numbered 0, the root's number")) }
+        if roles.contains(n.id) { return Some(f"node {n.id} is given twice") }
+        let parent = if n.parent == 0 { Some(Role::Group) } else { roles.get(n.parent) }
+        let Some(holder) = parent else {
+            return Some(f"node {n.id}'s parent {n.parent} isn't before it")
+        }
+        if !holds(holder) { return Some(f"node {n.id}'s parent {n.parent} holds no nodes") }
+        if n.role == Role::Field && n.field.is_none() {
+            return Some(f"field {n.id} has no `field`")
+        }
+        let _ = roles.insert(n.id, n.role)
+    }
+    None
+}
+
+/// Whether a node of `role` holds others.
+fn holds(role: Role) -> bool {
+    role == Role::Group ||
+        role == Role::ListBox ||
+        role == Role::TabList ||
+        role == Role::TabPanel ||
+        role == Role::Dialog ||
+        role == Role::Menu ||
+        role == Role::Table ||
+        role == Role::Row
+}
+
+@test
+fn a_tree_a_host_would_refuse_says_why() {
+    let list = Node { id: 1, role: Role::ListBox }
+    let option = Node { id: 2, parent: 1, role: Role::Option }
+    let fine = problem([list.clone(), option.clone()])
+    assert(fine.is_none())
+    let root = problem([Node { id: 0, role: Role::Text }])
+    assert(root == Some(String::from("a node is numbered 0, the root's number")))
+    let twice = problem([list.clone(), Node { id: 1, role: Role::Text }])
+    assert(twice == Some(String::from("node 1 is given twice")))
+    let early = problem([option.clone(), list.clone()])
+    assert(early == Some(String::from("node 2's parent 1 isn't before it")))
+    let held = problem([take list, take option, Node { id: 3, parent: 2, role: Role::Text }])
+    assert(held == Some(String::from("node 3's parent 2 holds no nodes")))
+    let bare = problem([Node { id: 4, role: Role::Field }])
+    assert(bare == Some(String::from("field 4 has no `field`")))
+}
+
 @test
 fn a_tree_and_its_geometry_have_the_hosts_layout() {
     let link = Node {
