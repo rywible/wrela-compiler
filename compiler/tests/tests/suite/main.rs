@@ -20,6 +20,7 @@ mod consts;
 mod derive;
 mod diagnostics;
 mod doc_examples;
+mod docsite;
 mod encodings;
 mod explain;
 mod format;

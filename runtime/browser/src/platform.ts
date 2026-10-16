@@ -230,6 +230,8 @@ export class BrowserPlatform {
   #navigated = false;
   constructor(readonly canvas: HTMLCanvasElement, readonly visible: (v: boolean) => void) {
     canvas.style.position = "relative"; canvas.style.zIndex = "1"; canvas.style.outline = "none"; canvas.tabIndex = 0;
+    // A touch's moves are the program's: the browser doesn't pan or zoom the page under it.
+    canvas.style.touchAction = "none";
     window.addEventListener("message", (e: MessageEvent<unknown>) => {
       if (window.parent === window || e.source !== window.parent || this.#parent || !document.referrer) return;
       if (e.origin !== new URL(document.referrer).origin) return;

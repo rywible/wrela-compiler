@@ -12,8 +12,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import console
 
 
-def packaged(root):
-    """A release of a console and one game, built from stand-in builds, and its stand-in cover."""
+def packaged(root, docs=False):
+    """A release of a console and one game (and the docs, if `docs`), built from stand-in builds,
+    and its stand-in cover."""
     cover = root / "cover.png"
     cover.write_bytes(b"rendered cover fixture")
     config = {
@@ -26,6 +27,16 @@ def packaged(root):
             "session": "session", "builds": {"session": "session"}, "cover": "cover.png",
         }],
     }
+    if docs:
+        config["docs"] = {"package": "docsite", "worker": "docs-host", "domain": "docs.example",
+                          "description": "The reference.", "packages": ["engine"]}
+
+    def export(docs, directory, commit):
+        # What `wrela doc --export` writes, in small.
+        (directory / "index.json").write_text('{"commit": "%s"}' % commit)
+        (directory / "llms.txt").write_text("# wrela\n")
+        (directory / "std").mkdir()
+        (directory / "std/io.md").write_text("# std::io\n")
 
     def build(package, output):
         output.mkdir(parents=True)
@@ -49,6 +60,7 @@ def packaged(root):
         patch.object(console, "ROOT", root),
         patch.object(console, "build_package", build),
         patch.object(console, "copy_licenses"),
+        patch.object(console, "export_docs", export),
         patch.object(console.subprocess, "check_output", return_value="fixture\n"),
         patch.dict(sys.modules, {"PIL": pillow}),
     ):
@@ -158,6 +170,53 @@ cover = "cover.png"
             catalog = (output / f"console-host/releases/{release}/catalog.tsv").read_text().split("\t")
             self.assertIn(f'<meta property="og:image" content="https://console.example/releases/{release}/{catalog[3]}">', page)
 
+    def test_the_docs_ship_their_program_beside_their_export_with_stable_addresses(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output, report, _ = packaged(Path(temporary), docs=True)
+            release = report["release"]
+            shelf = output / "docs-host"
+            # The program and the export together, in the release: the program fetches the
+            # export's files beside it.
+            for name in ["index.html", "game.wasm", "index.json", "llms.txt", "std/io.md", "files.json"]:
+                self.assertTrue((shelf / "releases" / release / name).is_file(), name)
+            self.assertIn('"commit": "fixture"', (shelf / "releases" / release / "index.json").read_text())
+            # An agent's addresses last from release to release.
+            redirects = (shelf / "_redirects").read_text().splitlines()
+            self.assertIn(f"/llms.txt /releases/{release}/llms.txt 302", redirects)
+            self.assertIn(f"/index.json /releases/{release}/index.json 302", redirects)
+            self.assertIn(f"/std/* /releases/{release}/std/:splat 302", redirects)
+            self.assertFalse(any("manifest.json" in line or "files.json" in line for line in redirects))
+            # Markdown is served as what it is, readable by anyone; the page itself is framed by no one.
+            docs_headers = (shelf / "_headers").read_text()
+            self.assertIn("/*.md\n  Content-Type: text/markdown; charset=utf-8\n  Access-Control-Allow-Origin: *", docs_headers)
+            self.assertIn("frame-ancestors 'none'", docs_headers)
+            self.assertIn("connect-src 'self';", docs_headers)
+            page = (shelf / "index.html").read_text()
+            self.assertIn(f'<base href="/releases/{release}/">', page)
+            self.assertIn('<meta name="description" content="The reference.">', page)
+            self.assertIn('<link rel="alternate" type="text/markdown" href="/llms.txt"', page)
+            self.assertIn('<noscript>', page)
+            self.assertIn('<meta name="wrela-storage" content="docs">', page)
+            docs = next(w for w in report["workers"] if w["worker"] == "docs-host")
+            self.assertEqual((docs["domain"], docs["console"]), ("docs.example", False))
+            wrangler = json.loads((output / "docs-host.wrangler.json").read_text())
+            self.assertEqual(wrangler["routes"], [{"pattern": "docs.example", "custom_domain": True}])
+
+    def test_the_docs_export_cannot_overwrite_the_program(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "shelf"
+            directory.mkdir()
+            (directory / "index.html").write_text("program")
+
+            def run(command, **kwargs):
+                corpus = Path(command[command.index("--export") + 1])
+                corpus.mkdir()
+                (corpus / "index.html").write_text("export")
+            with patch.object(console.subprocess, "run", run):
+                with self.assertRaisesRegex(ValueError, "both have index.html"):
+                    console.export_docs({"packages": []}, directory, "abc")
+            self.assertEqual((directory / "index.html").read_text(), "program")
+
     def test_private_storage_and_symlinks_cannot_be_uploaded(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -196,9 +255,18 @@ cover = "cover.png"
             fonts = root / "console/fonts"
             fonts.mkdir(parents=True)
             (fonts / "OFL-example.txt").write_text("Font license")
+            # A font a dependency bakes ships too, through a dependency of a dependency.
+            (root / "console/wrela.toml").write_text('[package]\nname = "console"\n[dependencies]\nbrand = { path = "../ui/brand" }\n')
+            (root / "ui/brand/fonts").mkdir(parents=True)
+            (root / "ui/brand/wrela.toml").write_text('[package]\nname = "brand"\n[dependencies]\nui = { path = ".." }\n')
+            (root / "ui/brand/fonts/OFL-Brand.txt").write_text("Brand font license")
+            (root / "ui/fonts").mkdir(parents=True)
+            (root / "ui/fonts/OFL-Ui.txt").write_text("UI font license")
             output = root / "release"
             output.mkdir()
             with patch.object(console, "ROOT", root):
                 console.copy_licenses("console", output)
             self.assertEqual((output / "LICENSE").read_text(), "MIT software license")
             self.assertEqual((output / "OFL-example.txt").read_text(), "Font license")
+            self.assertEqual((output / "OFL-Brand.txt").read_text(), "Brand font license")
+            self.assertEqual((output / "OFL-Ui.txt").read_text(), "UI font license")

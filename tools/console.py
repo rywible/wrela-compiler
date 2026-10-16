@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -83,6 +84,18 @@ def read_config(path):
                 raise ValueError("a build package is not inside the repository")
     if not seen:
         raise ValueError("the release needs at least one game")
+    if "docs" in data:
+        docs = data["docs"]
+        if component(docs["worker"]) in workers or docs["domain"] in domains:
+            raise ValueError("the docs share a worker or a domain")
+        origin(docs["domain"])
+        text = docs.get("description")
+        if not isinstance(text, str) or not text or any(c in text for c in "\r\n"):
+            raise ValueError("the docs need a one-line description")
+        for package in [docs["package"], *docs["packages"]]:
+            source = (ROOT / package).resolve()
+            if not source.is_relative_to(ROOT) or not (source / "wrela.toml").is_file():
+                raise ValueError(f"a docs package is not inside the repository: {package}")
     return data
 
 
@@ -130,10 +143,28 @@ def release_files(directory):
     return files
 
 
+def package_dirs(package):
+    """The package at `package` (relative to the repository) and every package it depends on:
+    a font any of them bakes ships in the build."""
+    seen = []
+    stack = [(ROOT / package).resolve()]
+    while stack:
+        directory = stack.pop()
+        if directory in seen:
+            continue
+        seen.append(directory)
+        manifest = directory / "wrela.toml"
+        if manifest.is_file():
+            dependencies = tomllib.loads(manifest.read_text()).get("dependencies", {})
+            stack.extend((directory / d["path"]).resolve() for d in dependencies.values())
+    return seen
+
+
 def copy_licenses(package, output):
     shutil.copy2(ROOT / "LICENSE", output / "LICENSE")
-    for license_file in (ROOT / package / "fonts").glob("OFL-*.txt"):
-        shutil.copy2(license_file, output / license_file.name)
+    for directory in package_dirs(package):
+        for license_file in (directory / "fonts").glob("OFL-*.txt"):
+            shutil.copy2(license_file, output / license_file.name)
 
 
 def build_package(package, output):
@@ -182,6 +213,60 @@ def card(console, release, catalog):
             f'\n<meta name="twitter:card" content="summary_large_image">')
 
 
+def export_docs(docs, directory, commit):
+    """The reference docs of std and the docs' packages (`wrela doc --export`), put in `directory`
+    beside the docs' program. A file of the export can't take the place of one of the program's."""
+    with tempfile.TemporaryDirectory() as temporary:
+        corpus = Path(temporary) / "corpus"
+        subprocess.run([str(ROOT / "tools/wrela"), "doc", "--export", str(corpus), "--commit", commit,
+                        *[str(ROOT / p) for p in docs["packages"]]], cwd=ROOT, check=True)
+        for item in sorted(corpus.iterdir()):
+            if (directory / item.name).exists():
+                raise ValueError(f"the docs' export and program both have {item.name}")
+            if item.is_dir():
+                shutil.copytree(item, directory / item.name)
+            else:
+                shutil.copy2(item, directory / item.name)
+
+
+def docs_headers(home):
+    """The docs Worker's headers: the program's, and its Markdown and text readable by anyone, as
+    what they are."""
+    raw = "\n  Access-Control-Allow-Origin: *"
+    return headers(home) + (f"/*.md\n  Content-Type: text/markdown; charset=utf-8{raw}\n"
+                            f"/*.txt\n  Content-Type: text/plain; charset=utf-8{raw}\n"
+                            f"/*.json{raw}\n")
+
+
+def docs_redirects(directory, release):
+    """Stable addresses for the docs' raw files (`/llms.txt`, `/std/io.md`): each leads to this
+    release's copy, so an agent's link outlives the release."""
+    lines = []
+    for item in sorted(directory.iterdir()):
+        if item.is_dir() and any(item.rglob("*.md")):
+            lines.append(f"/{item.name}/* /releases/{release}/{item.name}/:splat 302")
+        elif item.suffix in {".txt", ".json"} and item.name not in {"manifest.json", "files.json"}:
+            lines.append(f"/{item.name} /releases/{release}/{item.name} 302")
+    return "\n".join(lines) + "\n"
+
+
+def docs_page(docs):
+    """The docs page's description, its Markdown for agents, and words for a browser without
+    scripts: where the same docs are as plain text."""
+    text = html.escape(docs["description"])
+    home = origin(docs["domain"])
+    head = (f'\n<meta name="description" content="{text}">'
+            f'\n<meta property="og:type" content="website">'
+            f'\n<meta property="og:site_name" content="wrela">'
+            f'\n<meta property="og:title" content="wrela docs">'
+            f'\n<meta property="og:description" content="{text}">'
+            f'\n<meta property="og:url" content="{home}/">'
+            f'\n<link rel="alternate" type="text/markdown" href="/llms.txt" title="The docs as Markdown">')
+    body = ('\n<noscript>These docs are a Wrela program and need JavaScript and WebGPU. The same docs '
+            'are plain Markdown at <a href="/llms.txt">/llms.txt</a>.</noscript>')
+    return head, body
+
+
 def wrangler_config(project):
     """A worker's Wrangler configuration: its release's assets, on its custom domain only."""
     return {"name": project["worker"], "compatibility_date": COMPATIBILITY_DATE,
@@ -202,6 +287,14 @@ def package(config, output):
     parent = origin(console["domain"])
     catalog = []
     packages = [home]
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
+    docs = config.get("docs")
+    if docs is not None:
+        shelf = output / docs["worker"]
+        build_package(docs["package"], shelf)
+        copy_licenses(docs["package"], shelf)
+        export_docs(docs, shelf, commit)
+        packages.append(shelf)
     for game in config["games"]:
         game_output = output / game["worker"]
         game_output.mkdir()
@@ -225,9 +318,10 @@ def package(config, output):
         (home / filename).write_bytes(art)
         catalog.append("\t".join([game["id"], game["title"], child + "/" + game["session"] + "/",
                                    filename, str(width), str(height)]))
-    for project in [console, *config["games"]]:
+    projects = [console, *config["games"], *([docs] if docs is not None else [])]
+    for project in projects:
         directory = output / project["worker"]
-        namespace = "console" if project is console else project["id"]
+        namespace = "console" if project is console else "docs" if project is docs else project["id"]
         for document in directory.rglob("index.html"):
             document.write_text(document.read_text().replace(
                 "<head>", f'<head>\n<meta name="wrela-storage" content="{namespace}">'))
@@ -251,11 +345,20 @@ def package(config, output):
     for game in config["games"]:
         (home / f"prefetch-{game['id']}.txt").write_text(prefetch_list(game, output, release))
     (home / "_headers").write_text(headers(parent, [origin(g["domain"]) for g in config["games"]]))
-    for project in [console, *config["games"]]:
+    if docs is not None:
+        shelf = output / docs["worker"]
+        (shelf / "_headers").write_text(docs_headers(origin(docs["domain"])))
+        (shelf / "_redirects").write_text(docs_redirects(shelf, release))
+    for project in projects:
         directory = output / project["worker"]
         if project is console:
             entry = (directory / "index.html").read_text()
             entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">' + card(console, release, catalog))
+        elif project is docs:
+            head, body = docs_page(docs)
+            entry = (directory / "index.html").read_text()
+            entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">' + head)
+            entry = entry.replace("<body>", "<body>" + body)
         else:
             entry = None
         versioned = directory / "releases" / release
@@ -271,12 +374,11 @@ def package(config, output):
         (output / f"{project['worker']}.wrangler.json").write_text(
             json.dumps(wrangler_config(project), indent=2) + "\n")
     reports = []
-    for project in [console, *config["games"]]:
+    for project in projects:
         files = release_files(output / project["worker"])
         reports.append({"worker": project["worker"], "domain": project["domain"],
                         "console": project is console, "files": len(files),
                         "bytes": sum(p.stat().st_size for p in files)})
-    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
     report = {"source": commit, "release": release, "workers": reports}
     (output / "release.json").write_text(json.dumps(report, indent=2) + "\n")
     return report

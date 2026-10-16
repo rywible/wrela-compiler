@@ -37,7 +37,7 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean } = {}): Promise<Page> {
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[] } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null };
   const canvas = {
     style: {},
@@ -53,8 +53,11 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     baseURI: `${u.origin}${u.pathname}`,
     visibilityState: options.hidden ? "hidden" : "visible",
     hasFocus: () => options.focused ?? true,
-    querySelector: () => canvas,
-    createElement: () => ({ setAttribute() {}, textContent: "" }),
+    // The canvas, or the page's Markdown alternate when a test gives one.
+    querySelector: (selector: string) => selector.startsWith("link") ? (options.alternate ? { href: options.alternate } : null) : canvas,
+    createElement: (tag: string) => tag === "a"
+      ? { href: "", textContent: "" }
+      : { setAttribute() {}, textContent: "", append(_: string, a: { href: string; textContent: string }) { options.links?.push({ href: a.href, text: a.textContent }); } },
     // A box shown with a class (`unsupported`) is recorded with it.
     body: { append: (el: { textContent: string; className?: string }) => page.shown.push(el.className ? `[${el.className}] ${el.textContent}` : el.textContent) },
     addEventListener: (type: string, f: () => void) => type === "visibilitychange" && page.visibilityListeners.push(f),
@@ -117,6 +120,13 @@ test("a browser without WebGPU is told what a program needs, not that it failed"
   const page = await load("https://example.com/game/", { gpu: false });
   expect(page.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this browser doesn't support WebGPU).\nTry a current Chrome or Edge on a desktop or laptop computer."]);
   expect(page.posted).toEqual([]);
+});
+
+test("a page that is text as well links to its text when it can't run", async () => {
+  const links: { href: string; text: string }[] = [];
+  const page = await load("https://docs.example/", { gpu: false, alternate: "https://docs.example/llms.txt", links });
+  expect(page.shown[0]).toStartWith("[unsupported] This needs WebGPU");
+  expect(links).toEqual([{ href: "https://docs.example/llms.txt", text: "Read the same pages as plain text." }]);
 });
 
 test("a machine without a hardware adapter is told the same; other failures still say they stopped", async () => {

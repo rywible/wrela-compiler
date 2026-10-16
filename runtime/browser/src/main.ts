@@ -25,6 +25,14 @@ function showFatal(text: string, unsupported = false): void {
   if (unsupported) {
     box.className = "unsupported";
     box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nTry a current Chrome or Edge on a desktop or laptop computer.`;
+    // A page that is text as well (its Markdown alternate) says where that text is.
+    const alternate = document.querySelector<HTMLLinkElement>('link[rel="alternate"][type="text/markdown"]');
+    if (alternate && typeof alternate.href === "string" && alternate.href) {
+      const a = document.createElement("a");
+      a.href = alternate.href;
+      a.textContent = "Read the same pages as plain text.";
+      box.append("\n", a);
+    }
   } else {
     box.textContent = `wrela stopped: ${text}`;
   }
