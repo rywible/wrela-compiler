@@ -31,7 +31,7 @@ export function linkUrl(text: string): string {
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) throw new Error("a link is an http or https URL");
   return url.href;
 }
-const CURSORS = new Set(["default", "pointer", "text", "grab", "grabbing", "crosshair", "move", "nwse-resize", "nesw-resize"]);
+const CURSORS = new Set(["default", "pointer", "text", "grab", "grabbing", "crosshair", "move", "ew-resize", "nwse-resize", "nesw-resize"]);
 /** What `environment`'s capabilities word says this host has (runtime/browser): its bits. */
 export const PASTE_EVENTS = 1;
 export const TEXT_INPUT = 2;
