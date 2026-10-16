@@ -31,14 +31,22 @@ interface Page {
   mediaListeners: (() => void)[];
   visibilityListeners: (() => void)[];
   worker: { onmessage: ((event: MessageEvent<FromWorker>) => void) | null } | null;
+  /** The page's own text, when a test gives it one: what happened to it. */
+  text: string[];
+  classes: string[];
 }
 
 let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[] } = {}): Promise<Page> {
-  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null };
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean } = {}): Promise<Page> {
+  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null, text: [], classes: [] };
+  // The page's own text records a box put before it, and its removal.
+  const own = options.text ? {
+    before: (el: { textContent: string; className?: string }) => page.text.push(`before: [${el.className}] ${el.textContent.split("\n")[0]}`),
+    remove: () => page.text.push("removed"),
+  } : null;
   const canvas = {
     style: {},
     clientWidth: 100,
@@ -54,7 +62,8 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     visibilityState: options.hidden ? "hidden" : "visible",
     hasFocus: () => options.focused ?? true,
     // The canvas, or the page's Markdown alternate when a test gives one.
-    querySelector: (selector: string) => selector.startsWith("link") ? (options.alternate ? { href: options.alternate } : null) : canvas,
+    querySelector: (selector: string) => selector.startsWith("link") ? (options.alternate ? { href: options.alternate } : null) : selector.startsWith("main") ? own : canvas,
+    documentElement: { classList: { add: (name: string) => page.classes.push(name) } },
     createElement: (tag: string) => tag === "a"
       ? { href: "", textContent: "" }
       : { setAttribute() {}, textContent: "", append(_: string, a: { href: string; textContent: string }) { options.links?.push({ href: a.href, text: a.textContent }); } },
@@ -127,6 +136,18 @@ test("a page that is text as well links to its text when it can't run", async ()
   const page = await load("https://docs.example/", { gpu: false, alternate: "https://docs.example/llms.txt", links });
   expect(page.shown[0]).toStartWith("[unsupported] This needs WebGPU");
   expect(links).toEqual([{ href: "https://docs.example/llms.txt", text: "Read the same pages as plain text." }]);
+});
+
+test("a page with its own text shows it when it can't run, and drops it once the program draws", async () => {
+  const cannot = await load("https://docs.example/", { gpu: false, alternate: "https://docs.example/llms.txt", text: true });
+  expect(cannot.text).toEqual(["before: [unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this browser doesn't support WebGPU)."]);
+  expect(cannot.classes).toEqual(["text-shown"]);
+  expect(cannot.shown).toEqual([]);
+  const runs = await load("https://docs.example/", { text: true });
+  expect(runs.text).toEqual([]);
+  runs.worker!.onmessage!(new MessageEvent("message", { data: { type: "presented" } satisfies FromWorker }));
+  expect(runs.text).toEqual(["removed"]);
+  expect(runs.classes).toEqual([]);
 });
 
 test("a machine without a hardware adapter is told the same; other failures still say they stopped", async () => {

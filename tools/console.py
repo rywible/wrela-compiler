@@ -250,21 +250,58 @@ def docs_redirects(directory, release):
     return "\n".join(lines) + "\n"
 
 
-def docs_page(docs):
-    """The docs page's description, its Markdown for agents, and words for a browser without
-    scripts: where the same docs are as plain text."""
+def docs_page(docs, directory):
+    """The docs page's description, its Markdown for agents, and its own text (`main#wrela-text`):
+    the docs' pages, each a link to its Markdown, for whoever doesn't run the program, such as an
+    agent that reads the page as HTML or a browser without WebGPU. An address's fragment never
+    reaches the server, so the text says how an address names a page. The browser host shows it
+    when the program can't run and removes it once the program draws."""
     text = html.escape(docs["description"])
     home = origin(docs["domain"])
     head = (f'\n<meta name="description" content="{text}">'
             f'\n<meta property="og:type" content="website">'
             f'\n<meta property="og:site_name" content="wrela">'
-            f'\n<meta property="og:title" content="wrela docs">'
+            f'\n<meta property="og:title" content="Wrela docs">'
             f'\n<meta property="og:description" content="{text}">'
             f'\n<meta property="og:url" content="{home}/">'
             f'\n<link rel="alternate" type="text/markdown" href="/llms.txt" title="The docs as Markdown">')
-    body = ('\n<noscript>These docs are a Wrela program and need JavaScript and WebGPU. The same docs '
-            'are plain Markdown at <a href="/llms.txt">/llms.txt</a>.</noscript>')
-    return head, body
+    index = json.loads((directory / "index.json").read_text())
+    groups = {}
+    for page in index.get("pages", []):
+        group = "spec" if page["kind"] == "spec" else page["path"].split("/")[0]
+        groups.setdefault(group, []).append(page)
+    # The language, then std, then the packages by name, as `llms.txt` has them.
+    groups = dict(sorted(groups.items(), key=lambda g: (g[0] != "spec", g[0] != "std", g[0])))
+    files = [("llms.txt", "every page with its summary, and how to read the docs"),
+             ("index.json", "every item with its signature, its page and its source line"),
+             *[(f"{g}/llms-full.txt", f"{'the language' if g == 'spec' else g}'s pages in one file")
+               for g in groups if (directory / g / "llms-full.txt").is_file()],
+             ("llms-full.txt", "every page in one file")]
+    body = ['<main id="wrela-text">', "<h1>Wrela docs</h1>", f"<p>{text}</p>",
+            "<p>These pages are a Wrela program that draws with WebGPU. The same docs are plain "
+            "Markdown, for agents and for browsers that can't run the program:</p>", "<ul>"]
+    body += [f'<li><a href="{home}/{name}">{name}</a>: {what}.</li>' for name, what in files
+             if (directory / name).is_file()]
+    body += ["</ul>",
+             f"<p>An address of these docs names its page after <code>#</code>, and a heading on it "
+             f"after <code>:</code>. <code>{home}/#std/arena:arena-insert</code> is the heading "
+             f"<code>arena-insert</code> of <a href=\"{home}/std/arena.md\">{home}/std/arena.md</a>.</p>"]
+    for group, pages in groups.items():
+        body.append(f"<h2>{'The language' if group == 'spec' else html.escape(group)}</h2>")
+        body.append("<ul>")
+        for page in pages:
+            link = f'<a href="{home}/{html.escape(page["path"])}">{html.escape(page["title"])}</a>'
+            summary = page.get("summary", "")
+            body.append(f"<li>{link}: {code_of(summary)}</li>" if summary else f"<li>{link}</li>")
+        body.append("</ul>")
+    body.append("</main>")
+    return head, "\n" + "\n".join(body)
+
+
+def code_of(markdown):
+    """A line of Markdown as HTML: escaped, with its `code` as code."""
+    parts = html.escape(markdown, quote=False).split("`")
+    return "".join(f"<code>{part}</code>" if i % 2 else part for i, part in enumerate(parts))
 
 
 def wrangler_config(project):
@@ -355,9 +392,10 @@ def package(config, output):
             entry = (directory / "index.html").read_text()
             entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">' + card(console, release, catalog))
         elif project is docs:
-            head, body = docs_page(docs)
+            head, body = docs_page(docs, directory)
             entry = (directory / "index.html").read_text()
             entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">' + head)
+            entry = entry.replace("<title>wrela</title>", "<title>Wrela docs</title>")
             entry = entry.replace("<body>", "<body>" + body)
         else:
             entry = None

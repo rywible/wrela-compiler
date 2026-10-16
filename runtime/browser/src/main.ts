@@ -12,6 +12,14 @@ import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil
 
 let shown = false;
 
+/** The page's own text (`<main id="wrela-text">`), if it has one: what the program shows, for
+ * whoever doesn't run it, such as an agent that reads the page as HTML. The page's style keeps it
+ * out of sight while the program loads; it is shown when the program can't run here, and removed
+ * once the program draws, as the program's semantic tree says the same to a screen reader. */
+function pageText(): HTMLElement | null {
+  return document.querySelector<HTMLElement>("main#wrela-text");
+}
+
 /** Shows a fatal error over the canvas and logs it. When the machine can't run a program at all
  * (`unsupported`), it says plainly what a program needs. */
 function showFatal(text: string, unsupported = false): void {
@@ -25,6 +33,13 @@ function showFatal(text: string, unsupported = false): void {
   if (unsupported) {
     box.className = "unsupported";
     box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nTry a current Chrome or Edge on a desktop or laptop computer.`;
+    // A page with its own text shows it, under what's missing.
+    const own = pageText();
+    if (own) {
+      document.documentElement.classList.add("text-shown");
+      own.before(box);
+      return;
+    }
     // A page that is text as well (its Markdown alternate) says where that text is.
     const alternate = document.querySelector<HTMLLinkElement>('link[rel="alternate"][type="text/markdown"]');
     if (alternate && typeof alternate.href === "string" && alternate.href) {
@@ -287,6 +302,7 @@ function start(): void {
           error => worker.postMessage({ type: "host-reply", id: msg.id, bytes: new Uint8Array(), error: errorMessage(error) } satisfies ToWorker),
         );
       } else if (msg.type === "presented") {
+        pageText()?.remove();
         platform.presented();
       } else if (msg.type === "audio") {
         playVoice(msg.voice, test, worker).catch((e: unknown) => failEarly(e, testing));

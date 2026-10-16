@@ -2350,7 +2350,7 @@ Std and the engine give an author forms for building subjects such as creatures,
 - **`wrela doc --export <dir> [--commit <sha>] [<package-dir>...]`** writes the reference docs into a new directory, from the same index as `wrela doc`. The same sources give the same bytes. It writes:
   - in Markdown: this spec split at its sections, the lexical structure, the grammar, and a page for each module of std and of each package given;
   - `index.json`: each public item (its path, kind, signature, doc, page, anchor, and source file and line) and each section of the spec's prose;
-  - `llms.txt`, a map of the pages, and `llms-full.txt`, every page in one file.
+  - `llms.txt`, a map of the pages that says how to read them, and `llms-full.txt`, every page in one file; each group's pages are in one file too (`spec/llms-full.txt`, `std/llms-full.txt`), with its size in `llms.txt`.
 
 ### Tools for agents
 

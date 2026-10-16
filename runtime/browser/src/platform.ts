@@ -358,6 +358,11 @@ export class BrowserPlatform {
       if (!this.#input) throw new Error("this host has no clipboard yet");
       const r = new Reader(body); this.#input.offer(r.str(), r.str()); return new Uint8Array();
     }
+    if (service === "clipboard/write") {
+      // Text on the system clipboard now, as a person's press asked (a copy button): the browser
+      // refuses it without that press, and the program hears why.
+      await navigator.clipboard.writeText(DECODER.decode(body)); return new Uint8Array();
+    }
     if (service === "clipboard/pasted") {
       const pasted = this.#input?.pasted(new Reader(body).u32());
       if (!pasted) throw new Error("that paste isn't kept");

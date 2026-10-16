@@ -2,7 +2,9 @@
 //! that people and agents read alike. The language's spec, split by section, and a page per
 //! module of std and of each package given, in Markdown; `index.json`, every item and every
 //! section of prose with its page, anchor and source; `llms.txt`, a map of the pages, and
-//! `llms-full.txt`, all of them in one file. The same input gives the same bytes.
+//! `llms-full.txt`, all of them in one file, with each group's pages in one file of the group's
+//! (`spec/llms-full.txt`, `std/llms-full.txt`), small enough for an agent to read whole. The same
+//! input gives the same bytes.
 //!
 //! The items come from the index `wrela doc` reads (`doc.rs`), so a page says what a lookup
 //! says. The spec is the one this compiler was built with.
@@ -70,7 +72,7 @@ pub fn run(args: &[String]) -> ExitCode {
     match export(&out, commit.as_deref(), &packages) {
         Ok(n) => {
             println!(
-                "wrote {n} pages, index.json, llms.txt and llms-full.txt to {}",
+                "wrote {n} pages, index.json, llms.txt and llms-full.txt (whole and by group) to {}",
                 out.display()
             );
             ExitCode::SUCCESS
@@ -149,16 +151,51 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     }
     let json = serde_json::to_string_pretty(&index_json).map_err(|e| e.to_string())? + "\n";
     std::fs::write(out.join("index.json"), json).map_err(|e| e.to_string())?;
-    std::fs::write(out.join("llms.txt"), llms(&pages, version, commit))
-        .map_err(|e| e.to_string())?;
-    let mut full = String::new();
-    for p in &pages {
-        full.push_str(&format!("<!-- {} -->\n\n", p.path));
-        full.push_str(&p.text);
-        full.push('\n');
+    let groups = groups_of(&pages);
+    let mut sizes = Vec::new();
+    for (group, members) in &groups {
+        let text = full(members);
+        sizes.push((*group, text.len()));
+        std::fs::write(out.join(group).join("llms-full.txt"), text).map_err(|e| e.to_string())?;
     }
-    std::fs::write(out.join("llms-full.txt"), full).map_err(|e| e.to_string())?;
+    let all = full(&pages.iter().collect::<Vec<_>>());
+    std::fs::write(out.join("llms.txt"), llms(&groups, &sizes, all.len(), version, commit))
+        .map_err(|e| e.to_string())?;
+    std::fs::write(out.join("llms-full.txt"), all).map_err(|e| e.to_string())?;
     Ok(pages.len())
+}
+
+/// The pages by group, in the order a reader learns them: the spec, then std, then the packages
+/// by name. A page's group is `spec`, or the package its path starts with.
+fn groups_of(pages: &[Page]) -> Vec<(&str, Vec<&Page>)> {
+    let mut groups: BTreeMap<&str, Vec<&Page>> = BTreeMap::new();
+    for p in pages {
+        let group = if p.kind == "spec" { "spec" } else { p.path.split('/').next().unwrap_or("") };
+        groups.entry(group).or_default().push(p);
+    }
+    let mut order: Vec<(&str, Vec<&Page>)> = groups.into_iter().collect();
+    order.sort_by_key(|(g, _)| (*g != "spec", *g != "std", *g));
+    order
+}
+
+/// Pages in one file, each after a comment that names its path.
+fn full(pages: &[&Page]) -> String {
+    let mut text = String::new();
+    for p in pages {
+        text.push_str(&format!("<!-- {} -->\n\n", p.path));
+        text.push_str(&p.text);
+        text.push('\n');
+    }
+    text
+}
+
+/// A size in bytes as a reader reads it: `254 kB`, `1.5 MB`.
+fn size_of(bytes: usize) -> String {
+    if bytes >= 1_000_000 {
+        format!("{:.1} MB", bytes as f64 / 1e6)
+    } else {
+        format!("{} kB", bytes.div_ceil(1000))
+    }
 }
 
 /// The `name` of a manifest's `[package]`.
@@ -550,31 +587,35 @@ fn link_sections(text: &str, from: &str, places: &BTreeMap<String, (String, Stri
     out
 }
 
-/// `llms.txt`: what the docs are, then each page by its group, with its summary.
-fn llms(pages: &[Page], version: &str, commit: Option<&str>) -> String {
+/// `llms.txt`: what the docs are and how to read them, each group of pages in one file with its
+/// size, then each page by its group, with its summary.
+fn llms(
+    groups: &[(&str, Vec<&Page>)],
+    sizes: &[(&str, usize)],
+    all: usize,
+    version: &str,
+    commit: Option<&str>,
+) -> String {
     let at = match commit {
         Some(c) => format!("version {version}, commit {c}"),
         None => format!("version {version}"),
     };
     let mut out = format!(
-        "# wrela\n\n> The reference docs of wrela ({at}), an MIT-licensed language, compiler and engine for games that run in the browser. Each page is Markdown. `index.json` lists every public item and every section of the spec, with its page, anchor and source file; `llms-full.txt` is every page in one file. Source: {REPOSITORY}\n"
+        "# wrela\n\n> The reference docs of wrela ({at}), an MIT-licensed language, compiler and engine for games that run in the browser. Each page is Markdown. Source: {REPOSITORY}\n\n\
+         How to read them:\n\n\
+         - To write Wrela, read the language's pages in order, then look up items in std and the packages.\n\
+         - Each group's pages are also in one file, under \"In one file\" below: read a whole group at once where it fits.\n\
+         - `index.json` lists every page (`path`, `title`, `summary`, `kind`), every public item (`path`, `kind`, `signature`, `summary`, `doc`, `page`, `anchor`, `source`, `line`) and every section of the spec (`page`, `anchor`, `headings`, `text`). Search it for an item by its path, such as `std::arena::Arena::insert`.\n\
+         - An anchor is its heading in lowercase, with `-` for spaces and punctuation: `std/arena.md#arena-insert` is `Arena::insert`.\n"
     );
-    let mut groups: BTreeMap<&str, Vec<&Page>> = BTreeMap::new();
-    for p in pages {
-        let group = if p.kind == "spec" { "spec" } else { p.path.split('/').next().unwrap_or("") };
-        groups.entry(group).or_default().push(p);
+    out.push_str("\n## In one file\n\n");
+    for (g, size) in sizes {
+        out.push_str(&format!("- [{}]({g}/llms-full.txt): {}\n", title_of(g), size_of(*size)));
     }
-    // The spec first, then std, then the packages by name.
-    let mut order: Vec<&str> = groups.keys().copied().collect();
-    order.sort_by_key(|g| (*g != "spec", *g != "std", *g));
-    for g in order {
-        let title = match g {
-            "spec" => "The language",
-            "std" => "std",
-            other => other,
-        };
-        out.push_str(&format!("\n## {title}\n\n"));
-        for p in &groups[g] {
+    out.push_str(&format!("- [Everything](llms-full.txt): {}\n", size_of(all)));
+    for (g, pages) in groups {
+        out.push_str(&format!("\n## {}\n\n", title_of(g)));
+        for p in pages {
             if p.summary.is_empty() {
                 out.push_str(&format!("- [{}]({})\n", p.title, p.path));
             } else {
@@ -583,6 +624,11 @@ fn llms(pages: &[Page], version: &str, commit: Option<&str>) -> String {
         }
     }
     out
+}
+
+/// A group's title in `llms.txt`.
+fn title_of(group: &str) -> &str {
+    if group == "spec" { "The language" } else { group }
 }
 
 #[cfg(test)]

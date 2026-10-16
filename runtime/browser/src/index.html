@@ -17,6 +17,29 @@
     background: #000; color: #ddd; font: 16px/1.6 system-ui, sans-serif; text-align: center;
   }
   #wrela-error.unsupported a { color: #fff; }
+  /* A page's own text (main#wrela-text), for whoever doesn't run its program (main.ts
+     `pageText`): shown without scripts or WebGPU, out of sight while the program loads. */
+  #wrela-text {
+    box-sizing: border-box; max-width: 46rem; margin: 0 auto; padding: 32px 16px 64px;
+    color: #d7dae0; font: 16px/1.6 system-ui, sans-serif;
+  }
+  #wrela-text a { color: #fff; }
+  #wrela-text code { font: 0.875em ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+  @media (scripting: enabled) {
+    html:not(.text-shown) #wrela-text {
+      position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip-path: inset(50%);
+    }
+  }
+  @media (scripting: none) {
+    html, body { height: auto; overflow: auto; }
+    canvas#screen { display: none; }
+  }
+  .text-shown, .text-shown body { height: auto; overflow: auto; }
+  .text-shown canvas#screen { display: none; }
+  .text-shown #wrela-error.unsupported {
+    position: static; display: block; box-sizing: border-box; max-width: 46rem;
+    margin: 0 auto; padding: 32px 16px 0; text-align: left;
+  }
 </style>
 </head>
 <body>

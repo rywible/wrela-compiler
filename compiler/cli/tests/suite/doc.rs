@@ -207,6 +207,16 @@ fn the_export_writes_pages_an_index_and_a_map() {
     assert!(llms.contains("commit abcdef1"), "{llms}");
     let full = std::fs::read_to_string(root.join("out/llms-full.txt")).expect("llms-full.txt");
     assert!(full.contains("<!-- fixture/shapes.md -->") && full.contains("### Disc::area"));
+    // Each group is in one file of its own too, listed with its size; the language's first.
+    let group = std::fs::read_to_string(root.join("out/fixture/llms-full.txt")).expect("a group");
+    assert!(group.starts_with("<!-- fixture/shapes.md -->") && !group.contains("<!-- std/"));
+    let spec = std::fs::read_to_string(root.join("out/spec/llms-full.txt")).expect("the spec");
+    assert!(spec.contains("<!-- spec/language/6-memory.md -->") && !spec.contains("<!-- std/"));
+    let kb = group.len().div_ceil(1000);
+    assert!(llms.contains(&format!("- [fixture](fixture/llms-full.txt): {kb} kB\n")), "{llms}");
+    let (language, everything) =
+        (llms.find("(spec/llms-full.txt)").unwrap(), llms.find("(llms-full.txt)").unwrap());
+    assert!(language < llms.find("(std/llms-full.txt)").unwrap() && language < everything);
 }
 
 /// The same input gives the same bytes; an export never writes over another, and a commit is

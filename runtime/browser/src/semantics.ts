@@ -152,7 +152,9 @@ const STYLE = `
 .wrela-semantics { position: fixed; pointer-events: none; z-index: 1; }
 .wrela-semantics .wrela-node { position: absolute; margin: 0; padding: 0; border: 0; background: transparent;
   color: transparent; font-size: 1px; line-height: 1px; overflow: hidden; pointer-events: none; outline: none;
-  white-space: pre; resize: none; caret-color: transparent; }
+  white-space: pre; resize: none; caret-color: transparent; appearance: none; }
+.wrela-semantics input.wrela-node::-webkit-search-cancel-button,
+.wrela-semantics input.wrela-node::-webkit-search-decoration { appearance: none; display: none; }
 .wrela-semantics .wrela-holder { position: static; overflow: visible; }
 .wrela-semantics a.wrela-node.wrela-hit { pointer-events: auto; cursor: pointer; }
 .wrela-semantics .wrela-node:focus-visible, .wrela-semantics [role=listbox]:focus .wrela-active {

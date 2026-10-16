@@ -238,6 +238,17 @@ test("the environment says which input services the host has, and they reach the
     expect((await capabilities()) & (PASTE_EVENTS | TEXT_INPUT | SEMANTICS)).toBe(PASTE_EVENTS | TEXT_INPUT | SEMANTICS);
     await platform.request("text/input", new Writer().u8(1).f32(1).f32(2).f32(3).f32(4).bytes());
     await platform.request("clipboard/offer", new Writer().str("a").str("<b>a</b>").bytes());
+    // A copy button's text goes to the clipboard at once; a refusal comes back as an error.
+    const written: string[] = [];
+    const clipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (t: string) => { if (t === "no") throw new Error("not allowed"); written.push(t); } } });
+    try {
+      await platform.request("clipboard/write", new TextEncoder().encode("let x = 1"));
+      await expect(platform.request("clipboard/write", new TextEncoder().encode("no"))).rejects.toThrow("not allowed");
+      expect(written).toEqual(["let x = 1"]);
+    } finally {
+      if (clipboard) Object.defineProperty(navigator, "clipboard", clipboard); else Reflect.deleteProperty(navigator, "clipboard");
+    }
     const pasted = new Reader(await platform.request("clipboard/pasted", wordBytes(3)));
     expect([pasted.str(), pasted.str()]).toEqual(["hi", ""]);
     await expect(platform.request("clipboard/pasted", wordBytes(4))).rejects.toThrow("isn't kept");

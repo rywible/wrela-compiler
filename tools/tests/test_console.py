@@ -33,14 +33,18 @@ def packaged(root, docs=False):
 
     def export(docs, directory, commit):
         # What `wrela doc --export` writes, in small.
-        (directory / "index.json").write_text('{"commit": "%s"}' % commit)
+        (directory / "index.json").write_text(json.dumps({"commit": commit, "pages": [
+            {"path": "spec/language/6-memory.md", "title": "6. Memory", "summary": "Values & `moves`.", "kind": "spec"},
+            {"path": "std/io.md", "title": "std::io", "summary": "", "kind": "module"},
+        ]}))
         (directory / "llms.txt").write_text("# wrela\n")
         (directory / "std").mkdir()
         (directory / "std/io.md").write_text("# std::io\n")
+        (directory / "std/llms-full.txt").write_text("<!-- std/io.md -->\n")
 
     def build(package, output):
         output.mkdir(parents=True)
-        (output / "index.html").write_text("<html><head></head><body></body></html>")
+        (output / "index.html").write_text("<html><head><title>wrela</title></head><body></body></html>")
         (output / "game.wasm").write_bytes(b"wasm")
         # What a game streams as it plays, and its trap locations: never prefetched.
         (output / "files").mkdir()
@@ -195,7 +199,17 @@ cover = "cover.png"
             self.assertIn(f'<base href="/releases/{release}/">', page)
             self.assertIn('<meta name="description" content="The reference.">', page)
             self.assertIn('<link rel="alternate" type="text/markdown" href="/llms.txt"', page)
-            self.assertIn('<noscript>', page)
+            # The page's own text lists each page by its Markdown's stable address, says how an
+            # address names a page, and the tab is named before the program runs.
+            self.assertIn("<title>Wrela docs</title>", page)
+            text = page[page.index('<main id="wrela-text">'):page.index("</main>")]
+            self.assertIn("<h2>The language</h2>", text)
+            self.assertIn('<li><a href="https://docs.example/spec/language/6-memory.md">6. Memory</a>: '
+                          'Values &amp; <code>moves</code>.</li>', text)
+            self.assertIn('<li><a href="https://docs.example/std/io.md">std::io</a></li>', text)
+            self.assertIn('<a href="https://docs.example/std/llms-full.txt">std/llms-full.txt</a>', text)
+            self.assertNotIn("spec/llms-full.txt", text)
+            self.assertIn("<code>https://docs.example/#std/arena:arena-insert</code>", text)
             self.assertIn('<meta name="wrela-storage" content="docs">', page)
             docs = next(w for w in report["workers"] if w["worker"] == "docs-host")
             self.assertEqual((docs["domain"], docs["console"], docs["docs"]), ("docs.example", False, True))
