@@ -221,6 +221,18 @@ class DevTools(unittest.TestCase):
         self.assertEqual([s for s in seen if s != 'pong'], ['Runtime.evaluate', 'Runtime.evaluate', 'Input.insertText'])
         self.assertIn('pong', seen)
 
+    def test_a_page_without_its_context_yet_is_waited_for(self):
+        evaluations = []
+        def answer(message):
+            evaluations.append(1)
+            if len(evaluations) == 1:
+                return {'error': {'message': 'Cannot find default execution context'}}
+            return {'result': {'result': {'value': True}}}
+        port, seen, thread = self.serve(answer)
+        chrome_session.cdp(port, 'tab', [{'until': 'ready'}])
+        thread.join(5)
+        self.assertEqual(len(evaluations), 2)
+
     def test_an_error_or_a_page_never_ready_says_why(self):
         port, _, thread = self.serve(lambda m: {'error': {'message': 'no such key'}})
         with self.assertRaisesRegex(ValueError, 'Input.dispatchKeyEvent: no such key'):

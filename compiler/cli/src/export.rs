@@ -365,7 +365,7 @@ fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
     let mut page = Page {
         path: path.clone(),
         title: name.clone(),
-        summary: first_sentence(&module.intro),
+        summary: first_sentence(&module.intro).replace("language.md §", "§"),
         kind: "module",
         text: String::new(),
     };
@@ -425,7 +425,7 @@ fn record(e: &Entry, page: &str, anchor: &str) -> Value {
         "path": e.path.join("::"),
         "kind": e.kind,
         "signature": e.signature,
-        "summary": doc::first_sentence(&e.doc),
+        "summary": doc::first_sentence(&e.doc).replace("language.md §", "§"),
         "doc": e.doc,
         "page": page,
         "anchor": anchor,

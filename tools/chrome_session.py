@@ -108,7 +108,8 @@ class Socket:
 def cdp(port, target, commands):
     """Runs DevTools `commands` on tab `target`, in order: each `{"method", "params"}` waits for
     its answer; `{"wait": s}` waits s seconds; `{"until": js, "timeout": s}` evaluates `js` in the
-    page until it's true (or fails after `timeout`, 20 s by default). Returns the answers."""
+    page until it's true, while the page has no context to evaluate in too (or fails after
+    `timeout`, 20 s by default). Returns the answers."""
     ws = Socket(f'ws://127.0.0.1:{port}/devtools/page/{target}')
     answers = []
     try:
@@ -129,7 +130,13 @@ def cdp(port, target, commands):
             elif 'until' in command:
                 deadline = time.monotonic() + float(command.get('timeout', 20))
                 while True:
-                    result = call('Runtime.evaluate', {'expression': command['until'], 'returnByValue': True})
+                    try:
+                        result = call('Runtime.evaluate', {'expression': command['until'], 'returnByValue': True})
+                    except ValueError as error:
+                        # A page still loading has no context to evaluate in yet: wait for it too.
+                        if 'execution context' not in str(error) or time.monotonic() >= deadline:
+                            raise
+                        result = {}
                     if result.get('result', {}).get('value') is True:
                         break
                     if time.monotonic() >= deadline:

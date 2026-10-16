@@ -270,6 +270,8 @@ export class Semantics implements Overlay {
     const { name, nodes } = readTree(body);
     const root = this.root;
     root.setAttribute("aria-label", name);
+    // The tree's name is the page's: the browser's tab, its history and bookmarks show it.
+    if (name) document.title = name;
     const seen = new Set<number>();
     const children = new Map<number, HTMLElement[]>();
     for (const n of nodes) {

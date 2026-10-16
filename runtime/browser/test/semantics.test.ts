@@ -78,7 +78,7 @@ test("offsets go between UTF-16 and UTF-8", () => {
   expect([0, 1, 3, 7, 8, 99].map((b) => utf16At(s, b))).toEqual([0, 1, 2, 4, 5, 5]);
 });
 
-test("nodes are nested elements by parent: a document's parts, buttons and a list's options", () => onPage((page) => {
+test("nodes are nested elements by parent: a document's parts, buttons and a list's options; the tree's name is the page's title", () => onPage((page) => {
   const { o, events, el } = overlay(page);
   o.tree(tree([
     { id: 1, role: Role.Group, label: "Page" },
@@ -89,6 +89,7 @@ test("nodes are nested elements by parent: a document's parts, buttons and a lis
     { id: 6, parent: 5, role: Role.Option, label: "std::arena" },
     { id: 7, parent: 5, role: Role.Option, label: "std::io", flags: SELECTED },
   ]));
+  expect(document.title).toBe("Docs");
   const page1 = el(1);
   expect(page1.children.map((c) => c.id)).toEqual(["wrela-node-2", "wrela-node-3"]);
   expect([el(2).getAttribute("role"), el(2).getAttribute("aria-level"), el(2).textContent]).toEqual(["heading", "2", "Arena"]);
