@@ -1,0 +1,58 @@
+// `std::derive::filtered` on the GPU, a builtin a pixel: each pixel of the row box-filters one
+// builtin of x over a footprint of x itself and is white where that is its average worked out by
+// hand (within 1e-5, or exactly where the footprint misses every kink), red where not. The same
+// cases as std's `filtered_builtins_are_their_footprints_average`, through WGSL.
+use std::derive::filtered
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
+
+/// How many cases (the row's pixels).
+pub const CASES: u32 = 16
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// Each case: the filtered value and the average it should be; `zero` (0, known only on the GPU)
+/// added to each point, so none is folded while compiling.
+fn results(zero: f32) -> [vec2; CASES] {
+    [
+        vec2(filtered(|u: f32| trunc(u), at: 0.0 + zero, width: 1.0), 0.0),
+        vec2(filtered(|u: f32| trunc(u), at: -1.0 + zero, width: 1.0), -0.5),
+        vec2(filtered(|u: f32| floor(u), at: 0.0 + zero, width: 1.0), -0.5),
+        vec2(filtered(|u: f32| ceil(u), at: 0.0 + zero, width: 1.0), 0.5),
+        vec2(filtered(|u: f32| round(u), at: 0.5 + zero, width: 1.0), 0.5),
+        vec2(filtered(|u: f32| fract(u), at: 1000.25 + zero, width: 0.1), 0.25),
+        vec2(
+            filtered(|u: f32| fract(u), at: 1.0 - 1.0 / 16777216.0 + zero, width: 1.0 / 524288.0),
+            0.53124994,
+        ),
+        vec2(filtered(|u: f32| abs(u), at: 1000000.0 + zero, width: 0.01), 1000000.0),
+        vec2(filtered(|u: f32| abs(u), at: 0.25 + zero, width: 1.0), 0.3125),
+        vec2(filtered(|u: f32| min(u, 0.0), at: 1000000.0 + zero, width: 1.0), 0.0),
+        vec2(filtered(|u: f32| max(u, 0.0), at: 0.0 + zero, width: 1.0), 0.125),
+        vec2(filtered(|u: f32| saturate(u), at: 1000000.0 + zero, width: 1.0), 1.0),
+        vec2(filtered(|u: f32| clamp(u, -1.0, 1.0), at: 1.0 + zero, width: 1.0), 0.875),
+        vec2(filtered(|u: f32| clamp(u, u - 0.25, 1.0), at: 1.0 + zero, width: 1.0), 0.875),
+        vec2(filtered(|u: f32| sign(u), at: 0.25 + zero, width: 1.0), 0.5),
+        vec2(filtered(|u: f32| step(0.0, u), at: 0.25 + zero, width: 1.0), 0.75),
+    ]
+}
+
+@fragment
+fn cases(pixel: FragCoord) -> vec4 {
+    // Row 0's middle is at y = 0.5.
+    let r = results(pixel.position.y - 0.5)[min(u32(pixel.position.x), CASES - 1)]
+    // The far-off cases (7, 9, 11) are exact: the footprint misses their kinks.
+    let exact = r.y == 1000000.0 || (r.y == 0.0 && r.x == 0.0) || r.y == 1.0
+    let ok = abs(r.x - r.y) <= 1.0e-5 || (exact && r.x == r.y)
+    if ok { vec4(1.0) } else { vec4(1.0, 0.0, 0.0, 1.0) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, cases, vertices: 3)
+    screen.present()
+}

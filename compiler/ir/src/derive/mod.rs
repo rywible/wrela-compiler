@@ -45,6 +45,20 @@ pub fn value_and_gradient(
     ad::value_and_gradient(m, cache, f, ncap, target, with)
 }
 
+/// A function of `f`'s captures, `x` and a width (of `x`'s type) returning `f(x)` box-filtered
+/// over a footprint that wide along each of `x`'s components (`filtered`, language.md §13):
+/// each discontinuous builtin on the input's path is averaged over the range its operand spans
+/// in the footprint, to first order.
+pub fn filtered(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+) -> Result<FuncId> {
+    ad::filtered_value(m, cache, f, ncap, target)
+}
+
 /// The type [`value_and_gradient`]'s function returns for an input of type `x`: `(f32, X)`, or
 /// with the type `T` of `with`, `(f32, X, T)`.
 pub fn value_gradient_ty(types: &mut Types, x: TypeId, with: Option<TypeId>) -> TypeId {

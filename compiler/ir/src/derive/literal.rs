@@ -58,7 +58,7 @@ pub fn literal_gradient(
             let table_t = m.data[table.index()].ty;
             let mut mask = vec![0; func.params.len() + 1];
             mask[func.params.len()] = all_bits(&m.types, table_t);
-            let d = ad::derive(m, cache, copy, mask.clone(), n as u8, target)?;
+            let d = ad::derive(m, cache, copy, mask.clone(), n as u8, target, false)?;
             let returns = returns_active(m, cache, copy, mask, Mode::Ad) != 0;
             // The seeds: the unit vector of each chosen literal.
             let which = w.let_(&mut body, which_ty, Expr::Param(func.params.len() as u32));

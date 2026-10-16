@@ -55,7 +55,7 @@ pub(super) fn value_and_gradient(
     };
     let mut mask = vec![0; func.params.len()];
     mask[xi] = all_bits(&m.types, x_ty);
-    let d = derive(m, cache, f, mask.clone(), n, target)?;
+    let d = derive(m, cache, f, mask.clone(), n, target, false)?;
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let tuple = value_gradient_ty(&mut m.types, x_ty, payload);
     let mut g = Function::new(
@@ -123,6 +123,94 @@ pub(super) fn value_and_gradient(
 }
 
 /// The derivative of `f` with active parameters `mask` and `n` directions.
+/// The top bit of a derivation's directions in the cache's key: a filtering one.
+const FILTERED: u8 = 0x80;
+
+/// A footprint narrower than this is a point: the builtin's own value is kept.
+const NARROWEST: f64 = 1.0e-6;
+
+/// The builtins a filtering derivation box-filters: those that jump (or kink, for `abs`,
+/// `min`, `max` and the clamps), where a point sample aliases.
+fn filters(b: Builtin) -> bool {
+    use Builtin as B;
+    matches!(
+        b,
+        B::Fract
+            | B::Floor
+            | B::Ceil
+            | B::Round
+            | B::Trunc
+            | B::Step
+            | B::Sign
+            | B::Abs
+            | B::Min
+            | B::Max
+            | B::Clamp
+            | B::Saturate
+    )
+}
+
+/// A function of `f`'s captures, `x` and `width` (of `x`'s type) returning `f`'s value at `x`
+/// box-filtered over a footprint `width` wide along each of `x`'s components (`filtered`,
+/// language.md §13): forward-mode differentiation with each direction's seed its width, so
+/// every value's tangents span its range over the footprint (to first order), and each
+/// discontinuous builtin's value replaced by its average over that range.
+pub(super) fn filtered_value(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    ncap: u32,
+    target: Target,
+) -> Result<FuncId> {
+    let func = m.functions[f.index()].clone();
+    let xi = ncap as usize;
+    let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
+    let n = dims(m, x_ty)?;
+    let f32 = m.types.f32();
+    if func.ret != Some(f32) || func.ret_ref {
+        return Err(Error::not_derivable("`filtered` needs a function that returns an `f32`"));
+    }
+    let mut mask = vec![0; func.params.len()];
+    mask[xi] = all_bits(&m.types, x_ty);
+    let d = derive(m, cache, f, mask.clone(), n, target, true)?;
+    let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
+    let mut params = func.params.clone();
+    let width_param = params.len() as u32;
+    params.push(Param { name: "width".into(), ty: x_ty, by_ref: false, mutable: false });
+    let mut g = Function::new(format!("{}_filtered", func.name), params, Some(f32));
+    let mut body = Vec::new();
+    let mut args: Vec<Arg> =
+        (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+    let width = g.let_(&mut body, x_ty, Expr::Param(width_param));
+    // Seeds: each component of x's axis, its width long.
+    let x_by_ref = func.params[xi].by_ref;
+    for k in 0..n {
+        let seed = if n == 1 {
+            width
+        } else {
+            let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
+            let wk = g.let_(&mut body, f32, Expr::Extract(width, k as u32));
+            let comps = (0..n).map(|c| if c == k { wk } else { zero }).collect();
+            g.let_(&mut body, x_ty, Expr::Construct(x_ty, comps))
+        };
+        if x_by_ref {
+            let l = g.new_local(format!("seed{k}"), x_ty);
+            body.push(Stmt::Store(Place::local(l), seed));
+            args.push(Arg::Place(Place::local(l)));
+        } else {
+            args.push(Arg::Value(seed));
+        }
+    }
+    let dual_ty = m.functions[d.index()]
+        .ret
+        .ok_or_else(|| Error::internal("derived function returns nothing"))?;
+    let r = g.let_(&mut body, dual_ty, Expr::Call(d, args));
+    let value = if returns { g.let_(&mut body, f32, Expr::Extract(r, 0)) } else { r };
+    body.push(Stmt::Return(Some(value)));
+    g.body = body;
+    Ok(m.add_function(g))
+}
+
 pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -130,8 +218,11 @@ pub(super) fn derive(
     mask: Vec<Bits>,
     n: u8,
     target: Target,
+    filter: bool,
 ) -> Result<FuncId> {
-    if let Some(&d) = cache.ad.get(&(f, mask.clone(), n)) {
+    // The cache's key: the directions, and the filtering mode in the top bit.
+    let key_n = n | if filter { FILTERED } else { 0 };
+    if let Some(&d) = cache.ad.get(&(f, mask.clone(), key_n)) {
         return Ok(d);
     }
     let func = m.functions[f.index()].clone();
@@ -140,7 +231,7 @@ pub(super) fn derive(
     let act = body_activity(m, cache, f, &mask, Mode::Ad);
     no_write_through_mut(&func, &act, &mask, "a derivative")?;
     let mut nf = func.clone_signature();
-    nf.name = format!("{}_d{}", func.name, n);
+    nf.name = format!("{}_{}{}", func.name, if filter { "f" } else { "d" }, n);
     // Tangent parameters, appended: n per active parameter.
     let mut tparam: Vec<Vec<u32>> = vec![Vec::new(); func.params.len()];
     for (i, p) in func.params.iter().enumerate() {
@@ -183,7 +274,7 @@ pub(super) fn derive(
     let id = m.add_function(Function::new(nf.name.clone(), nf.params.clone(), nf.ret));
     // Cached before its body is built, for calls back into it; removed again if building
     // fails, so a later request doesn't find the bodiless placeholder.
-    let key = (f, mask, n);
+    let key = (f, mask, key_n);
     cache.ad.insert(key.clone(), id);
     let mut b = Ad {
         m,
@@ -193,6 +284,7 @@ pub(super) fn derive(
         act,
         n,
         target,
+        filter,
         tparam,
         tlocal,
         tv: HashMap::new(),
@@ -223,6 +315,10 @@ struct Ad<'a> {
     act: Activity,
     n: u8,
     target: Target,
+    /// Filtering (`filtered`): the tangents are each direction's derivative times the
+    /// footprint's width along it, and the discontinuous builtins are box-filtered over the
+    /// footprint they give (see `filtered_let`).
+    filter: bool,
     tparam: Vec<Vec<u32>>,
     tlocal: Vec<Vec<LocalId>>,
     /// Each active value's tangents (`None`: structurally zero).
@@ -429,7 +525,12 @@ impl Ad<'_> {
             Stmt::Let(v, Expr::Call(g, args)) => self.call(Some(*v), *g, args, out),
             Stmt::Eval(Expr::Call(g, args)) => self.call(None, *g, args, out),
             Stmt::Let(v, e) => {
-                out.push(s.clone());
+                match e {
+                    Expr::Builtin(b, args) if self.filter && self.act.value(*v) && filters(*b) => {
+                        self.filtered_let(*v, *b, args, out)
+                    }
+                    _ => out.push(s.clone()),
+                }
                 if self.act.value(*v) {
                     let mut ts = Vec::new();
                     for k in 0..self.n as usize {
@@ -484,7 +585,7 @@ impl Ad<'_> {
             out.push(let_or_eval(v, Expr::Call(g, args.to_vec())));
             return Ok(());
         }
-        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target)?;
+        let dg = derive(self.m, self.cache, g, mask.clone(), self.n, self.target, self.filter)?;
         let mut new_args = args.to_vec();
         for (i, a) in args.iter().enumerate() {
             if mask[i] == 0 {
@@ -517,6 +618,218 @@ impl Ad<'_> {
             (v, _) => out.push(let_or_eval(v, Expr::Call(dg, new_args))),
         }
         Ok(())
+    }
+
+    /// The footprint of `a - b` (`b` none: of `a`): the sum over the directions of its tangent's
+    /// size, its range over the footprint to first order; none where it has no tangent.
+    fn footprint(
+        &mut self,
+        out: &mut Block,
+        a: ValueId,
+        b: Option<ValueId>,
+        ty: TypeId,
+    ) -> Option<ValueId> {
+        let mut sum: Option<ValueId> = None;
+        for k in 0..self.n as usize {
+            let ta = self.t(a, k);
+            let tb = b.and_then(|b| self.t(b, k));
+            let t = match (ta, tb) {
+                (None, None) => continue,
+                (Some(x), None) => x,
+                (None, Some(y)) => self.emit(out, ty, Expr::Unary(UnOp::Neg, y)),
+                (Some(x), Some(y)) => self.bin(out, BinOp::Sub, x, y, ty),
+            };
+            let size = self.builtin(out, Builtin::Abs, vec![t], ty);
+            sum = Some(match sum {
+                None => size,
+                Some(s) => self.bin(out, BinOp::Add, s, size, ty),
+            });
+        }
+        sum
+    }
+
+    /// `fract(x)` box-filtered over a footprint `w` wide (`w` at least `NARROWEST`), from
+    /// `f = fract(x)` so large `x` keeps its precision. Under a period wide, `f` corrected by the
+    /// share of the footprint past each of `f`'s jumps (`h - f` below 0, `h - (1 - f)` past 1:
+    /// differences of nearby values, exact), so a footprint crossing none is `f` exactly; wider,
+    /// the difference of fract's integral (`u²/2` within a period, a half a period) at `f ± w/2`,
+    /// over `w`.
+    fn filtered_fract(&mut self, out: &mut Block, x: ValueId, w: ValueId, ty: TypeId) -> ValueId {
+        let f = self.builtin(out, Builtin::Fract, vec![x], ty);
+        let half = self.fc(out, ty, 0.5);
+        let one = self.fc(out, ty, 1.0);
+        let zero = self.zero(out, ty);
+        let h = self.bin(out, BinOp::Mul, w, half, ty);
+        let below = self.bin(out, BinOp::Sub, h, f, ty);
+        let below = self.builtin(out, Builtin::Max, vec![below, zero], ty);
+        let to_one = self.bin(out, BinOp::Sub, one, f, ty);
+        let past = self.bin(out, BinOp::Sub, h, to_one, ty);
+        let past = self.builtin(out, Builtin::Max, vec![past, zero], ty);
+        let jumps = self.bin(out, BinOp::Sub, below, past, ty);
+        let jumps = self.bin(out, BinOp::Div, jumps, w, ty);
+        let narrow = self.bin(out, BinOp::Add, f, jumps, ty);
+        let hi = self.bin(out, BinOp::Add, f, h, ty);
+        let lo = self.bin(out, BinOp::Sub, f, h, ty);
+        let ihi = self.fract_integral(out, hi, ty);
+        let ilo = self.fract_integral(out, lo, ty);
+        let d = self.bin(out, BinOp::Sub, ihi, ilo, ty);
+        let wide = self.bin(out, BinOp::Div, d, w, ty);
+        let is_wide = self.builtin(out, Builtin::Step, vec![one, w], ty);
+        self.builtin(out, Builtin::Mix, vec![narrow, wide, is_wide], ty)
+    }
+
+    /// `∫₀ᵘ fract`: `floor(u) / 2 + fract(u)² / 2`.
+    fn fract_integral(&mut self, out: &mut Block, u: ValueId, ty: TypeId) -> ValueId {
+        let half = self.fc(out, ty, 0.5);
+        let fl = self.builtin(out, Builtin::Floor, vec![u], ty);
+        let fr = self.builtin(out, Builtin::Fract, vec![u], ty);
+        let fr2 = self.bin(out, BinOp::Mul, fr, fr, ty);
+        let s = self.bin(out, BinOp::Add, fl, fr2, ty);
+        self.bin(out, BinOp::Mul, s, half, ty)
+    }
+
+    /// What box-filtering `|d|` over a footprint `w` wide adds to `|d|`: `max(w/2 - |d|, 0)² / w`
+    /// (the filtered value is `(d² + w²/4) / w` within `w/2` of 0, `|d|` beyond). Computed from
+    /// `|d|` and not from the integral's ends, so it's exactly 0 where the footprint misses the
+    /// kink however large `d` is.
+    fn kink(&mut self, out: &mut Block, d: ValueId, w: ValueId, ty: TypeId) -> ValueId {
+        let half = self.fc(out, ty, 0.5);
+        let zero = self.zero(out, ty);
+        let h = self.bin(out, BinOp::Mul, w, half, ty);
+        let a = self.builtin(out, Builtin::Abs, vec![d], ty);
+        let inside = self.bin(out, BinOp::Sub, h, a, ty);
+        let inside = self.builtin(out, Builtin::Max, vec![inside, zero], ty);
+        let sq = self.bin(out, BinOp::Mul, inside, inside, ty);
+        self.bin(out, BinOp::Div, sq, w, ty)
+    }
+
+    /// `step(0, x)` box-filtered over a footprint `w` wide: the share of it past 0.
+    fn filtered_step(&mut self, out: &mut Block, x: ValueId, w: ValueId, ty: TypeId) -> ValueId {
+        let half = self.fc(out, ty, 0.5);
+        let r = self.bin(out, BinOp::Div, x, w, ty);
+        let r = self.bin(out, BinOp::Add, r, half, ty);
+        self.builtin(out, Builtin::Saturate, vec![r], ty)
+    }
+
+    /// A footprint at least `NARROWEST` wide.
+    fn widened(&mut self, out: &mut Block, w: ValueId, ty: TypeId) -> ValueId {
+        let narrowest = self.fc(out, ty, NARROWEST);
+        self.builtin(out, Builtin::Max, vec![w, narrowest], ty)
+    }
+
+    /// `v = b(args)` in a filtering derivation: `b`'s value box-filtered over its operand's
+    /// footprint (`footprint`), or its own value where the footprint is narrower than
+    /// `NARROWEST` (a `mix` with a weight of 0 keeps it exactly). The kinked builtins are their
+    /// own value and the corrections their kinks add (`kink`): `abs` `|x| + k(x)`, `min` and
+    /// `max` `∓ k(a - b) / 2`, the clamps `+ (k(x - lo) - k(x - hi)) / 2` (each over its own
+    /// difference's footprint). `floor` is `x - fract(x)`, `ceil` `x + fract(-x)`, `round`
+    /// `floor(x + 1/2)`, `trunc` `floor(x) + 1 - step(0, x)` (they differ only at the
+    /// integers), `sign` `2 step(0, x) - 1`.
+    fn filtered_let(&mut self, v: ValueId, b: Builtin, args: &[ValueId], out: &mut Block) {
+        use Builtin as B;
+        let ty = self.ty(v);
+        let own = self.emit(out, ty, Expr::Builtin(b, args.to_vec()));
+        // The operand whose footprint matters: a step's edge from its point, min's and max's
+        // difference, the clamps' the wider of their argument less each bound's, the rest's
+        // argument.
+        let (a, minus) = match b {
+            B::Step => (args[1], Some(args[0])),
+            B::Min | B::Max => (args[0], Some(args[1])),
+            _ => (args[0], None),
+        };
+        let (w, bounds) = if b == B::Clamp {
+            let wl = self.footprint(out, a, Some(args[1]), ty);
+            let wh = self.footprint(out, a, Some(args[2]), ty);
+            let w = match (wl, wh) {
+                (Some(l), Some(h)) => Some(self.builtin(out, B::Max, vec![l, h], ty)),
+                (l, h) => l.or(h),
+            };
+            (w, Some((wl, wh)))
+        } else {
+            (self.footprint(out, a, minus, ty), None)
+        };
+        let Some(w) = w else {
+            out.push(Stmt::Let(v, Expr::Builtin(b, args.to_vec())));
+            return;
+        };
+        let narrowest = self.fc(out, ty, NARROWEST);
+        let used = self.builtin(out, B::Step, vec![narrowest, w], ty);
+        let w = self.widened(out, w, ty);
+        let one = self.fc(out, ty, 1.0);
+        let half = self.fc(out, ty, 0.5);
+        let x = args[0];
+        let filtered = match b {
+            B::Fract => self.filtered_fract(out, x, w, ty),
+            B::Floor => {
+                let f = self.filtered_fract(out, x, w, ty);
+                self.bin(out, BinOp::Sub, x, f, ty)
+            }
+            B::Ceil => {
+                let nx = self.emit(out, ty, Expr::Unary(UnOp::Neg, x));
+                let f = self.filtered_fract(out, nx, w, ty);
+                self.bin(out, BinOp::Add, x, f, ty)
+            }
+            B::Round => {
+                let xh = self.bin(out, BinOp::Add, x, half, ty);
+                let f = self.filtered_fract(out, xh, w, ty);
+                self.bin(out, BinOp::Sub, xh, f, ty)
+            }
+            B::Trunc => {
+                let f = self.filtered_fract(out, x, w, ty);
+                let fl = self.bin(out, BinOp::Sub, x, f, ty);
+                let st = self.filtered_step(out, x, w, ty);
+                let up = self.bin(out, BinOp::Sub, one, st, ty);
+                self.bin(out, BinOp::Add, fl, up, ty)
+            }
+            B::Step => {
+                let d = self.bin(out, BinOp::Sub, args[1], args[0], ty);
+                self.filtered_step(out, d, w, ty)
+            }
+            B::Sign => {
+                let st = self.filtered_step(out, x, w, ty);
+                let two = self.fc(out, ty, 2.0);
+                let t = self.bin(out, BinOp::Mul, st, two, ty);
+                self.bin(out, BinOp::Sub, t, one, ty)
+            }
+            B::Abs => {
+                let k = self.kink(out, x, w, ty);
+                self.bin(out, BinOp::Add, own, k, ty)
+            }
+            B::Min | B::Max => {
+                let d = self.bin(out, BinOp::Sub, args[0], args[1], ty);
+                let k = self.kink(out, d, w, ty);
+                let k = self.bin(out, BinOp::Mul, k, half, ty);
+                let op = if b == B::Min { BinOp::Sub } else { BinOp::Add };
+                self.bin(out, op, own, k, ty)
+            }
+            B::Clamp | B::Saturate => {
+                let (lo, hi) =
+                    if b == B::Clamp { (args[1], args[2]) } else { (self.zero(out, ty), one) };
+                // Each bound's kink over the footprint of `x` less it (a bound with no tangent
+                // shares `x`'s).
+                let (wl, wh) = match bounds {
+                    Some((l, h)) => (l, h),
+                    None => (None, None),
+                };
+                let wl = match wl {
+                    Some(l) => self.widened(out, l, ty),
+                    None => w,
+                };
+                let wh = match wh {
+                    Some(h) => self.widened(out, h, ty),
+                    None => w,
+                };
+                let xl = self.bin(out, BinOp::Sub, x, lo, ty);
+                let xh = self.bin(out, BinOp::Sub, x, hi, ty);
+                let kl = self.kink(out, xl, wl, ty);
+                let kh = self.kink(out, xh, wh, ty);
+                let k = self.bin(out, BinOp::Sub, kl, kh, ty);
+                let k = self.bin(out, BinOp::Mul, k, half, ty);
+                self.bin(out, BinOp::Add, own, k, ty)
+            }
+            _ => own,
+        };
+        out.push(Stmt::Let(v, Expr::Builtin(B::Mix, vec![own, filtered, used])));
     }
 
     /// The `k`th tangent of `v = e`.

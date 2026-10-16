@@ -21,6 +21,7 @@ pub(crate) fn call(
 ) -> Option<ir::ValueId> {
     let kind = match lang {
         Lang::IntervalOf => DeriveKind::Interval,
+        Lang::Filtered => DeriveKind::Filtered,
         Lang::LiftGradient => DeriveKind::Literals,
         Lang::LiftReads => DeriveKind::Reads,
         _ => DeriveKind::ValueAndGradient,
@@ -35,6 +36,7 @@ pub(crate) fn call(
     };
     let (input, output) = match kind {
         DeriveKind::Interval => (substs[0], substs.get(1).copied()),
+        DeriveKind::Filtered => (substs[0], None),
         // `gradient<const N>`: the literals' type and the result's are the call's.
         DeriveKind::Literals => {
             let which = fl.place_src_ty(c.args[1].place()?);
@@ -51,6 +53,10 @@ pub(crate) fn call(
     if kind != DeriveKind::Reads {
         let x = fl.arg_value(&c.args[1])?;
         args.push(ir::Arg::Value(x));
+    }
+    if kind == DeriveKind::Filtered {
+        let width = fl.arg_value(&c.args[2])?;
+        args.push(ir::Arg::Value(width));
     }
     let ret = fl.mb.m.functions[callee.index()].ret?;
     let v = fl.value(ret, ir::Expr::Call(callee, args));
@@ -102,6 +108,19 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
                 return ir::Function::new("value_and_gradient", params, Some(tuple));
             }
             ir::Function::new("value_and_gradient", params, None)
+        }
+        DeriveKind::Filtered => {
+            let f32 = mb.m.types.f32();
+            if let Some(x) = x {
+                params.push(ir::Param { name: "x".into(), ty: x, by_ref: false, mutable: false });
+                params.push(ir::Param {
+                    name: "width".into(),
+                    ty: x,
+                    by_ref: false,
+                    mutable: false,
+                });
+            }
+            ir::Function::new("filtered", params, Some(f32))
         }
         DeriveKind::Literals => {
             let w = cx.lower_ty(mb, *input, span);
@@ -213,6 +232,7 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
         let at = mb.callers.get(&p.id).map(|c| c.1);
         let what = match &p.key {
             InstanceKey::Derived { kind: DeriveKind::Interval, .. } => "its interval",
+            InstanceKey::Derived { kind: DeriveKind::Filtered, .. } => "its filtered value",
             _ => "its gradient",
         };
         let msg = if r.contains(&p.id) {
@@ -346,6 +366,13 @@ fn build(
                     output.is_some(),
                 ),
                 None => Err(ir::Error::internal("a gradient's signature has no input")),
+            }
+        }
+        // The captures are every parameter but the last two, the input and its width.
+        DeriveKind::Filtered => {
+            match (mb.m.functions[id.index()].params.len() as u32).checked_sub(2) {
+                Some(ncap) => ir::derive::filtered(&mut mb.m, &mut mb.derived, inner, ncap, target),
+                None => Err(ir::Error::internal("a filtered value's signature has no input")),
             }
         }
         DeriveKind::Interval => {

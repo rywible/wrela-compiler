@@ -514,6 +514,7 @@ fn derived_callables(p: &Program, f: FnId, body: &Body) -> Vec<(BodyId, Span)> {
                     | Lang::ValueAndGradient
                     | Lang::ValueGradientWith
                     | Lang::IntervalOf
+                    | Lang::Filtered
                     | Lang::LiftGradient,
             )
         );

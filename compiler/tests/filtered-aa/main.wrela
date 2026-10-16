@@ -1,0 +1,55 @@
+// A checkered ground plane seen to its horizon, three ways: each pixel's point sample (left),
+// `std::derive::filtered` over the pixel's footprint (middle), and the mean of 16 × 16 samples
+// across the pixel (right), the reference. Past a few metres the checks are finer than a pixel,
+// and a point sample of them aliases into moiré; the filtered pixels fade them to grey.
+use std::derive::filtered
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
+
+const W: f32 = 128.0
+const H: f32 = 96.0
+
+/// The checker: unit squares, a product of its two axes' stripes (`filtered`'s note).
+fn checker(p: vec2) -> f32 {
+    0.5 - 0.5 * (1.0 - 2.0 * step(0.5, fract(p.x))) * (1.0 - 2.0 * step(0.5, fract(p.y)))
+}
+
+/// Where the ray through pixel `px` (of a panel) meets the ground, 1.5 below the eye, in squares
+/// half a metre wide; the sky above the horizon is far off.
+fn ground(px: vec2) -> vec2 {
+    let ray = normalize(vec3((px.x - W * 0.5) / H, (H * 0.35 - px.y) / H, 1.0))
+    let t = 1.5 / max(-ray.y, 0.002)
+    vec2(ray.x * t, ray.z * t) * 2.0
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+@fragment
+fn panels(pixel: FragCoord) -> vec4 {
+    let panel = floor(pixel.position.x / W)
+    let px = vec2(pixel.position.x - panel * W, pixel.position.y)
+    let uv = ground(px)
+    // The pixel's footprint on the ground (taken before any branch: derivatives).
+    let width = fwidth(uv)
+    let filtered_value = filtered(checker, uv, width)
+    var reference = 0.0
+    for j in 0..16 {
+        for i in 0..16 {
+            let o = (vec2(f32(i), f32(j)) + vec2(0.5)) / 16.0 - vec2(0.5)
+            reference += checker(ground(px + o))
+        }
+    }
+    reference /= 256.0
+    let v = if panel < 0.5 { checker(uv) } else if panel < 1.5 { filtered_value } else { reference }
+    vec4(vec3(v), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, cover, panels, vertices: 3)
+    screen.present()
+}

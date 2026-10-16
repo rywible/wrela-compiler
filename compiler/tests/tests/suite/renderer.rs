@@ -436,6 +436,45 @@ fn temporal_keeps_swaying_grass_that_draws_its_motion() {
     assert!(4 * with <= 3 * without, "with motion {with}, without {without}");
 }
 
+/// `std::derive::filtered` antialiases a checkered ground plane at a sample a pixel: against the
+/// mean of 256 samples a pixel, its error is at most a quarter of a point sample's (which breaks
+/// into moiré past a few metres), on the GPU; and Chrome draws what the native host draws.
+#[test]
+#[ignore = "needs a GPU and Chrome"]
+fn a_filtered_checker_fades_where_a_point_sample_aliases() {
+    let (dir, rel) = page("compiler/tests/filtered-aa", "filtered-aa");
+    let run = Host::load(&dir).expect("load").run_frames(&[0.0], 384, 96).expect("run");
+    let at = |x: usize, y: usize| f64::from(run.frame[4 * (y * 384 + x)]);
+    let (mut point, mut filtered) = (0.0, 0.0);
+    for y in 0..96 {
+        for x in 0..128 {
+            let reference = at(x + 256, y);
+            point += (at(x, y) - reference).abs();
+            filtered += (at(x + 128, y) - reference).abs();
+        }
+    }
+    let n = 128.0 * 96.0;
+    eprintln!("against 256 samples: point {:.2}/255, filtered {:.2}/255", point / n, filtered / n);
+    assert!(4.0 * filtered <= point, "filtered {filtered}, point {point}");
+    let browser = run_in_chrome(&rel, 1, 384, 96, 60.0);
+    frames_match(&browser.frame, &run.frame);
+}
+
+/// `std::derive::filtered` gives each builtin its footprint's average on the GPU, as on the CPU:
+/// the fixture's 16 pixels, a case each (std's `filtered_builtins_are_their_footprints_average`),
+/// are all white, natively and in Chrome.
+#[test]
+#[ignore = "needs a GPU and Chrome"]
+fn filtered_builtins_are_their_footprints_average_on_the_gpu() {
+    let (dir, rel) = page("compiler/tests/filtered-cases", "filtered-cases");
+    let native = Host::load(&dir).expect("load").run_frames(&[0.0], 16, 1).expect("run").frame;
+    let browser = run_in_chrome(&rel, 1, 16, 1, 60.0).frame;
+    for (host, frame) in [("native", &native), ("Chrome", &browser)] {
+        let failed: Vec<usize> = (0..16).filter(|&k| frame[4 * k + 1] != 255).collect();
+        assert!(failed.is_empty(), "{host}: cases {failed:?} are not their average");
+    }
+}
+
 /// Leaves and a solid silhouette against sky are partial coverage. Their stored depth can
 /// change with jitter without the history becoming invalid. Keep that history and the
 /// spatial background contribution, while the opaque rows above retain depth rejection.

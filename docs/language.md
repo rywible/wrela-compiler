@@ -1769,6 +1769,7 @@ The compiler derives a function's gradient and its interval over a box from the 
 |---|---|
 | `gradient` | The forward-mode derivative |
 | `interval` | A conservative range over a box |
+| `filtered` | The value box-filtered over a footprint (antialiasing) |
 | Lipschitz bound | Not a compiler feature: a stdlib method, `lipschitz(near)` (§17). Debug builds and tests check it against the derived local bound, the `interval` of the `gradient`. |
 
 ```wrela
@@ -1784,6 +1785,7 @@ The derivations are `std::derive::{gradient, value_and_gradient, value_gradient_
 
 - `value_gradient_with` takes a function that returns `(f32, T)` and gives `(f32, X, T)`: the value, its gradient, and the rest as the function computes it, from one derived evaluation. So a shader gets a field's normal and channels without computing its distance twice.
 - `interval` takes the input's box type (`Interval`, `Box2`, `Box3`, `Box4`) and returns an `Interval`. For a vector result, it returns the vector's box: each component's range, from one derived function, the same as the per-component intervals.
+- `filtered(f, at, width)` gives `f(at)` averaged over a footprint `width` wide along each of `at`'s components: a pixel's spread in `f`'s input, from `fwidth`, for example. It is forward-mode differentiation with each direction's seed its width, so each value's tangents span its range over the footprint, to first order. Each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`, `abs`, `min`, `max`, `clamp` and `saturate` on the input's path takes the average of its operand's range in place of its point value: the point value plus what the jumps or kinks inside the footprint add. So a footprint that crosses none keeps the point's value exactly, at any magnitude, and a footprint under 10⁻⁶ keeps it too. Each value is averaged alone: a product of patterns along different components averages exactly, but `abs` of a difference of two averaged patterns does not, and what a branch on the input chooses is not filtered.
 - `std::field::Surface` provides `gradient`, `sample` (distance and gradient) and `interval` for every surface.
 
 The compiler derives them from the function's body, and from every function it calls (`derive.gradient`, `derive.interval`):
@@ -1897,7 +1899,7 @@ The compiler knows the language, a closed list of standard library (std) items a
   - `std::host`: `host_command`
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`, `Shipped`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`
-  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`
+  - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `filtered`
   - `std::math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`, `log`, `log2`, `pow`
   - `std::par`: `par_each`, `par_each_chunk`, `par_map_reduce`, `par_map_reduce_chunk`, `run_chunks`
   - `std::audio`: `start_voice`

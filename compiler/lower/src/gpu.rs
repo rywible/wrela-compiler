@@ -988,7 +988,8 @@ pub(crate) fn intrinsic(
             l @ (Lang::Gradient
             | Lang::ValueAndGradient
             | Lang::ValueGradientWith
-            | Lang::IntervalOf),
+            | Lang::IntervalOf
+            | Lang::Filtered),
         ) => {
             return crate::derive::call(fl, l, substs, c, ty);
         }

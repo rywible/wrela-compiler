@@ -164,6 +164,19 @@ pub fn value_gradient_with<X: Domain, T>(f: fn(X) -> (f32, T), at: X) -> (f32, X
 @intrinsic
 pub fn interval<X: Domain, Y: Domain>(f: fn(X) -> Y, over: X::Box) -> Y::Box {}
 
+/// `f(at)` box-filtered over a footprint `width` wide along each of `at`'s components (a pixel's
+/// spread in `f`'s input, say): each `fract`, `floor`, `ceil`, `round`, `trunc`, `step`, `sign`,
+/// `abs`, `min`, `max`, `clamp` and `saturate` on the input's path is replaced by its average
+/// over the range its operand spans in the footprint (to first order: the operand's derivative
+/// along each component, times the width there, summed in size). A point sample of a stripe or
+/// a checker aliases where its stripes are finer than a pixel; this one fades them to their
+/// mean. What a branch on the input chooses isn't filtered: write it with `step` or `mix`. Each
+/// value is averaged alone, to first order: a product of patterns along different components
+/// averages exactly, but `abs` of a difference of two averaged patterns doesn't (a checker is
+/// best a product of its stripes).
+@intrinsic
+pub fn filtered<X: Domain>(f: fn(X) -> f32, at: X, width: X) -> f32 {}
+
 // ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
 
 @test
@@ -205,4 +218,107 @@ fn samples_of_a_range_and_a_rectangle_stay_in_them() {
         let p = b.sample(3, i)
         assert(p.x >= b.lo.x && p.y >= b.lo.y && p.x < b.hi.x && p.y < b.hi.y)
     }
+}
+
+/// A footprint's mean of `f`, from `n` samples spread evenly across `[x - w/2, x + w/2]`.
+fn mean_over(f: fn(f32) -> f32, x: f32, w: f32, n: u32) -> f32 {
+    var s = 0.0
+    for i in 0..n {
+        s += f(x + w * ((f32(i) + 0.5) / f32(n) - 0.5))
+    }
+    s / f32(n)
+}
+
+/// Filtered stripes are near their footprint's mean, at every width: a point sample of stripes
+/// finer than the footprint is all one or all the other, the filtered value a share between.
+/// Over 64 points and widths from a thousandth of a stripe to many stripes, its error from a
+/// 4096-sample mean is at most a fifth of a point sample's, and under 0.05 on average.
+@test
+fn filtered_stripes_are_near_their_footprints_mean() {
+    let stripes = |u: f32| step(0.5, fract(u * 4.0))
+    var filtered_error = 0.0
+    var point_error = 0.0
+    var n = 0
+    for i in 0..64 {
+        let x = Interval { lo: -3.0, hi: 3.0 }.sample(3, i)
+        for w in [0.0005, 0.02, 0.1, 0.3, 1.0, 5.0] {
+            let mean = mean_over(stripes, x, w, 4096)
+            filtered_error += abs(filtered(stripes, x, w) - mean)
+            point_error += abs(stripes(x) - mean)
+            n += 1
+        }
+    }
+    assert(filtered_error <= 0.2 * point_error, f"{filtered_error} against {point_error}")
+    assert(filtered_error / f32(n) < 0.05, f"{filtered_error / f32(n)} on average")
+}
+
+/// A footprint of no width keeps the point's own value exactly; one wide over a checker of unit
+/// squares gives about half. The checker is written as a product of its two axes' stripes,
+/// which a box footprint averages exactly; `abs` of their difference would give 0 far off (each
+/// stripe's mean is a half, and the difference of the means is 0).
+@test
+fn filtered_checkers_are_the_point_up_close_and_grey_far_off() {
+    let checker = |p: vec2| {
+        0.5 - 0.5 * (1.0 - 2.0 * step(0.5, fract(p.x))) * (1.0 - 2.0 * step(0.5, fract(p.y)))
+    }
+    for i in 0..32 {
+        let p = Box2 { lo: vec2(-4.0), hi: vec2(4.0) }.sample(5, i)
+        assert(filtered(checker, p, vec2(0.0)) == checker(p), "a point's footprint changed it")
+        let far = filtered(checker, p, vec2(16.0))
+        assert(abs(far - 0.5) < 0.1, f"a wide footprint of a checker gave {far}")
+    }
+}
+
+fn near(got: f32, want: f32, what: str) {
+    assert(abs(got - want) <= 1.0e-5, f"{what}: {got}, not {want}")
+}
+
+/// Each builtin `filtered` box-filters, over a footprint of `x` itself, against its average
+/// worked out by hand: across a kink or a jump, beside one (a footprint that misses it keeps the
+/// point's value exactly, however large `x`), and just past fract's jump with a footprint of a
+/// few ulps (f32's own: `1 - 2⁻²⁴` and `2⁻¹⁹`, where `f + w/2 - 1` rounds). A clamp whose low
+/// bound moves with `x` has no kink there.
+@test
+fn filtered_builtins_are_their_footprints_average() {
+    let trunc_of = |u: f32| trunc(u)
+    near(filtered(trunc_of, at: 0.0, width: 1.0), 0.0, "trunc across 0")
+    near(filtered(trunc_of, at: 1.0, width: 1.0), 0.5, "trunc across 1")
+    near(filtered(trunc_of, at: -1.0, width: 1.0), -0.5, "trunc across -1")
+    near(filtered(trunc_of, at: -0.5, width: 1.0), 0.0, "trunc below 0")
+    let floor_of = |u: f32| floor(u)
+    near(filtered(floor_of, at: 0.0, width: 1.0), -0.5, "floor across 0")
+    assert(filtered(floor_of, at: 2.5, width: 0.5) == 2.0, "floor beside no jump")
+    let ceil_of = |u: f32| ceil(u)
+    near(filtered(ceil_of, at: 0.0, width: 1.0), 0.5, "ceil across 0")
+    let round_of = |u: f32| round(u)
+    near(filtered(round_of, at: 0.5, width: 1.0), 0.5, "round across a half")
+    let fract_of = |u: f32| fract(u)
+    near(filtered(fract_of, at: 1000.25, width: 0.1), 0.25, "fract far off")
+    near(filtered(fract_of, at: 0.0, width: 1.0), 0.5, "fract across 0")
+    near(
+        filtered(fract_of, at: 1.0 - 1.0 / 16777216.0, width: 1.0 / 524288.0),
+        0.53124994,
+        "fract by ulps",
+    )
+    let abs_of = |u: f32| abs(u)
+    assert(filtered(abs_of, at: 1000000.0, width: 0.01) == 1000000.0, "abs far from its kink")
+    near(filtered(abs_of, at: 0.0, width: 1.0), 0.25, "abs across 0")
+    near(filtered(abs_of, at: 0.25, width: 1.0), 0.3125, "abs beside 0")
+    let min_of = |u: f32| min(u, 0.0)
+    let max_of = |u: f32| max(u, 0.0)
+    assert(filtered(min_of, at: 1000000.0, width: 1.0) == 0.0, "min far from its kink")
+    near(filtered(min_of, at: 0.0, width: 1.0), -0.125, "min across 0")
+    near(filtered(max_of, at: 0.0, width: 1.0), 0.125, "max across 0")
+    let saturate_of = |u: f32| saturate(u)
+    assert(filtered(saturate_of, at: 1000000.0, width: 1.0) == 1.0, "saturate far from its kinks")
+    near(filtered(saturate_of, at: 0.0, width: 1.0), 0.125, "saturate across 0")
+    let clamp_of = |u: f32| clamp(u, -1.0, 1.0)
+    near(filtered(clamp_of, at: 1.0, width: 1.0), 0.875, "clamp across its top")
+    let moving = |u: f32| clamp(u, u - 0.25, 1.0)
+    near(filtered(moving, at: 1.0, width: 1.0), 0.875, "a clamp whose low bound moves with x")
+    let sign_of = |u: f32| sign(u)
+    near(filtered(sign_of, at: 0.0, width: 1.0), 0.0, "sign across 0")
+    near(filtered(sign_of, at: 0.25, width: 1.0), 0.5, "sign beside 0")
+    let step_of = |u: f32| step(0.0, u)
+    near(filtered(step_of, at: 0.25, width: 1.0), 0.75, "step beside 0")
 }

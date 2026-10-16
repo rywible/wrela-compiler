@@ -422,6 +422,7 @@ lang_items! {
     ValueAndGradient = "std::derive::value_and_gradient",
     ValueGradientWith = "std::derive::value_gradient_with",
     IntervalOf = "std::derive::interval",
+    Filtered = "std::derive::filtered",
     LiftGradient = "std::lift::gradient",
     LiftReads = "std::lift::reads",
     LiftCount = "std::lift::literal_count",
