@@ -118,3 +118,90 @@ class ChromeDiscovery(unittest.TestCase):
         self.assertTrue(headless.chrome_binary({}, 'darwin', found).startswith('/Applications/'))
         self.assertIn('--use-angle=vulkan', headless.platform_args('linux'))
         self.assertEqual(headless.platform_args('darwin'), [])
+
+
+class DevTools(unittest.TestCase):
+    """The DevTools client (`chrome_session.cdp`) against a WebSocket server of the test's own."""
+
+    @staticmethod
+    def serve(answer):
+        import base64, hashlib, json, socket, struct
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen(1)
+        seen = []
+
+        def frame(data, opcode=1):
+            head = bytes([0x80 | opcode])
+            n = len(data)
+            head += bytes([n]) if n < 126 else bytes([126]) + struct.pack('>H', n)
+            return head + data
+
+        def run():
+            conn, _ = listener.accept()
+            with conn:
+                head = b''
+                while b'\r\n\r\n' not in head:
+                    head += conn.recv(4096)
+                key = [l.split(b': ')[1] for l in head.split(b'\r\n') if l.startswith(b'Sec-WebSocket-Key')][0]
+                accept = base64.b64encode(hashlib.sha1(key + chrome_session.Socket.GUID.encode()).digest())
+                conn.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n'
+                             b'Sec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+                buffer = b''
+                def read(n):
+                    nonlocal buffer
+                    while len(buffer) < n:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            raise EOFError
+                        buffer += chunk
+                    out, buffer = buffer[:n], buffer[n:]
+                    return out
+                try:
+                    while True:
+                        first, second = read(2)
+                        n = second & 0x7f
+                        if n == 126:
+                            n = struct.unpack('>H', read(2))[0]
+                        assert second & 0x80, 'a client masks its frames'
+                        mask = read(4)
+                        data = bytes(b ^ mask[i % 4] for i, b in enumerate(read(n)))
+                        if first & 0x0f == 10:
+                            seen.append('pong')
+                            continue
+                        message = json.loads(data)
+                        seen.append(message['method'])
+                        # A ping and an event that answers nothing come before each answer.
+                        conn.sendall(frame(b'hi', opcode=9))
+                        conn.sendall(frame(json.dumps({'method': 'Page.event'}).encode()))
+                        conn.sendall(frame(json.dumps({'id': message['id'], **answer(message)}).encode()))
+                except EOFError:
+                    pass
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return listener.getsockname()[1], seen, thread
+
+    def test_commands_run_in_order_and_a_page_is_waited_for(self):
+        evaluations = []
+        def answer(message):
+            if message['method'] == 'Runtime.evaluate':
+                evaluations.append(1)
+                return {'result': {'result': {'value': len(evaluations) >= 2}}}
+            return {'result': {'ok': message['method']}}
+        port, seen, thread = self.serve(answer)
+        answers = chrome_session.cdp(port, 'tab', [
+            {'until': 'ready'}, {'wait': 0}, {'method': 'Input.insertText', 'params': {'text': 'か'}}])
+        thread.join(5)
+        self.assertEqual(answers, [{'ok': 'Input.insertText'}])
+        self.assertEqual([s for s in seen if s != 'pong'], ['Runtime.evaluate', 'Runtime.evaluate', 'Input.insertText'])
+        self.assertIn('pong', seen)
+
+    def test_an_error_or_a_page_never_ready_says_why(self):
+        port, _, thread = self.serve(lambda m: {'error': {'message': 'no such key'}})
+        with self.assertRaisesRegex(ValueError, 'Input.dispatchKeyEvent: no such key'):
+            chrome_session.cdp(port, 'tab', [{'method': 'Input.dispatchKeyEvent'}])
+        thread.join(5)
+        port, _, thread = self.serve(lambda m: {'result': {'result': {'value': False}}})
+        with self.assertRaisesRegex(ValueError, 'never had ready'):
+            chrome_session.cdp(port, 'tab', [{'until': 'ready', 'timeout': 0.2}])
+        thread.join(5)

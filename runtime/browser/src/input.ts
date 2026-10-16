@@ -3,7 +3,7 @@
 // worker. The ring is a SharedArrayBuffer, so an event written before a frame starts is in that
 // frame: it doesn't wait behind other messages.
 
-import { BUTTONS, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
+import { ASSIST_ACTIONS, BUTTONS, COMPOSE_MAX, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
 
 /** One event's EVENT_SIZE bytes: its kind, its modifiers, then four words. */
 export function encodeEvent(kind: number, modifiers: number, a: number, b: number, c: number, d: number): Uint8Array {
@@ -38,6 +38,21 @@ export function keyEvent(down: boolean, key: number, repeat: boolean, modifiers:
 }
 
 export const textEvent = (codepoint: number) => encodeEvent(EventKind.Text, 0, codepoint, 0, 0, 0);
+
+/** The `Compose` events for `text`, the text an input method is composing (runtime/abi
+ * `input`): one a character, at most COMPOSE_MAX, or one of length 0 when it's empty. A host
+ * writes them together (`InputRing.writeAll`). */
+export function composeEvents(text: string): Uint8Array[] {
+  const chars = [...text].slice(0, COMPOSE_MAX);
+  if (chars.length === 0) return [encodeEvent(EventKind.Compose, 0, 0, 0, 0, 0)];
+  return chars.map((c, i) => encodeEvent(EventKind.Compose, 0, c.codePointAt(0)!, i, chars.length, 0));
+}
+
+/** A paste, by the serial its data is kept under (`clipboard/pasted`). */
+export const pasteEvent = (serial: number) => encodeEvent(EventKind.Paste, 0, serial, 0, 0, 0);
+
+/** An assistive technology's action (ASSIST_ACTIONS' number) on the program's node `node`. */
+export const assistEvent = (node: number, action: number) => encodeEvent(EventKind.Assist, 0, node, action, 0, 0);
 
 /** A gamepad's button (the standard mapping's number), its value (0 to 1) and whether it's
  * pressed. */
@@ -218,6 +233,33 @@ export function parseScript(text: string): Scripted[] {
         }
         break;
       }
+      case "compose": {
+        const t = o.text;
+        if (typeof t !== "string") throw at("`text` is missing");
+        const chars = [...t];
+        if (chars.some(c => { const cp = c.codePointAt(0)!; return cp >= 0xd800 && cp <= 0xdfff; })) {
+          throw at("`text` has a lone surrogate, which isn't a character");
+        }
+        if (chars.length > COMPOSE_MAX) throw at(`\`text\` is more than ${COMPOSE_MAX} characters`);
+        for (const e of composeEvents(t)) push(e);
+        break;
+      }
+      case "paste": {
+        const v = o.serial;
+        if (v !== undefined && !whole(v)) throw at("`serial` must be a whole number");
+        push(pasteEvent(v === undefined ? 0 : (v as number)));
+        break;
+      }
+      case "assist": {
+        if (!whole(o.node)) throw at("`node` must be a whole number");
+        let action = 0;
+        if (o.action !== undefined) {
+          action = ASSIST_ACTIONS.findIndex((a) => a === o.action);
+          if (action < 0) throw at("`action` is activate, select or focus");
+        }
+        push(assistEvent(o.node as number, action));
+        break;
+      }
       case "padbutton": {
         const [p, b] = [pad(), named("button", PAD_BUTTONS)];
         if (o.pressed === undefined) throw at("`pressed` is missing");
@@ -267,7 +309,7 @@ export function parseScript(text: string): Scripted[] {
         break;
       }
       default:
-        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)`);
+        throw at(`\`${type}\` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)`);
     }
   });
   return out;
@@ -320,15 +362,25 @@ export class InputRing {
     return new InputRing(new SharedArrayBuffer(InputRing.HEADER + InputRing.CAPACITY * InputRing.SLOT));
   }
 
-  /** Writes an event, stamped with `time` (`epochNow`). */
+  /** Writes an event, stamped with `time` (`epochNow`). False if the ring is full. */
   write(event: Uint8Array, time: number): boolean {
+    return this.writeAll([event], time);
+  }
+
+  /** Writes `events` together, each stamped with `time`, or none of them if there isn't room
+   * for all (false): a reader then never sees part of a group, such as a composition's change,
+   * that was written whole. */
+  writeAll(events: readonly Uint8Array[], time: number): boolean {
     const written = Atomics.load(this.#counts, 0) >>> 0;
     const slowest = (Atomics.load(this.#counts, 3) !== 0 ? Atomics.load(this.#counts, 2) : Atomics.load(this.#counts, 1)) >>> 0;
-    if (((written - slowest) >>> 0) >= InputRing.CAPACITY) return false;
-    const at = (written % InputRing.CAPACITY) * InputRing.SLOT;
-    this.#bytes.set(event, at);
-    this.#view.setFloat64(at + EVENT_SIZE, time, true);
-    Atomics.store(this.#counts, 0, written + 1);
+    if (((written - slowest) >>> 0) + events.length > InputRing.CAPACITY) return false;
+    events.forEach((event, i) => {
+      const at = this.#slot(written + i);
+      this.#bytes.set(event, at);
+      this.#view.setFloat64(at + EVENT_SIZE, time, true);
+    });
+    // The count moves once, after every event is in place.
+    Atomics.store(this.#counts, 0, written + events.length);
     return true;
   }
 

@@ -5,6 +5,7 @@ import { BrowserPlatform } from "./platform.ts";
 import { AUDIO_CHANNELS, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { epochNow, InputRing } from "./input.ts";
+import { Overlay } from "./assist.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
 import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
@@ -319,7 +320,8 @@ function start(): void {
     const offscreen = canvas.transferControlToOffscreen();
     const { width, height } = devicePixels(canvas);
     const sized = { width, height };
-    listen(canvas, ring, epochNow, () => sized);
+    const overlay = new Overlay(canvas, (e) => ring.write(e, epochNow()), () => ({ rect: canvas.getBoundingClientRect(), ...sized }));
+    platform.attach(listen(canvas, ring, epochNow, () => sized, overlay), overlay);
     // A test's input is its script: a pad on the machine that runs it isn't heard.
     if (!test) pollPads(ring, epochNow, () => platform.active && document.visibilityState === "visible" && document.hasFocus());
     // `wrela run` serves the page with this mark: it sends new literals and builds (hot reload).

@@ -2,8 +2,9 @@
 
 import { expect, test } from "bun:test";
 import { EVENT_SIZE, EventKind } from "../src/abi.gen.ts";
-import { InputRing, keyCode, keyEvent, padAxisEvent, padButtonEvent, parseScript, pointerEvent, textEvent } from "../src/input.ts";
+import { composeEvents, InputRing, keyCode, keyEvent, padAxisEvent, padButtonEvent, parseScript, pasteEvent, pointerEvent, textEvent } from "../src/input.ts";
 import { listen, type PadState, padChanges, pollPads } from "../src/listen.ts";
+import { domEvent, onPage } from "./page.ts";
 
 test("the ring gives what was written, once, in order, with when", () => {
   const ring = InputRing.create();
@@ -80,40 +81,131 @@ test("keys are the ABI's numbers", () => {
   expect(keyCode("IntlRo")).toBe(0);
 });
 
-test("losing focus or a pointer releases controls whose up event cannot arrive", () => {
-  const original = Object.getOwnPropertyDescriptor(globalThis, "window");
-  const page = new EventTarget();
-  Object.defineProperty(globalThis, "window", { value: page, configurable: true });
-  try {
-    const canvas = Object.assign(new EventTarget(), {
-      getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }),
-      setPointerCapture() {},
-    });
-    const ring = InputRing.create();
-    listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
-    const event = (type: string, fields: Record<string, unknown>) => Object.assign(new Event(type), {
-      shiftKey: false, ctrlKey: false, altKey: false, metaKey: false, ...fields,
-    });
-    page.dispatchEvent(event("keydown", { code: "KeyA", key: "a", repeat: false }));
-    canvas.dispatchEvent(event("pointerdown", { clientX: 5, clientY: 6, pointerId: 1, button: 0 }));
-    ring.read();
-    page.dispatchEvent(new Event("blur"));
-    expect(ring.read().events).toEqual(new Uint8Array([
-      ...keyEvent(false, keyCode("KeyA"), false, 0), ...pointerEvent(EventKind.PointerUp, 5, 6, 0, 0),
-    ]));
-    page.dispatchEvent(new Event("blur"));
-    expect(ring.read().events.length).toBe(0);
-    canvas.dispatchEvent(event("pointerdown", { clientX: 8, clientY: 9, pointerId: 2, button: 2 }));
-    ring.read();
-    canvas.dispatchEvent(event("pointercancel", { pointerId: 2 }));
-    expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerUp, 8, 9, 2, 0));
-    canvas.dispatchEvent(event("lostpointercapture", { pointerId: 2 }));
-    expect(ring.read().events.length).toBe(0);
-  } finally {
-    if (original) Object.defineProperty(globalThis, "window", original);
-    else delete (globalThis as Record<string, unknown>)["window"];
-  }
+test("losing focus or a pointer releases controls whose up event cannot arrive", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const ring = InputRing.create();
+  listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
+  page.dispatchEvent(domEvent("keydown", { code: "KeyA", key: "a", repeat: false }));
+  canvas.dispatchEvent(domEvent("pointerdown", { clientX: 5, clientY: 6, pointerId: 1, button: 0 }));
+  ring.read();
+  page.dispatchEvent(new Event("blur"));
+  expect(ring.read().events).toEqual(new Uint8Array([
+    ...keyEvent(false, keyCode("KeyA"), false, 0), ...pointerEvent(EventKind.PointerUp, 5, 6, 0, 0),
+  ]));
+  page.dispatchEvent(new Event("blur"));
+  expect(ring.read().events.length).toBe(0);
+  canvas.dispatchEvent(domEvent("pointerdown", { clientX: 8, clientY: 9, pointerId: 2, button: 2 }));
+  ring.read();
+  canvas.dispatchEvent(domEvent("pointercancel", { pointerId: 2 }));
+  expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerUp, 8, 9, 2, 0));
+  canvas.dispatchEvent(domEvent("lostpointercapture", { pointerId: 2 }));
+  expect(ring.read().events.length).toBe(0);
+}));
+
+const bytes = (events: Uint8Array[]) => new Uint8Array(events.flatMap((e) => [...e]));
+const chars = (text: string) => [...text].map((c) => textEvent(c.codePointAt(0)!));
+
+test("a group is written whole or not at all", () => {
+  const ring = InputRing.create();
+  for (let i = 0; i < InputRing.CAPACITY - 1; i++) ring.write(textEvent(i), i);
+  expect(ring.writeAll(composeEvents("ab"), 0)).toBe(false);
+  ring.read();
+  expect(ring.writeAll(composeEvents("ab"), 0)).toBe(true);
+  expect(ring.read().events).toEqual(bytes(composeEvents("ab")));
 });
+
+test("text mode types from its field, composes in whole groups and leaves editing keys to the program", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  canvas.focus();
+  const ring = InputRing.create();
+  const input = listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
+  input.textInput(true, { x: 10, y: 20, w: 2, h: 16 });
+  const field = page.activeElement!;
+  expect(field.tagName).toBe("TEXTAREA");
+  expect(field.style.top).toBe("20px");
+  // A printable key is a KeyDown only: its text comes from the field, spaces included.
+  page.dispatchEvent(domEvent("keydown", { code: "KeyA", key: "a" }));
+  field.dispatchEvent(domEvent("input", { inputType: "insertText", data: "a b" }));
+  expect(ring.read().events).toEqual(bytes([keyEvent(true, keyCode("KeyA"), false, 0), ...chars("a b")]));
+  // Enter is the program's KeyDown; the field doesn't also act on it.
+  const enter = domEvent("keydown", { code: "Enter", key: "Enter" });
+  page.dispatchEvent(enter);
+  expect(enter.defaultPrevented).toBe(true);
+  const space = domEvent("keydown", { code: "Space", key: " " });
+  page.dispatchEvent(space);
+  expect(space.defaultPrevented).toBe(false);
+  ring.read();
+  // While an input method composes, its keys aren't sent; each change arrives whole, and the
+  // commit clears the composing before the committed text.
+  page.dispatchEvent(domEvent("keydown", { code: "KeyK", key: "Process", isComposing: true, keyCode: 229 }));
+  field.dispatchEvent(domEvent("compositionupdate", { data: "かな" }));
+  field.dispatchEvent(domEvent("input", { inputType: "insertCompositionText", data: "かな", isComposing: true }));
+  field.dispatchEvent(domEvent("compositionend", { data: "仮名" }));
+  field.dispatchEvent(domEvent("input", { inputType: "insertCompositionText", data: "仮名" }));
+  expect(ring.read().events).toEqual(bytes([...composeEvents("かな"), ...composeEvents(""), ...chars("仮名")]));
+  input.textInput(false, { x: 0, y: 0, w: 0, h: 0 });
+  expect(page.activeElement).toBe(canvas);
+}));
+
+test("a composition that doesn't fit waits whole, and a newer change replaces it", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const ring = InputRing.create();
+  const input = listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
+  input.textInput(true, { x: 0, y: 0, w: 1, h: 10 });
+  const field = page.activeElement!;
+  for (let i = 0; i < InputRing.CAPACITY - 1; i++) ring.write(textEvent(65), i);
+  field.dispatchEvent(domEvent("compositionupdate", { data: "ab" }));
+  field.dispatchEvent(domEvent("compositionupdate", { data: "abc" }));
+  expect(ring.read().events.length).toBe((InputRing.CAPACITY - 1) * EVENT_SIZE);
+  field.dispatchEvent(domEvent("compositionend", { data: "abc" }));
+  page.frame();
+  expect(ring.read().events).toEqual(bytes([...composeEvents("abc"), ...composeEvents(""), ...chars("abc")]));
+}));
+
+test("a paste is kept by its serial, and a copy takes what the program offers", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const ring = InputRing.create();
+  const input = listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
+  const clipboard = (data: Record<string, string>) => ({
+    getData: (t: string) => data[t] ?? "",
+    setData: (t: string, v: string) => { data[t] = v; },
+  });
+  for (let i = 1; i <= 9; i++) {
+    const paste = domEvent("paste", { clipboardData: clipboard({ "text/plain": `p${i}`, "text/html": `<i>p${i}</i>` }) });
+    page.dispatchEvent(paste);
+    expect(paste.defaultPrevented).toBe(true);
+  }
+  expect(ring.read().events.subarray(0, EVENT_SIZE)).toEqual(pasteEvent(1));
+  expect(input.pasted(9)).toEqual({ text: "p9", html: "<i>p9</i>" });
+  expect(input.pasted(1)).toBeNull();
+  const nothing = domEvent("copy", { clipboardData: clipboard({}) });
+  page.dispatchEvent(nothing);
+  expect(nothing.defaultPrevented).toBe(false);
+  input.offer("note", "<p>note</p>");
+  const out: Record<string, string> = {};
+  const copy = domEvent("copy", { clipboardData: clipboard(out) });
+  page.dispatchEvent(copy);
+  expect(copy.defaultPrevented).toBe(true);
+  expect(out).toEqual({ "text/plain": "note", "text/html": "<p>note</p>" });
+}));
+
+test("F6 hands the keys to the overlay, letting go of held keys first", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const control = page.createElement("button");
+  const overlay = { contains: (e: Element | null) => e === (control as unknown), enter: () => (control.focus(), true) };
+  const ring = InputRing.create();
+  listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }), overlay);
+  page.dispatchEvent(domEvent("keydown", { code: "Space", key: " " }));
+  ring.read();
+  const f6 = domEvent("keydown", { code: "F6", key: "F6" });
+  page.dispatchEvent(f6);
+  expect(f6.defaultPrevented).toBe(true);
+  expect(ring.read().events).toEqual(keyEvent(false, keyCode("Space"), false, 0));
+  // In the overlay, keys are its own: the program hears nothing.
+  page.dispatchEvent(domEvent("keyup", { code: "Space", key: " " }));
+  page.dispatchEvent(domEvent("keydown", { code: "Enter", key: "Enter" }));
+  expect(ring.read().events.length).toBe(0);
+}));
 
 test("a pad sends what changed: a button, a stick past its noise, and a let-go when it goes", () => {
   const last: (PadState | null)[] = [null, null, null, null];

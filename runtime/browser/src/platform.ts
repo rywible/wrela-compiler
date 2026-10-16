@@ -1,10 +1,19 @@
 // Application-host mechanisms. Services transport opaque bytes; the Wrela application
 // owns its catalog, UI, session protocol and save policy.
+import type { Overlay } from "./assist.ts";
+import { glyph, type Paper } from "./glyph.ts";
+import type { Listener } from "./listen.ts";
 import type { Bytes } from "./stream.ts";
+import { Reader, Writer } from "./wire.ts";
 
 export const MESSAGE_LIMIT = 1024 * 1024 - 512;
 const DECODER = new TextDecoder("utf-8", { fatal: true });
-const CURSORS = new Set(["default", "pointer", "text"]);
+const CURSORS = new Set(["default", "pointer", "text", "grab", "grabbing", "crosshair", "move", "nwse-resize", "nesw-resize"]);
+/** What `environment`'s capabilities word says this host has (runtime/browser): its bits. */
+export const PASTE_EVENTS = 1;
+export const TEXT_INPUT = 2;
+export const ACCESSIBILITY = 4;
+export const SYSTEM_GLYPHS = 8;
 export const wordBytes = (n: number): Bytes => {
   const b = new Uint8Array(4);
   new DataView(b.buffer).setUint32(0, n, true);
@@ -36,14 +45,15 @@ const checked = (body: unknown): Bytes => {
 
 /** A bounded request/reply channel. Closing it rejects every outstanding request. */
 /** The environment a program asks for (platform/host.wrela): whether the system asks for reduced
- * motion, the seconds since 1970, the device pixel ratio × 1024, and whether this page load is a
- * reload of the tab (its navigation's type), rather than a visit. */
-export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: number, navigations: PerformanceEntryList): Bytes {
-  const b = new Uint8Array(10);
+ * motion, the seconds since 1970, the device pixel ratio × 1024, whether this page load is a
+ * reload of the tab (its navigation's type), rather than a visit, and what this host has. */
+export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: number, navigations: PerformanceEntryList, capabilities: number): Bytes {
+  const b = new Uint8Array(14);
   b[0] = Number(reducedMotion);
   b.set(wordBytes(Math.floor(nowMs / 1000)), 1);
   b.set(wordBytes(Math.round(pixelRatio * 1024)), 5);
   b[9] = Number(navigations.some((n) => (n as PerformanceNavigationTiming).type === "reload"));
+  b.set(wordBytes(capabilities), 10);
   return b;
 }
 
@@ -181,6 +191,10 @@ export class BrowserPlatform {
   #inbox: Bytes[] = [];
   #receiving: { resolve: (b: Bytes) => void; reject: (e: Error) => void } | null = null;
   #shown: number | null = null;
+  #input: Listener | null = null;
+  #overlay: Overlay | null = null;
+  /** Where glyphs are drawn: the page's OffscreenCanvas, unless a test gives its own. */
+  paper: (w: number, h: number) => Paper = (w, h) => new OffscreenCanvas(w, h);
   // The parent asked this program to return (its page's Back): requests waiting to hear it,
   // or that it was asked before any waited.
   #leaving = new Set<() => void>();
@@ -226,6 +240,11 @@ export class BrowserPlatform {
     void s.closed.then(() => clearTimeout(timer));
   }
   get active(): boolean { return this.#shown === null; }
+  /** The input services (listen.ts) and the accessibility overlay (assist.ts), once there. */
+  attach(input: Listener, overlay: Overlay | null): void { this.#input = input; this.#overlay = overlay; }
+  #capabilities(): number {
+    return (this.#input ? PASTE_EVENTS | TEXT_INPUT : 0) | (this.#overlay ? ACCESSIBILITY : 0) | (typeof OffscreenCanvas === "function" ? SYSTEM_GLYPHS : 0);
+  }
   presented(): void { this.#parent?.signal("frame"); }
   failed(): void { this.#parent?.signal("failed"); }
   dispose(): void {
@@ -284,7 +303,7 @@ export class BrowserPlatform {
   async request(service: string, body: Bytes): Promise<Bytes> {
     checked(body);
     if (service === "environment") {
-      return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"));
+      return environment(matchMedia("(prefers-reduced-motion: reduce)").matches, Date.now(), window.devicePixelRatio || 1, performance.getEntriesByType("navigation"), this.#capabilities());
     }
     if (service === "image/decode") return decodeImage(body, browserDecode);
     if (service === "cursor") {
@@ -293,6 +312,30 @@ export class BrowserPlatform {
       if (!CURSORS.has(name)) throw new Error(`unsupported cursor: ${name.slice(0, 32)}`);
       this.canvas.style.cursor = name; return new Uint8Array();
     }
+    if (service === "text/input") {
+      // On (with the caret's rectangle, device pixels of the canvas) or off.
+      if (!this.#input) throw new Error("this host has no text input yet");
+      const r = new Reader(body); const on = r.u8() !== 0;
+      this.#input.textInput(on, { x: r.f32(), y: r.f32(), w: r.f32(), h: r.f32() }); return new Uint8Array();
+    }
+    if (service === "clipboard/offer") {
+      if (!this.#input) throw new Error("this host has no clipboard yet");
+      const r = new Reader(body); this.#input.offer(r.str(), r.str()); return new Uint8Array();
+    }
+    if (service === "clipboard/pasted") {
+      const pasted = this.#input?.pasted(new Reader(body).u32());
+      if (!pasted) throw new Error("that paste isn't kept");
+      return new Writer().str(pasted.text).str(pasted.html).bytes();
+    }
+    if (service === "a11y/tree") {
+      if (!this.#overlay) throw new Error("this host has no accessibility overlay");
+      this.#overlay.tree(body); return new Uint8Array();
+    }
+    if (service === "a11y/announce") {
+      if (!this.#overlay) throw new Error("this host has no accessibility overlay");
+      this.#overlay.announce(DECODER.decode(body)); return new Uint8Array();
+    }
+    if (service === "font/glyph") return glyph(body, this.paper);
     if (service === "icon") {
       // The program's icon in the page's tab, bookmarks and home screen: one link per kind and size.
       const { rel, sizes, href } = iconLink(body, document.baseURI);

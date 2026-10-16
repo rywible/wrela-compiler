@@ -123,6 +123,13 @@ impl<T: Plain> Vec<T> {
     }
 }
 
+impl<T> [T] {
+    /// Whether it holds no elements.
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+}
+
 impl<T> Vec<T> {
     /// An empty `Vec`, which allocates nothing until an element is pushed.
     pub fn new() -> Vec<T> {
@@ -969,4 +976,15 @@ fn a_bounded_list_holds_what_was_pushed() {
     // Removing moves the rest down, in order.
     var d: Bounded<u32, 4> = Bounded::from([1, 2, 3, 4])
     assert(d.is_full() && d.remove(1) == 2 && d.len() == 3 && d[1] == 3 && d[2] == 4)
+}
+
+/// A run says whether it's empty, as a `Vec` does; `[]` takes its element type from the parameter.
+@test
+fn a_run_says_whether_it_is_empty() {
+    let full: Vec<u32> = Vec::from([1, 2])
+    assert(!run_is_empty(full) && run_is_empty([]))
+}
+
+fn run_is_empty(xs: [u32]) -> bool {
+    xs.is_empty()
 }

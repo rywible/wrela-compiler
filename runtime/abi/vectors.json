@@ -1508,6 +1508,54 @@
     {
       "at": [
         "frame 0",
+        "frame 0",
+        "frame 1",
+        "frame 1",
+        "frame 2",
+        "frame 2"
+      ],
+      "events": [
+        "0a000000000000004b300000000000000200000000000000",
+        "0a000000000000006a300000010000000200000000000000",
+        "0a0000000000000000000000000000000000000000000000",
+        "0b0000000000000003000000000000000000000000000000",
+        "0c0000000000000009000000020000000000000000000000",
+        "0c000000000000000a000000000000000000000000000000"
+      ],
+      "name": "composing, pasting and assisting",
+      "payloads": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "script": "[\n  {\"frame\": 0, \"type\": \"compose\", \"text\": \"かな\"},\n  {\"frame\": 1, \"type\": \"compose\", \"text\": \"\"},\n  {\"frame\": 1, \"type\": \"paste\", \"serial\": 3},\n  {\"frame\": 2, \"type\": \"assist\", \"node\": 9, \"action\": \"focus\"},\n  {\"frame\": 2, \"type\": \"assist\", \"node\": 10}\n]"
+    },
+    {
+      "error": "event 0: `node` must be a whole number",
+      "name": "an assist with no node",
+      "script": "[{\"frame\": 0, \"type\": \"assist\"}]"
+    },
+    {
+      "error": "event 0: `action` is activate, select or focus",
+      "name": "an unknown assist action",
+      "script": "[{\"frame\": 0, \"type\": \"assist\", \"node\": 1, \"action\": \"poke\"}]"
+    },
+    {
+      "error": "event 0: `serial` must be a whole number",
+      "name": "a fractional paste serial",
+      "script": "[{\"frame\": 0, \"type\": \"paste\", \"serial\": 1.5}]"
+    },
+    {
+      "error": "event 0: `text` is missing",
+      "name": "compose text that's missing",
+      "script": "[{\"frame\": 0, \"type\": \"compose\"}]"
+    },
+    {
+      "at": [
+        "frame 0",
         "frame 1",
         "frame 1",
         "frame 2"
@@ -1610,7 +1658,7 @@
       "script": "[{\"frame\": 2, \"tick\": 1, \"type\": \"move\"}]"
     },
     {
-      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)",
+      "error": "event 0: `jump` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)",
       "name": "an unknown type",
       "script": "[{\"frame\": 0, \"type\": \"jump\"}]"
     },

@@ -172,7 +172,7 @@ pub fn frame(time: f32, width: u32, height: u32) {}
 #[test]
 fn perf_ui_frame_buffers_and_typing_preserve_behavior() {
     let dir = package("ui", "pub fn frame(time: f32, width: u32, height: u32) {}\n");
-    for file in ["widgets.wrela", "draw.wrela", "text.wrela", "ttf.wrela"] {
+    for file in ["widgets.wrela", "draw.wrela", "text.wrela", "ttf.wrela", "raster.wrela"] {
         std::fs::write(dir.join(file), source(&format!("ui/{file}"))).expect("copy UI source");
     }
     // A zero-area fallback glyph lays out text without a bake or draw; its self-kern also
@@ -327,7 +327,7 @@ fn typed_runs_and_keys_match_the_previous_editor() {
     std::fs::write(dir.join("widgets.wrela"), widgets).expect("UI tests");
     // The two focused cases plus every retained production UI regression.
     // Includes the caller-selected font atlas regression copied from text.wrela.
-    passes(&dir, 20);
+    passes(&dir, 30);
 }
 
 #[test]

@@ -4,7 +4,7 @@
 // (compiler/tests/tests/suite/input.rs runs it in both).
 
 use std::hash::{StateHash, state_hash}
-use std::input::{Button, Event, Input, Key, PadAxis, PadButton, events}
+use std::input::{Assist, Button, Event, Input, Key, PadAxis, PadButton, events}
 use std::io::print
 
 pub struct Log: Clone + StateHash {
@@ -77,7 +77,7 @@ pub fn typed(state: Game) -> vec2 {
 fn every_event_arrives_in_its_frame(game: Game) {
     assert(game.log.frames == 12)
     let n = game.log.events.len()
-    assert(n == 28, f"{n} events")
+    assert(n == 33, f"{n} events")
     let first = game.log.events[0]
     assert(first.0 == 0)
     assert(first.1 == Event::PointerMove { at: vec2(100.0, 120.0), mods: std::input::Mods {} })
@@ -89,6 +89,15 @@ fn every_event_arrives_in_its_frame(game: Game) {
     let t = typed(game)
     assert(t.y == 9.0, f"{t.y} characters")
     assert(t.x == f32(71 + 114 + 252 + 223 + 101 + 44 + 32 + 255 + 33))
+    // Composing "かな", then nothing, a paste and an assistive selection, in frame 10.
+    var seen = 0
+    for fe in game.log.events {
+        if fe.1 == (Event::Compose { char: 12394, index: 1, length: 2 }) && fe.0 == 10 { seen += 1 }
+        if fe.1 == (Event::Paste { serial: 5 }) { seen += 10 }
+        if fe.1 == (Event::Assist { node: 7, action: Assist::Select }) { seen += 100 }
+    }
+    assert(seen == 111, f"seen {seen}")
+    assert(game.input.composer.text.is_empty(), "the composing ended")
     // Pad 0's left stick to the right, its right trigger half down and held; East pressed and
     // let go in the frame; pad 1's left stick up.
     let pad = game.input.pads[0]

@@ -1,5 +1,7 @@
 import { expect, test } from "bun:test";
-import { BrowserPlatform, decodeImage, environment, exportName, prefetch, iconLink, MESSAGE_LIMIT, PortRpc, programUrl, wordAt, wordBytes } from "../src/platform.ts";
+import type { Overlay } from "../src/assist.ts";
+import { ACCESSIBILITY, BrowserPlatform, decodeImage, environment, exportName, iconLink, MESSAGE_LIMIT, PASTE_EVENTS, PortRpc, prefetch, programUrl, TEXT_INPUT, wordAt, wordBytes } from "../src/platform.ts";
+import { Reader, Writer } from "../src/wire.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
   const channel = new MessageChannel();
@@ -16,14 +18,15 @@ test("program channels correlate replies and close outstanding requests", async 
   } finally { left.close(); right.close(); }
 });
 
-test("the environment says whether this page load reloaded the tab", () => {
+test("the environment says whether this page load reloaded the tab, then what the host has", () => {
   const load = (type: string) => [{ type } as unknown as PerformanceEntry];
-  const b = environment(true, 1_700_000_000_999, 2, load("navigate"));
-  expect([b[0], wordAt(b.subarray(1)), wordAt(b.subarray(5)), b[9]]).toEqual([1, 1_700_000_000, 2048, 0]);
-  expect(environment(false, 0, 1, load("reload"))[9]).toBe(1);
+  const b = environment(true, 1_700_000_000_999, 2, load("navigate"), PASTE_EVENTS | ACCESSIBILITY);
+  expect([b[0], wordAt(b.subarray(1)), wordAt(b.subarray(5)), b[9], wordAt(b.subarray(10))]).toEqual([1, 1_700_000_000, 2048, 0, PASTE_EVENTS | ACCESSIBILITY]);
+  expect(b.length).toBe(14);
+  expect(environment(false, 0, 1, load("reload"), 0)[9]).toBe(1);
   // Back and forward are visits, and so is a page whose navigation the browser didn't record.
-  expect(environment(false, 0, 1, load("back_forward"))[9]).toBe(0);
-  expect(environment(false, 0, 1, [])[9]).toBe(0);
+  expect(environment(false, 0, 1, load("back_forward"), 0)[9]).toBe(0);
+  expect(environment(false, 0, 1, [], 0)[9]).toBe(0);
 });
 
 test("an image decodes only at the size the program expects", async () => {
@@ -192,9 +195,48 @@ test("a program sets the canvas cursor only to a listed shape", async () => {
     expect(canvas.style.cursor).toBe("pointer");
     await platform.request("cursor", encode("default"));
     expect(canvas.style.cursor).toBe("default");
+    for (const name of ["grab", "grabbing", "crosshair", "move", "nwse-resize", "nesw-resize"]) {
+      await platform.request("cursor", encode(name));
+      expect(canvas.style.cursor).toBe(name);
+    }
   } finally {
     platform.dispose();
     if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+  }
+});
+
+test("the environment says which input services the host has, and they reach them", async () => {
+  const names = ["window", "matchMedia"] as const;
+  const saved = names.map((n) => Object.getOwnPropertyDescriptor(globalThis, n));
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener: () => {}, devicePixelRatio: 2 } });
+  Object.defineProperty(globalThis, "matchMedia", { configurable: true, value: () => ({ matches: false }) });
+  const canvas = { style: {}, tabIndex: -1, focus: () => {} } as HTMLCanvasElement;
+  const platform = new BrowserPlatform(canvas, () => {});
+  const capabilities = async () => wordAt((await platform.request("environment", new Uint8Array())).subarray(10));
+  const calls: unknown[] = [];
+  try {
+    const before = await capabilities();
+    expect(before & (PASTE_EVENTS | TEXT_INPUT | ACCESSIBILITY)).toBe(0);
+    await expect(platform.request("text/input", new Writer().u8(1).f32(1).f32(2).f32(3).f32(4).bytes())).rejects.toThrow("no text input");
+    const input = {
+      release() {},
+      textInput: (on: boolean, caret: unknown) => calls.push(["text", on, caret]),
+      pasted: (n: number) => (n === 3 ? { text: "hi", html: "" } : null),
+      offer: (text: string, html: string) => calls.push(["offer", text, html]),
+    };
+    const overlay = { tree: (b: Uint8Array) => calls.push(["tree", b.length]), announce: (t: string) => calls.push(["say", t]) };
+    platform.attach(input, overlay as unknown as Overlay);
+    expect((await capabilities()) & (PASTE_EVENTS | TEXT_INPUT | ACCESSIBILITY)).toBe(PASTE_EVENTS | TEXT_INPUT | ACCESSIBILITY);
+    await platform.request("text/input", new Writer().u8(1).f32(1).f32(2).f32(3).f32(4).bytes());
+    await platform.request("clipboard/offer", new Writer().str("a").str("<b>a</b>").bytes());
+    const pasted = new Reader(await platform.request("clipboard/pasted", wordBytes(3)));
+    expect([pasted.str(), pasted.str()]).toEqual(["hi", ""]);
+    await expect(platform.request("clipboard/pasted", wordBytes(4))).rejects.toThrow("isn't kept");
+    await platform.request("a11y/announce", new TextEncoder().encode("3 items selected"));
+    expect(calls).toEqual([["text", true, { x: 1, y: 2, w: 3, h: 4 }], ["offer", "a", "<b>a</b>"], ["say", "3 items selected"]]);
+  } finally {
+    platform.dispose();
+    names.forEach((n, i) => { const d = saved[i]; if (d) Object.defineProperty(globalThis, n, d); else Reflect.deleteProperty(globalThis, n); });
   }
 });
 

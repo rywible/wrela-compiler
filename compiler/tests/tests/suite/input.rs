@@ -17,7 +17,7 @@ fn a_frame_test_plays_a_script() {
     assert_eq!(crate::tests_pass(&wrela_tests::repo_root().join("compiler/tests/input")), 1);
 }
 
-/// On the native host's CPU, the script's events reach the program: all 28, and the same
+/// On the native host's CPU, the script's events reach the program: all 33, and the same
 /// command-stream hash on two runs.
 #[test]
 fn the_native_host_plays_a_script() {
@@ -33,7 +33,7 @@ fn the_native_host_plays_a_script() {
             host.frame(wrela_host::frame_time(i, 60.0), 640, 480).expect("frame");
         }
         let n = host.call_export("event_count", &[]).expect("event_count");
-        assert_eq!(n, [Value::I32(28)]);
+        assert_eq!(n, [Value::I32(33)]);
         host.hash()
     };
     assert_eq!(run(), run());
@@ -58,4 +58,50 @@ fn both_hosts_read_the_same_events() {
         .expect("run");
     println!("input: Chrome {} native {}", chrome.hash, native.hash_hex());
     assert_eq!(chrome.hash, native.hash_hex(), "the hosts gave the program different events");
+}
+
+/// In Chrome, text mode takes trusted keys and an input method (DevTools' Input domain,
+/// platform/tests/text-input/typing.json), and each edit reaches the program once: typed text,
+/// spaces too, as Text after its KeyDown; Enter and Backspace as KeyDowns the hidden field doesn't
+/// also act on; a composition's changes whole, then its commit after a clear.
+#[test]
+#[ignore = "needs the runtime"]
+fn the_browser_types_and_composes_each_edit_once() {
+    let (_, rel) = wrela_tests::page("platform/tests/text-input", "text-input");
+    let commands = std::fs::read_to_string(
+        wrela_tests::repo_root().join("platform/tests/text-input/typing.json"),
+    )
+    .expect("the commands");
+    assert!(
+        wrela_tests::run_page_with_devtools(
+            &rel,
+            "#test&frames=240&width=64&height=64",
+            &commands,
+            300
+        ),
+        "the browser run failed; see {rel}/results/console.log"
+    );
+    let log = std::fs::read_to_string(wrela_tests::repo_root().join(&rel).join("results/log.txt"))
+        .expect("log.txt");
+    let down = |code: &str| format!("down {}", wrela_abi::input::key_code(code));
+    let want: Vec<String> = [
+        "text mode".to_string(),
+        down("KeyA"),
+        "text 97".into(),
+        down("Space"),
+        "text 32".into(),
+        down("KeyB"),
+        "text 98".into(),
+        down("Enter"),
+        down("Backspace"),
+        "compose 12363 0 2".into(),
+        "compose 12394 1 2".into(),
+        "compose 20206 0 2".into(),
+        "compose 21517 1 2".into(),
+        "compose 0 0 0".into(),
+        "text 20206".into(),
+        "text 21517".into(),
+    ]
+    .to_vec();
+    assert_eq!(log.lines().collect::<Vec<_>>(), want);
 }

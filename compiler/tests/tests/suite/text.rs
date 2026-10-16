@@ -68,6 +68,14 @@ fn font_baking_needs_positive_finite_geometry() {
     }
 }
 
+/// A glyph made while the program runs, from a host's drawing: a colour one draws its own colour
+/// on the GPU (ui/tests/glyphs).
+#[test]
+fn a_made_colour_glyph_draws_its_colour() {
+    let count = super::tests_pass(&wrela_tests::repo_root().join("ui/tests/glyphs"));
+    assert_eq!(count, 1);
+}
+
 /// Every widget's frame test, each driven by a script of input (ui/tests/widgets/scripts).
 #[test]
 fn the_widgets_pass_their_frame_tests() {

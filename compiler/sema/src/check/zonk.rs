@@ -321,10 +321,11 @@ pub(super) fn finish_common(c: &mut Checker) {
         );
     }
     c.binding_kinds();
-    // `let x = place` owns: only a `Copy` value can be copied out (§6.3).
+    // `let x = place` owns: only a `Copy` value can be copied out (§6.3). A run (`str`, `[T]`)
+    // is the one view type, never owned, so `let` of one reads it in place, as `borrow` does.
     for (id, at, keyword) in std::mem::take(&mut c.owned_lets) {
         let ty = c.infer.resolve(&c.p.types, c.locals[id.index()].ty);
-        if matches!(c.p.types.kind(ty), TyKind::Error)
+        if matches!(c.p.types.kind(ty), TyKind::Error | TyKind::Slice(_) | TyKind::Str)
             || crate::mir::is_callable(&c.p.types, ty)
             || crate::traits::implements_builtin(c.p, ty, crate::defs::Lang::Copy)
         {

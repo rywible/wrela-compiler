@@ -547,6 +547,16 @@ fn headless_with<S: AsRef<std::ffi::OsStr>>(
     cmd.status().expect("python3 runs tools/headless.py").success()
 }
 
+/// Runs the page at `rel` (from [`page`]) in headless Chrome with URL fragment `fragment`, giving it
+/// trusted input through DevTools while it runs: `commands` (tools/headless.py's `--cdp`), written
+/// beside the page. Whether the run passed; its printed lines are in `results/log.txt`.
+pub fn run_page_with_devtools(rel: &str, fragment: &str, commands: &str, timeout: u32) -> bool {
+    let file = repo_root().join(rel).join("devtools.json");
+    std::fs::write(&file, commands).expect("write the DevTools commands");
+    let timeout = timeout.to_string();
+    headless(["--cdp", file.to_str().expect("a UTF-8 path"), rel, fragment, &timeout])
+}
+
 /// Runs a plain page (no wrela build) at `rel` in headless Chrome with URL fragment
 /// `fragment`: whether it wrote `ok` to `results/DONE` within `timeout` seconds.
 pub fn run_page_in_chrome(rel: &str, fragment: &str, timeout: u32) -> bool {

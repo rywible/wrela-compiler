@@ -25,3 +25,13 @@ fn f(a: i32, b: u32, c: bool) -> f64 {
     let flag = if c { 1 } else { 0 }
     wide + f64(big) + f64(small) + f64(w.x + m.y + total) + f64(pair.0 + flag) + f64(pair.1)
 }
+
+// `[]` takes its element type from where it goes.
+fn count(ids: [u32]) -> u32 {
+    ids.len()
+}
+
+fn none() -> u32 {
+    let xs: [u32; 0] = []
+    count([]) + xs.len()
+}

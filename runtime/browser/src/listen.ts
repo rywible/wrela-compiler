@@ -1,31 +1,80 @@
 // The main thread's half of input (input.ts): the DOM's events, as the ABI's, into the ring the
-// render worker reads.
+// render worker reads, and the services that go with them: text mode, pastes and copies.
 
 import { EventKind, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
 import {
   buttonOf,
+  composeEvents,
   type InputRing,
   keyCode,
   keyEvent,
   modifiersOf,
   padAxisEvent,
   padButtonEvent,
+  pasteEvent,
   pointerEvent,
   textEvent,
   wheelEvent,
 } from "./input.ts";
 
+/** A rectangle in the canvas's device pixels. */
+export interface Box {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** What a paste carried. */
+export interface Pasted {
+  text: string;
+  html: string;
+}
+
+/** The input services `listen` gives the host (platform.ts). */
+export interface Listener {
+  /** Lets go of every key and pointer button the program holds, as if they were released. */
+  release(): void;
+  /** Text mode on, with the caret at `caret`, or off: the canvas has the keys again. */
+  textInput(active: boolean, caret: Box): void;
+  /** What paste `serial` carried, while it's kept (the last few). */
+  pasted(serial: number): Pasted | null;
+  /** What a copy or cut puts on the clipboard from now on (empty texts: nothing). */
+  offer(text: string, html: string): void;
+}
+
+/** How many pastes are kept for the program to ask for. */
+const PASTES_KEPT = 8;
+
+/** Keys the program edits text with: in text mode the hidden field mustn't act on them too. */
+const EDITING = new Set([
+  "Enter", "NumpadEnter", "Backspace", "Delete", "Tab", "Escape", "ArrowLeft", "ArrowRight",
+  "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown",
+]);
+
 /**
- * Turns the DOM's pointer, wheel and keyboard events on `canvas` (keys anywhere on the page)
- * into events in `ring`. Positions are in the canvas's device pixels, as `frame`'s width and
- * height count them. A key's text arrives as a Text event, after the key's KeyDown.
+ * Turns the DOM's pointer, wheel, keyboard, composition and paste events (keys anywhere on the
+ * page) into events in `ring`. Positions are in the canvas's device pixels, as `frame`'s width
+ * and height count them.
+ *
+ * Keys have one owner at a time:
+ * - **the canvas** (the default): each key's KeyDown, then the text it types as Text; the keys
+ *   the page would act on (Tab, Space, Backspace, scrolling) are the program's;
+ * - **text mode** (`textInput`, while the program edits text): a hidden field at the caret takes
+ *   the keys, so an input method composes there. Typed text comes from the field (Text), a
+ *   composition's changes as Compose groups, and committed text as a group that clears the
+ *   composing first; editing keys (Enter, Backspace, the arrows) are KeyDowns the field doesn't
+ *   act on, and keys an input method is using aren't sent at all;
+ * - **the overlay** (`overlay`, the accessibility tree, assist.ts): its own elements take the keys
+ *   and none reach the program. F6 from the canvas enters it, letting go of held keys first.
  */
 export function listen(
   canvas: HTMLCanvasElement,
   ring: InputRing,
   now: () => number,
   size: () => { width: number; height: number },
-): void {
+  overlay: { contains(e: Element | null): boolean; enter(): boolean } | null = null,
+): Listener {
   const at = (e: MouseEvent) => {
     const r = canvas.getBoundingClientRect();
     const { width, height } = size();
@@ -42,6 +91,86 @@ export function listen(
     for (const button of pointer.buttons) put(pointerEvent(EventKind.PointerUp, pointer.x, pointer.y, button, 0));
     pointers.delete(id);
   };
+  const release = () => {
+    for (const key of keys) put(keyEvent(false, key, false, 0));
+    keys.clear();
+    for (const id of pointers.keys()) releasePointer(id);
+  };
+
+  // Groups that must arrive whole (a composition's change, a commit), in order: one that doesn't
+  // fit waits for room, and a newer change replaces a change still waiting; commits are kept.
+  const groups: { events: Uint8Array[]; change: boolean }[] = [];
+  let retrying = false;
+  const flush = () => {
+    while (groups.length > 0 && ring.writeAll(groups[0]!.events, now())) groups.shift();
+    if (groups.length > 0 && !retrying) {
+      retrying = true;
+      requestAnimationFrame(() => {
+        retrying = false;
+        flush();
+      });
+    }
+  };
+  const group = (events: Uint8Array[], change: boolean) => {
+    if (change && groups.length > 0 && groups[groups.length - 1]!.change) groups.pop();
+    groups.push({ events, change });
+    flush();
+  };
+
+  // Text mode's field: invisible, at the caret so an input method's window opens there; made
+  // when the program first asks for text mode.
+  let field: HTMLTextAreaElement | null = null;
+  const texting = () => field !== null && document.activeElement === field;
+  const inOverlay = () => overlay !== null && overlay.contains(document.activeElement);
+  const makeField = () => {
+    const f = document.createElement("textarea");
+    f.setAttribute("aria-label", "Text being edited");
+    f.autocomplete = "off";
+    f.spellcheck = false;
+    f.setAttribute("autocapitalize", "off");
+    f.style.cssText = "position:fixed;left:0;top:0;width:1px;height:1em;padding:0;border:0;margin:0;" +
+      "opacity:0;resize:none;overflow:hidden;pointer-events:none;z-index:0;color:transparent;background:transparent";
+    document.body.append(f);
+    f.addEventListener("input", (e) => {
+      const input = e as InputEvent;
+      if (input.isComposing) return;
+      // Typed text; a composition's text is committed at its end, and editing keys are KeyDowns.
+      if ((input.inputType === "insertText" || input.inputType === "insertReplacementText") && input.data) {
+        group([...input.data].map((c) => textEvent(c.codePointAt(0)!)), false);
+      }
+      f.value = "";
+    });
+    f.addEventListener("compositionupdate", (e) => group(composeEvents(e.data ?? ""), true));
+    f.addEventListener("compositionend", (e) => {
+      const committed = [...(e.data ?? "")].map((c) => textEvent(c.codePointAt(0)!));
+      group([...composeEvents(""), ...committed], false);
+      f.value = "";
+    });
+    return f;
+  };
+
+  // Pastes, kept by serial for the program to ask for (`clipboard/pasted`).
+  const pastes = new Map<number, Pasted>();
+  let serial = 0;
+  window.addEventListener("paste", (e) => {
+    if (inOverlay() || !e.clipboardData) return;
+    e.preventDefault();
+    serial += 1;
+    pastes.set(serial, { text: e.clipboardData.getData("text/plain"), html: e.clipboardData.getData("text/html") });
+    pastes.delete(serial - PASTES_KEPT);
+    put(pasteEvent(serial));
+  });
+  // A copy or cut takes what the program offers: it offers before the keys that copy arrive.
+  let offered: Pasted = { text: "", html: "" };
+  const copy = (e: ClipboardEvent) => {
+    if (inOverlay() || !e.clipboardData || offered.text === "") return;
+    e.clipboardData.setData("text/plain", offered.text);
+    if (offered.html !== "") e.clipboardData.setData("text/html", offered.html);
+    e.preventDefault();
+  };
+  window.addEventListener("copy", copy);
+  window.addEventListener("cut", copy);
+
   canvas.addEventListener("pointermove", (e) => {
     // Coalesced moves arrive as one: the program needs where the pointer is, not each step.
     const [x, y] = at(e);
@@ -59,6 +188,8 @@ export function listen(
     pointers.set(e.pointerId, pointer);
     put(pointerEvent(EventKind.PointerDown, x, y, button, modifiersOf(e)));
     e.preventDefault();
+    // A press on the canvas gives it the keys back from the overlay; text mode keeps its field.
+    if (!texting()) canvas.focus({ preventScroll: true });
   });
   canvas.addEventListener("pointerup", (e) => {
     const [x, y] = at(e);
@@ -83,6 +214,23 @@ export function listen(
     { passive: false },
   );
   window.addEventListener("keydown", (e) => {
+    if (inOverlay()) return;
+    if (texting()) {
+      // An input method's keys are its own.
+      if (e.isComposing || e.keyCode === 229) return;
+      const key = keyCode(e.code);
+      keys.add(key);
+      put(keyEvent(true, key, e.repeat, modifiersOf(e)));
+      if (EDITING.has(e.code)) e.preventDefault();
+      return;
+    }
+    if (e.code === "F6" && overlay !== null) {
+      release();
+      if (overlay.enter()) {
+        e.preventDefault();
+        return;
+      }
+    }
     const key = keyCode(e.code);
     keys.add(key);
     put(keyEvent(true, key, e.repeat, modifiersOf(e)));
@@ -94,15 +242,37 @@ export function listen(
     if (["Tab", "Space", "Backspace", "ArrowUp", "ArrowDown", "PageUp", "PageDown"].includes(e.code)) e.preventDefault();
   });
   window.addEventListener("keyup", (e) => {
+    if (inOverlay()) return;
     const key = keyCode(e.code);
     keys.delete(key);
     put(keyEvent(false, key, false, modifiersOf(e)));
   });
-  window.addEventListener("blur", () => {
-    for (const key of keys) put(keyEvent(false, key, false, 0));
-    keys.clear();
-    for (const id of pointers.keys()) releasePointer(id);
-  });
+  window.addEventListener("blur", release);
+
+  return {
+    release,
+    textInput(active, caret) {
+      if (active) {
+        field ??= makeField();
+        const r = canvas.getBoundingClientRect();
+        const { width, height } = size();
+        const sx = width > 0 ? r.width / width : 1;
+        const sy = height > 0 ? r.height / height : 1;
+        Object.assign(field.style, {
+          left: `${r.left + caret.x * sx}px`,
+          top: `${r.top + caret.y * sy}px`,
+          height: `${Math.max(caret.h * sy, 1)}px`,
+        });
+        if (!texting()) field.focus({ preventScroll: true });
+      } else if (texting()) {
+        canvas.focus({ preventScroll: true });
+      }
+    },
+    pasted: (n) => pastes.get(n) ?? null,
+    offer(text, html) {
+      offered = { text, html };
+    },
+  };
 }
 
 /** A pad's buttons and axes as last sent: each button's value and pressed state, each axis's

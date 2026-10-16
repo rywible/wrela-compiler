@@ -179,12 +179,87 @@ pub enum Event: Copy + Eq + StateHash + Serialize {
     PadButton { pad: u32, button: PadButton, value: f32, pressed: bool },
     /// A gamepad's axis moved: its value, from -1 to 1. A host applies no dead zone.
     PadAxis { pad: u32, axis: PadAxis, value: f32 },
+    /// A character of the text an input method is composing, whole each time it changes: the
+    /// character at `index` of `length` (`length` 0: nothing is being composed). A `Composer`
+    /// puts a change together. What's committed arrives as `Text`.
+    Compose { char: u32, index: u32, length: u32 },
+    /// A person pasted: the host keeps what by `serial` (`clipboard/pasted`).
+    Paste { serial: u32 },
+    /// An assistive technology acted on the program's accessibility node `node` (`a11y/tree`).
+    Assist { node: u32, action: Assist },
     /// `len` bytes from connection `conn` (language.md §12): `payload(e)` reads them, in the call
     /// that was given the event. `serial` is the host's and is never used twice.
     Message { conn: u32, serial: u64, len: u32 },
     /// Connection `conn` opened, or closed. On a server, `tag` is the tag the program gave it
     /// (`platform::net::tag`), when the host tells a room it started again of it; else 0.
     Connection { conn: u32, open: bool, tag: u32 },
+}
+
+/// What an assistive technology does to a node.
+pub enum Assist: Copy + Eq + StateHash + Serialize + Fieldless {
+    /// Press it: a button's click, an item's opening.
+    Activate,
+    /// Make it the selection.
+    Select,
+    /// Move the focus to it.
+    Focus,
+}
+
+/// The text an input method is composing, put together from `Compose` events: a change counts
+/// only when all of it has arrived, its characters in order from index 0 (a reader that fell
+/// behind may have skipped some, and then the change is ignored). Committed text (`Text`) ends
+/// the composing.
+pub struct Composer: Clone + Eq {
+    /// The text being composed now: Unicode scalar values, empty when there's none.
+    pub text: Vec<u32>,
+    building: Vec<u32>,
+}
+
+impl Composer {
+    /// Nothing composed yet.
+    pub fn new() -> Composer {
+        Composer { text: Vec::new(), building: Vec::new() }
+    }
+
+    /// Takes event `e` into account; true if the text being composed changed.
+    pub fn apply(mut self, e: Event) -> bool {
+        match e {
+            Event::Compose { char, index, length } => {
+                if length == 0 {
+                    self.building.clear()
+                    return self.finish()
+                }
+                if index == 0 {
+                    self.building.clear()
+                }
+                if index != self.building.len() || index >= length {
+                    // A gap: a change only partly read.
+                    self.building.clear()
+                    return false
+                }
+                self.building.push(char)
+                if self.building.len() == length {
+                    let changed = self.text != self.building
+                    self.text = self.building.clone()
+                    self.building.clear()
+                    return changed
+                }
+                false
+            },
+            Event::Text { .. } => {
+                self.building.clear()
+                self.finish()
+            },
+            _ => false,
+        }
+    }
+
+    /// Nothing composed: true if there was something.
+    fn finish(mut self) -> bool {
+        let had = !self.text.is_empty()
+        self.text.clear()
+        had
+    }
 }
 
 /// An event as the host lays it out: its kind, its modifiers, then four words.
@@ -266,6 +341,12 @@ pub(package) fn event_of(r: RawEvent) -> Option<Event> {
         },
         9 => match PadAxis::from_u32(r.b) {
             Some(axis) => Some(Event::PadAxis { pad: r.a, axis, value: bitcast_f32(r.c) }),
+            None => None,
+        },
+        10 => Some(Event::Compose { char: r.a, index: r.b, length: r.c }),
+        11 => Some(Event::Paste { serial: r.a }),
+        12 => match Assist::from_u32(r.b) {
+            Some(action) => Some(Event::Assist { node: r.a, action }),
             None => None,
         },
         13 => Some(Event::Message { conn: r.a, serial: u64(r.b) | (u64(r.c) << 32), len: r.d }),
@@ -457,6 +538,8 @@ pub struct Input: Clone {
     pub mods: Mods,
     /// The gamepads, 0 to 3.
     pub pads: [Pad; PADS],
+    /// The text an input method is composing.
+    pub composer: Composer,
 }
 
 impl Input {
@@ -469,6 +552,7 @@ impl Input {
             keys: [0; 4],
             mods: Mods {},
             pads: [Pad {}; PADS],
+            composer: Composer::new(),
         }
     }
 
@@ -509,8 +593,15 @@ impl Input {
                     self.keys[k / 32] = self.keys[k / 32] & !(1 << (k % 32))
                     self.mods = mods
                 },
-                // Text, and the network's events, hold nothing down.
-                Event::Text { .. } | Event::Message { .. } | Event::Connection { .. } => {},
+                Event::Text { .. } => {
+                    let _ = self.composer.apply(e)
+                },
+                Event::Compose { .. } => {
+                    let _ = self.composer.apply(e)
+                },
+                // A paste, an assistive action and the network's events hold nothing down.
+                Event::Paste { .. } | Event::Assist { .. } => {},
+                Event::Message { .. } | Event::Connection { .. } => {},
                 Event::PadButton { pad, .. } => {
                     if pad < PADS {
                         self.pads[pad].update(pad, e)
@@ -559,4 +650,33 @@ impl Input {
         }
         out
     }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+fn composing(text: [u32]) -> Vec<Event> {
+    var out: Vec<Event> = Vec::new()
+    for i in 0..text.len() {
+        out.push(Event::Compose { char: text[i], index: i, length: text.len() })
+    }
+    out
+}
+
+/// A change counts once all of it has arrived; a change with a gap (a reader that fell behind)
+/// is ignored and the last whole one stays; an empty one, or committed text, ends composing.
+@test
+fn a_composer_takes_whole_changes_only() {
+    var c = Composer::new()
+    let ka = composing([12363, 12394])
+    assert(!c.apply(ka[0]) && c.text.is_empty(), "half a change shows nothing")
+    assert(c.apply(ka[1]) && c.text.len() == 2, "the whole change shows")
+    // A change whose first character was skipped: ignored.
+    let three = composing([12363, 12394, 12392])
+    assert(!c.apply(three[1]) && !c.apply(three[2]) && c.text.len() == 2)
+    assert(c.apply(Event::Compose { char: 0, index: 0, length: 0 }) && c.text.is_empty())
+    for e in three {
+        let _ = c.apply(e)
+    }
+    assert(c.text.len() == 3)
+    assert(c.apply(Event::Text { char: 20206 }) && c.text.is_empty(), "a commit ends it")
 }

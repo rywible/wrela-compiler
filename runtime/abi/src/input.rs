@@ -27,6 +27,9 @@
 //! | `Text` | a Unicode scalar value typed, 0 | 0, 0 |
 //! | `PadButton` | the pad (0 to 3), the button ([`PAD_BUTTONS`]) | its value (f32, 0 to 1), 1 if it's pressed |
 //! | `PadAxis` | the pad, the axis ([`PAD_AXES`]) | its value (f32, -1 to 1), 0 |
+//! | `Compose` | a character of the text being composed, its index in it | the text's length in characters, 0 |
+//! | `Paste` | the paste's serial number, 0 | 0, 0 |
+//! | `Assist` | the node ([`ASSIST_ACTIONS`]' target), the action | 0, 0 |
 //! | `Message` | the connection, the serial's low word | the serial's high word, the bytes' length |
 //! | `Connection` | the connection, 1 if it's open (0: closed) | its tag (below), 0 |
 //!
@@ -50,6 +53,19 @@
 //! (DOM's `KeyboardEvent.code`), named as [`KEYS`] lists it; one the list doesn't name is 0.
 //! What a key types arrives separately, as `Text`.
 //!
+//! An input method (IME) composes text before it's typed: `Compose` events give the text being
+//! composed, whole, each time it changes: one event a character, `index` 0 first, in order, each
+//! with the text's `length` (at most [`COMPOSE_MAX`]); a length of 0 (one event, character 0)
+//! means nothing is being composed. A host writes one change's events together, so a reader sees
+//! all of them or none; a change whose indices don't run from 0 to `length - 1` is incomplete
+//! (a reader that fell behind skipped some) and is ignored. Text composed and committed arrives
+//! as `Text`, after the `Compose` that clears it.
+//!
+//! `Paste` says a person pasted: the program asks its host for what was pasted by the serial
+//! (a host service, `clipboard/pasted`). `Assist` is an action an assistive technology took on
+//! one of the program's accessibility nodes (a host service, `a11y/tree`): activate it, select
+//! it or focus it ([`ASSIST_ACTIONS`]), by the node's number, whatever is drawn where.
+//!
 //! A gamepad's buttons and axes are the W3C Gamepad API's standard mapping, by number. A host
 //! sends an event when a button's value or pressed state changes, or an axis's value: a pad
 //! held still sends nothing. A stick's axes are as the pad gives them (right and down are
@@ -72,8 +88,10 @@
 //! ```
 //!
 //! `type` is `move`, `down`, `up`, `wheel`, `keydown`, `keyup`, `key` (a key down then up),
-//! `text` (a `Text` event for each character), `padbutton`, `padaxis` or `padpress` (a pad's
-//! button pressed then let go); `button` defaults to `primary`; `shift`, `ctrl`, `alt` and
+//! `text` (a `Text` event for each character), `compose` (the `Compose` events for its `text`,
+//! which may be empty), `paste` (its `serial`, default 0), `assist` (its `node`, and its `action`
+//! as [`ASSIST_ACTIONS`] names it, default `activate`), `padbutton`, `padaxis` or `padpress` (a
+//! pad's button pressed then let go); `button` defaults to `primary`; `shift`, `ctrl`, `alt` and
 //! `meta` default to false. A pad's events name its `pad` (0 to 3, default 0); a `padbutton`
 //! names its `button` (as [`PAD_BUTTONS`] does) and whether it's `pressed`, and its `value`
 //! defaults to 1 pressed and 0 not; a `padaxis` names its `axis` ([`PAD_AXES`]) and its
@@ -124,13 +142,15 @@ pub enum EventKind {
     Text = 7,
     PadButton = 8,
     PadAxis = 9,
-    // 10 to 12 are the platform's (an input method's text, a paste, an assistive action).
+    Compose = 10,
+    Paste = 11,
+    Assist = 12,
     Message = 13,
     Connection = 14,
 }
 
 impl EventKind {
-    pub const ALL: [EventKind; 11] = [
+    pub const ALL: [EventKind; 14] = [
         EventKind::PointerMove,
         EventKind::PointerDown,
         EventKind::PointerUp,
@@ -140,6 +160,9 @@ impl EventKind {
         EventKind::Text,
         EventKind::PadButton,
         EventKind::PadAxis,
+        EventKind::Compose,
+        EventKind::Paste,
+        EventKind::Assist,
         EventKind::Message,
         EventKind::Connection,
     ];
@@ -155,6 +178,9 @@ impl EventKind {
             EventKind::Text => "Text",
             EventKind::PadButton => "PadButton",
             EventKind::PadAxis => "PadAxis",
+            EventKind::Compose => "Compose",
+            EventKind::Paste => "Paste",
+            EventKind::Assist => "Assist",
             EventKind::Message => "Message",
             EventKind::Connection => "Connection",
         }
@@ -174,6 +200,12 @@ pub const META: u32 = 8;
 
 /// The buttons (`c` of a pointer down or up).
 pub const BUTTONS: [&str; 3] = ["primary", "middle", "secondary"];
+
+/// The most characters a `Compose` change holds: a host sends no more of a longer one.
+pub const COMPOSE_MAX: u32 = 64;
+
+/// What an `Assist` does to its node (word `b`), by number.
+pub const ASSIST_ACTIONS: [&str; 3] = ["activate", "select", "focus"];
 
 /// How many gamepads a host reports: pads 0 to 3.
 pub const PADS: u32 = 4;
@@ -331,6 +363,31 @@ impl Event {
 
     pub fn text(c: char) -> Event {
         Event { kind: EventKind::Text, modifiers: 0, words: [c as u32, 0, 0, 0] }
+    }
+
+    /// The `Compose` events for `text`, the text being composed (at most [`COMPOSE_MAX`]
+    /// characters are kept): one a character, or one of length 0 when `text` is empty.
+    pub fn compose(text: &str) -> Vec<Event> {
+        let chars: Vec<char> = text.chars().take(COMPOSE_MAX as usize).collect();
+        let n = chars.len() as u32;
+        if n == 0 {
+            return vec![Event { kind: EventKind::Compose, modifiers: 0, words: [0; 4] }];
+        }
+        (0..n)
+            .map(|i| Event {
+                kind: EventKind::Compose,
+                modifiers: 0,
+                words: [chars[i as usize] as u32, i, n, 0],
+            })
+            .collect()
+    }
+
+    pub fn paste(serial: u32) -> Event {
+        Event { kind: EventKind::Paste, modifiers: 0, words: [serial, 0, 0, 0] }
+    }
+
+    pub fn assist(node: u32, action: u32) -> Event {
+        Event { kind: EventKind::Assist, modifiers: 0, words: [node, action, 0, 0] }
     }
 
     pub fn pad_button(pad: u32, button: u32, value: f32, pressed: bool) -> Event {
@@ -512,6 +569,38 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     push(Event::text(c));
                 }
             }
+            "compose" => {
+                let t =
+                    o.get("text").and_then(Value::as_str).ok_or_else(|| at("`text` is missing"))?;
+                if t.chars().count() > COMPOSE_MAX as usize {
+                    return Err(at(&format!("`text` is more than {COMPOSE_MAX} characters")));
+                }
+                for e in Event::compose(t) {
+                    push(e);
+                }
+            }
+            "paste" => {
+                let serial = match o.get("serial") {
+                    None => 0,
+                    Some(_) => number("serial")
+                        .flatten()
+                        .ok_or_else(|| at("`serial` must be a whole number"))?,
+                };
+                push(Event::paste(serial));
+            }
+            "assist" => {
+                let node =
+                    number("node").flatten().ok_or_else(|| at("`node` must be a whole number"))?;
+                let action = match o.get("action") {
+                    None => 0,
+                    Some(v) => v
+                        .as_str()
+                        .and_then(|a| ASSIST_ACTIONS.iter().position(|x| *x == a))
+                        .map(|a| a as u32)
+                        .ok_or_else(|| at("`action` is activate, select or focus"))?,
+                };
+                push(Event::assist(node, action));
+            }
             "message" | "connection" if matches!(when, At::Tick(_)) => {
                 return Err(at(
                     "a tick has no network events: give a message or a connection a `frame`",
@@ -586,7 +675,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             }
             other => {
                 return Err(at(&format!(
-                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, padbutton, padpress, padaxis, message or connection)"
+                    "`{other}` isn't a type (move, down, up, wheel, keydown, keyup, key, text, compose, paste, assist, padbutton, padpress, padaxis, message or connection)"
                 )));
             }
         }
@@ -822,6 +911,41 @@ mod tests {
         ];
         for (text, why) in bad {
             let e = parse_script(text).expect_err(text);
+            assert!(e.contains(why), "{text}: {e}");
+        }
+    }
+
+    /// Composing, pasting and assistive actions, as a script gives them.
+    #[test]
+    fn compose_paste_and_assist_read_back() {
+        let script = r#"[
+            {"frame": 0, "type": "compose", "text": "かな"},
+            {"frame": 1, "type": "compose", "text": ""},
+            {"frame": 1, "type": "text", "text": "仮名"},
+            {"frame": 2, "type": "paste", "serial": 7},
+            {"frame": 3, "type": "assist", "node": 1004, "action": "select"},
+            {"frame": 3, "type": "assist", "node": 2}
+        ]"#;
+        let s = parse_script(script).expect("a valid script");
+        let words: Vec<_> = s.iter().map(|e| (e.event.kind, e.event.words)).collect();
+        assert_eq!(words[0], (EventKind::Compose, ['か' as u32, 0, 2, 0]));
+        assert_eq!(words[1], (EventKind::Compose, ['な' as u32, 1, 2, 0]));
+        assert_eq!(words[2], (EventKind::Compose, [0, 0, 0, 0]), "an empty one clears");
+        assert_eq!(words[5], (EventKind::Paste, [7, 0, 0, 0]));
+        assert_eq!(words[6], (EventKind::Assist, [1004, 1, 0, 0]));
+        assert_eq!(words[7], (EventKind::Assist, [2, 0, 0, 0]), "activate by default");
+        let long = "x".repeat(COMPOSE_MAX as usize + 1);
+        assert_eq!(Event::compose(&long).len(), COMPOSE_MAX as usize, "a long one is cut");
+        for (text, why) in [
+            (format!(r#"[{{"frame": 0, "type": "compose", "text": "{long}"}}]"#), "more than"),
+            (r#"[{"frame": 0, "type": "assist"}]"#.to_string(), "`node` must be"),
+            (
+                r#"[{"frame": 0, "type": "assist", "node": 1, "action": "poke"}]"#.to_string(),
+                "`action` is",
+            ),
+            (r#"[{"frame": 0, "type": "paste", "serial": -1}]"#.to_string(), "`serial` must be"),
+        ] {
+            let e = parse_script(&text).expect_err(&text);
             assert!(e.contains(why), "{text}: {e}");
         }
     }

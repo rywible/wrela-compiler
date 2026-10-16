@@ -106,6 +106,9 @@ export const EventKind = {
   Text: 7,
   PadButton: 8,
   PadAxis: 9,
+  Compose: 10,
+  Paste: 11,
+  Assist: 12,
   Message: 13,
   Connection: 14,
 } as const;
@@ -122,6 +125,10 @@ export const KEYS = ["Unknown", "KeyA", "KeyB", "KeyC", "KeyD", "KeyE", "KeyF", 
 export const PADS = 4;
 export const PAD_BUTTONS = ["south", "east", "west", "north", "leftshoulder", "rightshoulder", "lefttrigger", "righttrigger", "select", "start", "leftstick", "rightstick", "up", "down", "left", "right", "home"] as const;
 export const PAD_AXES = ["leftx", "lefty", "rightx", "righty"] as const;
+/** What an `Assist` does to its node, by number (runtime/abi `input`). */
+export const ASSIST_ACTIONS = ["activate", "select", "focus"] as const;
+/** The most characters a `Compose` change holds. */
+export const COMPOSE_MAX = 64;
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [

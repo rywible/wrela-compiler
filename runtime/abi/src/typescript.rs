@@ -54,6 +54,8 @@ pub fn typescript() -> String {
     let buttons = list(input::BUTTONS.iter().map(|b| format!("{b:?}")));
     let pad_buttons = list(input::PAD_BUTTONS.iter().map(|b| format!("{b:?}")));
     let pad_axes = list(input::PAD_AXES.iter().map(|a| format!("{a:?}")));
+    let assist_actions = list(input::ASSIST_ACTIONS.iter().map(|a| format!("{a:?}")));
+    let compose_max = input::COMPOSE_MAX;
     let texture_writable = stream::WRITABLE;
     let pass_join = stream::PASS_JOIN;
     let max_texture_3d = stream::MAX_TEXTURE_3D;
@@ -137,6 +139,10 @@ export const KEYS = [{keys}] as const;
 export const PADS = {pads};
 export const PAD_BUTTONS = [{pad_buttons}] as const;
 export const PAD_AXES = [{pad_axes}] as const;
+/** What an `Assist` does to its node, by number (runtime/abi `input`). */
+export const ASSIST_ACTIONS = [{assist_actions}] as const;
+/** The most characters a `Compose` change holds. */
+export const COMPOSE_MAX = {compose_max};
 /** Every function a program may import besides its memory, with its type as both hosts word
  * it. */
 export const HOST_FUNCTIONS = [

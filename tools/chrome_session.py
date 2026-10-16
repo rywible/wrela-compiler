@@ -4,12 +4,16 @@ headless.py retains its per-scenario server, results and timeout. Only the
 browser process is reused. Test threads run scenarios at the same time, each in its own tab;
 headless.py keeps each scenario's console to the records its own page logged.
 """
+import base64
+import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 from pathlib import Path
 import secrets
 import shlex
+import socket
+import struct
 import subprocess
 import threading
 import time
@@ -17,11 +21,125 @@ from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 
 
-def request(endpoint, action, payload=None):
+def request(endpoint, action, payload=None, timeout=20):
     req = Request(endpoint + '/' + action, data=json.dumps(payload).encode() if payload is not None else None,
                   headers={'Content-Type': 'application/json'})
-    with urlopen(req, timeout=20) as response:
+    with urlopen(req, timeout=timeout) as response:
         return json.load(response)
+
+
+class Socket:
+    """A WebSocket client (RFC 6455) on loopback: just what Chrome's DevTools protocol needs, text
+    frames out (masked, as a client's must be) and whole text frames in."""
+
+    GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+    def __init__(self, url, timeout=20):
+        u = urlparse(url)
+        if u.hostname != '127.0.0.1':
+            raise ValueError('DevTools is only on loopback')
+        self.sock = socket.create_connection((u.hostname, u.port), timeout=timeout)
+        key = base64.b64encode(secrets.token_bytes(16)).decode()
+        self.sock.sendall((f'GET {u.path} HTTP/1.1\r\nHost: {u.hostname}:{u.port}\r\n'
+                           'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+                           f'Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n').encode())
+        head = b''
+        while b'\r\n\r\n' not in head:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise ValueError('DevTools closed the connection')
+            head += chunk
+        header, self.buffer = head.split(b'\r\n\r\n', 1)
+        accept = base64.b64encode(hashlib.sha1((key + self.GUID).encode()).digest())
+        if b' 101 ' not in header.split(b'\r\n')[0] or accept not in header:
+            raise ValueError('DevTools refused the WebSocket')
+
+    def _read(self, n):
+        while len(self.buffer) < n:
+            chunk = self.sock.recv(65536)
+            if not chunk:
+                raise ValueError('DevTools closed the connection')
+            self.buffer += chunk
+        out, self.buffer = self.buffer[:n], self.buffer[n:]
+        return out
+
+    def send(self, text, opcode=1):
+        data = text.encode() if isinstance(text, str) else text
+        n = len(data)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack('>H', n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack('>Q', n)
+        mask = secrets.token_bytes(4)
+        self.sock.sendall(head + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def receive(self):
+        """The next whole text message; pings are answered, a close ends it."""
+        message = b''
+        while True:
+            first, second = self._read(2)
+            n = second & 0x7f
+            if n == 126:
+                n = struct.unpack('>H', self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack('>Q', self._read(8))[0]
+            mask = self._read(4) if second & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            opcode = first & 0x0f
+            if opcode == 8:
+                raise ValueError('DevTools closed the WebSocket')
+            if opcode == 9:
+                self.send(data, opcode=10)
+                continue
+            if opcode in (0, 1):
+                message += data
+                if first & 0x80:
+                    return message.decode()
+
+    def close(self):
+        self.sock.close()
+
+
+def cdp(port, target, commands):
+    """Runs DevTools `commands` on tab `target`, in order: each `{"method", "params"}` waits for
+    its answer; `{"wait": s}` waits s seconds; `{"until": js, "timeout": s}` evaluates `js` in the
+    page until it's true (or fails after `timeout`, 20 s by default). Returns the answers."""
+    ws = Socket(f'ws://127.0.0.1:{port}/devtools/page/{target}')
+    answers = []
+    try:
+        n = 0
+        def call(method, params):
+            nonlocal n
+            n += 1
+            ws.send(json.dumps({'id': n, 'method': method, 'params': params}))
+            while True:
+                message = json.loads(ws.receive())
+                if message.get('id') == n:
+                    if 'error' in message:
+                        raise ValueError(f'{method}: {message["error"].get("message")}')
+                    return message.get('result', {})
+        for command in commands:
+            if 'wait' in command:
+                time.sleep(float(command['wait']))
+            elif 'until' in command:
+                deadline = time.monotonic() + float(command.get('timeout', 20))
+                while True:
+                    result = call('Runtime.evaluate', {'expression': command['until'], 'returnByValue': True})
+                    if result.get('result', {}).get('value') is True:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise ValueError(f'the page never had {command["until"]}')
+                    time.sleep(0.05)
+            else:
+                answers.append(call(command['method'], command.get('params', {})))
+    finally:
+        ws.close()
+    return answers
 
 
 class ChromeSession:
@@ -130,6 +248,10 @@ class ChromeSession:
                     elif action == 'close':
                         session.close(payload['target'])
                         result = {}
+                    elif action == 'cdp':
+                        if payload['target'] not in session.targets:
+                            raise ValueError('unknown test tab')
+                        result = {'answers': cdp(session.port, payload['target'], payload['commands'])}
                     elif action == 'alive':
                         result = {'alive': session.proc is not None and session.proc.poll() is None}
                     else:

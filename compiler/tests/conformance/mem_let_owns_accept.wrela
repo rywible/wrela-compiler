@@ -21,3 +21,11 @@ fn owned(w: take World) -> u32 {
     let l = take w.log
     l.count
 }
+
+// A run is the one view type: `let` of one reads it in place, as `borrow` does.
+fn runs(words: [u32], name: String) -> u32 {
+    let all = words
+    let text = name.as_str()
+    let first = text.slice(0, 1)
+    all.len() + first.len()
+}

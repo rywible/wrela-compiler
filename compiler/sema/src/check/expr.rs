@@ -118,7 +118,8 @@ impl<'p> Checker<'p> {
                 };
                 let elem = elem_exp.unwrap_or_else(|| self.new_var(VarKind::General, span));
                 let xs: Vec<Expr> = items.iter().map(|x| self.check_expect(x, elem)).collect();
-                if items.is_empty() {
+                // `[]` takes its element type from where it goes: `f([])` for `xs: [u32]`.
+                if items.is_empty() && elem_exp.is_none() {
                     self.err(
                         Diagnostic::new(
                             codes::E0306,

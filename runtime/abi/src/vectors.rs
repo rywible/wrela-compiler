@@ -1604,6 +1604,23 @@ fn input_scripts() -> Value {
 ]"#,
         ),
         (
+            "composing, pasting and assisting",
+            r#"[
+  {"frame": 0, "type": "compose", "text": "かな"},
+  {"frame": 1, "type": "compose", "text": ""},
+  {"frame": 1, "type": "paste", "serial": 3},
+  {"frame": 2, "type": "assist", "node": 9, "action": "focus"},
+  {"frame": 2, "type": "assist", "node": 10}
+]"#,
+        ),
+        ("an assist with no node", r#"[{"frame": 0, "type": "assist"}]"#),
+        (
+            "an unknown assist action",
+            r#"[{"frame": 0, "type": "assist", "node": 1, "action": "poke"}]"#,
+        ),
+        ("a fractional paste serial", r#"[{"frame": 0, "type": "paste", "serial": 1.5}]"#),
+        ("compose text that's missing", r#"[{"frame": 0, "type": "compose"}]"#),
+        (
             "a connection's events",
             r#"[
   {"frame": 0, "type": "connection", "conn": 3, "open": true},

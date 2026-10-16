@@ -4,6 +4,12 @@
     tools/headless.py <page-dir relative to the repo root> [hash] [timeout-seconds]
     tools/headless.py runtime/browser/tests/hello-field '#run' 120
     tools/headless.py --url <url> <page-dir> [timeout-seconds]
+    tools/headless.py --cdp <commands.json> <page-dir> [hash] [timeout-seconds]
+
+With --cdp, the page also gets trusted input through Chrome's DevTools protocol while it runs: the
+file's commands (chrome_session.py's `cdp`: Input.dispatchKeyEvent, Input.imeSetComposition,
+Input.insertText, a wait, or a wait until the page is ready), sent once the tab has opened. A run
+of its own then starts a Chrome with a debugging port, as tools/check.sh's tests share.
 
 With --url, another server already serves the page (the studio server, which answers the lens's
 posts): Chrome opens the URL, and the run is done when the page's `results/DONE` file appears
@@ -28,6 +34,7 @@ WRELA_THROTTLE (bits a second) slows the server's sending, every request sharing
 """
 
 from collections import deque
+import json
 import math
 import os
 import re
@@ -38,6 +45,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from urllib.parse import urlsplit
 
@@ -231,6 +239,26 @@ def interrupt(signum, frame):
 
 def main(argv):
     url = None
+    commands = None
+    if len(argv) > 2 and argv[1] == "--cdp":
+        try:
+            with open(argv[2]) as f:
+                commands = json.load(f)
+        except (OSError, ValueError) as e:
+            fail(2, f"can't read the DevTools commands: {e}")
+        if not isinstance(commands, list):
+            fail(2, "the DevTools commands are a JSON array")
+        argv = [argv[0], *argv[3:]]
+        if not os.environ.get("WRELA_TEST_CHROME"):
+            # Trusted input needs DevTools: a Chrome with a debugging port, for this run alone.
+            from chrome_session import ChromeSession
+            with tempfile.TemporaryDirectory(prefix="wrela-cdp-") as directory, ChromeSession(directory):
+                return run(argv, commands)
+    return run(argv, commands)
+
+
+def run(argv, commands):
+    url = None
     if len(argv) > 1 and argv[1] == "--url":
         if not 4 <= len(argv) <= 5:
             fail(2, "usage: tools/headless.py --url <url> <page-dir> [timeout-seconds]")
@@ -279,6 +307,7 @@ def main(argv):
         fail(2, f"can't make {results}: {e}")
 
     done = []
+    driven = []
     server = None
     if url is None:
         server = start_server(page, done)
@@ -300,6 +329,13 @@ def main(argv):
             from chrome_session import request
             tab = request(shared, "start", {"url": url})
             chrome_log, offset, page_origin = tab["log"], tab["offset"], origin(url)
+            if commands is not None:
+                def drive():
+                    try:
+                        request(shared, "cdp", {"target": tab["target"], "commands": commands}, timeout=timeout)
+                    except Exception as error:
+                        driven.append(f"the DevTools input failed: {error}")
+                threading.Thread(target=drive, daemon=True).start()
         else:
             adopt_chrome_children()
             with open(chrome_log, "wb") as log:
@@ -334,6 +370,9 @@ def main(argv):
             if server is None and not done and os.path.exists(done_file):
                 with open(done_file, errors="replace") as f:
                     done.append(f.read().strip())
+            if driven:
+                reason = driven[0]
+                break
             if done:
                 status, reason = (0, None) if done[0] == "ok" else (1, f"page failed: {done[0]}")
                 break
