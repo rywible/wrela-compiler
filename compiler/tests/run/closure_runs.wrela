@@ -1,9 +1,10 @@
 // run: a closure's `str` and `[T]` parameters take a run, as a function's do: of text, a
-// `String` or an array
+// `String` or an array, and a closure returns from inside a loop over one
 // expect: found() = 5
 // expect: lengths() = 7
 // expect: summed() = 6.0
 // expect: passed_down() = 4
+// expect: returned() = 13
 
 pub fn found() -> u32 {
     let page = "abcabc"
@@ -37,4 +38,15 @@ fn call_with(f: fn(str) -> u32) -> u32 {
 pub fn passed_down() -> u32 {
     let k = 0
     call_with(|t: str| -> u32 { t.len() + k })
+}
+
+pub fn returned() -> u32 {
+    let first_over = |v: [f32], t: f32| -> u32 {
+        for i in 0..v.len() {
+            if v[i] > t { return i }
+        }
+        v.len()
+    }
+    let xs = [1.0, 5.0, 2.0]
+    first_over(xs, 4.0) * 10 + first_over(xs, 9.0)
 }
