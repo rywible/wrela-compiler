@@ -5,7 +5,7 @@
 
 import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
 import { GpuError, openDevice } from "./device.ts";
-import { errorMessage } from "./errors.ts";
+import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
@@ -83,7 +83,7 @@ function fatal(e: unknown): void {
   const build = running;
   const at = buildBase;
   void locate(errorMessage(e), async () => (build ? loadLines(at, build.manifest) : null)).then((text) => {
-    self.postMessage({ type: "fatal", message: text } satisfies FromWorker);
+    self.postMessage({ type: "fatal", message: text, unsupported: e instanceof UnsupportedError } satisfies FromWorker);
     if (testing) {
       putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
     }

@@ -53,7 +53,8 @@ export interface Loaded {
 }
 
 export type FromWorker =
-  | { type: "fatal"; message: string }
+  /** `unsupported`: the machine can't run a program (`UnsupportedError`), rather than it failed. */
+  | { type: "fatal"; message: string; unsupported: boolean }
   | { type: "host-request"; id: number; service: string; bytes: Uint8Array<ArrayBuffer> }
   | { type: "presented" }
   /** Test mode, `latency` or `keylatency`: the frames have started; send the events over `ms`

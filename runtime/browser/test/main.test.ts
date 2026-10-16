@@ -37,7 +37,7 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean } = {}): Promise<Page> {
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null };
   const canvas = {
     style: {},
@@ -55,10 +55,13 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     hasFocus: () => options.focused ?? true,
     querySelector: () => canvas,
     createElement: () => ({ setAttribute() {}, textContent: "" }),
-    body: { append: (el: { textContent: string }) => page.shown.push(el.textContent) },
+    // A box shown with a class (`unsupported`) is recorded with it.
+    body: { append: (el: { textContent: string; className?: string }) => page.shown.push(el.className ? `[${el.className}] ${el.textContent}` : el.textContent) },
     addEventListener: (type: string, f: () => void) => type === "visibilitychange" && page.visibilityListeners.push(f),
   });
   fake("gpu", {}, navigator);
+  // A browser without WebGPU has no `navigator.gpu` at all (afterEach restores it).
+  if (options.gpu === false) delete (navigator as unknown as Record<string, unknown>).gpu;
   fake("fetch", async (url: URL, init?: RequestInit) => {
     page.puts.push(`${init?.method} ${url}`);
     return new Response("");
@@ -108,6 +111,21 @@ test("a public page ignores #test", async () => {
   expect(page.shown).toEqual([]);
   expect(page.puts).toEqual([]);
   expect(page.posted.map((m) => m.type)).toEqual(["start", "visibility"]);
+});
+
+test("a browser without WebGPU is told what a program needs, not that it failed", async () => {
+  const page = await load("https://example.com/game/", { gpu: false });
+  expect(page.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this browser doesn't support WebGPU).\nTry a current Chrome or Edge on a desktop or laptop computer."]);
+  expect(page.posted).toEqual([]);
+});
+
+test("a machine without a hardware adapter is told the same; other failures still say they stopped", async () => {
+  const unsupported = await load("https://example.com/game/");
+  unsupported.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "WebGPU isn't available here (no adapter)", unsupported: true } satisfies FromWorker }));
+  expect(unsupported.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (WebGPU isn't available here (no adapter)).\nTry a current Chrome or Edge on a desktop or laptop computer."]);
+  const failed = await load("https://example.com/game/");
+  failed.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "device lost", unsupported: false } satisfies FromWorker }));
+  expect(failed.shown).toEqual(["wrela stopped: device lost"]);
 });
 
 test("the worker learns the page's visibility at once, and on each change", async () => {
@@ -238,7 +256,7 @@ test("a fatal render worker error stops the voice already playing", async () => 
   page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
   await Bun.sleep(1);
   expect(connected).toBe(true);
-  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed" } satisfies FromWorker }));
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed", unsupported: false } satisfies FromWorker }));
   expect(connected).toBe(false);
   expect(page.shown).toEqual(["wrela stopped: frame failed"]);
 });
@@ -260,7 +278,7 @@ test("a fatal render worker error keeps a loading voice from starting later", as
   });
   const page = await load("https://example.com/game/");
   page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
-  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed" } satisfies FromWorker }));
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed", unsupported: false } satisfies FromWorker }));
   loaded.resolve();
   await Bun.sleep(1);
   expect(nodes).toBe(0);

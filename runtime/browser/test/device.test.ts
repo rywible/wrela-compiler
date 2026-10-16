@@ -1,5 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { openDevice } from "../src/device.ts";
+import { UnsupportedError } from "../src/errors.ts";
 
 const original = Object.getOwnPropertyDescriptor(navigator, "gpu");
 afterEach(() => {
@@ -14,13 +15,15 @@ test("software and unclassified adapters fail before a device is requested", asy
       requestAdapter: async () => ({ info: { isFallbackAdapter }, requestDevice }),
     } });
     await expect(openDevice(false, () => {})).rejects.toThrow("hardware GPU required");
+    await expect(openDevice(false, () => {})).rejects.toBeInstanceOf(UnsupportedError);
   }
   expect(requestDevice).not.toHaveBeenCalled();
 });
 
-test("a missing adapter reports its cause", async () => {
+test("a missing adapter reports its cause, as a machine that can't run a program", async () => {
   Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter: async () => null } });
   await expect(openDevice(false, () => {})).rejects.toThrow("no adapter");
+  await expect(openDevice(false, () => {})).rejects.toBeInstanceOf(UnsupportedError);
 });
 
 test("hardware adapters retain limits and timestamp features", async () => {

@@ -3,7 +3,7 @@ import { BrowserPlatform } from "./platform.ts";
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
 import { AUDIO_CHANNELS, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
-import { errorMessage } from "./errors.ts";
+import { errorMessage, UnsupportedError } from "./errors.ts";
 import { epochNow, InputRing } from "./input.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
@@ -11,8 +11,9 @@ import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil
 
 let shown = false;
 
-/** Shows a fatal error over the canvas and logs it. */
-function showFatal(text: string): void {
+/** Shows a fatal error over the canvas and logs it. When the machine can't run a program at all
+ * (`unsupported`), it says plainly what a program needs. */
+function showFatal(text: string, unsupported = false): void {
   stopVoice();
   console.error(`wrela: ${text}`);
   if (shown) return;
@@ -20,14 +21,19 @@ function showFatal(text: string): void {
   const box = document.createElement("pre");
   box.id = "wrela-error";
   box.setAttribute("role", "alert");
-  box.textContent = `wrela stopped: ${text}`;
+  if (unsupported) {
+    box.className = "unsupported";
+    box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nTry a current Chrome or Edge on a desktop or laptop computer.`;
+  } else {
+    box.textContent = `wrela stopped: ${text}`;
+  }
   document.body.append(box);
 }
 
 /** A failure before the worker could report it: show it, and in test mode (even with bad
  * parameters), end the test. */
 function failEarly(e: unknown, testing: boolean): void {
-  showFatal(errorMessage(e));
+  showFatal(errorMessage(e), e instanceof UnsupportedError);
   if (testing) putResult(document.baseURI, "DONE", errorMessage(e)).catch((err: unknown) => console.error(errorMessage(err)));
 }
 
@@ -249,9 +255,9 @@ function start(): void {
     const test = testing ? parseTestParams(location.hash) : null;
     const canvas = document.querySelector<HTMLCanvasElement>("canvas#screen");
     if (!canvas) throw new Error("the page has no <canvas id=\"screen\">");
-    if (!("gpu" in navigator)) throw new Error("this browser doesn't support WebGPU");
+    if (!("gpu" in navigator)) throw new UnsupportedError("this browser doesn't support WebGPU");
     if (typeof canvas.transferControlToOffscreen !== "function") {
-      throw new Error("this browser can't hand a canvas to a worker (no OffscreenCanvas)");
+      throw new UnsupportedError("this browser can't hand a canvas to a worker (no OffscreenCanvas)");
     }
     if (test) {
       // The canvas shows the test frame at its own size.
@@ -300,7 +306,7 @@ function start(): void {
         );
       } else {
         platform.failed();
-        showFatal(msg.message);
+        showFatal(msg.message, msg.unsupported);
       }
     };
     worker.onerror = (event) => {

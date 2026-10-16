@@ -3,6 +3,7 @@
 and Binaryen's wasm-opt. tools/deploy.py deploys one."""
 import argparse
 import hashlib
+import html
 import io
 import json
 import os
@@ -47,6 +48,9 @@ def read_config(path):
     workers = {component(data["console"]["worker"])}
     domains = {data["console"]["domain"]}
     origin(data["console"]["domain"])
+    description = data["console"].get("description")
+    if not isinstance(description, str) or not description or any(c in description for c in "\r\n"):
+        raise ValueError("the console needs a one-line description")
     source = (ROOT / data["console"]["package"]).resolve()
     if not source.is_relative_to(ROOT) or not (source / "wrela.toml").is_file():
         raise ValueError("the console package is not inside the repository")
@@ -86,15 +90,19 @@ def headers(parent, children=(), embedded=False):
     # Assets are public. The origin-owned OPFS is never uploaded or served.
     ancestors = parent if embedded else "'none'"
     frame_src = " ".join(children) if children else "'none'"
+    connect_src = " ".join(["'self'", *children])
     policy = "cross-origin-isolated=(self" + "".join(f' "{c}"' for c in children) + ")"
+    # The console fetches a game's files ahead (`prefetch_list`) as readable CORS requests with
+    # credentials, as the game's own page fetches them, so the browser's cache keeps them for it.
+    shared = f"\n  Access-Control-Allow-Origin: {parent}\n  Access-Control-Allow-Credentials: true" if embedded else ""
     return f"""/*
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
-  Cross-Origin-Resource-Policy: cross-origin
+  Cross-Origin-Resource-Policy: cross-origin{shared}
   Permissions-Policy: {policy}
   X-Content-Type-Options: nosniff
   Referrer-Policy: origin
-  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; connect-src 'self'; img-src 'self' blob:; frame-src {frame_src}; frame-ancestors {ancestors}; object-src 'none'; base-uri 'self'
+  Content-Security-Policy: default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; worker-src 'self' blob:; connect-src {connect_src}; img-src 'self' blob:; frame-src {frame_src}; frame-ancestors {ancestors}; object-src 'none'; base-uri 'self'
 /*.wasm
   Content-Type: application/wasm
 /*.wgsl
@@ -141,9 +149,10 @@ def file_list(directory):
 
 
 def prefetch_list(game, output, release):
-    """What the console fetches of a game ahead of time, once it is idle: each build's page,
-    runtime, WASM and shaders, the session first. Not the files a game streams as it plays, nor
-    its trap locations, which only a crash reads."""
+    """What the console fetches of a game ahead of time, once it is idle: each build's runtime,
+    WASM and shaders, the session first. Not the files a game streams as it plays, nor its trap
+    locations, which only a crash reads, nor its pages: a frame's page is a navigation, which
+    the browser caches apart from fetches."""
     root = origin(game["domain"]) + "/releases/" + release + "/"
     builds = sorted(game["builds"], key=lambda name: name != game["session"])
     urls = []
@@ -151,10 +160,26 @@ def prefetch_list(game, output, release):
         directory = output / game["worker"] / name
         for path in sorted(release_files(directory)):
             relative = path.relative_to(directory)
-            if relative.parts[0] == "files" or path.suffix == ".lines":
+            if relative.parts[0] == "files" or path.suffix in {".lines", ".html"}:
                 continue
             urls.append(root + name + "/" + relative.as_posix())
     return "\n".join(urls) + "\n"
+
+
+def card(console, release, catalog):
+    """The console page's description, and the card a link to it shows where it is shared: its
+    first game's cover."""
+    home = origin(console["domain"])
+    text = html.escape(console["description"])
+    cover = f"{home}/releases/{release}/{catalog[0].split(chr(9))[3]}"
+    return (f'\n<meta name="description" content="{text}">'
+            f'\n<meta property="og:type" content="website">'
+            f'\n<meta property="og:site_name" content="wrela">'
+            f'\n<meta property="og:title" content="wrela">'
+            f'\n<meta property="og:description" content="{text}">'
+            f'\n<meta property="og:url" content="{home}/">'
+            f'\n<meta property="og:image" content="{cover}">'
+            f'\n<meta name="twitter:card" content="summary_large_image">')
 
 
 def wrangler_config(project):
@@ -230,7 +255,7 @@ def package(config, output):
         directory = output / project["worker"]
         if project is console:
             entry = (directory / "index.html").read_text()
-            entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">')
+            entry = entry.replace("<head>", f'<head>\n<base href="/releases/{release}/">' + card(console, release, catalog))
         else:
             entry = None
         versioned = directory / "releases" / release

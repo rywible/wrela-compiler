@@ -1,4 +1,5 @@
 import { LIMIT_SOURCES } from "./check.ts";
+import { UnsupportedError } from "./errors.ts";
 
 /** The GPU, its adapter or device failed, or reported an error. */
 export class GpuError extends Error {
@@ -11,8 +12,8 @@ export class GpuError extends Error {
 /** Opens a hardware adapter with its own limits, as the native host does. */
 export async function openDevice(timestamps: boolean, fatal: (error: Error) => void): Promise<GPUDevice> {
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
-  if (!adapter) throw new GpuError("WebGPU isn't available here (no adapter)");
-  if (adapter.info.isFallbackAdapter !== false) throw new GpuError("hardware GPU required; WebGPU selected a fallback adapter");
+  if (!adapter) throw new UnsupportedError("WebGPU isn't available here (no adapter)");
+  if (adapter.info.isFallbackAdapter !== false) throw new UnsupportedError("hardware GPU required; WebGPU selected a fallback adapter");
   const requiredLimits: Record<string, number> = {};
   for (const name of LIMIT_SOURCES.flat()) requiredLimits[name] = adapter.limits[name];
   const requiredFeatures: GPUFeatureName[] = timestamps && adapter.features.has("timestamp-query") ? ["timestamp-query"] : [];

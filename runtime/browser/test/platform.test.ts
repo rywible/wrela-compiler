@@ -52,7 +52,7 @@ test("prefetching fetches each URL at low priority until it is stopped", async (
   const list = "https://a.example/one\n\nhttps://a.example/missing\nhttps://a.example/two\n";
   await prefetch(list, "https://console.example/", new AbortController().signal, fetchFn);
   expect(seen.map(s => s.url).sort()).toEqual(["https://a.example/missing", "https://a.example/one", "https://a.example/two"]);
-  expect(seen[0]!.init).toMatchObject({ mode: "no-cors", credentials: "omit", priority: "low" });
+  expect(seen[0]!.init).toMatchObject({ mode: "cors", credentials: "include", priority: "low" });
   // Stopped (a program opening), nothing more starts.
   seen.length = 0;
   const many = ["stop", ...Array.from({ length: 20 }, (_, i) => `f${i}`)].map(n => `https://a.example/${n}`).join("\n");
@@ -236,9 +236,10 @@ test("a shown program is named in the address, and Back asks it to return", asyn
   };
   Object.defineProperty(globalThis, "window", { configurable: true, value: page });
   Object.defineProperty(globalThis, "history", { configurable: true, value: pages });
-  Object.defineProperty(globalThis, "location", { configurable: true, value: { hash: "", pathname: "/", search: "" } });
+  Object.defineProperty(globalThis, "location", { configurable: true, value: { hash: "", pathname: "/", search: "?from=link" } });
+  // The page's <base> is its release's directory; the address keeps the page's own path.
   Object.defineProperty(globalThis, "document", { configurable: true, value: {
-    baseURI: "https://console.example/",
+    baseURI: "https://console.example/releases/0123456789abcdef0123/",
     createElement: () => frame,
     body: { append: () => queueMicrotask(() => frame.onload?.()) },
   } });
@@ -253,7 +254,7 @@ test("a shown program is named in the address, and Back asks it to return", asyn
     const first = await platform.request("surface/open", new TextEncoder().encode("https://game.example/session/"));
     await expect(show(first, "../evil")).rejects.toThrow("invalid program name");
     await show(first, "leapling");
-    expect(entries.map(e => e.url)).toEqual(["/", "#leapling"]);
+    expect(entries.map(e => e.url)).toEqual(["/", "/?from=link#leapling"]);
     // Back: the program is asked to return, and the page is the console's again.
     pages.back();
     await new Promise(r => setTimeout(r, 0));
