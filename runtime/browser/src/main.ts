@@ -21,7 +21,8 @@ function pageText(): HTMLElement | null {
 }
 
 /** Shows a fatal error over the canvas and logs it. When the machine can't run a program at all
- * (`unsupported`), it says plainly what a program needs. */
+ * (`unsupported`), it says plainly what a program needs. A page with its own text that the
+ * program never drew over shows that text, under the error. */
 function showFatal(text: string, unsupported = false): void {
   stopVoice();
   console.error(`wrela: ${text}`);
@@ -30,11 +31,10 @@ function showFatal(text: string, unsupported = false): void {
   const box = document.createElement("pre");
   box.id = "wrela-error";
   box.setAttribute("role", "alert");
+  const own = pageText();
   if (unsupported) {
     box.className = "unsupported";
-    box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nTry a current Chrome or Edge on a desktop or laptop computer.`;
-    // A page with its own text shows it, under what's missing.
-    const own = pageText();
+    box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nA current Chrome, Edge or Safari has it, on a computer or a phone.`;
     if (own) {
       document.documentElement.classList.add("text-shown");
       own.before(box);
@@ -50,6 +50,11 @@ function showFatal(text: string, unsupported = false): void {
     }
   } else {
     box.textContent = `wrela stopped: ${text}`;
+    if (own) {
+      document.documentElement.classList.add("text-shown");
+      own.before(box);
+      return;
+    }
   }
   document.body.append(box);
 }
@@ -280,6 +285,11 @@ function start(): void {
     const canvas = document.querySelector<HTMLCanvasElement>("canvas#screen");
     if (!canvas) throw new Error("the page has no <canvas id=\"screen\">");
     if (!("gpu" in navigator)) throw new UnsupportedError("this browser doesn't support WebGPU");
+    // The program shares memory with its worker, which a page that isn't cross-origin isolated
+    // (as in some apps' own browsers) can't.
+    if (typeof SharedArrayBuffer === "undefined") {
+      throw new UnsupportedError("this page can't share memory with its worker here");
+    }
     if (typeof canvas.transferControlToOffscreen !== "function") {
       throw new UnsupportedError("this browser can't hand a canvas to a worker (no OffscreenCanvas)");
     }

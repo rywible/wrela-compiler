@@ -204,9 +204,20 @@ cover = "cover.png"
             self.assertIn("<title>Wrela docs</title>", page)
             text = page[page.index('<main id="wrela-text">'):page.index("</main>")]
             self.assertIn("<h2>The language</h2>", text)
-            self.assertIn('<li><a href="https://docs.example/spec/language/6-memory.md">6. Memory</a>: '
+            # A person's pages first, then what an agent reads.
+            self.assertLess(text.index("<h2>The language</h2>"), text.index("<h2>For agents</h2>"))
+            self.assertIn('<li><a href="https://docs.example/spec/language/6-memory.html">6. Memory</a>: '
                           'Values &amp; <code>moves</code>.</li>', text)
-            self.assertIn('<li><a href="https://docs.example/std/io.md">std::io</a></li>', text)
+            self.assertIn('<li><a href="https://docs.example/std/io.html">std::io</a></li>', text)
+            # Each page is HTML too, beside its Markdown, with the pages' style and the script that
+            # sends a browser without WebGPU to the page its address names.
+            shipped = shelf / "releases" / release
+            self.assertIn("<title>std::io | Wrela docs</title>", (shipped / "std/io.html").read_text())
+            for name in ["pages.css", "pages.js", "Manrope-Medium.ttf"]:
+                self.assertTrue((shipped / name).is_file(), name)
+            self.assertIn('<script src="pages.js" defer></script>', page)
+            # It comes before the program's own style, so it says more to win: a pinch still zooms.
+            self.assertIn("<style>html canvas#screen { touch-action: pinch-zoom; }</style>", page)
             self.assertIn('<a href="https://docs.example/std/llms-full.txt">std/llms-full.txt</a>', text)
             self.assertNotIn("spec/llms-full.txt", text)
             self.assertIn("<code>https://docs.example/#std/arena:arena-insert</code>", text)

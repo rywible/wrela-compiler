@@ -53,6 +53,7 @@ function overlay(page: FakePage) {
   const forward: Forward = {
     wheel: () => forwarded.push("wheel"),
     move: () => forwarded.push("move"),
+    press: (e) => forwarded.push(`press ${e.pointerType}`),
     key: (e, down) => forwarded.push(`${down ? "down" : "up"} ${e.key}`),
   };
   o.connect(forward);
@@ -127,6 +128,20 @@ test("a link is an <a> to its address: a plain click is the program's, a modifie
   el(1).dispatchEvent(domEvent("wheel"));
   el(1).dispatchEvent(domEvent("pointermove"));
   expect(forwarded).toEqual(["wheel", "move"]);
+  // A finger's press on a link is the canvas's, so a swipe from it scrolls; a mouse's is the
+  // link's own.
+  const finger = domEvent("pointerdown", { pointerType: "touch" });
+  el(1).dispatchEvent(finger);
+  el(1).dispatchEvent(domEvent("pointerdown", { pointerType: "mouse" }));
+  expect(forwarded).toEqual(["wheel", "move", "press touch"]);
+  expect(finger.defaultPrevented).toBe(true);
+  // ...and the click a finger's tap ends in is the program's too, which had the press.
+  events.length = 0;
+  el(1).dispatchEvent(finger);
+  const tapped = domEvent("click", { button: 0 });
+  el(1).dispatchEvent(tapped);
+  expect(tapped.defaultPrevented).toBe(true);
+  expect(events).toEqual([]);
   // A link takes the pointer only where it's drawn: half the device pixels in CSS pixels.
   o.geometry(geometry([[1, 10, 20, 30, 8], [2, 0, 0, 0, 0]]));
   expect([el(1).style.left, el(1).style.top, el(1).style.width, el(1).style.height]).toEqual(["5px", "10px", "15px", "4px"]);

@@ -44,7 +44,7 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null, text: [], classes: [] };
   // The page's own text records a box put before it, and its removal.
   const own = options.text ? {
-    before: (el: { textContent: string; className?: string }) => page.text.push(`before: [${el.className}] ${el.textContent.split("\n")[0]}`),
+    before: (el: { textContent: string; className?: string }) => page.text.push(`before: ${el.className ? `[${el.className}] ` : ""}${el.textContent.split("\n")[0]}`),
     remove: () => page.text.push("removed"),
   } : null;
   const canvas = {
@@ -127,7 +127,7 @@ test("a public page ignores #test", async () => {
 
 test("a browser without WebGPU is told what a program needs, not that it failed", async () => {
   const page = await load("https://example.com/game/", { gpu: false });
-  expect(page.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this browser doesn't support WebGPU).\nTry a current Chrome or Edge on a desktop or laptop computer."]);
+  expect(page.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this browser doesn't support WebGPU).\nA current Chrome, Edge or Safari has it, on a computer or a phone."]);
   expect(page.posted).toEqual([]);
 });
 
@@ -150,10 +150,29 @@ test("a page with its own text shows it when it can't run, and drops it once the
   expect(runs.classes).toEqual([]);
 });
 
+test("a page that can't share memory with its worker is a browser that can't run it", async () => {
+  const saved = Object.getOwnPropertyDescriptor(globalThis, "SharedArrayBuffer");
+  Reflect.deleteProperty(globalThis, "SharedArrayBuffer");
+  try {
+    const page = await load("https://docs.example/", { text: true });
+    expect(page.text).toEqual(["before: [unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (this page can't share memory with its worker here)."]);
+    expect(page.posted).toEqual([]);
+  } finally {
+    if (saved) Object.defineProperty(globalThis, "SharedArrayBuffer", saved);
+  }
+});
+
+test("a program that fails before it draws leaves its page's own text to read", async () => {
+  const page = await load("https://docs.example/", { text: true });
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "device lost", unsupported: false } satisfies FromWorker }));
+  expect(page.text).toEqual(["before: wrela stopped: device lost"]);
+  expect(page.classes).toEqual(["text-shown"]);
+});
+
 test("a machine without a hardware adapter is told the same; other failures still say they stopped", async () => {
   const unsupported = await load("https://example.com/game/");
   unsupported.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "WebGPU isn't available here (no adapter)", unsupported: true } satisfies FromWorker }));
-  expect(unsupported.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (WebGPU isn't available here (no adapter)).\nTry a current Chrome or Edge on a desktop or laptop computer."]);
+  expect(unsupported.shown).toEqual(["[unsupported] This needs WebGPU on a hardware GPU, which this browser can't give it (WebGPU isn't available here (no adapter)).\nA current Chrome, Edge or Safari has it, on a computer or a phone."]);
   const failed = await load("https://example.com/game/");
   failed.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "device lost", unsupported: false } satisfies FromWorker }));
   expect(failed.shown).toEqual(["wrela stopped: device lost"]);

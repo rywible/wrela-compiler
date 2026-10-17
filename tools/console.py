@@ -15,6 +15,8 @@ import sys
 import tempfile
 import tomllib
 
+import pages
+
 ROOT = Path(__file__).resolve().parents[1]
 MAX_FILE = 25 * 1024 * 1024
 MAX_FILES = 20_000
@@ -264,7 +266,11 @@ def docs_page(docs, directory):
             f'\n<meta property="og:title" content="Wrela docs">'
             f'\n<meta property="og:description" content="{text}">'
             f'\n<meta property="og:url" content="{home}/">'
-            f'\n<link rel="alternate" type="text/markdown" href="/llms.txt" title="The docs as Markdown">')
+            f'\n<link rel="alternate" type="text/markdown" href="/llms.txt" title="The docs as Markdown">'
+            f'\n<script src="pages.js" defer></script>'
+            # A reader may still pinch the docs larger, as on any page; a finger's swipe is the
+            # program's.
+            f'\n<style>html canvas#screen {{ touch-action: pinch-zoom; }}</style>')
     index = json.loads((directory / "index.json").read_text())
     groups = {}
     for page in index.get("pages", []):
@@ -277,23 +283,26 @@ def docs_page(docs, directory):
              *[(f"{g}/llms-full.txt", f"{'the language' if g == 'spec' else g}'s pages in one file")
                for g in groups if (directory / g / "llms-full.txt").is_file()],
              ("llms-full.txt", "every page in one file")]
+    # A person first: the pages, each as plain HTML. Then an agent: the Markdown, and how an
+    # address names a page, as its fragment never reaches the server.
     body = ['<main id="wrela-text">', "<h1>Wrela docs</h1>", f"<p>{text}</p>",
-            "<p>These pages are a Wrela program that draws with WebGPU. The same docs are plain "
-            "Markdown, for agents and for browsers that can't run the program:</p>", "<ul>"]
+            "<p>These pages are a Wrela program that draws with WebGPU. Here they are as plain "
+            "pages, for a browser that can't run it.</p>"]
+    for group, members in groups.items():
+        body.append(f"<h2>{'The language' if group == 'spec' else html.escape(group)}</h2>")
+        body.append("<ul>")
+        for page in members:
+            link = f'<a href="{home}/{html.escape(page["path"][:-3])}.html">{html.escape(page["title"])}</a>'
+            summary = page.get("summary", "")
+            body.append(f"<li>{link}: {code_of(summary)}</li>" if summary else f"<li>{link}</li>")
+        body.append("</ul>")
+    body += ["<h2>For agents</h2>", "<p>Each page is Markdown too:</p>", "<ul>"]
     body += [f'<li><a href="{home}/{name}">{name}</a>: {what}.</li>' for name, what in files
              if (directory / name).is_file()]
     body += ["</ul>",
              f"<p>An address of these docs names its page after <code>#</code>, and a heading on it "
              f"after <code>:</code>. <code>{home}/#std/arena:arena-insert</code> is the heading "
              f"<code>arena-insert</code> of <a href=\"{home}/std/arena.md\">{home}/std/arena.md</a>.</p>"]
-    for group, pages in groups.items():
-        body.append(f"<h2>{'The language' if group == 'spec' else html.escape(group)}</h2>")
-        body.append("<ul>")
-        for page in pages:
-            link = f'<a href="{home}/{html.escape(page["path"])}">{html.escape(page["title"])}</a>'
-            summary = page.get("summary", "")
-            body.append(f"<li>{link}: {code_of(summary)}</li>" if summary else f"<li>{link}</li>")
-        body.append("</ul>")
     body.append("</main>")
     return head, "\n" + "\n".join(body)
 
@@ -331,6 +340,7 @@ def package(config, output):
         build_package(docs["package"], shelf)
         copy_licenses(docs["package"], shelf)
         export_docs(docs, shelf, commit)
+        pages.write_pages(shelf)
         packages.append(shelf)
     for game in config["games"]:
         game_output = output / game["worker"]

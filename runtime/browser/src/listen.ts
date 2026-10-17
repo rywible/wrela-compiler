@@ -57,10 +57,13 @@ export interface Overlay {
 }
 
 /** What the overlay hands on to the program as if it happened over the canvas: the wheel and the
- * pointer's moves over a link, and the keys a field doesn't use. */
+ * pointer's moves over a link, a finger's or a pen's press on one (the canvas takes that pointer,
+ * so a swipe that starts on a link scrolls, and a tap is the program's), and the keys a field
+ * doesn't use. */
 export interface Forward {
   wheel(e: WheelEvent): void;
   move(e: PointerEvent): void;
+  press(e: PointerEvent): void;
   key(e: KeyboardEvent, down: boolean): void;
 }
 
@@ -205,7 +208,7 @@ export function listen(
     put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
   };
   canvas.addEventListener("pointermove", move);
-  canvas.addEventListener("pointerdown", (e) => {
+  const press = (e: PointerEvent) => {
     canvas.setPointerCapture(e.pointerId);
     const [x, y] = at(e);
     const button = buttonOf(e.button);
@@ -218,7 +221,8 @@ export function listen(
     // A press on the canvas gives it the keys back from the overlay, or to the field drawn there;
     // text mode keeps its field.
     if (!texting() && !overlay?.focusAt(e.clientX, e.clientY)) canvas.focus({ preventScroll: true });
-  });
+  };
+  canvas.addEventListener("pointerdown", press);
   canvas.addEventListener("pointerup", (e) => {
     const [x, y] = at(e);
     const button = buttonOf(e.button);
@@ -279,6 +283,7 @@ export function listen(
   overlay?.connect({
     wheel,
     move,
+    press,
     key(e, down) {
       const key = keyCode(e.code);
       if (down) keys.add(key);

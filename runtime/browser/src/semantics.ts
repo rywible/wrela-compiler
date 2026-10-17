@@ -156,7 +156,8 @@ const STYLE = `
 .wrela-semantics input.wrela-node::-webkit-search-cancel-button,
 .wrela-semantics input.wrela-node::-webkit-search-decoration { appearance: none; display: none; }
 .wrela-semantics .wrela-holder { position: static; overflow: visible; }
-.wrela-semantics a.wrela-node.wrela-hit { pointer-events: auto; cursor: pointer; }
+.wrela-semantics a.wrela-node.wrela-hit { pointer-events: auto; cursor: pointer; touch-action: pinch-zoom;
+  -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
 .wrela-semantics .wrela-node:focus-visible, .wrela-semantics [role=listbox]:focus .wrela-active {
   outline: 3px solid #4766ff; outline-offset: 2px; border-radius: 4px; }
 .wrela-semantics input.wrela-node:focus-visible, .wrela-semantics textarea.wrela-node:focus-visible { outline: none; }
@@ -187,6 +188,9 @@ export class Semantics implements Overlay {
   #fields = new Map<number, FieldState>();
   #forms = new Map<number, HTMLFormElement>();
   #forward: Forward | null = null;
+  /** Whether a finger's press on a link went to the canvas: the click it ends in is the program's,
+   * which had the press. */
+  #forwarded = false;
   // The focus the program last asked for, and where the focus was before a modal dialog opened.
   #focused = 0;
   #returns = new Map<number, Element | null>();
@@ -378,6 +382,11 @@ export class Semantics implements Overlay {
         break;
       case Role.Link: {
         el.addEventListener("click", (e) => {
+          if (this.#forwarded) {
+            this.#forwarded = false;
+            e.preventDefault();
+            return;
+          }
           // A plain click is the program's; a middle or modified click, the browser's.
           if (e.button !== 0 || e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
           e.preventDefault();
@@ -385,6 +394,15 @@ export class Semantics implements Overlay {
         });
         el.addEventListener("wheel", (e) => this.#forward?.wheel(e), { passive: false });
         el.addEventListener("pointermove", (e) => this.#forward?.move(e));
+        // A finger or a pen on a link is a press on the canvas: a swipe from a link scrolls, and
+        // a tap goes where the program says, once. A mouse keeps the link's own clicks.
+        el.addEventListener("pointerdown", (e) => {
+          this.#forwarded = false;
+          if (e.pointerType === "mouse" || !this.#forward) return;
+          e.preventDefault();
+          this.#forwarded = true;
+          this.#forward.press(e);
+        });
         break;
       }
       case Role.Option: case Role.Tab: case Role.MenuItem:
