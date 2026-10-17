@@ -421,6 +421,7 @@ export class BrowserPlatform {
       // A new tab with no way back to this page.
       window.open(linkUrl(DECODER.decode(body)), "_blank", "noopener,noreferrer"); return new Uint8Array();
     }
+    if (service === "nav/reload") { location.reload(); return new Uint8Array(); }
     if (service === "nav/go") {
       location.assign(sameOriginAddress(DECODER.decode(body), location.href)); return new Uint8Array();
     }
