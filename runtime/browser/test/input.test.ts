@@ -102,17 +102,12 @@ test("losing focus or a pointer releases controls whose up event cannot arrive",
   expect(ring.read().events.length).toBe(0);
 }));
 
-test("a finger's move is where the browser predicts it, and a mouse's where it is", () => onPage((page) => {
+test("a finger's move is where it is, never where the browser predicts it", () => onPage((page) => {
   const canvas = page.createElement("canvas");
   const ring = InputRing.create();
   listen(canvas as unknown as HTMLCanvasElement, ring, () => 1, () => ({ width: 100, height: 100 }));
   const ahead = () => [{ clientX: 31, clientY: 42 }, { clientX: 33, clientY: 47 }];
   canvas.dispatchEvent(domEvent("pointermove", { clientX: 30, clientY: 40, pointerId: 1, pointerType: "touch", getPredictedEvents: ahead }));
-  expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerMove, 33, 47, 0, 0));
-  // No prediction yet: where it is.
-  canvas.dispatchEvent(domEvent("pointermove", { clientX: 30, clientY: 40, pointerId: 1, pointerType: "touch", getPredictedEvents: () => [] }));
-  expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerMove, 30, 40, 0, 0));
-  canvas.dispatchEvent(domEvent("pointermove", { clientX: 30, clientY: 40, pointerId: 2, pointerType: "mouse", getPredictedEvents: ahead }));
   expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerMove, 30, 40, 0, 0));
 }));
 

@@ -205,12 +205,9 @@ export function listen(
     const [x, y] = at(e);
     const pointer = pointers.get(e.pointerId);
     if (pointer) Object.assign(pointer, { x, y });
-    // A finger's move is on the screen a frame or two after it's read, so the program is told
-    // where the browser predicts the finger will be by then (its predicted events), as the
-    // browser's own scrolling does: what a finger drags stays under it. A mouse is where it is.
-    const ahead = e.pointerType === "touch" && typeof e.getPredictedEvents === "function" ? e.getPredictedEvents() : [];
-    const [px, py] = ahead.length > 0 ? at(ahead[ahead.length - 1]!) : [x, y];
-    put(pointerEvent(EventKind.PointerMove, px, py, 0, modifiersOf(e)));
+    // Where the pointer is, never where the browser predicts it: a prediction overshoots as a
+    // finger slows or turns, and what the finger drags would shake under it.
+    put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
   };
   canvas.addEventListener("pointermove", move);
   const press = (e: PointerEvent) => {
