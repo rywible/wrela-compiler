@@ -44,8 +44,8 @@ test("a held finger moves evenly from frame to frame, however unevenly its moves
   const steps = ys.slice(20).map((y, i, a) => (i > 0 ? y - a[i - 1]! : frame)).slice(1);
   expect(steps.length).toBeGreaterThan(30);
   for (const s of steps) expect(Math.abs(s - frame)).toBeLessThan(frame * 0.1);
-  // A frame and a half behind the newest sample, about.
-  expect(ys[ys.length - 1]!).toBeGreaterThan(60 * frame - 3 * frame);
+  // Behind the finger no more than its samples come late: a frame, and the gap between two.
+  expect(60 * frame - ys[ys.length - 1]!).toBeLessThan(frame + 4 + 2);
 });
 
 test("a finger that rests is shown where it rests", () => {

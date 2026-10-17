@@ -217,7 +217,8 @@ cover = "cover.png"
                 self.assertTrue((shipped / name).is_file(), name)
             self.assertIn('<script src="pages.js" defer></script>', page)
             # It comes before the program's own style, so it says more to win: a pinch still zooms.
-            self.assertIn("<style>html canvas#screen { touch-action: pinch-zoom; }</style>", page)
+            self.assertIn("<style>html canvas#screen { touch-action: pinch-zoom; } html, body { background: #09090B; }", page)
+            self.assertIn('<meta name="theme-color" media="(prefers-color-scheme: light)" content="#FFFFFF">', page)
             self.assertIn('<a href="https://docs.example/std/llms-full.txt">std/llms-full.txt</a>', text)
             self.assertNotIn("spec/llms-full.txt", text)
             self.assertIn("<code>https://docs.example/#std/arena:arena-insert</code>", text)

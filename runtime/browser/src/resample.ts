@@ -3,9 +3,9 @@
 // read as they come, a frame sometimes finds no move and the next finds two frames' worth, and
 // what a finger drags stutters. So while a pointer is held, a frame at time `t` gets one move: where
 // the pointer was at `t - behind`, between the samples around that moment. `behind` covers how far
-// a frame's newest sample has trailed it over the last moments while the pointer moved, and the gap
-// between samples, so the samples around that moment have come: it grows at once when a frame's
-// newest sample trails it farther than any of those, and shrinks slowly once the farthest is past. So the moment shown advances by the frames' own steps, however
+// a frame's newest sample has trailed it over the last moments while the pointer moved, so a frame
+// has the sample its moment needs: it grows at once when a frame's newest sample trails it farther
+// than any of those, and shrinks slowly once the farthest is past. So the moment shown advances by the frames' own steps, however
 // unevenly the samples arrive. A move with nothing held, a press, a release and
 // every other event pass as they come, in order.
 
@@ -16,7 +16,7 @@ type Sample = { x: number; y: number; t: number };
 
 /** What `behind` starts at, and how long how late a sample came counts (ms); how much of itself
  * `behind` sheds a frame while more than that. */
-const START = 16;
+const START = 8;
 const KEPT = 2000;
 const SHED = 0.005;
 
@@ -25,9 +25,8 @@ export class Resampler {
   /** A held pointer's samples since the moment shown, oldest first: its press, then its moves. */
   #samples: Sample[] = [];
   #modifiers = 0;
-  /** How far behind a frame's time the pointer is shown, and the gap between its samples, in ms. */
+  /** How far behind a frame's time the pointer is shown, in ms. */
   #behind = START;
-  #gap = 8;
   /** How far behind each frame of the last `KEPT` ms needed the pointer shown, oldest first. */
   #needs: { t: number; need: number }[] = [];
   /** The times of the samples come since the last frame; the last frame's time and its newest
@@ -50,8 +49,6 @@ export class Resampler {
       const t = times[i] ?? now;
       if (kind === EventKind.PointerMove && this.#held) {
         this.#modifiers = view.getUint32(off + 4, true);
-        const last = this.#samples[this.#samples.length - 1]!;
-        if (this.#samples.length > 1 && t > last.t) this.#gap += (Math.min(t - last.t, 20) - this.#gap) * 0.1;
         this.#samples.push({ x, y, t });
         this.#fresh.push(t);
         continue;
@@ -84,7 +81,7 @@ export class Resampler {
     const newest = samples[samples.length - 1]!;
     // How far this frame's newest sample trails it, and the last frame's, if samples come since
     // were taken before it: the pointer was moving, and that frame lacked them.
-    const needs = (trail: number) => this.#needs.push({ t: now, need: trail + this.#gap + 1 });
+    const needs = (trail: number) => this.#needs.push({ t: now, need: trail + 1 });
     if (this.#fresh.length > 0) {
       needs(now - newest.t);
       if (this.#last !== null && Math.min(...this.#fresh) <= this.#last.frame) needs(this.#last.frame - this.#last.newest);
