@@ -184,6 +184,8 @@ export class Semantics implements Overlay {
   #root: HTMLDivElement | null = null;
   #live: HTMLDivElement | null = null;
   #els = new Map<number, HTMLElement>();
+  /** Where each element was last placed, so a geometry that didn't move it leaves it alone. */
+  #places = new WeakMap<HTMLElement, string>();
   #nodes = new Map<number, Node>();
   #fields = new Map<number, FieldState>();
   #forms = new Map<number, HTMLFormElement>();
@@ -339,6 +341,11 @@ export class Semantics implements Overlay {
       const el = this.#els.get(id);
       const n = this.#nodes.get(id);
       if (!el || !n || CONTAINERS.has(n.role)) continue;
+      // Only what moved is touched: after a scroll most of a long page stays out of view, and
+      // restyling every element costs the thread a phone's touches arrive on.
+      const place = `${x * sx},${y * sy},${w * sx},${h * sy}`;
+      if (this.#places.get(el) === place) continue;
+      this.#places.set(el, place);
       Object.assign(el.style, { left: `${x * sx}px`, top: `${y * sy}px`, width: `${w * sx}px`, height: `${h * sy}px` });
       // A link takes the pointer only where it's drawn and can be seen.
       el.classList.toggle("wrela-hit", w > 0 && h > 0);

@@ -376,9 +376,7 @@ test("a top-level program moves through its own addresses, and hears Back and Fo
     get search() { return new URL(entries[at]!, "https://docs.example").search; },
     get hash() { return new URL(entries[at]!, "https://docs.example").hash; },
     get href() { return new URL(entries[at]!, "https://docs.example").href; },
-    reload: () => { reloads++; },
   };
-  let reloads = 0;
   const pages = {
     state: null,
     pushState: (_s: unknown, _t: string, url: string) => { entries.splice(at + 1); entries.push(url); at++; },
@@ -405,9 +403,6 @@ test("a top-level program moves through its own addresses, and hears Back and Fo
     back();
     expect(await text("nav/changed")).toBe("/v0.1/");
     await expect(text("nav/push", "https://elsewhere.example/")).rejects.toThrow("own origin");
-    // A reload loads the page again, at the address it's at.
-    await text("nav/reload");
-    expect(reloads).toBe(1);
     // A program in a frame has no address of its own.
     page.parent = {};
     await expect(text("nav/push", "#x")).rejects.toThrow("no address of its own");

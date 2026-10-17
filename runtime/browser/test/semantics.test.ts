@@ -146,6 +146,12 @@ test("a link is an <a> to its address: a plain click is the program's, a modifie
   o.geometry(geometry([[1, 10, 20, 30, 8], [2, 0, 0, 0, 0]]));
   expect([el(1).style.left, el(1).style.top, el(1).style.width, el(1).style.height]).toEqual(["5px", "10px", "15px", "4px"]);
   expect([el(1).classes.has("wrela-hit"), el(2).classes.has("wrela-hit")]).toEqual([true, false]);
+  // A geometry that doesn't move an element leaves it alone; one that does places it.
+  el(1).style.left = "untouched";
+  o.geometry(geometry([[1, 10, 20, 30, 8], [2, 0, 0, 0, 0]]));
+  expect(el(1).style.left).toBe("untouched");
+  o.geometry(geometry([[1, 10, 30, 30, 8], [2, 0, 0, 0, 0]]));
+  expect([el(1).style.left, el(1).style.top]).toEqual(["5px", "15px"]);
 }));
 
 test("an update keeps each element and its focus; the program's focus moves it; leaving says so", () => onPage((page) => {
