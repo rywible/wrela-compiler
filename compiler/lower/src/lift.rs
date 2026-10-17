@@ -1,11 +1,11 @@
-//! Lifted builds (language.md §20): each `f32` literal of the chosen packages is read from a
+//! Lifted builds (language.md §23): each `f32` literal of the chosen packages is read from a
 //! table rather than built into the code, so a tool can change it while the program runs.
 //!
 //! - **Which literals.** Every operand the MIR has for an `f32` literal written in a lifted
 //!   package's files, wherever it's used: a constant whose value is literal is built where it's
 //!   used, from its own literals (so every use of `EAR_H` reads one entry), and so is a
 //!   parameter's or a field's default. A literal only a computed constant reads isn't lifted:
-//!   the build runs that code once (§10).
+//!   the build runs that code once (§13).
 //! - **The CPU** reads entry `i` from the table in memory: `Load(table[i])`. A change writes the
 //!   entry and counts a generation.
 //! - **The GPU** reads it from a storage buffer that every pipeline of a lifted build binds
@@ -309,7 +309,7 @@ fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u
     mb.m.add_function(f)
 }
 
-/// `std::lift`'s table intrinsics (§20), on the CPU.
+/// `std::lift`'s table intrinsics (§23), on the CPU.
 pub(crate) fn intrinsic(
     fl: &mut Fl,
     lang: wrela_sema::defs::Lang,

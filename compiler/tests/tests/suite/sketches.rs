@@ -103,7 +103,7 @@ fn u64_of(v: &[Value]) -> u64 {
     }
 }
 
-/// The tick's parallel loop gives the same world with 1, 2 and 4 threads (§6.12).
+/// The tick's parallel loop gives the same world with 1, 2 and 4 threads (§16.1).
 #[test]
 fn sketch_03s_tick_doesnt_depend_on_the_workers() {
     let run = |workers: u32| {

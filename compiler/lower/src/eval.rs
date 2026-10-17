@@ -1,4 +1,4 @@
-//! Build-time constants (language.md §10). A constant whose value isn't literal is computed by
+//! Build-time constants (language.md §13). A constant whose value isn't literal is computed by
 //! the build: it lowers the function that computes it ([`FnOwner::Const`]) and everything that
 //! calls into a CPU module of its own, runs that in wasmtime, and reads the value back out of
 //! the module's memory as a [`Value`]. The program's own module then lays each value out as
@@ -55,9 +55,9 @@ pub struct BuildData {
     /// A build whose WASM uses no SIMD (`wrela_wasm::Options::simd`): its results are the same,
     /// bit for bit, which a test checks.
     pub no_simd: bool,
-    /// A lifted build's literals (language.md §20).
+    /// A lifted build's literals (language.md §23).
     pub lift: Option<crate::LiftTable>,
-    /// Which host runs the build (§12): its entries, and what it may reach.
+    /// Which host runs the build (§15.3): its entries, and what it may reach.
     pub role: wrela_sema::defs::Role,
 }
 
@@ -135,7 +135,7 @@ pub fn lower_consts(
     cx.drain(&mut mb);
     crate::rewrite_cpu_math(&mut cx, &mut mb);
     cx.drain(&mut mb);
-    // A constant's parallel jobs run on the build's threads (§10): its module exports the
+    // A constant's parallel jobs run on the build's threads (§13): its module exports the
     // helpers' entry when it runs any.
     crate::thread_entries(&mut cx, &mut mb);
     if !cx.missing.is_empty() {
@@ -151,7 +151,7 @@ pub fn lower_consts(
     (ConstLowering::Ready(ConstModule { module: mb.m, exports }), diags)
 }
 
-/// A module whose exports run tests (§10): each of `tests`, a `@test` function, called with
+/// A module whose exports run tests (§13): each of `tests`, a `@test` function, called with
 /// nothing; each export returns 0. The constants they read are computed (in `data`).
 pub struct TestModule {
     pub module: ir::Module,

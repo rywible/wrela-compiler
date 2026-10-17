@@ -1,6 +1,6 @@
 // rejects: const.build
 // A panic while the build computes a constant is a compile error, where the program's own code
-// panicked, with the calls that led there (§10).
+// panicked, with the calls that led there (§13).
 struct Skeleton {
     bones: Vec<Text>,
 }

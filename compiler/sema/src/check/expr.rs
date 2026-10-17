@@ -273,7 +273,7 @@ impl<'p> Checker<'p> {
                             span.shrink_to_start().to(b.span.shrink_to_start()),
                             "`unsafe` is only for packages that declare it",
                         )
-                        .with_note("`unsafe` exists for the stdlib's core: the checker can't verify what's inside (§6.14)")
+                        .with_note("`unsafe` exists for the stdlib's core: the checker can't verify what's inside (§6.12)")
                         .with_help("declare `unsafe = true` in the package's `wrela.toml`, if it must"),
                     );
                 }
@@ -1413,7 +1413,7 @@ impl<'p> Checker<'p> {
     pub(crate) fn field_of_checked(&mut self, b: Expr, name: &ast::FieldName, span: Span) -> Expr {
         // Resolved through: a field `T::Out` normalizes only once `T` is known.
         let bt = self.infer.resolve(&self.p.types, b.ty);
-        // A field of the value a `GpuField` names, where it is: a `GpuField` of the field (§12).
+        // A field of the value a `GpuField` names, where it is: a `GpuField` of the field (§18).
         if let (&TyKind::Adt(a, ref args), ast::FieldName::Ident(n)) = (self.kind(bt), name)
             && self.p.is_lang_adt(a, Lang::GpuField)
             && args.len() == 2
@@ -1631,7 +1631,7 @@ impl<'p> Checker<'p> {
                             "a `Slots` is indexed by the invocation's `GlobalId`, not `{shown}`"
                         ),
                     )
-                    .with_note("each invocation may write only its own slot (§6.13)")
+                    .with_note("each invocation may write only its own slot (§18.4)")
                     .with_help(
                         "index it with the kernel's `id: GlobalId` parameter: `out[id] = value`",
                     ),
@@ -1724,7 +1724,7 @@ impl<'p> Checker<'p> {
             TyKind::Error => self.p.types.error,
             _ if let Some(t) = self.vec_elem(b.ty) => t,
             TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Bounded) => args[0],
-            // A buffer's elements, in GPU code (§12; CPU code can't read them, E0607).
+            // A buffer's elements, in GPU code (§18; CPU code can't read them, E0607).
             TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::GpuSpan) => args[0],
             _ => {
                 let shown = self.display(b.ty);
@@ -2073,7 +2073,7 @@ impl<'p> Checker<'p> {
             let name = &self.p.adt(adt).name;
             self.err(
                 Diagnostic::new(codes::E0601, path.span, format!("a `{name}` can't be built"))
-                    .with_note("each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§6.13)")
+                    .with_note("each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§18.4)")
                     .with_help(format!("take it as a kernel parameter: `id: {name}`")),
             );
         }
@@ -2247,7 +2247,7 @@ impl<'p> Checker<'p> {
 
     /// A parameter's or field's default where a call or literal leaves it out. It's checked
     /// as where it's declared, in `module`: its names are that module's, never the caller's.
-    /// A constant is a place nothing moves out of (§10), so where the value is `owned` (a
+    /// A constant is a place nothing moves out of (§13), so where the value is `owned` (a
     /// field, a `take` parameter) a constant that isn't `Copy` is cloned.
     pub(crate) fn check_default(
         &mut self,
@@ -2539,7 +2539,7 @@ impl<'p> Checker<'p> {
         Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms, mutable: false } }
     }
 
-    /// `x?` (§15): `x`'s value if it's `Some` or `Ok`; otherwise the function returns `None`, or
+    /// `x?` (§10): `x`'s value if it's `Some` or `Ok`; otherwise the function returns `None`, or
     /// the `Err`. A `match` with two arms.
     fn check_try(&mut self, inner: &ast::Expr, span: Span) -> Expr {
         let x = self.check_expr(inner, None);
@@ -2560,7 +2560,7 @@ impl<'p> Checker<'p> {
                         x.span,
                         format!("`?` takes an `Option` or a `Result`, not `{shown}`"),
                     )
-                    .with_note("`x?` is `x`'s value, or a return of its `None` or `Err` (§15)"),
+                    .with_note("`x?` is `x`'s value, or a return of its `None` or `Err` (§10)"),
                 );
                 return self.error_expr(span);
             }

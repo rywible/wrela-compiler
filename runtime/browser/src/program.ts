@@ -2,7 +2,7 @@
 // Mirrors runtime/native/src/program.rs: the same ABI checks before instantiating, the same order
 // of work for each batch (hash, decode, sequence, check, execute), the same errors. A request is
 // answered when its answer arrives (a readback, storage, a fetch: all asynchronous here), and
-// the program sees the answer from its next call on (language.md §6.15).
+// the program sees the answer from its next call on (language.md §17.1).
 
 import {
   AUDIO_CHANNELS,
@@ -527,7 +527,7 @@ export class Program {
         new DataView(memory.buffer).setUint32(PAR_HELPERS, helpers, true);
       }
       if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
-      // A program with state makes it once, before anything else runs (language.md §12).
+      // A program with state makes it once, before anything else runs (language.md §15).
       const init = instance.exports[EXPORT_INIT];
       if (typeof init === "function") program.#call(() => (init as () => void)());
       program.#ready = true;

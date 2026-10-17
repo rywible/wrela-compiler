@@ -1,6 +1,6 @@
 //! `wrela run <package-dir> [--port N] [--rooms-port N] [--lift <package>]... [--debug]`: builds
 //! the program lifted (by default its own package's literals) and serves it to Chrome on
-//! 127.0.0.1, with hot reload (language.md §20): an edit of a literal (by `wrela edit`, or a saved
+//! 127.0.0.1, with hot reload (language.md §23): an edit of a literal (by `wrela edit`, or a saved
 //! file) shows in the running program at its next frame, and any other edit builds it again and
 //! swaps the new build in, in the same page (compiler/driver/src/live.rs). The builds go in
 //! `<package>/build/run/`.

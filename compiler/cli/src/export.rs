@@ -527,8 +527,8 @@ fn relative(from: &str, to: &str) -> String {
     out
 }
 
-/// `text`, on page `from`, with each reference to a numbered part of the spec (`§6.15`, or
-/// `language.md §6.15`) a link to it. Code, links, and references to other documents
+/// `text`, on page `from`, with each reference to a numbered part of the spec (`§17.1`, or
+/// `language.md §17.1`) a link to it. Code, links, and references to other documents
 /// (`vision.md §2`, `#28 §5`) stay as they are.
 fn link_sections(text: &str, from: &str, places: &BTreeMap<String, (String, String)>) -> String {
     let mut out = String::with_capacity(text.len());
@@ -672,16 +672,20 @@ mod tests {
             text: text.into(),
         };
         let pages = [
-            page("spec/language/6-memory.md", "# 6. Memory\n\n## 6.15 Requests, not async\n"),
+            page("spec/language/6-memory.md", "# 6. Memory\n"),
+            page(
+                "spec/language/17-host-services.md",
+                "# 17. Host services\n\n## 17.1 Requests, not async\n",
+            ),
             page("spec/language/4-types.md", "# 4. Types\n"),
         ];
         let places = spec_places(&pages);
-        let text = "Requests (language.md §6.15), types (§4, §9) and `§6.15`; vision.md §2, #28 §5.\n\
+        let text = "Requests (language.md §17.1), types (§4, §9) and `§17.1`; vision.md §2, #28 §5.\n\
                     ```\n§4\n```\n[§4](x.md)\n";
         assert_eq!(
             link_sections(text, "std/io.md", &places),
-            "Requests ([§6.15](../spec/language/6-memory.md#6-15-requests-not-async)), types \
-             ([§4](../spec/language/4-types.md), §9) and `§6.15`; vision.md §2, #28 §5.\n\
+            "Requests ([§17.1](../spec/language/17-host-services.md#17-1-requests-not-async)), types \
+             ([§4](../spec/language/4-types.md), §9) and `§17.1`; vision.md §2, #28 §5.\n\
              ```\n§4\n```\n[§4](x.md)\n"
         );
         assert_eq!(

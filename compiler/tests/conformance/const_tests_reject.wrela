@@ -1,6 +1,6 @@
 // rejects: const.tests
 // A `@test` is a free function of no parameters and no result, which runs on the CPU as the
-// build runs constants (§10).
+// build runs constants (§13).
 use std::gpu::{GpuBuffer, buffer}
 
 struct Meter {

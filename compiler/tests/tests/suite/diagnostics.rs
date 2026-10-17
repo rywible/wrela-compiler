@@ -1,5 +1,5 @@
 //! AC6: the diagnostics suite (compiler/tests/diagnostics). Each case is one common mistake,
-//! from language.md's rejection examples (§6.16) and the conformance suite's rejecting cases:
+//! from language.md's rejection examples (§6.13) and the conformance suite's rejecting cases:
 //!
 //! ```text
 //! // mistake: moving a value out of a named place without `take`

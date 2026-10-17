@@ -1,4 +1,4 @@
-//! Rooms kept durably (language.md §12, `wrela_host::rooms`): a server program on `std::net` and
+//! Rooms kept durably (language.md §19, `wrela_host::rooms`): a server program on `std::net` and
 //! `platform::net`, its journal on disk, and what a crash, a torn write, another build's journal,
 //! a proposal that traps the room or one that runs past its deadline leave. The peers are played
 //! here, in Rust, by their packed messages (`std::pack`'s rules).

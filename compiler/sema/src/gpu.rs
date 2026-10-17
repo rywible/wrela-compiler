@@ -1,4 +1,4 @@
-//! GPU entry points' signatures (language.md §6.13, §12), checked where they're declared:
+//! GPU entry points' signatures (language.md §18.3, §18), checked where they're declared:
 //! what each stage may take and return, and that a kernel's `mut` parameters are safe to share
 //! across invocations. Lowering then only sees signatures it can map to WGSL.
 
@@ -52,7 +52,7 @@ pub fn is_varyings(p: &Program, entry: Entry, t: TyId) -> bool {
     entry == Entry::Fragment && clip_position_fields(p, t).next().is_some()
 }
 
-/// A field of a bound entry point's type (§12): the parameter it binds, and how it holds its
+/// A field of a bound entry point's type (§18): the parameter it binds, and how it holds its
 /// argument.
 #[derive(Clone, Copy, Debug)]
 pub struct BoundField {
@@ -123,7 +123,7 @@ pub fn bound_varyings(p: &Program, f: FnId, args: &[TyId]) -> Option<TyId> {
 }
 
 /// Whether entry point `f`, bound with generic arguments `args`, has the bound entry point's
-/// trait `l` with arguments `targs` (§12): a kernel `Kernel`, a vertex shader whose output is
+/// trait `l` with arguments `targs` (§18): a kernel `Kernel`, a vertex shader whose output is
 /// `V` `VertexShader<V>`, and a fragment shader whose input is `V`, or that takes none,
 /// `FragmentShader<V>`.
 pub fn bound_has(p: &Program, f: FnId, args: &[TyId], l: Lang, targs: &[TyId]) -> bool {
@@ -187,7 +187,7 @@ pub fn not_varying(p: &Program, field: &str, ty: TyId, span: wrela_diag::Span) -
     )
 }
 
-/// A GPU builtin input, named by the std type that carries it (language.md §12).
+/// A GPU builtin input, named by the std type that carries it (language.md §18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BuiltinInput {
     GlobalId,
@@ -224,7 +224,7 @@ impl BuiltinInput {
     }
 }
 
-/// What a fragment shader writes, by its return type (language.md §12).
+/// What a fragment shader writes, by its return type (language.md §18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FragmentOutput {
     /// A `vec4`: it replaces the target's texel.
@@ -289,7 +289,7 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) 
     )
     .with_note(
         "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides \
-         (§6.13)",
+         (§6.10)",
     );
     // Opting in is the fix only if every field is `GpuData` (an enum never is).
     if let TyKind::Adt(a, args) = p.types.kind(ty)
@@ -321,7 +321,7 @@ fn elems_not_gpu_data(
     Some(d)
 }
 
-/// Whether `t` is a group (§12): a borrow struct (not one std gives a meaning, as `GpuSpan`),
+/// Whether `t` is a group (§18): a borrow struct (not one std gives a meaning, as `GpuSpan`),
 /// which GPU code takes as its fields: their bindings and values.
 pub fn is_group(p: &Program, t: TyId) -> bool {
     matches!(p.types.kind(t), TyKind::Adt(a, _) if p.adt(*a).borrow && p.adt(*a).lang.is_none() && p.adt(*a).entry.is_none())
@@ -495,7 +495,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 )
                 .with_note(
                     "a kernel's `mut` parameters must be safe to share across invocations \
-                     (§6.13)",
+                     (§18.4)",
                 )
                 .with_help("take a `mut Slots<T>`: each invocation writes only its own slot"),
             ),

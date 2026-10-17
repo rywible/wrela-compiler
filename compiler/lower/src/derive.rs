@@ -1,4 +1,4 @@
-//! Derived interpretations (language.md §13): calls of `gradient`, `value_and_gradient` and
+//! Derived interpretations (language.md §14): calls of `gradient`, `value_and_gradient` and
 //! `interval`, and the instances that build them with `ir::derive`, on the CPU and on the GPU.
 
 use crate::body::{Fl, Repr};
@@ -260,7 +260,7 @@ fn reached(m: &ir::Module, from: ir::FuncId, waiting: &[ir::FuncId]) -> Vec<ir::
     reach.into_iter().filter(|f| waiting.contains(f)).collect()
 }
 
-/// `reads(f)` (§20): a run of the lifted literals `inner` can read through every call, in index
+/// `reads(f)` (§23): a run of the lifted literals `inner` can read through every call, in index
 /// order, laid out as constant data.
 fn build_reads(mb: &mut ModuleBuilder, id: ir::FuncId, inner: ir::FuncId) {
     if let Some(t) = mb.lift {

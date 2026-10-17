@@ -22,16 +22,16 @@ serde_json.workspace = true
 wrela-wasm.workspace = true
 wrela-wgsl.workspace = true
 wrela-abi.workspace = true
-# Build-time constants run the program's own code (language.md §10).
+# Build-time constants run the program's own code (language.md §13).
 wasmtime.workspace = true
-# Constants are cached by their inputs between builds, keyed by a digest of them (§10).
+# Constants are cached by their inputs between builds, keyed by a digest of them (§13).
 sha2 = "0.10"
 
-# Frame tests run the program's frames on the native host's CPU, without its GPU (§10).
+# Frame tests run the program's frames on the native host's CPU, without its GPU (§13).
 wrela-host = { path = "../../runtime/native", default-features = false }
 
 [features]
-# `@test(frames: n, gpu: true)` runs on the native host's GPU (§10): `wrela`'s and the test
+# `@test(frames: n, gpu: true)` runs on the native host's GPU (§13): `wrela`'s and the test
 # suite's builds have it; the compiler alone doesn't need wgpu.
 gpu = ["wrela-host/gpu"]
 

@@ -1,6 +1,6 @@
 // accepts: const.tests
 // A frame test runs the program's `init` and frames, then the test with the program's state,
-// borrowed (§10).
+// borrowed (§13).
 pub struct Game {
     ticks: u32,
 }

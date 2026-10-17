@@ -1,5 +1,5 @@
 // Sound output: a program has one voice, which the audio thread renders a quantum at a time,
-// and rings that carry events to it (language.md §6.13). The voice's state moves to
+// and rings that carry events to it (language.md §16.4). The voice's state moves to
 // the audio thread when it starts, so only that thread changes it; a ring is the one value both
 // threads use, and each end belongs to one of them.
 //
@@ -33,7 +33,7 @@ pub(package) struct Voice<S, R> {
 /// `QUANTUM` samples at `SAMPLE_RATE`, to fill. `state` moves to the audio thread for good, and
 /// `render` with it, so it's a function, or a closure that captures nothing; send the voice
 /// events through a `ring`, whose reader it holds. A program has one voice: a second `play`
-/// traps. A client's only (§12).
+/// traps. A client's only (§15).
 @client
 pub fn play<S, R: @audio fn(mut S, mut [f32], mut [f32])>(state: take S, render: R) {
     unsafe {

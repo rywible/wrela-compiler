@@ -1,4 +1,4 @@
-// Bound entry points as values (language.md §12): the left half of the screen is drawn by
+// Bound entry points as values (language.md §18): the left half of the screen is drawn by
 // entry points named and bound where they're recorded, the right by the same entry points
 // bound first, as values, and recorded by functions generic over them. renderer.rs checks
 // the halves match, to the bit.

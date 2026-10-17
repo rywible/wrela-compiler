@@ -48,7 +48,7 @@
 //! | 28 | `HandOver` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: after this call, the build at the path takes this program's place, with what it kept (`std::reload`). The request is answered only if the hand-over fails, and then this program goes on |
 //! | 29 | `HostRequest` | `request`, `service length`, `body length`, then UTF-8 service and opaque bytes, each padded to 4 bytes: a host capability request |
 //!
-//! **Requests** (language.md §6.15) are answered on a later call: the program polls each with
+//! **Requests** (language.md §17.1) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
 //! else the answer's length in bytes) and `wrela.request_take(request, ptr)` (copies the answer
 //! to `ptr` and forgets the request). The program chooses request numbers, each live once.
@@ -61,7 +61,7 @@
 //!
 //! - **Handles** are chosen by the program: small integers, each naming one live resource (a
 //!   buffer, a texture or a sampler) at a time. A resource lives until the program destroys it
-//!   (a compiled wrela program does when the value that owns it is dropped: language.md §6.13);
+//!   (a compiled wrela program does when the value that owns it is dropped: language.md §18.3);
 //!   work recorded before that still uses it.
 //! - **Pipelines** index [`crate::Manifest::pipelines`]. A dispatch names a compute pipeline and
 //!   a draw a render pipeline.

@@ -1,5 +1,5 @@
 //! AC10: every example compiles. Each ```wrela block of docs/language.md, and each one in a doc
-//! comment of std, is checked; std's are also run, and §19's tier-0 program is built.
+//! comment of std, is checked; std's are also run, and §22's tier-0 program is built.
 //!
 //! Most of the spec's blocks are fragments: they name a `world` or a `grazer` they don't
 //! declare. A block gets the context it names, as rustdoc's hidden lines give one: the items
@@ -323,8 +323,8 @@ impl Scene {
     Context { first: "use std::derive::{Interval, interval}", ..NONE },
     Context { first: "use std::field::{Surface, sphere}", ..NONE },
     Context { first: "use std::field::{Noise, Surface}", ..NONE },
-    Context { first: "use std::field::{Surface, round_cone, sphere}", ..NONE },
-    // §6.17's examples are whole programs.
+    Context { first: "use std::field::{Surface, cuboid, round_cone}", ..NONE },
+    // §16.2's examples are whole programs.
     Context { first: "use std::tick::{Ticked, start}", ..NONE },
     Context { first: "use std::handoff::{Latest, Publisher, handoff}", ..NONE },
     Context { first: "use std::par::spawn", ..NONE },
@@ -646,10 +646,10 @@ fn every_example_in_std_docs_compiles_and_runs() {
 #[test]
 fn the_tier_0_program_in_language_md_builds() {
     let doc = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
-    let section = &doc[doc.find("## 19. A complete program").expect("§19")..];
+    let section = &doc[doc.find("## 22. A complete program").expect("§22")..];
     let code = &section[section.find("```wrela\n").expect("a wrela block") + 9..];
     let code = &code[..code.find("```").expect("the block ends")];
     if let Err(e) = build(&package("language-md", code)) {
-        panic!("§19's program doesn't build:\n{e}");
+        panic!("§22's program doesn't build:\n{e}");
     }
 }

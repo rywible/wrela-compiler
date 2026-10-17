@@ -1,5 +1,5 @@
 // Work over several frames: a `@job fn` runs its body one part a frame, up to each `yield`
-// (language.md §6.18). `f.start(...)` takes its owned parameters and makes a `Job<f>`;
+// (language.md §16.3). `f.start(...)` takes its owned parameters and makes a `Job<f>`;
 // `job.resume(...)` takes its `borrow` and `mut` parameters, runs it to its next `yield` or its
 // end, and says which (`Step`).
 
@@ -10,7 +10,7 @@ use std::serialize::Serialize
 /// the locals it needs after that point. An owned value with no projections in it, so a field
 /// of the program's state can hold it. Its parts are where it stopped and each local it holds:
 /// it's `Clone`, `StateHash` and `Serialize` when they are, derived from them as a struct's are
-/// from its fields (§6.18's job values), so a simulation's state can hold one.
+/// from its fields (§16.3's job values), so a simulation's state can hold one.
 pub struct Job<F>: StateHash + Serialize {}
 
 /// What a job's `resume` did: it stopped at a `yield` (its work for this frame), or it ran to

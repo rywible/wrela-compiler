@@ -759,7 +759,7 @@ pub enum ExprKind {
     Return(Option<Box<Expr>>),
     Break,
     Continue,
-    /// `yield`: a job's work stops here for this frame (language.md §6.18).
+    /// `yield`: a job's work stops here for this frame (language.md §16.3).
     Yield,
     /// `x?`: the value of an `Ok` or `Some`, or a return of the error or `None`.
     Try(Box<Expr>),
@@ -769,7 +769,7 @@ pub enum ExprKind {
         op: AssignOp,
         value: Box<Expr>,
     },
-    /// `unsafe { ... }` (the stdlib's core, §6.14).
+    /// `unsafe { ... }` (the stdlib's core, §6.12).
     Unsafe(Block),
     /// `f"Weight: {w:.1} kg"`: text and holes, in order.
     FString(Vec<FPart>),

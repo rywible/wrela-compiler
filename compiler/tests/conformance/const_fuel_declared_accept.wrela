@@ -1,6 +1,6 @@
 // accepts: const.fuel
 // A constant may set its own fuel, above the build's 2^34 units or below: a literal, a power or
-// a product of them (§10). So may a test of code, above a test's 2^37.
+// a product of them (§13). So may a test of code, above a test's 2^37.
 @fuel(2 ** 40)
 const TABLE: Vec<u32> = squares(4096)
 

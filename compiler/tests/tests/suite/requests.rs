@@ -1,4 +1,4 @@
-//! Requests (language.md §6.15, AC6): compiler/tests/requests makes a readback, a store and a
+//! Requests (language.md §17.1, AC6): compiler/tests/requests makes a readback, a store and a
 //! load of its storage, and two fetches (one of a missing file), and polls them on later frames.
 //! The native host answers each as the program expects, and headless Chrome gives the same
 //! answers: its state hash, which covers a buffer write of every answer, is the native host's.

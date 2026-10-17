@@ -64,7 +64,7 @@ pub struct Roots {
     /// Functions lowered for the CPU though nothing exports them: for tests, so code that
     /// nothing calls still goes through lowering and the back ends.
     pub also: Vec<FnId>,
-    /// Frame tests (§10), each exported as `test.<index>`, with the program's state when it
+    /// Frame tests (§13), each exported as `test.<index>`, with the program's state when it
     /// takes it: a name no wrela function has.
     pub tests: Vec<FnId>,
 }
@@ -83,7 +83,7 @@ impl Roots {
             }
             let generic = !p.fn_all_generics(id).is_empty();
             // A generic one too: it's reported (the host can't choose its types). Not a job,
-            // which the program starts and resumes (§6.18).
+            // which the program starts and resumes (§16.3).
             if Some(f.module) == p.main
                 && f.public
                 && f.owner == wrela_sema::defs::FnOwner::Free
@@ -250,7 +250,7 @@ pub(crate) struct Cx<'a> {
     /// The values of the constants the build has computed, and the files `embed` reads.
     pub data: &'a BuildData,
     /// Whether a failure is explained: a failed `assert` shows its operands' values. In a
-    /// debug build, and in the modules that compute constants and run tests (§10).
+    /// debug build, and in the modules that compute constants and run tests (§13).
     pub explain: bool,
     /// Computed constants whose values were needed but aren't in `values` yet.
     pub missing: std::collections::BTreeSet<wrela_sema::ty::ConstId>,
@@ -267,7 +267,7 @@ pub(crate) struct Cx<'a> {
     /// What each render pipeline of `pipelines` is drawn into, first drawn first (the
     /// manifest's `targets`): from the draws left in the optimized CPU code, once it's emitted.
     pub pipeline_targets: Vec<Vec<ir::RenderTarget>>,
-    /// A lifted build's literals (§20): only the program's own modules read them, never the
+    /// A lifted build's literals (§23): only the program's own modules read them, never the
     /// modules that compute constants or run tests.
     pub lift: Option<&'a LiftTable>,
 }
@@ -305,7 +305,7 @@ pub(crate) struct ModuleBuilder {
     pub texts: HashMap<String, ir::DataId>,
     /// A lifted build's table of literals, and what keeps its GPU copy (CPU only).
     pub lift: Option<lift::CpuTable>,
-    /// Each job's value, as laid out (§6.18), by the job and its generics.
+    /// Each job's value, as laid out (§16.3), by the job and its generics.
     pub jobs: HashMap<(FnId, Vec<TyId>), job::JobLayout>,
 }
 
@@ -381,7 +381,7 @@ fn lower_in(
     let server = data.role == wrela_sema::defs::Role::Server;
     let mut has_entry = false;
     for &f in &roots.also {
-        // A job's body is lowered as its `resume` (§6.18).
+        // A job's body is lowered as its `resume` (§16.3).
         let key = if checked.program.func(f).attrs.job.is_some() {
             InstanceKey::JobResume { func: f, substs: Vec::new() }
         } else {
@@ -389,7 +389,7 @@ fn lower_in(
         };
         cx.instance(&mut cpu, key, None);
     }
-    // The program's state (§12): what `init` returns (a server's `serve_init`), which the
+    // The program's state (§15): what `init` returns (a server's `serve_init`), which the
     // other exports take first.
     let state = state_type(checked, data.role);
     if let Some((init, s)) = state {
@@ -405,7 +405,7 @@ fn lower_in(
             continue;
         }
         // A server build exports `serve_init` and `serve` alone; a client build every other
-        // export (§12).
+        // export (§15).
         let name = &checked.program.func(f).name;
         if server != (name == wrela_abi::EXPORT_SERVE_INIT || name == wrela_abi::EXPORT_SERVE) {
             continue;
@@ -727,7 +727,7 @@ impl<'a> Cx<'a> {
             if !ok {
                 self.err(
                     Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`init`'s signature is `init() -> State`: it makes the program's state, which the host keeps")
-                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§12)"),
+                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§15)"),
                 );
             }
             return ok;
@@ -754,7 +754,7 @@ impl<'a> Cx<'a> {
             };
             self.err(
                 Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
-                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§12)"),
+                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§15)"),
             );
             return false;
         }
@@ -826,7 +826,7 @@ impl<'a> Cx<'a> {
         ok
     }
 
-    /// A server build's export (§12): `serve_init() -> State`, then `serve(state: mut State,
+    /// A server build's export (§15): `serve_init() -> State`, then `serve(state: mut State,
     /// time: f32)` (`serve(time: f32)` without state). E0703 otherwise.
     fn check_server_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
         use wrela_sema::defs::{Mode, RetMode};
@@ -841,7 +841,7 @@ impl<'a> Cx<'a> {
             if !ok {
                 self.err(
                     Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`serve_init`'s signature is `serve_init() -> State`: it makes the server's state, which the host keeps")
-                        .with_note("the server host calls `serve_init` once, then passes its result to `serve` (§12)"),
+                        .with_note("the server host calls `serve_init` once, then passes its result to `serve` (§15)"),
                 );
             }
             return ok;
@@ -866,7 +866,7 @@ impl<'a> Cx<'a> {
             };
             self.err(
                 Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
-                    .with_note("a server program exports `serve`, and `serve_init` for its state; it reads what happened as events (§12)"),
+                    .with_note("a server program exports `serve`, and `serve_init` for its state; it reads what happened as events (§15)"),
             );
         }
         ok
@@ -926,7 +926,7 @@ impl<'a> Cx<'a> {
 /// E0600 for what a `@deterministic` function reaches through a call whose target only its
 /// instantiation knows (a trait method of a generic parameter): sema checked every call it could
 /// resolve, and this checks, instance by instance, each body the function's instances reach for
-/// `io`, `nondet` or `host` (§14). Reported once for each place the effect happens.
+/// `io`, `nondet` or `host` (§12). Reported once for each place the effect happens.
 fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
     use wrela_sema::effects::{BodyId, DETERMINISTIC};
     let p = &cx.checked.program;
@@ -1020,7 +1020,7 @@ fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
                     if chain.len() > 1 {
                         d = d.with_note(format!("the call chain: {}", chain.join(" → ")));
                     }
-                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§14)");
+                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§12)");
                     diags.push(d);
                 }
             }
@@ -1044,7 +1044,7 @@ const MAX_INSTANCE_DEPTH: u32 = 256;
 
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
-/// The program's `init` (§12): `pub fn init() -> S` in main.wrela, and its state type `S`; for
+/// The program's `init` (§15): `pub fn init() -> S` in main.wrela, and its state type `S`; for
 /// a server build, its `serve_init`.
 fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
     let p = &checked.program;

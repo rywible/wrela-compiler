@@ -351,7 +351,7 @@ pub enum HostOp {
     Present,
 }
 
-/// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.14). Addresses are
+/// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.12). Addresses are
 /// `u32`s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MemOp {
@@ -665,7 +665,7 @@ pub enum ResourceKind {
 }
 
 /// The scalar GPU code reads and writes a colour texture of format `f` in (`std::gpu`'s format
-/// types, language.md §12): four of it, the channels the format lacks ignored when written and
+/// types, language.md §18): four of it, the channels the format lacks ignored when written and
 /// 0 (alpha 1) when read.
 pub fn texel_scalar(f: TextureFormat) -> Scalar {
     if f.is_uint() { Scalar::U32 } else { Scalar::F32 }
@@ -780,11 +780,11 @@ pub struct Module {
     /// CPU only: the message a command too large for the host's command buffer panics with
     /// (std splits its own large commands; this is the backstop), as `nan_message` is held.
     pub command_message: Option<(DataId, u32)>,
-    /// CPU only: the program's state, which lasts across calls (language.md §12): data the
+    /// CPU only: the program's state, which lasts across calls (language.md §15): data the
     /// program changes, unlike the rest, which is constant.
     pub state: Option<DataId>,
     /// CPU only: other data the program changes: a lifted build's table of literals, and what
-    /// keeps its GPU copy (language.md §20).
+    /// keeps its GPU copy (language.md §23).
     pub writable: Vec<DataId>,
     /// CPU only: functions called by index ([`MemOp::RunTask`]): a parallel job's chunks, a
     /// voice's quanta, a ticker's ticks. Each takes a context address and a chunk index.

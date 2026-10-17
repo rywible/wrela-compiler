@@ -1,4 +1,4 @@
-// Dispatch over a domain (language.md §12): kernels with no bounds check of their own write
+// Dispatch over a domain (language.md §18): kernels with no bounds check of their own write
 // exactly what they cover, the compiler sizing their groups and returning the invocations past
 // it. The screen shows a band a dispatch, green where it holds what it should and red where it
 // doesn't: renderer.rs checks them.

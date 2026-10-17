@@ -1,4 +1,4 @@
-// Channels (AC5, language.md §17, D-002, D-026; compiler/tests/tests/suite/channels.rs): a
+// Channels (AC5, language.md §20, D-002, D-026; compiler/tests/tests/suite/channels.rs): a
 // field's points carry a `Tissue`, whose `Blend` is derived field by field. Where two parts
 // blend, the colour and the roughness mix, the normal bias turns along the sphere, and the
 // material is taken whole from the part that weighs more.

@@ -1,6 +1,6 @@
 // accepts: const.tests
 // A `@test` runs when `wrela test` asks, as the build runs constants: it reads constants and
-// calls the program's functions, and nothing of it is in a build (§10).
+// calls the program's functions, and nothing of it is in a build (§13).
 const SIDE: f32 = 3.0
 
 fn area(w: f32, h: f32) -> f32 {

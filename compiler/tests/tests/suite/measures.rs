@@ -1,4 +1,4 @@
-//! Measures and specs (language.md §20): std::field's measures find a surface where it is, to
+//! Measures and specs (language.md §23): std::field's measures find a surface where it is, to
 //! the precision of their Newton step, and std::lift's `Report` and `Loss` say how a spec's
 //! checks stand. Run as `@test` functions of a package (`wrela test`).
 

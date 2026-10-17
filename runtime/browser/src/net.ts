@@ -1,4 +1,4 @@
-// The network (language.md §12): the events a program reads, with messages' bytes, and its
+// The network (language.md §19): the events a program reads, with messages' bytes, and its
 // connections to its server's rooms over WebTransport. A connection is one session at
 // `/room/<name>?pair=<id>` of the server that `net.json` beside the build names, with one
 // bidirectional stream; each message on it is a frame: its length (a varint, at most MAX_FRAME),

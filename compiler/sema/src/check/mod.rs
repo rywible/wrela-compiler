@@ -313,7 +313,7 @@ impl<'p> Checker<'p> {
         let is_struct = |t| matches!(self.kind(t), TyKind::Adt(x, _) if !self.p.adt(*x).is_enum());
         if is_struct(a) && is_struct(b) {
             return d
-                .with_note("an `if` gives one type; each struct is its own type (a field's structure is its type, §17)")
+                .with_note("an `if` gives one type; each struct is its own type (a field's structure is its type, §20)")
                 .with_help("to choose between them at run time, make an enum with a variant for each, and `match` on it where it's used");
         }
         if !(callable(a) && callable(b)) || (fn_ptr(a) && fn_ptr(b)) {
@@ -1068,7 +1068,7 @@ impl<'p> Checker<'p> {
             if matches!(e.kind, ExprKind::Field(..)) && self.is_global_id(b.ty) {
                 self.err(
                     Diagnostic::new(codes::E0601, e.span, format!("a `{}` can't be changed", self.display(b.ty)))
-                        .with_note("a `Slots` is indexed by the invocation's own `GlobalId`, and workgroup memory's chunks by its `LocalId`, so each invocation writes only its own (§6.13)")
+                        .with_note("a `Slots` is indexed by the invocation's own `GlobalId`, and workgroup memory's chunks by its `LocalId`, so each invocation writes only its own (§18.4)")
                         .with_help("compute an index of your own from its fields: `let i = id.x + 1`"),
                 );
                 break;
@@ -1133,7 +1133,7 @@ impl<'p> Checker<'p> {
                     bad.span,
                     format!("a {owner}'s default of a generic type must be a literal value"),
                 )
-                .with_note("a constant expression has one type, which a generic type isn't (§10)"),
+                .with_note("a constant expression has one type, which a generic type isn't (§13)"),
             );
         }
     }
@@ -1590,7 +1590,7 @@ fn report_const_cycle(p: &Program, cycle: &[usize], diags: &mut Vec<Diagnostic>)
 }
 
 /// Checks a `const` item's value: any expression, checked as the body of the function that
-/// computes it (§10), which a `return` in it returns from.
+/// computes it (§13), which a `return` in it returns from.
 fn check_const(p: &Program, consts: &ConstTypes, id: ConstId) -> (TyId, Body, Vec<Diagnostic>) {
     let def = p.const_(id);
     let scope = Scope::new(def.module);

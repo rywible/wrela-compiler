@@ -39,7 +39,7 @@ fn smooth_creature(breath: f32) -> Surface {
     body.smooth_union(neck, k: 0.12).smooth_union(head, k: 0.08)
 }
 
-/// A box, exact (language.md §17's example).
+/// A box, exact (language.md §20's example).
 struct Cuboid: Copy + GpuData {
     half: vec3,
 }

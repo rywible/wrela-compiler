@@ -1,5 +1,5 @@
 // The semantic tree: what the program's drawing means, so a host can give it the platform's own
-// behaviour (language.md §6.15). The tree is made of nodes, each a kind of thing (a heading, a
+// behaviour (language.md §17.2). The tree is made of nodes, each a kind of thing (a heading, a
 // link, a field, a dialog), its state and its place on the screen. A browser host makes each
 // node the element that carries that behaviour, over the canvas: screen readers, the keyboard,
 // password managers, autofill and a link's menu work as on any page. What a person does to a

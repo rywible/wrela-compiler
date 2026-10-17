@@ -47,7 +47,7 @@ Error codes come from the lexical range E0001–E0099.
   This is the final list: each word has a use. Type names (`f32`, `u32`, `vec3`, `bool`, …) and
   attribute names (`compute` in `@compute`) are ordinary identifiers. `package` is only in
   `pub(package)` (language.md §3). wrela has no `dyn`
-  (language.md §18): the word stays reserved so the compiler can say what to use instead. `where`
+  (language.md §21): the word stays reserved so the compiler can say what to use instead. `where`
   isn't a keyword: bounds go on the parameters.
 
 ## Number literals
@@ -103,7 +103,7 @@ Error codes come from the lexical range E0001–E0099.
   (  )  [  ]  {  }  ,  ;  :  .  @  =  +  -  *  /  %  ^  &  |  !  <  >  ?  _
   ```
 
-  `**` is exponentiation and `^` is XOR. `?` propagates an error (language.md §15).
+  `**` is exponentiation and `^` is XOR. `?` propagates an error (language.md §10).
   `#`, `$`, `~` and `` ` `` are E0001.
 - **L16.** Where the grammar expects a `>` that closes a generic argument list (`GT_CLOSE` in
   the grammar), a `>>`, `>=` or `>>=` token is split: its first `>` closes the list, and the rest

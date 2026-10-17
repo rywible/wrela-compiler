@@ -1,5 +1,5 @@
 // Gradients and interval bounds of functions, which the compiler derives from each function's
-// body (language.md §13), and the ranges and boxes they work over. Any function that qualifies
+// body (language.md §14), and the ranges and boxes they work over. Any function that qualifies
 // has them; nothing here is specific to fields.
 
 /// A closed range `[lo, hi]` of `f32` values.

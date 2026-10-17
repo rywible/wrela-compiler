@@ -1,6 +1,6 @@
 // Fields, functions over space: signed-distance surfaces, the combinators that join, cut, move
 // and displace them, noise, channels such as colour, and measures and certified checks of a
-// surface (language.md §17). A field's structure is its type and its numbers are data:
+// surface (language.md §20). A field's structure is its type and its numbers are data:
 // `sphere(1.0).smooth_union(round_cone(...), k: 0.1)` has the type
 // `SmoothUnion<Sphere, RoundCone>`, whose value is a few floats that reach the GPU as a uniform.
 //
@@ -10,7 +10,7 @@
 // closure of a point states none. A `Noise` states its range, its gradient's bound and its
 // bandlimit.
 //
-// A surface's parts are the leaves of its tree of combinators (language.md §20): each knows
+// A surface's parts are the leaves of its tree of combinators (language.md §23): each knows
 // which part decides its distance at a point (`part_at`), each part's own distance, and its
 // name, so a tool can say what a point belongs to without knowing what made the surface.
 
@@ -37,7 +37,7 @@ pub trait Surface: Copy + GpuData {
     /// The signed distance from `p` to the surface.
     fn distance(self, p: vec3) -> f32
 
-    /// The gradient of `distance`, derived by the compiler (§13): the surface normal, not
+    /// The gradient of `distance`, derived by the compiler (§14): the surface normal, not
     /// normalized.
     fn gradient(self, p: vec3) -> vec3 {
         gradient(|q| self.distance(q), p)
@@ -68,7 +68,7 @@ pub trait Surface: Copy + GpuData {
         interval(|q| self.distance(q), over)
     }
 
-    /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§17), so
+    /// A bound on the length of `distance`'s gradient wherever |distance| < `near` (§20), so
     /// sphere tracing can step by it: primitives state theirs, combinators compose their parts'
     /// in ordinary code and pass the scope on. A consumer passes the scope it needs: a step of at
     /// most `near` (`to_bound`), or an interval test over a block that straddles the surface, at
@@ -177,12 +177,12 @@ pub trait Surface: Copy + GpuData {
         Mirror { inner: self }
     }
 
-    /// The same surface, one part with a name: tools say where a point is by it (§20).
+    /// The same surface, one part with a name: tools say where a point is by it (§23).
     fn named(self, name: Text) -> Named<Self> {
         Named { inner: self, name }
     }
 
-    // ---- provenance (§20) ----
+    // ---- provenance (§23) ----
 
     /// How many parts it has: the leaves of its tree of combinators. A primitive, a closure
     /// and a `named` surface are one part each.
@@ -275,7 +275,7 @@ pub fn part_share<S: Surface>(field: S, p: vec3, i: u32) -> f32 {
     (field.part_offset(p, i, by: 0.0001) - field.distance(p)) / 0.0001
 }
 
-// ---- measures (§20) ----------------------------------------------------------------------
+// ---- measures (§23) ----------------------------------------------------------------------
 //
 // Where a surface is, as numbers a spec can hold it to (std::lift's `Checks`). Each searches
 // with values, then takes one Newton step along its ray, so its derivative by anything the
@@ -463,10 +463,10 @@ pub fn part_image<S: Surface>(field: S, i: u32) -> u32 {
     i
 }
 
-// ---- certified checks (§20) ------------------------------------------------------------
+// ---- certified checks (§23) ------------------------------------------------------------
 
 /// What a certified check of a region found: the property holds at every point of it (proved by
-/// derived intervals, §13), it fails at a point (a counterexample), or the intervals couldn't
+/// derived intervals, §14), it fails at a point (a counterexample), or the intervals couldn't
 /// tell within the depth asked, first in the box given.
 pub enum Certified: Copy {
     Holds,
@@ -543,7 +543,7 @@ pub fn certify_apart<S: Surface>(field: S, a: u32, b: u32, region: Box3, depth: 
     )
 }
 
-/// A part's name, for tools (§20): the name its author gave it, the name of the group it's in,
+/// A part's name, for tools (§23): the name its author gave it, the name of the group it's in,
 /// the name of the space it's placed in (an engine's creature places parts on bones), and
 /// whether it's the mirror image of the part as written. Each name is empty where nothing gives
 /// one.
@@ -587,7 +587,7 @@ pub trait Noise: Copy + GpuData {
 
 /// A closure or function of a point is a surface too, its value the distance: `|p| length(p)
 /// - r`, written where it's used (§6.7). Its gradient and interval are derived as any
-/// surface's are; it has no Lipschitz bound of its own (§13).
+/// surface's are; it has no Lipschitz bound of its own (§14).
 impl<F: Copy + GpuData + fn(vec3) -> f32> Surface for F {
     fn distance(self, p: vec3) -> f32 {
         self(p)
@@ -892,7 +892,7 @@ pub fn smin(a: f32, b: f32, k: f32) -> f32 {
     }
 }
 
-// Provenance (§20) through a combinator of two surfaces, whose parts are `a`'s then `b`'s, and
+// Provenance (§23) through a combinator of two surfaces, whose parts are `a`'s then `b`'s, and
 // through one of an array of surfaces: what the combinators share. Each has its own `part_at`.
 
 /// The distances of `a` and `b` at `p`, part `i` of the two raised by `by` (`part_offset`).
@@ -1050,7 +1050,7 @@ impl<A: Surface, B: Surface> Surface for SmoothUnion<A, B> {
     }
 }
 
-/// The parts of a fixed array of surfaces of one type, joined (§17): `legs.union()`,
+/// The parts of a fixed array of surfaces of one type, joined (§20): `legs.union()`,
 /// `legs.smooth_union(k: 6cm)`. Each folds the parts in order, so `[a, b, c].union()` is
 /// `a.union(b).union(c)`.
 impl<S: Surface, const N: u32> [S; N] {
@@ -1924,7 +1924,7 @@ impl<C, S: Field<C>> Field<C> for ToBound<S> {
     }
 }
 
-/// A debug build's check of a stated bound (§13): over the boxes in [-16, 16]³ where the
+/// A debug build's check of a stated bound (§14): over the boxes in [-16, 16]³ where the
 /// distance can be within ±`near`, refined to boxes about `near` wide, the derived gradient's
 /// interval must allow a gradient no longer than `l`. A box whose every gradient is longer
 /// panics: `l` understates the gradient there. (A box can only prove a bound wrong, not right,

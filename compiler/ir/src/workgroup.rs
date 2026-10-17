@@ -1,4 +1,4 @@
-//! Workgroup memory's phases (language.md §6.13). Between barriers, each invocation writes only
+//! Workgroup memory's phases (language.md §18.5). Between barriers, each invocation writes only
 //! its own chunk and may read any element, so reading what another invocation may still be
 //! writing, or writing what another may still be reading, needs a barrier in between. This finds
 //! each read or write of workgroup memory reached, on some path through the kernel (its calls

@@ -35,7 +35,7 @@
       "labels": [],
       "message": "a `GlobalId` can't be built",
       "notes": [
-        "each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§6.13)"
+        "each invocation gets its own from the GPU, and `Slots` and workgroup memory's chunks are indexed by it, so each invocation writes only its own (§18.4)"
       ],
       "severity": "error",
       "span": {

@@ -1,4 +1,4 @@
-//! `wrela pipelines <package-dir> [--json]`: the pipeline-count query (language.md §7). Each
+//! `wrela pipelines <package-dir> [--json]`: the pipeline-count query (language.md §18.9). Each
 //! GPU entry point, how many pipelines instantiate it, the type arguments of each, and where
 //! CPU code dispatches or draws it: what to look at when a program makes more shaders than it
 //! means to (D-044, D-070).

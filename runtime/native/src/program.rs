@@ -194,7 +194,7 @@ pub(crate) enum Handing {
 const CALLED_WHILE_STARTING: &str =
     "its start function called the host; a wrela program calls the host only from an export";
 
-/// Where a program's requests read and write (language.md §6.15): its build, for `Fetch`, its
+/// Where a program's requests read and write (language.md §17.1): its build, for `Fetch`, its
 /// storage directory, for `StorageRead` and `StorageWrite`, and what answers its `Post`s.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Io {
@@ -949,7 +949,7 @@ impl<E: Executor> Program<E> {
 
         let Retired { executor, kept, ticks, ran, mut input, records, trace, batches, tick_from } =
             carried;
-        // A reload to another program's build drops the network's events (language.md §12).
+        // A reload to another program's build drops the network's events (language.md §17.2).
         input.for_build(compiled.pair);
         let trace = trace.unwrap_or(prepared_trace);
         let state = State {
@@ -1169,7 +1169,7 @@ impl<E: Executor> Program<E> {
         self.init_done
     }
 
-    /// A program with state makes it once, before anything else runs (language.md §12).
+    /// A program with state makes it once, before anything else runs (language.md §15).
     fn init(&mut self) -> Result<()> {
         let Ok(init) = self.instance.get_typed_func::<(), ()>(&mut self.store, EXPORT_INIT) else {
             self.init_done = true;
@@ -1667,7 +1667,7 @@ fn other_instance(
     Ok((store, instance))
 }
 
-/// Helper threads for code the build runs (constants, language.md §10): each an instance of a
+/// Helper threads for code the build runs (constants, language.md §13): each an instance of a
 /// module built with shared memory, on a thread of its own, running `__worker` until
 /// [`BuildHelpers::finish`]. Each has `fuel` (as the call it helps does), and what each used is
 /// counted, so the build bounds a constant's work across its threads.

@@ -1502,12 +1502,12 @@ impl<'a> Parser<'a> {
         let start = self.span();
         let trait_type_here = std::mem::take(&mut self.trait_type_here);
         if self.at(T::Dyn) {
-            // wrela has no `dyn` (language.md §18): say what to use. Where a trait names a type,
+            // wrela has no `dyn` (language.md §21): say what to use. Where a trait names a type,
             // read the trait as the type, which removing `dyn` makes valid; elsewhere the type
             // is an error, so nothing else is reported about it.
             let d = self.bump();
             let mut e = Diagnostic::new(codes::E0113, d.span, "wrela has no `dyn`")
-                .with_note("`dyn` is reserved so this error can say what to use instead (§18)");
+                .with_note("`dyn` is reserved so this error can say what to use instead (§21)");
             if trait_type_here {
                 e = e
                     .with_help("for any type with the trait, take it as a parameter of the trait's type, `x: Trait`, which makes the function generic; for one of a closed set of types, use an enum")

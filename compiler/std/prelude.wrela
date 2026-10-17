@@ -18,7 +18,7 @@ pub enum Option<T>: Copy + Eq + Ord + StateHash + Serialize + Pack + Plain {
     Some(T),
 }
 
-/// The outcome of something that can fail: its value, or an error (§15). `x?` is `x`'s value,
+/// The outcome of something that can fail: its value, or an error (§10). `x?` is `x`'s value,
 /// or returns its `Err` from the function.
 pub enum Result<T, E>: Copy + Eq + Ord + StateHash + Serialize + Pack {
     Ok(T),

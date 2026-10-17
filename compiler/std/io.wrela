@@ -1,5 +1,5 @@
 // Requests to the host: the program's storage ("bytes at a path"), fetching the build's files,
-// and posting to the host that serves the program (language.md §6.15). The module also has
+// and posting to the host that serves the program (language.md §17.1). The module also has
 // `print`, which shows a line on the host's console, and `Shipped`, files a build ships beside
 // the program.
 //

@@ -1,4 +1,4 @@
-// `yield` outside a job. `yield` ends a `@job fn`'s work for this frame (§6.18), in the job's
+// `yield` outside a job. `yield` ends a `@job fn`'s work for this frame (§16.3), in the job's
 // own body: not in an ordinary function, nor in a closure the job makes (a closure is called
 // where it's made, and can't stop the job).
 // ---- wrong

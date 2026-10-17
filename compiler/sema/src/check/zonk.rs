@@ -891,7 +891,7 @@ fn stored_callables_block(p: &Program, own: &Own, b: &Block, out: &mut Vec<Diagn
     }
 }
 
-/// Finishes a constant's value, checked as the body of the function that computes it (§10).
+/// Finishes a constant's value, checked as the body of the function that computes it (§13).
 /// The value must be one that lives as long as the program (E0332).
 pub(super) fn finish_const(c: Checker, e: Expr, ret: TyId) -> (TyId, Body, Vec<Diagnostic>) {
     let p = c.p;
@@ -910,7 +910,7 @@ pub(super) fn finish_const(c: Checker, e: Expr, ret: TyId) -> (TyId, Body, Vec<D
                 body.value.span,
                 format!("a constant can't hold {what}: its type is `{}`", p.display_ty(ty)),
             )
-            .with_note("a constant is an owned value that lives as long as the program; the build computes it and lays it out as read-only data (§10)"),
+            .with_note("a constant is an owned value that lives as long as the program; the build computes it and lays it out as read-only data (§13)"),
         );
         return (error, body, diags);
     }

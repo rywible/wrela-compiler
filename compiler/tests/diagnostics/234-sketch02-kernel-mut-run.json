@@ -12,7 +12,7 @@
       "labels": [],
       "message": "every invocation of a `@compute` kernel would hold `mut counts` at once, so it can't be a plain `mut` parameter",
       "notes": [
-        "a kernel's `mut` parameters must be safe to share across invocations (§6.13)"
+        "a kernel's `mut` parameters must be safe to share across invocations (§18.4)"
       ],
       "severity": "error",
       "span": {

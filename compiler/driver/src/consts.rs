@@ -1,4 +1,4 @@
-//! Build-time constants (language.md §10): the build runs the program's own code to compute
+//! Build-time constants (language.md §13): the build runs the program's own code to compute
 //! each constant whose value isn't literal. Lowering makes a module that computes them
 //! (`wrela_lower::lower_consts`); this runs it in wasmtime, with a fuel limit, reads each value
 //! back, and makes a panic, a trap or a computation that runs away a compile error with the
@@ -23,12 +23,12 @@ use wrela_sema::ty::ConstId;
 /// instructions: under a second on a 2024 laptop.
 pub const FUEL: u64 = 1 << 34;
 
-/// How much work one test may do (§10): eight times a constant's, since a test runs only when
+/// How much work one test may do (§13): eight times a constant's, since a test runs only when
 /// `wrela test` asks, and a simulation stepped for some seconds is a test worth writing. About
 /// 137 billion instructions: a few seconds.
 pub const TEST_FUEL: u64 = 1 << 37;
 
-/// Reads the files `embed` names, relative to the package's root at `root` (§10): a file that
+/// Reads the files `embed` names, relative to the package's root at `root` (§13): a file that
 /// can't be read, or whose path leaves the package, is E0218.
 pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, Vec<Diagnostic>) {
     let mut files = Embeds::new();
@@ -58,7 +58,7 @@ pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, V
             }
             Err(why) => diags.push(
                 Diagnostic::new(codes::E0218, span, format!("`embed` can't read `{path}`: {why}"))
-                    .with_note("a path is relative to the package's root: the directory with `main.wrela` (§10)"),
+                    .with_note("a path is relative to the package's root: the directory with `main.wrela` (§13)"),
             ),
         }
     }
@@ -66,7 +66,7 @@ pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, V
 }
 
 /// What computing the constants did: how many the build computed, and how many it read from
-/// the cache (§10).
+/// the cache (§13).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConstStats {
     pub computed: u32,
@@ -240,7 +240,7 @@ fn cycle(checked: &Checked, blocked: &[(ConstId, BTreeSet<ConstId>)]) -> Option<
 }
 
 /// A module of the build's code, running in wasmtime, with the host's functions refusing: what
-/// computes constants and runs tests. A constant's runs on memory its helpers share (§6.12).
+/// computes constants and runs tests. A constant's runs on memory its helpers share (§16.1).
 struct Running {
     store: wasmtime::Store<()>,
     instance: wasmtime::Instance,
@@ -467,7 +467,7 @@ fn run_one(
     }
 }
 
-/// Runs the program package's `@test` functions (§10), after its constants are computed into
+/// Runs the program package's `@test` functions (§13), after its constants are computed into
 /// A test that ran: which, why it failed if it did, and what it printed and timed.
 pub type Ran = (wrela_sema::ty::FnId, Option<Diagnostic>, wrela_host::Traced);
 
@@ -703,15 +703,15 @@ pub(crate) fn failure(
         d = d
             .with_note(match item {
                 Item::Const(c, fuel) if p.const_(c).fuel.is_some() => format!(
-                    "its `@fuel` stops it after about {} WASM instructions, its threads' together (§10)",
+                    "its `@fuel` stops it after about {} WASM instructions, its threads' together (§13)",
                     instructions(fuel)
                 ),
                 Item::Const(..) => format!(
-                    "the build stops a constant after about {} WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)",
+                    "the build stops a constant after about {} WASM instructions, so a computation that doesn't end is an error rather than a hang (§13)",
                     instructions(FUEL)
                 ),
                 Item::Test(_, fuel) => format!(
-                    "`wrela test` stops a test after about {} WASM instructions, so a test that doesn't end fails rather than hangs (§10)",
+                    "`wrela test` stops a test after about {} WASM instructions, so a test that doesn't end fails rather than hangs (§13)",
                     instructions(fuel)
                 ),
             })
@@ -727,13 +727,13 @@ pub(crate) fn failure(
     } else if code == codes::E0706 {
         let framed = matches!(item, Item::Test(f, _) if p.func(f).attrs.test_run.is_some());
         d = d.with_note(if framed {
-            "a frame test runs `init` and the program's frames (or a tick test its ticks), then the test: it passes unless one of them panics, and a failed `assert` panics (§10)"
+            "a frame test runs `init` and the program's frames (or a tick test its ticks), then the test: it passes unless one of them panics, and a failed `assert` panics (§13)"
         } else {
-            "a test passes unless it panics, and a failed `assert` panics (§10)"
+            "a test passes unless it panics, and a failed `assert` panics (§13)"
         });
     } else {
         d = d.with_note(
-            "the build runs the program's own code to compute a constant, so a panic or a failed `assert` in it fails the build (§10)",
+            "the build runs the program's own code to compute a constant, so a panic or a failed `assert` in it fails the build (§13)",
         );
     }
     d

@@ -252,7 +252,7 @@ impl Surface for Grazer {
     /// weight only while each later blend lowers the running value by at most 1.25 k, so where
     /// the grazer is within `near`, part `i` of the fold's twenty is within `near + 1.25 k (21
     /// - i)`. Sound, and loose: the torso, first, gets a scope its ellipsoids can't bound
-    /// (language.md §17's scopes).
+    /// (language.md §20's scopes).
     fn lipschitz(self, near: f32) -> f32 {
         let step = 1.25 * max(self.k, 0.0)
         let scope = |i: u32| near + step * f32(21 - i)

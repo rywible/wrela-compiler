@@ -1,6 +1,6 @@
 // accepts: const.places
 // A constant is a place that lives as long as the program: it's read and projected, a function
-// can return a projection of it, and `.clone()` gives an owned copy (§10).
+// can return a projection of it, and `.clone()` gives an owned copy (§13).
 const NAMES: Vec<Text> = names()
 const VALUES: [f32; 2] = [1.0, 2.0]
 

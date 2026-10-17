@@ -866,7 +866,7 @@ impl<'a> Parser<'a> {
                 None => d.with_help("write an f-string: `f\"{a} and {b}\"`"),
             },
             "println" | "print" | "eprintln" | "eprint" => {
-                let d = d.with_note("a wrela program has no console of its own; `std::io::print` shows a line on the host's (§6.15)");
+                let d = d.with_note("a wrela program has no console of its own; `std::io::print` shows a line on the host's (§17.3)");
                 match fstring() {
                     // The import is added once the module's names are known (`settle_print_fixes`).
                     Some(f) => {

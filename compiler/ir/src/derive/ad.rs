@@ -152,7 +152,7 @@ fn filters(b: Builtin) -> bool {
 
 /// A function of `f`'s captures, `x` and `width` (of `x`'s type) returning `f`'s value at `x`
 /// box-filtered over a footprint `width` wide along each of `x`'s components (`filtered`,
-/// language.md §13): forward-mode differentiation with each direction's seed its width, so
+/// language.md §14): forward-mode differentiation with each direction's seed its width, so
 /// every value's tangents span its range over the footprint (to first order), and each
 /// discontinuous builtin's value replaced by its average over that range.
 pub(super) fn filtered_value(

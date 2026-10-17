@@ -110,7 +110,7 @@ pub enum Callee {
     Value(Box<Expr>),
     /// `.clone()`: structural.
     Clone,
-    /// `f.start(...)`: a `Job<f>` holding the job's owned parameters (§6.18); `args` are the
+    /// `f.start(...)`: a `Job<f>` holding the job's owned parameters (§16.3); `args` are the
     /// job's generics.
     JobStart {
         func: FnId,
@@ -145,7 +145,7 @@ pub enum ExprKind {
     /// A string literal: a `Text` holding this UTF-8, laid out in the build.
     Text(std::sync::Arc<str>),
     /// `embed("path")`: `Bytes` holding the file at this path in the package, which the build
-    /// reads and lays out (§10).
+    /// reads and lays out (§13).
     Embed(std::sync::Arc<str>),
     /// A `const N: u32` generic parameter's value (§4).
     ConstParam(ParamId),
@@ -217,14 +217,14 @@ pub enum ExprKind {
     Return(Option<Box<Expr>>),
     Break,
     Continue,
-    /// `yield`, in a job's body: its work stops here for this frame (§6.18).
+    /// `yield`, in a job's body: its work stops here for this frame (§16.3).
     Yield,
     Dispatch(Box<Dispatch>),
     Draw(Box<Draw>),
     Error,
 }
 
-/// What a command records (§12): an entry point named where it's recorded, or a bound entry
+/// What a command records (§18): an entry point named where it's recorded, or a bound entry
 /// point's value.
 #[derive(Clone, Debug)]
 pub enum Shader {
@@ -254,7 +254,7 @@ pub struct Dispatch {
     pub indirect: bool,
     /// `groups` is the domain (`over:`): a `u32`, a `(u32, u32)` or `(u32, u32, u32)`, or a
     /// texture, whose size it is. The workgroup counts cover it, and invocations past it do
-    /// nothing (§12).
+    /// nothing (§18).
     pub over: bool,
     /// One per kernel parameter that isn't a builtin, as (parameter index, argument), in the
     /// order written; none for a bound kernel's value.
@@ -272,7 +272,7 @@ pub enum DrawCount {
     Indices,
 }
 
-/// A draw's render state, which its pipeline holds: build-time constants (§12).
+/// A draw's render state, which its pipeline holds: build-time constants (§18.7).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RenderState {
     /// `std::gpu::Cull`'s variant.
@@ -287,7 +287,7 @@ pub struct RenderState {
 
 #[derive(Clone, Debug)]
 pub struct Draw {
-    /// The open pass it draws into (§12): its type says the pass's targets.
+    /// The open pass it draws into (§18): its type says the pass's targets.
     pub pass: Box<Expr>,
     pub vertex: Shader,
     pub fragment: Shader,
@@ -302,7 +302,7 @@ pub struct Draw {
     /// `u32` fields.
     pub indices: Option<Box<Expr>>,
     pub state: RenderState,
-    /// Each shader's arguments, bound to it (§12), as (entry point: 0 the vertex shader, 1 the
+    /// Each shader's arguments, bound to it (§18), as (entry point: 0 the vertex shader, 1 the
     /// fragment shader; parameter index; argument), in the order written.
     pub args: Vec<(usize, usize, Expr)>,
     /// The counts in the order written, after the bound arguments; one not written (a

@@ -1,4 +1,4 @@
-//! Constants cached by their inputs, between builds (language.md §10). A computed constant is
+//! Constants cached by their inputs, between builds (language.md §13). A computed constant is
 //! lowered into a module of its own: the code it runs, the values of the constants it reads and
 //! the files it embeds, nothing else. The module's WASM is the constant's key, with the fuel it
 //! may use, so a constant is computed again only when one of those changes: an edit to a
@@ -82,7 +82,7 @@ fn package_root(dir: &Path) -> Option<&Path> {
 
 /// A constant's key: its module's WASM and the fuel it may use, with the identity of the code
 /// that runs it and reads its value back (build.rs: those sources' hash, and wasmtime's version).
-/// How many threads computed it isn't part of it: results don't depend on them (§6.12).
+/// How many threads computed it isn't part of it: results don't depend on them (§16.1).
 pub fn key(wasm: &[u8], fuel: u64) -> String {
     let mut h = Sha256::new();
     h.update(MAGIC);

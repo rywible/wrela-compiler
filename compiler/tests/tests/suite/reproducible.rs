@@ -1,7 +1,7 @@
 //! AC9, and AC15 of #41: builds are reproducible. The same package gives the same bytes, built
 //! twice and built from a copy at another path: no timestamps, absolute paths or iteration-order
 //! effects reach the output. Packages that embed files and compute constants at build time
-//! (§10), and that have dependencies (§3), are among them.
+//! (§13), and that have dependencies (§3), are among them.
 
 use crate::scratch;
 use wrela_tests::{build, copy_dir, repo_root};

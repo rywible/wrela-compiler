@@ -1,5 +1,5 @@
 //! `wrela test <package-dir> [<filter>] [--bless] [--json]`: runs the package's `@test`
-//! functions (language.md §10), or those whose names contain `filter`. `--exact` chooses
+//! functions (language.md §13), or those whose names contain `filter`. `--exact` chooses
 //! exactly one name, rejecting missing or ambiguous names before any tests run. `--std`
 //! chooses std's tests with an empty program package. Each runs as a debug
 //! build's constants are computed, on memory of its own; a test passes unless it panics, and a

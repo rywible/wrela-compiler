@@ -1,5 +1,5 @@
 // GPU buffers, textures and passes, the builtins of GPU entry points, and the CPU calls that
-// record GPU work: dispatches, draws, copies and readbacks (language.md §12, §6.13). Every
+// record GPU work: dispatches, draws, copies and readbacks (language.md §18, §18.3). Every
 // function here that CPU code calls carries the `host` effect.
 
 use std::abi::{
@@ -37,13 +37,13 @@ impl<T: GpuData> GpuBuffer<T> {
     }
 
     /// All its elements, read-only: a `GpuSpan<T>` of them. A bound entry point holds a buffer
-    /// given for a `[T]` parameter as this span (§12).
+    /// given for a `[T]` parameter as this span (§18).
     pub fn items(self) -> GpuSpan<T> {
         GpuSpan { buffer: self, start: 0, count: self.count }
     }
 
     /// All its elements, to change: a `GpuSpanMut<T>` of them. A bound entry point holds a
-    /// buffer given `mut` for a `mut Slots<T>` parameter as this span (§12).
+    /// buffer given `mut` for a `mut Slots<T>` parameter as this span (§18).
     pub fn items_mut(mut self) -> GpuSpanMut<T> {
         let count = self.count
         GpuSpanMut { buffer: mut self, start: 0, count }
@@ -78,7 +78,7 @@ impl<T: GpuData> GpuBuffer<T> {
 }
 
 /// A run of a GPU buffer's elements, read-only: a projection of the buffer, as `[T]` is of an
-/// array (§6.13). Two spans of one buffer bound together count as overlapping, even if their
+/// array (§18.3). Two spans of one buffer bound together count as overlapping, even if their
 /// ranges don't. Bound to a kernel, a span starts at a multiple of 256 bytes (WebGPU's rule),
 /// which the host checks.
 pub borrow struct GpuSpan<T> {
@@ -88,7 +88,7 @@ pub borrow struct GpuSpan<T> {
 }
 
 impl<T: GpuData> GpuSpan<T> {
-    /// How many elements it holds: in GPU code too, where it's read as a `[T]` (§12).
+    /// How many elements it holds: in GPU code too, where it's read as a `[T]` (§18).
     pub fn len(self) -> u32 {
         span_len(self)
     }
@@ -98,7 +98,7 @@ impl<T: GpuData> GpuSpan<T> {
 fn span_len<T>(s: GpuSpan<T>) -> u32 {}
 
 /// One value in a `GpuBuffer<S>`, where it is: an element (`buf.at(i)`) or, through the
-/// element's fields, a field of it (`buf.at(i).draw`, a `GpuField<S, DrawIndexedArgs>`; §12).
+/// element's fields, a field of it (`buf.at(i).draw`, a `GpuField<S, DrawIndexedArgs>`; §18).
 /// CPU code names it without reading it, for a command that reads it there (`indirect:`,
 /// `groups:`). It borrows its buffer, as a span does.
 pub borrow struct GpuField<S, T> {
@@ -134,7 +134,7 @@ fn destroy_buffer(handle: u32) {}
 fn copy_buffer(from: u32, from_offset: u32, to: u32, to_offset: u32, size: u32) {}
 
 /// A kernel parameter where each invocation writes only its own slot, indexed by its
-/// `GlobalId` (§6.13). The CPU passes a `GpuBuffer<T>` for it.
+/// `GlobalId` (§18.4). The CPU passes a `GpuBuffer<T>` for it.
 pub struct Slots<T> {
     handle: u32,
 }
@@ -256,17 +256,17 @@ pub fn write<T: GpuData>(buf: mut GpuBuffer<T>, at: u32, values: [T]) {
 @intrinsic
 fn write_buffer<T: GpuData>(handle: u32, at: u32, values: [T]) {}
 
-/// A kernel bound to its arguments, as a value: `let k = fill.bind(0.5, mut out)` (§12). Each
+/// A kernel bound to its arguments, as a value: `let k = fill.bind(0.5, mut out)` (§18). Each
 /// entry point has a borrow struct of its arguments, which the compiler makes and which has
 /// this trait; a function generic over `K: Kernel` takes any of them and passes it to
 /// `dispatch`, each kernel's instance its own pipeline.
 pub trait Kernel {}
 
-/// A vertex shader bound to its arguments, as a value, whose output is `V` (§12).
+/// A vertex shader bound to its arguments, as a value, whose output is `V` (§18).
 pub trait VertexShader<V> {}
 
 /// A fragment shader bound to its arguments, as a value, whose input from the vertex shader is
-/// `V` (§12). One that takes no input from it has the trait for every `V`.
+/// `V` (§18). One that takes no input from it has the trait for every `V`.
 pub trait FragmentShader<V> {}
 
 /// Records a dispatch of a `@compute` kernel bound to its arguments: `dispatch(kernel.bind(a,
@@ -396,7 +396,7 @@ fn begin_screen_pass_command(clear: vec4) {}
 @client
 pub fn present() {}
 
-/// An open pass: what a `draw` draws into (§12). Each kind of pass has it: `Pass<F>`,
+/// An open pass: what a `draw` draws into (§18). Each kind of pass has it: `Pass<F>`,
 /// `DepthPass<F>`, `DepthOnlyPass`, `ScreenPass` and `ScreenDepthPass`, and only they do (an
 /// `impl` elsewhere is E0415). A function that draws into whatever pass it's given takes one
 /// bounded by it: `fn shade<P: RenderPass>(pass: P, ...)`.
@@ -416,9 +416,9 @@ impl ScreenPass {
 
 impl RenderPass for ScreenPass {}
 
-// ---- textures, samplers and passes (§12) ------------------------------------------------------
+// ---- textures, samplers and passes (§18) ------------------------------------------------------
 
-/// How a colour texture stores its texels (§12): each format is a type, which says what a texel
+/// How a colour texture stores its texels (§18): each format is a type, which says what a texel
 /// is in GPU code (`Texel`). What else textures of it can do is a trait each format has or
 /// hasn't: GPU code filters between texels of a `Filtered` format, kernels write a `Storage`
 /// one, and passes draw into a `Target` one.
@@ -1060,7 +1060,7 @@ fn begin_pass_command(
 fn end_pass_command() {}
 
 /// Names the passes and dispatches after it in the hosts' timings, up to the next label or the
-/// frame's end (language.md §12): `label("terrain")` before `begin_pass_with_depth(...)`. Before
+/// frame's end (language.md §18): `label("terrain")` before `begin_pass_with_depth(...)`. Before
 /// a frame's first label, a pass is `pass` (`screen pass` on the screen), and a dispatch its
 /// kernel's pipeline.
 pub fn label(name: str) {
@@ -1116,7 +1116,7 @@ fn texture_depth<T>(t: T) -> u32 {}
 // ---- readback, indirect work and limits -------------------------------------------------------
 
 /// Reads a span of a buffer back to the CPU, once the GPU work recorded before it is done: a
-/// request, answered on a later call (§6.15). It's `nondet`: when the answer arrives depends on
+/// request, answered on a later call (§17.1). It's `nondet`: when the answer arrives depends on
 /// the GPU.
 pub fn read<T: GpuData + Plain>(span: GpuSpan<T>) -> Pending<T> {
     let n = size_of::<T>()
@@ -1164,7 +1164,7 @@ pub fn limits() -> Limits {
 @intrinsic
 fn limit(index: u32) -> u32 {}
 
-// ---- workgroup memory, atomics, appending and maps (§6.13, §12) -------------------------------
+// ---- workgroup memory, atomics, appending and maps (§18.4, §18.5) -------------------------------
 
 /// Workgroup memory: `N` `T`s that all of a workgroup's invocations share, as a kernel's
 /// `mut` parameter (CPU code doesn't pass it). Between barriers, each invocation writes only
@@ -1298,7 +1298,7 @@ fn one_get<T>(o: One<T>) -> T {}
 fn one_set<T>(o: mut One<T>, value: T) {}
 
 /// A texture of format `F` that a kernel writes, each invocation only its own texel: (`id.x`,
-/// `id.y`) of its `GlobalId` (§6.13). A kernel's `mut Texels<F>` parameter, for which CPU code
+/// `id.y`) of its `GlobalId` (§18.4). A kernel's `mut Texels<F>` parameter, for which CPU code
 /// passes `mut tex` of a `Texture<F>` made by `writable_texture`. A kernel reads what it writes
 /// only through another pass's binding of the texture, never in the same dispatch.
 pub struct Texels<F: Storage> {

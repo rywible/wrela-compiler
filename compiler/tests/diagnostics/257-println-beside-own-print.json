@@ -22,7 +22,7 @@
       "labels": [],
       "message": "`println!` is a macro, and wrela has no macros",
       "notes": [
-        "a wrela program has no console of its own; `std::io::print` shows a line on the host's (§6.15)"
+        "a wrela program has no console of its own; `std::io::print` shows a line on the host's (§17.3)"
       ],
       "severity": "error",
       "span": {

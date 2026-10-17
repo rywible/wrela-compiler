@@ -1,4 +1,4 @@
-//! The heap and raw memory on the CPU (language.md §6.9, §6.14): string literals, `Vec`'s
+//! The heap and raw memory on the CPU (language.md §6.9, §6.12): string literals, `Vec`'s
 //! elements, the runs a `Vec` or a string passes as, moves and drops, clones, panics, and the
 //! intrinsics of std's unsafe core.
 
@@ -94,7 +94,7 @@ impl Fl<'_, '_> {
             self.cx.err(Diagnostic::new(
                 codes::E0326,
                 span,
-                "GPU code can't hold `Bytes`: embedded files live on the CPU (language.md §10)",
+                "GPU code can't hold `Bytes`: embedded files live on the CPU (language.md §13)",
             ));
             return None;
         }
@@ -109,7 +109,7 @@ impl Fl<'_, '_> {
         Some(self.value(t, ir::Expr::Construct(t, vec![addr, len])))
     }
 
-    /// Panics with `s`: a message for the host, then a trap (§15).
+    /// Panics with `s`: a message for the host, then a trap (§10).
     pub fn panic_text(&mut self, s: &str) {
         let (addr, len) = self.text_parts(s);
         self.emit(ir::Stmt::Eval(ir::Expr::Mem(ir::MemOp::Panic, vec![addr, len])));

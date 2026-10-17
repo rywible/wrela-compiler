@@ -26,7 +26,7 @@
       "message": "computing the constant `STEPS` ran past the build's fuel limit",
       "notes": [
         "the call chain: const STEPS → settle",
-        "the build stops a constant after about 17 billion WASM instructions, so a computation that doesn't end is an error rather than a hang (§10)"
+        "the build stops a constant after about 17 billion WASM instructions, so a computation that doesn't end is an error rather than a hang (§13)"
       ],
       "severity": "error",
       "span": {

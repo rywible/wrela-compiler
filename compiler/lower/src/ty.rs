@@ -150,7 +150,7 @@ impl<'a> Cx<'a> {
             }
             TyKind::Adt(..) if let Some((f, args)) = self.job_of(t) => {
                 if gpu {
-                    let note = "a job runs on the CPU, over several frames (§6.18)";
+                    let note = "a job runs on the CPU, over several frames (§16.3)";
                     self.not_on_gpu(mb, &self.checked.program.display_ty(t), note, span);
                     return None;
                 }
@@ -480,7 +480,7 @@ impl<'a> Cx<'a> {
         owner.resources().get(i).cloned().flatten()
     }
 
-    /// The IR parameters a group parameter (§12) adds, bound as `b` binds it: one for each
+    /// The IR parameters a group parameter (§18) adds, bound as `b` binds it: one for each
     /// value field, in order, through its group fields (`Fl::pass_group`).
     fn group_params(
         &mut self,

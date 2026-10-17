@@ -1,4 +1,4 @@
-//! Jobs (language.md §6.18): a `@job fn`'s `yield`, `f.start(...)` and `job.resume(...)`.
+//! Jobs (language.md §16.3): a `@job fn`'s `yield`, `f.start(...)` and `job.resume(...)`.
 //! Starting and resuming are calls (`Callee::JobStart`, `Callee::JobResume`), so the memory
 //! checker sees their arguments as it sees any call's; lowering builds the job's value and its
 //! resume function from the job's MIR.
@@ -18,7 +18,7 @@ impl<'p> Checker<'p> {
         if !in_job || !self.closure_stack.is_empty() {
             let what = if in_job { "a closure in a job" } else { "a function that isn't a job" };
             self.err(Diagnostic::new(codes::E0335, span, format!("`yield` in {what}")).with_note(
-                "`yield` ends a `@job fn`'s work for this frame, in its own body (§6.18)",
+                "`yield` ends a `@job fn`'s work for this frame, in its own body (§16.3)",
             ));
             return self.error_expr(span);
         }

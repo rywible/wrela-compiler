@@ -39,7 +39,7 @@ pub struct Program {
     pub inherent_impls: HashMap<AdtId, Vec<ImplId>>,
     /// Std's inherent impls of built-in types (`impl str`).
     pub builtin_inherent: Vec<ImplId>,
-    /// Each entry point's bound type (§12), `AdtDef::entry`'s other way.
+    /// Each entry point's bound type (§18), `AdtDef::entry`'s other way.
     pub bound_types: HashMap<FnId, AdtId>,
     /// Each `Packed` struct's fields, in its word (§3). Its one real field is the word.
     pub packed: HashMap<AdtId, Vec<PackedField>>,
@@ -70,7 +70,7 @@ pub struct Program {
     pub syntax_errors: Vec<wrela_diag::Span>,
     /// The unit suffixes: `std::units`' constants by name (§5).
     pub units: HashMap<String, ConstId>,
-    /// What each job's value holds (§6.18), worked out before the bodies are checked: its
+    /// What each job's value holds (§16.3), worked out before the bodies are checked: its
     /// traits, derived field by field, are the locals' (`fn.job-values`).
     pub job_held: HashMap<FnId, crate::defs::JobHeld>,
 }
@@ -403,7 +403,7 @@ impl Program {
     }
 
     /// The declared fields of a struct (`variant` is `None`) or of one of an enum's variants.
-    /// A job's value's parts, when `a` with `args` is a `Job<f>` (§6.18): where it stopped, a
+    /// A job's value's parts, when `a` with `args` is a `Job<f>` (§16.3): where it stopped, a
     /// `u32` named `at` with a hash of the job's code (a save made by another build doesn't
     /// load), then each local it holds, by name, its type with the job's generics. To the traits
     /// derived field by field, they're its fields (`fn.job-values`).

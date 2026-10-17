@@ -1,6 +1,6 @@
 // rejects: const.tests
 // A frame test takes nothing, or the program's state borrowed: the frames change the state,
-// and the test reads it (§10).
+// and the test reads it (§13).
 pub struct Game {
     ticks: u32,
 }

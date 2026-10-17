@@ -1,5 +1,5 @@
 // A vertex shader and a fragment shader with parameters of the same name, given different
-// buffers: each reads its own (§12). The vertex shader's covers the screen; the fragment
+// buffers: each reads its own (§18). The vertex shader's covers the screen; the fragment
 // shader's colours it a quarter red. renderer.rs checks a pixel the vertex shader would leave
 // empty if it read the fragment shader's buffer.
 

@@ -1,4 +1,4 @@
-//! Roles (language.md §12): a program that exports `frame` has a client build, one that exports
+//! Roles (language.md §15): a program that exports `frame` has a client build, one that exports
 //! `serve` a server build, and one with both has both, each lowered from its own entries, with
 //! one pair id in both modules. What only one role may run, reached from the other role's
 //! entries, is E0708 with the call chain.

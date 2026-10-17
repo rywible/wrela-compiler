@@ -1,4 +1,4 @@
-//! Derived interpretations of IR functions (language.md §13): forward-mode gradients ([`ad`])
+//! Derived interpretations of IR functions (language.md §14): forward-mode gradients ([`ad`])
 //! and sound interval bounds ([`interval`]). Nothing here knows what a field is (D-056); any
 //! function of floats qualifies, so long as it records no GPU work and has no loop whose exit
 //! depends on its input (for intervals).
@@ -46,7 +46,7 @@ pub fn value_and_gradient(
 }
 
 /// A function of `f`'s captures, `x` and a width (of `x`'s type) returning `f(x)` box-filtered
-/// over a footprint that wide along each of `x`'s components (`filtered`, language.md §13):
+/// over a footprint that wide along each of `x`'s components (`filtered`, language.md §14):
 /// each discontinuous builtin on the input's path is averaged over the range its operand spans
 /// in the footprint, to first order.
 pub fn filtered(

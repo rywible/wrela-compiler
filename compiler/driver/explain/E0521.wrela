@@ -1,5 +1,5 @@
 // A projection or a loan live across a job's `yield`. A stopped job holds only owned values
-// (§6.18): each `resume` lends its `borrow` and `mut` parameters again, maybe from other
+// (§16.3): each `resume` lends its `borrow` and `mut` parameters again, maybe from other
 // places, so a projection of one (or a closure that captures one) can't wait across a
 // `yield`. Use the parameter itself after the `yield`, or keep an owned copy.
 // ---- wrong

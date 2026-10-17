@@ -1,5 +1,5 @@
 //! The built-in types and functions: the part of the closed list of compiler-known items
-//! (language.md §17) that isn't written in wrela. They're in scope everywhere (the prelude).
+//! (language.md §20) that isn't written in wrela. They're in scope everywhere (the prelude).
 
 use crate::program::Program;
 use crate::ty::{FloatTy, IntTy, TyId, TyKind, Types, VecElem};
@@ -193,11 +193,11 @@ builtin_fns! {
     TrailingZeros = "trailing_zeros", 1, Method, false, None;
     /// `xs.len()` of a run or an array: its element count, a `u32`.
     Len = "len", 1, Method, false, None;
-    /// `panic(message)`: a bug. Traps with the message (§15); its type is `!`.
+    /// `panic(message)`: a bug. Traps with the message (§10); its type is `!`.
     Panic = "panic", 1, Free, false, None;
     /// `assert(cond, message)`: panics with the message when `cond` is false.
     Assert = "assert", 2, Free, false, None;
-    /// `embed("path")`: the file at `path` in the package, read by the build, as `Bytes` (§10).
+    /// `embed("path")`: the file at `path` in the package, read by the build, as `Bytes` (§13).
     Embed = "embed", 1, Free, false, None;
 }
 

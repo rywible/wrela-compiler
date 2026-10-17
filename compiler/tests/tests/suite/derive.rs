@@ -121,7 +121,7 @@ fn gradients_agree_with_central_differences() {
                 worst = worse(worst, diff(g, fd) / scale);
             }
             assert!(checked >= 100, "{name}: only {checked} smooth points");
-            // What language.md §13 says they agree within.
+            // What language.md §14 says they agree within.
             assert!(worst <= 3.4e-4, "{name}: gradient relative error {worst:.2e}");
             report.lock().expect("report").push(format!(
                 "  {name:>11}: worst relative error {worst:.1e} over {checked} points ({skipped} \

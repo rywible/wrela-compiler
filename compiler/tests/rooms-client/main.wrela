@@ -1,4 +1,4 @@
-// A room's client and its server in one program (language.md §12): the client proposes a tag,
+// A room's client and its server in one program (language.md §19): the client proposes a tag,
 // joins room `chrome` of its server, and prints the room's tags once it has two (the server has
 // another peer's, from before it joined).
 use platform::net::{send, serve_room}

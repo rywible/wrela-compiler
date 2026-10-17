@@ -11,14 +11,14 @@ use std::mem::{load_u32, load_u8}
 
 /// Text known when the program is built: a string literal, or text a build-time constant made.
 /// A `Copy` handle to read-only UTF-8, so it can be stored anywhere: in GPU data too, where it
-/// travels as its handle (a field names its parts with it, §20), and only the CPU reads it.
+/// travels as its handle (a field names its parts with it, §23), and only the CPU reads it.
 pub struct Text: Copy + GpuData {
     // The compiler builds literals as these two fields, in this order.
     addr: u32,
     len: u32,
 }
 
-/// Bytes known when the program is built: a file `embed` read (language.md §10). A `Copy`
+/// Bytes known when the program is built: a file `embed` read (language.md §13). A `Copy`
 /// handle to read-only data, so it can be stored anywhere. It passes as a `[u8]` where one is
 /// expected.
 pub struct Bytes: Copy {

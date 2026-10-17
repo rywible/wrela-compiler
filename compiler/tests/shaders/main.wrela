@@ -2,7 +2,7 @@
 // render.rs): constant operands WGSL would reject when the shader is created, operations WGSL
 // spells differently, enums inside structs, entry point names the WGSL writer renames, uniform
 // values with no runtime value or too many bytes for a uniform binding, shaders drawn twice
-// with different type arguments, and constants the build computed (§10).
+// with different type arguments, and constants the build computed (§13).
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Slots, VertexIndex, begin_screen_pass, buffer,
     dispatch, draw, write,

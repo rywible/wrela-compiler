@@ -22,7 +22,7 @@
       "labels": [],
       "message": "`p` is a `Params`, which isn't `GpuData`, so it can't go to the GPU",
       "notes": [
-        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.13)"
+        "data crossing to the GPU must be `GpuData`, so its layout is the same on both sides (§6.10)"
       ],
       "severity": "error",
       "span": {

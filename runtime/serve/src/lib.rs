@@ -1,4 +1,4 @@
-//! The server host (language.md §12): a server build's rooms, over WebTransport. A session at
+//! The server host (language.md §19): a server build's rooms, over WebTransport. A session at
 //! `/room/<name>?pair=<id>` is a connection of room `<name>`, from a client build whose pair id
 //! is `<id>` (16 hex digits): one of another pair is refused before it reaches a room. It opens
 //! one bidirectional stream, on which each message is a frame: its length (a varint, at most

@@ -1,4 +1,4 @@
-// Frame tests on the GPU (language.md §10, `@test(frames: n, gpu: true)`): the first frame has
+// Frame tests on the GPU (language.md §13, `@test(frames: n, gpu: true)`): the first frame has
 // a kernel square 64 numbers and reads them back; later frames take what came back, and the
 // tests check it. Each frame draws a ramp on the screen, which two tests compare with a golden
 // PNG. `squares_come_back` and `the_ramp_is_its_golden` pass; `a_wrong_square_fails` and

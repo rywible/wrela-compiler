@@ -1,4 +1,4 @@
-//! Lifted builds (language.md §20): the table of literals a build lifts, with what tools need
+//! Lifted builds (language.md §23): the table of literals a build lifts, with what tools need
 //! to show and edit them, and the build's report of every float literal in the lifted packages,
 //! lifted or not and why (`lift.json`).
 
@@ -78,7 +78,7 @@ fn why_not(checked: &Checked, file: FileId, start: u32, end: u32) -> &'static st
         if inside(c.value.span) {
             let id = wrela_sema::ty::ConstId(i as u32);
             return if wrela_lower::is_computed(checked, id) {
-                "in a constant the build computes (§10), once: it's data in the build"
+                "in a constant the build computes (§13), once: it's data in the build"
             } else {
                 "in a constant nothing in the program reads"
             };

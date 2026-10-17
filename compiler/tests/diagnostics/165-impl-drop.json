@@ -12,7 +12,7 @@
       "labels": [],
       "message": "wrela has no destructors for a program's types",
       "notes": [
-        "a value's fields are dropped when it is; only std's core defines destructors (§18)"
+        "a value's fields are dropped when it is; only std's core defines destructors (§21)"
       ],
       "severity": "error",
       "span": {

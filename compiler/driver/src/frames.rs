@@ -1,4 +1,4 @@
-//! Frame and tick tests (language.md §10): `@test(frames: n) fn name(state: State)`, and
+//! Frame and tick tests (language.md §13): `@test(frames: n) fn name(state: State)`, and
 //! `@test(ticks: n)`. The program is built as a debug build is, with each such test exported,
 //! and run on the native host's CPU (`wrela_host::CpuHost`), which checks every command a frame
 //! records and answers storage and fetch requests, but has no GPU: `init`, then `n` frames at
@@ -24,7 +24,7 @@ pub const FPS: f64 = 60.0;
 pub const WIDTH: u32 = 640;
 pub const HEIGHT: u32 = 480;
 
-/// Runs frame and tick tests `tests` (§10), given the constants computed into `data`: each
+/// Runs frame and tick tests `tests` (§13), given the constants computed into `data`: each
 /// test's failure, if it failed, with the errors building them found.
 pub fn run(
     checked: &Checked,
@@ -131,7 +131,7 @@ pub fn run(
                 checked.program.func(f).span,
                 format!("the test `{name}` failed {phase}: {error}"),
             )
-            .with_note("a frame test passes unless its frames or the test fail (§10)"),
+            .with_note("a frame test passes unless its frames or the test fail (§13)"),
         });
         results.push((f, failed, traced));
     }
@@ -207,7 +207,7 @@ fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
 #[derive(Default)]
 struct GpuHost(#[cfg(feature = "gpu")] Option<wrela_host::Host>);
 
-/// Runs GPU frame test `i` (`@test(frames: n, gpu: true)`, §10) on the native host's GPU:
+/// Runs GPU frame test `i` (`@test(frames: n, gpu: true)`, §13) on the native host's GPU:
 /// `init`, its `frames` with `script`'s events, each frame's readbacks answered before the next,
 /// then the test. Why it failed, if it did. The GPU host meters no fuel: it runs the program as
 /// `wrela run` does. Each test is a new program, nothing of the last one's left; the host is
@@ -281,7 +281,7 @@ fn run_gpu_frames(
     }
 }
 
-/// The screen after a GPU frame test's frames against its golden (§10): within its mean
+/// The screen after a GPU frame test's frames against its golden (§13): within its mean
 /// difference, or why not. With `bless`, the golden is written from the screen first.
 #[cfg(feature = "gpu")]
 fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result<(), String> {
@@ -359,7 +359,7 @@ fn run_one(
     input: &Input,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
-    // One thread: a parallel job's chunks all run on it, and the result is the same (§6.12).
+    // One thread: a parallel job's chunks all run on it, and the result is the same (§16.1).
     match built.instantiate_in(1, Some(storage)) {
         Ok(mut host) => {
             let failed = run_on(&mut host, i, run, input);

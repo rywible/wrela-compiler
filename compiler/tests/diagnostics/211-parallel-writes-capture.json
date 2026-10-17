@@ -10,7 +10,7 @@
       "labels": [],
       "message": "this closure writes `total`, which it captures, and `par_each_mut` runs it on several workers at once",
       "notes": [
-        "workers that write `total` at the same time would race; a parallel closure writes only its own element (§6.12)",
+        "workers that write `total` at the same time would race; a parallel closure writes only its own element (§16.1)",
         "to combine a value from each element, compute it in the closure and combine them with `par_map_reduce`"
       ],
       "severity": "error",

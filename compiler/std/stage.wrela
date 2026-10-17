@@ -2,7 +2,7 @@
 // (language.md §7). A field the program assembles while it runs, from an edit log or a
 // sculpting tool, has no code of its own to compile; its tape is data. A `Tape` is a `Surface`
 // like any compiled field, on the CPU and the GPU, and its gradient and interval are derived
-// from `interpret`'s own code, as any function's are (§13).
+// from `interpret`'s own code, as any function's are (§14).
 //
 // Each operation writes its own register, the one at its index, from earlier registers or a
 // constant; the last register is the field's value. A tape is fixed-size, so it's `GpuData`

@@ -22,7 +22,7 @@
       "labels": [],
       "message": "`dispatch` takes its entry points bound to their arguments: `dispatch(kernel.bind(...), groups: n)`",
       "notes": [
-        "a kernel's arguments go in its `.bind(...)`, matched as a call's are (§12)"
+        "a kernel's arguments go in its `.bind(...)`, matched as a call's are (§18)"
       ],
       "severity": "error",
       "span": {

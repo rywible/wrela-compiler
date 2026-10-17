@@ -61,7 +61,7 @@ pub struct PackageInfo {
     pub deps: Vec<(String, usize)>,
     /// Its manifest declares `unsafe`.
     pub unsafe_ok: bool,
-    /// A lifted build lifts its literals (language.md §20): its literal tables are built where
+    /// A lifted build lifts its literals (language.md §23): its literal tables are built where
     /// they're used, from their literals, rather than kept as data.
     pub lifted: bool,
 }
@@ -329,7 +329,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         let core = is_std
             && self.p.module(m).path.get(1).is_some_and(|s| UNSAFE_CORE.contains(&s.as_str()));
         let mut attrs = self.fn_attrs(attrs, is_std, core);
-        // std's unsafe core: its public functions are callable only inside `unsafe` (§6.14).
+        // std's unsafe core: its public functions are callable only inside `unsafe` (§6.12).
         attrs.unsafe_call = is_std
             && public
             && matches!(self.p.module(m).path.get(1).map(String::as_str), Some("mem" | "alloc"))
@@ -668,7 +668,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         (fieldwise, diagnostic)
     }
 
-    /// A constant's attributes: `@fuel(n)`, the work its computation may do (§10), at most
+    /// A constant's attributes: `@fuel(n)`, the work its computation may do (§13), at most
     /// once; any other is E0108.
     fn const_attrs(&mut self, attrs: &[ast::Attribute]) -> Option<u64> {
         let mut fuel = None;
@@ -703,7 +703,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     a.span,
                     "`@fuel` takes one whole number of fuel units, at most 2 ** 46",
                 )
-                .with_note("a unit is about one WASM instruction; the build's own limit is 2 ** 34, a test's 2 ** 37 (§10)")
+                .with_note("a unit is about one WASM instruction; the build's own limit is 2 ** 34, a test's 2 ** 37 (§13)")
                 .with_help("write it as a literal or a power of two: `@fuel(2 ** 40)`"),
             ),
         }
@@ -871,7 +871,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                                 a.name.span,
                                 "a function is `@client` or `@server`, not both",
                             )
-                            .with_note("each marks what only that role's build may run (§12)"),
+                            .with_note("each marks what only that role's build may run (§15)"),
                         );
                     }
                     out.role = Some((role, a.span));
@@ -904,17 +904,17 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
                 "comptime" | "assert" | "assume" | "escaping" => {
                     let instead = match name {
-                        "comptime" => "write the work as a `const`, which the build runs (§10)",
+                        "comptime" => "write the work as a `const`, which the build runs (§13)",
                         "escaping" => {
                             "a closure that captures only values can be stored as it is (§6.7)"
                         }
                         _ => {
-                            "state a bound as a method, such as `lipschitz(near)`, and test it (§13)"
+                            "state a bound as a method, such as `lipschitz(near)`, and test it (§14)"
                         }
                     };
                     self.diags.push(
                         Diagnostic::new(codes::E0204, a.span, format!("wrela has no `@{name}`"))
-                            .with_note("it was decided against (language.md §18)")
+                            .with_note("it was decided against (language.md §21)")
                             .with_help(instead),
                     );
                 }
@@ -956,7 +956,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     at,
                     "`@fuel` goes on a `const` or a `@test` of code, not this function",
                 )
-                .with_note("a frame test's calls each get a test's fuel, 2 ** 37 (§10)")
+                .with_note("a frame test's calls each get a test's fuel, 2 ** 37 (§13)")
                 .with_fix("remove it", at, ""),
             );
         }
@@ -1005,7 +1005,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         out
     }
 
-    /// `@test(frames: n)` or `@test(ticks: n)` (§10), `n` from 1 to [`MAX_TEST_FRAMES`], and,
+    /// `@test(frames: n)` or `@test(ticks: n)` (§13), `n` from 1 to [`MAX_TEST_FRAMES`], and,
     /// with `input: "path"`, the script of input events (or the tick log) they get; with
     /// `gpu: true`, frames that run on the native host's GPU, and with `golden: "frame.png"`
     /// too, the PNG the screen after them is compared with, `within` a mean difference.
@@ -1087,7 +1087,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: \"script.json\"`, a script of input events for them (or, with `ticks`, a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§10), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps"),
                 );
                 (None, None, false, None)
             }
@@ -1522,7 +1522,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         }
     }
 
-    /// Each entry point's bound type (§12): the borrow struct of its arguments that
+    /// Each entry point's bound type (§18): the borrow struct of its arguments that
     /// `name.bind(...)` makes, generic over the entry point's generics.
     fn make_bound_types(&mut self) {
         for i in 0..self.p.fns.len() {
@@ -1871,7 +1871,7 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     /// E0222: a `@test` is a free function of no parameters and no result, run on the CPU when
-    /// `wrela test` asks (§10).
+    /// `wrela test` asks (§13).
     fn test_signature(&mut self, id: FnId) {
         let def = self.p.func(id);
         let Some(at) = def.attrs.test else { return };
@@ -2266,7 +2266,7 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     /// A parameter's or field's default (§3): a literal value stays as written; any other
-    /// constant expression becomes a constant the build computes once (§10), which the default
+    /// constant expression becomes a constant the build computes once (§13), which the default
     /// names. A default whose type is generic stays as written, and must be a literal (E0324):
     /// a constant has one type.
     fn default_value(&mut self, m: ModuleId, of: &str, d: &ast::Expr, ty: TyId) -> ast::Expr {
@@ -2415,7 +2415,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             if r.is_none() && drop {
                 self.diags.push(
                     Diagnostic::new(codes::E0413, t.span, "wrela has no destructors for a program's types")
-                        .with_note("a value's fields are dropped when it is; only std's core defines destructors (§18)")
+                        .with_note("a value's fields are dropped when it is; only std's core defines destructors (§21)")
                         .with_help("to run code when something ends, call it where it ends"),
                 );
             } else {
@@ -3031,7 +3031,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
     };
     let tr = p.trait_(r.trait_);
     let structural = tr.lang.is_some_and(Lang::is_structural);
-    // Destructors are std's core's alone (§18).
+    // Destructors are std's core's alone (§21).
     if tr.lang == Some(Lang::Drop) && !p.is_std(imp.module) {
         diags.push(
             Diagnostic::new(
@@ -3039,12 +3039,12 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 imp.span,
                 "only std's core defines destructors",
             )
-            .with_note("wrela has no user-defined destructors: a value's fields are dropped when it is (§18)")
+            .with_note("wrela has no user-defined destructors: a value's fields are dropped when it is (§21)")
             .with_help("to run code when something ends, call it where it ends"),
         );
         return;
     }
-    // A bound entry point's traits are its own (§12).
+    // A bound entry point's traits are its own (§18).
     if let Some(l @ (Lang::Kernel | Lang::VertexShader | Lang::FragmentShader)) = tr.lang {
         let what = match l {
             Lang::Kernel => "a kernel",
@@ -3057,11 +3057,11 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: {what} bound to its arguments has it", tr.name),
             )
-            .with_note("`name.bind(...)` makes a value of the entry point's bound type, which has the trait (§12)"),
+            .with_note("`name.bind(...)` makes a value of the entry point's bound type, which has the trait (§18)"),
         );
         return;
     }
-    // A pass's trait is std's passes' own (§12).
+    // A pass's trait is std's passes' own (§18).
     if tr.lang == Some(Lang::RenderPass) && !p.is_std(imp.module) {
         diags.push(
             Diagnostic::new(
@@ -3069,7 +3069,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: std's passes have it", tr.name),
             )
-            .with_note("a draw draws into the pass a `begin_` function gives, and its type says the pass's targets (§12)"),
+            .with_note("a draw draws into the pass a `begin_` function gives, and its type says the pass's targets (§18)"),
         );
         return;
     }
@@ -3641,7 +3641,7 @@ pub fn check_job_fields(p: &Program) -> Vec<Diagnostic> {
                         ),
                     )
                     .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
-                    .with_note("a job's value holds its body's locals, and has a trait when they do (§6.18)"),
+                    .with_note("a job's value holds its body's locals, and has a trait when they do (§16.3)"),
                 );
             }
         }
@@ -3859,7 +3859,7 @@ fn alias_refs(p: &Program, m: ModuleId, t: &ast::TypeExpr, f: &mut impl FnMut(Al
     }
 }
 
-/// The most fuel a constant may set (`@fuel`, §10): 2 ** 46 units, some hours of one core.
+/// The most fuel a constant may set (`@fuel`, §13): 2 ** 46 units, some hours of one core.
 pub const MAX_FUEL: u64 = 1 << 46;
 
 /// The value of `@fuel`'s argument: a whole number written as a literal, a power (`2 ** 40`) or

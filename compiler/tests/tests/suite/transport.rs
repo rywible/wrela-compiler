@@ -1,4 +1,4 @@
-//! Rooms over the network (language.md §12, `wrela-serve`): WebTransport sessions at
+//! Rooms over the network (language.md §19, `wrela-serve`): WebTransport sessions at
 //! `/room/<name>?pair=<id>`, one stream each, its messages framed by their length. The peers here
 //! are Rust WebTransport clients that trust the server's development certificate by its hash, and
 //! a program's client build in headless Chrome, which finds its server in `net.json`.

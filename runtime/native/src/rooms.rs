@@ -1,4 +1,4 @@
-//! A room kept durably (language.md §12): a [`Room`] of a server build, its journal on disk, and
+//! A room kept durably (language.md §19): a [`Room`] of a server build, its journal on disk, and
 //! the rules that make it survive a crash. The journal holds the records its program gave the
 //! host (`platform::net`'s `keep` and `compact`); the host keeps a call's records, flushed to
 //! disk, before it releases anything the call sent or closed, so what any peer saw committed is

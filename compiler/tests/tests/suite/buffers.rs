@@ -1,4 +1,4 @@
-//! A GPU buffer is an owned value (language.md §6.13, §12): dropping it records its
+//! A GPU buffer is an owned value (language.md §18.3, §18): dropping it records its
 //! destruction, in order with the work that uses it, and the host releases it when that work is
 //! done. A buffer in the program's state lasts with the state, so a game that makes buffers
 //! every frame doesn't accumulate them, and one it keeps is there in the next call. A span

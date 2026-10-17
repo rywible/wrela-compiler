@@ -825,7 +825,7 @@ impl<'a> FnCheck<'a> {
         st
     }
 
-    /// A job's `yield` (§6.18): nothing that holds a loan may be live across it (a projection,
+    /// A job's `yield` (§16.3): nothing that holds a loan may be live across it (a projection,
     /// a closure that captures one, a borrow struct), as a stopped job holds only owned values.
     /// The job's own `borrow` and `mut` parameters are given again at each `resume`.
     fn yield_(&mut self, st: &State, resume: BlockId, span: Span) {
@@ -851,7 +851,7 @@ impl<'a> FnCheck<'a> {
                     format!("{what} is used after this `yield`, but a stopped job holds no projections or loans"),
                 )
                 .with_secondary(self.local(l).span, "declared here")
-                .with_note("a job keeps only owned values from one frame to the next; its `borrow` and `mut` parameters are given again at each `resume` (§6.18)")
+                .with_note("a job keeps only owned values from one frame to the next; its `borrow` and `mut` parameters are given again at each `resume` (§16.3)")
                 .with_help("keep an owned value (`take` it, or `.clone()` it), or find the place again after the `yield`"),
             );
         }
@@ -1923,7 +1923,7 @@ impl<'a> FnCheck<'a> {
                 d.with_help("call a function that returns `mut` to change it")
             }
             LocalKind::Const(_) => d
-                .with_note("a constant lives as long as the program, and every use of it reads the same place (§10)")
+                .with_note("a constant lives as long as the program, and every use of it reads the same place (§13)")
                 .with_help(format!("copy it into a `var` to change the copy: `var x = {}.clone()`", decl.name)),
             _ => d,
         };

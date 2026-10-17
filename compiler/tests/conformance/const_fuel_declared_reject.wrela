@@ -1,5 +1,5 @@
 // rejects: const.fuel
-// A constant stops at the fuel it sets, as a compile error (§10).
+// A constant stops at the fuel it sets, as a compile error (§13).
 fn count(n: u32) -> u32 {
     var s: u32 = 0
     for i in 0..n { //~ E0705

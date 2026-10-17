@@ -1,4 +1,4 @@
-// run: build-time constants (§10): the build runs the program's own code, and each constant
+// run: build-time constants (§13): the build runs the program's own code, and each constant
 // equals what the same call returns at run time, bit for bit
 // expect: same_as_run_time() = true
 // expect: sum() = 285

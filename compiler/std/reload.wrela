@@ -1,5 +1,5 @@
 // Replacing the running build with another in the same page or process, and the bytes that pass
-// from one to the next (language.md §20). A tool replaces a build in a hot reload; a program
+// from one to the next (language.md §23). A tool replaces a build in a hot reload; a program
 // replaces itself with `hand_over`, to give its place to another build: a game made of several
 // builds, each loaded when the player reaches it. Either way the new build starts with `init`,
 // as any program does. What the old build kept with `keep` is what the new one's `kept` gives,

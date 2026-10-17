@@ -49,13 +49,13 @@ pub struct Output {
     /// The build's files by path relative to the output directory, in a fixed order; empty
     /// unless building found no errors.
     pub files: Vec<(String, Vec<u8>)>,
-    /// Each GPU pipeline the program records, for the pipeline-count query (§7); empty when
+    /// Each GPU pipeline the program records, for the pipeline-count query (§18.9); empty when
     /// checking found errors before lowering.
     pub pipelines: Vec<PipelineSummary>,
     /// The program package's own files (not std's or a dependency's), and where each is: what
     /// `wrela fix` may edit.
     pub program_files: ProgramFiles,
-    /// How many constants the build computed, and how many it read from the cache (§10).
+    /// How many constants the build computed, and how many it read from the cache (§13).
     pub consts: consts::ConstStats,
 }
 
@@ -201,7 +201,7 @@ pub struct BuildKind {
     pub testing: bool,
 }
 
-/// A lifted build (language.md §20): [`build`], with each `f32` literal of the packages named
+/// A lifted build (language.md §23): [`build`], with each `f32` literal of the packages named
 /// `lift` (the program's own, or its dependencies', by the names their manifests give) read
 /// from a table the program can change while it runs. The build's files include `lift.json`,
 /// which says where each literal is and why any float literal of those packages isn't lifted.
@@ -364,7 +364,7 @@ pub fn builtins() -> Vec<(&'static str, usize, bool)> {
         .collect()
 }
 
-/// What running a package's tests found (`wrela test`, §10).
+/// What running a package's tests found (`wrela test`, §13).
 #[derive(Debug)]
 pub struct TestOutput {
     pub sources: SourceMap,
@@ -392,7 +392,7 @@ impl TestOutput {
     }
 }
 
-/// Runs the package's `@test` functions as the build runs constants (§10): checked as a debug
+/// Runs the package's `@test` functions as the build runs constants (§13): checked as a debug
 /// build, its constants computed, then each test whose name contains `filter` called, with
 /// nothing of them in a build.
 pub fn test(root: &Path, filter: Option<&str>) -> TestOutput {
@@ -407,7 +407,7 @@ pub fn test_with_fuel(root: &Path, filter: Option<&str>, fuel: u64) -> TestOutpu
     })
 }
 
-/// [`test`], writing each GPU frame test's golden (`golden: "frame.png"`, §10) from this
+/// [`test`], writing each GPU frame test's golden (`golden: "frame.png"`, §13) from this
 /// machine's screen before comparing with it: `wrela test --bless`.
 pub fn test_blessing(root: &Path, filter: Option<&str>) -> TestOutput {
     on_compiler_thread(|| {
@@ -616,7 +616,7 @@ fn compile_loaded(
     }
     if !has_errors(&diagnostics) {
         let roots = roots(&checked);
-        // Each role the program has is a build of its own, from that role's entries (§12).
+        // Each role the program has is a build of its own, from that role's entries (§15).
         for role in roles(&checked) {
             data.role = role;
             let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
@@ -666,7 +666,7 @@ fn compile_loaded(
     Output { sources, diagnostics, std_warnings, files, pipelines, program_files, consts: stats }
 }
 
-/// The roles a program has (§12): a server's if main.wrela exports `serve`, a client's if it
+/// The roles a program has (§15): a server's if main.wrela exports `serve`, a client's if it
 /// exports `frame`, or if it doesn't export `serve` (so a program with neither is told it needs
 /// `frame`).
 fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
@@ -692,7 +692,7 @@ fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
 }
 
 /// Reads the files `embed` reads, then computes the constants the build computes, into `data`,
-/// before what reads them is lowered (§10): each step only if no errors came before it. With
+/// before what reads them is lowered (§13): each step only if no errors came before it. With
 /// `cache`, constants whose inputs are unchanged are read from it ([`const_cache`]).
 fn prepare(
     checked: &wrela_sema::Checked,
@@ -727,7 +727,7 @@ fn split_std_warnings(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<D
     std
 }
 
-/// What the pipeline-count query reports of each pipeline (§7).
+/// What the pipeline-count query reports of each pipeline (§18.9).
 fn summarize(
     checked: &wrela_sema::Checked,
     sources: &SourceMap,

@@ -1,4 +1,4 @@
-// run: jobs (§6.18): a `@job fn` runs to each `yield` per `resume`, keeping its owned locals
+// run: jobs (§16.3): a `@job fn` runs to each `yield` per `resume`, keeping its owned locals
 // (numbers, a `Vec`, a `String`) between them; its `take` parameters go to `start`, its `borrow`
 // and `mut` ones to each `resume`; it yields inside loops, `if`s and `match` arms, and a closure
 // it makes is called after a `yield`; a job dropped half done, or run to its end, frees what it

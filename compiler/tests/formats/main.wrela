@@ -1,4 +1,4 @@
-// Texture formats (language.md §12): a kernel writes r32uint, r32float and rgba8 textures, and
+// Texture formats (language.md §18): a kernel writes r32uint, r32float and rgba8 textures, and
 // passes draw into r16float, rg16float and r32uint ones (the last from a `u32` output). The
 // screen shows one band a texture, green where each texel holds what was written and red where
 // it doesn't: renderer.rs checks them in both hosts.

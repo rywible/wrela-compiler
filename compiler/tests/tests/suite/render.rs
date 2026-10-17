@@ -160,7 +160,7 @@ fn shaders_get_the_values_the_program_means() {
     assert_eq!(&got[..want.len()], &want);
 }
 
-/// The pipeline-count query (§7): each pipeline's entry points with their type arguments, and
+/// The pipeline-count query (§18.9): each pipeline's entry points with their type arguments, and
 /// where CPU code dispatches or draws it. Without a GPU.
 #[test]
 fn the_pipeline_count_query_reports_each_instantiation() {

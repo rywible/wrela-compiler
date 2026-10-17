@@ -1,4 +1,4 @@
-//! `@audio` (AC6, language.md §6.13): compiler/tests/audio's modal-synthesis voice, rendered
+//! `@audio` (AC6, language.md §16.4): compiler/tests/audio's modal-synthesis voice, rendered
 //! offline by the native host and in Chrome's AudioWorklet, gives the same samples, bit for bit.
 
 use wrela_host::CpuBuild;

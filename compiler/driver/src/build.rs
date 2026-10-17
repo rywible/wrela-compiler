@@ -35,7 +35,7 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
     emit_in(l, sources, simd, budgets, true, true)
 }
 
-/// A server build's files (language.md §12): `server/game.wasm` alone, with a memory of its
+/// A server build's files (language.md §15): `server/game.wasm` alone, with a memory of its
 /// own (not shared: a server build runs on one thread, and its host caps the memory of each
 /// instance). It has no pipelines and no browser runtime.
 pub fn emit_server(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {

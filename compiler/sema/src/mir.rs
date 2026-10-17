@@ -100,7 +100,7 @@ pub enum LocalKind {
     /// A call's `borrow` or `mut` argument, bound where it's evaluated and used by the call:
     /// so nothing evaluated in between (a later argument) can change it.
     Arg { mutable: bool },
-    /// A constant, a place that lives as long as the program (language.md §10): read and
+    /// A constant, a place that lives as long as the program (language.md §13): read and
     /// projected, never written or moved out of.
     Const(ConstId),
 }
@@ -279,7 +279,7 @@ pub struct Call {
     pub span: Span,
 }
 
-/// What a command records (§12): an entry point named where it's recorded, its arguments the
+/// What a command records (§18): an entry point named where it's recorded, its arguments the
 /// command's, or a bound entry point's value, borrowed, whose type names it once it's known
 /// (`gpu::bound_fields` says which parameter each field binds).
 #[derive(Clone, Debug)]
@@ -363,7 +363,7 @@ pub enum Rvalue {
     Const(ConstId),
     /// A string literal: a `Text` of this UTF-8, laid out in the build.
     Text(std::sync::Arc<str>),
-    /// `embed("path")`: `Bytes` of the file at this path in the package (§10).
+    /// `embed("path")`: `Bytes` of the file at this path in the package (§13).
     Embed(std::sync::Arc<str>),
     /// A `const N: u32` generic parameter's value: known once the function is instantiated.
     ConstParam(ParamId),
@@ -491,7 +491,7 @@ pub enum TerminatorKind {
     Return(Option<Operand>),
     /// A projection-returning function returns this place.
     ReturnPlace(Place),
-    /// A job's `yield` (§6.18): its work stops here for this frame. Resumed, it goes on at
+    /// A job's `yield` (§16.3): its work stops here for this frame. Resumed, it goes on at
     /// `resume`, with the owned locals it had.
     Yield {
         resume: BlockId,
@@ -594,7 +594,7 @@ pub fn fn_uses(p: &Program, s: &Statement, r: &Rvalue, mut each: impl FnMut(FnUs
     match r {
         Rvalue::Call(c) => match &c.callee {
             Callee::Fn { func, .. } => each(FnUse::Call(*func), c.span),
-            // Resuming a job runs its body (§6.18); starting one makes its value.
+            // Resuming a job runs its body (§16.3); starting one makes its value.
             Callee::JobStart { func, .. } | Callee::JobResume { func, .. } => {
                 each(FnUse::Call(*func), c.span)
             }

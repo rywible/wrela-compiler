@@ -1,6 +1,6 @@
 //! AC3: the conformance suite (compiler/tests/conformance). Every rule of docs/language.md,
 //! the memory model (§6) included, has at least one program that's accepted and one that's
-//! rejected with the rule's diagnostic code, and the table of rules is the spec's.
+//! rejected with the rule's diagnostic code, and the table of rules is the spec's index.
 //!
 //! A case is a `.wrela` file, built as a one-file package (its `main.wrela`), or a directory,
 //! built as a package. Its first lines say which rules it covers:
@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wrela_tests::{cases, files_under, header, par_map, repo_root};
 
-/// The rules, by section of docs/language.md, which names each one where it's written
+/// The rules, by section of docs/language.md, whose index lists each one with its words
 /// (`the_rule_table_is_the_specs`): the driver keeps the table, which `wrela primer` reads too.
 use wrela_driver::primer::RULES;
 
@@ -175,28 +175,51 @@ fn conformance() {
     assert!(missing.is_empty(), "rules without cases:\n{}", missing.join("\n"));
 }
 
-/// The rule table is language.md's, in both directions: every rule the spec names (as
-/// `` `area.rule` ``, with one of the table's areas) has a row here, and every row is named in the
-/// spec, where the rule is written.
+/// The rule table is language.md's: its index (*The rules by ID*) lists every rule of `RULES`,
+/// in the same order and with the same words, each with a section that exists; and the spec
+/// names no rule anywhere else, so its prose reads without IDs.
 #[test]
 fn the_rule_table_is_the_specs() {
     let spec = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
-    let areas: BTreeSet<&str> = RULES.iter().filter_map(|(id, _)| id.split('.').next()).collect();
-    let mut named = BTreeSet::new();
-    for piece in spec.split('`').skip(1).step_by(2) {
-        if let Some((area, rule)) = piece.split_once('.')
-            && areas.contains(area)
-            && !rule.is_empty()
-            && rule.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
-        {
-            named.insert(piece.to_string());
-        }
+    let at = spec.find("\n## The rules by ID\n").expect("the index");
+    let (prose, index) = spec.split_at(at);
+    let mut listed: Vec<(String, String)> = Vec::new();
+    for line in index.lines() {
+        let cells: Vec<&str> = line.split(" | ").collect();
+        let [id, says, section] = cells[..] else { continue };
+        let Some(id) = id.strip_prefix("| `").and_then(|i| i.strip_suffix('`')) else { continue };
+        let section = section.trim_end_matches(" |").trim_start_matches('§');
+        let heading = if section.contains('.') {
+            format!("\n### {section} ")
+        } else {
+            format!("\n## {section}. ")
+        };
+        assert!(prose.contains(&heading), "`{id}`'s section §{section} isn't in the spec");
+        listed.push((id.to_string(), says.to_string()));
     }
-    let table: BTreeSet<String> = RULES.iter().map(|(id, _)| id.to_string()).collect();
-    let unwritten: Vec<&String> = table.difference(&named).collect();
-    let untabled: Vec<&String> = named.difference(&table).collect();
-    assert!(unwritten.is_empty(), "rules language.md doesn't name: {unwritten:?}");
-    assert!(untabled.is_empty(), "rules language.md names that the table lacks: {untabled:?}");
+    let table: Vec<(String, String)> = RULES
+        .iter()
+        .map(|(id, says)| {
+            let mut c = says.chars();
+            let first = c.next().map(|f| f.to_uppercase().collect::<String>()).unwrap_or_default();
+            (id.to_string(), first + c.as_str())
+        })
+        .collect();
+    assert_eq!(listed, table, "the index and the primer's table differ");
+    let areas: BTreeSet<&str> = RULES.iter().filter_map(|(id, _)| id.split('.').next()).collect();
+    let named: Vec<&str> = prose
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|piece| {
+            piece.split_once('.').is_some_and(|(area, rule)| {
+                areas.contains(area)
+                    && !rule.is_empty()
+                    && rule.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+            })
+        })
+        .collect();
+    assert!(named.is_empty(), "rule IDs in the spec's prose, not its index: {named:?}");
 }
 
 /// A program without `frame` is an error (E0703) at the start of main.wrela, since no host can

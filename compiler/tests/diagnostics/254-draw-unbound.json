@@ -22,7 +22,7 @@
       "labels": [],
       "message": "`draw` takes its entry points bound to their arguments: `draw(pass, vs.bind(...), fs.bind(...), vertices: n)`",
       "notes": [
-        "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone (§12)"
+        "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone (§18)"
       ],
       "severity": "error",
       "span": {

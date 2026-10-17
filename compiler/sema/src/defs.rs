@@ -73,7 +73,7 @@ pub struct PackageDef {
     pub deps: BTreeMap<String, PackageId>,
     /// Its manifest declares that it uses `unsafe` (std's core does).
     pub unsafe_ok: bool,
-    /// A lifted build lifts its literals (language.md §20).
+    /// A lifted build lifts its literals (language.md §23).
     pub lifted: bool,
 }
 
@@ -204,7 +204,7 @@ macro_rules! lang_items {
                 )
             }
 
-            /// Whether it's a request to the host for IO (the `io` effect, §6.15).
+            /// Whether it's a request to the host for IO (the `io` effect, §17.1).
             pub fn requests_io(self) -> bool {
                 matches!(
                     self,
@@ -244,7 +244,7 @@ macro_rules! lang_items {
             }
 
             /// Whether it's a kernel's `mut` parameter that every invocation may hold at once
-            /// (§6.13): slots, workgroup memory, atomics, an append and a map.
+            /// (§18.4): slots, workgroup memory, atomics, an append and a map.
             pub fn is_invocation_safe(self) -> bool {
                 matches!(
                     self,
@@ -533,7 +533,7 @@ pub struct AdtDef {
     pub diagnostic: Option<String>,
     /// `borrow struct`: a named group of projections (§6.6).
     pub borrow: bool,
-    /// A bound entry point's type (§12): the borrow struct of this entry point's arguments,
+    /// A bound entry point's type (§18): the borrow struct of this entry point's arguments,
     /// which the compiler makes. Its generics are the entry point's, and its fields its
     /// parameters that a command binds (`gpu::bound_fields`), in order.
     pub entry: Option<FnId>,
@@ -632,7 +632,7 @@ pub enum FnOwner {
     Free,
     Impl(ImplId),
     Trait(TraitId),
-    /// The function the build runs to compute a constant (language.md §10): no parameters,
+    /// The function the build runs to compute a constant (language.md §13): no parameters,
     /// and the constant's type. Nothing names it.
     Const(ConstId),
 }
@@ -648,7 +648,7 @@ pub struct ParamSig {
     pub is_self: bool,
 }
 
-/// Which host runs a build (language.md §12): a client's (the browser's, with a screen) or a
+/// Which host runs a build (language.md §15): a client's (the browser's, with a screen) or a
 /// server's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Role {
@@ -667,7 +667,7 @@ impl Role {
     }
 }
 
-/// A GPU entry point (§12).
+/// A GPU entry point (§18).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Entry {
     Compute([u32; 3]),
@@ -686,10 +686,10 @@ impl Entry {
     }
 }
 
-/// The most frames a frame test runs (§10): ten minutes at 60 frames a second.
+/// The most frames a frame test runs (§13): ten minutes at 60 frames a second.
 pub const MAX_TEST_FRAMES: u32 = 36_000;
 
-/// A GPU frame test's golden (§10): a PNG in the package, by its path, where the path is
+/// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is
 /// written, and how far the screen may be from it: a mean difference, in 8-bit steps.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Golden {
@@ -710,28 +710,28 @@ pub struct FnAttrs {
     pub intrinsic: bool,
     /// Part of std's unsafe core (`std::mem`, `std::alloc`): callable only inside `unsafe`.
     pub unsafe_call: bool,
-    /// `@deterministic`: checked to have no nondeterministic effects (§14).
+    /// `@deterministic`: checked to have no nondeterministic effects (§12).
     pub deterministic: Option<Span>,
     /// `@audio`: an audio-worklet entry point (§8).
     pub audio: Option<Span>,
-    /// `@test`: a test `wrela test` runs, as the build runs constants (§10).
+    /// `@test`: a test `wrela test` runs, as the build runs constants (§13).
     pub test: Option<Span>,
     /// `@testing`: an export only a test build has (§9): what tests and tools call, which a
     /// shipped build leaves out, with all that only it reaches.
     pub testing: Option<Span>,
-    /// `@test(frames: n)` or `@test(ticks: n)`: what of the program the test runs first (§10).
+    /// `@test(frames: n)` or `@test(ticks: n)`: what of the program the test runs first (§13).
     pub test_run: Option<TestRun>,
     /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
     /// its path in the package, and where the path is written.
     pub test_input: Option<(String, Span)>,
     /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
-    /// their readbacks (§10).
+    /// their readbacks (§13).
     pub test_gpu: bool,
     /// `@fuel(n)` on a `@test` of code: the work it may do, in place of a test's limit, and
-    /// where it's written (§10).
+    /// where it's written (§13).
     pub fuel: Option<(u64, Span)>,
     /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
-    /// frames is within a mean difference `m` of that PNG in the package (§10).
+    /// frames is within a mean difference `m` of that PNG in the package (§13).
     pub test_golden: Option<Golden>,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
@@ -739,13 +739,13 @@ pub struct FnAttrs {
     /// `@effects(...)` (std's unsafe core): effects it has that inference can't see, because
     /// another thread or the host decides them through memory (§8).
     pub effects: Vec<crate::effects::Effect>,
-    /// `@job`: a job, whose body runs over several frames, to each `yield` (§6.18).
+    /// `@job`: a job, whose body runs over several frames, to each `yield` (§16.3).
     pub job: Option<Span>,
-    /// `@client` or `@server`: only that role's build may run it (§12).
+    /// `@client` or `@server`: only that role's build may run it (§15).
     pub role: Option<(Role, Span)>,
 }
 
-/// What a job's value holds (§6.18): where it stopped, and each local of its memory IR that owns
+/// What a job's value holds (§16.3): where it stopped, and each local of its memory IR that owns
 /// a value (its body's owned locals, its `take` parameters, and the temporaries a loop or an
 /// expression keeps, such as a range's bound): its fields to the traits derived field by field
 /// (`fn.job-values`), as they're the job's value's fields in lowering.
@@ -787,7 +787,7 @@ impl JobHeld {
     }
 }
 
-/// What of the program a test runs before it (§10).
+/// What of the program a test runs before it (§13).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TestRun {
     /// `@test(frames: n)`: `n` frames, with the program's ticks in lockstep.
@@ -796,7 +796,7 @@ pub enum TestRun {
     Ticks(u32),
 }
 
-/// std's unsafe core (language.md §17, §6.14): the only modules that use `unsafe`, and the
+/// std's unsafe core (language.md §20, §6.12): the only modules that use `unsafe`, and the
 /// only ones whose functions may state `@effects` or be a `@thread_entry`.
 pub const UNSAFE_CORE: &[&str] =
     &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff", "time"];
@@ -881,7 +881,7 @@ pub struct ConstDef {
     pub eval: FnId,
     /// Whether it's a parameter's or field's default (named by `name`), not a `const` item.
     pub default: bool,
-    /// The fuel its computation may use, if its declaration sets it (`@fuel(n)`, §10): in place
+    /// The fuel its computation may use, if its declaration sets it (`@fuel(n)`, §13): in place
     /// of the build's limit.
     pub fuel: Option<u64>,
 }

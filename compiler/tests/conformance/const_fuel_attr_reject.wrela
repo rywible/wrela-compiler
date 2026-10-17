@@ -1,6 +1,6 @@
 // rejects: const.fuel
 // `@fuel` is a whole number of units, at most 2^46, on a `const` or a `@test` of code, set
-// once (§10).
+// once (§13).
 @fuel(0) //~ E0108
 const ZERO: u32 = 1
 

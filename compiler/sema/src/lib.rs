@@ -1,5 +1,5 @@
 //! wrela's semantics (language.md §§3–8, 12): modules and names, types, traits and generics,
-//! type inference, the memory model (§6), and the GPU rules (§12).
+//! type inference, the memory model (§6), and the GPU rules (§18).
 
 pub mod borrowck;
 pub mod builtins;
@@ -108,7 +108,7 @@ impl Checked {
 }
 
 /// Every file `embed` reads, with where it's read: from the bodies' MIR and the constants'
-/// values (§10). A path may appear more than once.
+/// values (§13). A path may appear more than once.
 /// How an `embed` names its file: the package that embeds it (its index, std's 0 and the
 /// program's 1) and its path in that package, as `index:path`.
 pub fn embed_key(package: usize, path: &str) -> String {
@@ -199,7 +199,7 @@ fn check(
         let f = program.const_(c).eval;
         program.fns[f.index()].ret = t;
     }
-    // What each job holds across its `yield`s, a field each of its value's (§6.18): its traits
+    // What each job holds across its `yield`s, a field each of its value's (§16.3): its traits
     // are its locals', so they're known before the code that uses them is checked. (A job's
     // body is checked again below, with its diagnostics.)
     let jobs: Vec<ty::FnId> = (0..program.fns.len() as u32)

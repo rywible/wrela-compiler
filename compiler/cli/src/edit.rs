@@ -1,5 +1,5 @@
 //! `wrela edit <package-dir> [--edits <file.json>] [--dry-run] [--json]`: writes new values into
-//! literals of the program's source, each in its literal's style (language.md §20). The edits
+//! literals of the program's source, each in its literal's style (language.md §23). The edits
 //! are JSON, from the file or standard input: `{"edits": [{"file", "start", "end", "text",
 //! "hash", "value"}]}`, each literal as a lifted build's `lift.json` or `std::lift` names it.
 //! A file that has changed since its literals were read is refused, and so is an edit that would

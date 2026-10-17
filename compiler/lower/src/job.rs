@@ -1,4 +1,4 @@
-//! Jobs (language.md §6.18): a `@job fn`'s value, its start and its `resume`.
+//! Jobs (language.md §16.3): a `@job fn`'s value, its start and its `resume`.
 //!
 //! A job's value (`Job<f>`) is a struct: where it stopped (`at`: the MIR block it goes on at,
 //! `0` before it starts, [`DONE`] after its end), then each owned local of its body (its `take`

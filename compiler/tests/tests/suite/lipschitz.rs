@@ -1,4 +1,4 @@
-//! Lipschitz bounds (AC5, language.md §17, D-092), over the corpus's surfaces that state one
+//! Lipschitz bounds (AC5, language.md §20, D-092), over the corpus's surfaces that state one
 //! (compiler/tests/fields: `with_lipschitz`): each composed bound holds where its consumers look,
 //! by sampling the derived gradient and by std's debug-build check; `to_bound` gives a field
 //! sphere tracing can step by; and a debug build catches a wrong bound.

@@ -39,7 +39,7 @@ pub(crate) enum Repr {
     Swizzle(ir::Place, Vec<u8>),
     /// A closure or function, with where its captures are in this function.
     Callable(Callable, Vec<CaptureSrc>),
-    /// In GPU code, a group (a borrow struct, §12): each field's representation. It has no
+    /// In GPU code, a group (a borrow struct, §18): each field's representation. It has no
     /// runtime value: its resources are the module's, and its values are where its fields are.
     Group(Vec<Repr>),
     /// A projection chosen at run time (`borrow x = if c { a } else { b }`, §6.3): an IR local
@@ -81,7 +81,7 @@ pub(crate) struct Fl<'c, 'a> {
     unmatched: HashMap<BlockId, BlockId>,
     /// The projections bound in more than one place: in each branch of an `if` (§6.3).
     rebound: std::collections::HashSet<Local>,
-    /// Lowering a job's `resume` (§6.18, `crate::job`): its blocks aren't nested, so nothing
+    /// Lowering a job's `resume` (§16.3, `crate::job`): its blocks aren't nested, so nothing
     /// may flow between them in IR values. Every owned local is an IR local, every projection
     /// a pointer in one, and a closure's captures are found where it's called.
     job: bool,
@@ -183,7 +183,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         job: false,
     };
     fl.unmatched = unmatched(code, &fl.preds);
-    // The constants this code names: places that live as long as the program (§10).
+    // The constants this code names: places that live as long as the program (§13).
     let closure = match key {
         InstanceKey::Closure { id, .. } => Some(*id),
         _ => None,
@@ -209,7 +209,7 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
     fl.finish();
 }
 
-/// A job's `resume` (§6.18, `crate::job`): the job's fields moved into its locals, then its
+/// A job's `resume` (§16.3, `crate::job`): the job's fields moved into its locals, then its
 /// blocks from the one its `at` names, each a case of a loop round a choice of block, to a
 /// `yield` (its locals moved back into the job, `Step::Yielded`) or its end (`Step::Done`).
 fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey, id: ir::FuncId) {
@@ -623,7 +623,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// A group parameter (§12), bound as `b` binds it: each resource field its resource, each
+    /// A group parameter (§18), bound as `b` binds it: each resource field its resource, each
     /// group field a group, and each value field the next IR parameter from `k`.
     fn group_params(&mut self, ty: TyId, b: &Bound, k: &mut u32) -> Repr {
         let Bound::Group(bs) = b else { return Repr::Erased };
@@ -1064,7 +1064,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         self.store(place, v);
     }
 
-    /// A group built or copied in GPU code (§12): its fields' representations, with no value.
+    /// A group built or copied in GPU code (§18): its fields' representations, with no value.
     /// A value field's is a local holding it.
     fn group_rvalue(&mut self, r: &Rvalue) -> Option<Repr> {
         match r {
@@ -1096,7 +1096,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// A table's value (`mir::Rvalue::Const`): on the CPU its constant data, read in place; GPU
     /// code builds it.
     fn table(&mut self, c: ConstId) -> Repr {
-        // A lifted build's constant of a lifted package is built from its literals (§20).
+        // A lifted build's constant of a lifted package is built from its literals (§23).
         if let Some(v) = self.lifted_const(c) {
             return Repr::Value(v);
         }
@@ -1431,7 +1431,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                         Some(Lang::GpuSpan) if !self.is_gpu() => {
                             self.cx.err(span_read_on_cpu(
                                 self.here(),
-                                "CPU code can't read through a GPU buffer; `std::gpu::read` asks for its elements (§6.13)",
+                                "CPU code can't read through a GPU buffer; `std::gpu::read` asks for its elements (§18.3)",
                             ));
                             return None;
                         }
@@ -1465,7 +1465,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         Some((ir::Place { root, path }, ty, swizzle))
     }
 
-    /// Where place `p` starts: its local's representation or, through a group's fields (§12),
+    /// Where place `p` starts: its local's representation or, through a group's fields (§18),
     /// the field's; with that start's type, and how many of `p`'s projections it took.
     fn base_of(&mut self, p: &mir::Place) -> (Repr, TyId, usize) {
         let r = self.locals[p.local.index()].clone();
@@ -1484,7 +1484,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         (r, ty, n)
     }
 
-    /// What a projection of place `p` is: the group `p` names whole (§12), or else its place,
+    /// What a projection of place `p` is: the group `p` names whole (§18), or else its place,
     /// with a trailing swizzle; `Erased` if it has no runtime value.
     fn alias_of(&mut self, p: &mir::Place) -> Repr {
         // Only a group's local starts a group (GPU code makes them), and `group_of` would read
@@ -1501,7 +1501,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// The fields of the group `p` names whole, in GPU code (§12).
+    /// The fields of the group `p` names whole, in GPU code (§18).
     pub(crate) fn group_of(&mut self, p: &mir::Place) -> Option<Vec<Repr>> {
         match self.base_of(p) {
             (Repr::Group(fields), _, n) if n == p.proj.len() => Some(fields),
@@ -1568,7 +1568,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// A group passed to a GPU function (§12): what it binds, each resource field's resource,
+    /// A group passed to a GPU function (§18): what it binds, each resource field's resource,
     /// with each value field's value added to `out`, as the callee's `group_params` takes them.
     /// `None` if a field isn't one the callee can be bound to.
     fn pass_group(
@@ -1685,7 +1685,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// A MIR place's type, concrete.
     pub fn place_src_ty(&mut self, p: &mir::Place) -> TyId {
         // Projected from the local's type in this instance: a field of a generic local (a bound
-        // entry point's, §12) is known only once the local's type is.
+        // entry point's, §18) is known only once the local's type is.
         let mut t = self.concrete(self.mir.locals[p.local.index()].ty);
         let mut variant = None;
         for proj in &p.proj {
@@ -1823,7 +1823,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// The index of the lifted literal an operand is, in a lifted build (§20): an `f32`
+    /// The index of the lifted literal an operand is, in a lifted build (§23): an `f32`
     /// literal written in a lifted package.
     fn lifted_index(&self, o: &mir::Operand) -> Option<u32> {
         let lift = self.cx.lift?;
@@ -2334,7 +2334,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// E0708 for a call, in a CPU module, to what only the other role's build may run (§12):
+    /// E0708 for a call, in a CPU module, to what only the other role's build may run (§15):
     /// a function marked `@client` or `@server`, wherever the call chain from the build's
     /// entries reaches it (through generics and closures too, as it's checked per instance).
     fn check_role(&mut self, func: FnId, span: Span) {
@@ -2356,12 +2356,12 @@ impl<'c, 'a> Fl<'c, 'a> {
                 role.name()
             ),
         )
-        .with_note("a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve` and what they reach (§12)");
+        .with_note("a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve` and what they reach (§15)");
         self.cx.err(crate::gpu::with_call_chain(self, d));
     }
 
     /// E0708 for GPU work recorded by a server build's code, which runs where there's no GPU
-    /// (§12): whether it was.
+    /// (§15.3): whether it was.
     fn gpu_in_server(&mut self, span: Span) -> bool {
         if self.mb.gpu.is_some() || self.cx.data.role != wrela_sema::defs::Role::Server {
             return false;
@@ -2371,7 +2371,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             span,
             "GPU work in the server build's code: a server has no GPU",
         )
-        .with_note("a server build runs `serve_init` and `serve` and what they reach (§12)");
+        .with_note("a server build runs `serve_init` and `serve` and what they reach (§15)");
         self.cx.err(crate::gpu::with_call_chain(self, d));
         true
     }
@@ -2430,7 +2430,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                             a.span(),
                             "GPU code passes a group on as it received it or built it, with its resources as the shader received them",
                         )
-                        .with_note("a group has no value on the GPU: its fields are the shader's bindings and values (§12)"),
+                        .with_note("a group has no value on the GPU: its fields are the shader's bindings and values (§18)"),
                     );
                     return None;
                 }
@@ -2446,7 +2446,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             {
                 self.cx.err(span_read_on_cpu(
                     a.span(),
-                    "a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§6.13)",
+                    "a `GpuSpan` passes as a `[T]` on the GPU, where its buffer is; CPU code can't read through it (§18.3)",
                 ));
                 return None;
             }

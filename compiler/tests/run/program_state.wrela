@@ -1,4 +1,4 @@
-// run: a program with state (§12): the host calls `init` once, keeps what it returns, and
+// run: a program with state (§15): the host calls `init` once, keeps what it returns, and
 // passes it first to `frame` and to the other exports that take it
 // expect: frames() = 0
 // expect: bump(2) = 2

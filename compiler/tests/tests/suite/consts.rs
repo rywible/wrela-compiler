@@ -1,4 +1,4 @@
-//! Build-time constants between builds (language.md §10, M6): cached by their inputs, with the
+//! Build-time constants between builds (language.md §13, M6): cached by their inputs, with the
 //! fuel a declaration sets, and their parallel jobs on the build's threads.
 
 use crate::scratch;

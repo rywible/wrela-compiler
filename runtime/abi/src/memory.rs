@@ -30,7 +30,7 @@
 //! (`std::tick`); [`THREAD_AUDIO`], its voice's (`std::audio`); and [`THREAD_HELPER0`] on, its
 //! helpers, at most [`MAX_WORKERS`]. Each thread but the program's runs its own instance of the
 //! module, on the same memory, and enters it through a **thread entry**: an export std's
-//! unsafe core declares (`@thread_entry`, language.md §17), named `__` and the function's name,
+//! unsafe core declares (`@thread_entry`, language.md §20), named `__` and the function's name,
 //! whose first argument is the thread's number. The entry runs on that thread's own stack and
 //! uses that thread's block. Its other arguments are `u32`s:
 //!

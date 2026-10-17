@@ -1,4 +1,4 @@
-//! Hot reload (language.md §20, #51 AC9), in the native host: compiler/tests/reload, built
+//! Hot reload (language.md §23, #51 AC9), in the native host: compiler/tests/reload, built
 //! lifted, run in lockstep with a script of Space presses.
 //!
 //! - A literal set by the host (`__lift_set`) reaches the CPU and the GPU at the next frame;

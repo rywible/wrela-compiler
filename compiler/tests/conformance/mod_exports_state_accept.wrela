@@ -1,5 +1,5 @@
 // accepts: mod.use
-// A program with state exports `init`, and `frame` takes the state first, `mut` (§12).
+// A program with state exports `init`, and `frame` takes the state first, `mut` (§15).
 struct World {
     t: f32,
 }

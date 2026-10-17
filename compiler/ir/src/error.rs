@@ -9,7 +9,7 @@ use wrela_diag::Span;
 /// (`Stmt::At`).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Error {
-    /// The function can't be given a derived interpretation (language.md §13): it uses
+    /// The function can't be given a derived interpretation (language.md §14): it uses
     /// something the interpretation doesn't support.
     NotDerivable(String, Option<Span>),
     /// An interval of a function with a loop whose exit depends on the input.

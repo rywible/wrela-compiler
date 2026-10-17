@@ -10,7 +10,7 @@
       "labels": [],
       "message": "`embed` can't read `../secrets.txt`: each part of the path names a directory or the file: no `.`, `..` or empty parts",
       "notes": [
-        "a path is relative to the package's root, and uses `/` (§10)"
+        "a path is relative to the package's root, and uses `/` (§13)"
       ],
       "severity": "error",
       "span": {

@@ -25,7 +25,7 @@
       ],
       "message": "the branches of this `if` have different types: `Sphere` and `Cuboid`",
       "notes": [
-        "an `if` gives one type; each struct is its own type (a field's structure is its type, §17)"
+        "an `if` gives one type; each struct is its own type (a field's structure is its type, §20)"
       ],
       "severity": "error",
       "span": {

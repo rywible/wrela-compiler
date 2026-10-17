@@ -41,7 +41,7 @@ pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
 pub use trace::{Phase, Trace, Traced};
-/// Build-time code's shared memory (constants, language.md §10), read and written by the
+/// Build-time code's shared memory (constants, language.md §13), read and written by the
 /// build's thread while its helpers wait or have stopped.
 pub mod build_memory {
     pub use crate::shared::{slice, write};
@@ -787,7 +787,7 @@ impl Host {
         self.p().push_scripted(s);
     }
 
-    /// Queues a message of `bytes` from connection `conn` (language.md §12).
+    /// Queues a message of `bytes` from connection `conn` (language.md §17.2).
     pub fn push_message(&mut self, conn: u32, bytes: Vec<u8>) {
         self.p().push_message(conn, bytes);
     }
@@ -1063,7 +1063,7 @@ impl CpuHost {
         self.program.push_scripted(s);
     }
 
-    /// Queues a message of `bytes` from connection `conn` (language.md §12).
+    /// Queues a message of `bytes` from connection `conn` (language.md §17.2).
     pub fn push_message(&mut self, conn: u32, bytes: Vec<u8>) {
         self.program.push_message(conn, bytes);
     }

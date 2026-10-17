@@ -166,7 +166,7 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
             out.extend(fx.report(callee, DERIVED, ctx, span, codes::E0700));
         }
         out.extend(discarded_results(p, body, &fx));
-        // What's passed as a `@deterministic fn` or a `@parallel fn` (§9, §6.12).
+        // What's passed as a `@deterministic fn` or a `@parallel fn` (§9, §16.1).
         for arg in typed_callables(p, f, body) {
             if arg.flags.deterministic {
                 let ctx = format!("`{}` takes it as a `@deterministic fn`", arg.callee);
@@ -472,7 +472,7 @@ fn parallel_writes(body: &Body, arg: &TypedArg) -> Vec<Diagnostic> {
         )
         .with_note(format!(
             "workers that write `{first}` at the same time would race; a parallel closure writes \
-             only its own element (§6.12)"
+             only its own element (§16.1)"
         ))
         .with_note(
             "to combine a value from each element, compute it in the closure and combine them \
@@ -496,9 +496,9 @@ const GPU: &[Effect] = &[
 const AUDIO: &[Effect] =
     &[Effect::Io, Effect::Trace, Effect::Host, Effect::Recursion, Effect::Alloc];
 /// `@deterministic` code, a constant, and what runs on several workers at once. A replayed tick
-/// mustn't touch storage either: requests are `io` (§6.15).
+/// mustn't touch storage either: requests are `io` (§17.1).
 pub const DETERMINISTIC: &[Effect] = &[Effect::Io, Effect::Nondet, Effect::Host];
-/// What's derived can't allocate, do IO, be non-deterministic or call the host (§13).
+/// What's derived can't allocate, do IO, be non-deterministic or call the host (§14).
 const DERIVED: &[Effect] =
     &[Effect::Alloc, Effect::Io, Effect::Trace, Effect::Nondet, Effect::Host];
 

@@ -1,5 +1,5 @@
 // Collections: `Vec`, `Box`, `Bounded` and `Flags`, sorting, and `swap` and `replace`, which
-// move values out of places (language.md §6.9, §17). A collection owns its elements, frees them
+// move values out of places (language.md §6.9, §20). A collection owns its elements, frees them
 // when it's dropped, and iterates in an order that doesn't depend on addresses.
 
 use std::alloc::{alloc, free, realloc}
@@ -332,7 +332,7 @@ impl<T> Vec<T> {
     }
 
     /// `sort_by`, with its room in `room`, which keeps it: once `room` has grown to the
-    /// elements' bytes, a sort allocates nothing (a tick's, §6.17).
+    /// elements' bytes, a sort allocates nothing (a tick's, §16.2).
     pub fn sort_by_in(mut self, before: fn(T, T) -> bool, room: mut Vec<u8>) {
         let n = self.len
         // Runs of `SORT_RUN` elements, each sorted in place by insertion.
@@ -404,7 +404,7 @@ impl<T> Vec<T> {
     }
 
     /// Calls `f` on each element, which it may change, in parallel: on this thread and the
-    /// program's workers (§6.12). The elements are split into chunks by their number alone, so
+    /// program's workers (§16.1). The elements are split into chunks by their number alone, so
     /// what `f` does doesn't depend on how many workers there are. `f` sees its element and
     /// reads what it captures: it can't write captured data (E0520), or do IO, record GPU work
     /// or be non-deterministic (E0600).
@@ -416,7 +416,7 @@ impl<T> Vec<T> {
     }
 
     /// `map`s each element and `reduce`s the results, in parallel: on this thread and the
-    /// program's workers (§6.12). The elements are split into chunks by their number alone, each
+    /// program's workers (§16.1). The elements are split into chunks by their number alone, each
     /// chunk folds its elements from `init` in order, and the chunks' results are folded from
     /// `init` in order, so the result doesn't depend on how many workers there are (for a
     /// `reduce` that `init` is an identity of, it's the sequential fold's when `reduce` is
@@ -792,7 +792,7 @@ impl<T> Box<T> {
     }
 
     /// Whether it holds nothing: it was moved out, or it's a job's local not yet set (a job's
-    /// value is zeros where it holds nothing, §6.18), which clones, hashes and saves as itself.
+    /// value is zeros where it holds nothing, §16.3), which clones, hashes and saves as itself.
     pub fn is_empty(self) -> bool {
         self.addr == 0
     }

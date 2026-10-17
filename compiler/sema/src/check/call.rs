@@ -634,7 +634,7 @@ impl<'p> Checker<'p> {
                         "`{name}` is part of std's unsafe core, so it's called only inside `unsafe`"
                     ),
                 )
-                .with_note("nothing checks what it does with memory (§6.14)"),
+                .with_note("nothing checks what it does with memory (§6.12)"),
             );
         }
         let (params, ret) = self.sig_under(f, &subst);
@@ -698,7 +698,7 @@ impl<'p> Checker<'p> {
     }
 
     /// [`match_args`](Self::match_args), with each argument checked as a GPU entry point's is
-    /// when `gpu` (a buffer for a `[T]` parameter, §12).
+    /// when `gpu` (a buffer for a `[T]` parameter, §18).
     #[allow(clippy::too_many_arguments)]
     fn match_args_as(
         &mut self,
@@ -984,7 +984,7 @@ impl<'p> Checker<'p> {
     }
 
     /// Argument coercions: an array or a `Vec` passes as a run (`[T; N]` and `Vec<T>` to
-    /// `[T]`), a `GpuSpan<T>` too (in GPU code, where it's its buffer's elements, §12; CPU code
+    /// `[T]`), a `GpuSpan<T>` too (in GPU code, where it's its buffer's elements, §18; CPU code
     /// can't read them, E0607), and a `Text` or a `String` as a `str`; otherwise unify.
     pub(super) fn coerce_arg(&mut self, e: &Expr, param_ty: TyId) {
         if matches!(self.kind(param_ty), TyKind::Str) && self.is_stringy(e.ty) {
@@ -1484,7 +1484,7 @@ impl<'p> Checker<'p> {
         stmts
     }
 
-    /// `embed("path")` (§10): `Bytes` of the file at `path`, relative to the package's root.
+    /// `embed("path")` (§13): `Bytes` of the file at `path`, relative to the package's root.
     /// The path is a string literal that stays inside the package; the driver reads the file.
     fn check_embed(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let path = match args {
@@ -1503,14 +1503,14 @@ impl<'p> Checker<'p> {
                     span,
                     "`embed` takes one string literal: the path of a file in the package",
                 )
-                .with_note("the build reads the file, so its path is known when the program is built (§10)"),
+                .with_note("the build reads the file, so its path is known when the program is built (§13)"),
             );
             return self.failed_call(args, span);
         };
         if let Some(why) = embed_path_problem(&path) {
             self.err(
                 Diagnostic::new(codes::E0218, at, format!("`embed` can't read `{path}`: {why}"))
-                    .with_note("a path is relative to the package's root, and uses `/` (§10)"),
+                    .with_note("a path is relative to the package's root, and uses `/` (§13)"),
             );
             return self.error_expr(span);
         }
@@ -1526,7 +1526,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// `panic(message)` and `assert(cond)`, `assert(cond, message)` (§15). A message is text: a
+    /// `panic(message)` and `assert(cond)`, `assert(cond, message)` (§10). A message is text: a
     /// string, a `Text`, a `String` or a `str`.
     fn check_panic(&mut self, b: BuiltinFn, args: &[ast::Arg], span: Span) -> Expr {
         let str_ty = self.p.types.intern(TyKind::Str);
@@ -1571,7 +1571,7 @@ impl<'p> Checker<'p> {
         }
         // The operands of a comparison, each bound to a local and passed on after the message:
         // where a failure is explained (a debug build, a test, a constant), the panic shows
-        // their values, with their source (§10).
+        // their values, with their source (§13).
         let mut stmts = Vec::new();
         let shown = self.bind_compared(&mut xs[0], &mut stmts);
         xs.extend(shown);
@@ -2229,7 +2229,7 @@ impl<'p> Checker<'p> {
         {
             return self.bind_value(f, path, args, span);
         }
-        // `job.start(...)`: a `Job<job>` (§6.18).
+        // `job.start(...)`: a `Job<job>` (§16.3).
         if name.name == "start"
             && let Some(f) = self.fn_named(receiver)
             && self.p.func(f).attrs.job.is_some()
@@ -2578,7 +2578,7 @@ impl<'p> Checker<'p> {
 
     // ---- GPU intrinsics --------------------------------------------------------------------
 
-    /// A `dispatch` or `draw` argument, the entry point of stage `want` it records (§12): one
+    /// A `dispatch` or `draw` argument, the entry point of stage `want` it records (§18): one
     /// named (`cover`), bound where it's recorded (`shade.bind(scene)`), or a bound entry
     /// point's value (`let k = fill.bind(...)`, a parameter `K: Kernel`).
     fn command_shader<'a>(&mut self, e: &'a ast::Expr, want: Entry) -> Option<Recorded<'a>> {
@@ -2624,7 +2624,7 @@ impl<'p> Checker<'p> {
     }
 
     /// What a value of type `t` records, if it's a bound entry point's: its entry point's type
-    /// (§12), or a parameter bounded by `Kernel`, `VertexShader<V>` or `FragmentShader<V>`.
+    /// (§18), or a parameter bounded by `Kernel`, `VertexShader<V>` or `FragmentShader<V>`.
     fn bound_value_of(&self, t: TyId) -> Option<BoundValue> {
         match self.kind(t) {
             TyKind::Adt(a, args) => {
@@ -2646,7 +2646,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// What a `dispatch` or `draw` argument binds (§12): an entry point of stage `want`, named
+    /// What a `dispatch` or `draw` argument binds (§18): an entry point of stage `want`, named
     /// alone when it takes nothing (`cover`) or bound to its arguments (`shade.bind(scene,
     /// field)`). Its generic arguments are fresh, and its arguments aren't checked yet.
     fn bound_entry<'a>(&mut self, e: &'a ast::Expr, want: Entry) -> Option<Bound<'a>> {
@@ -2716,7 +2716,7 @@ impl<'p> Checker<'p> {
         Some(Bound { func, gen_args, args, span: e.span })
     }
 
-    /// `k.bind(...)` as a value (§12): a literal of `k`'s bound type, a borrow struct whose
+    /// `k.bind(...)` as a value (§18): a literal of `k`'s bound type, a borrow struct whose
     /// fields hold the arguments as `gpu::bound_fields` says (a buffer given whole as a span
     /// of it). A command takes it in place of a named entry point.
     fn bind_value(&mut self, func: FnId, path: &ast::Path, args: &[ast::Arg], span: Span) -> Expr {
@@ -2821,7 +2821,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// What a command records of `r` (§12): its shader, and for an entry point named there, the
+    /// What a command records of `r` (§18): its shader, and for an entry point named there, the
     /// arguments it binds ([`Self::bind_args`], which `skip` is for).
     fn record(&mut self, r: Recorded, skip: Option<TyId>) -> (Shader, Vec<(usize, Expr)>) {
         match r {
@@ -2878,7 +2878,7 @@ impl<'p> Checker<'p> {
         order.into_iter().filter_map(|k| out[k].take().map(|e| (user[k].0, e))).collect()
     }
 
-    /// E0603 for `dispatch` or `draw` in the form before entry points were bound (§12): their
+    /// E0603 for `dispatch` or `draw` in the form before entry points were bound (§18): their
     /// arguments among the call's own. With a fix that binds them, when the source is at hand
     /// and each argument has one place to go.
     fn unbound_gpu_call(&mut self, call: &str, rewrite: Option<(Span, String)>, span: Span) {
@@ -2898,7 +2898,7 @@ impl<'p> Checker<'p> {
             span,
             format!("`{call}` takes its entry points bound to their arguments: {form}"),
         )
-        .with_note(format!("{note} (§12)"));
+        .with_note(format!("{note} (§18)"));
         if let Some((at, text)) = rewrite {
             d = d.with_fix("bind the arguments", at, text);
         }
@@ -3050,7 +3050,7 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// A dispatch's or draw's argument for an entry point's parameter `p` (§6.13). A buffer
+    /// A dispatch's or draw's argument for an entry point's parameter `p` (§18.3). A buffer
     /// parameter takes a `GpuBuffer<T>` or a span of one: for `[T]`, the buffer borrowed or a
     /// `GpuSpan<T>`; for `mut Slots<T>` (or `mut [T]`), `mut buf` or a `GpuSpanMut<T>`. Any
     /// other parameter takes its own type.
@@ -3083,7 +3083,7 @@ impl<'p> Checker<'p> {
                         e.span,
                         format!("`{}` is written by the GPU, so it's passed `mut ...`", p.name),
                     )
-                    .with_note("every mutation is visible where it happens (§6.2, §6.13)")
+                    .with_note("every mutation is visible where it happens (§6.2, §18.3)")
                     .with_fix("add `mut`", e.span.shrink_to_start(), "mut "),
                 );
             }
@@ -3144,7 +3144,7 @@ impl<'p> Checker<'p> {
                                 p.name
                             ),
                         )
-                        .with_note("every mutation is visible where it happens (§6.2, §6.13)")
+                        .with_note("every mutation is visible where it happens (§6.2, §18.3)")
                         .with_fix(
                             "add `mut`",
                             e.span.shrink_to_start(),
@@ -3324,7 +3324,7 @@ impl<'p> Checker<'p> {
     /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
     /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
     /// A draw's pass: an open pass's value, which its `begin_` function gave, or a parameter
-    /// bounded by `RenderPass` (§12). Its type says what the draw draws into.
+    /// bounded by `RenderPass` (§18). Its type says what the draw draws into.
     fn render_pass(&mut self, e: &ast::Expr) -> Option<Expr> {
         let x = self.check_expr(e, None);
         let is_pass = match self.kind(x.ty) {
@@ -3783,7 +3783,7 @@ fn declared_render_constant(
     }
 }
 
-/// An entry point as `dispatch` and `draw` take it (§12): which one, its generic arguments,
+/// An entry point as `dispatch` and `draw` take it (§18): which one, its generic arguments,
 /// and the arguments of its `.bind(...)` (none when it's named alone).
 struct Bound<'a> {
     func: FnId,
@@ -3792,7 +3792,7 @@ struct Bound<'a> {
     span: Span,
 }
 
-/// A `dispatch` or `draw` argument (§12): an entry point named where it's recorded, or a
+/// A `dispatch` or `draw` argument (§18): an entry point named where it's recorded, or a
 /// bound entry point's value.
 enum Recorded<'a> {
     Named(Bound<'a>),
@@ -3898,7 +3898,7 @@ fn literal_sign(e: &ast::Expr) -> Option<bool> {
 }
 
 /// Why `embed` can't read `path`, if it can't: it must be relative to the package's root, use
-/// `/`, and stay inside the package (§10).
+/// `/`, and stay inside the package (§13).
 pub(crate) fn embed_path_problem(path: &str) -> Option<&'static str> {
     if path.is_empty() {
         return Some("the path is empty");

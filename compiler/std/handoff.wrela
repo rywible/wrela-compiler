@@ -1,4 +1,4 @@
-// Hand-offs: the latest value from one thread to another, without waiting (language.md §6.17).
+// Hand-offs: the latest value from one thread to another, without waiting (language.md §16.2).
 // One thread publishes whole values; another reads the newest complete one. Neither waits, and
 // a value is never read half-written. It's a triple buffer: three slots, of which the publisher
 // owns one (its back), the reader one (its front), and the third (the middle) holds the newest

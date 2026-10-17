@@ -1,4 +1,4 @@
-# Lifted builds (language.md §20): a program whose `shapes` dependency is lifted
+# Lifted builds (language.md §23): a program whose `shapes` dependency is lifted
 # (compiler/tests/tests/suite/lift.rs).
 [package]
 name = "lift"

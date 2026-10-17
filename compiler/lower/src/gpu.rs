@@ -70,7 +70,7 @@ pub struct PipelineOut {
     pub bindings: Vec<ResourceBinding>,
     /// Which instantiation of its entry points it is.
     pub key: PipelineKey,
-    /// Where CPU code dispatches or draws it, first seen first (the pipeline-count query, §7).
+    /// Where CPU code dispatches or draws it, first seen first (the pipeline-count query, §18.9).
     pub sites: Vec<Span>,
     /// A debug build's: the binding of the flag its bounds checks set (`ir::bounds`).
     pub debug_flag: Option<u32>,
@@ -97,7 +97,7 @@ pub(crate) struct GpuCx {
     pub uniform_fields: Vec<Option<u32>>,
     /// Over a domain: the block's field holding the domain's size.
     pub domain_field: Option<u32>,
-    /// A lifted build's literal table (§20): the storage buffer every pipeline binds last.
+    /// A lifted build's literal table (§23): the storage buffer every pipeline binds last.
     pub literals: Option<ir::ResourceId>,
 }
 
@@ -164,7 +164,7 @@ pub(crate) enum ParamClass {
     /// The vertex shader's output, read by the fragment shader.
     Varyings,
     Uniform,
-    /// A group (a borrow struct, §12): its fields are the interface's leaves.
+    /// A group (a borrow struct, §18): its fields are the interface's leaves.
     Group,
 }
 
@@ -279,7 +279,7 @@ pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TextureFormat {
 }
 
 /// How a group's field of type `ty` is passed: bound, a group of its own, or a value in the
-/// uniform block (§12).
+/// uniform block (§18).
 fn field_class(cx: &Cx, ty: TyId) -> ParamClass {
     match resource_class(cx, ty) {
         Some(class) => class,
@@ -341,7 +341,7 @@ pub(crate) struct EntryParams {
     pub params: Vec<(TyId, ParamClass)>,
 }
 
-/// A parameter an entry point is passed, or a field of a group it's passed (§12).
+/// A parameter an entry point is passed, or a field of a group it's passed (§18).
 #[derive(Clone, Debug)]
 pub(crate) struct Leaf {
     /// Its entry point and parameter, as indices.
@@ -384,7 +384,7 @@ pub(crate) struct Interface {
     /// The entry points: a kernel, or a vertex shader then a fragment shader.
     pub entries: Vec<EntryParams>,
     /// What's bound to resources (buffers, textures, samplers), in binding order: parameters,
-    /// and the fields of groups. Each shader's are its own (§12).
+    /// and the fields of groups. Each shader's are its own (§18).
     pub bound: Vec<Leaf>,
     /// The uniform block's fields, each a uniform parameter or a group's value. Its `name` is
     /// its field's (`lit_cam`; with the entry point's first when both shaders have one).
@@ -697,7 +697,7 @@ fn record_dispatch(fl: &mut Fl, d: &mir::Dispatch, span: Span) -> Option<()> {
         return None;
     }
     let kernel = recorded_shader(fl, &d.kernel)?;
-    // A kernel a generic function dispatches over a domain is known here (§12, E0603).
+    // A kernel a generic function dispatches over a domain is known here (§18, E0603).
     if d.over
         && kernel.value.is_some()
         && wrela_sema::gpu::shares_memory(&fl.cx.checked.program, kernel.func)
@@ -908,7 +908,7 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     Some(())
 }
 
-/// What a draw draws into: its pass's targets, as the pass's type says (§12). A draw whose
+/// What a draw draws into: its pass's targets, as the pass's type says (§18). A draw whose
 /// fragment shader's output its pass's targets can't take is E0603: one that gives its
 /// fragments their depth (`WithDepth`) needs a depth target, one that returns a `u32` an
 /// `R32Uint` texture, which nothing else is drawn into.
@@ -1749,7 +1749,7 @@ fn fragment_only(
 
 /// A kernel's workgroup memory: E0610 for a barrier that its workgroup's invocations may not
 /// all reach together, E0609 for a read or write of workgroup memory with no barrier since an
-/// access of the other kind (§6.13).
+/// access of the other kind (§18.5).
 fn check_workgroup(
     cx: &mut Cx,
     mb: &ModuleBuilder,
@@ -1783,7 +1783,7 @@ fn check_workgroup(
                 user_span_in(cx, mb, h.func, at),
                 format!("`{name}` is {what} here, and {other}: there's no barrier since"),
             )
-            .with_note("between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§6.13)")
+            .with_note("between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§18.5)")
             .with_help(format!("call `barrier(mut {name})` between the writes and the reads")),
         );
     }
@@ -1936,7 +1936,7 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
         }
         bind(&mut resources, leaf, id);
     }
-    // A lifted build's literals: a buffer every pipeline binds, after the others (§20).
+    // A lifted build's literals: a buffer every pipeline binds, after the others (§23).
     let literals = crate::lift::len(cx);
     if literals > 0 {
         let binding = 1 + bindings.len() as u32;
@@ -2219,7 +2219,7 @@ fn check_storage_buffers(cx: &mut Cx, iface: &Interface, uniform: Option<&Unifor
 }
 
 /// E0602 when a shader of a pipeline binds more textures, samplers or storage textures than a
-/// WebGPU stage may, groups' fields counted (§12): named by the first past the limit.
+/// WebGPU stage may, groups' fields counted (§18): named by the first past the limit.
 fn check_stage_limits(cx: &mut Cx, iface: &Interface) {
     use wrela_abi::manifest::{
         MAX_SAMPLED_TEXTURES_PER_STAGE, MAX_SAMPLERS_PER_STAGE, MAX_STORAGE_TEXTURES_PER_STAGE,
@@ -2618,7 +2618,7 @@ struct GroupAt<'i> {
     fields: &'i [Option<u32>],
 }
 
-/// A group an entry point takes (§12), at `path` in its parameter: each field bound to its
+/// A group an entry point takes (§18), at `path` in its parameter: each field bound to its
 /// resource, its place in the uniform block, or a group of its own, as `b` binds it.
 fn entry_group(fl: &mut Fl, at: &GroupAt, path: &[u32], ty: TyId, b: Option<&Bound>) -> Repr {
     let Some(Bound::Group(bs)) = b else { return Repr::Erased };

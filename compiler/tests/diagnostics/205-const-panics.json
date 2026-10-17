@@ -24,7 +24,7 @@
       "message": "computing the constant `SPINE` panicked: no bone is named `spine`",
       "notes": [
         "the call chain: const SPINE → find",
-        "the build runs the program's own code to compute a constant, so a panic or a failed `assert` in it fails the build (§10)"
+        "the build runs the program's own code to compute a constant, so a panic or a failed `assert` in it fails the build (§13)"
       ],
       "severity": "error",
       "span": {

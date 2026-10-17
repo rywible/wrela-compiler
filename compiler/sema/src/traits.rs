@@ -435,7 +435,7 @@ pub fn implements(p: &Program, ty: TyId, r: &TraitRef) -> bool {
     {
         return implements_builtin(p, ty, l);
     }
-    // A bound entry point's type has its stage's trait (§12); nothing else has one but a
+    // A bound entry point's type has its stage's trait (§18); nothing else has one but a
     // parameter bounded by it.
     if let Some(l @ (Lang::Kernel | Lang::VertexShader | Lang::FragmentShader)) =
         p.trait_(r.trait_).lang
@@ -666,7 +666,7 @@ pub fn may_need_drop(p: &Program, ty: TyId) -> bool {
         TyKind::ArrayN(e, _) => may_need_drop(p, *e),
         // A borrow struct owns nothing: its fields are borrows, or `Copy` (§6.4).
         TyKind::Adt(a, _) if p.adt(*a).borrow => false,
-        // A job's value holds its body's owned locals, which only its MIR says (§6.18).
+        // A job's value holds its body's owned locals, which only its MIR says (§16.3).
         TyKind::Adt(a, _) if p.is_lang_adt(*a, Lang::Job) => true,
         TyKind::Adt(a, args) => {
             explicit_drop(p, *a).is_some()
@@ -819,7 +819,7 @@ pub fn reveal(p: &Program, hidden: &HashMap<FnId, TyId>, t: TyId) -> TyId {
                 let ts = ts.iter().map(|&x| rev(x)).collect();
                 types.intern(TyKind::Adt(*a, ts))
             }
-            // A job's (`Job<realize<C, K>>`, §6.18).
+            // A job's (`Job<realize<C, K>>`, §16.3).
             TyKind::FnDef(f, ts) => {
                 let ts = ts.iter().map(|&x| rev(x)).collect();
                 types.intern(TyKind::FnDef(*f, ts))

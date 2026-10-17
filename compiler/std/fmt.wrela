@@ -689,7 +689,7 @@ impl Big {
     }
 }
 
-/// What a failed `assert` panics with where its failure is explained (§10): its message, then
+/// What a failed `assert` panics with where its failure is explained (§13): its message, then
 /// the value of each operand of its comparison that isn't a literal: ``assertion failed: `got`
 /// is 0.5``. Text is quoted (bit 0 of `quoted` for `a`, bit 1 for `b`). The compiler calls these
 /// in a debug build, a test and a constant; elsewhere the message is all a failed `assert` says.

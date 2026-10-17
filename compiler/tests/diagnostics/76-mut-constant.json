@@ -12,7 +12,7 @@
       "labels": [],
       "message": "can't lend mutably `START`: `START` is a constant",
       "notes": [
-        "a constant lives as long as the program, and every use of it reads the same place (§10)"
+        "a constant lives as long as the program, and every use of it reads the same place (§13)"
       ],
       "severity": "error",
       "span": {

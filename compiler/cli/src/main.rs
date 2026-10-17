@@ -9,30 +9,30 @@
 //!                                         --optimize makes the WASM smaller with
 //!                                         Binaryen, its trap locations in game.lines;
 //!                                         --lift reads that package's literals from a
-//!                                         table the program can change (§20)
+//!                                         table the program can change (§23)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
 //! wrela fix <package-dir> [--json]        make every fix a tool can make, and report each
 //! wrela edit <package-dir> [--edits <file>] [--dry-run] [--json]
-//!                                         write new values into literals (§20), from
+//!                                         write new values into literals (§23), from
 //!                                         JSON edits; refuses a file that has changed
 //! wrela explain <code>                    what a diagnostic code means, with a program that
 //!                                         has it and the program fixed
 //! wrela doc <item> [<package-dir>]        an item's signature, doc comment and examples
-//! wrela pipelines <package-dir> [--json]  each GPU entry point's instantiations (§7)
+//! wrela pipelines <package-dir> [--json]  each GPU entry point's instantiations (§18.9)
 //! wrela profile <package-dir> [--frames n] [--size WxH] [--input <script.json>] [--serial]
 //!     [--json] [--baseline <report.json>] [--compare <build-dir>] where a frame's time goes on this machine: the GPU's
 //!                                         by label, the CPU's and its phases (medians and
 //!                                         95th percentiles), each pipeline's WGSL; with a
 //!                                         baseline, how each time changed
 //! wrela test <package-dir> [<filter>] [--json]
-//!                                         run the package's `@test` functions (§10), or
+//!                                         run the package's `@test` functions (§13), or
 //!                                         those whose names contain `filter`; exit 1 if one
 //!                                         fails
 //! wrela primer [area]                     the language's rules, each with a program that
 //!                                         keeps it and one that breaks it
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
-//!                                         make the package's spec hold (§20)
+//!                                         make the package's spec hold (§23)
 //! wrela trace <package-dir> --watch <export>,...
 //!                                         run frames and print what exports say after each
 //! wrela bisect <package-dir> --until "<export> <op> <number>"
@@ -48,7 +48,7 @@
 //! wrela refactor <package-dir> <change> [--dry-run] [--json]
 //!                                         rename, move, add-param, change-mode: checked
 //!                                         before written, refused on a stale plan
-//! wrela studio <package-dir> [...]        the lens (§20)
+//! wrela studio <package-dir> [...]        the lens (§23)
 //! wrela audio <package-dir> <action> [...] a piece's voice as files and numbers: wav,
 //!                                         describe, numbers, midi, sheet, speed; and
 //!                                         `wrela audio partials <wav> --key k`

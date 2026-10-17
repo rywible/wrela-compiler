@@ -1,4 +1,4 @@
-//! Interval arithmetic (language.md §13, D-075). An active value of type `T` becomes two values
+//! Interval arithmetic (language.md §14, D-075). An active value of type `T` becomes two values
 //! of type `T`, `lo` and `hi`: componentwise bounds on every value it can take when the input
 //! ranges over a box, **as the target computes it**. That last part is what makes the result
 //! sound for the program that actually runs: each operation's bounds are widened outward by the

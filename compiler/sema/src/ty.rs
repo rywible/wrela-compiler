@@ -158,12 +158,12 @@ impl FloatTy {
 pub struct FnFlags {
     /// Two bits per parameter, the first parameter's lowest: 0 borrow, 1 `mut`, 2 `take`.
     pub modes: u64,
-    /// `@deterministic fn(...)`: only a function that's deterministic can be passed (§14).
+    /// `@deterministic fn(...)`: only a function that's deterministic can be passed (§12).
     pub deterministic: bool,
-    /// `@parallel fn(...)`: a function that runs on several workers at once (§6.12), so it
+    /// `@parallel fn(...)`: a function that runs on several workers at once (§16.1), so it
     /// writes no captured data and does no IO, GPU work or non-deterministic work.
     pub parallel: bool,
-    /// `@audio fn(...)`: a function the audio thread runs (§6.13), so it doesn't allocate, do
+    /// `@audio fn(...)`: a function the audio thread runs (§16.4), so it doesn't allocate, do
     /// IO, recurse or record GPU work, and captures nothing (it outlives the call).
     pub audio: bool,
 }

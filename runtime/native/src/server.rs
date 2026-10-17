@@ -1,4 +1,4 @@
-//! A server build's rooms (language.md §12): `server/game.wasm`, run one instance per room, each
+//! A server build's rooms (language.md §19): `server/game.wasm`, run one instance per room, each
 //! with a memory of its own (not shared), a cap on that memory, and a deadline on every call
 //! into it. A room is started by `serve_init` and woken by `serve`; nothing it calls blocks: a
 //! request it makes is answered when the call has returned, for the next call to read.
@@ -542,7 +542,7 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
             Ok(bytes.len() as i32)
         },
     )?;
-    // A phase's timing is for frames; a room ignores it (§6.15's `trace`).
+    // A phase's timing is for frames; a room ignores it (§17.3's `trace`).
     linker.func_wrap(
         IMPORT_MODULE,
         IMPORT_PHASE,

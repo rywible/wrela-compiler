@@ -1,11 +1,11 @@
-// Raw memory: what std's unsafe core is built on (language.md §6.14). Addresses are `u32`s, and
+// Raw memory: what std's unsafe core is built on (language.md §6.12). Addresses are `u32`s, and
 // nothing here is checked: a wrong address or size breaks the program's memory. Each function
 // can be called only inside `unsafe`, which only std's core uses.
 
 use std::abi::{PANIC, THREAD_BLOCKS, THREAD_BLOCK_SIZE}
 
 /// A destructor: what dropping a value does besides dropping its fields. Only std's core
-/// implements it (§18), for the types that own memory: `Vec`, `Box`.
+/// implements it (§21), for the types that own memory: `Vec`, `Box`.
 pub trait Drop {
     /// Frees what the value owns. The compiler calls it once, when the value is dropped.
     fn drop(mut self)

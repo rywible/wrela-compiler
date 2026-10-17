@@ -1,12 +1,12 @@
 // The logic of networked rooms: an ordered log for each room, in which every proposal is applied
-// exactly once (language.md §12). A room's server orders what its peers propose and keeps what
+// exactly once (language.md §19). A room's server orders what its peers propose and keeps what
 // it commits; its state changes only by a deterministic reducer of the committed entries. Every
 // peer applies them in the room's order with the same code, so every peer's committed state is
 // the room's. A peer shows its own proposals at once (its view) and rebases them on what the
 // room commits.
 //
 // This is the logic alone: what to send, what to keep and what to close come back as values,
-// and the hosts move the bytes (messages, §6.15) and keep the records durably.
+// and the hosts move the bytes (messages, §17.2) and keep the records durably.
 //
 // Exactly once, whatever is lost:
 // - A proposal's id is (peer, session, counter). A session's counters go 1, 2, 3, ... with no
@@ -49,7 +49,7 @@ pub struct Entry<T>: Clone + Pack {
 
 /// A room's state and how a proposal changes it. `check` says whether the room takes it and
 /// changes nothing; `apply` changes the state, for an entry `check` accepted. Both are checked
-/// as `@deterministic` code is (§14): the room and every peer run them on the same entries in
+/// as `@deterministic` code is (§12): the room and every peer run them on the same entries in
 /// the same order, and a room's log replayed must give its state again.
 pub trait Reduce<T> {
     /// Whether the room takes `entry`; the state doesn't change.

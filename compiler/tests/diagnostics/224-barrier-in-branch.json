@@ -38,7 +38,7 @@
       "labels": [],
       "message": "`row` is read here, and another invocation may still be writing it: there's no barrier since",
       "notes": [
-        "between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§6.13)"
+        "between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§18.5)"
       ],
       "severity": "error",
       "span": {

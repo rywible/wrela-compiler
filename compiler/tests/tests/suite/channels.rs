@@ -1,4 +1,4 @@
-//! Channels (AC5, language.md §17, D-002, D-026): compiler/tests/channels's `Tissue`, whose
+//! Channels (AC5, language.md §20, D-002, D-026): compiler/tests/channels's `Tissue`, whose
 //! `Blend` is derived field by field, on a body and a hoof joined by a smooth union.
 
 use crate::built;

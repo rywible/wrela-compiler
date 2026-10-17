@@ -36,7 +36,7 @@
 //!
 //! ## Messages
 //!
-//! A `Message` is bytes from a connection (language.md §12). Its event says how many; the
+//! A `Message` is bytes from a connection (language.md §17.2). Its event says how many; the
 //! program copies them with `wrela.payload(serial_lo, serial_hi, ptr, cap) -> length` ([`IMPORT_PAYLOAD`]),
 //! during the call that gave it the event and no later: the host keeps a message's bytes while
 //! its event is queued and during that call, then lets them go. A serial is never used twice
@@ -799,7 +799,7 @@ impl Queue {
         self.pair = pair;
     }
 
-    /// The build changed (a reload to another pair, language.md §12): queued messages and
+    /// The build changed (a reload to another pair, language.md §17.2): queued messages and
     /// connection events go, as their bytes were for the old build's types; the rest stay.
     pub fn drop_network(&mut self) {
         self.events.retain(|e| !e.kind.is_network());

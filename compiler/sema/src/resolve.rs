@@ -1134,7 +1134,7 @@ fn resolve_type_path(
         .flatten()
         .enumerate()
         .map(|(i, a)| match &a.kind {
-            // `Job<f>` takes a job, a function (§6.18): its type is the function's.
+            // `Job<f>` takes a job, a function (§16.3): its type is the function's.
             ast::TypeExprKind::Path(path)
                 if matches!(res, Res::Adt(j) if p.is_lang_adt(j, Lang::Job))
                     && let Some(Res::Fn(f)) = resolve_value_item(p, scope.module, path) =>

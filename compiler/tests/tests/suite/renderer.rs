@@ -101,7 +101,7 @@ fn a_kernel_writes_a_textures_texels() {
     }
 }
 
-/// Groups (§12): a kernel and a fragment shader each take one parameter of textures, a sampler,
+/// Groups (§18): a kernel and a fragment shader each take one parameter of textures, a sampler,
 /// a buffer's span and values (compiler/tests/groups). The left half, drawn from a group, is the
 /// right half, drawn from the same inputs one by one, to the bit; the kernel's group filled the
 /// texture they read.
@@ -128,7 +128,7 @@ fn halves_alike(pkg: &str, name: &str) {
     assert!(lit > (half * SIZE / 4) as usize, "only {lit} pixels show the filled texture");
 }
 
-/// Bound entry points as values (§12): the right half is drawn by entry points bound first, as
+/// Bound entry points as values (§18): the right half is drawn by entry points bound first, as
 /// values, and recorded by functions generic over `Kernel`, `VertexShader<V>` and
 /// `FragmentShader<V>` (compiler/tests/bound), with a buffer given whole where the left half
 /// gives a span of it. It's the left half, drawn by the same entry points bound where they're
@@ -188,7 +188,7 @@ fn the_browser_writes_texels_as_the_native_host_does() {
     hosts_agree_on("compiler/tests/texels", "texels-browser");
 }
 
-/// Texture formats (§12, compiler/tests/formats): a kernel writes r32uint, r32float and rgba8
+/// Texture formats (§18, compiler/tests/formats): a kernel writes r32uint, r32float and rgba8
 /// textures, passes draw into r16float, rg16float and r32uint ones (the last a fragment
 /// shader's `u32`), and each texel holds what was written. The screen's six bands are each a
 /// texture's texels checked against what they should be: green throughout.
@@ -220,7 +220,7 @@ fn the_browser_holds_each_format_as_the_native_host_does() {
     bands_green(&chrome, 6);
 }
 
-/// Dispatch over a domain (§12, compiler/tests/domains): kernels with no bounds check of their
+/// Dispatch over a domain (§18, compiler/tests/domains): kernels with no bounds check of their
 /// own, over 100, over (13, 7) and over a texture, each write exactly what they cover: the
 /// screen's three bands are each a dispatch's results checked, green throughout.
 #[test]

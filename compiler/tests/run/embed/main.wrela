@@ -1,4 +1,4 @@
-// run: `embed("path")` gives `Bytes` of a file in the package, read by the build (§10); it
+// run: `embed("path")` gives `Bytes` of a file in the package, read by the build (§13); it
 // passes as a `[u8]` (an argument, a borrow struct's field), and a constant can hold it or
 // compute from it
 // expect: len() = 5

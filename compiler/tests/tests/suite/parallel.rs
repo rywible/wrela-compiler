@@ -1,4 +1,4 @@
-//! Parallel jobs (AC6, language.md §6.12): compiler/tests/parallel steps 10,000 particles with
+//! Parallel jobs (AC6, language.md §16.1): compiler/tests/parallel steps 10,000 particles with
 //! `par_each_mut` and sums their energy with `par_map_reduce` each frame. The results, and the
 //! state hash (which covers every particle each frame), are the same with 1, 2, 4 and 8
 //! workers: on the CPU host here, in the native host and in headless Chrome

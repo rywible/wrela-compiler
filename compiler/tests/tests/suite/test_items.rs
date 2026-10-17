@@ -1,4 +1,4 @@
-//! `@test` functions and `wrela test` (language.md §10): each test of the program package runs
+//! `@test` functions and `wrela test` (language.md §13): each test of the program package runs
 //! as the build runs constants, in the order written, and passes unless it panics. A failed one
 //! is E0706 at the innermost frame in the program's own code, with the call chain; one that
 //! runs away is E0705. Tests aren't part of a build, and a dependency's tests don't run.
@@ -356,7 +356,7 @@ fn std_tests_pass() {
     assert!(out.results.len() >= 5, "{} of std's tests ran", out.results.len());
 }
 
-/// Frame tests (§10): `init`, then the frames at 60 a second on a 640 × 480 screen, then the
+/// Frame tests (§13): `init`, then the frames at 60 a second on a 640 × 480 screen, then the
 /// test with the program's state, on the native host's CPU, which answers storage requests.
 /// A failure says in which call it happened, at the program's own code; tests of code run
 /// beside them, all in the order written.
@@ -556,7 +556,7 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     );
 }
 
-/// Frame tests on the GPU (§10, `@test(frames: n, gpu: true)`): compiler/tests/gpu-frames has a
+/// Frame tests on the GPU (§13, `@test(frames: n, gpu: true)`): compiler/tests/gpu-frames has a
 /// kernel square numbers and reads them back between frames; one test finds the squares, and
 /// one that expects a wrong square fails with the values it compared. Its frames draw a ramp:
 /// the screen is within its golden, and far from a black one.
@@ -583,7 +583,7 @@ fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
 }
 
 /// A golden is written by `--bless` (`wrela test --bless`), from this machine's screen, and a
-/// test with none fails saying so (§10).
+/// test with none fails saying so (§13).
 #[test]
 #[ignore = "needs a GPU"]
 fn a_golden_is_blessed_from_the_screen() {

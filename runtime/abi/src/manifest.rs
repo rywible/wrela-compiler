@@ -41,7 +41,7 @@
 //!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
 //!   format and `slope_scale` times the triangle's depth slope, at most `clamp` (when not 0)
 //!   in size: WebGPU's `depthBias`, `depthBiasSlopeScale` and `depthBiasClamp`. None of these
-//!   may be given at run time, so a program states them where it draws (language.md §12).
+//!   may be given at run time, so a program states them where it draws (language.md §18).
 
 use crate::Limits;
 pub use crate::stream::Compare;

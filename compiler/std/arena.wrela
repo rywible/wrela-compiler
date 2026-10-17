@@ -223,13 +223,13 @@ impl<T> Arena<T> {
     }
 
     /// Calls `f` on each value, which it may change, in parallel: `Vec::par_each_mut` over the
-    /// values in iteration order (§6.12).
+    /// values in iteration order (§16.1).
     pub fn par_each_mut(mut self, f: @parallel fn(mut T)) {
         self.values.par_each_mut(f)
     }
 
     /// `map`s each value and `reduce`s the results, in parallel: `Vec::par_map_reduce` over the
-    /// values in iteration order (§6.12).
+    /// values in iteration order (§16.1).
     pub fn par_map_reduce<R: Clone>(
         self,
         init: R,

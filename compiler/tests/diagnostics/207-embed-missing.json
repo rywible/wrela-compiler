@@ -10,7 +10,7 @@
       "labels": [],
       "message": "`embed` can't read `levels/one.bin`: there's no such file in the package",
       "notes": [
-        "a path is relative to the package's root: the directory with `main.wrela` (§10)"
+        "a path is relative to the package's root: the directory with `main.wrela` (§13)"
       ],
       "severity": "error",
       "span": {

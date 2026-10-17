@@ -1,4 +1,4 @@
-//! Messages (language.md §12, runtime/abi `input`'s Messages): a message is an event whose bytes
+//! Messages (language.md §17.2, runtime/abi `input`'s Messages): a message is an event whose bytes
 //! the program reads (`std::input::payload`) in the call that was given it, and no later. Both
 //! the client's host and the server's rooms give them; a tick never does.
 

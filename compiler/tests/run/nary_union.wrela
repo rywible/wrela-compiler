@@ -1,5 +1,5 @@
 // run: a fixed array of surfaces joins with `union()` and `smooth_union(k)`, folding in order:
-// the same distance as the chained binary combinators, bit for bit (std::field, §17)
+// the same distance as the chained binary combinators, bit for bit (std::field, §20)
 // expect: union_gap(0.45) = 0.0
 // expect: union_gap(2.0) = 0.0
 // expect: smooth_gap(0.45) = 0.0

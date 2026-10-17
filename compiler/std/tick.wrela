@@ -1,4 +1,4 @@
-// The ticker: a simulation step at a fixed rate, on a thread of its own (language.md §6.17).
+// The ticker: a simulation step at a fixed rate, on a thread of its own (language.md §16.2).
 // `start` moves a state, a step and a hash to the ticker's thread, where the host steps
 // the state `hz` times a second. Each tick gets its number, its length and the input events
 // the host stamped at its start (its records), and nothing else: no clock, and nothing that

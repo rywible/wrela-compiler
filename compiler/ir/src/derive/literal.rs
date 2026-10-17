@@ -1,5 +1,5 @@
-//! Parameter gradients (language.md §20): how a function's value changes with a lifted build's
-//! literals, by the same forward-mode derivation as `gradient` (§13).
+//! Parameter gradients (language.md §23): how a function's value changes with a lifted build's
+//! literals, by the same forward-mode derivation as `gradient` (§14).
 //!
 //! A lifted literal is a read of the program's table (`Load(table[i])`), deep in whatever code
 //! reads it. The derivation makes the table an input: each function the derived one reaches

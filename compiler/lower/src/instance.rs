@@ -19,13 +19,13 @@ pub enum InstanceKey {
     },
     /// A closure in `owner`'s body, lifted to a function of its captures and parameters.
     Closure { owner: Rc<InstanceKey>, id: ClosureId },
-    /// A derived interpretation of a callable (language.md §13).
+    /// A derived interpretation of a callable (language.md §14).
     /// `output`: an interval's result type (its range is that type's box), or what a value and
     /// gradient carries beside them (`value_gradient_with`'s `T`).
     Derived { of: Callable, kind: DeriveKind, input: TyId, output: Option<TyId> },
     /// Drop or clone glue for a concrete type (`crate::glue`).
     Glue { kind: crate::glue::GlueKind, ty: TyId },
-    /// A job's `resume` (§6.18): its body, from where its value says it stopped to its next
+    /// A job's `resume` (§16.3): its body, from where its value says it stopped to its next
     /// `yield` or its end (`crate::job`); `substs` are the job's generics.
     JobResume { func: FnId, substs: Vec<TyId> },
 }
@@ -38,10 +38,10 @@ pub enum DeriveKind {
     Interval,
     /// The value box-filtered over a footprint (`filtered`): `f32`.
     Filtered,
-    /// A parameter gradient (§20): the value and its derivative by each of some lifted
+    /// A parameter gradient (§23): the value and its derivative by each of some lifted
     /// literals. `input` is the literals' array type, `output` the result's.
     Literals,
-    /// The lifted literals the callable can read (§20): `output` is the run's type.
+    /// The lifted literals the callable can read (§23): `output` is the run's type.
     Reads,
 }
 
@@ -50,7 +50,7 @@ pub enum DeriveKind {
 pub enum Bound {
     /// A run, a span, a `Slots`, a texture or a sampler: its resource.
     One(ir::ResourceId),
-    /// A group (a borrow struct, §12): each field's, `None` for a field passed as a value.
+    /// A group (a borrow struct, §18): each field's, `None` for a field passed as a value.
     Group(Vec<Option<Bound>>),
 }
 

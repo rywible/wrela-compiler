@@ -1,4 +1,4 @@
-//! Parallel jobs (`std::par`, language.md §6.12). `par_each(chunks, args...)` (and
+//! Parallel jobs (`std::par`, language.md §16.1). `par_each(chunks, args...)` (and
 //! `par_map_reduce`) runs its chunk function, `par_each_chunk(chunk, chunks, args...)`, for each
 //! chunk on this thread and on the program's workers. The job becomes a task: a function of a
 //! context address and a chunk, called by index from the module's table. The context holds the

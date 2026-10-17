@@ -20,7 +20,7 @@
 //! - exports `frame(time: f32, width: u32, height: u32)`, which the host calls once per frame
 //!   with the seconds since the program started and the canvas size in pixels;
 //! - may export `init()`, which the host calls once, after instantiating the module and before
-//!   anything else: a program with state makes it there (language.md §12);
+//!   anything else: a program with state makes it there (language.md §15);
 //! - imports `wrela.submit(ptr: i32, len: i32)`, which hands the host a batch of commands: `len`
 //!   bytes at `ptr` in its memory (see [`stream`]); and may import
 //!   `wrela.request_status(request: i32) -> i32` and `wrela.request_take(request: i32, ptr: i32)`,
@@ -71,7 +71,7 @@ pub const IMPORT_REQUEST_STATUS: &str = "request_status";
 pub const IMPORT_REQUEST_TAKE: &str = "request_take";
 pub const IMPORT_LIMIT: &str = "limit";
 /// `wrela.audio(task, context)`: starts the program's voice, which the audio thread renders by
-/// calling [`EXPORT_AUDIO`] with the same two numbers (language.md §6.13). Once per program.
+/// calling [`EXPORT_AUDIO`] with the same two numbers (language.md §16.4). Once per program.
 pub const IMPORT_AUDIO: &str = "audio";
 /// `wrela.tick(task, context, hz)`: starts the program's ticker, which the ticker's thread
 /// steps `hz` times a second by calling [`EXPORT_TICK`] with the two numbers and the tick's
@@ -89,7 +89,7 @@ pub const EXPORT_AUDIO: &str = "__audio";
 /// with the records at [`memory::TICK_RECORDS`], on the ticker's thread
 /// ([`memory::THREAD_TICK`]), on its own instance of the module, with the same memory.
 pub const EXPORT_TICK: &str = "__tick";
-/// `__lift_set(literal, value)`: in a lifted build (language.md §20), changes a literal's value,
+/// `__lift_set(literal, value)`: in a lifted build (language.md §23), changes a literal's value,
 /// as `std::lift::set` does: code reads the new one from its next call, on the CPU and the GPU.
 /// A host calls it on the program's thread, between calls (a tool's edit, hot reload).
 pub const EXPORT_LIFT_SET: &str = "__lift_set";
@@ -158,14 +158,14 @@ pub const HOST_FUNCTIONS: [HostFunction; 13] = [
 
 /// The export the host calls each frame.
 pub const EXPORT_FRAME: &str = "frame";
-/// The export a program with state has (language.md §12): the host calls it once, after
+/// The export a program with state has (language.md §15): the host calls it once, after
 /// instantiating the program and before any other export.
 pub const EXPORT_INIT: &str = "init";
-/// A server build's exports (language.md §12): the server host calls `serve_init` once, when it
+/// A server build's exports (language.md §15): the server host calls `serve_init` once, when it
 /// starts the program, and `serve` whenever something happens (an event, a timer).
 pub const EXPORT_SERVE_INIT: &str = "serve_init";
 pub const EXPORT_SERVE: &str = "serve";
-/// The custom section both of a program's builds carry (language.md §12): eight bytes,
+/// The custom section both of a program's builds carry (language.md §15.3): eight bytes,
 /// little-endian, the [`pair_id`] of its client and server modules, which a client and a server
 /// compare to know they're one program's.
 pub const PAIR_SECTION: &str = "wrela.pair";

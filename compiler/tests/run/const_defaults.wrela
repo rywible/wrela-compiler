@@ -1,5 +1,5 @@
 // run: a default that isn't a literal is a constant expression, computed once by the build
-// (language.md §3, §10): arithmetic, units, constants and calls, for parameters and fields. A
+// (language.md §3, §13): arithmetic, units, constants and calls, for parameters and fields. A
 // default that isn't `Copy` is cloned where it's owned, and a borrowed parameter reads it in place.
 // expect: reach() = 2.15
 // expect: tolerance() = 0.001

@@ -92,7 +92,7 @@ pub fn build(p: &Program, consts: &Consts, f: FnId, body: &thir::Body) -> (Body,
 
 /// Whether a constant's value is literal all the way down: literals, text, and struct, enum,
 /// tuple, array and vector literals of them, and other such constants. Lowering folds it; any
-/// other constant is computed by the build (§10).
+/// other constant is computed by the build (§13).
 pub fn is_literal(consts: &Consts, e: &thir::Expr) -> bool {
     match &e.kind {
         ExprKind::Lit(_) | ExprKind::Text(_) | ExprKind::Embed(_) => true,
@@ -509,7 +509,7 @@ impl<'a> Builder<'a> {
     /// projection-returning call returned.
     fn is_named_place(&self, e: &thir::Expr) -> bool {
         match &e.place_root().kind {
-            // A constant is a place that lives as long as the program (§10).
+            // A constant is a place that lives as long as the program (§13).
             ExprKind::Local(_) | ExprKind::Const(_) => true,
             ExprKind::Call(c) => c.ret_mode != RetMode::Owned,
             _ => false,
@@ -1398,7 +1398,7 @@ impl<'a> Builder<'a> {
     }
 
     /// A dispatch's or draw's argument: a buffer passed `mut buf` is bound mutably, so while
-    /// the GPU writes it nothing else reaches it (§6.13); anything else is borrowed.
+    /// the GPU writes it nothing else reaches it (§18.3); anything else is borrowed.
     fn gpu_arg(&mut self, a: &thir::Expr) -> Option<Place> {
         match &a.kind {
             ExprKind::MutArg(x) => {
