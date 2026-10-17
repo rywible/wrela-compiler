@@ -17,6 +17,7 @@ import { type Inbox, Net } from "./net.ts";
 import { type PrintSink, type Program, type ProgramOptions, runWorker, type SpawnWorker } from "./program.ts";
 import type { FromHelper, FromTicker, FromWorker, Loaded, Replay, TickerOptions, TickerStart, TickReport, ToWorker, VoiceOptions } from "./messages.ts";
 import { encodePng } from "./png.ts";
+import { Resampler } from "./resample.ts";
 import { frameTime, holdFor, inputUrl, loaded, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 import { lockstepTicks, runTicker, TickerControl, TickerMode } from "./ticker.ts";
 import { wasmHash } from "./ticks.ts";
@@ -65,14 +66,18 @@ const net = new Net(
 );
 
 /** Gives the program the events the main thread has written, and what its connections had: it
- * reads them in its next call. The input's times, for the latency test. */
-function deliverInput(program: Program): readonly number[] {
+ * reads them in its next call. A frame shown at `frame` (ms since 1970) gets a held pointer's moves
+ * resampled to it (resample.ts); the latency test's, as they came. The input's times, for that
+ * test. */
+function deliverInput(program: Program, frame: number | null = null): readonly number[] {
   net.deliver(program.inbox);
   if (!ring) return [];
   const { events, times } = ring.read();
-  program.queueInput(events);
+  program.queueInput(frame === null ? events : resampler.take(events, times, frame));
   return times;
 }
+
+const resampler = new Resampler();
 
 /** Stops everything and reports `e`: to the page, and in test mode to `results/DONE`. A trap in
  * an optimized build is reported once its location is fetched (`locate`). */
@@ -383,7 +388,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
           canvas.width = width;
           canvas.height = height;
         }
-        deliverInput(program);
+        deliverInput(program, performance.timeOrigin + now);
         executor.presented = false;
         executor.frame = frames;
         program.frame(time, width, height);

@@ -111,6 +111,24 @@ test("a finger's move is where it is, never where the browser predicts it", () =
   expect(ring.read().events).toEqual(pointerEvent(EventKind.PointerMove, 30, 40, 0, 0));
 }));
 
+test("a held pointer's samples are written once each, when the browser read them", () => onPage((page) => {
+  const canvas = page.createElement("canvas");
+  const ring = InputRing.create();
+  listen(canvas as unknown as HTMLCanvasElement, ring, () => 1000 + performance.now(), () => ({ width: 100, height: 100 }));
+  const at = (e: Event, timeStamp: number) => Object.defineProperty(e, "timeStamp", { value: timeStamp });
+  const t0 = performance.now() - 50;
+  canvas.dispatchEvent(at(domEvent("pointerdown", { clientX: 0, clientY: 0, pointerId: 1, pointerType: "touch", button: 0 }), t0));
+  ring.read();
+  const a = { clientX: 0, clientY: 10, timeStamp: t0 + 4 };
+  const b = { clientX: 0, clientY: 20, timeStamp: t0 + 8 };
+  // Taken as it's read, then again among a move's coalesced samples: written once.
+  canvas.dispatchEvent(at(domEvent("pointerrawupdate", { clientX: a.clientX, clientY: a.clientY, pointerId: 1, getCoalescedEvents: () => [a] }), a.timeStamp));
+  canvas.dispatchEvent(at(domEvent("pointermove", { clientX: b.clientX, clientY: b.clientY, pointerId: 1, getCoalescedEvents: () => [a, b] }), b.timeStamp));
+  const { events, times } = ring.read();
+  expect(events).toEqual(new Uint8Array([...pointerEvent(EventKind.PointerMove, 0, 10, 0, 0), ...pointerEvent(EventKind.PointerMove, 0, 20, 0, 0)]));
+  expect(times.map((t) => Math.round(t - 1000 - t0))).toEqual([4, 8]);
+}));
+
 const bytes = (events: Uint8Array[]) => new Uint8Array(events.flatMap((e) => [...e]));
 const chars = (text: string) => [...text].map((c) => textEvent(c.codePointAt(0)!));
 

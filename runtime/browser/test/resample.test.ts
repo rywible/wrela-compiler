@@ -1,0 +1,70 @@
+// A held pointer's moves resampled to the frames (src/resample.ts).
+
+import { expect, test } from "bun:test";
+import { EVENT_SIZE, EventKind } from "../src/abi.gen.ts";
+import { keyEvent, pointerEvent } from "../src/input.ts";
+import { Resampler } from "../src/resample.ts";
+
+const join = (events: Uint8Array[]) => new Uint8Array(events.flatMap((e) => [...e]));
+
+/** Each event's kind and position. */
+function read(bytes: Uint8Array): { kind: number; x: number; y: number }[] {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  return Array.from({ length: bytes.length / EVENT_SIZE }, (_, i) => ({
+    kind: view.getUint32(i * EVENT_SIZE, true),
+    x: view.getFloat32(i * EVENT_SIZE + 8, true),
+    y: view.getFloat32(i * EVENT_SIZE + 12, true),
+  }));
+}
+
+test("a held finger moves evenly from frame to frame, however unevenly its moves arrive", () => {
+  const r = new Resampler();
+  const frame = 1000 / 60;
+  // A finger moving 1 px a ms, sampled every 4 ms; frame n reads the samples that arrived by
+  // then, some a frame late, in a fixed uneven pattern.
+  r.take(pointerEvent(EventKind.PointerDown, 0, 0, 0, 0), [0], 0);
+  const late = [false, true, false, false, true, true, false, false, true, false];
+  const ys: number[] = [];
+  let next = 4;
+  for (let n = 1; n <= 60; n++) {
+    const now = n * frame;
+    const cut = late[n % late.length] ? now - frame : now;
+    const events: Uint8Array[] = [];
+    const times: number[] = [];
+    while (next <= cut) {
+      events.push(pointerEvent(EventKind.PointerMove, 0, next, 0, 0));
+      times.push(next);
+      next += 4;
+    }
+    const moves = read(r.take(join(events), times, now));
+    expect(moves.length).toBeLessThanOrEqual(1);
+    if (moves.length === 1) ys.push(moves[0]!.y);
+  }
+  // Once settled, each frame moves the finger's speed times a frame, give or take a tenth.
+  const steps = ys.slice(20).map((y, i, a) => (i > 0 ? y - a[i - 1]! : frame)).slice(1);
+  expect(steps.length).toBeGreaterThan(30);
+  for (const s of steps) expect(Math.abs(s - frame)).toBeLessThan(frame * 0.1);
+  // A frame and a half behind the newest sample, about.
+  expect(ys[ys.length - 1]!).toBeGreaterThan(60 * frame - 3 * frame);
+});
+
+test("a finger that rests is shown where it rests", () => {
+  const r = new Resampler();
+  r.take(pointerEvent(EventKind.PointerDown, 5, 5, 0, 0), [0], 0);
+  let last = { kind: 0, x: 0, y: 0 };
+  for (const e of read(r.take(pointerEvent(EventKind.PointerMove, 5, 40, 0, 0), [8], 16))) last = e;
+  for (let n = 2; n < 20; n++) for (const e of read(r.take(new Uint8Array(0), [], n * 16))) last = e;
+  expect(last).toEqual({ kind: EventKind.PointerMove, x: 5, y: 40 });
+});
+
+test("a press, a release, a move with nothing held and other events pass as they come", () => {
+  const r = new Resampler();
+  const hover = pointerEvent(EventKind.PointerMove, 3, 4, 0, 0);
+  const down = pointerEvent(EventKind.PointerDown, 3, 4, 0, 0);
+  const key = keyEvent(true, 1, false, 0);
+  expect(r.take(join([hover, down, key]), [0, 1, 2], 10)).toEqual(join([hover, down, key]));
+  // A release comes after the frame's move, and a move after it isn't held.
+  const out = read(r.take(join([pointerEvent(EventKind.PointerMove, 3, 30, 0, 0), pointerEvent(EventKind.PointerUp, 3, 30, 0, 0), pointerEvent(EventKind.PointerMove, 9, 9, 0, 0)]), [20, 21, 22], 30));
+  expect(out.map((e) => e.kind)).toEqual([EventKind.PointerMove, EventKind.PointerUp, EventKind.PointerMove]);
+  expect(out[2]).toEqual({ kind: EventKind.PointerMove, x: 9, y: 9 });
+});

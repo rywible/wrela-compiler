@@ -111,9 +111,12 @@ export function listen(
     const sy = r.height > 0 ? height / r.height : 1;
     return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy] as const;
   };
-  const put = (event: Uint8Array) => ring.write(event, now());
+  const put = (event: Uint8Array, time = now()) => ring.write(event, time);
+  // When the browser read a pointer's event, on `now`'s clock: its time stamp is the screen's.
+  const read = (e: Event) => now() - Math.min(Math.max(performance.now() - e.timeStamp, 0), 100);
   const keys = new Set<number>();
-  const pointers = new Map<number, { x: number; y: number; buttons: Set<number> }>();
+  // Each held pointer: where it is, its buttons, and its newest sample written's time stamp.
+  const pointers = new Map<number, { x: number; y: number; buttons: Set<number>; stamp: number }>();
   const releasePointer = (id: number) => {
     const pointer = pointers.get(id);
     if (!pointer) return;
@@ -200,25 +203,39 @@ export function listen(
   window.addEventListener("copy", copy);
   window.addEventListener("cut", copy);
 
-  const move = (e: PointerEvent) => {
-    // Coalesced moves arrive as one: the program needs where the pointer is, not each step.
-    const [x, y] = at(e);
+  // A held pointer's samples, each once, when the browser read it: the worker shows the pointer
+  // between them (resample.ts). They're taken as they're read (`pointerrawupdate`, where the
+  // browser has it), as a frame's moves come together later; and from a move's coalesced
+  // samples, which have those. Where the pointer is, never where the browser predicts it: a
+  // prediction overshoots as a finger slows or turns.
+  const sample = (e: PointerEvent) => {
     const pointer = pointers.get(e.pointerId);
-    if (pointer) Object.assign(pointer, { x, y });
-    // Where the pointer is, never where the browser predicts it: a prediction overshoots as a
-    // finger slows or turns, and what the finger drags would shake under it.
+    if (!pointer) return;
+    const steps = typeof e.getCoalescedEvents === "function" ? e.getCoalescedEvents() : [];
+    for (const step of steps.length > 0 ? steps : [e]) {
+      if (step.timeStamp <= pointer.stamp) continue;
+      pointer.stamp = step.timeStamp;
+      const [x, y] = at(step);
+      Object.assign(pointer, { x, y });
+      put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)), read(step));
+    }
+  };
+  const move = (e: PointerEvent) => {
+    if (pointers.has(e.pointerId)) return sample(e);
+    const [x, y] = at(e);
     put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
   };
   canvas.addEventListener("pointermove", move);
+  canvas.addEventListener("pointerrawupdate", sample as EventListener);
   const press = (e: PointerEvent) => {
     canvas.setPointerCapture(e.pointerId);
     const [x, y] = at(e);
     const button = buttonOf(e.button);
-    const pointer = pointers.get(e.pointerId) ?? { x, y, buttons: new Set<number>() };
-    Object.assign(pointer, { x, y });
+    const pointer = pointers.get(e.pointerId) ?? { x, y, buttons: new Set<number>(), stamp: 0 };
+    Object.assign(pointer, { x, y, stamp: e.timeStamp });
     pointer.buttons.add(button);
     pointers.set(e.pointerId, pointer);
-    put(pointerEvent(EventKind.PointerDown, x, y, button, modifiersOf(e)));
+    put(pointerEvent(EventKind.PointerDown, x, y, button, modifiersOf(e)), read(e));
     e.preventDefault();
     // A press on the canvas gives it the keys back from the overlay, or to the field drawn there;
     // text mode keeps its field.
