@@ -20,7 +20,9 @@
 //   A room is rebuilt from its records (`Room::replay`), and the reducer is deterministic
 //   (`Reduce`, checked as `@deterministic` code is), so it's rebuilt exactly.
 
-use std::pack::{Budget, Pack, pack, unpack_within}
+use std::host::request
+use std::input::{Event, events, payload}
+use std::pack::{Budget, Pack, pack, unpack, unpack_within}
 
 /// A proposal's identity: who made it, in which of their sessions, and its number in that
 /// session, from 1.
@@ -1496,4 +1498,143 @@ fn a_connection_says_hello_once() {
         0,
     )
     assert(again.closes == Vec::from([1]) && again.records.is_empty())
+}
+
+// The host's network commands: a client's connections to its server's rooms, and a room's
+// journal and connections. The hosts carry the bytes and keep the records durably; the host
+// never answers these commands.
+//
+// A client opens a connection to a room by a number it chooses: a `Connection` event says when
+// it's open, and exactly one says when it's closed, whatever closes it; its messages come between.
+//
+// What the host does with a call's commands: it keeps every record the call gave it (`keep`,
+// `compact`) durably, in order, before it sends anything the call sent (`send`) or closes what
+// it closed (`close`). If it can't keep them, it sends nothing and starts the room again from
+// what it had kept.
+//
+// A server tags a connection (`tag`) with what it learned of it, such as its peer: when the host
+// starts the room again on a fresh instance, the `Connection` events that tell it of its open
+// connections carry their tags.
+
+/// The connection a room's journal comes from: before any live connection's events, the server
+/// host gives a room it starts its kept records, oldest first, as messages from this one.
+pub const JOURNAL: u32 = 0
+
+/// The bit the host sets on a connection's number when it gives back a message that trapped the
+/// room alone, on a fresh instance (`Room::poisoned`).
+pub const POISONED: u32 = 2147483648
+
+/// A room compacts once its journal holds this many records past its snapshot.
+pub const COMPACT_AFTER: u64 = 1024
+
+fn word(bytes: mut Vec<u8>, x: u32) {
+    for k in 0..4 {
+        bytes.push(u8((x >> (8 * k)) & 255))
+    }
+}
+
+/// Keeps `record` (a packed `Record`) at the end of the room's journal.
+@server
+pub fn keep(record: [u8]) {
+    let _ = request("net/keep", record)
+}
+
+/// Replaces the room's journal with `snapshot` (a packed `Record::Snapshot`): the host writes it
+/// whole, then drops the records before it.
+@server
+pub fn compact(snapshot: [u8]) {
+    let _ = request("net/compact", snapshot)
+}
+
+/// Opens connection `conn` (a number not open) to room `room` of the program's server: 1 to 64 of
+/// a-z, 0-9, `-` and `_`. The browser host finds the server in `net.json` beside the build.
+@client
+pub fn open(conn: u32, room: str) {
+    var body: Vec<u8> = Vec::with_capacity(4 + room.len())
+    word(mut body, conn)
+    for i in 0..room.len() {
+        body.push(room.byte(i))
+    }
+    let _ = request("net/open", body)
+}
+
+/// Sends `bytes` on connection `conn`: on a server, once the call's records are kept. Bytes for a
+/// connection that has closed go nowhere.
+pub fn send(conn: u32, bytes: [u8]) {
+    var body: Vec<u8> = Vec::with_capacity(4 + bytes.len())
+    word(mut body, conn)
+    for b in bytes {
+        body.push(b)
+    }
+    let _ = request("net/send", body)
+}
+
+/// Closes connection `conn`, after the call's sends.
+pub fn close(conn: u32) {
+    var body: Vec<u8> = Vec::new()
+    word(mut body, conn)
+    let _ = request("net/close", body)
+}
+
+/// Tags connection `conn` with `tag`, once the call's records are kept: the `Connection` event
+/// that tells a room started again of the connection carries it.
+@server
+pub fn tag(conn: u32, tag: u32) {
+    var body: Vec<u8> = Vec::new()
+    word(mut body, conn)
+    word(mut body, tag)
+    let _ = request("net/tag", body)
+}
+
+/// Carries out a room's step: its records kept, then its tags, sends and closes.
+@server
+pub fn carry_out<S: Clone + Pack, T: Clone + Pack>(step: Step<S, T>) {
+    for r in step.records {
+        keep(pack(r.clone()))
+    }
+    for t in step.tags {
+        tag(t.0, t.1)
+    }
+    for s in step.sends {
+        send(s.0, s.1)
+    }
+    for c in step.closes {
+        close(c)
+    }
+}
+
+/// Runs a room for a server's `serve`, at the room's time `at` (milliseconds): reads the events
+/// since the last call (after a start, its journal first) and carries out what the room makes of
+/// them, compacting its journal once it's long. A journal record this program can't read means
+/// the journal isn't its own: that's a panic, and the host keeps the room closed.
+@server
+pub fn serve_room<S: Reduce<T> + Clone + Pack, T: Clone + Pack>(room: mut Room<S, T>, at: u64) {
+    for e in events() {
+        match e {
+            Event::Message { conn, .. } => {
+                let Some(bytes) = payload(e) else { continue }
+                if conn == JOURNAL {
+                    match unpack::<Record<S, T>>(take bytes) {
+                        Ok(r) => room.restore(r),
+                        Err(_) => panic("a journal record this program can't read"),
+                    }
+                } else if conn >= POISONED {
+                    carry_out(room.poisoned(conn - POISONED, take bytes))
+                } else {
+                    carry_out(room.receive(conn, take bytes, at))
+                }
+            },
+            Event::Connection { conn, open, tag } => {
+                if open {
+                    room.opened(conn, tag)
+                } else {
+                    room.closed(conn)
+                }
+            },
+            _ => {},
+        }
+    }
+    if room.since_snapshot() > COMPACT_AFTER {
+        compact(pack(room.compact()))
+    }
 }

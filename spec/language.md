@@ -1719,7 +1719,7 @@ cook_again: the light's literals change ──► s.light, s.air reloaded
 
 A program asks its host for IO, GPU readback and other work through requests that it polls, and reads input, prints lines and reads the clock through the host's other services.
 
-The services are `platform::host`'s and std's functions over one ABI (`runtime/abi`), which both hosts implement alike. What a program asks of its host is `io` to make, and what it reads back is `nondet` (§8.1), so `@deterministic` code takes the host's answers as data, through a tick's records (§16.2).
+The services are `std::host`'s and std's functions over one ABI (`runtime/abi`), which both hosts implement alike. What a program asks of its host is `io` to make, and what it reads back is `nondet` (§8.1), so `@deterministic` code takes the host's answers as data, through a tick's records (§16.2).
 
 ### 17.1 Requests, not async
 
@@ -1746,13 +1746,14 @@ A game already has a suspension point, the tick or the frame, so the language do
 
 #### Application services
 
-`std::host::request(service, bytes)` uses the same `Pending<u8>` model for the capabilities of an application host.
+`std::host` gives a client the services of an application host: the page's environment, decoding images, the cursor and icons, other programs shown in this one's place and the messages between them, files the user imports or exports, the clipboard, text input, the semantic tree and the page's address. Each service is a function that makes one request and gives a `Pending<u8>`.
 
-- The service name is a relative path. The payload and the reply are opaque bytes.
-- An unsupported service fails as an ordinary IO request.
-- The shared command ABI and both hosts carry the request; Wrela packages own the protocol schemas and the policy. The compiler knows no application service names.
+- Underneath, each is `std::host::request(service, bytes)`: a service name, a relative path, and bytes that only the service reads. `request` is `pub(package)`, so only std's own functions reach it (E0203): a program asks for a service through its function.
+- std owns each service's bytes, the request's and the answer's, and the hosts implement them. So one toolchain release ships both sides of every host contract. The compiler still knows no service names: the services are ordinary std code, not items of the closed list (§20.1).
+- Each service's function is `@client`, so a server build can't reach it (E0708). A host that doesn't have a service fails the request, as an IO request fails: the native client host has none of a browser's application services.
 - The command buffer bounds a request. Reading an answer has the same `nondet` effect as the other requests.
-- Examples are an embedded application's message channel and a file that the user selects. These mechanisms are not specific to games.
+- **`std::host::custom(service, bytes)`** asks for a service that the program's embedding host defines, named `app/<service>` (a Rust program that embeds the native or server host answers it, `wrela_host`'s handlers). No host of the toolchain's own has one. It is the one public request, and its names can't be a toolchain service's.
+- Protocols between programs, such as an embedded program's messages with the program that shows it, are the packages' own: std carries their bytes and never reads them.
 
 ### 17.2 Input and messages
 
@@ -1766,7 +1767,7 @@ Input (`std::input`) is the pointer, the keyboard and up to four gamepads. `even
 - `Event::Assist` is what a person or an assistive technology does to a node of the program's semantic tree (`std::semantics`), by the node's number.
 - `Event::Field` says that a text field's text changed. The host keeps the text, and the program reads it by revision.
 
-All are host services, `platform::host`. Positions are in the same pixels as `frame`'s width and height. `Input` keeps what is held and where the pointer is, from the events it is given: `input.read()` reads them, and `input.update(events)` takes them as data.
+All are host services, `std::host`. Positions are in the same pixels as `frame`'s width and height. `Input` keeps what is held and where the pointer is, from the events it is given: `input.read()` reads them, and `input.update(events)` takes them as data.
 
 A call reads only the events that arrived before it started, in the same order on both hosts. The native host plays a script of them (`wrela-host --input script.json`, and a frame test's `@test(frames: n, input: "script.json")`, §13.2). A browser delivers each event to the program's next frame.
 
@@ -2140,7 +2141,7 @@ Every peer applies the committed entries in the room's order, with the same code
 - A room's host keeps each step's records durably before it sends what follows them. So a room rebuilt from its records (`Room::replay`) is the same room.
 - A seeded model of a network checks this over 10,000 runs, with connections that drop, a server that crashes and loses what it had not kept, and a room that compacts. Every peer ends with the room's state and every proposal the reducer took, once.
 
-**Who may propose:** a room takes a proposal only from its peer's connection, whose hello carried the peer's token. The room tags that connection with the peer (`platform::net::tag`), so a room that its host starts again knows it. A peer's id, which every entry shows, proves nothing. A connection says hello once; the room refuses a second hello (`HELLO_AGAIN`).
+**Who may propose:** a room takes a proposal only from its peer's connection, whose hello carried the peer's token. The room tags that connection with the peer (`std::net::tag`), so a room that its host starts again knows it. A peer's id, which every entry shows, proves nothing. A connection says hello once; the room refuses a second hello (`HELLO_AGAIN`).
 
 **Catching up and compaction:**
 
@@ -2150,7 +2151,7 @@ Every peer applies the committed entries in the room's order, with the same code
 
 ### 19.2 Durable rooms
 
-The server host keeps each room durably (`wrela_host::rooms`). `platform::net`'s `serve_room` runs a room for `serve`. The host writes each call's records (`keep`, `compact`) to the room's journal, flushed to disk, before it sends anything the call sent. A room that starts reads its journal back first.
+The server host keeps each room durably (`wrela_host::rooms`). `std::net`'s `serve_room` runs a room for `serve`. The host writes each call's records (`keep`, `compact`) to the room's journal, flushed to disk, before it sends anything the call sent. A room that starts reads its journal back first.
 
 - The journal's header names its format, the server build's WASM hash and the room. The host does not read a journal of another build or room.
 - Each record carries a CRC-32C. A record cut short by a crash ends the journal.
@@ -2184,7 +2185,7 @@ A journal that the program traps on, or a poisoned message that it traps on, qua
 - The browser closes a connection with more than 1 MiB waiting to be written, or whose messages would hold more than 16 MiB waiting for the program.
 - A room's state must pack into one host request (1 MiB) to compact, and into one frame (64 KiB) to be sent to a peer that is far behind. Larger states are not split.
 
-**Clients:** a client opens connection `conn` to a room with `platform::net::open(conn, room)` (`@client`), and uses `send` and `close` as a server does. Each connection it opens gives one `Connection` event when it is open, and exactly one when it is closed, whatever closes it.
+**Clients:** a client opens connection `conn` to a room with `std::net::open(conn, room)` (`@client`), and uses `send` and `close` as a server does. Each connection it opens gives one `Connection` event when it is open, and exactly one when it is closed, whatever closes it.
 
 #### Finding and running the server
 
@@ -2249,10 +2250,11 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::stage` | `Tape`, `Op`, `Reg` and `interpret`: fields built at run time (§14.4) |
 | `std::gpu` | Buffers (`GpuBuffer<T>`, `GpuSpan<T>`, `buffer`, `write`, `copy`, `read`), textures and samplers, passes, `dispatch` and `draw`, kernel outputs (`Slots<T>`, `Shared<T, N>`, `Atomics<T>`, `Append<T>`, `AtomicMap`, `Texels`, `Texels3d`), typed builtins, lossy encodings, `limits()` (§18) |
 | `std::io` | `load`, `store`, `fetch` and `post`, polled through `Pending<T>`; `print` (§17.1, §17.3) |
+| `std::host` | A client's application services, each a request: `environment`, `decode_image`, `cursor`, `icon`, embedded programs (`open`, `wait_ready`, `show`, `send`, `receive`, `reply`, `wait_closed`, `close`), files (`import_file`, `export_file`), the clipboard (`offer`, `copy`, `pasted`), text input, `publish` (the semantic tree), the page's address and links; and their answers read: `read_environment` (`Environment`), `read_surface`, `read_call` (`Call`), `read_pasted`, `read_glyph` (`GlyphImage`) (§17.1) |
 | `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, `payload` (a message's bytes), and `Input`, the keys and buttons held (§17.2) |
 | `std::semantics` | A program's semantic tree, which a host shows as real elements: `Node`, `Role`, `Field`, `FieldKind`; `structure`, `geometry` and `clip`, the tree's bytes; `changes`, the part of the tree to send since `Sent`; `steps`, a slider's step from an `Assist`; `FieldState` and `read_field_state`, a field's text as the host has it (§17.2) |
 | `std::pack` | `Pack`: values in as few bits as they allow, read back exactly (§6.11) |
-| `std::net` | `Room`, `Log`, `Reduce`: a room's ordered log, delivered exactly once (§19) |
+| `std::net` | `Room`, `Log`, `Reduce`: a room's ordered log, delivered exactly once; the host's network commands: a client's `open`, `send` and `close`, and a server's `keep`, `compact`, `tag` and `serve_room` (§19) |
 | `std::time` | `now`, seconds on the host's clock, and `since`, to time work while the program runs; both are `nondet`, so not in `@deterministic` code, a constant or a test (§17.3). `phase(name)` marks a phase of the thread's work, which the host times and reports (`trace`); it is available everywhere except GPU, `@audio` and derived code |
 | `std::lift` | A lifted build's literals: `Literal`, `count`, `literal`, their values, sources and files, `set`, `generation` and `Watch`; `gradient` by literals, and `reads`; the spec types `Checks`, `Loss` and `Report`; `Minimize`, which makes a function of some literals as small as it can (BFGS, then rounding to the literals' decimals) (§23.1, §23.7) |
 | `std::reload` | Hot reload: `keep` gives bytes to the build that replaces this one, and that build's `kept` returns them. One build hands its place to another with `prepare`, `unprepare` and `hand_over` (§15.4, §23.2) |

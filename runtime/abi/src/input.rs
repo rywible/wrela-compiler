@@ -45,7 +45,7 @@
 //! size); the rest wait for the next call. Messages and connections never become a tick's
 //! records: v1 gives the network to frames and a server's `serve`, not to ticks.
 //!
-//! A server program may tag a connection with a number (`platform::net::tag`, a host command
+//! A server program may tag a connection with a number (`std::net::tag`, a host command
 //! carried out once the call's records are kept). When its host starts it again on a fresh
 //! instance, the `Connection` events that tell it of its open connections carry their tags, so
 //! what it knew of each connection survives the restart; a client's are 0.

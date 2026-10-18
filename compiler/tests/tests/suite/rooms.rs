@@ -1,5 +1,5 @@
 //! Rooms kept durably (language.md §19, `wrela_host::rooms`): a server program on `std::net` and
-//! `platform::net`, its journal on disk, and what a crash, a torn write, another build's journal,
+//! `std::net`, its journal on disk, and what a crash, a torn write, another build's journal,
 //! a proposal that traps the room or one that runs past its deadline leave. The peers are played
 //! here, in Rust, by their packed messages (`std::pack`'s rules).
 
@@ -155,7 +155,7 @@ fn sent_to(out: &[Out], conn: u32) -> Vec<Down> {
 
 /// A room of tags. A multiple of 7 is refused; 13 traps the reducer, and 99 loops in it.
 const PROGRAM: &str = r#"
-use platform::net::serve_room
+use std::net::serve_room
 use std::net::{Entry, Reduce, Room, Verdict}
 use std::pack::Pack
 
@@ -199,23 +199,14 @@ pub(crate) const DEAF: &str = r#"
 pub fn serve(time: f32) {}
 "#;
 
-/// The server build of `program` (a package's main.wrela, beside the platform), in scratch
-/// directory `name`.
+/// The server build of `program` (a package's main.wrela), in scratch directory `name`.
 pub(crate) fn server_wasm(name: &str, program: &str) -> Vec<u8> {
     {
         let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(name);
         let _ = std::fs::remove_dir_all(&root);
         let pkg = root.join("pkg");
         std::fs::create_dir_all(&pkg).expect("scratch package");
-        let platform = wrela_tests::repo_root().join("platform");
-        std::fs::write(
-            pkg.join("wrela.toml"),
-            format!(
-                "[package]\nname = \"rooms\"\n\n[dependencies]\nplatform = {{ path = \"{}\" }}\n",
-                platform.display()
-            ),
-        )
-        .expect("manifest");
+        std::fs::write(pkg.join("wrela.toml"), "[package]\nname = \"rooms\"\n").expect("manifest");
         std::fs::write(pkg.join("main.wrela"), program).expect("main");
         let out = root.join("build");
         wrela_tests::must_build(&pkg, &out);

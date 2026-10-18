@@ -169,7 +169,7 @@ fn a_server_frame_past_the_transport_bound_closes_the_connection() {
     let wasm = server_wasm(
         "oversize-server-frame",
         r#"
-use platform::net::send
+use std::net::send
 use std::input::{Event, events}
 
 pub fn serve(time: f32) {
@@ -212,7 +212,7 @@ fn a_room_delivers_its_last_frame_before_closing() {
     let wasm = server_wasm(
         "last-server-frame",
         r#"
-use platform::net::{close, send}
+use std::net::{close, send}
 use std::input::{Event, events}
 
 pub fn serve(time: f32) {

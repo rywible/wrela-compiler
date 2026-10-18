@@ -83,7 +83,7 @@ pub fn fixture_backup(s: mut Session) {
         saved: s.saved,
         body: s.recovered.clone(),
     }
-    let _ = std::host::request("fixture/expected", save(expected))
+    let _ = std::host::custom("fixture/expected", save(expected))
 }
 "#,
     );
@@ -116,7 +116,7 @@ pub fn fixture_backup(s: mut Session) {
                             backup.push(data.to_vec());
                         }
                         wrela_abi::stream::Command::HostRequest {
-                            service: "fixture/expected",
+                            service: "app/fixture/expected",
                             body,
                             ..
                         } => {

@@ -269,3 +269,44 @@ fn chrome_fetches_shipped_files_alike() {
     let (hash, _) = shipped_native(&dir);
     assert_eq!(browser.hash, hash, "the hosts' answers differ (their state hashes do)");
 }
+
+/// The native client host has none of a browser's application services (language.md §17.1):
+/// asking it for one fails the request, as a failed IO request fails, and the program goes on.
+#[test]
+fn the_native_host_fails_a_browser_service() {
+    let text = "use std::host
+use std::io::{IoError, Pending, print}
+
+struct S {
+    asked: Option<Pending<u8>>,
+}
+
+pub fn init() -> S {
+    S { asked: Some(host::environment()) }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {
+    var answer: Option<Result<Vec<u8>, IoError>> = None
+    match mut s.asked {
+        Some(p) => answer = p.poll(),
+        None => {},
+    }
+    match answer {
+        Some(Ok(_)) => print(\"answered\"),
+        Some(Err(_)) => print(\"failed\"),
+        None => {},
+    }
+    if answer.is_some() { s.asked = None }
+}
+";
+    let dir = crate::package("requests-browser-service", text);
+    let out = dir.join("build");
+    wrela_tests::must_build(&dir, &out);
+    let mut host = wrela_host::CpuHost::load(&out).expect("load");
+    let mut logs = Vec::new();
+    for i in 0..4 {
+        host.frame(i as f32 / 60.0, 64, 48).expect("a failed request doesn't trap");
+        logs.extend(host.take_logs());
+    }
+    assert_eq!(logs, ["failed"]);
+}

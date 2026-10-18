@@ -1,10 +1,10 @@
 //! A room kept durably (language.md §19): a [`Room`] of a server build, its journal on disk, and
 //! the rules that make it survive a crash. The journal holds the records its program gave the
-//! host (`platform::net`'s `keep` and `compact`); the host keeps a call's records, flushed to
+//! host (`std::net`'s `keep` and `compact`); the host keeps a call's records, flushed to
 //! disk, before it releases anything the call sent or closed, so what any peer saw committed is
 //! in the journal. A room that starts reads its journal back first, as messages from connection
 //! `JOURNAL` (0), before any live event, and then hears of its open connections again, each with
-//! the tag the program gave it (`platform::net::tag`). A call is given what waits a call's worth
+//! the tag the program gave it (`std::net::tag`). A call is given what waits a call's worth
 //! at a time ([`wrela_abi::input::within_call`]), and must read all of it.
 //!
 //! A call that fails keeps nothing and sends nothing, and the room starts again from its journal
@@ -34,10 +34,10 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-/// The connection a room's journal comes from (`platform::net::JOURNAL`).
+/// The connection a room's journal comes from (`std::net::JOURNAL`).
 pub const JOURNAL: u32 = 0;
 /// The bit set on a connection's number for a message that trapped the room alone
-/// (`platform::net::POISONED`).
+/// (`std::net::POISONED`).
 pub const POISONED: u32 = 1 << 31;
 /// How many times in a row a room may fail at the host's limits before its connections close.
 pub const RETRIES: u32 = 3;

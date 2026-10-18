@@ -1,4 +1,4 @@
-//! The semantic tree in Chrome (platform/tests/semantics): a person's clicks, typing and input
+//! The semantic tree in Chrome (compiler/tests/semantics): a person's clicks, typing and input
 //! method reach the program through the host's real elements.
 
 /// A click on the field's drawn rectangle gives it the keys; what's typed and composed there is
@@ -7,9 +7,9 @@
 #[test]
 #[ignore = "needs the runtime"]
 fn a_person_types_composes_and_clicks_through_the_semantic_tree() {
-    let (_, rel) = wrela_tests::page("platform/tests/semantics", "semantics");
+    let (_, rel) = wrela_tests::page("compiler/tests/semantics", "semantics");
     let commands = std::fs::read_to_string(
-        wrela_tests::repo_root().join("platform/tests/semantics/person.json"),
+        wrela_tests::repo_root().join("compiler/tests/semantics/person.json"),
     )
     .expect("the commands");
     assert!(

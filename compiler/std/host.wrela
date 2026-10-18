@@ -1,14 +1,20 @@
-// Requests to a named service of the host, such as the clipboard or the page's address: bytes
-// out, bytes back. A request carries a service name and bytes that only the service reads; the
-// host knows nothing more of them. What each service's bytes mean is Wrela code's
-// (`platform::host`). The answer comes on a `Pending`, as any request's does (`std::io`).
+// The host's services: requests to a named service, bytes out and bytes back, and the services
+// of the browser host for an application: the page's environment, images, the cursor and icons,
+// other programs shown in this one's place, files, the clipboard, text input, the semantic tree
+// and the page's address. Each service's function sends one request and gives the `Pending` that
+// its answer comes back on (`std::io`). Every request and answer is bytes that only the service
+// reads; std owns their layout, so one toolchain ships both sides of each contract. The services
+// are a client's (`@client`); a host that doesn't have a service fails the request.
 
-use std::io::{Pending, next_request, path_problem}
+use std::io::{Pending, next_request, path_problem, print}
+use std::semantics
+use std::semantics::{Node, Sent}
+use std::serialize::{LoadError, Reader, Writer}
 
 /// Sends `bytes` to the host's service `service`, a relative path such as `clipboard/offer`. The
 /// request and answer bytes are the service's own. A host without the service fails the request,
 /// as any failed request fails.
-pub fn request(service: str, bytes: [u8]) -> Pending<u8> {
+pub(package) fn request(service: str, bytes: [u8]) -> Pending<u8> {
     if let Some(why) = path_problem(service) {
         panic(f"host service `{service}` {why}")
     }
@@ -22,3 +28,555 @@ pub fn request(service: str, bytes: [u8]) -> Pending<u8> {
 
 @intrinsic
 fn host_command(request: u32, service: str, bytes: [u8]) {}
+
+/// The little-endian `u32` at byte `at` of a service's answer, or `None` if fewer than four bytes
+/// are there.
+fn word(bytes: [u8], at: u32 = 0) -> Option<u32> {
+    if at > bytes.len() || bytes.len() - at < 4 { return None }
+    Some(
+        u32(bytes[at]) |
+            (u32(bytes[at + 1]) << 8) |
+            (u32(bytes[at + 2]) << 16) |
+            (u32(bytes[at + 3]) << 24),
+    )
+}
+
+/// Where the program runs: byte 0 whether the system asks for reduced motion, then words: the
+/// seconds since 1970 (at 1) and the device pixel ratio × 1024 (at 5); byte 9 whether this page
+/// load reloaded the tab, rather than visiting the page; then the word of what the host has (at
+/// 10, `capabilities`); byte 14 whether the system asks for a light colour scheme
+/// (`prefers_light`). A host may give fewer bytes.
+@client
+pub fn environment() -> Pending<u8> {
+    request("environment", [u8(0); 0])
+}
+
+/// A compressed image (PNG, WebP or JPEG), decoded by the host to its RGBA8 pixels, rows top to
+/// bottom, as the file holds them. It must be `width` by `height`: another size fails.
+@client
+pub fn decode_image(bytes: [u8], width: u32, height: u32) -> Pending<u8> {
+    var body: Vec<u8> = Vec::new()
+    for n in [width, height] {
+        for shift in [0, 8, 16, 24] { body.push(u8((n >> shift) & 255)) }
+    }
+    for b in bytes { body.push(b) }
+    request("image/decode", body)
+}
+
+/// Fetches each URL of `list` (absolute, one a line) into the host's cache ahead of time, at
+/// low priority; a program opening stops it. Answers once all are done or it stopped.
+@client
+pub fn prefetch(list: [u8]) -> Pending<u8> {
+    request("prefetch", list)
+}
+
+/// The pointer's shape over the program: `default`, `pointer`, `text`, `grab`, `grabbing`,
+/// `crosshair`, `move`, `nwse-resize` or `nesw-resize`.
+@client
+pub fn cursor(name: str) -> Pending<u8> {
+    var bytes: Vec<u8> = Vec::new()
+    for i in 0..name.len() { bytes.push(name.byte(i)) }
+    request("cursor", bytes)
+}
+
+/// One of the page's icons: `rel` is `icon` or `apple-touch-icon`, `size` its pixels on a side,
+/// and `path` a square PNG the build shipped (`Shipped::path`).
+@client
+pub fn icon(rel: str, size: u32, path: str) -> Pending<u8> {
+    let text = f"{rel} {size} {path}"
+    var bytes: Vec<u8> = Vec::new()
+    for i in 0..text.len() { bytes.push(text.byte(i)) }
+    request("icon", bytes)
+}
+
+/// Opens the program at `url` (relative to this build) in a surface of its own, hidden until it's
+/// shown (`show`), at most four at a time. The answer is the surface's id (`read_surface`); it
+/// fails if the program can't be opened.
+@client
+pub fn open(url: str) -> Pending<u8> {
+    var bytes: Vec<u8> = Vec::new()
+    for i in 0..url.len() { bytes.push(url.byte(i)) }
+    request("surface/open", bytes)
+}
+
+/// Waits for the program in surface `id` to say it shows its first useful frame (its `ready`).
+/// If it closes first, or isn't ready within 120 s, the request fails and the host closes it.
+@client
+pub fn wait_ready(id: u32) -> Pending<u8> {
+    request("surface/frame", id_bytes(id))
+}
+
+/// Waits for surface `id` to close: answered once it has.
+@client
+pub fn wait_closed(id: u32) -> Pending<u8> {
+    request("surface/closed", id_bytes(id))
+}
+
+/// Closes surface `id` and the program in it.
+@client
+pub fn close(id: u32) -> Pending<u8> {
+    request("surface/close", id_bytes(id))
+}
+
+fn id_bytes(id: u32) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_u32(id)
+    take w.into_bytes()
+}
+
+/// The surface's id in an `open` answer.
+pub fn read_surface(bytes: [u8]) -> Option<u32> {
+    word(bytes)
+}
+
+/// Shows a program in place of this one, `name` (a lowercase key) naming it in the page's
+/// address, so the browser's Back asks it to return.
+@client
+pub fn show(id: u32, name: str) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(id)
+    var body = take w.into_bytes()
+    for i in 0..name.len() { body.push(name.byte(i)) }
+    request("surface/show", body)
+}
+
+/// Calls the program in surface `id` with `bytes`, on its parent channel: the answer is its reply
+/// (`reply`), and fails if it replied that it failed or it closed first.
+@client
+pub fn send(id: u32, bytes: [u8]) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(id)
+    var body = take w.into_bytes()
+    for b in bytes { body.push(b) }
+    request("surface/call", body)
+}
+
+/// The next call from the program that shows this one: the call's id (a word) and then its bytes.
+/// One receive waits at a time; it fails if this program has no parent or the channel closes.
+@client
+pub fn receive() -> Pending<u8> {
+    request("channel/receive", [u8(0); 0])
+}
+
+/// A call from the program that shows this one: its id, to `reply` to, and its bytes.
+pub struct Call: Clone {
+    pub id: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// Reads a `receive` answer: `None` if it's shorter than an id.
+pub fn read_call(bytes: [u8]) -> Option<Call> {
+    let Some(id) = word(bytes) else { return None }
+    var body: Vec<u8> = Vec::new()
+    for i in 4..bytes.len() { body.push(bytes[i]) }
+    Some(Call { id, bytes: body })
+}
+
+/// Answers call `id` from the program that shows this one with `bytes`, as a success unless `ok`
+/// is false.
+@client
+pub fn reply(id: u32, bytes: [u8], ok: bool = true) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(id)
+    w.write_u8(if ok { 1 } else { 0 })
+    var body = take w.into_bytes()
+    for b in bytes { body.push(b) }
+    request("channel/reply", body)
+}
+
+/// A file the person chooses: its bytes. Fails if they cancel, or the file is over 1 MiB.
+@client
+pub fn import_file() -> Pending<u8> {
+    request("file/import", [u8(0); 0])
+}
+
+/// Offers `bytes` to the person as a download named `name`.
+@client
+pub fn export_file(name: str, bytes: [u8]) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(name)
+    var body = take w.into_bytes()
+    for b in bytes { body.push(b) }
+    request("file/export", body)
+}
+
+/// Tells the program that shows this one in its place that this one shows its first useful frame.
+@client
+pub fn ready() -> Pending<u8> {
+    request("surface/ready", [u8(0); 0])
+}
+
+/// Tells the program that shows this one in its place that this one failed to start.
+@client
+pub fn failed() -> Pending<u8> {
+    request("surface/failed", [u8(0); 0])
+}
+
+/// A character group drawn by the system's fonts, for a host with `SYSTEM_GLYPHS`: `face` 0 for
+/// sans and 1 for mono, `px` the size it's drawn at, and `text` the group. The answer is the
+/// host's glyph bitmap and metrics for it.
+@client
+pub fn glyph(face: u8, px: u32, text: str) -> Pending<u8> {
+    var body: Vec<u8> = Vec::new()
+    body.push(face)
+    for k in 0..4 {
+        body.push(u8((px >> (8 * k)) & 255))
+    }
+    for i in 0..text.len() {
+        body.push(text.byte(i))
+    }
+    request("font/glyph", body)
+}
+
+/// A `glyph` answer, read: the host's drawing: its advance, where its pixels sit from the pen (left, and top above the
+/// baseline), all in pixels at `px` an em; its size, whether it has colour of its own, and its
+/// RGBA pixels, rows from the top.
+pub struct GlyphImage: Clone {
+    pub px: f32,
+    pub advance: f32,
+    pub left: f32,
+    pub top: f32,
+    pub width: u32,
+    pub height: u32,
+    pub colored: bool,
+    pub pixels: Vec<u8>,
+}
+
+/// Reads a `glyph` answer drawn at `px` pixels an em: `None` if it isn't one.
+pub fn read_glyph(bytes: [u8], px: f32) -> Option<GlyphImage> {
+    if bytes.len() < 21 {
+        return None
+    }
+    let width = word32(bytes, 12)
+    let height = word32(bytes, 16)
+    if width == 0 ||
+        height == 0 ||
+        width > 4096 ||
+        height > 4096 ||
+        bytes.len() != 21 + width * height * 4 {
+        return None
+    }
+    var pixels: Vec<u8> = Vec::with_capacity(width * height * 4)
+    for i in 21..bytes.len() {
+        pixels.push(bytes[i])
+    }
+    Some(
+        GlyphImage {
+            px,
+            advance: bitcast_f32(word32(bytes, 0)),
+            left: bitcast_f32(word32(bytes, 4)),
+            top: bitcast_f32(word32(bytes, 8)),
+            width,
+            height,
+            colored: bytes[20] != 0,
+            pixels,
+        },
+    )
+}
+
+fn word32(b: [u8], at: u32) -> u32 {
+    match word(b, at) {
+        Some(w) => w,
+        None => 0,
+    }
+}
+
+/// A service that the program's embedding host defines, under `app/` (`app/<service>`): for a
+/// program run by a host that another program embeds (`wrela_host`'s handlers), with bytes that
+/// only the two of them read. No host of the toolchain's own has one, so it fails without them.
+pub fn custom(service: str, bytes: [u8]) -> Pending<u8> {
+    request(f"app/{service}", bytes)
+}
+
+/// Asks the program that shows this one to take its place back: this one closes.
+@client
+pub fn return_to_parent() -> Pending<u8> {
+    request("surface/return", [u8(0); 0])
+}
+
+// ---- input services (runtime/browser: listen.ts, semantics.ts) -------------------------------------
+
+/// A bit of the capabilities word (`capabilities`): the host sends `Event::Paste` and takes what
+/// a program `offer`s to the clipboard.
+pub const PASTE_EVENTS: u32 = 1
+/// A bit of the capabilities word: the host takes `text_input`.
+pub const TEXT_INPUT: u32 = 2
+/// A bit of the capabilities word: the host takes the semantic tree (`publish`), `field_state`,
+/// `submit` and `announce`.
+pub const SEMANTICS: u32 = 4
+/// A bit of the capabilities word: the host draws glyphs with the system's fonts (`font/glyph`).
+pub const SYSTEM_GLYPHS: u32 = 8
+
+/// An `environment` answer, read. A host may give fewer bytes: what it leaves out reads as `false`,
+/// `None` or 0.
+pub struct Environment: Copy {
+    /// Whether the system asks for reduced motion.
+    pub reduced_motion: bool,
+    /// The seconds since 1970.
+    pub seconds: Option<u32>,
+    /// The device's pixels to a CSS pixel.
+    pub pixel_ratio: Option<f32>,
+    /// Whether this page load reloaded the tab, rather than visiting the page.
+    pub reloaded: bool,
+    /// What the host has: `PASTE_EVENTS`, `TEXT_INPUT`, `SEMANTICS` and `SYSTEM_GLYPHS`.
+    pub capabilities: u32,
+    /// Whether the system asks for a light colour scheme.
+    pub prefers_light: bool,
+}
+
+/// Reads an `environment` answer.
+pub fn read_environment(bytes: [u8]) -> Environment {
+    var ratio: Option<f32> = None
+    if let Some(r) = word(bytes, 5) { ratio = Some(f32(r) / 1024.0) }
+    var capabilities = 0
+    if let Some(c) = word(bytes, 10) { capabilities = c }
+    Environment {
+        reduced_motion: bytes.len() > 0 && bytes[0] != 0,
+        seconds: word(bytes, 1),
+        pixel_ratio: ratio,
+        reloaded: bytes.len() > 9 && bytes[9] != 0,
+        capabilities,
+        prefers_light: bytes.len() > 14 && bytes[14] != 0,
+    }
+}
+
+fn write_f32(w: mut Writer, x: f32) {
+    w.write_u32(bitcast_u32(x))
+}
+
+fn write_rect(w: mut Writer, r: vec4) {
+    write_f32(mut w, r.x)
+    write_f32(mut w, r.y)
+    write_f32(mut w, r.z)
+    write_f32(mut w, r.w)
+}
+
+/// Text mode (`text/input`): on while the program edits text, its caret at `caret` (x, y, width,
+/// height in device pixels), so an input method composes there and its keys arrive as `Text` and
+/// `Compose`; off gives the keys back to the canvas.
+@client
+pub fn text_input(active: bool, caret: vec4) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u8(if active { 1 } else { 0 })
+    write_rect(mut w, caret)
+    let body = take w.into_bytes()
+    request("text/input", body)
+}
+
+/// What a copy or cut puts on the system clipboard from now on (`clipboard/offer`), as plain text
+/// and HTML: a copy happens before the keys that ask for it arrive, so a program offers what it
+/// would copy whenever that changes. Empty text offers nothing.
+@client
+pub fn offer(text: str, html: str) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(text)
+    w.write_str(html)
+    let body = take w.into_bytes()
+    request("clipboard/offer", body)
+}
+
+/// Puts `text` on the system clipboard now (`clipboard/write`), as a person's press asked, such as
+/// on a copy button; it answers once the text is there. A browser refuses it without such a press.
+@client
+pub fn copy(text: str) -> Pending<u8> {
+    request("clipboard/write", utf8(text))
+}
+
+/// What paste `serial` (`Event::Paste`) carried (`clipboard/pasted`); `read_pasted` reads the
+/// answer.
+@client
+pub fn pasted(serial: u32) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(serial)
+    let body = take w.into_bytes()
+    request("clipboard/pasted", body)
+}
+
+/// A paste's plain text and HTML.
+pub struct Pasted: Clone + Eq {
+    pub text: String,
+    pub html: String,
+}
+
+/// Reads a paste's answer (`pasted`): its plain text, then its HTML.
+pub fn read_pasted(bytes: take Vec<u8>) -> Result<Pasted, LoadError> {
+    var r = Reader::new(take bytes)
+    let text = r.read_string()?
+    let html = r.read_string()?
+    Ok(Pasted { text, html })
+}
+
+/// The program's semantic tree is now `nodes` (std::semantics), named `name`, which a browser
+/// shows as the page's title: what changed of it since `sent` goes to the host, the structure
+/// (`semantics/tree`) before the places (`semantics/geometry`, clipped to `view`). Screen readers, the keyboard, links and fields work on the nodes, and what a
+/// person does comes back as `Event::Assist` and `Event::Field`. The requests go on `told`. A tree
+/// the host would refuse (`semantics::problem`) isn't sent: the console says why.
+@client
+pub fn publish(told: mut Vec<Pending<u8>>, sent: mut Sent, name: str, nodes: [Node], view: vec4) {
+    let (tree, places) = semantics::changes(mut sent, name, nodes, view)
+    if let Some(b) = tree {
+        if let Some(why) = semantics::problem(nodes) {
+            print(f"the semantic tree isn't sent: {why.as_str()}")
+            return
+        }
+        told.push(request("semantics/tree", b))
+    }
+    if let Some(b) = places { told.push(request("semantics/geometry", b)) }
+}
+
+/// Field `node`'s state after an `Event::Field` (`field/state`); `semantics::read_field_state`
+/// reads the answer. Reading it tells the host the program has seen that revision.
+@client
+pub fn field_state(node: u32) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(node)
+    let body = take w.into_bytes()
+    request("field/state", body)
+}
+
+/// Submits form `form` as a person would (`form/submit`): a password manager offers to save it.
+@client
+pub fn submit(form: u32) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(form)
+    let body = take w.into_bytes()
+    request("form/submit", body)
+}
+
+/// Says `text` to a screen reader, after what it's saying (`a11y/announce`).
+@client
+pub fn announce(text: str) -> Pending<u8> {
+    request("a11y/announce", utf8(text))
+}
+
+fn utf8(text: str) -> Vec<u8> {
+    var bytes: Vec<u8> = Vec::new()
+    for i in 0..text.len() { bytes.push(text.byte(i)) }
+    bytes
+}
+
+// ---- the page's address and links (runtime/browser: platform.ts) ------------------------------
+
+/// The page's address: its path, query and fragment (`/v0.1/#std/io`), as UTF-8.
+@client
+pub fn address() -> Pending<u8> {
+    request("nav/location", [u8(0); 0])
+}
+
+/// A new entry in the page's history at `address`, on the page's own origin and resolved against
+/// its address (`#std/io`, `/v0.2/`): the browser's Back returns to the one before. A program in
+/// a frame has no address of its own.
+@client
+pub fn push_address(address: str) -> Pending<u8> {
+    request("nav/push", utf8(address))
+}
+
+/// The page's address is now `address`, with no new history entry.
+@client
+pub fn replace_address(address: str) -> Pending<u8> {
+    request("nav/replace", utf8(address))
+}
+
+/// Answers with the page's address (UTF-8) when Back or Forward moves through the addresses the
+/// program gave; ask again for the next.
+@client
+pub fn address_changed() -> Pending<u8> {
+    request("nav/changed", [u8(0); 0])
+}
+
+/// Opens `url`, an http or https URL, in a new tab, with no way back to this page.
+@client
+pub fn open_link(url: str) -> Pending<u8> {
+    request("nav/open", utf8(url))
+}
+
+/// Goes to another page of this origin in this tab (`/v0.2/`): another build, such as another
+/// version of a site.
+@client
+pub fn go(address: str) -> Pending<u8> {
+    request("nav/go", utf8(address))
+}
+
+/// Whether the program takes the browser's find keys (Ctrl or Cmd with F or G, and F3) for a find
+/// of its own: the browser's finds nothing in a canvas. The program hears the keys either way.
+@client
+pub fn claim_find(on: bool) -> Pending<u8> {
+    request("keys/find", [if on { u8(1) } else { u8(0) }])
+}
+
+@test
+fn a_paste_has_the_hosts_layout() {
+    var w = Writer::new()
+    w.write_str("hi")
+    w.write_str("<b>hi</b>")
+    let p = read_pasted(take w.into_bytes())
+    assert(p == Ok(Pasted { text: String::from("hi"), html: String::from("<b>hi</b>") }))
+    assert(read_pasted(Vec::from([u8(9), 0, 0, 0])).is_err(), "a short answer")
+    let e = read_environment([0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 0])
+    assert(e.capabilities == 5 && read_environment([0]).capabilities == 0)
+    // A host that says nothing of the colour scheme leaves it dark.
+    assert(read_environment([0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 5, 0, 0, 0, 1]).prefers_light)
+    assert(!e.prefers_light)
+}
+
+/// Answers when the parent asks this program to return, as the browser's Back does.
+@client
+pub fn asked_to_return() -> Pending<u8> {
+    request("surface/leave", [u8(0); 0])
+}
+
+@test
+fn capability_words_reject_short_and_out_of_range_runs() {
+    assert(word([1, 2, 3, 4]) == Some(0x04030201))
+    assert(word([1, 2, 3]).is_none())
+    assert(word([1, 2, 3, 4], 5).is_none())
+    assert(word([1, 2, 3, 4], 0xFFFFFFFF).is_none())
+}
+
+@test
+fn a_hosts_answer_reads_back() {
+    var bytes: Vec<u8> = Vec::new()
+    for w in [bitcast_u32(40.0), bitcast_u32(-1.0), bitcast_u32(30.0), 1, 2] {
+        bytes.push(u8(w & 255))
+        bytes.push(u8((w >> 8) & 255))
+        bytes.push(u8((w >> 16) & 255))
+        bytes.push(u8(w >> 24))
+    }
+    bytes.push(1)
+    for _ in 0..8 {
+        bytes.push(9)
+    }
+    let Some(r) = read_glyph(bytes, 128.0) else { panic("an answer") }
+    assert(r.advance == 40.0 && r.left == -1.0 && r.top == 30.0 && r.colored && r.pixels.len() == 8)
+    bytes.push(0)
+    assert(read_glyph(bytes, 128.0).is_none(), "a byte too many")
+}
+
+@test
+fn an_environment_answer_reads_back() {
+    var bytes: Vec<u8> = Vec::new()
+    bytes.push(1)
+    for w in [u32(1760000000), u32(2048)] {
+        for k in 0..4 { bytes.push(u8((w >> (8 * k)) & 255)) }
+    }
+    bytes.push(1)
+    for k in 0..4 { bytes.push(u8((SEMANTICS >> (8 * k)) & 255)) }
+    bytes.push(1)
+    let e = read_environment(bytes)
+    assert(e.reduced_motion && e.reloaded && e.prefers_light && e.capabilities == SEMANTICS)
+    let Some(seconds) = e.seconds else { panic("seconds") }
+    let Some(ratio) = e.pixel_ratio else { panic("a pixel ratio") }
+    assert(seconds == 1760000000 && ratio == 2.0)
+    let none = read_environment([u8(0); 0])
+    assert(!none.reduced_motion && !none.reloaded && !none.prefers_light && none.capabilities == 0)
+    assert(none.seconds.is_none() && none.pixel_ratio.is_none())
+}
+
+@test
+fn a_call_and_a_surface_read_back() {
+    let Some(call) = read_call([5, 0, 0, 0, 9, 8]) else { panic("a call") }
+    assert(call.id == 5 && call.bytes.len() == 2 && call.bytes[0] == 9 && call.bytes[1] == 8)
+    assert(read_call([1, 2, 3]).is_none())
+    assert(read_surface([7, 0, 0, 0]) == Some(7))
+    assert(read_surface([7, 0]).is_none())
+}

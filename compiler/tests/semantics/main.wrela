@@ -1,0 +1,96 @@
+// The semantic tree, seen from the program: a link, a field and a button, published on the first
+// frame, and what a person does to them printed as it's read (`std::io::print`, test mode's
+// log.txt). The field's text is read after each `Event::Field`, and printed when it changes.
+
+use std::host
+use std::input::{Event, events}
+use std::io::{Pending, print}
+use std::semantics
+use std::semantics::{Field, FieldKind, Node, Role, Sent}
+
+const LINK: u32 = 1
+const FIELD: u32 = 2
+const BUTTON: u32 = 3
+
+pub struct State {
+    told: Vec<Pending<u8>>,
+    sent: Sent,
+    heard: u32,
+    seen: u32,
+    reading: Option<Pending<u8>>,
+    text: String,
+}
+
+pub fn init() -> State {
+    State { told: Vec::new(), sent: Sent {}, heard: 0, seen: 0, reading: None, text: String::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    for e in events() {
+        match e {
+            Event::Assist { node, action } => print(f"assist {node} {u32(action)}"),
+            Event::Field { node, revision } => if node == FIELD {
+                s.heard = max(s.heard, revision)
+            },
+            Event::KeyDown { key, .. } => print(f"down {u32(key)}"),
+            _ => {},
+        }
+    }
+    if let Some(Ok(bytes)) = poll(mut s.reading) {
+        if let Ok(state) = semantics::read_field_state(take bytes) {
+            s.seen = max(s.seen, state.revision)
+            if state.text != s.text {
+                let composing = if state.composing { " composing" } else { "" }
+                print(f"text {state.text.as_str()} {state.start}{composing}")
+                s.text = state.text.clone()
+            }
+        }
+    }
+    if s.reading.is_none() && s.heard > s.seen { s.reading = Some(host::field_state(FIELD)) }
+    let nodes = [
+        Node {
+            id: LINK,
+            role: Role::Link,
+            label: String::from("Next"),
+            href: String::from("#next"),
+            rect: vec4(4.0, 4.0, 40.0, 12.0),
+        },
+        Node {
+            id: FIELD,
+            role: Role::Field,
+            label: String::from("Name"),
+            rect: vec4(4.0, 24.0, 56.0, 12.0),
+            field: Some(
+                Field { kind: FieldKind::Text, form: 1, autocomplete: String::from("username") },
+            ),
+        },
+        Node {
+            id: BUTTON,
+            role: Role::Button,
+            label: String::from("Go"),
+            rect: vec4(4.0, 44.0, 40.0, 12.0),
+        },
+    ]
+    host::publish(
+        mut s.told,
+        mut s.sent,
+        "Semantics",
+        nodes,
+        vec4(0.0, 0.0, f32(width), f32(height)),
+    )
+    var i = 0
+    while i < s.told.len() {
+        if s.told[i].poll().is_some() { let _ = s.told.remove(i) } else { i += 1 }
+    }
+}
+
+/// The answer, once `pending` has one; then nothing is pending.
+fn poll(pending: mut Option<Pending<u8>>) -> Option<Result<Vec<u8>, std::io::IoError>> {
+    var answer = None
+    match mut pending {
+        Some(p) => answer = p.poll(),
+        None => {},
+    }
+    if answer.is_some() { pending = None }
+    answer
+}

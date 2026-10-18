@@ -1,7 +1,7 @@
 // A room's client and its server in one program (language.md §19): the client proposes a tag,
 // joins room `chrome` of its server, and prints the room's tags once it has two (the server has
 // another peer's, from before it joined).
-use platform::net::{send, serve_room}
+use std::net::{send, serve_room}
 use std::input::{Event, events, payload}
 use std::io::print
 use std::net::{Entry, Log, Reduce, Room, Verdict}
@@ -41,7 +41,7 @@ fn send_all(conn: u32, out: Vec<Vec<u8>>) {
 
 pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
     if s.frames == 0 {
-        platform::net::open(1, "chrome")
+        std::net::open(1, "chrome")
     }
     s.frames += 1
     for e in events() {

@@ -1,0 +1,8 @@
+# The semantic tree in a real browser (std::semantics, std::host::publish): the program
+# publishes a link, a field in a form and a button, and prints each Assist, Field and KeyDown it
+# reads, and each new text it reads from the field; compiler/tests/tests/suite/semantics.rs clicks,
+# types and composes at them through Chrome's DevTools protocol and checks what it printed.
+[package]
+name = "semantics_page"
+
+[dependencies]

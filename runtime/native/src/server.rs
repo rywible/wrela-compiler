@@ -164,14 +164,14 @@ struct RoomState {
     dropped: u64,
     /// The events (and messages' bytes) the room hasn't read.
     input: Queue,
-    /// The network commands of the calls since they were last taken (`platform::net`), in
+    /// The network commands of the calls since they were last taken (`std::net`), in
     /// order: never answered. And their bytes, and the most they may hold.
     commands: Vec<Net>,
     command_bytes: usize,
     command_cap: usize,
 }
 
-/// A room's network command (`platform::net`): what the host does with a call's, once it
+/// A room's network command (`std::net`): what the host does with a call's, once it
 /// returns.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Net {

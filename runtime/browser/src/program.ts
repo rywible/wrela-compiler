@@ -368,7 +368,7 @@ export interface ProgramOptions {
    * read. */
   kept?: Uint8Array | undefined;
   inbox?: Inbox | undefined;
-  /** Its connections (`platform::net`): without them, `net/` requests fail as any request this
+  /** Its connections (`std::net`): without them, `net/` requests fail as any request this
    * host can't answer. */
   net?: Pick<Net, "open" | "send" | "close" | "closeAll" | "plan"> | undefined;
 }
@@ -673,7 +673,7 @@ export class Program {
     }
   }
 
-  /** A network command (`platform::net`): checks the export's planned connections, or carries
+  /** A network command (`std::net`): checks the export's planned connections, or carries
    * it out at commit. It is never answered, so it holds nothing for the program to take. */
   #netCommand(service: string, body: Bytes, execute = true): void {
     const net = execute ? this.#net! : (this.#netPlan ??= this.#net!.plan());

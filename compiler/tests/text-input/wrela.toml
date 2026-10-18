@@ -1,0 +1,7 @@
+# Text mode in a real browser (std::host::text_input): the program turns it on, and prints
+# each Text, Compose and KeyDown it reads; compiler/tests/tests/suite/input.rs types at it through
+# Chrome's DevTools protocol (trusted keys and an input method) and checks what it printed.
+[package]
+name = "text_input"
+
+[dependencies]

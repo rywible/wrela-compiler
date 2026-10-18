@@ -198,7 +198,7 @@ interface Session {
 export const pairParam = (pair: bigint) => pair.toString(16).padStart(16, "0");
 
 /**
- * A program's connections (`platform::net`'s `open`, `send`, `close`). Each opened connection
+ * A program's connections (`std::net`'s `open`, `send`, `close`). Each opened connection
  * gives exactly one `Connection` event that it's open (if it opens), then exactly one that it's
  * closed, whatever closes it; its messages come between. What arrives waits in `arrived` for the
  * frame that takes it.

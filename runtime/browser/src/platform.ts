@@ -73,7 +73,7 @@ const checked = (body: unknown): Bytes => {
 };
 
 /** A bounded request/reply channel. Closing it rejects every outstanding request. */
-/** The environment a program asks for (platform/host.wrela): whether the system asks for reduced
+/** The environment a program asks for (compiler/std/host.wrela): whether the system asks for reduced
  * motion, the seconds since 1970, the device pixel ratio × 1024, whether this page load is a
  * reload of the tab (its navigation's type), rather than a visit, what this host has, and whether
  * the system asks for a light colour scheme. */
@@ -91,7 +91,7 @@ export function environment(reducedMotion: boolean, nowMs: number, pixelRatio: n
 /** How many prefetches run at once. */
 const PREFETCHES = 3;
 
-/** `prefetch` (platform/host.wrela): fetches each URL of `list`, one a line, into the browser's
+/** `prefetch` (compiler/std/host.wrela): fetches each URL of `list`, one a line, into the browser's
  * cache at low priority, a few at a time, until `signal` aborts. A URL that fails is skipped:
  * the program fetches it again when it needs it. Answers once all are done or it is aborted.
  * Each is a readable request with credentials, as the page that later loads it makes: an opaque
@@ -116,7 +116,7 @@ export interface Decoded { width: number; height: number; pixels: Uint8ClampedAr
 /** The most pixels a decoded image may have. */
 const IMAGE_PIXELS = 4096 * 4096;
 
-/** `image/decode` (platform/host.wrela): the width and height the program expects (words), then
+/** `image/decode` (compiler/std/host.wrela): the width and height the program expects (words), then
  * a compressed image, which `decode` turns into its pixels. Another size fails. */
 export async function decodeImage(body: Bytes, decode: (image: Bytes) => Promise<Decoded>): Promise<Bytes> {
   const width = wordAt(body), height = wordAt(body.subarray(4));

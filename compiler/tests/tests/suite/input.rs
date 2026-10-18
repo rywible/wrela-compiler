@@ -61,15 +61,15 @@ fn both_hosts_read_the_same_events() {
 }
 
 /// In Chrome, text mode takes trusted keys and an input method (DevTools' Input domain,
-/// platform/tests/text-input/typing.json), and each edit reaches the program once: typed text,
+/// compiler/tests/text-input/typing.json), and each edit reaches the program once: typed text,
 /// spaces too, as Text after its KeyDown; Enter and Backspace as KeyDowns the hidden field doesn't
 /// also act on; a composition's changes whole, then its commit after a clear.
 #[test]
 #[ignore = "needs the runtime"]
 fn the_browser_types_and_composes_each_edit_once() {
-    let (_, rel) = wrela_tests::page("platform/tests/text-input", "text-input");
+    let (_, rel) = wrela_tests::page("compiler/tests/text-input", "text-input");
     let commands = std::fs::read_to_string(
-        wrela_tests::repo_root().join("platform/tests/text-input/typing.json"),
+        wrela_tests::repo_root().join("compiler/tests/text-input/typing.json"),
     )
     .expect("the commands");
     assert!(

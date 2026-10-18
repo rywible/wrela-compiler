@@ -1,0 +1,37 @@
+// Text mode, seen from the program: on from the first frame, at a caret near the top left, and
+// every event that edits text printed as it's read (`std::io::print`, test mode's log.txt).
+
+use std::host
+use std::input::{Event, events}
+use std::io::{Pending, print}
+
+pub struct State {
+    asked: Option<Pending<u8>>,
+}
+
+pub fn init() -> State {
+    State { asked: Some(host::text_input(active: true, caret: vec4(20.0, 20.0, 2.0, 18.0))) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    var answer = None
+    match mut s.asked {
+        Some(p) => answer = p.poll(),
+        None => {},
+    }
+    if let Some(a) = answer {
+        match a {
+            Ok(_) => print("text mode"),
+            Err(e) => print(f"text mode failed: {e.message()}"),
+        }
+        s.asked = None
+    }
+    for e in events() {
+        match e {
+            Event::Text { char } => print(f"text {char}"),
+            Event::Compose { char, index, length } => print(f"compose {char} {index} {length}"),
+            Event::KeyDown { key, .. } => print(f"down {u32(key)}"),
+            _ => {},
+        }
+    }
+}

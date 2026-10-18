@@ -368,7 +368,7 @@ def package(config, output):
             image = image.convert("RGB")
             image.thumbnail((960, 540), Image.Resampling.LANCZOS)
             width, height = image.size
-            # The console has the host decode it (platform/host.wrela `decode_image`).
+            # The console has the host decode it (compiler/std/host.wrela `decode_image`).
             encoded = io.BytesIO()
             image.save(encoded, "WEBP", quality=COVER_QUALITY, method=6)
         art = encoded.getvalue()

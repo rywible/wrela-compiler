@@ -249,7 +249,7 @@ fn server_build(name: &str, main: &str) -> ServerBuild {
 }
 
 const ROOMS: &str = r#"
-use std::host::request
+use std::host::custom
 use std::io::{Pending, print}
 
 struct Room {
@@ -265,7 +265,7 @@ pub fn serve(room: mut Room, time: f32) {
     room.serves += 1
     print(f"serve {room.serves}")
     if room.serves == 1 {
-        room.asked = Some(request("echo", [7, 8, 9]))
+        room.asked = Some(custom("echo", [7, 8, 9]))
     }
     if let Some(p) = replace(mut room.asked, None) {
         var pending = take p
@@ -288,7 +288,7 @@ pub fn serve(room: mut Room, time: f32) {
 fn a_room_keeps_its_state_and_reads_answers_on_the_next_call() {
     let build = server_build("rooms", ROOMS);
     let echo: wrela_host::server::Answers = std::sync::Arc::new(|service, body| {
-        assert_eq!(service, "echo");
+        assert_eq!(service, "app/echo");
         Ok(body.to_vec())
     });
     let mut room = Room::start(&build, Limits::default(), Some(echo)).expect("started");
@@ -407,4 +407,29 @@ fn a_client_build_isnt_a_server_build() {
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("a client build loaded as a server's"),
     }
+}
+
+/// A host service is std's, through its typed function: a program can't send a raw request
+/// (`std::host::request` is `pub(package)`, E0203), and a server build can't reach a client's
+/// service (E0708).
+#[test]
+fn host_services_are_reached_through_std_and_by_clients_only() {
+    let (codes, text) = errors(
+        "raw-host-request",
+        "use std::host::request\n\npub fn frame(time: f32, width: u32, height: u32) {\n    \
+         let _ = request(\"clipboard/write\", [u8(0); 0])\n}\n",
+    );
+    assert!(codes.iter().any(|c| c == "E0203"), "{text}");
+    let (codes, text) = errors(
+        "server-host-service",
+        "use std::host\n\npub fn serve(time: f32) {\n    let _ = host::copy(\"x\")\n}\n",
+    );
+    assert!(codes.iter().any(|c| c == "E0708"), "{text}");
+    assert!(text.contains("copy"), "the chain names the service: {text}");
+    let (codes, text) = errors(
+        "client-host-service",
+        "use std::host\n\npub fn frame(time: f32, width: u32, height: u32) {\n    \
+         let _ = host::copy(\"x\")\n}\n",
+    );
+    assert!(codes.is_empty(), "a client reaches the clipboard: {text}");
 }
