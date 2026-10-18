@@ -1,4 +1,4 @@
-//! AC3: the conformance suite (compiler/tests/conformance). Every rule of docs/language.md,
+//! AC3: the conformance suite (compiler/tests/conformance). Every rule of spec/language.md,
 //! the memory model (§6) included, has at least one program that's accepted and one that's
 //! rejected with the rule's diagnostic code, and the table of rules is the spec's index.
 //!
@@ -20,7 +20,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use wrela_tests::{cases, files_under, header, par_map, repo_root};
 
-/// The rules, by section of docs/language.md, whose index lists each one with its words
+/// The rules, by section of spec/language.md, whose index lists each one with its words
 /// (`the_rule_table_is_the_specs`): the driver keeps the table, which `wrela primer` reads too.
 use wrela_driver::primer::RULES;
 
@@ -180,7 +180,7 @@ fn conformance() {
 /// names no rule anywhere else, so its prose reads without IDs.
 #[test]
 fn the_rule_table_is_the_specs() {
-    let spec = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
+    let spec = std::fs::read_to_string(repo_root().join("spec/language.md")).expect("language.md");
     let at = spec.find("\n## The rules by ID\n").expect("the index");
     let (prose, index) = spec.split_at(at);
     let mut listed: Vec<(String, String)> = Vec::new();

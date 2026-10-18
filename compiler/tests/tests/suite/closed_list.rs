@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use wrela_tests::repo_root;
 
 fn spec() -> String {
-    std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md")
+    std::fs::read_to_string(repo_root().join("spec/language.md")).expect("language.md")
 }
 
 /// §20's text, from its heading to the next section's.

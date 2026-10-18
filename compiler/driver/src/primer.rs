@@ -8,7 +8,7 @@ mod embedded {
     include!(concat!(env!("OUT_DIR"), "/conformance.rs"));
 }
 
-/// Every rule of the conformance suite, in docs/language.md's order, with what it says: the
+/// Every rule of the conformance suite, in spec/language.md's order, with what it says: the
 /// suite's test (`conformance.rs`) checks that this table, language.md's index (*The rules by
 /// ID*) and the suite's cases name the same rules, and the index with these words.
 pub const RULES: &[(&str, &str)] = &[

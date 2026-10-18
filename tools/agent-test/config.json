@@ -5,7 +5,7 @@
   "agents": "one fresh agent per task, run through Claude Code's Agent tool with model `sonnet`, from the repository root, prompted only with: \"Read <task-dir>/BRIEF.txt and do exactly what it says.\" BRIEF.txt is `brief` filled in for the task; <task-dir> is target/agent-test/<run>/<task id>.",
   "max_attempts": 8,
   "context": [
-    "docs/language.md",
+    "spec/language.md",
     "spec/lexical.md",
     "spec/grammar.ebnf",
     "examples/hello-field/main.wrela",

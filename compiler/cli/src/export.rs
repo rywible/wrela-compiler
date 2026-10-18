@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crate::doc::{self, Entry, Index};
 
-const LANGUAGE: &str = include_str!("../../../docs/language.md");
+const LANGUAGE: &str = include_str!("../../../spec/language.md");
 const LEXICAL: &str = include_str!("../../../spec/lexical.md");
 const GRAMMAR: &str = include_str!("../../../spec/grammar.ebnf");
 const REPOSITORY: &str = "https://github.com/rywible/wrela";

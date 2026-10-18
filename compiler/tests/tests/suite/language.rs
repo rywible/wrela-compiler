@@ -1,4 +1,4 @@
-//! AC10: every example compiles. Each ```wrela block of docs/language.md, and each one in a doc
+//! AC10: every example compiles. Each ```wrela block of spec/language.md, and each one in a doc
 //! comment of std, is checked; std's are also run, and §22's tier-0 program is built.
 //!
 //! Most of the spec's blocks are fragments: they name a `world` or a `grazer` they don't
@@ -611,7 +611,7 @@ fn run_example(dir: &std::path::Path) -> Result<(), String> {
 
 #[test]
 fn every_example_in_language_md_compiles() {
-    let doc = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
+    let doc = std::fs::read_to_string(repo_root().join("spec/language.md")).expect("language.md");
     let blocks = markdown_blocks("language.md", &doc);
     assert!(blocks.len() >= 20, "only {} wrela blocks in language.md", blocks.len());
     let problems = check_blocks("language-md-examples", &blocks, CONTEXTS);
@@ -645,7 +645,7 @@ fn every_example_in_std_docs_compiles_and_runs() {
 
 #[test]
 fn the_tier_0_program_in_language_md_builds() {
-    let doc = std::fs::read_to_string(repo_root().join("docs/language.md")).expect("language.md");
+    let doc = std::fs::read_to_string(repo_root().join("spec/language.md")).expect("language.md");
     let section = &doc[doc.find("## 22. A complete program").expect("§22")..];
     let code = &section[section.find("```wrela\n").expect("a wrela block") + 9..];
     let code = &code[..code.find("```").expect("the block ends")];
