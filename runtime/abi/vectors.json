@@ -1550,12 +1550,55 @@
       "script": "[\n  {\"frame\": 0, \"type\": \"compose\", \"text\": \"かな\"},\n  {\"frame\": 1, \"type\": \"compose\", \"text\": \"\"},\n  {\"frame\": 1, \"type\": \"paste\", \"serial\": 3},\n  {\"frame\": 2, \"type\": \"assist\", \"node\": 9, \"action\": \"focus\"},\n  {\"frame\": 2, \"type\": \"assist\", \"node\": 10}\n]"
     },
     {
+      "at": [
+        "frame 0",
+        "frame 0",
+        "frame 1",
+        "frame 2",
+        "frame 3",
+        "frame 3"
+      ],
+      "events": [
+        "050000000800000001000000000000000000000000000000",
+        "060000000800000001000000000000000000000000000000",
+        "02000000000000000000803f000000400200000000000000",
+        "0c0000000000000004000000050000000000000000000000",
+        "080000000000000000000000070000000000803f01000000",
+        "090000000000000000000000030000000000803e00000000"
+      ],
+      "name": "keys, buttons, axes and actions by number",
+      "payloads": [
+        "",
+        "",
+        "",
+        "",
+        "",
+        ""
+      ],
+      "script": "[\n  {\"frame\": 0, \"type\": \"key\", \"code\": 1, \"meta\": true},\n  {\"frame\": 1, \"type\": \"down\", \"x\": 1, \"y\": 2, \"button\": 2},\n  {\"frame\": 2, \"type\": \"assist\", \"node\": 4, \"action\": 5},\n  {\"frame\": 3, \"type\": \"padbutton\", \"button\": 7, \"pressed\": true},\n  {\"frame\": 3, \"type\": \"padaxis\", \"axis\": 3, \"value\": 0.25}\n]"
+    },
+    {
+      "error": "event 0: `code` is a key's number, 1 to 89",
+      "name": "a key's number past the keys",
+      "script": "[{\"frame\": 0, \"type\": \"key\", \"code\": 90}]"
+    },
+    {
+      "error": "event 0: a key is its `key` or its `code`, not both",
+      "name": "a key and a code",
+      "script": "[{\"frame\": 0, \"type\": \"key\", \"key\": \"KeyA\", \"code\": 1}]"
+    },
+    {
+      "error": "event 0: `17` isn't a pad's button (south, east, west, north, leftshoulder, rightshoulder, lefttrigger, righttrigger, select, start, leftstick, rightstick, up, down, left, right, home, or 0 to 16)",
+      "name": "a pad button's number past the list",
+      "script": "[{\"frame\": 0, \"type\": \"padpress\", \"button\": 17}]"
+    },
+    {
       "error": "event 0: `node` must be a whole number",
       "name": "an assist with no node",
       "script": "[{\"frame\": 0, \"type\": \"assist\"}]"
     },
     {
-      "error": "event 0: `action` is activate, select, focus, increment, decrement or dismiss",
+      "error": "event 0: `action` is activate, select, focus, increment, decrement or dismiss (0 to 5)",
       "name": "an unknown assist action",
       "script": "[{\"frame\": 0, \"type\": \"assist\", \"node\": 1, \"action\": \"poke\"}]"
     },
@@ -1684,7 +1727,7 @@
       "script": "[{\"frame\": 0, \"type\": \"key\", \"key\": \"A\"}]"
     },
     {
-      "error": "event 0: `button` is primary, middle or secondary",
+      "error": "event 0: `button` is primary, middle or secondary (0, 1 or 2)",
       "name": "an unknown button",
       "script": "[{\"frame\": 0, \"type\": \"down\", \"button\": \"left\"}]"
     },
@@ -1704,7 +1747,7 @@
       "script": "[{\"frame\": 0, \"type\": \"text\"}]"
     },
     {
-      "error": "event 0: `a` isn't a pad's button (south, east, west, north, leftshoulder, rightshoulder, lefttrigger, righttrigger, select, start, leftstick, rightstick, up, down, left, right, home)",
+      "error": "event 0: `a` isn't a pad's button (south, east, west, north, leftshoulder, rightshoulder, lefttrigger, righttrigger, select, start, leftstick, rightstick, up, down, left, right, home, or 0 to 16)",
       "name": "an unknown pad button",
       "script": "[{\"frame\": 0, \"type\": \"padpress\", \"button\": \"a\"}]"
     },

@@ -374,6 +374,7 @@ lang_items! {
     PostCommand = "std::io::post_command",
     HostCommand = "std::host::host_command",
     Shipped = "std::io::Shipped",
+    Script = "std::input::Script",
     PrepareCommand = "std::reload::prepare_command",
     UnprepareCommand = "std::reload::unprepare_command",
     HandOverCommand = "std::reload::hand_over_command",
@@ -721,9 +722,9 @@ pub struct FnAttrs {
     pub testing: Option<Span>,
     /// `@test(frames: n)` or `@test(ticks: n)`: what of the program the test runs first (§13).
     pub test_run: Option<TestRun>,
-    /// `@test(frames: n, input: "script.json")`: a script of input events the frames get, by
-    /// its path in the package, and where the path is written.
-    pub test_input: Option<(String, Span)>,
+    /// `@test(frames: n, input: ...)`: the input events the frames (or ticks) get, and where
+    /// the input is written.
+    pub test_input: Option<(TestInput, Span)>,
     /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
     /// their readbacks (§13).
     pub test_gpu: bool,
@@ -794,6 +795,19 @@ pub enum TestRun {
     Frames(u32),
     /// `@test(ticks: n)`: `n` ticks, with no frames.
     Ticks(u32),
+}
+
+/// A frame or tick test's input (`@test(frames: n, input: ...)`, §13.2).
+#[derive(Clone, Debug)]
+pub enum TestInput {
+    /// `input: "path"`: a file in the package, by its path: a script of input events in
+    /// runtime/abi `input`'s format, or a tick test's tick log.
+    File(String),
+    /// `input: NAME` as written, while names resolve: then it's a `Const`, or it's reported
+    /// and the test has no input.
+    Named(ast::Path),
+    /// `input: NAME`: a constant of type `std::input::Script`, whose computed value is the script.
+    Const(ConstId),
 }
 
 /// std's unsafe core (language.md §20, §6.12): the only modules that use `unsafe`, and the

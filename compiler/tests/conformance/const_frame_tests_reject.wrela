@@ -38,3 +38,14 @@ fn too_far() {
 @test(frames: 10, gpu: true, within: 1.0) //~ E0222
 fn within_nothing() {
 }
+
+// A test's input is a `std::input::Script` constant, or a file of the package by its path.
+const LIMIT: u32 = 3
+
+@test(frames: 10, input: LIMIT) //~ E0222
+fn input_of_another_type() {
+}
+
+@test(frames: 10, input: frame) //~ E0222
+fn input_that_isnt_a_constant() {
+}

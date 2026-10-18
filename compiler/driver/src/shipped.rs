@@ -12,7 +12,7 @@ use wrela_sema::defs::Lang;
 use wrela_sema::ty::ConstId;
 
 /// The bytes of a `String`'s value (a `Vec<u8>`'s: its bytes, length and capacity).
-fn string_of(v: &Value) -> Option<String> {
+pub(crate) fn string_of(v: &Value) -> Option<String> {
     let Value::Parts(s) = v else { return None };
     let Value::Parts(vec) = s.first()? else { return None };
     match vec.first()? {

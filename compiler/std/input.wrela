@@ -8,9 +8,12 @@
 // `Input::update` is ordinary code over a run of events.
 //
 // The hosts deliver events through `wrela.input` (runtime/abi `input`): the same events in the
-// same order in Chrome and in the native host, which plays a script of them for tests.
+// same order in Chrome and in the native host, which plays a script of them for tests. A
+// `Script` is one, written as a constant: a frame test's input, and what `wrela script` writes.
 
+use std::fmt::{json_number, json_text}
 use std::hash::StateHash
+use std::math::is_finite
 use std::serialize::Serialize
 
 /// A pointer button.
@@ -675,6 +678,395 @@ impl Input {
     }
 }
 
+/// The most characters a script's `compose` holds (runtime/abi `input`'s `COMPOSE_MAX`).
+const COMPOSE_MAX: u32 = 64
+
+/// A script of input events, each at the frame it arrives before or the tick it's a record of:
+/// a frame or tick test's input (`@test(frames: n, input: NAME)`, language.md §13.2), and what
+/// `wrela script` writes for the native host to play (`wrela-host --input`). `Script::frames()`
+/// or `Script::ticks()` starts one, and each method adds events to it, so a script is a
+/// constant:
+///
+/// ```wrela
+/// use std::input::{Key, Mods, Script}
+///
+/// pub const PEN: Script = Script::frames()
+///     .press(2, Key::A, Mods { meta: true })
+///     .down(5, vec2(150.0, 150.0))
+///     .move_to(6, vec2(180.0, 160.0))
+///     .up(7, vec2(180.0, 160.0))
+/// ```
+///
+/// Each method's `at` is a frame (a tick, in a script that `ticks()` started), and they don't
+/// decrease. A method panics where the hosts would refuse the script (an `at` before the last,
+/// `Key::Unknown`, a value out of its range), so a bad script fails the build of its constant.
+pub struct Script: Clone {
+    // `wrela_driver` reads this field first: the events, in runtime/abi `input`'s script format
+    // (a JSON array, its keys, buttons and actions by number).
+    json: String,
+    ticks: bool,
+    last: u32,
+    count: u32,
+}
+
+impl Script {
+    /// A script with no events, whose events arrive before frames: each method's `at` is a frame.
+    pub fn frames() -> Script {
+        Script { json: String::from("[\n]"), ticks: false, last: 0, count: 0 }
+    }
+
+    /// A script with no events, of a tick test's records: each method's `at` is a tick. A tick
+    /// has no network events, so `message`, `message_text` and `connection` panic.
+    pub fn ticks() -> Script {
+        Script { json: String::from("[\n]"), ticks: true, last: 0, count: 0 }
+    }
+
+    /// The script in runtime/abi `input`'s format: a JSON array of events.
+    pub fn as_json(self) -> borrow str {
+        self.json.as_str()
+    }
+
+    /// The pointer moved to `to`.
+    pub fn move_to(take self, at: u32, to: vec2, mods: Mods = Mods {}) -> Script {
+        var s = take self
+        s.begin(at, "move")
+        s.point(to)
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `button` went down at `point`.
+    pub fn down(
+        take self,
+        at: u32,
+        point: vec2,
+        button: Button = Button::Primary,
+        mods: Mods = Mods {},
+    ) -> Script {
+        var s = take self
+        s.begin(at, "down")
+        s.point(point)
+        s.whole("button", u32(button))
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `button` went up at `point`.
+    pub fn up(
+        take self,
+        at: u32,
+        point: vec2,
+        button: Button = Button::Primary,
+        mods: Mods = Mods {},
+    ) -> Script {
+        var s = take self
+        s.begin(at, "up")
+        s.point(point)
+        s.whole("button", u32(button))
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// A scroll of `delta` pixels at `point`: right and down are positive.
+    pub fn wheel(take self, at: u32, point: vec2, delta: vec2, mods: Mods = Mods {}) -> Script {
+        var s = take self
+        s.begin(at, "wheel")
+        s.point(point)
+        s.number("dx", delta.x)
+        s.number("dy", delta.y)
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `key` went down; `repeat` when it's held and the keyboard repeats it.
+    pub fn key_down(
+        take self,
+        at: u32,
+        key: Key,
+        repeat: bool = false,
+        mods: Mods = Mods {},
+    ) -> Script {
+        var s = take self
+        s.begin(at, "keydown")
+        s.code(key)
+        if repeat {
+            s.flag("repeat", on: true)
+        }
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `key` went up.
+    pub fn key_up(take self, at: u32, key: Key, mods: Mods = Mods {}) -> Script {
+        var s = take self
+        s.begin(at, "keyup")
+        s.code(key)
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `key` went down, then up, in one frame (or tick).
+    pub fn press(take self, at: u32, key: Key, mods: Mods = Mods {}) -> Script {
+        var s = take self
+        s.begin(at, "key")
+        s.code(key)
+        s.held(mods)
+        s.end()
+        s
+    }
+
+    /// `text` was typed: a `Text` event for each of its characters.
+    pub fn text(take self, at: u32, text: str) -> Script {
+        var s = take self
+        s.begin(at, "text")
+        s.string("text", text)
+        s.end()
+        s
+    }
+
+    /// An input method's text being composed is now `text` (empty: nothing is), at most 64
+    /// characters: its `Compose` events.
+    pub fn compose(take self, at: u32, text: str) -> Script {
+        var chars = 0
+        for i in 0..text.len() {
+            if text.byte(i) & 192 != 128 {
+                chars += 1
+            }
+        }
+        if chars > COMPOSE_MAX {
+            panic(f"a script's composed text is at most {COMPOSE_MAX} characters, not {chars}")
+        }
+        var s = take self
+        s.begin(at, "compose")
+        s.string("text", text)
+        s.end()
+        s
+    }
+
+    /// A person pasted: the host keeps what by `serial`.
+    pub fn paste(take self, at: u32, serial: u32 = 0) -> Script {
+        var s = take self
+        s.begin(at, "paste")
+        s.whole("serial", serial)
+        s.end()
+        s
+    }
+
+    /// An assistive technology took `action` on semantic node `node`.
+    pub fn assist(take self, at: u32, node: u32, action: Assist = Assist::Activate) -> Script {
+        var s = take self
+        s.begin(at, "assist")
+        s.whole("node", node)
+        s.whole("action", u32(action))
+        s.end()
+        s
+    }
+
+    /// The field the host keeps for semantic node `node` changed: its newest revision.
+    pub fn field(take self, at: u32, node: u32, revision: u32) -> Script {
+        var s = take self
+        s.begin(at, "field")
+        s.whole("node", node)
+        s.whole("revision", revision)
+        s.end()
+        s
+    }
+
+    /// `bytes` arrived from connection `conn`. Only a frame has network events.
+    pub fn message(take self, at: u32, conn: u32, bytes: [u8]) -> Script {
+        var s = take self
+        s.network(at, "message")
+        s.whole("conn", conn)
+        s.json.push_str(", \"bytes\": [")
+        for i in 0..bytes.len() {
+            if i > 0 {
+                s.json.push_str(", ")
+            }
+            s.json.push_str(f"{bytes[i]}")
+        }
+        s.json.push_str("]")
+        s.end()
+        s
+    }
+
+    /// `text`'s UTF-8 bytes arrived from connection `conn`. Only a frame has network events.
+    pub fn message_text(take self, at: u32, conn: u32, text: str) -> Script {
+        var s = take self
+        s.network(at, "message")
+        s.whole("conn", conn)
+        s.string("text", text)
+        s.end()
+        s
+    }
+
+    /// Connection `conn` opened, or closed. Only a frame has network events.
+    pub fn connection(take self, at: u32, conn: u32, open: bool) -> Script {
+        var s = take self
+        s.network(at, "connection")
+        s.whole("conn", conn)
+        s.flag("open", open)
+        s.end()
+        s
+    }
+
+    /// Gamepad `pad`'s `button` is now pressed, value 1, or not, value 0.
+    pub fn pad_button(
+        take self,
+        at: u32,
+        button: PadButton,
+        pressed: bool,
+        pad: u32 = 0,
+    ) -> Script {
+        var s = take self
+        s.begin(at, "padbutton")
+        s.pad(pad)
+        s.whole("button", u32(button))
+        s.flag("pressed", pressed)
+        s.end()
+        s
+    }
+
+    /// Gamepad `pad`'s `button` has `value`, from 0 to 1 (a trigger's travel), and is pressed or
+    /// not.
+    pub fn pad_button_value(
+        take self,
+        at: u32,
+        button: PadButton,
+        value: f32,
+        pressed: bool,
+        pad: u32 = 0,
+    ) -> Script {
+        if !(value >= 0.0 && value <= 1.0) {
+            panic(f"a script's pad button's value is from 0 to 1, not {value}")
+        }
+        var s = take self
+        s.begin(at, "padbutton")
+        s.pad(pad)
+        s.whole("button", u32(button))
+        s.flag("pressed", pressed)
+        s.number("value", value)
+        s.end()
+        s
+    }
+
+    /// Gamepad `pad`'s `button` was pressed, then let go, in one frame (or tick).
+    pub fn pad_press(take self, at: u32, button: PadButton, pad: u32 = 0) -> Script {
+        var s = take self
+        s.begin(at, "padpress")
+        s.pad(pad)
+        s.whole("button", u32(button))
+        s.end()
+        s
+    }
+
+    /// Gamepad `pad`'s `axis` moved to `value`, from -1 to 1.
+    pub fn pad_axis(take self, at: u32, axis: PadAxis, value: f32, pad: u32 = 0) -> Script {
+        if !(value >= -1.0 && value <= 1.0) {
+            panic(f"a script's pad axis's value is from -1 to 1, not {value}")
+        }
+        var s = take self
+        s.begin(at, "padaxis")
+        s.pad(pad)
+        s.whole("axis", u32(axis))
+        s.number("value", value)
+        s.end()
+        s
+    }
+
+    /// Opens an event of type `ty` at `at`, which isn't before the last event's.
+    fn begin(mut self, at: u32, ty: str) {
+        let unit = if self.ticks { "tick" } else { "frame" }
+        if self.count > 0 && at < self.last {
+            panic(f"a script's {unit}s don't decrease: {unit} {at} comes after {unit} {self.last}")
+        }
+        self.last = at
+        self.count += 1
+        // Before the closing "\n]".
+        self.json.truncate(self.json.len() - 2)
+        if self.count > 1 {
+            self.json.push_str(",")
+        }
+        self.json.push_str(f"\n  {{\"{unit}\": {at}, \"type\": \"{ty}\"")
+    }
+
+    /// [`begin`] for a network event, which only a frame has.
+    fn network(mut self, at: u32, ty: str) {
+        if self.ticks {
+            panic(f"a tick has no network events: a script's `{ty}` is at a frame")
+        }
+        self.begin(at, ty)
+    }
+
+    /// Closes the event, and the array.
+    fn end(mut self) {
+        self.json.push_str("}\n]")
+    }
+
+    fn whole(mut self, key: str, n: u32) {
+        self.json.push_str(f", \"{key}\": {n}")
+    }
+
+    fn number(mut self, key: str, x: f32) {
+        if !is_finite(x) {
+            panic(f"a script's `{key}` is a finite number, not {x}")
+        }
+        self.json.push_str(f", \"{key}\": ")
+        json_number(mut self.json, x)
+    }
+
+    fn flag(mut self, key: str, on: bool) {
+        self.json.push_str(f", \"{key}\": {on}")
+    }
+
+    fn string(mut self, key: str, text: str) {
+        self.json.push_str(f", \"{key}\": \"")
+        json_text(mut self.json, text)
+        self.json.push_str("\"")
+    }
+
+    fn point(mut self, p: vec2) {
+        self.number("x", p.x)
+        self.number("y", p.y)
+    }
+
+    fn code(mut self, key: Key) {
+        if key == Key::Unknown {
+            panic("a script's key is a key the hosts name, not `Key::Unknown`")
+        }
+        self.whole("code", u32(key))
+    }
+
+    fn pad(mut self, pad: u32) {
+        if pad >= PADS {
+            panic(f"a script's pad is 0 to {PADS - 1}, not {pad}")
+        }
+        if pad != 0 {
+            self.whole("pad", pad)
+        }
+    }
+
+    fn held(mut self, mods: Mods) {
+        if mods.shift {
+            self.flag("shift", on: true)
+        }
+        if mods.ctrl {
+            self.flag("ctrl", on: true)
+        }
+        if mods.alt {
+            self.flag("alt", on: true)
+        }
+        if mods.meta {
+            self.flag("meta", on: true)
+        }
+    }
+}
+
 // ---- tests ------------------------------------------------------------------------------------
 
 fn composing(text: [u32]) -> Vec<Event> {
@@ -719,4 +1111,76 @@ fn a_composer_rejects_a_changed_length_mid_change() {
         let _ = c.apply(e)
     }
     assert(c.text == Vec::from([99, 100]), "a fresh whole change must still be accepted")
+}
+
+/// Each method writes its event in runtime/abi `input`'s format, keys and buttons by number,
+/// with the defaults left out or written as the format's own defaults.
+@test
+fn a_script_writes_each_event_in_the_hosts_format() {
+    let s = Script::frames()
+        .move_to(0, vec2(1.5, 2.0))
+        .down(1, vec2(1.5, 2.0))
+        .up(1, vec2(3.0, 4.0), Button::Secondary, Mods { shift: true, meta: true })
+        .wheel(2, vec2(0.0, 0.0), vec2(-3.0, 120.25))
+        .key_down(3, Key::A)
+        .key_down(3, Key::A, repeat: true)
+        .key_up(3, Key::Tab, Mods { ctrl: true, alt: true })
+        .press(4, Key::Left)
+        .text(4, "a\"é")
+        .compose(5, "")
+        .paste(5)
+        .assist(6, node: 9)
+        .assist(6, node: 10, action: Assist::Dismiss)
+        .field(6, node: 3, revision: 7)
+        .message(7, conn: 2, bytes: [0, 255])
+        .message_text(7, conn: 0, text: "hi")
+        .connection(8, conn: 2, open: false)
+        .pad_button(8, PadButton::RightTrigger, pressed: true)
+        .pad_button_value(8, PadButton::LeftTrigger, 0.5, pressed: false, pad: 3)
+        .pad_press(9, PadButton::East)
+        .pad_axis(9, PadAxis::LeftY, -0.75)
+    let want = [
+        "[",
+        "  {\"frame\": 0, \"type\": \"move\", \"x\": 1.5, \"y\": 2},",
+        "  {\"frame\": 1, \"type\": \"down\", \"x\": 1.5, \"y\": 2, \"button\": 0},",
+        "  {\"frame\": 1, \"type\": \"up\", \"x\": 3, \"y\": 4, \"button\": 2, \"shift\": true, \"meta\": true},",
+        "  {\"frame\": 2, \"type\": \"wheel\", \"x\": 0, \"y\": 0, \"dx\": -3, \"dy\": 120.25},",
+        "  {\"frame\": 3, \"type\": \"keydown\", \"code\": 1},",
+        "  {\"frame\": 3, \"type\": \"keydown\", \"code\": 1, \"repeat\": true},",
+        "  {\"frame\": 3, \"type\": \"keyup\", \"code\": 40, \"ctrl\": true, \"alt\": true},",
+        "  {\"frame\": 4, \"type\": \"key\", \"code\": 42},",
+        "  {\"frame\": 4, \"type\": \"text\", \"text\": \"a\\\"é\"},",
+        "  {\"frame\": 5, \"type\": \"compose\", \"text\": \"\"},",
+        "  {\"frame\": 5, \"type\": \"paste\", \"serial\": 0},",
+        "  {\"frame\": 6, \"type\": \"assist\", \"node\": 9, \"action\": 0},",
+        "  {\"frame\": 6, \"type\": \"assist\", \"node\": 10, \"action\": 5},",
+        "  {\"frame\": 6, \"type\": \"field\", \"node\": 3, \"revision\": 7},",
+        "  {\"frame\": 7, \"type\": \"message\", \"conn\": 2, \"bytes\": [0, 255]},",
+        "  {\"frame\": 7, \"type\": \"message\", \"conn\": 0, \"text\": \"hi\"},",
+        "  {\"frame\": 8, \"type\": \"connection\", \"conn\": 2, \"open\": false},",
+        "  {\"frame\": 8, \"type\": \"padbutton\", \"button\": 7, \"pressed\": true},",
+        "  {\"frame\": 8, \"type\": \"padbutton\", \"pad\": 3, \"button\": 6, \"pressed\": false, \"value\": 0.5},",
+        "  {\"frame\": 9, \"type\": \"padpress\", \"button\": 1},",
+        "  {\"frame\": 9, \"type\": \"padaxis\", \"axis\": 1, \"value\": -0.75}",
+        "]",
+    ]
+    var text = String::new()
+    for i in 0..want.len() {
+        if i > 0 {
+            text.push_str("\n")
+        }
+        text.push_str(want[i])
+    }
+    assert(s.as_json() == text.as_str(), s.as_json())
+}
+
+/// A script with no events is an empty array; a tick script's events are at ticks, and events
+/// may share a frame.
+@test
+fn a_scripts_events_are_at_frames_or_ticks() {
+    let empty = Script::frames()
+    assert(empty.as_json() == "[\n]")
+    let t = Script::ticks().pad_press(3, PadButton::South).pad_press(3, PadButton::South)
+    assert(t.as_json().starts_with("[\n  {\"tick\": 3, \"type\": \"padpress\""))
+    assert(t.as_json().ends_with("{\"tick\": 3, \"type\": \"padpress\", \"button\": 0}\n]"))
 }

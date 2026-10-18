@@ -73,6 +73,7 @@ const CONTEXTS: &[Context] = &[
     },
     Context { first: "pub struct Look {", ..NONE },
     Context { first: "use std::derive::Box3", ..NONE },
+    Context { first: "use std::input::{Key, Mods, Script}", ..NONE },
     Context { first: "pub struct Game {", ..NONE },
     Context { first: "pub enum Edit: Copy {", ..NONE },
     Context {

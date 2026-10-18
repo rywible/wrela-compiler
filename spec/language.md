@@ -1243,7 +1243,21 @@ A frame test runs the program first. `@test(frames: n)` goes on a function that 
 - The host checks every command that a frame records, as both hosts do. It answers storage and fetch requests, with storage of the test's own. It has no GPU, so a readback fails the test.
 - Each call (`init`, a frame, the test) gets a test's fuel. So a frame that never ends fails after the same work on every machine.
 - A failure says in which call it happened: `panicked in frame 12 of 600`.
-- `@test(frames: n, input: "script.json")` gives the frames a script of input events, from a file in the package (in the format of runtime/abi's `input`). The host queues each event before the frame it is for. So a test drives a program's UI as a person would; `ui/`'s widgets are tested this way.
+- `@test(frames: n, input: SCRIPT)` gives the frames a script of input events: `SCRIPT` names a constant of type `std::input::Script`, in scope of the test. The host queues each event before the frame it is for (a tick test's, as its tick's records). So a test drives a program's UI as a person would; `ui/`'s widgets are tested this way.
+  - A script is a constant. `Script::frames()` (or `Script::ticks()`) starts one, and each method adds events at a frame (or a tick): `move_to`, `down`, `up`, `wheel`, `key_down`, `key_up`, `press`, `text`, `compose`, `paste`, `assist`, `field`, `message`, `message_text`, `connection`, `pad_button`, `pad_button_value`, `pad_press` and `pad_axis`.
+  - Frames (or ticks) don't decrease. A method panics on what the hosts would refuse, so a bad script fails the build of its constant.
+  - A name that isn't a `Script` constant is E0222, and so is a tick test given a script of frames.
+  - `input: "path"` reads the script from a file in the package instead, in runtime/abi `input`'s format: a JSON array of events. A tick test's file can be a tick log (§16.2).
+
+```wrela
+use std::input::{Key, Mods, Script}
+
+pub const PEN: Script = Script::frames()
+    .press(2, Key::P, Mods { meta: true })
+    .down(5, vec2(150.0, 150.0))
+    .move_to(6, vec2(180.0, 160.0))
+    .up(7, vec2(180.0, 160.0))
+```
 
 #### GPU frame tests and goldens
 
@@ -1769,7 +1783,7 @@ Input (`std::input`) is the pointer, the keyboard and up to four gamepads. `even
 
 All are host services, `std::host`. Positions are in the same pixels as `frame`'s width and height. `Input` keeps what is held and where the pointer is, from the events it is given: `input.read()` reads them, and `input.update(events)` takes them as data.
 
-A call reads only the events that arrived before it started, in the same order on both hosts. The native host plays a script of them (`wrela-host --input script.json`, and a frame test's `@test(frames: n, input: "script.json")`, §13.2). A browser delivers each event to the program's next frame.
+A call reads only the events that arrived before it started, in the same order on both hosts. The native host plays a script of them: a frame test's `@test(frames: n, input: SCRIPT)` (§13.2), and `wrela-host <build> --input script.json`. `wrela script <package> <module>::<NAME> -o script.json` writes a `Script` constant in the hosts' format for it. A browser delivers each event to the program's next frame.
 
 #### Messages
 
@@ -2205,6 +2219,7 @@ The compiler knows the language, a closed list of std items and its targets; the
   - `std::gpu`: `GpuBuffer`, `Slots`, `GlobalId`, `LocalId`, `WorkgroupId`, `VertexIndex`, `InstanceIndex`, `FragCoord`, `ClipPosition`, `Flat`, `Over`, `WithDepth`, `Cull`, `DepthBias`, `Depth`, `dispatch`, `draw`, `buffer`, `write_buffer`, `destroy_buffer`, `copy_buffer`, `GpuSpan`, `GpuSpanMut`, `GpuField`, `field_at`, `begin_screen_pass_command`, `RenderPass`, `Pass`, `DepthPass`, `DepthOnlyPass`, `ScreenPass`, `ScreenDepthPass`, `present`, `Texture`, `DepthTexture`, `Sampler`, `ComparisonSampler`, `create_texture`, `write_texture_rows`, `destroy_texture`, `create_sampler`, `destroy_sampler`, `begin_pass_command`, `end_pass_command`, `label_command`, `texture_sample`, `texture_sample_level`, `texture_sample_compare`, `texture_sample_compare_level`, `texture_load`, `depth_load`, `Texture3d`, `Rgba8`, `Rgba16Float`, `R16Float`, `Rg16Float`, `R32Float`, `R32Uint`, `create_texture_3d`, `texture3d_sample_level`, `texture3d_load`, `texture_width`, `texture_height`, `texture_depth`, `span_len`, `read_buffer_command`, `limit`, `Shared`, `Atomics`, `Append`, `AtomicMap`, `AppendBuffer`, `AtomicMapBuffer`, `local_index`, `workgroup_invocations`, `shared_get`, `shared_set`, `workgroup_barrier`, `discard`, `atomic_len`, `atomic_load`, `atomic_store`, `atomic_add`, `atomic_sub`, `atomic_min`, `atomic_max`, `atomic_and`, `atomic_or`, `atomic_xor`, `atomic_exchange`, `atomic_compare_exchange`, `append_push`, `One`, `one_get`, `one_set`, `DrawArgs`, `DrawIndexedArgs`, `DispatchArgs`, `Texels`, `texels_store`, `Texels3d`, `texels3d_store`, `Kernel`, `VertexShader`, `FragmentShader`
   - `std::host`: `host_command`
   - `std::io`: `next_request`, `request_status`, `storage_read_command`, `storage_write_command`, `fetch_command`, `print_command`, `post_command`, `Shipped`
+  - `std::input`: `Script`
   - `std::mem`: `take_answer`, `take_input`, `take_payload`, `keep_bytes`, `kept_bytes`, `read_clock`, `Drop`, `size_of`, `align_of`, `needs_drop`, `read`, `zeroed`, `write`, `drop_at`, `at`, `at_mut`, `at_mut_pair`, `heap_base`, `memory_pages`, `memory_grow`, `load_u32`, `store_u32`, `load_u8`, `store_u8`, `copy`, `fill`, `compare_swap`, `atomic_add`, `atomic_load`, `atomic_store`, `wait`, `notify`, `run_task`, `task`, `thread_block`, `wait_for`, `abort`, `debug_build`, `test_build`
   - `std::derive`: `Interval`, `Domain`, `gradient`, `value_and_gradient`, `value_gradient_with`, `interval`, `filtered`
   - `std::math`: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh`, `exp`, `exp2`, `log`, `log2`, `pow`
@@ -2251,7 +2266,7 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::gpu` | Buffers (`GpuBuffer<T>`, `GpuSpan<T>`, `buffer`, `write`, `copy`, `read`), textures and samplers, passes, `dispatch` and `draw`, kernel outputs (`Slots<T>`, `Shared<T, N>`, `Atomics<T>`, `Append<T>`, `AtomicMap`, `Texels`, `Texels3d`), typed builtins, lossy encodings, `limits()` (§18) |
 | `std::io` | `load`, `store`, `fetch` and `post`, polled through `Pending<T>`; `print` (§17.1, §17.3) |
 | `std::host` | A client's application services, each a request: `environment`, `decode_image`, `cursor`, `icon`, embedded programs (`open`, `wait_ready`, `show`, `send`, `receive`, `reply`, `wait_closed`, `close`), files (`import_file`, `export_file`), the clipboard (`offer`, `copy`, `pasted`), text input, `publish` (the semantic tree), the page's address and links; and their answers read: `read_environment` (`Environment`), `read_surface`, `read_call` (`Call`), `read_pasted`, `read_glyph` (`GlyphImage`) (§17.1) |
-| `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, `payload` (a message's bytes), and `Input`, the keys and buttons held (§17.2) |
+| `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, `payload` (a message's bytes), `Input`, the keys and buttons held (§17.2), and `Script`, a script of input events for a frame test (§13.2) |
 | `std::semantics` | A program's semantic tree, which a host shows as real elements: `Node`, `Role`, `Field`, `FieldKind`; `structure`, `geometry` and `clip`, the tree's bytes; `changes`, the part of the tree to send since `Sent`; `steps`, a slider's step from an `Assist`; `FieldState` and `read_field_state`, a field's text as the host has it (§17.2) |
 | `std::pack` | `Pack`: values in as few bits as they allow, read back exactly (§6.11) |
 | `std::net` | `Room`, `Log`, `Reduce`: a room's ordered log, delivered exactly once; the host's network commands: a client's `open`, `send` and `close`, and a server's `keep`, `compact`, `tag` and `serve_room` (§19) |

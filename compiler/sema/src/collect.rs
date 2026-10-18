@@ -1007,16 +1007,18 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     /// `@test(frames: n)` or `@test(ticks: n)` (§13), `n` from 1 to [`MAX_TEST_FRAMES`], and,
-    /// with `input: "path"`, the script of input events (or the tick log) they get; with
-    /// `gpu: true`, frames that run on the native host's GPU, and with `golden: "frame.png"`
-    /// too, the PNG the screen after them is compared with, `within` a mean difference.
+    /// with `input: NAME` (a `std::input::Script` constant, resolved with the signatures) or
+    /// `input: "path"` (a file in the package), the script of input events (or the tick log)
+    /// they get; with `gpu: true`, frames that run on the native host's GPU, and with
+    /// `golden: "frame.png"` too, the PNG the screen after them is compared with, `within` a
+    /// mean difference.
     /// Anything else is E0222.
     #[allow(clippy::type_complexity)]
     fn test_run(
         &mut self,
         a: &ast::Attribute,
         args: &[ast::Arg],
-    ) -> (Option<TestRun>, Option<(String, Span)>, bool, Option<Golden>) {
+    ) -> (Option<TestRun>, Option<(TestInput, Span)>, bool, Option<Golden>) {
         let named =
             |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
         let others = args.iter().any(|x| {
@@ -1048,7 +1050,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                 _ => Err(()),
             },
         };
-        let input = path("input");
+        let input = match named("input").map(|x| (&x.value.kind, x.value.span)) {
+            Some((ast::ExprKind::Path(p), span)) => Ok(Some((TestInput::Named(p.clone()), span))),
+            _ => path("input").map(|p| p.map(|(path, span)| (TestInput::File(path), span))),
+        };
         // `gpu: true`: frames on the GPU (not ticks, which draw nothing).
         let gpu = match named("gpu").map(|x| &x.value.kind) {
             None => Ok(false),
@@ -1086,7 +1091,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     Diagnostic::new(
                         codes::E0222,
                         a.span,
-                        format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: \"script.json\"`, a script of input events for them (or, with `ticks`, a tick log to check them against)"),
+                        format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)"),
                     )
                     .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps"),
                 );
@@ -1603,6 +1608,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 PendingItem::Fn(id, f) => {
                     self.fn_signature(*id, f);
                     self.test_signature(*id);
+                    self.test_input(*id);
                     self.testing_export(*id);
                 }
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
@@ -1922,6 +1928,33 @@ impl<'d, 'u> Collector<'d, 'u> {
                 .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics"),
             );
         }
+    }
+
+    /// E0222: `@test(..., input: NAME)` names a constant from the test's module. Its type, a
+    /// `std::input::Script`, is checked once constants' types are known
+    /// ([`check_test_inputs`]).
+    fn test_input(&mut self, id: FnId) {
+        let def = self.p.func(id);
+        let Some((TestInput::Named(path), span)) = &def.attrs.test_input else { return };
+        let (span, module) = (*span, def.module);
+        let r = resolve::resolve_value_item(&self.p, module, path);
+        let input = match r {
+            Some(Res::Const(c)) if !self.p.const_(c).default => Some((TestInput::Const(c), span)),
+            _ => {
+                let name = self.p.text(span).unwrap_or("it").to_string();
+                let what = r.map_or("nothing".to_string(), |r| resolve::describe_res(&self.p, r));
+                self.diags.push(
+                    Diagnostic::new(
+                        codes::E0222,
+                        span,
+                        format!("a test's input `{name}` names {what}, not a constant"),
+                    )
+                    .with_note(INPUT_NOTE),
+                );
+                None
+            }
+        };
+        self.p.fns[id.index()].attrs.test_input = input;
     }
 
     /// W0004: `Clone` written beside `Copy`, which implies it (§3).
@@ -3598,6 +3631,35 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
 /// Whether `t` is a job's value (`Job<f>`), whose parts are known once its body is checked.
 fn is_job(p: &Program, t: TyId) -> bool {
     matches!(p.types.kind(t), TyKind::Adt(a, _) if p.is_lang_adt(*a, Lang::Job))
+}
+
+/// What a test's input is (§13.2), for its errors.
+const INPUT_NOTE: &str = "a test's input is a `std::input::Script` constant (`input: SCRIPT`), or a file in the package (`input: \"path\"`): a script in runtime/abi `input`'s format, or with `ticks` a tick log";
+
+/// E0222: each `@test(..., input: NAME)` names a constant of type `std::input::Script`, given
+/// the constants' types (`tys`).
+pub fn check_test_inputs(p: &Program, tys: &crate::check::ConstTypes) -> Vec<Diagnostic> {
+    let mut out = Vec::new();
+    for f in &p.fns {
+        let Some((TestInput::Const(c), span)) = &f.attrs.test_input else { continue };
+        // A constant whose type isn't known has an error of its own.
+        let Some(&t) = tys.get(c) else { continue };
+        if p.lang_of_ty(t) != Some(Lang::Script) {
+            out.push(
+                Diagnostic::new(
+                    codes::E0222,
+                    *span,
+                    format!(
+                        "a test's input {} is a `{}`, not a `std::input::Script`",
+                        p.const_(*c).short(),
+                        p.display_ty(t)
+                    ),
+                )
+                .with_note(INPUT_NOTE),
+            );
+        }
+    }
+    out
 }
 
 /// E0407 for a struct that declares `Clone` or a `@fieldwise` trait whose field is a job's value

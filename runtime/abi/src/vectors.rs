@@ -1642,6 +1642,22 @@ fn input_scripts() -> Value {
   {"frame": 2, "type": "assist", "node": 10}
 ]"#,
         ),
+        (
+            "keys, buttons, axes and actions by number",
+            r#"[
+  {"frame": 0, "type": "key", "code": 1, "meta": true},
+  {"frame": 1, "type": "down", "x": 1, "y": 2, "button": 2},
+  {"frame": 2, "type": "assist", "node": 4, "action": 5},
+  {"frame": 3, "type": "padbutton", "button": 7, "pressed": true},
+  {"frame": 3, "type": "padaxis", "axis": 3, "value": 0.25}
+]"#,
+        ),
+        ("a key's number past the keys", r#"[{"frame": 0, "type": "key", "code": 90}]"#),
+        ("a key and a code", r#"[{"frame": 0, "type": "key", "key": "KeyA", "code": 1}]"#),
+        (
+            "a pad button's number past the list",
+            r#"[{"frame": 0, "type": "padpress", "button": 17}]"#,
+        ),
         ("an assist with no node", r#"[{"frame": 0, "type": "assist"}]"#),
         (
             "an unknown assist action",

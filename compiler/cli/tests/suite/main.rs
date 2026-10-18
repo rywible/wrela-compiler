@@ -8,6 +8,7 @@ mod fix;
 mod profile;
 mod query;
 mod refactor;
+mod script;
 mod solve;
 mod studio;
 mod test;

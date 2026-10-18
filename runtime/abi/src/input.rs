@@ -100,7 +100,10 @@
 //! `meta` default to false. A pad's events name its `pad` (0 to 3, default 0); a `padbutton`
 //! names its `button` (as [`PAD_BUTTONS`] does) and whether it's `pressed`, and its `value`
 //! defaults to 1 pressed and 0 not; a `padaxis` names its `axis` ([`PAD_AXES`]) and its
-//! `value`, from -1 to 1. [`parse_script`] reads one.
+//! `value`, from -1 to 1. Instead of a name, a key may be its number (`"code": 1` for
+//! `"key": "KeyA"`, as [`KEYS`] numbers them), and a `button`, an `axis` or an `action` its
+//! number in its list: std's `Script` writes them so (`wrela script` prints one). [`parse_script`]
+//! reads one.
 //!
 //! ```json
 //! [
@@ -522,22 +525,42 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             .iter()
             .try_fold(0, |m, (k, bit)| flag(k).map(|on| if on { m | bit } else { m }))?;
         let ty = o.get("type").and_then(Value::as_str).ok_or_else(|| at("`type` is missing"))?;
+        // A name of `names`, or its number.
+        let index = |key: &str, names: &[&str]| -> Option<Option<u32>> {
+            let v = o.get(key)?;
+            let n = match v.as_str() {
+                Some(name) => names.iter().position(|n| *n == name).map(|i| i as u32),
+                None => number(key).flatten(),
+            };
+            Some(n.filter(|&n| (n as usize) < names.len()))
+        };
         let button = || -> Result<u32, String> {
-            match o.get("button") {
+            match index("button", &BUTTONS) {
                 None => Ok(0),
-                Some(v) => v
-                    .as_str()
-                    .and_then(|b| BUTTONS.iter().position(|x| *x == b))
-                    .map(|b| b as u32)
-                    .ok_or_else(|| at("`button` is primary, middle or secondary")),
+                Some(b) => {
+                    b.ok_or_else(|| at("`button` is primary, middle or secondary (0, 1 or 2)"))
+                }
             }
         };
         let key = || -> Result<u32, String> {
-            let name =
-                o.get("key").and_then(Value::as_str).ok_or_else(|| at("`key` is missing"))?;
-            match key_code(name) {
-                0 => Err(at(&format!("`{name}` isn't a key (they're DOM codes, such as KeyA)"))),
-                k => Ok(k),
+            match (o.get("key"), o.get("code")) {
+                (Some(_), Some(_)) => Err(at("a key is its `key` or its `code`, not both")),
+                (None, Some(_)) => number("code")
+                    .flatten()
+                    .filter(|&k| k != 0 && (k as usize) < KEYS.len())
+                    .ok_or_else(|| {
+                        at(&format!("`code` is a key's number, 1 to {}", KEYS.len() - 1))
+                    }),
+                (Some(v), None) => {
+                    let name = v.as_str().ok_or_else(|| at("`key` must be a DOM code"))?;
+                    match key_code(name) {
+                        0 => Err(at(&format!(
+                            "`{name}` isn't a key (they're DOM codes, such as KeyA)"
+                        ))),
+                        k => Ok(k),
+                    }
+                }
+                (None, None) => Err(at("`key` (or `code`) is missing")),
             }
         };
         let pad = || -> Result<u32, String> {
@@ -549,16 +572,17 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     .ok_or_else(|| at("`pad` is 0, 1, 2 or 3")),
             }
         };
-        let named =
-            |key: &str, names: &[&str]| -> Result<u32, String> {
-                let name = o
-                    .get(key)
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| at(&format!("`{key}` is missing")))?;
-                names.iter().position(|n| *n == name).map(|i| i as u32).ok_or_else(|| {
-                    at(&format!("`{name}` isn't a pad's {key} ({})", names.join(", ")))
-                })
-            };
+        let named = |key: &str, names: &[&str]| -> Result<u32, String> {
+            index(key, names).ok_or_else(|| at(&format!("`{key}` is missing")))?.ok_or_else(|| {
+                let v = &o[key];
+                let v = v.as_str().map_or_else(|| v.to_string(), str::to_string);
+                at(&format!(
+                    "`{v}` isn't a pad's {key} ({}, or 0 to {})",
+                    names.join(", "),
+                    names.len() - 1
+                ))
+            })
+        };
         let mut push = |event| out.push(Scripted { at: when, event, payload: Vec::new() });
         match ty {
             "move" => {
@@ -605,15 +629,11 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             "assist" => {
                 let node =
                     number("node").flatten().ok_or_else(|| at("`node` must be a whole number"))?;
-                let action = match o.get("action") {
+                let action = match index("action", &ASSIST_ACTIONS) {
                     None => 0,
-                    Some(v) => v
-                        .as_str()
-                        .and_then(|a| ASSIST_ACTIONS.iter().position(|x| *x == a))
-                        .map(|a| a as u32)
-                        .ok_or_else(|| {
-                            at("`action` is activate, select, focus, increment, decrement or dismiss")
-                        })?,
+                    Some(a) => a.ok_or_else(|| {
+                        at("`action` is activate, select, focus, increment, decrement or dismiss (0 to 5)")
+                    })?,
                 };
                 push(Event::assist(node, action));
             }
@@ -1048,6 +1068,79 @@ mod tests {
         assert_eq!(q.len(), 1);
         assert_eq!(q.take(8), Event::text('c').bytes());
         assert!(q.is_empty());
+    }
+
+    /// A key's number (`code`) and a button's, an axis's or an action's number read as its name
+    /// does; a number past its list says why.
+    #[test]
+    fn numbers_read_as_names() {
+        let named = r#"[
+            {"frame": 0, "type": "key", "key": "KeyA", "meta": true},
+            {"frame": 1, "type": "down", "x": 1, "y": 2, "button": "secondary"},
+            {"frame": 2, "type": "assist", "node": 4, "action": "dismiss"},
+            {"frame": 3, "type": "padbutton", "button": "righttrigger", "pressed": true},
+            {"frame": 3, "type": "padaxis", "axis": "righty", "value": 0.25}
+        ]"#;
+        let numbered = r#"[
+            {"frame": 0, "type": "key", "code": 1, "meta": true},
+            {"frame": 1, "type": "down", "x": 1, "y": 2, "button": 2},
+            {"frame": 2, "type": "assist", "node": 4, "action": 5.0},
+            {"frame": 3, "type": "padbutton", "button": 7, "pressed": true},
+            {"frame": 3, "type": "padaxis", "axis": 3, "value": 0.25}
+        ]"#;
+        assert_eq!(parse_script(named), parse_script(numbered));
+        for (text, why) in [
+            (r#"[{"frame": 0, "type": "key", "code": 0}]"#, "`code` is a key's number, 1 to 89"),
+            (r#"[{"frame": 0, "type": "key", "code": 90}]"#, "`code` is a key's number"),
+            (r#"[{"frame": 0, "type": "key", "code": 1.5}]"#, "`code` is a key's number"),
+            (r#"[{"frame": 0, "type": "key", "key": "KeyA", "code": 1}]"#, "not both"),
+            (r#"[{"frame": 0, "type": "key"}]"#, "`key` (or `code`) is missing"),
+            (r#"[{"frame": 0, "type": "down", "button": 3}]"#, "`button` is primary"),
+            (r#"[{"frame": 0, "type": "assist", "node": 1, "action": 6}]"#, "`action` is"),
+            (r#"[{"frame": 0, "type": "padpress", "button": 17}]"#, "`17` isn't a pad's button"),
+            (r#"[{"frame": 0, "type": "padaxis", "axis": -1, "value": 0}]"#, "isn't a pad's axis"),
+        ] {
+            let e = parse_script(text).expect_err(text);
+            assert!(e.contains(why), "{text}: {e}");
+        }
+    }
+
+    /// std's `Script` writes keys, pointer buttons, pad buttons and axes, and assistive actions
+    /// as their std enums' discriminants (compiler/std/input.wrela), which are their numbers
+    /// here: each enum's variants are this module's list, in order.
+    #[test]
+    fn std_enums_number_as_the_abi_does() {
+        let std = include_str!("../../../compiler/std/input.wrela");
+        let variants = |name: &str| -> Vec<String> {
+            let head = format!("pub enum {name}:");
+            let start = std.find(&head).unwrap_or_else(|| panic!("std has no enum {name}"));
+            std[start..]
+                .lines()
+                .skip(1)
+                .map(str::trim)
+                .take_while(|l| *l != "}")
+                .filter(|l| !l.is_empty() && !l.starts_with("//"))
+                .map(|l| l.strip_suffix(',').expect("a fieldless variant").to_string())
+                .collect()
+        };
+        let lower = |name: &str| -> Vec<String> {
+            variants(name).iter().map(|v| v.to_lowercase()).collect()
+        };
+        assert_eq!(lower("Button"), BUTTONS);
+        assert_eq!(lower("PadButton"), PAD_BUTTONS);
+        assert_eq!(lower("PadAxis"), PAD_AXES);
+        assert_eq!(lower("Assist"), ASSIST_ACTIONS);
+        // std's keys drop DOM's `Key` and `Arrow`.
+        let keys = variants("Key");
+        assert_eq!(keys.len(), KEYS.len());
+        for (i, (k, dom)) in keys.iter().zip(KEYS).enumerate() {
+            let same = *k == dom || format!("Key{k}") == dom || format!("Arrow{k}") == dom;
+            assert!(same, "std's Key::{k} is key {i}, which is {dom}");
+            // `key_of`, which reads a key's number, agrees.
+            if i > 0 {
+                assert!(std.contains(&format!("        {i} => Key::{k},\n")), "key_of({i})");
+            }
+        }
     }
 
     /// Key numbers are a stable table: no name twice, and the first is "no key".

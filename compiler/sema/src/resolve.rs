@@ -282,7 +282,8 @@ pub fn visible_names(p: &Program, m: ModuleId) -> Vec<String> {
     out
 }
 
-fn describe_res(p: &Program, r: Res) -> String {
+/// How a diagnostic names what `r` is: "the constant `X`", "the type `T`".
+pub(crate) fn describe_res(p: &Program, r: Res) -> String {
     match r {
         Res::Module(m) => format!("the module `{}`", p.module(m).name()),
         Res::Adt(a) => format!("the type `{}`", p.adt(a).name),

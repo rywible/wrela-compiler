@@ -192,7 +192,9 @@ fn check(
         for t in 0..p.traits.len() {
             diags.extend(fieldwise::check_trait(p, ty::TraitId(t as u32)));
         }
-        check::check_consts(p, diags)
+        let consts = check::check_consts(p, diags);
+        diags.extend(collect::check_test_inputs(p, &consts.tys));
+        consts
     };
     // A constant's type is the result of the function the build runs to compute it.
     for (&c, &t) in &consts.tys {

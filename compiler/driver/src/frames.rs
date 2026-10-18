@@ -5,9 +5,10 @@
 //! 60 a second on a 640 × 480 screen (a program with a ticker ticks in lockstep with them,
 //! #43 §2.3), or `n` ticks with no frames, then the test with the program's state. Each test
 //! runs on a new instance, with storage of its own, and each call (`init`, a frame, a tick, the
-//! test) gets a test's fuel. A test with `input: "script.json"` gets the script's input events
-//! (runtime/abi `input`), each queued before the frame it's for, or as its tick's records; a
-//! tick test's input can instead be a tick log (runtime/abi `ticks`), whose records its ticks
+//! test) gets a test's fuel. A test with `input: NAME`, a `std::input::Script` constant, or
+//! `input: "path"`, a file of the package in runtime/abi `input`'s script format, gets the
+//! script's input events, each queued before the frame it's for, or as its tick's records; a
+//! tick test's file can instead be a tick log (runtime/abi `ticks`), whose records its ticks
 //! get, and whose state hashes each tick's must be.
 
 use crate::build;
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceMap, codes, has_errors};
 use wrela_lower::BuildData;
 use wrela_sema::Checked;
-use wrela_sema::defs::{Golden, TestRun};
+use wrela_sema::defs::{Golden, TestInput, TestRun};
 use wrela_sema::ty::FnId;
 
 /// Frames a second, and the screen's size in pixels, that a frame test's frames get.
@@ -90,17 +91,18 @@ pub fn run(
     for (i, &f) in tests.iter().enumerate() {
         let attrs = &checked.program.func(f).attrs;
         let run = attrs.test_run.unwrap_or(TestRun::Frames(1));
+        let ticks = matches!(run, TestRun::Ticks(_));
         let input = match &attrs.test_input {
             None => Input::Script(Vec::new()),
-            Some((path, span)) => match read_input(root, path, matches!(run, TestRun::Ticks(_))) {
+            Some((input, span)) => match input_of(checked, data, root, input, ticks) {
                 Ok(s) => s,
-                Err(why) => {
+                Err((shown, why)) => {
                     let d = Diagnostic::new(
                         codes::E0222,
                         *span,
-                        format!("the test's input `{path}` {why}"),
+                        format!("the test's input {shown} {why}"),
                     )
-                    .with_note("a script is a JSON array of input events, by the frame each arrives before or the tick it's a record of (runtime/abi `input`); a tick test's input may be a tick log instead (runtime/abi `ticks`)");
+                    .with_note("a script is a JSON array of input events, by the frame each arrives before or the tick it's a record of (runtime/abi `input`), which a `std::input::Script` constant holds; a tick test's file may be a tick log instead (runtime/abi `ticks`)");
                     results.push((f, Some(d), wrela_host::Traced::default()));
                     continue;
                 }
@@ -184,6 +186,37 @@ fn failed(
 enum Input {
     Script(Vec<wrela_host::Scripted>),
     Log(wrela_host::TickLog),
+}
+
+/// A test's input (a tick test's, with `ticks`): a `Script` constant's computed value, or the
+/// file at its path in the package at `root`. Else how to name it in an error, and why.
+fn input_of(
+    checked: &Checked,
+    data: &BuildData,
+    root: &Path,
+    input: &TestInput,
+    ticks: bool,
+) -> Result<Input, (String, String)> {
+    match input {
+        TestInput::File(path) => {
+            read_input(root, path, ticks).map_err(|why| (format!("`{path}`"), why))
+        }
+        TestInput::Const(c) => {
+            let shown = checked.program.const_(*c).short();
+            let Some(json) = crate::script::json_of(checked, data, *c) else {
+                return Err((shown, "has no computed value".into()));
+            };
+            let script = wrela_host::parse_script(&json)
+                .map_err(|e| (shown.clone(), format!("isn't a script: {e}")))?;
+            if ticks && script.iter().any(|s| matches!(s.at, wrela_abi::input::At::Frame(_))) {
+                let why = "has events at frames, and a tick test runs no frames: start it with `Script::ticks()`";
+                return Err((shown, why.into()));
+            }
+            Ok(Input::Script(script))
+        }
+        // Names resolve as the program is checked: one that didn't was reported then.
+        TestInput::Named(_) => Err(("name".into(), "names no constant".into())),
+    }
 }
 
 /// The input at `path` in the package at `root`, or why it can't be read: a tick log (for a

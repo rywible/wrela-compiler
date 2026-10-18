@@ -23,6 +23,7 @@ pub mod package;
 pub mod primer;
 pub mod query;
 pub mod refactor;
+pub mod script;
 pub mod serve;
 pub mod shipped;
 pub mod studio;

@@ -76,7 +76,7 @@ fn a_made_colour_glyph_draws_its_colour() {
     assert_eq!(count, 1);
 }
 
-/// Every widget's frame test, each driven by a script of input (ui/tests/widgets/scripts).
+/// Every widget's frame test, each driven by a script of input (ui/tests/widgets/scripts.wrela).
 #[test]
 fn the_widgets_pass_their_frame_tests() {
     let out = wrela_driver::test(&wrela_tests::repo_root().join("ui/tests/widgets"), None);

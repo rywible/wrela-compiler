@@ -28,6 +28,9 @@
 //!                                         run the package's `@test` functions (§13), or
 //!                                         those whose names contain `filter`; exit 1 if one
 //!                                         fails
+//! wrela script <package-dir> <module>::<NAME> [-o <file>]
+//!                                         a `std::input::Script` constant as the hosts'
+//!                                         script format, for `wrela-host --input`
 //! wrela primer [area]                     the language's rules, each with a program that
 //!                                         keeps it and one that breaks it
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
@@ -86,6 +89,7 @@ mod query;
 mod refactor;
 mod reference;
 mod run;
+mod script;
 mod solve;
 mod studio;
 mod sweeps;
@@ -105,6 +109,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela pipelines <package-dir> [--json]",
         "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
+        "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
@@ -149,6 +154,7 @@ fn main() -> ExitCode {
         "audio" => audio::run(rest),
         "reference" => reference::run(rest),
         "solve" => solve::run(rest),
+        "script" => script::run(rest),
         "primer" => primer::run(rest),
         "query" => query::query(rest),
         "refactor" => refactor::run(rest),

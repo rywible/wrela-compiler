@@ -166,16 +166,27 @@ export function parseScript(text: string): Scripted[] {
     }
     const type = o.type;
     if (typeof type !== "string") throw at("`type` is missing");
+    // A name of `names`, or its number: -1 for neither.
+    const index = (v: unknown, names: readonly string[]) => {
+      const i = typeof v === "string" ? names.indexOf(v) : whole(v) ? (v as number) : -1;
+      return i < names.length ? i : -1;
+    };
     const button = () => {
-      const v = o.button;
-      if (v === undefined) return 0;
-      const b = BUTTONS.findIndex((x) => x === v);
-      if (b < 0) throw at("`button` is primary, middle or secondary");
+      if (o.button === undefined) return 0;
+      const b = index(o.button, BUTTONS);
+      if (b < 0) throw at("`button` is primary, middle or secondary (0, 1 or 2)");
       return b;
     };
     const key = () => {
+      if (o.key !== undefined && o.code !== undefined) throw at("a key is its `key` or its `code`, not both");
+      if (o.code !== undefined) {
+        const k = o.code;
+        if (!whole(k) || k === 0 || (k as number) >= KEYS.length) throw at(`\`code\` is a key's number, 1 to ${KEYS.length - 1}`);
+        return k as number;
+      }
       const name = o.key;
-      if (typeof name !== "string") throw at("`key` is missing");
+      if (name === undefined) throw at("`key` (or `code`) is missing");
+      if (typeof name !== "string") throw at("`key` must be a DOM code");
       const k = keyCode(name);
       if (k === 0) throw at(`\`${name}\` isn't a key (they're DOM codes, such as KeyA)`);
       return k;
@@ -187,10 +198,13 @@ export function parseScript(text: string): Scripted[] {
       return v;
     };
     const named = (key: string, names: readonly string[]) => {
-      const name = o[key];
-      if (typeof name !== "string") throw at(`\`${key}\` is missing`);
-      const i = names.indexOf(name);
-      if (i < 0) throw at(`\`${name}\` isn't a pad's ${key} (${names.join(", ")})`);
+      const v = o[key];
+      if (v === undefined) throw at(`\`${key}\` is missing`);
+      const i = index(v, names);
+      if (i < 0) {
+        const shown = typeof v === "string" ? v : JSON.stringify(v);
+        throw at(`\`${shown}\` isn't a pad's ${key} (${names.join(", ")}, or 0 to ${names.length - 1})`);
+      }
       return i;
     };
     const push = (event: Uint8Array) => out.push({ at: when, event });
@@ -252,8 +266,8 @@ export function parseScript(text: string): Scripted[] {
         if (!whole(o.node)) throw at("`node` must be a whole number");
         let action = 0;
         if (o.action !== undefined) {
-          action = ASSIST_ACTIONS.findIndex((a) => a === o.action);
-          if (action < 0) throw at("`action` is activate, select, focus, increment, decrement or dismiss");
+          action = index(o.action, ASSIST_ACTIONS);
+          if (action < 0) throw at("`action` is activate, select, focus, increment, decrement or dismiss (0 to 5)");
         }
         push(assistEvent(o.node as number, action));
         break;
