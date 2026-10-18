@@ -98,8 +98,11 @@ impl Blobs {
     }
 
     /// Puts `data` in blob `id`, made by [`Blobs::create_reserved`] with at least as many bytes
-    /// reserved: its bytes take the reservation's place, and what's left of it is let go.
-    pub(crate) fn fill(&mut self, id: u32, data: Vec<u8>) -> Result<(), String> {
+    /// reserved: its bytes take the reservation's place, and what's left of it is let go. The
+    /// blob keeps only its bytes, not room the work that made them had (an encoder's worst
+    /// case): `data` is shrunk to fit first, while the reservation still counts it.
+    pub(crate) fn fill(&mut self, id: u32, mut data: Vec<u8>) -> Result<(), String> {
+        data.shrink_to_fit();
         let Some(&room) = self.reserved.get(&id) else {
             return Err(format!("blob {id} has no bytes reserved"));
         };
@@ -112,6 +115,40 @@ impl Blobs {
         self.reserved.remove(&id);
         self.bytes = self.bytes - room + len;
         Ok(())
+    }
+
+    /// Counts `bytes` against the budget, with no handle, before they're held: a served post's
+    /// body, from the moment its length is known until it's a blob or it's gone
+    /// ([`Blobs::refund`], [`Blobs::adopt`]).
+    pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), String> {
+        self.reserve(bytes)?;
+        self.bytes += bytes;
+        Ok(())
+    }
+
+    /// Gives back `bytes` that [`Blobs::charge`] counted.
+    pub(crate) fn refund(&mut self, bytes: u64) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+    }
+
+    /// A new blob of `data`, made for `request`, whose bytes [`Blobs::charge`] counted already:
+    /// they're the blob's now. With no handle left, `data` comes back, still charged.
+    pub(crate) fn adopt(&mut self, request: u32, data: Vec<u8>) -> Result<u32, (String, Vec<u8>)> {
+        let id = match self.create(request) {
+            Ok(id) => id,
+            Err(why) => return Err((why, data)),
+        };
+        self.held.insert(id, Arc::new(data));
+        Ok(id)
+    }
+
+    /// The bytes the budget counts, and the bytes the blobs hold with their room to grow: what a
+    /// test compares.
+    #[cfg(test)]
+    pub(crate) fn counted(&self) -> (u64, u64) {
+        let held = self.held.values().map(|b| b.capacity() as u64).sum::<u64>()
+            + self.reserved.values().sum::<u64>();
+        (self.bytes, held)
     }
 
     /// Whether `more` bytes fit the budget beside what the blobs hold.
@@ -279,6 +316,22 @@ mod tests {
         assert!(h.get(held).is_err());
         h.create_reserved(3, 100).expect("all of the budget is free again");
         assert_eq!(h.release_all(), (1, 100));
+    }
+
+    #[test]
+    fn charged_bytes_count_until_refunded_or_adopted_by_a_blob() {
+        let mut b = Blobs::new(BlobBudget { bytes: 10, handles: 1 });
+        b.charge(6).expect("6 bytes fit");
+        assert!(b.charge(6).unwrap_err().contains("budget"), "the 6 are counted");
+        let id = b.adopt(1, vec![1; 6]).expect("a blob of them");
+        assert!(b.fits(5).is_err(), "still counted, as the blob's");
+        b.charge(4).expect("4 more fit");
+        let (why, back) = b.adopt(2, vec![2; 4]).expect_err("no handle is left");
+        assert!(why.contains("blobs") && back.len() == 4);
+        b.refund(4);
+        assert_eq!(b.rollback(1), 1, "an adopted blob is its request's");
+        assert!(b.get(id).is_err());
+        b.charge(10).expect("all of the budget is free again");
     }
 
     #[test]

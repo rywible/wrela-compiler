@@ -1,18 +1,17 @@
-//! The little HTTP the toolchain's servers speak (the studio's, `serve.rs`, and `wrela run`'s,
-//! `live.rs`): one request per connection, on 127.0.0.1 only. A request must name this machine
-//! as its host (so a page elsewhere can't reach a server through DNS rebinding), and a post must
-//! come from the server's own pages (their `Origin`), so another site open in the browser can't
-//! change files. A put (test mode's results) isn't checked for its origin: a browser asks a
-//! server before another site's page may put, and these servers answer no such question.
+//! The toolchain's local servers' HTTP (the studio's, `serve.rs`, and `wrela run`'s, `live.rs`):
+//! the protocol is `wrela_host::loopback`'s, which a tool's server (`std::tool::serve`) speaks
+//! too: 127.0.0.1 only, a host that names this machine, posts only from the server's own pages,
+//! and files reached through a directory handle following no link. This is how these servers
+//! listen, read a whole request, and serve a directory by its path.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use wrela_host::loopback;
 
-/// The largest request body a server takes (a test's frame, an edit's JSON).
-pub(crate) const MAX_BODY: usize = 16 << 20;
+pub(crate) use wrela_host::loopback::{listen, respond};
 
 /// A request: its method, its path and query, and its body.
 pub(crate) struct Request {
@@ -27,14 +26,6 @@ impl Request {
     pub fn param(&self, key: &str) -> Option<&str> {
         self.query.split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
     }
-}
-
-/// Listens on 127.0.0.1:`port` (0: a free port): the listener, and its port.
-pub(crate) fn listen(port: u16) -> Result<(TcpListener, u16), String> {
-    let listener = TcpListener::bind(("127.0.0.1", port))
-        .map_err(|e| format!("can't listen on 127.0.0.1:{port}: {e}"))?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    Ok((listener, port))
 }
 
 /// Answers `listener`'s connections from a thread of its own, each with `handle` on a thread of
@@ -70,54 +61,19 @@ pub(crate) fn stop(port: u16, stopping: &AtomicBool) -> bool {
 /// refusal is answered).
 pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Request>> {
     let mut reader = BufReader::new(stream.try_clone()?);
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/"));
-    let mut length = 0usize;
-    let (mut host, mut origin) = (String::new(), None::<String>);
-    loop {
-        let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 || h.trim().is_empty() {
-            break;
-        }
-        if let Some((k, v)) = h.split_once(':') {
-            let (k, v) = (k.trim(), v.trim());
-            if k.eq_ignore_ascii_case("content-length") {
-                length = v.parse().unwrap_or(0);
-            } else if k.eq_ignore_ascii_case("host") {
-                host = v.to_ascii_lowercase();
-            } else if k.eq_ignore_ascii_case("origin") {
-                origin = Some(v.to_ascii_lowercase());
-            }
-        }
-    }
     let mut out = stream.try_clone()?;
-    let local = ["127.0.0.1", "localhost", "[::1]"];
-    if !local.iter().any(|h| host == *h || host == format!("{h}:{port}")) {
-        respond(
-            &mut out,
-            403,
-            "text/plain",
-            b"this server answers only requests for this machine",
-        )?;
-        return Ok(None);
-    }
-    // A post only from this server's own pages.
-    if method == "POST" && origin.as_deref() != Some(format!("http://{host}").as_str()) {
-        respond(&mut out, 403, "text/plain", b"posts are taken only from this server's pages")?;
-        return Ok(None);
-    }
-    // A body past the cap is refused, not cut short (and then written as if whole).
-    if length > MAX_BODY {
-        let why = format!("a request's body is at most {MAX_BODY} bytes");
-        respond(&mut out, 413, "text/plain", why.as_bytes())?;
-        return Ok(None);
-    }
-    let mut body = vec![0u8; length];
+    let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(None) };
+    let mut body = vec![0u8; head.length];
     reader.read_exact(&mut body)?;
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    Ok(Some(Request { method, path: path.to_string(), query: query.to_string(), body }))
+    Ok(Some(Request { method: head.method, path: head.path, query: head.query, body }))
+}
+
+/// The directory `root`, opened, if it isn't a symbolic link itself.
+fn open(root: &Path) -> Option<cap_std::fs::Dir> {
+    if std::fs::symlink_metadata(root).ok()?.file_type().is_symlink() {
+        return None;
+    }
+    cap_std::fs::Dir::open_ambient_dir(root, cap_std::ambient_authority()).ok()
 }
 
 /// Writes a test-mode result (`PUT /results/<name>`) under `root`: a plain file name only.
@@ -127,19 +83,11 @@ pub(crate) fn put_result(
     name: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
-    let plain = !name.is_empty()
-        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-        && !name.starts_with('.');
-    if !plain {
-        return respond(out, 403, "text/plain", b"a result is a plain file name");
-    }
-    let results = root.join("results");
-    if crate::ensure_no_symlink_path(root, &results.join(name)).is_err() {
+    let _ = std::fs::create_dir_all(root);
+    let Some(dir) = open(root) else {
         return respond(out, 403, "text/plain", b"a result path cannot contain a symbolic link");
-    }
-    std::fs::create_dir_all(&results)?;
-    crate::write_atomic(&results.join(name), body)?;
-    respond(out, 201, "text/plain", b"")
+    };
+    loopback::put_result(out, &dir, name, &mut &body[..], body.len() as u64)
 }
 
 /// Answers a GET of the file at `rel` in `dir`, an `index.html` as `page` makes it of the
@@ -148,96 +96,16 @@ pub(crate) fn get_file(
     out: &mut TcpStream,
     dir: &Path,
     rel: &str,
-    page: impl FnOnce(&str) -> String,
+    page: impl Fn(&str) -> String,
 ) -> std::io::Result<()> {
-    // Request paths still contain URL escapes. Decode once before checking or joining a path:
-    // checking the encoded spelling would let `%2e%2e` escape the build directory.
-    let Some(rel) = decode_path(rel) else {
-        return respond(out, 404, "text/plain", b"not found");
-    };
-    if wrela_abi::check::path_problem(&rel).is_some()
-        || crate::ensure_no_symlink_path(dir, &dir.join(&rel)).is_err()
-    {
-        return respond(out, 404, "text/plain", b"not found");
-    }
-    match std::fs::read(dir.join(&rel)) {
-        Ok(mut bytes) => {
-            if rel == "index.html" {
-                bytes = page(&String::from_utf8_lossy(&bytes)).into_bytes();
-            }
-            respond(out, 200, mime(&rel), &bytes)
-        }
-        Err(_) => respond(out, 404, "text/plain", b"not found"),
-    }
-}
-
-fn decode_path(path: &str) -> Option<String> {
-    fn hex(byte: u8) -> Option<u8> {
-        match byte {
-            b'0'..=b'9' => Some(byte - b'0'),
-            b'a'..=b'f' => Some(byte - b'a' + 10),
-            b'A'..=b'F' => Some(byte - b'A' + 10),
-            _ => None,
-        }
-    }
-
-    let mut decoded = Vec::with_capacity(path.len());
-    let mut bytes = path.bytes();
-    while let Some(byte) = bytes.next() {
-        if byte == b'%' {
-            let value = hex(bytes.next()?)? * 16 + hex(bytes.next()?)?;
-            // A URL escape cannot introduce a new path part after routing has selected a file.
-            if value == b'/' || value == b'\\' {
-                return None;
-            }
-            decoded.push(value);
-        } else {
-            decoded.push(byte);
-        }
-    }
-    String::from_utf8(decoded).ok()
-}
-
-fn mime(path: &str) -> &'static str {
-    match path.rsplit('.').next() {
-        Some("html") => "text/html; charset=utf-8",
-        Some("js") => "text/javascript",
-        Some("wasm") => "application/wasm",
-        Some("json") => "application/json",
-        Some("wgsl") => "text/plain; charset=utf-8",
-        Some("png") => "image/png",
-        _ => "application/octet-stream",
-    }
-}
-
-/// An HTTP response, with the headers that let the page's workers share memory (COOP and
-/// COEP, which `SharedArrayBuffer` needs) and keep nothing cached.
-pub(crate) fn respond(
-    out: &mut TcpStream,
-    status: u16,
-    kind: &str,
-    body: &[u8],
-) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        201 => "Created",
-        403 => "Forbidden",
-        404 => "Not Found",
-        413 => "Content Too Large",
-        _ => "Method Not Allowed",
-    };
-    write!(
-        out,
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nConnection: close\r\n\r\n",
-        body.len()
-    )?;
-    out.write_all(body)?;
-    out.flush()
+    let Some(at) = open(dir) else { return respond(out, 404, "text/plain", b"not found") };
+    loopback::get_file(out, &at, rel, Some(&page))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn percent_encoded_get_paths_are_decoded_once_and_checked() {

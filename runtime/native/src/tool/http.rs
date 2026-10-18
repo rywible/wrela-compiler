@@ -371,6 +371,7 @@ impl Transport for Tcp {
 #[derive(Debug)]
 struct Resolve {
     stall: Duration,
+    signal: Option<super::Signal>,
 }
 
 impl Resolver for Resolve {
@@ -380,6 +381,9 @@ impl Resolver for Resolve {
         _: &ureq::config::Config,
         _: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
+        if let Some(signal) = &self.signal {
+            (signal.0)("resolve");
+        }
         std::thread::sleep(self.stall);
         let host = uri.host().ok_or(ureq::Error::HostNotFound)?;
         let port = uri.port_u16().unwrap_or(443);
@@ -458,7 +462,11 @@ fn send(
         .timeout_global(Some(left))
         .build();
     let connector = Connect(socket.clone()).chain(RustlsConnector::default());
-    let agent = ureq::Agent::with_parts(config, connector, Resolve { stall: s.resolve_stall });
+    let agent = ureq::Agent::with_parts(
+        config,
+        connector,
+        Resolve { stall: s.resolve_stall, signal: s.signal.clone() },
+    );
     let mut builder = ureq::http::Request::builder().method(f.method.as_str()).uri(&f.url);
     for (name, value) in &f.headers {
         builder = builder.header(name, value);

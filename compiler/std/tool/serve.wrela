@@ -1,0 +1,142 @@
+// A tool's local server (language.md §15.5): a static server over a directory in a granted
+// root, on 127.0.0.1, with the toolchain's servers' rules. It answers only requests that name
+// this machine as their host, so a page elsewhere can't reach it through DNS rebinding, and
+// every answer is cross-origin isolated, as the browser runtime needs. A GET is answered with
+// the file (`/`, or a path that ends in `/`, is its `index.html`), reached through the root's
+// handle, following no symbolic link. A PUT of `/results/<name>` writes the page's result into
+// `results/` if the root is a write root, and is refused in a read root.
+//
+// A POST, which is taken only from the server's own pages (their `Origin`), goes to the tool:
+// `next_post` gives the oldest one not given yet, and `answer` sends the page the tool's bytes.
+// A post's body (at most 16 MiB) is charged to the tool's blob budget before it's read. A post
+// has a deadline (30 s unless `start` gives another) from when its connection is taken: one whose
+// body is still coming then, or that the tool hasn't taken or answered, fails with 504,
+// and a `next_post` that no post comes for fails at its own (60 s unless it asks for another).
+// These deadlines are on the system's clock, also in a tool test.
+//
+// A server is closed when the tool ends, or when `close` closes it: then its port is closed.
+
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, ask, malformed}
+use std::tool::answer as read_answer
+use std::tool::blob::{Data, read_data, write_data}
+
+/// A running server: its handle, from a `start` answer.
+pub struct Server: Copy + Eq {
+    id: u32,
+}
+
+impl Server {
+    /// Its handle's number, as the host names it.
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+
+/// A started server, its port, and its origin: `http://127.0.0.1:<port>`.
+pub struct Started: Clone {
+    pub server: Server,
+    pub port: u16,
+    pub origin: String,
+}
+
+/// A post a page made: its number, which `answer` names, the path (and query) it was sent to,
+/// and its body (a blob if it's over 512 KiB).
+pub struct Post: Clone {
+    pub id: u32,
+    pub path: String,
+    pub body: Data,
+}
+
+fn server_body(s: Server) -> Writer {
+    var w = Writer::new()
+    w.write_u32(s.id)
+    w
+}
+
+/// Starts a server over the directory `root` (a root path, or a root) on 127.0.0.1:`port`, or a
+/// free port for 0, whose posts each wait at most `post_timeout` seconds for the tool's answer
+/// (0: 30 s): `read_started` reads the answer.
+@tool
+pub fn start(root: str, port: u16 = 0, post_timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(root)
+    w.write_u32(u32(port))
+    w.write_u64(bitcast_u64(post_timeout))
+    ask("serve/start", take w.into_bytes())
+}
+
+/// The oldest post that `server` hasn't given the tool yet, once one comes, waiting at most
+/// `timeout` seconds (0: 60 s): `read_post` reads the answer.
+@tool
+pub fn next_post(server: Server, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = server_body(server)
+    w.write_u64(bitcast_u64(timeout))
+    ask("serve/next_post", take w.into_bytes())
+}
+
+/// Answers post `post` of `server` with `bytes`, which the page gets with status 200: the request
+/// fails if the post isn't waiting (it was answered, its deadline passed, or its page went).
+/// `std::tool::answer` reads the answer.
+@tool
+pub fn answer(server: Server, post: u32, bytes: Data) -> Pending<u8> {
+    var w = server_body(server)
+    w.write_u32(post)
+    write_data(mut w, bytes)
+    ask("serve/answer", take w.into_bytes())
+}
+
+/// Closes `server`: its port, its connections, and its posts, which fail. `std::tool::answer`
+/// reads the answer.
+@tool
+pub fn close(server: Server) -> Pending<u8> {
+    ask("serve/close", server_body(server).into_bytes())
+}
+
+/// Reads a `start` answer: the handle and the port (`u32`s), then the origin.
+pub fn read_started(polled: take Result<Vec<u8>, IoError>) -> Result<Started, ToolError> {
+    var r = Reader::new(read_answer(take polled)?)
+    let Ok(id) = r.read_u32() else { return Err(malformed("serve/start")) }
+    let Ok(port) = r.read_u32() else { return Err(malformed("serve/start")) }
+    let Ok(origin) = r.read_string() else { return Err(malformed("serve/start")) }
+    if !r.at_end() || port > 65535 {
+        return Err(malformed("serve/start"))
+    }
+    Ok(Started { server: Server { id }, port: u16(port), origin })
+}
+
+/// Reads a `next_post` answer: the post's number (a `u32`), its path, then its body
+/// (`blob::Data`).
+pub fn read_post(polled: take Result<Vec<u8>, IoError>) -> Result<Post, ToolError> {
+    var r = Reader::new(read_answer(take polled)?)
+    let Ok(id) = r.read_u32() else { return Err(malformed("serve/next_post")) }
+    let Ok(path) = r.read_string() else { return Err(malformed("serve/next_post")) }
+    let Some(body) = read_data(mut r) else { return Err(malformed("serve/next_post")) }
+    if !r.at_end() {
+        return Err(malformed("serve/next_post"))
+    }
+    Ok(Post { id, path, body })
+}
+
+@test
+fn a_start_and_a_post_read_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(2)
+    w.write_u32(8123)
+    w.write_str("http://127.0.0.1:8123")
+    let Ok(started) = read_started(Ok(take w.into_bytes())) else { panic("started") }
+    assert(started.server.id() == 2 && started.port == 8123)
+    assert(started.origin.as_str() == "http://127.0.0.1:8123")
+    var p = Writer::new()
+    p.write_u8(0)
+    p.write_u32(5)
+    p.write_str("/done")
+    write_data(mut p, Data::Bytes(Vec::from([u8(7)])))
+    let Ok(post) = read_post(Ok(take p.into_bytes())) else { panic("a post") }
+    assert(post.id == 5 && post.path.as_str() == "/done")
+    let Data::Bytes(b) = post.body else { panic("bytes") }
+    assert(b.len() == 1 && b[0] == 7)
+    assert(read_post(Ok(Vec::from([u8(0), 5, 0, 0, 0]))).is_err(), "a short post")
+}

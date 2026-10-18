@@ -10,6 +10,7 @@ use std::tool::blob::Data
 use std::tool::files
 use std::tool::http
 use std::tool::run
+use std::tool::serve
 use std::tool::testing
 use std::tool::testing::Fake
 use std::tool::time
@@ -350,4 +351,23 @@ fn a_fake_program_is_a_tool_package() {
     }
     let Some(o) = take refused else { panic("no answer") }
     assert(run::read_ran(take o).is_err(), "npx isn't granted")
+}
+
+@test(tool)
+@job
+fn a_served_post_waits_while_the_fake_clock_moves() {
+    var s = serve::start("scratch")
+    var sg = s.poll()
+    while sg.is_none() {
+        yield
+        sg = s.poll()
+    }
+    let Some(sp) = take sg else { panic("no answer") }
+    let Ok(started) = serve::read_started(take sp) else { panic("it serves its scratch") }
+    // Nothing in a tool test posts to its server: the fake clock moves while a post is waited
+    // for, so an hour's timer fires at once.
+    let post = serve::next_post(started.server, 600.0)
+    var t = time::after(3600.0)
+    while t.poll().is_none() { yield }
+    assert(!post.is_done(), "no post came")
 }

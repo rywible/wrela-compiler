@@ -78,9 +78,23 @@ pub(crate) struct Services {
     pub toolchain: Option<super::toolchain::Service>,
     /// The builds the drive service holds.
     pub drives: Mutex<super::drive::Drives>,
+    /// The servers the serve service holds.
+    pub servers: Mutex<super::serve::Servers>,
+    /// Where a service that answers a request itself, later, sends the answer
+    /// ([`Work::Later`]): the run's own channel, until it ends.
+    pub answers: Mutex<Option<std::sync::mpsc::Sender<(u32, Answer)>>>,
     /// A test's held output write, and its output write that fails part way ([`super::Testing`]).
     pub hold: Option<(String, Duration)>,
     pub write_fail: Option<String>,
+    /// A test's start of a server that fails once the server listens.
+    pub fail_server_start: bool,
+    /// A test's image work that holds this long first, seeing no cancel.
+    pub image_stall: Duration,
+    /// What tells a test the host has reached a moment it waits for.
+    pub signal: Option<super::Signal>,
+    /// The threads of work given up on (it didn't stop within the grace after it was
+    /// cancelled): the run's end waits for them with the rest, and counts those still running.
+    pub strays: Mutex<Vec<std::thread::JoinHandle<()>>>,
 }
 
 impl Services {
@@ -92,6 +106,27 @@ impl Services {
     /// The driven builds.
     pub(crate) fn drives(&self) -> std::sync::MutexGuard<'_, super::drive::Drives> {
         self.drives.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The servers.
+    pub(crate) fn servers(&self) -> std::sync::MutexGuard<'_, super::serve::Servers> {
+        self.servers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Gives `answer` to `request`, which a service answers itself ([`Work::Later`]): nothing,
+    /// once the run has ended.
+    pub(crate) fn send(&self, request: u32, answer: Answer) {
+        let answers = self.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(to) = answers.as_ref() {
+            let _ = to.send((request, answer));
+        }
+    }
+
+    /// Tells a test the host has reached `moment` ([`super::Signal`]).
+    pub(crate) fn signal(&self, moment: &'static str) {
+        if let Some(signal) = &self.signal {
+            (signal.0)(moment);
+        }
     }
 
     /// The fakes a tool test set, by URL (none outside a test).
@@ -221,6 +256,10 @@ pub(crate) enum Data {
 /// Work on a worker thread: given the services and the request's number.
 pub(crate) type Task = Box<dyn FnOnce(&Arc<Services>, u32) -> Answer + Send>;
 
+/// A request registered with the service that answers it, on the host's loop: its answer now,
+/// or `None` if the service sends it later ([`Services::send`]).
+pub(crate) type Register = Box<dyn FnOnce(&Arc<Services>, u32) -> Option<Answer> + Send>;
+
 /// How a request is carried out.
 pub(crate) enum Work {
     /// Answered now, after the call that made it.
@@ -239,6 +278,9 @@ pub(crate) enum Work {
     /// Answered by a worker of the pool for long waits, but given to the tool only once this
     /// much of a test's fake time has passed since the request: a fake site's delay.
     Held(Duration, Task),
+    /// Registered at once, after the call that made it, with the service that answers it when
+    /// something happens (a served post arrives), not by a worker that would wait for it.
+    Later(Register),
     /// Answered with the date now, on the run's clock.
     Utc,
     /// A test sets its fake clock's date: seconds and nanoseconds since 1970.
@@ -345,6 +387,8 @@ pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
             super::toolchain::route(s, &name["toolchain/".len()..], &mut b)
         }
         _ if name.starts_with("drive/") => super::drive::route(&name["drive/".len()..], &mut b),
+        _ if name.starts_with("image/") => super::image::route(&name["image/".len()..], &mut b),
+        _ if name.starts_with("serve/") => super::serve::route(&name["serve/".len()..], &mut b),
         "run/run" => match super::run::parse(&mut b, std::time::Instant::now()) {
             Ok(r) => Work::Long(Box::new(move |s, request| answer(super::run::run(s, request, r)))),
             Err(why) => Work::Now(err(&why)),
@@ -403,6 +447,7 @@ pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
                 answer(
                     s.caps
                         .write_with(&path, |f| {
+                            s.signal("write");
                             std::thread::sleep(s.io_delay);
                             f.write_all(&bytes)
                         })
@@ -543,11 +588,40 @@ fn read_blob(s: &Services, request: u32, path: &str) -> Result<Vec<u8>, String> 
     }
 }
 
+/// Services with no grants and `budget`, for a test of one service.
+#[cfg(test)]
+pub(crate) fn for_test(budget: super::BlobBudget) -> Services {
+    Services {
+        caps: Caps::open(&super::caps::Grants::default(), |_| None).expect("no grants"),
+        blobs: Mutex::new(Blobs::new(budget)),
+        io_delay: Duration::ZERO,
+        closing: Arc::new(AtomicBool::new(false)),
+        testing: false,
+        fakes: Mutex::new(HashMap::new()),
+        work: OnceLock::new(),
+        work_at: None,
+        groups: None,
+        spawn_pause: Duration::ZERO,
+        resolve_stall: Duration::ZERO,
+        grace: Duration::ZERO,
+        stuck: Arc::new(OnceLock::new()),
+        toolchain: None,
+        drives: Mutex::default(),
+        servers: Mutex::default(),
+        answers: Mutex::new(None),
+        hold: None,
+        write_fail: None,
+        fail_server_start: false,
+        image_stall: Duration::ZERO,
+        signal: None,
+        strays: Mutex::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tool::BlobBudget;
-    use crate::tool::caps::Grants;
 
     /// A reader of `left` zeros that counts what it gave.
     struct Counted {
@@ -567,25 +641,7 @@ mod tests {
 
     #[test]
     fn a_body_past_the_budget_is_refused_as_it_arrives_and_its_blob_given_back() {
-        let services = Services {
-            caps: Caps::open(&Grants::default(), |_| None).expect("no grants"),
-            blobs: Mutex::new(Blobs::new(BlobBudget { bytes: 1 << 20, handles: 4 })),
-            io_delay: Duration::ZERO,
-            closing: Arc::new(AtomicBool::new(false)),
-            testing: false,
-            fakes: Mutex::new(HashMap::new()),
-            work: OnceLock::new(),
-            work_at: None,
-            groups: None,
-            spawn_pause: Duration::ZERO,
-            resolve_stall: Duration::ZERO,
-            grace: Duration::ZERO,
-            stuck: Arc::new(OnceLock::new()),
-            toolchain: None,
-            drives: Mutex::default(),
-            hold: None,
-            write_fail: None,
-        };
+        let services = for_test(BlobBudget { bytes: 1 << 20, handles: 4 });
         let mut from = Counted { left: 64 << 20, given: 0 };
         let mut out = Vec::new();
         let read = services.put_read(1, &mut out, &mut from, u64::MAX, "the body");

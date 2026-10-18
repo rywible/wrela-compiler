@@ -74,6 +74,8 @@ mod test_items;
 mod text;
 mod threads;
 mod tool;
+mod tool_image;
+mod tool_serve;
 mod transport;
 mod unroll;
 mod warnings;

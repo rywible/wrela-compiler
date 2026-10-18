@@ -448,6 +448,7 @@ fn carry_out(
     let _ = s.stuck.set(format!(
         "the toolchain's work for request {request} didn't stop within {grace:?} of being cancelled"
     ));
+    s.strays.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
     Err(why)
 }
 

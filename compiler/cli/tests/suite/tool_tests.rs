@@ -28,7 +28,7 @@ fn ran(dir: &std::path::Path) -> Vec<(String, bool, String)> {
 fn the_tool_tests_fixture_passes() {
     let dir = wrela_root().join("compiler/tests/tool_tests");
     let tests = ran(&dir);
-    assert_eq!(tests.len(), 9, "{tests:?}");
+    assert_eq!(tests.len(), 10, "{tests:?}");
     for (name, passed, message) in &tests {
         assert!(passed, "{name}: {message}");
     }

@@ -1,0 +1,178 @@
+// A tool's images (language.md §15.5): PNG, JPEG and still WebP decoded to RGBA8, resized with
+// Lanczos3, and encoded as PNG or as lossy WebP, by the host on the CPU, beside the tool. The
+// same inputs give the same bytes. Pixels are RGBA8, rows top to bottom, in a blob the host
+// holds: each answer's pixels or encoded bytes are a new blob, and each request takes bytes or a
+// blob (`blob::Data`), such as a `files::read_blob` answer or a drive capture's pixels.
+//
+// The host reads each request's sizes first (an image's headers, the pixels' dimensions), then
+// reserves the answer's blob, and the most its own work holds, in the tool's blob budget, before
+// anything is decoded: an image that doesn't fit fails then, without being decoded. A WebP whose
+// image isn't its canvas's size, or that is animated, is refused. Each request
+// has a deadline, 60 s unless it asks for another (at most 600 s), from when the host takes it.
+// An image is 1 to 16384 pixels each way.
+//
+// Covers are made as Pillow's `thumbnail` and `save(..., "WEBP")` make them: `fit` gives the
+// size within a box, `resize` resamples to it, and `encode_webp` encodes at a quality and method.
+
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::blob::{Data, read_data, write_data}
+
+/// An image's size in pixels.
+pub struct Size: Copy + Eq {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// An image: its size, and its pixels, RGBA8, rows top to bottom, in a blob.
+pub struct Image: Clone {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Data,
+}
+
+/// The size of an image of `size` fit within `within`, keeping its aspect, as Pillow's
+/// `Image.thumbnail` computes it: `size` itself if it fits already (an image is never enlarged),
+/// else the side of `within` that binds, and the other side, at least 1, whichever of its floor
+/// and its ceiling keeps the aspect closer (the floor if both do).
+pub fn fit(size: Size, within: Size) -> Size {
+    if within.width >= size.width && within.height >= size.height {
+        return size
+    }
+    let aspect = f64(size.width) / f64(size.height)
+    let x = f64(within.width)
+    let y = f64(within.height)
+    if x / y >= aspect {
+        let lo = floor(y * aspect)
+        let hi = ceil(y * aspect)
+        let pick = if abs(aspect - hi / y) < abs(aspect - lo / y) { hi } else { lo }
+        return Size { width: u32(max(pick, 1.0)), height: within.height }
+    }
+    let lo = floor(x / aspect)
+    let hi = ceil(x / aspect)
+    let lo_key = if lo == 0.0 { 0.0 } else { abs(aspect - x / lo) }
+    let hi_key = if hi == 0.0 { 0.0 } else { abs(aspect - x / hi) }
+    let pick = if hi_key < lo_key { hi } else { lo }
+    Size { width: within.width, height: u32(max(pick, 1.0)) }
+}
+
+fn timed(service: str, w: take Writer, timeout: f64) -> Pending<u8> {
+    var w = take w
+    w.write_u64(bitcast_u64(timeout))
+    ask(service, take w.into_bytes())
+}
+
+/// Decodes `bytes`, a PNG (its first frame, if it has several), a JPEG or a still WebP, as RGBA8:
+/// `read_image` reads the answer. Grey, indexed and 16-bit PNGs come out as RGBA8, and an image
+/// with no alpha comes out opaque.
+@tool
+pub fn decode(bytes: Data, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    write_data(mut w, bytes)
+    timed("image/decode", take w, timeout)
+}
+
+/// Resizes `image` to `to` with Lanczos3, as Pillow's `Image.Resampling.LANCZOS` weighs pixels
+/// (its kernel widened by the scale when it shrinks), over premultiplied alpha, horizontally then
+/// vertically: `read_image` reads the answer.
+@tool
+pub fn resize(image: Image, to: Size, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = pixels(image)
+    w.write_u32(to.width)
+    w.write_u32(to.height)
+    timed("image/resize", take w, timeout)
+}
+
+/// Encodes `image` as a PNG of RGBA8: `read_encoded` reads the answer.
+@tool
+pub fn encode_png(image: Image, timeout: f64 = 0.0) -> Pending<u8> {
+    timed("image/encode_png", pixels(image), timeout)
+}
+
+/// Encodes `image` (at most 16383 pixels each way) as a lossy WebP through libwebp, at `quality`
+/// (0 to 100) and `method` (0, the fastest, to 6, the smallest), with its alpha, if it has any,
+/// at quality 100: `read_encoded` reads the answer. An opaque image has no alpha in the file.
+@tool
+pub fn encode_webp(image: Image, quality: f64, method: u8, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = pixels(image)
+    w.write_u64(bitcast_u64(quality))
+    w.write_u8(method)
+    timed("image/encode_webp", take w, timeout)
+}
+
+/// `image`'s pixels and size, as the host reads them.
+fn pixels(image: Image) -> Writer {
+    var w = Writer::new()
+    write_data(mut w, image.rgba)
+    w.write_u32(image.width)
+    w.write_u32(image.height)
+    w
+}
+
+impl Image {
+    /// Its size.
+    pub fn size(self) -> Size {
+        Size { width: self.width, height: self.height }
+    }
+}
+
+/// Reads a `decode` or `resize` answer: the width and height (`u32`s), then the pixels
+/// (`blob::Data`).
+pub fn read_image(polled: take Result<Vec<u8>, IoError>) -> Result<Image, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(width) = r.read_u32() else { return Err(malformed("image")) }
+    let Ok(height) = r.read_u32() else { return Err(malformed("image")) }
+    let Some(rgba) = read_data(mut r) else { return Err(malformed("image")) }
+    if !r.at_end() {
+        return Err(malformed("image"))
+    }
+    Ok(Image { width, height, rgba })
+}
+
+/// Reads an `encode_png` or `encode_webp` answer: the file's bytes (`blob::Data`).
+pub fn read_encoded(polled: take Result<Vec<u8>, IoError>) -> Result<Data, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Some(bytes) = read_data(mut r) else { return Err(malformed("image/encode")) }
+    if !r.at_end() {
+        return Err(malformed("image/encode"))
+    }
+    Ok(bytes)
+}
+
+@test
+fn an_image_fits_its_box_as_pillows_thumbnail_does() {
+    // console.py's covers: a 1920×1080 capture into 960×540.
+    let cover = Size { width: 960, height: 540 }
+    let fits = |w: u32, h: u32| fit(Size { width: w, height: h }, cover)
+    assert(fits(1920, 1080) == cover)
+    // The height binds, and the width rounds to the closer aspect.
+    assert(fits(1000, 750) == Size { width: 720, height: 540 })
+    assert(fits(1001, 750) == Size { width: 721, height: 540 })
+    // The width binds.
+    assert(fits(3000, 1000) == Size { width: 960, height: 320 })
+    // An image that fits is never enlarged; one side past the box is shrunk.
+    assert(fits(100, 50) == Size { width: 100, height: 50 })
+    assert(fits(100, 600) == Size { width: 90, height: 540 })
+    // At least 1.
+    assert(fits(10000, 1) == Size { width: 960, height: 1 })
+}
+
+@test
+fn an_image_answer_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(3)
+    w.write_u32(2)
+    w.write_u8(1)
+    w.write_u32(9)
+    let Ok(image) = read_image(Ok(take w.into_bytes())) else { panic("an image") }
+    assert(image.width == 3 && image.height == 2)
+    let Data::Blob(b) = image.rgba else { panic("a blob") }
+    assert(b.id() == 9)
+    assert(read_image(Ok(Vec::from([u8(0), 3, 0, 0, 0]))).is_err(), "a short answer")
+    let Ok(Data::Blob(e)) = read_encoded(Ok(Vec::from([u8(0), 1, 4, 0, 0, 0]))) else {
+        panic("encoded bytes")
+    }
+    assert(e.id() == 4)
+}

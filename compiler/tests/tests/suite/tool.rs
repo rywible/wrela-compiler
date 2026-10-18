@@ -12,10 +12,10 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use wrela_host::tool::{BlobBudget, Caps, End, Ended, Grants, Options, Testing, ToolBuild};
+use wrela_host::tool::{BlobBudget, Caps, End, Ended, Grants, Options, Signal, Testing, ToolBuild};
 
 /// A scratch directory of its own.
-fn scratch(name: &str) -> PathBuf {
+pub(crate) fn scratch(name: &str) -> PathBuf {
     let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("tool-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
@@ -23,7 +23,7 @@ fn scratch(name: &str) -> PathBuf {
 }
 
 /// The tool build of a package whose `main.wrela` is `main`.
-fn tool_build(name: &str, main: &str) -> ToolBuild {
+pub(crate) fn tool_build(name: &str, main: &str) -> ToolBuild {
     let dir = scratch(&format!("{name}-package"));
     let ident = name.replace('-', "_");
     std::fs::write(dir.join("wrela.toml"), format!("[package]\nname = \"{ident}\"\n"))
@@ -41,7 +41,9 @@ fn tool_build(name: &str, main: &str) -> ToolBuild {
 }
 
 /// What the tool printed, and a printer that keeps it, calling `also` with each line first.
-fn printer(also: impl Fn(&str) + Send + Sync + 'static) -> (Arc<Mutex<Vec<String>>>, Options) {
+pub(crate) fn printer(
+    also: impl Fn(&str) + Send + Sync + 'static,
+) -> (Arc<Mutex<Vec<String>>>, Options) {
     let lines = Arc::new(Mutex::new(Vec::new()));
     let kept = lines.clone();
     let mut options = Options::new(Caps::open(&Grants::default(), |_| None).expect("no grants"));
@@ -52,15 +54,39 @@ fn printer(also: impl Fn(&str) + Send + Sync + 'static) -> (Arc<Mutex<Vec<String
     (lines, options)
 }
 
+/// A test's signal ([`Signal`]), and the moments it's told of, with when, as they come.
+pub(crate) fn signals() -> (Signal, std::sync::mpsc::Receiver<(&'static str, Instant)>) {
+    let (sent, told) = std::sync::mpsc::channel();
+    let sent = Mutex::new(sent);
+    let signal = Signal(Arc::new(move |moment| {
+        let _ = sent.lock().expect("the signal").send((moment, Instant::now()));
+    }));
+    (signal, told)
+}
+
+/// Waits for the host to reach `moment`: when it did.
+pub(crate) fn reached(
+    told: &std::sync::mpsc::Receiver<(&'static str, Instant)>,
+    moment: &str,
+) -> Instant {
+    loop {
+        let (m, at) =
+            told.recv_timeout(Duration::from_secs(60)).unwrap_or_else(|_| panic!("no {moment}"));
+        if m == moment {
+            return at;
+        }
+    }
+}
+
 /// Runs `build` with `options`, checking that the run left no worker behind.
-fn run(build: &ToolBuild, options: Options) -> Ended {
+pub(crate) fn run(build: &ToolBuild, options: Options) -> Ended {
     let ended = wrela_host::tool::run(build, options);
     assert_eq!(ended.workers_left, 0, "every worker stopped: {ended:?}");
     ended
 }
 
 /// The `tool_init` and `tool` that start and resume a job `main` of no parameters.
-const ENTRIES: &str = r#"
+pub(crate) const ENTRIES: &str = r#"
 pub fn tool_init() -> Job<main> {
     main.start()
 }
@@ -690,32 +716,46 @@ fn main() -> u32 {
 fn a_worker_stuck_in_a_file_write_ends_the_run_in_bounded_time_as_the_hosts() {
     let build = tool_build("slow-write", &format!("{SLOW_WRITE}{ENTRIES}"));
     let out = scratch("slow-write");
+    // How late a thread may wake, past what the host itself waits.
+    let late = Duration::from_secs(1);
     for interrupted in [false, true] {
         let (_, mut options) = printer(|_| {});
         options.caps =
             Caps::open(&Grants::default().root("out", &out, true), |_| None).expect("out");
-        // A disk that takes 3 s to write the blob, a grace of 100 ms.
+        // A disk that takes 5 s to write the blob, a grace of 100 ms.
+        let (signal, told) = signals();
+        let grace = Duration::from_millis(100);
         options.testing = Testing {
-            grace: Duration::from_millis(100),
-            io_delay: Duration::from_secs(3),
+            grace,
+            io_delay: Duration::from_secs(5),
+            signal: Some(signal),
             ..Testing::default()
         };
+        // The end comes once the write has started: an interrupt then, or a timeout the write
+        // starts within.
+        let timeout = Duration::from_secs(3);
+        let interrupt = Arc::new(AtomicBool::new(false));
         if interrupted {
-            let interrupt = Arc::new(AtomicBool::new(false));
             options.interrupt = Some(interrupt.clone());
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                interrupt.store(true, Ordering::Release);
-            });
         } else {
-            options.timeout = Some(Duration::from_millis(300));
+            options.timeout = Some(timeout);
         }
         let started = Instant::now();
-        let ended = wrela_host::tool::run(&build, options);
-        let took = started.elapsed();
+        let build = build.clone();
+        let running = std::thread::spawn(move || wrela_host::tool::run(&build, options));
+        let writing = reached(&told, "write");
+        let end = if interrupted {
+            interrupt.store(true, Ordering::Release);
+            Instant::now()
+        } else {
+            assert!(writing < started + timeout, "the write started before the timeout");
+            started + timeout
+        };
+        let ended = running.join().expect("the run");
         // The run ends at its timeout or interrupt plus the grace, not when the write does, and
         // the blob table is released though the write still holds the blob's bytes.
-        assert!(took < Duration::from_secs(2), "interrupted: {interrupted}, {took:?}");
+        let took = Instant::now().saturating_duration_since(end);
+        assert!(took < grace + late, "interrupted: {interrupted}, {took:?} after the end");
         let End::Host(why) = &ended.end else { panic!("{:?}", ended.end) };
         assert!(why.contains("still running"), "{why}");
         let first = if interrupted { "interrupted" } else { "timeout" };
@@ -962,20 +1002,24 @@ pub fn tool(job: mut Job<main>) -> u32 {
 #[test]
 fn the_tools_end_closes_a_connection_that_waits_and_a_stuck_one_is_the_hosts_failure() {
     use std::io::Read;
-    let build = tool_build("fetch-one", FETCH_ONE);
-    // A server that takes the connection and never answers: it reports when the client closes.
+    // A server that takes the connection and never answers. Once the run has returned, it says
+    // whether the client had closed the connection by then: its read finds the end at once.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
     let port = listener.local_addr().expect("its address").port();
-    let (closed, when) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        if let Ok((mut s, _)) = listener.accept() {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = s.read(&mut buf) {
-                if n == 0 {
-                    let _ = closed.send(Instant::now());
-                    return;
-                }
+    let (accepted, taken) = std::sync::mpsc::channel();
+    let (check, checking) = std::sync::mpsc::channel::<()>();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().expect("the connection");
+        let _ = accepted.send(Instant::now());
+        checking.recv().expect("the run returned");
+        s.set_nonblocking(true).expect("nonblocking");
+        let mut buf = [0u8; 4096];
+        loop {
+            match s.read(&mut buf) {
+                Ok(0) => return true,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return false,
             }
         }
     });
@@ -983,33 +1027,48 @@ fn the_tools_end_closes_a_connection_that_waits_and_a_stuck_one_is_the_hosts_fai
     let (_, mut options) = printer(|_| {});
     options.caps = Caps::open(&Grants::default().net(&host), |_| None).expect("granted");
     options.args = vec![format!("https://{host}/")];
-    options.timeout = Some(Duration::from_millis(500));
+    let timeout = Duration::from_secs(3);
+    options.timeout = Some(timeout);
     let started = Instant::now();
-    let ended = run(&build, options);
-    let returned = Instant::now();
+    let running = std::thread::spawn(move || run(&build_of_fetch(), options));
+    let at = taken.recv_timeout(Duration::from_secs(60)).expect("the request connected");
+    assert!(at < started + timeout, "the request connected before the timeout");
+    let ended = running.join().expect("the run");
+    check.send(()).expect("the server waits");
     assert_eq!(ended.end, End::Timeout, "a clean end at the timeout, not a host's failure");
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
-    let closed = when.recv_timeout(Duration::from_secs(5)).expect("the connection was closed");
-    assert!(closed <= returned + Duration::from_millis(50), "closed before the run returned");
+    assert!(server.join().expect("the server"), "closed before the run returned");
 
     // A request whose client can't be stopped (a name lookup that doesn't return, here a
     // test's stalled resolver) ends the run as the host's failure once the grace after its
-    // deadline passes, though the run has no timeout; its worker is left past the grace.
+    // deadline (0.3 s, from the host's taking it, before its lookup) passes, though the run has
+    // no timeout; its worker is left past the grace.
+    let (signal, told) = signals();
     let (_, mut options) = printer(|_| {});
     options.caps = Caps::open(&Grants::default().net(&host), |_| None).expect("granted");
     options.args = vec![format!("https://{host}/"), "short".into()];
+    let grace = Duration::from_millis(100);
     options.testing = Testing {
-        grace: Duration::from_millis(100),
-        resolve_stall: Duration::from_secs(3),
+        grace,
+        resolve_stall: Duration::from_secs(5),
+        signal: Some(signal),
         ..Testing::default()
     };
-    let started = Instant::now();
-    let ended = wrela_host::tool::run(&build, options);
-    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    let running = std::thread::spawn(move || wrela_host::tool::run(&build_of_fetch(), options));
+    let resolving = reached(&told, "resolve");
+    let ended = running.join().expect("the run");
+    let took = resolving.elapsed();
+    let late = Duration::from_secs(1);
+    assert!(took < Duration::from_millis(300) + grace + late, "{took:?} after the lookup began");
     let End::Host(why) = &ended.end else { panic!("{:?}", ended.end) };
     assert!(why.contains("didn't stop within") && why.contains("still running"), "{why}");
     assert_eq!(ended.end.status(), 71);
     assert_eq!(ended.workers_left, 1);
+}
+
+/// The tool of [`FETCH_ONE`], built once.
+fn build_of_fetch() -> ToolBuild {
+    static BUILT: std::sync::OnceLock<ToolBuild> = std::sync::OnceLock::new();
+    BUILT.get_or_init(|| tool_build("fetch-one", FETCH_ONE)).clone()
 }
 
 const FAKE_BIG: &str = r#"
