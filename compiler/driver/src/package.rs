@@ -5,7 +5,7 @@
 //! needs canonical-path dedup and cycle protection, and until that's decided a check must never
 //! pass without reading the files behind a link.
 
-use std::fs;
+use crate::reach::{Kind, Reach};
 use std::path::{Path, PathBuf};
 use wrela_syntax::lexer::is_name;
 
@@ -29,14 +29,20 @@ pub struct LayoutError {
 }
 
 pub fn find_files(root: &Path) -> Result<Vec<PackageFile>, Vec<LayoutError>> {
+    find_files_in(&Reach::anywhere(), root)
+}
+
+/// [`find_files`], reading only what `reach` may (§15.5's toolchain service).
+pub fn find_files_in(reach: &Reach, root: &Path) -> Result<Vec<PackageFile>, Vec<LayoutError>> {
     let mut files = Vec::new();
     let mut errors = Vec::new();
-    walk(root, root, &mut Vec::new(), &mut files, &mut errors);
+    walk(reach, root, root, &mut Vec::new(), &mut files, &mut errors);
     files.sort_by(|a, b| a.module.cmp(&b.module));
     if errors.is_empty() { Ok(files) } else { Err(errors) }
 }
 
 fn walk(
+    reach: &Reach,
     root: &Path,
     dir: &Path,
     prefix: &mut Vec<String>,
@@ -44,7 +50,7 @@ fn walk(
     errors: &mut Vec<LayoutError>,
 ) {
     let display = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
-    let entries = match fs::read_dir(dir) {
+    let entries = match reach.entries(dir) {
         Ok(e) => e,
         Err(e) => {
             errors.push(LayoutError {
@@ -56,11 +62,11 @@ fn walk(
             return;
         }
     };
-    let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-    entries.sort_by_cached_key(|e| e.file_name());
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
+    let mut entries = entries;
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (file_name, kind) in entries {
+        let path = dir.join(&file_name);
+        let name = file_name.to_string_lossy().to_string();
         if name.starts_with('.') {
             continue;
         }
@@ -68,9 +74,10 @@ fn walk(
         if prefix.is_empty() && wrela_sema::OUTPUT_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(&path) else { continue };
-        if meta.file_type().is_symlink() {
-            if fs::metadata(&path).is_ok_and(|m| m.is_dir()) {
+        // A link's target, followed: an error is a link out of the roots, or a broken one.
+        let target = if kind == Kind::Link { reach.kind(&path, true) } else { Ok(Some(kind)) };
+        if kind == Kind::Link {
+            if matches!(target, Ok(Some(Kind::Dir))) {
                 errors.push(LayoutError {
                     path: display(&path),
                     message: format!(
@@ -84,13 +91,13 @@ fn walk(
                 });
                 continue;
             }
-        } else if meta.is_dir() {
+        } else if kind == Kind::Dir {
             // A directory with a manifest is another package, not part of this one's tree.
-            if path.join("wrela.toml").is_file() {
+            if reach.is_file(&path.join("wrela.toml")) {
                 continue;
             }
             if !is_name(&name) {
-                if has_wrela_files(&path) {
+                if has_wrela_files(reach, &path) {
                     errors.push(LayoutError {
                         path: display(&path),
                         message: format!(
@@ -103,17 +110,13 @@ fn walk(
                 continue;
             }
             prefix.push(name);
-            walk(root, &path, prefix, files, errors);
+            walk(reach, root, &path, prefix, files, errors);
             prefix.pop();
             continue;
         }
         let Some(stem) = name.strip_suffix(".wrela") else { continue };
         // A pipe or a device would block or never end when read.
-        let regular = if meta.file_type().is_symlink() {
-            fs::metadata(&path).is_ok_and(|m| m.is_file())
-        } else {
-            meta.is_file()
-        };
+        let regular = matches!(target, Ok(Some(Kind::File)));
         if !regular {
             errors.push(LayoutError {
                 path: display(&path),
@@ -143,18 +146,18 @@ fn walk(
 /// Whether `dir` holds a `.wrela` file, in it or below it, as [`walk`] would find one: hidden
 /// entries and other packages are skipped, and symbolic links aren't followed (so a cycle of
 /// links ends).
-fn has_wrela_files(dir: &Path) -> bool {
-    if dir.join("wrela.toml").is_file() {
+fn has_wrela_files(reach: &Reach, dir: &Path) -> bool {
+    if reach.is_file(&dir.join("wrela.toml")) {
         return false;
     }
-    fs::read_dir(dir).is_ok_and(|entries| {
-        entries.filter_map(Result::ok).any(|e| {
-            let p = e.path();
-            if e.file_name().to_string_lossy().starts_with('.') {
+    reach.entries(dir).is_ok_and(|entries| {
+        entries.into_iter().any(|(name, kind)| {
+            let p = dir.join(&name);
+            if name.to_string_lossy().starts_with('.') {
                 return false;
             }
             p.extension().is_some_and(|x| x == "wrela")
-                || (e.file_type().is_ok_and(|t| t.is_dir()) && has_wrela_files(&p))
+                || (kind == Kind::Dir && has_wrela_files(reach, &p))
         })
     })
 }
@@ -162,6 +165,7 @@ fn has_wrela_files(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("wrela-pkg-{name}-{}", std::process::id()));

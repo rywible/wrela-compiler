@@ -172,6 +172,95 @@ fn size(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |m| m.len())
 }
 
+/// A command that runs `exe` with `argv` in a process group the host owns: in a group of its
+/// own, or, under a supervisor, in this host's group through `wrela tool --launch`, which waits
+/// until the file `go` is there (its group is recorded), then takes a group of its own and
+/// becomes the program. So there's no moment when it has a group nobody knows of.
+pub(crate) fn owned_command(
+    s: &Services,
+    exe: &Path,
+    argv: Vec<std::ffi::OsString>,
+    go: &Path,
+) -> Result<Command, String> {
+    match (&s.groups, s.caps.runner()) {
+        (None, _) => {
+            let mut c = Command::new(exe);
+            c.args(&argv);
+            #[cfg(unix)]
+            std::os::unix::process::CommandExt::process_group(&mut c, 0);
+            Ok(c)
+        }
+        (Some(_), Some(runner)) => {
+            let mut c = Command::new(runner);
+            c.arg("tool").arg("--launch").arg(go).arg(exe).args(argv);
+            Ok(c)
+        }
+        (Some(_), None) => {
+            Err("a supervised program needs `wrela tool --launch`, and nothing here runs it".into())
+        }
+    }
+}
+
+/// Starts `command` (an [`owned_command`]), records its process group for a supervisor, and lets
+/// it go: the child and its group. `program` names it in errors.
+pub(crate) fn start_owned(
+    s: &Services,
+    command: &mut Command,
+    go: &Path,
+    program: &str,
+) -> Result<(std::process::Child, i32), String> {
+    let mut child = command.spawn().map_err(|e| format!("can't run `{program}`: {e}"))?;
+    let group = child.id() as i32;
+    // A test's moment between the start and the record, when only this host's group holds it.
+    std::thread::sleep(s.spawn_pause);
+    if let Err(why) = record(s, group) {
+        stop(&mut child, group);
+        return Err(why);
+    }
+    if s.groups.is_some()
+        && let Err(e) = std::fs::write(go, b"")
+    {
+        stop(&mut child, group);
+        return Err(format!("letting the program go: {e}"));
+    }
+    Ok((child, group))
+}
+
+/// Waits for `child`, which leads process group `group`, looking every few milliseconds for the
+/// tool's end and for `stop`'s reason to end it: its exit status, its group killed as it ends
+/// (so nothing it started outlives it), or why the host killed the group first.
+pub(crate) fn wait_owned(
+    s: &Services,
+    child: &mut std::process::Child,
+    group: i32,
+    program: &str,
+    mut stop_now: impl FnMut() -> Option<String>,
+) -> Result<std::process::ExitStatus, String> {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                // What it started and left running goes with it.
+                kill_group(group);
+                return Ok(status);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                stop(child, group);
+                return Err(format!("waiting for `{program}`: {e}"));
+            }
+        }
+        if s.closing.load(Ordering::Acquire) {
+            stop(child, group);
+            return Err(format!("the tool ended before `{program}` did"));
+        }
+        if let Some(why) = stop_now() {
+            stop(child, group);
+            return Err(why);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 /// Carries out `r` for `request`: the program's status (its exit code, or minus the signal that
 /// ended it), then its standard output and standard error, each bytes or a blob.
 pub(crate) fn run(s: &Services, request: u32, r: Run) -> Result<Vec<u8>, String> {
@@ -213,7 +302,7 @@ pub(crate) fn run(s: &Services, request: u32, r: Run) -> Result<Vec<u8>, String>
         f.map_err(|e| format!("the program's input or output: {e}"))
     };
     // What runs: the executable and its arguments.
-    let (exe, mut argv): (std::path::PathBuf, Vec<std::ffi::OsString>) = match &program {
+    let (exe, argv): (std::path::PathBuf, Vec<std::ffi::OsString>) = match &program {
         Program::Native(path) => (path.clone(), r.args.iter().map(Into::into).collect()),
         Program::Tool { runner, package } => {
             let left = r.due.saturating_duration_since(Instant::now());
@@ -231,32 +320,7 @@ pub(crate) fn run(s: &Services, request: u32, r: Run) -> Result<Vec<u8>, String>
             (runner.clone(), a)
         }
     };
-    // Under a supervisor, the program starts in this host's group, through `wrela tool
-    // --launch`, which waits until its group is recorded, then takes a group of its own and
-    // becomes the program: so there's no moment when it has a group nobody knows of.
-    let launcher = match (&s.groups, s.caps.runner()) {
-        (None, _) => None,
-        (Some(_), Some(runner)) => Some(runner.to_path_buf()),
-        (Some(_), None) => {
-            return Err(
-                "a supervised program needs `wrela tool --launch`, and nothing here runs it".into(),
-            );
-        }
-    };
-    let mut command = match &launcher {
-        None => {
-            let mut c = Command::new(&exe);
-            c.args(&argv);
-            #[cfg(unix)]
-            std::os::unix::process::CommandExt::process_group(&mut c, 0);
-            c
-        }
-        Some(runner) => {
-            let mut c = Command::new(runner);
-            c.arg("tool").arg("--launch").arg(&go).arg(&exe).args(argv.drain(..));
-            c
-        }
-    };
+    let mut command = owned_command(s, &exe, argv, &go)?;
     command.env_clear();
     command.env("PATH", s.caps.path_baseline());
     command.env("HOME", dir.join("home"));
@@ -273,54 +337,23 @@ pub(crate) fn run(s: &Services, request: u32, r: Run) -> Result<Vec<u8>, String>
         .stdin(opened(&input, false)?)
         .stdout(opened(&output, true)?)
         .stderr(opened(&errors, true)?);
-    let mut child = command.spawn().map_err(|e| format!("can't run `{}`: {e}", r.program))?;
-    let group = child.id() as i32;
-    // A test's moment between the start and the record, when only this host's group holds it.
-    std::thread::sleep(s.spawn_pause);
-    if let Err(why) = record(s, group) {
-        stop(&mut child, group);
-        return Err(why);
-    }
-    if launcher.is_some()
-        && let Err(e) = std::fs::write(&go, b"")
-    {
-        stop(&mut child, group);
-        return Err(format!("letting the program go: {e}"));
-    }
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                // What it started and left running goes with it.
-                kill_group(group);
-                break status;
-            }
-            Ok(None) => {}
-            Err(e) => {
-                stop(&mut child, group);
-                return Err(format!("waiting for `{}`: {e}", r.program));
-            }
-        }
-        if s.closing.load(Ordering::Acquire) {
-            stop(&mut child, group);
-            return Err(format!("the tool ended before `{}` did", r.program));
-        }
+    let (mut child, group) = start_owned(s, &mut command, &go, &r.program)?;
+    let status = wait_owned(s, &mut child, group, &r.program, || {
         if Instant::now() >= r.due {
-            stop(&mut child, group);
-            return Err(format!(
+            return Some(format!(
                 "`{}` ran past its deadline of {} s, and the host killed its process group",
                 r.program,
                 r.deadline.as_secs_f64()
             ));
         }
         if size(&output) > MOST_OUTPUT || size(&errors) > MOST_OUTPUT {
-            stop(&mut child, group);
-            return Err(format!(
+            return Some(format!(
                 "`{}` wrote more than {MOST_OUTPUT} bytes of output, and the host killed its process group",
                 r.program
             ));
         }
-        std::thread::sleep(POLL);
-    };
+        None
+    })?;
     let code = match status.code() {
         Some(c) => c,
         None => {

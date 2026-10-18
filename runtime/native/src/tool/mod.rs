@@ -9,9 +9,9 @@
 //! whole may have one (`--timeout`), and an interrupt (Ctrl-C) stops it, inside a call too.
 //!
 //! **Services run beside the tool.** A call never waits on one: the requests a call makes are
-//! carried out after it returns, on the host's worker threads (files, blobs, HTTP, programs) or
-//! by the host's own loop (timers, the date), and each answer reaches the tool no sooner than
-//! its next call. Every service is given one capability context ([`Caps`]), made from the
+//! carried out after it returns, on the host's worker threads (files, blobs, HTTP, programs, the
+//! toolchain, driven builds) or by the host's own loop (timers, the date), and each answer
+//! reaches the tool no sooner than its next call. Every service is given one capability context ([`Caps`]), made from the
 //! command line's grants, and reaches files, secrets, hosts and programs through it alone.
 //!
 //! **A tool test's clock is fake** ([`Options::fake_clock`], language.md §13.2). It moves only
@@ -26,24 +26,29 @@
 //! interrupt, waiting on nothing), the host stops its workers (work not started is dropped,
 //! work in progress gets a bounded grace), stops the clock thread that interrupts calls, and
 //! releases every blob, those of requests the tool never read first ([`Ended`] says what was
-//! left). A worker running a program kills its process group as it sees the end, and one
-//! waiting for an HTTP response shuts its connection down and joins the client's thread;
-//! then the directory the run's programs had is removed. No file work holds the blob table's
-//! lock, so a stuck worker can't hold up the release.
-//! A worker still running after the grace makes the end the host's failure (status 71), whatever
-//! the tool's own end was, and `wrela tool` then ends the process, so no worker outlives it. The host keeps no compiled code: it compiles the tool's WASM for each run, so nothing
-//! it loads comes from a directory a tool could write.
+//! left). A worker running a program kills its process group as it sees the end, one
+//! waiting for an HTTP response shuts its connection down and joins the client's thread, one
+//! waiting for the toolchain cancels its work, and every driven build's calls are stopped, then
+//! each build is closed, with the same grace; then the directory the run's programs had is
+//! removed. No file work holds the blob table's lock, so a stuck worker can't hold up the
+//! release. A worker or a driven build still running after the grace makes the end the host's
+//! failure (status 71), whatever the tool's own end was, and `wrela tool` then ends the process,
+//! so no worker outlives it. The host keeps no compiled code: it compiles the tool's WASM, and a
+//! driven build's, for each run, so nothing it loads comes from a directory a tool could write.
 
 mod blobs;
 mod caps;
 mod console;
+mod drive;
 mod http;
 mod run;
 mod services;
+pub mod toolchain;
 
 pub use blobs::BlobBudget;
 pub use caps::{Caps, Grants, Program, ProgramGrant};
 pub use run::{GROUPS_ENV, launch};
+pub use toolchain::Toolchain;
 
 use console::Console;
 use services::{Answer, Services, Task, Work};
@@ -68,10 +73,12 @@ const EPOCH: Duration = Duration::from_millis(10);
 /// How often the host's loop looks for an interrupt while it waits for answers.
 const WAKE: Duration = Duration::from_millis(20);
 
-/// The worker threads that carry out files and blobs, and those that wait on the network and
-/// on programs: two pools, so that a long wait never holds up a file.
+/// The worker threads that carry out files and blobs, those that wait on the network and on
+/// programs, and those that wait on the compiler and driven builds: three pools, so that a long
+/// wait never holds up a file, and a build never holds up the network.
 const WORKERS: usize = 4;
 const LONG_WORKERS: usize = 4;
+const HEAVY_WORKERS: usize = 4;
 
 /// How long, once the tool has ended, the host waits for work in progress to finish.
 const GRACE: Duration = Duration::from_secs(5);
@@ -105,6 +112,12 @@ pub struct Options {
     /// A file the host appends each program's process group to as it starts, for a supervisor
     /// that must kill them if this host can't (a tool test's, §13.2).
     pub groups: Option<std::path::PathBuf>,
+    /// The compiler the toolchain service runs (`std::tool::toolchain`): `None`, and its
+    /// requests fail.
+    pub toolchain: Option<Arc<dyn Toolchain>>,
+    /// The directory, the host's own, where the toolchain keeps its constants' cache: never one
+    /// a tool is granted. `None`: one of the run's own, removed with it.
+    pub cache: Option<std::path::PathBuf>,
     /// What only tests change.
     #[doc(hidden)]
     pub testing: Testing,
@@ -112,7 +125,9 @@ pub struct Options {
 
 /// A run's settings that only tests change: the workers' grace, a slow disk under each blob
 /// written to a file, a clock thread that fails to start, where the run's own directory is, a
-/// pause between a program's start and its record, and a name lookup that stalls.
+/// pause between a program's start and its record, a name lookup that stalls, and, for the
+/// toolchain's outputs, one write held a while and one that fails part way (each chosen by its
+/// path's end, or `#n` for a request's `n`th write).
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct Testing {
@@ -122,6 +137,8 @@ pub struct Testing {
     pub work_dir: Option<std::path::PathBuf>,
     pub spawn_pause: Duration,
     pub resolve_stall: Duration,
+    pub hold: Option<(String, Duration)>,
+    pub write_fail: Option<String>,
 }
 
 impl Default for Testing {
@@ -133,6 +150,8 @@ impl Default for Testing {
             work_dir: None,
             spawn_pause: Duration::ZERO,
             resolve_stall: Duration::ZERO,
+            hold: None,
+            write_fail: None,
         }
     }
 }
@@ -151,6 +170,8 @@ impl Options {
             entries: (EXPORT_TOOL_INIT.to_string(), EXPORT_TOOL.to_string()),
             fake_clock: None,
             groups: None,
+            toolchain: None,
+            cache: None,
             testing: Testing::default(),
         }
     }
@@ -343,9 +364,18 @@ impl Pool {
                         let answer = std::panic::catch_unwind(run).unwrap_or_else(|_| {
                             Answer::Bytes(b"\x01the host's service failed".to_vec())
                         });
-                        // A failed request's answer names no blob: those made for it go back.
+                        // A failed request's answer names no blob or build: those made for it go
+                        // back.
                         if matches!(&answer, Answer::Bytes(b) if b.first() == Some(&1)) {
                             services.blobs().rollback(request);
+                            let made = services.drives().rollback(request);
+                            for d in made {
+                                if !d.close(services.grace) {
+                                    let _ = services
+                                        .stuck
+                                        .set("a failed request's driven build didn't close".into());
+                                }
+                            }
                         }
                         if done.send((request, answer)).is_err() {
                             break;
@@ -402,21 +432,24 @@ impl Pool {
     }
 }
 
-/// The two pools of workers: files and blobs, and long waits (HTTP, programs).
+/// The three pools of workers: files and blobs, long waits (HTTP, programs), and heavy work
+/// (the compiler, driven builds).
 struct Pools {
     files: Pool,
     long: Pool,
+    heavy: Pool,
 }
 
 impl Pools {
-    /// Stops both, their work in progress sharing one `grace`: how many workers are left.
+    /// Stops all three, their work in progress sharing one `grace`: how many workers are left.
     fn stop(self, grace: Duration) -> usize {
         let until = Instant::now() + grace;
-        let Pools { mut files, mut long } = self;
-        // Both are told first, so neither's work waits on the other's grace.
+        let Pools { mut files, mut long, mut heavy } = self;
+        // All are told first, so none's work waits on another's grace.
         files.close();
         long.close();
-        long.stop(until) + files.stop(until)
+        heavy.close();
+        heavy.stop(until) + long.stop(until) + files.stop(until)
     }
 }
 
@@ -494,7 +527,17 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     };
     let start = start_bytes(&options.args, options.caps.secrets());
     let Options {
-        caps, blob_budget, interrupt, print, testing, entries, fake_clock, groups, ..
+        caps,
+        blob_budget,
+        interrupt,
+        print,
+        testing,
+        entries,
+        fake_clock,
+        groups,
+        toolchain,
+        cache,
+        ..
     } = options;
     let blobs = Mutex::new(blobs::Blobs::new(blob_budget));
     let services = Arc::new(Services {
@@ -511,11 +554,16 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         resolve_stall: testing.resolve_stall,
         grace: testing.grace,
         stuck: Arc::new(std::sync::OnceLock::new()),
+        toolchain: toolchain.map(|toolchain| toolchain::Service { toolchain, cache }),
+        hold: testing.hold.clone(),
+        write_fail: testing.write_fail.clone(),
+        drives: Mutex::default(),
     });
     let (done, answers) = mpsc::channel();
     let pools = Pools {
         files: Pool::start(&services, &done, "files", WORKERS),
         long: Pool::start(&services, &done, "long", LONG_WORKERS),
+        heavy: Pool::start(&services, &done, "heavy", HEAVY_WORKERS),
     };
     drop(done);
     let (console, writer) = match Console::start(print) {
@@ -552,7 +600,18 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     // The store, and the console's sending end in it, go when `drive` returns.
     let mut end = run.drive(&engine, build, &entries, start, console);
     ticker.stop();
-    let workers_left = pools.stop(testing.grace);
+    // Driven builds' running calls stop first, so the workers waiting on them return.
+    services.drives().stop_all();
+    let mut workers_left = pools.stop(testing.grace);
+    // Then each driven build closes, on its own thread: one that doesn't within the grace is
+    // left, as a stuck worker is.
+    let driven = services.drives().take_all();
+    let until = Instant::now() + testing.grace;
+    for d in driven {
+        if !d.close(until.saturating_duration_since(Instant::now())) {
+            workers_left += 1;
+        }
+    }
     let lines_dropped = writer.stop(testing.grace);
     // Its programs' files and `HOME`: no program runs now (each worker kills its own as the
     // tool ends), unless a worker is still past its grace.
@@ -738,8 +797,10 @@ impl Run<'_> {
         if !s.taken.is_empty() {
             let mut blobs =
                 self.services.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut drives = self.services.drives();
             for request in s.taken.drain(..) {
                 blobs.publish(request);
+                drives.publish(request);
             }
         }
         for (request, service, body) in std::mem::take(&mut s.made) {
@@ -753,6 +814,7 @@ impl Run<'_> {
                 }
                 Work::Worker(task) => self.pools.files.send(request, task),
                 Work::Long(task) => self.pools.long.send(request, task),
+                Work::Heavy(task) => self.pools.heavy.send(request, task),
                 Work::Held(after, task) => {
                     self.due.insert(request, self.now() + after);
                     self.pools.long.send(request, task);

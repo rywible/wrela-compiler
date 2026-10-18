@@ -710,6 +710,9 @@ pub struct ToolTest {
     /// The programs `std::tool::run` may run (`run: [("wrangler", "fakes/wrangler")]`): each
     /// name, and the directory in the test's package of the tool package that stands in for it.
     pub run: Vec<(String, String)>,
+    /// The roots the test may read (`read: [("repo", "../..")]`): each name, and its directory,
+    /// relative to the test's package (it may lead above it, with `..`). Never written.
+    pub read: Vec<(String, String)>,
 }
 
 /// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is

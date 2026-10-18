@@ -1,0 +1,349 @@
+// A tool's toolchain (language.md §15.5): builds, tests, checks, formatting and the reference
+// docs of packages in the tool's roots, by the compiler's own code, in the tool host's process:
+// what `wrela build`, `test`, `check`, `fmt` and `doc --export` do. A package and an output are
+// root paths (`NAME/rel`); an output is in a write root.
+//
+// The compiler reads only through the tool's roots: the package, its dependencies (one outside
+// the roots is an error), its workspace's manifest and members, and the files it embeds. Its
+// constants' cache is the host's, never beside a package. Each request has a deadline, 300 s
+// unless it asks for another (at most 600 s), from when the host takes it; past it, or when the
+// tool ends, the host stops the work, and kills `wasm-opt`'s process group if it runs.
+//
+// A program's errors aren't the request's: a build or a check with errors answers with them
+// (`ok` false). A request fails for what the host can't do: a path outside the roots, a
+// deadline passed.
+
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, answer, ask, malformed}
+
+/// A diagnostic: whether it's an error (else a warning), its code (`E0220`), its message, where
+/// it is (`file:line:column`, or empty), and the whole of it as `wrela check` shows it.
+pub struct Diagnostic: Clone {
+    pub error: bool,
+    pub code: String,
+    pub message: String,
+    pub at: String,
+    pub rendered: String,
+}
+
+/// A dependency read from another package than its manifest names: the dependency's name,
+/// wherever a manifest declares it, and the package's directory (a root path).
+pub struct Override: Clone {
+    pub name: String,
+    pub dir: String,
+}
+
+/// How to build: through Binaryen's `wasm-opt` (`wrela build --optimize`), lifting the literals
+/// of these packages (`--lift`), with dependencies read from other packages, with SIMD or
+/// without, as a debug build or not, and how long it may take in seconds (0: 300 s).
+pub struct BuildOptions: Clone {
+    pub optimize: bool,
+    pub lift: Vec<String>,
+    pub overrides: Vec<Override>,
+    pub simd: bool,
+    pub debug: bool,
+    pub timeout: f64,
+}
+
+/// What `wrela build` makes: no optimizing, lifting or overrides, SIMD, a release build.
+pub fn options() -> BuildOptions {
+    BuildOptions {
+        optimize: false,
+        lift: Vec::new(),
+        overrides: Vec::new(),
+        simd: true,
+        debug: false,
+        timeout: 0.0,
+    }
+}
+
+/// A build: whether it has no errors, the files it wrote into its output (by their paths
+/// there), its diagnostics, and how many constants it computed and read from the cache.
+pub struct Built: Clone {
+    pub ok: bool,
+    pub files: Vec<String>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub computed: u32,
+    pub cached: u32,
+}
+
+/// One test's result: its name, where it is, whether it passed, why it failed (as `wrela test`
+/// shows it), and what it printed.
+pub struct TestResult: Clone {
+    pub name: String,
+    pub at: String,
+    pub passed: bool,
+    pub message: String,
+    pub printed: Vec<String>,
+}
+
+/// A test run: whether every test passed, each test's result, the errors that kept the tests
+/// from running, and how many the filter left out.
+pub struct Tested: Clone {
+    pub passed: bool,
+    pub results: Vec<TestResult>,
+    pub diagnostics: Vec<Diagnostic>,
+    pub filtered_out: u32,
+}
+
+/// A check: whether it found no errors, and what it found.
+pub struct Checked: Clone {
+    pub ok: bool,
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A file `fmt` couldn't format, and why (its syntax errors).
+pub struct Unformatted: Clone {
+    pub path: String,
+    pub why: String,
+}
+
+/// What `fmt` did: the files it changed (or that a check found not formatted), and those it
+/// couldn't format.
+pub struct Formatted: Clone {
+    pub changed: Vec<String>,
+    pub failed: Vec<Unformatted>,
+}
+
+/// Builds the package at `pkg` into `out`, a directory in a write root, as `wrela build -o`
+/// does: the same files, byte for byte. A file an earlier build wrote there and this one doesn't
+/// is removed, and one no build wrote is left, and stops the build. `read_built` reads the
+/// answer.
+@tool
+pub fn build(pkg: str, out: str, options: BuildOptions) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(pkg)
+    w.write_str(out)
+    w.write_u8(if options.optimize { 1 } else { 0 })
+    w.write_u8(if options.simd { 1 } else { 0 })
+    w.write_u8(if options.debug { 1 } else { 0 })
+    w.write_u32(options.lift.len())
+    for l in options.lift {
+        w.write_str(l.as_str())
+    }
+    w.write_u32(options.overrides.len())
+    for o in options.overrides {
+        w.write_str(o.name.as_str())
+        w.write_str(o.dir.as_str())
+    }
+    w.write_u64(bitcast_u64(options.timeout))
+    ask("toolchain/build", take w.into_bytes())
+}
+
+/// Runs the tests of the package at `pkg` whose names hold `filter` (all, for ""), as `wrela
+/// test` does: `read_tested` reads the answer. A tool test isn't run here (it needs `wrela
+/// test`'s processes): it fails, saying so.
+@tool
+pub fn test(pkg: str, filter: str, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(pkg)
+    w.write_str(filter)
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/test", take w.into_bytes())
+}
+
+/// Checks the package at `pkg`, as `wrela check` does: `read_checked` reads the answer.
+@tool
+pub fn check(pkg: str, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(pkg)
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/check", take w.into_bytes())
+}
+
+/// Formats the `.wrela` files at `paths` (root paths of files, or of directories, each package's
+/// files as `wrela check` reads them), as `wrela fmt` does; with `check`, writes nothing and
+/// only says which aren't formatted (`wrela fmt --check`). `read_formatted` reads the answer.
+@tool
+pub fn fmt(paths: [String], check: bool, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(paths.len())
+    for p in paths {
+        w.write_str(p.as_str())
+    }
+    w.write_u8(if check { 1 } else { 0 })
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/fmt", take w.into_bytes())
+}
+
+/// Writes the reference docs of std and `packages` into `out`, a new or empty directory in a
+/// write root, as `wrela doc --export` does: their source is `repository` at `revision` ("" for
+/// `main`), each package's files named by their paths in its root. `read_exported` reads the
+/// answer.
+@tool
+pub fn doc_export(
+    packages: [String],
+    out: str,
+    repository: str,
+    revision: str,
+    timeout: f64 = 0.0,
+) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u32(packages.len())
+    for p in packages {
+        w.write_str(p.as_str())
+    }
+    w.write_str(out)
+    w.write_str(repository)
+    w.write_str(revision)
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/doc_export", take w.into_bytes())
+}
+
+/// A count of texts, then each, or `None`.
+fn read_strings(r: mut Reader) -> Option<Vec<String>> {
+    let Ok(n) = r.read_u32() else { return None }
+    if n > r.left() {
+        return None
+    }
+    var out: Vec<String> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(s) = r.read_string() else { return None }
+        out.push(take s)
+    }
+    Some(out)
+}
+
+/// A count of diagnostics, then each: whether it's an error, its code, message, place and text.
+fn read_diagnostics(r: mut Reader) -> Option<Vec<Diagnostic>> {
+    let Ok(n) = r.read_u32() else { return None }
+    if n > r.left() {
+        return None
+    }
+    var out: Vec<Diagnostic> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(error) = r.read_u8() else { return None }
+        let Ok(code) = r.read_string() else { return None }
+        let Ok(message) = r.read_string() else { return None }
+        let Ok(at) = r.read_string() else { return None }
+        let Ok(rendered) = r.read_string() else { return None }
+        out.push(Diagnostic { error: error != 0, code, message, at, rendered })
+    }
+    Some(out)
+}
+
+/// Reads a `build` answer.
+pub fn read_built(polled: take Result<Vec<u8>, IoError>) -> Result<Built, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/build")) }
+    let Some(files) = read_strings(mut r) else { return Err(malformed("toolchain/build")) }
+    let Some(diagnostics) = read_diagnostics(mut r) else {
+        return Err(malformed("toolchain/build"))
+    }
+    let Ok(computed) = r.read_u32() else { return Err(malformed("toolchain/build")) }
+    let Ok(cached) = r.read_u32() else { return Err(malformed("toolchain/build")) }
+    if !r.at_end() {
+        return Err(malformed("toolchain/build"))
+    }
+    Ok(Built { ok: ok != 0, files, diagnostics, computed, cached })
+}
+
+/// Reads a `test` answer.
+pub fn read_tested(polled: take Result<Vec<u8>, IoError>) -> Result<Tested, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(passed) = r.read_u8() else { return Err(malformed("toolchain/test")) }
+    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/test")) }
+    if n > r.left() {
+        return Err(malformed("toolchain/test"))
+    }
+    var results: Vec<TestResult> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(name) = r.read_string() else { return Err(malformed("toolchain/test")) }
+        let Ok(at) = r.read_string() else { return Err(malformed("toolchain/test")) }
+        let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/test")) }
+        let Ok(message) = r.read_string() else { return Err(malformed("toolchain/test")) }
+        let Some(printed) = read_strings(mut r) else { return Err(malformed("toolchain/test")) }
+        results.push(TestResult { name, at, passed: ok != 0, message, printed })
+    }
+    let Some(diagnostics) = read_diagnostics(mut r) else { return Err(malformed("toolchain/test")) }
+    let Ok(filtered_out) = r.read_u32() else { return Err(malformed("toolchain/test")) }
+    if !r.at_end() {
+        return Err(malformed("toolchain/test"))
+    }
+    Ok(Tested { passed: passed != 0, results, diagnostics, filtered_out })
+}
+
+/// Reads a `check` answer.
+pub fn read_checked(polled: take Result<Vec<u8>, IoError>) -> Result<Checked, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/check")) }
+    let Some(diagnostics) = read_diagnostics(mut r) else {
+        return Err(malformed("toolchain/check"))
+    }
+    if !r.at_end() {
+        return Err(malformed("toolchain/check"))
+    }
+    Ok(Checked { ok: ok != 0, diagnostics })
+}
+
+/// Reads a `fmt` answer.
+pub fn read_formatted(polled: take Result<Vec<u8>, IoError>) -> Result<Formatted, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Some(changed) = read_strings(mut r) else { return Err(malformed("toolchain/fmt")) }
+    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/fmt")) }
+    if n > r.left() {
+        return Err(malformed("toolchain/fmt"))
+    }
+    var failed: Vec<Unformatted> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(path) = r.read_string() else { return Err(malformed("toolchain/fmt")) }
+        let Ok(why) = r.read_string() else { return Err(malformed("toolchain/fmt")) }
+        failed.push(Unformatted { path, why })
+    }
+    if !r.at_end() {
+        return Err(malformed("toolchain/fmt"))
+    }
+    Ok(Formatted { changed, failed })
+}
+
+/// Reads a `doc_export` answer: how many files it wrote.
+pub fn read_exported(polled: take Result<Vec<u8>, IoError>) -> Result<u32, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/doc_export")) }
+    if !r.at_end() {
+        return Err(malformed("toolchain/doc_export"))
+    }
+    Ok(n)
+}
+
+@test
+fn a_build_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u8(1)
+    w.write_u32(1)
+    w.write_str("game.wasm")
+    w.write_u32(1)
+    w.write_u8(0)
+    w.write_str("W0003")
+    w.write_str("a warning")
+    w.write_str("main.wrela:1:1")
+    w.write_str("warning[W0003]: a warning")
+    w.write_u32(2)
+    w.write_u32(3)
+    let Ok(built) = read_built(Ok(take w.into_bytes())) else { panic("a build") }
+    assert(built.ok && built.files.len() == 1 && built.files[0].as_str() == "game.wasm")
+    assert(built.diagnostics.len() == 1 && !built.diagnostics[0].error)
+    assert(built.computed == 2 && built.cached == 3)
+    assert(read_built(Ok(Vec::from([u8(0), 1, 9, 0, 0, 0]))).is_err(), "more files than bytes")
+}
+
+@test
+fn a_test_run_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u8(0)
+    w.write_u32(1)
+    w.write_str("fails")
+    w.write_str("main.wrela:3:4")
+    w.write_u8(0)
+    w.write_str("on purpose")
+    w.write_u32(1)
+    w.write_str("a line")
+    w.write_u32(0)
+    w.write_u32(2)
+    let Ok(t) = read_tested(Ok(take w.into_bytes())) else { panic("a run") }
+    assert(!t.passed && t.results.len() == 1 && !t.results[0].passed)
+    assert(t.results[0].printed.len() == 1 && t.filtered_out == 2)
+}

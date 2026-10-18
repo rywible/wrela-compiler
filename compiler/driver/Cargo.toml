@@ -27,6 +27,11 @@ wasmtime.workspace = true
 # Constants are cached by their inputs between builds, keyed by a digest of them (§13).
 sha2 = "0.10"
 
+# A compile confined to a tool's read roots (`reach`, language.md §15.5) opens each file relative
+# to its root's directory handle, without waiting on a FIFO (`O_NONBLOCK`).
+cap-std = "4"
+libc = "0.2"
+
 # A tool test that doesn't end is killed with its process group (§13.2), without `unsafe`.
 rustix = { version = "1", features = ["process"] }
 

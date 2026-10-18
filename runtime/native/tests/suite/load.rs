@@ -77,3 +77,23 @@ fn rejects_a_program_with_other_imports() {
         "invalid program: it imports `env.now`, which isn't one of the host's: `wrela.memory`, `wrela.submit`, `wrela.request_status`, `wrela.request_take`, `wrela.limit`, `wrela.audio`, `wrela.input`, `wrela.payload`, `wrela.tick`, `wrela.keep`, `wrela.kept`, `wrela.clock`, `wrela.print`, `wrela.phase`"
     );
 }
+
+/// A driven build (the tool host's `drive`, language.md §15.5), read through its directory's
+/// handle and compiled to be stopped, runs as a loaded one: the same frames give the same hash.
+#[test]
+fn a_driven_build_runs_as_a_loaded_one() {
+    let dir = common::first_light_copy("driven");
+    let handle = wrela_host::open_build_dir(&dir).expect("the build's directory");
+    let stop = wrela_host::Stop::new().expect("a stop");
+    let driven = CpuBuild::load_driven(handle, &dir, stop).expect("driven");
+    let loaded = CpuBuild::load(&dir).expect("loaded");
+    let mut hashes = Vec::new();
+    for build in [driven, loaded] {
+        let mut host = build.start_with(1).expect("start");
+        for i in 0..3 {
+            host.lockstep_frame(i, 60.0, 64, 48, &[]).expect("a frame");
+        }
+        hashes.push(host.hash());
+    }
+    assert_eq!(hashes[0], hashes[1]);
+}

@@ -37,7 +37,15 @@ pub fn script(root: &Path, name: &str) -> ScriptOutput {
         let script = errors(&diagnostics).and_then(|()| named(&checked, name)).and_then(|c| {
             let mut data = BuildData { debug: true, testing: true, ..Default::default() };
             let cache = crate::const_cache::dirs_of(root);
-            prepare(&checked, &sources, &loaded.dirs, &mut data, &mut diagnostics, &cache);
+            prepare(
+                &checked,
+                &sources,
+                &loaded.dirs,
+                &mut data,
+                &mut diagnostics,
+                &cache,
+                &crate::reach::Reach::anywhere(),
+            );
             errors(&diagnostics)?;
             json_of(&checked, &data, c).ok_or_else(|| format!("`{name}` has no computed value"))
         });

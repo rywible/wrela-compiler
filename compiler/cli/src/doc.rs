@@ -210,14 +210,26 @@ pub(crate) fn std_sources() -> Vec<SourceFile> {
 /// The files of the package at `dir`, each module under `prefix` (`engine::creature`) if one is
 /// given, and named as `[prefix] file` then.
 pub(crate) fn package_sources(dir: &Path, prefix: Option<&str>) -> Result<Vec<SourceFile>, String> {
-    let files = wrela_driver::package::find_files(dir).map_err(|errs| {
+    let here = std::env::current_dir().unwrap_or_default();
+    package_sources_in(&wrela_driver::reach::Reach::anywhere(), &here, dir, prefix)
+}
+
+/// [`package_sources`], read through `reach`, each file named by its path from `base`.
+pub(crate) fn package_sources_in(
+    reach: &wrela_driver::reach::Reach,
+    base: &Path,
+    dir: &Path,
+    prefix: Option<&str>,
+) -> Result<Vec<SourceFile>, String> {
+    let files = wrela_driver::package::find_files_in(reach, dir).map_err(|errs| {
         errs.iter().map(|e| format!("{}: {}", e.path, e.message)).collect::<Vec<_>>().join("; ")
     })?;
     let mut sources = Vec::new();
     for f in files {
-        let text = std::fs::read_to_string(&f.path)
+        let text = reach
+            .read_to_string(&f.path)
             .map_err(|e| format!("can't read `{}`: {e}", f.path.display()))?;
-        let file = repository_path(&f.path);
+        let file = repository_path(base, &f.path);
         match prefix {
             Some(p) => {
                 let mut module = vec![p.to_string()];
@@ -230,10 +242,10 @@ pub(crate) fn package_sources(dir: &Path, prefix: Option<&str>) -> Result<Vec<So
     Ok(sources)
 }
 
-/// `path` as the repository names it: relative to the current directory, `/`-separated.
-fn repository_path(path: &Path) -> String {
-    let here = std::env::current_dir().ok();
-    let relative = here.as_deref().and_then(|h| path.strip_prefix(h).ok()).unwrap_or(path);
+/// `path` as the repository names it: relative to `base` (the current directory, for `wrela
+/// doc`), `/`-separated.
+fn repository_path(base: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(base).unwrap_or(path);
     let parts: Vec<String> = relative
         .components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))

@@ -37,6 +37,10 @@ static ENGINE: LazyLock<Engine> = LazyLock::new(|| engine(false));
 /// does too much work fails rather than hangs, after the same work on every machine.
 static METERED: LazyLock<Engine> = LazyLock::new(|| engine(true));
 
+/// [`ENGINE`], with epoch interruption: for a program the tool host drives (language.md §15.5's
+/// `drive`), whose calls a [`Stop`] ends on every thread, a deadline's or a cancel's.
+static INTERRUPTIBLE: LazyLock<Engine> = LazyLock::new(|| engine_with(false, true));
+
 /// The engine that counts fuel ([`METERED`]): the compiler runs a build's constants and tests
 /// under it too, so a process that builds and runs programs makes one.
 pub fn metered_engine() -> &'static Engine {
@@ -44,15 +48,133 @@ pub fn metered_engine() -> &'static Engine {
 }
 
 fn engine(fuel: bool) -> Engine {
+    engine_with(fuel, false)
+}
+
+fn engine_with(fuel: bool, interruptible: bool) -> Engine {
     let mut config = wasmtime::Config::new();
     // A program's memory is shared with its workers (wrela_abi::memory). Wasmtime's threads are
     // a tier 2 feature: no security updates for old releases.
     config.wasm_threads(true).shared_memory(true).consume_fuel(fuel);
+    config.epoch_interruption(interruptible);
     // No native unwind info: wasmtime's backtraces and its handling of a panic in a host
     // function don't need it, and macOS registers it for every function under one lock per
     // process, so a test binary's threads queued on it as they loaded programs.
     config.native_unwind_info(false);
     Engine::new(&config).expect("wasmtime's configuration is valid")
+}
+
+/// How often the interruptible engine's epoch moves on: how soon a [`Stop`] ends a call.
+const EPOCH: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// The thread that moves [`INTERRUPTIBLE`]'s epoch on, while a [`Stop`] is alive: how many are,
+/// and the thread with its flag to end.
+type Ticking = Option<(usize, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>;
+static TICKING: std::sync::Mutex<Ticking> = std::sync::Mutex::new(None);
+
+/// What ends a driven program's calls (the tool host's `drive`, language.md §15.5): once it's
+/// stopped, or past its deadline, every call into the program on any of its threads (its own,
+/// its helpers', the ticker's) traps with an interrupt within about 10 ms, as the engine's epoch
+/// moves. The first thread that sees its deadline pass stops it for good, so every other
+/// thread of that call stops too, whatever deadline is set after. A wait in a call (a job's join, `atomic.wait`) isn't interrupted, but a helper's trap
+/// wakes what waits for it. While a `Stop` is alive, a thread of the host's moves the epoch on;
+/// the last one's drop ends and joins it.
+#[derive(Clone)]
+pub struct Stop(Arc<StopState>);
+
+struct StopState {
+    stopped: std::sync::atomic::AtomicBool,
+    /// Nanoseconds after `base` from which calls stop; `u64::MAX`: none.
+    deadline: std::sync::atomic::AtomicU64,
+    base: std::time::Instant,
+}
+
+impl Stop {
+    /// A stop, not stopped, with no deadline.
+    pub fn new() -> Result<Stop> {
+        let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        match ticking.as_mut() {
+            Some((count, _, _)) => *count += 1,
+            None => {
+                let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let r = running.clone();
+                let thread = std::thread::Builder::new()
+                    .name("wrela-drive-epochs".into())
+                    .spawn(move || {
+                        while r.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::sleep(EPOCH);
+                            INTERRUPTIBLE.increment_epoch();
+                        }
+                    })
+                    .map_err(|e| {
+                        Error::Program(format!("can't start the thread that stops calls: {e}"))
+                    })?;
+                *ticking = Some((1, running, thread));
+            }
+        }
+        Ok(Stop(Arc::new(StopState {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            deadline: std::sync::atomic::AtomicU64::new(u64::MAX),
+            base: std::time::Instant::now(),
+        })))
+    }
+
+    /// Stops every call from now on.
+    pub fn stop(&self) {
+        self.0.stopped.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Calls stop from `at` on (`None`: no deadline).
+    pub fn set_deadline(&self, at: Option<std::time::Instant>) {
+        let nanos = at.map_or(u64::MAX, |at| {
+            u64::try_from(at.saturating_duration_since(self.0.base).as_nanos()).unwrap_or(u64::MAX)
+        });
+        self.0.deadline.store(nanos, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Whether calls stop now: it's stopped, or past its deadline.
+    pub fn is_due(&self) -> bool {
+        let s = &self.0;
+        s.stopped.load(std::sync::atomic::Ordering::Acquire)
+            || s.base.elapsed().as_nanos()
+                >= u128::from(s.deadline.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Whether it was stopped ([`Stop::stop`]), not only past a deadline.
+    pub fn is_stopped(&self) -> bool {
+        self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Makes `store`'s calls end when this is due.
+    fn install<T>(&self, store: &mut Store<T>) {
+        let stop = self.clone();
+        store.set_epoch_deadline(1);
+        store.epoch_deadline_callback(move |_| {
+            Ok(if stop.is_due() {
+                // Latched before this thread stops: a deadline cleared once this call has
+                // answered doesn't let another of its threads (a helper held in a wait) go on.
+                stop.stop();
+                wasmtime::UpdateDeadline::Interrupt
+            } else {
+                wasmtime::UpdateDeadline::Continue(1)
+            })
+        });
+    }
+}
+
+impl Drop for StopState {
+    fn drop(&mut self) {
+        let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((count, _, _)) = ticking.as_mut() {
+            *count -= 1;
+            if *count == 0
+                && let Some((_, running, thread)) = ticking.take()
+            {
+                running.store(false, std::sync::atomic::Ordering::Release);
+                let _ = thread.join();
+            }
+        }
+    }
 }
 
 /// Why the program's last call failed, for a caller that reports it against the source: the
@@ -63,6 +185,11 @@ pub struct Failure {
     pub frames: Vec<u32>,
     pub trap: Option<wasmtime::Trap>,
     pub panic: Option<String>,
+    /// Where in the source it happened, if the build says (its trap locations), else the
+    /// innermost frame's code offset.
+    pub at: Option<String>,
+    /// The ticker's tick it happened in, if it happened in one (alone, or in a lockstep frame).
+    pub tick: Option<u32>,
 }
 
 /// Carries out commands that have already been decoded, sequenced and checked.
@@ -204,6 +331,9 @@ const CALLED_WHILE_STARTING: &str =
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Io {
     pub build: Option<PathBuf>,
+    /// A driven build's directory, opened: when it's there, `Fetch` reads through it alone, one
+    /// part at a time, following no link (`crate::confined`), and never by `build`'s path.
+    pub build_dir: Option<Arc<cap_std::fs::Dir>>,
     pub storage: Option<PathBuf>,
     pub post: Option<PostHandler>,
     pub host: Option<HostHandler>,
@@ -325,8 +455,11 @@ impl Requests {
             }
             Command::Fetch { request, url } => {
                 self.start(*request, cmd.opcode())?;
-                let a = Self::file(&self.io.build, url, "build to fetch from")
-                    .and_then(|f| std::fs::read(f).map_err(|e| e.to_string()));
+                let a = match &self.io.build_dir {
+                    Some(dir) => crate::confined::read(dir, url, u64::MAX),
+                    None => Self::file(&self.io.build, url, "build to fetch from")
+                        .and_then(|f| std::fs::read(f).map_err(|e| e.to_string())),
+                };
                 (*request, a)
             }
             Command::HostRequest { request, service, body } => {
@@ -566,6 +699,8 @@ pub(crate) struct Program<E: 'static> {
     lines: Option<Arc<Lines>>,
     /// The fuel each call gets, on a metered engine ([`METERED`]).
     fuel: Option<u64>,
+    /// What ends its calls, on the interruptible engine ([`INTERRUPTIBLE`]).
+    stop: Option<Stop>,
     /// Why the last call failed, if it did.
     last_failure: Option<Failure>,
     /// Whether `init` completed (or the module has no `init`).
@@ -852,6 +987,8 @@ pub(crate) struct Compiled {
     module: Module,
     /// The fuel each call gets, when compiled for [`METERED`].
     fuel: Option<u64>,
+    /// What ends its calls, when compiled for [`INTERRUPTIBLE`].
+    stop: Option<Stop>,
     /// Its memory's type: shared.
     memory: wasmtime::MemoryType,
     lines: Option<Arc<Lines>>,
@@ -886,6 +1023,20 @@ pub(crate) fn compile_cached(
     compiled(crate::cache::module(engine_for(fuel), wasm, hash, dir)?, wasm, fuel, sidecar)
 }
 
+/// A program the tool host drives: compiled for [`INTERRUPTIBLE`] (never from or into a cache:
+/// the host keeps no compiled code), its calls ended by `stop`. `sidecar` is as
+/// [`compile_cached`]'s.
+pub(crate) fn compile_interruptible(
+    wasm: &[u8],
+    sidecar: Option<&[u8]>,
+    stop: Stop,
+) -> Result<Compiled> {
+    let module = Module::new(&INTERRUPTIBLE, wasm).map_err(|e| Error::Program(format!("{e:#}")))?;
+    let mut compiled = compiled(module, wasm, None, sidecar)?;
+    compiled.stop = Some(stop);
+    Ok(compiled)
+}
+
 fn compiled(
     module: Module,
     wasm: &[u8],
@@ -905,7 +1056,7 @@ fn compiled(
         )),
         None => None,
     };
-    Ok(Compiled { module, fuel, memory, lines, pair: wrela_abi::read_pair(wasm) })
+    Ok(Compiled { module, fuel, stop: None, memory, lines, pair: wrela_abi::read_pair(wasm) })
 }
 
 impl<E: Executor> Program<E> {
@@ -1066,6 +1217,9 @@ impl<E: Executor> Program<E> {
         {
             fail_after_store!(wrap(e));
         }
+        if let Some(stop) = &compiled.stop {
+            stop.install(&mut store);
+        }
         if let Err(e) = linker.define(&store, IMPORT_MODULE, IMPORT_MEMORY, memory.clone()) {
             fail_after_store!(wrap(e));
         }
@@ -1106,7 +1260,8 @@ impl<E: Executor> Program<E> {
         let threads = (0..n)
             .map(|i| {
                 let thread = memory::THREAD_HELPER0 + i;
-                spawn_worker(compiled.module.clone(), memory.clone(), thread, trace.clone())
+                let stop = compiled.stop.clone();
+                spawn_worker(compiled.module.clone(), memory.clone(), thread, trace.clone(), stop)
             })
             .collect();
         if has_worker {
@@ -1125,6 +1280,7 @@ impl<E: Executor> Program<E> {
             ticker: None,
             records,
             fuel: compiled.fuel,
+            stop: compiled.stop.clone(),
             last_failure: None,
             init_done: false,
             // A program that replaces one may be replaced in turn.
@@ -1350,7 +1506,7 @@ impl<E: Executor> Program<E> {
     /// A trap on thread `thread` as the host reports it, with its panic message and where it
     /// was; kept as [`Program::last_failure`].
     fn trapped(&mut self, trap: &wasmtime::Error, thread: u32) -> Error {
-        let what = self.describe_trap(trap);
+        let (what, at) = self.describe_trap(trap);
         let panic = self.take_panic_message(thread);
         let frames = trap
             .downcast_ref::<wasmtime::WasmBacktrace>()
@@ -1359,7 +1515,8 @@ impl<E: Executor> Program<E> {
             })
             .unwrap_or_default();
         let kind = trap.downcast_ref::<wasmtime::Trap>().copied();
-        self.last_failure = Some(Failure { frames, trap: kind, panic: panic.clone() });
+        self.last_failure =
+            Some(Failure { frames, trap: kind, panic: panic.clone(), at, tick: None });
         Error::Trap(match panic {
             Some(msg) => format!("panic: {msg}: {what}"),
             None => what,
@@ -1380,7 +1537,7 @@ impl<E: Executor> Program<E> {
     /// What trapped, and where in the source if the program says: the location of the
     /// innermost frame that has one. A build without its trap locations (an optimized build
     /// whose `game.lines` is missing) gives the innermost frame's module offset instead.
-    fn describe_trap(&self, trap: &wasmtime::Error) -> String {
+    fn describe_trap(&self, trap: &wasmtime::Error) -> (String, Option<String>) {
         let what = match trap.downcast_ref::<wasmtime::Trap>() {
             Some(t) => t.to_string(),
             None => format!("{trap:#}"),
@@ -1392,8 +1549,8 @@ impl<E: Executor> Program<E> {
             None => offsets.into_iter().next().map(|o| format!("code offset {o:#x}")),
         };
         match at {
-            Some(loc) => format!("{what} at {loc}"),
-            None => what,
+            Some(loc) => (format!("{what} at {loc}"), Some(loc)),
+            None => (what, None),
         }
     }
 
@@ -1409,9 +1566,14 @@ impl<E: Executor> Program<E> {
         };
         let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
         if self.audio.is_none() {
-            let (mut store, instance) =
-                other_instance(&self.module, &self.memory, "the audio thread", &self.trace())
-                    .map_err(wrap)?;
+            let (mut store, instance) = other_instance(
+                &self.module,
+                &self.memory,
+                "the audio thread",
+                &self.trace(),
+                self.stop.as_ref(),
+            )
+            .map_err(wrap)?;
             let render = instance
                 .get_typed_func::<(u32, u32, u32), ()>(&mut store, EXPORT_AUDIO)
                 .map_err(wrap)?;
@@ -1613,9 +1775,14 @@ impl<E: Executor> Program<E> {
             return Ok(t);
         }
         let wrap = |e: wasmtime::Error| Error::Program(format!("{e:#}"));
-        let (mut store, instance) =
-            other_instance(&self.module, &self.memory, "the ticker", &self.trace())
-                .map_err(wrap)?;
+        let (mut store, instance) = other_instance(
+            &self.module,
+            &self.memory,
+            "the ticker",
+            &self.trace(),
+            self.stop.as_ref(),
+        )
+        .map_err(wrap)?;
         let tick = instance
             .get_typed_func::<(u32, u32, u32, u32), ()>(&mut store, EXPORT_TICK)
             .map_err(wrap)?;
@@ -1665,7 +1832,11 @@ impl<E: Executor> Program<E> {
 
     /// Tick `k` trapped: the program's panic, as the host reports it.
     fn tick_trapped(&mut self, k: u32, trap: &wasmtime::Error) -> Error {
-        match self.trapped(trap, memory::THREAD_TICK) {
+        let error = self.trapped(trap, memory::THREAD_TICK);
+        if let Some(f) = &mut self.last_failure {
+            f.tick = Some(k);
+        }
+        match error {
             Error::Trap(why) => Error::Trap(format!("in tick {k}: {why}")),
             e => e,
         }
@@ -1726,9 +1897,13 @@ fn other_instance(
     memory: &SharedMemory,
     who: &'static str,
     trace: &Trace,
+    stop: Option<&Stop>,
 ) -> wasmtime::Result<(Store<bool>, Instance)> {
     let engine = module.engine();
     let mut store = Store::new(engine, false);
+    if let Some(stop) = stop {
+        stop.install(&mut store);
+    }
     // On a metered engine, another thread's instance isn't what a call's fuel bounds.
     if engine.get_consume_fuel() {
         store.set_fuel(u64::MAX)?;
@@ -1798,7 +1973,7 @@ impl BuildHelpers {
                     let mut used = HelperRun::default();
                     let run = |used: &mut HelperRun| -> wasmtime::Result<()> {
                         let (mut store, instance) =
-                            other_instance(&module, &memory, "build-time code", &trace)?;
+                            other_instance(&module, &memory, "build-time code", &trace, None)?;
                         let metered = store.engine().get_consume_fuel();
                         if metered {
                             store.set_fuel(fuel)?;
@@ -1878,10 +2053,12 @@ fn spawn_worker(
     memory: SharedMemory,
     thread: u32,
     trace: Trace,
+    stop: Option<Stop>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let run = || -> wasmtime::Result<()> {
-            let (mut store, instance) = other_instance(&module, &memory, "a helper", &trace)?;
+            let (mut store, instance) =
+                other_instance(&module, &memory, "a helper", &trace, stop.as_ref())?;
             let worker = instance.get_typed_func::<u32, ()>(&mut store, EXPORT_WORKER)?;
             worker.call(&mut store, thread)
         };

@@ -9,50 +9,74 @@ use wrela_diag::{FileId, SourceMap};
 /// exactly the files `wrela check` reads; other directories are searched for packages and
 /// files, skipping hidden entries and symbolic links. Returns whether the layout was readable.
 fn collect(path: &Path, out: &mut Vec<PathBuf>) -> bool {
-    if !path.is_dir() {
+    let mut errors = Vec::new();
+    collect_in(&wrela_driver::reach::Reach::anywhere(), path, out, &mut errors);
+    for e in &errors {
+        eprintln!("error: {e}");
+    }
+    errors.is_empty()
+}
+
+/// [`collect`], reading only what `reach` may, with what's wrong put in `errors`.
+pub(crate) fn collect_in(
+    reach: &wrela_driver::reach::Reach,
+    path: &Path,
+    out: &mut Vec<PathBuf>,
+    errors: &mut Vec<String>,
+) {
+    use wrela_driver::reach::Kind;
+    // A path that can't be read is an error, never a path with nothing to format.
+    let kind = match reach.kind(path, true) {
+        Ok(Some(kind)) => kind,
+        Ok(None) => {
+            errors.push(format!("`{}` isn't there", path.display()));
+            return;
+        }
+        Err(e) => {
+            errors.push(format!("can't read `{}`: {e}", path.display()));
+            return;
+        }
+    };
+    if kind != Kind::Dir {
         if path.extension().is_some_and(|x| x == "wrela") {
             // A pipe or a device would block or never end when read.
-            if !path.is_file() {
-                eprintln!("error: `{}` isn't a regular file", path.display());
-                return false;
+            if kind != Kind::File {
+                errors.push(format!("`{}` isn't a regular file", path.display()));
+                return;
             }
             out.push(path.to_path_buf());
         }
-        return true;
+        return;
     }
-    if path.join("main.wrela").is_file() {
-        return match wrela_driver::package::find_files(path) {
-            Ok(files) => {
-                out.extend(files.into_iter().map(|f| f.path));
-                true
-            }
-            Err(errors) => {
-                for e in errors {
-                    eprintln!("error: {}: {}", path.join(&e.path).display(), e.message);
+    if reach.is_file(&path.join("main.wrela")) {
+        match wrela_driver::package::find_files_in(reach, path) {
+            Ok(files) => out.extend(files.into_iter().map(|f| f.path)),
+            Err(errs) => {
+                for e in errs {
+                    errors.push(format!("{}: {}", path.join(&e.path).display(), e.message));
                 }
-                false
             }
-        };
+        }
+        return;
     }
-    let entries = match std::fs::read_dir(path) {
+    let entries = match reach.entries(path) {
         Ok(e) => e,
         Err(e) => {
             // Its files can't be checked: that's no pass.
-            eprintln!("error: can't read `{}`: {e}", path.display());
-            return false;
+            errors.push(format!("can't read `{}`: {e}", path.display()));
+            return;
         }
     };
-    let mut entries: Vec<PathBuf> = entries.filter_map(Result::ok).map(|e| e.path()).collect();
-    entries.sort();
-    let mut ok = true;
-    for e in entries {
+    let mut entries: Vec<(PathBuf, Kind)> =
+        entries.into_iter().map(|(name, kind)| (path.join(name), kind)).collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    for (e, kind) in entries {
         let hidden = e.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
-        if hidden || std::fs::symlink_metadata(&e).is_ok_and(|m| m.file_type().is_symlink()) {
+        if hidden || kind == Kind::Link {
             continue;
         }
-        ok &= collect(&e, out);
+        collect_in(reach, &e, out, errors);
     }
-    ok
 }
 
 /// Formats on a thread with the compiler's stack: the parser and the formatter recurse over

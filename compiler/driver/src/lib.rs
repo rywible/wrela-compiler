@@ -22,6 +22,7 @@ pub mod optimize;
 pub mod package;
 pub mod primer;
 pub mod query;
+pub mod reach;
 pub mod refactor;
 pub mod script;
 pub mod serve;
@@ -227,6 +228,107 @@ pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Out
     })
 }
 
+/// What a compile reaches beyond its package, and what stops it: where it may read, where it
+/// caches its constants, which dependencies it reads from elsewhere, and a flag that cancels
+/// it. The `wrela` commands use [`Scope::default`]: anywhere, the package's own cache, nothing
+/// overridden, never cancelled. The tool host's `toolchain` service (language.md §15.5) gives a
+/// tool's: its read roots, a cache the host owns, and its request's cancellation.
+#[derive(Clone, Debug, Default)]
+pub struct Scope {
+    pub reach: reach::Reach,
+    /// The constants' cache directories ([`const_cache`]), in the order read; `None`: the
+    /// package's `build/consts` and the shared one ([`const_cache::dirs_of`]).
+    pub cache: Option<Vec<std::path::PathBuf>>,
+    /// Dependencies read from these directories, by name, wherever a manifest declares them:
+    /// the studio's lens gets its subject package this way.
+    pub overrides: Vec<(String, std::path::PathBuf)>,
+    /// Set to stop the compile: it stops at its next phase (loading, checking, constants,
+    /// lowering a role, emitting) with [`CANCELLED`].
+    pub cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+/// What a cancelled compile gives ([`Scope::cancel`]).
+pub const CANCELLED: &str = "the compile was cancelled";
+
+impl Scope {
+    /// [`CANCELLED`], if the compile is to stop.
+    fn stop(&self) -> Result<(), String> {
+        match &self.cancel {
+            Some(c) if c.load(std::sync::atomic::Ordering::Acquire) => Err(CANCELLED.into()),
+            _ => Ok(()),
+        }
+    }
+
+    /// The constants' cache for the package at `root`.
+    fn cache_of(&self, root: &Path) -> Vec<std::path::PathBuf> {
+        self.cache.clone().unwrap_or_else(|| const_cache::dirs_of(root))
+    }
+}
+
+/// A build of the package at `root` within `scope`: [`build`], or a debug or test build (`kind`),
+/// with no SIMD unless `simd`, lifting the packages `lift` names ([`build_lifted`]). An error if
+/// a lifted name isn't one of the program's packages, or if `scope` cancels it.
+pub fn build_in(
+    root: &Path,
+    kind: BuildKind,
+    simd: bool,
+    lift: &[String],
+    scope: &Scope,
+) -> Result<Output, String> {
+    on_compiler_thread(|| {
+        scope.stop()?;
+        let loaded = load_scoped(root, &Overlay::new(), scope);
+        if let Some(l) = &loaded.2 {
+            let names: Vec<&str> = l.packages.iter().skip(1).map(|p| p.name.as_str()).collect();
+            if let Some(bad) = lift.iter().map(|n| lift_package(n)).find(|n| !names.contains(n)) {
+                return Err(format!(
+                    "lift: the program has no package named `{bad}` (it has {})",
+                    names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
+                ));
+            }
+        }
+        let mode = Mode { debug: kind.debug, testing: kind.testing, no_simd: !simd, emit: true };
+        compile_loaded_in(root, mode, wrela_lower::Roots::of, lift, loaded, scope)
+    })
+}
+
+/// [`check`] within `scope`: an error only if `scope` cancels it.
+pub fn check_in(root: &Path, scope: &Scope) -> Result<Output, String> {
+    on_compiler_thread(|| {
+        scope.stop()?;
+        let loaded = load_scoped(root, &Overlay::new(), scope);
+        compile_loaded_in(root, Mode::CHECK, wrela_lower::Roots::of, &[], loaded, scope)
+    })
+}
+
+/// [`test`] within `scope`: an error only if `scope` cancels it. A tool test (§13.2) isn't run
+/// here, since it needs processes of its own that `wrela test` supervises: each fails, saying so.
+pub fn test_in(root: &Path, filter: Option<&str>, scope: &Scope) -> Result<TestOutput, String> {
+    on_compiler_thread(|| {
+        let ran = run_tests_in(
+            root,
+            filter,
+            PackageKind::Program,
+            consts::TEST_FUEL,
+            false,
+            false,
+            scope,
+        );
+        match ran {
+            Ok(out) => Ok(out),
+            Err(Stopped::Cancelled) => Err(CANCELLED.into()),
+            Err(Stopped::Matched(_)) => unreachable!("only an exact filter counts its matches"),
+        }
+    })
+}
+
+/// Why a test run stopped before it ran its tests: an exact filter matched this many, or the
+/// scope cancelled it.
+enum Stopped {
+    Matched(usize),
+    Cancelled,
+}
+
 /// The package a `--lift` entry names: `name`, or `name/file.wrela` (one file of it).
 fn lift_package(entry: &str) -> &str {
     entry.split_once('/').map_or(entry, |(p, _)| p)
@@ -340,7 +442,8 @@ pub fn with_partial<T: Send>(
         if lower && !has_errors(&diagnostics) {
             let mut data = wrela_lower::BuildData::default();
             let cache = const_cache::dirs_of(root);
-            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
+            let reach = reach::Reach::anywhere();
+            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &reach);
             if !has_errors(&diagnostics) {
                 let roots = wrela_lower::Roots::every_fn(&checked);
                 lowered = Some(wrela_lower::lower(&checked, &roots, &data, false).0);
@@ -453,7 +556,24 @@ fn run_tests(
     bless: bool,
     exact: bool,
 ) -> Result<TestOutput, usize> {
-    let (sources, mut diagnostics, loaded) = load(root);
+    run_tests_in(root, filter, kind, fuel, bless, exact, &Scope::default()).map_err(|s| match s {
+        Stopped::Matched(n) => n,
+        Stopped::Cancelled => unreachable!("an unscoped run isn't cancelled"),
+    })
+}
+
+fn run_tests_in(
+    root: &Path,
+    filter: Option<&str>,
+    kind: PackageKind,
+    fuel: u64,
+    bless: bool,
+    exact: bool,
+    scope: &Scope,
+) -> Result<TestOutput, Stopped> {
+    let stop = || scope.stop().map_err(|_| Stopped::Cancelled);
+    stop()?;
+    let (sources, mut diagnostics, loaded) = load_scoped(root, &Overlay::new(), scope);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
         split_std_warnings(&sources, &mut diagnostics);
         return Ok(TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 });
@@ -467,8 +587,10 @@ fn run_tests(
     // A debug build's checks, as `wrela build --debug` makes them (§11).
     let mut data = wrela_lower::BuildData { debug: true, testing: true, ..Default::default() };
     let mut filtered_out = 0;
-    let cache = const_cache::dirs_of(root);
-    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
+    stop()?;
+    let cache = scope.cache_of(root);
+    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &scope.reach);
+    stop()?;
     let mut results = Vec::new();
     if !has_errors(&diagnostics) {
         // The package's tests, in the order written.
@@ -490,7 +612,7 @@ fn run_tests(
             )
         });
         if exact && tests.len() != 1 {
-            return Err(tests.len());
+            return Err(Stopped::Matched(tests.len()));
         }
         filtered_out = all - tests.len();
         // Tests of code run as constants are computed; frame tests run the program first, and
@@ -505,12 +627,27 @@ fn run_tests(
             ran.extend(r);
             diagnostics.extend(d);
         }
+        stop()?;
         if !framed.is_empty() && !has_errors(&diagnostics) {
-            let (r, d) = frames::run(&checked, &sources, &data, &framed, root, fuel, bless);
+            let (r, d) =
+                frames::run(&checked, &sources, &data, &framed, root, fuel, bless, &scope.reach);
             ran.extend(r);
             diagnostics.extend(d);
         }
-        if !tools.is_empty() && !has_errors(&diagnostics) {
+        stop()?;
+        if !tools.is_empty() && !has_errors(&diagnostics) && scope.reach.is_confined() {
+            for &f in &tools {
+                let why = Diagnostic::new(
+                    codes::E0706,
+                    p.func(f).name_span,
+                    format!(
+                        "the tool test `{}` didn't run: a tool test runs under `wrela test`, which supervises its processes, not in a tool's toolchain service",
+                        p.func(f).name
+                    ),
+                );
+                ran.push((f, Some(why), wrela_host::Traced::default()));
+            }
+        } else if !tools.is_empty() && !has_errors(&diagnostics) {
             let (r, d) = tool_tests::run(&checked, &sources, &mut data, &tools, root);
             ran.extend(r);
             diagnostics.extend(d);
@@ -583,11 +720,25 @@ fn compile_loaded(
     mode: Mode,
     roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
     lift: &[String],
-    (sources, mut diagnostics, loaded): (SourceMap, Vec<Diagnostic>, Option<Loaded>),
+    loaded: (SourceMap, Vec<Diagnostic>, Option<Loaded>),
 ) -> Output {
+    compile_loaded_in(root, mode, roots, lift, loaded, &Scope::default())
+        .expect("an unscoped compile isn't cancelled")
+}
+
+/// [`compile_loaded`] within `scope`, which may cancel it between its phases.
+fn compile_loaded_in(
+    root: &Path,
+    mode: Mode,
+    roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
+    lift: &[String],
+    (sources, mut diagnostics, loaded): (SourceMap, Vec<Diagnostic>, Option<Loaded>),
+    scope: &Scope,
+) -> Result<Output, String> {
+    scope.stop()?;
     let Some(Loaded { units, mut packages, dirs, files: all_files, .. }) = loaded else {
         let std_warnings = split_std_warnings(&sources, &mut diagnostics);
-        return Output {
+        return Ok(Output {
             sources,
             diagnostics,
             std_warnings,
@@ -595,7 +746,7 @@ fn compile_loaded(
             pipelines: Vec::new(),
             program_files: Vec::new(),
             consts: consts::ConstStats::default(),
-        };
+        });
     };
     // The program package's own files: package 1's (std is 0).
     let program_files: ProgramFiles = all_files
@@ -616,6 +767,7 @@ fn compile_loaded(
         .map(|(f, _, path)| (*f, lift::relative(path, root)))
         .collect();
     let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+    scope.stop()?;
     let mut files = Vec::new();
     let mut pipelines = Vec::new();
     let mut data = wrela_lower::BuildData {
@@ -624,8 +776,10 @@ fn compile_loaded(
         testing: mode.testing,
         ..Default::default()
     };
-    let cache = const_cache::dirs_of(root);
-    let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache);
+    let cache = scope.cache_of(root);
+    let stats =
+        prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &scope.reach);
+    scope.stop()?;
     if !lift.is_empty() && !has_errors(&diagnostics) {
         data.lift = Some(lift::table(&checked, &sources, &lifted_files));
     }
@@ -641,8 +795,10 @@ fn compile_loaded(
         let roots = roots(&checked);
         // Each role the program has is a build of its own, from that role's entries (§15).
         for role in roles(&checked) {
+            scope.stop()?;
             data.role = role;
             let (lowered, d) = wrela_lower::lower(&checked, &roots, &data, mode.emit);
+            scope.stop()?;
             let ok = !has_errors(&d);
             diagnostics.extend(d);
             if role == wrela_sema::defs::Role::Client {
@@ -686,7 +842,15 @@ fn compile_loaded(
         files.clear();
     }
     let std_warnings = split_std_warnings(&sources, &mut diagnostics);
-    Output { sources, diagnostics, std_warnings, files, pipelines, program_files, consts: stats }
+    Ok(Output {
+        sources,
+        diagnostics,
+        std_warnings,
+        files,
+        pipelines,
+        program_files,
+        consts: stats,
+    })
 }
 
 /// The roles a program has (§15.3): a server's if main.wrela exports `serve`, a tool's if it
@@ -721,11 +885,12 @@ fn prepare(
     data: &mut wrela_lower::BuildData,
     diagnostics: &mut Vec<Diagnostic>,
     cache: &[std::path::PathBuf],
+    reach: &reach::Reach,
 ) -> consts::ConstStats {
     if has_errors(diagnostics) {
         return consts::ConstStats::default();
     }
-    let (embeds, d) = consts::read_embeds(checked, dirs);
+    let (embeds, d) = consts::read_embeds_in(reach, checked, dirs);
     data.embeds = embeds;
     diagnostics.extend(d);
     if has_errors(diagnostics) {
@@ -798,7 +963,18 @@ fn load(root: &Path) -> (SourceMap, Vec<Diagnostic>, Option<Loaded>) {
 
 /// [`load`], with `overlay`'s texts in place of those files' on disk.
 fn load_with(root: &Path, overlay: &Overlay) -> (SourceMap, Vec<Diagnostic>, Option<Loaded>) {
+    load_scoped(root, overlay, &Scope::default())
+}
+
+/// [`load_with`], reading only what `scope` reaches, its dependencies overridden as it says.
+fn load_scoped(
+    root: &Path,
+    overlay: &Overlay,
+    scope: &Scope,
+) -> (SourceMap, Vec<Diagnostic>, Option<Loaded>) {
     let mut l = Loader {
+        reach: scope.reach.clone(),
+        overrides: scope.overrides.clone(),
         overlay: overlay.clone(),
         sources: SourceMap::new(),
         diags: Vec::new(),
@@ -882,6 +1058,10 @@ struct Loaded {
 
 /// Loads a package and, through their manifests, the packages it depends on (language.md §3).
 struct Loader {
+    /// Where it may read.
+    reach: reach::Reach,
+    /// Dependencies loaded from these directories, by name, whatever their manifests say.
+    overrides: Vec<(String, std::path::PathBuf)>,
     /// Texts that stand in for files on disk ([`Overlay`]).
     overlay: Overlay,
     sources: SourceMap,
@@ -915,14 +1095,23 @@ impl Loader {
         kind: PackageKind,
         at: Option<Span>,
     ) -> Option<usize> {
-        let canon = match dir.canonicalize() {
-            Ok(c) if c.is_dir() => c,
-            _ => {
+        let canon = match self.reach.canonical(dir) {
+            Ok(c) if self.reach.is_dir(&c) => c,
+            found => {
                 let what = name.unwrap_or("the package");
-                let msg = format!(
-                    "the dependency `{what}` isn't there: `{}` isn't a directory",
-                    dir.display()
-                );
+                let outside =
+                    found.is_err_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied);
+                let msg = if outside {
+                    format!(
+                        "the dependency `{what}` is outside the roots the tool was granted: `{}`",
+                        dir.display()
+                    )
+                } else {
+                    format!(
+                        "the dependency `{what}` isn't there: `{}` isn't a directory",
+                        dir.display()
+                    )
+                };
                 if let Some(at) = at {
                     let d = Diagnostic::new(codes::E0220, at, msg);
                     self.diags.push(d.with_help(
@@ -930,10 +1119,15 @@ impl Loader {
                     ));
                 } else {
                     let file = self.sources.add(dir.display().to_string(), "");
+                    let why = if outside {
+                        "is outside the roots the tool was granted"
+                    } else {
+                        "isn't a directory"
+                    };
                     self.diags.push(Diagnostic::new(
                         codes::E0205,
                         Span::new(file, 0, 0),
-                        format!("the package `{}` isn't a directory", dir.display()),
+                        format!("the package `{}` {why}", dir.display()),
                     ));
                     self.layout_failed = true;
                 }
@@ -970,7 +1164,7 @@ impl Loader {
         let manifest = if let Some((_, m)) = cached {
             // Read already, as a workspace's or a member's: its errors are reported.
             m.clone().unwrap_or_default()
-        } else if let Some(text) = optional_file(&manifest_path) {
+        } else if let Some(text) = optional_file(&self.reach, &manifest_path) {
             let display = format!("{prefix}wrela.toml");
             match text {
                 Ok(text) => {
@@ -1032,7 +1226,7 @@ impl Loader {
         });
         self.dirs.push((canon.clone(), index));
         self.visiting.push((canon.clone(), pkg_name, at));
-        let files = match package::find_files(dir) {
+        let files = match package::find_files_in(&self.reach, dir) {
             Ok(files) => files,
             Err(errors) => {
                 for e in errors {
@@ -1061,7 +1255,7 @@ impl Loader {
             };
             let text = match stand_in {
                 Some(t) => Ok(t.clone()),
-                None => std::fs::read(&pf.path).map_err(|e| e.to_string()).and_then(|b| {
+                None => self.reach.read(&pf.path).map_err(|e| e.to_string()).and_then(|b| {
                     String::from_utf8(b).map_err(|_| "the file isn't valid UTF-8 (L1)".to_string())
                 }),
             };
@@ -1102,12 +1296,16 @@ impl Loader {
                 );
                 continue;
             }
-            let dep_dir = match &dep.source {
-                manifest::Source::Path(path) => dir.join(path),
-                manifest::Source::Workspace => match self.member(&canon, &dep.name, dep.span) {
-                    Some(d) => d,
-                    None => continue,
-                },
+            let overridden = self.overrides.iter().find(|(n, _)| *n == dep.name);
+            let dep_dir = match (overridden, &dep.source) {
+                (Some((_, d)), _) => d.clone(),
+                (None, manifest::Source::Path(path)) => dir.join(path),
+                (None, manifest::Source::Workspace) => {
+                    match self.member(&canon, &dep.name, dep.span) {
+                        Some(d) => d,
+                        None => continue,
+                    }
+                }
             };
             if let Some(j) =
                 self.package(&dep_dir, Some(&dep.name), PackageKind::Dependency, Some(dep.span))
@@ -1122,7 +1320,7 @@ impl Loader {
     /// The directory of the member named `name` of the workspace of the package in `dir`,
     /// which depends on it at `at`; `None` when there's none (reported, E0220).
     fn member(&mut self, dir: &Path, name: &str, at: Span) -> Option<std::path::PathBuf> {
-        let Some(path) = workspace::find(dir) else {
+        let Some(path) = workspace::find_in(&self.reach, dir) else {
             self.diags.push(
                 Diagnostic::new(
                     codes::E0220,
@@ -1158,8 +1356,11 @@ impl Loader {
             return members.clone();
         }
         let members = self.manifest_at(path).and_then(|m| {
+            let reach = self.reach.clone();
             let (members, errors) =
-                workspace::members(path, m.workspace.as_ref()?, &mut |p| self.manifest_at(p));
+                workspace::members_in(&reach, path, m.workspace.as_ref()?, &mut |p| {
+                    self.manifest_at(p)
+                });
             self.diags.extend(errors);
             Some(members)
         });
@@ -1174,7 +1375,7 @@ impl Loader {
             return m.clone();
         }
         let shown = self.shown(path);
-        let parsed = match std::fs::read_to_string(path) {
+        let parsed = match self.reach.read_to_string(path) {
             Ok(text) => {
                 let f = self.sources.add(shown, text);
                 manifest::parse(f, &self.sources.file(f).text.clone())
@@ -1248,19 +1449,24 @@ fn add_unit(
 /// A regular file's text, an error for anything present that cannot be read as one, or `None`
 /// only when no directory entry exists. Checking the entry before reading also keeps a pipe or
 /// device named `wrela.toml` from blocking the compiler.
-fn optional_file(path: &Path) -> Option<Result<String, std::io::Error>> {
-    let entry = match std::fs::symlink_metadata(path) {
-        Ok(entry) => entry,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+fn optional_file(reach: &reach::Reach, path: &Path) -> Option<Result<String, std::io::Error>> {
+    let entry = match reach.kind(path, false) {
+        Ok(Some(kind)) => kind,
+        Ok(None) => return None,
         Err(e) => return Some(Err(e)),
     };
-    let regular = if entry.file_type().is_symlink() {
-        std::fs::metadata(path).map(|target| target.is_file())
+    let regular = if entry == reach::Kind::Link {
+        reach.kind(path, true).and_then(|target| match target {
+            Some(kind) => Ok(kind == reach::Kind::File),
+            None => {
+                Err(std::io::Error::new(std::io::ErrorKind::NotFound, "its link leads nowhere"))
+            }
+        })
     } else {
-        Ok(entry.is_file())
+        Ok(entry == reach::Kind::File)
     };
     match regular {
-        Ok(true) => Some(std::fs::read_to_string(path)),
+        Ok(true) => Some(reach.read_to_string(path)),
         Ok(false) => Some(Err(std::io::Error::other("it isn't a regular file"))),
         Err(e) => Some(Err(e)),
     }

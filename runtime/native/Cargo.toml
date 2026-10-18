@@ -24,8 +24,9 @@ wasmtime.workspace = true
 cap-std = "4"
 # `O_NONBLOCK`, so opening a tool's file never waits on a FIFO; process groups for `run`.
 libc = "0.2"
-# `std::tool::run`'s process groups, killed without `unsafe` (already in the tree, for cap-std).
-rustix = { version = "1", features = ["process"] }
+# `std::tool::run`'s process groups, killed without `unsafe`, and files opened through a directory
+# handle without following a link (`confined`); already in the tree, for cap-std.
+rustix = { version = "1", features = ["process", "fs"] }
 # `std::tool::http`'s client: blocking, on the tool host's worker threads, over rustls.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }

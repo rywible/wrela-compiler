@@ -13,7 +13,9 @@
 //! clock can't reach among them) 2. The process ends with the tool, so no worker outlives it.
 //!
 //! The build is made in memory and its WASM compiled for this run: nothing is written beside
-//! the package but the constants' cache that every build keeps.
+//! the package. Its constants' cache, and the toolchain service's (`std::tool::toolchain`, which
+//! this command gives the host: `crate::toolchain`), is the user's own
+//! (`crate::toolchain::cache_dir`), never one in a root the tool is granted.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -98,7 +100,19 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let built = wrela_driver::build(&dir);
+    let cache = crate::toolchain::cache_dir();
+    let scope = wrela_driver::Scope {
+        cache: Some(cache.iter().cloned().collect()),
+        ..wrela_driver::Scope::default()
+    };
+    let built =
+        match wrela_driver::build_in(&dir, wrela_driver::BuildKind::default(), true, &[], &scope) {
+            Ok(b) => b,
+            Err(why) => {
+                eprintln!("error: {why}");
+                return ExitCode::from(2);
+            }
+        };
     if crate::report(&built, false) {
         return ExitCode::from(1);
     }
@@ -131,6 +145,8 @@ pub fn run(args: &[String]) -> ExitCode {
     // A supervisor (a tool test's) that must be able to kill this tool's programs names a file
     // for their process groups.
     options.groups = std::env::var_os(wrela_host::tool::GROUPS_ENV).map(std::path::PathBuf::from);
+    options.toolchain = Some(Arc::new(crate::toolchain::Compiler));
+    options.cache = cache;
     options.testing = testing();
     let ended = wrela_host::tool::run(&ToolBuild::from_wasm(wasm.clone()), options);
     if !matches!(ended.end, wrela_host::tool::End::Exit(_)) {
@@ -165,6 +181,9 @@ fn test(dir: &std::path::Path) -> ExitCode {
     for (name, package) in &spec.run {
         grants = grants.program(name, wrela_host::tool::ProgramGrant::Tool(package.clone()));
     }
+    for (name, dir) in &spec.read {
+        grants = grants.root(name, dir, false);
+    }
     let ended = match (Caps::open(&grants, |_| None), std::fs::read(&spec.wasm)) {
         (Ok(caps), Ok(wasm)) => {
             let mut options = Options::new(caps);
@@ -172,6 +191,8 @@ fn test(dir: &std::path::Path) -> ExitCode {
             options.entries = (spec.init.clone(), spec.resume.clone());
             options.fake_clock = Some((spec.utc, 0));
             options.groups = Some(spec.groups.clone());
+            options.toolchain = Some(Arc::new(crate::toolchain::Compiler));
+            options.cache = crate::toolchain::cache_dir();
             options.testing = testing();
             let ended = wrela_host::tool::run(&ToolBuild::from_wasm(wasm), options);
             let end = match &ended.end {
@@ -198,8 +219,11 @@ fn test(dir: &std::path::Path) -> ExitCode {
 }
 
 /// The host's settings that only the command's own tests change, from the environment: a pause
-/// between a program's start and its record (`WRELA_TESTING_SPAWN_PAUSE`) and a name lookup
-/// that stalls (`WRELA_TESTING_RESOLVE_STALL`), each in seconds.
+/// between a program's start and its record (`WRELA_TESTING_SPAWN_PAUSE`), a name lookup that
+/// stalls (`WRELA_TESTING_RESOLVE_STALL`) and a slow disk under each output written
+/// (`WRELA_TESTING_IO_DELAY`), each in seconds; one output write held (`WRELA_TESTING_HOLD`,
+/// `which:seconds`), and one that fails part way (`WRELA_TESTING_WRITE_FAIL`, `which`), each
+/// chosen by its path's end or `#n`, the request's `n`th write.
 fn testing() -> wrela_host::tool::Testing {
     let seconds = |name: &str| {
         std::env::var(name)
@@ -211,6 +235,12 @@ fn testing() -> wrela_host::tool::Testing {
     wrela_host::tool::Testing {
         spawn_pause: seconds("WRELA_TESTING_SPAWN_PAUSE"),
         resolve_stall: seconds("WRELA_TESTING_RESOLVE_STALL"),
+        io_delay: seconds("WRELA_TESTING_IO_DELAY"),
+        hold: std::env::var("WRELA_TESTING_HOLD").ok().and_then(|v| {
+            let (which, s) = v.rsplit_once(':')?;
+            Some((which.to_string(), Duration::try_from_secs_f64(s.parse().ok()?).ok()?))
+        }),
+        write_fail: std::env::var("WRELA_TESTING_WRITE_FAIL").ok().filter(|v| !v.is_empty()),
         ..wrela_host::tool::Testing::default()
     }
 }

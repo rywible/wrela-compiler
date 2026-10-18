@@ -1024,11 +1024,17 @@ impl<'d, 'u> Collector<'d, 'u> {
     }
 
     /// `@test(tool, ...)` (§13.2): a tool test, with its options: `budget: s`, seconds from 0 to
-    /// [`MAX_TOOL_TEST_BUDGET`]; `net: ["host", ...]`, the fake sites it reaches; and `run:
+    /// [`MAX_TOOL_TEST_BUDGET`]; `net: ["host", ...]`, the fake sites it reaches; `run:
     /// [("name", "dir"), ...]`, the programs it may run, each a tool package in a directory of
-    /// the test's package. Anything else is E0222.
+    /// the test's package; and `read: [("name", "dir"), ...]`, the roots it may read, each a
+    /// directory relative to the test's package. Anything else is E0222.
     fn tool_test(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<ToolTest> {
-        let mut test = ToolTest { budget: TOOL_TEST_BUDGET, net: Vec::new(), run: Vec::new() };
+        let mut test = ToolTest {
+            budget: TOOL_TEST_BUDGET,
+            net: Vec::new(),
+            run: Vec::new(),
+            read: Vec::new(),
+        };
         let mut bad: Option<(Span, &str)> = None;
         let mut seen: Vec<&str> = Vec::new();
         let text = |e: &ast::Expr| match &e.kind {
@@ -1089,7 +1095,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                     }
                 }
-                "run" => {
+                "run" | "read" => {
                     let pairs = match &arg.value.kind {
                         ast::ExprKind::Array(items) => items
                             .iter()
@@ -1102,15 +1108,37 @@ impl<'d, 'u> Collector<'d, 'u> {
                             .collect::<Option<Vec<(String, String)>>>(),
                         _ => None,
                     };
+                    let read = name.name == "read";
+                    // A root may lead above the package (`..`); a program is inside it.
+                    let dir_ok = |dir: &str| {
+                        if read {
+                            !dir.is_empty()
+                                && !dir.starts_with('/')
+                                && !dir.contains(['\\', '\0'])
+                                && dir.split('/').all(|p| !p.is_empty() && p != ".")
+                        } else {
+                            wrela_abi::check::path_problem(dir).is_none()
+                        }
+                    };
                     let ok = |(name, dir): &(String, String)| {
                         !name.is_empty()
+                            && name != "."
+                            && name != ".."
+                            && name != "scratch"
                             && name.bytes().all(|b| {
                                 b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
                             })
-                            && wrela_abi::check::path_problem(dir).is_none()
+                            && dir_ok(dir)
                     };
                     match pairs.filter(|p| p.iter().all(ok)) {
+                        Some(p) if read => test.read = p,
                         Some(p) => test.run = p,
+                        None if read => {
+                            bad = bad.or(Some((
+                                arg.span,
+                                "`read` is an array of `(\"name\", \"dir\")`: a root's name (not `scratch`), and its directory, relative to the test's package",
+                            )))
+                        }
                         None => {
                             bad = bad.or(Some((
                                 arg.span,
@@ -1119,7 +1147,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                     }
                 }
-                _ => bad = bad.or(Some((arg.span, "a tool test takes `budget`, `net` and `run`"))),
+                _ => {
+                    bad = bad
+                        .or(Some((arg.span, "a tool test takes `budget`, `net`, `run` and `read`")))
+                }
             }
         }
         if let Some((span, why)) = bad {

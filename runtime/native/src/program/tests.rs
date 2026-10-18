@@ -1093,7 +1093,14 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
     let batch = Encoder::new().fetch(4, "data/level.bin").finish();
     let mut p = requester(
         &batch,
-        Io { build: Some(build), storage: None, post: None, host: None, quiet: false },
+        Io {
+            build: Some(build),
+            build_dir: None,
+            storage: None,
+            post: None,
+            host: None,
+            quiet: false,
+        },
     );
     p.call("ask", &[]).expect("ask");
     assert_eq!(call_i32(&mut p, "status"), 5);
@@ -1119,8 +1126,14 @@ fn failed_request_take_keeps_the_answer_for_a_valid_destination() {
 fn storage_keeps_bytes_at_paths() {
     let storage = scratch_dir("storage");
     assert!(!storage.join("saves").exists(), "the write must create missing parents");
-    let io =
-        Io { build: None, storage: Some(storage.clone()), post: None, host: None, quiet: false };
+    let io = Io {
+        build: None,
+        build_dir: None,
+        storage: Some(storage.clone()),
+        post: None,
+        host: None,
+        quiet: false,
+    };
     let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
     let mut p = requester(&write, io.clone());
     p.call("ask", &[]).expect("ask");

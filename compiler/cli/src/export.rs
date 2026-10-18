@@ -90,17 +90,46 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     if out.exists() && out.read_dir().map_err(|e| e.to_string())?.next().is_some() {
         return Err(format!("`{}` isn't empty: export into a new directory", out.display()));
     }
+    let here = std::env::current_dir().unwrap_or_default();
+    let reach = wrela_driver::reach::Reach::anywhere();
+    let (pages, files) = files_of(commit, REPOSITORY, packages, &reach, &here)?;
+    for (path, bytes) in &files {
+        let path = out.join(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, bytes)
+            .map_err(|e| format!("can't write `{}`: {e}", path.display()))?;
+    }
+    Ok(pages)
+}
+
+/// Files by their paths, with their bytes.
+pub(crate) type Files = Vec<(String, Vec<u8>)>;
+
+/// The docs of std and `packages`, as files by their paths in the export: how many pages, and
+/// the files. `repository` is where the source is, and `commit` its revision (`main` if none);
+/// a package's files are named by their paths from `base`. Files are read through `reach`.
+/// The same input gives the same bytes.
+pub(crate) fn files_of(
+    commit: Option<&str>,
+    repository: &str,
+    packages: &[PathBuf],
+    reach: &wrela_driver::reach::Reach,
+    base: &Path,
+) -> Result<(usize, Files), String> {
     let mut sources = doc::std_sources();
     let mut names = Vec::new();
     for dir in packages {
-        let manifest = std::fs::read_to_string(dir.join("wrela.toml"))
+        let manifest = reach
+            .read_to_string(&dir.join("wrela.toml"))
             .map_err(|e| format!("`{}` isn't a package: {e}", dir.display()))?;
         let name = package_name(&manifest)
             .ok_or_else(|| format!("`{}`'s wrela.toml has no valid package name", dir.display()))?;
         if name == "std" || names.contains(&name) {
             return Err(format!("two packages are named `{name}`"));
         }
-        sources.extend(doc::package_sources(dir, Some(&name))?);
+        sources.extend(doc::package_sources_in(reach, base, dir, Some(&name))?);
         names.push(name);
     }
     let index = doc::index_of(sources);
@@ -109,7 +138,7 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     for p in &pages {
         sections.extend(sections_of(p));
     }
-    let source = format!("{REPOSITORY}/blob/{}/", commit.unwrap_or("main"));
+    let source = format!("{repository}/blob/{}/", commit.unwrap_or("main"));
     let mut items: Vec<Value> = Vec::new();
     for m in 0..index.modules.len() {
         let (page, mut records) = module_page(&index, m, &source);
@@ -131,7 +160,7 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
     let index_json = json!({
         "version": version,
         "commit": commit,
-        "repository": REPOSITORY,
+        "repository": repository,
         "pages": pages.iter().map(|p| json!({
             "path": p.path, "title": p.title, "summary": p.summary, "kind": p.kind,
         })).collect::<Vec<_>>(),
@@ -140,29 +169,22 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
             "page": s.page, "anchor": s.anchor, "headings": s.headings, "text": s.text,
         })).collect::<Vec<_>>(),
     });
-    std::fs::create_dir_all(out).map_err(|e| e.to_string())?;
-    for p in &pages {
-        let path = out.join(&p.path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, &p.text)
-            .map_err(|e| format!("can't write `{}`: {e}", path.display()))?;
-    }
+    let mut files: Vec<(String, Vec<u8>)> =
+        pages.iter().map(|p| (p.path.clone(), p.text.clone().into_bytes())).collect();
     let json = serde_json::to_string_pretty(&index_json).map_err(|e| e.to_string())? + "\n";
-    std::fs::write(out.join("index.json"), json).map_err(|e| e.to_string())?;
+    files.push(("index.json".into(), json.into_bytes()));
     let groups = groups_of(&pages);
     let mut sizes = Vec::new();
     for (group, members) in &groups {
         let text = full(members);
         sizes.push((*group, text.len()));
-        std::fs::write(out.join(group).join("llms-full.txt"), text).map_err(|e| e.to_string())?;
+        files.push((format!("{group}/llms-full.txt"), text.into_bytes()));
     }
     let all = full(&pages.iter().collect::<Vec<_>>());
-    std::fs::write(out.join("llms.txt"), llms(&groups, &sizes, all.len(), version, commit))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(out.join("llms-full.txt"), all).map_err(|e| e.to_string())?;
-    Ok(pages.len())
+    let map = llms(&groups, &sizes, all.len(), version, commit, repository);
+    files.push(("llms.txt".into(), map.into_bytes()));
+    files.push(("llms-full.txt".into(), all.into_bytes()));
+    Ok((pages.len(), files))
 }
 
 /// The pages by group, in the order a reader learns them: the spec, then std, then the packages
@@ -585,13 +607,14 @@ fn llms(
     all: usize,
     version: &str,
     commit: Option<&str>,
+    repository: &str,
 ) -> String {
     let at = match commit {
         Some(c) => format!("version {version}, commit {c}"),
         None => format!("version {version}"),
     };
     let mut out = format!(
-        "# wrela\n\n> The reference docs of wrela ({at}), an MIT-licensed language, compiler and engine for games that run in the browser. Each page is Markdown. Source: {REPOSITORY}\n\n\
+        "# wrela\n\n> The reference docs of wrela ({at}), an MIT-licensed language, compiler and engine for games that run in the browser. Each page is Markdown. Source: {repository}\n\n\
          How to read them:\n\n\
          - To write Wrela, read the language's pages in order, then look up items in std and the packages.\n\
          - Each group's pages are also in one file, under \"In one file\" below: read a whole group at once where it fits.\n\

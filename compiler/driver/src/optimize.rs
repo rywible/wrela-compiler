@@ -3,7 +3,10 @@
 //! a trap still says where it happened. The table leaves the module for a file of its own beside
 //! it ([`wrela_abi::lines::SIDECAR`]), which a host reads only when a trap needs it.
 //!
-//! `wasm-opt` is found on `PATH`, or at `WRELA_WASM_OPT`. It may use only the features the
+//! `wasm-opt` is found on `PATH`, or at `WRELA_WASM_OPT`. [`optimize_with`] runs it through a
+//! caller's runner: the tool host's `toolchain` service runs it in a process group the host owns,
+//! and kills that group when the request is cancelled, past its deadline, or when the tool ends
+//! (language.md §15.5). It may use only the features the
 //! back end emits: plain SIMD (never relaxed, [`wrela_wasm::check_no_relaxed_simd`]), threads,
 //! bulk memory, sign extension and multiple results. It assumes traps happen, so it keeps every
 //! one, and isn't given fast math, so float operations keep their IEEE results.
@@ -25,9 +28,42 @@ const FEATURES: [&str; 6] = [
     "--enable-multivalue",
 ];
 
+/// How a program the optimizer ran ended: whether it succeeded, its status as text, and what it
+/// wrote to its standard output and standard error.
+pub struct Ran {
+    pub success: bool,
+    pub status: String,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// What runs `wasm-opt`: given the program and its arguments, how it ended, or why it couldn't
+/// run (or was stopped).
+pub type Runner<'a> =
+    dyn FnMut(&std::path::Path, &[std::ffi::OsString]) -> Result<Ran, String> + 'a;
+
+/// Runs `program` with `args` as a child of this process, waiting for it.
+fn run_here(program: &std::path::Path, args: &[std::ffi::OsString]) -> Result<Ran, String> {
+    let out = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| format!("can't run `{}`: {e}", program.display()))?;
+    Ok(Ran {
+        success: out.status.success(),
+        status: out.status.to_string(),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
 /// `wasm`, optimized, without its lines table; and the table for its optimized code, encoded.
 pub fn optimize(wasm: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let program = wasm_opt()?;
+    optimize_with(wasm, &mut run_here)
+}
+
+/// [`optimize`], `wasm-opt` run by `run`.
+pub fn optimize_with(wasm: &[u8], run: &mut Runner) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let program = wasm_opt(run)?;
     let (bare, payload) = wrela_wasm::without_custom_section(wasm, lines::SECTION)?;
     let table = match payload {
         Some(p) => {
@@ -42,19 +78,16 @@ pub fn optimize(wasm: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
     };
     write("in.wasm", &bare)?;
     write("in.map", table.source_map()?.as_bytes())?;
-    let out = Command::new(&program)
-        .arg(path("in.wasm"))
-        .arg("-Oz")
-        .args(FEATURES)
-        .arg("--input-source-map")
-        .arg(path("in.map"))
-        .arg("--output-source-map")
-        .arg(path("out.map"))
-        .arg("-o")
-        .arg(path("out.wasm"))
-        .output()
-        .map_err(|e| format!("can't run `{}`: {e}", program.display()))?;
-    if !out.status.success() {
+    let mut args: Vec<std::ffi::OsString> = vec![path("in.wasm").into(), "-Oz".into()];
+    args.extend(FEATURES.iter().map(Into::into));
+    for (flag, name) in
+        [("--input-source-map", "in.map"), ("--output-source-map", "out.map"), ("-o", "out.wasm")]
+    {
+        args.push(flag.into());
+        args.push(path(name).into());
+    }
+    let out = run(&program, &args)?;
+    if !out.success {
         return Err(format!(
             "`wasm-opt` failed ({}): {}",
             out.status,
@@ -75,7 +108,7 @@ pub fn optimize(wasm: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
 }
 
 /// The `wasm-opt` to run, checked to be [`WASM_OPT_VERSION`] or later.
-fn wasm_opt() -> Result<PathBuf, String> {
+fn wasm_opt(run: &mut Runner) -> Result<PathBuf, String> {
     let program = std::env::var_os("WRELA_WASM_OPT").map_or("wasm-opt".into(), PathBuf::from);
     let missing = |why: String| {
         format!(
@@ -83,10 +116,7 @@ fn wasm_opt() -> Result<PathBuf, String> {
              (on PATH, or at WRELA_WASM_OPT): {why}"
         )
     };
-    let out = Command::new(&program)
-        .arg("--version")
-        .output()
-        .map_err(|e| missing(format!("can't run `{}`: {e}", program.display())))?;
+    let out = run(&program, &["--version".into()]).map_err(missing)?;
     let text = String::from_utf8_lossy(&out.stdout);
     match version(&text) {
         Some(v) if v >= WASM_OPT_VERSION => Ok(program),

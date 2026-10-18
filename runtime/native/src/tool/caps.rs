@@ -472,6 +472,168 @@ impl Caps {
         }
     }
 
+    /// The directory at `path`, by its real path, if it's a directory inside its root (the root
+    /// itself for `NAME`), and the root is granted for writing if `write`: what the toolchain
+    /// and drive services give the compiler and the native host, which read through `reach`.
+    pub(crate) fn dir_path(&self, path: &str, write: bool) -> Result<PathBuf, String> {
+        let (root, rel) = self.resolve(path, write)?;
+        let Some(rel) = rel else { return Ok(root.path.clone()) };
+        // Opened through the root's handle, so a link can't lead it out.
+        let meta = root.dir.metadata(rel).map_err(|e| failed(path, e))?;
+        if !meta.is_dir() {
+            return Err(format!("`{path}` isn't a directory"));
+        }
+        let real = root.path.join(rel).canonicalize().map_err(|e| failed(path, e))?;
+        if !real.starts_with(&root.path) {
+            return Err(format!("`{path}` leads outside its root"));
+        }
+        Ok(real)
+    }
+
+    /// The directory at `path` (a root path, or a root), opened through its root's handle one
+    /// part at a time, following no link: its real path, and the handle, which later reads go
+    /// through, so a link put in its place after this leads nowhere.
+    pub(crate) fn open_dir(&self, path: &str) -> Result<(PathBuf, Dir), String> {
+        let (root, rel) = self.resolve(path, false)?;
+        let parts: Vec<&str> = rel.map_or_else(Vec::new, |r| r.split('/').collect());
+        let dir =
+            crate::confined::open_dir(&root.dir, &parts, false).map_err(|e| failed(path, e))?;
+        let real = parts.iter().fold(root.path.clone(), |p, part| p.join(part));
+        Ok((real, dir))
+    }
+
+    /// The directory above the file at `path` in a write root, opened one part at a time
+    /// through the root's handle without following a link (made, with `create`), and the
+    /// file's name: what output that must not be written through a link is written in.
+    fn parent_nofollow(&self, path: &str, create: bool) -> Result<(Dir, String), String> {
+        let (dir, rel) = self.file(path, true)?;
+        let parts = crate::confined::parts(rel)?;
+        let (name, above) = parts.split_last().expect("a path has a part");
+        let at = crate::confined::open_dir(dir, above, create).map_err(|e| failed(path, e))?;
+        Ok((at, name.to_string()))
+    }
+
+    /// Makes the directories at `path` in a write root, one part at a time, following no link
+    /// (a link in place of one stops it): those above it, and `path` itself if `itself`. Each
+    /// this call made is added to `made`, as a root path, in the order made. The last one,
+    /// opened.
+    pub(crate) fn make_dirs_tracked(
+        &self,
+        path: &str,
+        itself: bool,
+        made: &mut Vec<String>,
+    ) -> Result<Dir, String> {
+        let (root, rel) = self.resolve(path, true)?;
+        let parts = match rel {
+            Some(rel) => crate::confined::parts(rel)?,
+            None if itself => Vec::new(),
+            None => return Err(format!("`{path}` is a root, not a file in one")),
+        };
+        let upto = if itself { parts.len() } else { parts.len().saturating_sub(1) };
+        let mut at = root.dir.try_clone().map_err(|e| failed(path, e))?;
+        let mut prefix = path.split('/').next().unwrap_or_default().to_string();
+        for part in &parts[..upto] {
+            prefix = format!("{prefix}/{part}");
+            if crate::confined::make_dir(&at, part).map_err(|e| failed(path, e))? {
+                made.push(prefix.clone());
+            }
+            at = crate::confined::open_dir(&at, &[part], false).map_err(|e| failed(path, e))?;
+        }
+        Ok(at)
+    }
+
+    /// Opens the regular file at `path` in a write root to write it, making the directories it
+    /// needs (each made added to `made`) and following no link: made if it isn't there, and not
+    /// emptied, so the caller can count it as its own before it changes it.
+    pub(crate) fn open_output(
+        &self,
+        path: &str,
+        made: &mut Vec<String>,
+    ) -> Result<std::fs::File, String> {
+        let at = self.make_dirs_tracked(path, false, made)?;
+        let name = path.rsplit('/').next().unwrap_or_default();
+        crate::confined::open_file(&at, name, true).map_err(|e| failed(path, e))
+    }
+
+    /// Removes the empty directory at `path` in a write root, following no link.
+    pub(crate) fn remove_dir_nofollow(&self, path: &str) -> Result<(), String> {
+        if self.kind_nofollow(path)? != Some(Kind::Dir) {
+            return Ok(());
+        }
+        let (at, name) = self.parent_nofollow(path, false)?;
+        crate::confined::remove(&at, &name, true).map_err(|e| failed(path, e))
+    }
+
+    /// Whether `path` is in a write root (or is one).
+    pub(crate) fn writable(&self, path: &str) -> Result<(), String> {
+        self.resolve(path, true).map(|_| ())
+    }
+
+    /// What's at `path` in a write root, not following a link anywhere on the way: `None` if
+    /// nothing is, `Link` if a part of it is a link (so nothing is reached through it).
+    pub(crate) fn kind_nofollow(&self, path: &str) -> Result<Option<Kind>, String> {
+        let (dir, rel) = self.file(path, true)?;
+        let parts = crate::confined::parts(rel)?;
+        let mut at = dir.try_clone().map_err(|e| failed(path, e))?;
+        for (k, part) in parts.iter().enumerate() {
+            let meta = match at.symlink_metadata(part) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(failed(path, e)),
+            };
+            let kind = Kind::of(meta.file_type());
+            if k + 1 == parts.len() || kind != Kind::Dir {
+                return Ok(Some(kind));
+            }
+            at = crate::confined::open_dir(&at, &[part], false).map_err(|e| failed(path, e))?;
+        }
+        unreachable!("a path has a part")
+    }
+
+    /// The bytes of the regular file at `path` in a write root, at most `most`, following no
+    /// link: `None` if nothing is there.
+    pub(crate) fn read_nofollow(&self, path: &str, most: u64) -> Result<Option<Vec<u8>>, String> {
+        if self.kind_nofollow(path)?.is_none() {
+            return Ok(None);
+        }
+        let (dir, rel) = self.file(path, true)?;
+        crate::confined::read(dir, rel, most).map(Some)
+    }
+
+    /// Removes the regular file at `path` in a write root, if one is there, following no link:
+    /// a link or a directory there is left.
+    pub(crate) fn remove_file_nofollow(&self, path: &str) -> Result<(), String> {
+        if self.kind_nofollow(path)? != Some(Kind::File) {
+            return Ok(());
+        }
+        let (at, name) = self.parent_nofollow(path, false)?;
+        crate::confined::remove(&at, &name, false).map_err(|e| failed(path, e))
+    }
+
+    /// Every root's real path and a handle of its own to its directory, read roots and write
+    /// roots alike: where the toolchain service lets the compiler read.
+    pub(crate) fn readable(&self) -> Result<Vec<(PathBuf, Dir)>, String> {
+        self.roots
+            .iter()
+            .map(|(name, r)| {
+                let dir = r.dir.try_clone().map_err(|e| format!("the root `{name}`: {e}"))?;
+                Ok((r.path.clone(), dir))
+            })
+            .collect()
+    }
+
+    /// The bytes of the regular file at `path`, at most `most`: more is an error.
+    pub(crate) fn read_most(&self, path: &str, most: u64) -> Result<Vec<u8>, String> {
+        let (dir, rel) = self.file(path, false)?;
+        let file = open_file(dir, rel, path, false)?;
+        let mut bytes = Vec::new();
+        file.take(most + 1).read_to_end(&mut bytes).map_err(|e| failed(path, e))?;
+        if bytes.len() as u64 > most {
+            return Err(format!("`{path}` is more than {most} bytes"));
+        }
+        Ok(bytes)
+    }
+
     /// The bytes of the file at `path`, at most [`MOST_BYTES`].
     pub(crate) fn read(&self, path: &str) -> Result<Vec<u8>, String> {
         let (dir, rel) = self.file(path, false)?;

@@ -8,6 +8,7 @@
 //! name. Tools that only need the directories use [`dependency_dirs`].
 
 use crate::manifest::{self, Source, WorkspaceDecl};
+use crate::reach::{Kind, Reach};
 use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 
@@ -30,12 +31,21 @@ pub struct Member {
 
 /// The nearest manifest at or above `dir` that declares a workspace: its path.
 pub fn find(dir: &Path) -> Option<PathBuf> {
-    let mut at = dir.canonicalize().ok()?;
+    find_in(&Reach::anywhere(), dir)
+}
+
+/// [`find`], looking only where `reach` may read: a confined search stops at the top of the
+/// roots, and never reads a manifest above them.
+pub fn find_in(reach: &Reach, dir: &Path) -> Option<PathBuf> {
+    let mut at = reach.canonical(dir).ok()?;
     loop {
+        if !reach.covers(&at) {
+            return None;
+        }
         let path = at.join("wrela.toml");
         // A regular file only: a pipe named `wrela.toml` would block.
-        if path.is_file()
-            && std::fs::read_to_string(&path).is_ok_and(|t| manifest::declares_workspace(&t))
+        if reach.is_file(&path)
+            && reach.read_to_string(&path).is_ok_and(|t| manifest::declares_workspace(&t))
         {
             return Some(path);
         }
@@ -54,6 +64,16 @@ pub fn members(
     decl: &WorkspaceDecl,
     manifest_of: &mut dyn FnMut(&Path) -> Option<manifest::Manifest>,
 ) -> (Members, Vec<Diagnostic>) {
+    members_in(&Reach::anywhere(), path, decl, manifest_of)
+}
+
+/// [`members`], reading only what `reach` may: a member outside it is an error (E0223).
+pub fn members_in(
+    reach: &Reach,
+    path: &Path,
+    decl: &WorkspaceDecl,
+    manifest_of: &mut dyn FnMut(&Path) -> Option<manifest::Manifest>,
+) -> (Members, Vec<Diagnostic>) {
     let base = path.parent().unwrap_or(Path::new("."));
     let mut out: Vec<(Member, Span)> = Vec::new();
     let mut unread = false;
@@ -63,7 +83,7 @@ pub fn members(
         let span = *span;
         let dirs = if let Some(parent) = entry.strip_suffix("/*").or((entry == "*").then_some("")) {
             let parent_dir = base.join(parent);
-            let Ok(entries) = std::fs::read_dir(&parent_dir) else {
+            let Ok(entries) = reach.entries(&parent_dir) else {
                 errors.push(
                     bad(
                         span,
@@ -76,10 +96,11 @@ pub fn members(
                 continue;
             };
             let mut dirs: Vec<PathBuf> = entries
-                .filter_map(Result::ok)
-                .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
-                .map(|e| e.path())
-                .filter(|p| p.is_dir() && p.join("wrela.toml").is_file())
+                .into_iter()
+                .filter(|(name, _)| !name.to_string_lossy().starts_with('.'))
+                .filter(|(_, kind)| matches!(kind, Kind::Dir | Kind::Link))
+                .map(|(name, _)| parent_dir.join(name))
+                .filter(|p| reach.is_dir(p) && reach.is_file(&p.join("wrela.toml")))
                 .collect();
             dirs.sort();
             if dirs.is_empty() {
@@ -93,14 +114,21 @@ pub fn members(
             dirs
         } else {
             let dir = base.join(entry);
-            if !dir.is_dir() {
+            if !reach.covers(&dir) {
+                errors.push(bad(
+                    span,
+                    format!("the member `{entry}` is outside the roots the tool was granted"),
+                ));
+                continue;
+            }
+            if !reach.is_dir(&dir) {
                 errors.push(
                     bad(span, format!("the member `{entry}` isn't a directory"))
                         .with_help("fix the path, which is relative to this `wrela.toml`"),
                 );
                 continue;
             }
-            if !dir.join("wrela.toml").is_file() {
+            if !reach.is_file(&dir.join("wrela.toml")) {
                 errors.push(
                     bad(span, format!("the member `{entry}` has no `wrela.toml`, so it isn't a package"))
                         .with_help(format!("give it one, with `[package]` and `name = \"...\"`, or take `{entry}` out of `members`")),
@@ -110,7 +138,7 @@ pub fn members(
             vec![dir]
         };
         for dir in dirs {
-            let Ok(canon) = dir.canonicalize() else { continue };
+            let Ok(canon) = reach.canonical(&dir) else { continue };
             if out.iter().any(|(m, _)| m.dir == canon) {
                 continue;
             }

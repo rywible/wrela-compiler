@@ -31,6 +31,15 @@ pub const TEST_FUEL: u64 = 1 << 37;
 /// Reads the files `embed` names, relative to the package's root at `root` (§13): a file that
 /// can't be read, or whose path leaves the package, is E0218.
 pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, Vec<Diagnostic>) {
+    read_embeds_in(&crate::reach::Reach::anywhere(), checked, dirs)
+}
+
+/// [`read_embeds`], reading only what `reach` may: a file outside it is E0218 too.
+pub fn read_embeds_in(
+    reach: &crate::reach::Reach,
+    checked: &Checked,
+    dirs: &[std::path::PathBuf],
+) -> (Embeds, Vec<Diagnostic>) {
     let mut files = Embeds::new();
     let mut diags = Vec::new();
     let mut seen = BTreeSet::new();
@@ -45,8 +54,8 @@ pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, V
         let read = match root.join(path).canonicalize() {
             // A symbolic link may lead out of the package.
             Ok(full) if !full.starts_with(&root) => Err("it's outside the package".to_string()),
-            Ok(full) if !full.is_file() => Err("it isn't a file".to_string()),
-            Ok(full) => std::fs::read(full).map_err(|e| e.to_string()),
+            Ok(full) if !reach.is_file(&full) => Err("it isn't a file".to_string()),
+            Ok(full) => reach.read(&full).map_err(|e| e.to_string()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err("there's no such file in the package".to_string())
             }

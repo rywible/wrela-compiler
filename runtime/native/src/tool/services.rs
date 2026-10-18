@@ -38,7 +38,7 @@ fn err(why: &str) -> Answer {
     Answer::Bytes(bytes)
 }
 
-fn answer(result: Result<Vec<u8>, String>) -> Answer {
+pub(crate) fn answer(result: Result<Vec<u8>, String>) -> Answer {
     match result {
         Ok(payload) => ok(&payload),
         Err(why) => err(&why),
@@ -74,12 +74,24 @@ pub(crate) struct Services {
     pub grace: Duration,
     /// Set by a worker whose work can't be stopped: the host ends the run as its failure.
     pub stuck: Arc<OnceLock<String>>,
+    /// The compiler the toolchain service runs, if the host was given one, and its cache.
+    pub toolchain: Option<super::toolchain::Service>,
+    /// The builds the drive service holds.
+    pub drives: Mutex<super::drive::Drives>,
+    /// A test's held output write, and its output write that fails part way ([`super::Testing`]).
+    pub hold: Option<(String, Duration)>,
+    pub write_fail: Option<String>,
 }
 
 impl Services {
     pub(crate) fn blobs(&self) -> std::sync::MutexGuard<'_, Blobs> {
         // A worker that panicked while it held them leaves them as they were.
         self.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The driven builds.
+    pub(crate) fn drives(&self) -> std::sync::MutexGuard<'_, super::drive::Drives> {
+        self.drives.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The fakes a tool test set, by URL (none outside a test).
@@ -207,7 +219,7 @@ pub(crate) enum Data {
 }
 
 /// Work on a worker thread: given the services and the request's number.
-pub(crate) type Task = Box<dyn FnOnce(&Services, u32) -> Answer + Send>;
+pub(crate) type Task = Box<dyn FnOnce(&Arc<Services>, u32) -> Answer + Send>;
 
 /// How a request is carried out.
 pub(crate) enum Work {
@@ -221,6 +233,9 @@ pub(crate) enum Work {
     /// Answered by a worker of the pool for long waits (HTTP, programs), so that a slow
     /// network or program never holds up files.
     Long(Task),
+    /// Answered by a worker of the pool for the compiler and driven builds, whose work takes
+    /// seconds to minutes: so it holds up neither files nor the network.
+    Heavy(Task),
     /// Answered by a worker of the pool for long waits, but given to the tool only once this
     /// much of a test's fake time has passed since the request: a fake site's delay.
     Held(Duration, Task),
@@ -326,6 +341,10 @@ pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
             let task: Task = Box::new(move |s, request| answer(super::http::fetch(s, request, f)));
             if delay > Duration::ZERO { Work::Held(delay, task) } else { Work::Long(task) }
         }
+        _ if name.starts_with("toolchain/") => {
+            super::toolchain::route(s, &name["toolchain/".len()..], &mut b)
+        }
+        _ if name.starts_with("drive/") => super::drive::route(&name["drive/".len()..], &mut b),
         "run/run" => match super::run::parse(&mut b, std::time::Instant::now()) {
             Ok(r) => Work::Long(Box::new(move |s, request| answer(super::run::run(s, request, r)))),
             Err(why) => Work::Now(err(&why)),
@@ -562,6 +581,10 @@ mod tests {
             resolve_stall: Duration::ZERO,
             grace: Duration::ZERO,
             stuck: Arc::new(OnceLock::new()),
+            toolchain: None,
+            drives: Mutex::default(),
+            hold: None,
+            write_fail: None,
         };
         let mut from = Counted { left: 64 << 20, given: 0 };
         let mut out = Vec::new();

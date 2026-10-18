@@ -7,8 +7,10 @@
 //!
 //! Each test's run gets: a new, empty write root `scratch`; its budget (`budget: s`, 10 s
 //! unless it says) as the run's timeout; a fake clock; its `net` hosts as fake sites, served
-//! from `scratch/sites/<host>/`; and its `run` programs, each a tool package of the test's
-//! package. Nothing else: no other file, no network, no secret, no other program. It passes if
+//! from `scratch/sites/<host>/`; its `run` programs, each a tool package of the test's
+//! package; its `read` roots, each a directory relative to the test's package, for reading
+//! only; and the toolchain and drive services, within those roots. Nothing else: no other file,
+//! no network, no secret, no other program. It passes if
 //! the job ends, and fails if it panics or traps, if its budget runs out, or if the host fails.
 //! If the process itself is still running [`MARGIN`] past the budget, it's killed, and the test
 //! fails.
@@ -64,6 +66,9 @@ pub struct Spec {
     pub net: Vec<String>,
     /// Each program the test may run, and the tool package that stands in for it.
     pub run: Vec<(String, PathBuf)>,
+    /// Each root the test may read, and its directory.
+    #[serde(default)]
+    pub read: Vec<(String, PathBuf)>,
     /// The fake clock's date at the start: seconds since 1970.
     pub utc: u64,
     /// Where the process writes how the run ended ([`Ended`]).
@@ -198,6 +203,14 @@ fn one(
         }
         run.push((name.clone(), at));
     }
+    let mut read = Vec::new();
+    for (name, dir) in &test.read {
+        let at = root.join(dir);
+        if !at.is_dir() {
+            return Err(format!("its root `{name}` is `{dir}`, and there's no directory there"));
+        }
+        read.push((name.clone(), at));
+    }
     let spec = Spec {
         wasm: module.to_path_buf(),
         init: format!("{}.{i}", wrela_lower::TOOL_TEST_INIT),
@@ -206,6 +219,7 @@ fn one(
         scratch,
         net: test.net.clone(),
         run,
+        read,
         utc: START_UTC,
         ended: own.join("ended.json"),
         groups: own.join("groups.txt"),

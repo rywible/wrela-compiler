@@ -27,6 +27,7 @@ pub const HEIGHT: u32 = 480;
 
 /// Runs frame and tick tests `tests` (§13), given the constants computed into `data`: each
 /// test's failure, if it failed, with the errors building them found.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     checked: &Checked,
     sources: &SourceMap,
@@ -35,6 +36,7 @@ pub fn run(
     root: &Path,
     fuel: u64,
     bless: bool,
+    reach: &crate::reach::Reach,
 ) -> (Vec<crate::consts::Ran>, Vec<Diagnostic>) {
     let mut roots = wrela_lower::Roots::of(checked);
     roots.tests = tests.to_vec();
@@ -94,7 +96,7 @@ pub fn run(
         let ticks = matches!(run, TestRun::Ticks(_));
         let input = match &attrs.test_input {
             None => Input::Script(Vec::new()),
-            Some((input, span)) => match input_of(checked, data, root, input, ticks) {
+            Some((input, span)) => match input_of(checked, data, root, input, ticks, reach) {
                 Ok(s) => s,
                 Err((shown, why)) => {
                     let d = Diagnostic::new(
@@ -111,7 +113,7 @@ pub fn run(
         let storage = dir.0.join(format!("storage.{i}"));
         let (ran, traced) = match (attrs.test_gpu, run, &input) {
             (true, TestRun::Frames(n), Input::Script(script)) => {
-                let golden = attrs.test_golden.as_ref().map(|g| (g, root, bless));
+                let golden = attrs.test_golden.as_ref().map(|g| (g, root, bless, reach));
                 run_gpu(&mut gpu, &dir.0, &storage, i, n, script, golden)
             }
             _ => run_one(&built, &storage, i, run, &input),
@@ -196,10 +198,11 @@ fn input_of(
     root: &Path,
     input: &TestInput,
     ticks: bool,
+    reach: &crate::reach::Reach,
 ) -> Result<Input, (String, String)> {
     match input {
         TestInput::File(path) => {
-            read_input(root, path, ticks).map_err(|why| (format!("`{path}`"), why))
+            read_input(reach, root, path, ticks).map_err(|why| (format!("`{path}`"), why))
         }
         TestInput::Const(c) => {
             let shown = checked.program.const_(*c).short();
@@ -221,7 +224,12 @@ fn input_of(
 
 /// The input at `path` in the package at `root`, or why it can't be read: a tick log (for a
 /// tick test, `ticks`) if its bytes start as one, else a script.
-fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
+fn read_input(
+    reach: &crate::reach::Reach,
+    root: &Path,
+    path: &str,
+    ticks: bool,
+) -> Result<Input, String> {
     if wrela_abi::check::path_problem(path).is_some() {
         return Err("must be a path inside the package, with `/` between its parts".into());
     }
@@ -230,10 +238,10 @@ fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
     if !full.starts_with(&root) {
         return Err("is outside the package".into());
     }
-    if !full.is_file() {
+    if !reach.is_file(&full) {
         return Err("isn't a regular file".into());
     }
-    let bytes = std::fs::read(full).map_err(|e| format!("can't be read: {e}"))?;
+    let bytes = reach.read(&full).map_err(|e| format!("can't be read: {e}"))?;
     if ticks && bytes.starts_with(&wrela_abi::ticks::MAGIC) {
         let log =
             wrela_host::TickLog::decode(&bytes).map_err(|e| format!("isn't a tick log: {e}"))?;
@@ -263,7 +271,7 @@ fn run_gpu(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
-    golden: Option<(&Golden, &Path, bool)>,
+    golden: Option<(&Golden, &Path, bool, &crate::reach::Reach)>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
     let options = wrela_host::Options {
@@ -296,7 +304,7 @@ fn run_gpu_frames(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
-    golden: Option<(&Golden, &Path, bool)>,
+    golden: Option<(&Golden, &Path, bool, &crate::reach::Reach)>,
 ) -> Option<Failed> {
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
@@ -306,13 +314,13 @@ fn run_gpu_frames(
             return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
     }
-    if let Some((g, root, bless)) = golden {
+    if let Some((g, root, bless, reach)) = golden {
         let after = format!("after {frames} frames");
         let screen = match host.read_screen() {
             Ok(s) => s,
             Err(e) => return failed(e, None, after),
         };
-        if let Err(why) = against_golden(g, root, &screen, bless) {
+        if let Err(why) = against_golden(g, root, &screen, bless, reach) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
     }
@@ -323,9 +331,17 @@ fn run_gpu_frames(
 }
 
 /// The screen after a GPU frame test's frames against its golden (§13): within its mean
-/// difference, or why not. With `bless`, the golden is written from the screen first.
+/// difference, or why not. With `bless`, the golden is written from the screen first. It's read
+/// through `reach`: in a tool's toolchain, through its roots' handles, so a package swapped
+/// for a link out of them reads nothing.
 #[cfg(feature = "gpu")]
-fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result<(), String> {
+fn against_golden(
+    g: &Golden,
+    root: &Path,
+    screen: &[u8],
+    bless: bool,
+    reach: &crate::reach::Reach,
+) -> Result<(), String> {
     let path = &g.path;
     let full = golden_path(root, path)?;
     if bless {
@@ -335,9 +351,13 @@ fn against_golden(g: &Golden, root: &Path, screen: &[u8], bless: bool) -> Result
         wrela_host::image::write_png(&full, WIDTH, HEIGHT, screen)
             .map_err(|e| format!("writing its golden `{path}`: {e}"))?;
     }
-    let (w, h, want) = wrela_host::image::read_png(&full).map_err(|_| {
-        format!("it has no golden `{path}` to compare the screen with: `wrela test --bless` writes it from this machine's")
-    })?;
+    let (w, h, want) = reach
+        .read(&full)
+        .map_err(|e| e.to_string())
+        .and_then(|bytes| wrela_host::image::png_of(&bytes, &full).map_err(|e| e.to_string()))
+        .map_err(|why| {
+            format!("it has no golden `{path}` to compare the screen with ({why}): `wrela test --bless` writes it from this machine's")
+        })?;
     if (w, h) != (WIDTH, HEIGHT) {
         return Err(format!(
             "its golden `{path}` is {w}×{h}, and a frame test's screen is {WIDTH}×{HEIGHT}"
@@ -521,10 +541,20 @@ mod tests {
         symlink(outside.join("input.json"), pkg.join("outside.json")).expect("file symlink");
         symlink(&pkg, scratch.0.join("package-link")).expect("package symlink");
 
-        assert!(read_input(&pkg, "linked/input.json", false).is_err());
-        assert!(read_input(&pkg, "outside.json", false).is_err());
-        assert!(read_input(&pkg, "input.json", false).is_ok());
-        assert!(read_input(&scratch.0.join("package-link"), "input.json", false).is_ok());
+        assert!(
+            read_input(&crate::reach::Reach::anywhere(), &pkg, "linked/input.json", false).is_err()
+        );
+        assert!(read_input(&crate::reach::Reach::anywhere(), &pkg, "outside.json", false).is_err());
+        assert!(read_input(&crate::reach::Reach::anywhere(), &pkg, "input.json", false).is_ok());
+        assert!(
+            read_input(
+                &crate::reach::Reach::anywhere(),
+                &scratch.0.join("package-link"),
+                "input.json",
+                false
+            )
+            .is_ok()
+        );
     }
 
     #[cfg(unix)]
@@ -544,5 +574,34 @@ mod tests {
             golden_path(&pkg, "goldens/frame.png").expect("ordinary path"),
             pkg.canonicalize().expect("canonical package").join("goldens/frame.png")
         );
+    }
+
+    /// In a tool's toolchain, a golden is read through the roots' handles: a package swapped for
+    /// a link out of them, after it was loaded, reads no golden from where the link leads.
+    #[cfg(all(unix, feature = "gpu"))]
+    #[test]
+    fn a_golden_is_read_through_the_roots_alone() {
+        let scratch = Scratch::new();
+        let (root, outside) = (scratch.0.join("root"), scratch.0.join("outside"));
+        std::fs::create_dir_all(root.join("package/goldens")).expect("package");
+        std::fs::create_dir_all(outside.join("goldens")).expect("outside");
+        let screen = vec![0u8; (WIDTH * HEIGHT * 4) as usize];
+        for dir in [&root.join("package"), &outside] {
+            wrela_host::image::write_png(&dir.join("goldens/frame.png"), WIDTH, HEIGHT, &screen)
+                .expect("a golden");
+        }
+        let golden = Golden {
+            path: "goldens/frame.png".into(),
+            span: wrela_diag::Span::new(wrela_diag::FileId(0), 0, 0),
+            within: 0.5,
+        };
+        let reach = crate::reach::Reach::within(std::slice::from_ref(&root)).expect("the root");
+        let pkg = root.join("package");
+        against_golden(&golden, &pkg, &screen, false, &reach).expect("the package's golden");
+        // The package, swapped for a link to a directory outside the root.
+        std::fs::rename(&pkg, root.join("moved")).expect("move");
+        std::os::unix::fs::symlink(&outside, &pkg).expect("a link out");
+        let refused = against_golden(&golden, &pkg, &screen, false, &reach).expect_err("outside");
+        assert!(refused.contains("outside the roots"), "{refused}");
     }
 }

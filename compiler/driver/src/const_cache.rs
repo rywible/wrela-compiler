@@ -8,7 +8,9 @@
 //! per key, each a constant's value ([`encode`]); and, when `WRELA_CONST_CACHE` names one, a
 //! directory every package and checkout that set it share. A build reads the package's first,
 //! then the shared one (a hit there is kept in the package's too), and writes both: so the
-//! tests, which read only the package's, find what a session's builds computed or found. A file
+//! tests, which read only the package's, find what a session's builds computed or found. A
+//! compile's `Scope` may name other directories instead: the tool host's toolchain service keeps
+//! its cache in one of the host's own, never beside a package it was granted (§15.5). A file
 //! is written whole to a temporary name and renamed into place, so two builds at once never read
 //! half of one. Files no build has used for a week are removed.
 

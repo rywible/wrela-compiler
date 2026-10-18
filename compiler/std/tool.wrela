@@ -30,7 +30,8 @@
 // }
 // ```
 //
-// The services are `std::tool`'s modules: `files`, `blob` and `time`. Each is `@tool`, and only
+// The services are `std::tool`'s modules: `files`, `blob`, `time`, `http`, `run`, `toolchain`
+// (builds, tests, checks, formatting and docs) and `drive` (builds run on the native host). Each is `@tool`, and only
 // what the `wrela tool` command line grants it reaches outside the tool: roots of files by name,
 // and secrets by name. Every answer of a tool service says whether it succeeded: its first byte
 // is 0, then what it gives, or 1, then why it failed in UTF-8. The readers here read that.

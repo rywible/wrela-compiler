@@ -1,0 +1,428 @@
+// A tool's driven builds (language.md §15.5): a build loaded on the native host beside the
+// tool, with the GPU or on the CPU alone, and run as the tool says: `init`, frames and ticks with
+// a `std::input::Script`, the screen captured, the state's hash, what it printed and timed, and
+// its other exports called. It's the host `wrela-host` runs, so the same build and script give
+// the same hash.
+//
+// A build is a directory in a root (what `toolchain::build` writes); the host reads its files
+// through the grants and compiles its WASM for each load, keeping no compiled code. Each
+// operation has a deadline, 60 s unless it asks for another (at most 600 s), from when the host
+// takes it: past it, or when the tool ends, the host stops the build's WASM on every thread. A
+// build that trapped, or was stopped, runs nothing more, but its screen, hash, lines and phases
+// can be read. One operation runs at a time on a build: another fails while it runs. The host
+// closes every build when the tool ends.
+//
+// Every operation that runs the program says when it started (seconds since the build loaded),
+// how long it took, and when each frame or tick started and ended, so a tool can time them.
+
+use std::input::Script
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::blob::{Data, read_data}
+
+/// How a GPU build's passes and dispatches are timed (`wrela-host --timestamps`): not at all,
+/// beside each other, or each alone.
+pub enum Timing: Copy + Eq {
+    Off,
+    Span,
+    Serial,
+}
+
+/// How to load a build: with a GPU (a real one: the host never renders in software) or on the
+/// CPU alone; its screen's size; its frames' rate; how many threads run its parallel jobs (the
+/// program's own among them; 0: one per core); how a GPU build is timed; how long each helper
+/// holds a job's result back, in microseconds (a test's slow jobs); and how long loading may
+/// take in seconds (0: 60 s).
+pub struct Load: Clone {
+    pub gpu: bool,
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    pub workers: u32,
+    pub timing: Timing,
+    pub hold: u32,
+    pub timeout: f64,
+}
+
+/// A load on the CPU alone: a 640×360 screen at 60 frames a second, a thread per core, no held
+/// jobs.
+pub fn cpu() -> Load {
+    Load {
+        gpu: false,
+        width: 640,
+        height: 360,
+        fps: 60.0,
+        workers: 0,
+        timing: Timing::Off,
+        hold: 0,
+        timeout: 0.0,
+    }
+}
+
+/// A load with the GPU, as `cpu()` otherwise.
+pub fn gpu() -> Load {
+    var l = cpu()
+    l.gpu = true
+    l
+}
+
+/// A driven build: its handle, from a `load` answer.
+pub struct Build: Copy + Eq {
+    id: u32,
+}
+
+impl Build {
+    /// Its handle's number, as the host names it.
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+
+/// A loaded build, and how long loading it took, in seconds.
+pub struct Loaded: Copy {
+    pub build: Build,
+    pub elapsed: f64,
+}
+
+/// A number an export takes or returns (§15.2): an `i32` (a `u32`, a `bool` or a small integer
+/// crosses as one), an `i64`'s bits, an `f32` or an `f64`.
+pub enum Scalar: Copy {
+    I32(i32),
+    I64(u64),
+    F32(f32),
+    F64(f64),
+}
+
+/// What a trap happened in: `init`, a frame, a tick or an export's call.
+pub enum Stage: Copy + Eq {
+    Init,
+    Frame,
+    Tick,
+    Call,
+}
+
+/// A trap: the host's message (which says the tick, for a trap in one, and where), the panic's
+/// own message (empty if it wasn't a panic), where in the source (empty if the build doesn't
+/// say), what it happened in, and the frame's or tick's number.
+pub struct Trap: Clone {
+    pub message: String,
+    pub panic: String,
+    pub at: String,
+    pub stage: Stage,
+    pub number: u32,
+}
+
+/// When a frame or a tick started and ended: seconds since the build loaded.
+pub struct Step: Copy {
+    pub start: f64,
+    pub end: f64,
+}
+
+/// What running gave: when it started and how long it took (seconds), each frame or tick that
+/// ran to its end, an export's results, and the trap that ended it, if one did.
+pub struct Ran: Clone {
+    pub started: f64,
+    pub elapsed: f64,
+    pub steps: Vec<Step>,
+    pub results: Vec<Scalar>,
+    pub trap: Option<Trap>,
+}
+
+/// A GPU build's screen: its size, and its pixels, RGBA8, rows top to bottom, in a blob.
+pub struct Capture: Clone {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Data,
+}
+
+/// The lines a build printed since the last `logs`, and how many more there were than an answer
+/// holds (4096).
+pub struct Logs: Clone {
+    pub lines: Vec<String>,
+    pub dropped: u32,
+}
+
+/// A phase a build timed (`std::time::phase`): its name, its seconds summed, how many times.
+pub struct Phase: Clone {
+    pub name: String,
+    pub seconds: f64,
+    pub times: u32,
+}
+
+fn handle_body(b: Build) -> Writer {
+    var w = Writer::new()
+    w.write_u32(b.id)
+    w
+}
+
+fn timeout_ask(service: str, w: take Writer, timeout: f64) -> Pending<u8> {
+    var w = take w
+    w.write_u64(bitcast_u64(timeout))
+    ask(service, take w.into_bytes())
+}
+
+/// Loads the build in `build` (a root path) as `options` says, without running its `init`:
+/// `read_loaded` reads the answer.
+@tool
+pub fn load(build: str, options: Load) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(build)
+    w.write_u8(if options.gpu { 1 } else { 0 })
+    w.write_u32(options.width)
+    w.write_u32(options.height)
+    w.write_u64(bitcast_u64(options.fps))
+    w.write_u32(options.workers)
+    w.write_u8(match options.timing {
+        Timing::Off => 0,
+        Timing::Span => 1,
+        Timing::Serial => 2,
+    })
+    w.write_u32(options.hold)
+    timeout_ask("drive/load", take w, options.timeout)
+}
+
+/// Runs the build's `init`, once, before anything else runs: `read_ran` reads the answer.
+@tool
+pub fn init(b: Build, timeout: f64 = 0.0) -> Pending<u8> {
+    timeout_ask("drive/init", handle_body(b), timeout)
+}
+
+/// Runs the build's next `n` frames, in lockstep with its ticker if it has one (as `wrela-host`
+/// runs them), with `script`'s events, by their frames counted from the build's first:
+/// `read_ran` reads the answer.
+@tool
+pub fn frames(b: Build, n: u32, script: Script, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(n)
+    w.write_str(script.as_json())
+    timeout_ask("drive/frames", take w, timeout)
+}
+
+/// Runs the next `n` ticks of a build loaded on the CPU alone, with no frames, each with
+/// `script`'s records of it, by their ticks counted from the first (as `wrela-host --no-gpu`
+/// runs them): `read_ran` reads the answer.
+@tool
+pub fn ticks(b: Build, n: u32, script: Script, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(n)
+    w.write_str(script.as_json())
+    timeout_ask("drive/ticks", take w, timeout)
+}
+
+/// A GPU build's screen after its last frame, in a blob: `read_capture` reads the answer. The
+/// pixels' bytes and their blob are reserved in the tool's blob budget before they're read
+/// back, so a capture that doesn't fit fails before it's read.
+@tool
+pub fn capture(b: Build, timeout: f64 = 0.0) -> Pending<u8> {
+    timeout_ask("drive/capture", handle_body(b), timeout)
+}
+
+/// The state hash of everything the build submitted since it loaded (FNV-1a 64, as `wrela-host`
+/// prints it): `read_hash` reads the answer.
+@tool
+pub fn hash(b: Build) -> Pending<u8> {
+    timeout_ask("drive/hash", handle_body(b), 0.0)
+}
+
+/// The lines the build printed since the last `logs`: `read_logs` reads the answer.
+@tool
+pub fn logs(b: Build) -> Pending<u8> {
+    timeout_ask("drive/logs", handle_body(b), 0.0)
+}
+
+/// The phases the build timed, on all its threads: `read_phases` reads the answer.
+@tool
+pub fn phases(b: Build) -> Pending<u8> {
+    timeout_ask("drive/phases", handle_body(b), 0.0)
+}
+
+/// Calls the build's export `export` with `args` (at most 64): `read_ran` reads the answer, its
+/// results in `results`.
+@tool
+pub fn call(b: Build, export: str, args: [Scalar], timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_str(export)
+    w.write_u32(args.len())
+    for a in args {
+        match a {
+            Scalar::I32(x) => {
+                w.write_u8(0)
+                w.write_u64(u64(u32(x)))
+            },
+            Scalar::I64(bits) => {
+                w.write_u8(1)
+                w.write_u64(bits)
+            },
+            Scalar::F32(x) => {
+                w.write_u8(2)
+                w.write_u64(u64(bitcast_u32(x)))
+            },
+            Scalar::F64(x) => {
+                w.write_u8(3)
+                w.write_u64(bitcast_u64(x))
+            },
+        }
+    }
+    timeout_ask("drive/call", take w, timeout)
+}
+
+/// Closes the build: its host and threads go, and the handle names nothing after this.
+@tool
+pub fn close(b: Build) -> Pending<u8> {
+    ask("drive/close", handle_body(b).into_bytes())
+}
+
+/// Reads a `load` answer: the handle (a `u32`), then the seconds loading took (an `f64`'s bits).
+pub fn read_loaded(polled: take Result<Vec<u8>, IoError>) -> Result<Loaded, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(id) = r.read_u32() else { return Err(malformed("drive/load")) }
+    let Ok(elapsed) = r.read_u64() else { return Err(malformed("drive/load")) }
+    if !r.at_end() {
+        return Err(malformed("drive/load"))
+    }
+    Ok(Loaded { build: Build { id }, elapsed: bitcast_f64(elapsed) })
+}
+
+/// Reads an answer of `init`, `frames`, `ticks` or `call`.
+pub fn read_ran(polled: take Result<Vec<u8>, IoError>) -> Result<Ran, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(started) = r.read_u64() else { return Err(malformed("drive")) }
+    let Ok(elapsed) = r.read_u64() else { return Err(malformed("drive")) }
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive")) }
+    if n > r.left() {
+        return Err(malformed("drive"))
+    }
+    var steps: Vec<Step> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(start) = r.read_u64() else { return Err(malformed("drive")) }
+        let Ok(end) = r.read_u64() else { return Err(malformed("drive")) }
+        steps.push(Step { start: bitcast_f64(start), end: bitcast_f64(end) })
+    }
+    let Ok(count) = r.read_u32() else { return Err(malformed("drive")) }
+    if count > r.left() {
+        return Err(malformed("drive"))
+    }
+    var results: Vec<Scalar> = Vec::with_capacity(count)
+    for _ in 0..count {
+        let Ok(kind) = r.read_u8() else { return Err(malformed("drive")) }
+        let Ok(bits) = r.read_u64() else { return Err(malformed("drive")) }
+        let low = u32(bits & 4294967295)
+        results.push(match kind {
+            0 => Scalar::I32(i32(low)),
+            1 => Scalar::I64(bits),
+            2 => Scalar::F32(bitcast_f32(low)),
+            3 => Scalar::F64(bitcast_f64(bits)),
+            _ => return Err(malformed("drive")),
+        })
+    }
+    let Ok(trapped) = r.read_u8() else { return Err(malformed("drive")) }
+    var trap: Option<Trap> = None
+    if trapped == 1 {
+        let Ok(message) = r.read_string() else { return Err(malformed("drive")) }
+        let Ok(panic_message) = r.read_string() else { return Err(malformed("drive")) }
+        let Ok(at) = r.read_string() else { return Err(malformed("drive")) }
+        let Ok(stage) = r.read_u8() else { return Err(malformed("drive")) }
+        let Ok(number) = r.read_u32() else { return Err(malformed("drive")) }
+        let stage = match stage {
+            0 => Stage::Init,
+            1 => Stage::Frame,
+            2 => Stage::Tick,
+            3 => Stage::Call,
+            _ => return Err(malformed("drive")),
+        }
+        trap = Some(Trap { message, panic: panic_message, at, stage, number })
+    }
+    if !r.at_end() {
+        return Err(malformed("drive"))
+    }
+    Ok(Ran { started: bitcast_f64(started), elapsed: bitcast_f64(elapsed), steps, results, trap })
+}
+
+/// Reads a `capture` answer: the width and height (`u32`s), then the pixels (`blob::Data`).
+pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(width) = r.read_u32() else { return Err(malformed("drive/capture")) }
+    let Ok(height) = r.read_u32() else { return Err(malformed("drive/capture")) }
+    let Some(rgba) = read_data(mut r) else { return Err(malformed("drive/capture")) }
+    if !r.at_end() {
+        return Err(malformed("drive/capture"))
+    }
+    Ok(Capture { width, height, rgba })
+}
+
+/// Reads a `hash` answer: a `u64`.
+pub fn read_hash(polled: take Result<Vec<u8>, IoError>) -> Result<u64, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(h) = r.read_u64() else { return Err(malformed("drive/hash")) }
+    if !r.at_end() {
+        return Err(malformed("drive/hash"))
+    }
+    Ok(h)
+}
+
+/// Reads a `logs` answer: a count, each line, then how many more there were.
+pub fn read_logs(polled: take Result<Vec<u8>, IoError>) -> Result<Logs, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive/logs")) }
+    if n > r.left() {
+        return Err(malformed("drive/logs"))
+    }
+    var lines: Vec<String> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(l) = r.read_string() else { return Err(malformed("drive/logs")) }
+        lines.push(take l)
+    }
+    let Ok(dropped) = r.read_u32() else { return Err(malformed("drive/logs")) }
+    if !r.at_end() {
+        return Err(malformed("drive/logs"))
+    }
+    Ok(Logs { lines, dropped })
+}
+
+/// Reads a `phases` answer: a count, then each phase's name, seconds and times.
+pub fn read_phases(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Phase>, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive/phases")) }
+    if n > r.left() {
+        return Err(malformed("drive/phases"))
+    }
+    var out: Vec<Phase> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(name) = r.read_string() else { return Err(malformed("drive/phases")) }
+        let Ok(seconds) = r.read_u64() else { return Err(malformed("drive/phases")) }
+        let Ok(times) = r.read_u32() else { return Err(malformed("drive/phases")) }
+        out.push(Phase { name, seconds: bitcast_f64(seconds), times })
+    }
+    if !r.at_end() {
+        return Err(malformed("drive/phases"))
+    }
+    Ok(out)
+}
+
+@test
+fn a_run_with_a_trap_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u64(bitcast_u64(f64(1.5)))
+    w.write_u64(bitcast_u64(f64(0.25)))
+    w.write_u32(1)
+    w.write_u64(bitcast_u64(f64(1.5)))
+    w.write_u64(bitcast_u64(f64(1.75)))
+    w.write_u32(1)
+    w.write_u8(0)
+    w.write_u64(u64(u32(i32(-3))))
+    w.write_u8(1)
+    w.write_str("in tick 20: panic: no")
+    w.write_str("no")
+    w.write_str("main.wrela:9:5")
+    w.write_u8(2)
+    w.write_u32(20)
+    let Ok(ran) = read_ran(Ok(take w.into_bytes())) else { panic("a run") }
+    assert(ran.started == 1.5 && ran.elapsed == 0.25 && ran.steps.len() == 1)
+    let Scalar::I32(x) = ran.results[0] else { panic("an i32") }
+    assert(x == -3)
+    let Some(trap) = ran.trap else { panic("a trap") }
+    assert(trap.stage == Stage::Tick && trap.number == 20 && trap.panic.as_str() == "no")
+    assert(read_ran(Ok(Vec::from([u8(0), 1]))).is_err(), "a short run")
+}

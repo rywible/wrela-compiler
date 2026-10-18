@@ -32,10 +32,22 @@ pub fn write_png(path: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<()
 /// Reads a PNG as RGBA8 (a golden frame, or a reference image): its width, height and pixels,
 /// rows top to bottom. Grey, grey with alpha, RGB, indexed and 16-bit images are converted.
 pub fn read_png(path: &Path) -> Result<(u32, u32, Vec<u8>)> {
-    let io = |e: std::io::Error| Error::io(path, e);
+    let file = std::fs::File::open(path).map_err(|e| Error::io(path, e))?;
+    decode_png(std::io::BufReader::new(file), path)
+}
+
+/// [`read_png`] of a PNG's bytes, read already (through a directory handle, say); `path` names
+/// it in errors.
+pub fn png_of(bytes: &[u8], path: &Path) -> Result<(u32, u32, Vec<u8>)> {
+    decode_png(std::io::Cursor::new(bytes), path)
+}
+
+fn decode_png(
+    from: impl std::io::BufRead + std::io::Seek,
+    path: &Path,
+) -> Result<(u32, u32, Vec<u8>)> {
     let decode = |e: png::DecodingError| Error::io(path, std::io::Error::other(e));
-    let file = std::fs::File::open(path).map_err(io)?;
-    let mut decoder = png::Decoder::new(std::io::BufReader::new(file));
+    let mut decoder = png::Decoder::new(from);
     decoder.set_transformations(png::Transformations::normalize_to_color8());
     let mut reader = decoder.read_info().map_err(decode)?;
     let size = reader

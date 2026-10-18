@@ -99,6 +99,7 @@ mod studio;
 mod sweeps;
 mod test;
 mod tool;
+mod toolchain;
 mod trace;
 
 pub(crate) fn usage() -> ExitCode {

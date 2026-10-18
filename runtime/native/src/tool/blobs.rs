@@ -61,6 +61,8 @@ pub(crate) struct Blobs {
     budget: BlobBudget,
     /// Each request's blobs that the tool hasn't been told of yet.
     unpublished: HashMap<u32, Vec<u32>>,
+    /// The bytes reserved for blobs not filled yet, by blob: counted in `bytes` already.
+    reserved: HashMap<u32, u64>,
 }
 
 impl Blobs {
@@ -81,6 +83,35 @@ impl Blobs {
         self.held.insert(id, Arc::new(Vec::new()));
         self.unpublished.entry(request).or_default().push(id);
         Ok(id)
+    }
+
+    /// A new, empty blob made for `request` with `bytes` reserved for it: the handle and the
+    /// bytes are counted now, in one step, before the bytes are read, so two requests can't both
+    /// count on the same room. [`Blobs::fill`] puts the bytes in; a release gives the
+    /// reservation back.
+    pub(crate) fn create_reserved(&mut self, request: u32, bytes: u64) -> Result<u32, String> {
+        self.reserve(bytes)?;
+        let id = self.create(request)?;
+        self.bytes += bytes;
+        self.reserved.insert(id, bytes);
+        Ok(id)
+    }
+
+    /// Puts `data` in blob `id`, made by [`Blobs::create_reserved`] with at least as many bytes
+    /// reserved: its bytes take the reservation's place, and what's left of it is let go.
+    pub(crate) fn fill(&mut self, id: u32, data: Vec<u8>) -> Result<(), String> {
+        let Some(&room) = self.reserved.get(&id) else {
+            return Err(format!("blob {id} has no bytes reserved"));
+        };
+        if data.len() as u64 > room {
+            return Err(format!("{} bytes are more than the {room} reserved", data.len()));
+        }
+        let blob = self.held.get_mut(&id).ok_or_else(|| no_blob(id))?;
+        let len = data.len() as u64;
+        *blob = Arc::new(data);
+        self.reserved.remove(&id);
+        self.bytes = self.bytes - room + len;
+        Ok(())
     }
 
     /// Whether `more` bytes fit the budget beside what the blobs hold.
@@ -141,7 +172,7 @@ impl Blobs {
             ));
         }
         let blob = self.held.remove(&id).ok_or_else(|| no_blob(id))?;
-        self.bytes -= blob.len() as u64;
+        self.bytes -= blob.len() as u64 + self.reserved.remove(&id).unwrap_or(0);
         for ids in self.unpublished.values_mut() {
             ids.retain(|&b| b != id);
         }
@@ -154,7 +185,7 @@ impl Blobs {
         let ids = self.unpublished.remove(&request).unwrap_or_default();
         for &id in &ids {
             if let Some(blob) = self.held.remove(&id) {
-                self.bytes -= blob.len() as u64;
+                self.bytes -= blob.len() as u64 + self.reserved.remove(&id).unwrap_or(0);
             }
         }
         ids.len()
@@ -174,6 +205,7 @@ impl Blobs {
             }
         }
         self.held.clear();
+        self.reserved.clear();
         self.bytes = 0;
         ended
     }
@@ -226,6 +258,27 @@ mod tests {
         assert!(b.get(one).is_err(), "released");
         b.append(kept, &[2; 10]).expect("its bytes are free again");
         assert_eq!(b.rollback(1), 0, "once");
+    }
+
+    #[test]
+    fn a_reservation_counts_its_bytes_and_handle_before_they_are_read() {
+        // Two captures at once whose bytes together are past the budget: only one is admitted.
+        let mut b = Blobs::new(BlobBudget { bytes: 10, handles: 4 });
+        let one = b.create_reserved(1, 6).expect("admitted");
+        assert!(b.create_reserved(2, 6).unwrap_err().contains("budget"), "no room is left");
+        assert!(b.fits(5).is_err(), "the reservation is counted");
+        b.fill(one, vec![1; 4]).expect("filled");
+        assert_eq!(b.get(one).expect("held").len(), 4);
+        b.create_reserved(2, 6).expect("what the fill didn't use is let go");
+        // With no handle left, a capture isn't admitted either.
+        let mut h = Blobs::new(BlobBudget { bytes: 100, handles: 1 });
+        let held = h.create_reserved(1, 6).expect("admitted");
+        assert!(h.create_reserved(2, 6).unwrap_err().contains("blobs"), "no handle is left");
+        // A failed request gives back its reservation.
+        assert_eq!(h.rollback(1), 1);
+        assert!(h.get(held).is_err());
+        h.create_reserved(3, 100).expect("all of the budget is free again");
+        assert_eq!(h.release_all(), (1, 100));
     }
 
     #[test]
