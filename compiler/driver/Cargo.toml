@@ -27,6 +27,9 @@ wasmtime.workspace = true
 # Constants are cached by their inputs between builds, keyed by a digest of them (§13).
 sha2 = "0.10"
 
+# A tool test that doesn't end is killed with its process group (§13.2), without `unsafe`.
+rustix = { version = "1", features = ["process"] }
+
 # Frame tests run the program's frames on the native host's CPU, without its GPU (§13).
 wrela-host = { path = "../../runtime/native", default-features = false }
 

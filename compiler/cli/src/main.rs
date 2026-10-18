@@ -154,7 +154,25 @@ fn main() -> ExitCode {
         "doc" => doc::run(rest),
         "pipelines" => pipelines::run(rest),
         "profile" => profile::run(rest),
-        "test" => test::run(rest),
+        "test" => {
+            // Each tool test runs in a process of this executable's (§13.2).
+            if let Ok(me) = std::env::current_exe() {
+                wrela_driver::tool_tests::set_runner(me);
+            }
+            // Ctrl-C ends the tool tests running, each with every process group it started,
+            // then the process: a tool test's processes aren't in the terminal's group.
+            let handled = ctrlc::set_handler(|| {
+                wrela_driver::tool_tests::stop_all();
+                std::process::exit(130);
+            });
+            if let Err(e) = handled {
+                eprintln!(
+                    "error: `wrela test` can't take Ctrl-C, so it couldn't end its tool tests: {e}"
+                );
+                return ExitCode::from(71);
+            }
+            test::run(rest)
+        }
         "studio" => studio::run(rest),
         "run" => run::run(rest),
         "tool" => tool::run(rest),

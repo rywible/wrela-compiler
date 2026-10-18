@@ -1,0 +1,353 @@
+// The tool tests (language.md §13.2): each a job on the package's tool build, in a process of
+// its own, with a new `scratch` root and a fake clock. `wrela test` runs them;
+// compiler/cli/tests/suite/tool_tests.rs checks they pass, and the ways a tool test fails.
+
+use std::hash::sha256::{Sha256, sha256}
+use std::io::{IoError, print}
+use std::tool::answer
+use std::tool::blob
+use std::tool::blob::Data
+use std::tool::files
+use std::tool::http
+use std::tool::run
+use std::tool::testing
+use std::tool::testing::Fake
+use std::tool::time
+
+/// Whether an answer says the request succeeded.
+fn succeeded(polled: take Result<Vec<u8>, IoError>) -> bool {
+    answer(take polled).is_ok()
+}
+
+/// The bytes of `text`.
+fn utf8(text: str) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new()
+    for i in 0..text.len() {
+        out.push(text.byte(i))
+    }
+    out
+}
+
+@test(tool)
+@job
+fn a_tool_test_writes_and_reads_its_scratch() {
+    var w = files::write("scratch/notes/a.txt", utf8("kept"))
+    var wrote = w.poll()
+    while wrote.is_none() {
+        yield
+        wrote = w.poll()
+    }
+    let Some(done) = take wrote else { panic("no answer") }
+    assert(succeeded(take done), "scratch is a write root")
+    var r = files::read("scratch/notes/a.txt")
+    var got = r.poll()
+    while got.is_none() {
+        yield
+        got = r.poll()
+    }
+    let Some(read) = take got else { panic("no answer") }
+    let Ok(bytes) = answer(take read) else { panic("the file is there") }
+    assert(bytes.len() == 4 && bytes[0] == 107)
+    print("scratch holds notes/a.txt")
+}
+
+@test(tool)
+@job
+fn each_tool_test_has_a_scratch_of_its_own() {
+    // What another test wrote in its scratch isn't in this one's.
+    var s = files::stat("scratch/notes/a.txt")
+    var got = s.poll()
+    while got.is_none() {
+        yield
+        got = s.poll()
+    }
+    let Some(stated) = take got else { panic("no answer") }
+    assert(!succeeded(take stated), "a new scratch")
+    var l = files::list("scratch")
+    var listed = l.poll()
+    while listed.is_none() {
+        yield
+        listed = l.poll()
+    }
+    let Some(polled) = take listed else { panic("no answer") }
+    let Ok(entries) = files::read_list(take polled) else { panic("scratch lists") }
+    assert(entries.len() == 0, "scratch starts empty")
+}
+
+@test(tool, net: ["game.example"])
+@job
+fn the_fake_clock_fires_a_timer_while_a_fake_site_waits() {
+    let started = std::time::now()
+    var set = testing::set_utc(time::Utc { seconds: 2000000000, nanos: 0 })
+    while set.poll().is_none() { yield }
+    var page = files::write("scratch/sites/game.example/slow.txt", utf8("late"))
+    while page.poll().is_none() { yield }
+    var slow = testing::fake("https://game.example/slow.txt", Fake::Delay(10.0))
+    while slow.poll().is_none() { yield }
+    // The site answers after 10 s of fake time; the timer fires after 1 s, first.
+    var f = http::fetch(http::get("https://game.example/slow.txt"))
+    var t = time::after(1.0)
+    var order: Vec<u32> = Vec::new()
+    var fetched: Option<http::Response> = None
+    var fired = false
+    while fetched.is_none() || !fired {
+        if !fired && t.poll().is_some() {
+            fired = true
+            order.push(1)
+        }
+        if fetched.is_none() {
+            if let Some(polled) = f.poll() {
+                let Ok(r) = http::read_response(take polled) else { panic("a response") }
+                fetched = Some(take r)
+                order.push(2)
+            }
+        }
+        if fetched.is_none() || !fired {
+            yield
+        }
+    }
+    assert(order.len() == 2 && order[0] == 1 && order[1] == 2, "the timer fired first")
+    let Some(response) = take fetched else { panic("a response") }
+    assert(response.status == 200)
+    let Data::Bytes(body) = response.body else { panic("a small body") }
+    assert(body.len() == 4 && body[0] == 108)
+    var u = time::utc_now()
+    var now = u.poll()
+    while now.is_none() {
+        yield
+        now = u.poll()
+    }
+    let Some(polled) = take now else { panic("no answer") }
+    let Ok(date) = time::read_utc(take polled) else { panic("a date") }
+    assert(date.seconds == 2000000010 && date.nanos == 0, "10 s of fake time passed")
+    assert(std::time::since(started) < 5.0, "and no real 10 s")
+}
+
+@test(tool, net: ["game.example"])
+@job
+fn a_fake_delay_past_the_deadline_fails_at_the_deadline() {
+    var page = files::write("scratch/sites/game.example/late.txt", utf8("late"))
+    while page.poll().is_none() { yield }
+    var slow = testing::fake("https://game.example/late.txt", Fake::Delay(20.0))
+    while slow.poll().is_none() { yield }
+    var request = http::get("https://game.example/late.txt")
+    request.timeout = 5.0
+    var f = http::fetch(request)
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { panic("no answer") }
+    assert(http::read_response(take polled).is_err(), "a real site would have timed out")
+    var u = time::utc_now()
+    var now = u.poll()
+    while now.is_none() {
+        yield
+        now = u.poll()
+    }
+    let Some(p) = take now else { panic("no answer") }
+    let Ok(date) = time::read_utc(take p) else { panic("a date") }
+    assert(date.seconds == 1767225605, "it failed at 5 s of fake time, not 20")
+}
+
+@test(tool)
+@job
+fn fake_timers_fire_in_the_order_of_their_deadlines() {
+    let seconds = [3.0, 1.0, 2.0, 1.0]
+    var timers: Vec<std::io::Pending<u8>> = Vec::new()
+    for s in seconds {
+        timers.push(time::after(s))
+    }
+    var fired: Vec<u32> = Vec::new()
+    while fired.len() < 4 {
+        for i in 0..4 {
+            var seen = false
+            for f in fired {
+                if f == i {
+                    seen = true
+                }
+            }
+            if !seen && timers[i].poll().is_some() {
+                fired.push(i)
+            }
+        }
+        if fired.len() < 4 {
+            yield
+        }
+    }
+    // 1 s twice (in the order made), then 2 s, then 3 s.
+    assert(fired[0] == 1 && fired[1] == 3 && fired[2] == 2 && fired[3] == 0)
+}
+
+@test(tool, net: ["game.example"])
+@job
+fn a_fake_site_serves_its_scratch_and_fakes_change_a_url() {
+    var page = files::write("scratch/sites/game.example/index.html", utf8("home"))
+    while page.poll().is_none() { yield }
+    // Each URL in turn: the file, a missing one, then each fake.
+    let urls = [
+        "https://game.example/",
+        "https://game.example/none.txt",
+        "https://game.example/index.html",
+        "https://game.example/index.html",
+        "https://game.example/index.html",
+        "https://game.example/index.html",
+    ]
+    let statuses = [u16(200), 404, 503, 404, 200, 200]
+    let lengths = [u32(4), 0, 4, 0, 5, 4]
+    for i in 0..6 {
+        var faked = match i {
+            2 => testing::fake(urls[i], Fake::Status(503)),
+            3 => testing::fake(urls[i], Fake::Missing),
+            4 => testing::fake(urls[i], Fake::Bytes(utf8("other"))),
+            5 => testing::fake(urls[i], Fake::Clear),
+            _ => testing::fake(urls[i], Fake::Delay(0.0)),
+        }
+        var answered = faked.poll()
+        while answered.is_none() {
+            yield
+            answered = faked.poll()
+        }
+        let Some(a) = take answered else { panic("no answer") }
+        assert(succeeded(take a), "a fake is set")
+        var f = http::fetch(http::get(urls[i]))
+        var got = f.poll()
+        while got.is_none() {
+            yield
+            got = f.poll()
+        }
+        let Some(polled) = take got else { panic("no answer") }
+        let Ok(response) = http::read_response(take polled) else { panic("a response") }
+        let Data::Bytes(body) = response.body else { panic("a small body") }
+        assert(response.status == statuses[i], f"{urls[i]}: status {response.status}")
+        assert(body.len() == lengths[i], f"{urls[i]}: {body.len()} bytes")
+    }
+}
+
+@test(tool, net: ["game.example"])
+@job
+fn only_https_to_a_granted_host_is_fetched() {
+    let urls = ["https://elsewhere.example/", "http://game.example/", "https://game.example:8443/"]
+    let words = ["isn't granted", "isn't an `https://` URL", "isn't granted"]
+    for i in 0..3 {
+        var f = http::fetch(http::get(urls[i]))
+        var got = f.poll()
+        while got.is_none() {
+            yield
+            got = f.poll()
+        }
+        let Some(polled) = take got else { panic("no answer") }
+        let Err(e) = http::read_response(take polled) else { panic(f"{urls[i]} was fetched") }
+        let message = e.message()
+        var found = false
+        let want = words[i]
+        for k in 0..message.len() {
+            if message.slice(k, message.len()).starts_with(want) {
+                found = true
+            }
+        }
+        assert(found, f"{urls[i]}: {message}")
+    }
+}
+
+@test(tool, net: ["game.example"], budget: 30)
+@job
+fn a_body_over_512_kib_comes_as_a_blob() {
+    // 600 KiB, two chunks into a blob, then a file of the fake site.
+    var nb = blob::new()
+    var made = nb.poll()
+    while made.is_none() {
+        yield
+        made = nb.poll()
+    }
+    let Some(m) = take made else { panic("no answer") }
+    let Ok(b) = blob::read_handle(take m) else { panic("a blob") }
+    var whole = Sha256::new()
+    for k in 0..2 {
+        let chunk = Vec::filled(307200, u8(k + 1))
+        whole.update(chunk)
+        var ap = blob::append(b, chunk)
+        while ap.poll().is_none() { yield }
+    }
+    var wb = files::write_blob("scratch/sites/game.example/big.bin", b)
+    while wb.poll().is_none() { yield }
+    var f = http::fetch(http::get("https://game.example/big.bin"))
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { panic("no answer") }
+    let Ok(response) = http::read_response(take polled) else { panic("a response") }
+    let Data::Blob(body) = response.body else { panic("a body over 512 KiB is a blob") }
+    // Its digest, a chunk at a time, is the digest of what was written.
+    var digest = Sha256::new()
+    var at: u64 = 0
+    loop {
+        var r = blob::read(body, at, 131072)
+        var piece = r.poll()
+        while piece.is_none() {
+            yield
+            piece = r.poll()
+        }
+        let Some(p) = take piece else { panic("no answer") }
+        let Ok(bytes) = answer(take p) else { panic("a chunk") }
+        if bytes.len() == 0 {
+            break
+        }
+        at += u64(bytes.len())
+        digest.update(bytes)
+    }
+    assert(at == 614400, f"{at} bytes")
+    assert(digest.finish() == whole.finish())
+    assert(sha256(Vec::filled(3, u8(1))) != whole.finish())
+}
+
+@test(tool, net: ["game.example"], run: [("wrangler", "fakes/wrangler")], budget: 60)
+@job
+fn a_fake_program_is_a_tool_package() {
+    var page = files::write("scratch/release/index.html", utf8("v2"))
+    while page.poll().is_none() { yield }
+    // A timer of fake time doesn't fire while a real program runs: the clock moves only when
+    // the test waits on nothing else.
+    var tick = time::after(0.001)
+    var deploy = run::command("wrangler", "scratch")
+    deploy.args.push(String::from("deploy"))
+    deploy.args.push(String::from("release"))
+    deploy.args.push(String::from("game.example"))
+    var r = run::run(deploy)
+    var got = r.poll()
+    while got.is_none() {
+        yield
+        got = r.poll()
+    }
+    assert(!tick.is_done(), "the clock waited for the program")
+    while tick.poll().is_none() { yield }
+    let Some(polled) = take got else { panic("no answer") }
+    let Ok(ran) = run::read_ran(take polled) else { panic("it ran") }
+    let Data::Bytes(out) = ran.stdout else { panic("a short output") }
+    let Some(said) = String::from_utf8(out.clone()) else { panic("UTF-8") }
+    assert(ran.status == 0, f"wrangler exited {ran.status}: {said.as_str()}")
+    let expected = "deployed game.example\n"
+    assert(said.as_str() == expected, said.as_str())
+    var f = http::fetch(http::get("https://game.example/"))
+    var fetched = f.poll()
+    while fetched.is_none() {
+        yield
+        fetched = f.poll()
+    }
+    let Some(p) = take fetched else { panic("no answer") }
+    let Ok(response) = http::read_response(take p) else { panic("a response") }
+    let Data::Bytes(body) = response.body else { panic("a small body") }
+    assert(response.status == 200 && body.len() == 2 && body[1] == 50, "the deployed page")
+    // A program the test doesn't name isn't granted.
+    var other = run::run(run::command("npx", "scratch"))
+    var refused = other.poll()
+    while refused.is_none() {
+        yield
+        refused = other.poll()
+    }
+    let Some(o) = take refused else { panic("no answer") }
+    assert(run::read_ran(take o).is_err(), "npx isn't granted")
+}

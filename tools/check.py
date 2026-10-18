@@ -30,7 +30,8 @@ SOURCES = ("content", "examples", "games", "engine", "compiler/std", "compiler/t
            "compiler/tests/math", "compiler/tests/sketches", "compiler/tests/numerics",
            "compiler/tests/render", "compiler/tests/queries", "compiler/tests/simd",
            "compiler/tests/input", "compiler/tests/lift", "compiler/tests/texels",
-           "compiler/tests/shader_params", "compiler/tests/unroll", "ui", "studio",
+           "compiler/tests/shader_params", "compiler/tests/unroll", "compiler/tests/tool_tests",
+           "ui", "studio",
            "studio/tests/views", "docsite", "platform",
            "console")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.

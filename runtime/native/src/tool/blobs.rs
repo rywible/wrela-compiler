@@ -148,6 +148,18 @@ impl Blobs {
         Ok(())
     }
 
+    /// Request `request` failed: the blobs made for it, which no answer names, are released,
+    /// and their bytes freed. How many there were.
+    pub(crate) fn rollback(&mut self, request: u32) -> usize {
+        let ids = self.unpublished.remove(&request).unwrap_or_default();
+        for &id in &ids {
+            if let Some(blob) = self.held.remove(&id) {
+                self.bytes -= blob.len() as u64;
+            }
+        }
+        ids.len()
+    }
+
     /// The tool has read request `request`'s answer: its blobs are the tool's now.
     pub(crate) fn publish(&mut self, request: u32) {
         self.unpublished.remove(&request);
@@ -202,6 +214,18 @@ mod tests {
         drop(writing);
         b.release(one).expect("released once the write is done");
         b.append(two, &[2; 8]).expect("the budget is free again");
+    }
+
+    #[test]
+    fn a_failed_requests_blobs_are_released_with_their_bytes() {
+        let mut b = Blobs::new(BlobBudget { bytes: 10, handles: 4 });
+        let one = b.create(1).expect("a blob");
+        b.append(one, &[1; 6]).expect("6 bytes");
+        let kept = b.create(2).expect("another request's");
+        assert_eq!(b.rollback(1), 1);
+        assert!(b.get(one).is_err(), "released");
+        b.append(kept, &[2; 10]).expect("its bytes are free again");
+        assert_eq!(b.rollback(1), 0, "once");
     }
 
     #[test]

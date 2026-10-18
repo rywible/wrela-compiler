@@ -154,7 +154,8 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
                 format!("`{}` is a constant, which the build computes", def.name),
             ));
         }
-        if def.attrs.test.is_some() {
+        // A tool test runs on the tool host, which has its services (§13.2).
+        if def.attrs.test.is_some() && def.attrs.test_tool.is_none() {
             contexts
                 .push((DETERMINISTIC, format!("`{}` is a test, which the build runs", def.name)));
         }

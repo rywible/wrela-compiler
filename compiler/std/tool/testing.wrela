@@ -1,0 +1,68 @@
+// What a tool test (`@test(tool, ...)`, language.md §13.2) sets on its host: fakes for its fake
+// sites' URLs, and its fake clock's date. Each is a request, answered at once; outside a tool
+// test, each fails.
+//
+// A fake site serves the files under `scratch/sites/<host>/` (`GET` and `HEAD`; another method
+// gets 405). A fake for a URL (without its fragment) changes that: `Status(n)` answers with
+// status `n` and the file, if there is one; `Missing` with 404 and no body; `Bytes(b)` with
+// 200 and these bytes, whatever the method. Each of the three takes the place of the one set
+// before. `Delay(s)` makes the answer come after `s` seconds of the test's fake time, so a
+// timer can fire first. `Clear` takes back all that was set.
+//
+// The fake clock moves only when every request the test waits on is answered by the clock
+// (timers, delayed fakes): then it jumps to the soonest. `utc_now` reads it.
+
+use std::io::Pending
+use std::serialize::Writer
+use std::tool::ask
+use std::tool::time::Utc
+
+/// A fake for a fake site's URL.
+pub enum Fake: Clone {
+    /// The file (if there is one) with this status, from 100 to 999.
+    Status(u16),
+    /// A 404 with no body, though the file is there.
+    Missing,
+    /// 200 with these bytes as the body (at most 512 KiB), whatever the method.
+    Bytes(Vec<u8>),
+    /// The answer comes after these seconds of the test's fake time.
+    Delay(f64),
+    /// Nothing faked: the file again.
+    Clear,
+}
+
+/// Sets `fake` for the URL `url`. `std::tool::answer` reads the answer.
+@tool
+pub fn fake(url: str, fake: Fake) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(url)
+    match fake {
+        Fake::Status(n) => {
+            w.write_u8(0)
+            w.write_u32(u32(n))
+        },
+        Fake::Missing => w.write_u8(1),
+        Fake::Bytes(b) => {
+            w.write_u8(2)
+            for x in b {
+                w.write_u8(x)
+            }
+        },
+        Fake::Delay(s) => {
+            w.write_u8(3)
+            w.write_u64(bitcast_u64(s))
+        },
+        Fake::Clear => w.write_u8(4),
+    }
+    ask("testing/fake", take w.into_bytes())
+}
+
+/// Sets the fake clock's date to `now`: `time::utc_now` reads it from here on, moved on as the
+/// fake clock moves.
+@tool
+pub fn set_utc(now: Utc) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_u64(now.seconds)
+    w.write_u32(now.nanos)
+    ask("testing/utc", take w.into_bytes())
+}

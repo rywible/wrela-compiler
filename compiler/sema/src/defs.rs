@@ -692,6 +692,26 @@ impl Entry {
 /// The most frames a frame test runs (§13): ten minutes at 60 frames a second.
 pub const MAX_TEST_FRAMES: u32 = 36_000;
 
+/// A tool test's budget unless it says (§13.2): seconds of real time for its whole run.
+pub const TOOL_TEST_BUDGET: f64 = 10.0;
+
+/// The most a tool test's budget may be: ten minutes.
+pub const MAX_TOOL_TEST_BUDGET: f64 = 600.0;
+
+/// `@test(tool, ...)` (§13.2): a `@job fn` run on the package's tool build, in a process of its
+/// own, with a new write root `scratch`, a budget, and fakes for what it reaches.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolTest {
+    /// Seconds of real time the run may take ([`TOOL_TEST_BUDGET`] unless it says).
+    pub budget: f64,
+    /// The hosts `std::tool::http` reaches (`net: ["game.example"]`): each a fake site, which
+    /// the host serves from `scratch/sites/<host>/`. No tool test reaches the network.
+    pub net: Vec<String>,
+    /// The programs `std::tool::run` may run (`run: [("wrangler", "fakes/wrangler")]`): each
+    /// name, and the directory in the test's package of the tool package that stands in for it.
+    pub run: Vec<(String, String)>,
+}
+
 /// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is
 /// written, and how far the screen may be from it: a mean difference, in 8-bit steps.
 #[derive(Clone, Debug, PartialEq)]
@@ -730,6 +750,8 @@ pub struct FnAttrs {
     /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
     /// their readbacks (§13).
     pub test_gpu: bool,
+    /// `@test(tool, ...)`: a tool test, a job run on the tool host (§13.2).
+    pub test_tool: Option<ToolTest>,
     /// `@fuel(n)` on a `@test` of code: the work it may do, in place of a test's limit, and
     /// where it's written (§13).
     pub fuel: Option<(u64, Span)>,

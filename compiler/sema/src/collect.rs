@@ -846,9 +846,15 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
                 "intrinsic" if is_std => out.intrinsic = true,
                 "test" => {
-                    if let Some(args) = &a.args {
-                        (out.test_run, out.test_input, out.test_gpu, out.test_golden) =
-                            self.test_run(a, args);
+                    match &a.args {
+                        Some(args) if args.iter().any(is_tool_arg) => {
+                            out.test_tool = self.tool_test(a, args);
+                        }
+                        Some(args) => {
+                            (out.test_run, out.test_input, out.test_gpu, out.test_golden) =
+                                self.test_run(a, args);
+                        }
+                        None => {}
                     }
                     out.test = Some(a.span);
                 }
@@ -956,9 +962,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                 }
             }
         }
-        // A test of code may set its fuel; a frame test's calls each get a test's.
+        // A test of code may set its fuel; a frame test's calls each get a test's, and a tool
+        // test has a budget of time instead.
         if let Some((_, at)) = out.fuel
-            && (out.test.is_none() || out.test_run.is_some())
+            && (out.test.is_none() || out.test_run.is_some() || out.test_tool.is_some())
         {
             out.fuel = None;
             self.diags.push(
@@ -1014,6 +1021,116 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
         }
         out
+    }
+
+    /// `@test(tool, ...)` (§13.2): a tool test, with its options: `budget: s`, seconds from 0 to
+    /// [`MAX_TOOL_TEST_BUDGET`]; `net: ["host", ...]`, the fake sites it reaches; and `run:
+    /// [("name", "dir"), ...]`, the programs it may run, each a tool package in a directory of
+    /// the test's package. Anything else is E0222.
+    fn tool_test(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<ToolTest> {
+        let mut test = ToolTest { budget: TOOL_TEST_BUDGET, net: Vec::new(), run: Vec::new() };
+        let mut bad: Option<(Span, &str)> = None;
+        let mut seen: Vec<&str> = Vec::new();
+        let text = |e: &ast::Expr| match &e.kind {
+            ast::ExprKind::Lit(l @ ast::Lit { kind: ast::LitKind::Str, .. }) => {
+                Some(wrela_syntax::lexer::string_value(&l.text))
+            }
+            _ => None,
+        };
+        for arg in args {
+            let Some(name) = &arg.name else {
+                if !is_tool_arg(arg) || seen.contains(&"tool") {
+                    bad = bad
+                        .or(Some((arg.span, "`tool` comes once, and every other option is named")));
+                }
+                seen.push("tool");
+                continue;
+            };
+            if seen.contains(&name.name.as_str()) {
+                bad = bad.or(Some((arg.span, "each option is given once")));
+                continue;
+            }
+            seen.push(name.name.as_str());
+            match name.name.as_str() {
+                "budget" => {
+                    let v = match &arg.value.kind {
+                        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Float(v), .. }) => {
+                            Some(*v)
+                        }
+                        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
+                            v.ok().map(|v| v as f64)
+                        }
+                        _ => None,
+                    };
+                    match v.filter(|v| *v > 0.0 && *v <= MAX_TOOL_TEST_BUDGET) {
+                        Some(v) => test.budget = v,
+                        None => {
+                            bad = bad.or(Some((
+                                arg.span,
+                                "`budget` is seconds, more than 0 and at most 600",
+                            )))
+                        }
+                    }
+                }
+                "net" => {
+                    let hosts = match &arg.value.kind {
+                        ast::ExprKind::Array(items) => {
+                            items.iter().map(text).collect::<Option<Vec<String>>>()
+                        }
+                        _ => None,
+                    };
+                    match hosts.filter(|h| h.iter().all(|h| is_host(h))) {
+                        Some(h) => test.net = h,
+                        None => {
+                            bad = bad.or(Some((
+                                arg.span,
+                                "`net` is an array of hosts, such as `[\"game.example\"]`: lowercase letters, digits, `-` and `.`",
+                            )))
+                        }
+                    }
+                }
+                "run" => {
+                    let pairs = match &arg.value.kind {
+                        ast::ExprKind::Array(items) => items
+                            .iter()
+                            .map(|i| match &i.kind {
+                                ast::ExprKind::Tuple(parts) if parts.len() == 2 => {
+                                    Some((text(&parts[0])?, text(&parts[1])?))
+                                }
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<(String, String)>>>(),
+                        _ => None,
+                    };
+                    let ok = |(name, dir): &(String, String)| {
+                        !name.is_empty()
+                            && name.bytes().all(|b| {
+                                b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+                            })
+                            && wrela_abi::check::path_problem(dir).is_none()
+                    };
+                    match pairs.filter(|p| p.iter().all(ok)) {
+                        Some(p) => test.run = p,
+                        None => {
+                            bad = bad.or(Some((
+                                arg.span,
+                                "`run` is an array of `(\"name\", \"dir\")`: a program's name, and the directory in the package of the tool package that stands in for it",
+                            )))
+                        }
+                    }
+                }
+                _ => bad = bad.or(Some((arg.span, "a tool test takes `budget`, `net` and `run`"))),
+            }
+        }
+        if let Some((span, why)) = bad {
+            self.diags.push(
+                Diagnostic::new(codes::E0222, span, format!("`@test(tool, ...)`: {why}"))
+                    .with_secondary(a.span, "in this tool test")
+                    .with_note("`@test(tool, budget: 5, net: [\"game.example\"], run: [(\"wrangler\", \"fakes/wrangler\")])` runs a `@job fn` on the package's tool build, with fake sites and programs (§13.2)"),
+            );
+            return None;
+        }
+        Some(test)
     }
 
     /// `@test(frames: n)` or `@test(ticks: n)` (§13), `n` from 1 to [`MAX_TEST_FRAMES`], and,
@@ -1895,9 +2012,12 @@ impl<'d, 'u> Collector<'d, 'u> {
         let frames = def.attrs.test_run.is_some();
         let program = self.p.package_of(def.module).kind == PackageKind::Program;
         // A dependency's frame test is about its own program, checked when it's the package
-        // checked; here its frames aren't this program's.
-        if frames && !program {
+        // checked; here its frames aren't this program's. So is a tool test.
+        if (frames || def.attrs.test_tool.is_some()) && !program {
             return;
+        }
+        if def.attrs.test_tool.is_some() {
+            return self.tool_test_signature(id, at);
         }
         // The program's state: what `init`, in main.wrela, makes.
         let state = self.p.main.and_then(|main| {
@@ -1936,6 +2056,43 @@ impl<'d, 'u> Collector<'d, 'u> {
                 )
                 .with_secondary(at, "declared a test here")
                 .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics"),
+            );
+        }
+    }
+
+    /// E0222: a tool test is a free `@job fn` of no parameters and no result, of a package with
+    /// a tool build (main.wrela exports `tool`, §15.5).
+    fn tool_test_signature(&mut self, id: FnId, at: Span) {
+        let def = self.p.func(id);
+        let tool = self.p.main.is_some_and(|main| {
+            self.p.fns.iter().any(|f| {
+                f.module == main && f.public && f.owner == FnOwner::Free && f.name == "tool"
+            })
+        });
+        let why = if def.attrs.job.is_none() {
+            Some("a tool test is a `@job fn`, which the tool host resumes as its answers come")
+        } else if def.owner != FnOwner::Free {
+            Some("it's a method, and a test is a function of its own")
+        } else if !def.params.is_empty() {
+            Some("it takes parameters, and nothing passes them")
+        } else if def.ret != self.p.types.unit {
+            Some("it returns a value, and nothing reads it: check what it computes with `assert`")
+        } else if !def.generics.is_empty() {
+            Some("it's generic, and nothing chooses its types")
+        } else if !tool {
+            Some("its package has no tool build: main.wrela exports no `tool` (§15.5)")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            self.diags.push(
+                Diagnostic::new(
+                    codes::E0222,
+                    def.sig_span,
+                    format!("`{}` can't be a tool test: {why}", def.name),
+                )
+                .with_secondary(at, "declared a tool test here")
+                .with_note("a tool test is `@test(tool) @job fn name() { ... }`, run on the package's tool build: it passes if the job ends, and fails on a panic, a trap or its budget (§13.2)"),
             );
         }
     }
@@ -3645,6 +3802,21 @@ fn is_job(p: &Program, t: TyId) -> bool {
 
 /// What a test's input is (§13.2), for its errors.
 const INPUT_NOTE: &str = "a test's input is a `std::input::Script` constant (`input: SCRIPT`), or a file in the package (`input: \"path\"`): a script in runtime/abi `input`'s format, or with `ticks` a tick log";
+
+/// Whether `arg` is `tool`, alone, which makes a `@test` a tool test (§13.2).
+fn is_tool_arg(arg: &ast::Arg) -> bool {
+    arg.name.is_none()
+        && matches!(&arg.value.kind, ast::ExprKind::Path(p) if p.is_single() && p.segments[0].ident.name == "tool")
+}
+
+/// Whether `host` can name a host: lowercase letters, digits, `-` and `.`, with no part empty.
+fn is_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.split('.').all(|part| !part.is_empty())
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+}
 
 /// E0222: each `@test(..., input: NAME)` names a constant of type `std::input::Script`, given
 /// the constants' types (`tys`).

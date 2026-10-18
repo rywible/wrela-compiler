@@ -1,0 +1,115 @@
+// A tool's HTTP (language.md §15.5): a request to a host that `wrela tool --net HOST` grants,
+// over HTTPS, and its response. Only `https://` URLs reach a host, and only a host granted
+// exactly (`HOST`, or `HOST:PORT` for a port), with no user in the URL. A redirect isn't
+// followed: the tool gets the
+// response, with its `location` header, and decides. A body over 512 KiB goes through a blob,
+// both ways; a response's body is at most 256 MiB. Each request has a deadline, 30 s unless it
+// asks for another (`timeout`, at most 600 s); past it, the request fails.
+//
+// In a tool test (§13.2), the hosts are fake sites: the host answers `GET` with the file at
+// `scratch/sites/<host>/<path>`, or 404, unless the test set a fake for the URL
+// (`std::tool::testing`). A tool test never reaches the network.
+
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::blob::{Data, read_data, write_data}
+
+/// A header of a request or a response: its name and value. A response's names are lowercase.
+pub struct Header: Clone {
+    pub name: String,
+    pub value: String,
+}
+
+/// A request: its method (`GET`, `PUT`, ...), its URL, its headers and its body, and how long it
+/// may take in seconds (0: 30 s).
+pub struct Request: Clone {
+    pub method: String,
+    pub url: String,
+    pub headers: Vec<Header>,
+    pub body: Data,
+    pub timeout: f64,
+}
+
+/// A `GET` of `url`, with no headers and no body.
+pub fn get(url: str) -> Request {
+    Request {
+        method: String::from("GET"),
+        url: String::from(url),
+        headers: Vec::new(),
+        body: Data::empty(),
+        timeout: 0.0,
+    }
+}
+
+/// A response: its status, its headers and its body, which is a blob if it's over 512 KiB.
+pub struct Response: Clone {
+    pub status: u16,
+    pub headers: Vec<Header>,
+    pub body: Data,
+}
+
+impl Response {
+    /// The value of the header `name` (lowercase), if the response has one.
+    pub fn header(self, name: str) -> Option<String> {
+        for h in self.headers {
+            if h.name.as_str() == name {
+                return Some(h.value.clone())
+            }
+        }
+        None
+    }
+}
+
+/// Sends `request`: `read_response` reads the answer. A body of bytes over 512 KiB panics: send
+/// it as a blob.
+@tool
+pub fn fetch(request: Request) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(request.method.as_str())
+    w.write_str(request.url.as_str())
+    w.write_u32(request.headers.len())
+    for h in request.headers {
+        w.write_str(h.name.as_str())
+        w.write_str(h.value.as_str())
+    }
+    w.write_u64(bitcast_u64(request.timeout))
+    write_data(mut w, request.body)
+    ask("http/fetch", take w.into_bytes())
+}
+
+/// Reads a `fetch` answer: the status (a `u32`), the headers (a count, then each name and
+/// value), then the body (`blob::Data`).
+pub fn read_response(polled: take Result<Vec<u8>, IoError>) -> Result<Response, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(status) = r.read_u32() else { return Err(malformed("http/fetch")) }
+    let Ok(n) = r.read_u32() else { return Err(malformed("http/fetch")) }
+    var headers: Vec<Header> = Vec::new()
+    for _ in 0..n {
+        let Ok(name) = r.read_string() else { return Err(malformed("http/fetch")) }
+        let Ok(value) = r.read_string() else { return Err(malformed("http/fetch")) }
+        headers.push(Header { name, value })
+    }
+    let Some(body) = read_data(mut r) else { return Err(malformed("http/fetch")) }
+    if !r.at_end() || status > 999 {
+        return Err(malformed("http/fetch"))
+    }
+    Ok(Response { status: u16(status), headers, body })
+}
+
+@test
+fn a_response_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(404)
+    w.write_u32(1)
+    w.write_str("content-length")
+    w.write_str("0")
+    write_data(mut w, Data::empty())
+    let Ok(response) = read_response(Ok(take w.into_bytes())) else { panic("a response") }
+    assert(response.status == 404 && response.headers.len() == 1)
+    let Some(length) = response.header("content-length") else { panic("its header") }
+    assert(length.as_str() == "0")
+    assert(response.header("location").is_none())
+    assert(read_response(Ok(Vec::from([u8(0), 200, 0, 0, 0]))).is_err(), "a short response")
+}

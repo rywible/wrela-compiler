@@ -223,7 +223,7 @@ pub const RULES: &[(&str, &str)] = &[
     // §13.2 tests
     (
         "const.tests",
-        "a `@test` is a free function of no parameters and no result, run as constants are",
+        "a `@test` is a free function of no parameters and no result, run as constants are; a tool test is such a `@job fn`, run on the tool host",
     ),
     // §14.2 how they're derived
     ("derive.gradient", "`gradient` of a closure or function of an `f32` or a float vector"),

@@ -7,10 +7,15 @@
 //! A file is opened without waiting (`O_NONBLOCK`), so a FIFO with nothing at its other end can't
 //! hold a worker, and the opened handle must be a regular file: a FIFO, a socket or a device is
 //! refused, by the handle's own type, not the path's.
+//!
+//! Hosts (`--net HOST`) and programs (`--allow-run NAME[=PATH]`) are granted by name too. A
+//! program's executable is found when the grants are opened, on the `PATH` of that moment, and
+//! kept as an absolute path, so nothing later changes which file runs. A tool test's hosts are
+//! fakes, served from its `scratch` root, and its programs tool packages (`tool:DIR`).
 
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, FileType, OpenOptions};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -19,13 +24,44 @@ use std::path::PathBuf;
 pub const MOST_BYTES: usize = 512 * 1024;
 
 /// What the command line grants a tool, before anything is opened: roots by name (`--read
-/// NAME=DIR`, `--write NAME=DIR`) and secrets by name (`--secret NAME`).
+/// NAME=DIR`, `--write NAME=DIR`), secrets by name (`--secret NAME`), hosts (`--net HOST`) and
+/// programs (`--allow-run NAME[=PATH]`).
 #[derive(Clone, Debug, Default)]
 pub struct Grants {
     /// Each root: its name, its directory, and whether the tool may change it.
     pub roots: Vec<(String, PathBuf, bool)>,
     /// The environment variables the tool may read, by name.
     pub secrets: Vec<String>,
+    /// The hosts `std::tool::http` may reach, over HTTPS.
+    pub net: Vec<String>,
+    /// The hosts a tool test's fake sites stand in for, served from `scratch/sites/<host>/`.
+    pub fake_net: Vec<String>,
+    /// The programs `std::tool::run` may run: each name and where it's found.
+    pub programs: Vec<(String, ProgramGrant)>,
+    /// The `wrela` executable that runs a `tool:` program's package (`wrela tool`).
+    pub tool_runner: Option<PathBuf>,
+}
+
+/// Where a granted program is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgramGrant {
+    /// `--allow-run NAME`: the file `NAME` in a directory of `PATH`, found when the grants are
+    /// opened.
+    OnPath,
+    /// `--allow-run NAME=PATH`: that executable.
+    At(PathBuf),
+    /// `--allow-run NAME=tool:DIR`: the tool build of the package at `DIR`, which `wrela tool`
+    /// runs in a process of its own.
+    Tool(PathBuf),
+}
+
+/// A granted program, found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Program {
+    /// An executable, by its absolute path.
+    Native(PathBuf),
+    /// A tool package's tool build, run by `runner` (`wrela tool`).
+    Tool { runner: PathBuf, package: PathBuf },
 }
 
 impl Grants {
@@ -42,14 +78,42 @@ impl Grants {
         self
     }
 
-    /// Reads one grant of a command line: `--read NAME=DIR`, `--write NAME=DIR` or `--secret
-    /// NAME`, as the flag and its value. `Ok(false)` if `flag` isn't a grant's.
+    /// Grants the host `host`, for HTTPS.
+    pub fn net(mut self, host: &str) -> Grants {
+        self.net.push(host.to_string());
+        self
+    }
+
+    /// Grants the program `name`, found as `grant` says.
+    pub fn program(mut self, name: &str, grant: ProgramGrant) -> Grants {
+        self.programs.push((name.to_string(), grant));
+        self
+    }
+
+    /// Reads one grant of a command line: `--read NAME=DIR`, `--write NAME=DIR`, `--secret
+    /// NAME`, `--net HOST` or `--allow-run NAME[=PATH]` (`=tool:DIR` for a tool package), as the
+    /// flag and its value. `Ok(false)` if `flag` isn't a grant's.
     pub fn parse(&mut self, flag: &str, value: &str) -> Result<bool, String> {
         let write = match flag {
             "--read" => false,
             "--write" => true,
             "--secret" => {
                 self.secrets.push(value.to_string());
+                return Ok(true);
+            }
+            "--net" => {
+                self.net.push(value.to_string());
+                return Ok(true);
+            }
+            "--allow-run" => {
+                let grant = match value.split_once('=') {
+                    None => (value, ProgramGrant::OnPath),
+                    Some((name, at)) => match at.strip_prefix("tool:") {
+                        Some(dir) => (name, ProgramGrant::Tool(PathBuf::from(dir))),
+                        None => (name, ProgramGrant::At(PathBuf::from(at))),
+                    },
+                };
+                self.programs.push((grant.0.to_string(), grant.1));
                 return Ok(true);
             }
             _ => return Ok(false),
@@ -62,9 +126,10 @@ impl Grants {
     }
 }
 
-/// A root, opened.
+/// A root, opened: its handle, and its directory's path, for a program's working directory.
 struct Root {
     dir: Dir,
+    path: PathBuf,
     write: bool,
 }
 
@@ -104,15 +169,100 @@ pub struct Entry {
 pub struct Caps {
     roots: BTreeMap<String, Root>,
     secrets: Vec<(String, String)>,
+    net: BTreeSet<String>,
+    fake_net: BTreeSet<String>,
+    programs: BTreeMap<String, Program>,
+    /// `PATH` when the grants were opened: the baseline a program's environment starts from.
+    path: String,
+    /// The `wrela` that runs `tool:` programs and launches supervised ones.
+    runner: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Caps {
-    /// Names the roots and the secrets, never the secrets' values.
+    /// Names the roots, the secrets, the hosts and the programs, never the secrets' values.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let roots: Vec<(&String, bool)> = self.roots.iter().map(|(n, r)| (n, r.write)).collect();
         let secrets: Vec<&String> = self.secrets.iter().map(|(n, _)| n).collect();
-        f.debug_struct("Caps").field("roots", &roots).field("secrets", &secrets).finish()
+        f.debug_struct("Caps")
+            .field("roots", &roots)
+            .field("secrets", &secrets)
+            .field("net", &self.net)
+            .field("fake_net", &self.fake_net)
+            .field("programs", &self.programs)
+            .finish()
     }
+}
+
+/// Whether `host` can name a host: lowercase letters, digits, `-` and `.`, no part empty, and
+/// then `:` and a port from 1 if `port` allows one.
+pub(crate) fn valid_host(host: &str, port: bool) -> bool {
+    let (name, at) = match host.split_once(':') {
+        Some((name, at)) if port => (name, Some(at)),
+        _ => (host, None),
+    };
+    !name.is_empty()
+        && name.split('.').all(|p| !p.is_empty())
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+        && at.is_none_or(|p| p.parse::<u16>().is_ok_and(|n| n > 0) && !p.starts_with('0'))
+}
+
+/// Whether the file at `path` is one the user may run: a regular file with an execute bit.
+fn executable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    let runs = |m: &std::fs::Metadata| {
+        std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let runs = |_: &std::fs::Metadata| true;
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && runs(&m))
+}
+
+/// Finds program `name` as `grant` says, given `PATH`'s value then: its absolute path.
+fn find_program(
+    name: &str,
+    grant: &ProgramGrant,
+    path: &str,
+    runner: Option<&PathBuf>,
+) -> Result<Program, String> {
+    let found = match grant {
+        ProgramGrant::OnPath => {
+            let found = std::env::split_paths(path)
+                .filter(|d| d.is_absolute())
+                .map(|d| d.join(name))
+                .find(|p| executable(p));
+            found.ok_or_else(|| format!("the program `{name}` isn't on PATH"))?
+        }
+        ProgramGrant::At(at) => {
+            if !executable(at) {
+                return Err(format!(
+                    "the program `{name}` ({}) isn't an executable file",
+                    at.display()
+                ));
+            }
+            at.clone()
+        }
+        ProgramGrant::Tool(dir) => {
+            let Some(runner) = runner else {
+                return Err(format!("the program `{name}` is a tool, and nothing here runs one"));
+            };
+            let package = dir.canonicalize().map_err(|e| {
+                format!("the program `{name}`'s tool package ({}): {e}", dir.display())
+            })?;
+            if !package.join("wrela.toml").is_file() {
+                return Err(format!(
+                    "the program `{name}`'s tool package ({}) has no wrela.toml",
+                    dir.display()
+                ));
+            }
+            return Ok(Program::Tool { runner: runner.clone(), package });
+        }
+    };
+    // Absolute, not canonical: a link keeps its name, which a program may go by (`argv[0]`).
+    let absolute = std::path::absolute(&found)
+        .map_err(|e| format!("the program `{name}` ({}): {e}", found.display()))?;
+    Ok(Program::Native(absolute))
 }
 
 /// Whether `name` can name a root or a secret: letters, digits, `_`, `-` and `.`, but not `.`
@@ -176,7 +326,10 @@ impl Caps {
             }
             let opened = Dir::open_ambient_dir(dir, ambient_authority())
                 .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?;
-            roots.insert(name.clone(), Root { dir: opened, write: *write });
+            let path = dir
+                .canonicalize()
+                .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?;
+            roots.insert(name.clone(), Root { dir: opened, path, write: *write });
         }
         let mut secrets: Vec<(String, String)> = Vec::new();
         for name in &grants.secrets {
@@ -191,12 +344,93 @@ impl Caps {
             };
             secrets.push((name.clone(), value));
         }
-        Ok(Caps { roots, secrets })
+        // A host of the network may name its port; a fake site is a name alone.
+        let hosts = |given: &[String], port: bool| -> Result<BTreeSet<String>, String> {
+            given
+                .iter()
+                .map(|h| {
+                    if valid_host(h, port) {
+                        Ok(h.clone())
+                    } else {
+                        Err(format!(
+                            "`{h}` can't name a host: lowercase letters, digits, `-` and `.`, then `:PORT` if it has one"
+                        ))
+                    }
+                })
+                .collect()
+        };
+        let net = hosts(&grants.net, true)?;
+        let fake_net = hosts(&grants.fake_net, false)?;
+        let path = env("PATH").unwrap_or_default();
+        let mut programs = BTreeMap::new();
+        for (name, grant) in &grants.programs {
+            if !valid_name(name) {
+                return Err(format!(
+                    "`{name}` can't name a program: use letters, digits, `_`, `-` and `.`"
+                ));
+            }
+            if programs.contains_key(name) {
+                return Err(format!("the program `{name}` is granted twice"));
+            }
+            let found = find_program(name, grant, &path, grants.tool_runner.as_ref())?;
+            programs.insert(name.clone(), found);
+        }
+        Ok(Caps {
+            roots,
+            secrets,
+            net,
+            fake_net,
+            programs,
+            path,
+            runner: grants.tool_runner.clone(),
+        })
     }
 
     /// The secrets granted, by name, with their values.
     pub(crate) fn secrets(&self) -> &[(String, String)] {
         &self.secrets
+    }
+
+    /// The secret granted as `name`'s value.
+    pub(crate) fn secret(&self, name: &str) -> Option<&str> {
+        self.secrets.iter().find(|(n, _)| n == name).map(|(_, v)| v.as_str())
+    }
+
+    /// Whether `host` is granted (`--net`), and whether as a fake site: `None` if it isn't.
+    pub(crate) fn host(&self, host: &str) -> Option<bool> {
+        if self.fake_net.contains(host) {
+            Some(true)
+        } else {
+            self.net.contains(host).then_some(false)
+        }
+    }
+
+    /// The program granted as `name`.
+    pub(crate) fn program(&self, name: &str) -> Result<&Program, String> {
+        self.programs.get(name).ok_or_else(|| {
+            format!("the program `{name}` isn't granted: `--allow-run {name}` grants it")
+        })
+    }
+
+    /// The `wrela` that launches a supervised program, if there is one.
+    pub(crate) fn runner(&self) -> Option<&std::path::Path> {
+        self.runner.as_deref()
+    }
+
+    /// `PATH` when the grants were opened.
+    pub(crate) fn path_baseline(&self) -> &str {
+        &self.path
+    }
+
+    /// The directory of write root `name`, for a program to work in.
+    pub(crate) fn write_root_dir(&self, name: &str) -> Result<&std::path::Path, String> {
+        match self.roots.get(name) {
+            Some(r) if r.write => Ok(&r.path),
+            Some(_) => Err(format!(
+                "`{name}` is granted for reading only: a program works in a write root"
+            )),
+            None => Err(format!("there's no root `{name}` for a program to work in")),
+        }
     }
 
     /// The root a path names and the path inside it (`None`: the root itself), if the path is
@@ -391,5 +625,34 @@ mod tests {
         assert!(g.parse("--read", "src").is_err());
         assert_eq!(g.parse("--frames", "3"), Ok(false));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hosts_and_programs_are_granted_by_name_and_found_once() {
+        let mut g = Grants::default();
+        for (flag, value) in [
+            ("--net", "game.example"),
+            ("--net", "127.0.0.1:8443"),
+            ("--allow-run", "sh"),
+            ("--allow-run", "shell=/bin/sh"),
+        ] {
+            assert_eq!(g.parse(flag, value), Ok(true), "{flag} {value}");
+        }
+        let caps = Caps::open(&g, |n| (n == "PATH").then(|| "/nowhere:/bin".into())).expect("ok");
+        assert_eq!(caps.host("game.example"), Some(false));
+        assert_eq!(caps.host("127.0.0.1:8443"), Some(false));
+        assert_eq!(caps.host("127.0.0.1"), None, "a host is granted with its port, exactly");
+        let Ok(Program::Native(sh)) = caps.program("sh") else { panic!("sh") };
+        assert_eq!(sh, &PathBuf::from("/bin/sh"), "found on PATH, once");
+        assert!(caps.program("ls").is_err(), "only what's granted");
+        assert_eq!(caps.path_baseline(), "/nowhere:/bin");
+        for bad in ["Game.example", "a..b", "a.example:0", "a.example:99999", "user@a.example"] {
+            let g = Grants::default().net(bad);
+            assert!(Caps::open(&g, |_| None).is_err(), "{bad}");
+        }
+        let missing = Grants::default().program("sh", ProgramGrant::OnPath);
+        assert!(Caps::open(&missing, |_| Some("/nowhere".into())).is_err(), "not on PATH");
+        let tool = Grants::default().program("t", ProgramGrant::Tool(PathBuf::from("/")));
+        assert!(Caps::open(&tool, |_| None).unwrap_err().contains("nothing here runs one"));
     }
 }

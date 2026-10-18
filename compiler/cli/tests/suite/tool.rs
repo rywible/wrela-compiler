@@ -2,6 +2,7 @@
 //! arguments; the process's exit status is the tool's.
 
 use crate::common::{manifest, package, wrela};
+use std::process::Command;
 
 /// A tool that copies the file its first argument names from `in` to `out`, prints its secret's
 /// length, and exits with as many arguments as it was given.
@@ -192,4 +193,364 @@ pub fn tool() -> u32 {
         .expect("kill");
     assert!(sent.success());
     assert_eq!(exit_within(&mut child, bound), Some(130), "the first Ctrl-C ends it");
+}
+
+/// A tool that runs one granted program and prints what it gave: `<program> [--stdin=TEXT]
+/// [--env=NAME=VALUE]... [--secret=NAME]... [--timeout=S] -- [args...]`, in the write root
+/// `work`. It prints the program's standard output, then `status N`; or `error: ...` and exits 1.
+const RUN: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::blob::Data
+use std::tool::run
+
+/// The bytes of `text`.
+fn utf8(text: str) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new()
+    for i in 0..text.len() {
+        out.push(text.byte(i))
+    }
+    out
+}
+
+/// `text` after its first `=`, and before it.
+fn split(text: str) -> (String, String) {
+    for i in 0..text.len() {
+        if text.byte(i) == 61 {
+            return (String::from(text.slice(0, i)), String::from(text.slice(i + 1, text.len())))
+        }
+    }
+    (String::from(text), String::new())
+}
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var c = run::command(given[0].as_str(), "work")
+    var i = 1
+    while i < given.len() {
+        let a = given[i].as_str()
+        i += 1
+        if a == "--" {
+            break
+        }
+        let (flag, value) = split(a)
+        if flag.as_str() == "--stdin" {
+            c.stdin = Data::Bytes(utf8(value.as_str()))
+        } else if flag.as_str() == "--env" {
+            let (name, v) = split(value.as_str())
+            c.env.push(run::Var { name, value: v })
+        } else if flag.as_str() == "--secret" {
+            c.secrets.push(take value)
+        } else if flag.as_str() == "--timeout" {
+            c.timeout = if value.as_str() == "0.5" { 0.5 } else { 30.0 }
+        }
+    }
+    while i < given.len() {
+        c.args.push(given[i].clone())
+        i += 1
+    }
+    var r = run::run(c)
+    var got = r.poll()
+    while got.is_none() {
+        yield
+        got = r.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    match run::read_ran(take polled) {
+        Ok(ran) => {
+            if let Data::Bytes(out) = ran.stdout {
+                if let Some(text) = String::from_utf8(out.clone()) {
+                    print(text.as_str())
+                }
+            }
+            print(f"status {ran.status}")
+            0
+        }
+        Err(e) => {
+            print(f"error: {e.message()}")
+            1
+        }
+    }
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// The package of [`RUN`] and its write root `work`, in a scratch directory named `name`.
+fn run_package(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = package(
+        name,
+        &[("wrela.toml", &manifest("tool_run")), ("main.wrela", RUN), ("work/.keep", "")],
+    );
+    let work = dir.join("work");
+    (dir, work)
+}
+
+/// `wrela tool` on `dir` with the write root `work`, granting each of `programs`.
+fn run_tool(dir: &std::path::Path, work: &std::path::Path, programs: &[&str]) -> Command {
+    let mut c = wrela();
+    c.arg("tool").arg(dir).arg("--write").arg(format!("work={}", work.display()));
+    for p in programs {
+        c.args(["--allow-run", p]);
+    }
+    c
+}
+
+/// Whether a process whose command line has `marker` is still running, after waiting up to 2 s
+/// for one to go.
+fn still_running(marker: &str) -> bool {
+    let started = std::time::Instant::now();
+    loop {
+        let found = Command::new("pgrep").args(["-f", marker]).output().expect("pgrep");
+        if !found.status.success() {
+            return false;
+        }
+        if started.elapsed() > std::time::Duration::from_secs(2) {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn a_granted_program_runs_with_its_arguments_and_input() {
+    let (dir, work) = run_package("tool-run-echo");
+    let out = run_tool(&dir, &work, &["echo"]).args(["--", "echo", "--", "a", "b c"]).output();
+    let out = out.expect("run wrela tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout, "a b c\n\nstatus 0\n");
+    let out = run_tool(&dir, &work, &["cat"])
+        .args(["--", "cat", "--stdin=piped in", "--"])
+        .output()
+        .expect("run wrela tool");
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "piped in\nstatus 0\n");
+    // A program that isn't granted isn't run.
+    let out = run_tool(&dir, &work, &["cat"]).args(["--", "echo", "--"]).output().expect("run");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("isn't granted"));
+    // Nor is one that isn't on PATH.
+    let out = run_tool(&dir, &work, &["no-such-program-wrela"]).args(["--", "x"]).output();
+    let out = out.expect("run");
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("isn't on PATH"));
+}
+
+#[test]
+fn a_program_gets_an_empty_environment_and_its_baseline() {
+    let (dir, work) = run_package("tool-run-env");
+    let path = std::env::var("PATH").expect("PATH");
+    let out = run_tool(&dir, &work, &["env"])
+        .args(["--secret", "WRELA_RUN_TOKEN"])
+        .args(["--", "env", "--env=EXTRA=1", "--secret=WRELA_RUN_TOKEN", "--"])
+        .env("WRELA_RUN_SENTINEL", "leaked")
+        .env("WRELA_RUN_TOKEN", "t0ken")
+        .output()
+        .expect("run wrela tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    let mut names: Vec<&str> =
+        stdout.lines().filter_map(|l| l.split_once('=').map(|(n, _)| n)).collect();
+    names.sort();
+    assert_eq!(names, ["EXTRA", "HOME", "LANG", "PATH", "WRELA_RUN_TOKEN"], "{stdout}");
+    assert!(stdout.contains(&format!("PATH={path}\n")), "{stdout}");
+    assert!(stdout.contains("LANG=C.UTF-8\n") && stdout.contains("WRELA_RUN_TOKEN=t0ken\n"));
+    assert!(!stdout.contains("leaked"), "the parent's environment isn't the program's");
+    let home = stdout.lines().find_map(|l| l.strip_prefix("HOME=")).expect("HOME");
+    assert!(!std::path::Path::new(home).exists(), "the host removes its HOME as the tool ends");
+    // A granted secret goes only to a program whose request names it, and an ungranted one to
+    // none.
+    let out = run_tool(&dir, &work, &["env"])
+        .args(["--secret", "WRELA_RUN_TOKEN", "--", "env", "--"])
+        .env("WRELA_RUN_TOKEN", "t0ken")
+        .output()
+        .expect("run wrela tool");
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("t0ken"));
+    let out = run_tool(&dir, &work, &["env"])
+        .args(["--", "env", "--secret=WRELA_RUN_TOKEN", "--"])
+        .env("WRELA_RUN_TOKEN", "t0ken")
+        .output()
+        .expect("run wrela tool");
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("isn't granted"));
+}
+
+#[test]
+fn a_program_is_the_file_found_when_the_grants_were_opened() {
+    use std::os::unix::fs::PermissionsExt;
+    let (dir, work) = run_package("tool-run-path");
+    let (a, b) = (dir.join("a"), dir.join("b"));
+    for (d, who) in [(&a, "A"), (&b, "B")] {
+        std::fs::create_dir_all(d).expect("mkdir");
+        let script = d.join("hello");
+        std::fs::write(&script, format!("#!/bin/sh\necho {who} \"$PATH\"\n")).expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    // Found on the PATH of `wrela tool`; a PATH the request gives is the program's, but doesn't
+    // change which program runs.
+    let out = run_tool(&dir, &work, &["hello"])
+        .args(["--", "hello", &format!("--env=PATH={}", b.display()), "--"])
+        .env("PATH", format!("{}:/usr/bin:/bin", a.display()))
+        .output()
+        .expect("run wrela tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(stdout, format!("A {}\n\nstatus 0\n", b.display()), "{stdout}");
+    // `NAME=PATH` names the file itself.
+    let out = run_tool(&dir, &work, &[&format!("hello={}", b.join("hello").display())])
+        .args(["--", "hello", "--"])
+        .output()
+        .expect("run wrela tool");
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("B "), "{out:?}");
+}
+
+#[test]
+fn a_deadline_or_the_tools_end_kills_the_programs_whole_process_group() {
+    let (dir, work) = run_package("tool-run-deadline");
+    // Its deadline: the shell and the sleep it started in the background both go.
+    let marker = "sleep 31.4159";
+    let started = std::time::Instant::now();
+    let out = run_tool(&dir, &work, &["sh"])
+        .args(["--", "sh", "--timeout=0.5", "--", "-c", &format!("{marker} & {marker}")])
+        .output()
+        .expect("run wrela tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.contains("ran past its deadline of 0.5 s"), "{stdout}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!still_running(marker), "the program's whole group is killed");
+    // The tool's end, with the program still running: the tool's timeout ends both.
+    let marker = "sleep 27.1828";
+    let started = std::time::Instant::now();
+    let out = run_tool(&dir, &work, &["sh"])
+        .args(["--timeout", "0.5", "--", "sh", "--", "-c", &format!("{marker} & {marker}")])
+        .output()
+        .expect("run wrela tool");
+    assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+    assert!(!still_running(marker), "the tool's end kills the program's group");
+}
+
+/// A tool that fetches the URL it's given, with a deadline of 0.5 s if a second argument says
+/// `short`: it prints the status, or `error: ...` and exits 1.
+const FETCH: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::http
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var request = http::get(given[0].as_str())
+    if given.len() > 1 {
+        request.timeout = 0.5
+    }
+    var f = http::fetch(request)
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    match http::read_response(take polled) {
+        Ok(response) => {
+            print(f"status {response.status}")
+            0
+        }
+        Err(e) => {
+            print(f"error: {e.message()}")
+            1
+        }
+    }
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+#[test]
+fn http_reaches_only_a_granted_host_and_a_stuck_server_holds_up_no_end() {
+    let dir =
+        package("tool-fetch", &[("wrela.toml", &manifest("tool_fetch")), ("main.wrela", FETCH)]);
+    // Refused before any connection: no grant, or not HTTPS.
+    for (url, grant, words) in [
+        ("https://example.com/", None, "isn't granted"),
+        ("https://example.com:444/", Some("example.com"), "isn't granted"),
+        ("http://example.com/", Some("example.com"), "isn't an `https://` URL"),
+    ] {
+        let mut c = wrela();
+        c.arg("tool").arg(&dir);
+        if let Some(g) = grant {
+            c.args(["--net", g]);
+        }
+        let out = c.args(["--", url]).output().expect("run wrela tool");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(out.status.code(), Some(1), "{url}: {stdout}");
+        assert!(stdout.contains(words), "{url}: {stdout}");
+    }
+    // A server that takes the connection and never answers: the request's deadline fails it,
+    // and the tool's timeout ends the tool however long the request would wait.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("its address").port();
+    let held = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        for s in listener.incoming().take(2) {
+            kept.push(s);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    });
+    let host = format!("127.0.0.1:{port}");
+    let url = format!("https://{host}/");
+    let started = std::time::Instant::now();
+    let out = wrela()
+        .arg("tool")
+        .arg(&dir)
+        .args(["--net", &host, "--", &url, "short"])
+        .output()
+        .expect("run wrela tool");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert!(stdout.starts_with("error: "), "{stdout}");
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+    let started = std::time::Instant::now();
+    let out = wrela()
+        .arg("tool")
+        .arg(&dir)
+        .args(["--net", &host, "--timeout", "0.5", "--", &url])
+        .output()
+        .expect("run wrela tool");
+    assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(started.elapsed() < std::time::Duration::from_secs(15), "{:?}", started.elapsed());
+    // A name lookup that stalls past the request's deadline, which no socket cuts, with no
+    // `--timeout`: the host's failure, the grace after the deadline, and the process (with the
+    // client's thread) ends.
+    let started = std::time::Instant::now();
+    let out = wrela()
+        .arg("tool")
+        .arg(&dir)
+        .args(["--net", &host, "--", &url, "short"])
+        .env("WRELA_TESTING_RESOLVE_STALL", "60")
+        .output()
+        .expect("run wrela tool");
+    assert_eq!(out.status.code(), Some(71), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("didn't stop within"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
+    drop(held);
 }

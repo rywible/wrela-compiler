@@ -1,0 +1,48 @@
+// A fake `wrangler` for the tool tests (tests.wrela): `wrangler deploy <dir> <host>` copies
+// `<dir>/index.html` of its write root `scratch` to the fake site's
+// `scratch/sites/<host>/index.html`, prints `deployed <host>`, and exits 0. Anything else exits
+// 2.
+
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, answer, args}
+use std::tool::files
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    if given.len() != 3 || given[0].as_str() != "deploy" {
+        print("usage: wrangler deploy <dir> <host>")
+        return 2
+    }
+    var p = files::read(f"scratch/{given[1].as_str()}/index.html")
+    var got = p.poll()
+    while got.is_none() {
+        yield
+        got = p.poll()
+    }
+    let Some(read) = take got else { return 3 }
+    let Ok(page) = answer(take read) else { return 4 }
+    var w = files::write(f"scratch/sites/{given[2].as_str()}/index.html", page)
+    var wrote = w.poll()
+    while wrote.is_none() {
+        yield
+        wrote = w.poll()
+    }
+    let Some(done) = take wrote else { return 5 }
+    if answer(take done).is_err() {
+        return 6
+    }
+    print(f"deployed {given[2].as_str()}")
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}

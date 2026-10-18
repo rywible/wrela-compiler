@@ -27,6 +27,65 @@ fn blob_body(blob: Blob) -> Writer {
     w
 }
 
+/// Bytes a request carries or an answer gives: in the request or the answer itself, if at most
+/// 512 KiB, or as a blob the host holds (an HTTP body, a program's input or output).
+pub enum Data: Clone {
+    Bytes(Vec<u8>),
+    Blob(Blob),
+}
+
+impl Data {
+    /// No bytes.
+    pub fn empty() -> Data {
+        Data::Bytes(Vec::new())
+    }
+}
+
+/// Writes `data` as the host reads it: 0, a count and the bytes; or 1 and the blob's handle.
+/// More than 512 KiB of bytes panics: put them in a blob.
+pub(package) fn write_data(w: mut Writer, data: Data) {
+    match data {
+        Data::Bytes(b) => {
+            if b.len() > MOST_BYTES {
+                panic("more than 512 KiB of bytes in one request: put them in a blob")
+            }
+            w.write_u8(0)
+            w.write_u32(b.len())
+            for x in b {
+                w.write_u8(x)
+            }
+        },
+        Data::Blob(blob) => {
+            w.write_u8(1)
+            w.write_u32(blob.id)
+        },
+    }
+}
+
+/// Reads data as the host writes it (`write_data`'s layout), or `None` if it doesn't read as
+/// that.
+pub(package) fn read_data(r: mut Reader) -> Option<Data> {
+    match r.read_u8() {
+        Ok(0) => {
+            let Ok(n) = r.read_u32() else { return None }
+            if n > r.left() {
+                return None
+            }
+            var bytes: Vec<u8> = Vec::with_capacity(n)
+            for _ in 0..n {
+                let Ok(x) = r.read_u8() else { return None }
+                bytes.push(x)
+            }
+            Some(Data::Bytes(bytes))
+        },
+        Ok(1) => {
+            let Ok(id) = r.read_u32() else { return None }
+            Some(Data::Blob(Blob { id }))
+        },
+        _ => None,
+    }
+}
+
 /// A new, empty blob: `read_handle` reads the answer.
 @tool
 pub fn new() -> Pending<u8> {
@@ -89,6 +148,20 @@ pub fn read_len(polled: take Result<Vec<u8>, IoError>) -> Result<u64, ToolError>
         return Err(malformed("blob/len"))
     }
     Ok(n)
+}
+
+@test
+fn data_reads_back_as_written() {
+    var w = Writer::new()
+    write_data(mut w, Data::Bytes(Vec::from([u8(7), 8])))
+    write_data(mut w, Data::Blob(Blob { id: 5 }))
+    var r = Reader::new(take w.into_bytes())
+    let Some(Data::Bytes(b)) = read_data(mut r) else { panic("bytes") }
+    assert(b.len() == 2 && b[1] == 8)
+    let Some(Data::Blob(blob)) = read_data(mut r) else { panic("a blob") }
+    assert(blob.id() == 5 && r.at_end())
+    var short = Reader::new(Vec::from([u8(0), 9, 0, 0, 0, 1]))
+    assert(read_data(mut short).is_none(), "fewer bytes than its count")
 }
 
 @test

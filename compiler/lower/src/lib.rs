@@ -67,7 +67,19 @@ pub struct Roots {
     /// Frame tests (§13), each exported as `test.<index>`, with the program's state when it
     /// takes it: a name no wrela function has.
     pub tests: Vec<FnId>,
+    /// Tool tests (§13.2), jobs: each exported as [`TOOL_TEST_INIT`] and [`TOOL_TEST`] with
+    /// `.<index>`, a tool's entries that start and resume it. A tool build with them exports
+    /// neither the program's own `tool_init` and `tool` nor anything else.
+    pub tool_tests: Vec<FnId>,
 }
+
+/// The export, `tool_test_init.<index>`, that starts tool test `index` (§13.2): as `tool_init`,
+/// with no result; the job is kept in the module's data.
+pub const TOOL_TEST_INIT: &str = "tool_test_init";
+
+/// The export, `tool_test.<index>`, that resumes tool test `index`: as `tool`, it returns
+/// `std::tool::RUNNING` while the job yields, then 0 once it has ended.
+pub const TOOL_TEST: &str = "tool_test";
 
 impl Roots {
     /// The default roots: the entry module's public functions; every non-generic entry point
@@ -100,7 +112,7 @@ impl Roots {
                 gpu_checks.push((id, substs));
             }
         }
-        Roots { exports, gpu_checks, also: Vec::new(), tests: Vec::new() }
+        Roots { exports, gpu_checks, also: Vec::new(), tests: Vec::new(), tool_tests: Vec::new() }
     }
 
     /// [`Roots::of`], and every other function of the package that can be lowered on its own:
@@ -391,7 +403,8 @@ fn lower_in(
     }
     // The program's state (§15): what `init` returns (a server's `serve_init`, a tool's
     // `tool_init`), which the other exports take first.
-    let state = state_type(checked, data.role);
+    // A tool build for tool tests keeps their jobs as its state (§13.2), not `tool_init`'s.
+    let state = if roots.tool_tests.is_empty() { state_type(checked, data.role) } else { None };
     if let Some((init, s)) = state {
         let span = checked.program.func(init).sig_span;
         if let Some(t) = cx.lower_ty(&mut cpu, s, span) {
@@ -399,7 +412,10 @@ fn lower_in(
             cpu.m.state = Some(cpu.m.add_data(ir::Data { name: "state".into(), ty: t, value }));
         }
     }
-    for &f in &roots.exports {
+    // A tool build for tool tests has their entries alone (§13.2).
+    let exports: &[FnId] = if roots.tool_tests.is_empty() { &roots.exports } else { &[] };
+    tool_test_entries(&mut cx, &mut cpu, &roots.tool_tests);
+    for &f in exports {
         // A `@testing` export is a test build's only (§9).
         if checked.program.func(f).attrs.testing.is_some() && !data.testing {
             continue;
@@ -1259,6 +1275,59 @@ fn add_wrapper(
     }
     w.body = body;
     mb.m.add_function(w)
+}
+
+/// The tool tests' entries (§13.2), the jobs `tests`. The module's state is a struct of their
+/// jobs, a field each. Test `i`'s `tool_test_init.<i>` stores its job's start in its field (a
+/// job of no parameters starts as zeros), and `tool_test.<i>` resumes it there and returns
+/// `std::tool::RUNNING` if it yielded, else 0.
+fn tool_test_entries(cx: &mut Cx, mb: &mut ModuleBuilder, tests: &[FnId]) {
+    if tests.is_empty() {
+        return;
+    }
+    let mut jobs = Vec::new();
+    for &f in tests {
+        let resume = cx.instance(mb, InstanceKey::JobResume { func: f, substs: Vec::new() }, None);
+        let Some(layout) = cx.job_layout(mb, f, &[]) else { return };
+        let Some(step) = mb.m.functions[resume.index()].ret else { return };
+        jobs.push((resume, layout.ty, step));
+    }
+    let fields = jobs.iter().enumerate().map(|(i, j)| (format!("test_{i}"), j.1)).collect();
+    let ty = mb.m.types.intern(ir::TypeDef::Struct { name: "ToolTests".into(), fields });
+    let value = eval::zero(&mb.m.types, ty);
+    let data = mb.m.add_data(ir::Data { name: "state".into(), ty, value });
+    mb.m.state = Some(data);
+    let u32_ty = mb.m.types.u32();
+    let bool_ty = mb.m.types.bool();
+    for (i, (resume, job, step)) in jobs.into_iter().enumerate() {
+        let at = ir::Place::root(ir::PlaceRoot::Data(data)).with(ir::Proj::Field(i as u32));
+        let mut init = ir::Function::new(format!("{TOOL_TEST_INIT}_{i}"), Vec::new(), None);
+        let mut body = Vec::new();
+        let zero = init.let_(&mut body, job, ir::Expr::Zero(job));
+        body.push(ir::Stmt::Store(at.clone(), zero));
+        body.push(ir::Stmt::Return(None));
+        init.body = body;
+        let init = mb.m.add_function(init);
+        let mut tool = ir::Function::new(format!("{TOOL_TEST}_{i}"), Vec::new(), Some(u32_ty));
+        let mut body = Vec::new();
+        let call = ir::Expr::Call(resume, vec![ir::Arg::Place(at)]);
+        let stepped = tool.let_(&mut body, step, call);
+        let tag = tool.let_(&mut body, u32_ty, ir::Expr::Extract(stepped, 0));
+        // `Step::Yielded` is the first variant.
+        let yielded = ir::Expr::Const(ir::Const::U32(mb.m.types.tag(step, 0)));
+        let yielded = tool.let_(&mut body, u32_ty, yielded);
+        let running = tool.let_(&mut body, bool_ty, ir::Expr::Binary(ir::BinOp::Eq, tag, yielded));
+        let more = ir::Expr::Const(ir::Const::U32(wrela_abi::TOOL_RUNNING));
+        let more = tool.let_(&mut body, u32_ty, more);
+        let done = tool.let_(&mut body, u32_ty, ir::Expr::Const(ir::Const::U32(0)));
+        let select = ir::Expr::Select { cond: running, if_true: more, if_false: done };
+        let status = tool.let_(&mut body, u32_ty, select);
+        body.push(ir::Stmt::Return(Some(status)));
+        tool.body = body;
+        let tool = mb.m.add_function(tool);
+        mb.m.exports.push((format!("{TOOL_TEST_INIT}.{i}"), init));
+        mb.m.exports.push((format!("{TOOL_TEST}.{i}"), tool));
+    }
 }
 
 /// An export that runs `inner` on the program's state, in data `state`: with `init`, it stores

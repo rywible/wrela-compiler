@@ -27,6 +27,7 @@ pub mod script;
 pub mod serve;
 pub mod shipped;
 pub mod studio;
+pub mod tool_tests;
 pub mod workspace;
 
 /// std's modules: each one's path and source.
@@ -492,9 +493,12 @@ fn run_tests(
             return Err(tests.len());
         }
         filtered_out = all - tests.len();
-        // Tests of code run as constants are computed; frame tests run the program first.
+        // Tests of code run as constants are computed; frame tests run the program first, and
+        // tool tests run on the tool host, each in a process of its own.
+        let (tools, rest): (Vec<_>, Vec<_>) =
+            tests.iter().partition(|&&f| p.func(f).attrs.test_tool.is_some());
         let (framed, plain): (Vec<_>, Vec<_>) =
-            tests.iter().partition(|&&f| p.func(f).attrs.test_run.is_some());
+            rest.iter().partition(|&&f| p.func(f).attrs.test_run.is_some());
         let mut ran = Vec::new();
         if !plain.is_empty() {
             let (r, d) = consts::run_tests(&checked, &sources, &data, &plain, fuel);
@@ -503,6 +507,11 @@ fn run_tests(
         }
         if !framed.is_empty() && !has_errors(&diagnostics) {
             let (r, d) = frames::run(&checked, &sources, &data, &framed, root, fuel, bless);
+            ran.extend(r);
+            diagnostics.extend(d);
+        }
+        if !tools.is_empty() && !has_errors(&diagnostics) {
+            let (r, d) = tool_tests::run(&checked, &sources, &mut data, &tools, root);
             ran.extend(r);
             diagnostics.extend(d);
         }

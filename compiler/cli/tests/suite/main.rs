@@ -13,4 +13,5 @@ mod solve;
 mod studio;
 mod test;
 mod tool;
+mod tool_tests;
 mod trace;

@@ -1036,7 +1036,7 @@ All attributes except `@diagnostic`, `@intrinsic` and `@fuel` are part of a type
 | `@diagnostic(...)` | traits, types | An error message written by a library. It isn't part of the type. |
 | `@audio` | functions, function types | Code that the audio thread runs (§16.4) |
 | `@job` | functions | A job: a function whose body runs over several frames, to each `yield` (§16.3) |
-| `@test`, `@test(frames: n)` | functions | A test. `wrela test` runs it as the build runs constants, or after `n` of the program's frames (§13.2). With `gpu: true` it runs on the GPU, and with `golden: "frame.png"` it compares its screen with a PNG. |
+| `@test`, `@test(frames: n)`, `@test(tool)` | functions | A test. `wrela test` runs it as the build runs constants, or after `n` of the program's frames (§13.2). With `gpu: true` it runs on the GPU, and with `golden: "frame.png"` it compares its screen with a PNG. `@test(tool)` goes on a `@job fn`, which runs on the package's tool build. |
 | `@fuel(n)` | constants, tests of code | The work that the build may do to compute the constant or run the test (§13.1) |
 | `@client`, `@server`, `@tool` | functions | Only that role's build may run the function (§15.3). Reaching it from another role's entries is E0708. A function has one role (E0204). |
 | `@testing` | exports | An export that only a test build has. See below. |
@@ -1247,7 +1247,7 @@ A test is a function marked `@test`, which `wrela test` runs the same way that t
   - The tests of the package's dependencies don't run.
 - **A test runs as a constant is computed:** compiled to WASM with every function it calls, with a constant's effects (§8.3). Each test runs on new memory, so one test can't change what another sees.
 - **Tests are built as a debug build is** (§11.3). `debug_build()` is true, and a float operation that makes a NaN from operands that hold none fails the test.
-- **A test's fuel limit is 2³⁷ units,** eight times a constant's: a few seconds of work, so a test can step a simulation for a while. A test of code may set its own, as a constant does: `@fuel(2 ** 40)` on the `@test`, for a check that does more work. On a frame test, `@fuel` is E0108, since each call of a frame test gets a test's fuel.
+- **A test's fuel limit is 2³⁷ units,** eight times a constant's: a few seconds of work, so a test can step a simulation for a while. A test of code may set its own, as a constant does: `@fuel(2 ** 40)` on the `@test`, for a check that does more work. On a frame test, `@fuel` is E0108, since each call of a frame test gets a test's fuel. On a tool test it is E0108 too: a tool test has a budget of time instead.
 - **A test passes unless it panics,** and a failed `assert` panics.
   - A panic or a trap is E0706, at the innermost frame in the program's own code, with the call chain.
   - Past the fuel limit is E0705.
@@ -1289,6 +1289,49 @@ pub const PEN: Script = Script::frames()
   - `wrela test --bless` first writes each golden it runs from this machine's screen. A test whose golden is missing fails, and says so.
   - A golden or `within` anywhere else is E0222: on a CPU frame test, on a tick test, or `within` with no golden.
   - A failure says how far the screen is from the golden, the largest difference in one channel, and how many channels differ.
+
+#### Tool tests
+
+A tool test checks a tool (§15.5) with fakes for what the tool reaches: its files, sites and programs. `@test(tool)` goes on a `@job fn` of a package that has a tool build.
+
+```text
+use std::tool::http
+use std::tool::run
+
+@test(tool, net: ["game.example"], run: [("wrangler", "fakes/wrangler")], budget: 30)
+@job
+fn deploys_the_release() {
+    var r = run::run(run::command("wrangler", "scratch"))
+    while r.poll().is_none() { yield }
+    var f = http::fetch(http::get("https://game.example/"))
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { panic("no answer") }
+    let Ok(response) = http::read_response(take polled) else { panic("no response") }
+    assert(response.status == 200)
+}
+```
+
+- **The spelling is `@test(tool, ...)`.** A tool test is a test, and `tool` chooses how it runs, as `frames: n` does. So `wrela test` runs it, a filter chooses it, and `tools/check.sh wrela::<package>::<name>` runs exactly it.
+- **A tool test is a free `@job fn` with no parameters and no result,** of a package whose main.wrela exports `tool`. A tool test of another function, or in a package with no tool build, is E0222. A test of code can't be a job (E0336), and keeps a constant's effects; a tool test has a tool's.
+- **Its options are named:** `budget: s`, the seconds that the run may take (more than 0, at most 600; 10 if the test doesn't say); `net: ["host", ...]`, the fake sites that it reaches; and `run: [("name", "dir"), ...]`, the programs that it may run. Any other option, or a value of the wrong kind, is E0222.
+- **`wrela test` builds the package's tool build with the tests' jobs as its entries,** in place of `tool_init` and `tool`. It runs each test in a `wrela` process of its own (`wrela tool --test`), which leads a process group of its own.
+- **`wrela test` owns every process group that a test starts.** Each program that the test runs leads a group of its own, and the test's host records each group; a `tool:` program's host records its own programs' groups in the same place. A program starts in its host's group (through `wrela tool --launch`) and takes its own only once its group is recorded, so no group of a test's is ever unknown. If the test's host can't end them itself (it still runs 10 s after its budget, it is stopped, or it ends without saying how), `wrela test` stops its group, then stops and kills every recorded group, then kills the host's. Ctrl-C on `wrela test` does the same for every test that is running, then ends `wrela test` with status 130. So the run always ends, and nothing that a test started outlives it.
+- **Each test's run has only what its attribute gives:**
+  - a new, empty write root, `scratch`, which another test never sees;
+  - its budget, as the run's timeout;
+  - a fake clock;
+  - its `net` hosts, as fake sites;
+  - its `run` programs, as tool packages.
+
+  It has no other root, no secret and no network.
+- **The fake clock moves only when the test waits on the clock alone.** It starts at 2026-01-01T00:00:00Z. After a call, if every request outstanding is answered by the clock (a timer, or a fake site's delay), the clock jumps to the soonest, and the timers fire in the order of their deadlines (the order made, for equal ones). While a file, a read of a fake site or a program is in progress, the clock waits. `time::utc_now` reads the fake date, and `std::tool::testing::set_utc` sets it. So a test that waits an hour takes no time.
+- **A fake site serves files from the test's scratch:** `https://<host>/<path>` is `scratch/sites/<host>/<path>`. A path that ends in `/` is its `index.html`. A `GET` or `HEAD` of a file that isn't there is a 404, and another method is a 405. `std::tool::testing::fake(url, f)` changes what the site answers for one URL: `Status(n)`, `Missing`, `Bytes(b)` or `Delay(s)`, a delay in fake seconds. `Clear` takes them back. A fake site keeps a real site's limits: a delay past the request's `timeout` fails the request at the timeout, on the fake clock, and a body is at most 256 MiB.
+- **A fake program is a tool package in the test's package:** `run: [("wrangler", "fakes/wrangler")]` grants `wrangler` as the tool build of the package in `fakes/wrangler` (`--allow-run wrangler=tool:DIR`, §15.5). So no fake is written in another language. It runs in a process of its own, on the system's clock.
+- **A tool test passes if its job ends.** It fails if it panics, if a failed `assert` panics, if it traps, if its budget runs out, or if the host fails. Each failure is E0706, with the host's reason. What it prints is the test's output (`printed` in `wrela test --json`).
 
 #### An example
 
@@ -1505,6 +1548,7 @@ A tool is a program for the work around a program: builds, captures, releases, c
 
 ```text
 wrela tool <package> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
+           [--net HOST[:PORT]]... [--allow-run NAME[=PATH|=tool:DIR]]...
            [--timeout S] [--blob-budget B] [-- args...]
 ```
 
@@ -1516,7 +1560,7 @@ wrela tool <package> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME].
 - `--timeout` is a budget for the whole run (status 124); a time that the clock cannot reach is a usage error (status 2). Ctrl-C stops the tool, also inside a call (status 130). A trap, or a status that is not `RUNNING` or 0 to 255, gives status 70. If the host cannot run the tool, or cannot stop it (it cannot take Ctrl-C, or cannot start the thread that interrupts calls), the status is 71, and no Wasm runs.
 - `print` never waits either. The host puts each line on a queue (at most 1024 lines and 4 MiB), and a thread of its own writes them out. A line that finds the queue full is dropped, and the host prints how many it dropped when the console takes lines again. When the tool ends, the console has the same grace as the workers to take what is queued; lines it does not take are dropped. So a console that nobody reads, such as a full pipe, cannot stop `--timeout` or Ctrl-C, and the host's last message cannot hold up the end.
 - Services run on the host's worker threads, so a call never waits for one. An answer reaches the tool no sooner than its next call, as on every host (§17.1).
-- However the tool ends, the host stops its workers and releases all that the tool held. Work that has not started is dropped, and work in progress has a grace of 5 s. If a worker is still running after the grace, the run is the host's failure (status 71), whatever the tool's own end was, and `wrela tool` ends the process, so no work outlives it. No file work holds the lock on the tool's blobs, so their release never waits on a file.
+- However the tool ends, the host stops its workers and releases all that the tool held. Work that has not started is dropped, and work in progress has a grace of 5 s. A worker that waits for a program kills the program's process group, and one that waits for an HTTP response shuts its connection down and waits for its client's thread. If a worker is still running after the grace, the run is the host's failure (status 71), whatever the tool's own end was, and `wrela tool` ends the process, so no work outlives it. No file work holds the lock on the tool's blobs, so their release never waits on a file.
 - A resource that a request makes belongs to that request until the tool reads the answer. If the tool ends first, the host releases it with the rest. The host keeps no compiled code from one run to the next.
 
 **A tool is a job.** std has no executor. A tool's work is a `@job fn` that `tool_init` starts and `tool` resumes (§16.3), and the job waits for a request with `yield`. `while p.poll().is_none() { yield }` waits for an answer that the tool does not read, such as a timer's. To read the answer, keep what `poll` gives:
@@ -1563,13 +1607,25 @@ pub fn tool(job: mut Job<main>) -> u32 {
 - A path is `NAME/relative/path`, with `/` between its parts and no part empty, `.` or `..`. `NAME` alone is the root itself. The host opens each path relative to its root's directory handle, one part at a time. So no path or symbolic link leaves the root, also a link that replaces a directory after a check.
 - The host opens a file without waiting on it, and the opened handle must be a regular file. A FIFO, a socket or a device fails the request at once, by the type of the handle, not of the path.
 - `--secret NAME` reads the environment variable `NAME` when the tool starts. `std::tool::secret(name)` gives it, and gives `None` for a name that is not granted. The host never shows a secret.
+- `--net HOST` grants a host to `std::tool::http`, over HTTPS. The URL's host must be the grant exactly: `--net HOST:PORT` grants that port, and a URL with a user is refused.
+- `--allow-run NAME` grants the program `NAME` to `std::tool::run`. The host finds it on `PATH` when the grants are opened and keeps its absolute path, so a later change to `PATH` does not change which file runs. `--allow-run NAME=PATH` names the file itself. `--allow-run NAME=tool:DIR` names the tool build of the package at `DIR`, which this `wrela` runs as `wrela tool`.
+- **A granted program has the user's authority.** It runs natively, as any process does: it can reach what the user can, and `npx` runs code that it downloads. Its working directory is where it starts, not a confinement. Grant only the programs that the tool needs.
 
 **The services** are `std::tool`'s, and each is `@tool`:
 - `args()`, the arguments after `--`, and `secret(name)`. The host gives both when it starts the tool, as the bytes that `kept` reads (`runtime/abi`), so neither is a request.
 - `files`: `read(path)` and `write(path, bytes)` for whole files of at most 512 KiB (`write` makes the directories it needs). `list(dir)` gives each entry's name, kind and size, and `stat(path)` the kind and size. `remove(path)` removes a file, a link or an empty directory, and `remove_all(dir)` a tree; both need a write root and never remove a root. `make_dirs(path)`. `read_blob(path)` and `write_blob(path, blob)` move a file of any size.
 - `blob`: bytes that the host holds for the tool. `new()`, `append(b, bytes)` and `read(b, offset, len)` move at most 512 KiB at a time; `len(b)`; `release(b)`. While `write_blob` writes a blob, an append to it or its release fails, so its bytes stay counted. A tool holds at most 2 GiB in at most 4096 blobs. `--blob-budget` changes this: `64M` for bytes, or `2G,16` for bytes and handles. A request past the budget fails, as other requests fail. The host releases every blob when the tool ends.
 - `time`: `after(seconds)`, a timer, and `utc_now()`, the seconds and nanoseconds since 1970. Both are requests, so a tool that waits for a timer has a request outstanding.
-- The first byte of each answer tells whether the service succeeded. `std::tool::answer(polled)` gives the answer's bytes, or a `ToolError` with the host's reason. `files::read_list`, `files::read_entry`, `blob::read_handle`, `blob::read_len` and `time::read_utc` read the other answers. Each request is smaller than the 1 MiB command buffer.
+- `http`: `fetch(Request { method, url, headers, body, timeout })` gives a `Response { status, headers, body }` (`read_response`). Only `https://` URLs reach a host, and only a granted host. The tool can't set the `Host` header, or another that names where the request goes or how its body is framed (`Content-Length`, `Transfer-Encoding`, `Connection`, a name starting with `:`): such a request fails, so the grant is the host that the request reaches. The host follows no redirect: the tool gets the response, with its `location` header. A body over 512 KiB is a blob (`blob::Data`), in both directions, and a response's body is at most 256 MiB. A request has a deadline of 30 s, or the `timeout` that it gives, at most 600 s.
+  - The host makes the connection, and keeps a handle to its socket. Past the deadline, or when the tool ends, it shuts the socket down, so the client returns, and it waits for the client's thread before it answers. A client that still hasn't returned the grace after it was cancelled (a name lookup, which no socket cuts) ends the run at once as the host's failure (status 71), with or without `--timeout`. No connection or thread of a request outlives the run.
+- `run`: `run(Command { program, args, stdin, env, secrets, cwd, timeout })` runs a granted program, and gives a `Ran { status, stdout, stderr }` (`read_ran`). There is no shell. `cwd` names a write root, where the program starts. Its input and outputs are bytes, or blobs over 512 KiB, and each output is at most 256 MiB. The status is the exit code, or minus the signal that ended the program.
+  - The program gets an empty environment and a fixed baseline: `PATH` as it was when the grants were opened, `HOME` a directory that the host owns for the run (and removes at its end), and `LANG=C.UTF-8`. Then it gets the request's `env`, and the granted secrets that the request names in `secrets`, each as a variable of its name.
+  - The program leads a process group of its own. The host kills the whole group when the program ends (so nothing that it started outlives it), past its deadline (60 s, or the `timeout` that it gives, at most 600 s), past 256 MiB of output, and when the tool ends.
+  - A `tool:` program runs as `wrela tool <DIR>`, with the request's `cwd` as its one write root (by the same name), its arguments, its named secrets, and the deadline as its `--timeout`.
+- **Deadlines count from the request.** A request's deadline starts when the host takes it, after the call that makes it. Work that is still queued at its deadline (every worker is busy) fails without starting, and work that starts later has only what is left. HTTP and programs wait on their own workers, apart from the workers for files and blobs, so a slow network or program never holds up a file.
+- **Bytes are charged as they arrive.** A response's body, or a program's output, goes into the answer a chunk at a time, charged to the blob budget as each chunk is read. Past the budget, or past 256 MiB, the request fails at once, without reading the rest. A request that fails gives back every blob made for it, and the host removes the files it used.
+- `testing`: a tool test's fakes (§13.2): `fake(url, f)` for a fake site's URL, and `set_utc(date)` for the fake clock. Outside a tool test, these requests fail.
+- The first byte of each answer tells whether the service succeeded. `std::tool::answer(polled)` gives the answer's bytes, or a `ToolError` with the host's reason. `files::read_list`, `files::read_entry`, `blob::read_handle`, `blob::read_len`, `time::read_utc`, `http::read_response` and `run::read_ran` read the other answers. Each request is smaller than the 1 MiB command buffer.
 - A tool makes requests to these services only. Storage, fetches and posts (`std::io`) are a client's: the tool host fails the call that makes one.
 
 ## 16. Concurrency
@@ -2352,6 +2408,7 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::units` | Suffix constants in SI: `km`, `m`, `cm`, `mm`, `um`, `t`, `kg`, `g`, `mg`, `h`, `s`, `ms`, `us`, `rad`, `deg`, `Hz`, `kHz`, `N`, `J`, `W`, `Pa`, `kPa` (§5) |
 | `std::math` | The transcendentals for CPU code, compiled to WASM (§11.1); `PI`, `TAU` and `is_finite` |
 | `std::hash` | `StateHash` (`@fieldwise`), `Hasher`, `state_hash` (§6.11) |
+| `std::hash::sha256` | SHA-256 (FIPS 180-4): `Sha256`, a digest made a run of bytes at a time (`update`, `finish`), so a blob is hashed a chunk at a time; `sha256(bytes)`; `hex(bytes)` |
 | `std::serialize` | `Serialize` (`@fieldwise`), `Writer`, `Reader`, `save`, `load`, `LoadError` (§6.11) |
 | `std::field` | `Surface`, `Field<C>`, `Noise`, `Blend`, `Color`, `UnitVec3`, `Cat<T>`. Primitives: `sphere`, `ellipsoid`, `round_cone`, `cuboid`, `half_space`. Forms: `oval`, `tube`. Combinators: `union`, `smooth_union`, `intersect`, `translate`, `displace`, `with`, and `union` and `smooth_union` of an array. Noise: `value_noise`, `fbm`. Provenance: `parts`, `part_at`, `part_distance`, `part_name`, `part_offset`, `named`, `mirror_x`, `PartName`, `part_share`. Certified checks: `certify_positive`, `certify_clear`, `certify_apart`, `Certified`. Measures: `hit`, `top`, `bottom`, `width`, `front`, `back`, `farthest`, `part_named` (§23.7) |
 | `std::quat` | `Quat`: rotations as unit quaternions, on the CPU and the GPU |
@@ -2361,8 +2418,11 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::io` | `load`, `store`, `fetch` and `post`, polled through `Pending<T>`; `print` (§17.1, §17.3) |
 | `std::tool` | A tool's start and its services' answers (§15.5): `RUNNING`, `args`, `secret`, `answer` and `ToolError` |
 | `std::tool::files` | A tool's files in its granted roots: `read`, `write`, `list`, `stat`, `remove`, `remove_all`, `make_dirs`, `read_blob`, `write_blob`; `Entry`, `Kind`, `read_list`, `read_entry` |
-| `std::tool::blob` | Bytes the tool host holds for a tool: `Blob`, `new`, `append`, `read`, `len`, `release`, `read_handle`, `read_len` |
+| `std::tool::blob` | Bytes the tool host holds for a tool: `Blob`, `new`, `append`, `read`, `len`, `release`, `read_handle`, `read_len`; `Data`, bytes or a blob, which `http` and `run` carry |
 | `std::tool::time` | A tool's timer and the date: `after`, `utc_now`, `Utc`, `read_utc` |
+| `std::tool::http` | HTTPS to a granted host: `fetch`, `get`, `Request`, `Response`, `Header`, `read_response` |
+| `std::tool::run` | A granted program: `run`, `command`, `Command`, `Var`, `Ran`, `read_ran` |
+| `std::tool::testing` | A tool test's fakes (§13.2): `fake`, `Fake`, `set_utc` |
 | `std::host` | A client's application services, each a request: `environment`, `decode_image`, `cursor`, `icon`, embedded programs (`open`, `wait_ready`, `show`, `send`, `receive`, `reply`, `wait_closed`, `close`), files (`import_file`, `export_file`), the clipboard (`offer`, `copy`, `pasted`), text input, `publish` (the semantic tree), the page's address and links; and their answers read: `read_environment` (`Environment`), `read_surface`, `read_call` (`Call`), `read_pasted`, `read_glyph` (`GlyphImage`) (§17.1) |
 | `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, `payload` (a message's bytes), `Input`, the keys and buttons held (§17.2), and `Script`, a script of input events for a frame test (§13.2) |
 | `std::semantics` | A program's semantic tree, which a host shows as real elements: `Node`, `Role`, `Field`, `FieldKind`; `structure`, `geometry` and `clip`, the tree's bytes; `changes`, the part of the tree to send since `Sent`; `steps`, a slider's step from an `Assist`; `FieldState` and `read_field_state`, a field's text as the host has it (§17.2) |
@@ -2931,7 +2991,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `err.try` | `x?` returns a `None` or an `Err` from a function that returns the same kind | §10.1 |
 | `gpu.uniformity` | Derivatives only where every pixel reaches them, in uniform control flow | §11.4 |
 | `const.fuel` | `@fuel(n)` on a `const` or a test sets the work it may do, its threads' together | §13.1 |
-| `const.tests` | A `@test` is a free function of no parameters and no result, run as constants are | §13.2 |
+| `const.tests` | A `@test` is a free function of no parameters and no result, run as constants are; a tool test is such a `@job fn`, run on the tool host | §13.2 |
 | `derive.gradient` | `gradient` of a closure or function of an `f32` or a float vector | §14.2 |
 | `derive.interval` | `interval` over a box, of a function whose loops don't depend on its input | §14.2 |
 | `gpu.roles` | A client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool_init` and `tool`, and `@client`, `@server` and `@tool` code stays in its role | §15.3 |

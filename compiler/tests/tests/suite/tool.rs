@@ -759,3 +759,300 @@ pub fn tool(job: mut Job<main>) -> u32 {
     assert_eq!(ended.end.status(), 71);
     assert!(lines.lock().expect("the lines").is_empty(), "no Wasm ran");
 }
+
+const ROLLBACK: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, answer}
+use std::tool::blob
+use std::tool::run
+
+@job
+fn main() -> u32 {
+    // Its standard output fits the budget, as a blob; its standard error doesn't.
+    var c = run::command("sh", "out")
+    c.args.push(String::from("-c"))
+    c.args.push(String::from("/usr/bin/head -c 614400 /dev/zero; /usr/bin/head -c 614400 /dev/zero >&2"))
+    var r = run::run(c)
+    var got = r.poll()
+    while got.is_none() {
+        yield
+        got = r.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    match run::read_ran(take polled) {
+        Ok(_) => print("ran"),
+        Err(e) => print(f"failed: {e.message()}"),
+    }
+    print("after the failure")
+    // The whole budget is free again.
+    var nb = blob::new()
+    var made = nb.poll()
+    while made.is_none() {
+        yield
+        made = nb.poll()
+    }
+    let Some(m) = take made else { return 91 }
+    let Ok(b) = blob::read_handle(take m) else { return 92 }
+    for _ in 0..2 {
+        var ap = blob::append(b, Vec::filled(524288, u8(1)))
+        var app = ap.poll()
+        while app.is_none() {
+            yield
+            app = ap.poll()
+        }
+        let Some(a) = take app else { return 93 }
+        if answer(take a).is_err() {
+            print("the budget wasn't given back")
+            return 1
+        }
+    }
+    0
+}
+"#;
+
+#[test]
+fn a_request_that_fails_part_way_gives_back_its_blobs_and_files() {
+    let build = tool_build("rollback", &format!("{ROLLBACK}{ENTRIES}"));
+    let root = scratch("rollback");
+    let (out, work) = (root.join("out"), root.join("work"));
+    std::fs::create_dir_all(&out).expect("out");
+    let grants = Grants::default()
+        .root("out", &out, true)
+        .program("sh", wrela_host::tool::ProgramGrant::At("/bin/sh".into()));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (dir, kept) = (work.clone(), seen.clone());
+    // What the run's directory holds once the request has failed, the tool still running.
+    let (lines, mut options) = printer(move |line| {
+        if line == "after the failure" {
+            let mut names: Vec<String> = std::fs::read_dir(&dir)
+                .map(|d| {
+                    d.filter_map(|e| e.ok())
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            *kept.lock().expect("seen") = names;
+        }
+    });
+    options.caps = Caps::open(&grants, |_| None).expect("granted");
+    options.blob_budget = BlobBudget { bytes: 1 << 20, handles: 8 };
+    options.testing = Testing { work_dir: Some(work), ..Testing::default() };
+    let ended = run(&build, options);
+    let lines = lines.lock().expect("the lines").clone();
+    assert_eq!(ended.end, End::Exit(0), "{lines:?}");
+    assert!(lines[0].starts_with("failed: ") && lines[0].contains("budget"), "{lines:?}");
+    assert_eq!(*seen.lock().expect("seen"), ["home"], "the request's files are gone");
+    assert_eq!(ended.blobs_released, (1, 1 << 20), "only the blob the tool made after");
+}
+
+const STARVE: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::RUNNING
+use std::tool::files
+use std::tool::run
+
+@job
+fn main() -> u32 {
+    // Four programs fill the long waits' workers; a fifth queues behind them past its deadline.
+    var waits: Vec<std::io::Pending<u8>> = Vec::new()
+    for i in 0..5 {
+        var c = run::command("sleep", "out")
+        c.args.push(String::from(if i < 4 { "2" } else { "0" }))
+        if i == 4 {
+            c.timeout = 1.0
+        }
+        waits.push(run::run(c))
+    }
+    // A file isn't held up by them.
+    let asked = std::time::now()
+    var s = files::stat("out")
+    while s.poll().is_none() { yield }
+    if std::time::since(asked) < 1.0 {
+        print("the file was answered at once")
+    }
+    var answered: Vec<Option<Result<run::Ran, std::tool::ToolError>>> = Vec::new()
+    for _ in 0..5 {
+        answered.push(None)
+    }
+    var left = 5
+    while left > 0 {
+        for i in 0..5 {
+            if answered[i].is_none() {
+                if let Some(polled) = waits[i].poll() {
+                    answered[i] = Some(run::read_ran(take polled))
+                    left -= 1
+                }
+            }
+        }
+        if left > 0 {
+            yield
+        }
+    }
+    for i in 0..5 {
+        if let Some(a) = replace(mut answered[i], None) {
+            match a {
+                Ok(ran) => print(f"{i}: status {ran.status}"),
+                Err(e) => print(f"{i}: {e.message()}"),
+            }
+        }
+    }
+    0
+}
+"#;
+
+#[test]
+fn long_waits_hold_up_no_file_and_a_deadline_counts_from_the_request() {
+    let build = tool_build("starve", &format!("{STARVE}{ENTRIES}"));
+    let out = scratch("starve");
+    let grants = Grants::default()
+        .root("out", &out, true)
+        .program("sleep", wrela_host::tool::ProgramGrant::OnPath);
+    let (lines, mut options) = printer(|_| {});
+    options.caps =
+        Caps::open(&grants, |n| (n == "PATH").then(|| "/bin:/usr/bin".into())).expect("granted");
+    let ended = run(&build, options);
+    let lines = lines.lock().expect("the lines").clone();
+    assert_eq!(ended.end, End::Exit(0), "{lines:?}");
+    assert_eq!(lines[0], "the file was answered at once", "{lines:?}");
+    for i in 0..4 {
+        assert_eq!(lines[1 + i], format!("{i}: status 0"), "{lines:?}");
+    }
+    assert_eq!(lines[5], "4: `sleep` didn't start within its deadline of 1 s", "{lines:?}");
+}
+
+const FETCH_ONE: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::http
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var request = http::get(given[0].as_str())
+    request.timeout = if given.len() > 1 { 0.3 } else { 60.0 }
+    var f = http::fetch(request)
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    match http::read_response(take polled) {
+        Ok(r) => print(f"status {r.status}"),
+        Err(e) => print(f"error: {e.message()}"),
+    }
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+#[test]
+fn the_tools_end_closes_a_connection_that_waits_and_a_stuck_one_is_the_hosts_failure() {
+    use std::io::Read;
+    let build = tool_build("fetch-one", FETCH_ONE);
+    // A server that takes the connection and never answers: it reports when the client closes.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port");
+    let port = listener.local_addr().expect("its address").port();
+    let (closed, when) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut s, _)) = listener.accept() {
+            let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = s.read(&mut buf) {
+                if n == 0 {
+                    let _ = closed.send(Instant::now());
+                    return;
+                }
+            }
+        }
+    });
+    let host = format!("127.0.0.1:{port}");
+    let (_, mut options) = printer(|_| {});
+    options.caps = Caps::open(&Grants::default().net(&host), |_| None).expect("granted");
+    options.args = vec![format!("https://{host}/")];
+    options.timeout = Some(Duration::from_millis(500));
+    let started = Instant::now();
+    let ended = run(&build, options);
+    let returned = Instant::now();
+    assert_eq!(ended.end, End::Timeout, "a clean end at the timeout, not a host's failure");
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    let closed = when.recv_timeout(Duration::from_secs(5)).expect("the connection was closed");
+    assert!(closed <= returned + Duration::from_millis(50), "closed before the run returned");
+
+    // A request whose client can't be stopped (a name lookup that doesn't return, here a
+    // test's stalled resolver) ends the run as the host's failure once the grace after its
+    // deadline passes, though the run has no timeout; its worker is left past the grace.
+    let (_, mut options) = printer(|_| {});
+    options.caps = Caps::open(&Grants::default().net(&host), |_| None).expect("granted");
+    options.args = vec![format!("https://{host}/"), "short".into()];
+    options.testing = Testing {
+        grace: Duration::from_millis(100),
+        resolve_stall: Duration::from_secs(3),
+        ..Testing::default()
+    };
+    let started = Instant::now();
+    let ended = wrela_host::tool::run(&build, options);
+    assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+    let End::Host(why) = &ended.end else { panic!("{:?}", ended.end) };
+    assert!(why.contains("didn't stop within") && why.contains("still running"), "{why}");
+    assert_eq!(ended.end.status(), 71);
+    assert_eq!(ended.workers_left, 1);
+}
+
+const FAKE_BIG: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::RUNNING
+use std::tool::http
+
+@job
+fn main() -> u32 {
+    var f = http::fetch(http::get("https://game.example/big.bin"))
+    var got = f.poll()
+    while got.is_none() {
+        yield
+        got = f.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    match http::read_response(take polled) {
+        Ok(r) => print(f"status {r.status}"),
+        Err(e) => print(f"error: {e.message()}"),
+    }
+    0
+}
+"#;
+
+#[test]
+fn a_fake_sites_body_has_a_real_ones_limit() {
+    let build = tool_build("fake-big", &format!("{FAKE_BIG}{ENTRIES}"));
+    let scratch_root = scratch("fake-big");
+    let site = scratch_root.join("sites/game.example");
+    std::fs::create_dir_all(&site).expect("the site");
+    // 256 MiB and a byte, sparse: no disk is spent on it.
+    std::fs::File::create(site.join("big.bin"))
+        .and_then(|f| f.set_len((256 << 20) + 1))
+        .expect("a sparse file");
+    let mut grants = Grants::default().root("scratch", &scratch_root, true);
+    grants.fake_net = vec!["game.example".into()];
+    let (lines, mut options) = printer(|_| {});
+    options.caps = Caps::open(&grants, |_| None).expect("granted");
+    options.fake_clock = Some((0, 0));
+    let ended = run(&build, options);
+    let lines = lines.lock().expect("the lines").clone();
+    assert_eq!(ended.end, End::Exit(0), "{lines:?}");
+    assert_eq!(lines, ["error: the response's body is more than 268435456 bytes"]);
+    assert_eq!(ended.blobs_released, (0, 0));
+}

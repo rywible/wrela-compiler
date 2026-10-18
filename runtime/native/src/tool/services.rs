@@ -1,12 +1,17 @@
 //! The tool services (`std::tool`'s modules, language.md §15.5): each request's service and
-//! bytes, read as std writes them, and the work that answers it. std owns both sides of every
+//! bytes, read as std writes them, and the work that answers it (`http` and `run` are modules
+//! of their own; `testing` is a tool test's fakes, §13.2). std owns both sides of every
 //! layout; this is the host's half. Every answer starts with a byte, 0 for success then what the
 //! service gives, or 1 then why it failed, in UTF-8. A service the host doesn't have fails the
 //! request instead, as any host's does.
 
 use super::blobs::Blobs;
 use super::caps::{Caps, Entry, MOST_BYTES};
-use std::sync::Mutex;
+use super::http::{Fake, Faked};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 /// What a request is answered with.
@@ -40,19 +45,165 @@ fn answer(result: Result<Vec<u8>, String>) -> Answer {
     }
 }
 
-/// What every service shares: the capability context and the blobs.
+/// What every service shares: the capability context, the blobs, a tool test's fakes, the
+/// directory the host owns for the run's programs, and whether the tool has ended.
 pub(crate) struct Services {
     pub caps: Caps,
     pub blobs: Mutex<Blobs>,
     /// How long a blob's write to a file waits before it writes: a test's slow disk.
     pub io_delay: Duration,
+    /// Set once the tool has ended: a worker waiting on a program or a response stops.
+    pub closing: Arc<AtomicBool>,
+    /// Whether this is a tool test's run, which has fakes (`std::tool::testing`).
+    pub testing: bool,
+    /// A tool test's fakes for its fake sites' URLs.
+    pub fakes: Mutex<HashMap<String, Fake>>,
+    /// The run's own directory, made when a program first runs: its `HOME`, and its input and
+    /// output files. `work_at` names it, for a test; else it's a new one in the system's
+    /// temporary directory.
+    pub work: OnceLock<Result<PathBuf, String>>,
+    pub work_at: Option<PathBuf>,
+    /// Where each program's process group is written as it starts, for a supervisor that must
+    /// kill them if this host can't (a tool test's, §13.2).
+    pub groups: Option<PathBuf>,
+    /// A test's moment between a program's start and its record.
+    pub spawn_pause: Duration,
+    /// A test's name lookup that takes this long, which nothing cancels.
+    pub resolve_stall: Duration,
+    /// How long a cancelled HTTP client has to return before the run is the host's failure.
+    pub grace: Duration,
+    /// Set by a worker whose work can't be stopped: the host ends the run as its failure.
+    pub stuck: Arc<OnceLock<String>>,
 }
 
 impl Services {
-    fn blobs(&self) -> std::sync::MutexGuard<'_, Blobs> {
+    pub(crate) fn blobs(&self) -> std::sync::MutexGuard<'_, Blobs> {
         // A worker that panicked while it held them leaves them as they were.
         self.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
+
+    /// The fakes a tool test set, by URL (none outside a test).
+    pub(crate) fn fakes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Fake>> {
+        self.fakes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The run's own directory, with `home/` in it, made the first time it's needed.
+    pub(crate) fn work_dir(&self) -> Result<PathBuf, String> {
+        self.work
+            .get_or_init(|| {
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.subsec_nanos());
+                let dir = self.work_at.clone().unwrap_or_else(|| {
+                    std::env::temp_dir()
+                        .join(format!("wrela-tool-{}-{n}-{nanos}", std::process::id()))
+                });
+                std::fs::create_dir_all(dir.join("home"))
+                    .map(|_| dir)
+                    .map_err(|e| format!("can't make the run's directory: {e}"))
+            })
+            .clone()
+    }
+
+    /// Reads `from` to its end into `out` as std's `blob::read_data` reads it: 0 and the bytes
+    /// (a count, then each) if they fit an answer, else 1 and a new blob of them, made for
+    /// `request`. The bytes are charged to the blob budget as they're read, a chunk at a time,
+    /// so a body past the budget, or past `most` bytes, is refused as soon as it gets there,
+    /// not once it's all read; the blob is released then.
+    pub(crate) fn put_read(
+        &self,
+        request: u32,
+        out: &mut Vec<u8>,
+        from: &mut dyn std::io::Read,
+        most: u64,
+        what: &str,
+    ) -> Result<(), String> {
+        let mut sink = self.sink(request, most);
+        let mut chunk = vec![0; 1 << 20];
+        loop {
+            let n = from.read(&mut chunk).map_err(|e| format!("{what}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            sink.push(&chunk[..n], what)?;
+        }
+        sink.finish(out);
+        Ok(())
+    }
+
+    /// A sink for at most `most` bytes of `request`'s answer.
+    pub(crate) fn sink(&self, request: u32, most: u64) -> Sink<'_> {
+        Sink { s: self, request, inline: Vec::new(), blob: None, total: 0, most }
+    }
+}
+
+/// Bytes being given to a request's answer: kept here while they fit one, then in a blob of
+/// the request's, which is released if they never reach the answer.
+pub(crate) struct Sink<'a> {
+    s: &'a Services,
+    request: u32,
+    inline: Vec<u8>,
+    blob: Option<u32>,
+    total: u64,
+    most: u64,
+}
+
+impl Sink<'_> {
+    /// Adds `bytes`, charged to the budget now: an error past it or past `most`.
+    pub(crate) fn push(&mut self, bytes: &[u8], what: &str) -> Result<(), String> {
+        self.total += bytes.len() as u64;
+        if self.total > self.most {
+            return Err(format!("{what} is more than {} bytes", self.most));
+        }
+        if self.blob.is_none() && self.inline.len() + bytes.len() <= MOST_BYTES {
+            self.inline.extend_from_slice(bytes);
+            return Ok(());
+        }
+        let mut blobs = self.s.blobs();
+        let id = match self.blob {
+            Some(id) => id,
+            None => {
+                let id = blobs.create(self.request)?;
+                self.blob = Some(id);
+                let kept = std::mem::take(&mut self.inline);
+                blobs.append(id, &kept)?;
+                id
+            }
+        };
+        blobs.append(id, bytes)
+    }
+
+    /// The bytes, or the blob, written to `out`: the blob is the answer's now.
+    pub(crate) fn finish(mut self, out: &mut Vec<u8>) {
+        match self.blob.take() {
+            None => {
+                out.push(0);
+                out.extend_from_slice(&(self.inline.len() as u32).to_le_bytes());
+                out.extend_from_slice(&self.inline);
+            }
+            Some(id) => {
+                out.push(1);
+                out.extend_from_slice(&id.to_le_bytes());
+            }
+        }
+    }
+}
+
+impl Drop for Sink<'_> {
+    /// Bytes that never reached an answer give their blob back.
+    fn drop(&mut self) {
+        if let Some(id) = self.blob.take() {
+            let _ = self.s.blobs().release(id);
+        }
+    }
+}
+
+/// Bytes a request carries, or a blob of them.
+pub(crate) enum Data {
+    Bytes(Vec<u8>),
+    Blob(u32),
 }
 
 /// Work on a worker thread: given the services and the request's number.
@@ -62,19 +213,35 @@ pub(crate) type Task = Box<dyn FnOnce(&Services, u32) -> Answer + Send>;
 pub(crate) enum Work {
     /// Answered now, after the call that made it.
     Now(Answer),
-    /// Answered, with no bytes, once this time has passed.
+    /// Answered, with no bytes, once this time has passed (on the run's clock: a test's is
+    /// fake).
     Timer(Duration),
-    /// Answered by a worker.
+    /// Answered by a worker of the pool for files and blobs.
     Worker(Task),
+    /// Answered by a worker of the pool for long waits (HTTP, programs), so that a slow
+    /// network or program never holds up files.
+    Long(Task),
+    /// Answered by a worker of the pool for long waits, but given to the tool only once this
+    /// much of a test's fake time has passed since the request: a fake site's delay.
+    Held(Duration, Task),
+    /// Answered with the date now, on the run's clock.
+    Utc,
+    /// A test sets its fake clock's date: seconds and nanoseconds since 1970.
+    SetUtc(u64, u32),
 }
 
 /// A request's bytes, read in order as std's `Writer` wrote them.
-struct Body<'a> {
+pub(crate) struct Body<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Body<'a> {
+    /// A reader at the start of `bytes`.
+    pub(crate) fn new(bytes: &'a [u8]) -> Body<'a> {
+        Body { bytes, at: 0 }
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
         let end = self.at.checked_add(n).filter(|&e| e <= self.bytes.len());
         let Some(end) = end else { return Err("the request's bytes end too soon".into()) };
@@ -83,17 +250,34 @@ impl<'a> Body<'a> {
         Ok(out)
     }
 
-    fn u32(&mut self) -> Result<u32, String> {
+    pub(crate) fn u8(&mut self) -> Result<u8, String> {
+        Ok(self.take(1)?[0])
+    }
+
+    pub(crate) fn u32(&mut self) -> Result<u32, String> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
 
-    fn u64(&mut self) -> Result<u64, String> {
+    pub(crate) fn u64(&mut self) -> Result<u64, String> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().expect("eight bytes")))
     }
 
-    fn str(&mut self) -> Result<String, String> {
+    pub(crate) fn str(&mut self) -> Result<String, String> {
         let n = self.u32()? as usize;
-        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| "a path isn't UTF-8".to_string())
+        String::from_utf8(self.take(n)?.to_vec()).map_err(|_| "text isn't UTF-8".to_string())
+    }
+
+    /// Bytes or a blob, as std's `blob::write_data` writes them: 0, a count and the bytes, or
+    /// 1 and a blob's handle.
+    pub(crate) fn data(&mut self) -> Result<Data, String> {
+        match self.u8()? {
+            0 => {
+                let n = self.u32()? as usize;
+                Ok(Data::Bytes(self.take(n)?.to_vec()))
+            }
+            1 => Ok(Data::Blob(self.u32()?)),
+            k => Err(format!("{k} isn't bytes (0) or a blob (1)")),
+        }
     }
 
     fn rest(&mut self) -> &'a [u8] {
@@ -102,27 +286,68 @@ impl<'a> Body<'a> {
         out
     }
 
-    fn end(&self) -> Result<(), String> {
+    pub(crate) fn end(&self) -> Result<(), String> {
         if self.at == self.bytes.len() { Ok(()) } else { Err("the request has bytes left".into()) }
     }
 }
 
-/// How request `service`, with `body`, is carried out.
-pub(crate) fn route(service: &str, body: &[u8]) -> Work {
+/// How request `service`, with `body`, is carried out, with what the services hold.
+pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
     let Some(name) = service.strip_prefix("tool/") else { return Work::Now(Answer::Failed) };
-    let mut b = Body { bytes: body, at: 0 };
+    let mut b = Body::new(body);
     match name {
         "time/after" => match b.u64().and_then(|bits| b.end().map(|_| f64::from_bits(bits))) {
             Ok(s) if (0.0..1e9).contains(&s) => Work::Timer(Duration::from_secs_f64(s)),
             Ok(s) => Work::Now(err(&format!("can't wait {s} seconds"))),
             Err(why) => Work::Now(err(&why)),
         },
-        "time/utc" => {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-            let now = now.unwrap_or_default();
-            let mut payload = now.as_secs().to_le_bytes().to_vec();
-            payload.extend_from_slice(&now.subsec_nanos().to_le_bytes());
-            Work::Now(ok(&payload))
+        "time/utc" => match b.end() {
+            Ok(()) => Work::Utc,
+            Err(why) => Work::Now(err(&why)),
+        },
+        "http/fetch" => {
+            let f = match super::http::parse(&mut b, std::time::Instant::now()) {
+                Ok(f) => f,
+                Err(why) => return Work::Now(err(&why)),
+            };
+            // A fake site's delay is the test's fake time, read as the request is made. A delay
+            // past the request's deadline fails it at the deadline, as a real site would.
+            let delay = match super::http::target(&f.url) {
+                Ok((host, _)) if s.caps.host(host) == Some(true) => {
+                    s.fakes().get(super::http::fake_key(&f.url)).map_or(0.0, |f| f.delay)
+                }
+                _ => 0.0,
+            };
+            let delay = Duration::from_secs_f64(delay);
+            if delay > f.deadline {
+                let why = super::http::expired(&f);
+                return Work::Held(f.deadline, Box::new(move |_, _| err(&why)));
+            }
+            let task: Task = Box::new(move |s, request| answer(super::http::fetch(s, request, f)));
+            if delay > Duration::ZERO { Work::Held(delay, task) } else { Work::Long(task) }
+        }
+        "run/run" => match super::run::parse(&mut b, std::time::Instant::now()) {
+            Ok(r) => Work::Long(Box::new(move |s, request| answer(super::run::run(s, request, r)))),
+            Err(why) => Work::Now(err(&why)),
+        },
+        "testing/fake" | "testing/utc" if !s.testing => Work::Now(err(
+            "only a tool test's host has fakes: `std::tool::testing` is for `@test(tool)`",
+        )),
+        "testing/fake" => match testing_fake(&mut b) {
+            Ok((url, change)) => {
+                let mut fakes = s.fakes();
+                let set = fakes.entry(super::http::fake_key(&url).to_string()).or_default();
+                change(set);
+                Work::Now(ok(&[]))
+            }
+            Err(why) => Work::Now(err(&why)),
+        },
+        "testing/utc" => {
+            match (|| Ok::<_, String>((b.u64()?, b.u32()?)))().and_then(|v| b.end().map(|_| v)) {
+                Ok((seconds, nanos)) if nanos < 1_000_000_000 => Work::SetUtc(seconds, nanos),
+                Ok(_) => Work::Now(err("nanoseconds are fewer than 1000000000")),
+                Err(why) => Work::Now(err(&why)),
+            }
         }
         "files/read" | "files/list" | "files/stat" | "files/remove" | "files/remove_all"
         | "files/make_dirs" | "files/read_blob" => {
@@ -212,6 +437,43 @@ pub(crate) fn route(service: &str, body: &[u8]) -> Work {
     }
 }
 
+/// A change to a fake site's URL, as std's `testing::fake` writes it: the URL, then what to
+/// change: 0 a status (a `u32`), 1 missing, 2 bytes (the rest), each in place of the one set
+/// before; 3 a delay (an `f64`'s bits); 4 nothing faked.
+#[allow(clippy::type_complexity)]
+fn testing_fake(b: &mut Body) -> Result<(String, Box<dyn FnOnce(&mut Fake)>), String> {
+    let url = b.str()?;
+    super::http::target(&url)?;
+    let change: Box<dyn FnOnce(&mut Fake)> = match b.u8()? {
+        0 => {
+            let status = b.u32()?;
+            if !(100..=999).contains(&status) {
+                return Err(format!("{status} isn't a status: 100 to 999"));
+            }
+            Box::new(move |f| f.answer = Some(Faked::Status(status as u16)))
+        }
+        1 => Box::new(|f| f.answer = Some(Faked::Missing)),
+        2 => {
+            let bytes = b.rest().to_vec();
+            if bytes.len() > MOST_BYTES {
+                return Err("a fake's bytes are at most 512 KiB".into());
+            }
+            Box::new(move |f| f.answer = Some(Faked::Bytes(bytes)))
+        }
+        3 => {
+            let delay = f64::from_bits(b.u64()?);
+            if !(0.0..=super::http::LONGEST).contains(&delay) {
+                return Err(format!("a delay is 0 to {} seconds", super::http::LONGEST));
+            }
+            Box::new(move |f| f.delay = delay)
+        }
+        4 => Box::new(|f| *f = Fake::default()),
+        k => return Err(format!("{k} isn't a fake")),
+    };
+    b.end()?;
+    Ok((url, change))
+}
+
 /// An entry as `files::read_list` and `read_entry` read it: (the name), the kind, the size.
 fn write_entry(out: &mut Vec<u8>, e: &Entry, named: bool) {
     if named {
@@ -259,5 +521,58 @@ fn read_blob(s: &Services, request: u32, path: &str) -> Result<Vec<u8>, String> 
             let _ = s.blobs().release(id);
             Err(why)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::BlobBudget;
+    use crate::tool::caps::Grants;
+
+    /// A reader of `left` zeros that counts what it gave.
+    struct Counted {
+        left: usize,
+        given: usize,
+    }
+
+    impl std::io::Read for Counted {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.left);
+            buf[..n].fill(0);
+            self.left -= n;
+            self.given += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn a_body_past_the_budget_is_refused_as_it_arrives_and_its_blob_given_back() {
+        let services = Services {
+            caps: Caps::open(&Grants::default(), |_| None).expect("no grants"),
+            blobs: Mutex::new(Blobs::new(BlobBudget { bytes: 1 << 20, handles: 4 })),
+            io_delay: Duration::ZERO,
+            closing: Arc::new(AtomicBool::new(false)),
+            testing: false,
+            fakes: Mutex::new(HashMap::new()),
+            work: OnceLock::new(),
+            work_at: None,
+            groups: None,
+            spawn_pause: Duration::ZERO,
+            resolve_stall: Duration::ZERO,
+            grace: Duration::ZERO,
+            stuck: Arc::new(OnceLock::new()),
+        };
+        let mut from = Counted { left: 64 << 20, given: 0 };
+        let mut out = Vec::new();
+        let read = services.put_read(1, &mut out, &mut from, u64::MAX, "the body");
+        assert!(read.unwrap_err().contains("budget"));
+        assert!(from.given <= 2 << 20, "refused within a chunk of the budget: {}", from.given);
+        assert_eq!(services.blobs().release_all(), (0, 0), "its blob is given back");
+        // Within the budget, past what an answer holds: a blob.
+        let mut from = Counted { left: 600 << 10, given: 0 };
+        services.put_read(2, &mut out, &mut from, u64::MAX, "the body").expect("it fits");
+        assert_eq!(out[0], 1, "a blob");
+        assert_eq!(services.blobs().release_all(), (1, 600 << 10));
     }
 }
