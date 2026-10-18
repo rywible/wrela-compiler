@@ -475,10 +475,12 @@ impl str {
         var digits = 0
         var scale: i64 = 0
         while i < n && self.byte(i) >= 48 && self.byte(i) <= 57 {
-            mant = mant * 10.0 + f64(self.byte(i) - 48)
-            if mant >= 1e100 {
-                mant /= 1e100
-                scale += 100
+            if mant < 1e100 {
+                mant = mant * 10.0 + f64(self.byte(i) - 48)
+            } else {
+                // Further digits are below f64's precision. Keep their places in the
+                // exponent, without moving them up into the retained mantissa.
+                scale += 1
             }
             digits += 1
             i += 1
@@ -486,11 +488,9 @@ impl str {
         if i < n && self.byte(i) == 46 {
             i += 1
             while i < n && self.byte(i) >= 48 && self.byte(i) <= 57 {
-                mant = mant * 10.0 + f64(self.byte(i) - 48)
-                scale -= 1
-                if mant >= 1e100 {
-                    mant /= 1e100
-                    scale += 100
+                if mant < 1e100 {
+                    mant = mant * 10.0 + f64(self.byte(i) - 48)
+                    scale -= 1
                 }
                 digits += 1
                 i += 1
@@ -611,6 +611,23 @@ fn extreme_float_exponents_finish_at_their_limits() {
     }
     compensated.push_str("e-400")
     assert(compensated.as_str().parse_f32() == Some(1.0))
+}
+
+@test
+fn long_float_mantissas_keep_their_digit_places() {
+    var integer = String::from("1")
+    for _ in 0..100 {
+        integer.push_byte(48)
+    }
+    integer.push_str("1e-101")
+    assert(integer.as_str().parse_f32() == Some(1.0))
+
+    var fraction = String::from("0.1")
+    for _ in 0..100 {
+        fraction.push_byte(48)
+    }
+    fraction.push_str("1")
+    assert(fraction.as_str().parse_f32() == Some(0.1))
 }
 
 @test

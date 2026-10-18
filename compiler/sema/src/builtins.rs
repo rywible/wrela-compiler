@@ -272,7 +272,9 @@ impl BuiltinFn {
             }
             Abs | Sign => {
                 let t = takes(numeric(args[0]), "a number or vector", args[0])?;
-                if self == Sign && matches!(types.kind(t), TyKind::Int(i) if !i.signed()) {
+                if self == Sign
+                    && matches!(types.kind(scalar_of(types, t)), TyKind::Int(i) if !i.signed())
+                {
                     return Err(
                         "`sign` of an unsigned integer is always 0 or 1; compare with 0 instead"
                             .into(),
@@ -392,6 +394,22 @@ pub fn is_f64_math(types: &Types, t: TyId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sign_rejects_unsigned_scalars_and_vectors() {
+        let p = Program::default();
+        for int in [IntTy::U8, IntTy::U16, IntTy::U32, IntTy::U64] {
+            assert!(BuiltinFn::Sign.result(&p, &[p.types.intern(TyKind::Int(int))]).is_err());
+        }
+        for width in 2..=4 {
+            let unsigned = p.types.intern(TyKind::Vec(VecElem::U32, width));
+            assert!(BuiltinFn::Sign.result(&p, &[unsigned]).is_err());
+            for elem in [VecElem::I32, VecElem::F32, VecElem::F64] {
+                let ty = p.types.intern(TyKind::Vec(elem, width));
+                assert_eq!(BuiltinFn::Sign.result(&p, &[ty]), Ok(ty));
+            }
+        }
+    }
 
     #[test]
     fn every_builtin_is_found_by_its_name() {

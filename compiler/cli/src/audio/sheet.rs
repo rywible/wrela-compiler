@@ -170,7 +170,7 @@ pub fn draw(t: &Take, samples: &[f32], bars: Option<(u32, u32)>) -> Result<Vec<u
         if k % 12 == 0 {
             let y = y_of_key(k) as usize;
             img.rect(LEFT, y, LEFT + PLOT, y + 1, GRID);
-            img.text(8, y.saturating_sub(4), &format!("C{}", k / 12 - 1), 1, LABEL);
+            img.text(8, y.saturating_sub(4), &format!("C{}", i64::from(k / 12) - 1), 1, LABEL);
         }
     }
     for n in &t.notes {

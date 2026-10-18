@@ -16,11 +16,11 @@ test("thread imports initialize and read strict UTF-8 without TextDecoder", asyn
     const memory = new WebAssembly.Memory({ initial: 1, maximum: 1, shared: true });
     const imports = fresh.refusingImports(memory, "the audio thread", Error);
     const host = imports[IMPORT_MODULE]!;
+    const newHost = () => fresh.refusingImports(memory, "the audio thread", Error)[IMPORT_MODULE]!;
     expect(host[IMPORT_MEMORY]).toBe(memory);
     (host[IMPORT_CLOCK] as (ptr: number) => void)(8);
     expect(Number.isFinite(new DataView(memory.buffer).getFloat64(8, true))).toBe(true);
     expect(() => (host[IMPORT_PHASE] as (ptr: number, len: number) => void)(0, 0)).not.toThrow();
-    expect(() => (host[HOST_FUNCTIONS[0]![0]] as () => void)()).toThrow("the audio thread can't call the host");
     const bytes = new Uint8Array(memory.buffer);
     const line = "\uFEFFvoice é🦀\0%";
     const encoded = new TextEncoder().encode(line);
@@ -31,10 +31,11 @@ test("thread imports initialize and read strict UTF-8 without TextDecoder", asyn
     (host[IMPORT_PHASE] as (ptr: number, len: number) => void)(16, encoded.length);
     for (const invalid of [[0xc3], [0xc0, 0x80], [0xed, 0xa0, 0x80], [0xf4, 0x90, 0x80, 0x80], [0x80]]) {
       bytes.set(invalid, 16);
-      expect(() => (host[IMPORT_PRINT] as (ptr: number, len: number) => void)(16, invalid.length)).toThrow("print: the text isn't UTF-8");
-      expect(() => (host[IMPORT_PHASE] as (ptr: number, len: number) => void)(16, invalid.length)).toThrow("phase: the text isn't UTF-8");
+      expect(() => (newHost()[IMPORT_PRINT] as (ptr: number, len: number) => void)(16, invalid.length)).toThrow("print: the text isn't UTF-8");
+      expect(() => (newHost()[IMPORT_PHASE] as (ptr: number, len: number) => void)(16, invalid.length)).toThrow("phase: the text isn't UTF-8");
     }
-    expect(() => (host[IMPORT_PRINT] as (ptr: number, len: number) => void)(65_535, 2)).toThrow("print(65535, 2) reaches past the end of the program's memory");
+    expect(() => (newHost()[IMPORT_PRINT] as (ptr: number, len: number) => void)(65_535, 2)).toThrow("print(65535, 2) reaches past the end of the program's memory");
+    expect(() => (newHost()[HOST_FUNCTIONS[0]![0]] as () => void)()).toThrow("the audio thread can't call the host");
   } finally {
     Object.defineProperty(globalThis, "TextDecoder", decoder);
     log.mockRestore();

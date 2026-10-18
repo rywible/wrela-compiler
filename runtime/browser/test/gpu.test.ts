@@ -749,6 +749,30 @@ test("commands that wait for a pipeline keep their frame's label; the next frame
   expect(device.passLabels).toEqual(["look", "look", "compute"]);
 });
 
+test("texture passes waiting for a pipeline keep separate timings in their recorded frames", async () => {
+  for (const join of [false, true]) {
+    const device = new FakeDevice();
+    device.features.add("timestamp-query");
+    const m = shapes();
+    const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER)));
+    const later = Promise.withResolvers<BuiltPipeline>();
+    const executor = new GpuExecutor(device.gpu, [later.promise, compute!], { texture: () => fakeTexture("screen") }, "span");
+    const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+    run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 8, 8, "rgba8unorm")
+      .label("first").beginPass(offscreen(3, NONE)).draw(0, 3, 1, [1, 2], u(0)).endPass());
+    executor.frame = 1;
+    run(new Encoder().label("second").beginPass({ ...offscreen(3, NONE, true), join })
+      .draw(0, 3, 1, [1, 2], u(1)).endPass());
+    const caughtUp = executor.caughtUp();
+    later.resolve(draw!);
+    await caughtUp;
+    expect((await executor.timings()).map(({ frame, label }) => ({ frame, label }))).toEqual([
+      { frame: 0, label: "first" }, { frame: 1, label: "second" },
+    ]);
+    executor.destroyAll();
+  }
+});
+
 test("a command that waited for a pipeline, then fails, fails the program", async () => {
   const device = new FakeDevice();
   const m = shapes();

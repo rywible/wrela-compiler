@@ -7,7 +7,7 @@ import type { Semantics } from "./semantics.ts";
 import { Reader, Writer } from "./wire.ts";
 
 export const MESSAGE_LIMIT = 1024 * 1024 - 512;
-const DECODER = new TextDecoder("utf-8", { fatal: true });
+const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const ENCODER = new TextEncoder();
 
 /** The longest address or link a program may give (`nav/*`). */

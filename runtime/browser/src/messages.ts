@@ -121,6 +121,8 @@ export interface TickerStart extends TickerOptions {
   input: SharedArrayBuffer;
   /** Test mode: a script's events; frame-keyed ones are the ticker's once their frame starts. */
   script: Scripted[];
+  /** Frames already started when the ticker was requested: their scripts preceded this ticker. */
+  framesBeforeStart: number;
   /** Test mode: keep each tick's records and state hash, for a tick log. */
   hashes: boolean;
   /** Test mode: keep each tick's time. */

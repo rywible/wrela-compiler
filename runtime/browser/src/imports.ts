@@ -30,8 +30,10 @@ export function clockImport(memory: WebAssembly.Memory): (ptr: number) => void {
     const seconds = (performance.timeOrigin + performance.now()) / 1000;
     // A grow replaces the buffer (and detaches an unshared one); otherwise reuse the view.
     const buffer = memory.buffer;
+    const at = ptr >>> 0;
+    if (at + 8 > buffer.byteLength) throw new RangeError(`clock(${at}) reaches past the end of the program's memory`);
     if (view?.buffer !== buffer) view = new DataView(buffer);
-    view.setFloat64(ptr >>> 0, seconds, true);
+    view.setFloat64(at, seconds, true);
   };
 }
 
@@ -75,18 +77,22 @@ export function refusingImports(
   Refusal: new (message: string) => Error,
   onPrint: (line: string) => void = () => {},
   started: () => boolean = () => true,
-  startFailed: (error: Error) => void = () => {},
+  failed: (error: Error) => void = () => {},
 ): WebAssembly.Imports {
+  let failure: Error | null = null;
   const refuse = () => {
     throw new Refusal(`${who} can't call the host`);
   };
   const afterStart = <A extends unknown[], R>(f: (...args: A) => R) => (...args: A): R => {
-    if (!started()) {
-      const error = new Refusal(CALLED_WHILE_STARTING);
-      startFailed(error);
-      throw error;
+    if (failure !== null) throw failure;
+    try {
+      if (!started()) throw new Refusal(CALLED_WHILE_STARTING);
+      return f(...args);
+    } catch (e) {
+      failure = e instanceof Error ? e : new Refusal(String(e));
+      failed(failure);
+      throw e;
     }
-    return f(...args);
   };
   // The clock, a line printed and a phase answer on every thread (a voice may read the clock;
   // a tick and a parallel job's chunk may print).

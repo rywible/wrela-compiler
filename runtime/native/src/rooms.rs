@@ -295,6 +295,7 @@ impl RoomHost {
         limits: Limits,
     ) -> Result<RoomHost, Failure> {
         std::fs::create_dir_all(dir).map_err(host)?;
+        let dir = dir.canonicalize().map_err(host)?;
         let path = dir.join(format!("{name}.journal"));
         let held = Held::take(&path)?;
         let (journal, _) = Journal::open(&path, build_hash, name)?;
@@ -625,6 +626,42 @@ impl RoomHost {
 #[cfg(test)]
 mod tests {
     use super::crc32c;
+
+    #[test]
+    fn journal_path_aliases_wait_for_the_same_room() {
+        use std::sync::{Arc, mpsc};
+        use std::time::Duration;
+
+        let dir = std::env::temp_dir().join(format!("wrela-journal-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("nested")).expect("scratch directory");
+        let wasm = wat::parse_str(
+            r#"(module (memory (export "memory") 1)
+                (func (export "serve") (param f32)))"#,
+        )
+        .expect("server module");
+        let build = Arc::new(super::ServerBuild::from_wasm(&wasm).expect("server build"));
+        let first = super::RoomHost::open(build.clone(), 1, &dir, "a", super::Limits::default())
+            .expect("first room");
+        let alias = dir.join("nested/..");
+        let (tx, rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let _room = super::RoomHost::open(build, 1, &alias, "a", super::Limits::default())
+                .expect("second room once the first closes");
+            tx.send(()).expect("report open");
+        });
+        let early = rx.recv_timeout(Duration::from_millis(100));
+        drop(first);
+        if early.is_err() {
+            rx.recv_timeout(Duration::from_secs(2)).expect("the journal becomes free");
+        }
+        second.join().expect("second room thread");
+        std::fs::remove_dir_all(dir).expect("remove scratch directory");
+        assert!(
+            matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+            "an alias bypassed the journal lock"
+        );
+    }
 
     /// The check value every CRC-32C implementation gives.
     #[test]

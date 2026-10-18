@@ -372,6 +372,7 @@ fn split_top(s: &str) -> Vec<String> {
     for c in s.chars() {
         match c {
             '<' | '(' | '[' => depth += 1,
+            '>' if cur.ends_with('-') => {}
             '>' | ')' | ']' => depth -= 1,
             ',' if depth == 0 => {
                 out.push(cur.trim().to_string());
@@ -398,7 +399,17 @@ fn parse_signature(sig: &str) -> Result<(Vec<String>, Option<String>), String> {
             "a signature is `(<type>, ...) -> <type>`, with `_` for any type and `..` for any parameters: not `{sig}`"
         )
     };
-    let (params, ret) = match s.find("->") {
+    let mut depth = 0i32;
+    let arrow = s.char_indices().find_map(|(i, c)| {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '-' if depth == 0 && s[i..].starts_with("->") => return Some(i),
+            _ => {}
+        }
+        None
+    });
+    let (params, ret) = match arrow {
         Some(i) if s.starts_with('(') => (&s[..i], Some(s[i + 2..].trim())),
         None if s.starts_with('(') => (s, None),
         Some(0) => ("(..)", Some(s[2..].trim())),

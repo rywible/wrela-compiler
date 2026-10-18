@@ -138,6 +138,10 @@ pub fn lower_consts(
     // A constant's parallel jobs run on the build's threads (§13): its module exports the
     // helpers' entry when it runs any.
     crate::thread_entries(&mut cx, &mut mb);
+    if data.debug {
+        // Constants run the same debug float checks as the program that reads them (§13).
+        mb.m.nan_message = Some(cx.text_data(&mut mb, crate::NAN_MESSAGE));
+    }
     if !cx.missing.is_empty() {
         return (ConstLowering::Needs(cx.missing), Vec::new());
     }
@@ -250,6 +254,42 @@ pub struct Memory<'m> {
     pub bytes: &'m [u8],
 }
 
+/// The most aggregate containers on any path through a computed constant's value (§2.4).
+pub const MAX_CONST_VALUE_DEPTH: u32 = 256;
+
+/// Why a constant's computed value could not be read from its module's memory.
+#[derive(Debug)]
+pub enum ReadError {
+    /// Malformed memory: a pointer, enum tag or type did not describe a value.
+    Invalid(String),
+    /// Its value exceeds [`MAX_CONST_VALUE_DEPTH`] nested aggregate containers.
+    TooDeep,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) => f.write_str(message),
+            Self::TooDeep => write!(
+                f,
+                "a computed constant's value nests more than {MAX_CONST_VALUE_DEPTH} aggregates deep"
+            ),
+        }
+    }
+}
+
+impl From<String> for ReadError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
+impl From<&str> for ReadError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 impl Memory<'_> {
     fn get(&self, at: u32, n: u32) -> Result<&[u8], String> {
         let end = at.checked_add(n).ok_or("an address past the end of memory")?;
@@ -264,14 +304,19 @@ impl Memory<'_> {
 }
 
 /// Reads constant `c`'s value out of the memory of the module that computed it, at `addr`.
-pub fn read_value(checked: &Checked, c: ConstId, mem: &Memory, addr: u32) -> Result<Value, String> {
+pub fn read_value(
+    checked: &Checked,
+    c: ConstId,
+    mem: &Memory,
+    addr: u32,
+) -> Result<Value, ReadError> {
     let empty = BuildData::default();
     let mut cx = Cx::new(checked, &empty, true);
     let mut mb = ModuleBuilder::default();
     let def = checked.program.const_(c);
     let t = checked.program.func(def.eval).ret;
     match cx.lower_ty(&mut mb, t, def.span) {
-        Some(it) => cx.read(&mut mb, t, it, mem, addr, def.span),
+        Some(it) => cx.read(&mut mb, (t, it), mem, addr, def.span, 0),
         None => Ok(Value::Parts(Vec::new())),
     }
 }
@@ -296,19 +341,33 @@ impl Cx<'_> {
     fn read(
         &mut self,
         mb: &mut ModuleBuilder,
-        t: TyId,
-        it: ir::TypeId,
+        (t, it): (TyId, ir::TypeId),
         mem: &Memory,
         at: u32,
         span: Span,
-    ) -> Result<Value, String> {
+        depth: u32,
+    ) -> Result<Value, ReadError> {
         use ir::layout::{array_stride, column_stride, field_offsets};
+        let aggregate = !matches!(
+            mb.m.types.get(it),
+            ir::TypeDef::Scalar(_) | ir::TypeDef::Atomic(_) | ir::TypeDef::Ptr(_)
+        );
+        if aggregate && depth >= MAX_CONST_VALUE_DEPTH {
+            return Err(ReadError::TooDeep);
+        }
+        let depth = depth + u32::from(aggregate);
         let t = self.checked.reveal(t);
         let offsets = field_offsets(&mb.m.types, it).to_vec();
         if let Some((is_vec, elem)) = self.owner_of(t) {
             let data = mem.u32(at + offsets[0])?;
+            if !is_vec && data == 0 {
+                return Ok(Value::Parts(vec![Value::Points(Vec::new())]));
+            }
             let len = if is_vec { mem.u32(at + offsets[1])? } else { 1 };
             let pointee = match self.lower_ty(mb, elem, span) {
+                // A box still owns one value when that value has no runtime parts. Keep
+                // that presence distinct from an empty box, whose address is zero.
+                None if !is_vec => Value::Points(vec![Value::Parts(Vec::new())]),
                 None => Value::Points(Vec::new()),
                 Some(e) if mb.m.types.get(e) == &ir::TypeDef::Scalar(ir::Scalar::U8) => {
                     Value::Bytes(mem.get(data, len)?.to_vec())
@@ -319,7 +378,7 @@ impl Cx<'_> {
                     for i in 0..len {
                         let a = i.checked_mul(stride).and_then(|o| data.checked_add(o));
                         let a = a.ok_or("an element past the end of memory")?;
-                        out.push(self.read(mb, elem, e, mem, a, span)?);
+                        out.push(self.read(mb, (elem, e), mem, a, span, depth)?);
                     }
                     Value::Points(out)
                 }
@@ -361,12 +420,12 @@ impl Cx<'_> {
             ir::TypeDef::Array(e, n) => {
                 let elem = match self.checked.program.types.kind(t) {
                     TyKind::Array(x, _) | TyKind::ArrayN(x, _) => *x,
-                    _ => return Err(format!("an array of type {}", self.show(t))),
+                    _ => return Err(format!("an array of type {}", self.show(t)).into()),
                 };
                 let stride = array_stride(&mb.m.types, e);
                 let mut out = Vec::with_capacity(n as usize);
                 for i in 0..n {
-                    out.push(self.read(mb, elem, e, mem, at + i * stride, span)?);
+                    out.push(self.read(mb, (elem, e), mem, at + i * stride, span, depth)?);
                 }
                 Value::Parts(out)
             }
@@ -375,7 +434,14 @@ impl Cx<'_> {
                 for (k, ft) in self.field_map(mb, t, None, span) {
                     let Some(k) = k else { continue };
                     let (_, fit) = fields[k as usize];
-                    out.push(self.read(mb, ft, fit, mem, at + offsets[k as usize], span)?);
+                    out.push(self.read(
+                        mb,
+                        (ft, fit),
+                        mem,
+                        at + offsets[k as usize],
+                        span,
+                        depth,
+                    )?);
                 }
                 Value::Parts(out)
             }
@@ -386,7 +452,7 @@ impl Cx<'_> {
                 let Some((k, (_, payload))) =
                     variant.and_then(|k| Some((k, variants.get(k as usize)?)))
                 else {
-                    return Err(format!("an enum `{}` with the tag {tag}", self.show(t)));
+                    return Err(format!("an enum `{}` with the tag {tag}", self.show(t)).into());
                 };
                 let payload = match payload {
                     Some(pt) => {
@@ -402,11 +468,11 @@ impl Cx<'_> {
                             let (_, fit) = pfields[j as usize];
                             out.push(self.read(
                                 mb,
-                                ft,
-                                fit,
+                                (ft, fit),
                                 mem,
                                 base + poffsets[j as usize],
                                 span,
+                                depth,
                             )?);
                         }
                         Some(Box::new(Value::Parts(out)))
@@ -416,7 +482,7 @@ impl Cx<'_> {
                 Value::Variant(k, payload)
             }
             ir::TypeDef::Run(_) | ir::TypeDef::RuntimeArray(_) | ir::TypeDef::Ptr(_) => {
-                return Err(format!("a value of type {} points into memory", self.show(t)));
+                return Err(format!("a value of type {} points into memory", self.show(t)).into());
             }
         })
     }
@@ -441,16 +507,26 @@ impl Cx<'_> {
             let data = match ps.first()? {
                 Value::Points(xs) if xs.is_empty() => ir::ConstValue::Scalar(ir::Const::U32(0)),
                 Value::Points(xs) => {
-                    let e = self.lower_ty(mb, elem, span)?;
-                    let mut parts = Vec::with_capacity(xs.len());
-                    for x in xs {
-                        parts.push(self.place_value(mb, elem, e, x, span)?);
-                    }
-                    let (ty, value) = if is_vec {
-                        let n = parts.len() as u32;
-                        (mb.m.types.intern(ir::TypeDef::Array(e, n)), ir::ConstValue::Parts(parts))
+                    let (ty, value) = if let Some(e) = self.lower_ty(mb, elem, span) {
+                        let mut parts = Vec::with_capacity(xs.len());
+                        for x in xs {
+                            parts.push(self.place_value(mb, elem, e, x, span)?);
+                        }
+                        if is_vec {
+                            let n = parts.len() as u32;
+                            (
+                                mb.m.types.intern(ir::TypeDef::Array(e, n)),
+                                ir::ConstValue::Parts(parts),
+                            )
+                        } else {
+                            (e, parts.pop()?)
+                        }
+                    } else if !is_vec {
+                        // Like `Box::new`, a box of a zero-sized value owns a nonzero byte.
+                        let byte = mb.m.types.scalar(ir::Scalar::U8);
+                        (byte, ir::ConstValue::Scalar(zero_scalar(ir::Scalar::U8)))
                     } else {
-                        (e, parts.pop()?)
+                        return None;
                     };
                     ir::ConstValue::Addr(mb.m.add_data(ir::Data {
                         name: "const".into(),

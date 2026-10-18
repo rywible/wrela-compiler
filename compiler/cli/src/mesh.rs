@@ -125,11 +125,12 @@ pub fn parse_stl(bytes: &[u8]) -> Result<Mesh, String> {
             for k in 0..3 {
                 let o = base + 12 * c + 4 * k;
                 let bits = u32::from_le_bytes([bytes[o], bytes[o + 1], bytes[o + 2], bytes[o + 3]]);
-                key[k] = bits;
                 p[k] = f64::from(f32::from_bits(bits));
                 if !p[k].is_finite() {
                     return Err("an STL vertex has a non-finite coordinate".to_string());
                 }
+                // Both IEEE zero encodings name the same coordinate.
+                key[k] = if p[k] == 0.0 { 0 } else { bits };
             }
             *corner = *index.entry(key).or_insert_with(|| {
                 vertices.push(p);
@@ -495,6 +496,24 @@ fn closest_on_triangle(p: V3, t: &[V3; 3]) -> V3 {
     let [a, b, c] = *t;
     let ab = sub(b, a);
     let ac = sub(c, a);
+    if cross(ab, ac) == [0.0; 3] {
+        // A collapsed triangle is the union of its segments. The face-region
+        // formulas below can divide by zero when two corners coincide.
+        return [(a, b), (b, c), (c, a)]
+            .into_iter()
+            .map(|(from, to)| {
+                let edge = sub(to, from);
+                let squared = dot(edge, edge);
+                let along = if squared == 0.0 {
+                    0.0
+                } else {
+                    (dot(sub(p, from), edge) / squared).clamp(0.0, 1.0)
+                };
+                add(from, scale(edge, along))
+            })
+            .min_by(|a, b| dot(sub(p, *a), sub(p, *a)).total_cmp(&dot(sub(p, *b), sub(p, *b))))
+            .expect("three segments");
+    }
     let ap = sub(p, a);
     let d1 = dot(ab, ap);
     let d2 = dot(ac, ap);
@@ -622,6 +641,27 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn stl_signed_zero_corners_belong_to_the_same_piece() {
+        let mut bytes = vec![0u8; 80];
+        bytes.extend(2u32.to_le_bytes());
+        for triangle in [
+            [[0.0f32, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
+            [[1.0f32, -0.0, -0.0], [1.0, 1.0, 0.0], [-0.0, 1.0, -0.0]],
+        ] {
+            bytes.extend([0u8; 12]);
+            for point in triangle {
+                for coordinate in point {
+                    bytes.extend(coordinate.to_le_bytes());
+                }
+            }
+            bytes.extend([0u8; 2]);
+        }
+        let mesh = parse_stl(&bytes).expect("binary STL");
+        assert_eq!(mesh.vertices.len(), 4);
+        assert_eq!(mesh.pieces(), [vec![0, 1]]);
+    }
+
+    #[test]
     fn axes_name_each_file_axis_once_and_keep_handedness() {
         assert!(Registration::parse_axes("x,y").is_err());
         assert!(Registration::parse_axes("x,x,z").is_err());
@@ -668,6 +708,20 @@ pub(crate) mod tests {
         assert!(s.inside(p));
         let e = s.exit(p, [1.0, 0.0, 0.0]).unwrap();
         assert!((e - 1.5).abs() < 0.02, "exit {e}");
+    }
+
+    #[test]
+    fn nearest_handles_collapsed_triangle_edges() {
+        for triangle in [
+            [[0.0; 3], [0.0; 3], [1.0, 0.0, 0.0]],
+            [[0.0; 3], [1.0, 0.0, 0.0], [0.0; 3]],
+            [[1.0, 0.0, 0.0], [0.0; 3], [0.0; 3]],
+        ] {
+            let solid = Solid::new(vec![triangle]);
+            assert_eq!(solid.nearest([0.5, 1.0, 0.0]), 1.0);
+        }
+        let point = Solid::new(vec![[[0.0; 3]; 3]]);
+        assert_eq!(point.nearest([0.0, 1.0, 0.0]), 1.0);
     }
 
     /// The hierarchy finds every crossing brute force finds.

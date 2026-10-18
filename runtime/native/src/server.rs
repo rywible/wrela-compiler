@@ -10,14 +10,14 @@
 
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, TypedFunc};
 use wrela_abi::input::{EVENT_SIZE, Event, Queue};
 use wrela_abi::stream::{self, Command};
 use wrela_abi::{
-    EXPORT_MEMORY, EXPORT_SERVE, EXPORT_SERVE_INIT, IMPORT_INPUT, IMPORT_LIMIT, IMPORT_MODULE,
-    IMPORT_PAYLOAD, IMPORT_PHASE, IMPORT_PRINT, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE,
-    IMPORT_SUBMIT,
+    EXPORT_MEMORY, EXPORT_SERVE, EXPORT_SERVE_INIT, IMPORT_CLOCK, IMPORT_INPUT, IMPORT_LIMIT,
+    IMPORT_MODULE, IMPORT_PAYLOAD, IMPORT_PHASE, IMPORT_PRINT, IMPORT_REQUEST_STATUS,
+    IMPORT_REQUEST_TAKE, IMPORT_SUBMIT,
 };
 
 /// How often the engines' epoch advances: a deadline is a whole number of these.
@@ -26,6 +26,9 @@ const EPOCH: Duration = Duration::from_millis(1);
 /// At most this many printed lines are kept for each room; past it, lines are counted, not
 /// kept, so printing can't grow the host's memory or make it wait.
 const PRINTED_CAP: usize = 256;
+
+/// Every room reads the same clock, including a room started again after a failure.
+static CLOCK_ZERO: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// The server engine: a call can be interrupted at its deadline (epochs advance on a thread of
 /// their own), and modules may use atomics on their own memory.
@@ -542,6 +545,13 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
             Ok(bytes.len() as i32)
         },
     )?;
+    linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, |mut c: Caller<'_, RoomState>, at: u32| {
+        let bytes = CLOCK_ZERO.elapsed().as_secs_f64().to_le_bytes();
+        let m = memory(&mut c)?;
+        m.write(&mut c, at as usize, &bytes).map_err(|_| {
+            wasmtime::format_err!("clock({at}) reaches past the end of the program's memory")
+        })
+    })?;
     // A phase's timing is for frames; a room ignores it (§17.3's `trace`).
     linker.func_wrap(
         IMPORT_MODULE,
@@ -549,4 +559,34 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
         |_: Caller<'_, RoomState>, _at: u32, _len: u32| {},
     )?;
     Ok(linker)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_server_reads_a_monotonic_clock() {
+        let wasm = wat::parse_str(
+            r#"(module
+                (import "wrela" "clock" (func $clock (param i32)))
+                (memory (export "memory") 1)
+                (func (export "serve") (param f32)
+                    i32.const 0 call $clock))"#,
+        )
+        .expect("server module");
+        let build = ServerBuild::from_wasm(&wasm).expect("server build");
+        let mut room = Room::start(&build, Limits::default(), None).expect("room with a clock");
+        room.serve(0.0).expect("first clock read");
+        let read = |room: &Room| {
+            f64::from_le_bytes(room.memory.data(&room.store)[..8].try_into().expect("clock"))
+        };
+        let first = read(&room);
+        room.serve(1.0).expect("second clock read");
+        let second = read(&room);
+        assert!(first >= 0.0 && second >= first, "the clock went back: {first}, {second}");
+        let mut later = Room::start(&build, Limits::default(), None).expect("a later room");
+        later.serve(0.0).expect("another room's clock");
+        assert!(read(&later) >= second, "rooms share the server's clock");
+    }
 }

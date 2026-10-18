@@ -4,11 +4,11 @@ use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
 
 struct Out<T> {
     pos: ClipPosition,
-    extra: T, //~ E0602
+    extra: T,
 }
 
 @vertex
-fn cover(v: VertexIndex) -> Out<ClipPosition> {
+fn cover(v: VertexIndex) -> Out<ClipPosition> { //~ E0602
     let p = ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) }
     Out { pos: p, extra: p }
 }

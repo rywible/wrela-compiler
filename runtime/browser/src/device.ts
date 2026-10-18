@@ -14,9 +14,11 @@ export async function openDevice(timestamps: boolean, fatal: (error: Error) => v
   const adapter = await navigator.gpu?.requestAdapter({ powerPreference: "high-performance" });
   if (!adapter) throw new UnsupportedError("WebGPU isn't available here (no adapter)");
   if (adapter.info.isFallbackAdapter !== false) throw new UnsupportedError("hardware GPU required; WebGPU selected a fallback adapter");
+  if (!adapter.features.has("indirect-first-instance")) throw new UnsupportedError("the GPU doesn't support indirect-first-instance");
   const requiredLimits: Record<string, number> = {};
   for (const name of LIMIT_SOURCES.flat()) requiredLimits[name] = adapter.limits[name];
-  const requiredFeatures: GPUFeatureName[] = timestamps && adapter.features.has("timestamp-query") ? ["timestamp-query"] : [];
+  const requiredFeatures: GPUFeatureName[] = ["indirect-first-instance"];
+  if (timestamps && adapter.features.has("timestamp-query")) requiredFeatures.push("timestamp-query");
   const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
   device.addEventListener("uncapturederror", (e) => fatal(new GpuError(e.error.message)));
   device.lost.then((info) => {

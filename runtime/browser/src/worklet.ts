@@ -30,16 +30,20 @@ class Voice extends AudioWorkletProcessor {
     super();
     const { module, memory, task, context, quanta } = options.processorOptions;
     let started = false;
-    let startFailure: Error | null = null;
+    let hostFailure: Error | null = null;
     const instance = new WebAssembly.Instance(
       module,
       refusingImports(memory, "the audio thread", Error, (line) => {
         this.port.postMessage({ type: "print", line } satisfies FromVoice);
-      }, () => started, (error) => (startFailure = error)),
+      }, () => started, (error) => (hostFailure = error)),
     );
-    if (startFailure !== null) throw startFailure;
+    if (hostFailure !== null) throw hostFailure;
     started = true;
-    this.#render = instance.exports[EXPORT_AUDIO] as (thread: number, task: number, context: number) => void;
+    const render = instance.exports[EXPORT_AUDIO] as (thread: number, task: number, context: number) => void;
+    this.#render = (...args) => {
+      try { render(...args); } catch (e) { throw hostFailure ?? e; }
+      if (hostFailure !== null) throw hostFailure;
+    };
     // The memory may grow, but a view of shared memory stays valid, and this one is below the heap.
     this.#left = new Float32Array(memory.buffer, AUDIO_OUT, AUDIO_QUANTUM);
     this.#right = new Float32Array(memory.buffer, AUDIO_OUT + 4 * AUDIO_QUANTUM, AUDIO_QUANTUM);

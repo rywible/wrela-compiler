@@ -1,7 +1,7 @@
 import { expect, spyOn, test } from "bun:test";
-import { TICK_HASH } from "../src/abi.gen.ts";
+import { EVENT_SIZE, TICK_HASH, TICK_ORIGIN, TICK_RECORDS } from "../src/abi.gen.ts";
 import { VisibleClock } from "../src/frame.ts";
-import { InputRing } from "../src/input.ts";
+import { InputRing, textEvent } from "../src/input.ts";
 import type { FromTicker, TickerStart } from "../src/messages.ts";
 import { runTicker, TickerControl } from "../src/ticker.ts";
 import { buildModule, type Import, op } from "./wasm-builder.ts";
@@ -44,6 +44,7 @@ test("the ticker relays prints without mistaking them for its final report", asy
     delay: 0,
     replayable: false,
     replay: null,
+    framesBeforeStart: 0,
   };
   const messages: FromTicker[] = [];
   const log = spyOn(console, "log").mockImplementation(() => {});
@@ -66,4 +67,50 @@ test("the ticker control's counters cross the signed boundary as unsigned words"
   expect(control.frames).toBe(n);
   expect(control.target).toBe(n);
   expect(await Promise.race([control.ranTo(n).then(() => "resolved"), Bun.sleep(20).then(() => "timed out")])).toBe("resolved");
+});
+
+test("lockstep ticks publish the build origin and preserve the replay origin", async () => {
+  const module = await WebAssembly.compile(buildModule({ memory: 20, funcs: [{
+    type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: op.unreachable, export: "__tick",
+  }] }));
+  for (const origin of [null, 0.5]) {
+    const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
+    const control = TickerControl.create();
+    control.go(2, 1.5);
+    control.runTo(1);
+    const messages: FromTicker[] = [];
+    await runTicker({
+      module, memory, task: 0, context: 0, hz: 60, control: control.buffer,
+      clock: VisibleClock.create().buffer, input: InputRing.create().buffer,
+      script: [], hashes: false, timing: false, wasmHash: 0n, delay: 0, replayable: false,
+      replay: origin === null ? null : { upto: 1, ticks: [], origin },
+      framesBeforeStart: 0,
+    }, message => messages.push(message));
+    expect(messages.map(message => message.type)).toEqual(["fatal"]);
+    expect(new DataView(memory.buffer).getFloat64(TICK_ORIGIN, true)).toBe(origin ?? 1.5);
+  }
+});
+
+test("a ticker skips scripts before its start and keeps frames that start while it loads", async () => {
+  const module = await WebAssembly.compile(buildModule({ memory: 20, funcs: [{
+    type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: op.unreachable, export: "__tick",
+  }] }));
+  for (const replay of [null, { upto: 0, ticks: [], origin: null }]) {
+    const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
+    const control = TickerControl.create();
+    control.framesStarted(4);
+    control.go(2);
+    control.runTo(1);
+    await runTicker({
+      module, memory, task: 0, context: 0, hz: 60, control: control.buffer,
+      clock: VisibleClock.create().buffer, input: InputRing.create().buffer,
+      script: [0, 1, 2, 3].map(frame => ({ at: { frame }, event: textEvent(65 + frame) })),
+      hashes: false, timing: false, wasmHash: 0n, delay: 0, replayable: false, replay,
+      framesBeforeStart: 2,
+    }, () => {});
+    expect(new DataView(memory.buffer).getUint32(TICK_RECORDS, true)).toBe(2);
+    expect(new Uint8Array(memory.buffer, TICK_RECORDS + 4, 2 * EVENT_SIZE)).toEqual(new Uint8Array([
+      ...textEvent(67), ...textEvent(68),
+    ]));
+  }
 });

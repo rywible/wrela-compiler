@@ -51,17 +51,21 @@ const DONE = 5;
 /** 1: a tick trapped (DONE is notified too). */
 const FAILED = 6;
 const WORDS = 7;
+// The lockstep origin is published before MODE wakes the ticker; no thread writes it again.
+const ORIGIN = 32;
 
 /** The words the render worker and the ticker's thread share. */
 export class TickerControl {
   readonly #words: Int32Array;
+  readonly #origin: Float64Array;
 
   constructor(readonly buffer: SharedArrayBuffer) {
     this.#words = new Int32Array(buffer, 0, WORDS);
+    this.#origin = new Float64Array(buffer, ORIGIN, 1);
   }
 
   static create(): TickerControl {
-    return new TickerControl(new SharedArrayBuffer(WORDS * 4));
+    return new TickerControl(new SharedArrayBuffer(ORIGIN + 8));
   }
 
   #set(word: number, value: number): void {
@@ -76,9 +80,13 @@ export class TickerControl {
   }
 
   /** Starts the ticks on a schedule (`TickerMode`). */
-  go(mode: number): void {
+  go(mode: number, origin = 0): void {
+    this.#origin[0] = origin;
     this.#set(MODE, mode);
   }
+
+  /** The frame time the build's lockstep ticks count from. Read after its mode is published. */
+  get origin(): number { return this.#origin[0]!; }
 
   get mode(): number {
     return Atomics.load(this.#words, MODE);
@@ -245,8 +253,9 @@ class Ticker {
     this.log = start.hashes ? new TickLogWriter(start.wasmHash, start.hz, first) : null;
     const r = start.replay;
     this.replay = r && r.upto > 0 ? { upto: r.upto, ticks: new Map(r.ticks) } : null;
-    // A script's events of the frames started before the reload reached the replaced build.
-    if (r) this.framesQueued = control.frames;
+    // Frames before the request reached the program without this ticker. Frames that start
+    // while this thread loads still belong to it, so use the captured count, not control.frames.
+    this.framesQueued = start.framesBeforeStart;
     // The replaced build's clock goes on: its ticks were due when they were.
     if (r?.origin != null) this.setOrigin(r.origin);
   }
@@ -275,6 +284,7 @@ class Ticker {
         continue;
       }
       if (mode === TickerMode.LOCKSTEP) {
+        if (this.t0 === null) this.setOrigin(control.origin);
         if (this.next < control.target) this.runTick();
         else control.sleep(seen);
         continue;

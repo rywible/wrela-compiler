@@ -973,8 +973,23 @@ impl<'c, 'a> Fl<'c, 'a> {
             return;
         }
         if place.proj.is_empty() {
-            // A callable: no IR value; the local stands for it.
+            // A callable normally has no IR value; a job stores an owned environment below.
             if let Some(c) = self.callable_rvalue(r) {
+                // A job keeps a value-capturing closure's environment just as it keeps any
+                // other owned local. Reconstructing it where it's called would copy the
+                // captures again, after they may have changed, and lose them at a yield.
+                if self.job
+                    && let Repr::Callable(Callable::Closure { .. }, srcs) = &c
+                    && let Some(v) = self.closure_value(l, srcs)
+                {
+                    let var = match self.locals[l.index()] {
+                        Repr::Var(var) => var,
+                        _ => self.new_local("closure", self.f.value_ty(v)),
+                    };
+                    self.emit(ir::Stmt::Store(ir::Place::local(var), v));
+                    self.locals[l.index()] = Repr::Var(var);
+                    return;
+                }
                 if let (Repr::Callable(old, _), Repr::Callable(new, _)) =
                     (&self.locals[l.index()], &c)
                     && old != new
@@ -1205,9 +1220,9 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// A callable as this code calls it here: in a job's `resume`, a closure's captures found
-    /// again where it's called (its locals' places, and the pointers its projections hold, are
-    /// the same wherever it's made; the values in IR values aren't).
+    /// A callable as this code calls it here: in a job's `resume`, a projection-capturing
+    /// closure's sources found again where it's called. Its locals have stable places, but a
+    /// chosen projection's pointer is read in the current block.
     fn fresh(&mut self, r: Repr) -> Repr {
         match r {
             Repr::Callable(c @ Callable::Closure { .. }, _) if self.job => {
@@ -2215,9 +2230,18 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// The callable an argument passes: a closure or function a local holds.
-    pub fn callable_arg(&self, a: &mir::Arg) -> Option<Repr> {
-        self.callable_of(a.place()?)
+    /// The callable an argument passes: a closure or function a local holds, including a
+    /// closure environment stored as an ordinary value.
+    pub fn callable_arg(&mut self, a: &mir::Arg) -> Option<Repr> {
+        let p = a.place()?;
+        if let Some(r) = self.callable_of(p) {
+            return Some(self.fresh(r));
+        }
+        if !p.proj.is_empty() {
+            return None;
+        }
+        let (callable, srcs) = self.stored_callable(p.local)?;
+        Some(Repr::Callable(callable, srcs))
     }
 
     /// A place passed for a `[T]` parameter (`run_t`): a run of it if it's a fixed array, else
@@ -2408,7 +2432,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         for (p, a) in def.params.iter().zip(args) {
             let pt = self.cx.concrete(p.ty, &subst);
             if let TyKind::FnPtr(..) = self.types().kind(pt) {
-                let arg = self.callable_arg(a).map(|r| self.fresh(r));
+                let arg = self.callable_arg(a);
                 match arg {
                     Some(Repr::Callable(callable, srcs)) => {
                         out.extend(self.capture_args(&srcs)?);
@@ -2592,6 +2616,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             // Its parameters are passed as a direct call passes them (borrowed aggregates by
             // reference on the CPU).
             Callable::Func { func, substs } => {
+                self.check_role(*func, span);
                 return self.call_fn(*func, substs.clone(), args, span);
             }
             Callable::Closure { owner, id } => (owner, id),

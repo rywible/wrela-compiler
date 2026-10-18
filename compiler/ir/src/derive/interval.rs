@@ -552,12 +552,12 @@ impl<'a> Ivx<'a> {
 
     /// `x`, or `to` in each component that's NaN.
     fn unless_nan(&mut self, out: &mut Block, x: ValueId, ty: TypeId, to: f64) -> ValueId {
-        if let TypeDef::Vector(_, n) = *self.m.types.get(ty) {
-            let f32t = self.m.types.f32();
+        if let TypeDef::Vector(s, n) = *self.m.types.get(ty) {
+            let st = self.m.types.scalar(s);
             let comps = (0..n as u32)
                 .map(|c| {
-                    let xc = self.emit(out, f32t, Expr::Extract(x, c));
-                    self.unless_nan(out, xc, f32t, to)
+                    let xc = self.emit(out, st, Expr::Extract(x, c));
+                    self.unless_nan(out, xc, st, to)
                 })
                 .collect();
             return self.emit(out, ty, Expr::Construct(ty, comps));
@@ -685,7 +685,10 @@ impl<'a> Ivx<'a> {
             Scalar::I16 => (Const::Small(s, i16::MIN as i64), Const::Small(s, i16::MAX as i64)),
             Scalar::U16 => (Const::Small(s, 0), Const::Small(s, u16::MAX as i64)),
         };
-        (self.emit(out, ty, Expr::Const(lo)), self.emit(out, ty, Expr::Const(hi)))
+        let st = self.m.types.scalar(s);
+        let lo = self.emit(out, st, Expr::Const(lo));
+        let hi = self.emit(out, st, Expr::Const(hi));
+        (self.coerce(out, lo, ty), self.coerce(out, hi, ty))
     }
 
     /// The empty range of type `ty` (`lo` above `hi`), the identity of the hull.
@@ -1407,8 +1410,8 @@ impl<'a> Ivx<'a> {
                 self.builtin(out, Builtin::Min, vec![old.1, hi], ty),
             ),
             Some(i) => {
-                let TypeDef::Vector(_, n) = *self.m.types.get(ty) else { return Ok(()) };
-                let st = self.m.types.f32();
+                let TypeDef::Vector(s, n) = *self.m.types.get(ty) else { return Ok(()) };
+                let st = self.m.types.scalar(s);
                 let mut ends = [old.0, old.1];
                 for (k, end) in ends.iter_mut().enumerate() {
                     let parts: Vec<ValueId> = (0..n as u32)
@@ -1730,6 +1733,10 @@ impl<'a> Ivx<'a> {
                     let h = self.emit(out, bt, Expr::Bitcast(x.1, bits));
                     self.cmp(out, BinOp::Eq, l, h)
                 }
+                _ if self.m.types.is_vector(self.ty(x.0)) => {
+                    let bt = self.bool_ty();
+                    self.builtin(out, Builtin::AllEqual, vec![x.0, x.1], bt)
+                }
                 _ => self.cmp(out, BinOp::Eq, x.0, x.1),
             };
             single = Some(match single {
@@ -1822,7 +1829,8 @@ impl<'a> Ivx<'a> {
                 if matches!(w, BinOp::Shl | BinOp::Shr) {
                     // An out-of-range shift traps on the CPU; mask it.
                     let st = me.ty(amount);
-                    let mask = me.emit(out, st, Expr::Const(Const::U32(bits - 1)));
+                    let u32t = me.m.types.u32();
+                    let mask = me.emit(out, u32t, Expr::Const(Const::U32(bits - 1)));
                     amount = me.bin(out, BinOp::BitAnd, amount, mask, st);
                 }
                 me.bin(out, w, xs[0], amount, ty)
@@ -1916,24 +1924,25 @@ impl<'a> Ivx<'a> {
         args: &[Iv],
         mut rule: impl FnMut(&mut Self, &mut Block, TypeId, &[Iv]) -> R<Iv>,
     ) -> R<Iv> {
-        let TypeDef::Vector(_, n) = *self.m.types.get(ty) else {
+        let TypeDef::Vector(s, n) = *self.m.types.get(ty) else {
             return rule(self, out, ty, args);
         };
-        let f32t = self.m.types.f32();
+        let st = self.m.types.scalar(s);
         let (mut los, mut his) = (Vec::new(), Vec::new());
         for c in 0..n as u32 {
             let mut comps = Vec::new();
             for a in args {
-                comps.push(if self.m.types.is_vector(self.ty(a.0)) {
+                comps.push(if let TypeDef::Vector(s, _) = *self.m.types.get(self.ty(a.0)) {
+                    let at = self.m.types.scalar(s);
                     (
-                        self.emit(out, f32t, Expr::Extract(a.0, c)),
-                        self.emit(out, f32t, Expr::Extract(a.1, c)),
+                        self.emit(out, at, Expr::Extract(a.0, c)),
+                        self.emit(out, at, Expr::Extract(a.1, c)),
                     )
                 } else {
                     *a
                 });
             }
-            let (l, h) = rule(self, out, f32t, &comps)?;
+            let (l, h) = rule(self, out, st, &comps)?;
             los.push(l);
             his.push(h);
         }
@@ -2020,6 +2029,17 @@ impl<'a> Ivx<'a> {
     fn convert(&mut self, out: &mut Block, x: ValueId, to: Scalar, ty: TypeId) -> R<Iv> {
         let r = self.range(x);
         let from = self.elem(self.ty(x));
+        self.per_comp(out, ty, &[r], |me, out, ty, rs| me.convert_range(out, rs[0], from, to, ty))
+    }
+
+    fn convert_range(
+        &mut self,
+        out: &mut Block,
+        r: Iv,
+        from: Scalar,
+        to: Scalar,
+        ty: TypeId,
+    ) -> R<Iv> {
         let conv =
             |me: &mut Self, out: &mut Block, v: ValueId| me.emit(out, ty, Expr::Convert(v, to));
         let monotone = (from.is_float() && to.is_float())
@@ -2036,7 +2056,7 @@ impl<'a> Ivx<'a> {
             // Truncation is monotone; clamp first so no bound is out of range (which traps on
             // the CPU). A point that far out traps anyway.
             let (lo, hi) = float_int_range(from, to);
-            let xt = self.ty(x);
+            let xt = self.ty(r.0);
             let cl = self.fc(out, xt, lo);
             let ch = self.fc(out, xt, hi);
             let mut ends = Vec::new();
@@ -2280,41 +2300,40 @@ impl<'a> Ivx<'a> {
     /// the other components are exactly 0, where dividing `x` by its length as intervals would
     /// lose that `x_i / |x_i|` is ±1.
     fn normalize(&mut self, out: &mut Block, x: Iv, ty: TypeId) -> R<Iv> {
-        let TypeDef::Vector(_, n) = *self.m.types.get(ty) else {
+        let TypeDef::Vector(s, n) = *self.m.types.get(ty) else {
             return Err(Error::internal("a normalize of a non-vector"));
         };
-        let f32t = self.m.types.f32();
+        let st = self.m.types.scalar(s);
         let sq = self.sqr(out, x, ty);
         let (mut los, mut his) = (Vec::new(), Vec::new());
         for i in 0..n as u32 {
             // R² over the others: its least and greatest.
             let mut r = None;
             for j in (0..n as u32).filter(|&j| j != i) {
-                let l = self.emit(out, f32t, Expr::Extract(sq.0, j));
-                let h = self.emit(out, f32t, Expr::Extract(sq.1, j));
+                let l = self.emit(out, st, Expr::Extract(sq.0, j));
+                let h = self.emit(out, st, Expr::Extract(sq.1, j));
                 r = Some(match r {
                     None => (l, h),
-                    Some((al, ah)) => (
-                        self.bin(out, BinOp::Add, al, l, f32t),
-                        self.bin(out, BinOp::Add, ah, h, f32t),
-                    ),
+                    Some((al, ah)) => {
+                        (self.bin(out, BinOp::Add, al, l, st), self.bin(out, BinOp::Add, ah, h, st))
+                    }
                 });
             }
             let (rl, rh) = r.ok_or_else(|| Error::internal("a one-component vector"))?;
-            let a = self.emit(out, f32t, Expr::Extract(x.0, i));
-            let b = self.emit(out, f32t, Expr::Extract(x.1, i));
-            let zero = self.fc(out, f32t, 0.0);
+            let a = self.emit(out, st, Expr::Extract(x.0, i));
+            let b = self.emit(out, st, Expr::Extract(x.1, i));
+            let zero = self.fc(out, st, 0.0);
             // lo: at a, with the R² that makes it least; hi: at b, with the R² that makes it most.
             let a_pos = self.cmp(out, BinOp::Ge, a, zero);
             let ra = self.select(out, a_pos, rh, rl);
-            let lo = self.unit_part(out, a, ra, f32t);
+            let lo = self.unit_part(out, a, ra, st);
             let b_pos = self.cmp(out, BinOp::Ge, b, zero);
             let rb = self.select(out, b_pos, rl, rh);
-            let hi = self.unit_part(out, b, rb, f32t);
+            let hi = self.unit_part(out, b, rb, st);
             // normalize rounds: a few ulps on the CPU (a division by a square root), more on
             // the GPU (an inverse square root), and never past ±1 by more than that.
             let ulps = if self.gpu() { 8.0 } else { 4.0 };
-            let (lo, hi) = self.widen(out, (lo, hi), f32t, ulps, 0.0);
+            let (lo, hi) = self.widen(out, (lo, hi), st, ulps, 0.0);
             los.push(lo);
             his.push(hi);
         }
@@ -2731,5 +2750,89 @@ fn range_ty(types: &mut Types, ty: TypeId) -> TypeId {
             if r == e { ty } else { types.intern(TypeDef::Ptr(r)) }
         }
         _ => ty,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check_vector_interval(
+        scalar: Scalar,
+        op: fn(&mut Types, &mut Function, &mut Block, TypeId, ValueId) -> ValueId,
+    ) {
+        let mut m = Module::default();
+        let ty = m.types.vector_of(scalar, 2);
+        let mut f = Function::new(
+            "vector",
+            vec![Param { name: "x".into(), ty, by_ref: false, mutable: false }],
+            Some(ty),
+        );
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, ty, Expr::Param(0));
+        let result = op(&mut m.types, &mut f, &mut body, ty, x);
+        body.push(Stmt::Return(Some(result)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
+            .expect("the vector operation can be bounded");
+        verify(&m).expect("the derived operation keeps every component's type");
+    }
+
+    #[test]
+    fn integer_vector_arithmetic_has_valid_intervals() {
+        check_vector_interval(Scalar::I32, |_, f, body, ty, x| {
+            f.let_(body, ty, Expr::Binary(BinOp::Add, x, x))
+        });
+    }
+
+    #[test]
+    fn vector_float_to_integer_conversions_have_valid_intervals() {
+        check_vector_interval(Scalar::F32, |types, f, body, ty, x| {
+            let int_ty = types.vector_of(Scalar::I32, 2);
+            let ints = f.let_(body, int_ty, Expr::Convert(x, Scalar::I32));
+            f.let_(body, ty, Expr::Convert(ints, Scalar::F32))
+        });
+    }
+
+    #[test]
+    fn integer_vector_shifts_have_valid_intervals() {
+        check_vector_interval(Scalar::U32, |_, f, body, ty, x| {
+            f.let_(body, ty, Expr::Binary(BinOp::Shl, x, x))
+        });
+    }
+
+    #[test]
+    fn f64_vector_division_has_valid_intervals() {
+        check_vector_interval(Scalar::F64, |_, f, body, ty, x| {
+            f.let_(body, ty, Expr::Binary(BinOp::Div, x, x))
+        });
+    }
+
+    #[test]
+    fn f64_vector_normalization_has_valid_intervals() {
+        check_vector_interval(Scalar::F64, |_, f, body, ty, x| {
+            f.let_(body, ty, Expr::Builtin(Builtin::Normalize, vec![x]))
+        });
+    }
+
+    #[test]
+    fn f64_vector_component_narrowing_has_valid_intervals() {
+        check_vector_interval(Scalar::F64, |types, f, body, ty, x| {
+            let scalar = types.scalar(Scalar::F64);
+            let bool_ty = types.bool();
+            let local = f.new_local("vector", ty);
+            body.push(Stmt::Store(Place::local(local), x));
+            let component =
+                f.let_(body, scalar, Expr::Load(Place::local(local).with(Proj::Comp(0))));
+            let zero = f.let_(body, scalar, Expr::Const(Const::F64(0.0)));
+            let positive = f.let_(body, bool_ty, Expr::Binary(BinOp::Gt, component, zero));
+            let mut then = Vec::new();
+            let read = f.let_(&mut then, ty, Expr::Load(Place::local(local)));
+            then.push(Stmt::Return(Some(read)));
+            body.push(Stmt::If { cond: positive, then, else_: Vec::new() });
+            x
+        });
     }
 }

@@ -569,8 +569,8 @@ export class GpuExecutor {
   readonly #uploads: Ring;
   #encoder: GPUCommandEncoder | null = null;
   #pass: OpenPass | null = null;
-  /** A pass that ended, not yet recorded: the next pass continues it if it may join it, on the
-   * same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
+  /** A pass that ended, not yet recorded: the next pass in its frame continues it if it may join
+   * it, on the same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
   #ended: OpenPass | null = null;
   readonly #timer: Timer | null;
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
@@ -721,8 +721,8 @@ export class GpuExecutor {
   }
 
   /** The timestamp writes for a pass about to be recorded; never flushes. */
-  #timestamps(label: string): { timestampWrites?: GPUComputePassTimestampWrites } {
-    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(this.#running?.frame ?? this.frame, label) };
+  #timestamps(label: string, frame = this.#running?.frame ?? this.frame): { timestampWrites?: GPUComputePassTimestampWrites } {
+    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
@@ -852,7 +852,7 @@ export class GpuExecutor {
       this.#labelGeneration = generation;
     }
     if (this.#ended !== null) {
-      const mayJoin = cmd.op === "BeginPass" && joins(cmd.pass, this.#ended.pass);
+      const mayJoin = cmd.op === "BeginPass" && generation === this.#ended.at.generation && joins(cmd.pass, this.#ended.pass);
       // Keep both passes until their draws say whether their resource usage scopes can
       // share one WebGPU pass. A kept target alone doesn't make read/write uses compatible.
       if (!mayJoin && this.#pass === null && cmd.op !== "Label") {
@@ -942,10 +942,11 @@ export class GpuExecutor {
           pass: { color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
           draws: [],
           label: this.#label,
+          at: this.#running ?? { frame: this.#frame, generation: this.#generation },
         };
         return;
       case "BeginPass":
-        this.#pass = { pass: cmd.pass, draws: [], label: this.#label };
+        this.#pass = { pass: cmd.pass, draws: [], label: this.#label, at: this.#running ?? { frame: this.#frame, generation: this.#generation } };
         return;
       case "Draw":
       case "DrawIndirect":
@@ -1296,7 +1297,7 @@ export class GpuExecutor {
     if (open === null) throw new Error(`host bug: ${op} without a pass`);
     const ended = this.#ended;
     if (ended !== null) {
-      if (op === "EndPass" && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
+      if (op === "EndPass" && open.at.generation === ended.at.generation && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
         for (const draw of open.draws) ended.draws.push(draw);
         return;
       }
@@ -1365,7 +1366,7 @@ export class GpuExecutor {
     }));
     const [r, g, b, a] = pass.clear;
     const label = open.label ?? (onScreen ? "screen pass" : "pass");
-    const timed = this.#timestamps(label);
+    const timed = this.#timestamps(label, open.at.frame);
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
       label,
@@ -1417,5 +1418,5 @@ export class GpuExecutor {
   }
 }
 
-/** A pass between its beginning and `Present` or `EndPass`, and the name the program gave it. */
-type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null; uses?: Map<number, number> };
+/** A pass between its beginning and `Present` or `EndPass`, its name and the frame it belongs to. */
+type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null; at: RecordedIn; uses?: Map<number, number> };

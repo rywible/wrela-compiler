@@ -874,6 +874,8 @@ pub struct ConstDef {
     pub name: String,
     pub module: ModuleId,
     pub ty: Option<TyId>,
+    /// The written annotation, available while signatures (and their array lengths) resolve.
+    pub annotation: Option<ast::TypeExpr>,
     pub value: ast::Expr,
     pub public: bool,
     pub span: Span,

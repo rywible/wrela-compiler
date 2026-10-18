@@ -130,6 +130,25 @@ fn parameters_are_added_and_their_modes_changed_at_every_call() {
 }
 
 #[test]
+fn new_arguments_and_parameters_stay_before_trailing_comments() {
+    let dir = common::package(
+        "refactor-parameter-comments",
+        &[(
+            "main.wrela",
+            "fn f(a: i32 // keep the parameter\n) -> i32 { a }\n\
+             pub fn g() -> i32 {\n    f(1 // keep the argument\n    )\n}\n\
+             pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )],
+    );
+    let result = plan(&dir, &["add-param", "f", "b: i32", "--value", "0", "--json"]);
+    assert_eq!(result["written"], true, "{result}");
+    let text = main_text(&dir);
+    assert!(text.contains("a: i32, b: i32 // keep the parameter"), "{text}");
+    assert!(text.contains("f(1, b: 0 // keep the argument"), "{text}");
+    assert!(checks(&dir));
+}
+
+#[test]
 fn a_plan_applies_only_to_the_files_it_was_made_from() {
     let dir = package("apply");
     let a = plan(&dir, &["rename", "first", "head", "--dry-run", "--json"]);

@@ -18,6 +18,23 @@ test("program channels correlate replies and close outstanding requests", async 
   } finally { left.close(); right.close(); }
 });
 
+test("clipboard writes preserve an initial byte-order mark as text", async () => {
+  const oldWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+  const oldClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+  let written = "";
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { parent: {}, addEventListener() {} } });
+  Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: async (text: string) => { written = text; } } });
+  const platform = new BrowserPlatform({ style: {} } as HTMLCanvasElement, () => {});
+  try {
+    await platform.request("clipboard/write", new TextEncoder().encode("\uFEFFtext"));
+    expect(written).toBe("\uFEFFtext");
+  } finally {
+    platform.dispose();
+    if (oldWindow) Object.defineProperty(globalThis, "window", oldWindow); else Reflect.deleteProperty(globalThis, "window");
+    if (oldClipboard) Object.defineProperty(navigator, "clipboard", oldClipboard); else Reflect.deleteProperty(navigator, "clipboard");
+  }
+});
+
 test("the environment says whether this page load reloaded the tab, what the host has, then the colour scheme", () => {
   const load = (type: string) => [{ type } as unknown as PerformanceEntry];
   const b = environment(true, 1_700_000_000_999, 2, load("navigate"), PASTE_EVENTS | SEMANTICS);

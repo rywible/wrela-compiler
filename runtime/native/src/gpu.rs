@@ -420,8 +420,12 @@ impl Gpu {
     /// `timing` says whether passes are timed, and how.
     pub(crate) fn new(manifest: &Manifest, shaders: &[String], timing: Timing) -> Result<Gpu> {
         let timestamps = timing != Timing::Off;
-        let features =
-            if timestamps { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        // Indirect arguments include first_instance, including arguments written by a
+        // kernel. Without this feature, a non-zero value can silently discard the draw.
+        let mut features = wgpu::Features::INDIRECT_FIRST_INSTANCE;
+        if timestamps {
+            features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
         let (device, queue) = open_device("wrela-host", features)?;
 
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -2051,6 +2055,13 @@ mod tests {
         for kind in [wgpu::DeviceType::IntegratedGpu, wgpu::DeviceType::DiscreteGpu] {
             assert!(require_hardware("hardware", kind).is_ok());
         }
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn indirect_draws_enable_nonzero_first_instances() {
+        let gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
+        assert!(gpu.device.features().contains(wgpu::Features::INDIRECT_FIRST_INSTANCE));
     }
 
     /// Copies a texture before a later write can replace it, leaving the copy in the current

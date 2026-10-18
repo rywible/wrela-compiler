@@ -1345,14 +1345,23 @@ impl<E: Executor> Program<E> {
             self.audio = Some((store, render));
         }
         let trace = self.trace();
-        let (store, render) = self.audio.as_mut().expect("made above");
         let n = AUDIO_QUANTUM as usize;
         let channels = wrela_abi::AUDIO_CHANNELS as usize;
         let mut out = Vec::with_capacity(channels * n * quanta as usize);
+        self.last_failure = None;
         for _ in 0..quanta {
-            trace
-                .end_phase_after(|| render.call(&mut *store, (memory::THREAD_AUDIO, task, context)))
-                .map_err(|e| Error::Trap(format!("the voice trapped: {}", e.root_cause())))?;
+            let result = {
+                let (store, render) = self.audio.as_mut().expect("made above");
+                trace.end_phase_after(|| {
+                    render.call(&mut *store, (memory::THREAD_AUDIO, task, context))
+                })
+            };
+            if let Err(trap) = result {
+                return Err(match self.trapped(&trap, memory::THREAD_AUDIO) {
+                    Error::Trap(why) => Error::Trap(format!("the voice trapped: {why}")),
+                    error => error,
+                });
+            }
             // The quantum finished writing these samples before returning. Convert them
             // straight from shared memory, before the next quantum can overwrite them.
             let bytes = shared::slice(&self.memory, memory::AUDIO_OUT as usize, channels * n * 4)
@@ -1384,7 +1393,9 @@ impl<E: Executor> Program<E> {
     /// thread ran it (`wrela_abi::memory::PAR_HOLD`): for tests, which slow jobs down so the
     /// threads that take them wait.
     pub(crate) fn hold_jobs(&self, micros: u32) {
-        crate::shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
+        if self.memory.data().len() >= memory::PAR_HOLD as usize + 4 {
+            crate::shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
+        }
     }
 
     /// The ticker's rate, once the program has started one (`std::tick::start`).
@@ -1395,7 +1406,9 @@ impl<E: Executor> Program<E> {
     /// Whether each tick reports its state's hash (`wrela_abi::memory::TICK_WANT_HASH`), and so
     /// does the ticker's `start`, if it hasn't run yet.
     pub(crate) fn want_hashes(&self, on: bool) {
-        shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(on));
+        if self.memory.data().len() >= memory::TICK_WANT_HASH as usize + 4 {
+            shared::store_u32(&self.memory, memory::TICK_WANT_HASH, u32::from(on));
+        }
     }
 
     /// The state hash the ticker reported last: after `start`, the first state's.
@@ -1499,8 +1512,15 @@ impl<E: Executor> Program<E> {
         // A tick takes no network events.
         let events: Vec<Event> =
             arriving.iter().map(|s| s.event).filter(|e| !e.kind.is_network()).collect();
-        let from = *self.tick_from.get_or_insert(i);
         if let Some(hz) = self.ticker_hz() {
+            let from = *self.tick_from.get_or_insert(i);
+            // A build handed over to starts its own ticks at this frame's time. A hot
+            // reload keeps the old base, so its replayed ticks stay on that same clock.
+            shared::write(
+                &self.memory,
+                memory::TICK_ORIGIN as usize,
+                &(f64::from(from) / fps).to_le_bytes(),
+            );
             self.push_records(events);
             while self.next_tick() < lockstep_ticks(i - from, hz, fps) {
                 self.scripted_tick(script, log.as_deref_mut())?;

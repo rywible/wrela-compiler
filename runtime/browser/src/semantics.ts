@@ -378,6 +378,7 @@ export class Semantics implements Overlay {
     if (old && old.dataset.role === String(n.role) && old.tagName === wanted.toUpperCase() &&
       (n.role !== Role.Field || old.dataset.kind === String(n.field!.kind))) return old;
     old?.remove();
+    this.#fields.delete(n.id);
     const el = document.createElement(wanted);
     el.className = CONTAINERS.has(n.role) ? "wrela-node wrela-holder" : "wrela-node";
     el.dataset.role = String(n.role);
@@ -385,6 +386,8 @@ export class Semantics implements Overlay {
     const id = n.id;
     switch (n.role) {
       case Role.Button:
+      case Role.Checkbox:
+      case Role.Switch:
         el.addEventListener("click", () => this.write(assistEvent(id, Action.Activate)));
         break;
       case Role.Link: {
@@ -553,6 +556,7 @@ export class Semantics implements Overlay {
     // The form a field belongs to: a password manager saves a form's fields together.
     const form = this.#form(spec.form);
     if (el.parentElement !== form && form !== null) form.append(el);
+    else if (form === null && el.parentElement?.tagName === "FORM") this.root.append(el);
     if (spec.replace > f.applied) {
       if (f.revision === spec.seen && !f.composing) {
         el.value = spec.text;
@@ -643,6 +647,9 @@ export class Semantics implements Overlay {
       return siblings[to]!;
     };
     switch (role) {
+      case Role.Link:
+        if (!n?.href && e.key === "Enter") { this.write(assistEvent(id, Action.Activate)); e.preventDefault(); }
+        break;
       case Role.Tab: {
         const tabs = [...(el.parentElement?.children ?? [])].filter((c) => (c as HTMLElement).dataset.role === String(Role.Tab)) as HTMLElement[];
         const next = step(tabs, true);

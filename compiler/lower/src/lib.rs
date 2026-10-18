@@ -26,8 +26,8 @@ mod task;
 mod ty;
 
 pub use eval::{
-    BuildData, ConstLowering, ConstModule, Embeds, Memory, TestModule, Value, Values, is_computed,
-    lower_consts, lower_tests, read_value,
+    BuildData, ConstLowering, ConstModule, Embeds, MAX_CONST_VALUE_DEPTH, Memory, ReadError,
+    TestModule, Value, Values, is_computed, lower_consts, lower_tests, read_value,
 };
 pub use gpu::{PipelineKey, PipelineKind, PipelineOut};
 pub use instance::{Callable, InstanceKey};
@@ -410,6 +410,23 @@ fn lower_in(
         if server != (name == wrela_abi::EXPORT_SERVE_INIT || name == wrela_abi::EXPORT_SERVE) {
             continue;
         }
+        let def = checked.program.func(f);
+        if let Some((only, _)) = def.attrs.role
+            && only != data.role
+        {
+            cx.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0708,
+                    def.name_span,
+                    format!(
+                        "`{name}` runs only in a {} build, and this is the {} build's code",
+                        only.name(),
+                        data.role.name()
+                    ),
+                )
+                .with_note("each build's exports are entry points for that role (§15)"),
+            );
+        }
         if !checked.program.fn_all_generics(f).is_empty() {
             // Reported; it has no types to be lowered with.
             cx.check_export(f, state.map(|s| s.1));
@@ -767,6 +784,21 @@ impl<'a> Cx<'a> {
             return false;
         }
         let mut ok = true;
+        if takes_state && def.params[0].mode == Mode::Take {
+            let p = &def.params[0];
+            ok = false;
+            self.err(
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    p.span,
+                    format!(
+                        "`{}` takes the program's state, so `{}` must be borrowed or `mut`, not `take`",
+                        def.name, p.name
+                    ),
+                )
+                .with_note("the host keeps the state for later calls (§15)"),
+            );
+        }
         let skip = usize::from(takes_state);
         for p in &def.params[skip..] {
             let k = self.checked.program.types.kind(p.ty);

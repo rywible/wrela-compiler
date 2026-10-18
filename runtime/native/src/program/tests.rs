@@ -219,6 +219,22 @@ fn worker_metrics_without_control_words_are_zero() {
     assert_eq!(program.helped(), 0);
 }
 
+#[test]
+fn host_controls_without_control_words_do_not_panic() {
+    let mut program = load_wat(
+        r#"(module
+            (import "wrela" "memory" (memory 0 16384 shared))
+            (export "memory" (memory 0))
+            (func (export "frame") (param f32 i32 i32)))"#,
+    )
+    .unwrap();
+    program.want_hashes(false);
+    program.want_hashes(true);
+    program.hold_jobs(1);
+    let error = program.ticks_beside_frames(1, 1, 60.0, 1, 1).unwrap_err();
+    assert!(matches!(error, Error::Program(why) if why.contains("hasn't started a ticker")));
+}
+
 /// The ABI's default limits are WebGPU's, as wgpu has them (`wrela_abi` can't see wgpu).
 #[test]
 fn the_default_limits_are_webgpus() {
@@ -265,6 +281,36 @@ fn audio_quanta_copy_samples_before_the_next_call_overwrites_them() {
             .flat_map(|n| [n as f32, -(n as f32 + 1.0)])
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn audio_panics_keep_the_message_and_failure_location() {
+    let wat = format!(
+        r#"(module
+            (import "wrela" "memory" (memory 20 16384 shared))
+            (import "wrela" "audio" (func $start (param i32 i32)))
+            (export "memory" (memory 0))
+            (global $called (mut i32) (i32.const 0))
+            (data (i32.const {}) "boom")
+            (func (export "init") (call $start (i32.const 1) (i32.const 0)))
+            (func (export "frame") (param f32 i32 i32))
+            (func (export "__audio") (param i32 i32 i32)
+                (if (i32.eqz (global.get $called)) (then
+                    (global.set $called (i32.const 1))
+                    (i32.store (i32.const {}) (i32.const 4))
+                    unreachable))))"#,
+        memory::panic_at(memory::THREAD_AUDIO) + 4,
+        memory::panic_at(memory::THREAD_AUDIO)
+    );
+    let mut program = load_wat(&wat).unwrap();
+    let error = program.render_audio(1).unwrap_err();
+    assert!(matches!(&error, Error::Trap(why) if why.contains("panic: boom")), "{error}");
+    let failure = program.last_failure().expect("the audio trap is recorded");
+    assert_eq!(failure.panic.as_deref(), Some("boom"));
+    assert_eq!(failure.trap, Some(wasmtime::Trap::UnreachableCodeReached));
+    assert!(!failure.frames.is_empty(), "the audio trap has a code location");
+    program.render_audio(1).expect("the next quantum succeeds");
+    assert!(program.last_failure().is_none());
 }
 
 #[test]
@@ -582,6 +628,38 @@ fn lockstep_rejects_nonpositive_and_nonfinite_fps() {
         let err = program.lockstep_frame(0, fps, 1, 1, &[], None).expect_err("invalid fps");
         assert!(matches!(&err, Error::Program(m) if m.contains("fps must be finite")), "{err}");
     }
+}
+
+#[test]
+fn lockstep_ticker_origin_starts_at_its_first_frame_and_survives_reload() {
+    let wat = format!(
+        r#"(module
+            (import "wrela" "memory" (memory 20 16384 shared))
+            (import "wrela" "tick" (func $start (param i32 i32 i32)))
+            (export "memory" (memory 0))
+            (func (export "init") (call $start (i32.const 1) (i32.const 0) (i32.const 60)))
+            (func (export "frame") (param f32 i32 i32))
+            (func (export "__tick") (param i32 i32 i32 i32)
+                (i32.store (i32.const 0) (i32.add (local.get 3) (i32.const 1))))
+            (func (export "ticks") (result i32) (i32.load (i32.const 0)))
+            (func (export "origin") (result f64) (f64.load (i32.const {}))))"#,
+        memory::TICK_ORIGIN
+    );
+    let compiled = compile_with(&wat::parse_str(wat).expect("WAT compiles"), None).unwrap();
+    let mut program =
+        Program::instantiate(&compiled, &manifest(), Recorder::default(), Io::default(), false, 1)
+            .unwrap();
+    program.keep_ticks();
+    program.lockstep_frame(60, 60.0, 1, 1, &[], None).unwrap();
+    assert_eq!(program.call("origin", &[]).unwrap(), [Value::F64(1.0)]);
+    assert_eq!(call_i32(&mut program, "ticks"), 1);
+    let carried = program.retire();
+    let mut program =
+        Program::instantiate_carrying(&compiled, &manifest(), carried, Io::default(), 1, true)
+            .unwrap();
+    program.lockstep_frame(61, 60.0, 1, 1, &[], None).unwrap();
+    assert_eq!(program.call("origin", &[]).unwrap(), [Value::F64(1.0)]);
+    assert_eq!(call_i32(&mut program, "ticks"), 2);
 }
 
 #[test]

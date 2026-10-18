@@ -1,7 +1,7 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
 import { AUDIO_OUT, AUDIO_QUANTUM } from "../src/abi.gen.ts";
 import type { FromVoice, VoiceProcessorOptions } from "../src/messages.ts";
-import { buildModule, type Import, op } from "./wasm-builder.ts";
+import { buildModule, type Import, op, SUBMIT } from "./wasm-builder.ts";
 
 const oldProcessor = Object.getOwnPropertyDescriptor(globalThis, "AudioWorkletProcessor");
 const oldRegister = Object.getOwnPropertyDescriptor(globalThis, "registerProcessor");
@@ -66,6 +66,16 @@ test.each(["with", "without"] as const)("the audio worklet %s TextDecoder discri
     expect(messages).toEqual([{ type: "print", line: "from voice" }, { type: "rendered" }]);
     expect(log).toHaveBeenCalledWith("wrela: from voice");
     expect(new Float32Array(memory.buffer, AUDIO_OUT, AUDIO_QUANTUM)).toEqual(output);
+    const caught = await WebAssembly.compile(buildModule({ imports: [SUBMIT], memory: 20, funcs: [{
+      type: { params: ["i32", "i32", "i32"], results: [] }, export: "__audio",
+      body: [0x06, 0x40, ...op.i32(0), ...op.i32(0), ...op.call(0), 0x19, 0x0b],
+    }] }));
+    messages.length = 0;
+    const refused = new VoiceClass({ processorOptions: { module: caught, memory, task: 0, context: 0, quanta: 1 } });
+    output.fill(9);
+    expect(refused.process([], [[output]])).toBe(false);
+    expect(messages).toEqual([{ type: "trap", message: "the audio thread can't call the host" }]);
+    expect(output).toEqual(new Float32Array(AUDIO_QUANTUM).fill(9));
   } finally {
     log.mockRestore();
   }

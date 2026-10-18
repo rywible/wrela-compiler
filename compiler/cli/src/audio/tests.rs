@@ -28,6 +28,31 @@ fn invalid_sheet_bar_ranges_return_errors() {
 }
 
 #[test]
+fn sheet_supports_the_lowest_midi_key() {
+    let take = super::Take {
+        title: String::new(),
+        name: String::new(),
+        bars: 1,
+        beats_per_bar: 1,
+        seconds: 1.0,
+        voices: vec!["piano".into()],
+        notes: vec![super::Played {
+            key: 0,
+            voice: 0,
+            onset: 0.0,
+            release: 0.5,
+            velocity: 0.8,
+            bar: 1,
+        }],
+        sustain: Vec::new(),
+        soft: Vec::new(),
+        beats: vec![0.0, 1.0],
+    };
+    let png = super::sheet::draw(&take, &[], None).expect("sheet for MIDI key 0");
+    assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+}
+
+#[test]
 fn malformed_wav_chunks_return_errors_instead_of_panicking() {
     let path = std::env::temp_dir().join(format!("wrela-audio-bad-wav-{}.wav", std::process::id()));
     let header = b"RIFF\0\0\0\0WAVE";
@@ -57,6 +82,37 @@ fn audio_length_rejects_values_that_cannot_be_rendered() {
     for seconds in [0.0, -1.0, f64::NAN, f64::INFINITY, 1.0e12] {
         assert!(quanta(seconds).is_err(), "accepted {seconds}");
     }
+}
+
+#[test]
+fn partials_rejects_invalid_keys_and_measurement_ranges() {
+    let path =
+        std::env::temp_dir().join(format!("wrela-audio-partials-range-{}.wav", std::process::id()));
+    dsp::write_wav(&path, &[0.0; 100], 1).expect("write WAV");
+    for (flag, value) in [
+        ("--from", "inf"),
+        ("--from", "NaN"),
+        ("--from", "-1"),
+        ("--from", "1e300"),
+        ("--from", "1"),
+        ("--seconds", "inf"),
+        ("--seconds", "NaN"),
+        ("--seconds", "0"),
+        ("--seconds", "-1"),
+        ("--key", "128"),
+    ] {
+        let args = [
+            "partials".into(),
+            path.display().to_string(),
+            "--key".into(),
+            "60".into(),
+            flag.into(),
+            value.into(),
+        ];
+        let parsed = super::parse(&args).expect("partials arguments");
+        assert!(super::partials(&parsed).is_err(), "accepted {flag} {value}");
+    }
+    std::fs::remove_file(path).expect("remove WAV");
 }
 
 #[cfg(unix)]

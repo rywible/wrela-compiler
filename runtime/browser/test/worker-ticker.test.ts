@@ -1,0 +1,120 @@
+// The render worker's ticker scheduling, with CPU stand-ins for its GPU and program.
+import { expect, test } from "bun:test";
+import { InputRing } from "../src/input.ts";
+import { TICK_ORIGIN } from "../src/abi.gen.ts";
+import { Inbox } from "../src/net.ts";
+import { TickerControl } from "../src/ticker.ts";
+import { TEST_DEFAULTS } from "../src/testmode.ts";
+import type { TickerStart, ToWorker } from "../src/messages.ts";
+
+let scenarios = 0;
+
+async function tickerScenario(reloading: boolean, history = false, hz = 60): Promise<void> {
+  const globals = globalThis as unknown as Record<string, unknown>;
+  const saved = new Map(["self", "Worker", "fetch", "__tickerTest"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const timers: ReturnType<typeof setInterval>[] = [];
+  const targets: number[] = [];
+  const origins: number[] = [];
+  const startedAfter: number[] = [];
+  const frameOrigins: number[] = [];
+  let frames = 0;
+  let builds = 0;
+  let reloaded = false;
+  const stopped = Promise.withResolvers<string>();
+  const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {} };
+  const device = {
+    createTexture: () => ({}), pushErrorScope() {}, popErrorScope: async () => null,
+    queue: { onSubmittedWorkDone: async () => {} },
+  };
+  const self = {
+    location: { href: "https://site.example/worker.js" },
+    onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null,
+    postMessage(message: { type: string; message?: string }) { if (message.type === "fatal") stopped.resolve(message.message!); },
+  };
+  try {
+    globals.self = self;
+    globals.fetch = async () => new Response("");
+    globals.__tickerTest = { device, takeReload() {
+      if (!reloading || reloaded || frames < 2) return null;
+      reloaded = true;
+      return "https://site.example/next/";
+    }, makeProgram(options: { startTicker: (options: object, print: () => void) => void }) {
+      const replacement = builds++ > 0;
+      const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
+      const program = {
+        executor, ticker: null as { hz: number } | null, inbox: new Inbox(), queueInput() {},
+        keeping: new Uint8Array(), shutdown() {},
+        frame() {
+          if (!reloading && frames === 1) {
+            program.ticker = { hz };
+            options.startTicker({ hz, memory }, () => {});
+          }
+          if (frames === 2 && program.ticker !== null) frameOrigins.push(new DataView(memory.buffer).getFloat64(TICK_ORIGIN, true));
+          if (frames++ === 2) throw new Error("stopped after three frames");
+        },
+      };
+      if (replacement || history) {
+        program.ticker = { hz };
+        options.startTicker({ hz, memory }, () => {});
+      }
+      return program;
+    } };
+    globals.Worker = class {
+      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+      postMessage(start: TickerStart) {
+        const control = new TickerControl(start.control);
+        startedAfter.push(start.framesBeforeStart);
+        let reported = false;
+        timers.push(setInterval(() => {
+          if (control.stopped) {
+            if (!reported) this.onmessage?.(new MessageEvent("message", { data: {
+              type: "ticks", report: { cpu_ms: [] }, log: null, replay: { upto: control.target, ticks: [], origin: control.origin },
+            } }));
+            reported = true;
+            return;
+          }
+          if (control.target > 0) { targets.push(control.target); origins.push(control.origin); control.ran(control.target); }
+        }, 1));
+      }
+      terminate() {}
+    };
+    const bundle = await Bun.build({ entrypoints: [new URL("../src/worker.ts", import.meta.url).pathname], target: "browser", format: "esm", plugins: [{
+      name: "worker ticker dependencies", setup(build) {
+        build.onResolve({ filter: /\/(loader|device|live)\.ts$|^\.\/(loader|device|live)\.ts$/ }, ({ path }) => ({ path, namespace: "ticker-test" }));
+        build.onLoad({ filter: /.*/, namespace: "ticker-test" }, ({ path }) => ({ loader: "js", contents: path.endsWith("device.ts")
+          ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; }"
+          : path.endsWith("live.ts") ? "export class Live { start() {} take() { return globalThis.__tickerTest.takeReload(); } swapped() {} drawn() {} }"
+          : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
+      },
+    }] });
+    expect(bundle.success).toBe(true);
+    const source = `${await bundle.outputs[0]!.text()}\n// ticker scenario ${scenarios++}\n`;
+    await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
+    self.onmessage!({ data: {
+      type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, canvas: { getContext: () => ({ configure() {} }) },
+      input: InputRing.create().buffer, width: 1, height: 1, test: { ...TEST_DEFAULTS, frames: 4, width: 1, height: 1, fps: 60, saturate: 1 },
+    } } as unknown as MessageEvent<ToWorker>);
+    expect(await Promise.race([stopped.promise, Bun.sleep(2000).then(() => "timed out")])).toContain("stopped after three frames");
+    expect(frames).toBe(3);
+    expect(targets).toEqual(history ? [1, 2, 3] : hz === 60 ? [1] : []);
+    expect(origins).toEqual(history ? [0, 0, 0] : hz === 60 ? [2 / 60] : []);
+    expect(startedAfter).toEqual(history ? [0, 2] : [2]);
+    // The stand-in ticker never writes the program's memory: it may still be loading when
+    // a zero-target frame returns from ranTo(0), so the render worker must publish this.
+    if (hz < 60) expect(frameOrigins).toEqual([2 / 60]);
+  } finally {
+    for (const timer of timers) clearInterval(timer);
+    for (const [name, descriptor] of saved) {
+      if (descriptor) Object.defineProperty(globalThis, name, descriptor);
+      else Reflect.deleteProperty(globalThis, name);
+    }
+  }
+}
+
+test("a ticker first started during a frame gets ticks from the next frame", () => tickerScenario(false));
+
+test("a reload starting the first ticker counts from the reload frame", () => tickerScenario(true));
+
+test("a reload with ticker history keeps its original schedule", () => tickerScenario(true, true));
+
+test("a zero-tick frame sees its origin before the ticker thread starts", () => tickerScenario(false, false, 30));

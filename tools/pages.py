@@ -149,7 +149,7 @@ def inline(markdown):
     t = re.sub(r"`([^`]+)`", keep, markdown)
     t = html.escape(t, quote=False)
     t = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
-               lambda m: f'<a href="{html.escape(href(m.group(2)))}">{m.group(1)}</a>', t)
+               lambda m: f'<a href="{html.escape(href(html.unescape(m.group(2))))}">{m.group(1)}</a>', t)
     t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
     t = re.sub(r"(?<![\w*])\*([^*\s][^*]*?)\*(?![\w*])", r"<em>\1</em>", t)
     return re.sub("\x00(\\d+)\x00", lambda m: codes[int(m.group(1))], t)

@@ -23,6 +23,30 @@ fn query(dir: &PathBuf, queries: &[&str]) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn signature_search_keeps_nested_function_arrows_and_parameter_commas() {
+    let dir = common::package(
+        "query-callback-signatures",
+        &[(
+            "main.wrela",
+            "fn at(f: fn(u32, u32) -> f32, k: u32) -> f32 { f(k, k) }\n\
+             pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )],
+    );
+    let answers = query(
+        &dir,
+        &["search (fn(u32, u32) -> f32, u32) -> f32", "search (fn(u32, u32) -> f32, u32)"],
+    );
+    for answer in answers {
+        assert!(
+            answer["matches"]
+                .as_array()
+                .is_some_and(|matches| matches.iter().any(|m| m["function"] == "main::at")),
+            "{answer}"
+        );
+    }
+}
+
+#[test]
 fn one_check_answers_every_kind_of_query() {
     let dir = package("kinds");
     let a = query(

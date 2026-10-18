@@ -137,6 +137,27 @@ const settle = async (until: () => boolean) => {
 };
 
 describe("what a connection holds", () => {
+  test("a replacement build reads its own server configuration", async () => {
+    await withServer([], async (urls) => {
+      const fetched: string[] = [];
+      globalThis.fetch = (async (url: string | URL | Request) => {
+        fetched.push(String(url));
+        return new Response(JSON.stringify({ url: fetched.length === 1 ? "https://first.example" : "https://next.example" }));
+      }) as typeof fetch;
+      let base = "https://site.example/first/";
+      const net = new Net(() => base, () => {});
+      net.open(1, "lobby", 1n);
+      await settle(() => net.arrived.length > 0);
+      net.closeAll();
+      base = "https://site.example/next/";
+      net.open(2, "lobby", 2n);
+      await settle(() => net.arrived.length > 0);
+      expect(fetched).toEqual(["https://site.example/first/net.json", "https://site.example/next/net.json"]);
+      expect(urls).toEqual(["https://first.example/room/lobby?pair=0000000000000001", "https://next.example/room/lobby?pair=0000000000000002"]);
+      net.closeAll();
+    });
+  });
+
   test("it gives its build's pair id, and writes waiting past PENDING bytes close it", async () => {
     await withServer([], async (urls) => {
       const lines: string[] = [];

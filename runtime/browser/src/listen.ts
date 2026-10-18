@@ -5,7 +5,7 @@ import { EventKind, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
 import {
   buttonOf,
   composeEvents,
-  type InputRing,
+  InputRing,
   keyCode,
   keyEvent,
   modifiersOf,
@@ -90,8 +90,8 @@ const EDITING = new Set([
  *   the page would act on (Tab, Space, Backspace, scrolling) are the program's;
  * - **text mode** (`textInput`, while the program edits text): a hidden field at the caret takes
  *   the keys, so an input method composes there. Typed text comes from the field (Text), a
- *   composition's changes as Compose groups, and committed text as a group that clears the
- *   composing first; editing keys (Enter, Backspace, the arrows) are KeyDowns the field doesn't
+ *   composition's changes as Compose groups, and committed text after clearing the composing
+ *   first; editing keys (Enter, Backspace, the arrows) are KeyDowns the field doesn't
  *   act on, and keys an input method is using aren't sent at all;
  * - **the overlay** (`overlay`, the semantic tree, semantics.ts): its own elements take the keys,
  *   and only those a field doesn't use reach the program (`Forward`). F6 from the canvas enters it,
@@ -111,7 +111,11 @@ export function listen(
     const sy = r.height > 0 ? height / r.height : 1;
     return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy] as const;
   };
-  const put = (event: Uint8Array, time = now()) => ring.write(event, time);
+  const put = (event: Uint8Array, time = now()) => group([event], false, time);
+  // Motion and wheel samples may be dropped under pressure, without passing queued controls.
+  const samplePut = (event: Uint8Array, time = now()) => {
+    if (groups.length === 0) ring.write(event, time);
+  };
   // When the browser read a pointer's event, on `now`'s clock: its time stamp is the screen's.
   const read = (e: Event) => now() - Math.min(Math.max(performance.now() - e.timeStamp, 0), 100);
   const keys = new Set<number>();
@@ -123,18 +127,21 @@ export function listen(
     for (const button of pointer.buttons) put(pointerEvent(EventKind.PointerUp, pointer.x, pointer.y, button, 0));
     pointers.delete(id);
   };
-  const release = () => {
+  const releaseKeys = () => {
     for (const key of keys) put(keyEvent(false, key, false, 0));
     keys.clear();
+  };
+  const release = () => {
+    releaseKeys();
     for (const id of pointers.keys()) releasePointer(id);
   };
 
-  // Groups that must arrive whole (a composition's change, a commit), in order: one that doesn't
-  // fit waits for room, and a newer change replaces a change still waiting; commits are kept.
-  const groups: { events: Uint8Array[]; change: boolean }[] = [];
+  // Controls and text wait in order for room. Composition changes stay whole, and a newer change
+  // replaces one still waiting. Large text commits use ring-sized chunks so none can block forever.
+  const groups: { events: Uint8Array[]; change: boolean; time: number }[] = [];
   let retrying = false;
   const flush = () => {
-    while (groups.length > 0 && ring.writeAll(groups[0]!.events, now())) groups.shift();
+    while (groups.length > 0 && ring.writeAll(groups[0]!.events, groups[0]!.time)) groups.shift();
     if (groups.length > 0 && !retrying) {
       retrying = true;
       requestAnimationFrame(() => {
@@ -143,9 +150,11 @@ export function listen(
       });
     }
   };
-  const group = (events: Uint8Array[], change: boolean) => {
+  const group = (events: Uint8Array[], change: boolean, time = now()) => {
     if (change && groups.length > 0 && groups[groups.length - 1]!.change) groups.pop();
-    groups.push({ events, change });
+    for (let i = 0; i < events.length; i += InputRing.CAPACITY) {
+      groups.push({ events: events.slice(i, i + InputRing.CAPACITY), change, time });
+    }
     flush();
   };
 
@@ -217,13 +226,13 @@ export function listen(
       pointer.stamp = step.timeStamp;
       const [x, y] = at(step);
       Object.assign(pointer, { x, y });
-      put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)), read(step));
+      samplePut(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)), read(step));
     }
   };
   const move = (e: PointerEvent) => {
     if (pointers.has(e.pointerId)) return sample(e);
     const [x, y] = at(e);
-    put(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
+    samplePut(pointerEvent(EventKind.PointerMove, x, y, 0, modifiersOf(e)));
   };
   canvas.addEventListener("pointermove", move);
   canvas.addEventListener("pointerrawupdate", sample as EventListener);
@@ -239,7 +248,10 @@ export function listen(
     e.preventDefault();
     // A press on the canvas gives it the keys back from the overlay, or to the field drawn there;
     // text mode keeps its field.
-    if (!texting() && !overlay?.focusAt(e.clientX, e.clientY)) canvas.focus({ preventScroll: true });
+    if (!texting()) {
+      if (overlay?.focusAt(e.clientX, e.clientY)) releaseKeys();
+      else canvas.focus({ preventScroll: true });
+    }
   };
   canvas.addEventListener("pointerdown", press);
   canvas.addEventListener("pointerup", (e) => {
@@ -257,7 +269,7 @@ export function listen(
     const [x, y] = at(e);
     // Lines and pages become pixels: a line is 16 px, a page the canvas's height.
     const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? size().height : 1;
-    put(wheelEvent(x, y, e.deltaX * k, e.deltaY * k, modifiersOf(e)));
+    samplePut(wheelEvent(x, y, e.deltaX * k, e.deltaY * k, modifiersOf(e)));
     e.preventDefault();
   };
   canvas.addEventListener("wheel", wheel, { passive: false });
@@ -299,6 +311,7 @@ export function listen(
     put(keyEvent(false, key, false, modifiersOf(e)));
   });
   window.addEventListener("blur", release);
+  window.addEventListener("focusin", () => { if (inOverlay()) releaseKeys(); });
   overlay?.connect({
     wheel,
     move,
@@ -415,8 +428,16 @@ export function padChanges(pads: readonly (PadReading | null)[], last: (PadState
 export function pollPads(ring: InputRing, now: () => number, active: () => boolean = () => true): void {
   if (typeof navigator.getGamepads !== "function") return;
   const last: (PadState | null)[] = Array.from({ length: PADS }, () => null);
+  let pending: Uint8Array[] = [];
+  let pendingAt = 0;
   const poll = () => {
-    if (active()) for (const event of padChanges(navigator.getGamepads(), last)) ring.write(event, now());
+    if (active()) {
+      if (pending.length === 0) {
+        pending = padChanges(navigator.getGamepads(), last);
+        pendingAt = now();
+      }
+      if (ring.writeAll(pending, pendingAt)) pending = [];
+    }
     requestAnimationFrame(poll);
   };
   requestAnimationFrame(poll);

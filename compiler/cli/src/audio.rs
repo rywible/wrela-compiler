@@ -469,10 +469,24 @@ fn speed(a: &Args) -> Result<(), String> {
 fn partials(a: &Args) -> Result<(), String> {
     let file = a.rest.first().ok_or("partials needs a WAV file")?;
     let key = a.key.ok_or("partials needs --key, the note's MIDI key")?;
+    if key > 127 {
+        return Err("partials needs a MIDI key from 0 to 127".into());
+    }
+    if !a.from.is_finite() || a.from < 0.0 {
+        return Err("partials needs a finite, non-negative --from time".into());
+    }
+    let seconds = a.seconds.unwrap_or(8.0);
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return Err("partials needs a positive, finite --seconds length".into());
+    }
     let (samples, channels, rate) = dsp::read_wav(Path::new(file))?;
     let mono: Vec<f32> =
         samples.chunks_exact(channels).map(|c| c.iter().sum::<f32>() / channels as f32).collect();
-    let report = measure::report(&mono, rate, key, a.from, a.seconds.unwrap_or(8.0));
+    let remaining = mono.len() as f64 / rate - a.from;
+    if remaining <= 0.0 {
+        return Err("partials needs a --from time before the end of the recording".into());
+    }
+    let report = measure::report(&mono, rate, key, a.from, seconds.min(remaining));
     println!("{}", serde_json::to_string_pretty(&report).expect("json"));
     Ok(())
 }

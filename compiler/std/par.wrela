@@ -26,8 +26,8 @@ use std::abi::{
 use std::alloc::{free, place, reach_heap}
 use std::collections::replace
 use std::mem::{
-    abort_from, atomic_add, atomic_load, atomic_store, compare_swap, count, load_u32, notify, read,
-    run_task, size_of, store_u32, task, thread_block, wait, wait_for, write,
+    Drop, abort_from, atomic_add, atomic_load, atomic_store, compare_swap, count, load_u32, notify,
+    read, run_task, size_of, store_u32, task, thread_block, wait, wait_for, write,
 }
 
 // A task's slot: its words and states that are std's own (the state is its first word).
@@ -252,7 +252,8 @@ struct TaskContext<I, O, F> {
     out: u32,
 }
 
-/// A task: `f(input)`, running on a helper. `join` gives its result.
+/// A task: `f(input)`, running on a helper. `join` gives its result. Dropping it completes the
+/// work as `join` does, then drops its result and releases its slot and memory.
 pub struct Task<O> {
     /// Its slot's address, or 0 if it ran when it was made (every slot was taken).
     slot: u32,
@@ -348,6 +349,12 @@ impl<O> Task<O> {
     /// helper has started it. Its value doesn't depend on timing. A trap in the task is the
     /// program's panic, here.
     pub fn join(take self) -> O {
+        var pending = take self
+        pending.finish()
+    }
+
+    /// Completes the work, takes its result, and leaves this task with nothing owned.
+    fn finish(mut self) -> O {
         unsafe {
             if self.slot != 0 {
                 loop {
@@ -369,16 +376,27 @@ impl<O> Task<O> {
                     }
                 }
                 atomic_store(self.slot, SLOT_FREE)
+                self.slot = 0
             }
             // Its result may hold blocks in memory a helper grew.
             reach_heap()
             let result = read::<Option<O>>(self.out)
             free(self.out, size_of::<Option<O>>())
             free(self.context, self.context_size)
+            self.out = 0
+            self.context = 0
             match take result {
                 Some(x) => x,
                 None => panic("a job finished with no result"),
             }
+        }
+    }
+}
+
+impl<O> Drop for Task<O> {
+    fn drop(mut self) {
+        if self.context != 0 {
+            let _ = self.finish()
         }
     }
 }
@@ -436,5 +454,54 @@ fn nested_work_restores_the_outer_failure_marker() {
         assert(during_chunk == outer, "a nested chunk hid its outer task's failure marker")
         assert(after_task == outer, "a nested task lost its outer task's failure marker")
         assert(after_chunk == outer, "a nested chunk lost its outer task's failure marker")
+    }
+}
+
+fn task_value(value: take u32) -> u32 {
+    value + 1
+}
+
+@test
+fn dropping_a_task_releases_its_slot_and_heap_blocks() {
+    var slot = 0
+    var context = 0
+    var out = 0
+    {
+        let pending = spawn(7, task_value)
+        slot = pending.slot
+        context = pending.context
+        out = pending.out
+    }
+    assert(slot != 0)
+    unsafe {
+        assert(atomic_load(slot) == SLOT_FREE, "a dropped task kept its slot")
+    }
+    let again = spawn(9, task_value)
+    assert(
+        (again.context == context && again.out == out) ||
+            (again.context == out && again.out == context),
+        "a dropped task kept its heap blocks",
+    )
+    assert(take again.join() == 10)
+    let joined = spawn(11, task_value)
+    assert(take joined.join() == 12)
+}
+
+fn task_vector(value: take Vec<u32>) -> Vec<u32> {
+    take value
+}
+
+@test
+fn dropping_a_task_drops_its_owned_result() {
+    unsafe {
+        let expected = std::alloc::alloc(size: 16, align: 16)
+        free(expected, 16)
+        {
+            let values = Vec::from([7, 9])
+            let pending = spawn(take values, task_vector)
+        }
+        let reused = std::alloc::alloc(size: 16, align: 16)
+        assert(reused == expected, "a dropped task kept its result's allocation")
+        free(reused, 16)
     }
 }

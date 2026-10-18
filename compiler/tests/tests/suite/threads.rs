@@ -60,6 +60,22 @@ fn a_trapping_job_traps_at_its_join() {
         assert_eq!(failure.panic.as_deref(), Some("a job's input was 13"));
     }
 }
+
+#[test]
+fn a_trapping_job_traps_when_dropped() {
+    for (workers, hold) in [(1, 0), (2, 0), (8, 0), (2, 50_000), (8, 50_000)] {
+        let mut host = start(workers);
+        host.hold_jobs(hold);
+        assert_eq!(one_u32(&mut host, "trap_at_drop", &[Value::I32(4)]), 8);
+        let error = host.call_export("trap_at_drop", &[Value::I32(13)]).expect_err("13 traps");
+        assert!(error.to_string().contains("a job's input was 13"));
+        assert_eq!(
+            host.last_failure().expect("a trap").panic.as_deref(),
+            Some("a job's input was 13")
+        );
+    }
+}
+
 /// Shrink only the fixture's imported memory maximum, so memory.grow fails under the real
 /// allocator lock after a few blocks. No production allocator or scheduling path is replaced.
 fn small_heap() -> std::path::PathBuf {

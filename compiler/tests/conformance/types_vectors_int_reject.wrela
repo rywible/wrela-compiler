@@ -13,6 +13,10 @@ fn negate(u: vec3u) -> vec3u {
     -u //~ E0305
 }
 
+fn unsigned_sign(u: vec3u) -> vec3u {
+    sign(u) //~ E0305
+}
+
 fn components(a: f32) -> vec3u {
     // A `vec3u`'s components are `u32`s.
     vec3u(a, 1, 2) //~ E0323

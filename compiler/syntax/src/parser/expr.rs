@@ -355,7 +355,12 @@ impl<'a> Parser<'a> {
     }
 
     pub(crate) fn parse_expr_ctx(&mut self, ctx: Ctx) -> PResult<Expr> {
-        self.nested(|p| p.parse_expr_inner(ctx))
+        let expr = self.nested(|p| p.parse_expr_inner(ctx))?;
+        if super::expression_too_deep(&expr) {
+            self.too_deep_error(expr.span.shrink_to_start());
+            return Err(Failed);
+        }
+        Ok(expr)
     }
 
     /// An array literal's element, and whether it's the fill: `x` or `..x`.

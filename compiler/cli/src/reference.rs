@@ -684,9 +684,16 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<Table>, String> {
             while chars[i] != '=' && chars[i] != '\n' {
                 i += 1;
             }
-            line[..i].trim().to_string()
+            let key: String = chars[..i].iter().collect();
+            let key = key.trim();
+            if key.is_empty()
+                || !key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+            {
+                return Err(at(format!("`{key}` needs a quoted key")));
+            }
+            key.to_string()
         };
-        while chars[i] == ' ' {
+        while matches!(chars[i], ' ' | '\t') {
             i += 1;
         }
         if chars[i] != '=' {
@@ -748,7 +755,7 @@ fn read_string(chars: &[char], start: usize) -> Result<(String, usize), String> 
 
 fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
     let mut i = start;
-    while chars[i] == ' ' {
+    while matches!(chars[i], ' ' | '\t') {
         i += 1;
     }
     match chars[i] {
@@ -756,7 +763,7 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
         '[' => {
             let mut items = Vec::new();
             i += 1;
-            while chars[i] == ' ' {
+            while matches!(chars[i], ' ' | '\t') {
                 i += 1;
             }
             if chars[i] == ']' {
@@ -766,14 +773,14 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
                 let (v, n) = read_value(chars, i)?;
                 items.push(v);
                 i = n;
-                while chars[i] == ' ' {
+                while matches!(chars[i], ' ' | '\t') {
                     i += 1;
                 }
                 match chars[i] {
                     ']' => return Ok((Value::List(items), i + 1)),
                     ',' => {
                         i += 1;
-                        while chars[i] == ' ' {
+                        while matches!(chars[i], ' ' | '\t') {
                             i += 1;
                         }
                         if chars[i] == ']' {
@@ -787,7 +794,7 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
         }
         _ => {
             let end = (i..chars.len())
-                .find(|&k| matches!(chars[k], ',' | ']' | '\n' | ' '))
+                .find(|&k| matches!(chars[k], ',' | ']' | '\n' | ' ' | '\t'))
                 .unwrap_or(chars.len());
             let word: String = chars[i..end].iter().collect();
             match word.replace('_', "").parse::<f64>() {
@@ -2466,6 +2473,24 @@ mod tests {
         assert!(parse_toml("x = 1\nx = 2\n").is_err());
         for number in ["inf", "-inf", "NaN"] {
             assert!(parse_toml(&format!("x = {number}\n")).is_err(), "accepted {number}");
+        }
+    }
+
+    #[test]
+    fn toml_horizontal_tabs_are_whitespace() {
+        let tables = parse_toml("\"elbow left\"\t=\t[1\t,\t2,\t3\t]\nangles\t=\t32\n")
+            .expect("horizontal whitespace");
+        assert_eq!(tables[0].get("angles"), Some(&Value::Num(32.0)));
+        assert_eq!(
+            tables[0].get("elbow left"),
+            Some(&Value::List(vec![Value::Num(1.0), Value::Num(2.0), Value::Num(3.0)]))
+        );
+    }
+
+    #[test]
+    fn invalid_toml_bare_keys_return_errors() {
+        for text in ["é=1", "=1", "two words=1"] {
+            assert!(parse_toml(text).is_err(), "accepted {text:?}");
         }
     }
 

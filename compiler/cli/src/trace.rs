@@ -188,15 +188,6 @@ fn shown(v: &[Value], sep: &str) -> String {
         .join(sep)
 }
 
-fn number(value: Value) -> f64 {
-    match value {
-        Value::I32(x) => f64::from(x),
-        Value::I64(x) => x as f64,
-        Value::F32(x) => f64::from(x),
-        Value::F64(x) => x,
-    }
-}
-
 fn values_json(values: &[Value]) -> Vec<serde_json::Value> {
     values
         .iter()
@@ -260,21 +251,84 @@ struct Until {
 
 enum Test {
     /// A comparison with a number.
-    Compare(Comparison, f64),
+    Compare(Comparison, Number),
     Nan,
 }
 
-/// Whether a value compares with a number as an operator says.
-type Comparison = fn(&f64, &f64) -> bool;
+#[derive(Clone, Copy)]
+enum Number {
+    Integer(i128),
+    Float(f64),
+}
+
+impl Number {
+    fn of(value: Value) -> Self {
+        match value {
+            Value::I32(x) => Self::Integer(i128::from(x)),
+            Value::I64(x) => Self::Integer(i128::from(x)),
+            Value::F32(x) => Self::Float(f64::from(x)),
+            Value::F64(x) => Self::Float(x),
+        }
+    }
+
+    /// Compare without rounding an integer to a float first. When a float's truncated
+    /// integer equals the other operand, that integer is exactly representable as a float.
+    fn compare(self, other: Self) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Integer(a), Self::Integer(b)) => Some(a.cmp(&b)),
+            (Self::Float(a), Self::Float(b)) => a.partial_cmp(&b),
+            (Self::Integer(a), Self::Float(b)) => {
+                if b.is_nan() {
+                    None
+                } else if b >= -(i128::MIN as f64) {
+                    Some(Ordering::Less)
+                } else if b < i128::MIN as f64 {
+                    Some(Ordering::Greater)
+                } else {
+                    match a.cmp(&(b as i128)) {
+                        Ordering::Equal => (a as f64).partial_cmp(&b),
+                        order => Some(order),
+                    }
+                }
+            }
+            (Self::Float(_), Self::Integer(_)) => other.compare(self).map(Ordering::reverse),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Comparison {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+impl Comparison {
+    fn holds(self, order: Option<std::cmp::Ordering>) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match self {
+            Self::Lt => order == Some(Less),
+            Self::Le => matches!(order, Some(Less | Equal)),
+            Self::Gt => order == Some(Greater),
+            Self::Ge => matches!(order, Some(Greater | Equal)),
+            Self::Eq => order == Some(Equal),
+            Self::Ne => order != Some(Equal),
+        }
+    }
+}
 
 /// The operators `--until` takes.
 const COMPARISONS: [(&str, Comparison); 6] = [
-    ("<", f64::lt),
-    ("<=", f64::le),
-    (">", f64::gt),
-    (">=", f64::ge),
-    ("==", f64::eq),
-    ("!=", f64::ne),
+    ("<", Comparison::Lt),
+    ("<=", Comparison::Le),
+    (">", Comparison::Gt),
+    (">=", Comparison::Ge),
+    ("==", Comparison::Eq),
+    ("!=", Comparison::Ne),
 ];
 
 fn parse_until(text: &str) -> Option<Until> {
@@ -283,7 +337,12 @@ fn parse_until(text: &str) -> Option<Until> {
         ["nan", e] | [e, "is", "nan"] => (*e, Test::Nan),
         [e, op, n] => {
             let (_, holds) = COMPARISONS.iter().find(|(o, _)| o == op)?;
-            (*e, Test::Compare(*holds, n.parse().ok()?))
+            let number = n
+                .parse::<i128>()
+                .map(Number::Integer)
+                .or_else(|_| n.parse::<f64>().map(Number::Float))
+                .ok()?;
+            (*e, Test::Compare(*holds, number))
         }
         _ => return None,
     };
@@ -295,10 +354,11 @@ fn parse_until(text: &str) -> Option<Until> {
 }
 
 impl Until {
-    fn holds(&self, v: f64) -> bool {
+    fn holds(&self, v: Value) -> bool {
+        let v = Number::of(v);
         match self.test {
-            Test::Nan => v.is_nan(),
-            Test::Compare(holds, n) => holds(&v, &n),
+            Test::Nan => matches!(v, Number::Float(x) if x.is_nan()),
+            Test::Compare(holds, n) => holds.holds(v.compare(n)),
         }
     }
 }
@@ -324,7 +384,7 @@ fn run_bisect(a: &Args, until: &Until, text: &str) -> Result<ExitCode, String> {
         let Some(&x) = v.get(until.component) else {
             return Err(format!("`{}` gives {} values", until.export, v.len()));
         };
-        if until.holds(number(x)) {
+        if until.holds(x) {
             if a.json {
                 println!(
                     "{}",
@@ -351,6 +411,23 @@ fn run_bisect(a: &Args, until: &Until, text: &str) -> Result<ExitCode, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bisect_compares_large_integers_without_rounding() {
+        let holds = |test, value| parse_until(test).expect("condition").holds(value);
+        let large = Value::I64(9_007_199_254_740_993);
+        assert!(holds("answer == 9007199254740993", large));
+        assert!(!holds("answer == 9007199254740992", large));
+        assert!(holds("answer > 9007199254740992.0", large));
+        assert!(holds("answer < 9007199254740994.0", large));
+        assert!(holds("answer < 9007199254740993", Value::F64(9_007_199_254_740_992.0)));
+        assert!(holds("answer > -9223372036854775809", Value::I64(i64::MIN)));
+        assert!(holds("answer < 9223372036854775808.0", Value::I64(i64::MAX)));
+        assert!(holds("answer > -1.5", Value::I32(-1)));
+        assert!(holds("answer != 0", Value::F64(f64::NAN)));
+        assert!(!holds("answer <= 0", Value::F64(f64::NAN)));
+        assert!(holds("nan answer", Value::F64(f64::NAN)));
+    }
 
     #[test]
     fn trace_keeps_integer_and_f64_precision_in_its_text() {

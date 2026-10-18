@@ -828,3 +828,78 @@ fn water_reflections_follow_raster_jitter_without_foreground_colour_leaks() {
         }
     }
 }
+
+/// Every supported skeleton depth keeps its real root's transform in the GPU palette.
+#[test]
+fn pose_instances_keeps_the_root_of_a_full_depth_skeleton() {
+    let dir = super::engine_package(
+        "renderer/full-depth-pose",
+        "full_depth_pose",
+        r#"use engine::creature::{MAX_BONES, Skeleton}
+use engine::render::{Instance, Poser, RestSkeleton, pose_instances}
+use std::gpu::{GpuBuffer, buffer, buffer_of, dispatch, read}
+use std::io::Pending
+use std::transform::{identity, rotate_z, translate}
+
+struct RootTurn: Copy + GpuData {}
+
+impl Poser for RootTurn {
+    fn local(self, bone: u32, pose: vec4) -> mat4 {
+        if bone == 0 { rotate_z(1.5707963) } else { identity() }
+    }
+
+    fn root(self, at: vec3, heading: f32, pose: vec4) -> mat4 {
+        translate(at)
+    }
+}
+
+pub struct State {
+    instances: GpuBuffer<Instance>,
+    skeletons: GpuBuffer<RestSkeleton>,
+    palettes: GpuBuffer<mat4>,
+    pending: Option<Pending<mat4>>,
+    got: Vec<mat4>,
+}
+
+pub fn init() -> State {
+    var skeleton = Skeleton::new()
+    var parent = skeleton.root("root", vec3(0.0))
+    for _ in 1..MAX_BONES {
+        parent = skeleton.bone("child", parent, vec3(0.0, 1.0, 0.0))
+    }
+    State {
+        instances: buffer_of([Instance {
+            at: vec3(3.0, 4.0, 5.0), heading: 0.0, pose: vec4(0.0), skeleton: 0,
+        }]),
+        skeletons: buffer_of([RestSkeleton::of(skeleton)]),
+        palettes: buffer(MAX_BONES), pending: None, got: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if !s.got.is_empty() { return }
+    match mut s.pending {
+        Some(p) => if let Some(Ok(v)) = p.poll() { s.got = take v },
+        None => {
+            dispatch(pose_instances.bind(RootTurn {}, s.instances, s.skeletons, mut s.palettes),
+                groups: 1)
+            s.pending = Some(read(s.palettes.items()))
+        },
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn every_bone_keeps_the_root_rotation(s: State) {
+    assert(s.got.len() == MAX_BONES, "the GPU palette came back")
+    let expected = translate(vec3(3.0, 4.0, 5.0)) * rotate_z(1.5707963)
+    for bone in 0..MAX_BONES {
+        for column in 0..4 {
+            assert(length(s.got[bone][column] - expected[column]) < 1.0e-4,
+                f"bone {bone}, column {column} lost its root transform")
+        }
+    }
+}
+"#,
+    );
+    assert_eq!(super::tests_pass(&dir), 1);
+}

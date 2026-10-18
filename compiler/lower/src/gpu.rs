@@ -1970,7 +1970,8 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                 continue;
             }
             let ty = mb.m.types.intern(ir::TypeDef::Array(et, len));
-            workgroup_bytes += ir::layout::layout(&mb.m.types, ty).size;
+            workgroup_bytes =
+                workgroup_bytes.saturating_add(ir::layout::layout(&mb.m.types, ty).size);
             let kind = ir::ResourceKind::Workgroup;
             let res = ir::Resource { name: param.name.clone(), binding: u32::MAX, kind, ty };
             resources[e][i] = Some(Bound::One(mb.m.add_resource(res)));
@@ -2459,6 +2460,23 @@ fn varying_layout(
             varying_leaves(cx, mb, ft, vec![k], false, span, &mut out);
         }
     }
+    let count = out.iter().filter(|v| !v.position).count();
+    let max = wrela_sema::gpu::MAX_VARYINGS;
+    if count > max {
+        cx.err(
+            Diagnostic::new(
+                codes::E0602,
+                span,
+                format!(
+                    "this vertex shader passes {count} values to the fragment shader, more than {max}"
+                ),
+            )
+            .with_note(format!(
+                "WebGPU's default limit is {max} (`maxInterStageShaderVariables`): a matrix passes a value per column, and a struct one per field"
+            )),
+        );
+        return None;
+    }
     found.then_some(out)
 }
 
@@ -2802,6 +2820,7 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
     let checked = cx.checked;
     let def = checked.program.func(f);
     let mut fragment = None;
+    let mut compute = None;
     let mut mb = match entry {
         Some(stage) => {
             // A fragment shader may take a vertex output, whichever vertex shader it's drawn with.
@@ -2824,6 +2843,8 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
             let id = entry_function(&mut mb, &keys[0], &def.name, ret, varyings);
             fragment = (stage == Entry::Fragment)
                 .then(|| (id, entry_inputs(&iface.entries[0], false, false)));
+            compute = matches!(stage, Entry::Compute(_))
+                .then(|| (id, entry_inputs(&iface.entries[0], true, false)));
             mb
         }
         None => {
@@ -2854,6 +2875,9 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
     };
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
+    if let Some((id, inputs)) = compute {
+        check_workgroup(cx, &mb, id, &inputs);
+    }
     if let Some((id, inputs)) = fragment {
         check_uniformity(cx, &mb, id, &inputs);
     }
@@ -2911,6 +2935,83 @@ pub fn frame(time: f32, width: u32, height: u32) {
 "#;
         let (_, errors) = lower_source(source);
         assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+    }
+
+    #[test]
+    fn oversized_workgroup_memory_reports_a_limit_error_without_overflow() {
+        let source = r#"
+use std::gpu::Shared
+
+@compute(1)
+fn oversized(first: mut Shared<u32, 536870912>, second: mut Shared<u32, 536870912>) {}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, codes::E0602);
+        assert!(errors[0].message.contains("workgroup memory"), "{errors:?}");
+    }
+
+    #[test]
+    fn generic_vertex_outputs_obey_the_interstage_location_limit() {
+        let source = r#"
+use std::gpu::{ClipPosition, VertexIndex, begin_screen_pass, draw}
+
+struct Output<T: Copy>: Copy {
+    position: ClipPosition,
+    values: T,
+}
+
+@vertex
+fn cover<T: Copy>(vertex: VertexIndex, values: T) -> Output<T> {
+    Output { position: ClipPosition { position: vec4(f32(vertex.index), 0.0, 0.5, 1.0) }, values }
+}
+
+@fragment
+fn shade() -> vec4 { vec4(1.0) }
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let pass = begin_screen_pass(clear: vec4(0.0))
+    draw(pass, cover.bind(values: (1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0,
+        10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0)), shade, vertices: 3)
+    pass.present()
+}
+"#;
+        let (_, errors) = lower_source(&source.replace(", 17.0", ""));
+        assert!(!wrela_diag::has_errors(&errors), "16 locations: {errors:?}");
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, codes::E0602);
+        assert!(errors[0].message.contains("passes 17 values"), "{errors:?}");
+    }
+
+    #[test]
+    fn unused_kernels_check_workgroup_hazards_and_barrier_uniformity() {
+        let source = r#"
+use std::gpu::{LocalId, Shared, barrier}
+
+@compute(64)
+fn race(row: mut Shared<f32, 64>, lid: LocalId) {
+    let mine = row.chunk(lid)
+    row.write(mine, 0, 1.0)
+    let _ = row.get(0)
+}
+
+@compute(64)
+fn divergent(row: mut Shared<f32, 64>, lid: LocalId) {
+    if lid.x < 32 { barrier(mut row) }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(errors.iter().any(|d| d.code == codes::E0609), "{errors:?}");
+        assert!(errors.iter().any(|d| d.code == codes::E0610), "{errors:?}");
     }
 
     #[test]

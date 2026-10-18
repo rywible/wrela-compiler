@@ -4,6 +4,7 @@
 // frame: it doesn't wait behind other messages.
 
 import { ASSIST_ACTIONS, BUTTONS, COMPOSE_MAX, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
+import { parseJson } from "./json.ts";
 
 /** One event's EVENT_SIZE bytes: its kind, its modifiers, then four words. */
 export function encodeEvent(kind: number, modifiers: number, a: number, b: number, c: number, d: number): Uint8Array {
@@ -118,7 +119,7 @@ export function arrivals(script: Scripted[]): Arrivals {
 export function parseScript(text: string): Scripted[] {
   let value: unknown;
   try {
-    value = JSON.parse(text);
+    value = parseJson(text);
   } catch (e) {
     throw new Error(`the script isn't JSON: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -229,10 +230,7 @@ export function parseScript(text: string): Scripted[] {
         const t = o.text;
         if (typeof t !== "string") throw at("`text` is missing");
         for (const c of t) {
-          const cp = c.codePointAt(0)!;
-          // A lone surrogate isn't a Unicode scalar value (serde_json refuses the script too).
-          if (cp >= 0xd800 && cp <= 0xdfff) throw at("`text` has a lone surrogate, which isn't a character");
-          push(textEvent(cp));
+          push(textEvent(c.codePointAt(0)!));
         }
         break;
       }
@@ -240,9 +238,6 @@ export function parseScript(text: string): Scripted[] {
         const t = o.text;
         if (typeof t !== "string") throw at("`text` is missing");
         const chars = [...t];
-        if (chars.some(c => { const cp = c.codePointAt(0)!; return cp >= 0xd800 && cp <= 0xdfff; })) {
-          throw at("`text` has a lone surrogate, which isn't a character");
-        }
         if (chars.length > COMPOSE_MAX) throw at(`\`text\` is more than ${COMPOSE_MAX} characters`);
         for (const e of composeEvents(t)) push(e);
         break;

@@ -206,20 +206,29 @@ pub fn session_path(path: &str) -> Option<(&str, Option<u64>)> {
     Some((name, pair))
 }
 
+/// The next non-reserved connection number, if the server still has one.
+fn connection_id(next: &AtomicU32) -> Option<u32> {
+    next.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+        (id < wrela_host::rooms::POISONED).then(|| id + 1)
+    })
+    .ok()
+}
+
 impl Rooms {
-    /// Lets connection `conn` of a client of pair `pair` into room `name`, started if it isn't
-    /// running: the room's queue. The build is the room's, under the same lock as a new build.
+    /// Lets a client of pair `pair` into room `name`, started if it isn't running: its
+    /// connection number and the room's queue. The build is checked under the same lock as a
+    /// new build.
     fn join(
         self: &Arc<Self>,
         name: &str,
         pair: Option<u64>,
-        conn: u32,
         link: Link,
-    ) -> Result<SyncSender<ToRoom>, Refusal> {
+    ) -> Result<(u32, SyncSender<ToRoom>), Refusal> {
         let mut state = self.state.lock().expect("the rooms' lock");
         if pair.is_none() || state.build.pair != pair {
             return Err(Refusal::Pair);
         }
+        let conn = connection_id(&self.next_conn).ok_or(Refusal::Busy)?;
         let tx = match state.rooms.get(name) {
             Some(r) => r.tx.clone(),
             None => {
@@ -241,7 +250,7 @@ impl Rooms {
             }
         };
         tx.try_send(ToRoom::Opened(conn, link)).map_err(|_| Refusal::Busy)?;
-        Ok(tx)
+        Ok((conn, tx))
     }
 
     /// From now on, rooms run `build`: each room running closes its connections and stops.
@@ -478,11 +487,10 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
         request.not_found().await;
         return;
     };
-    let conn = rooms.next_conn.fetch_add(1, Ordering::Relaxed);
     let (tx, mut from_room) = tokio::sync::mpsc::channel(QUEUE);
     let link = Link { tx, held: Arc::new(AtomicUsize::new(0)) };
-    let to_room = match rooms.join(&name, pair, conn, link) {
-        Ok(to_room) => to_room,
+    let (conn, to_room) = match rooms.join(&name, pair, link) {
+        Ok(joined) => joined,
         Err(Refusal::Pair) => return request.forbidden().await,
         Err(Refusal::Busy) => return request.too_many_requests().await,
     };
@@ -515,18 +523,27 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
         while let Some((o, _share)) = from_room.recv().await {
             match o {
                 Out::Send(_, bytes) => {
+                    if bytes.len() > MAX_FRAME {
+                        break;
+                    }
                     let wrote = tokio::time::timeout(WRITE, send.write_all(&frame(&bytes))).await;
                     if !matches!(wrote, Ok(Ok(()))) {
-                        break;
+                        return false;
                     }
                 }
                 Out::Close(_) => break,
             }
         }
+        true
     };
-    tokio::select! {
-        () = reading => {}
-        () = writing => {}
+    let finish = tokio::select! {
+        () = reading => false,
+        finish = writing => finish,
+    };
+    if finish {
+        // A successful write only queued its bytes. Let the peer acknowledge them before
+        // closing the session, which would otherwise drop the last frame's tail.
+        let _ = tokio::time::timeout(WRITE, send.finish()).await;
     }
     // What waited for it goes now, and with it the bytes it held.
     from_room.close();
@@ -650,6 +667,16 @@ mod tests {
         // Every byte comes back.
         drop((held, mine));
         assert_eq!((hog.load(Ordering::Acquire), shared.load(Ordering::Acquire)), (0, 0));
+    }
+
+    #[test]
+    fn connection_numbers_stop_before_the_reserved_range() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        let next = AtomicU32::new(wrela_host::rooms::POISONED - 1);
+        assert_eq!(super::connection_id(&next), Some(wrela_host::rooms::POISONED - 1));
+        assert_eq!(super::connection_id(&next), None);
+        assert_eq!(super::connection_id(&next), None);
+        assert_eq!(next.load(Ordering::Relaxed), wrela_host::rooms::POISONED);
     }
 
     #[test]

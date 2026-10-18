@@ -429,10 +429,15 @@ fn run_one(
         Ok(addr) if used <= fuel => running.read(|bytes| {
             let mem = Memory { bytes };
             wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
-                Box::new(Diagnostic::internal(format!(
-                    "reading the value of `{}`: {e}",
-                    checked.program.const_(c).name
-                )))
+                let def = checked.program.const_(c);
+                Box::new(match e {
+                    wrela_lower::ReadError::TooDeep => Diagnostic::new(
+                        codes::E0704,
+                        def.span,
+                        format!("computing {} failed: {e}", def.shown()),
+                    ),
+                    _ => Diagnostic::internal(format!("reading the value of `{}`: {e}", def.name)),
+                })
             })
         }),
         // Its threads' work together was past its fuel.

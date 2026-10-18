@@ -154,6 +154,25 @@ test("a link is an <a> to its address: a plain click is the program's, a modifie
   expect([el(1).style.left, el(1).style.top]).toEqual(["5px", "15px"]);
 }));
 
+test("a link without an address activates from the keyboard", () => onPage((page) => {
+  const { o, events, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Link, label: "Run" }]));
+  el(1).focus();
+  events.length = 0;
+  const enter = domEvent("keydown", { key: "Enter" });
+  el(1).dispatchEvent(enter);
+  expect(events).toEqual([assistEvent(1, Action.Activate)]);
+  expect(enter.defaultPrevented).toBe(true);
+}));
+
+test("checkboxes and switches activate from an assistive click", () => onPage((page) => {
+  const { o, events, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Checkbox, label: "Accept" }, { id: 2, role: Role.Switch, label: "Sound" }]));
+  el(1).click();
+  el(2).click();
+  expect(events).toEqual([assistEvent(1, Action.Activate), assistEvent(2, Action.Activate)]);
+}));
+
 test("an update keeps each element and its focus; the program's focus moves it; leaving says so", () => onPage((page) => {
   const { o, events, canvas, el } = overlay(page);
   o.tree(tree([{ id: 1, role: Role.Button, label: "A" }, { id: 2, role: Role.Button, label: "B" }]));
@@ -252,6 +271,26 @@ test("the program replaces a field's text only if it has read the field's newest
   made.value = "again!";
   made.dispatchEvent(domEvent("input"));
   expect(new DataView(o.fieldState(1).buffer).getUint32(4, true)).toBe(4);
+}));
+
+test("a node that changes from a field drops its old field state", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Field, field: { replace: 1, text: "old" } }]));
+  const field = el(1);
+  o.tree(tree([{ id: 1, role: Role.Button, label: "Continue" }]));
+  expect(el(1)).not.toBe(field);
+  expect(() => o.fieldState(1)).toThrow("node 1 has no field");
+}));
+
+test("a field can leave its form while keeping its element and text", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Field, field: { form: 1, replace: 1, text: "draft" } }]));
+  const field = el(1);
+  o.tree(tree([{ id: 1, role: Role.Field, field: { replace: 1 } }]));
+  expect(el(1)).toBe(field);
+  expect(field.value).toBe("draft");
+  expect(field.parentElement === (o.root as unknown as FakeElement)).toBe(true);
+  expect(() => o.submit(1)).toThrow("no form 1");
 }));
 
 test("tabs, sliders and a modal dialog have their keyboard patterns", () => onPage((page) => {

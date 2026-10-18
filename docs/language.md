@@ -159,6 +159,7 @@ Limits keep every build finite.
 - Expressions, blocks, types and patterns nest at most 128 deep, and an expression's tree is at most 512 deep (E0112).
 - A generic function's instantiations go at most 256 calls deep.
 - A type has at most 4096 parts, counting a part each time it appears (E0412, E0329). This holds for any value's type and for type arguments: a type that doubles at each step, like `(a, a)`, grows past any machine.
+- A computed constant's value nests at most 256 aggregate containers deep (E0704). Each struct, tuple, enum, array, vector, matrix, `Box` and `Vec` counts once along a path through the value; scalar leaves do not count. This also bounds chains through heap pointers.
 - A value larger than the CPU stack traps when the function that holds it is entered, as a stack overflow does.
 - In GPU code, a type larger than WGSL allows (2³¹ − 1 bytes) is an error (E0702).
 
@@ -1601,6 +1602,7 @@ All three are in std, built on the unsafe core (§6.12), and none of them is spe
   - `f` is `@deterministic`, so the result is a function of `input` alone, whichever thread runs it and whenever.
   - A task that no helper has started runs inside `join`. With no helpers, every task runs there, and a task that joins another can't deadlock.
   - A trap in a task is the program's panic at its `join`.
+  - Dropping a task completes its work as `join` does, then drops the result and releases its slot and memory. A trap is the program's panic there too.
   - `done()` says whether the task has finished, and is `nondet`. With no helpers (a page on a machine with two cores), `done()` runs a task that hasn't run yet, so a program that polls a task before it joins it doesn't wait forever.
   - A parallel call (`par_each_mut`, §16.1) inside a task, or inside a `@parallel fn`, runs on that thread alone.
 

@@ -1321,13 +1321,39 @@ impl Ad<'_> {
             }
             B::Normalize => d[0].map(|dx| {
                 // (dx - n dot(n, dx)) / |x|
-                let f32 = self.m.types.f32();
-                let len = self.builtin(out, B::Length, vec![a0], f32);
-                let ndx = self.builtin(out, B::Dot, vec![v, dx], f32);
+                let scalar = self.m.types.scalar(self.m.types.element_scalar(a0ty).unwrap());
+                let len = self.builtin(out, B::Length, vec![a0], scalar);
+                let ndx = self.builtin(out, B::Dot, vec![v, dx], scalar);
                 let proj = self.bin(out, BinOp::Mul, v, ndx, ty);
                 let num = self.bin(out, BinOp::Sub, dx, proj, ty);
                 self.div(out, num, len, ty)
             }),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn f64_vector_normalization_has_a_valid_derivative() {
+        let mut m = Module::default();
+        let ty = m.types.vector_of(Scalar::F64, 2);
+        let mut f = Function::new(
+            "normalize_double",
+            vec![Param { name: "x".into(), ty, by_ref: false, mutable: false }],
+            Some(ty),
+        );
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, ty, Expr::Param(0));
+        let normalized = f.let_(&mut body, ty, Expr::Builtin(Builtin::Normalize, vec![x]));
+        body.push(Stmt::Return(Some(normalized)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the source is valid IR");
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], 1, Target::Cpu, false)
+            .expect("normalization is differentiable");
+        verify(&m).expect("the derivative keeps the vector's component type");
     }
 }

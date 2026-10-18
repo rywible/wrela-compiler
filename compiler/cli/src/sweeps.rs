@@ -336,7 +336,8 @@ impl Path {
             let past = if last { (-g1).max(0.0) } else { 0.0 };
             let outside =
                 if first { 0.0 } else { (-g0).max(0.0) } + if last { 0.0 } else { (-g1).max(0.0) };
-            let k = (rho * rho + outside * outside).sqrt();
+            let k =
+                if outside > 0.0 { 10000.0 + (rho * rho + outside * outside).sqrt() } else { rho };
             if k < key {
                 key = k;
                 best = (self.along[i] + t + before + past, rho, theta);
@@ -991,4 +992,26 @@ fn sweep_lm(
     };
     let stop = Stop { steps: 60, gain: 1e-5, damping: 1e6 };
     levenberg_marquardt(x, bumps, r_max, stop, cost, normal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn place_prefers_a_segment_whose_planes_hold_the_point() {
+        let diagonal = 0.5f64.sqrt();
+        let path = Path {
+            at: vec![[0.0; 3], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0]],
+            normal: vec![[1.0, 0.0, 0.0], [diagonal, diagonal, 0.0], [0.0, 1.0, 0.0]],
+            up: vec![[0.0, 0.0, 1.0]; 3],
+            along: vec![0.0, 1.0, 2.0],
+        };
+        let (along, rho, _) = path.place([1.2, -0.3, 0.0]);
+        // The first segment's end plane is x + y = 1. This point is before
+        // that plane, so the engine chooses the first segment, even though
+        // the next segment's end section is closer in Euclidean distance.
+        assert!(along < 1.0, "assigned to the next segment: {along}");
+        assert!(rho > 0.4, "used the next segment's radius: {rho}");
+    }
 }

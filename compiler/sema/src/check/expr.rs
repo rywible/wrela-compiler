@@ -198,7 +198,11 @@ impl<'p> Checker<'p> {
                     }
                 });
                 // `[x; N]` with `const N: u32`: its length is known once it's instantiated.
-                let param_len = match &count.kind {
+                let mut param_count = count.as_ref();
+                while let ast::ExprKind::Paren(inner) = &param_count.kind {
+                    param_count = inner;
+                }
+                let param_len = match &param_count.kind {
                     ast::ExprKind::Path(p) if p.is_single() && !local_len => self
                         .scope
                         .param(&p.segments[0].ident.name)

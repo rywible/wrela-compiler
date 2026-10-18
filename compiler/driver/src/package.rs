@@ -141,8 +141,12 @@ fn walk(
 }
 
 /// Whether `dir` holds a `.wrela` file, in it or below it, as [`walk`] would find one: hidden
-/// entries are skipped and symbolic links aren't followed (so a cycle of links ends).
+/// entries and other packages are skipped, and symbolic links aren't followed (so a cycle of
+/// links ends).
 fn has_wrela_files(dir: &Path) -> bool {
+    if dir.join("wrela.toml").is_file() {
+        return false;
+    }
     fs::read_dir(dir).is_ok_and(|entries| {
         entries.filter_map(Result::ok).any(|e| {
             let p = e.path();
@@ -187,6 +191,20 @@ mod tests {
         fs::write(d.join("fn.wrela"), "").expect("write");
         let errs = find_files(&d).expect_err("bad names");
         assert_eq!(errs.len(), 2);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn nested_packages_under_nonmodule_directories_are_not_modules() {
+        let d = tmp("nested-package");
+        fs::write(d.join("main.wrela"), "").expect("source");
+        fs::create_dir_all(d.join("web-assets/vendor")).expect("directory");
+        fs::write(d.join("web-assets/vendor/wrela.toml"), "").expect("manifest");
+        fs::write(d.join("web-assets/vendor/main.wrela"), "").expect("package source");
+        let files = find_files(&d).expect("nested package is not a module");
+        assert_eq!(files.len(), 1);
+        fs::write(d.join("web-assets/own.wrela"), "").expect("invalid module");
+        assert!(find_files(&d).is_err(), "own modules still need valid directory names");
         let _ = fs::remove_dir_all(&d);
     }
 

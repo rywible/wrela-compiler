@@ -30,7 +30,8 @@ SOURCES = ("examples", "games", "engine", "compiler/std", "compiler/tests/fields
            "compiler/tests/math", "compiler/tests/sketches", "compiler/tests/numerics",
            "compiler/tests/render", "compiler/tests/queries", "compiler/tests/simd",
            "compiler/tests/input", "compiler/tests/lift", "compiler/tests/texels",
-           "compiler/tests/shader_params", "compiler/tests/unroll", "ui", "studio", "platform",
+           "compiler/tests/shader_params", "compiler/tests/unroll", "ui", "studio",
+           "studio/tests/views", "docsite", "platform",
            "console")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")

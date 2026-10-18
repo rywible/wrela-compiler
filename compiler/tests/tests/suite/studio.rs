@@ -31,6 +31,11 @@ const SIZE: (u32, u32) = (512, 512);
 /// How many frames to wait for the lens at most.
 const WAIT: u32 = 400;
 
+#[test]
+fn ordinary_views_size_their_buffers_after_silhouettes() {
+    assert_eq!(super::tests_pass(&repo_root().join("studio/tests/views")), 1);
+}
+
 /// AC9's limits, in metres.
 const ERROR: f64 = 0.001;
 const LITERALS: usize = 8;

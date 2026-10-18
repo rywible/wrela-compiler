@@ -72,6 +72,13 @@ pub fn trap_at_join(n: u32) -> u32 {
     take j.join() + other % 2
 }
 
+/// Dropping an unjoined task completes it and raises its panic at this call too.
+pub fn trap_at_drop(n: u32) -> u32 {
+    let pending = spawn(n, checked)
+    let other = churn((1, 1000))
+    n * 2 + other % 2
+}
+
 /// Parallel work inside a parallel closure: the inner work runs on that thread alone, and the
 /// results are the same whatever the helpers.
 pub fn nested_parallel(rows: u32) -> u32 {

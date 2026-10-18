@@ -76,6 +76,14 @@ impl<'a> Lexer<'a> {
         self.text.get(pos..).and_then(|s| s.chars().next())
     }
 
+    /// Identifier continuation for L3's recovery too: a non-ASCII name stays one token.
+    fn ident_continue_at(&self, pos: usize) -> bool {
+        self.src.get(pos).is_some_and(|&b| {
+            is_ident_continue(b)
+                || b >= 0x80 && self.char_at(pos).is_some_and(char::is_alphanumeric)
+        })
+    }
+
     fn error(&mut self, d: Diagnostic) {
         self.out.diagnostics.push(d);
     }
@@ -330,7 +338,7 @@ impl<'a> Lexer<'a> {
             self.push(kind, start, line_break_before);
             return true;
         }
-        if b == b'_' && !self.peek(1).is_some_and(is_ident_continue) {
+        if b == b'_' && !self.ident_continue_at(start + 1) {
             self.pos += 1;
             self.push(TokenKind::Underscore, start, line_break_before);
         } else if is_ident_start(b)
@@ -399,8 +407,7 @@ impl<'a> Lexer<'a> {
         [3, 2, 1].into_iter().find_map(|n| rest.get(..n).and_then(TokenKind::punctuation)).filter(
             |k| {
                 // `_` followed by an identifier character is an identifier (L10).
-                *k != TokenKind::Underscore
-                    || !rest.as_bytes().get(1).copied().is_some_and(is_ident_continue)
+                *k != TokenKind::Underscore || !self.ident_continue_at(self.pos + 1)
             },
         )
     }

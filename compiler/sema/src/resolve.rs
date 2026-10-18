@@ -4,6 +4,7 @@ use crate::builtins::{BuiltinFn, BuiltinTy};
 use crate::defs::*;
 use crate::program::Program;
 use crate::ty::*;
+use std::collections::HashMap;
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast;
 
@@ -757,6 +758,12 @@ pub fn resolve_type(
         }
         ast::TypeExprKind::Array(elem, len) => {
             let e = resolve_type(p, diags, scope, elem, TyPos::Normal);
+            let len = len.as_deref().map(|mut len| {
+                while let ast::ExprKind::Paren(inner) = &len.kind {
+                    len = inner;
+                }
+                len
+            });
             if let Some(len) = len
                 && let ast::ExprKind::Path(path) = &len.kind
                 && let Some(seg) = path.segments.iter().find(|s| s.generics.is_some())
@@ -940,9 +947,9 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
     Diagnostic::new(
         codes::E0325,
         len.span,
-        "an array length is an integer literal or a constant holding one",
+        "an array length is an integer constant expression with no calls",
     )
-    .with_note("evaluating expressions at compile time is tier 1")
+    .with_note("its value must fit a `u32`, without overflow or division by zero")
 }
 
 /// How many variants enum `a` has, when it can be an array's length: its variants hold nothing
@@ -958,49 +965,183 @@ pub fn enum_length(p: &Program, a: AdtId) -> Option<u32> {
     dense.then_some(def.variants().len() as u32)
 }
 
-/// The value of an array length: an integer literal, or a constant holding one, resolved in
-/// `module`; a constant's own value is resolved in the module that defines it. `None` for
-/// anything else, including a constant whose value refers back to itself.
+/// The value of an array length: integer arithmetic without calls, resolved in `module`;
+/// a constant's own value is resolved in the module that defines it, with its own integer
+/// type. Unconstrained literals in a length use `u32`. `None` for invalid operations, a
+/// negative result, a result past `u32`, or a constant cycle.
 pub fn const_u32(p: &Program, module: ModuleId, e: &ast::Expr) -> Option<u32> {
-    length(p, module, e, &mut Vec::new())
+    let mut constants = IntegerConstants::default();
+    let ty = integer_hint(p, module, e, &mut constants)?.unwrap_or(IntTy::U32);
+    u32::try_from(integer_value(p, module, e, ty, &mut constants)?).ok()
 }
 
 /// The value of constant `c` as an array length: [`const_u32`] of its value.
 fn const_value_u32(p: &Program, c: ConstId) -> Option<u32> {
-    let def = p.const_(c);
-    length(p, def.module, &def.value, &mut vec![c])
+    u32::try_from(integer_constant(p, c, &mut IntegerConstants::default())?.0).ok()
 }
 
-/// [`const_u32`]; `visiting` holds the constants whose values are being read.
-fn length(
+/// Each referenced constant is evaluated once, even when many expressions share it.
+#[derive(Default)]
+struct IntegerConstants {
+    visiting: Vec<ConstId>,
+    values: HashMap<ConstId, Option<(i128, IntTy)>>,
+}
+
+/// A constant's integer value and type, before body checking has resolved all constant types.
+fn integer_constant(
+    p: &Program,
+    c: ConstId,
+    constants: &mut IntegerConstants,
+) -> Option<(i128, IntTy)> {
+    if let Some(&value) = constants.values.get(&c) {
+        return value;
+    }
+    if constants.visiting.contains(&c) {
+        return None;
+    }
+    constants.visiting.push(c);
+    let result = (|| {
+        let def = p.const_(c);
+        // A later declaration's annotation may not have been resolved yet. Resolve a scalar
+        // path here; aggregate annotations can't be integers and may depend on lengths.
+        let written = match (&def.ty, &def.annotation) {
+            (Some(t), _) => Some(*t),
+            (None, Some(annotation)) => {
+                let mut annotation = annotation;
+                while let ast::TypeExprKind::Paren(inner) = &annotation.kind {
+                    annotation = inner;
+                }
+                if !matches!(annotation.kind, ast::TypeExprKind::Path(_)) {
+                    return None;
+                }
+                Some(resolve_type(
+                    p,
+                    &mut Vec::new(),
+                    &Scope::new(def.module),
+                    annotation,
+                    TyPos::Normal,
+                ))
+            }
+            (None, None) => None,
+        };
+        let ty = match written {
+            Some(t) => match p.types.kind(t) {
+                TyKind::Int(ty) => *ty,
+                _ => return None,
+            },
+            None => integer_hint(p, def.module, &def.value, constants)?.unwrap_or(IntTy::I32),
+        };
+        Some((integer_value(p, def.module, &def.value, ty, constants)?, ty))
+    })();
+    constants.visiting.pop();
+    constants.values.insert(c, result);
+    result
+}
+
+/// The concrete integer type imposed by an expression's constants, if any. Literal types
+/// stay open, as they do in body inference. `None` rejects non-integers and conflicting types.
+fn integer_hint(
     p: &Program,
     module: ModuleId,
     e: &ast::Expr,
-    visiting: &mut Vec<ConstId>,
-) -> Option<u32> {
+    constants: &mut IntegerConstants,
+) -> Option<Option<IntTy>> {
     match &e.kind {
-        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
-            v.ok().and_then(|v| u32::try_from(v).ok())
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(_), .. }) => Some(None),
+        ast::ExprKind::Paren(inner) | ast::ExprKind::Unary(_, inner) => {
+            integer_hint(p, module, inner, constants)
         }
-        ast::ExprKind::Paren(inner) => length(p, module, inner, visiting),
+        ast::ExprKind::Binary(ast::BinOp::Shl | ast::BinOp::Shr | ast::BinOp::Pow, a, _) => {
+            integer_hint(p, module, a, constants)
+        }
+        ast::ExprKind::Binary(_, a, b) => {
+            let (a, b) =
+                (integer_hint(p, module, a, constants)?, integer_hint(p, module, b, constants)?);
+            if a.is_some() && b.is_some() && a != b { None } else { Some(a.or(b)) }
+        }
         ast::ExprKind::Path(path) => {
-            let c = match resolve_value_item(p, module, path)? {
-                Res::Const(c) => c,
-                // `[T; E]`: one element for each of an enum's variants (`ty.enum-arrays`).
-                Res::Adt(a) => return enum_length(p, a),
-                _ => return None,
-            };
-            if visiting.contains(&c) {
+            if path.segments.iter().any(|s| s.generics.is_some()) {
                 return None;
             }
-            visiting.push(c);
-            let def = p.const_(c);
-            let v = length(p, def.module, &def.value, visiting);
-            visiting.pop();
-            v
+            match resolve_value_item(p, module, path)? {
+                Res::Const(c) => Some(Some(integer_constant(p, c, constants)?.1)),
+                Res::Adt(a) => enum_length(p, a).map(|_| Some(IntTy::U32)),
+                _ => None,
+            }
         }
         _ => None,
     }
+}
+
+/// Evaluates only the integer operations available without calls. Each intermediate value
+/// must fit its inferred type. Shifts truncate bits as the CPU does and reject large amounts.
+fn integer_value(
+    p: &Program,
+    module: ModuleId,
+    e: &ast::Expr,
+    ty: IntTy,
+    constants: &mut IntegerConstants,
+) -> Option<i128> {
+    let min = if ty.signed() { -(1i128 << (ty.bits() - 1)) } else { 0 };
+    let max = i128::from(ty.max());
+    let truncate = |value: i128| {
+        let bits = value & ((1i128 << ty.bits()) - 1);
+        if ty.signed() && bits > max { bits - (1i128 << ty.bits()) } else { bits }
+    };
+    let value = match &e.kind {
+        ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => i128::from(v.ok()?),
+        ast::ExprKind::Paren(inner) => integer_value(p, module, inner, ty, constants)?,
+        ast::ExprKind::Unary(ast::UnOp::Neg, inner) if ty.signed() => {
+            // A negative literal can name the signed minimum, whose positive part doesn't fit.
+            let mut literal = inner.as_ref();
+            while let ast::ExprKind::Paren(inner) = &literal.kind {
+                literal = inner;
+            }
+            match &literal.kind {
+                ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(v), .. }) => {
+                    -i128::from(v.ok()?)
+                }
+                _ => integer_value(p, module, inner, ty, constants)?.checked_neg()?,
+            }
+        }
+        ast::ExprKind::Unary(ast::UnOp::Not, inner) => {
+            truncate(!integer_value(p, module, inner, ty, constants)?)
+        }
+        ast::ExprKind::Binary(op, a, b) => {
+            let a = integer_value(p, module, a, ty, constants)?;
+            let amount = matches!(op, ast::BinOp::Shl | ast::BinOp::Shr | ast::BinOp::Pow);
+            let b = integer_value(p, module, b, if amount { IntTy::U32 } else { ty }, constants)?;
+            match op {
+                ast::BinOp::Add => a.checked_add(b)?,
+                ast::BinOp::Sub => a.checked_sub(b)?,
+                ast::BinOp::Mul => a.checked_mul(b)?,
+                ast::BinOp::Div => a.checked_div(b)?,
+                ast::BinOp::Rem => a.checked_rem(b)?,
+                ast::BinOp::Pow => a.checked_pow(u32::try_from(b).ok()?)?,
+                ast::BinOp::Shl if b < i128::from(ty.bits()) => truncate(a << b),
+                ast::BinOp::Shr if b < i128::from(ty.bits()) => a >> b,
+                ast::BinOp::BitAnd => a & b,
+                ast::BinOp::BitOr => a | b,
+                ast::BinOp::BitXor => a ^ b,
+                _ => return None,
+            }
+        }
+        ast::ExprKind::Path(path) if path.segments.iter().all(|s| s.generics.is_none()) => {
+            match resolve_value_item(p, module, path)? {
+                Res::Const(c) => {
+                    let (value, actual) = integer_constant(p, c, constants)?;
+                    if ty != actual {
+                        return None;
+                    }
+                    value
+                }
+                Res::Adt(a) => i128::from(enum_length(p, a)?),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    (min <= value && value <= max).then_some(value)
 }
 
 /// The item a value path names from `module` (`N`, `a::inner::N`), if it names one; generic
@@ -1380,6 +1521,111 @@ fn projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn array_lengths_accept_integer_constant_expressions() {
+        let source = "\
+            struct Samples { values: [u32; COUNT - 2] }\n\
+            const COUNT: u32 = WIDTH * 3 + 1\n\
+            const WIDTH: u32 = 2\n\
+            pub fn count() -> u32 {\n\
+                let values: [u32; (WIDTH + 3)] = [0; COUNT - 2]\n\
+                values.len()\n\
+            }\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn constant_parameter_lengths_accept_parentheses() {
+        let source = "\
+            pub fn count<const N: u32>() -> u32 {\n\
+                let values: [u32; (N)] = [0; ((N))]\n\
+                values.len()\n\
+            }\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn array_length_constants_use_later_type_aliases() {
+        let source = "\
+            type Samples = [u32; COUNT]\n\
+            type Size = u32\n\
+            const COUNT: Size = WIDTH + 1\n\
+            const WIDTH: Size = 2\n\
+            pub fn count(values: Samples) -> u32 { values.len() }\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn alias_length_parameters_shadow_global_constants() {
+        let source = "\
+            type Buffer<const N: u32> = [u32; N]\n\
+            const N: Buffer<2> = [1, 2]\n\
+            type Identity<Identity> = Identity\n\
+            pub fn identity(value: Identity<u32>) -> u32 { value }\n\
+            pub fn size() -> u32 { N.len() }\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn integer_length_operations_do_not_wrap_or_trap() {
+        let mut diagnostics = Vec::new();
+        let p = crate::collect::collect(
+            crate::test_units(
+                "\
+                const WIDTH: u32 = 2\n\
+                const SIGNED = !0\n\
+                const BACK = -2 + 4\n\
+                const BYTE: u8 = 255\n\
+                const FLOAT: f32 = 2\n",
+            ),
+            &crate::collect::PackageInfo::std_and_program(),
+            &mut diagnostics,
+        );
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        let module = p.main.expect("main");
+        for (expression, expected) in [
+            ("WIDTH ** 3", Some(8)),
+            ("SIGNED", None),
+            ("SIGNED + 2", Some(1)),
+            ("BACK", Some(2)),
+            ("BYTE << 1", Some(254)),
+            ("BYTE + 1", None),
+            ("FLOAT", None),
+            ("(9 / 2) + (9 % 2)", Some(5)),
+            ("(1 << 3) | (7 & 3) ^ (8 >> 2)", Some(9)),
+            ("4294967295 + 1", None),
+            ("0 - 1", None),
+            ("65536 * 65536", None),
+            ("2 ** 32", None),
+            ("1 / 0", None),
+            ("1 % 0", None),
+            ("1 << 32", None),
+            ("1 >> 32", None),
+            ("WIDTH::<u32> + 1", None),
+            ("2 ** WIDTH::<u32>", None),
+            ("(!0) ^ 4294967295", Some(0)),
+            ("width()", None),
+        ] {
+            let parsed = wrela_syntax::parse(
+                wrela_diag::FileId(0),
+                &format!("const LENGTH = {expression}\n"),
+            );
+            assert!(!parsed.has_errors(), "{:#?}", parsed.diagnostics);
+            let ast::ItemKind::Const(c) = &parsed.file.items[0].kind else {
+                panic!("a constant");
+            };
+            assert_eq!(const_u32(&p, module, &c.value), expected, "{expression}");
+        }
+    }
 
     #[test]
     fn frontend_perf_suggestions_preserve_unicode_distance_and_ties() {

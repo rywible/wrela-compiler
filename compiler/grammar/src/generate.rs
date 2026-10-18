@@ -509,8 +509,12 @@ impl<'g> Generator<'g> {
 
     /// A random small edit of a derivation (delete, insert, replace or swap a token), for
     /// checking that the two parsers also agree on near-miss programs, most of them invalid.
-    /// Only edits that a text can spell ([`renderable`]) are made.
+    /// Only edits that a text can spell ([`renderable`]) are made. A grammar whose only
+    /// terminal is EOF has no mutation to draw, so its derivation is left unchanged.
     pub fn mutate(&self, terms: &[Terminal], rng: &mut Rng) -> Vec<Terminal> {
+        if self.terminals.iter().all(|t| *t == Terminal::Token(TokenKind::Eof)) {
+            return terms.to_vec();
+        }
         loop {
             let t = self.mutate_once(terms, rng);
             if renderable(&t) {
@@ -875,6 +879,14 @@ pub(crate) fn glued_gt(run: TokenKind, next: TokenKind) -> Option<TokenKind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_eof_only_derivation_has_no_mutation() {
+        let g = Grammar::parse("file ::= EOF\n").unwrap();
+        let generator = Generator::new(&g, GenConfig::default());
+        let terms = g.terminals();
+        assert_eq!(generator.mutate(&terms, &mut Rng::new(1)), terms);
+    }
 
     #[test]
     fn glue_rules_match_the_lexer() {

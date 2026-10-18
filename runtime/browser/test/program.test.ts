@@ -356,6 +356,63 @@ test("a failed audio or ticker start fails the call even if the module catches i
   }
 });
 
+test("invalid memory and request imports fail the call even if the module catches them", async () => {
+  const cases: { name: string; args: number[]; result?: boolean; message: string }[] = [
+    { name: "request_take", args: [9, 0], message: "request_take(9): the request isn't answered" },
+    { name: "input", args: [65536, 1], result: true, message: "input(65536, 1) reaches past the end of the program's memory" },
+    { name: "keep", args: [65536, 1], message: "keep(65536, 1) reaches past the end of the program's memory" },
+    { name: "kept", args: [65536, 1], result: true, message: "kept(65536, 1) reaches past the end of the program's memory" },
+    { name: "clock", args: [65536], message: "clock(65536) reaches past the end of the program's memory" },
+    { name: "print", args: [65536, 1], message: "print(65536, 1) reaches past the end of the program's memory" },
+    { name: "phase", args: [65536, 1], message: "phase(65536, 1) reaches past the end of the program's memory" },
+  ];
+  for (const { name, args, result, message } of cases) {
+    const host: FuncImport = { module: "wrela", name, kind: "func", type: { params: args.map(() => "i32"), results: result ? ["i32"] : [] } };
+    const body = [0x06, 0x40, ...args.flatMap(op.i32), ...op.call(0), ...(result ? [0x1a] : []), 0x19, 0x0b];
+    const program = await Program.load(
+      buildModule({ imports: [host], memory: 1, funcs: [{ type: FRAME_TYPE, body, export: "frame" }] }),
+      checker(), new Recorder(), { kept: Uint8Array.of(1) },
+    );
+    program.queueInput(new Uint8Array(EVENT_SIZE));
+    expect(() => program.frame(0, 1, 1)).toThrow(TrapError);
+    expect(() => program.frame(0, 1, 1)).toThrow(message);
+  }
+});
+
+test("a caught host trap prevents later host side effects in the same call", async () => {
+  const KEEP: FuncImport = { module: "wrela", name: "keep", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  const PRINT: FuncImport = { ...KEEP, name: "print" };
+  const program = await load(buildModule({
+    imports: [KEEP, PRINT], memory: 1, funcs: [{ type: FRAME_TYPE, export: "frame", body: [
+      0x06, 0x40, ...op.i32(65536), ...op.i32(1), ...op.call(0), 0x19, 0x0b,
+      ...op.i32(16), ...op.i32(5), ...op.call(1),
+    ] }], data: [{ offset: 16, bytes: new TextEncoder().encode("later") }],
+  }));
+  const log = spyOn(console, "log").mockImplementation(() => {});
+  try {
+    expect(() => program.frame(0, 1, 1)).toThrow("keep(65536, 1)");
+    expect(log).not.toHaveBeenCalled();
+  } finally { log.mockRestore(); }
+});
+
+test("another thread cannot hide a refused host import or continue its host effects", async () => {
+  const PRINT: FuncImport = { module: "wrela", name: "print", kind: "func", type: { params: ["i32", "i32"], results: [] } };
+  for (const printAfter of [false, true]) {
+    const module = await WebAssembly.compile(buildModule({ imports: [SUBMIT, PRINT], memory: 1, funcs: [{
+      type: { params: [], results: [] }, export: "run", body: [
+        0x06, 0x40, ...op.i32(0), ...op.i32(0), ...op.call(0), 0x19, 0x0b,
+        ...(printAfter ? [...op.i32(16), ...op.i32(5), ...op.call(1)] : []),
+      ],
+    }], data: [{ offset: 16, bytes: new TextEncoder().encode("later") }] }));
+    const instance = await otherInstance(module, new WebAssembly.Memory({ initial: 1, maximum: 16384, shared: true }), "a helper");
+    const log = spyOn(console, "log").mockImplementation(() => {});
+    try {
+      expect(() => (instance.exports.run as () => void)()).toThrow("a helper can't call the host");
+      expect(log).not.toHaveBeenCalled();
+    } finally { log.mockRestore(); }
+  }
+});
+
 test("reports program traps", async () => {
   const program = await load(buildModule({ memory: 1, funcs: [{ type: FRAME_TYPE, body: op.unreachable, export: "frame" }] }));
   expect(() => program.frame(0, 1, 1)).toThrow(TrapError);

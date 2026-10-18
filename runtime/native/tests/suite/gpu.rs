@@ -1037,3 +1037,44 @@ fn indexed_indirect_draws_cull_and_bias() {
     }
     drop(host);
 }
+
+/// An indirect draw starts at the instance named by its arguments, including indexed draws.
+#[test]
+#[ignore = "needs a GPU"]
+fn indirect_draws_keep_their_first_instance() {
+    let source = r#"
+@vertex fn vs(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32)
+    -> @builtin(position) vec4f {
+    let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+    let position = corners[vertex] + vec2f(f32(instance) - 5.0, 0.0) * 10.0;
+    return vec4f(position, 0, 1);
+}
+@fragment fn fs() -> @location(0) vec4f { return vec4f(0, 1, 0, 1); }
+"#;
+    let pipelines = r#"[{ "name": "instance", "shader": "instance.wgsl", "kind": "render",
+        "vertex_entry": "vs", "fragment_entry": "fs",
+        "targets": [{ "color": "rgba8unorm", "depth": false }], "bindings": [] }]"#;
+    for indexed in [false, true] {
+        let mut encoder = Encoder::new();
+        encoder.create_buffer(1, 20).create_buffer(2, 12);
+        encoder.write_buffer(2, 0, &words(&[0, 1, 2]));
+        let args = if indexed { vec![3, 1, 0, 0, 5] } else { vec![3, 1, 0, 5] };
+        encoder.write_buffer(1, 0, &words(&args)).begin_screen_pass([0.0, 0.0, 0.0, 1.0]);
+        if indexed {
+            encoder.draw_indexed_indirect(0, [2, 0, 12], 1, 0, &[], &[]);
+        } else {
+            encoder.draw_indirect(0, 1, 0, &[], &[]);
+        }
+        encoder.present();
+        let wasm = wat::parse_str(common::wat::program(&[vec![encoder.finish()]])).unwrap();
+        let dir = common::build(
+            "indirect-first-instance",
+            &common::manifest(pipelines),
+            &[("instance.wgsl", source)],
+            &wasm,
+        );
+        let mut host = Host::load(&dir).expect("loads");
+        let run = host.run_frames(&[0.0], 4, 4).expect("runs");
+        assert_eq!(pixel(&run.frame, 4, 2, 2), [0, 255, 0, 255], "indexed: {indexed}");
+    }
+}

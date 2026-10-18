@@ -283,3 +283,25 @@ fn long_try_chain_is_bounded_while_parsing() {
     let parsed = parse(FileId(0), &source);
     assert!(parsed.diagnostics.iter().any(|d| d.code.as_str() == "E0112"));
 }
+
+#[test]
+fn expression_depth_limit_applies_to_attributes_and_array_lengths() {
+    let at_limit = format!("1{}", " + 1".repeat(wrela_syntax::MAX_EXPR_DEPTH as usize - 1));
+    let too_deep = format!("{at_limit} + 1");
+    for expression in [&at_limit, &too_deep] {
+        for source in [
+            format!("@attribute({expression})\nfn f() {{}}\n"),
+            format!("type T = [i32; {expression}]\n"),
+            format!("fn f(x: [i32; {expression}]) {{}}\n"),
+            format!("struct S {{ x: [i32; {expression}] }}\n"),
+        ] {
+            let parsed = parse(FileId(0), &source);
+            let errors: Vec<_> = parsed.diagnostics.iter().filter(|d| d.is_error()).collect();
+            if expression == &at_limit {
+                assert!(errors.is_empty(), "{source}: {errors:#?}");
+            } else {
+                assert!(errors.iter().any(|d| d.code.as_str() == "E0112"), "{source}: {errors:#?}");
+            }
+        }
+    }
+}

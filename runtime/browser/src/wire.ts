@@ -2,7 +2,7 @@
 // them: little-endian words, an f32 as its bits, a string as its length in bytes then its UTF-8.
 
 const ENCODER = new TextEncoder();
-const DECODER = new TextDecoder("utf-8", { fatal: true });
+const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Reads a request's body from the start; each read past its end throws. */
 export class Reader {

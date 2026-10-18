@@ -161,13 +161,18 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     // (Chrome's `AudioContext.playbackStats`, where it has them) say whether it kept up.
     const ctx = new AudioContext({ sampleRate: AUDIO_SAMPLE_RATE, latencyHint: "interactive" });
     await ctx.audioWorklet.addModule(url);
+    if (generation !== audio.generation) {
+      await ctx.close();
+      return;
+    }
     const playing = node(ctx, null);
+    audio.node = playing.node;
     await ctx.resume();
     const failure = await Promise.race([
       new Promise<null>((resolve) => setTimeout(() => resolve(null), test.live * 1000)),
       playing.failed,
     ]);
-    if (failure !== null) {
+    if (failure !== null || generation !== audio.generation) {
       await ctx.close();
       return;
     }
@@ -175,6 +180,8 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     const reported = stats ? Object.fromEntries(Object.keys(Object.getPrototypeOf(stats)).concat(Object.keys(stats)).map((k) => [k, (stats as Record<string, unknown>)[k]]).filter(([, v]) => typeof v === "number")) : null;
     await putResult(document.baseURI, "live.json", JSON.stringify({ seconds: test.live, played: ctx.currentTime, state: ctx.state, baseLatency: ctx.baseLatency, outputLatency: ctx.outputLatency, playbackStats: reported }));
     await ctx.close();
+    if (audio.node === playing.node) disconnectVoice();
+    if (generation !== audio.generation) return;
     worker.postMessage({ type: "audio-rendered" } satisfies ToWorker);
     return;
   }
@@ -182,15 +189,17 @@ async function playVoice(voice: VoiceOptions, test: TestParams | null, worker: W
     if (test.audio === 0) return;
     const ctx = new OfflineAudioContext({ numberOfChannels: AUDIO_CHANNELS, length: test.audio * AUDIO_QUANTUM, sampleRate: AUDIO_SAMPLE_RATE });
     await ctx.audioWorklet.addModule(url);
+    if (generation !== audio.generation) return;
     const playing = node(ctx, test.audio);
     const done = Promise.race([playing.rendered.then(() => null), playing.failed]);
     const started = performance.now();
     const rendered = await ctx.startRendering();
     const ms = performance.now() - started;
+    if (generation !== audio.generation) return;
     // The worklet's marker follows every print on its port, so all its lines reach the render
     // worker before `audio-rendered` lets the test save its log.
     const failure = await done;
-    if (failure !== null) return;
+    if (failure !== null || generation !== audio.generation) return;
     // The channels interleaved, as the native host gives them.
     const left = rendered.getChannelData(0);
     const right = rendered.getChannelData(1);

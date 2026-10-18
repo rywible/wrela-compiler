@@ -10,6 +10,7 @@ import { pathUrl } from "./path.ts";
 import { type Compiled, type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
 import { UTF8 } from "./wasm.ts";
+import { parseScript, type Scripted } from "./input.ts";
 
 export interface Build {
   manifest: Manifest;
@@ -40,6 +41,11 @@ async function getText(fetchFn: Fetch, url: URL): Promise<string> {
   } catch {
     throw new Error(`${url} isn't UTF-8`);
   }
+}
+
+/** Loads a test's input script, with the native host's text and input rules. */
+export async function loadScript(url: URL, fetchFn: Fetch = (url) => fetch(url)): Promise<Scripted[]> {
+  return parseScript(await getText(fetchFn, url));
 }
 
 /** Fetches and validates a build; its files resolve against `base`. */

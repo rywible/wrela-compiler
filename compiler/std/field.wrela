@@ -1182,20 +1182,18 @@ impl<S: Surface, const N: u32> Surface for SmoothUnionAll<S, N> {
         array_parts(self.parts)
     }
 
-    /// The part of the operand nearest `p`, as the blend weighs them.
+    /// The part selected by the binary smooth unions folded in order.
     fn part_at(self, p: vec3) -> (f32, u32) {
         if N == 0 {
             return (EMPTY, 0)
         }
         let (d0, p0) = self.parts[0].part_at(p)
         var d = d0
-        var nearest = d0
         var part = p0
         var first = self.parts[0].parts()
         for i in 1..N {
             let (di, pi) = self.parts[i].part_at(p)
-            if di < nearest {
-                nearest = di
+            if di < d {
                 part = first + pi
             }
             d = smin(d, di, self.k)
@@ -1764,19 +1762,28 @@ fn box_weight(x: f32, h: f32, i: f32) -> f32 {
 /// box reaches, each times its kernel's average on each axis.
 pub fn value_noise_box(p: vec3, half: vec3) -> f32 {
     let h = abs(half)
-    let lo = floor(p - h)
-    let n = floor(p + h) - lo + 2.0
+    // Work relative to p's cell, so adding one lattice step does not round back to the same
+    // coordinate where |p| is at least 2^24.
+    let cell = floor(p)
+    let f = p - cell
+    let lo = floor(f - h)
+    let n = floor(f + h) - lo + 2.0
     let (nx, ny, nz) = (u32(n.x), u32(n.y), u32(n.z))
-    let (ix, iy, iz) = (lattice_coord(lo.x), lattice_coord(lo.y), lattice_coord(lo.z))
+    let (ix, iy, iz) = (
+        lattice_coord(cell.x).wrapping_add(lattice_coord(lo.x)),
+        lattice_coord(cell.y).wrapping_add(lattice_coord(lo.y)),
+        lattice_coord(cell.z).wrapping_add(lattice_coord(lo.z)),
+    )
+    let local = f - lo
     var s = 0.0
     for k in 0..nz {
-        let wz = box_weight(p.z, h.z, lo.z + f32(k))
+        let wz = box_weight(local.z, h.z, f32(k))
         if wz != 0.0 {
             for j in 0..ny {
-                let wyz = wz * box_weight(p.y, h.y, lo.y + f32(j))
+                let wyz = wz * box_weight(local.y, h.y, f32(j))
                 if wyz != 0.0 {
                     for i in 0..nx {
-                        let w = wyz * box_weight(p.x, h.x, lo.x + f32(i))
+                        let w = wyz * box_weight(local.x, h.x, f32(i))
                         let v = lattice(
                             ix.wrapping_add(i32(i)),
                             iy.wrapping_add(i32(j)),
@@ -2540,6 +2547,32 @@ fn each_part_is_found_where_it_decides_the_distance() {
     for i in 0..1024 {
         let q = b.sample(5, i)
         assert(s.part_at(q).0 == s.distance(q), f"at ({q.x}, {q.y}, {q.z})")
+    }
+}
+
+@test
+fn array_blend_provenance_matches_the_binary_fold() {
+    let a = sphere(1.0).named("a")
+    let b = sphere(1.0).named("b")
+    let c = sphere(1.1).named("c")
+    let folded = a.smooth_union(b, k: 1.0).smooth_union(c, k: 1.0)
+    let array = [a, b, c].smooth_union(k: 1.0)
+    let p = vec3(0.0)
+    assert(folded.part_at(p).1 == 0)
+    assert(array.part_at(p).1 == folded.part_at(p).1)
+    assert(array.part_at(p).0 == folded.part_at(p).0)
+}
+
+@test
+fn noise_boxes_keep_lattice_steps_at_large_coordinates() {
+    for x in [16777216.0, 33554432.0, -33554432.0] {
+        let p = vec3(x, 0.0, 0.0)
+        assert(value_noise_box(p, vec3(0.0)) == value_noise(p))
+        let i = lattice_coord(x)
+        let want = 0.25 * lattice(i.wrapping_sub(1), y: 0, z: 0) +
+            0.5 * lattice(i, y: 0, z: 0) +
+            0.25 * lattice(i.wrapping_add(1), y: 0, z: 0)
+        assert(abs(value_noise_box(p, vec3(1.0, 0.0, 0.0)) - want) < 0.000001)
     }
 }
 

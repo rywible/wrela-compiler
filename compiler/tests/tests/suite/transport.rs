@@ -165,6 +165,89 @@ fn a_frame_too_long_closes_the_connection_and_a_wrong_path_is_refused() {
 }
 
 #[test]
+fn a_server_frame_past_the_transport_bound_closes_the_connection() {
+    let wasm = server_wasm(
+        "oversize-server-frame",
+        r#"
+use platform::net::send
+use std::input::{Event, events}
+
+pub fn serve(time: f32) {
+    for e in events() {
+        if let Event::Message { conn, .. } = e {
+            var bytes: Vec<u8> = Vec::new()
+            for i in 0..65536 {
+                bytes.push(0)
+            }
+            send(conn, bytes)
+            bytes.push(0)
+            send(conn, bytes)
+        }
+    }
+}
+"#,
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash, _server) =
+        start_build("oversize-down", &wasm, &runtime, wrela_serve::Bounds::default());
+    let path = format!("/room/large?pair={:016x}", wrela_abi::read_pair(&wasm).expect("pair"));
+    runtime.block_on(async {
+        let mut peer = connect(port, hash, &path).await.expect("connects");
+        peer.put(b"hi").await;
+        let mut header = [0u8; 3];
+        tokio::time::timeout(Duration::from_secs(3), peer.recv.read_exact(&mut header))
+            .await
+            .expect("the valid frame arrives")
+            .expect("its header");
+        assert_eq!(header, [0x80, 0x80, 0x04]);
+        let mut bytes = vec![1u8; wrela_serve::MAX_FRAME];
+        peer.recv.read_exact(&mut bytes).await.expect("the maximum-size frame");
+        assert!(bytes.iter().all(|&b| b == 0));
+        assert!(peer.ends(Duration::from_secs(3)).await, "an oversized server frame was written");
+    });
+}
+
+#[test]
+fn a_room_delivers_its_last_frame_before_closing() {
+    let wasm = server_wasm(
+        "last-server-frame",
+        r#"
+use platform::net::{close, send}
+use std::input::{Event, events}
+
+pub fn serve(time: f32) {
+    for e in events() {
+        if let Event::Message { conn, .. } = e {
+            var bytes: Vec<u8> = Vec::new()
+            for i in 0..65536 {
+                bytes.push(0)
+            }
+            send(conn, bytes)
+            close(conn)
+        }
+    }
+}
+"#,
+    );
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash, _server) =
+        start_build("last-frame", &wasm, &runtime, wrela_serve::Bounds::default());
+    let path = format!("/room/last?pair={:016x}", wrela_abi::read_pair(&wasm).expect("pair"));
+    runtime.block_on(async {
+        let mut peer = connect(port, hash, &path).await.expect("connects");
+        peer.put(b"hi").await;
+        let mut bytes = vec![1u8; wrela_serve::MAX_FRAME + 3];
+        tokio::time::timeout(Duration::from_secs(3), peer.recv.read_exact(&mut bytes))
+            .await
+            .expect("the last frame arrives")
+            .expect("the entire last frame");
+        assert_eq!(&bytes[..3], [0x80, 0x80, 0x04]);
+        assert!(bytes[3..].iter().all(|&b| b == 0));
+        assert!(peer.ends(Duration::from_secs(3)).await, "the connection closes after its send");
+    });
+}
+
+#[test]
 fn a_browser_joins_a_room_over_webtransport() {
     let (dir, rel) = wrela_tests::page("compiler/tests/rooms-client", "rooms-client-chrome");
     let server = std::fs::read(dir.join("server/game.wasm")).expect("the program's server build");

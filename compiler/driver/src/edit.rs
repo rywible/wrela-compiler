@@ -88,7 +88,8 @@ pub fn unit_of(text: &str) -> f64 {
     let t = text.trim_start_matches('-').trim_start();
     let (digits, suffix) = wrela_syntax::lexer::split_suffix(t);
     let unit = if suffix.is_empty() { 1.0 } else { unit_value(suffix).unwrap_or(1.0) };
-    let exp = digits.find(['e', 'E']).and_then(|i| digits[i + 1..].parse::<i32>().ok());
+    let exp =
+        digits.find(['e', 'E']).and_then(|i| digits[i + 1..].replace('_', "").parse::<i32>().ok());
     unit * 10f64.powi(exp.unwrap_or(0))
 }
 
@@ -357,7 +358,7 @@ pub(crate) fn unary(bytes: &[u8], at: usize) -> bool {
 /// one is.
 pub(crate) fn minus_before(bytes: &[u8], at: usize) -> Option<usize> {
     let m = blanks_before(bytes, at);
-    (m > 0 && bytes[m - 1] == b'-' && unary(bytes, m - 1)).then_some(m - 1)
+    (m > 0 && bytes[m - 1] == b'-' && unary(bytes, m - 1)).then(|| m - 1)
 }
 
 /// The lines that differ, as (line from 1, old, new): both texts have the same lines, since
@@ -474,6 +475,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_literal_at_the_start_has_no_preceding_minus() {
+        assert_eq!(minus_before(b"0.5", 0), None);
+        assert_eq!(minus_before(b" \t0.5", 2), None);
+    }
+
+    #[test]
     fn tiny_values_and_long_decimal_styles_read_back_exactly() {
         for (old, value) in [
             ("0.5", f32::from_bits(1)),
@@ -540,6 +547,7 @@ mod tests {
         assert_eq!(unit_of("0.25"), 1.0);
         assert_eq!(unit_of("-15cm"), 0.01);
         assert!((unit_of("2.5e-3") - 0.001).abs() < 1e-18);
+        assert!((unit_of("2.5e-0_3") - 0.001).abs() < 1e-18);
         assert!((unit_of("90deg") - std::f64::consts::PI / 180.0).abs() < 1e-15);
     }
 

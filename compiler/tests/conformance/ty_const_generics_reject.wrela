@@ -15,8 +15,8 @@ struct Window<const N: u32> {
     xs: [f32; N],
 }
 
-// A length argument is a number or a constant holding one, as an array's is.
-const TWICE: u32 = 2 * 4
+// A constant used as a length must contain no calls, as an array's length must.
+const TWICE: u32 = 2 * length()
 
 fn window() -> u32 {
     let w: Window<TWICE> = Window { xs: [0.0; 8] } //~ E0325
@@ -40,5 +40,7 @@ fn explicit_kind_mismatch() -> u32 {
 }
 
 impl<const N: u32> Window<N> {
-    fn length() -> u32 { N }
+    fn length() -> u32 {
+        N
+    }
 }

@@ -334,6 +334,62 @@ test("a fatal render worker error keeps a loading voice from starting later", as
   expect(nodes).toBe(0);
 });
 
+test("stopping test audio while its worklet loads keeps it from starting later", async () => {
+  for (const mode of ["audio=1", "live=1"]) {
+    const loaded = Promise.withResolvers<void>();
+    let nodes = 0;
+    const Context = class {
+      readonly audioWorklet = { addModule: () => loaded.promise };
+      readonly destination = {};
+      readonly state = "running";
+      async resume() {}
+      async close() {}
+      async startRendering() { return { getChannelData: () => new Float32Array(128) }; }
+    };
+    fake("AudioContext", Context);
+    fake("OfflineAudioContext", Context);
+    fake("AudioWorkletNode", class {
+      readonly port = { onmessage: null };
+      onprocessorerror = null;
+      constructor() { nodes++; }
+      connect() {}
+      disconnect() {}
+    });
+    const page = await load(`http://127.0.0.1/game/#test&${mode}`);
+    page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+    page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio-stop" } satisfies FromWorker }));
+    loaded.resolve();
+    await Bun.sleep(5);
+    expect(nodes).toBe(0);
+    expect(page.posted.some((message) => message.type === "audio-rendered")).toBe(false);
+  }
+});
+
+test("a fatal worker error stops live test audio and prevents a successful audio result", async () => {
+  let connected = false;
+  fake("AudioContext", class {
+    readonly audioWorklet = { addModule: async () => {} };
+    readonly destination = {};
+    readonly state = "running";
+    async resume() {}
+    async close() {}
+  });
+  fake("AudioWorkletNode", class {
+    readonly port = { onmessage: null };
+    onprocessorerror = null;
+    connect() { connected = true; }
+    disconnect() { connected = false; }
+  });
+  const page = await load("http://127.0.0.1/game/#test&live=1");
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "audio", voice: {} as VoiceOptions } satisfies FromWorker }));
+  await Bun.sleep(1);
+  expect(connected).toBe(true);
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "frame failed", unsupported: false } satisfies FromWorker }));
+  expect(connected).toBe(false);
+  await Bun.sleep(1050);
+  expect(page.posted.some((message) => message.type === "audio-rendered")).toBe(false);
+});
+
 test("offline audio waits for the worklet's print marker before reporting it rendered", async () => {
   let voicePort: { onmessage: ((event: MessageEvent<FromVoice>) => void) | null } | null = null;
   fake(

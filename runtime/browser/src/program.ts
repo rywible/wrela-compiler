@@ -255,14 +255,23 @@ export function otherInstance(
   onPrint: PrintSink = () => {},
 ): Promise<WebAssembly.Instance> {
   let started = false;
-  let startFailure: Error | null = null;
+  let hostFailure: Error | null = null;
   return WebAssembly.instantiate(
     module,
-    refusingImports(memory, who, TrapError, onPrint, () => started, (error) => (startFailure = error)),
+    refusingImports(memory, who, TrapError, onPrint, () => started, (error) => (hostFailure = error)),
   ).then((instance) => {
-    if (startFailure !== null) throw startFailure;
+    if (hostFailure !== null) throw hostFailure;
     started = true;
-    return instance;
+    // A Wasm catch_all can catch an import's JavaScript exception. Check each thread entry
+    // after it returns too, so it cannot turn a rejected host call into a successful tick/job.
+    const exports = Object.fromEntries(Object.entries(instance.exports).map(([name, value]) => [name, typeof value !== "function" ? value : (...args: number[]) => {
+      if (hostFailure !== null) throw hostFailure;
+      let result: unknown;
+      try { result = value(...args); } catch (e) { throw hostFailure ?? e; }
+      if (hostFailure !== null) throw hostFailure;
+      return result;
+    }]));
+    return { exports };
   });
 }
 
@@ -382,7 +391,7 @@ export class Program {
   /** The ticker the program started: its task, context and rate. */
   #ticker: Pick<TickerOptions, "task" | "context" | "hz"> | null = null;
   readonly #startTicker: ((ticker: TickerOptions, onPrint: PrintSink) => void) | null;
-  /** The error behind the most recent trap raised by `submit`, so the caller gets it rather
+  /** The first trap raised by a host import in this call, so the caller gets it rather
    * than whatever the engine wraps it in. */
   #failure: unknown = null;
   /** The first error the executor gave: what it holds isn't known after it, so every later
@@ -458,7 +467,7 @@ export class Program {
     } catch (e) {
       throw new ProgramError(`its \`${LINES_SECTION}\` section is malformed: ${errorMessage(e)}`);
     }
-    const imports = {
+    const imports: WebAssembly.Imports = {
       [IMPORT_MODULE]: {
         [IMPORT_MEMORY]: memory,
         [IMPORT_SUBMIT]: (ptr: number, len: number) => program.#submitImport(ptr, len),
@@ -491,6 +500,22 @@ export class Program {
         },
       },
     };
+    // JavaScript exceptions thrown by imports are catchable by Wasm's catch_all. A rejected
+    // host call still fails the export, as a native host trap does; preserve the trap's panic
+    // message too. Imports with a typed failure already recorded keep that exact error.
+    const hostImports = imports[IMPORT_MODULE]!;
+    for (const [name, value] of Object.entries(hostImports)) {
+      if (typeof value !== "function") continue;
+      hostImports[name] = (...args: number[]) => {
+        if (program.#failure !== null) throw program.#failure;
+        try {
+          return value(...args);
+        } catch (e) {
+          program.#failure ??= new TrapError(trapMessage(e, memory, THREAD_MAIN, program.#lines));
+          throw e;
+        }
+      };
+    }
     // As the native host words it: a module that can't be instantiated isn't a valid program.
     let instance: WebAssembly.Instance;
     try {

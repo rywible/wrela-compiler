@@ -838,11 +838,11 @@ fn opening(text: &str, close: u32) -> u32 {
 /// trailing comma, or with a comma after what's there.
 fn before_close(text: &str, open: u32, close: u32, item: &str) -> (u32, u32, String) {
     let inner = &text[open as usize + 1..close as usize];
-    let trimmed = inner.trim_end();
-    let at = open + 1 + trimmed.len() as u32;
-    if trimmed.trim().is_empty() {
-        (open + 1, open + 1, item.to_string())
-    } else if trimmed.ends_with(',') {
+    let Some(last) = crate::edit::lex(inner).last() else {
+        return (open + 1, open + 1, item.to_string());
+    };
+    let at = open + 1 + last.span.end;
+    if last.kind == wrela_syntax::token::TokenKind::Comma {
         (at, at, format!(" {item},"))
     } else {
         (at, at, format!(", {item}"))

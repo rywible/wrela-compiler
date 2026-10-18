@@ -559,6 +559,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     name: c.name.name.clone(),
                     module: m,
                     ty: None,
+                    annotation: c.ty.clone(),
                     value: c.value.clone(),
                     public,
                     span: item.span,
@@ -1660,7 +1661,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             .iter()
             .map(|(m, _, t)| {
                 let mut out = Vec::new();
-                alias_refs(&self.p, *m, &t.ty, &mut |a| {
+                alias_refs(&self.p, *m, &t.ty, &t.generics, &mut |a| {
                     if let Some(&i) = index.get(&a) {
                         out.push(i);
                     }
@@ -2305,6 +2306,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             name: of.to_string(),
             module: m,
             ty: Some(ty),
+            annotation: None,
             value: d.clone(),
             public: false,
             span: d.span,
@@ -3831,28 +3833,82 @@ fn holds_itself(p: &Program, ty: TyId, stack: &mut Vec<TyId>, finite: &mut HashS
     holds
 }
 
-/// Calls `f` with each type alias a type expression names by a single-segment path, resolved in
-/// module `m`.
-fn alias_refs(p: &Program, m: ModuleId, t: &ast::TypeExpr, f: &mut impl FnMut(AliasId)) {
+/// Calls `f` with each alias a type expression depends on, including through a length
+/// constant's annotation, resolved in module `m` with its generic parameters in scope.
+fn alias_refs(
+    p: &Program,
+    m: ModuleId,
+    t: &ast::TypeExpr,
+    params: &[ast::GenericParam],
+    f: &mut impl FnMut(AliasId),
+) {
+    alias_refs_in(p, m, t, params, f, &mut Vec::new());
+}
+
+/// A length can depend on an alias through a constant's annotation, including annotations
+/// on other constants it uses. These aliases must resolve before the length does.
+fn const_alias_refs(p: &Program, c: ConstId, f: &mut impl FnMut(AliasId), seen: &mut Vec<ConstId>) {
+    if seen.contains(&c) {
+        return;
+    }
+    seen.push(c);
+    let def = p.const_(c);
+    if let Some(annotation) = &def.annotation {
+        alias_refs_in(p, def.module, annotation, &[], f, seen);
+    }
+    def.value.walk(&mut |e| {
+        if let ast::ExprKind::Path(path) = &e.kind
+            && let Some(Res::Const(c)) = resolve::resolve_value_item(p, def.module, path)
+        {
+            const_alias_refs(p, c, f, seen);
+        }
+    });
+}
+
+fn alias_refs_in(
+    p: &Program,
+    m: ModuleId,
+    t: &ast::TypeExpr,
+    params: &[ast::GenericParam],
+    f: &mut impl FnMut(AliasId),
+    seen: &mut Vec<ConstId>,
+) {
     match &t.kind {
         ast::TypeExprKind::Path(path) => {
-            if let Some(Res::Alias(a)) = resolve::resolve_value_item(p, m, path) {
-                f(a);
+            if !params.iter().any(|g| g.name.name == path.segments[0].ident.name) {
+                match resolve::resolve_value_item(p, m, path) {
+                    Some(Res::Alias(a)) => f(a),
+                    Some(Res::Const(c)) => const_alias_refs(p, c, f, seen),
+                    _ => {}
+                }
             }
             for seg in &path.segments {
                 for g in seg.generics.iter().flatten() {
-                    alias_refs(p, m, g, f);
+                    alias_refs_in(p, m, g, params, f, seen);
                 }
             }
         }
-        ast::TypeExprKind::Array(e, _) | ast::TypeExprKind::Paren(e) => alias_refs(p, m, e, f),
+        ast::TypeExprKind::Array(e, len) => {
+            alias_refs_in(p, m, e, params, f, seen);
+            if let Some(len) = len {
+                len.walk(&mut |e| {
+                    if let ast::ExprKind::Path(path) = &e.kind
+                        && !params.iter().any(|g| g.name.name == path.segments[0].ident.name)
+                        && let Some(Res::Const(c)) = resolve::resolve_value_item(p, m, path)
+                    {
+                        const_alias_refs(p, c, f, seen);
+                    }
+                });
+            }
+        }
+        ast::TypeExprKind::Paren(e) => alias_refs_in(p, m, e, params, f, seen),
         ast::TypeExprKind::Tuple(ts) | ast::TypeExprKind::Traits(ts) => {
-            ts.iter().for_each(|x| alias_refs(p, m, x, f))
+            ts.iter().for_each(|x| alias_refs_in(p, m, x, params, f, seen))
         }
         ast::TypeExprKind::Fn(ft) => {
-            ft.params.iter().for_each(|x| alias_refs(p, m, &x.ty, f));
+            ft.params.iter().for_each(|x| alias_refs_in(p, m, &x.ty, params, f, seen));
             if let Some(r) = &ft.ret {
-                alias_refs(p, m, r, f);
+                alias_refs_in(p, m, r, params, f, seen);
             }
         }
         ast::TypeExprKind::Int(_) | ast::TypeExprKind::Error => {}

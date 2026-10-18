@@ -134,7 +134,9 @@ impl Lines {
                 return Err(format!("the segment `{segment}` has {} fields", fields.len()));
             }
             for (field, value) in fields.iter().take(4).enumerate() {
-                last[field] += value;
+                last[field] = last[field]
+                    .checked_add(*value)
+                    .ok_or_else(|| format!("a value in the segment `{segment}` is too large"))?;
             }
             let offset = u32::try_from(last[0]).map_err(|_| format!("the offset {}", last[0]))?;
             if entries.last().is_some_and(|&(o, _)| offset < o) {
@@ -150,7 +152,13 @@ impl Lines {
                 if last[2] < 0 || last[3] < 0 {
                     return Err(format!("the segment `{segment}` is before its source's start"));
                 }
-                Some(format!("{file}:{}:{}", last[2] + 1, last[3] + 1))
+                let line = last[2]
+                    .checked_add(1)
+                    .ok_or_else(|| format!("the line in the segment `{segment}` is too large"))?;
+                let column = last[3]
+                    .checked_add(1)
+                    .ok_or_else(|| format!("the column in the segment `{segment}` is too large"))?;
+                Some(format!("{file}:{line}:{column}"))
             };
             entries.push((offset, location));
         }
@@ -219,7 +227,7 @@ fn leb(out: &mut Vec<u8>, mut x: u32) {
 
 /// `value` as a source map's base64 VLQ: sign in the lowest bit, five bits a digit.
 fn vlq(out: &mut String, value: i64) {
-    let mut v = if value < 0 { ((-value) << 1) | 1 } else { value << 1 };
+    let mut v = (value.unsigned_abs() << 1) | u64::from(value < 0);
     loop {
         let digit = (v & 31) as usize;
         v >>= 5;
@@ -232,13 +240,17 @@ fn vlq(out: &mut String, value: i64) {
 
 /// The next base64 VLQ of a segment.
 fn unvlq(bytes: &mut std::str::Bytes) -> Result<i64, String> {
-    let mut v: i64 = 0;
-    for shift in (0..60).step_by(5) {
+    let mut v: u64 = 0;
+    for shift in (0..65).step_by(5) {
         let b = bytes.next().ok_or("a segment ends in the middle of a number")?;
-        let digit = BASE64.iter().position(|&d| d == b).ok_or("a segment isn't base64")? as i64;
+        let digit = BASE64.iter().position(|&d| d == b).ok_or("a segment isn't base64")? as u64;
+        if shift == 60 && digit & 31 > 15 {
+            return Err("a number in a segment is too large".into());
+        }
         v |= (digit & 31) << shift;
         if digit & 32 == 0 {
-            return Ok(if v & 1 == 1 { -(v >> 1) } else { v >> 1 });
+            let magnitude = (v >> 1) as i64;
+            return Ok(if v & 1 == 1 { -magnitude } else { magnitude });
         }
     }
     Err("a number in a segment is too long".into())
@@ -352,6 +364,40 @@ mod tests {
             r#"{"version":2,"sources":["a"],"mappings":"C"}"#,
         ] {
             assert!(Lines::from_source_map(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn large_source_locations_survive_their_source_map() {
+        let lines = Lines::new([
+            (0, Some(format!("a.wrela:{}:{}", i64::MAX, i64::MAX))),
+            (1, Some("a.wrela:1:1".into())),
+        ]);
+        let map = lines.source_map().expect("map");
+        assert_eq!(Lines::from_source_map(&map), Ok(lines));
+    }
+
+    #[test]
+    fn source_map_delta_overflow_is_rejected() {
+        let mut segment = String::from("AA");
+        vlq(&mut segment, (1 << 59) - 1);
+        segment.push('A');
+        let mappings = vec![segment; 17].join(",");
+        let map = serde_json::json!({
+            "version": 3, "sources": ["a.wrela"], "mappings": mappings
+        });
+        assert!(Lines::from_source_map(&map.to_string()).is_err());
+
+        // A zero-based location must still fit when it becomes one-based.
+        for fields in [[0, 0, i64::MAX, 0], [0, 0, 0, i64::MAX]] {
+            let mut mappings = String::new();
+            for value in fields {
+                vlq(&mut mappings, value);
+            }
+            let map = serde_json::json!({
+                "version": 3, "sources": ["a.wrela"], "mappings": mappings
+            });
+            assert!(Lines::from_source_map(&map.to_string()).is_err());
         }
     }
 }

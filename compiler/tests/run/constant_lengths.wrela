@@ -1,0 +1,26 @@
+// run: integer constant expressions determine array types and repeat counts
+// expect: lengths() = 15
+// expect: generic_length() = 3
+
+const WIDTH: u32 = 2
+const COUNT: u32 = WIDTH * 3 + 1
+
+struct Samples {
+    values: [u32; COUNT - 2],
+}
+
+pub fn lengths() -> u32 {
+    let samples = Samples { values: [4; WIDTH + 3] }
+    let powers = [1; WIDTH ** 2]
+    let shifted = [2; (1 << WIDTH) | 2]
+    samples.values.len() + powers.len() + shifted.len()
+}
+
+fn count<const N: u32>() -> u32 {
+    let values: [u32; (N)] = [0; ((N))]
+    values.len()
+}
+
+pub fn generic_length() -> u32 {
+    count::<3>()
+}

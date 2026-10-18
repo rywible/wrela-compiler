@@ -25,7 +25,7 @@ impl Interval {
     /// The first 2ⁿ points split evenly when the range is halved, and halved again, up to n
     /// times (`sobol`).
     pub fn sample(self, seed: u32, i: u32) -> f32 {
-        self.lo + (self.hi - self.lo) * sobol(seed, 0, i)
+        sample_component(self.lo, self.hi, sobol(seed, 0, i))
     }
 }
 
@@ -46,7 +46,10 @@ impl Box2 {
     /// (`Interval::sample`).
     pub fn sample(self, seed: u32, i: u32) -> vec2 {
         let t = vec2(sobol(seed, 0, i), sobol(seed, 1, i))
-        self.lo + (self.hi - self.lo) * t
+        vec2(
+            sample_component(self.lo.x, self.hi.x, t.x),
+            sample_component(self.lo.y, self.hi.y, t.y),
+        )
     }
 }
 
@@ -72,7 +75,21 @@ impl Box3 {
     /// ```
     pub fn sample(self, seed: u32, i: u32) -> vec3 {
         let t = vec3(sobol(seed, 0, i), sobol(seed, 1, i), sobol(seed, 2, i))
-        self.lo + (self.hi - self.lo) * t
+        vec3(
+            sample_component(self.lo.x, self.hi.x, t.x),
+            sample_component(self.lo.y, self.hi.y, t.y),
+            sample_component(self.lo.z, self.hi.z, t.z),
+        )
+    }
+}
+
+/// Interpolates a sample without overflowing when finite endpoints span more than f32 holds.
+fn sample_component(lo: f32, hi: f32, t: f32) -> f32 {
+    let width = hi - lo
+    if width == 1.0 / 0.0 {
+        lo * (1.0 - t) + hi * t
+    } else {
+        lo + width * t
     }
 }
 
@@ -217,6 +234,20 @@ fn samples_of_a_range_and_a_rectangle_stay_in_them() {
         assert(r.lo <= x && x < r.hi, "a sample is outside its range")
         let p = b.sample(3, i)
         assert(p.x >= b.lo.x && p.y >= b.lo.y && p.x < b.hi.x && p.y < b.hi.y)
+    }
+}
+
+@test
+fn samples_stay_finite_when_their_ranges_span_large_values() {
+    let r = Interval { lo: -2.0e38, hi: 2.0e38 }
+    let b2 = Box2 { lo: vec2(r.lo), hi: vec2(r.hi) }
+    let b3 = Box3 { lo: vec3(r.lo), hi: vec3(r.hi) }
+    for i in 0..16 {
+        assert(r.contains(r.sample(3, i)))
+        let p2 = b2.sample(3, i)
+        assert(r.contains(p2.x) && r.contains(p2.y))
+        let p3 = b3.sample(3, i)
+        assert(r.contains(p3.x) && r.contains(p3.y) && r.contains(p3.z))
     }
 }
 

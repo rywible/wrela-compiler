@@ -3,14 +3,14 @@
 
 /// <reference lib="webworker" />
 
-import { MAX_WORKERS, SCREEN_FORMAT } from "./abi.gen.ts";
+import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
 import { GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
-import { arrivals, epochNow, InputRing, parseScript, type Scripted } from "./input.ts";
+import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
-import { browserIo, type Build, loadBuild, loadLines, startProgram } from "./loader.ts";
+import { browserIo, type Build, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
@@ -123,6 +123,7 @@ const clock = VisibleClock.create();
  * build's ticker a new one. */
 const ticker = {
   control: TickerControl.create(),
+  memory: null as WebAssembly.Memory | null,
   /** Resolved with the ticks when the ticker's thread has stopped (test mode, a hot reload). */
   report: null as Promise<{ report: TickReport; log: Uint8Array<ArrayBuffer> | null; replay: Replay }> | null,
   thread: null as Worker | null,
@@ -145,6 +146,8 @@ function tickerStarter(
   replay: Replay | null = null,
 ): (options: TickerOptions, onPrint: PrintSink) => void {
   return (options, onPrint) => {
+    const framesBeforeStart = ticker.control.frames;
+    ticker.memory = options.memory;
     if (replay === null) ring?.attachTicker();
     const thread = new Worker(self.location.href, { type: "module", name: "wrela sim" });
     ticker.thread = thread;
@@ -169,6 +172,7 @@ function tickerStarter(
       input: ring!.buffer,
       wasmHash: settings.hashes ? wasmHash(wasm) : 0n,
       replay,
+      framesBeforeStart,
     } satisfies ToWorker);
   };
 }
@@ -237,6 +241,7 @@ function stopHelpers(): void {
  * started. */
 function newTicker(frames: number): void {
   ticker.control = TickerControl.create();
+  ticker.memory = null;
   ticker.report = null;
   ticker.thread = null;
   ticker.control.framesStarted(frames);
@@ -481,20 +486,30 @@ interface Running {
   program: Program;
   executor: GpuExecutor;
   hz: number;
-  tickFrom: number;
+  /** The first tick's frame, once a ticker has existed; null before then. */
+  tickFrom: number | null;
 }
 
 /** `program`, running with its ticks counted from frame `tickFrom`. */
-function runningFrom(program: Program, tickFrom: number): Running {
+function runningFrom(program: Program, tickFrom: number | null): Running {
   const executor = program.executor as GpuExecutor;
   executor.built.catch(fatal);
   return { program, executor, hz: program.ticker?.hz ?? 0, tickFrom };
 }
 
+/** Publishes lockstep time before a frame can run, even when no tick is due yet and the
+ * ticker's thread is still loading. Its thread later publishes the same origin. */
+function scheduleTicker(mode: number, origin = 0): void {
+  if (mode === TickerMode.LOCKSTEP && ticker.memory !== null) {
+    new DataView(ticker.memory.buffer).setFloat64(TICK_ORIGIN, origin, true);
+  }
+  ticker.control.go(mode, origin);
+}
+
 /** `program` in the place of the one that ran, its ticker going on `schedule`. */
-function runNext(program: Program, tickFrom: number, schedule: number): Running {
-  const r = runningFrom(program, tickFrom);
-  if (r.hz > 0) ticker.control.go(schedule);
+function runNext(program: Program, tickFrom: number | null, schedule: number, fps: number, frame: number): Running {
+  const r = runningFrom(program, tickFrom ?? (program.ticker === null ? null : frame));
+  if (r.hz > 0) scheduleTicker(schedule, r.tickFrom! / fps);
   return r;
 }
 
@@ -520,7 +535,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     format: SCREEN_FORMAT,
     usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
   });
-  const script: Scripted[] = params.input ? parseScript(await (await fetch(inputUrl(base, params.input))).text()) : [];
+  const script: Scripted[] = params.input ? await loadScript(inputUrl(base, params.input)) : [];
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
   // The tick log needs only the ticks' hashes (the sim's state, cheap), not the frames'.
@@ -568,16 +583,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       },
     );
   running = salted;
-  let r = runningFrom(await start(salted, null), 0);
+  const first = await start(salted, null);
+  let r = runningFrom(first, first.ticker === null ? null : 0);
   if (timing !== "off" && !r.executor.timed) throw new GpuError("the test asks for timestamps, but this device has no timestamp queries");
   const schedule = params.paced > 0 ? TickerMode.CLOCK : TickerMode.LOCKSTEP;
   if (params.latency > 0 || params.keylatency > 0) {
     self.postMessage({ type: "latency-start", ms: ((frames - 2) * 1000) / fps } satisfies FromWorker);
   }
   const began0 = performance.now();
+  clock.startAt(epochNow());
   if (r.hz > 0) {
-    clock.startAt(epochNow());
-    ticker.control.go(schedule);
+    scheduleTicker(schedule);
   }
   // Saturated, the frames the GPU hasn't finished (at most two: the CPU records a frame while
   // the GPU draws the last).
@@ -594,15 +610,22 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     // Hot reload: a new build replaces the program before this frame.
     const next = live?.take(r.program) ?? null;
     if (next !== null) {
-      r = runNext(await swap(r.program, next, i, start), r.tickFrom, schedule);
+      r = runNext(await swap(r.program, next, i, start), r.tickFrom, schedule, fps, i);
       live!.swapped();
     }
     const control = ticker.control;
+    // A program may start its ticker from a frame after init. Its first ticks belong to
+    // this frame, the first one that follows that start, rather than every prior frame.
+    if (r.hz === 0 && r.program.ticker !== null) {
+      r.hz = r.program.ticker.hz;
+      r.tickFrom = i;
+      scheduleTicker(schedule, i / fps);
+    }
     r.executor.frame = i;
     control.framesStarted(i + 1);
     if (r.hz > 0 && params.paced === 0) {
       // Lockstep: the ticks before this frame run first, as on the native host.
-      const ticks = lockstepTicks(i - r.tickFrom, r.hz, fps);
+      const ticks = lockstepTicks(i - r.tickFrom!, r.hz, fps);
       control.runTo(ticks);
       await control.ranTo(ticks);
       // The ticker's thread reports its trap (`tickerStarter`).
@@ -647,7 +670,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     const asked = handOvers!.takeAsked();
     if (asked !== null) {
       const p = await handOver(program, asked, i + 1, start);
-      if (p !== program) r = runNext(p, i + 1, schedule);
+      if (p !== program) r = runNext(p, null, schedule, fps, i + 1);
     }
   }
   await draining;

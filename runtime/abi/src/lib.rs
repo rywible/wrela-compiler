@@ -187,21 +187,25 @@ pub fn pair_id(client: Option<&[u8]>, server: Option<&[u8]>) -> u64 {
 /// in order, and anything malformed gives `None`.
 pub fn read_pair(wasm: &[u8]) -> Option<u64> {
     fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
-        let mut x = 0usize;
+        let mut x = 0u32;
         for shift in (0..35).step_by(7) {
             let byte = *b.get(*at)?;
             *at += 1;
-            x |= usize::from(byte & 127) << shift;
+            if shift == 28 && byte > 15 {
+                return None;
+            }
+            x |= u32::from(byte & 127) << shift;
             if byte < 128 {
-                return Some(x);
+                return Some(x as usize);
             }
         }
         None
     }
     let mut at = 8;
-    if wasm.get(..4)? != b"\0asm" {
+    if wasm.get(..8)? != b"\0asm\x01\0\0\0" {
         return None;
     }
+    let mut pair = None;
     while at < wasm.len() {
         let id = wasm[at];
         at += 1;
@@ -215,10 +219,10 @@ pub fn read_pair(wasm: &[u8]) -> Option<u64> {
         let len = leb(body, &mut k)?;
         if body.get(k..k.checked_add(len)?)? == PAIR_SECTION.as_bytes() {
             let id: [u8; 8] = body.get(k + len..)?.try_into().ok()?;
-            return Some(u64::from_le_bytes(id));
+            pair.get_or_insert(u64::from_le_bytes(id));
         }
     }
-    None
+    pair
 }
 pub const EXPORT_MEMORY: &str = "memory";
 
@@ -313,6 +317,34 @@ mod tests {
         assert_eq!(super::read_pair(b"not a module"), None);
         // The ids of the two roles' modules differ by which is which.
         assert_ne!(super::pair_id(Some(b"a"), None), super::pair_id(None, Some(b"a")));
+    }
+
+    #[test]
+    fn a_pair_section_rejects_malformed_modules() {
+        let mut wasm = b"\0asm\x01\0\0\0".to_vec();
+        let name = super::PAIR_SECTION.as_bytes();
+        wasm.extend([0, (1 + name.len() + 8) as u8, name.len() as u8]);
+        wasm.extend(name);
+        wasm.extend(7u64.to_le_bytes());
+        assert_eq!(super::read_pair(&wasm), Some(7));
+
+        let mut section_after_pair = wasm.clone();
+        section_after_pair.extend([0, 1, 0]);
+        assert_eq!(super::read_pair(&section_after_pair), Some(7));
+
+        let mut bad_version = wasm.clone();
+        bad_version[4] = 2;
+        assert_eq!(super::read_pair(&bad_version), None);
+
+        let mut truncated_after_pair = wasm.clone();
+        truncated_after_pair.extend([0, 10]);
+        assert_eq!(super::read_pair(&truncated_after_pair), None);
+
+        // A section's length is u32 LEB128, including a padded representation.
+        let mut oversized_length = wasm[..8].to_vec();
+        oversized_length.extend([0, wasm[9] | 0x80, 0x80, 0x80, 0x80, 0x10]);
+        oversized_length.extend_from_slice(&wasm[10..]);
+        assert_eq!(super::read_pair(&oversized_length), None);
     }
 
     /// The checked-in generated files are this crate's output (the browser runtime and std

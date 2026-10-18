@@ -18,6 +18,7 @@ import {
 } from "./abi.gen.ts";
 import type { TextureFormat } from "./stream.ts";
 import { errorMessage } from "./errors.ts";
+import { parseJson } from "./json.ts";
 
 export type UniformSpace = "uniform" | "storage";
 /** How two depths compare, in WebGPU's names. */
@@ -124,9 +125,6 @@ export class ManifestError extends Error {
 }
 
 type Json = Record<string, unknown>;
-
-/** In a `u` regex a surrogate pair is one code point, so this finds only unpaired ones. */
-const LONE_SURROGATE = /\p{Cs}/u;
 
 const isObject = (v: unknown): v is Json => typeof v === "object" && v !== null && !Array.isArray(v);
 
@@ -285,39 +283,11 @@ function pipeline(v: unknown, i: number): Pipeline {
   return { ...stage, name, shader, uniform, bindings, debug_flag };
 }
 
-/** How deep serde_json, and so the native host, nests arrays and objects. */
-const MAX_NESTING = 127;
-
-/** How deep arrays and objects nest in a parsed JSON value. */
-function nesting(v: unknown): number {
-  let deepest = 0;
-  const stack: [unknown, number][] = [[v, 0]];
-  while (stack.length > 0) {
-    const [x, d] = stack.pop()!;
-    if (x === null || typeof x !== "object") continue;
-    deepest = Math.max(deepest, d + 1);
-    for (const y of Object.values(x)) stack.push([y, d + 1]);
-  }
-  return deepest;
-}
-
 /** Parses and validates a manifest; any other version is rejected. */
 export function parseManifest(json: string): Manifest {
   let v: unknown;
   try {
-    // serde_json, and so the native host, rejects a lone UTF-16 surrogate anywhere.
-    v = JSON.parse(json, (key, value: unknown) => {
-      if (LONE_SURROGATE.test(key) || (typeof value === "string" && LONE_SURROGATE.test(value))) {
-        throw new Error("a string has a lone surrogate");
-      }
-      // serde_json rejects a number past f64's range (`1e400`); JSON.parse makes it infinite.
-      if (typeof value === "number" && !Number.isFinite(value)) {
-        throw new Error("a number is out of range");
-      }
-      return value;
-    });
-    // serde_json reads arrays and objects nested at most 127 deep.
-    if (nesting(v) > MAX_NESTING) throw new Error(`arrays and objects nest more than ${MAX_NESTING} deep`);
+    v = parseJson(json);
   } catch (e) {
     throw new ManifestError(errorMessage(e));
   }

@@ -19,13 +19,16 @@ pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
     out
 }
 
-/// The `ClipPosition` fields of a struct type, as declared; none for any other type.
+/// The `ClipPosition` fields of an instantiated struct type; none for any other type.
 fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef> {
-    let fields = match p.types.kind(t) {
-        TyKind::Adt(a, _) => p.adt(*a).fields(),
-        _ => &[],
+    let (fields, types) = match p.types.kind(t) {
+        TyKind::Adt(a, args) => (p.adt(*a).fields(), p.fields_of(*a, args, None)),
+        _ => (&[][..], Vec::new()),
     };
-    fields.iter().filter(|f| p.lang_of_ty(f.ty) == Some(Lang::ClipPosition))
+    fields
+        .iter()
+        .zip(types)
+        .filter_map(|(f, ty)| (p.lang_of_ty(ty) == Some(Lang::ClipPosition)).then_some(f))
 }
 
 /// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
@@ -417,15 +420,17 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             ),
         ),
         Entry::Vertex => {
-            if let TyKind::Adt(a, _) = p.types.kind(def.ret) {
+            if let TyKind::Adt(a, args) = p.types.kind(def.ret) {
                 // What it passes on (a generic field's type is checked where it's drawn).
                 let fields = p.adt(*a).fields();
                 let mut count = 0;
-                for f in fields.iter().filter(|f| p.lang_of_ty(f.ty) != Some(Lang::ClipPosition)) {
-                    match varying_count(p, f.ty) {
+                for (f, ty) in fields.iter().zip(p.fields_of(*a, args, None)).filter(|(_, ty)| {
+                    p.lang_of_ty(*ty) != Some(Lang::ClipPosition)
+                }) {
+                    match varying_count(p, ty) {
                         Some(n) => count += n,
-                        None if !p.types.has_params(f.ty) => {
-                            out.push(not_varying(p, &f.name, f.ty, f.span));
+                        None if !p.types.has_params(ty) => {
+                            out.push(not_varying(p, &f.name, ty, f.span));
                         }
                         None => {}
                     }
@@ -578,5 +583,64 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 format!("{stage} can't take `{}`: {why}", p.display_ty(ps.ty)),
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature_errors(source: &str) -> Vec<Diagnostic> {
+        let mut diagnostics = Vec::new();
+        let p = crate::collect::collect(
+            crate::test_units(source),
+            &crate::collect::PackageInfo::std_and_program(),
+            &mut diagnostics,
+        );
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        check_entries(&p)
+    }
+
+    #[test]
+    fn vertex_position_uses_instantiated_field_types() {
+        let errors = signature_errors(
+            "use std::gpu::ClipPosition\n\
+             struct Output<P> { position: P, colour: vec3 }\n\
+             @vertex\n\
+             fn vertex() -> Output<ClipPosition> {\n\
+                 Output { position: ClipPosition { position: vec4(0.0) }, colour: vec3(1.0) }\n\
+             }\n\
+             @fragment\n\
+             fn fragment(input: Output<ClipPosition>) -> vec4 { vec4(input.colour, 1.0) }\n",
+        );
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
+    fn vertex_varyings_validate_instantiated_field_types() {
+        let errors = signature_errors(
+            "use std::gpu::ClipPosition\n\
+             struct Output<T> { position: ClipPosition, value: T }\n\
+             @vertex\n\
+             fn vertex() -> Output<f64> {\n\
+                 Output { position: ClipPosition { position: vec4(0.0) }, value: 1.0 }\n\
+             }\n",
+        );
+        assert!(
+            errors.iter().any(|d| d.code == codes::E0602 && d.message.contains("`value`")),
+            "{errors:#?}"
+        );
+        let errors = signature_errors(
+            "use std::gpu::ClipPosition\n\
+             struct Output<T> { position: ClipPosition, value: T }\n\
+             @vertex\n\
+             fn vertex() -> Output<(mat4, mat4, mat4, mat4, mat4)> {\n\
+                 Output { position: ClipPosition { position: vec4(0.0) }, value: (mat4(), mat4(), mat4(), mat4(), mat4()) }\n\
+             }\n",
+        );
+        assert!(
+            errors.iter().any(|d| d.code == codes::E0602 && d.message.contains("20 values")),
+            "{errors:#?}"
+        );
     }
 }

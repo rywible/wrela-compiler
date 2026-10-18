@@ -205,7 +205,7 @@ export const pairParam = (pair: bigint) => pair.toString(16).padStart(16, "0");
  */
 export class Net {
   readonly #sessions = new Map<number, Session>();
-  #server: Promise<Server> | null = null;
+  #server: { url: string; ready: Promise<Server> } | null = null;
   /** What arrived: a message's bytes, or a connection's opening or closing. */
   arrived: ({ conn: number; bytes: Uint8Array } | { conn: number; open: boolean })[] = [];
   /** The bytes the messages in `arrived` hold, each counted with OVERHEAD more. */
@@ -218,13 +218,16 @@ export class Net {
   ) {}
 
   #fetchServer(): Promise<Server> {
-    this.#server ??= fetch(new URL("net.json", this.base()))
+    const url = new URL("net.json", this.base()).href;
+    if (this.#server?.url === url) return this.#server.ready;
+    const ready = fetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`net.json: ${r.status}`);
         return r.text();
       })
       .then(parseServer);
-    return this.#server;
+    this.#server = { url, ready };
+    return ready;
   }
 
   /** Opens connection `conn` to room `room`, for the build of pair id `pair` (a build of none

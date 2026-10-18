@@ -10,6 +10,11 @@ import pages
 
 
 class Render(unittest.TestCase):
+    def test_link_queries_are_escaped_once(self):
+        out = pages.render("[search](https://example.test/?q=fields&sort=name)")
+        self.assertIn('href="https://example.test/?q=fields&amp;sort=name"', out)
+        self.assertNotIn("&amp;amp;", out)
+
     def test_headings_take_the_exports_anchors_and_repeats_are_numbered(self):
         out = pages.render("# std::arena\n\n## Arena::insert\n\n## `Arena`\n\n## Arena\n")
         self.assertIn('<h1 id="std-arena">', out)

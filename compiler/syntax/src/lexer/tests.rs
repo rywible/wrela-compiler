@@ -18,7 +18,7 @@ fn frontend_perf_punctuation_dispatch_preserves_longest_match() {
             .find(|k| text.starts_with(k.fixed_text().unwrap()))
             .filter(|k| {
                 *k != TokenKind::Underscore
-                    || !text.as_bytes().get(1).copied().is_some_and(is_ident_continue)
+                    || !text.chars().nth(1).is_some_and(|c| c.is_alphanumeric() || c == '_')
             });
         assert_eq!(lexer.punct(), expected, "{text:?}");
     }
@@ -111,6 +111,13 @@ fn l3_non_ascii_identifier_is_one_token_with_one_error() {
     // A bad character immediately before the name must not consume its non-ASCII start.
     assert_eq!(texts("$éx"), ["éx", ""]);
     assert_eq!(codes_of("$éx"), ["E0001", "E0001"]);
+
+    // `_` is a wildcard only on its own; a non-ASCII name keeps its leading underscore too.
+    for name in ["_é", "_αβ", "_²"] {
+        assert_eq!(texts(name), [name, ""], "{name}");
+        assert_eq!(kinds(name), [T::Ident, T::Eof], "{name}");
+        assert_eq!(codes_of(name), ["E0001"], "{name}");
+    }
 }
 
 #[test]
