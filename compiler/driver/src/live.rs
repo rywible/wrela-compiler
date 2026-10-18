@@ -64,23 +64,7 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
                     walk(&path, false, before, out);
                 }
             } else if name.ends_with(".wrela") || name == "wrela.toml" {
-                // Reading follows a file symlink, so its cache key must describe the target too.
-                // Keep using the entry's metadata above to avoid following directory symlinks.
-                let Ok(meta) = std::fs::metadata(&path) else { continue };
-                if !meta.is_file() {
-                    continue;
-                }
-                let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-                let len = meta.len();
-                let seen = match before.get(&path) {
-                    Some(s) if s.modified == modified && s.len == len => s.clone(),
-                    _ => Seen {
-                        modified,
-                        len,
-                        text: std::fs::read_to_string(&path).unwrap_or_default().into(),
-                    },
-                };
-                out.insert(path, seen);
+                see(path, before, out);
             }
         }
     }
@@ -89,6 +73,26 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
         walk(d, true, before, &mut out);
     }
     out
+}
+
+/// Adds the file at `path` to `out` if it's a regular file, read again only where its time or
+/// length has changed since `before`.
+fn see(path: PathBuf, before: &Files, out: &mut Files) {
+    // Reading follows a file symlink, so its cache key must describe the target too. A walk
+    // uses the entry's own metadata to avoid following directory symlinks.
+    let Ok(meta) = std::fs::metadata(&path) else { return };
+    if !meta.is_file() {
+        return;
+    }
+    let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+    let len = meta.len();
+    let seen = match before.get(&path) {
+        Some(s) if s.modified == modified && s.len == len => s.clone(),
+        _ => {
+            Seen { modified, len, text: std::fs::read_to_string(&path).unwrap_or_default().into() }
+        }
+    };
+    out.insert(path, seen);
 }
 
 /// The files whose texts differ between `before` and `now`, and those only one of them has.
@@ -118,8 +122,10 @@ pub struct Watcher {
     /// Where the builds go: `out/<version>`, the last two kept.
     out: PathBuf,
     version: u64,
-    /// The packages' directories.
+    /// The packages' directories, and the manifests of the workspaces they were found through
+    /// (watched alone: a workspace's directory holds far more than the program's files).
     dirs: Vec<PathBuf>,
+    workspaces: Vec<PathBuf>,
     /// The files when last looked at, and as the newest build saw them.
     seen: Files,
     built: Files,
@@ -143,23 +149,25 @@ impl Watcher {
         kind: crate::BuildKind,
     ) -> Result<Watcher, String> {
         check_output_path(pkg, out)?;
-        let packages = crate::packages(pkg)?;
-        let lift = if lift.is_empty() { vec![packages[0].0.clone()] } else { lift.to_vec() };
-        let dirs: Vec<PathBuf> = packages.into_iter().map(|(_, d)| d).collect();
+        let inputs = crate::inputs(pkg)?;
+        let lift = if lift.is_empty() { vec![inputs.packages[0].0.clone()] } else { lift.to_vec() };
+        let dirs: Vec<PathBuf> = inputs.packages.into_iter().map(|(_, d)| d).collect();
         let mut w = Watcher {
             pkg: pkg.to_path_buf(),
             lift,
             kind,
             out: out.to_path_buf(),
             version: 0,
-            seen: scan(&dirs, &Files::new()),
+            seen: Files::new(),
             dirs,
+            workspaces: inputs.workspaces,
             built: Files::new(),
             literals: Vec::new(),
             lifted: None,
             values: Vec::new(),
             saved: None,
         };
+        w.seen = w.look(&Files::new());
         match w.build() {
             Change::Failed(why) => Err(why),
             _ => Ok(w),
@@ -175,9 +183,18 @@ impl Watcher {
         self.version
     }
 
+    /// The files watched as they are now, each read again only where it changed since `before`.
+    fn look(&self, before: &Files) -> Files {
+        let mut now = scan(&self.dirs, before);
+        for path in &self.workspaces {
+            see(path.clone(), before, &mut now);
+        }
+        now
+    }
+
     /// Looks at the files once: what's changed since the last look, if anything.
     pub fn poll(&mut self) -> Option<Change> {
-        let now = scan(&self.dirs, &self.seen);
+        let now = self.look(&self.seen);
         let changed: Vec<&PathBuf> = changed(&self.seen, &now).collect();
         if changed.is_empty() {
             self.seen = now;
@@ -201,9 +218,10 @@ impl Watcher {
 
     /// Builds the program as its files are now, into the next version's directory.
     fn build(&mut self) -> Change {
-        if let Ok(packages) = crate::packages(&self.pkg) {
-            self.dirs = packages.into_iter().map(|(_, dir)| dir).collect();
-            self.seen = scan(&self.dirs, &self.seen);
+        if let Ok(inputs) = crate::inputs(&self.pkg) {
+            self.dirs = inputs.packages.into_iter().map(|(_, dir)| dir).collect();
+            self.workspaces = inputs.workspaces;
+            self.seen = self.look(&self.seen);
         }
         let out = match crate::build_lifted(&self.pkg, &self.lift, self.kind) {
             Ok(out) => out,
@@ -574,6 +592,53 @@ mod tests {
             );
         }
         assert!(check_output_path(&pkg, &pkg.join("build/live")).is_ok());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A workspace's manifest is watched, alone: a change to its members can change which
+    /// package a dependency is, and the rebuild then watches that package's files.
+    #[test]
+    fn a_rebuild_follows_the_workspaces_members() {
+        let root = std::env::temp_dir().join(format!("wrela-live-members-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let write = |path: &str, text: &str| {
+            let p = root.join(path);
+            std::fs::create_dir_all(p.parent().expect("a parent")).expect("directory");
+            std::fs::write(p, text).expect("write");
+        };
+        write("wrela.toml", "[workspace]\nmembers = [\"program\", \"a\"]\n");
+        write(
+            "program/wrela.toml",
+            "[package]\nname = \"program\"\n\n[dependencies]\nlibrary = { workspace = true }\n",
+        );
+        write(
+            "program/main.wrela",
+            "fn v() -> f32 {\n    library::value::value()\n}\n\npub fn frame(time: f32, width: u32, height: u32) {}\n",
+        );
+        for dir in ["a", "lib-b"] {
+            write(&format!("{dir}/wrela.toml"), "[package]\nname = \"library\"\n");
+            write(&format!("{dir}/value.wrela"), "pub fn value() -> f32 { 0.5 }\n");
+        }
+        let pkg = root.join("program");
+        let mut watcher =
+            Watcher::start(&pkg, &pkg.join("build/live"), &[], crate::BuildKind::default())
+                .expect("watcher");
+        let (a, b) =
+            (root.join("a").canonicalize().unwrap(), root.join("lib-b").canonicalize().unwrap());
+        assert!(watcher.dirs.contains(&a) && !watcher.dirs.contains(&b));
+        write("wrela.toml", "[workspace]\nmembers = [\"program\", \"lib-b\"]\n");
+        assert!(
+            matches!(watcher.poll(), Some(Change::Built { .. })),
+            "a change to the workspace's members must rebuild"
+        );
+        assert!(watcher.dirs.contains(&b) && !watcher.dirs.contains(&a), "{:?}", watcher.dirs);
+        write("lib-b/value.wrela", "pub fn value() -> f32 { 0.75 }\n");
+        assert!(
+            matches!(watcher.poll(), Some(Change::Built { .. })),
+            "the new member's edit must rebuild"
+        );
+        write("a/value.wrela", "pub fn value() -> f32 { 0.25 }\n");
+        assert_eq!(watcher.poll(), None, "the old member isn't watched");
         let _ = std::fs::remove_dir_all(root);
     }
 

@@ -1,0 +1,6 @@
+// rejects: mod.packages
+// A workspace's members are packages with names of their own, and a workspace dependency names
+// one of them.
+fn f() -> u32 {
+    1
+}

@@ -295,8 +295,10 @@ cover = "cover.png"
             fonts = root / "console/fonts"
             fonts.mkdir(parents=True)
             (fonts / "OFL-example.txt").write_text("Font license")
-            # A font a dependency bakes ships too, through a dependency of a dependency.
-            (root / "console/wrela.toml").write_text('[package]\nname = "console"\n[dependencies]\nbrand = { path = "../ui/brand" }\n')
+            # A font a dependency bakes ships too, through a dependency of a dependency: one a
+            # member of the workspace, found by its name, and one found by its path.
+            (root / "wrela.toml").write_text('[workspace]\nmembers = [\n    "console",\n    "ui/*",\n]\n')
+            (root / "console/wrela.toml").write_text('[package]\nname = "console"\n[dependencies]\nbrand = { workspace = true }\n')
             (root / "ui/brand/fonts").mkdir(parents=True)
             (root / "ui/brand/wrela.toml").write_text('[package]\nname = "brand"\n[dependencies]\nui = { path = ".." }\n')
             (root / "ui/brand/fonts/OFL-Brand.txt").write_text("Brand font license")
@@ -310,3 +312,19 @@ cover = "cover.png"
             self.assertEqual((output / "OFL-example.txt").read_text(), "Font license")
             self.assertEqual((output / "OFL-Brand.txt").read_text(), "Brand font license")
             self.assertEqual((output / "OFL-Ui.txt").read_text(), "UI font license")
+
+    def test_workspace_members_are_the_nearest_workspaces(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            (root / "wrela.toml").write_text('[workspace]\nmembers = ["outer"]\n')
+            (root / "outer").mkdir()
+            (root / "outer/wrela.toml").write_text('[package]\nname = "outer"\n')
+            inner = root / "inner"
+            (inner / "great-tree").mkdir(parents=True)
+            (inner / "wrela.toml").write_text('[package]\nname = "app"\n[workspace]\nmembers = [".", "great-tree"]\n')
+            (inner / "great-tree/wrela.toml").write_text("")
+            self.assertEqual(console.workspace_members(inner / "great-tree"),
+                             {"app": inner, "great_tree": inner / "great-tree"})
+            (inner / "wrela.toml").write_text('[package]\nname = "great_tree"\n[workspace]\nmembers = [".", "*"]\n')
+            with self.assertRaises(ValueError):
+                console.workspace_members(inner)

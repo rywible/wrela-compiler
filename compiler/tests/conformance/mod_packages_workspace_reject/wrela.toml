@@ -1,0 +1,13 @@
+[package]
+name = "app"
+
+[workspace]
+members = [
+    "lib",
+    "other",
+    "gone", # //~ E0223
+]
+
+[dependencies]
+lib = { workspace = true }
+nowhere = { workspace = true } # //~ E0220

@@ -1,0 +1,8 @@
+// accepts: mod.packages
+// A workspace's packages depend on each other by name: the nearest `wrela.toml` with
+// `[workspace]` lists them, and a member without a `[package] name` is named by its directory.
+use round_solids::balls::volume
+
+fn f() -> f32 {
+    volume(1.0) + geo::shapes::area(1.0)
+}

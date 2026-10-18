@@ -382,15 +382,34 @@ unsafe = true                          # it may use `unsafe` (§6.12; E0214 othe
 
 [dependencies]
 fieldkit = { path = "../fieldkit" }    # a local path, relative to this file
+engine = { workspace = true }          # the member of the workspace named `engine`
 ```
 
 - **A dependency's modules are named under it:** `use fieldkit::shapes::blob`. A path's first name is `std`, a module of the package, or one of its dependencies, and one name can't be both (E0201).
 - **Only `pub` items cross a package boundary.** `pub(package)` makes an item, a field or a method visible to every module of its package and to no other (E0203).
 - **The orphan rule is per package:** an `impl` lives in the package of its trait or of its type, and std is a package too. std's privileges (its core's `unsafe`, intrinsics, destructors and lang items) come from its being std's package.
 - **A directory with its own `wrela.toml` is another package,** never part of this one's module tree. Only the program's `main.wrela` is its interface to the host (§15.1); in a dependency, `main.wrela` is an ordinary module.
-- **Dependencies are built from source with the program.** A dependency is a local path: there are no versions, lockfiles or registries. A dependency can't lead back to a package that depends on it (E0221), a `path` that isn't a directory is E0220, and a manifest that isn't valid is E0219. A package that two others depend on is built once.
+- **Dependencies are built from source with the program.** A dependency is a local package, found by its path or by its name in the workspace: there are no versions, lockfiles or registries. A dependency can't lead back to a package that depends on it (E0221), a `path` that isn't a directory is E0220, and a manifest that isn't valid is E0219. A package that two others depend on is built once.
 - **A diagnostic in a dependency names the package and the path inside it:** `[fieldkit] shapes/blob.wrela:3:5`. Builds with dependencies are byte-reproducible, from any path.
 - **Effects are inferred across packages** as within one: exported functions don't state them (§8, §21).
+
+#### Workspaces
+
+A workspace is a set of packages that depend on each other by name. A `wrela.toml` with `[workspace]` lists its members:
+
+```text
+[workspace]
+members = [
+    "engine",       # a package's directory, relative to this file
+    "content/*",    # each directory in content/ that has a wrela.toml
+]
+```
+
+- **A package's workspace is the nearest `wrela.toml` with `[workspace]`** in its directory or above it. When workspaces nest, the nearest one is used.
+- **`name = { workspace = true }` is the member named `name`.** A member's name is its `[package] name`; a member without one has its directory's name, with `-` read as `_`. A package can use a member this way whether it is a member or not. A dependency has a `path` or `workspace = true`, not both (E0219).
+- **A workspace's manifest is a package's too only if it has `[package]`.** Without one, its directory isn't a package, and checking or building it is E0223.
+- **Each member is a package with a name of its own.** A member that isn't a directory with a `wrela.toml`, a `/*` that names no package, and two members with one name are E0223. A directory listed twice is one member. A workspace dependency with no workspace above it, or with no member of that name, is E0220.
+- **`path` dependencies work in a workspace and outside it.** `members` is the only key of `[workspace]`; any other key, or a section declared twice, is E0219.
 
 ## 4. Types
 

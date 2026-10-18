@@ -1,0 +1,66 @@
+// A workspace that isn't valid: a member that isn't a package, a `/*` that names no package, or
+// two members with one name. A dependency `name = { workspace = true }` is the member named
+// `name`, so each member is a directory with a `wrela.toml`, and its name is its own. A
+// workspace's `wrela.toml` without `[package]` is no package, so it can't be checked or built.
+// ---- wrong
+use geometry::shapes::area
+
+fn coin() -> f32 {
+    area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[workspace]
+members = ["geometry", "solids"]
+
+[dependencies]
+geometry = { workspace = true }
+// ---- file geometry/wrela.toml
+[package]
+name = "geometry"
+// ---- file geometry/shapes.wrela
+pub fn area(r: f32) -> f32 {
+    3.14159 * r * r
+}
+// ---- file solids/wrela.toml
+[package]
+name = "geometry"
+// ---- file solids/balls.wrela
+pub fn volume(r: f32) -> f32 {
+    4.18879 * r * r * r
+}
+// ---- fixed
+use geometry::shapes::area
+
+fn coin() -> f32 {
+    area(0.01)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- file wrela.toml
+[package]
+name = "game"
+
+[workspace]
+members = ["geometry", "solids"]
+
+[dependencies]
+geometry = { workspace = true }
+// ---- file geometry/wrela.toml
+[package]
+name = "geometry"
+// ---- file geometry/shapes.wrela
+pub fn area(r: f32) -> f32 {
+    3.14159 * r * r
+}
+// ---- file solids/wrela.toml
+[package]
+name = "solids"
+// ---- file solids/balls.wrela
+pub fn volume(r: f32) -> f32 {
+    4.18879 * r * r * r
+}

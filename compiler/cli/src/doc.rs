@@ -245,11 +245,9 @@ fn build_index(dir: Option<&Path>) -> Result<Index, String> {
     if let Some(dir) = dir {
         sources.extend(package_sources(dir, None)?);
         // The packages it depends on, each module under its package's name (`engine::creature`).
-        if let Ok(text) = std::fs::read_to_string(dir.join("wrela.toml"))
-            && let Ok(m) = wrela_driver::manifest::parse(FileId(0), &text)
-        {
-            for dep in m.deps {
-                if let Ok(files) = package_sources(&dir.join(&dep.path), Some(&dep.name)) {
+        if let Ok(deps) = wrela_driver::workspace::dependency_dirs(dir) {
+            for (name, dep) in deps {
+                if let Ok(files) = package_sources(&dep, Some(&name)) {
                     sources.extend(files);
                 }
             }

@@ -131,6 +131,7 @@ codes! {
     E0220 = "E0220", "a dependency that isn't there";
     E0221 = "E0221", "packages that depend on each other";
     E0222 = "E0222", "a `@test` that `wrela test` can't run";
+    E0223 = "E0223", "a workspace that isn't valid";
 
     // ---- E03xx: types ----------------------------------------------------------------------
     E0300 = "E0300", "mismatched types";

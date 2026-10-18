@@ -1,0 +1,3 @@
+pub fn volume(r: f32) -> f32 {
+    geo::shapes::area(r) * r
+}

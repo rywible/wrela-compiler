@@ -361,17 +361,23 @@ pub fn program_dir(pkg: &Path) -> PathBuf {
 
 /// The dependencies the floor's manifest at `pkg` gives, each path made absolute.
 fn dependencies(pkg: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    let text = std::fs::read_to_string(pkg.join("wrela.toml"))
-        .map_err(|e| format!("can't read {}/wrela.toml: {e}", pkg.display()))?;
-    let m = crate::manifest::parse(wrela_diag::FileId(0), &text)
-        .map_err(|_| format!("{}/wrela.toml doesn't read", pkg.display()))?;
-    m.deps
-        .iter()
-        .map(|d| {
-            let path = pkg.join(&d.path).canonicalize().map_err(|e| format!("{}: {e}", d.path))?;
-            Ok((d.name.clone(), path))
+    crate::workspace::dependency_dirs(pkg)?
+        .into_iter()
+        .map(|(name, dir)| {
+            let path = dir.canonicalize().map_err(|e| format!("{}: {e}", dir.display()))?;
+            Ok((name, path))
         })
         .collect()
+}
+
+/// The studio package's manifest, `bytes`, for its copy beside the copy of `ui`: its workspace
+/// dependency on `ui` is a path to that copy, so the lens builds from any directory.
+fn studio_manifest(bytes: &[u8]) -> Result<Vec<u8>, String> {
+    let text = crate::workspace::with_paths(&String::from_utf8_lossy(bytes), |name| {
+        (name == "ui").then(|| "../ui".to_string())
+    })
+    .map_err(|e| format!("studio/wrela.toml: {e}"))?;
+    Ok(text.into_bytes())
 }
 
 /// A manifest's `[dependencies]` lines: `deps` in order.
@@ -427,6 +433,8 @@ fn write_map_lens(pkg: &Path, name: &str) -> Result<PathBuf, String> {
                 _ if rest.starts_with("glue/") => {}
                 _ => write(&base.join("maplens").join(rest), bytes)?,
             }
+        } else if *rel == "wrela.toml" {
+            write(&base.join("studio").join(rel), &studio_manifest(bytes)?)?;
         } else if !rel.starts_with("glue/") {
             write(&base.join("studio").join(rel), bytes)?;
         }
@@ -469,6 +477,10 @@ fn write_lens(pkg: &Path, s: &Subject) -> std::io::Result<PathBuf> {
                 // subject's (below).
                 Some("main.wrela") => write(&lens.join("main.wrela"), bytes)?,
                 Some(_) => {}
+                None if sub == "studio" && *rel == "wrela.toml" => write(
+                    &base.join(sub).join(rel),
+                    &studio_manifest(bytes).map_err(std::io::Error::other)?,
+                )?,
                 None => write(&base.join(sub).join(rel), bytes)?,
             }
         }

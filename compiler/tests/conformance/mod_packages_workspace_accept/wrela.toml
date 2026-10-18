@@ -1,0 +1,12 @@
+[package]
+name = "app"
+
+[workspace]
+members = [
+    ".",
+    "libs/*", # geo and round-solids
+]
+
+[dependencies]
+geo = { workspace = true }
+round_solids = { workspace = true }

@@ -2579,10 +2579,10 @@ mod tests {
         let manifest = std::fs::read_to_string(out.join("wrela.toml")).expect("manifest");
         let parsed = wrela_driver::manifest::parse(wrela_diag::FileId(0), &manifest)
             .expect("valid generated manifest");
-        assert_eq!(
-            out.join(&parsed.deps[0].path).canonicalize().unwrap(),
-            engine.canonicalize().unwrap()
-        );
+        let wrela_driver::manifest::Source::Path(path) = &parsed.deps[0].source else {
+            panic!("a path dependency")
+        };
+        assert_eq!(out.join(path).canonicalize().unwrap(), engine.canonicalize().unwrap());
         let source = std::fs::read_to_string(out.join("replica.wrela")).expect("source");
         let lexed = wrela_syntax::lex(wrela_diag::FileId(0), &source);
         let names = lexed

@@ -145,6 +145,33 @@ def release_files(directory):
     return files
 
 
+def workspace_members(directory):
+    """The members of the workspace of the package at `directory`, by name: the nearest
+    wrela.toml at or above it with `[workspace]` lists them, each a path or a path ending `/*`
+    (each directory in it with a wrela.toml). A member's name is its `[package] name`, else its
+    directory's with `-` read as `_` (spec/language.md §3.6)."""
+    for root in [directory, *directory.parents]:
+        manifest = root / "wrela.toml"
+        if manifest.is_file() and "workspace" in (data := tomllib.loads(manifest.read_text())):
+            break
+    else:
+        raise ValueError(f"{directory} has a workspace dependency, but no workspace")
+    members = {}
+    for entry in data["workspace"].get("members", []):
+        if entry == "*" or entry.endswith("/*"):
+            dirs = sorted(p for p in (root / entry[:-1]).iterdir()
+                          if p.is_dir() and not p.name.startswith(".") and (p / "wrela.toml").is_file())
+        else:
+            dirs = [root / entry]
+        for member in dirs:
+            member = member.resolve()
+            package = tomllib.loads((member / "wrela.toml").read_text()).get("package", {})
+            name = package.get("name", member.name.replace("-", "_"))
+            if members.setdefault(name, member) != member:
+                raise ValueError(f"two members of the workspace are named {name}")
+    return members
+
+
 def package_dirs(package):
     """The package at `package` (relative to the repository) and every package it depends on:
     a font any of them bakes ships in the build."""
@@ -158,7 +185,11 @@ def package_dirs(package):
         manifest = directory / "wrela.toml"
         if manifest.is_file():
             dependencies = tomllib.loads(manifest.read_text()).get("dependencies", {})
-            stack.extend((directory / d["path"]).resolve() for d in dependencies.values())
+            for name, dependency in dependencies.items():
+                if dependency.get("workspace"):
+                    stack.append(workspace_members(directory)[name])
+                else:
+                    stack.append((directory / dependency["path"]).resolve())
     return seen
 
 

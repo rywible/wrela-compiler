@@ -96,11 +96,13 @@ pub fn copy_dir(from: &Path, to: &Path) {
 }
 
 /// Copies the package at `from` to `to` ([`copy_dir`]), each relative `path = "…"` in its
-/// wrela.toml made absolute against `from`: its dependencies are found from the copy too.
+/// wrela.toml made absolute against `from`, and each `{ workspace = true }` the absolute path of
+/// the member it is: its dependencies are found from the copy too.
 pub fn copy_package(from: &Path, to: &Path) {
     copy_dir(from, to);
     let manifest = to.join("wrela.toml");
     let text = std::fs::read_to_string(&manifest).expect("wrela.toml");
+    let text = wrela_driver::workspace::detached(from, &text).expect("its workspace dependencies");
     const KEY: &str = "path = \"";
     let (mut out, mut rest) = (String::new(), text.as_str());
     while let Some(at) = rest.find(KEY) {

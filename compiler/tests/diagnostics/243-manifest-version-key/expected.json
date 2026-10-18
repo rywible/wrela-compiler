@@ -10,7 +10,7 @@
       "labels": [],
       "message": "`version` isn't a key of `[package]`, or its value has the wrong type",
       "notes": [
-        "`[package]` has `name = \"...\"` and `unsafe = true`; `[dependencies]` has `name = { path = \"...\" }`"
+        "`[package]` has `name = \"...\"` and `unsafe = true`"
       ],
       "severity": "error",
       "span": {
