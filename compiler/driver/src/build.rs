@@ -32,23 +32,41 @@ pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 /// With `budgets`, a shipped build's, it's E0707 to have a pipeline whose WGSL is over
 /// `MAX_WGSL_BYTES`.
 pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> BuildOutput {
-    emit_in(l, sources, simd, budgets, true, true)
+    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, budgets, true)
 }
 
-/// A server build's files (language.md §15): `server/game.wasm` alone, with a memory of its
-/// own (not shared: a server build runs on one thread, and its host caps the memory of each
-/// instance). It has no pipelines and no browser runtime.
-pub fn emit_server(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    let mut out = emit_in(l, sources, simd, false, false, false);
+/// A server's or a tool's build's files (language.md §15.3): its module alone, at
+/// [`SERVER_WASM`] or [`TOOL_WASM`], with a memory of its own (not shared: either runs on one
+/// thread, and its host caps the memory). It has no pipelines and no browser runtime.
+pub fn emit_headless(
+    l: &Lowered,
+    sources: &SourceMap,
+    simd: bool,
+    role: wrela_sema::defs::Role,
+) -> BuildOutput {
+    let module = match role {
+        wrela_sema::defs::Role::Tool => TOOL_WASM,
+        _ => SERVER_WASM,
+    };
+    // Its own memory, which a tool's may grow to 4 GiB.
+    let max_pages = match role {
+        wrela_sema::defs::Role::Tool => wrela_abi::memory::TOOL_MAX_PAGES,
+        _ => wrela_abi::memory::MAX_PAGES,
+    };
+    let options = wrela_wasm::Options { simd, shared_memory: false, max_pages };
+    let mut out = emit_in(l, sources, options, false, false);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {
-        *path = SERVER_WASM.to_string();
+        *path = module.to_string();
     }
     out
 }
 
 /// Where a server build's module is, in the build's directory.
 pub const SERVER_WASM: &str = "server/game.wasm";
+
+/// Where a tool build's module is, in the build's directory.
+pub const TOOL_WASM: &str = "tool/tool.wasm";
 
 /// Puts the program's pair id ([`wrela_abi::pair_id`]) into each of its builds' modules, as
 /// the custom section [`wrela_abi::PAIR_SECTION`]: `client` and `server` are their bytes.
@@ -66,21 +84,19 @@ pub fn pair(client: Option<&mut Vec<u8>>, server: Option<&mut Vec<u8>>) {
 /// A CPU frame test's files: its WASM and the manifest the host uses to check its commands.
 /// There are no shader or browser files; `CpuBuild`'s explicit CPU-only loaders read it.
 pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> BuildOutput {
-    emit_in(l, sources, simd, false, false, true)
+    emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false)
 }
 
 fn emit_in(
     l: &Lowered,
     sources: &SourceMap,
-    simd: bool,
+    options: wrela_wasm::Options,
     budgets: bool,
     shaders: bool,
-    shared_memory: bool,
 ) -> BuildOutput {
     let mut diagnostics = Vec::new();
     let mut files = Vec::new();
     let mut code_lines = Vec::new();
-    let options = wrela_wasm::Options { simd, shared_memory };
     match wrela_wasm::emit_with(&l.cpu, options) {
         Ok(out) => {
             // Where each part of the code came from, as `file:line:column`, for trap messages.

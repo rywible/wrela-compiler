@@ -1,0 +1,172 @@
+// A tool's files (language.md §15.5): roots that `wrela tool` grants by name, `--read NAME=DIR`
+// and `--write NAME=DIR` (a write root may be read too). A path is `NAME/relative/path`, with `/`
+// between its parts and none of them empty, `.` or `..`; `NAME` alone is the root itself. The
+// host opens every path relative to its root's directory, so nothing reaches outside the root,
+// through a symbolic link either, even one put in its place after a check. A path outside the
+// roots, or a change to a root granted for reading, fails the request.
+//
+// Each function makes one request; its answer is read by `std::tool::answer` (no bytes, or a
+// file's), `read_list`, `read_entry` or `blob::read_handle`. A whole file read or written at once
+// is at most 512 KiB (`MOST_BYTES`); a larger one goes through a blob (`read_blob`, `write_blob`).
+
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{MOST_BYTES, ToolError, answer, ask, malformed}
+use std::tool::blob::Blob
+
+/// What a path names.
+pub enum Kind: Copy + Eq {
+    File,
+    Dir,
+    /// A symbolic link, as a directory lists it.
+    Link,
+    /// Anything else: a socket, a device.
+    Other,
+}
+
+/// A directory's entry (`list`), or what's at a path (`stat`): its name (empty for `stat`), its
+/// kind and its size in bytes.
+pub struct Entry: Clone {
+    pub name: String,
+    pub kind: Kind,
+    pub size: u64,
+}
+
+fn path_body(path: str) -> Vec<u8> {
+    var w = Writer::new()
+    w.write_str(path)
+    take w.into_bytes()
+}
+
+/// The bytes of the file at `path`, at most 512 KiB: a larger file fails the request (read it
+/// with `read_blob`). `std::tool::answer` reads the answer.
+@tool
+pub fn read(path: str) -> Pending<u8> {
+    ask("files/read", path_body(path))
+}
+
+/// Writes `bytes` as the whole file at `path`, in a write root, making the directories it needs.
+/// The bytes are at most 512 KiB; more panics (write a blob with `write_blob`).
+@tool
+pub fn write(path: str, bytes: [u8]) -> Pending<u8> {
+    if bytes.len() > MOST_BYTES {
+        panic("files::write: more than 512 KiB at once: write a blob (`write_blob`)")
+    }
+    var body = path_body(path)
+    for b in bytes {
+        body.push(b)
+    }
+    ask("files/write", body)
+}
+
+/// The entries of the directory at `path`, sorted by name. `read_list` reads the answer.
+@tool
+pub fn list(path: str) -> Pending<u8> {
+    ask("files/list", path_body(path))
+}
+
+/// What's at `path`: its kind and size, following a link inside the root. `read_entry` reads
+/// the answer.
+@tool
+pub fn stat(path: str) -> Pending<u8> {
+    ask("files/stat", path_body(path))
+}
+
+/// Removes the file, link or empty directory at `path`, in a write root.
+@tool
+pub fn remove(path: str) -> Pending<u8> {
+    ask("files/remove", path_body(path))
+}
+
+/// Removes the directory at `path` and everything in it, in a write root. A root itself can't be
+/// removed.
+@tool
+pub fn remove_all(path: str) -> Pending<u8> {
+    ask("files/remove_all", path_body(path))
+}
+
+/// Makes the directory at `path` and those above it that aren't there, in a write root.
+@tool
+pub fn make_dirs(path: str) -> Pending<u8> {
+    ask("files/make_dirs", path_body(path))
+}
+
+/// The file at `path`, whatever its size, as a new blob (`std::tool::blob`): `blob::read_handle`
+/// reads the answer.
+@tool
+pub fn read_blob(path: str) -> Pending<u8> {
+    ask("files/read_blob", path_body(path))
+}
+
+/// Writes the bytes of `blob` as the whole file at `path`, in a write root, making the
+/// directories it needs. The blob stays the tool's.
+@tool
+pub fn write_blob(path: str, blob: Blob) -> Pending<u8> {
+    var body = path_body(path)
+    var w = Writer::new()
+    w.write_u32(blob.id())
+    for b in take w.into_bytes() {
+        body.push(b)
+    }
+    ask("files/write_blob", body)
+}
+
+fn read_kind(r: mut Reader) -> Option<Kind> {
+    match r.read_u8() {
+        Ok(0) => Some(Kind::File),
+        Ok(1) => Some(Kind::Dir),
+        Ok(2) => Some(Kind::Link),
+        Ok(3) => Some(Kind::Other),
+        _ => None,
+    }
+}
+
+/// Reads a `list` answer: a count, then each entry's name, its kind (a byte: file, directory,
+/// link, other) and its size (a `u64`).
+pub fn read_list(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Entry>, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("files/list")) }
+    var out: Vec<Entry> = Vec::new()
+    for _ in 0..n {
+        let Ok(name) = r.read_string() else { return Err(malformed("files/list")) }
+        let Some(kind) = read_kind(mut r) else { return Err(malformed("files/list")) }
+        let Ok(size) = r.read_u64() else { return Err(malformed("files/list")) }
+        out.push(Entry { name, kind, size })
+    }
+    if !r.at_end() {
+        return Err(malformed("files/list"))
+    }
+    Ok(out)
+}
+
+/// Reads a `stat` answer: its kind (a byte) and its size (a `u64`).
+pub fn read_entry(polled: take Result<Vec<u8>, IoError>) -> Result<Entry, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Some(kind) = read_kind(mut r) else { return Err(malformed("files/stat")) }
+    let Ok(size) = r.read_u64() else { return Err(malformed("files/stat")) }
+    if !r.at_end() {
+        return Err(malformed("files/stat"))
+    }
+    Ok(Entry { name: String::new(), kind, size })
+}
+
+@test
+fn a_list_has_the_hosts_layout() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(2)
+    w.write_str("a.txt")
+    w.write_u8(0)
+    w.write_u64(5)
+    w.write_str("sub")
+    w.write_u8(1)
+    w.write_u64(0)
+    let Ok(list) = read_list(Ok(take w.into_bytes())) else { panic("a list") }
+    assert(list.len() == 2 && list[0].name.as_str() == "a.txt" && list[0].size == 5)
+    assert(list[0].kind == Kind::File && list[1].kind == Kind::Dir)
+    assert(read_list(Ok(Vec::from([u8(0), 1, 0, 0, 0]))).is_err(), "a short list")
+    let Ok(e) = read_entry(Ok(Vec::from([u8(0), 2, 9, 0, 0, 0, 0, 0, 0, 0]))) else {
+        panic("an entry")
+    }
+    assert(e.kind == Kind::Link && e.size == 9)
+}

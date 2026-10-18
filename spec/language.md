@@ -1038,7 +1038,7 @@ All attributes except `@diagnostic`, `@intrinsic` and `@fuel` are part of a type
 | `@job` | functions | A job: a function whose body runs over several frames, to each `yield` (§16.3) |
 | `@test`, `@test(frames: n)` | functions | A test. `wrela test` runs it as the build runs constants, or after `n` of the program's frames (§13.2). With `gpu: true` it runs on the GPU, and with `golden: "frame.png"` it compares its screen with a PNG. |
 | `@fuel(n)` | constants, tests of code | The work that the build may do to compute the constant or run the test (§13.1) |
-| `@client`, `@server` | functions | Only that role's build may run the function (§15.3). Reaching it from the other role's entries is E0708. A function can't have both (E0204). |
+| `@client`, `@server`, `@tool` | functions | Only that role's build may run the function (§15.3). Reaching it from another role's entries is E0708. A function has one role (E0204). |
 | `@testing` | exports | An export that only a test build has. See below. |
 
 **`@testing` exports exist only in a test build:**
@@ -1428,13 +1428,14 @@ A bound that a function states about itself is a std method, not a fact the comp
 
 A program is a package whose `main.wrela` exports the functions that a host calls; a host runs the program's build, and gives it a screen, a GPU, threads, input and its other services.
 
-Three hosts run builds, from the same ABI (`runtime/abi`):
+Three hosts run builds, from the same ABI (`runtime/abi`), and the native host has a profile for tools:
 
 | Host | What it is | What it runs |
 |---|---|---|
 | The browser host | A page in Chrome, on WebGPU (`runtime/browser`) | A client build |
 | The native host | `wrela-host`, on wgpu and wasmtime (`runtime/native`) | A client build, on the machine's GPU; or its CPU alone (`--no-gpu`, and the frame tests of §13.2), which checks commands but runs no shaders |
 | The server host | `wrela-serve` (`wrela_host::server`) | A server build's rooms (§15.3, §19) |
+| The native host's tool profile | `wrela tool` (`wrela_host::tool`), on wasmtime | A tool build, with what its command line grants (§15.5) |
 
 Where this spec says "both hosts", it means the browser host and the native host: a program gives the same results, and the same command stream, on both.
 
@@ -1456,20 +1457,21 @@ Exports other than `frame` serve tests and tools, and take scalar and vector par
 - A returned value crosses as its numbers in order (fields, then elements, then components), at most 64. `wrela trace` names them `.x` to `.w`, or `.0` and on for more than four.
 - Other types cannot cross, and the host cannot choose a generic function's types (E0703).
 
-### 15.3 Client and server roles
+### 15.3 Client, server and tool roles
 
-A program has a role for each host that runs it: a client build that a browser host runs, and a server build that a server host runs.
+A program has a role for each host that runs it: a client build that a browser host runs, a server build that a server host runs, and a tool build that the native host's tool profile runs.
 
 - **Client:** a browser host runs the client build, through `init` and `frame` (§15.1).
 - **Server:** a server host runs the server build. It calls `serve_init() -> S` once, when it starts the program, and `serve(state: mut S, time: f32)` when something happens. `serve` reads what happened as events. Without state, it is `serve(time: f32)`.
+- **Tool:** the tool profile runs the tool build. It calls `tool_init() -> S` once, then `tool(state: mut S) -> u32` until it returns an exit status (§15.5). Without state, it is `tool() -> u32`.
 
-A program that exports `frame` has a client build, one that exports `serve` has a server build, and one with both has both. `wrela build` writes the client's files, and the server's module as `server/game.wasm`.
+A program that exports `frame` has a client build, one that exports `serve` has a server build, and one that exports `tool` has a tool build; a program with several has each. `wrela build` writes the client's files, the server's module as `server/game.wasm`, and the tool's as `tool/tool.wasm`.
 
-- Each build is lowered from its own entries, so neither module holds the other's code.
-- The server's module has a memory of its own, not shared, because a server build runs on one thread and its host caps each instance's memory.
-- Both modules carry the program's pair id, in the custom section `wrela.pair`: a hash of both modules. A client gives the pair id with each connection, and a server refuses a client of another pair.
-- `@client` and `@server` (§9) mark code that only that role's build may run. std's screen passes, `present`, `std::audio::play` and `std::tick::start` are `@client`. A server build records no GPU work.
-- Reaching the other role's code from a build's entries, through calls, generics or closures, is E0708, with the call chain.
+- Each build is lowered from its own entries, so no module holds another role's code.
+- The server's and the tool's modules each have a memory of their own, not shared, because each runs on one thread and its host caps the memory. A tool's may grow to 4 GiB.
+- The client's and the server's modules carry the program's pair id, in the custom section `wrela.pair`: a hash of both modules. A client gives the pair id with each connection, and a server refuses a client of another pair. A tool build has none.
+- `@client`, `@server` and `@tool` (§9) mark code that only that role's build may run. std's screen passes, `present`, `std::audio::play`, `std::tick::start` and `std::host`'s services are `@client`, and `std::tool`'s services `@tool`. Neither a server build nor a tool build records GPU work.
+- Reaching another role's code from a build's entries, through calls, generics or closures, is E0708, with the call chain.
 
 **The server host** (`wrela_host::server`) runs a server build as one instance per room. Each instance has a cap on its memory and a deadline on every call into it, `serve_init` included. Nothing a room calls waits: the host answers a request after the call returns, for the next call to read. A call that fails says why:
 
@@ -1496,6 +1498,79 @@ A program can give its place to another build, in the same page or the same nati
   - If the build cannot be made ready, the request fails and the program continues. If the new build's `init` fails, the old build starts again in its place with what it had kept, and the host prints the reason: the screen never goes black.
 - The host keeps the pipelines of the build that handed over, which the new one does not use, until the next hand-over. So going back builds no pipelines.
 - A host that runs one build alone (the CPU host) fails these requests.
+
+### 15.5 Tools
+
+A tool is a program for the work around a program: builds, captures, releases, checks. The native host's tool profile runs its tool build (§15.3), with only what its command line grants:
+
+```text
+wrela tool <package> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
+           [--timeout S] [--blob-budget B] [-- args...]
+```
+
+**The host calls `tool` when there is something to read.**
+- The host calls `tool_init` once, then `tool` once. After that, it calls `tool` again each time at least one of the tool's outstanding requests is answered. An answer that the tool has not read does not wake it.
+- `tool` returns `std::tool::RUNNING` (`u32::MAX`) to be called again, or an exit status from 0 to 255. That status is the process's.
+- If `tool` returns `RUNNING` with no request outstanding, the tool waits on nothing. The host stops it with status 70, and does not call it again.
+- A tool build has one thread, and no GPU, ticker or voice. Its memory may grow to 4 GiB. A call has no deadline: a tool may compute for a long time between requests.
+- `--timeout` is a budget for the whole run (status 124); a time that the clock cannot reach is a usage error (status 2). Ctrl-C stops the tool, also inside a call (status 130). A trap, or a status that is not `RUNNING` or 0 to 255, gives status 70. If the host cannot run the tool, or cannot stop it (it cannot take Ctrl-C, or cannot start the thread that interrupts calls), the status is 71, and no Wasm runs.
+- `print` never waits either. The host puts each line on a queue (at most 1024 lines and 4 MiB), and a thread of its own writes them out. A line that finds the queue full is dropped, and the host prints how many it dropped when the console takes lines again. When the tool ends, the console has the same grace as the workers to take what is queued; lines it does not take are dropped. So a console that nobody reads, such as a full pipe, cannot stop `--timeout` or Ctrl-C, and the host's last message cannot hold up the end.
+- Services run on the host's worker threads, so a call never waits for one. An answer reaches the tool no sooner than its next call, as on every host (§17.1).
+- However the tool ends, the host stops its workers and releases all that the tool held. Work that has not started is dropped, and work in progress has a grace of 5 s. If a worker is still running after the grace, the run is the host's failure (status 71), whatever the tool's own end was, and `wrela tool` ends the process, so no work outlives it. No file work holds the lock on the tool's blobs, so their release never waits on a file.
+- A resource that a request makes belongs to that request until the tool reads the answer. If the tool ends first, the host releases it with the rest. The host keeps no compiled code from one run to the next.
+
+**A tool is a job.** std has no executor. A tool's work is a `@job fn` that `tool_init` starts and `tool` resumes (§16.3), and the job waits for a request with `yield`. `while p.poll().is_none() { yield }` waits for an answer that the tool does not read, such as a timer's. To read the answer, keep what `poll` gives:
+
+```wrela
+// A tool that waits a moment, reads a file, and exits with its size.
+use std::job::{Job, Step}
+use std::tool::{RUNNING, answer}
+use std::tool::files
+use std::tool::time::after
+
+@job
+fn main() -> u32 {
+    var t = after(0.1)
+    while t.poll().is_none() { yield }
+    var p = files::read("src/notes.txt")
+    var got = p.poll()
+    while got.is_none() {
+        yield
+        got = p.poll()
+    }
+    let Some(polled) = take got else { return 1 }
+    match answer(take polled) {
+        Ok(bytes) => bytes.len() % 256,
+        Err(_) => 2,
+    }
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start()
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+```
+
+**Grants.**
+- Grants come only from the command line. The host opens them once, when the tool starts, into one capability context that every service gets. A request outside the grants fails, and the tool continues.
+- `--read NAME=DIR` grants the directory as the root `NAME`. `--write NAME=DIR` grants it for writing, and for reading too. A root that is not a directory, or a name that is granted twice, stops the command before the tool starts.
+- A path is `NAME/relative/path`, with `/` between its parts and no part empty, `.` or `..`. `NAME` alone is the root itself. The host opens each path relative to its root's directory handle, one part at a time. So no path or symbolic link leaves the root, also a link that replaces a directory after a check.
+- The host opens a file without waiting on it, and the opened handle must be a regular file. A FIFO, a socket or a device fails the request at once, by the type of the handle, not of the path.
+- `--secret NAME` reads the environment variable `NAME` when the tool starts. `std::tool::secret(name)` gives it, and gives `None` for a name that is not granted. The host never shows a secret.
+
+**The services** are `std::tool`'s, and each is `@tool`:
+- `args()`, the arguments after `--`, and `secret(name)`. The host gives both when it starts the tool, as the bytes that `kept` reads (`runtime/abi`), so neither is a request.
+- `files`: `read(path)` and `write(path, bytes)` for whole files of at most 512 KiB (`write` makes the directories it needs). `list(dir)` gives each entry's name, kind and size, and `stat(path)` the kind and size. `remove(path)` removes a file, a link or an empty directory, and `remove_all(dir)` a tree; both need a write root and never remove a root. `make_dirs(path)`. `read_blob(path)` and `write_blob(path, blob)` move a file of any size.
+- `blob`: bytes that the host holds for the tool. `new()`, `append(b, bytes)` and `read(b, offset, len)` move at most 512 KiB at a time; `len(b)`; `release(b)`. While `write_blob` writes a blob, an append to it or its release fails, so its bytes stay counted. A tool holds at most 2 GiB in at most 4096 blobs. `--blob-budget` changes this: `64M` for bytes, or `2G,16` for bytes and handles. A request past the budget fails, as other requests fail. The host releases every blob when the tool ends.
+- `time`: `after(seconds)`, a timer, and `utc_now()`, the seconds and nanoseconds since 1970. Both are requests, so a tool that waits for a timer has a request outstanding.
+- The first byte of each answer tells whether the service succeeded. `std::tool::answer(polled)` gives the answer's bytes, or a `ToolError` with the host's reason. `files::read_list`, `files::read_entry`, `blob::read_handle`, `blob::read_len` and `time::read_utc` read the other answers. Each request is smaller than the 1 MiB command buffer.
+- A tool makes requests to these services only. Storage, fetches and posts (`std::io`) are a client's: the tool host fails the call that makes one.
 
 ## 16. Concurrency
 
@@ -1697,7 +1772,7 @@ Without jobs, work too long for one frame needs a state machine written by hand:
 - A job may be generic: `Job<realize<Coat, Fawn>>` names its types, and `start` infers them as a call does.
 - A job isn't called or passed as a value (E0336): it is started. A `pub` job isn't an export.
 - **Nothing that holds a loan lives across a `yield`:** not a projection, nor a closure or a borrow struct that holds one (E0521). This includes a projection of a lent parameter, which the next `resume` may lend from another place. Owned values live across a `yield`, and so does a closure that copies what it captures.
-- A job has no executor and no IO of its own. The program resumes a job where it would test a flag, and a request stays a polled value (§17.1): `while p.poll().is_none() { yield }`.
+- A job has no executor and no IO of its own. The program resumes a job where it would test a flag, and a request stays a polled value (§17.1): `while p.poll().is_none() { yield }`. A tool's work is a job that its host resumes when an answer arrives (§15.5).
 
 **A job's value is state like any other.**
 - Its parts are where it stopped and each local it holds: its body's owned locals, its `take` parameters, and the values that a loop keeps, such as a range's bound.
@@ -1783,7 +1858,7 @@ A game already has a suspension point, the tick or the frame, so the language do
 
 - Underneath, each is `std::host::request(service, bytes)`: a service name, a relative path, and bytes that only the service reads. `request` is `pub(package)`, so only std's own functions reach it (E0203): a program asks for a service through its function.
 - std owns each service's bytes, the request's and the answer's, and the hosts implement them. So one toolchain release ships both sides of every host contract. The compiler still knows no service names: the services are ordinary std code, not items of the closed list (§20.1).
-- Each service's function is `@client`, so a server build can't reach it (E0708). A host that doesn't have a service fails the request, as an IO request fails: the native client host has none of a browser's application services.
+- Each service's function is `@client`, so neither a server build nor a tool build can reach it (E0708). A tool's services are `std::tool`'s (§15.5). A host that doesn't have a service fails the request, as an IO request fails: the native client host has none of a browser's application services.
 - The command buffer bounds a request. Reading an answer has the same `nondet` effect as the other requests.
 - **`std::host::custom(service, bytes)`** asks for a service that the program's embedding host defines, named `app/<service>` (a Rust program that embeds the native or server host answers it, `wrela_host`'s handlers). No host of the toolchain's own has one. It is the one public request, and its names can't be a toolchain service's.
 - Protocols between programs, such as an embedded program's messages with the program that shows it, are the packages' own: std carries their bytes and never reads them.
@@ -2284,6 +2359,10 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::stage` | `Tape`, `Op`, `Reg` and `interpret`: fields built at run time (§14.4) |
 | `std::gpu` | Buffers (`GpuBuffer<T>`, `GpuSpan<T>`, `buffer`, `write`, `copy`, `read`), textures and samplers, passes, `dispatch` and `draw`, kernel outputs (`Slots<T>`, `Shared<T, N>`, `Atomics<T>`, `Append<T>`, `AtomicMap`, `Texels`, `Texels3d`), typed builtins, lossy encodings, `limits()` (§18) |
 | `std::io` | `load`, `store`, `fetch` and `post`, polled through `Pending<T>`; `print` (§17.1, §17.3) |
+| `std::tool` | A tool's start and its services' answers (§15.5): `RUNNING`, `args`, `secret`, `answer` and `ToolError` |
+| `std::tool::files` | A tool's files in its granted roots: `read`, `write`, `list`, `stat`, `remove`, `remove_all`, `make_dirs`, `read_blob`, `write_blob`; `Entry`, `Kind`, `read_list`, `read_entry` |
+| `std::tool::blob` | Bytes the tool host holds for a tool: `Blob`, `new`, `append`, `read`, `len`, `release`, `read_handle`, `read_len` |
+| `std::tool::time` | A tool's timer and the date: `after`, `utc_now`, `Utc`, `read_utc` |
 | `std::host` | A client's application services, each a request: `environment`, `decode_image`, `cursor`, `icon`, embedded programs (`open`, `wait_ready`, `show`, `send`, `receive`, `reply`, `wait_closed`, `close`), files (`import_file`, `export_file`), the clipboard (`offer`, `copy`, `pasted`), text input, `publish` (the semantic tree), the page's address and links; and their answers read: `read_environment` (`Environment`), `read_surface`, `read_call` (`Call`), `read_pasted`, `read_glyph` (`GlyphImage`) (§17.1) |
 | `std::input` | `events`, `Event`, `Key`, `Button`, `Mods`, `payload` (a message's bytes), `Input`, the keys and buttons held (§17.2), and `Script`, a script of input events for a frame test (§13.2) |
 | `std::semantics` | A program's semantic tree, which a host shows as real elements: `Node`, `Role`, `Field`, `FieldKind`; `structure`, `geometry` and `clip`, the tree's bytes; `changes`, the part of the tree to send since `Sent`; `steps`, a slider's step from an `Assist`; `FieldState` and `read_field_state`, a field's text as the host has it (§17.2) |
@@ -2855,7 +2934,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `const.tests` | A `@test` is a free function of no parameters and no result, run as constants are | §13.2 |
 | `derive.gradient` | `gradient` of a closure or function of an `f32` or a float vector | §14.2 |
 | `derive.interval` | `interval` over a box, of a function whose loops don't depend on its input | §14.2 |
-| `gpu.roles` | A client build runs `init` and `frame`, a server build `serve_init` and `serve`, and `@client` and `@server` code stays in its role | §15.3 |
+| `gpu.roles` | A client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool_init` and `tool`, and `@client`, `@server` and `@tool` code stays in its role | §15.3 |
 | `fn.jobs` | A `@job fn` runs over several frames, to each `yield`: `f.start(...)` takes its `take` parameters, and `job.resume(...)` its `borrow` and `mut` ones | §16.3 |
 | `fn.job-values` | A job's value is `Clone`, `StateHash` and `Serialize` when the locals it holds are | §16.3 |
 | `mem.jobs` | A job keeps only owned values across a `yield`: no projection or loan | §16.3 |

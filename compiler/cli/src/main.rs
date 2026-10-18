@@ -60,6 +60,10 @@
 //!                                         compressed
 //! wrela reference deviation <parts> <package-dir> [--points n] [--json]
 //!                                         how far a package's surface is from the mesh's
+//! wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
+//!     [--timeout S] [--blob-budget B] [-- args...]
+//!                                         build the package's tool and run it with those
+//!                                         grants (§15.5); exit with the tool's status
 //! ```
 //!
 //! Exit status: 0 success, 1 the program has errors (or `fmt --check` found unformatted
@@ -94,6 +98,7 @@ mod solve;
 mod studio;
 mod sweeps;
 mod test;
+mod tool;
 mod trace;
 
 pub(crate) fn usage() -> ExitCode {
@@ -120,6 +125,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
         "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--timeout S] [--blob-budget B] [-- args...]",
         "wrela audio <package-dir> (wav <out.wav> | describe | numbers | midi <out.mid> | sheet <out.png> [--bars a-b] | speed) [--take n] [--seconds s]",
         "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
         "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",
@@ -151,6 +157,7 @@ fn main() -> ExitCode {
         "test" => test::run(rest),
         "studio" => studio::run(rest),
         "run" => run::run(rest),
+        "tool" => tool::run(rest),
         "audio" => audio::run(rest),
         "reference" => reference::run(rest),
         "solve" => solve::run(rest),

@@ -190,11 +190,14 @@ pub struct Options {
     /// they're in memory and each component is computed on its own: the same results, bit for
     /// bit, which a test checks.
     pub simd: bool,
+    /// The most pages the memory grows to: [`memory::MAX_PAGES`] (1 GiB), or a tool build's
+    /// [`memory::TOOL_MAX_PAGES`].
+    pub max_pages: u32,
 }
 
 impl Default for Options {
     fn default() -> Options {
-        Options { shared_memory: true, simd: true }
+        Options { shared_memory: true, simd: true, max_pages: memory::MAX_PAGES }
     }
 }
 
@@ -206,7 +209,7 @@ pub fn emit(m: &ir::Module) -> Result<Emitted, String> {
 
 /// [`emit`], with these options.
 pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
-    let Options { shared_memory, simd } = options;
+    let Options { shared_memory, simd, max_pages } = options;
     if !m.entry_points.is_empty() || !m.resources.is_empty() {
         return Err("internal: a GPU module reached the WASM back end".into());
     }
@@ -270,7 +273,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     // The memory, shared: workers' instances get the same one (wrela_abi::memory).
     let memory_type = MemoryType {
         minimum: u64::from(heap_base / memory::PAGE + memory::HEAP_START_PAGES),
-        maximum: Some(u64::from(memory::MAX_PAGES)),
+        maximum: Some(u64::from(max_pages)),
         memory64: false,
         shared: shared_memory,
         page_size_log2: None,

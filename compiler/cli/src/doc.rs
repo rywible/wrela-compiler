@@ -198,8 +198,10 @@ pub(crate) fn std_sources() -> Vec<SourceFile> {
         .iter()
         .map(|(name, text)| {
             let module: Vec<String> = name.split("::").map(String::from).collect();
-            let display = format!("std/{}.wrela", module[1]);
-            let file = format!("compiler/std/{}.wrela", module[1]);
+            // `std::tool::files` is std/tool/files.wrela.
+            let path = module[1..].join("/");
+            let display = format!("std/{path}.wrela");
+            let file = format!("compiler/std/{path}.wrela");
             (module, display, file, text.to_string())
         })
         .collect()

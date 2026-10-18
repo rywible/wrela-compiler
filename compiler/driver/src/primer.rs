@@ -231,10 +231,10 @@ pub const RULES: &[(&str, &str)] = &[
         "derive.interval",
         "`interval` over a box, of a function whose loops don't depend on its input",
     ),
-    // §15.3 client and server roles
+    // §15.3 client, server and tool roles
     (
         "gpu.roles",
-        "a client build runs `init` and `frame`, a server build `serve_init` and `serve`, and `@client` and `@server` code stays in its role",
+        "a client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool_init` and `tool`, and `@client`, `@server` and `@tool` code stays in its role",
     ),
     // §16.3 work over several frames
     (

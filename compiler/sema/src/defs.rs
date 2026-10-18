@@ -649,21 +649,23 @@ pub struct ParamSig {
     pub is_self: bool,
 }
 
-/// Which host runs a build (language.md §15): a client's (the browser's, with a screen) or a
-/// server's.
+/// Which host runs a build (language.md §15.3): a client's (the browser's, with a screen), a
+/// server's, or a tool's (the native host's tool profile).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Role {
     #[default]
     Client,
     Server,
+    Tool,
 }
 
 impl Role {
-    /// As diagnostics name it.
+    /// As diagnostics and attributes name it.
     pub fn name(self) -> &'static str {
         match self {
             Role::Client => "client",
             Role::Server => "server",
+            Role::Tool => "tool",
         }
     }
 }
@@ -742,7 +744,7 @@ pub struct FnAttrs {
     pub effects: Vec<crate::effects::Effect>,
     /// `@job`: a job, whose body runs over several frames, to each `yield` (§16.3).
     pub job: Option<Span>,
-    /// `@client` or `@server`: only that role's build may run it (§15).
+    /// `@client`, `@server` or `@tool`: only that role's build may run it (§15.3).
     pub role: Option<(Role, Span)>,
 }
 

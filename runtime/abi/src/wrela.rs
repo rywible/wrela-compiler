@@ -64,6 +64,11 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ),
     ("AUDIO_CHANNELS", crate::AUDIO_CHANNELS, "The voice's channels: left, then right."),
     (
+        "TOOL_RUNNING",
+        crate::TOOL_RUNNING,
+        "What a tool's `tool` returns to be called again, rather than an exit status.",
+    ),
+    (
         "MAX_TEXTURE_3D",
         crate::stream::MAX_TEXTURE_3D,
         "The widest, tallest and deepest 3D texture.",

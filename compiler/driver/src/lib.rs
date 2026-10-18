@@ -642,8 +642,8 @@ fn compile_loaded(
             if !ok || !mode.emit {
                 continue;
             }
-            if role == wrela_sema::defs::Role::Server {
-                let out = build::emit_server(&lowered, &sources, !data.no_simd);
+            if role != wrela_sema::defs::Role::Client {
+                let out = build::emit_headless(&lowered, &sources, !data.no_simd, role);
                 diagnostics.extend(out.diagnostics);
                 files.extend(out.files);
                 continue;
@@ -680,9 +680,9 @@ fn compile_loaded(
     Output { sources, diagnostics, std_warnings, files, pipelines, program_files, consts: stats }
 }
 
-/// The roles a program has (§15): a server's if main.wrela exports `serve`, a client's if it
-/// exports `frame`, or if it doesn't export `serve` (so a program with neither is told it needs
-/// `frame`).
+/// The roles a program has (§15.3): a server's if main.wrela exports `serve`, a tool's if it
+/// exports `tool`, a client's if it exports `frame`, or if it exports neither `serve` nor
+/// `tool` (so a program with none is told it needs `frame`).
 fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
     use wrela_sema::defs::{FnOwner, Role};
     let p = &checked.program;
@@ -694,15 +694,12 @@ fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
         })
     };
     let server = exports(wrela_abi::EXPORT_SERVE);
-    let client = exports(wrela_abi::EXPORT_FRAME) || !server;
-    let mut out = Vec::new();
-    if client {
-        out.push(Role::Client);
-    }
-    if server {
-        out.push(Role::Server);
-    }
-    out
+    let tool = exports(wrela_abi::EXPORT_TOOL);
+    let client = exports(wrela_abi::EXPORT_FRAME) || !(server || tool);
+    [(client, Role::Client), (server, Role::Server), (tool, Role::Tool)]
+        .into_iter()
+        .filter_map(|(has, role)| has.then_some(role))
+        .collect()
 }
 
 /// Reads the files `embed` reads, then computes the constants the build computes, into `data`,

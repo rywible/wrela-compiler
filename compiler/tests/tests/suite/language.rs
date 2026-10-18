@@ -72,6 +72,10 @@ const CONTEXTS: &[Context] = &[
         ..NONE
     },
     Context { first: "pub struct Look {", ..NONE },
+    Context {
+        first: "// A tool that waits a moment, reads a file, and exits with its size.",
+        ..NONE
+    },
     Context { first: "use std::derive::Box3", ..NONE },
     Context { first: "use std::input::{Key, Mods, Script}", ..NONE },
     Context { first: "pub struct Game {", ..NONE },

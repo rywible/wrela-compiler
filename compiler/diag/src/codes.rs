@@ -238,7 +238,7 @@ codes! {
     E0705 = "E0705", "a constant whose computation ran past the build's fuel limit";
     E0706 = "E0706", "a `@test` that fails";
     E0707 = "E0707", "a shipped build over a budget: a pipeline's WGSL";
-    E0708 = "E0708", "code only the other role's build may run, reached from this role's entries";
+    E0708 = "E0708", "code only another role's build may run, reached from this role's entries";
 
     // ---- E09xx: not in tier 0 --------------------------------------------------------------
 

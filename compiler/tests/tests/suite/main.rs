@@ -73,6 +73,7 @@ mod sweep;
 mod test_items;
 mod text;
 mod threads;
+mod tool;
 mod transport;
 mod unroll;
 mod warnings;

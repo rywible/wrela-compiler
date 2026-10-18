@@ -1,8 +1,9 @@
-// Code that only one role's build may run, reached from the other role's entries. A program's
+// Code that only one role's build may run, reached from another role's entries. A program's
 // client build runs `init` and `frame` and what they reach; its server build runs `serve_init`
-// and `serve` and what they reach. `@client` and `@server` mark what belongs to one role (std's
-// screen passes, `present`, audio and the ticker are the client's), and a server records no GPU
-// work. Move the call to the role it belongs to.
+// and `serve` and what they reach; its tool build `tool_init` and `tool`. `@client`, `@server`
+// and `@tool` mark what belongs to one role (std's screen passes, `present`, audio and the
+// ticker are the client's, `std::tool`'s services the tool's), and neither a server nor a tool
+// records GPU work. Move the call to the role it belongs to.
 // ---- wrong
 @server
 fn save(n: u32) -> u32 {

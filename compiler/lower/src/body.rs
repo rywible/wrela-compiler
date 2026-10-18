@@ -24,6 +24,9 @@ use wrela_sema::thir::Lit;
 use wrela_sema::ty::*;
 use wrela_syntax::ast::{BinOp, UnOp};
 
+/// What E0708 notes: each role's build and the entries it's lowered from (§15.3).
+const ROLE_ENTRIES: &str = "a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve`; its tool build `tool_init` and `tool` (§15.3)";
+
 /// How a MIR local exists in the IR function.
 #[derive(Clone, Debug)]
 pub(crate) enum Repr {
@@ -1920,13 +1923,13 @@ impl<'c, 'a> Fl<'c, 'a> {
                 }
             }
             Rvalue::Dispatch(d) => {
-                if !self.gpu_in_server(span) {
+                if !self.gpu_without_gpu(span) {
                     crate::gpu::lower_dispatch(self, d, span);
                 }
                 None
             }
             Rvalue::Draw(d) => {
-                if !self.gpu_in_server(span) {
+                if !self.gpu_without_gpu(span) {
                     crate::gpu::lower_draw(self, d, span);
                 }
                 None
@@ -2358,8 +2361,8 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
-    /// E0708 for a call, in a CPU module, to what only the other role's build may run (§15):
-    /// a function marked `@client` or `@server`, wherever the call chain from the build's
+    /// E0708 for a call, in a CPU module, to what only another role's build may run (§15.3):
+    /// a function marked `@client`, `@server` or `@tool`, wherever the call chain from the build's
     /// entries reaches it (through generics and closures too, as it's checked per instance).
     fn check_role(&mut self, func: FnId, span: Span) {
         if self.mb.gpu.is_some() {
@@ -2380,22 +2383,24 @@ impl<'c, 'a> Fl<'c, 'a> {
                 role.name()
             ),
         )
-        .with_note("a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve` and what they reach (§15)");
+        .with_note(ROLE_ENTRIES);
         self.cx.err(crate::gpu::with_call_chain(self, d));
     }
 
-    /// E0708 for GPU work recorded by a server build's code, which runs where there's no GPU
-    /// (§15.3): whether it was.
-    fn gpu_in_server(&mut self, span: Span) -> bool {
-        if self.mb.gpu.is_some() || self.cx.data.role != wrela_sema::defs::Role::Server {
+    /// E0708 for GPU work recorded by a server's or a tool's build, which runs where there's no
+    /// GPU (§15.3): whether it was.
+    fn gpu_without_gpu(&mut self, span: Span) -> bool {
+        let role = self.cx.data.role;
+        if self.mb.gpu.is_some() || role == wrela_sema::defs::Role::Client {
             return false;
         }
+        let r = role.name();
         let d = Diagnostic::new(
             wrela_diag::codes::E0708,
             span,
-            "GPU work in the server build's code: a server has no GPU",
+            format!("GPU work in the {r} build's code: a {r} has no GPU"),
         )
-        .with_note("a server build runs `serve_init` and `serve` and what they reach (§15)");
+        .with_note(ROLE_ENTRIES);
         self.cx.err(crate::gpu::with_call_chain(self, d));
         true
     }

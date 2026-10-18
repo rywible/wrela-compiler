@@ -860,9 +860,13 @@ impl<'d, 'u> Collector<'d, 'u> {
                     self.no_args(a, codes::E0336);
                     out.job = Some(a.span);
                 }
-                "client" | "server" => {
+                "client" | "server" | "tool" => {
                     self.no_args(a, codes::E0204);
-                    let role = if name == "client" { Role::Client } else { Role::Server };
+                    let role = match name {
+                        "client" => Role::Client,
+                        "server" => Role::Server,
+                        _ => Role::Tool,
+                    };
                     if let Some((other, _)) = out.role
                         && other != role
                     {
@@ -870,9 +874,14 @@ impl<'d, 'u> Collector<'d, 'u> {
                             Diagnostic::new(
                                 codes::E0204,
                                 a.name.span,
-                                "a function is `@client` or `@server`, not both",
+                                format!(
+                                    "a function has one role: it's `@{}` already, so not `@{name}`",
+                                    other.name()
+                                ),
                             )
-                            .with_note("each marks what only that role's build may run (§15)"),
+                            .with_note(
+                                "`@client`, `@server` and `@tool` each mark what only that role's build may run (§15.3)",
+                            ),
                         );
                     }
                     out.role = Some((role, a.span));
@@ -932,6 +941,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         "job",
                         "client",
                         "server",
+                        "tool",
                     ];
                     let mut d = Diagnostic::new(
                         codes::E0204,

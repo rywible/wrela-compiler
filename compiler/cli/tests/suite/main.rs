@@ -12,4 +12,5 @@ mod script;
 mod solve;
 mod studio;
 mod test;
+mod tool;
 mod trace;

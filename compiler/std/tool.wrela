@@ -1,0 +1,139 @@
+// A tool: a program the native host's tool profile runs (`wrela tool`, language.md §15.5), for
+// the work around a game: builds, captures, releases. A tool exports `tool_init() -> S` and
+// `tool(state: mut S) -> u32`. The host calls `tool` once, then again each time a request of the
+// tool's is answered; `tool` returns `RUNNING` to be called again, or the tool's exit status.
+//
+// A tool is written as a `@job fn` that `tool_init` starts and `tool` resumes: a request is
+// waited on with `yield`, as a frame waits for an answer (§16.3).
+//
+// ```wrela
+// use std::job::{Job, Step}
+// use std::tool::{RUNNING, args}
+// use std::tool::time::after
+//
+// @job
+// fn main(names: take Vec<String>) -> u32 {
+//     var p = after(0.1)
+//     while p.poll().is_none() { yield }
+//     u32(names.len())
+// }
+//
+// pub fn tool_init() -> Job<main> {
+//     main.start(args())
+// }
+//
+// pub fn tool(job: mut Job<main>) -> u32 {
+//     match job.resume() {
+//         Step::Yielded => RUNNING,
+//         Step::Done(status) => status,
+//     }
+// }
+// ```
+//
+// The services are `std::tool`'s modules: `files`, `blob` and `time`. Each is `@tool`, and only
+// what the `wrela tool` command line grants it reaches outside the tool: roots of files by name,
+// and secrets by name. Every answer of a tool service says whether it succeeded: its first byte
+// is 0, then what it gives, or 1, then why it failed in UTF-8. The readers here read that.
+
+use std::abi::TOOL_RUNNING
+use std::host::request
+use std::io::{IoError, Pending}
+use std::serialize::Reader
+
+/// What `tool` returns to be called again, once a request it made is answered: any other
+/// value, from 0 to 255, is the tool's exit status.
+pub const RUNNING: u32 = TOOL_RUNNING
+
+/// The arguments the tool was run with: what follows `--` on the `wrela tool` command line. The
+/// host gives them when it starts the tool, so this makes no request.
+@tool
+pub fn args() -> Vec<String> {
+    var r = Reader::new(Vec::from_kept())
+    var out: Vec<String> = Vec::new()
+    let Ok(n) = r.read_u32() else { return out }
+    for _ in 0..n {
+        let Ok(a) = r.read_string() else { return out }
+        out.push(take a)
+    }
+    out
+}
+
+/// The secret granted as `name` (`--secret NAME`: the environment variable's value when the
+/// tool started), or `None` if `name` isn't granted. The host never shows a secret.
+@tool
+pub fn secret(name: str) -> Option<String> {
+    var r = Reader::new(Vec::from_kept())
+    let Ok(n) = r.read_u32() else { return None }
+    for _ in 0..n {
+        let Ok(_) = r.read_string() else { return None }
+    }
+    let Ok(count) = r.read_u32() else { return None }
+    for _ in 0..count {
+        let Ok(key) = r.read_string() else { return None }
+        let Ok(value) = r.read_string() else { return None }
+        if key.as_str() == name {
+            return Some(value)
+        }
+    }
+    None
+}
+
+/// Why a tool's request failed, in the host's words: a path outside the roots, a file that
+/// isn't there, a budget spent.
+pub struct ToolError: Clone {
+    message: String,
+}
+
+impl ToolError {
+    /// What the host said.
+    pub fn message(self) -> borrow str {
+        self.message
+    }
+}
+
+/// A tool service's answer, read: what it gives, or why it failed. `polled` is what the
+/// request's `poll` gave.
+pub fn answer(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<u8>, ToolError> {
+    let bytes = match take polled {
+        Ok(b) => take b,
+        Err(e) => return Err(ToolError { message: e.message().to_string() }),
+    }
+    if bytes.len() == 0 {
+        return Err(ToolError { message: String::from("the host's answer is empty") })
+    }
+    var rest: Vec<u8> = Vec::with_capacity(bytes.len() - 1)
+    for i in 1..bytes.len() {
+        rest.push(bytes[i])
+    }
+    if bytes[0] == 0 {
+        return Ok(rest)
+    }
+    match String::from_utf8(take rest) {
+        Some(message) => Err(ToolError { message }),
+        None => Err(ToolError { message: String::from("the host's reason isn't UTF-8") }),
+    }
+}
+
+/// A `ToolError` for an answer that doesn't read as the service's.
+pub(package) fn malformed(service: str) -> ToolError {
+    ToolError { message: String::from(f"the host's answer to `{service}` doesn't read as one") }
+}
+
+/// The most bytes of data one tool request carries or one answer gives: whole files, and a
+/// blob's chunks, are at most this (512 KiB).
+pub const MOST_BYTES: u32 = 524288
+
+/// Sends a request to the tool service `service` (`tool/<service>`). Each service's function
+/// that calls it is `@tool`.
+pub(package) fn ask(service: str, body: [u8]) -> Pending<u8> {
+    request(f"tool/{service}", body)
+}
+
+@test
+fn an_answer_reads_as_its_bytes_or_its_reason() {
+    let Ok(ok) = answer(Ok(Vec::from([u8(0), 7, 8]))) else { panic("a success") }
+    assert(ok.len() == 2 && ok[0] == 7 && ok[1] == 8)
+    let Err(e) = answer(Ok(Vec::from([u8(1), 110, 111]))) else { panic("a failure") }
+    assert(e.message() == "no")
+    assert(answer(Ok(Vec::new())).is_err(), "an empty answer")
+}

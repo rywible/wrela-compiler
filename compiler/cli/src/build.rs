@@ -110,7 +110,8 @@ fn optimized(files: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
 const LINES: &str = "game.lines";
 
 /// Whether a build writes a file with this name: `game.wasm`, `manifest.json`, a pipeline's
-/// `pipeline_<n>.wgsl`, a file of the runtime, or a server build's `server/game.wasm`.
+/// `pipeline_<n>.wgsl`, a file of the runtime, a server build's `server/game.wasm` or a tool
+/// build's `tool/tool.wasm`.
 fn written_by_build(name: &str) -> bool {
     let pipeline = name
         .strip_prefix("pipeline_")
@@ -128,6 +129,7 @@ fn written_by_build(name: &str) -> bool {
         || name == "manifest.json"
         || name == "lift.json"
         || name == wrela_driver::build::SERVER_WASM
+        || name == wrela_driver::build::TOOL_WASM
         || wrela_driver::build::RUNTIME_FILES.iter().any(|(f, _)| *f == name)
 }
 

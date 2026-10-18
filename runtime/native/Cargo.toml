@@ -20,6 +20,10 @@ gpu = ["dep:wgpu", "dep:pollster", "dep:png"]
 [dependencies]
 wrela-abi.workspace = true
 wasmtime.workspace = true
+# The tool host's files: directory-relative handles, so no path or symbolic link leaves a root.
+cap-std = "4"
+# `O_NONBLOCK`, so opening a tool's file never waits on a FIFO.
+libc = "0.2"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 png = { version = "0.18", optional = true }

@@ -127,6 +127,9 @@ pub(package) const AUDIO_QUANTUM: u32 = 128
 /// The voice's channels: left, then right.
 pub(package) const AUDIO_CHANNELS: u32 = 2
 
+/// What a tool's `tool` returns to be called again, rather than an exit status.
+pub(package) const TOOL_RUNNING: u32 = 4294967295
+
 /// The widest, tallest and deepest 3D texture.
 pub(package) const MAX_TEXTURE_3D: u32 = 2048
 

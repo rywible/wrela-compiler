@@ -1,7 +1,8 @@
-//! Roles (language.md §15): a program that exports `frame` has a client build, one that exports
-//! `serve` a server build, and one with both has both, each lowered from its own entries, with
-//! one pair id in both modules. What only one role may run, reached from the other role's
-//! entries, is E0708 with the call chain.
+//! Roles (language.md §15.3): a program that exports `frame` has a client build, one that
+//! exports `serve` a server build, one that exports `tool` a tool build, and one with several
+//! has each, lowered from its own entries; the client and server modules share one pair id.
+//! What only one role may run, reached from another role's entries, is E0708 with the call
+//! chain.
 
 use std::path::{Path, PathBuf};
 
@@ -225,17 +226,187 @@ pub fn serve(state: mut u32, time: f32, extra: u32) {}
 }
 
 #[test]
-fn a_function_is_client_or_server_not_both() {
+fn a_function_has_one_role() {
     let main = r#"
 @client
 @server
 fn both() {}
 
+@server
+@tool
+fn also() {}
+
 pub fn frame(time: f32, width: u32, height: u32) {}
 "#;
     let (codes, text) = errors("both-roles", main);
-    assert!(codes.contains(&"E0204".to_string()), "{text}");
-    assert!(text.contains("`@client` or `@server`, not both"), "{text}");
+    assert_eq!(codes, ["E0204", "E0204"], "{text}");
+    assert!(text.contains("it's `@client` already, so not `@server`"), "{text}");
+    assert!(text.contains("it's `@server` already, so not `@tool`"), "{text}");
+}
+
+// ---- the tool role ----------------------------------------------------------------------------
+
+/// A program with all three roles: what each build runs, and what only one role may.
+const THREE: &str = r#"
+/// Code every build runs.
+fn shared(x: u32) -> u32 {
+    x + 1
+}
+
+@tool
+fn tool_only(x: u32) -> u32 {
+    shared(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = shared(width)
+}
+
+pub fn serve(time: f32) {
+    let _ = shared(2)
+}
+
+pub fn tool_init() -> u32 {
+    tool_only(0)
+}
+
+pub fn tool(state: mut u32) -> u32 {
+    state = shared(state)
+    state
+}
+"#;
+
+/// The maximum pages of the memory a module defines, if it defines one.
+fn memory_max(wasm: &[u8]) -> Option<u64> {
+    let engine = wasmtime::Engine::new(wasmtime::Config::new().wasm_threads(true)).expect("engine");
+    let module = wasmtime::Module::new(&engine, wasm).expect("a module");
+    module.exports().find_map(|e| match e.ty() {
+        wasmtime::ExternType::Memory(m) => m.maximum(),
+        _ => None,
+    })
+}
+
+#[test]
+fn a_tool_build_has_only_the_tools_code() {
+    let files = files(&package("three", THREE));
+    let tool = file(&files, "tool/tool.wasm");
+    let (tool_exports, tool_shared) = exports_and_memory(tool);
+    let mut sorted = tool_exports.clone();
+    sorted.sort();
+    assert_eq!(sorted, ["memory", "tool", "tool_init"], "{tool_exports:?}");
+    // One thread, its memory its own, and room to grow to 4 GiB less a page.
+    assert!(!tool_shared);
+    assert_eq!(memory_max(tool), Some(65535));
+    // The other builds have none of the tool's exports, and the tool isn't paired with them.
+    let (client_exports, _) = exports_and_memory(file(&files, "game.wasm"));
+    let (server_exports, _) = exports_and_memory(file(&files, "server/game.wasm"));
+    for exports in [&client_exports, &server_exports] {
+        assert!(!exports.iter().any(|e| e.starts_with("tool")), "{exports:?}");
+    }
+    assert!(wrela_abi::read_pair(tool).is_none());
+    assert_eq!(
+        wrela_abi::read_pair(file(&files, "game.wasm")),
+        wrela_abi::read_pair(file(&files, "server/game.wasm"))
+    );
+}
+
+#[test]
+fn a_tool_only_program_builds_only_the_tool() {
+    let main = "pub fn tool() -> u32 {\n    0\n}\n";
+    let files = files(&package("tool-only", main));
+    let paths: Vec<&str> = files.iter().map(|(p, _)| p.as_str()).collect();
+    assert_eq!(paths, ["tool/tool.wasm"]);
+}
+
+#[test]
+fn tool_code_reached_from_a_client_or_a_server_is_e0708_with_its_chain() {
+    let main = r#"
+use std::tool::files
+
+@tool
+fn keep(x: u32) -> u32 {
+    x
+}
+
+fn helper(x: u32) -> u32 {
+    keep(x)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = helper(width)
+}
+
+pub fn serve(time: f32) {
+    let _ = files::read("out/a.txt")
+}
+
+pub fn tool() -> u32 {
+    keep(0)
+}
+"#;
+    let (codes, text) = errors("tool-from-others", main);
+    assert_eq!(codes, ["E0708", "E0708"], "{text}");
+    assert!(text.contains("`keep` runs only in a tool build, and this is the client build's code"));
+    assert!(text.contains("`frame` → `helper`"), "{text}");
+    assert!(text.contains("`read` runs only in a tool build, and this is the server build's"));
+}
+
+#[test]
+fn client_server_and_gpu_code_reached_from_a_tool_is_e0708() {
+    let main = r#"
+use std::gpu::{GlobalId, Slots, buffer, dispatch}
+use std::host
+
+@compute(64, 1, 1)
+fn fill(id: GlobalId, out: mut Slots<u32>) {
+    out[id] = 1
+}
+
+@server
+fn persist(x: u32) -> u32 {
+    x
+}
+
+@client
+fn show(x: u32) -> u32 {
+    x
+}
+
+fn work() -> u32 {
+    var out = buffer::<u32>(64)
+    dispatch(fill.bind(mut out), over: 64)
+    persist(1) + show(2)
+}
+
+pub fn tool() -> u32 {
+    let _ = host::copy("x")
+    work()
+}
+"#;
+    let (codes, text) = errors("others-from-tool", main);
+    assert_eq!(codes, ["E0708", "E0708", "E0708", "E0708"], "{text}");
+    assert!(text.contains("GPU work in the tool build's code: a tool has no GPU"), "{text}");
+    assert!(text.contains("`persist` runs only in a server build, and this is the tool build's"));
+    assert!(text.contains("`show` runs only in a client build, and this is the tool build's"));
+    assert!(text.contains("`copy` runs only in a client build"), "{text}");
+    assert!(text.contains("`tool` → `work`"), "{text}");
+}
+
+#[test]
+fn the_tool_entries_signatures_are_checked() {
+    let main = r#"
+pub fn tool_init(seed: u32) -> u32 {
+    seed
+}
+
+pub fn tool(state: mut u32, extra: u32) -> f32 {
+    0.0
+}
+"#;
+    let (codes, text) = errors("tool-signatures", main);
+    assert_eq!(codes, ["E0703", "E0703"], "{text}");
+    assert!(text.contains("`tool_init`'s signature is `tool_init() -> State`"), "{text}");
+    assert!(text.contains("`tool`'s signature is `tool() -> u32`"), "{text}");
 }
 
 // ---- the server host's rooms ------------------------------------------------------------------

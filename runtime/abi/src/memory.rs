@@ -20,8 +20,9 @@
 //! | then, from a page boundary | the heap, which grows up |
 //!
 //! The memory starts with [`HEAP_START_PAGES`] pages of heap after the constants, and grows up to
-//! [`MAX_PAGES`] (1 GiB) as the heap needs. It's shared: the module imports it (`wrela.memory`),
-//! and every thread's instance of the module gets the same one.
+//! [`MAX_PAGES`] (1 GiB) as the heap needs (a tool build's to [`TOOL_MAX_PAGES`]). It's shared:
+//! the module imports it (`wrela.memory`), and every thread's instance of the module gets the
+//! same one. A server's or a tool's build has a memory of its own instead, on its one thread.
 //!
 //! ## Threads
 //!
@@ -215,6 +216,9 @@ pub const THREAD_STACK_SIZE: u32 = 1 << 20;
 pub const DATA_BASE: u32 = STACK_TOP + (THREADS - 1) * THREAD_STACK_SIZE;
 /// The most the memory grows to: 1 GiB.
 pub const MAX_PAGES: u32 = 16384;
+/// The most a tool build's memory grows to (language.md §15.5): all a 32-bit address reaches but
+/// its last page, so the allocator's ends stay below 2³².
+pub const TOOL_MAX_PAGES: u32 = 65535;
 /// The heap's room when the program starts, in pages: 1 MiB.
 pub const HEAP_START_PAGES: u32 = 16;
 

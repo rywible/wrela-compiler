@@ -24,6 +24,8 @@ sha2 = "0.10"
 # A faster allocator than macOS's: the compiler allocates a great deal.
 mimalloc.workspace = true
 png = "0.18"
+# `wrela tool`'s Ctrl-C: it stops the tool, and the host cleans up after it.
+ctrlc = "3"
 
 [lints]
 workspace = true

@@ -98,7 +98,8 @@ pub const EXPORT_LIFT_SET: &str = "__lift_set";
 /// before. A host that starts a program anew keeps nothing.
 pub const IMPORT_KEEP: &str = "keep";
 /// `kept(address, cap) -> length`: copies up to `cap` bytes of what the replaced build last
-/// kept to the address, and gives how many it kept, all of them (0 if nothing).
+/// kept to the address, and gives how many it kept, all of them (0 if nothing). The tool host
+/// gives a tool its start this way instead: its arguments and granted secrets (`std::tool`).
 pub const IMPORT_KEPT: &str = "kept";
 /// `clock(address)`: writes the seconds since the host started the program, an `f64` that never
 /// goes back, to the address (`std::time::now`). Reading it is `nondet` (language.md §8).
@@ -165,6 +166,13 @@ pub const EXPORT_INIT: &str = "init";
 /// starts the program, and `serve` whenever something happens (an event, a timer).
 pub const EXPORT_SERVE_INIT: &str = "serve_init";
 pub const EXPORT_SERVE: &str = "serve";
+/// A tool build's exports (language.md §15.3, §15.5): the tool host calls `tool_init` once, when
+/// it starts the tool, then `tool` once, and again each time a request of the tool's is
+/// answered. `tool` returns [`TOOL_RUNNING`] to be called again, or the tool's exit status.
+pub const EXPORT_TOOL_INIT: &str = "tool_init";
+pub const EXPORT_TOOL: &str = "tool";
+/// What a tool's `tool` returns to be called again, rather than an exit status (0 to 255).
+pub const TOOL_RUNNING: u32 = u32::MAX;
 /// The custom section both of a program's builds carry (language.md §15.3): eight bytes,
 /// little-endian, the [`pair_id`] of its client and server modules, which a client and a server
 /// compare to know they're one program's.

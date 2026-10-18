@@ -69,7 +69,7 @@ pub fn alloc(size: u32, align: u32) -> u32 {
     }
     unlock()
     if block == 0 {
-        panic("out of memory: the heap can't grow past 1 GiB")
+        panic("out of memory: the heap can't grow past its most (1 GiB; a tool's, 4 GiB)")
     }
     unsafe {
         reach_heap()

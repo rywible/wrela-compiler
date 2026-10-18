@@ -265,7 +265,7 @@ struct Compiled {
 /// The build's code as WASM, with where each offset is in the source. With `shared`, its memory
 /// is shared and imported, so helpers can run its parallel jobs.
 fn emit(m: &wrela_ir::Module, simd: bool, shared: bool) -> Result<wrela_wasm::Emitted, String> {
-    let options = wrela_wasm::Options { shared_memory: shared, simd };
+    let options = wrela_wasm::Options { shared_memory: shared, simd, ..Default::default() };
     wrela_wasm::emit_with(m, options)
         .map_err(|e| format!("the WASM back end failed on the build's code: {e}"))
 }

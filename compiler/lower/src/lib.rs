@@ -378,7 +378,7 @@ fn lower_in(
     cx.lift = data.lift.as_ref().filter(|t| !t.literals.is_empty());
     let mut cpu = ModuleBuilder::default();
     cx.make_table(&mut cpu);
-    let server = data.role == wrela_sema::defs::Role::Server;
+    let role = data.role;
     let mut has_entry = false;
     for &f in &roots.also {
         // A job's body is lowered as its `resume` (§16.3).
@@ -389,8 +389,8 @@ fn lower_in(
         };
         cx.instance(&mut cpu, key, None);
     }
-    // The program's state (§15): what `init` returns (a server's `serve_init`), which the
-    // other exports take first.
+    // The program's state (§15): what `init` returns (a server's `serve_init`, a tool's
+    // `tool_init`), which the other exports take first.
     let state = state_type(checked, data.role);
     if let Some((init, s)) = state {
         let span = checked.program.func(init).sig_span;
@@ -404,10 +404,10 @@ fn lower_in(
         if checked.program.func(f).attrs.testing.is_some() && !data.testing {
             continue;
         }
-        // A server build exports `serve_init` and `serve` alone; a client build every other
-        // export (§15).
+        // A server build exports `serve_init` and `serve` alone, a tool build `tool_init` and
+        // `tool`; a client build every other export (§15.3).
         let name = &checked.program.func(f).name;
-        if server != (name == wrela_abi::EXPORT_SERVE_INIT || name == wrela_abi::EXPORT_SERVE) {
+        if export_role(name) != role {
             continue;
         }
         let def = checked.program.func(f);
@@ -424,7 +424,7 @@ fn lower_in(
                         data.role.name()
                     ),
                 )
-                .with_note("each build's exports are entry points for that role (§15)"),
+                .with_note("each build's exports are entry points for that role (§15.3)"),
             );
         }
         if !checked.program.fn_all_generics(f).is_empty() {
@@ -435,7 +435,7 @@ fn lower_in(
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         let name = cx.checked.program.func(f).name.clone();
-        has_entry |= name == if server { wrela_abi::EXPORT_SERVE } else { wrela_abi::EXPORT_FRAME };
+        has_entry |= name == entry_export(role);
         if cx.check_export(f, state.map(|s| s.1)) {
             let id = enum_wrapper(&cx, &mut cpu, f, id);
             let id = match (cpu.m.state, state) {
@@ -458,7 +458,7 @@ fn lower_in(
         };
         cpu.m.exports.push((format!("test.{i}"), id));
     }
-    if !has_entry && !server {
+    if !has_entry && role == wrela_sema::defs::Role::Client {
         cx.no_frame();
     }
     cx.drain(&mut cpu);
@@ -735,6 +735,9 @@ impl<'a> Cx<'a> {
         if def.name == wrela_abi::EXPORT_SERVE_INIT || def.name == wrela_abi::EXPORT_SERVE {
             return self.check_server_export(f, state);
         }
+        if def.name == wrela_abi::EXPORT_TOOL_INIT || def.name == wrela_abi::EXPORT_TOOL {
+            return self.check_tool_export(f, state);
+        }
         if def.name == wrela_abi::EXPORT_INIT {
             let t = &self.checked.program.types;
             let ok = def.params.is_empty()
@@ -899,6 +902,49 @@ impl<'a> Cx<'a> {
             self.err(
                 Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
                     .with_note("a server program exports `serve`, and `serve_init` for its state; it reads what happened as events (§15)"),
+            );
+        }
+        ok
+    }
+
+    /// A tool build's export (§15.5): `tool_init() -> State`, then `tool(state: mut State) ->
+    /// u32` (`tool() -> u32` without state). E0703 otherwise.
+    fn check_tool_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
+        use wrela_sema::defs::{Mode, RetMode};
+        let def = self.checked.program.func(f);
+        let t = &self.checked.program.types;
+        let generic = !self.checked.program.fn_all_generics(f).is_empty();
+        if def.name == wrela_abi::EXPORT_TOOL_INIT {
+            let ok = def.params.is_empty()
+                && !t.is_unit(def.ret)
+                && def.ret_mode == RetMode::Owned
+                && !generic;
+            if !ok {
+                self.err(
+                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`tool_init`'s signature is `tool_init() -> State`: it makes the tool's state, which the host keeps")
+                        .with_note("the tool host calls `tool_init` once, then passes its result to `tool` (§15.5)"),
+                );
+            }
+            return ok;
+        }
+        let ok = match (state, def.params.as_slice()) {
+            (Some(s), [p]) => p.ty == s && p.mode == Mode::Mut,
+            (None, []) => true,
+            _ => false,
+        } && def.ret == t.u32
+            && def.ret_mode == RetMode::Owned
+            && !generic;
+        if !ok {
+            let msg = match state {
+                Some(s) => format!(
+                    "`tool`'s signature is `tool(state: mut {}) -> u32`: the tool host calls it until it returns an exit status",
+                    self.checked.program.display_ty(s)
+                ),
+                None => "`tool`'s signature is `tool() -> u32`: the tool host calls it until it returns an exit status".into(),
+            };
+            self.err(
+                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
+                    .with_note("`tool` returns `std::tool::RUNNING` to be called again once a request is answered, or an exit status from 0 to 255 (§15.5)"),
             );
         }
         ok
@@ -1074,16 +1120,37 @@ fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
 /// polymorphic recursion gets near.
 const MAX_INSTANCE_DEPTH: u32 = 256;
 
+/// The role whose build has the export `name` (§15.3): `serve_init` and `serve` are a
+/// server's, `tool_init` and `tool` a tool's, and every other export a client's.
+fn export_role(name: &str) -> wrela_sema::defs::Role {
+    use wrela_sema::defs::Role;
+    match name {
+        wrela_abi::EXPORT_SERVE_INIT | wrela_abi::EXPORT_SERVE => Role::Server,
+        wrela_abi::EXPORT_TOOL_INIT | wrela_abi::EXPORT_TOOL => Role::Tool,
+        _ => Role::Client,
+    }
+}
+
+/// The export a role's host calls again and again: `frame`, `serve` or `tool` (§15.3).
+fn entry_export(role: wrela_sema::defs::Role) -> &'static str {
+    match role {
+        wrela_sema::defs::Role::Client => wrela_abi::EXPORT_FRAME,
+        wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE,
+        wrela_sema::defs::Role::Tool => wrela_abi::EXPORT_TOOL,
+    }
+}
+
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
 /// The program's `init` (§15): `pub fn init() -> S` in main.wrela, and its state type `S`; for
-/// a server build, its `serve_init`.
+/// a server build, its `serve_init`, and for a tool build, its `tool_init`.
 fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
     let p = &checked.program;
     let main = p.main?;
     let init = match role {
         wrela_sema::defs::Role::Client => wrela_abi::EXPORT_INIT,
         wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE_INIT,
+        wrela_sema::defs::Role::Tool => wrela_abi::EXPORT_TOOL_INIT,
     };
     p.fns.iter().enumerate().find_map(|(i, f)| {
         (f.module == main

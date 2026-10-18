@@ -34,6 +34,7 @@ mod program;
 pub mod rooms;
 pub mod server;
 mod shared;
+pub mod tool;
 mod trace;
 
 pub use cache::compiled_code_prefix;
