@@ -58,6 +58,15 @@ fn comments_survive() {
     }
 }
 
+#[test]
+fn a_leading_bom_does_not_move_the_first_comment() {
+    for comment in ["// module", "/// function"] {
+        let source = format!("\u{feff}{comment}\nfn f() {{}}\n");
+        let formatted = round_trip(&source);
+        assert!(formatted.starts_with(comment), "{formatted}");
+    }
+}
+
 /// A table of short numbers that doesn't fit on a line fills its lines, as rustfmt does; other
 /// arrays, and tables with comments in them, keep one element to a line.
 #[test]

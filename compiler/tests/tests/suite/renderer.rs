@@ -81,6 +81,19 @@ fn each_capability_draws_what_it_should() {
 }
 
 #[test]
+#[ignore = "needs a GPU"]
+fn plant_fields_remain_finite_at_centres_and_extreme_blend_distances() {
+    let (dir, _) = page("compiler/tests/crown-numerics", "crown-numerics");
+    let run = native_at(&dir, 80, 16);
+    for panel in 0..5 {
+        let x = panel * 16 + 8;
+        let at = 4 * (8 * 80 + x);
+        let got = run.frame[at..at + 4].try_into().expect("RGBA pixel");
+        near(got, [0, 255, 0, 255], &format!("plant numeric panel {panel}"));
+    }
+}
+
+#[test]
 #[ignore = "needs the runtime"]
 fn the_browser_draws_the_native_hosts_frame() {
     hosts_agree_on("compiler/tests/renderer", "renderer-browser");

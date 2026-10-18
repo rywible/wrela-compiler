@@ -69,6 +69,38 @@ test("the ticker control's counters cross the signed boundary as unsigned words"
   expect(await Promise.race([control.ranTo(n).then(() => "resolved"), Bun.sleep(20).then(() => "timed out")])).toBe("resolved");
 });
 
+test("a ticker failure cannot miss a frame about to wait for its ticks", async () => {
+  const control = TickerControl.create();
+  const waitAsync = Atomics.waitAsync;
+  const failBeforeWait = ((words: Int32Array, index: number, value: number, timeout?: number) => {
+    // The ticker traps after ranTo checks its state, just before the frame begins waiting.
+    control.fail();
+    return waitAsync(words, index, value, timeout);
+  }) as typeof Atomics.waitAsync;
+  const wait = spyOn(Atomics, "waitAsync").mockImplementation(failBeforeWait);
+  try {
+    expect(await Promise.race([control.ranTo(1).then(() => "resolved"), Bun.sleep(20).then(() => "timed out")])).toBe("resolved");
+    expect(control.failed).toBe(true);
+  } finally {
+    wait.mockRestore();
+    control.ran(1);
+  }
+});
+
+test("stopping a ticker releases a frame waiting for ticks", async () => {
+  const control = TickerControl.create();
+  const waiting = control.ranTo(1);
+  control.stop();
+  try {
+    expect(await Promise.race([waiting.then(() => "resolved"), Bun.sleep(20).then(() => "timed out")])).toBe("resolved");
+    // A tick that was already running may publish its count after stop; later waits still end.
+    control.ran(1);
+    expect(await Promise.race([control.ranTo(2).then(() => "resolved"), Bun.sleep(20).then(() => "timed out")])).toBe("resolved");
+  } finally {
+    control.ran(2);
+  }
+});
+
 test("lockstep ticks publish the build origin and preserve the replay origin", async () => {
   const module = await WebAssembly.compile(buildModule({ memory: 20, funcs: [{
     type: { params: ["i32", "i32", "i32", "i32"], results: [] }, body: op.unreachable, export: "__tick",

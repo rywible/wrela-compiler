@@ -4,6 +4,7 @@ import { BrowserPlatform } from "./platform.ts";
 
 import { AUDIO_CHANNELS, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
+import { fitSize } from "./frame.ts";
 import { epochNow, InputRing } from "./input.ts";
 import { Semantics } from "./semantics.ts";
 import { listen, pollPads } from "./listen.ts";
@@ -313,9 +314,13 @@ function start(): void {
     const ring = InputRing.create();
     const platform = new BrowserPlatform(canvas, visible => worker.postMessage({ type: "visibility", visible: visible && document.visibilityState === "visible" } satisfies ToWorker));
     const clip = new Clip();
+    let maxScreen = Infinity;
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
-      if (msg.type === "host-request") {
+      if (msg.type === "screen-limit") {
+        maxScreen = msg.max;
+        Object.assign(sized, fitSize(sized.width, sized.height, maxScreen));
+      } else if (msg.type === "host-request") {
         platform.request(msg.service, msg.bytes).then(
           bytes => worker.postMessage({ type: "host-reply", id: msg.id, bytes, error: null } satisfies ToWorker),
           error => worker.postMessage({ type: "host-reply", id: msg.id, bytes: new Uint8Array(), error: errorMessage(error) } satisfies ToWorker),
@@ -375,7 +380,8 @@ function start(): void {
     worker.postMessage(msg, [offscreen]);
     if (!test) {
       const resize = (entry?: ResizeObserverEntry) => {
-        Object.assign(sized, devicePixels(canvas, entry));
+        const pixels = devicePixels(canvas, entry);
+        Object.assign(sized, fitSize(pixels.width, pixels.height, maxScreen));
         worker.postMessage({ type: "resize", ...sized } satisfies ToWorker);
       };
       const observer = new ResizeObserver(([entry]) => resize(entry));

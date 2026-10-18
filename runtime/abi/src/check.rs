@@ -25,6 +25,10 @@
 //!   one isn't a depth texture and the depth one is, and they're the same size.
 //! - **Requests:** a storage path or a URL is relative, `/`-separated, with no empty, `.` or
 //!   `..` parts ([`path_problem`]).
+//!
+//! A host that holds an exported call's commands until it returns brackets its checks with
+//! [`Checker::begin_call`] and [`Checker::end_call`]. A trapped call discards its commands and
+//! restores the checker's resources to those from before the call (language.md §18.3).
 
 use crate::Manifest;
 use crate::manifest::{BindingKind, RenderTarget, Stage};
@@ -126,6 +130,9 @@ pub struct Checker {
     limits: crate::Limits,
     pipelines: Vec<Shape>,
     resources: HashMap<u32, Resource>,
+    /// Successful creates and destroys in the current exported call, reversed if it traps.
+    resource_undo: Vec<(u32, Option<Resource>)>,
+    in_call: bool,
     /// The current usage scope, a dispatch or the open pass: each buffer's or texture's use
     /// so far, (read-only, read-write). Dispatches happen only outside a pass (the sequencer
     /// checks), so the two kinds of scope never overlap and share this map.
@@ -172,6 +179,8 @@ impl Checker {
             limits,
             pipelines,
             resources: HashMap::new(),
+            resource_undo: Vec::new(),
+            in_call: false,
             scope: HashMap::new(),
             spare_scope: HashMap::new(),
             attachments: Vec::new(),
@@ -184,6 +193,39 @@ impl Checker {
     /// The screen's dimensions for the next frame's pass checks.
     pub fn set_screen_size(&mut self, width: u32, height: u32) {
         self.screen_size = Some((width, height));
+    }
+
+    /// Starts checking an exported call whose commands the host holds until it returns.
+    pub fn begin_call(&mut self) {
+        debug_assert!(!self.in_call);
+        debug_assert!(self.resource_undo.is_empty());
+        self.in_call = true;
+    }
+
+    /// Keeps a successful call's resource changes, or restores the resources it started with
+    /// when the call traps and its held commands are discarded.
+    pub fn end_call(&mut self, commit: bool) {
+        debug_assert!(self.in_call);
+        self.in_call = false;
+        if commit {
+            self.resource_undo.clear();
+            return;
+        }
+        for (handle, previous) in self.resource_undo.drain(..).rev() {
+            match previous {
+                Some(resource) => {
+                    self.resources.insert(handle, resource);
+                }
+                None => {
+                    self.resources.remove(&handle);
+                }
+            }
+        }
+        self.scope.clear();
+        self.spare_scope.clear();
+        self.attachments.clear();
+        self.written.clear();
+        self.targets = (None, false);
     }
 
     /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
@@ -297,15 +339,15 @@ impl Checker {
             }
             Command::DestroyBuffer { handle } => {
                 self.buffer(op, *handle)?;
-                self.resources.remove(handle);
+                self.destroy(*handle);
             }
             Command::DestroyTexture { handle } => {
                 self.texture(op, *handle)?;
-                self.resources.remove(handle);
+                self.destroy(*handle);
             }
             Command::DestroySampler { handle } => {
                 self.sampler(op, *handle)?;
-                self.resources.remove(handle);
+                self.destroy(*handle);
             }
             Command::WriteBuffer { handle, offset, data } => {
                 self.range(op, *handle, *offset, data.len() as u32, "writing")?;
@@ -502,7 +544,18 @@ impl Checker {
             });
         }
         self.resources.insert(handle, r);
+        if self.in_call {
+            self.resource_undo.push((handle, None));
+        }
         Ok(())
+    }
+
+    /// Removes a resource whose kind the command has already checked.
+    fn destroy(&mut self, handle: u32) {
+        let previous = self.resources.remove(&handle);
+        if self.in_call {
+            self.resource_undo.push((handle, previous));
+        }
     }
 
     fn missing(op: Opcode, what: &str, handle: u32) -> CommandError {
@@ -672,6 +725,12 @@ impl Checker {
                     b.handle
                 ));
             }
+            if !kind.is_buffer() && (b.offset != 0 || b.size != 0) {
+                return err(format!(
+                    "a texture or sampler binding has offset {} and size {}: both must be 0",
+                    b.offset, b.size
+                ));
+            }
             match kind {
                 BindingKind::Read | BindingKind::ReadWrite => {
                     self.range(op, b.handle, b.offset, b.size, "binding")?;
@@ -743,6 +802,162 @@ mod tests {
     use super::*;
 
     use crate::stream::Pass;
+
+    #[test]
+    fn aborted_calls_restore_created_destroyed_and_reused_resources() {
+        let mut checker = Checker::new(&crate::vectors::check_manifest());
+        checker.check(&Command::CreateBuffer { handle: 1, size: 64 }).expect("buffer");
+        checker
+            .check(&Command::CreateTexture {
+                handle: 2,
+                width: 8,
+                height: 8,
+                format: TextureFormat::Rgba8,
+                writable: false,
+                depth: 0,
+            })
+            .expect("texture");
+        checker
+            .check(&Command::CreateSampler {
+                handle: 3,
+                linear: true,
+                repeat: false,
+                compare: None,
+            })
+            .expect("sampler");
+
+        checker.begin_call();
+        for size in [128, 256] {
+            checker.check(&Command::DestroyBuffer { handle: 1 }).expect("destroy buffer");
+            checker.check(&Command::CreateBuffer { handle: 1, size }).expect("reuse handle");
+        }
+        checker.check(&Command::DestroyTexture { handle: 2 }).expect("destroy texture");
+        checker.check(&Command::CreateBuffer { handle: 2, size: 32 }).expect("change kind");
+        checker.check(&Command::DestroySampler { handle: 3 }).expect("destroy sampler");
+        checker
+            .check(&Command::CreateTexture {
+                handle: 3,
+                width: 8,
+                height: 8,
+                format: TextureFormat::Rgba8,
+                writable: false,
+                depth: 0,
+            })
+            .expect("replace sampler with target");
+        checker.check(&Command::CreateBuffer { handle: 4, size: 16 }).expect("new buffer");
+        checker.check(&Command::CreateBuffer { handle: 5, size: 16 }).expect("temporary buffer");
+        checker.check(&Command::DestroyBuffer { handle: 5 }).expect("drop temporary buffer");
+        checker
+            .check(&Command::BeginPass(Pass {
+                color: 3,
+                keep_color: false,
+                join: false,
+                clear: [0.0; 4],
+                depth: NONE,
+                keep_depth: false,
+                clear_depth: 1.0,
+            }))
+            .expect("unfinished pass");
+        checker
+            .check(&Command::Draw {
+                pipeline: 0,
+                vertices: 3,
+                instances: 1,
+                bindings: vec![Binding::range(1, 0, 256), Binding::range(2, 0, 32)],
+                uniforms: &[0; 16],
+            })
+            .expect("draw before trap");
+        checker.end_call(false);
+
+        assert_eq!(checker.buffer(Opcode::ReadBuffer, 1), Ok(64));
+        assert_eq!(checker.texture(Opcode::BeginPass, 2).expect("restored texture").width, 8);
+        assert_eq!(checker.sampler(Opcode::DestroySampler, 3), Ok(false));
+        for handle in [4, 5] {
+            assert!(checker.buffer(Opcode::ReadBuffer, handle).is_err());
+        }
+        assert!(checker.scope.is_empty());
+        assert!(checker.spare_scope.is_empty());
+        assert!(checker.attachments.is_empty());
+        assert!(checker.written.is_empty());
+        assert_eq!(checker.targets, (None, false));
+        assert!(checker.resource_undo.is_empty());
+    }
+
+    #[test]
+    fn committed_calls_keep_resources_and_do_not_affect_later_rollbacks() {
+        let mut checker = Checker::new(&Manifest::new("game.wasm"));
+        checker.check(&Command::CreateBuffer { handle: 1, size: 64 }).expect("original buffer");
+        checker.begin_call();
+        checker.check(&Command::DestroyBuffer { handle: 1 }).expect("destroy original");
+        checker.check(&Command::CreateBuffer { handle: 2, size: 32 }).expect("committed buffer");
+        checker.end_call(true);
+        assert!(checker.buffer(Opcode::ReadBuffer, 1).is_err());
+        assert_eq!(checker.buffer(Opcode::ReadBuffer, 2), Ok(32));
+
+        checker.begin_call();
+        assert!(checker.check(&Command::CreateBuffer { handle: 2, size: 128 }).is_err());
+        assert!(checker.check(&Command::DestroyBuffer { handle: 1 }).is_err());
+        checker.check(&Command::CreateBuffer { handle: 1, size: 16 }).expect("aborted buffer");
+        checker.end_call(false);
+        assert!(checker.buffer(Opcode::ReadBuffer, 1).is_err());
+        assert_eq!(checker.buffer(Opcode::ReadBuffer, 2), Ok(32));
+        assert!(checker.resource_undo.is_empty());
+    }
+
+    #[test]
+    fn textures_and_samplers_cannot_bind_buffer_ranges() {
+        let mut checker = Checker::new(&crate::vectors::sample_manifest());
+        checker
+            .check(&Command::CreateTexture {
+                handle: 1,
+                width: 1,
+                height: 1,
+                format: TextureFormat::Rgba8,
+                writable: false,
+                depth: 0,
+            })
+            .expect("texture");
+        checker
+            .check(&Command::CreateSampler {
+                handle: 2,
+                linear: true,
+                repeat: false,
+                compare: None,
+            })
+            .expect("sampler");
+        checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("pass");
+        for slot in 0..2 {
+            for (offset, size) in [(4, 0), (0, 4), (4, 4)] {
+                let mut bindings = vec![Binding::of(1), Binding::of(2)];
+                bindings[slot].offset = offset;
+                bindings[slot].size = size;
+                let error = checker
+                    .check(&Command::Draw {
+                        pipeline: 1,
+                        vertices: 3,
+                        instances: 1,
+                        bindings,
+                        uniforms: &[],
+                    })
+                    .expect_err("a texture or sampler has no buffer range");
+                assert_eq!(
+                    error.why,
+                    format!(
+                        "a texture or sampler binding has offset {offset} and size {size}: both must be 0"
+                    )
+                );
+            }
+        }
+        checker
+            .check(&Command::Draw {
+                pipeline: 1,
+                vertices: 3,
+                instances: 1,
+                bindings: vec![Binding::of(1), Binding::of(2)],
+                uniforms: &[],
+            })
+            .expect("valid bindings after rejected ranges");
+    }
 
     #[test]
     fn used_depth_clear_is_from_zero_to_one() {

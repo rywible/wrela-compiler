@@ -299,10 +299,52 @@ fn infer_from_bounds(c: &mut Checker) {
     }
 }
 
+/// Powers whose base started as an integer literal keep their exponent open: a later use
+/// can make both floats. Propagate that choice through shared literals before defaulting
+/// the remaining integer bases and their `u32` exponents.
+fn infer_powers(c: &mut Checker) {
+    let powers = c.pows.clone();
+    let open = |c: &Checker| {
+        powers
+            .iter()
+            .flat_map(|&(base, exp, _)| [base, exp])
+            .map(|t| match c.infer.var_kind(&c.p.types, t) {
+                Some(VarKind::General) => 3,
+                Some(VarKind::Int) => 2,
+                Some(VarKind::Float) => 1,
+                None => 0,
+            })
+            .sum::<usize>()
+    };
+    loop {
+        let before = open(c);
+        for &(base, exp, _) in &powers {
+            let float = |t| {
+                matches!(c.kind(t), TyKind::Float(_))
+                    || c.infer.var_kind(&c.p.types, t) == Some(VarKind::Float)
+            };
+            if float(base) || float(exp) {
+                c.try_unify(base, exp);
+            } else if matches!(c.kind(base), TyKind::Int(_)) {
+                c.try_unify(exp, c.p.types.u32);
+            }
+        }
+        if open(c) == before {
+            break;
+        }
+    }
+    for (base, exp, _) in powers {
+        if c.is_intlike(base) {
+            c.try_unify(exp, c.p.types.u32);
+        }
+    }
+}
+
 /// Resolves every type, and checks what needed resolved types.
 pub(super) fn finish_common(c: &mut Checker) {
     infer_from_bounds(c);
     c.settle_projections(true);
+    infer_powers(c);
     let unknown = c.infer.apply_defaults(&c.p.types);
     // A signature with an error in it was reported where it's written: what the body can't
     // infer from it follows from that.
@@ -321,6 +363,7 @@ pub(super) fn finish_common(c: &mut Checker) {
         );
     }
     c.binding_kinds();
+    c.check_matches();
     // `let x = place` owns: only a `Copy` value can be copied out (§6.3). A run (`str`, `[T]`)
     // is the one view type, never owned, so `let` of one reads it in place, as `borrow` does.
     for (id, at, keyword) in std::mem::take(&mut c.owned_lets) {

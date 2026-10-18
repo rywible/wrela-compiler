@@ -37,6 +37,41 @@ pub(crate) fn has_mut_field(p: &Program, t: crate::ty::TyId) -> bool {
         .any(|(f, ft)| f.mode == RetMode::Mut || (p.is_borrow_struct(ft) && has_mut_field(p, ft)))
 }
 
+/// A borrow struct's fields and nested fields: their paths, types and projection modes.
+fn borrow_struct_fields(
+    p: &Program,
+    ty: crate::ty::TyId,
+) -> Vec<(Vec<u32>, crate::ty::TyId, RetMode)> {
+    fn visit(
+        p: &Program,
+        ty: crate::ty::TyId,
+        path: &mut Vec<u32>,
+        out: &mut Vec<(Vec<u32>, crate::ty::TyId, RetMode)>,
+    ) {
+        let crate::ty::TyKind::Adt(a, args) = p.types.kind(ty) else { return };
+        for (i, (f, ft)) in
+            p.adt_fields(*a, None).iter().zip(p.fields_of(*a, args, None)).enumerate()
+        {
+            path.push(i as u32);
+            let mode = if f.mode == RetMode::Owned
+                && matches!(p.types.kind(ft), crate::ty::TyKind::Slice(_) | crate::ty::TyKind::Str)
+            {
+                RetMode::Borrow
+            } else {
+                f.mode
+            };
+            out.push((path.clone(), ft, mode));
+            if p.is_borrow_struct(ft) {
+                visit(p, ft, path, out);
+            }
+            path.pop();
+        }
+    }
+    let mut out = Vec::new();
+    visit(p, ty, &mut Vec::new(), &mut out);
+    out
+}
+
 /// Checks every function and closure body of `body`.
 pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
     let mut out = Vec::new();
@@ -894,13 +929,10 @@ impl<'a> FnCheck<'a> {
                             kind: OperandKind::Copy(src) | OperandKind::Move(src, _),
                             ty,
                             ..
-                        }) if src.proj.is_empty()
-                            && (is_callable(&self.p.types, *ty)
-                                || self.p.is_borrow_struct(*ty)) =>
-                        {
-                            // A closure held by another local, copied or moved (`take f`): its
-                            // loans travel with it.
-                            self.inherit(st, at, place.local, src.local, s.span)
+                        }) if is_callable(&self.p.types, *ty) || self.p.is_borrow_struct(*ty) => {
+                            // A closure or borrow struct, copied or moved (`take f`): its
+                            // loans travel with it, including from a nested borrow struct.
+                            self.inherit(st, at, place.local, src, s.span)
                         }
                         _ => {}
                     }
@@ -1087,8 +1119,11 @@ impl<'a> FnCheck<'a> {
         let own = || Target { place: place.clone(), via: Vec::new(), exact: true, mutable: true };
         // Through a borrow struct's projection field: what the field projects, from the loans
         // under it; with none (a parameter's), the place itself.
-        if !self.is_alias(place.local) && self.p.is_borrow_struct(self.local(place.local).ty) {
-            if self.borrow_field_mode(place).is_none() && !place.proj.is_empty() {
+        if self.p.is_borrow_struct(self.local(place.local).ty) {
+            if !self.is_alias(place.local)
+                && self.borrow_field_mode(place).is_none()
+                && !place.proj.is_empty()
+            {
                 return vec![own()];
             }
             let path: Vec<Option<u32>> = place
@@ -1102,7 +1137,10 @@ impl<'a> FnCheck<'a> {
             let mut out: Vec<Target> = Vec::new();
             for i in st.loans.iter() {
                 let l = &self.loans[i];
-                if l.holder != place.local || l.field.is_empty() {
+                if l.holder != place.local {
+                    continue;
+                }
+                if l.field.is_empty() && (!self.is_alias(place.local) || !path.is_empty()) {
                     continue;
                 }
                 // The loan's field path and the place's agree as far as both go: the rest of a
@@ -1173,6 +1211,71 @@ impl<'a> FnCheck<'a> {
         out
     }
 
+    /// The storage of a borrow struct itself, apart from what its fields project.
+    fn struct_storage(&self, st: &State, place: &Place) -> Vec<Target> {
+        let field: Option<Vec<_>> = place
+            .proj
+            .iter()
+            .map(|p| match p {
+                Proj::Field(i) => Some(*i),
+                _ => None,
+            })
+            .collect();
+        if let Some(field) = field
+            && !field.is_empty()
+        {
+            let prefix = st
+                .loans
+                .iter()
+                .map(|i| &self.loans[i])
+                .filter(|l| {
+                    l.holder == place.local && !l.field.is_empty() && field.starts_with(&l.field)
+                })
+                .map(|l| l.field.len())
+                .max();
+            let projected: Vec<_> = st
+                .loans
+                .iter()
+                .map(|i| &self.loans[i])
+                .filter(|l| {
+                    l.holder == place.local
+                        && Some(l.field.len()) == prefix
+                        && field.starts_with(&l.field)
+                })
+                .map(|l| {
+                    let mut source = l.place.clone();
+                    if l.exact {
+                        source.proj.extend(field[l.field.len()..].iter().copied().map(Proj::Field));
+                    }
+                    Target { place: source, via: l.via.clone(), exact: l.exact, mutable: l.mutable }
+                })
+                .collect();
+            if !projected.is_empty() {
+                return projected;
+            }
+        }
+        if !self.is_alias(place.local) {
+            return vec![Target {
+                place: place.clone(),
+                via: Vec::new(),
+                exact: true,
+                mutable: true,
+            }];
+        }
+        st.loans
+            .iter()
+            .map(|i| &self.loans[i])
+            .filter(|l| l.holder == place.local && l.field.is_empty())
+            .map(|l| {
+                let mut source = l.place.clone();
+                if l.exact {
+                    extend_path(&mut source, &place.proj);
+                }
+                Target { place: source, via: l.via.clone(), exact: l.exact, mutable: l.mutable }
+            })
+            .collect()
+    }
+
     /// `local` starts aliasing `place`.
     fn bind(
         &mut self,
@@ -1185,12 +1288,78 @@ impl<'a> FnCheck<'a> {
     ) {
         let kind = if mutable { Access::MutBorrow } else { Access::Borrow };
         let targets = self.resolve(st, place);
+        let ty = self.local(local).ty;
+        let fields = if self.p.is_borrow_struct(ty) {
+            borrow_struct_fields(self.p, ty)
+                .into_iter()
+                .map(|(field, ty, mode)| {
+                    let mut source = place.clone();
+                    source.proj.extend(field.iter().copied().map(Proj::Field));
+                    let targets = if self.p.is_borrow_struct(ty) {
+                        self.struct_storage(st, &source)
+                    } else {
+                        self.resolve(st, &source)
+                    };
+                    (field, mode, targets)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        // An alias needs its source aggregate's storage too, even when all of the
+        // aggregate's projection fields point elsewhere.
+        let storage =
+            if self.p.is_borrow_struct(ty) { self.struct_storage(st, place) } else { Vec::new() };
         // What `local` held before (a loop's last pass) ends here, before the new loan's
         // access is checked against the others.
         self.redefine(st, local);
         self.access(st, at, place, kind, span);
         // A call's `mut` argument is only reserved until the call (§6.5).
         let reserve = mutable && self.local(local).kind == LocalKind::Arg { mutable: true };
+        if self.p.is_borrow_struct(ty) {
+            for t in storage {
+                let mut via = vec![local];
+                via.extend(t.via);
+                let mutable = mutable && t.mutable;
+                self.new_loan(
+                    st,
+                    at,
+                    Loan {
+                        place: t.place,
+                        mutable: mutable && !reserve,
+                        reserved: mutable && reserve,
+                        holder: local,
+                        via,
+                        exact: t.exact,
+                        field: Vec::new(),
+                        span,
+                    },
+                );
+            }
+            for (field, mode, targets) in fields {
+                for t in targets {
+                    let mut via = vec![local];
+                    via.extend(t.via);
+                    let mutable =
+                        t.mutable && (mode == RetMode::Mut || (mode == RetMode::Owned && mutable));
+                    self.new_loan(
+                        st,
+                        at,
+                        Loan {
+                            place: t.place,
+                            mutable: mutable && !reserve,
+                            reserved: mutable && reserve,
+                            holder: local,
+                            via,
+                            exact: t.exact,
+                            field: field.clone(),
+                            span,
+                        },
+                    );
+                }
+            }
+            return;
+        }
         for t in targets {
             if reserve {
                 let reserved = t.mutable;
@@ -1283,6 +1452,12 @@ impl<'a> FnCheck<'a> {
         fields: &[Arg],
         span: Span,
     ) {
+        let modes = match self.p.types.kind(self.local(holder).ty) {
+            crate::ty::TyKind::Adt(a, _) => {
+                self.p.adt_fields(*a, None).iter().map(|f| f.mode).collect::<Vec<_>>()
+            }
+            _ => Vec::new(),
+        };
         for (i, a) in fields.iter().enumerate() {
             let (p, mutable) = match a {
                 Arg::Borrow(p, _) => (p, false),
@@ -1291,6 +1466,26 @@ impl<'a> FnCheck<'a> {
             };
             let ty = place_ty(self.p, &self.body.locals, p);
             if self.p.is_borrow_struct(ty) {
+                if modes.get(i).is_some_and(|mode| *mode != RetMode::Owned) {
+                    for t in self.struct_storage(st, p) {
+                        let mut via = vec![holder];
+                        via.extend(t.via);
+                        self.new_loan(
+                            st,
+                            at,
+                            Loan {
+                                place: t.place,
+                                mutable: mutable && t.mutable,
+                                reserved: false,
+                                holder,
+                                via,
+                                exact: t.exact,
+                                field: vec![i as u32],
+                                span,
+                            },
+                        );
+                    }
+                }
                 // A borrow struct inside this one: its loans, under this field.
                 let inner: Vec<Loan> = self
                     .resolve_loans(st, p)
@@ -1336,10 +1531,22 @@ impl<'a> FnCheck<'a> {
             })
             .collect();
         let Some(fields) = fields else { return Vec::new() };
+        let ty = place_ty(self.p, &self.body.locals, p);
+        let projected = self.p.is_borrow_struct(ty).then(|| {
+            borrow_struct_fields(self.p, ty)
+                .into_iter()
+                .filter_map(|(field, _, mode)| (mode != RetMode::Owned).then_some(field))
+                .collect::<Vec<_>>()
+        });
         st.loans
             .iter()
             .map(|i| &self.loans[i])
             .filter(|l| l.holder == p.local && l.field.starts_with(&fields))
+            .filter(|l| {
+                projected.as_ref().is_none_or(|paths| {
+                    paths.iter().any(|field| field.as_slice() == &l.field[fields.len()..])
+                })
+            })
             .map(|l| (l.clone(), l.field[fields.len()..].to_vec()))
             .collect()
     }
@@ -1357,6 +1564,7 @@ impl<'a> FnCheck<'a> {
         // The callee's parameter types and result type, to see which arguments the result can
         // point into.
         let sig = self.call_signature(c);
+        let borrow_struct = self.p.is_borrow_struct(self.local(holder).ty);
         for (k, a) in c.args.iter().enumerate() {
             if let Some((params, ret)) = &sig
                 && let Some(&pt) = params.get(k)
@@ -1373,9 +1581,14 @@ impl<'a> FnCheck<'a> {
                 Arg::Take(_) => continue,
             };
             let mutable = from_mut && c.ret_mode == RetMode::Mut;
-            for t in self.resolve(st, p) {
+            let targets =
+                if borrow_struct { self.struct_storage(st, p) } else { self.resolve(st, p) };
+            for t in targets {
                 self.lend(st, at, holder, Target { exact: false, ..t }, mutable, span);
             }
+        }
+        if borrow_struct {
+            self.borrow_struct_result_loans(st, at, holder, c, span);
         }
     }
 
@@ -1413,47 +1626,74 @@ impl<'a> FnCheck<'a> {
         span: Span,
     ) {
         let ty = self.local(holder).ty;
-        let crate::ty::TyKind::Adt(a, args) = self.p.types.kind(ty) else { return };
-        let (a, args) = (*a, args.clone());
         let params = self.call_signature(c).map(|(params, _)| params);
-        let modes: Vec<RetMode> = self.p.adt_fields(a, None).iter().map(|f| f.mode).collect();
-        let tys = self.p.fields_of(a, &args, None);
-        for (i, (mode, fty)) in modes.into_iter().zip(tys).enumerate() {
-            let run = matches!(
-                self.p.types.kind(fty),
-                crate::ty::TyKind::Slice(_) | crate::ty::TyKind::Str
-            );
-            let nested = self.p.is_borrow_struct(fty);
-            if mode == RetMode::Owned && !run && !nested {
-                continue; // a `Copy` value
+        for (field, fty, mode) in borrow_struct_fields(self.p, ty) {
+            if mode == RetMode::Owned {
+                continue;
             }
-            let mutable = mode == RetMode::Mut || (nested && has_mut_field(self.p, fty));
+            let mutable = mode == RetMode::Mut;
             for (k, arg) in c.args.iter().enumerate() {
-                if let Some(pt) = params.as_ref().and_then(|ps| ps.get(k))
-                    && !crate::traits::can_hold(self.p, *pt, fty)
-                {
-                    continue;
-                }
                 let p = match arg {
-                    Arg::Borrow(_, _) if mutable => continue,
                     Arg::Borrow(p, _) | Arg::Mut(p, _) => p,
+                    Arg::Take(op) if self.p.is_borrow_struct(op.ty) => {
+                        let Some(p) = op.place() else { continue };
+                        p
+                    }
                     Arg::Take(_) => continue,
                 };
-                let from_mut = matches!(arg, Arg::Mut(..));
-                for t in self.resolve(st, p) {
-                    let mut via = vec![holder];
-                    via.extend(t.via);
-                    let loan = Loan {
-                        place: t.place,
-                        mutable: mutable && from_mut && t.mutable,
-                        reserved: false,
-                        holder,
-                        via,
-                        exact: false,
-                        field: vec![i as u32],
-                        span,
+                let pt = params
+                    .as_ref()
+                    .and_then(|ps| ps.get(k))
+                    .copied()
+                    .unwrap_or_else(|| place_ty(self.p, &self.body.locals, p));
+                // A borrow struct lends each field in its own mode, even when the
+                // parameter holding the struct is read-only.
+                let mut sources = if self.p.is_borrow_struct(pt) {
+                    borrow_struct_fields(self.p, pt)
+                        .into_iter()
+                        .filter(|(_, _, mode)| {
+                            !matches!(arg, Arg::Take(_)) || *mode != RetMode::Owned
+                        })
+                        .map(|(path, ty, mode)| {
+                            let mut source = p.clone();
+                            source.proj.extend(path.into_iter().map(Proj::Field));
+                            (source, ty, mode == RetMode::Mut)
+                        })
+                        .collect()
+                } else {
+                    vec![(p.clone(), pt, matches!(arg, Arg::Mut(..)))]
+                };
+                if self.p.is_borrow_struct(pt) && pt == fty && !matches!(arg, Arg::Take(_)) {
+                    sources.push((p.clone(), pt, matches!(arg, Arg::Mut(..))));
+                }
+                for (source, source_ty, from_mut) in sources {
+                    let aggregate = self.p.is_borrow_struct(source_ty);
+                    if (mutable && !from_mut)
+                        || (aggregate && source_ty != fty)
+                        || !crate::traits::can_hold(self.p, source_ty, fty)
+                    {
+                        continue;
+                    }
+                    let targets = if aggregate {
+                        self.struct_storage(st, &source)
+                    } else {
+                        self.resolve(st, &source)
                     };
-                    self.new_loan(st, at, loan);
+                    for t in targets {
+                        let mut via = vec![holder];
+                        via.extend(t.via);
+                        let loan = Loan {
+                            place: t.place,
+                            mutable: mutable && from_mut && t.mutable,
+                            reserved: false,
+                            holder,
+                            via,
+                            exact: false,
+                            field: field.clone(),
+                            span,
+                        };
+                        self.new_loan(st, at, loan);
+                    }
                 }
             }
         }
@@ -1572,18 +1812,12 @@ impl<'a> FnCheck<'a> {
         }
     }
 
-    /// `to` holds what `from` holds (a closure copied to another local).
-    fn inherit(&mut self, st: &mut State, at: Point, to: Local, from: Local, span: Span) {
-        let held: Vec<Loan> = st
-            .loans
-            .iter()
-            .filter(|&i| self.loans[i].holder == from)
-            .map(|i| self.loans[i].clone())
-            .collect();
-        for l in held {
+    /// `to` holds what `from` holds: a closure or borrow struct copied to another local.
+    fn inherit(&mut self, st: &mut State, at: Point, to: Local, from: &Place, span: Span) {
+        for (l, field) in self.resolve_loans(st, from) {
             let mut via = vec![to];
             via.extend(l.via.iter().copied());
-            self.new_loan(st, at, Loan { holder: to, via, span, ..l });
+            self.new_loan(st, at, Loan { holder: to, via, field, span, ..l });
         }
     }
 
@@ -1969,7 +2203,12 @@ impl<'a> FnCheck<'a> {
         if !self.emit {
             return;
         }
-        for t in self.resolve(st, place) {
+        let targets = if self.p.is_borrow_struct(place_ty(self.p, &self.body.locals, place)) {
+            self.struct_storage(st, place)
+        } else {
+            self.resolve(st, place)
+        };
+        for t in targets {
             if self.reject_swizzle_return(&t.place, ret_span) {
                 continue;
             }
@@ -2241,6 +2480,286 @@ fn unused_locals(p: &Program, body: &Body) -> Vec<Diagnostic> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copied_nested_borrow_struct_keeps_its_loans() {
+        for source_place in ["nested.view", "alias.view"] {
+            let source = format!(
+                "
+borrow struct View {{ value: borrow String }}
+borrow struct Nested {{ view: View }}
+pub fn inspect(value: mut String) -> u32 {{
+    let nested = Nested {{ view: View {{ value }} }}
+    borrow alias = nested
+    let view = {source_place}
+    value = String::new()
+    view.value.len()
+}}
+"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+                "{source_place}: {diagnostics:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn borrow_struct_alias_preserves_mutable_field_loans() {
+        let source = "
+borrow struct View { value: mut String }
+pub fn inspect(value: mut String) -> u32 {
+    let original = View { value: mut value }
+    borrow alias = original
+    let view = alias
+    value = String::new()
+    view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn copying_a_borrow_struct_alias_copies_its_value_fields() {
+        let source = "
+borrow struct Source { value: u32 }
+pub fn inspect() -> u32 {
+    let copy = {
+        let source = Source { value: 42 }
+        borrow alias = source
+        alias
+    }
+    copy.value
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn borrow_struct_alias_cannot_outlive_its_storage() {
+        for returned in ["original", "alias"] {
+            let source = format!(
+                "
+borrow struct View {{ value: borrow String }}
+pub fn escape(value: String) -> borrow View {{
+    let original = View {{ value }}
+    borrow alias = original
+    {returned}
+}}
+"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0508"),
+                "{returned}: {diagnostics:#?}"
+            );
+        }
+        let source = "
+borrow struct View { value: borrow String }
+pub fn project(original: View) -> borrow View { original }
+pub fn alias(original: View) -> borrow View {
+    borrow alias = original
+    alias
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn copied_nested_borrow_struct_releases_other_fields() {
+        let source = "
+borrow struct View { value: borrow String }
+borrow struct Nested { view: View, spare: borrow String }
+pub fn inspect(value: String, spare: mut String) -> u32 {
+    let nested = Nested { view: View { value }, spare }
+    let view = nested.view
+    spare = String::new()
+    view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn returned_nested_borrow_struct_keeps_its_loans() {
+        let source = "
+borrow struct View { value: borrow String }
+borrow struct Nested { view: View }
+fn project(value: String) -> Nested { Nested { view: View { value } } }
+pub fn inspect(value: mut String) -> u32 {
+    let nested = project(value)
+    value = String::new()
+    nested.view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn projected_borrow_struct_results_keep_fields_and_storage() {
+        let source = "
+borrow struct View { value: borrow String }
+fn pass(view: View) -> borrow View { view }
+pub fn inspect(value: mut String) -> u32 {
+    let original = View { value }
+    let view = pass(original)
+    value = String::new()
+    view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+            "{diagnostics:#?}"
+        );
+        let source = "
+borrow struct View { value: borrow String }
+fn pass(view: View) -> borrow View { view }
+pub fn escape(value: String) -> borrow View {
+    let original = View { value }
+    pass(original)
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0508"), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn nested_borrow_struct_projections_keep_their_storage() {
+        let source = "
+borrow struct View { value: borrow String }
+borrow struct Outer { view: borrow View }
+pub fn escape(value: String) -> Outer {
+    let original = View { value }
+    Outer { view: original }
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0508"), "{diagnostics:#?}");
+        let forwarded = source
+            .replace(
+                "pub fn escape",
+                "fn wrap(view: View) -> Outer { Outer { view } }\npub fn escape",
+            )
+            .replace("Outer { view: original }", "wrap(original)");
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(&forwarded), &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0508"), "{diagnostics:#?}");
+        let source = "
+borrow struct View { value: borrow String }
+borrow struct Outer { view: borrow View }
+borrow struct Owned { view: View }
+fn wrap(view: View) -> Outer { Outer { view } }
+pub fn direct(view: View) -> Outer { Outer { view } }
+pub fn forwarded(view: View) -> Outer { wrap(view) }
+pub fn copied(value: String) -> Owned {
+    let original = View { value }
+    Owned { view: original }
+}
+borrow struct Nested { view: View }
+borrow struct Projected { nested: borrow Nested }
+pub fn inner(nested: Nested) -> borrow View {
+    let outer = Projected { nested }
+    outer.nested.view
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn mutable_borrow_struct_arguments_reserve_until_the_call() {
+        let source = "
+borrow struct View { value: borrow String }
+fn inspect(view: mut View, count: u32) -> u32 { view.value.len() + count }
+pub fn run(value: String) -> u32 {
+    var view = View { value }
+    inspect(mut view, view.value.len())
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn returned_borrow_struct_preserves_mutable_argument_fields() {
+        let source = "
+borrow struct View { value: mut String }
+fn pass(view: View) -> View { view }
+pub fn inspect(value: mut String) -> u32 {
+    let original = View { value: mut value }
+    let view = pass(original)
+    value = String::new()
+    view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+            "{diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn returned_borrow_struct_cannot_borrow_a_local_argument_field() {
+        let source = "
+borrow struct Source { value: u32 }
+borrow struct View { value: borrow u32 }
+fn project(source: Source) -> View { View { value: source.value } }
+pub fn escape() -> View {
+    let source = Source { value: 42 }
+    project(source)
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0508"), "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn returned_borrow_struct_keeps_taken_projection_fields() {
+        let source = "
+borrow struct View { value: mut String }
+fn pass(view: take View) -> View { view }
+pub fn inspect(value: mut String) -> u32 {
+    let original = View { value: mut value }
+    let view = pass(take original)
+    value = String::new()
+    view.value.len()
+}
+";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(
+            diagnostics.iter().any(|d| matches!(d.code.as_str(), "E0506" | "E0507")),
+            "{diagnostics:#?}"
+        );
+    }
+
     #[test]
     fn swizzle_projection_call_results_cannot_escape_copied_arguments() {
         for source in [

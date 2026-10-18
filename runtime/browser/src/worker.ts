@@ -79,6 +79,14 @@ function deliverInput(program: Program, frame: number | null = null): readonly n
 
 const resampler = new Resampler();
 
+/** Completion writes in order: a failure that arrives during a successful PUT must be the
+ * server's final result, even when that first PUT is slow. */
+let doneReport = Promise.resolve();
+function reportDone(text: string): Promise<void> {
+  doneReport = doneReport.catch(() => {}).then(() => putResult(base, "DONE", text));
+  return doneReport;
+}
+
 /** Stops everything and reports `e`: to the page, and in test mode to `results/DONE`. A trap in
  * an optimized build is reported once its location is fetched (`locate`). */
 function fatal(e: unknown): void {
@@ -90,7 +98,7 @@ function fatal(e: unknown): void {
   void locate(errorMessage(e), async () => (build ? loadLines(at, build.manifest) : null)).then((text) => {
     self.postMessage({ type: "fatal", message: text, unsupported: e instanceof UnsupportedError } satisfies FromWorker);
     if (testing) {
-      putResult(base, "DONE", text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
+      reportDone(text).catch((err: unknown) => console.error(`can't report the failure: ${errorMessage(err)}`));
     }
   });
 }
@@ -337,6 +345,7 @@ const startVoice = (voice: VoiceOptions, onPrint: PrintSink) => {
 const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency || 1) - 3, MAX_WORKERS)) + 1;
 
 async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, live: Live | null): Promise<void> {
+  self.postMessage({ type: "screen-limit", max: device.limits.maxTextureDimension2D } satisfies FromWorker);
   const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
   clock.startAt(epochNow());
   const screen = { texture: () => ctx.getCurrentTexture() };
@@ -453,16 +462,19 @@ async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint
   const row = width * 4;
   const padded = alignTo(row, 256);
   const staging = device.createBuffer({ size: padded * height, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
-  const encoder = device.createCommandEncoder();
-  encoder.copyTextureToBuffer({ texture }, { buffer: staging, bytesPerRow: padded, rowsPerImage: height }, [width, height]);
-  device.queue.submit([encoder.finish()]);
-  await staging.mapAsync(GPUMapMode.READ);
-  const mapped = new Uint8Array(staging.getMappedRange());
-  const out = new Uint8Array(row * height);
-  for (let y = 0; y < height; y++) out.set(mapped.subarray(y * padded, y * padded + row), y * row);
-  staging.unmap();
-  staging.destroy();
-  return out;
+  try {
+    const encoder = device.createCommandEncoder();
+    encoder.copyTextureToBuffer({ texture }, { buffer: staging, bytesPerRow: padded, rowsPerImage: height }, [width, height]);
+    device.queue.submit([encoder.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const mapped = new Uint8Array(staging.getMappedRange());
+    const out = new Uint8Array(row * height);
+    for (let y = 0; y < height; y++) out.set(mapped.subarray(y * padded, y * padded + row), y * row);
+    staging.unmap();
+    return out;
+  } finally {
+    staging.destroy();
+  }
 }
 
 /** What a test records as it runs, for its results. */
@@ -607,6 +619,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     // Paced at `fps`, as a display paces frames: requests are answered in real time between
     // them, as when the game runs.
     if (params.saturate === 0) await sleepUntil(began0 + (i * 1000) / fps);
+    if (failed) return;
     // Hot reload: a new build replaces the program before this frame.
     const next = live?.take(r.program) ?? null;
     if (next !== null) {
@@ -631,6 +644,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       // The ticker's thread reports its trap (`tickerStarter`).
       if (control.failed) return;
     }
+    if (failed) return;
     for (const e of frameEvents.get(i) ?? []) r.program.queueScripted(e);
     if (params.clip > 0 && i === params.clipfrom) self.postMessage({ type: "clip-start" } satisfies FromWorker);
     if (params.clip > 0 && i === params.clipfrom + params.clip) self.postMessage({ type: "clip-stop" } satisfies FromWorker);
@@ -674,6 +688,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     }
   }
   await draining;
+  if (failed) return;
   await saveResults(device, build, params, r, screen, timing, record);
 }
 
@@ -732,8 +747,11 @@ async function saveResults(
   const resources = [...page.resources, ...loaded(["resource"])];
   const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, resources };
   await putResult(base, "load.json", JSON.stringify(load));
+  // An asynchronous device or voice failure may arrive while results are being saved. Its
+  // DONE report is final; a later successful write must not replace it.
+  if (failed) return;
   console.log(`wrela test: ${frames} frames at ${width}x${height}, state hash ${hash ? hash.hex() : "none"}`);
-  await putResult(base, "DONE", "ok");
+  await reportDone("ok");
 }
 
 /** Starts a worker thread for the program's parallel jobs: this script again, told to run them. */

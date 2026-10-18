@@ -718,7 +718,11 @@ pub(crate) fn literal_values(
     for l in literals {
         let current = texts.get(l.file as usize)?;
         let (s, e) = moved(&lifted[l.file as usize].1, current, l.start, l.end)?;
-        values.push(crate::edit::signed_value(&current.text()[s as usize..e as usize])?);
+        let value = crate::edit::signed_value(&current.text()[s as usize..e as usize])?;
+        if !value.is_finite() {
+            return None;
+        }
+        values.push(value);
     }
     Some(values)
 }
@@ -856,6 +860,43 @@ pub fn reference_mask(width: u32, height: u32, rgba: &[u8]) -> Result<Vec<u8>, S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overflowing_literals_require_a_rebuild() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-studio-overflow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let text =
+            "pub fn value() -> f32 { 0.5 }\npub fn frame(time: f32, width: u32, height: u32) {}\n";
+        let file = dir.join("main.wrela");
+        std::fs::write(&file, text).expect("source");
+        assert!(!crate::check(&dir).has_errors(), "the initial program checks");
+        let built = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+        let lifted = vec![(file.clone(), Numbers::new(text))];
+        let start = text.find("0.5").expect("literal") as u32;
+        let literals =
+            vec![crate::lift::ReportLiteral { file: 0, start, end: start + 3, value: 0.5 }];
+        for value in ["1e99", "-1e99", "1e99m", "16777217", "18446744073709551615"] {
+            std::fs::write(&file, text.replace("0.5", value)).expect("changed source");
+            assert!(
+                crate::check(&dir).diagnostics.iter().any(|d| d.code == wrela_diag::codes::E0006),
+                "the compiler rejects {value} as unrepresentable"
+            );
+            let now = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+            assert!(
+                literal_values(&lifted, &literals, &now, &built).is_none(),
+                "{value} must rebuild to report its compiler error"
+            );
+        }
+        for value in ["16777216", "16777217.0"] {
+            std::fs::write(&file, text.replace("0.5", value)).expect("valid changed source");
+            assert!(!crate::check(&dir).has_errors(), "the compiler accepts {value}");
+            let now = crate::live::scan(std::slice::from_ref(&dir), &Files::new());
+            assert_eq!(literal_values(&lifted, &literals, &now, &built), Some(vec![16777216.0]));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn edit_posts_reject_an_invalid_entry_without_keeping_other_edits() {

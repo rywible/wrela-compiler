@@ -101,6 +101,9 @@ type Resource = { kind: "buffer"; size: number } | Texture | { kind: "sampler"; 
 export class Checker {
   readonly #pipelines: Shape[];
   readonly #resources = new Map<number, Resource>();
+  /** Original values of resource handles changed in the current export, if one is active. */
+  #inCall = false;
+  readonly #beforeCall = new Map<number, Resource | undefined>();
   /** The current usage scope, a dispatch or the open pass: each buffer's or texture's use so
    * far, bit 1 read-only and bit 2 read-write. Dispatches happen only outside a pass (the `Sequencer`
    * checks), so the two kinds of scope never overlap and share this map. */
@@ -139,6 +142,33 @@ export class Checker {
   /** Gives screen passes the frame's canvas size for attachment checks. */
   setScreenSize(width: number, height: number): void {
     this.#screenSize = [width, height];
+  }
+
+  /** Begins an export outside any pass. Resource changes remain reversible until it returns. */
+  beginCall(): void {
+    this.#inCall = true;
+  }
+
+  /** Commits a successful export, or forgets all its resource changes. An export never keeps
+   * an open pass, so its usage scope and attachments need not cross this boundary. */
+  endCall(commit: boolean): void {
+    if (!commit) {
+      for (const [handle, resource] of this.#beforeCall) {
+        if (resource === undefined) this.#resources.delete(handle);
+        else this.#resources.set(handle, resource);
+      }
+    }
+    this.#beforeCall.clear();
+    this.#inCall = false;
+    this.#scope.clear();
+    this.#spareScope.clear();
+    this.#attachments = [];
+    this.#targets = { colour: null, depth: false };
+    this.#written.length = 0;
+  }
+
+  #remember(handle: number): void {
+    if (this.#inCall && !this.#beforeCall.has(handle)) this.#beforeCall.set(handle, this.#resources.get(handle));
   }
 
   /** Checks a command that has passed the `Sequencer`, and records its effect. */
@@ -220,14 +250,17 @@ export class Checker {
         return;
       case "DestroyBuffer":
         this.#buffer(op, cmd.handle);
+        this.#remember(cmd.handle);
         this.#resources.delete(cmd.handle);
         return;
       case "DestroyTexture":
         this.#texture(op, cmd.handle);
+        this.#remember(cmd.handle);
         this.#resources.delete(cmd.handle);
         return;
       case "DestroySampler":
         this.#sampler(op, cmd.handle);
+        this.#remember(cmd.handle);
         this.#resources.delete(cmd.handle);
         return;
       case "WriteBuffer":
@@ -368,6 +401,7 @@ export class Checker {
   #create(op: OpcodeName, handle: number, r: Resource): void {
     const old = this.#resources.get(handle);
     if (old !== undefined) throw new CommandError(op, `handle ${handle} already names a ${old.kind}`);
+    this.#remember(handle);
     this.#resources.set(handle, r);
   }
 
@@ -455,6 +489,9 @@ export class Checker {
       const { kind, format } = p.bindings[i]!;
       if (this.#attachments.includes(b.handle)) {
         throw err(`texture ${b.handle} is the pass's target, so its draws can't bind it`);
+      }
+      if (kind !== "read" && kind !== "read_write" && (b.offset !== 0 || b.size !== 0)) {
+        throw err(`a texture or sampler binding has offset ${b.offset} and size ${b.size}: both must be 0`);
       }
       switch (kind) {
         case "read":

@@ -57,6 +57,29 @@ test("a finger that rests is shown where it rests", () => {
   expect(last).toEqual({ kind: EventKind.PointerMove, x: 5, y: 40 });
 });
 
+test("moves stay resampled while another pointer button remains held", () => {
+  const r = new Resampler();
+  r.take(join([
+    pointerEvent(EventKind.PointerDown, 0, 0, 0, 0),
+    pointerEvent(EventKind.PointerDown, 0, 0, 2, 0),
+    pointerEvent(EventKind.PointerUp, 0, 0, 0, 0),
+  ]), [0, 1, 2], 2);
+  const moves = read(r.take(join([
+    pointerEvent(EventKind.PointerMove, 0, 10, 0, 0),
+    pointerEvent(EventKind.PointerMove, 0, 14, 0, 0),
+  ]), [10, 14], 16));
+  expect(moves).toHaveLength(1);
+  expect(moves[0]!.kind).toBe(EventKind.PointerMove);
+  expect(moves[0]!.y).toBeGreaterThan(0);
+  expect(moves[0]!.y).toBeLessThan(10);
+  r.take(pointerEvent(EventKind.PointerUp, 0, 14, 2, 0), [17], 17);
+  const hover = join([
+    pointerEvent(EventKind.PointerMove, 0, 20, 0, 0),
+    pointerEvent(EventKind.PointerMove, 0, 24, 0, 0),
+  ]);
+  expect(r.take(hover, [20, 24], 24)).toEqual(hover);
+});
+
 test("a press, a release, a move with nothing held and other events pass as they come", () => {
   const r = new Resampler();
   const hover = pointerEvent(EventKind.PointerMove, 3, 4, 0, 0);

@@ -100,3 +100,19 @@ test("a missing uniform is no uniform block, as in serde", () => {
   const m = parseManifest(GOLDEN.replace('"uniform": null,', ""));
   expect(m.pipelines[1]!.uniform).toBeNull();
 });
+
+test("only kernels bind storage textures", () => {
+  for (const kind of ["storage_texture", "storage_texture_3d"]) {
+    for (const stage of [undefined, "vertex", "fragment"]) {
+      const m = JSON.parse(GOLDEN);
+      Object.assign(m.pipelines[1].bindings[0], { kind, stage });
+      expectInvalid(
+        () => parseManifest(JSON.stringify(m)),
+        "pipeline 1's binding 0 is a storage texture, which only a kernel can bind",
+      );
+    }
+    const m = JSON.parse(GOLDEN);
+    Object.assign(m.pipelines[0].bindings[0], { kind, format: "rgba8unorm" });
+    expect(() => parseManifest(JSON.stringify(m))).not.toThrow();
+  }
+});

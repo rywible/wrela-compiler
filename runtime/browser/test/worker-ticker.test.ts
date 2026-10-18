@@ -1,4 +1,4 @@
-// The render worker's ticker scheduling, with CPU stand-ins for its GPU and program.
+// The render worker's ticker scheduling and failures, with CPU stand-ins for its GPU and program.
 import { expect, test } from "bun:test";
 import { InputRing } from "../src/input.ts";
 import { TICK_ORIGIN } from "../src/abi.gen.ts";
@@ -9,7 +9,7 @@ import type { TickerStart, ToWorker } from "../src/messages.ts";
 
 let scenarios = 0;
 
-async function tickerScenario(reloading: boolean, history = false, hz = 60): Promise<void> {
+async function tickerScenario(reloading: boolean, history = false, hz = 60, asynchronousFailure: "frame" | "results" | "report" | "readback" | null = null): Promise<void> {
   const globals = globalThis as unknown as Record<string, unknown>;
   const saved = new Map(["self", "Worker", "fetch", "__tickerTest"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const timers: ReturnType<typeof setInterval>[] = [];
@@ -19,21 +19,48 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60): Pro
   const frameOrigins: number[] = [];
   let frames = 0;
   let builds = 0;
+  let buffersDestroyed = 0;
   let reloaded = false;
   const stopped = Promise.withResolvers<string>();
+  const reported = Promise.withResolvers<void>();
+  const done: string[] = [];
   const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {} };
   const device = {
-    createTexture: () => ({}), pushErrorScope() {}, popErrorScope: async () => null,
-    queue: { onSubmittedWorkDone: async () => {} },
+    createTexture: () => ({ width: 1, height: 1 }), pushErrorScope() {}, popErrorScope: async () => null,
+    createBuffer: () => ({
+      mapAsync: async () => { if (asynchronousFailure === "readback") throw new Error("readback mapping failed"); },
+      getMappedRange: () => new ArrayBuffer(256), unmap() {}, destroy() { buffersDestroyed++; },
+    }),
+    createCommandEncoder: () => ({ copyTextureToBuffer() {}, finish() {} }),
+    queue: { onSubmittedWorkDone: async () => {}, submit() {} },
   };
   const self = {
     location: { href: "https://site.example/worker.js" },
     onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null,
-    postMessage(message: { type: string; message?: string }) { if (message.type === "fatal") stopped.resolve(message.message!); },
+    postMessage(message: { type: string; message?: string }) {
+      if (message.type === "fatal") stopped.resolve(message.message!);
+      if (message.type === "load-query" && (asynchronousFailure === "results" || asynchronousFailure === "report")) {
+        if (asynchronousFailure === "results") self.onmessage!({ data: { type: "audio-failed", message: "audio stopped during results" } } as MessageEvent<ToWorker>);
+        self.onmessage!({ data: { type: "load", opened_ms: 0, resources: [] } } as unknown as MessageEvent<ToWorker>);
+      }
+    },
   };
   try {
     globals.self = self;
-    globals.fetch = async () => new Response("");
+    globals.fetch = async (url: URL, init?: RequestInit) => {
+      if (url.pathname.endsWith("/results/DONE")) {
+        const body = String(init?.body);
+        if (body === "ok" && asynchronousFailure === "report") {
+          self.onmessage!({ data: { type: "audio-failed", message: "audio stopped during results" } } as MessageEvent<ToWorker>);
+          // The successful PUT is already in flight when the error is reported. Its server
+          // write finishes later than the error's unless the worker serializes both writes.
+          await Bun.sleep(20);
+        }
+        done.push(body);
+        if (body !== "ok") reported.resolve();
+      }
+      return new Response("");
+    };
     globals.__tickerTest = { device, takeReload() {
       if (!reloading || reloaded || frames < 2) return null;
       reloaded = true;
@@ -43,14 +70,17 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60): Pro
       const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
       const program = {
         executor, ticker: null as { hz: number } | null, inbox: new Inbox(), queueInput() {},
-        keeping: new Uint8Array(), shutdown() {},
+        keeping: new Uint8Array(), shutdown() {}, workerChunks: () => 0,
         frame() {
-          if (!reloading && frames === 1) {
+          if (asynchronousFailure === "frame" && frames === 0) queueMicrotask(() => self.onmessage!({ data: {
+            type: "audio-failed", message: "audio stopped during the frame",
+          } } as MessageEvent<ToWorker>));
+          if (!reloading && asynchronousFailure === null && frames === 1) {
             program.ticker = { hz };
             options.startTicker({ hz, memory }, () => {});
           }
           if (frames === 2 && program.ticker !== null) frameOrigins.push(new DataView(memory.buffer).getFloat64(TICK_ORIGIN, true));
-          if (frames++ === 2) throw new Error("stopped after three frames");
+          if (frames++ === 2 && asynchronousFailure === null) throw new Error("stopped after three frames");
         },
       };
       if (replacement || history) {
@@ -94,7 +124,18 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60): Pro
       type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, canvas: { getContext: () => ({ configure() {} }) },
       input: InputRing.create().buffer, width: 1, height: 1, test: { ...TEST_DEFAULTS, frames: 4, width: 1, height: 1, fps: 60, saturate: 1 },
     } } as unknown as MessageEvent<ToWorker>);
-    expect(await Promise.race([stopped.promise, Bun.sleep(2000).then(() => "timed out")])).toContain("stopped after three frames");
+    const failure = await Promise.race([stopped.promise, Bun.sleep(2000).then(() => "timed out")]);
+    expect(await Promise.race([reported.promise.then(() => true), Bun.sleep(2000).then(() => false)])).toBe(true);
+    if (asynchronousFailure !== null) {
+      expect(failure).toContain(asynchronousFailure === "frame" ? "audio stopped during the frame" : asynchronousFailure === "readback" ? "readback mapping failed" : "audio stopped during results");
+      // Let the current asynchronous work finish. No later frame or successful DONE may follow.
+      await Bun.sleep(asynchronousFailure === "report" ? 50 : 20);
+      expect(frames).toBe(asynchronousFailure === "frame" ? 1 : 4);
+      expect(done).toEqual(asynchronousFailure === "report" ? ["ok", failure] : [failure]);
+      if (asynchronousFailure === "readback") expect(buffersDestroyed).toBe(1);
+      return;
+    }
+    expect(failure).toContain("stopped after three frames");
     expect(frames).toBe(3);
     expect(targets).toEqual(history ? [1, 2, 3] : hz === 60 ? [1] : []);
     expect(origins).toEqual(history ? [0, 0, 0] : hz === 60 ? [2 / 60] : []);
@@ -118,3 +159,11 @@ test("a reload starting the first ticker counts from the reload frame", () => ti
 test("a reload with ticker history keeps its original schedule", () => tickerScenario(true, true));
 
 test("a zero-tick frame sees its origin before the ticker thread starts", () => tickerScenario(false, false, 30));
+
+test("an asynchronous fatal error stops test frames", () => tickerScenario(false, false, 60, "frame"));
+
+test("a fatal error during result saving cannot be replaced by a successful DONE", () => tickerScenario(false, false, 60, "results"));
+
+test("a fatal error during a successful DONE upload stays the final result", () => tickerScenario(false, false, 60, "report"));
+
+test("a failed result readback destroys its staging buffer", () => tickerScenario(false, false, 60, "readback"));

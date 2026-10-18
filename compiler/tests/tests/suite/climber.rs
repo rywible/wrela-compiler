@@ -6,5 +6,5 @@ use wrela_tests::repo_root;
 /// them.
 #[test]
 fn the_fights_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 30);
+    assert_eq!(super::tests_pass(&repo_root().join("examples/climber")), 31);
 }

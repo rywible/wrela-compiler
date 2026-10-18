@@ -1,4 +1,4 @@
-//! The floor's map and small growth fixtures. Full-scene bakes, tours and timing claims are
+//! The floor's map, simulation and small growth fixtures. Full-scene bakes and timing claims are
 //! historical experiments; cache, shipping, rendering and browser behavior use small fixtures.
 
 use crate::scratch;
@@ -74,6 +74,60 @@ fn the_environments_bounded_art_and_collision_regressions_pass() {
     let great_tree = repo_root().join("examples/great-tree").display().to_string();
     text.push_str(&format!("great_tree = {{ path = {great_tree:?} }}\n"));
     std::fs::write(manifest, text).expect("add great tree dependency");
+    let declared = copied_map_test_count(&dir)
+        + extra.iter().map(|file| declared_tests(&dir.join(file))).sum::<usize>();
+    assert_eq!(super::tests_pass(&dir), declared);
+}
+
+/// Run the production simulation and encounter on the map, with a short tour and no baked
+/// wood. The tick's movement and control regressions need no full-scene history or growth.
+#[test]
+fn the_worlds_bounded_simulation_regressions_pass() {
+    let dir =
+        map_package("last-green/world", "pub fn frame(time: f32, width: u32, height: u32) {}\n");
+    let floor = repo_root().join("games/last-green");
+    let extra = ["world.wrela", "encounter.wrela", "behaviour.wrela", "fawns.wrela"];
+    for file in extra {
+        std::fs::copy(floor.join(file), dir.join(file)).expect("copy simulation fixture module");
+    }
+    std::fs::write(
+        dir.join("history.wrela"),
+        r#"
+use engine::footing::Obstacles
+
+pub const OBSTACLES: Obstacles = Obstacles::of(Vec::new(), vec2(-128.0), vec2(128.0))
+pub const TOUR: Vec<vec2> = Vec::from([vec2(0.0, 16.0), vec2(16.0, 16.0)])
+
+pub fn tiles_lo() -> vec2i { vec2i(-1) }
+pub fn tiles_hi() -> vec2i { vec2i(1) }
+pub fn draw_at(at: vec2) -> f32 { 0.0 }
+"#,
+    )
+    .expect("write bounded history");
+    std::fs::write(
+        dir.join("wildwood.wrela"),
+        r#"
+pub const REACH: f32 = 60.0
+pub const MOST_TRUNKS: u32 = 512
+pub const EGG = vec2(32.0)
+pub const ROAD_START = vec2(16.0)
+
+pub fn road_points(every: f32) -> Vec<vec2> {
+    Vec::from([ROAD_START, EGG])
+}
+
+pub fn trunks_round(at: vec2, reach: f32) -> Vec<vec4> { Vec::new() }
+pub fn covered(last: vec4, count: u32, around: vec2) -> f32 { REACH }
+"#,
+    )
+    .expect("write bounded wildwood");
+    let manifest = dir.join("wrela.toml");
+    let mut text = std::fs::read_to_string(&manifest).expect("read map fixture manifest");
+    for dependency in ["climber", "fawn"] {
+        let path = repo_root().join("examples").join(dependency).display().to_string();
+        text.push_str(&format!("{dependency} = {{ path = {path:?} }}\n"));
+    }
+    std::fs::write(manifest, text).expect("add creature dependencies");
     let declared = copied_map_test_count(&dir)
         + extra.iter().map(|file| declared_tests(&dir.join(file))).sum::<usize>();
     assert_eq!(super::tests_pass(&dir), declared);

@@ -165,7 +165,9 @@ pub fn comment_places(src: &str) -> Vec<(String, usize, bool)> {
 fn on_own_line(src: &str, c: &Comment) -> bool {
     let start = c.span.start as usize;
     let line = src[..start].rfind('\n').map_or(0, |i| i + 1);
-    src[line..start].chars().all(|ch| ch.is_whitespace() || ch == ',' || ch == ';')
+    let prefix = &src[line..start];
+    let prefix = if line == 0 { prefix.trim_start_matches('\u{feff}') } else { prefix };
+    prefix.chars().all(|ch| ch.is_whitespace() || ch == ',' || ch == ';')
 }
 
 /// Whether the formatter writes a token of this kind as the source has it: everything but

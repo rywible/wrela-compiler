@@ -35,6 +35,8 @@ pub struct LiftedLiteral {
     pub column: u32,
     /// The value its source gives it.
     pub value: f32,
+    /// One unit of the written mantissa, including its exponent and suffix.
+    pub unit: f64,
     /// A negation is applied to it where it's used (`-0.5`): its sign is the expression's.
     pub negated: bool,
 }
@@ -404,9 +406,9 @@ impl Fl<'_, '_> {
             .literals
             .iter()
             .map(|l| {
-                ir::ConstValue::Parts(
-                    [l.file, l.start, l.end, l.line, l.column].map(scalar).to_vec(),
-                )
+                let mut fields = [l.file, l.start, l.end, l.line, l.column].map(scalar).to_vec();
+                fields.push(ir::ConstValue::Scalar(ir::Const::F64(l.unit)));
+                ir::ConstValue::Parts(fields)
             })
             .collect();
         let ty = self.mb.m.types.intern(ir::TypeDef::Array(source_t, lift.literals.len() as u32));

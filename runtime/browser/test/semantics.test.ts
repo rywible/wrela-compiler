@@ -293,6 +293,31 @@ test("a field can leave its form while keeping its element and text", () => onPa
   expect(() => o.submit(1)).toThrow("no form 1");
 }));
 
+test("fields in a form follow their tree's order without replacing their inputs", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  const first: Spec = { id: 1, role: Role.Field, field: { form: 1, replace: 1, text: "first" } };
+  const second: Spec = { id: 2, role: Role.Field, field: { form: 1, replace: 1, text: "second" } };
+  o.tree(tree([first, second]));
+  const inputs = [el(1), el(2)] as const;
+  o.tree(tree([second, first]));
+  expect(el(1)).toBe(inputs[0]);
+  expect(el(2)).toBe(inputs[1]);
+  expect(el(1).parentElement!.children.map((input) => input.id)).toEqual(["wrela-node-2", "wrela-node-1"]);
+  expect([el(1).value, el(2).value]).toEqual(["first", "second"]);
+}));
+
+test("a focused node can move before its sibling without moving its element", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  const first: Spec = { id: 1, role: Role.Button, label: "First" };
+  const second: Spec = { id: 2, role: Role.Button, label: "Second" };
+  o.tree(tree([first, second]));
+  const focused = el(2);
+  focused.focus();
+  o.tree(tree([second, first]));
+  expect(page.activeElement).toBe(focused);
+  expect(el(1).parentElement!.children.filter((node) => node.id).map((node) => node.id)).toEqual(["wrela-node-2", "wrela-node-1"]);
+}));
+
 test("tabs, sliders and a modal dialog have their keyboard patterns", () => onPage((page) => {
   const { o, events, el } = overlay(page);
   const opener = page.createElement("button");

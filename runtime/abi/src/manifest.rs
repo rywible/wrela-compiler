@@ -528,6 +528,12 @@ impl Manifest {
                         b.binding
                     ));
                 }
+                if render && b.kind.is_storage() {
+                    return err(format!(
+                        "pipeline {i}'s binding {} is a storage texture, which only a kernel can bind",
+                        b.binding
+                    ));
+                }
                 if b.stage == BindingStage::Vertex && b.kind == BindingKind::ReadWrite {
                     return err(format!(
                         "pipeline {i}'s binding {} is written, and a vertex shader can't write",
@@ -1040,6 +1046,25 @@ mod tests {
         m.pipelines[0].uniform =
             Some(UniformBlock { binding: 0, size: 20, space: UniformSpace::Uniform });
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn only_kernels_bind_storage_textures() {
+        for kind in [BindingKind::StorageTexture, BindingKind::StorageTexture3d] {
+            for stage in [BindingStage::Both, BindingStage::Vertex, BindingStage::Fragment] {
+                let mut m = sample();
+                m.pipelines[1].bindings[0].kind = kind;
+                m.pipelines[1].bindings[0].stage = stage;
+                assert_eq!(
+                    Manifest::parse(&m.to_json()).expect_err("render storage texture").0,
+                    "pipeline 1's binding 0 is a storage texture, which only a kernel can bind"
+                );
+            }
+            let mut m = sample();
+            m.pipelines[0].bindings[0].kind = kind;
+            m.pipelines[0].bindings[0].format = Some(TextureFormat::Rgba8);
+            Manifest::parse(&m.to_json()).expect("kernel storage texture");
+        }
     }
 
     #[test]

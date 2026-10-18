@@ -619,7 +619,8 @@ impl<'a> Parser<'a> {
     /// before `a`'s line.
     fn join_lines(&self, a: Span, b: Span) -> Vec<wrela_diag::Edit> {
         let between = &self.text[a.end as usize..b.start as usize];
-        let line_start = self.text[..a.start as usize].rfind('\n').map_or(0, |i| i + 1);
+        let first = if self.text.starts_with('\u{feff}') { 3 } else { 0 };
+        let line_start = self.text[..a.start as usize].rfind('\n').map_or(first, |i| i + 1);
         let line = &self.text[line_start..a.start as usize];
         let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
         // Only space and comments lie between two tokens, so each `//` starts a comment.

@@ -204,25 +204,28 @@ fn solve(
         let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
         let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
         let line = l["line"].as_u64().unwrap_or(0) as u32;
-        let Some((_, fr)) = wanted.iter().find(|(p, _)| *p == path) else { continue };
-        if fr.lines.iter().any(|&(a, b)| a <= line && line <= b) {
-            let text = l["text"].as_str().unwrap_or("").to_string();
-            lits.push(Lit {
-                index: l["index"].as_u64().unwrap_or(0) as u32,
-                file: fr.file.display().to_string(),
-                line,
-                decimals: decimals(&text),
-                unit: wrela_driver::edit::unit_of(&text),
-                edit: LiteralEdit {
-                    file: f["path"].as_str().unwrap_or("").into(),
-                    start: l["start"].as_u64().unwrap_or(0) as u32,
-                    end: l["end"].as_u64().unwrap_or(0) as u32,
-                    text,
-                    hash: f["hash"].as_str().unwrap_or("").into(),
-                    value: 0.0,
-                },
-            });
-        }
+        let Some((_, fr)) = wanted
+            .iter()
+            .find(|(p, f)| *p == path && f.lines.iter().any(|&(a, b)| a <= line && line <= b))
+        else {
+            continue;
+        };
+        let text = l["text"].as_str().unwrap_or("").to_string();
+        lits.push(Lit {
+            index: l["index"].as_u64().unwrap_or(0) as u32,
+            file: fr.file.display().to_string(),
+            line,
+            decimals: decimals(&text),
+            unit: wrela_driver::edit::unit_of(&text),
+            edit: LiteralEdit {
+                file: f["path"].as_str().unwrap_or("").into(),
+                start: l["start"].as_u64().unwrap_or(0) as u32,
+                end: l["end"].as_u64().unwrap_or(0) as u32,
+                text,
+                hash: f["hash"].as_str().unwrap_or("").into(),
+                value: 0.0,
+            },
+        });
     }
     if lits.is_empty() {
         return Err("no lifted literal is on the lines named".into());

@@ -699,7 +699,7 @@ pub(crate) fn parse_toml(text: &str) -> Result<Vec<Table>, String> {
         if chars[i] != '=' {
             return Err(at(format!("`{key}` needs `= value`")));
         }
-        let (value, next) = read_value(&chars, i + 1).map_err(at)?;
+        let (value, next) = read_value(&chars, i + 1, 0).map_err(at)?;
         if chars[next..].iter().any(|c| !c.is_whitespace()) {
             return Err(at("something follows the value (a list stays on one line)".into()));
         }
@@ -753,7 +753,7 @@ fn read_string(chars: &[char], start: usize) -> Result<(String, usize), String> 
     }
 }
 
-fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
+fn read_value(chars: &[char], start: usize, depth: u32) -> Result<(Value, usize), String> {
     let mut i = start;
     while matches!(chars[i], ' ' | '\t') {
         i += 1;
@@ -761,6 +761,12 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
     match chars[i] {
         '"' => read_string(chars, i).map(|(s, n)| (Value::Str(s), n)),
         '[' => {
+            if depth >= wrela_syntax::MAX_NESTING {
+                return Err(format!(
+                    "a list is nested more than {} levels deep",
+                    wrela_syntax::MAX_NESTING
+                ));
+            }
             let mut items = Vec::new();
             i += 1;
             while matches!(chars[i], ' ' | '\t') {
@@ -770,7 +776,7 @@ fn read_value(chars: &[char], start: usize) -> Result<(Value, usize), String> {
                 return Ok((Value::List(items), i + 1));
             }
             loop {
-                let (v, n) = read_value(chars, i)?;
+                let (v, n) = read_value(chars, i, depth + 1)?;
                 items.push(v);
                 i = n;
                 while matches!(chars[i], ' ' | '\t') {
@@ -1464,6 +1470,18 @@ fn comment(text: &str) -> String {
     out
 }
 
+/// A name as a Wrela string literal, keeping its contents on one source line.
+fn quoted_name(name: &str) -> String {
+    let escaped = name
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('\0', "\\0");
+    format!("\"{escaped}\"")
+}
+
 /// A number as a wrela `f32` literal, to 0.01 mm.
 fn num(x: f64) -> String {
     let s = format!("{:.5}", if x.abs() < 0.000005 { 0.0 } else { x });
@@ -1520,11 +1538,19 @@ pub fn write_package(
     let out_abs = out.canonicalize().map_err(|e| e.to_string())?;
     let engine = engine.canonicalize().map_err(|e| format!("{}: {e}", engine.display()))?;
     let name = ident(out_abs.file_name().and_then(|n| n.to_str()).unwrap_or("replica"));
+    let engine_path = wrela_driver::lift::relative(&engine, &out_abs)
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n");
     let toml = format!(
         "# A replica, written by `wrela reference replica` from {}.\n[package]\nname = \"{name}\"\n\n\
          [dependencies]\nengine = {{ path = \"{}\" }}\n",
-        file.path.file_name().and_then(|n| n.to_str()).unwrap_or("its parts file"),
-        wrela_driver::lift::relative(&engine, &out_abs)
+        file.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("its parts file")
+            .replace(['\n', '\r'], " "),
+        engine_path
     );
     let files = [
         ("wrela.toml", toml),
@@ -1658,13 +1684,18 @@ fn replica_source(file: &PartsFile, sampled: &[Sampled]) -> String {
         };
         match s.part.parent {
             None => {
-                let _ = writeln!(g, "    {bind}s.root(\"{}\", {})", s.part.name, vec(s.part.from));
+                let _ = writeln!(
+                    g,
+                    "    {bind}s.root({}, {})",
+                    quoted_name(&s.part.name),
+                    vec(s.part.from)
+                );
             }
             Some(p) => {
                 let _ = writeln!(
                     g,
-                    "    {bind}s.joint(\"{}\", {}, {})",
-                    s.part.name,
+                    "    {bind}s.joint({}, {}, {})",
+                    quoted_name(&s.part.name),
                     ident(&sampled[p].part.name),
                     vec(s.part.from)
                 );
@@ -1681,9 +1712,9 @@ fn replica_source(file: &PartsFile, sampled: &[Sampled]) -> String {
         };
         let _ = writeln!(
             g,
-            "        .join(\"{}\", s.find(\"{}\"), {}().with(clay()), seam: {seam})",
-            s.part.name,
-            s.part.name,
+            "        .join({}, s.find({}), {}().with(clay()), seam: {seam})",
+            quoted_name(&s.part.name),
+            quoted_name(&s.part.name),
             ident(&s.part.name)
         );
     }
@@ -1703,7 +1734,7 @@ fn replica_source(file: &PartsFile, sampled: &[Sampled]) -> String {
             g,
             "/// {}: {} stations of {} radii, from {} to {}.\npub fn {id}() -> Loft<{n}> {{\n    \
              loft(\n        vec3(),\n        {},\n        {},\n        stations: {},\n        angles: {},\n        radii: metres({}),\n    )\n}}\n\n",
-            s.part.name,
+            s.part.name.replace(['\n', '\r'], " "),
             t.stations,
             s.part.angles,
             vec(s.part.from),
@@ -1733,7 +1764,7 @@ fn sweep_source(id: &str, s: &Sampled, sw: &Swept, landmarks: &[(String, V3)]) -
     let _ = writeln!(
         g,
         "/// {}: a sweep through {} points, {} sections (within 2 mm of {:.0}% of the measured radii; {:.1} mm rms).",
-        s.part.name,
+        s.part.name.replace(['\n', '\r'], " "),
         sw.points.len(),
         f.sections.len(),
         100.0 * f.within_2mm,
@@ -1757,7 +1788,9 @@ fn sweep_source(id: &str, s: &Sampled, sw: &Swept, landmarks: &[(String, V3)]) -
             .filter(|(_, d)| *d < 0.04)
             .min_by(|a, b| a.1.total_cmp(&b.1));
         let _ = match near {
-            Some((n, _)) => writeln!(g, "            // {:.0} cm along: at \"{n}\"", along * 100.0),
+            Some((n, _)) => {
+                writeln!(g, "            // {:.0} cm along: at {}", along * 100.0, quoted_name(n))
+            }
             None => writeln!(g, "            // {:.0} cm along", along * 100.0),
         };
         let _ = write!(
@@ -2488,6 +2521,17 @@ mod tests {
     }
 
     #[test]
+    fn toml_lists_have_a_bounded_nesting_depth() {
+        let nested = |n: usize| format!("x = {}0{}\n", "[".repeat(n), "]".repeat(n));
+        let limit = wrela_syntax::MAX_NESTING as usize;
+        assert!(parse_toml(&nested(limit)).is_ok());
+        for depth in [limit + 1, 50_000] {
+            let error = parse_toml(&nested(depth)).expect_err("too much nesting");
+            assert!(error.contains("nested more than"), "{error}");
+        }
+    }
+
+    #[test]
     fn invalid_toml_bare_keys_return_errors() {
         for text in ["é=1", "=1", "two words=1"] {
             assert!(parse_toml(text).is_err(), "accepted {text:?}");
@@ -2516,6 +2560,43 @@ mod tests {
         let file = PartsFile::read(&dir.join("ball.parts.toml")).unwrap();
         let solid = file.solid().unwrap();
         (dir, file, solid)
+    }
+
+    #[test]
+    fn generated_packages_preserve_quoted_paths_and_part_names() {
+        let (dir, mut file, solid) = ball(
+            "quoting",
+            "reference = \"ball.toml\"\n[[part]]\nname = \"ball\"\nfrom = [0.0, 0.15, 0.0]\nto = [0.0, 0.25, 0.0]\nangles = 8\nspacing = 0.05\n",
+        );
+        let mut sampled = sample(&solid, &file.parts[0], (0.0, 0.0));
+        sampled.part.name = "left \"side\"\\part\nnext\rline\tend\0".into();
+        file.path.set_file_name("parts\nfile.toml");
+        let engine = dir.join("engine\"path\\name\nnext");
+        std::fs::create_dir(&engine).expect("engine directory");
+        let out = dir.join("replica");
+        write_package(&file, std::slice::from_ref(&sampled), &out, &engine)
+            .expect("write a valid package");
+        let manifest = std::fs::read_to_string(out.join("wrela.toml")).expect("manifest");
+        let parsed = wrela_driver::manifest::parse(wrela_diag::FileId(0), &manifest)
+            .expect("valid generated manifest");
+        assert_eq!(
+            out.join(&parsed.deps[0].path).canonicalize().unwrap(),
+            engine.canonicalize().unwrap()
+        );
+        let source = std::fs::read_to_string(out.join("replica.wrela")).expect("source");
+        let lexed = wrela_syntax::lex(wrela_diag::FileId(0), &source);
+        let names = lexed
+            .tokens
+            .iter()
+            .filter(|t| {
+                t.kind == wrela_syntax::TokenKind::Str
+                    && wrela_syntax::lexer::string_value(
+                        &source[t.span.start as usize..t.span.end as usize],
+                    ) == sampled.part.name
+            })
+            .count();
+        assert_eq!(names, 3, "the root, part and bone lookup keep the same name");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A replica of a sphere mesh (radius 0.1 m once placed), one part through it: it builds,

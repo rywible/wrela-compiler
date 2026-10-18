@@ -362,6 +362,9 @@ export function validateManifest(m: Manifest): void {
       if (!render && b.stage !== "both") {
         throw err(`pipeline ${i}'s binding ${b.binding} names a stage, but it's a kernel's`);
       }
+      if (render && isStorage(b.kind)) {
+        throw err(`pipeline ${i}'s binding ${b.binding} is a storage texture, which only a kernel can bind`);
+      }
       if (b.stage === "vertex" && b.kind === "read_write") {
         throw err(`pipeline ${i}'s binding ${b.binding} is written, and a vertex shader can't write`);
       }

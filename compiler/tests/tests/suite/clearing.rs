@@ -386,6 +386,74 @@ fn the_engines_own_tests_pass() {
     assert_eq!(super::tests_pass(&engine), declared);
 }
 
+/// The broad culling cone must contain the camera's corners, including a square viewport.
+/// This is CPU visibility state: the empty prototype needs no mesh realization or GPU work.
+#[test]
+fn rock_culling_keeps_each_view_edge_and_corner() {
+    let source = r#"
+use engine::realize::{Mesh, Room}
+use engine::stone::{Placement, Realized, Rocks, normal_matrix}
+use engine::view::first_camera
+use std::gpu::buffer
+use std::transform::{identity, translate}
+
+fn prototype() -> Realized {
+    Realized {
+        mesh: Mesh::new(Room { vertices: 1, quads: 1 }),
+        colours: buffer(1),
+        at: identity(),
+        seed: 1,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var near: Vec<Realized> = Vec::new()
+    near.push(prototype())
+    var far: Vec<Realized> = Vec::new()
+    far.push(prototype())
+    let origin = vec3(100.0, 20.0, -50.0)
+    let placements = [Placement {
+        prototype: 0,
+        at: translate(origin),
+        normal_at: normal_matrix(identity()),
+        reach: 0.25,
+        seed: 1,
+    }]
+    var rocks = Rocks::new(take near, take far, placements)
+    for width in [640, 360, 960] {
+        let cam = first_camera(vec3(0.0), vec3(0.0, 0.0, 1.0), 1.0, width, 640)
+        // The centre, four edges and four corners project inside the actual view.
+        for y in [-0.98, 0.0, 0.98] {
+            for x in [-0.98, 0.0, 0.98] {
+                let point = cam.eye + 20.0 * (cam.forward + cam.tan_half *
+                    (cam.right * (x * cam.aspect) + cam.up * y))
+                let clip = cam.view_proj * vec4(point, 1.0)
+                assert(abs(clip.x) < clip.w && abs(clip.y) < clip.w &&
+                    clip.z > 0.0 && clip.z < clip.w, "the sample is outside the view")
+                rocks.spheres[0] = vec4(point + origin, 0.25)
+                rocks.cull(cam, origin)
+                assert(rocks.seen_count[0] == 0, "a distant sphere used its near mesh")
+                assert(rocks.seen_count[1] == 1, "a visible edge or corner rock was culled")
+            }
+        }
+        rocks.spheres[0] = vec4(origin - cam.forward * 20.0, 0.25)
+        rocks.cull(cam, origin)
+        assert(rocks.seen_count[0] + rocks.seen_count[1] == 0,
+            "a rock behind the camera was retained")
+        rocks.spheres[0] = vec4(origin + cam.forward * 20.0 + cam.right * 100.0, 0.25)
+        rocks.cull(cam, origin)
+        assert(rocks.seen_count[0] + rocks.seen_count[1] == 0,
+            "a rock well outside the view was retained")
+    }
+}
+
+@test(frames: 1)
+fn each_visible_rock_is_kept() {}
+"#;
+    let package = super::engine_package("clearing/rock-culling", "rock_culling", source);
+    assert_eq!(super::tests_pass(&package), 1);
+}
+
 /// Replacing a wrapped field block invalidates the level over the evicted tile as well as
 /// the incoming tile, even when the new tile lies outside every visible level. A tile at
 /// a level's final row or column also invalidates its sampled endpoint.

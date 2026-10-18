@@ -1,6 +1,6 @@
 // The CPU side: a program's WASM, its imports, the batches it submits, and its requests.
-// Mirrors runtime/native/src/program.rs: the same ABI checks before instantiating, the same order
-// of work for each batch (hash, decode, sequence, check, execute), the same errors. A request is
+// Mirrors runtime/native/src/program.rs: the same ABI checks before instantiating, then hash,
+// decode, sequence and check each batch; execute only after the export succeeds. A request is
 // answered when its answer arrives (a readback, storage, a fetch: all asynchronous here), and
 // the program sees the answer from its next call on (language.md §17.1).
 
@@ -91,7 +91,7 @@ export class TrapError extends Error {
 /** Carries out commands that have already been decoded, sequenced and checked. */
 export interface Executor {
   execute(cmd: Command): void;
-  /** Called after each call of `frame` returns: submit the frame's work. */
+  /** Called after each successful export: submit its work. */
   flush(): void;
   /** A buffer's bytes, for a `ReadBuffer` request, once the GPU's work recorded so far is
    * done. An executor without a GPU doesn't have it. */
@@ -129,13 +129,29 @@ type Answer = { bytes: Bytes } | { error: string };
 class Requests {
   readonly #inFlight = new Set<number>();
   readonly #arriving: [number, Answer][] = [];
+  readonly #reserved = new Set<number>();
   readonly answered = new Map<number, Answer>();
 
-  /** Starts request `request`, whose answer `work` gives. */
-  start(op: OpcodeName, request: number, work: () => Promise<Bytes>): void {
+  #check(op: OpcodeName, request: number): void {
     if (this.#inFlight.has(request) || this.answered.has(request) || this.#arriving.some((a) => a[0] === request)) {
       throw new CommandError(op, `request ${request} is already in use`);
     }
+  }
+
+  /** Checks an export's request now, before any of its effects can reach the host. */
+  reserve(op: OpcodeName, request: number): void {
+    this.#check(op, request);
+    if (this.#reserved.has(request)) throw new CommandError(op, `request ${request} is already in use`);
+    this.#reserved.add(request);
+  }
+
+  endCall(): void {
+    this.#reserved.clear();
+  }
+
+  /** Starts request `request`, whose answer `work` gives. */
+  start(op: OpcodeName, request: number, work: () => Promise<Bytes>): void {
+    this.#check(op, request);
     this.#inFlight.add(request);
     let promise: Promise<Bytes>;
     try {
@@ -354,7 +370,7 @@ export interface ProgramOptions {
   inbox?: Inbox | undefined;
   /** Its connections (`platform::net`): without them, `net/` requests fail as any request this
    * host can't answer. */
-  net?: Pick<Net, "open" | "send" | "close" | "closeAll"> | undefined;
+  net?: Pick<Net, "open" | "send" | "close" | "closeAll" | "plan"> | undefined;
 }
 
 /** The pair id in a module's PAIR_SECTION, if it has one. */
@@ -375,6 +391,8 @@ export class Program {
   /** The state hash, when the options ask for it. */
   readonly hash: StateHash | null;
   #sequencer = new Sequencer();
+  /** Validated commands wait for the export to return successfully before execution. */
+  #pending: Command[] = [];
   #memory: WebAssembly.Memory | null = null;
   /** The memory's maximum, in bytes: what the program reserves. */
   #reserved = 0;
@@ -394,7 +412,7 @@ export class Program {
   /** The first trap raised by a host import in this call, so the caller gets it rather
    * than whatever the engine wraps it in. */
   #failure: unknown = null;
-  /** The first error the executor gave: what it holds isn't known after it, so every later
+  /** The first error while committing host work: what it holds isn't known after it, so every later
    * command fails. (A command the sequencer or the checker rejects leaves no trace.) */
   #failed: string | null = null;
   readonly #requests = new Requests();
@@ -404,6 +422,8 @@ export class Program {
   /** Input events not yet read (`wrela.input`), with messages' bytes. */
   readonly #inbox: Inbox;
   readonly #net: ProgramOptions["net"] | null;
+  /** This export's planned connection states, made only when it submits a network command. */
+  #netPlan: Pick<Net, "open" | "send" | "close"> | null = null;
   /** Its build's pair id, which its connections give its server. */
   #pair: bigint | null = null;
   /** What the replaced build kept (`wrela.kept`), and what this one keeps (`wrela.keep`). */
@@ -551,7 +571,9 @@ export class Program {
         // How many helpers there are: with none, std runs a task when asked if it's done.
         new DataView(memory.buffer).setUint32(PAR_HELPERS, helpers, true);
       }
-      if (options.tickHashes) new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
+      if (options.tickHashes && memory.buffer.byteLength >= TICK_WANT_HASH + 4) {
+        new DataView(memory.buffer).setUint32(TICK_WANT_HASH, 1, true);
+      }
       // A program with state makes it once, before anything else runs (language.md §15).
       const init = instance.exports[EXPORT_INIT];
       if (typeof init === "function") program.#call(() => (init as () => void)());
@@ -566,7 +588,8 @@ export class Program {
     return program;
   }
 
-  /** Decodes and runs one batch. The state hash covers every submitted byte, valid or not. */
+  /** Decodes and checks one owned batch, keeping its commands until the export succeeds. The
+   * state hash covers every submitted byte, valid or not. */
   #submit(batch: Bytes): void {
     this.hash?.update(batch);
     for (const cmd of decode(batch)) {
@@ -581,13 +604,12 @@ export class Program {
         this.#sequencer = before;
         throw e;
       }
-      try {
-        this.executor.execute(cmd);
-      } catch (e) {
-        this.#failed = errorMessage(e);
-        throw e;
+      if (cmd.op === "HostRequest" && this.#net && cmd.service.startsWith("net/")) {
+        this.#netCommand(cmd.service, cmd.body, false);
+      } else if ("request" in cmd) {
+        this.#requests.reserve(cmd.op, cmd.request);
       }
-      this.#request(cmd);
+      this.#pending.push(cmd);
     }
   }
 
@@ -606,7 +628,7 @@ export class Program {
         this.#requests.start(cmd.op, cmd.request, io ? () => io.storageRead(cmd.path) : none("storage"));
         return;
       case "StorageWrite": {
-        // The data is a view into the program's memory: copy it.
+        // Give the request its own bytes, independent of the staged batch.
         const data = cmd.data.slice();
         const write = io ? () => io.storageWrite(cmd.path, data).then(() => new Uint8Array(0)) : none("storage");
         this.#requests.start(cmd.op, cmd.request, write);
@@ -616,7 +638,7 @@ export class Program {
         this.#requests.start(cmd.op, cmd.request, io ? () => io.fetch(cmd.url) : none("build to fetch from"));
         return;
       case "Post": {
-        // The body is a view into the program's memory: copy it.
+        // Give the request its own bytes, independent of the staged batch.
         const body = cmd.body.slice();
         this.#requests.start(cmd.op, cmd.request, io ? () => io.post(cmd.url, body) : none("server to post to"));
         return;
@@ -651,28 +673,29 @@ export class Program {
     }
   }
 
-  /** A network command (`platform::net`): carried out at once and never answered, so it holds
-   * nothing for the program to take. */
-  #netCommand(service: string, body: Bytes): void {
-    const net = this.#net!;
+  /** A network command (`platform::net`): checks the export's planned connections, or carries
+   * it out at commit. It is never answered, so it holds nothing for the program to take. */
+  #netCommand(service: string, body: Bytes, execute = true): void {
+    const net = execute ? this.#net! : (this.#netPlan ??= this.#net!.plan());
     switch (service) {
       case "net/open": {
         let room: string;
         try {
           // A copy: the body is a view into the program's shared memory, which a decoder refuses.
-          room = new TextDecoder("utf-8", { fatal: true }).decode(body.slice(4));
+          room = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body.slice(4));
         } catch {
           throw new TrapError("`net/open`'s room isn't UTF-8");
         }
         try {
-          net.open(connOf(service, body), room, this.#pair);
+          const conn = connOf(service, body);
+          net.open(conn, room, this.#pair);
         } catch (e) {
           throw new TrapError(errorMessage(e));
         }
         return;
       }
       case "net/send":
-        net.send(connOf(service, body), body.slice(4));
+        net.send(connOf(service, body), body.subarray(4));
         return;
       case "net/close":
         net.close(connOf(service, body));
@@ -717,10 +740,9 @@ export class Program {
           `submit(${p}, ${n}) reaches past the end of the program's memory (${memory.length} bytes)`,
         );
       }
-      // Not copied (D-097): WebGPU reads the shared memory itself, and nothing runs in it until
-      // this call returns (the program's thread is here, and no parallel job runs across a call
-      // to the host). What outlives the batch is copied (`Bytes`).
-      this.#submit(new Uint8Array(this.#memory!.buffer, p, n) as Bytes);
+      // The export may overwrite its command buffer after this import returns, or trap after
+      // submitting several batches. Keep each batch's bytes until the export can commit it.
+      this.#submit(memory.slice(p, p + n));
     } catch (e) {
       this.#failure = e;
       throw e;
@@ -931,24 +953,45 @@ export class Program {
   #call<T>(f: () => T): T {
     this.#requests.settle();
     this.#failure = null;
+    const before = this.#sequencer.copy();
+    this.checker.beginCall();
     let result: T;
     try {
-      result = f();
+      try {
+        result = f();
+      } catch (e) {
+        if (this.#failure !== null) throw this.#failure;
+        throw new TrapError(trapMessage(e, this.#memory, THREAD_MAIN, this.#lines));
+      }
+      // A module can catch an import's exception; that rejected import still fails its call.
+      if (this.#failure !== null) throw this.#failure;
+      this.#sequencer.endFrame();
     } catch (e) {
+      this.#pending.length = 0;
+      this.#sequencer = before;
+      this.checker.endCall(false);
+      throw e;
+    } finally {
       this.#inbox.endCall();
-      const failure = this.#failure;
+      this.#requests.endCall();
+      this.#netPlan = null;
       this.#failure = null;
-      if (failure !== null) throw failure;
-      throw new TrapError(trapMessage(e, this.#memory, THREAD_MAIN, this.#lines));
     }
-    this.#inbox.endCall();
-    // A module can catch the exception a failed submit throws (WASM exception handling) and
-    // return as if nothing happened: the call fails anyway.
-    const failure = this.#failure;
-    this.#failure = null;
-    if (failure !== null) throw failure;
-    this.#sequencer.endFrame();
-    this.executor.flush();
+    this.checker.endCall(true);
+    const pending = this.#pending;
+    this.#pending = [];
+    try {
+      for (const cmd of pending) {
+        this.executor.execute(cmd);
+        this.#request(cmd);
+      }
+      this.executor.flush();
+    } catch (e) {
+      // An executor or host capability can fail during commit, after external effects have
+      // begun. Its partial state cannot be rolled back, so no later commands may use it.
+      this.#failed = errorMessage(e);
+      throw e;
+    }
     return result;
   }
 }

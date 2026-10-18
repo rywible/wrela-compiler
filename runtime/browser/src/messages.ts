@@ -53,6 +53,8 @@ export interface Loaded {
 }
 
 export type FromWorker =
+  /** The largest screen dimension, so input and semantic geometry use the frame's fitted size. */
+  | { type: "screen-limit"; max: number }
   /** `unsupported`: the machine can't run a program (`UnsupportedError`), rather than it failed. */
   | { type: "fatal"; message: string; unsupported: boolean }
   | { type: "host-request"; id: number; service: string; bytes: Uint8Array<ArrayBuffer> }

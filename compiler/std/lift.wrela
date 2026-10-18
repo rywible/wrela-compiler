@@ -25,6 +25,9 @@ pub struct Source: Copy + Eq {
     pub end: u32,
     pub line: u32,
     pub column: u32,
+    /// One unit of the written mantissa, including its exponent and suffix: `15cm` is 0.01,
+    /// `2.5e-3cm` is 0.00001, and a plain decimal without an exponent is 1.
+    pub unit: f64,
 }
 
 /// How many literals this build lifted.
@@ -562,16 +565,36 @@ fn identity(n: u32) -> Vec<f64> {
 }
 
 /// `v` rounded to `decimals` decimals of `unit`, halves away from 0 (`15cm`'s 0 decimals are
-/// whole centimetres).
-fn round_to(v: f32, decimals: u32, unit: f64) -> f32 {
-    var k: f64 = 1.0
+/// whole centimetres). An underflowed written unit keeps a finite `v`; an overflowed one
+/// rounds it to zero.
+pub fn round_to(v: f32, decimals: u32, unit: f64) -> f32 {
+    if v == 0.0 { return 0.0 }
+    var step = unit
     for _ in 0..decimals {
-        k *= 10.0
+        step /= 10.0
     }
-    let scaled = f64(v) / unit * k
+    if step == 0.0 { return v }
+    let scaled = f64(v) / step
+    if scaled == 0.0 { return 0.0 }
+    // A step this small cannot change the f32 value; avoid overflowing an intermediate.
+    if abs(scaled) >= 4503599627370496.0 { return v }
     let whole = if scaled < 0.0 { -floor(-scaled + 0.5) } else { floor(scaled + 0.5) }
-    let r = f32(whole / k * unit)
+    let r = f32(whole * step)
     if r == 0.0 { 0.0 } else { r }
+}
+
+@test
+fn rounding_zero_keeps_zero_with_an_extreme_written_exponent() {
+    // Both 0e-999 and 0e999 are finite zero literals, even though their units are not
+    // representable as finite positive f64s.
+    let infinity: u64 = 0x7ff0000000000000
+    for unit in [0.0, bitcast_f64(infinity)] {
+        assert(round_to(v: 0.0, decimals: 0, unit: unit) == 0.0)
+    }
+    assert(round_to(v: 0.156, decimals: 0, unit: 0.0) == 0.156)
+    assert(round_to(v: 0.156, decimals: 0, unit: bitcast_f64(infinity)) == 0.0)
+    assert(round_to(v: 1.0e30, decimals: 10, unit: 1.0e-300) == 1.0e30)
+    assert(abs(round_to(v: 0.156, decimals: 0, unit: 0.01) - 0.16) < 1.0e-7)
 }
 
 @test

@@ -13,11 +13,15 @@ mod wat_gen;
 #[derive(Default)]
 struct Recorder {
     log: Vec<&'static str>,
+    created: Vec<u32>,
 }
 
 impl Executor for Recorder {
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
         self.log.push(cmd.opcode().name());
+        if let Command::CreateBuffer { handle, .. } = cmd {
+            self.created.push(*handle);
+        }
         Ok(())
     }
 
@@ -52,6 +56,134 @@ fn run(frames: &[Vec<Vec<u8>>]) -> (Program<Recorder>, Result<()>) {
 
 fn run_err(frames: &[Vec<Vec<u8>>]) -> Error {
     run(frames).1.expect_err("the run fails")
+}
+
+#[test]
+fn a_trapped_call_discards_its_submitted_commands() {
+    let batch = Encoder::new().create_buffer(1, 64).finish();
+    let escaped: String = batch.iter().map(|b| format!("\\{b:02x}")).collect();
+    let mut program = load_wat(&format!(
+        r#"(module
+            (import "wrela" "submit" (func $submit (param i32 i32)))
+            (import "wrela" "memory" (memory 1 16384 shared))
+            (export "memory" (memory 0))
+            (data (i32.const 0) "{escaped}")
+            (func (export "frame") (param $time f32) (param i32 i32)
+                i32.const 0 i32.const {} call $submit
+                local.get $time f32.const 0 f32.eq
+                if unreachable end))"#,
+        batch.len()
+    ))
+    .expect("loads");
+    assert!(matches!(program.frame(0.0, 64, 64), Err(Error::Trap(_))));
+    assert!(program.executor().log.is_empty(), "a trapped call executed GPU commands");
+    program.frame(1.0, 64, 64).expect("the trapped call did not reserve its buffer handle");
+    assert_eq!(program.executor().log, ["CreateBuffer", "end"]);
+}
+
+#[test]
+fn requests_wait_for_success_and_keep_their_submitted_bytes() {
+    let batch = Encoder::new().host_request(7, "echo", &[4, 5, 6]).finish();
+    let wasm = wat::parse_str(format!(
+        r#"(module
+            (import "wrela" "submit" (func $submit (param i32 i32)))
+            (import "wrela" "request_status" (func $status (param i32) (result i32)))
+            (import "wrela" "memory" (memory 1 16384 shared))
+            (export "memory" (memory 0))
+            (data (i32.const 1024) "{}")
+            (func (export "frame") (param $time f32) (param i32 i32)
+                i32.const 0 i32.const 1024 i32.const {len} memory.copy
+                i32.const 0 i32.const {len} call $submit
+                i32.const 0 i32.const 0 i32.const {len} memory.fill
+                i32.const 512 i32.const 7 call $status i32.store
+                local.get $time f32.const 0 f32.eq
+                if unreachable end)
+            (func (export "status") (result i32) i32.const 7 call $status))"#,
+        wat_gen::escape(&batch),
+        len = batch.len(),
+    ))
+    .expect("test WAT compiles");
+    let called = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = called.clone();
+    let io = Io {
+        host: Some(HostHandler::new(move |service, body| {
+            assert_eq!((service, body), ("echo", &[4, 5, 6][..]));
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(body.to_vec())
+        })),
+        ..Io::default()
+    };
+    let mut program = Program::instantiate(
+        &compile_with(&wasm, None).expect("compiles"),
+        &manifest(),
+        Recorder::default(),
+        io,
+        false,
+        1,
+    )
+    .expect("loads");
+    assert!(program.frame(0.0, 64, 64).is_err());
+    assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 0);
+    program.frame(1.0, 64, 64).expect("the failed call released its request ID");
+    assert_eq!(called.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(shared::read(&program.memory, 512, 4).unwrap(), REQUEST_PENDING.to_le_bytes());
+    assert_eq!(call_i32(&mut program, "status"), 3);
+}
+
+#[test]
+fn staged_batches_keep_their_order_and_traps_preserve_existing_buffers() {
+    let initial = Encoder::new().create_buffer(1, 64).finish();
+    let first = Encoder::new().destroy_buffer(1).create_buffer(2, 64).finish();
+    let second = Encoder::new().create_buffer(3, 64).finish();
+    let check = Encoder::new().write_buffer(1, 0, &[1, 2, 3, 4]).finish();
+    let mut program = load_wat(&format!(
+        r#"(module
+            (import "wrela" "submit" (func $submit (param i32 i32)))
+            (import "wrela" "memory" (memory 1 16384 shared))
+            (export "memory" (memory 0))
+            (data (i32.const 1024) "{initial}")
+            (data (i32.const 2048) "{first}")
+            (data (i32.const 3072) "{second}")
+            (data (i32.const 4096) "{check}")
+            (func (export "init") i32.const 1024 i32.const {initial_len} call $submit)
+            (func (export "frame") (param $time f32) (param i32 i32)
+                i32.const 0 i32.const 2048 i32.const {first_len} memory.copy
+                i32.const 0 i32.const {first_len} call $submit
+                i32.const 0 i32.const 3072 i32.const {second_len} memory.copy
+                i32.const 0 i32.const {second_len} call $submit
+                i32.const 0 i32.const 0 i32.const {first_len} memory.fill
+                local.get $time f32.const 0 f32.eq
+                if unreachable end)
+            (func (export "check") i32.const 4096 i32.const {check_len} call $submit))"#,
+        initial = wat_gen::escape(&initial),
+        first = wat_gen::escape(&first),
+        second = wat_gen::escape(&second),
+        check = wat_gen::escape(&check),
+        initial_len = initial.len(),
+        first_len = first.len(),
+        second_len = second.len(),
+        check_len = check.len(),
+    ))
+    .expect("loads and runs init");
+    assert_eq!(program.executor().created, [1]);
+    assert!(program.frame(0.0, 64, 64).is_err());
+    assert_eq!(program.executor().log, ["CreateBuffer", "end"]);
+    program.call("check", &[]).expect("the old buffer survived the trapped destroy");
+    program.frame(1.0, 64, 64).expect("both original batches run after success");
+    assert_eq!(program.executor().created, [1, 2, 3]);
+    assert_eq!(
+        program.executor().log,
+        [
+            "CreateBuffer",
+            "end",
+            "WriteBuffer",
+            "end",
+            "DestroyBuffer",
+            "CreateBuffer",
+            "CreateBuffer",
+            "end"
+        ]
+    );
 }
 
 fn command_err(batch: Vec<u8>) -> (Opcode, String) {
@@ -845,6 +977,46 @@ fn nothing_runs_after_the_host_fails_a_command() {
         "{next}"
     );
     assert_eq!(program.executor().log, ["BeginScreenPass"]);
+}
+
+#[derive(Default)]
+struct FailsAtEnd(Recorder);
+
+impl Executor for FailsAtEnd {
+    fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        self.0.execute(cmd)
+    }
+
+    fn end_frame(&mut self) -> Result<()> {
+        Err(Error::Gpu("submission failed".into()))
+    }
+
+    fn read_back(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
+        self.0.read_back(handle, offset, size)
+    }
+}
+
+#[test]
+fn nothing_runs_after_the_host_fails_to_finish_a_call() {
+    let first = Encoder::new().create_buffer(1, 64).finish();
+    let second = Encoder::new().create_buffer(2, 64).finish();
+    let wasm = wat::parse_str(wat_gen::program(&[vec![first], vec![second]])).expect("WAT");
+    let mut program = Program::instantiate(
+        &compile_with(&wasm, None).expect("compiles"),
+        &manifest(),
+        FailsAtEnd::default(),
+        Io::default(),
+        false,
+        1,
+    )
+    .expect("loads");
+    assert!(matches!(program.frame(0.0, 64, 64), Err(Error::Gpu(_))));
+    let next = program.frame(1.0, 64, 64).expect_err("the host failed before");
+    assert!(
+        matches!(&next, Error::Command(CommandError { why, .. }) if why.contains("failed to carry out an earlier command")),
+        "{next}"
+    );
+    assert_eq!(program.executor().0.created, [1]);
 }
 
 #[test]

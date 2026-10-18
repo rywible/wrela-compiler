@@ -96,7 +96,7 @@ fn export(out: &Path, commit: Option<&str>, packages: &[PathBuf]) -> Result<usiz
         let manifest = std::fs::read_to_string(dir.join("wrela.toml"))
             .map_err(|e| format!("`{}` isn't a package: {e}", dir.display()))?;
         let name = package_name(&manifest)
-            .ok_or_else(|| format!("`{}`'s wrela.toml names no package", dir.display()))?;
+            .ok_or_else(|| format!("`{}`'s wrela.toml has no valid package name", dir.display()))?;
         if name == "std" || names.contains(&name) {
             return Err(format!("two packages are named `{name}`"));
         }
@@ -200,17 +200,7 @@ fn size_of(bytes: usize) -> String {
 
 /// The `name` of a manifest's `[package]`.
 fn package_name(manifest: &str) -> Option<String> {
-    let mut in_package = false;
-    for line in manifest.lines() {
-        let line = line.trim();
-        if line.starts_with('[') {
-            in_package = line == "[package]";
-        } else if in_package && let Some(rest) = line.strip_prefix("name") {
-            let value = rest.trim_start().strip_prefix('=')?.trim();
-            return Some(value.trim_matches('"').to_string());
-        }
-    }
-    None
+    wrela_driver::manifest::parse(wrela_diag::FileId(0), manifest).ok()?.name.map(|(name, _)| name)
 }
 
 /// An anchor for `heading`: lowercase letters, digits and `-`, as Markdown renderers make them.

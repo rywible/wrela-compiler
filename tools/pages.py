@@ -141,21 +141,51 @@ def href(link):
 def inline(markdown):
     """A line of Markdown as HTML: its code, links, bold and italics; everything else escaped."""
     codes = []
+    urls = []
 
     def keep(m):
         codes.append(f"<code>{html.escape(m.group(1), quote=False)}</code>")
         return f"\x00{len(codes) - 1}\x00"
 
+    def link(m):
+        # Style a link's label, but keep marks in its destination as URL characters.
+        urls.append(html.escape(href(html.unescape(m.group(2)))))
+        return f'<a href="\x01{len(urls) - 1}\x01">{m.group(1)}</a>'
+
     t = re.sub(r"`([^`]+)`", keep, markdown)
     t = html.escape(t, quote=False)
-    t = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)",
-               lambda m: f'<a href="{html.escape(href(html.unescape(m.group(2))))}">{m.group(1)}</a>', t)
+    t = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", link, t)
     t = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", t)
     t = re.sub(r"(?<![\w*])\*([^*\s][^*]*?)\*(?![\w*])", r"<em>\1</em>", t)
-    return re.sub("\x00(\\d+)\x00", lambda m: codes[int(m.group(1))], t)
+    t = re.sub("\x00(\\d+)\x00", lambda m: codes[int(m.group(1))], t)
+    return re.sub("\x01(\\d+)\x01", lambda m: urls[int(m.group(1))], t)
 
 
 ITEM = re.compile(r"^( *)([-*+]|\d{1,4}\.) (.*)$")
+
+
+def cells(row):
+    """A table row's cells, keeping code spans and escaped bars in their cell."""
+    parts, cell, code = [], [], False
+    text = row.strip()
+    i = 1 if text.startswith("|") else 0
+    while i < len(text):
+        c = text[i]
+        if c == "\\" and i + 1 < len(text) and text[i + 1] == "|":
+            cell.append("|")
+            i += 2
+            continue
+        if c == "`":
+            code = not code
+        if c == "|" and not code:
+            parts.append("".join(cell).strip())
+            cell = []
+        else:
+            cell.append(c)
+        i += 1
+    if cell:
+        parts.append("".join(cell).strip())
+    return parts
 
 
 def render(markdown):
@@ -187,9 +217,13 @@ def render(markdown):
         if t.startswith("```"):
             flush()
             close_lists()
+            fence = len(t) - len(t.lstrip("`"))
             code = []
             i += 1
-            while i < len(lines) and not lines[i].strip().startswith("```"):
+            while i < len(lines):
+                closing = lines[i].strip()
+                if len(closing) >= fence and not closing.strip("`"):
+                    break
                 code.append(lines[i])
                 i += 1
             out.append(f"<pre><code>{html.escape(chr(10).join(code), quote=False)}</code></pre>")
@@ -221,7 +255,6 @@ def render(markdown):
         if t.startswith("|") and i + 1 < len(lines) and re.match(r"^\|[\s|:-]+\|?$", lines[i + 1].strip()) and "-" in lines[i + 1]:
             flush()
             close_lists()
-            cells = lambda row: [c.strip() for c in row.strip().strip("|").split("|")]
             head = cells(t)
             rows = []
             i += 2

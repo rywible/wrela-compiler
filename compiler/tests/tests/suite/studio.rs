@@ -36,6 +36,43 @@ fn ordinary_views_size_their_buffers_after_silhouettes() {
     assert_eq!(super::tests_pass(&repo_root().join("studio/tests/views")), 1);
 }
 
+#[test]
+fn literal_rounding_uses_the_source_unit_and_exponent() {
+    let pkg = super::scratch("studio-literal-rounding-source");
+    std::fs::write(
+        pkg.join("wrela.toml"),
+        format!(
+            "[package]\nname = \"rounding\"\n[dependencies]\nstudio = {{ path = {:?} }}\n",
+            repo_root().join("studio").to_string_lossy()
+        ),
+    )
+    .expect("manifest");
+    std::fs::write(
+        pkg.join("main.wrela"),
+        "pub fn centimetres() -> f32 { 15cm }\n\
+         pub fn zero() -> f32 { 0cm }\n\
+         pub fn exponent() -> f32 { 1.0e-3 }\n\
+         pub fn combined() -> f32 { 2.5e-3cm }\n\
+         pub fn rounded(i: u32, v: f32) -> f32 { studio::drag::to_decimals(i, v) }\n\
+         pub fn frame(time: f32, width: u32, height: u32) {}\n",
+    )
+    .expect("source");
+    let dir = super::lift::build_into("studio-literal-rounding", &pkg, &["rounding"], false);
+    let report = super::lift::report(&dir);
+    let literals = report["literals"].as_array().expect("literals");
+    let mut host = CpuHost::load(&dir).expect("host");
+    for (text, value, expected) in [
+        ("15cm", 0.156, 0.16),
+        ("0cm", 0.156, 0.16),
+        ("1.0e-3", 0.00126, 0.0013),
+        ("2.5e-3cm", 0.0000264, 0.000026),
+    ] {
+        let index = literals.iter().position(|l| l["text"] == text).expect("lifted literal");
+        let rounded = one_f32(&mut host, "rounded", &[Value::I32(index as i32), Value::F32(value)]);
+        assert_eq!(rounded, expected, "rounding {value} in the style of {text}");
+    }
+}
+
 /// AC9's limits, in metres.
 const ERROR: f64 = 0.001;
 const LITERALS: usize = 8;

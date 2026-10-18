@@ -21,7 +21,7 @@ const KEPT = 2000;
 const SHED = 0.005;
 
 export class Resampler {
-  #held = false;
+  #buttons = 0;
   /** A held pointer's samples since the moment shown, oldest first: its press, then its moves. */
   #samples: Sample[] = [];
   #modifiers = 0;
@@ -47,29 +47,29 @@ export class Resampler {
       const x = view.getFloat32(off + 8, true);
       const y = view.getFloat32(off + 12, true);
       const t = times[i] ?? now;
-      if (kind === EventKind.PointerMove && this.#held) {
+      if (kind === EventKind.PointerMove && this.#buttons !== 0) {
         this.#modifiers = view.getUint32(off + 4, true);
         this.#samples.push({ x, y, t });
         this.#fresh.push(t);
         continue;
       }
       // A release comes after this frame's move, from where the pointer is shown.
-      if (kind === EventKind.PointerUp && this.#held) {
+      if (kind === EventKind.PointerUp && this.#buttons !== 0) {
         this.#step(now, out);
         stepped = true;
-        this.#held = false;
-        this.#samples = [];
+        this.#buttons &= ~(1 << view.getUint32(off + 16, true));
+        if (this.#buttons === 0) this.#samples = [];
       }
       out.push(events.subarray(off, off + EVENT_SIZE));
       if (kind === EventKind.PointerDown) {
-        this.#held = true;
+        this.#buttons |= 1 << view.getUint32(off + 16, true);
         this.#samples = [{ x, y, t }];
         this.#shown = [x, y];
         this.#fresh = [];
         this.#last = null;
       }
     }
-    if (this.#held && !stepped) this.#step(now, out);
+    if (this.#buttons !== 0 && !stepped) this.#step(now, out);
     const bytes = new Uint8Array(out.length * EVENT_SIZE);
     out.forEach((e, i) => bytes.set(e, i * EVENT_SIZE));
     return bytes;

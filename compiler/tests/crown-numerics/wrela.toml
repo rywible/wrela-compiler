@@ -1,0 +1,5 @@
+[package]
+name = "crown_numerics"
+
+[dependencies]
+engine = { path = "../../../engine" }

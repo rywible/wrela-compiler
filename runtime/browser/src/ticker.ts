@@ -46,7 +46,7 @@ const STOP = 2;
 const TARGET = 3;
 /** Frames started: a script's events of those frames are the ticker's from its next tick. */
 const FRAMES = 4;
-/** Ticks run; notified after each. */
+/** Ticks run; notified after each. Stopping or failing releases every frame target. */
 const DONE = 5;
 /** 1: a tick trapped (DONE is notified too). */
 const FAILED = 6;
@@ -113,6 +113,7 @@ export class TickerControl {
   /** Stops the ticks; in test mode the ticker's thread then reports them. */
   stop(): void {
     this.#set(STOP, 1);
+    this.#releaseFrames();
   }
 
   get stopped(): boolean {
@@ -132,6 +133,13 @@ export class TickerControl {
   /** On the ticker's thread: a tick trapped. */
   fail(): void {
     Atomics.store(this.#words, FAILED, 1);
+    this.#releaseFrames();
+  }
+
+  #releaseFrames(): void {
+    // Change the word a frame waits on too: a notification alone can arrive between its
+    // state check and waitAsync, leaving it asleep forever.
+    Atomics.store(this.#words, DONE, -1);
     Atomics.notify(this.#words, DONE);
   }
 
@@ -147,12 +155,12 @@ export class TickerControl {
   }
 
   /** On the render worker, without blocking it: resolves when `n` ticks have run, or a tick
-   * trapped. */
+   * trapped, or the ticker stopped. */
   async ranTo(n: number): Promise<void> {
     n >>>= 0;
     for (;;) {
       const done = Atomics.load(this.#words, DONE) >>> 0;
-      if (done >= n || this.failed) return;
+      if (done >= n || this.failed || this.stopped) return;
       const { async, value } = Atomics.waitAsync(this.#words, DONE, done | 0);
       if (async) await value;
     }

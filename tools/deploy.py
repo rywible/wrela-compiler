@@ -177,12 +177,12 @@ def deploy(output, require_main_head=False, dry_run=False, get=fetch, now=None,
                 print(f"{w['worker']} never served {d['release']}: nothing to keep", flush=True)
                 continue
             restore(d["release"], w["domain"], output / w["worker"], get)
-    for w in workers:
-        files = console.release_files(output / w["worker"])
-        print(f"{w['worker']} ({w['domain']}): {len(files)} files", flush=True)
     names = [w["worker"] for w in workers]
     after = next_history(deploys, release, report["source"], names, now)
     (output / home["worker"] / "deploys.json").write_text(json.dumps({"deploys": after}, indent=2) + "\n")
+    for w in workers:
+        files = console.release_files(output / w["worker"])
+        print(f"{w['worker']} ({w['domain']}): {len(files)} files", flush=True)
     if require_main_head and main_head() != report["source"]:
         raise ValueError(f"{report['source']} is no longer the head of main; a newer push deploys")
     if dry_run:

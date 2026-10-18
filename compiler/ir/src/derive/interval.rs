@@ -773,6 +773,9 @@ impl<'a> Ivx<'a> {
                 ));
             }
         };
+        if n == 0 {
+            return Err(Error::not_derivable("an interval cannot read an empty array"));
+        }
         if self.m.place_ty(self.f, p) != Some(ty) {
             return Err(Error::not_derivable(
                 "an interval through an index that depends on the input, into an array of \
@@ -786,7 +789,7 @@ impl<'a> Ivx<'a> {
         let held = |me: &mut Self, out: &mut Block, x: ValueId| -> R<ValueId> {
             let last = match me.m.types.as_scalar(it) {
                 Some(Scalar::U32) => Const::U32(n - 1),
-                Some(Scalar::I32) => Const::I32(n as i32 - 1),
+                Some(Scalar::I32) => Const::I32((n - 1).min(i32::MAX as u32) as i32),
                 _ => {
                     return Err(Error::not_derivable(
                         "an interval through an index that isn't u32 or i32",
@@ -1608,7 +1611,7 @@ impl<'a> Ivx<'a> {
                         ),
                     });
                 }
-                acc.ok_or_else(|| Error::internal("an empty array"))?
+                acc.ok_or_else(|| Error::not_derivable("an interval cannot read an empty array"))?
             }
             Expr::Construct(..)
             | Expr::Variant(..)
@@ -2756,6 +2759,54 @@ fn range_ty(types: &mut Types, ty: TypeId) -> TypeId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_array_index_cannot_be_bounded() {
+        for from_value in [false, true] {
+            let (mut m, id) = indexed_array(0, Scalar::U32, from_value);
+            let err = derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
+                .expect_err("an empty array has no elements to bound");
+            assert!(matches!(err, Error::NotDerivable(..)), "{err}");
+            assert!(err.message().contains("empty array"), "{err}");
+        }
+    }
+
+    #[test]
+    fn signed_indices_into_large_arrays_have_valid_intervals() {
+        let (mut m, id) = indexed_array(1 << 31, Scalar::I32, false);
+        derive(&mut m, &mut DeriveCache::default(), id, vec![1], Target::Cpu, false)
+            .expect("a signed index can reach the first half of a large array");
+        verify(&m).expect("the derived array read has valid bounds and types");
+    }
+
+    fn indexed_array(n: u32, index_scalar: Scalar, from_value: bool) -> (Module, FuncId) {
+        let mut m = Module::default();
+        let float = m.types.f32();
+        let index_ty = m.types.scalar(index_scalar);
+        let array = m.types.intern(TypeDef::Array(float, n));
+        let mut f = Function::new(
+            "array_index",
+            vec![Param { name: "x".into(), ty: float, by_ref: false, mutable: false }],
+            Some(float),
+        );
+        let mut body = Vec::new();
+        let x = f.let_(&mut body, float, Expr::Param(0));
+        let index = f.let_(&mut body, index_ty, Expr::Convert(x, index_scalar));
+        let values = f.let_(&mut body, array, Expr::Zero(array));
+        let access = if from_value {
+            Expr::ExtractDyn(values, index)
+        } else {
+            let local = f.new_local("values", array);
+            body.push(Stmt::Store(Place::local(local), values));
+            Expr::Load(Place::local(local).with(Proj::Index(index)))
+        };
+        let result = f.let_(&mut body, float, access);
+        body.push(Stmt::Return(Some(result)));
+        f.body = body;
+        let id = m.add_function(f);
+        verify(&m).expect("the array can be indexed dynamically");
+        (m, id)
+    }
 
     fn check_vector_interval(
         scalar: Scalar,

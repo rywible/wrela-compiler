@@ -10,6 +10,20 @@ import pages
 
 
 class Render(unittest.TestCase):
+    def test_link_destinations_do_not_receive_text_styles(self):
+        out = pages.render("[**file**](https://example.test/a**b**c?q=*value*)")
+        self.assertEqual(out, '<p><a href="https://example.test/a**b**c?q=*value*"><strong>file</strong></a></p>')
+
+    def test_fenced_code_keeps_shorter_fences_and_backticks_with_text(self):
+        out = pages.render("````wrela\n\nlet a = 1\n```\n````still code\n\n````\n")
+        self.assertEqual(out, "<pre><code>\nlet a = 1\n```\n````still code\n</code></pre>")
+
+    def test_escaped_pipes_stay_in_their_table_cells(self):
+        for first in ("`x\\|y`", "`x|y`"):
+            out = pages.render(f"| A | B |\n|---|---|\n| {first} | *z* |\n")
+            self.assertIn("<td><code>x|y</code></td><td><em>z</em></td>", out)
+        self.assertEqual(pages.cells("| a || c |"), ["a", "", "c"])
+
     def test_link_queries_are_escaped_once(self):
         out = pages.render("[search](https://example.test/?q=fields&sort=name)")
         self.assertIn('href="https://example.test/?q=fields&amp;sort=name"', out)

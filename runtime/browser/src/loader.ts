@@ -70,7 +70,7 @@ export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch
 }
 
 /**
- * Where a program in this browser keeps its requests' bytes: `Fetch` reads a file of the build
+ * Where a program in this browser keeps its requests' bytes: `Fetch` and `Post` use the build
  * at `files` (the page's build, `base`, unless a hot reload swapped another in), and storage is
  * the origin's private file system, under `wrela/` and the page's path (so two games on one
  * origin don't share it). Paths are checked before they get here (`pathProblem`).
@@ -118,7 +118,7 @@ export function browserIo(
     },
     async post(url, body) {
       // Only to the build's own origin: the path is relative (`pathProblem`).
-      const response = await fetchFn(pathUrl(base, url), { method: "POST", body });
+      const response = await fetchFn(pathUrl(files, url), { method: "POST", body });
       if (!response.ok) throw new Error(`POST ${url} failed: ${response.status} ${response.statusText}`);
       return new Uint8Array(await response.arrayBuffer());
     },

@@ -391,8 +391,14 @@ def package(config, output):
             marker.unlink()
         for file in sorted(directory.rglob("*")):
             if file.is_file():
-                digest.update(str(file.relative_to(output)).encode())
-                digest.update(file.read_bytes())
+                path = file.relative_to(output).as_posix().encode()
+                body = file.read_bytes()
+                # Frame both fields: a file `a` containing `bc` must not hash like `ab`
+                # containing `c`, nor may file contents absorb the next file's path.
+                digest.update(len(path).to_bytes(8, "big"))
+                digest.update(path)
+                digest.update(len(body).to_bytes(8, "big"))
+                digest.update(body)
     release = digest.hexdigest()[:20]
     for index, line in enumerate(catalog):
         parts = line.split("\t")

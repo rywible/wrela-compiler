@@ -13,6 +13,12 @@ const ENCODER = new TextEncoder();
 /** The longest address or link a program may give (`nav/*`). */
 const ADDRESS_LIMIT = 2048;
 
+/** A path that still resolves on this origin when History or Location reads it again. */
+function addressPath(url: Pick<URL, "pathname" | "search" | "hash">): string {
+  const path = (url.pathname.startsWith("//") ? "/." : "") + url.pathname;
+  return path + url.search + url.hash;
+}
+
 /** `text` as an address on the page's own origin (`#std/io`, `/v0.1/?q=x`), resolved against
  * the page's address `here`: its path, query and fragment. Another origin, another scheme, or
  * text with control characters fails. */
@@ -20,8 +26,8 @@ export function sameOriginAddress(text: string, here: string): string {
   if (text.length === 0 || text.length > ADDRESS_LIMIT || /[\u0000-\u001f\u007f\\]/.test(text)) throw new Error("invalid address");
   const base = new URL(here);
   const url = new URL(text, base);
-  if (url.origin !== base.origin) throw new Error("an address stays on the page's own origin");
-  return url.pathname + url.search + url.hash;
+  if (url.origin !== base.origin || url.protocol !== base.protocol) throw new Error("an address stays on the page's own origin");
+  return addressPath(url);
 }
 
 /** `text` as a link to follow: an absolute http or https URL without credentials. */
@@ -185,7 +191,7 @@ export class PortRpc {
 }
 
 // A shown program's name in the page's address, `#name`: a lowercase key.
-const SHOWN_NAME = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const SHOWN_NAME = /^[a-z0-9-]{1,64}$/;
 export function shownName(body: Bytes): string | null {
   if (body.length <= 4) return null;
   const name = DECODER.decode(body.subarray(4));
@@ -404,11 +410,11 @@ export class BrowserPlatform {
     if (service === "surface/failed") { this.#parent?.signal("failed"); return new Uint8Array(); }
     if (service === "surface/ready") { this.#parent?.signal("ready"); return new Uint8Array(); }
     if (service === "surface/return") { this.#parent?.signal("return"); return new Uint8Array(); }
-    if (service === "nav/location") return ENCODER.encode(location.pathname + location.search + location.hash);
+    if (service === "nav/location") return ENCODER.encode(addressPath(location));
     if (service === "nav/push" || service === "nav/replace" || service === "nav/changed") {
       if (window.parent !== window) throw new Error("an embedded program has no address of its own");
       if (service === "nav/changed") {
-        const here = () => ENCODER.encode(location.pathname + location.search + location.hash);
+        const here = () => ENCODER.encode(addressPath(location));
         if (this.#navigated) { this.#navigated = false; return here(); }
         return new Promise<Bytes>(resolve => { this.#navigating.add(() => resolve(here())); });
       }
@@ -449,7 +455,7 @@ export class BrowserPlatform {
         if (this.#shown !== null) throw new Error("a program surface is already shown");
         const name = shownName(body);
         this.#shown = wordAt(body); s.frame.style.zIndex = "2"; s.frame.style.pointerEvents = "auto"; this.canvas.style.visibility = "hidden"; this.visible(false); s.frame.contentWindow?.focus();
-        if (name && window.parent === window && typeof history !== "undefined") history.pushState({ wrela: this.#shown }, "", `${location.pathname}${location.search}#${name}`);
+        if (name && window.parent === window && typeof history !== "undefined") history.pushState({ wrela: this.#shown }, "", addressPath({ pathname: location.pathname, search: location.search, hash: `#${name}` }));
         return new Uint8Array();
       }
       if (service === "surface/close") { s.close(); return new Uint8Array(); }

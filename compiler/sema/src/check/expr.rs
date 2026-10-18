@@ -972,7 +972,7 @@ impl<'p> Checker<'p> {
             BinOp::Pow | BinOp::Shl | BinOp::Shr => {
                 let x = self.check_expr(a, expected);
                 let hint = self.right_hint(op, x.ty);
-                let y = self.check_expr(b, Some(hint));
+                let y = self.check_expr(b, hint);
                 (x, y)
             }
             _ => {
@@ -1130,12 +1130,14 @@ impl<'p> Checker<'p> {
     }
 
     /// The type the right operand of `op` is checked against, when the left is an `a`: a shift
-    /// amount is a `u32`, so is an integer's exponent; anything else is `a`'s type.
-    pub(crate) fn right_hint(&self, op: BinOp, a: TyId) -> TyId {
+    /// amount is a `u32`, so is an integer's exponent; anything else is `a`'s type. An
+    /// integer literal's power stays open until its base settles: later uses may need a float.
+    pub(crate) fn right_hint(&self, op: BinOp, a: TyId) -> Option<TyId> {
         match op {
-            BinOp::Shl | BinOp::Shr => self.p.types.u32,
-            BinOp::Pow if self.is_intlike(a) => self.p.types.u32,
-            _ => a,
+            BinOp::Shl | BinOp::Shr => Some(self.p.types.u32),
+            BinOp::Pow if self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) => None,
+            BinOp::Pow if self.is_intlike(a) => Some(self.p.types.u32),
+            _ => Some(a),
         }
     }
 
@@ -1247,6 +1249,15 @@ impl<'p> Checker<'p> {
                     return fail(self);
                 }
                 self.int_only(a, op.text(), span);
+                Some(a)
+            }
+            BinOp::Pow if self.infer.var_kind(&self.p.types, a) == Some(VarKind::Int) => {
+                if matches!(self.kind(b), TyKind::Float(_))
+                    || self.infer.var_kind(&self.p.types, b) == Some(VarKind::Float)
+                {
+                    let _ = self.infer.unify(&self.p.types, a, b);
+                }
+                self.pows.push((a, b, span));
                 Some(a)
             }
             BinOp::Pow if self.is_intlike(a) => {
@@ -2881,6 +2892,71 @@ fn decimal(text: &str) -> Option<(u128, i32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn integer_power_literals_infer_float_types_from_later_uses() {
+        for expression in
+            ["2 ** 3", "base ** 3", "2 ** exponent", "base ** exponent", "2 ** 0.5", "2 ** -1"]
+        {
+            let source = format!(
+                "pub fn power() -> f32 {{\n\
+                     let base = 2\n\
+                     let exponent = 3\n\
+                     let value = {expression}\n\
+                     let floating: f32 = value\n\
+                     floating\n\
+                 }}\n"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(!wrela_diag::has_errors(&diagnostics), "{source}: {diagnostics:#?}");
+        }
+    }
+
+    #[test]
+    fn shared_power_literals_settle_before_integer_defaults() {
+        for source in [
+            "pub fn power() -> f32 {\n\
+                 let a = 2\n\
+                 let b = 3\n\
+                 let c = 4\n\
+                 let first = a ** b\n\
+                 let second = b ** c\n\
+                 let last = c ** 0.5\n\
+                 first + second + last\n\
+             }\n",
+            "pub fn power() -> u32 {\n\
+                 let a = 2\n\
+                 let b = 3\n\
+                 let first = a ** b\n\
+                 let second = b ** a\n\
+                 first + second\n\
+             }\n",
+            "pub fn power() -> i32 {\n\
+                 let value = 2 ** 3\n\
+                 value\n\
+             }\n",
+            "pub fn power() -> f32 {\n\
+                 var value = 2\n\
+                 value **= 3\n\
+                 let floating: f32 = value\n\
+                 floating\n\
+             }\n",
+        ] {
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(source), &mut diagnostics);
+            assert!(!wrela_diag::has_errors(&diagnostics), "{source}: {diagnostics:#?}");
+        }
+        for exponent in ["true", "i32(3)", "-1"] {
+            let source = format!("pub fn power() -> i32 {{ 2 ** {exponent} }}");
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| d.code.as_str() == "E0305"),
+                "{source}: {diagnostics:#?}"
+            );
+        }
+    }
+
     #[test]
     fn array_repeats_respect_local_shadowing_of_constant_lengths() {
         for count in ["LENGTH", "(LENGTH)", "LENGTH + 1"] {

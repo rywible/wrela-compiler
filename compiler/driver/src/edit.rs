@@ -82,14 +82,18 @@ fn unit_value(suffix: &str) -> Option<f64> {
     })
 }
 
+/// A decimal exponent's start; `e` and `E` inside a hexadecimal integer are digits.
+fn exponent(digits: &str) -> Option<usize> {
+    if digits.starts_with("0x") { None } else { digits.find(['e', 'E']) }
+}
+
 /// What one unit of a literal's digits is worth (`15cm`: 0.01, `2.5e-3`: 0.001, a plain number:
 /// 1): the unit its decimals count in.
 pub fn unit_of(text: &str) -> f64 {
     let t = text.trim_start_matches('-').trim_start();
     let (digits, suffix) = wrela_syntax::lexer::split_suffix(t);
     let unit = if suffix.is_empty() { 1.0 } else { unit_value(suffix).unwrap_or(1.0) };
-    let exp =
-        digits.find(['e', 'E']).and_then(|i| digits[i + 1..].replace('_', "").parse::<i32>().ok());
+    let exp = exponent(digits).and_then(|i| digits[i + 1..].replace('_', "").parse::<i32>().ok());
     unit * 10f64.powi(exp.unwrap_or(0))
 }
 
@@ -99,13 +103,17 @@ pub fn literal_value(text: &str) -> Option<f32> {
     if digits.is_empty() {
         return None;
     }
-    let is_int = !digits.contains(['.', 'e', 'E']);
+    let is_int = !digits.contains('.') && exponent(digits).is_none();
     if suffix.is_empty() {
-        return Some(if is_int {
-            wrela_syntax::lexer::int_value(digits).ok()? as f32
-        } else {
-            wrela_syntax::lexer::float_value_f32(digits)
-        });
+        if is_int {
+            let integer = wrela_syntax::lexer::int_value(digits).ok()?;
+            let value = integer as f32;
+            // As in the checker, an integer must be exact in its inferred float type. The
+            // upper bound also excludes 2^64, whose conversion back to u64 would saturate.
+            return (f64::from(value) < 18446744073709551616.0 && value as u64 == integer)
+                .then_some(value);
+        }
+        return Some(wrela_syntax::lexer::float_value_f32(digits));
     }
     let unit = unit_value(suffix)?;
     let n = match wrela_syntax::lexer::int_value(digits) {
@@ -125,7 +133,7 @@ pub fn format_like(old: &str, v: f32) -> Option<String> {
     let (digits, suffix) = wrela_syntax::lexer::split_suffix(old);
     let unit = if suffix.is_empty() { 1.0 } else { unit_value(suffix)? };
     let target = f64::from(v) / unit;
-    let exp = digits.find(['e', 'E']);
+    let exp = exponent(digits);
     let (mant, exp_text) = match exp {
         Some(i) => (&digits[..i], Some(&digits[i..])),
         None => (digits, None),
@@ -473,6 +481,17 @@ pub fn parse_edits(text: &str) -> Result<Vec<LiteralEdit>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hexadecimal_digits_are_not_decimal_exponents() {
+        assert_eq!(literal_value("0xdead"), Some(57005.0));
+        assert_eq!(literal_value("0xDEAD"), Some(57005.0));
+        assert_eq!(literal_value("0x1e3m"), Some(483.0));
+        assert_eq!(unit_of("0x1e3"), 1.0);
+        assert_eq!(unit_of("0x1e3km"), 1000.0);
+        assert_eq!(format_like("0xdead", 42.0), Some("42".into()));
+        assert_eq!(format_like("0xdead", 0.25), Some("0.25".into()));
+    }
 
     #[test]
     fn a_literal_at_the_start_has_no_preceding_minus() {

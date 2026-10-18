@@ -221,19 +221,21 @@ pub enum Assist: Copy + Eq + StateHash + Serialize + Fieldless {
 }
 
 /// The text an input method is composing, put together from `Compose` events: a change counts
-/// only when all of it has arrived, its characters in order from index 0 (a reader that fell
-/// behind may have skipped some, and then the change is ignored). Committed text (`Text`) ends
-/// the composing.
+/// only when all of it has arrived, its characters in order from index 0 with one length (a
+/// reader that fell behind may have skipped some, and then the change is ignored). Committed
+/// text (`Text`) ends the composing.
 pub struct Composer: Clone + Eq {
     /// The text being composed now: Unicode scalar values, empty when there's none.
     pub text: Vec<u32>,
     building: Vec<u32>,
+    /// The length announced by the first character of the change being built.
+    length: u32,
 }
 
 impl Composer {
     /// Nothing composed yet.
     pub fn new() -> Composer {
-        Composer { text: Vec::new(), building: Vec::new() }
+        Composer { text: Vec::new(), building: Vec::new(), length: 0 }
     }
 
     /// Takes event `e` into account; true if the text being composed changed.
@@ -242,14 +244,17 @@ impl Composer {
             Event::Compose { char, index, length } => {
                 if length == 0 {
                     self.building.clear()
+                    self.length = 0
                     return self.finish()
                 }
                 if index == 0 {
                     self.building.clear()
+                    self.length = length
                 }
-                if index != self.building.len() || index >= length {
+                if length != self.length || index != self.building.len() || index >= length {
                     // A gap: a change only partly read.
                     self.building.clear()
+                    self.length = 0
                     return false
                 }
                 self.building.push(char)
@@ -257,12 +262,14 @@ impl Composer {
                     let changed = self.text != self.building
                     self.text = self.building.clone()
                     self.building.clear()
+                    self.length = 0
                     return changed
                 }
                 false
             },
             Event::Text { .. } => {
                 self.building.clear()
+                self.length = 0
                 self.finish()
             },
             _ => false,
@@ -695,4 +702,21 @@ fn a_composer_takes_whole_changes_only() {
     }
     assert(c.text.len() == 3)
     assert(c.apply(Event::Text { char: 20206 }) && c.text.is_empty(), "a commit ends it")
+}
+
+/// A partial change cannot supply the prefix of another change with a different length.
+@test
+fn a_composer_rejects_a_changed_length_mid_change() {
+    var c = Composer::new()
+    for e in composing([120]) {
+        let _ = c.apply(e)
+    }
+    assert(!c.apply(Event::Compose { char: 97, index: 0, length: 3 }))
+    // The old change's suffix and the new change's first event were skipped.
+    assert(!c.apply(Event::Compose { char: 98, index: 1, length: 2 }))
+    assert(c.text == Vec::from([120]), "partial changes were combined into text")
+    for e in composing([99, 100]) {
+        let _ = c.apply(e)
+    }
+    assert(c.text == Vec::from([99, 100]), "a fresh whole change must still be accepted")
 }

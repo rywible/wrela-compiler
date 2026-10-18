@@ -330,11 +330,10 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
             if !(flags.deterministic || flags.parallel || flags.audio) {
                 continue;
             }
-            let held_by = match &op.kind {
-                mir::OperandKind::Copy(pl) | mir::OperandKind::Move(pl, _) => held.get(&pl.local),
-                mir::OperandKind::Const(_) => None,
+            let Some(target) = op.place().and_then(|place| callable_body(p, f, body, place, held))
+            else {
+                continue;
             };
-            let Some(&target) = held_by else { continue };
             out.push(TypedArg {
                 body: target,
                 span: op.span,
@@ -1166,6 +1165,27 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use wrela_diag::FileId;
+
+    #[test]
+    fn attributed_function_fields_check_projected_callables() {
+        for callable in ["now", "|| now()"] {
+            let source = format!(
+                "use std::time::now\n\
+                 struct Held<F> {{ value: F }}\n\
+                 struct Checked {{ value: @deterministic fn() -> f64 }}\n\
+                 pub fn inspect() {{\n\
+                     let held = Held {{ value: {callable} }}\n\
+                     let _ = Checked {{ value: held.value }}\n\
+                 }}\n"
+            );
+            let mut diagnostics = Vec::new();
+            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            assert!(
+                diagnostics.iter().any(|d| d.code == codes::E0600),
+                "{callable}: {diagnostics:#?}"
+            );
+        }
+    }
 
     #[test]
     fn unused_closures_do_not_execute_their_body_effects() {

@@ -192,7 +192,15 @@ fn read_input(root: &Path, path: &str, ticks: bool) -> Result<Input, String> {
     if wrela_abi::check::path_problem(path).is_some() {
         return Err("must be a path inside the package, with `/` between its parts".into());
     }
-    let bytes = std::fs::read(root.join(path)).map_err(|e| format!("can't be read: {e}"))?;
+    let root = root.canonicalize().map_err(|e| format!("can't resolve its package: {e}"))?;
+    let full = root.join(path).canonicalize().map_err(|e| format!("can't be read: {e}"))?;
+    if !full.starts_with(&root) {
+        return Err("is outside the package".into());
+    }
+    if !full.is_file() {
+        return Err("isn't a regular file".into());
+    }
+    let bytes = std::fs::read(full).map_err(|e| format!("can't be read: {e}"))?;
     if ticks && bytes.starts_with(&wrela_abi::ticks::MAGIC) {
         let log =
             wrela_host::TickLog::decode(&bytes).map_err(|e| format!("isn't a tick log: {e}"))?;
@@ -463,6 +471,28 @@ impl Drop for Scratch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_input_stays_inside_its_package() {
+        use std::os::unix::fs::symlink;
+
+        let scratch = Scratch::new();
+        let pkg = scratch.0.join("package");
+        let outside = scratch.0.join("outside");
+        std::fs::create_dir_all(&pkg).expect("package");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(pkg.join("input.json"), "[]").expect("input");
+        std::fs::write(outside.join("input.json"), "[]").expect("outside input");
+        symlink(&outside, pkg.join("linked")).expect("directory symlink");
+        symlink(outside.join("input.json"), pkg.join("outside.json")).expect("file symlink");
+        symlink(&pkg, scratch.0.join("package-link")).expect("package symlink");
+
+        assert!(read_input(&pkg, "linked/input.json", false).is_err());
+        assert!(read_input(&pkg, "outside.json", false).is_err());
+        assert!(read_input(&pkg, "input.json", false).is_ok());
+        assert!(read_input(&scratch.0.join("package-link"), "input.json", false).is_ok());
+    }
 
     #[cfg(unix)]
     #[test]

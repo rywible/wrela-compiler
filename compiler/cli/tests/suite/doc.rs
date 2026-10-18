@@ -237,6 +237,33 @@ fn the_export_is_the_same_each_time_and_writes_only_into_a_new_directory() {
     assert!(!bad.status.success() && !root.join("c").exists());
 }
 
+#[test]
+fn the_export_reads_commented_package_names() {
+    let root = shapes("doc-export-commented-name");
+    std::fs::write(
+        root.join("fixture/wrela.toml"),
+        "[package] # documentation fixture\nname = \"fixture\" # the package name\n",
+    )
+    .expect("write manifest");
+    let out = export(&root, "out", &[]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(root.join("out/fixture/shapes.md").is_file());
+}
+
+#[test]
+fn the_export_rejects_package_names_that_escape_its_directory() {
+    let root = shapes("doc-export-escaping-name");
+    std::fs::create_dir(root.join("escaped")).expect("outside directory");
+    let outside = root.join("escaped/shapes.md");
+    std::fs::write(&outside, "keep this file").expect("outside file");
+    std::fs::write(root.join("fixture/wrela.toml"), common::manifest("../escaped"))
+        .expect("write manifest");
+    let out = export(&root, "out", &[]);
+    assert_eq!(std::fs::read_to_string(outside).expect("outside file"), "keep this file");
+    assert!(!out.status.success());
+    assert!(!root.join("out").exists());
+}
+
 /// A lookup reads the package as it is now, not an export: an edited doc comment shows at once.
 #[test]
 fn a_lookup_reads_the_package_as_it_is_now() {

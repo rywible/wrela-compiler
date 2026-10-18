@@ -105,6 +105,34 @@ fn a_negative_loss_uses_its_magnitude_for_rounding_tolerance() {
     assert!((x - 1.3).abs() < 1e-6, "the source-precision value is kept: {answer}");
 }
 
+#[test]
+fn repeated_free_options_include_each_range_of_the_same_file_once() {
+    let dir = common::package(
+        "solve-repeated-free",
+        &[
+            ("wrela.toml", &common::manifest("repeated_free")),
+            (
+                "fit.wrela",
+                "pub const X: f32 = 1.0\npub const Y: f32 = 2.0\n\npub fn miss() -> f32 {\n    let x = X - 3.0\n    let y = Y - 4.0\n    x * x + y * y\n}\n",
+            ),
+            ("main.wrela", common::FRAME),
+        ],
+    );
+    let answer = common::answer(common::wrela().arg("solve").arg(&dir).args([
+        "--minimize",
+        "fit::miss",
+        "--free",
+        "fit.wrela:1",
+        "--free",
+        "./fit.wrela:2",
+        "--free",
+        "fit.wrela:1-2",
+        "--json",
+    ]));
+    assert_eq!(answer["literals"].as_array().unwrap().len(), 2, "{answer}");
+    assert!(answer["loss_after"].as_f64().unwrap() < 1e-6, "{answer}");
+}
+
 const BALL: &str = "use std::field::{Surface, sphere}
 
 /// A ball on the ground.

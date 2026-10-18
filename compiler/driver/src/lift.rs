@@ -62,6 +62,7 @@ pub fn table(checked: &Checked, sources: &SourceMap, files: &[(FileId, String)])
             end,
             line: lc.line,
             column: lc.column,
+            unit: crate::edit::unit_of(&sources.file(file).text[start as usize..end as usize]),
             value,
             negated,
         });
@@ -112,6 +113,7 @@ pub fn report(checked: &Checked, sources: &SourceMap, t: &LiftTable) -> String {
                 "end": l.end,
                 "line": l.line,
                 "column": l.column,
+                "unit": l.unit,
                 "text": &f.text[l.start as usize..l.end as usize],
                 "value": l.value,
                 "negated": l.negated,

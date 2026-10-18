@@ -282,6 +282,7 @@ export class Semantics implements Overlay {
     if (name) document.title = name;
     const seen = new Set<number>();
     const children = new Map<number, HTMLElement[]>();
+    const fields = new Map<HTMLElement, HTMLElement[]>();
     for (const n of nodes) {
       seen.add(n.id);
       const el = this.#element(n);
@@ -290,6 +291,12 @@ export class Semantics implements Overlay {
       const list = children.get(n.parent) ?? [];
       list.push(el);
       children.set(n.parent, list);
+      const form = el.parentElement;
+      if (form?.tagName === "FORM") {
+        const inputs = fields.get(form) ?? [];
+        inputs.push(el);
+        fields.set(form, inputs);
+      }
     }
     // Nodes that went: a focused one hands the focus back to the canvas.
     for (const [id, el] of this.#els) {
@@ -302,6 +309,9 @@ export class Semantics implements Overlay {
       if (focused) this.canvas.focus();
     }
     for (const [form, el] of this.#forms) if (el.childElementCount === 0) { el.remove(); this.#forms.delete(form); }
+    // A form takes its fields' place among the semantic children, but its own inputs must
+    // follow the tree's order too, for keyboard navigation and screen readers.
+    for (const [form, inputs] of fields) this.#order(form, inputs, null);
     // Each parent's children, in order; the root's after its live region.
     for (const [parent, els] of children) {
       const holder = parent === 0 ? root : this.#els.get(parent)!;
@@ -588,7 +598,10 @@ export class Semantics implements Overlay {
       const item: HTMLElement = el.parentElement?.tagName === "FORM" && el.parentElement !== holder ? el.parentElement : el;
       if (item === ref) { ref = ref.nextElementSibling; continue; }
       // Moving an element takes its focus away: one in its place already keeps it.
-      if (item.parentElement === holder && item.contains(document.activeElement)) continue;
+      if (item.parentElement === holder && item.contains(document.activeElement)) {
+        ref = item.nextElementSibling;
+        continue;
+      }
       holder.insertBefore(item, ref);
     }
   }

@@ -406,14 +406,63 @@ struct MoveInfo {
     keyword: u32,
     /// Each name the old module sees (but the item's), and the path to import it by.
     imports: BTreeMap<String, String>,
+    /// The original call graph, with the moved functions named at their new paths.
+    calls: BTreeMap<(String, String), usize>,
 }
 
-/// From the first doc comment or attribute line above `span` to the end of its last line.
+/// Each caller and target, with their use counts. Paths remain stable when a new check gives
+/// definitions new IDs; `renames` accounts for the item and methods the move relocates.
+fn call_targets(
+    checked: &Checked,
+    sources: &SourceMap,
+    renames: &BTreeMap<String, String>,
+) -> BTreeMap<(String, String), usize> {
+    let ix = Index::new(checked, sources);
+    let name = |f| {
+        let path = ix.fn_path(f);
+        renames.get(&path).cloned().unwrap_or(path)
+    };
+    let mut calls = BTreeMap::new();
+    for (&f, body) in &checked.mir {
+        let caller = name(f);
+        for (s, r) in wrela_sema::mir::rvalues(body) {
+            wrela_sema::mir::fn_uses(ix.p, s, r, |u, _| {
+                *calls.entry((caller.clone(), name(u.func()))).or_default() += 1;
+            });
+        }
+    }
+    calls
+}
+
+/// Includes the item's doc comments, attributes and trailing comment, without taking another
+/// item that shares its first or last line.
 fn whole_lines(f: &SourceFile, span: Span) -> (u32, u32) {
-    let start = f.line_start(crate::query::doc_top(f, f.line_index(span.start)));
     let text = &f.text;
-    let end =
+    let line = f.line_index(span.start);
+    // The item's span starts at its keyword, after `pub` where present. A semicolon before
+    // it separates a previous item; otherwise its whole opening line belongs to it.
+    let line_start = f.line_start(line);
+    let prefix = &text[line_start as usize..span.start as usize];
+    let start = crate::edit::lex(prefix)
+        .filter(|t| t.kind == wrela_syntax::token::TokenKind::Semi)
+        .last()
+        .map_or_else(
+            || f.line_start(crate::query::doc_top(f, line)),
+            |t| {
+                let rest = &prefix[t.span.end as usize..];
+                line_start + t.span.end + (rest.len() - rest.trim_start().len()) as u32
+            },
+        );
+    let line_end =
         text[span.end as usize..].find('\n').map_or(text.len(), |i| span.end as usize + i + 1);
+    let tail = &text[span.end as usize..line_end];
+    let rest = tail.trim_start();
+    let after_separator = rest.strip_prefix(';').unwrap_or(rest).trim_start();
+    let end = if after_separator.is_empty() || after_separator.starts_with("//") {
+        line_end
+    } else {
+        span.end as usize + (tail.len() - rest.len()) + usize::from(rest.starts_with(';'))
+    };
     (start, end as u32)
 }
 
@@ -542,6 +591,7 @@ pub fn move_item(root: &Path, item: &str, module: &str) -> Result<Plan, Refusal>
             })
             .map_or(span.start, |t| span.start + t.span.start);
         let mut imports = BTreeMap::new();
+        let target_module = p.modules.iter().position(|m| m.path.join("::") == module);
         for (n, b) in &p.module(module_id).scope {
             if *n == name {
                 continue;
@@ -557,8 +607,44 @@ pub fn move_item(root: &Path, item: &str, module: &str) -> Result<Plan, Refusal>
                 Res::Module(m) => at(m),
                 _ => continue,
             };
+            // Scalar constants are folded into MIR, so a call-graph comparison cannot see
+            // their binding change. Refuse a conflicting bare name before moving it; an
+            // explicit path remains safe in either module.
+            if matches!(b.res, Res::Const(_))
+                && target_module.is_some_and(|target| {
+                    wrela_sema::resolve::lookup_name(p, wrela_sema::ty::ModuleId(target as u32), n)
+                        .is_some_and(|res| res != b.res)
+                })
+                && ranges.iter().any(|&(s, e)| {
+                    let moved = &text[s as usize..e as usize];
+                    let tokens: Vec<_> = crate::edit::lex(moved).collect();
+                    tokens.iter().enumerate().any(|(i, token)| {
+                        token.kind == wrela_syntax::token::TokenKind::Ident
+                            && &moved[token.span.range()] == n
+                            && (i == 0
+                                || tokens[i - 1].kind != wrela_syntax::token::TokenKind::ColonColon)
+                    })
+                })
+            {
+                return refuse(format!(
+                    "`{n}` names another item in `{module}`: qualify it as `{path}` before moving"
+                ));
+            }
             imports.insert(n.clone(), path);
         }
+        let mut renames = BTreeMap::new();
+        let prefix = format!("{from_module}::");
+        for (i, f) in p.fns.iter().enumerate() {
+            if f.span.file == span.file
+                && ranges.iter().any(|&(s, e)| s <= f.span.start && f.span.end <= e)
+            {
+                let path = ix.fn_path(wrela_sema::ty::FnId(i as u32));
+                if let Some(rest) = path.strip_prefix(&prefix) {
+                    renames.insert(path.clone(), format!("{module}::{rest}"));
+                }
+            }
+        }
+        let calls = call_targets(checked, sources, &renames);
         Ok(MoveInfo {
             name: name.to_string(),
             path,
@@ -568,6 +654,7 @@ pub fn move_item(root: &Path, item: &str, module: &str) -> Result<Plan, Refusal>
             public,
             keyword,
             imports,
+            calls,
         })
     })?;
     let mut texts = Texts::new(root);
@@ -679,6 +766,16 @@ pub fn move_item(root: &Path, item: &str, module: &str) -> Result<Plan, Refusal>
     }
     for (f, p) in &imported {
         notes.push(format!("{f} imports `{p}`"));
+    }
+    let calls = crate::with_checked_in(root, &texts.overlay(), |checked, sources| {
+        call_targets(checked, sources, &BTreeMap::new())
+    })
+    .map_err(|errors| Refusal {
+        why: "the program wouldn't check after the move".into(),
+        errors: Some(errors),
+    })?;
+    if calls != info.calls {
+        return refuse("moving the item would make a call go to another function");
     }
     texts.plan(format!("move `{}` to `{module}`", info.path), notes)
 }
@@ -1180,6 +1277,70 @@ pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_move_refuses_to_change_call_targets() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-refactor-move-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let source = "pub fn helper() -> i32 { 1 }\npub fn moved() -> i32 { helper() }\n";
+        std::fs::write(dir.join("a.wrela"), source).expect("source module");
+        std::fs::write(dir.join("b.wrela"), "fn helper() -> i32 { 2 }\n").expect("target module");
+        let result = move_item(&dir, "a::moved", "b");
+        assert!(result.is_err_and(|r| r.why.contains("another function")));
+        assert_eq!(std::fs::read_to_string(dir.join("a.wrela")).expect("source"), source);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_move_keeps_constant_bindings_and_allows_generics_and_closures() {
+        let dir = std::env::temp_dir()
+            .join(format!("wrela-refactor-move-bindings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        std::fs::write(
+            dir.join("a.wrela"),
+            "pub const VALUE: i32 = 1\npub fn moved() -> i32 { VALUE }\n",
+        )
+        .expect("source module");
+        std::fs::write(dir.join("b.wrela"), "const VALUE: i32 = 2\n").expect("target module");
+        assert!(
+            move_item(&dir, "a::moved", "b")
+                .is_err_and(|r| r.why.contains("qualify it as `a::VALUE`"))
+        );
+        for source in [
+            "pub const VALUE: i32 = 1\npub fn moved() -> i32 { a::VALUE }\n",
+            "pub fn moved<T: Copy>(x: T) -> T { x }\npub fn caller() -> i32 { moved(3) }\n",
+            "pub fn helper(f: fn() -> i32) -> i32 { f() }\npub fn moved() -> i32 { helper(|| 3) }\npub fn caller() -> i32 { moved() }\n",
+        ] {
+            std::fs::write(dir.join("a.wrela"), source).expect("source module");
+            move_item(&dir, "a::moved", "b").expect("move keeps its bindings");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn moving_an_item_leaves_other_items_on_its_line() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-refactor-shared-line-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let moved = "pub fn moved() -> i32 { 1 }";
+        let kept = "pub fn kept() -> i32 { 2 }";
+        for source in [format!("{moved}; {kept}\n"), format!("{kept}; {moved}\n")] {
+            std::fs::write(dir.join("a.wrela"), source).expect("source module");
+            std::fs::write(dir.join("b.wrela"), "").expect("target module");
+            let plan = move_item(&dir, "a::moved", "b").expect("move plan");
+            let old_module = plan.files.iter().find(|f| f.file == "a.wrela").expect("old module");
+            let new_module = plan.files.iter().find(|f| f.file == "b.wrela").expect("new module");
+            assert!(old_module.new.contains(kept), "{}", old_module.new);
+            assert!(!old_module.new.contains(moved), "{}", old_module.new);
+            assert!(new_module.new.contains("fn moved"), "{}", new_module.new);
+            assert!(!new_module.new.contains("fn kept"), "{}", new_module.new);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     #[test]
     fn parameter_delimiters_ignore_strings_and_comments() {

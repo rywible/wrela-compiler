@@ -217,6 +217,39 @@ export class Net {
     readonly print: (line: string) => void,
   ) {}
 
+  /** Checks one export's commands without opening, sending or closing anything. A send can
+   * close a connection at its byte limits, so later opens see that same planned lifetime. */
+  plan(): Pick<Net, "open" | "send" | "close"> {
+    const sessions = new Map<number, { open: boolean; writer: boolean; pending: number }>();
+    const state = (conn: number) => {
+      let planned = sessions.get(conn);
+      if (planned === undefined) {
+        const session = this.#sessions.get(conn);
+        planned = { open: session !== undefined && !session.closed, writer: session?.writer != null, pending: session?.pending ?? 0 };
+        sessions.set(conn, planned);
+      }
+      return planned;
+    };
+    return {
+      open(conn, room, pair) {
+        const session = state(conn);
+        if (session.open) throw new Error(`connection ${conn} is open`);
+        session.open = roomName(room) && pair !== null;
+        session.writer = false;
+        session.pending = 0;
+      },
+      send(conn, bytes) {
+        const session = state(conn);
+        if (!session.open || !session.writer) return;
+        // The frame's varint prefix is one, two or three bytes (MAX_UP is below 2^21).
+        const cost = bytes.length + (bytes.length < 128 ? 1 : bytes.length < 16384 ? 2 : 3) + OVERHEAD;
+        if (bytes.length > MAX_UP || session.pending + cost > PENDING) session.open = false;
+        else session.pending += cost;
+      },
+      close(conn) { state(conn).open = false; },
+    };
+  }
+
   #fetchServer(): Promise<Server> {
     const url = new URL("net.json", this.base()).href;
     if (this.#server?.url === url) return this.#server.ready;
@@ -226,7 +259,12 @@ export class Net {
         return r.text();
       })
       .then(parseServer);
-    this.#server = { url, ready };
+    const server = { url, ready };
+    this.#server = server;
+    void ready.catch(() => {
+      // A temporary fetch failure must not make every later connection fail with it.
+      if (this.#server === server) this.#server = null;
+    });
     return ready;
   }
 

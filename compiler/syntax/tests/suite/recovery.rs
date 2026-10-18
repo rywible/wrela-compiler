@@ -159,6 +159,17 @@ fn print_fix_keeps_a_leading_bom_first() {
 }
 
 #[test]
+fn join_lines_fix_keeps_a_leading_bom_first() {
+    let source = "\u{feff}fn f() { if true {} // why\n    else {} }\n";
+    let parsed = parse(FileId(0), source);
+    let diagnostic =
+        parsed.diagnostics.iter().find(|d| d.code.as_str() == "E0111").expect("else error");
+    let fixed = wrela_diag::apply_edits(source, &diagnostic.fixes[0].edits);
+    assert!(fixed.starts_with("\u{feff}// why\n"), "{fixed}");
+    assert!(!parse(FileId(0), &fixed).has_errors(), "{fixed}");
+}
+
+#[test]
 fn print_fix_does_not_call_a_local_binding() {
     for source in [
         "fn f(print: i32) { println!(\"hello\") }\n",

@@ -791,6 +791,24 @@ fn checks() -> Value {
             &with_buffers(&|e| _ = e.dispatch(1, [1; 3], &[Binding::range(1, 0, 0), b(2)], &u)),
         ),
         check(
+            "a texture binding with a buffer offset",
+            &m,
+            &with_textures(&|e| {
+                let mut bindings = tex;
+                bindings[0].offset = 4;
+                e.begin_screen_pass([0.0; 4]).draw(5, 3, 1, &bindings, &[]).present();
+            }),
+        ),
+        check(
+            "a sampler binding with a buffer size",
+            &m,
+            &with_textures(&|e| {
+                let mut bindings = tex;
+                bindings[1].size = 4;
+                e.begin_screen_pass([0.0; 4]).draw(5, 3, 1, &bindings, &[]).present();
+            }),
+        ),
+        check(
             "a copy within one buffer",
             &m,
             &with_buffers(&|e| _ = e.copy_buffer(1, 0, 1, 256, 4)),
@@ -1349,6 +1367,17 @@ fn manifests() -> Vec<Value> {
             edited(&|m| {
                 m.pipelines[0].bindings =
                     (1..6).map(|b| bind(b, BindingKind::StorageTexture)).collect()
+            }),
+        ),
+        manifest(
+            "a render pipeline's storage texture",
+            edited(&|m| m.pipelines[1].bindings[0].kind = BindingKind::StorageTexture),
+        ),
+        manifest(
+            "a fragment shader's storage 3D texture",
+            edited(&|m| {
+                m.pipelines[1].bindings[0].kind = BindingKind::StorageTexture3d;
+                m.pipelines[1].bindings[0].stage = BindingStage::Fragment;
             }),
         ),
         manifest(

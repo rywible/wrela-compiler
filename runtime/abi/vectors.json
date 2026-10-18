@@ -1081,6 +1081,22 @@
         "name": "an empty binding"
       },
       {
+        "bytes": "575243530a000000ec00000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b0000000000000000000000010000000400000010000000000000000000000000000000000000000500000044000000050000000300000001000000040000000800000004000000000000000a00000000000000000000000900000000000000000000000b0000000000000000000000000000000600000000000000",
+        "error": {
+          "message": "Draw failed: a texture or sampler binding has offset 4 and size 0: both must be 0",
+          "opcode": "Draw"
+        },
+        "name": "a texture binding with a buffer offset"
+      },
+      {
+        "bytes": "575243530a000000ec00000001000000080000000100000000020000010000000800000002000000000200000900000010000000080000000400000004000000000000000900000010000000090000000400000004000000020000000c000000100000000a0000000100000000000000000000000c000000100000000b0000000000000000000000010000000400000010000000000000000000000000000000000000000500000044000000050000000300000001000000040000000800000000000000000000000a00000000000000040000000900000000000000000000000b0000000000000000000000000000000600000000000000",
+        "error": {
+          "message": "Draw failed: a texture or sampler binding has offset 0 and size 4: both must be 0",
+          "opcode": "Draw"
+        },
+        "name": "a sampler binding with a buffer size"
+      },
+      {
         "bytes": "575243530a0000003c000000010000000800000001000000000200000100000008000000020000000002000008000000140000000100000000000000010000000001000004000000",
         "error": {
           "message": "CopyBuffer failed: buffer 1 is both the copy's source and its destination",
@@ -2505,6 +2521,16 @@
       "error": "invalid manifest: pipeline 0 has 5 storage textures; WebGPU's default limit is 4",
       "json": "{\n  \"manifest_version\": 8,\n  \"stream_version\": 10,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba16float\"\n        },\n        {\n          \"binding\": 2,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba16float\"\n        },\n        {\n          \"binding\": 3,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba16float\"\n        },\n        {\n          \"binding\": 4,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba16float\"\n        },\n        {\n          \"binding\": 5,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba16float\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"targets\": [\n        {\n          \"color\": \"rgba8unorm\",\n          \"depth\": false\n        }\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"texture\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        }\n      ]\n    }\n  ]\n}\n",
       "name": "too many storage textures in a kernel"
+    },
+    {
+      "error": "invalid manifest: pipeline 1's binding 0 is a storage texture, which only a kernel can bind",
+      "json": "{\n  \"manifest_version\": 8,\n  \"stream_version\": 10,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"targets\": [\n        {\n          \"color\": \"rgba8unorm\",\n          \"depth\": false\n        }\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"storage_texture\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        }\n      ]\n    }\n  ]\n}\n",
+      "name": "a render pipeline's storage texture"
+    },
+    {
+      "error": "invalid manifest: pipeline 1's binding 0 is a storage texture, which only a kernel can bind",
+      "json": "{\n  \"manifest_version\": 8,\n  \"stream_version\": 10,\n  \"wasm\": \"game.wasm\",\n  \"pipelines\": [\n    {\n      \"name\": \"sample\",\n      \"shader\": \"pipeline_0.wgsl\",\n      \"kind\": \"compute\",\n      \"entry\": \"main\",\n      \"workgroup_size\": [\n        64,\n        1,\n        1\n      ],\n      \"uniform\": {\n        \"binding\": 0,\n        \"size\": 32,\n        \"space\": \"uniform\"\n      },\n      \"bindings\": [\n        {\n          \"binding\": 1,\n          \"kind\": \"read_write\"\n        }\n      ]\n    },\n    {\n      \"name\": \"cover+shade\",\n      \"shader\": \"pipeline_1.wgsl\",\n      \"kind\": \"render\",\n      \"vertex_entry\": \"vs\",\n      \"fragment_entry\": \"fs\",\n      \"targets\": [\n        {\n          \"color\": \"rgba8unorm\",\n          \"depth\": false\n        }\n      ],\n      \"uniform\": null,\n      \"bindings\": [\n        {\n          \"binding\": 0,\n          \"kind\": \"storage_texture_3d\",\n          \"stage\": \"fragment\",\n          \"format\": \"rgba8unorm\"\n        },\n        {\n          \"binding\": 1,\n          \"kind\": \"sampler\"\n        }\n      ]\n    }\n  ]\n}\n",
+      "name": "a fragment shader's storage 3D texture"
     },
     {
       "error": "invalid manifest: pipeline 0's uniform block of 20 bytes isn't a multiple of 16",

@@ -30,6 +30,7 @@ interface Page {
   /** Fires the page's media query listeners (a pixel ratio change). */
   mediaListeners: (() => void)[];
   visibilityListeners: (() => void)[];
+  canvasEvents: Map<string, (event: unknown) => void>;
   worker: { onmessage: ((event: MessageEvent<FromWorker>) => void) | null } | null;
   /** The page's own text, when a test gives it one: what happened to it. */
   text: string[];
@@ -41,7 +42,7 @@ let loads = 0;
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
 async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean } = {}): Promise<Page> {
-  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], worker: null, text: [], classes: [] };
+  const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], canvasEvents: new Map(), worker: null, text: [], classes: [] };
   // The page's own text records a box put before it, and its removal.
   const own = options.text ? {
     before: (el: { textContent: string; className?: string }) => page.text.push(`before: ${el.className ? `[${el.className}] ` : ""}${el.textContent.split("\n")[0]}`),
@@ -52,7 +53,8 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     clientWidth: 100,
     clientHeight: 50,
     transferControlToOffscreen: () => ({}),
-    addEventListener: () => {},
+    addEventListener: (name: string, listener: (event: unknown) => void) => page.canvasEvents.set(name, listener),
+    getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 50 }),
   };
   const u = new URL(url);
   fake("location", { hostname: u.hostname, hash: u.hash });
@@ -209,6 +211,25 @@ test("the canvas is watched in device pixels, so a pixel ratio change resizes it
   const page = await load("https://example.com/game/");
   expect(page.observed).toEqual([{ box: "device-pixel-content-box" }]);
   expect(page.mediaListeners).toEqual([]);
+});
+
+test("input uses the fitted frame size when the canvas exceeds the GPU limit", async () => {
+  const page = await load("https://example.com/game/", { devicePixelBox: false });
+  page.worker!.onmessage!(new MessageEvent("message", { data: { type: "screen-limit", max: 100 } satisfies FromWorker }));
+  const start = page.posted.find(msg => msg.type === "start")!;
+  const ring = new InputRing(start.input);
+  page.canvasEvents.get("pointermove")!({ pointerId: 1, clientX: 50, clientY: 25 });
+  const event = ring.read().events;
+  const view = new DataView(event.buffer, event.byteOffset, event.byteLength);
+  expect([view.getFloat32(8, true), view.getFloat32(12, true)]).toEqual([50, 25]);
+  expect(page.shown).toEqual([]);
+  // Resizes use the same limit; smaller canvases retain their full device-pixel size.
+  (window as { devicePixelRatio: number }).devicePixelRatio = 3;
+  page.mediaListeners.at(-1)!();
+  expect(page.posted.at(-1)).toEqual({ type: "resize", width: 100, height: 50 });
+  (window as { devicePixelRatio: number }).devicePixelRatio = 0.5;
+  page.mediaListeners.at(-1)!();
+  expect(page.posted.at(-1)).toEqual({ type: "resize", width: 50, height: 25 });
 });
 
 test("without device-pixel boxes, a pixel ratio change still resizes the canvas", async () => {

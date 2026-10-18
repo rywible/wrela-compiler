@@ -90,6 +90,20 @@ test("fetches and posts literal percent escapes inside the build", async () => {
   ]);
 });
 
+test("a replacement build fetches and posts relative to its own directory", async () => {
+  const requested: { url: string; method: string }[] = [];
+  const io = browserIo(BASE, async (url, init) => {
+    requested.push({ url: url.href, method: init?.method ?? "GET" });
+    return new Response(Uint8Array.of(1));
+  }, "http://localhost/next/");
+  await io.fetch("data.bin");
+  await io.post("save", Uint8Array.of(2));
+  expect(requested).toEqual([
+    { url: "http://localhost/next/data.bin", method: "GET" },
+    { url: "http://localhost/next/save", method: "POST" },
+  ]);
+});
+
 test("checked URL paths keep spaces and controls literal inside the build", async () => {
   const paths = [" /admin", "\t/admin", "sa\nve.bin", "folder/name "];
   const requested: string[] = [];

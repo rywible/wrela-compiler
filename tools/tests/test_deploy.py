@@ -165,6 +165,15 @@ class Deploy(unittest.TestCase):
             with patch.object(console, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "file-count"):
                 deploy.deploy(output, dry_run=True, get=live_site().get, now=NOW)
 
+    def test_the_file_limit_includes_the_deploy_history(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            output = built(Path(temporary))
+            site = Site()
+            site.deploys = []
+            # The console has one asset before deploys.json is written, and two after.
+            with patch.object(console, "MAX_FILES", 1), self.assertRaisesRegex(ValueError, "file-count"):
+                deploy.deploy(output, dry_run=True, get=site.get, now=NOW)
+
     def test_a_deploy_no_longer_at_main_s_head_changes_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = built(Path(temporary))

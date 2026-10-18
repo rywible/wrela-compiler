@@ -7,7 +7,7 @@
 use crate::error::{Error, Result};
 use crate::shared;
 use crate::trace::Trace;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
 use wasmtime::SharedMemory;
@@ -144,6 +144,11 @@ struct State<E> {
     executor: E,
     hash: StateHash,
     sequencer: Sequencer,
+    /// Checked batches wait until the export returns successfully. The program may reuse its
+    /// command memory between submits, so each batch has its own bytes.
+    pending: Vec<Vec<u8>>,
+    /// A trapped export restores the sequence state alongside the checker's resources.
+    before_call: Option<Sequencer>,
     /// The typed error behind the most recent trap raised by `submit`, so the caller gets it
     /// rather than wasmtime's flattened message.
     failure: Option<Error>,
@@ -256,6 +261,8 @@ struct Requests {
     arriving: Vec<(u32, std::result::Result<Vec<u8>, String>)>,
     /// Requests the host answers after a call ([`Program::answer`]): another build's.
     waiting: Vec<u32>,
+    /// IDs in this call's checked batches, before their requests are carried out.
+    reserved: HashSet<u32>,
 }
 
 impl Requests {
@@ -264,6 +271,7 @@ impl Requests {
         if self.answered.contains_key(&request)
             || self.arriving.iter().any(|a| a.0 == request)
             || self.waiting.contains(&request)
+            || self.reserved.contains(&request)
         {
             return Err(Error::Command(CommandError {
                 opcode: op,
@@ -352,6 +360,37 @@ impl Requests {
 }
 
 impl<E: Executor> State<E> {
+    fn begin_call(&mut self) {
+        self.checker.begin_call();
+        self.before_call = Some(self.sequencer.clone());
+    }
+
+    fn discard_call(&mut self) {
+        self.pending.clear();
+        self.requests.reserved.clear();
+        self.checker.end_call(false);
+        if let Some(before) = self.before_call.take() {
+            self.sequencer = before;
+        }
+    }
+
+    /// A successful export must close every pass before any of its commands take effect.
+    fn commit_call(&mut self) -> Result<()> {
+        if let Err(error) = self.sequencer.end_frame() {
+            self.discard_call();
+            return Err(error.into());
+        }
+        self.checker.end_call(true);
+        self.before_call = None;
+        self.requests.reserved.clear();
+        for batch in std::mem::take(&mut self.pending) {
+            for command in stream::decode(&batch)? {
+                self.execute(&command)?;
+            }
+        }
+        Ok(())
+    }
+
     fn submit(&mut self, batch: &[u8]) -> Result<()> {
         // The state hash covers every submitted byte, valid or not.
         self.hash.update(batch);
@@ -371,41 +410,61 @@ impl<E: Executor> State<E> {
                 self.sequencer = before;
                 return Err(e.into());
             }
-            if let Err(e) = self.executor.execute(&cmd) {
-                self.failed = Some(e.to_string());
-                return Err(e);
-            }
             match &cmd {
-                Command::ReadBuffer { request, handle, offset, size } => {
+                Command::ReadBuffer { request, .. }
+                | Command::StorageRead { request, .. }
+                | Command::StorageWrite { request, .. }
+                | Command::Fetch { request, .. }
+                | Command::Post { request, .. }
+                | Command::HostRequest { request, .. }
+                | Command::Prepare { request, .. }
+                | Command::HandOver { request, .. } => {
                     self.requests.start(*request, cmd.opcode())?;
-                    let answer =
-                        self.executor.read_back(*handle, *offset, *size).map_err(|e| e.to_string());
-                    self.requests.arriving.push((*request, answer));
-                }
-                Command::StorageRead { .. }
-                | Command::StorageWrite { .. }
-                | Command::Fetch { .. }
-                | Command::Post { .. }
-                | Command::HostRequest { .. } => self.requests.io(&cmd)?,
-                Command::Prepare { request, path } | Command::HandOver { request, path } => {
-                    self.requests.start(*request, cmd.opcode())?;
-                    let path = path.to_string();
-                    if !self.hands_over {
-                        let why = "this host has no other build to hand over to".to_string();
-                        self.requests.arriving.push((*request, Err(why)));
-                    } else if let Command::Prepare { .. } = cmd {
-                        self.requests.waiting.push(*request);
-                        self.handing.push(Handing::Prepare { request: *request, path });
-                    } else {
-                        self.requests.waiting.push(*request);
-                        self.handing.push(Handing::HandOver { request: *request, path });
-                    }
-                }
-                Command::Unprepare { path } if self.hands_over => {
-                    self.handing.push(Handing::Unprepare { path: path.to_string() });
+                    self.requests.reserved.insert(*request);
                 }
                 _ => {}
             }
+        }
+        self.pending.push(batch.to_vec());
+        Ok(())
+    }
+
+    /// Carries out a command already checked during the successful export.
+    fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        if let Err(e) = self.executor.execute(cmd) {
+            self.failed = Some(e.to_string());
+            return Err(e);
+        }
+        match cmd {
+            Command::ReadBuffer { request, handle, offset, size } => {
+                self.requests.start(*request, cmd.opcode())?;
+                let answer =
+                    self.executor.read_back(*handle, *offset, *size).map_err(|e| e.to_string());
+                self.requests.arriving.push((*request, answer));
+            }
+            Command::StorageRead { .. }
+            | Command::StorageWrite { .. }
+            | Command::Fetch { .. }
+            | Command::Post { .. }
+            | Command::HostRequest { .. } => self.requests.io(cmd)?,
+            Command::Prepare { request, path } | Command::HandOver { request, path } => {
+                self.requests.start(*request, cmd.opcode())?;
+                let path = path.to_string();
+                if !self.hands_over {
+                    let why = "this host has no other build to hand over to".to_string();
+                    self.requests.arriving.push((*request, Err(why)));
+                } else if let Command::Prepare { .. } = cmd {
+                    self.requests.waiting.push(*request);
+                    self.handing.push(Handing::Prepare { request: *request, path });
+                } else {
+                    self.requests.waiting.push(*request);
+                    self.handing.push(Handing::HandOver { request: *request, path });
+                }
+            }
+            Command::Unprepare { path } if self.hands_over => {
+                self.handing.push(Handing::Unprepare { path: path.to_string() });
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -958,6 +1017,8 @@ impl<E: Executor> Program<E> {
             executor,
             hash: StateHash::new(),
             sequencer: Sequencer::new(),
+            pending: Vec::new(),
+            before_call: None,
             failure: None,
             // From the start, so `init`'s batches are kept too.
             batches,
@@ -1187,7 +1248,9 @@ impl<E: Executor> Program<E> {
         match self.fuel {
             Some(fuel) => self.store.set_fuel(fuel).map_err(|e| Error::Program(format!("{e:#}"))),
             None => Ok(()),
-        }
+        }?;
+        self.store.data_mut().begin_call();
+        Ok(())
     }
 
     /// Why the last call failed, if it did: for reporting it against the source.
@@ -1253,25 +1316,35 @@ impl<E: Executor> Program<E> {
     fn finish_call(&mut self, result: wasmtime::Result<()>) -> Result<()> {
         self.settle(result)?;
         let state = self.store.data_mut();
-        state.sequencer.end_frame()?;
-        state.executor.end_frame()
+        let result = state.executor.end_frame();
+        if let Err(error) = &result {
+            state.failed = Some(error.to_string());
+        }
+        result
     }
 
     /// Settles requests and traces, preserving a Wasm trap before checking command completion.
     fn settle(&mut self, result: wasmtime::Result<()>) -> Result<()> {
+        self.last_failure = None;
+        let failure = self.store.data_mut().failure.take();
+        let result = match (result, failure) {
+            (Ok(()), _) => self.store.data_mut().commit_call(),
+            (Err(_), Some(failure)) => {
+                self.store.data_mut().discard_call();
+                Err(failure)
+            }
+            (Err(trap), None) => {
+                self.store.data_mut().discard_call();
+                Err(self.trapped(&trap, memory::THREAD_MAIN))
+            }
+        };
         // What the call's requests got, the program sees from its next call on. The call's
         // phase ends with it.
         self.store.data_mut().requests.settle();
         // The messages it was given: their bytes go with the call.
         self.store.data_mut().input.end_call();
         self.store.data().trace.end_phase();
-        self.last_failure = None;
-        let failure = self.store.data_mut().failure.take();
-        match (result, failure) {
-            (Ok(()), _) => Ok(()),
-            (Err(_), Some(failure)) => Err(failure),
-            (Err(trap), None) => Err(self.trapped(&trap, memory::THREAD_MAIN)),
-        }
+        result
     }
 
     /// A trap on thread `thread` as the host reports it, with its panic message and where it
@@ -1874,7 +1947,7 @@ fn check_thread_started(started: &mut bool) -> wasmtime::Result<()> {
     Err(wasmtime::format_err!("{CALLED_WHILE_STARTING}"))
 }
 
-/// `wrela.submit(ptr, len)`: decode and execute one batch of `len` bytes at `ptr`.
+/// `wrela.submit(ptr, len)`: check and keep one batch until its export returns successfully.
 fn submit<E: Executor>(
     mut caller: wasmtime::Caller<'_, State<E>>,
     ptr: u32,

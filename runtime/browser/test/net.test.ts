@@ -137,6 +137,61 @@ const settle = async (until: () => boolean) => {
 };
 
 describe("what a connection holds", () => {
+  test("a call's network plan checks connection lifetimes without changing the network", async () => {
+    await withServer([], async (urls) => {
+      const net = new Net(() => "https://site.example/game/", () => {});
+      net.open(1, "lobby", 1n);
+      await settle(() => net.arrived.length > 0);
+      try {
+        const plan = net.plan();
+        expect(() => plan.open(1, "lobby", 1n)).toThrow("connection 1 is open");
+        plan.close(1);
+        plan.open(1, "lobby", 1n);
+        // A newly opened stream has no writer yet, so sends cannot close it.
+        plan.send(1, new Uint8Array(MAX_UP + 1));
+        expect(() => plan.open(1, "lobby", 1n)).toThrow("connection 1 is open");
+        plan.close(1);
+        plan.open(1, "Invalid Room", 1n);
+        plan.open(1, "lobby", 1n);
+        plan.open(2, "lobby", null);
+        plan.open(2, "lobby", 1n);
+
+        const oversized = net.plan();
+        oversized.send(1, new Uint8Array(MAX_UP + 1));
+        oversized.open(1, "lobby", 1n);
+        // A plan starts from the bytes already waiting, and counts its own sends too.
+        for (let i = 0; i < 17; i++) net.send(1, new Uint8Array(60_000));
+        const queued = net.plan();
+        queued.send(1, new Uint8Array(60_000));
+        queued.open(1, "lobby", 1n);
+        expect(() => net.open(1, "lobby", 1n)).toThrow("connection 1 is open");
+        expect(net.arrived).toEqual([{ conn: 1, open: true }]);
+        expect(urls).toHaveLength(1);
+      } finally { net.closeAll(); }
+    });
+  });
+
+  test("a later connection retries a server configuration that could not be fetched", async () => {
+    await withServer([], async (urls) => {
+      let requests = 0;
+      globalThis.fetch = (async () => {
+        if (++requests === 1) throw new Error("temporarily offline");
+        return new Response('{"url":"https://server.example"}');
+      }) as unknown as typeof fetch;
+      const net = new Net(() => "https://site.example/game/", () => {});
+      try {
+        net.open(1, "lobby", 1n);
+        await settle(() => net.arrived.length > 0);
+        expect(net.arrived).toEqual([{ conn: 1, open: false }]);
+        net.open(2, "lobby", 1n);
+        await settle(() => net.arrived.length > 1);
+        expect(net.arrived[1]).toEqual({ conn: 2, open: true });
+        expect(requests).toBe(2);
+        expect(urls).toEqual(["https://server.example/room/lobby?pair=0000000000000001"]);
+      } finally { net.closeAll(); }
+    });
+  });
+
   test("a replacement build reads its own server configuration", async () => {
     await withServer([], async (urls) => {
       const fetched: string[] = [];

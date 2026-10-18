@@ -34,6 +34,14 @@ struct Obligation {
     why: String,
 }
 
+/// A match whose coverage is checked once the body's types are known.
+struct PendingMatch {
+    ty: TyId,
+    /// Each arm's pattern and whether it has a guard.
+    arms: Vec<(Pat, bool)>,
+    span: Span,
+}
+
 /// The local names in scope, innermost last: a stack that block ends cut back, with an index by
 /// name, so a lookup doesn't walk every shadowed binding.
 #[derive(Default)]
@@ -124,6 +132,9 @@ pub(crate) struct Checker<'p> {
     /// Pattern bindings declared before their types were known, and whether each binds into a
     /// place: their kinds are decided at the end ([`Checker::binding_kinds`]).
     pending_bindings: Vec<(LocalId, bool)>,
+    /// Matches whose patterns parsed and typed: coverage uses the body's final types, so
+    /// numeric patterns compare at the precision selected by later uses too.
+    pending_matches: Vec<PendingMatch>,
     /// `let x = place`: an error unless `x`'s type turns out `Copy` (E0518). The local, the
     /// place's span, and the `let` keyword's.
     pub(crate) owned_lets: Vec<(LocalId, Span, Span)>,
@@ -168,6 +179,7 @@ impl<'p> Checker<'p> {
             int_ops: Vec::new(),
             indexes: Vec::new(),
             pending_bindings: Vec::new(),
+            pending_matches: Vec::new(),
             owned_lets: Vec::new(),
             binding_mut: false,
             saw_syntax_error: false,
@@ -630,7 +642,7 @@ impl<'p> Checker<'p> {
             Some(b) => {
                 // As the right operand of `place op value`.
                 let hint = self.right_hint(b, place.ty);
-                let v = self.check_expr(value, Some(hint));
+                let v = self.check_expr(value, hint);
                 let result = self.binary_result(b, place.ty, v.ty, span);
                 if let Some(r) = result {
                     self.expect(r, place.ty, span);

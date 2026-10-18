@@ -11,7 +11,7 @@ import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
 import { carried, lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
-import { checker, type ErrorVector, vectors } from "./fixtures.ts";
+import { checker, type ErrorVector, shapes, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -93,6 +93,27 @@ describe("checks", () => {
       }
       expect(error).toEqual(v.error);
     });
+  }
+});
+
+test("texture and sampler bindings reject buffer ranges", () => {
+  for (const kind of ["texture", "sampler"] as const) {
+    const m = shapes();
+    m.pipelines[1]!.bindings = [{ binding: 1, kind, stage: "both", format: kind === "texture" ? "rgba8unorm" : null }];
+    const c = checker(m);
+    c.check(kind === "texture"
+      ? { op: "CreateTexture", handle: 1, width: 1, height: 1, depth: 0, format: "rgba8unorm", writable: false }
+      : { op: "CreateSampler", handle: 1, linear: false, repeat: false, compare: null });
+    for (const [offset, size] of [[4, 0], [0, 4], [4, 4]]) {
+      expect(() => c.check({
+        op: "Dispatch", pipeline: 1, groups: [1, 1, 1],
+        bindings: [{ handle: 1, offset: offset!, size: size! }], uniforms: new Uint8Array(16),
+      })).toThrow(`a texture or sampler binding has offset ${offset} and size ${size}: both must be 0`);
+    }
+    expect(() => c.check({
+      op: "Dispatch", pipeline: 1, groups: [1, 1, 1],
+      bindings: [{ handle: 1, offset: 0, size: 0 }], uniforms: new Uint8Array(16),
+    })).not.toThrow();
   }
 });
 

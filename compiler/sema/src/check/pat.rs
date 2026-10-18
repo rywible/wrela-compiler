@@ -1,6 +1,6 @@
 //! Patterns: `let` destructuring and `match`, with exhaustiveness and unreachable arms.
 
-use super::Checker;
+use super::{Checker, PendingMatch};
 use crate::defs::*;
 use crate::program::Program;
 use crate::resolve;
@@ -701,30 +701,39 @@ impl<'p> Checker<'p> {
             && !scrutinee_error
             && !arms.iter().any(|a| a.pats.iter().any(has_error_pat))
         {
-            self.check_exhaustive(&s, &out, span);
+            let patterns = out.iter().map(|a| (a.pat.clone(), a.guard.is_some())).collect();
+            self.pending_matches.push(PendingMatch { ty: s.ty, arms: patterns, span });
         }
         Expr { ty, span, kind: ExprKind::Match { scrutinee: Box::new(s), arms: out, mutable } }
     }
 
-    fn check_exhaustive(&mut self, s: &Expr, arms: &[Arm], span: Span) {
-        let ty = self.infer.resolve(&self.p.types, s.ty);
+    pub(super) fn check_matches(&mut self) {
+        for PendingMatch { ty, arms, span } in std::mem::take(&mut self.pending_matches) {
+            let ty = self.infer.resolve(&self.p.types, ty);
+            if !matches!(self.p.types.kind(ty), TyKind::Error) {
+                self.check_exhaustive(ty, &arms, span);
+            }
+        }
+    }
+
+    fn check_exhaustive(&mut self, ty: TyId, arms: &[(Pat, bool)], span: Span) {
         let mut rows: Vec<Vec<DPat>> = Vec::new();
         // One budget for all the arms' checks (out of steps, an arm is taken to be needed),
         // another for the whole match's.
         let mut steps = Steps::new();
-        for arm in arms {
-            let d = self.dpat(&arm.pat);
+        for (pat, guarded) in arms {
+            let d = self.dpat(pat);
             if !useful(self.p, &rows, std::slice::from_ref(&d), &[ty], &mut steps) {
                 self.err(
                     Diagnostic::new(
                         codes::W0002,
-                        arm.pat.span,
+                        pat.span,
                         "this arm can never match: the arms before it cover everything it does",
                     )
                     .with_help("remove it, or move it before the arm that covers it"),
                 );
             }
-            if arm.guard.is_none() {
+            if !guarded {
                 rows.push(vec![d]);
             }
         }
@@ -759,9 +768,17 @@ impl<'p> Checker<'p> {
         match &p.kind {
             PatKind::Wild | PatKind::Bind(_) => DPat::Wild,
             PatKind::Lit(Lit::Bool(b)) => DPat::Ctor(Ctor::Variant(u32::from(*b)), Vec::new()),
-            // Keyed by value: `-0.0` is `0.0`, and `1.0` is `1`.
-            PatKind::Lit(Lit::Float(f, _)) if f.fract() == 0.0 && f.abs() < 9.0e15 => {
-                DPat::Lit(format!("{}", *f as i128))
+            // Keyed by the compared value: `-0.0` is `0.0`, and literals that round to
+            // the same float at the scrutinee's precision cover one another.
+            PatKind::Lit(l) if matches!(self.kind(p.ty), TyKind::Float(_)) => {
+                let value = match (self.kind(p.ty), l) {
+                    (TyKind::Float(FloatTy::F32), Lit::Float(_, f)) => f64::from(*f),
+                    (TyKind::Float(FloatTy::F32), Lit::Int(i)) => f64::from(*i as f32),
+                    (_, Lit::Float(f, _)) => *f,
+                    (_, Lit::Int(i)) => *i as f64,
+                    _ => return DPat::Lit(format!("{l:?}")),
+                };
+                DPat::Lit(if value == 0.0 { "0".into() } else { value.to_string() })
             }
             PatKind::Lit(Lit::Int(i)) => DPat::Lit(format!("{i}")),
             PatKind::Lit(l) => DPat::Lit(format!("{l:?}")),
@@ -1069,5 +1086,53 @@ fn constant_names(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn unreachable_float_patterns_compare_at_the_scrutinees_precision() {
+        for (ty, first, second, unreachable) in [
+            ("f32", "16777216.0", "16777217.0", true),
+            ("f32", "0.1", "0.100000001", true),
+            ("f32", "16777216", "16777217.0", true),
+            ("f32", "0", "-0.0", true),
+            ("f64", "16777216.0", "16777217.0", false),
+            ("f64", "0.1", "0.100000001", false),
+            ("f64", "9007199254740992", "9007199254740993.0", true),
+        ] {
+            for infer_later in [false, true] {
+                let (param, init, later) = if infer_later {
+                    (
+                        String::new(),
+                        format!("let value = {first}\n"),
+                        format!("let _typed: {ty} = value\n"),
+                    )
+                } else {
+                    (format!("value: {ty}"), String::new(), String::new())
+                };
+                let source = format!(
+                    "pub fn classify({param}) -> u32 {{\n\
+                         {init}\
+                         let result = match value {{\n\
+                             {first} => 1,\n\
+                             {second} => 2,\n\
+                             _ => 0,\n\
+                         }}\n\
+                         {later}\
+                         result\n\
+                     }}\n"
+                );
+                let mut diagnostics = Vec::new();
+                crate::check_program(crate::test_units(&source), &mut diagnostics);
+                assert!(!wrela_diag::has_errors(&diagnostics), "{source}: {diagnostics:#?}");
+                assert_eq!(
+                    diagnostics.iter().any(|d| d.code.as_str() == "W0002"),
+                    unreachable,
+                    "{source}: {diagnostics:#?}"
+                );
+            }
+        }
     }
 }
