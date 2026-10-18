@@ -26,7 +26,7 @@ from chrome_session import ChromeSession
 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCES = ("examples", "games", "engine", "compiler/std", "compiler/tests/fields",
+SOURCES = ("content", "examples", "games", "engine", "compiler/std", "compiler/tests/fields",
            "compiler/tests/math", "compiler/tests/sketches", "compiler/tests/numerics",
            "compiler/tests/render", "compiler/tests/queries", "compiler/tests/simd",
            "compiler/tests/input", "compiler/tests/lift", "compiler/tests/texels",

@@ -71,7 +71,7 @@ fn the_environments_bounded_art_and_collision_regressions_pass() {
     }
     let manifest = dir.join("wrela.toml");
     let mut text = std::fs::read_to_string(&manifest).expect("read map fixture manifest");
-    let great_tree = repo_root().join("examples/great-tree").display().to_string();
+    let great_tree = repo_root().join("content/great-tree").display().to_string();
     text.push_str(&format!("great_tree = {{ path = {great_tree:?} }}\n"));
     std::fs::write(manifest, text).expect("add great tree dependency");
     let declared = copied_map_test_count(&dir)
@@ -124,7 +124,7 @@ pub fn covered(last: vec4, count: u32, around: vec2) -> f32 { REACH }
     let manifest = dir.join("wrela.toml");
     let mut text = std::fs::read_to_string(&manifest).expect("read map fixture manifest");
     for dependency in ["climber", "fawn"] {
-        let path = repo_root().join("examples").join(dependency).display().to_string();
+        let path = repo_root().join("content").join(dependency).display().to_string();
         text.push_str(&format!("{dependency} = {{ path = {path:?} }}\n"));
     }
     std::fs::write(manifest, text).expect("add creature dependencies");

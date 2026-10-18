@@ -1,6 +1,6 @@
 //! AC7: the lens's test subjects, round 1's wolf and grazer (design-archive-2026-10:
-//! experiments/agent-authoring/), ported to the engine's creature API (examples/wolf,
-//! examples/grazer). Each port matches its WGSL original (compiler/tests/fixtures/round1/,
+//! experiments/agent-authoring/), ported to the engine's creature API (content/wolf,
+//! content/grazer). Each port matches its WGSL original (compiler/tests/fixtures/round1/,
 //! with round 1's helper library) within 0.5 mm at 128 points of `Box3::sample` near the
 //! surface; the original runs on the GPU, as round 1's tool ran it.
 
@@ -14,9 +14,9 @@ const LIMIT: f64 = 0.0005;
 const POINTS: usize = 128;
 const NEAR: f32 = 0.02;
 
-/// The subject `name`'s build (examples/<name>), shared by the suites.
+/// The subject `name`'s build (content/<name>), shared by the suites.
 fn built(name: &str) -> PathBuf {
-    super::built(&format!("../../examples/{name}"))
+    super::built(&format!("../../content/{name}"))
 }
 
 /// The first `n` of the subject's samples (`sample(seed, i)` in its box) within `NEAR` of its
@@ -108,7 +108,7 @@ fn the_grazer_matches_round_1s() {
 
 /// The subject `name`'s build with its package's literals lifted, shared as [`built`]'s is.
 fn lifted(name: &str) -> PathBuf {
-    super::built_lifted(&format!("../../examples/{name}"), &[name])
+    super::built_lifted(&format!("../../content/{name}"), &[name])
 }
 
 /// Every float literal of the subject's package is lifted, or its report says why; `wrela
@@ -124,7 +124,7 @@ fn lifts_every_literal(name: &str) {
     }
     let mut floats = 0;
     for f in r["files"].as_array().unwrap() {
-        let path = repo_root().join("examples").join(name).join(f["path"].as_str().unwrap());
+        let path = repo_root().join("content").join(name).join(f["path"].as_str().unwrap());
         let text = std::fs::read_to_string(path).unwrap();
         floats += wrela_syntax::lexer::lex(wrela_diag::FileId(0), &text)
             .tokens
@@ -150,7 +150,7 @@ fn lifts_every_literal(name: &str) {
         "{name}: each float literal is in the report once"
     );
     let planned = wrela_driver::edit::plan(
-        &repo_root().join("examples").join(name),
+        &repo_root().join("content").join(name),
         &super::lift::same_values(&r),
     )
     .expect("the same values plan");

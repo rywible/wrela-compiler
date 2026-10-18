@@ -157,13 +157,13 @@ fn hello_fields_own_tests_pass() {
 /// The wolf's walk (frame tests of 120 frames, AC7).
 #[test]
 fn the_wolfs_own_tests_pass() {
-    own_tests_pass("examples/wolf");
+    own_tests_pass("content/wolf");
 }
 
 /// The grazer's walk (frame tests of 120 frames, AC7).
 #[test]
 fn the_grazers_own_tests_pass() {
-    own_tests_pass("examples/grazer");
+    own_tests_pass("content/grazer");
 }
 
 const GAMEPLAY_FRAMES: u32 = 60;

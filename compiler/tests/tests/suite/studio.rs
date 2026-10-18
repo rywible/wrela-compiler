@@ -106,7 +106,7 @@ impl Subject {
         edits: &[(&str, &str)],
     ) -> (PathBuf, Vec<(PathBuf, String)>) {
         let pkg = super::scratch(&format!("studio-{name}-{tag}"));
-        wrela_tests::copy_package(&repo_root().join("examples").join(name), &pkg);
+        wrela_tests::copy_package(&repo_root().join("content").join(name), &pkg);
         let mut files = Vec::new();
         for path in wrela_tests::files_under(&pkg, &["wrela"]) {
             let mut text = std::fs::read_to_string(&path).expect("read");
@@ -382,7 +382,7 @@ fn the_studio_server_answers_only_this_machine() {
 #[test]
 fn nothing_of_the_studio_is_in_a_games_build() {
     let dir = super::scratch("studio-not-in-game");
-    wrela_tests::must_build(&repo_root().join("examples/wolf"), &dir);
+    wrela_tests::must_build(&repo_root().join("content/wolf"), &dir);
     let manifest = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
     for kernel in
         ["start_rays", "step_rays", "sample_grid", "snap_points", "show_canvas", "step_minima"]
@@ -397,7 +397,7 @@ fn nothing_of_the_studio_is_in_a_games_build() {
             String::from_utf8_lossy(text)
         );
     }
-    let toml = std::fs::read_to_string(repo_root().join("examples/wolf/wrela.toml")).unwrap();
+    let toml = std::fs::read_to_string(repo_root().join("content/wolf/wrela.toml")).unwrap();
     assert!(!toml.contains("studio"), "the wolf depends on the studio");
 }
 /// A ball 30 cm across on the ground, its spec (one check holds, one misses) and its blueprint
@@ -499,7 +499,7 @@ fn specs_blueprints_and_close_ups_answer_on_a_ball() {
     assert_eq!(off["framing"], "the subject", "{off}");
 }
 
-/// AC9 of #51: the great tree is a plant in wrela source (examples/great-tree, `engine::plant`),
+/// AC9 of #51: the great tree is a plant in wrela source (content/great-tree, `engine::plant`),
 /// and the lens draws it, probes it and drags its literals, as it does a creature's. A tree is
 /// ten times a creature's size: the lens searches for its bounds in a box that grows until it
 /// holds the subject, and its rays reach past the subject's far side.
