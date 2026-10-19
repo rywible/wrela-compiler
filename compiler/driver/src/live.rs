@@ -16,8 +16,8 @@
 //! page says which frame first showed a change), `/results/<file>` (test mode's results).
 
 use crate::http;
+use crate::lift::{Numbers, lifted_files, literal_values};
 use crate::lift::{Report, ReportLiteral};
-use crate::studio::{Numbers, lifted_files, literal_values};
 use std::collections::BTreeMap;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};

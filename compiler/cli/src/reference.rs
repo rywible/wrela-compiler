@@ -1188,7 +1188,7 @@ pub fn trimmed(solid: &Solid, part: &Part) -> Option<(Part, f64, f64)> {
 /// each end that's inside another part (a joint): from nothing where the run-on starts to all
 /// of it at the cap, so the part passes under its neighbour before it ends. A part that ended
 /// proud of its neighbour (by a fraction of a millimetre: two lofts' sections of one surface
-/// differ that much) left a step, which the lens drew as a line across the form (the torso's
+/// differ that much) left a step, which a render drew as a line across the form (the torso's
 /// front cap, the neck's at the withers). A table's `trim` is how much of its run-on axis went
 /// at each end.
 pub fn taper(sampled: &mut [Sampled]) {
@@ -1579,7 +1579,7 @@ pub fn write_package(
     Ok(())
 }
 
-const SUBJECT: &str = "// What the lens shows of this package: the replica.
+const SUBJECT: &str = "// The replica, as the package's subject.
 
 use engine::creature::Creature
 use replica::replica
@@ -2110,7 +2110,7 @@ pub fn deviation(
     })
 }
 
-/// The views the see-through rays look from: the sides, the top, the front, and the lens's
+/// The views the see-through rays look from: the sides, the top, the front, and a
 /// three-quarter view and its mirror image.
 pub const VIEWS: [(&str, V3); 5] = [
     ("side", [1.0, 0.0, 0.0]),

@@ -1,4 +1,4 @@
-//! AC7: the lens's test subjects, round 1's wolf and grazer (design-archive-2026-10:
+//! AC7: the authoring test subjects, round 1's wolf and grazer (design-archive-2026-10:
 //! experiments/agent-authoring/), ported to the engine's creature API (content/wolf,
 //! content/grazer). Each port matches its WGSL original (compiler/tests/fixtures/round1/,
 //! with round 1's helper library) within 0.5 mm at 128 points of `Box3::sample` near the

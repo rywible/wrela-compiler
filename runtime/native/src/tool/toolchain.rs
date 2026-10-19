@@ -78,10 +78,49 @@ pub trait Toolchain: Send + Sync {
         revision: Option<&str>,
         base: &Path,
     ) -> Result<Vec<(String, Vec<u8>)>, String>;
+    /// The answers to `queries` on the package in `package` (`wrela query --json`'s JSON), its
+    /// dependencies read from other directories as `overrides` says.
+    fn query(
+        &self,
+        job: &Job,
+        package: &Path,
+        queries: &[String],
+        overrides: &[(String, PathBuf)],
+    ) -> Result<String, String>;
+    /// Each file a lifted build's report (`lift.json`'s text) lifted, by its path in the report
+    /// (relative to the program's package), and each literal's value as the build has it.
+    fn lifted(&self, report: &str) -> Result<(Vec<String>, Vec<f32>), String>;
+    /// The values of a lifted build's literals in its lifted files as they are now, each read
+    /// by `read` by its path in the report: `None` if a file changed past its literals.
+    fn literal_values(
+        &self,
+        report: &str,
+        read: &dyn Fn(&str) -> Result<String, String>,
+    ) -> Result<Option<Vec<f32>>, String>;
+    /// Edits of a lifted build's literals, each by its index in the build and its new value,
+    /// planned by `wrela edit`'s code against the files as they are now (each read by `read`):
+    /// what to write, or why they're refused.
+    fn plan_literal_edits(
+        &self,
+        report: &str,
+        read: &dyn Fn(&str) -> Result<String, String>,
+        edits: &[(u32, f32)],
+    ) -> Result<LiteralEdits, String>;
+}
+
+/// Planned edits of a lifted build's literals: each file's path in the report, the hash of its
+/// text they were planned against (`std::lift::file_hash`'s) and its new text, and the answer
+/// once they're written (`wrela edit --json`'s, on one line); or, if they're refused, the
+/// refusal's answer, and no files.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LiteralEdits {
+    pub files: Vec<(String, String, String)>,
+    pub answer: String,
+    pub refused: bool,
 }
 
 /// How to build: through `wasm-opt`, lifting these packages, with these dependencies read from
-/// other directories (by name, wherever declared: a lens's subject), with SIMD or not, as a
+/// other directories (by name, wherever declared: a program written around another package), with SIMD or not, as a
 /// debug build or not.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuildOptions {
@@ -332,6 +371,30 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
                 let revision = b.str()?;
                 Op::Doc { packages, out, repository, revision }
             }
+            "query" => {
+                let package = b.str()?;
+                let queries = strs(b)?;
+                let n = b.u32()?;
+                let mut overrides = Vec::new();
+                for _ in 0..n.min(MOST_BYTES as u32) {
+                    overrides.push((b.str()?, b.str()?));
+                }
+                Op::Query { package, queries, overrides }
+            }
+            "literals" => Op::Literals { program: b.str()?, build: b.str()? },
+            "edit" => {
+                let program = b.str()?;
+                let build = b.str()?;
+                let n = b.u32()?;
+                if n as usize > MOST_BYTES / 8 {
+                    return Err("more edits than the request holds".into());
+                }
+                let mut edits = Vec::new();
+                for _ in 0..n {
+                    edits.push((b.u32()?, f32::from_bits(b.u32()?)));
+                }
+                Op::Edit { program, build, edits }
+            }
             _ => return Err(format!("the toolchain has no `{name}`")),
         };
         Ok(op)
@@ -379,6 +442,20 @@ enum Op {
         out: String,
         repository: String,
         revision: String,
+    },
+    Query {
+        package: String,
+        queries: Vec<String>,
+        overrides: Vec<(String, String)>,
+    },
+    Literals {
+        program: String,
+        build: String,
+    },
+    Edit {
+        program: String,
+        build: String,
+        edits: Vec<(u32, f32)>,
     },
 }
 
@@ -539,8 +616,171 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
             written.finish(job)?;
             out.u32(files.len() as u32);
         }
+        Op::Query { package, queries, overrides } => {
+            let dir = caps.dir_path(&package, false)?;
+            let mut dirs = Vec::new();
+            for (name, path) in overrides {
+                dirs.push((name, caps.dir_path(&path, false)?));
+            }
+            out.str(&toolchain.query(job, &dir, &queries, &dirs)?);
+        }
+        Op::Literals { program, build } => {
+            let lifted = Lifted::open(s, &program, &build, false)?;
+            let (paths, built) = toolchain.lifted(&lifted.report)?;
+            let mut roots = Vec::with_capacity(paths.len());
+            for p in &paths {
+                roots.push(lifted.root_path(p)?);
+            }
+            let values = toolchain.literal_values(&lifted.report, &|p| lifted.read(p))?;
+            out.u32(roots.len() as u32);
+            for r in &roots {
+                out.str(r);
+            }
+            out.u32(built.len() as u32);
+            for x in built {
+                out.u32(x.to_bits());
+            }
+            match values {
+                Some(v) => {
+                    out.u8(1).u32(v.len() as u32);
+                    for x in v {
+                        out.u32(x.to_bits());
+                    }
+                }
+                None => {
+                    out.u8(0);
+                }
+            }
+        }
+        Op::Edit { program, build, edits } => {
+            let lifted = Lifted::open(s, &program, &build, true)?;
+            let planned =
+                toolchain.plan_literal_edits(&lifted.report, &|p| lifted.read(p), &edits)?;
+            if job.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            out.str(&lifted.write(job, &planned)?);
+        }
     }
     Ok(out.0)
+}
+
+/// A lifted build and its program, for literal edits and values: the build's report
+/// (`lift.json`), and the program's package's real directory, which the report's paths are
+/// relative to. Each file is reached through its root (a write root, to edit), one part at a
+/// time following no link.
+struct Lifted<'a> {
+    s: &'a Services,
+    report: String,
+    program: PathBuf,
+    write: bool,
+}
+
+impl<'a> Lifted<'a> {
+    fn open(
+        s: &'a Services,
+        program: &str,
+        build: &str,
+        write: bool,
+    ) -> Result<Lifted<'a>, String> {
+        let program = s.caps.dir_path(program, false)?;
+        let bytes = s.caps.read_confined(&format!("{build}/lift.json"), MOST_SOURCE)?;
+        let report =
+            String::from_utf8(bytes).map_err(|_| format!("`{build}/lift.json` isn't UTF-8"))?;
+        Ok(Lifted { s, report, program, write })
+    }
+
+    /// The root path of the file at `rel` from the program's package.
+    fn root_path(&self, rel: &str) -> Result<String, String> {
+        let mut real = self.program.clone();
+        for part in rel.split('/') {
+            match part {
+                "" | "." => {}
+                ".." => {
+                    if !real.pop() {
+                        return Err(format!("`{rel}` leads above the file system's root"));
+                    }
+                }
+                p => real.push(p),
+            }
+        }
+        self.s.caps.root_path_of(&real, self.write)
+    }
+
+    /// The text of the file at `rel` from the program's package.
+    fn read(&self, rel: &str) -> Result<String, String> {
+        let path = self.root_path(rel)?;
+        let bytes = self.s.caps.read_confined(&path, MOST_SOURCE)?;
+        String::from_utf8(bytes).map_err(|_| format!("`{path}` isn't UTF-8"))
+    }
+
+    /// Writes `planned`, unless it's a refusal, or a file has changed since it was planned
+    /// (then nothing is written): the answer the edits give. The request's cancellation is
+    /// looked at before each file is read, and right before each file takes its old one's place:
+    /// a cancelled edit replaces no more files, and fails.
+    fn write(&self, job: &Job, planned: &LiteralEdits) -> Result<String, String> {
+        if planned.refused {
+            return Ok(planned.answer.clone());
+        }
+        let failed = |why: String| Ok(format!("{{\"why\":{},\"written\":false}}", json_text(&why)));
+        let mut paths = Vec::with_capacity(planned.files.len());
+        for (rel, hash, _) in &planned.files {
+            if job.cancelled() {
+                return Err(CANCELLED.into());
+            }
+            let checked = self.root_path(rel).and_then(|path| {
+                let now = self.s.caps.read_confined(&path, MOST_SOURCE)?;
+                let mut h = wrela_abi::hash::StateHash::new();
+                h.update(&now);
+                if h.hex() != *hash {
+                    return Err(format!(
+                        "{rel} changed since the edits were planned: nothing is written"
+                    ));
+                }
+                Ok(path)
+            });
+            match checked {
+                Ok(path) => paths.push(path),
+                Err(why) => return failed(why),
+            }
+        }
+        for (path, (_, _, text)) in paths.iter().zip(&planned.files) {
+            let before = || {
+                // A test's held replacement: it waits for the request's end, or the hold's.
+                if let Some((which, held)) = &self.s.hold
+                    && path.ends_with(which.as_str())
+                {
+                    let until = Instant::now() + *held;
+                    while !job.cancelled() && Instant::now() < until {
+                        std::thread::sleep(POLL);
+                    }
+                }
+                if job.cancelled() { Err(CANCELLED.to_string()) } else { Ok(()) }
+            };
+            match self.s.caps.replace_nofollow(path, text.as_bytes(), &before) {
+                Ok(()) => {}
+                Err(why) if why == CANCELLED => return Err(why),
+                Err(why) => return failed(why),
+            }
+        }
+        Ok(planned.answer.clone())
+    }
+}
+
+/// `text` as a JSON string, quoted.
+fn json_text(text: &str) -> String {
+    let mut out = String::from("\"");
+    for c in text.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// What a request the toolchain's work stopped for gives, if it stops between phases.

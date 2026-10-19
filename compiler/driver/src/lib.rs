@@ -25,9 +25,7 @@ pub mod query;
 pub mod reach;
 pub mod refactor;
 pub mod script;
-pub mod serve;
 pub mod shipped;
-pub mod studio;
 pub mod suite;
 pub mod tool_tests;
 pub mod workspace;
@@ -241,7 +239,7 @@ pub struct Scope {
     /// package's `build/consts` and the shared one ([`const_cache::dirs_of`]).
     pub cache: Option<Vec<std::path::PathBuf>>,
     /// Dependencies read from these directories, by name, wherever a manifest declares them:
-    /// the studio's lens gets its subject package this way.
+    /// a tool builds a program around another package this way.
     pub overrides: Vec<(String, std::path::PathBuf)>,
     /// Set to stop the compile: it stops at its next phase (loading, checking, constants,
     /// lowering a role, emitting) with [`CANCELLED`].
@@ -376,8 +374,7 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
 /// it, so a reader sees the old file or the whole new one.
 pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    // A temporary file of this write's own: the studio server's threads may write one file at
-    // once.
+    // A temporary file of this write's own: several threads may write one file at once.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
@@ -395,7 +392,7 @@ pub(crate) fn pretty(v: &serde_json::Value) -> String {
 }
 
 /// Loads and checks the package at `root`, and runs `f` on what checking found, with the
-/// sources: for queries over a program (`wrela studio`'s subject). The rendered errors if it
+/// sources: for queries over a program. The rendered errors if it
 /// doesn't load or check.
 pub fn with_checked<T: Send>(
     root: &Path,
@@ -433,17 +430,31 @@ pub fn with_partial<T: Send>(
     lower: bool,
     f: impl FnOnce(Partial<'_>) -> T + Send,
 ) -> Result<T, String> {
+    with_partial_in(root, lower, &Scope::default(), f)
+}
+
+/// [`with_partial`] within `scope`: it reads only what `scope` reaches, and stops if `scope`
+/// cancels it.
+pub fn with_partial_in<T: Send>(
+    root: &Path,
+    lower: bool,
+    scope: &Scope,
+    f: impl FnOnce(Partial<'_>) -> T + Send,
+) -> Result<T, String> {
     on_compiler_thread(|| {
-        let (sources, mut diagnostics, loaded) = load_with(root, &Overlay::new());
+        scope.stop()?;
+        let (sources, mut diagnostics, loaded) = load_scoped(root, &Overlay::new(), scope);
         let Some(Loaded { units, packages, dirs, .. }) = loaded else {
             return Err(wrela_diag::render::render_all(&sources, &diagnostics));
         };
+        scope.stop()?;
         let checked = wrela_sema::check_packages(units, &packages, &mut diagnostics);
+        scope.stop()?;
         let mut lowered = None;
         if lower && !has_errors(&diagnostics) {
             let mut data = wrela_lower::BuildData::default();
-            let cache = const_cache::dirs_of(root);
-            let reach = reach::Reach::anywhere();
+            let cache = scope.cache.clone().unwrap_or_else(|| const_cache::dirs_of(root));
+            let reach = scope.reach.clone();
             prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &reach);
             if !has_errors(&diagnostics) {
                 let roots = wrela_lower::Roots::every_fn(&checked);

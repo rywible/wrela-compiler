@@ -6,8 +6,8 @@ mod roundtrip;
 use std::path::{Path, PathBuf};
 
 /// The `.wrela` files under `dir`, in its subdirectories too, in a fixed order. A `build`
-/// directory is skipped: what a build writes there (a lens's copies of the studio's sources)
-/// isn't the repository's, and the gate writes it while these tests read.
+/// directory is skipped: what a build or a tool writes there isn't the repository's, and the
+/// gate writes it while these tests read.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();

@@ -339,6 +339,23 @@ pub(crate) struct Io {
     pub host: Option<HostHandler>,
     /// Don't show printed lines on stderr: the caller shows them ([`crate::Options::quiet`]).
     pub quiet: bool,
+    /// Its posts wait for the host's user, who takes them ([`Program::take_posts`]) and
+    /// answers each ([`Program::answer`]): a driven build's go to its tool. `post` answers none.
+    pub queue_posts: bool,
+}
+
+/// The most posts a program's host's user holds unanswered: past them, a post fails at once.
+pub(crate) const MOST_QUEUED_POSTS: usize = 64;
+
+/// The most bytes a queued post's body has: past them, it fails at once.
+pub(crate) const MOST_QUEUED_POST: usize = 512 << 10;
+
+/// A post waiting for the host's user to answer it: its request, its URL and its body.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedPost {
+    pub request: u32,
+    pub url: String,
+    pub body: Vec<u8>,
 }
 
 /// A post's answer, from the URL and the body.
@@ -393,6 +410,10 @@ struct Requests {
     waiting: Vec<u32>,
     /// IDs in this call's checked batches, before their requests are carried out.
     reserved: HashSet<u32>,
+    /// Posts that wait for the host's user ([`Io::queue_posts`]), not yet taken.
+    posts: Vec<QueuedPost>,
+    /// The requests of posts taken and not yet answered.
+    taken: HashSet<u32>,
 }
 
 impl Requests {
@@ -469,6 +490,26 @@ impl Requests {
                     None => Err("this host has no capability handler".to_string()),
                 };
                 (*request, a)
+            }
+            Command::Post { request, url, body } if self.io.queue_posts => {
+                self.start(*request, cmd.opcode())?;
+                let held = self.posts.len() + self.taken.len();
+                let refused = if held >= MOST_QUEUED_POSTS {
+                    Some(format!("{MOST_QUEUED_POSTS} posts already wait for an answer"))
+                } else if body.len() > MOST_QUEUED_POST {
+                    Some(format!("a post's body is at most {MOST_QUEUED_POST} bytes here"))
+                } else {
+                    None
+                };
+                if let Some(why) = refused {
+                    (*request, Err(why))
+                } else {
+                    self.waiting.push(*request);
+                    let post =
+                        QueuedPost { request: *request, url: url.to_string(), body: body.to_vec() };
+                    self.posts.push(post);
+                    return Ok(());
+                }
             }
             Command::Post { request, url, body } => {
                 self.start(*request, cmd.opcode())?;
@@ -1368,6 +1409,31 @@ impl<E: Executor> Program<E> {
         let requests = &mut self.store.data_mut().requests;
         requests.waiting.retain(|&r| r != request);
         requests.answered.insert(request, answer);
+    }
+
+    /// The posts that wait for the host's user since the last time ([`Io::queue_posts`]): each
+    /// waits until [`Program::answer_post`] answers it.
+    pub(crate) fn take_posts(&mut self) -> Vec<QueuedPost> {
+        let requests = &mut self.store.data_mut().requests;
+        let posts = std::mem::take(&mut requests.posts);
+        requests.taken.extend(posts.iter().map(|p| p.request));
+        posts
+    }
+
+    /// Answers post `request`, one [`Program::take_posts`] gave: the program sees the answer
+    /// from its next call on. An error if no such post waits.
+    pub(crate) fn answer_post(
+        &mut self,
+        request: u32,
+        answer: std::result::Result<Vec<u8>, String>,
+    ) -> std::result::Result<(), String> {
+        let requests = &mut self.store.data_mut().requests;
+        if !requests.taken.remove(&request) {
+            return Err(format!("no post {request} waits for an answer"));
+        }
+        requests.waiting.retain(|&r| r != request);
+        requests.answered.insert(request, answer);
+        Ok(())
     }
 
     /// What it keeps for the build that replaces it (`std::reload::keep`), so far.

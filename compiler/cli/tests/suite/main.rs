@@ -2,7 +2,6 @@
 
 mod audio;
 mod common;
-mod compare;
 mod doc;
 mod docs_chrome;
 mod drive;
@@ -12,7 +11,6 @@ mod query;
 mod refactor;
 mod script;
 mod solve;
-mod studio;
 mod suite;
 mod test;
 mod tool;

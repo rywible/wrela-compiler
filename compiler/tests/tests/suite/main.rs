@@ -63,7 +63,6 @@ mod spike13;
 mod stage;
 mod stair;
 mod std_docs;
-mod studio;
 mod subjects;
 mod sweep;
 mod test_items;

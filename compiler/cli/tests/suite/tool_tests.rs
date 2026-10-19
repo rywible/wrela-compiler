@@ -76,6 +76,32 @@ fn traps() {
     }
 }
 
+@test(tool, blobs: "1K")
+@job
+fn holds_its_blob_budget() {
+    // 2 KiB in a blob, past a budget of 1 KiB: the append fails, as a request past it does.
+    var n = std::tool::blob::new()
+    var made = n.poll()
+    while made.is_none() {
+        yield
+        made = n.poll()
+    }
+    let Some(mp) = take made else { panic("no answer") }
+    let Ok(b) = std::tool::blob::read_handle(take mp) else { panic("a blob") }
+    var bytes: Vec<u8> = Vec::new()
+    for _ in 0..2048 {
+        bytes.push(0)
+    }
+    var a = std::tool::blob::append(b, bytes)
+    var got = a.poll()
+    while got.is_none() {
+        yield
+        got = a.poll()
+    }
+    let Some(ap) = take got else { panic("no answer") }
+    assert(std::tool::answer(take ap).is_ok(), "past the test's blob budget")
+}
+
 @test(tool, budget: 1)
 @job
 fn spins_past_its_budget() {
@@ -96,6 +122,8 @@ fn spins_past_its_budget() {
     assert!(!passed && message.contains("on purpose"), "{message}");
     let (_, passed, message) = get("traps");
     assert!(!passed && message.contains("trapped"), "{message}");
+    let (_, passed, message) = get("holds_its_blob_budget");
+    assert!(!passed && message.contains("past the test's blob budget"), "{message}");
     let (_, passed, message) = get("spins_past_its_budget");
     assert!(!passed && message.contains("past its budget of 1 s"), "{message}");
 }
@@ -129,6 +157,7 @@ fn a_tool_test_is_a_job_of_no_parameters_in_a_package_with_a_tool_build() {
         ("@test(tool, net: [\"Game.Example\"])\n@job\nfn upper() {}\n", "E0222", "`net`"),
         ("@test(tool, run: [(\"x\", \"../out\")])\n@job\nfn out() {}\n", "E0222", "`run`"),
         ("@test(tool, frames: 3)\n@job\nfn frames() {}\n", "E0222", "takes `budget`"),
+        ("@test(tool, blobs: \"8X\")\n@job\nfn blobs() {}\n", "E0222", "`blobs` is a blob budget"),
         ("@test(tool)\n@fuel(100)\n@job\nfn fuel() {}\n", "E0108", "`@fuel`"),
         // A test of code is no job, and keeps a constant's effects.
         ("@test\n@job\nfn plain() {}\n", "E0336", "can't be a job"),

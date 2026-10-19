@@ -1,6 +1,6 @@
-//! The little HTTP the toolchain's local servers speak: the studio's and `wrela run`'s (the
-//! driver's `serve.rs` and `live.rs`), and a tool's (`std::tool::serve`, language.md §15.5). One
-//! request per connection, on 127.0.0.1 only. A request must name this machine as its host (so a
+//! The little HTTP the toolchain's local servers speak: `wrela run`'s (the driver's `live.rs`),
+//! and a tool's (`std::tool::serve`, language.md §15.5). One request per connection, on
+//! 127.0.0.1 only. A request must name this machine as its host (so a
 //! page elsewhere can't reach a server through DNS rebinding), and a post must come from the
 //! server's own pages (their `Origin`), so another site open in the browser can't change files. A
 //! put (test mode's results) isn't checked for its origin: a browser asks a server before another
@@ -289,7 +289,7 @@ pub fn put_result(
         if copied < length {
             return Err(std::io::Error::other("the result's body ended short of its length"));
         }
-        rename(&results, &tmp, name)
+        crate::confined::rename(&results, &tmp, name)
     })();
     if let Err(e) = written {
         undo(Some(&results), &tmp);
@@ -297,17 +297,6 @@ pub fn put_result(
         return Err(e);
     }
     respond(out, 201, "text/plain", b"").map(|()| true)
-}
-
-/// Renames `from` in `dir` to `to` in it: a link at `to` is replaced, not followed.
-#[cfg(unix)]
-fn rename(dir: &Dir, from: &str, to: &str) -> std::io::Result<()> {
-    rustix::fs::renameat(dir, from, dir, to).map_err(Into::into)
-}
-
-#[cfg(not(unix))]
-fn rename(_: &Dir, _: &str, _: &str) -> std::io::Result<()> {
-    Err(std::io::Error::other("a confined path needs a Unix"))
 }
 
 #[cfg(test)]

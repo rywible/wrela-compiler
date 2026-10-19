@@ -1357,13 +1357,13 @@ describe("posts", () => {
   const later = () => new Promise((r) => setTimeout(r, 0));
 
   test("go to the host's post, and fail without one", async () => {
-    const batch = new Encoder().post(4, "studio/echo", Uint8Array.of(1, 2, 3, 4)).finish();
+    const batch = new Encoder().post(4, "notes/reply", Uint8Array.of(1, 2, 3, 4)).finish();
     const io = {
       fetch: async () => new Uint8Array(0),
       storageRead: async () => new Uint8Array(0),
       storageWrite: async () => {},
       post: async (url: string, body: Uint8Array) => {
-        expect(url).toBe("studio/echo");
+        expect(url).toBe("notes/reply");
         return Uint8Array.from(body).reverse();
       },
     };

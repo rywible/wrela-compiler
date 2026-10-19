@@ -4,6 +4,7 @@
 //! | Query | Answer |
 //! |---|---|
 //! | `type <file>:<line>:<col>` | the type of the smallest expression, local or parameter there |
+//! | `fields <file>:<line>:<col>` | that type's path, and its public fields by their paths, through the structs they hold |
 //! | `callers <fn>` | each call of the function (through its trait too), and where |
 //! | `callees <fn>` | what the function calls, dispatches or draws, and where first |
 //! | `impls <trait or type>` | a trait's impls, or a type's |
@@ -35,13 +36,14 @@ use wrela_sema::program::Program;
 use wrela_sema::ty::{AdtId, FnId, ModuleId, TraitId, TyId, TyKind};
 
 /// What each query takes, for usage messages.
-pub const KINDS: &str = "type <file>:<line>:<col> | callers <fn> | callees <fn> | impls <trait-or-type> | \
+pub const KINDS: &str = "type <file>:<line>:<col> | fields <file>:<line>:<col> | callers <fn> | callees <fn> | impls <trait-or-type> | \
 effects <fn> | borrows <file>:<line> | instantiations <fn> | search <signature>";
 
 /// One query.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Query {
     Type { file: String, line: u32, column: u32 },
+    Fields { file: String, line: u32, column: u32 },
     Callers(String),
     Callees(String),
     Impls(String),
@@ -78,6 +80,10 @@ pub fn parse(text: &str) -> Result<Query, String> {
             let (file, v) = at(2)?;
             Query::Type { file, line: v[0], column: v[1] }
         }
+        "fields" => {
+            let (file, v) = at(2)?;
+            Query::Fields { file, line: v[0], column: v[1] }
+        }
         "borrows" => {
             let (file, v) = at(1)?;
             Query::Borrows { file, line: v[0] }
@@ -103,8 +109,18 @@ pub struct Answered {
 /// `query`, `error` if it couldn't be answered, and `unsure` if an error in the program could
 /// change it (see the top of this file). `Err` if the package doesn't load.
 pub fn answer(root: &Path, queries: &[(String, Query)]) -> Result<Answered, String> {
+    answer_in(root, queries, &crate::Scope::default())
+}
+
+/// [`answer`] within `scope` (a tool's toolchain service's): it reads only what `scope`
+/// reaches.
+pub fn answer_in(
+    root: &Path,
+    queries: &[(String, Query)],
+    scope: &crate::Scope,
+) -> Result<Answered, String> {
     let lower = queries.iter().any(|(_, q)| matches!(q, Query::Instantiations(_)));
-    crate::with_partial(root, lower, |part| {
+    crate::with_partial_in(root, lower, scope, |part| {
         let checked = part.checked;
         let ix = Index::new(checked, part.sources);
         let gaps = Gaps::new(ix.p, &part.errors);
@@ -116,6 +132,9 @@ pub fn answer(root: &Path, queries: &[(String, Query)]) -> Result<Answered, Stri
                 let answer = match (unknown, q) {
                     (Some(why), _) => Err(why),
                     (None, Query::Type { file, line, column }) => ix.type_at(file, *line, *column),
+                    (None, Query::Fields { file, line, column }) => {
+                        ix.fields_at(file, *line, *column)
+                    }
                     (None, Query::Callers(name)) => ix.callers(name),
                     (None, Query::Callees(name)) => ix.callees(name),
                     (None, Query::Impls(name)) => ix.impls(name),
@@ -225,7 +244,9 @@ impl<'a> Gaps<'a> {
         // A function a query names, unless the name names none (that's the query's own error).
         let named = |name: &str| ix.one_fn(name).ok().map(|(f, _)| f);
         match q {
-            Query::Type { file, line, column } => match at(file, *line, *column) {
+            Query::Type { file, line, column } | Query::Fields { file, line, column } => match at(
+                file, *line, *column,
+            ) {
                 Some(f) if self.unknown(ix, f) => inside(f),
                 f => (None, self.with_outside(f)),
             },
@@ -702,13 +723,96 @@ impl<'a> Index<'a> {
     }
 
     fn type_at(&self, file: &str, line: u32, column: u32) -> Result<Value, String> {
+        let (f, span, ty, what) = self.typed_at(file, line, column)?;
+        Ok(json!({
+            "at": self.at(span),
+            "text": self.p.text(span).unwrap_or(""),
+            "kind": what,
+            "type": self.p.display_ty(ty),
+            "in": self.fn_path(f),
+        }))
+    }
+
+    /// The fields of the type of what is at `file:line:column` ([`Index::type_at`]): the type,
+    /// its path as another package names it (`null` if it isn't a public struct or enum
+    /// without type arguments), and each public field of a struct by its path from it (`albedo`,
+    /// `albedo.r`), with its type, through the public fields of the structs it holds, four
+    /// deep.
+    fn fields_at(&self, file: &str, line: u32, column: u32) -> Result<Value, String> {
+        let (f, span, ty, _) = self.typed_at(file, line, column)?;
+        let ty = self.checked.reveal(ty);
+        let mut fields = Vec::new();
+        self.public_fields(ty, "", 0, &mut fields);
+        Ok(json!({
+            "at": self.at(span),
+            "text": self.p.text(span).unwrap_or(""),
+            "type": self.p.display_ty(ty),
+            "path": self.type_path(ty),
+            "in": self.fn_path(f),
+            "fields": fields,
+        }))
+    }
+
+    /// The path another package names `ty` by: its package's name (or `std`), its module's
+    /// path and its name; `None` if it isn't a public struct or enum without type arguments.
+    fn type_path(&self, ty: TyId) -> Option<String> {
+        let p = self.p;
+        let TyKind::Adt(a, args) = p.types.kind(ty) else { return None };
+        let adt = p.adt(*a);
+        if !args.is_empty() || !adt.public {
+            return None;
+        }
+        let module = &p.module(adt.module).path;
+        let package = p.package_of(adt.module);
+        let mut parts: Vec<&str> = Vec::new();
+        if package.kind != wrela_sema::defs::PackageKind::Std
+            && module.first() != Some(&package.name)
+        {
+            parts.push(&package.name);
+        }
+        parts.extend(module.iter().map(String::as_str));
+        parts.push(&adt.name);
+        Some(parts.join("::"))
+    }
+
+    /// The public fields of a struct of type `t`, each by its path from `prefix`, with its
+    /// type, into `out`, and theirs, to depth 4.
+    fn public_fields(&self, t: TyId, prefix: &str, depth: u32, out: &mut Vec<Value>) {
+        let p = self.p;
+        if depth >= 4 {
+            return;
+        }
+        let TyKind::Adt(a, args) = p.types.kind(t) else { return };
+        let adt = p.adt(*a);
+        if adt.is_enum() {
+            return;
+        }
+        for (fd, ft) in adt.fields().iter().zip(p.fields_of(*a, args, None)) {
+            if !fd.public {
+                continue;
+            }
+            let path =
+                if prefix.is_empty() { fd.name.clone() } else { format!("{prefix}.{}", fd.name) };
+            out.push(json!({ "path": path, "type": p.display_ty(ft) }));
+            self.public_fields(ft, &path, depth + 1, out);
+        }
+    }
+
+    /// The function at `file:line:column`, and the smallest parameter, local or expression of
+    /// its code there: its span, its type and which of these it is.
+    fn typed_at(
+        &self,
+        file: &str,
+        line: u32,
+        column: u32,
+    ) -> Result<(FnId, Span, TyId, &'static str), String> {
         let file = self.file(file)?;
         let offset = self.offset(file, line, column)?;
         let f = self.fn_at(file, offset).ok_or("no function's code is there")?;
         let body = &self.checked.mir[&f];
         let def = self.p.func(f);
         // Every span with a type: parameters, locals, operands and what's assigned.
-        let mut found: Vec<(Span, TyId, &str)> = Vec::new();
+        let mut found: Vec<(Span, TyId, &'static str)> = Vec::new();
         for prm in &def.params {
             found.push((prm.span, prm.ty, "parameter"));
         }
@@ -717,7 +821,7 @@ impl<'a> Index<'a> {
                 found.push((l.span, l.ty, "local"));
             }
         }
-        let operand = |o: &Operand, found: &mut Vec<(Span, TyId, &str)>| {
+        let operand = |o: &Operand, found: &mut Vec<(Span, TyId, &'static str)>| {
             if !matches!(o.kind, OperandKind::Const(_)) || o.span.end > o.span.start {
                 found.push((o.span, o.ty, "expression"));
             }
@@ -764,13 +868,7 @@ impl<'a> Index<'a> {
             })
             .min_by_key(|(s, _, _)| (s.end - s.start, s.start))
             .ok_or("nothing with a type is there")?;
-        Ok(json!({
-            "at": self.at(span),
-            "text": self.p.text(span).unwrap_or(""),
-            "kind": what,
-            "type": self.p.display_ty(ty),
-            "in": self.fn_path(f),
-        }))
+        Ok((f, span, ty, what))
     }
 
     /// Each use of `f`, by any function: the user, how and where.

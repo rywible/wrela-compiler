@@ -44,7 +44,7 @@ fn golden_bytes() {
         words(&[21, 24, 4, 14]), // Fetch
         b"data/level.bin\0\0".to_vec(),
         words(&[23, 28, 5, 11, 2]), // Post
-        b"studio/edit\0".to_vec(),
+        b"notes/write\0".to_vec(),
         vec![123, 125, 0, 0],
         words(&[24, 32, 1, 3, 0, 12, 3, 16, 0, 0]), // DrawIndexedIndirect
         words(&[25, 12, 7]),                        // Label

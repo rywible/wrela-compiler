@@ -89,8 +89,21 @@ fn both_hosts_agree_with_any_workers() {
             wrela_tests::ChromeRun { workers, ..wrela_tests::ChromeRun::new(FRAMES, 16, 16, 60.0) };
         let chrome = wrela_tests::run_in_chrome_with(&rel, run);
         assert_eq!(chrome.hash, want, "Chrome with {workers} workers");
-        // Chrome starts its workers while the program runs: they join in by the later frames.
-        assert_eq!(chrome.worker_chunks > 0, workers > 1, "Chrome's workers ran chunks");
+        // Chrome starts its workers while the program runs: they join in by the later frames,
+        // and on a busy machine more frames may pass before one helps (as on the CPU host), so
+        // a run whose workers ran nothing is followed by longer ones.
+        let mut chunks = chrome.worker_chunks;
+        for _ in 0..3 {
+            if workers == 1 || chunks > 0 {
+                break;
+            }
+            let longer = wrela_tests::ChromeRun {
+                workers,
+                ..wrela_tests::ChromeRun::new(FRAMES * 10, 16, 16, 60.0)
+            };
+            chunks = wrela_tests::run_in_chrome_with(&rel, longer).worker_chunks;
+        }
+        assert_eq!(chunks > 0, workers > 1, "Chrome's workers ran chunks");
     }
 }
 

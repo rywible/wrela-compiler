@@ -16,8 +16,8 @@
 use cap_std::ambient_authority;
 use cap_std::fs::{Dir, File, FileType, OpenOptions};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 /// The most bytes a whole file read or written at once holds (`std::tool::MOST_BYTES`): a larger
 /// one goes through a blob.
@@ -649,6 +649,78 @@ impl Caps {
         }
         let (dir, rel) = self.file(path, true)?;
         crate::confined::read(dir, rel, most).map(Some)
+    }
+
+    /// The bytes of the regular file at `path` in any root, at most `most`, reached one part at
+    /// a time following no link.
+    pub(crate) fn read_confined(&self, path: &str, most: u64) -> Result<Vec<u8>, String> {
+        let (dir, rel) = self.file(path, false)?;
+        crate::confined::read(dir, rel, most)
+    }
+
+    /// Replaces the regular file at `path` in a write root with `bytes`, following no link: they
+    /// go to a new file beside it, which then takes its place, so a reader sees the old file or
+    /// the whole new one, and a failed write leaves the old one. `before` is asked right before
+    /// the new file takes the old one's place: its error leaves the old file, and is the error.
+    pub(crate) fn replace_nofollow(
+        &self,
+        path: &str,
+        bytes: &[u8],
+        before: &dyn Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.kind_nofollow(path)? != Some(Kind::File) {
+            return Err(format!("`{path}` isn't a regular file reached without a link"));
+        }
+        let (at, name) = self.parent_nofollow(path, false)?;
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = format!(".{name}.tmp-{}-{n}", std::process::id());
+        let written = (|| {
+            let mut file = crate::confined::open_file(&at, &tmp, true)?;
+            file.set_len(0)?;
+            file.write_all(bytes)?;
+            file.sync_all()
+        })()
+        .map_err(|e| failed(path, e))
+        .and_then(|()| before())
+        .and_then(|()| crate::confined::rename(&at, &tmp, &name).map_err(|e| failed(path, e)));
+        if written.is_err() {
+            let _ = crate::confined::remove(&at, &tmp, false);
+        }
+        written
+    }
+
+    /// The root path (`NAME/rel`) of the real path `real` (with no `.` or `..` part): in the
+    /// deepest root whose directory holds it, a write root if `write`.
+    pub(crate) fn root_path_of(&self, real: &Path, write: bool) -> Result<String, String> {
+        let mut best: Option<(&str, PathBuf, usize)> = None;
+        for (name, r) in &self.roots {
+            if write && !r.write {
+                continue;
+            }
+            let dir = r.path.canonicalize().unwrap_or_else(|_| r.path.clone());
+            if let Ok(rest) = real.strip_prefix(&dir) {
+                let depth = dir.components().count();
+                if best.as_ref().is_none_or(|(_, _, d)| depth > *d) {
+                    best = Some((name, rest.to_path_buf(), depth));
+                }
+            }
+        }
+        let Some((name, rest, _)) = best else {
+            let kind = if write { "write root" } else { "root" };
+            return Err(format!("`{}` isn't in a granted {kind}", real.display()));
+        };
+        let mut out = name.to_string();
+        for c in rest.components() {
+            match c {
+                std::path::Component::Normal(part) => {
+                    out.push('/');
+                    out.push_str(&part.to_string_lossy());
+                }
+                _ => return Err(format!("`{}` isn't a plain path", real.display())),
+            }
+        }
+        Ok(out)
     }
 
     /// Removes the regular file at `path` in a write root, if one is there, following no link:

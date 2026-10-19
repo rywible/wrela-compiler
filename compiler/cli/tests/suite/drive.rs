@@ -595,3 +595,158 @@ fn a_driven_fetch_reads_the_build_opened_at_load() {
     assert!(printed.contains("log fetched 6 bytes"), "the build as opened: {printed}");
     assert!(!printed.contains("17 bytes"), "nothing from where the link leads: {printed}");
 }
+
+/// A program that posts to `notes/a` and `notes/b` on its first frame, and on each later frame
+/// says what each post got, and posts to `notes/c`, which nothing answers.
+const POSTER: &str = r#"
+use std::io::{Pending, post, print}
+
+pub struct Game {
+    asked: Vec<Pending<u8>>,
+}
+
+pub fn init() -> Game {
+    Game { asked: Vec::new() }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if game.asked.is_empty() {
+        game.asked.push(post("notes/a", [u8(1), 2]))
+        game.asked.push(post("notes/b", [u8(3)]))
+        return
+    }
+    for i in 0..game.asked.len() {
+        match game.asked[i].poll() {
+            Some(Ok(bytes)) => print(f"post {i}: {bytes.len()} bytes"),
+            Some(Err(e)) => print(f"post {i} failed: {e.message()}"),
+            None => {},
+        }
+    }
+    game.asked.push(post("notes/c", [u8(4)]))
+}
+"#;
+
+/// A tool that drives the poster: its posts, answered (the first), failed (the second), and
+/// answered again (refused), then a frame, and the build closed with a post unanswered.
+const POST_TOOL: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, answer, args}
+use std::tool::blob::Data
+use std::tool::drive
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var l = drive::load("src/build", drive::cpu())
+    var loaded = l.poll()
+    while loaded.is_none() {
+        yield
+        loaded = l.poll()
+    }
+    let Some(lp) = take loaded else { return 90 }
+    let Ok(it) = drive::read_loaded(take lp) else { return 91 }
+    let b = it.build
+    var i = drive::init(b)
+    while i.poll().is_none() { yield }
+    var f = drive::frames(b, 1, std::input::Script::frames())
+    while f.poll().is_none() { yield }
+    var p = drive::posts(b)
+    var got = p.poll()
+    while got.is_none() {
+        yield
+        got = p.poll()
+    }
+    let Some(pp) = take got else { return 92 }
+    let Ok(posts) = drive::read_posts(take pp) else { return 93 }
+    for post in posts {
+        let Data::Bytes(body) = post.body.clone() else { return 94 }
+        print(f"posted {post.url.as_str()} {body.len()}")
+    }
+    var a = drive::answer(b, posts[0].id, Data::Bytes(Vec::from([u8(7), 8, 9])))
+    var answered = a.poll()
+    while answered.is_none() {
+        yield
+        answered = a.poll()
+    }
+    let Some(ap) = take answered else { return 95 }
+    print(f"answered {answer(take ap).is_ok()}")
+    var x = drive::fail(b, posts[1].id, "no")
+    while x.poll().is_none() { yield }
+    var again = drive::answer(b, posts[0].id, Data::empty())
+    var twice = again.poll()
+    while twice.is_none() {
+        yield
+        twice = again.poll()
+    }
+    let Some(tp) = take twice else { return 96 }
+    print(f"answered twice {answer(take tp).is_ok()}")
+    var g = drive::frames(b, 1, std::input::Script::frames())
+    while g.poll().is_none() { yield }
+    var o = drive::logs(b)
+    var logged = o.poll()
+    while logged.is_none() {
+        yield
+        logged = o.poll()
+    }
+    let Some(op) = take logged else { return 97 }
+    let Ok(lines) = drive::read_logs(take op) else { return 98 }
+    for line in lines.lines {
+        print(f"log {line.as_str()}")
+    }
+    // The post to `notes/c` waits: closing the build gives it up.
+    var c = drive::close(b)
+    while c.poll().is_none() { yield }
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// A driven build's posts go to the tool: each is given once, with its URL and body, and
+/// answered or failed once; the program reads the answers from its next call on. A build closed
+/// with a post unanswered closes at once.
+#[test]
+fn a_driven_builds_posts_go_to_the_tool() {
+    let dir = package(
+        "drive-posts",
+        &[
+            ("tool/wrela.toml", &manifest("poster_tool")),
+            ("tool/main.wrela", POST_TOOL),
+            ("subject/wrela.toml", &manifest("poster")),
+            ("subject/main.wrela", POSTER),
+        ],
+    );
+    let (tool, src, out) = (dir.join("tool"), dir.join("src"), dir.join("out"));
+    std::fs::create_dir_all(&out).expect("out");
+    let built = wrela()
+        .arg("build")
+        .arg(dir.join("subject"))
+        .arg("-o")
+        .arg(src.join("build"))
+        .output()
+        .expect("wrela build");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let started = Instant::now();
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &[]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(started.elapsed() < Duration::from_secs(30), "closing gave the post up");
+    for line in [
+        "posted notes/a 2",
+        "posted notes/b 1",
+        "answered true",
+        "answered twice false",
+        "log post 0: 3 bytes",
+        "log post 1 failed",
+    ] {
+        assert!(printed.contains(line), "{line}: {printed}");
+    }
+}

@@ -73,6 +73,9 @@ pub struct Spec {
     /// Whether it may start Chrome (`browser: true`), on the real clock.
     #[serde(default)]
     pub browser: bool,
+    /// Its blob budget (`blobs: "8M,64"`), if it gives one.
+    #[serde(default)]
+    pub blobs: Option<String>,
     /// The fake clock's date at the start: seconds since 1970.
     pub utc: u64,
     /// Where the process writes how the run ended ([`Ended`]).
@@ -225,6 +228,7 @@ fn one(
         run,
         read,
         browser: test.browser,
+        blobs: test.blobs.clone(),
         utc: START_UTC,
         ended: own.join("ended.json"),
         groups: own.join("groups.txt"),

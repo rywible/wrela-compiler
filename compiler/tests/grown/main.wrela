@@ -1,8 +1,8 @@
 // Memory one thread grew, used by the others. In Chrome, a helper whose instance started while
 // the program's thread was growing the shared memory went on seeing an old size, so a block std's
-// allocator gave it from memory grown since was out of bounds to it (the map lens: its `init`
+// allocator gave it from memory grown since was out of bounds to it (a program whose `init`
 // grew the heap for its fonts and renderer while the helpers started, and the helpers that ran
-// its preview's parallel jobs trapped). compiler/tests/tests/suite/threads.rs runs it.
+// its parallel jobs trapped). compiler/tests/tests/suite/threads.rs runs it.
 
 use std::io::print
 use std::par::{Task, spawn}

@@ -275,6 +275,16 @@ fn a_served_write_root_answers_files_refusals_posts_and_results() {
         let r = exchange(port, &request(port, "POST", "/echo", origin, b"x"));
         assert!(r.starts_with("HTTP/1.1 403"), "a post from {origin:?}: {r}");
     }
+    // It listens on the loopback address alone: this machine's other addresses reach nothing.
+    let outside = std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|u| u.connect("192.0.2.1:9").and_then(|_| u.local_addr()))
+        .map(|a| a.ip());
+    if let Ok(ip) = outside
+        && !ip.is_loopback()
+        && !ip.is_unspecified()
+    {
+        assert!(std::net::TcpStream::connect((ip, port)).is_err(), "the server answered on {ip}");
+    }
 
     // A post's answer is the tool's, inline or through a blob.
     let echoed = exchange(port, &request(port, "POST", "/echo?k=v", Some(&own), b"hello"));

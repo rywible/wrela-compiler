@@ -16,6 +16,10 @@ import runner
 
 
 class Selection(unittest.TestCase):
+    def test_a_step_and_a_program_never_share_a_log(self):
+        self.assertNotEqual(check.log_name("wrela-suite"), check.log_name("wrela::suite"))
+        self.assertEqual(check.log_name("wrela-tests::suite"), "wrela-tests__suite")
+
     def test_only_zero_or_one_name_is_valid(self):
         self.assertIsNone(check.selection([]))
         self.assertEqual(check.selection(['a::test']), 'a::test')

@@ -66,6 +66,11 @@ mod unix {
         Ok(file)
     }
 
+    /// Renames `from` in `dir` to `to` in it: a link at `to` is replaced, not followed.
+    pub(crate) fn rename(dir: &Dir, from: &str, to: &str) -> std::io::Result<()> {
+        rustix::fs::renameat(dir, from, dir, to).map_err(Into::into)
+    }
+
     /// Removes the file, link (itself) or empty directory `name` in `dir`.
     pub(crate) fn remove(dir: &Dir, name: &str, is_dir: bool) -> std::io::Result<()> {
         let flags = if is_dir { AtFlags::REMOVEDIR } else { AtFlags::empty() };
@@ -74,7 +79,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub(crate) use unix::{make_dir, open_dir, open_file, remove};
+pub(crate) use unix::{make_dir, open_dir, open_file, remove, rename};
 
 #[cfg(not(unix))]
 pub(crate) fn open_dir(_: &Dir, _: &[&str], _: bool) -> std::io::Result<Dir> {
@@ -88,6 +93,11 @@ pub(crate) fn open_file(_: &Dir, _: &str, _: bool) -> std::io::Result<std::fs::F
 
 #[cfg(not(unix))]
 pub(crate) fn make_dir(_: &Dir, _: &str) -> std::io::Result<bool> {
+    Err(std::io::Error::other("a confined path needs a Unix"))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn rename(_: &Dir, _: &str, _: &str) -> std::io::Result<()> {
     Err(std::io::Error::other("a confined path needs a Unix"))
 }
 

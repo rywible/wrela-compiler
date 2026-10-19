@@ -1,7 +1,7 @@
 //! Embeds the explanations `wrela explain` prints (explain/<code>.wrela), one per diagnostic
 //! code, as a table: `src/explain.rs` reads them. Also embeds the conformance suite's cases, for
-//! `wrela primer`, and the packages `wrela studio` writes beside the lens's program; and the
-//! identity of the code that computes a constant, for the constants cache's keys.
+//! `wrela primer`, and the identity of the code that computes a constant, for the constants
+//! cache's keys.
 
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -22,23 +22,6 @@ fn main() {
     let cases =
         walk(&root.join("compiler/tests/conformance"), &|_| true, &|n| n.ends_with(".wrela"));
     out("conformance.rs", &table("CASES", "&str", "include_str", &cases));
-    // The studio's packages (studio/ and ui/), so the command works from any directory: each
-    // package's modules, manifest, fonts and their licences, not its tests or build output, by
-    // path from it.
-    let mut packages = String::new();
-    for (name, dir) in [("STUDIO", "studio"), ("UI", "ui")] {
-        let skip =
-            |n: &str| ["tests", "build", "results", "target"].contains(&n) || n.starts_with('.');
-        let keep = |n: &str| {
-            n.ends_with(".wrela")
-                || n == "wrela.toml"
-                || n.ends_with(".ttf")
-                || (n.starts_with("OFL") && n.ends_with(".txt"))
-        };
-        let files = walk(&root.join(dir), &|n| !skip(n), &keep);
-        packages.push_str(&table(name, "&[u8]", "include_bytes", &files));
-    }
-    out("packages.rs", &packages);
     // What a computed constant's value depends on beside its WASM, the fuel and the format
     // (const_cache.rs's key): the code that runs it and reads it back, and the host it runs
     // in. Their sources' hash is in each key, so a cache shared by checkouts of other commits

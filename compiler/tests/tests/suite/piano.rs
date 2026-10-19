@@ -64,7 +64,7 @@ fn a_mistake_in_a_score_fails_the_build_where_it_is() {
     }
 }
 
-/// Every number of the taste and the marks is lifted, so the lens's tools can change it while
+/// Every number of the taste and the marks is lifted, so a tool can change it while
 /// the piece plays (AC4).
 #[test]
 fn every_number_of_the_performance_is_lifted() {

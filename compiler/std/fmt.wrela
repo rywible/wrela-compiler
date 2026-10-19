@@ -12,7 +12,7 @@
 // NaN is `NaN`, infinities are `inf` and `-inf`.
 //
 // `json_text` and `json_number` write text and floats as JSON, for tools that read a program's
-// answers (the studio's lens, a lifted build's checks).
+// answers (a lifted build's checks).
 
 use std::math::is_finite
 

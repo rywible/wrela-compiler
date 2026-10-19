@@ -191,6 +191,18 @@ pub(crate) fn tokens(text: &str) -> Vec<(TokenKind, String)> {
 /// each file's new text and what changed, or why they're refused. Nothing is written here
 /// ([`write`] does).
 pub fn plan(root: &Path, edits: &[LiteralEdit]) -> Result<Vec<FileEdit>, Refused> {
+    plan_with(
+        &|file| std::fs::read_to_string(root.join(file)).map_err(|e| format!("can't read it: {e}")),
+        edits,
+    )
+}
+
+/// [`plan`], each file read by `read` by its path in the edits: a tool's files are read through
+/// its grants.
+pub fn plan_with(
+    read: &dyn Fn(&str) -> Result<String, String>,
+    edits: &[LiteralEdit],
+) -> Result<Vec<FileEdit>, Refused> {
     let mut by_file: BTreeMap<&str, Vec<&LiteralEdit>> = BTreeMap::new();
     for e in edits {
         by_file.entry(e.file.as_str()).or_default().push(e);
@@ -198,9 +210,7 @@ pub fn plan(root: &Path, edits: &[LiteralEdit]) -> Result<Vec<FileEdit>, Refused
     let mut out = Vec::new();
     for (file, mut list) in by_file {
         let refuse = |why: String| Refused { file: file.to_string(), why };
-        let path = root.join(file);
-        let text =
-            std::fs::read_to_string(&path).map_err(|e| refuse(format!("can't read it: {e}")))?;
+        let text = read(file).map_err(refuse)?;
         let hash = crate::lift::file_hash(text.as_bytes());
         for e in &list {
             if e.hash != hash {

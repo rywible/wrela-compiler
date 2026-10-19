@@ -388,6 +388,15 @@ fn test(dir: &std::path::Path) -> ExitCode {
         (Ok(caps), Ok(wasm)) => {
             let mut options = Options::new(caps);
             options.timeout = Some(Duration::from_secs_f64(spec.budget));
+            if let Some(b) = &spec.blobs {
+                match BlobBudget::parse(b) {
+                    Ok(budget) => options.blob_budget = budget,
+                    Err(why) => {
+                        eprintln!("error: a tool test's spec: {why}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
             options.entries = (spec.init.clone(), spec.resume.clone());
             options.fake_clock = Some((spec.utc, 0));
             // A live browser keeps the system's time: the clock doesn't jump past its page.

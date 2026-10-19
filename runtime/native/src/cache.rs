@@ -1,12 +1,11 @@
 //! Compiled code, kept beside a build: compiling a program's WASM is most of the time it takes
-//! to load (the lens on the wolf: 1.5 s of 2.2), and an agent's actions load the same build
-//! over and over. The first load writes the module's compiled code to
+//! to load (a large program's 1.5 s of 2.2), and a tool's runs load the same build over and
+//! over. The first load writes the module's compiled code to
 //! `<build>/.native/game-<hash>-<arch>.cwasm` (the hash is the WASM's, the arch the machine's);
-//! later loads of the same WASM read it back. `wrela studio` writes it right after building the
-//! lens (`precompile`). With `WRELA_NATIVE_CACHE` naming a directory, every build keeps its code
-//! there instead (the tests' builds, made afresh each run with mostly the same WASM), and code
-//! written more than a day before is removed as new code is written. A build made for one run
-//! keeps none beside it.
+//! later loads of the same WASM read it back. With `WRELA_NATIVE_CACHE` naming a directory,
+//! every build keeps its code there instead (the tests' builds, made afresh each run with mostly
+//! the same WASM), and code written more than a day before is removed as new code is written. A
+//! build made for one run keeps none beside it.
 //!
 //! Reading compiled code back is `unsafe` in wasmtime: the bytes become executable code, so they
 //! must be what `Module::serialize` wrote. Wasmtime checks that they were written by its own
@@ -19,12 +18,6 @@ use crate::error::{Error, Result};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Module};
-
-/// The start of the names of `wasm`'s compiled code in a build's `.native` directory: each
-/// machine's code, and code that counts fuel, is a file of its own.
-pub fn compiled_code_prefix(wasm: &[u8]) -> String {
-    stem(wrela_abi::ticks::wasm_hash(wasm))
-}
 
 /// The start of the names of the compiled code of the WASM whose hash is `hash`: `game-` and
 /// the hash.

@@ -39,8 +39,8 @@ pub fn flatten_gpu(m: &mut Module) -> Result<()> {
         promote(m, &mut f);
         forward_stores(m, &mut f);
         dce(&mut f);
-        // An inlined function given a constant `bool` keeps only the branch it takes (the lens's
-        // `isolate: false`), as the CPU's inlining does.
+        // An inlined function given a constant `bool` keeps only the branch it takes (an
+        // `isolate: false` argument), as the CPU's inlining does.
         fold_constant_branches(&mut f);
         collapse_rebuilds(&mut f);
         cse(&mut f);
@@ -871,7 +871,7 @@ fn callee_order(m: &Module) -> Result<(Vec<usize>, Vec<u32>)> {
 /// (`specialize_uniform_calls`). (Entry points are written whole.)
 fn outlined(m: &mut Module) -> Vec<bool> {
     // Small arguments' functions stay calls only where the inlined shader would be too big
-    // to write (a creature's, the lens's): elsewhere every call is inlined, as M1 measured
+    // to write (a creature's): elsewhere every call is inlined, as M1 measured
     // fastest (a branch-free kernel the GPU compiler sees whole). There, a function given the
     // same uniform data from several places is specialized to it first, so it can stay a call.
     let Ok((order, calls)) = callee_order(m) else { return vec![false; m.functions.len()] };
@@ -1058,7 +1058,7 @@ fn uniform_loads(
 
 /// The size of an entry point inlined whole, in statements, past which functions that take
 /// few arguments stay calls. M1's fields are at most half of it; sketch 02's shaders and the
-/// wolf's and the lens's are over (up to twelve times), and would be MBs of WGSL.
+/// wolf's are over (up to twelve times), and would be MBs of WGSL.
 const INLINE_LIMIT: usize = 16000;
 
 /// The size of a flattened module (`flattened_size`), in statements, past which functions given

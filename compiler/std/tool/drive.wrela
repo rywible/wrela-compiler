@@ -14,12 +14,17 @@
 //
 // Every operation that runs the program says when it started (seconds since the build loaded),
 // how long it took, and when each frame or tick started and ended, so a tool can time them.
+//
+// A driven build's posts (`std::io::post`) go to the tool: `posts` gives those it made, and
+// `answer` answers each (or `fail` fails it), which the program reads from its next call on. A build holds at most 64
+// posts unanswered, each of at most 512 KiB; past them, a post fails at once.
 
 use std::input::Script
 use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
-use std::tool::blob::{Data, read_data}
+use std::tool::{ToolError, ask, malformed}
+use std::tool::answer as answer_bytes
+use std::tool::blob::{Data, read_data, write_data}
 
 /// How a GPU build's passes and dispatches are timed (`wrela-host --timestamps`): not at all,
 /// beside each other, or each alone.
@@ -136,11 +141,12 @@ pub struct Capture: Clone {
     pub rgba: Data,
 }
 
-/// The lines a build printed since the last `logs`, and how many more there were than an answer
-/// holds (4096).
+/// The lines a build printed since the last `logs`, the oldest first, and how many more wait
+/// for the next `logs`: an answer holds at most 4096 lines and 512 KiB of them (a line of more
+/// than 256 KiB is cut, with a note).
 pub struct Logs: Clone {
     pub lines: Vec<String>,
-    pub dropped: u32,
+    pub waiting: u32,
 }
 
 /// A phase a build timed (`std::time::phase`): its name, its seconds summed, how many times.
@@ -148,6 +154,14 @@ pub struct Phase: Clone {
     pub name: String,
     pub seconds: f64,
     pub times: u32,
+}
+
+/// A post the build made (`std::io::post`), which waits for the tool's answer: its number,
+/// which `answer` names, the URL it was sent to, and its body.
+pub struct Post: Clone {
+    pub id: u32,
+    pub url: String,
+    pub body: Data,
 }
 
 fn handle_body(b: Build) -> Writer {
@@ -225,7 +239,8 @@ pub fn hash(b: Build) -> Pending<u8> {
     timeout_ask("drive/hash", handle_body(b), 0.0)
 }
 
-/// The lines the build printed since the last `logs`: `read_logs` reads the answer.
+/// The lines the build printed since the last `logs`, as many as an answer holds (the rest
+/// wait for the next): `read_logs` reads the answer.
 @tool
 pub fn logs(b: Build) -> Pending<u8> {
     timeout_ask("drive/logs", handle_body(b), 0.0)
@@ -267,6 +282,34 @@ pub fn call(b: Build, export: str, args: [Scalar], timeout: f64 = 0.0) -> Pendin
     timeout_ask("drive/call", take w, timeout)
 }
 
+/// The posts the build made since the last `posts`, the oldest first: as many as an answer
+/// holds, the rest at the next. Each waits for the tool's `answer`; the program sees the answer
+/// from its next call on. `read_posts` reads the answer.
+@tool
+pub fn posts(b: Build) -> Pending<u8> {
+    timeout_ask("drive/posts", handle_body(b), 0.0)
+}
+
+/// Answers post `post` of the build with `bytes`: the request fails if no such post waits.
+/// `std::tool::answer` reads the answer.
+@tool
+pub fn answer(b: Build, post: u32, bytes: Data) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(post)
+    write_data(mut w, bytes)
+    timeout_ask("drive/answer", take w, 0.0)
+}
+
+/// Fails post `post` of the build, saying `why`: the program's request fails, as a post nothing
+/// answers does. The request fails if no such post waits. `std::tool::answer` reads the answer.
+@tool
+pub fn fail(b: Build, post: u32, why: str) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(post)
+    w.write_str(why)
+    timeout_ask("drive/fail", take w, 0.0)
+}
+
 /// Closes the build: its host and threads go, and the handle names nothing after this.
 @tool
 pub fn close(b: Build) -> Pending<u8> {
@@ -275,7 +318,7 @@ pub fn close(b: Build) -> Pending<u8> {
 
 /// Reads a `load` answer: the handle (a `u32`), then the seconds loading took (an `f64`'s bits).
 pub fn read_loaded(polled: take Result<Vec<u8>, IoError>) -> Result<Loaded, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(id) = r.read_u32() else { return Err(malformed("drive/load")) }
     let Ok(elapsed) = r.read_u64() else { return Err(malformed("drive/load")) }
     if !r.at_end() {
@@ -286,7 +329,7 @@ pub fn read_loaded(polled: take Result<Vec<u8>, IoError>) -> Result<Loaded, Tool
 
 /// Reads an answer of `init`, `frames`, `ticks` or `call`.
 pub fn read_ran(polled: take Result<Vec<u8>, IoError>) -> Result<Ran, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(started) = r.read_u64() else { return Err(malformed("drive")) }
     let Ok(elapsed) = r.read_u64() else { return Err(malformed("drive")) }
     let Ok(n) = r.read_u32() else { return Err(malformed("drive")) }
@@ -341,7 +384,7 @@ pub fn read_ran(polled: take Result<Vec<u8>, IoError>) -> Result<Ran, ToolError>
 
 /// Reads a `capture` answer: the width and height (`u32`s), then the pixels (`blob::Data`).
 pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(width) = r.read_u32() else { return Err(malformed("drive/capture")) }
     let Ok(height) = r.read_u32() else { return Err(malformed("drive/capture")) }
     let Some(rgba) = read_data(mut r) else { return Err(malformed("drive/capture")) }
@@ -351,9 +394,29 @@ pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, To
     Ok(Capture { width, height, rgba })
 }
 
+/// Reads a `posts` answer: a count, then each post's number, URL and body (`blob::Data`).
+pub fn read_posts(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Post>, ToolError> {
+    var r = Reader::new(answer_bytes(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive/posts")) }
+    if n > r.left() {
+        return Err(malformed("drive/posts"))
+    }
+    var out: Vec<Post> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(id) = r.read_u32() else { return Err(malformed("drive/posts")) }
+        let Ok(url) = r.read_string() else { return Err(malformed("drive/posts")) }
+        let Some(body) = read_data(mut r) else { return Err(malformed("drive/posts")) }
+        out.push(Post { id, url, body })
+    }
+    if !r.at_end() {
+        return Err(malformed("drive/posts"))
+    }
+    Ok(out)
+}
+
 /// Reads a `hash` answer: a `u64`.
 pub fn read_hash(polled: take Result<Vec<u8>, IoError>) -> Result<u64, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(h) = r.read_u64() else { return Err(malformed("drive/hash")) }
     if !r.at_end() {
         return Err(malformed("drive/hash"))
@@ -361,9 +424,9 @@ pub fn read_hash(polled: take Result<Vec<u8>, IoError>) -> Result<u64, ToolError
     Ok(h)
 }
 
-/// Reads a `logs` answer: a count, each line, then how many more there were.
+/// Reads a `logs` answer: a count, each line, then how many more wait.
 pub fn read_logs(polled: take Result<Vec<u8>, IoError>) -> Result<Logs, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(n) = r.read_u32() else { return Err(malformed("drive/logs")) }
     if n > r.left() {
         return Err(malformed("drive/logs"))
@@ -373,16 +436,16 @@ pub fn read_logs(polled: take Result<Vec<u8>, IoError>) -> Result<Logs, ToolErro
         let Ok(l) = r.read_string() else { return Err(malformed("drive/logs")) }
         lines.push(take l)
     }
-    let Ok(dropped) = r.read_u32() else { return Err(malformed("drive/logs")) }
+    let Ok(waiting) = r.read_u32() else { return Err(malformed("drive/logs")) }
     if !r.at_end() {
         return Err(malformed("drive/logs"))
     }
-    Ok(Logs { lines, dropped })
+    Ok(Logs { lines, waiting })
 }
 
 /// Reads a `phases` answer: a count, then each phase's name, seconds and times.
 pub fn read_phases(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Phase>, ToolError> {
-    var r = Reader::new(answer(take polled)?)
+    var r = Reader::new(answer_bytes(take polled)?)
     let Ok(n) = r.read_u32() else { return Err(malformed("drive/phases")) }
     if n > r.left() {
         return Err(malformed("drive/phases"))
@@ -425,4 +488,19 @@ fn a_run_with_a_trap_reads_back() {
     let Some(trap) = ran.trap else { panic("a trap") }
     assert(trap.stage == Stage::Tick && trap.number == 20 && trap.panic.as_str() == "no")
     assert(read_ran(Ok(Vec::from([u8(0), 1]))).is_err(), "a short run")
+}
+
+@test
+fn posts_read_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(1)
+    w.write_u32(7)
+    w.write_str("notes/edit")
+    write_data(mut w, Data::Bytes(Vec::from([u8(123), 125])))
+    let Ok(posts) = read_posts(Ok(take w.into_bytes())) else { panic("posts") }
+    assert(posts.len() == 1 && posts[0].id == 7 && posts[0].url.as_str() == "notes/edit")
+    let Data::Bytes(b) = posts[0].body.clone() else { panic("bytes") }
+    assert(b.len() == 2 && b[0] == 123)
+    assert(read_posts(Ok(Vec::from([u8(0), 1, 0, 0, 0]))).is_err(), "a short answer")
 }

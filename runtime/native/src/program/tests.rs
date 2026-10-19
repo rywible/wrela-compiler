@@ -1100,6 +1100,7 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
             post: None,
             host: None,
             quiet: false,
+            queue_posts: false,
         },
     );
     p.call("ask", &[]).expect("ask");
@@ -1133,6 +1134,7 @@ fn storage_keeps_bytes_at_paths() {
         post: None,
         host: None,
         quiet: false,
+        queue_posts: false,
     };
     let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
     let mut p = requester(&write, io.clone());
@@ -1203,9 +1205,9 @@ fn storage_paths_cant_cross_symbolic_links() {
 
 #[test]
 fn posts_go_to_the_handler_and_fail_without_one() {
-    let batch = Encoder::new().post(4, "studio/echo", &[1, 2, 3, 4]).finish();
+    let batch = Encoder::new().post(4, "notes/reply", &[1, 2, 3, 4]).finish();
     let echo = PostHandler::new(|url, body| {
-        assert_eq!(url, "studio/echo");
+        assert_eq!(url, "notes/reply");
         Ok(body.iter().rev().copied().collect())
     });
     let mut p = requester(&batch, Io { post: Some(echo), ..Io::default() });
@@ -1218,6 +1220,36 @@ fn posts_go_to_the_handler_and_fail_without_one() {
     let elsewhere = Encoder::new().post(4, "https://example.com/x", &[]).finish();
     let err = requester(&elsewhere, Io::default()).call("ask", &[]).expect_err("rejected");
     assert!(err.to_string().contains("must be relative"), "{err}");
+}
+
+#[test]
+fn queued_posts_wait_for_their_answer_and_are_bounded() {
+    let queued = || Io { queue_posts: true, ..Io::default() };
+    let batch = Encoder::new().post(4, "notes/reply", &[1, 2, 3, 4]).finish();
+    let mut p = requester(&batch, queued());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_PENDING, "it waits for the host's user");
+    let posts = p.take_posts();
+    assert_eq!(
+        posts,
+        [QueuedPost { request: 4, url: "notes/reply".into(), body: vec![1, 2, 3, 4] }]
+    );
+    assert!(p.take_posts().is_empty(), "each post is given once");
+    assert!(p.answer_post(5, Ok(Vec::new())).is_err(), "no post 5 waits");
+    p.answer_post(4, Ok(vec![4, 3, 2, 1])).expect("answered");
+    assert_eq!(call_i32(&mut p, "status"), 4);
+    assert_eq!(call_i32(&mut p, "take"), 0x0102_0304);
+    assert!(p.answer_post(4, Ok(Vec::new())).is_err(), "a post is answered once");
+    // Past the most that wait, a post fails at once.
+    let mut many = Encoder::new();
+    for r in 5..5 + MOST_QUEUED_POSTS as u32 {
+        many.post(r, "notes/reply", &[]);
+    }
+    let batch = many.post(4, "notes/reply", &[]).finish();
+    let mut p = requester(&batch, queued());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED);
+    assert_eq!(p.take_posts().len(), MOST_QUEUED_POSTS);
 }
 
 #[test]

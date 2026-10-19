@@ -269,10 +269,16 @@ def wrela_test(name, executable, logs):
         print(f"ok wrela::{parts[1]}::{test['name']} ({test['at']})", flush=True)
 
 
+def log_name(name):
+    """A check's log file name: `::` keeps its own spelling, so `wrela::suite` (a Rust program)
+    and `wrela-suite` (a step) never share a log."""
+    return re.sub(r"[^\w.-]+", "-", name.replace("::", "__"))
+
+
 def job(name, logs, work):
     """Runs `work(output)`, writing its output to a log of its own. Any failure is recorded,
     not raised, so the other checks still run: (name, the failure or None, the log)."""
-    log = logs / "jobs" / (re.sub(r"[^\w.-]+", "-", name) + ".log")
+    log = logs / "jobs" / (log_name(name) + ".log")
     log.parent.mkdir(exist_ok=True)
     started = time.monotonic()
     with log.open("w") as output:

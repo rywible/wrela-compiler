@@ -9,7 +9,7 @@
 //! package's literals lifted, and runs it on the CPU, where `std::lift::Minimize` solves: BFGS
 //! on the function's derivatives by the literals (`std::lift::gradient`, forward mode), each
 //! step along a line searched until the value falls enough (Armijo's rule). The literals end
-//! rounded to their own decimals, as the lens's drags do: the one that changed most first, the
+//! rounded to their own decimals, as a drag's are: the one that changed most first, the
 //! rest solved again with it held, and the last given more decimals while rounding would cost
 //! more than 5% of the value (`--exact` keeps them as solved). This finds the literals on the
 //! lines named and their decimals, passes them in, and reports what came out; with `--write`,

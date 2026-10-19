@@ -24,7 +24,7 @@
 //! untested = ["games/big"]           # members whose tests the whole suite doesn't run yet
 //!
 //! [tools.release]
-//! package = "studio/release"         # a member with a tool build
+//! package = "tools/release"         # a member with a tool build
 //! read = ["ws=."]                    # a root's name = its path from this file
 //! write = ["out=build/release"]
 //! net = ["api.cloudflare.com"]
@@ -707,7 +707,7 @@ mod tests {
     #[test]
     fn reads_a_workspaces_files_and_tools() {
         let text = r#"[tools.release]
-package = "studio/release"
+package = "tools/release"
 read = ["ws=."]
 write = ["out=build/release"]
 net = ["api.example"]
@@ -717,14 +717,14 @@ browser = true
 timeout = 1800
 
 [workspace]
-members = ["studio/*"]
+members = ["tools/*"]
 allow = ["**/*.wrela", "AGENTS.md"]
 exclude = ["compiler/**"]
 pending = ["games/console.toml"]
 untested = ["games/last-green"]
 
 [tools.lint]
-package = "studio/lint"
+package = "tools/lint"
 "#;
         let w = parse(file(), text).expect("parses").workspace.expect("a workspace");
         let globs = |g: &[(String, Span)]| g.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
@@ -735,7 +735,7 @@ package = "studio/lint"
         let names: Vec<&str> = w.tools.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["release", "lint"], "a tool declared before `[workspace]` is its");
         let release = &w.tools[0];
-        assert_eq!(release.package, "studio/release");
+        assert_eq!(release.package, "tools/release");
         assert_eq!(release.read, [("ws".to_string(), ".".to_string())]);
         assert_eq!(release.write, [("out".to_string(), "build/release".to_string())]);
         assert_eq!(release.net, ["api.example"]);

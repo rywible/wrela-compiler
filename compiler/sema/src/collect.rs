@@ -1027,8 +1027,9 @@ impl<'d, 'u> Collector<'d, 'u> {
     /// [`MAX_TOOL_TEST_BUDGET`]; `net: ["host", ...]`, the fake sites it reaches; `run:
     /// [("name", "dir"), ...]`, the programs it may run, each a tool package in a directory of
     /// the test's package; and `read: [("name", "dir"), ...]`, the roots it may read, each a
-    /// directory relative to the test's package; and `browser: true`, Chrome, on the real
-    /// clock. Anything else is E0222.
+    /// directory relative to the test's package; `browser: true`, Chrome, on the real clock; and
+    /// `blobs: "8M,64"`, the blob budget, as `wrela tool --blob-budget` takes it. Anything else
+    /// is E0222.
     fn tool_test(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<ToolTest> {
         let mut test = ToolTest {
             budget: TOOL_TEST_BUDGET,
@@ -1036,6 +1037,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             run: Vec::new(),
             read: Vec::new(),
             browser: false,
+            blobs: None,
         };
         let mut bad: Option<(Span, &str)> = None;
         let mut seen: Vec<&str> = Vec::new();
@@ -1080,6 +1082,15 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                     }
                 }
+                "blobs" => match text(&arg.value).filter(|b| is_blob_budget(b)) {
+                    Some(b) => test.blobs = Some(b),
+                    None => {
+                        bad = bad.or(Some((
+                            arg.span,
+                            "`blobs` is a blob budget, as `wrela tool --blob-budget` takes it: bytes (`8M`), then `,` and handles",
+                        )))
+                    }
+                },
                 "browser" => match &arg.value.kind {
                     ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(on), .. }) => {
                         test.browser = *on;
@@ -1158,7 +1169,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 _ => {
                     bad = bad.or(Some((
                         arg.span,
-                        "a tool test takes `budget`, `net`, `run`, `read` and `browser`",
+                        "a tool test takes `budget`, `net`, `run`, `read`, `browser` and `blobs`",
                     )))
                 }
             }
@@ -2022,7 +2033,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         let Some(at) = def.attrs.testing else { return };
         // A dependency's own program's test exports (in its `main.wrela`) are about that program,
         // checked when it's the package checked: here they're functions no test build exports
-        // (the map lens depends on a floor, a program).
+        // (a tool's program may depend on another program).
         let module = self.p.module(def.module);
         if self.p.package_of(def.module).kind != PackageKind::Program
             && module.path.last().is_some_and(|m| m == "main")
@@ -4222,6 +4233,18 @@ fn fuel_value(e: &ast::Expr) -> Option<u64> {
         }
         _ => None,
     }
+}
+
+/// Whether `text` is a blob budget, as `wrela tool --blob-budget` takes it: digits, then `K`,
+/// `M` or `G` if it says, then `,` and digits if it gives the handles.
+fn is_blob_budget(text: &str) -> bool {
+    let (bytes, handles) = match text.split_once(',') {
+        Some((b, h)) => (b, Some(h)),
+        None => (text, None),
+    };
+    let digits = bytes.strip_suffix(['K', 'k', 'M', 'm', 'G', 'g']).unwrap_or(bytes);
+    let number = |d: &str| !d.is_empty() && d.len() <= 18 && d.bytes().all(|b| b.is_ascii_digit());
+    number(digits) && handles.is_none_or(number)
 }
 
 #[cfg(test)]

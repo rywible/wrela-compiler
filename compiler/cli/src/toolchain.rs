@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use wrela_driver::Scope;
 use wrela_driver::reach::Reach;
-use wrela_host::tool::toolchain::{BuildOptions, Built, Diagnostic, Job, TestResult, Tested};
+use wrela_host::tool::toolchain::{
+    BuildOptions, Built, Diagnostic, Job, LiteralEdits, TestResult, Tested,
+};
 
 /// The compiler.
 pub struct Compiler;
@@ -130,6 +132,61 @@ impl wrela_host::tool::Toolchain for Compiler {
     ) -> Result<Vec<(String, Vec<u8>)>, String> {
         let reach = Reach::of_dirs(job.roots()?);
         crate::export::files_of(revision, repository, packages, &reach, base).map(|(_, f)| f)
+    }
+
+    fn query(
+        &self,
+        job: &Job,
+        package: &Path,
+        queries: &[String],
+        overrides: &[(String, PathBuf)],
+    ) -> Result<String, String> {
+        let scope = scope_of(job, overrides)?;
+        let parsed = queries
+            .iter()
+            .map(|q| Ok((q.clone(), wrela_driver::query::parse(q)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let answered = wrela_driver::query::answer_in(package, &parsed, &scope)?;
+        Ok(serde_json::Value::Array(answered.answers).to_string())
+    }
+
+    fn lifted(&self, report: &str) -> Result<(Vec<String>, Vec<f32>), String> {
+        let r = wrela_driver::lift::parse_report(report)?;
+        let built = r.literals.iter().map(|l| l.value).collect();
+        Ok((r.files.into_iter().map(|f| f.path).collect(), built))
+    }
+
+    fn literal_values(
+        &self,
+        report: &str,
+        read: &dyn Fn(&str) -> Result<String, String>,
+    ) -> Result<Option<Vec<f32>>, String> {
+        let r = wrela_driver::lift::parse_report(report)?;
+        wrela_driver::lift::values_now(&r, read)
+    }
+
+    fn plan_literal_edits(
+        &self,
+        report: &str,
+        read: &dyn Fn(&str) -> Result<String, String>,
+        edits: &[(u32, f32)],
+    ) -> Result<LiteralEdits, String> {
+        let r = wrela_driver::lift::parse_report(report)?;
+        Ok(match wrela_driver::lift::plan_by_index(&r, read, edits) {
+            Ok(files) => LiteralEdits {
+                answer: wrela_driver::edit::to_value(&files, true).to_string(),
+                files: files.into_iter().map(|f| (f.file, f.old_hash, f.text)).collect(),
+                refused: false,
+            },
+            Err(refused) => LiteralEdits {
+                files: Vec::new(),
+                answer: serde_json::json!({
+                    "written": false, "file": refused.file, "why": refused.why,
+                })
+                .to_string(),
+                refused: true,
+            },
+        })
     }
 }
 

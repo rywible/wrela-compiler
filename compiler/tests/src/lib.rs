@@ -820,7 +820,7 @@ pub fn timings(results: &Path) -> Vec<GpuTiming> {
         .collect()
 }
 
-/// Runs the page another server serves at `url` (the studio server) in headless Chrome: its
+/// Runs the page another server serves at `url` (`wrela run`'s) in headless Chrome: its
 /// results go to `page/results/`. Panics, pointing at the console log, if the run fails.
 pub fn run_url_in_chrome(url: &str, page: &Path, timeout: u32) {
     let ran =

@@ -9,8 +9,8 @@
 //! (the repository), with the toolchain's servers' rules (`crate::loopback`): a request must
 //! name this machine, every answer is cross-origin isolated, a file is reached one part at a
 //! time following no link, nothing under `.git` is served, and a `PUT` goes only to a plain file
-//! name in a `results/` directory. [`run_url`] runs a page that another server serves (the
-//! studio's) instead, and the run is done when the page's `results/DONE` appears.
+//! name in a `results/` directory. [`run_url`] runs a page that another server serves (`wrela
+//! run`'s) instead, and the run is done when the page's `results/DONE` appears.
 //!
 //! **One Chrome serves a process's runs at once**, each in a window of its own, so tests that run
 //! side by side share it. It starts with the first run, and ends (its process group killed, its
@@ -162,7 +162,7 @@ pub fn run(page: Page) -> Result<(), String> {
     drive(&url, &results, page.timeout, page.script, &|| lock(&done).clone())
 }
 
-/// Runs the page another server serves at `url` (the studio's) in Chrome, its results going to
+/// Runs the page another server serves at `url` (`wrela run`'s) in Chrome, its results going to
 /// `page/results/`: `Ok` once that's where `DONE` says `ok`, else why not.
 pub fn run_url(url: &str, page: &Path, timeout: Duration) -> Result<(), String> {
     let results = fresh_results(page)?;

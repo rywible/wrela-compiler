@@ -9,8 +9,8 @@ This is the Python tools' runner (lookbook.py, round.py). The compiler's own tes
 Chrome through the Rust driver instead (runtime/chrome, `wrela_host::pages`), which also gives a
 page trusted input.
 
-With --url, another server already serves the page (the studio server, which answers the lens's
-posts): Chrome opens the URL, and the run is done when the page's `results/DONE` file appears
+With --url, another server already serves the page (`wrela tool studio`'s, which answers the
+lens's posts): Chrome opens the URL, and the run is done when the page's `results/DONE` file appears
 (the page-dir may then be any directory).
 
 The page finishes by PUTting `results/DONE`: the body `ok` means it passed, anything else is the

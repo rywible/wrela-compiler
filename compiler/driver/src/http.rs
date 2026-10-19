@@ -1,7 +1,7 @@
-//! The toolchain's local servers' HTTP (the studio's, `serve.rs`, and `wrela run`'s, `live.rs`):
+//! The HTTP of `wrela run`'s local server (`live.rs`):
 //! the protocol is `wrela_host::loopback`'s, which a tool's server (`std::tool::serve`) speaks
 //! too: 127.0.0.1 only, a host that names this machine, posts only from the server's own pages,
-//! and files reached through a directory handle following no link. This is how these servers
+//! and files reached through a directory handle following no link. This is how the server
 //! listen, read a whole request, and serve a directory by its path.
 
 use std::io::{BufReader, Read};

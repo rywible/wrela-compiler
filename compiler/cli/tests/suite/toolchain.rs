@@ -527,3 +527,248 @@ fn a_request_that_doesnt_finish_leaves_none_of_its_outputs() {
     assert!(printed.contains("past its deadline of 2 s"), "{printed}");
     assert!(!there(&out.join("c")), "nothing it made is left");
 }
+
+/// A tool for a lifted build's literals, through the toolchain, printing what it got:
+/// `lift PKG OUT NAME` (a build lifting package `NAME`), `literals PROG BUILD`, `edit PROG BUILD
+/// LITERAL VALUE` and `query PKG QUERY NAME DIR` (`NAME` read from `DIR`). A request that fails
+/// prints `error: ...` and exits 1.
+const LIFT_TOOL: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::toolchain
+use std::tool::toolchain::Override
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    let what = given[0].clone()
+    var p = if what.as_str() == "lift" {
+        var options = toolchain::options()
+        options.lift.push(given[3].clone())
+        toolchain::build(given[1].as_str(), given[2].as_str(), options)
+    } else if what.as_str() == "literals" {
+        toolchain::literals(given[1].as_str(), given[2].as_str())
+    } else if what.as_str() == "edit" || what.as_str() == "edit-timed" {
+        let Some(i) = given[3].as_str().parse_u32() else { return 2 }
+        let Some(v) = given[4].as_str().parse_f32() else { return 2 }
+        let timeout = if what.as_str() == "edit-timed" { 1.0 } else { 0.0 }
+        toolchain::edit(given[1].as_str(), given[2].as_str(), [(i, v)], timeout)
+    } else {
+        var queries: Vec<String> = Vec::new()
+        queries.push(given[2].clone())
+        toolchain::query(given[1].as_str(), queries, [Override { name: given[3].clone(), dir: given[4].clone() }])
+    }
+    var got = p.poll()
+    while got.is_none() {
+        yield
+        got = p.poll()
+    }
+    let Some(polled) = take got else { return 90 }
+    if what.as_str() == "lift" {
+        match toolchain::read_built(take polled) {
+            Ok(b) => print(f"built ok={b.ok}"),
+            Err(e) => {
+                print(f"error: {e.message()}")
+                return 1
+            },
+        }
+    } else if what.as_str() == "literals" {
+        match toolchain::read_literals(take polled) {
+            Ok(l) => {
+                for f in l.files {
+                    print(f"file {f.as_str()}")
+                }
+                for x in l.built {
+                    print(f"built {x}")
+                }
+                match l.values {
+                    Some(v) => {
+                        for x in v {
+                            print(f"value {x}")
+                        }
+                    },
+                    None => print("values none"),
+                }
+            },
+            Err(e) => {
+                print(f"error: {e.message()}")
+                return 1
+            },
+        }
+    } else {
+        let answer = if what.as_str() != "query" {
+            toolchain::read_edited(take polled)
+        } else {
+            toolchain::read_queried(take polled)
+        }
+        match answer {
+            Ok(text) => print(text.as_str()),
+            Err(e) => {
+                print(f"error: {e.message()}")
+                return 1
+            },
+        }
+    }
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// A lifted program and the package it lifts, in the write root `work`; the tool beside them.
+fn lifted_packages(name: &str) -> (PathBuf, PathBuf) {
+    let dir = package(
+        name,
+        &[
+            ("tool/wrela.toml", &manifest("lift_probe")),
+            ("tool/main.wrela", LIFT_TOOL),
+            (
+                "work/subject/wrela.toml",
+                "[package]\nname = \"subject\"\n\n[dependencies]\nshape = { path = \"../shape\" }\n",
+            ),
+            ("work/subject/main.wrela", "pub fn frame(time: f32, width: u32, height: u32) {}\n"),
+            (
+                "work/subject/probe.wrela",
+                "fn at(p: vec3) {\n    let c = shape::ball::tint(p.x)\n}\n",
+            ),
+            ("work/shape/wrela.toml", "[package]\nname = \"shape\"\n"),
+            (
+                "work/shape/ball.wrela",
+                "pub struct Tint: Copy {\n    pub r: f32,\n    g: f32,\n}\n\npub fn tint(r: f32) -> Tint {\n    Tint { r, g: 1.0 }\n}\n\npub fn radius() -> f32 {\n    0.5 + 0.25\n}\n",
+            ),
+        ],
+    );
+    (dir.join("tool"), dir.join("work"))
+}
+
+/// `wrela tool` on `tool`, with `work` its write root, and `args`.
+fn lift_probe(tool: &Path, work: &Path, args: &[&str]) -> (Option<i32>, String) {
+    lift_probe_with(tool, work, args, &[])
+}
+
+/// [`lift_probe`], with the environment's `env` too.
+fn lift_probe_with(
+    tool: &Path,
+    work: &Path,
+    args: &[&str],
+    env: &[(&str, &str)],
+) -> (Option<i32>, String) {
+    let mut c = wrela();
+    c.envs(env.iter().copied());
+    c.arg("tool").arg(tool).arg("--write").arg(format!("work={}", work.display()));
+    c.arg("--timeout").arg("120").arg("--").args(args);
+    run(&mut c)
+}
+
+#[test]
+fn a_lifted_builds_literals_are_read_and_written_through_the_grants() {
+    let (tool, work) = lifted_packages("toolchain-lifted");
+    let (code, printed) =
+        lift_probe(&tool, &work, &["lift", "work/subject", "work/build", "shape"]);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("built ok=true"), "{printed}");
+    let literals =
+        |work: &Path| lift_probe(&tool, work, &["literals", "work/subject", "work/build"]);
+    let (code, printed) = literals(&work);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("file work/shape/ball.wrela"), "{printed}");
+    assert!(printed.contains("value 1\nvalue 0.5\nvalue 0.25"), "{printed}");
+    // Another tool's edit of a literal: its new value, with no build.
+    let ball = work.join("shape/ball.wrela");
+    let text = std::fs::read_to_string(&ball).expect("ball");
+    std::fs::write(&ball, text.replace("0.25", "0.125")).expect("edit");
+    let (_, printed) = literals(&work);
+    assert!(printed.contains("value 1\nvalue 0.5\nvalue 0.125"), "{printed}");
+    assert!(printed.contains("built 1\nbuilt 0.5\nbuilt 0.25"), "as the build has them: {printed}");
+    // The tool's edit, by the literal's index, written in the literal's own style.
+    let (code, printed) =
+        lift_probe(&tool, &work, &["edit", "work/subject", "work/build", "1", "0.75"]);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("\"written\":true"), "{printed}");
+    assert!(std::fs::read_to_string(&ball).expect("ball").contains("0.75 + 0.125"));
+    // A change past the literals: no values, and no edit.
+    std::fs::write(&ball, text.replace("0.5 + 0.25", "0.5 * 0.25")).expect("edit");
+    let (_, printed) = literals(&work);
+    assert!(printed.contains("values none"), "{printed}");
+    let (_, printed) =
+        lift_probe(&tool, &work, &["edit", "work/subject", "work/build", "1", "0.6"]);
+    assert!(printed.contains("\"written\":false") && printed.contains("rebuild"), "{printed}");
+    assert!(std::fs::read_to_string(&ball).expect("ball").contains("0.5 * 0.25"));
+    // A lifted file the build named that is now a symbolic link is neither read nor written:
+    // the link, and the file it names, stay as they are.
+    std::fs::write(&ball, &text).expect("restore");
+    let elsewhere = work.join("elsewhere.wrela");
+    std::fs::write(&elsewhere, &text).expect("a file to link to");
+    std::fs::remove_file(&ball).expect("remove");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&elsewhere, &ball).expect("link");
+    let (code, printed) =
+        lift_probe(&tool, &work, &["edit", "work/subject", "work/build", "1", "0.6"]);
+    assert!(code != Some(0) || printed.contains("\"written\":false"), "{printed}");
+    assert_eq!(std::fs::read_to_string(&elsewhere).expect("elsewhere"), text);
+    assert!(std::fs::symlink_metadata(&ball).expect("link").file_type().is_symlink());
+    // A package in a read root is read, and not written.
+    let mut c = wrela();
+    c.arg("tool").arg(&tool).arg("--read").arg(format!("work={}", work.display()));
+    c.arg("--timeout").arg("120").args(["--", "edit", "work/subject", "work/build", "1", "0.6"]);
+    let (_, printed) = run(&mut c);
+    assert!(printed.contains("write root") || printed.contains("\"written\":false"), "{printed}");
+}
+
+#[test]
+fn a_query_reads_a_values_public_fields_through_the_overrides() {
+    let (tool, work) = lifted_packages("toolchain-query");
+    // The subject's dependency is named elsewhere: the override reads it from `shape`.
+    let manifest = work.join("subject/wrela.toml");
+    std::fs::write(
+        &manifest,
+        "[package]\nname = \"subject\"\n\n[dependencies]\nshape = { path = \"../nowhere\" }\n",
+    )
+    .expect("manifest");
+    let (code, printed) = lift_probe(
+        &tool,
+        &work,
+        &["query", "work/subject", "fields probe.wrela:2:9", "shape", "work/shape"],
+    );
+    assert_eq!(code, Some(0), "{printed}");
+    let answers: serde_json::Value = serde_json::from_str(printed.trim()).expect("JSON");
+    let a = &answers[0];
+    assert_eq!(a["path"], "shape::ball::Tint", "{a}");
+    assert_eq!(a["fields"], serde_json::json!([{ "path": "r", "type": "f32" }]), "{a}");
+}
+
+/// An edit cancelled while its file waits to take the old one's place (held until the request
+/// is cancelled, at its 1 s deadline) replaces nothing: the source is as it was, and no file of
+/// the edit's is left beside it.
+#[test]
+fn a_cancelled_edit_leaves_its_source_as_it_was() {
+    let (tool, work) = lifted_packages("toolchain-edit-cancelled");
+    let (code, printed) =
+        lift_probe(&tool, &work, &["lift", "work/subject", "work/build", "shape"]);
+    assert_eq!(code, Some(0), "{printed}");
+    let ball = work.join("shape/ball.wrela");
+    let before = std::fs::read_to_string(&ball).expect("ball");
+    let (code, printed) = lift_probe_with(
+        &tool,
+        &work,
+        &["edit-timed", "work/subject", "work/build", "1", "0.75"],
+        &[("WRELA_TESTING_HOLD", "ball.wrela:60")],
+    );
+    assert_eq!(code, Some(1), "{printed}");
+    assert!(printed.contains("past its deadline"), "{printed}");
+    assert_eq!(std::fs::read_to_string(&ball).expect("ball"), before, "the source is unchanged");
+    assert_eq!(names(&work.join("shape")), ["ball.wrela", "wrela.toml"], "nothing left beside it");
+    // Not held, the same edit is written.
+    let (code, printed) =
+        lift_probe(&tool, &work, &["edit-timed", "work/subject", "work/build", "1", "0.75"]);
+    assert!(code == Some(0) && printed.contains("\"written\":true"), "{printed}");
+}

@@ -40,7 +40,6 @@ mod shared;
 pub mod tool;
 mod trace;
 
-pub use cache::compiled_code_prefix;
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
@@ -53,7 +52,7 @@ pub mod build_memory {
     pub use crate::shared::{slice, write};
 }
 pub use program::{
-    BuildHelpers, Failure, HelperRun, HostHandler, PostHandler, Stop, Ticked, Value,
+    BuildHelpers, Failure, HelperRun, HostHandler, PostHandler, QueuedPost, Stop, Ticked, Value,
     metered_engine, refuse_host_functions,
 };
 pub use wrela_abi::input::{Event, Scripted, parse_script};
@@ -103,7 +102,7 @@ pub struct Options {
     /// Named application-host capabilities (`std::host::request`); unsupported without this.
     pub host: Option<HostHandler>,
     /// Don't show the program's printed lines on stderr (`wrela: ...`): for a caller that
-    /// shows them itself ([`Host::take_logs`]), such as `wrela studio`'s headless runner.
+    /// shows them itself ([`Host::take_logs`]), such as a tool that drives the build.
     pub quiet: bool,
     /// Don't run the program's `init` while loading: the caller runs it ([`Host::init`]),
     /// after asking for the ticker's first hash, say.
@@ -157,6 +156,7 @@ fn io(
         post,
         host,
         quiet,
+        queue_posts: false,
     }
 }
 
@@ -251,12 +251,6 @@ fn same_build(log: &TickLog, build: u64) -> Result<(), ReplayError> {
     } else {
         Err(ReplayError::OtherBuild { log: log.wasm_hash, build })
     }
-}
-
-/// Compiles the build in `dir` and keeps its compiled code beside it, so the loads that follow
-/// don't compile it again (`cache`).
-pub fn precompile(dir: impl AsRef<Path>) -> Result<()> {
-    compile_build(dir.as_ref(), None).map(|_| ())
 }
 
 /// A build read from its directory, its WASM compiled.
@@ -632,6 +626,8 @@ impl Host {
         let gpu = Gpu::new(&build.manifest, &build.shaders, options.timing)?;
         let n = workers(options.workers);
         let mut io = options.io(dir);
+        // A driven build's posts go to its tool (`std::tool::drive`).
+        io.queue_posts = handle.is_some();
         io.build_dir = handle;
         let mut program = Program::instantiate_with(
             &build.compiled,
@@ -871,8 +867,24 @@ impl Host {
         self.p().push_message(conn, bytes);
     }
 
+    /// The posts the program made since the last time, which wait for an answer
+    /// ([`Host::answer_post`]): a driven build's (`std::tool::drive`).
+    pub fn take_posts(&mut self) -> Vec<QueuedPost> {
+        self.p().take_posts()
+    }
+
+    /// Answers post `request`, one [`Host::take_posts`] gave: the program sees the answer from
+    /// its next call on.
+    pub fn answer_post(
+        &mut self,
+        request: u32,
+        answer: std::result::Result<Vec<u8>, String>,
+    ) -> std::result::Result<(), String> {
+        self.p().answer_post(request, answer)
+    }
+
     /// Calls `frame(time, width, height)` once, and ends the frame: for a caller that drives
-    /// the program a frame at a time (a studio session), and reads the screen when it wants.
+    /// the program a frame at a time (a session a person types), and reads the screen when it wants.
     pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
         self.p().executor().set_screen(width, height)?;
         self.p().frame(time, width, height)?;
@@ -1125,6 +1137,8 @@ impl CpuBuild {
     pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
         let mut io = io(&self.dir, storage, None, None, self.quiet);
         io.build_dir = self.handle.clone();
+        // A driven build's posts go to its tool (`std::tool::drive`).
+        io.queue_posts = self.handle.is_some();
         let n = self::workers(workers);
         let (compiled, manifest) = (&self.compiled, &self.manifest);
         let program =
@@ -1160,6 +1174,22 @@ impl CpuHost {
     /// Queues an input event, which the program reads from its next call on.
     pub fn push_input(&mut self, e: Event) {
         self.program.push_input(e);
+    }
+
+    /// The posts the program made since the last time, which wait for an answer
+    /// ([`CpuHost::answer_post`]): a driven build's (`std::tool::drive`).
+    pub fn take_posts(&mut self) -> Vec<QueuedPost> {
+        self.program.take_posts()
+    }
+
+    /// Answers post `request`, one [`CpuHost::take_posts`] gave: the program sees the answer
+    /// from its next call on.
+    pub fn answer_post(
+        &mut self,
+        request: u32,
+        answer: std::result::Result<Vec<u8>, String>,
+    ) -> std::result::Result<(), String> {
+        self.program.answer_post(request, answer)
     }
 
     /// Queues a script's event (a message with its bytes).

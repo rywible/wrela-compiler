@@ -25,7 +25,8 @@
 //! reads through the grants, as it reads the build's other files. The build's storage is a
 //! directory of the host's own, removed when the build closes.
 
-use super::services::{Answer, Body, Services, Task, Work};
+use super::caps::MOST_BYTES;
+use super::services::{Answer, Body, Data, Services, Task, Work};
 use super::toolchain::Out;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -40,7 +41,8 @@ const DEADLINE: Duration = Duration::from_secs(60);
 /// How often the worker looks at the operation it waits for.
 const POLL: Duration = Duration::from_millis(10);
 
-/// The most lines `logs` gives at once (the rest are counted); each is at most 16 KiB.
+/// The most lines `logs` gives at once, and the most bytes of them: the rest wait for the next
+/// `logs`. A line longer than an answer holds is cut, with a note.
 const MOST_LINES: usize = 4096;
 
 /// The most frames or ticks one request runs.
@@ -143,6 +145,8 @@ enum Command {
     Logs,
     Phases,
     Call(String, Vec<crate::Value>),
+    Posts,
+    Answer(u32, Result<Data, String>),
 }
 
 impl Command {
@@ -156,6 +160,8 @@ impl Command {
             Command::Logs => "logs",
             Command::Phases => "phases",
             Command::Call(..) => "call",
+            Command::Posts => "posts",
+            Command::Answer(..) => "answer",
         }
     }
 }
@@ -167,8 +173,10 @@ enum Reply {
     Ran(Ran),
     Screen(u32, u32, Vec<u8>),
     Hash(u64),
-    Logs(Vec<String>),
+    Logs(Vec<String>, usize),
     Phases(Vec<crate::Phase>),
+    Posts(Vec<crate::QueuedPost>),
+    Answered,
 }
 
 /// What running gave: when it started (seconds since the build loaded) and how long it took,
@@ -208,6 +216,10 @@ struct Actor {
     next_frame: u32,
     /// Why it runs nothing more: it trapped, or a call was stopped.
     ended: Option<String>,
+    /// The posts the program made that the tool hasn't been given yet.
+    posts: std::collections::VecDeque<crate::QueuedPost>,
+    /// The lines the program printed that the tool hasn't been given yet.
+    lines: std::collections::VecDeque<String>,
 }
 
 impl Actor {
@@ -351,11 +363,60 @@ impl Actor {
                 }));
             }
             Command::Logs => {
-                return Ok(Reply::Logs(match &mut self.host {
+                let printed = match &mut self.host {
                     Hosted::Cpu(host) => host.take_logs(),
                     #[cfg(feature = "gpu")]
                     Hosted::Gpu(host) => host.take_logs(),
-                }));
+                };
+                self.lines.extend(printed);
+                // As many as an answer holds, the oldest first; the rest wait for the next.
+                let mut given = Vec::new();
+                let mut bytes = 0;
+                while let Some(l) = self.lines.front() {
+                    let size = l.len().min(MOST_BYTES / 2) + 4;
+                    if given.len() == MOST_LINES || (!given.is_empty() && bytes + size > MOST_BYTES)
+                    {
+                        break;
+                    }
+                    bytes += size;
+                    given.extend(self.lines.pop_front());
+                }
+                return Ok(Reply::Logs(given, self.lines.len()));
+            }
+            Command::Posts => {
+                let made = match &mut self.host {
+                    Hosted::Cpu(host) => host.take_posts(),
+                    #[cfg(feature = "gpu")]
+                    Hosted::Gpu(host) => host.take_posts(),
+                };
+                self.posts.extend(made);
+                // As many as an answer holds, the oldest first; the rest wait for the next.
+                let mut given = Vec::new();
+                let mut bytes = 0;
+                while let Some(p) = self.posts.front() {
+                    let size = p.body.len() + p.url.len() + 16;
+                    if !given.is_empty() && bytes + size > MOST_BYTES {
+                        break;
+                    }
+                    bytes += size;
+                    given.extend(self.posts.pop_front());
+                }
+                return Ok(Reply::Posts(given));
+            }
+            Command::Answer(request, data) => {
+                let answer = match data {
+                    Ok(Data::Bytes(bytes)) => Ok(bytes),
+                    Ok(Data::Blob(_)) => {
+                        return Err("an answer's blob is read before it's sent".into());
+                    }
+                    Err(why) => Err(why),
+                };
+                match &mut self.host {
+                    Hosted::Cpu(host) => host.answer_post(request, answer),
+                    #[cfg(feature = "gpu")]
+                    Hosted::Gpu(host) => host.answer_post(request, answer),
+                }?;
+                return Ok(Reply::Answered);
             }
             Command::Phases => {
                 let trace = match &mut self.host {
@@ -479,6 +540,15 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             "hash" => Command::Hash,
             "logs" => Command::Logs,
             "phases" => Command::Phases,
+            "posts" => Command::Posts,
+            "answer" => {
+                let post = b.u32()?;
+                Command::Answer(post, Ok(b.data()?))
+            }
+            "fail" => {
+                let post = b.u32()?;
+                Command::Answer(post, Err(b.str()?))
+            }
             "call" => {
                 let export = b.str()?;
                 let n = b.u32()?;
@@ -614,6 +684,8 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
                 inited: false,
                 next_frame: 0,
                 ended: None,
+                posts: std::collections::VecDeque::new(),
+                lines: std::collections::VecDeque::new(),
             };
             if sent.send(Ok(Reply::Loaded(since.elapsed().as_secs_f64()))).is_err() {
                 drop(actor);
@@ -692,6 +764,13 @@ fn operate(
             }
         }
         let _idle = Idle(&driven);
+        // An answer's blob is read now: the build's thread has no blobs.
+        let command = match command {
+            Command::Answer(post, Ok(Data::Blob(id))) => {
+                Command::Answer(post, Ok(Data::Bytes(s.blobs().get(id)?.as_ref().clone())))
+            }
+            c => c,
+        };
         // The screen's bytes and its blob are reserved before it's read back: a capture that
         // doesn't fit isn't read. The blob is the request's, so a failure gives them back.
         let mut screen = None;
@@ -728,13 +807,12 @@ fn operate(
             Reply::Hash(hash) => {
                 out.u64(hash);
             }
-            Reply::Logs(lines) => {
-                let n = lines.len().min(MOST_LINES);
-                out.u32(n as u32);
-                for l in &lines[..n] {
-                    out.str(&super::toolchain::bounded(l));
+            Reply::Logs(lines, waiting) => {
+                out.u32(lines.len() as u32);
+                for l in &lines {
+                    out.str(&bounded(l));
                 }
-                out.u32((lines.len() - n) as u32);
+                out.u32(waiting as u32);
             }
             Reply::Phases(phases) => {
                 out.u32(phases.len() as u32);
@@ -742,6 +820,14 @@ fn operate(
                     out.str(&p.name).f64(p.seconds).u32(p.times);
                 }
             }
+            Reply::Posts(posts) => {
+                out.u32(posts.len() as u32);
+                for p in &posts {
+                    out.u32(p.request).str(&p.url).u8(0).u32(p.body.len() as u32);
+                    out.0.extend_from_slice(&p.body);
+                }
+            }
+            Reply::Answered => {}
             Reply::Loaded(_) => return Err("the build's thread answered something else".into()),
         }
         Ok(out.0)
@@ -802,4 +888,18 @@ fn closed(s: &Services, handle: u32) -> Answer {
         return super::services::answer(Err(format!("the driven build {handle} didn't close")));
     }
     super::services::answer(Ok(Vec::new()))
+}
+
+/// `line`, at most half an answer's bytes of it (cut at a character), with a note if it was
+/// cut.
+fn bounded(line: &str) -> String {
+    let most = MOST_BYTES / 2;
+    if line.len() <= most {
+        return line.to_string();
+    }
+    let mut end = most;
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} more bytes)", &line[..end], line.len() - end)
 }

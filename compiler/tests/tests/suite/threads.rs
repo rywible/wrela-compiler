@@ -30,8 +30,8 @@ fn jobs_give_the_same_results_with_any_helpers() {
 }
 
 /// A job a program polls (`done`) is done before long, with no helpers too: then the first poll
-/// runs it, since no helper would ever start it (a page on a two-core machine has none; the map
-/// lens, which polls its preview, waited forever in test mode's one thread).
+/// runs it, since no helper would ever start it (a page on a two-core machine has none; a program
+/// that polled its preview waited forever in test mode's one thread).
 #[test]
 fn a_polled_job_is_done_with_any_helpers() {
     const MOST: u32 = 2_000_000_000;

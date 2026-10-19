@@ -42,8 +42,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-/// How long Chrome may take to answer on its pipe.
-pub const STARTUP: Duration = Duration::from_secs(15);
+/// How long Chrome may take to answer on its pipe. Generous: under a full check's load (builds,
+/// GPU tests and other browsers at once) a healthy Chrome has taken over 15 s to answer, and a
+/// slow start isn't a fault of what a test checks. A Chrome that fails to start ends sooner.
+pub const STARTUP: Duration = Duration::from_secs(60);
 
 /// How long a killed group has to be seen gone.
 const REAP: Duration = Duration::from_secs(2);

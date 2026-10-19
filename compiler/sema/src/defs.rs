@@ -724,6 +724,9 @@ pub struct ToolTest {
     /// Whether `std::tool::browser` may start Chrome (`browser: true`): the test then runs on
     /// the real clock, as a live browser does.
     pub browser: bool,
+    /// The blob budget (`blobs: "8M,64"`, as `wrela tool --blob-budget` takes it), if the test
+    /// gives one.
+    pub blobs: Option<String>,
 }
 
 /// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is

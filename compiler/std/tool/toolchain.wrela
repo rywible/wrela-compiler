@@ -1,7 +1,11 @@
-// A tool's toolchain (language.md §15.5): builds, tests, checks, formatting and the reference
-// docs of packages in the tool's roots, by the compiler's own code, in the tool host's process:
-// what `wrela build`, `test`, `check`, `fmt` and `doc --export` do. A package and an output are
-// root paths (`NAME/rel`); an output is in a write root.
+// A tool's toolchain (language.md §15.5): builds, tests, checks, formatting, queries and the
+// reference docs of packages in the tool's roots, by the compiler's own code, in the tool host's
+// process: what `wrela build`, `test`, `check`, `fmt`, `query` and `doc --export` do. A package
+// and an output are root paths (`NAME/rel`); an output is in a write root.
+//
+// A lifted build's literals (§23) are a tool's to read and write: `literals` gives their values
+// in the files as they are now (a live tool sends them to the running program), and `edit`
+// writes new values of them by their index in the build through `wrela edit`'s code.
 //
 // The compiler reads only through the tool's roots: the package, its dependencies (one outside
 // the roots is an error), its workspace's manifest and members, and the files it embeds. Its
@@ -191,6 +195,74 @@ pub fn doc_export(
     ask("toolchain/doc_export", take w.into_bytes())
 }
 
+/// Answers `queries` (as `wrela query` takes them: `type main.wrela:3:9`, `fields
+/// main.wrela:3:9`, `callees main::step`) on the package at `pkg`, with one check, its
+/// dependencies read from other packages as `overrides` says (as a build's are):
+/// `read_queried` reads the answer, `wrela query --json`'s JSON.
+@tool
+pub fn query(
+    pkg: str,
+    queries: [String],
+    overrides: [Override],
+    timeout: f64 = 0.0,
+) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(pkg)
+    w.write_u32(queries.len())
+    for q in queries {
+        w.write_str(q.as_str())
+    }
+    w.write_u32(overrides.len())
+    for o in overrides {
+        w.write_str(o.name.as_str())
+        w.write_str(o.dir.as_str())
+    }
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/query", take w.into_bytes())
+}
+
+/// The literals of the lifted build in `build` (a directory with its `lift.json`) of the program
+/// at `program`: their values as the build has them, and in the files it lifted as they are now.
+/// `read_literals` reads the answer.
+@tool
+pub fn literals(program: str, build: str, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(program)
+    w.write_str(build)
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/literals", take w.into_bytes())
+}
+
+/// Writes new values of the literals of the lifted build in `build` of the program at
+/// `program`, each by its index in the build, into the files as they are now, through `wrela
+/// edit`'s code: each literal keeps its form, and nothing is written if a file has changed past
+/// its literals since the build, or if `wrela edit` refuses. The files are in write roots, and
+/// each is replaced whole. `read_edited` reads the answer: `wrela edit --json`'s, on one line,
+/// with `written` true, or `{"file", "why", "written": false}`.
+@tool
+pub fn edit(program: str, build: str, edits: [(u32, f32)], timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(program)
+    w.write_str(build)
+    w.write_u32(edits.len())
+    for e in edits {
+        let (i, v) = e
+        w.write_u32(i)
+        w.write_u32(bitcast_u32(v))
+    }
+    w.write_u64(bitcast_u64(timeout))
+    ask("toolchain/edit", take w.into_bytes())
+}
+
+/// A lifted build's literals now: the files it lifted (root paths), the literals' values as the
+/// build has them, and their values in the files as they are now, or `None` if a file has
+/// changed past its literals (it needs a new build).
+pub struct Literals: Clone {
+    pub files: Vec<String>,
+    pub built: Vec<f32>,
+    pub values: Option<Vec<f32>>,
+}
+
 /// A count of texts, then each, or `None`.
 fn read_strings(r: mut Reader) -> Option<Vec<String>> {
     let Ok(n) = r.read_u32() else { return None }
@@ -297,6 +369,56 @@ pub fn read_formatted(polled: take Result<Vec<u8>, IoError>) -> Result<Formatted
     Ok(Formatted { changed, failed })
 }
 
+/// Reads a `query` answer: the JSON of the answers, an array with one for each query.
+pub fn read_queried(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
+    read_text(take polled, "toolchain/query")
+}
+
+/// Reads an `edit` answer: its JSON.
+pub fn read_edited(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
+    read_text(take polled, "toolchain/edit")
+}
+
+fn read_text(polled: take Result<Vec<u8>, IoError>, service: str) -> Result<String, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(text) = r.read_string() else { return Err(malformed(service)) }
+    if !r.at_end() {
+        return Err(malformed(service))
+    }
+    Ok(text)
+}
+
+/// Reads a `literals` answer: the files, whether the values follow, then their count and each.
+pub fn read_literals(polled: take Result<Vec<u8>, IoError>) -> Result<Literals, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Some(files) = read_strings(mut r) else { return Err(malformed("toolchain/literals")) }
+    let Some(built) = read_floats(mut r) else { return Err(malformed("toolchain/literals")) }
+    let Ok(has) = r.read_u8() else { return Err(malformed("toolchain/literals")) }
+    var values: Option<Vec<f32>> = None
+    if has == 1 {
+        let Some(v) = read_floats(mut r) else { return Err(malformed("toolchain/literals")) }
+        values = Some(take v)
+    }
+    if !r.at_end() {
+        return Err(malformed("toolchain/literals"))
+    }
+    Ok(Literals { files, built, values })
+}
+
+/// A count of `f32`s, then each's bits, or `None`.
+fn read_floats(r: mut Reader) -> Option<Vec<f32>> {
+    let Ok(n) = r.read_u32() else { return None }
+    if n > r.left() {
+        return None
+    }
+    var v: Vec<f32> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(bits) = r.read_u32() else { return None }
+        v.push(bitcast_f32(bits))
+    }
+    Some(v)
+}
+
 /// Reads a `doc_export` answer: how many files it wrote.
 pub fn read_exported(polled: take Result<Vec<u8>, IoError>) -> Result<u32, ToolError> {
     var r = Reader::new(answer(take polled)?)
@@ -346,4 +468,35 @@ fn a_test_run_reads_back() {
     let Ok(t) = read_tested(Ok(take w.into_bytes())) else { panic("a run") }
     assert(!t.passed && t.results.len() == 1 && !t.results[0].passed)
     assert(t.results[0].printed.len() == 1 && t.filtered_out == 2)
+}
+
+@test
+fn literals_read_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u32(1)
+    w.write_str("ws/content/ball/subject.wrela")
+    w.write_u32(2)
+    w.write_u32(bitcast_u32(0.5))
+    w.write_u32(bitcast_u32(-1.5))
+    w.write_u8(1)
+    w.write_u32(2)
+    w.write_u32(bitcast_u32(0.25))
+    w.write_u32(bitcast_u32(-1.5))
+    let Ok(l) = read_literals(Ok(take w.into_bytes())) else { panic("literals") }
+    assert(l.files.len() == 1 && l.files[0].as_str() == "ws/content/ball/subject.wrela")
+    assert(l.built.len() == 2 && l.built[0] == 0.5, "the build's values")
+    let Some(v) = l.values else { panic("values") }
+    assert(v.len() == 2 && v[0] == 0.25 && v[1] == -1.5)
+    var x = Writer::new()
+    x.write_u8(0)
+    x.write_u32(0)
+    x.write_u32(0)
+    x.write_u8(0)
+    let Ok(stale) = read_literals(Ok(take x.into_bytes())) else { panic("no values") }
+    assert(stale.values.is_none(), "a file changed past its literals")
+    assert(
+        read_literals(Ok(Vec::from([u8(0), 0, 0, 0, 0, 0, 0, 0, 0, 1, 9]))).is_err(),
+        "a short answer",
+    )
 }

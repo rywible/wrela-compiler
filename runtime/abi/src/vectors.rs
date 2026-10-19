@@ -185,7 +185,7 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .storage_read(2, "saves/slot1")
         .storage_write(3, "saves/a", &[1, 2, 3, 4, 5])
         .fetch(4, "data/level.bin")
-        .post(5, "studio/edit", &[123, 125])
+        .post(5, "notes/write", &[123, 125])
         .draw_indexed_indirect(1, [3, 0, 12], 3, 16, &[], &[])
         .label("terrain")
         .prepare(6, "../floor")

@@ -51,7 +51,6 @@
 //! wrela refactor <package-dir> <change> [--dry-run] [--json]
 //!                                         rename, move, add-param, change-mode: checked
 //!                                         before written, refused on a stale plan
-//! wrela studio <package-dir> [...]        the lens (§23)
 //! wrela audio <package-dir> <action> [...] a piece's voice as files and numbers: wav,
 //!                                         describe, numbers, midi, sheet, speed; and
 //!                                         `wrela audio partials <wav> --key k`
@@ -86,7 +85,6 @@ use std::process::ExitCode;
 
 mod audio;
 mod build;
-mod compare;
 mod doc;
 mod edit;
 mod explain;
@@ -103,7 +101,6 @@ mod reference;
 mod run;
 mod script;
 mod solve;
-mod studio;
 mod suite;
 mod sweeps;
 mod test;
@@ -141,7 +138,6 @@ pub(crate) fn usage() -> ExitCode {
         "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
         "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",
         "wrela audio clicks <file.wav> [--notes <take.json>]",
-        "wrela studio <package-dir> [serve [--port N] | build [--artifacts-only] | run <script> | look | beside <manifest> | variants <package-dir>... | sweep <literal> <value>... | <action> [args...]] [--png FILE] [--view F] [--size WxH] [--reference PNG] [--debug]",
     ];
     eprintln!("usage:\n  {}\nqueries: {}", lines.join("\n  "), wrela_driver::query::KINDS);
     ExitCode::from(2)
@@ -184,7 +180,6 @@ fn main() -> ExitCode {
             }
             test::run(rest)
         }
-        "studio" => studio::run(rest),
         "suite" => suite::run(rest),
         "run" => run::run(rest),
         "tool" => tool::run(rest),
