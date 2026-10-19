@@ -1,14 +1,20 @@
 // A kernel that reads past the end of its buffer from 0.05 s on
 // (compiler/tests/tests/suite/bounds.rs). WGSL doesn't trap: the read gives an element in range,
 // or a zero. A debug build checks each index, and the host reports the first frame that went
-// out of range; a release build doesn't check.
+// out of range; a release build doesn't check. A guarded index is checked only where the guard
+// lets the program read it.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
 
 @compute(64)
 fn spill(input: [u32], out: mut Slots<u32>, past: u32, id: GlobalId) {
     // A fixed array's index, always in range: checked, never out.
     let table = [10, 20, 30, 40]
-    out[id] = input[id.x + past] + table[(id.x + past) % 4]
+    // In range where it's read: a select would read `table[id.x - 1]` at every invocation.
+    var before = 0
+    if id.x > 0 && id.x <= 4 {
+        before = table[id.x - 1]
+    }
+    out[id] = input[id.x + past] + table[(id.x + past) % 4] + before
 }
 
 pub struct Buffers {
