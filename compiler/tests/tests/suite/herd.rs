@@ -19,12 +19,6 @@ fn herd() -> PathBuf {
 fn ours() -> CpuHost {
     CpuBuild::load(herd()).expect("load the herd").start_with(1).expect("start")
 }
-/// AC6's physique and #43 §9's per bone: the herd's own tests (examples/herd's `@test`s).
-#[test]
-fn the_herds_own_tests_pass() {
-    assert_eq!(super::tests_pass(&wrela_tests::repo_root().join("examples/herd")), 2);
-}
-
 /// Reusing the height of a vertical ray's column keeps each hit's bits and march count,
 /// including misses, signed zeros, nonvertical rays and nonfinite inputs.
 #[test]

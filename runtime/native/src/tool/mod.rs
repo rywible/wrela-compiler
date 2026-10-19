@@ -54,7 +54,7 @@ mod services;
 pub mod toolchain;
 
 pub use blobs::BlobBudget;
-pub use caps::{Caps, Grants, Program, ProgramGrant};
+pub use caps::{Caps, Grants, Opened, Program, ProgramGrant};
 pub use run::{GROUPS_ENV, launch};
 pub use toolchain::Toolchain;
 

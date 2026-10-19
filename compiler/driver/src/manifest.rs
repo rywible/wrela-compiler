@@ -12,16 +12,31 @@
 //! ```
 //!
 //! A manifest can also declare a workspace, whose members are packages found by name
-//! ([`crate::workspace`]):
+//! ([`crate::workspace`]), the files it may hold (`wrela suite allow`, [`crate::suite`]), and
+//! its tools with their grants (`wrela tool <name>`):
 //!
 //! ```text
 //! [workspace]
 //! members = ["geo", "content/*"]     # paths from this file; `/*` is each package in it
+//! allow = ["**/*.wrela", "**/wrela.toml"]   # globs of the files the workspace may hold
+//! exclude = ["compiler/**"]          # globs the allowlist check doesn't look at
+//! pending = ["games/console.toml"]   # files not allowed yet, reported until they go
+//! untested = ["games/big"]           # members whose tests the whole suite doesn't run yet
+//!
+//! [tools.release]
+//! package = "studio/release"         # a member with a tool build
+//! read = ["ws=."]                    # a root's name = its path from this file
+//! write = ["out=build/release"]
+//! net = ["api.cloudflare.com"]
+//! run = ["wasm-opt"]                 # as `--allow-run` takes them
+//! secrets = ["CLOUDFLARE_API_TOKEN"]
+//! browser = true
+//! timeout = 1800                     # seconds
 //! ```
 //!
 //! The file is read as the subset of TOML these need: `[section]` headers, `key = value` lines,
-//! and values that are strings, `true`, `false`, an inline table of those, or an array (which
-//! may run over several lines). Anything else is E0219, at its place in the file.
+//! and values that are strings, `true`, `false`, whole numbers, an inline table of those, or an
+//! array (which may run over several lines). Anything else is E0219, at its place in the file.
 
 use std::collections::HashSet;
 use wrela_diag::{Diagnostic, FileId, Span, codes};
@@ -64,6 +79,41 @@ pub struct WorkspaceDecl {
     /// Each entry of `members`, a path relative to the manifest's directory or one ending `/*`,
     /// and its place.
     pub members: Vec<(String, Span)>,
+    /// `allow`: globs, from the manifest's directory, of the files the workspace may hold.
+    pub allow: Vec<(String, Span)>,
+    /// `exclude`: globs of files the allowlist check doesn't look at.
+    pub exclude: Vec<(String, Span)>,
+    /// `pending`: globs of files the allowlist refuses, reported as waiting for removal.
+    pub pending: Vec<(String, Span)>,
+    /// `untested`: members, by their directories, whose tests the whole suite doesn't run yet;
+    /// it says so, and naming them still runs them.
+    pub untested: Vec<(String, Span)>,
+    /// Each `[tools.<name>]`.
+    pub tools: Vec<ToolDecl>,
+}
+
+/// A workspace's `[tools.<name>]`: a member's tool build and the most that `wrela tool <name>`
+/// grants it (language.md §15.5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolDecl {
+    pub name: String,
+    /// The `[tools.<name>]` header.
+    pub span: Span,
+    /// `package`: the member's directory, from the manifest's.
+    pub package: String,
+    /// `read` and `write`: each root's name and its directory, from the manifest's.
+    pub read: Vec<(String, String)>,
+    pub write: Vec<(String, String)>,
+    /// `net`: hosts, as `--net` takes them.
+    pub net: Vec<String>,
+    /// `run`: programs, as `--allow-run` takes them (`NAME`, `NAME=PATH`, `NAME=tool:DIR`).
+    pub run: Vec<String>,
+    /// `secrets`: environment variables, by name.
+    pub secrets: Vec<String>,
+    /// `browser`: Chrome may be started (`--browser`).
+    pub browser: bool,
+    /// `timeout`: the run's budget, in seconds.
+    pub timeout: Option<u64>,
 }
 
 /// A value in the subset of TOML a manifest uses.
@@ -71,6 +121,7 @@ pub struct WorkspaceDecl {
 enum Value {
     Str(String),
     Bool(bool),
+    Int(u64),
     Table(Vec<(String, Value, Span)>),
     Array(Vec<(Value, Span)>),
 }
@@ -102,6 +153,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
     let mut section = String::new();
     let mut keys = HashSet::new();
     let mut sections = HashSet::new();
+    let mut tools: Vec<ToolDecl> = Vec::new();
     let mut offset = 0u32;
     // The end of a value that ran over lines: the lines before it are read.
     let mut skip_to = 0u32;
@@ -141,14 +193,40 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
             match section.as_str() {
                 "package" => out.package = true,
                 "dependencies" => {}
-                "workspace" => out.workspace = Some(WorkspaceDecl { span, members: Vec::new() }),
+                "workspace" => {
+                    out.workspace = Some(WorkspaceDecl {
+                        span,
+                        members: Vec::new(),
+                        allow: Vec::new(),
+                        exclude: Vec::new(),
+                        pending: Vec::new(),
+                        untested: Vec::new(),
+                        tools: Vec::new(),
+                    })
+                }
+                s if s.strip_prefix("tools.").is_some_and(is_tool_name) => tools.push(ToolDecl {
+                    name: s["tools.".len()..].to_string(),
+                    span,
+                    package: String::new(),
+                    read: Vec::new(),
+                    write: Vec::new(),
+                    net: Vec::new(),
+                    run: Vec::new(),
+                    secrets: Vec::new(),
+                    browser: false,
+                    timeout: None,
+                }),
+                s if s.starts_with("tools.") => errors.push(
+                    bad(at, content.len(), format!("`{}` can't name a tool", &s["tools.".len()..]))
+                        .with_note("a tool's name has letters, digits, `_` and `-`, so it can't be read as a path"),
+                ),
                 _ => errors.push(
                     bad(
                         at,
                         content.len(),
                         format!("`[{section}]` isn't a section of `wrela.toml`"),
                     )
-                    .with_note("a manifest has `[package]`, `[dependencies]` and `[workspace]` (language.md §3.6)"),
+                    .with_note("a manifest has `[package]`, `[dependencies]`, `[workspace]` and `[tools.<name>]` (language.md §3.6)"),
                 ),
             }
             continue;
@@ -277,17 +355,158 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                     w.members = members;
                 }
             }
+            ("workspace", "untested", Value::Array(items)) => {
+                let mut dirs = Vec::new();
+                for (v, vspan) in items {
+                    match v {
+                        Value::Str(s) if is_inner_path(&s) => dirs.push((s, vspan)),
+                        _ => errors.push(Diagnostic::new(codes::E0219, vspan, "each of `untested` is a member's directory, from this file, as a string")),
+                    }
+                }
+                if let Some(w) = &mut out.workspace {
+                    w.untested = dirs;
+                }
+            }
+            ("workspace", key @ ("allow" | "exclude" | "pending"), Value::Array(items)) => {
+                let mut globs = Vec::new();
+                for (v, vspan) in items {
+                    match v {
+                        Value::Str(s) if crate::suite::is_glob(&s) => globs.push((s, vspan)),
+                        _ => errors.push(
+                            Diagnostic::new(codes::E0219, vspan, format!("each of `{key}` is a glob of paths, as a string"))
+                                .with_note("a glob is a path from this file, with `/` between its parts: `*` and `?` match within a part, a part `**` matches any number of parts, and no part is empty, `.` or `..`"),
+                        ),
+                    }
+                }
+                if let Some(w) = &mut out.workspace {
+                    match key {
+                        "allow" => w.allow = globs,
+                        "exclude" => w.exclude = globs,
+                        _ => w.pending = globs,
+                    }
+                }
+            }
+            (sec, key, value) if sec.starts_with("tools.") => {
+                // A header that didn't read is reported already.
+                let Some(tool) = tools.last_mut().filter(|t| sec["tools.".len()..] == t.name) else {
+                    continue;
+                };
+                if let Err(why) = tool_key(tool, key, value) {
+                    errors.push(bad(at, content.len(), why).with_note("`[tools.<name>]` has `package = \"...\"`, `read`, `write`, `net`, `run` and `secrets` (arrays of strings), `browser = true` and `timeout = <seconds>` (language.md §3.6)"));
+                }
+            }
             ("", _, _) => errors.push(bad(at, content.len(), "a key outside a section".into())
                 .with_help("put it under `[package]`, `[dependencies]` or `[workspace]`")),
             (sec, key, _) => errors.push(bad(at, content.len(), format!("`{key}` isn't a key of `[{sec}]`, or its value has the wrong type"))
                 .with_note(match sec {
                     "package" => "`[package]` has `name = \"...\"` and `unsafe = true`",
                     "dependencies" => "`[dependencies]` has `name = { path = \"...\" }` and `name = { workspace = true }`",
-                    _ => "`[workspace]` has `members = [\"...\", ...]`",
+                    _ => "`[workspace]` has `members`, `allow`, `exclude`, `pending` and `untested`, each `[\"...\", ...]`",
                 })),
         }
     }
+    for tool in tools {
+        match &mut out.workspace {
+            _ if tool.package.is_empty() => errors.push(
+                Diagnostic::new(codes::E0219, tool.span, format!("the tool `{}` names no `package`", tool.name))
+                    .with_help("give it `package = \"...\"`, the directory of a member with a tool build"),
+            ),
+            Some(w) => w.tools.push(tool),
+            None => errors.push(
+                Diagnostic::new(codes::E0219, tool.span, format!("the tool `{}` is declared outside a workspace", tool.name))
+                    .with_note("`[tools.<name>]` belongs to a manifest with `[workspace]`, whose members are the tools' packages"),
+            ),
+        }
+    }
     if errors.is_empty() { Ok(out) } else { Err(errors) }
+}
+
+/// Whether `s` can name a tool: letters, digits, `_` and `-`, so `wrela tool <name>` can't read
+/// it as a path.
+pub fn is_tool_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Whether `s` can name a root, a program or a secret, as the tool host takes them: letters,
+/// digits, `_`, `-` and `.`.
+fn is_grant_name(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Whether `s` is a path from the workspace's directory that stays inside it: `.`, or parts
+/// separated by `/`, none of them empty, `.` or `..`.
+fn is_inner_path(s: &str) -> bool {
+    s == "." || (!s.is_empty() && s.split('/').all(|p| !p.is_empty() && p != "." && p != ".."))
+}
+
+/// Reads `key = value` of a `[tools.<name>]` into `tool`, or says what's wrong.
+fn tool_key(tool: &mut ToolDecl, key: &str, value: Value) -> Result<(), String> {
+    let strings = |value: Value| -> Result<Vec<String>, String> {
+        let Value::Array(items) = value else {
+            return Err(format!("`{key}` is an array of strings"));
+        };
+        items
+            .into_iter()
+            .map(|(v, _)| match v {
+                Value::Str(s) => Ok(s),
+                _ => Err(format!("`{key}` is an array of strings")),
+            })
+            .collect()
+    };
+    match (key, value) {
+        ("package", Value::Str(p)) if is_inner_path(&p) => tool.package = p,
+        ("package", _) => {
+            return Err(
+                "a tool's `package` is a member's directory, from this file, as a string".into()
+            );
+        }
+        (k @ ("read" | "write"), v) => {
+            let mut roots = Vec::new();
+            for grant in strings(v)? {
+                match grant.split_once('=') {
+                    Some((name, path)) if is_grant_name(name) && is_inner_path(path) => {
+                        roots.push((name.to_string(), path.to_string()))
+                    }
+                    _ => {
+                        return Err(format!(
+                            "`{grant}` isn't a root: `{k}` grants `NAME=PATH`, a name of letters, digits, `_`, `-` and `.`, and a path inside the workspace (no part empty, `.` or `..`)"
+                        ));
+                    }
+                }
+            }
+            if k == "read" { tool.read = roots } else { tool.write = roots }
+        }
+        ("net", v) => tool.net = strings(v)?,
+        ("secrets", v) => {
+            tool.secrets = strings(v)?;
+            if let Some(bad) = tool.secrets.iter().find(|s| !is_grant_name(s)) {
+                return Err(format!("`{bad}` can't name a secret"));
+            }
+        }
+        ("run", v) => {
+            tool.run = strings(v)?;
+            if let Some(bad) = tool.run.iter().find(|r| {
+                let (name, at) = r.split_once('=').unwrap_or((r, "x"));
+                !is_grant_name(name) || at.is_empty() || at == "tool:"
+            }) {
+                return Err(format!(
+                    "`{bad}` isn't a program: `run` takes `NAME`, `NAME=PATH` or `NAME=tool:DIR`, as `--allow-run` does"
+                ));
+            }
+        }
+        ("browser", Value::Bool(b)) => tool.browser = b,
+        ("timeout", Value::Int(n)) if n > 0 => tool.timeout = Some(n),
+        ("timeout", _) => {
+            return Err("a tool's `timeout` is a whole number of seconds, more than 0".into());
+        }
+        (k, _) => {
+            return Err(format!(
+                "`{k}` isn't a key of `[tools.{}]`, or its value has the wrong type",
+                tool.name
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `s` is a member's path: not empty, with `*` only as its last part (`content/*`).
@@ -370,6 +589,11 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
     if let Some(rest) = s.strip_prefix("false") {
         return Ok((Value::Bool(false), rest));
     }
+    let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits > 0 {
+        let n = s[..digits].parse().map_err(|_| Box::new(bad("a number is at most 2⁶⁴ - 1")))?;
+        return Ok((Value::Int(n), &s[digits..]));
+    }
     if let Some(rest) = s.strip_prefix('"') {
         let mut out = String::new();
         let mut chars = rest.char_indices();
@@ -430,7 +654,9 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
             }
         }
     }
-    Err(Box::new(bad("a value is a string, `true`, `false`, `{ ... }` or `[ ... ]`")))
+    Err(Box::new(bad(
+        "a value is a string, `true`, `false`, a whole number, `{ ... }` or `[ ... ]`",
+    )))
 }
 
 #[cfg(test)]
@@ -476,6 +702,86 @@ mod tests {
                 .expect("parses");
         assert!(one.package);
         assert_eq!(one.workspace.expect("a workspace").members.len(), 2);
+    }
+
+    #[test]
+    fn reads_a_workspaces_files_and_tools() {
+        let text = r#"[tools.release]
+package = "studio/release"
+read = ["ws=."]
+write = ["out=build/release"]
+net = ["api.example"]
+run = ["wasm-opt", "wrangler=tool:fakes/wrangler"]
+secrets = ["TOKEN"]
+browser = true
+timeout = 1800
+
+[workspace]
+members = ["studio/*"]
+allow = ["**/*.wrela", "AGENTS.md"]
+exclude = ["compiler/**"]
+pending = ["games/console.toml"]
+untested = ["games/last-green"]
+
+[tools.lint]
+package = "studio/lint"
+"#;
+        let w = parse(file(), text).expect("parses").workspace.expect("a workspace");
+        let globs = |g: &[(String, Span)]| g.iter().map(|(s, _)| s.clone()).collect::<Vec<_>>();
+        assert_eq!(globs(&w.allow), ["**/*.wrela", "AGENTS.md"]);
+        assert_eq!(globs(&w.exclude), ["compiler/**"]);
+        assert_eq!(globs(&w.pending), ["games/console.toml"]);
+        assert_eq!(globs(&w.untested), ["games/last-green"]);
+        let names: Vec<&str> = w.tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["release", "lint"], "a tool declared before `[workspace]` is its");
+        let release = &w.tools[0];
+        assert_eq!(release.package, "studio/release");
+        assert_eq!(release.read, [("ws".to_string(), ".".to_string())]);
+        assert_eq!(release.write, [("out".to_string(), "build/release".to_string())]);
+        assert_eq!(release.net, ["api.example"]);
+        assert_eq!(release.run, ["wasm-opt", "wrangler=tool:fakes/wrangler"]);
+        assert_eq!(release.secrets, ["TOKEN"]);
+        assert!(release.browser && release.timeout == Some(1800));
+        assert_eq!(
+            &text[release.span.start as usize..release.span.end as usize],
+            "[tools.release]"
+        );
+        let lint = &w.tools[1];
+        assert!(lint.read.is_empty() && !lint.browser && lint.timeout.is_none());
+    }
+
+    #[test]
+    fn rejects_what_a_workspace_or_a_tool_gets_wrong() {
+        let ws = "[workspace]\nmembers = [\"t\"]\n";
+        for (tail, says) in [
+            ("allow = [\"/abs\"]\n", "glob"),
+            ("allow = [\"a/../b\"]\n", "glob"),
+            ("exclude = [\"a**\"]\n", "glob"),
+            ("pending = [true]\n", "glob"),
+            ("untested = [\"../x\"]\n", "member's directory"),
+            ("allow = \"*\"\n", "isn't a key"),
+            ("[tools.t]\npackage = \"t\"\ncolour = \"red\"\n", "`colour` isn't a key"),
+            ("[tools.t]\nread = [\"in=data\"]\n", "names no `package`"),
+            ("[tools.t]\npackage = \"../t\"\n", "member's directory"),
+            ("[tools.t]\npackage = \"t\"\nread = [\"in\"]\n", "isn't a root"),
+            ("[tools.t]\npackage = \"t\"\nwrite = [\"out=../x\"]\n", "isn't a root"),
+            ("[tools.t]\npackage = \"t\"\nwrite = [\"out=/tmp\"]\n", "isn't a root"),
+            ("[tools.t]\npackage = \"t\"\nnet = \"a.example\"\n", "array of strings"),
+            ("[tools.t]\npackage = \"t\"\nrun = [\"x=\"]\n", "isn't a program"),
+            ("[tools.t]\npackage = \"t\"\nsecrets = [\"A B\"]\n", "can't name a secret"),
+            ("[tools.t]\npackage = \"t\"\ntimeout = 0\n", "`timeout`"),
+            ("[tools.t]\npackage = \"t\"\ntimeout = \"60\"\n", "`timeout`"),
+            ("[tools.t]\npackage = \"t\"\nbrowser = \"yes\"\n", "`browser` isn't a key"),
+            ("[tools.a/b]\npackage = \"t\"\n", "can't name a tool"),
+            ("[tools.t]\npackage = \"t\"\n[tools.t]\npackage = \"t\"\n", "more than once"),
+        ] {
+            let text = format!("{ws}{tail}");
+            let errors = parse(file(), &text).expect_err(&text);
+            assert!(errors.iter().all(|e| e.code == codes::E0219), "{text}: {errors:?}");
+            assert!(errors.iter().any(|e| e.message.contains(says)), "{text}: {errors:?}");
+        }
+        let alone = parse(file(), "[tools.t]\npackage = \"t\"\n").expect_err("no workspace");
+        assert!(alone[0].message.contains("outside a workspace"), "{alone:?}");
     }
 
     #[test]

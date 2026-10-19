@@ -32,11 +32,6 @@ const SIZE: (u32, u32) = (512, 512);
 const WAIT: u32 = 400;
 
 #[test]
-fn ordinary_views_size_their_buffers_after_silhouettes() {
-    assert_eq!(super::tests_pass(&repo_root().join("studio/tests/views")), 1);
-}
-
-#[test]
 fn literal_rounding_uses_the_source_unit_and_exponent() {
     let pkg = super::scratch("studio-literal-rounding-source");
     std::fs::write(

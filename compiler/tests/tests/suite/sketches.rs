@@ -149,23 +149,6 @@ fn the_gameplay_sketchs_own_tests_pass() {
     own_tests_pass("compiler/tests/sketches/gameplay");
 }
 
-#[test]
-fn hello_fields_own_tests_pass() {
-    own_tests_pass("examples/hello-field");
-}
-
-/// The wolf's walk (frame tests of 120 frames, AC7).
-#[test]
-fn the_wolfs_own_tests_pass() {
-    own_tests_pass("content/wolf");
-}
-
-/// The grazer's walk (frame tests of 120 frames, AC7).
-#[test]
-fn the_grazers_own_tests_pass() {
-    own_tests_pass("content/grazer");
-}
-
 const GAMEPLAY_FRAMES: u32 = 60;
 
 /// The four systems in Chrome and in the native host: the same frames (their state hash covers

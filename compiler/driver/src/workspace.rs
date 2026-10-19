@@ -5,7 +5,9 @@
 //!
 //! The loader ([`crate::check`] and the rest) reports what's wrong as diagnostics: E0220 for a
 //! dependency no workspace has, E0223 for a workspace whose members aren't packages or share a
-//! name. Tools that only need the directories use [`dependency_dirs`].
+//! name, or whose tools (`[tools.<name>]`) and `untested` name no member, or a member with no
+//! tool build. Tools that only need the directories use [`dependency_dirs`]; `wrela suite` and
+//! `wrela tool <name>` read a whole workspace with [`Workspace::open`].
 
 use crate::manifest::{self, Source, WorkspaceDecl};
 use crate::reach::{Kind, Reach};
@@ -173,7 +175,133 @@ pub fn members_in(
             out.push((Member { name, dir: canon }, span));
         }
     }
-    (Members { list: out.into_iter().map(|(m, _)| m).collect(), unread }, errors)
+    let members = Members { list: out.into_iter().map(|(m, _)| m).collect(), unread };
+    errors.extend(check_tools(reach, base, decl, &members));
+    (members, errors)
+}
+
+/// What's wrong with the workspace's `untested` and `[tools.<name>]` (E0223): a directory that
+/// isn't one of `members`, or a tool's `package` whose `main.wrela` doesn't export `tool`, so it
+/// has no tool build (§15.5).
+fn check_tools(
+    reach: &Reach,
+    base: &Path,
+    decl: &WorkspaceDecl,
+    members: &Members,
+) -> Vec<Diagnostic> {
+    let mut errors = Vec::new();
+    let member = |path: &str| {
+        let at = reach.canonical(&base.join(path)).ok();
+        at.filter(|d| members.list.iter().any(|m| &m.dir == d))
+    };
+    for (path, span) in &decl.untested {
+        if member(path).is_none() && !members.unread {
+            errors.push(Diagnostic::new(
+                codes::E0223,
+                *span,
+                format!("`untested` names `{path}`, which isn't a member of this workspace"),
+            ));
+        }
+    }
+    for tool in &decl.tools {
+        let Some(dir) = member(&tool.package) else {
+            // A member whose manifest didn't read may be it: that error is reported.
+            if !members.unread {
+                errors.push(
+                    Diagnostic::new(
+                        codes::E0223,
+                        tool.span,
+                        format!(
+                            "the tool `{}`'s package `{}` isn't a member of this workspace",
+                            tool.name, tool.package
+                        ),
+                    )
+                    .with_help("list its directory in `members`, or fix `package`"),
+                );
+            }
+            continue;
+        };
+        if !exports_tool(reach, &dir) {
+            errors.push(Diagnostic::new(
+                codes::E0223,
+                tool.span,
+                format!(
+                    "the tool `{}`'s package `{}` has no tool build: its main.wrela doesn't export `tool` (§15.5)",
+                    tool.name, tool.package
+                ),
+            ));
+        }
+    }
+    errors
+}
+
+/// Whether the package in `dir` has a tool build: its `main.wrela` has a `pub fn tool`.
+fn exports_tool(reach: &Reach, dir: &Path) -> bool {
+    let Ok(text) = reach.read_to_string(&dir.join("main.wrela")) else { return false };
+    let parsed = wrela_syntax::parse(FileId(0), &text);
+    parsed.file.items.iter().any(|item| {
+        item.vis.is_some_and(|v| !v.package)
+            && matches!(&item.kind, wrela_syntax::ast::ItemKind::Fn(f) if f.name.name == "tool")
+    })
+}
+
+/// A workspace, read: its manifest's path, its directory (canonical), what it declares and its
+/// members.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    pub manifest: PathBuf,
+    pub root: PathBuf,
+    pub decl: WorkspaceDecl,
+    pub members: Vec<Member>,
+}
+
+impl Workspace {
+    /// The workspace whose manifest is `manifest`: its members found and its tools checked. The
+    /// error is everything wrong with it, each problem on a line of its own.
+    pub fn open(manifest: &Path) -> Result<Workspace, String> {
+        let manifest = manifest
+            .canonicalize()
+            .map_err(|e| format!("can't read {}: {e}", manifest.display()))?;
+        let root = manifest.parent().expect("a manifest's directory").to_path_buf();
+        let text = std::fs::read_to_string(&manifest)
+            .map_err(|e| format!("can't read {}: {e}", manifest.display()))?;
+        let mut sources = wrela_diag::SourceMap::new();
+        let file = sources.add(manifest.display().to_string(), text.clone());
+        let parsed = manifest::parse(file, &text)
+            .map_err(|errors| wrela_diag::render::render_all(&sources, &errors))?;
+        let Some(decl) = parsed.workspace else {
+            return Err(format!("{} has no `[workspace]`", manifest.display()));
+        };
+        let mut unread = Vec::new();
+        let (members, errors) = crate::on_compiler_thread(|| {
+            members(&manifest, &decl, &mut |p| read(p).map_err(|e| unread.push(e)).ok())
+        });
+        if !unread.is_empty() || !errors.is_empty() {
+            let mut out = unread.join("\n");
+            out.push_str(&wrela_diag::render::render_all(&sources, &errors));
+            return Err(out);
+        }
+        Ok(Workspace { manifest, root, decl, members: members.list })
+    }
+
+    /// The workspace at or above `dir`: [`Workspace::open`] on its manifest.
+    pub fn of(dir: &Path) -> Result<Workspace, String> {
+        let path = find(dir).ok_or_else(|| {
+            format!("no `wrela.toml` at or above `{}` has `[workspace]`", dir.display())
+        })?;
+        Workspace::open(&path)
+    }
+
+    /// `dir`'s path from the workspace's directory, with `/` between its parts: how the suite
+    /// names a member (`wrela::<path>::<test>`).
+    pub fn path_of(&self, dir: &Path) -> String {
+        relative(dir, &self.root)
+    }
+
+    /// The tool the workspace declares as `name`.
+    pub fn tool(&self, name: &str) -> Option<&manifest::ToolDecl> {
+        self.decl.tools.iter().find(|t| t.name == name)
+    }
 }
 
 /// The name of the member in `dir` whose manifest is `m`: its `[package] name`, else its
@@ -524,6 +652,70 @@ mod tests {
         assert_eq!(got, [("E0219", "../geo/wrela.toml".to_string())]);
         assert!(dependency_dirs(&d.join("app")).is_err_and(|e| e.contains("geo")));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A tool's package must be a member with a tool build, and `untested` must name members:
+    /// the check of a package that reads the workspace reports what's wrong (E0223), and so does
+    /// opening the workspace.
+    #[test]
+    fn a_workspaces_tools_are_members_with_tool_builds() {
+        const TOOL: &str = "pub fn tool() -> u32 {\n    0\n}\n";
+        let files = |tools: &str| {
+            vec![
+                (
+                    "wrela.toml".to_string(),
+                    format!("[workspace]\nmembers = [\"app\", \"tool\", \"lib\"]\n{tools}"),
+                ),
+                // The app reads the workspace: it depends on a member by name.
+                (
+                    "app/wrela.toml".to_string(),
+                    "[package]\nname = \"app\"\n\n[dependencies]\nlib = { workspace = true }\n"
+                        .to_string(),
+                ),
+                ("lib/wrela.toml".to_string(), "[package]\nname = \"lib\"\n".to_string()),
+                ("lib/one.wrela".to_string(), "pub fn one() -> u32 {\n    1\n}\n".to_string()),
+                ("app/main.wrela".to_string(), FRAME.to_string()),
+                ("tool/wrela.toml".to_string(), "[package]\nname = \"tool\"\n".to_string()),
+                ("tool/main.wrela".to_string(), TOOL.to_string()),
+                ("outside/wrela.toml".to_string(), "[package]\nname = \"outside\"\n".to_string()),
+                ("outside/main.wrela".to_string(), TOOL.to_string()),
+            ]
+        };
+        let cases = [
+            ("good", "[tools.t]\npackage = \"tool\"\n", None),
+            (
+                "not-member",
+                "[tools.t]\npackage = \"outside\"\n",
+                Some("isn't a member of this workspace"),
+            ),
+            ("gone", "[tools.t]\npackage = \"gone\"\n", Some("isn't a member of this workspace")),
+            ("no-tool", "[tools.t]\npackage = \"app\"\n", Some("has no tool build")),
+            ("untested", "untested = [\"outside\"]\n", Some("`untested` names `outside`")),
+        ];
+        for (name, tools, says) in cases {
+            let files = files(tools);
+            let files: Vec<(&str, &str)> =
+                files.iter().map(|(p, t)| (p.as_str(), t.as_str())).collect();
+            let d = tree(&format!("tools-{name}"), &files);
+            let got = errors(&d.join("app"));
+            let opened = Workspace::open(&d.join("wrela.toml"));
+            match says {
+                None => {
+                    assert_eq!(got, [], "{name}");
+                    let ws = opened.expect("opens");
+                    assert_eq!(ws.tool("t").map(|t| t.package.as_str()), Some("tool"));
+                    assert_eq!(ws.path_of(&ws.members[1].dir), "tool");
+                }
+                Some(says) => {
+                    assert!(
+                        got.iter().any(|(c, m)| *c == "E0223" && m.contains(says)),
+                        "{name}: {got:?}"
+                    );
+                    assert!(opened.is_err_and(|e| e.contains(says)), "{name}");
+                }
+            }
+            let _ = std::fs::remove_dir_all(&d);
+        }
     }
 
     #[test]

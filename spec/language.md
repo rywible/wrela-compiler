@@ -409,7 +409,28 @@ members = [
 - **`name = { workspace = true }` is the member named `name`.** A member's name is its `[package] name`; a member without one has its directory's name, with `-` read as `_`. A package can use a member this way whether it is a member or not. A dependency has a `path` or `workspace = true`, not both (E0219).
 - **A workspace's manifest is a package's too only if it has `[package]`.** Without one, its directory isn't a package, and checking or building it is E0223.
 - **Each member is a package with a name of its own.** A member that isn't a directory with a `wrela.toml`, a `/*` that names no package, and two members with one name are E0223. A directory listed twice is one member. A workspace dependency with no workspace above it, or with no member of that name, is E0220.
-- **`path` dependencies work in a workspace and outside it.** `members` is the only key of `[workspace]`; any other key, or a section declared twice, is E0219.
+- **`path` dependencies work in a workspace and outside it.**
+- **`[workspace]`'s keys are arrays of strings.** Any other key, a value of another kind, or a section declared twice, is E0219.
+  - `members`, above.
+  - `allow`, `exclude` and `pending`: globs of the workspace's files, for `wrela suite allow` (§13.2). A glob is a path from this file, with `/` between its parts, and no part empty, `.` or `..`. `*` and `?` match within a part, and a part `**` matches any number of parts.
+  - `untested`: members, by their directories, whose tests `wrela suite` runs only when they are named. A directory that isn't a member is E0223.
+
+A workspace also declares its tools (§15.5), each in a `[tools.<name>]`: a member with a tool build, and the most that `wrela tool <name>` grants it.
+
+```text
+[tools.release]
+package = "studio/release"        # a member's directory, relative to this file
+read = ["ws=."]                   # a root's name and its directory, relative to this file
+write = ["out=build/release"]     # made if it is missing
+net = ["api.cloudflare.com"]      # as --net takes them
+run = ["wasm-opt"]                # as --allow-run takes them; a path is relative to this file
+secrets = ["CLOUDFLARE_API_TOKEN"]
+browser = true                    # --browser
+timeout = 1800                    # seconds
+```
+
+- **`package` is required.** A tool's name has letters, digits, `_` and `-`. Each root's directory stays inside the workspace: no part of its path is empty, `.` or `..`. A key that isn't one of these, a value of the wrong kind, and a `[tools.<name>]` in a manifest without `[workspace]` are E0219.
+- **A tool's package is a member with a tool build.** A `package` that isn't a member, or whose `main.wrela` doesn't export `tool`, is E0223. This is checked each time the workspace is read: by the check of a package that depends on a member by name, by `wrela tool` and by `wrela suite`.
 
 ## 4. Types
 
@@ -1336,6 +1357,24 @@ fn deploys_the_release() {
 - **A fake program is a tool package in the test's package:** `run: [("wrangler", "fakes/wrangler")]` grants `wrangler` as the tool build of the package in `fakes/wrangler` (`--allow-run wrangler=tool:DIR`, §15.5). So no fake is written in another language. It runs in a process of its own, on the system's clock.
 - **A tool test passes if its job ends.** It fails if it panics, if a failed `assert` panics, if it traps, if its budget runs out, or if the host fails. Each failure is E0706, with the host's reason. What it prints is the test's output (`printed` in `wrela test --json`).
 
+#### A workspace's suite
+
+`wrela suite [<name>] [--workspace <dir>]` checks the workspace at or above the current directory (or at `dir`) in one command:
+
+- `fmt`: each member's `.wrela` files are formatted, as `wrela fmt --check` finds them in the member's directory.
+- `allow`: each of the workspace's files is one that `[workspace] allow` declares (§3.6).
+  - The workspace's files are the files under its directory that its `.gitignore` files don't ignore. The check reads no git index, so it runs the same on a copy of the files, and it checks a file that git shows as untracked too. It reads only the versioned `.gitignore` files: a checkout's own excludes (`.git/info/exclude`, `core.excludesFile`) hide nothing, so every checkout of the same files gives the same answer. It reads the patterns as git does (a trailing `/**` matches what is inside a directory, not the directory), but a `[...]` class as its text.
+  - A file that an `exclude` glob matches isn't looked at.
+  - A file that no `allow` glob matches fails the check, by its name, unless a `pending` glob matches it. Then the check reports it as pending removal. A `pending` glob that matches no such file fails the check, so the list says what is there.
+- `wrela::<package-path>::`: each test of the member at that path from the workspace's directory, as `wrela test` runs them, in a `wrela test` process of its own. These are tests of code, frame and tick tests, GPU frame tests with their goldens (on the hardware GPU), and tool tests, each supervised as `wrela test` supervises it.
+- `wrela::<package-path>::<test-name>`: exactly that test (`wrela test --exact`).
+
+How it runs:
+
+- **With no name, the suite runs every check:** `fmt`, `allow`, and each member's tests, several members at a time. It doesn't run the tests of a member that `untested` lists, and says so.
+- **A name selects exactly what it names, as `tools/check.sh` reads a name.** A malformed name, an empty one, a second one, a member that the workspace doesn't have, and a test name that no test of the package has, or more than one, are usage errors (status 2). A member's tests that are named fail if it has none.
+- **Every check runs, also when another fails.** The output names each test and each check as it ends, then each failure's output, then a summary. The status is 0 if every check passes and 1 if one fails.
+
 #### An example
 
 A test of code and a frame test:
@@ -1605,7 +1644,7 @@ pub fn tool(job: mut Job<main>) -> u32 {
 ```
 
 **Grants.**
-- Grants come only from the command line. The host opens them once, when the tool starts, into one capability context that every service gets. A request outside the grants fails, and the tool continues.
+- Grants come only from the command line, and from a workspace's `[tools.<name>]` (§3.6). The host opens them once, when the tool starts, into one capability context that every service gets. A request outside the grants fails, and the tool continues.
 - `--read NAME=DIR` grants the directory as the root `NAME`. `--write NAME=DIR` grants it for writing, and for reading too. A root that is not a directory, or a name that is granted twice, stops the command before the tool starts.
 - A path is `NAME/relative/path`, with `/` between its parts and no part empty, `.` or `..`. `NAME` alone is the root itself. The host opens each path relative to its root's directory handle, one part at a time. So no path or symbolic link leaves the root, also a link that replaces a directory after a check.
 - The host opens a file without waiting on it, and the opened handle must be a regular file. A FIFO, a socket or a device fails the request at once, by the type of the handle, not of the path.
@@ -1613,6 +1652,9 @@ pub fn tool(job: mut Job<main>) -> u32 {
 - `--net HOST` grants a host to `std::tool::http`, over HTTPS. The URL's host must be the grant exactly: `--net HOST:PORT` grants that port, and a URL with a user is refused.
 - `--allow-run NAME` grants the program `NAME` to `std::tool::run`. The host finds it on `PATH` when the grants are opened and keeps its absolute path, so a later change to `PATH` does not change which file runs. `--allow-run NAME=PATH` names the file itself. `--allow-run NAME=tool:DIR` names the tool build of the package at `DIR`, which this `wrela` runs as `wrela tool`.
 - `--browser` grants `std::tool::browser`: the host may start Chrome stable for the tool. Chrome is `WRELA_CHROME` if that is set, else the macOS app or the first Chrome on Linux's `PATH`; `WRELA_CHROME_ARGS` adds arguments.
+- **`wrela tool <name>`** runs the tool that the workspace at or above the current directory declares as `[tools.<name>]`: its package's tool build, with the grants that the workspace declares, each path from the workspace's directory. A word that names a declared tool is the tool; any other argument is a package's directory.
+  - **The command line can only narrow the declared grants.** If it grants nothing, the run has the declared grants. If it grants anything, its grants are the run's grants instead, and each must be within a declared grant: a root at or below a declared root of the same name (a declared write root, to write), a program as it is declared (`--allow-run NAME` alone keeps the declared one), and a host, a secret or `--browser` that is declared. `--timeout` can only shorten a declared `timeout`. Any other grant stops the command before the tool starts (status 2). `--blob-budget` is a limit, not a grant, and the command line sets it as for a package.
+  - Each declared root is opened from the workspace's directory one part at a time, following no link, and a missing write root is made the same way. A narrowed root is opened from its declared root's directory the same way. The run gets these opened directories, not their paths opened again: so a directory replaced after the check, by a link or anything else, leads nowhere new, and nothing outside the workspace is made or granted.
 - **A granted program has the user's authority.** It runs natively, as any process does: it can reach what the user can, and `npx` runs code that it downloads. Its working directory is where it starts, not a confinement. Grant only the programs that the tool needs.
 
 **The services** are `std::tool`'s, and each is `@tool`:

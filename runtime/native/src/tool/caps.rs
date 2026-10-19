@@ -42,6 +42,37 @@ pub struct Grants {
     pub tool_runner: Option<PathBuf>,
     /// Whether `std::tool::browser` may start Chrome (`--browser`).
     pub browser: bool,
+    /// Roots opened already, by name: [`Caps::open`] keeps each handle instead of opening its
+    /// directory again by its path, so what was checked through the handle is what's granted.
+    pub opened: Vec<(String, Opened)>,
+}
+
+/// A directory, opened: a handle that a root can be granted as ([`Grants::opened`]).
+#[derive(Clone, Debug)]
+pub struct Opened(std::sync::Arc<Dir>);
+
+impl Opened {
+    /// The directory at `path`, opened by its path: a directory the command trusts, such as a
+    /// workspace's.
+    pub fn at(path: &std::path::Path) -> Result<Opened, String> {
+        let dir = Dir::open_ambient_dir(path, ambient_authority())
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        Ok(Opened(std::sync::Arc::new(dir)))
+    }
+
+    /// The directory at `rel` (parts separated by `/`, or `.` for this one) inside this one,
+    /// each part opened through the one before without following a link, and with `make`, made
+    /// if it's missing. So whatever replaces a part, before or after, nothing outside is reached
+    /// or made.
+    pub fn within(&self, rel: &str, make: bool) -> Result<Opened, String> {
+        let dir = if rel == "." {
+            self.0.try_clone().map_err(|e| e.to_string())?
+        } else {
+            let parts = crate::confined::parts(rel)?;
+            crate::confined::open_dir(&self.0, &parts, make).map_err(|e| format!("`{rel}`: {e}"))?
+        };
+        Ok(Opened(std::sync::Arc::new(dir)))
+    }
 }
 
 /// Where a granted program is.
@@ -329,11 +360,20 @@ impl Caps {
             if roots.contains_key(name) {
                 return Err(format!("the root `{name}` is granted twice"));
             }
-            let opened = Dir::open_ambient_dir(dir, ambient_authority())
-                .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?;
-            let path = dir
-                .canonicalize()
-                .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?;
+            let kept = grants.opened.iter().find(|(n, _)| n == name);
+            let (opened, path) = match kept {
+                // Opened and checked already: the handle is the root, and its path names it for
+                // a program's working directory.
+                Some((_, o)) => {
+                    (o.0.try_clone().map_err(|e| format!("the root `{name}`: {e}"))?, dir.clone())
+                }
+                None => (
+                    Dir::open_ambient_dir(dir, ambient_authority())
+                        .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?,
+                    dir.canonicalize()
+                        .map_err(|e| format!("the root `{name}` ({}): {e}", dir.display()))?,
+                ),
+            };
             roots.insert(name.clone(), Root { dir: opened, path, write: *write });
         }
         let mut secrets: Vec<(String, String)> = Vec::new();

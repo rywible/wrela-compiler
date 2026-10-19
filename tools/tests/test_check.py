@@ -74,7 +74,7 @@ class Selection(unittest.TestCase):
         self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two', 'three'])
         text = output.getvalue()
         for shown in ['step output for clippy', 'step output for rustfmt', 'step output for browser',
-                      'program output for one', 'one failed', '4 of 13 checks failed']:
+                      'program output for one', 'one failed', '4 of 14 checks failed']:
             self.assertIn(shown, text)
         self.assertIn('all checks failed', text)
 
@@ -114,7 +114,7 @@ class Selection(unittest.TestCase):
                             patch.object(check, 'program_name', side_effect=str), \
                             patch.object(check, 'call', side_effect=build) as build_cli, \
                             patch.object(check, 'step', side_effect=selected), \
-                            patch.object(check, 'wrela_test', side_effect=selected), \
+                            patch.object(check, 'wrela_name', side_effect=selected), \
                             patch.object(check, 'listed', return_value=['test']), \
                             patch.object(check, 'rust_run', return_value=1), \
                             contextlib.redirect_stdout(io.StringIO()):
@@ -226,6 +226,26 @@ if mode == 'failure': sys.exit(1)
 
 
 class WrelaSelection(unittest.TestCase):
+    def test_a_members_name_goes_to_the_suite_and_the_toolchains_stays_here(self):
+        with patch.object(check, 'call') as run, patch.object(check, 'wrela_test') as here:
+            for name in ['wrela::engine::alpha', 'wrela::games/leapling::', 'wrela::missing::']:
+                check.wrela_name(name, Path('wrela'), Path('logs'))
+                self.assertEqual(run.call_args.args[0],
+                                 ['wrela', 'suite', name, '--workspace', str(check.ROOT)])
+            here.assert_not_called()
+            run.reset_mock()
+            for name in ['wrela::compiler/std::x', 'wrela::compiler/tests/fields::',
+                         'wrela::runtime/fixtures/x::y']:
+                check.wrela_name(name, Path('wrela'), Path('logs'))
+                self.assertEqual(here.call_args.args[0], name)
+            run.assert_not_called()
+
+    def test_the_workspace_is_the_suites_and_not_formatted_twice(self):
+        self.assertFalse([s for s in check.SOURCES if not s.startswith(check.TOOLCHAIN)])
+        with patch.object(check, 'call') as run:
+            check.step('wrela-suite', Path('wrela'), Path('logs'))
+        self.assertEqual(run.call_args.args[0], ['wrela', 'suite', '--workspace', str(check.ROOT)])
+
     def test_exact_results_required_and_package_paths_confined(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

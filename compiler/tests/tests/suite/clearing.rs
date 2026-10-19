@@ -360,32 +360,6 @@ fn the_wind_is_a_function_of_time_and_place() {
     assert!(len([a[0], a[1], a[2]]) > 1e-4, "no sway: {a:?}");
 }
 
-/// AC8: the clearing's own tests (`wrela test examples/clearing`, world.wrela): over the whole
-/// walk, a planted foot slides under 5 mm and stands within 1 cm of the terrain, the legs keep
-/// their lengths within 1e-4 m, and the springs' energy decays after the trail's turns.
-#[test]
-fn the_walks_own_tests_pass() {
-    assert_eq!(super::tests_pass(&repo_root().join("examples/clearing")), 2);
-}
-
-/// The engine's own tests (`@test`s in engine/), on the CPU: each one its files declare runs and
-/// passes (counted from the files, so a branch that adds one needn't change this test).
-#[test]
-fn the_engines_own_tests_pass() {
-    let engine = repo_root().join("engine");
-    let declared: usize = std::fs::read_dir(&engine)
-        .expect("engine/")
-        .map(|e| e.expect("an entry of engine/").path())
-        .filter(|p| p.extension().is_some_and(|x| x == "wrela"))
-        .map(|p| {
-            let text = std::fs::read_to_string(&p).expect("an engine file");
-            text.lines().filter(|l| l.trim_start().starts_with("@test")).count()
-        })
-        .sum();
-    assert!(declared > 0, "engine/ declares no tests");
-    assert_eq!(super::tests_pass(&engine), declared);
-}
-
 /// The broad culling cone must contain the camera's corners, including a square viewport.
 /// This is CPU visibility state: the empty prototype needs no mesh realization or GPU work.
 #[test]

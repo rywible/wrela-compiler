@@ -13,6 +13,7 @@ mod refactor;
 mod script;
 mod solve;
 mod studio;
+mod suite;
 mod test;
 mod tool;
 mod tool_tests;

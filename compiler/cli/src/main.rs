@@ -64,6 +64,14 @@
 //!     [--timeout S] [--blob-budget B] [-- args...]
 //!                                         build the package's tool and run it with those
 //!                                         grants (§15.5); exit with the tool's status
+//! wrela tool <name> [grants...] [-- args...]
+//!                                         the tool the workspace declares as `name`
+//!                                         (`[tools.<name>]`), with its grants, which the
+//!                                         command line may only narrow
+//! wrela suite [<check-name>] [--workspace <dir>]
+//!                                         every check of the workspace: its members' format,
+//!                                         its allowlist and its members' tests; or one
+//!                                         (`fmt`, `allow`, `wrela::<package-path>::[<test>]`)
 //! ```
 //!
 //! Exit status: 0 success, 1 the program has errors (or `fmt --check` found unformatted
@@ -96,6 +104,7 @@ mod run;
 mod script;
 mod solve;
 mod studio;
+mod suite;
 mod sweeps;
 mod test;
 mod tool;
@@ -126,7 +135,8 @@ pub(crate) fn usage() -> ExitCode {
         "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
         "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
-        "wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--blob-budget B] [-- args...]",
+        "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
+        "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--blob-budget B] [-- args...]",
         "wrela audio <package-dir> (wav <out.wav> | describe | numbers | midi <out.mid> | sheet <out.png> [--bars a-b] | speed) [--take n] [--seconds s]",
         "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
         "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",
@@ -175,6 +185,7 @@ fn main() -> ExitCode {
             test::run(rest)
         }
         "studio" => studio::run(rest),
+        "suite" => suite::run(rest),
         "run" => run::run(rest),
         "tool" => tool::run(rest),
         "audio" => audio::run(rest),

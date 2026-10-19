@@ -4,7 +4,7 @@
 //! same samples every time, and in Chrome the same as on the native host, in real time without
 //! dropping out (long checks: a minute of the piece, the whole of it at full size).
 
-use super::{engine_package, tests_pass};
+use super::engine_package;
 use std::path::Path;
 use wrela_host::CpuBuild;
 use wrela_tests::{page, repo_root};
@@ -62,13 +62,6 @@ fn a_mistake_in_a_score_fails_the_build_where_it_is() {
         let got = score_error(name, voices);
         assert!(got.contains(want), "{name}: {got}");
     }
-}
-
-/// The piece's own tests: its score has 78 bars in four voices, and its deadpan plays the score
-/// exactly.
-#[test]
-fn the_gymnopedies_tests_pass() {
-    assert_eq!(tests_pass(&repo_root().join("examples/gymnopedie")), 2);
 }
 
 /// Every number of the taste and the marks is lifted, so the lens's tools can change it while

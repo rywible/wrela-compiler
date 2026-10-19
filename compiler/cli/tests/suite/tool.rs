@@ -721,3 +721,191 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// A workspace with the tool `copy` (the package `copier`, [`COPY`]), its grants `extra` added to
+/// what it declares: `in` to read, `out` to write (not made yet), its secret, and a minute.
+fn copy_workspace(name: &str, extra: &str) -> std::path::PathBuf {
+    let tool = format!(
+        "[tools.copy]\npackage = \"copier\"\nread = [\"in=data/in\"]\nwrite = [\"out=data/out\"]\nsecrets = [\"WRELA_TOOL_TEST_TOKEN\"]\ntimeout = 60\n{extra}"
+    );
+    package(
+        name,
+        &[
+            ("wrela.toml", &format!("[workspace]\nmembers = [\"copier\", \"plain\"]\n\n{tool}")),
+            ("copier/wrela.toml", &manifest("copier")),
+            ("copier/main.wrela", COPY),
+            ("plain/wrela.toml", &manifest("plain")),
+            ("plain/main.wrela", "pub fn frame(time: f32, width: u32, height: u32) {}\n"),
+            ("data/in/notes.txt", "kept"),
+            ("data/in/sub/notes.txt", "narrowed"),
+        ],
+    )
+}
+
+/// `wrela tool <name>` in `dir` with `args`: its status and what it printed.
+fn named(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
+    let out = wrela()
+        .arg("tool")
+        .args(args)
+        .current_dir(dir)
+        .env("WRELA_TOOL_TEST_TOKEN", "abcd")
+        .output()
+        .expect("run wrela tool");
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    (out.status.code(), text)
+}
+
+#[test]
+fn a_named_tool_runs_with_the_grants_its_workspace_declares() {
+    let ws = copy_workspace("tool-named", "");
+    assert!(!ws.join("data/out").exists());
+    // From below the workspace's directory, the name finds the tool.
+    let (status, out) = named(&ws.join("plain"), &["copy", "--", "notes.txt", "b", "c"]);
+    assert_eq!(status, Some(3), "{out}");
+    assert_eq!(out, "copied notes.txt; the token is 4 bytes\n");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("data/out/copy/notes.txt")).expect("copied"),
+        "kept"
+    );
+    // A path is a package's directory, as before: with no grants, it can read nothing.
+    let (status, out) = named(&ws, &["./copier", "--", "notes.txt"]);
+    assert_eq!(status, Some(91), "{out}");
+    // A word that names no tool and no directory says what the workspace has.
+    let (status, out) = named(&ws, &["missing"]);
+    assert_eq!(status, Some(2), "{out}");
+    assert!(
+        out.contains("neither a package's directory nor a tool") && out.contains("copy"),
+        "{out}"
+    );
+}
+
+#[test]
+fn the_command_line_may_narrow_a_named_tools_grants_and_never_widen_them() {
+    let ws = copy_workspace("tool-narrow", "net = [\"a.example\"]\nrun = [\"ls\"]\n");
+    let at = |p: &str| ws.join(p).canonicalize().expect("a directory").display().to_string();
+    std::fs::create_dir_all(ws.join("data/out/sub")).expect("mkdir");
+    // Narrower: a root below the declared one, no secret, a shorter timeout.
+    let read = format!("in={}", at("data/in/sub"));
+    let write = format!("out={}", at("data/out/sub"));
+    let (status, out) = named(
+        &ws,
+        &["copy", "--read", &read, "--write", &write, "--net", "a.example", "--allow-run", "ls"],
+    );
+    assert_eq!(status, Some(64), "the tool ran, with no arguments: {out}");
+    let (status, out) = named(
+        &ws,
+        &["copy", "--read", &read, "--write", &write, "--timeout", "30", "--", "notes.txt"],
+    );
+    assert_eq!(status, Some(1), "{out}");
+    assert!(out.is_empty(), "no secret was granted: {out}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("data/out/sub/copy/notes.txt")).expect("copied"),
+        "narrowed"
+    );
+    // Wider: each is refused before the tool starts.
+    let above = format!("in={}", at("data"));
+    let write_in = format!("in={}", at("data/in"));
+    let other = format!("other={}", at("data/in"));
+    for (args, says) in [
+        (&["--read", above.as_str()][..], "`--read in="),
+        (&["--write", write_in.as_str()], "`--write in="),
+        (&["--read", other.as_str()], "`--read other="),
+        (&["--net", "b.example"], "`--net b.example`"),
+        (&["--secret", "HOME"], "`--secret HOME`"),
+        (&["--browser"], "`--browser`"),
+        (&["--allow-run", "cat"], "`--allow-run cat`"),
+        (&["--allow-run", "ls=/bin/cat"], "`--allow-run ls=...`"),
+        (&["--timeout", "61"], "`--timeout 61`"),
+    ] {
+        let mut all = vec!["copy"];
+        all.extend(args);
+        let (status, out) = named(&ws, &all);
+        assert_eq!(status, Some(2), "{args:?}: {out}");
+        assert!(out.contains(says) && out.contains("widens"), "{args:?}: {out}");
+    }
+}
+
+#[test]
+fn a_workspaces_tools_are_checked_when_it_is_read() {
+    let tool = |body: &str| {
+        format!("[workspace]\nmembers = [\"copier\", \"plain\"]\n\n[tools.copy]\n{body}")
+    };
+    for (body, code, says) in [
+        ("package = \"copier\"\ncolour = \"red\"\n", "E0219", "`colour` isn't a key"),
+        ("read = [\"in=data/in\"]\n", "E0219", "names no `package`"),
+        ("package = \"copier\"\nwrite = [\"out=../out\"]\n", "E0219", "isn't a root"),
+        ("package = \"elsewhere\"\n", "E0223", "isn't a member of this workspace"),
+        ("package = \"plain\"\n", "E0223", "has no tool build"),
+    ] {
+        let ws = copy_workspace("tool-invalid", "");
+        std::fs::write(ws.join("wrela.toml"), tool(body)).expect("write");
+        let (status, out) = named(&ws, &["copy"]);
+        assert_eq!(status, Some(2), "{body}: {out}");
+        assert!(out.contains(code) && out.contains(says), "{body}: {out}");
+        let suite = wrela().arg("suite").arg("fmt").current_dir(&ws).output().expect("run");
+        let (status, out) = (suite.status.code(), String::from_utf8_lossy(&suite.stderr));
+        assert_eq!(status, Some(1), "{body}: {out}");
+        assert!(out.contains(code) && out.contains(says), "the suite reads it too: {body}: {out}");
+    }
+    // A write root that a link leads outside the workspace is never made there.
+    let ws = copy_workspace("tool-link", "");
+    let outside = package("tool-link-outside", &[]);
+    std::fs::create_dir_all(ws.join("data")).expect("mkdir");
+    std::os::unix::fs::symlink(&outside, ws.join("data/out")).expect("link");
+    let (status, out) = named(&ws, &["copy", "--", "notes.txt"]);
+    assert_eq!(status, Some(2), "{out}");
+    assert!(out.contains("isn't a directory inside the workspace"), "{out}");
+    assert_eq!(std::fs::read_dir(&outside).expect("read").count(), 0, "nothing was made outside");
+}
+
+/// A directory of the workspace swapped for a link outside it, after the grants are checked and
+/// before the tool runs (at the moment the command says it has checked them), neither widens a
+/// narrowed root nor moves a write root made inside the workspace: the run keeps the
+/// directories it checked, and nothing outside is read or made.
+#[test]
+fn a_directory_swapped_after_the_grants_are_checked_leads_nowhere_new() {
+    let ws = copy_workspace("tool-swap", "");
+    let outside = package(
+        "tool-swap-outside",
+        &[("in/sub/notes.txt", "outside"), ("in/notes.txt", "outside"), ("out/.keep", "")],
+    );
+    let hold = package("tool-swap-hold", &[]);
+    let canonical = ws.canonicalize().expect("canonical");
+    let read = format!("in={}", canonical.join("data/in/sub").display());
+    let mut child = wrela()
+        .arg("tool")
+        .args(["copy", "--read", &read, "--write"])
+        .arg(format!("out={}", canonical.join("data/out").display()))
+        .args(["--", "notes.txt"])
+        .current_dir(&ws)
+        .env("WRELA_TESTING_GRANTS_HOLD", &hold)
+        .spawn()
+        .expect("run wrela tool");
+    // The write root wasn't there: the command made it, before it said it had checked.
+    assert!(
+        within(std::time::Duration::from_secs(60), || hold.join("checked").exists()),
+        "the grants were checked"
+    );
+    assert!(ws.join("data/out").is_dir(), "the write root was made");
+    std::fs::rename(ws.join("data"), ws.join("data-kept")).expect("move the checked directory");
+    std::os::unix::fs::symlink(&outside, ws.join("data")).expect("a link outside");
+    std::fs::write(hold.join("go"), "").expect("go");
+    let status = child.wait().expect("the tool ends");
+    assert_eq!(status.code(), Some(1), "the tool copied its one file");
+    let copied = std::fs::read_to_string(ws.join("data-kept/out/copy/notes.txt"));
+    assert_eq!(copied.expect("copied into the checked root").as_str(), "narrowed");
+    assert!(!outside.join("out/copy").exists(), "nothing was made outside the workspace");
+}
+
+/// Whether `done` holds within `bound`, asked every few milliseconds.
+fn within(bound: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let until = std::time::Instant::now() + bound;
+    while std::time::Instant::now() < until {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    done()
+}

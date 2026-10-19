@@ -11,3 +11,6 @@ __pycache__/
 node_modules/
 # The native host's compiled code, kept beside a build it loads (runtime/native cache.rs)
 .native/
+# Local tools' state, never the repository's: Claude Code's worktrees and Wrangler's cache
+.claude/worktrees/
+/.wrangler/

@@ -68,23 +68,6 @@ fn font_baking_needs_positive_finite_geometry() {
     }
 }
 
-/// A glyph made while the program runs, from a host's drawing: a colour one draws its own colour
-/// on the GPU (ui/tests/glyphs).
-#[test]
-fn a_made_colour_glyph_draws_its_colour() {
-    let count = super::tests_pass(&wrela_tests::repo_root().join("ui/tests/glyphs"));
-    assert_eq!(count, 1);
-}
-
-/// Every widget's frame test, each driven by a script of input (ui/tests/widgets/scripts.wrela).
-#[test]
-fn the_widgets_pass_their_frame_tests() {
-    let out = wrela_driver::test(&wrela_tests::repo_root().join("ui/tests/widgets"), None);
-    let failures: Vec<_> = out.results.iter().filter(|r| r.failure.is_some()).collect();
-    assert!(out.passed(), "{:?} {failures:?}", out.diagnostics);
-    assert!(out.results.len() >= 9, "{} tests", out.results.len());
-}
-
 /// The test strings' sizes and lines, as ui/tests/text lays them out.
 const SIZES: [f32; 7] = [10.0, 12.0, 16.0, 24.0, 32.0, 48.0, 72.0];
 const LATIN: &str = "The quick brown fox jumps over the lazy dog: 0123456789";

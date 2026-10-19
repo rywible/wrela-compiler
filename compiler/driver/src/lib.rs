@@ -28,6 +28,7 @@ pub mod script;
 pub mod serve;
 pub mod shipped;
 pub mod studio;
+pub mod suite;
 pub mod tool_tests;
 pub mod workspace;
 

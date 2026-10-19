@@ -34,19 +34,6 @@ fn the_tool_tests_fixture_passes() {
     }
 }
 
-/// A job that traps does so at the tick that takes it (#43 AC6), through the tool host:
-/// engine/tests/run-jobs's tool test builds its package through `std::tool::toolchain` and
-/// drives its ticks through `std::tool::drive`, with no helpers, one or seven, and with jobs
-/// slowed; and the trap's stage and number are the host's, reached by frames too.
-#[test]
-fn the_run_jobs_tool_test_passes() {
-    let tests = ran(&wrela_root().join("engine/tests/run-jobs"));
-    assert_eq!(tests.len(), 2, "the trap at its tick, and its number: {tests:?}");
-    for (name, passed, message) in &tests {
-        assert!(passed, "{name}: {message}");
-    }
-}
-
 /// The repository's root.
 fn wrela_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
