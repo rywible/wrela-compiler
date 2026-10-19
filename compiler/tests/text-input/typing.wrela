@@ -1,0 +1,15 @@
+// What compiler/tests/tests/suite/input.rs types in Chrome, in text mode: trusted keys (a, a
+// space, b, Enter, Backspace), then an input method's composition and its commit.
+
+use std::input::Key
+use std::tool::browser::{Script, Until}
+
+pub const TYPING: Script = Script::new()
+    .wait(Until::active("textarea"))
+    .press(Key::A)
+    .press(Key::Space)
+    .press(Key::B)
+    .press(Key::Enter)
+    .press(Key::Backspace)
+    .compose("かな", start: 2, end: 2)
+    .insert_text("仮名")

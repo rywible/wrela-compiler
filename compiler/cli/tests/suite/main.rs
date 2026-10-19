@@ -4,6 +4,7 @@ mod audio;
 mod common;
 mod compare;
 mod doc;
+mod docs_chrome;
 mod drive;
 mod fix;
 mod profile;

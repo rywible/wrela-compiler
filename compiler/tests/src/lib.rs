@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use wrela_diag::{Diagnostic, Edit, FileId};
+use wrela_host::chrome::script::Step;
 use wrela_host::{CpuHost, GpuTiming, Host, TickLog, Timing, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
@@ -457,7 +458,7 @@ impl RawGpu {
 }
 
 /// Builds the package at `pkg` (a path from the repo root) into `target/tmp/<name>`, where
-/// tools/headless.py can serve it as a page (its runs write `results/` there). Returns the
+/// [`run_page`] can serve it as a page (its runs write `results/` there). Returns the
 /// directory and its path from the repo root. Each package is built once per process, and each
 /// page is a copy of that build.
 pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
@@ -529,40 +530,48 @@ fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -
     base
 }
 
-/// Runs tools/headless.py, from the repo root, with `args`: whether the run passed. It empties
-/// the page's `results/` first.
-fn headless<S: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = S>) -> bool {
-    headless_with(args, None)
+/// Runs the page at `rel` (a directory from the repo root) in headless Chrome
+/// (`wrela_host::pages`), with URL fragment `fragment`, within `timeout` seconds, giving it
+/// `script`'s trusted input while it runs: why it failed, if it did. It empties the page's
+/// `results/` first.
+pub fn run_page(
+    rel: &str,
+    fragment: &str,
+    timeout: u32,
+    script: Option<&[Step]>,
+) -> Result<(), String> {
+    let root = repo_root();
+    wrela_host::pages::run(wrela_host::pages::Page {
+        root: &root,
+        page: rel,
+        fragment,
+        timeout: std::time::Duration::from_secs(u64::from(timeout)),
+        script,
+    })
 }
 
-/// [`headless`], the test server slowed to `throttle` bits a second if given.
-fn headless_with<S: AsRef<std::ffi::OsStr>>(
-    args: impl IntoIterator<Item = S>,
-    throttle: Option<String>,
-) -> bool {
-    let mut cmd = std::process::Command::new("python3");
-    cmd.arg(repo_root().join("tools/headless.py")).args(args).current_dir(repo_root());
-    match throttle {
-        Some(bits) => cmd.env("WRELA_THROTTLE", bits),
-        None => cmd.env_remove("WRELA_THROTTLE"),
-    };
-    cmd.status().expect("python3 runs tools/headless.py").success()
+/// Runs the page at `rel` (from [`page`]) in headless Chrome with URL fragment `fragment`,
+/// giving it `script`'s trusted input while it runs (a `std::tool::browser::Script`, which
+/// [`browser_script`] reads). Whether the run passed; its printed lines are in
+/// `results/log.txt`.
+pub fn run_page_with_script(rel: &str, fragment: &str, script: &[Step], timeout: u32) -> bool {
+    match run_page(rel, fragment, timeout, Some(script)) {
+        Ok(()) => true,
+        Err(why) => {
+            eprintln!("{why}");
+            false
+        }
+    }
 }
 
-/// Runs the page at `rel` (from [`page`]) in headless Chrome with URL fragment `fragment`, giving it
-/// trusted input through DevTools while it runs: `commands` (tools/headless.py's `--cdp`), written
-/// beside the page. Whether the run passed; its printed lines are in `results/log.txt`.
-pub fn run_page_with_devtools(rel: &str, fragment: &str, commands: &str, timeout: u32) -> bool {
-    let file = repo_root().join(rel).join("devtools.json");
-    std::fs::write(&file, commands).expect("write the DevTools commands");
-    let timeout = timeout.to_string();
-    headless(["--cdp", file.to_str().expect("a UTF-8 path"), rel, fragment, &timeout])
-}
-
-/// Runs a plain page (no wrela build) at `rel` in headless Chrome with URL fragment
-/// `fragment`: whether it wrote `ok` to `results/DONE` within `timeout` seconds.
-pub fn run_page_in_chrome(rel: &str, fragment: &str, timeout: u32) -> bool {
-    headless([rel, fragment, &timeout.to_string()])
+/// The `std::tool::browser::Script` constant `name` of the package at `pkg` (from the repo
+/// root), as the driver's steps.
+pub fn browser_script(pkg: &str, name: &str) -> Vec<Step> {
+    let out = wrela_driver::script::browser_script(&repo_root().join(pkg), name);
+    let json = out.script.unwrap_or_else(|why| {
+        panic!("{why}: {}", wrela_diag::render::render_all(&out.sources, &out.diagnostics))
+    });
+    wrela_host::chrome::script::parse(&json).unwrap_or_else(|why| panic!("`{name}`: {why}"))
 }
 
 /// A test-mode run in headless Chrome that must fail: the message the page failed with.
@@ -645,9 +654,6 @@ pub struct ChromeRun {
     pub salt: u32,
     /// Each frame as soon as the last is done, not at its time.
     pub saturate: bool,
-    /// The network slowed to this many bits a second (the test server's `WRELA_THROTTLE`: every
-    /// request shares the rate); 0 for full speed.
-    pub throttle: u64,
 }
 
 impl ChromeRun {
@@ -682,8 +688,6 @@ impl ChromeRun {
             nohash,
             salt,
             saturate,
-            // The server's, not the page's.
-            throttle: _,
         } = self;
         let mut fragment = format!(
             "#test&frames={frames}&width={width}&height={height}&fps={fps}&workers={workers}"
@@ -724,10 +728,13 @@ impl ChromeRun {
         if let Some(script) = &self.script {
             std::fs::write(repo_root().join(rel).join(SCRIPT), script).expect("write the script");
         }
-        headless_with(
-            [rel, &self.fragment(), &self.timeout().to_string()],
-            (self.throttle > 0).then(|| self.throttle.to_string()),
-        )
+        match run_page(rel, &self.fragment(), self.timeout(), None) {
+            Ok(()) => true,
+            Err(why) => {
+                eprintln!("{why}");
+                false
+            }
+        }
     }
 }
 
@@ -813,18 +820,17 @@ pub fn timings(results: &Path) -> Vec<GpuTiming> {
         .collect()
 }
 
-/// Runs the page another server serves at `url` (the studio server) in headless Chrome
-/// (tools/headless.py --url): its results go to `page/results/`. Panics, pointing at the
-/// console log, if the run fails.
+/// Runs the page another server serves at `url` (the studio server) in headless Chrome: its
+/// results go to `page/results/`. Panics, pointing at the console log, if the run fails.
 pub fn run_url_in_chrome(url: &str, page: &Path, timeout: u32) {
-    let timeout = timeout.to_string();
-    let args: [&std::ffi::OsStr; 4] =
-        ["--url".as_ref(), url.as_ref(), page.as_os_str(), timeout.as_ref()];
-    assert!(
-        headless(args),
-        "the browser run failed; see {}",
-        page.join("results/console.log").display()
-    );
+    let ran =
+        wrela_host::pages::run_url(url, page, std::time::Duration::from_secs(u64::from(timeout)));
+    if let Err(why) = ran {
+        panic!(
+            "the browser run failed ({why}); see {}",
+            page.join("results/console.log").display()
+        );
+    }
 }
 
 #[cfg(test)]

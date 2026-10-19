@@ -4,12 +4,10 @@
     tools/headless.py <page-dir relative to the repo root> [hash] [timeout-seconds]
     tools/headless.py runtime/browser/tests/hello-field '#run' 120
     tools/headless.py --url <url> <page-dir> [timeout-seconds]
-    tools/headless.py --cdp <commands.json> <page-dir> [hash] [timeout-seconds]
 
-With --cdp, the page also gets trusted input through Chrome's DevTools protocol while it runs: the
-file's commands (chrome_session.py's `cdp`: Input.dispatchKeyEvent, Input.imeSetComposition,
-Input.insertText, a wait, or a wait until the page is ready), sent once the tab has opened. A run
-of its own then starts a Chrome with a debugging port, as tools/check.sh's tests share.
+This is the Python tools' runner (lookbook.py, round.py). The compiler's own tests run pages in
+Chrome through the Rust driver instead (runtime/chrome, `wrela_host::pages`), which also gives a
+page trusted input.
 
 With --url, another server already serves the page (the studio server, which answers the lens's
 posts): Chrome opens the URL, and the run is done when the page's `results/DONE` file appears
@@ -34,7 +32,6 @@ WRELA_THROTTLE (bits a second) slows the server's sending, every request sharing
 """
 
 from collections import deque
-import json
 import math
 import os
 import re
@@ -45,9 +42,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-from urllib.parse import urlsplit
 
 import serve
 
@@ -99,26 +94,14 @@ CONSOLE_END = re.compile(r'^(.*)", source: (.*) \(\d+\)$')
 LOG_RECORD = re.compile(r"^\[\d+:\d+:\d{4}/\d{6}\.\d+:")
 
 
-def origin(url):
-    """The `scheme://host:port` a page or console source belongs to; a blob's is its creator's."""
-    parts = urlsplit(url[len("blob:"):] if url.startswith("blob:") else url)
-    return f"{parts.scheme}://{parts.netloc}" if parts.scheme and parts.netloc else None
-
-
 class ConsoleTail:
-    """Tail Chrome's appended records while keeping incomplete console lines live.
+    """Tail Chrome's appended records while keeping incomplete console lines live."""
 
-    With `page_origin`, the log is a Chrome shared by several pages: only complete records
-    whose source has that origin are kept, and nothing is shown before a record's source is
-    known."""
-
-    def __init__(self, chrome_log, console_log, offset=0, page_origin=None):
+    def __init__(self, chrome_log, console_log, offset=0):
         self.chrome_log, self.console_log = chrome_log, console_log
         self.offset, self.written = offset, 0
-        self.page_origin = page_origin
         self.pending = b""
         self.message = False
-        self.record = []  # the open record's lines, while its source is unknown
         self.lines = deque(maxlen=20)
         self.preview = None
         with open(console_log, "wb"):
@@ -138,22 +121,10 @@ class ConsoleTail:
         return (end.group(1), False, end.group(2)) if end else (line, True, None)
 
     def keep(self, text, complete):
-        """Adds the console text on `text` to `complete` once its page is known to be this one."""
-        if self.page_origin is None:
-            line, self.message, _ = self.parse(text, self.message)
-            if line is not None:
-                complete.append(line)
-            return
-        if self.message and LOG_RECORD.match(text):
-            self.record = []  # the open record ended without a source: no page to give it to
-        line, self.message, source = self.parse(text, self.message)
-        if line is None:
-            return
-        self.record.append(line)
-        if not self.message:
-            if origin(source) == self.page_origin:
-                complete.extend(self.record)
-            self.record = []
+        """Adds the console text on `text` to `complete`."""
+        line, self.message, _ = self.parse(text, self.message)
+        if line is not None:
+            complete.append(line)
 
     def read(self):
         try:
@@ -176,7 +147,7 @@ class ConsoleTail:
                 at = end.end()
             self.pending = data[at:]
             self.preview = self.parse(self.pending.rstrip(b"\r").decode(errors="replace"), self.message)[0] \
-                if self.pending and self.page_origin is None else None
+                if self.pending else None
             body = "".join(line + "\n" for line in complete).encode()
             preview = (self.preview + "\n").encode() if self.preview is not None else b""
             # Only the incomplete last line can change. Complete lines stay on disk.
@@ -241,26 +212,6 @@ def interrupt(signum, frame):
 
 def main(argv):
     url = None
-    commands = None
-    if len(argv) > 2 and argv[1] == "--cdp":
-        try:
-            with open(argv[2]) as f:
-                commands = json.load(f)
-        except (OSError, ValueError) as e:
-            fail(2, f"can't read the DevTools commands: {e}")
-        if not isinstance(commands, list):
-            fail(2, "the DevTools commands are a JSON array")
-        argv = [argv[0], *argv[3:]]
-        if not os.environ.get("WRELA_TEST_CHROME"):
-            # Trusted input needs DevTools: a Chrome with a debugging port, for this run alone.
-            from chrome_session import ChromeSession
-            with tempfile.TemporaryDirectory(prefix="wrela-cdp-") as directory, ChromeSession(directory):
-                return run(argv, commands)
-    return run(argv, commands)
-
-
-def run(argv, commands):
-    url = None
     if len(argv) > 1 and argv[1] == "--url":
         if not 4 <= len(argv) <= 5:
             fail(2, "usage: tools/headless.py --url <url> <page-dir> [timeout-seconds]")
@@ -309,8 +260,6 @@ def run(argv, commands):
         fail(2, f"can't make {results}: {e}")
 
     done = []
-    driven = []  # why the DevTools input failed
-    drove = []  # it finished
     server = None
     if url is None:
         server = start_server(page, done)
@@ -321,68 +270,46 @@ def run(argv, commands):
     start = time.monotonic()
     status, reason = 1, None
     proc = None
-    tab = None
-    shared = None
-    offset = 0
-    page_origin = None  # a Chrome of its own logs only this page
     console = None
     try:
-        shared = os.environ.get("WRELA_TEST_CHROME")
-        if shared:
-            from chrome_session import request
-            tab = request(shared, "start", {"url": url})
-            chrome_log, offset, page_origin = tab["log"], tab["offset"], origin(url)
-            if commands is not None:
-                def drive():
-                    try:
-                        request(shared, "cdp", {"target": tab["target"], "commands": commands}, timeout=timeout)
-                        drove.append(True)
-                    except Exception as error:
-                        driven.append(f"the DevTools input failed: {error}")
-                threading.Thread(target=drive, daemon=True).start()
-        else:
-            adopt_chrome_children()
-            with open(chrome_log, "wb") as log:
-                proc = subprocess.Popen(
-                    [
-                        CHROME,
-                        "--headless=new",
-                        f"--user-data-dir={profile}",
-                        "--no-first-run",
-                        "--no-default-browser-check",
-                        "--disable-extensions",
-                        "--disable-background-timer-throttling",
-                        "--disable-renderer-backgrounding",
-                        # A test page plays its voice without a click (test mode's `live`).
-                        "--autoplay-policy=no-user-gesture-required",
-                        # Timestamp queries at full resolution, not quantized to 100 µs.
-                        "--enable-webgpu-developer-features",
-                        "--enable-logging=stderr",
-                        "--v=0",
-                        "--window-size=1920,1080",
-                        *platform_args(),
-                        *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
-                        url,
-                    ],
-                    stdin=subprocess.DEVNULL,
-                    stdout=log,
-                    stderr=log,
-                    start_new_session=True,
-                )
-        console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset, page_origin)
+        adopt_chrome_children()
+        with open(chrome_log, "wb") as log:
+            proc = subprocess.Popen(
+                [
+                    CHROME,
+                    "--headless=new",
+                    f"--user-data-dir={profile}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-extensions",
+                    "--disable-background-timer-throttling",
+                    "--disable-renderer-backgrounding",
+                    # A test page plays its voice without a click (test mode's `live`).
+                    "--autoplay-policy=no-user-gesture-required",
+                    # Timestamp queries at full resolution, not quantized to 100 µs.
+                    "--enable-webgpu-developer-features",
+                    "--enable-logging=stderr",
+                    "--v=0",
+                    "--window-size=1920,1080",
+                    *platform_args(),
+                    *shlex.split(os.environ.get("WRELA_CHROME_ARGS", "")),
+                    url,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=log,
+                start_new_session=True,
+            )
+        console = ConsoleTail(chrome_log, os.path.join(results, "console.log"))
         while True:
             if server is None and not done and os.path.exists(done_file):
                 with open(done_file, errors="replace") as f:
                     done.append(f.read().strip())
-            if driven:
-                reason = driven[0]
-                break
-            # A scripted page passes only once its script has run, too.
-            if done and (commands is None or drove or done[0] != "ok"):
+            if done:
                 status, reason = (0, None) if done[0] == "ok" else (1, f"page failed: {done[0]}")
                 break
-            if (shared and not request(shared, "alive", {})["alive"]) or (proc is not None and proc.poll() is not None):
-                reason = "chrome exited early" if shared else f"chrome exited early (status {proc.returncode})"
+            if proc.poll() is not None:
+                reason = f"chrome exited early (status {proc.returncode})"
                 break
             if time.monotonic() - start >= timeout:
                 reason = f"timed out after {timeout:.0f}s"
@@ -392,18 +319,13 @@ def run(argv, commands):
     except KeyboardInterrupt:
         status, reason = 1, "interrupted"
     finally:
-        if tab is not None:
-            try:
-                request(shared, "close", {"target": tab["target"]})
-            except Exception as error:
-                status, reason = 1, f"could not close the browser test tab: {error}"
         if proc is not None:
             stop(proc)
         if server is not None:
             server.shutdown()
             server.server_close()
         if console is None:
-            console = ConsoleTail(chrome_log, os.path.join(results, "console.log"), offset, page_origin)
+            console = ConsoleTail(chrome_log, os.path.join(results, "console.log"))
         lines = console.read()
         shutil.rmtree(profile, ignore_errors=True)
 

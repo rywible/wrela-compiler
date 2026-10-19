@@ -1,5 +1,5 @@
 //! The two hosts agree: first-light run in headless Chrome (the browser runtime, via
-//! tools/headless.py) and in the native host gives the same state hash, and frames within a
+//! `wrela_host::pages`) and in the native host gives the same state hash, and frames within a
 //! mean absolute difference of 0.5/255.
 //!
 //! Ignored by default: it needs Chrome stable, python3 and the GPU. Run it with
@@ -12,7 +12,6 @@
 use crate::common;
 
 use std::path::Path;
-use std::process::Command;
 use wrela_abi::Manifest;
 use wrela_host::{Host, frame_time, image};
 
@@ -52,13 +51,16 @@ fn browser_and_native_agree_on_first_light() {
     stage(&build, &root.join("runtime/browser/dist"), &page);
 
     let fragment = format!("#test&frames={FRAMES}&width={WIDTH}&height={HEIGHT}&fps={FPS}");
-    let status = Command::new("python3")
-        .arg(root.join("tools/headless.py"))
-        .args([page_rel, &fragment, "180"])
-        .current_dir(&root)
-        .status()
-        .expect("python3 runs tools/headless.py");
-    assert!(status.success(), "the browser run failed; see {page_rel}/results/console.log");
+    let ran = wrela_host::pages::run(wrela_host::pages::Page {
+        root: &root,
+        page: page_rel,
+        fragment: &fragment,
+        timeout: std::time::Duration::from_secs(180),
+        script: None,
+    });
+    if let Err(why) = ran {
+        panic!("the browser run failed ({why}); see {page_rel}/results/console.log");
+    }
     let results = page.join("results");
     let browser_hash = std::fs::read_to_string(results.join("hash.txt")).expect("hash.txt");
     let browser_frame = std::fs::read(results.join("frame.rgba")).expect("frame.rgba");

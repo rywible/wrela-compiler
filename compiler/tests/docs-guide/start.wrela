@@ -1,0 +1,6 @@
+// The guide's start: what a reader opens first.
+
+/// Says hello to `name`, and gives its length.
+pub fn greet(name: str) -> u32 {
+    name.len()
+}

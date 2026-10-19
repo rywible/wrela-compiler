@@ -1027,13 +1027,15 @@ impl<'d, 'u> Collector<'d, 'u> {
     /// [`MAX_TOOL_TEST_BUDGET`]; `net: ["host", ...]`, the fake sites it reaches; `run:
     /// [("name", "dir"), ...]`, the programs it may run, each a tool package in a directory of
     /// the test's package; and `read: [("name", "dir"), ...]`, the roots it may read, each a
-    /// directory relative to the test's package. Anything else is E0222.
+    /// directory relative to the test's package; and `browser: true`, Chrome, on the real
+    /// clock. Anything else is E0222.
     fn tool_test(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<ToolTest> {
         let mut test = ToolTest {
             budget: TOOL_TEST_BUDGET,
             net: Vec::new(),
             run: Vec::new(),
             read: Vec::new(),
+            browser: false,
         };
         let mut bad: Option<(Span, &str)> = None;
         let mut seen: Vec<&str> = Vec::new();
@@ -1078,6 +1080,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                     }
                 }
+                "browser" => match &arg.value.kind {
+                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(on), .. }) => {
+                        test.browser = *on;
+                    }
+                    _ => bad = bad.or(Some((arg.span, "`browser` is `true` or `false`"))),
+                },
                 "net" => {
                     let hosts = match &arg.value.kind {
                         ast::ExprKind::Array(items) => {
@@ -1148,8 +1156,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                     }
                 }
                 _ => {
-                    bad = bad
-                        .or(Some((arg.span, "a tool test takes `budget`, `net`, `run` and `read`")))
+                    bad = bad.or(Some((
+                        arg.span,
+                        "a tool test takes `budget`, `net`, `run`, `read` and `browser`",
+                    )))
                 }
             }
         }

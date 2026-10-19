@@ -32,6 +32,7 @@ mod handover;
 #[cfg(feature = "gpu")]
 pub mod image;
 pub mod loopback;
+pub mod pages;
 mod program;
 pub mod rooms;
 pub mod server;
@@ -44,6 +45,8 @@ pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
 pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
 pub use trace::{Phase, Trace, Traced};
+/// Chrome over the DevTools protocol, which the browser service and the page runs drive.
+pub use wrela_chrome as chrome;
 /// Build-time code's shared memory (constants, language.md §13), read and written by the
 /// build's thread while its helpers wait or have stopped.
 pub mod build_memory {

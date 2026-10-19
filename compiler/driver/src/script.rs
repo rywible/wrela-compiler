@@ -23,6 +23,18 @@ pub struct ScriptOutput {
 /// The `std::input::Script` constant `name` (`<module>::<NAME>`, or the end of its path) of
 /// the package at `root`, computed as `wrela test` computes it, as runtime/abi `input`'s JSON.
 pub fn script(root: &Path, name: &str) -> ScriptOutput {
+    script_of(root, name, Lang::Script)
+}
+
+/// The `std::tool::browser::Script` constant `name` of the package at `root`, computed as
+/// [`script`] computes an input script's, as its steps' JSON (`wrela_chrome::script`'s format):
+/// what the compiler's browser tests give a page.
+pub fn browser_script(root: &Path, name: &str) -> ScriptOutput {
+    script_of(root, name, Lang::BrowserScript)
+}
+
+/// A constant `name`, of the script type `lang`, of the package at `root`: its JSON.
+fn script_of(root: &Path, name: &str, lang: Lang) -> ScriptOutput {
     on_compiler_thread(|| {
         let (sources, mut diagnostics, loaded) = load(root);
         let Some(loaded) = loaded else {
@@ -34,28 +46,30 @@ pub fn script(root: &Path, name: &str) -> ScriptOutput {
         let errors = |d: &[Diagnostic]| -> Result<(), String> {
             if has_errors(d) { Err("the package has errors".into()) } else { Ok(()) }
         };
-        let script = errors(&diagnostics).and_then(|()| named(&checked, name)).and_then(|c| {
-            let mut data = BuildData { debug: true, testing: true, ..Default::default() };
-            let cache = crate::const_cache::dirs_of(root);
-            prepare(
-                &checked,
-                &sources,
-                &loaded.dirs,
-                &mut data,
-                &mut diagnostics,
-                &cache,
-                &crate::reach::Reach::anywhere(),
-            );
-            errors(&diagnostics)?;
-            json_of(&checked, &data, c).ok_or_else(|| format!("`{name}` has no computed value"))
-        });
+        let script =
+            errors(&diagnostics).and_then(|()| named(&checked, name, lang)).and_then(|c| {
+                let mut data = BuildData { debug: true, testing: true, ..Default::default() };
+                let cache = crate::const_cache::dirs_of(root);
+                prepare(
+                    &checked,
+                    &sources,
+                    &loaded.dirs,
+                    &mut data,
+                    &mut diagnostics,
+                    &cache,
+                    &crate::reach::Reach::anywhere(),
+                );
+                errors(&diagnostics)?;
+                json_of(&checked, &data, c).ok_or_else(|| format!("`{name}` has no computed value"))
+            });
         crate::split_std_warnings(&sources, &mut diagnostics);
         ScriptOutput { sources, diagnostics, script }
     })
 }
 
-/// The `Script` constant of the package's own modules whose path is `name`, or ends with it.
-fn named(checked: &Checked, name: &str) -> Result<ConstId, String> {
+/// The constant of type `lang` of the package's own modules whose path is `name`, or ends with
+/// it.
+fn named(checked: &Checked, name: &str, lang: Lang) -> Result<ConstId, String> {
     let p = &checked.program;
     let want: Vec<&str> = name.split("::").collect();
     let found: Vec<ConstId> = (0..p.consts.len() as u32)
@@ -81,10 +95,11 @@ fn named(checked: &Checked, name: &str) -> Result<ConstId, String> {
         }
     };
     match checked.consts.get(&c) {
-        Some((t, _)) if p.lang_of_ty(checked.reveal(*t)) == Some(Lang::Script) => Ok(c),
+        Some((t, _)) if p.lang_of_ty(checked.reveal(*t)) == Some(lang) => Ok(c),
         Some((t, _)) => Err(format!(
-            "`{name}` is a `{}`, not a `std::input::Script`",
-            p.display_ty(checked.reveal(*t))
+            "`{name}` is a `{}`, not a `{}`",
+            p.display_ty(checked.reveal(*t)),
+            lang.path()
         )),
         None => Err(format!("`{name}` has no type: the package has errors")),
     }

@@ -126,7 +126,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
         "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
-        "wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--timeout S] [--blob-budget B] [-- args...]",
+        "wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--blob-budget B] [-- args...]",
         "wrela audio <package-dir> (wav <out.wav> | describe | numbers | midi <out.mid> | sheet <out.png> [--bars a-b] | speed) [--take n] [--seconds s]",
         "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
         "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",

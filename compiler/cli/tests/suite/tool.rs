@@ -554,3 +554,170 @@ fn http_reaches_only_a_granted_host_and_a_stuck_server_holds_up_no_end() {
     assert!(started.elapsed() < std::time::Duration::from_secs(20), "{:?}", started.elapsed());
     drop(held);
 }
+
+/// A tool that serves its write root `scratch`, opens its `index.html` in a browser, says so,
+/// and waits until it's stopped.
+const BROWSE: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::RUNNING
+use std::tool::browser
+use std::tool::serve
+use std::tool::time
+
+@job
+fn main() -> u32 {
+    var s = serve::start("scratch")
+    var sg = s.poll()
+    while sg.is_none() {
+        yield
+        sg = s.poll()
+    }
+    let Some(sp) = take sg else { return 90 }
+    let Ok(started) = serve::read_started(take sp) else { return 91 }
+    var o = browser::open(f"{started.origin.as_str()}/".as_str())
+    var og = o.poll()
+    while og.is_none() {
+        yield
+        og = o.poll()
+    }
+    let Some(op) = take og else { return 90 }
+    match browser::read_opened(take op) {
+        Ok(_) => print("opened"),
+        Err(e) => {
+            print(f"open: {e.message()}")
+            return 1
+        },
+    }
+    var t = time::after(600.0)
+    while t.poll().is_none() { yield }
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start()
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// Whether process group `group` still has a process.
+fn group_alive(group: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &format!("-{group}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// The browse tool's package, with its site and a temporary directory of its own.
+fn browse_package(name: &str) -> std::path::PathBuf {
+    package(
+        name,
+        &[
+            ("wrela.toml", &manifest("tool_browse")),
+            ("main.wrela", BROWSE),
+            ("site/index.html", "<!doctype html><title>Site</title>"),
+            ("tmp/.keep", ""),
+        ],
+    )
+}
+
+/// `wrela tool` running the browse tool of `dir`, under a supervisor's file of groups, with
+/// `dir/tmp` as its temporary directory, once it has said its browser opened: the child, and
+/// the one group recorded, Chrome's.
+fn browsing(dir: &std::path::Path) -> (std::process::Child, i32) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let groups = dir.join("groups.txt");
+    let _ = std::fs::remove_file(&groups);
+    let mut child = wrela()
+        .arg("tool")
+        .arg(dir)
+        .arg("--write")
+        .arg(format!("scratch={}", dir.join("site").display()))
+        .arg("--browser")
+        .env("WRELA_TOOL_GROUPS", &groups)
+        .env("TMPDIR", dir.join("tmp"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("run wrela tool");
+    let mut first = String::new();
+    BufReader::new(child.stdout.as_mut().expect("its output"))
+        .read_line(&mut first)
+        .expect("a line");
+    assert_eq!(first.trim(), "opened");
+    let recorded: Vec<i32> = std::fs::read_to_string(&groups)
+        .expect("the groups")
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
+        .collect();
+    assert_eq!(recorded.len(), 1, "Chrome's group: {recorded:?}");
+    assert!(group_alive(recorded[0]), "Chrome runs in the recorded group");
+    (child, recorded[0])
+}
+
+/// The profiles under `at`: each holds the log the driver keeps there.
+fn profiles(at: &std::path::Path) -> usize {
+    walk(at).into_iter().filter(|p| p.ends_with("chrome.log")).count()
+}
+
+/// Under a supervisor, Chrome's process group is recorded before Chrome runs; Ctrl-C ends the
+/// tool in bounded time, and with it every process of that group, and the profile.
+#[test]
+#[ignore = "needs the runtime"]
+fn a_tools_browser_is_supervised_and_ends_with_it() {
+    let dir = browse_package("tool-browse");
+    let (mut child, group) = browsing(&dir);
+    assert_eq!(profiles(&dir.join("tmp")), 1, "its profile is in the run's own directory");
+    let sent = Command::new("kill").args(["-INT", &child.id().to_string()]).status().expect("kill");
+    assert!(sent.success());
+    assert_eq!(exit_within(&mut child, std::time::Duration::from_secs(30)), Some(130));
+    assert!(!group_alive(group), "no process of Chrome's group is left");
+    assert_eq!(profiles(&dir.join("tmp")), 0, "and no profile");
+}
+
+/// A tool host killed outright (`SIGKILL`, which it can't clean up after) takes its Chrome with
+/// it: Chrome's end of its DevTools pipe closes, and it shuts down, at once. What's left is the
+/// run's directory, with the profile; the next run sweeps it.
+#[test]
+#[ignore = "needs the runtime"]
+fn a_killed_tool_host_leaves_no_chrome_and_its_profile_goes_at_the_next_start() {
+    let dir = browse_package("tool-browse-killed");
+    let (mut child, group) = browsing(&dir);
+    child.kill().expect("SIGKILL");
+    child.wait().expect("reaped");
+    let since = std::time::Instant::now();
+    while group_alive(group) {
+        assert!(since.elapsed() < std::time::Duration::from_secs(10), "Chrome outlived its host");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(profiles(&dir.join("tmp")), 1, "the killed host's profile is left");
+    // The next run's start sweeps it.
+    let (mut next, _) = browsing(&dir);
+    assert_eq!(profiles(&dir.join("tmp")), 1, "only the new run's profile is there");
+    let sent = Command::new("kill").args(["-INT", &next.id().to_string()]).status().expect("kill");
+    assert!(sent.success());
+    assert_eq!(exit_within(&mut next, std::time::Duration::from_secs(30)), Some(130));
+    assert_eq!(profiles(&dir.join("tmp")), 0);
+}
+
+/// The files under `dir`, at any depth.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

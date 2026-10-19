@@ -15,6 +15,7 @@ members = [
     "runtime/abi",
     "runtime/native",
     "runtime/serve",
+    "runtime/chrome",
 ]
 
 [workspace.package]
@@ -31,6 +32,7 @@ wrela-driver = { path = "compiler/driver" }
 wrela-abi = { path = "runtime/abi" }
 wrela-host = { path = "runtime/native" }
 wrela-serve = { path = "runtime/serve" }
+wrela-chrome = { path = "runtime/chrome" }
 wrela-ir = { path = "compiler/ir" }
 wrela-lower = { path = "compiler/lower" }
 wrela-wasm = { path = "compiler/wasm" }

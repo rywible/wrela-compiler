@@ -60,25 +60,17 @@ fn both_hosts_read_the_same_events() {
     assert_eq!(chrome.hash, native.hash_hex(), "the hosts gave the program different events");
 }
 
-/// In Chrome, text mode takes trusted keys and an input method (DevTools' Input domain,
-/// compiler/tests/text-input/typing.json), and each edit reaches the program once: typed text,
+/// In Chrome, text mode takes trusted keys and an input method (DevTools' Input domain, the
+/// browser script compiler/tests/text-input `typing::TYPING`), and each edit reaches the program once: typed text,
 /// spaces too, as Text after its KeyDown; Enter and Backspace as KeyDowns the hidden field doesn't
 /// also act on; a composition's changes whole, then its commit after a clear.
 #[test]
 #[ignore = "needs the runtime"]
 fn the_browser_types_and_composes_each_edit_once() {
     let (_, rel) = wrela_tests::page("compiler/tests/text-input", "text-input");
-    let commands = std::fs::read_to_string(
-        wrela_tests::repo_root().join("compiler/tests/text-input/typing.json"),
-    )
-    .expect("the commands");
+    let script = wrela_tests::browser_script("compiler/tests/text-input", "TYPING");
     assert!(
-        wrela_tests::run_page_with_devtools(
-            &rel,
-            "#test&frames=240&width=64&height=64",
-            &commands,
-            300
-        ),
+        wrela_tests::run_page_with_script(&rel, TYPING_FRAGMENT, &script, 300),
         "the browser run failed; see {rel}/results/console.log"
     );
     let log = std::fs::read_to_string(wrela_tests::repo_root().join(&rel).join("results/log.txt"))
@@ -104,6 +96,26 @@ fn the_browser_types_and_composes_each_edit_once() {
     ]
     .to_vec();
     assert_eq!(log.lines().collect::<Vec<_>>(), want);
+}
+
+const TYPING_FRAGMENT: &str = "#test&frames=240&width=64&height=64";
+
+/// The typing script waits for the text mode's field to have the focus: with another element
+/// named, the run fails at that wait, saying what had the focus.
+#[test]
+#[ignore = "needs the runtime"]
+fn the_typing_script_waits_for_the_field_it_names() {
+    use wrela_host::chrome::script::{Step, Until};
+    let (_, rel) = wrela_tests::page("compiler/tests/text-input", "text-input-wrong");
+    let mut script = wrela_tests::browser_script("compiler/tests/text-input", "TYPING");
+    let Some(Step::Wait(Until::Active(tag), timeout)) = script.first_mut() else {
+        panic!("the script first waits for the field")
+    };
+    *tag = "select".into();
+    *timeout = std::time::Duration::from_secs(3);
+    let failed = wrela_tests::run_page(&rel, TYPING_FRAGMENT, 300, Some(&script))
+        .expect_err("a wrong field");
+    assert!(failed.contains("`select`") && failed.contains("`textarea` had the focus"), "{failed}");
 }
 
 /// A `std::input::Script` constant holds the script its methods say, in the hosts' format: its

@@ -87,7 +87,7 @@ pub(crate) fn put_result(
     let Some(dir) = open(root) else {
         return respond(out, 403, "text/plain", b"a result path cannot contain a symbolic link");
     };
-    loopback::put_result(out, &dir, name, &mut &body[..], body.len() as u64)
+    loopback::put_result(out, &dir, name, &mut &body[..], body.len() as u64).map(|_| ())
 }
 
 /// Answers a GET of the file at `rel` in `dir`, an `index.html` as `page` makes it of the

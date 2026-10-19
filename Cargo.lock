@@ -3189,6 +3189,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wrela-chrome"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "libc",
+ "rustix",
+ "serde_json",
+ "shlex",
+ "wrela-abi",
+]
+
+[[package]]
 name = "wrela-diag"
 version = "0.1.0"
 dependencies = [
@@ -3241,6 +3253,7 @@ dependencies = [
  "webp",
  "wgpu",
  "wrela-abi",
+ "wrela-chrome",
  "zune-core",
  "zune-jpeg",
 ]

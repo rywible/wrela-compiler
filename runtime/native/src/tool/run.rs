@@ -122,10 +122,20 @@ pub fn launch(go: &Path, program: &std::ffi::OsStr, args: &[std::ffi::OsString])
 /// How long a launched program waits for its host to let it go.
 const LAUNCH_WAIT: Duration = Duration::from_secs(30);
 
-/// Kills process group `group`, whatever is left of it: a group already gone is no error.
+/// Kills process group `group`, whatever is left of it: a group already gone is no error. On
+/// Linux, where the host adopts its descendants once it has started a browser
+/// (`PR_SET_CHILD_SUBREAPER`), it then reaps what of the group it adopted, waiting at most
+/// [`REAP`], so no zombie of a program's accumulates.
 fn kill_group(group: i32) {
     if let Some(pid) = rustix::process::Pid::from_raw(group) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        #[cfg(target_os = "linux")]
+        {
+            let since = Instant::now();
+            while !wrela_chrome::reap_group(pid) && since.elapsed() < REAP {
+                std::thread::sleep(POLL);
+            }
+        }
     }
 }
 
@@ -210,20 +220,31 @@ pub(crate) fn start_owned(
     program: &str,
 ) -> Result<(std::process::Child, i32), String> {
     let mut child = command.spawn().map_err(|e| format!("can't run `{program}`: {e}"))?;
+    let group = let_go(s, &mut child, go)?;
+    Ok((child, group))
+}
+
+/// `child`, an [`owned_command`] just started, recorded for a supervisor and let go: the process
+/// group it leads. If it can't be, it's killed.
+pub(crate) fn let_go(
+    s: &Services,
+    child: &mut std::process::Child,
+    go: &Path,
+) -> Result<i32, String> {
     let group = child.id() as i32;
     // A test's moment between the start and the record, when only this host's group holds it.
     std::thread::sleep(s.spawn_pause);
     if let Err(why) = record(s, group) {
-        stop(&mut child, group);
+        stop(child, group);
         return Err(why);
     }
     if s.groups.is_some()
         && let Err(e) = std::fs::write(go, b"")
     {
-        stop(&mut child, group);
+        stop(child, group);
         return Err(format!("letting the program go: {e}"));
     }
-    Ok((child, group))
+    Ok(group)
 }
 
 /// Waits for `child`, which leads process group `group`, looking every few milliseconds for the

@@ -273,6 +273,13 @@ macro_rules! lang_items {
 
             /// Where each lang item lives in std.
             pub const PATHS: &'static [(Lang, &'static str)] = &[$( (Lang::$v, $path), )*];
+
+            /// Where it lives in std.
+            pub fn path(self) -> &'static str {
+                match self {
+                    $( Lang::$v => $path, )*
+                }
+            }
         }
     };
 }
@@ -375,6 +382,7 @@ lang_items! {
     HostCommand = "std::host::host_command",
     Shipped = "std::io::Shipped",
     Script = "std::input::Script",
+    BrowserScript = "std::tool::browser::Script",
     PrepareCommand = "std::reload::prepare_command",
     UnprepareCommand = "std::reload::unprepare_command",
     HandOverCommand = "std::reload::hand_over_command",
@@ -713,6 +721,9 @@ pub struct ToolTest {
     /// The roots the test may read (`read: [("repo", "../..")]`): each name, and its directory,
     /// relative to the test's package (it may lead above it, with `..`). Never written.
     pub read: Vec<(String, String)>,
+    /// Whether `std::tool::browser` may start Chrome (`browser: true`): the test then runs on
+    /// the real clock, as a live browser does.
+    pub browser: bool,
 }
 
 /// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is

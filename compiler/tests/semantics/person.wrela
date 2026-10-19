@@ -1,0 +1,30 @@
+// What a person does to the page in Chrome (compiler/tests/tests/suite/semantics.rs): a click on
+// the field's drawn rectangle, a key, text an input method commits, a composition and its commit,
+// Enter, then a click on the link. Each step after the click waits until the program has printed
+// what it read of the one before, so each reaches it in a frame of its own.
+
+use std::input::Key
+use std::tool::browser::{Element, Match, Script, Until}
+
+pub const PERSON: Script = Script::new()
+    .wait(
+        Until::exists(Element::css(".wrela-semantics input"))
+            .and(
+                Until::attribute(Element::css(".wrela-semantics a"), "href", Match::ends("#next")),
+            ),
+    )
+    .click_at(x: 20.0, y: 30.0)
+    .wait(Until::active("input"))
+    .press(Key::A)
+    .wait(Until::printed("text a 1"))
+    .insert_text("é")
+    .wait(Until::printed("text aé 3"))
+    .compose("かな", start: 2, end: 2)
+    .wait(Until::printed("text aéかな 9 composing"))
+    .insert_text("仮名")
+    .wait(Until::printed("text aé仮名 9"))
+    .press(Key::Enter)
+    .wait(Until::printed(f"down {u32(Key::Enter)}".as_str()))
+    .click_at(x: 20.0, y: 10.0)
+    .wait(Until::printed("assist 1 0"))
+    .wait(Until::hash(Match::starts("#test")))

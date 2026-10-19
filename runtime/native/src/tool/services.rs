@@ -58,8 +58,9 @@ pub(crate) struct Services {
     pub testing: bool,
     /// A tool test's fakes for its fake sites' URLs.
     pub fakes: Mutex<HashMap<String, Fake>>,
-    /// The run's own directory, made when a program first runs: its `HOME`, and its input and
-    /// output files. `work_at` names it, for a test; else it's a new one in the system's
+    /// The run's own directory, made when a program or a browser first runs: its `HOME`, its
+    /// input and output files, and its browsers' profiles; those of a host that was killed are
+    /// removed when the next makes its own. `work_at` names it, for a test; else it's a new one in the system's
     /// temporary directory.
     pub work: OnceLock<Result<PathBuf, String>>,
     pub work_at: Option<PathBuf>,
@@ -80,6 +81,8 @@ pub(crate) struct Services {
     pub drives: Mutex<super::drive::Drives>,
     /// The servers the serve service holds.
     pub servers: Mutex<super::serve::Servers>,
+    /// The browsers the browser service holds.
+    pub browsers: Mutex<super::browser::Browsers>,
     /// Where a service that answers a request itself, later, sends the answer
     /// ([`Work::Later`]): the run's own channel, until it ends.
     pub answers: Mutex<Option<std::sync::mpsc::Sender<(u32, Answer)>>>,
@@ -113,6 +116,11 @@ impl Services {
         self.servers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// The browsers.
+    pub(crate) fn browsers(&self) -> std::sync::MutexGuard<'_, super::browser::Browsers> {
+        self.browsers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Gives `answer` to `request`, which a service answers itself ([`Work::Later`]): nothing,
     /// once the run has ended.
     pub(crate) fn send(&self, request: u32, answer: Answer) {
@@ -144,6 +152,9 @@ impl Services {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map_or(0, |d| d.subsec_nanos());
                 let dir = self.work_at.clone().unwrap_or_else(|| {
+                    // What a killed host left (its programs' files, its browsers' profiles)
+                    // goes first.
+                    wrela_chrome::sweep(&std::env::temp_dir(), "wrela-tool-");
                     std::env::temp_dir()
                         .join(format!("wrela-tool-{}-{n}-{nanos}", std::process::id()))
                 });
@@ -389,6 +400,9 @@ pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
         _ if name.starts_with("drive/") => super::drive::route(&name["drive/".len()..], &mut b),
         _ if name.starts_with("image/") => super::image::route(&name["image/".len()..], &mut b),
         _ if name.starts_with("serve/") => super::serve::route(&name["serve/".len()..], &mut b),
+        _ if name.starts_with("browser/") => {
+            super::browser::route(s, &name["browser/".len()..], &mut b)
+        }
         "run/run" => match super::run::parse(&mut b, std::time::Instant::now()) {
             Ok(r) => Work::Long(Box::new(move |s, request| answer(super::run::run(s, request, r)))),
             Err(why) => Work::Now(err(&why)),
@@ -608,6 +622,7 @@ pub(crate) fn for_test(budget: super::BlobBudget) -> Services {
         toolchain: None,
         drives: Mutex::default(),
         servers: Mutex::default(),
+        browsers: Mutex::default(),
         answers: Mutex::new(None),
         hold: None,
         write_fail: None,

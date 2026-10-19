@@ -9,8 +9,9 @@
 //! unless it says) as the run's timeout; a fake clock; its `net` hosts as fake sites, served
 //! from `scratch/sites/<host>/`; its `run` programs, each a tool package of the test's
 //! package; its `read` roots, each a directory relative to the test's package, for reading
-//! only; and the toolchain and drive services, within those roots. Nothing else: no other file,
-//! no network, no secret, no other program. It passes if
+//! only; and the toolchain and drive services, within those roots; and, with `browser: true`,
+//! Chrome (`std::tool::browser`), on the real clock. Nothing else: no other file, no network,
+//! no secret, no other program. It passes if
 //! the job ends, and fails if it panics or traps, if its budget runs out, or if the host fails.
 //! If the process itself is still running [`MARGIN`] past the budget, it's killed, and the test
 //! fails.
@@ -69,6 +70,9 @@ pub struct Spec {
     /// Each root the test may read, and its directory.
     #[serde(default)]
     pub read: Vec<(String, PathBuf)>,
+    /// Whether it may start Chrome (`browser: true`), on the real clock.
+    #[serde(default)]
+    pub browser: bool,
     /// The fake clock's date at the start: seconds since 1970.
     pub utc: u64,
     /// Where the process writes how the run ended ([`Ended`]).
@@ -220,6 +224,7 @@ fn one(
         net: test.net.clone(),
         run,
         read,
+        browser: test.browser,
         utc: START_UTC,
         ended: own.join("ended.json"),
         groups: own.join("groups.txt"),

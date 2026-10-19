@@ -40,6 +40,8 @@ pub struct Grants {
     pub programs: Vec<(String, ProgramGrant)>,
     /// The `wrela` executable that runs a `tool:` program's package (`wrela tool`).
     pub tool_runner: Option<PathBuf>,
+    /// Whether `std::tool::browser` may start Chrome (`--browser`).
+    pub browser: bool,
 }
 
 /// Where a granted program is.
@@ -92,7 +94,8 @@ impl Grants {
 
     /// Reads one grant of a command line: `--read NAME=DIR`, `--write NAME=DIR`, `--secret
     /// NAME`, `--net HOST` or `--allow-run NAME[=PATH]` (`=tool:DIR` for a tool package), as the
-    /// flag and its value. `Ok(false)` if `flag` isn't a grant's.
+    /// flag and its value. `Ok(false)` if `flag` isn't a grant's. (`--browser` takes no value:
+    /// it sets [`Grants::browser`].)
     pub fn parse(&mut self, flag: &str, value: &str) -> Result<bool, String> {
         let write = match flag {
             "--read" => false,
@@ -176,6 +179,7 @@ pub struct Caps {
     path: String,
     /// The `wrela` that runs `tool:` programs and launches supervised ones.
     runner: Option<PathBuf>,
+    browser: bool,
 }
 
 impl std::fmt::Debug for Caps {
@@ -189,6 +193,7 @@ impl std::fmt::Debug for Caps {
             .field("net", &self.net)
             .field("fake_net", &self.fake_net)
             .field("programs", &self.programs)
+            .field("browser", &self.browser)
             .finish()
     }
 }
@@ -383,7 +388,13 @@ impl Caps {
             programs,
             path,
             runner: grants.tool_runner.clone(),
+            browser: grants.browser,
         })
+    }
+
+    /// Whether the tool may start a browser (`--browser`).
+    pub(crate) fn browser(&self) -> bool {
+        self.browser
     }
 
     /// The secrets granted, by name, with their values.

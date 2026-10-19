@@ -1,0 +1,23 @@
+[package]
+name = "wrela-chrome"
+description = "Chrome stable driven over the DevTools protocol: headless, a hardware GPU, a throwaway profile in a process group of its own"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The keys a script presses, by the numbers `std::input::Key` gives them.
+wrela-abi.workspace = true
+serde_json.workspace = true
+# A screenshot's PNG, which DevTools sends as base64; already in the tree.
+base64 = "0.22"
+# `WRELA_CHROME_ARGS`, split as a shell splits it; already in the tree.
+shlex = "2"
+# Chrome's pipe, handed to it as fds 3 and 4 between `fork` and `exec`; already in the tree.
+libc = "0.2"
+# Chrome's process group, signalled without `unsafe`; already in the tree.
+rustix = { version = "1", features = ["process"] }
+
+[lints]
+workspace = true

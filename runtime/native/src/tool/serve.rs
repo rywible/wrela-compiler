@@ -69,6 +69,16 @@ impl Servers {
         ids.iter().filter_map(|id| self.held.remove(id)).collect()
     }
 
+    /// The ports of the servers running: what a browser of the tool's may reach.
+    pub(crate) fn ports(&self) -> Vec<u16> {
+        self.held.values().map(|s| s.port).collect()
+    }
+
+    /// The server on `port`, if one runs there.
+    pub(crate) fn on_port(&self, port: u16) -> Option<Arc<Server>> {
+        self.held.values().find(|s| s.port == port).cloned()
+    }
+
     /// Takes every server, to close: the tool has ended.
     pub(crate) fn take_all(&mut self) -> Vec<Arc<Server>> {
         self.unpublished.clear();
@@ -146,11 +156,20 @@ pub(crate) struct Server {
     conns: Mutex<HashMap<u64, TcpStream>>,
     /// Its threads: the one that accepts, and each connection's.
     threads: Mutex<Vec<JoinHandle<()>>>,
+    /// The `results/DONE` it has kept for each browser session (the session its browser's proxy
+    /// named the put with), or why it can't be read whole: a browser's page has put its result
+    /// once its session's is here.
+    done: Mutex<HashMap<String, Result<String, String>>>,
 }
 
 impl Server {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The `results/DONE` it has kept for browser session `session`, if it has.
+    pub(crate) fn done(&self, session: &str) -> Option<Result<String, String>> {
+        self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(session).cloned()
     }
 
     /// Closes it: its waiters fail, its posts' bytes are given back, its listener and
@@ -219,6 +238,28 @@ impl Server {
             st.given.insert(post.id, (post.reply, post.due));
             s.send(request, super::services::answer(Ok(out.0)));
         }
+    }
+}
+
+/// The most of a `results/DONE` a browser's result is read as: one longer is written, and its
+/// browser's result is an error that says so, never the part that fits.
+const MOST_DONE: usize = 1 << 20;
+
+/// A reader that keeps what it gives, up to [`MOST_DONE`], and counts all of it: a result's
+/// body as it's written.
+struct Tee<'a> {
+    from: &'a mut dyn std::io::Read,
+    kept: Vec<u8>,
+    total: u64,
+}
+
+impl std::io::Read for Tee<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.from.read(buf)?;
+        let room = MOST_DONE.saturating_sub(self.kept.len());
+        self.kept.extend_from_slice(&buf[..n.min(room)]);
+        self.total += n as u64;
+        Ok(n)
     }
 }
 
@@ -335,6 +376,7 @@ fn start(
         stopping: AtomicBool::new(false),
         conns: Mutex::new(HashMap::new()),
         threads: Mutex::new(Vec::new()),
+        done: Mutex::new(HashMap::new()),
     });
     // Registered under its request before anything runs, and before any answer names it.
     let handle = {
@@ -464,13 +506,43 @@ fn connection(
                 "text/plain",
                 b"this server's root is granted for reading only: it takes no results",
             ),
-            Some(name) => crate::loopback::put_result(
-                &mut out,
-                &server.dir,
-                name,
-                &mut reader,
-                head.length as u64,
-            ),
+            Some(name) => {
+                // A test's held write of a result.
+                if let Some((which, held)) = &s.hold
+                    && format!("results/{name}").ends_with(which.as_str())
+                {
+                    std::thread::sleep(*held);
+                }
+                // The body as it's written, so the result kept is this put's own.
+                let mut body = Tee { from: &mut reader, kept: Vec::new(), total: 0 };
+                let put = crate::loopback::put_result(
+                    &mut out,
+                    &server.dir,
+                    name,
+                    &mut body,
+                    head.length as u64,
+                );
+                // Kept: the browser that put it has its result now, not when it asked to.
+                if matches!(put, Ok(true))
+                    && name == "DONE"
+                    && let Some(session) = &head.session
+                {
+                    let text = if body.total > MOST_DONE as u64 {
+                        Err(format!(
+                            "the page's results/DONE is {} bytes, more than the {MOST_DONE} a result is read as",
+                            body.total
+                        ))
+                    } else {
+                        Ok(String::from_utf8_lossy(&body.kept).trim().to_string())
+                    };
+                    server
+                        .done
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(session.clone(), text);
+                }
+                put.map(|_| ())
+            }
             None => respond(&mut out, 403, "text/plain", b"a page puts only its results/"),
         },
         "POST" => post(s, server, head, &mut reader, &mut out, taken + server.post_deadline),

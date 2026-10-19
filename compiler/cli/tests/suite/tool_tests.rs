@@ -334,3 +334,146 @@ fn a_program_started_but_not_yet_recorded_ends_with_its_tests_host() {
     let gone = within(std::time::Duration::from_secs(3), || running(&sleeper).is_empty());
     assert!(gone, "the unrecorded program was still in its host's group, and ended with it");
 }
+
+/// Tool tests with a browser (`browser: true`): one serves a page from its scratch, opens,
+/// observes and closes it, and passes; one runs past its budget, and one traps, each with a
+/// browser open, and each fails, leaving no Chrome and no profile; one without the grant has no
+/// browser.
+#[test]
+#[ignore = "needs the runtime"]
+fn a_tool_test_with_a_browser_passes_and_one_that_fails_leaves_nothing() {
+    // Each test serves a page of its scratch and opens it: `opened` is what `open` gave.
+    let open = r#"
+    var w = files::write("scratch/page.html", utf8("<!doctype html><title>Guide</title>"))
+    var wg = w.poll()
+    while wg.is_none() {
+        yield
+        wg = w.poll()
+    }
+    var s = serve::start("scratch")
+    var sg = s.poll()
+    while sg.is_none() {
+        yield
+        sg = s.poll()
+    }
+    let Some(sp) = take sg else { panic("no answer") }
+    let Ok(started) = serve::read_started(take sp) else { panic("no server") }
+    var o = browser::open(f"{started.origin.as_str()}/page.html".as_str())
+    var og = o.poll()
+    while og.is_none() {
+        yield
+        og = o.poll()
+    }
+    let Some(op) = take og else { panic("no answer") }
+    let opened = browser::read_opened(take op)
+"#;
+    let tests = r#"
+use std::tool::answer
+use std::tool::browser
+use std::tool::files
+use std::tool::serve
+use std::tool::time
+
+fn utf8(text: str) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new()
+    for i in 0..text.len() {
+        out.push(text.byte(i))
+    }
+    out
+}
+
+@test(tool, browser: true, budget: 60)
+@job
+fn serves_opens_observes_and_closes() {
+OPEN
+    let Ok(b) = opened else { panic("no browser") }
+    var t = browser::title(b)
+    var tg = t.poll()
+    while tg.is_none() {
+        yield
+        tg = t.poll()
+    }
+    let Some(tp) = take tg else { panic("no answer") }
+    let Ok(title) = browser::read_text(take tp) else { panic("no title") }
+    assert(title.as_str() == "Guide", title.as_str())
+    var c = browser::close(b)
+    var cg = c.poll()
+    while cg.is_none() {
+        yield
+        cg = c.poll()
+    }
+    let Some(cp) = take cg else { panic("no answer") }
+    assert(answer(take cp).is_ok(), "closed")
+}
+
+@test(tool, browser: true, budget: 3)
+@job
+fn runs_past_its_budget_with_a_browser_open() {
+OPEN
+    assert(opened.is_ok(), "a browser")
+    var t = time::after(600.0)
+    while t.poll().is_none() { yield }
+}
+
+@test(tool, browser: true, budget: 60)
+@job
+fn traps_with_a_browser_open() {
+OPEN
+    assert(opened.is_ok(), "a browser")
+    panic("on purpose, with a browser open")
+}
+
+@test(tool)
+@job
+fn has_no_browser_without_the_grant() {
+OPEN
+    let Err(why) = opened else { panic("a browser without the grant") }
+    assert(why.message().find("isn't granted").is_some(), why.message())
+}
+"#
+    .replace("OPEN\n", open.trim_start_matches('\n'));
+    let dir = tool_package("tool-tests-browser", &tests);
+    let tmp = dir.join("tmp");
+    std::fs::create_dir_all(&tmp).expect("a temporary directory");
+    let out = json(wrela().arg("test").arg(&dir).arg("--json").env("TMPDIR", &tmp));
+    let tests: Vec<(String, bool, String)> = out["tests"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{out}"))
+        .iter()
+        .map(|t| {
+            let message = t["failure"]["message"].as_str().unwrap_or("").to_string();
+            (t["name"].as_str().expect("a name").to_string(), t["passed"] == true, message)
+        })
+        .collect();
+    let get = |name: &str| tests.iter().find(|t| t.0 == name).expect(name).clone();
+    let (_, passed, message) = get("serves_opens_observes_and_closes");
+    assert!(passed, "{message}");
+    let (_, passed, message) = get("runs_past_its_budget_with_a_browser_open");
+    assert!(!passed && message.contains("past its budget of 3 s"), "{message}");
+    let (_, passed, message) = get("traps_with_a_browser_open");
+    assert!(!passed && message.contains("on purpose"), "{message}");
+    let (_, passed, message) = get("has_no_browser_without_the_grant");
+    assert!(passed, "{message}");
+    let left = walk(&tmp).into_iter().filter(|p| p.ends_with("chrome.log")).count();
+    assert_eq!(left, 0, "no profile is left");
+    let ps = std::process::Command::new("ps").args(["-Ao", "command"]).output().expect("ps");
+    let named = String::from_utf8_lossy(&ps.stdout)
+        .lines()
+        .filter(|l| l.contains(&*tmp.to_string_lossy()))
+        .count();
+    assert_eq!(named, 0, "no Chrome is left");
+}
+
+/// The files under `dir`, at any depth.
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}

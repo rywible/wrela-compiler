@@ -1,0 +1,631 @@
+// A tool's browser (language.md §15.5): Chrome stable, headless, on the machine's hardware GPU,
+// with a throwaway profile, which the host drives over the DevTools protocol. `open` opens a
+// page in a browser of its own; a `Script` acts on it as a person does (clicks, keys, an input
+// method), configures it (permissions, focus, size) and waits for conditions; typed observations
+// read what it shows (titles, texts, counts, attributes, the focus, the location, the clipboard,
+// the console, the page's test-mode result) and its screen; `close` ends it. Nothing here is
+// JavaScript, and the comparisons a tool makes of what it observed are its own: `Match` holds
+// them.
+//
+// A browser reaches only the tool's own local servers (`std::tool::serve`'s origins, over plain
+// HTTP) and the hosts and ports `--net` grants (over HTTPS, or a secure WebSocket): every
+// connection it makes goes through a proxy of the host's, which refuses any other, and it has no
+// QUIC or WebTransport. Starting one needs `--browser` (`browser: true` in a tool test).
+//
+// A browser is a resource of its `open` request until the tool reads the answer, and the host
+// closes it (its process group killed, its profile removed) if the request fails or the tool
+// ends first; it closes every browser when the tool ends, and Chrome shuts down if the host is
+// killed. `close` is never held up by a request using the browser: that request fails at once.
+// Each request has a deadline, 60 s unless it asks for another (at most 600 s), from when the
+// host takes it. An observation is never cut short: one that would be more than 512 KiB fails.
+//
+// A `Script` is a value, made in a constant as `std::input::Script` is: the compiler's own browser
+// tests give their pages one (`wrela_driver::script::browser_script` reads it).
+//
+// ```wrela
+// use std::input::Key
+// use std::tool::browser::{Element, Match, Script, Until}
+//
+// pub const READ: Script = Script::new()
+//     .wait(Until::title(Match::is("Wrela docs")))
+//     .click(Element::css("a").with_text("Next page: std::io"))
+//     .press(Key::Enter)
+//     .wait(Until::printed("down 37"), timeout: 5.0)
+// ```
+
+use std::fmt::{json_number, json_text}
+use std::input::{Key, Mods}
+use std::io::{IoError, Pending}
+use std::serialize::{Reader, Writer}
+use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::blob::{Data, read_data}
+
+/// How a text is matched: exactly, by its start, by its end, or by a part of it.
+pub struct Match: Clone {
+    kind: u8,
+    text: String,
+}
+
+impl Match {
+    /// Exactly `text`.
+    pub fn is(text: str) -> Match {
+        Match { kind: 0, text: String::from(text) }
+    }
+
+    /// Starting with `text`.
+    pub fn starts(text: str) -> Match {
+        Match { kind: 1, text: String::from(text) }
+    }
+
+    /// Ending with `text`.
+    pub fn ends(text: str) -> Match {
+        Match { kind: 2, text: String::from(text) }
+    }
+
+    /// Holding `text`.
+    pub fn contains(text: str) -> Match {
+        Match { kind: 3, text: String::from(text) }
+    }
+
+    /// Whether `text` matches.
+    pub fn matches(self, text: str) -> bool {
+        let t = self.text.as_str()
+        match self.kind {
+            0 => text == t,
+            1 => text.starts_with(t),
+            2 => text.ends_with(t),
+            _ => text.find(t).is_some(),
+        }
+    }
+
+    fn json(self) -> String {
+        let key = match self.kind {
+            0 => "is",
+            1 => "starts",
+            2 => "ends",
+            _ => "contains",
+        }
+        var out = String::from(f"{{\"{key}\": \"")
+        json_text(mut out, self.text.as_str())
+        out.push_str("\"}")
+        out
+    }
+}
+
+/// An element: the first that matches a CSS selector and, if it's given, has exactly `text` as
+/// its text (its `textContent`).
+pub struct Element: Clone {
+    pub css: String,
+    pub text: Option<String>,
+}
+
+impl Element {
+    /// The first element `selector` matches.
+    pub fn css(selector: str) -> Element {
+        if selector.len() == 0 {
+            panic("an element's selector isn't empty")
+        }
+        Element { css: String::from(selector), text: None }
+    }
+
+    /// The first of them whose text is exactly `text`.
+    pub fn with_text(take self, text: str) -> Element {
+        var e = take self
+        e.text = Some(String::from(text))
+        e
+    }
+
+    fn json(self) -> String {
+        var out = String::from("{\"css\": \"")
+        json_text(mut out, self.css.as_str())
+        out.push_str("\"")
+        if let Some(t) = self.text.clone() {
+            out.push_str(", \"text\": \"")
+            json_text(mut out, t.as_str())
+            out.push_str("\"")
+        }
+        out.push_str("}")
+        out
+    }
+
+    fn write(self, w: mut Writer) {
+        w.write_str(self.css.as_str())
+        match self.text.clone() {
+            Some(t) => {
+                w.write_u8(1)
+                w.write_str(t.as_str())
+            },
+            None => w.write_u8(0),
+        }
+    }
+}
+
+/// A condition a script waits for.
+pub struct Until: Clone {
+    json: String,
+}
+
+fn text_json(text: str) -> String {
+    var out = String::from("\"")
+    json_text(mut out, text)
+    out.push_str("\"")
+    out
+}
+
+impl Until {
+    /// The page's title matches.
+    pub fn title(m: Match) -> Until {
+        Until { json: f"{{\"title\": {m.json().as_str()}}}" }
+    }
+
+    /// An element matches.
+    pub fn exists(on: Element) -> Until {
+        Until { json: f"{{\"exists\": {on.json().as_str()}}}" }
+    }
+
+    /// Exactly `n` elements match (each of the selector's that has the text, if it's given).
+    pub fn count(on: Element, n: u32) -> Until {
+        Until { json: f"{{\"count\": {on.json().as_str()}, \"n\": {n}}}" }
+    }
+
+    /// The texts of the elements `selector` matches, in document order, are `are`.
+    pub fn texts(selector: str, are: [Text]) -> Until {
+        var list = String::new()
+        for i in 0..are.len() {
+            if i > 0 {
+                list.push_str(", ")
+            }
+            list.push_str(text_json(are[i].to_string().as_str()).as_str())
+        }
+        Until { json: f"{{\"texts\": {text_json(selector).as_str()}, \"are\": [{list.as_str()}]}}" }
+    }
+
+    /// The attribute `name` of the element matches.
+    pub fn attribute(on: Element, name: str, m: Match) -> Until {
+        Until {
+            json: f"{{\"attribute\": {on.json().as_str()}, \"name\": {text_json(name).as_str()}, \"is\": {m.json().as_str()}}}",
+        }
+    }
+
+    /// An element named `tag` (`input`, `textarea`) has the focus.
+    pub fn active(tag: str) -> Until {
+        Until { json: f"{{\"active\": {text_json(tag).as_str()}}}" }
+    }
+
+    /// The page's location (its whole URL) matches.
+    pub fn location(m: Match) -> Until {
+        Until { json: f"{{\"location\": {m.json().as_str()}}}" }
+    }
+
+    /// The location's hash (`#...`) matches.
+    pub fn hash(m: Match) -> Until {
+        Until { json: f"{{\"hash\": {m.json().as_str()}}}" }
+    }
+
+    /// The clipboard holds a text that matches (the page reads it, so it must have the
+    /// permission and the focus).
+    pub fn clipboard(m: Match) -> Until {
+        Until { json: f"{{\"clipboard\": {m.json().as_str()}}}" }
+    }
+
+    /// The program printed `line` (`std::io::print`, which the browser runtime shows on the
+    /// console).
+    pub fn printed(line: str) -> Until {
+        Until { json: f"{{\"printed\": {text_json(line).as_str()}}}" }
+    }
+
+    /// The page's test-mode result, `results/DONE`, has been kept: written by the tool's server
+    /// that serves the page, since the page opened (a put the server refused, or hasn't finished,
+    /// isn't).
+    pub fn done() -> Until {
+        Until { json: String::from("{\"done\": true}") }
+    }
+
+    /// Both this and `other`.
+    pub fn and(take self, other: Until) -> Until {
+        Until { json: f"{{\"all\": [{self.json.as_str()}, {other.json.as_str()}]}}" }
+    }
+}
+
+/// A permission a page may be granted.
+pub enum Permission: Copy + Eq {
+    /// Reading and writing the clipboard.
+    Clipboard,
+}
+
+/// Scripted steps on a page: what a person does, how the page is set up, and the conditions
+/// waited for between them, in order. A wait, and a click or focus of an element (which waits
+/// for it), each have a timeout in seconds (20 unless it says), within the request's deadline:
+/// one that passes fails the script, saying what the page had.
+pub struct Script: Clone {
+    // `wrela_driver` reads this field first: the steps, in `wrela_chrome::script`'s format (a
+    // JSON array).
+    json: String,
+    count: u32,
+}
+
+fn seconds(timeout: f64) -> f64 {
+    if !(timeout > 0.0 && timeout <= 600.0) {
+        panic(f"a script's timeout is more than 0 and at most 600 s, not {timeout}")
+    }
+    timeout
+}
+
+impl Script {
+    /// A script with no steps.
+    pub fn new() -> Script {
+        Script { json: String::from("[\n]"), count: 0 }
+    }
+
+    /// The steps, as the host reads them: a JSON array.
+    pub fn as_json(self) -> borrow str {
+        self.json.as_str()
+    }
+
+    fn step(take self, text: str) -> Script {
+        var s = take self
+        s.json.truncate(s.json.len() - 2)
+        if s.count > 0 {
+            s.json.push_str(",")
+        }
+        s.count += 1
+        s.json.push_str(f"\n  {{\"step\": {text}}}\n]")
+        s
+    }
+
+    fn timed(take self, kind: str, rest: str, timeout: f64) -> Script {
+        var t = String::new()
+        json_number(mut t, f32(seconds(timeout)))
+        take self.step(f"\"{kind}\", {rest}, \"timeout\": {t.as_str()}")
+    }
+
+    /// Waits until `until` holds.
+    pub fn wait(take self, until: Until, timeout: f64 = 20.0) -> Script {
+        take self.timed("wait", f"\"until\": {until.json.as_str()}", timeout)
+    }
+
+    /// Once `on` is there, a click at its centre, scrolled into view: a trusted click, as a
+    /// person's.
+    pub fn click(take self, on: Element, timeout: f64 = 20.0) -> Script {
+        take self.timed("click", f"\"on\": {on.json().as_str()}", timeout)
+    }
+
+    /// A click at a point of the viewport, in CSS pixels.
+    pub fn click_at(take self, x: f32, y: f32) -> Script {
+        var p = String::new()
+        json_number(mut p, x)
+        p.push_str(", \"y\": ")
+        json_number(mut p, y)
+        take self.step(f"\"click_at\", \"x\": {p.as_str()}")
+    }
+
+    /// `key` pressed and released, with `mods` held: what it types on a US layout is typed.
+    pub fn press(take self, key: Key, mods: Mods = Mods {}) -> Script {
+        if key == Key::Unknown {
+            panic("a script's key is a key the hosts name, not `Key::Unknown`")
+        }
+        take self.step(
+            f"\"press\", \"key\": {u32(key)}, \"shift\": {mods.shift}, \"ctrl\": {mods.ctrl}, \"alt\": {mods.alt}, \"meta\": {mods.meta}",
+        )
+    }
+
+    /// `text`, as an input method commits it.
+    pub fn insert_text(take self, text: str) -> Script {
+        take self.step(f"\"insert\", \"text\": {text_json(text).as_str()}")
+    }
+
+    /// An input method's composition of `text`, its selection from `start` to `end`.
+    pub fn compose(take self, text: str, start: u32, end: u32) -> Script {
+        take self.step(
+            f"\"compose\", \"text\": {text_json(text).as_str()}, \"start\": {start}, \"end\": {end}",
+        )
+    }
+
+    /// Once `on` is there, it takes the focus.
+    pub fn focus(take self, on: Element, timeout: f64 = 20.0) -> Script {
+        take self.timed("focus", f"\"on\": {on.json().as_str()}", timeout)
+    }
+
+    /// The page is granted `permission`.
+    pub fn grant(take self, permission: Permission) -> Script {
+        let name = match permission {
+            Permission::Clipboard => "clipboard",
+        }
+        take self.step(f"\"grant\", \"permissions\": [\"{name}\"]")
+    }
+
+    /// The page has the focus whether or not its window does (`on`), as a person's page does
+    /// when they use it: the clipboard needs it.
+    pub fn emulate_focus(take self, on: bool = true) -> Script {
+        take self.step(f"\"emulate_focus\", \"on\": {on}")
+    }
+
+    /// The viewport is `width` × `height`, at a device scale of 1.
+    pub fn size(take self, width: u32, height: u32) -> Script {
+        if width == 0 || height == 0 || width > 16384 || height > 16384 {
+            panic(f"a size of {width}×{height} isn't 1 to 16384 each way")
+        }
+        take self.step(f"\"size\", \"width\": {width}, \"height\": {height}")
+    }
+}
+
+/// An open browser: its handle, from an `open` answer.
+pub struct Browser: Copy + Eq {
+    id: u32,
+}
+
+impl Browser {
+    /// Its handle's number, as the host names it.
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+
+/// The element that has the focus: its tag (lowercase) and its `id`.
+pub struct Focused: Clone {
+    pub tag: String,
+    pub id: String,
+}
+
+/// A browser's screen: its size, and a PNG of it, in a blob.
+pub struct Capture: Clone {
+    pub width: u32,
+    pub height: u32,
+    pub png: Data,
+}
+
+fn timeout_of(w: mut Writer, timeout: f64) {
+    w.write_u64(bitcast_u64(timeout))
+}
+
+fn handle_body(b: Browser) -> Writer {
+    var w = Writer::new()
+    w.write_u32(b.id)
+    w
+}
+
+/// Opens `url` in a browser of its own, its viewport `width` × `height`: `read_opened` reads
+/// the answer. It fails if the browser offers no hardware WebGPU adapter.
+@tool
+pub fn open(url: str, width: u32 = 1280, height: u32 = 720, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(url)
+    w.write_u32(width)
+    w.write_u32(height)
+    timeout_of(mut w, timeout)
+    ask("browser/open", take w.into_bytes())
+}
+
+/// Runs `script`'s steps on `b`'s page, in order: `std::tool::answer` reads the answer, which
+/// fails with the step that failed, and what the page had.
+@tool
+pub fn run(b: Browser, script: Script, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_str(script.as_json())
+    timeout_of(mut w, timeout)
+    ask("browser/run", take w.into_bytes())
+}
+
+fn observe(b: Browser, kind: u8, timeout: f64) -> Writer {
+    var w = handle_body(b)
+    w.write_u8(kind)
+    timeout_of(mut w, timeout)
+    w
+}
+
+/// The page's title: `read_text` reads the answer.
+@tool
+pub fn title(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 0, timeout).into_bytes())
+}
+
+/// The page's location, its whole URL: `read_text` reads the answer.
+@tool
+pub fn location(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 1, timeout).into_bytes())
+}
+
+/// What the clipboard holds, as the page reads it (it needs the permission and the focus):
+/// `read_text` reads the answer.
+@tool
+pub fn clipboard(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 2, timeout).into_bytes())
+}
+
+/// How many elements match `on`: `read_count` reads the answer.
+@tool
+pub fn count(b: Browser, on: Element, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = observe(b, 3, timeout)
+    on.write(mut w)
+    ask("browser/observe", take w.into_bytes())
+}
+
+/// The texts of the elements `selector` matches, in document order: `read_texts` reads the
+/// answer.
+@tool
+pub fn texts(b: Browser, selector: str, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = observe(b, 4, timeout)
+    w.write_str(selector)
+    ask("browser/observe", take w.into_bytes())
+}
+
+/// The attribute `name` of the element `on`, if it's there and has it: `read_attribute` reads
+/// the answer.
+@tool
+pub fn attribute(b: Browser, on: Element, name: str, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = observe(b, 5, timeout)
+    on.write(mut w)
+    w.write_str(name)
+    ask("browser/observe", take w.into_bytes())
+}
+
+/// The element with the focus, if one has it: `read_active` reads the answer.
+@tool
+pub fn active(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 6, timeout).into_bytes())
+}
+
+/// Every console line of the page and its workers so far, the host's notes of what it refused
+/// among them: `read_texts` reads the answer.
+@tool
+pub fn console(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 7, timeout).into_bytes())
+}
+
+/// What the page's server has kept of its `results/DONE` since the page opened (test mode's
+/// result: `ok`, or why it failed), if it has: `read_attribute` reads the answer.
+@tool
+pub fn results(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    ask("browser/observe", observe(b, 8, timeout).into_bytes())
+}
+
+/// The page's screen, the viewport at its size, as a PNG: `read_capture` reads the answer. The
+/// host reserves the blob's most bytes in the budget before it asks for the screen.
+@tool
+pub fn capture(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    timeout_of(mut w, timeout)
+    ask("browser/capture", take w.into_bytes())
+}
+
+/// Closes `b`: its page, and the browser's process group and profile. `std::tool::answer`
+/// reads the answer.
+@tool
+pub fn close(b: Browser) -> Pending<u8> {
+    ask("browser/close", handle_body(b).into_bytes())
+}
+
+/// Reads an `open` answer: the handle (a `u32`).
+pub fn read_opened(polled: take Result<Vec<u8>, IoError>) -> Result<Browser, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(id) = r.read_u32() else { return Err(malformed("browser/open")) }
+    if !r.at_end() {
+        return Err(malformed("browser/open"))
+    }
+    Ok(Browser { id })
+}
+
+/// Reads a text an observation gives (`title`, `location`, `clipboard`).
+pub fn read_text(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
+    if !r.at_end() {
+        return Err(malformed("browser/observe"))
+    }
+    Ok(t)
+}
+
+/// Reads texts an observation gives (`texts`, `console`): a count, then each.
+pub fn read_texts(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<String>, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("browser/observe")) }
+    var out: Vec<String> = Vec::new()
+    for _ in 0..n {
+        let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
+        out.push(take t)
+    }
+    if !r.at_end() {
+        return Err(malformed("browser/observe"))
+    }
+    Ok(out)
+}
+
+/// Reads a `count` answer.
+pub fn read_count(polled: take Result<Vec<u8>, IoError>) -> Result<u32, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("browser/observe")) }
+    if !r.at_end() {
+        return Err(malformed("browser/observe"))
+    }
+    Ok(n)
+}
+
+/// Reads a text that may not be there (`attribute`, `results`): 0, or 1 and the text.
+pub fn read_attribute(polled: take Result<Vec<u8>, IoError>) -> Result<Option<String>, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(there) = r.read_u8() else { return Err(malformed("browser/observe")) }
+    var out: Option<String> = None
+    if there == 1 {
+        let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
+        out = Some(take t)
+    }
+    if !r.at_end() || there > 1 {
+        return Err(malformed("browser/observe"))
+    }
+    Ok(out)
+}
+
+/// Reads an `active` answer: 0, or 1, the tag and the id.
+pub fn read_active(polled: take Result<Vec<u8>, IoError>) -> Result<Option<Focused>, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(there) = r.read_u8() else { return Err(malformed("browser/observe")) }
+    var out: Option<Focused> = None
+    if there == 1 {
+        let Ok(tag) = r.read_string() else { return Err(malformed("browser/observe")) }
+        let Ok(id) = r.read_string() else { return Err(malformed("browser/observe")) }
+        out = Some(Focused { tag, id })
+    }
+    if !r.at_end() || there > 1 {
+        return Err(malformed("browser/observe"))
+    }
+    Ok(out)
+}
+
+/// Reads a `capture` answer: the width and height (`u32`s), then the PNG (`blob::Data`).
+pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, ToolError> {
+    var r = Reader::new(answer(take polled)?)
+    let Ok(width) = r.read_u32() else { return Err(malformed("browser/capture")) }
+    let Ok(height) = r.read_u32() else { return Err(malformed("browser/capture")) }
+    let Some(png) = read_data(mut r) else { return Err(malformed("browser/capture")) }
+    if !r.at_end() {
+        return Err(malformed("browser/capture"))
+    }
+    Ok(Capture { width, height, png })
+}
+
+@test
+fn a_script_is_its_steps_in_order() {
+    let s = Script::new()
+        .wait(
+            Until::title(Match::is("Wrela \"docs\"")).and(
+                Until::count(Element::css("a").with_text("6. Memory"), 2),
+            ),
+            timeout: 30.0,
+        )
+        .click(Element::css("a[href$=\"#io\"]"))
+        .press(Key::A, Mods { shift: true })
+        .insert_text("é")
+        .wait(Until::texts("nav a", ["6.1", "6.2"]), timeout: 1.5)
+    let want = "[\n  {\"step\": \"wait\", \"until\": {\"all\": [{\"title\": {\"is\": \"Wrela \\\"docs\\\"\"}}, {\"count\": {\"css\": \"a\", \"text\": \"6. Memory\"}, \"n\": 2}]}, \"timeout\": 30},\n  {\"step\": \"click\", \"on\": {\"css\": \"a[href$=\\\"#io\\\"]\"}, \"timeout\": 20},\n  {\"step\": \"press\", \"key\": 1, \"shift\": true, \"ctrl\": false, \"alt\": false, \"meta\": false},\n  {\"step\": \"insert\", \"text\": \"é\"},\n  {\"step\": \"wait\", \"until\": {\"texts\": \"nav a\", \"are\": [\"6.1\", \"6.2\"]}, \"timeout\": 1.5}\n]"
+    assert(s.as_json() == want, s.as_json())
+    let empty = Script::new()
+    assert(empty.as_json() == "[\n]")
+}
+
+@test
+fn a_match_compares_as_it_says() {
+    assert(Match::is("ab").matches("ab") && !Match::is("ab").matches("abc"))
+    assert(Match::starts("# std").matches("# std::io") && Match::ends("#next").matches("x#next"))
+    assert(Match::contains("b").matches("abc") && !Match::contains("d").matches("abc"))
+}
+
+@test
+fn observations_read_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    w.write_u8(1)
+    w.write_str("input")
+    w.write_str("name")
+    let Ok(Some(f)) = read_active(Ok(take w.into_bytes())) else { panic("focused") }
+    assert(f.tag.as_str() == "input" && f.id.as_str() == "name")
+    var t = Writer::new()
+    t.write_u8(0)
+    t.write_u32(2)
+    t.write_str("a")
+    t.write_str("b")
+    let Ok(texts) = read_texts(Ok(take t.into_bytes())) else { panic("texts") }
+    assert(texts.len() == 2 && texts[1].as_str() == "b")
+    let Ok(none) = read_attribute(Ok(Vec::from([u8(0), 0]))) else { panic("no attribute") }
+    assert(none.is_none())
+    assert(read_count(Ok(Vec::from([u8(0), 5]))).is_err(), "a short count")
+}

@@ -83,14 +83,11 @@ class Selection(unittest.TestCase):
             with patch.object(os, 'cpu_count', return_value=cores):
                 self.assertEqual(check.threads(), expected)
 
-    def test_tools_run_in_their_own_process_away_from_the_checks_browser(self):
-        with patch.dict(os.environ, {'WRELA_TEST_CHROME': 'http://127.0.0.1:1/token', 'KEPT': '1'}), \
-                patch.object(check, 'call') as run:
+    def test_tools_run_in_their_own_process(self):
+        with patch.object(check, 'call') as run:
             check.step('tools', Path('wrela'), Path('logs'))
         self.assertEqual(run.call_args.args[0], [sys.executable, 'tools/runner.py', '--tools-tests'])
         self.assertEqual(run.call_args.kwargs['cwd'], check.ROOT)
-        self.assertNotIn('WRELA_TEST_CHROME', run.call_args.kwargs['env'])
-        self.assertEqual(run.call_args.kwargs['env']['KEPT'], '1')
 
     def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
         original = Path.cwd()
@@ -120,7 +117,6 @@ class Selection(unittest.TestCase):
                             patch.object(check, 'wrela_test', side_effect=selected), \
                             patch.object(check, 'listed', return_value=['test']), \
                             patch.object(check, 'rust_run', return_value=1), \
-                            patch.object(check, 'ChromeSession', side_effect=lambda _: contextlib.nullcontext()), \
                             contextlib.redirect_stdout(io.StringIO()):
                         self.assertEqual(check.main(arguments), 0)
                         build_cli.assert_called_once()

@@ -51,6 +51,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::host", include_str!("../../std/host.wrela")),
     ("std::tool", include_str!("../../std/tool.wrela")),
     ("std::tool::blob", include_str!("../../std/tool/blob.wrela")),
+    ("std::tool::browser", include_str!("../../std/tool/browser.wrela")),
     ("std::tool::drive", include_str!("../../std/tool/drive.wrela")),
     ("std::tool::files", include_str!("../../std/tool/files.wrela")),
     ("std::tool::http", include_str!("../../std/tool/http.wrela")),

@@ -31,7 +31,8 @@
 //! left). A worker running a program kills its process group as it sees the end, one
 //! waiting for an HTTP response shuts its connection down and joins the client's thread, one
 //! waiting for the toolchain or an image cancels its work, and every driven build's calls are
-//! stopped, then each build and each server is closed, with the same grace (a server's listener
+//! stopped and every browser's connection closed, then each build, each server and each browser
+//! (its process group and its profile) is closed, with the same grace (a server's listener
 //! and connections are shut and its threads joined, so its port is closed when the run
 //! returns); then the directory the run's programs had is removed. No file work holds the blob
 //! table's lock, so a stuck worker can't hold up the release. A worker, a driven build or a
@@ -41,6 +42,7 @@
 //! driven build's, for each run, so nothing it loads comes from a directory a tool could write.
 
 mod blobs;
+mod browser;
 mod caps;
 mod console;
 mod drive;
@@ -115,6 +117,9 @@ pub struct Options {
     /// fire, in the order of their deadlines, as soon as the tool waits on nothing else, and
     /// `std::tool::testing` sets fakes. `None`: the system's clock, and no fakes.
     pub fake_clock: Option<(u64, u32)>,
+    /// A tool test's run on the system's clock, its fakes kept: one with a live browser, whose
+    /// page the clock mustn't jump past (`browser: true`, language.md §13.2).
+    pub real_clock: bool,
     /// A file the host appends each program's process group to as it starts, for a supervisor
     /// that must kill them if this host can't (a tool test's, §13.2).
     pub groups: Option<std::path::PathBuf>,
@@ -132,8 +137,9 @@ pub struct Options {
 /// A run's settings that only tests change: the workers' grace, a slow disk under each blob
 /// written to a file, a clock thread that fails to start, where the run's own directory is, a
 /// pause between a program's start and its record, a name lookup that stalls, and, for the
-/// toolchain's outputs, one write held a while and one that fails part way (each chosen by its
-/// path's end, or `#n` for a request's `n`th write), a server's start that fails once it
+/// toolchain's outputs, one write held a while (a served page's result too, by `results/<name>`)
+/// and one that fails part way (each chosen by its path's end, or `#n` for a request's `n`th
+/// write), a server's start that fails once it
 /// listens, image work that holds a while, seeing no cancel, and a [`Signal`] of the moments a
 /// test waits for.
 #[doc(hidden)]
@@ -155,7 +161,9 @@ pub struct Testing {
 /// What a test is told as the host reaches a moment it waits for, so it acts then rather than
 /// after a guessed time: `"write"` (a blob's write to a file starts), `"resolve"` (an HTTP
 /// request's name lookup starts), `"image"` (an image's work starts), `"listening"` (a server
-/// listens), `"connection"` (a server takes a connection) and `"post"` (a server queues a post).
+/// listens), `"connection"` (a server takes a connection), `"post"` (a server queues a post),
+/// `"browser"` (a browser has opened its page), `"run"` (a browser's script starts),
+/// `"closing"` (the host takes a browser's close) and `"close"` (a worker starts it).
 #[doc(hidden)]
 #[derive(Clone)]
 pub struct Signal(pub Arc<dyn Fn(&'static str) + Send + Sync>);
@@ -197,6 +205,7 @@ impl Options {
             print: Arc::new(|line| println!("{line}")),
             entries: (EXPORT_TOOL_INIT.to_string(), EXPORT_TOOL.to_string()),
             fake_clock: None,
+            real_clock: false,
             groups: None,
             toolchain: None,
             cache: None,
@@ -413,6 +422,14 @@ impl Pool {
                                         .set("a failed request's server didn't close".into());
                                 }
                             }
+                            let made = services.browsers().rollback(request);
+                            for browser in made {
+                                if !browser.close() {
+                                    let _ = services.stuck.set(
+                                        "a failed request's browser didn't end cleanly".into(),
+                                    );
+                                }
+                            }
                         }
                         if done.send((request, answer)).is_err() {
                             break;
@@ -571,6 +588,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         testing,
         entries,
         fake_clock,
+        real_clock,
         groups,
         toolchain,
         cache,
@@ -600,6 +618,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         strays: Mutex::default(),
         drives: Mutex::default(),
         servers: Mutex::default(),
+        browsers: Mutex::default(),
         answers: Mutex::new(None),
     });
     let (done, answers) = mpsc::channel();
@@ -636,7 +655,9 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         deadline,
         outstanding: HashSet::new(),
         origin: Instant::now(),
-        fake: fake_clock.map(|(s, n)| Fake { now: Duration::ZERO, utc: Duration::new(s, n) }),
+        fake: fake_clock
+            .filter(|_| !real_clock)
+            .map(|(s, n)| Fake { now: Duration::ZERO, utc: Duration::new(s, n) }),
         timed: BinaryHeap::new(),
         timed_answers: HashMap::new(),
         due: HashMap::new(),
@@ -646,8 +667,10 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     // The store, and the console's sending end in it, go when `drive` returns.
     let mut end = run.drive(&engine, build, &entries, start, console);
     ticker.stop();
-    // Driven builds' running calls stop first, so the workers waiting on them return.
+    // Driven builds' running calls stop first, and every browser's connection closes, so the
+    // workers waiting on them return.
     services.drives().stop_all();
+    services.browsers().disconnect_all();
     let mut workers_left = pools.stop(testing.grace);
     // Then each driven build closes, on its own thread: one that doesn't within the grace is
     // left, as a stuck worker is.
@@ -663,6 +686,13 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     let servers = services.servers().take_all();
     for server in servers {
         if !server.close(&services, until.saturating_duration_since(Instant::now())) {
+            workers_left += 1;
+        }
+    }
+    // And each browser: its process group killed and its profile removed.
+    let browsers = services.browsers().take_all();
+    for b in browsers {
+        if !b.close() {
             workers_left += 1;
         }
     }
@@ -879,10 +909,12 @@ impl Run<'_> {
                 self.services.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut drives = self.services.drives();
             let mut servers = self.services.servers();
+            let mut browsers = self.services.browsers();
             for request in s.taken.drain(..) {
                 blobs.publish(request);
                 drives.publish(request);
                 servers.publish(request);
+                browsers.publish(request);
             }
         }
         for (request, service, body) in std::mem::take(&mut s.made) {
@@ -916,7 +948,9 @@ impl Run<'_> {
                             f.utc = set.saturating_sub(f.now);
                             Answer::Bytes(vec![0])
                         }
-                        None => Answer::Bytes(b"\x01only a tool test's clock is set".to_vec()),
+                        None => Answer::Bytes(
+                            b"\x01only a tool test's fake clock is set: not the system's".to_vec(),
+                        ),
                     };
                     self.arrived.push((request, answer));
                 }

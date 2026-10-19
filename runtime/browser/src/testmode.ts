@@ -2,8 +2,8 @@
 // fixed number of frames at fixed times and canvas size, its parallel jobs on a fixed number of
 // threads (the program's own included), then saves the last frame, the state hash, the lines
 // the program printed (`log.txt`) and each frame's CPU time, when it began, and the frame each
-// printed line came in (`frames.json`) to `results/` for
-// tools/headless.py. With `audio`, the main thread also renders that many
+// printed line came in (`frames.json`) to `results/` for whoever runs the page (the compiler's
+// tests' `wrela_host::pages`, a tool's browser, tools/headless.py). With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples (and how long
 // the render took, `audio-ms.json`); with `live=s`, it plays the voice in real time for s seconds
 // instead and saves what the browser says of the playback (`live.json`: its underruns, where it
@@ -40,8 +40,8 @@
 // long creating them all, at once, took (#42 AC4's cold pipelines). `load.json` has when the page opened
 // and each file it loaded; `memory.json` the bytes of the program's GPU buffers and textures (at
 // the end, and at most) and of its WASM memory (reserved, and grown to). It's part of the shipped bundle, so the agreement test runs
-// the exact bytes a game ships, but only a page served from this machine (tools/serve.py and
-// tools/headless.py bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
+// the exact bytes a game ships, but only a page served from this machine (the test servers all
+// bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
 import type { Loaded } from "./messages.ts";
 import { pathUrl } from "./path.ts";

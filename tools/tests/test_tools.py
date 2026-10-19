@@ -345,33 +345,17 @@ class ConsoleTest(unittest.TestCase):
         self.assertEqual(lines, expected)
         self.assertEqual(written, "".join(line + "\n" for line in expected))
 
-    def test_a_shared_chrome_keeps_only_this_pages_records(self):
-        # Two pages in one Chrome log, their records interleaved and cut at every byte.
-        prefix = '[1:2:1014/100542.389367:INFO:CONSOLE:1] "'
-        chrome_log = (
-            prefix + 'mine\nsecond line", source: http://127.0.0.1:4000/page/main.js (1)\n'
-            + prefix + 'theirs\nfetched 16 bytes", source: http://127.0.0.1:4001/page/main.js (1)\n'
-            + prefix + 'from my worker", source: blob:http://127.0.0.1:4000/6f1c (3)\n'
-            + prefix + 'unattributed\n'
-            + '[1:2:1014/100542.389400:ERROR:gpu] not console\n'
-            + prefix + 'their worker", source: blob:http://127.0.0.1:4001/9a2e (3)\n'
-            + prefix + 'a near port", source: http://127.0.0.1:40001/page/main.js (1)\n'
-            + prefix + 'last", source: http://127.0.0.1:4000/page/main.js (9)\n'
-        ).encode()
-        mine = ["mine", "second line", "from my worker", "last"]
-        with tempfile.TemporaryDirectory() as tmp:
-            log, out = os.path.join(tmp, "chrome.log"), os.path.join(tmp, "console.log")
-            open(log, "wb").close()
-            console = headless.ConsoleTail(log, out, 0, headless.origin("http://127.0.0.1:4000/page/#run"))
-            for at in range(len(chrome_log)):
-                with open(log, "ab") as source:
-                    source.write(chrome_log[at:at + 1])
-                shown = console.read()
-                with open(out) as output:
-                    written = output.read().splitlines()
-                self.assertEqual(written, mine[:len(written)])
-                self.assertEqual(shown, written)
-            self.assertEqual(written, mine)
+
+class ChromeDiscovery(unittest.TestCase):
+    def test_platform_chrome_and_flags(self):
+        found = {'google-chrome': '/usr/bin/google-chrome', 'chromium': '/usr/bin/chromium'}.get
+        self.assertEqual(headless.chrome_binary({'WRELA_CHROME': '/x/chrome'}, 'linux', found), '/x/chrome')
+        self.assertEqual(headless.chrome_binary({}, 'linux', found), '/usr/bin/google-chrome')
+        self.assertEqual(headless.chrome_binary({}, 'linux', lambda name: None), 'google-chrome-stable')
+        self.assertTrue(headless.chrome_binary({}, 'darwin', found).startswith('/Applications/'))
+        self.assertIn('--use-angle=vulkan', headless.platform_args('linux'))
+        self.assertIn('--password-store=basic', headless.platform_args('linux'))
+        self.assertEqual(headless.platform_args('darwin'), [])
 
 
 class ScoreTest(unittest.TestCase):

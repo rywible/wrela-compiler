@@ -1,5 +1,5 @@
 //! AC1: examples/hello-field end to end. `wrela build` output runs in headless Chrome (the
-//! standard browser runtime, via tools/headless.py) and in the native host; both give the same
+//! standard browser runtime, via `wrela_host::pages`) and in the native host; both give the same
 //! state hash, both frames are within a mean of 0.5/255 of the checked-in golden frame
 //! (fixtures/hello-field.png, from the native host), and fixed pixels match the same shading
 //! evaluated on the CPU (`probe`, in WASM).
@@ -22,7 +22,7 @@ const MEAN_LIMIT: f64 = 0.5;
 /// The largest difference between a GPU pixel and the CPU's evaluation of it, in 8-bit steps.
 const PROBE_LIMIT: f64 = 2.0;
 
-/// The build, in a directory under the repo root (tools/headless.py serves the repo), so it's
+/// The build, in a directory under the repo root (the page runs' server serves the repo), so it's
 /// also the browser's page.
 fn page(name: &str) -> (PathBuf, String) {
     wrela_tests::page("examples/hello-field", &format!("hello-field-{name}"))

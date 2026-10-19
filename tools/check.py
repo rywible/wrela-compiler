@@ -22,7 +22,6 @@ import time
 import unittest
 import xml.etree.ElementTree as ET
 
-from chrome_session import ChromeSession
 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +30,7 @@ SOURCES = ("content", "examples", "games", "engine", "compiler/std", "compiler/t
            "compiler/tests/render", "compiler/tests/queries", "compiler/tests/simd",
            "compiler/tests/input", "compiler/tests/lift", "compiler/tests/texels",
            "compiler/tests/shader_params", "compiler/tests/unroll", "compiler/tests/tool_tests",
+           "compiler/tests/docs-guide",
            "ui", "studio",
            "studio/tests/views", "docsite", "platform",
            "console")
@@ -203,9 +203,8 @@ def step(name, wrela, logs, out=None):
     }
     if name == "tools":
         # In a process of its own: the tools' tests patch modules, the environment and the
-        # working directory, and their fake browsers must not reach the check's Chrome.
-        environment = {k: v for k, v in os.environ.items() if k != "WRELA_TEST_CHROME"}
-        call([sys.executable, "tools/runner.py", "--tools-tests"], cwd=ROOT, env=environment, **into(out))
+        # working directory.
+        call([sys.executable, "tools/runner.py", "--tools-tests"], cwd=ROOT, **into(out))
     elif name.startswith("tools::"):
         selected = name[len("tools::"):]
         if selected not in tools_ids():
@@ -283,7 +282,7 @@ def suite(wrela, logs):
                for check in CARGO_STEPS]
     counts = []
     print(f"Rust test programs run {threads()} tests at a time", flush=True)
-    with ChromeSession(logs), ThreadPoolExecutor(1) as lane:
+    with ThreadPoolExecutor(1) as lane:
         light = lane.submit(lambda: [
             job(check, logs, lambda out, check=check: step(check, wrela, logs, out))
             for check in LIGHT_STEPS])
@@ -329,8 +328,7 @@ def main(arguments):
             else:
                 program, test = matching(programs, name)
                 tests = [test]
-            with ChromeSession(logs):
-                count = rust_run(program, names=tests)
+            count = rust_run(program, names=tests)
             print(f"{count} passed", flush=True)
     print(f"{name or 'all checks'} {'passed' if status == 0 else 'failed'} in {time.monotonic() - started:.1f}s",
           flush=True)
