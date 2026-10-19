@@ -1349,7 +1349,13 @@ impl<'p> Checker<'p> {
                 Expr {
                     ty,
                     span,
-                    kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(call)), ty, span }),
+                    kind: ExprKind::Block(Block {
+                        stmts,
+                        tail: Some(Box::new(call)),
+                        ty,
+                        span,
+                        inline: true,
+                    }),
                 }
             }
             Err(msg) => {
@@ -1584,7 +1590,7 @@ impl<'p> Checker<'p> {
         let not =
             Expr { ty: bool_ty, span: at, kind: ExprKind::Unary(ast::UnOp::Not, Box::new(cond)) };
         let fail = plain_call(Callee::Builtin(b), xs, false, ty, span);
-        let then = Block { stmts: Vec::new(), tail: Some(Box::new(fail)), ty, span };
+        let then = Block { stmts: Vec::new(), tail: Some(Box::new(fail)), ty, span, inline: false };
         let check =
             Expr { ty, span, kind: ExprKind::If { cond: Box::new(not), then, else_: None } };
         if stmts.is_empty() {
@@ -1593,15 +1599,22 @@ impl<'p> Checker<'p> {
         Expr {
             ty,
             span,
-            kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(check)), ty, span }),
+            kind: ExprKind::Block(Block {
+                stmts,
+                tail: Some(Box::new(check)),
+                ty,
+                span,
+                inline: true,
+            }),
         }
     }
 
     /// The operands of an `assert`'s comparison (`a == b`, `a < b`, through `Eq` and `Ord` too)
     /// that aren't literals, each bound to a local in `stmts` (in the order written, so each is
     /// evaluated once) and read from it by the comparison: a copy of a `Copy` value, the value
-    /// of a temporary, or else a projection of the place. Each comes back as its local, at the
-    /// operand's span, to be shown.
+    /// of a temporary, or else a projection of the place. The bindings are part of the
+    /// `assert`'s statement ([`Block::inline`]), so a temporary an operand projects into lives
+    /// through the comparison. Each comes back as its local, at the operand's span, to be shown.
     fn bind_compared(&mut self, cond: &mut Expr, stmts: &mut Vec<Stmt>) -> Vec<Expr> {
         let Some((a, b)) = comparison_operands(self.p, cond) else { return Vec::new() };
         let mut out = Vec::new();
@@ -1876,7 +1889,7 @@ impl<'p> Checker<'p> {
         }
         let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
         let tail = Expr { ty, span, kind: ExprKind::Construct(xs) };
-        let block = Block { stmts, tail: Some(Box::new(tail)), ty, span };
+        let block = Block { stmts, tail: Some(Box::new(tail)), ty, span, inline: false };
         Expr { ty, span, kind: ExprKind::Block(block) }
     }
 

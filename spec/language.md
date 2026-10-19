@@ -624,6 +624,8 @@ log.push(edit)                 // error: `log` was moved, so it can't be used he
 - **A struct literal moves the owned locals it names.** `Impostor { colour, normal, bounds }`, or `..base` for a local `base`, moves each named local whose type isn't `Copy` into the new value, as `take` would. A use after that is a use after a move (E0500), and the diagnostic shows the literal as the place of the move. A `take` written in a literal is a warning (W0009). Calls, bindings and assignments still mark every move.
 - **A move reaches every path that can follow it,** through branches, loops and `continue`. So a move inside a loop of a value from outside it is an error (E0515): the second time round, there'd be nothing to move. Move a `.clone()`, or move the value after the loop.
 - **Destruction is deterministic:** at the end of scope, in reverse declaration order. A value that was moved out isn't destroyed again.
+- **A temporary lives until the end of its statement,** so every projection of it in the statement reads it: `assert(make().as_str() == "ab")`, `f(make().as_str())`. A temporary that something consumes (a `take` argument, a binding, a field of a new value) is its new owner's. A temporary made in a branch of an `if` or a `match`, or in a block's statement, ends there.
+- **A binding can't keep a projection of a temporary** (E0522): `let s = make().as_str()`, `borrow v = make()` and `let View { s } = view(make())` point into values that end with their statement. Bind the owner first, then project it: `let owned = make()`, `let s = owned.as_str()`.
 - **There is no null.** Use `Option<T>`.
 
 ### 6.2 Parameter modes
@@ -661,6 +663,7 @@ A **projection** gives access to a place where it is, with no copy. A `borrow` p
 
   So a type that adds `Copy` never changes what a binding borrows.
 - **`let` reads a run in place too:** `let line = text.slice(a, b)`, `let name = s.as_str()`, `let rest = ids` for a parameter `ids: [u32]`. A run (`str`, `[T]`, §6.6) is never owned and never `Copy`, so a binding of a run can only project its place. For a run, `let` means the same as `borrow`.
+- **A projection binds a place that outlives it,** never a temporary (E0522, §6.1): `let name = make_name().as_str()` is an error; `let owned = make_name()` and then `let name = owned.as_str()` is the fix. A run or a borrow struct that a pattern binds is a projection too, wherever it comes from, so it keeps the loans of what it points into.
 - **Names bound in a pattern or a loop project the matched place, read-only:** `match e { Some(log) => … }`, `for g in world.grazers`.
   - `match mut place { … }` and `for mut g in world.grazers` make them mutable projections, so a payload can change in place: `match mut slot { Some(s) => s.count += 1, None => {} }`.
   - A match on a temporary owns its value.
@@ -3028,6 +3031,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `mem.literal-moves` | A struct literal moves the owned locals it names, without `take` | §6.1 |
 | `mem.loops` | A value from outside a loop can't be moved inside it | §6.1 |
 | `mem.drop` | A value is dropped at the end of its owner's scope; only std's core has destructors | §6.1 |
+| `mem.temporaries` | A temporary ends with its statement, and a binding can't keep a projection of one | §6.1 |
 | `mem.modes` | `mut` and `take` arguments are marked where they're passed | §6.2 |
 | `mem.receivers` | A `mut self` call isn't marked; a `take self` call on a named place is | §6.2 |
 | `mem.let-owns` | `let` owns: a place whose type isn't `Copy` is borrowed, cloned or taken | §6.3 |

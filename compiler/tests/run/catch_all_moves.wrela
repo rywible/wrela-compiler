@@ -1,0 +1,186 @@
+// run: an arm that binds a matched temporary whole (`other => ..`) owns it: the value is freed
+// once, whether the arm moves it on (as its value, into a call, a `return` or a field) or not.
+// A block freed twice is handed out twice, so two values made after it share their memory:
+// `apart()` is 21 when they don't, 22 when they do.
+// expect: apart() = 21
+// expect: as_value() = 121
+// expect: into_call() = 321
+// expect: into_return() = 421
+// expect: into_field() = 521
+// expect: after_parts_full() = 621
+// expect: after_parts_pair() = 721
+// expect: guard_fails() = 821
+// expect: bound_from_call() = 921
+// expect: kept() = 1021
+// expect: kept_no_leak(2048) = 2048
+
+enum Held {
+    Empty,
+    Full { v: Vec<u32> },
+    Pair { a: Vec<u32>, b: Vec<u32> },
+}
+
+struct Wrap {
+    h: Held,
+}
+
+/// Four `x`s, in a block of the smallest size.
+fn filled(x: u32) -> Vec<u32> {
+    var v = Vec::with_capacity(4)
+    for _ in 0..4 {
+        v.push(x)
+    }
+    v
+}
+
+fn full(x: u32) -> Held {
+    Held::Full { v: filled(x) }
+}
+
+fn first(h: Held) -> u32 {
+    match h {
+        Held::Full { v } => v[0],
+        Held::Pair { a, b } => a[0] + b[0],
+        Held::Empty => 0,
+    }
+}
+
+fn first_owned(h: take Held) -> u32 {
+    first(h)
+}
+
+/// Two values made one after the other, in blocks of the same size: 21 when they're apart.
+pub fn apart() -> u32 {
+    let a = filled(1)
+    let b = filled(2)
+    a[0] + b[0] * 10
+}
+
+fn passed_on(h: take Held) -> Held {
+    match take h {
+        Held::Empty => Held::Empty,
+        other => take other,
+    }
+}
+
+/// The arm's value is the binding.
+pub fn as_value() -> u32 {
+    let h = passed_on(full(1))
+    first(h) * 100 + apart()
+}
+
+fn counted(h: take Held) -> u32 {
+    match take h {
+        Held::Empty => 0,
+        other => first_owned(take other),
+    }
+}
+
+/// The binding is moved into a call.
+pub fn into_call() -> u32 {
+    counted(full(3)) * 100 + apart()
+}
+
+fn returned(h: take Held) -> Held {
+    match take h {
+        Held::Empty => {},
+        other => {
+            return take other
+        },
+    }
+    Held::Empty
+}
+
+/// The binding is returned from inside the arm.
+pub fn into_return() -> u32 {
+    let h = returned(full(4))
+    first(h) * 100 + apart()
+}
+
+fn wrapped(h: take Held) -> Wrap {
+    match take h {
+        Held::Empty => Wrap { h: Held::Empty },
+        other => Wrap { h: other },
+    }
+}
+
+/// The binding is moved into a field of a new value.
+pub fn into_field() -> u32 {
+    let w = wrapped(full(5))
+    first(w.h) * 100 + apart()
+}
+
+fn after_parts(h: take Held) -> Held {
+    match take h {
+        Held::Pair { a, b } => Held::Full { v: filled(a[0] + b[0]) },
+        Held::Empty => Held::Empty,
+        other => take other,
+    }
+}
+
+/// After arms that bind parts, the catch-all is chosen.
+pub fn after_parts_full() -> u32 {
+    let h = after_parts(full(6))
+    first(h) * 100 + apart()
+}
+
+/// An arm that binds parts is chosen, before the catch-all.
+pub fn after_parts_pair() -> u32 {
+    let h = after_parts(Held::Pair { a: filled(3), b: filled(4) })
+    first(h) * 100 + apart()
+}
+
+fn guarded(h: take Held) -> Held {
+    match take h {
+        Held::Full { v } if v[0] > 100 => Held::Empty,
+        other => take other,
+    }
+}
+
+/// An arm that binds a part fails its guard, and the catch-all is chosen.
+pub fn guard_fails() -> u32 {
+    let h = guarded(full(8))
+    first(h) * 100 + apart()
+}
+
+fn from_call() -> Held {
+    match full(9) {
+        Held::Empty => Held::Empty,
+        other => take other,
+    }
+}
+
+/// The matched temporary is a call's value, not a `take`.
+pub fn bound_from_call() -> u32 {
+    let h = from_call()
+    first(h) * 100 + apart()
+}
+
+fn read(h: take Held) -> u32 {
+    match take h {
+        Held::Empty => 0,
+        other => first(other),
+    }
+}
+
+/// The binding is only read: the value is freed once, at the arm's end.
+pub fn kept() -> u32 {
+    read(full(10)) * 100 + apart()
+}
+
+/// A 1 MiB value whose first element is 1.
+fn large() -> Held {
+    var v = Vec::with_capacity(262144)
+    v.push(1)
+    Held::Full { v }
+}
+
+/// The binding is only read, round after round, of 1 MiB each: 2 GiB if it were never freed,
+/// and the memory stops at 1 GiB.
+pub fn kept_no_leak(n: u32) -> u32 {
+    var count = 0
+    for _ in 0..n {
+        count += read(large())
+    }
+    count
+}

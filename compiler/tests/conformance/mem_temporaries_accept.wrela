@@ -1,0 +1,50 @@
+// accepts: mem.temporaries
+// A projection of a temporary is used within its statement: as a receiver, an argument, an
+// operand, an `assert`'s comparison (with a message too), an f-string's hole and a `match`'s
+// arms. A binding projects a local that owns the value. A string literal lives as long as the
+// program, so a projection of one can be kept.
+fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out
+}
+
+fn head(s: str) -> borrow str {
+    s.slice(from: 0, to: 2)
+}
+
+fn joined(a: str, b: str) -> String {
+    var out = String::new()
+    out.push_str(a)
+    out.push_str(b)
+    out
+}
+
+borrow struct View {
+    s: str,
+}
+
+fn view(x: String) -> View {
+    View { s: x.as_str() }
+}
+
+fn within_the_statement() -> u32 {
+    let n = made("ab").as_str().len() + head(made("ab cd").as_str()).len()
+    let j = joined(b: made("cd").as_str(), a: made("ab").as_str())
+    assert(made("ab").as_str() == "ab")
+    assert(head(made("ab cd").as_str()) == "ab", f"not {made("ab").as_str()}")
+    assert(view(made("ab")).s == "ab" && j.as_str() == "abcd")
+    let f = f"{made("ab").as_str()}!"
+    let m = match view(made("ab")) {
+        View { s } => s.len(),
+    }
+    n + f.len() + m
+}
+
+fn the_owner_first() -> u32 {
+    let owned = made("ab")
+    let s = owned.as_str()
+    let View { s: t } = view(owned)
+    let lit = head("ab cd")
+    s.len() + t.len() + lit.len()
+}

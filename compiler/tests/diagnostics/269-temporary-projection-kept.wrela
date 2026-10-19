@@ -1,0 +1,13 @@
+// mistake: keeping a projection of a temporary past its statement
+// expect: E0522
+// fix: no
+fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let name = made("ab").as_str()
+    let _ = name.len()
+}

@@ -15,7 +15,8 @@
 //! **Drops** (§6.1) are placed here too. A value whose type may need dropping is dropped where
 //! its owner's scope ends, in reverse order: a local at the end of its block (and on every
 //! `return`, `break` or `continue` that leaves the block), a temporary at the end of its
-//! statement. A temporary whose value something consumes (a field of a new value, a `take`
+//! statement, where it ends ([`StatementKind::Dead`]): a binding can't keep a projection of it
+//! (E0522, the borrow checker's). A temporary whose value something consumes (a field of a new value, a `take`
 //! argument, a binding, an assignment, a return) is passed on whole ([`MoveKind::Temp`]) and
 //! not dropped. Moving out of a place leaves zeros there, which drop as nothing, so a value
 //! moved on some paths needs no flag: its drop finds zeros.
@@ -132,6 +133,9 @@ struct FnState {
     span: Span,
     /// The local that names each constant this code uses (`LocalKind::Const`).
     consts: HashMap<ConstId, Local>,
+    /// The bindings of inline blocks ([`thir::Block::inline`]): owned as temporaries are, by
+    /// the statement they're part of.
+    inline: Vec<Local>,
 }
 
 impl FnState {
@@ -145,6 +149,7 @@ impl FnState {
             closure,
             span,
             consts: HashMap::new(),
+            inline: Vec::new(),
         }
     }
 }
@@ -155,6 +160,8 @@ struct Scope {
     /// The locals and temporaries it owns whose types may need dropping, in the order they got
     /// their values.
     owned: Vec<Local>,
+    /// A statement's: the temporaries made while it's evaluated, which end with it.
+    made: Vec<Local>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -279,6 +286,14 @@ impl<'a> Builder<'a> {
             shorthand: false,
             closure: self.fs.closure,
         });
+        // A temporary ends with the statement being evaluated (a block's value's, with the
+        // statement the block is in). A constant's local is kept for the whole function.
+        let ends = !matches!(kind, LocalKind::User(_) | LocalKind::Const(_));
+        if ends
+            && let Some(s) = self.fs.scopes.iter_mut().rev().find(|s| s.kind == ScopeKind::Temps)
+        {
+            s.made.push(id);
+        }
         id
     }
 
@@ -304,7 +319,7 @@ impl<'a> Builder<'a> {
     }
 
     fn open_scope(&mut self, kind: ScopeKind) {
-        self.fs.scopes.push(Scope { kind, owned: Vec::new() });
+        self.fs.scopes.push(Scope { kind, owned: Vec::new(), made: Vec::new() });
     }
 
     /// Ends the innermost scope: drops what it owns, in reverse order. A block's temporaries
@@ -312,10 +327,11 @@ impl<'a> Builder<'a> {
     fn close_scope(&mut self) {
         let Some(scope) = self.fs.scopes.pop() else { return };
         if scope.kind == ScopeKind::Block {
-            let (locals, temps): (Vec<Local>, Vec<Local>) = scope
-                .owned
-                .into_iter()
-                .partition(|&l| matches!(self.locals[l.index()].kind, LocalKind::User(_)));
+            let (locals, temps): (Vec<Local>, Vec<Local>) =
+                scope.owned.into_iter().partition(|&l| {
+                    matches!(self.locals[l.index()].kind, LocalKind::User(_))
+                        && !self.fs.inline.contains(&l)
+                });
             self.drop_locals(locals.into_iter().rev());
             if let Some(outer) = self.fs.scopes.last_mut() {
                 outer.owned.extend(temps);
@@ -323,6 +339,10 @@ impl<'a> Builder<'a> {
             return;
         }
         self.drop_locals(scope.owned.into_iter().rev());
+        for l in scope.made.into_iter().rev() {
+            let at = self.locals[l.index()].span;
+            self.push(StatementKind::Dead(l), at);
+        }
     }
 
     /// Drops each of `locals`, in order, each at where its value was bound.
@@ -392,8 +412,9 @@ impl<'a> Builder<'a> {
     }
 
     /// After a pattern bound owned names to parts of a temporary (`match make() { Some(v) =>
-    /// .. }`), those parts are the bindings' now: they're moved out of the temporary, which
-    /// leaves zeros there for its drop. Done once the arm is chosen, after its guard.
+    /// .. }`), or to all of it (`other => ..`), those parts are the bindings' now: they're moved
+    /// out of the temporary ([`MoveKind::Bound`]), which leaves zeros there for its drop. Done
+    /// once the arm is chosen, after its guard.
     fn commit_moves(&mut self, pat: &thir::Pat, place: &Place) {
         if !self.owning_temp(place.local) {
             return;
@@ -406,7 +427,7 @@ impl<'a> Builder<'a> {
                 ) && self.needs_drop(pat.ty)
                 {
                     let op = Operand {
-                        kind: OperandKind::Move(place.clone(), MoveKind::Temp),
+                        kind: OperandKind::Move(place.clone(), MoveKind::Bound),
                         ty: pat.ty,
                         span: pat.span,
                     };
@@ -1423,6 +1444,9 @@ impl<'a> Builder<'a> {
     // ---- control flow ----------------------------------------------------------------------
 
     fn block(&mut self, b: &thir::Block, want: Want) -> Option<Operand> {
+        if b.inline {
+            return self.inline_block(b, want);
+        }
         self.open_scope(ScopeKind::Block);
         let mut declared = Vec::new();
         for s in &b.stmts {
@@ -1432,6 +1456,38 @@ impl<'a> Builder<'a> {
         self.close_scope();
         for l in declared.into_iter().rev() {
             self.push(StatementKind::Dead(l), b.span);
+        }
+        v
+    }
+
+    /// A block that's part of the statement it's in ([`thir::Block::inline`]): its statements
+    /// open no scope of their own, so their temporaries, and the values its bindings own, are
+    /// the statement's, dropped and ended where it ends. Each part is still evaluated once, in
+    /// the order the block gives.
+    fn inline_block(&mut self, b: &thir::Block, want: Want) -> Option<Operand> {
+        let mut declared = Vec::new();
+        for s in &b.stmts {
+            let from = declared.len();
+            self.stmt_inner(s, &mut declared);
+            for &l in &declared[from..] {
+                // `own_local` gave it to the block around; it's the statement's.
+                let mut owned = false;
+                if let Some(s) =
+                    self.fs.scopes.iter_mut().rev().find(|s| s.kind == ScopeKind::Block)
+                    && let Some(i) = s.owned.iter().position(|&x| x == l)
+                {
+                    s.owned.remove(i);
+                    owned = true;
+                }
+                if owned && let Some(s) = self.fs.scopes.last_mut() {
+                    s.owned.push(l);
+                }
+                self.fs.inline.push(l);
+            }
+        }
+        let v = b.tail.as_ref().and_then(|t| self.value(t, want));
+        if let Some(s) = self.fs.scopes.iter_mut().rev().find(|s| s.kind == ScopeKind::Temps) {
+            s.made.extend(declared);
         }
         v
     }

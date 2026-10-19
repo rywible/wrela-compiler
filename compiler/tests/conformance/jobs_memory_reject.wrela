@@ -1,10 +1,20 @@
 // rejects: mem.jobs
 // Across a job's `yield`, nothing that holds a loan: not a projection of a parameter lent to
-// `resume` (the next one may lend another place), nor a closure that captures one. (The
-// parameter itself is lent again at each `resume`.)
+// `resume` (the next one may lend another place), nor a closure that captures one, nor a run
+// a pattern takes from a borrow struct that borrows one. (The parameter itself is lent again
+// at each `resume`.)
 struct Scratch {
     rows: Vec<u32>,
     count: u32,
+    name: String,
+}
+
+borrow struct Named {
+    s: str,
+}
+
+fn named(x: Scratch) -> Named {
+    Named { s: x.name.as_str() }
 }
 
 @job
@@ -23,6 +33,13 @@ fn captured(scratch: mut Scratch) -> u32 {
     yield //~ E0521
     bump()
     scratch.count
+}
+
+@job
+fn destructured(scratch: mut Scratch) -> u32 {
+    let Named { s } = named(scratch)
+    yield //~ E0521
+    s.len()
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}

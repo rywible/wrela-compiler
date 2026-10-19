@@ -316,6 +316,10 @@ pub struct Block {
     pub tail: Option<Box<Expr>>,
     pub ty: TyId,
     pub span: Span,
+    /// Made by the checker to evaluate parts of one expression in order (`assert`'s operands,
+    /// a builtin's arguments written out of order): part of the statement it's in, so what its
+    /// statements make, its bindings too, ends with that statement (§6.1), not with each of them.
+    pub inline: bool,
 }
 
 #[derive(Clone, Debug)]

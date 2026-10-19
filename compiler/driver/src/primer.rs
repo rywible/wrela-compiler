@@ -133,6 +133,10 @@ pub const RULES: &[(&str, &str)] = &[
         "mem.drop",
         "a value is dropped at the end of its owner's scope; only std's core has destructors",
     ),
+    (
+        "mem.temporaries",
+        "a temporary ends with its statement, and a binding can't keep a projection of one",
+    ),
     // §6.2 parameter modes
     ("mem.modes", "`mut` and `take` arguments are marked where they're passed"),
     ("mem.receivers", "a `mut self` call isn't marked; a `take self` call on a named place is"),

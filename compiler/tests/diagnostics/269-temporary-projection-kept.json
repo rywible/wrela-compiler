@@ -1,0 +1,43 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0522",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "bind the owner first, in a statement of its own: `let owned = made(..)`, then project `owned`"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [
+        {
+          "file": "main.wrela",
+          "message": "this temporary ends at the end of its statement",
+          "span": {
+            "column": 16,
+            "end": 258,
+            "end_column": 26,
+            "end_line": 11,
+            "line": 11,
+            "start": 248
+          }
+        }
+      ],
+      "message": "`name` points into a temporary that ends with its statement",
+      "notes": [
+        "a temporary lives until the end of the statement that makes it (a branch of an `if` or a `match` ends its own), so nothing used after that can keep a projection of it (§6.1)"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 16,
+        "end": 267,
+        "end_column": 35,
+        "end_line": 11,
+        "line": 11,
+        "start": 248
+      },
+      "title": "a binding that keeps a projection of a temporary"
+    }
+  ],
+  "version": 2
+}

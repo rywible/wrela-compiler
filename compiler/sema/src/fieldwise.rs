@@ -941,7 +941,10 @@ impl Builder<'_> {
     fn block(&self, stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
         let ty = tail.as_ref().map_or(self.p.types.unit, |t| t.ty);
         let span = self.span;
-        self.e(ty, ExprKind::Block(Block { stmts, tail: tail.map(Box::new), ty, span }))
+        self.e(
+            ty,
+            ExprKind::Block(Block { stmts, tail: tail.map(Box::new), ty, span, inline: false }),
+        )
     }
 
     fn stmt(&self, e: Expr) -> Stmt {
@@ -1270,6 +1273,7 @@ impl Builder<'_> {
                         tail: Some(Box::new(self.var(o))),
                         ty,
                         span: self.span,
+                        inline: false,
                     };
                     let choice = self.e(
                         ty,
@@ -1335,8 +1339,13 @@ impl Builder<'_> {
                 .collect();
             b.field_call(e, parts)
         };
-        let block =
-            |b: &Self, stmts: Vec<Stmt>| Block { stmts, tail: None, ty: unit, span: b.span };
+        let block = |b: &Self, stmts: Vec<Stmt>| Block {
+            stmts,
+            tail: None,
+            ty: unit,
+            span: b.span,
+            inline: false,
+        };
         let each = |b: &Self, from: Expr, body: Vec<Stmt>| Stmt {
             kind: StmtKind::ForRange {
                 var: i,
@@ -1618,8 +1627,13 @@ impl Builder<'_> {
                 ),
             );
             let ty = built.ty;
-            let then =
-                Block { stmts: Vec::new(), tail: Some(Box::new(built)), ty, span: self.span };
+            let then = Block {
+                stmts: Vec::new(),
+                tail: Some(Box::new(built)),
+                ty,
+                span: self.span,
+                inline: false,
+            };
             acc =
                 self.e(ty, ExprKind::If { cond: Box::new(test), then, else_: Some(Box::new(acc)) });
         }

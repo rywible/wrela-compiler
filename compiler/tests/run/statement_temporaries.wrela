@@ -1,0 +1,217 @@
+// run: a temporary lives until the end of its statement, so a projection of it reads it there:
+// as a receiver, a call's argument, an f-string's hole, operands written out of order, and an
+// `assert`'s comparison, which binds the values its operands project into first (§6.1). A
+// value made after a temporary was freed would take its block, so a projection read after it
+// would read that value's bytes. Each temporary is freed once (`apart()` is 21 when no block
+// is handed out twice) and freed at all (a 1 MiB one made 2,048 times would need 2 GiB; the
+// memory stops at 1 GiB). An `assert` evaluates its operands' parts once each, in the order
+// written: an index is read before a later argument changes it.
+// expect: receiver() = 97
+// expect: call_argument() = 97
+// expect: fstring_hole() = 3
+// expect: out_of_order() = 4
+// expect: asserted() = 1
+// expect: asserted_nested() = 1
+// expect: asserted_call() = 1
+// expect: asserted_field() = 1
+// expect: in_order() = 1
+// expect: in_order_through_a_projection() = 1
+// expect: in_order_named() = 1
+// expect: first_panics_first() panics "first"
+// expect: named_panics_first() panics "made"
+// expect: twice() = 21
+// expect: in_a_loop(2048) = 2048
+
+fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out
+}
+
+/// Its first two bytes.
+fn head(s: str) -> borrow str {
+    s.slice(from: 0, to: 2)
+}
+
+fn joined(a: str, b: str) -> String {
+    var out = String::new()
+    out.push_str(a)
+    out.push_str(b)
+    out
+}
+
+borrow struct View {
+    s: str,
+}
+
+fn view(x: String) -> View {
+    View { s: x.as_str() }
+}
+
+/// The first byte of `s`, after another value of its size is made: 97 when `s` is "ab".
+fn read_after(s: str) -> u32 {
+    let other = made("xy")
+    u32(s.byte(0)) + u32(other.byte(0)) - 120
+}
+
+/// The receiver is the temporary.
+pub fn receiver() -> u32 {
+    read_after(made("ab").as_str())
+}
+
+/// A call's argument is the temporary.
+pub fn call_argument() -> u32 {
+    read_after(head(made("ab cd").as_str()))
+}
+
+/// An f-string's hole reads a temporary.
+pub fn fstring_hole() -> u32 {
+    let s = f"{made("ab").as_str()}!"
+    if s.as_str() == "ab!" { s.len() } else { 0 }
+}
+
+/// Arguments written out of their order are bound first, with what they point into.
+pub fn out_of_order() -> u32 {
+    let s = joined(b: made("cd").as_str(), a: made("ab").as_str())
+    if s.as_str() == "abcd" { s.len() } else { 0 }
+}
+
+/// An `assert`'s comparison of a temporary's projection, with a message.
+pub fn asserted() -> u32 {
+    assert(made("ab").as_str() == "ab", "differs")
+    1
+}
+
+pub fn asserted_nested() -> u32 {
+    assert(made(made("ab").as_str()).as_str() == "ab")
+    1
+}
+
+pub fn asserted_call() -> u32 {
+    assert(head(made("ab cd").as_str()) == "ab", f"not {made("ab").as_str()}")
+    1
+}
+
+/// A run field of a borrow struct that a temporary makes.
+pub fn asserted_field() -> u32 {
+    assert(view(made("ab")).s == "ab")
+    1
+}
+
+/// Adds one to `i`, and makes "ab".
+fn changed(i: mut u32) -> String {
+    i += 1
+    made("ab")
+}
+
+/// `s` for 0, else its last byte.
+fn pick(n: u32, s: str) -> borrow str {
+    if n == 0 { s } else { s.slice(from: s.len() - 1, to: s.len()) }
+}
+
+fn at(v: [u32], i: u32) -> borrow u32 {
+    v[i]
+}
+
+/// `values[i]` is read before `changed(mut i)` runs: `pick` gets 0.
+pub fn in_order() -> u32 {
+    let values = [0, 1]
+    var i = 0
+    assert(pick(values[i], changed(mut i).as_str()) == "ab")
+    i
+}
+
+/// An earlier call that returns a projection runs before a later argument.
+pub fn in_order_through_a_projection() -> u32 {
+    let values = [0, 1]
+    var i = 0
+    assert(pick(at(values, i + 0), changed(mut i).as_str()) == "ab")
+    i
+}
+
+/// Named arguments run in the order written: `i` changes first, so `pick` gets 1.
+pub fn in_order_named() -> u32 {
+    let values = [0, 1]
+    var i = 0
+    assert(pick(s: changed(mut i).as_str(), n: values[i]) == "b")
+    i
+}
+
+/// Panics, after the calls before it.
+fn first_late(s: str) -> borrow str {
+    if s.len() > 0 {
+        panic("first")
+    }
+    s
+}
+
+/// Panics, after the calls before it.
+fn made_late(s: str) -> String {
+    if s.len() > 0 {
+        panic("made")
+    }
+    made(s)
+}
+
+fn either(a: str, b: str) -> borrow str {
+    if a.len() > 0 { a } else { b }
+}
+
+/// The earlier argument, a call that returns a projection, runs first.
+pub fn first_panics_first() -> u32 {
+    assert(either(first_late("ab"), made_late("cd").as_str()) == "ab")
+    1
+}
+
+/// The argument written first runs first, though its parameter comes second.
+pub fn named_panics_first() -> u32 {
+    assert(either(b: made_late("cd").as_str(), a: first_late("ab")) == "ab")
+    1
+}
+
+/// Four `x`s, in a block of the smallest size.
+fn filled(x: u32) -> Vec<u32> {
+    var v = Vec::with_capacity(4)
+    for _ in 0..4 {
+        v.push(x)
+    }
+    v
+}
+
+fn first(v: Vec<u32>) -> borrow u32 {
+    v[0]
+}
+
+/// Two values made one after the other, in blocks of the same size: 21 when they're apart.
+fn apart() -> u32 {
+    let a = filled(1)
+    let b = filled(2)
+    a[0] + b[0] * 10
+}
+
+/// Temporaries an `assert` binds, then two new values of their size: apart unless one was
+/// freed twice.
+pub fn twice() -> u32 {
+    {
+        assert(first(filled(3)) == 3)
+        assert(view(made("ab")).s == "ab")
+    }
+    apart()
+}
+
+/// A 1 MiB value whose first element is 1.
+fn large() -> Vec<u32> {
+    var v = Vec::with_capacity(262144)
+    v.push(1)
+    v
+}
+
+/// A 1 MiB temporary in each round, which an `assert` binds: freed at the round's end.
+pub fn in_a_loop(n: u32) -> u32 {
+    var count = 0
+    for _ in 0..n {
+        assert(first(large()) == 1)
+        count += first(large())
+    }
+    count
+}

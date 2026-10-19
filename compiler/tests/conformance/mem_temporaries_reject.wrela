@@ -1,0 +1,97 @@
+// rejects: mem.temporaries
+// A binding can't keep a projection of a temporary, which ends with its statement: directly,
+// through a call's argument, a whole value borrowed, a borrow struct or its run field bound by
+// a pattern, a branch's temporary (which ends with its branch, even when the branch's value is
+// used in the same statement), a block's statement, a closure that captures one, and an
+// assignment of a borrow struct to a local that outlives the statement.
+fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out
+}
+
+fn head(s: str) -> borrow str {
+    s.slice(from: 0, to: 2)
+}
+
+borrow struct View {
+    s: str,
+}
+
+fn view(x: String) -> View {
+    View { s: x.as_str() }
+}
+
+fn direct() -> u32 {
+    let s = made("ab").as_str() //~ E0522
+    s.len()
+}
+
+fn through_an_argument() -> u32 {
+    let s = head(made("ab").as_str()) //~ E0522
+    s.len()
+}
+
+fn borrowed_whole() -> u32 {
+    borrow v = made("ab") //~ E0522
+    v.len()
+}
+
+fn a_borrow_struct() -> u32 {
+    let v = view(made("ab")) //~ E0522
+    v.s.len()
+}
+
+fn its_run_field() -> u32 {
+    let View { s } = view(made("ab")) //~ E0522
+    s.len()
+}
+
+fn a_field_of_one() -> u32 {
+    let s = view(made("ab")).s //~ E0522
+    s.len()
+}
+
+fn a_branch(k: bool) -> u32 {
+    borrow s = if k { made("ab").as_str() } else { made("cd").as_str() } //~ E0522 E0522
+    s.len()
+}
+
+fn a_value_from_a_branch(k: bool) -> u32 {
+    // A branch's temporaries end in the branch, and its value can't move out of the
+    // projection it makes.
+    let s = if k { made("ab").as_str() } else { made("cd").as_str() } //~ E0502 E0502 E0522 E0522
+    let t = match k {
+        true => made("ab").as_str(), //~ E0502 E0522
+        false => made("cd").as_str(), //~ E0502 E0522
+    }
+    s.len() + t.len()
+}
+
+fn a_branch_passed_on(k: bool) -> u32 {
+    head(if k { made("ab").as_str() } else { made("cd").as_str() }).len() //~ E0522 E0522
+}
+
+fn a_block() -> u32 {
+    let s = {
+        let inner = made("ab").as_str() //~ E0522
+        head(inner) //~ E0502
+    }
+    s.len()
+}
+
+fn a_closure() -> u32 {
+    let f = {
+        borrow v = made("ab") //~ E0522
+        || v.len()
+    }
+    f()
+}
+
+fn assigned() -> u32 {
+    let a = made("xy")
+    var v = view(a)
+    let n = v.s.len()
+    v = view(made("ab")) //~ E0522
+    n + v.s.len()
+}

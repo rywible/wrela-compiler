@@ -215,6 +215,7 @@ codes! {
     E0519 = "E0519", "a projection as a field of an ordinary type";
     E0520 = "E0520", "a parallel closure that writes data it captures";
     E0521 = "E0521", "a projection or a loan live across a `yield`";
+    E0522 = "E0522", "a binding that keeps a projection of a temporary";
 
     // ---- E06xx: effects and GPU rules ------------------------------------------------------
     E0600 = "E0600", "an effect a context forbids";

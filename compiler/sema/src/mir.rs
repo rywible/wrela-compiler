@@ -215,6 +215,10 @@ pub enum MoveKind {
     Unmarked,
     /// A temporary's value (or part of it) passed on to what consumes it: its new owner.
     Temp,
+    /// A temporary's value (or part of it) moved to an owned name that a pattern binds. The
+    /// temporary is still dropped, as it must be when the match chooses another arm, so the
+    /// move leaves zeros there, whole or in part.
+    Bound,
 }
 
 #[derive(Clone, Debug)]

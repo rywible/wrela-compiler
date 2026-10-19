@@ -1178,8 +1178,7 @@ fn a_script_writes_each_event_in_the_hosts_format() {
 /// may share a frame.
 @test
 fn a_scripts_events_are_at_frames_or_ticks() {
-    let empty = Script::frames()
-    assert(empty.as_json() == "[\n]")
+    assert(Script::frames().as_json() == "[\n]")
     let t = Script::ticks().pad_press(3, PadButton::South).pad_press(3, PadButton::South)
     assert(t.as_json().starts_with("[\n  {\"tick\": 3, \"type\": \"padpress\""))
     assert(t.as_json().ends_with("{\"tick\": 3, \"type\": \"padpress\", \"button\": 0}\n]"))

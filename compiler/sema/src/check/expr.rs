@@ -266,7 +266,7 @@ impl<'p> Checker<'p> {
             ast::ExprKind::Assign { target, op, value } => {
                 let st = self.check_assign(target, *op, value, span);
                 let unit = self.p.types.unit;
-                let block = Block { stmts: vec![st], tail: None, ty: unit, span };
+                let block = Block { stmts: vec![st], tail: None, ty: unit, span, inline: false };
                 Expr { ty: unit, span, kind: ExprKind::Block(block) }
             }
             ast::ExprKind::Unsafe(b) => {
@@ -2517,7 +2517,13 @@ impl<'p> Checker<'p> {
         Expr {
             ty: string_ty,
             span,
-            kind: ExprKind::Block(Block { stmts, tail: Some(Box::new(tail)), ty: string_ty, span }),
+            kind: ExprKind::Block(Block {
+                stmts,
+                tail: Some(Box::new(tail)),
+                ty: string_ty,
+                span,
+                inline: false,
+            }),
         }
     }
 
@@ -2542,7 +2548,7 @@ impl<'p> Checker<'p> {
             self.check_else(&t, else_, expected, span, "if let", "the pattern doesn't match");
         let unit = self.p.types.unit;
         let else_e = else_e.unwrap_or_else(|| {
-            let empty = Block { stmts: Vec::new(), tail: None, ty: unit, span };
+            let empty = Block { stmts: Vec::new(), tail: None, ty: unit, span, inline: false };
             Expr { ty: unit, span, kind: ExprKind::Block(empty) }
         });
         let then_e = Expr { ty: t.ty, span: t.span, kind: ExprKind::Block(t) };

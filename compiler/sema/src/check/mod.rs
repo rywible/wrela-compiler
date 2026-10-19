@@ -423,7 +423,7 @@ impl<'p> Checker<'p> {
             None if stmts.last().is_some_and(|s| self.diverges(s)) => self.p.types.never,
             None => self.p.types.unit,
         };
-        Block { stmts, tail, ty, span: b.span }
+        Block { stmts, tail, ty, span: b.span, inline: false }
     }
 
     /// Whether a statement never finishes normally: `return`, or a `loop` with no `break`.
@@ -600,6 +600,7 @@ impl<'p> Checker<'p> {
                     tail: Some(Box::new(leave)),
                     ty: never,
                     span: pat.span,
+                    inline: false,
                 };
                 let mut b = self.check_loop_body(body);
                 self.env.truncate(env_len);

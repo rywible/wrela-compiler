@@ -20,7 +20,7 @@
 //! The rules that depend only on how code is written are checked while the MIR is built
 //! ([`crate::mir::build`]).
 
-use crate::defs::{Mode, RetMode};
+use crate::defs::{Lang, Mode, RetMode};
 use crate::mir::*;
 use crate::program::Program;
 use crate::thir;
@@ -94,7 +94,12 @@ fn run_bodies(
     let holders: Vec<bool> = body
         .locals
         .iter()
-        .map(|d| d.kind.is_projection() || is_callable(&p.types, d.ty) || p.is_borrow_struct(d.ty))
+        .map(|d| {
+            d.kind.is_projection()
+                || is_callable(&p.types, d.ty)
+                || p.is_borrow_struct(d.ty)
+                || is_run(&p.types, d.ty)
+        })
         .collect();
     let mut captured = Captured::new();
     for (i, f) in body.fns.iter().enumerate() {
@@ -322,6 +327,11 @@ pub(crate) fn stmt_uses_defs(
         // A drop at the end of a scope: not a use, as the local's own end isn't.
         StatementKind::Drop(_) => None,
     }
+}
+
+/// Whether a value of type `t` is a run (`str`, `[T]`), which points where it was read from.
+fn is_run(types: &crate::ty::Types, t: crate::ty::TyId) -> bool {
+    matches!(types.kind(t), crate::ty::TyKind::Str | crate::ty::TyKind::Slice(_))
 }
 
 /// Whether assigning `r` to the whole local `l` writes through it: `l` aliases a place, and `r`
@@ -929,9 +939,13 @@ impl<'a> FnCheck<'a> {
                             kind: OperandKind::Copy(src) | OperandKind::Move(src, _),
                             ty,
                             ..
-                        }) if is_callable(&self.p.types, *ty) || self.p.is_borrow_struct(*ty) => {
-                            // A closure or borrow struct, copied or moved (`take f`): its
-                            // loans travel with it, including from a nested borrow struct.
+                        }) if is_callable(&self.p.types, *ty)
+                            || self.p.is_borrow_struct(*ty)
+                            || is_run(&self.p.types, *ty) =>
+                        {
+                            // A closure, borrow struct or run, copied or moved (`take f`): its
+                            // loans travel with it, including from a nested borrow struct, and
+                            // a run's from the borrow struct field it's read from.
                             self.inherit(st, at, place.local, src, s.span)
                         }
                         _ => {}
@@ -950,7 +964,11 @@ impl<'a> FnCheck<'a> {
                 st.uninit.insert(l.index());
             }
             StatementKind::Dead(l) => {
-                self.out_of_scope(st, at, *l, s.span);
+                if matches!(self.local(*l).kind, LocalKind::User(_)) {
+                    self.out_of_scope(st, at, *l, s.span);
+                } else {
+                    self.temporary_ends(st, at, *l);
+                }
                 self.redefine(st, *l);
                 st.uninit.remove(l.index());
             }
@@ -992,6 +1010,55 @@ impl<'a> FnCheck<'a> {
                 .with_secondary(end, format!("`{what}`'s scope ends here"))
                 .with_note(note)
                 .with_help(format!("declare `{what}` outside the block, so it lives as long")),
+            );
+        }
+    }
+
+    /// Temporary `t` ends with its statement (§6.1): nothing used after it may still point into
+    /// it, such as a binding of its projection (`let s = made().as_str()`), E0522.
+    fn temporary_ends(&mut self, st: &State, at: Point, t: Local) {
+        if !self.emit || !matches!(self.local(t).kind, LocalKind::Temp | LocalKind::TempVar) {
+            return;
+        }
+        // A string literal's `Text` is a handle to text in the build, which lives as long as
+        // the program: what projects it points there.
+        if self.p.lang_of_ty(self.local(t).ty) == Some(Lang::Text) {
+            return;
+        }
+        let kept: Vec<usize> = st
+            .loans
+            .iter()
+            .filter(|&i| {
+                let loan = &self.loans[i];
+                loan.place.local == t && loan.holder != t && self.live_after(at, loan.holder)
+            })
+            .collect();
+        let mut holders = Vec::new();
+        for i in kept {
+            let holder = self.loans[i].holder;
+            if holders.contains(&holder) || self.reported.contains(&i) {
+                continue;
+            }
+            holders.push(holder);
+            self.reported.push(i);
+            let decl = self.local(t);
+            let owner = if decl.name == "temporary" { "..." } else { decl.name.as_str() };
+            let h = self.local(holder);
+            let what = match h.kind {
+                // The value an `if` or a `match` gives, from the branch that made the temporary.
+                LocalKind::TempVar => format!("the value of this `{}`", h.name),
+                LocalKind::Temp if h.name == "temporary" => "a value made from it".into(),
+                _ => self.holder_text(holder),
+            };
+            self.err(
+                Diagnostic::new(
+                    codes::E0522,
+                    self.loans[i].span,
+                    format!("{what} points into a temporary that ends with its statement"),
+                )
+                .with_secondary(decl.span, "this temporary ends at the end of its statement")
+                .with_note("a temporary lives until the end of the statement that makes it (a branch of an `if` or a `match` ends its own), so nothing used after that can keep a projection of it (§6.1)")
+                .with_help(format!("bind the owner first, in a statement of its own: `let owned = {owner}`, then project `owned`")),
             );
         }
     }

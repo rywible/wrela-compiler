@@ -174,8 +174,7 @@ pub fn hex(bytes: [u8]) -> String {
 
 /// Whether `digest` is `want` in hexadecimal, as `hex` writes it.
 fn digest_is(digest: [u8; 32], want: str) -> bool {
-    let text = hex(digest)
-    text.as_str() == want
+    hex(digest).as_str() == want
 }
 
 /// The UTF-8 of `s`, as bytes to hash.

@@ -172,7 +172,8 @@ fn errors_keep_tests_from_running() {
 
 /// A failed `assert` of a comparison shows the operands that aren't literals, each evaluated
 /// once, with their source: numbers, vectors and text (quoted); a type without `Format` isn't
-/// shown. A message given comes first.
+/// shown. A message given comes first. An operand that projects into a temporary
+/// (`made(..).as_str()`) keeps the temporary through the comparison, and is shown as it is.
 #[test]
 fn a_failed_assert_shows_what_it_compared() {
     let src = "struct Id: Copy + Eq {
@@ -186,6 +187,13 @@ fn half(x: f32) -> f32 {
 fn counted(log: mut u32) -> u32 {
     log += 1
     log
+}
+
+fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out.push_str(\"!\")
+    out
 }
 
 @test
@@ -217,6 +225,17 @@ fn evaluated_once() {
 }
 
 @test
+fn a_temporary_lives_through_the_comparison() {
+    assert(String::from(\"ab\").as_str() == \"ab\")
+    assert(made(\"ab\").as_str() == \"ab!\", \"differs\")
+}
+
+@test
+fn a_temporary_is_shown() {
+    assert(made(\"ab\").as_str() == \"ab\", \"made\")
+}
+
+@test
 fn messages_are_made_only_on_failure() {
     var log = 0
     assert(1 < 2, f\"{counted(mut log)}\")
@@ -241,10 +260,85 @@ fn messages_are_made_only_on_failure() {
             "evaluated_once",
             "the test `evaluated_once` panicked: assertion failed: `counted(mut log)` is 1",
         ),
+        ("a_temporary_lives_through_the_comparison", ""),
+        (
+            "a_temporary_is_shown",
+            "the test `a_temporary_is_shown` panicked: made: `made(\"ab\").as_str()` is \"ab!\"",
+        ),
         ("messages_are_made_only_on_failure", ""),
     ];
     let want: Vec<(&str, String)> = want.iter().map(|(n, m)| (*n, m.to_string())).collect();
     assert_eq!(messages, want);
+}
+
+/// An `assert`'s operands run once each, in the order written, through the calls they make:
+/// an index is read before a later argument changes it, and an earlier call that returns a
+/// projection runs (and here panics) before a later argument's call.
+#[test]
+fn an_asserts_operands_run_in_order() {
+    let src = "fn made(s: str) -> String {
+    var out = String::new()
+    out.push_str(s)
+    out
+}
+
+fn changed(i: mut u32) -> String {
+    i += 1
+    made(\"ab\")
+}
+
+fn pick(n: u32, s: str) -> borrow str {
+    if n == 0 { s } else { s.slice(from: s.len() - 1, to: s.len()) }
+}
+
+fn first(s: str) -> borrow str {
+    if s.len() > 0 {
+        panic(\"first\")
+    }
+    s
+}
+
+fn late(s: str) -> String {
+    if s.len() > 0 {
+        panic(\"late\")
+    }
+    made(s)
+}
+
+fn either(a: str, b: str) -> borrow str {
+    if a.len() > 0 { a } else { b }
+}
+
+@test
+fn an_index_is_read_first() {
+    let values = [0, 1]
+    var i = 0
+    assert(pick(values[i], changed(mut i).as_str()) == \"ab\")
+    i = 0
+    assert(pick(s: changed(mut i).as_str(), n: values[i]) == \"b\")
+}
+
+@test
+fn an_earlier_call_runs_first() {
+    assert(either(first(\"ab\"), late(\"cd\").as_str()) == \"ab\")
+}
+";
+    let out = wrela_driver::test(&package("test_items/order", src), None);
+    let messages: Vec<(&str, String)> = out
+        .results
+        .iter()
+        .map(|r| (r.name.as_str(), r.failure.as_ref().map_or(String::new(), |d| d.message.clone())))
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            ("an_index_is_read_first", String::new()),
+            (
+                "an_earlier_call_runs_first",
+                "the test `an_earlier_call_runs_first` panicked: first".to_string()
+            ),
+        ]
+    );
 }
 
 /// Where else a failure is explained: a constant the build computes, and a debug build. A

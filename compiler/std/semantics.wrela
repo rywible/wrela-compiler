@@ -445,8 +445,7 @@ fn a_fields_state_reads_back() {
     assert(
         s.node == 9 && s.revision == 4 && s.start == 1 && s.end == 3 && s.backward && !s.composing,
     )
-    let text = s.text.clone()
-    assert(text.as_str() == "héllo")
+    assert(s.text.as_str() == "héllo")
     assert(read_field_state(Vec::from([u8(1), 0])).is_err(), "a short answer")
     assert(steps(Assist::Increment) == 1 && steps(Assist::Activate) == 0)
 }

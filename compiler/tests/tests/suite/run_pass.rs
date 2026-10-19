@@ -87,6 +87,12 @@ fn run_case(path: &Path) -> Result<usize, String> {
 }
 
 fn run_case_named(path: &Path, name: &str) -> Result<usize, String> {
+    run_case_built(path, name, false)
+}
+
+/// [`run_case_named`], with the program built as a debug build if `debug` (language.md §11.3).
+/// The build without SIMD is a release build either way.
+fn run_case_built(path: &Path, name: &str, debug: bool) -> Result<usize, String> {
     let dir = scratch(&format!("run-pass/{name}"));
     let main = if path.is_dir() {
         copy_dir(path, &dir);
@@ -101,7 +107,15 @@ fn run_case_named(path: &Path, name: &str) -> Result<usize, String> {
     }
     std::fs::write(dir.join("main.wrela"), with_frame(&text)).expect("write");
     let out = dir.join("build");
-    let built = build(&dir).map_err(|e| format!("doesn't build:\n{e}"))?;
+    let built = if debug {
+        let built = wrela_driver::build_for_tests(&dir, true);
+        if built.has_errors() {
+            return Err("doesn't build as a debug build".into());
+        }
+        built
+    } else {
+        build(&dir).map_err(|e| format!("doesn't build:\n{e}"))?
+    };
     built.write_to(&out).expect("write the build");
     let mut host = CpuHost::load(&out).map_err(|e| format!("doesn't load: {e}"))?;
     // The same program without SIMD must give the same results (language.md §11; simd.rs).
@@ -178,6 +192,20 @@ fn closures_write_back_mutable_swizzle_arguments() {
 fn erased_array_accesses_still_check_bounds() {
     let path = repo_root().join("compiler/tests/run/erased_array_bounds.wrela");
     run_case_named(&path, "erased-array-bounds").expect("erased elements still check bounds");
+}
+
+#[test]
+fn catch_all_arms_free_their_value_once() {
+    let path = repo_root().join("compiler/tests/run/catch_all_moves.wrela");
+    run_case_built(&path, "catch-all-moves", true).expect("a value bound whole is freed once");
+}
+
+/// In a debug build (what `wrela test` runs) too, a temporary lives through its statement, an
+/// `assert` keeps what its operands project into, and each is freed once.
+#[test]
+fn statement_temporaries_in_a_debug_build() {
+    let path = repo_root().join("compiler/tests/run/statement_temporaries.wrela");
+    run_case_built(&path, "statement-temporaries-debug", true).expect("read and freed once");
 }
 
 #[test]
