@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deploy a release that tools/console.py built to Cloudflare Workers, keeping what live clients use.
+"""Deploy a release that `wrela tool release` built to Cloudflare Workers, keeping what live clients use.
 
     tools/deploy.py --release <dir> [--require-main-head] [--dry-run]
 
@@ -32,14 +32,37 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import console
-
 ROOT = Path(__file__).resolve().parents[1]
 # How long a release stays after it stops being live: a tab left open that long can still play.
 KEEP = timedelta(days=14)
 WRANGLER = ["npx", "--yes", "wrangler@4.151.0"]
 RELEASE = re.compile(r"[a-f0-9]{20}")
+# The largest file Cloudflare serves, and the most files a Worker's assets may have (as the
+# release tool checks, studio/release/tree.wrela).
+MAX_FILE = 25 * 1024 * 1024
+MAX_FILES = 20_000
+
+
+def release_files(directory):
+    """The files a Worker uploads from `directory`: never a link, private or runtime output, hidden
+    build metadata, or more than Cloudflare serves."""
+    files = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("release assets cannot be symbolic links")
+        if not path.is_file():
+            continue
+        relative = path.relative_to(directory)
+        if any(part in {"storage", "results", ".native", "node_modules"} for part in relative.parts):
+            raise ValueError(f"private/runtime output in release: {relative}")
+        if any(part.startswith(".") for part in relative.parts):
+            raise ValueError(f"hidden build metadata in release: {relative}")
+        if path.stat().st_size > MAX_FILE:
+            raise ValueError(f"Cloudflare file limit exceeded: {relative}")
+        files.append(path)
+    if len(files) > MAX_FILES:
+        raise ValueError("Cloudflare file-count limit exceeded")
+    return files
 
 
 def fetch(url):
@@ -181,7 +204,7 @@ def deploy(output, require_main_head=False, dry_run=False, get=fetch, now=None,
     after = next_history(deploys, release, report["source"], names, now)
     (output / home["worker"] / "deploys.json").write_text(json.dumps({"deploys": after}, indent=2) + "\n")
     for w in workers:
-        files = console.release_files(output / w["worker"])
+        files = release_files(output / w["worker"])
         print(f"{w['worker']} ({w['domain']}): {len(files)} files", flush=True)
     if require_main_head and main_head() != report["source"]:
         raise ValueError(f"{report['source']} is no longer the head of main; a newer push deploys")
@@ -197,7 +220,7 @@ def deploy(output, require_main_head=False, dry_run=False, get=fetch, now=None,
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--release", type=Path, required=True, help="tools/console.py's output")
+    parser.add_argument("--release", type=Path, required=True, help="`wrela tool release`'s output (build/release)")
     parser.add_argument("--require-main-head", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

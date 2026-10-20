@@ -142,7 +142,7 @@ pub fn read_encoded(polled: take Result<Vec<u8>, IoError>) -> Result<Data, ToolE
 
 @test
 fn an_image_fits_its_box_as_pillows_thumbnail_does() {
-    // console.py's covers: a 1920×1080 capture into 960×540.
+    // The release's covers (studio/release): a 1920×1080 capture into 960×540.
     let cover = Size { width: 960, height: 540 }
     let fits = |w: u32, h: u32| fit(Size { width: w, height: h }, cover)
     assert(fits(1920, 1080) == cover)

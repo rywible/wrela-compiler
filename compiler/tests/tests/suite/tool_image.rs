@@ -2,8 +2,8 @@
 //! (a PNG, a JPEG and a WebP of four 8×8 quadrants) decode to their pixels; a Lanczos3 resize
 //! matches a reference computed here from the formula, within 1 per channel; an encode decodes
 //! back (a PNG exactly, a WebP within a PSNR bound), to the same bytes each time; a 1920×1080
-//! frame goes through blobs into a 960×540 cover, as tools/console.py makes one; and an image
-//! too large for the blob budget is refused from its header, before it's decoded.
+//! frame goes through blobs into a 960×540 cover, as the release tool (studio/release) makes one;
+//! and an image too large for the blob budget is refused from its header, before it's decoded.
 
 use crate::tool::{printer, reached, run, scratch, signals, tool_build};
 use std::path::{Path, PathBuf};

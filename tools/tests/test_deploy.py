@@ -11,7 +11,6 @@ from unittest.mock import patch
 import urllib.error
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import console
 import deploy
 
 NOW = datetime(2026, 10, 15, 12, tzinfo=timezone.utc)
@@ -54,7 +53,7 @@ class Site:
 
 
 def built(root):
-    """A release D as tools/console.py leaves it."""
+    """A release D as `wrela tool release` leaves it."""
     output = root / "release"
     for worker in WORKERS:
         (output / worker / "releases" / D).mkdir(parents=True)
@@ -162,7 +161,7 @@ class Deploy(unittest.TestCase):
     def test_a_worker_over_its_file_limit_fails_rather_than_drops_a_release(self):
         with tempfile.TemporaryDirectory() as temporary:
             output = built(Path(temporary))
-            with patch.object(console, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "file-count"):
+            with patch.object(deploy, "MAX_FILES", 3), self.assertRaisesRegex(ValueError, "file-count"):
                 deploy.deploy(output, dry_run=True, get=live_site().get, now=NOW)
 
     def test_the_file_limit_includes_the_deploy_history(self):
@@ -171,8 +170,24 @@ class Deploy(unittest.TestCase):
             site = Site()
             site.deploys = []
             # The console has one asset before deploys.json is written, and two after.
-            with patch.object(console, "MAX_FILES", 1), self.assertRaisesRegex(ValueError, "file-count"):
+            with patch.object(deploy, "MAX_FILES", 1), self.assertRaisesRegex(ValueError, "file-count"):
                 deploy.deploy(output, dry_run=True, get=site.get, now=NOW)
+
+    def test_private_storage_and_symlinks_cannot_be_uploaded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "game.wasm").write_bytes(b"wasm")
+            self.assertEqual(len(deploy.release_files(root)), 1)
+            (root / "storage").mkdir()
+            save = root / "storage/save"
+            save.write_bytes(b"private")
+            with self.assertRaisesRegex(ValueError, "private"):
+                deploy.release_files(root)
+            save.unlink()
+            (root / "storage").rmdir()
+            (root / "outside").symlink_to(root / "game.wasm")
+            with self.assertRaisesRegex(ValueError, "symbolic"):
+                deploy.release_files(root)
 
     def test_a_deploy_no_longer_at_main_s_head_changes_nothing(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -194,7 +209,8 @@ class Deploy(unittest.TestCase):
             (output / "docs-host" / "releases" / D).mkdir(parents=True)
             for worker in [*WORKERS, "docs-host"]:
                 listing = output / worker / "releases" / D / "files.json"
-                listing.write_text(json.dumps(console.file_list(listing.parent)))
+                listing.write_text(json.dumps({str(f.relative_to(listing.parent)): hashlib.sha256(f.read_bytes()).hexdigest()
+                                               for f in deploy.release_files(listing.parent)}))
             site = live_site()
             ran = []
 
