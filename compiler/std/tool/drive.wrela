@@ -15,6 +15,10 @@
 // Every operation that runs the program says when it started (seconds since the build loaded),
 // how long it took, and when each frame or tick started and ended, so a tool can time them.
 //
+// A build's voice (`std::audio::play`) renders offline: `audio` gives its next quanta, the
+// samples Chrome's AudioWorklet renders, in a blob whose bytes are reserved in the tool's blob
+// budget before the first quantum runs.
+//
 // A driven build's posts (`std::io::post`) go to the tool: `posts` gives those it made, and
 // `answer` answers each (or `fail` fails it), which the program reads from its next call on. A build holds at most 64
 // posts unanswered, each of at most 512 KiB; past them, a post fails at once.
@@ -156,6 +160,14 @@ pub struct Phase: Clone {
     pub times: u32,
 }
 
+/// A voice's samples, rendered offline: `f32`s, little-endian, the channels interleaved (left,
+/// right, left, ...), at `std::audio::SAMPLE_RATE`, in a blob; and if asked, each quantum's
+/// seconds to render, `f64`s, little-endian, in another.
+pub struct Audio: Clone {
+    pub samples: Data,
+    pub times: Option<Data>,
+}
+
 /// A post the build made (`std::io::post`), which waits for the tool's answer: its number,
 /// which `answer` names, the URL it was sent to, and its body.
 pub struct Post: Clone {
@@ -282,6 +294,20 @@ pub fn call(b: Build, export: str, args: [Scalar], timeout: f64 = 0.0) -> Pendin
     timeout_ask("drive/call", take w, timeout)
 }
 
+/// Renders the voice's next `quanta` quanta (`std::audio::QUANTUM` samples each, in each
+/// channel) offline, as `wrela-host` renders them, after `init`: `read_audio` reads the answer.
+/// With `timed`, the quanta render one at a time, and each is timed. The samples' bytes and
+/// their blobs are reserved in the tool's blob budget first: a render that doesn't fit fails
+/// before a quantum runs. A trap in the voice fails the request and ends the build, as a call's
+/// trap does; a build without a voice fails the request alone.
+@tool
+pub fn audio(b: Build, quanta: u32, timed: bool = false, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(quanta)
+    w.write_u8(if timed { 1 } else { 0 })
+    timeout_ask("drive/audio", take w, timeout)
+}
+
 /// The posts the build made since the last `posts`, the oldest first: as many as an answer
 /// holds, the rest at the next. Each waits for the tool's `answer`; the program sees the answer
 /// from its next call on. `read_posts` reads the answer.
@@ -394,6 +420,26 @@ pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, To
     Ok(Capture { width, height, rgba })
 }
 
+/// Reads an `audio` answer: the samples (`blob::Data`), then 1 and the times (`blob::Data`), or
+/// 0.
+pub fn read_audio(polled: take Result<Vec<u8>, IoError>) -> Result<Audio, ToolError> {
+    var r = Reader::new(answer_bytes(take polled)?)
+    let Some(samples) = read_data(mut r) else { return Err(malformed("drive/audio")) }
+    var times: Option<Data> = None
+    match r.read_u8() {
+        Ok(0) => {},
+        Ok(1) => {
+            let Some(t) = read_data(mut r) else { return Err(malformed("drive/audio")) }
+            times = Some(take t)
+        },
+        _ => return Err(malformed("drive/audio")),
+    }
+    if !r.at_end() {
+        return Err(malformed("drive/audio"))
+    }
+    Ok(Audio { samples, times })
+}
+
 /// Reads a `posts` answer: a count, then each post's number, URL and body (`blob::Data`).
 pub fn read_posts(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Post>, ToolError> {
     var r = Reader::new(answer_bytes(take polled)?)
@@ -488,6 +534,21 @@ fn a_run_with_a_trap_reads_back() {
     let Some(trap) = ran.trap else { panic("a trap") }
     assert(trap.stage == Stage::Tick && trap.number == 20 && trap.panic.as_str() == "no")
     assert(read_ran(Ok(Vec::from([u8(0), 1]))).is_err(), "a short run")
+}
+
+@test
+fn audio_reads_back() {
+    var w = Writer::new()
+    w.write_u8(0)
+    write_data(mut w, Data::Bytes(Vec::from([u8(0), 0, 128, 63])))
+    w.write_u8(1)
+    write_data(mut w, Data::Bytes(Vec::from([u8(1), 2, 3, 4, 5, 6, 7, 8])))
+    let Ok(a) = read_audio(Ok(take w.into_bytes())) else { panic("audio") }
+    let Data::Bytes(s) = a.samples else { panic("bytes") }
+    assert(s.len() == 4 && s[3] == 63)
+    let Some(Data::Bytes(t)) = a.times else { panic("times") }
+    assert(t.len() == 8)
+    assert(read_audio(Ok(Vec::from([u8(0), 0, 0, 0, 0, 0, 2]))).is_err(), "a bad flag")
 }
 
 @test

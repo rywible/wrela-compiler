@@ -170,3 +170,49 @@ fn a_list_has_the_hosts_layout() {
     }
     assert(e.kind == Kind::Link && e.size == 9)
 }
+
+/// `path`, as a command line gives it (relative to the directory root `root` stands for), as a
+/// path in that root: `root/path`, `root` itself for `.`, or `None` if it isn't a plain relative
+/// path (absolute, or with a part that's empty, `.` or `..`). A leading `./` and trailing `/`s
+/// are dropped.
+pub fn rooted(root: str, path: str) -> Option<String> {
+    var to = path.len()
+    while to > 1 && path.byte(to - 1) == 47 {
+        to -= 1
+    }
+    let whole = path.slice(0, to)
+    if whole == "." {
+        return Some(String::from(root))
+    }
+    let from = if whole.starts_with("./") { 2 } else { 0 }
+    let p = path.slice(from, to)
+    if p.is_empty() || p.starts_with("/") {
+        return None
+    }
+    for range in p.split("/") {
+        let (a, b) = range
+        let part = p.slice(a, b)
+        if part.is_empty() || part == "." || part == ".." {
+            return None
+        }
+    }
+    Some(String::from(f"{root}/{p}"))
+}
+
+@test
+fn command_line_paths_are_rooted_or_refused() {
+    let cases: [(Text, Text); 5] = [
+        ("examples/piano", "ws/examples/piano"),
+        ("./build/x.wav", "ws/build/x.wav"),
+        ("out/", "ws/out"),
+        (".", "ws"),
+        ("a/b/c", "ws/a/b/c"),
+    ]
+    for (given, want) in cases {
+        let Some(got) = rooted("ws", given) else { panic(given) }
+        assert(got.as_str() == want, got.as_str())
+    }
+    for bad in ["", "/etc", "a/../b", "a//b", "a/./b"] {
+        assert(rooted("ws", bad).is_none(), bad)
+    }
+}

@@ -16,7 +16,6 @@ const INV_PIO2: f64 = 0.636619772367581382433
 // pi/2 split in two: the first 33 bits, then the rest.
 const PIO2_HI: f64 = 1.57079631090164184570
 const PIO2_LO: f64 = 0.0000000158932547735281966916
-const PI_F64: f64 = 3.14159265358979311600
 
 /// π, to f32's precision.
 pub const PI: f32 = 3.14159265
@@ -223,17 +222,17 @@ fn exp_tail(r: f64) -> f64 {
 }
 
 /// e^x for an f64 `x`, |x| <= 700.
-fn exp_f64(x: f64) -> f64 {
+fn wide_exp(x: f64) -> f64 {
     let n = round(x * LOG2E)
     exp_poly(x - n * LN2) * pow2(i32(n))
 }
 
 /// e^x - 1 for an f64 `x`, |x| <= 700: near 0, without the cancellation of `e^x - 1`.
-fn expm1_f64(x: f64) -> f64 {
+fn wide_expm1(x: f64) -> f64 {
     if abs(x) <= HALF_LN2 {
         x * exp_tail(x)
     } else {
-        exp_f64(x) - 1.0
+        wide_exp(x) - 1.0
     }
 }
 
@@ -243,7 +242,7 @@ fn pow2(n: i32) -> f64 {
 }
 
 /// 2^x for an f64 `x`; overflows to infinity and underflows to 0 at f32's limits.
-fn exp2_f64(x: f64) -> f64 {
+fn wide_exp2(x: f64) -> f64 {
     if x > 129.0 {
         return 1.0 / 0.0
     }
@@ -266,7 +265,7 @@ pub fn exp(x: f32) -> f32 {
     if xd < -104.0 {
         return 0.0
     }
-    f32(exp_f64(xd))
+    f32(wide_exp(xd))
 }
 
 /// The hyperbolic sine of `x`, (e^x - e^-x) / 2.
@@ -280,7 +279,7 @@ pub fn sinh(x: f32) -> f32 {
         return with_sign_of(1.0 / 0.0, x)
     }
     // With E = e^a - 1, e^a - e^-a = E + E / (E + 1): no cancellation near 0.
-    let e = expm1_f64(a)
+    let e = wide_expm1(a)
     with_sign_of(f32(0.5 * (e + e / (e + 1.0))), x)
 }
 
@@ -293,7 +292,7 @@ pub fn cosh(x: f32) -> f32 {
     if a > 90.0 {
         return f32(1.0 / 0.0)
     }
-    let e = exp_f64(a)
+    let e = wide_exp(a)
     f32(0.5 * (e + 1.0 / e))
 }
 
@@ -308,7 +307,7 @@ pub fn tanh(x: f32) -> f32 {
         return with_sign_of(1.0, x)
     }
     // With E = e^(2a) - 1, (e^(2a) - 1) / (e^(2a) + 1) = E / (E + 2).
-    let e = expm1_f64(2.0 * a)
+    let e = wide_expm1(2.0 * a)
     with_sign_of(f32(e / (e + 2.0)), x)
 }
 
@@ -322,11 +321,11 @@ pub fn exp2(x: f32) -> f32 {
     if is_nan(x) {
         return x
     }
-    f32(exp2_f64(f64(x)))
+    f32(wide_exp2(f64(x)))
 }
 
 /// log2 of a positive, finite f64: the exponent plus log2 of the mantissa.
-fn log2_f64(x: f64) -> f64 {
+fn wide_log2(x: f64) -> f64 {
     let bits = bitcast_u64(x)
     var e = i32((bits >> 52) & 2047) - 1023
     var m = bitcast_f64((bits & 4503599627370495) | 4607182418800017408)
@@ -359,7 +358,7 @@ fn log2_scaled(x: f32, scale: f64) -> f32 {
     if is_inf(x) {
         return x
     }
-    f32(log2_f64(f64(x)) * scale)
+    f32(wide_log2(f64(x)) * scale)
 }
 
 /// The base-2 logarithm of `x`: minus infinity at 0, and NaN below 0.
@@ -402,7 +401,7 @@ pub fn pow(x: f32, y: f32) -> f32 {
     if x < 0.0 && floor(y) != y {
         return (x - x) / (x - x)
     }
-    let r = f32(exp2_f64(f64(y) * log2_f64(abs(f64(x)))))
+    let r = f32(wide_exp2(f64(y) * wide_log2(abs(f64(x)))))
     if neg {
         -r
     } else {
@@ -411,7 +410,7 @@ pub fn pow(x: f32, y: f32) -> f32 {
 }
 
 /// atan of an f64, by a reduction to |a| < 7/16 and an odd polynomial.
-fn atan_f64(x: f64) -> f64 {
+fn wide_atan(x: f64) -> f64 {
     if x != x {
         return x
     }
@@ -457,7 +456,7 @@ fn sign_bit(x: f64) -> bool {
     (bitcast_u64(x) >> 63) == 1
 }
 
-fn atan2_f64(y: f64, x: f64) -> f64 {
+fn wide_atan2(y: f64, x: f64) -> f64 {
     if x != x || y != y {
         return x + y
     }
@@ -475,7 +474,7 @@ fn atan2_f64(y: f64, x: f64) -> f64 {
         let q = if x > 0.0 { PI_F64 * 0.25 } else { PI_F64 * 0.75 }
         return if y > 0.0 { q } else { -q }
     }
-    let t = atan_f64(abs(y / x))
+    let t = wide_atan(abs(y / x))
     let r = if x > 0.0 {
         t
     } else {
@@ -494,22 +493,935 @@ pub fn atan(x: f32) -> f32 {
     if x == 0.0 {
         return x
     }
-    f32(atan_f64(f64(x)))
+    f32(wide_atan(f64(x)))
 }
 
 /// The angle from the positive x axis to the point `(x, y)`, in [-π, π].
 pub fn atan2(y: f32, x: f32) -> f32 {
-    f32(atan2_f64(f64(y), f64(x)))
+    f32(wide_atan2(f64(y), f64(x)))
 }
 
 /// The angle whose sine is `x`, in [-π/2, π/2]; NaN outside [-1, 1].
 pub fn asin(x: f32) -> f32 {
     let xd = f64(x)
-    f32(atan2_f64(xd, sqrt((1.0 - xd) * (1.0 + xd))))
+    f32(wide_atan2(xd, sqrt((1.0 - xd) * (1.0 + xd))))
 }
 
 /// The angle whose cosine is `x`, in [0, π]; NaN outside [-1, 1].
 pub fn acos(x: f32) -> f32 {
     let xd = f64(x)
-    f32(atan2_f64(sqrt((1.0 - xd) * (1.0 + xd)), xd))
+    f32(wide_atan2(sqrt((1.0 - xd) * (1.0 + xd)), xd))
+}
+
+// ---- f64 ----------------------------------------------------------------------------------
+//
+// The same functions of f64s, for CPU code that measures in f64 (a tool's spectra, a mesh's
+// rays): `sin_f64`, `cos_f64`, `atan_f64`, `atan2_f64`, `exp_f64`, `log_f64`, `log10_f64`,
+// `log2_f64` and `pow_f64`, with `PI_F64` and `TAU_F64`. The built-in transcendentals of an f64
+// are E0702 (§11.4); these are ordinary functions, over the ranges they say: `sin_f64` and
+// `cos_f64` of |x| below 2^20·π/2, `pow_f64` of a positive, finite base. Each is within an ulp
+// of libm where sampled (300,000 points of each against macOS's libm, outside the repository,
+// and the points in `LIBM`), but `pow_f64` near overflow, within two; `pow_f64` is an infinity
+// or 0 past f64's range, and exact where a correctly rounded libm is (x¹, x², x⁻¹, √x and 2ⁿ),
+// and `log10_f64` and `log2_f64` at the powers of their bases.
+//
+// Credit (MIT licence): the algorithms and coefficients follow musl's libm (FreeBSD msun, and
+// Sun's fdlibm before it): __sin and __cos, __rem_pio2's medium range reduction, atan and
+// atan2, exp and log. `pow` is e^(y·log x) with log x and the product carried in two f64s
+// (Dekker's products), so its error is exp's; x¹, x², x⁻¹, √x and 2ⁿ are exact, as a correctly
+// rounded libm's are.
+
+// π/2's reduction (__rem_pio2): 1.5 / f64's epsilon rounds to an integer when added and taken
+// away; 2/π; π/2 in three parts of 33 bits, each with the rest after it; π/4.
+const D_TOINT: f64 = 6755399441055744.0
+const D_INV_PIO2: f64 = bitcast_f64(u64(0x3FE45F306DC9C883))
+const D_PIO2_1: f64 = bitcast_f64(u64(0x3FF921FB54400000))
+const D_PIO2_1T: f64 = bitcast_f64(u64(0x3DD0B4611A626331))
+const D_PIO2_2: f64 = bitcast_f64(u64(0x3DD0B4611A600000))
+const D_PIO2_2T: f64 = bitcast_f64(u64(0x3BA3198A2E037073))
+const D_PIO2_3: f64 = bitcast_f64(u64(0x3BA3198A2E000000))
+const D_PIO2_3T: f64 = bitcast_f64(u64(0x397B839A252049C1))
+const D_PIO4: f64 = bitcast_f64(u64(0x3FE921FB54442D18))
+
+/// π, and the rest of it past an f64.
+pub const PI_F64: f64 = bitcast_f64(u64(0x400921FB54442D18))
+const D_PI_LO: f64 = bitcast_f64(u64(0x3CA1A62633145C07))
+
+/// 2π.
+pub const TAU_F64: f64 = bitcast_f64(u64(0x401921FB54442D18))
+
+// __sin's and __cos's polynomials.
+const D_S1: f64 = bitcast_f64(u64(0xBFC5555555555549))
+const D_S2: f64 = bitcast_f64(u64(0x3F8111111110F8A6))
+const D_S3: f64 = bitcast_f64(u64(0xBF2A01A019C161D5))
+const D_S4: f64 = bitcast_f64(u64(0x3EC71DE357B1FE7D))
+const D_S5: f64 = bitcast_f64(u64(0xBE5AE5E68A2B9CEB))
+const D_S6: f64 = bitcast_f64(u64(0x3DE5D93A5ACFD57C))
+const D_C1: f64 = bitcast_f64(u64(0x3FA555555555554C))
+const D_C2: f64 = bitcast_f64(u64(0xBF56C16C16C15177))
+const D_C3: f64 = bitcast_f64(u64(0x3EFA01A019CB1590))
+const D_C4: f64 = bitcast_f64(u64(0xBE927E4F809C52AD))
+const D_C5: f64 = bitcast_f64(u64(0x3E21EE9EBDB4B1C4))
+const D_C6: f64 = bitcast_f64(u64(0xBDA8FAE9BE8838D4))
+
+// atan's table (atan of 0.5, 1, 1.5 and ∞, each in two parts) and polynomial.
+const D_ATAN_HI: [f64; 4] = [
+    0.463647609000806093515,
+    0.785398163397448278999,
+    0.982793723247329054082,
+    1.57079632679489655800,
+]
+const D_ATAN_LO: [f64; 4] = [
+    0.0000000000000000226987774529616870924,
+    0.0000000000000000306161699786838301793,
+    0.0000000000000000139033110312309984516,
+    0.0000000000000000612323399573676603587,
+]
+const D_AT: [f64; 11] = [
+    0.333333333333329318027,
+    -0.199999999998764832476,
+    0.142857142725034663711,
+    -0.111111104054623557880,
+    0.0909088713343650656196,
+    -0.0769187620504482999495,
+    0.0666107313738753120669,
+    -0.0583357013379057348645,
+    0.0497687799461593236017,
+    -0.0365315727442169155270,
+    0.0162858201153657823623,
+]
+
+// exp's and log's: ln 2 in two parts (the first with 32 bits to spare), 1/ln 2, and their
+// polynomials.
+const D_LN2_HI: f64 = bitcast_f64(u64(0x3FE62E42FEE00000))
+const D_LN2_LO: f64 = bitcast_f64(u64(0x3DEA39EF35793C76))
+const D_INV_LN2: f64 = bitcast_f64(u64(0x3FF71547652B82FE))
+const D_INV_LN2_LO: f64 = bitcast_f64(u64(0x3C7777D0FFDA0D24))
+
+// 1/ln 10, in two parts.
+const D_INV_LN10: f64 = bitcast_f64(u64(0x3FDBCB7B1526E50E))
+const D_INV_LN10_LO: f64 = bitcast_f64(u64(0x3C695355BAAAFAD3))
+const D_P1: f64 = bitcast_f64(u64(0x3FC555555555553E))
+const D_P2: f64 = bitcast_f64(u64(0xBF66C16C16BEBD93))
+const D_P3: f64 = bitcast_f64(u64(0x3F11566AAF25DE2C))
+const D_P4: f64 = bitcast_f64(u64(0xBEBBBD41C5D26BF1))
+const D_P5: f64 = bitcast_f64(u64(0x3E66376972BEA4D0))
+const D_LG1: f64 = bitcast_f64(u64(0x3FE5555555555593))
+const D_LG2: f64 = bitcast_f64(u64(0x3FD999999997FA04))
+const D_LG3: f64 = bitcast_f64(u64(0x3FD2492494229359))
+const D_LG4: f64 = bitcast_f64(u64(0x3FCC71C51D8E78AF))
+const D_LG5: f64 = bitcast_f64(u64(0x3FC7466496CB03DE))
+const D_LG6: f64 = bitcast_f64(u64(0x3FC39A09D078C69F))
+const D_LG7: f64 = bitcast_f64(u64(0x3FC2F112DF3E5244))
+
+/// The high 32 bits of `x`'s magnitude.
+fn d_high(x: f64) -> u32 {
+    u32((bitcast_u64(x) >> 32) & 0x7fffffff)
+}
+
+fn d_sin_kernel(x: f64, y: f64, tail: bool) -> f64 {
+    let z = x * x
+    let w = z * z
+    let r = D_S2 + z * (D_S3 + z * D_S4) + z * w * (D_S5 + z * D_S6)
+    let v = z * x
+    if !tail {
+        x + v * (D_S1 + z * r)
+    } else {
+        x - ((z * (0.5 * y - v * r) - y) - v * D_S1)
+    }
+}
+
+fn d_cos_kernel(x: f64, y: f64) -> f64 {
+    let z = x * x
+    let w = z * z
+    let r = z * (D_C1 + z * (D_C2 + z * D_C3)) + w * w * (D_C4 + z * (D_C5 + z * D_C6))
+    let hz = 0.5 * z
+    let one = 1.0 - hz
+    one + (((1.0 - one) - hz) + (z * r - x * y))
+}
+
+/// `x` less the nearest multiple `n` of π/2, as two f64s (y0 + y1, |y0| <= π/4 about), and
+/// `n`: __rem_pio2's reduction for |x| < 2^20·π/2.
+fn d_reduce(x: f64) -> (f64, f64, i32) {
+    assert(d_high(x) < 0x413921fb, f"sin_f64 and cos_f64 take |x| < 2^20·π/2, not {x}")
+    var fn_ = x * D_INV_PIO2 + D_TOINT - D_TOINT
+    var n = i32(fn_)
+    var r = x - fn_ * D_PIO2_1
+    var w = fn_ * D_PIO2_1T
+    if r - w < -D_PIO4 {
+        n -= 1
+        fn_ -= 1.0
+        r = x - fn_ * D_PIO2_1
+        w = fn_ * D_PIO2_1T
+    } else if r - w > D_PIO4 {
+        n += 1
+        fn_ += 1.0
+        r = x - fn_ * D_PIO2_1
+        w = fn_ * D_PIO2_1T
+    }
+    var y0 = r - w
+    let ex = d_high(x) >> 20
+    var ey = u32((bitcast_u64(y0) >> 52) & 0x7ff)
+    if ex > ey + 16 {
+        var t = r
+        w = fn_ * D_PIO2_2
+        r = t - w
+        w = fn_ * D_PIO2_2T - ((t - r) - w)
+        y0 = r - w
+        ey = u32((bitcast_u64(y0) >> 52) & 0x7ff)
+        if ex > ey + 49 {
+            t = r
+            w = fn_ * D_PIO2_3
+            r = t - w
+            w = fn_ * D_PIO2_3T - ((t - r) - w)
+            y0 = r - w
+        }
+    }
+    (y0, (r - y0) - w, n)
+}
+
+/// The sine of `x`, in radians, |x| < 2^20·π/2.
+pub fn sin_f64(x: f64) -> f64 {
+    if d_high(x) <= 0x3fe921fb {
+        if d_high(x) < 0x3e500000 {
+            return x
+        }
+        return d_sin_kernel(x, 0.0, tail: false)
+    }
+    let (a, b, n) = d_reduce(x)
+    let q = n & 3
+    if q == 0 {
+        d_sin_kernel(a, b, tail: true)
+    } else if q == 1 {
+        d_cos_kernel(a, b)
+    } else if q == 2 {
+        -d_sin_kernel(a, b, tail: true)
+    } else {
+        -d_cos_kernel(a, b)
+    }
+}
+
+/// The cosine of `x`, in radians, |x| < 2^20·π/2.
+pub fn cos_f64(x: f64) -> f64 {
+    if d_high(x) <= 0x3fe921fb {
+        if d_high(x) < 0x3e46a09e {
+            return 1.0
+        }
+        return d_cos_kernel(x, 0.0)
+    }
+    let (a, b, n) = d_reduce(x)
+    let q = n & 3
+    if q == 0 {
+        d_cos_kernel(a, b)
+    } else if q == 1 {
+        -d_sin_kernel(a, b, tail: true)
+    } else if q == 2 {
+        -d_cos_kernel(a, b)
+    } else {
+        d_sin_kernel(a, b, tail: true)
+    }
+}
+
+/// The angle whose tangent is `x`, in [-π/2, π/2].
+pub fn atan_f64(x: f64) -> f64 {
+    if x != x {
+        return x
+    }
+    let neg = x < 0.0
+    var a = abs(x)
+    if a > 100000000000000000000.0 {
+        return if neg { -D_ATAN_HI[3] } else { D_ATAN_HI[3] }
+    }
+    if a < 0.0000000074505805969238281 {
+        return x
+    }
+    var id: i32 = -1
+    if a >= 0.4375 {
+        if a < 0.6875 {
+            id = 0
+            a = (2.0 * a - 1.0) / (2.0 + a)
+        } else if a < 1.1875 {
+            id = 1
+            a = (a - 1.0) / (a + 1.0)
+        } else if a < 2.4375 {
+            id = 2
+            a = (a - 1.5) / (1.0 + 1.5 * a)
+        } else {
+            id = 3
+            a = -1.0 / a
+        }
+    }
+    let z = a * a
+    let w = z * z
+    let s1 = z *
+        (D_AT[0] + w * (D_AT[2] + w * (D_AT[4] + w * (D_AT[6] + w * (D_AT[8] + w * D_AT[10])))))
+    let s2 = w * (D_AT[1] + w * (D_AT[3] + w * (D_AT[5] + w * (D_AT[7] + w * D_AT[9]))))
+    let r = if id < 0 {
+        a - a * (s1 + s2)
+    } else {
+        D_ATAN_HI[u32(id)] - ((a * (s1 + s2) - D_ATAN_LO[u32(id)]) - a)
+    }
+    if neg {
+        -r
+    } else {
+        r
+    }
+}
+
+fn d_sign_bit(x: f64) -> bool {
+    (bitcast_u64(x) >> 63) == 1
+}
+
+/// The angle from the positive x axis to the point (`x`, `y`), in [-π, π].
+pub fn atan2_f64(y: f64, x: f64) -> f64 {
+    if x != x || y != y {
+        return x + y
+    }
+    if x == 1.0 {
+        return atan_f64(y)
+    }
+    if y == 0.0 {
+        if !d_sign_bit(x) {
+            return y
+        }
+        return if d_sign_bit(y) { -PI_F64 } else { PI_F64 }
+    }
+    if x == 0.0 {
+        return if y > 0.0 { 0.5 * PI_F64 } else { -0.5 * PI_F64 }
+    }
+    let inf = 1.0 / 0.0
+    if abs(x) == inf {
+        if abs(y) == inf {
+            let q = if x > 0.0 { 0.25 * PI_F64 } else { 0.75 * PI_F64 }
+            return if y > 0.0 { q } else { -q }
+        }
+        let q = if x > 0.0 { 0.0 } else { PI_F64 }
+        return if y > 0.0 { q } else { -q }
+    }
+    if abs(y) == inf {
+        return if y > 0.0 { 0.5 * PI_F64 } else { -0.5 * PI_F64 }
+    }
+    let ex = d_high(x) >> 20
+    let ey = d_high(y) >> 20
+    // |y/x| past 2^60, or below 2^-60 with x < 0: atan's own limits.
+    let z = if ey > ex + 60 {
+        0.5 * PI_F64 + 0.5 * D_PI_LO
+    } else if x < 0.0 && ex > ey + 60 {
+        0.0
+    } else {
+        atan_f64(abs(y / x))
+    }
+    if x > 0.0 {
+        return if y > 0.0 { z } else { -z }
+    }
+    if y > 0.0 {
+        PI_F64 - (z - D_PI_LO)
+    } else {
+        (z - D_PI_LO) - PI_F64
+    }
+}
+
+/// `y` times 2^`n`.
+fn d_scaled(y: f64, n: i32) -> f64 {
+    var v = y
+    var k = n
+    if k > 1023 {
+        v *= bitcast_f64(u64(0x7FE0000000000000))
+        k -= 1023
+        if k > 1023 {
+            v *= bitcast_f64(u64(0x7FE0000000000000))
+            k = min(k - 1023, 1023)
+        }
+    } else if k < -1022 {
+        // 2^-1022 · 2^53, so a subnormal result is rounded once.
+        v *= bitcast_f64(u64(0x0360000000000000))
+        k += 969
+        if k < -1022 {
+            v *= bitcast_f64(u64(0x0360000000000000))
+            k = max(k + 969, -1022)
+        }
+    }
+    v * bitcast_f64(u64(k + 1023) << 52)
+}
+
+/// e to the power `x`.
+pub fn exp_f64(x: f64) -> f64 {
+    if x != x {
+        return x
+    }
+    if x > 709.782712893383973096 {
+        return 1.0 / 0.0
+    }
+    if x < -745.13321910194110842 {
+        return 0.0
+    }
+    let ax = abs(x)
+    var k: i32 = 0
+    var hi = x
+    var lo = 0.0
+    var r = x
+    if ax > 0.5 * 0.693147180559945286227 {
+        if ax >= 1.5 * 0.693147180559945286227 {
+            k = i32(D_INV_LN2 * x + if x < 0.0 { -0.5 } else { 0.5 })
+        } else {
+            k = if x < 0.0 { -1 } else { 1 }
+        }
+        hi = x - f64(k) * D_LN2_HI
+        lo = f64(k) * D_LN2_LO
+        r = hi - lo
+    } else if ax <= 0.0000000037252902984619141 {
+        return 1.0 + x
+    }
+    let xx = r * r
+    let c = r - xx * (D_P1 + xx * (D_P2 + xx * (D_P3 + xx * (D_P4 + xx * D_P5))))
+    let y = 1.0 + (r * c / (2.0 - c) - lo + hi)
+    if k == 0 {
+        y
+    } else {
+        d_scaled(y, k)
+    }
+}
+
+/// `a` as two halves of 26 bits (Veltkamp's split), for exact products.
+fn d_split(a: f64) -> (f64, f64) {
+    let c = 134217729.0 * a
+    let hi = c - (c - a)
+    (hi, a - hi)
+}
+
+/// `a * b`, and its rounding error: the two sum to the exact product (Dekker).
+fn d_two_product(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b
+    let (ah, al) = d_split(a)
+    let (bh, bl) = d_split(b)
+    (p, ((ah * bh - p) + ah * bl + al * bh) + al * bl)
+}
+
+/// `a + b`, and its rounding error (Knuth).
+fn d_two_sum(a: f64, b: f64) -> (f64, f64) {
+    let s = a + b
+    let bb = s - a
+    (s, (a - (s - bb)) + (b - bb))
+}
+
+/// The natural logarithm of a positive, finite `x`, as two f64s whose sum is within about 2^-62
+/// of it, relatively: log's reduction to 2^k (1 + f), with f - f²/2 and the sum carried exactly.
+fn d_log_parts(x: f64) -> (f64, f64) {
+    var bits = bitcast_u64(x)
+    var hx = u32(bits >> 32)
+    var k: i32 = 0
+    if hx < 0x00100000 {
+        // A subnormal: scaled up by 2^54 first.
+        k -= 54
+        bits = bitcast_u64(x * 18014398509481984.0)
+        hx = u32(bits >> 32)
+    }
+    hx += 0x3ff00000 - 0x3fe6a09e
+    k += i32(hx >> 20) - 0x3ff
+    hx = (hx & 0x000fffff) + 0x3fe6a09e
+    let m = bitcast_f64((u64(hx) << 32) | (bits & 0xffffffff))
+    let f = m - 1.0
+    let (ff, ffe) = d_two_product(f, f)
+    let hfsq = 0.5 * ff
+    let s = f / (2.0 + f)
+    let z = s * s
+    let w = z * z
+    let t1 = w * (D_LG2 + w * (D_LG4 + w * D_LG6))
+    let t2 = z * (D_LG1 + w * (D_LG3 + w * (D_LG5 + w * D_LG7)))
+    let dk = f64(k)
+    let small = s * (hfsq + t2 + t1) + dk * D_LN2_LO
+    let (a, ae) = d_two_sum(f, -hfsq)
+    let (b, be) = d_two_sum(dk * D_LN2_HI, a)
+    d_two_sum(b, be + ae - 0.5 * ffe + small)
+}
+
+/// The natural logarithm of `x`: minus infinity at 0, NaN below 0.
+pub fn log_f64(x: f64) -> f64 {
+    if x != x || x == 1.0 / 0.0 {
+        return x
+    }
+    if x == 0.0 {
+        return -1.0 / 0.0
+    }
+    if x < 0.0 {
+        return (x - x) / (x - x)
+    }
+    let (hi, lo) = d_log_parts(x)
+    hi + lo
+}
+
+/// log's two parts times `c` (in two parts too): the product rounded once.
+fn d_log_times(x: f64, c: f64, c_lo: f64) -> f64 {
+    if x != x || x == 1.0 / 0.0 || x <= 0.0 {
+        return log_f64(x)
+    }
+    let (hi, lo) = d_log_parts(x)
+    let (p, pe) = d_two_product(hi, c)
+    p + (pe + hi * c_lo + lo * c)
+}
+
+/// The logarithm of `x` to base 10: minus infinity at 0, NaN below 0; exact at the powers of 10.
+pub fn log10_f64(x: f64) -> f64 {
+    d_log_times(x, D_INV_LN10, D_INV_LN10_LO)
+}
+
+/// The logarithm of `x` to base 2: minus infinity at 0, NaN below 0; exact at the powers of 2.
+pub fn log2_f64(x: f64) -> f64 {
+    d_log_times(x, D_INV_LN2, D_INV_LN2_LO)
+}
+
+/// `x` to the power `y`, for a positive, finite `x` and a finite `y`: an infinity past f64's
+/// range, 0 below it. Its error is exp's, and log's 2^-62 times |y ln x|: within an ulp while
+/// |y ln x| is below about 300, within two up to the overflow.
+pub fn pow_f64(x: f64, y: f64) -> f64 {
+    assert(x > 0.0 && x < 1.0 / 0.0, f"pow_f64 takes a positive, finite base, not {x}")
+    if y == 0.0 || x == 1.0 {
+        return 1.0
+    }
+    // The powers a correctly rounded libm gives exactly, given so: a section's squareness is
+    // often held at 1 or 2, and its quadrants' floor is a power of two. Within an ulp of them,
+    // fits that turn on the last bits went their own way (the wolf's hind leg, 62% of its
+    // surface within 2 mm where the host's libm gave 84%).
+    if y == 1.0 {
+        return x
+    }
+    if y == 2.0 {
+        return x * x
+    }
+    if y == -1.0 {
+        return 1.0 / x
+    }
+    if y == 0.5 {
+        return sqrt(x)
+    }
+    if x == 2.0 && y == trunc(y) && abs(y) <= 1000.0 {
+        return d_scaled(1.0, i32(y))
+    }
+    let (hi, lo) = d_log_parts(x)
+    // Past exp's range, the power is too: an infinity or 0, before the compensated product,
+    // whose splits would overflow (y beyond 2^996 or so) and make a NaN of it.
+    let rough = y * hi
+    if rough > 710.0 {
+        return 1.0 / 0.0
+    }
+    if rough < -746.0 {
+        return 0.0
+    }
+    let (p, pe) = d_two_product(y, hi)
+    let (q, qe) = d_two_sum(p, pe + y * lo)
+    let e = exp_f64(q)
+    // Overflowed or flushed to 0 at the boundary: the correction would make inf · 0 a NaN.
+    if e == 1.0 / 0.0 || e == 0.0 {
+        return e
+    }
+    e + e * qe
+}
+
+/// How many representable f64s apart `a` and `b` are, if they have one sign (else the most).
+fn d_apart(a: f64, b: f64) -> u64 {
+    let x = bitcast_u64(a)
+    let y = bitcast_u64(b)
+    if (x >> 63) != (y >> 63) {
+        return if a == 0.0 && b == 0.0 { 0 } else { 18446744073709551615 }
+    }
+    if x > y { x - y } else { y - x }
+}
+
+@test
+fn powers_past_the_range_are_infinite_or_zero() {
+    let inf = 1.0 / 0.0
+    let cases: [(f64, f64, f64); 9] = [
+        (10.0, 400.0, inf),
+        (2.0, 1025.0, inf),
+        (2.0, 1e308, inf),
+        (0.5, -1e308, inf),
+        (10.0, -400.0, 0.0),
+        (2.0, -1e308, 0.0),
+        (0.5, 1e308, 0.0),
+        (1.0000001, 1e300, inf),
+        (1.0000001, -1e300, 0.0),
+    ]
+    for (x, y, want) in cases {
+        let got = pow_f64(x, y: y)
+        assert(got == want, f"{x}^{y}: {got}")
+    }
+    // Near the overflow and the subnormal boundaries, libm's (macOS's) values: to a bit, or two
+    // where |y ln x| nears 709 (log's 2^-62 error, times y).
+    let near: [(f64, f64, u64); 12] = [
+        (10.0, 308.25, u64(0x7FEFA788589D81D3)),
+        (10.0, -307.9, u64(0x00090D7A3A04564B)),
+        (10.0, -310.0, u64(0x000012688B70E62B)),
+        (10.0, -323.5, u64(0x0000000000000001)),
+        (2.0, -1074.0, u64(0x0000000000000001)),
+        (2.0, 1023.9, u64(0x7FEDDB680117AA8E)),
+        (1.0000001, 7000000000.0, u64(0x7F0D941AE6E762D4)),
+        (0.9999999, 7000000000.0, u64(0x00D14F03C6DBC57F)),
+        (7.0, 364.7, u64(0x7FECAFF29E2D5797)),
+        (7.0, -382.5, u64(0x0000000000000001)),
+        (3.0, 646.0, u64(0x7FED906A378B5987)),
+        (3.0, -679.0, u64(0x0000000000000000)),
+    ]
+    for (x, y, bits) in near {
+        let got = pow_f64(x, y: y)
+        assert(d_apart(got, bitcast_f64(bits)) <= 2, f"{x}^{y}: {got} against {bitcast_f64(bits)}")
+    }
+}
+
+/// How many of `want`'s ulps `got` is from it.
+fn d_ulps(got: f64, want: f64) -> f64 {
+    abs(got - want) / max(abs(want) * 0.0000000000000002220446049250313, 0.0)
+}
+
+@test
+fn the_f64_functions_are_within_an_ulp_of_their_values() {
+    // Each against the nearest f64 to the true value.
+    let cases = [
+        (sin_f64(0.5), 0.479425538604203),
+        (cos_f64(0.5), 0.8775825618903728),
+        (sin_f64(TAU_F64 * 7.0 / 48.0), 0.7933533402912352),
+        (cos_f64(100.0), 0.8623188722876839),
+        (sin_f64(-3.0), -0.1411200080598672),
+        (cos_f64(1000000.0), 0.9367521275331447),
+        (atan2_f64(y: 1.0, x: 1.0), 0.7853981633974483),
+        (atan2_f64(y: -1.0, x: -2.0), -2.677945044588987),
+        (atan2_f64(y: 0.0, x: -1.0), PI_F64),
+        (exp_f64(1.0), 2.718281828459045),
+        (exp_f64(-700.0), 9.85967654375977e-305),
+        (log_f64(10.0), 2.302585092994046),
+        (log10_f64(2.0), 0.3010299956639812),
+        (log10_f64(0.00007), -4.154901959985743),
+        (log2_f64(10.0), 3.321928094887362),
+        (log2_f64(1.5), 0.5849625007211562),
+        (pow_f64(x: 2.0, y: 0.5), 1.4142135623730951),
+        (pow_f64(x: 0.001, y: 3.5), 0.000000000031622776601683794),
+        (pow_f64(x: 7.0, y: -2.25), 0.012546696999005395),
+    ]
+    for (got, want) in cases {
+        assert(d_ulps(got, want) <= 1.0, f"{got} against {want}")
+    }
+    assert(sin_f64(0.0) == 0.0 && cos_f64(0.0) == 1.0 && exp_f64(0.0) == 1.0 && log_f64(1.0) == 0.0)
+    assert(log10_f64(1000.0) == 3.0 && log10_f64(0.01) == -2.0 && log2_f64(1024.0) == 10.0)
+    assert(log10_f64(0.0) == -1.0 / 0.0 && log2_f64(0.125) == -3.0)
+    // Exact where the power is.
+    let x = 0.123456789
+    assert(pow_f64(x, y: 1.0) == x && pow_f64(x, y: 2.0) == x * x && pow_f64(x, y: -1.0) == 1.0 / x)
+    assert(
+        pow_f64(x, y: 0.5) == sqrt(x) &&
+            pow_f64(2.0, y: -3.0) == 0.125 &&
+            pow_f64(2.0, y: 10.0) == 1024.0,
+    )
+}
+
+/// Sampled inputs of each f64 function, and what macOS's libm gives for them (bits): the
+/// function (0 `sin_f64` to 8 `pow_f64`, in the order below), its arguments, its value.
+const LIBM: [(u32, u64, u64, u64); 288] = [
+    (0, 0x3FFF611CDA6DECA8, 0x0000000000000000, 0x3FED9791907C69CE),
+    (1, 0xC0026453AC262478, 0x0000000000000000, 0xBFE54BF24F4C7AD0),
+    (2, 0xC045E1BDC2AECAAC, 0x0000000000000000, 0xBFF8C4677F1CDDCB),
+    (3, 0x401CBEDA83F52FD4, 0xBFB88813CB9BD580, 0x3FF95898AD3B2F45),
+    (4, 0xC07ECC4336E65C53, 0x0000000000000000, 0x138102A8E7DF3251),
+    (5, 0x29D3AE1DCA648EEA, 0x0000000000000000, 0xC06EA558B9447C35),
+    (6, 0x1B030FD1CA211F40, 0x0000000000000000, 0xC0663AA55822D021),
+    (7, 0x2050ED6C6D860579, 0x0000000000000000, 0xC07F9EB307A5621F),
+    (8, 0x3F6C85387DDD2D6C, 0xC02634B3B9B3A13E, 0x459969676B58175F),
+    (0, 0xC0B65E9EE4F3AF95, 0x0000000000000000, 0xBFDED614AC4A6120),
+    (1, 0xC0BAB3C82D05C561, 0x0000000000000000, 0x3FEE569BA94011F9),
+    (2, 0x40475E487AF631C0, 0x0000000000000000, 0x3FF8CA5AE1BBDBC2),
+    (3, 0x401366E5D97F923A, 0xC01272543B583452, 0x4002A5CD96941A61),
+    (4, 0xC0604639749B88B0, 0x0000000000000000, 0x3431FD1CF1EC269D),
+    (5, 0x7DB6C052683941E4, 0x0000000000000000, 0x408569739A018095),
+    (6, 0x7B03714FEE470817, 0x0000000000000000, 0x4071C8ED7D511FFA),
+    (7, 0x1B57F441983FC4D2, 0x0000000000000000, 0xC0824B57A656D978),
+    (8, 0x402A0387F139FD31, 0x4030B8690D91CBB6, 0x43CD8EB7AAD52A19),
+    (0, 0x400F4B00428DA594, 0x0000000000000000, 0xBFE646E8F8F4F978),
+    (1, 0x4002C066F1A2731C, 0x0000000000000000, 0xBFE6593CBAFAF339),
+    (2, 0xC0445872C6895D5D, 0x0000000000000000, 0xBFF8BD5747C46538),
+    (3, 0x3FF9CB85CF55C8F0, 0xC02206DCEE7826D3, 0x4007B77F8774C0DF),
+    (4, 0x4085CE4DADD9B164, 0x0000000000000000, 0x7ED9E7CD323A7622),
+    (5, 0x7DB0348DEADF511F, 0x0000000000000000, 0x408566BCC02E9EF1),
+    (6, 0x1C82E58E2755951F, 0x0000000000000000, 0xC06553936302BB2B),
+    (7, 0x7897729363BF1B74, 0x0000000000000000, 0x408C5469329219EF),
+    (8, 0x3F857050460EE1BD, 0x40060A5C782EBF40, 0x3ECD65C8C6139E57),
+    (0, 0xC00A0F82789D66B2, 0x0000000000000000, 0x3FBD9FDD1ADD6E8D),
+    (1, 0xC0BFA49D5CCFC538, 0x0000000000000000, 0xBF9278DD1230179A),
+    (2, 0xC03ED2AB64848B9E, 0x0000000000000000, 0xBFF89D23E811196F),
+    (3, 0xC02053A4E60368A9, 0x400EEB66B92DB47C, 0xBFF20ECD62F8DE8E),
+    (4, 0xC07B0AC7EBCD8F0A, 0x0000000000000000, 0x18EB8B24DD9D9EC8),
+    (5, 0x4659C9373F1C6E58, 0x0000000000000000, 0x4051CB68893B0C4D),
+    (6, 0x33BD862ACA70C60A, 0x0000000000000000, 0xC04D5E2F6F65E2C0),
+    (7, 0x44DF2EAC4DB019CF, 0x0000000000000000, 0x4053BD9C28CA8116),
+    (8, 0x3FF0F6E808C5419A, 0x40123957BE9772C0, 0x3FF4E3CED7F28391),
+    (0, 0xC09F4E5C45423624, 0x0000000000000000, 0x3FE5B7FE9472FE8F),
+    (1, 0x40A7B33F5887AFF0, 0x0000000000000000, 0x3FD9DD1521977376),
+    (2, 0xC035D98CD66BF69F, 0x0000000000000000, 0xBFF866A69E3F19ED),
+    (3, 0xBFDA41C626EBAE80, 0xBFED3AD2FE4348A0, 0xC005C16E2CBEE2BA),
+    (4, 0xC04C350623680C30, 0x0000000000000000, 0x3AD871CEB1747C98),
+    (5, 0x3909A7551BA495CE, 0x0000000000000000, 0xC0531DE7436FB2CF),
+    (6, 0x1CA040C9CBD72EC8, 0x0000000000000000, 0xC06542677AFA0A1C),
+    (7, 0x6C9B4C4D5C9CCA58, 0x0000000000000000, 0x4086562A728A49D4),
+    (8, 0x3FF566D41B8A5730, 0xC0317221D962FBBA, 0x3F799D087FB7CB50),
+    (0, 0x3FF7AB6F58BEE910, 0x0000000000000000, 0x3FEFDDC6469F1E75),
+    (1, 0x40BCA40B39A81A34, 0x0000000000000000, 0x3FED0A938A43FC4C),
+    (2, 0xC0405D8C317099E2, 0x0000000000000000, 0xBFF8A4E0F64EDD5D),
+    (3, 0xC01EB98631A58E20, 0x4020C0EE85F7A3A0, 0xBFE7BF51FA9591BE),
+    (4, 0x407E3BB96F4E7988, 0x0000000000000000, 0x6B8D6C487CA3BBB5),
+    (5, 0x5092E30047EDA485, 0x0000000000000000, 0x406711606C8584F1),
+    (6, 0x3B70D10207E1394D, 0x0000000000000000, 0xC035A70D3BD18B00),
+    (7, 0x6273CDACE5A53148, 0x0000000000000000, 0x408142761FB3FE31),
+    (8, 0x3FED5E93E788966E, 0xC02B0AE41B1F0F3C, 0x400984210EB92E8D),
+    (0, 0x40B88CAABAAC44F2, 0x0000000000000000, 0x3FEFDF6FC53D49A3),
+    (1, 0xC0B195BCAD5983CB, 0x0000000000000000, 0xBFEF9066302E61DA),
+    (2, 0x4030B581EA8C61B8, 0x0000000000000000, 0x3FF82D22FB92BED2),
+    (3, 0x400C7A0B35040DB4, 0x3FE9B2CF877F7B20, 0x3FF5951A26006156),
+    (4, 0xC0783042AF5AB8F6, 0x0000000000000000, 0x1D092B108EB4C99C),
+    (5, 0x3D13FAF63932DFB0, 0x0000000000000000, 0xC03FA9A0E43D1E51),
+    (6, 0x1CF85EAF79771F09, 0x0000000000000000, 0xC0650C9C2D0241B3),
+    (7, 0x4FEA813A38ED4E9A, 0x0000000000000000, 0x406FF74D43339003),
+    (8, 0x3FA46839F9BDC472, 0x40246615A15C4B72, 0x3CF7F7FF988D78C2),
+    (0, 0xC0BE71C5F7D0B93A, 0x0000000000000000, 0xBFDFB14C790F6111),
+    (1, 0x4092EB10C96B3750, 0x0000000000000000, 0xBFD3FC1F7F2946DC),
+    (2, 0xC027B17A80CDEF74, 0x0000000000000000, 0xBFF7C90C1FC3C08A),
+    (3, 0x3FFB76794F8B0F40, 0xC0230D39AEDFD465, 0x4007B4E0BA310FD0),
+    (4, 0x408093EAE23C0D16, 0x0000000000000000, 0x6FC42E0B16F7EB72),
+    (5, 0x72111AAEA87860FE, 0x0000000000000000, 0x40815FC426130C00),
+    (6, 0x4E88385C34BBFB07, 0x0000000000000000, 0x4051947BA20D0EA8),
+    (7, 0x37CB914DD17BC4DD, 0x0000000000000000, 0xC06046E21661C086),
+    (8, 0x3FEF1221D48F53C6, 0x401835C9A1C87C74, 0x3FEAC5DAD39BF26A),
+    (0, 0x40B7444CDA48C6D0, 0x0000000000000000, 0xBFC4533EF4B4E0C7),
+    (1, 0xC0C172C5998B2377, 0x0000000000000000, 0x3FDA64071E4CFD32),
+    (2, 0x3FFC7EF879928760, 0x0000000000000000, 0x3FF0F266B147CBE9),
+    (3, 0xC0114C94F9D1CDA1, 0x3FC3BB5EBD0A14C0, 0xBFF8900B01DFD4C0),
+    (4, 0x40800DCE38A7EF16, 0x0000000000000000, 0x6E41BF41B816EDAB),
+    (5, 0x65A15FB4BA327A20, 0x0000000000000000, 0x407A20CD526E32BC),
+    (6, 0x4D36FA574BF06DA2, 0x0000000000000000, 0x404FFCDECCE9F4C0),
+    (7, 0x09979EB4BD17B679, 0x0000000000000000, 0xC08B2B8128E492B0),
+    (8, 0x4018F3C7C6EC4118, 0xC031A5ADCC0A0D48, 0x3D04FEF97C37888C),
+    (0, 0x40B8DA2272C05CD4, 0x0000000000000000, 0xBFD97A66185CAF47),
+    (1, 0x408C0EFD46E28D30, 0x0000000000000000, 0x3FEA0293D5F83196),
+    (2, 0xC0466AD2ED9B7BC8, 0x0000000000000000, 0xBFF8C6A388F46533),
+    (3, 0x4010B78A7F2EADC0, 0x400670EEEAE52EA4, 0x3FEF5956AD10F8D3),
+    (4, 0x4072B26C62353814, 0x0000000000000000, 0x5AE7FD4D8865B5B4),
+    (5, 0x0E8EE4EBF7178960, 0x0000000000000000, 0xC0811CF8B524CEB1),
+    (6, 0x451CA6C6A07DB35A, 0x0000000000000000, 0x4038EFFF1E434E20),
+    (7, 0x73CD618F424793B8, 0x0000000000000000, 0x4089EF03B82BCDCC),
+    (8, 0x3F8028442E4A18F7, 0x402C3C4EF081BEB8, 0x39C4BED419B41E64),
+    (0, 0xC0A918150DFFD642, 0x0000000000000000, 0xBFEF1A4D6BC209E1),
+    (1, 0x40BB312ED2C150D4, 0x0000000000000000, 0x3FEAA75A47173FD5),
+    (2, 0x40467FE84FE895A0, 0x0000000000000000, 0x3FF8C6F919C4F1A6),
+    (3, 0xC022847B0CA714EA, 0xC016B231C6A07C42, 0xC000F6FA40C4E54D),
+    (4, 0x406CDF3244C3D268, 0x0000000000000000, 0x54C2B7B43235F061),
+    (5, 0x3631B6EF884FE450, 0x0000000000000000, 0xC05B01DDC28F1FE3),
+    (6, 0x1AFE034B313E5E97, 0x0000000000000000, 0xC0663DF861889A9F),
+    (7, 0x3BA6CBAA4CBB20F4, 0x0000000000000000, 0xC0511F50FEEC3D63),
+    (8, 0x404A1D49B2267072, 0xC018F269815266F0, 0x3DB53C385F30C5D2),
+    (0, 0xC095FC22B6A4BEB0, 0x0000000000000000, 0x3FD8E654174EEA49),
+    (1, 0x400271C05EFF6344, 0x0000000000000000, 0xBFE573E892F652AD),
+    (2, 0x403E4161FE41DD34, 0x0000000000000000, 0x3FF89AA675D652AF),
+    (3, 0x4021D1F45FDAA7D0, 0xBFF93AFF38EB18E0, 0x3FFBEF765C8D56CD),
+    (4, 0xC07DCAF161AFA6ED, 0x0000000000000000, 0x14F391851169B917),
+    (5, 0x0EC7B69E8CB2387A, 0x0000000000000000, 0xC08108E8347C1225),
+    (6, 0x422349CE51901ED6, 0x0000000000000000, 0x40253C04C5F6BB40),
+    (7, 0x4C2DB621352E86ED, 0x0000000000000000, 0x40687C930539F747),
+    (8, 0x3F5418C10FA3BEC6, 0x402776DED9278D12, 0x38D73687B145C5CA),
+    (0, 0xC0BCDBA7DE5E1232, 0x0000000000000000, 0x3FEF5BB542B741C8),
+    (1, 0x40A98EDDB4AFC99C, 0x0000000000000000, 0xBFE055C2140B281E),
+    (2, 0x403C16942D848EE0, 0x0000000000000000, 0x3FF890378A1A1DB8),
+    (3, 0xC01E25B6B312BEA9, 0xC01EA3230F57FD40, 0xC002E9FE430B4ACF),
+    (4, 0x40821237631E7DCC, 0x0000000000000000, 0x74136478ACE4DAC5),
+    (5, 0x6F2250FD99871411, 0x0000000000000000, 0x40805BB0CC9DE526),
+    (6, 0x05362CE6ED1EBB3E, 0x0000000000000000, 0xC071AD391DD65DF7),
+    (7, 0x75953B7837D121E8, 0x0000000000000000, 0x408AD343F893E3E9),
+    (8, 0x408DE1D5276E5820, 0xC02A1301E964CE8A, 0x37DE34368FE598EC),
+    (0, 0x40B93FF1711C4504, 0x0000000000000000, 0xBFEFC8B60ED3488F),
+    (1, 0x3FF883EB6569E6DC, 0x0000000000000000, 0x3FA3C0BC8318EDBC),
+    (2, 0x40306A5AD49F86B4, 0x0000000000000000, 0x3FF828C4C7E7F9AF),
+    (3, 0x401247E14186EE36, 0x3FD4938291C311C0, 0x3FF8024F9C40A15D),
+    (4, 0x40732808C487E71C, 0x0000000000000000, 0x5B923DB68CACD591),
+    (5, 0x74236158A26579D0, 0x0000000000000000, 0x408217C1A9B8E221),
+    (6, 0x20314A9B52C1EBCC, 0x0000000000000000, 0xC0631C7700EB21E4),
+    (7, 0x1B646418996B736D, 0x0000000000000000, 0xC08245337C429DE7),
+    (8, 0x3F75D971374BF00E, 0xC02362477B6C3157, 0x44821CB124B07663),
+    (0, 0xC0A018FA8FF6D310, 0x0000000000000000, 0x3FD8A6C35C984D06),
+    (1, 0x400E33A9D02B50F8, 0x0000000000000000, 0xBFE9C9C7F11450E5),
+    (2, 0x403BA96834F3DDC0, 0x0000000000000000, 0x3FF88DF8C038CDCB),
+    (3, 0x40003DCE0F703CB0, 0xC02340F65565BD4A, 0x40077852C5A61F32),
+    (4, 0xC066EDB4BF706688, 0x0000000000000000, 0x2F64A95F991B1ADF),
+    (5, 0x2304198A479CD64E, 0x0000000000000000, 0xC0740B2F34FB58C0),
+    (6, 0x056744687831B8AA, 0x0000000000000000, 0xC0719E709061137A),
+    (7, 0x63F19CBC7BCBFD9A, 0x0000000000000000, 0x4082011BA9C58A85),
+    (8, 0x401642BDA7E0FCBE, 0xC0200EDCF608DAA8, 0x3EB159112F403B7B),
+    (0, 0xC0B3D3F13152D23B, 0x0000000000000000, 0x3FE87DAA31800EA7),
+    (1, 0xC0BDA619EB7117B0, 0x0000000000000000, 0x3FEFFF43C8C166C6),
+    (2, 0xC029EA1B51629BD4, 0x0000000000000000, 0xBFF7E67D8D2F062C),
+    (3, 0x3FF67C000D5E44C0, 0x4013F6387E73C438, 0x3FD19128F1151F8F),
+    (4, 0xC08320CC84D3850A, 0x0000000000000000, 0x08BE69718E199DBF),
+    (5, 0x2DE2A1CD6967292D, 0x0000000000000000, 0xC069055A0A33F618),
+    (6, 0x5234AB2ED50C6839, 0x0000000000000000, 0x405600C3D07D25D0),
+    (7, 0x1770B8464A922FE8, 0x0000000000000000, 0xC0843F7DFA3250CB),
+    (8, 0x404B10355BE818A2, 0x4030B23E484F0964, 0x45F1A633B52CA0DD),
+    (0, 0x408A0DD6262265E0, 0x0000000000000000, 0xBFEDE958BC75309F),
+    (1, 0xC0AFE78FAABED616, 0x0000000000000000, 0x3FEEAA48ED0734FA),
+    (2, 0x402353A6904670DC, 0x0000000000000000, 0x3FF77B9DED6B2521),
+    (3, 0x3FF9BD2FC71A2F90, 0xC0067CA3F1B1DFD2, 0x4004F9684C37BA24),
+    (4, 0x4078720919EAF4CC, 0x0000000000000000, 0x6333640E30FD7462),
+    (5, 0x27B6888788799AF7, 0x0000000000000000, 0xC070C9944633BCAB),
+    (6, 0x624363D64CC37DC9, 0x0000000000000000, 0x4064AB2A652A9528),
+    (7, 0x192FE78C1247C214, 0x0000000000000000, 0xC0836008D52B1DAF),
+    (8, 0x4010E05A6C02B695, 0x403089E765EBC33C, 0x421463B5EBA1D966),
+    (0, 0xC0A2C1D70671273E, 0x0000000000000000, 0xBFE5A6FF92C6ED6A),
+    (1, 0x3FF4292159152400, 0x0000000000000000, 0x3FD391DB150ACA7E),
+    (2, 0x4039918A5D601494, 0x0000000000000000, 0x3FF881DDC951A3FB),
+    (3, 0x40223D7C0DD232E8, 0x4017FA970339812A, 0x3FEFA8587FA9713A),
+    (4, 0x406FD638F036ED58, 0x0000000000000000, 0x56E5CD6FA216C7C9),
+    (5, 0x185A053831D7C3A1, 0x0000000000000000, 0xC07B6F811BF05D81),
+    (6, 0x49BE224B931BAA77, 0x0000000000000000, 0x40479E28A7291130),
+    (7, 0x1F0DDA36D460EC63, 0x0000000000000000, 0xC08070CD42C716BB),
+    (8, 0x4018EA5D8CEE560A, 0xC02969BA72A4C9E8, 0x3DD62134E87323E5),
+    (0, 0xBFEB41B81AE709E0, 0x0000000000000000, 0xBFE8140FD2B20EDF),
+    (1, 0xBFB1C25781E3DA00, 0x0000000000000000, 0x3FEFEC4BD37C57E4),
+    (2, 0x402E82D09B1FDC10, 0x0000000000000000, 0x3FF815DF384E2846),
+    (3, 0xC01FF9FB15176F68, 0x401521F38C44CBAC, 0xBFEF93F3B8EFB212),
+    (4, 0x407CB34CD3A14660, 0x0000000000000000, 0x69568AEF00B3A090),
+    (5, 0x2A2BD5084C13EC7C, 0x0000000000000000, 0xC06E2B5A3727B408),
+    (6, 0x5D4075892E4D5FAA, 0x0000000000000000, 0x4061A640588700D8),
+    (7, 0x66D8E1C5FDAE77C8, 0x0000000000000000, 0x40837518A14374F9),
+    (8, 0x3F8809A70AD3C5C9, 0xC01E2FC52544E06C, 0x42F509D5F0F8E767),
+    (0, 0x4004C597908CE750, 0x0000000000000000, 0x3FE097AAAB7D64B8),
+    (1, 0xC0A704EB1E0903F8, 0x0000000000000000, 0x3FEE02110D9174BF),
+    (2, 0xC01293237AEDD000, 0x0000000000000000, 0xBFF5BD31318AEF90),
+    (3, 0xBFEDCB74964035E0, 0xC013BF8BE927A610, 0xC007A43B0677C333),
+    (4, 0xC064854BAE817AEC, 0x0000000000000000, 0x3121DE12DA5EFB0C),
+    (5, 0x426FF59E86072417, 0x0000000000000000, 0x403BB980A56DC271),
+    (6, 0x0633D4728492C99B, 0x0000000000000000, 0xC07160EFAE884B83),
+    (7, 0x462E668A6DAEC521, 0x0000000000000000, 0x4058FB44007DE401),
+    (8, 0x40711C46C7963966, 0xC02EBCCDCF4EEE16, 0x38279F999ECE0D1C),
+    (0, 0xC097C4011E4EB690, 0x0000000000000000, 0xBFDCFFB57EDADB14),
+    (1, 0x400416D98432FE6A, 0x0000000000000000, 0xBFE9D9422A78E5D4),
+    (2, 0xC043FC15CF0486C2, 0x0000000000000000, 0xBFF8BB865781E993),
+    (3, 0xC006512CA5527AA0, 0x4014C352EB7F8A1A, 0xBFDF8F8FFCB0B1A9),
+    (4, 0x407F6D3EE84ADCBC, 0x0000000000000000, 0x6D4583C9ED557A93),
+    (5, 0x5D51FE43399065F8, 0x0000000000000000, 0x40745E5865187234),
+    (6, 0x6A80C7BB2EACBD34, 0x0000000000000000, 0x4069A0B513DB892E),
+    (7, 0x0B701EF87530B803, 0x0000000000000000, 0xC08A3FE9BE570F5B),
+    (8, 0x3FED7C53A2965B61, 0xBFE2A50CB529AA00, 0x3FF0C8066E0765C7),
+    (0, 0xC0AEDF2E5BAC19EE, 0x0000000000000000, 0x3FE0429EFF3C7622),
+    (1, 0x408FAA93C3B56C10, 0x0000000000000000, 0xBFC434A6AE3E09BC),
+    (2, 0xC0450809C13167D5, 0x0000000000000000, 0xBFF8C09F33BC7486),
+    (3, 0x3FCF0317E14616C0, 0x400617D4E3DF16B8, 0x3FB666DFAB992BF9),
+    (4, 0xC07DB92C1809C911, 0x0000000000000000, 0x150DB566FB6B54AF),
+    (5, 0x3EA898F97C26AB4D, 0x0000000000000000, 0xC02C4087514F7A81),
+    (6, 0x6885CA52F0A911A9, 0x0000000000000000, 0x40687015639AF938),
+    (7, 0x35586499CFAB4BF1, 0x0000000000000000, 0xC0652C880A10DAA4),
+    (8, 0x3FC0C3CA7D40C18B, 0x4025849F4B7D317A, 0x3DF5D258187C3C2D),
+    (0, 0xC0BF76D0BB33CEB5, 0x0000000000000000, 0x3FCCF528F3BCF589),
+    (1, 0xC0B922283157A83E, 0x0000000000000000, 0x3FEF82867C35D003),
+    (2, 0xC03DC297607DC2E9, 0x0000000000000000, 0xBFF89866513EBD32),
+    (3, 0xC012706D1D86C184, 0xC01DB475BE205953, 0xC004B03FE51848A0),
+    (4, 0x406E700B5172C80C, 0x0000000000000000, 0x55E3AC9AB9177CA8),
+    (5, 0x39F912059CE9E78D, 0x0000000000000000, 0xC05085F43533CBF7),
+    (6, 0x052D3C988772F9FF, 0x0000000000000000, 0xC071B01E61D415B8),
+    (7, 0x5C031C8E4E56239C, 0x0000000000000000, 0x407C141A1A2B9158),
+    (8, 0x4012B5CFAB0D84C0, 0xC00E9567EA76C100, 0x3F667CCE07D1060E),
+    (0, 0x40B02F3120B4E6D2, 0x0000000000000000, 0x3FE13C6B55450F07),
+    (1, 0x4005C69CE40AE49A, 0x0000000000000000, 0xBFED395079C90657),
+    (2, 0x4041A36896B16E20, 0x0000000000000000, 0x3FF8ADE6E7C6BB76),
+    (3, 0x3FD3E58A43F5E3C0, 0xC0143913F9E59F22, 0x4008A4349EAFE565),
+    (4, 0x40761B4DAB247148, 0x0000000000000000, 0x5FD391DFD87E2BAD),
+    (5, 0x48979A379C1AACEE, 0x0000000000000000, 0x405802C1AD235373),
+    (6, 0x23B1ED04F86682A3, 0x0000000000000000, 0xC0610084B1DCF1F3),
+    (7, 0x4603E8282A0FC7C6, 0x0000000000000000, 0x4058542C235D0BB6),
+    (8, 0x3F553DD94295C5C0, 0xC0326F159EDA50A8, 0x4AFBEAC3B9EE627C),
+    (0, 0x4088459E6F28A430, 0x0000000000000000, 0xBFE550BC78D775FF),
+    (1, 0xC0BD895E3B3B1EAD, 0x0000000000000000, 0xBFECE0AF1DF18CF3),
+    (2, 0xC0337A59AD59DDE1, 0x0000000000000000, 0xBFF84FE07F96434E),
+    (3, 0x4007AD2DEEEF286C, 0x4003C29277D1D738, 0x3FEC029E26D64216),
+    (4, 0x4071374D7B3B8230, 0x0000000000000000, 0x58C51B3A5FC7DDAC),
+    (5, 0x0E163DC1B13AB13D, 0x0000000000000000, 0xC081466AAE8BA2BA),
+    (6, 0x403E374A0D065557, 0x0000000000000000, 0x3FF7AF0C90F51400),
+    (7, 0x765FAFF132331B6D, 0x0000000000000000, 0x408B37E2FBB495CC),
+    (8, 0x3F741D6C65650EC1, 0x4024F47D2BCD0148, 0x3AE8ECA483F4BC3E),
+    (0, 0x40BDC06264D89A30, 0x0000000000000000, 0x3FED62B1F1650A31),
+    (1, 0x3FE0F96B13C5F880, 0x0000000000000000, 0x3FEB9A43F3D3CAA2),
+    (2, 0xC01FD8A55754E5D0, 0x0000000000000000, 0xBFF72230BDB1AA20),
+    (3, 0xC011D3CABD27CCE6, 0x3FFC1147E1F253E8, 0xBFF3221121FEC495),
+    (4, 0xC06BBB21BF3B0F0A, 0x0000000000000000, 0x2BEEB8B71FD64421),
+    (5, 0x40DA6EF5603E9999, 0x0000000000000000, 0x402469861E394694),
+    (6, 0x6753F2353552915A, 0x0000000000000000, 0x4067B7D40E79CD58),
+    (7, 0x2E51CF24406C019D, 0x0000000000000000, 0xC0719D86FA3E74B4),
+    (8, 0x3FB3160C1541022F, 0x401E6E84A07B68F8, 0x3E26B145D69C1065),
+    (0, 0xC00CFCE6E4D9C816, 0x0000000000000000, 0x3FDDA94F5ADF3E7A),
+    (1, 0x40B1734925D669A2, 0x0000000000000000, 0x3FEFF1BC844F1463),
+    (2, 0xC01A6C8D02189C50, 0x0000000000000000, 0xBFF6BA9CAE25BB27),
+    (3, 0x40044FB151A9336C, 0xC021895AD1F0A4D5, 0x4006E0C1849301FF),
+    (4, 0x4075E0894A254B80, 0x0000000000000000, 0x5F7FD08E9D3659C2),
+    (5, 0x0495C3D5EA35D63D, 0x0000000000000000, 0xC0849174F4F84A2B),
+    (6, 0x202C533159B93174, 0x0000000000000000, 0xC0631F3D2E238D68),
+    (7, 0x3EF31302EE6A7A2B, 0x0000000000000000, 0xC02F7E2DFB0A0844),
+    (8, 0x3FDA9D1CBD868DA2, 0x40318C37F9CFE70C, 0x3E8B982520E86497),
+    (0, 0xC00E631B306EDA06, 0x0000000000000000, 0x3FE389E987FF4D75),
+    (1, 0x40B1A0C994D6C37E, 0x0000000000000000, 0x3FBC35C21BE04EA4),
+    (2, 0x4046B7DCA57E441E, 0x0000000000000000, 0x3FF8C7D92E289C61),
+    (3, 0xC0183C6875650B85, 0xC01EE80CBB655938, 0xC003D007F90C3143),
+    (4, 0x40817CC49CFBA88E, 0x0000000000000000, 0x72640FD0DF557B84),
+    (5, 0x7947427489E35824, 0x0000000000000000, 0x4083DFEBB61711B5),
+    (6, 0x08764FCB224C7714, 0x0000000000000000, 0xC070B2B93C61C476),
+    (7, 0x20316DFD037487A3, 0x0000000000000000, 0xC07FBE06433EC294),
+    (8, 0x3FB2B05496BBD8EE, 0xC0308634D4B32A16, 0x43D505C9AE3B14E6),
+    (0, 0x40B832408546B1D2, 0x0000000000000000, 0xBFEA5F576FC479D9),
+    (1, 0xC00E801F6EF63316, 0x0000000000000000, 0xBFE91024AFFD0490),
+    (2, 0x4020C8EBB2350B10, 0x0000000000000000, 0x3FF73C367AC505BD),
+    (3, 0xC023B7477D945B07, 0xBFD26ACF6F06B3C0, 0xBFF999842E302337),
+    (4, 0xC06508118AE903C8, 0x0000000000000000, 0x30C334AF1E4C7BAA),
+    (5, 0x3E944587FAF44D4C, 0x0000000000000000, 0xC02E06743A6206AC),
+    (6, 0x08F2690C3EE67300, 0x0000000000000000, 0xC0708D86FB126D01),
+    (7, 0x36AC2A96FDCD5287, 0x0000000000000000, 0xC06285E4226A58AD),
+    (8, 0x404FBEBCAFEDDE15, 0xC020947C303B9716, 0x3CD478E9EED86525),
+    (0, 0x40BA8DCAD52A8F48, 0x0000000000000000, 0xBFE271011794A128),
+    (1, 0x409E294358BB3BD8, 0x0000000000000000, 0x3FC88A6178C0C281),
+    (2, 0x40072D3D6F729990, 0x0000000000000000, 0x3FF3D09929FEBB29),
+    (3, 0x3FC27C89518BE300, 0xC018B9DA3F81EED2, 0x4008F224009FB2FE),
+    (4, 0xC083894E8078D33C, 0x0000000000000000, 0x0790E96F0E675A68),
+    (5, 0x24CBABA0E2C1D062, 0x0000000000000000, 0xC072CF8A3B82DC98),
+    (6, 0x64E9E81C8E07A1B6, 0x0000000000000000, 0x406643C6D06F4152),
+    (7, 0x5492DD69861132A5, 0x0000000000000000, 0x4074A3CD5718FFE8),
+    (8, 0x4040A3A85299FA6F, 0xC02B4DAB91EE5022, 0x3B9F56C4AFF3FE0E),
+    (0, 0xC0C371B85D4A8825, 0x0000000000000000, 0xBFD0DF230FA7BC44),
+    (1, 0x40B7DDEBA93CA8A2, 0x0000000000000000, 0xBFEC6CF9DC4A3827),
+    (2, 0xC047361C811A904B, 0x0000000000000000, 0xBFF8C9C345FF90E7),
+    (3, 0x40224CE12C0628C4, 0x40217300386FC16E, 0x3FE9E4F8C648CFC0),
+    (4, 0xC05C246F59B54E80, 0x0000000000000000, 0x35C832C48CEC8C6D),
+    (5, 0x1F219B5B2D8FC63C, 0x0000000000000000, 0xC076BCE7B5DB54FE),
+    (6, 0x0FEC784E9B5B31A5, 0x0000000000000000, 0xC06CE7BCD340E8B4),
+    (7, 0x5B6C91FED969DB93, 0x0000000000000000, 0x407B7D6213212FB0),
+    (8, 0x4022223463C71FC4, 0xC01A12A67444568C, 0x3EA344DB7EDFB1AD),
+    (0, 0x40BBCDCCBFD886C4, 0x0000000000000000, 0xBFEBBE777782CED5),
+    (1, 0x40C2B4DB88DFCCFE, 0x0000000000000000, 0xBFE1440BB3751202),
+    (2, 0xC0307AB421F9DBCA, 0x0000000000000000, 0xBFF829BB6A25AD6A),
+    (3, 0x401444B982788844, 0x3FFBF7E0CB514778, 0x3FF3D1558AD9D7C7),
+    (4, 0xC06D325138203F74, 0x0000000000000000, 0x2AE04B2B34CD35FB),
+    (5, 0x2151A7C2D15C8306, 0x0000000000000000, 0xC07538B2DF91EA50),
+    (6, 0x29B23BC7336A7947, 0x0000000000000000, 0xC05AC70910499584),
+    (7, 0x2EE39B48311EE639, 0x0000000000000000, 0xC0710B4EC90E99FD),
+    (8, 0x403651B27C87A40A, 0xC02E6E503F7A6B64, 0x3BAC795F9A6C82C2),
+]
+
+@test
+fn the_f64_functions_are_within_an_ulp_of_libm_where_sampled() {
+    for (k, xb, yb, want_bits) in LIBM {
+        let x = bitcast_f64(xb)
+        let y = bitcast_f64(yb)
+        let got = match k {
+            0 => sin_f64(x),
+            1 => cos_f64(x),
+            2 => atan_f64(x),
+            3 => atan2_f64(y: x, x: y),
+            4 => exp_f64(x),
+            5 => log_f64(x),
+            6 => log10_f64(x),
+            7 => log2_f64(x),
+            _ => pow_f64(x, y: y),
+        }
+        let want = bitcast_f64(want_bits)
+        assert(d_ulps(got, want) <= 1.0, f"function {k} of {x}, {y}: {got} against libm's {want}")
+    }
 }

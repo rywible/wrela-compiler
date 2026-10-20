@@ -3,8 +3,8 @@
 // the three brushes, four steps, two impacts and two whooshes are cued before the voice starts, so
 // the samples don't depend on when the audio thread runs: Chrome's AudioWorklet and the native
 // host's offline run give the same ones, bit for bit. The steps, impacts and whooshes ring for a
-// minute (a palette no world would have), so each is on for the whole render: `wrela audio
-// compiler/tests/mixer speed` times the worst quantum.
+// minute (a palette no world would have), so each is on for the whole render: the audio tool's
+// `speed` (`wrela tool audio -- compiler/tests/mixer speed`) times the worst quantum.
 
 use engine::sound::{Babble, Breath, Cue, Palette, Surface, Swish, mix, mixer}
 use std::audio::{QUANTUM, RingWriter, play}

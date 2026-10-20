@@ -36,6 +36,7 @@ pub const STD_SOURCES: &[(&str, &str)] = &[
     ("std::string", include_str!("../../std/string.wrela")),
     ("std::cmp", include_str!("../../std/cmp.wrela")),
     ("std::fmt", include_str!("../../std/fmt.wrela")),
+    ("std::json", include_str!("../../std/json.wrela")),
     ("std::arena", include_str!("../../std/arena.wrela")),
     ("std::units", include_str!("../../std/units.wrela")),
     ("std::hash", include_str!("../../std/hash.wrela")),

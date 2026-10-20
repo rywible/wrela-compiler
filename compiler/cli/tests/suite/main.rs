@@ -1,6 +1,5 @@
 //! The command's tests, in one binary (one link, one check by clippy): a module a command.
 
-mod audio;
 mod common;
 mod doc;
 mod docs_chrome;

@@ -750,3 +750,356 @@ fn a_driven_builds_posts_go_to_the_tool() {
         assert!(printed.contains(line), "{line}: {printed}");
     }
 }
+
+/// A piece with a voice: started on its first frame, it plays a saw in the left channel and a
+/// quieter, slower one in the right, so each sample's bits depend on every quantum before it.
+const VOICE: &str = r#"
+use std::audio::play
+
+pub struct Saw {
+    left: f32,
+    right: f32,
+}
+
+@audio
+fn sing(s: mut Saw, left: mut [f32], right: mut [f32]) {
+    for i in 0..left.len() {
+        s.left += 0.0071
+        if s.left > 1.0 {
+            s.left -= 2.0
+        }
+        s.right += 0.0013
+        if s.right > 1.0 {
+            s.right -= 2.0
+        }
+        left[i] = s.left * 0.5
+        right[i] = s.right * 0.25
+    }
+}
+
+pub struct Piece {
+    started: bool,
+}
+
+pub fn init() -> Piece {
+    Piece { started: false }
+}
+
+pub fn frame(p: mut Piece, time: f32, width: u32, height: u32) {
+    if !p.started {
+        p.started = true
+        play(Saw { left: 0.0, right: 0.0 }, sing)
+    }
+}
+"#;
+
+/// A tool that renders the piece's voice: 300 quanta at once, written to `out/voice.f32`, then
+/// 10 more each timed, written to `out/timed.f32`; and with `early`, the voice asked for before
+/// `init` and before the voice starts.
+const VOICE_TOOL: &str = r#"
+use std::io::{IoError, print}
+use std::job::{Job, Step}
+use std::tool::{RUNNING, answer, args}
+use std::tool::blob
+use std::tool::blob::Data
+use std::tool::drive
+use std::tool::files
+
+@job
+fn write(blob: take Data, path: take String) -> u32 {
+    let Data::Blob(b) = blob else { return 80 }
+    var w = files::write_blob(path.as_str(), b)
+    var got = w.poll()
+    while got.is_none() {
+        yield
+        got = w.poll()
+    }
+    let Some(polled) = take got else { return 81 }
+    if answer(take polled).is_err() {
+        return 82
+    }
+    0
+}
+
+fn rendered(polled: take Result<Vec<u8>, IoError>) -> Option<drive::Audio> {
+    match drive::read_audio(take polled) {
+        Ok(a) => Some(a),
+        Err(e) => {
+            print(f"refused: {e.message()}")
+            None
+        },
+    }
+}
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    let early = !given.is_empty()
+    var options = drive::cpu()
+    options.width = 16
+    options.height = 16
+    var l = drive::load("src/build", options)
+    var lg = l.poll()
+    while lg.is_none() {
+        yield
+        lg = l.poll()
+    }
+    let Some(lp) = take lg else { return 90 }
+    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+    let b = loaded.build
+    if early {
+        var a = drive::audio(b, 1)
+        var ag = a.poll()
+        while ag.is_none() {
+            yield
+            ag = a.poll()
+        }
+        let Some(ap) = take ag else { return 92 }
+        let _ = rendered(take ap)
+    }
+    var i = drive::init(b)
+    while i.poll().is_none() { yield }
+    if early {
+        var a = drive::audio(b, 1)
+        var ag = a.poll()
+        while ag.is_none() {
+            yield
+            ag = a.poll()
+        }
+        let Some(ap) = take ag else { return 92 }
+        let _ = rendered(take ap)
+    }
+    var f = drive::frames(b, 1, std::input::Script::frames())
+    while f.poll().is_none() { yield }
+    var a = drive::audio(b, 300)
+    var ag = a.poll()
+    while ag.is_none() {
+        yield
+        ag = a.poll()
+    }
+    let Some(ap) = take ag else { return 92 }
+    let Some(voice) = rendered(take ap) else { return 0 }
+    if voice.times.is_some() {
+        return 93
+    }
+    var w = Box::new(write.start(take voice.samples, String::from("out/voice.f32")))
+    loop {
+        match w.get_mut().resume() {
+            Step::Yielded => yield,
+            Step::Done(0) => break,
+            Step::Done(status) => return status,
+        }
+    }
+    var t = drive::audio(b, 10, timed: true)
+    var tg = t.poll()
+    while tg.is_none() {
+        yield
+        tg = t.poll()
+    }
+    let Some(tp) = take tg else { return 94 }
+    let Some(timed) = rendered(take tp) else { return 0 }
+    let Some(Data::Blob(times)) = timed.times.clone() else { return 95 }
+    var n = blob::len(times)
+    var ng = n.poll()
+    while ng.is_none() {
+        yield
+        ng = n.poll()
+    }
+    let Some(np) = take ng else { return 96 }
+    let Ok(len) = blob::read_len(take np) else { return 97 }
+    print(f"times {len}")
+    var w2 = Box::new(write.start(take timed.samples, String::from("out/timed.f32")))
+    loop {
+        match w2.get_mut().resume() {
+            Step::Yielded => yield,
+            Step::Done(0) => break,
+            Step::Done(status) => return status,
+        }
+    }
+    print("rendered")
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// A driven build's voice renders offline: the samples, through a blob, are the host's own
+/// (`CpuHost::render_audio` after the first frame), bit for bit, and so are the timed quanta
+/// after them; a voice asked for before `init`, or before the program starts it, is refused;
+/// and a render past the blob budget is refused before it runs.
+#[test]
+fn a_driven_voice_renders_the_hosts_samples() {
+    let dir = package(
+        "drive-voice",
+        &[
+            ("tool/wrela.toml", &manifest("voice_tool")),
+            ("tool/main.wrela", VOICE_TOOL),
+            ("subject/wrela.toml", &manifest("voice")),
+            ("subject/main.wrela", VOICE),
+        ],
+    );
+    let (tool, src, out) = (dir.join("tool"), dir.join("src"), dir.join("out"));
+    std::fs::create_dir_all(&out).expect("out");
+    let built = wrela()
+        .arg("build")
+        .arg(dir.join("subject"))
+        .arg("-o")
+        .arg(src.join("build"))
+        .output()
+        .expect("wrela build");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &[]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("times 80") && printed.contains("rendered"), "{printed}");
+    let mut host = wrela_host::CpuBuild::load(src.join("build"))
+        .expect("load")
+        .quiet()
+        .start()
+        .expect("start");
+    host.frame(0.0, 16, 16).expect("the first frame");
+    let bytes = |s: Vec<f32>| s.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+    let voice = std::fs::read(out.join("voice.f32")).expect("the voice");
+    assert_eq!(voice.len(), 300 * 128 * 2 * 4);
+    assert_eq!(voice, bytes(host.render_audio(300).expect("render")), "the host's samples");
+    let timed = std::fs::read(out.join("timed.f32")).expect("the timed quanta");
+    assert_eq!(timed, bytes(host.render_audio(10).expect("render")), "the next quanta");
+    assert!(voice.chunks(4).any(|s| s != [0; 4]), "it sang");
+
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &["early"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("refused: `audio` runs after `init`"), "{printed}");
+    assert!(printed.contains("refused: it hasn't started a voice"), "{printed}");
+
+    let c = drive(&tool, &src, &out, "60", &[]);
+    let at = c.get_args().position(|a| a == "--timeout").expect("a timeout");
+    let mut args: Vec<std::ffi::OsString> = c.get_args().map(Into::into).collect();
+    args.insert(at, "--blob-budget".into());
+    args.insert(at + 1, "100K".into());
+    let mut c = wrela();
+    c.args(args);
+    let (code, printed) = run(&mut c);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("refused: the voice's 307200 bytes"), "{printed}");
+    assert!(printed.contains("budget"), "{printed}");
+}
+
+/// A piece whose voice never finishes its first quantum.
+const STUCK_VOICE: &str = r#"
+use std::audio::play
+
+pub struct Stuck {
+    n: u32,
+}
+
+@audio
+fn sing(s: mut Stuck, left: mut [f32], right: mut [f32]) {
+    while s.n < 4000000000 {
+        s.n = (s.n * 3 + 1) % 1000
+    }
+}
+
+pub struct Piece {
+    started: bool,
+}
+
+pub fn init() -> Piece {
+    Piece { started: false }
+}
+
+pub fn frame(p: mut Piece, time: f32, width: u32, height: u32) {
+    if !p.started {
+        p.started = true
+        play(Stuck { n: 0 }, sing)
+    }
+}
+"#;
+
+/// A tool that asks the stuck voice for a quantum with a deadline of 1 s, then the build's hash.
+const STUCK_TOOL: &str = r#"
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::drive
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var l = drive::load("src/build", drive::cpu())
+    var lg = l.poll()
+    while lg.is_none() {
+        yield
+        lg = l.poll()
+    }
+    let Some(lp) = take lg else { return 90 }
+    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+    let b = loaded.build
+    var i = drive::init(b)
+    while i.poll().is_none() { yield }
+    var f = drive::frames(b, 1, std::input::Script::frames())
+    while f.poll().is_none() { yield }
+    var a = drive::audio(b, 1, timeout: 1.0)
+    var ag = a.poll()
+    while ag.is_none() {
+        yield
+        ag = a.poll()
+    }
+    let Some(ap) = take ag else { return 92 }
+    match drive::read_audio(take ap) {
+        Ok(_) => print("rendered"),
+        Err(e) => print(f"refused: {e.message()}"),
+    }
+    var h = drive::hash(b)
+    while h.poll().is_none() { yield }
+    print("hashed")
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// A voice that never ends its quantum is stopped at the request's deadline, and the build still
+/// answers what doesn't run it.
+#[test]
+fn a_driven_voice_past_its_deadline_is_stopped() {
+    let dir = package(
+        "drive-stuck-voice",
+        &[
+            ("tool/wrela.toml", &manifest("stuck_tool")),
+            ("tool/main.wrela", STUCK_TOOL),
+            ("subject/wrela.toml", &manifest("stuck")),
+            ("subject/main.wrela", STUCK_VOICE),
+        ],
+    );
+    let (tool, src, out) = (dir.join("tool"), dir.join("src"), dir.join("out"));
+    std::fs::create_dir_all(&out).expect("out");
+    let built = wrela()
+        .arg("build")
+        .arg(dir.join("subject"))
+        .arg("-o")
+        .arg(src.join("build"))
+        .output()
+        .expect("wrela build");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let started = Instant::now();
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &[]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("refused: `audio` ran past its deadline of 1 s"), "{printed}");
+    assert!(printed.contains("hashed"), "{printed}");
+    assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}

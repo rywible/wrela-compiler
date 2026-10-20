@@ -20,6 +20,7 @@ from unittest.mock import patch
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.dirname(TESTS)
@@ -605,6 +606,17 @@ class ListeningTest(unittest.TestCase):
                 levels.append(listening.rms(samples))
             # One level for all, set by the spike's peak.
             self.assertLess(max(levels) / min(levels), 1.001)
+
+    def test_renders_go_through_the_audio_tool_with_workspace_paths(self):
+        root = Path.cwd().resolve()
+        out = root / "examples/gymnopedie/build/listening/work/a.wav"
+        self.assertEqual(
+            listening.audio("examples/gymnopedie", "wav", out, "--take", 2),
+            [listening.WRELA, "tool", "audio", "--", "examples/gymnopedie", "wav",
+             "examples/gymnopedie/build/listening/work/a.wav", "--take", "2"],
+        )
+        with self.assertRaises(SystemExit):
+            listening.audio("wav", Path(tempfile.gettempdir()).resolve() / "a.wav")
 
     def test_the_gate_counts_wrelas_pairs_and_passes_at_12_of_16(self):
         key = {f"{n:02}": {"wrela": "A" if n % 3 else "B"} for n in range(1, 17)}

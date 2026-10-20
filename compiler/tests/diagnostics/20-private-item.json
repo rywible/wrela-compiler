@@ -15,21 +15,21 @@
           "message": "declared here without `pub`",
           "span": {
             "column": 4,
-            "end": 11618,
-            "end_column": 12,
-            "end_line": 406,
-            "line": 406,
-            "start": 11610
+            "end": 11877,
+            "end_column": 13,
+            "end_line": 413,
+            "line": 413,
+            "start": 11868
           }
         }
       ],
-      "message": "`atan_f64` is private to `std::math`",
+      "message": "`wide_atan` is private to `std::math`",
       "notes": [],
       "severity": "error",
       "span": {
         "column": 16,
-        "end": 113,
-        "end_column": 24,
+        "end": 114,
+        "end_column": 25,
         "end_line": 4,
         "line": 4,
         "start": 105

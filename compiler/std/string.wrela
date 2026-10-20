@@ -461,6 +461,14 @@ impl str {
         Some(i32(m))
     }
 
+    /// The `f64` it spells (`[+-]digits[.digits][e[+-]digits]`), the nearest one (ties to even),
+    /// as Rust's `parse` reads it; `None` if it isn't one, or is past f64's range
+    /// (`parse_f64_at`).
+    pub fn parse_f64(self) -> Option<f64> {
+        let owned = String::from(self)
+        parse_f64_at(owned.as_bytes(), 0, self.len())
+    }
+
     /// The `f32` it spells (digits, an optional `-`, `.` and signed exponent); `None` if it isn't one.
     /// Decimal digits are read into an `f64` and rounded once.
     pub fn parse_f32(self) -> Option<f32> {
@@ -644,6 +652,367 @@ fn float_parser_rejects_multiple_exponent_signs() {
     }
     assert("1e-2".parse_f32() == Some(0.01))
     assert("1e+2".parse_f32() == Some(100.0))
+}
+
+// ---- Decimals read as f64s ------------------------------------------------------------------
+
+/// Whether `b` is an ASCII digit.
+fn is_digit(b: u8) -> bool {
+    b >= 48 && b <= 57
+}
+
+/// The finite `f64` that `text[from..to]` spells (`[+-]digits[.digits][e[+-]digits]`), or
+/// `None`: the nearest one (ties to even), as Rust's `parse` reads it. Up to 15 significant
+/// digits with a decimal exponent within ±22 take one exact division or product (Clinger's fast
+/// path); others are read exactly (`nearest_f64`), every digit to `KEPT`.
+pub fn parse_f64_at(text: [u8], from: u32, to: u32) -> Option<f64> {
+    var i = from
+    var neg = false
+    if i < to && (text[i] == 45 || text[i] == 43) {
+        neg = text[i] == 45
+        i += 1
+    }
+    // The significant digits (to `KEPT`), and the power of ten after the last one kept.
+    var digits: Vec<u8> = Vec::new()
+    var exponent: i64 = 0
+    var more = false
+    var seen = false
+    while i < to && is_digit(text[i]) {
+        seen = true
+        let d = text[i] - 48
+        if digits.len() < KEPT {
+            if !digits.is_empty() || d != 0 {
+                digits.push(d)
+            }
+        } else {
+            exponent += 1
+            more = more || d != 0
+        }
+        i += 1
+    }
+    if i < to && text[i] == 46 {
+        i += 1
+        while i < to && is_digit(text[i]) {
+            seen = true
+            let d = text[i] - 48
+            if digits.len() < KEPT {
+                if !digits.is_empty() || d != 0 {
+                    digits.push(d)
+                }
+                exponent -= 1
+            } else {
+                more = more || d != 0
+            }
+            i += 1
+        }
+    }
+    if !seen {
+        return None
+    }
+    if i < to && (text[i] == 101 || text[i] == 69) {
+        i += 1
+        var eneg = false
+        if i < to && (text[i] == 45 || text[i] == 43) {
+            eneg = text[i] == 45
+            i += 1
+        }
+        if i >= to {
+            return None
+        }
+        var e: i64 = 0
+        while i < to && is_digit(text[i]) {
+            if e < 100000 {
+                e = e * 10 + i64(text[i] - 48)
+            }
+            i += 1
+        }
+        exponent += if eneg { -e } else { e }
+    }
+    if i != to {
+        return None
+    }
+    var v = 0.0
+    if !digits.is_empty() {
+        // The value is below 10^(top + 1) and at least 10^top.
+        let top = exponent + i64(digits.len()) - 1
+        var mant: u64 = 0
+        if digits.len() <= 19 {
+            for d in digits {
+                mant = mant * 10 + u64(d)
+            }
+        }
+        if !more && digits.len() <= 15 && exponent >= -22 && exponent <= 22 {
+            // Both exact in an f64: one rounding.
+            let p = POWERS[u32(abs(exponent))]
+            v = if exponent < 0 { f64(mant) / p } else { f64(mant) * p }
+        } else if top > 309 {
+            v = 1.0 / 0.0
+        } else if top >= -330 {
+            v = nearest_f64(digits, exponent, more)
+        }
+    }
+    if !(abs(v) < 1.0 / 0.0) {
+        return None
+    }
+    Some(if neg { -v } else { v })
+}
+
+/// The most significant digits `parse_f64` keeps: past 768, a digit can't move the nearest f64,
+/// only whether the value is a tie (so the rest count as whether they're 0).
+const KEPT: u32 = 800
+
+/// The f64 nearest the integer `digits` spell (decimal, the first the most significant) times
+/// 10^`e10` (ties to even), or a little more than that if `more` (digits past them weren't all
+/// 0): the quotient of the exact numerator and denominator in big integers, to 57 bits, then
+/// rounded once, to the precision the result has (fewer bits for a subnormal).
+fn nearest_f64(digits: [u8], e10: i64, more: bool) -> f64 {
+    var num = big_of(0)
+    for d in digits {
+        big_mul_small(mut num, 10)
+        big_add_small(mut num, u32(d))
+    }
+    var den = big_of(1)
+    if e10 >= 0 {
+        for _ in 0..u32(e10) {
+            big_mul_small(mut num, 10)
+        }
+    } else {
+        for _ in 0..u32(-e10) {
+            big_mul_small(mut den, 10)
+        }
+    }
+    // num · 2^s / den in [2^55, 2^57).
+    let s = 56 - (i64(big_bits(num)) - i64(big_bits(den)))
+    var x = if s >= 0 { big_shl(num, u32(s)) } else { num.clone() }
+    let d = if s < 0 { big_shl(den, u32(-s)) } else { den.clone() }
+    var q: u64 = 0
+    var bit = 58
+    while bit > 0 {
+        bit -= 1
+        let t = big_shl(d, bit)
+        if big_cmp(x, t) >= 0 {
+            big_sub(mut x, t)
+            q = q | (u64(1) << bit)
+        }
+    }
+    var sticky = more
+    for limb in x {
+        sticky = sticky || limb != 0
+    }
+    let qb = 64 - q.leading_zeros()
+    let e2 = -s
+    let lead = e2 + i64(qb) - 1
+    if lead > 1023 {
+        return 1.0 / 0.0
+    }
+    var keep: i64 = 53
+    if lead < -1022 {
+        keep = 53 - (-1022 - lead)
+    }
+    if keep < 0 {
+        return 0.0
+    }
+    let drop = i64(qb) - keep
+    var m = if drop >= 64 { u64(0) } else { q >> u32(drop) }
+    let rest = if drop >= 64 { q } else { q & ((u64(1) << u32(drop)) - 1) }
+    let half = if drop >= 65 { u64(0) } else { u64(1) << u32(drop - 1) }
+    if drop <= 64 && (rest > half || (rest == half && (sticky || (m & 1) == 1))) {
+        m += 1
+    }
+    // m × 2^(e2 + drop), each step exact: the result is representable.
+    var v = f64(m)
+    var k = e2 + drop
+    while k > 1000 {
+        v *= bitcast_f64(u64(0x7E70000000000000))
+        k -= 1000
+    }
+    while k < -1000 {
+        v *= bitcast_f64(u64(0x0170000000000000))
+        k += 1000
+    }
+    v * bitcast_f64(u64(k + 1023) << 52)
+}
+
+fn big_of(x: u64) -> Vec<u32> {
+    var a: Vec<u32> = Vec::new()
+    a.push(u32(x & 4294967295))
+    a.push(u32(x >> 32))
+    big_trim(mut a)
+    a
+}
+
+fn big_trim(a: mut Vec<u32>) {
+    while a.len() > 1 && a[a.len() - 1] == 0 {
+        let _ = a.pop()
+    }
+}
+
+/// `a` times `m`.
+fn big_mul_small(a: mut Vec<u32>, m: u32) {
+    var carry: u64 = 0
+    for i in 0..a.len() {
+        let t = u64(a[i]) * u64(m) + carry
+        a[i] = u32(t & 4294967295)
+        carry = t >> 32
+    }
+    if carry > 0 {
+        a.push(u32(carry))
+    }
+}
+
+/// `a` plus `m`.
+fn big_add_small(a: mut Vec<u32>, m: u32) {
+    var carry = u64(m)
+    var i = 0
+    while carry > 0 {
+        if i == a.len() {
+            a.push(0)
+        }
+        let t = u64(a[i]) + carry
+        a[i] = u32(t & 4294967295)
+        carry = t >> 32
+        i += 1
+    }
+}
+
+/// `a` times 2^`bits`.
+fn big_shl(a: [u32], bits: u32) -> Vec<u32> {
+    let words = bits / 32
+    let b = bits % 32
+    var out: Vec<u32> = Vec::filled(words, 0)
+    var carry: u32 = 0
+    for limb in a {
+        if b == 0 {
+            out.push(limb)
+        } else {
+            out.push((limb << b) | carry)
+            carry = limb >> (32 - b)
+        }
+    }
+    if carry > 0 {
+        out.push(carry)
+    }
+    big_trim(mut out)
+    out
+}
+
+/// -1, 0 or 1 as `a` is less than, equal to or more than `b` (both trimmed).
+fn big_cmp(a: [u32], b: [u32]) -> i32 {
+    if a.len() != b.len() {
+        return if a.len() < b.len() { -1 } else { 1 }
+    }
+    var i = a.len()
+    while i > 0 {
+        i -= 1
+        if a[i] != b[i] {
+            return if a[i] < b[i] { -1 } else { 1 }
+        }
+    }
+    0
+}
+
+/// `a` less `b`, which is at most `a`.
+fn big_sub(a: mut Vec<u32>, b: [u32]) {
+    var owed: i64 = 0
+    for i in 0..a.len() {
+        var t = i64(a[i]) - owed - (if i < b.len() { i64(b[i]) } else { 0 })
+        if t < 0 {
+            t += 4294967296
+            owed = 1
+        } else {
+            owed = 0
+        }
+        a[i] = u32(t)
+    }
+    big_trim(mut a)
+}
+
+/// How many bits `a` takes.
+fn big_bits(a: [u32]) -> u32 {
+    let top = a[a.len() - 1]
+    32 * (a.len() - 1) + (32 - top.leading_zeros())
+}
+
+/// 10^0 to 10^22, each exact in an f64.
+const POWERS: [f64; 23] = [
+    1.0,
+    10.0,
+    100.0,
+    1000.0,
+    10000.0,
+    100000.0,
+    1000000.0,
+    10000000.0,
+    100000000.0,
+    1000000000.0,
+    10000000000.0,
+    100000000000.0,
+    1000000000000.0,
+    10000000000000.0,
+    100000000000000.0,
+    1000000000000000.0,
+    10000000000000000.0,
+    100000000000000000.0,
+    1000000000000000000.0,
+    10000000000000000000.0,
+    100000000000000000000.0,
+    1000000000000000000000.0,
+    10000000000000000000000.0,
+]
+
+@test
+fn decimals_read_as_the_nearest_f64() {
+    let cases = [
+        ("0.1", 0.1),
+        ("-2.5e-3", -0.0025),
+        ("6.590000", 6.59),
+        ("1E2", 100.0),
+        (".5", 0.5),
+        ("5.", 5.0),
+        ("+0.130761", 0.130761),
+        ("123456789012345678", 123456789012345680.0),
+        ("0.24999999999999997", 0.24999999999999997),
+        ("2.965925826289068", 2.965925826289068),
+        ("9007199254740993", 9007199254740992.0),
+        ("9007199254740995", 9007199254740996.0),
+        ("9007199254740993.0000000000001", 9007199254740994.0),
+        ("2.2250738585072014e-308", 2.2250738585072014e-308),
+        ("4.9406564584124654e-324", 5e-324),
+        ("1.7976931348623157e308", 1.7976931348623157e308),
+        ("0.000000000000000000000000000001234567890123456789", 1.2345678901234568e-30),
+    ]
+    for (text, want) in cases {
+        let owned = String::from(text)
+        let Some(x) = parse_f64_at(owned.as_bytes(), 0, text.len()) else { panic(f"{text}") }
+        assert(x == want, f"{text}: {x}")
+    }
+    // Past 19 digits, each digit still counts: the nearest f64 by its bits, as Rust's `parse`
+    // gives them (a tie goes to the even one, and a digit past it breaks the tie).
+    let exact: [(Text, u64); 7] = [
+        ("1.0000000000000001111", 0x3ff0000000000001),
+        ("1.00000000000000011102230246251565404236316680908203125", 0x3ff0000000000000),
+        ("1.000000000000000111022302462515654042363166809082031251", 0x3ff0000000000001),
+        ("1.000000000000000111022302462515654042363166809082031249", 0x3ff0000000000000),
+        ("1.00000000000000033306690738754696212708950042724609375", 0x3ff0000000000002),
+        (
+            "9007199254740993.00000000000000000000000000000000000000000000000000000000000000000000000000001",
+            0x4340000000000001,
+        ),
+        (
+            "0.10000000000000000555111512312578270211815834045410156250000000000001",
+            0x3fb999999999999a,
+        ),
+    ]
+    for (text, bits) in exact {
+        let owned = String::from(text)
+        let Some(x) = parse_f64_at(owned.as_bytes(), 0, text.len()) else { panic(f"{text}") }
+        assert(bitcast_u64(x) == bits, f"{text}: {x}")
+    }
+    assert("0.1".parse_f64() == Some(0.1) && "x".parse_f64().is_none(), "a str's own")
+    for text in ["", "-", "e5", "1e", "1.2.3", "inf", "nan", "1e999"] {
+        let owned = String::from(text)
+        assert(parse_f64_at(owned.as_bytes(), 0, text.len()).is_none(), text)
+    }
 }
 
 impl Eq for str {

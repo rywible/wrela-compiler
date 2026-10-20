@@ -9,7 +9,7 @@ the key kept apart until the listener has answered.
 Spike 14's round: four renders of the first Gymnopédie, for a person to rank blind. They are
 {wrela's piano, a sampled piano} x {the deadpan, the performance}. wrela's are the piece's dry
 takes (examples/gymnopedie takes 2 and 3: no room, as the sampled piano has none); the sampled
-piano plays each take's MIDI file (`wrela audio ... midi`): the Salamander Grand Piano V3
+piano plays each take's MIDI file (the audio tool's `midi`): the Salamander Grand Piano V3
 (Alexander Holm, CC BY 3.0), the whole instrument (FreePats' retuned SFZ, with its velocity
 tracking, release samples and pedal noise), played by sfizz. They're written as A.wav to D.wav;
 which is which goes in key-open-after-ranking.json. With them, outside the test: the
@@ -25,7 +25,9 @@ gate passes at 12 of 16 (p < 0.05 against a coin toss).
 Every render is scaled to the same RMS level (the loudest the set allows with no peak past
 -1 dBFS), and padded with silence to the longest, so neither loudness nor length gives one away.
 
-Needs `wrela` built (`cargo build --release -p wrela`), sfizz's `sfizz_render` (under
+Needs `wrela` built (`cargo build --release -p wrela`), which runs the audio tool
+(`wrela tool audio`, studio/audio; its paths are from the repository's root, so an output
+directory must be inside it), sfizz's `sfizz_render` (under
 $WRELA_SFIZZ, or ~/.cache/wrela/sfizz: its `bin/` and `lib/`), and the SFZ (at
 $WRELA_REFERENCE_SFZ, or under ~/.cache/wrela/salamander-sfz/). Run from the repository's root.
 """
@@ -60,6 +62,21 @@ def sfizz():
     lib = str(root / "lib")
     env = {**os.environ, "DYLD_LIBRARY_PATH": lib, "LD_LIBRARY_PATH": lib}
     return root / "bin" / "sfizz_render", env
+
+
+def audio(*args):
+    """The audio tool's command line (`wrela tool audio -- ...`) for `args`: each path (a `Path`)
+    made relative to the repository's root, as the tool takes paths in its workspace."""
+    root = Path.cwd().resolve()
+    words = []
+    for a in args:
+        if isinstance(a, Path):
+            full = a.resolve()
+            if full != root and root not in full.parents:
+                sys.exit(f"{a} is outside the repository: the audio tool writes only in its workspace")
+            a = full.relative_to(root).as_posix()
+        words.append(str(a))
+    return [WRELA, "tool", "audio", "--", *words]
 
 
 def run(*args, env=None):
@@ -149,14 +166,14 @@ def round_of_four(out):
     renders = {}
     for take, name in ((2, "deadpan"), (3, "performance")):
         wav = work / f"wrela-{name}.wav"
-        run(WRELA, "audio", PIECE, "wav", str(wav), "--take", str(take))
+        run(*audio(PIECE, "wav", wav, "--take", take))
         renders[f"wrela piano, {name}"] = wav
         mid = work / f"{name}.mid"
-        run(WRELA, "audio", PIECE, "midi", str(mid), "--take", str(take))
+        run(*audio(PIECE, "midi", mid, "--take", take))
         ref = work / f"sampled-{name}.wav"
         run(str(render), "--sfz", str(sfz), "--midi", str(mid), "--wav", str(ref), "--samplerate", "48000", "--quality", "3", env=env)
         renders[f"sampled piano, {name}"] = ref
-    run(WRELA, "audio", PIECE, "wav", str(out / "wrela-performance-with-room.wav"), "--take", "1")
+    run(*audio(PIECE, "wav", out / "wrela-performance-with-room.wav", "--take", 1))
     loaded = {k: read_wav(v) for k, v in renders.items()}
     key = blind(loaded, out, "ABCD", "key-open-after-ranking.json")
     print(json.dumps({"files": [f"{out}/{letter}.wav" for letter in key], "key": str(out / "key-open-after-ranking.json")}, indent=2))
@@ -215,10 +232,10 @@ def gate(out, rng=None):
     for piece, take in sorted({(p, t) for p, t, _, _ in GATE}):
         name = Path(piece).name
         wav, mid, ref = work / f"wrela-{name}.wav", work / f"{name}.mid", work / f"sampled-{name}.wav"
-        run(WRELA, "audio", piece, "wav", str(wav), "--take", str(take))
-        run(WRELA, "audio", piece, "midi", str(mid), "--take", str(take))
+        run(*audio(piece, "wav", wav, "--take", take))
+        run(*audio(piece, "midi", mid, "--take", take))
         run(str(render), "--sfz", str(sfz), "--midi", str(mid), "--wav", str(ref), "--samplerate", "48000", "--quality", "3", env=env)
-        described = json.loads(run(WRELA, "audio", piece, "describe", "--take", str(take)))
+        described = json.loads(run(*audio(piece, "describe", "--take", take)))
         takes[(piece, take)] = (read_wav(wav), read_wav(ref), described)
     rng = rng or secrets.SystemRandom()
     key = {}

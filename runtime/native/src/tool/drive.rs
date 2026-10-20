@@ -21,6 +21,10 @@
 //! ends) makes the run the host's failure once the grace after the deadline has passed, as an
 //! HTTP client that won't return does.
 //!
+//! **A voice renders offline** (`audio`): its quanta, the samples a browser's AudioWorklet
+//! renders, as `wrela-host` renders them, into a blob whose bytes are reserved in the budget
+//! before the first quantum runs, so a render that doesn't fit runs nothing.
+//!
 //! **No compiled code is kept or read**: each `load` compiles the build's WASM, which the host
 //! reads through the grants, as it reads the build's other files. The build's storage is a
 //! directory of the host's own, removed when the build closes.
@@ -47,6 +51,9 @@ const MOST_LINES: usize = 4096;
 
 /// The most frames or ticks one request runs.
 const MOST_STEPS: u32 = 1 << 20;
+
+/// The bytes of one quantum of a voice's samples: its channels' samples, `f32`s.
+const QUANTUM_BYTES: u64 = wrela_abi::AUDIO_QUANTUM as u64 * wrela_abi::AUDIO_CHANNELS as u64 * 4;
 
 /// The driven builds of one run: each by its handle, and each request's that the tool hasn't
 /// been told of.
@@ -145,6 +152,8 @@ enum Command {
     Logs,
     Phases,
     Call(String, Vec<crate::Value>),
+    /// The voice's next quanta, and whether each is timed.
+    Audio(u32, bool),
     Posts,
     Answer(u32, Result<Data, String>),
 }
@@ -160,6 +169,7 @@ impl Command {
             Command::Logs => "logs",
             Command::Phases => "phases",
             Command::Call(..) => "call",
+            Command::Audio(..) => "audio",
             Command::Posts => "posts",
             Command::Answer(..) => "answer",
         }
@@ -176,6 +186,9 @@ enum Reply {
     Logs(Vec<String>, usize),
     Phases(Vec<crate::Phase>),
     Posts(Vec<crate::QueuedPost>),
+    /// A voice's samples (`f32`s, little-endian, the channels interleaved) and, if asked, each
+    /// quantum's seconds (`f64`s).
+    Audio(Vec<u8>, Vec<u8>),
     Answered,
 }
 
@@ -266,7 +279,11 @@ impl Actor {
     fn carry_out(&mut self, command: Command) -> Result<Reply, String> {
         let running = matches!(
             command,
-            Command::Init | Command::Frames(..) | Command::Ticks(..) | Command::Call(..)
+            Command::Init
+                | Command::Frames(..)
+                | Command::Ticks(..)
+                | Command::Call(..)
+                | Command::Audio(..)
         );
         if running {
             if let Some(why) = &self.ended {
@@ -345,6 +362,7 @@ impl Actor {
                     Err(e) => ran.trap = Some(self.trap(&e, 3, 0)),
                 }
             }
+            Command::Audio(quanta, timed) => return self.audio(quanta, timed),
             Command::Capture => {
                 return match &mut self.host {
                     Hosted::Cpu(_) => Err("a build loaded without the GPU has no screen".into()),
@@ -429,6 +447,53 @@ impl Actor {
         }
         ran.elapsed = self.since() - ran.started;
         Ok(Reply::Ran(ran))
+    }
+}
+
+impl Actor {
+    /// The voice's next `quanta` quanta, rendered offline as `CpuHost::render_audio` renders
+    /// them: all at once, or one at a time and each timed. A trap ends the build, as a call's
+    /// does, and fails the request.
+    fn audio(&mut self, quanta: u32, timed: bool) -> Result<Reply, String> {
+        let mut samples = Vec::with_capacity((u64::from(quanta) * QUANTUM_BYTES) as usize);
+        let mut times = Vec::new();
+        let mut render = |n: u32| match &mut self.host {
+            Hosted::Cpu(host) => host.render_audio(n),
+            #[cfg(feature = "gpu")]
+            Hosted::Gpu(host) => host.render_audio(n),
+        };
+        let mut done = Ok(());
+        if timed {
+            times.reserve(8 * quanta as usize);
+            for _ in 0..quanta {
+                let started = Instant::now();
+                match render(1) {
+                    Ok(s) => {
+                        times.extend_from_slice(&started.elapsed().as_secs_f64().to_le_bytes());
+                        samples.extend(s.iter().flat_map(|x| x.to_le_bytes()));
+                    }
+                    Err(e) => {
+                        done = Err(e);
+                        break;
+                    }
+                }
+            }
+        } else {
+            match render(quanta) {
+                Ok(s) => samples.extend(s.iter().flat_map(|x| x.to_le_bytes())),
+                Err(e) => done = Err(e),
+            }
+        }
+        match done {
+            Ok(()) => Ok(Reply::Audio(samples, times)),
+            // No voice, say: not a trap.
+            Err(crate::Error::Program(why)) => Err(why),
+            Err(e) => {
+                let message = e.to_string();
+                self.ended = Some(format!("its voice trapped: {message}"));
+                Err(message)
+            }
+        }
     }
 }
 
@@ -541,6 +606,11 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             "logs" => Command::Logs,
             "phases" => Command::Phases,
             "posts" => Command::Posts,
+            "audio" => {
+                let quanta = b.u32()?;
+                let timed = b.u8()? != 0;
+                Command::Audio(quanta, timed)
+            }
             "answer" => {
                 let post = b.u32()?;
                 Command::Answer(post, Ok(b.data()?))
@@ -783,6 +853,26 @@ fn operate(
                 .map_err(|why| format!("the screen's {bytes} bytes: {why}"))?;
             screen = Some(id);
         }
+        // A voice's samples, and its times if asked, are reserved before it renders.
+        let mut voice = None;
+        if let Command::Audio(quanta, timed) = command {
+            let bytes = u64::from(quanta) * QUANTUM_BYTES;
+            let id = s
+                .blobs()
+                .create_reserved(request, bytes)
+                .map_err(|why| format!("the voice's {bytes} bytes: {why}"))?;
+            let times = if timed {
+                let bytes = u64::from(quanta) * 8;
+                Some(
+                    s.blobs()
+                        .create_reserved(request, bytes)
+                        .map_err(|why| format!("the quanta's times, {bytes} bytes: {why}"))?,
+                )
+            } else {
+                None
+            };
+            voice = Some((id, times));
+        }
         let (sent, reply) = mpsc::channel();
         {
             let commands =
@@ -795,7 +885,14 @@ fn operate(
                 .send((command, sent))
                 .map_err(|_| format!("the driven build {handle}'s thread has ended"))?;
         }
-        let reply = wait(s, &reply, &driven.stop, due, what, deadline)?;
+        let reply = wait(s, &reply, &driven.stop, due, what, deadline).map_err(|why| {
+            // A voice the deadline stopped is the request's failure, as a call's is.
+            if why.contains("interrupt") && (driven.stop.is_stopped() || Instant::now() >= due) {
+                past_deadline(what, deadline)
+            } else {
+                why
+            }
+        })?;
         let mut out = Out::default();
         match reply {
             Reply::Ran(ran) => write_ran(&mut out, &ran, &driven.stop, due, what, deadline)?,
@@ -803,6 +900,20 @@ fn operate(
                 let id = screen.ok_or("a screen nobody asked for")?;
                 s.blobs().fill(id, rgba)?;
                 out.u32(w).u32(h).u8(1).u32(id);
+            }
+            Reply::Audio(samples, times) => {
+                let (id, timed) = voice.ok_or("a voice nobody asked for")?;
+                s.blobs().fill(id, samples)?;
+                out.u8(1).u32(id);
+                match timed {
+                    Some(t) => {
+                        s.blobs().fill(t, times)?;
+                        out.u8(1).u8(1).u32(t);
+                    }
+                    None => {
+                        out.u8(0);
+                    }
+                }
             }
             Reply::Hash(hash) => {
                 out.u64(hash);
@@ -847,10 +958,7 @@ fn write_ran(
     if ran.trap.as_ref().is_some_and(|t| t.message.contains("interrupt"))
         && (stop.is_stopped() || Instant::now() >= due)
     {
-        return Err(format!(
-            "`{what}` ran past its deadline of {} s, and the host stopped the build",
-            deadline.as_secs_f64()
-        ));
+        return Err(past_deadline(what, deadline));
     }
     out.f64(ran.started).f64(ran.elapsed).u32(ran.steps.len() as u32);
     for (start, end) in &ran.steps {
@@ -875,6 +983,14 @@ fn write_ran(
         }
     }
     Ok(())
+}
+
+/// Why a request whose operation ran past its deadline failed.
+fn past_deadline(what: &str, deadline: Duration) -> String {
+    format!(
+        "`{what}` ran past its deadline of {} s, and the host stopped the build",
+        deadline.as_secs_f64()
+    )
 }
 
 /// Closes `handle`'s build.
