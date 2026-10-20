@@ -266,6 +266,29 @@ class WrelaSelection(unittest.TestCase):
                 self.assertEqual(here.call_args.args[0], name)
             run.assert_not_called()
 
+    def test_a_name_under_the_clis_rust_programs_is_theirs(self):
+        programs = [{'name': 'wrela::suite'}, {'name': 'wrela::wrela'}]
+        names = ['tool::a', 'tool::b', 'other::c']
+        for name, rust in [('wrela::suite::tool::', ['tool::a', 'tool::b']),
+                           ('wrela::suite::tool::a', ['tool::a']),
+                           ('wrela::engine::alpha', None), ('wrela::suite', None)]:
+            with self.subTest(name=name), \
+                    patch.object(check, 'build_tests', return_value=programs), \
+                    patch.object(check, 'program_name', side_effect=lambda p: p['name']), \
+                    patch.object(check, 'listed', side_effect=lambda p: names if p['name'] == 'wrela::suite' else []), \
+                    patch.object(check, 'call'), \
+                    patch.object(check, 'wrela_name') as wrela, \
+                    patch.object(check, 'rust_run', return_value=1) as run, \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(check.main([name]), 0)
+                if rust:
+                    self.assertEqual(run.call_args.args[0], programs[0])
+                    self.assertEqual(run.call_args.kwargs['names'], rust)
+                    wrela.assert_not_called()
+                else:
+                    self.assertEqual(wrela.call_args.args[0], name)
+                    run.assert_not_called()
+
     def test_the_workspace_is_the_suites_and_not_formatted_twice(self):
         self.assertFalse([s for s in check.SOURCES if not s.startswith(check.TOOLCHAIN)])
         with patch.object(check, 'call') as run:

@@ -1,0 +1,61 @@
+// accepts: trait.fieldwise-walk
+// A list of pairs nested to any depth has a derived trait with a parameter, which its first
+// element's way of having it gives, however deep that element is: a builder that adds a part at
+// a time makes such a list (24 parts here, 23 pairs deep).
+trait Channel<C> {
+    fn channel(self) -> C
+}
+
+impl Channel<f32> for f32 {
+    fn channel(self) -> f32 {
+        self
+    }
+}
+
+struct Part<F>: Copy {
+    value: F,
+}
+
+@fieldwise
+trait Items<C> {
+    fn first(self) -> C {
+        for item in fields(self) {
+            return item.first()
+        }
+    }
+}
+
+impl<C, F: Channel<C>> Items<C> for Part<F> {
+    fn first(self) -> C {
+        self.value.channel()
+    }
+}
+
+trait Whole<C> {
+    fn whole(take self) -> C
+}
+
+struct Body<P> {
+    parts: P,
+}
+
+impl<P> Body<P> {
+    fn add(take self, part: Part<f32>) -> Body<(P, Part<f32>)> {
+        Body { parts: (take self.parts, part) }
+    }
+}
+
+impl<C, P: Items<C>> Whole<C> for Body<P> {
+    fn whole(take self) -> C {
+        self.parts.first()
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let p = Part { value: 1.0 }
+    let _ = Body { parts: p }
+        .add(p).add(p).add(p).add(p).add(p).add(p).add(p).add(p)
+        .add(p).add(p).add(p).add(p).add(p).add(p).add(p).add(p)
+        .add(p).add(p).add(p).add(p).add(p).add(p).add(p)
+        .whole()
+}

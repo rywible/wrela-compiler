@@ -314,6 +314,47 @@ fn a_type_that_doubles_through_later_bindings_is_an_error_quickly() {
 }
 
 #[test]
+fn bounds_that_lead_back_to_their_trait_infer_quickly() {
+    // Each impl's bounds ask for both traits of the same type again: followed as they branch,
+    // two ways at each level of the fuel (the tuple's size and 16), inferring `C` took hours. A
+    // watchdog fails the test rather than wait.
+    let tuple = vec!["x"; 32].join(", ");
+    let src = format!(
+        "trait A<C> {{
+    fn a(self) -> C
+}}
+
+trait B<C> {{
+    fn b(self) -> C
+}}
+
+impl<C, T: A<C> + B<C>> A<C> for T {{
+    fn a(self) -> C {{
+        self.b()
+    }}
+}}
+
+impl<C, T: A<C> + B<C>> B<C> for T {{
+    fn b(self) -> C {{
+        self.a()
+    }}
+}}
+
+pub fn f() -> i32 {{
+    let x: f32 = 1.0
+    let _ = ({tuple}).a()
+    1
+}}"
+    );
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(compile("cyclic_bounds", &src).0));
+    let codes = rx
+        .recv_timeout(std::time::Duration::from_secs(QUICK))
+        .expect("the check ends within QUICK seconds");
+    assert_eq!(codes, ["E0207"]);
+}
+
+#[test]
 fn values_too_large_for_memory_trap_on_entry() {
     // Each struct holds two of the one before: 2^41 floats, laid out once per struct.
     let mut src = String::from("struct P0: Copy { a: f32, b: f32 }\n");

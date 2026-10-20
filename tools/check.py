@@ -15,6 +15,7 @@ platform, console) is checked by one step, `wrela-suite`: `wrela suite`, which f
 and tests every member. A Wrela name of a member, `wrela::<package-path>::[<test>]`, passes
 through to `wrela suite`, which reads it as this file reads its own. The toolchain's own Wrela
 (compiler/std and compiler/tests' packages) is checked here: `wrela-fmt`, and its Wrela names.
+A name under one of the CLI crate's Rust programs (`wrela::suite::tool::`) is that program's.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -235,6 +236,13 @@ def step(name, wrela, logs, out=None):
         call(commands[name], **into(out))
 
 
+def rust_named(programs, name):
+    """Whether `name` is under a Rust program's name: the CLI crate's programs (`wrela::suite`,
+    `wrela::wrela`) start as Wrela names do, and a Wrela name's package is a directory, never one
+    of them."""
+    return any(name.startswith(program_name(program) + "::") for program in programs)
+
+
 def wrela_name(name, executable, logs):
     """A Wrela name: a toolchain package's here (`wrela_test`), a workspace member's through
     `wrela suite`, which takes the same names and refuses one it doesn't know."""
@@ -345,20 +353,21 @@ def main(arguments):
             if name in ("wrela-fmt", "wrela-suite", "wgsl"):
                 call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
             step(name, wrela, logs)
-        elif name.startswith("wrela::"):
-            build_tests()  # The same dependency features and executable as the full suite.
-            # `cargo test --no-run` builds the CLI's test harness, not its normal executable.
-            call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
-            wrela_name(name, wrela, logs)
         else:
+            # The same dependency features and executable as the full suite.
             programs = build_tests()
-            if name.endswith("::"):
-                program, tests = group(programs, name)
+            if name.startswith("wrela::") and not rust_named(programs, name):
+                # `cargo test --no-run` builds the CLI's test harness, not its normal executable.
+                call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
+                wrela_name(name, wrela, logs)
             else:
-                program, test = matching(programs, name)
-                tests = [test]
-            count = rust_run(program, names=tests)
-            print(f"{count} passed", flush=True)
+                if name.endswith("::"):
+                    program, tests = group(programs, name)
+                else:
+                    program, test = matching(programs, name)
+                    tests = [test]
+                count = rust_run(program, names=tests)
+                print(f"{count} passed", flush=True)
     print(f"{name or 'all checks'} {'passed' if status == 0 else 'failed'} in {time.monotonic() - started:.1f}s",
           flush=True)
     return status

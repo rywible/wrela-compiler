@@ -66,6 +66,8 @@ pub struct Program {
     /// The goals the trait solver is working on: an impl's bounds can lead back to one of
     /// them. The first one's size, while there are any.
     pub(crate) solving: std::cell::RefCell<(HashSet<(TyId, TraitRef)>, u32)>,
+    /// [`crate::traits::impl_args`]'s queries in progress, and its answers so far.
+    pub(crate) impl_queries: std::cell::RefCell<crate::traits::ImplQueries>,
     /// Where the source's syntax errors are.
     pub syntax_errors: Vec<wrela_diag::Span>,
     /// The unit suffixes: `std::units`' constants by name (§5).

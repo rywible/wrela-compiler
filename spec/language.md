@@ -327,7 +327,7 @@ pub trait Parts: Copy {
 - `for mut f in fields(self)` walks with `mut self`. `fields(self).rev()` walks the fields last first, for a fold from the right.
 - So the trait decides how its fields' results combine where the shapes above don't: a sum, a fold that threads a value through them, or the field that holds an index.
 - A walk whose body always returns returns from its first field, so `for f in fields(self) { return f.first() }` needs nothing after it. It's derived as that field's body alone (an array's first element's).
-- A tuple's or an array's derived impl has a generic trait's arguments as its first element does: a pair of `PartChannels<Tissue>` items is a `PartChannels<Tissue>`.
+- A tuple's or an array's derived impl has a generic trait's arguments as its first element does, however deep the pairs nest: a pair of `PartChannels<Tissue>` items is a `PartChannels<Tissue>`, and so is a pair whose first element is such a pair.
 - The body is checked once, with `f` of the trait's field type (any type with the trait); its memory rules are checked where it's derived.
 - The walk is the fields one after another, not a loop. So it can't `break` or `continue` (`return` leaves the method), and it can't hold a closure, since its body is written again for each field: E0337, as is `fields(self)` anywhere else.
 - An impl written by hand gives the method itself (E0401).

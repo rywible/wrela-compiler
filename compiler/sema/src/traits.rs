@@ -288,13 +288,57 @@ pub fn fits_fn_bound(p: &Program, ty: TyId, bound: TyId) -> bool {
 /// self type matches `ty` and that applies (or whose arguments another impl gives). `ty` is
 /// concrete: it has no declared bounds.
 pub fn impl_args(p: &Program, ty: TyId, t: TraitId) -> Vec<Vec<TyId>> {
-    impl_args_at(p, ty, t, 0)
+    impl_args_at(p, ty, t, p.types.size(ty).min(MAX_TYPE_SIZE) + IMPL_ARGS_SLACK)
 }
 
-/// How deep [`impl_args`] goes through bounds that solve an impl's parameters.
-const IMPL_ARGS_DEPTH: u32 = 16;
+/// How much deeper than its type's size [`impl_args`] goes through bounds that solve an impl's
+/// parameters: a level per level of the type (a pair's first element, a field's type), as a
+/// list of pairs nested to any depth needs, and this many more.
+const IMPL_ARGS_SLACK: u32 = 16;
 
-fn impl_args_at(p: &Program, ty: TyId, t: TraitId, depth: u32) -> Vec<Vec<TyId>> {
+/// [`impl_args`]'s queries in progress, outermost first, and the answers found since the
+/// outermost one started. A query that an impl's bounds lead back to while it's in progress
+/// gives nothing there (`impl<C, T: A<C> + B<C>> A<C> for T`), and one asked again is answered
+/// from before, so each of the bounds' branches is followed once, however much fuel is left.
+#[derive(Debug, Default)]
+pub(crate) struct ImplQueries {
+    active: Vec<(TyId, TraitId)>,
+    /// The outermost place in `active` that a query in progress led back to, since the
+    /// innermost started: its answer, and those of the queries it asked, depend on that one's.
+    cut: usize,
+    known: HashMap<(TyId, TraitId), Vec<Vec<TyId>>>,
+}
+
+/// [`impl_args`], going `fuel` levels deeper at most.
+fn impl_args_at(p: &Program, ty: TyId, t: TraitId, fuel: u32) -> Vec<Vec<TyId>> {
+    let key = (ty, t);
+    let (at, outer_cut) = {
+        let q = &mut *p.impl_queries.borrow_mut();
+        if let Some(known) = q.known.get(&key) {
+            return known.clone();
+        }
+        if let Some(at) = q.active.iter().position(|&k| k == key) {
+            q.cut = q.cut.min(at);
+            return Vec::new();
+        }
+        q.active.push(key);
+        (q.active.len() - 1, std::mem::replace(&mut q.cut, usize::MAX))
+    };
+    let out = impl_args_of(p, ty, t, fuel);
+    let q = &mut *p.impl_queries.borrow_mut();
+    q.active.pop();
+    // An answer that leans on an outer query in progress may change once that one's known.
+    if q.cut >= at {
+        q.known.insert(key, out.clone());
+    }
+    q.cut = q.cut.min(outer_cut);
+    if q.active.is_empty() {
+        q.known.clear();
+    }
+    out
+}
+
+fn impl_args_of(p: &Program, ty: TyId, t: TraitId, fuel: u32) -> Vec<Vec<TyId>> {
     let structural = p.trait_(t).lang.is_some_and(|l| l.is_structural());
     let mut out: Vec<Vec<TyId>> = Vec::new();
     for &i in p.impls_of(t) {
@@ -303,9 +347,9 @@ fn impl_args_at(p: &Program, ty: TyId, t: TraitId, depth: u32) -> Vec<Vec<TyId>>
         if !match_ty(p, imp.self_ty, ty, &imp.generics, &mut subst) {
             continue;
         }
-        if depth < IMPL_ARGS_DEPTH {
-            solve_from_bounds(p, &imp.generics, &mut subst, depth);
-            solve_from_elements(p, i, ty, t, &mut subst, depth);
+        if fuel > 0 {
+            solve_from_bounds(p, &imp.generics, &mut subst, fuel - 1);
+            solve_from_elements(p, i, ty, t, &mut subst, fuel - 1);
         }
         let args =
             imp.trait_ref.as_ref().map(|r| r.subst(&p.types, &subst).args).unwrap_or_default();
@@ -324,7 +368,7 @@ fn impl_args_at(p: &Program, ty: TyId, t: TraitId, depth: u32) -> Vec<Vec<TyId>>
 /// bounds, as a function's are (language.md §7): in `impl<C, F: Field<C>> Field<C> for
 /// Masked<F>`, `F` is known from the self type, and when it implements `Field` one way, that
 /// gives `C`.
-fn solve_from_bounds(p: &Program, generics: &[ParamId], subst: &mut Subst, depth: u32) {
+fn solve_from_bounds(p: &Program, generics: &[ParamId], subst: &mut Subst, fuel: u32) {
     let open = |subst: &Subst, t: TyId| {
         p.types.any(t, &mut |k| matches!(k, TyKind::Param(g) if generics.contains(g) && subst.get(*g).is_none()))
     };
@@ -345,7 +389,7 @@ fn solve_from_bounds(p: &Program, generics: &[ParamId], subst: &mut Subst, depth
                         .map(|r| r.args)
                         .collect(),
                     None if p.types.has_params(arg) => continue,
-                    None => impl_args_at(p, arg, b.trait_, depth + 1),
+                    None => impl_args_at(p, arg, b.trait_, fuel),
                 };
                 ways.dedup();
                 if let [only] = ways.as_slice() {
@@ -371,14 +415,7 @@ fn solve_from_bounds(p: &Program, generics: &[ParamId], subst: &mut Subst, depth
 /// Solves a tuple's or an array's derived impl's trait parameters (`impl<C, T0, T1> Tr<C> for
 /// (T0, T1)`) from its first element: it has the trait as its elements do, so the way the first
 /// has it gives `C` (a pair of `Field<Tint>`s is a `Field<Tint>`).
-fn solve_from_elements(
-    p: &Program,
-    i: ImplId,
-    ty: TyId,
-    t: TraitId,
-    subst: &mut Subst,
-    depth: u32,
-) {
+fn solve_from_elements(p: &Program, i: ImplId, ty: TyId, t: TraitId, subst: &mut Subst, fuel: u32) {
     let imp = p.impl_(i);
     if !imp.from_opt_in
         || !matches!(p.types.kind(imp.self_ty), TyKind::Tuple(_) | TyKind::ArrayN(..))
@@ -401,7 +438,7 @@ fn solve_from_elements(
     let mut ways: Vec<Vec<TyId>> = match declared_bounds(p, first) {
         Some(bounds) => bounds.into_iter().filter(|b| b.trait_ == t).map(|b| b.args).collect(),
         None if p.types.has_params(first) => return,
-        None => impl_args_at(p, first, t, depth + 1),
+        None => impl_args_at(p, first, t, fuel),
     };
     ways.dedup();
     if let [only] = ways.as_slice() {
