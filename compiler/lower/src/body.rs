@@ -883,7 +883,13 @@ impl<'c, 'a> Fl<'c, 'a> {
             TerminatorKind::ArmFailed { next, .. } => Some(*next),
             TerminatorKind::Return(o) => {
                 let v = o.as_ref().and_then(|o| self.operand(o));
-                self.job_return(crate::job::DONE, 1, v, jb);
+                // A result with no value is past a call that never returns (a `panic` at the
+                // body's end), as in a function's return: nothing reaches it.
+                if v.is_none() && self.mb.m.types.field(jb.step, 2).is_some() {
+                    self.emit(ir::Stmt::Trap);
+                } else {
+                    self.job_return(crate::job::DONE, 1, v, jb);
+                }
                 return;
             }
             TerminatorKind::Yield { resume } => {

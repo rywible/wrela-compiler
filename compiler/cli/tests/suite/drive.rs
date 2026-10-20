@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 /// GPU), and prints what it got:
 /// - `cpu`: frames with a script on the CPU (the script goes to `out/script.json`), the hash,
 ///   a call of `add`, a trap in `boom`, and a frame after the trap;
+/// - `at`: frames at 0.25 s and 3 s, outside lockstep, on the CPU, and the hash;
 /// - `gpu`: three frames on the GPU, the screen captured and written to `out/screen.rgba`, the
 ///   hash;
 /// - `spin`: a call of `spin`, which never ends, with a deadline of 1 s, then the hash;
@@ -166,6 +167,25 @@ fn main(given: take Vec<String>) -> u32 {
         if let Err(e) = drive::read_ran(take apol) {
             print(f"after: {e.message()}")
         }
+    } else if what.as_str() == "at" {
+        var steps = 0
+        let times = [0.25, 3.0]
+        for k in 0..2 {
+            var f = drive::frame_at(b, times[k])
+            var fg = f.poll()
+            while fg.is_none() {
+                yield
+                fg = f.poll()
+            }
+            let Some(fp) = take fg else { return 90 }
+            let ran = match drive::read_ran(take fp) {
+                Ok(r) => take r,
+                Err(e) => return failed(e),
+            }
+            assert(ran.trap.is_none(), "a frame at a time")
+            steps += ran.steps.len()
+        }
+        print(f"frames {steps}")
     } else if what.as_str() == "fetch" {
         // Loaded: say so, and wait until the build's directory has been swapped.
         var m = files::write("out/loaded", utf8("1"))
@@ -277,8 +297,8 @@ pub fn tool(running: mut Running) -> u32 {
 }
 "#;
 
-/// A program that counts the events it reads and writes its count to a GPU buffer each frame
-/// (the hash covers what it submits), with exports to call: `add`, `boom`, which panics on 13,
+/// A program that counts the events it reads and writes its count and the frame's time to a GPU
+/// buffer each frame (the hash covers what it submits), with exports to call: `add`, `boom`, which panics on 13,
 /// and `spin`, which never ends.
 const SUBJECT: &str = r#"
 use std::gpu::{GpuBuffer, buffer, write}
@@ -290,14 +310,14 @@ pub struct Game {
 }
 
 pub fn init() -> Game {
-    Game { events: 0, counts: buffer(1) }
+    Game { events: 0, counts: buffer(2) }
 }
 
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     for _ in events() {
         game.events += 1
     }
-    write(mut game.counts, 0, [game.events])
+    write(mut game.counts, 0, [game.events, bitcast_u32(time)])
 }
 
 pub fn add(a: i32, b: i32) -> i32 {
@@ -397,6 +417,29 @@ fn frames_on_the_cpu_give_the_hosts_hash_and_a_trap_says_what_and_where() {
         plain.lockstep_frame(i, 60.0, 640, 360, &[]).expect("a frame");
     }
     assert_ne!(plain.hash(), host.hash(), "the script changes what the program prints");
+}
+
+/// `frame_at` runs one frame at the time the tool gives, as the host's own frame at that time:
+/// the same hash, and not lockstep's (whose frames are at 0 and 1/60 s).
+#[test]
+fn a_frame_at_a_time_is_the_hosts_frame_at_that_time() {
+    let (tool, src, out) = setup("drive-at");
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &["at"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("frames 2"), "{printed}");
+    let start = || {
+        wrela_host::CpuBuild::load(src.join("build")).expect("load").start_with(2).expect("start")
+    };
+    let mut host = start();
+    for time in [0.25, 3.0] {
+        host.frame(time, 640, 360).expect("a frame");
+    }
+    assert_eq!(value(&printed, "hash"), host.hash().to_string(), "{printed}");
+    let mut lockstep = start();
+    for i in 0..2 {
+        lockstep.lockstep_frame(i, 60.0, 640, 360, &[]).expect("a frame");
+    }
+    assert_ne!(lockstep.hash(), host.hash(), "the frames' times are the tool's");
 }
 
 #[test]

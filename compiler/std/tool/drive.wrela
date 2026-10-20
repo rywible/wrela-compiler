@@ -225,6 +225,17 @@ pub fn frames(b: Build, n: u32, script: Script, timeout: f64 = 0.0) -> Pending<u
     timeout_ask("drive/frames", take w, timeout)
 }
 
+/// Runs one frame at `time`, in seconds, outside lockstep: the program's `frame(time, width,
+/// height)`, as `wrela_host::Host::run_frames` calls it, with no ticks waited for. So a tool can
+/// draw a frame at any time, a camera's, a light's or a jitter's, in any order. `read_ran` reads
+/// the answer.
+@tool
+pub fn frame_at(b: Build, time: f32, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(bitcast_u32(time))
+    timeout_ask("drive/frame_at", take w, timeout)
+}
+
 /// Runs the next `n` ticks of a build loaded on the CPU alone, with no frames, each with
 /// `script`'s records of it, by their ticks counted from the first (as `wrela-host --no-gpu`
 /// runs them): `read_ran` reads the answer.

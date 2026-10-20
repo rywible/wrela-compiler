@@ -146,6 +146,8 @@ struct Load {
 enum Command {
     Init,
     Frames(u32, Vec<Scripted>),
+    /// One frame at a time the tool gives, outside lockstep (`Host::run_frames`'s frame).
+    FrameAt(f32),
     Ticks(u32, Vec<Scripted>),
     Capture,
     Hash,
@@ -163,6 +165,7 @@ impl Command {
         match self {
             Command::Init => "init",
             Command::Frames(..) => "frames",
+            Command::FrameAt(..) => "frame_at",
             Command::Ticks(..) => "ticks",
             Command::Capture => "capture",
             Command::Hash => "hash",
@@ -281,6 +284,7 @@ impl Actor {
             command,
             Command::Init
                 | Command::Frames(..)
+                | Command::FrameAt(..)
                 | Command::Ticks(..)
                 | Command::Call(..)
                 | Command::Audio(..)
@@ -327,6 +331,20 @@ impl Actor {
                         break;
                     }
                     ran.steps.push((start, self.since()));
+                }
+            }
+            Command::FrameAt(time) => {
+                let i = self.next_frame;
+                let start = self.since();
+                let done = match &mut self.host {
+                    Hosted::Cpu(host) => host.frame(time, w, h),
+                    #[cfg(feature = "gpu")]
+                    Hosted::Gpu(host) => host.frame(time, w, h),
+                };
+                self.next_frame += 1;
+                match done {
+                    Ok(()) => ran.steps.push((start, self.since())),
+                    Err(e) => ran.trap = Some(self.trap(&e, 1, i)),
                 }
             }
             Command::Ticks(n, script) => {
@@ -600,6 +618,13 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 }
                 let s = script(&b.str()?)?;
                 if name == "frames" { Command::Frames(n, s) } else { Command::Ticks(n, s) }
+            }
+            "frame_at" => {
+                let time = f32::from_bits(b.u32()?);
+                if !time.is_finite() {
+                    return Err(format!("a frame's time is finite, not {time}"));
+                }
+                Command::FrameAt(time)
             }
             "capture" => Command::Capture,
             "hash" => Command::Hash,

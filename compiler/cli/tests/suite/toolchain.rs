@@ -8,7 +8,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 /// A tool that does what its arguments say, through the toolchain, and prints what it got:
-/// `build PKG OUT`, `build-optimized PKG OUT` (with a 2 s deadline), `test PKG`, `check PKG`,
+/// `build PKG OUT`, `build-optimized PKG OUT` (with a 2 s deadline), `build-testing PKG OUT` (a
+/// test build, with the `@testing` exports), `test PKG`, `check PKG`,
 /// `fmt PATH` and `fmt-check PATH`. A request that fails prints `error: ...` and exits 1.
 const TOOL: &str = r#"
 use std::io::print
@@ -32,8 +33,10 @@ fn main(given: take Vec<String>) -> u32 {
     let what = given[0].clone()
     var paths: Vec<String> = Vec::new()
     paths.push(given[1].clone())
-    var p = if what.as_str() == "build" || what.as_str() == "build-optimized" || what.as_str() == "build-timed" {
+    let building = what.as_str() == "build" || what.as_str() == "build-optimized" || what.as_str() == "build-timed" || what.as_str() == "build-testing"
+    var p = if building {
         var options = toolchain::options()
+        options.testing = what.as_str() == "build-testing"
         if what.as_str() == "build-optimized" {
             options.optimize = true
             options.timeout = 2.0
@@ -58,7 +61,7 @@ fn main(given: take Vec<String>) -> u32 {
         got = p.poll()
     }
     let Some(polled) = take got else { return 90 }
-    if what.as_str() == "build" || what.as_str() == "build-optimized" || what.as_str() == "build-timed" {
+    if building {
         let built = match toolchain::read_built(take polled) {
             Ok(b) => take b,
             Err(e) => return failed(e),
@@ -239,6 +242,39 @@ fn a_build_through_the_toolchain_is_wrela_builds_byte_for_byte_and_writes_nothin
         .expect("wrela build");
     assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
     assert_eq!(a, files(&reference), "the service's build is `wrela build`'s");
+}
+
+/// A test build through the toolchain (`testing`) is `wrela build --testing`'s, byte for byte,
+/// with the program's `@testing` export, which a normal build leaves out.
+#[test]
+fn a_test_build_through_the_toolchain_keeps_the_testing_exports() {
+    let main = format!("{SUBJECT}\n@testing\npub fn probe() -> u32 {{\n    SUM\n}}\n");
+    let subject = [("subject/wrela.toml", manifest("subject")), ("subject/main.wrela", main)];
+    let subject: Vec<(&str, &str)> = subject.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let (tool, src, out) = packages("toolchain-testing", &subject);
+    for (mode, into) in [("build-testing", "out/testing"), ("build", "out/normal")] {
+        let (code, printed) = run(&mut probe(&tool, &src, &out, &[mode, "src/subject", into]));
+        assert_eq!(code, Some(0), "{printed}");
+        assert!(printed.contains("built ok=true"), "{printed}");
+    }
+    let reference = out.join("reference");
+    let built = wrela()
+        .arg("build")
+        .arg(src.join("subject"))
+        .arg("--testing")
+        .arg("-o")
+        .arg(&reference)
+        .output()
+        .expect("wrela build --testing");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    let testing = files(&out.join("testing"));
+    assert_eq!(testing, files(&reference), "the service's test build is `wrela build --testing`'s");
+    let exports = |dir: &Path| {
+        let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
+        wasm.windows(5).any(|w| w == b"probe")
+    };
+    assert!(exports(&out.join("testing")), "the test build exports `probe`");
+    assert!(!exports(&out.join("normal")), "a normal build doesn't");
 }
 
 #[test]

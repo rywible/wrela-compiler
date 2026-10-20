@@ -121,7 +121,7 @@ pub struct LiteralEdits {
 
 /// How to build: through `wasm-opt`, lifting these packages, with these dependencies read from
 /// other directories (by name, wherever declared: a program written around another package), with SIMD or not, as a
-/// debug build or not.
+/// debug build or not, as a test build (with the program's `@testing` exports) or not.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct BuildOptions {
     pub optimize: bool,
@@ -129,6 +129,7 @@ pub struct BuildOptions {
     pub overrides: Vec<(String, PathBuf)>,
     pub simd: bool,
     pub debug: bool,
+    pub testing: bool,
 }
 
 /// A diagnostic, as the compiler gives it: whether it's an error, its code, its message, where
@@ -345,13 +346,14 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
                 let package = b.str()?;
                 let out = b.str()?;
                 let (optimize, simd, debug) = (b.u8()? != 0, b.u8()? != 0, b.u8()? != 0);
+                let testing = b.u8()? != 0;
                 let lift = strs(b)?;
                 let n = b.u32()?;
                 let mut overrides = Vec::new();
                 for _ in 0..n.min(MOST_BYTES as u32) {
                     overrides.push((b.str()?, b.str()?));
                 }
-                Op::Build { package, out, optimize, simd, debug, lift, overrides }
+                Op::Build { package, out, optimize, simd, debug, testing, lift, overrides }
             }
             "test" => {
                 let package = b.str()?;
@@ -423,6 +425,7 @@ enum Op {
         optimize: bool,
         simd: bool,
         debug: bool,
+        testing: bool,
         lift: Vec<String>,
         overrides: Vec<(String, String)>,
     },
@@ -534,11 +537,12 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
     let caps = &s.caps;
     let mut out = Out::default();
     match op {
-        Op::Build { package, out: into, optimize, simd, debug, lift, overrides } => {
+        Op::Build { package, out: into, optimize, simd, debug, testing, lift, overrides } => {
             let dir = caps.dir_path(&package, false)?;
             // The output's root is a write root, checked before any work.
             caps.writable(&into)?;
-            let mut options = BuildOptions { optimize, lift, simd, debug, overrides: Vec::new() };
+            let mut options =
+                BuildOptions { optimize, lift, simd, debug, testing, overrides: Vec::new() };
             for (name, path) in overrides {
                 options.overrides.push((name, caps.dir_path(&path, false)?));
             }

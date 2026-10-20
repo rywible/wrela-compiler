@@ -1,5 +1,0 @@
-[package]
-name = "wood_occlusion"
-
-[dependencies]
-engine = { path = "../../../engine" }

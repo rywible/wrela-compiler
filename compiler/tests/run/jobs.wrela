@@ -2,7 +2,8 @@
 // (numbers, a `Vec`, a `String`) between them; its `take` parameters go to `start`, its `borrow`
 // and `mut` ones to each `resume`; it yields inside loops, `if`s and `match` arms, and a closure
 // it makes is called after a `yield`; a job dropped half done, or run to its end, frees what it
-// holds, once; a generic job is laid out for each of its types
+// holds, once; a generic job is laid out for each of its types; and a job whose body ends in a
+// `panic` after a loop that returns its result runs to that result
 // expect: counted(4) = 4010
 // expect: counted(0) = 0
 // expect: gathered(5) = 31020
@@ -12,6 +13,7 @@
 // expect: finished(2048) = 2048
 // expect: resumed_after_done() traps
 // expect: generic(3) = 33
+// expect: returns_before_its_panic(3) = 5
 use std::job::{Job, Step}
 
 struct Scratch {
@@ -253,6 +255,28 @@ fn run_weigh<W: Weigh + Copy>(job: take Job<weigh<W>>) -> u32 {
 pub fn generic(n: u32) -> u32 {
     let w = Weighing { light: weigh.start(Light {}, n) }
     run_weigh(take w.light) + run_weigh(weigh.start(Heavy {}, n))
+}
+
+/// Returns 5 from inside its loop, at the second step; its end, a panic, is never reached.
+@job
+fn found() -> u32 {
+    for i in 0..3 {
+        yield
+        if i == 1 {
+            return 5
+        }
+    }
+    panic("never reached")
+}
+
+pub fn returns_before_its_panic(n: u32) -> u32 {
+    var j = found.start()
+    for _ in 0..n {
+        if let Step::Done(v) = j.resume() {
+            return v
+        }
+    }
+    0
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {}

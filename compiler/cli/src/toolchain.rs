@@ -47,7 +47,7 @@ fn diagnostics_of(
 impl wrela_host::tool::Toolchain for Compiler {
     fn build(&self, job: &Job, package: &Path, options: &BuildOptions) -> Result<Built, String> {
         let scope = scope_of(job, &options.overrides)?;
-        let kind = wrela_driver::BuildKind { debug: options.debug, testing: false };
+        let kind = wrela_driver::BuildKind { debug: options.debug, testing: options.testing };
         let mut out = wrela_driver::build_in(package, kind, options.simd, &options.lift, &scope)?;
         if options.optimize && !out.has_errors() {
             crate::build::optimized_with(&mut out.files, |wasm| {
