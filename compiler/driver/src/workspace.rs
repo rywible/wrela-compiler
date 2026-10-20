@@ -140,6 +140,17 @@ pub fn members_in(
             vec![dir]
         };
         for dir in dirs {
+            if let Some((file, line)) = ignored(reach, base, &dir) {
+                let shown = relative(&dir, base);
+                errors.push(
+                    bad(
+                        span,
+                        format!("the member `{shown}` is ignored by {file}:{line}, so it won't be committed"),
+                    )
+                    .with_help("rename its directory, or take it back in the `.gitignore` with a `!` rule"),
+                );
+                continue;
+            }
             let Ok(canon) = reach.canonical(&dir) else { continue };
             if out.iter().any(|(m, _)| m.dir == canon) {
                 continue;
@@ -178,6 +189,20 @@ pub fn members_in(
     let members = Members { list: out.into_iter().map(|(m, _)| m).collect(), unread };
     errors.extend(check_tools(reach, base, decl, &members));
     (members, errors)
+}
+
+/// The `.gitignore` file and line that make git ignore the member directory `dir` in the
+/// workspace's directory `base` (`crate::suite::ignored_by`), read through `reach`; `None` if
+/// git keeps it, or it isn't below `base`.
+fn ignored(reach: &Reach, base: &Path, dir: &Path) -> Option<(String, usize)> {
+    let rel = dir.strip_prefix(base).ok()?.to_str()?.replace('\\', "/");
+    if rel.split('/').any(|p| p == "..") {
+        return None;
+    }
+    crate::suite::ignored_by(&rel, &mut |file| {
+        let path = base.join(file);
+        if reach.is_file(&path) { reach.read_to_string(&path).ok() } else { None }
+    })
 }
 
 /// What's wrong with the workspace's `untested` and `[tools.<name>]` (E0223): a directory that
@@ -514,7 +539,7 @@ mod tests {
         let app = |deps: &str| format!("[package]\nname = \"app\"\n\n[dependencies]\n{deps}\n");
         // Each case: its name, its files, and the error it gives: its code and what it says.
         type Case = (&'static str, Vec<(&'static str, String)>, &'static str, &'static str);
-        let cases: [Case; 7] = [
+        let cases: [Case; 8] = [
             (
                 "none",
                 vec![("app/wrela.toml", app("lib = { workspace = true }"))],
@@ -560,6 +585,17 @@ mod tests {
                 ],
                 codes::E0223.as_str(),
                 "the member `lib` has no `wrela.toml`",
+            ),
+            (
+                "ignored",
+                vec![
+                    ("wrela.toml", "[workspace]\nmembers = [\"app\", \"app/tests/*\"]\n".into()),
+                    (".gitignore", "# outputs\n**/build/\n".into()),
+                    ("app/tests/build/wrela.toml", "[package]\nname = \"app_build\"\n".into()),
+                    ("app/wrela.toml", app("app_build = { workspace = true }")),
+                ],
+                codes::E0223.as_str(),
+                "the member `app/tests/build` is ignored by .gitignore:2, so it won't be committed",
             ),
             (
                 "empty-glob",

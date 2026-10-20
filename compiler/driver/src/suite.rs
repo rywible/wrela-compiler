@@ -78,13 +78,15 @@ struct Rule {
     dirs_only: bool,
     /// It has a `/` before its end, so it matches paths from `base`, not names at any depth.
     anchored: bool,
+    /// Its line in its file, from 1.
+    line: usize,
 }
 
 impl Rule {
     /// The rules of an ignore file's `text`, in the directory `base`.
     fn read(base: &str, text: &str) -> Vec<Rule> {
         let mut rules = Vec::new();
-        for line in text.lines() {
+        for (number, line) in text.lines().enumerate() {
             let line = line.trim_end();
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -108,7 +110,14 @@ impl Rule {
                 Some(dir) => format!("{dir}/*/**"),
                 None => glob.to_string(),
             };
-            rules.push(Rule { base: base.to_string(), glob, negated, dirs_only, anchored });
+            rules.push(Rule {
+                base: base.to_string(),
+                glob,
+                negated,
+                dirs_only,
+                anchored,
+                line: number + 1,
+            });
         }
         rules
     }
@@ -132,6 +141,35 @@ impl Rule {
             part_matches(&self.glob, inside.rsplit('/').next().unwrap_or(inside))
         }
     }
+}
+
+/// The ignore file and line that make git ignore the directory at `path` (from the workspace's
+/// directory, `/` between its parts), or `None` if git keeps it: so a workspace's member that a
+/// `.gitignore` hides, which would never be committed, is found. A directory in an ignored one
+/// is ignored by that one's rule, as git never looks inside it. `read` gives the text of the
+/// ignore file at a path from the workspace's directory, `None` if there is none.
+pub fn ignored_by(
+    path: &str,
+    read: &mut dyn FnMut(&str) -> Option<String>,
+) -> Option<(String, usize)> {
+    let file_in = |dir: &str| {
+        if dir.is_empty() { ".gitignore".to_string() } else { format!("{dir}/.gitignore") }
+    };
+    let mut rules = Vec::new();
+    let mut at = String::new();
+    for part in path.split('/').filter(|p| !p.is_empty() && *p != ".") {
+        if let Some(text) = read(&file_in(&at)) {
+            rules.extend(Rule::read(&at, &text));
+        }
+        at = if at.is_empty() { part.to_string() } else { format!("{at}/{part}") };
+        // The last rule that matches decides, as in git.
+        if let Some(r) = rules.iter().rev().find(|r| r.matches(&at, true)) {
+            if !r.negated {
+                return Some((file_in(&r.base), r.line));
+            }
+        }
+    }
+    None
 }
 
 /// The workspace's files under `root` (see the module's comment): each path from `root`, with
@@ -377,6 +415,30 @@ mod tests {
         .expect("a workspace");
         assert_eq!(allowlist(&decl, &found).refused, ["abc/keep.py"]);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A directory that an ignore file hides, or that is inside one it hides, is found with the
+    /// rule's file and line; one that a later rule takes back isn't hidden.
+    #[test]
+    fn an_ignored_directory_is_found_with_its_rule() {
+        let files = [
+            (".gitignore", "# outputs\n**/build/\n!keep/build/\n"),
+            ("games/.gitignore", "\n/drafts\n"),
+        ];
+        let mut read = |p: &str| files.iter().find(|(f, _)| *f == p).map(|(_, t)| t.to_string());
+        let at = |r: Option<(String, usize)>| r.map(|(f, l)| format!("{f}:{l}"));
+        assert_eq!(
+            at(ignored_by("console/tests/build", &mut read)).as_deref(),
+            Some(".gitignore:2")
+        );
+        assert_eq!(at(ignored_by("a/build/inner", &mut read)).as_deref(), Some(".gitignore:2"));
+        assert_eq!(
+            at(ignored_by("games/drafts/one", &mut read)).as_deref(),
+            Some("games/.gitignore:2")
+        );
+        assert_eq!(ignored_by("keep/build", &mut read), None);
+        assert_eq!(ignored_by("console/tests/shader-budget", &mut read), None);
+        assert_eq!(ignored_by("drafts", &mut read), None);
     }
 
     /// Only the versioned ignore files count: a checkout's own `.git/info/exclude` can't hide a

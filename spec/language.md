@@ -408,7 +408,7 @@ members = [
 - **A package's workspace is the nearest `wrela.toml` with `[workspace]`** in its directory or above it. When workspaces nest, the nearest one is used.
 - **`name = { workspace = true }` is the member named `name`.** A member's name is its `[package] name`; a member without one has its directory's name, with `-` read as `_`. A package can use a member this way whether it is a member or not. A dependency has a `path` or `workspace = true`, not both (E0219).
 - **A workspace's manifest is a package's too only if it has `[package]`.** Without one, its directory isn't a package, and checking or building it is E0223.
-- **Each member is a package with a name of its own.** A member that isn't a directory with a `wrela.toml`, a `/*` that names no package, and two members with one name are E0223. A directory listed twice is one member. A workspace dependency with no workspace above it, or with no member of that name, is E0220.
+- **Each member is a package with a name of its own.** A member that isn't a directory with a `wrela.toml`, a `/*` that names no package, and two members with one name are E0223. So is a member that the workspace's versioned `.gitignore` files ignore, read as `wrela suite` reads them (a directory inside an ignored one is ignored too): git would never commit it, so the workspace would break in every other checkout. A directory listed twice is one member. A workspace dependency with no workspace above it, or with no member of that name, is E0220.
 - **`path` dependencies work in a workspace and outside it.**
 - **`[workspace]`'s keys are arrays of strings.** Any other key, a value of another kind, or a section declared twice, is E0219.
   - `members`, above.
