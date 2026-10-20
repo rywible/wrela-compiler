@@ -22,7 +22,8 @@
 //! The memory starts with [`HEAP_START_PAGES`] pages of heap after the constants, and grows up to
 //! [`MAX_PAGES`] (1 GiB) as the heap needs (a tool build's to [`TOOL_MAX_PAGES`]). It's shared:
 //! the module imports it (`wrela.memory`), and every thread's instance of the module gets the
-//! same one. A server's or a tool's build has a memory of its own instead, on its one thread.
+//! same one (a tool build's too, language.md §15.5). A server's build has a memory of its own
+//! instead, on its one thread.
 //!
 //! ## Threads
 //!

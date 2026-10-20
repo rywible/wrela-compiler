@@ -32,6 +32,7 @@
 //! secrets = ["CLOUDFLARE_API_TOKEN"]
 //! browser = true
 //! timeout = 1800                     # seconds
+//! workers = 4                        # helpers for std::par, beside the tool's thread
 //! ```
 //!
 //! The file is read as the subset of TOML these need: `[section]` headers, `key = value` lines,
@@ -114,6 +115,9 @@ pub struct ToolDecl {
     pub browser: bool,
     /// `timeout`: the run's budget, in seconds.
     pub timeout: Option<u64>,
+    /// `workers`: how many helpers run its `std::par` work, 0 to `wrela_abi`'s `MAX_WORKERS`;
+    /// `wrela tool --workers` may only lower it.
+    pub workers: Option<u32>,
 }
 
 /// A value in the subset of TOML a manifest uses.
@@ -215,6 +219,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                     secrets: Vec::new(),
                     browser: false,
                     timeout: None,
+                    workers: None,
                 }),
                 s if s.starts_with("tools.") => errors.push(
                     bad(at, content.len(), format!("`{}` can't name a tool", &s["tools.".len()..]))
@@ -392,7 +397,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                     continue;
                 };
                 if let Err(why) = tool_key(tool, key, value) {
-                    errors.push(bad(at, content.len(), why).with_note("`[tools.<name>]` has `package = \"...\"`, `read`, `write`, `net`, `run` and `secrets` (arrays of strings), `browser = true` and `timeout = <seconds>` (language.md §3.6)"));
+                    errors.push(bad(at, content.len(), why).with_note("`[tools.<name>]` has `package = \"...\"`, `read`, `write`, `net`, `run` and `secrets` (arrays of strings), `browser = true`, `timeout = <seconds>` and `workers = <helpers>` (language.md §3.6)"));
                 }
             }
             ("", _, _) => errors.push(bad(at, content.len(), "a key outside a section".into())
@@ -498,6 +503,15 @@ fn tool_key(tool: &mut ToolDecl, key: &str, value: Value) -> Result<(), String> 
         ("timeout", Value::Int(n)) if n > 0 => tool.timeout = Some(n),
         ("timeout", _) => {
             return Err("a tool's `timeout` is a whole number of seconds, more than 0".into());
+        }
+        ("workers", Value::Int(n)) if n <= u64::from(wrela_abi::memory::MAX_WORKERS) => {
+            tool.workers = Some(n as u32)
+        }
+        ("workers", _) => {
+            return Err(format!(
+                "a tool's `workers` is how many helpers it has, from 0 to {}",
+                wrela_abi::memory::MAX_WORKERS
+            ));
         }
         (k, _) => {
             return Err(format!(
@@ -715,6 +729,7 @@ run = ["wasm-opt", "wrangler=tool:fakes/wrangler"]
 secrets = ["TOKEN"]
 browser = true
 timeout = 1800
+workers = 3
 
 [workspace]
 members = ["tools/*"]
@@ -741,13 +756,14 @@ package = "tools/lint"
         assert_eq!(release.net, ["api.example"]);
         assert_eq!(release.run, ["wasm-opt", "wrangler=tool:fakes/wrangler"]);
         assert_eq!(release.secrets, ["TOKEN"]);
-        assert!(release.browser && release.timeout == Some(1800));
+        assert!(release.browser && release.timeout == Some(1800) && release.workers == Some(3));
         assert_eq!(
             &text[release.span.start as usize..release.span.end as usize],
             "[tools.release]"
         );
         let lint = &w.tools[1];
         assert!(lint.read.is_empty() && !lint.browser && lint.timeout.is_none());
+        assert!(lint.workers.is_none());
     }
 
     #[test]
@@ -771,6 +787,8 @@ package = "tools/lint"
             ("[tools.t]\npackage = \"t\"\nsecrets = [\"A B\"]\n", "can't name a secret"),
             ("[tools.t]\npackage = \"t\"\ntimeout = 0\n", "`timeout`"),
             ("[tools.t]\npackage = \"t\"\ntimeout = \"60\"\n", "`timeout`"),
+            ("[tools.t]\npackage = \"t\"\nworkers = 9\n", "`workers`"),
+            ("[tools.t]\npackage = \"t\"\nworkers = \"2\"\n", "`workers`"),
             ("[tools.t]\npackage = \"t\"\nbrowser = \"yes\"\n", "`browser` isn't a key"),
             ("[tools.a/b]\npackage = \"t\"\n", "can't name a tool"),
             ("[tools.t]\npackage = \"t\"\n[tools.t]\npackage = \"t\"\n", "more than once"),

@@ -28,7 +28,7 @@ fn ran(dir: &std::path::Path) -> Vec<(String, bool, String)> {
 fn the_tool_tests_fixture_passes() {
     let dir = wrela_root().join("compiler/tests/tool_tests");
     let tests = ran(&dir);
-    assert_eq!(tests.len(), 10, "{tests:?}");
+    assert_eq!(tests.len(), 11, "{tests:?}");
     for (name, passed, message) in &tests {
         assert!(passed, "{name}: {message}");
     }
@@ -158,6 +158,7 @@ fn a_tool_test_is_a_job_of_no_parameters_in_a_package_with_a_tool_build() {
         ("@test(tool, run: [(\"x\", \"../out\")])\n@job\nfn out() {}\n", "E0222", "`run`"),
         ("@test(tool, frames: 3)\n@job\nfn frames() {}\n", "E0222", "takes `budget`"),
         ("@test(tool, blobs: \"8X\")\n@job\nfn blobs() {}\n", "E0222", "`blobs` is a blob budget"),
+        ("@test(tool, workers: 9)\n@job\nfn many() {}\n", "E0222", "`workers` is how many"),
         ("@test(tool)\n@fuel(100)\n@job\nfn fuel() {}\n", "E0108", "`@fuel`"),
         // A test of code is no job, and keeps a constant's effects.
         ("@test\n@job\nfn plain() {}\n", "E0336", "can't be a job"),

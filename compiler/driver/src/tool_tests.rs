@@ -76,6 +76,8 @@ pub struct Spec {
     /// Its blob budget (`blobs: "8M,64"`), if it gives one.
     #[serde(default)]
     pub blobs: Option<String>,
+    /// Its helpers (`workers: n`).
+    pub workers: u32,
     /// The fake clock's date at the start: seconds since 1970.
     pub utc: u64,
     /// Where the process writes how the run ended ([`Ended`]).
@@ -158,7 +160,7 @@ pub(crate) fn run(
         .enumerate()
         .map(|(i, &f)| (i, p.func(f).name.clone(), p.func(f).attrs.test_tool.clone()))
         .collect();
-    let ran = crate::consts::each_at_once(&each, |(i, _, test)| {
+    let ran = crate::consts::each_on(at_once(), &each, |(i, _, test)| {
         let Some(test) = test else { return Err("it isn't a tool test".to_string()) };
         let Some(runner) = RUNNER.get() else {
             return Err("this process can't run tool tests: `wrela test` runs each in a `wrela` process of its own".into());
@@ -189,6 +191,15 @@ pub(crate) fn run(
 
 /// Runs tool test `i`, `test`, of the package at `root` in a process of its own, with what its
 /// attribute grants, in a directory of its own under `dir`: how it ended, and what it printed.
+/// How many of a package's tool tests run at once: half the cores, at least 2. Each is a
+/// process that uses many cores itself (its builds' constants, its driven builds, its helpers),
+/// so a test per core loaded a machine of 10 cores to 38 runnable threads, and a test's budget,
+/// which is real time, ran out under the others' load.
+fn at_once() -> usize {
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    (cores / 2).max(2)
+}
+
 fn one(
     runner: &Path,
     dir: &Path,
@@ -229,6 +240,7 @@ fn one(
         read,
         browser: test.browser,
         blobs: test.blobs.clone(),
+        workers: test.workers,
         utc: START_UTC,
         ended: own.join("ended.json"),
         groups: own.join("groups.txt"),
@@ -355,4 +367,25 @@ fn kill_tree(group: i32, groups: &Path) {
         signal_group(g, Signal::KILL);
     }
     signal_group(group, Signal::KILL);
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tool_tests_run_half_as_many_at_once_as_the_cores_at_least_two() {
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        assert_eq!(super::at_once(), (cores / 2).max(2));
+        let ran = std::sync::atomic::AtomicUsize::new(0);
+        let most = std::sync::atomic::AtomicUsize::new(0);
+        let items: Vec<u32> = (0..16).collect();
+        let out = crate::consts::each_on(3, &items, |&i| {
+            let now = ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            most.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            ran.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            i * 2
+        });
+        assert_eq!(out, (0..16).map(|i| i * 2).collect::<Vec<u32>>(), "in the items' order");
+        assert!(most.load(std::sync::atomic::Ordering::SeqCst) <= 3, "at most 3 at once");
+    }
 }

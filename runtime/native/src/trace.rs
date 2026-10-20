@@ -56,9 +56,14 @@ impl Traced {
 #[derive(Clone)]
 pub struct Trace(Arc<Mutex<State>>);
 
+/// Where a trace's lines go instead of being kept ([`Trace::to`]).
+type Sink = Arc<dyn Fn(String) + Send + Sync>;
+
 struct State {
     /// What's shown before each line on stderr (`wrela: `, a constant's name); `None`: quiet.
     shown: Option<String>,
+    /// Where each line goes, if not kept.
+    sink: Option<Sink>,
     traced: Traced,
     /// Each thread's phase: its index in `traced.phases`, and when it started.
     open: HashMap<ThreadId, (usize, Instant)>,
@@ -69,9 +74,20 @@ impl Trace {
     pub fn new(shown: Option<String>) -> Trace {
         Trace(Arc::new(Mutex::new(State {
             shown,
+            sink: None,
             traced: Traced::default(),
             open: HashMap::new(),
         })))
+    }
+
+    /// A trace that gives each line to `sink` as it's made, and neither shows nor keeps it, and
+    /// keeps no phases: a tool's helpers' lines go to its console this way (language.md §15.5),
+    /// and their phases nowhere, as the tool's own thread's go, so a long run's distinct phase
+    /// names hold no memory.
+    pub(crate) fn to(sink: impl Fn(String) + Send + Sync + 'static) -> Trace {
+        let trace = Trace::new(None);
+        trace.state().sink = Some(Arc::new(sink));
+        trace
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -81,6 +97,11 @@ impl Trace {
     /// A line the program printed: shown now, unless quiet, and kept.
     pub fn print(&self, line: String) {
         let mut s = self.state();
+        if let Some(sink) = s.sink.clone() {
+            drop(s);
+            sink(line);
+            return;
+        }
         if let Some(shown) = &s.shown {
             eprintln!("{shown}{line}");
         }
@@ -96,6 +117,9 @@ impl Trace {
     pub fn phase(&self, name: &str) {
         let now = Instant::now();
         let mut s = self.state();
+        if s.sink.is_some() {
+            return;
+        }
         let me = std::thread::current().id();
         s.end(me, now);
         if name.is_empty() {
@@ -271,6 +295,23 @@ fn text<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_trace_to_a_sink_keeps_no_phases() {
+        // A tool's helpers: their lines go to the console, and their phases nowhere, however
+        // many names they time.
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let l = lines.clone();
+        let t = Trace::to(move |line| l.lock().expect("lines").push(line));
+        for i in 0..10_000 {
+            t.phase(&format!("phase {i}"));
+        }
+        t.print("printed".into());
+        assert!(t.phases().is_empty());
+        assert_eq!(t.open_phases(), 0);
+        assert_eq!(*lines.lock().expect("lines"), ["printed"]);
+        assert!(t.take().is_empty(), "no line kept either");
+    }
 
     #[test]
     fn a_phase_runs_to_its_threads_next_and_is_summed_by_name() {

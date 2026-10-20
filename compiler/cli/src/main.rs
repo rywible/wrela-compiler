@@ -55,7 +55,7 @@
 //!                                         describe, numbers, midi, sheet, speed; and
 //!                                         `wrela audio partials <wav> --key k`
 //! wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
-//!     [--timeout S] [--blob-budget B] [-- args...]
+//!     [--timeout S] [--workers N] [--blob-budget B] [-- args...]
 //!                                         build the package's tool and run it with those
 //!                                         grants (§15.5); exit with the tool's status
 //! wrela tool <name> [grants...] [-- args...]
@@ -123,7 +123,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
-        "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--blob-budget B] [-- args...]",
+        "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
         "wrela audio <package-dir> (wav <out.wav> | describe | numbers | midi <out.mid> | sheet <out.png> [--bars a-b] | speed) [--take n] [--seconds s]",
         "wrela audio partials <file.wav> --key k [--from s] [--seconds s]",
         "wrela audio model <dir-of-key-velocity.wav> --out <file.wrela> [--against <dir>]",

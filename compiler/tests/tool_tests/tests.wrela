@@ -371,3 +371,38 @@ fn a_served_post_waits_while_the_fake_clock_moves() {
     while t.poll().is_none() { yield }
     assert(!post.is_done(), "no post came")
 }
+
+/// `i` stepped a few times: a value that a fold's order shows in.
+fn stepped(i: u32) -> u32 {
+    var x = i
+    for _ in 0..100 {
+        x = x.wrapping_mul(1664525).wrapping_add(1013904223)
+    }
+    x
+}
+
+@test(tool, workers: 7)
+@job
+fn a_parallel_job_on_seven_helpers_folds_as_one_thread_does() {
+    var xs: Vec<u32> = Vec::new()
+    for i in 0..10000 {
+        xs.push(i)
+    }
+    let folded = xs.par_map_reduce(
+        u32(7),
+        |i| stepped(i),
+        |a, b| a.wrapping_mul(31).wrapping_add(b),
+    )
+    // The same fold on this thread alone: each chunk of 64 from 7, in order, then the chunks'.
+    var alone = u32(7)
+    var chunk = 0
+    while chunk * 64 < xs.len() {
+        var part = u32(7)
+        for i in chunk * 64..min(xs.len(), (chunk + 1) * 64) {
+            part = part.wrapping_mul(31).wrapping_add(stepped(xs[i]))
+        }
+        alone = alone.wrapping_mul(31).wrapping_add(part)
+        chunk += 1
+    }
+    assert(folded == alone, f"{folded} is {alone}")
+}

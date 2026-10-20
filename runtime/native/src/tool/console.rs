@@ -18,7 +18,8 @@ pub const LINES: usize = 1024;
 /// The most bytes of lines the queue holds.
 pub const BYTES: usize = 4 << 20;
 
-/// What the tool's store holds: the queue's sending end.
+/// What the tool's store holds, and each of its helpers: the queue's sending end.
+#[derive(Clone)]
 pub(crate) struct Console {
     lines: mpsc::SyncSender<String>,
     counts: Arc<Counts>,
@@ -80,16 +81,20 @@ impl Console {
         ))
     }
 
-    /// Queues `line` without waiting: a full queue drops it.
+    /// Queues `line` without waiting: a full queue drops it. The tool's thread and its helpers
+    /// print at once, so a line's bytes are reserved in one step, below the cap, before it's
+    /// queued.
     pub(crate) fn print(&self, line: String) {
         let c = &self.counts;
-        if c.queued_bytes.load(Ordering::Acquire) + line.len() > BYTES {
+        let len = line.len();
+        let reserved = c.queued_bytes.fetch_update(Ordering::AcqRel, Ordering::Acquire, |q| {
+            q.checked_add(len).filter(|&n| n <= BYTES)
+        });
+        if reserved.is_err() {
             c.drop_lines(1);
             return;
         }
-        let len = line.len();
         c.queued.fetch_add(1, Ordering::AcqRel);
-        c.queued_bytes.fetch_add(len, Ordering::AcqRel);
         if self.lines.try_send(line).is_err() {
             c.queued.fetch_sub(1, Ordering::AcqRel);
             c.queued_bytes.fetch_sub(len, Ordering::AcqRel);
@@ -143,6 +148,52 @@ mod tests {
         // One line printed, the rest dropped: those that found the queue full, and the queued.
         assert_eq!(dropped, (LINES * 3 - 1) as u64);
         drop(release);
+    }
+
+    #[test]
+    fn producers_at_once_never_queue_more_than_the_byte_cap() {
+        // A helper prints beside the tool: lines just over half the cap, from 8 threads at once,
+        // with the printer held on its first line. One fits; every other is dropped and counted.
+        for _ in 0..1000 {
+            let (release, held) = mpsc::channel::<()>();
+            let held = Mutex::new(held);
+            let taken = Arc::new(AtomicUsize::new(0));
+            let t = taken.clone();
+            let (console, writer) = Console::start(Arc::new(move |_| {
+                t.fetch_add(1, Ordering::AcqRel);
+                let _ = held.lock().map(|h| h.recv());
+            }))
+            .expect("a console");
+            console.print("first".into());
+            while taken.load(Ordering::Acquire) == 0 {
+                std::thread::yield_now();
+            }
+            let line = "x".repeat(BYTES / 2 + 1);
+            // They spin until all are ready, then print together.
+            let ready = Arc::new(AtomicUsize::new(0));
+            let producers: Vec<_> = (0..8)
+                .map(|_| {
+                    let (console, line, ready) = (console.clone(), line.clone(), ready.clone());
+                    std::thread::spawn(move || {
+                        ready.fetch_add(1, Ordering::AcqRel);
+                        while ready.load(Ordering::Acquire) < 8 {
+                            std::hint::spin_loop();
+                        }
+                        console.print(line);
+                    })
+                })
+                .collect();
+            for p in producers {
+                p.join().expect("a producer");
+            }
+            let c = &console.counts;
+            assert!(c.queued_bytes.load(Ordering::Acquire) <= BYTES, "over the cap");
+            assert_eq!(c.queued.load(Ordering::Acquire), 1, "one line fits");
+            assert_eq!(c.dropped_ever.load(Ordering::Acquire), 7, "the rest are counted");
+            drop(console);
+            drop(release);
+            writer.stop(Duration::from_secs(5));
+        }
     }
 
     #[test]

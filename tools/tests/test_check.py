@@ -82,6 +82,28 @@ class Selection(unittest.TestCase):
             self.assertIn(shown, text)
         self.assertIn('all checks failed', text)
 
+    def test_the_workspaces_suite_runs_alone_after_the_rust_programs(self):
+        # It tests on every core: beside the Rust programs, it overloaded the machine.
+        events = []
+        with tempfile.TemporaryDirectory() as temp, \
+                patch.object(check, 'ROOT', Path(temp)), \
+                patch.object(check, 'build_tests', return_value=['one', 'two']), \
+                patch.object(check, 'program_name', side_effect=str), \
+                patch.object(check, 'call'), \
+                patch.object(check, 'listed', return_value=['test']), \
+                patch.object(check, 'step', side_effect=lambda name, *a: events.append(name)), \
+                patch.object(check, 'rust_run',
+                             side_effect=lambda program, out: events.append(program) or 1), \
+                contextlib.redirect_stdout(io.StringIO()):
+            cwd = Path.cwd()
+            try:
+                self.assertEqual(check.main([]), 0)
+            finally:
+                os.chdir(cwd)
+        self.assertEqual(events[-1], 'wrela-suite')
+        self.assertEqual(events.count('wrela-suite'), 1)
+        self.assertLess(events.index('two'), events.index('wrela-suite'))
+
     def test_tests_run_two_to_six_at_a_time(self):
         for cores, expected in [(None, 2), (1, 2), (4, 2), (10, 5), (12, 6), (64, 6)]:
             with patch.object(os, 'cpu_count', return_value=cores):

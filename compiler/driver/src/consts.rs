@@ -541,7 +541,17 @@ pub fn run_tests(
 /// `run` of each of `items`, on as many threads as the machine has cores: the results in the
 /// items' order. Each test runs in an instance of its own, so one doesn't wait on another.
 pub(crate) fn each_at_once<T: Sync, R: Send>(items: &[T], run: impl Fn(&T) -> R + Sync) -> Vec<R> {
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(items.len());
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    each_on(cores, items, run)
+}
+
+/// [`each_at_once`], on `threads` threads at most.
+pub(crate) fn each_on<T: Sync, R: Send>(
+    threads: usize,
+    items: &[T],
+    run: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let threads = threads.max(1).min(items.len());
     let next = AtomicUsize::new(0);
     let done = Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|s| {

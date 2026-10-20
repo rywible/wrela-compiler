@@ -1028,7 +1028,8 @@ impl<'d, 'u> Collector<'d, 'u> {
     /// [("name", "dir"), ...]`, the programs it may run, each a tool package in a directory of
     /// the test's package; and `read: [("name", "dir"), ...]`, the roots it may read, each a
     /// directory relative to the test's package; `browser: true`, Chrome, on the real clock; and
-    /// `blobs: "8M,64"`, the blob budget, as `wrela tool --blob-budget` takes it. Anything else
+    /// `blobs: "8M,64"`, the blob budget, as `wrela tool --blob-budget` takes it; and `workers:
+    /// n`, its helpers, 0 to `MAX_WORKERS` ([`TOOL_TEST_WORKERS`] unless it says). Anything else
     /// is E0222.
     fn tool_test(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> Option<ToolTest> {
         let mut test = ToolTest {
@@ -1038,6 +1039,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             read: Vec::new(),
             browser: false,
             blobs: None,
+            workers: TOOL_TEST_WORKERS,
         };
         let mut bad: Option<(Span, &str)> = None;
         let mut seen: Vec<&str> = Vec::new();
@@ -1088,6 +1090,19 @@ impl<'d, 'u> Collector<'d, 'u> {
                         bad = bad.or(Some((
                             arg.span,
                             "`blobs` is a blob budget, as `wrela tool --blob-budget` takes it: bytes (`8M`), then `,` and handles",
+                        )))
+                    }
+                },
+                "workers" => match &arg.value.kind {
+                    ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(ast::IntValue::Ok(n)), .. })
+                        if *n <= u64::from(wrela_abi::memory::MAX_WORKERS) =>
+                    {
+                        test.workers = *n as u32;
+                    }
+                    _ => {
+                        bad = bad.or(Some((
+                            arg.span,
+                            "`workers` is how many helpers it has, a whole number from 0 to 8",
                         )))
                     }
                 },
@@ -1169,7 +1184,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 _ => {
                     bad = bad.or(Some((
                         arg.span,
-                        "a tool test takes `budget`, `net`, `run`, `read`, `browser` and `blobs`",
+                        "a tool test takes `budget`, `net`, `run`, `read`, `browser`, `blobs` and `workers`",
                     )))
                 }
             }

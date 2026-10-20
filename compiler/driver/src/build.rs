@@ -36,8 +36,10 @@ pub fn emit(l: &Lowered, sources: &SourceMap, simd: bool, budgets: bool) -> Buil
 }
 
 /// A server's or a tool's build's files (language.md §15.3): its module alone, at
-/// [`SERVER_WASM`] or [`TOOL_WASM`], with a memory of its own (not shared: either runs on one
-/// thread, and its host caps the memory). It has no pipelines and no browser runtime.
+/// [`SERVER_WASM`] or [`TOOL_WASM`]. It has no pipelines and no browser runtime. A server's
+/// memory is its own (not shared: it runs on one thread, and its host caps the memory); a
+/// tool's is imported and shared, as a client's is, so its host's helpers run `std::par`'s
+/// work on it, and may grow to 4 GiB.
 pub fn emit_headless(
     l: &Lowered,
     sources: &SourceMap,
@@ -48,12 +50,10 @@ pub fn emit_headless(
         wrela_sema::defs::Role::Tool => TOOL_WASM,
         _ => SERVER_WASM,
     };
-    // Its own memory, which a tool's may grow to 4 GiB.
-    let max_pages = match role {
-        wrela_sema::defs::Role::Tool => wrela_abi::memory::TOOL_MAX_PAGES,
-        _ => wrela_abi::memory::MAX_PAGES,
-    };
-    let options = wrela_wasm::Options { simd, shared_memory: false, max_pages };
+    let tool = role == wrela_sema::defs::Role::Tool;
+    let max_pages =
+        if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
+    let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages };
     let mut out = emit_in(l, sources, options, false, false);
     out.files.retain(|(path, _)| path == "game.wasm");
     for (path, _) in &mut out.files {

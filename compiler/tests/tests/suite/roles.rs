@@ -294,8 +294,8 @@ fn a_tool_build_has_only_the_tools_code() {
     let mut sorted = tool_exports.clone();
     sorted.sort();
     assert_eq!(sorted, ["memory", "tool", "tool_init"], "{tool_exports:?}");
-    // One thread, its memory its own, and room to grow to 4 GiB less a page.
-    assert!(!tool_shared);
+    // Its memory shared with its helpers (std::par), with room to grow to 4 GiB less a page.
+    assert!(tool_shared);
     assert_eq!(memory_max(tool), Some(65535));
     // The other builds have none of the tool's exports, and the tool isn't paired with them.
     let (client_exports, _) = exports_and_memory(file(&files, "game.wasm"));

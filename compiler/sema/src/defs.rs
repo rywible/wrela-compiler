@@ -706,6 +706,10 @@ pub const TOOL_TEST_BUDGET: f64 = 10.0;
 /// The most a tool test's budget may be: ten minutes.
 pub const MAX_TOOL_TEST_BUDGET: f64 = 600.0;
 
+/// A tool test's helpers unless it says (§13.2): a few, whatever the machine, so its runs are
+/// alike everywhere.
+pub const TOOL_TEST_WORKERS: u32 = 2;
+
 /// `@test(tool, ...)` (§13.2): a `@job fn` run on the package's tool build, in a process of its
 /// own, with a new write root `scratch`, a budget, and fakes for what it reaches.
 #[derive(Clone, Debug, PartialEq)]
@@ -727,6 +731,9 @@ pub struct ToolTest {
     /// The blob budget (`blobs: "8M,64"`, as `wrela tool --blob-budget` takes it), if the test
     /// gives one.
     pub blobs: Option<String>,
+    /// How many helpers run its `std::par` work (`workers: 4`): [`TOOL_TEST_WORKERS`] unless it
+    /// says, at most `wrela_abi`'s `MAX_WORKERS`.
+    pub workers: u32,
 }
 
 /// A GPU frame test's golden (§13): a PNG in the package, by its path, where the path is

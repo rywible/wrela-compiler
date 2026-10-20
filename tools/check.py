@@ -3,9 +3,12 @@
 Every retained test runs, including GPU and browser tests. There are no tiers, remembered
 passes or environment-selected sizes. Compiled artifacts are cached; test results are not.
 
-The suite runs Clippy and the doc tests, then two lanes at once: the other steps, in turn, and
-the Rust test programs, in turn, each running several tests at a time. Every check runs even
-when another fails, and each failure's output is shown at the end.
+The suite runs Clippy and the doc tests, then two lanes at once: the light steps, in turn, and
+the Rust test programs, in turn, each running several tests at a time; then `wrela-suite`
+alone. It runs several members at a time, each testing on every core, so beside the Rust
+programs it loaded a machine of 10 cores to 75 runnable threads, and tests with deadlines in
+real time (Chrome's answers, a tool test's budget) missed them. Every check runs even when
+another fails, and each failure's output is shown at the end.
 
 The workspace's Wrela (wrela.toml: the engine, content, examples, games, studio, ui, docsite,
 platform, console) is checked by one step, `wrela-suite`: `wrela suite`, which formats, allowlists
@@ -39,11 +42,13 @@ SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "comp
            "compiler/tests/tool_tests", "compiler/tests/docs-guide")
 # The toolchain's own packages, whose Wrela names this file runs; any other is the workspace's.
 TOOLCHAIN = ("compiler/", "runtime/")
-# Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
+# Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes; the
+# workspace's suite uses every core, so it runs after them.
 CARGO_STEPS = ("clippy", "doc")
-LIGHT_STEPS = ("rustfmt", "wrela-fmt", "wrela-suite", "tools", "browser-types", "browser-dist",
-               "browser-size", "browser", "wgsl")
-STEPS = CARGO_STEPS + LIGHT_STEPS
+LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",
+               "browser", "wgsl")
+HEAVY_STEPS = ("wrela-suite",)
+STEPS = CARGO_STEPS + LIGHT_STEPS + HEAVY_STEPS
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_WORKER", "WRELA_CONST_CACHE")
 PRINT = threading.Lock()
 
@@ -312,6 +317,8 @@ def suite(wrela, logs):
             results.append(job(program_name(program), logs,
                                lambda out, program=program: counts.append(rust_run(program, out))))
         results += light.result()
+    results += [job(check, logs, lambda out, check=check: step(check, wrela, logs, out))
+                for check in HEAVY_STEPS]
     failures = [(name, failure, log) for name, failure, log in results if failure]
     for name, failure, log in failures:
         print(f"\n== {name}: {failure}\n{log.read_text(errors='replace')}", end="", flush=True)

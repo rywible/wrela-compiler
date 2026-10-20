@@ -87,9 +87,25 @@ struct StopState {
     /// Nanoseconds after `base` from which calls stop; `u64::MAX`: none.
     deadline: std::sync::atomic::AtomicU64,
     base: std::time::Instant,
+    /// Another reason to stop, asked on each epoch ([`Stop::beside`]).
+    also: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    /// Whether it counts in [`TICKING`]: a [`Stop::new`]'s, on [`INTERRUPTIBLE`].
+    ticks: bool,
 }
 
 impl Stop {
+    /// A stop for an engine whose epoch its owner moves on itself (the tool host's: language.md
+    /// §15.5), not stopped, with no deadline: it's also due once `also` says so.
+    pub(crate) fn beside(also: impl Fn() -> bool + Send + Sync + 'static) -> Stop {
+        Stop(Arc::new(StopState {
+            stopped: std::sync::atomic::AtomicBool::new(false),
+            deadline: std::sync::atomic::AtomicU64::new(u64::MAX),
+            base: std::time::Instant::now(),
+            also: Some(Box::new(also)),
+            ticks: false,
+        }))
+    }
+
     /// A stop, not stopped, with no deadline.
     pub fn new() -> Result<Stop> {
         let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -116,6 +132,8 @@ impl Stop {
             stopped: std::sync::atomic::AtomicBool::new(false),
             deadline: std::sync::atomic::AtomicU64::new(u64::MAX),
             base: std::time::Instant::now(),
+            also: None,
+            ticks: true,
         })))
     }
 
@@ -138,6 +156,7 @@ impl Stop {
         s.stopped.load(std::sync::atomic::Ordering::Acquire)
             || s.base.elapsed().as_nanos()
                 >= u128::from(s.deadline.load(std::sync::atomic::Ordering::Acquire))
+            || s.also.as_ref().is_some_and(|also| also())
     }
 
     /// Whether it was stopped ([`Stop::stop`]), not only past a deadline.
@@ -146,7 +165,7 @@ impl Stop {
     }
 
     /// Makes `store`'s calls end when this is due.
-    fn install<T>(&self, store: &mut Store<T>) {
+    pub(crate) fn install<T>(&self, store: &mut Store<T>) {
         let stop = self.clone();
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(move |_| {
@@ -164,6 +183,9 @@ impl Stop {
 
 impl Drop for StopState {
     fn drop(&mut self) {
+        if !self.ticks {
+            return;
+        }
         let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some((count, _, _)) = ticking.as_mut() {
             *count -= 1;
@@ -905,24 +927,81 @@ impl<E> Retired<E> {
     }
 }
 
-/// A program's helper threads: dropping it shuts them down (they see the flag when they wake)
-/// and waits for them.
-struct Helpers {
+/// A program's helper threads (a client build's, or a tool build's: language.md §16.1): dropping
+/// it shuts them down (they see the flag when they wake) and waits for them.
+pub(crate) struct Helpers {
     memory: SharedMemory,
     threads: Vec<std::thread::JoinHandle<()>>,
 }
 
-impl Drop for Helpers {
-    fn drop(&mut self) {
+impl Helpers {
+    /// `count` helpers (at most [`MAX_WORKERS`]) for `module`'s instances on `memory`, each on
+    /// a thread of its own from [`memory::THREAD_HELPER0`], printing and timing into `trace`,
+    /// their calls ending when `stop` is due; none if the module exports no `__worker` (it runs
+    /// no parallel jobs). The memory's [`memory::PAR_HELPERS`] says how many. Each waits `delay`
+    /// before it starts (a tool host's test makes helpers slow to start; else 0). Why they
+    /// can't start, the helpers already started shut down.
+    pub(crate) fn start(
+        module: &Module,
+        memory: &SharedMemory,
+        count: u32,
+        trace: &Trace,
+        stop: Option<&Stop>,
+        delay: std::time::Duration,
+    ) -> std::result::Result<Helpers, String> {
+        let mut helpers = Helpers { memory: memory.clone(), threads: Vec::new() };
+        if module.get_export(EXPORT_WORKER).is_none() {
+            return Ok(helpers);
+        }
+        let controls = memory::PAR_HELPERS as usize + 4;
+        if memory.data().len() < controls {
+            return Err(format!(
+                "it exports `{EXPORT_WORKER}` but its memory is {} bytes; the helpers need at least {controls}",
+                memory.data().len()
+            ));
+        }
+        let n = count.min(MAX_WORKERS);
+        for i in 0..n {
+            let thread = memory::THREAD_HELPER0 + i;
+            let (module, memory, trace) = (module.clone(), memory.clone(), trace.clone());
+            let spawned = spawn_worker(module, memory, thread, trace, stop.cloned(), delay)
+                .map_err(|e| format!("can't start helper {i}: {e}"))?;
+            helpers.threads.push(spawned);
+        }
+        shared::store_u32(memory, memory::PAR_HELPERS, n);
+        Ok(helpers)
+    }
+
+    /// Tells the helpers to return (each sees it once it waits for work) and waits for them:
+    /// with a `grace`, only that long, leaving any still running then. How many it left.
+    pub(crate) fn shut_down(&mut self, grace: Option<std::time::Duration>) -> usize {
         if self.threads.is_empty() {
-            return;
+            return 0;
         }
         shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
         shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
         let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
+        let until = grace.map(|g| std::time::Instant::now() + g);
+        let mut left = 0;
         for t in self.threads.drain(..) {
+            if let Some(until) = until {
+                while !t.is_finished() && std::time::Instant::now() < until {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                if !t.is_finished() {
+                    left += 1;
+                    continue;
+                }
+            }
             let _ = t.join();
         }
+        left
+    }
+}
+
+impl Drop for Helpers {
+    fn drop(&mut self) {
+        self.shut_down(None);
     }
 }
 
@@ -1289,26 +1368,18 @@ impl<E: Executor> Program<E> {
             Err(e) => fail_after_store!(Error::Program(format!("{e:#}"))),
         };
         // The helpers: each its own instance on its own thread, sharing the memory.
-        let has_worker = compiled.module.get_export(EXPORT_WORKER).is_some();
-        let controls = memory::PAR_HELPERS as usize + 4;
-        if has_worker && memory.data().len() < controls {
-            fail_after_store!(Error::Program(format!(
-                "it exports `{EXPORT_WORKER}` but its memory is {} bytes; the helpers need at least {controls}",
-                memory.data().len()
-            )));
-        }
-        let n = if has_worker { workers.clamp(1, MAX_WORKERS + 1) - 1 } else { 0 };
-        let threads = (0..n)
-            .map(|i| {
-                let thread = memory::THREAD_HELPER0 + i;
-                let stop = compiled.stop.clone();
-                spawn_worker(compiled.module.clone(), memory.clone(), thread, trace.clone(), stop)
-            })
-            .collect();
-        if has_worker {
-            crate::shared::store_u32(&memory, memory::PAR_HELPERS, n);
-        }
-        let helpers = Helpers { memory: memory.clone(), threads };
+        let n = workers.clamp(1, MAX_WORKERS + 1) - 1;
+        let helpers = match Helpers::start(
+            &compiled.module,
+            &memory,
+            n,
+            &trace,
+            compiled.stop.as_ref(),
+            std::time::Duration::ZERO,
+        ) {
+            Ok(h) => h,
+            Err(why) => fail_after_store!(Error::Program(why)),
+        };
         let program = Program {
             store,
             instance,
@@ -2120,8 +2191,12 @@ fn spawn_worker(
     thread: u32,
     trace: Trace,
     stop: Option<Stop>,
-) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || {
+    delay: std::time::Duration,
+) -> std::io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new().name(format!("wrela-helper-{thread}")).spawn(move || {
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
         let run = || -> wasmtime::Result<()> {
             let (mut store, instance) =
                 other_instance(&module, &memory, "a helper", &trace, stop.as_ref())?;
@@ -2367,9 +2442,14 @@ fn kept<E: Executor>(
 /// and every build a hot reload swaps in, so the clock never goes back.
 static CLOCK_ZERO: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
 
+/// The clock (`wrela.clock`): the seconds since [`CLOCK_ZERO`], the same on every thread.
+pub(crate) fn clock_seconds() -> f64 {
+    CLOCK_ZERO.elapsed().as_secs_f64()
+}
+
 /// Writes the clock (`wrela.clock`): the seconds since [`CLOCK_ZERO`], an `f64`, at `ptr`.
 fn write_clock(memory: &SharedMemory, ptr: u32) -> wasmtime::Result<()> {
-    let seconds = CLOCK_ZERO.elapsed().as_secs_f64();
+    let seconds = clock_seconds();
     if !shared::write(memory, ptr as usize, &seconds.to_le_bytes()) {
         return Err(wasmtime::format_err!(
             "clock({ptr}) reaches past the end of the program's memory"

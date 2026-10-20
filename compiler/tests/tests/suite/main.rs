@@ -72,6 +72,7 @@ mod tool;
 mod tool_browser;
 mod tool_image;
 mod tool_serve;
+mod tool_threads;
 mod transport;
 mod unroll;
 mod warnings;

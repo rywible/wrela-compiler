@@ -1,13 +1,13 @@
 //! `wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
 //! [--net HOST]... [--allow-run NAME[=PATH|=tool:DIR]]... [--browser] [--timeout S]
-//! [--blob-budget B] [-- args...]`: builds the package's tool build and runs it on the native host's tool profile
+//! [--workers N] [--blob-budget B] [-- args...]`: builds the package's tool build and runs it on the native host's tool profile
 //! (language.md §15.5, `wrela_host::tool`), with what the command line grants it and nothing
 //! else. A `tool:` program is run by this same executable, as `wrela tool`.
 //!
 //! `wrela tool <name> [grants...] [-- args...]` runs the tool that the workspace at or above the
 //! current directory declares as `[tools.<name>]` (language.md §3.6): its package's tool build,
 //! with the grants the workspace declares, its paths from the workspace's directory. The
-//! command line may only narrow them ([`narrowed`]). A path to a package keeps working as
+//! command line may only narrow them, and its `timeout` and `workers` ([`narrowed`]). A path to a package keeps working as
 //! before; a word that names a tool is the tool, else a directory.
 //!
 //! `wrela tool --test <dir>` runs one tool test (§13.2), as `wrela test` asks: the test's
@@ -46,6 +46,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     let mut grants = Grants { tool_runner: std::env::current_exe().ok(), ..Grants::default() };
     let mut timeout = None;
+    let mut workers = None;
     let mut budget = BlobBudget::default();
     let mut dir = None;
     let mut tool_args = Vec::new();
@@ -73,6 +74,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 | "--net"
                 | "--allow-run"
                 | "--timeout"
+                | "--workers"
                 | "--blob-budget"
         ) {
             return crate::unknown(a);
@@ -93,6 +95,7 @@ pub fn run(args: &[String]) -> ExitCode {
                 .ok_or_else(|| {
                     format!("--timeout takes seconds the clock can reach, not `{value}`")
                 }),
+            "--workers" => parse_workers(value).map(|n| workers = Some(n)),
             "--blob-budget" => BlobBudget::parse(value).map(|b| budget = b),
             _ => grants.parse(flag, value).map(|_| ()),
         };
@@ -115,6 +118,13 @@ pub fn run(args: &[String]) -> ExitCode {
             let most = tool.timeout.map(Duration::from_secs);
             match narrowed(&declared, grants, timeout, most) {
                 Ok((g, t)) => (grants, timeout) = (g, t),
+                Err(why) => {
+                    eprintln!("error: the tool `{}`: {why}", tool.name);
+                    return ExitCode::from(2);
+                }
+            }
+            match fewer_workers(workers, tool.workers) {
+                Ok(n) => workers = n,
                 Err(why) => {
                     eprintln!("error: the tool `{}`: {why}", tool.name);
                     return ExitCode::from(2);
@@ -183,6 +193,9 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut options = Options::new(caps);
     options.args = tool_args;
     options.timeout = timeout;
+    if let Some(n) = workers {
+        options.workers = n;
+    }
     options.blob_budget = budget;
     options.interrupt = Some(interrupt);
     // A supervisor (a tool test's) that must be able to kill this tool's programs names a file
@@ -197,6 +210,27 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     // Ends the process here, so a worker still past its grace (the end says so) can't outlive it.
     std::process::exit(i32::from(ended.end.status()))
+}
+
+/// `--workers N`: how many helpers run `std::par`'s work beside the tool's thread, 0 to
+/// `wrela_abi`'s `MAX_WORKERS`.
+fn parse_workers(value: &str) -> Result<u32, String> {
+    let most = wrela_abi::memory::MAX_WORKERS;
+    value.parse::<u32>().ok().filter(|n| *n <= most).ok_or_else(|| {
+        format!("--workers takes a number of helpers from 0 to {most}, not `{value}`")
+    })
+}
+
+/// The helpers of a run of a declared tool: the command line's `--workers` (`given`), which
+/// may only lower what the workspace declares (`most`); else the declared number; else `None`,
+/// the host's default.
+fn fewer_workers(given: Option<u32>, most: Option<u32>) -> Result<Option<u32>, String> {
+    match (given, most) {
+        (Some(n), Some(m)) if n > m => Err(format!(
+            "`--workers {n}` widens its grants: the workspace gives it {m} helpers at most"
+        )),
+        (n, m) => Ok(n.or(m)),
+    }
 }
 
 /// The tool that `arg` names, if it's a name rather than a path: a word of letters, digits, `_`
@@ -398,6 +432,7 @@ fn test(dir: &std::path::Path) -> ExitCode {
                 }
             }
             options.entries = (spec.init.clone(), spec.resume.clone());
+            options.workers = spec.workers;
             options.fake_clock = Some((spec.utc, 0));
             // A live browser keeps the system's time: the clock doesn't jump past its page.
             options.real_clock = spec.browser;

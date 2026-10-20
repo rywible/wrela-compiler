@@ -109,6 +109,12 @@ pub fn tool() -> u32 {
 "#;
     let dir = package("tool-loop", &[("wrela.toml", &manifest("tool_loop")), ("main.wrela", main)]);
     let started = std::time::Instant::now();
+    // Helpers are 0 to 8.
+    for bad in ["9", "-1", "two"] {
+        let out = wrela().arg("tool").arg(&dir).args(["--workers", bad]).output().expect("run");
+        assert_eq!(out.status.code(), Some(2), "--workers {bad}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--workers takes"), "{bad}");
+    }
     let out = wrela().arg("tool").arg(&dir).args(["--timeout", "0.3"]).output().expect("run");
     assert_eq!(out.status.code(), Some(124), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(String::from_utf8_lossy(&out.stderr).contains("ran past its timeout"));
@@ -782,10 +788,10 @@ fn a_named_tool_runs_with_the_grants_its_workspace_declares() {
 
 #[test]
 fn the_command_line_may_narrow_a_named_tools_grants_and_never_widen_them() {
-    let ws = copy_workspace("tool-narrow", "net = [\"a.example\"]\nrun = [\"ls\"]\n");
+    let ws = copy_workspace("tool-narrow", "net = [\"a.example\"]\nrun = [\"ls\"]\nworkers = 2\n");
     let at = |p: &str| ws.join(p).canonicalize().expect("a directory").display().to_string();
     std::fs::create_dir_all(ws.join("data/out/sub")).expect("mkdir");
-    // Narrower: a root below the declared one, no secret, a shorter timeout.
+    // Narrower: a root below the declared one, no secret, a shorter timeout, fewer helpers.
     let read = format!("in={}", at("data/in/sub"));
     let write = format!("out={}", at("data/out/sub"));
     let (status, out) = named(
@@ -795,7 +801,19 @@ fn the_command_line_may_narrow_a_named_tools_grants_and_never_widen_them() {
     assert_eq!(status, Some(64), "the tool ran, with no arguments: {out}");
     let (status, out) = named(
         &ws,
-        &["copy", "--read", &read, "--write", &write, "--timeout", "30", "--", "notes.txt"],
+        &[
+            "copy",
+            "--read",
+            &read,
+            "--write",
+            &write,
+            "--timeout",
+            "30",
+            "--workers",
+            "1",
+            "--",
+            "notes.txt",
+        ],
     );
     assert_eq!(status, Some(1), "{out}");
     assert!(out.is_empty(), "no secret was granted: {out}");
@@ -817,6 +835,7 @@ fn the_command_line_may_narrow_a_named_tools_grants_and_never_widen_them() {
         (&["--allow-run", "cat"], "`--allow-run cat`"),
         (&["--allow-run", "ls=/bin/cat"], "`--allow-run ls=...`"),
         (&["--timeout", "61"], "`--timeout 61`"),
+        (&["--workers", "3"], "`--workers 3`"),
     ] {
         let mut all = vec!["copy"];
         all.extend(args);
