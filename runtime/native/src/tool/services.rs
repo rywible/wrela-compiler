@@ -283,9 +283,12 @@ pub(crate) enum Work {
     /// Answered by a worker of the pool for long waits (HTTP, programs), so that a slow
     /// network or program never holds up files.
     Long(Task),
-    /// Answered by a worker of the pool for the compiler and driven builds, whose work takes
-    /// seconds to minutes: so it holds up neither files nor the network.
+    /// Answered by a worker of the pool for the compiler and images, whose work takes seconds
+    /// to minutes: so it holds up neither files nor the network.
     Heavy(Task),
+    /// Answered by a worker of the pool for driven builds, so a tool that drives several
+    /// instances at once runs them at once, and a build's calls never wait for the compiler.
+    Drive(Task),
     /// Answered by a worker of the pool for long waits, but given to the tool only once this
     /// much of a test's fake time has passed since the request: a fake site's delay.
     Held(Duration, Task),

@@ -519,7 +519,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             Ok((load, deadline)) => {
                 let task: Task =
                     Box::new(move |s, request| loaded(s, request, load, entered + deadline));
-                Work::Heavy(task)
+                Work::Drive(task)
             }
             Err(why) => failed(why),
         };
@@ -579,13 +579,13 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
     match parsed {
         Ok((handle, None, _)) => {
             let task: Task = Box::new(move |s, _| closed(s, handle));
-            Work::Heavy(task)
+            Work::Drive(task)
         }
         Ok((handle, Some(command), deadline)) => {
             let task: Task = Box::new(move |s, request| {
                 operate(s, request, handle, command, entered + deadline, deadline)
             });
-            Work::Heavy(task)
+            Work::Drive(task)
         }
         Err(why) => failed(why),
     }

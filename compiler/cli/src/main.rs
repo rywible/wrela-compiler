@@ -54,11 +54,6 @@
 //! wrela audio <package-dir> <action> [...] a piece's voice as files and numbers: wav,
 //!                                         describe, numbers, midi, sheet, speed; and
 //!                                         `wrela audio partials <wav> --key k`
-//! wrela reference replica <parts> -o <dir> [--engine <dir>] [--harmonics k]
-//!     [--sections-every m] [--seam m]     a reference mesh as a package of lofts, maybe
-//!                                         compressed
-//! wrela reference deviation <parts> <package-dir> [--points n] [--json]
-//!                                         how far a package's surface is from the mesh's
 //! wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
 //!     [--timeout S] [--blob-budget B] [-- args...]
 //!                                         build the package's tool and run it with those
@@ -91,18 +86,15 @@ mod explain;
 mod export;
 mod fix;
 mod fmt;
-mod mesh;
 mod pipelines;
 mod primer;
 mod profile;
 mod query;
 mod refactor;
-mod reference;
 mod run;
 mod script;
 mod solve;
 mod suite;
-mod sweeps;
 mod test;
 mod tool;
 mod toolchain;
@@ -129,8 +121,6 @@ pub(crate) fn usage() -> ExitCode {
         "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
-        "wrela reference replica <parts.toml> -o <out-dir> [--engine <dir>] [--harmonics k] [--sections-every m] [--seam m]",
-        "wrela reference deviation <parts.toml> <package-dir> [--points n] [--json]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--blob-budget B] [-- args...]",
@@ -184,7 +174,6 @@ fn main() -> ExitCode {
         "run" => run::run(rest),
         "tool" => tool::run(rest),
         "audio" => audio::run(rest),
-        "reference" => reference::run(rest),
         "solve" => solve::run(rest),
         "script" => script::run(rest),
         "primer" => primer::run(rest),

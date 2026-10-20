@@ -1604,7 +1604,7 @@ wrela tool <package> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME].
 - A tool build has one thread, and no GPU, ticker or voice. Its memory may grow to 4 GiB. A call has no deadline: a tool may compute for a long time between requests.
 - `--timeout` is a budget for the whole run (status 124); a time that the clock cannot reach is a usage error (status 2). Ctrl-C stops the tool, also inside a call (status 130). A trap, or a status that is not `RUNNING` or 0 to 255, gives status 70. If the host cannot run the tool, or cannot stop it (it cannot take Ctrl-C, or cannot start the thread that interrupts calls), the status is 71, and no Wasm runs.
 - `print` never waits either. The host puts each line on a queue (at most 1024 lines and 4 MiB), and a thread of its own writes them out. A line that finds the queue full is dropped, and the host prints how many it dropped when the console takes lines again. When the tool ends, the console has the same grace as the workers to take what is queued; lines it does not take are dropped. So a console that nobody reads, such as a full pipe, cannot stop `--timeout` or Ctrl-C, and the host's last message cannot hold up the end.
-- Services run on the host's worker threads, so a call never waits for one. An answer reaches the tool no sooner than its next call, as on every host (§17.1).
+- Services run on the host's worker threads, so a call never waits for one. An answer reaches the tool no sooner than its next call, as on every host (§17.1). The workers are bounded: 4 for files and blobs, 4 for the network and programs, 4 for the compiler and images (so at most 4 builds at once), and one per core, from 4 to 16, for driven builds' work (so a tool that drives several instances of a build runs that many at once).
 - However the tool ends, the host stops its workers and releases all that the tool held. Work that has not started is dropped, and work in progress has a grace of 5 s. A worker that waits for a program kills the program's process group, one that waits for an HTTP response shuts its connection down and waits for its client's thread, and one that waits for the toolchain or an image cancels its work. Every driven build's calls are stopped, and then each build and each server is closed, with the same grace: a server's listener and connections are shut and its threads joined, so its port is closed when the run ends. If a worker is still running after the grace, the run is the host's failure (status 71), whatever the tool's own end was, and `wrela tool` ends the process, so no work outlives it. No file work holds the lock on the tool's blobs, so their release never waits on a file.
 - A resource that a request makes belongs to that request until the tool reads the answer. If the tool ends first, the host releases it with the rest. The host keeps no compiled code from one run to the next.
 
@@ -2872,8 +2872,6 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames and prints what the exports say after each frame (`--csv`) |
-| `wrela reference replica <parts> -o <dir>` | Writes a replica of a reference mesh as a package: a skeleton, and a loft or a sweep for each part (below) |
-| `wrela reference deviation <parts> <package>` | Measures how far a package's surface is from the mesh's surface (below) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |
@@ -2889,30 +2887,6 @@ These commands let an agent read what the compiler knows about a package, instea
 It also answers on a program with errors. A function whose body has an error has no memory IR, so what it calls, borrows and does is not known. An answer that such a function, or an error outside every body, could change lists those errors as `unsure`.
 
 **`wrela refactor`** plans the change and checks the new texts before it writes anything. It refuses the change, with the errors, if the program would not check, and refuses it if a call would quietly bind to another function. `--dry-run --json` gives a plan with each file's hash; `apply <plan>` refuses the plan if a file has changed since.
-
-**`wrela reference replica <parts> -o <dir>`** builds the replica from a parts file:
-
-- The parts file names a mesh's manifest in `references/`, landmarks, and each part's axis, angles, station spacing and longest radius. The file's top gives defaults. The manifest's `axes`, `origin` and `metres_per_unit` place the mesh in a creature's frame, and the package carries the manifest's `attribution`.
-- Each axis runs 2 cm past its ends (`overlap`) and is then trimmed to the mesh, so parts that meet at a joint overlap. At an end inside another part, the part sinks by up to `taper` toward its cap, so it passes under its neighbour instead of ending in a step.
-- A radius is where a ray from the axis leaves the mesh: where the ray's winding number falls to 0. So the ray passes surfaces inside the mesh where a sculpt crosses itself. A radius held at the longest (its ray ran into another part) is filled from the measured radii around it.
-- Radii are integers, in tenths of a millimetre, so a lifted build does not lift them.
-- `--harmonics k --sections-every m` compresses each table:
-  - Each section is a Fourier series of `k` harmonics, and each coefficient is a Catmull–Rom curve through a control section every `m` metres.
-  - The coefficients are fitted to the measured radii by least squares; a radius held at the longest is free.
-  - Where no other part reaches a radius's point (or the points halfway to the next radii), the fit is held up to the measured radius. So the compressed parts leave no crack where the dense parts left none.
-  - The command reports how many numbers the compact form takes.
-- A part with `sections = k` is a sweep (`engine::sweep`) along a path from `from` through `through` (landmarks) to `to`, with `k` control sections of `bumps` bumps (4 unless the part says otherwise) and domes `ends` long:
-  - Its radii are measured in its own planes every `spacing`. Each radius is the part's own surface, or shared: another part, as measured, holds its point (the ray ran on along that part).
-  - Each station's section is fitted alone, outward from the station with the most of its own surface, each from its neighbour's, so a bump follows its feature.
-  - The control sections are fitted to those sections by least squares, then all at once: own radii in full, shared radii only where the fit passes them.
-  - Where no fitted part reaches 2.5 mm inside a measured radius, the radius is held to within 2 mm and its part is fitted again, the parts that came nearest first.
-- `--seam m` joins every part with a seam `m` wide.
-
-**`wrela reference deviation <parts> <package>`** reports:
-
-- at points spread over the mesh's surface (skipping surfaces inside it), how far short of the mesh the package is, or how far past it outward: the shares within 2 mm and 5 mm, and the mean, by part, with the worst places;
-- the volumes inside one and not the other;
-- rays from five views (the two sides, the top, the front and a three-quarter view, one every 2 mm) that pass through the mesh but meet nothing of the package, inside its outline or at its rim: places where a viewer would see through it.
 
 **`wrela profile`** builds the program as `wrela build` builds it and runs it on the native host's GPU. It reports:
 

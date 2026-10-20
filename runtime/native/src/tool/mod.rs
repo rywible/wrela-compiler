@@ -82,11 +82,20 @@ const EPOCH: Duration = Duration::from_millis(10);
 const WAKE: Duration = Duration::from_millis(20);
 
 /// The worker threads that carry out files and blobs, those that wait on the network and on
-/// programs, and those that wait on the compiler and driven builds: three pools, so that a long
-/// wait never holds up a file, and a build never holds up the network.
+/// programs, those that wait on the compiler and images, and those that run driven builds' work:
+/// four pools, so that a long wait never holds up a file, a build never holds up the network,
+/// and a driven build's calls never wait for the compiler. Four compile at once at most; driven
+/// builds run as many at once as the machine has cores, from 4 to `MOST_DRIVE_WORKERS`
+/// (`drive_workers`), so a tool that drives several instances of a build uses the machine.
 const WORKERS: usize = 4;
 const LONG_WORKERS: usize = 4;
 const HEAVY_WORKERS: usize = 4;
+const MOST_DRIVE_WORKERS: usize = 16;
+
+/// The drive pool's workers: one per core the machine has, from 4 to `MOST_DRIVE_WORKERS`.
+fn drive_workers() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get().clamp(4, MOST_DRIVE_WORKERS))
+}
 
 /// How long, once the tool has ended, the host waits for work in progress to finish.
 const GRACE: Duration = Duration::from_secs(5);
@@ -486,24 +495,26 @@ impl Pool {
     }
 }
 
-/// The three pools of workers: files and blobs, long waits (HTTP, programs), and heavy work
-/// (the compiler, driven builds).
+/// The four pools of workers: files and blobs, long waits (HTTP, programs), heavy work (the
+/// compiler, images) and driven builds.
 struct Pools {
     files: Pool,
     long: Pool,
     heavy: Pool,
+    drive: Pool,
 }
 
 impl Pools {
-    /// Stops all three, their work in progress sharing one `grace`: how many workers are left.
+    /// Stops all four, their work in progress sharing one `grace`: how many workers are left.
     fn stop(self, grace: Duration) -> usize {
         let until = Instant::now() + grace;
-        let Pools { mut files, mut long, mut heavy } = self;
+        let Pools { mut files, mut long, mut heavy, mut drive } = self;
         // All are told first, so none's work waits on another's grace.
         files.close();
         long.close();
         heavy.close();
-        heavy.stop(until) + long.stop(until) + files.stop(until)
+        drive.close();
+        drive.stop(until) + heavy.stop(until) + long.stop(until) + files.stop(until)
     }
 }
 
@@ -628,6 +639,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         files: Pool::start(&services, &done, "files", WORKERS),
         long: Pool::start(&services, &done, "long", LONG_WORKERS),
         heavy: Pool::start(&services, &done, "heavy", HEAVY_WORKERS),
+        drive: Pool::start(&services, &done, "drive", drive_workers()),
     };
     drop(done);
     let (console, writer) = match Console::start(print) {
@@ -929,6 +941,7 @@ impl Run<'_> {
                 Work::Worker(task) => self.pools.files.send(request, task),
                 Work::Long(task) => self.pools.long.send(request, task),
                 Work::Heavy(task) => self.pools.heavy.send(request, task),
+                Work::Drive(task) => self.pools.drive.send(request, task),
                 Work::Held(after, task) => {
                     self.due.insert(request, self.now() + after);
                     self.pools.long.send(request, task);
@@ -1189,4 +1202,18 @@ fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
         },
     )?;
     Ok(linker)
+}
+
+#[cfg(test)]
+mod pool_tests {
+    /// The compiler's pool stays at 4, whatever the machine; driven builds get a worker per
+    /// core, 4 to 16.
+    #[test]
+    fn compiles_are_bounded_and_drives_follow_the_cores() {
+        assert_eq!(super::HEAVY_WORKERS, 4);
+        let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let drive = super::drive_workers();
+        assert_eq!(drive, cores.clamp(4, super::MOST_DRIVE_WORKERS));
+        assert!((4..=16).contains(&drive));
+    }
 }
