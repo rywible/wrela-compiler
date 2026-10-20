@@ -24,8 +24,7 @@ pub struct BuildOutput {
 }
 
 /// A pipeline's WGSL at most, in bytes: what a browser compiles while the scene loads (spike 13).
-/// How long a scene's pipelines take to create isn't counted here but measured, cold, in Chrome
-/// (`clearing::the_clearing_is_playable_cold_within_its_budget`).
+/// How long a scene's pipelines take to create isn't counted here.
 pub const MAX_WGSL_BYTES: usize = 256 * 1024;
 
 /// Runs the back ends over a lowered program. `sources` names the locations a trap reports.

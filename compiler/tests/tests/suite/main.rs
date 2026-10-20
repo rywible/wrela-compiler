@@ -9,10 +9,8 @@ mod bounds;
 mod buffers;
 mod channels;
 mod closed_list;
-mod clusters;
 mod codes;
 mod conformance;
-mod console;
 mod consts;
 mod derive;
 mod diagnostics;
@@ -29,7 +27,6 @@ mod herd;
 mod input;
 mod keys;
 mod language;
-mod last_green;
 mod lift;
 mod limits;
 mod lipschitz;
@@ -43,7 +40,6 @@ mod noise;
 mod numerics;
 mod optimize;
 mod parallel;
-mod piano;
 mod reload;
 mod render;
 mod renderer;
@@ -58,11 +54,9 @@ mod sketches;
 mod snapshots;
 mod spike13;
 mod stage;
-mod stair;
 mod std_docs;
 mod subjects;
 mod test_items;
-mod text;
 mod threads;
 mod tool;
 mod tool_browser;
@@ -96,17 +90,6 @@ fn scratch_root() -> PathBuf {
 fn package(name: &str, text: &str) -> PathBuf {
     let dir = scratch(name);
     std::fs::write(dir.join("main.wrela"), with_frame(text)).expect("write main.wrela");
-    dir
-}
-
-/// [`package`], named `name` in its manifest, which depends on the engine (engine/).
-fn engine_package(dir: &str, name: &str, text: &str) -> PathBuf {
-    let dir = package(dir, text);
-    let engine = wrela_tests::repo_root().join("engine").display().to_string();
-    let manifest = format!(
-        "[package]\nname = \"{name}\"\n\n[dependencies]\nengine = {{ path = {engine:?} }}\n"
-    );
-    std::fs::write(dir.join("wrela.toml"), manifest).expect("write wrela.toml");
     dir
 }
 

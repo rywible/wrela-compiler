@@ -30,6 +30,11 @@
 //! reserved before it's read back; and a recording build's commands, decoded, as many as an
 //! answer holds, the rest kept for the next `commands`.
 //!
+//! **A GPU build hands over to the builds beside it** (`std::reload`): each is opened through
+//! the grants by its root path, from the running build's (none outside the root), and compiled
+//! to be stopped as the first was. `running` says which runs. A load can name its storage, a
+//! write root's directory, which stays when the build closes.
+//!
 //! **No compiled code is kept or read**: each `load` compiles the build's WASM, which the host
 //! reads through the grants, as it reads the build's other files. The build's storage is a
 //! directory of the host's own, removed when the build closes.
@@ -140,8 +145,9 @@ impl Driven {
 
 /// How a build is loaded: with a GPU or on the CPU alone, its screen's size, its frames' rate,
 /// how many threads run its parallel jobs (0: one per core), how its GPU work is timed, and how
-/// long each helper holds a job's result back (microseconds: a test's slow jobs), and whether
-/// it records the commands it submits (`commands`).
+/// long each helper holds a job's result back (microseconds: a test's slow jobs), whether it
+/// records the commands it submits (`commands`), and where its storage is (a write root's
+/// directory, kept; empty: a directory of the host's, removed with the build).
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 struct Load {
@@ -154,6 +160,7 @@ struct Load {
     timing: crate::Timing,
     hold: u32,
     record: bool,
+    storage: String,
 }
 
 /// An operation of a driven build's.
@@ -172,6 +179,8 @@ enum Command {
     ReadBuffer(u32),
     /// The commands it recorded since the last time.
     Commands,
+    /// The root path of the build that runs: after a hand-over, the one handed over to.
+    Running,
     Hash,
     Logs,
     Phases,
@@ -193,6 +202,7 @@ impl Command {
             Command::Buffers => "buffers",
             Command::BufferSize(..) | Command::ReadBuffer(..) => "read_buffer",
             Command::Commands => "commands",
+            Command::Running => "running",
             Command::Hash => "hash",
             Command::Logs => "logs",
             Command::Phases => "phases",
@@ -215,6 +225,7 @@ enum Reply {
     Bytes(Vec<u8>),
     /// The commands, and how many wait for the next.
     Commands(Vec<Recorded>, usize),
+    Text(String),
     Hash(u64),
     Logs(Vec<String>, usize),
     Phases(Vec<crate::Phase>),
@@ -273,8 +284,10 @@ struct Actor {
 }
 
 /// A command a build recorded, as `commands` gives it: its opcode's name; a label's name; the
-/// name of the pipeline a dispatch or draw uses; a dispatch's workgroups; and the buffers it
-/// binds (each one's handle, offset and size; 0 for the whole).
+/// name of the pipeline a dispatch or draw uses; a dispatch's workgroups; the buffers it binds
+/// (each one's handle, offset and size; 0 for the whole); what a host-facing command names (a
+/// storage path, a fetch's or a post's URL, a host request's service, a build's path); and the
+/// bytes a storage write, a post or a host request carries.
 #[derive(Default)]
 struct Recorded {
     kind: &'static str,
@@ -282,6 +295,8 @@ struct Recorded {
     pipeline: String,
     groups: [u32; 3],
     bindings: Vec<[u32; 3]>,
+    target: String,
+    bytes: Vec<u8>,
 }
 
 impl Recorded {
@@ -298,6 +313,16 @@ impl Recorded {
             C::Dispatch { pipeline, groups, bindings, .. } => {
                 (r.pipeline, r.groups, r.bindings) = (named(*pipeline), *groups, bound(bindings));
             }
+            C::StorageRead { path, .. }
+            | C::Fetch { url: path, .. }
+            | C::Prepare { path, .. }
+            | C::Unprepare { path }
+            | C::HandOver { path, .. } => r.target = bounded(path),
+            C::StorageWrite { path, data: bytes, .. }
+            | C::Post { url: path, body: bytes, .. }
+            | C::HostRequest { service: path, body: bytes, .. } => {
+                (r.target, r.bytes) = (bounded(path), bytes.to_vec());
+            }
             C::Draw { pipeline, bindings, .. }
             | C::DispatchIndirect { pipeline, bindings, .. }
             | C::DrawIndirect { pipeline, bindings, .. }
@@ -311,7 +336,13 @@ impl Recorded {
 
     /// Its bytes in an answer.
     fn size(&self) -> usize {
-        self.kind.len() + self.label.len() + self.pipeline.len() + 28 + 12 * self.bindings.len()
+        self.kind.len()
+            + self.label.len()
+            + self.pipeline.len()
+            + self.target.len()
+            + self.bytes.len()
+            + 36
+            + 12 * self.bindings.len()
     }
 }
 
@@ -503,6 +534,13 @@ impl Actor {
             c @ (Command::Buffers | Command::BufferSize(_) | Command::ReadBuffer(_)) => {
                 return self.buffer_op(c);
             }
+            Command::Running => {
+                return Ok(Reply::Text(match &self.host {
+                    Hosted::Cpu(_) => self.load.path.clone(),
+                    #[cfg(feature = "gpu")]
+                    Hosted::Gpu(host) => host.driven_at().unwrap_or(&self.load.path).to_string(),
+                }));
+            }
             Command::Commands => {
                 if !self.load.record {
                     return Err("the build wasn't loaded to record its commands (`record`)".into());
@@ -510,7 +548,11 @@ impl Actor {
                 let batches = match &mut self.host {
                     Hosted::Cpu(host) => host.take_batches(),
                     #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.take_batches(),
+                    Hosted::Gpu(host) => {
+                        // The build that runs names the pipelines: after a hand-over, another.
+                        self.pipelines = host.pipeline_names();
+                        host.take_batches()
+                    }
                 };
                 for batch in &batches {
                     let commands = wrela_abi::stream::decode(batch)
@@ -524,6 +566,19 @@ impl Actor {
                 // As many as an answer holds, the oldest first; the rest wait for the next.
                 let mut given = Vec::new();
                 let mut bytes = 0;
+                // A command no answer holds is dropped, and this answer fails, saying so: an
+                // observation is whole or isn't given.
+                if let Some(r) = self.recorded.front()
+                    && r.size() > MOST_BYTES
+                {
+                    let why = format!(
+                        "a recorded `{}` of {} bytes is more than an answer holds, so it's dropped",
+                        r.kind,
+                        r.size()
+                    );
+                    self.recorded.pop_front();
+                    return Err(why);
+                }
                 while let Some(r) = self.recorded.front() {
                     let size = r.size();
                     if given.len() == MOST_COMMANDS
@@ -663,7 +718,7 @@ impl Actor {
 /// The host for `load`, made on the build's own thread: its directory opened through the grants
 /// once, now, and its files and its program's fetches read through that handle alone.
 fn start(
-    s: &Services,
+    s: &Arc<Services>,
     load: &Load,
     stop: crate::Stop,
     storage: PathBuf,
@@ -681,7 +736,19 @@ fn start(
                 record: load.record,
                 ..crate::Options::default()
             };
-            let mut host = crate::Host::load_driven(handle, &dir, stop, &options)
+            // It hands over to the builds it names beside it, each opened through the grants,
+            // as its own directory was: the tool's services held weakly, so the host doesn't
+            // keep them past the tool's end.
+            let weak = Arc::downgrade(s);
+            let beside = crate::Beside {
+                at: load.path.clone(),
+                open: Arc::new(move |root: &str| match weak.upgrade() {
+                    Some(services) => services.caps.open_dir(root),
+                    None => Err("the tool has ended".into()),
+                }),
+                stop: stop.clone(),
+            };
+            let mut host = crate::Host::load_driven(handle, &dir, stop, &options, Some(beside))
                 .map_err(|e| e.to_string())?;
             // Only if asked: the word is the jobs' protocol's, which a program without jobs may
             // keep other bytes in.
@@ -743,6 +810,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             };
             let hold = b.u32()?;
             let record = b.u8()? != 0;
+            let storage = b.str()?;
             if !(fps.is_finite() && fps > 0.0) {
                 return Err(format!("frames' rate is more than 0, not {fps}"));
             }
@@ -752,7 +820,8 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             if workers > wrela_abi::memory::MAX_WORKERS + 1 {
                 return Err(format!("at most {} workers", wrela_abi::memory::MAX_WORKERS + 1));
             }
-            let load = Load { path, gpu, width, height, fps, workers, timing, hold, record };
+            let load =
+                Load { path, gpu, width, height, fps, workers, timing, hold, record, storage };
             Ok((load, deadline(b)?))
         })();
         return match parsed {
@@ -787,6 +856,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             "buffers" => Command::Buffers,
             "read_buffer" => Command::ReadBuffer(b.u32()?),
             "commands" => Command::Commands,
+            "running" => Command::Running,
             "hash" => Command::Hash,
             "logs" => Command::Logs,
             "phases" => Command::Phases,
@@ -910,9 +980,19 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
         d.next += 1;
         d.next
     };
-    let storage = match s.work_dir() {
-        Ok(dir) => dir.join(format!("drive-{handle}")),
-        Err(why) => return super::services::answer(Err(why)),
+    // The build's storage: a write root's directory the tool names, which it keeps, or a
+    // directory of the host's, removed with the build.
+    let owned = load.storage.is_empty();
+    let storage = if owned {
+        match s.work_dir() {
+            Ok(dir) => dir.join(format!("drive-{handle}")),
+            Err(why) => return super::services::answer(Err(why)),
+        }
+    } else {
+        match s.caps.dir_path(&load.storage, true) {
+            Ok(dir) => dir,
+            Err(why) => return super::services::answer(Err(format!("the build's storage: {why}"))),
+        }
     };
     let (commands, received) = mpsc::channel::<Sent>();
     let (sent, reply) = mpsc::channel();
@@ -928,7 +1008,9 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
                 Ok(h) => h,
                 Err(why) => {
                     let _ = sent.send(Err(why));
-                    let _ = std::fs::remove_dir_all(&dir);
+                    if owned {
+                        let _ = std::fs::remove_dir_all(&dir);
+                    }
                     return;
                 }
             };
@@ -946,7 +1028,9 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
             };
             if sent.send(Ok(Reply::Loaded(since.elapsed().as_secs_f64()))).is_err() {
                 drop(actor);
-                let _ = std::fs::remove_dir_all(&dir);
+                if owned {
+                    let _ = std::fs::remove_dir_all(&dir);
+                }
                 return;
             }
             while let Ok((command, answer)) = received.recv() {
@@ -956,7 +1040,9 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
                 let _ = answer.send(result);
             }
             drop(actor);
-            let _ = std::fs::remove_dir_all(&dir);
+            if owned {
+                let _ = std::fs::remove_dir_all(&dir);
+            }
         });
     let thread = match spawned {
         Ok(t) => t,
@@ -1098,8 +1184,13 @@ fn operate(
                     for b in &r.bindings {
                         out.u32(b[0]).u32(b[1]).u32(b[2]);
                     }
+                    out.str(&r.target).u32(r.bytes.len() as u32);
+                    out.0.extend_from_slice(&r.bytes);
                 }
                 out.u32(waiting as u32);
+            }
+            Reply::Text(text) => {
+                out.str(&text);
             }
             Reply::Size(_) => return Err("the build's thread answered something else".into()),
             Reply::Ran(ran) => write_ran(&mut out, &ran, &driven.stop, due, what, deadline)?,

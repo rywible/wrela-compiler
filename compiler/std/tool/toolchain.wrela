@@ -145,9 +145,17 @@ pub fn build(pkg: str, out: str, options: BuildOptions) -> Pending<u8> {
 /// test`'s processes): it fails, saying so.
 @tool
 pub fn test(pkg: str, filter: str, timeout: f64 = 0.0) -> Pending<u8> {
+    let none: [Override; 0] = []
+    test_with(pkg, filter, none, timeout)
+}
+
+/// `test`, its dependencies read from other packages as `overrides` says (as a build's are).
+@tool
+pub fn test_with(pkg: str, filter: str, overrides: [Override], timeout: f64 = 0.0) -> Pending<u8> {
     var w = Writer::new()
     w.write_str(pkg)
     w.write_str(filter)
+    write_overrides(mut w, overrides)
     w.write_u64(bitcast_u64(timeout))
     ask("toolchain/test", take w.into_bytes())
 }
@@ -155,10 +163,27 @@ pub fn test(pkg: str, filter: str, timeout: f64 = 0.0) -> Pending<u8> {
 /// Checks the package at `pkg`, as `wrela check` does: `read_checked` reads the answer.
 @tool
 pub fn check(pkg: str, timeout: f64 = 0.0) -> Pending<u8> {
+    let none: [Override; 0] = []
+    check_with(pkg, none, timeout)
+}
+
+/// `check`, its dependencies read from other packages as `overrides` says (as a build's are).
+@tool
+pub fn check_with(pkg: str, overrides: [Override], timeout: f64 = 0.0) -> Pending<u8> {
     var w = Writer::new()
     w.write_str(pkg)
+    write_overrides(mut w, overrides)
     w.write_u64(bitcast_u64(timeout))
     ask("toolchain/check", take w.into_bytes())
+}
+
+/// Each override's dependency name and package, after their count.
+fn write_overrides(w: mut Writer, overrides: [Override]) {
+    w.write_u32(overrides.len())
+    for o in overrides {
+        w.write_str(o.name.as_str())
+        w.write_str(o.dir.as_str())
+    }
 }
 
 /// Formats the `.wrela` files at `paths` (root paths of files, or of directories, each package's
@@ -217,11 +242,7 @@ pub fn query(
     for q in queries {
         w.write_str(q.as_str())
     }
-    w.write_u32(overrides.len())
-    for o in overrides {
-        w.write_str(o.name.as_str())
-        w.write_str(o.dir.as_str())
-    }
+    write_overrides(mut w, overrides)
     w.write_u64(bitcast_u64(timeout))
     ask("toolchain/query", take w.into_bytes())
 }

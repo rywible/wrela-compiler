@@ -261,6 +261,10 @@ struct Build {
     /// FNV-1a 64 of the WASM: which build a tick log is for.
     wasm_hash: u64,
     compiled: program::Compiled,
+    /// A driven build's root path (as a tool names it) and its directory, opened: its files and
+    /// its program's fetches are read through that handle alone.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    driven: Option<(String, std::sync::Arc<BuildDir>)>,
 }
 
 /// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. An
@@ -280,7 +284,7 @@ fn compile_build_with_shaders(dir: &Path, fuel: Option<u64>, shaders: bool) -> R
     let sidecar = Path::new(&manifest.wasm).with_extension(wrela_abi::lines::SIDECAR);
     let sidecar = std::fs::read(dir.join(sidecar)).ok();
     let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel, sidecar.as_deref())?;
-    Ok(Build { manifest, shaders, wasm_hash, compiled })
+    Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
 /// A build's directory, opened: a driven build reads its files, and its program fetches, only
@@ -320,7 +324,7 @@ fn driven_build(build: &BuildDir, stop: Stop, shaders: bool) -> Result<Build> {
     let sidecar = Path::new(&manifest.wasm).with_extension(wrela_abi::lines::SIDECAR);
     let sidecar = read(&sidecar.to_string_lossy()).ok();
     let compiled = program::compile_interruptible(&wasm, sidecar.as_deref(), stop)?;
-    Ok(Build { manifest, shaders, wasm_hash, compiled })
+    Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
@@ -346,6 +350,20 @@ fn read_file<T>(
     read(&path).map_err(|e| Error::io(path, e))
 }
 
+/// What a driven host needs to hand over to another build (`std::reload`): the root path of
+/// the build it loaded, how to open another build by its root path (within the tool's grants,
+/// as the build's own directory was: its real path and its directory, opened), and what stops
+/// every build's calls. The builds it hands over to are compiled to be driven too.
+#[cfg(feature = "gpu")]
+pub struct Beside {
+    pub at: String,
+    #[allow(clippy::type_complexity)]
+    pub open: std::sync::Arc<
+        dyn Fn(&str) -> std::result::Result<(PathBuf, BuildDir), String> + Send + Sync,
+    >,
+    pub stop: Stop,
+}
+
 /// A loaded program, ready to run.
 #[cfg(feature = "gpu")]
 pub struct Host {
@@ -360,6 +378,8 @@ pub struct Host {
     prepared: handover::PreparedBuilds,
     /// Preparations let go before they finished: dropped only after their threads end.
     cancelled_preparations: Vec<handover::Preparation>,
+    /// A driven host's way to the builds it hands over to.
+    beside: Option<Beside>,
 }
 
 #[cfg(feature = "gpu")]
@@ -391,11 +411,16 @@ impl Host {
         {
             return Err((error, Box::new(carried)));
         }
+        let mut io = self.options.io(dir);
+        if let Some((_, handle)) = &build.driven {
+            io.queue_posts = true;
+            io.build_dir = Some(handle.clone());
+        }
         let mut program = Program::instantiate_carrying_recover(
             &build.compiled,
             &build.manifest,
             carried,
-            self.options.io(dir),
+            io,
             workers(self.options.workers),
             false,
         )?;
@@ -595,37 +620,51 @@ impl Host {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
         let build = compile_build(dir, None)?;
-        Host::start(build, dir, options, true, None)
+        Host::start(build, dir, options, true)
     }
 
     /// The build in the directory `build`, opened at `dir`, to be driven (the tool host's
     /// `drive`, language.md §15.5): its calls end when `stop` is due, on each of its threads,
     /// and it keeps and reads no compiled code. Its files, and its program's fetches, are read
-    /// through `build` alone, so a link put in place of `dir` later leads nowhere. It can't hand
-    /// over to another build or hot reload (a request to fails). Its storage is
-    /// `options.storage`, which a driven build must name.
-    pub fn load_driven(build: BuildDir, dir: &Path, stop: Stop, options: &Options) -> Result<Host> {
+    /// through `build` alone, so a link put in place of `dir` later leads nowhere. It can't hot
+    /// reload. Its storage is `options.storage`, which a driven build must name.
+    ///
+    /// With `beside`, it hands over to other builds (`std::reload`), each opened by its root path
+    /// through `beside`'s grants and compiled to be driven, as this one is; without, it can't
+    /// (a request to fails).
+    pub fn load_driven(
+        build: BuildDir,
+        dir: &Path,
+        stop: Stop,
+        options: &Options,
+        beside: Option<Beside>,
+    ) -> Result<Host> {
         if options.storage.is_none() || options.reloadable {
             return Err(Error::Program(
                 "a driven build names its storage, and isn't reloadable".into(),
             ));
         }
-        let compiled = driven_build(&build, stop, true)?;
-        Host::start(compiled, dir, options, false, Some(std::sync::Arc::new(build)))
+        let mut compiled = driven_build(&build, stop, true)?;
+        let at = beside.as_ref().map(|b| b.at.clone()).unwrap_or_default();
+        compiled.driven = Some((at, std::sync::Arc::new(build)));
+        let mut host = Host::start(compiled, dir, options, beside.is_some())?;
+        host.beside = beside;
+        Ok(host)
+    }
+
+    /// The root path of the build that runs, as the tool named it (after a hand-over, the one
+    /// handed over to), if it's driven.
+    pub fn driven_at(&self) -> Option<&str> {
+        self.build.driven.as_ref().map(|(at, _)| at.as_str())
     }
 
     /// Starts `build`, in `dir`, on a new device; `hands_over` lets it hand over to other builds,
-    /// and its fetches read through `handle` if it's given.
-    fn start(
-        build: Build,
-        dir: &Path,
-        options: &Options,
-        hands_over: bool,
-        handle: Option<std::sync::Arc<BuildDir>>,
-    ) -> Result<Host> {
+    /// and its fetches read through its directory's handle if it's driven.
+    fn start(build: Build, dir: &Path, options: &Options, hands_over: bool) -> Result<Host> {
         let gpu = Gpu::new(&build.manifest, &build.shaders, options.timing)?;
         let n = workers(options.workers);
         let mut io = options.io(dir);
+        let handle = build.driven.as_ref().map(|(_, h)| h.clone());
         // A driven build's posts go to its tool (`std::tool::drive`).
         io.queue_posts = handle.is_some();
         io.build_dir = handle;
@@ -651,6 +690,7 @@ impl Host {
             options: options.clone(),
             prepared: handover::PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
+            beside: None,
         };
         if !options.defer_init {
             host.init()?;

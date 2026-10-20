@@ -216,7 +216,11 @@ fn main(given: take Vec<String>) -> u32 {
             for x in c.bindings {
                 bound.push_str(f" {x.handle}:{x.offset}:{x.size}")
             }
-            print(f"command {c.kind.as_str()} {c.label.as_str()} {c.pipeline.as_str()} {c.groups.x},{c.groups.y},{c.groups.z}{bound.as_str()}")
+            var carried = String::new()
+            for x in c.bytes {
+                carried.push_str(f" {x}")
+            }
+            print(f"command {c.kind.as_str()} {c.label.as_str()} {c.pipeline.as_str()} {c.groups.x},{c.groups.y},{c.groups.z}{bound.as_str()} {c.target.as_str()}{carried.as_str()}")
         }
         print(f"waiting {recorded.waiting}")
         var n = drive::read_buffer(b, 999999)
@@ -365,6 +369,7 @@ pub fn tool(running: mut Running) -> u32 {
 const SUBJECT: &str = r#"
 use std::gpu::{GpuBuffer, buffer, label, write}
 use std::input::events
+use std::io::store
 
 pub struct Game {
     events: u32,
@@ -381,6 +386,8 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     }
     label("counts")
     write(mut game.counts, 0, [game.events, bitcast_u32(time)])
+    let stored: [u8; 3] = [7, 8, 9]
+    let _ = store("probe", stored)
 }
 
 pub fn add(a: i32, b: i32) -> i32 {
@@ -513,10 +520,11 @@ fn a_recording_builds_buffers_and_commands_come_back() {
     let names: Vec<String> = pipeline_names(&src.join("build"));
     let mut want = Vec::new();
     for batch in host.take_batches() {
-        want.push("command Batch   0,0,0".to_string());
+        want.push("command Batch   0,0,0 ".to_string());
         for c in wrela_abi::stream::decode(&batch).expect("a batch") {
             let (mut label, mut pipeline, mut groups, mut bound) =
                 (String::new(), String::new(), [0; 3], String::new());
+            let (mut target, mut carried) = (String::new(), String::new());
             let bind = |b: &[wrela_abi::stream::Binding]| -> String {
                 b.iter().map(|b| format!(" {}:{}:{}", b.handle, b.offset, b.size)).collect()
             };
@@ -528,18 +536,23 @@ fn a_recording_builds_buffers_and_commands_come_back() {
                 C::Draw { pipeline: p, bindings, .. } => {
                     (pipeline, bound) = (names[*p as usize].clone(), bind(bindings));
                 }
+                C::StorageWrite { path, data, .. } => {
+                    target = path.to_string();
+                    carried = data.iter().map(|b| format!(" {b}")).collect();
+                }
                 _ => {}
             }
             let [x, y, z] = groups;
+            let kind = c.opcode().name();
             want.push(format!(
-                "command {} {label} {pipeline} {x},{y},{z}{bound}",
-                c.opcode().name()
+                "command {kind} {label} {pipeline} {x},{y},{z}{bound} {target}{carried}"
             ));
         }
     }
     let got: Vec<&str> = printed.lines().filter(|l| l.starts_with("command ")).collect();
     assert_eq!(got, want, "{printed}");
     assert!(got.iter().any(|l| l.starts_with("command Label counts ")), "{printed}");
+    assert!(got.iter().any(|l| l.ends_with(" probe 7 8 9")), "a write's path and bytes: {printed}");
     assert!(printed.contains("waiting 0"), "{printed}");
 }
 
@@ -1280,4 +1293,125 @@ fn pipeline_names(dir: &Path) -> Vec<String> {
         .into_iter()
         .map(|p| p.name)
         .collect()
+}
+
+/// A tool that loads `src/a` on the GPU with its storage in `out/store`, runs three frames,
+/// and prints which build runs.
+const HANDING_TOOL: &str = r#"
+use std::input::Script
+use std::io::print
+use std::job::{Job, Step}
+use std::tool::{RUNNING, args}
+use std::tool::drive
+
+@job
+fn main(given: take Vec<String>) -> u32 {
+    var options = drive::gpu()
+    options.storage = String::from("out/store")
+    var l = drive::load("src/a", options)
+    var lg = l.poll()
+    while lg.is_none() {
+        yield
+        lg = l.poll()
+    }
+    let Some(lp) = take lg else { return 90 }
+    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+    let b = loaded.build
+    var i = drive::init(b)
+    while i.poll().is_none() { yield }
+    var f = drive::frames(b, 3, Script::frames())
+    var fg = f.poll()
+    while fg.is_none() {
+        yield
+        fg = f.poll()
+    }
+    let Some(fp) = take fg else { return 90 }
+    let Ok(ran) = drive::read_ran(take fp) else { return 92 }
+    if let Some(trap) = ran.trap {
+        print(f"trap {trap.message.as_str()}")
+    }
+    var r = drive::running(b)
+    var rg = r.poll()
+    while rg.is_none() {
+        yield
+        rg = r.poll()
+    }
+    let Some(rp) = take rg else { return 90 }
+    let Ok(at) = drive::read_running(take rp) else { return 93 }
+    print(f"running {at.as_str()}")
+    var x = drive::close(b)
+    while x.poll().is_none() { yield }
+    0
+}
+
+pub fn tool_init() -> Job<main> {
+    main.start(args())
+}
+
+pub fn tool(job: mut Job<main>) -> u32 {
+    match job.resume() {
+        Step::Yielded => RUNNING,
+        Step::Done(status) => status,
+    }
+}
+"#;
+
+/// A program that hands its place to the build beside it, `../b`, at its first frame.
+const HANDS_OVER: &str = r#"
+use std::reload::hand_over
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = hand_over("../b")
+}
+"#;
+
+/// The build handed over to: it stores `7 8 9` as `probe` each frame.
+const HANDED_TO: &str = r#"
+use std::io::store
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let stored: [u8; 3] = [7, 8, 9]
+    let _ = store("probe", stored)
+}
+"#;
+
+/// A driven build hands over to the build beside it in its root, which the host opens through
+/// the grants and runs (`running` names it), and a load's storage in a write root stays when the
+/// build closes, holding what the build stored. A path out of the root is refused (handover.rs).
+#[test]
+fn a_driven_build_hands_over_beside_it_and_keeps_its_storage_where_asked() {
+    let dir = package(
+        "drive-handover",
+        &[
+            ("tool/wrela.toml", &manifest("handing")),
+            ("tool/main.wrela", HANDING_TOOL),
+            ("a/wrela.toml", &manifest("a")),
+            ("a/main.wrela", HANDS_OVER),
+            ("b/wrela.toml", &manifest("b")),
+            ("b/main.wrela", HANDED_TO),
+        ],
+    );
+    let (src, out) = (dir.join("src"), dir.join("out"));
+    std::fs::create_dir_all(out.join("store")).expect("out");
+    for name in ["a", "b"] {
+        let built = wrela()
+            .arg("build")
+            .arg(dir.join(name))
+            .arg("-o")
+            .arg(src.join(name))
+            .output()
+            .expect("wrela build");
+        assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    }
+    let mut c = wrela();
+    c.arg("tool").arg(dir.join("tool"));
+    c.arg("--read").arg(format!("src={}", src.display()));
+    c.arg("--write").arg(format!("out={}", out.display()));
+    c.arg("--timeout").arg("60");
+    let (code, printed) = run(&mut c);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("running src/b"), "{printed}");
+    assert!(!printed.contains("trap"), "{printed}");
+    let stored = std::fs::read(out.join("store/probe")).expect("the stored file stays");
+    assert_eq!(stored, [7, 8, 9]);
 }

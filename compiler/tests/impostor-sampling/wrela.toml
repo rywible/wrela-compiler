@@ -1,5 +1,0 @@
-[package]
-name = "impostor_sampling"
-
-[dependencies]
-engine = { path = "../../../engine" }

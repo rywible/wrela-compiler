@@ -13,7 +13,7 @@
 
 use crate::gpu::{Builder, Gpu, Ready, pipeline_key};
 use crate::program::{Handing, Retired};
-use crate::{Build, Error, Host, Result, compile_build};
+use crate::{Build, BuildDir, Error, Host, Result, Stop, compile_build, driven_build};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
@@ -58,6 +58,45 @@ fn prepare(dir: PathBuf, builder: Builder, have: std::collections::HashSet<u64>)
     })
 }
 
+/// Compiles the build opened as `handle` (root path `at`) to be driven, its calls ended by
+/// `stop`, and builds the pipelines `builder`'s device doesn't hold (`have`): on a thread of its
+/// own.
+fn prepare_driven(
+    at: String,
+    handle: BuildDir,
+    stop: Stop,
+    builder: Builder,
+    have: std::collections::HashSet<u64>,
+) -> Preparation {
+    std::thread::spawn(move || {
+        let mut build = driven_build(&handle, stop, true).map_err(|e| e.to_string())?;
+        build.driven = Some((at, std::sync::Arc::new(handle)));
+        let ready =
+            builder.build_all(&build.manifest, &build.shaders, &have).map_err(|e| e.to_string())?;
+        Ok((build, ready))
+    })
+}
+
+/// The root path that `path` (a request's, from the build at `at`) names: `..` parts take a part
+/// off, but never the root's name.
+fn beside_root(at: &str, path: &str) -> std::result::Result<String, String> {
+    let mut parts: Vec<&str> = at.split('/').filter(|p| !p.is_empty()).collect();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." if parts.len() > 1 => {
+                parts.pop();
+            }
+            ".." => return Err(format!("`{path}` leads out of the tool's root `{at}`")),
+            p => parts.push(p),
+        }
+    }
+    Ok(parts.join("/"))
+}
+
+/// A build another names, opened if the host is driven: its root path and its directory.
+type Opened = Option<(String, BuildDir)>;
+
 fn keys_of(build: &Build) -> Vec<u64> {
     build.manifest.pipelines.iter().zip(&build.shaders).map(|(p, s)| pipeline_key(p, s)).collect()
 }
@@ -70,8 +109,14 @@ impl Host {
         for h in self.p().take_handing() {
             match h {
                 Handing::Prepare { request, path } => {
-                    let dir = beside(&self.dir, &path);
-                    self.start_preparing(&dir);
+                    let (dir, opened) = match self.resolve(&path) {
+                        Ok(r) => r,
+                        Err(why) => {
+                            self.p().answer(request, Err(why));
+                            continue;
+                        }
+                    };
+                    self.start_preparing(&dir, opened);
                     let now = match self.prepared.get_mut(&dir) {
                         Some(Prepared::Going(_, waiting)) => {
                             waiting.push(request);
@@ -86,7 +131,7 @@ impl Host {
                     }
                 }
                 Handing::Unprepare { path } => {
-                    let dir = beside(&self.dir, &path);
+                    let Ok((dir, _)) = self.resolve(&path) else { continue };
                     match self.prepared.remove(&dir) {
                         Some(Prepared::Ready(_, keys)) => self.p().executor().let_go(&keys),
                         // Let the thread finish without blocking this call, but retain it so
@@ -114,19 +159,38 @@ impl Host {
         }
         self.poll_prepared(None);
         if let Some((request, path)) = hand {
-            let dir = beside(&self.dir, &path);
-            self.hand_over(request, dir)?;
+            match self.resolve(&path) {
+                Ok((dir, opened)) => self.hand_over(request, dir, opened)?,
+                Err(why) => self.p().answer(request, Err(why)),
+            }
         }
         Ok(())
     }
 
-    /// Starts getting the build in `dir` ready, unless it is or it's on its way.
-    fn start_preparing(&mut self, dir: &Path) {
+    /// The directory a request's `path` names from the running build, and for a driven host,
+    /// that build opened through the tool's grants (`Beside`), by its root path.
+    fn resolve(&self, path: &str) -> std::result::Result<(PathBuf, Opened), String> {
+        let Some(b) = &self.beside else { return Ok((beside(&self.dir, path), None)) };
+        let at = self.driven_at().unwrap_or(&b.at);
+        let root = beside_root(at, path)?;
+        let (dir, handle) = (b.open)(&root)?;
+        Ok((dir, Some((root, handle))))
+    }
+
+    /// Starts getting the build in `dir` ready (through `opened`, if the host is driven),
+    /// unless it is or it's on its way.
+    fn start_preparing(&mut self, dir: &Path, opened: Opened) {
         if self.prepared.contains_key(dir) {
             return;
         }
+        let stop = self.beside.as_ref().map(|b| b.stop.clone());
         let gpu: &mut Gpu = self.p().executor();
-        let job = prepare(dir.to_path_buf(), gpu.builder(), gpu.pipeline_keys());
+        let job = match (opened, stop) {
+            (Some((at, handle)), Some(stop)) => {
+                prepare_driven(at, handle, stop, gpu.builder(), gpu.pipeline_keys())
+            }
+            _ => prepare(dir.to_path_buf(), gpu.builder(), gpu.pipeline_keys()),
+        };
         self.prepared.insert(dir.to_path_buf(), Prepared::Going(job, Vec::new()));
     }
 
@@ -168,8 +232,8 @@ impl Host {
 
     /// Hands the program's place to the build in `dir` (`std::reload::hand_over`'s request
     /// `request`).
-    fn hand_over(&mut self, request: u32, dir: PathBuf) -> Result<()> {
-        self.start_preparing(&dir);
+    fn hand_over(&mut self, request: u32, dir: PathBuf, opened: Opened) -> Result<()> {
+        self.start_preparing(&dir, opened);
         self.poll_prepared(Some(&dir));
         let build = match self.prepared.remove(&dir) {
             Some(Prepared::Ready(build, _)) => build,
@@ -237,6 +301,22 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A driven build's hand-over path is resolved from its root path, and none leaves the root.
+    #[test]
+    fn a_driven_hand_overs_path_stays_in_its_root() {
+        assert_eq!(
+            beside_root("out/tower/stair", "../test-floor").as_deref(),
+            Ok("out/tower/test-floor")
+        );
+        assert_eq!(
+            beside_root("out/stair", "./next/./floor").as_deref(),
+            Ok("out/stair/next/floor")
+        );
+        assert_eq!(beside_root("out/stair", "..").as_deref(), Ok("out"));
+        assert!(beside_root("out/stair", "../..").is_err(), "the root's name stays");
+        assert!(beside_root("out", "../elsewhere").is_err());
+    }
     use crate::program::{Io, Program};
     use crate::{Options, Timing};
     use std::sync::mpsc;
@@ -268,11 +348,12 @@ mod tests {
         program.hand_over_here();
         let mut host = Host {
             program: Some(program),
-            build: Build { manifest, shaders: Vec::new(), wasm_hash: 0, compiled },
+            build: Build { manifest, shaders: Vec::new(), wasm_hash: 0, compiled, driven: None },
             dir: PathBuf::from("preparation-lifetime"),
             options: Options::default(),
             prepared: PreparedBuilds::new(),
             cancelled_preparations: Vec::new(),
+            beside: None,
         };
         let builder = host.p().executor().builder();
         let (entered, release, finished) = (mpsc::channel(), mpsc::channel(), mpsc::channel());

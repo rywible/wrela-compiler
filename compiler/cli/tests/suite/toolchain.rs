@@ -49,6 +49,15 @@ fn main(given: take Vec<String>) -> u32 {
         toolchain::test(given[1].as_str(), "")
     } else if what.as_str() == "check" {
         toolchain::check(given[1].as_str())
+    } else if what.as_str() == "test-with" || what.as_str() == "check-with" {
+        // `test-with PKG NAME DIR`: the dependency `NAME` read from `DIR`.
+        var overrides: Vec<toolchain::Override> = Vec::new()
+        overrides.push(toolchain::Override { name: given[2].clone(), dir: given[3].clone() })
+        if what.as_str() == "test-with" {
+            toolchain::test_with(given[1].as_str(), "", overrides)
+        } else {
+            toolchain::check_with(given[1].as_str(), overrides)
+        }
     } else if what.as_str() == "doc" || what.as_str() == "doc-timed" {
         let timeout = if what.as_str() == "doc-timed" { 2.0 } else { 0.0 }
         toolchain::doc_export(paths, given[2].as_str(), "https://example.test/repo", "", timeout)
@@ -68,7 +77,7 @@ fn main(given: take Vec<String>) -> u32 {
         }
         print(f"built ok={built.ok} files={built.files.len()}")
         diagnostics(built.diagnostics)
-    } else if what.as_str() == "test" {
+    } else if what.as_str() == "test" || what.as_str() == "test-with" {
         let tested = match toolchain::read_tested(take polled) {
             Ok(t) => take t,
             Err(e) => return failed(e),
@@ -86,7 +95,7 @@ fn main(given: take Vec<String>) -> u32 {
             Err(e) => return failed(e),
         }
         print(f"exported {pages}")
-    } else if what.as_str() == "check" {
+    } else if what.as_str() == "check" || what.as_str() == "check-with" {
         let checked = match toolchain::read_checked(take polled) {
             Ok(c) => take c,
             Err(e) => return failed(e),
@@ -308,6 +317,36 @@ fn a_dependency_outside_the_read_roots_is_refused() {
     let (code, printed) = run(&mut probe(&tool, &src, &out, &["check", "elsewhere/subject"]));
     assert_eq!(code, Some(1), "{printed}");
     assert!(printed.contains("error: ") && printed.contains("no root `elsewhere`"), "{printed}");
+}
+
+/// A test or a check reads a dependency from the package an override names, wherever its
+/// manifest declares it: here a workspace member with no workspace, which fails without it.
+#[test]
+fn test_and_check_read_dependencies_through_overrides() {
+    let main = "use geo::value::value\n\npub fn frame(time: f32, width: u32, height: u32) {}\n\n@test\nfn reads_its_dependency() {\n    assert(value() == 1)\n}\n";
+    let manifest_text =
+        "[package]\nname = \"subject\"\n\n[dependencies]\ngeo = { workspace = true }\n";
+    let (tool, src, out) = packages(
+        "toolchain-overrides",
+        &[
+            ("subject/wrela.toml", manifest_text),
+            ("subject/main.wrela", main),
+            ("geo/wrela.toml", "[package]\nname = \"geo\"\n"),
+            ("geo/value.wrela", "pub fn value() -> u32 {\n    1\n}\n"),
+        ],
+    );
+    let (code, printed) =
+        run(&mut probe(&tool, &src, &out, &["test-with", "src/subject", "geo", "src/geo"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("tested passed=true"), "{printed}");
+    assert!(printed.contains("test reads_its_dependency passed=true"), "{printed}");
+    let (code, printed) =
+        run(&mut probe(&tool, &src, &out, &["check-with", "src/subject", "geo", "src/geo"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("checked ok=true"), "{printed}");
+    let (code, printed) = run(&mut probe(&tool, &src, &out, &["check", "src/subject"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("checked ok=false") && printed.contains("E0220"), "{printed}");
 }
 
 #[test]

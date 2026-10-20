@@ -57,9 +57,20 @@ pub trait Toolchain: Send + Sync {
     fn build(&self, job: &Job, package: &Path, options: &BuildOptions) -> Result<Built, String>;
     /// The package's tests whose names hold `filter` (all of them for `None`), run as
     /// `wrela test` runs them.
-    fn test(&self, job: &Job, package: &Path, filter: Option<&str>) -> Result<Tested, String>;
+    fn test(
+        &self,
+        job: &Job,
+        package: &Path,
+        filter: Option<&str>,
+        overrides: &[(String, PathBuf)],
+    ) -> Result<Tested, String>;
     /// The package's diagnostics, as `wrela check` finds them.
-    fn check(&self, job: &Job, package: &Path) -> Result<Vec<Diagnostic>, String>;
+    fn check(
+        &self,
+        job: &Job,
+        package: &Path,
+        overrides: &[(String, PathBuf)],
+    ) -> Result<Vec<Diagnostic>, String>;
     /// Whether a build writes a file named `name` into its output: what the list of the files
     /// the last build wrote ([`LIST`]) may name (`wrela build`'s rule).
     fn owns(&self, name: &str) -> bool;
@@ -358,9 +369,13 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
             "test" => {
                 let package = b.str()?;
                 let filter = b.str()?;
-                Op::Test { package, filter: (!filter.is_empty()).then_some(filter) }
+                let overrides = overrides_of(b)?;
+                Op::Test { package, filter: (!filter.is_empty()).then_some(filter), overrides }
             }
-            "check" => Op::Check { package: b.str()? },
+            "check" => {
+                let package = b.str()?;
+                Op::Check { package, overrides: overrides_of(b)? }
+            }
             "fmt" => {
                 let paths = strs(b)?;
                 let check = b.u8()? != 0;
@@ -376,12 +391,7 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
             "query" => {
                 let package = b.str()?;
                 let queries = strs(b)?;
-                let n = b.u32()?;
-                let mut overrides = Vec::new();
-                for _ in 0..n.min(MOST_BYTES as u32) {
-                    overrides.push((b.str()?, b.str()?));
-                }
-                Op::Query { package, queries, overrides }
+                Op::Query { package, queries, overrides: overrides_of(b)? }
             }
             "literals" => Op::Literals { program: b.str()?, build: b.str()? },
             "edit" => {
@@ -432,9 +442,11 @@ enum Op {
     Test {
         package: String,
         filter: Option<String>,
+        overrides: Vec<(String, String)>,
     },
     Check {
         package: String,
+        overrides: Vec<(String, String)>,
     },
     Fmt {
         paths: Vec<String>,
@@ -559,9 +571,10 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
             write_diagnostics(&mut out, &built.diagnostics);
             out.u32(built.consts.0).u32(built.consts.1);
         }
-        Op::Test { package, filter } => {
+        Op::Test { package, filter, overrides } => {
             let dir = caps.dir_path(&package, false)?;
-            let tested = toolchain.test(job, &dir, filter.as_deref())?;
+            let dirs = override_dirs(caps, overrides)?;
+            let tested = toolchain.test(job, &dir, filter.as_deref(), &dirs)?;
             let passed = !tested.diagnostics.iter().any(|d| d.error)
                 && tested.results.iter().all(|r| r.passed);
             out.u8(u8::from(passed)).u32(tested.results.len() as u32);
@@ -576,9 +589,10 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
             write_diagnostics(&mut out, &tested.diagnostics);
             out.u32(tested.filtered_out);
         }
-        Op::Check { package } => {
+        Op::Check { package, overrides } => {
             let dir = caps.dir_path(&package, false)?;
-            let diagnostics = toolchain.check(job, &dir)?;
+            let dirs = override_dirs(caps, overrides)?;
+            let diagnostics = toolchain.check(job, &dir, &dirs)?;
             out.u8(u8::from(!diagnostics.iter().any(|d| d.error)));
             write_diagnostics(&mut out, &diagnostics);
         }
@@ -622,10 +636,7 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
         }
         Op::Query { package, queries, overrides } => {
             let dir = caps.dir_path(&package, false)?;
-            let mut dirs = Vec::new();
-            for (name, path) in overrides {
-                dirs.push((name, caps.dir_path(&path, false)?));
-            }
+            let dirs = override_dirs(caps, overrides)?;
             out.str(&toolchain.query(job, &dir, &queries, &dirs)?);
         }
         Op::Literals { program, build } => {
@@ -1015,4 +1026,26 @@ fn format(
         }
     }
     Ok((changed, failed))
+}
+
+/// A request's overrides: a count, then each dependency's name and the root path read for it.
+fn overrides_of(b: &mut Body) -> Result<Vec<(String, String)>, String> {
+    let n = b.u32()?;
+    let mut overrides = Vec::new();
+    for _ in 0..n.min(MOST_BYTES as u32) {
+        overrides.push((b.str()?, b.str()?));
+    }
+    Ok(overrides)
+}
+
+/// Each override's directory, through the grants.
+fn override_dirs(
+    caps: &super::caps::Caps,
+    overrides: Vec<(String, String)>,
+) -> Result<Vec<(String, PathBuf)>, String> {
+    let mut dirs = Vec::new();
+    for (name, path) in overrides {
+        dirs.push((name, caps.dir_path(&path, false)?));
+    }
+    Ok(dirs)
 }

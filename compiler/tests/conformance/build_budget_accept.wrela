@@ -1,7 +1,6 @@
 // accepts: build.budget
 // A shipped build's pipeline has at most 256 KiB of WGSL: a table of 30,000 numbers (about 180
-// KiB) is within it. There's no limit on how many pipelines a build has: how long they take to
-// create is measured (clearing.rs).
+// KiB) is within it. There's no limit on how many pipelines a build has.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
 const TABLE: [f32; 30000] = [0.5; 30000]

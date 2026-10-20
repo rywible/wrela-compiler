@@ -65,8 +65,14 @@ impl wrela_host::tool::Toolchain for Compiler {
         })
     }
 
-    fn test(&self, job: &Job, package: &Path, filter: Option<&str>) -> Result<Tested, String> {
-        let scope = scope_of(job, &[])?;
+    fn test(
+        &self,
+        job: &Job,
+        package: &Path,
+        filter: Option<&str>,
+        overrides: &[(String, PathBuf)],
+    ) -> Result<Tested, String> {
+        let scope = scope_of(job, overrides)?;
         let out = wrela_driver::test_in(package, filter, &scope)?;
         let results = out
             .results
@@ -90,8 +96,13 @@ impl wrela_host::tool::Toolchain for Compiler {
         })
     }
 
-    fn check(&self, job: &Job, package: &Path) -> Result<Vec<Diagnostic>, String> {
-        let scope = scope_of(job, &[])?;
+    fn check(
+        &self,
+        job: &Job,
+        package: &Path,
+        overrides: &[(String, PathBuf)],
+    ) -> Result<Vec<Diagnostic>, String> {
+        let scope = scope_of(job, overrides)?;
         let out = wrela_driver::check_in(package, &scope)?;
         Ok(diagnostics_of(&out.sources, &out.diagnostics))
     }
