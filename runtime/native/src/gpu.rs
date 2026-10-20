@@ -1568,12 +1568,17 @@ impl Gpu {
         out
     }
 
+    /// A buffer's size in bytes.
+    pub(crate) fn buffer_size(&self, handle: u32) -> Result<u64> {
+        match self.resources.get(&handle) {
+            Some(Resource::Buffer(b)) => Ok(b.size()),
+            _ => Err(Error::Gpu(format!("there's no buffer {handle}"))),
+        }
+    }
+
     /// Copies a whole buffer back to the CPU (waits for the GPU): for tests.
     pub(crate) fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
-        let size = match self.resources.get(&handle) {
-            Some(Resource::Buffer(b)) => b.size() as u32,
-            _ => return Err(Error::Gpu(format!("there's no buffer {handle}"))),
-        };
+        let size = self.buffer_size(handle)? as u32;
         self.read_range(handle, 0, size)
     }
 

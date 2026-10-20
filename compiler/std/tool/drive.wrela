@@ -41,8 +41,8 @@ pub enum Timing: Copy + Eq {
 /// How to load a build: with a GPU (a real one: the host never renders in software) or on the
 /// CPU alone; its screen's size; its frames' rate; how many threads run its parallel jobs (the
 /// program's own among them; 0: one per core); how a GPU build is timed; how long each helper
-/// holds a job's result back, in microseconds (a test's slow jobs); and how long loading may
-/// take in seconds (0: 60 s).
+/// holds a job's result back, in microseconds (a test's slow jobs); whether it records the
+/// commands it submits, for `commands`; and how long loading may take in seconds (0: 60 s).
 pub struct Load: Clone {
     pub gpu: bool,
     pub width: u32,
@@ -51,6 +51,7 @@ pub struct Load: Clone {
     pub workers: u32,
     pub timing: Timing,
     pub hold: u32,
+    pub record: bool,
     pub timeout: f64,
 }
 
@@ -65,6 +66,7 @@ pub fn cpu() -> Load {
         workers: 0,
         timing: Timing::Off,
         hold: 0,
+        record: false,
         timeout: 0.0,
     }
 }
@@ -153,6 +155,33 @@ pub struct Logs: Clone {
     pub waiting: u32,
 }
 
+/// A buffer a command binds: its handle, and the range bound (offset and size in bytes; a size
+/// of 0 is the whole buffer, or a texture or sampler).
+pub struct Bound: Copy {
+    pub handle: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+/// A command a build submitted: its opcode's name (`Draw`, `Dispatch`, `Label`, ...: the
+/// runtime/abi stream's); a label's name; the name of the pipeline a dispatch or a draw uses
+/// (its manifest's); a dispatch's workgroups; and the resources it binds, in order. What a
+/// command doesn't have is empty or 0. Each batch begins with a `Batch` of its own.
+pub struct Recorded: Clone {
+    pub kind: String,
+    pub label: String,
+    pub pipeline: String,
+    pub groups: vec3u,
+    pub bindings: Vec<Bound>,
+}
+
+/// The commands a build recorded since the last `commands`, the oldest first, and how many more
+/// wait for the next: an answer holds at most 65,536 of them and 512 KiB of their names.
+pub struct Commands: Clone {
+    pub commands: Vec<Recorded>,
+    pub waiting: u32,
+}
+
 /// A phase a build timed (`std::time::phase`): its name, its seconds summed, how many times.
 pub struct Phase: Clone {
     pub name: String,
@@ -205,6 +234,7 @@ pub fn load(build: str, options: Load) -> Pending<u8> {
         Timing::Serial => 2,
     })
     w.write_u32(options.hold)
+    w.write_u8(if options.record { 1 } else { 0 })
     timeout_ask("drive/load", take w, options.timeout)
 }
 
@@ -267,6 +297,30 @@ pub fn hash(b: Build) -> Pending<u8> {
 @tool
 pub fn logs(b: Build) -> Pending<u8> {
     timeout_ask("drive/logs", handle_body(b), 0.0)
+}
+
+/// The GPU buffers a GPU build holds, oldest first, by their handles (a buffer the program
+/// dropped is gone): `read_buffers` reads the answer.
+@tool
+pub fn buffers(b: Build) -> Pending<u8> {
+    timeout_ask("drive/buffers", handle_body(b), 0.0)
+}
+
+/// The bytes of a GPU build's buffer `handle` (one `buffers` names), read back from the GPU into
+/// a blob, whose bytes are reserved in the tool's blob budget before they're read: `read_bytes`
+/// reads the answer.
+@tool
+pub fn read_buffer(b: Build, handle: u32, timeout: f64 = 0.0) -> Pending<u8> {
+    var w = handle_body(b)
+    w.write_u32(handle)
+    timeout_ask("drive/read_buffer", take w, timeout)
+}
+
+/// The commands a build loaded with `record` submitted since the last `commands`, as many as an
+/// answer holds (the rest wait for the next): `read_commands` reads the answer.
+@tool
+pub fn commands(b: Build) -> Pending<u8> {
+    timeout_ask("drive/commands", handle_body(b), 0.0)
 }
 
 /// The phases the build timed, on all its threads: `read_phases` reads the answer.
@@ -498,6 +552,72 @@ pub fn read_logs(polled: take Result<Vec<u8>, IoError>) -> Result<Logs, ToolErro
         return Err(malformed("drive/logs"))
     }
     Ok(Logs { lines, waiting })
+}
+
+/// Reads a `buffers` answer: a count, then each handle.
+pub fn read_buffers(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<u32>, ToolError> {
+    var r = Reader::new(answer_bytes(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive/buffers")) }
+    if n > r.left() {
+        return Err(malformed("drive/buffers"))
+    }
+    var out: Vec<u32> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(h) = r.read_u32() else { return Err(malformed("drive/buffers")) }
+        out.push(h)
+    }
+    if !r.at_end() {
+        return Err(malformed("drive/buffers"))
+    }
+    Ok(out)
+}
+
+/// Reads a `read_buffer` answer: the buffer's bytes (`blob::Data`).
+pub fn read_bytes(polled: take Result<Vec<u8>, IoError>) -> Result<Data, ToolError> {
+    var r = Reader::new(answer_bytes(take polled)?)
+    let Some(bytes) = read_data(mut r) else { return Err(malformed("drive/read_buffer")) }
+    if !r.at_end() {
+        return Err(malformed("drive/read_buffer"))
+    }
+    Ok(bytes)
+}
+
+/// Reads a `commands` answer: a count, each command's kind, label, pipeline, workgroups and
+/// bindings, then how many wait.
+pub fn read_commands(polled: take Result<Vec<u8>, IoError>) -> Result<Commands, ToolError> {
+    var r = Reader::new(answer_bytes(take polled)?)
+    let Ok(n) = r.read_u32() else { return Err(malformed("drive/commands")) }
+    if n > r.left() {
+        return Err(malformed("drive/commands"))
+    }
+    var commands: Vec<Recorded> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(kind) = r.read_string() else { return Err(malformed("drive/commands")) }
+        let Ok(label) = r.read_string() else { return Err(malformed("drive/commands")) }
+        let Ok(pipeline) = r.read_string() else { return Err(malformed("drive/commands")) }
+        var groups = vec3u(0)
+        for k in 0..3 {
+            let Ok(g) = r.read_u32() else { return Err(malformed("drive/commands")) }
+            groups[k] = g
+        }
+        let Ok(m) = r.read_u32() else { return Err(malformed("drive/commands")) }
+        if m > r.left() {
+            return Err(malformed("drive/commands"))
+        }
+        var bindings: Vec<Bound> = Vec::with_capacity(m)
+        for _ in 0..m {
+            let Ok(handle) = r.read_u32() else { return Err(malformed("drive/commands")) }
+            let Ok(offset) = r.read_u32() else { return Err(malformed("drive/commands")) }
+            let Ok(size) = r.read_u32() else { return Err(malformed("drive/commands")) }
+            bindings.push(Bound { handle, offset, size })
+        }
+        commands.push(Recorded { kind, label, pipeline, groups, bindings })
+    }
+    let Ok(waiting) = r.read_u32() else { return Err(malformed("drive/commands")) }
+    if !r.at_end() {
+        return Err(malformed("drive/commands"))
+    }
+    Ok(Commands { commands, waiting })
 }
 
 /// Reads a `phases` answer: a count, then each phase's name, seconds and times.

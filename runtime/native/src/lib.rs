@@ -937,6 +937,16 @@ impl Host {
         self.p().executor().buffers()
     }
 
+    /// The running build's pipelines' names, by index: what a recorded command names.
+    pub fn pipeline_names(&self) -> Vec<String> {
+        self.build.manifest.pipelines.iter().map(|p| p.name.clone()).collect()
+    }
+
+    /// A GPU buffer's size in bytes: what [`Host::read_buffer`] gives, without reading it.
+    pub fn buffer_size(&mut self, handle: u32) -> Result<u64> {
+        self.p().executor().buffer_size(handle)
+    }
+
     /// Reads a GPU buffer back after a run. For tests: it waits for the GPU.
     pub fn read_buffer(&mut self, handle: u32) -> Result<Vec<u8>> {
         self.p().executor().read_buffer(handle)
@@ -1006,6 +1016,11 @@ pub struct CpuBuild {
 }
 
 impl CpuBuild {
+    /// Its pipelines' names, by index: what a recorded command names.
+    pub fn pipeline_names(&self) -> Vec<String> {
+        self.manifest.pipelines.iter().map(|p| p.name.clone()).collect()
+    }
+
     /// Loads the build in `dir`; its shaders must exist but aren't compiled. Its compiled code
     /// is kept beside it, as a [`Host`]'s is.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {

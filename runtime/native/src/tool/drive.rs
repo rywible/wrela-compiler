@@ -25,6 +25,11 @@
 //! renders, as `wrela-host` renders them, into a blob whose bytes are reserved in the budget
 //! before the first quantum runs, so a render that doesn't fit runs nothing.
 //!
+//! **A GPU build's buffers and a build's commands can be read** (`buffers`, `read_buffer`,
+//! `commands`): a buffer's size first, from the build's thread, so its blob and bytes are
+//! reserved before it's read back; and a recording build's commands, decoded, as many as an
+//! answer holds, the rest kept for the next `commands`.
+//!
 //! **No compiled code is kept or read**: each `load` compiles the build's WASM, which the host
 //! reads through the grants, as it reads the build's other files. The build's storage is a
 //! directory of the host's own, removed when the build closes.
@@ -48,6 +53,13 @@ const POLL: Duration = Duration::from_millis(10);
 /// The most lines `logs` gives at once, and the most bytes of them: the rest wait for the next
 /// `logs`. A line longer than an answer holds is cut, with a note.
 const MOST_LINES: usize = 4096;
+
+/// The most commands `commands` gives at once, and the most bytes of their labels: the rest
+/// wait for the next `commands`.
+const MOST_COMMANDS: usize = 65536;
+
+/// The most buffers `buffers` names: past it, the answer would be cut, so it fails.
+const MOST_BUFFERS: usize = 65536;
 
 /// The most frames or ticks one request runs.
 const MOST_STEPS: u32 = 1 << 20;
@@ -128,7 +140,8 @@ impl Driven {
 
 /// How a build is loaded: with a GPU or on the CPU alone, its screen's size, its frames' rate,
 /// how many threads run its parallel jobs (0: one per core), how its GPU work is timed, and how
-/// long each helper holds a job's result back (microseconds: a test's slow jobs).
+/// long each helper holds a job's result back (microseconds: a test's slow jobs), and whether
+/// it records the commands it submits (`commands`).
 #[derive(Clone, Debug)]
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
 struct Load {
@@ -140,6 +153,7 @@ struct Load {
     workers: u32,
     timing: crate::Timing,
     hold: u32,
+    record: bool,
 }
 
 /// An operation of a driven build's.
@@ -150,6 +164,14 @@ enum Command {
     FrameAt(f32),
     Ticks(u32, Vec<Scripted>),
     Capture,
+    /// The GPU buffers the program holds, oldest first.
+    Buffers,
+    /// A GPU buffer's size, then its bytes: the size first, so they're reserved before they're
+    /// read back.
+    BufferSize(u32),
+    ReadBuffer(u32),
+    /// The commands it recorded since the last time.
+    Commands,
     Hash,
     Logs,
     Phases,
@@ -168,6 +190,9 @@ impl Command {
             Command::FrameAt(..) => "frame_at",
             Command::Ticks(..) => "ticks",
             Command::Capture => "capture",
+            Command::Buffers => "buffers",
+            Command::BufferSize(..) | Command::ReadBuffer(..) => "read_buffer",
+            Command::Commands => "commands",
             Command::Hash => "hash",
             Command::Logs => "logs",
             Command::Phases => "phases",
@@ -185,6 +210,11 @@ enum Reply {
     Loaded(f64),
     Ran(Ran),
     Screen(u32, u32, Vec<u8>),
+    Buffers(Vec<u32>),
+    Size(u64),
+    Bytes(Vec<u8>),
+    /// The commands, and how many wait for the next.
+    Commands(Vec<Recorded>, usize),
     Hash(u64),
     Logs(Vec<String>, usize),
     Phases(Vec<crate::Phase>),
@@ -236,6 +266,53 @@ struct Actor {
     posts: std::collections::VecDeque<crate::QueuedPost>,
     /// The lines the program printed that the tool hasn't been given yet.
     lines: std::collections::VecDeque<String>,
+    /// The commands it recorded that the tool hasn't been given yet.
+    recorded: std::collections::VecDeque<Recorded>,
+    /// Its pipelines' names, by index (the manifest's).
+    pipelines: Vec<String>,
+}
+
+/// A command a build recorded, as `commands` gives it: its opcode's name; a label's name; the
+/// name of the pipeline a dispatch or draw uses; a dispatch's workgroups; and the buffers it
+/// binds (each one's handle, offset and size; 0 for the whole).
+#[derive(Default)]
+struct Recorded {
+    kind: &'static str,
+    label: String,
+    pipeline: String,
+    groups: [u32; 3],
+    bindings: Vec<[u32; 3]>,
+}
+
+impl Recorded {
+    /// `c`, its pipeline named from `pipelines`.
+    fn of(c: &wrela_abi::stream::Command, pipelines: &[String]) -> Recorded {
+        use wrela_abi::stream::Command as C;
+        let named = |p: u32| pipelines.get(p as usize).cloned().unwrap_or_default();
+        let bound = |b: &[wrela_abi::stream::Binding]| -> Vec<[u32; 3]> {
+            b.iter().map(|b| [b.handle, b.offset, b.size]).collect()
+        };
+        let mut r = Recorded { kind: c.opcode().name(), ..Recorded::default() };
+        match c {
+            C::Label { name } => r.label = bounded(name),
+            C::Dispatch { pipeline, groups, bindings, .. } => {
+                (r.pipeline, r.groups, r.bindings) = (named(*pipeline), *groups, bound(bindings));
+            }
+            C::Draw { pipeline, bindings, .. }
+            | C::DispatchIndirect { pipeline, bindings, .. }
+            | C::DrawIndirect { pipeline, bindings, .. }
+            | C::DrawIndexedIndirect { pipeline, bindings, .. } => {
+                (r.pipeline, r.bindings) = (named(*pipeline), bound(bindings));
+            }
+            _ => {}
+        }
+        r
+    }
+
+    /// Its bytes in an answer.
+    fn size(&self) -> usize {
+        self.kind.len() + self.label.len() + self.pipeline.len() + 28 + 12 * self.bindings.len()
+    }
 }
 
 impl Actor {
@@ -264,6 +341,38 @@ impl Actor {
             step,
             number,
         }
+    }
+
+    /// A GPU buffer's operation: the buffers it holds, one's size, or one's bytes.
+    #[cfg(feature = "gpu")]
+    fn buffer_op(&mut self, c: Command) -> Result<Reply, String> {
+        let Hosted::Gpu(host) = &mut self.host else {
+            return Err("a build loaded without the GPU holds no GPU buffers".into());
+        };
+        match c {
+            Command::Buffers => {
+                let held = host.buffers();
+                if held.len() > MOST_BUFFERS {
+                    return Err(format!(
+                        "the build holds {} buffers, more than an answer names ({MOST_BUFFERS})",
+                        held.len()
+                    ));
+                }
+                Ok(Reply::Buffers(held))
+            }
+            Command::BufferSize(h) => {
+                host.buffer_size(h).map(Reply::Size).map_err(|e| e.to_string())
+            }
+            Command::ReadBuffer(h) => {
+                host.read_buffer(h).map(Reply::Bytes).map_err(|e| e.to_string())
+            }
+            _ => Err("not a buffer's operation".into()),
+        }
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn buffer_op(&mut self, _: Command) -> Result<Reply, String> {
+        Err("a build loaded without the GPU holds no GPU buffers".into())
     }
 
     /// Its host, if it's a CPU host.
@@ -391,6 +500,42 @@ impl Actor {
                     }
                 };
             }
+            c @ (Command::Buffers | Command::BufferSize(_) | Command::ReadBuffer(_)) => {
+                return self.buffer_op(c);
+            }
+            Command::Commands => {
+                if !self.load.record {
+                    return Err("the build wasn't loaded to record its commands (`record`)".into());
+                }
+                let batches = match &mut self.host {
+                    Hosted::Cpu(host) => host.take_batches(),
+                    #[cfg(feature = "gpu")]
+                    Hosted::Gpu(host) => host.take_batches(),
+                };
+                for batch in &batches {
+                    let commands = wrela_abi::stream::decode(batch)
+                        .map_err(|e| format!("a recorded batch doesn't decode: {e}"))?;
+                    // A batch begins with a mark of its own: a label counts to its batch's end.
+                    self.recorded.push_back(Recorded { kind: "Batch", ..Recorded::default() });
+                    for c in &commands {
+                        self.recorded.push_back(Recorded::of(c, &self.pipelines));
+                    }
+                }
+                // As many as an answer holds, the oldest first; the rest wait for the next.
+                let mut given = Vec::new();
+                let mut bytes = 0;
+                while let Some(r) = self.recorded.front() {
+                    let size = r.size();
+                    if given.len() == MOST_COMMANDS
+                        || (!given.is_empty() && bytes + size > MOST_BYTES)
+                    {
+                        break;
+                    }
+                    bytes += size;
+                    given.extend(self.recorded.pop_front());
+                }
+                return Ok(Reply::Commands(given, self.recorded.len()));
+            }
             Command::Hash => {
                 return Ok(Reply::Hash(match &mut self.host {
                     Hosted::Cpu(host) => host.hash(),
@@ -517,7 +662,12 @@ impl Actor {
 
 /// The host for `load`, made on the build's own thread: its directory opened through the grants
 /// once, now, and its files and its program's fetches read through that handle alone.
-fn start(s: &Services, load: &Load, stop: crate::Stop, storage: PathBuf) -> Result<Hosted, String> {
+fn start(
+    s: &Services,
+    load: &Load,
+    stop: crate::Stop,
+    storage: PathBuf,
+) -> Result<(Hosted, Vec<String>), String> {
     let (dir, handle) = s.caps.open_dir(&load.path)?;
     if load.gpu {
         #[cfg(feature = "gpu")]
@@ -528,6 +678,7 @@ fn start(s: &Services, load: &Load, stop: crate::Stop, storage: PathBuf) -> Resu
                 workers: load.workers,
                 quiet: true,
                 defer_init: true,
+                record: load.record,
                 ..crate::Options::default()
             };
             let mut host = crate::Host::load_driven(handle, &dir, stop, &options)
@@ -537,17 +688,22 @@ fn start(s: &Services, load: &Load, stop: crate::Stop, storage: PathBuf) -> Resu
             if load.hold > 0 {
                 host.hold_jobs(load.hold);
             }
-            return Ok(Hosted::Gpu(Box::new(host)));
+            let names = host.pipeline_names();
+            return Ok((Hosted::Gpu(Box::new(host)), names));
         }
         #[cfg(not(feature = "gpu"))]
         return Err("this tool host was built without the GPU".into());
     }
-    let build = crate::CpuBuild::load_driven(handle, &dir, stop).map_err(|e| e.to_string())?;
+    let mut build = crate::CpuBuild::load_driven(handle, &dir, stop).map_err(|e| e.to_string())?;
+    if load.record {
+        build = build.recording();
+    }
+    let names = build.pipeline_names();
     let host = build.instantiate_in(load.workers, Some(&storage)).map_err(|e| e.to_string())?;
     if load.hold > 0 {
         host.hold_jobs(load.hold);
     }
-    Ok(Hosted::Cpu(host))
+    Ok((Hosted::Cpu(host), names))
 }
 
 /// A request's deadline: the `f64` of seconds at its end (0: [`DEADLINE`]).
@@ -586,6 +742,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 k => return Err(format!("{k} isn't a timing mode")),
             };
             let hold = b.u32()?;
+            let record = b.u8()? != 0;
             if !(fps.is_finite() && fps > 0.0) {
                 return Err(format!("frames' rate is more than 0, not {fps}"));
             }
@@ -595,7 +752,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             if workers > wrela_abi::memory::MAX_WORKERS + 1 {
                 return Err(format!("at most {} workers", wrela_abi::memory::MAX_WORKERS + 1));
             }
-            let load = Load { path, gpu, width, height, fps, workers, timing, hold };
+            let load = Load { path, gpu, width, height, fps, workers, timing, hold, record };
             Ok((load, deadline(b)?))
         })();
         return match parsed {
@@ -627,6 +784,9 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 Command::FrameAt(time)
             }
             "capture" => Command::Capture,
+            "buffers" => Command::Buffers,
+            "read_buffer" => Command::ReadBuffer(b.u32()?),
+            "commands" => Command::Commands,
             "hash" => Command::Hash,
             "logs" => Command::Logs,
             "phases" => Command::Phases,
@@ -764,7 +924,7 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
             let _ = std::fs::create_dir_all(&dir);
             let host = start(&services, &load2, stop2, dir.clone());
             drop(services);
-            let host = match host {
+            let (host, pipelines) = match host {
                 Ok(h) => h,
                 Err(why) => {
                     let _ = sent.send(Err(why));
@@ -781,6 +941,8 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
                 ended: None,
                 posts: std::collections::VecDeque::new(),
                 lines: std::collections::VecDeque::new(),
+                recorded: std::collections::VecDeque::new(),
+                pipelines,
             };
             if sent.send(Ok(Reply::Loaded(since.elapsed().as_secs_f64()))).is_err() {
                 drop(actor);
@@ -898,28 +1060,48 @@ fn operate(
             };
             voice = Some((id, times));
         }
-        let (sent, reply) = mpsc::channel();
-        {
-            let commands =
-                driven.commands.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let Some(commands) = commands.as_ref() else {
-                return Err(format!("the driven build {handle} is closed"));
-            };
-            driven.stop.set_deadline(Some(due));
-            commands
-                .send((command, sent))
-                .map_err(|_| format!("the driven build {handle}'s thread has ended"))?;
+        // A buffer's bytes and their blob are reserved before it's read back: its size first,
+        // from the build's thread, then the blob, then the bytes. The blob is the request's.
+        let mut bytes_blob = None;
+        if let Command::ReadBuffer(h) = command {
+            let size =
+                match exchange(s, &driven, handle, Command::BufferSize(h), due, what, deadline)? {
+                    Reply::Size(n) => n,
+                    _ => return Err("the build's thread answered something else".into()),
+                };
+            let id = s
+                .blobs()
+                .create_reserved(request, size)
+                .map_err(|why| format!("buffer {h}'s {size} bytes: {why}"))?;
+            bytes_blob = Some(id);
         }
-        let reply = wait(s, &reply, &driven.stop, due, what, deadline).map_err(|why| {
-            // A voice the deadline stopped is the request's failure, as a call's is.
-            if why.contains("interrupt") && (driven.stop.is_stopped() || Instant::now() >= due) {
-                past_deadline(what, deadline)
-            } else {
-                why
-            }
-        })?;
+        let reply = exchange(s, &driven, handle, command, due, what, deadline)?;
         let mut out = Out::default();
         match reply {
+            Reply::Buffers(held) => {
+                out.u32(held.len() as u32);
+                for h in held {
+                    out.u32(h);
+                }
+            }
+            Reply::Bytes(bytes) => {
+                let id = bytes_blob.ok_or("a buffer's bytes nobody asked for")?;
+                s.blobs().fill(id, bytes)?;
+                out.u8(1).u32(id);
+            }
+            Reply::Commands(given, waiting) => {
+                out.u32(given.len() as u32);
+                for r in &given {
+                    out.str(r.kind).str(&r.label).str(&r.pipeline);
+                    out.u32(r.groups[0]).u32(r.groups[1]).u32(r.groups[2]);
+                    out.u32(r.bindings.len() as u32);
+                    for b in &r.bindings {
+                        out.u32(b[0]).u32(b[1]).u32(b[2]);
+                    }
+                }
+                out.u32(waiting as u32);
+            }
+            Reply::Size(_) => return Err("the build's thread answered something else".into()),
             Reply::Ran(ran) => write_ran(&mut out, &ran, &driven.stop, due, what, deadline)?,
             Reply::Screen(w, h, rgba) => {
                 let id = screen.ok_or("a screen nobody asked for")?;
@@ -968,6 +1150,38 @@ fn operate(
         }
         Ok(out.0)
     })())
+}
+
+/// Sends `command` to the build's thread and waits for its reply, within the deadline.
+fn exchange(
+    s: &Services,
+    driven: &Driven,
+    handle: u32,
+    command: Command,
+    due: Instant,
+    what: &str,
+    deadline: Duration,
+) -> Result<Reply, String> {
+    let (sent, reply) = mpsc::channel();
+    {
+        let commands = driven.commands.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(commands) = commands.as_ref() else {
+            return Err(format!("the driven build {handle} is closed"));
+        };
+        driven.stop.set_deadline(Some(due));
+        commands
+            .send((command, sent))
+            .map_err(|_| format!("the driven build {handle}'s thread has ended"))?;
+    }
+    let reply = wait(s, &reply, &driven.stop, due, what, deadline).map_err(|why| {
+        // A voice the deadline stopped is the request's failure, as a call's is.
+        if why.contains("interrupt") && (driven.stop.is_stopped() || Instant::now() >= due) {
+            past_deadline(what, deadline)
+        } else {
+            why
+        }
+    })?;
+    Ok(reply)
 }
 
 /// Writes `ran` as `drive::read_ran` reads it. A call that the deadline stopped (the trap is

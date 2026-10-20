@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 /// - `cpu`: frames with a script on the CPU (the script goes to `out/script.json`), the hash,
 ///   a call of `add`, a trap in `boom`, and a frame after the trap;
 /// - `at`: frames at 0.25 s and 3 s, outside lockstep, on the CPU, and the hash;
+/// - `record`: the subject on the GPU, recording its commands: two frames, its buffers (the
+///   newest's bytes go to `out/buffer.bin`), and the commands it submitted, a line each;
 /// - `gpu`: three frames on the GPU, the screen captured and written to `out/screen.rgba`, the
 ///   hash;
 /// - `spin`: a call of `spin`, which never ends, with a deadline of 1 s, then the hash;
@@ -98,8 +100,9 @@ fn two(n: take u32) -> u32 {
 @job
 fn main(given: take Vec<String>) -> u32 {
     let what = given[0].clone()
-    var options = if what.as_str() == "gpu" { drive::gpu() } else { drive::cpu() }
+    var options = if what.as_str() == "gpu" || what.as_str() == "record" { drive::gpu() } else { drive::cpu() }
     options.workers = 2
+    options.record = what.as_str() == "record"
     let at = if what.as_str() == "gpu" { "fx" } else { "src/build" }
     var l = drive::load(at, options)
     var lg = l.poll()
@@ -166,6 +169,65 @@ fn main(given: take Vec<String>) -> u32 {
         let Some(apol) = take ag else { return 90 }
         if let Err(e) = drive::read_ran(take apol) {
             print(f"after: {e.message()}")
+        }
+    } else if what.as_str() == "record" {
+        var f = drive::frames(b, 2, Script::frames())
+        while f.poll().is_none() { yield }
+        var l = drive::buffers(b)
+        var lg = l.poll()
+        while lg.is_none() {
+            yield
+            lg = l.poll()
+        }
+        let Some(lp) = take lg else { return 90 }
+        let held = match drive::read_buffers(take lp) {
+            Ok(h) => take h,
+            Err(e) => return failed(e),
+        }
+        print(f"buffers {held.len()}")
+        var r = drive::read_buffer(b, held[held.len() - 1])
+        var rg = r.poll()
+        while rg.is_none() {
+            yield
+            rg = r.poll()
+        }
+        let Some(rp) = take rg else { return 90 }
+        let bytes = match drive::read_bytes(take rp) {
+            Ok(d) => take d,
+            Err(e) => return failed(e),
+        }
+        let Data::Blob(blob) = bytes else { return 96 }
+        var w = files::write_blob("out/buffer.bin", blob)
+        while w.poll().is_none() { yield }
+        var c = drive::commands(b)
+        var cg = c.poll()
+        while cg.is_none() {
+            yield
+            cg = c.poll()
+        }
+        let Some(cp) = take cg else { return 90 }
+        let recorded = match drive::read_commands(take cp) {
+            Ok(x) => take x,
+            Err(e) => return failed(e),
+        }
+        for k in 0..recorded.commands.len() {
+            let c = recorded.commands[k].clone()
+            var bound = String::new()
+            for x in c.bindings {
+                bound.push_str(f" {x.handle}:{x.offset}:{x.size}")
+            }
+            print(f"command {c.kind.as_str()} {c.label.as_str()} {c.pipeline.as_str()} {c.groups.x},{c.groups.y},{c.groups.z}{bound.as_str()}")
+        }
+        print(f"waiting {recorded.waiting}")
+        var n = drive::read_buffer(b, 999999)
+        var ng = n.poll()
+        while ng.is_none() {
+            yield
+            ng = n.poll()
+        }
+        let Some(np) = take ng else { return 90 }
+        if let Err(e) = drive::read_bytes(take np) {
+            print(f"missing: {e.message()}")
         }
     } else if what.as_str() == "at" {
         var steps = 0
@@ -301,7 +363,7 @@ pub fn tool(running: mut Running) -> u32 {
 /// buffer each frame (the hash covers what it submits), with exports to call: `add`, `boom`, which panics on 13,
 /// and `spin`, which never ends.
 const SUBJECT: &str = r#"
-use std::gpu::{GpuBuffer, buffer, write}
+use std::gpu::{GpuBuffer, buffer, label, write}
 use std::input::events
 
 pub struct Game {
@@ -317,6 +379,7 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     for _ in events() {
         game.events += 1
     }
+    label("counts")
     write(mut game.counts, 0, [game.events, bitcast_u32(time)])
 }
 
@@ -417,6 +480,67 @@ fn frames_on_the_cpu_give_the_hosts_hash_and_a_trap_says_what_and_where() {
         plain.lockstep_frame(i, 60.0, 640, 360, &[]).expect("a frame");
     }
     assert_ne!(plain.hash(), host.hash(), "the script changes what the program prints");
+}
+
+/// A build loaded to record gives the tool its GPU buffers, one's bytes as the host reads them
+/// back, and the commands it submitted, each batch marked, as the host's own recording decodes
+/// them; a buffer it doesn't hold is refused.
+#[test]
+fn a_recording_builds_buffers_and_commands_come_back() {
+    let (tool, src, out) = setup("drive-record");
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &["record"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("missing: GPU error: there's no buffer 999999"), "{printed}");
+    let storage = out.join("storage");
+    let options = wrela_host::Options {
+        storage: Some(storage),
+        workers: 2,
+        record: true,
+        defer_init: true,
+        ..Default::default()
+    };
+    let mut host =
+        wrela_host::Host::load_with(src.join("build"), &options).expect("a hardware GPU");
+    host.init().expect("init");
+    for i in 0..2 {
+        host.lockstep_frame(i, 60.0, 640, 360, &[]).expect("a frame");
+    }
+    let held = host.buffers();
+    assert_eq!(value(&printed, "buffers"), held.len().to_string(), "{printed}");
+    let newest = host.read_buffer(held[held.len() - 1]).expect("read");
+    assert_eq!(std::fs::read(out.join("buffer.bin")).expect("the bytes"), newest);
+    use wrela_abi::stream::Command as C;
+    let names: Vec<String> = pipeline_names(&src.join("build"));
+    let mut want = Vec::new();
+    for batch in host.take_batches() {
+        want.push("command Batch   0,0,0".to_string());
+        for c in wrela_abi::stream::decode(&batch).expect("a batch") {
+            let (mut label, mut pipeline, mut groups, mut bound) =
+                (String::new(), String::new(), [0; 3], String::new());
+            let bind = |b: &[wrela_abi::stream::Binding]| -> String {
+                b.iter().map(|b| format!(" {}:{}:{}", b.handle, b.offset, b.size)).collect()
+            };
+            match &c {
+                C::Label { name } => label = name.to_string(),
+                C::Dispatch { pipeline: p, groups: g, bindings, .. } => {
+                    (pipeline, groups, bound) = (names[*p as usize].clone(), *g, bind(bindings));
+                }
+                C::Draw { pipeline: p, bindings, .. } => {
+                    (pipeline, bound) = (names[*p as usize].clone(), bind(bindings));
+                }
+                _ => {}
+            }
+            let [x, y, z] = groups;
+            want.push(format!(
+                "command {} {label} {pipeline} {x},{y},{z}{bound}",
+                c.opcode().name()
+            ));
+        }
+    }
+    let got: Vec<&str> = printed.lines().filter(|l| l.starts_with("command ")).collect();
+    assert_eq!(got, want, "{printed}");
+    assert!(got.iter().any(|l| l.starts_with("command Label counts ")), "{printed}");
+    assert!(printed.contains("waiting 0"), "{printed}");
 }
 
 /// `frame_at` runs one frame at the time the tool gives, as the host's own frame at that time:
@@ -1145,4 +1269,15 @@ fn a_driven_voice_past_its_deadline_is_stopped() {
     assert!(printed.contains("refused: `audio` ran past its deadline of 1 s"), "{printed}");
     assert!(printed.contains("hashed"), "{printed}");
     assert!(started.elapsed() < Duration::from_secs(20), "{:?}", started.elapsed());
+}
+
+/// The pipelines' names of the build in `dir`, by index (its manifest's).
+fn pipeline_names(dir: &Path) -> Vec<String> {
+    let text = std::fs::read_to_string(dir.join("manifest.json")).expect("manifest.json");
+    wrela_abi::manifest::Manifest::parse(&text)
+        .expect("a manifest")
+        .pipelines
+        .into_iter()
+        .map(|p| p.name)
+        .collect()
 }

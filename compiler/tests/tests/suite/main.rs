@@ -8,7 +8,6 @@ mod audio;
 mod bounds;
 mod buffers;
 mod channels;
-mod clearing;
 mod closed_list;
 mod clusters;
 mod codes;

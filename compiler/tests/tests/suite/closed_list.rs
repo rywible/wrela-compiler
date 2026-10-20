@@ -1,7 +1,8 @@
 //! AC1, AC10: language.md §20 publishes the closed list of std items the compiler knows
 //! (D-081), and the files of std's unsafe core. Both are checked against what's built: the
 //! list against the compiler's own table (`wrela_sema::defs::Lang::PATHS`), in both
-//! directions, and the core against the std files that use `unsafe`.
+//! directions, and the core against the std files that use `unsafe`. And the compiler knows
+//! nothing beyond std: its crates name nothing of the engine.
 
 use std::collections::BTreeSet;
 use wrela_tests::repo_root;
@@ -101,4 +102,21 @@ fn only_the_core_states_effects_and_thread_entries() {
     let out = wrela_driver::check(&dir);
     let codes: Vec<&str> = out.diagnostics.iter().map(|d| d.code.as_str()).collect();
     assert_eq!(codes, ["E0204", "E0204"], "{:#?}", out.diagnostics);
+}
+
+/// #42 AC7, layering: the compiler's crates name nothing of the engine (the `wrela` command's
+/// tools, which find an `engine/` beside a parts file, aren't the compiler).
+#[test]
+fn the_compilers_crates_name_nothing_of_the_engine() {
+    let root = repo_root();
+    for krate in ["syntax", "sema", "lower", "ir", "wasm", "wgsl", "driver", "diag"] {
+        for p in wrela_tests::files_under(&root.join("compiler").join(krate).join("src"), &["rs"]) {
+            let text = std::fs::read_to_string(&p).expect("read");
+            assert!(
+                !text.contains("engine::") && !text.contains("\"engine\""),
+                "{} names the engine",
+                p.display()
+            );
+        }
+    }
 }
