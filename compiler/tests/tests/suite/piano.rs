@@ -1,68 +1,13 @@
-//! Spike 14 (#48): a piano piece as a program. engine::score reads notation in constants, and a
-//! mistake in it fails the build where it is; examples/gymnopedie's score and performance pass
-//! their own tests; every number of its taste and marks is lifted; engine::piano renders the
-//! same samples every time, and in Chrome the same as on the native host, in real time without
-//! dropping out (long checks: a minute of the piece, the whole of it at full size).
+//! Spike 14 (#48): a piano piece as a program. engine::score reads notation in constants (a
+//! mistake in it fails the build where it is: engine/tests/errors); examples/gymnopedie's score
+//! and performance pass their own tests; every number of its taste and marks is lifted;
+//! engine::piano renders the same samples every time, and in Chrome the same as on the native
+//! host, in real time without dropping out (long checks: a minute of the piece, the whole of it
+//! at full size).
 
-use super::engine_package;
 use std::path::Path;
 use wrela_host::CpuBuild;
 use wrela_tests::{page, repo_root};
-
-/// The build error a score's text makes: E0704's message.
-fn score_error(name: &str, voices: &str) -> String {
-    let text = format!(
-        "use engine::score::{{Score, meter, score}}\n\nconst S: Score = score(\"s\", meter(beats: 3, unit: 4)){voices}\n"
-    );
-    let dir = engine_package(&format!("piano/{name}"), "scores", &text);
-    let out = wrela_driver::check(&dir);
-    let e = out.diagnostics.iter().find(|d| d.code.as_str() == "E0704").unwrap_or_else(|| {
-        panic!(
-            "{name}: no E0704 in {:?}",
-            out.diagnostics.iter().map(|d| &d.message).collect::<Vec<_>>()
-        )
-    });
-    e.message.clone()
-}
-
-#[test]
-fn a_mistake_in_a_score_fails_the_build_where_it_is() {
-    let cases = [
-        (
-            "short_bar",
-            r#".voice("melody", ["e4/4 g4 b4 | c5/2 | d5/2. |"])"#,
-            "s, voice `melody`, bar 2, beat 3: bar 2 holds 2 beats, but 3/4 has 3",
-        ),
-        (
-            "long_bar",
-            r#".voice("melody", ["e4/4 g4 b4 c5 |"])"#,
-            "bar 1 holds 4 beats, but 3/4 has 3",
-        ),
-        (
-            "off_the_keyboard",
-            r#".voice("melody", ["g#0/2. |"])"#,
-            "this pitch isn't one of the piano's 88 keys (A0 to C8)",
-        ),
-        ("no_octave", r#".voice("melody", ["c9/2. |"])"#, "a pitch needs an octave from 0 to 8"),
-        (
-            "lost_tie",
-            r#".voice("melody", ["e4/2.~ | f4/2. |"])"#,
-            "bar 2, beat 1: a tie continues to no note of the same pitch",
-        ),
-        ("open_hairpin", r#".voice("melody", ["e4/2. !< | f4/2. |"])"#, "a hairpin isn't ended"),
-        ("open_slur", r#".voice("melody", ["e4/2. ( | f4/2. |"])"#, "a slur isn't ended"),
-        ("unknown_mark", r#".voice("melody", ["e4/2. !loud |"])"#, "`!loud` isn't a mark"),
-        (
-            "voices_disagree",
-            r#".voice("melody", ["e4/2. | f4/2. |"]).voice("bass", ["e2/2. |"])"#,
-            "s: voice `bass` has 1 bars, but the voices before it have 2",
-        ),
-    ];
-    for (name, voices, want) in cases {
-        let got = score_error(name, voices);
-        assert!(got.contains(want), "{name}: {got}");
-    }
-}
 
 /// Every number of the taste and the marks is lifted, so a tool can change it while
 /// the piece plays (AC4).
