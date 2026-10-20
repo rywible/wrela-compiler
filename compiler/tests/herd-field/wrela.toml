@@ -1,0 +1,8 @@
+# The herd's grazer at points on the GPU, for herd.rs's comparison with spike 01's field.wgsl
+# (#42 AC7), on frozen copies of the engine and the herd: a compiler-regression input.
+[package]
+name = "herd_field"
+
+[dependencies]
+engine = { path = "../frozen/engine" }
+herd = { path = "../frozen/herd" }

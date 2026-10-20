@@ -1,7 +1,7 @@
 //! AC11: the programs the language was designed from, sketches 01–03 (design-archive-2026-10:
 //! docs/design/sketches/), written in the language as built, with the engine they're written
-//! against (the top-level `engine/` package). Each change from a sketch is noted next to its
-//! code ("Changed:"), with its reason.
+//! against (its frozen copy, compiler/tests/frozen/engine: they're the compiler's inputs). Each
+//! change from a sketch is noted next to its code ("Changed:"), with its reason.
 
 use crate::{built, tests_pass};
 use wrela_host::{CpuBuild, CpuHost, Value};

@@ -1,0 +1,9 @@
+# A frozen copy of content/wolf at dc0f28e0, on the frozen engine: round 1's wolf, ported, an input of
+# the compiler's tests (subjects.rs: against round 1's WGSL, lifted builds and their gradients),
+# never updated with content/.
+[package]
+name = "wolf"
+
+[dependencies]
+engine = { path = "../engine" }
+round1 = { path = "../round1" }

@@ -1,0 +1,742 @@
+// Fonts and text layout for a user interface: fonts as signed distance fields, baked when the
+// program is built (ttf.wrela), and text laid out a line at a time. The default fonts are Inter
+// for the UI and JetBrains Mono for source, from ui/fonts; a program may bake others. A glyph's
+// field is sampled at 32 pixels per em; the GPU reads it at any size (draw.wrela), from 10 to
+// 72 pixels.
+//
+// Text is laid out by character group (`next_cluster`): a letter with its accents, an emoji
+// with its skin tone, a flag's two letters, an emoji sequence joined by U+200D, each one glyph.
+// A group the baked fonts haven't (past Latin-1) gets a glyph made while the program runs from
+// the host's system fonts (`Renderer::fetch`, raster.wrela), and until it has, `?`'s. Groups
+// are an approximation of Unicode's extended grapheme clusters for those cases only, and
+// there's no shaping between groups: Arabic letters don't join, Indic conjuncts don't form, and
+// there are no ligatures.
+
+use raster::Made
+use ttf::{Baked, bake}
+
+/// The fonts, baked from their files: constants, so a build holds each once, and the build's
+/// cache keeps them while the files and the baker are as they were.
+@fuel(2 ** 38)
+pub const SANS: Baked = bake(embed("fonts/Inter-Regular-Latin1.ttf"), em: 32.0, spread: 4.0)
+
+@fuel(2 ** 38)
+pub const MONO: Baked = bake(embed("fonts/JetBrainsMono-Regular-Latin1.ttf"), em: 32.0, spread: 4.0)
+
+/// A face's baked font.
+fn baked(face: Face) -> borrow Baked {
+    match face {
+        Face::Sans => SANS,
+        Face::Mono => MONO,
+    }
+}
+
+/// Which font.
+pub enum Face: Copy + Eq {
+    /// Inter: proportional, for the UI.
+    Sans,
+    /// JetBrains Mono: monospace, for source and numbers in columns.
+    Mono,
+}
+
+/// A glyph: its advance (ems), where its field sits from the pen (pixels at the font's `em`),
+/// and where its field is in the atlas.
+pub struct Glyph: Copy {
+    pub advance: f32,
+    pub left: f32,
+    pub top: f32,
+    pub width: u32,
+    pub height: u32,
+    /// Into the baked font's fields.
+    offset: u32,
+    /// Its top-left texel in the atlas.
+    pub atlas_x: u32,
+    pub atlas_y: u32,
+    /// Whether its texels are a colour image (an emoji's), not a field.
+    pub color: bool,
+}
+
+/// What a glyph index stands for while a group's glyph is asked for, or couldn't be made.
+const NONE: u32 = 4294967295
+
+/// A character group past the baked fonts, and its glyph once it's made (`NONE` till then).
+pub struct Group: Clone {
+    text: String,
+    glyph: u32,
+}
+
+/// A font, from its baked constant when the program starts.
+pub struct Font: Clone {
+    /// The pixels per em its fields were sampled at, and the distance (in those pixels) that
+    /// the field's 0 and 255 stand for.
+    pub em: f32,
+    pub spread: f32,
+    /// Above and below the baseline, and between lines: ems.
+    pub ascender: f32,
+    pub descender: f32,
+    pub line_gap: f32,
+    /// What a caller sets for its look, both 0 unless it does: the space added between
+    /// glyphs, and the stroke added to each side of a glyph's ink, both ems.
+    pub tracking: f32,
+    pub weight: f32,
+    glyphs: Vec<Glyph>,
+    /// Each code point below 256: its glyph's index plus one (0: none).
+    index: [u32; 256],
+    /// The advance's change between two baked glyphs, by `left * kerned + right`: ems.
+    kerning: Vec<f32>,
+    /// How many glyphs were baked: the kerning table's side. Glyphs made later aren't kerned.
+    kerned: u32,
+    /// Character groups past the baked fonts: asked for, made, or not to be had.
+    groups: Vec<Group>,
+    /// The fields supplied with this face, including application-specific fonts.
+    fields: Vec<u8>,
+    /// `?`'s glyph: what a character the font hasn't shows.
+    missing: u32,
+}
+
+impl Font {
+    /// The font of `face`: its glyphs, each code point's, and its kerning by glyph.
+    pub fn of(face: Face) -> Font {
+        Font::from_baked(baked(face))
+    }
+
+    /// The font of `b`, a baked face of the program's choice rather than one of `Face`'s.
+    pub fn from_baked(b: Baked) -> Font {
+        let n = b.glyphs.len()
+        var glyphs: Vec<Glyph> = Vec::with_capacity(n)
+        var index = [0; 256]
+        for i in 0..n {
+            let g = b.glyphs[i]
+            glyphs.push(
+                Glyph {
+                    advance: g.advance,
+                    left: g.left,
+                    top: g.top,
+                    width: g.width,
+                    height: g.height,
+                    offset: g.offset,
+                    atlas_x: 0,
+                    atlas_y: 0,
+                    color: false,
+                },
+            )
+            if g.codepoint < 256 {
+                index[g.codepoint] = i + 1
+            }
+        }
+        var kerning: Vec<f32> = Vec::filled(n * n, 0.0)
+        for k in b.kerning {
+            kerning[k.left * n + k.right] = f32(k.units) / 8192.0
+        }
+        let missing = if index[63] > 0 { index[63] - 1 } else { 0 }
+        Font {
+            em: b.em,
+            spread: b.spread,
+            ascender: b.ascender,
+            descender: b.descender,
+            line_gap: b.line_gap,
+            tracking: 0.0,
+            weight: 0.0,
+            glyphs,
+            index,
+            kerning,
+            kerned: n,
+            groups: Vec::new(),
+            fields: b.fields.clone(),
+            missing,
+        }
+    }
+
+    pub fn count(self) -> u32 {
+        self.glyphs.len()
+    }
+
+    /// The bytes of its glyphs' fields, all of them.
+    pub fn field_bytes(self) -> u32 {
+        self.fields.len()
+    }
+
+    /// The index of the glyph for code point `cp`: `?`'s for one the font hasn't.
+    pub fn glyph_index(self, cp: u32) -> u32 {
+        if cp < 256 && self.index[cp] > 0 { self.index[cp] - 1 } else { self.missing }
+    }
+
+    /// The glyph for the character group `text[from..to]`: a baked one, one made for it, or
+    /// `?`'s.
+    pub fn group_glyph(self, text: str, from: u32, to: u32) -> u32 {
+        let (cp, end) = decode(text, from)
+        if end == to && cp < 256 && self.index[cp] > 0 {
+            return self.index[cp] - 1
+        }
+        let group = text.slice(from, to)
+        for g in self.groups {
+            if g.glyph != NONE && g.text.as_str() == group {
+                return g.glyph
+            }
+        }
+        self.missing
+    }
+
+    /// Whether `?` stands for the group because it's past the baked glyphs and hasn't been asked
+    /// for yet.
+    pub fn wants(self, group: str) -> bool {
+        let (cp, end) = decode(group, 0)
+        if end == group.len() && cp < 256 {
+            return false
+        }
+        for g in self.groups {
+            if g.text.as_str() == group {
+                return false
+            }
+        }
+        true
+    }
+
+    /// The group is asked for: it isn't wanted again, made or not.
+    pub fn ask(mut self, group: str) {
+        self.groups.push(Group { text: String::from(group), glyph: NONE })
+    }
+
+    /// The group's glyph is `made`, its texels at `x`, `y` in the atlas.
+    pub fn add(mut self, group: str, made: Made, x: u32, y: u32) {
+        let index = self.glyphs.len()
+        self.glyphs.push(
+            Glyph {
+                advance: made.advance,
+                left: made.left,
+                top: made.top,
+                width: made.width,
+                height: made.height,
+                offset: 0,
+                atlas_x: x,
+                atlas_y: y,
+                color: made.color,
+            },
+        )
+        for i in 0..self.groups.len() {
+            if self.groups[i].text.as_str() == group {
+                self.groups[i].glyph = index
+            }
+        }
+    }
+
+    /// `?`'s glyph.
+    pub fn missing(self) -> u32 {
+        self.missing
+    }
+
+    pub fn glyph(self, i: u32) -> Glyph {
+        self.glyphs[i]
+    }
+
+    /// Byte `k` of glyph `i`'s field (rows from the top).
+    pub fn field_byte(self, i: u32, k: u32) -> u8 {
+        self.fields[self.glyphs[i].offset + k]
+    }
+
+    /// The kerning between glyphs `a` and `b`: ems added to `a`'s advance.
+    pub fn kern(self, a: u32, b: u32) -> f32 {
+        if a >= self.kerned || b >= self.kerned { 0.0 } else { self.kerning[a * self.kerned + b] }
+    }
+
+    /// A line's height at `size` pixels per em.
+    pub fn line_height(self, size: f32) -> f32 {
+        (self.ascender - self.descender + self.line_gap) * size
+    }
+
+    /// Lays `text` out at `size` pixels per em from a pen at `pen` (pixels): `visit(i, g, at)`
+    /// for each character group, with its first byte, its glyph's index and the pen there
+    /// (kerned), until `visit` returns false. The pen after the last glyph laid out.
+    pub fn walk(self, text: str, size: f32, pen: f32, visit: fn(u32, u32, f32) -> bool) -> f32 {
+        var x = pen
+        var prev = 4294967295
+        var i = 0
+        while i < text.len() {
+            let next = next_cluster(text, i)
+            let g = self.group_glyph(text, i, next)
+            if prev != 4294967295 {
+                x += self.kern(prev, g) * size
+            }
+            if !visit(i, g, x) {
+                return x
+            }
+            x += (self.glyphs[g].advance + self.tracking) * size
+            prev = g
+            i = next
+        }
+        x
+    }
+
+    /// How wide `text` is at `size` pixels per em.
+    pub fn measure(self, text: str, size: f32) -> f32 {
+        self.walk(text, size, 0.0, |_i, _g, _pen| true)
+    }
+
+    /// The byte offset in `text` nearest `x` pixels from its start, at `size`: where a click
+    /// puts a text cursor.
+    pub fn offset_at(self, text: str, size: f32, x: f32) -> u32 {
+        var at = 0
+        var distance = abs(x)
+        let end = self.walk(text, size, 0.0, |i, _g, pen| {
+            let d = abs(x - pen)
+            if d <= distance {
+                distance = d
+                at = i
+            }
+            true
+        })
+        if abs(x - end) <= distance {
+            at = text.len()
+        }
+        at
+    }
+
+    /// The caret's x position at byte offset `at`, including kerning before the next glyph.
+    pub fn caret_at(self, text: str, size: f32, at: u32) -> f32 {
+        self.walk(text, size, 0.0, |i, _g, _pen| i != at)
+    }
+
+    /// `text` broken into lines no wider than `width` at `size` pixels per em, each line's
+    /// byte range `(from, to)`: at each newline, and at the last space that keeps a line narrow
+    /// enough (the space left out). A word wider than a line breaks where it meets the edge. An
+    /// empty line is still a line, so a caret has somewhere to be.
+    pub fn wrap(self, text: str, size: f32, width: f32) -> Vec<(u32, u32)> {
+        var lines: Vec<(u32, u32)> = Vec::new()
+        for part in text.split("\n") {
+            var from = part.0
+            while true {
+                let end = self.fit(text, from, part.1, size, width)
+                if end >= part.1 {
+                    lines.push((from, part.1))
+                    break
+                }
+                // Back to the last space that fits, if the line has one past its start.
+                var cut = end
+                while cut > from && text.byte(cut) != 32 {
+                    cut = previous(text, cut)
+                }
+                if cut > from {
+                    lines.push((from, cut))
+                    from = cut + 1
+                } else {
+                    lines.push((from, end))
+                    from = end
+                }
+            }
+        }
+        lines
+    }
+
+    /// Where the longest run of `text` from byte `from` (before `to`) no wider than `width`
+    /// ends: at least one character, so a line always moves on.
+    fn fit(self, text: str, from: u32, to: u32, size: f32, width: f32) -> u32 {
+        var end = to
+        var first = true
+        self.walk(text.slice(from, to), size, 0.0, |i, g, pen| {
+            if !first && pen + (self.glyphs[g].advance + self.tracking) * size > width {
+                end = from + i
+                return false
+            }
+            first = false
+            true
+        })
+        end
+    }
+
+    /// Glyph `i`'s place in the atlas.
+    pub fn place(mut self, i: u32, x: u32, y: u32) {
+        self.glyphs[i].atlas_x = x
+        self.glyphs[i].atlas_y = y
+    }
+}
+
+/// The code point at byte `i` of UTF-8 `s`, and where the next one starts. A byte that doesn't
+/// start a valid sequence is U+FFFD, one byte long.
+pub fn decode(s: str, i: u32) -> (u32, u32) {
+    let Some((cp, len)) = s.char_at(i) else { return (65533, i + 1) }
+    (cp, i + len)
+}
+
+/// Whether `cp` joins the group before it: a combining mark, a variation selector, an emoji's
+/// skin tone or a tag.
+fn extends(cp: u32) -> bool {
+    (cp >= 0x300 && cp <= 0x36F) ||
+        (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+        (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+        (cp >= 0x20D0 && cp <= 0x20FF) ||
+        (cp >= 0xFE00 && cp <= 0xFE0F) ||
+        (cp >= 0xFE20 && cp <= 0xFE2F) ||
+        (cp >= 0x1F3FB && cp <= 0x1F3FF) ||
+        (cp >= 0xE0020 && cp <= 0xE007F) ||
+        (cp >= 0xE0100 && cp <= 0xE01EF)
+}
+
+/// A regional indicator: two make a flag.
+fn regional(cp: u32) -> bool {
+    cp >= 0x1F1E6 && cp <= 0x1F1FF
+}
+
+/// Where the character group that starts at byte `i` of `s` ends: the character, any marks,
+/// selectors, skin tones and tags that join it, a second regional indicator after a first (a
+/// flag), and whatever U+200D joins on (an emoji sequence).
+pub fn next_cluster(s: str, i: u32) -> u32 {
+    let (cp, after) = decode(s, i)
+    var j = after
+    if regional(cp) && j < s.len() {
+        let (b, k) = decode(s, j)
+        if regional(b) {
+            j = k
+        }
+    }
+    while j < s.len() {
+        let (c, k) = decode(s, j)
+        if c == 0x200D {
+            j = if k < s.len() { decode(s, k).1 } else { k }
+        } else if extends(c) {
+            j = k
+        } else {
+            break
+        }
+    }
+    j
+}
+
+/// Where the character group that ends at byte `i` of `s` starts.
+pub fn previous_cluster(s: str, i: u32) -> u32 {
+    var at = 0
+    var start = 0
+    while at < i {
+        start = at
+        at = next_cluster(s, at)
+    }
+    start
+}
+
+/// Where the character before byte `i` of UTF-8 `s` starts.
+pub fn previous(s: str, i: u32) -> u32 {
+    var j = i
+    while j > 0 {
+        j -= 1
+        if (u32(s.byte(j)) & 192) != 128 {
+            return j
+        }
+    }
+    0
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// A byte that doesn't start a character is one replacement character (std's `char_at` tests
+/// UTF-8's every invalid form); a character decodes whole.
+@test
+fn decode_replaces_what_isnt_a_character() {
+    assert(decode("a狼", 1) == (29436, 4))
+    assert(decode("a狼", 2) == (65533, 3))
+}
+
+@test
+fn wrapping_breaks_at_spaces_newlines_and_long_words() {
+    let font = Font::of(Face::Sans)
+    let size = 16.0
+    let text = "one two three\n\nfour"
+    // Wide enough for "one two" but not "one two three".
+    let width = font.measure("one two", size) + 1.0
+    let lines = font.wrap(text, size, width)
+    assert(lines.len() == 4, f"{lines.len()} lines")
+    assert(text.slice(lines[0].0, lines[0].1) == "one two")
+    assert(text.slice(lines[1].0, lines[1].1) == "three")
+    assert(lines[2].0 == lines[2].1, "the empty line between the newlines")
+    assert(text.slice(lines[3].0, lines[3].1) == "four")
+    // A word wider than a line breaks inside it, and every line fits.
+    let long = "abcdefghijklmnop"
+    let narrow = font.measure("abcd", size) + 0.5
+    let parts = font.wrap(long, size, narrow)
+    assert(parts.len() >= 4, f"{parts.len()} parts")
+    var total = 0
+    for p in parts {
+        assert(font.measure(long.slice(p.0, p.1), size) <= narrow)
+        total += p.1 - p.0
+    }
+    assert(total == long.len(), "every byte is on a line once")
+}
+
+@test
+fn wrapping_accounts_for_tracking() {
+    var font = Font::of(Face::Sans)
+    font.tracking = 0.25
+    let size = 16.0
+    let text = "aaaa"
+    let width = font.measure("aa", size) - 0.5 * font.tracking * size
+    let lines = font.wrap(text, size, width)
+    for line in lines {
+        assert(font.measure(text.slice(line.0, line.1), size) <= width)
+    }
+}
+
+fn chars(cps: [u32]) -> String {
+    var s = String::new()
+    for c in cps {
+        s.push_char(c)
+    }
+    s
+}
+
+/// A letter and its accent, a skin tone, a flag and an emoji sequence are each one group; the
+/// caret moves over each whole.
+@test
+fn character_groups_hold_what_shows_as_one() {
+    // "e" + U+0301, 👍🏽, 🇺🇸, 👩‍💻, then "x".
+    let s = chars([101, 0x301, 0x1F44D, 0x1F3FD, 0x1F1FA, 0x1F1F8, 0x1F469, 0x200D, 0x1F4BB, 120])
+    let t = s.as_str()
+    var starts: Vec<u32> = Vec::new()
+    var i = 0
+    while i < t.len() {
+        starts.push(i)
+        i = next_cluster(t, i)
+    }
+    // Bytes: e (1) + U+0301 (2); two 4-byte; two 4-byte; 4 + 3 + 4; x.
+    assert(starts == Vec::from([0, 3, 11, 19, 30]), f"{starts.len()} groups")
+    assert(
+        previous_cluster(t, 30) == 19 && previous_cluster(t, 3) == 0 && previous_cluster(t, 0) == 0,
+    )
+    // A lone regional indicator, and a joiner at the end, still end.
+    let lone = chars([0x1F1FA, 97])
+    assert(next_cluster(lone.as_str(), 0) == 4)
+    let joined = chars([0x1F469, 0x200D])
+    assert(next_cluster(joined.as_str(), 0) == joined.len())
+}
+
+/// A glyph made later is drawn for its group, isn't kerned, and leaves the baked kerning as it
+/// was.
+@test
+fn made_glyphs_keep_the_baked_kerning() {
+    var font = Font::of(Face::Sans)
+    let a = font.glyph_index(65)
+    let v = font.glyph_index(86)
+    let kerned = font.kern(a, v)
+    assert(kerned != 0.0)
+    let wolf = chars([0x72FC])
+    assert(
+        font.wants(wolf.as_str()) &&
+            font.group_glyph(wolf.as_str(), from: 0, to: 3) == font.missing(),
+    )
+    font.ask(wolf.as_str())
+    assert(!font.wants(wolf.as_str()), "asked once")
+    let made = Made {
+        advance: 1.0,
+        left: 0.0,
+        top: 30.0,
+        width: 4,
+        height: 4,
+        color: false,
+        texels: Vec::filled(64, 0),
+    }
+    font.add(wolf.as_str(), made, x: 1, y: 600)
+    let g = font.group_glyph(wolf.as_str(), from: 0, to: 3)
+    assert(g == font.count() - 1 && font.glyph(g).atlas_y == 600)
+    assert(font.kern(a, v) == kerned, "the baked pairs are as they were")
+    assert(font.kern(a, g) == 0.0 && font.kern(g, v) == 0.0)
+    // Laid out: "A" then the made glyph's em.
+    let text = chars([65, 0x72FC])
+    let advance = font.glyph(a).advance
+    assert(abs(font.measure(text.as_str(), 10.0) - 10.0 * (advance + 1.0)) < 1.0e-4)
+}
+
+/// Made glyphs go below the baked ones, shelf by shelf, and stop when the rows are full.
+@test
+fn made_glyphs_fill_their_rows_and_stop() {
+    var fonts = Fonts::load()
+    let first = fonts.place_made(w: 100, h: 40)
+    assert(first == Some(vec2u(1, fonts.baked)))
+    assert(fonts.place_made(w: 100, h: 10) == Some(vec2u(102, fonts.baked)))
+    assert(fonts.place_made(w: 2000, h: 10).is_none(), "wider than the atlas")
+    var placed = 0
+    while fonts.place_made(w: 1000, h: 100).is_some() {
+        placed += 1
+    }
+    assert(placed == (MADE_ROWS - 41) / 101, f"{placed} rows")
+}
+
+@test
+fn offset_uses_kerned_caret_positions() {
+    let font = Font::of(Face::Sans)
+    let a = font.glyph_index(65)
+    let v = font.glyph_index(86)
+    let advance = font.glyph(a).advance
+    let next = advance + font.kern(a, v)
+    assert(next < advance)
+    let x = 0.25 * (next + advance)
+    assert(x > 0.5 * next && x < 0.5 * advance)
+    assert(font.offset_at("AV", 1.0, x) == 1)
+    assert(abs(font.caret_at("AV", 1.0, 1) - next) < 1.0e-6)
+}
+
+/// The two fonts, and where their glyphs are in one atlas: `width` × `height` texels, the baked
+/// glyphs in its first `baked` rows and glyphs made later below them, shelf by shelf.
+pub struct Fonts: Clone {
+    pub sans: Font,
+    pub mono: Font,
+    pub width: u32,
+    pub height: u32,
+    pub baked: u32,
+    /// Where the next made glyph goes: the shelf's left and top, and its height so far.
+    shelf: vec3u,
+}
+
+/// Rows of the atlas for glyphs made while the program runs.
+pub const MADE_ROWS: u32 = 1024
+
+/// Each glyph's place in an atlas `width` texels wide, shelf by shelf: the glyphs in order,
+/// each shelf as tall as its tallest, a texel apart so filtering doesn't bleed. Returns the
+/// height used.
+fn pack(font: mut Font, width: u32, start: u32) -> u32 {
+    var x = 1
+    var y = start
+    var shelf = 0
+    for i in 0..font.count() {
+        let g = font.glyph(i)
+        if x + g.width + 1 > width {
+            x = 1
+            y += shelf + 1
+            shelf = 0
+        }
+        font.place(i, x, y)
+        x += g.width + 1
+        shelf = max(shelf, g.height)
+    }
+    y + shelf + 1
+}
+
+impl Fonts {
+    /// Both fonts, their glyphs placed in an atlas 1024 texels wide.
+    pub fn load() -> Fonts {
+        var sans = Font::of(Face::Sans)
+        var mono = Font::of(Face::Mono)
+        let width = 1024
+        let mid = pack(mut sans, width, 1)
+        let baked = pack(mut mono, width, mid)
+        Fonts { sans, mono, width, height: baked + MADE_ROWS, baked, shelf: vec3u(1, baked, 0) }
+    }
+
+    /// Fonts of two baked faces of the program's choice: `Face::Sans` draws with the first and
+    /// `Face::Mono` with the second. `load` gives the default pair, Inter and JetBrains Mono.
+    pub fn from_baked(first: Baked, second: Baked) -> Fonts {
+        var sans = Font::from_baked(first)
+        var mono = Font::from_baked(second)
+        let width = 1024
+        let mid = pack(mut sans, width, 1)
+        let baked = pack(mut mono, width, mid)
+        Fonts { sans, mono, width, height: baked + MADE_ROWS, baked, shelf: vec3u(1, baked, 0) }
+    }
+
+    pub fn font(self, face: Face) -> borrow Font {
+        match face {
+            Face::Sans => self.sans,
+            Face::Mono => self.mono,
+        }
+    }
+
+    pub fn font_mut(mut self, face: Face) -> mut Font {
+        match face {
+            Face::Sans => mut self.sans,
+            Face::Mono => mut self.mono,
+        }
+    }
+
+    /// Where a made glyph `w` × `h` texels goes in the atlas, a texel from the next: on this
+    /// shelf, or a new one below it; `None` when the made rows are full.
+    pub fn place_made(mut self, w: u32, h: u32) -> Option<vec2u> {
+        if w + 2 > self.width {
+            return None
+        }
+        if self.shelf.x + w + 1 > self.width {
+            self.shelf = vec3u(1, self.shelf.y + self.shelf.z + 1, 0)
+        }
+        if self.shelf.y + h + 1 > self.height {
+            return None
+        }
+        let at = vec2u(self.shelf.x, self.shelf.y)
+        self.shelf = vec3u(self.shelf.x + w + 1, self.shelf.y, max(self.shelf.z, h))
+        Some(at)
+    }
+
+    /// The baked rows' texels, RGBA8 with each glyph's field in red, rows from the top.
+    pub fn atlas(self) -> Vec<u8> {
+        var bytes: Vec<u8> = Vec::filled(self.width * self.baked * 4, 0)
+        for f in 0..2 {
+            borrow font = self.font(if f == 0 { Face::Sans } else { Face::Mono })
+            for i in 0..font.kerned {
+                let g = font.glyph(i)
+                for row in 0..g.height {
+                    let base = ((g.atlas_y + row) * self.width + g.atlas_x) * 4
+                    for col in 0..g.width {
+                        let v = font.field_byte(i, row * g.width + col)
+                        bytes[base + col * 4] = v
+                        bytes[base + col * 4 + 3] = 255
+                    }
+                }
+            }
+        }
+        bytes
+    }
+}
+
+@test
+fn rebuilding_the_baked_atlas_ignores_made_glyphs() {
+    var fonts = Fonts::load()
+    let before = fonts.atlas()
+    fonts.sans.ask("狼")
+    fonts.sans.add(
+        "狼",
+        Made {
+            advance: 1.0,
+            left: 0.0,
+            top: 30.0,
+            width: 4,
+            height: 4,
+            color: false,
+            texels: Vec::filled(64, 0),
+        },
+        x: 1,
+        y: fonts.baked,
+    )
+    assert(fonts.atlas() == before)
+}
+
+@test
+fn caller_fonts_keep_their_own_fields_and_atlas_places() {
+    var glyphs: Vec<ttf::BakedGlyph> = Vec::new()
+    glyphs.push(
+        ttf::BakedGlyph {
+            codepoint: 63,
+            advance: 0.5,
+            left: 0.0,
+            top: 1.0,
+            width: 2,
+            height: 1,
+            offset: 0,
+        },
+    )
+    var first = Baked {
+        em: 9.0,
+        spread: 2.0,
+        ascender: 0.8,
+        descender: -0.2,
+        line_gap: 0.0,
+        glyphs,
+        kerning: Vec::new(),
+        fields: Vec::filled(2, 17),
+    }
+    var second = first.clone()
+    second.fields[0] = 231
+    let fonts = Fonts::from_baked(first, second)
+    first.fields[0] = 0
+    assert(fonts.sans.field_byte(i: 0, k: 0) == 17)
+    assert(fonts.mono.field_byte(i: 0, k: 0) == 231)
+    let bytes = fonts.atlas()
+    let a = fonts.sans.glyph(0)
+    let b = fonts.mono.glyph(0)
+    assert(a.atlas_y != b.atlas_y)
+    assert(bytes[(a.atlas_y * fonts.width + a.atlas_x) * 4] == 17)
+    assert(bytes[(b.atlas_y * fonts.width + b.atlas_x) * 4] == 231)
+}

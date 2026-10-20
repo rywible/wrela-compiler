@@ -1,0 +1,869 @@
+// Round 1's grazer (design-archive-2026-10: experiments/agent-authoring/grazer/creature.wgsl),
+// ported to the engine's creature API: the same joints, and the same parts in the same order,
+// each now a named part on a bone. It matches its WGSL within 0.5 mm near the surface (AC7);
+// where a port's numbers differ from the WGSL's, it's by rounding: a part written in its bone's
+// space subtracts the bone's position where the WGSL subtracted the part's.
+//
+// A large quadruped herbivore (bison × deer × camel), standing. Metres, +y up, ground at y = 0,
+// facing +z. Round 1 evaluated the whole field at the mirrored point, so every paired part is
+// written once on the +x (right) side: here every item is mirrored, the midline's too (its
+// noise isn't symmetric).
+//
+// Changed from the WGSL:
+// - Its colour (`albedo`: dapples, a rump patch, a countershaded belly, socks, a cape) isn't
+//   ported. Each part carries a coat of its own instead (channels per part), from the WGSL's
+//   palette.
+
+use engine::creature::{Creature, Frame, Modifier, Skeleton, creature, cut, frame, ground, smooth}
+use round1::shapes::{
+    FlatCone, NOISE3_LIPSCHITZ, ell, fbm3, fbm3_lipschitz, fbm3_range, flat_cone, mirror_x, noise3,
+    rot_x, sd_box, sstep, sstep_slope,
+}
+use std::field::{Blend, Color, Surface, cuboid, rgb, round_cone, smax, sphere}
+use std::quat::Quat
+
+// ---- channels: a coat per part ------------------------------------------------------------------
+
+/// What a point of the grazer carries: its coat's colour (round 1's palette).
+pub struct Coat: Copy + GpuData + Blend {
+    pub albedo: Color,
+}
+
+const HIDE = Coat { albedo: rgb(r: 0.12, g: 0.062, b: 0.030) }
+const WOOL = Coat { albedo: rgb(r: 0.058, g: 0.035, b: 0.02) }
+const PALE = Coat { albedo: rgb(r: 0.20, g: 0.13, b: 0.08) }
+const SOCK = Coat { albedo: rgb(r: 0.05, g: 0.032, b: 0.022) }
+const HOOF = Coat { albedo: rgb(r: 0.022, g: 0.019, b: 0.017) }
+const EYE = Coat { albedo: rgb(r: 0.008, g: 0.006, b: 0.005) }
+const HORN = Coat { albedo: rgb(r: 0.035, g: 0.03, b: 0.026) }
+const TUFT = Coat { albedo: rgb(r: 0.03, g: 0.02, b: 0.013) }
+
+// ---- skeleton -----------------------------------------------------------------------------------
+
+// The midline chain
+pub const PELVIS: vec3 = vec3(0.0, 1.30, 0.00)
+pub const SPINE: vec3 = vec3(0.0, 1.36, 0.50)
+pub const CHEST: vec3 = vec3(0.0, 1.36, 1.00)
+pub const NECK0: vec3 = vec3(0.0, 1.28, 1.12)
+pub const NECK1: vec3 = vec3(0.0, 1.48, 1.38)
+pub const NECK2: vec3 = vec3(0.0, 1.68, 1.51)
+pub const NECK3: vec3 = vec3(0.0, 1.86, 1.60)
+pub const HEAD: vec3 = vec3(0.0, 2.00, 1.66) // poll; the head bone points forward and down
+pub const HEAD_PITCH: f32 = 0.65 // radians below horizontal
+pub const TAIL0: vec3 = vec3(0.0, 1.36, -0.30)
+pub const TAIL1: vec3 = vec3(0.0, 1.30, -0.37)
+pub const TAIL2: vec3 = vec3(0.0, 1.20, -0.41)
+pub const TAIL3: vec3 = vec3(0.0, 1.07, -0.42)
+pub const TAIL4: vec3 = vec3(0.0, 0.94, -0.42)
+pub const TAIL5: vec3 = vec3(0.0, 0.81, -0.415)
+pub const TAIL_END: vec3 = vec3(0.0, 0.68, -0.41)
+// The right hind leg (parent PELVIS)
+pub const HIP: vec3 = vec3(0.21, 1.18, 0.00)
+pub const STIFLE: vec3 = vec3(0.22, 0.71, 0.17) // femur 0.50, bends forward
+pub const HOCK: vec3 = vec3(0.20, 0.32, -0.055) // tibia 0.45, bends back
+pub const HFETLOCK: vec3 = vec3(0.20, 0.10, -0.035) // cannon 0.22
+// The right fore leg (parent CHEST)
+pub const SCAPULA: vec3 = vec3(0.22, 1.48, 0.86) // top of the shoulder blade (withers)
+pub const SHOULDER: vec3 = vec3(0.26, 1.12, 1.18) // point of the shoulder
+pub const ELBOW: vec3 = vec3(0.23, 0.73, 0.96) // humerus 0.45, slopes back
+pub const KNEE: vec3 = vec3(0.21, 0.31, 0.97) // forearm 0.42, vertical
+pub const FFETLOCK: vec3 = vec3(0.205, 0.10, 0.99) // cannon 0.21
+// Attachments in the head's space (x lateral, y up, z along the head)
+pub const EYE_AT: vec3 = vec3(0.096, 0.03, 0.185)
+pub const EAR_BASE: vec3 = vec3(0.088, 0.035, -0.015)
+pub const HORN0: vec3 = vec3(0.07, 0.085, 0.045)
+pub const HORN1: vec3 = vec3(0.165, 0.10, 0.025)
+pub const HORN2: vec3 = vec3(0.205, 0.16, 0.01)
+pub const HORN3: vec3 = vec3(0.20, 0.215, 0.03)
+
+/// The skeleton: the midline chain, the tail, and four legs (fore right, fore left, hind
+/// right, hind left: the gait's order), each left one paired with its right.
+pub fn skeleton() -> Skeleton {
+    var s = Skeleton::new()
+    let pelvis = s.root("pelvis", PELVIS)
+    let spine = s.joint("spine", pelvis, SPINE)
+    let chest = s.joint("chest", spine, CHEST)
+    let n0 = s.joint("neck 0", chest, NECK0)
+    let n1 = s.joint("neck 1", n0, NECK1)
+    let n2 = s.joint("neck 2", n1, NECK2)
+    let n3 = s.joint("neck 3", n2, NECK3)
+    s.joint("head", n3, HEAD)
+    let t0 = s.joint("tail 0", pelvis, TAIL0)
+    let t1 = s.joint("tail 1", t0, TAIL1)
+    let t2 = s.joint("tail 2", t1, TAIL2)
+    let t3 = s.joint("tail 3", t2, TAIL3)
+    let t4 = s.joint("tail 4", t3, TAIL4)
+    s.joint("tail 5", t4, TAIL5)
+    let (scapula, _) = s.joint_pair("scapula right", "scapula left", chest, SCAPULA)
+    s.leg_pair(
+        ["shoulder right", "elbow right", "knee right", "fore fetlock right"],
+        ["shoulder left", "elbow left", "knee left", "fore fetlock left"],
+        scapula,
+        [SHOULDER, ELBOW, KNEE, FFETLOCK],
+    )
+    s.leg_pair(
+        ["hip right", "stifle right", "hock right", "hind fetlock right"],
+        ["hip left", "stifle left", "hock left", "hind fetlock left"],
+        pelvis,
+        [HIP, STIFLE, HOCK, HFETLOCK],
+    )
+    s
+}
+
+/// The head's space: at the poll, pitched down.
+pub fn head_frame() -> Frame {
+    frame(HEAD, turn: Quat::axis_angle(vec3(1.0, 0.0, 0.0), HEAD_PITCH))
+}
+
+/// A point in the head's space, as round 1's `head_space`.
+fn head_space(p: vec3) -> vec3 {
+    rot_x(p - HEAD, -HEAD_PITCH)
+}
+
+// ---- shapes of the grazer's own -----------------------------------------------------------------
+
+/// The local frame of the bone from `a` to `b`: z along the bone (0 at `a`), x lateral, y = z ×
+/// x. For a leg bone pointing down, local +y is forward.
+fn bone_space(p: vec3, a: vec3, b: vec3) -> vec3 {
+    let d = normalize(b - a)
+    let sx = normalize(vec3(1.0, 0.0, 0.0) - d * d.x)
+    let sy = cross(d, sx)
+    let q = p - a
+    vec3(dot(q, sx), dot(q, sy), dot(q, d))
+}
+
+/// An ellipsoidal muscle on the bone from `a` to `b`, a fraction `t` along it, offset by `off`
+/// in the bone's frame (round 1's `muscle`); with `noise` times `noise3` at `freq` per metre at
+/// the point in the creature's space (`origin` is where this space's origin is there).
+pub struct Muscle: Copy + GpuData {
+    pub a: vec3,
+    pub t: f32,
+    pub b: vec3,
+    pub noise: f32,
+    pub r: vec3,
+    pub freq: f32,
+    pub origin: vec3,
+    pub off: vec2,
+}
+
+/// A muscle of radii `r` on the bone from `a` to `b` (in the space of the bone it moves
+/// with, at `at`), `t` along it, offset by `off`.
+pub fn muscle(a: vec3, b: vec3, at: vec3, t: f32, off: vec2, r: vec3) -> Muscle {
+    Muscle { a: a - at, b: b - at, t, off, r, noise: 0.0, freq: 0.0, origin: at }
+}
+
+impl Surface for Muscle {
+    fn distance(self, p: vec3) -> f32 {
+        let q = bone_space(p, self.a, self.b)
+        let d = ell(self.r).distance(
+            q - vec3(self.off.x, self.off.y, self.t * length(self.b - self.a)),
+        )
+        if self.noise != 0.0 { d + self.noise * noise3((p + self.origin) * self.freq) } else { d }
+    }
+
+    /// The ellipsoid's, in a turned frame, within `near` plus the noise's reach, and the
+    /// noise's.
+    fn lipschitz(self, near: f32) -> f32 {
+        let n = abs(self.noise)
+        ell(self.r).lipschitz(near + n) + n * abs(self.freq) * NOISE3_LIPSCHITZ
+    }
+}
+
+/// A hoof's horn, in its fetlock's frame (`drop` above the ground): a round cone, a flat sole
+/// on the ground, and a cleft between the claws.
+pub struct Hoof: Copy + GpuData {
+    pub drop: f32,
+}
+
+impl Surface for Hoof {
+    fn distance(self, p: vec3) -> f32 {
+        let q = p + vec3(0.0, self.drop, 0.0)
+        var h = round_cone(
+            vec3(0.0, 0.032, 0.045),
+            vec3(0.0, 0.078, 0.018),
+            r_top: 0.062,
+            r_bottom: 0.043,
+        )
+            .distance(q)
+        h = smax(h, -q.y, 0.006)
+        smax(h, -sd_box(q - vec3(0.0, 0.03, 0.10), vec3(0.004, 0.05, 0.05)), 0.004)
+    }
+
+    /// A cone, a plane and a box (each exact), joined by smooth maxima.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// The ear's frame, from its base in the head's space.
+fn ear_space(h: vec3) -> vec3 {
+    let dir = normalize(vec3(0.9, 0.15, -0.4))
+    let fwd = normalize(vec3(0.5, 0.3, 0.8))
+    let sx = normalize(fwd - dir * dot(fwd, dir))
+    let sy = cross(dir, sx)
+    let q = h - EAR_BASE
+    vec3(dot(q, sx), dot(q, sy), dot(q, dir))
+}
+
+/// A leaf-shaped ear, thin along its x, cupped on its front face, in the head's space.
+pub struct Ear: Copy + GpuData {
+    pub cup: f32,
+}
+
+impl Surface for Ear {
+    fn distance(self, h: vec3) -> f32 {
+        let e = ear_space(h)
+        let d = round_cone(
+            vec3(0.0, 0.0, 0.03),
+            vec3(0.0, 0.0, 0.15),
+            r_top: 0.042,
+            r_bottom: 0.014,
+        )
+            .distance(vec3(e.x * 1.9, e.y, e.z)) /
+            1.9
+        let cup = round_cone(
+            vec3(0.0, 0.0, 0.05),
+            vec3(0.0, 0.0, 0.145),
+            r_top: 0.031,
+            r_bottom: 0.009,
+        )
+            .distance(vec3((e.x - self.cup) * 1.9, e.y, e.z)) /
+            1.9
+        smax(d, -cup, 0.004)
+    }
+
+    /// Two cones squashed by 1.9 across x and divided by it: each at most 1.9 / 1.9 = 1, then
+    /// a smooth maximum.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+// ---- modifiers ----------------------------------------------------------------------------------
+
+/// Where the woolly cape grows (the hump, the neck, the shoulders, the throat, the upper fore
+/// legs; not the face), at the mirrored point.
+fn cape_mask(p: vec3) -> f32 {
+    let zs = p.z + 0.6 * (p.y - 1.2) + 0.08 * noise3(p * 4.0)
+    let fore = sstep(zs, from: 0.35, to: 0.65) * sstep(p.y, from: 0.8, to: 1.05)
+    let chaps = 0.4 *
+        sstep(p.z, from: 0.7, to: 0.88) *
+        sstep(p.z, from: 1.23, to: 1.06) *
+        sstep(p.y, from: 0.58, to: 0.8)
+    let face = sstep(length(head_space(p) - vec3(0.0, -0.02, 0.32)), from: 0.2, to: 0.36)
+    max(fore, chaps) * face
+}
+
+/// The woolly cape: it inflates and roughens what's before it, divided to stay near
+/// 1-Lipschitz.
+pub struct Cape: Copy + GpuData {
+    pub depth: f32,
+}
+
+/// The most the cape's shag adds: its base, fbm3's range and noise3's.
+fn shag_most(depth: f32) -> f32 {
+    depth + 0.014 * fbm3_range(3) + 0.012
+}
+
+impl Modifier for Cape {
+    fn apply(self, d: f32, p: vec3) -> f32 {
+        let m = cape_mask(mirror_x(p))
+        if m > 0.0 {
+            let shag = m *
+                (self.depth +
+                    0.014 * fbm3(p * vec3(9.0, 5.0, 9.0), 3) +
+                    0.012 * noise3(
+                        p * 4.0 + 5.0,
+                    ))
+            (d - shag) / (1.0 + 0.4 * m)
+        } else {
+            d
+        }
+    }
+
+    /// With s the shag and m the mask: ∇((d − s) / (1 + 0.4 m)) is at most |∇d| + |∇s| plus
+    /// |d − s| 0.4 |∇m|, and within `near` of the surface |d − s| ≤ 1.4 near. The mask's
+    /// gradient: its steps' slopes times their arguments' (the cape's line rises 0.6 per metre
+    /// and wanders by noise; the face's is a distance, 1); the shag's: the mask's times its
+    /// largest, plus its noise's bounds.
+    fn lipschitz(self, inner: f32, near: f32) -> f32 {
+        let line = length(vec2(1.0, 0.6)) + 0.08 * 4.0 * NOISE3_LIPSCHITZ
+        let fore = sstep_slope(from: 0.35, to: 0.65) * line + sstep_slope(from: 0.8, to: 1.05)
+        let chaps = 0.4 *
+            (sstep_slope(from: 0.7, to: 0.88) +
+                sstep_slope(from: 1.23, to: 1.06) +
+                sstep_slope(from: 0.58, to: 0.8))
+        let mask = max(fore, chaps) + sstep_slope(from: 0.2, to: 0.36)
+        let shag = mask * shag_most(self.depth) +
+            0.014 * 9.0 * fbm3_lipschitz(3) +
+            0.012 * 4.0 * NOISE3_LIPSCHITZ
+        inner + shag + 1.4 * near * 0.4 * mask
+    }
+
+    fn widen(self, near: f32) -> f32 {
+        1.4 * near + shag_most(self.depth)
+    }
+}
+
+/// A neck cone of round 1's (`cone_sq`), on the neck's base bone: squashed across x by `sx`,
+/// its ends on the midline.
+pub fn neck_cone(a: vec3, c: vec3, r1: f32, r2: f32, sx: f32) -> FlatCone {
+    flat_cone(a - NECK0, c - NECK0, r1, r2, sx, scale_ends: false)
+}
+
+/// A tail segment from `a` to `c`, on the bone at `a`.
+fn tail_cone(a: vec3, c: vec3, r1: f32, r2: f32) -> std::field::With<std::field::RoundCone, Coat> {
+    round_cone(vec3(), c - a, r_top: r1, r_bottom: r2).with(HIDE)
+}
+
+// ---- the grazer ---------------------------------------------------------------------------------
+
+/// The grazer, standing.
+pub fn grazer() -> Creature<Coat> {
+    let s = skeleton()
+    let b = |name: Text| s.find(name)
+    let (pelvis, chest, head) = (b("pelvis"), b("chest"), b("head"))
+    let (shoulder, elbow, knee, ffet) = (
+        b("shoulder right"),
+        b("elbow right"),
+        b("knee right"),
+        b("fore fetlock right"),
+    )
+    let (hip, stifle, hock, hfet) = (
+        b("hip right"),
+        b("stifle right"),
+        b("hock right"),
+        b("hind fetlock right"),
+    )
+    creature(s)
+        .group(
+            "torso",
+            |g| {
+                g.join(
+                    "barrel",
+                    pelvis,
+                    ell(vec3(0.37, 0.33, 0.60))
+                        .translate(vec3(0.0, 1.10, 0.53) - PELVIS)
+                        .with(HIDE),
+                )
+                    .join(
+                        "chest",
+                        chest,
+                        ell(vec3(0.36, 0.35, 0.34))
+                            .translate(vec3(0.0, 1.14, 0.96) - CHEST)
+                            .with(WOOL),
+                        seam: smooth(0.14),
+                    )
+                    .join(
+                        "rump",
+                        pelvis,
+                        ell(vec3(0.30, 0.27, 0.36))
+                            .translate(vec3(0.0, 1.21, 0.02) - PELVIS)
+                            .with(HIDE),
+                        seam: smooth(0.14),
+                    )
+                    .join(
+                        "shoulder hump",
+                        chest,
+                        ell(vec3(0.23, 0.24, 0.40))
+                            .translate(vec3(0.0, 1.49, 0.80) - CHEST)
+                            .with(WOOL),
+                        seam: smooth(0.12),
+                    )
+                    .join(
+                        "hip point", // the hook
+                        pelvis,
+                        ell(vec3(0.06, 0.05, 0.07))
+                            .translate(vec3(0.24, 1.26, 0.14) - PELVIS)
+                            .with(HIDE),
+                        seam: smooth(0.08),
+                    )
+            },
+            mirror: true,
+        )
+        .group(
+            "neck",
+            |g| {
+                let n0 = b("neck 0")
+                g.join(
+                    "neck base",
+                    n0,
+                    neck_cone(NECK0, NECK1, r1: 0.30, r2: 0.22, sx: 1.3).with(WOOL),
+                )
+                    .join(
+                        "throat",
+                        n0,
+                        round_cone(
+                            vec3(0.0, -0.02, -0.06),
+                            vec3(0.0, 0.08, 0.06),
+                            r_top: 0.30,
+                            r_bottom: 0.22,
+                        ).with(WOOL),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "neck middle",
+                        b("neck 1"),
+                        flat_cone(
+                            vec3(),
+                            NECK2 - NECK1,
+                            r1: 0.22,
+                            r2: 0.175,
+                            sx: 1.3,
+                            scale_ends: false,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "neck upper",
+                        b("neck 2"),
+                        flat_cone(
+                            vec3(),
+                            NECK3 - NECK2,
+                            r1: 0.175,
+                            r2: 0.14,
+                            sx: 1.3,
+                            scale_ends: false,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "neck top",
+                        b("neck 3"),
+                        flat_cone(
+                            vec3(),
+                            HEAD - NECK3,
+                            r1: 0.14,
+                            r2: 0.10,
+                            sx: 1.3,
+                            scale_ends: false,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "mane", // a ridge along the top of the neck
+                        n0,
+                        neck_cone(
+                            vec3(0.0, 1.74, 1.40),
+                            vec3(0.0, 1.99, 1.58),
+                            r1: 0.045,
+                            r2: 0.035,
+                            sx: 2.0,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "beard", // hanging under the jaw and the throat
+                        n0,
+                        neck_cone(
+                            vec3(0.0, 1.76, 1.68),
+                            vec3(0.0, 1.48, 1.56),
+                            r1: 0.03,
+                            r2: 0.06,
+                            sx: 1.6,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "dewlap", // a keel down the front of the chest
+                        n0,
+                        neck_cone(
+                            vec3(0.0, 1.28, 1.24),
+                            vec3(0.0, 0.88, 1.12),
+                            r1: 0.07,
+                            r2: 0.08,
+                            sx: 2.2,
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.08),
+                    )
+            },
+            seam: smooth(0.10),
+            mirror: true,
+        )
+        .group(
+            "head",
+            |g| {
+                g.join(
+                    "cranium",
+                    head,
+                    ell(vec3(0.115, 0.105, 0.13)).translate(vec3(0.0, 0.02, 0.06)).with(HIDE),
+                )
+                    .join(
+                        "face", // the nasal bridge
+                        head,
+                        round_cone(
+                            vec3(0.0, 0.0, 0.10),
+                            vec3(0.0, -0.025, 0.38),
+                            r_top: 0.10,
+                            r_bottom: 0.07,
+                        )
+                            .with(HIDE),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "muzzle",
+                        head,
+                        ell(vec3(0.072, 0.075, 0.08)).translate(vec3(0.0, -0.04, 0.43)).with(PALE),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "upper lip", // a little overhanging
+                        head,
+                        ell(vec3(0.06, 0.028, 0.05)).translate(vec3(0.0, -0.068, 0.47)).with(PALE),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "lower jaw",
+                        head,
+                        round_cone(
+                            vec3(0.0, -0.075, 0.05),
+                            vec3(0.0, -0.105, 0.40),
+                            r_top: 0.07,
+                            r_bottom: 0.034,
+                        )
+                            .with(HIDE),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "chin", // and lower lip
+                        head,
+                        ell(vec3(0.042, 0.02, 0.042)).translate(vec3(0.0, -0.115, 0.42)).with(PALE),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "cheek", // masseter
+                        head,
+                        ell(vec3(0.05, 0.075, 0.09))
+                            .translate(vec3(0.065, -0.055, 0.12))
+                            .with(HIDE),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "brow",
+                        head,
+                        ell(vec3(0.032, 0.018, 0.05)).translate(vec3(0.08, 0.066, 0.18)).with(HIDE),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "eye",
+                        head,
+                        sphere(0.028).translate(EYE_AT).with(EYE),
+                        seam: smooth(0.008),
+                    )
+                    .join(
+                        "mouth line",
+                        head,
+                        cuboid(half: vec3(0.1, 0.0025, 0.08))
+                            .translate(vec3(0.0, -0.098, 0.49))
+                            .with(EYE),
+                        seam: cut(0.003),
+                    )
+                    .join(
+                        "nostril",
+                        head,
+                        ell(vec3(0.012, 0.026, 0.016))
+                            .rotate(Quat::axis_angle(vec3(1.0, 0.0, 0.0), -0.5))
+                            .translate(vec3(0.034, -0.02, 0.505))
+                            .with(EYE),
+                        seam: cut(0.006),
+                    )
+            },
+            seam: smooth(0.05),
+            space: head_frame(),
+            mirror: true,
+        )
+        .group(
+            "tail",
+            |g| {
+                g.join("tail 0", b("tail 0"), tail_cone(TAIL0, TAIL1, r1: 0.06, r2: 0.045))
+                    .join(
+                        "tail 1",
+                        b("tail 1"),
+                        tail_cone(TAIL1, TAIL2, r1: 0.045, r2: 0.036),
+                        seam: smooth(0.015),
+                    )
+                    .join(
+                        "tail 2",
+                        b("tail 2"),
+                        tail_cone(TAIL2, TAIL3, r1: 0.036, r2: 0.030),
+                        seam: smooth(0.015),
+                    )
+                    .join(
+                        "tail 3",
+                        b("tail 3"),
+                        tail_cone(TAIL3, TAIL4, r1: 0.030, r2: 0.026),
+                        seam: smooth(0.015),
+                    )
+                    .join(
+                        "tail 4",
+                        b("tail 4"),
+                        tail_cone(TAIL4, TAIL5, r1: 0.026, r2: 0.022),
+                        seam: smooth(0.015),
+                    )
+                    .join(
+                        "tuft",
+                        b("tail 5"),
+                        Muscle {
+                            a: vec3(),
+                            b: TAIL_END - TAIL5,
+                            t: 0.55,
+                            off: vec2(0.0),
+                            r: vec3(0.04, 0.04, 0.085),
+                            noise: 0.002,
+                            freq: 30.0,
+                            origin: TAIL5,
+                        }.with(TUFT),
+                        seam: smooth(0.03),
+                    )
+            },
+            seam: smooth(0.05),
+            mirror: true,
+        )
+        .group(
+            "fore leg",
+            |g| {
+                g.join(
+                    "shoulder blade", // the scapula's mass
+                    b("scapula right"),
+                    muscle(
+                        SCAPULA,
+                        SHOULDER,
+                        SCAPULA,
+                        t: 0.45,
+                        off: vec2(0.0, -0.02),
+                        r: vec3(0.12, 0.17, 0.28),
+                    )
+                        .with(WOOL),
+                )
+                    .join(
+                        "upper arm",
+                        shoulder,
+                        round_cone(vec3(), ELBOW - SHOULDER, r_top: 0.10, r_bottom: 0.085).with(
+                            WOOL,
+                        ),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "triceps",
+                        shoulder,
+                        muscle(
+                            SHOULDER,
+                            ELBOW,
+                            SHOULDER,
+                            t: 0.55,
+                            off: vec2(0.0, -0.08),
+                            r: vec3(0.10, 0.13, 0.2),
+                        )
+                            .with(WOOL),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "point of elbow",
+                        elbow,
+                        sphere(0.05).translate(vec3(0.0, 0.02, -0.065)).with(HIDE),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "forearm",
+                        elbow,
+                        round_cone(vec3(), KNEE - ELBOW, r_top: 0.10, r_bottom: 0.048).with(HIDE),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "forearm muscles",
+                        elbow,
+                        muscle(
+                            ELBOW,
+                            KNEE,
+                            ELBOW,
+                            t: 0.2,
+                            off: vec2(0.0, 0.01),
+                            r: vec3(0.085, 0.115, 0.17),
+                        )
+                            .with(HIDE),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "knee",
+                        knee,
+                        ell(vec3(0.058, 0.056, 0.055)).with(SOCK),
+                        seam: smooth(0.03),
+                    ) // the carpus
+                    .join(
+                        "cannon",
+                        knee,
+                        round_cone(vec3(), FFETLOCK - KNEE, r_top: 0.040, r_bottom: 0.037).with(
+                            SOCK,
+                        ),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "fetlock",
+                        ffet,
+                        sphere(0.045).translate(vec3(0.0, 0.0, -0.01)).with(SOCK),
+                        seam: smooth(0.025),
+                    )
+                    .join(
+                        "pastern",
+                        ffet,
+                        round_cone(
+                            vec3(0.0, 0.0, -0.005),
+                            vec3(0.0, 0.068 - FFETLOCK.y, 0.022),
+                            r_top: 0.04,
+                            r_bottom: 0.043,
+                        ).with(SOCK),
+                        seam: smooth(0.02),
+                    )
+                    .join("hoof", ffet, Hoof { drop: FFETLOCK.y }.with(HOOF), seam: smooth(0.01))
+            },
+            seam: smooth(0.07),
+            mirror: true,
+        )
+        .group(
+            "hind leg",
+            |g| {
+                g.join(
+                    "thigh",
+                    hip,
+                    muscle(
+                        HIP,
+                        STIFLE,
+                        HIP,
+                        t: 0.5,
+                        off: vec2(0.0, -0.10),
+                        r: vec3(0.15, 0.27, 0.36),
+                    ).with(HIDE),
+                )
+                    .join(
+                        "hamstrings",
+                        hip,
+                        round_cone(
+                            vec3(0.13, 1.18, -0.24) - HIP,
+                            vec3(0.18, 0.66, -0.07) - HIP,
+                            r_top: 0.12,
+                            r_bottom: 0.07,
+                        ).with(HIDE),
+                        seam: smooth(0.09),
+                    )
+                    .join(
+                        "stifle", // the patella
+                        stifle,
+                        sphere(0.065).translate(vec3(0.015, 0.0, 0.05)).with(HIDE),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "gaskin",
+                        stifle,
+                        round_cone(vec3(), HOCK - STIFLE, r_top: 0.10, r_bottom: 0.052).with(HIDE),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "calf",
+                        stifle,
+                        muscle(
+                            STIFLE,
+                            HOCK,
+                            STIFLE,
+                            t: 0.32,
+                            off: vec2(0.0, -0.05),
+                            r: vec3(0.07, 0.08, 0.16),
+                        )
+                            .with(HIDE),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "achilles",
+                        stifle,
+                        round_cone(
+                            mix(STIFLE, HOCK, vec3(0.5)) + vec3(0.0, 0.0, -0.07) - STIFLE,
+                            HOCK + vec3(0.0, 0.04, -0.07) - STIFLE,
+                            r_top: 0.022,
+                            r_bottom: 0.022,
+                        ).with(HIDE),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "point of hock",
+                        hock,
+                        sphere(0.035).translate(vec3(0.0, 0.04, -0.07)).with(HIDE),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "hock",
+                        hock,
+                        ell(vec3(0.055, 0.058, 0.06)).with(SOCK),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "cannon",
+                        hock,
+                        round_cone(vec3(), HFETLOCK - HOCK, r_top: 0.043, r_bottom: 0.038).with(
+                            SOCK,
+                        ),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "fetlock",
+                        hfet,
+                        sphere(0.046).translate(vec3(0.0, 0.0, -0.01)).with(SOCK),
+                        seam: smooth(0.025),
+                    )
+                    .join(
+                        "pastern",
+                        hfet,
+                        round_cone(
+                            vec3(0.0, 0.0, -0.005),
+                            vec3(0.0, 0.068 - HFETLOCK.y, 0.022),
+                            r_top: 0.04,
+                            r_bottom: 0.043,
+                        ).with(SOCK),
+                        seam: smooth(0.02),
+                    )
+                    .join("hoof", hfet, Hoof { drop: HFETLOCK.y }.with(HOOF), seam: smooth(0.01))
+            },
+            seam: smooth(0.08),
+            mirror: true,
+        )
+        .then(
+            Cape { depth: 0.016 },
+        )
+        .group(
+            "ears",
+            |g| g.join("ear", head, Ear { cup: 0.022 }.with(WOOL)),
+            seam: smooth(0.012),
+            space: head_frame(),
+            mirror: true,
+        )
+        .group(
+            "horns",
+            |g| {
+                g.join(
+                    "horn base",
+                    head,
+                    round_cone(HORN0, HORN1, r_top: 0.036, r_bottom: 0.026).with(HORN),
+                )
+                    .join(
+                        "horn middle",
+                        head,
+                        round_cone(HORN1, HORN2, r_top: 0.026, r_bottom: 0.018).with(HORN),
+                        seam: smooth(0.012),
+                    )
+                    .join(
+                        "horn tip",
+                        head,
+                        round_cone(HORN2, HORN3, r_top: 0.018, r_bottom: 0.009).with(HORN),
+                        seam: smooth(0.008),
+                    )
+            },
+            seam: smooth(0.025),
+            space: head_frame(),
+            mirror: true,
+        )
+        .then(ground())
+}

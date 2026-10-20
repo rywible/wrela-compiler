@@ -1,0 +1,71 @@
+// Seeds and random streams: deterministic random numbers for content and for the sim.
+//
+// An individual's numbers come from its seed (`Seed`, `Rng::new`), so a herd's variation costs
+// no bytes. Each sim entity has its own stream (`Rng::split`), so results don't depend on which
+// worker ran it.
+
+use std::hash::StateHash
+use std::serialize::Serialize
+
+/// What an individual is made from: a definition plus this number.
+pub struct Seed: Copy + Eq + StateHash + Serialize {
+    pub value: u32,
+}
+
+pub fn seed(value: u32) -> Seed {
+    Seed { value }
+}
+
+/// A mulberry32 generator. Its draws are f64s in [0, 1); `range` and `unit` round a draw to f32
+/// once.
+pub struct Rng: Copy + StateHash + Serialize {
+    state: u32,
+}
+
+impl Rng {
+    pub fn new(seed: Seed) -> Rng {
+        Rng { state: seed.value.wrapping_mul(7919).wrapping_add(17) }
+    }
+
+    /// A generator whose state is `state` as it is, not mixed: `new` mixes a seed first.
+    pub fn raw(state: u32) -> Rng {
+        Rng { state }
+    }
+
+    /// The next draw, in [0, 1).
+    pub fn next(mut self) -> f64 {
+        self.state = self.state.wrapping_add(0x6d2b79f5)
+        var t = self.state
+        t = (t ^ (t >> 15)).wrapping_mul(t | 1)
+        t = t ^ t.wrapping_add((t ^ (t >> 7)).wrapping_mul(t | 61))
+        f64(t ^ (t >> 14)) / 4294967296.0
+    }
+
+    /// A draw computed in [lo, hi) in f64, then rounded once to f32. Rounding can reach an endpoint.
+    pub fn range(mut self, lo: f64, hi: f64) -> f32 {
+        f32(lo + (hi - lo) * self.next())
+    }
+
+    /// A draw in [0, 1), as an f32.
+    pub fn unit(mut self) -> f32 {
+        min(f32(self.next()), bitcast_f32(0x3f7fffff))
+    }
+
+    /// A stream of its own for entity `n`: the same whatever order entities draw in.
+    pub fn split(self, n: u32) -> Rng {
+        Rng { state: self.state ^ n.wrapping_mul(0x9e3779b9) }
+    }
+}
+
+@test
+fn a_unit_draw_stays_below_one_after_rounding() {
+    var near_one = Rng::raw(52078625)
+    let draw = near_one.unit()
+    assert(draw >= 0.0 && draw < 1.0, "a unit draw rounded up to one")
+    assert(draw == bitcast_f32(0x3f7fffff))
+    var ordinary = Rng::raw(7)
+    for _ in 0..16 {
+        let x = ordinary.unit()
+        assert(x >= 0.0 && x < 1.0)
+    }
+}

@@ -1,0 +1,105 @@
+// The herd's grazer, seed by seed, at points on the GPU (#42 AC7): its distance, gradient and
+// channels, which herd.rs compares with spike 01's hand-written field.wgsl. The test reads the
+// newest three buffers the program holds: the points, the distances, and the samples. It builds
+// on frozen copies of the engine and the herd (compiler/tests/frozen), so it's a regression
+// input of the compiler: the compiled field against the hand-written one.
+
+use engine::creature::{ALL, Parts}
+use herd::grazer::{field_of, grazer}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+pub struct Game {
+    points: GpuBuffer<vec4>,
+    dist: GpuBuffer<f32>,
+    samp: GpuBuffer<vec4>,
+}
+
+pub fn init() -> Game {
+    Game { points: buffer(1), dist: buffer(1), samp: buffer(1) }
+}
+
+// ---- the field at points (AC7, and its cost against field.wgsl's) -------------------------------
+
+/// The distance at each point, every part in.
+@compute(64)
+fn distances<C, F: Parts<C>>(field: F, points: [vec4], out: mut Slots<f32>, id: GlobalId) {
+    out[id] = field.distance_masked(points[id.x].xyz, ALL, 0.0)
+}
+
+/// The distance and gradient at each point.
+@compute(64)
+fn samples<C, F: Parts<C>>(field: F, points: [vec4], out: mut Slots<vec4>, id: GlobalId) {
+    let p = points[id.x].xyz
+    let s = field.sample(p)
+    out[id] = vec4(s.0, s.1)
+}
+
+/// Seed `s`'s field at `n` points (a multiple of 64) scattered over its bounds by xorshift
+/// 12345: three new buffers, the newest the program holds: the points, the distances, and the
+/// distances and gradients.
+pub fn evaluate(game: mut Game, s: u32, n: u32) {
+    let g = grazer(s)
+    let b = g.bounds()
+    var r = herd::terrain::XorShift { state: 12345 }
+    var pts: Vec<vec4> = Vec::new()
+    for _ in 0..n {
+        pts.push(vec4(r.point(b.lo, b.hi), 0.0))
+    }
+    game.points = buffer(n)
+    write(mut game.points, 0, pts)
+    game.dist = buffer(n)
+    game.samp = buffer(n)
+    let field = g.field()
+    dispatch(
+        distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist),
+        groups: n / 64,
+    )
+    dispatch(
+        samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp),
+        groups: n / 64,
+    )
+}
+
+/// The distance and channels (torso-ness, hoof-ness) at each point, every part in.
+@compute(64)
+fn channel_samples(
+    field: herd::grazer::GrazerField,
+    points: [vec4],
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let (d, c) = field.distance_and_channels(points[id.x].xyz)
+    out[id] = vec4(d, c.torso, c.hoof, 0.0)
+}
+
+/// `n` points near seed `s`'s surface (#42 AC7): `Box3::sample`'s points over its bounds, in
+/// order, those within 2 cm of its surface by the CPU's distance. Three new buffers: the points,
+/// and at each, the GPU's distance, and its distance and channels.
+pub fn near_surface(game: mut Game, s: u32, n: u32) {
+    let g = grazer(s)
+    let b = g.bounds()
+    var pts: Vec<vec4> = Vec::new()
+    var i = 0
+    while pts.len() < n {
+        let p = b.sample(1, i)
+        if abs(g.distance(p)) < 0.02 {
+            pts.push(vec4(p, 0.0))
+        }
+        i += 1
+    }
+    game.points = buffer(n)
+    write(mut game.points, 0, pts)
+    game.dist = buffer(n)
+    game.samp = buffer(n)
+    let field = field_of(g)
+    dispatch(
+        distances.bind(field: field, points: game.points.span(0, n), out: mut game.dist),
+        groups: n / 64,
+    )
+    dispatch(
+        channel_samples.bind(field: field, points: game.points.span(0, n), out: mut game.samp),
+        groups: n / 64,
+    )
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}

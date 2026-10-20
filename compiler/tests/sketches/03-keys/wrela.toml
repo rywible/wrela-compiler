@@ -3,6 +3,6 @@
 name = "keys"
 
 [dependencies]
-engine = { path = "../../../../engine" }
+engine = { path = "../../frozen/engine" }
 grazer = { path = "../01-creature" }
 simulation = { path = "../03-simulation" }

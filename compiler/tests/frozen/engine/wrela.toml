@@ -1,0 +1,6 @@
+# A frozen copy of engine/ at dc0f28e0: the 37 modules that the compiler's regression inputs reach
+# (the herd, the round-1 ports, the sketches, diagnostics 260-266), unchanged. It's an input of
+# the compiler's tests, never updated with the engine: the compiler must keep compiling it as it
+# does, so a change in its output is the compiler's, not the engine's.
+[package]
+name = "engine"

@@ -1,6 +1,8 @@
 //! The herd (examples/herd) against spike 01 (#42 AC1–AC7). The fixtures are the spike's files,
 //! unchanged (compiler/tests/fixtures/spike01): its CPU module (`cpu.wasm`), its kernels and its
-//! seed-1 parameters.
+//! seed-1 parameters. The compiled grazer's checks against them (its field and its skin weights)
+//! build frozen copies of the herd and the engine (compiler/tests/frozen, herd-field): they test
+//! the compiler, so their input doesn't change with the engine.
 //!
 //! CPU comparisons run both sides in one harness, the native host's wasmtime, alternating after a
 //! warm-up round (M1's method): the spike's `cpu.wasm` and the herd's build.
@@ -11,9 +13,10 @@ use wrela_host::{CpuBuild, CpuHost, Host, Value};
 use wrela_tests::spike01::{HARNESS_D, fixture, fixture_path, harness};
 use wrela_tests::{files_under, repo_root};
 
-/// The herd, built once for the suite (`built` builds it under the suite's scratch).
+/// The herd's frozen copy (compiler/tests/frozen/herd, a compiler-regression input), built once
+/// for the suite (`built` builds it under the suite's scratch).
 fn herd() -> PathBuf {
-    built("../../examples/herd")
+    built("frozen/herd")
 }
 
 fn ours() -> CpuHost {
@@ -165,7 +168,7 @@ fn a_realization_past_65535_live_blocks_is_whole() {
 }
 // ---- AC7: the herd's grazer against field.wgsl ------------------------------------------------
 
-/// The herd's grazer, seed 1, at the `n` points herd-realize's export `export` (`evaluate` or
+/// The herd's grazer, seed 1, at the `n` points herd-field's export `export` (`evaluate` or
 /// `near_surface`) samples, the newest three buffers it holds: the points (vec4s, as bytes), its
 /// distances and its samples (vec4s: the distance, then the gradient or the channels); and the
 /// command batches it recorded, if `record`.
@@ -176,7 +179,7 @@ fn grazer_points(
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>, Vec<Vec<u8>>) {
     use wrela_tests::f32s;
     let options = wrela_host::Options { record, ..wrela_host::Options::default() };
-    let mut host = Host::load_with(built("herd-realize"), &options).expect("load");
+    let mut host = Host::load_with(built("herd-field"), &options).expect("load");
     host.call_export(export, &[Value::I32(1), Value::I32(n as i32)]).expect(export);
     let made = host.buffers();
     let [.., p, d, s] = made[..] else { panic!("{export} made {made:?}") };

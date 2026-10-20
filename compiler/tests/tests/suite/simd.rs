@@ -142,7 +142,8 @@ fn the_numerics_corpus_is_the_same_with_simd() {
 #[test]
 fn command_streams_are_the_same_with_simd() {
     let programs = [
-        ("examples/hello-field", 30),
+        ("compiler/tests/frozen/hello-field", 30),
+        ("compiler/tests/frozen/herd", 10),
         ("compiler/tests/sketches/01-creature", 10),
         ("compiler/tests/sketches/02-drawing", 4),
         ("compiler/tests/sketches/03-simulation", 60),

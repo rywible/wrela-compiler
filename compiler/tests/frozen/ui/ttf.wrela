@@ -1,0 +1,998 @@
+// TrueType fonts baked into signed distance fields when the program is built (language.md
+// §13): each Latin-1 glyph's outline as a field, its metrics, and the font's kerning, from the
+// font's file (`embed`). A program calls `bake` in a constant; text.wrela's fonts are
+// constants made this way.
+//
+// What it reads of the file: `head`'s units per em and `loca`'s format, `maxp`, `hhea` and
+// `hmtx` for the advances, `OS/2` for the metrics a font says to use, `cmap` (formats 4 and
+// 12, Unicode's tables) for each character's glyph, `glyf` for the outlines (composites
+// included), and `GPOS`'s pair adjustments for the kerning. A glyph's quadratic curves are
+// flattened finely enough that the distance to them is within 0.002 px of the true curves' at
+// 32 px per em.
+
+use std::math::is_finite
+
+/// A font's glyphs as distance fields, sampled at `em` pixels per em: a field's byte `v` is
+/// the signed distance `(v / 255 − 0.5) × 2 × spread` pixels from the pixel's centre to the
+/// outline, positive inside.
+pub struct Baked: Clone {
+    pub em: f32,
+    pub spread: f32,
+    /// Above and below the baseline, and between lines: ems (the descender is negative).
+    pub ascender: f32,
+    pub descender: f32,
+    pub line_gap: f32,
+    /// Each character of `LATIN1`'s glyph, in that order.
+    pub glyphs: Vec<BakedGlyph>,
+    /// The kerning that isn't 0, by glyph (in the order above): 1/8192 ems added to the left
+    /// glyph's advance.
+    pub kerning: Vec<Kern>,
+    /// Each glyph's field, `width × height` bytes, rows from the top.
+    pub fields: Vec<u8>,
+}
+
+/// A glyph: its code point, advance (ems), where its field's left edge is from the pen and
+/// its top above the baseline (pixels at `em`), its size, and where its bytes start.
+pub struct BakedGlyph: Copy {
+    pub codepoint: u32,
+    pub advance: f32,
+    pub left: f32,
+    pub top: f32,
+    pub width: u32,
+    pub height: u32,
+    pub offset: u32,
+}
+
+/// Kerning between two glyphs, by their indices: `units` 1/8192 ems added to the left one's
+/// advance.
+pub struct Kern: Copy {
+    pub left: u32,
+    pub right: u32,
+    pub units: i32,
+}
+
+/// How many characters a font has: printable ASCII and the rest of Latin-1.
+pub const LATIN1: u32 = 191
+
+/// Character `i` of the font's: 0x20 to 0x7E, then 0xA0 to 0xFF.
+pub fn latin1(i: u32) -> u32 {
+    if i < 95 { 0x20 + i } else { 0xA0 + i - 95 }
+}
+
+/// Bakes `file`'s Latin-1 glyphs at `em` pixels per em, `spread` pixels each way. A font that
+/// lacks a character, or isn't a TrueType font, panics: the build's error.
+pub fn bake(file: Bytes, em: f32, spread: f32) -> Baked {
+    assert(em > 0.0 && is_finite(em), "`em` must be a positive finite number")
+    assert(spread > 0.0 && is_finite(spread), "`spread` must be a positive finite number")
+    let t = Tables::of(file)
+    let upem = f64(u16_at(file, t.head + 18))
+    let scale = f64(em) / upem
+    let ems = |units: i32| f32(f64(units) / upem)
+    var ids: Vec<u32> = Vec::new()
+    var jobs: Vec<Field> = Vec::new()
+    var glyphs: Vec<BakedGlyph> = Vec::new()
+    for i in 0..LATIN1 {
+        let c = latin1(i)
+        // A soft hyphen shows only where a line breaks, as a hyphen: some fonts leave it out.
+        var id = glyph_index(file, t, c)
+        if id < 0 && c == 0xAD {
+            id = glyph_index(file, t, 0x2D)
+        }
+        assert(id >= 0, f"the font has no U+{c:04x}")
+        let gid = u32(id)
+        ids.push(gid)
+        var pen = Pen::new(scale)
+        outline(file, t, gid, Transform::identity(), mut pen, 0)
+        jobs.push(Field::around(take pen.contours, spread))
+        glyphs.push(
+            BakedGlyph {
+                codepoint: c,
+                advance: ems(i32(advance(file, t, gid))),
+                left: 0.0,
+                top: 0.0,
+                width: 0,
+                height: 0,
+                offset: 0,
+            },
+        )
+    }
+    // The fields, a glyph on each helper.
+    jobs.par_each_mut(|j| j.sample(spread))
+    var fields: Vec<u8> = Vec::new()
+    for i in 0..LATIN1 {
+        borrow j = jobs[i]
+        glyphs[i].left = f32(j.left)
+        glyphs[i].top = f32(j.top)
+        glyphs[i].width = j.width
+        glyphs[i].height = j.height
+        glyphs[i].offset = fields.len()
+        for v in j.bytes {
+            fields.push(v)
+        }
+    }
+    let (ascender, descender, line_gap) = metrics(file, t)
+    Baked {
+        em,
+        spread,
+        ascender: ems(ascender),
+        descender: ems(descender),
+        line_gap: ems(line_gap),
+        glyphs,
+        kerning: kerning(file, t, ids, upem),
+        fields,
+    }
+}
+
+// ---- the file ----------------------------------------------------------------------------------
+
+fn u16_at(b: Bytes, at: u32) -> u32 {
+    (u32(b.at(at)) << 8) | u32(b.at(at + 1))
+}
+
+fn i16_at(b: Bytes, at: u32) -> i32 {
+    let v = u16_at(b, at)
+    if v >= 32768 { i32(v) - 65536 } else { i32(v) }
+}
+
+fn u32_at(b: Bytes, at: u32) -> u32 {
+    (u16_at(b, at) << 16) | u16_at(b, at + 2)
+}
+
+/// Where each table the baker reads starts (0: the font has none).
+struct Tables: Copy {
+    cmap: u32,
+    head: u32,
+    hhea: u32,
+    hmtx: u32,
+    loca: u32,
+    glyf: u32,
+    os2: u32,
+    gpos: u32,
+}
+
+impl Tables {
+    fn of(b: Bytes) -> Tables {
+        let version = u32_at(b, 0)
+        assert(version == 0x00010000 || version == 0x74727565, "not a TrueType font")
+        var t = Tables { cmap: 0, head: 0, hhea: 0, hmtx: 0, loca: 0, glyf: 0, os2: 0, gpos: 0 }
+        for k in 0..u16_at(b, 4) {
+            let at = 12 + k * 16
+            let offset = u32_at(b, at + 8)
+            match u32_at(b, at) {
+                0x636d6170 => t.cmap = offset,
+                0x68656164 => t.head = offset,
+                0x68686561 => t.hhea = offset,
+                0x686d7478 => t.hmtx = offset,
+                0x6c6f6361 => t.loca = offset,
+                0x676c7966 => t.glyf = offset,
+                0x4f532f32 => t.os2 = offset,
+                0x47504f53 => t.gpos = offset,
+                _ => {},
+            }
+        }
+        assert(t.cmap > 0 && t.head > 0 && t.hhea > 0 && t.hmtx > 0, "a font's tables are missing")
+        assert(t.loca > 0 && t.glyf > 0, "not a TrueType font with outlines (`glyf`)")
+        t
+    }
+}
+
+/// Character `c`'s glyph, by the first of the font's Unicode tables that maps it: -1 if none.
+fn glyph_index(b: Bytes, t: Tables, c: u32) -> i32 {
+    for k in 0..u16_at(b, t.cmap + 2) {
+        let at = t.cmap + 4 + k * 8
+        let (platform, encoding) = (u16_at(b, at), u16_at(b, at + 2))
+        if platform != 0 && !(platform == 3 && (encoding == 1 || encoding == 10)) {
+            continue
+        }
+        let sub = t.cmap + u32_at(b, at + 4)
+        let id = match u16_at(b, sub) {
+            4 => format4(b, sub, c),
+            12 => format12(b, sub, c),
+            _ => -1,
+        }
+        if id >= 0 {
+            return id
+        }
+    }
+    -1
+}
+
+/// A `cmap` format 4 subtable's glyph for `c`.
+fn format4(b: Bytes, sub: u32, c: u32) -> i32 {
+    if c > 0xffff {
+        return -1
+    }
+    let segs = u16_at(b, sub + 6) / 2
+    let ends = sub + 14
+    let starts = ends + segs * 2 + 2
+    let deltas = starts + segs * 2
+    let ranges = deltas + segs * 2
+    for i in 0..segs {
+        if c > u16_at(b, ends + i * 2) {
+            continue
+        }
+        let start = u16_at(b, starts + i * 2)
+        if c < start {
+            return -1
+        }
+        let delta = u16_at(b, deltas + i * 2)
+        let range = u16_at(b, ranges + i * 2)
+        if range == 0 {
+            return i32((c + delta) & 0xffff)
+        }
+        if range == 0xffff {
+            return -1
+        }
+        let g = u16_at(b, ranges + i * 2 + range + (c - start) * 2)
+        if g == 0 {
+            return -1
+        }
+        return i32((g + delta) & 0xffff)
+    }
+    -1
+}
+
+/// A `cmap` format 12 subtable's glyph for `c`.
+fn format12(b: Bytes, sub: u32, c: u32) -> i32 {
+    for k in 0..u32_at(b, sub + 12) {
+        let at = sub + 16 + k * 12
+        let (start, end) = (u32_at(b, at), u32_at(b, at + 4))
+        if c >= start && c <= end {
+            return i32(u32_at(b, at + 8) + c - start)
+        }
+    }
+    -1
+}
+
+/// Glyph `id`'s advance, in font units.
+fn advance(b: Bytes, t: Tables, id: u32) -> u32 {
+    let n = u16_at(b, t.hhea + 34)
+    u16_at(b, t.hmtx + min(id, n - 1) * 4)
+}
+
+/// The ascender, descender and line gap, in font units: `OS/2`'s typographic ones if it says
+/// to use them, else `hhea`'s.
+fn metrics(b: Bytes, t: Tables) -> (i32, i32, i32) {
+    if t.os2 > 0 && (u16_at(b, t.os2 + 62) & 0x80) != 0 {
+        return (i16_at(b, t.os2 + 68), i16_at(b, t.os2 + 70), i16_at(b, t.os2 + 72))
+    }
+    var ascender = i16_at(b, t.hhea + 4)
+    var descender = i16_at(b, t.hhea + 6)
+    var line_gap = i16_at(b, t.hhea + 8)
+    if t.os2 > 0 {
+        line_gap = fallback_line_gap(
+            hhea_ascender: ascender,
+            hhea_descender: descender,
+            hhea_gap: line_gap,
+            typo_ascender: i16_at(b, t.os2 + 68),
+            typo_descender: i16_at(b, t.os2 + 70),
+            typo_gap: i16_at(b, t.os2 + 72),
+        )
+    }
+    if t.os2 > 0 && ascender == 0 {
+        ascender = i16_at(b, t.os2 + 68)
+        if ascender == 0 {
+            ascender = i32(u16_at(b, t.os2 + 74))
+        }
+    }
+    if t.os2 > 0 && descender == 0 {
+        descender = i16_at(b, t.os2 + 70)
+        if descender == 0 {
+            descender = -i32(u16_at(b, t.os2 + 76))
+        }
+    }
+    (ascender, descender, line_gap)
+}
+
+/// The line gap when the hhea ascender or descender is absent: the OS/2 typographic line gap
+/// when either typographic height is present, otherwise no gap.
+fn fallback_line_gap(
+    hhea_ascender: i32,
+    hhea_descender: i32,
+    hhea_gap: i32,
+    typo_ascender: i32,
+    typo_descender: i32,
+    typo_gap: i32,
+) -> i32 {
+    if hhea_ascender != 0 && hhea_descender != 0 {
+        return hhea_gap
+    }
+    if typo_ascender != 0 || typo_descender != 0 { typo_gap } else { 0 }
+}
+
+@test
+fn missing_hhea_heights_choose_the_same_line_gap_as_ttf_parser() {
+    assert(
+        fallback_line_gap(
+            hhea_ascender: 800,
+            hhea_descender: -200,
+            hhea_gap: 20,
+            typo_ascender: 700,
+            typo_descender: -300,
+            typo_gap: 40,
+        ) ==
+            20,
+    )
+    assert(
+        fallback_line_gap(
+            hhea_ascender: 0,
+            hhea_descender: -200,
+            hhea_gap: 20,
+            typo_ascender: 700,
+            typo_descender: -300,
+            typo_gap: 40,
+        ) ==
+            40,
+    )
+    assert(
+        fallback_line_gap(
+            hhea_ascender: 800,
+            hhea_descender: 0,
+            hhea_gap: 20,
+            typo_ascender: 700,
+            typo_descender: -300,
+            typo_gap: 40,
+        ) ==
+            40,
+    )
+    assert(
+        fallback_line_gap(
+            hhea_ascender: 0,
+            hhea_descender: 0,
+            hhea_gap: 20,
+            typo_ascender: 0,
+            typo_descender: 0,
+            typo_gap: 40,
+        ) ==
+            0,
+    )
+}
+
+// ---- outlines ------------------------------------------------------------------------------------
+
+/// A 2×3 transform of a composite glyph's components, in font units: `x' = a x + c y + e`.
+struct Transform: Copy {
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
+}
+
+impl Transform {
+    fn identity() -> Transform {
+        Transform { a: 1.0, b: 0.0, c: 0.0, d: 1.0, e: 0.0, f: 0.0 }
+    }
+
+    fn is_identity(self) -> bool {
+        self.a == 1.0 &&
+            self.b == 0.0 &&
+            self.c == 0.0 &&
+            self.d == 1.0 &&
+            self.e == 0.0 &&
+            self.f == 0.0
+    }
+
+    /// `self`, then `inner` within it.
+    fn then(self, inner: Transform) -> Transform {
+        Transform {
+            a: self.a * inner.a + self.c * inner.b,
+            b: self.b * inner.a + self.d * inner.b,
+            c: self.a * inner.c + self.c * inner.d,
+            d: self.b * inner.c + self.d * inner.d,
+            e: self.a * inner.e + self.c * inner.f + self.e,
+            f: self.b * inner.e + self.d * inner.f + self.f,
+        }
+    }
+}
+
+/// A glyph's outline as closed polygons in pixels at `em`, y up: each contour's points, its
+/// curves flattened.
+struct Contours {
+    xs: Vec<f64>,
+    ys: Vec<f64>,
+    /// Where each contour starts in `xs` and `ys`.
+    starts: Vec<u32>,
+}
+
+/// What draws an outline into `contours`: TrueType's quadratic outline, its points on and off
+/// the curve, turned into lines and curves, each curve flattened.
+struct Pen {
+    scale: f64,
+    contours: Contours,
+    /// The point drawn last, in pixels.
+    at_x: f64,
+    at_y: f64,
+    transform: Transform,
+    /// The contour's first point on the curve, its first point off it, and the last point off
+    /// it not yet drawn (font units).
+    first_on: bool,
+    first_on_x: f32,
+    first_on_y: f32,
+    first_off: bool,
+    first_off_x: f32,
+    first_off_y: f32,
+    last_off: bool,
+    last_off_x: f32,
+    last_off_y: f32,
+}
+
+impl Pen {
+    fn new(scale: f64) -> Pen {
+        Pen {
+            scale,
+            contours: Contours { xs: Vec::new(), ys: Vec::new(), starts: Vec::new() },
+            at_x: 0.0,
+            at_y: 0.0,
+            transform: Transform::identity(),
+            first_on: false,
+            first_on_x: 0.0,
+            first_on_y: 0.0,
+            first_off: false,
+            first_off_x: 0.0,
+            first_off_y: 0.0,
+            last_off: false,
+            last_off_x: 0.0,
+            last_off_y: 0.0,
+        }
+    }
+
+    /// `(x, y)` in font units, transformed, in pixels.
+    fn px(self, x: f32, y: f32) -> (f64, f64) {
+        var tx = x
+        var ty = y
+        if !self.transform.is_identity() {
+            let t = self.transform
+            tx = t.a * x + t.c * y + t.e
+            ty = t.b * x + t.d * y + t.f
+        }
+        (f64(tx) * self.scale, f64(ty) * self.scale)
+    }
+
+    fn add(mut self, x: f64, y: f64) {
+        if self.contours.starts.len() > 0 {
+            self.contours.xs.push(x)
+            self.contours.ys.push(y)
+        }
+        self.at_x = x
+        self.at_y = y
+    }
+
+    fn move_to(mut self, x: f32, y: f32) {
+        let (px, py) = self.px(x, y)
+        self.contours.starts.push(self.contours.xs.len())
+        self.contours.xs.push(px)
+        self.contours.ys.push(py)
+        self.at_x = px
+        self.at_y = py
+    }
+
+    fn line_to(mut self, x: f32, y: f32) {
+        let (px, py) = self.px(x, y)
+        self.add(px, py)
+    }
+
+    /// A curve from the point drawn last, through control point `(x1, y1)` to `(x, y)`.
+    fn quad_to(mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let (ax, ay) = (self.at_x, self.at_y)
+        let (bx, by) = self.px(x1, y1)
+        let (cx, cy) = self.px(x, y)
+        let n = steps(distance(ax, ay, bx, by) + distance(bx, by, cx, cy))
+        for i in 1..n + 1 {
+            let t = f64(i) / f64(n)
+            let u = 1.0 - t
+            self.add(
+                u * u * ax + 2.0 * u * t * bx + t * t * cx,
+                u * u * ay + 2.0 * u * t * by + t * t * cy,
+            )
+        }
+    }
+
+    /// The contour so far, closed.
+    fn close(mut self) {
+        if self.contours.starts.len() == 0 {
+            return
+        }
+        let first = self.contours.starts[self.contours.starts.len() - 1]
+        let last = self.contours.xs.len() - 1
+        let (fx, fy) = (self.contours.xs[first], self.contours.ys[first])
+        if fx != self.contours.xs[last] || fy != self.contours.ys[last] {
+            self.contours.xs.push(fx)
+            self.contours.ys.push(fy)
+        }
+    }
+
+    /// A point of a contour, in font units: on the curve or off it, and whether it's the
+    /// contour's last.
+    fn point(mut self, x: f32, y: f32, on: bool, last: bool) {
+        if !self.first_on {
+            if on {
+                self.first_on = true
+                self.first_on_x = x
+                self.first_on_y = y
+                self.move_to(x, y)
+            } else if self.first_off {
+                let (mx, my) = half_way(self.first_off_x, self.first_off_y, x, y)
+                self.first_on = true
+                self.first_on_x = mx
+                self.first_on_y = my
+                self.last_off = true
+                self.last_off_x = x
+                self.last_off_y = y
+                self.move_to(mx, my)
+            } else {
+                self.first_off = true
+                self.first_off_x = x
+                self.first_off_y = y
+            }
+        } else if self.last_off && on {
+            self.last_off = false
+            self.quad_to(self.last_off_x, self.last_off_y, x, y)
+        } else if self.last_off {
+            let (ox, oy) = (self.last_off_x, self.last_off_y)
+            self.last_off_x = x
+            self.last_off_y = y
+            let (mx, my) = half_way(ox, oy, x, y)
+            self.quad_to(ox, oy, mx, my)
+        } else if on {
+            self.line_to(x, y)
+        } else {
+            self.last_off = true
+            self.last_off_x = x
+            self.last_off_y = y
+        }
+        if last {
+            self.finish()
+        }
+    }
+
+    /// Ends a contour: its last curve back to its start.
+    fn finish(mut self) {
+        if self.first_off && self.last_off {
+            self.last_off = false
+            let (mx, my) = half_way(
+                self.last_off_x,
+                self.last_off_y,
+                self.first_off_x,
+                self.first_off_y,
+            )
+            self.quad_to(self.last_off_x, self.last_off_y, mx, my)
+        }
+        if self.first_on && self.first_off {
+            self.quad_to(self.first_off_x, self.first_off_y, self.first_on_x, self.first_on_y)
+        } else if self.first_on && self.last_off {
+            self.quad_to(self.last_off_x, self.last_off_y, self.first_on_x, self.first_on_y)
+        } else if self.first_on {
+            self.line_to(self.first_on_x, self.first_on_y)
+        }
+        self.first_on = false
+        self.first_off = false
+        self.last_off = false
+        self.close()
+    }
+}
+
+/// Half way from `(ax, ay)` to `(bx, by)`.
+fn half_way(ax: f32, ay: f32, bx: f32, by: f32) -> (f32, f32) {
+    (ax + 0.5 * (bx - ax), ay + 0.5 * (by - ay))
+}
+
+fn distance(ax: f64, ay: f64, bx: f64, by: f64) -> f64 {
+    sqrt((ax - bx) * (ax - bx) + (ay - by) * (ay - by))
+}
+
+/// The segments of a curve whose control polygon is `len` pixels long.
+fn steps(len: f64) -> u32 {
+    u32(min(max(ceil(len * 4.0), 4.0), 256.0))
+}
+
+/// Draws glyph `id` with `pen`, under `transform`: a composite glyph's components each under
+/// theirs too, at most 32 deep.
+fn outline(b: Bytes, t: Tables, id: u32, transform: Transform, pen: mut Pen, depth: u32) {
+    assert(depth < 32, "a composite glyph nests too deep")
+    let long = i16_at(b, t.head + 50) == 1
+    let (start, end) = if long {
+        (u32_at(b, t.loca + id * 4), u32_at(b, t.loca + id * 4 + 4))
+    } else {
+        (u16_at(b, t.loca + id * 2) * 2, u16_at(b, t.loca + id * 2 + 2) * 2)
+    }
+    if end <= start {
+        return
+    }
+    let g = t.glyf + start
+    let contours = i16_at(b, g)
+    if contours >= 0 {
+        pen.transform = transform
+        simple(b, g, u32(contours), mut pen)
+        return
+    }
+    // A composite: each component, a glyph under a transform of its own.
+    var at = g + 10
+    var more = true
+    while more {
+        let flags = u16_at(b, at)
+        let component = u16_at(b, at + 2)
+        at += 4
+        var inner = Transform::identity()
+        let words = (flags & 0x0001) != 0
+        if (flags & 0x0002) != 0 {
+            if words {
+                inner.e = f32(i16_at(b, at))
+                inner.f = f32(i16_at(b, at + 2))
+            } else {
+                inner.e = f32(i8_at(b, at))
+                inner.f = f32(i8_at(b, at + 1))
+            }
+        }
+        at += if words { 4 } else { 2 }
+        if (flags & 0x0080) != 0 {
+            inner.a = f2dot14(b, at)
+            inner.b = f2dot14(b, at + 2)
+            inner.c = f2dot14(b, at + 4)
+            inner.d = f2dot14(b, at + 6)
+            at += 8
+        } else if (flags & 0x0040) != 0 {
+            inner.a = f2dot14(b, at)
+            inner.d = f2dot14(b, at + 2)
+            at += 4
+        } else if (flags & 0x0008) != 0 {
+            inner.a = f2dot14(b, at)
+            inner.d = inner.a
+            at += 2
+        }
+        outline(b, t, component, transform.then(inner), mut pen, depth + 1)
+        more = (flags & 0x0020) != 0
+    }
+}
+
+fn i8_at(b: Bytes, at: u32) -> i32 {
+    let v = u32(b.at(at))
+    if v >= 128 { i32(v) - 256 } else { i32(v) }
+}
+
+fn f2dot14(b: Bytes, at: u32) -> f32 {
+    f32(i16_at(b, at)) / 16384.0
+}
+
+/// A simple glyph at `g` with `n` contours: its points, through `pen`.
+fn simple(b: Bytes, g: u32, n: u32, pen: mut Pen) {
+    if n == 0 {
+        return
+    }
+    let ends = g + 10
+    let points = u16_at(b, ends + (n - 1) * 2) + 1
+    let instructions = u16_at(b, ends + n * 2)
+    // The flags, each repeated as it says.
+    var at = ends + n * 2 + 2 + instructions
+    var flags: Vec<u32> = Vec::with_capacity(points)
+    while flags.len() < points {
+        let f = u32(b.at(at))
+        at += 1
+        flags.push(f)
+        if (f & 0x08) != 0 {
+            let repeat = u32(b.at(at))
+            at += 1
+            for _ in 0..repeat {
+                flags.push(f)
+            }
+        }
+    }
+    // The coordinates: deltas, short (a byte, its sign in the flag) or long.
+    var xs: Vec<i32> = Vec::with_capacity(points)
+    var x = 0
+    for i in 0..points {
+        let f = flags[i]
+        if (f & 0x02) != 0 {
+            let d = i32(b.at(at))
+            at += 1
+            x += if (f & 0x10) != 0 { d } else { -d }
+        } else if (f & 0x10) == 0 {
+            x += i16_at(b, at)
+            at += 2
+        }
+        xs.push(wrap16(x))
+    }
+    var y = 0
+    var contour = 0
+    var next_end = u16_at(b, ends)
+    for i in 0..points {
+        let f = flags[i]
+        if (f & 0x04) != 0 {
+            let d = i32(b.at(at))
+            at += 1
+            y += if (f & 0x20) != 0 { d } else { -d }
+        } else if (f & 0x20) == 0 {
+            y += i16_at(b, at)
+            at += 2
+        }
+        let last = i == next_end
+        pen.point(f32(xs[i]), f32(wrap16(y)), on: (f & 0x01) != 0, last: last)
+        if last && contour + 1 < n {
+            contour += 1
+            next_end = u16_at(b, ends + contour * 2)
+        }
+    }
+}
+
+/// `v` as an i16 wraps it.
+fn wrap16(v: i32) -> i32 {
+    let w = ((v % 65536) + 65536) % 65536
+    if w >= 32768 { w - 65536 } else { w }
+}
+
+// ---- fields --------------------------------------------------------------------------------------
+
+/// A glyph's field: its contours, where it sits (pixels at `em`), and its bytes once sampled.
+struct Field {
+    contours: Contours,
+    left: f64,
+    top: f64,
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+}
+
+impl Field {
+    /// The field around `contours`: their bounds, `spread` and a pixel more each way.
+    fn around(contours: take Contours, spread: f32) -> Field {
+        var x0 = 1.0e300
+        var y0 = 1.0e300
+        var x1 = -1.0e300
+        var y1 = -1.0e300
+        for i in 0..contours.xs.len() {
+            x0 = min(x0, contours.xs[i])
+            y0 = min(y0, contours.ys[i])
+            x1 = max(x1, contours.xs[i])
+            y1 = max(y1, contours.ys[i])
+        }
+        if x0 > x1 {
+            return Field { contours, left: 0.0, top: 0.0, width: 0, height: 0, bytes: Vec::new() }
+        }
+        let pad = ceil(f64(spread)) + 1.0
+        let (left, bottom) = (floor(x0) - pad, floor(y0) - pad)
+        let (right, top) = (ceil(x1) + pad, ceil(y1) + pad)
+        Field {
+            contours,
+            left,
+            top,
+            width: u32(right - left),
+            height: u32(top - bottom),
+            bytes: Vec::new(),
+        }
+    }
+
+    /// Each pixel's signed distance to the outline, positive inside, as a byte.
+    fn sample(mut self, spread: f32) {
+        borrow c = self.contours
+        // The segment geometry is the same for every pixel of this glyph.
+        var segments: Vec<Segment> = Vec::with_capacity(c.xs.len())
+        for k in 0..c.starts.len() {
+            let from = c.starts[k]
+            let to = if k + 1 < c.starts.len() { c.starts[k + 1] } else { c.xs.len() }
+            for i in from..to - 1 {
+                let (ax, ay, bx, by) = (c.xs[i], c.ys[i], c.xs[i + 1], c.ys[i + 1])
+                let (dx, dy) = (bx - ax, by - ay)
+                segments.push(Segment { ax, ay, by, dx, dy, len2: dx * dx + dy * dy })
+            }
+        }
+        var bytes: Vec<u8> = Vec::with_capacity(self.width * self.height)
+        for row in 0..self.height {
+            // Rows from the top: row 0's centre is half a pixel below `top`.
+            let y = self.top - f64(row) - 0.5
+            for col in 0..self.width {
+                let x = self.left + f64(col) + 0.5
+                var d2 = 1.0e300
+                var winding = 0
+                for s in segments {
+                    d2 = min(d2, s.distance_squared(x, y))
+                    // The nonzero winding rule (TrueType's).
+                    let cross = s.dx * (y - s.ay) - (x - s.ax) * s.dy
+                    if s.ay <= y {
+                        if s.by > y && cross > 0.0 {
+                            winding += 1
+                        }
+                    } else if s.by <= y && cross < 0.0 {
+                        winding -= 1
+                    }
+                }
+                // Square root is monotone: take it once, after choosing the nearest segment.
+                let d = sqrt(d2)
+                let signed = if winding != 0 { d } else { -d }
+                let v = min(max(0.5 + signed / (2.0 * f64(spread)), 0.0), 1.0)
+                bytes.push(u8(floor(v * 255.0 + 0.5)))
+            }
+        }
+        self.bytes = take bytes
+    }
+}
+
+/// A flattened outline segment, with its direction and squared length already found.
+struct Segment: Copy {
+    ax: f64,
+    ay: f64,
+    by: f64,
+    dx: f64,
+    dy: f64,
+    len2: f64,
+}
+
+impl Segment {
+    fn distance_squared(self, x: f64, y: f64) -> f64 {
+        let t = if self.len2 > 0.0 {
+            min(max(((x - self.ax) * self.dx + (y - self.ay) * self.dy) / self.len2, 0.0), 1.0)
+        } else {
+            0.0
+        }
+        let (px, py) = (x - (self.ax + t * self.dx), y - (self.ay + t * self.dy))
+        px * px + py * py
+    }
+}
+
+// ---- kerning -------------------------------------------------------------------------------------
+
+/// The kerning between the glyphs `ids` (each a character's, in order) from the font's `GPOS`
+/// pair adjustments, in 1/8192 ems: for each pair, the first subtable that covers it decides,
+/// lookup by lookup. Only pairs not 0.
+fn kerning(b: Bytes, t: Tables, ids: [u32], upem: f64) -> Vec<Kern> {
+    var out: Vec<Kern> = Vec::new()
+    if t.gpos == 0 {
+        return out
+    }
+    let pairs = pair_subtables(b, t.gpos)
+    let n = ids.len()
+    for i in 0..n {
+        for j in 0..n {
+            var units = 0
+            for s in pairs {
+                let (found, v) = pair_advance(b, s, ids[i], ids[j])
+                if found {
+                    units = i32(nearest(f64(v) / upem * 8192.0))
+                    break
+                }
+            }
+            if units != 0 {
+                out.push(Kern { left: i, right: j, units })
+            }
+        }
+    }
+    out
+}
+
+/// `x` to the nearest whole number, halves away from 0.
+fn nearest(x: f64) -> f64 {
+    if x < 0.0 { -floor(-x + 0.5) } else { floor(x + 0.5) }
+}
+
+/// Where each pair adjustment subtable (lookup type 2, or an extension of one) starts, in the
+/// lookups' order.
+fn pair_subtables(b: Bytes, gpos: u32) -> Vec<u32> {
+    var out: Vec<u32> = Vec::new()
+    let list = gpos + u16_at(b, gpos + 8)
+    for l in 0..u16_at(b, list) {
+        let lookup = list + u16_at(b, list + 2 + l * 2)
+        let kind = u16_at(b, lookup)
+        for s in 0..u16_at(b, lookup + 4) {
+            let sub = lookup + u16_at(b, lookup + 6 + s * 2)
+            if kind == 2 {
+                out.push(sub)
+            } else if kind == 9 && u16_at(b, sub + 2) == 2 {
+                out.push(sub + u32_at(b, sub + 4))
+            }
+        }
+    }
+    out
+}
+
+/// Whether pair subtable `s` covers glyphs `a` then `c`, and if so the change to `a`'s advance
+/// (font units).
+fn pair_advance(b: Bytes, s: u32, a: u32, c: u32) -> (bool, i32) {
+    let format = u16_at(b, s)
+    let coverage = covered(b, s + u16_at(b, s + 2), a)
+    if coverage < 0 {
+        return (false, 0)
+    }
+    let (vf1, vf2) = (u16_at(b, s + 4), u16_at(b, s + 6))
+    let (size1, size2) = (2 * bits(vf1), 2 * bits(vf2))
+    // Where the first value's x advance is in it: after its x and y placements, if it has them.
+    let x_advance = |record: u32| {
+        if (vf1 & 0x0004) != 0 { i16_at(b, record + 2 * bits(vf1 & 0x0003)) } else { 0 }
+    }
+    if format == 1 {
+        let set = s + u16_at(b, s + 10 + u32(coverage) * 2)
+        let count = u16_at(b, set)
+        let record = 2 + size1 + size2
+        // The pairs are sorted by their second glyph.
+        var lo = 0
+        var hi = count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            let at = set + 2 + mid * record
+            let second = u16_at(b, at)
+            if second == c {
+                return (true, x_advance(at + 2))
+            }
+            if second < c {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return (false, 0)
+    }
+    if format == 2 {
+        let class1 = class_of(b, s + u16_at(b, s + 8), a)
+        let class2 = class_of(b, s + u16_at(b, s + 10), c)
+        let (count1, count2) = (u16_at(b, s + 12), u16_at(b, s + 14))
+        if class1 >= count1 || class2 >= count2 {
+            return (false, 0)
+        }
+        let at = s + 16 + (class1 * count2 + class2) * (size1 + size2)
+        return (true, x_advance(at))
+    }
+    (false, 0)
+}
+
+/// How many bits of `v` are set.
+fn bits(v: u32) -> u32 {
+    var n = 0
+    for k in 0..16 {
+        n += (v >> k) & 1
+    }
+    n
+}
+
+/// Glyph `g`'s index in the coverage table at `at`, or -1.
+fn covered(b: Bytes, at: u32, g: u32) -> i32 {
+    let format = u16_at(b, at)
+    let count = u16_at(b, at + 2)
+    if format == 1 {
+        var lo = 0
+        var hi = count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            let v = u16_at(b, at + 4 + mid * 2)
+            if v == g {
+                return i32(mid)
+            }
+            if v < g {
+                lo = mid + 1
+            } else {
+                hi = mid
+            }
+        }
+        return -1
+    }
+    if format == 2 {
+        for r in 0..count {
+            let range = at + 4 + r * 6
+            let (start, end) = (u16_at(b, range), u16_at(b, range + 2))
+            if g >= start && g <= end {
+                return i32(u16_at(b, range + 4) + g - start)
+            }
+        }
+    }
+    -1
+}
+
+/// Glyph `g`'s class in the class definition at `at`: 0 if it lists none.
+fn class_of(b: Bytes, at: u32, g: u32) -> u32 {
+    let format = u16_at(b, at)
+    if format == 1 {
+        let start = u16_at(b, at + 2)
+        let count = u16_at(b, at + 4)
+        if g >= start && g < start + count {
+            return u16_at(b, at + 6 + (g - start) * 2)
+        }
+        return 0
+    }
+    if format == 2 {
+        for r in 0..u16_at(b, at + 2) {
+            let range = at + 4 + r * 6
+            if g >= u16_at(b, range) && g <= u16_at(b, range + 2) {
+                return u16_at(b, range + 4)
+            }
+        }
+    }
+    0
+}

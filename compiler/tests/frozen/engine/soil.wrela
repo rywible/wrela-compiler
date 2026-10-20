@@ -1,0 +1,139 @@
+// The soil: what a place's ground is, how deep, and how well it feeds what grows in it, from the
+// ground's shape, its rock and its water.
+//
+// The history's survey keeps the soil per cell (`grow::Land::soil`); `soil_of` gives it at any
+// point. Its depth comes from the soil production function: weathering against creep.
+
+use grow::Ground
+
+/// What a place's soil is. Rock: bare, or a skin over it. Thin: stony, on crests and steep
+/// slopes. Loam: the brown earth of the gentle slopes. Colluvium: deep, crept down into the
+/// hollows and the slopes' feet. Alluvium: laid by water on the valley floors. Gley: waterlogged,
+/// grey. Peat: so wet that what dies there doesn't rot.
+pub enum SoilKind: Copy + Eq + Fieldless {
+    Rock,
+    Thin,
+    Loam,
+    Colluvium,
+    Alluvium,
+    Gley,
+    Peat,
+}
+
+/// A place's soil: its kind, its depth to rock (m), and how well crops would do in it (0 to 1).
+pub struct Soil: Copy {
+    pub kind: SoilKind,
+    pub depth: f32,
+    pub fertile: f32,
+}
+
+/// How far round a place its soil reads the ground's shape (m): the mean of the curvatures at
+/// both, so that a bump smaller than the first doesn't make a hollow; the slope at the first.
+pub const SOIL_SPANS = [12.0, 32.0]
+
+/// The soil at a place: the ground's curvature there (`lap`, the Laplacian of its height, 1/m;
+/// positive in a hollow), its slope, how much of it is rock, and its wetness (`water`'s).
+///
+/// Weathering makes soil from rock, fastest under a thin soil and slower as the soil deepens
+/// (the soil production function); creep moves it downhill in proportion to the slope. Where the
+/// ground is convex the two balance at a depth that is thinner the sharper the crest; where it is
+/// concave the soil gathers (colluvium). Past the angle a soil can hold (about 30°), it slides
+/// off. The valley floors, wet from their catchment and nearly level, hold what the water laid
+/// (alluvium); wetter still, the soil is waterlogged (gley), then peat.
+pub fn soil(lap: f32, slope: f32, rock: f32, wet: f32) -> Soil {
+    var depth = if lap < 0.0 {
+        clamp(0.5 * log(CREST / max(-lap, 1.0e-4)), 0.05, 1.2)
+    } else {
+        min(1.2 + 150.0 * lap, 2.5)
+    }
+    depth *= (1.0 - smoothstep(0.6, 1.0, slope)) * (1.0 - rock)
+    let kind = if rock > 0.6 || depth < 0.08 {
+        SoilKind::Rock
+    } else if wet > 0.9 && slope < 0.05 {
+        SoilKind::Peat
+    } else if wet > 0.75 {
+        SoilKind::Gley
+    } else if wet > 0.6 && slope < 0.06 && depth > 0.8 {
+        SoilKind::Alluvium
+    } else if lap > 0.0025 && depth > 1.0 {
+        SoilKind::Colluvium
+    } else if depth < 0.35 {
+        SoilKind::Thin
+    } else {
+        SoilKind::Loam
+    }
+    let base = match kind {
+        SoilKind::Rock => 0.0,
+        SoilKind::Thin => 0.25,
+        SoilKind::Loam => 0.6,
+        SoilKind::Colluvium => 0.75,
+        SoilKind::Alluvium => 0.95,
+        SoilKind::Gley => 0.35,
+        SoilKind::Peat => 0.15,
+    }
+    let fertile = base * smoothstep(0.05, 0.6, depth) * (1.0 - 0.5 * smoothstep(0.3, 0.7, slope))
+    Soil { kind, depth, fertile }
+}
+
+/// `soil` at `p` on `ground`, with its wetness `wet` there.
+pub fn soil_of<G: Ground>(ground: G, p: vec2, wet: f32) -> Soil {
+    soil_from(|q| ground.height(q.x, q.y), p, ground.rock(p), wet)
+}
+
+/// `soil` at `p`, the ground's height read by `height` (its curvature at `SOIL_SPANS`, its slope
+/// at the first), with its rock and its wetness there.
+pub(package) fn soil_from(height: fn(vec2) -> f32, p: vec2, rock: f32, wet: f32) -> Soil {
+    let h = height(p)
+    var lap = 0.0
+    var slope = 0.0
+    for k in 0..2 {
+        let d = SOIL_SPANS[k]
+        let e = height(p + vec2(d, 0.0))
+        let w = height(p - vec2(d, 0.0))
+        let n = height(p - vec2(0.0, d))
+        let s = height(p + vec2(0.0, d))
+        lap += 0.5 * (e + w + n + s - 4.0 * h) / (d * d)
+        if k == 0 {
+            slope = length(vec2(e - w, n - s)) / (2.0 * d)
+        }
+    }
+    soil(lap: lap, slope: slope, rock: rock, wet: wet)
+}
+
+/// The crest's curvature (1/m) under which weathering and creep balance at a soil 0.3 m deep.
+const CREST: f32 = 0.012
+
+// ---- tests --------------------------------------------------------------------------------------
+
+/// The soil is thin on a sharp crest and deeper on a gentle one, deeper again on the flat, and
+/// deepest in a hollow; it slides off a steep slope; the valley floor's is laid by water, and
+/// the wettest ground's is waterlogged, then peat; rock has none.
+@test
+fn the_soil_is_thin_on_crests_and_deep_in_hollows() {
+    let sharp = soil(lap: -0.008, slope: 0.1, rock: 0.0, wet: 0.3)
+    let gentle = soil(lap: -0.004, slope: 0.1, rock: 0.0, wet: 0.3)
+    let flat = soil(lap: 0.0, slope: 0.02, rock: 0.0, wet: 0.3)
+    let hollow = soil(lap: 0.006, slope: 0.1, rock: 0.0, wet: 0.3)
+    assert(sharp.kind == SoilKind::Thin, f"a sharp crest's soil is {u32(sharp.kind)}")
+    assert(sharp.depth < gentle.depth && gentle.depth < flat.depth, "crests no thinner")
+    assert(flat.depth < hollow.depth && hollow.kind == SoilKind::Colluvium, "no colluvium")
+    assert(
+        soil(lap: 0.0, slope: 1.2, rock: 0.0, wet: 0.3).kind == SoilKind::Rock,
+        "a cliff holds a soil",
+    )
+    assert(
+        soil(lap: 0.0, slope: 0.02, rock: 0.0, wet: 0.65).kind == SoilKind::Alluvium,
+        "no alluvium",
+    )
+    assert(soil(lap: 0.0, slope: 0.2, rock: 0.0, wet: 0.8).kind == SoilKind::Gley, "no gley")
+    assert(soil(lap: 0.0, slope: 0.02, rock: 0.0, wet: 0.95).kind == SoilKind::Peat, "no peat")
+    assert(
+        soil(lap: 0.0, slope: 0.02, rock: 0.9, wet: 0.3).kind == SoilKind::Rock,
+        "rock holds a soil",
+    )
+    assert(
+        soil(lap: 0.0, slope: 0.02, rock: 0.0, wet: 0.65).fertile > flat.fertile,
+        "alluvium no richer",
+    )
+    assert(flat.fertile > sharp.fertile, "a crest's soil as rich as the flat's")
+}

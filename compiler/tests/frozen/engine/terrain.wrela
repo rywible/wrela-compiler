@@ -1,0 +1,1192 @@
+// Terrain: one terrain field for a floor, drawn from a clipmap cooked from it on the GPU, and
+// raycast on the CPU by the sim. The drawn ground and the sim's feet read the one field.
+//
+// A game writes a `Terrain` (the ground's height and what covers it) and makes a `Clipmap`
+// (`Clipmap::new`); `Clipmap::follow` moves the levels with the eye and cooks those that moved.
+// The sim raycasts the field itself (`raycast`, `below`).
+//
+// The clipmap is LEVELS nested squares of SIDE × SIDE texels round the eye, each texel the
+// field's height, its normal and its cover (albedo, grass) at a point of the level's grid. Level
+// l's spacing is the finest's times 2^l, so the levels reach from centimetres round the eye to
+// kilometres. A level is cooked again when the eye moves it a cell (its centre is snapped to its
+// grid, two cells at a time, so the finer level's edge lies on its lines). The vertex shader
+// reads the texels and never evaluates the field.
+//
+// No cracks between levels: a level's quads inside the finer level's square are dropped; the
+// finer level's outer band morphs its heights to the coarser level's, so its edge lies on the
+// coarser level's triangles; and skirts hang from each level's outer edge and from the edge of
+// the hole the finer level fills, each sharing its edge's vertices, so a pixel the seam's
+// T-junctions leave uncovered on either side sees a skirt, never past the ground.
+
+use light::Lit
+use sim::Hit
+use noise::{hash2, noise2_wrapped}
+use std::gpu::{
+    Address, ClipPosition, DrawIndexedArgs, FragCoord, GlobalId, GpuBuffer, GpuSpan, Oct32, Rgba8,
+    RenderPass, Sampler, Slots, Texture, Unorm8x4, VertexIndex, begin_pass, buffer, buffer_of,
+    dispatch, draw, label, sampler, texture, write,
+}
+use view::Camera
+
+/// A terrain: the ground's height over the plane, and what covers it. The game writes it;
+/// the engine cooks it into a clipmap, and the sim raycasts it.
+pub trait Terrain: Copy + GpuData {
+    /// The ground's height at (x, z), in metres.
+    fn height(self, x: f32, z: f32) -> f32
+
+    /// The ground mesh under separately drawn solids. By default the whole heightfield;
+    /// terrain assembled with solid outcrops can leave their volume out of this substrate.
+    /// Collision, normals and cover still read `height`, the complete ground surface.
+    fn substrate_height(self, at: vec3) -> f32 {
+        at.y
+    }
+
+    /// What covers the ground at `at` (a point on it) whose normal is `n`: its albedo and how
+    /// much grass grows there. Cooked into the clipmap, so it can be as costly as it needs.
+    fn cover(self, at: vec3, n: vec3) -> Cover
+
+    /// What covers the ground at `at`, given the ground's fields there (`Clipmap::write_fields`:
+    /// four numbers a game keeps over the plane, such as a history's light at the ground and its
+    /// trails' wear, each 0 to 1), or -1 in each where they aren't known. By default, `cover`.
+    fn cover_with(self, at: vec3, n: vec3, fields: vec4) -> Cover {
+        self.cover(at, n)
+    }
+
+    /// What covers the ground at `at` (as `cover_with`), as a cooked texel `footprint` metres
+    /// across sees it: a terrain whose cover has detail finer than a far level's texels fades
+    /// it out there, so the far land doesn't alias. By default, `cover_with`.
+    fn cover_seen(self, at: vec3, n: vec3, fields: vec4, footprint: f32) -> Cover {
+        self.cover_with(at, n, fields)
+    }
+
+    /// A bound on the ground's slope, rise over run, which a raycast steps by.
+    fn steepest(self) -> f32 {
+        3.0
+    }
+
+    /// The ground's normal at (x, z), from central differences `e` apart.
+    fn normal(self, x: f32, z: f32, e: f32) -> vec3 {
+        let dx = self.height(x - e, z) - self.height(x + e, z)
+        let dz = self.height(x, z - e) - self.height(x, z + e)
+        normalize(vec3(dx, 2.0 * e, dz))
+    }
+}
+
+/// What covers the ground: its albedo (linear); and its meadow, which the grass reads where
+/// it's placed: how much grass grows there and how tall (each 0 to 1), how dry and how deep a
+/// green it is; and its flowers: how much of each of three kinds (weights), and how many grow.
+/// And the wood's floor's own plants, where the grass doesn't grow: how many (0 to 1),
+/// then how much of each kind (weights): ferns, bracken, low herbs. The habitat they grow in
+/// (`flora`: the soil's acidity, its wetness, the light, how worn it is; each 0 to 1), which
+/// chooses their species (`grass::species_of`). And what the ground is made of where it shows
+/// (`materials`: weights of leaf litter, soil, rock, moss), whose cooked detail the ground's
+/// pixels show close up (`ground_shade`).
+pub struct Cover: Copy + GpuData {
+    pub albedo: vec3,
+    pub grass: f32,
+    pub tall: f32 = 0.5,
+    pub dry: f32 = 0.0,
+    pub deep: f32 = 0.0,
+    pub flowers: vec4 = vec4(0.0),
+    pub under: vec4 = vec4(0.0),
+    pub flora: vec4 = vec4(0.0),
+    pub materials: vec4 = vec4(0.0, 1.0, 0.0, 0.0),
+}
+
+/// One cooked point of the clipmap: the height, the normal (octahedral), the cover (the albedo's
+/// square root, for its dark greens' precision, and the grass), the meadow (tall, dry, deep),
+/// the flowers (each kind's weight, and how many), and the wood's floor's plants (`Cover::under`).
+pub struct Texel: Copy + GpuData {
+    pub height: f32,
+    pub normal: Oct32,
+    pub cover: Unorm8x4,
+    pub meadow: Unorm8x4,
+    pub flowers: Unorm8x4,
+    pub under: Unorm8x4,
+    pub flora: Unorm8x4,
+    pub materials: Unorm8x4,
+}
+
+/// Texels along each side of a level, and the quads between them.
+pub const SIDE: u32 = 129
+pub const QUADS: u32 = SIDE - 1
+/// The most levels a clipmap has.
+pub const MAX_LEVELS: u32 = 12
+/// A level's rows in the buffer: as wide as its cooking dispatch's rows, whole groups of 8.
+pub const ROW: u32 = (SIDE + 7) / 8 * 8
+/// Texels a level takes in the buffer: its SIDE rows, rounded up to a 256-byte span (WebGPU
+/// binds a span from a multiple of 256 bytes; a texel is 32, so 64 texels are a whole number of
+/// spans).
+pub const STRIDE: u32 = (SIDE * ROW + 63) / 64 * 64
+/// The points a level's triangles join (`ground`): its grid's, then the dropped points of its
+/// skirt along each outer edge (`SIDE` a side), then those of its skirt along each edge of the
+/// hole the finer level fills (`QUADS / 2 + 1` a side).
+pub const LEVEL_POINTS: u32 = SIDE * SIDE + 4 * SIDE + 4 * (QUADS / 2 + 1)
+/// The places the hole can be: its corner `HOLE` or one more of the level's cells in each way
+/// (`Clipmap::place` snaps a level to two of its cells and the finer level to one). The ground's
+/// indices hold a run for each, then one with no hole, the finest level's.
+const HOLES: u32 = 4
+/// The nearest the hole's corner can be, in the level's cells: the finer level, half as wide,
+/// centred in it.
+const HOLE: u32 = QUADS / 4
+/// How far a skirt hangs below a level's edge, in its cells.
+const SKIRT: f32 = 2.0
+/// The band of a level, in its own cells from its edge, over which it morphs to the next.
+const MORPH_FROM: f32 = 52.0
+const MORPH_TO: f32 = 62.0
+
+/// Where each level is, as the shaders read it: level l's texel (0, 0) at
+/// (`at[l].x`, `at[l].y`), `at[l].z` apart; the levels in use; and where the eye is (x, z), which
+/// a level's morph to the next follows (its place moves in steps; the eye doesn't).
+pub struct Levels: Copy + GpuData {
+    pub at: [vec4; MAX_LEVELS],
+    pub count: u32,
+    pub eye: vec2,
+}
+
+/// How the ground's fields lie (`Clipmap::fields_on`): a texture that wraps round the plane every
+/// `period` metres, each texel `texel` metres, in `blocks` blocks a side, each a tile `tile`
+/// metres across (a block holds the fields of whichever tile it wraps to that's written there,
+/// and `tiles` says which); `on` 0 until a game turns them on.
+pub struct FieldsAt: Copy + GpuData {
+    pub period: f32,
+    pub texel: f32,
+    pub tile: f32,
+    pub blocks: u32,
+    pub on: u32,
+}
+
+/// The ground's fields at (x, z): the block it wraps to, if the tile it's in is the one written
+/// there; else -1 in each.
+pub fn fields_here(
+    fields: Texture<Rgba8>,
+    s: Sampler,
+    at: FieldsAt,
+    tiles: [vec4],
+    x: f32,
+    z: f32,
+) -> vec4 {
+    if at.on == 0 {
+        return vec4(-1.0)
+    }
+    let t = vec2i(floor(vec2(x, z) / at.tile))
+    let b = vec2i(
+        ((t.x % i32(at.blocks)) + i32(at.blocks)) % i32(at.blocks),
+        ((t.y % i32(at.blocks)) + i32(at.blocks)) % i32(at.blocks),
+    )
+    let held = tiles[u32(b.y) * at.blocks + u32(b.x)]
+    if held.z == 0.0 || i32(held.x) != t.x || i32(held.y) != t.y {
+        return vec4(-1.0)
+    }
+    // Sampled within the tile's own block (clamped half a texel in): a neighbour's block may hold
+    // another tile.
+    let local = clamp(
+        vec2(x, z) - vec2(t) * at.tile,
+        vec2(at.texel * 0.5),
+        vec2(at.tile - at.texel * 0.5),
+    )
+    let uv = (vec2(b) * at.tile + local) / at.period
+    fields.sample_level(s, uv)
+}
+
+/// A terrain's clipmap on the GPU, and where its levels are.
+pub struct Clipmap {
+    texels: GpuBuffer<Texel>,
+    /// A level's texels as it moves (`cook_level`), copied into `texels` after.
+    moving: GpuBuffer<Texel>,
+    levels: Levels,
+    /// The ground's triangles (`ground_indices`), and each level's draw of them this frame: its
+    /// run of them, one instance, from its first point.
+    indices: GpuBuffer<u32>,
+    args: GpuBuffer<DrawIndexedArgs>,
+    finest: f32,
+    /// Whether each level holds what its place asks (false until it's cooked).
+    cooked: [bool; MAX_LEVELS],
+    /// Levels cooked since the clipmap was made (each time a level moved).
+    pub cooks: u32,
+    /// The ground's fields (`fields_on`): the texture, how it's read and lies, and which tile
+    /// each block holds (x, z, and 1 if any), on the GPU and here.
+    fields: Texture<Rgba8>,
+    fields_s: Sampler,
+    fields_at: FieldsAt,
+    field_tiles: GpuBuffer<vec4>,
+    held: Vec<vec4>,
+    /// The render origin (`view::Camera::origin`): the levels lie in render space, and cook the
+    /// ground at the world's points.
+    origin: vec2,
+    /// The ground's detail close up, cooked once (`cook_detail`): a tile each of leaf litter,
+    /// soil, rock and moss, read through a repeating sampler (`ground_shade`).
+    pub details: Details,
+}
+
+/// The ground's detail tiles (`cook_detail`), and the repeating sampler they're read through.
+pub struct Details {
+    pub litter: Texture<Rgba8>,
+    pub soil: Texture<Rgba8>,
+    pub rock: Texture<Rgba8>,
+    pub moss: Texture<Rgba8>,
+    pub s: Sampler,
+}
+
+impl Clipmap {
+    /// A clipmap of `levels` levels (at most `MAX_LEVELS`), the finest `finest` apart.
+    pub fn new(levels: u32, finest: f32) -> Clipmap {
+        let n = min(levels, MAX_LEVELS)
+        Clipmap {
+            texels: buffer(n * STRIDE),
+            moving: buffer(STRIDE),
+            levels: Levels { at: [vec4(0.0); MAX_LEVELS], count: n, eye: vec2(0.0) },
+            indices: buffer_of(ground_indices()),
+            args: buffer(MAX_LEVELS),
+            finest,
+            cooked: [false; MAX_LEVELS],
+            cooks: 0,
+            fields: texture::<Rgba8>(width: 1, height: 1),
+            fields_s: sampler(),
+            fields_at: FieldsAt { period: 1.0, texel: 1.0, tile: 1.0, blocks: 1, on: 0 },
+            field_tiles: buffer(1),
+            held: Vec::from([vec4(0.0)]),
+            origin: vec2(0.0),
+            details: Details {
+                litter: cook_detail(0),
+                soil: cook_detail(1),
+                rock: cook_detail(2),
+                moss: cook_detail(3),
+                s: sampler(address: Address::Repeat),
+            },
+        }
+    }
+
+    /// The render origin moved to `o` (world, x and z): the levels move with render space and
+    /// keep what they cooked, so long as `o` moved by whole cells of the coarsest level's snap
+    /// (twice its spacing: a game moves its origin by whole blocks of tiles).
+    pub fn set_origin(mut self, o: vec2) {
+        let d = o - self.origin
+        if d == vec2(0.0) {
+            return
+        }
+        for l in 0..self.levels.count {
+            let a = self.levels.at[l]
+            self.levels.at[l] = vec4(a.xy - d, a.z, a.w)
+        }
+        self.levels.eye -= d
+        self.origin = o
+    }
+
+    /// Turns the ground's fields on: `blocks` blocks a side, each a tile `tile` metres across of
+    /// `side` texels a side (RGBA, each 0 to 1), which `Terrain::cover_with` reads as it cooks.
+    pub fn fields_on(mut self, tile: f32, side: u32, blocks: u32) {
+        self.fields = texture::<Rgba8>(width: side * blocks, height: side * blocks)
+        self.fields_s = sampler(address: Address::Repeat)
+        self.fields_at = FieldsAt {
+            period: tile * f32(blocks),
+            texel: tile / f32(side),
+            tile,
+            blocks,
+            on: 1,
+        }
+        self.held = Vec::filled(blocks * blocks, vec4(0.0))
+        self.field_tiles = buffer_of(self.held)
+        self.cooked = [false; MAX_LEVELS]
+    }
+
+    /// Tile `t`'s fields (`side` × `side` texels, 4 bytes each, rows from its corner) written
+    /// into the block it wraps to; the levels over it cook again.
+    pub fn write_fields(mut self, t: vec2i, bytes: [u8]) {
+        let at = self.fields_at
+        if at.on == 0 {
+            return
+        }
+        let n = i32(at.blocks)
+        let b = vec2u(u32(((t.x % n) + n) % n), u32(((t.y % n) + n) % n))
+        let side = u32(round(at.tile / at.texel))
+        let k = b.y * at.blocks + b.x
+        let old = self.held[k]
+        if old.z != 0.0 && old.xy != vec2(t) {
+            self.touched(old.xy * at.tile, (old.xy + vec2(1.0)) * at.tile)
+        }
+        self.fields.write(b.x * side, b.y * side, side, side, bytes)
+        self.held[k] = vec4(f32(t.x), f32(t.y), 1.0, 0.0)
+        write(mut self.field_tiles, 0, self.held)
+        self.touched(vec2(t) * at.tile, vec2(t + vec2i(1)) * at.tile)
+    }
+
+    /// Tile `t`'s fields forgotten (its block holds nothing): the levels over it cook again.
+    pub fn drop_fields(mut self, t: vec2i) {
+        let at = self.fields_at
+        if at.on == 0 {
+            return
+        }
+        let n = i32(at.blocks)
+        let b = vec2u(u32(((t.x % n) + n) % n), u32(((t.y % n) + n) % n))
+        let k = b.y * at.blocks + b.x
+        if self.held[k].z != 0.0 && i32(self.held[k].x) == t.x && i32(self.held[k].y) == t.y {
+            self.held[k] = vec4(0.0)
+            write(mut self.field_tiles, 0, self.held)
+            self.touched(vec2(t) * at.tile, vec2(t + vec2i(1)) * at.tile)
+        }
+    }
+
+    /// The levels whose squares reach from `lo` to `hi` (the world's) cook again whole.
+    fn touched(mut self, lo: vec2, hi: vec2) {
+        let (lo, hi) = (lo - self.origin, hi - self.origin)
+        for l in 0..self.levels.count {
+            let a = self.levels.at[l]
+            let end = a.xy + vec2(f32(QUADS) * a.z)
+            if a.x < hi.x && a.y < hi.y && end.x >= lo.x && end.y >= lo.y {
+                self.cooked[l] = false
+            }
+        }
+    }
+
+    /// Where the levels are, for the shaders.
+    pub fn levels(self) -> Levels {
+        self.levels
+    }
+
+    /// The texels, for the shaders.
+    pub fn texels(self) -> std::gpu::GpuSpan<Texel> {
+        self.texels.span(start: 0, count: self.levels.count * STRIDE)
+    }
+
+    /// Level `l`'s spacing.
+    pub fn spacing(self, l: u32) -> f32 {
+        self.finest * f32(1 << l)
+    }
+
+    /// Where level `l` goes when the eye is at `eye`: its texel (0, 0), the level centred on the
+    /// eye snapped to two of its cells.
+    pub fn place(self, l: u32, eye: vec3) -> vec2 {
+        let s = self.spacing(l)
+        let c = floor(eye.xz / (2.0 * s)) * (2.0 * s)
+        c - vec2(f32(QUADS / 2) * s)
+    }
+
+    /// Moves the levels with the eye, cooking each that moves (or that `terrain` changed for,
+    /// when `again`). Records the cooking passes; returns how many levels were cooked.
+    pub fn follow<T: Terrain>(mut self, terrain: T, eye: vec3, again: bool) -> u32 {
+        var cooked = 0
+        self.levels.eye = eye.xz
+        for l in 0..self.levels.count {
+            let at = self.place(l, eye)
+            let old = self.levels.at[l]
+            if again || !self.cooked[l] || old.x != at.x || old.y != at.y {
+                let s = self.spacing(l)
+                self.levels.at[l] = vec4(at.x, at.y, s, 0.0)
+                // How many cells it moved, each way: what it kept is that far back in its old
+                // texels (all of it is cooked, for a level not cooked yet).
+                let moved = if again || !self.cooked[l] {
+                    vec2i(i32(SIDE))
+                } else { vec2i(round((at - old.xy) / s)) }
+                label("terrain cook")
+                dispatch(
+                    cook_level.bind(
+                        terrain,
+                        fields: self.fields,
+                        fs: self.fields_s,
+                        fields_at: self.fields_at,
+                        tiles: self.field_tiles,
+                        at: vec4(at.x, at.y, s, 0.0),
+                        origin: self.origin,
+                        moved: moved,
+                        from: self.texels.span(start: l * STRIDE, count: STRIDE),
+                        out: mut self.moving,
+                    ),
+                    groups: (ROW / 8, ROW / 8, 1),
+                )
+                std::gpu::copy(
+                    from: self.moving.span(start: 0, count: STRIDE),
+                    to: self.texels.span_mut(start: l * STRIDE, count: STRIDE),
+                )
+                self.cooked[l] = true
+                cooked += 1
+            }
+        }
+        self.cooks += cooked
+        // Each level's draw: its run of the indices, by where its hole is.
+        var args: Vec<DrawIndexedArgs> = Vec::new()
+        for l in 0..self.levels.count {
+            var run = HOLES
+            if l > 0 {
+                let a = self.levels.at[l]
+                let lo = vec2u((self.levels.at[l - 1].xy - a.xy) / a.z + vec2(0.5))
+                run = min(lo.x - HOLE, 1) + 2 * min(lo.y - HOLE, 1)
+            }
+            args.push(
+                DrawIndexedArgs {
+                    indices: run_length(run),
+                    instances: 1,
+                    first_index: first_index(run),
+                    base_vertex: i32(l * LEVEL_POINTS),
+                    first_instance: 0,
+                },
+            )
+        }
+        write(mut self.args, 0, args)
+        cooked
+    }
+
+    /// The ground's indices, to draw with `draw_args`.
+    pub fn indices(self) -> GpuSpan<u32> {
+        self.indices.span(start: 0, count: self.indices.len())
+    }
+
+    /// Level `l`'s draw of the ground's indices this frame.
+    pub fn draw_args(self, l: u32) -> GpuSpan<DrawIndexedArgs> {
+        self.args.span(start: l, count: 1)
+    }
+
+    /// The ground as a shadow caster into `pass`, seen from the sun by `view`: each level drawn
+    /// (its depth alone), biased as casters are (`shadow::CASTER`).
+    pub fn cast<P: RenderPass>(self, pass: P, view: mat4) {
+        let levels = self.levels()
+        for l in 0..levels.count {
+            draw(
+                pass,
+                ground_shadow.bind(levels, self.texels(), view),
+                vegetation::nothing,
+                indices: self.indices(),
+                indirect: self.draw_args(l),
+                depth_bias: shadow::CASTER,
+            )
+        }
+    }
+}
+
+/// Where the finer level's hole is in run `r` of the ground's indices (`r < HOLES`).
+fn hole_of(r: u32) -> vec2u {
+    vec2u(HOLE + r % 2, HOLE + r / 2)
+}
+
+/// The indices in run `r`: its quads (the hole's left out) and its skirts, two triangles each.
+fn run_length(r: u32) -> u32 {
+    let hole = if r < HOLES { (QUADS / 2) * (QUADS / 2) } else { 0 }
+    let inner = if r < HOLES { 4 * (QUADS / 2) } else { 0 }
+    (QUADS * QUADS - hole + 4 * QUADS + inner) * 6
+}
+
+fn first_index(r: u32) -> u32 {
+    var at = 0
+    for k in 0..r {
+        at += run_length(k)
+    }
+    at
+}
+
+/// The ground's indices: each run's (`HOLES` with a hole, then one without) quads, then its
+/// outer skirts, then its inner skirts, each quad's corners as `ground` once drew them.
+fn ground_indices() -> Vec<u32> {
+    let qx = [0, 1, 1, 0, 1, 0]
+    let qz = [0, 0, 1, 0, 1, 1]
+    var out: Vec<u32> = Vec::new()
+    for r in 0..HOLES + 1 {
+        let lo = if r < HOLES { hole_of(r) } else { vec2u(QUADS) }
+        let hi = lo + vec2u(QUADS / 2)
+        for cz in 0..QUADS {
+            for cx in 0..QUADS {
+                if cx >= lo.x && cx < hi.x && cz >= lo.y && cz < hi.y {
+                    continue
+                }
+                for c in 0..6 {
+                    out.push((cz + qz[c]) * SIDE + cx + qx[c])
+                }
+            }
+        }
+        for side in 0..4 {
+            for i in 0..QUADS {
+                for c in 0..6 {
+                    let j = i + qx[c]
+                    let top = if side == 0 { j } else if side == 1 {
+                        QUADS * SIDE + j
+                    } else if side == 2 {
+                        j * SIDE
+                    } else { j * SIDE + QUADS }
+                    out.push(if qz[c] == 0 { top } else { SIDE * SIDE + side * SIDE + j })
+                }
+            }
+        }
+        if r < HOLES {
+            for side in 0..4 {
+                for i in 0..QUADS / 2 {
+                    for c in 0..6 {
+                        let j = i + qx[c]
+                        let g = if side == 0 { vec2u(lo.x + j, lo.y) } else if side == 1 {
+                            vec2u(lo.x + j, hi.y)
+                        } else if side == 2 { vec2u(lo.x, lo.y + j) } else { vec2u(hi.x, lo.y + j) }
+                        let dropped = SIDE * SIDE + 4 * SIDE + side * (QUADS / 2 + 1) + j
+                        out.push(if qz[c] == 0 { g.y * SIDE + g.x } else { dropped })
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A level's texels: the terrain's height, normal and cover at each point of its grid. A
+/// level that moved `moved` cells keeps the texels of the points it held, from where they were
+/// in `from` (its texels before), and cooks only those it brings in: a move of two cells cooks
+/// 258 texels, not 16641.
+@compute(8, 8)
+pub fn cook_level<T: Terrain>(
+    terrain: T,
+    fields: Texture<Rgba8>,
+    fs: Sampler,
+    fields_at: FieldsAt,
+    tiles: [vec4],
+    at: vec4,
+    origin: vec2,
+    moved: vec2i,
+    from: [Texel],
+    out: mut Slots<Texel>,
+    id: GlobalId,
+) {
+    if id.x >= SIDE || id.y >= SIDE {
+        return
+    }
+    let was = vec2i(i32(id.x), i32(id.y)) + moved
+    if was.x >= 0 && was.x < i32(SIDE) && was.y >= 0 && was.y < i32(SIDE) {
+        out[id] = from[u32(was.y) * ROW + u32(was.x)]
+        return
+    }
+    // The texel's world point: its render-space point and the render origin.
+    let s = at.z
+    let x = (at.x + f32(id.x) * s) + origin.x
+    let z = (at.y + f32(id.y) * s) + origin.y
+    let h = terrain.height(x, z)
+    let n = terrain.normal(x, z, s * 0.5)
+    let f = fields_here(fields, fs, fields_at, tiles, x, z)
+    let c = terrain.cover_seen(vec3(x, h, z), n, f, s)
+    // Slot (i, j) is j * ROW + i: the dispatch's rows are ROW wide (`texel_index`).
+    out[id] = Texel {
+        height: terrain.substrate_height(vec3(x, h, z)),
+        normal: Oct32::encode(n),
+        cover: Unorm8x4::encode(vec4(sqrt(saturate(c.albedo)), saturate(c.grass))),
+        meadow: Unorm8x4::encode(saturate(vec4(c.tall, c.dry, c.deep, 0.0))),
+        flowers: Unorm8x4::encode(saturate(c.flowers)),
+        under: Unorm8x4::encode(saturate(c.under)),
+        flora: Unorm8x4::encode(saturate(c.flora)),
+        materials: Unorm8x4::encode(saturate(c.materials)),
+    }
+}
+
+/// Texel (i, j) of level `l`, as its cook dispatch wrote it (`ROW` to a row).
+pub fn texel_index(l: u32, i: u32, j: u32) -> u32 {
+    l * STRIDE + j * ROW + i
+}
+
+/// The cell of level `l` that holds `xz` (clamped to the level): its four texels' indices
+/// (`texel_index`: its corner (i, j), then (i + 1, j), (i, j + 1) and (i + 1, j + 1)), and how
+/// far across it `xz` is.
+fn level_cell(levels: Levels, l: u32, xz: vec2) -> (vec4u, vec2) {
+    let a = levels.at[l]
+    let g = clamp((xz - a.xy) / a.z, vec2(0.0), vec2(f32(QUADS) - 0.001))
+    let i = floor(g)
+    let (x, y) = (u32(i.x), u32(i.y))
+    let at = vec4u(
+        texel_index(l, x, y),
+        texel_index(l, x + 1, y),
+        texel_index(l, x, y + 1),
+        texel_index(l, x + 1, y + 1),
+    )
+    (at, g - i)
+}
+
+/// A bilinear blend of a cell's four corners' values (as `level_cell` orders them), `f` across.
+fn bilinear(v: vec4, f: vec2) -> f32 {
+    mix(mix(v.x, v.y, f.x), mix(v.z, v.w, f.x), f.y)
+}
+
+/// Level `l`'s height at (x, z), between its texels (bilinear), from `texels`.
+pub fn level_height(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> f32 {
+    let (at, f) = level_cell(levels, l, xz)
+    let h = vec4(
+        texels[at.x].height,
+        texels[at.y].height,
+        texels[at.z].height,
+        texels[at.w].height,
+    )
+    bilinear(h, f)
+}
+
+/// How far a point is from the eye in level `l`'s cells (the larger of x and z).
+fn eye_cells(levels: Levels, l: u32, xz: vec2) -> f32 {
+    let d = abs(xz - levels.eye)
+    max(d.x, d.y) / levels.at[l].z
+}
+
+/// How far a point of level `l` has morphed to level `l + 1`: 0 inside the band, 1 at its end
+/// (and 0 for the coarsest level, which has none beyond it). The band is the eye's distance
+/// in the level's cells, so it moves smoothly with the eye; it ends 62 cells out, within the
+/// level wherever its place has snapped to (its centre is within 2 cells of the eye).
+fn morph(levels: Levels, l: u32, xz: vec2) -> f32 {
+    if l + 1 >= levels.count {
+        return 0.0
+    }
+    saturate((eye_cells(levels, l, xz) - MORPH_FROM) / (MORPH_TO - MORPH_FROM))
+}
+
+/// What the ground's vertex shader passes on: the world point.
+pub struct GroundVertex: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+}
+
+/// The ground's points: level `v / LEVEL_POINTS`'s (`LEVEL_POINTS`), each shaded once for the
+/// triangles that share it (an indexed draw a level, `Clipmap::draw_args`). Each reads its
+/// level's texels, morphed in the band at the level's edge to the coarser level's heights; it
+/// never evaluates the field.
+@vertex
+pub fn ground(v: VertexIndex, cam: Camera, levels: Levels, texels: [Texel]) -> GroundVertex {
+    let world = ground_world(v.index, levels, texels)
+    GroundVertex { clip: ClipPosition { position: cam.clip(world) }, world }
+}
+
+/// The ground's point `v` as a shadow caster, seen from the sun by `view` (`Clipmap::cast`).
+@vertex
+pub fn ground_shadow(v: VertexIndex, levels: Levels, texels: [Texel], view: mat4) -> ClipPosition {
+    ClipPosition { position: view * vec4(ground_world(v.index, levels, texels), 1.0) }
+}
+
+/// Where the ground's point `index` is (render space): `ground`'s and `ground_shadow`'s.
+fn ground_world(index: u32, levels: Levels, texels: [Texel]) -> vec3 {
+    let l = index / LEVEL_POINTS
+    let p = index % LEVEL_POINTS
+    let a = levels.at[l]
+    let s = a.z
+    var gx = 0
+    var gz = 0
+    var drop = 0.0
+    if p < SIDE * SIDE {
+        gx = p % SIDE
+        gz = p / SIDE
+    } else if p < SIDE * SIDE + 4 * SIDE {
+        // An outer skirt's: hanging below a point of the level's edge.
+        let e = p - SIDE * SIDE
+        let side = e / SIDE
+        let i = e % SIDE
+        if side == 0 {
+            gx = i
+        } else if side == 1 {
+            gx = i
+            gz = QUADS
+        } else if side == 2 {
+            gz = i
+        } else {
+            gx = QUADS
+            gz = i
+        }
+        drop = SKIRT * s
+    } else {
+        // An inner skirt's: below a point of the edge of the finer level's hole (on this
+        // level's grid; the finer level has none inside it).
+        let e = p - SIDE * SIDE - 4 * SIDE
+        let side = e / (QUADS / 2 + 1)
+        let i = e % (QUADS / 2 + 1)
+        let lo = if l > 0 { vec2u((levels.at[l - 1].xy - a.xy) / s + vec2(0.5)) } else { vec2u(0) }
+        let hi = lo + vec2u(QUADS / 2)
+        if side == 0 {
+            gx = lo.x + i
+            gz = lo.y
+        } else if side == 1 {
+            gx = lo.x + i
+            gz = hi.y
+        } else if side == 2 {
+            gx = lo.x
+            gz = lo.y + i
+        } else {
+            gx = hi.x
+            gz = lo.y + i
+        }
+        drop = SKIRT * s
+    }
+    let xz = a.xy + vec2(f32(gx), f32(gz)) * s
+    var h = texels[texel_index(l, gx, gz)].height
+    let m = morph(levels, l, xz)
+    if m > 0.0 {
+        h = mix(h, level_height(levels, texels, l + 1, xz), m)
+    }
+    vec3(xz.x, h - drop, xz.y)
+}
+
+/// The ground at `xz` as the clipmap holds it: its normal, albedo (linear) and height (as
+/// `height_at` has it), from the finest level that holds the point, blended to the next where
+/// that level morphs.
+pub fn ground_at(levels: Levels, texels: [Texel], xz: vec2) -> (vec3, vec3, f32) {
+    ground_from(levels, texels, level_at(levels, xz), xz)
+}
+
+/// `ground_at` from level `l` (`level_at`'s, found once by a caller that reads more of it).
+fn ground_from(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> (vec3, vec3, f32) {
+    let (n0, c0, h0) = level_cover(levels, texels, l, xz)
+    let m = morph(levels, l, xz)
+    var n = n0
+    var c = c0
+    var h = h0
+    if m > 0.0 {
+        let (n1, c1, h1) = level_cover(levels, texels, l + 1, xz)
+        n = mix(n0, n1, vec3(m))
+        c = mix(c0, c1, vec4(m))
+        h = mix(h0, h1, m)
+    }
+    (normalize(n), c.rgb * c.rgb, h)
+}
+
+/// Level `l`'s normal, cover and height at `xz`, between its texels (bilinear).
+fn level_cover(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> (vec3, vec4, f32) {
+    let (at, f) = level_cell(levels, l, xz)
+    let t00 = texels[at.x]
+    let t10 = texels[at.y]
+    let t01 = texels[at.z]
+    let t11 = texels[at.w]
+    let n = mix(
+        mix(t00.normal.decode(), t10.normal.decode(), vec3(f.x)),
+        mix(t01.normal.decode(), t11.normal.decode(), vec3(f.x)),
+        vec3(f.y),
+    )
+    let c = mix(
+        mix(t00.cover.decode(), t10.cover.decode(), vec4(f.x)),
+        mix(t01.cover.decode(), t11.cover.decode(), vec4(f.x)),
+        vec4(f.y),
+    )
+    (n, c, bilinear(vec4(t00.height, t10.height, t01.height, t11.height), f))
+}
+
+/// The finest level that holds `xz` before its morph's end (the level it's drawn from, blended
+/// to the next by `morph`).
+pub fn level_at(levels: Levels, xz: vec2) -> u32 {
+    var l = 0
+    while l + 1 < levels.count && eye_cells(levels, l, xz) >= MORPH_TO {
+        l += 1
+    }
+    l
+}
+
+/// What covers the ground at `xz`, as the clipmap holds it: its normal, cover, meadow and
+/// flowers (each as the texels' encodings decode), and its height (as `height_at` has it),
+/// between texels and blended from the level it's drawn from to the next where that level
+/// morphs: what the grass is placed by.
+pub struct Covering: Copy {
+    pub normal: vec3,
+    pub height: f32,
+    pub cover: vec4,
+    pub meadow: vec4,
+    pub flowers: vec4,
+    pub under: vec4,
+    pub flora: vec4,
+}
+
+/// Level `l`'s ground at `xz`, between its texels (bilinear).
+fn level_ground(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> Covering {
+    let (at, f) = level_cell(levels, l, xz)
+    var out = Covering {
+        normal: vec3(0.0),
+        height: 0.0,
+        cover: vec4(0.0),
+        meadow: vec4(0.0),
+        flowers: vec4(0.0),
+        under: vec4(0.0),
+        flora: vec4(0.0),
+    }
+    var heights = vec4(0.0)
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let w = (if dx == 0 { 1.0 - f.x } else { f.x }) * (if dy == 0 { 1.0 - f.y } else {
+                f.y
+            })
+            let t = texels[at[dy * 2 + dx]]
+            out.normal += t.normal.decode() * w
+            out.cover += t.cover.decode() * w
+            out.meadow += t.meadow.decode() * w
+            out.flowers += t.flowers.decode() * w
+            out.under += t.under.decode() * w
+            out.flora += t.flora.decode() * w
+            heights[dy * 2 + dx] = t.height
+        }
+    }
+    out.height = bilinear(heights, f)
+    out
+}
+
+pub fn ground_cover_at(levels: Levels, texels: [Texel], xz: vec2) -> Covering {
+    let l = level_at(levels, xz)
+    let g0 = level_ground(levels, texels, l, xz)
+    let m = morph(levels, l, xz)
+    if m <= 0.0 {
+        return Covering { normal: normalize(g0.normal), ..g0 }
+    }
+    let g1 = level_ground(levels, texels, l + 1, xz)
+    Covering {
+        normal: normalize(mix(g0.normal, g1.normal, vec3(m))),
+        height: mix(g0.height, g1.height, m),
+        cover: mix(g0.cover, g1.cover, vec4(m)),
+        meadow: mix(g0.meadow, g1.meadow, vec4(m)),
+        flowers: mix(g0.flowers, g1.flowers, vec4(m)),
+        under: mix(g0.under, g1.under, vec4(m)),
+        flora: mix(g0.flora, g1.flora, vec4(m)),
+    }
+}
+
+/// The ground's height at `xz` as the clipmap holds it, as it's drawn: the level it's drawn
+/// from, blended to the next where that level morphs.
+pub fn height_at(levels: Levels, texels: [Texel], xz: vec2) -> f32 {
+    let l = level_at(levels, xz)
+    let h = level_height(levels, texels, l, xz)
+    let m = morph(levels, l, xz)
+    if m <= 0.0 {
+        return h
+    }
+    mix(h, level_height(levels, texels, l + 1, xz), m)
+}
+
+// ---- raycasts (the sim's) -------------------------------------------------------------------
+
+/// Where the ray from `from` along `dir` (a unit vector) first meets the ground, within
+/// `reach` metres: stepping by the gap over the slope's bound, so it never steps through a
+/// rise, then halving the last step to a millimetre.
+pub fn raycast<T: Terrain>(terrain: T, from: vec3, dir: vec3, reach: f32) -> Hit {
+    let rate = abs(dir.y) + terrain.steepest() * length(dir.xz)
+    var t = 0.0
+    var before = 0.0
+    while t <= reach {
+        let p = from + dir * t
+        let gap = p.y - terrain.height(p.x, p.z)
+        if gap <= 0.0 {
+            // Between `before` (above) and `t` (below).
+            var lo = before
+            var hi = t
+            for _ in 0..32 {
+                if hi - lo < 1.0e-4 {
+                    break
+                }
+                let mid = 0.5 * (lo + hi)
+                let q = from + dir * mid
+                if q.y - terrain.height(q.x, q.z) > 0.0 {
+                    lo = mid
+                } else {
+                    hi = mid
+                }
+            }
+            let at = from + dir * hi
+            let h = terrain.height(at.x, at.z)
+            let point = vec3(at.x, h, at.z)
+            return Hit {
+                point,
+                normal: terrain.normal(at.x, at.z, 0.02),
+                distance: hi,
+                hit: true,
+            }
+        }
+        if t >= reach {
+            break
+        }
+        let next = min(t + max(gap / max(rate, 1.0e-3), 1.0e-3), reach)
+        if next <= t {
+            break
+        }
+        before = t
+        t = next
+    }
+    Hit { point: from, normal: vec3(0.0, 1.0, 0.0), distance: reach, hit: false }
+}
+
+/// The ground straight below (or above) `at`: its point and normal.
+pub fn below<T: Terrain>(terrain: T, at: vec3) -> Hit {
+    let h = terrain.height(at.x, at.z)
+    Hit {
+        point: vec3(at.x, h, at.z),
+        normal: terrain.normal(at.x, at.z, 0.02),
+        distance: at.y - h,
+        hit: true,
+    }
+}
+
+// ---- shading ---------------------------------------------------------------------------------
+
+/// The ground's pixel: the clipmap's normal and cover at its point, lit by the sun through the
+/// shadows and the clouds' shadows, and by the probes' sky light; through the haze.
+@fragment
+pub fn ground_shade(
+    g: GroundVertex,
+    lt: lit::Lighting,
+    texels: [Texel],
+    litter: Texture<Rgba8>,
+    soil: Texture<Rgba8>,
+    rock: Texture<Rgba8>,
+    moss: Texture<Rgba8>,
+    ds: Sampler,
+) -> vec4 {
+    // The level it's drawn from, found once for its cover and its materials.
+    let level = level_at(lt.levels, g.world.xz)
+    let (n, coarse, _) = ground_from(lt.levels, texels, level, g.world.xz)
+    // Its detail close up: what it's made of (`Cover::materials`), each material's cooked tile
+    // at two sizes (the finer fading out where a pixel spans its texels: no mipmaps), keyed to
+    // the world. A clipmap texel is 12.5 cm at the finest: without them, the ground read as
+    // smooth paint close up.
+    let mats = materials_at(lt.levels, texels, level, g.world.xz)
+    let foot = lt.cam.footprint(length(g.world - lt.cam.eye))
+    let wp = g.world + lt.cam.keyed()
+    let w = mats / max(mats.x + mats.y + mats.z + mats.w, 1.0e-3)
+    let a4 = abs(n)
+    let tri = a4 * a4 * a4 * a4 / max(dot(a4 * a4, a4 * a4), 1.0e-6)
+    // Rock across the planes the normal faces (a face's grain doesn't smear); the rest flat.
+    // A material of no weight adds nothing to the sum, so its tiles aren't read.
+    let rk = DETAIL_SIZES[2]
+    let rocky = if w.z == 0.0 {
+        vec3(0.0)
+    } else {
+        (detail_of(rock, ds, wp.zy, rk, foot) * tri.x +
+            detail_of(rock, ds, wp.xz, rk, foot) * tri.y +
+            detail_of(rock, ds, wp.xy, rk, foot) * tri.z) *
+            w.z
+    }
+    let detail = weighted_detail(litter, ds, wp.xz, DETAIL_SIZES[0], foot, w.x) +
+        weighted_detail(soil, ds, wp.xz, DETAIL_SIZES[1], foot, w.y) +
+        rocky +
+        weighted_detail(moss, ds, wp.xz, DETAIL_SIZES[3], foot, w.w)
+    let albedo = coarse * detail
+    // The sky's reflection, but no glint of the sun: the ground is covered (grass, and far off
+    // trees), whose blades and leaves shade each other's glints where the ground's would show
+    // (looking toward the sun, at a grazing angle); a crown's levels, where they meet, showed
+    // the glint through their silhouettes' differences (5.2/255 against 3.6, bound 4).
+    let (sun, sky, reflected) = lit::sun_and_gloss(lt, g.world, n, soft: 2.0)
+    let l = Lit { albedo, n, sun, sky, through: vec3(0.0), rough: 0.9, reflected }
+    let c = lit::shown(lt, l, g.world)
+    vec4(c, view::GROUND)
+}
+
+// ---- the ground's detail -------------------------------------------------------------------
+
+/// Each detail tile's texels a side, and how wide each tile lies on the ground (m): leaf litter,
+/// soil, rock, moss.
+pub const DETAIL_TEXELS: u32 = 256
+// (The look renders the scene under the output's size and paints it: litter's leaves smaller
+// than about 12 cm, and soil's crumbs, didn't survive it.)
+const DETAIL_SIZES = [2.8, 2.6, 3.5, 1.6]
+
+/// Detail tile `k` (0 leaf litter, 1 soil, 2 rock, 3 moss), cooked once: each texel a colour
+/// multiplier over the cover's albedo (halved: 0.5 keeps it), wrapping.
+pub fn cook_detail(k: u32) -> Texture<Rgba8> {
+    var t = texture::<Rgba8>(width: DETAIL_TEXELS, height: DETAIL_TEXELS)
+    let p = begin_pass(mut t)
+    draw(p, detail_full, detail_texel.bind(k: k), vertices: 3)
+    p.end()
+    t
+}
+
+/// A triangle covering the target.
+@vertex
+fn detail_full(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// Wrapped cell `(x, y)` of a grid `n` a side's hash, seeded.
+fn cell_hash(x: i32, y: i32, n: i32, seed: i32) -> f32 {
+    hash2(((x % n) + n) % n + seed * 131, ((y % n) + n) % n - seed * 71)
+}
+
+/// A texel of detail tile `k`.
+@fragment
+fn detail_texel(pixel: FragCoord, k: u32) -> vec4 {
+    let uv = pixel.position.xy / f32(DETAIL_TEXELS)
+    var c = vec3(1.0)
+    if k == 0 {
+        // Leaf litter: overlapping leaves vary in value over darker soil. The cover owns
+        // their colour; tinting this multiplier brown again made umber ground orange.
+        let n = 22
+        let q = uv * f32(n)
+        let base = floor(q)
+        c = vec3(0.62) * (0.85 + 0.3 * noise2_wrapped(q * 2.0, period: vec2i(n * 2, n * 2)))
+        var best = -1.0
+        for layer in 0..3 {
+            for j in -1..2 {
+                for i in -1..2 {
+                    let cx = i32(base.x) + i
+                    let cy = i32(base.y) + j
+                    let s = layer * 7
+                    let centre = vec2(f32(cx), f32(cy)) +
+                        vec2(cell_hash(cx, cy, n, s + 1), cell_hash(cx, cy, n, s + 2))
+                    let a = 6.2831855 * cell_hash(cx, cy, n, s + 3)
+                    let dir = vec2(cos(a), sin(a))
+                    let d = q - centre
+                    let along = dot(d, dir) / 0.55
+                    let across = dot(d, vec2(-dir.y, dir.x)) /
+                        (0.24 + 0.1 * cell_hash(cx, cy, n, s + 4))
+                    let inside = 1.0 - (along * along + across * across)
+                    let order = f32(layer) + cell_hash(cx, cy, n, s + 5)
+                    if inside > 0.0 && order > best {
+                        best = order
+                        let value = cell_hash(cx, cy, n, s + 6)
+                        let leaf = vec3(mix(1.05, 0.75, value))
+                        // A midrib, and the leaf's edge darker.
+                        let rib = 1.0 - 0.25 * smoothstep(0.06, 0.0, abs(across) * 0.24)
+                        c = leaf * (0.75 + 0.35 * smoothstep(0.0, 0.25, inside)) * rib
+                    }
+                }
+            }
+        }
+    } else if k == 1 {
+        // Soil: crumbs and clods, damp and dry, and a few small angular stones half sunk in it
+        // (pale round stones in a grid read as polka dots).
+        let crumbs = noise2_wrapped(uv * 48.0, period: vec2i(48, 48)) * 0.5 +
+            noise2_wrapped(uv * 120.0, period: vec2i(120, 120)) * 0.3 +
+            noise2_wrapped(uv * 12.0, period: vec2i(12, 12)) * 0.2
+        c = vec3(0.78 + 0.44 * crumbs)
+        let damp = smoothstep(0.45, 0.7, noise2_wrapped(uv * 6.0 + vec2(1.7), period: vec2i(6, 6)))
+        c *= 1.0 - 0.18 * damp
+        let n = 24
+        let q = uv * f32(n)
+        let cx = i32(floor(q.x))
+        let cy = i32(floor(q.y))
+        let centre = floor(q) +
+            vec2(0.25) +
+            0.5 * vec2(cell_hash(cx, cy, n, 8), cell_hash(cx, cy, n, 9))
+        let r = 0.08 + 0.14 * cell_hash(cx, cy, n, 10)
+        // An angular outline: the distance stretched along a turned axis and broken by noise.
+        let a = 6.2831855 * cell_hash(cx, cy, n, 13)
+        let off = q - centre
+        let e = vec2(dot(off, vec2(cos(a), sin(a))), dot(off, vec2(-sin(a), cos(a)))) *
+            vec2(0.7, 1.3)
+        let d = (abs(e.x) + abs(e.y)) * 0.75 / r +
+            0.35 * noise2_wrapped(uv * 160.0, period: vec2i(160, 160))
+        if cell_hash(cx, cy, n, 11) > 0.72 {
+            let stone = vec3(1.08, 1.06, 1.02) * (0.85 + 0.25 * cell_hash(cx, cy, n, 12))
+            c = mix(c, stone * (0.85 + 0.3 * crumbs), vec3(smoothstep(1.0, 0.85, d)))
+            c *= 1.0 - 0.25 * smoothstep(1.3, 1.0, d) * smoothstep(0.9, 1.05, d) * step(0.0, off.y)
+        }
+    } else if k == 2 {
+        // Rock: its grain, cracks across it, and pale lichen in spots.
+        let grain = noise2_wrapped(uv * 64.0, period: vec2i(64, 64)) * 0.5 +
+            noise2_wrapped(uv * 160.0, period: vec2i(160, 160)) * 0.5
+        c = vec3(0.82 + 0.36 * grain)
+        // Cracks: thin, broken into short runs (a noise's level line everywhere read as a maze
+        // of wiggly lines on the crag's top).
+        let crack = 1.0 - abs(noise2_wrapped(uv * 9.0, period: vec2i(9, 9)) - 0.5) * 2.0
+        let runs = smoothstep(0.6, 0.75, noise2_wrapped(uv * 5.0 + vec2(2.3), period: vec2i(5, 5)))
+        c *= 1.0 - 0.3 * smoothstep(0.96, 0.99, crack) * runs
+        // Lichen in irregular crusts, broken at their edges, faint (bold round spots read as a
+        // leopard's at the coarser scale).
+        let crust = noise2_wrapped(uv * 20.0 + vec2(3.0), period: vec2i(20, 20)) * 0.7 +
+            noise2_wrapped(uv * 70.0, period: vec2i(70, 70)) * 0.3
+        let lichen = smoothstep(0.62, 0.72, crust)
+        c = mix(c, vec3(1.18, 1.2, 1.06), vec3(lichen * 0.45))
+    } else {
+        // Moss: tufts, lit tips and dark between.
+        let tufts = noise2_wrapped(uv * 90.0, period: vec2i(90, 90)) * 0.6 +
+            noise2_wrapped(uv * 220.0, period: vec2i(220, 220)) * 0.4
+        c = mix(vec3(0.62, 0.7, 0.55), vec3(1.25, 1.3, 1.05), vec3(tufts))
+    }
+    vec4(clamp(c * 0.5, vec3(0.0), vec3(1.0)), 1.0)
+}
+
+/// A detail tile's colour multiplier at `q` (m, on its plane), the tile `size` across: read at
+/// that size and four times it, the finer fading out where a pixel `foot` across spans its texels,
+/// and both where the coarser does (no mipmaps).
+fn detail_of(t: Texture<Rgba8>, ds: Sampler, q: vec2, size: f32, foot: f32) -> vec3 {
+    let fine = smoothstep(2.5, 0.8, foot * f32(DETAIL_TEXELS) / size)
+    let far = smoothstep(2.5, 0.8, foot * f32(DETAIL_TEXELS) / (size * 4.0))
+    // Faded out at both sizes it's 1, and faded out at the finer the finer read adds nothing
+    // (a mix's weight of 0 keeps its first value exactly): what isn't seen isn't read.
+    if far == 0.0 {
+        return vec3(1.0)
+    }
+    // The coarser read at half strength: at four times the size its shapes (a stone, a crust)
+    // are the size of a footstep, and read as a printed pattern at full strength.
+    let c = mix(
+        vec3(1.0),
+        t.sample_level(ds, q / (size * 4.0) + vec2(0.37, 0.71)).rgb * 2.0,
+        vec3(0.5),
+    )
+    if fine == 0.0 {
+        return mix(vec3(1.0), c, vec3(far))
+    }
+    let f = t.sample_level(ds, q / size).rgb * 2.0
+    mix(vec3(1.0), mix(c, f * c, vec3(fine)), vec3(far))
+}
+
+/// `detail_of` times its material's weight `w`; a weight of 0 adds nothing to a sum of them, so
+/// the material's tile isn't read.
+fn weighted_detail(t: Texture<Rgba8>, ds: Sampler, q: vec2, size: f32, foot: f32, w: f32) -> vec3 {
+    if w == 0.0 {
+        return vec3(0.0)
+    }
+    detail_of(t, ds, q, size, foot) * w
+}
+
+/// What the ground is made of at `xz` (`Cover::materials`), from level `l` (the level it's
+/// drawn from, `level_at`'s), between its texels and through its transition to the next
+/// level. Material detail must follow the same morph as the cover's colour and normal.
+pub fn materials_at(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> vec4 {
+    let here = level_materials(levels, texels, l, xz)
+    let m = morph(levels, l, xz)
+    if m <= 0.0 {
+        return here
+    }
+    mix(here, level_materials(levels, texels, l + 1, xz), vec4(m))
+}
+
+fn level_materials(levels: Levels, texels: [Texel], l: u32, xz: vec2) -> vec4 {
+    let (at, f) = level_cell(levels, l, xz)
+    let a = mix(texels[at.x].materials.decode(), texels[at.y].materials.decode(), vec4(f.x))
+    let b = mix(texels[at.z].materials.decode(), texels[at.w].materials.decode(), vec4(f.x))
+    mix(a, b, vec4(f.y))
+}
+
+/// A material boundary follows the same transition as height and colour, including at the
+/// end where the level selected by `level_at` changes. A missing material morph jumps here.
+@test
+fn material_weights_follow_the_clipmap_morph() {
+    var at = [vec4(0.0); MAX_LEVELS]
+    at[0] = vec4(-64.0, -64.0, 1.0, 0.0)
+    at[1] = vec4(-128.0, -128.0, 2.0, 0.0)
+    let levels = Levels { at, count: 2, eye: vec2(0.0) }
+    var texels: Vec<Texel> = Vec::new()
+    for l in 0..2 {
+        let materials = if l == 0 { vec4(0.0, 1.0, 0.0, 0.0) } else { vec4(0.0, 0.0, 1.0, 0.0) }
+        let t = Texel {
+            height: 0.0,
+            normal: Oct32::encode(vec3(0.0, 1.0, 0.0)),
+            cover: Unorm8x4::encode(vec4(0.0)),
+            meadow: Unorm8x4::encode(vec4(0.0)),
+            flowers: Unorm8x4::encode(vec4(0.0)),
+            under: Unorm8x4::encode(vec4(0.0)),
+            flora: Unorm8x4::encode(vec4(0.0)),
+            materials: Unorm8x4::encode(materials),
+        }
+        for _ in 0..STRIDE {
+            texels.push(t)
+        }
+    }
+    for k in 0..11 {
+        let xz = vec2(52.0 + f32(k), 0.0)
+        let value = materials_at(levels, texels, level_at(levels, xz), xz)
+        let expected = f32(k) / 10.0
+        assert(abs(value.z - expected) < 1.0e-5, f"material changed to {value} at {xz}")
+        assert(abs(value.y + value.z - 1.0) < 1.0e-5, "material blend lost its total weight")
+    }
+}
+
+struct RaycastPlain: Copy + GpuData {}
+
+impl Terrain for RaycastPlain {
+    fn height(self, x: f32, z: f32) -> f32 {
+        0.0
+    }
+    fn cover(self, at: vec3, n: vec3) -> Cover {
+        Cover { albedo: vec3(0.0), grass: 0.0 }
+    }
+}
+
+@test
+fn shallow_ground_rays_reach_their_hit() {
+    let dir = normalize(vec3(1.0, -0.01, 0.0))
+    let hit = raycast(RaycastPlain {}, vec3(0.0, 1.0, 0.0), dir, reach: 200.0)
+    assert(hit.hit, "a ray stopped before its ground intersection")
+    assert(abs(hit.distance - 1.0 / -dir.y) < 0.01)
+    let short = raycast(RaycastPlain {}, vec3(0.0, 1.0, 0.0), dir, reach: 50.0)
+    assert(!short.hit, "a ray searched past its reach")
+    let end = raycast(RaycastPlain {}, vec3(0.0, 1.0, 0.0), vec3(0.0, -1.0, 0.0), reach: 1.0)
+    assert(end.hit && end.distance == 1.0, "a hit exactly at the ray's reach was lost")
+}

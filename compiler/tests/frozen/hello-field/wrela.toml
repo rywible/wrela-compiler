@@ -1,0 +1,4 @@
+# A frozen copy of examples/hello-field at dc0f28e0: a small std-only program, an input of the
+# compiler's tests (hello_field.rs, reproducible.rs, simd.rs), never updated with the example.
+[package]
+name = "hello_field"

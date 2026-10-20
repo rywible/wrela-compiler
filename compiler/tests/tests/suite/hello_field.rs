@@ -1,4 +1,5 @@
-//! AC1: examples/hello-field end to end. `wrela build` output runs in headless Chrome (the
+//! AC1: examples/hello-field end to end, as its frozen copy (compiler/tests/frozen/hello-field,
+//! the compiler's and the hosts' input). `wrela build` output runs in headless Chrome (the
 //! standard browser runtime, via `wrela_host::pages`) and in the native host; both give the same
 //! state hash, both frames are within a mean of 0.5/255 of the checked-in golden frame
 //! (fixtures/hello-field.png, from the native host), and fixed pixels match the same shading
@@ -25,7 +26,7 @@ const PROBE_LIMIT: f64 = 2.0;
 /// The build, in a directory under the repo root (the page runs' server serves the repo), so it's
 /// also the browser's page.
 fn page(name: &str) -> (PathBuf, String) {
-    wrela_tests::page("examples/hello-field", &format!("hello-field-{name}"))
+    wrela_tests::page("compiler/tests/frozen/hello-field", &format!("hello-field-{name}"))
 }
 
 fn golden() -> PathBuf {

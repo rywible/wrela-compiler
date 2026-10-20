@@ -1,0 +1,1479 @@
+// A floor's map, as types: what its author decides, and positions that keep their precision far
+// from the origin.
+//
+// The map (`Map`) holds:
+// - the land's big shapes (`Land`, the crags);
+// - the sites and keystones (`Site`), and what each must do for a player (`Relation`);
+// - the openings, and what keeps each open in the present (`Opening`, `Keeper`);
+// - the water, the routes (`Route`) and the events by year (`Event`);
+// - the regions, with the character of their forest (`Region`, `Kind`).
+// `refusals` lists every reason a map cannot be grown, and `refuse` panics, naming each. A history
+// (`grow`) then grows the floor round the map, and the interest check (`interest`) measures what
+// a player standing anywhere would see.
+//
+//     map ──refuse──▶ (every opening kept in the present) ──grow──▶ history ──interest──▶ check
+//
+// A position that keeps its precision however far a player walks is a tile and an offset in it
+// (`Place`); the tile is the unit a floor streams in.
+//
+// Names are `Text` in the map's tables, which only CPU code reads (the GPU reads a site's place).
+
+use noise::{fbm2, hash2, noise2}
+use sim::SimState
+use stone::Bed
+use std::hash::StateHash
+use std::serialize::Serialize
+
+// ---- tiles and places ---------------------------------------------------------------------------
+
+/// A tile's side (m): the unit a floor streams in, and the grain of a place's tile.
+pub const TILE: f32 = 256.0
+
+/// A place on the plane: a tile and where in it (from its corner, each in [0, TILE)), so a
+/// position keeps its precision however far it is from the origin. An `f32` world position is a
+/// metre wrong after a minute's walk 10 km out; a place's offset is never larger than a
+/// tile.
+pub struct Place: Copy + Eq + Plain + StateHash + Serialize + SimState {
+    pub tile: vec2i,
+    pub local: vec2,
+}
+
+impl Place {
+    /// The place at world point `p` (x, z).
+    pub fn of(p: vec2) -> Place {
+        Place { tile: vec2i(0), local: vec2(0.0) }.moved(p)
+    }
+
+    /// The place at world point `p` given in `f64`s, exact to far beyond a floor.
+    pub fn of_f64(x: f64, z: f64) -> Place {
+        let t = vec2i(i32(floor(x / f64(TILE))), i32(floor(z / f64(TILE))))
+        let local = vec2(f32(x - f64(t.x) * f64(TILE)), f32(z - f64(t.y) * f64(TILE)))
+        Place { tile: t, local }.moved(vec2(0.0))
+    }
+
+    /// This place moved by `d` (m): its tile changes as it leaves the tile.
+    pub fn moved(self, d: vec2) -> Place {
+        var local = self.local + d
+        let shift = vec2i(floor(local / TILE))
+        var tile = self.tile + shift
+        local -= vec2(shift) * TILE
+        // Rounding can leave an offset of exactly TILE: the next tile's corner.
+        if local.x >= TILE {
+            local.x -= TILE
+            tile.x += 1
+        }
+        if local.y >= TILE {
+            local.y -= TILE
+            tile.y += 1
+        }
+        Place { tile, local }
+    }
+
+    /// Where `other` is from this place (m): exact while they're within a few tiles.
+    pub fn to(self, other: Place) -> vec2 {
+        vec2(other.tile - self.tile) * TILE + (other.local - self.local)
+    }
+
+    /// Where this place is from the corner of tile `origin` (m): render space, whose origin is a
+    /// tile near the camera, so what's drawn near the camera keeps its precision.
+    pub fn from_tile(self, origin: vec2i) -> vec2 {
+        vec2(self.tile - origin) * TILE + self.local
+    }
+
+    /// The world point, as an `f32` (a millimetre wrong 10 km out; for the floor near the origin).
+    pub fn world(self) -> vec2 {
+        vec2(self.tile) * TILE + self.local
+    }
+
+    /// The world point in `f64`s.
+    pub fn world_f64(self) -> vec2d {
+        vec2d(
+            f64(self.tile.x) * f64(TILE) + f64(self.local.x),
+            f64(self.tile.y) * f64(TILE) + f64(self.local.y),
+        )
+    }
+}
+
+impl SimState for vec2i {}
+
+/// The tile that holds world point `p`.
+pub fn tile_of(p: vec2) -> vec2i {
+    vec2i(floor(p / TILE))
+}
+
+// ---- the land's big shapes ----------------------------------------------------------------------
+
+/// The land's big shapes, as fields over the plane that a floor's terrain composes (on the CPU,
+/// for the history and the sim, and on the GPU, as the clipmap cooks it: one field). Each list
+/// ends at its first entry whose size is 0.
+pub struct Land: Copy + GpuData {
+    /// Hills: (x, z, radius, height): a broad top falling to nothing at the radius.
+    pub hills: [vec4; 8],
+    /// Hollows: (x, z, radius, depth).
+    pub hollows: [vec4; 8],
+    /// Ridges: each a run of points (x, z, height, half-width), a point of half-width 0 ending a
+    /// ridge; a bell across each segment, the highest of them.
+    pub ridges: [vec4; 24],
+    /// Ravines: each a run of points (x, z, depth, half-width at the rim), ended as ridges are;
+    /// a bed a third as wide, falling `fall` metres more toward its last point (`ravine_fall`).
+    pub ravines: [vec4; 16],
+    pub ravine_fall: f32,
+    /// Crags: (x, z, height, foot radius): steep-sided, flat-ish on top, rock. A ramp of scree
+    /// climbs each from the direction `ramps[i]` (radians from +x toward +z), so its top can be
+    /// reached on foot.
+    pub crags: [vec4; 4],
+    pub ramps: vec4,
+    /// Each crag's floor: the ground's height at its middle without it (m). Its tiers stand on it,
+    /// so their tops are planes whatever the land under them does (`crag_slabs` cuts its rock to
+    /// the same planes); the game sets them from its whole ground (`Land::settled`).
+    pub floors: vec4,
+    /// The plateau's tilt: rising `tilt.z` metres along (x, y), over `tilt.w` metres.
+    pub tilt: vec4,
+}
+
+/// How far apart a ravine's slumped walls are along it (m).
+pub const SLUMP_EVERY: f32 = 150.0
+
+/// The distance from `p` to segment `a`–`b`, and how far along it the nearest point is (0 to 1).
+pub fn to_segment(p: vec2, a: vec2, b: vec2) -> (f32, f32) {
+    let ab = b - a
+    let t = clamp(dot(p - a, ab) / max(dot(ab, ab), 1.0e-6), 0.0, 1.0)
+    (length(p - a - ab * t), t)
+}
+
+impl Land {
+    /// The shapes' height at `p` (m) without the crags and ravines (`crags_over`, `ravine`): the
+    /// plateau's tilt over a gentle roll, its ridges, hills and hollows.
+    pub fn base(self, p: vec2) -> f32 {
+        let t = self.tilt
+        var y = t.z * clamp(dot(p, t.xy) / max(t.w, 1.0), 0.0, 1.0)
+        y += 3.0 * (fbm2(p * 0.006 + vec2(3.0, 9.0), 3) - 0.5)
+        y += self.ridge(p)
+        for h in self.hills {
+            if h.z > 0.0 {
+                y += h.w * (1.0 - smoothstep(0.1, 1.0, length(p - h.xy) / h.z))
+            }
+        }
+        for h in self.hollows {
+            if h.z > 0.0 {
+                y -= h.w * (1.0 - smoothstep(0.3 * h.z, h.z, length(p - h.xy)))
+            }
+        }
+        y
+    }
+
+    /// What the crags add at `p` over ground `here` high there (m): a bedded crag's tiers stand on
+    /// its floor (`floors`), an outcrop's on the ground; their talus and ramps on the ground. And
+    /// whether a bedded crag's slabs stand over `p` (1, else 0: `crag_slabs`; its tops and cliffs
+    /// are theirs, and the game's relief on them would stand through them).
+    pub fn crags_over(self, p: vec2, here: f32) -> vec2 {
+        var y = vec2(0.0)
+        for i in 0..4 {
+            let c = self.crags[i]
+            if c.w > 0.0 && length(p - c.xy) < max(crag_reach(c), 3.5 * c.w) {
+                // An outcrop rides the ground under it, as the land does.
+                let rise = if bedded(c) { self.floors[i] - here } else { 0.0 }
+                y = max(y, crag(p, c, self.ramps[i], u32(i), rise))
+            }
+        }
+        y
+    }
+
+    /// The ground mesh's part of the crags: talus and access ramps, with bedded rock
+    /// supplied by `crag_beds` alone. Keeping the same rock in the heightfield lets its
+    /// coarser triangles cross the slabs as the clipmap follows the eye. Returns the earth
+    /// height over `here`, and how much rock was removed from the complete surface.
+    pub fn crag_substrate_over(self, p: vec2, here: f32) -> vec2 {
+        var earth = 0.0
+        var whole = 0.0
+        for i in 0..4 {
+            let c = self.crags[i]
+            if c.w > 0.0 && length(p - c.xy) < max(crag_reach(c), 3.5 * c.w) {
+                let rise = if bedded(c) { self.floors[i] - here } else { 0.0 }
+                let (talus, body, _) = crag_shape(p, c, u32(i))
+                let ramp = crag_ramp(p, c, self.ramps[i], u32(i), rise)
+                let substrate = if bedded(c) {
+                    max(talus, ramp)
+                } else {
+                    max(max(talus, body), ramp)
+                }
+                earth = max(earth, substrate)
+                whole = max(whole, max(max(talus, rise + body), ramp))
+            }
+        }
+        vec2(earth, max(whole - earth, 0.0))
+    }
+
+    /// This land with its crags' floors set from `ground`, the whole ground's height without the
+    /// crags at a point (the game's: it adds its own shapes to the land's `base`).
+    pub fn settled(self, ground: fn(vec2) -> f32) -> Land {
+        var l = self
+        for i in 0..4 {
+            l.floors[i] = ground(self.crags[i].xy)
+        }
+        l
+    }
+
+    /// The ridges' height at `p`: each segment's bell across it, the highest.
+    pub fn ridge(self, p: vec2) -> f32 {
+        var best = 0.0
+        for i in 0..23 {
+            let a = self.ridges[i]
+            let b = self.ridges[i + 1]
+            if a.w > 0.0 && b.w > 0.0 {
+                let (d, t) = to_segment(p, a.xy, b.xy)
+                let h = mix(a.z, b.z, t)
+                let w = mix(a.w, b.w, t)
+                best = max(best, h * exp(-(d * d) / (w * w)))
+            }
+        }
+        best
+    }
+
+    /// Signed curvature along a segment. Interpolating the vertex turns keeps a bend's
+    /// inner bank on the same side through each join, including short sampled courses.
+    fn ravine_bend(self, i: u32, t: f32) -> f32 {
+        let a = self.ravines[i]
+        let b = self.ravines[i + 1]
+        let dir = normalize(b.xy - a.xy + vec2(1.0e-8))
+        var before = dir
+        var after = dir
+        if i > 0 && self.ravines[i - 1].w > 0.0 {
+            before = normalize(a.xy - self.ravines[i - 1].xy + vec2(1.0e-8))
+        }
+        if i < 14 && self.ravines[i + 2].w > 0.0 {
+            after = normalize(self.ravines[i + 2].xy - b.xy + vec2(1.0e-8))
+        }
+        clamp(
+            4.0 * mix(before.x * dir.y - before.y * dir.x, dir.x * after.y - dir.y * after.x, t),
+            -1.0,
+            1.0,
+        )
+    }
+
+    /// How deep the ravines cut at `p`, and how far along the nearest one it is (m from its first
+    /// point), and how far from its course. Its walls are steep but where they've slumped.
+    pub fn ravine_at(self, p: vec2) -> vec3 {
+        var best = 1.0e9
+        var along = 0.0
+        var cut = 0.0
+        var walked = 0.0
+        var length_of = 0.0
+        for i in 0..15 {
+            let a = self.ravines[i]
+            let b = self.ravines[i + 1]
+            if a.w > 0.0 && b.w > 0.0 {
+                let (d, t) = to_segment(p, a.xy, b.xy)
+                let len = length(b.xy - a.xy)
+                if d < best {
+                    best = d
+                    along = walked + t * len
+                    // Its walls slumped to a slope a player can walk down for 20 m or so every
+                    // `SLUMP_EVERY`, where it's wider.
+                    let slump = smoothstep(
+                        0.7,
+                        0.9,
+                        0.5 + 0.5 * cos(along * 6.2831853 / SLUMP_EVERY),
+                    )
+                    let w = mix(a.w, b.w, t) * (1.0 + 3.5 * slump)
+                    let depth = mix(a.z, b.z, t)
+                    let dir = (b.xy - a.xy) / max(len, 1.0e-5)
+                    let offset = p - mix(a.xy, b.xy, t)
+                    let side = if dot(offset, vec2(-dir.y, dir.x)) < 0.0 { -1.0 } else { 1.0 }
+                    let section = ravine_section(side * d, w, self.ravine_bend(i, t))
+                    cut = depth * section.x
+                }
+                walked += len
+            } else if a.w > 0.0 {
+                length_of = walked
+                walked = 0.0
+            }
+        }
+        if length_of == 0.0 {
+            length_of = walked
+        }
+        vec3(cut, along, best)
+    }
+
+    /// How much of `p` is a ravine's wall (0 to 1; not where it's slumped to a walkable slope). A
+    /// floor gives these faces rock's own relief, so close up they read as rock. (A bedded crag's
+    /// cliffs are its slabs', `crag_slabs`; an outcrop takes none: its relief's lines read as a
+    /// crack maze.)
+    pub fn faces(self, p: vec2) -> f32 {
+        var f = 0.0
+        var walked = 0.0
+        for i in 0..15 {
+            let a = self.ravines[i]
+            let b = self.ravines[i + 1]
+            if a.w > 0.0 && b.w > 0.0 {
+                let (d, t) = to_segment(p, a.xy, b.xy)
+                let len = length(b.xy - a.xy)
+                let along = walked + t * len
+                let slump = smoothstep(0.7, 0.9, 0.5 + 0.5 * cos(along * 6.2831853 / SLUMP_EVERY))
+                let w = mix(a.w, b.w, t) * (1.0 + 3.5 * slump)
+                let dir = (b.xy - a.xy) / max(len, 1.0e-5)
+                let offset = p - mix(a.xy, b.xy, t)
+                let side = if dot(offset, vec2(-dir.y, dir.x)) < 0.0 { -1.0 } else { 1.0 }
+                let section = ravine_section(side * d, w, self.ravine_bend(i, t))
+                f = max(f, section.y * (1.0 - slump))
+                walked += len
+            } else if a.w > 0.0 {
+                walked = 0.0
+            }
+        }
+        f
+    }
+
+    /// How deep the ravines cut at `p`: its depth, its bed falling `ravine_fall` more toward its
+    /// end.
+    pub fn ravine(self, p: vec2) -> f32 {
+        let r = self.ravine_at(p)
+        if r.x <= 0.0 {
+            return 0.0
+        }
+        r.x * (1.0 + self.ravine_fall / max(self.ravines[0].z, 1.0) * clamp(r.y / 600.0, 0.0, 1.0))
+    }
+
+    /// How much of `p` is a crag's rock (0 to 1): its faces and its top.
+    pub fn crag_rock(self, p: vec2) -> f32 {
+        var r = 0.0
+        for i in 0..4 {
+            let c = self.crags[i]
+            if c.w > 0.0 {
+                r = max(r, crag_bare(p, c, self.ramps[i], u32(i)))
+            }
+        }
+        r
+    }
+}
+
+/// How much of `p` is crag `c`'s rock (0 to 1; crag `i` of its land, its ramp from `ramp`): its
+/// top and cliffs (1), its talus and its ramp's scree. Its own function, small in its arguments,
+/// so the shaders that read the land at many points call it and don't copy it (`ir::opt`).
+pub fn crag_bare(p: vec2, c: vec4, ramp: f32, i: u32) -> f32 {
+    var r = 0.0
+    // Its top and cliffs bare; its talus stony, the grass taking it back toward its toe.
+    let d = crag_rim(p, c, i)
+    let out = d - cliff_width(c)
+    if out < 0.0 {
+        // A bedded crag's top is its slabs' (`crag_slabs`), over the ground: nothing grows
+        // through them. An outcrop's is bare but where soil gathers in pockets (none round its
+        // middle, where a player stands to look out: no blade in the eye).
+        r = 1.0
+        if !bedded(c) {
+            let pockets = 0.45 * smoothstep(0.55, 0.75, fbm2(p * 0.11 + vec2(f32(i) * 7.0), 2))
+            let middle = smoothstep(8.0, 14.0, length(p - c.xy))
+            r = 1.0 - pockets * middle * (1.0 - smoothstep(-6.0, -2.0, d))
+        }
+    } else if out < talus_width(c) {
+        let toe = out / talus_width(c) + 0.25 * (noise2(p * 0.25) - 0.5)
+        r = max(r, 0.9 * (1.0 - smoothstep(0.3, 1.0, toe)))
+    }
+    // Its ramp's scree, where no tree stands (so the way up stays open).
+    let dir = vec2(cos(ramp), sin(ramp))
+    let k = p - c.xy
+    let along = dot(k, dir)
+    let side = abs(dot(k, vec2(-dir.y, dir.x)))
+    if side < 9.0 && along > 0.0 && along < 3.5 * c.w {
+        let across = side + 1.5 * (noise2(p * 0.3) - 0.5)
+        let scree = (1.0 - smoothstep(5.0, 8.0, across)) *
+            smoothstep(0.0, 0.2 * c.w, along) *
+            (1.0 - smoothstep(2.9 * c.w, 3.5 * c.w, along))
+        // The ramp's scree in place of what's under it: the ground's relief keeps its boulders
+        // off it, so the way up stays walkable.
+        r = mix(r, 0.75, scree * step(0.0, out))
+    }
+    r
+}
+
+/// The sides of a crag's outline: the joint planes it splits along.
+pub const CRAG_SIDES: u32 = 7
+
+/// How far `p` is outside crag `i`'s rim (m; negative inside): its outline in plan a polygon of
+/// `CRAG_SIDES` sides, each the trace of a joint plane, at its own distance and turn, so its cliffs
+/// are planes and its corners sharp (a round outline reads as a dome).
+pub fn crag_rim(p: vec2, c: vec4, i: u32) -> f32 {
+    let k = p - c.xy
+    // Past its talus's toe, how far it is matters no more than that it's past it: the land's
+    // height reads every crag at every point, and its planes cost.
+    let r = length(k)
+    if r > crag_reach(c) {
+        return r - 1.2 * c.w
+    }
+    var d = -1.0e9
+    for s in 0..CRAG_SIDES {
+        d = max(d, dot(k, crag_dir(i, s)) - crag_side(c, i, s))
+    }
+    if bedded(c) { d } else { d + 1.2 * (noise2(p * 0.15) - 0.5) }
+}
+
+/// The direction crag `i`'s side `s` faces (in plan): a joint plane's.
+pub fn crag_dir(i: u32, s: u32) -> vec2 {
+    let a = 6.2831853 * (f32(s) + 0.7 * hash2(i32(s), i32(i) * 13 + 1)) / f32(CRAG_SIDES)
+    vec2(cos(a), sin(a))
+}
+
+/// How far crag `c`'s side `s` stands from its middle at its lowest tier's rim (m).
+pub fn crag_side(c: vec4, i: u32, s: u32) -> f32 {
+    c.w * (0.55 + 0.3 * hash2(i32(s), i32(i) * 13 + 2))
+}
+
+/// How much crag `i`'s side `s` draws in at tier `tier` over the tier under it (a factor, 0.7
+/// to 0.92: every tier steps back from the one under it to a ledge, so a crag reads as beds of
+/// rock stacked, a stepped mesa; a side drawn in by little or nothing read as a building's wall).
+pub fn tier_shrink(i: u32, s: u32, tier: u32) -> f32 {
+    1.0 - (0.08 + 0.22 * hash2(i32(s) * 7 + i32(tier), i32(i) * 13 + 5))
+}
+
+/// Whether crag `c` stands as beds of rock, its cliffs solids (`crag_slabs`): one of two tiers
+/// or more. A lower one is an outcrop, one rounded mass of the heightfield, its outline rough and
+/// its top crowned, with soil in pockets: seen from a few metres off, a 4 m rock cut as one flat
+/// slab reads as a blank sheet.
+pub fn bedded(c: vec4) -> bool {
+    c.z >= 20.0
+}
+
+/// How many tiers a crag rises in: one a bed about 10 m thick, at most four (a crag as one
+/// drum reads as a barrel).
+pub fn crag_tiers(c: vec4) -> u32 {
+    u32(clamp(floor(c.z / 10.0), 1.0, 4.0))
+}
+
+/// How tall each of a crag's tiers is (m): its height over its talus, shared.
+pub fn tier_height(c: vec4) -> f32 {
+    (1.0 - TALUS_HIGH) * c.z / f32(crag_tiers(c))
+}
+
+/// A tier's cliff: its height over its width out from its rim (m): near sheer (a slope of 6,
+/// about 80°: at 2.6 a crag read as the dome it was), within the ground's steepest
+/// (`Terrain::steepest`); a rock a few metres tall less steep (a slope of 1.5 at 9 m and under),
+/// as a player sees it from a few metres off, where a sheer face in the clipmap is a stretched
+/// curtain.
+pub fn cliff_width(c: vec4) -> f32 {
+    tier_height(c) / clamp(c.z / 6.0, 1.5, 6.0)
+}
+
+/// A crag's talus: the height it's banked to at the cliff's foot (of the crag's height), and how
+/// far it runs out from there (m): concave, at about 37° where it meets the cliff.
+pub const TALUS_HIGH: f32 = 0.25
+
+pub fn talus_width(c: vec4) -> f32 {
+    2.0 * TALUS_HIGH * c.z / 0.75
+}
+
+/// How far from its middle a crag's rock reaches at most: its outline's furthest corner, its
+/// cliff and its talus, with room for its corners' angles.
+pub fn crag_reach(c: vec4) -> f32 {
+    1.2 * c.w + 1.4 * (cliff_width(c) + talus_width(c)) + 2.0
+}
+
+/// Crag `i` at `c`'s body at `p`: its talus's height over the ground round it, its tiers' height
+/// over its floor (-1e9 off them), and how much of `p` is one of its tiers' cliffs (0 to 1). Each
+/// tier is a bed of the rock, its outline its own polygon inside the one under it (each side
+/// drawn in by its own amount, to a ledge wide in one place and narrow in another); its top a plane tilted with the beds, so it's a slab and
+/// not a drum; the talus fallen from the lowest. Its slabs (`crag_slabs`) are cut to the same
+/// planes, their faces at its cliffs' feet.
+pub fn crag_shape(p: vec2, c: vec4, i: u32) -> (f32, f32, f32) {
+    let k = p - c.xy
+    let r = length(k)
+    let tw = talus_width(c)
+    let foot = TALUS_HIGH * c.z
+    if r > crag_reach(c) {
+        return (0.0, -1.0e9, 0.0)
+    }
+    let n = crag_tiers(c)
+    let th = tier_height(c)
+    let cw = cliff_width(c)
+    let lean = dot(k, crag_tilt(c, i))
+    var dirs = [vec2(0.0); 7]
+    var sides = [0.0; 7]
+    var d = -1.0e9
+    for s in 0..CRAG_SIDES {
+        dirs[s] = crag_dir(i, s)
+        sides[s] = crag_side(c, i, s)
+        d = max(d, dot(k, dirs[s]) - sides[s])
+    }
+    // The talus round the lowest tier's foot, falling away steep and then gently.
+    let rough = 1.2 * (noise2(p * 0.15) - 0.5)
+    let t = saturate((d + rough - cw) / tw)
+    let talus = foot * (1.0 - t) * (1.0 - t)
+    let outcrop = !bedded(c)
+    if outcrop {
+        d += rough
+    }
+    var body = -1.0e9
+    var face = 0.0
+    for tier in 0..n {
+        if tier > 0 {
+            d = -1.0e9
+            for s in 0..CRAG_SIDES {
+                sides[s] *= tier_shrink(i, s, tier)
+                d = max(d, dot(k, dirs[s]) - sides[s])
+            }
+        }
+        if d < cw {
+            // Straight down its cliff to the top of the tier under it, with a crisp edge at its
+            // rim and its foot (a smoothstep's shoulders read as a dome).
+            let under = if tier == 0 { foot } else { foot + th * f32(tier) + lean }
+            let crown = if outcrop { 1.5 * exp(-dot(k, k) / (c.w * c.w * 0.5)) } else { 0.0 }
+            let top = foot + th * f32(tier + 1) + lean + crown
+            body = max(body, mix(top, under, saturate(d / cw)))
+            face = max(face, smoothstep(-0.8, 0.0, d))
+        }
+    }
+    (talus, body, face)
+}
+
+/// A bed of a crag's rock as a solid (`stone::Bed`), and where its frame's origin is in the world:
+/// the crag's middle, at its floor.
+pub struct CragBed: Copy {
+    pub at: vec3,
+    pub bed: Bed,
+}
+
+/// Crag `c`'s rock as solids (crag `i` of its land, on floor `floor`; `ground` the ground's height
+/// round it, without it): each tier cut into beds about 4 m thick, each bed a prism of the tier's
+/// joint planes at its cliff's foot (`crag_shape`'s: the solid holds the heightfield's cliff, so
+/// a player walks the heightfield and never into rock) under the tier's tilted top. No bed juts
+/// past the heightfield's cliff; one over another sits back a little on some sides. The lowest
+/// bed reaches down under the ground round the crag.
+pub fn crag_slabs(c: vec4, i: u32, floor: f32, ground: fn(vec2) -> f32) -> Vec<CragBed> {
+    var out: Vec<CragBed> = Vec::new()
+    if !bedded(c) {
+        return out
+    }
+    let n = crag_tiers(c)
+    let th = tier_height(c)
+    let cw = cliff_width(c)
+    let foot = TALUS_HIGH * c.z
+    let tilt = crag_tilt(c, i)
+    let at = vec3(c.x, floor, c.y)
+    var sides = [0.0; 7]
+    var low = 0.0
+    for s in 0..CRAG_SIDES {
+        sides[s] = crag_side(c, i, s)
+        let k = crag_dir(i, s) * (sides[s] + cw + 1.0)
+        low = min(low, ground(c.xy + k) - floor - dot(k, tilt))
+    }
+    let up = vec3(-tilt.x, 1.0, -tilt.y)
+    let ul = length(up)
+    for tier in 0..n {
+        if tier > 0 {
+            for s in 0..CRAG_SIDES {
+                sides[s] *= tier_shrink(i, s, tier)
+            }
+        }
+        let from = foot + th * f32(tier)
+        let top = from + th
+        let beds = max(1, u32(round(th / 4.0)))
+        for b in 0..beds {
+            let y0 = if b > 0 {
+                from + th * f32(b) / f32(beds)
+            } else if tier == 0 {
+                low - 2.0
+            } else {
+                from - 0.3
+            }
+            // Its top just over the heightfield's (which the tier's top plane makes), so the
+            // solid's face is what's drawn.
+            let y1 = if b + 1 == beds { top + 0.05 } else { from + th * f32(b + 1) / f32(beds) }
+            var planes = [vec4(0.0); 9]
+            var reach = 0.0
+            for s in 0..CRAG_SIDES {
+                let h = hash2(i32(s) * 5 + i32(b), i32(i) * 31 + i32(tier) * 7)
+                // A bed over another sits back on some sides, so its bedding line shows.
+                let back = if b > 0 { 0.15 * step(0.5, h) } else { 0.0 }
+                let d = crag_dir(i, s)
+                let w = sides[s] + cw - back
+                planes[s] = vec4(d.x, 0.0, d.y, w)
+                reach = max(reach, w)
+            }
+            planes[7] = vec4(up / ul, y1 / ul)
+            planes[8] = vec4(-up / ul, -y0 / ul)
+            // Its outline's corners stand at most about 1.6 times its sides out (adjacent joints
+            // turn by at most 87°).
+            let r = 1.6 * reach
+            let t = length(tilt) * r
+            let bed = Bed {
+                planes,
+                lo: vec3(-r, y0 - t - 0.5, -r),
+                hi: vec3(r, y1 + t + 0.5, r),
+                seed: i * 100 + tier * 10 + b,
+            }
+            out.push(CragBed { at, bed })
+        }
+    }
+    out
+}
+
+impl Land {
+    /// Every crag's rock as solids (`crag_slabs`), on its floor; `ground` the ground's height
+    /// without the crags.
+    pub fn crag_beds(self, ground: fn(vec2) -> f32) -> Vec<CragBed> {
+        var out: Vec<CragBed> = Vec::new()
+        for i in 0..4 {
+            let c = self.crags[i]
+            if c.w > 0.0 {
+                var beds = crag_slabs(c, u32(i), self.floors[i], ground)
+                out.append(mut beds)
+            }
+        }
+        out
+    }
+}
+
+/// How crag `c`'s top leans (rise per metre): as a tall crag's beds dip, but less on a small rock,
+/// whose lean over its width would match its height and drape it like a sheet.
+fn crag_tilt(c: vec4, i: u32) -> vec2 {
+    vec2(cos(1.3 + f32(i)), sin(1.3 + f32(i))) * (6.0 / c.w) * min(1.0, c.z / 30.0)
+}
+
+/// A crag at `c` (x, z, height, foot radius), crag `i` of its land, over ground `rise` metres
+/// under its floor: its talus, its tiers (`crag_shape`), and a ramp of scree up from the direction
+/// `ramp` (radians), so a player can climb it; and whether its slabs stand over `p` (1, else 0).
+pub fn crag(p: vec2, c: vec4, ramp: f32, i: u32, rise: f32) -> vec2 {
+    let (talus, body, _) = crag_shape(p, c, i)
+    let ramp_h = crag_ramp(p, c, ramp, i, rise)
+    let slab = if bedded(c) && body > -1.0e8 { 1.0 } else { 0.0 }
+    vec2(max(max(talus, rise + body), ramp_h), slab)
+}
+
+/// The earth ramp shared by the collision surface and the drawn substrate.
+fn crag_ramp(p: vec2, c: vec4, ramp: f32, i: u32, rise: f32) -> f32 {
+    let k = p - c.xy
+    let tilt = crag_tilt(c, i)
+    // The ramp: a wedge whose top meets the crag's at its rim, falling to the ground over three
+    // feet's widths.
+    let dir = vec2(cos(ramp), sin(ramp))
+    let along = dot(k, dir)
+    let across = abs(dot(k, vec2(-dir.y, dir.x)))
+    let reach = 3.5 * c.w
+    // Its top just under the crag's tilted top inside the rim (the top's own height holds
+    // there) and as high as it at the rim, so the climb has no step where it meets it, and no
+    // ridge across the top; from its floor there, and from the ground round it lower down.
+    let floor = rise * (1.0 - smoothstep(0.55 * c.w, 2.0 * c.w, along))
+    // Carry the transverse tilt too: an untilted ramp crest cuts through the low side
+    // of the slab's tilted plane, leaving a strip of earth across its stone surface.
+    let lean = dot(k, tilt) - dot(dir, tilt) * max(along - 0.55 * c.w, 0.0)
+    (c.z + lean - 0.3 + floor) *
+        (1.0 - smoothstep(0.55 * c.w, reach, along)) *
+        (1.0 - smoothstep(4.0, 9.0, across)) *
+        step(0.0, along)
+}
+
+// ---- sites, relations, openings and keepers ----------------------------------------------------
+
+/// What a site is for: where a player arrives, the town's site, an anchor (room
+/// for an elite's fight), the Warden's arena, a rest point, a waystone, an echo's site, a view, or
+/// a landmark seen from afar.
+pub enum SiteKind: Copy + Eq + Fieldless {
+    Gate,
+    Town,
+    Anchor,
+    Arena,
+    Rest,
+    Waystone,
+    Echo,
+    View,
+    Landmark,
+}
+
+/// What stands at a site, for the history (what it does to the forest), the check (how it draws
+/// the eye) and the floor (what's built there).
+pub enum Feature: Copy + Eq + Fieldless {
+    /// Nothing built: the place itself (a glade, a shore, a bend of a trail).
+    Ground,
+    Tree,
+    Tower,
+    Crag,
+    Ring,
+    Stone,
+    Ruin,
+    Glade,
+    Vista,
+    Water,
+    Fall,
+}
+
+/// A site: what it's for and what stands there, where (x, z), how tall it stands above the
+/// ground and how far it reaches on the plane (m), and how strongly it draws the eye (0 to 1).
+pub struct Site: Copy {
+    pub kind: SiteKind,
+    pub feature: Feature,
+    pub at: vec2,
+    pub tall: f32 = 0.0,
+    pub reach: f32 = 6.0,
+    pub salience: f32 = 0.4,
+    pub name: Text,
+}
+
+impl Site {
+    /// Whether the check draws a player to it as a keystone (an echo's site is small, found by
+    /// coming near; its features draw where it's lit).
+    pub fn keystone(self) -> bool {
+        self.kind != SiteKind::Rest && (self.kind != SiteKind::Echo || self.salience >= 0.5)
+    }
+
+    /// Whether it opens the forest round it (a glade, a view, water): the check sees it across
+    /// its breadth, not up its height.
+    pub fn open(self) -> bool {
+        self.feature == Feature::Glade ||
+            self.feature == Feature::Vista ||
+            self.feature == Feature::Water
+    }
+}
+
+/// What a relation asks of a site: to be seen from a place (a sightline the history keeps open),
+/// or to stay hidden until a player reaches it (a reveal: the land hides it before).
+pub enum Relation: Copy + Eq {
+    Seen { from: vec2, within: f32, to: u32, landmark: bool, name: Text },
+    Hidden { from: vec2, within: f32, to: u32, name: Text },
+}
+
+impl Relation {
+    pub fn to(self) -> u32 {
+        match self {
+            Relation::Seen { to, .. } => to,
+            Relation::Hidden { to, .. } => to,
+        }
+    }
+
+    pub fn from(self) -> vec2 {
+        match self {
+            Relation::Seen { from, .. } => from,
+            Relation::Hidden { from, .. } => from,
+        }
+    }
+
+    pub fn within(self) -> f32 {
+        match self {
+            Relation::Seen { within, .. } => within,
+            Relation::Hidden { within, .. } => within,
+        }
+    }
+
+    pub fn name(self) -> Text {
+        match self {
+            Relation::Seen { name, .. } => name,
+            Relation::Hidden { name, .. } => name,
+        }
+    }
+
+    /// Whether its site must be made out as a landmark: its visible part at least 1° tall.
+    pub fn landmark(self) -> bool {
+        match self {
+            Relation::Seen { landmark, .. } => landmark,
+            Relation::Hidden { .. } => false,
+        }
+    }
+}
+
+/// What keeps an opening open in the present: grazing (a herd's route reaches it), people (while
+/// they live there), bare rock, water, a recent event, or nothing.
+pub enum Keeper: Copy + Eq {
+    Nothing,
+    Grazing,
+    People { from: i32, to: i32 },
+    Rock,
+    Water,
+    Event { year: i32 },
+}
+
+/// How recent an event's opening is in the present to be kept by it: a history closes a gap in
+/// some decades.
+pub const RECENT: i32 = 60
+
+/// An opening the author wants in the forest: a lawn, a hilltop kept clear, a glade, and what
+/// keeps it open.
+pub struct Opening: Copy {
+    pub at: vec2,
+    pub radius: f32,
+    pub keeper: Keeper,
+    pub name: Text,
+}
+
+/// What a route is: an old road (people laid it), a herd's route, or a trail of the critical
+/// path (worn by the herd and the deer, as a herd's route is).
+pub enum RouteKind: Copy + Eq + Fieldless {
+    Road,
+    Herd,
+    Trail,
+}
+
+/// A route over the plane: its points, how wide it's kept clear (m), and what keeps it.
+pub struct Route {
+    pub kind: RouteKind,
+    pub points: Vec<vec2>,
+    pub width: f32,
+    pub keeper: Keeper,
+    pub name: Text,
+}
+
+impl Route {
+    /// The distance from `p` to the route (m), and how far along it the nearest point is (m).
+    pub fn distance(self, p: vec2) -> vec2 {
+        if self.points.len() == 1 {
+            return vec2(length(p - self.points[0]), 0.0)
+        }
+        var best = 1.0e9
+        var along = 0.0
+        var walked = 0.0
+        for i in 1..self.points.len() {
+            let a = self.points[i - 1]
+            let b = self.points[i]
+            let (d, t) = to_segment(p, a, b)
+            let len = length(b - a)
+            if d < best {
+                best = d
+                along = walked + t * len
+            }
+            walked += len
+        }
+        vec2(best, along)
+    }
+
+    /// Its length (m).
+    pub fn length(self) -> f32 {
+        var l = 0.0
+        for i in 1..self.points.len() {
+            l += length(self.points[i] - self.points[i - 1])
+        }
+        l
+    }
+
+    /// The point `s` m along it (held to its ends), and the way it goes there: (x, z, dx, dz).
+    pub fn along(self, s: f32) -> vec4 {
+        var walked = 0.0
+        let n = self.points.len()
+        assert(n > 0, "an empty route has no point along it")
+        for i in 1..n {
+            let ab = self.points[i] - self.points[i - 1]
+            let len = length(ab)
+            if s <= walked + len || i == n - 1 {
+                let t = clamp((s - walked) / max(len, 1.0e-6), 0.0, 1.0)
+                return vec4(self.points[i - 1] + ab * t, ab / max(len, 1.0e-6))
+            }
+            walked += len
+        }
+        vec4(self.points[0], 1.0, 0.0)
+    }
+}
+
+/// The water the author places: meres (x, z, radius, level: the water's height), springs where
+/// streams rise, and the points where water falls off the land. The history's flow decides the
+/// streams' courses between.
+pub struct Water: Copy {
+    pub meres: [vec4; 2],
+    pub springs: [vec2; 8],
+    pub spring_count: u32,
+    pub falls: [vec2; 2],
+}
+
+/// What happens in a year of the history.
+pub enum EventKind: Copy + Eq {
+    /// A gale round `at`, blowing toward `dir`, dying away past `reach`: it throws or snaps the
+    /// trees it finds exposed, and breaks some tops (`grow::gale`). The stronger it is (`share`,
+    /// 0 to 1), the less exposed a tree need be: at its strongest it throws nearly all.
+    Storm { at: vec2, reach: f32, dir: vec2, share: f32 },
+    /// A fire round `at`, lit on its upwind side: it runs as its fuel, dryness, slope and the
+    /// wind let it, no further than `reach` from `at`, and kills what its heat there can kill;
+    /// the dead stand, silvered, and thick-barked survivors are scarred (`grow::fire`).
+    Fire { at: vec2, reach: f32 },
+    /// The tallest tree of species `kind` within `reach` of `at` falls across toward `toward`.
+    Fall { at: vec2, reach: f32, kind: u32, toward: vec2 },
+    /// Lightning kills the tallest tree within reach; it stands.
+    Strike { at: vec2, reach: f32 },
+    /// Small gaps through the whole wood, each decade, block by block (the wind's).
+    Gaps { block: f32, chance: f32, radius: f32 },
+}
+
+pub struct Event: Copy {
+    pub year: i32,
+    pub kind: EventKind,
+    pub name: Text,
+}
+
+/// A tree the author keeps (a pin): planted in `year`, of species `kind`, kept alive.
+pub struct Kept: Copy {
+    pub at: vec2,
+    pub kind: u32,
+    pub year: i32,
+    pub name: Text,
+}
+
+/// How a region's forest grows: what browses it (deer through it, and seedlings eaten), the
+/// head room browsing keeps (the browse line, m), and the share of each of up to eight species
+/// its first trees are (`mix`, by the floor's species' indices; all 0: as the ground suits each).
+pub struct Character: Copy {
+    pub deer: f32 = 0.12,
+    pub seedlings: f32 = 0.0,
+    pub browse_line: f32 = 0.0,
+    pub thinned: f32 = 0.0,
+    pub mix: [f32; 8] = [0.0; 8],
+}
+
+/// What a region's forest is like, by name.
+pub enum Kind: Copy + Eq + Fieldless {
+    WoodPasture,
+    HighForest,
+    Carr,
+    Pine,
+    Burn,
+    Windthrow,
+    Ravine,
+    Edge,
+}
+
+/// A region: its name, what it's like and how its forest grows, and its seed on the plane (a
+/// point belongs to the region whose seed is nearest, each seed's distance divided by its
+/// `weight`).
+pub struct Region: Copy {
+    pub name: Text,
+    pub kind: Kind,
+    pub at: vec2,
+    pub weight: f32 = 1.0,
+    pub character: Character,
+}
+
+/// The herd: when it comes, how many trips it makes a year, and where it drinks.
+pub struct Herd: Copy {
+    pub arrives: i32,
+    pub trips: u32,
+    pub drink: vec2,
+    pub rest: vec2,
+}
+
+/// A floor's map: everything its author decides, and nothing else.
+pub struct Map {
+    /// The authored land's square on the plane, and the history's last year (the present).
+    pub lo: vec2,
+    pub hi: vec2,
+    pub present: i32,
+    pub land: Land,
+    pub sites: Vec<Site>,
+    pub relations: Vec<Relation>,
+    pub openings: Vec<Opening>,
+    pub routes: Vec<Route>,
+    pub water: Water,
+    pub events: Vec<Event>,
+    /// The way the floor's wind blows (toward): off the floor's edge, into the forest. It
+    /// drives the fires (`grow::fire`), and throws the trees the gaps' gusts take.
+    pub wind: vec2,
+    pub kept: Vec<Kept>,
+    pub regions: Vec<Region>,
+    pub herd: Herd,
+    /// The world's seed: every draw of its history (`grow::simulate`) is mixed with it, so each
+    /// seed grows another world from the same map. An authoring tool: bake many, ship the best.
+    pub seed: u32 = 0,
+}
+
+impl Map {
+    /// The region that holds `p` (its index): the one whose seed is nearest, by weight.
+    pub fn region_of(self, p: vec2) -> u32 {
+        var best = 0
+        var d = 1.0e12
+        var i = 0
+        for r in self.regions {
+            let e = length(p - r.at) / max(r.weight, 1.0e-3)
+            if e < d {
+                d = e
+                best = i
+            }
+            i += 1
+        }
+        best
+    }
+
+    /// The distance from `p` to the nearest route of `kind`, and that route's index.
+    pub fn to_route(self, p: vec2, kind: RouteKind) -> (f32, u32) {
+        var best = 1.0e9
+        var which = 0
+        var i = 0
+        for r in self.routes {
+            if r.kind == kind {
+                let d = r.distance(p).x
+                if d < best {
+                    best = d
+                    which = i
+                }
+            }
+            i += 1
+        }
+        (best, which)
+    }
+
+    /// Whether `p` is in the authored square.
+    pub fn inside(self, p: vec2) -> bool {
+        p.x >= self.lo.x && p.y >= self.lo.y && p.x < self.hi.x && p.y < self.hi.y
+    }
+
+    /// The site named `name`'s index (a misspelled name panics: in a constant, the build fails).
+    pub fn site(self, name: str) -> u32 {
+        var i = 0
+        for s in self.sites {
+            if s.name == name {
+                return i
+            }
+            i += 1
+        }
+        panic(f"the map has no site named `{name}`")
+    }
+
+    /// How many sites of kind `k` it has.
+    pub fn count(self, k: SiteKind) -> u32 {
+        var n = 0
+        for s in self.sites {
+            if s.kind == k {
+                n += 1
+            }
+        }
+        n
+    }
+}
+
+// ---- keepers: what's refused before the history runs ------------------------------------------
+
+/// Why the map can't be grown: an opening (or a route kept clear) with no keeper, or with one
+/// not at work in the present, by its index among the openings (or the routes) and its name.
+pub enum Refusal: Copy + Eq {
+    NoKeeper { opening: u32, name: Text },
+    KeeperGone { opening: u32, name: Text, why: Text },
+    RouteEmpty { route: u32, name: Text },
+    RouteNotKept { route: u32, name: Text, why: Text },
+}
+
+impl Refusal {
+    /// What's wrong, in words.
+    pub fn say(self) -> String {
+        match self {
+            Refusal::NoKeeper { name, .. } => {
+                f"the opening `{name}` has no keeper: nothing keeps it open in the present, so the history closes it (name its keeper: grazing, rock, water, a recent event)"
+            },
+            Refusal::KeeperGone { name, why, .. } => {
+                f"the opening `{name}`'s keeper isn't at work in the present: {why}"
+            },
+            Refusal::RouteEmpty { name, .. } => {
+                f"the route `{name}` has no points"
+            },
+            Refusal::RouteNotKept { name, why, .. } => {
+                f"the route `{name}` isn't kept in the present: {why}"
+            },
+        }
+    }
+}
+
+/// Whether a keeper whose work has a date is active in `present`: why not, or nothing.
+fn dated_keeper_gone(present: i32, k: Keeper) -> Option<Text> {
+    match k {
+        Keeper::People { from, to } => if present < from {
+            Some("its people have not arrived yet")
+        } else if present >= to {
+            Some("its people left before the present")
+        } else { None },
+        Keeper::Event { year } => if year > present {
+            Some("its event has not happened yet")
+        } else if present - year > RECENT {
+            Some("its event is too long before the present: the forest has closed it again")
+        } else { None },
+        _ => None,
+    }
+}
+
+/// Whether `k`, keeping a place at `p` `radius` across, is at work in the map's present: why not,
+/// or nothing.
+fn keeper_gone(m: Map, k: Keeper, p: vec2, radius: f32) -> Option<Text> {
+    match k {
+        Keeper::Nothing => Some("it has none"),
+        Keeper::People { .. } => dated_keeper_gone(m.present, k),
+        Keeper::Event { .. } => dated_keeper_gone(m.present, k),
+        Keeper::Grazing => {
+            if m.herd.arrives > m.present {
+                return Some("no herd grazes there in the present")
+            }
+            // A herd's route (or a trail it wears) reaches it.
+            var reached = false
+            for r in m.routes {
+                if r.kind != RouteKind::Road || r.keeper == Keeper::Grazing {
+                    reached = reached || r.distance(p).x < radius + 30.0
+                }
+            }
+            if reached { None } else { Some("no herd route reaches it") }
+        },
+        Keeper::Rock => if m.land.crag_rock(p) > 0.3 { None } else {
+            Some("there's no rock there: rock keeps a crag's top open")
+        },
+        Keeper::Water => {
+            var wet = false
+            for w in m.water.meres {
+                wet = wet || (w.z > 0.0 && length(p - w.xy) < w.z + radius)
+            }
+            for i in 0..m.water.spring_count {
+                wet = wet || length(p - m.water.springs[i]) < radius + 20.0
+            }
+            for f in m.water.falls {
+                wet = wet || length(p - f) < radius + 20.0
+            }
+            if wet { None } else { Some("no water the map places reaches it") }
+        },
+    }
+}
+
+fn empty_route_refusal(route: Route, which: u32) -> Option<Refusal> {
+    if route.points.is_empty() {
+        Some(Refusal::RouteEmpty { route: which, name: route.name })
+    } else {
+        None
+    }
+}
+
+/// Every reason the map can't be grown: each opening with no keeper, or one not at work in the
+/// present; each route kept clear by people who left (an old road with no herd on it). Checked
+/// before the history runs, which would otherwise close them.
+pub fn refusals(m: Map) -> Vec<Refusal> {
+    var out: Vec<Refusal> = Vec::new()
+    var i = 0
+    for o in m.openings {
+        if o.keeper == Keeper::Nothing {
+            out.push(Refusal::NoKeeper { opening: i, name: o.name })
+        } else if let Some(why) = keeper_gone(m, o.keeper, o.at, o.radius) {
+            out.push(Refusal::KeeperGone { opening: i, name: o.name, why })
+        }
+        i += 1
+    }
+    var r = 0
+    for route in m.routes {
+        if let Some(why) = empty_route_refusal(route, r) {
+            out.push(why)
+            r += 1
+            continue
+        }
+        let p = route.points[route.points.len() / 2]
+        if let Some(why) = keeper_gone(m, route.keeper, p, route.width) {
+            out.push(Refusal::RouteNotKept { route: r, name: route.name, why })
+        }
+        r += 1
+    }
+    out
+}
+
+/// Refuses the map if it has a refusal (`refusals`): a panic naming every one, so a build that
+/// grows it fails before the history runs.
+pub fn refuse(m: Map) {
+    let r = refusals(m)
+    if r.len() > 0 {
+        var text = String::new()
+        for x in r {
+            text.push_str(x.say().as_str())
+            text.push_str("; ")
+        }
+        panic(f"the map can't be grown: {text}")
+    }
+}
+
+// ---- tests -----------------------------------------------------------------------------------------
+
+/// A keeper's interval includes its first year, excludes its end, and an event cannot keep an
+/// opening before it happens.
+@test
+fn future_and_expired_keepers_are_not_at_work_in_the_present() {
+    assert(dated_keeper_gone(100, Keeper::People { from: 101, to: 120 }).is_some())
+    assert(dated_keeper_gone(100, Keeper::People { from: 80, to: 100 }).is_some())
+    assert(dated_keeper_gone(100, Keeper::People { from: 100, to: 101 }).is_none())
+    assert(dated_keeper_gone(100, Keeper::Event { year: 101 }).is_some())
+    assert(dated_keeper_gone(100, Keeper::Event { year: 100 }).is_none())
+}
+
+fn test_route(points: take Vec<vec2>) -> Route {
+    Route {
+        kind: RouteKind::Trail,
+        points,
+        width: 1.0,
+        keeper: Keeper::Nothing,
+        name: "test route",
+    }
+}
+
+/// Empty and one-point routes have defined geometry: an empty route is nowhere and has no
+/// length; a one-point route is that point. Asking for a point along an empty route is refused
+/// separately before a map is grown.
+@test
+fn routes_with_fewer_than_two_points_have_defined_geometry() {
+    let empty = test_route(Vec::new())
+    assert(empty.length() == 0.0, "an empty route has a length")
+    assert(empty.distance(vec2(0.0)).x == 1.0e9, "an empty route is near a point")
+
+    let point = test_route(Vec::from([vec2(3.0, 4.0)]))
+    assert(point.length() == 0.0, "a one-point route has a length")
+    assert(point.distance(vec2(0.0)) == vec2(5.0, 0.0), "a one-point route has no point")
+    assert(point.along(10.0) == vec4(3.0, 4.0, 1.0, 0.0), "a one-point route moves")
+}
+
+/// An empty route is an explicit authoring refusal, rather than a bounds or arithmetic trap.
+@test
+fn an_empty_route_refusal_explains_the_problem() {
+    let refusal = empty_route_refusal(test_route(Vec::new()), 2).unwrap()
+    let expected = Refusal::RouteEmpty { route: 2, name: "test route" }
+    assert(refusal == expected, "no empty refusal")
+    assert(refusal.say() == "the route `test route` has no points", "an empty route is obscure")
+}
+
+/// A place stepped a minute at a walk, 60 Hz, ends where an `f64` walk does within 5 cm, 10 km and
+/// 1,000 km out; `f32` positions drift a metre at 10 km.
+@test
+fn a_place_keeps_its_precision_far_out() {
+    for far in [0.0, 10000.0, 1000000.0] {
+        let start = Place::of_f64(far, -0.5 * far)
+        let v = vec2(cos(0.7), sin(0.7)) * 1.4
+        var p = start
+        for _ in 0..3600 {
+            p = p.moved(v * (1.0 / 60.0))
+        }
+        let end = p.world_f64()
+        let s = start.world_f64()
+        let want = s + vec2d(f64(v.x), f64(v.y)) * 60.0
+        let off = length(end - want)
+        assert(off < 0.05, f"{far} m out, a minute's walk ends {off} m off")
+    }
+}
+
+/// Crag `c`'s height at `p` over flat ground at its floor (crag `i`): its talus or its tiers.
+fn crag_on_flat(p: vec2, c: vec4, i: u32) -> f32 {
+    let (talus, body, _) = crag_shape(p, c, i)
+    max(talus, body)
+}
+
+/// A crag's form, on two small cases: a tall crag stands in tiers of steep cliffs over a talus
+/// with a flat, bare top; a small rock leans less than its height across its top.
+@test
+fn a_crag_has_tiers_of_cliffs_a_talus_and_a_flat_top() {
+    let tall = vec4(0.0, 0.0, 72.0, 36.0)
+    let top = crag_on_flat(vec2(0.0), tall, 1)
+    assert(abs(top - 72.0) < 0.5, f"its top stands {top} m high, not its 72 m")
+    // Out from its middle, every way: down by cliffs (somewhere steeper than 2 in 1) to a gentle
+    // talus, and nothing past its reach.
+    for s in 0..8 {
+        let a = 6.2831853 * f32(s) / 8.0
+        let dir = vec2(cos(a), sin(a))
+        var steepest = 0.0
+        var last = top
+        var rises = 0.0
+        for k in 1..400 {
+            let h = crag_on_flat(dir * (0.25 * f32(k)), tall, 1)
+            steepest = max(steepest, (last - h) / 0.25)
+            rises = max(rises, h - last)
+            last = h
+        }
+        assert(steepest > 2.0, f"toward {a}, its steepest drop is {steepest} in 1: no cliff")
+        assert(rises < 0.5, f"toward {a}, it rises {rises} m going out: no tier is under another")
+        let past = crag_on_flat(dir * (crag_reach(tall) + 1.0), tall, 1)
+        assert(past == 0.0, f"toward {a}, it stands {past} m past its reach")
+    }
+    // A tall crag's top is bare: no soil pocket for a tree whose crown would float over it.
+    for k in 0..40 {
+        let p = vec2(cos(f32(k)), sin(f32(k))) * (0.4 * f32(k))
+        if crag_rim(p, tall, 1) < -2.0 {
+            let bare = crag_bare(p, tall, 0.0, 1)
+            assert(bare > 0.99, f"at {p}, its top is only {bare} bare")
+        }
+    }
+    // A small rock's top leans less than its height across its width.
+    let small = vec4(0.0, 0.0, 4.0, 12.0)
+    let lean = abs(dot(crag_tilt(small, 3), vec2(2.0 * small.w, 0.0)))
+    assert(lean < 0.5 * small.z, f"a 4 m rock's top leans {lean} m across its width")
+}
+
+/// Whether any of `beds` holds point `q` (in their frame).
+fn held(beds: Vec<CragBed>, q: vec3) -> bool {
+    for b in beds {
+        if b.bed.distance(q) < 0.0 {
+            return true
+        }
+    }
+    false
+}
+
+/// A crag's slabs hold its rock and stand on it, on a tall crag and a low one over flat ground:
+/// wherever its heightfield is rock (its cliffs and tops, over its talus), a slab holds the point
+/// 0.2 m under it, so the heightfield's draped cliff is never what's drawn; and on its tops (off
+/// its cliffs, which are too steep to stand on) no slab stands more than 0.3 m over it, so a
+/// player walking the heightfield stands on the slab's top and walks into no rock. Every slab lies in its box.
+@test
+fn a_crags_slabs_hold_its_cliffs_and_stand_on_its_top() {
+    for case in 0..2 {
+        let c = if case == 0 { vec4(0.0, 0.0, 45.0, 30.0) } else { vec4(0.0, 0.0, 22.0, 16.0) }
+        let beds = crag_slabs(c, 2, 0.0, |_q| 0.0)
+        assert(beds.len() > 0, "a crag has no slabs")
+        let reach = crag_reach(c)
+        for j in 0..120 {
+            for k in 0..120 {
+                let p = (vec2(f32(j), f32(k)) / 119.0 * 2.0 - vec2(1.0)) * reach
+                let (talus, body, face) = crag_shape(p, c, 2)
+                if body > talus + 0.3 {
+                    assert(
+                        held(beds, vec3(p.x, body - 0.2, p.y)),
+                        f"at {p}, its rock {body} m high is in no slab",
+                    )
+                    if face == 0.0 {
+                        assert(
+                            !held(beds, vec3(p.x, body + 0.3, p.y)),
+                            f"at {p}, a slab stands over its rock {body} m high",
+                        )
+                    }
+                }
+            }
+        }
+        for b in beds {
+            let r = b.bed
+            for q in [
+                vec3(r.lo.x, 0.5 * (r.lo.y + r.hi.y), 0.0),
+                vec3(r.hi.x, 0.5 * (r.lo.y + r.hi.y), 0.0),
+                vec3(0.0, r.lo.y, 0.0),
+                vec3(0.0, r.hi.y, 0.0),
+            ] {
+                assert(r.distance(q) > 0.0, f"slab {r.seed} reaches past its box at {q}")
+            }
+        }
+    }
+    // An outcrop (a rock of one tier) is the heightfield's alone.
+    let outcrop = crag_slabs(vec4(0.0, 0.0, 4.0, 12.0), 2, 0.0, |_q| 0.0)
+    assert(outcrop.len() == 0, f"a 4 m outcrop has {outcrop.len()} slabs")
+}
+
+/// Which ground a crag's slabs stand over (`Land::crags_over`): a bedded crag's middle and its
+/// cliffs' feet, not its talus's toe, and nowhere on an outcrop.
+@test
+fn a_bedded_crags_slabs_and_no_outcrops_stand_over_the_ground() {
+    let tall = vec4(0.0, 0.0, 45.0, 30.0)
+    let low = vec4(300.0, 0.0, 4.0, 12.0)
+    let land = Land {
+        hills: [vec4(0.0); 8],
+        hollows: [vec4(0.0); 8],
+        ridges: [vec4(0.0); 24],
+        ravines: [vec4(0.0); 16],
+        ravine_fall: 0.0,
+        crags: [tall, low, vec4(0.0), vec4(0.0)],
+        ramps: vec4(0.0),
+        floors: vec4(0.0),
+        tilt: vec4(0.0),
+    }
+    assert(land.crags_over(tall.xy, 0.0).y == 1.0, "no slab stands over a bedded crag's middle")
+    let toe = tall.xy + vec2(1.2 * tall.w + cliff_width(tall) + talus_width(tall), 0.0)
+    assert(land.crags_over(toe, 0.0).y == 0.0, "a slab stands over a crag's talus's toe")
+    assert(land.crags_over(low.xy, 0.0).y == 0.0, "a slab stands over an outcrop")
+}
+
+/// Solid crags own their rock volume. The terrain below keeps the surrounding earth and the
+/// climb ramp, while low outcrops without a solid mesh remain complete heightfields.
+@test
+fn crag_substrate_keeps_earth_and_leaves_rock_to_the_slabs() {
+    let tall = vec4(0.0, 0.0, 45.0, 30.0)
+    let low = vec4(300.0, 0.0, 4.0, 12.0)
+    let land = Land {
+        hills: [vec4(0.0); 8],
+        hollows: [vec4(0.0); 8],
+        ridges: [vec4(0.0); 24],
+        ravines: [vec4(0.0); 16],
+        ravine_fall: 0.0,
+        crags: [tall, low, vec4(0.0), vec4(0.0)],
+        ramps: vec4(0.0),
+        floors: vec4(0.0),
+        tilt: vec4(0.0),
+    }
+    var separated = 0
+    var earth = 0
+    for j in -12..13 {
+        for k in -12..13 {
+            let p = vec2(f32(j), f32(k)) * 5.0
+            let full = land.crags_over(p, 0.0)
+            let base = land.crag_substrate_over(p, 0.0)
+            assert(base.x <= full.x + 1.0e-5, f"substrate rose above the surface at {p}")
+            if full.y == 0.0 {
+                assert(abs(base.x - full.x) < 1.0e-5, f"exposed earth changed at {p}")
+                earth += 1
+            }
+            if full.x - base.x > 1.0 {
+                separated += 1
+            }
+        }
+    }
+    assert(separated > 20 && earth > 100, "the fixture did not cover both rock and earth")
+    for k in 0..24 {
+        let p = vec2(f32(k) * 5.0, 0.0)
+        let full = land.crags_over(p, 0.0).x
+        let ramp = crag_ramp(p, tall, 0.0, 0, 0.0)
+        if abs(full - ramp) < 1.0e-5 {
+            assert(
+                abs(land.crag_substrate_over(p, 0.0).x - full) < 1.0e-5,
+                "the climb ramp was cut",
+            )
+        }
+    }
+    assert(
+        land.crag_substrate_over(low.xy, 0.0) == land.crags_over(low.xy, 0.0),
+        "an outcrop lost its surface without a slab to supply it",
+    )
+}
+
+/// The whole ramp crest meets the bedding plane, including its low side. Testing only the
+/// centreline misses terrain crossing the slab where the bed tilts across the ramp.
+@test
+fn a_crag_ramp_meets_the_tilted_top_across_its_full_width() {
+    let c = vec4(0.0, 0.0, 45.0, 30.0)
+    let angle = 0.52
+    let dir = vec2(cos(angle), sin(angle))
+    let side = vec2(-dir.y, dir.x)
+    for rise in [-10.0, 0.0, 10.0] {
+        for j in 1..9 {
+            for k in -4..5 {
+                let p = dir * f32(j) + side * (f32(k) * 0.95)
+                let top = c.z + dot(p, crag_tilt(c, 0)) + rise
+                let ramp = crag_ramp(p, c, angle, 0, rise)
+                assert(abs(top - ramp - 0.3) < 1.0e-4, f"ramp crossed its bedding plane at {p}")
+            }
+        }
+    }
+}
+
+/// Bed depth and exposed wall fraction across a stream valley. Inside a bend, deposited
+/// sediment makes a broad low shelf; outside it, erosion leaves a narrower cut bank.
+/// The channel centre and the outer rim remain fixed in height.
+fn ravine_section(across: f32, width: f32, bend: f32) -> vec2 {
+    let bank = bend * smoothstep(-0.2, 0.2, across / max(width, 1.0e-5)) * 2.0 - bend
+    let inner = max(bank, 0.0)
+    let outer = max(-bank, 0.0)
+    let r = abs(across) / max(width * (1.0 + 0.45 * inner - 0.15 * outer), 1.0e-5)
+    let ordinary = 1.0 - smoothstep(0.3, 1.0 - 0.15 * outer, r)
+    let shelf = 1.0 - 0.18 * smoothstep(0.25, 0.42, r) - 0.82 * smoothstep(0.68, 1.0, r)
+    let cut = mix(ordinary, shelf, inner)
+    let wall = smoothstep(mix(0.32, 0.7, inner), mix(0.46, 0.78, inner), r) *
+        (1.0 - smoothstep(0.87, 1.0, r))
+    vec2(cut, wall)
+}
+
+@test
+fn ravine_bends_keep_the_bed_and_form_opposed_banks() {
+    for bend in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+        assert(
+            ravine_section(across: 0.0, width: 10.0, bend: bend).x == 1.0,
+            "bend moved the channel bed",
+        )
+        for i in 0..101 {
+            let x = f32(i) * 0.2
+            let a = ravine_section(across: x, width: 10.0, bend: bend)
+            let b = ravine_section(across: -x, width: 10.0, bend: -bend)
+            assert(length(a - b) < 1.0e-5, "opposite bends do not mirror")
+            assert(
+                a.x >= 0.0 && a.x <= 1.0 && a.y >= 0.0 && a.y <= 1.0,
+                "bank escaped its height bounds",
+            )
+        }
+        assert(
+            ravine_section(across: 15.0, width: 10.0, bend: bend).x == 0.0,
+            "bank cut past its bounded rim",
+        )
+    }
+    let inner = ravine_section(across: 7.0, width: 10.0, bend: 1.0)
+    let outer = ravine_section(across: -7.0, width: 10.0, bend: 1.0)
+    assert(inner.x > outer.x + 0.4, "bend did not form a low inner shelf")
+    assert(inner.y < 0.01, "flat deposited shelf was classified as a rock wall")
+}

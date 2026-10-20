@@ -1,0 +1,189 @@
+// A creature walking on the spot: a `Walker` steps its gait's cycle (`sim::GaitState`), poses
+// it on the CPU (`render::palette`) and draws it.
+//
+// The examples and the lens draw creatures this way. A walk keeps a record of what it has done
+// (`Walked`: bone lengths, foot places, finite matrices), which a frame test checks.
+
+use creature::{Creature, Skeleton}
+use look::CreatureLook
+use realize::{Mesh, realize_once}
+use render::{
+    ByChannels, Lights, MAX_BONES, Palette, Shaded, skin, palette, shade, unlit_shadow, view,
+}
+use sim::{GaitState, Mode, Pose, Transform}
+use std::gpu::{
+    ComparisonSampler, Cull, DepthTexture, GpuBuffer, begin_screen_pass_with_depth, buffer,
+    comparison_sampler, depth_texture, draw, write,
+}
+
+/// What a walk has done: the largest error in a leg bone's length, and in a foot's place
+/// against the gait's beyond what the leg can't reach; how many times a foot's place was beyond
+/// its leg's reach; the lowest and highest a foot has been, from where it is at rest; and
+/// whether every bone's matrix was finite.
+pub struct Walked: Copy {
+    pub length_error: f32,
+    pub foot_error: f32,
+    pub overreached: u32,
+    pub lowest: f32,
+    pub highest: f32,
+    pub frames: u32,
+    pub finite: bool,
+}
+
+/// Nothing walked yet.
+pub fn walked() -> Walked {
+    Walked {
+        length_error: 0.0,
+        foot_error: 0.0,
+        overreached: 0,
+        lowest: 1.0e9,
+        highest: -1.0e9,
+        frames: 0,
+        finite: true,
+    }
+}
+
+impl Walked {
+    /// Records a frame: the palette `p` that posed `s` as `pose` (`render::palette`, its root
+    /// where the creature stands). Each leg's bones should keep their lengths, and each foot be
+    /// where the gait puts it, its step scaled from the gait's hips to the leg's; beyond the
+    /// leg's reach, short by as much as the place is beyond it.
+    pub fn record(mut self, s: Skeleton, p: Palette, pose: Pose) {
+        let legs = s.legs()
+        let at = |m: mat4, v: vec3| (m * vec4(v, 1.0)).xyz
+        for i in 0..s.leg_count() {
+            let j = legs[i].joints
+            let (h, k, a, f) = (s.rest(j[0]), s.rest(j[1]), s.rest(j[2]), s.rest(j[3]))
+            let hip = at(p.bones[j[0].index], h)
+            let knee = at(p.bones[j[1].index], k)
+            let ankle = at(p.bones[j[2].index], a)
+            let foot = at(p.bones[j[3].index], f)
+            self.length_error = max(self.length_error, abs(length(knee - hip) - length(k - h)))
+            self.length_error = max(self.length_error, abs(length(ankle - knee) - length(a - k)))
+            let lp = pose.legs[i]
+            let target = f + (lp.foot - vec3(lp.hip.x, 0.0, lp.hip.z)) * (h.y / render::GAIT_HIP)
+            let short = max(length(target - (f - a) - h) - (length(k - h) + length(a - k)), 0.0)
+            if short > 0.0 {
+                self.overreached += 1
+            }
+            self.foot_error = max(self.foot_error, length(foot - target) - short)
+            self.lowest = min(self.lowest, foot.y - f.y)
+            self.highest = max(self.highest, foot.y - f.y)
+        }
+        for b in 0..s.len() {
+            for c in 0..4 {
+                let col = p.bones[b][c]
+                self.finite = self.finite && col == col && dot(col, col) < 1.0e30
+            }
+        }
+        self.frames += 1
+    }
+}
+
+/// A creature walking on the spot, drawn: its mesh, realized once, its gait, and a GPU buffer
+/// of the palette that poses it (computed on the CPU each frame), what its walk has done, and
+/// the screen's depth. It casts no shadow (`render::unlit_shadow`).
+pub struct Walker {
+    mesh: Mesh,
+    gait: GaitState,
+    palettes: GpuBuffer<mat4>,
+    pub walked: Walked,
+    depth: DepthTexture,
+    shadow: DepthTexture,
+    shadow_sampler: ComparisonSampler,
+    width: u32,
+    height: u32,
+}
+
+/// Where a walker stands: it walks on the spot.
+const STILL = Transform { pos: vec3(), heading: 0.0 }
+
+/// How far its gait steps each frame: a walker is presentation, stepped once a frame, as at 60
+/// frames a second.
+const FRAME_STEP: f32 = 1.0 / 60.0
+
+/// The examples' lights: a warm sun and a cool sky.
+const LIGHTS = Lights {
+    sun_colour: vec3(1.6, 1.5, 1.35),
+    sky: vec3(0.55, 0.65, 0.8),
+    ground: vec3(0.3, 0.27, 0.22),
+    ambient: 0.6,
+    exposure: 0.9,
+    f0: 0.04,
+    normal_offset: 3cm,
+    compare_bias: 0.002,
+}
+
+/// `creature`, its mesh realized as `look` says, ready to walk on the spot with its gait's
+/// cycle.
+pub fn walker<C, K: Creature<C>>(creature: K, look: CreatureLook) -> Walker {
+    let gait = GaitState { phase: 0.0, speed: 0.8, turn: 0.0, mode: Mode::Walk }
+    let mesh = realize_once(creature, look)
+    let shadow = unlit_shadow()
+    Walker {
+        mesh,
+        gait,
+        palettes: buffer(MAX_BONES),
+        walked: walked(),
+        depth: depth_texture(width: 1, height: 1),
+        shadow,
+        shadow_sampler: comparison_sampler(),
+        width: 1,
+        height: 1,
+    }
+}
+
+impl Walker {
+    /// A frame on a screen `width` by `height`: the gait a step on, `creature` posed by it (and
+    /// the pose recorded), and drawn skinned and shaded by its channels (`Shaded`), by a camera
+    /// at `eye` looking at `at`.
+    pub fn frame<C: Shaded, K: Creature<C>>(
+        mut self,
+        creature: K,
+        width: u32,
+        height: u32,
+        eye: vec3,
+        at: vec3,
+    ) {
+        self.gait = self.gait.advance(FRAME_STEP)
+        let pose = self.gait.pose()
+        let posed = palette(creature.skeleton(), pose, STILL)
+        self.walked.record(creature.skeleton(), posed, pose)
+        write(mut self.palettes, 0, posed.bones)
+        if width != self.width || height != self.height {
+            self.depth = depth_texture(width, height)
+            self.width = width
+            self.height = height
+        }
+        let v = view(
+            eye,
+            at,
+            fovy: 0.7853982,
+            aspect: f32(width) / f32(height),
+            sun: vec3(0.4, 1.0, 0.3),
+            extent: 4.0,
+        )
+        let pass = begin_screen_pass_with_depth(mut self.depth, clear: vec4(0.55, 0.7, 0.85, 1.0))
+        draw(
+            pass,
+            skin.bind(
+                verts: self.mesh.verts.items(),
+                palettes: self.palettes.span(start: 0, count: MAX_BONES),
+                first: 0,
+                view: v,
+            ),
+            shade.bind(
+                field: creature.field(),
+                look: ByChannels {},
+                view: v,
+                lights: LIGHTS,
+                shadow: self.shadow,
+                shadow_sampler: self.shadow_sampler,
+            ),
+            indices: self.mesh.quads.items(),
+            indirect: self.mesh.draw.items(),
+            cull: Cull::Back,
+        )
+        pass.present()
+    }
+}

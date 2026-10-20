@@ -1,0 +1,1582 @@
+// Realization: a creature's field cooked into a skinned mesh on the GPU, by kernels written in
+// Wrela.
+//
+// A `Realizer` keeps the meshes of every instance of one creature type, at the levels of detail
+// their size on screen asks for (`Realizer::frame`). `realize_once` and `realizing` give one
+// creature's mesh. Each individual at each level (a cell size) is realized in five passes:
+//
+//   1. cull_blocks: one invocation per block of 4×4×4 cells. Each item's interval over the block
+//      grown by a cell gives its bit in the block's `PartMask`, and the creature's interval,
+//      folded through the kept items, says whether the surface can be there; live blocks go
+//      into a list, whose count is the next passes' indirect dispatch, and the block map gets
+//      each block's live slot + 1, or 0.
+//   2. place_vertices: one 4×4×4 workgroup per live block (a slice of them a frame, when a level
+//      change is spread over frames). The block's
+//      5³ corners are evaluated once each, into workgroup memory, each under one mask: its
+//      block's inside it, and on the block's boundary the union of the masks of the live blocks
+//      that share it, so every block that evaluates a corner gets the same bits and no quad goes
+//      missing. Each cell the surface crosses gets a vertex: each crossed edge's root
+//      (regula falsi) and gradient, a QEF pulled toward their mean, clamped to the cell. The cell
+//      map keeps each cell's signs and vertex.
+//   3. emit_quads: each cell with a vertex emits a quad for each crossed edge leaving its low
+//      corner, joining the four cells around it, facing outward; the index count is the draw's.
+//      Passes 2 and 3 go in chunks of at most 65,535 workgroups (`record_blocks`), WebGPU's most
+//      along x: chunk_groups gives each chunk's group counts from the live blocks' count.
+//   4. finish_mesh: the index count clamped to the slab, so a draw reads only its own indices;
+//      the counts, and the skin pass's group count.
+//   5. skin_vertices: each vertex's skin weights.
+//
+// No count is read back in this path. Meshes live in pools, one per creature type and level,
+// cut into slabs; the queue realizes as many as a frame's budget allows.
+
+use creature::{Creature, NONE, PartMask, Parts}
+use look::{CreatureLook, Detail}
+use std::derive::{Box3, gradient}
+use std::collections::replace
+use std::gpu::{
+    Append, AppendBuffer, Atomics, DispatchArgs, DrawIndexedArgs, GlobalId, GpuBuffer, LocalId, One,
+    Shared, Slots, WorkgroupId, append_buffer, barrier, buffer, dispatch, read, write,
+}
+use std::io::Pending
+use std::mem::{debug_build, size_of}
+
+/// A block's cells along each axis: a 4×4×4 workgroup in `place_vertices` and `emit_quads`.
+pub const BLOCK: u32 = 4
+
+/// A cell with no vertex (a `CellWord`'s 24 bits all set).
+pub const NO_VERTEX: u32 = 0xffffff
+
+/// A cell's word in the cell map: its vertex (`NO_VERTEX` for none), and which of its eight
+/// corners are inside (a bit each).
+pub struct CellWord: Packed + Copy {
+    pub vertex: Bits<24>,
+    pub signs: Bits<8>,
+}
+
+/// What a realization's passes counted (`Mesh::tally`), which `finish_mesh` writes: its
+/// vertices (within its room), the holes, the overflow flags, the vertices and quads pushed (past
+/// its room too), and the live blocks. One readback of it says all a realization did.
+pub struct Tally: Copy + GpuData + Plain {
+    pub vertices: u32,
+    pub holes: u32,
+    pub flags: u32,
+    pub pushed_vertices: u32,
+    pub pushed_quads: u32,
+    pub live_blocks: u32,
+}
+
+/// `Tally::flags`: the vertices ran past the mesh's room; the quads did.
+pub const VERTICES_FULL: u32 = 2
+pub const QUADS_FULL: u32 = 4
+
+/// Root-finding steps for each crossed edge.
+pub const ROOT_STEPS: u32 = 4
+
+/// The QEF's pull toward the crossings' mean.
+pub const QEF_PULL: f32 = 0.05
+
+/// The extraction grid, in rest space: cells `cell` wide from `origin`, in blocks of 4³.
+pub struct Grid: Copy + GpuData {
+    pub origin: vec3,
+    pub cell: f32,
+    /// Blocks along each axis.
+    pub size: vec3u,
+    pub blocks: u32,
+}
+
+impl Grid {
+    /// The grid around `b`: its origin two cells below `b`'s low corner,
+    /// and enough blocks to reach two cells past its high one.
+    pub fn around(b: Box3, cell: f32) -> Grid {
+        let pad = 2.0 * cell
+        let origin = b.lo - vec3(pad)
+        let size = vec3u(ceil((b.hi + vec3(pad) - origin) / (f32(BLOCK) * cell)))
+        Grid { origin, cell, size, blocks: size.x * size.y * size.z }
+    }
+
+    /// Block `b`'s coordinates, in blocks.
+    pub fn block_xyz(self, b: u32) -> vec3u {
+        let s = self.size
+        vec3u(b % s.x, (b / s.x) % s.y, b / (s.x * s.y))
+    }
+
+    /// The block at block coordinates `c`.
+    pub fn block_at(self, c: vec3u) -> u32 {
+        c.x + self.size.x * (c.y + self.size.y * c.z)
+    }
+
+    /// The lattice's corner `c`, in cells from the origin. Every block that shares a corner
+    /// gets the same point from it, bit for bit, which a block's corner plus an offset doesn't
+    /// give: two blocks evaluating one corner at points an ulp apart can disagree on its sign,
+    /// and a quad between them is lost.
+    pub fn corner(self, c: vec3u) -> vec3 {
+        self.origin + vec3(c) * self.cell
+    }
+
+    /// Block `b`'s low corner.
+    pub fn block_corner(self, b: u32) -> vec3 {
+        self.origin + vec3(self.block_xyz(b)) * (f32(BLOCK) * self.cell)
+    }
+
+    /// Block `b`, as a box.
+    pub fn block_bounds(self, b: u32) -> Box3 {
+        let lo = self.block_corner(b)
+        Box3 { lo, hi: lo + vec3(self.cell * f32(BLOCK)) }
+    }
+
+    /// The whole grid, as a box.
+    pub fn extent(self) -> Box3 {
+        Box3 { lo: self.origin, hi: self.origin + vec3(self.size) * (f32(BLOCK) * self.cell) }
+    }
+}
+
+/// `b` grown by `by` on every side.
+pub fn grow(b: Box3, by: f32) -> Box3 {
+    Box3 { lo: b.lo - vec3(by), hi: b.hi + vec3(by) }
+}
+
+/// A block the surface can pass through, and the items that can matter in it.
+pub struct LiveBlock: Copy + GpuData {
+    pub block: u32,
+    pub mask: PartMask,
+}
+
+/// The boundary corners one invocation of `place_vertices` evaluated, in a debug build (to check
+/// that every block that evaluates a corner gets the same bits): for each of its two, the corner's
+/// index in the grid's lattice (x fastest) plus 1 (0: none), and its value's bits.
+pub struct CornerProbe: Copy + GpuData {
+    pub corners: [u32; 2],
+    pub bits: [u32; 2],
+}
+
+/// The most blocks a grid a debug build probes has (`Scratch::probe`).
+pub const PROBE_BLOCKS: u32 = 32768
+
+/// One vertex of a realized mesh, 48 bytes: its rest position, its four bones (a
+/// byte each), its normal, their weights (a byte each, adding up to 255), and the items that
+/// matter near it, for shading.
+pub struct SkinVertex: Copy + GpuData {
+    pub pos: vec3,
+    pub bones: u32,
+    pub normal: vec3,
+    pub weights: u32,
+    pub mask: PartMask,
+}
+
+/// A quad's two triangles, six indices: an indexed draw reads them in order.
+pub struct Quad: Copy + GpuData {
+    pub a: u32,
+    pub b: u32,
+    pub c: u32,
+    pub d: u32,
+    pub e: u32,
+    pub f: u32,
+}
+
+/// Where cell `c` of the block in live slot `slot` is in a cell map with room for `blocks`
+/// blocks (its length over `BLOCK³`): row by row, as one dispatch of that many blocks would
+/// number its invocations.
+pub fn cell_key(slot: u32, c: vec3u, blocks: u32) -> u32 {
+    (slot * BLOCK + c.x) + c.y * blocks * BLOCK + c.z * blocks * BLOCK * BLOCK
+}
+
+// ---- pass 1: which blocks matter, and which items matter in each ------------------------------
+
+/// Which blocks the surface can pass through, and which items can matter in each: each item's
+/// interval over the block grown by one cell (a quad can straddle two blocks). The block map
+/// gets each block's live slot + 1, or 0.
+@compute(64)
+pub fn cull_blocks<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    live: mut Append<LiveBlock>,
+    block_map: mut Slots<u32>,
+    id: GlobalId,
+) {
+    if id.x >= grid.blocks {
+        return
+    }
+    let c = field.cull(grow(grid.block_bounds(id.x), grid.cell))
+    if c.lo > 0.0 || c.hi < 0.0 {
+        block_map[id] = 0 // no surface here; never evaluated again
+        return
+    }
+    block_map[id] = live.push(LiveBlock { block: id.x, mask: c.mask }) + 1
+}
+
+// ---- pass 2: a vertex in each crossed cell ---------------------------------------------------
+
+/// A cell's corner `j` (0 to 7), from its low corner: bit 0 along x, bit 1 along y, bit 2
+/// along z.
+fn corner_offset(j: u32) -> vec3u {
+    vec3u(j & 1, (j >> 1) & 1, (j >> 2) & 1)
+}
+
+/// The mask of the block at `i` (`(dx + 1) + 3 (dy + 1) + 9 (dz + 1)`) of the 3 × 3 × 3 around
+/// block `b`: none outside the grid or where culled.
+fn neighbour_mask(grid: Grid, blocks: [LiveBlock], block_map: [u32], b: vec3u, i: u32) -> PartMask {
+    // One past `b`'s neighbour, so none is below 0.
+    let n = b + vec3u(i % 3, (i / 3) % 3, i / 9)
+    let size = grid.size
+    if n.x < 1 || n.y < 1 || n.z < 1 || n.x > size.x || n.y > size.y || n.z > size.z {
+        return NONE
+    }
+    let s = block_map[grid.block_at(n - 1)]
+    if s == 0 { NONE } else { blocks[s - 1].mask }
+}
+
+/// The mask a corner `c` of a block whose own is `own` is evaluated under: its own, and on its
+/// boundary the union with each live block that shares the corner, from the masks of the
+/// blocks around it (`neighbour_mask`).
+fn corner_mask(near: Shared<PartMask, 27>, own: PartMask, c: vec3u) -> PartMask {
+    let (cx, cy, cz) = (c.x, c.y, c.z)
+    // Along each axis, the blocks sharing the corner: the one below too at its low face, the
+    // one above too at its high face. All eight unions, the same block more than once inside
+    // (no branch: the invocations of a SIMD group take different corners).
+    let (x0, x1) = (if cx == 0 { 0 } else { 1 }, if cx == BLOCK { 2 } else { 1 })
+    let (y0, y1) = (3 * (if cy == 0 { 0 } else { 1 }), 3 * (if cy == BLOCK { 2 } else { 1 }))
+    let (z0, z1) = (9 * (if cz == 0 { 0 } else { 1 }), 9 * (if cz == BLOCK { 2 } else { 1 }))
+    own.or(near.get(x0 + y0 + z0))
+        .or(near.get(x1 + y0 + z0))
+        .or(near.get(x0 + y1 + z0))
+        .or(near.get(x1 + y1 + z0))
+        .or(near.get(x0 + y0 + z1))
+        .or(near.get(x1 + y0 + z1))
+        .or(near.get(x0 + y1 + z1))
+        .or(near.get(x1 + y1 + z1))
+}
+
+/// Coordinate `a` of `v` (0 for x, 1 for y, 2 for z).
+fn coordinate(v: vec3, a: u32) -> f32 {
+    if a == 0 { v.x } else if a == 1 { v.y } else { v.z }
+}
+
+/// `v` with coordinate `a` (`coordinate`) set to `x`.
+fn with_coordinate(v: vec3, a: u32, x: f32) -> vec3 {
+    if a == 0 { vec3(x, v.y, v.z) } else if a == 1 { vec3(v.x, x, v.z) } else { vec3(v.x, v.y, x) }
+}
+
+/// The edges between a block's 5³ corners: 100 along each axis.
+const EDGES: u32 = 300
+
+/// The corner (each axis 0 to 4) whose place along axis `a` is `u`, and along the next two
+/// axes (in turn) `v` and `w`.
+fn turned(a: u32, u: u32, v: u32, w: u32) -> vec3u {
+    if a == 0 { vec3u(u, v, w) } else if a == 1 { vec3u(w, u, v) } else { vec3u(v, w, u) }
+}
+
+/// Edge `e` of a block's (`EDGES`): its axis, and its low corner (its place along the axis 0 to
+/// 3, the others 0 to 4). Edge `a × 100 + u + 4 (v + 5 w)` (`turned`).
+fn edge_of(e: u32) -> (u32, vec3u) {
+    let a = e / 100
+    let r = e % 100
+    (a, turned(a, u: r % 4, v: (r / 4) % 5, w: r / 20))
+}
+
+/// The edge of a block's (`edge_of`) along axis `a` from corner `c`.
+fn edge_at(a: u32, c: vec3u) -> u32 {
+    let (u, v, w) = if a == 0 { (c.x, c.y, c.z) } else if a == 1 { (c.y, c.z, c.x) } else {
+        (c.z, c.x, c.y)
+    }
+    a * 100 + u + 4 * (v + 5 * w)
+}
+
+fn det3(a: vec3, b: vec3, c: vec3) -> f32 {
+    dot(a, cross(b, c))
+}
+
+/// The solution of `(a0 a1 a2) x = b` by Cramer's rule; 0 where the matrix is singular.
+fn solve3(a0: vec3, a1: vec3, a2: vec3, b: vec3) -> vec3 {
+    let det = det3(a0, a1, a2)
+    if abs(det) < 1.0e-12 {
+        return vec3(0.0)
+    }
+    vec3(det3(b, a1, a2), det3(a0, b, a2), det3(a0, a1, b)) / det
+}
+
+/// Each chunk's group counts for a pass over live slots `from` to `to` (not included, and not
+/// past the live blocks' end): three `u32`s a chunk, `GROUPS_MOST` workgroups (fewer past the
+/// end), chunk `c` from slot `from + c × GROUPS_MOST`.
+@compute(64)
+fn chunk_groups(live: [u32], from: u32, to: u32, out: mut Slots<u32>, id: GlobalId) {
+    let start = from + (id.x / 3) * GROUPS_MOST
+    let end = min(live[0], to)
+    let left = if end > start { end - start } else { 0 }
+    out[id] = if id.x % 3 != 0 { 1 } else { min(left, GROUPS_MOST) }
+}
+
+/// The field's normal at `x`, from the items in `mask`, seen `fp` wide: one function for an
+/// edge's crossing and a vertex alike, so a large creature's shader holds its derived fold once.
+fn normal_at<C, F: Parts<C>>(field: F, mask: PartMask, fp: f32, x: vec3) -> vec3 {
+    normalize(gradient(|q: vec3| field.distance_masked(q, mask, fp), x))
+}
+
+/// In each live block, a vertex for every cell the surface crosses: where the planes through
+/// its edges' crossings, with the gradient there, best meet (dual contouring). Its cell map
+/// entry: its signs, and the vertex. Its skin weights come in a pass of their own
+/// (`skin_vertices`: this pass's WGSL has no room for them in its 256 KiB).
+@compute(4, 4, 4)
+pub fn place_vertices<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    first: u32,
+    blocks: [LiveBlock],
+    block_map: [u32],
+    near: mut Shared<PartMask, 27>,
+    corners: mut Shared<f32, 125>,
+    crossings: mut Shared<vec4, EDGES>,
+    probe: mut Slots<CornerProbe>,
+    cells: mut Atomics<u32>,
+    verts: mut Append<SkinVertex>,
+    block: WorkgroupId,
+    lid: LocalId,
+    id: GlobalId,
+) {
+    // A chunk of the live blocks starts at `first` (`record_blocks`).
+    let slot = block.x + first
+    let lb = blocks[slot]
+    // Each cell's entry in the cell map, wherever the slice's dispatch puts its invocation.
+    let key = cell_key(slot, lid.xyz(), cells.len() / (BLOCK * BLOCK * BLOCK))
+    let cell = grid.cell
+    let b = grid.block_xyz(lb.block)
+    // The block's low corner, in cells.
+    let g = b * BLOCK
+    // Detail finer than a cell is for shading: the field is seen a cell wide.
+    let fp = cell
+    // The masks around the block, read once for its 98 boundary corners.
+    let around = near.chunk(lid)
+    for k in 0..around.len() {
+        near.write(around, k, neighbour_mask(grid, blocks, block_map, b, around.index(k)))
+    }
+    barrier(mut near)
+    let chunk = corners.chunk(lid)
+    var probed = CornerProbe { corners: [0, 0], bits: [0, 0] }
+    for k in 0..chunk.len() {
+        let i = chunk.index(k)
+        let c = vec3u(i % 5, (i / 5) % 5, i / 25)
+        let mask = corner_mask(near, lb.mask, c)
+        let at = grid.corner(g + c)
+        let d = field.distance_masked(at, mask, fp)
+        corners.write(chunk, k, d)
+        let inside = c.x > 0 && c.x < BLOCK && c.y > 0 && c.y < BLOCK && c.z > 0 && c.z < BLOCK
+        if debug_build() && !inside && k < 2 {
+            let (nx, ny) = (grid.size.x * BLOCK + 1, grid.size.y * BLOCK + 1)
+            let p = g + c
+            probed.corners[k] = p.x + nx * (p.y + ny * p.z) + 1
+            probed.bits[k] = bitcast_u32(d)
+        }
+    }
+    // (Room for `PROBE_BLOCKS` blocks: a larger grid's isn't probed. A slot's index counts the
+    // dispatch's every group, so a slot below the room can still fall past it.)
+    if debug_build() && grid.blocks <= PROBE_BLOCKS {
+        probe[id] = probed
+    }
+    barrier(mut corners)
+
+    // Where the surface crosses each edge of the block's corners it crosses, and the gradient
+    // there, found once (by any invocation: `crossings`' chunks). An edge inside the block is
+    // four cells', and each cell found it again, while the cells the surface misses waited:
+    // the clearing's first 50 frames' realizations took 0.45 s of the GPU, now 0.25. Each is
+    // kept as the normal and the crossing's coordinate along its edge (its others are the
+    // edge's, exactly: the root's steps move along it alone), in a vec4. Kept as a struct of
+    // two vec3s, the table made this pass 7 times slower on the herd's grazers at 3 cm (Apple
+    // M-series, in wgpu); two tables of vec4s, the same 9.6 KB, cost a fifth more than one.
+    let mask = lb.mask
+    let edges = crossings.chunk(lid)
+    for k in 0..edges.len() {
+        let (axis, low) = edge_of(edges.index(k))
+        let high = low + turned(axis, u: 1, v: 0, w: 0)
+        var fa = corners.get(low.x + low.y * 5 + low.z * 25)
+        var fb = corners.get(high.x + high.y * 5 + high.z * 25)
+        if (fa < 0.0) != (fb < 0.0) {
+            var pa = grid.corner(g + low)
+            var pb = grid.corner(g + high)
+            for _ in 0..ROOT_STEPS {
+                let x = pa + (pb - pa) * (fa / (fa - fb))
+                let fx = field.distance_masked(x, mask, fp)
+                if (fx < 0.0) == (fa < 0.0) {
+                    pa = x
+                    fa = fx
+                } else {
+                    pb = x
+                    fb = fx
+                }
+            }
+            let x = pa + (pb - pa) * (fa / (fa - fb))
+            crossings.write(edges, k, vec4(normal_at(field, mask, fp, x), coordinate(x, axis)))
+        }
+    }
+    barrier(mut crossings)
+
+    var vals = [0.0; 8]
+    var signs = 0
+    for j in 0..8 {
+        let p = lid.xyz() + corner_offset(j)
+        vals[j] = corners.get(p.x + p.y * 5 + p.z * 25)
+        if vals[j] < 0.0 {
+            signs = signs | (1 << j)
+        }
+    }
+    if signs == 0 || signs == 255 {
+        cells.store(key, u32(CellWord { vertex: NO_VERTEX, signs }))
+        return
+    }
+
+    // The crossings of the cell's 12 edges.
+    let cc = g + lid.xyz()
+    let cmin = grid.corner(cc)
+    var pts = [vec3(0.0); 12]
+    var nrm = [vec3(0.0); 12]
+    var n = 0
+    var mass = vec3(0.0)
+    for e in 0..12 {
+        let axis = e >> 2
+        let r = e & 3
+        let ja = ((r & 1) << ((axis + 1) % 3)) | ((r >> 1) << ((axis + 2) % 3))
+        let jb = ja | (1 << axis)
+        if ((signs >> ja) & 1) == ((signs >> jb) & 1) {
+            continue
+        }
+        let low = lid.xyz() + corner_offset(ja)
+        let c = crossings.get(edge_at(axis, low))
+        let at = with_coordinate(grid.corner(g + low), axis, c.w)
+        pts[n] = at
+        nrm[n] = c.xyz
+        mass += at
+        n += 1
+    }
+
+    // The QEF, pulled toward the crossings' mean, clamped to the cell.
+    let m = mass / f32(n)
+    var a0 = vec3(QEF_PULL, 0.0, 0.0)
+    var a1 = vec3(0.0, QEF_PULL, 0.0)
+    var a2 = vec3(0.0, 0.0, QEF_PULL)
+    var rhs = vec3(0.0)
+    for i in 0..n {
+        let q = nrm[i]
+        a0 += q * q.x
+        a1 += q * q.y
+        a2 += q * q.z
+        rhs += q * dot(q, pts[i] - m)
+    }
+    let pos = clamp(m + solve3(a0, a1, a2, rhs), cmin, grid.corner(cc + 1))
+    let normal = normal_at(field, mask, fp, pos)
+    // Its skin weights come in their own pass (`skin_vertices`).
+    let vi = verts.push(SkinVertex { pos, bones: 0, normal, weights: 255, mask })
+    cells.store(key, u32(CellWord { vertex: min(vi, NO_VERTEX), signs }))
+}
+
+// ---- pass 3: a quad for every crossed edge -----------------------------------------------------
+
+/// The vertex of the cell at grid cell `c` (which may be outside the grid), through the block
+/// map and the cell map: none outside the grid, in a culled block, or past the vertices' room.
+pub fn vertex_at(
+    grid: Grid,
+    block_map: [u32],
+    cells: [u32],
+    blocks: u32,
+    room: u32,
+    c: vec3i,
+) -> u32 {
+    let (u, n) = (vec3u(c), grid.size * BLOCK)
+    if c.x < 0 || c.y < 0 || c.z < 0 || u.x >= n.x || u.y >= n.y || u.z >= n.z {
+        return NO_VERTEX
+    }
+    let s = block_map[grid.block_at(u / BLOCK)]
+    if s == 0 {
+        return NO_VERTEX
+    }
+    let v = CellWord::of_bits(cells[cell_key(s - 1, u % BLOCK, blocks)]).vertex
+    if v >= room { NO_VERTEX } else { v }
+}
+
+/// For each crossed edge leaving a cell's low corner along +x, +y and +z, a quad joining the
+/// four cells around it, facing from inside to outside. A quad missing a neighbour's vertex is
+/// counted as a hole.
+@compute(4, 4, 4)
+pub fn emit_quads(
+    grid: Grid,
+    room: u32,
+    first: u32,
+    blocks: [LiveBlock],
+    block_map: [u32],
+    cells: [u32],
+    quads: mut Append<Quad>,
+    holes: mut Atomics<u32>,
+    block: WorkgroupId,
+    lid: LocalId,
+) {
+    // A chunk of the live blocks starts at `first` (`record_blocks`).
+    let slot = block.x + first
+    let n = cells.len() / (BLOCK * BLOCK * BLOCK)
+    let cell = CellWord::of_bits(cells[cell_key(slot, lid.xyz(), n)])
+    let v0 = cell.vertex
+    if v0 >= room {
+        return
+    }
+    let signs = cell.signs
+    let g = vec3i(grid.block_xyz(blocks[slot].block) * BLOCK + lid.xyz())
+    let in0 = signs & 1
+    for axis in 0..3 {
+        let in1 = (signs >> (1 << axis)) & 1
+        if in0 == in1 {
+            continue
+        }
+        // The other two axes: the four cells around the edge are this one, back along the first,
+        // back along both, and back along the second.
+        let a1 = (axis + 1) % 3
+        let a2 = (axis + 2) % 3
+        let u = vec3i(i32(a1 == 0), i32(a1 == 1), i32(a1 == 2))
+        let w = vec3i(i32(a2 == 0), i32(a2 == 1), i32(a2 == 2))
+        let v1 = vertex_at(grid, block_map, cells, n, room, g - u)
+        let v2 = vertex_at(grid, block_map, cells, n, room, g - u - w)
+        let v3 = vertex_at(grid, block_map, cells, n, room, g - w)
+        if v1 == NO_VERTEX || v2 == NO_VERTEX || v3 == NO_VERTEX {
+            let _ = holes.add(i: 0, value: 1)
+            continue
+        }
+        let _ = quads.push(if in0 == 1 {
+            Quad { a: v0, b: v1, c: v2, d: v0, e: v2, f: v3 }
+        } else {
+            Quad { a: v0, b: v2, c: v1, d: v0, e: v3, f: v2 }
+        })
+    }
+}
+
+// ---- pass 4: the draw's arguments ---------------------------------------------------------------
+
+/// The draw's arguments from the counts, each clamped to its room (`vroom` vertices, `qroom`
+/// quads), so a draw reads only its own mesh; the skin pass's group counts; and the tally: the
+/// overflow flags, the counts as pushed, the holes `emit_quads` counted and the live blocks.
+@compute(1)
+pub fn finish_mesh(
+    vertices: [u32],
+    quads: [u32],
+    live: [u32],
+    holes: [u32],
+    vroom: u32,
+    qroom: u32,
+    draw: mut One<DrawIndexedArgs>,
+    skin: mut One<DispatchArgs>,
+    tally: mut One<Tally>,
+    id: GlobalId,
+) {
+    let (v, q) = (vertices[0], quads[0])
+    let drawn = min(v, vroom)
+    draw.set(
+        id,
+        DrawIndexedArgs {
+            indices: 6 * min(q, qroom),
+            instances: 1,
+            first_index: 0,
+            base_vertex: 0,
+            first_instance: 0,
+        },
+    )
+    skin.set(id, DispatchArgs { x: (drawn + 63) / 64, y: 1, z: 1 })
+    let flags = (if v > vroom { VERTICES_FULL } else { 0 }) | (if q > qroom { QUADS_FULL } else {
+        0
+    })
+    tally.set(
+        id,
+        Tally {
+            vertices: drawn,
+            holes: holes[0],
+            flags,
+            pushed_vertices: v,
+            pushed_quads: q,
+            live_blocks: live[0],
+        },
+    )
+}
+
+// ---- pass 5: skin weights ------------------------------------------------------------------------
+
+/// Each vertex's skin weights (from the parts of the items in its mask, falling off
+/// over `falloff`, the field seen `fp` wide, a cell), as `place_vertices` would give them.
+@compute(64)
+pub fn skin_vertices<C, F: Parts<C>>(
+    field: F,
+    fp: f32,
+    falloff: f32,
+    tally: [Tally],
+    verts: mut Slots<SkinVertex>,
+    id: GlobalId,
+) {
+    if id.x >= tally[0].vertices {
+        return
+    }
+    let v = verts[id]
+    let (bones, weights) = field.skin_at(v.pos, v.mask, fp, falloff)
+    verts[id] = SkinVertex { pos: v.pos, bones, normal: v.normal, weights, mask: v.mask }
+}
+
+// ---- meshes, scratch and pools --------------------------------------------------------------
+
+/// What every realization shares, one after another: the live list (whose count is the next
+/// passes' indirect dispatch), the block map and the cell map, for grids of up to `blocks`
+/// blocks.
+pub struct Scratch {
+    pub live: AppendBuffer<LiveBlock>,
+    pub block_map: GpuBuffer<u32>,
+    pub cells: GpuBuffer<u32>,
+    /// The group counts of a pass's chunks (`chunk_groups`).
+    pub chunks: GpuBuffer<u32>,
+    /// A debug build's: each boundary corner's value as each live block evaluated it, an
+    /// invocation's two in its slot. A release build's holds one, and nothing writes it.
+    pub probe: GpuBuffer<CornerProbe>,
+}
+
+impl Scratch {
+    pub fn new(blocks: u32) -> Scratch {
+        let n = max(blocks, 1)
+        Scratch {
+            live: append_buffer(n),
+            block_map: buffer(n),
+            cells: buffer(n * 64),
+            chunks: buffer(3 * chunks_for(n)),
+            probe: buffer(if debug_build() { min(n, PROBE_BLOCKS) * 64 } else { 1 }),
+        }
+    }
+
+    /// Room for a grid of `blocks` blocks: grown if need be.
+    pub fn fit(mut self, blocks: u32) {
+        if blocks > self.block_map.len() {
+            self = Scratch::new(blocks)
+        }
+    }
+}
+
+/// A mesh's room: how many vertices and quads it holds.
+pub struct Room: Copy + Eq {
+    pub vertices: u32,
+    pub quads: u32,
+}
+
+/// A realized mesh: its vertices, its quads (an index buffer), and its draw's arguments.
+pub struct Mesh {
+    pub verts: AppendBuffer<SkinVertex>,
+    pub quads: AppendBuffer<Quad>,
+    /// Its draw's arguments and the skin pass's group counts, which `finish_mesh` writes.
+    pub draw: GpuBuffer<DrawIndexedArgs>,
+    pub skin: GpuBuffer<DispatchArgs>,
+    /// The holes `emit_quads` counts, and what the passes counted.
+    pub holes: GpuBuffer<u32>,
+    pub tally: GpuBuffer<Tally>,
+}
+
+impl Mesh {
+    pub fn new(room: Room) -> Mesh {
+        Mesh {
+            verts: append_buffer(room.vertices),
+            quads: append_buffer(room.quads),
+            draw: buffer(1),
+            skin: buffer(1),
+            holes: buffer(1),
+            tally: buffer(1),
+        }
+    }
+
+    pub fn room(self) -> Room {
+        Room { vertices: self.verts.capacity(), quads: self.quads.capacity() }
+    }
+
+    /// Bytes it takes.
+    pub fn bytes(self) -> u64 {
+        Mesh::bytes_for(self.room())
+    }
+
+    /// Bytes a mesh with room `room` takes: its vertices, its quads, its arguments, its tally
+    /// and holes, and its two counts.
+    pub fn bytes_for(room: Room) -> u64 {
+        let args = size_of::<DrawIndexedArgs>() + size_of::<DispatchArgs>()
+        u64(room.vertices) * 48 + u64(room.quads) * 24 + u64(args + size_of::<Tally>() + 4 + 24)
+    }
+}
+
+/// Records one realization: `field`'s mesh on `grid`, its skin weights falling off over
+/// `falloff`, into `mesh`: `record_cull`, `record_vertices`, then `record_finish` (a
+/// `Realizer` spreads a level change's vertices over frames: `record_slice`).
+pub fn record<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    falloff: f32,
+    scratch: mut Scratch,
+    mesh: mut Mesh,
+) {
+    record_cull(field, grid, mut scratch, mut mesh)
+    record_vertices(field, grid, mut scratch, mut mesh)
+    record_finish(field, grid, falloff, mut scratch, mut mesh)
+}
+
+/// `creature`'s mesh, realized once as `realize_once` does it, but with no skin weights: for a
+/// rigid one of one bone (a stone), whose vertices `place_vertices` gives to that bone whole,
+/// as the skin pass would. A pass less at load, and a pipeline less in the scene's 64.
+pub fn realize_rigid<C, K: Creature<C>>(creature: K, look: CreatureLook) -> Mesh {
+    var p = prepare(creature, look)
+    let field = creature.field()
+    record_cull(field, p.grid, mut p.scratch, mut p.mesh)
+    record_vertices(field, p.grid, mut p.scratch, mut p.mesh)
+    record_mesh(p.grid, mut p.scratch, mut p.mesh)
+    take p.mesh
+}
+
+/// What realizing `creature` once as `look` says starts from: the grid round its bounds grown
+/// by the look's tolerance, its cells for a surface that bends no tighter than 5 cm; a mesh with
+/// room for what the grid's blocks can hold; and their scratch.
+struct Prepared {
+    grid: Grid,
+    mesh: Mesh,
+    scratch: Scratch,
+}
+
+fn prepare<C, K: Creature<C>>(creature: K, look: CreatureLook) -> Prepared {
+    let grid = Grid::around(
+        grow(creature.bounds(), look.surface.tolerance),
+        look.surface.cell_size(5cm),
+    )
+    Prepared {
+        grid,
+        mesh: Mesh::new(Room { vertices: grid.blocks * 8, quads: grid.blocks * 16 }),
+        scratch: Scratch::new(grid.blocks),
+    }
+}
+
+/// The slices realizing over frames takes for `grid` (as the realizer counts them,
+/// `Realizer::advance`): live blocks go as the grid's surface, about 6 × blocks^(2/3); a
+/// quarter more, so the last slice, which takes the rest, is
+/// seldom more than one.
+fn slices_for(grid: Grid) -> u32 {
+    let expected = 7.5 * pow(f32(grid.blocks), 2.0 / 3.0)
+    clamp(u32(ceil(expected / f32(SLICE_BLOCKS))), 1, MAX_SLICES)
+}
+
+/// `creature`'s mesh, realized once as `look` says, for a program that keeps one (`walk`): on
+/// the grid around its bounds grown by the look's tolerance, its cells for a
+/// surface that bends no tighter than 5 cm.
+pub fn realize_once<C, K: Creature<C>>(creature: K, look: CreatureLook) -> Mesh {
+    var p = prepare(creature, look)
+    record(creature.field(), p.grid, look.deform.weights.falloff, mut p.scratch, mut p.mesh)
+    take p.mesh
+}
+
+/// A creature's mesh, whole, and a box it lies in at rest (its grid's).
+pub struct Whole {
+    pub mesh: Mesh,
+    pub bounds: Box3,
+}
+
+/// Realizes `creature` as `look` says, as `realize_once` does but over frames (language.md
+/// §16.3), so no submission runs long (the GPU safety rule: under 100 ms): its first `resume`
+/// finds its live blocks,
+/// each after places the vertices of `per_frame` slices of them (`SLICE_BLOCKS` blocks each),
+/// then the last finishes the mesh. Its result is the whole mesh; its scratch goes with it.
+@job
+pub fn realizing<C, K: Creature<C>>(look: take CreatureLook, creature: K, per_frame: u32) -> Whole {
+    var p = prepare(creature, look)
+    record_cull(creature.field(), p.grid, mut p.scratch, mut p.mesh)
+    let slices = slices_for(p.grid)
+    let falloff = look.deform.weights.falloff
+    // The next slice: past the last, the finish; past that, done.
+    var at = 0
+    while at <= slices {
+        yield
+        for _ in 0..per_frame {
+            if at < slices {
+                record_slice(creature.field(), p.grid, at, slices, mut p.scratch, mut p.mesh)
+            } else if at == slices {
+                record_finish(creature.field(), p.grid, falloff, mut p.scratch, mut p.mesh)
+            }
+            at = min(at + 1, slices + 1)
+        }
+    }
+    Whole { mesh: take p.mesh, bounds: p.grid.extent() }
+}
+
+/// A realization's first part: `mesh` emptied, and the live blocks of `grid` found.
+pub fn record_cull<C, F: Parts<C>>(field: F, grid: Grid, scratch: mut Scratch, mesh: mut Mesh) {
+    scratch.fit(grid.blocks)
+    scratch.live.clear()
+    mesh.verts.clear()
+    mesh.quads.clear()
+    // The holes counted from 0 (`finish_mesh` writes the rest whole).
+    write(mut mesh.holes, 0, [0])
+    dispatch(
+        cull_blocks.bind(
+            field: field,
+            grid: grid,
+            live: mut scratch.live,
+            block_map: mut scratch.block_map,
+        ),
+        groups: (grid.blocks + 63) / 64,
+    )
+}
+
+/// A realization's vertices in every live block.
+pub fn record_vertices<C, F: Parts<C>>(field: F, grid: Grid, scratch: mut Scratch, mesh: mut Mesh) {
+    place_blocks(field, grid, from: 0, to: grid.blocks, scratch: mut scratch, mesh: mut mesh)
+}
+
+/// A realization's vertices in slice `slice` of its live blocks, of `slices`: `SLICE_BLOCKS`
+/// of them from `slice × SLICE_BLOCKS`, the last slice taking the rest. A `Realizer` spreads
+/// a level change so over frames.
+pub fn record_slice<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    slice: u32,
+    slices: u32,
+    scratch: mut Scratch,
+    mesh: mut Mesh,
+) {
+    let from = min(slice * SLICE_BLOCKS, grid.blocks)
+    let to = if slice + 1 >= slices { grid.blocks } else { min(from + SLICE_BLOCKS, grid.blocks) }
+    place_blocks(field, grid, from: from, to: to, scratch: mut scratch, mesh: mut mesh)
+}
+
+/// The vertices in live slots `from` to `to` (not included; `to` at most the grid's blocks).
+fn place_blocks<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    from: u32,
+    to: u32,
+    scratch: mut Scratch,
+    mesh: mut Mesh,
+) {
+    if from == 0 && to == grid.blocks && grid.blocks <= GROUPS_MOST {
+        // Every live block, in one dispatch: its count is the group count.
+        dispatch(
+            place_vertices.bind(
+                field: field,
+                grid: grid,
+                first: 0,
+                blocks: scratch.live.items(),
+                block_map: scratch.block_map.span(0, scratch.block_map.len()),
+                probe: mut scratch.probe,
+                cells: mut scratch.cells,
+                verts: mut mesh.verts,
+            ),
+            groups: scratch.live.count(),
+        )
+        return
+    }
+    let chunks = record_chunks(from, to, mut scratch)
+    for c in 0..chunks {
+        dispatch(
+            place_vertices.bind(
+                field: field,
+                grid: grid,
+                first: from + c * GROUPS_MOST,
+                blocks: scratch.live.items(),
+                block_map: scratch.block_map.span(0, scratch.block_map.len()),
+                probe: mut scratch.probe,
+                cells: mut scratch.cells,
+                verts: mut mesh.verts,
+            ),
+            groups: scratch.chunks.span(start: 3 * c, count: 3),
+        )
+    }
+}
+
+/// WebGPU's most workgroups along an axis: a pass over more live blocks goes in chunks.
+const GROUPS_MOST: u32 = 65535
+
+/// How many chunks a pass over `blocks` live slots goes in (at least one).
+fn chunks_for(blocks: u32) -> u32 {
+    max((blocks + GROUPS_MOST - 1) / GROUPS_MOST, 1)
+}
+
+/// The group counts of a pass over live slots `from` to `to` (not included) in `scratch.chunks`,
+/// dispatched after culling: how many chunks the pass goes in.
+fn record_chunks(from: u32, to: u32, scratch: mut Scratch) -> u32 {
+    let chunks = chunks_for(to - from)
+    dispatch(
+        chunk_groups.bind(live: scratch.live.count(), from: from, to: to, out: mut scratch.chunks),
+        over: 3 * chunks,
+    )
+    chunks
+}
+
+/// A realization's last part, once every live block has its vertices: the quads, the draw's
+/// arguments, and the skin weights.
+pub fn record_finish<C, F: Parts<C>>(
+    field: F,
+    grid: Grid,
+    falloff: f32,
+    scratch: mut Scratch,
+    mesh: mut Mesh,
+) {
+    record_mesh(grid, mut scratch, mut mesh)
+    // The tally bounds it (its vertex count), and the skin pass's arguments drive it.
+    dispatch(
+        skin_vertices.bind(
+            field: field,
+            fp: grid.cell,
+            falloff: falloff,
+            tally: mesh.tally.items(),
+            verts: mesh.verts.items_mut(),
+        ),
+        groups: mesh.skin.items(),
+    )
+}
+
+/// A realization's mesh finished from its placed vertices: its quads, and its tally and draw's
+/// arguments.
+fn record_mesh(grid: Grid, scratch: mut Scratch, mesh: mut Mesh) {
+    let room = mesh.room()
+    if grid.blocks <= GROUPS_MOST {
+        // Every live block, in one dispatch: its count is the group count.
+        dispatch(
+            emit_quads.bind(
+                grid: grid,
+                room: room.vertices,
+                first: 0,
+                blocks: scratch.live.items(),
+                block_map: scratch.block_map.span(0, scratch.block_map.len()),
+                cells: scratch.cells.span(0, scratch.cells.len()),
+                quads: mut mesh.quads,
+                holes: mut mesh.holes,
+            ),
+            groups: scratch.live.count(),
+        )
+    } else {
+        let chunks = record_chunks(0, grid.blocks, mut scratch)
+        for c in 0..chunks {
+            dispatch(
+                emit_quads.bind(
+                    grid: grid,
+                    room: room.vertices,
+                    first: c * GROUPS_MOST,
+                    blocks: scratch.live.items(),
+                    block_map: scratch.block_map.span(0, scratch.block_map.len()),
+                    cells: scratch.cells.span(0, scratch.cells.len()),
+                    quads: mut mesh.quads,
+                    holes: mut mesh.holes,
+                ),
+                groups: scratch.chunks.span(start: 3 * c, count: 3),
+            )
+        }
+    }
+    dispatch(
+        finish_mesh.bind(
+            vertices: mesh.verts.count(),
+            quads: mesh.quads.count(),
+            live: scratch.live.count(),
+            holes: mesh.holes.items(),
+            vroom: room.vertices,
+            qroom: room.quads,
+            draw: mut mesh.draw,
+            skin: mut mesh.skin,
+            tally: mut mesh.tally,
+        ),
+        groups: 1,
+    )
+}
+
+// ---- the realization queue, levels of detail and mesh memory --------------------------------------
+
+/// Where an instance is this frame: its root and heading, which place its rest space.
+pub struct Placement: Copy {
+    pub at: vec3,
+    pub heading: f32,
+}
+
+/// The camera as LOD reads it: where the eye is, the view-projection, the screen's height in
+/// pixels, and how high the view is (radians).
+pub struct Eye: Copy {
+    pub at: vec3,
+    pub view_proj: mat4,
+    pub height: f32,
+    pub fovy: f32,
+}
+
+/// No level.
+pub const NO_LEVEL: u32 = 0xffffffff
+
+/// One instance a realizer looks after: its field and rest-space bounds, its mesh at each
+/// level, the level it draws, the level it should have, and how large its finest cells look.
+struct Held<F> {
+    field: F,
+    bounds: Box3,
+    meshes: Vec<Option<Mesh>>,
+    drawn: u32,
+    target: u32,
+    priority: f32,
+    visible: bool,
+    /// Its drawn mesh is to be realized again (a calibration's, or one that overflowed).
+    stale: bool,
+}
+
+/// A realization whose result is being read back: its instance and level, and whether it
+/// calibrated its level's room.
+struct Check {
+    instance: u32,
+    level: u32,
+    tally: Pending<Tally>,
+    calibration: bool,
+}
+
+/// A mesh's room after seeing a realization push `vertices` and `quads`: a quarter more, and
+/// room to spare.
+fn room_for(vertices: u32, quads: u32) -> Room {
+    Room { vertices: vertices + vertices / 4 + 1024, quads: quads + quads / 4 + 1024 }
+}
+
+/// The room a calibration realizes into: the most `grid` could hold.
+fn calibration_room(grid: Grid) -> Room {
+    Room { vertices: grid.blocks * 8, quads: grid.blocks * 8 }
+}
+
+/// A level's room, as a realizer knows it: not yet, a calibration on its way
+/// (`Realizer::calibrate`), or known.
+enum LevelRoom: Copy + Eq {
+    Unknown,
+    Calibrating,
+    Known(Room),
+}
+
+impl LevelRoom {
+    /// The room, once it's known.
+    fn room(self) -> Option<Room> {
+        match self {
+            LevelRoom::Known(room) => Some(room),
+            _ => None,
+        }
+    }
+}
+
+/// The live blocks a frame's slice of a level change takes (`Realizer::advance`).
+pub const SLICE_BLOCKS: u32 = 384
+
+/// The most slices a level change is cut into: the last takes the rest.
+pub const MAX_SLICES: u32 = 512
+
+/// A level change being realized a step a frame (`Realizer::advance`): its instance and level,
+/// its grid and mesh, the step it's at (0 culls, 1 to `slices` place a slice of the live blocks'
+/// vertices each, then it finishes) and how many slices.
+struct Slicing {
+    instance: u32,
+    level: u32,
+    grid: Grid,
+    mesh: Mesh,
+    at: u32,
+    slices: u32,
+    /// It calibrates its level's room (`Realizer::calibrate`).
+    calibration: bool,
+}
+
+/// The meshes of every instance of one creature type: realized at their levels
+/// of detail as their size on screen asks, a frame's budget at a time, the largest on screen
+/// first; a new one at its coarsest level first. Each level's room is calibrated once, from the
+/// largest grid waiting; each realization's counts are read back to catch an overflow, which
+/// grows the room and realizes the instance again. These two readbacks are presentation's alone:
+/// nothing read back drives a pass. A released mesh goes back to its level's free list.
+pub struct Realizer<F> {
+    /// The type's levels and realization settings (its look's `detail`), and how far its skin
+    /// weights fall off from each part (its look's).
+    pub detail: Detail,
+    falloff: f32,
+    held: Vec<Held<F>>,
+    rooms: Vec<LevelRoom>,
+    free: Vec<Vec<Mesh>>,
+    checks: Vec<Check>,
+    scratch: Scratch,
+    /// The level change being realized a step a frame, and its own scratch.
+    slicing: Option<Slicing>,
+    slow: Scratch,
+    /// How many readbacks it made, how many realizations, and how many holes and overflows the
+    /// readbacks found.
+    pub readbacks: u32,
+    pub realizations: u32,
+    pub holes: u32,
+    pub overflows: u32,
+}
+
+impl<F> Realizer<F> {
+    /// A realizer for a creature type drawn as `look` says.
+    pub fn new(look: CreatureLook) -> Realizer<F> {
+        let detail = look.detail
+        Realizer {
+            detail,
+            falloff: look.deform.weights.falloff,
+            held: Vec::new(),
+            rooms: Vec::filled(detail.levels.len(), LevelRoom::Unknown),
+            free: Vec::from_fn(detail.levels.len(), |_| Vec::new()),
+            checks: Vec::new(),
+            scratch: Scratch::new(1),
+            readbacks: 0,
+            realizations: 0,
+            holes: 0,
+            overflows: 0,
+            slicing: None,
+            slow: Scratch::new(1),
+        }
+    }
+
+    /// Looks after an instance whose field is `field`, its surface in `bounds` (rest space): its
+    /// number.
+    pub fn add(mut self, field: take F, bounds: Box3) -> u32 {
+        let meshes: Vec<Option<Mesh>> = Vec::from_fn(self.detail.levels.len(), |_| None)
+        self.held.push(
+            Held {
+                field,
+                bounds,
+                meshes,
+                drawn: NO_LEVEL,
+                target: NO_LEVEL,
+                priority: 0.0,
+                visible: true,
+                stale: false,
+            },
+        )
+        self.held.len() - 1
+    }
+
+    pub fn len(self) -> u32 {
+        self.held.len()
+    }
+
+    /// The level instance `i` draws, or `NO_LEVEL` before it has a mesh.
+    pub fn drawn(self, i: u32) -> u32 {
+        self.held[i].drawn
+    }
+
+    /// The level instance `i` should have.
+    pub fn target(self, i: u32) -> u32 {
+        self.held[i].target
+    }
+
+    /// Instance `i`'s field.
+    pub fn field(self, i: u32) -> borrow F {
+        self.held[i].field
+    }
+
+    /// The mesh instance `i` draws: it must have one (`drawn`).
+    pub fn mesh(self, i: u32) -> borrow Mesh {
+        borrow h = self.held[i]
+        match h.meshes[h.drawn] {
+            Some(m) => m,
+            None => panic("this instance has no mesh to draw"),
+        }
+    }
+
+    /// A slab's bytes at `level` (a mesh with that level's room), or 0 before it's calibrated.
+    pub fn slab_bytes(self, level: u32) -> u64 {
+        match self.rooms[level].room() {
+            Some(room) => Mesh::bytes_for(room),
+            None => 0,
+        }
+    }
+
+    /// Bytes its meshes take, the free lists' and the calibrations' included.
+    pub fn allocated(self) -> u64 {
+        var n: u64 = 0
+        for h in self.held {
+            for m in h.meshes {
+                if let Some(mesh) = m {
+                    n += mesh.bytes()
+                }
+            }
+        }
+        for level in self.free {
+            for m in level {
+                n += m.bytes()
+            }
+        }
+        if let Some(s) = self.slicing {
+            n += s.mesh.bytes()
+        }
+        n
+    }
+
+    /// Whether every instance draws its target level and nothing waits on a readback.
+    pub fn settled(self) -> bool {
+        if self.checks.len() > 0 {
+            return false
+        }
+        for h in self.held {
+            if h.drawn == NO_LEVEL || h.drawn != h.target || h.stale {
+                return false
+            }
+        }
+        true
+    }
+
+    /// The grid instance `i` is realized on at level `level`.
+    pub fn grid(self, i: u32, level: u32) -> Grid {
+        Grid::around(self.held[i].bounds, self.detail.levels[level].cell)
+    }
+
+    /// Instance `i`'s bounding sphere, placed at `p`: its centre and radius.
+    fn sphere(self, i: u32, p: Placement) -> (vec3, f32) {
+        let b = self.held[i].bounds
+        let (c, s) = (cos(p.heading), sin(p.heading))
+        let mid = 0.5 * (b.lo + b.hi)
+        let centre = p.at + vec3(c * mid.x + s * mid.z, mid.y, -s * mid.x + c * mid.z)
+        (centre, 0.5 * length(b.hi - b.lo))
+    }
+
+    /// How large `level`'s cells look on screen, in pixels, where a pixel is `pixel` wide.
+    fn projected(self, level: u32, pixel: f32) -> f32 {
+        self.detail.levels[level].cell / pixel
+    }
+}
+
+/// Whether a bounding sphere at `centre` of `radius` can be on screen: against the view's clip
+/// space, where `scale` is the projection's largest (a radius in clip units, at the centre's
+/// depth).
+fn on_screen(centre: vec3, radius: f32, view_proj: mat4, scale: f32) -> bool {
+    let clip = view_proj * vec4(centre, 1.0)
+    let r = radius * scale
+    clip.w > -radius && abs(clip.x) <= clip.w + r && abs(clip.y) <= clip.w + r
+}
+
+impl<C, F: Parts<C>> Realizer<F> {
+    /// This frame: the readbacks that have arrived; each instance's
+    /// target level, from how large its cells look; then the queue, realized within the budget.
+    pub fn frame(mut self, eye: Eye, placed: [Placement]) {
+        self.answer()
+        let n = min(self.held.len(), placed.len())
+        let top = self.detail.levels.len() - 1
+        let max_px = self.detail.max_cell_px
+        // The projection's largest scale, and the tangent of half the view's height: the same
+        // for every instance.
+        let m = eye.view_proj
+        let scale = max(length(vec3(m[0].x, m[1].x, m[2].x)), length(vec3(m[0].y, m[1].y, m[2].y)))
+        let half_height = tan(0.5 * eye.fovy)
+        for i in 0..n {
+            let (centre, radius) = self.sphere(i, placed[i])
+            self.held[i].visible = on_screen(centre, radius, eye.view_proj, scale)
+            // The size of a pixel at its point nearest the eye.
+            let near = max(length(centre - eye.at) - radius, 0.1)
+            let pixel = 2.0 * near * half_height / eye.height
+            // The coarsest level whose cells look small enough; the finest if none does.
+            var want = top
+            for l in 0..self.detail.levels.len() {
+                if self.projected(l, pixel) <= max_px {
+                    want = l
+                    break
+                }
+            }
+            let drawn = self.held[i].drawn
+            // Back to a coarser level only once its cells look well under the limit.
+            if drawn != NO_LEVEL && want < drawn {
+                if self.projected(want, pixel) > max_px * (1.0 - self.detail.hysteresis) {
+                    want = drawn
+                }
+            }
+            self.held[i].target = want
+            self.held[i].priority = self.projected(top, pixel)
+        }
+        // An instance this frame doesn't place isn't in it.
+        for i in n..self.held.len() {
+            self.held[i].visible = false
+        }
+        self.spend()
+    }
+
+    /// Every instance at `level`, whatever the budget, on screen or not: for still frames and
+    /// tests. A frame realizes all it can; a level whose room isn't known yet is calibrated
+    /// first, which takes a readback, answered from a later frame. Whether every instance draws
+    /// `level` now.
+    pub fn realize_all(mut self, level: u32) -> bool {
+        self.answer()
+        // A level change in progress is dropped (a calibration's, so its level calibrates again).
+        if let Some(s) = replace(mut self.slicing, None) {
+            if s.calibration {
+                self.rooms[s.level] = LevelRoom::Unknown
+            }
+            self.release(s.level, take s.mesh)
+        }
+        for i in 0..self.held.len() {
+            self.held[i].target = level
+        }
+        while self.step(force: true, off_screen: true).0 > 0.0 {}
+        self.settled()
+    }
+
+    /// Realizes the waiting instances, largest on screen first, until the budget is spent; and
+    /// with what's left, at most one new instance off screen, at its coarsest level, so a camera
+    /// that turns to it finds it drawn, and a camera that suddenly sees many new instances
+    /// doesn't ask for all of them in one frame.
+    fn spend(mut self) {
+        var spent = 0.0
+        var off_screen = 0
+        while spent < self.detail.budget_us {
+            let (cost, unseen) = self.step(force: false, off_screen: off_screen == 0)
+            if cost <= 0.0 {
+                break
+            }
+            spent += cost
+            if unseen {
+                off_screen += 1
+            }
+        }
+        self.advance()
+    }
+
+    /// The level instance `i` should realize next: its coarsest first, then its target, or its
+    /// drawn level again when that mesh is stale; none when it has its target, or is off screen
+    /// with a mesh that isn't stale. `force`: straight to its target, on screen or not.
+    fn next_level(self, i: u32, force: bool) -> u32 {
+        borrow h = self.held[i]
+        // A new instance's coarsest level, or a stale mesh again, on screen or off (off screen
+        // goes last: `step`).
+        if h.drawn == NO_LEVEL && !force {
+            return 0
+        }
+        if h.stale && h.drawn != NO_LEVEL {
+            return h.drawn
+        }
+        if (!h.visible && !force) || h.target == NO_LEVEL {
+            return NO_LEVEL
+        }
+        if h.drawn == NO_LEVEL {
+            return h.target
+        }
+        if h.drawn != h.target {
+            return h.target
+        }
+        NO_LEVEL
+    }
+
+    /// The waiting instance largest on screen and its next level (`next_level`), or `NO_LEVEL`
+    /// for both: of those with a mesh if `drawn`, else of those without one (of all if `force`,
+    /// on screen or not). One off screen goes last, and only if `off_screen`. A level whose room
+    /// is being calibrated waits.
+    fn pick(self, force: bool, off_screen: bool, drawn: bool) -> (u32, u32) {
+        var best = NO_LEVEL
+        var level = NO_LEVEL
+        var priority = -2.0
+        for i in 0..self.held.len() {
+            // One with a mesh changes level, or is realized again, a step a frame (`begin`); one
+            // without is realized whole (`step`). Forced, each is realized whole.
+            if !force && (self.held[i].drawn != NO_LEVEL) != drawn {
+                continue
+            }
+            let l = self.next_level(i, force)
+            if l == NO_LEVEL || self.rooms[l] == LevelRoom::Calibrating {
+                continue
+            }
+            // Off screen goes last, if at all.
+            let seen = self.held[i].visible || force
+            if !seen && !off_screen {
+                continue
+            }
+            let p = if seen { self.held[i].priority } else { -1.0 }
+            if p > priority {
+                priority = p
+                best = i
+                level = l
+            }
+        }
+        (best, level)
+    }
+
+    /// One realization: the waiting instance largest on screen, at its next level (calibrating
+    /// the level's room first if no one has). Its estimated cost, in microseconds, 0 when
+    /// nothing could be realized; and whether its instance is off screen.
+    fn step(mut self, force: bool, off_screen: bool) -> (f32, bool) {
+        let (best, level) = self.pick(force, off_screen, drawn: false)
+        if best == NO_LEVEL {
+            return (0.0, false)
+        }
+        let unseen = !(self.held[best].visible || force)
+        let cost = match self.rooms[level].room() {
+            None => self.calibrate(level, force),
+            Some(room) => self.realize(best, level, room),
+        }
+        (cost, unseen)
+    }
+
+    /// One step of the level change in progress, or the start of the next (`begin`): culling,
+    /// then a slice of the live blocks' vertices (`SLICE_BLOCKS`) each frame, the last slice
+    /// taking the rest, then the quads and skin weights; meanwhile the instance draws the mesh
+    /// it has. So a frame takes only a slice of a level change: when the GPU's clocks fall, a
+    /// whole realization in one frame can make that frame late.
+    /// New instances aren't spread so: they're realized whole within the budget, to draw soon.
+    fn advance(mut self) {
+        if self.slicing.is_none() && !self.begin() {
+            return
+        }
+        var s = replace(mut self.slicing, None).unwrap()
+        let i = s.instance
+        if s.at == 0 {
+            record_cull(self.held[i].field, s.grid, mut self.slow, mut s.mesh)
+        } else if s.at <= s.slices {
+            record_slice(
+                self.held[i].field,
+                s.grid,
+                slice: s.at - 1,
+                slices: s.slices,
+                scratch: mut self.slow,
+                mesh: mut s.mesh,
+            )
+        } else {
+            record_finish(self.held[i].field, s.grid, self.falloff, mut self.slow, mut s.mesh)
+            self.queue_check(i, s.level, s.mesh, s.calibration)
+            // A calibration's mesh is drawn if its instance wants the level, until it's realized
+            // again in the room the calibration finds (as `calibrate`'s).
+            if !s.calibration || self.next_level(i, force: false) == s.level {
+                self.place(i, s.level, take s.mesh, stale: s.calibration)
+            }
+            return
+        }
+        s.at += 1
+        self.slicing = Some(take s)
+    }
+
+    /// Starts the next level change: the instance largest on screen whose mesh is stale or
+    /// whose level isn't its target, else one off screen whose mesh is stale. Its level's room
+    /// is calibrated first, whole, if no one has. Whether one started.
+    fn begin(mut self) -> bool {
+        let (picked, level) = self.pick(force: false, off_screen: true, drawn: true)
+        if picked == NO_LEVEL {
+            return false
+        }
+        // A level no one has calibrated is calibrated first, a step a frame too.
+        let room = self.rooms[level].room()
+        let calibration = room.is_none()
+        let best = if calibration { self.largest(level) } else { picked }
+        let grid = self.grid(best, level)
+        let mesh = match room {
+            None => Mesh::new(calibration_room(grid)),
+            Some(room) => self.slab(level, room),
+        }
+        if calibration {
+            self.rooms[level] = LevelRoom::Calibrating
+        }
+        let slices = slices_for(grid)
+        self.slicing = Some(
+            Slicing { instance: best, level, grid, mesh, at: 0, slices, calibration },
+        )
+        true
+    }
+
+    /// Calibrates `level`'s room: the instance with the largest grid at that level, of all
+    /// of them, is realized into room for the most its grid could hold, and its counts are read
+    /// back once. Of all, not of those waiting: a larger one realized later would overflow the
+    /// room. If it's waiting for the level,
+    /// it draws that mesh until the room is known and it's realized again.
+    fn calibrate(mut self, level: u32, force: bool) -> f32 {
+        let best = self.largest(level)
+        let grid = self.grid(best, level)
+        var mesh = Mesh::new(calibration_room(grid))
+        self.rooms[level] = LevelRoom::Calibrating
+        self.record_into(best, level, grid, mut mesh, calibration: true)
+        if self.next_level(best, force) == level {
+            self.place(best, level, take mesh, stale: true)
+        }
+        f32(grid.blocks) * self.detail.levels[level].cost_us
+    }
+
+    /// The instance with the largest grid at `level`, of all of them.
+    fn largest(self, level: u32) -> u32 {
+        var best = 0
+        var blocks = 0
+        for i in 0..self.held.len() {
+            let g = self.grid(i, level)
+            if g.blocks > blocks {
+                best = i
+                blocks = g.blocks
+            }
+        }
+        best
+    }
+
+    /// Realizes instance `i` at `level` into a mesh with room `room`, which it draws from now on.
+    fn realize(mut self, i: u32, level: u32, room: Room) -> f32 {
+        let grid = self.grid(i, level)
+        var mesh = self.slab(level, room)
+        self.record_into(i, level, grid, mut mesh, calibration: false)
+        self.place(i, level, take mesh, stale: false)
+        f32(grid.blocks) * self.detail.levels[level].cost_us
+    }
+
+    /// A mesh with `level`'s room, `room`: one from its free list, or a new one.
+    fn slab(mut self, level: u32, room: Room) -> Mesh {
+        match self.free[level].pop() {
+            Some(m) => take m,
+            None => Mesh::new(room),
+        }
+    }
+
+    /// Records instance `i`'s realization at `level` into `mesh`, and the readback of what it
+    /// counted.
+    fn record_into(mut self, i: u32, level: u32, grid: Grid, mesh: mut Mesh, calibration: bool) {
+        record(self.held[i].field, grid, self.falloff, mut self.scratch, mut mesh)
+        self.queue_check(i, level, mesh, calibration)
+    }
+
+    /// The readback of what instance `i`'s realization at `level` into `mesh` counted, once its
+    /// passes are recorded.
+    fn queue_check(mut self, i: u32, level: u32, mesh: Mesh, calibration: bool) {
+        self.checks.push(
+            Check {
+                instance: i,
+                level,
+                tally: read(mesh.tally.items()),
+                calibration,
+            },
+        )
+        self.readbacks += 1
+        self.realizations += 1
+    }
+
+    /// Instance `i` draws `mesh` at `level` from now on, to be realized again if `stale`; the
+    /// mesh it drew before goes back to its level's free list, if it has that level's room.
+    fn place(mut self, i: u32, level: u32, mesh: take Mesh, stale: bool) {
+        let before = self.held[i].drawn
+        if let Some(old) = replace(mut self.held[i].meshes[level], Some(take mesh)) {
+            self.release(level, take old)
+        }
+        if before != NO_LEVEL && before != level {
+            if let Some(old) = replace(mut self.held[i].meshes[before], None) {
+                self.release(before, take old)
+            }
+        }
+        self.held[i].drawn = level
+        self.held[i].stale = stale
+    }
+
+    fn release(mut self, level: u32, mesh: take Mesh) {
+        if let Some(room) = self.rooms[level].room() {
+            if mesh.room() == room {
+                self.free[level].push(take mesh)
+            }
+        }
+    }
+
+    /// The readbacks that have arrived: a calibration sets its level's room; an overflow grows
+    /// it, and has the instance realized again.
+    fn answer(mut self) {
+        var k = 0
+        while k < self.checks.len() {
+            let Some(answer) = self.checks[k].tally.poll() else {
+                k += 1
+                continue
+            }
+            let c = self.checks.remove(k)
+            let Ok(tallies) = answer else { continue }
+            if tallies.len() == 0 {
+                continue
+            }
+            let t = tallies[0]
+            self.holes += t.holes
+            let pushed = room_for(t.pushed_vertices, t.pushed_quads)
+            if c.calibration {
+                self.rooms[c.level] = LevelRoom::Known(pushed)
+            } else if t.flags != 0 {
+                self.overflows += 1
+                let had = self.rooms[c.level].room().unwrap()
+                self.rooms[c.level] = LevelRoom::Known(
+                    Room {
+                        vertices: max(had.vertices, pushed.vertices),
+                        quads: max(had.quads, pushed.quads),
+                    },
+                )
+                self.free[c.level].clear()
+                self.held[c.instance].stale = true
+            }
+        }
+    }
+}

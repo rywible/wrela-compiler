@@ -1,0 +1,5 @@
+# A frozen copy of ui/ at dc0f28e0 (its modules and fonts, with their licences), which the
+# gameplay sketch (compiler/tests/sketches/gameplay) uses: an input of the compiler's tests,
+# never updated with ui/.
+[package]
+name = "ui"

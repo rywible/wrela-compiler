@@ -1,0 +1,242 @@
+// The herd's simulation (#43 §12): sketch 03's herd tick, without players, input or terrain
+// edits, on the ticker's thread (`engine::run`). Each tick a spatial grid of the grazers is
+// rebuilt at its start, in the buffers it had; each grazer steers by sketch 03's `herd_intent`
+// (without its threat), drawing from its own random stream; its phase advances by 0.9 dt and its
+// height follows the drawn terrain; and it casts four foot rays at the sim's terrain, whose hits
+// are sim state (they don't move the drawn feet: IK is M5's). A grazer's mass comes from a
+// physique job that its spawn asks for, due a second later. A steady tick allocates nothing.
+
+use engine::physique::adaptive_mass
+use engine::rng::{Rng, seed}
+use engine::run::{Asks, TickInput}
+use engine::sim::{Sim, SimState, Tick}
+use engine::spatial::SpatialGrid
+use grazer::{LEG0, density, grazer, params}
+use std::arena::Arena
+use std::hash::StateHash
+use std::math::PI
+use std::serialize::Serialize
+use terrain::{Terrain, height}
+
+/// How many grazers: seeds 1 to 40.
+pub const HERD: u32 = 40
+
+/// A grazer's physique is due this many ticks after its spawn: a second at 60 Hz.
+pub const PHYSIQUE_DUE: u32 = 60
+
+/// A grazer as the sim has it.
+pub struct Grazer: Sim {
+    pub seed: u32,
+    pub pos: vec3,
+    /// Radians about +y, 0 facing +z.
+    pub heading: f32,
+    pub phase: f32,
+    pub head_down: f32,
+    pub rng: Rng,
+    /// Where its feet are in its own space (x and z, at rest), and how far each foot's ray fell
+    /// to the sim's terrain (-1 for a miss).
+    pub feet: [vec2; 4],
+    pub hits: [f32; 4],
+    /// Its mass in kg, once its physique's job has answered.
+    pub mass: f32,
+}
+
+/// A physique the sim asked for: whose, when, and when it's due.
+pub struct Asked: Copy + Eq + StateHash + Serialize + SimState {
+    pub seed: u32,
+    pub tick: Tick,
+    pub due: Tick,
+}
+
+/// The herd's world: ordinary values.
+pub struct World: Sim {
+    pub tick: Tick,
+    pub grazers: Arena<Grazer>,
+    pub terrain: Terrain,
+    pub asked: Vec<Asked>,
+    /// The grazers' positions at the start of the last tick, in 10 m cells: rebuilt each tick.
+    pub herd: SpatialGrid<Grazer>,
+}
+
+impl Asks for World {
+    /// A grazer's seed: its physique comes from it alone.
+    type Ask = u32
+    /// Its mass, kg.
+    type Answer = f32
+
+    @deterministic
+    fn asks(self, tick: Tick) -> Vec<(u32, Tick)> {
+        var out: Vec<(u32, Tick)> = Vec::new()
+        for a in self.asked {
+            if a.tick == tick {
+                out.push((a.seed, a.due))
+            }
+        }
+        out
+    }
+
+    /// The spike's method (#43 §9): an adaptive octree down to a 2 cm finest cell.
+    @deterministic
+    fn work(ask: u32) -> f32 {
+        f32(adaptive_mass(grazer(ask).field(), density, 2cm).mass)
+    }
+}
+
+/// The herd at tick 0, as spike 01 places it (`herdInstances`, `rng(4242)`): an 8 × 5 grid,
+/// jittered, each grazer's heading, phase and head drawn in the spike's order, its height the
+/// drawn terrain's. Each asks for its physique.
+pub fn spawn() -> World {
+    var r = Rng::raw(4242)
+    let streams = Rng::new(seed(7))
+    var grazers: Arena<Grazer> = Arena::new()
+    var asked: Vec<Asked> = Vec::new()
+    for i in 0..HERD {
+        let row = f64(i / 8)
+        let col = f64(i % 8)
+        let x = (col - 3.5) * 4.0 + (r.next() - 0.5) * 1.6
+        let z = (row - 2.0) * 4.6 + (r.next() - 0.5) * 1.6
+        let heading = f64(PI) / 2.0 + (r.next() - 0.5) * 0.7
+        let phase = r.next()
+        let head_down = if r.next() < 0.4 { 1.0 } else { 0.2 * r.next() }
+        let g = params(i + 1)
+        var feet = [vec2(0.0); 4]
+        for l in 0..4 {
+            let f = g.joints[LEG0 + l * 4 + 3]
+            feet[l] = vec2(f32(f.x), f32(f.z))
+        }
+        let (fx, fz) = (f32(x), f32(z))
+        let _ = grazers.insert(
+            Grazer {
+                seed: i + 1,
+                pos: vec3(fx, height(fx, fz), fz),
+                heading: f32(heading),
+                phase: f32(phase),
+                head_down: f32(head_down),
+                rng: streams.split(i),
+                feet,
+                hits: [-1.0; 4],
+                mass: 0.0,
+            },
+        )
+        asked.push(Asked { seed: i + 1, tick: 0, due: PHYSIQUE_DUE })
+    }
+    World { tick: 0, grazers, terrain: Terrain::new(7), asked, herd: SpatialGrid::new(10m) }
+}
+
+/// The angle to turn from `heading` to face along `dir`, in (-π, π].
+fn turn_towards(heading: f32, dir: vec3) -> f32 {
+    var a = atan2(dir.x, dir.z) - heading
+    while a > PI {
+        a -= 2.0 * PI
+    }
+    while a <= -PI {
+        a += 2.0 * PI
+    }
+    a
+}
+
+/// What a grazer wants this tick (sketch 03's `herd_intent`, without its threat): toward the
+/// middle of the herd within 15 m (`herd`, as the tick began), wandering a little by its own
+/// stream. How fast to turn (radians a second),
+/// and to go (metres a second).
+@deterministic
+pub fn herd_intent(g: mut Grazer, herd: SpatialGrid<Grazer>) -> (f32, f32) {
+    let wander = 0.4 * (g.rng.unit() - 0.5)
+    var centre = vec3(0.0)
+    var n = 0.0
+    herd.each_within(g.pos, radius: 15m, f: |mate| {
+        centre += mate.pos
+        n += 1.0
+    })
+    let forward = vec3(sin(g.heading), 0.0, cos(g.heading))
+    let toward = if n > 1.0 { centre / n - g.pos } else { forward }
+    (0.5 * turn_towards(g.heading, toward) + wander, 60cm)
+}
+
+/// A tick: the physiques due arrive; the grid is built; each grazer steers, walks, follows the
+/// drawn ground and casts its feet's rays.
+@deterministic
+pub fn step(w: mut World, input: TickInput<World>) {
+    for a in input.answers {
+        for mut g in w.grazers {
+            if g.seed == a.ask {
+                g.mass = a.answer
+            }
+        }
+        w.asked.retain(|x| x.seed != a.ask)
+    }
+    let dt = input.dt
+    w.herd.rebuild(w.grazers, |g| g.pos) // positions at the tick's start, in last tick's buffers
+    borrow herd = w.herd
+    borrow terrain = w.terrain
+    w.grazers.par_each_mut(|g| {
+        let (turn, speed) = herd_intent(mut g, herd)
+        g.heading += turn * dt
+        let forward = vec3(sin(g.heading), 0.0, cos(g.heading))
+        let p = g.pos + forward * (speed * dt)
+        g.pos = vec3(p.x, height(p.x, p.z), p.z)
+        g.phase = fract(g.phase + 0.9 * dt)
+        // Each foot's ray: from 1.5 m above the sim terrain's own height at the foot, down.
+        let (c, s) = (cos(g.heading), sin(g.heading))
+        for l in 0..4 {
+            let f = g.feet[l]
+            let x = g.pos.x + c * f.x + s * f.y
+            let z = g.pos.z - s * f.x + c * f.y
+            let (hit, _) = terrain.raycast(
+                vec3(x, terrain.height(x, z) + 1.5m, z),
+                vec3(0.0, -1.0, 0.0),
+                10m,
+            )
+            g.hits[l] = hit
+        }
+    })
+    w.tick += 1
+}
+
+/// A grazer as the frames see it.
+pub struct Seen: Copy + Plain {
+    pub seed: u32,
+    pub pos: vec3,
+    pub heading: f32,
+    pub phase: f32,
+    pub head_down: f32,
+}
+
+/// The most grazers a snapshot holds.
+pub const MAX_SEEN: u32 = 64
+
+/// What the frames see of the world: each grazer's seed, place, heading, phase and head.
+pub struct Snap: Copy + Plain {
+    pub grazers: Bounded<Seen, MAX_SEEN>,
+}
+
+@deterministic
+pub fn snapshot(w: World) -> Snap {
+    var out = Snap { grazers: Bounded::new() }
+    for g in w.grazers {
+        if !out.grazers.is_full() {
+            out.grazers.push(
+                Seen {
+                    seed: g.seed,
+                    pos: g.pos,
+                    heading: g.heading,
+                    phase: g.phase,
+                    head_down: g.head_down,
+                },
+            )
+        }
+    }
+    out
+}
+
+/// A grazer `alpha` of the way from `a` to `b`: places and heads straight, headings and phases
+/// the short way round.
+pub fn between(a: Seen, b: Seen, alpha: f32) -> Seen {
+    Seen {
+        seed: a.seed,
+        pos: mix(a.pos, b.pos, vec3(alpha)),
+        heading: engine::present::lerp_angle(a.heading, b.heading, alpha),
+        phase: engine::present::lerp_phase(a.phase, b.phase, alpha),
+        head_down: mix(a.head_down, b.head_down, alpha),
+    }
+}

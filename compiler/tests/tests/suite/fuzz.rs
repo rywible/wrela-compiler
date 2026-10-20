@@ -1,5 +1,6 @@
-//! A fuzz test (AC9): mutated programs must not crash the compiler. Every `.wrela` file in the
-//! repository is a seed. Each case applies a few random edits (deleting, duplicating or swapping
+//! A fuzz test (AC9): mutated programs must not crash the compiler. Every `.wrela` file under
+//! compiler/ is a seed: std, the tests' programs, and their frozen copies of engine-scale
+//! programs (compiler/tests/frozen). Each case applies a few random edits (deleting, duplicating or swapping
 //! spans, inserting tokens that often matter, and inserting deeply nested or very long
 //! constructs that probe the compiler's limits) and runs the whole pipeline, checking and
 //! building.
@@ -203,9 +204,8 @@ fn uses_tiers_1_2(text: &str) -> bool {
 
 /// Small real programs provide syntax and semantic variety without full-scene compilation.
 fn corpus() -> Vec<String> {
-    let corpus: Vec<String> = ["compiler", "content", "examples", "games"]
-        .iter()
-        .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
+    let corpus: Vec<String> = files_under(&repo_root().join("compiler"), &["wrela"])
+        .into_iter()
         .map(|p| std::fs::read_to_string(p).expect("read"))
         .filter(|t| t.len() <= 8192)
         .collect();
@@ -214,10 +214,9 @@ fn corpus() -> Vec<String> {
 }
 
 #[test]
-fn the_repository_has_seeds_using_tiers_1_and_2() {
-    let all: Vec<String> = ["compiler", "content", "examples", "games"]
-        .iter()
-        .flat_map(|dir| files_under(&repo_root().join(dir), &["wrela"]))
+fn the_compiler_has_seeds_using_tiers_1_and_2() {
+    let all: Vec<String> = files_under(&repo_root().join("compiler"), &["wrela"])
+        .into_iter()
         .map(|p| std::fs::read_to_string(p).expect("read"))
         .collect();
     let t12: Vec<&String> = all.iter().filter(|t| uses_tiers_1_2(t)).collect();

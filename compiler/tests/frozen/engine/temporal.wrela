@@ -1,0 +1,449 @@
+// Temporal AA and upscaling: the scene, drawn at a lower resolution and jittered within its
+// pixel each frame (Halton 2, 3), is brought up to the output's resolution by keeping a history
+// at that resolution. Each output pixel reconstructs this frame's colour from the
+// nearest samples (weighted by how near each falls), reprojects the history to where its point
+// was last frame (by the motion target where something moved, else by its depth and the
+// camera), clips that history to this frame's neighbourhood of colours, and blends.
+//
+// What moves is what the motion targets say moved, this frame's and the last's: a pixel that
+// doesn't move takes none of a moving sample's colour, and where something moved off a pixel
+// its history is left behind. Nothing here knows what moves (a creature, a herd, a rolling
+// stone): what draws motion is treated as moving.
+//
+// The scene's alpha is a tag (what a pixel shows: its class times 64, plus which one), which
+// can't be blended: the output keeps the nearest sample's.
+//
+// The box is a scene pixel's 3 × 3 samples' (a 2 × 2 spread is narrow and noisy: its box lets
+// through less of a right history and more of a wrong one). Below the output's size, each scene
+// pixel's is found once, by a kernel (`neighbourhoods`), and the output's pixels read their
+// nearest's (`resolve`): at half the output's size four of them share each one. At the output's
+// size each output pixel has its own, and gathers it itself (`resolve_gathered`).
+
+use std::gpu::{DepthTexture, FragCoord, GlobalId, Rgba16Float, Sampler, Texels, Texture}
+use view::{Camera, class_of, thin}
+
+/// What the resolve reads besides the textures: the scene camera (at the scene's size), the
+/// output's size, how much of this frame a pixel takes when a sample falls on it, and whether
+/// there's a history yet.
+pub struct Resolve: Copy + GpuData {
+    pub cam: Camera,
+    pub out: vec2,
+    pub blend: f32,
+    pub fresh: u32,
+    /// How the jitter shifted the scene's samples in their pixels (in the scene's pixels:
+    /// `view::jitter_of` the camera's frame, a still camera's too), found once a frame; and
+    /// how it shifted the frame before's.
+    pub jitter: vec2,
+    pub last_jitter: vec2,
+    /// Where on the output anything that moves can be, now or last frame (a rectangle, its
+    /// corners in output pixels: `seen_box` of the moving things' bounds; empty for none):
+    /// where last frame's motion is checked for what moved off a pixel.
+    pub moving: vec4,
+    /// How many frames the camera has held still before this one (`held`; 0 when it moved):
+    /// a settled view's history gathers more frames (`SETTLED`).
+    pub settled: f32 = 0.0,
+}
+
+/// The least share of a frame a settled view's pixel takes: its history is the mean of about
+/// this many frames' samples (1 / this), not the last few's. Each of the levels' and the near
+/// fades' dithers steps through its 16 places over the jitter's cycle (`lod::anchor`), and a
+/// history of a few frames' (`Resolve::blend`) weighted the last of them most, so a settled
+/// still kept the pattern as a screen over crowns and trunks. A mean of 16 cycles' frames evens
+/// it: each of the jitter's offsets meets each of the pattern's places (`lod::anchor`; a mean of
+/// 64 frames left a grain on pale leaves). What changes in a settled view (a tile streaming in,
+/// a leaf in the wind) is still clipped to this frame's neighbourhood, so it doesn't trail.
+pub const SETTLED: f32 = 256.0
+
+/// Whether `cam` sees just what it saw last frame (its view and projection held, its jitter
+/// aside): a settled view (`Resolve::settled`).
+pub fn held(cam: Camera) -> bool {
+    let (a, b) = (cam.view_proj, cam.last_view_proj)
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+}
+
+/// The rectangle on the output (`out` pixels) round the world's box `lo` to `hi` as `cam` sees
+/// it now and saw it last frame, `margin` pixels wider each way; the whole output if a corner is
+/// behind the eye either time.
+pub fn seen_box(cam: Camera, out: vec2, lo: vec3, hi: vec3, margin: f32) -> vec4 {
+    let scale = out / cam.screen
+    var a = vec2(1.0e9)
+    var b = vec2(-1.0e9)
+    for i in 0..8 {
+        let p = vec3(
+            if (i & 1) == 0 { lo.x } else { hi.x },
+            if (i & 2) == 0 { lo.y } else { hi.y },
+            if (i & 4) == 0 { lo.z } else { hi.z },
+        )
+        let now = cam.view_proj * vec4(p, 1.0)
+        let then = cam.last_view_proj * vec4(p, 1.0)
+        if now.w <= 1.0e-3 || then.w <= 1.0e-3 {
+            return vec4(0.0, 0.0, out)
+        }
+        let (x, y) = (cam.pixel(p) * scale, cam.last_pixel(p) * scale)
+        a = min(a, min(x, y))
+        b = max(b, max(x, y))
+    }
+    vec4(a - vec2(margin), b + vec2(margin))
+}
+
+/// Luma and chroma (YCoCg): colours compared and clipped here, where a box fits them better.
+fn to_ycocg(c: vec3) -> vec3 {
+    vec3(
+        0.25 * c.r + 0.5 * c.g + 0.25 * c.b,
+        0.5 * c.r - 0.5 * c.b,
+        -0.25 * c.r + 0.5 * c.g - 0.25 * c.b,
+    )
+}
+
+fn from_ycocg(c: vec3) -> vec3 {
+    vec3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z)
+}
+
+/// A colour squashed so a bright sample doesn't dominate its neighbours' mean.
+fn tamed(c: vec3) -> vec3 {
+    c / (1.0 + max(c.r, max(c.g, c.b)))
+}
+
+fn untamed(c: vec3) -> vec3 {
+    c / max(1.0 - max(c.r, max(c.g, c.b)), 1.0e-4)
+}
+
+/// The scene pixel `at`'s neighbourhood, its 3 × 3 samples (tamed, in YCoCg): their mean and how
+/// much of them thin geometry covers (grass, leaves, flowers), and their spread and which classes
+/// they show (a bit each).
+fn neighbourhood(scene: Texture<Rgba16Float>, at: vec2i) -> (vec4, vec4) {
+    let size = vec2i(i32(scene.width()), i32(scene.height()))
+    var m1 = vec3(0.0)
+    var m2 = vec3(0.0)
+    var covered = 0.0
+    var seen: u32 = 0
+    for dy in 0..3 {
+        for dx in 0..3 {
+            let p = clamp(at + vec2i(dx - 1, dy - 1), vec2i(0), size - vec2i(1))
+            let texel = scene.load(x: u32(p.x), y: u32(p.y))
+            let y = to_ycocg(tamed(max(texel.rgb, vec3(0.0))))
+            m1 += y
+            m2 += y * y
+            let class = class_of(texel.a)
+            seen = seen | (1 << class)
+            if thin(class) {
+                covered += 1.0
+            }
+        }
+    }
+    let mean = m1 / 9.0
+    let sigma = sqrt(max(m2 / 9.0 - mean * mean, vec3(0.0)))
+    (vec4(mean, covered / 9.0), vec4(sigma, f32(seen)))
+}
+
+/// Each scene pixel's neighbourhood (`neighbourhood`) into `means` and `spreads`, both the
+/// scene's size, for `resolve`: found once a scene pixel, which pays where output pixels share
+/// scene pixels (a scene drawn below the output's size). At the output's size each output pixel
+/// has its own, and `resolve_gathered` finds it itself.
+@compute(8, 8)
+pub fn neighbourhoods(
+    scene: Texture<Rgba16Float>,
+    means: mut Texels<Rgba16Float>,
+    spreads: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    let (mean, spread) = neighbourhood(scene, vec2i(i32(id.x), i32(id.y)))
+    means.store(id, mean)
+    spreads.store(id, spread)
+}
+
+/// The history at `px` (output pixels), filtered by a Catmull-Rom spline in 5 taps (bilinear
+/// taps placed to give its weights), so a moving history stays sharp.
+fn history_at(history: Texture<Rgba16Float>, s: Sampler, px: vec2, size: vec2) -> vec3 {
+    let pos = px - vec2(0.5)
+    let c = floor(pos) + vec2(0.5)
+    let f = pos - floor(pos)
+    let w0 = f * (vec2(-0.5) + f * (vec2(1.0) - 0.5 * f))
+    let w1 = vec2(1.0) + f * f * (vec2(-2.5) + 1.5 * f)
+    let w2 = f * (vec2(0.5) + f * (vec2(2.0) - 1.5 * f))
+    let w3 = f * f * (vec2(-0.5) + 0.5 * f)
+    let w12 = w1 + w2
+    let o12 = w2 / w12
+    let t0 = (c - vec2(1.0)) / size
+    let t3 = (c + vec2(2.0)) / size
+    let t12 = (c + o12) / size
+    var r = vec3(0.0)
+    r += history.sample_level(s, vec2(t12.x, t0.y)).rgb * (w12.x * w0.y)
+    r += history.sample_level(s, vec2(t0.x, t12.y)).rgb * (w0.x * w12.y)
+    r += history.sample_level(s, vec2(t12.x, t12.y)).rgb * (w12.x * w12.y)
+    r += history.sample_level(s, vec2(t3.x, t12.y)).rgb * (w3.x * w12.y)
+    r += history.sample_level(s, vec2(t12.x, t3.y)).rgb * (w12.x * w3.y)
+    let total = w12.x * w0.y + w0.x * w12.y + w12.x * w12.y + w3.x * w12.y + w12.x * w3.y
+    max(r / total, vec3(0.0))
+}
+
+/// The scene pixel whose sample falls nearest the output pixel at `pixel`'s centre.
+fn nearest(r: Resolve, pixel: FragCoord) -> vec2i {
+    let in_size = r.cam.screen
+    let q = pixel.position.xy * (in_size / r.out)
+    let lim = vec2i(i32(in_size.x) - 1, i32(in_size.y) - 1)
+    clamp(vec2i(floor(q + r.jitter)), vec2i(0), lim)
+}
+
+/// The output pixel at `pixel`: this frame's samples reconstructed there, blended with the
+/// history reprojected and clipped. Its alpha is the nearest sample's tag. `motion` is this
+/// frame's motion target and `last_motion` the frame before's (`motion_of`); `means` and
+/// `spreads` are the scene's neighbourhoods (`neighbourhoods`), for a scene drawn below the
+/// output's size.
+@fragment
+pub fn resolve(
+    pixel: FragCoord,
+    r: Resolve,
+    scene: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    last_depth: DepthTexture,
+    motion: Texture<Rgba16Float>,
+    last_motion: Texture<Rgba16Float>,
+    history: Texture<Rgba16Float>,
+    means: Texture<Rgba16Float>,
+    spreads: Texture<Rgba16Float>,
+    s: Sampler,
+) -> vec4 {
+    let near = nearest(r, pixel)
+    let hood = means.load(x: u32(near.x), y: u32(near.y))
+    let spread = spreads.load(x: u32(near.x), y: u32(near.y))
+    resolved(pixel, r, scene, depth, last_depth, motion, last_motion, history, hood, spread, s)
+}
+
+/// `resolve` for a scene drawn at the output's size, which finds its nearest sample's
+/// neighbourhood itself: each output pixel has its own, so a pass that stored them all would
+/// write and read them back for nothing (36% of the resolve's time at 1280 × 720 on a Radeon
+/// iGPU). Its neighbourhood is held in 32 bits, not stored in half floats, so it clips a
+/// little differently (within 1/255 on the tests' scene).
+@fragment
+pub fn resolve_gathered(
+    pixel: FragCoord,
+    r: Resolve,
+    scene: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    last_depth: DepthTexture,
+    motion: Texture<Rgba16Float>,
+    last_motion: Texture<Rgba16Float>,
+    history: Texture<Rgba16Float>,
+    s: Sampler,
+) -> vec4 {
+    let (hood, spread) = neighbourhood(scene, nearest(r, pixel))
+    resolved(pixel, r, scene, depth, last_depth, motion, last_motion, history, hood, spread, s)
+}
+
+/// The output pixel at `pixel` (`resolve`), its nearest sample's neighbourhood `hood` and
+/// `spread` (`neighbourhood`): this frame's samples reconstructed there, blended with the
+/// history reprojected and clipped. Its alpha is the nearest sample's tag. `motion` is this
+/// frame's motion target and `last_motion` the frame before's (`motion_of`).
+fn resolved(
+    pixel: FragCoord,
+    r: Resolve,
+    scene: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    last_depth: DepthTexture,
+    motion: Texture<Rgba16Float>,
+    last_motion: Texture<Rgba16Float>,
+    history: Texture<Rgba16Float>,
+    hood: vec4,
+    spread: vec4,
+    s: Sampler,
+) -> vec4 {
+    let cam = r.cam
+    let in_size = cam.screen
+    let scale = in_size / r.out
+    // This output pixel's centre in the scene's pixels.
+    let q = pixel.position.xy * scale
+    // The samples were taken at their pixels' centres, the image shifted by the jitter: sample
+    // (i, j) shows what's at (i + 0.5, j + 0.5) - jitter, unjittered.
+    let j = r.jitter
+    // The four samples round the point, which a bilinear reconstruction would read.
+    let base = vec2i(floor(q + j - vec2(0.5)))
+    let lim = vec2i(i32(in_size.x) - 1, i32(in_size.y) - 1)
+    let near = nearest(r, pixel)
+    let z = depth.load(x: u32(near.x), y: u32(near.y))
+    // Thin geometry and silhouettes against the sky represent coverage, not one opaque
+    // surface. Their jittered samples must include the background and retain that history:
+    // depth can alternate each frame at the same point without either surface moving.
+    let classes = u32(spread.w + 0.5)
+    let coverage = hood.w > 0.0 || ((classes & 1) != 0 && classes != 1)
+    var sum = vec3(0.0)
+    var weight = 0.0
+    var sum_else = vec3(0.0)
+    var weight_else = 0.0
+    var nearest = 0.0
+    var tag = 0.0
+    var moving = false
+    var moved = vec4(0.0)
+    for dy in 0..2 {
+        for dx in 0..2 {
+            let p = clamp(base + vec2i(dx, dy), vec2i(0), lim)
+            let texel = scene.load(x: u32(p.x), y: u32(p.y))
+            let c = tamed(max(texel.rgb, vec3(0.0)))
+            let pos = vec2(p) + vec2(0.5) - j
+            // How far it falls, in output pixels. The history gathers the other subpixel
+            // samples over the jitter's cycle.
+            let d = (pos - q) / scale
+            let sample_depth = depth.load(x: u32(p.x), y: u32(p.y))
+            // A reconstruction filter must not mix an opaque surface with geometry well
+            // behind it. Keep the nearest sample's surface across large depth breaks; small
+            // changes on a slope still filter. Jittered frames supply silhouette coverage.
+            let same_surface = abs(sample_depth - z) <= max(max(sample_depth, z) * 0.2, 1.0e-7)
+            // A compact tent is zero at its boundary and interpolates exact scene samples.
+            // The previous four-tap Gaussian truncated a nonzero weight there, biasing an
+            // aligned native sample toward its right and lower neighbours. Keep a little
+            // overlap even when an output pixel spans less than half a scene pixel. Thin
+            // silhouettes keep wider support to reconstruct partial background coverage. Never
+            // extend past the four-tap footprint, including when reducing scene resolution.
+            let support = if coverage { 0.8 } else { 0.55 }
+            let radius = min(vec2(1.0) / scale, max(vec2(1.0), support / scale))
+            let tent = max(vec2(1.0) - abs(d) / radius, vec2(0.0))
+            let w = if coverage || same_surface { tent.x * tent.y } else { 0.0 }
+            sum += c * w
+            weight += w
+            // And all but the moving ones' (see `current`).
+            let m = motion.load(x: u32(p.x), y: u32(p.y))
+            let moves = m.z > 0.5
+            let still = if moves { 0.0 } else { w }
+            sum_else += c * still
+            weight_else += still
+            if w >= nearest {
+                nearest = w
+                tag = texel.a
+                moving = moves
+                moved = m
+            }
+        }
+    }
+    // A pixel whose nearest sample doesn't move takes none of the moving samples: a creature's
+    // colour in a pixel of the ground would trail once the creature walked on, as the pixel's
+    // history says the ground. (A moving thing's own pixels take every sample, so its edge
+    // stays smooth from within.)
+    let current = if moving {
+        sum / max(weight, 1.0e-6)
+    } else {
+        sum_else / max(weight_else, 1.0e-6)
+    }
+    // Reproject the same surface that supplied the nearest colour and tag. Taking the
+    // closest of the four depths instead borrowed a foreground edge's motion for the
+    // background beside it, smearing distant detail when the camera moved.
+    var expected_depth = 0.0
+    // Where this pixel's point was last frame, in output pixels.
+    var last = vec2(0.0)
+    // Thin geometry the wind bends (`deforming_of`): its point's own motion, the camera's with
+    // it, where the history there showed thin geometry too. Grass a cloak pushes aside points
+    // back at where the cloak was: there it's reprojected by the camera, as before. It's still
+    // to everything else here, so its coverage blends as before.
+    let bent = (q - moved.xy) / scale
+    let deforming = moved.z > 0.25 &&
+        moved.z <= 0.5 &&
+        coverage &&
+        bent.x >= 0.0 &&
+        bent.y >= 0.0 &&
+        bent.x < r.out.x &&
+        bent.y < r.out.y &&
+        thin(class_of(history.load(x: u32(bent.x), y: u32(bent.y)).a))
+    if moved.z > 0.5 || deforming {
+        last = bent
+    } else if z > 0.0 {
+        let world = cam.unjittered().world_at(q, z)
+        let previous = cam.last_view_proj * vec4(world, 1.0)
+        expected_depth = previous.z / previous.w
+        last = cam.last_pixel(world) / scale
+    } else {
+        // The sky: a direction, so only the camera's turn moves it.
+        last = cam.last_pixel(cam.eye + cam.unjittered().ray(q) * 1.0e5) / scale
+    }
+    let inside = last.x >= 0.0 && last.y >= 0.0 && last.x < r.out.x && last.y < r.out.y
+    if r.fresh != 0 || !inside {
+        return vec4(untamed(current), tag)
+    }
+    // Colour clipping alone cannot reject an old surface whose colour still occurs in the
+    // neighbourhood. Check the old depths at the reprojected point first. Any of its four
+    // jittered samples may represent this surface at an edge; a two-percent tolerance lets
+    // a sloped surface move within a pixel. Explicit object motion owns its reprojection.
+    if !moving && !coverage {
+        let old_base = vec2i(floor(last * scale + r.last_jitter - vec2(0.5)))
+        var matches = false
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let p = clamp(old_base + vec2i(dx, dy), vec2i(0), lim)
+                let old = last_depth.load(x: u32(p.x), y: u32(p.y))
+                matches = matches || abs(old - expected_depth) <= max(expected_depth * 0.02, 1.0e-7)
+            }
+        }
+        if !matches {
+            return vec4(untamed(current), tag)
+        }
+    }
+    let prev = tamed(history_at(history, s, last, r.out))
+    // What the history showed there: if nothing round the pixel shows it now (a creature that
+    // walked on), it's left behind, and the box isn't widened for it; nor beside anything that
+    // moves (a widened box beside the creature lets its colour into the history, to trail).
+    let was = class_of(history.load(x: u32(last.x), y: u32(last.y)).a)
+    let still_seen = ((u32(spread.w + 0.5) >> was) & 1) != 0 && moved.z < 0.5
+    // Clip the history to the box of this frame's neighbourhood (its mean and spread), wider
+    // where thin geometry covers part of it: up to 1.75 spreads where it's half covered.
+    let cover = hood.w
+    let gamma = 1.0 + if still_seen { 3.0 * cover * (1.0 - cover) } else { 0.0 }
+    let lo = hood.xyz - spread.xyz * gamma
+    let hi = hood.xyz + spread.xyz * gamma
+    let h = to_ycocg(prev)
+    let centre = 0.5 * (hi + lo)
+    let extent = max(0.5 * (hi - lo), vec3(1.0e-5))
+    let off = h - centre
+    let unit = abs(off / extent)
+    let most = max(unit.x, max(unit.y, unit.z))
+    let clipped = if most > 1.0 { centre + off / most } else { h }
+    // This frame's share: more where a sample fell near the pixel's centre. Where the history
+    // showed something moving and the pixel doesn't move now, it moved off: this frame's alone
+    // (the box round an edge holds its colours, which would let it trail). The history showed
+    // it if any of the four texels round the point did: they carry most of its filtered colour
+    // (`history_at`). A history texel showed what its nearest sample showed last frame (as
+    // `tag` here), so last frame's motion there says whether that moved. Only where something
+    // moving can be (`Resolve::moving`), so the other pixels don't pay for the loads.
+    var left = false
+    let px = pixel.position.xy
+    let c = r.moving
+    let inside = px.x >= c.x && px.y >= c.y && px.x <= c.z && px.y <= c.w
+    if inside && !moving {
+        let core = vec2i(floor(last - vec2(0.5)))
+        for dy in 0..2 {
+            for dx in 0..2 {
+                let t = vec2(core + vec2i(dx, dy)) + vec2(0.5)
+                let sample = clamp(vec2i(floor(t * scale + r.last_jitter)), vec2i(0), lim)
+                left = left || last_motion.load(x: u32(sample.x), y: u32(sample.y)).z > 0.5
+            }
+        }
+    }
+    // In a settled view, a pixel that doesn't move takes the mean of the frames since the view
+    // settled, up to `SETTLED` of them.
+    let settling = if r.settled > 0.0 && moved.z < 0.5 {
+        max(1.0 / (r.settled + 1.0), 1.0 / SETTLED)
+    } else {
+        1.0
+    }
+    let a = if left { 1.0 } else {
+        min(clamp(r.blend * nearest * 1.6, r.blend * 0.25, 0.5), settling)
+    }
+    let out = mix(from_ycocg(clipped), current, vec3(a))
+    vec4(untamed(max(out, vec3(0.0))), tag)
+}
+
+/// What the motion target holds: in a pixel something moved in, where it was last frame
+/// relative to now (scene pixels, `now - last`), and 1 in z; in a pixel of thin geometry the wind
+/// bends (`deforming_of`), the same with 0.5 in z; elsewhere 0 (the camera's own motion is found
+/// from the depth).
+pub fn motion_of(cam: Camera, world: vec3, last_world: vec3) -> vec4 {
+    let now = cam.pixel(world)
+    let then = cam.last_pixel(last_world)
+    vec4(now - then, 1.0, 1.0)
+}
+
+/// `motion_of` for thin geometry the wind bends (grass): 0.5 in z, so a resolve reprojects its
+/// pixels by it but treats them as still otherwise (its samples blend with what's beside them,
+/// and nothing is left behind where it was).
+pub fn deforming_of(cam: Camera, world: vec3, last_world: vec3) -> vec4 {
+    let now = cam.pixel(world)
+    let then = cam.last_pixel(last_world)
+    vec4(now - then, 0.5, 1.0)
+}

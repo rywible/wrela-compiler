@@ -1,8 +1,8 @@
 # Sketch 02, "drawing the grazer" (compiler/tests/tests/suite/sketches.rs). Its code is the
-# engine's: engine/render.wrela. This program draws sketch 01's grazer with it.
+# engine's: render.wrela, in its frozen copy (compiler/tests/frozen/engine). This program draws sketch 01's grazer with it.
 [package]
 name = "drawing"
 
 [dependencies]
-engine = { path = "../../../../engine" }
+engine = { path = "../../frozen/engine" }
 grazer = { path = "../01-creature" }

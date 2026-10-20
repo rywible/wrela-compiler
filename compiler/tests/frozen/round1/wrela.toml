@@ -1,0 +1,4 @@
+# A frozen copy of content/round1 at dc0f28e0: round 1's helpers ported to wrela, which the frozen
+# wolf and grazer use. An input of the compiler's tests, never updated with content/.
+[package]
+name = "round1"

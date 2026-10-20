@@ -1,0 +1,1031 @@
+// Stones and rocks: fields realized to meshes at load, then drawn each frame from the meshes.
+//
+// A stone is a displaced, faceted oval (`stone`); a bed (`Bed`) and a block (`Block`) are
+// jointed rock. Each is a creature of one bone, so the engine's realization makes its mesh at
+// load, as it does a creature's, with its normals and colours cooked in (`realize_stone`,
+// `realize_bed`, `realize_block`). Each frame draws from the meshes, so no field is evaluated per
+// vertex or per pixel. `Rocks` draws many placements of a few prototypes, one instanced draw for
+// each kind and level.
+
+use character::colours
+use creature::{Creature, Skeleton, creature}
+use light::{Lit}
+use lit::{Lighting, shown, sun_and_gloss}
+use look::{CreatureLook, Mesh as Tolerance}
+use noise::{hash3, noise3, rand}
+use realize::{Mesh, SkinVertex, realize_rigid}
+use render::{ByChannels, Shaded}
+use std::derive::Box3
+use std::derive::Interval
+use std::field::{Blend, Fbm, Noise, Surface, VALUE_NOISE_LIPSCHITZ, fbm, oval, value_noise}
+use std::gpu::{
+    ClipPosition, DrawIndexedArgs, Flat, FragCoord, GlobalId, GpuBuffer, InstanceIndex, RenderPass,
+    Slots, Unorm8x4, VertexIndex, buffer, discard, dispatch, draw, write,
+}
+use std::math::TAU
+use std::transform::{rotate_y, translate}
+use view::{Camera, ROCK}
+
+/// What a point of a stone carries: its colour (linear).
+pub struct Rock: Copy + GpuData + Blend {
+    pub albedo: vec3,
+}
+
+impl Shaded for Rock {
+    fn albedo(self) -> vec3 {
+        self.albedo
+    }
+
+    fn roughness(self) -> f32 {
+        0.8
+    }
+}
+
+/// A stone's flat faces: the half-spaces it's cut by (each `dot(p, n) < w` for `n` in xyz),
+/// their intersection's distance.
+pub struct Facets: Copy + GpuData {
+    pub planes: [vec4; 7],
+}
+
+impl Surface for Facets {
+    fn distance(self, p: vec3) -> f32 {
+        var d = -1.0e9
+        for q in self.planes {
+            d = max(d, dot(p, q.xyz) - q.w)
+        }
+        d
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// A stone's colour at a point of it, `r` across, seed `seed`: grey granite with a grain, each
+/// facet a little its own tone, lichen in broad faint crusts where it faces the sky, and moss on
+/// its top (round lichen spots and a noise's crack lines read as a leopard's and a maze).
+pub struct Stain: Copy + GpuData {
+    pub r: f32,
+    pub seed: f32,
+}
+
+/// Granite's grain at `q` (0 to 1): three octaves, the coarsest the strongest.
+pub fn grain(q: vec3) -> f32 {
+    0.5 * noise3(q) + 0.3 * noise3(q * 3.1) + 0.2 * noise3(q * 9.7)
+}
+
+impl Stain {
+    pub fn at(self, p: vec3) -> Rock {
+        let q = p * (6.0 / self.r) + vec3(self.seed)
+        var c = mix(vec3(0.22, 0.21, 0.20), vec3(0.36, 0.34, 0.31), vec3(grain(q)))
+        // A fine speckle at a fixed scale, whatever the stone's size, faint.
+        c *= 0.94 + 0.12 * noise3(p * 9.0 + vec3(self.seed))
+        // Warmer and cooler in broad patches across it.
+        c *= mix(
+            vec3(0.95, 0.98, 1.03),
+            vec3(1.05, 1.0, 0.93),
+            vec3(noise3(p * (1.2 / self.r) + vec3(self.seed * 0.7))),
+        )
+        let top = p.y / self.r
+        let crust = 0.7 * noise3(p * 1.1 + vec3(5.0, 2.0, 1.0) + vec3(self.seed)) +
+            0.3 * noise3(p * 4.0 + vec3(self.seed))
+        let lichen = smoothstep(0.5, 0.75, crust) * smoothstep(-0.2, 0.4, top)
+        c = mix(c, vec3(0.42, 0.41, 0.30), vec3(lichen * 0.4))
+        let moss = smoothstep(0.25, 0.65, top + 0.35 * (noise3(p * 2.5 + vec3(self.seed)) - 0.5))
+        Rock { albedo: mix(c, vec3(0.10, 0.14, 0.035), vec3(moss * 0.6)) }
+    }
+}
+
+/// A stone's field: an oval `radius` across, squashed by `squash`, lumpy (fractal noise), cut
+/// by seven planes into facets, as weathered granite splits; and its colour.
+pub type StoneField = std::field::Field<Rock>
+
+/// A stone `radius` across, squashed by `squash`, seed `seed`, as a field.
+pub fn stone_field(radius: f32, squash: vec3, seed: u32) -> StoneField {
+    var planes = [vec4(0.0); 7]
+    for k in 0..7 {
+        let a = TAU * rand(seed, 20 + k)
+        let z = rand(seed, 40 + k) * 1.6 - 0.5
+        let n = normalize(vec3(cos(a), z, sin(a)))
+        let h = radius * (0.78 + 0.18 * rand(seed, 60 + k))
+        planes[k] = vec4(n * squash, h)
+    }
+    let stain = Stain { r: radius, seed: f32(seed) * 3.1 }
+    // Lumps at its own scale, and the rock's own roughness at a fixed one (a big stone, smooth
+    // at its own scale alone, read as clay in the lookbook).
+    oval(squash * radius)
+        .displace(
+            fbm(freq: 1.7 / radius, octaves: 3, offset: vec3(f32(seed) * 3.1)),
+            amp: 0.14 * radius,
+        )
+        .displace(fbm(freq: 2.2, octaves: 2, offset: vec3(f32(seed) * 1.7)), amp: 0.045)
+        .intersect(Facets { planes })
+        .with_at(|p| stain.at(p))
+}
+
+/// A stone as a creature of one bone (at its centre), to realize.
+pub type Stone = Creature<Rock>
+
+pub fn stone(radius: f32, squash: vec3, seed: u32) -> Stone {
+    var s = Skeleton::new()
+    let root = s.root("stone", vec3(0.0))
+    // Its box: the oval's, grown by the lumps' reach (its facets bound nothing of their own).
+    let half = squash * radius * 1.2 + vec3(0.02)
+    creature(s).part(root, stone_field(radius, squash, seed)).bounded(Box3 { lo: -half, hi: half })
+}
+
+/// A stone realized: its mesh, its colours, and where it is (its rest space to the world).
+pub struct Realized {
+    pub mesh: Mesh,
+    pub colours: GpuBuffer<Unorm8x4>,
+    pub at: mat4,
+    pub seed: u32,
+}
+
+/// A placement borrows one mesh from its owner. Its enclosing sphere is in world space.
+pub struct Placement: Copy {
+    pub prototype: u32,
+    pub at: mat4,
+    pub normal_at: mat3,
+    pub reach: f32,
+    pub seed: u32,
+}
+
+/// Repeated rigid stones: a small set of owned GPU meshes and plain placement data.
+pub struct Instances {
+    pub prototypes: Vec<Realized>,
+    pub placements: Vec<Placement>,
+}
+
+impl Instances {
+    pub fn shift(mut self, delta: vec3) {
+        for mut p in self.placements {
+            p.at[3] = vec4(p.at[3].xyz + delta, 1.0)
+        }
+    }
+}
+
+impl Placement {
+    /// Whether this sphere meets an orthographic shadow volume (clip z is 0 to 1).
+    pub fn casts_into(self, view: mat4) -> bool {
+        let p = view * vec4(self.at[3].xyz, 1.0)
+        let r = self.reach *
+            vec3(
+                length(vec3(view[0].x, view[1].x, view[2].x)),
+                length(vec3(view[0].y, view[1].y, view[2].y)),
+                length(vec3(view[0].z, view[1].z, view[2].z)),
+            )
+        abs(p.x) <= 1.0 + r.x && abs(p.y) <= 1.0 + r.y && p.z >= -r.z && p.z <= 1.0 + r.z
+    }
+}
+
+/// A normal transforms by the inverse transpose, including when instances squash a mesh.
+pub fn normal_matrix(at: mat4) -> mat3 {
+    let a = at[0].xyz
+    let b = at[1].xyz
+    let c = at[2].xyz
+    let cofactor = mat3(cross(b, c), cross(c, a), cross(a, b))
+    let determinant = dot(a, cross(b, c))
+    mat3(cofactor[0] / determinant, cofactor[1] / determinant, cofactor[2] / determinant)
+}
+
+@test
+fn stone_instance_normals_stay_perpendicular_after_squashing() {
+    let at = translate(vec3(4.0, 2.0, -7.0)) *
+        rotate_y(0.7) *
+        std::transform::scale(vec3(1.4, 0.35, 0.8))
+    let normal = normalize(vec3(1.0, 1.0, 0.0))
+    let tangent = vec3(1.0, -1.0, 0.0)
+    let transformed = (at * vec4(tangent, 0.0)).xyz
+    let n = normalize(normal_matrix(at) * normal)
+    assert(abs(dot(n, transformed)) < 1.0e-5, "squashed stone normal leaned away from its surface")
+    assert(abs(length(n) - 1.0) < 1.0e-5, "stone normal lost its unit length")
+}
+
+@test
+fn repeated_stone_bounds_follow_the_origin_and_shadow_volume() {
+    let identity = std::transform::scale(vec3(1.0))
+    let p = Placement {
+        prototype: 0,
+        at: translate(vec3(1.3, 0.0, 0.5)),
+        normal_at: normal_matrix(identity),
+        reach: 0.4,
+        seed: 7,
+    }
+    assert(p.casts_into(identity), "a caster overlapping a shadow edge was culled")
+    let outside = Placement { at: translate(vec3(1.5, 0.0, 0.5)), ..p }
+    assert(!outside.casts_into(identity), "a caster outside the shadow volume survived")
+    var set = Instances { prototypes: Vec::new(), placements: Vec::from([p]) }
+    set.shift(vec3(-1.3, 0.0, 0.0))
+    let moved = set.placements[0]
+    assert(length(moved.at[3].xyz - vec3(0.0, 0.0, 0.5)) < 1.0e-6, "origin shift lost a placement")
+    assert(
+        moved.prototype == p.prototype && moved.reach == p.reach,
+        "origin shift changed mesh ownership",
+    )
+    assert(moved.casts_into(identity), "shifted caster lost its shadow")
+}
+
+/// The stone of `radius`, `squash` and `seed`, realized once (cells for an 8 mm tolerance, at
+/// most 4 cm: a stone bends gently, and its stain varies over a sixth of its radius) at `at`
+/// turned by `turn` about +y.
+pub fn realize_stone(radius: f32, squash: vec3, seed: u32, at: vec3, turn: f32) -> Realized {
+    realize_stone_within(
+        radius,
+        squash,
+        seed,
+        at,
+        turn,
+        CreatureLook { surface: Tolerance { tolerance: 8mm, largest: 4cm } },
+    )
+}
+
+/// A reusable stone prototype, with a surface tolerance suited to its final displayed scale.
+pub fn realize_stone_within(
+    radius: f32,
+    squash: vec3,
+    seed: u32,
+    at: vec3,
+    turn: f32,
+    look: CreatureLook,
+) -> Realized {
+    let s = stone(radius, squash, seed)
+    let mesh = realize_rigid(s, look)
+    let colours = colours(mesh, s.field(), ByChannels {}, cell: 1cm)
+    Realized { mesh, colours, at: translate(at) * rotate_y(turn), seed }
+}
+
+/// What a stone's vertex passes on.
+pub struct StoneVertex: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub normal: vec3,
+    pub albedo: vec3,
+    pub seed: Flat<u32>,
+}
+
+@vertex
+pub fn stone_vertex(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    colours: [Unorm8x4],
+    at: mat4,
+    seed: u32,
+    cam: Camera,
+) -> StoneVertex {
+    stone_point(v.index, verts, colours, at, mat3(at[0].xyz, at[1].xyz, at[2].xyz), seed, cam)
+}
+
+fn stone_point(
+    index: u32,
+    verts: [SkinVertex],
+    colours: [Unorm8x4],
+    at: mat4,
+    normal_at: mat3,
+    seed: u32,
+    cam: Camera,
+) -> StoneVertex {
+    let sv = verts[index]
+    let world = (at * vec4(sv.pos, 1.0)).xyz
+    let c = colours[index].decode()
+    StoneVertex {
+        clip: ClipPosition { position: cam.clip(world) },
+        world,
+        normal: normal_at * sv.normal,
+        albedo: c.rgb * c.rgb,
+        seed: Flat { value: seed },
+    }
+}
+
+/// An instance's inverse transpose is computed once on the CPU with its placement.
+@vertex
+pub fn stone_instance_vertex(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    colours: [Unorm8x4],
+    at: mat4,
+    normal_at: mat3,
+    seed: u32,
+    cam: Camera,
+) -> StoneVertex {
+    stone_point(v.index, verts, colours, at, normal_at, seed, cam)
+}
+
+@vertex
+pub fn stone_shadow(v: VertexIndex, verts: [SkinVertex], at: mat4, view: mat4) -> ClipPosition {
+    ClipPosition { position: view * (at * vec4(verts[v.index].pos, 1.0)) }
+}
+
+/// Whether a pixel belongs to a mesh's share of a transition. Both representations use the
+/// same framebuffer pixel and frame, with adjacent shares, so one draws colour and depth at
+/// each pixel. A whole share keeps the ordinary opaque path.
+pub fn coverage_kept(coverage: vec2, pixel: vec2, frame: u32) -> bool {
+    if coverage.x <= 0.0 && coverage.y >= 1.0 {
+        return true
+    }
+    let anchor = vec2(f32(frame % 4), f32((frame / 4) % 4))
+    lod::keeps_packed(lod::packed(vec4(coverage, anchor)), pixel)
+}
+
+@test
+fn complementary_stone_meshes_cover_each_pixel_once() {
+    for frame in 0..16 {
+        for step in 0..33 {
+            let split = f32(step) / 32.0
+            for y in 0..4 {
+                for x in 0..4 {
+                    let pixel = vec2(f32(x) + 0.5, f32(y) + 0.5)
+                    let near = coverage_kept(vec2(0.0, split), pixel, frame)
+                    let far = coverage_kept(vec2(split, 1.0), pixel, frame)
+                    assert(
+                        near != far,
+                        "mesh transition left a hole or shaded the same pixel twice",
+                    )
+                    if step == 0 { assert(!near && far, "zero share retained the near mesh") }
+                    if step == 32 { assert(near && !far, "whole share retained the far mesh") }
+                }
+            }
+        }
+    }
+}
+
+/// A stone's pixel: its cooked normal and colour, lit by the world's light, darker where it
+/// meets the ground (`lit_stone`).
+@fragment
+pub fn stone_shade(
+    s: StoneVertex,
+    pixel: FragCoord,
+    lt: Lighting,
+    coverage: vec2 = vec2(0.0, 1.0),
+) -> vec4 {
+    if !coverage_kept(coverage, pixel.position.xy, lt.cam.frame) {
+        discard()
+    }
+    lit_stone(s, lt)
+}
+
+/// Stone `s` lit by `lt`'s light, darker where it meets the ground.
+fn lit_stone(s: StoneVertex, lt: Lighting) -> vec4 {
+    let n = normalize(s.normal)
+    let (sun, sky, reflected) = sun_and_gloss(lt, s.world, n, soft: 1.0)
+    let ground = probes::ground_under(lt.grid, lt.grounds, s.world.xz)
+    let low = 0.4 + 0.6 * smoothstep(0.0, 0.5, s.world.y - ground)
+    let lit = Lit {
+        albedo: s.albedo,
+        n,
+        sun,
+        sky: sky * low,
+        through: vec3(0.0),
+        rough: Rock { albedo: s.albedo }.roughness(),
+        reflected: reflected * low,
+        glint: 1.0,
+    }
+    let c = shown(lt, lit, s.world)
+    vec4(c, ROCK + f32(s.seed.value % 63))
+}
+
+// ---- bedrock: a bed of rock as a solid ------------------------------------------------------------
+
+/// A bed of rock as a solid: a prism its faces cut (each `dot(p, n) < w` for `n` in xyz, `n` of
+/// unit length): its joints' planes round it, its bedding planes over and under it. Flat faces
+/// and hard edges, which light can carve (rock as a heightfield draped where it should break).
+pub struct Bed: Copy + GpuData {
+    pub planes: [vec4; 9],
+    /// A box it lies in, and its tone's seed.
+    pub lo: vec3,
+    pub hi: vec3,
+    pub seed: u32,
+}
+
+impl Surface for Bed {
+    fn distance(self, p: vec3) -> f32 {
+        var d = -1.0e9
+        for q in self.planes {
+            d = max(d, dot(p, q.xyz) - q.w)
+        }
+        d
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// A bed's colour at `p` (in its own frame): granite of its own tone, one bed lighter or darker
+/// than the next, a darker seam along its foot where the bed over it sits, faint streaks down
+/// it where water runs. No spots, no crack lines: its form carries it.
+pub fn bed_colour(b: Bed, p: vec3) -> Rock {
+    let tone = 0.85 + 0.3 * rand(b.seed, 3)
+    let g = grain(p * 0.9 + vec3(f32(b.seed) * 1.3))
+    var c = tone * mix(vec3(0.30, 0.29, 0.27), vec3(0.40, 0.38, 0.34), vec3(g))
+    // How far over its bedding plane under it `p` is (the last plane's: `-n` up, so `w - dot`).
+    let under = b.planes[8]
+    let above = -(dot(p, under.xyz) - under.w)
+    c *= 0.82 + 0.18 * smoothstep(0.0, 0.5, above)
+    let streak = noise3(vec3(p.x * 1.6, p.y * 0.12, p.z * 1.6) + vec3(f32(b.seed)))
+    c *= 1.0 - 0.12 * smoothstep(0.6, 0.85, streak)
+    Rock { albedo: c }
+}
+
+/// A bed as a creature of one bone, to realize.
+pub fn bed(b: Bed) -> Creature<Rock> {
+    var s = Skeleton::new()
+    let root = s.root("bed", vec3(0.0))
+    creature(s).part(root, b.with_at(|p| bed_colour(b, p))).bounded(Box3 { lo: b.lo, hi: b.hi })
+}
+
+/// Bed `b` realized at `at` (its frame's origin in the world): cells of about 45 cm (its faces
+/// are planes; an edge rounds by about a cell), its colours a cell 25 cm.
+pub fn realize_bed(b: Bed, at: vec3) -> Realized {
+    let c = bed(b)
+    let look = CreatureLook { surface: Tolerance { tolerance: 50cm, largest: 45cm } }
+    let mesh = realize_rigid(c, look)
+    let colours = colours(mesh, c.field(), ByChannels {}, cell: 25cm)
+    Realized { mesh, colours, at: translate(at), seed: b.seed }
+}
+
+// ---- rocks: many solids from a few ----------------------------------------------------------------
+
+/// A block of jointed rock as a solid, `half` its half extents (the largest 1: a placement
+/// scales it to its size, about evenly, so what weathered it is as coarse each way): its four
+/// joint faces, each a little off square and off upright; its bedding planes over and under it,
+/// a little tilted; and the chips off its edges and corners where it broke, each a plane at its
+/// own depth. Its edges are worn by `round`. Its laminae (the thin beds it was laid down in, at
+/// a slant to its bedding: cross-beds) are a normal (xyz) and how many there are to a unit (w).
+pub struct Block: Copy + GpuData {
+    pub planes: [vec4; 14],
+    pub laminae: vec4,
+    pub half: vec3,
+    pub seed: u32,
+    pub dark: vec3,
+    pub round: f32,
+    pub light: vec3,
+}
+
+impl Surface for Block {
+    fn distance(self, p: vec3) -> f32 {
+        var d = -1.0e9
+        for q in self.planes {
+            d = std::field::smax(d, dot(p, q.xyz) - q.w, self.round)
+        }
+        d
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// A block of jointed rock, half extents `half` (the largest 1), seed `seed`, its rock's colours
+/// `dark` to `light` (`Block`): 4 to 8 chips off its upright edges, a sixteenth to a fifth of its
+/// least half extent deep (three in five with one of them a break a third to three fifths deep);
+/// if `worn` (weathered out of a cliff, not one from inside it, whose top is under the next
+/// block's foot), off its top's edges and corners too, and its upright edges broken back deeper,
+/// a sixth to a half, so it's no box seen from over it; and cross-beds dipping up to 25°
+/// whichever way, 6 to 14 to a unit.
+pub fn block(seed: u32, half: vec3, dark: vec3, light: vec3, worn: bool = true) -> Block {
+    var planes = [vec4(0.0, 1.0, 0.0, 1.0e3); 14]
+    for k in 0..4 {
+        let a = TAU * f32(k) / 4.0 + 0.1 * (rand(seed, 70 + k) - 0.5)
+        let n = normalize(vec3(cos(a), 0.08 * (rand(seed, 75 + k) - 0.5), sin(a)))
+        let reach = if k % 2 == 0 { half.x } else { half.z }
+        planes[k] = vec4(n, reach * (1.0 - 0.05 * rand(seed, 80 + k)))
+    }
+    let tilt = vec2(rand(seed, 120) - 0.5, rand(seed, 121) - 0.5) * 0.015
+    planes[4] = vec4(normalize(vec3(tilt.x, 1.0, tilt.y)), half.y)
+    planes[5] = vec4(
+        normalize(vec3(-tilt.y, -1.0, tilt.x)),
+        half.y * (1.0 - 0.04 * rand(seed, 122)),
+    )
+    let least = min(half.x, min(half.y, half.z))
+    let chips = 4 + u32(5.0 * rand(seed, 130))
+    for k in 0..chips {
+        // A top corner, a top edge or an upright one (its foot sits tight on what's under it):
+        // each axis's side, or (for an edge) none on one of them.
+        let side = vec3(
+            if rand(seed, 140 + k) < 0.5 { -1.0 } else { 1.0 },
+            1.0,
+            if rand(seed, 160 + k) < 0.5 { -1.0 } else { 1.0 },
+        )
+        let edge = if worn { u32(4.0 * rand(seed, 170 + k)) } else { 1 }
+        let at = vec3(
+            if edge == 0 { 0.0 } else { side.x },
+            if edge == 1 { 0.0 } else { side.y },
+            if edge == 2 { 0.0 } else { side.z },
+        ) * half
+        let n = normalize(
+            sign(at) / max(half, vec3(1.0e-3)) +
+                0.6 * (vec3(rand(seed, 180 + k), rand(seed, 190 + k), rand(seed, 200 + k)) - 0.5),
+        )
+        // (The first, on three in five, a corner or an edge broken off deep.)
+        let broken = k == 0 && rand(seed, 131) < 0.6
+        let deep = least * if broken { 0.3 + 0.3 * rand(seed, 210) } else if worn && edge == 1 {
+            0.16 + 0.34 * rand(seed, 210 + k)
+        } else { 0.06 + 0.16 * rand(seed, 210 + k) }
+        planes[6 + k] = vec4(n, dot(at, n) - deep)
+    }
+    let dip = 0.45 * rand(seed, 220)
+    let way = TAU * rand(seed, 221)
+    let lam = normalize(vec3(cos(way) * dip, 1.0, sin(way) * dip))
+    Block {
+        planes,
+        laminae: vec4(lam, 6.0 + 8.0 * rand(seed, 222)),
+        half,
+        seed,
+        dark,
+        round: 0.025,
+        light,
+    }
+}
+
+/// A block from inside a cliff is chipped on its upright edges only: its top's edges are whole at
+/// their middles, where the next block's foot sits on it (chipped, each parting would show as a
+/// notch, a mortar course); one weathered out of a cliff has its top's edges chipped too.
+@test
+fn a_block_from_inside_a_cliff_keeps_its_tops_edges_whole() {
+    let half = vec3(1.0, 0.45, 0.7)
+    let edges = [
+        vec3(0.85 * half.x, half.y, 0.0),
+        vec3(-0.85 * half.x, half.y, 0.0),
+        vec3(0.0, half.y, 0.85 * half.z),
+        vec3(0.0, half.y, -0.85 * half.z),
+    ]
+    var cut = 0
+    for seed in 0..40 {
+        let inner = block(seed, half, vec3(0.2), vec3(0.4), worn: false)
+        let worn = block(seed, half, vec3(0.2), vec3(0.4), worn: true)
+        for p in edges {
+            assert(inner.distance(p) < 0.03, f"block {seed}'s top edge is chipped at {p}")
+            if worn.distance(p) > 0.05 {
+                cut += 1
+            }
+        }
+    }
+    assert(cut >= 5, f"only {cut} of the worn blocks' top edges are chipped")
+}
+
+/// Where `p` is through its lamina (0 at a lamina's foot to 1 at its top), the laminae `lam`
+/// (`Block::laminae`), each a little thicker or thinner than the next as the current that laid
+/// it down ran faster or slower.
+fn lamina(lam: vec4, p: vec3) -> f32 {
+    fract(dot(p, lam.xyz) * lam.w + 0.8 * value_noise(p * 2.5 + vec3(3.0)))
+}
+
+/// How a block weathers, as a noise over its surface: its faces' broad swells and hollows where
+/// it fractured, no face a plane; its coarse grain's roughness, where it weathered most; its
+/// laminae weathered out as small steps (`step_of`); and pitting, where its pebbles fell out;
+/// each by its weight (`weights`). No two steps are as thick.
+pub struct Wear: Copy + GpuData {
+    pub laminae: vec4,
+    pub fracture: Fbm,
+    pub hollows: Fbm,
+    pub pits: Fbm,
+    pub weights: vec4,
+}
+
+/// A lamina's step (`lamina`'s fraction `f`): sinking across it, then rising back sharply, so
+/// each riser faces up, where the sky lights it (one facing down, under a lip, would be lit by
+/// the ground too, with nothing of the rock to shade it).
+fn step_of(f: f32) -> f32 {
+    1.25 * smoothstep(0.8, 1.0, f) - f
+}
+
+impl Noise for Wear {
+    fn value(self, p: vec3) -> f32 {
+        self.weights.w * self.fracture.value(p) +
+            self.weights.x * self.hollows.value(p) +
+            self.weights.y * step_of(lamina(self.laminae, p)) +
+            self.weights.z * self.pits.value(p)
+    }
+
+    fn range(self) -> Interval {
+        let f = self.fracture.range()
+        let a = self.hollows.range()
+        let c = self.pits.range()
+        let w = self.weights
+        Interval {
+            lo: w.w * f.lo + w.x * a.lo - w.y + w.z * c.lo,
+            hi: w.w * f.hi + w.x * a.hi + 0.25 * w.y + w.z * c.hi,
+        }
+    }
+
+    /// The parts' bounds, by their weights; a step's slope is at most 1 + 1.25 × 7.5 times its
+    /// phase's, which is its laminae's count to a unit and the wobble's (its value noise's bound
+    /// at 2.5 × the scale, by 0.8).
+    fn lipschitz(self) -> f32 {
+        let w = self.weights
+        let phase = self.laminae.w + 2.0 * VALUE_NOISE_LIPSCHITZ
+        w.w * self.fracture.lipschitz() +
+            w.x * self.hollows.lipschitz() +
+            w.y * 10.4 * phase +
+            w.z * self.pits.lipschitz()
+    }
+
+    fn bandlimit(self) -> f32 {
+        max(max(self.hollows.bandlimit(), self.laminae.w * 5.0), self.pits.bandlimit())
+    }
+}
+
+/// A block's colour at `p` (in its own frame): its rock's grain, its own tone; darker in broad
+/// patches of weathered crust, and down the few broad streaks water left, most low on it; paler
+/// and greyer where a chip broke fresh rock open; dark on its underside, in the crevice over what
+/// it stands on (nothing else shades it from the light the ground throws up); its top a little
+/// bleached; pale lichen in ragged patches, more toward its top.
+pub fn block_colour(b: Block, p: vec3) -> Rock {
+    // Its own tone and hue: some blocks darker, some paler, warmer or greyer.
+    let tone = 0.88 + 0.24 * rand(b.seed, 3)
+    let hue = mix(vec3(0.97, 0.99, 1.03), vec3(1.04, 1.0, 0.94), vec3(rand(b.seed, 4)))
+    let g = grain(p * 5.0 + vec3(f32(b.seed) * 1.3))
+    var c = tone * hue * mix(b.dark, b.light, vec3(g))
+    // Which face it's on: a chip's is fresh.
+    var d = -1.0e9
+    var face = 0
+    for k in 0..14 {
+        let e = dot(p, b.planes[k].xyz) - b.planes[k].w
+        if e > d {
+            d = e
+            face = k
+        }
+    }
+    if face >= 6 {
+        c = mix(c, vec3(dot(b.light, vec3(0.33))), vec3(0.2))
+    } else if face == 5 {
+        // Its underside: in the crevice over what it stands on, out of the light.
+        c *= 0.4
+    } else {
+        let crust = noise3(p * 0.9 + vec3(f32(b.seed) * 0.37))
+        c *= 0.85 + 0.2 * crust
+    }
+    let up = p.y / b.half.y
+    let streak = noise3(vec3(p.x * 2.5, p.y * 0.35, p.z * 2.5) + vec3(f32(b.seed)))
+    c *= 1.0 - 0.25 * smoothstep(0.6, 0.85, streak) * smoothstep(1.0, -0.5, up)
+    c *= 1.0 + 0.08 * smoothstep(0.6, 0.95, up)
+    // Lichen: pale grey crusts in ragged patches, more toward its top, faint (bold round spots
+    // read as a leopard's, and green as a cast over all of it).
+    let crust = 0.6 * noise3(p * 4.0 + vec3(f32(b.seed) * 0.13)) + 0.4 * noise3(p * 11.0)
+    let lichen = smoothstep(0.58, 0.72, crust) * smoothstep(-0.8, 0.6, up)
+    c = mix(c, vec3(0.34, 0.34, 0.31), vec3(0.3 * lichen))
+    Rock { albedo: c }
+}
+
+/// Block `b` weathered by `rough` (`Wear`, of its own size), its laminae's steps `steps` deep (a
+/// rock laid down in none, as granite, has none), as a creature of one bone to realize.
+pub fn worn(b: Block, rough: f32, steps: f32 = 0.05) -> Creature<Rock> {
+    let wear = Wear {
+        laminae: b.laminae,
+        fracture: fbm(freq: 1.0, octaves: 2, offset: vec3(f32(b.seed) * 1.1)),
+        hollows: fbm(freq: 5.0, octaves: 3, offset: vec3(f32(b.seed) * 2.3)),
+        pits: fbm(freq: 20.0, octaves: 2, offset: vec3(f32(b.seed) * 0.7)),
+        weights: vec4(0.18, steps, 0.07, 0.6),
+    }
+    let grow = b.half * 0.05 + vec3(rough * 2.0)
+    var s = Skeleton::new()
+    let root = s.root("block", vec3(0.0))
+    creature(s)
+        .part(root, b.displace(wear, amp: rough).with_at(|p| block_colour(b, p)))
+        .bounded(Box3 { lo: -b.half - grow, hi: b.half + grow })
+}
+
+/// Block `b` worn by `rough`, its laminae's steps `steps` deep (`worn`), and realized as a
+/// prototype (at the origin) to `look`'s tolerance, its colours a cell `cell` across: a rock's
+/// (`Rocks`), which its placements scale.
+pub fn realize_block(
+    b: Block,
+    rough: f32,
+    look: CreatureLook,
+    cell: f32,
+    steps: f32 = 0.05,
+) -> Realized {
+    let c = worn(b, rough, steps: steps)
+    let mesh = realize_rigid(c, look)
+    let colours = colours(mesh, c.field(), ByChannels {}, cell)
+    Realized { mesh, colours, at: translate(vec3(0.0)), seed: b.seed }
+}
+
+/// A rock's placement as the GPU reads it: where its prototype goes (its transform, and that
+/// transform's inverse transpose for its normals), and its tone's seed.
+pub struct RockAt: Copy + GpuData {
+    pub at: mat4,
+    pub normal_at: mat3,
+    pub seed: u32,
+}
+
+/// Rocks: a few kinds of prototype solid, each realized near (fine, for rocks close to the eye)
+/// and far (coarse), and many placements of them; each kind and level drawn with one instanced
+/// draw (`Rocks::draw`) over the placements of its run (`first`, `count`) the camera sees at that
+/// level (`Rocks::cull`: `seen`, from `seen_first`, `seen_count` of them, kind by kind, near then
+/// far); its shadows from all of them, far (`Rocks::cast`).
+pub struct Rocks {
+    pub near: Vec<Realized>,
+    pub far: Vec<Realized>,
+    pub placed: GpuBuffer<RockAt>,
+    pub first: Vec<u32>,
+    pub count: Vec<u32>,
+    /// Each kind's draw of all its placements (shadows), and each kind's and level's of those
+    /// seen.
+    pub args: Vec<GpuBuffer<DrawIndexedArgs>>,
+    pub seen_args: Vec<GpuBuffer<DrawIndexedArgs>>,
+    /// Where each placement is and how far it reaches (its centre and radius), on the CPU.
+    pub spheres: Vec<vec4>,
+    pub seen: GpuBuffer<u32>,
+    pub seen_first: Vec<u32>,
+    pub seen_count: Vec<u32>,
+    /// The render origin (its world point): placements are in the world, the camera and the
+    /// shadows' views in render space, the world less it (`cull` sets it).
+    pub origin: vec3,
+    /// Each kind's grain (`rock_shade`): how far across its grains are (m) and how much lighter or
+    /// darker each is; and how far across its mottling is (m) and how much. None, unless set.
+    pub grain: Vec<vec4>,
+}
+
+/// The least of the view's half height a rock must span to be drawn (its radius over its
+/// distance, over the view's `tan_half`): a stone smaller than a few pixels far off isn't.
+pub const SEEN_SPAN: f32 = 0.004
+
+/// How near a rock is drawn from its near prototype: within this many times its own radius.
+pub const NEAR_RADII: f32 = 6.0
+
+/// Whether a sphere `sp` (its centre and radius, in the eye's space) is seen from `eye` looking
+/// along `forward`: in front of it, within a cone `wide` (the tangent of its widest half angle)
+/// round its line of sight, and spanning at least `SEEN_SPAN` of a view whose half height's
+/// tangent is `tan_half`.
+pub fn in_view(sp: vec4, eye: vec3, forward: vec3, tan_half: f32, wide: f32) -> bool {
+    let to = sp.xyz - eye
+    let ahead = dot(to, forward)
+    // Distance from a cone's sloped side: the radius projects onto its unit normal,
+    // rather than only across the view axis.
+    let margin = sp.w * sqrt(1.0 + wide * wide)
+    if ahead < -sp.w || length(to - forward * ahead) > wide * max(ahead, 0.0) + margin {
+        return false
+    }
+    sp.w >= SEEN_SPAN * tan_half * length(to)
+}
+
+@test
+fn a_rock_sphere_crossing_the_sloped_view_edge_is_kept() {
+    let eye = vec3(0.0)
+    let forward = vec3(0.0, 0.0, 1.0)
+    let edge = vec3(10.0, 0.0, 10.0)
+    let outside = normalize(vec3(1.0, 0.0, -1.0))
+    let centre = edge + outside * 0.9
+    assert(
+        in_view(vec4(centre, 1.0), eye, forward, tan_half: 0.7, wide: 1.0),
+        "a sphere crossing the cone's edge was culled",
+    )
+}
+
+@test
+fn a_rock_is_drawn_where_it_is_seen_and_big_enough_to_be() {
+    let eye = vec3(0.0, 2.0, 0.0)
+    let ahead = vec3(0.0, 0.0, 1.0)
+    let (t, w) = (0.4, 0.7)
+    assert(in_view(vec4(0.0, 2.0, 50.0, 1.0), eye, ahead, t, w), "a rock ahead isn't drawn")
+    assert(!in_view(vec4(0.0, 2.0, -50.0, 1.0), eye, ahead, t, w), "a rock behind is drawn")
+    assert(!in_view(vec4(200.0, 2.0, 50.0, 1.0), eye, ahead, t, w), "a rock off to the side is")
+    // Its sphere reaching into the view from just outside it counts.
+    assert(in_view(vec4(37.0, 2.0, 50.0, 3.0), eye, ahead, t, w), "a rock at the edge isn't")
+    // A stone a metre across 2 km off spans a pixel or less: left out.
+    assert(!in_view(vec4(0.0, 2.0, 2000.0, 0.5), eye, ahead, t, w), "a far pebble is drawn")
+    // One round the eye is always drawn.
+    assert(in_view(vec4(0.0, 2.0, -1.0, 3.0), eye, ahead, t, w), "a rock round the eye isn't")
+}
+
+/// Prototype `k`'s mesh's draw arguments, for `count` instances.
+@compute(1)
+fn rock_args(mesh: [DrawIndexedArgs], count: u32, out: mut Slots<DrawIndexedArgs>, id: GlobalId) {
+    let m = mesh[0]
+    out[id] = DrawIndexedArgs {
+        indices: m.indices,
+        instances: count,
+        first_index: m.first_index,
+        base_vertex: m.base_vertex,
+        first_instance: 0,
+    }
+}
+
+impl Rocks {
+    /// Rocks of the kinds `near` and `far` realize (the same kinds, fine and coarse) placed as
+    /// `placements` say (each placement's `prototype` a kind; others are left out).
+    pub fn new(
+        near: take Vec<Realized>,
+        far: take Vec<Realized>,
+        placements: [Placement],
+    ) -> Rocks {
+        let n = far.len()
+        var sorted: Vec<RockAt> = Vec::with_capacity(placements.len())
+        var spheres: Vec<vec4> = Vec::with_capacity(placements.len())
+        var first: Vec<u32> = Vec::new()
+        var count: Vec<u32> = Vec::new()
+        for k in 0..n {
+            first.push(sorted.len())
+            for p in placements {
+                if p.prototype == k {
+                    sorted.push(RockAt { at: p.at, normal_at: p.normal_at, seed: p.seed })
+                    spheres.push(vec4(p.at[3].xyz, p.reach))
+                }
+            }
+            count.push(sorted.len() - first[k])
+        }
+        var placed: GpuBuffer<RockAt> = buffer(max(sorted.len(), 1))
+        if !sorted.is_empty() {
+            write(mut placed, 0, sorted)
+        }
+        var args: Vec<GpuBuffer<DrawIndexedArgs>> = Vec::new()
+        var seen_args: Vec<GpuBuffer<DrawIndexedArgs>> = Vec::new()
+        for k in 0..n {
+            var a: GpuBuffer<DrawIndexedArgs> = buffer(1)
+            dispatch(rock_args.bind(far[k].mesh.draw.items(), count[k], mut a), groups: 1)
+            args.push(take a)
+            seen_args.push(buffer(1))
+            seen_args.push(buffer(1))
+        }
+        let total = max(sorted.len(), 1)
+        Rocks {
+            near,
+            far,
+            placed,
+            first,
+            count,
+            args,
+            seen_args,
+            spheres,
+            seen: buffer(total),
+            seen_first: Vec::filled(2 * n, 0),
+            seen_count: Vec::filled(2 * n, 0),
+            origin: vec3(0.0),
+            grain: Vec::filled(n, vec4(0.0)),
+        }
+    }
+
+    /// The rocks camera `cam` (in render space, the world less `origin`) sees: each whose sphere
+    /// meets its view and spans enough of it (`in_view`), near (within `NEAR_RADII` of its radii)
+    /// or far; their indices written for the draws, each kind's and level's count into its draw.
+    pub fn cull(mut self, cam: Camera, origin: vec3) {
+        self.origin = origin
+        var seen: Vec<u32> = Vec::with_capacity(self.spheres.len())
+        // A cone enclosing the rectangular view reaches its corners, along the diagonal.
+        let wide = cam.tan_half * sqrt(1.0 + cam.aspect * cam.aspect)
+        for k in 0..self.far.len() {
+            for level in 0..2 {
+                let at = 2 * k + level
+                self.seen_first[at] = seen.len()
+                for i in self.first[k]..(self.first[k] + self.count[k]) {
+                    let sp = vec4(self.spheres[i].xyz - origin, self.spheres[i].w)
+                    let near = length(sp.xyz - cam.eye) < NEAR_RADII * sp.w
+                    if near == (level == 0) &&
+                        in_view(sp, cam.eye, cam.forward, cam.tan_half, wide) {
+                        seen.push(i)
+                    }
+                }
+                self.seen_count[at] = seen.len() - self.seen_first[at]
+            }
+        }
+        if !seen.is_empty() {
+            write(mut self.seen, 0, seen)
+        }
+        for k in 0..self.far.len() {
+            for level in 0..2 {
+                let at = 2 * k + level
+                borrow p = if level == 0 { self.near[k] } else { self.far[k] }
+                dispatch(
+                    rock_args.bind(
+                        p.mesh.draw.items(),
+                        self.seen_count[at],
+                        mut self.seen_args[at],
+                    ),
+                    groups: 1,
+                )
+            }
+        }
+    }
+
+    /// How many rocks are placed.
+    pub fn len(self) -> u32 {
+        var n = 0
+        for c in self.count {
+            n += c
+        }
+        n
+    }
+
+    /// The rocks as shadow casters into `pass`, seen from the sun by `view`, each far, biased as
+    /// casters are (`shadow::CASTER`).
+    pub fn cast<P: RenderPass>(self, pass: P, view: mat4) {
+        for k in 0..self.far.len() {
+            if self.count[k] == 0 {
+                continue
+            }
+            borrow p = self.far[k]
+            draw(
+                pass,
+                rock_shadow.bind(
+                    verts: p.mesh.verts.items(),
+                    placed: self.placed.items(),
+                    first: self.first[k],
+                    origin: self.origin,
+                    view: view,
+                ),
+                vegetation::nothing,
+                indices: p.mesh.quads.items(),
+                indirect: self.args[k].items(),
+                depth_bias: shadow::CASTER,
+            )
+        }
+    }
+
+    /// The rocks the camera sees (`cull`) drawn into `pass`, lit by `lt`, each at its level.
+    pub fn draw<P: RenderPass>(self, pass: P, lt: Lighting) {
+        for k in 0..self.far.len() {
+            for level in 0..2 {
+                let at = 2 * k + level
+                if self.seen_count[at] == 0 {
+                    continue
+                }
+                borrow p = if level == 0 { self.near[k] } else { self.far[k] }
+                draw(
+                    pass,
+                    rock_vertex.bind(
+                        verts: p.mesh.verts.items(),
+                        colours: p.colours.items(),
+                        placed: self.placed.items(),
+                        seen: self.seen.items(),
+                        first: self.seen_first[at],
+                        origin: self.origin,
+                        cam: lt.cam,
+                    ),
+                    rock_shade.bind(lt, origin: self.origin, grain: self.grain[k]),
+                    indices: p.mesh.quads.items(),
+                    indirect: self.seen_args[at].items(),
+                    cull: std::gpu::Cull::Back,
+                    depth: view::NEAREST,
+                )
+            }
+        }
+    }
+}
+
+/// A rock's fragment `s` (`rock_vertex`, its world `origin` less): its colour toned over the rock
+/// where it stands, not block by block (a face whose every block is its own shade reads as
+/// masonry), in broad patches darker and paler a few blocks across, and in streaks down it where
+/// water runs, across its blocks; its kind's `grain` (`Rocks::grain`: each grain lighter or
+/// darker, where a pixel is small enough to see it, faded out where it isn't, so it doesn't
+/// shimmer; and mottled a little coarser); then lit as a stone (`lit_stone`). (Per pixel: a
+/// rock's near mesh has far more vertices than pixels it covers.)
+@fragment
+pub fn rock_shade(s: StoneVertex, lt: Lighting, origin: vec3, grain: vec4) -> vec4 {
+    let w = s.world + origin
+    let broad = noise3(w * 0.04 + vec3(3.0, 7.0, 1.0))
+    let streak = noise3(vec3(w.x * 0.35, w.y * 0.025, w.z * 0.35))
+    var toned = s
+    toned.albedo *= (0.78 + 0.44 * broad) * (1.0 - 0.3 * smoothstep(0.55, 0.8, streak))
+    // (Each only where it shows: most of a view's rock is too far off for either.)
+    let foot = lt.cam.footprint(length(s.world - lt.cam.eye))
+    let fine = grain.y * (1.0 - smoothstep(0.5 * grain.x, 2.0 * grain.x, foot))
+    if fine > 0.0 {
+        // A grain each `grain.x` cell, its own tone: crisp, as crystals are, and one hash.
+        let g = vec3i(floor(w / grain.x))
+        toned.albedo *= 1.0 + fine * (2.0 * hash3(g.x, g.y, g.z) - 1.0)
+    }
+    let coarse = grain.w * (1.0 - smoothstep(0.5 * grain.z, 2.0 * grain.z, foot))
+    if coarse > 0.0 {
+        toned.albedo *= 1.0 + coarse * (2.0 * noise3(w / grain.z + vec3(5.0, 1.0, 3.0)) - 1.0)
+    }
+    lit_stone(toned, lt)
+}
+
+/// Vertex `v` of a rock prototype's mesh, in its placement `first + i`, seen from the sun by
+/// `view`.
+@vertex
+pub fn rock_shadow(
+    v: VertexIndex,
+    i: InstanceIndex,
+    verts: [SkinVertex],
+    placed: [RockAt],
+    first: u32,
+    origin: vec3,
+    view: mat4,
+) -> ClipPosition {
+    let r = placed[first + i.index]
+    ClipPosition { position: view * vec4((r.at * vec4(verts[v.index].pos, 1.0)).xyz - origin, 1.0) }
+}
+
+/// Vertex `v` of a rock prototype's mesh, in the placement seen `first + i`: its colour a little
+/// lighter or darker by its placement's seed (`rock_shade` tones it over the rock).
+@vertex
+pub fn rock_vertex(
+    v: VertexIndex,
+    i: InstanceIndex,
+    verts: [SkinVertex],
+    colours: [Unorm8x4],
+    placed: [RockAt],
+    seen: [u32],
+    first: u32,
+    origin: vec3,
+    cam: Camera,
+) -> StoneVertex {
+    let r = placed[seen[first + i.index]]
+    let at = mat4(r.at[0], r.at[1], r.at[2], vec4(r.at[3].xyz - origin, 1.0))
+    var sv = stone_point(v.index, verts, colours, at, r.normal_at, r.seed, cam)
+    sv.albedo *= 0.94 + 0.12 * rand(r.seed, 1)
+    sv
+}

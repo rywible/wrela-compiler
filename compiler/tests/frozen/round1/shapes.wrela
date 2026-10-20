@@ -1,0 +1,226 @@
+// Round 1's helper library (fieldview's lib.wgsl), ported: the shapes, rotations and noise the
+// wolf and the grazer were written with. Each is written as its WGSL is, operation for
+// operation, so the ports match the originals within rounding (AC7: 0.5 mm). Where wrela's std
+// has the same function (`round_cone`, `smin`, `smax`), the port uses std's, which is the same
+// up to rounding. Each shape states a Lipschitz bound, derived in its comment.
+
+use std::field::{Surface, RoundCone, round_cone}
+
+/// WGSL's `smoothstep(from, to, x)`, as its formula, for either order of the edges: round 1's
+/// authors wrote some with `from > to`, a falling step, which WGSL leaves to the platform.
+pub fn sstep(x: f32, from: f32, to: f32) -> f32 {
+    let t = clamp((x - from) / (to - from), 0.0, 1.0)
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// The steepest `sstep(from: a, to: b, x)` gets, per unit of `x`: 1.5 over the edges' gap.
+pub fn sstep_slope(from: f32, to: f32) -> f32 {
+    1.5 / abs(to - from)
+}
+
+/// `p` turned by `a` radians about x, as round 1's `rot_x`.
+pub fn rot_x(p: vec3, a: f32) -> vec3 {
+    let (c, s) = (cos(a), sin(a))
+    vec3(p.x, c * p.y - s * p.z, s * p.y + c * p.z)
+}
+
+/// `p` turned by `a` radians about y, as round 1's `rot_y`.
+pub fn rot_y(p: vec3, a: f32) -> vec3 {
+    let (c, s) = (cos(a), sin(a))
+    vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z)
+}
+
+/// `p` turned by `a` radians about z, as round 1's `rot_z`.
+pub fn rot_z(p: vec3, a: f32) -> vec3 {
+    let (c, s) = (cos(a), sin(a))
+    vec3(c * p.x - s * p.y, s * p.x + c * p.y, p.z)
+}
+
+/// `p` reflected into x ≥ 0, as round 1's `mirror_x`.
+pub fn mirror_x(p: vec3) -> vec3 {
+    vec3(abs(p.x), p.y, p.z)
+}
+
+/// Round 1's `sd_box`: a box with half-extents `half`, centred at the origin. Exact.
+pub fn sd_box(p: vec3, half: vec3) -> f32 {
+    let q = abs(p) - half
+    length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+}
+
+// ---- noise ---------------------------------------------------------------------------------------
+
+/// Round 1's `fv_hash`: a lattice point's value, in [-1, 1].
+pub fn fv_hash(x: i32, y: i32, z: i32) -> f32 {
+    // `u32(x)` keeps an `i32`'s bits, as WGSL's `bitcast<u32>`.
+    let k: u32 = 2891336453
+    var h = u32(x)
+        .wrapping_mul(747796405)
+        .wrapping_add(u32(y).wrapping_mul(k))
+        .wrapping_add(
+            u32(z).wrapping_mul(277803737),
+        )
+    h = ((h >> ((h >> 28) + 4)) ^ h).wrapping_mul(277803737)
+    h = (h >> 22) ^ h
+    f32(h) * (2.0 / 4294967295.0) - 1.0
+}
+
+/// Round 1's `noise3`: value noise with a cubic fade, in [-1, 1].
+pub fn noise3(x: vec3) -> f32 {
+    let fl = floor(x)
+    let (ix, iy, iz) = (i32(fl.x), i32(fl.y), i32(fl.z))
+    let f = x - fl
+    // `saturate` changes no value (the fade maps [0, 1] onto itself), but it tells a derived
+    // interval the fade stays in [0, 1] across a cell's edge, as std's `value_noise` does.
+    let u = saturate(f * f * (vec3(3.0) - 2.0 * f))
+    let (jx, jy, jz) = (ix + 1, iy + 1, iz + 1)
+    mix(
+        mix(
+            mix(fv_hash(ix, iy, iz), fv_hash(jx, iy, iz), u.x),
+            mix(fv_hash(ix, jy, iz), fv_hash(jx, jy, iz), u.x),
+            u.y,
+        ),
+        mix(
+            mix(fv_hash(ix, iy, jz), fv_hash(jx, iy, jz), u.x),
+            mix(fv_hash(ix, jy, jz), fv_hash(jx, jy, jz), u.x),
+            u.y,
+        ),
+        u.z,
+    )
+}
+
+/// A bound on `noise3`'s gradient: along each axis the fade's slope is at most 1.5 and the
+/// values it mixes differ by at most 2, so 3 per axis, and 3√3 in all.
+pub const NOISE3_LIPSCHITZ: f32 = 5.1962
+
+/// Round 1's `fbm3`: `octaves` layers of `noise3`, each at 2.03 times the frequency and half
+/// the amplitude of the last, from 0.5.
+pub fn fbm3(x: vec3, octaves: u32) -> f32 {
+    var s = 0.0
+    var a = 0.5
+    var q = x
+    for _ in 0..octaves {
+        s += a * noise3(q)
+        q = q * 2.03 + vec3(1.7, 9.2, 3.1)
+        a *= 0.5
+    }
+    s
+}
+
+/// The most `fbm3` can be, either way: the octaves' amplitudes summed.
+pub fn fbm3_range(octaves: u32) -> f32 {
+    var r = 0.0
+    var a = 0.5
+    for _ in 0..octaves {
+        r += a
+        a *= 0.5
+    }
+    r
+}
+
+/// A bound on `fbm3`'s gradient, for unit frequency: each octave's amplitude times its
+/// frequency times `noise3`'s bound.
+pub fn fbm3_lipschitz(octaves: u32) -> f32 {
+    var l = 0.0
+    var a = 0.5
+    var f = 1.0
+    for _ in 0..octaves {
+        l += a * f * NOISE3_LIPSCHITZ
+        a *= 0.5
+        f *= 2.03
+    }
+    l
+}
+
+// ---- shapes --------------------------------------------------------------------------------------
+
+/// Round 1's ellipsoid (the wolf's `sd_ell`, the grazer's `ell`): the usual bound outside, and
+/// inside `(k0 - 1)` times the smallest radius, a true lower bound with no break at the centre.
+pub struct Ell: Copy + GpuData {
+    pub r: vec3,
+}
+
+pub fn ell(r: vec3) -> Ell {
+    Ell { r }
+}
+
+impl Surface for Ell {
+    fn distance(self, p: vec3) -> f32 {
+        let k0 = length(p / self.r)
+        if k0 < 1.0 {
+            return (k0 - 1.0) * min(self.r.x, min(self.r.y, self.r.z))
+        }
+        // Outside, k1 ≥ k0 / max(r) > 0; the floor is for a derived interval, whose boxes can
+        // hold the centre (the grazer's `sd_ellipsoid` has it too).
+        let k1 = max(length(p / (self.r * self.r)), 1.0e-9)
+        k0 * (k0 - 1.0) / k1
+    }
+
+    /// Inside, k0's gradient is at most 1 / min(r), so the distance's is at most 1. Outside,
+    /// with k1 = |p / r²|: ∇k0 = (p / r²) / k0 is k1 / k0 long, |∇k1| ≤ 1 / min(r)², and
+    /// k0 / max(r) ≤ k1 ≤ k0 / min(r); so the gradient of k0 (k0 − 1) / k1 is at most
+    /// (2 − 1 / k0) + (1 − 1 / k0) (max(r) / min(r))². Where the distance is below `near`,
+    /// k0 − 1 < e = near / min(r) (the distance is at least (k0 − 1) min(r)).
+    fn lipschitz(self, near: f32) -> f32 {
+        let lo = min(self.r.x, min(self.r.y, self.r.z))
+        let hi = max(self.r.x, max(self.r.y, self.r.z))
+        let e = max(near, 0.0) / lo
+        let k = 1.0 + e
+        max(1.0, (2.0 - 1.0 / k + (1.0 - 1.0 / k) * (hi / lo) * (hi / lo)) * 1.001)
+    }
+}
+
+/// A round cone squashed across x (round 1's `sd_flat_cone` and `cone_sq`): the cone from `a`
+/// (radius `r1`) to `b` (`r2`), in a space whose x is `sx` times longer, its distance divided
+/// by `sx`. The zero set is the squashed cone's.
+pub struct FlatCone: Copy + GpuData {
+    pub cone: RoundCone,
+    pub sx: f32,
+}
+
+/// The cone from `a` to `b`, squashed by `sx` across x; `a` and `b` are scaled with the space
+/// (round 1's `sd_flat_cone`), or not where `scale_ends` is false (the grazer's `cone_sq`).
+pub fn flat_cone(a: vec3, b: vec3, r1: f32, r2: f32, sx: f32, scale_ends: bool = true) -> FlatCone {
+    let s = vec3(sx, 1.0, 1.0)
+    let (a2, b2) = if scale_ends { (a * s, b * s) } else { (a, b) }
+    FlatCone { cone: round_cone(a2, b2, r_top: r1, r_bottom: r2), sx }
+}
+
+impl Surface for FlatCone {
+    fn distance(self, p: vec3) -> f32 {
+        self.cone.distance(vec3(p.x * self.sx, p.y, p.z)) / self.sx
+    }
+
+    /// The cone's gradient is a unit vector; the squash scales its x by `sx`, and the result
+    /// is divided by `sx`: at most max(sx, 1) / sx.
+    fn lipschitz(self, near: f32) -> f32 {
+        max(self.sx, 1.0) / self.sx
+    }
+}
+
+/// An ellipsoid less a layer of fur: `ell(p - centre)` minus `amp` times `fbm3` at the point
+/// in the creature's space (`origin` is the space this one's origin is at) times `freq`, plus
+/// `offset`: round 1's ruffs, manes and hackles.
+pub struct FurredEll: Copy + GpuData {
+    pub centre: vec3,
+    pub r: vec3,
+    pub amp: f32,
+    pub freq: vec3,
+    pub offset: vec3,
+    pub octaves: u32,
+    pub origin: vec3,
+}
+
+impl Surface for FurredEll {
+    fn distance(self, p: vec3) -> f32 {
+        let fur = fbm3((p + self.origin) * self.freq + self.offset, self.octaves)
+        ell(self.r).distance(p - self.centre) - self.amp * fur
+    }
+
+    /// The ellipsoid's, within `near` plus the fur's reach, and the fur's: `amp` times fbm3's
+    /// bound times the largest frequency.
+    fn lipschitz(self, near: f32) -> f32 {
+        let reach = abs(self.amp) * fbm3_range(self.octaves)
+        let f = max(abs(self.freq.x), max(abs(self.freq.y), abs(self.freq.z)))
+        ell(self.r).lipschitz(near + reach) + abs(self.amp) * f * fbm3_lipschitz(self.octaves)
+    }
+}

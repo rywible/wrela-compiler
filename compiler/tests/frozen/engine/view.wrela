@@ -1,0 +1,297 @@
+// The renderer's camera: what every pass of a frame reads. It's jittered within its
+// pixel each frame by the Halton (2, 3) sequence, which temporal AA averages, and it keeps last
+// frame's matrix, so a pixel's world point is found where it was (reprojection).
+//
+// Rendering is camera-relative: what's drawn is in render space, the world less the
+// render origin (`Camera::origin`), a whole number of tiles near the eye that a game moves as
+// the eye travels. So what's near the camera keeps its precision however far it is from the
+// world's origin; what's keyed to the world (noise, a ground's height) adds the origin back.
+//
+// Depth is reversed and the far plane infinite: a fragment's depth is near / distance along the
+// view, 1 at the near plane and 0 at infinity. A float's precision is then even in distance, so
+// hills 10 km away don't fight. Passes clear depth to 0 and keep the greater.
+
+use std::gpu::{Compare, Depth}
+use std::transform::{identity, translate}
+
+/// The draw state of a pass that keeps the nearest fragment, in reversed depth.
+pub const NEAREST = Depth { compare: Compare::Greater, write: true }
+
+/// The draw state of a shading pass after a depth prepass: where the prepass drew, nothing
+/// written.
+pub const PREPASSED = Depth { compare: Compare::Equal, write: false }
+
+/// The draw state of what's drawn behind everything (the sky): where nothing was drawn.
+pub const BEHIND = Depth { compare: Compare::Equal, write: false }
+
+/// The draw state of what's drawn again over a pass with depth (a creature's motion): where
+/// nothing in front of it was drawn, nothing written.
+pub const SEEN = Depth { compare: Compare::GreaterEqual, write: false }
+
+pub struct Camera: Copy + GpuData {
+    /// World to clip space, without the jitter: this frame's, and the last frame's.
+    pub view_proj: mat4,
+    pub last_view_proj: mat4,
+    pub eye: vec3,
+    /// The near plane's distance (m).
+    pub near: f32,
+    /// The camera's basis: where it looks, its right and its up.
+    pub forward: vec3,
+    pub tan_half: f32,
+    pub right: vec3,
+    /// The screen's width over its height.
+    pub aspect: f32,
+    pub up: vec3,
+    /// Seconds since the program began.
+    pub time: f32,
+    /// The render origin: the world point (whole tiles, y 0) that render space's origin stands
+    /// for. Every position a pass reads is the world's less this.
+    pub origin: vec3,
+    /// The frame's number.
+    pub frame: u32,
+    /// This frame's offset within its pixel, in clip units.
+    pub jitter: vec2,
+    /// The target's size, in pixels.
+    pub screen: vec2,
+    /// 1 when the frame is one of a still's (`camera`'s `grid`): its jitter a cell of a 4 × 4
+    /// grid, tied to its place in the dithers' 16 (`jitter_of`, `lod::anchor`); 0 in play.
+    pub grid: u32,
+}
+
+/// The jitter's cycle: 16 points of the Halton (2, 3) sequence.
+pub const JITTER_CYCLE: u32 = 16
+
+/// Element `i` of the Halton sequence of base `b`, in [0, 1).
+pub fn halton(i: u32, b: u32) -> f32 {
+    var f = 1.0
+    var r = 0.0
+    var n = i
+    while n > 0 {
+        f = f / f32(b)
+        r += f * f32(n % b)
+        n = n / b
+    }
+    r
+}
+
+/// The offset of frame `frame` within its pixel, in [-0.5, 0.5) pixels each way: Halton (2, 3)
+/// from its second point; or, on a still's `grid`, the middle of cell (k % 4, k / 4) of a 4 × 4
+/// grid, where k is the frame's place in the dithers' 16 (`lod::anchor`). Then any 16 frames in
+/// a row take each cell once and each place once, and the dither's step and the jitter's cell
+/// move together: a pixel kept at some of the places is kept at cells spread over its whole
+/// pixel (the Bayer matrix's thresholds are spread so), and its mean is a 256-frame mean's.
+pub fn jitter_of(frame: u32, grid: bool = false) -> vec2 {
+    if grid {
+        let k = frame % 16
+        return (vec2(f32(k % 4), f32(k / 4)) + vec2(0.5)) / 4.0 - vec2(0.5)
+    }
+    let k = frame % JITTER_CYCLE + 1
+    vec2(halton(k, 2) - 0.5, halton(k, 3) - 0.5)
+}
+
+/// A perspective projection with reversed, infinite depth: a point `d` along the view has
+/// depth `near / d`. `fovy` is the height's angle, `aspect` the width over the height.
+pub fn reversed_perspective(fovy: f32, aspect: f32, near: f32) -> mat4 {
+    let f = 1.0 / tan(fovy / 2.0)
+    // View space looks along -z: clip w is -z, and clip z is `near`, so z / w is near / d.
+    mat4(
+        vec4(f / aspect, 0.0, 0.0, 0.0),
+        vec4(0.0, f, 0.0, 0.0),
+        vec4(0.0, 0.0, 0.0, -1.0),
+        vec4(0.0, 0.0, near, 0.0),
+    )
+}
+
+/// The camera at `eye`, looking at `at`, `fovy` high, on a target `width` by `height` pixels,
+/// for frame `frame` at `time` seconds: jittered unless `still`, on a still's grid if `grid`
+/// (`jitter_of`). `last` is the camera of the frame before (itself, for the first).
+pub fn camera(
+    eye: vec3,
+    at: vec3,
+    fovy: f32,
+    width: u32,
+    height: u32,
+    frame: u32,
+    time: f32,
+    last: Camera,
+    still: bool = false,
+    origin: vec3 = vec3(0.0),
+    grid: bool = false,
+) -> Camera {
+    let aspect = f32(width) / f32(height)
+    let near = 0.1
+    let proj = reversed_perspective(fovy, aspect, near)
+    let view = std::transform::look_at(eye, at)
+    let forward = normalize(at - eye)
+    let right = normalize(cross(forward, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, forward)
+    let j = if still { vec2(0.0) } else { jitter_of(frame, grid) }
+    // Last frame's matrix takes this frame's render space: a point here was `moved` further
+    // from the last frame's origin.
+    let moved = origin - last.origin
+    let last_view_proj = if moved == vec3(0.0) { last.view_proj } else {
+        last.view_proj * translate(moved)
+    }
+    Camera {
+        view_proj: proj * view,
+        last_view_proj,
+        eye,
+        near,
+        forward,
+        tan_half: tan(fovy / 2.0),
+        right,
+        aspect,
+        up,
+        time,
+        jitter: vec2(2.0 * j.x / f32(width), -2.0 * j.y / f32(height)),
+        screen: vec2(f32(width), f32(height)),
+        frame,
+        origin,
+        grid: if grid { 1 } else { 0 },
+    }
+}
+
+/// A camera for frame 0 with no frame before it: its own last.
+pub fn first_camera(eye: vec3, at: vec3, fovy: f32, width: u32, height: u32) -> Camera {
+    let c = camera(eye, at, fovy, width, height, frame: 0, time: 0.0, last: blank())
+    Camera { last_view_proj: c.view_proj, ..c }
+}
+
+/// A camera that sees nothing: the start of a chain of cameras.
+pub fn blank() -> Camera {
+    Camera {
+        view_proj: identity(),
+        last_view_proj: identity(),
+        eye: vec3(0.0),
+        near: 0.1,
+        forward: vec3(0.0, 0.0, 1.0),
+        tan_half: 0.5,
+        right: vec3(1.0, 0.0, 0.0),
+        aspect: 1.0,
+        up: vec3(0.0, 1.0, 0.0),
+        time: 0.0,
+        jitter: vec2(0.0),
+        screen: vec2(1.0),
+        frame: 0,
+        origin: vec3(0.0),
+        grid: 0,
+    }
+}
+
+/// The period that what's keyed to the world repeats over (m): the render origin is kept within
+/// half of it either way for noise and hashes (`Camera::keyed`), whose inputs then stay small.
+/// Within 32 km of the world's origin it's the origin itself; a pattern jumps where a game's
+/// origin wraps, 32 km out and every 65 km after.
+pub const KEYED_PERIOD: f32 = 65536.0
+
+impl Camera {
+    /// The render origin wrapped to within half `KEYED_PERIOD` either way: added to a
+    /// render-space point, the point that noise and hashes keyed to the world read (the same
+    /// before and after the origin moves).
+    pub fn keyed(self) -> vec3 {
+        self.origin - round(self.origin / KEYED_PERIOD) * KEYED_PERIOD
+    }
+
+    /// A world point's clip position, jittered.
+    pub fn clip(self, world: vec3) -> vec4 {
+        let c = self.view_proj * vec4(world, 1.0)
+        vec4(c.x + self.jitter.x * c.w, c.y + self.jitter.y * c.w, c.z, c.w)
+    }
+
+    /// The camera without its jitter: its rays (`ray`, `world_at`) through pixels' own points,
+    /// where the output and the history hold them.
+    pub fn unjittered(self) -> Camera {
+        Camera { jitter: vec2(0.0), ..self }
+    }
+
+    /// The ray from the eye through the point `px` of the target (pixels from its top left),
+    /// as this frame's jitter shifted it.
+    pub fn ray(self, px: vec2) -> vec3 {
+        let ndc = vec2(px.x / self.screen.x * 2.0 - 1.0, 1.0 - px.y / self.screen.y * 2.0) -
+            self.jitter
+        normalize(
+            self.forward +
+                self.right * (ndc.x * self.tan_half * self.aspect) +
+                self.up * (ndc.y * self.tan_half),
+        )
+    }
+
+    /// The distance along the view of a fragment of depth `depth` (reversed): infinite at 0.
+    pub fn distance_of(self, depth: f32) -> f32 {
+        self.near / max(depth, 1.0e-12)
+    }
+
+    /// The world point at `px` whose depth is `depth`.
+    pub fn world_at(self, px: vec2, depth: f32) -> vec3 {
+        let ray = self.ray(px)
+        self.eye + ray * (self.distance_of(depth) / dot(ray, self.forward))
+    }
+
+    /// How wide a pixel is at `distance` along the view (m).
+    pub fn footprint(self, distance: f32) -> f32 {
+        distance * 2.0 * self.tan_half / self.screen.y
+    }
+
+    /// Where a world point was on the target last frame, in pixels (unjittered: as the history
+    /// holds it).
+    pub fn last_pixel(self, world: vec3) -> vec2 {
+        let c = self.last_view_proj * vec4(world, 1.0)
+        let ndc = c.xy / c.w
+        vec2((ndc.x * 0.5 + 0.5) * self.screen.x, (0.5 - ndc.y * 0.5) * self.screen.y)
+    }
+
+    /// The angle between where it looks and its view's corners (radians).
+    pub fn corner_angle(self) -> f32 {
+        atan(self.tan_half * sqrt(1.0 + self.aspect * self.aspect))
+    }
+
+    /// Where a world point is on the target this frame, in pixels, unjittered.
+    pub fn pixel(self, world: vec3) -> vec2 {
+        let c = self.view_proj * vec4(world, 1.0)
+        let ndc = c.xy / c.w
+        vec2((ndc.x * 0.5 + 0.5) * self.screen.x, (0.5 - ndc.y * 0.5) * self.screen.y)
+    }
+}
+
+// ---- tags ----------------------------------------------------------------------------------
+
+/// What a pixel shows, in the scene's alpha: its class times 64, plus which one of it (a crown,
+/// a stone, a creature's part). The sky's tag is 0. The look's passes read them.
+pub const SKY: f32 = 0.0
+pub const GROUND: f32 = 64.0
+pub const GRASS: f32 = 128.0
+pub const LEAVES: f32 = 192.0
+pub const BARK: f32 = 256.0
+pub const CREATURE: f32 = 320.0
+pub const ROCK: f32 = 384.0
+pub const FLOWER: f32 = 448.0
+pub const WATER: f32 = 512.0
+/// A veil: drifting, see-through matter (smoke, mist) drawn as coverage kept a share of the time,
+/// which temporal AA settles. Thin, so the AA's history keeps it; no line is drawn round it.
+pub const VEIL: f32 = 576.0
+
+/// A tag's class (0 the sky, 1 the ground, ... 7 flowers, 8 water, 9 veils).
+pub fn class_of(tag: f32) -> u32 {
+    u32(max(tag, 0.0) / 64.0 + 0.001)
+}
+
+/// The classes of thin geometry, which covers part of a pixel (a bit each: grass, leaves,
+/// flowers and veils).
+const THIN: u32 = (1 << class_of(GRASS)) |
+    (1 << class_of(LEAVES)) |
+    (1 << class_of(FLOWER)) |
+    (1 << class_of(VEIL))
+
+/// Whether a class (`class_of`) is thin geometry (`THIN`).
+pub fn thin(class: u32) -> bool {
+    ((THIN >> class) & 1) != 0
+}
+
+/// A veil is a class of its own, and thin: temporal AA keeps its partial coverage.
+@test
+fn a_veil_is_thin_and_its_own_class() {
+    assert(class_of(VEIL) == 9, "a veil shares another class")
+    assert(class_of(VEIL + 63.0) == 9, "a veil's last tag leaves its class")
+    assert(thin(class_of(VEIL)), "a veil isn't thin")
+    assert(!thin(class_of(CREATURE)), "a creature is thin")
+}

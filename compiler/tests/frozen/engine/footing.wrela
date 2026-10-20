@@ -1,0 +1,1020 @@
+// Where a player can stand, and how fast they go: one rule for the sim's collision, the interest
+// check's walkers and the map's reachability, so what the check says a player can reach, a
+// player can walk to.
+//
+// - The ground decides most of it (`pace`): how steep it is (`STEEPEST`), the plateau's edge
+//   (past it the land falls away) and water's depth (a mere's, a stream's). Shallow water slows
+//   a player; deep water stops them.
+// - What stands on the ground stops a player too: trunks, stones and walls, thorny shrubs and
+//   big logs. These are the obstacles (`obstacles_of`): circles and capsules binned on a grid,
+//   packed in 8 bytes each. The sim holds all of a floor's obstacles in its program (a build's
+//   constant) and tests a step only against those near it.
+//
+// The sim moves a player with `step` (or `step_over`, which crosses low logs). `stands` says how
+// fast a player goes at a point, and `walkable_of` gives a grid of the places a player can
+// stand.
+
+use grow::{Grid, Ground, Habit, Heap, LOG_LENGTH, State, Stream, Tree}
+use place::{Map, Water}
+use std::math::TAU
+
+/// The steepest ground a player can stand on (rise over run: about 42°).
+pub const STEEPEST: f32 = 0.9
+/// Water deeper than this (m) stops a player; deeper than `WADE` slows them to `WADING`.
+pub const DEEP: f32 = 0.8
+pub const WADE: f32 = 0.2
+pub const WADING: f32 = 0.45
+/// How far inside the plateau's edge a player can go (m): the edge is a fall, not a slope.
+pub const EDGE: f32 = 1.5
+/// A player's radius (m), against the obstacles.
+pub const BODY: f32 = 0.35
+/// Largest finite log height in the packed field; anything higher remains an uncrossable solid.
+pub const MAX_LOG_HEIGHT: f32 = 62.0 * 0.02
+
+/// The ground's slope at `p` (rise over run), over a metre each way.
+pub fn slope<G: Ground>(g: G, p: vec2) -> f32 {
+    let dx = g.height(p.x + 1.0, p.y) - g.height(p.x - 1.0, p.y)
+    let dz = g.height(p.x, p.y + 1.0) - g.height(p.x, p.y - 1.0)
+    0.5 * length(vec2(dx, dz))
+}
+
+/// How deep the meres' water is at `p` (m; 0 or less on dry ground), where the ground is
+/// `ground` high: a mere's level over its basin.
+pub fn mere_depth(w: Water, p: vec2, ground: f32) -> f32 {
+    var d = 0.0
+    for m in w.meres {
+        if m.z > 0.0 && length(p - m.xy) < m.z * 1.3 {
+            d = max(d, m.w - ground)
+        }
+    }
+    d
+}
+
+/// How fast a player goes at `p` against open level ground (0 can't stand there), from the
+/// ground alone: its slope, the edge, and the meres' water. Streams and what stands on the
+/// ground are the obstacles' (`Obstacles::depth`, `Obstacles::push`).
+pub fn pace<G: Ground>(g: G, w: Water, p: vec2) -> f32 {
+    if g.past_edge(p) > -EDGE {
+        return 0.0
+    }
+    let s = slope(g, p)
+    if s > STEEPEST {
+        return 0.0
+    }
+    let deep = mere_depth(w, p, g.height(p.x, p.y))
+    if deep > DEEP {
+        return 0.0
+    }
+    let wading = if deep > WADE { WADING } else { 1.0 }
+    wading * (1.0 - 0.5 * smoothstep(0.3, STEEPEST, s))
+}
+
+// ---- obstacles ----------------------------------------------------------------------------------
+
+/// What an obstacle is.
+pub enum Thing: Copy + Eq + Fieldless {
+    Trunk,
+    Stone,
+    Wall,
+    Shrub,
+    Log,
+    /// A stretch of a stream: its width is the capsule's, and it has a depth.
+    Stream,
+}
+
+/// An obstacle: a capsule from `a` to `b` of radius `r` (a circle where they're the same), what
+/// it is, and its vertical extent: stream depth or log height above the ground (m).
+pub struct Obstacle: Copy {
+    pub a: vec2,
+    pub b: vec2,
+    pub r: f32,
+    pub thing: Thing,
+    /// Stream depth or log height. Packed log heights round up; an overflow stays solid.
+    pub depth: f32,
+}
+
+impl Obstacle {
+    /// Logs whose recorded height fits within `clearance` can be crossed from above. Standing
+    /// trunks and walls have no bounded height in this representation and always block.
+    pub fn cleared(self, clearance: f32) -> bool {
+        self.thing == Thing::Log && self.depth < 1.0 / 0.0 && self.depth <= clearance
+    }
+
+    /// The distance from `p` to the capsule's surface (negative inside), and the direction out.
+    pub fn reach(self, p: vec2) -> (f32, vec2) {
+        let ab = self.b - self.a
+        let t = clamp(dot(p - self.a, ab) / max(dot(ab, ab), 1.0e-8), 0.0, 1.0)
+        let q = self.a + ab * t
+        let d = p - q
+        let len = length(d)
+        let out = if len > 1.0e-5 { d / len } else { vec2(1.0, 0.0) }
+        (len - self.r, out)
+    }
+}
+
+/// The obstacles' bins (m).
+pub const BIN: f32 = 16.0
+
+/// The obstacles of a stretch of ground, binned: the bins' corner and count each way, each bin's
+/// first item (and one past the last bin's), and the items packed two words each
+/// (`pack`), each bin's in order.
+pub struct Obstacles {
+    pub lo: vec2,
+    pub nx: u32,
+    pub nz: u32,
+    pub start: Vec<u32>,
+    pub items: Vec<u32>,
+}
+
+/// An obstacle as two words, its place from its bin's corner `corner`: its first point (16 bits
+/// each way of the bin), then its thing (3 bits), radius (7 bits, 2 cm steps), length (8 bits,
+/// 25 cm steps), direction (8 bits) and depth (6 bits, 2 cm steps).
+fn pack(o: Obstacle, corner: vec2) -> (u32, u32) {
+    let local = clamp((o.a - corner) / BIN, vec2(0.0), vec2(0.99999))
+    let w0 = u32(local.x * 65536.0) | (u32(local.y * 65536.0) << 16)
+    let ab = o.b - o.a
+    let len = length(ab)
+    let dir = if len > 1.0e-4 { atan2(ab.y, ab.x) } else { 0.0 }
+    let extent = if o.thing == Thing::Log {
+        u32(clamp(ceil(o.depth / 0.02), 0.0, 63.0))
+    } else {
+        min(u32(round(o.depth / 0.02)), 63)
+    }
+    // Log capsules are derived from rendered geometry. Round their size outward, with room
+    // for the direction's quantisation, so packing cannot expose a sliver of solid wood.
+    let radius = if o.thing == Thing::Log { ceil((o.r + len * 0.013 + 0.001) / 0.02) } else {
+        round(o.r / 0.02)
+    }
+    let span = if o.thing == Thing::Log { ceil(len / 0.25) } else { round(len / 0.25) }
+    let w1 = (u32(o.thing) & 7) |
+        (min(u32(radius), 127) << 3) |
+        (min(u32(span), 255) << 10) |
+        ((u32(round((dir / TAU + 1.0) * 256.0)) % 256) << 18) |
+        (extent << 26)
+    (w0, w1)
+}
+
+fn unpack(w0: u32, w1: u32, corner: vec2) -> Obstacle {
+    let a = corner + vec2(f32(w0 & 65535) + 0.5, f32(w0 >> 16) + 0.5) * (BIN / 65536.0)
+    let len = f32((w1 >> 10) & 255) * 0.25
+    let dir = TAU * f32((w1 >> 18) & 255) / 256.0
+    let thing = Thing::from_u32(w1 & 7).unwrap_or(Thing::Stone)
+    let extent = (w1 >> 26) & 63
+    Obstacle {
+        a,
+        b: a + vec2(cos(dir), sin(dir)) * len,
+        r: f32((w1 >> 3) & 127) * 0.02,
+        thing,
+        depth: if thing == Thing::Log && extent == 63 { 1.0 / 0.0 } else { f32(extent) * 0.02 },
+    }
+}
+
+impl Obstacles {
+    /// Obstacles `all` binned over the ground from `lo` to `hi`. A capsule goes in its first
+    /// point's bin; a query reaches a bin each way, so none is longer than a bin.
+    pub fn of(all: [Obstacle], lo: vec2, hi: vec2) -> Obstacles {
+        let nx = u32(ceil((hi.x - lo.x) / BIN))
+        let nz = u32(ceil((hi.y - lo.y) / BIN))
+        var count: Vec<u32> = Vec::filled(nx * nz + 1, 0)
+        var keep: Vec<bool> = Vec::with_capacity(all.len())
+        for o in all {
+            let b = bin_of(lo, nx, nz, o.a)
+            keep.push(b < nx * nz)
+            if b < nx * nz {
+                count[b + 1] += 1
+            }
+        }
+        for k in 0..(nx * nz) {
+            let before = count[k]
+            count[k + 1] += before
+        }
+        var cursor = count.clone()
+        var items: Vec<u32> = Vec::filled(2 * count[nx * nz], 0)
+        var i = 0
+        for o in all {
+            if keep[i] {
+                let b = bin_of(lo, nx, nz, o.a)
+                let corner = lo + vec2(f32(b % nx), f32(b / nx)) * BIN
+                let (w0, w1) = pack(o, corner)
+                items[2 * cursor[b]] = w0
+                items[2 * cursor[b] + 1] = w1
+                cursor[b] += 1
+            }
+            i += 1
+        }
+        Obstacles { lo, nx, nz, start: count, items }
+    }
+
+    /// How many obstacles it holds.
+    pub fn len(self) -> u32 {
+        self.items.len() / 2
+    }
+
+    /// Calls `f` with each obstacle in the bins round `p` (each within a bin of it).
+    pub fn near(self, p: vec2, f: fn(Obstacle)) {
+        let c = vec2i(floor((p - self.lo) / BIN))
+        for dj in 0..3 {
+            let j = c.y + dj - 1
+            if j < 0 || j >= i32(self.nz) {
+                continue
+            }
+            for di in 0..3 {
+                let i = c.x + di - 1
+                if i < 0 || i >= i32(self.nx) {
+                    continue
+                }
+                let b = u32(j) * self.nx + u32(i)
+                let corner = self.lo + vec2(f32(i), f32(j)) * BIN
+                for k in self.start[b]..self.start[b + 1] {
+                    f(unpack(self.items[2 * k], self.items[2 * k + 1], corner))
+                }
+            }
+        }
+    }
+
+    /// Calls `f` once per capsule touching the disk. Include the preceding bin because
+    /// a capsule's first point can lie outside the disk while its far end crosses it.
+    pub fn within(self, p: vec2, radius: f32, f: fn(Obstacle)) {
+        let lo = vec2i(floor((p - vec2(radius + BIN) - self.lo) / BIN))
+        let hi = vec2i(floor((p + vec2(radius + BIN) - self.lo) / BIN))
+        for j in max(lo.y, 0)..min(hi.y + 1, i32(self.nz)) {
+            for i in max(lo.x, 0)..min(hi.x + 1, i32(self.nx)) {
+                let b = u32(j) * self.nx + u32(i)
+                let corner = self.lo + vec2(f32(i), f32(j)) * BIN
+                for k in self.start[b]..self.start[b + 1] {
+                    let o = unpack(self.items[2 * k], self.items[2 * k + 1], corner)
+                    let (distance, _) = o.reach(p)
+                    if distance <= radius {
+                        f(o)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The deepest stream water at `p` (m).
+    pub fn depth(self, p: vec2) -> f32 {
+        var d = 0.0
+        self.near(p, |o| {
+            if o.thing == Thing::Stream {
+                let (out, _) = o.reach(p)
+                if out < 0.0 {
+                    d = max(d, o.depth * min(-out / max(o.r * 0.5, 0.1), 1.0))
+                }
+            }
+        })
+        d
+    }
+
+    /// `p` pushed out of every solid obstacle (not a stream) a body of radius `body` overlaps,
+    /// and whether it overlapped any.
+    pub fn push(self, p: vec2, body: f32) -> (vec2, bool) {
+        let (by, hit) = self.push_by(p, body)
+        (p + by, hit)
+    }
+
+    /// How far `push` moves `p`, and whether it overlapped any: the push alone, so a body far
+    /// from the origin (whose world point is coarse in `f32`) moves by exactly its step when
+    /// nothing is in its way.
+    pub fn push_by(self, p: vec2, body: f32) -> (vec2, bool) {
+        self.push_by_over(p, body, clearance: 0.0)
+    }
+
+    /// The push for a body able to rise over logs up to `clearance` metres tall.
+    pub fn push_by_over(self, p: vec2, body: f32, clearance: f32) -> (vec2, bool) {
+        var by = vec2(0.0)
+        var hit = false
+        for _ in 0..3 {
+            var moved = false
+            let at = p + by
+            self.near(at, |o| {
+                if o.thing != Thing::Stream && !o.cleared(clearance) {
+                    let (d, out) = o.reach(p + by)
+                    if d < body {
+                        by += out * (body - d + 1.0e-3)
+                        moved = true
+                    }
+                }
+            })
+            hit = hit || moved
+            if !moved {
+                break
+            }
+        }
+        (by, hit)
+    }
+
+    /// Whether a body of radius `body` at `p` overlaps a solid obstacle.
+    pub fn blocked(self, p: vec2, body: f32) -> bool {
+        self.blocked_over(p, body, clearance: 0.0)
+    }
+
+    /// Whether anything taller than the body's allowed clearance blocks it.
+    pub fn blocked_over(self, p: vec2, body: f32, clearance: f32) -> bool {
+        var any = false
+        self.near(p, |o| {
+            if o.thing != Thing::Stream && !o.cleared(clearance) {
+                let (d, _) = o.reach(p)
+                any = any || d < body - 1.0e-3
+            }
+        })
+        any
+    }
+
+    /// Height above the ground needed to cross nearby low logs. Rise starts before contact,
+    /// reaches the full log height before the body overlaps, and eases down on the far side.
+    pub fn lift(self, p: vec2, body: f32, clearance: f32) -> f32 {
+        if clearance <= 0.0 {
+            return 0.0
+        }
+        var height = 0.0
+        self.near(p, |o| {
+            if o.cleared(clearance) {
+                let (d, _) = o.reach(p)
+                let blend = 1.0 - smoothstep(body + 0.15, body + 1.8, d)
+                height = max(height, (o.depth + 0.08) * blend)
+            }
+        })
+        height
+    }
+}
+
+fn bin_of(lo: vec2, nx: u32, nz: u32, p: vec2) -> u32 {
+    let c = vec2i(floor((p - lo) / BIN))
+    if c.x < 0 || c.y < 0 || u32(c.x) >= nx || u32(c.y) >= nz {
+        nx * nz
+    } else {
+        u32(c.y) * nx + u32(c.x)
+    }
+}
+
+/// The obstacles a history leaves: each standing trunk taller than a player (alive or dead) as
+/// a circle of its girth; each thorny shrub's thicket as a circle of most of its crown; each log
+/// thick enough not to step over, as a capsule along its fall, in pieces no longer than a bin;
+/// the streams' courses as capsules with their depth; and `stones` (x, z, radius) and `walls`
+/// (each two points and a half-thickness: (a, b), (r, 0)).
+pub fn obstacles_of(
+    trees: [Tree],
+    habits: [Habit],
+    streams: [Stream],
+    stones: [vec3],
+    walls: [vec4],
+    lo: vec2,
+    hi: vec2,
+) -> Obstacles {
+    var all: Vec<Obstacle> = Vec::new()
+    for t in trees {
+        let h = habits[t.kind]
+        if h.thorny {
+            if t.state == State::Alive && t.tall > 0.8 {
+                let r = 0.7 * t.reach
+                all.push(
+                    Obstacle {
+                        a: t.at + t.lean,
+                        b: t.at + t.lean,
+                        r,
+                        thing: Thing::Shrub,
+                        depth: 0.0,
+                    },
+                )
+            }
+        } else if (t.state == State::Alive || t.state == State::Snag) && t.tall > 2.0 {
+            let r = max(t.girth, 0.04)
+            all.push(Obstacle { a: t.at, b: t.at, r, thing: Thing::Trunk, depth: 0.0 })
+        } else if t.state == State::Log && t.girth > 0.25 {
+            let len = t.tall * LOG_LENGTH
+            var s = 0.0
+            while s < len {
+                let e = min(s + 0.75 * BIN, len)
+                all.push(
+                    Obstacle {
+                        a: t.at + t.fall * s,
+                        b: t.at + t.fall * e,
+                        r: t.girth,
+                        thing: Thing::Log,
+                        depth: 2.0 * t.girth,
+                    },
+                )
+                s = e
+            }
+        }
+    }
+    for s in streams {
+        for i in 1..s.points.len() {
+            let p = s.points[i - 1]
+            let q = s.points[i]
+            // A stream's authored points can be more than a bin apart. Each capsule is stored
+            // in its first point's bin, and `near` only reads the neighbouring bins.
+            let n = max(u32(ceil(length(q.xy - p.xy) / (0.75 * BIN))), 1)
+            for k in 0..n {
+                let a = mix(p.xy, q.xy, vec2(f32(k) / f32(n)))
+                let b = mix(p.xy, q.xy, vec2(f32(k + 1) / f32(n)))
+                all.push(Obstacle { a, b, r: 0.5 * p.z, thing: Thing::Stream, depth: p.w })
+            }
+        }
+    }
+    for st in stones {
+        all.push(Obstacle { a: st.xy, b: st.xy, r: st.z, thing: Thing::Stone, depth: 0.0 })
+    }
+    for w in walls {
+        // A wall longer than a bin, in pieces.
+        let len = length(w.zw - w.xy)
+        let n = u32(ceil(len / (0.75 * BIN)))
+        for k in 0..n {
+            let a = mix(w.xy, w.zw, vec2(f32(k) / f32(n)))
+            let b = mix(w.xy, w.zw, vec2(f32(k + 1) / f32(n)))
+            all.push(Obstacle { a, b, r: 0.5, thing: Thing::Wall, depth: 0.0 })
+        }
+    }
+    Obstacles::of(all, lo, hi)
+}
+
+// ---- a step -------------------------------------------------------------------------------------
+
+/// How far a body of radius `body` stepping from `p` by `d` moves: pushed out of the obstacles,
+/// and held back from ground it can't stand on (it slides along the way it can go, or stays).
+/// And how fast it goes where it ends against open level ground (`pace`, with the streams'
+/// water). The move, not the end: with nothing in its way it's `d` exactly. A body on ground too
+/// steep to stand on (it came to rest on a slope's limit) can always step off it: down, or onto
+/// less steep ground (`steps_off`).
+pub fn step<G: Ground>(g: G, w: Water, o: Obstacles, p: vec2, d: vec2, body: f32) -> (vec2, f32) {
+    step_over(g, w, o, p, d, body, clearance: 0.0)
+}
+
+/// A step with a bounded height allowance for crossing low logs. Ground, water, tall logs,
+/// trunks and walls keep the same collision rules as a grounded step.
+pub fn step_over<G: Ground>(
+    g: G,
+    w: Water,
+    o: Obstacles,
+    p: vec2,
+    d: vec2,
+    body: f32,
+    clearance: f32,
+) -> (vec2, f32) {
+    let here = stands(g, w, o, p)
+    let tries = [d, vec2(d.x, 0.0), vec2(0.0, d.y)]
+    for t in tries {
+        let (by, _) = o.push_by_over(p + t, body, clearance)
+        let moved = t + by
+        if length(moved) > 2.0 * length(d) + 0.05 {
+            // Pushed further than it stepped: squeezed between two obstacles.
+            continue
+        }
+        let q = p + moved
+        if o.blocked_over(q, body, clearance) {
+            continue
+        }
+        let k = stands(g, w, o, q)
+        if k > 0.0 || (here == 0.0 && steps_off(g, w, o, p, q)) {
+            return (moved, k)
+        }
+    }
+    (vec2(0.0), here)
+}
+
+/// Whether a body at `p`, on ground too steep to stand on, gets off it by going to `q`: down, or
+/// onto less steep ground, and not over the edge or into deep water. What stops a body for
+/// another reason (the edge, deep water) still stops it.
+fn steps_off<G: Ground>(g: G, w: Water, o: Obstacles, p: vec2, q: vec2) -> bool {
+    let s = slope(g, p)
+    if s <= STEEPEST {
+        return false
+    }
+    let up = g.height(q.x, q.y)
+    if g.past_edge(q) > -EDGE || mere_depth(w, q, up) > DEEP || o.depth(q) > DEEP {
+        return false
+    }
+    slope(g, q) < s || up < g.height(p.x, p.y)
+}
+
+/// How fast a player goes at `p` (0 can't stand there): the ground's `pace`, slowed in a stream's
+/// shallows and stopped in its deep water.
+pub fn stands<G: Ground>(g: G, w: Water, o: Obstacles, p: vec2) -> f32 {
+    let k = pace(g, w, p)
+    if k == 0.0 {
+        return 0.0
+    }
+    let deep = o.depth(p)
+    if deep > DEEP {
+        0.0
+    } else if deep > WADE {
+        min(k, WADING)
+    } else {
+        k
+    }
+}
+
+// ---- ways on foot -------------------------------------------------------------------------------
+
+/// Where a player can stand on a grid of `cell` m (`walkable_of`): each cell stands (`stands`,
+/// at its middle, and on steep ground at the middles of its sides too) with room for a body a
+/// little wider than a player's (logs, walls and thickets close the cells along them).
+pub struct Walkable {
+    pub grid: Grid,
+    pub ok: Vec<bool>,
+}
+
+/// How much wider than a player a walkable cell's room is (m): a way planned on the mask keeps
+/// clear of what it passes.
+const CLEAR: f32 = 0.15
+
+/// The walkable mask over `lo` to `hi`, `cell` m a cell.
+pub fn walkable_of<G: Ground>(
+    g: G,
+    w: Water,
+    o: Obstacles,
+    lo: vec2,
+    hi: vec2,
+    cell: f32,
+) -> Walkable {
+    let grid = Grid::over(lo, hi, cell)
+    var rows: Vec<Row> = Vec::from_fn(grid.nz, |j| Row { j, ok: Vec::new() })
+    rows.par_each_mut(|r| {
+        r.ok = Vec::with_capacity(grid.nx)
+        for i in 0..grid.nx {
+            let p = grid.centre(r.j * grid.nx + i)
+            r.ok.push(cell_stands(g, w, o, p, grid.cell) && !o.blocked(p, BODY + CLEAR))
+        }
+    })
+    var ok: Vec<bool> = Vec::with_capacity(grid.cells())
+    for mut r in rows {
+        ok.append(mut r.ok)
+    }
+    Walkable { grid, ok }
+}
+
+/// Ground steeper than this (rise over run) at a cell's middle is tested at the middles of the
+/// cell's sides too: a band too steep to stand on can lie between two cells' middles, and a way
+/// planned across them would lead a player onto it.
+const ROUGH: f32 = 0.5
+
+/// Whether a player stands in the cell of `cell` m round `p`: at its middle, and where the ground
+/// there is steep (`ROUGH`), at the middles of its four sides, which a way crosses.
+fn cell_stands<G: Ground>(g: G, w: Water, o: Obstacles, p: vec2, cell: f32) -> bool {
+    if stands(g, w, o, p) == 0.0 {
+        return false
+    }
+    if slope(g, p) <= ROUGH {
+        return true
+    }
+    let h = 0.5 * cell
+    for d in [vec2(h, 0.0), vec2(-h, 0.0), vec2(0.0, h), vec2(0.0, -h)] {
+        if stands(g, w, o, p + d) == 0.0 {
+            return false
+        }
+    }
+    true
+}
+
+/// A row of the mask, as a helper works it out.
+struct Row {
+    j: u32,
+    ok: Vec<bool>,
+}
+
+/// A cell's eight neighbours, and the two it passes between on a diagonal (0 for none).
+const STEPS = [
+    vec2i(1, 0),
+    vec2i(-1, 0),
+    vec2i(0, 1),
+    vec2i(0, -1),
+    vec2i(1, 1),
+    vec2i(1, -1),
+    vec2i(-1, 1),
+    vec2i(-1, -1),
+]
+
+impl Walkable {
+    /// Takes out each cell that `o` blocks, as `walkable_of` judges it (a player and `CLEAR`
+    /// round it): for solids that the mask's own obstacles don't hold.
+    pub fn without(mut self, o: Obstacles) {
+        for c in 0..self.grid.cells() {
+            if self.ok[c] && o.blocked(self.grid.centre(c), BODY + CLEAR) {
+                self.ok[c] = false
+            }
+        }
+    }
+
+    /// The walkable cell nearest `p` (looked for within 20 cells), or `grow::NONE`.
+    pub fn nearest(self, p: vec2) -> u32 {
+        let g = self.grid
+        let c = vec2i(floor((p - g.lo) / g.cell))
+        let offset = abs((p - g.lo) / g.cell - vec2(c) - vec2(0.5))
+        var best = grow::NONE
+        var d = bitcast_f32(0x7f7fffff)
+        for r in 0..20 {
+            for dj in -r..(r + 1) {
+                for di in -r..(r + 1) {
+                    let q = c + vec2i(di, dj)
+                    if (abs(di) == r || abs(dj) == r) &&
+                        q.x >= 0 &&
+                        q.y >= 0 &&
+                        q.x < i32(g.nx) &&
+                        q.y < i32(g.nz) {
+                        let k = u32(q.y) * g.nx + u32(q.x)
+                        if self.ok[k] && length(g.centre(k) - p) < d {
+                            d = length(g.centre(k) - p)
+                            best = k
+                        }
+                    }
+                }
+            }
+            // The nearest point in the next ring is at least this far away. A farther
+            // corner of this ring can lose to a side of the next one.
+            let next = (f32(r) + 1.0 - max(offset.x, offset.y)) * g.cell
+            if best != grow::NONE && (r == 0 || d <= next) {
+                return best
+            }
+        }
+        best
+    }
+
+    /// The quickest way on the mask from `from` to `to` (A*: eight neighbours, no corner cut
+    /// between two closed cells), as cell middles; empty if there's none.
+    pub fn way(self, from: vec2, to: vec2) -> Vec<vec2> {
+        let g = self.grid
+        var out: Vec<vec2> = Vec::new()
+        let start = self.nearest(from)
+        let goal = self.nearest(to)
+        if start == grow::NONE || goal == grow::NONE {
+            return out
+        }
+        let nn = g.cells()
+        var cost: Vec<f32> = Vec::filled(nn, 1.0e30)
+        var came: Vec<u32> = Vec::filled(nn, grow::NONE)
+        var open = Heap { items: Vec::new() }
+        cost[start] = 0.0
+        open.push(length(g.centre(goal) - g.centre(start)), start)
+        while !open.items.is_empty() {
+            let c = open.pop().y
+            if c == goal {
+                break
+            }
+            let here = vec2i(i32(c % g.nx), i32(c / g.nx))
+            for k in 0..8 {
+                let q = here + STEPS[k]
+                if q.x < 0 || q.y < 0 || q.x >= i32(g.nx) || q.y >= i32(g.nz) {
+                    continue
+                }
+                let n = u32(q.y) * g.nx + u32(q.x)
+                if !self.ok[n] {
+                    continue
+                }
+                // A diagonal step only between two open cells.
+                if k >= 4 {
+                    let a = u32(here.y) * g.nx + u32(q.x)
+                    let b = u32(q.y) * g.nx + u32(here.x)
+                    if !self.ok[a] || !self.ok[b] {
+                        continue
+                    }
+                }
+                let step = if k >= 4 { 1.41421 } else { 1.0 }
+                let c2 = cost[c] + step * g.cell
+                if c2 < cost[n] {
+                    cost[n] = c2
+                    came[n] = c
+                    open.push(c2 + length(g.centre(goal) - g.centre(n)), n)
+                }
+            }
+        }
+        if came[goal] == grow::NONE && goal != start {
+            return out
+        }
+        var c = goal
+        while c != start && c != grow::NONE {
+            out.push(g.centre(c))
+            c = came[c]
+        }
+        out.push(g.centre(start))
+        var back: Vec<vec2> = Vec::with_capacity(out.len())
+        var k = out.len()
+        while k > 0 {
+            k -= 1
+            back.push(out[k])
+        }
+        back
+    }
+
+    /// The cells a player can walk to from `from` (as `way` steps: eight neighbours, no corner
+    /// cut between two closed cells).
+    pub fn reached_from(self, from: vec2) -> Vec<bool> {
+        let g = self.grid
+        var seen: Vec<bool> = Vec::filled(g.cells(), value: false)
+        let start = self.nearest(from)
+        if start == grow::NONE {
+            return seen
+        }
+        var todo: Vec<u32> = Vec::from([start])
+        seen[start] = true
+        while !todo.is_empty() {
+            let c = todo.pop().unwrap()
+            let here = vec2i(i32(c % g.nx), i32(c / g.nx))
+            for k in 0..8 {
+                let q = here + STEPS[k]
+                if q.x < 0 || q.y < 0 || q.x >= i32(g.nx) || q.y >= i32(g.nz) {
+                    continue
+                }
+                let n = u32(q.y) * g.nx + u32(q.x)
+                if seen[n] || !self.ok[n] {
+                    continue
+                }
+                if k >= 4 {
+                    let a = u32(here.y) * g.nx + u32(q.x)
+                    let b = u32(q.y) * g.nx + u32(here.x)
+                    if !self.ok[a] || !self.ok[b] {
+                        continue
+                    }
+                }
+                seen[n] = true
+                todo.push(n)
+            }
+        }
+        seen
+    }
+
+    /// Whether a cell `reached` (`reached_from`) is within `reach` of `at`.
+    pub fn reaches(self, reached: [bool], at: vec2, reach: f32) -> bool {
+        let g = self.grid
+        let lo = vec2i(floor((at - vec2(reach) - g.lo) / g.cell))
+        let n = i32(ceil(2.0 * reach / g.cell)) + 1
+        for dj in 0..n {
+            for di in 0..n {
+                let q = lo + vec2i(di, dj)
+                if q.x >= 0 && q.y >= 0 && q.x < i32(g.nx) && q.y < i32(g.nz) {
+                    let c = u32(q.y) * g.nx + u32(q.x)
+                    if reached[c] && length(g.centre(c) - at) <= reach {
+                        return true
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// A tour of `stops` on foot, in their order: the quickest way between each two (`way`), a
+    /// point every `every` m or so; and the stops no way was found to (skipped).
+    pub fn tour(self, stops: [vec2], every: f32) -> (Vec<vec2>, Vec<vec2>) {
+        var out: Vec<vec2> = Vec::new()
+        var missed: Vec<vec2> = Vec::new()
+        var from = if stops.len() == 0 { vec2(0.0) } else { stops[0] }
+        for i in 1..stops.len() {
+            let w = self.way(from, stops[i])
+            if w.is_empty() {
+                missed.push(stops[i])
+                continue
+            }
+            for p in w {
+                if out.is_empty() || length(p - out[out.len() - 1]) >= every {
+                    out.push(p)
+                }
+            }
+            from = stops[i]
+        }
+        (out, missed)
+    }
+}
+
+// ---- tests --------------------------------------------------------------------------------------
+
+/// A cell in the next square ring can be nearer than the previous ring's opposite corner.
+@test
+fn nearest_walkable_uses_distance_across_grid_rings() {
+    let grid = Grid::over(vec2(0.0), vec2(24.0), 1.0)
+    var ok: Vec<bool> = Vec::filled(grid.cells(), value: false)
+    ok[9 * grid.nx + 9] = true
+    let closest = 10 * grid.nx + 12
+    ok[closest] = true
+    let mask = Walkable { grid, ok }
+    assert(mask.nearest(vec2(10.99)) == closest, "the previous ring's farther corner was selected")
+    let coarse = Grid::over(vec2(0.0), vec2(8589934592.0), 4294967296.0)
+    let wide = Walkable { grid: coarse, ok: Vec::from([true, false, false, false]) }
+    assert(wide.nearest(vec2(0.0)) == 0, "an artificial distance limit lost the containing cell")
+}
+
+/// A stream segment longer than a bin still has water at its far end, where a query cannot
+/// see the bin holding its first point.
+@test
+fn a_long_stream_has_depth_across_its_binned_length() {
+    let stream = Stream {
+        points: Vec::from([vec4(0.0, 10.0, 2.0, 1.0), vec4(40.0, 10.0, 2.0, 1.0)]),
+    }
+    let trees: Vec<Tree> = Vec::new()
+    let habits: Vec<Habit> = Vec::new()
+    let stones: Vec<vec3> = Vec::new()
+    let walls: Vec<vec4> = Vec::new()
+    let o = obstacles_of(trees, habits, [take stream], stones, walls, vec2(0.0), vec2(64.0, 32.0))
+    assert(o.depth(vec2(32.0, 10.0)) > 0.9, "the far part of the stream became dry")
+}
+
+/// Ground for the tests: level, but rising at `rise` (rise over run) from x = `from` to x = `to`.
+struct Band: Copy {
+    from: f32,
+    to: f32,
+    rise: f32,
+}
+
+impl Ground for Band {
+    fn height(self, x: f32, z: f32) -> f32 {
+        self.rise * (clamp(x, self.from, self.to) - self.from)
+    }
+
+    fn past_edge(self, p: vec2) -> f32 {
+        -100.0
+    }
+
+    fn rock(self, p: vec2) -> f32 {
+        0.0
+    }
+}
+
+/// No water, and nothing standing on the ground, over 20 m by 20 m.
+fn dry() -> (Water, Obstacles) {
+    let water = Water {
+        meres: [vec4(0.0), vec4(0.0)],
+        springs: [vec2(0.0), ..vec2(0.0)],
+        spring_count: 0,
+        falls: [vec2(0.0), vec2(0.0)],
+    }
+    let nothing: Vec<Obstacle> = Vec::new()
+    (water, Obstacles::of(nothing, vec2(0.0), vec2(20.0)))
+}
+
+/// A band too steep to stand on that lies between two cells' middles closes the cells beside it,
+/// so no way crosses it; a band a player can stand on is crossed. The band, 2.2 m wide at 0.95,
+/// is too steep (`slope` over a metre each way) only within 0.2 m of x = 11, which no cell's
+/// middle (x = 10.5, 11.5) is.
+@test
+fn a_way_doesnt_cross_a_steep_band_between_two_cells() {
+    let (w, o) = dry()
+    let steep = Band { from: 9.9, to: 12.1, rise: 0.95 }
+    assert(stands(steep, w, o, vec2(10.5, 5.0)) > 0.0, "the cell west of the band stands")
+    assert(stands(steep, w, o, vec2(11.5, 5.0)) > 0.0, "the cell east of the band stands")
+    assert(stands(steep, w, o, vec2(11.0, 5.0)) == 0.0, "the band's middle doesn't")
+    let mask = walkable_of(steep, w, o, vec2(0.0), vec2(20.0), 1.0)
+    let way = mask.way(vec2(5.0, 5.0), vec2(15.0, 5.0))
+    assert(way.is_empty(), f"a way of {way.len()} cells crosses the band")
+    let gentle = Band { from: 9.9, to: 12.1, rise: 0.8 }
+    let crossed = walkable_of(gentle, w, o, vec2(0.0), vec2(20.0), 1.0)
+    assert(!crossed.way(vec2(5.0, 5.0), vec2(15.0, 5.0)).is_empty(), "a gentle band is crossed")
+}
+
+/// A solid that the mask's obstacles don't hold, taken out of it, closes the cells round it as
+/// the mask's own would, and a way goes round it.
+@test
+fn a_mask_without_a_solid_closes_its_cells_as_its_own_obstacles_do() {
+    let (w, o) = dry()
+    let flat = Band { from: 30.0, to: 31.0, rise: 0.0 }
+    let log = Obstacle {
+        a: vec2(10.0, 2.0),
+        b: vec2(10.0, 18.0),
+        r: 0.4,
+        thing: Thing::Log,
+        depth: 1.0 / 0.0,
+    }
+    let own = walkable_of(
+        flat,
+        w,
+        Obstacles::of([log], vec2(0.0), vec2(20.0)),
+        vec2(0.0),
+        vec2(20.0),
+        1.0,
+    )
+    var mask = walkable_of(flat, w, o, vec2(0.0), vec2(20.0), 1.0)
+    assert(!mask.way(vec2(5.0, 10.0), vec2(15.0, 10.0)).is_empty(), "open ground is crossed")
+    mask.without(Obstacles::of([log], vec2(0.0), vec2(20.0)))
+    assert(mask.ok == own.ok, "the cells closed differ from the mask's own obstacles'")
+    let way = mask.way(vec2(5.0, 10.0), vec2(15.0, 10.0))
+    assert(!way.is_empty(), "no way round the log")
+    for p in way {
+        assert(
+            abs(p.x - 10.0) > BODY + 0.4 || p.y < 2.0 || p.y > 18.0,
+            f"the way crosses the log at {p}",
+        )
+    }
+}
+
+/// A body on ground too steep to stand on steps off it, down, but not up it/// A body on ground too steep to stand on steps off it, down, but not up it (the floor's walk
+/// stopped for good on the crag's talus); one that stands is still held back from ground too
+/// steep.
+@test
+fn a_body_on_ground_too_steep_steps_off_it() {
+    let (w, o) = dry()
+    let g = Band { from: 5.0, to: 15.0, rise: 1.2 }
+    let at = vec2(10.0, 10.0)
+    assert(stands(g, w, o, at) == 0.0, "the slope is too steep to stand on")
+    let (down, _) = step(g, w, o, at, vec2(-0.1, 0.0), BODY)
+    assert(length(down - vec2(-0.1, 0.0)) < 1.0e-5, f"it stepped {down} down the slope")
+    let (up, _) = step(g, w, o, at, vec2(0.1, 0.0), BODY)
+    assert(length(up) < 1.0e-5, f"it stepped {up} up the slope")
+    // Below the slope (`slope` is over a metre each way, so it steepens from x = 4): a body that
+    // stands walks on until the next step would be too steep (past x = 5.5), and stops there.
+    let (on, _) = step(g, w, o, vec2(4.0, 10.0), vec2(0.1, 0.0), BODY)
+    assert(length(on) > 0.05, "a body below the slope walks toward it")
+    let (held, _) = step(g, w, o, vec2(5.45, 10.0), vec2(0.1, 0.0), BODY)
+    assert(length(held) < 1.0e-5, f"a body that stands stepped {held} onto ground too steep")
+}
+
+/// A floating body crosses a low log with a smooth rise, but tall logs and standing trunks
+/// still block it. A grounded body retains its collision with the same low log.
+@test
+fn bounded_clearance_crosses_low_logs_and_keeps_tall_obstacles_solid() {
+    let g = Band { from: 0.0, to: 20.0, rise: 0.0 }
+    let (water, _) = dry()
+    for thing in [Thing::Log, Thing::Trunk, Thing::Wall] {
+        for radius in [0.4, 0.8] {
+            let item = Obstacle {
+                a: vec2(4.0, 10.0),
+                b: vec2(12.0, 10.0),
+                r: radius,
+                thing,
+                depth: 2.0 * radius,
+            }
+            let o = Obstacles::of([item], vec2(0.0), vec2(20.0))
+            var at = vec2(8.0, 6.0)
+            var previous = 0.0
+            var high = 0.0
+            for _ in 0..160 {
+                let (moved, _) = step_over(g, water, o, at, vec2(0.0, 0.05), BODY, 1.2)
+                at += moved
+                let height = o.lift(at, BODY, 1.2)
+                assert(abs(height - previous) < 0.05, f"the lift jumped {height - previous} m")
+                if o.blocked(at, BODY) {
+                    assert(height >= 2.0 * radius, "the floating body clipped the log")
+                }
+                high = max(high, height)
+                previous = height
+            }
+            if thing == Thing::Log && radius < 0.6 {
+                assert(at.y > 13.9 && high > 0.8 && previous == 0.0, "the low log was not crossed")
+                let (edge, _) = o.push(vec2(8.0, 9.9), BODY)
+                let (held, _) = step(g, water, o, edge, vec2(0.0, 0.05), BODY)
+                assert(length(held) < 0.01, "the grounded body crossed the same low log")
+            } else {
+                assert(at.y < 10.0 - radius && high == 0.0, "a tall obstacle was cleared")
+            }
+        }
+    }
+}
+
+/// A recorded log height can exceed its girth, as for wood resting above a hollow. Packing
+/// rounds height up, and overflow never turns a tall obstacle into a clearable short one.
+@test
+fn log_height_packing_is_conservative_and_overflow_stays_solid() {
+    for height in [0.801, 1.201, 1.26, 4.0] {
+        let item = Obstacle {
+            a: vec2(4.0),
+            b: vec2(6.0, 4.0),
+            r: 0.2,
+            thing: Thing::Log,
+            depth: height,
+        }
+        let o = Obstacles::of([item], vec2(0.0), vec2(16.0))
+        var found = false
+        o.near(vec2(5.0, 4.0), |stored| {
+            found = true
+            assert(stored.depth >= height, "packing lowered the log height")
+            if height > 1.2 {
+                assert(!stored.cleared(1.2), "a high log became clearable")
+            }
+            if height >= 1.26 {
+                assert(!stored.cleared(1000.0), "overflow became a finite short log")
+            }
+        })
+        assert(found, "the log was lost")
+        if height < 1.2 {
+            assert(o.lift(vec2(5.0, 4.0), BODY, 1.2) > height, "lift used girth instead of height")
+        }
+    }
+}
+
+/// Regional queries include long capsule starts in an adjacent bin and omit distant shapes.
+@test
+fn regional_obstacles_include_capsules_starting_outside_the_disk() {
+    let o = Obstacles::of(
+        [
+            Obstacle {
+                a: vec2(-25.0, 0.0),
+                b: vec2(-13.0, 0.0),
+                r: 0.4,
+                thing: Thing::Wall,
+                depth: 0.0,
+            },
+            Obstacle {
+                a: vec2(40.0, 0.0),
+                b: vec2(40.0, 0.0),
+                r: 0.4,
+                thing: Thing::Trunk,
+                depth: 0.0,
+            },
+        ],
+        vec2(-64.0),
+        vec2(64.0),
+    )
+    var count = 0
+    o.within(vec2(0.0), 16.0, |item| {
+        count += 1
+        assert(item.thing == Thing::Wall, "regional query included a distant shape")
+    })
+    assert(count == 1, "regional query lost or duplicated the long capsule")
+}

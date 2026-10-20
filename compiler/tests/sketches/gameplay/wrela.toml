@@ -5,5 +5,5 @@
 name = "gameplay"
 
 [dependencies]
-engine = { path = "../../../../engine" }
-ui = { path = "../../../../ui" }
+engine = { path = "../../frozen/engine" }
+ui = { path = "../../frozen/ui" }

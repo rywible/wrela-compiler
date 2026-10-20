@@ -1,0 +1,2410 @@
+// The interest check: from every place a player can stand on a floor, what draws the eye
+// somewhere new, and how a player who follows the draws gets on.
+//
+// It is a tape measure for an author, not a judge of beauty: it can say a place is dull, never
+// that it is good. Run it with `check` on a floor's map and what its history left (`Evidence`);
+// `report` gives what it found as JSON, and `map_image` draws it.
+//
+// What the eye sees is worked out from what a history left (its trees, its light, its trails),
+// on a grid of `Settings::cell` (`sight_of`):
+// - the ground's height;
+// - the crowns' tops and bases, and how much they hide;
+// - the trunks and the undergrowth at eye height;
+// - the open ground and the trails.
+// A sightline loses light to what it passes through (Beer–Lambert), and the ground stops it.
+// The eye is a third-person camera's: `Settings::eye` above the ground.
+//
+// A draw is something seen that leads somewhere. Each has a target, a place to walk to, and a
+// strength (0 to 1). The kinds of draw:
+// - a keystone (a site: its size on screen, against the sky or not, how hazy);
+// - an opening (light through the trees, seen from under them);
+// - a crest (rising ground that hides what is beyond it);
+// - a trail running away from the eye;
+// - a small feature (a veteran tree, a silver snag, a big log, a stone).
+//
+// The checks:
+// - the share of the walkable floor where nothing draws (dead);
+// - whether each of the map's relations holds;
+// - curious walkers, who follow the strongest draw to a place they have not been, at a player's
+//   run: the times between arrivals (the cadence) and the time they are lost;
+// - the critical path's pilgrims, who keep to the trails and the anchors;
+// - whether the sites a player must reach can be reached on foot from the gate (`footing`'s
+//   rule).
+
+use footing::{Obstacles, Thing, pace}
+use grow::{Grid, Ground, Habit, Heap, History, State, Tree, canopy}
+use noise::rand
+use place::{Feature, Map, Relation, Site, SiteKind}
+use std::math::TAU
+use std::time::phase
+
+/// How the check looks: its sight grid's cell (m), a view every `view` m, the directions a view
+/// sweeps, the eye's height above the ground (m), a player's run (m/s), how long each walker
+/// walks (s), how many walkers start each km² (each twice, with two seeds), and how many
+/// pilgrims walk the trails from the gate (four hours each).
+pub struct Settings: Copy {
+    pub cell: f32,
+    pub view: f32,
+    pub azimuths: u32,
+    pub eye: f32,
+    pub run: f32,
+    pub walk_for: f32,
+    pub starts_per_km2: f32,
+    pub trail_walkers: u32,
+}
+
+/// The check as the floor's tests read it: 4 m cells, a view each 8 m, 48 directions; 16 walkers
+/// for each 0.91 km² of the floor, an hour each; at the third person's eye and a player's run.
+pub const FULL = Settings {
+    cell: 4.0,
+    view: 8.0,
+    azimuths: 48,
+    eye: 2.3,
+    run: 5.0,
+    walk_for: 3600.0,
+    starts_per_km2: 17.6,
+    trail_walkers: 16,
+}
+
+/// The check the map lens runs after each edit, with the preview's history: a view each 16 m,
+/// 32 directions, and no walkers (what the lens shows is the views, the relations and the
+/// openings; the walkers' cadence is the bake's check's).
+pub const QUICK = Settings {
+    cell: 4.0,
+    view: 16.0,
+    azimuths: 32,
+    eye: 2.3,
+    run: 5.0,
+    walk_for: 3600.0,
+    starts_per_km2: 0.0,
+    trail_walkers: 0,
+}
+
+// ---- what the check reads of a history ----------------------------------------------------------
+
+/// What the check reads of a history: its trees, the present's light at the ground and thorn
+/// (on `fields`), the ground's wetness (on `wet_grid`) and the trails' wear (on `wear_grid`).
+/// The same from a history as it ends (`of`) or from its bake read back (`bake`'s tiles). And
+/// each tree as it's drawn, where the floor gives them (`crowns`, a tree each): the eye sees what
+/// the renderer draws; none, and they're the history's own (its reach, a base from its height
+/// and light, its girth, its height). And what's built, that the eye can't see through
+/// (`solids`: x, z, radius, height). And the ground's height at each cell of `fields`, where
+/// the history read it (`heights`; empty where it didn't): the check reads it again only on a
+/// grid of its own.
+pub struct Evidence {
+    pub trees: Vec<Tree>,
+    pub crowns: Vec<Drawn>,
+    pub solids: Vec<vec4>,
+    pub fields: Grid,
+    pub heights: Vec<f32>,
+    pub light: Vec<f32>,
+    pub thorn: Vec<f32>,
+    pub wet_grid: Grid,
+    pub wet: Vec<f32>,
+    pub wear_grid: Grid,
+    pub wear: Vec<f32>,
+}
+
+impl Evidence {
+    /// A history's, as it ends.
+    pub fn of(h: History) -> Evidence {
+        Evidence {
+            trees: h.trees.clone(),
+            crowns: Vec::new(),
+            solids: Vec::new(),
+            fields: h.land.grid,
+            heights: h.land.heights.clone(),
+            light: h.light.clone(),
+            thorn: h.thorn.clone(),
+            wet_grid: h.land.grid,
+            wet: h.land.wet.clone(),
+            wear_grid: h.herd_grid,
+            wear: h.wear.clone(),
+        }
+    }
+
+    /// From decisions alone (a bake's, read back): `trees`, and the wetness and wear on their
+    /// grids; the light and thorn worked out again on `fields` in year `present` (the
+    /// consequences, `grow::canopy`).
+    pub fn of_decisions(
+        trees: take Vec<Tree>,
+        habits: [Habit],
+        present: i32,
+        fields: Grid,
+        wet_grid: Grid,
+        wet: take Vec<f32>,
+        wear_grid: Grid,
+        wear: take Vec<f32>,
+    ) -> Evidence {
+        let (light, thorn) = canopy(fields, trees, habits, present)
+        Evidence {
+            trees,
+            crowns: Vec::new(),
+            solids: Vec::new(),
+            fields,
+            heights: Vec::new(),
+            light,
+            thorn,
+            wet_grid,
+            wet,
+            wear_grid,
+            wear,
+        }
+    }
+}
+
+/// A tree as it's drawn (`Evidence::crowns`): its crown's base, top and reach (m), how dense its
+/// leaves are against its kind's whole crown (a crown drawn narrower holds them closer), and
+/// its trunk's radius at the eye (m).
+pub struct Drawn: Copy {
+    pub base: f32,
+    pub top: f32,
+    pub reach: f32,
+    pub dense: f32,
+    pub trunk: f32,
+}
+
+// ---- what the eye sees --------------------------------------------------------------------------
+
+/// What the eye needs of the place, cell by cell.
+pub struct Sight {
+    pub grid: Grid,
+    /// The ground's height (m).
+    pub ground: Vec<f32>,
+    /// The crowns' top and base, above the ground (m; 0 where there's no crown).
+    pub top: Vec<f32>,
+    pub base: Vec<f32>,
+    /// How much a sightline loses per metre in the crowns, and at eye height below them (trunks
+    /// and undergrowth; and the trunks' share of it), as extinction (1/m).
+    pub crown: Vec<f32>,
+    pub under: Vec<f32>,
+    pub stems: Vec<f32>,
+    /// How high the undergrowth stands (m above the ground): its saplings' tops, and 2.5 m
+    /// (trunks and logs at the eye) at the least.
+    pub brush_top: Vec<f32>,
+    /// Each cell's trunks as they stand (x, z, radius at the eye; cell `c`'s from
+    /// `trunk_start[c]` to `trunk_start[c + 1]`), which a sightline meets near the eye
+    /// (`NEAR_EXACT`), where a cell's average wouldn't show the one in front of it.
+    pub trunk_start: Vec<u32>,
+    pub trunks: Vec<vec3>,
+    /// What's built a metre or more across, which nothing is seen through: the tower, a big
+    /// stone (x, z, radius, height above the ground).
+    pub solids: Vec<vec4>,
+    /// Light at the ground (0 deep shade to 1 open sky), and trail wear (0 to 1).
+    pub open: Vec<f32>,
+    pub trail: Vec<f32>,
+    /// How fast a player goes here, against open level ground (0 can't).
+    pub walk: Vec<f32>,
+    /// The small things that catch the eye between the keystones, binned.
+    pub features: Vec<Spot>,
+    pub feature_bins: Vec<u32>,
+    pub bins: Grid,
+}
+
+/// A small thing that catches the eye: a veteran tree among younger ones, a silver snag, a big
+/// log, a stone. Where it stands, how tall and wide it shows (m), and how strongly it draws.
+pub struct Spot: Copy {
+    pub at: vec2,
+    pub tall: f32,
+    pub wide: f32,
+    pub salience: f32,
+}
+
+/// How much a crown's leaves stop a sightline, per metre through it, for a species of shade 1
+/// (the renderer's crowns, cards with gaps between, calibrated against its depth: at 24 test
+/// places, 0.22 saw past what the renderer draws at 3, and 0.38 with `SAPLING` brings all 24
+/// within 0.1).
+const CROWN_DENSITY: f32 = 0.38
+
+/// How much a sapling under the crowns stops a sightline, per metre through it, at 2 m tall
+/// or more (a thorn stops 0.16): calibrated with `CROWN_DENSITY`.
+const SAPLING: f32 = 0.12
+
+/// The features' bins (m).
+const FBIN: f32 = 40.0
+
+/// The features a history and the stones leave, sorted into their bins.
+fn features_of(bins: Grid, trees: [Tree], stones: [vec3]) -> (Vec<Spot>, Vec<u32>) {
+    var all: Vec<Spot> = Vec::new()
+    for t in trees {
+        if t.state == State::Snag && t.tall > 8.0 {
+            all.push(Spot { at: t.at, tall: t.tall, wide: 2.0 * t.girth + 1.0, salience: 0.3 })
+        } else if t.state == State::Alive && (t.girth > 0.6 || (t.tall > 15.0 && t.light > 0.6)) {
+            all.push(Spot { at: t.at, tall: t.tall, wide: 2.0 * t.reach, salience: 0.25 })
+        } else if t.state == State::Log && t.girth > 0.4 && t.tall > 12.0 {
+            all.push(
+                Spot {
+                    at: t.at + t.fall * t.tall * 0.4,
+                    tall: 2.0 * t.girth,
+                    wide: t.tall * 0.8,
+                    salience: 0.2,
+                },
+            )
+        }
+    }
+    for st in stones {
+        if st.z > 0.55 {
+            all.push(Spot { at: st.xy, tall: 1.6 * st.z, wide: 2.0 * st.z, salience: 0.25 })
+        }
+    }
+    let nb = bins.cells()
+    var count: Vec<u32> = Vec::filled(nb + 1, 0)
+    for f in all {
+        if bins.holds(f.at) {
+            count[bins.cell_at(f.at) + 1] += 1
+        }
+    }
+    for k in 0..nb {
+        let before = count[k]
+        count[k + 1] += before
+    }
+    var cursor = count.clone()
+    var sorted: Vec<Spot> = Vec::filled(
+        count[nb],
+        Spot { at: vec2(0.0), tall: 0.0, wide: 0.0, salience: 0.0 },
+    )
+    for f in all {
+        if bins.holds(f.at) {
+            let b = bins.cell_at(f.at)
+            sorted[cursor[b]] = f
+            cursor[b] += 1
+        }
+    }
+    (sorted, count)
+}
+
+/// Every cell of `g` within `r` of `p`: `f` with its index.
+fn disk(g: Grid, p: vec2, r: f32, f: fn(u32)) {
+    let span = i32(ceil(2.0 * r / g.cell)) + 1
+    let lo = g.ij(p - vec2(r))
+    for dj in 0..span {
+        for di in 0..span {
+            let i = lo.x + di
+            let j = lo.y + dj
+            if i >= 0 && j >= 0 && i < i32(g.nx) && j < i32(g.nz) {
+                let k = u32(j) * g.nx + u32(i)
+                if length(g.centre(k) - p) < r + 0.5 * g.cell {
+                    f(k)
+                }
+            }
+        }
+    }
+}
+
+/// A row of the sight grid's ground, worked out by a helper.
+struct Heights {
+    j: u32,
+    out: Vec<f32>,
+}
+
+/// The sight grid over `g`, from what a history left (`e`), the floor's ground and water, and
+/// the obstacles a player walks round (its stones and walls).
+pub fn sight_of<G: Ground>(
+    ground: G,
+    m: Map,
+    habits: [Habit],
+    e: Evidence,
+    obstacles: Obstacles,
+    stones: [vec3],
+    g: Grid,
+) -> Sight {
+    let nn = g.cells()
+    // The ground's heights: the history's, on its grid; else read, a row each on a helper.
+    let same = e.heights.len() == nn &&
+        e.fields.lo == g.lo &&
+        e.fields.cell == g.cell &&
+        e.fields.nx == g.nx
+    var heights: Vec<f32> = Vec::with_capacity(nn)
+    if same {
+        heights = e.heights.clone()
+    } else {
+        var rows: Vec<Heights> = Vec::from_fn(g.nz, |j| Heights { j, out: Vec::new() })
+        rows.par_each_mut(|r| {
+            for i in 0..g.nx {
+                let p = g.centre(r.j * g.nx + i)
+                r.out.push(ground.height(p.x, p.y))
+            }
+        })
+        for mut r in rows {
+            heights.append(mut r.out)
+        }
+    }
+    var top: Vec<f32> = Vec::filled(nn, 0.0)
+    var base: Vec<f32> = Vec::filled(nn, 1.0e9)
+    var crown: Vec<f32> = Vec::filled(nn, 0.0)
+    var stems: Vec<f32> = Vec::filled(nn, 0.0)
+    var brush: Vec<f32> = Vec::filled(nn, 0.0)
+    var brush_top: Vec<f32> = Vec::filled(nn, 0.0)
+    var logs: Vec<f32> = Vec::filled(nn, 0.0)
+    let area = g.cell * g.cell
+    let drawn = e.crowns.len() == e.trees.len()
+    for i in 0..e.trees.len() {
+        let t = e.trees[i]
+        let h = habits[t.kind]
+        // A crown: a tree's, or a thorn's drawn as a shrub (its crown from near the ground, as
+        // thick to its edge).
+        let shrub = h.thorny && drawn && t.tall > 1.2
+        if t.state == State::Alive && ((t.tall > 4.0 && !h.thorny) || shrub) {
+            let c = t.at + t.lean
+            // The crown's base and reach: as it's drawn, or the history's: its base lower for a
+            // tree grown in the open, and never below its browse line.
+            let low = if drawn { e.crowns[i].base } else {
+                max(t.tall * if t.light > 0.55 { 0.3 } else { 0.55 }, t.lift)
+            }
+            let reach = if drawn { e.crowns[i].reach } else { t.reach }
+            let tall = if drawn { max(e.crowns[i].top, low + 0.5) } else { t.tall }
+            let shade = CROWN_DENSITY * h.shade * if drawn { e.crowns[i].dense } else { 1.0 }
+            // Round, as a tree's crown is: over each cell, from its middle's height less the
+            // crown's half height there to its middle's plus it (an ellipsoid from `low` to the
+            // top). A shrub's is as thick to its edge (its clumps sit low and wide).
+            let mid = 0.5 * (low + tall)
+            let half = 0.5 * (tall - low)
+            disk(g, c, reach, |k| {
+                let d = length(g.centre(k) - c) / max(reach, 0.1)
+                let s = if shrub { 1.0 } else { sqrt(max(1.0 - d * d, 0.0)) }
+                top[k] = max(top[k], mid + half * s)
+                base[k] = min(base[k], mid - half * s)
+                crown[k] = max(crown[k], shade)
+            })
+        }
+        // Trunks at eye height, alive or dead: a stem's width over the cell's area.
+        if (t.state == State::Alive || t.state == State::Snag) && t.tall > 2.0 && g.holds(t.at) {
+            let girth = if drawn { e.crowns[i].trunk } else { t.girth }
+            stems[g.cell_at(t.at)] += 2.0 * girth / area
+        }
+        // Undergrowth: saplings and thorn below the crowns, as wide as they're drawn (and those
+        // the renderer draws: over 1.2 m; a drawn thorn is a crown, above).
+        let least = if drawn { 1.2 } else { 0.8 }
+        if t.state == State::Alive && (t.tall <= 4.0 || h.thorny) && t.tall > least && !shrub {
+            let thick = if h.thorny { 0.16 } else { SAPLING }
+            let v = thick * min(t.tall / 2.0, 1.0)
+            let wide = if drawn { e.crowns[i].reach } else { t.reach }
+            let high = if drawn { e.crowns[i].top } else { t.tall }
+            disk(g, t.at + t.lean, wide, |k| {
+                brush[k] += v
+                brush_top[k] = max(brush_top[k], high)
+            })
+        }
+        if t.state == State::Log && t.tall > 4.0 {
+            t.each_along(g.cell * 0.5, |p, _| {
+                if g.holds(p) {
+                    logs[g.cell_at(p)] += 0.3
+                }
+            })
+        }
+    }
+    // The trunks as they stand, sorted into the cells.
+    var trunk_start: Vec<u32> = Vec::filled(nn + 1, 0)
+    for i in 0..e.trees.len() {
+        let t = e.trees[i]
+        if (t.state == State::Alive || t.state == State::Snag) && t.tall > 2.0 && g.holds(t.at) {
+            trunk_start[g.cell_at(t.at) + 1] += 1
+        }
+    }
+    for c in 0..nn {
+        let before = trunk_start[c]
+        trunk_start[c + 1] += before
+    }
+    var cursor = trunk_start.clone()
+    var trunks: Vec<vec3> = Vec::filled(trunk_start[nn], vec3(0.0))
+    for i in 0..e.trees.len() {
+        let t = e.trees[i]
+        if (t.state == State::Alive || t.state == State::Snag) && t.tall > 2.0 && g.holds(t.at) {
+            let c = g.cell_at(t.at)
+            trunks[cursor[c]] = vec3(t.at, if drawn { e.crowns[i].trunk } else { t.girth })
+            cursor[c] += 1
+        }
+    }
+    // What's built: a thing a metre across or more stops a sightline that meets it (`transmit`);
+    // a smaller one is seen past, as a trunk is (its width over the cell's area).
+    var solids: Vec<vec4> = Vec::new()
+    for b in e.solids {
+        if b.z >= 1.0 {
+            solids.push(b)
+        } else if g.holds(b.xy) && b.w > 1.0 {
+            stems[g.cell_at(b.xy)] += 2.0 * b.z / area
+        }
+    }
+    var under: Vec<f32> = Vec::filled(nn, 0.0)
+    var open: Vec<f32> = Vec::filled(nn, 0.0)
+    var trail: Vec<f32> = Vec::filled(nn, 0.0)
+    var walk: Vec<f32> = Vec::filled(nn, 0.0)
+    for c in 0..nn {
+        if base[c] > 1.0e8 {
+            base[c] = 0.0
+        }
+        under[c] = stems[c] + min(brush[c], 0.35)
+        let p = g.centre(c)
+        open[c] = if e.fields.holds(p) { e.fields.sample(e.light, p) } else { 1.0 }
+        var w = 0.0
+        for k in 0..4 {
+            let q = p + vec2(f32(k % 2) - 0.5, f32(k / 2) - 0.5) * (0.5 * g.cell)
+            if e.wear_grid.holds(q) {
+                w = max(w, e.wear_grid.sample(e.wear, q))
+            }
+        }
+        trail[c] = min(w * 1.4, 1.0)
+    }
+    // Walking: the ground's pace (slope, the edge, the meres), slowed by thorn, logs and wet
+    // ground; the streams' deep water and the stones and walls stop a player.
+    var paces: Vec<Heights> = Vec::from_fn(g.nz, |j| Heights { j, out: Vec::new() })
+    paces.par_each_mut(|r| {
+        for i in 0..g.nx {
+            let p = g.centre(r.j * g.nx + i)
+            var w = pace(ground, m.water, p)
+            if w > 0.0 && obstacles.depth(p) > footing::DEEP {
+                w = 0.0
+            }
+            r.out.push(w)
+        }
+    })
+    var k = 0
+    for mut r in paces {
+        for w in r.out {
+            walk[k] = w
+            k += 1
+        }
+    }
+    for c in 0..nn {
+        let p = g.centre(c)
+        var w = walk[c]
+        let thorn = if e.fields.holds(p) { e.fields.sample(e.thorn, p) } else { 0.0 }
+        w *= 1.0 - 0.6 * smoothstep(0.5, 0.9, thorn)
+        w *= 1.0 - 0.3 * min(logs[c], 1.0)
+        let wet = if e.wet_grid.holds(p) { e.wet_grid.sample(e.wet, p) } else { 0.0 }
+        if wet > 0.93 {
+            w *= 0.6
+        }
+        // Trails are easy going.
+        walk[c] = min(1.0, w * (1.0 + 0.3 * trail[c]))
+    }
+    for st in stones {
+        disk(g, st.xy, st.z * 0.8, |k| { walk[k] = 0.0 })
+    }
+    // Walls: their cells' centres within a wall's thickness and a half cell.
+    for c in 0..nn {
+        let p = g.centre(c)
+        var hit = false
+        obstacles.near(p, |o| {
+            if o.thing == Thing::Wall {
+                let (d, _) = o.reach(p)
+                hit = hit || d < 0.35 * g.cell
+            }
+        })
+        if hit {
+            walk[c] = 0.0
+        }
+    }
+    let hi = g.lo + vec2(f32(g.nx), f32(g.nz)) * g.cell
+    let bins = Grid::over(g.lo, hi, FBIN)
+    let (features, feature_bins) = features_of(bins, e.trees, stones)
+    Sight {
+        grid: g,
+        ground: heights,
+        top,
+        base,
+        crown,
+        under,
+        stems,
+        brush_top,
+        trunk_start,
+        trunks,
+        solids,
+        open,
+        trail,
+        walk,
+        features,
+        feature_bins,
+        bins,
+    }
+}
+
+/// The ground's height at `p`, bilinear on the sight grid.
+pub fn ground_at(s: Sight, p: vec2) -> f32 {
+    s.grid.sample(s.ground, p)
+}
+
+/// How far from the eye (m) a sightline meets each trunk as it stands (`Sight::near`).
+const NEAR_EXACT: f32 = 8.0
+
+/// Whether the sightline from `a` to `b` on the plane (shorter than a cell) meets a trunk as it
+/// stands: one in the cells round its middle.
+fn meets_trunk(s: Sight, a: vec2, b: vec2) -> bool {
+    let ab = b - a
+    let c = s.grid.ij(0.5 * (a + b))
+    for dj in 0..3 {
+        for di in 0..3 {
+            let i = c.x + di - 1
+            let j = c.y + dj - 1
+            if i >= 0 && j >= 0 && i < i32(s.grid.nx) && j < i32(s.grid.nz) {
+                let k = u32(j) * s.grid.nx + u32(i)
+                for q in s.trunk_start[k]..s.trunk_start[k + 1] {
+                    let tr = s.trunks[q]
+                    let t = clamp(dot(tr.xy - a, ab) / max(dot(ab, ab), 1.0e-8), 0.0, 1.0)
+                    if length(a + ab * t - tr.xy) < tr.z {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// How far `p` is from the nearest trunk's surface at the eye (m; 99 with none within a cell).
+pub fn trunk_clearance(s: Sight, p: vec2) -> f32 {
+    let c = s.grid.ij(p)
+    var best = 99.0
+    for dj in 0..3 {
+        for di in 0..3 {
+            let i = c.x + di - 1
+            let j = c.y + dj - 1
+            if i >= 0 && j >= 0 && i < i32(s.grid.nx) && j < i32(s.grid.nz) {
+                let k = u32(j) * s.grid.nx + u32(i)
+                for q in s.trunk_start[k]..s.trunk_start[k + 1] {
+                    let tr = s.trunks[q]
+                    best = min(best, length(p - tr.xy) - tr.z)
+                }
+            }
+        }
+    }
+    best
+}
+
+/// How much light gets from `from` to `to` (0 to 1): what the sightline passes through, crowns
+/// and trunks and undergrowth, as extinction; nothing if the ground's in the way. Its last
+/// `skip` metres are the target's own (a keystone's foot among its own grass). Within
+/// `NEAR_EXACT` of the eye it meets the trunks as they stand; past it, their average.
+pub fn transmit(s: Sight, from: vec3, to: vec3, skip: f32) -> f32 {
+    let d = to - from
+    let run = length(d.xz)
+    if run < 0.5 {
+        return 1.0
+    }
+    var t = 1.5
+    var tau = 0.0
+    while t < run - skip {
+        let p = from + d * (t / run)
+        if !s.grid.holds(p.xz) {
+            break
+        }
+        let g = ground_at(s, p.xz)
+        if p.y < g - 0.2 {
+            return 0.0
+        }
+        let c = s.grid.cell_at(p.xz)
+        let h = p.y - g
+        for b in s.solids {
+            if h < b.w && length(p.xz - b.xy) < b.z {
+                return 0.0
+            }
+        }
+        let step = clamp(0.02 * t, 1.5, 8.0)
+        let near = t < NEAR_EXACT
+        if near && h < 12.0 && meets_trunk(s, from.xz + d.xz * ((t - 1.5) / run), p.xz) {
+            return 0.0
+        }
+        // Near the eye the trunks were met as they stand: the rest of the undergrowth.
+        let under = if near { s.under[c] - s.stems[c] } else { s.under[c] }
+        if h < s.top[c] {
+            tau += step * if h > s.base[c] { s.crown[c] } else { under }
+        } else if h < max(2.5, s.brush_top[c]) {
+            tau += step * under
+        }
+        if tau > 6.0 {
+            return 0.0
+        }
+        t += step
+    }
+    exp(-tau)
+}
+
+/// Whether the ground and the crowns behind `to` (beyond it, seen from `from`) stay below it: a
+/// keystone against the sky draws the eye more than one against the forest.
+fn skyline(s: Sight, from: vec3, to: vec3) -> bool {
+    let d = to - from
+    let run = length(d.xz)
+    let dir = d.xz / max(run, 1.0e-3)
+    let angle = d.y / run
+    var t = run + 6.0
+    var clear = true
+    while t < run + 900.0 && clear {
+        let p = from.xz + dir * t
+        if !s.grid.holds(p) {
+            // Past the floor: the far land is lower than anything on the plateau seen from it.
+            break
+        }
+        let c = s.grid.cell_at(p)
+        let h = s.ground[c] + s.top[c]
+        clear = (h - from.y) / t < angle
+        t += clamp(0.03 * t, 3.0, 12.0)
+    }
+    clear
+}
+
+// ---- draws --------------------------------------------------------------------------------------
+
+/// What draws: a keystone (a site), an opening (light through the trees), a crest, a trail, a
+/// small feature.
+pub enum Pull: Copy + Eq + Fieldless {
+    Key,
+    Opening,
+    Crest,
+    Trail,
+    Feature,
+}
+
+/// A draw seen from a place: what it is (and which site), where it leads, how strongly.
+pub struct Draw: Copy {
+    pub pull: Pull,
+    pub site: u32,
+    pub target: vec2,
+    pub strength: f32,
+}
+
+pub const MAX_DRAWS: u32 = 10
+
+/// A place a player can stand, and what draws them from it.
+pub struct View: Copy {
+    pub at: vec2,
+    pub walkable: bool,
+    pub draws: Bounded<Draw, MAX_DRAWS>,
+    /// The strongest draw, and how many draw at least `FAINT`.
+    pub best: f32,
+    pub count: u32,
+}
+
+/// A draw weaker than this doesn't count.
+pub const FAINT: f32 = 0.12
+
+/// A site's points the eye might see: its top, its middle and its foot (above the ground), or
+/// for one that opens the forest (a glade, a view out, water), points across it at head height.
+/// A crag's relief is the ground's own: its points are its top (what shows of it over the trees;
+/// its faces are under its top, in the rock).
+fn site_point(s: Sight, k: Site, i: u32) -> vec3 {
+    if k.feature == Feature::Crag {
+        vec3(k.at.x, ground_at(s, k.at) + 1.0, k.at.y)
+    } else if k.open() {
+        let a = TAU * f32(i) / 3.0
+        let r = if i == 0 { 0.0 } else { 0.5 * k.reach }
+        let p = k.at + vec2(cos(a), sin(a)) * r
+        vec3(p.x, ground_at(s, p) + 2.5, p.y)
+    } else {
+        let f = if i == 0 { 0.95 } else if i == 1 { 0.6 } else { 0.25 }
+        vec3(k.at.x, ground_at(s, k.at) + k.tall * f, k.at.y)
+    }
+}
+
+/// How strongly site `k` draws a player whose eye is at `eye`: how much of it is seen, how big
+/// it looks, whether it stands against the sky, and the haze; nothing from close by.
+pub fn site_draw(s: Sight, eye: vec3, k: Site) -> f32 {
+    let d = length(k.at - eye.xz)
+    if d < k.reach + 12.0 {
+        return 0.0
+    }
+    var seen = 0.0
+    var shown = 0.0
+    var sky = false
+    // The last metres to it are its own: a keystone's foot among its own grass, a crag's top.
+    let own = if k.feature == Feature::Crag { k.reach } else { min(k.reach, 6.0) }
+    for i in 0..3 {
+        let p = site_point(s, k, i)
+        let t = transmit(s, eye, p, skip: own)
+        seen = max(seen, t)
+        // How much of it shows: each point a third of it, as much as it's seen.
+        shown += t / 3.0
+        if i == 0 && t > 0.25 && k.tall > 3.0 {
+            sky = skyline(s, eye, p)
+        }
+    }
+    if seen < 0.05 {
+        return 0.0
+    }
+    // Its size on screen: as much of its height as shows, for something standing (a tip over
+    // the trees is small), or its breadth for an opening.
+    let size = if k.open() { 2.0 * k.reach } else {
+        max(k.tall * max(shown / max(seen, 1.0e-3), 0.34), 1.0)
+    } / d
+    let big = smoothstep(0.004, 0.05, size)
+    let against = if sky { 1.0 } else { 0.6 }
+    k.salience * seen * big * against * exp(-d / 2500.0)
+}
+
+/// What draws a player standing at `at`, with their eye `set.eye` above the ground.
+pub fn view_at(s: Sight, m: Map, set: Settings, at: vec2) -> View {
+    let c = s.grid.cell_at(at)
+    var v = View { at, walkable: s.walk[c] > 0.15, draws: Bounded::new(), best: 0.0, count: 0 }
+    let eye = vec3(at.x, ground_at(s, at) + set.eye, at.y)
+    var draws: Vec<Draw> = Vec::new()
+    // The sites.
+    var ki = 0
+    for k in m.sites {
+        if k.keystone() {
+            let st = site_draw(s, eye, k)
+            if st > 0.02 {
+                draws.push(Draw { pull: Pull::Key, site: ki, target: k.at, strength: st })
+            }
+        }
+        ki += 1
+    }
+    // Features within reach of the eye.
+    let b = s.bins.ij(at)
+    for dj in 0..5 {
+        for di in 0..5 {
+            let i = b.x + di - 2
+            let j = b.y + dj - 2
+            if i >= 0 && j >= 0 && i < i32(s.bins.nx) && j < i32(s.bins.nz) {
+                let bin = u32(j) * s.bins.nx + u32(i)
+                for q in s.feature_bins[bin]..s.feature_bins[bin + 1] {
+                    let f = s.features[q]
+                    let d = length(f.at - at)
+                    if d > 12.0 && d < 80.0 {
+                        let g = ground_at(s, f.at)
+                        let seen = transmit(
+                            s,
+                            eye,
+                            vec3(f.at.x, g + min(f.tall * 0.5, 2.5), f.at.y),
+                            skip: 1.0,
+                        )
+                        let size = max(min(f.tall, 6.0), f.wide * 0.5) / d
+                        // In shade, a small thing doesn't stand out (in a blind test, the
+                        // rater named none of them); lit, in a gap, it does.
+                        let lit = 0.3 + 0.7 * smoothstep(0.35, 0.7, s.open[s.grid.cell_at(f.at)])
+                        let st = f.salience * lit * seen * smoothstep(0.02, 0.12, size)
+                        if st > 0.02 {
+                            draws.push(
+                                Draw { pull: Pull::Feature, site: 0, target: f.at, strength: st },
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let under = s.top[c] > 4.0 && s.open[c] < 0.5
+    let here_open = s.open[c]
+    for a in 0..set.azimuths {
+        let ang = TAU * f32(a) / f32(set.azimuths)
+        let dir = vec2(cos(ang), sin(ang))
+        // Along the eye's level, through the trunks: openings, and trails.
+        var tau = 0.0
+        var t = 2.0
+        var shut = false
+        var opening_from = 0.0
+        var opening_run = 0.0
+        var trail_run = 0.0
+        var trail_far = 0.0
+        var max_angle = -1.0e9
+        var crest_at = 0.0
+        var crest_h = 0.0
+        var hidden = 0.0
+        while t < 260.0 && !shut {
+            let p = at + dir * t
+            if !s.grid.holds(p) {
+                break
+            }
+            let q = s.grid.cell_at(p)
+            let g = ground_at(s, p)
+            let step = if t < 60.0 { 2.0 } else { 4.0 }
+            // The ground's profile: the highest it rises in view, and how far beyond that it
+            // falls out of sight.
+            let angle = (g + 0.5 - eye.y) / t
+            if angle > max_angle {
+                max_angle = angle
+                crest_at = t
+                crest_h = g
+                hidden = 0.0
+            } else if (max_angle * t + eye.y) - g > 1.5 {
+                hidden += step
+            }
+            let tr = exp(-tau)
+            // Light ahead, seen from under the crowns: open sky over the ground (no crown).
+            if s.top[q] < 4.0 && tr > 0.12 {
+                if opening_from == 0.0 {
+                    opening_from = t
+                }
+                opening_run += step
+            } else if opening_run > 0.0 && opening_run < 8.0 {
+                opening_from = 0.0
+                opening_run = 0.0
+            }
+            // A trail running away from the eye.
+            if s.trail[q] > 0.3 && tr > 0.25 && t > 6.0 {
+                trail_run += step
+                trail_far = t
+            }
+            if g > eye.y {
+                shut = true
+            }
+            tau += step * s.under[q]
+            if s.top[q] > 4.0 && s.base[q] < set.eye {
+                tau += step * s.crown[q]
+            }
+            if tau > 5.0 {
+                shut = true
+            }
+            t += step
+        }
+        if under && opening_run >= 8.0 && opening_from > 12.0 {
+            let st = 0.55 *
+                smoothstep(6.0, 30.0, opening_run) *
+                exp(-0.004 * opening_from) *
+                (1.0 - 0.7 * here_open)
+            draws.push(
+                Draw {
+                    pull: Pull::Opening,
+                    site: 0,
+                    target: at + dir * (opening_from + 8.0),
+                    strength: st,
+                },
+            )
+        }
+        // A crest: rising ground that hides what's past it, near enough to walk to.
+        if crest_at > 15.0 && crest_at < 220.0 && hidden > 24.0 {
+            let rise = crest_h - (eye.y - set.eye)
+            let tr = transmit(
+                s,
+                eye,
+                vec3(at.x + dir.x * crest_at, crest_h + 1.0, at.y + dir.y * crest_at),
+                skip: 2.0,
+            )
+            let st = 0.45 *
+                tr *
+                smoothstep(20.0, 80.0, hidden) *
+                (0.55 + 0.45 * smoothstep(-1.0, 8.0, rise))
+            if st > 0.02 {
+                draws.push(
+                    Draw { pull: Pull::Crest, site: 0, target: at + dir * crest_at, strength: st },
+                )
+            }
+        }
+        if trail_run >= 10.0 && trail_far > 15.0 {
+            let st = 0.35 * smoothstep(10.0, 40.0, trail_run)
+            draws.push(
+                Draw { pull: Pull::Trail, site: 0, target: at + dir * trail_far, strength: st },
+            )
+        }
+    }
+    // The strongest, merged: a draw within 20 m of a stronger one's target is that one.
+    draws.sort_by(|a, b| a.strength > b.strength)
+    for d in draws {
+        var dup = false
+        for i in 0..v.draws.len() {
+            dup = dup || length(v.draws[i].target - d.target) < 20.0
+        }
+        if !dup && !v.draws.is_full() {
+            v.draws.push(d)
+        }
+    }
+    for i in 0..v.draws.len() {
+        let st = v.draws[i].strength
+        v.best = max(v.best, st)
+        if st >= FAINT {
+            v.count += 1
+        }
+    }
+    v
+}
+
+/// The views' grid: one every `set.view` m over the map's square.
+pub fn views_grid(m: Map, set: Settings) -> Grid {
+    Grid::over(m.lo, m.hi, set.view)
+}
+
+/// Whether a player can stand at `p` on the authored floor (its square, inside its edge).
+fn authored<G: Ground>(ground: G, m: Map, s: Sight, p: vec2) -> bool {
+    m.inside(p) && ground.past_edge(p) < -2.0 && s.grid.holds(p) && s.walk[s.grid.cell_at(p)] > 0.15
+}
+
+/// Every view over the map's square, in parallel.
+pub fn views_of<G: Ground>(ground: G, m: Map, s: Sight, set: Settings) -> Vec<View> {
+    let vg = views_grid(m, set)
+    var out: Vec<View> = Vec::from_fn(
+        vg.cells(),
+        |v| View { at: vg.centre(v), walkable: false, draws: Bounded::new(), best: 0.0, count: 0 },
+    )
+    out.par_each_mut(|v| {
+        if authored(ground, m, s, v.at) {
+            v = view_at(s, m, set, v.at)
+        }
+    })
+    out
+}
+
+// ---- the dead share and the relations -----------------------------------------------------------
+
+/// What the dead-zone check found, over the floor or a region: the walkable views, the share
+/// with no draw at least `FAINT`, the share with no draw of the map's own (keystones, openings,
+/// crests, trails: the features left out), the share drawn two ways or more, and the walkable
+/// area (km²).
+pub struct Coverage: Copy {
+    pub walkable: u32,
+    pub dead: f32,
+    pub quiet: f32,
+    pub rich: f32,
+    pub area: f32,
+}
+
+/// The coverage of the views in region `region` (`NONE`: the whole floor).
+pub fn coverage(m: Map, views: [View], set: Settings, region: u32) -> Coverage {
+    var n = 0
+    var dead = 0
+    var quiet = 0
+    var rich = 0
+    for v in views {
+        if v.walkable && (region == grow::NONE || m.region_of(v.at) == region) {
+            n += 1
+            if v.best < FAINT {
+                dead += 1
+            }
+            var major = 0.0
+            for i in 0..v.draws.len() {
+                if v.draws[i].pull != Pull::Feature {
+                    major = max(major, v.draws[i].strength)
+                }
+            }
+            if major < FAINT {
+                quiet += 1
+            }
+            if v.count >= 2 {
+                rich += 1
+            }
+        }
+    }
+    let total = f32(max(n, 1))
+    Coverage {
+        walkable: n,
+        dead: f32(dead) / total,
+        quiet: f32(quiet) / total,
+        rich: f32(rich) / total,
+        area: f32(n) * set.view * set.view / 1.0e6,
+    }
+}
+
+/// How a relation holds: the most a player standing where it's judged from is drawn to its site,
+/// and for a reveal, the most a player on the approach is (which should be little).
+pub struct Held: Copy {
+    pub at: f32,
+    pub before: f32,
+    pub holds: bool,
+}
+
+/// The draw a relation needs where it's judged from, and the most a reveal's approach may have.
+pub const HOLDS: f32 = 0.2
+pub const HIDDEN: f32 = 0.1
+
+/// Where a relation is judged from: of its place and eight round it (`within` out), where a
+/// player can stand (not in deep water, nor on a crag's face), the eye that its site draws most,
+/// and that draw.
+pub fn relation_view(s: Sight, m: Map, set: Settings, r: Relation) -> (vec3, f32) {
+    let k = m.sites[r.to()]
+    var best = vec3(r.from().x, ground_at(s, r.from()) + set.eye, r.from().y)
+    var at = -1.0
+    for i in 0..9 {
+        let a = TAU * f32(i) / 8.0
+        let p = r.from() + if i == 0 { vec2(0.0) } else { vec2(cos(a), sin(a)) * r.within() }
+        if !s.grid.holds(p) || s.walk[s.grid.cell_at(p)] <= 0.0 {
+            continue
+        }
+        let eye = vec3(p.x, ground_at(s, p) + set.eye, p.y)
+        let d = site_draw(s, eye, k)
+        if d > at {
+            at = d
+            best = eye
+        }
+    }
+    (best, at)
+}
+
+pub fn relation_holds(s: Sight, m: Map, set: Settings, r: Relation) -> Held {
+    let k = m.sites[r.to()]
+    let (_, at) = relation_view(s, m, set, r)
+    var before = 0.0
+    var holds = at >= HOLDS
+    match r {
+        Relation::Hidden { .. } => {
+            // The approach: places 40–160 m back from where it's revealed, away from the site.
+            let back = normalize(r.from() - k.at)
+            let side = vec2(-back.y, back.x)
+            for i in 0..12 {
+                let p = r.from() + back * (40.0 + 10.0 * f32(i)) + side * (f32(i % 3) - 1.0) * 25.0
+                let eye = vec3(p.x, ground_at(s, p) + set.eye, p.y)
+                before = max(before, site_draw(s, eye, k))
+            }
+            holds = holds && before < HIDDEN
+        },
+        _ => {},
+    }
+    Held { at, before, holds }
+}
+
+// ---- curious walkers ------------------------------------------------------------------------------
+
+/// A walker's record: where it went (a point every few metres), what it arrived at and when (s:
+/// (pull, time, region)), the sites it found (site, time), and the time it spent with nothing to
+/// follow, and in all.
+pub struct Walk {
+    pub path: Vec<vec2>,
+    pub arrivals: Vec<vec3>,
+    pub found: Vec<vec2>,
+    pub lost: f32,
+    pub time: f32,
+    /// Of the time lost, how much was spent turning back from what it couldn't walk.
+    pub blocked: f32,
+}
+
+/// How far a walker goes between looks (m), and the visited map's cells (m).
+const STRIDE: f32 = 4.0
+const SEEN_CELL: f32 = 25.0
+
+/// Who a walker is: a magpie follows whatever draws strongest; a pilgrim commits to the map's own
+/// draws and turns aside to a small feature only when none is in view; a trail pilgrim keeps to
+/// the trails and the anchors (the critical path).
+pub enum Walker: Copy + Eq + Fieldless {
+    Magpie,
+    Pilgrim,
+    Trail,
+}
+
+/// Whether `d` is a draw walker `who` may follow, with a map's own draw in view or not.
+fn allowed(m: Map, who: Walker, d: Draw, major_in_view: bool) -> bool {
+    match who {
+        Walker::Magpie => true,
+        Walker::Pilgrim => d.pull != Pull::Feature || !major_in_view,
+        Walker::Trail => d.pull == Pull::Trail ||
+            (d.pull == Pull::Key && critical(m.sites[d.site])),
+    }
+}
+
+/// Whether a site is on the critical path: the anchors, the town's site and the Warden's arena.
+pub fn critical(k: Site) -> bool {
+    k.kind == SiteKind::Anchor || k.kind == SiteKind::Arena || k.kind == SiteKind::Town
+}
+
+/// A curious walker from `start`: at each look, they follow the strongest draw they may to
+/// somewhere they haven't been (a little keener on what's ahead), keeping their target unless a
+/// much stronger one shows; with nothing to follow, they wander on, lost (a trail pilgrim heads
+/// for the nearest trail it hasn't walked). Arriving is coming within 12 m of a target (a site's
+/// reach and 12 m more). It stops after `set.walk_for` s, or when `until` sites have been found
+/// (`critical` ones, for a trail pilgrim).
+pub fn walk<G: Ground>(
+    ground: G,
+    m: Map,
+    s: Sight,
+    views: [View],
+    set: Settings,
+    start: vec2,
+    seed: u32,
+    who: Walker,
+) -> Walk {
+    let vg = views_grid(m, set)
+    let seen_grid = Grid::over(
+        s.grid.lo,
+        s.grid.lo + vec2(f32(s.grid.nx), f32(s.grid.nz)) * s.grid.cell,
+        SEEN_CELL,
+    )
+    var w = Walk {
+        path: Vec::new(),
+        arrivals: Vec::new(),
+        found: Vec::new(),
+        lost: 0.0,
+        time: 0.0,
+        blocked: 0.0,
+    }
+    var seen: Vec<bool> = Vec::filled(seen_grid.cells(), value: false)
+    var found_sites: Vec<bool> = Vec::filled(m.sites.len(), value: false)
+    var wanted = 0
+    for k in m.sites {
+        if critical(k) {
+            wanted += 1
+        }
+    }
+    var found_critical = 0
+    var p = start
+    var heading = TAU * rand(seed, 1)
+    var target = Draw { pull: Pull::Key, site: grow::NONE, target: p, strength: 0.0 }
+    var has = false
+    // When the target was chosen, and how long it should take to reach: past twice that and a
+    // minute more, the walker gives up on it (it's somewhere it can't get to).
+    var since = 0.0
+    var due = 0.0
+    // A trail pilgrim's way to its target (`way`), and the point of it it's making for.
+    var route: Vec<vec2> = Vec::new()
+    var leg = 0
+    var routed = target.target
+    var k = 0
+    while w.time < set.walk_for {
+        if has && w.time - since > 2.0 * due + 60.0 {
+            seen[seen_grid.cell_at(target.target)] = true
+            has = false
+        }
+        if seen_grid.holds(p) {
+            seen[seen_grid.cell_at(p)] = true
+        }
+        if k % 2 == 0 {
+            w.path.push(p)
+        }
+        k += 1
+        // Sites found by coming near them.
+        var ki = 0
+        for key in m.sites {
+            if !found_sites[ki] && length(p - key.at) < key.reach + 15.0 {
+                found_sites[ki] = true
+                w.found.push(vec2(f32(ki), w.time))
+                if critical(key) {
+                    found_critical += 1
+                }
+            }
+            ki += 1
+        }
+        if who == Walker::Trail && found_critical == wanted {
+            break
+        }
+        // Arrived?
+        if has {
+            let r = match target.pull {
+                Pull::Key => m.sites[target.site].reach + 12.0,
+                Pull::Feature => 6.0,
+                _ => 12.0,
+            }
+            if length(target.target - p) < r {
+                w.arrivals.push(vec3(f32(u32(target.pull)), w.time, f32(m.region_of(p))))
+                seen[seen_grid.cell_at(target.target)] = true
+                has = false
+            }
+        }
+        // Look round.
+        let v = if vg.holds(p) { views[vg.cell_at(p)] } else {
+            View { at: p, walkable: false, draws: Bounded::new(), best: 0.0, count: 0 }
+        }
+        var best = Draw { pull: Pull::Key, site: grow::NONE, target: p, strength: 0.0 }
+        var best_score = 0.0
+        var major_in_view = false
+        for i in 0..v.draws.len() {
+            let d = v.draws[i]
+            major_in_view = major_in_view ||
+                (d.pull != Pull::Feature &&
+                    d.strength >= FAINT &&
+                    !seen[seen_grid.cell_at(d.target)])
+        }
+        for i in 0..v.draws.len() {
+            let d = v.draws[i]
+            if d.strength >= FAINT &&
+                m.inside(d.target) &&
+                !seen[seen_grid.cell_at(d.target)] &&
+                allowed(m, who, d, major_in_view) {
+                let to = normalize(d.target - p + vec2(1.0e-4))
+                let ahead = 0.75 + 0.25 * dot(to, vec2(cos(heading), sin(heading)))
+                let score = d.strength * ahead
+                if score > best_score {
+                    best_score = score
+                    best = d
+                }
+            }
+        }
+        // A pilgrim keeps to a big target while it's still somewhere new.
+        let committed = who != Walker::Magpie &&
+            has &&
+            target.pull != Pull::Feature &&
+            !seen[seen_grid.cell_at(target.target)]
+        if committed && best.pull == Pull::Feature {
+            best_score = 0.0
+        }
+        if !has || seen[seen_grid.cell_at(target.target)] {
+            if best_score > 0.0 {
+                target = best
+                has = true
+                since = w.time
+                due = length(best.target - p) / set.run
+            } else {
+                has = false
+            }
+        } else if best_score > 1.4 * target.strength {
+            target = best
+            since = w.time
+            due = length(best.target - p) / set.run
+        }
+        // A trail pilgrim with nothing in view heads for the nearest trail point it hasn't
+        // walked, or the nearest critical site it hasn't found.
+        if !has && who == Walker::Trail {
+            let aim = trail_aim(m, seen_grid, seen, found_sites, p)
+            if length(aim - p) > 1.0 {
+                target = Draw { pull: Pull::Trail, site: grow::NONE, target: aim, strength: FAINT }
+                has = true
+                since = w.time
+                due = length(aim - p) / set.run
+            }
+        }
+        // A trail pilgrim finds its way to a new target, and gives it up if there's none.
+        if who == Walker::Trail && has && length(routed - target.target) > 1.0 {
+            route = way(s, p, target.target)
+            leg = 0
+            routed = target.target
+            if route.is_empty() {
+                seen[seen_grid.cell_at(target.target)] = true
+                has = false
+            }
+        }
+        // Step: toward the target (along its way, for a trail pilgrim), or on (lost), round what
+        // can't be walked.
+        var dir = vec2(cos(heading), sin(heading))
+        var on_way = false
+        if has && who == Walker::Trail && leg < route.len() {
+            while leg + 1 < route.len() && length(route[leg] - p) < 0.75 * STRIDE {
+                leg += 1
+            }
+            dir = normalize(route[leg] - p + vec2(1.0e-4))
+            on_way = true
+        } else if has {
+            dir = normalize(target.target - p + vec2(1.0e-4))
+        } else {
+            dir = normalize(dir + vec2(rand(seed, k) - 0.5, rand(seed, k + 7) - 0.5) * 0.5)
+        }
+        var go = dir
+        var easiest = walk_at(s, p + dir * STRIDE)
+        if on_way {
+            easiest = max(easiest, 0.2)
+        }
+        if easiest < 0.3 && !on_way {
+            for f in 1..8 {
+                for side in 0..2 {
+                    let a = f32(f) * 0.35 * if side == 0 { 1.0 } else { -1.0 }
+                    let d = vec2(cos(a) * dir.x - sin(a) * dir.y, sin(a) * dir.x + cos(a) * dir.y)
+                    let e = walk_at(s, p + d * STRIDE)
+                    if e > easiest + 0.05 {
+                        easiest = e
+                        go = d
+                    }
+                }
+            }
+        }
+        let next = p + go * STRIDE
+        if easiest < 0.1 || !m.inside(next) {
+            // Blocked: turn about, and give up what it was making for (the way to it is shut).
+            heading += 2.0
+            if has && seen_grid.holds(target.target) {
+                seen[seen_grid.cell_at(target.target)] = true
+            }
+            has = false
+            w.time += 2.0
+            w.lost += 2.0
+            w.blocked += 2.0
+            continue
+        }
+        let rise = ground_at(s, next) - ground_at(s, p)
+        let pace = set.run * max(easiest, 0.2) / (1.0 + 2.5 * max(rise / STRIDE, 0.0))
+        let dt = STRIDE / pace
+        w.time += dt
+        if !has {
+            w.lost += dt
+        }
+        heading = atan2(go.y, go.x)
+        p = next
+    }
+    w
+}
+
+/// The quickest way on foot from `from` to `to` over the sight grid (A*: eight neighbours, a
+/// step's cost its length over the pace there), as cell centres from `from`'s to `to`'s; empty if
+/// there's none.
+pub fn way(s: Sight, from: vec2, to: vec2) -> Vec<vec2> {
+    let g = s.grid
+    var out: Vec<vec2> = Vec::new()
+    if !g.holds(from) || !g.holds(to) {
+        return out
+    }
+    let start = nearest_walkable(s, from)
+    let goal = nearest_walkable(s, to)
+    if s.walk[start] <= 0.1 || s.walk[goal] <= 0.1 {
+        return out
+    }
+    let nn = g.cells()
+    var cost: Vec<f32> = Vec::filled(nn, 1.0e30)
+    var came: Vec<u32> = Vec::filled(nn, grow::NONE)
+    var open = Heap { items: Vec::new() }
+    cost[start] = 0.0
+    open.push(length(g.centre(goal) - g.centre(start)), start)
+    var found = false
+    var expanded = 0
+    while !open.items.is_empty() && expanded < 400000 {
+        let top = open.pop()
+        let c = top.y
+        if c == goal {
+            found = true
+            break
+        }
+        let here = cost[c]
+        if bitcast_f32(top.x) > here + length(g.centre(goal) - g.centre(c)) + 1.0e-3 {
+            continue
+        }
+        expanded += 1
+        let i = i32(c % g.nx)
+        let j = i32(c / g.nx)
+        for d in 0..8 {
+            let x = i + grow::DI[d]
+            let y = j + grow::DJ[d]
+            if x < 0 || y < 0 || x >= i32(g.nx) || y >= i32(g.nz) {
+                continue
+            }
+            let k = u32(y) * g.nx + u32(x)
+            let w = s.walk[k]
+            if w <= 0.1 {
+                continue
+            }
+            let step = g.cell * if grow::DI[d] != 0 && grow::DJ[d] != 0 { 1.4142 } else { 1.0 }
+            let next = here + step / w
+            if next < cost[k] {
+                cost[k] = next
+                came[k] = c
+                open.push(next + length(g.centre(goal) - g.centre(k)), k)
+            }
+        }
+    }
+    if !found {
+        return out
+    }
+    var c = goal
+    while c != start && c != grow::NONE {
+        out.push(g.centre(c))
+        c = came[c]
+    }
+    out.push(g.centre(start))
+    var back: Vec<vec2> = Vec::with_capacity(out.len())
+    var k = out.len()
+    while k > 0 {
+        k -= 1
+        back.push(out[k])
+    }
+    back
+}
+
+fn walk_at(s: Sight, p: vec2) -> f32 {
+    if s.grid.holds(p) { s.walk[s.grid.cell_at(p)] } else { 0.0 }
+}
+
+/// Where a trail pilgrim with nothing in view heads: the nearest critical site it hasn't found,
+/// if a trail it hasn't walked doesn't come nearer; else the nearest such trail point.
+fn trail_aim(m: Map, seen_grid: Grid, seen: [bool], found: [bool], p: vec2) -> vec2 {
+    var best = p
+    var d = 1.0e9
+    for r in m.routes {
+        if r.kind == place::RouteKind::Trail || r.kind == place::RouteKind::Road {
+            for i in 1..r.points.len() {
+                let a = r.points[i - 1]
+                let b = r.points[i]
+                let n = u32(ceil(length(b - a) / 20.0))
+                for k in 0..(n + 1) {
+                    let q = mix(a, b, vec2(f32(k) / f32(max(n, 1))))
+                    let e = length(q - p)
+                    if e < d && !seen[seen_grid.cell_at(q)] {
+                        d = e
+                        best = q
+                    }
+                }
+            }
+        }
+    }
+    var i = 0
+    for k in m.sites {
+        if critical(k) && !found[i] && length(k.at - p) < d {
+            d = length(k.at - p)
+            best = k.at
+        }
+        i += 1
+    }
+    best
+}
+
+/// The walkers' starts: the gate, and the walkable views on a lattice spaced so there are
+/// `set.starts_per_km2` over the floor's walkable area (`area`, km²).
+pub fn starts(m: Map, views: [View], set: Settings, area: f32) -> Vec<vec2> {
+    starts_from(m.sites, views, set, area)
+}
+
+/// `starts`, split from the map so the zero-walker setting can be checked without constructing a
+/// floor. Zero means none: in particular, QUICK must not run hour-long walkers from the gate.
+fn starts_from(sites: [Site], views: [View], set: Settings, area: f32) -> Vec<vec2> {
+    var out: Vec<vec2> = Vec::new()
+    if set.starts_per_km2 <= 0.0 {
+        return out
+    }
+    for k in sites {
+        if k.kind == SiteKind::Gate {
+            out.push(k.at)
+        }
+    }
+    let want = max(u32(round(set.starts_per_km2 * area)), 1)
+    var walkable = 0
+    for v in views {
+        if v.walkable {
+            walkable += 1
+        }
+    }
+    let every = max(walkable / want, 1)
+    var n = 0
+    // Spread through the views in a scrambled order, so the lattice doesn't follow the rows.
+    var i = 0
+    for v in views {
+        if v.walkable {
+            if (n + u32(rand(i, 41) * f32(every))) % every == 0 && out.len() < want + 1 {
+                out.push(v.at)
+            }
+            n += 1
+        }
+        i += 1
+    }
+    out
+}
+
+/// What the walkers say together: arrivals per hour, the median and longest time between
+/// arrivals (s), the share of time lost, and the sites found per hour.
+pub struct Cadence: Copy {
+    pub arrivals_per_hour: f32,
+    pub median_gap: f32,
+    pub longest_gap: f32,
+    pub lost: f32,
+    pub keystones_per_hour: f32,
+    /// The share of time lost turning back from what can't be walked.
+    pub blocked: f32,
+}
+
+/// The cadence of `walks`, of the arrivals in region `region` (`NONE` for all), against the time
+/// spent there (worked out from their paths).
+pub fn cadence(m: Map, walks: [Walk], region: u32) -> Cadence {
+    var gaps: Vec<f32> = Vec::new()
+    var arrivals = 0
+    var found = 0
+    var lost = 0.0
+    var blocked = 0.0
+    var time = 0.0
+    var longest = 0.0
+    for w in walks {
+        // The time in the region: its share of the path's points.
+        var share = 1.0
+        if region != grow::NONE {
+            var inside = 0
+            for p in w.path {
+                if m.region_of(p) == region {
+                    inside += 1
+                }
+            }
+            share = f32(inside) / f32(max(w.path.len(), 1))
+        }
+        var last = 0.0
+        for a in w.arrivals {
+            if region == grow::NONE || u32(a.z) == region {
+                let gap = (a.y - last) * share
+                gaps.push(gap)
+                longest = max(longest, gap)
+                last = a.y
+                arrivals += 1
+            }
+        }
+        let trailing = (w.time - last) * share
+        gaps.push(trailing)
+        longest = max(longest, trailing)
+        for f in w.found {
+            if m.sites[u32(f.x)].keystone() &&
+                (region == grow::NONE || m.region_of(m.sites[u32(f.x)].at) == region) {
+                found += 1
+            }
+        }
+        lost += w.lost * share
+        blocked += w.blocked * share
+        time += w.time * share
+    }
+    gaps.sort_by(|a, b| a < b)
+    let hours = time / 3600.0
+    Cadence {
+        arrivals_per_hour: f32(arrivals) / max(hours, 1.0e-3),
+        median_gap: if gaps.is_empty() { 0.0 } else { gaps[gaps.len() / 2] },
+        longest_gap: longest,
+        lost: lost / max(time, 1.0e-3),
+        keystones_per_hour: f32(found) / max(hours, 1.0e-3),
+        blocked: blocked / max(time, 1.0e-3),
+    }
+}
+
+// ---- reachable --------------------------------------------------------------------------------------
+
+/// The cells of the sight grid a player can reach on foot from `from` (walkable cells joined to
+/// it, each way and diagonally): the reachability the map's sites need.
+pub fn reachable(s: Sight, from: vec2) -> Vec<bool> {
+    let g = s.grid
+    var out: Vec<bool> = Vec::filled(g.cells(), value: false)
+    if !g.holds(from) {
+        return out
+    }
+    var queue: Vec<u32> = Vec::new()
+    let c0 = nearest_walkable(s, from)
+    if s.walk[c0] <= 0.1 {
+        return out
+    }
+    out[c0] = true
+    queue.push(c0)
+    var head = 0
+    while head < queue.len() {
+        let c = queue[head]
+        head += 1
+        let i = i32(c % g.nx)
+        let j = i32(c / g.nx)
+        for dj in 0..3 {
+            for di in 0..3 {
+                let x = i + di - 1
+                let y = j + dj - 1
+                if x >= 0 && y >= 0 && x < i32(g.nx) && y < i32(g.nz) {
+                    let k = u32(y) * g.nx + u32(x)
+                    if !out[k] && s.walk[k] > 0.1 {
+                        out[k] = true
+                        queue.push(k)
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The walkable cell nearest `p` (within 12 m), or `p`'s own.
+pub fn nearest_walkable(s: Sight, p: vec2) -> u32 {
+    let g = s.grid
+    var best = g.cell_at(p)
+    var d = 1.0e9
+    let r = i32(ceil(12.0 / g.cell))
+    let c = g.ij(p)
+    for dj in 0..(2 * r + 1) {
+        for di in 0..(2 * r + 1) {
+            let i = c.x + di - r
+            let j = c.y + dj - r
+            if i >= 0 && j >= 0 && i < i32(g.nx) && j < i32(g.nz) {
+                let k = u32(j) * g.nx + u32(i)
+                let e = length(g.centre(k) - p)
+                if s.walk[k] > 0.1 && e <= 12.0 && e < d {
+                    d = e
+                    best = k
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Whether a site whose place is `at` and reach `reach` can be stood beside: a reachable cell
+/// within its reach and 8 m more.
+pub fn reaches(s: Sight, from_gate: [bool], at: vec2, reach: f32) -> bool {
+    let g = s.grid
+    var any = false
+    disk(g, at, reach + 8.0, |k| { any = any || from_gate[k] })
+    any
+}
+
+// ---- the whole check ------------------------------------------------------------------------------
+
+/// The whole check of a floor: its views, each region's coverage and the floor's, each
+/// relation's verdict, the walkers (magpies, pilgrims) and the trail pilgrims from the gate, and
+/// what can be reached from the gate.
+pub struct Checked {
+    pub sight: Sight,
+    pub views: Vec<View>,
+    pub coverage: Coverage,
+    pub regions: Vec<Coverage>,
+    pub held: Vec<Held>,
+    pub magpies: Vec<Walk>,
+    pub pilgrims: Vec<Walk>,
+    pub trail: Vec<Walk>,
+    pub reach: Vec<bool>,
+    /// Each opening's cover (`opening_cover`).
+    pub openings: Vec<f32>,
+}
+
+/// A floor's preview: the check on its history at the preview's grain, and the streams
+/// that history found, for the map lens to draw.
+pub struct Preview {
+    pub checked: Checked,
+    pub streams: Vec<grow::Stream>,
+}
+
+/// A walk to run: who, from where, with which seed.
+struct Job {
+    who: Walker,
+    start: vec2,
+    seed: u32,
+    out: Walk,
+}
+
+/// The check of a floor's map `m`, with what its history left (`e`), at `set`.
+pub fn check<G: Ground>(
+    ground: G,
+    m: Map,
+    habits: [Habit],
+    e: Evidence,
+    obstacles: Obstacles,
+    stones: [vec3],
+    set: Settings,
+) -> Checked {
+    let g = Grid::over(
+        e.fields.lo,
+        e.fields.lo + vec2(f32(e.fields.nx), f32(e.fields.nz)) * e.fields.cell,
+        set.cell,
+    )
+    phase("sight")
+    let sight = sight_of(ground, m, habits, e, obstacles, stones, g)
+    phase("views")
+    let views = views_of(ground, m, sight, set)
+    let cov = coverage(m, views, set, grow::NONE)
+    var regions: Vec<Coverage> = Vec::new()
+    for r in 0..m.regions.len() {
+        regions.push(coverage(m, views, set, r))
+    }
+    var held: Vec<Held> = Vec::new()
+    for r in m.relations {
+        held.push(relation_holds(sight, m, set, r))
+    }
+    // The walkers, in parallel: each start twice (two seeds), a magpie and a pilgrim each time;
+    // and sixteen trail pilgrims from the gate.
+    let from = starts(m, views, set, cov.area)
+    var jobs: Vec<Job> = Vec::new()
+    var i = 0
+    for round in 0..2 {
+        for st in from {
+            jobs.push(
+                Job {
+                    who: Walker::Magpie,
+                    start: st,
+                    seed: 100 + i + 1000 * round,
+                    out: empty_walk(),
+                },
+            )
+            jobs.push(
+                Job {
+                    who: Walker::Pilgrim,
+                    start: st,
+                    seed: 100 + i + 1000 * round,
+                    out: empty_walk(),
+                },
+            )
+            i += 1
+        }
+    }
+    let gate = gate_of(m)
+    for k in 0..set.trail_walkers {
+        jobs.push(Job { who: Walker::Trail, start: gate, seed: 7000 + k, out: empty_walk() })
+    }
+    let long = Settings { walk_for: 4.0 * 3600.0, ..set }
+    phase("walkers")
+    jobs.par_each_mut(|j| {
+        let s = if j.who == Walker::Trail { long } else { set }
+        j.out = walk(ground, m, sight, views, s, j.start, j.seed, j.who)
+    })
+    var magpies: Vec<Walk> = Vec::new()
+    var pilgrims: Vec<Walk> = Vec::new()
+    var trail: Vec<Walk> = Vec::new()
+    while !jobs.is_empty() {
+        let j = jobs.remove(0)
+        match j.who {
+            Walker::Magpie => magpies.push(take j.out),
+            Walker::Pilgrim => pilgrims.push(take j.out),
+            Walker::Trail => trail.push(take j.out),
+        }
+    }
+    phase("reach")
+    let reach = reachable(sight, gate)
+    var openings: Vec<f32> = Vec::new()
+    for o in m.openings {
+        openings.push(opening_cover(e.trees, o.at, o.radius))
+    }
+    Checked {
+        sight,
+        views,
+        coverage: cov,
+        regions,
+        held,
+        magpies,
+        pilgrims,
+        trail,
+        reach,
+        openings,
+    }
+}
+
+fn empty_walk() -> Walk {
+    Walk {
+        path: Vec::new(),
+        arrivals: Vec::new(),
+        found: Vec::new(),
+        lost: 0.0,
+        time: 0.0,
+        blocked: 0.0,
+    }
+}
+
+/// A tour of `stops` on foot, in their order: the quickest way between each two (`way`), a point
+/// every 6 m or so (each way's cells thinned, its corners kept).
+pub fn tour(s: Sight, stops: [vec2]) -> Vec<vec2> {
+    var out: Vec<vec2> = Vec::new()
+    for i in 0..max(stops.len(), 1) - 1 {
+        let w = way(s, stops[i], stops[i + 1])
+        for p in w {
+            if out.is_empty() || length(p - out[out.len() - 1]) >= 6.0 {
+                out.push(p)
+            }
+        }
+    }
+    out
+}
+
+/// `stops` in the order a walker from the first would take them, each the nearest not yet taken.
+pub fn nearest_first(stops: [vec2]) -> Vec<vec2> {
+    var left: Vec<vec2> = Vec::from(stops)
+    var out: Vec<vec2> = Vec::new()
+    if left.is_empty() {
+        return out
+    }
+    out.push(left.remove(0))
+    while !left.is_empty() {
+        let at = out[out.len() - 1]
+        var best = 0
+        for i in 0..left.len() {
+            if length(left[i] - at) < length(left[best] - at) {
+                best = i
+            }
+        }
+        out.push(left.remove(best))
+    }
+    out
+}
+
+/// The map's gate (its first `Gate` site), or the origin.
+pub fn gate_of(m: Map) -> vec2 {
+    for k in m.sites {
+        if k.kind == SiteKind::Gate {
+            return k.at
+        }
+    }
+    vec2(0.0)
+}
+
+/// The critical path's time (s): for each trail pilgrim that found every critical site, when it
+/// found the last; the median of them, and how many found them all.
+pub fn critical_path(m: Map, trail: [Walk]) -> (f32, u32) {
+    var times: Vec<f32> = Vec::new()
+    var wanted = 0
+    for k in m.sites {
+        if critical(k) {
+            wanted += 1
+        }
+    }
+    for w in trail {
+        var n = 0
+        var last = 0.0
+        for f in w.found {
+            if critical(m.sites[u32(f.x)]) {
+                n += 1
+                last = max(last, f.y)
+            }
+        }
+        if n == wanted {
+            times.push(last)
+        }
+    }
+    let all = times.len()
+    times.sort_by(|a, b| a < b)
+    (if times.is_empty() { 1.0e9 } else { times[times.len() / 2] }, all)
+}
+
+// ---- calibration ---------------------------------------------------------------------------------
+
+/// How much light gets `dist` metres out at the eye's level from `at` along `dir`, as the model
+/// sees it: the chance that a level sightline isn't stopped before then (the renderer's depth
+/// checks it).
+pub fn eye_level(s: Sight, at: vec2, dir: vec2, dist: f32, eye: f32) -> f32 {
+    let from = vec3(at.x, ground_at(s, at) + eye, at.y)
+    let to = from + vec3(dir.x, 0.0, dir.y) * dist
+    transmit(s, from, to, skip: 0.0)
+}
+
+/// `eye_level` averaged over the directions within `half` of `yaw`, one each 0.025 radians (as
+/// fine as a near trunk needs).
+pub fn seen_beyond(s: Sight, at: vec2, yaw: f32, half: f32, dist: f32, eye: f32) -> f32 {
+    if half == 0.0 {
+        return eye_level(s, at, vec2(cos(yaw), sin(yaw)), dist, eye)
+    }
+    let n = u32(ceil(2.0 * half / 0.025)) + 1
+    var sum = 0.0
+    for i in 0..n {
+        let a = yaw + half * (2.0 * f32(i) / f32(n - 1) - 1.0)
+        sum += eye_level(s, at, vec2(cos(a), sin(a)), dist, eye)
+    }
+    sum / f32(n)
+}
+
+// ---- the report -----------------------------------------------------------------------------------
+
+/// The most of an opening's middle that crowns may cover and it still be open.
+pub const OPEN: f32 = 0.2
+
+/// The share of an opening's middle (four fifths of its radius, on a 2 m grid) under the crowns
+/// of trees taller than 4 m, but the author's kept trees (a pin stands in an opening by design:
+/// the clearing's great oak).
+pub fn opening_cover(trees: [Tree], at: vec2, radius: f32) -> f32 {
+    let r = 0.8 * radius
+    let g = Grid::over(at - vec2(r), at + vec2(r), 2.0)
+    var shut: Vec<bool> = Vec::filled(g.cells(), value: false)
+    for t in trees {
+        if t.state == State::Alive &&
+            t.tall > 4.0 &&
+            !t.pinned &&
+            length(t.at + t.lean - at) < r + t.reach {
+            disk(g, t.at + t.lean, t.reach, |k| { shut[k] = true })
+        }
+    }
+    var n = 0
+    var covered = 0
+    for k in 0..g.cells() {
+        if length(g.centre(k) - at) < r {
+            n += 1
+            if shut[k] {
+                covered += 1
+            }
+        }
+    }
+    f32(covered) / f32(max(n, 1))
+}
+
+/// The floor's area (km²): its square's, inside its edge.
+pub fn floor_area<G: Ground>(ground: G, m: Map) -> f32 {
+    let g = Grid::over(m.lo, m.hi, 10.0)
+    var n = 0
+    for c in 0..g.cells() {
+        if ground.past_edge(g.centre(c)) < 0.0 {
+            n += 1
+        }
+    }
+    f32(n) * 100.0 / 1.0e6
+}
+
+fn cadence_json(c: Cadence) -> String {
+    f"{{\"draws_per_hour\": {c.arrivals_per_hour:.2}, \"median_gap\": {c.median_gap:.1}, \"longest_gap\": {c.longest_gap:.1}, \"lost\": {c.lost:.4}, \"blocked\": {c.blocked:.4}, \"keystones_per_hour\": {c.keystones_per_hour:.2}}}"
+}
+
+fn json_string(s: str) -> String {
+    var out = String::from("\"")
+    std::fmt::json_text(mut out, s)
+    out.push_str("\"")
+    out
+}
+
+/// A view as JSON (a lookbook shot's numbers): its strongest draw and how many draw at
+/// least `FAINT`, whether it's dead (nothing draws) or quiet (only features draw: no site, opening,
+/// crest or trail), and each draw: what pulls (and the site's name, for a site's), how strongly.
+pub fn view_json(m: Map, v: View) -> String {
+    var major = 0.0
+    var draws = String::new()
+    for i in 0..v.draws.len() {
+        let d = v.draws[i]
+        if d.pull != Pull::Feature {
+            major = max(major, d.strength)
+        }
+        let what = match d.pull {
+            Pull::Key => m.sites[d.site].name,
+            Pull::Opening => "an opening",
+            Pull::Crest => "a crest",
+            Pull::Trail => "a trail",
+            Pull::Feature => "a feature",
+        }
+        let sep = if i == 0 { "" } else { ", " }
+        draws.push_str(f"{sep}{{\"pull\": {json_string(what)}, \"strength\": {d.strength:.3}}}")
+    }
+    f"{{\"best\": {v.best:.3}, \"count\": {v.count}, \"dead\": {flag(v.best < FAINT)}, \"quiet\": {flag(major < FAINT)}, \"draws\": [{draws}]}}"
+}
+
+fn coverage_json(c: Coverage) -> String {
+    f"\"walkable\": {c.walkable}, \"walkable_km2\": {c.area:.3}, \"dead\": {c.dead:.4}, \"quiet\": {c.quiet:.4}, \"rich\": {c.rich:.4}"
+}
+
+fn flag(b: bool) -> Text {
+    if b { "true" } else { "false" }
+}
+
+/// What the check found, as JSON: the floor's area and coverage; each region's coverage and
+/// cadence; each relation's verdict, and whether its viewpoint can be reached from the gate;
+/// each opening's cover; each site's reach from the gate; the walkers' cadence and the critical
+/// path's time. The floor's tests read it, as the map lens and an agent do.
+pub fn report<G: Ground>(ground: G, m: Map, c: Checked) -> String {
+    var out = String::from("{\n")
+    out.push_str(f"  \"area_km2\": {floor_area(ground, m):.3},\n")
+    out.push_str(
+        f"  \"floor\": {{{coverage_json(c.coverage)}, \"magpies\": {cadence_json(cadence(m, c.magpies, grow::NONE))}, \"pilgrims\": {cadence_json(cadence(m, c.pilgrims, grow::NONE))}}},\n",
+    )
+    out.push_str("  \"regions\": [\n")
+    for r in 0..m.regions.len() {
+        let sep = if r + 1 < m.regions.len() { "," } else { "" }
+        out.push_str(
+            f"    {{\"name\": {json_string(m.regions[r].name)}, {coverage_json(c.regions[r])}, \"pilgrims\": {cadence_json(cadence(m, c.pilgrims, r))}}}{sep}\n",
+        )
+    }
+    out.push_str("  ],\n  \"relations\": [\n")
+    for i in 0..m.relations.len() {
+        let r = m.relations[i]
+        let h = c.held[i]
+        let hidden = match r {
+            Relation::Hidden { .. } => true,
+            _ => false,
+        }
+        let reached = reaches(c.sight, c.reach, r.from(), r.within())
+        let sep = if i + 1 < m.relations.len() { "," } else { "" }
+        out.push_str(
+            f"    {{\"name\": {json_string(r.name())}, \"site\": {json_string(m.sites[r.to()].name)}, \"landmark\": {flag(r.landmark())}, \"hidden\": {flag(hidden)}, \"from\": [{r.from().x:.1}, {r.from().y:.1}], \"draw\": {h.at:.3}, \"before\": {h.before:.3}, \"holds\": {flag(h.holds)}, \"reached\": {flag(reached)}}}{sep}\n",
+        )
+    }
+    out.push_str("  ],\n  \"openings\": [\n")
+    for i in 0..m.openings.len() {
+        let o = m.openings[i]
+        let cover = c.openings[i]
+        let open = cover <= OPEN
+        let sep = if i + 1 < m.openings.len() { "," } else { "" }
+        out.push_str(
+            f"    {{\"name\": {json_string(o.name)}, \"cover\": {cover:.3}, \"open\": {flag(open)}}}{sep}\n",
+        )
+    }
+    out.push_str("  ],\n  \"sites\": [\n")
+    for i in 0..m.sites.len() {
+        let k = m.sites[i]
+        let reached = reaches(c.sight, c.reach, k.at, k.reach)
+        let sep = if i + 1 < m.sites.len() { "," } else { "" }
+        out.push_str(
+            f"    {{\"name\": {json_string(k.name)}, \"kind\": {u32(k.kind)}, \"critical\": {flag(critical(k))}, \"reached\": {flag(reached)}}}{sep}\n",
+        )
+    }
+    let (median, all) = critical_path(m, c.trail)
+    // How many of the trail pilgrims found each critical site: the one they miss.
+    var found = String::new()
+    for i in 0..m.sites.len() {
+        if critical(m.sites[i]) {
+            var n = 0
+            for w in c.trail {
+                for f in w.found {
+                    if u32(f.x) == i {
+                        n += 1
+                    }
+                }
+            }
+            if !found.is_empty() {
+                found.push_str(", ")
+            }
+            found.push_str(f"{json_string(m.sites[i].name)}: {n}")
+        }
+    }
+    // Each pilgrim's start, and its time lost and blocked: for finding where walkers get stuck.
+    var walks = String::new()
+    for w in c.pilgrims {
+        if !walks.is_empty() {
+            walks.push_str(", ")
+        }
+        let p0 = if w.path.is_empty() { vec2(0.0) } else { w.path[0] }
+        let pn = if w.path.is_empty() { vec2(0.0) } else { w.path[w.path.len() - 1] }
+        walks.push_str(
+            f"[{p0.x:.0}, {p0.y:.0}, {pn.x:.0}, {pn.y:.0}, {w.lost:.0}, {w.blocked:.0}, {w.time:.0}]",
+        )
+    }
+    out.push_str(
+        f"  ],\n  \"critical\": {{\"median_s\": {median:.0}, \"reached\": {all}, \"of\": {c.trail.len()}, \"found\": {{{found}}}}},\n  \"pilgrim_walks\": [{walks}]\n}}\n",
+    )
+    out
+}
+
+/// The views for a map: each view's strongest draw (a byte, 0 to 1 as 0 to 254; 255 where a
+/// player can't stand), rows from the square's corner, after the grid's size (two `u32`s).
+pub fn views_bytes(m: Map, c: Checked, set: Settings) -> Vec<u8> {
+    let vg = views_grid(m, set)
+    var out: Vec<u8> = Vec::new()
+    for k in 0..4 {
+        out.push(u8((vg.nx >> (8 * k)) & 255))
+    }
+    for k in 0..4 {
+        out.push(u8((vg.nz >> (8 * k)) & 255))
+    }
+    for v in c.views {
+        out.push(if v.walkable { u8(clamp(v.best, 0.0, 1.0) * 254.0) } else { 255 })
+    }
+    out
+}
+
+/// The check's walking grid (`Sight::walk`): each cell's pace a byte (0 to 1 as 0 to 255), rows
+/// from the grid's corner, after its size (two `u32`s) and its corner and cell (three `f32`s).
+pub fn walk_bytes(c: Checked) -> Vec<u8> {
+    let g = c.sight.grid
+    var out: Vec<u8> = Vec::new()
+    for x in [g.nx, g.nz, bitcast_u32(g.lo.x), bitcast_u32(g.lo.y), bitcast_u32(g.cell)] {
+        for k in 0..4 {
+            out.push(u8((x >> (8 * k)) & 255))
+        }
+    }
+    for w in c.sight.walk {
+        out.push(u8(clamp(w, 0.0, 1.0) * 255.0))
+    }
+    out
+}
+
+/// The floor's map as an image (the play harness's map): over the map's square, `px`
+/// metres a pixel, the ground's relief lit from the north-west, darker under the crowns (the
+/// light at the ground), the trails' earth, open water, what can't be walked greyed, the dead
+/// zones red (a walkable view with no draw `FAINT` or more), the routes yellow and the sites
+/// white. Its size (two `u32`s), its corner and pixel (three `f32`s), then RGBA8 rows from the
+/// corner, north (-z) first.
+pub fn map_image(m: Map, c: Checked, set: Settings, px: f32) -> Vec<u8> {
+    borrow s = c.sight
+    let g = s.grid
+    let w = u32(ceil((m.hi.x - m.lo.x) / px))
+    let h = u32(ceil((m.hi.y - m.lo.y) / px))
+    var out: Vec<u8> = Vec::with_capacity(20 + 4 * w * h)
+    for x in [w, h, bitcast_u32(m.lo.x), bitcast_u32(m.lo.y), bitcast_u32(px)] {
+        for k in 0..4 {
+            out.push(u8((x >> (8 * k)) & 255))
+        }
+    }
+    let vg = views_grid(m, set)
+    var rgb: Vec<vec3> = Vec::filled(w * h, vec3(0.1))
+    for y in 0..h {
+        for x in 0..w {
+            let q = m.lo + (vec2(f32(x), f32(y)) + vec2(0.5)) * px
+            if !g.holds(q) {
+                continue
+            }
+            let cc = g.cell_at(q)
+            let e = g.cell
+            let dx = g.sample(s.ground, q + vec2(e, 0.0)) - g.sample(s.ground, q - vec2(e, 0.0))
+            let dz = g.sample(s.ground, q + vec2(0.0, e)) - g.sample(s.ground, q - vec2(0.0, e))
+            let n = normalize(vec3(-dx, 2.0 * e, -dz))
+            let shade = 0.55 + 0.45 * max(dot(n, normalize(vec3(-1.0, 1.4, -1.0))), 0.0)
+            let wood = mix(vec3(0.09, 0.17, 0.07), vec3(0.42, 0.52, 0.26), vec3(s.open[cc]))
+            var col = mix(wood, vec3(0.55, 0.42, 0.28), vec3(s.trail[cc] * 0.8)) * shade
+            if s.walk[cc] <= 0.0 {
+                col *= 0.55
+            }
+            for mere in m.water.meres {
+                if mere.z > 0.0 && length(q - mere.xy) < mere.z {
+                    col = vec3(0.12, 0.25, 0.42)
+                }
+            }
+            if vg.holds(q) {
+                let v = c.views[vg.cell_at(q)]
+                if v.walkable && v.best < FAINT {
+                    col = mix(col, vec3(0.85, 0.12, 0.1), vec3(0.55))
+                }
+            }
+            rgb[y * w + x] = col
+        }
+    }
+    // The routes and the sites over it.
+    for r in m.routes {
+        for k in 1..r.points.len() {
+            let a = (r.points[k - 1] - m.lo) / px
+            let b = (r.points[k] - m.lo) / px
+            let steps = u32(ceil(length(b - a))) + 1
+            for i in 0..steps {
+                let p = mix(a, b, vec2(f32(i) / f32(steps)))
+                dot_at(mut rgb, w, h, p, 0.8, vec3(0.95, 0.85, 0.45))
+            }
+        }
+    }
+    for k in m.sites {
+        dot_at(mut rgb, w, h, (k.at - m.lo) / px, 2.2, vec3(1.0))
+    }
+    for col in rgb {
+        let v = sqrt(clamp(col, vec3(0.0), vec3(1.0)))
+        out.push(u8(v.x * 255.0))
+        out.push(u8(v.y * 255.0))
+        out.push(u8(v.z * 255.0))
+        out.push(255)
+    }
+    out
+}
+
+/// A filled dot of radius `r` pixels at `p` in an image `w` by `h`.
+fn dot_at(rgb: mut Vec<vec3>, w: u32, h: u32, p: vec2, r: f32, col: vec3) {
+    let lo = vec2i(floor(p - vec2(r)))
+    let hi = vec2i(ceil(p + vec2(r)))
+    for y in max(lo.y, 0)..min(hi.y + 1, i32(h)) {
+        for x in max(lo.x, 0)..min(hi.x + 1, i32(w)) {
+            if length(vec2(f32(x) + 0.5, f32(y) + 0.5) - p) <= r {
+                rgb[u32(y) * w + u32(x)] = col
+            }
+        }
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// A small sight grid with just the walking data used by path and reachability checks.
+fn walking_grid(g: Grid, walk: take Vec<f32>) -> Sight {
+    Sight {
+        grid: g,
+        ground: Vec::new(),
+        top: Vec::new(),
+        base: Vec::new(),
+        crown: Vec::new(),
+        under: Vec::new(),
+        stems: Vec::new(),
+        brush_top: Vec::new(),
+        trunk_start: Vec::new(),
+        trunks: Vec::new(),
+        solids: Vec::new(),
+        open: Vec::new(),
+        trail: Vec::new(),
+        walk,
+        features: Vec::new(),
+        feature_bins: Vec::new(),
+        bins: g,
+    }
+}
+
+@test
+fn blocked_cells_are_not_reachable_without_a_walkable_start() {
+    let g = Grid { lo: vec2(0.0), nx: 2, nz: 2, cell: 4.0 }
+    let s = walking_grid(g, Vec::filled(g.cells(), 0.0))
+    let at = g.centre(0)
+    for can in reachable(s, at) {
+        assert(!can, "a blocked start was marked reachable")
+    }
+    assert(way(s, at, at).is_empty(), "a blocked start produced a route")
+}
+
+@test
+fn walking_starts_snap_only_within_twelve_metres() {
+    let g = Grid { lo: vec2(0.0), nx: 2, nz: 2, cell: 16.0 }
+    let s = walking_grid(g, Vec::from([0.0, 1.0, 0.0, 0.0]))
+    assert(nearest_walkable(s, g.centre(0)) == 0, "snapped sixteen metres across blocked ground")
+    assert(nearest_walkable(s, vec2(12.0, 8.0)) == 1, "a cell twelve metres away is in reach")
+}
+
+fn two_region_map() -> Map {
+    Map {
+        lo: vec2(0.0),
+        hi: vec2(32.0),
+        present: 0,
+        land: place::Land {
+            hills: [vec4(0.0); 8],
+            hollows: [vec4(0.0); 8],
+            ridges: [vec4(0.0); 24],
+            ravines: [vec4(0.0); 16],
+            ravine_fall: 0.0,
+            crags: [vec4(0.0); 4],
+            ramps: vec4(0.0),
+            floors: vec4(0.0),
+            tilt: vec4(0.0),
+        },
+        sites: Vec::new(),
+        relations: Vec::new(),
+        openings: Vec::new(),
+        routes: Vec::new(),
+        water: place::Water {
+            meres: [vec4(0.0); 2],
+            springs: [vec2(0.0); 8],
+            spring_count: 0,
+            falls: [vec2(0.0); 2],
+        },
+        events: Vec::new(),
+        wind: vec2(1.0, 0.0),
+        kept: Vec::new(),
+        regions: Vec::from(
+            [
+                place::Region {
+                    name: "one",
+                    kind: place::Kind::HighForest,
+                    at: vec2(8.0),
+                    character: place::Character {},
+                },
+                place::Region {
+                    name: "two",
+                    kind: place::Kind::HighForest,
+                    at: vec2(24.0),
+                    character: place::Character {},
+                },
+            ],
+        ),
+        herd: place::Herd { arrives: 0, trips: 0, drink: vec2(0.0), rest: vec2(0.0) },
+    }
+}
+
+@test
+fn cadence_counts_trailing_gaps_in_the_regions_time() {
+    let m = two_region_map()
+    let walk = Walk {
+        path: Vec::from([vec2(8.0), vec2(24.0)]),
+        arrivals: Vec::from([vec3(0.0, 80.0, 1.0)]),
+        found: Vec::new(),
+        lost: 0.0,
+        time: 100.0,
+        blocked: 0.0,
+    }
+    var walks: Vec<Walk> = Vec::new()
+    walks.push(take walk)
+    let quiet = cadence(m, walks, 0)
+    assert(quiet.median_gap == 50.0)
+    assert(quiet.longest_gap == 50.0, "a region with no arrivals lost its whole gap")
+    let regional = cadence(m, walks, 1)
+    assert(
+        regional.median_gap == 40.0,
+        "regional gaps must use the same time share as its duration",
+    )
+    assert(regional.longest_gap == 40.0)
+    let all = cadence(m, walks, grow::NONE)
+    assert(all.median_gap == 80.0 && all.longest_gap == 80.0)
+}
+
+@test
+fn a_single_sight_direction_has_no_angular_division() {
+    let g = Grid { lo: vec2(0.0), nx: 2, nz: 2, cell: 4.0 }
+    var s = walking_grid(g, Vec::filled(g.cells(), 1.0))
+    s.ground = Vec::filled(g.cells(), 0.0)
+    assert(seen_beyond(s, g.centre(0), yaw: 0.7, half: 0.0, dist: 0.0, eye: 1.7) == 1.0)
+}
+
+@test
+fn opening_cover_follows_the_crowns_reach_and_lean() {
+    let tree = Tree {
+        at: vec2(20.0, 0.0),
+        kind: 0,
+        born: 0,
+        tall: 10.0,
+        reach: 6.0,
+        lean: vec2(-20.0, 0.0),
+        girth: 1.0,
+        light: 1.0,
+        vigour: 1.0,
+        state: State::Alive,
+        died: 0,
+        fell: 0,
+        fall: vec2(0.0),
+        cause: grow::Cause::Old,
+        pinned: false,
+        shaped: grow::NONE,
+        lift: 2.0,
+        fork: 0.0,
+        seed: 1,
+    }
+    assert(
+        opening_cover([tree], vec2(0.0), radius: 5.0) == 1.0,
+        "a crown leaning over the opening was ignored",
+    )
+    let wide = Tree { lean: vec2(0.0), reach: 25.0, ..tree }
+    assert(
+        opening_cover([wide], vec2(0.0), radius: 5.0) == 1.0,
+        "a wide crown over the opening was ignored",
+    )
+    assert(opening_cover([Tree { pinned: true, ..tree }], vec2(0.0), radius: 5.0) == 0.0)
+}
+
+@test
+fn view_json_escapes_site_names() {
+    var m = two_region_map()
+    m.sites.push(
+        Site {
+            kind: SiteKind::Anchor,
+            feature: Feature::Ground,
+            at: vec2(8.0),
+            name: "a\"b\\c\nδ",
+        },
+    )
+    var draws: Bounded<Draw, MAX_DRAWS> = Bounded::new()
+    draws.push(Draw { pull: Pull::Key, site: 0, target: vec2(8.0), strength: 1.0 })
+    let view = View { at: vec2(8.0), walkable: true, draws, best: 1.0, count: 1 }
+    assert(
+        view_json(m, view).find("\"pull\": \"a\\\"b\\\\c\\nδ\"").is_some(),
+        "site names must be escaped in view JSON",
+    )
+}
+
+struct ReportGround: Copy {}
+
+impl Ground for ReportGround {
+    fn height(self, x: f32, z: f32) -> f32 {
+        0.0
+    }
+    fn past_edge(self, p: vec2) -> f32 {
+        -1.0
+    }
+    fn rock(self, p: vec2) -> f32 {
+        0.0
+    }
+}
+
+@test
+fn interest_report_escapes_all_authored_names() {
+    var m = two_region_map()
+    m.regions[0].name = "region\"\\\nδ"
+    m.sites.push(
+        Site {
+            kind: SiteKind::Anchor,
+            feature: Feature::Ground,
+            at: vec2(8.0),
+            name: "site\"\\\nδ",
+        },
+    )
+    m.relations.push(
+        Relation::Seen {
+            from: vec2(8.0),
+            within: 1.0,
+            to: 0,
+            landmark: false,
+            name: "relation\"\\\nδ",
+        },
+    )
+    m.openings.push(
+        place::Opening {
+            at: vec2(8.0),
+            radius: 1.0,
+            keeper: place::Keeper::Nothing,
+            name: "opening\"\\\nδ",
+        },
+    )
+    let g = Grid { lo: vec2(0.0), nx: 2, nz: 2, cell: 16.0 }
+    let coverage = Coverage { walkable: 4, dead: 0.0, quiet: 0.0, rich: 0.0, area: 0.001 }
+    let checked = Checked {
+        sight: walking_grid(g, Vec::filled(g.cells(), 1.0)),
+        views: Vec::new(),
+        coverage,
+        regions: Vec::filled(2, coverage),
+        held: Vec::from([Held { at: 1.0, before: 0.0, holds: true }]),
+        magpies: Vec::new(),
+        pilgrims: Vec::new(),
+        trail: Vec::new(),
+        reach: Vec::filled(g.cells(), value: true),
+        openings: Vec::from([0.0]),
+    }
+    let json = report(ReportGround {}, m, checked)
+    for name in ["region", "site", "relation", "opening"] {
+        assert(
+            json.find(f"\"name\": \"{name}\\\"\\\\\\nδ\"").is_some(),
+            f"{name}'s name is not escaped in report JSON",
+        )
+    }
+    assert(json.find("\"site\": \"site\\\"\\\\\\nδ\"").is_some())
+    assert(json.find("\"found\": {\"site\\\"\\\\\\nδ\": 0}").is_some())
+}
+
+/// The map lens's QUICK check does not schedule even a sampled curious walker.
+@test
+fn quick_has_no_walker_starts() {
+    let sites = [
+        Site {
+            kind: SiteKind::Gate,
+            feature: Feature::Ground,
+            at: vec2(0.0),
+            name: "gate",
+        },
+    ]
+    let views = [
+        View {
+            at: vec2(8.0),
+            walkable: true,
+            draws: Bounded::new(),
+            best: 0.0,
+            count: 0,
+        },
+    ]
+    let starts = starts_from(sites, views, QUICK, 1.0)
+    assert(starts.is_empty(), "QUICK scheduled a curious walker")
+    assert(QUICK.trail_walkers == 0, "QUICK scheduled a trail walker")
+}

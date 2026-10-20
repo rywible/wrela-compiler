@@ -1,0 +1,101 @@
+// The herd's look (#43 §8.4): spike 01's. Its lights, the grazer's albedo and roughness from its
+// channels (hide, a dapple from noise on the torso, hoof colour by the hoof channel), the
+// terrain's, and the colour written to the screen. The spike shades into an sRGB target and a
+// blit raises what it stores to 1/2.2; the screen here stores what it's given, so the shading
+// writes that transfer itself: the colour quantized as the sRGB target stores it, decoded, then
+// raised to 1/2.2. M5 replaces all of it with the look the owner picks (#28).
+
+use engine::render::{Lights, Look, View}
+use grazer::Tissue
+use std::field::value_noise
+use std::gpu::{ComparisonSampler, DepthTexture}
+use terrain::Ground
+
+/// Spike 01's lights.
+pub const LIGHTS = Lights {
+    sun_colour: vec3(3.2, 2.9, 2.5),
+    sky: vec3(0.42, 0.55, 0.75),
+    ground: vec3(0.30, 0.26, 0.20),
+    ambient: 0.55,
+    exposure: 0.8,
+    f0: 0.04,
+    normal_offset: 3cm,
+    compare_bias: 0.002,
+}
+
+/// Toward the sun.
+pub const SUN = vec3(-0.5, 0.75, -0.45)
+
+/// The sky's colour, behind everything.
+pub const SKY = vec3(0.42, 0.55, 0.75)
+
+/// Sketch 01's colours, linear.
+const HIDE = vec3(0.148, 0.089, 0.047)
+const HIDE_DARK = vec3(0.060, 0.037, 0.021)
+const HOOF = vec3(0.0130, 0.0090, 0.0070)
+
+/// The dapple's frequency, per metre.
+const DAPPLE = 3.0
+
+/// sRGB's encoding of a linear value, and its decoding.
+pub fn srgb_encode(x: f32) -> f32 {
+    if x <= 0.0031308 { 12.92 * x } else { 1.055 * pow(x, 1.0 / 2.4) - 0.055 }
+}
+
+pub fn srgb_decode(x: f32) -> f32 {
+    if x <= 0.04045 { x / 12.92 } else { pow((x + 0.055) / 1.055, 2.4) }
+}
+
+/// A linear value as an sRGB target stores it (encoded, eight bits), read back (decoded).
+fn stored(x: f32) -> f32 {
+    srgb_decode(round(clamp(srgb_encode(x), 0.0, 1.0) * 255.0) / 255.0)
+}
+
+/// What the spike's screen shows of a colour `c` it shaded: each component `stored`, then raised
+/// to 1/2.2.
+pub fn transfer(c: vec3) -> vec3 {
+    pow(vec3(stored(c.x), stored(c.y), stored(c.z)), vec3(1.0 / 2.2))
+}
+
+/// One grazer's look: its noise offset, which places its dapples.
+pub struct GrazerLook: Copy + GpuData {
+    pub offset: vec3,
+}
+
+/// Dapples on the torso: thresholded noise whose edge widens with the footprint (D-077).
+fn dapple(p: vec3, fp: f32, offset: vec3) -> f32 {
+    let q = (p + offset) * DAPPLE
+    let n = value_noise(q) + 0.5 * value_noise(q * 2.0 + 31.0)
+    let edge = max(0.08, fp * DAPPLE * 2.0)
+    smoothstep(0.25 - edge, 0.25 + edge, n)
+}
+
+impl Look<Tissue> for GrazerLook {
+    fn surface(self, c: Tissue, rest: vec3, fp: f32) -> (vec3, f32) {
+        var hide = HIDE
+        if c.torso > 0.0 {
+            hide = mix(HIDE, HIDE_DARK, vec3(dapple(rest, fp, self.offset) * c.torso))
+        }
+        (mix(hide, HOOF, vec3(c.hoof)), mix(0.7, 0.35, c.hoof))
+    }
+
+    fn output(self, colour: vec3) -> vec4 {
+        vec4(transfer(colour), 1.0)
+    }
+}
+
+/// The terrain's colour: two greens mixed by noise, lit as the grazers are.
+@fragment
+pub fn ground_shade(
+    g: Ground,
+    view: View,
+    lights: Lights,
+    shadow: DepthTexture,
+    shadow_sampler: ComparisonSampler,
+) -> vec4 {
+    let n = normalize(g.normal)
+    let k = value_noise(vec3(g.world.x, 0.0, g.world.z) * 0.35) * 0.5 + 0.5
+    let albedo = mix(vec3(0.035, 0.060, 0.012), vec3(0.075, 0.085, 0.020), vec3(k))
+    let lit = lights.shadow(view, g.world, n, shadow, shadow_sampler)
+    vec4(transfer(lights.light(albedo, 0.9, n, g.world, view, lit)), 1.0)
+}

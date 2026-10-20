@@ -1,0 +1,490 @@
+// The herd (#43 §12, #42 AC1): spike 01's 40 grazers, seeds 1 to 40, on its terrain, simulated
+// on the ticker's thread (`engine::run`, herd.wrela) and drawn from their fields: realized at
+// levels of detail as their size on screen asks (`engine::realize`), posed on the GPU by the
+// walk cycle, cast into a 2048² shadow map, and shaded per pixel. No JS and no WGSL is written by
+// hand for it.
+//
+// Keys choose what a frame draws (a test's script presses them): H the herd's camera (the
+// default), C the close-up's (seed 1 alone, at the origin, as the spike draws it); L the live herd
+// (the default); and 1, 2 or 3 a still frame for comparing with the spike's: its placement, each
+// grazer's phase at its own plus 0.9 t (t the frame's time), every grazer realized at 3, 2 or
+// 1.5 cm; 4 the still frame with each grazer at the level its size on screen asks (LOD). The sim
+// doesn't drive a still frame. T draws the terrain or not (for timing the creatures' passes
+// alone). O starts the camera's tour of the live herd: a 2-minute loop, from 30 m out to 4, round
+// the herd, again and again (#42 AC4's 10 minutes).
+
+use engine::present::Snapshots
+use engine::look::{ByPart, CreatureLook, Detail, Shadow, Skin}
+use engine::realize::{Eye, NO_LEVEL, Placement, Realizer}
+use engine::render::{
+    Instance, MAX_BONES, RestSkeleton, depth_only, pose_instances, shade, skin, skin_shadow, view,
+}
+use engine::run::run
+use grazer::{FALLOFF, GrazerField, field_of, grazer, params}
+use herd::{HERD, Seen, Snap, between, snapshot, spawn, step}
+use look::{GrazerLook, LIGHTS, SKY, SUN, ground_shade, transfer}
+use std::gpu::{
+    ComparisonSampler, Cull, DepthBias, DepthTexture, GpuBuffer, begin_depth_pass,
+    begin_screen_pass_with_depth, buffer, comparison_sampler, depth_texture, dispatch, draw, write,
+}
+use std::input::{Event, Key, events}
+use std::io::print
+use std::math::PI
+use terrain::{GRID, ground, height}
+use walk::Walk
+
+/// How the grazers are drawn (#43 §13): levels of detail at 3, 2 and 1.5 cm cells, with our
+/// realization's costs and a 4 ms budget (the defaults); skin weights falling off over 6 cm; a
+/// 2048² shadow map.
+const LOOK = CreatureLook {
+    detail: Detail {},
+    deform: Skin { weights: ByPart { falloff: FALLOFF } },
+    shadow: Shadow::Map { resolution: 2048 },
+}
+
+/// The cameras: 40° high at 16:9 (the screen's own aspect is used), each with its shadow map's
+/// extent.
+pub enum Camera: Copy + Eq {
+    Herd,
+    CloseUp,
+    /// The tour, from when it started.
+    Tour(f32),
+}
+
+/// What a frame draws: the live herd, or a still frame of the spike's placement with every
+/// grazer at one level, or with each at the level its size on screen asks (LOD).
+enum Mode: Copy + Eq {
+    Live,
+    Still(u32),
+    StillLod,
+}
+
+/// The middle of the herd, where its cameras look.
+const HERD_MIDDLE = vec3(0.0, 80cm, 1m)
+
+/// The tour's loop, seconds.
+const TOUR_LOOP: f32 = 120s
+
+/// The tour's camera `t` seconds in: round the herd once a loop, from 30 m out to 4 and back
+/// three times, looking at the herd's middle.
+fn tour(t: f32) -> (vec3, vec3) {
+    let at = HERD_MIDDLE
+    let a = 2.0 * PI * t / TOUR_LOOP
+    let r = 4m + 13m * (1.0 + cos(6.0 * PI * t / TOUR_LOOP))
+    (at + vec3(r * sin(a), 80cm + 0.25 * r, -r * cos(a)), at)
+}
+
+pub struct Game {
+    snaps: Snapshots<Snap>,
+    /// The herd as the spike places it, for still frames.
+    placed: Snap,
+    realizer: Realizer<GrazerField>,
+    looks: Vec<GrazerLook>,
+    skeletons: GpuBuffer<RestSkeleton>,
+    instances: GpuBuffer<Instance>,
+    palettes: GpuBuffer<mat4>,
+    shadow: DepthTexture,
+    shadow_sampler: ComparisonSampler,
+    depth: DepthTexture,
+    width: u32,
+    height: u32,
+    camera: Camera,
+    mode: Mode,
+    /// The level a still frame last realized every grazer at (`NO_LEVEL` if none).
+    realized: u32,
+    /// Whether every grazer has been drawn yet.
+    all_drawn: bool,
+    terrain: bool,
+    /// Whether each grazer has been drawn, and reached the level it should have, yet (live).
+    drawn_yet: Vec<bool>,
+    at_level_yet: Vec<bool>,
+}
+
+pub fn init() -> Game {
+    let world = spawn()
+    let placed = snapshot(world)
+    let latest = run(take world, hz: 60, step: step, present: snapshot)
+    var realizer: Realizer<GrazerField> = Realizer::new(LOOK)
+    var looks: Vec<GrazerLook> = Vec::new()
+    var rests: Vec<RestSkeleton> = Vec::new()
+    for i in 0..HERD {
+        let g = grazer(i + 1)
+        let _ = realizer.add(field_of(g), g.bounds())
+        looks.push(GrazerLook { offset: vec3(params(i + 1).offset) })
+        rests.push(RestSkeleton::of(g.skeleton()))
+    }
+    var skeletons: GpuBuffer<RestSkeleton> = buffer(HERD)
+    write(mut skeletons, 0, rests)
+    let side = match LOOK.shadow {
+        Shadow::Map { resolution } => resolution,
+        Shadow::None => 1,
+    }
+    Game {
+        snaps: Snapshots::new(take latest, hz: 60),
+        placed,
+        realizer,
+        looks,
+        skeletons,
+        instances: buffer(HERD),
+        palettes: buffer(HERD * MAX_BONES),
+        shadow: depth_texture(width: side, height: side),
+        shadow_sampler: comparison_sampler(),
+        depth: depth_texture(width: 1, height: 1),
+        width: 1,
+        height: 1,
+        camera: Camera::Herd,
+        mode: Mode::Live,
+        realized: NO_LEVEL,
+        all_drawn: false,
+        terrain: true,
+        drawn_yet: Vec::new(),
+        at_level_yet: Vec::new(),
+    }
+}
+
+/// The keys this frame (at `time`): cameras and modes.
+fn keys(game: mut Game, time: f32) {
+    for e in events() {
+        if let Event::KeyDown { key, .. } = e {
+            match key {
+                Key::H => game.camera = Camera::Herd,
+                Key::C => game.camera = Camera::CloseUp,
+                Key::L => game.mode = Mode::Live,
+                Key::Digit1 => game.mode = Mode::Still(0),
+                Key::Digit2 => game.mode = Mode::Still(1),
+                Key::Digit3 => game.mode = Mode::Still(2),
+                Key::Digit4 => game.mode = Mode::StillLod,
+                Key::T => game.terrain = !game.terrain,
+                Key::O => game.camera = Camera::Tour(time),
+                _ => {},
+            }
+        }
+    }
+}
+
+/// The grazers this frame draws, and where: the live herd between its two snapshots around
+/// the frame's sim time; a still frame's placement with each phase moved on by 0.9 t; the
+/// close-up's seed 1 alone, at the origin.
+fn seen(game: mut Game, time: f32) -> Vec<Seen> {
+    var out: Vec<Seen> = Vec::new()
+    if game.camera == Camera::CloseUp {
+        let phase = 0.3 + 0.9 * time
+        out.push(
+            Seen {
+                seed: 1,
+                pos: vec3(0.0, height(x: 0.0, z: 0.0), 0.0),
+                heading: PI / 2.0,
+                phase: fract(phase),
+                head_down: 0.2,
+            },
+        )
+        return out
+    }
+    if game.mode != Mode::Live {
+        for g in game.placed.grazers {
+            out.push(Seen { phase: fract(g.phase + 0.9 * time), ..g })
+        }
+        return out
+    }
+    game.snaps.update()
+    let b = game.snaps.at(game.snaps.sim_time(time))
+    for i in 0..min(b.a.grazers.len(), b.b.grazers.len()) {
+        out.push(between(b.a.grazers[i], b.b.grazers[i], b.alpha))
+    }
+    out
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    keys(mut game, time)
+    if width != game.width || height != game.height {
+        game.depth = depth_texture(width, height)
+        game.width = width
+        game.height = height
+    }
+    let aspect = f32(width) / f32(height)
+    let fovy = 40deg
+    let (eye, at, extent) = match game.camera {
+        Camera::Herd => (vec3(2m, 7.5m, -27m), HERD_MIDDLE, 26m),
+        Camera::CloseUp => (vec3(85cm, 1.4m, -3.6m), vec3(85cm, 1.2m, 0.0), 4m),
+        Camera::Tour(from) => {
+            let (eye, at) = tour(time - from)
+            (eye, at, 26m)
+        },
+    }
+    let v = view(eye: eye, at: at, fovy: fovy, aspect: aspect, sun: SUN, extent: extent)
+    let grazers = seen(mut game, time)
+
+    // Realization: a still frame's level for every grazer at once; the live herd's by size on
+    // screen, within the frame's budget.
+    if let Mode::Still(level) = game.mode {
+        if game.realized != level && game.realizer.realize_all(level) {
+            game.realized = level
+            print(f"every grazer realized at level {level}")
+        }
+    } else {
+        game.realized = NO_LEVEL
+        var placed: Vec<Placement> = Vec::new()
+        for g in grazers {
+            placed.push(Placement { at: g.pos, heading: g.heading })
+        }
+        game.realizer.frame(
+            Eye { at: v.eye, view_proj: v.view_proj, height: f32(height), fovy },
+            placed,
+        )
+        // When each grazer is first drawn, and first has the level it should (#42 AC4).
+        while game.drawn_yet.len() < HERD {
+            game.drawn_yet.push(false)
+            game.at_level_yet.push(false)
+        }
+        for i in 0..HERD {
+            let (drawn, target) = (game.realizer.drawn(i), game.realizer.target(i))
+            if !game.drawn_yet[i] && drawn != NO_LEVEL {
+                game.drawn_yet[i] = true
+                print(f"grazer {i + 1} drawn")
+            }
+            if !game.at_level_yet[i] && drawn != NO_LEVEL && drawn == target {
+                game.at_level_yet[i] = true
+                print(f"grazer {i + 1} at its level")
+            }
+        }
+    }
+
+    // Posing: one pass for every grazer drawn.
+    var instances: Vec<Instance> = Vec::new()
+    for g in grazers {
+        let i = g.seed - 1
+        if game.realizer.drawn(i) != NO_LEVEL {
+            instances.push(
+                Instance {
+                    at: g.pos,
+                    heading: g.heading,
+                    pose: vec4(g.phase, g.head_down, 0.0, 0.0),
+                    skeleton: i,
+                },
+            )
+        }
+    }
+    let n = instances.len()
+    if n > 0 {
+        write(mut game.instances, 0, instances)
+        dispatch(
+            pose_instances.bind(
+                poser: Walk {},
+                instances: game.instances.span(start: 0, count: n),
+                skeletons: game.skeletons.span(start: 0, count: HERD),
+                palettes: mut game.palettes,
+            ),
+            groups: n,
+        )
+    }
+    if !game.all_drawn && n == HERD && game.camera == Camera::Herd {
+        game.all_drawn = true
+        print(f"all {HERD} grazers drawn")
+    }
+
+    // The sun's shadow map: the grazers alone, biased.
+    let palettes = game.palettes.span(start: 0, count: HERD * MAX_BONES)
+    let shadow_pass = begin_depth_pass(mut game.shadow, clear_depth: 1.0)
+    for k in 0..n {
+        let i = instances[k].skeleton
+        borrow mesh = game.realizer.mesh(i)
+        draw(
+            shadow_pass,
+            skin_shadow.bind(
+                verts: mesh.verts.items(),
+                palettes: palettes,
+                first: k * MAX_BONES,
+                view: v,
+            ),
+            depth_only,
+            indices: mesh.quads.items(),
+            indirect: mesh.draw.items(),
+            depth_bias: DepthBias { constant: 4, slope: 2.0, clamp: 0.0 },
+        )
+    }
+    shadow_pass.end()
+
+    // The terrain, then the grazers, shaded per pixel.
+    let pass = begin_screen_pass_with_depth(mut game.depth, clear: vec4(transfer(SKY), 1.0))
+    if game.terrain {
+        draw(
+            pass,
+            ground.bind(view: v),
+            ground_shade.bind(
+                view: v,
+                lights: LIGHTS,
+                shadow: game.shadow,
+                shadow_sampler: game.shadow_sampler,
+            ),
+            vertices: GRID * GRID * 6,
+        )
+    }
+    for k in 0..n {
+        let i = instances[k].skeleton
+        borrow mesh = game.realizer.mesh(i)
+        draw(
+            pass,
+            skin.bind(
+                verts: mesh.verts.items(),
+                palettes: palettes,
+                first: k * MAX_BONES,
+                view: v,
+            ),
+            shade.bind(
+                field: game.realizer.field(i),
+                look: game.looks[i],
+                view: v,
+                lights: LIGHTS,
+                shadow: game.shadow,
+                shadow_sampler: game.shadow_sampler,
+            ),
+            indices: mesh.quads.items(),
+            indirect: mesh.draw.items(),
+            cull: Cull::Back,
+        )
+    }
+    pass.present()
+}
+
+// ---- for the tests (compiler/tests/tests/suite/herd.rs) ----------------------------------------
+
+/// The grazer of seed `s`'s skin weights at `p`, under the items in the mask given, seen a
+/// footprint wide: its four bones (a byte each) and their weights (a byte each).
+pub fn skin_at(s: u32, p: vec3, lo: u32, hi: u32, fp: f32) -> (u32, u32) {
+    engine::creature::Parts::skin_at(
+        grazer(s).field(),
+        p,
+        engine::creature::PartMask { lo, hi },
+        fp,
+        FALLOFF,
+    )
+}
+
+/// Its mass (kg) by the spike's method, cells down to `finest`.
+pub fn mass(s: u32, finest: f32) -> f32 {
+    f32(engine::physique::adaptive_mass(grazer(s).field(), grazer::density, finest).mass)
+}
+
+/// A physique, summed up (`physique`).
+struct Summary {
+    /// The whole's mass, kg.
+    mass: f32,
+    /// The bones' masses summed.
+    summed: f32,
+    /// How many bones have mass.
+    bones: u32,
+    /// The least of each bone's moments' triangle inequalities (I_a + I_b - I_c over the
+    /// largest moment: never below 0).
+    least: f32,
+}
+
+/// Its physique per bone by the spike's method, cells down to `finest` (#43 §9), summed up.
+fn physique(s: u32, finest: f32) -> Summary {
+    let m = engine::physique::adaptive_physique(grazer(s), grazer::density, finest)
+    var sum = 0.0
+    var bones = 0
+    var least = 1.0
+    for b in m.per {
+        sum += b.mass
+        if b.mass > 0.0 {
+            bones += 1
+            let i = b.inertia
+            let most = max(i.x, max(i.y, i.z))
+            least = min(least, min(i.x + i.y - i.z, min(i.x + i.z - i.y, i.y + i.z - i.x)) / most)
+        }
+    }
+    Summary { mass: m.total.mass, summed: sum, bones, least }
+}
+
+/// The most two physiques' bones differ, for bones over 1 kg (relative to the bone's mass):
+/// the spike's method's against the derived interval's (`integrate`), cells down to `finest`.
+fn physique_methods_differ(s: u32, finest: f32) -> f32 {
+    let a = engine::physique::adaptive_physique(grazer(s), grazer::density, finest)
+    let b = engine::physique::integrate(
+        grazer(s),
+        grazer::density,
+        engine::physique::Per::Bone,
+        finest,
+    )
+    var most = 0.0
+    for i in 0..a.per.len() {
+        if b.per[i].mass > 1.0 {
+            most = max(most, abs(a.per[i].mass - b.per[i].mass) / b.per[i].mass)
+        }
+    }
+    most
+}
+
+/// What realization has done: realizations, readbacks, holes and overflows found.
+pub fn realized(game: Game) -> (u32, u32, u32, u32) {
+    borrow r = game.realizer
+    (r.realizations, r.readbacks, r.holes, r.overflows)
+}
+
+/// The bytes of mesh memory allocated, in MiB.
+pub fn mesh_memory(game: Game) -> f32 {
+    f32(game.realizer.allocated()) / 1048576.0
+}
+
+/// A slab's MiB at level `level` (0 before the level is calibrated).
+pub fn slab_mib(game: Game, level: u32) -> f32 {
+    f32(game.realizer.slab_bytes(level)) / 1048576.0
+}
+
+/// The level each grazer draws (`NO_LEVEL` before it has a mesh) and should have.
+pub fn level(game: Game, s: u32) -> (u32, u32) {
+    (game.realizer.drawn(s - 1), game.realizer.target(s - 1))
+}
+
+/// Spike 01's evaluation benchmark (`bench_eval`) on seed `s`: `n` points from xorshift 12345
+/// in the box from `lo` to `hi`, the distance at each summed; with `pruned` 1, each sample
+/// leaves out the items that can't matter there.
+pub fn bench_eval(s: u32, n: u32, pruned: u32, lo: vec3, hi: vec3) -> f64 {
+    let field = grazer(s).field()
+    let bounds = engine::creature::Parts::item_bounds(field)
+    var r = terrain::XorShift { state: 12345 }
+    var sum: f64 = 0.0
+    for _ in 0..n {
+        let q = r.point(lo, hi)
+        let d = if pruned != 0 { engine::creature::Parts::sample_pruned(field, q, bounds).0 } else {
+            field.distance(q)
+        }
+        sum += f64(d)
+    }
+    sum
+}
+
+/// Spike 01's raycast benchmark on the sim's terrain: the steps `n` rays took, and how many hit.
+pub fn raycast(n: u32) -> (u32, u32) {
+    terrain::raycast_bench(terrain::Terrain::new(7), n)
+}
+
+// ---- tests (`wrela test examples/herd`) -----------------------------------------------------
+
+/// AC6's physique: seed 1's mass at a 2 cm finest cell within 0.05% of the spike's ground truth
+/// (1,119.26 kg, a uniform 1 cm grid of 25M samples; the spike's own: 1,118.94).
+@test
+fn seed_1s_mass_is_the_ground_truths() {
+    let truth = 1119.26
+    let m = mass(1, 0.02)
+    let off = (m - truth) / truth * 100.0
+    assert(abs(off) <= 0.05, f"{m:.2} kg is {off:.3}% from {truth} kg")
+}
+
+/// #43 §9: the physique per bone, by the spike's method: the bones' masses sum to the whole,
+/// which is `adaptive_mass`'s; every bone's moments of inertia meet the triangle inequality;
+/// and each bone over 1 kg is within 5% of the derived interval's method (`integrate`). The two
+/// lay their cells on different grids, and a cell where two bones meet counts wholly for the
+/// bone nearest its centre, so they differ by a share of a cell at each bone's ends: 20% at
+/// 4 cm, 3.6% at 2 cm and 2.4% at 1 cm.
+@test
+fn the_physique_gives_each_bone_its_mass_and_moments() {
+    let p = physique(1, 0.02)
+    let whole = mass(1, 0.02)
+    assert(abs(p.mass - whole) <= 1.0e-6 * whole, f"{p.mass} kg against {whole}")
+    assert(abs(p.mass - p.summed) <= 1.0e-4 * p.mass, f"{p.summed} kg summed against {p.mass}")
+    assert(p.bones >= 20, f"only {p.bones} bones have mass")
+    assert(p.least >= -1.0e-4, f"a bone's moments break the triangle inequality: {p.least}")
+    let differ = physique_methods_differ(1, 0.02)
+    assert(differ <= 0.05, f"a bone is {differ * 100.0:.2}% from integrate's")
+}

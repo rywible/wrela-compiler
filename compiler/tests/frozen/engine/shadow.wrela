@@ -1,0 +1,234 @@
+// Sun shadows: shadow maps that say how much of the sun's light reaches each point of the world.
+//
+// Two static cascades cover the land, one over the near land and one over the far; they are
+// drawn only when something static changes. A dynamic map covers the space round what moves
+// (the creature) and is drawn every frame. A lookup (`sunlit`) reads both and takes the darker.
+// Four fixed comparison taps soften edges in shadow-map space. A surface keeps the same light as
+// time and the viewing camera change.
+
+use std::gpu::{ComparisonSampler, DepthBias, DepthTexture}
+use std::transform::{look_at, ortho}
+
+/// The depth bias a caster draws into a shadow map with: enough that a lit surface doesn't
+/// shadow itself.
+pub const CASTER = DepthBias { constant: 2, slope: 1.5, clamp: 0.0 }
+
+/// The sun's views: each map's light-space-to-clip matrix, the basis the sun sees (for cards
+/// that face it), each map's texel size (m), and each map's texel in its uv (the near map's,
+/// the far's, the moving one's).
+pub struct Shadows: Copy + GpuData {
+    pub near: mat4,
+    pub far: mat4,
+    pub moving: mat4,
+    pub right: vec3,
+    pub near_texel: f32,
+    pub up: vec3,
+    pub far_texel: f32,
+    pub texel_uv: vec3,
+    pub moving_texel: f32,
+}
+
+/// Where the static cascades are: each a square `span` metres wide round `centre`, seen from
+/// `reach` metres toward the sun, `side` texels a side.
+pub struct Cascade: Copy {
+    pub centre: vec3,
+    pub span: f32,
+    pub reach: f32,
+    pub side: u32,
+}
+
+/// The sun's view of a square round `centre`, `span` wide, from `reach` toward `sun`.
+pub fn sun_view(sun: vec3, centre: vec3, span: f32, reach: f32) -> mat4 {
+    let h = span * 0.5
+    ortho(left: -h, right: h, bottom: -h, top: h, near: 1.0, far: 2.0 * reach) *
+        look_at(centre + sun * reach, centre)
+}
+
+/// Snap a replacement static cascade to the texel grid of its previous map. The reference
+/// moves with render space, so shifting the render origin does not change the grid.
+pub fn snapped_centre(sun: vec3, centre: vec3, reference: vec3, texel: f32) -> vec3 {
+    let fwd = -normalize(sun)
+    let right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, fwd)
+    let delta = centre - reference
+    reference +
+        right * (round(dot(delta, right) / texel) * texel) +
+        up * (round(dot(delta, up) / texel) * texel) +
+        fwd * dot(delta, fwd)
+}
+
+/// The near map's share, fading into the far map before its border. Both maps stay valid in
+/// this band; switching at the last valid texel made a moving square of light on the land.
+fn near_share(clip: vec3) -> f32 {
+    let edge = min(1.0 - abs(clip.x), 1.0 - abs(clip.y)) * 0.5
+    smoothstep(0.01, 0.12, edge) * smoothstep(0.0, 0.04, min(clip.z, 1.0 - clip.z))
+}
+
+/// The shadows for a frame: the static cascades `near` and `far` (their maps each `side` texels
+/// a side), and the moving map round `moving_at`, `moving_span` wide, `moving_side` texels a
+/// side.
+pub fn shadows(
+    sun: vec3,
+    near: Cascade,
+    far: Cascade,
+    moving_at: vec3,
+    moving_span: f32,
+    moving_side: u32,
+) -> Shadows {
+    let s = normalize(sun)
+    let fwd = -s
+    let right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, fwd)
+    // The moving map's centre snapped to its texels, so its edges don't crawl as it follows.
+    let texel = moving_span / f32(moving_side)
+    let snapped = vec3(
+        floor(dot(moving_at, right) / texel) * texel,
+        floor(dot(moving_at, up) / texel) * texel,
+        dot(moving_at, fwd),
+    )
+    let centre = right * snapped.x + up * snapped.y + fwd * snapped.z
+    Shadows {
+        near: sun_view(s, near.centre, near.span, near.reach),
+        far: sun_view(s, far.centre, far.span, far.reach),
+        moving: sun_view(s, centre, moving_span, 40.0),
+        right,
+        near_texel: near.span / f32(near.side),
+        up,
+        far_texel: far.span / f32(far.side),
+        texel_uv: vec3(1.0) / vec3(f32(near.side), f32(far.side), f32(moving_side)),
+        moving_texel: texel,
+    }
+}
+
+/// A symmetric filter in shadow texels. Comparison sampling filters each tap bilinearly.
+/// Rotating sparse taps each frame made static dappled shadows flicker, especially while
+/// moving, when temporal history cannot gather a complete cycle.
+const TAPS = [vec2(-0.75, -0.75), vec2(0.75, -0.75), vec2(-0.75, 0.75), vec2(0.75, 0.75)]
+
+/// How lit `p` is in one map (`view`'s, one of its texels `texel_uv` of its uv), `soft` texels
+/// of penumbra, biased `bias` in depth.
+fn lookup(
+    view: mat4,
+    map: DepthTexture,
+    texel_uv: f32,
+    s: ComparisonSampler,
+    p: vec3,
+    soft: f32,
+    bias: f32,
+) -> (f32, bool) {
+    let lp = view * vec4(p, 1.0)
+    let uv = vec2(lp.x * 0.5 + 0.5, lp.y * -0.5 + 0.5)
+    let inside = uv.x > 0.01 &&
+        uv.x < 0.99 &&
+        uv.y > 0.01 &&
+        uv.y < 0.99 &&
+        lp.z < 1.0 &&
+        lp.z > 0.0
+    if !inside {
+        return (1.0, false)
+    }
+    let texel = soft * texel_uv
+    let at = |o: vec2| map.sample_compare_level(s, uv + o * texel, lp.z - bias)
+    let lit = at(TAPS[0]) + at(TAPS[1]) + at(TAPS[2]) + at(TAPS[3])
+    (lit / 4.0, true)
+}
+
+/// How lit `world` is by the sun (0 to 1), its normal `n`: the static cascades (the near one
+/// where it holds the point, else the far) and the moving map, the darker of the two; `soft`
+/// texels of penumbra.
+pub fn sunlit(
+    sh: Shadows,
+    world: vec3,
+    n: vec3,
+    near: DepthTexture,
+    far: DepthTexture,
+    moving: DepthTexture,
+    s: ComparisonSampler,
+    soft: f32,
+) -> f32 {
+    let lit = statically_sunlit(sh, world, n, near, far, s, soft)
+    let (m, _) = lookup(
+        sh.moving,
+        moving,
+        sh.texel_uv.z,
+        s,
+        world + n * (sh.moving_texel * 1.5),
+        1.5,
+        bias: 0.0008,
+    )
+    min(lit, m)
+}
+
+/// How lit `world` is by the sun through the static cascades alone (`sunlit` without the moving
+/// map): for light kept over many frames, such as the probes', which a moving shadow mustn't
+/// mark.
+pub fn statically_sunlit(
+    sh: Shadows,
+    world: vec3,
+    n: vec3,
+    near: DepthTexture,
+    far: DepthTexture,
+    s: ComparisonSampler,
+    soft: f32,
+) -> f32 {
+    let (a, inside) = lookup(
+        sh.near,
+        near,
+        sh.texel_uv.x,
+        s,
+        world + n * (sh.near_texel * 1.2),
+        soft,
+        bias: 0.0004,
+    )
+    let share = if inside { near_share((sh.near * vec4(world, 1.0)).xyz) } else { 0.0 }
+    if share >= 1.0 {
+        return a
+    }
+    let (b, _) = lookup(
+        sh.far,
+        far,
+        sh.texel_uv.y,
+        s,
+        world + n * (sh.far_texel * 1.2),
+        1.5,
+        bias: 0.0006,
+    )
+    mix(b, a, share)
+}
+
+@test
+fn static_shadow_replacement_keeps_its_texel_grid() {
+    let sun = normalize(vec3(0.9, 0.407, -0.159))
+    let fwd = -sun
+    let right = normalize(cross(fwd, vec3(0.0, 1.0, 0.0)))
+    let up = cross(right, fwd)
+    let reference = vec3(12.3, 7.1, -22.6)
+    let texel = 144.0 / 2048.0
+    let at = reference + vec3(41.37, -2.1, 13.6)
+    let snapped = snapped_centre(sun, at, reference, texel)
+    let delta = snapped - reference
+    assert(
+        abs(dot(delta, right) / texel - round(dot(delta, right) / texel)) < 0.001,
+        "replacement moved the shadow's horizontal texel grid",
+    )
+    assert(
+        abs(dot(delta, up) / texel - round(dot(delta, up) / texel)) < 0.001,
+        "replacement moved the shadow's vertical texel grid",
+    )
+    let shift = vec3(256.0, 0.0, -512.0)
+    let moved = snapped_centre(sun, at + shift, reference + shift, texel)
+    assert(length(moved - shift - snapped) < 0.0002, "render origin shift moved the static grid")
+}
+
+@test
+fn static_shadow_cascades_meet_over_a_continuous_band() {
+    assert(near_share(vec3(0.0, 0.0, 0.5)) == 1.0, "near centre lost its detail")
+    assert(near_share(vec3(0.98, 0.0, 0.5)) < 0.0001, "near edge switches before fading out")
+    var previous = 1.0
+    for i in 0..101 {
+        let share = near_share(vec3(0.75 + f32(i) * 0.0025, 0.0, 0.5))
+        assert(share <= previous && previous - share < 0.02, "cascade boundary pops")
+        previous = share
+    }
+    assert(previous == 0.0, "near map extends beyond its valid border")
+}

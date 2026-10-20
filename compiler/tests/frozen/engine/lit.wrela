@@ -1,0 +1,107 @@
+// The lighting that every shading pass reads, as one parameter (`Lighting`, a group:
+// language.md §18): the frame's camera and light, the sun's shadows, the probes' sky light, the
+// clouds' shadows and the air.
+//
+// A shading pass binds a `Lighting`, then asks how much sun reaches a point (`sun_at`, or
+// `sun_and_sky` and `sun_and_gloss` for more), and `shown` for a lit surface's colour as the
+// eye sees it through the air.
+
+use light::{Light, Lit}
+use probes::{ProbeGrid, sky_light, sky_lights}
+use shadow::{Shadows, sunlit}
+use sky::{Clouds, cloud_shadow}
+use std::gpu::{ComparisonSampler, DepthTexture, GpuSpan, Rgba16Float, Sampler, Texture, Texture3d}
+use terrain::Levels
+use view::Camera
+
+/// The frame's lighting: the camera, the light, the sun's shadows and their maps (`near`,
+/// `far`, `moving`, read through `cmp`), the probes' grid, maps (`probes`) and their columns'
+/// `grounds`, the clouds (where their field has drifted) and their shadow map (`cloud`), the
+/// clipmap's levels, and the air's aerial perspective (`air`); textures read through `s`, a
+/// linear sampler.
+pub borrow struct Lighting {
+    pub cam: Camera,
+    pub light: Light,
+    pub shadows: Shadows,
+    pub grid: ProbeGrid,
+    pub clouds: Clouds,
+    pub levels: Levels,
+    pub near: borrow DepthTexture,
+    pub far: borrow DepthTexture,
+    pub moving: borrow DepthTexture,
+    pub cmp: borrow ComparisonSampler,
+    pub probes: borrow Texture<Rgba16Float>,
+    pub grounds: GpuSpan<f32>,
+    pub cloud: borrow Texture<Rgba16Float>,
+    pub air: borrow Texture3d<Rgba16Float>,
+    pub s: borrow Sampler,
+}
+
+/// How much sun reaches `world` (0 to 1), its normal `n`: the shadow maps', `soft` texels of
+/// penumbra, times the clouds' shadow.
+pub fn sun_at(l: Lighting, world: vec3, n: vec3, soft: f32) -> f32 {
+    sun_through(l, world, n, soft, cloud_shadow(l.clouds, l.cloud, l.s, world))
+}
+
+/// `sun_at` through the clouds' shadow `shade`.
+fn sun_through(l: Lighting, world: vec3, n: vec3, soft: f32, shade: f32) -> f32 {
+    sunlit(l.shadows, world, n, l.near, l.far, l.moving, l.cmp, soft) * shade
+}
+
+/// How much sun reaches `world` (as `sun_at`), and the sky light (and bounce) there for a
+/// surface facing `sky_n`, from the probes: the bounce of the sun dimmed by the clouds' shadow
+/// there, which is read once for both.
+pub fn sun_and_sky(l: Lighting, world: vec3, n: vec3, sky_n: vec3, soft: f32) -> (f32, vec3) {
+    let shade = cloud_shadow(l.clouds, l.cloud, l.s, world)
+    (
+        sun_through(l, world, n, soft, shade),
+        sky_light(l.grid, l.probes, l.s, l.grounds, l.light, world, sky_n, shade),
+    )
+}
+
+/// How much sun reaches `world` (as `sun_at`), the sky light there for a surface facing `n` (as
+/// `sun_and_sky`), and the light its gloss reflects: toward its reflection of the ray from the
+/// eye (`light::Lit::reflected`).
+pub fn sun_and_gloss(l: Lighting, world: vec3, n: vec3, soft: f32) -> (f32, vec3, vec3) {
+    sun_sky_and_gloss(l, world, n, sky_n: n, facing: n, soft: soft, shadow_at: world)
+}
+
+/// `sun_and_gloss` for a surface whose sky light is for another facing, `sky_n`, and whose gloss
+/// is about `facing`: a leaf's, whose sky light is its crown's, and whose gloss is its side's
+/// that faces the eye. Its shadow maps are read at `shadow_at`: a leaf's, past its own mass's
+/// leaves.
+pub fn sun_sky_and_gloss(
+    l: Lighting,
+    world: vec3,
+    n: vec3,
+    sky_n: vec3,
+    facing: vec3,
+    soft: f32,
+    shadow_at: vec3,
+) -> (f32, vec3, vec3) {
+    let shade = cloud_shadow(l.clouds, l.cloud, l.s, world)
+    let v = normalize(l.cam.eye - world)
+    let r = facing * (2.0 * dot(facing, v)) - v
+    let (sky, reflected) = sky_lights(
+        l.grid,
+        l.probes,
+        l.s,
+        l.grounds,
+        l.light,
+        world,
+        sky_n,
+        r,
+        shade,
+    )
+    (sun_through(l, shadow_at, n, soft, shade), sky, reflected)
+}
+
+/// `colour`, at `world`, as the eye sees it through the air between them (`light::hazed`).
+pub fn through_air(l: Lighting, colour: vec3, world: vec3) -> vec3 {
+    light::hazed(l.air, l.s, l.light, colour, world, l.cam.eye)
+}
+
+/// What a surface at `world` shows: lit as `lit` says (`light::world`), through the air.
+pub fn shown(l: Lighting, lit: Lit, world: vec3) -> vec3 {
+    through_air(l, light::world(l.light, lit, world, l.cam.eye), world)
+}

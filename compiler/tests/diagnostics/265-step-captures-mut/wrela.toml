@@ -2,4 +2,4 @@
 name = "misuse"
 
 [dependencies]
-engine = { path = "../../../../engine" }
+engine = { path = "../../frozen/engine" }

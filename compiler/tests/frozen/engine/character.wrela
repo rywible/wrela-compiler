@@ -1,0 +1,444 @@
+// Characters: creatures drawn as meshes with cel shading, skinned by their bones and cast into
+// the moving shadow map.
+//
+// Make a character with `cast` (a creature, its look and how to realize it). Each frame, call
+// `realize` until it is realized (a slice a frame), give it its bones with `pose`, and draw it:
+// `shadow` into the moving shadow map, `draw` into the scene and `motion` into the motion target.
+//
+// - The mesh has its normals and colours cooked in when it is realized, so no pixel evaluates
+//   the creature's field.
+// - It is shaded in two bands with a narrow terminator, a rim where the sun is behind, and a line
+//   where the form turns away from the eye (`cel`).
+// - It is drawn a second time into the motion target, from this frame's palette and the last,
+//   so temporal AA reprojects it by its own motion.
+
+use creature::Parts
+use light::{Light, Lit, clay_or, gloss}
+use lit::{Lighting, sun_and_gloss, through_air}
+use realize::{Mesh, SkinVertex, Tally}
+use render::{Look, skin_matrix}
+use std::gpu::{
+    ClipPosition, Cull, Flat, FragCoord, GlobalId, GpuBuffer, RenderPass, Slots, Unorm8x4,
+    VertexIndex, buffer, copy, discard, dispatch, draw, write,
+}
+use std::job::{Job, Step}
+use std::transform::{rotate_y, translate}
+use temporal::motion_of
+use view::{CREATURE, Camera}
+
+/// Each vertex's colour, from the field's channels at it (under its mask, seen a cell wide),
+/// as the creature's look turns them into an albedo: cooked once, after the mesh is realized.
+@compute(64)
+pub fn cook_colours<C, F: Parts<C>, L: Look<C>>(
+    field: F,
+    look: L,
+    fp: f32,
+    tally: [Tally],
+    verts: [SkinVertex],
+    colours: mut Slots<Unorm8x4>,
+    id: GlobalId,
+) {
+    if id.x >= tally[0].vertices {
+        return
+    }
+    let v = verts[id.x]
+    let (_, _, c) = field.sample_masked(v.pos, v.mask, fp)
+    let (albedo, rough) = look.surface(c, v.pos, fp)
+    colours[id] = Unorm8x4::encode(vec4(sqrt(saturate(albedo)), saturate(rough)))
+}
+
+/// A realized mesh's colours: a buffer of one per vertex the mesh has room for, cooked from
+/// `field` through `look` (cells `cell` wide).
+pub fn colours<C, F: Parts<C>, L: Look<C>>(
+    mesh: Mesh,
+    field: F,
+    look: L,
+    cell: f32,
+) -> GpuBuffer<Unorm8x4> {
+    let room = mesh.room().vertices
+    var out: GpuBuffer<Unorm8x4> = buffer(room)
+    dispatch(
+        cook_colours.bind(
+            field,
+            look,
+            fp: cell,
+            tally: mesh.tally.items(),
+            verts: mesh.verts.items(),
+            colours: mut out,
+        ),
+        groups: (room + 63) / 64,
+    )
+    out
+}
+
+/// A character's baked surface: the colour and roughness, plus independent metallic reflectance.
+pub struct Material: Copy + GpuData {
+    pub colour: Unorm8x4,
+    pub metallic: f32,
+}
+
+@compute(64)
+pub fn cook_materials<C, F: Parts<C>, L: Look<C>>(
+    field: F,
+    look: L,
+    fp: f32,
+    tally: [Tally],
+    verts: [SkinVertex],
+    materials: mut Slots<Material>,
+    id: GlobalId,
+) {
+    if id.x >= tally[0].vertices {
+        return
+    }
+    let v = verts[id.x]
+    let (_, _, c) = field.sample_masked(v.pos, v.mask, fp)
+    let (albedo, rough) = look.surface(c, v.pos, fp)
+    materials[id] = Material {
+        colour: Unorm8x4::encode(vec4(sqrt(saturate(albedo)), saturate(rough))),
+        metallic: saturate(look.metallic(c, v.pos, fp)),
+    }
+}
+
+/// Bake a character's complete surface once. Rigid scenery can keep the smaller `colours`
+/// buffer; characters retain their independent roughness and conducting share for lighting.
+pub fn materials<C, F: Parts<C>, L: Look<C>>(
+    mesh: Mesh,
+    field: F,
+    look: L,
+    cell: f32,
+) -> GpuBuffer<Material> {
+    let room = mesh.room().vertices
+    var out: GpuBuffer<Material> = buffer(room)
+    dispatch(
+        cook_materials.bind(
+            field,
+            look,
+            fp: cell,
+            tally: mesh.tally.items(),
+            verts: mesh.verts.items(),
+            materials: mut out,
+        ),
+        groups: (room + 63) / 64,
+    )
+    out
+}
+
+/// A character realized: its mesh and each vertex's colour.
+pub struct Realized {
+    pub mesh: Mesh,
+    pub materials: GpuBuffer<Material>,
+}
+
+/// A rigid character's one bone where it stands: its feet at `feet`, facing `heading` (radians
+/// from +z toward +x).
+pub fn placed(feet: vec3, heading: f32) -> mat4 {
+    translate(feet) * rotate_y(heading)
+}
+
+/// What a character's vertex passes on: its world point and normal, its colour, and the bone
+/// that moves it most (which part it is, for the lines where its parts meet).
+pub struct CharacterVertex: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub normal: vec3,
+    pub albedo: vec3,
+    pub rough: f32 = 1.0,
+    pub metallic: f32 = 0.0,
+    pub part: Flat<u32>,
+}
+
+/// Which part each bone is in, for the lines where parts meet: 0 the body (its trunk, its head
+/// and its tail), and each leg its own (1 to 4).
+pub struct PartOf: Copy + GpuData {
+    pub of: [u32; 64],
+}
+
+/// A skeleton's parts: each leg's bones its own part, every other bone the body's.
+pub fn parts_of(s: creature::Skeleton) -> PartOf {
+    var p = PartOf { of: [0; 64] }
+    let legs = s.legs()
+    for i in 0..s.leg_count() {
+        for b in legs[i].joints {
+            p.of[b.index] = i + 1
+        }
+    }
+    p
+}
+
+@vertex
+pub fn character(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    materials: [Material],
+    palettes: [mat4],
+    parts: PartOf,
+    cam: Camera,
+) -> CharacterVertex {
+    let sv = verts[v.index]
+    let m = skin_matrix(sv, palettes, 0)
+    let world = (m * vec4(sv.pos, 1.0)).xyz
+    let n = mat3(m[0].xyz, m[1].xyz, m[2].xyz) * sv.normal
+    let surface = materials[v.index]
+    let c = surface.colour.decode()
+    CharacterVertex {
+        clip: ClipPosition { position: cam.clip(world) },
+        world,
+        normal: n,
+        albedo: c.rgb * c.rgb,
+        rough: c.a,
+        metallic: surface.metallic,
+        part: Flat { value: parts.of[min(sv.bones & 255, 63)] },
+    }
+}
+
+/// A character's pixel: the cel treatment's bands lit by the sun through the shadows and by the
+/// sky light, through the haze; its tag the character's class and its part.
+@fragment
+pub fn character_shade(c: CharacterVertex, pixel: FragCoord, lt: Lighting) -> vec4 {
+    // Where the camera has pulled in close (a trunk behind it), the character fades: a dither,
+    // turned each frame, that temporal AA settles (it filled the screen).
+    let near = smoothstep(0.55, 1.25, length(c.world - lt.cam.eye))
+    if near < 1.0 {
+        let q = vec2u(pixel.position.xy) % vec2u(4)
+        let bayer = [
+            0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0, 3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0,
+        ]
+        let t = fract((bayer[q.y * 4 + q.x] + 0.5) / 16.0 + 0.618034 * f32(lt.cam.frame % 64))
+        if t > near {
+            discard()
+        }
+    }
+    let n = normalize(c.normal)
+    let (sun, sky, reflected) = sun_and_gloss(lt, c.world, n, soft: 1.0)
+    let open = probes::open_light(lt.probes, vec3(0.0, 1.0, 0.0))
+    let albedo = clay_or(lt.light, c.albedo)
+    let metallic = if lt.light.clay != 0 { 0.0 } else { saturate(c.metallic) }
+    let diffuse = cel(lt.light, albedo, n, sun, sky, open, c.world, lt.cam.eye) * (1.0 - metallic)
+    // A bevel narrower than a pixel contains several normals. Broaden only its specular
+    // lobe by that variance, so a polished edge does not flash as individual samples move.
+    let dx = dpdx(n)
+    let dy = dpdy(n)
+    let r2 = max(c.rough * c.rough, 0.01)
+    let rough = min(1.0, sqrt(sqrt(r2 * r2 + 0.25 * (dot(dx, dx) + dot(dy, dy)))))
+    let specular = gloss(
+        lt.light,
+        Lit { albedo, n, sun, sky, through: vec3(0.0), rough, metallic, reflected, glint: 1.0 },
+        normalize(lt.cam.eye - c.world),
+    )
+    let colour = diffuse + specular
+    vec4(through_air(lt, colour, c.world), CREATURE + f32(c.part.value % 63))
+}
+
+/// The cel treatment of a character's point (`albedo` its colour, `n` its normal, `sun` how much
+/// sun reaches it, `sky` the sky light there, `open` the open sky's): two bands with a narrow
+/// terminator, the light one where the sun reaches it, the shade a cool blue-grey of its colour;
+/// a thin rim of its own lit colour only where the sun is behind it (never the sky's white, which
+/// read as a halo against the dark wood); and a thin line, a darker shade of its colour, where
+/// its form turns away from the eye, about a pixel and a half wide however far it is.
+fn cel(
+    light: Light,
+    albedo: vec3,
+    n: vec3,
+    sun: f32,
+    sky: vec3,
+    open: vec3,
+    world: vec3,
+    eye: vec3,
+) -> vec3 {
+    let l = light.sun
+    let v = normalize(eye - world)
+    let t = smoothstep(0.0, 0.03, dot(n, l)) * sun
+    let lit = light.sun_colour * 0.75 + open * 0.5
+    let dark = vec3(0.36, 0.40, 0.54) * (0.45 + 0.55 * saturate(dot(sky, vec3(0.6))))
+    let facing = dot(n, v)
+    let behind = saturate(-dot(v, l))
+    let rim = smoothstep(0.72, 0.9, 1.0 - max(facing, 0.0)) * behind * sun
+    let banded = albedo * (mix(dark, lit, vec3(t)) + light.sun_colour * (rim * 0.6))
+    let edge = 1.0 - smoothstep(1.0, 2.0, facing / max(fwidth(facing), 1.0e-4))
+    banded * (1.0 - 0.3 * edge)
+}
+
+/// What a character's motion vertex passes on: where its point is now and was last frame.
+pub struct MotionVertex: Copy {
+    pub clip: ClipPosition,
+    pub now: vec3,
+    pub then: vec3,
+}
+
+@vertex
+pub fn character_motion(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    palettes: [mat4],
+    last: [mat4],
+    cam: Camera,
+) -> MotionVertex {
+    let sv = verts[v.index]
+    let now = (skin_matrix(sv, palettes, 0) * vec4(sv.pos, 1.0)).xyz
+    let then = (skin_matrix(sv, last, 0) * vec4(sv.pos, 1.0)).xyz
+    MotionVertex { clip: ClipPosition { position: cam.clip(now) }, now, then }
+}
+
+/// A character's motion: where its point is on the target now against where it was.
+@fragment
+pub fn motion(m: MotionVertex, cam: Camera) -> vec4 {
+    motion_of(cam, m.now, m.then)
+}
+
+@vertex
+pub fn character_shadow(
+    v: VertexIndex,
+    verts: [SkinVertex],
+    palettes: [mat4],
+    view: mat4,
+) -> ClipPosition {
+    let sv = verts[v.index]
+    ClipPosition { position: view * (skin_matrix(sv, palettes, 0) * vec4(sv.pos, 1.0)) }
+}
+
+/// A creature cast as a character (a floor's fawn, a fight's wolf): realized a slice a frame from
+/// the first frame it's wanted (`realize`), its colours through `look`; then drawn from its
+/// palette (`pose`) into the scene, the motion target (this frame's palette against the last)
+/// and, where it's `shadowed`, the moving shadow map.
+pub struct Cast<C, K: creature::Creature<C>, L: Look<C>> {
+    creature: K,
+    look: L,
+    how: look::CreatureLook,
+    slices: u32,
+    job: Option<Job<realize::realizing<C, K>>>,
+    pub realized: Option<Realized>,
+    palette: GpuBuffer<mat4>,
+    last: GpuBuffer<mat4>,
+    /// Whether it's drawn this frame, and whether it falls in the moving shadow map.
+    pub on: bool,
+    pub shadowed: bool,
+}
+
+/// `creature`, to be realized as `how` says, `slices` frames a slice, coloured by `look`.
+pub fn cast<C, K: creature::Creature<C>, L: Look<C>>(
+    creature: take K,
+    look: L,
+    how: look::CreatureLook,
+    slices: u32,
+) -> Cast<C, K, L> {
+    Cast {
+        creature,
+        look,
+        how,
+        slices,
+        job: None,
+        realized: None,
+        palette: buffer(creature::MAX_BONES),
+        last: buffer(creature::MAX_BONES),
+        on: false,
+        shadowed: false,
+    }
+}
+
+impl<C, K: creature::Creature<C>, L: Look<C>> Cast<C, K, L> {
+    /// A frame's slice of its realization (started the first time); nothing once it's realized.
+    pub fn realize(mut self) {
+        if self.realized.is_some() {
+            return
+        }
+        if self.job.is_none() {
+            let job: Job<realize::realizing<C, K>> = realize::realizing.start(self.how)
+            self.job = Some(take job)
+        }
+        match mut self.job {
+            Some(job) => match job.resume(self.creature, self.slices) {
+                Step::Yielded => {},
+                Step::Done(whole) => {
+                    let c = materials(whole.mesh, self.creature.field(), self.look, cell: 1cm)
+                    self.realized = Some(Realized { mesh: take whole.mesh, materials: c })
+                    self.job = None
+                },
+            },
+            None => {},
+        }
+    }
+
+    /// This frame's palette, `bones`; and whether it's in the moving shadow map. Where it wasn't
+    /// drawn last frame, or the render space moved (`moved`), the last palette is this one: no
+    /// place to move from.
+    pub fn pose(mut self, bones: [mat4; creature::MAX_BONES], shadowed: bool, moved: bool) {
+        copy(from: self.palette.items(), to: self.last.items_mut())
+        write(mut self.palette, 0, bones)
+        if !self.on || moved {
+            copy(from: self.palette.items(), to: self.last.items_mut())
+        }
+        self.on = true
+        self.shadowed = shadowed
+        self.realize()
+    }
+
+    /// Not drawn this frame.
+    pub fn hide(mut self) {
+        self.on = false
+    }
+
+    /// Its depth into the moving shadow map (`view`), where it's on and shadowed.
+    pub fn shadow<P: RenderPass>(self, pass: P, view: mat4) {
+        if let Some(c) = self.realized {
+            if self.on && self.shadowed {
+                draw(
+                    pass,
+                    character_shadow.bind(
+                        verts: c.mesh.verts.items(),
+                        palettes: self.palette.items(),
+                        view: view,
+                    ),
+                    vegetation::nothing,
+                    indices: c.mesh.quads.items(),
+                    indirect: c.mesh.draw.items(),
+                    depth_bias: shadow::CASTER,
+                )
+            }
+        }
+    }
+
+    /// It in the scene, lit by `lt`, its parts `parts`.
+    pub fn draw<P: RenderPass>(self, pass: P, lt: Lighting, cam: Camera, parts: PartOf) {
+        if let Some(c) = self.realized {
+            if self.on {
+                draw(
+                    pass,
+                    character.bind(
+                        verts: c.mesh.verts.items(),
+                        materials: c.materials.items(),
+                        palettes: self.palette.items(),
+                        parts: parts,
+                        cam: cam,
+                    ),
+                    character_shade.bind(lt),
+                    indices: c.mesh.quads.items(),
+                    indirect: c.mesh.draw.items(),
+                    cull: Cull::Back,
+                    depth: view::NEAREST,
+                )
+            }
+        }
+    }
+
+    /// Its motion: its palette against its last.
+    pub fn motion<P: RenderPass>(self, pass: P, cam: Camera) {
+        if let Some(c) = self.realized {
+            if self.on {
+                draw(
+                    pass,
+                    character_motion.bind(
+                        verts: c.mesh.verts.items(),
+                        palettes: self.palette.items(),
+                        last: self.last.items(),
+                        cam: cam,
+                    ),
+                    motion.bind(cam),
+                    indices: c.mesh.quads.items(),
+                    indirect: c.mesh.draw.items(),
+                    cull: Cull::Back,
+                    depth: view::SEEN,
+                )
+            }
+        }
+    }
+}

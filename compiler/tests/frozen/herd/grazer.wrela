@@ -1,0 +1,397 @@
+// Spike 01's grazer (design-archive-2026-10: spikes/01-grazer, grazer.js and field.wgsl),
+// written through the engine's creature API (#43 §12): its 29 bones, its 20 parts on them in its
+// fold order (torso, neck, head, tail, the legs' twelve segments, the four hooves),
+// smooth-unioned over 6 cm times its scale; the torso's fbm, filtered by the footprint as the
+// spike's octaves fade; its two channels, torso-ness and hoof-ness; and skin bindings that give
+// the spike's weights. Its numbers come from its seed as grazer.js draws them: mulberry32 seeded
+// with seed × 7919 + 17, five draws, computed in f64 and rounded once.
+
+use engine::creature::{Creature, Parts, Segment, Skeleton, along, creature, split}
+use engine::rng::{Rng, seed}
+use std::derive::{Box3, Interval}
+use std::field::{Blend, Fbm, Noise, ellipsoid, fbm, half_space, round_cone, value_noise}
+use std::units::{kg, m}
+
+/// What a point of the grazer carries: how much it's torso (dappled hide) and how much hoof.
+/// Everything else is plain hide.
+pub struct Tissue: Copy + GpuData + Blend {
+    pub torso: f32,
+    pub hoof: f32,
+}
+
+const HIDE = Tissue { torso: 0.0, hoof: 0.0 }
+const TORSO_HIDE = Tissue { torso: 1.0, hoof: 0.0 }
+const HOOF = Tissue { torso: 0.0, hoof: 1.0 }
+
+/// Its density, kg/m³ (sketch 01 §1): hide and hoof.
+pub const HIDE_DENSITY: f32 = 1050 * kg / m ** 3
+pub const HOOF_DENSITY: f32 = 1300 * kg / m ** 3
+
+/// How far the skin weights fall off: the spike's 6 cm.
+pub const FALLOFF: f32 = 6cm
+
+/// The torso's bark: `std::field`'s fbm, filtered as the spike's `fbm_d` filters it (D-077).
+/// Seen a footprint wide, an octave whose period is under two to four footprints fades out,
+/// and finer ones are skipped.
+pub struct Bark: Copy + GpuData {
+    pub fbm: Fbm,
+}
+
+/// How much of an octave of frequency `freq` a footprint `fp` wide sees.
+fn octave_weight(fp: f32, freq: f32) -> f32 {
+    1.0 - smoothstep(0.25, 0.5, fp * freq)
+}
+
+impl Noise for Bark {
+    fn value(self, p: vec3) -> f32 {
+        self.fbm.value(p)
+    }
+
+    fn range(self) -> Interval {
+        self.fbm.range()
+    }
+
+    fn lipschitz(self) -> f32 {
+        self.fbm.lipschitz()
+    }
+
+    fn bandlimit(self) -> f32 {
+        self.fbm.bandlimit()
+    }
+
+    fn filtered(self, p: vec3, footprint: vec3) -> f32 {
+        let fp = footprint.x
+        let q = p + self.fbm.offset
+        var s = 0.0
+        var a = 1.0
+        var fr = self.fbm.freq
+        for o in 0..self.fbm.octaves {
+            let w = a * octave_weight(fp, fr)
+            if w <= 0.0 {
+                break
+            }
+            s += w * value_noise(q * fr + f32(o) * 17.0)
+            a *= 0.5
+            fr *= 2.0
+        }
+        s
+    }
+}
+
+// ---- the spike's makeGrazer, in f64 -------------------------------------------------------------
+
+// In `vec3d`s, for the same numbers as JavaScript's; each point is rounded to f32 once.
+
+/// The bones, in the spike's order.
+pub const PELVIS: u32 = 0
+pub const CHEST: u32 = 1
+pub const NECK0: u32 = 2
+pub const HEAD: u32 = 6
+pub const TAIL0: u32 = 7
+pub const LEG0: u32 = 13
+pub const BONES: u32 = 29
+
+/// The neck's and the tail's spans at scale 1, from each chain's first joint to its end.
+const NECK_SPAN = vec3d(x: 0.0, y: 55cm, z: 45cm)
+const TAIL_SPAN = vec3d(x: 0.0, y: -55cm, z: -45cm)
+
+/// Each leg segment's radii at scale 1, at its top and its bottom. The first segment's top
+/// radius is also multiplied by the bulk (`leg_radii`).
+const LEG_RADII: [(f64, f64); 3] = [(10cm, 6.5cm), (6.5cm, 4.8cm), (4.8cm, 4.2cm)]
+
+/// The rest skeleton at scale 1, in metres: +y up, +z forward (grazer.js's `restSkeleton`).
+fn rest_joints() -> [vec3d; BONES] {
+    var j = [vec3d(0.0); BONES]
+    j[0] = vec3d(x: 0.0, y: 1.3m, z: 0.0)
+    j[1] = vec3d(x: 0.0, y: 1.3m, z: 1m)
+    let neck_base = vec3d(x: 0.0, y: 1.5m, z: 1.55m)
+    for i in 0..4 {
+        j[2 + i] = neck_base + NECK_SPAN * (f64(i) / 4.0)
+    }
+    j[6] = neck_base + NECK_SPAN + vec3d(x: 0.0, y: 0.0, z: 12cm)
+    let tail_base = vec3d(x: 0.0, y: 1.45m, z: -40cm)
+    for i in 0..6 {
+        j[7 + i] = tail_base + TAIL_SPAN * (f64(i) / 6.0)
+    }
+    let fore = [
+        vec3d(x: 0.0, y: -45cm, z: -4cm),
+        vec3d(x: 0.0, y: -42cm, z: 3cm),
+        vec3d(x: 0.0, y: -20cm, z: 2cm),
+    ]
+    let hind = [
+        vec3d(x: 0.0, y: -50cm, z: 10cm),
+        vec3d(x: 0.0, y: -45cm, z: -12cm),
+        vec3d(x: 0.0, y: -22cm, z: 0.0),
+    ]
+    let hips = [
+        vec3d(x: 25cm, y: 1.15m, z: 1.25m),
+        vec3d(x: -25cm, y: 1.15m, z: 1.25m),
+        vec3d(x: 25cm, y: 1.25m, z: 5cm),
+        vec3d(x: -25cm, y: 1.25m, z: 5cm),
+    ]
+    for l in 0..4 {
+        var p = hips[l]
+        j[13 + l * 4] = p
+        for k in 0..3 {
+            p += if l < 2 { fore[k] } else { hind[k] }
+            j[14 + l * 4 + k] = p
+        }
+    }
+    j
+}
+
+/// One individual's numbers (grazer.js's `makeGrazer`): its build and scale, its joints, and
+/// what its parts are made of.
+pub struct Params: Copy {
+    pub bulk: f64,
+    pub scale: f64,
+    pub joints: [vec3d; BONES],
+    /// The fbm's offset.
+    pub offset: vec3d,
+}
+
+pub fn params(seed_value: u32) -> Params {
+    var r = Rng::new(seed(seed_value))
+    let bulk = 0.9 + 0.25 * r.next()
+    let s = 0.92 + 0.16 * r.next()
+    let rest = rest_joints()
+    var joints = [vec3d(0.0); BONES]
+    for i in 0..BONES {
+        joints[i] = rest[i] * s
+    }
+    let ox = 100.0 * r.next()
+    let oy = 100.0 * r.next()
+    let oz = 100.0 * r.next()
+    Params { bulk, scale: s, joints, offset: vec3d(ox, oy, oz) }
+}
+
+/// A box in f64.
+struct Bounds: Copy {
+    lo: vec3d,
+    hi: vec3d,
+}
+
+fn grow(b: Bounds, c: vec3d, r: vec3d) -> Bounds {
+    Bounds { lo: min(b.lo, c - r), hi: max(b.hi, c + r) }
+}
+
+/// A point and a radius rounded to f32 and back, as the spike's bounds read them from its
+/// `Float32Array`.
+fn f(x: f64) -> f64 {
+    f64(f32(x))
+}
+
+fn fv(a: vec3d) -> vec3d {
+    vec3d(vec3(a))
+}
+
+/// A round cone in f64: its two ends and their radii.
+struct Cone: Copy {
+    a: vec3d,
+    ra: f64,
+    b: vec3d,
+    rb: f64,
+}
+
+/// A round cone's bounds: each end grown by the larger radius.
+fn grow_cone(b: Bounds, c: Cone) -> Bounds {
+    let r = max(f(c.ra), f(c.rb))
+    grow(grow(b, fv(c.a), vec3d(r)), fv(c.b), vec3d(r))
+}
+
+/// The grazer's rest-space bounds, as grazer.js's `bounds` makes them: each part's own bounds,
+/// padded for the blend.
+pub fn bounds(g: Params) -> Box3 {
+    let j = g.joints
+    var b = Bounds { lo: vec3d(1e300), hi: vec3d(-1e300) }
+    let amp = f(3mm) * 1.875
+    let (c1, r1, c2, r2) = torso_parts(g)
+    b = grow(b, fv(c1), fv(r1) + amp)
+    b = grow(b, fv(c2), fv(r2) + amp)
+    let (centre, radii, muzzle) = head_parts(g)
+    b = grow(b, fv(centre), fv(radii))
+    b = grow_cone(b, muzzle)
+    b = grow_cone(b, neck_cone(g))
+    b = grow_cone(b, tail_cone(g))
+    for l in 0..4 {
+        let bone = LEG0 + l * 4
+        for k in 0..3 {
+            let (top, bottom) = leg_radii(g, k)
+            b = grow_cone(b, Cone { a: j[bone + k], ra: top, b: j[bone + k + 1], rb: bottom })
+        }
+    }
+    let hoof = hoof_cone(g)
+    for l in 0..4 {
+        let foot = j[LEG0 + l * 4 + 3]
+        b = grow_cone(b, Cone { a: foot, ra: hoof.ra, b: foot + hoof.b, rb: hoof.rb })
+    }
+    let pad = f(6cm * g.scale) * 0.25
+    Box3 { lo: vec3(b.lo - pad), hi: vec3(b.hi + pad) }
+}
+
+/// The torso's two ellipsoids: their centres and radii.
+fn torso_parts(g: Params) -> (vec3d, vec3d, vec3d, vec3d) {
+    let s = g.scale
+    let c = g.joints[CHEST]
+    let sb = s * g.bulk
+    (
+        c + vec3d(x: 0.0, y: 5cm, z: -15cm) * s,
+        vec3d(x: 42cm, y: 48cm, z: 80cm) * sb,
+        c + vec3d(x: 0.0, y: 5cm, z: -85cm) * s,
+        vec3d(x: 38cm, y: 44cm, z: 50cm) * sb,
+    )
+}
+
+/// The head's ellipsoid, its centre and radii; and its muzzle.
+fn head_parts(g: Params) -> (vec3d, vec3d, Cone) {
+    let s = g.scale
+    let h = g.joints[HEAD]
+    (
+        h + vec3d(x: 0.0, y: -4cm, z: 10cm) * s,
+        vec3d(x: 12cm, y: 15cm, z: 24cm) * s,
+        Cone {
+            a: h + vec3d(x: 0.0, y: -5cm, z: 15cm) * s,
+            ra: 10cm * s,
+            b: h + vec3d(x: 0.0, y: -16cm, z: 42cm) * s,
+            rb: 6.5cm * s,
+        },
+    )
+}
+
+/// The neck: a round cone along the neck chain's span.
+fn neck_cone(g: Params) -> Cone {
+    let (s, n0) = (g.scale, g.joints[NECK0])
+    Cone { a: n0, ra: 22cm * s * g.bulk, b: n0 + NECK_SPAN * s, rb: 12cm * s }
+}
+
+/// The tail: a round cone along the tail chain's span.
+fn tail_cone(g: Params) -> Cone {
+    let (s, t0) = (g.scale, g.joints[TAIL0])
+    Cone { a: t0, ra: 7cm * s, b: t0 + TAIL_SPAN * s, rb: 2.5cm * s }
+}
+
+/// Leg segment `k`'s radii, at its top and its bottom.
+fn leg_radii(g: Params, k: u32) -> (f64, f64) {
+    let (top, bottom) = LEG_RADII[k]
+    let top = if k == 0 { top * g.bulk } else { top }
+    (top * g.scale, bottom * g.scale)
+}
+
+/// A hoof, in its foot's space: a round cone from the foot down.
+fn hoof_cone(g: Params) -> Cone {
+    let s = g.scale
+    Cone { a: vec3d(0.0), ra: 6cm * s, b: vec3d(0.0, -8cm * s, 0.0), rb: 7cm * s }
+}
+
+// ---- the creature ---------------------------------------------------------------------------------
+
+/// A grazer: whatever `grazer` builds, seen as a creature of `Tissue`.
+pub type Grazer = Creature<Tissue>
+
+/// A grazer's field: what the renderer and the physique read.
+pub type GrazerField = Parts<Tissue>
+
+/// A grazer's field, as the type `GrazerField` names it.
+pub fn field_of(g: Grazer) -> GrazerField {
+    g.field()
+}
+
+/// The grazer of seed `seed_value`.
+pub fn grazer(seed_value: u32) -> Grazer {
+    let g = params(seed_value)
+    let s = g.scale
+    let j = g.joints
+    // The skeleton: pelvis, chest, four neck joints, the head, six tail joints, four legs.
+    var sk = Skeleton::new()
+    let pelvis = sk.root("pelvis", vec3(j[PELVIS]))
+    let chest = sk.joint("chest", pelvis, vec3(j[CHEST]))
+    let neck = sk.chain("neck", chest, vec3(j[NECK0]) - vec3(j[CHEST]), 4, vec3(NECK_SPAN * s))
+    let head = sk.joint("head", neck.last(), vec3(j[HEAD]))
+    let tail = sk.chain("tail", pelvis, vec3(j[TAIL0]) - vec3(j[PELVIS]), 6, vec3(TAIL_SPAN * s))
+    let names = [
+        ["fore left hip", "fore left knee", "fore left ankle", "fore left foot"],
+        ["fore right hip", "fore right knee", "fore right ankle", "fore right foot"],
+        ["hind left hip", "hind left knee", "hind left ankle", "hind left foot"],
+        ["hind right hip", "hind right knee", "hind right ankle", "hind right foot"],
+    ]
+    for l in 0..4 {
+        let b = LEG0 + l * 4
+        let parent = if l < 2 { chest } else { pelvis }
+        let _ = sk.leg_at(
+            names[l],
+            parent,
+            [vec3(j[b]), vec3(j[b + 1]), vec3(j[b + 2]), vec3(j[b + 3])],
+        )
+    }
+
+    // Torso: two ellipsoids, smooth-unioned (k 15 cm), displaced by fbm; on the pelvis, its
+    // weight split from pelvis to chest along z.
+    let at = vec3(j[PELVIS])
+    let (c1, r1, c2, r2) = torso_parts(g)
+    let torso = ellipsoid(vec3(r1))
+        .translate(vec3(c1) - at)
+        .smooth_union(ellipsoid(vec3(r2)).translate(vec3(c2) - at), k: f32(15cm * s))
+        .displace(Bark { fbm: fbm(25.0, 4, offset: vec3(g.offset) + at) }, amp: 3mm)
+        .with(TORSO_HIDE)
+    let z_pelvis = vec3(0.0, 0.0, f32(j[PELVIS].z))
+    let z_chest = vec3(0.0, 0.0, f32(j[CHEST].z))
+
+    // Neck: a round cone along the neck chain's span.
+    let nc = neck_cone(g)
+    let (n0, neck_end) = (vec3(nc.a), vec3(nc.b))
+    let neck_part = round_cone(vec3(), neck_end - n0, r_top: f32(nc.ra), r_bottom: f32(nc.rb))
+        .with(HIDE)
+
+    // Head: an ellipsoid smooth-unioned with a muzzle cone (k 5 cm).
+    let hv = vec3(j[HEAD])
+    let (centre, radii, muzzle) = head_parts(g)
+    let head_part = ellipsoid(vec3(radii))
+        .translate(vec3(centre) - hv)
+        .smooth_union(
+            round_cone(
+                vec3(muzzle.a) - hv,
+                vec3(muzzle.b) - hv,
+                r_top: f32(muzzle.ra),
+                r_bottom: f32(muzzle.rb),
+            ),
+            k: f32(5cm * s),
+        )
+        .with(HIDE)
+
+    // Tail: a round cone along the tail chain's span.
+    let tc = tail_cone(g)
+    let (t0, tail_end) = (vec3(tc.a), vec3(tc.b))
+    let tail_part = round_cone(vec3(), tail_end - t0, r_top: f32(tc.ra), r_bottom: f32(tc.rb))
+        .with(HIDE)
+
+    let hoof = hoof_cone(g)
+    creature(sk)
+        .join("torso", pelvis, torso, skin: split(pelvis, chest, a: z_pelvis, b: z_chest))
+        .join("neck", neck.first(), neck_part, skin: along(neck, a: n0, b: neck_end))
+        .join("head", head, head_part)
+        .join("tail", tail.first(), tail_part, skin: along(tail, a: t0, b: tail_end))
+        // Legs: three round cones each, then a hoof (a round cone below the sole's plane).
+        .each_leg(|leg| {
+            leg.fill(|seg: Segment| {
+                let (top, bottom) = leg_radii(g, seg.index)
+                round_cone(vec3(), seg.end, r_top: f32(top), r_bottom: f32(bottom)).with(HIDE)
+            })
+                .foot(
+                    round_cone(
+                        vec3(hoof.a),
+                        vec3(hoof.b),
+                        r_top: f32(hoof.ra),
+                        r_bottom: f32(hoof.rb),
+                    )
+                        .intersect(half_space(vec3(0.0, -1.0, 0.0), f32(7cm * s)))
+                        .with(HOOF),
+                )
+        })
+        .blend(f32(6cm * s))
+        .bounded(bounds(g))
+}
+
+/// Its density where its channels are `c`: hide, and hoof where it's hoof.
+pub fn density(c: Tissue) -> f32 {
+    mix(HIDE_DENSITY, HOOF_DENSITY, c.hoof)
+}

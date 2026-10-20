@@ -1,0 +1,532 @@
+// Physical properties from a creature's field: its mass, centre of mass, moments of inertia and
+// collision capsules, per bone or whole, for the simulation to read.
+//
+// The simulation reads these, so they are computed by `@deterministic` code and come out the
+// same on every client. Use `integrate` or `adaptive_physique` for mass, and `fit_capsules` for
+// capsules; a `Creature` offers the same as methods. The derived interval classifies cells as
+// inside, outside or straddling the surface; only straddling cells are refined, so the cost
+// follows the surface's area, not the volume.
+
+use creature::{Bone, Creature, Parts}
+use std::derive::{Box3, interval}
+use std::field::Bound
+use std::hash::StateHash
+
+/// What a quantity is gathered per.
+pub enum Per: Copy + Eq {
+    /// Each bone: a cell counts for the bone whose part is nearest it.
+    Bone,
+    /// The whole creature.
+    Whole,
+}
+
+/// A body's mass (kg), its centre of mass, and its moments of inertia about axes through the
+/// centre (kg m², about x, y and z).
+pub struct MassProps: Copy + StateHash {
+    pub mass: f32,
+    pub centre: vec3,
+    pub inertia: vec3,
+}
+
+/// Mass, per bone (indexed by bone) or whole.
+pub struct Mass: Clone + StateHash {
+    pub per: Vec<MassProps>,
+    pub total: MassProps,
+}
+
+/// A capsule: the points within `radius` of the segment from `a` to `b`.
+pub struct Capsule: Copy + StateHash {
+    pub bone: Bone,
+    pub a: vec3,
+    pub b: vec3,
+    pub radius: f32,
+}
+
+/// What the simulation sees of a creature.
+pub struct Physique: Clone + StateHash {
+    pub mass: Mass,
+    pub collision: Vec<Capsule>,
+}
+
+/// The octrees' cube: the skeleton's rest positions grown by a metre, enlarged to include
+/// each known finite item bound. An item with no known bound keeps the skeleton-based search
+/// region; this does not establish coverage for arbitrary unbounded fields.
+fn cover<C, K: Creature<C>>(c: K) -> Box3 {
+    let s = c.skeleton()
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    for i in 0..s.len() {
+        let p = s.rest(Bone { index: i })
+        lo = min(lo, p)
+        hi = max(hi, p)
+    }
+    lo -= vec3(1.0)
+    hi += vec3(1.0)
+    for b in c.field().item_bounds() {
+        if b.radius < 1.0e29 {
+            lo = min(lo, b.centre - vec3(b.radius))
+            hi = max(hi, b.centre + vec3(b.radius))
+        }
+    }
+    let centre = 0.5 * (lo + hi)
+    let half = max(max(hi.x - lo.x, hi.y - lo.y), hi.z - lo.z) * 0.5
+    Box3 { lo: centre - half, hi: centre + half }
+}
+
+/// A box holding the creature's surface: the cells of an octree, five levels deep, that the
+/// derived interval can't show are outside.
+pub fn bounds<C, K: Creature<C>>(c: K) -> Box3 {
+    let field = c.field()
+    var lo = vec3(1.0e9)
+    var hi = vec3(-1.0e9)
+    var stack: Vec<(Box3, u32)> = Vec::new()
+    stack.push((cover(c), 0))
+    while let Some((b, depth)) = stack.pop() {
+        let r = interval(|q: vec3| field.distance(q), b)
+        if r.lo > 0.0 {
+            continue
+        }
+        if depth == 5 || r.hi < 0.0 {
+            lo = min(lo, b.lo)
+            hi = max(hi, b.hi)
+            continue
+        }
+        let h = 0.5 * (b.hi.x - b.lo.x)
+        for j in 0..8 {
+            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+            stack.push((Box3 { lo: b.lo + o, hi: b.lo + o + h }, depth + 1))
+        }
+    }
+    Box3 { lo, hi }
+}
+
+/// Mass properties of a cell of density `rho` (a cube), about its own centre.
+fn cell_props(lo: vec3, size: f32, rho: f32) -> MassProps {
+    let mass = rho * size * size * size
+    // A cube's moment about an axis through its centre: m (a² + b²) / 12.
+    let i = mass * size * size / 6.0
+    MassProps { mass, centre: lo + 0.5 * size, inertia: vec3(i) }
+}
+
+/// Adds `b` to `a`, moving the moments to the new centre (the parallel-axis theorem).
+fn combine(a: MassProps, b: MassProps) -> MassProps {
+    let mass = a.mass + b.mass
+    if mass <= 0.0 {
+        return a
+    }
+    let centre = (a.centre * a.mass + b.centre * b.mass) / mass
+    let shift = |m: MassProps| {
+        let d = m.centre - centre
+        m.inertia +
+            m.mass * vec3(d.y * d.y + d.z * d.z, d.x * d.x + d.z * d.z, d.x * d.x + d.y * d.y)
+    }
+    MassProps { mass, centre, inertia: shift(a) + shift(b) }
+}
+
+const EMPTY: MassProps = MassProps { mass: 0.0, centre: vec3(), inertia: vec3() }
+
+/// The creature's mass: the density its channels give, `density(channels)`, integrated over
+/// its inside, refining cells the surface crosses down to `finest`. In handle order, cell by
+/// cell, so the sums don't depend on anything but the creature.
+@deterministic
+pub fn integrate<C, K: Creature<C>>(c: K, density: fn(C) -> f32, per: Per, finest: f32) -> Mass {
+    let field = c.field()
+    let bones = c.skeleton().len()
+    var out = Mass { per: Vec::filled(bones, EMPTY), total: EMPTY }
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(cover(c))
+    while let Some(b) = stack.pop() {
+        let size = b.hi.x - b.lo.x
+        let centre = 0.5 * (b.lo + b.hi)
+        // A cell at the finest size is sampled at its centre; a larger one is classified by
+        // the derived interval over it.
+        var inside = false
+        if size <= finest {
+            if field.distance(centre) >= 0.0 {
+                continue
+            }
+            inside = true
+        } else {
+            let r = interval(|q: vec3| field.distance(q), b)
+            if r.lo > 0.0 {
+                continue
+            }
+            inside = r.hi < 0.0
+        }
+        if inside {
+            let m = cell_props(b.lo, size, density(field.channels(centre)))
+            out.total = combine(out.total, m)
+            if per == Per::Bone {
+                let i = c.nearest_bone(centre).index
+                out.per[i] = combine(out.per[i], m)
+            }
+        } else {
+            // Children pushed in reverse, so they're taken in order.
+            let h = 0.5 * size
+            for k in 0..8 {
+                let j = 7 - k
+                let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+                stack.push(Box3 { lo: b.lo + o, hi: b.lo + o + h })
+            }
+        }
+    }
+    out
+}
+
+/// A capsule per bone (or one, whole) holding the creature's inside within `tolerance`: its
+/// axis runs from the bone to its first child, and its radius reaches the farthest inside
+/// cell nearest that bone.
+@deterministic
+pub fn fit_capsules<C, K: Creature<C>>(c: K, per: Per, tolerance: f32) -> Vec<Capsule> {
+    let field = c.field()
+    let s = c.skeleton()
+    let n = s.len()
+    // Each bone's axis: to its first child, or nowhere for a leaf.
+    var axes = Vec::from_fn(n, |i| {
+        let a = s.rest(Bone { index: i })
+        (a, a)
+    })
+    for i in 0..n {
+        let b = Bone { index: i }
+        let parent = s.parent(b).index
+        if parent != i && axes[parent].0 == axes[parent].1 {
+            axes[parent] = (axes[parent].0, s.rest(b))
+        }
+    }
+    var radius: Vec<f32> = Vec::filled(n, 0.0)
+    var used = Vec::filled(n, value: false)
+    var stack: Vec<Box3> = Vec::new()
+    stack.push(cover(c))
+    while let Some(b) = stack.pop() {
+        let size = b.hi.x - b.lo.x
+        if size > tolerance {
+            let r = interval(|q: vec3| field.distance(q), b)
+            if r.lo > 0.0 {
+                continue
+            }
+            let h = 0.5 * size
+            for k in 0..8 {
+                let j = 7 - k
+                let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+                stack.push(Box3 { lo: b.lo + o, hi: b.lo + o + h })
+            }
+            continue
+        }
+        let centre = 0.5 * (b.lo + b.hi)
+        if field.distance(centre) >= 0.0 {
+            continue
+        }
+        let i = match per {
+            Per::Bone => c.nearest_bone(centre).index,
+            Per::Whole => 0,
+        }
+        let (a, e) = axes[i]
+        radius[i] = max(radius[i], segment_distance(centre, a, e) + 0.5 * tolerance)
+        used[i] = true
+    }
+    var out: Vec<Capsule> = Vec::new()
+    for i in 0..n {
+        if used[i] {
+            let (a, e) = axes[i]
+            out.push(Capsule { bone: Bone { index: i }, a, b: e, radius: radius[i] })
+        }
+    }
+    out
+}
+
+/// How far `p` is from the segment `a`–`b`.
+pub fn segment_distance(p: vec3, a: vec3, b: vec3) -> f32 {
+    let ab = b - a
+    let t = if dot(ab, ab) > 0.0 { clamp(dot(p - a, ab) / dot(ab, ab), 0.0, 1.0) } else { 0.0 }
+    length(p - (a + t * ab))
+}
+
+// ---- mass by an adaptive octree -----------------------------------------------------------------
+
+/// What `adaptive_mass` finds: the mass (kg), the volume (m³), the centre of mass, and how many
+/// samples it took.
+pub struct Weighed: Copy + StateHash {
+    pub mass: f64,
+    pub volume: f64,
+    pub centre: vec3,
+    pub samples: u32,
+}
+
+/// What the octree counts each cube of the inside into (for a creature whose channels are
+/// `C`).
+trait Gather<C> {
+    /// A cube of half-edge `h` at `c`, of density `rho`, counted whole.
+    fn add(mut self, c: vec3, h: f32, rho: f32)
+
+    /// One more sample taken.
+    fn sampled(mut self)
+}
+
+/// Sums, in f64.
+struct Sums {
+    mass: f64,
+    volume: f64,
+    moment: vec3d,
+    samples: u32,
+}
+
+impl<C> Gather<C> for Sums {
+    fn sampled(mut self) {
+        self.samples += 1
+    }
+
+    fn add(mut self, c: vec3, h: f32, rho: f32) {
+        let edge = 2.0 * f64(h)
+        let vol = edge * edge * edge
+        let mass = vol * f64(rho)
+        self.volume += vol
+        self.mass += mass
+        self.moment += mass * vec3d(c)
+    }
+}
+
+/// How far a node's centre's distance may be from the surface's where the node holds none: its
+/// half-diagonal times 1.5, an assumption that the gradient is at most 1.5 near the surface.
+const CLASSIFY: f32 = 1.5
+
+/// The octree's root: a cube around the items' bounds (those that bound something), its centre
+/// and half-edge.
+fn root_cube(bounds: [Bound]) -> (vec3, f32) {
+    var lo = vec3(1.0e30)
+    var hi = vec3(-1.0e30)
+    for b in bounds {
+        if b.radius < 1.0e29 {
+            lo = min(lo, b.centre - vec3(b.radius))
+            hi = max(hi, b.centre + vec3(b.radius))
+        }
+    }
+    let e = hi - lo
+    ((lo + hi) * 0.5, max(e.x, max(e.y, e.z)) * 0.5)
+}
+
+/// A creature's mass by an adaptive octree from a cube around the
+/// bounds of its items, each node classified by the distance at its centre (empty where it's
+/// more than 1.5 h √3, whole where it's less than minus that, h the node's half-edge), down to
+/// cells `finest` wide, which count where their centre is inside (the midpoint rule). Each
+/// sample leaves out the items that can't matter there (`Parts::sample_pruned`), and `density`
+/// gives its density from its channels. An estimate, not a certificate: the factor 1.5 is an
+/// assumption, not a bound (the grazer's gradient reaches 11 deep inside).
+@deterministic
+pub fn adaptive_mass<C, F: Parts<C>>(field: F, density: fn(C) -> f32, finest: f32) -> Weighed {
+    let bounds = field.item_bounds()
+    let (c, h) = root_cube(bounds)
+    var sums = Sums { mass: 0.0, volume: 0.0, moment: vec3d(0.0), samples: 0 }
+    node(field, density, bounds, c, h, finest, mut sums)
+    let m = max(sums.mass, 1.0e-30)
+    Weighed {
+        mass: sums.mass,
+        volume: sums.volume,
+        centre: vec3(sums.moment / m),
+        samples: sums.samples,
+    }
+}
+
+/// The node of half-edge `h` at `c`: classified, counted, or split into eight.
+@deterministic
+fn node<C, F: Parts<C>, G: Gather<C>>(
+    field: F,
+    density: fn(C) -> f32,
+    bounds: [Bound],
+    c: vec3,
+    h: f32,
+    finest: f32,
+    sums: mut G,
+) {
+    sums.sampled()
+    let (d, ch) = field.sample_pruned(c, bounds)
+    let r = h * 1.7320508 * CLASSIFY
+    if d > r {
+        return
+    }
+    if d < -r {
+        sums.add(c, h, density(ch))
+        return
+    }
+    if 2.0 * h <= finest {
+        if d < 0.0 {
+            sums.add(c, h, density(ch))
+        }
+        return
+    }
+    let q = h * 0.5
+    for i in 0..8 {
+        let o = vec3(
+            if i & 1 != 0 { q } else { -q },
+            if i & 2 != 0 { q } else { -q },
+            if i & 4 != 0 { q } else { -q },
+        )
+        node(field, density, bounds, c + o, q, finest, mut sums)
+    }
+}
+
+/// Each bone's sums, in f64: its mass, its first moments, its second moments (Σ m x², Σ m y²,
+/// Σ m z²), and the cubes' own moments about their centres.
+struct BoneSums<K> {
+    creature: K,
+    mass: Vec<f64>,
+    first: Vec<vec3d>,
+    second: Vec<vec3d>,
+    own: Vec<f64>,
+}
+
+impl<C, K: Creature<C>> Gather<C> for BoneSums<K> {
+    fn sampled(mut self) {}
+
+    /// The cube counts for the bone whose part is nearest its centre.
+    fn add(mut self, c: vec3, h: f32, rho: f32) {
+        let i = self.creature.nearest_bone(c).index
+        let edge = 2.0 * f64(h)
+        let m = edge * edge * edge * f64(rho)
+        let p = vec3d(c)
+        self.mass[i] += m
+        self.first[i] += m * p
+        self.second[i] += m * p * p
+        // A cube's moment about an axis through its centre: m (a² + a²) / 12.
+        self.own[i] += m * edge * edge / 6.0
+    }
+}
+
+/// Mass properties from sums: the centre, and the moments about axes through it (the
+/// parallel-axis theorem, in f64).
+fn props(mass: f64, first: vec3d, second: vec3d, own: f64) -> MassProps {
+    if mass <= 0.0 {
+        return EMPTY
+    }
+    let c = first / mass
+    // Σ m (y² + z²) about the origin, moved to the centre: minus M (cy² + cz²).
+    let about = |a: u32, b: u32| second[a] + second[b] + own - mass * (c[a] * c[a] + c[b] * c[b])
+    MassProps {
+        mass: f32(mass),
+        centre: vec3(c),
+        inertia: vec3(f32(about(1, 2)), f32(about(0, 2)), f32(about(0, 1))),
+    }
+}
+
+/// A creature's mass, centre of mass and moments of inertia, each bone's (the bone whose part
+/// is nearest each counted cube) and the whole's: `adaptive_mass`'s octree, cells down to
+/// `finest`, sums in f64. The whole is the bones' sum.
+@deterministic
+pub fn adaptive_physique<C, K: Creature<C>>(
+    creature: take K,
+    density: fn(C) -> f32,
+    finest: f32,
+) -> Mass {
+    let field = creature.field()
+    let n = creature.skeleton().len()
+    let bounds = field.item_bounds()
+    let (c, h) = root_cube(bounds)
+    var sums = BoneSums {
+        creature,
+        mass: Vec::filled(n, 0.0),
+        first: Vec::filled(n, vec3d(0.0)),
+        second: Vec::filled(n, vec3d(0.0)),
+        own: Vec::filled(n, 0.0),
+    }
+    node(field, density, bounds, c, h, finest, mut sums)
+    var out = Mass { per: Vec::new(), total: EMPTY }
+    var all = (0.0, vec3d(0.0), vec3d(0.0), 0.0)
+    for i in 0..n {
+        out.per.push(props(sums.mass[i], sums.first[i], sums.second[i], sums.own[i]))
+        all.0 += sums.mass[i]
+        all.1 += sums.first[i]
+        all.2 += sums.second[i]
+        all.3 += sums.own[i]
+    }
+    out.total = props(all.0, all.1, all.2, all.3)
+    out
+}
+
+fn sphere_for_cover() -> Creature<f32> {
+    var skeleton = creature::Skeleton::new()
+    let root = skeleton.root("root", vec3(0.0))
+    creature::creature(skeleton).part(root, std::field::sphere(2.0).with(1.0))
+}
+
+@test
+fn creature_bounds_include_a_part_beyond_the_skeleton_margin() {
+    let c = sphere_for_cover()
+    let b = bounds(c)
+    for axis in 0..3 {
+        assert(
+            b.lo[axis] <= -2.0 && b.hi[axis] >= 2.0,
+            "the bounds contain the whole two-metre sphere",
+        )
+    }
+}
+
+@test
+fn integration_counts_a_part_beyond_the_skeleton_margin() {
+    let c = sphere_for_cover()
+    let mass = integrate(c, |density: f32| density, Per::Whole, finest: 0.25)
+    let expected = 4.0 * std::math::PI * 8.0 / 3.0
+    assert(
+        abs(mass.total.mass - expected) < 1.0,
+        f"sphere mass {mass.total.mass}, expected {expected}",
+    )
+}
+
+@test
+fn fitted_capsules_include_a_part_beyond_the_skeleton_margin() {
+    let c = sphere_for_cover()
+    let capsules = fit_capsules(c, Per::Whole, tolerance: 0.25)
+    assert(capsules.len() == 1)
+    assert(
+        capsules[0].radius >= 2.0 && capsules[0].radius <= 2.25,
+        "the fitted capsule contains the two-metre sphere within the sampling tolerance",
+    )
+}
+
+fn disconnected_for_cover() -> Creature<f32> {
+    var skeleton = creature::Skeleton::new()
+    let root = skeleton.root("root", vec3(0.0))
+    creature::creature(skeleton)
+        .part(root, std::field::sphere(0.5).with(1.0))
+        .part(root, std::field::sphere(0.5).translate(vec3(6.0, 0.0, 0.0)).with(1.0))
+}
+
+@test
+fn physique_keeps_disconnected_parts_with_known_bounds() {
+    let c = disconnected_for_cover()
+    let b = bounds(c)
+    assert(b.lo.x <= -0.5 && b.hi.x >= 6.5, "both disconnected spheres are bounded")
+    let mass = integrate(c, |density: f32| density, Per::Whole, finest: 0.25)
+    let expected = 2.0 * 4.0 * std::math::PI * 0.125 / 3.0
+    assert(abs(mass.total.mass - expected) < 0.15, "both disconnected spheres have mass")
+    assert(abs(mass.total.centre.x - 3.0) < 0.1, "the mass lies between the two spheres")
+    let capsules = fit_capsules(c, Per::Whole, tolerance: 0.25)
+    assert(
+        capsules.len() == 1 && capsules[0].radius >= 6.5,
+        "the capsule reaches the disconnected sphere",
+    )
+}
+
+struct UnknownBoundSphere: Copy + GpuData {}
+
+impl std::field::Surface for UnknownBoundSphere {
+    fn distance(self, p: vec3) -> f32 {
+        length(p) - 0.5
+    }
+}
+
+impl std::field::Field<f32> for UnknownBoundSphere {
+    fn channels(self, p: vec3) -> f32 {
+        1.0
+    }
+}
+
+fn unknown_for_cover() -> Creature<f32> {
+    var skeleton = creature::Skeleton::new()
+    let root = skeleton.root("root", vec3(0.0))
+    creature::creature(skeleton).part(root, UnknownBoundSphere {})
+}
+
+@test
+fn an_unknown_item_bound_keeps_the_skeleton_search_region() {
+    let b = cover(unknown_for_cover())
+    assert(b.lo == vec3(-1.0) && b.hi == vec3(1.0), "unknown bounds keep the fallback region")
+}

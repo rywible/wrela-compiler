@@ -1,0 +1,1766 @@
+// Landforms: a land's relief, worked out at build time over a grid from its rock, the uplift
+// under it and its water.
+//
+// Call `evolve` with the land to start from, the cells that hold the base level, the uplift and
+// the rock. Each step:
+// - raises the land by its uplift;
+// - routes its water to the base level, its pits flooded by a priority flood with an epsilon
+//   (`drainage`);
+// - cuts the channels by the stream power law, implicit, n = 1, in the order the water flows
+//   (`incise`);
+// - lets the slopes creep, by diffusion (`diffuse`).
+// Rock that is hard to erode keeps its height; soft rock goes.
+//
+// A game keeps the relief (`Relief`), which its terrain reads on the CPU and the GPU alike. An
+// agent reads the land through `Landscape` and `summary`: heights, where the water goes, how
+// much gathers, and the land's forms.
+
+use grow::{Grid, Heap, NEIGHBOURS, NONE}
+use std::string::String
+
+/// How far the flood raises a cell over the cell it reached it from (m), so every cell it
+/// fills still drains: a little, but more than a float's step anywhere within `HIGHEST`.
+const RISE: f32 = 1.0e-3
+
+/// How far from 0 a land's heights may be (m): within it a float's step is under `RISE` / 2.
+pub const HIGHEST: f32 = 4096.0
+
+/// Where the water on a land goes: each cell's receiver, the neighbour it falls to most steeply
+/// over the land with its pits filled (`NONE` where none is lower: an outlet); the land with its
+/// pits filled; and the cells in the order the flood reached them, so a cell's receiver always
+/// comes before it.
+pub struct Drainage {
+    pub down: Vec<u32>,
+    pub filled: Vec<f32>,
+    pub order: Vec<u32>,
+}
+
+/// Where the water on the land `heights` (over grid `g`) goes, `outlets` the cells it leaves the
+/// land by. The pits are filled by flooding from the outlets, lowest first, each cell raised to
+/// `RISE` over the cell it's reached from (a priority flood, with an epsilon), so every cell drains
+/// to an outlet, across a pit by the way it would spill.
+pub fn drainage(g: Grid, heights: [f32], outlets: [bool]) -> Drainage {
+    let nn = g.cells()
+    let (nx, nz) = (g.nx, g.nz)
+    var filled: Vec<f32> = Vec::filled(nn, 0.0)
+    var done: Vec<bool> = Vec::filled(nn, value: false)
+    var order: Vec<u32> = Vec::with_capacity(nn)
+    var heap = Heap { items: Vec::new() }
+    for c in 0..nn {
+        assert(abs(heights[c]) < HIGHEST, "a land's height is past `landform::HIGHEST`")
+        if outlets[c] {
+            filled[c] = heights[c]
+            done[c] = true
+            heap.push(filled[c], c)
+        }
+    }
+    while !heap.items.is_empty() {
+        let top = heap.pop()
+        let h = bitcast_f32(top.x)
+        let c = top.y
+        order.push(c)
+        let (i, j) = (i32(c % nx), i32(c / nx))
+        for k in 0..8 {
+            let n = vec2i(i, j) + NEIGHBOURS[k]
+            if n.x >= 0 && n.y >= 0 && n.x < i32(nx) && n.y < i32(nz) {
+                let q = u32(n.y) * nx + u32(n.x)
+                if !done[q] {
+                    done[q] = true
+                    filled[q] = max(heights[q], h + RISE)
+                    heap.push(filled[q], q)
+                }
+            }
+        }
+    }
+    var down: Vec<u32> = Vec::filled(nn, NONE)
+    for c in 0..nn {
+        let (i, j) = (i32(c % nx), i32(c / nx))
+        var best = 0.0
+        for k in 0..8 {
+            let n = vec2i(i, j) + NEIGHBOURS[k]
+            if n.x >= 0 && n.y >= 0 && n.x < i32(nx) && n.y < i32(nz) {
+                let q = u32(n.y) * nx + u32(n.x)
+                let fall = (filled[c] - filled[q]) / length(vec2(NEIGHBOURS[k]))
+                if fall > best {
+                    best = fall
+                    down[c] = q
+                }
+            }
+        }
+    }
+    Drainage { down, filled, order }
+}
+
+/// A grid's border cells: `drainage`'s outlets where the water leaves by every edge.
+pub fn border(g: Grid) -> Vec<bool> {
+    Vec::from_fn(g.cells(), |c| {
+        let (i, j) = (c % g.nx, c / g.nx)
+        i == 0 || j == 0 || i == g.nx - 1 || j == g.nz - 1
+    })
+}
+
+// ---- the land's making --------------------------------------------------------------------------
+
+/// How a land is made: how many steps, each how many years; the stream power law's exponent on
+/// the area a channel drains (m, about 0.5; n is 1); how fast its slopes creep (m² a year); and
+/// the area (m²) that drains through a cell before its water runs in a channel and cuts it
+/// (below it, a slope only creeps and fails); how readily the water lays down what it
+/// carries (`settle`'s G: 0 carries everything away); the slope its creep runs away at, as a
+/// share of the slope its rock stands at (`diffuse`'s critical slope: 0 creeps linearly); and
+/// how much the slope a face fails at scatters from cell to cell and step to step (`collapse`).
+pub struct Shaping: Copy {
+    pub steps: u32,
+    pub years: f32,
+    pub m: f32,
+    pub creep: f32,
+    pub channel: f32 = 0.0,
+    pub laying: f32 = 0.0,
+    pub critical: f32 = 0.0,
+    pub scatter: f32 = 0.0,
+}
+
+/// A rock's strength where it is: how easily water cuts it (the stream power law's K, m^(1-2m)
+/// a year); the steepest slope (rise over run) it stands at before it fails; how fast a face
+/// steeper than that weathers back (m a year: the most it sheds), hard rock slowly; and how much
+/// of the land's creep it has (0 to 1): bare hard rock barely creeps, the soil on soft rock does.
+pub struct Strength: Copy {
+    pub erodibility: f32,
+    pub standing: f32,
+    pub weathering: f32,
+    pub creep: f32 = 1.0,
+}
+
+/// A land as it was made: its grid, its heights (m), each cell's receiver (`NONE` at the base
+/// level), the area that drains through it (m²), its uplift (m a year), its rock's erodibility
+/// (the stream power law's K, at its surface), which cells hold the base level, and how deep
+/// the lakes its last pits hold are (m; 0 where there's none).
+pub struct Landscape: Clone {
+    pub grid: Grid,
+    pub heights: Vec<f32>,
+    pub down: Vec<u32>,
+    pub area: Vec<f32>,
+    pub uplift: Vec<f32>,
+    pub erodibility: Vec<f32>,
+    pub base: Vec<bool>,
+    pub lakes: Vec<f32>,
+}
+
+/// The land made from `start` (heights over grid `g`) over `s`'s steps: the cells `base` holds
+/// at their heights, the base level, which the water leaves the land by; the rest raised by
+/// `uplift` (m a year) each year, their water routed across their pits, their channels cut where
+/// their rock (`rock(x, height, z)`) lets them, their slopes crept, and those steeper than their
+/// rock stands at failed. What's left has its last pits filled, as lakes: each of its cells
+/// stands over its receiver, which is `NONE` only at the base level.
+pub fn evolve(
+    g: Grid,
+    start: [f32],
+    base: [bool],
+    uplift: [f32],
+    rock: fn(vec3) -> Strength,
+    s: Shaping,
+) -> Landscape {
+    let nn = g.cells()
+    var h: Vec<f32> = Vec::from_fn(nn, |c| start[c])
+    var area: Vec<f32> = Vec::filled(nn, 0.0)
+    var down: Vec<u32> = Vec::filled(nn, NONE)
+    var k: Vec<f32> = Vec::filled(nn, 0.0)
+    var ease: Vec<f32> = Vec::filled(nn, 1.0)
+    var critical: Vec<f32> = Vec::filled(nn, 0.0)
+    var was: Vec<f32> = Vec::filled(nn, 0.0)
+    for step in 0..s.steps {
+        for c in 0..nn {
+            if !base[c] {
+                h[c] += uplift[c] * s.years
+            }
+        }
+        let d = drainage(g, h, base)
+        for c in 0..nn {
+            down[c] = if base[c] { NONE } else { d.down[c] }
+            let at = g.centre(c)
+            let r = rock(vec3(at.x, h[c], at.y))
+            k[c] = r.erodibility
+            ease[c] = r.creep
+            critical[c] = s.critical * r.standing
+        }
+        gather(g, d.order, down, mut area)
+        for c in 0..nn {
+            was[c] = h[c]
+        }
+        incise(g, d.order, down, area, k, s, mut h)
+        if s.laying > 0.0 {
+            settle(g, d.order, down, area, was, s.laying, mut h)
+        }
+        diffuse(g, mut h, base, s.creep * s.years, ease, critical)
+        collapse(g, mut h, base, rock, FAILS, s.years, scatter: s.scatter, step: step)
+    }
+    // The land as it's left: its pits filled once more (creep can open one), so every cell
+    // stands over the one its water goes to; what the fill raised is a lake.
+    let d = drainage(g, h, base)
+    var lakes: Vec<f32> = Vec::filled(nn, 0.0)
+    for c in 0..nn {
+        lakes[c] = if d.filled[c] - h[c] > LAKE { d.filled[c] - h[c] } else { 0.0 }
+        h[c] = d.filled[c]
+        down[c] = if base[c] { NONE } else { d.down[c] }
+        let at = g.centre(c)
+        k[c] = rock(vec3(at.x, h[c], at.y)).erodibility
+    }
+    gather(g, d.order, down, mut area)
+    Landscape {
+        grid: g,
+        heights: h,
+        down,
+        area,
+        uplift: Vec::from_fn(nn, |c| uplift[c]),
+        erodibility: k,
+        base: Vec::from_fn(nn, |c| base[c]),
+        lakes,
+    }
+}
+
+/// How many times a step lets its too-steep slopes fail, and the least depth a filled pit holds
+/// to be a lake (m), not the fill's own rise.
+const FAILS: u32 = 2
+const LAKE: f32 = 0.25
+
+/// Slopes steeper than their rock stands at fail over `years` (threshold hillslopes, as thermal
+/// erosion does): each cell over its steepest lower neighbour by more than its rock's `standing`
+/// slope there (the rock half way down, so a cliff of hard rock over soft fails at the soft
+/// rock's), scattered by up to half `scatter` of it either way from cell to cell and from `step`
+/// to step (as slides do, here and not there), gives half the excess to it, but no more than that
+/// rock weathers in the time, `passes` times, all cells at once each time; the cells `held` keep
+/// their heights, and what falls onto one leaves the land.
+pub fn collapse(
+    g: Grid,
+    h: mut Vec<f32>,
+    held: [bool],
+    rock: fn(vec3) -> Strength,
+    passes: u32,
+    years: f32,
+    scatter: f32 = 0.0,
+    step: u32 = 0,
+) {
+    let (nx, nz) = (g.nx, g.nz)
+    var moved: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    for _ in 0..passes {
+        for c in 0..g.cells() {
+            moved[c] = 0.0
+        }
+        for c in 0..g.cells() {
+            if held[c] {
+                continue
+            }
+            let (i, j) = (i32(c % nx), i32(c / nx))
+            var best = 0.0
+            var to = NONE
+            var run = 1.0
+            for k in 0..8 {
+                let n = vec2i(i, j) + NEIGHBOURS[k]
+                if n.x >= 0 && n.y >= 0 && n.x < i32(nx) && n.y < i32(nz) {
+                    let q = u32(n.y) * nx + u32(n.x)
+                    let d = length(vec2(NEIGHBOURS[k])) * g.cell
+                    let slope = (h[c] - h[q]) / d
+                    if slope > best {
+                        best = slope
+                        to = q
+                        run = d
+                    }
+                }
+            }
+            if to == NONE {
+                continue
+            }
+            let mid = 0.5 * (g.centre(c) + g.centre(to))
+            let r = rock(vec3(mid.x, 0.5 * (h[c] + h[to]), mid.y))
+            let spread = 1.0 + scatter * (noise::hash2(i32(c), i32(step)) - 0.5)
+            let excess = (best - r.standing * spread) * run
+            if excess > 0.0 {
+                let falls = min(0.5 * excess, r.weathering * years / f32(passes))
+                moved[c] -= falls
+                if !held[to] {
+                    moved[to] += falls
+                }
+            }
+        }
+        for c in 0..g.cells() {
+            h[c] += moved[c]
+        }
+    }
+}
+
+/// The area that drains through each cell (m²): its own, and all that reaches it, passed down
+/// from the highest cell (the last the flood reached) to the lowest.
+fn gather(g: Grid, order: [u32], down: [u32], area: mut Vec<f32>) {
+    let own = g.cell * g.cell
+    for c in 0..g.cells() {
+        area[c] = own
+    }
+    var n = order.len()
+    while n > 0 {
+        n -= 1
+        let c = order[n]
+        if down[c] != NONE {
+            area[down[c]] += area[c]
+        }
+    }
+}
+
+/// One step of the stream power law, dh/dt = -K A^m S, n = 1, implicit in the receiver's new
+/// height, so it holds at any step: each cell after its receiver, in
+/// the flood's order, where its water runs in a channel (`Shaping::channel`). A cell with no
+/// receiver holds, and so does one in a pit, under the receiver its water spills to: a lake's
+/// floor isn't cut, but its outlet is, so it drains.
+pub fn incise(
+    g: Grid,
+    order: [u32],
+    down: [u32],
+    area: [f32],
+    k: [f32],
+    s: Shaping,
+    h: mut Vec<f32>,
+) {
+    for c in order {
+        let r = down[c]
+        if r != NONE && h[r] < h[c] && area[c] >= s.channel {
+            let run = length(g.centre(c) - g.centre(r))
+            let f = k[c] * s.years * pow(area[c], s.m) / run
+            h[c] = (h[c] + f * h[r]) / (1.0 + f)
+        }
+    }
+}
+
+/// What the water cut in a step (each cell's fall from `was`, its height before) carried down
+/// and laid where its load is heavy for its water (an erosion and deposition model:
+/// D = G Qs / Q, the water's discharge as the area that drains): each cell, from the highest, takes
+/// in what its donors pass on and what it lost itself, lays down `laying` (G, 0 to 1) times its
+/// load over the area that drains through it, but not so much that it stands over half way to its
+/// lowest donor (its water still flows), and passes the rest on. What reaches a cell with no
+/// receiver leaves the land.
+pub fn settle(
+    g: Grid,
+    order: [u32],
+    down: [u32],
+    area: [f32],
+    was: [f32],
+    laying: f32,
+    h: mut Vec<f32>,
+) {
+    let own = g.cell * g.cell
+    var load: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    var donor: Vec<f32> = Vec::filled(g.cells(), 1.0e9)
+    var n = order.len()
+    while n > 0 {
+        n -= 1
+        let c = order[n]
+        load[c] += max(was[c] - h[c], 0.0) * own
+        let r = down[c]
+        if r == NONE {
+            continue
+        }
+        let room = max(0.5 * (donor[c] - h[c]), 0.0)
+        let lay = min(laying * load[c] / area[c], room)
+        h[c] += lay
+        load[r] += load[c] - lay * own
+        donor[r] = min(donor[r], h[c])
+    }
+}
+
+/// Slopes creeping for `kt` (a diffusivity times the time, m²): explicit diffusion over the four
+/// neighbours, each pair of cells passing material at the mean of their rocks' `ease` (0 to 1)
+/// of it, the cells `held` keeping their heights and an edge passing nothing (a missing neighbour
+/// is the cell). Where a pair's `critical` slope (their mean) is over 0, the creep is nonlinear:
+/// faster by 1 / (1 - (S / Sc)²) as its slope S nears
+/// it, to `RUNAWAY` times at most (the faces past it fail, `collapse`), so slopes run straight
+/// down from rounded crests; linear where it's 0. In steps of at most a fifth of a cell's area
+/// each, at the fastest (stable).
+pub fn diffuse(g: Grid, h: mut Vec<f32>, held: [bool], kt: f32, ease: [f32], critical: [f32]) {
+    if kt <= 0.0 {
+        return
+    }
+    let a = kt / (g.cell * g.cell)
+    var fastest = 1.0
+    for c in 0..g.cells() {
+        if critical[c] > 0.0 {
+            fastest = RUNAWAY
+        }
+    }
+    let parts = u32(ceil(a * fastest / 0.2))
+    let each = a / f32(parts)
+    let (nx, nz) = (g.nx, g.nz)
+    var was: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    for _ in 0..parts {
+        for c in 0..g.cells() {
+            was[c] = h[c]
+        }
+        for j in 0..nz {
+            for i in 0..nx {
+                let c = j * nx + i
+                if !held[c] {
+                    let here = was[c]
+                    var flow = 0.0
+                    if i > 0 {
+                        flow += pass(g, was, ease, critical, c, c - 1)
+                    }
+                    if i + 1 < nx {
+                        flow += pass(g, was, ease, critical, c, c + 1)
+                    }
+                    if j > 0 {
+                        flow += pass(g, was, ease, critical, c, c - nx)
+                    }
+                    if j + 1 < nz {
+                        flow += pass(g, was, ease, critical, c, c + nx)
+                    }
+                    h[c] = here + each * flow
+                }
+            }
+        }
+    }
+}
+
+/// How much nonlinear creep can run away by, at most (`diffuse`).
+const RUNAWAY: f32 = 3.0
+
+/// What cell `n` passes cell `c` in a part of a creep (`diffuse`), its heights `h`: their height's
+/// difference, by their mean `ease`, faster as their slope nears their mean `critical` one.
+fn pass(g: Grid, h: [f32], ease: [f32], critical: [f32], c: u32, n: u32) -> f32 {
+    let rise = h[n] - h[c]
+    let sc = 0.5 * (critical[c] + critical[n])
+    let faster = if sc > 0.0 {
+        let r = rise / (g.cell * sc)
+        min(1.0 / max(1.0 - r * r, 1.0e-6), RUNAWAY)
+    } else { 1.0 }
+    0.5 * (ease[c] + ease[n]) * faster * rise
+}
+
+// ---- its water, as it shows ----------------------------------------------------------------------
+
+/// A land's lakes as basins: each run of its lake cells (`Landscape::lakes` over 0) joined side to
+/// side (not corner to corner: a divide a cell wide keeps two apart), numbered from 0 (`of`,
+/// `NONE` past them), and each one's level (m): the height its pit was filled to, which it spills
+/// at.
+pub struct Basins: Clone {
+    pub of: Vec<u32>,
+    pub level: Vec<f32>,
+}
+
+/// The lakes of `l` (`Basins`).
+pub fn basins(l: Landscape) -> Basins {
+    let g = l.grid
+    var of: Vec<u32> = Vec::filled(g.cells(), NONE)
+    var level: Vec<f32> = Vec::new()
+    var todo: Vec<u32> = Vec::new()
+    for c in 0..g.cells() {
+        if l.lakes[c] <= 0.0 || of[c] != NONE {
+            continue
+        }
+        let id = level.len()
+        var top = l.heights[c]
+        of[c] = id
+        todo.push(c)
+        while !todo.is_empty() {
+            let at = todo.pop().unwrap()
+            top = max(top, l.heights[at])
+            let (i, j) = (i32(at % g.nx), i32(at / g.nx))
+            for k in 0..4 {
+                let n = vec2i(i, j) + SIDES[k]
+                if n.x >= 0 && n.y >= 0 && n.x < i32(g.nx) && n.y < i32(g.nz) {
+                    let q = u32(n.y) * g.nx + u32(n.x)
+                    if l.lakes[q] > 0.0 && of[q] == NONE {
+                        of[q] = id
+                        todo.push(q)
+                    }
+                }
+            }
+        }
+        level.push(top)
+    }
+    Basins { of, level }
+}
+
+/// A cell's four sides' neighbours.
+const SIDES = [vec2i(-1, 0), vec2i(1, 0), vec2i(0, -1), vec2i(0, 1)]
+
+/// The channels of `l` as they show, `lakes` its basins: every cell outside a lake that `threshold`
+/// m² or more drains through, as courses of cells down their receivers. Each starts at a head (a
+/// channel cell no other channel cell outside a lake drains into: a channel's top, or where one
+/// leaves a lake) and runs down to where it enters a lake (that cell its last), leaves the land
+/// (an outlet), or meets a course traced before it (that cell its last: a tributary ends on the
+/// stream it joins). The heads draining most are traced first, so a lake's outflow runs unbroken.
+pub fn channels(l: Landscape, threshold: f32, lakes: Basins) -> Vec<Vec<u32>> {
+    let g = l.grid
+    let open = |c: u32| l.area[c] >= threshold && lakes.of[c] == NONE
+    var fed: Vec<bool> = Vec::filled(g.cells(), value: false)
+    for c in 0..g.cells() {
+        if open(c) && l.down[c] != NONE {
+            fed[l.down[c]] = true
+        }
+    }
+    var heads: Vec<u32> = Vec::new()
+    for c in 0..g.cells() {
+        if open(c) && !fed[c] {
+            heads.push(c)
+        }
+    }
+    heads.sort_by(|a, b| l.area[a] > l.area[b])
+    var taken: Vec<bool> = Vec::filled(g.cells(), value: false)
+    var out: Vec<Vec<u32>> = Vec::new()
+    for h in heads {
+        var course: Vec<u32> = Vec::new()
+        var c = h
+        loop {
+            course.push(c)
+            if taken[c] || lakes.of[c] != NONE {
+                break
+            }
+            taken[c] = true
+            let r = l.down[c]
+            if r == NONE {
+                break
+            }
+            c = r
+        }
+        out.push(take course)
+    }
+    out
+}
+
+// ---- the relief, as the terrain reads it --------------------------------------------------------
+
+/// A land's relief over its grid, `N` cells (`nx` × `nz`, from `lo`, `cell` metres a side), as a
+/// terrain reads it on the CPU and the GPU: each cell's rise over the land the game made it
+/// from (m), and how wet it is, from the area that drains through it (0 to 1), packed in a word
+/// (`pack`), so a terrain that holds one stays small. Its fields are sampled between the cells'
+/// middles: the rise smoothly (Catmull-Rom, through each cell's own), the wetness linearly; past
+/// the grid each is its nearest edge's.
+pub struct Relief<const N: u32>: Copy + GpuData {
+    pub lo: vec2,
+    pub cell: f32,
+    pub nx: u32,
+    pub nz: u32,
+    pub cells: [u32; N],
+}
+
+/// A relief's rise, from `-RISE_RANGE` to `RISE_RANGE` m in steps of 1 / `RISE_STEPS` m, in a
+/// word's low 24 bits; its wetness, 0 to 255, in the high 8.
+pub const RISE_RANGE: f32 = 1024.0
+const RISE_STEPS: f32 = 8192.0
+const LOW_24: u32 = 16777215
+
+/// A cell of a relief: its rise (m, within `RISE_RANGE`) and its wetness (0 to 1).
+pub fn pack(rise: f32, wet: f32) -> u32 {
+    assert(abs(rise) < RISE_RANGE, "a relief's rise is past `landform::RISE_RANGE`")
+    let r = min(u32(round((rise + RISE_RANGE) * RISE_STEPS)), LOW_24)
+    r | (u32(round(saturate(wet) * 255.0)) << 24)
+}
+
+/// The area a channel drains (m²) at which the ground is as wet as it gets, and below which
+/// it's dry: the wetness runs between them on a log scale.
+pub const DRY_AREA: f32 = 2.0e4
+pub const WET_AREA: f32 = 4.0e6
+
+impl<const N: u32> Relief<N> {
+    /// The relief of `l`, made from the land `from` (each cell's height before it was made).
+    pub fn of(l: Landscape, from: [f32]) -> Relief<N> {
+        let g = l.grid
+        assert(g.cells() == N, "a relief's grid has `N` cells")
+        var r = Relief { lo: g.lo, cell: g.cell, nx: g.nx, nz: g.nz, cells: [0; N] }
+        let span = log(WET_AREA / DRY_AREA)
+        for c in 0..N {
+            r.cells[c] = pack(l.heights[c] - from[c], log(l.area[c] / DRY_AREA) / span)
+        }
+        r
+    }
+
+    /// No relief over grid `g`: none of its cells risen, none wet.
+    pub fn none(g: Grid) -> Relief<N> {
+        assert(g.cells() == N, "a relief's grid has `N` cells")
+        Relief { lo: g.lo, cell: g.cell, nx: g.nx, nz: g.nz, cells: [pack(rise: 0.0, wet: 0.0); N] }
+    }
+
+    /// Cell `c`'s rise (m).
+    pub fn rise(self, c: u32) -> f32 {
+        rise_of(self.cells[c])
+    }
+
+    /// Cell `c`'s wetness (0 to 1).
+    pub fn wet(self, c: u32) -> f32 {
+        wet_of(self.cells[c])
+    }
+
+    // The fields read the cells in place, and work out where they are from numbers alone: a
+    // method of the relief's called for each cell would copy the whole relief into the GPU's
+    // private memory each time.
+
+    /// The rise at `p` (m): Catmull-Rom between the cells' middles, through each one's own.
+    pub fn rise_at(self, p: vec2) -> f32 {
+        let q = (p - self.lo) / self.cell - vec2(0.5)
+        let f = q - floor(q)
+        let c = vec2i(floor(q))
+        let wx = catmull_rom(f.x)
+        let wz = catmull_rom(f.y)
+        var y = 0.0
+        for b in 0..4 {
+            var row = 0.0
+            for a in 0..4 {
+                let k = clamped(self.nx, self.nz, c.x - 1 + i32(a), c.y - 1 + i32(b))
+                row += wx[a] * rise_of(self.cells[k])
+            }
+            y += wz[b] * row
+        }
+        y
+    }
+
+    /// The rise at `p` (m) and its slope: its rise per metre along x and along z, the Catmull-Rom
+    /// spline's own (`rise_at`'s).
+    pub fn rise_grad(self, p: vec2) -> vec3 {
+        let q = (p - self.lo) / self.cell - vec2(0.5)
+        let f = q - floor(q)
+        let c = vec2i(floor(q))
+        let wx = catmull_rom(f.x)
+        let wz = catmull_rom(f.y)
+        let dx = catmull_rom_slope(f.x)
+        let dz = catmull_rom_slope(f.y)
+        var y = vec3(0.0)
+        for b in 0..4 {
+            var row = vec2(0.0)
+            for a in 0..4 {
+                let k = clamped(self.nx, self.nz, c.x - 1 + i32(a), c.y - 1 + i32(b))
+                let v = rise_of(self.cells[k])
+                row += vec2(wx[a], dx[a]) * v
+            }
+            y += vec3(wz[b] * row.x, wz[b] * row.y, dz[b] * row.x)
+        }
+        vec3(y.x, y.y / self.cell, y.z / self.cell)
+    }
+
+    /// How wet the ground is at `p` (0 to 1), linear between the cells' middles.
+    pub fn wet_at(self, p: vec2) -> f32 {
+        let q = (p - self.lo) / self.cell - vec2(0.5)
+        let f = q - floor(q)
+        let c = vec2i(floor(q))
+        let (nx, nz) = (self.nx, self.nz)
+        let a = mix(
+            wet_of(self.cells[clamped(nx, nz, c.x, c.y)]),
+            wet_of(self.cells[clamped(nx, nz, c.x + 1, c.y)]),
+            f.x,
+        )
+        let b = mix(
+            wet_of(self.cells[clamped(nx, nz, c.x, c.y + 1)]),
+            wet_of(self.cells[clamped(nx, nz, c.x + 1, c.y + 1)]),
+            f.x,
+        )
+        mix(a, b, f.y)
+    }
+
+    /// How much of the relief holds at `p` (0 to 1): all of it more than `collar` metres inside
+    /// the outermost cells' middles, none past them, smoothly between (level at both ends), so a
+    /// terrain that adds `within(p) * rise_at(p)` to the land it was made from meets that land at
+    /// the grid's edges with no step and no crease.
+    pub fn within(self, p: vec2, collar: f32) -> f32 {
+        let first = self.lo + vec2(0.5 * self.cell)
+        let last = self.lo + (vec2(f32(self.nx), f32(self.nz)) - vec2(0.5)) * self.cell
+        let inside = min(p - first, last - p)
+        smoothstep(0.0, collar, inside.x) * smoothstep(0.0, collar, inside.y)
+    }
+}
+
+/// A packed cell's rise (m) and wetness (0 to 1).
+fn rise_of(cell: u32) -> f32 {
+    f32(cell & LOW_24) / RISE_STEPS - RISE_RANGE
+}
+
+fn wet_of(cell: u32) -> f32 {
+    f32(cell >> 24) / 255.0
+}
+
+/// The index of cell (i, j) of a grid `nx` by `nz`, each clamped to it.
+fn clamped(nx: u32, nz: u32, i: i32, j: i32) -> u32 {
+    u32(clamp(j, 0, i32(nz) - 1)) * nx + u32(clamp(i, 0, i32(nx) - 1))
+}
+
+/// Catmull-Rom's weights at `t` (0 to 1) along a span, for the points before it, at its ends and
+/// after it.
+fn catmull_rom(t: f32) -> vec4 {
+    let t2 = t * t
+    let t3 = t2 * t
+    vec4(
+        0.5 * (-t3 + 2.0 * t2 - t),
+        0.5 * (3.0 * t3 - 5.0 * t2 + 2.0),
+        0.5 * (-3.0 * t3 + 4.0 * t2 + t),
+        0.5 * (t3 - t2),
+    )
+}
+
+/// Catmull-Rom's weights' derivatives at `t` (`catmull_rom`'s), per span.
+fn catmull_rom_slope(t: f32) -> vec4 {
+    let t2 = t * t
+    vec4(
+        0.5 * (-3.0 * t2 + 4.0 * t - 1.0),
+        0.5 * (9.0 * t2 - 10.0 * t),
+        0.5 * (-9.0 * t2 + 8.0 * t + 1.0),
+        0.5 * (3.0 * t2 - 2.0 * t),
+    )
+}
+
+// ---- what an agent reads of it ------------------------------------------------------------------
+
+/// A land as an agent surveys it: what its making left (`made`); how much each cell rose or sank
+/// over the land it was made from (m); the heights a game draws over the same grid's cells, the
+/// final surface; the cells its summary counts; and the places found in it, with their names.
+pub struct Survey: Clone {
+    pub made: Landscape,
+    pub rise: Vec<f32>,
+    pub surface: Vec<f32>,
+    pub counted: Vec<bool>,
+    pub places: Vec<Feature>,
+    pub names: Vec<String>,
+}
+
+impl Survey {
+    /// The final surface's summary over the counted cells, its channels those that drain more
+    /// than `channel` m².
+    pub fn summary(self, channel: f32) -> Summary {
+        summary(self.made.grid, self.surface, self.made.area, self.made.base, self.counted, channel)
+    }
+}
+
+/// A land's form at a cell, from its slope and curvature at the grid's scale: flat; a ridge's
+/// crest or a spur running down from one (convex: gently, steeply); an even slope; a hollow or a
+/// valley's floor (concave: steeply, gently); a cliff.
+pub enum Landform: Copy + Eq + Fieldless {
+    Flat,
+    Ridge,
+    Spur,
+    Slope,
+    Hollow,
+    Valley,
+    Cliff,
+}
+
+/// The slope (rise over run) past which a cell is a cliff (about 45°), under which it's flat
+/// (about 3°), and the curvature (1/m, the Laplacian of its heights) past which it's convex or
+/// concave.
+pub const CLIFF: f32 = 1.0
+pub const LEVEL: f32 = 0.05
+pub const CURVED: f32 = 2.0e-4
+
+/// The slope (rise over run) and the curvature (the Laplacian, 1/m; positive in a hollow) of
+/// heights `h` over grid `g` at cell (i, j), by central differences, an edge's one-sided.
+pub fn shape(g: Grid, h: [f32], i: i32, j: i32) -> vec2 {
+    let here = h[g.index(i, j)]
+    let w = h[g.index(i - 1, j)]
+    let e = h[g.index(i + 1, j)]
+    let n = h[g.index(i, j - 1)]
+    let s = h[g.index(i, j + 1)]
+    let dx = (e - w) / (2.0 * g.cell)
+    let dz = (s - n) / (2.0 * g.cell)
+    vec2(length(vec2(dx, dz)), (w + e + n + s - 4.0 * here) / (g.cell * g.cell))
+}
+
+/// The form of heights `h` over grid `g` at cell (i, j).
+pub fn landform(g: Grid, h: [f32], i: i32, j: i32) -> Landform {
+    let sc = shape(g, h, i, j)
+    let (slope, lap) = (sc.x, sc.y)
+    if slope >= CLIFF {
+        Landform::Cliff
+    } else if slope < LEVEL && abs(lap) < CURVED {
+        Landform::Flat
+    } else if lap < -CURVED {
+        if slope < 0.27 { Landform::Ridge } else { Landform::Spur }
+    } else if lap > CURVED {
+        if slope < 0.14 { Landform::Valley } else { Landform::Hollow }
+    } else {
+        Landform::Slope
+    }
+}
+
+/// What a land's heights `h` over grid `g` add up to, over the cells `counted`: their lowest,
+/// highest and mean height (m); its hypsometric integral (where the mean stands between the
+/// lowest and the highest, 0 to 1); how many cells' slopes are under 5°, 15°, 30° and 45° and
+/// past it (shares); its forms' shares, in `Landform`'s order; its drainage density (km of
+/// channel, cells that drain over `channel` m² by `area`, a km²); and its pits, cells with no
+/// lower neighbour that aren't outlets.
+pub struct Summary: Copy {
+    pub low: f32,
+    pub high: f32,
+    pub mean: f32,
+    pub hypsometric: f32,
+    pub slopes: [f32; 5],
+    pub forms: [f32; Landform],
+    pub density: f32,
+    pub pits: u32,
+}
+
+/// The slopes (rise over run) between `Summary::slopes`' shares: 5°, 15°, 30° and 45°.
+const SLOPES = [0.0875, 0.268, 0.577, 1.0]
+
+pub fn summary(
+    g: Grid,
+    h: [f32],
+    area: [f32],
+    outlets: [bool],
+    counted: [bool],
+    channel: f32,
+) -> Summary {
+    var s = Summary {
+        low: 1.0e9,
+        high: -1.0e9,
+        mean: 0.0,
+        hypsometric: 0.0,
+        slopes: [0.0; 5],
+        forms: [0.0; Landform],
+        density: 0.0,
+        pits: 0,
+    }
+    var n = 0
+    var channels = 0
+    for j in 0..g.nz {
+        for i in 0..g.nx {
+            let c = j * g.nx + i
+            if !counted[c] {
+                continue
+            }
+            n += 1
+            s.low = min(s.low, h[c])
+            s.high = max(s.high, h[c])
+            s.mean += h[c]
+            let slope = shape(g, h, i32(i), i32(j)).x
+            var b = 0
+            while b < 4 && slope >= SLOPES[b] {
+                b += 1
+            }
+            s.slopes[b] += 1.0
+            s.forms[landform(g, h, i32(i), i32(j))] += 1.0
+            if area[c] > channel {
+                channels += 1
+            }
+            if !outlets[c] {
+                var lower = false
+                for k in 0..8 {
+                    let q = vec2i(i32(i), i32(j)) + NEIGHBOURS[k]
+                    if q.x >= 0 && q.y >= 0 && q.x < i32(g.nx) && q.y < i32(g.nz) {
+                        lower = lower || h[g.index(q.x, q.y)] < h[c]
+                    }
+                }
+                if !lower {
+                    s.pits += 1
+                }
+            }
+        }
+    }
+    if n == 0 {
+        return s
+    }
+    let count = f32(n)
+    s.mean /= count
+    s.hypsometric = (s.mean - s.low) / max(s.high - s.low, 1.0e-6)
+    for b in 0..5 {
+        s.slopes[b] /= count
+    }
+    for f in 0..7 {
+        s.forms[f] /= count
+    }
+    let km2 = count * g.cell * g.cell * 1.0e-6
+    s.density = f32(channels) * g.cell * 1.0e-3 / km2
+    s
+}
+
+// ---- the places it makes ------------------------------------------------------------------------
+
+/// A kind of place a land's making leaves that draws a walker: a summit, the top of the land
+/// round it; a tor, a knob of hard rock standing over the land round it; an overlook, a crest
+/// over a long drop; falls, where a stream drops over hard rock; a gorge, a stream between steep
+/// walls; a spring, where a stream begins; a lake, where the water stands; a confluence, where
+/// two streams meet.
+pub enum PlaceKind: Copy + Eq + Fieldless {
+    Summit,
+    Tor,
+    Overlook,
+    Falls,
+    Gorge,
+    Spring,
+    Lake,
+    Confluence,
+}
+
+/// A place a land's making left: its kind, where (x, z) and how high, how much it is that kind
+/// (each kind's own measure, `places`'), and which way it faces (unit: down a drop, along a
+/// stream toward where it is ten cells on).
+pub struct Feature: Copy {
+    pub kind: PlaceKind,
+    pub at: vec2,
+    pub height: f32,
+    pub measure: f32,
+    pub toward: vec2,
+}
+
+/// What makes a place: the area (m²) past which water runs in a channel; how far round a summit
+/// it's the highest (m); how much its land round it is lower within that (m, a summit's least);
+/// how far round a tor (m) and how much it stands (m); a tor's rock, as hard as this share of the
+/// land's median erodibility or harder; how far an overlook looks down (m) and how far it drops
+/// within it (m); the least drop of falls (m) over a few cells; a gorge's walls' least height (m)
+/// within how far (m); a lake's least depth (m); a confluence's branches' least area (m²); how far
+/// apart two places of a kind are, at least (m); and how many of each kind, at most.
+pub struct Finding: Copy {
+    pub channel: f32,
+    pub summit_reach: f32,
+    pub summit_rise: f32,
+    pub tor_reach: f32,
+    pub tor_rise: f32,
+    pub tor_hard: f32,
+    pub overlook_reach: f32,
+    pub overlook_drop: f32,
+    pub falls_drop: f32,
+    pub gorge_walls: f32,
+    pub gorge_reach: f32,
+    pub lake_depth: f32,
+    pub confluence_area: f32,
+    pub apart: f32,
+    pub most: u32,
+}
+
+/// The places land `l` left over its cells `counted` (heights `surface`: its final surface, as a
+/// game draws it over the same cells), each kind's best first and at most `f.most` of a kind,
+/// no two of a kind nearer than `f.apart`. Each kind's measure: a summit's, how far the land
+/// within its reach falls below it (m); a tor's, how far it stands over the land within its
+/// reach (m); an overlook's, its drop (m); falls', their drop (m); a gorge's, its lower wall's
+/// height (m); a spring's, the area that gathers to it (m²); a lake's, its depth (m); a
+/// confluence's, its smaller branch's area (m²).
+pub fn places(l: Landscape, surface: [f32], counted: [bool], f: Finding) -> Vec<Feature> {
+    let g = l.grid
+    let (nx, nz) = (g.nx, g.nz)
+    var all: Vec<Feature> = Vec::new()
+    var hard: Vec<f32> = Vec::new()
+    for c in 0..g.cells() {
+        if counted[c] {
+            hard.push(l.erodibility[c])
+        }
+    }
+    hard.sort_by(|a, b| a < b)
+    let median = if hard.is_empty() { 0.0 } else { hard[hard.len() / 2] }
+    let at = |i: i32, j: i32| surface[g.index(i, j)]
+    for c in 0..g.cells() {
+        if !counted[c] {
+            continue
+        }
+        let (i, j) = (i32(c % nx), i32(c / nx))
+        let p = g.centre(c)
+        let h = surface[c]
+        let channel = l.area[c] >= f.channel
+        if !channel {
+            // A summit, a tor: the highest within its reach, standing over the land round it.
+            let (top, low) = reach(g, surface, i, j, f.summit_reach)
+            if top <= h && h - low >= f.summit_rise {
+                all.push(
+                    Feature {
+                        kind: PlaceKind::Summit,
+                        at: p,
+                        height: h,
+                        measure: h - low,
+                        toward: vec2(0.0),
+                    },
+                )
+            }
+            let (ttop, tlow) = reach(g, surface, i, j, f.tor_reach)
+            if ttop <= h && h - tlow >= f.tor_rise && l.erodibility[c] <= f.tor_hard * median {
+                all.push(
+                    Feature {
+                        kind: PlaceKind::Tor,
+                        at: p,
+                        height: h,
+                        measure: h - tlow,
+                        toward: vec2(0.0),
+                    },
+                )
+            }
+            // An overlook: a crest (no neighbour higher) with the land falling far within its reach
+            // one way.
+            let (near_top, _) = reach(g, surface, i, j, g.cell * 1.5)
+            if near_top <= h {
+                var drop = 0.0
+                var toward = vec2(0.0)
+                for k in 0..16 {
+                    let a = std::math::TAU * f32(k) / 16.0
+                    let d = vec2(cos(a), sin(a))
+                    let q = g.ij(p + d * f.overlook_reach)
+                    if q.x >= 0 && q.y >= 0 && q.x < i32(nx) && q.y < i32(nz) {
+                        let fall = h - at(q.x, q.y)
+                        if fall > drop {
+                            drop = fall
+                            toward = d
+                        }
+                    }
+                }
+                if drop >= f.overlook_drop {
+                    all.push(
+                        Feature {
+                            kind: PlaceKind::Overlook,
+                            at: p,
+                            height: h,
+                            measure: drop,
+                            toward,
+                        },
+                    )
+                }
+            }
+            continue
+        }
+        let r = l.down[c]
+        // Which way the stream goes: toward where it is a few cells on, not its next cell only,
+        // so a bend's first step doesn't turn it.
+        var on = c
+        for _ in 0..10 {
+            if l.down[on] != NONE {
+                on = l.down[on]
+            }
+        }
+        let flow = if on != c { normalize(g.centre(on) - p) } else { vec2(0.0) }
+        // Falls: the stream's drop over its next few cells.
+        var q = c
+        var steps = 0
+        while steps < 3 && l.down[q] != NONE {
+            q = l.down[q]
+            steps += 1
+        }
+        let drop = h - surface[q]
+        let run = length(g.centre(q) - p)
+        if steps == 3 && drop >= f.falls_drop && drop > 0.6 * run {
+            all.push(
+                Feature { kind: PlaceKind::Falls, at: p, height: h, measure: drop, toward: flow },
+            )
+        }
+        // A gorge: both its walls, across the stream, high within the gorge's reach.
+        if r != NONE && on != c {
+            let across = vec2(-flow.y, flow.x)
+            var walls = 1.0e9
+            for side in [-1.0, 1.0] {
+                var high = 0.0
+                for k in 1..5 {
+                    let w = g.ij(p + across * side * f.gorge_reach * f32(k) / 4.0)
+                    high = max(high, at(w.x, w.y) - h)
+                }
+                walls = min(walls, high)
+            }
+            if walls >= f.gorge_walls {
+                all.push(
+                    Feature {
+                        kind: PlaceKind::Gorge,
+                        at: p,
+                        height: h,
+                        measure: walls,
+                        toward: flow,
+                    },
+                )
+            }
+        }
+        // A spring: a channel no channel runs into; a confluence: two that run in.
+        var big = 0
+        var least = 1.0e30
+        for k in 0..8 {
+            let n = vec2i(i, j) + NEIGHBOURS[k]
+            if n.x >= 0 && n.y >= 0 && n.x < i32(nx) && n.y < i32(nz) {
+                let d = u32(n.y) * nx + u32(n.x)
+                if l.down[d] == c && l.area[d] >= f.channel {
+                    big += 1
+                    least = min(least, l.area[d])
+                }
+            }
+        }
+        if big == 0 {
+            all.push(
+                Feature {
+                    kind: PlaceKind::Spring,
+                    at: p,
+                    height: h,
+                    measure: l.area[c],
+                    toward: flow,
+                },
+            )
+        } else if big >= 2 && least >= f.confluence_area {
+            all.push(
+                Feature {
+                    kind: PlaceKind::Confluence,
+                    at: p,
+                    height: h,
+                    measure: least,
+                    toward: flow,
+                },
+            )
+        }
+    }
+    for c in 0..g.cells() {
+        if counted[c] && l.lakes[c] >= f.lake_depth {
+            all.push(
+                Feature {
+                    kind: PlaceKind::Lake,
+                    at: g.centre(c),
+                    height: surface[c],
+                    measure: l.lakes[c],
+                    toward: vec2(0.0),
+                },
+            )
+        }
+    }
+    // Each kind's best, apart.
+    all.sort_by(|a, b| a.measure > b.measure)
+    var out: Vec<Feature> = Vec::new()
+    for kind in [
+        PlaceKind::Summit,
+        PlaceKind::Tor,
+        PlaceKind::Overlook,
+        PlaceKind::Falls,
+        PlaceKind::Gorge,
+        PlaceKind::Spring,
+        PlaceKind::Lake,
+        PlaceKind::Confluence,
+    ] {
+        var n = 0
+        for x in all {
+            if x.kind != kind || n >= f.most {
+                continue
+            }
+            var near = false
+            for y in out {
+                near = near || y.kind == kind && length(y.at - x.at) < f.apart
+            }
+            if !near {
+                out.push(x)
+                n += 1
+            }
+        }
+    }
+    out
+}
+
+/// The highest and the lowest of heights `h` over grid `g` within `r` metres of cell (i, j)'s
+/// middle, the cell itself left out.
+fn reach(g: Grid, h: [f32], i: i32, j: i32, r: f32) -> (f32, f32) {
+    let span = i32(ceil(r / g.cell))
+    var top = -1.0e9
+    var low = 1.0e9
+    for dj in -span..(span + 1) {
+        for di in -span..(span + 1) {
+            if (di != 0 || dj != 0) && f32(di * di + dj * dj) * g.cell * g.cell <= r * r {
+                let x = i + di
+                let z = j + dj
+                if x >= 0 && z >= 0 && x < i32(g.nx) && z < i32(g.nz) {
+                    let v = h[u32(z) * g.nx + u32(x)]
+                    top = max(top, v)
+                    low = min(low, v)
+                }
+            }
+        }
+    }
+    (top, low)
+}
+
+// ---- tests --------------------------------------------------------------------------------------
+
+/// A grid `nx` by `nz` cells `cell` metres wide, from the origin.
+fn grid(nx: u32, nz: u32, cell: f32) -> Grid {
+    Grid { lo: vec2(0.0), nx, nz, cell }
+}
+
+/// Whether each cell's receivers lead to an outlet, never round.
+fn drains(g: Grid, d: Drainage, outlets: [bool]) -> bool {
+    for c in 0..g.cells() {
+        var at = c
+        var steps = 0
+        while d.down[at] != NONE && !outlets[at] {
+            at = d.down[at]
+            steps += 1
+            if steps > g.cells() {
+                return false
+            }
+        }
+        if !outlets[at] {
+            return false
+        }
+    }
+    true
+}
+
+@test
+fn a_level_land_drains_to_its_border() {
+    let g = grid(nx: 12, nz: 9, cell: 10.0)
+    let h: Vec<f32> = Vec::filled(g.cells(), 5.0)
+    let outlets = border(g)
+    let d = drainage(g, h, outlets)
+    assert(drains(g, d, outlets))
+    // Every cell's area reaches an outlet, and none twice.
+    var area: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    let down: Vec<u32> = Vec::from_fn(g.cells(), |c| if outlets[c] { NONE } else { d.down[c] })
+    gather(g, d.order, down, mut area)
+    var out = 0.0
+    for c in 0..g.cells() {
+        if outlets[c] {
+            out += area[c]
+        }
+    }
+    assert(out == f32(g.cells()) * 100.0)
+}
+
+@test
+fn a_closed_bowl_spills_by_its_notch() {
+    // A bowl closed on every side but a notch in its west wall: the only outlet is past the
+    // notch, so every cell drains through it.
+    let g = grid(nx: 11, nz: 11, cell: 10.0)
+    var h: Vec<f32> = Vec::from_fn(g.cells(), |c| {
+        let p = vec2(f32(c % 11), f32(c / 11)) - vec2(5.0)
+        0.2 * dot(p, p)
+    })
+    let notch = g.index(i: 0, j: 5)
+    h[g.index(i: 1, j: 5)] = 1.0
+    h[notch] = 0.5
+    var outlets: Vec<bool> = Vec::filled(g.cells(), value: false)
+    outlets[notch] = true
+    let d = drainage(g, h, outlets)
+    assert(drains(g, d, outlets))
+    let down: Vec<u32> = Vec::from_fn(g.cells(), |c| if outlets[c] { NONE } else { d.down[c] })
+    var area: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    gather(g, d.order, down, mut area)
+    assert(area[notch] == f32(g.cells()) * 100.0)
+    // The bowl's floor is filled to spill, each cell a little over the one it drains to.
+    for c in 0..g.cells() {
+        if d.down[c] != NONE && !outlets[c] {
+            assert(d.filled[c] > d.filled[d.down[c]])
+        }
+    }
+}
+
+@test
+fn equal_spills_choose_one_way_and_never_loop() {
+    // Two outlets at the same height either side of a level saddle: each cell drains to one.
+    let g = grid(nx: 9, nz: 3, cell: 10.0)
+    let h: Vec<f32> = Vec::filled(g.cells(), 2.0)
+    var outlets: Vec<bool> = Vec::filled(g.cells(), value: false)
+    outlets[g.index(i: 0, j: 1)] = true
+    outlets[g.index(i: 8, j: 1)] = true
+    let d = drainage(g, h, outlets)
+    assert(drains(g, d, outlets))
+}
+
+@test
+fn creep_damps_a_sine_by_its_exact_factor() {
+    // h = A sin(πi/(n-1)) sin(πj/(n-1)), zero on the held border: the five-point Laplacian's
+    // eigenvalue for it is -8 sin²(π/2(n-1)) / dx², so one explicit step scales every cell by
+    // 1 - 8 a sin²(π/2(n-1)), a = κt/dx².
+    let n = 17
+    let g = grid(n, n, 8.0)
+    let amp = 100.0
+    let w = std::math::PI / f32(n - 1)
+    var h: Vec<f32> = Vec::from_fn(g.cells(), |c| {
+        amp * sin(w * f32(c % n)) * sin(w * f32(c / n))
+    })
+    let before = h.clone()
+    let a = 0.15
+    diffuse(
+        g,
+        mut h,
+        border(g),
+        a * g.cell * g.cell,
+        Vec::filled(g.cells(), 1.0),
+        Vec::filled(g.cells(), 0.0),
+    )
+    let s = sin(0.5 * w)
+    let factor = 1.0 - 8.0 * a * s * s
+    for c in 0..g.cells() {
+        if abs(before[c]) > 1.0 {
+            assert(abs(h[c] / before[c] - factor) < 1.0e-4)
+        }
+    }
+}
+
+/// A channel one cell wide, `n` cells long, its outlet at its west end, raised 1 mm a year: each
+/// cell's own area and all upstream of it drains through it, so its steady slope is U / (K A^m)
+/// exactly (n = 1). Its rock's K is 2e-5, a quarter of that in the cells `hard` (from, to).
+fn channel(n: u32, hard: vec2u) -> Landscape {
+    let g = grid(n, 1, 50.0)
+    let start: Vec<f32> = Vec::filled(n, 0.0)
+    var base: Vec<bool> = Vec::filled(n, value: false)
+    base[0] = true
+    let u: Vec<f32> = Vec::filled(n, 1.0e-3)
+    let s = Shaping { steps: 400, years: 2.0e4, m: 0.5, creep: 0.0 }
+    evolve(
+        g,
+        start,
+        base,
+        u,
+        |p: vec3| {
+            let i = u32(p.x / 50.0)
+            let k = if i >= hard.x && i < hard.y { 0.5e-5 } else { 2.0e-5 }
+            Strength { erodibility: k, standing: 1.0e9, weathering: 0.0 }
+        },
+        s,
+    )
+}
+
+@test
+fn a_channel_reaches_the_stream_power_laws_steady_slope() {
+    let n = 24
+    let l = channel(n, hard: vec2u(0))
+    for i in 1..n {
+        let a = f32(n - i) * 2500.0
+        assert(abs(l.area[i] - a) < 1.0e-3 * a)
+        let slope = (l.heights[i] - l.heights[i - 1]) / 50.0
+        let law = 1.0e-3 / (2.0e-5 * sqrt(a))
+        assert(abs(slope / law - 1.0) < 1.0e-3)
+    }
+}
+
+@test
+fn hard_rock_holds_a_steeper_channel() {
+    // A band four times harder: its slope four times the law's for the soft rock at the same area.
+    let n = 24
+    let l = channel(n, hard: vec2u(10, 14))
+    for i in 10..14 {
+        let a = f32(n - i) * 2500.0
+        let slope = (l.heights[i] - l.heights[i - 1]) / 50.0
+        let soft = 1.0e-3 / (2.0e-5 * sqrt(a))
+        assert(abs(slope / (4.0 * soft) - 1.0) < 1.0e-3)
+    }
+}
+
+@test
+fn a_relief_passes_through_its_cells_and_fades_at_its_edges() {
+    let g = Grid { lo: vec2(-100.0, 40.0), nx: 6, nz: 5, cell: 20.0 }
+    let from: Vec<f32> = Vec::filled(30, 3.0)
+    let heights: Vec<f32> = Vec::from_fn(30, |c| 3.0 + f32(c % 7) * 1.5 - f32(c / 6))
+    var area: Vec<f32> = Vec::filled(30, 400.0)
+    area[14] = WET_AREA
+    let l = Landscape {
+        grid: g,
+        heights,
+        down: Vec::filled(30, NONE),
+        area,
+        uplift: Vec::filled(30, 0.0),
+        erodibility: Vec::filled(30, 0.0),
+        base: Vec::filled(30, value: false),
+        lakes: Vec::filled(30, 0.0),
+    }
+    let r: Relief<30> = Relief::of(l, from)
+    for c in 0..30 {
+        let p = g.centre(c)
+        assert(abs(r.rise_at(p) - (l.heights[c] - 3.0)) < 1.0e-3)
+    }
+    assert(r.wet(14) == 1.0 && r.wet(0) == 0.0)
+    // A rise packs to within half a step, and no relief is no rise.
+    assert(abs(r.rise(7) - (l.heights[7] - 3.0)) <= 0.5 / RISE_STEPS)
+    // Its slope is the spline's: central differences of the rise agree.
+    for c in 0..30 {
+        let p = g.centre(c) + vec2(3.7, -5.1)
+        let grad = r.rise_grad(p)
+        let e = 0.01
+        let dx = (r.rise_at(p + vec2(e, 0.0)) - r.rise_at(p - vec2(e, 0.0))) / (2.0 * e)
+        let dz = (r.rise_at(p + vec2(0.0, e)) - r.rise_at(p - vec2(0.0, e))) / (2.0 * e)
+        assert(
+            abs(grad.x - r.rise_at(p)) < 1.0e-4 &&
+                abs(grad.y - dx) < 2.0e-2 &&
+                abs(grad.z - dz) < 2.0e-2,
+        )
+    }
+    let none: Relief<30> = Relief::none(g)
+    assert(none.rise_at(g.centre(14)) == 0.0 && none.wet_at(g.centre(14)) == 0.0)
+    // None of it holds on the outermost cells' middles or past them, all of it a collar in.
+    assert(r.within(g.centre(0), 15.0) == 0.0)
+    assert(r.within(vec2(-200.0, 0.0), 15.0) == 0.0)
+    assert(r.within(g.centre(g.index(i: 2, j: 2)), 15.0) == 1.0)
+}
+
+@test
+fn a_summary_counts_forms_slopes_and_pits() {
+    // A cone: its sides are slopes, its top a ridge; no pits but the outlets on its border.
+    let g = grid(nx: 21, nz: 21, cell: 10.0)
+    let h: Vec<f32> = Vec::from_fn(g.cells(), |c| {
+        let p = vec2(f32(c % 21), f32(c / 21)) - vec2(10.0)
+        60.0 - 2.0 * length(p)
+    })
+    let outlets = border(g)
+    let all: Vec<bool> = Vec::filled(g.cells(), value: true)
+    let d = drainage(g, h, outlets)
+    let down: Vec<u32> = Vec::from_fn(g.cells(), |c| if outlets[c] { NONE } else { d.down[c] })
+    var area: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    gather(g, d.order, down, mut area)
+    let s = summary(g, h, area, outlets, all, 1.0e9)
+    assert(s.pits == 0 && s.density == 0.0)
+    assert(s.high == 60.0)
+    // The cone's sides are a slope of 0.2, between 5° and 15°.
+    assert(s.slopes[1] > 0.8)
+    var forms = 0.0
+    for f in s.forms {
+        forms += f
+    }
+    assert(abs(forms - 1.0) < 1.0e-5)
+}
+
+/// Nonlinear creep runs faster as a slope nears its critical one: the crest of a ridge whose sides
+/// fall at 0.8 of it loses 1 / (1 - 0.8²) times what linear creep takes from it.
+@test
+fn creep_runs_faster_as_a_slope_nears_its_critical_one() {
+    let g = grid(nx: 9, nz: 9, cell: 1.0)
+    let ridge: Vec<f32> = Vec::from_fn(81, |c| -0.8 * abs(f32(c % 9) - 4.0))
+    let held: Vec<bool> = Vec::filled(81, value: false)
+    var linear = ridge.clone()
+    diffuse(g, mut linear, held, 0.01, Vec::filled(81, 1.0), Vec::filled(81, 0.0))
+    var steep = ridge.clone()
+    diffuse(g, mut steep, held, 0.01, Vec::filled(81, 1.0), Vec::filled(81, 1.0))
+    let c = 4 * 9 + 4
+    let ratio = (steep[c] - ridge[c]) / (linear[c] - ridge[c])
+    assert(abs(ratio - 1.0 / (1.0 - 0.64)) < 1.0e-3, f"the crest crept {ratio} times as fast")
+}
+
+/// Faces scattered fail at their rock's slope give or take: over many steps, the same wall falls
+/// to different slopes from cell to cell, all within the scatter of its rock's.
+@test
+fn scattered_faces_fail_at_their_rocks_slope_give_or_take() {
+    let g = grid(nx: 40, nz: 6, cell: 8.0)
+    var h: Vec<f32> = Vec::from_fn(g.cells(), |c| if c % 40 < 20 { 40.0 } else { 0.0 })
+    let held: Vec<bool> = Vec::filled(g.cells(), value: false)
+    let soft = |p: vec3| Strength { erodibility: 0.0, standing: 0.6, weathering: 1.0e9 }
+    for step in 0..200 {
+        collapse(g, mut h, held, soft, passes: 2, years: 1.0, scatter: 0.4, step: step)
+    }
+    var lo = 1.0e9
+    var hi = 0.0
+    for j in 0..6 {
+        var steepest = 0.0
+        for i in 1..40 {
+            let c = j * 40 + i
+            steepest = max(steepest, abs(h[c] - h[c - 1]) / 8.0)
+        }
+        assert(steepest <= 0.6 * 1.2 + 0.05, f"row {j} stands at {steepest}")
+        lo = min(lo, steepest)
+        hi = max(hi, steepest)
+    }
+    assert(hi - lo > 0.01, "every row fell to the same slope")
+}
+
+/// A wall 40 m high in soft rock (it stands at 0.6) falls to a slope it stands at, and keeps the
+/// material it had; in hard rock (it stands at 5), the same wall stands.
+@test
+fn soft_walls_fall_to_their_rocks_slope_and_hard_ones_stand() {
+    let g = grid(nx: 40, nz: 3, cell: 8.0)
+    let wall: Vec<f32> = Vec::from_fn(g.cells(), |c| if c % 40 < 20 { 40.0 } else { 0.0 })
+    let held: Vec<bool> = Vec::filled(g.cells(), value: false)
+    var soft = wall.clone()
+    let soft_rock = |p: vec3| Strength { erodibility: 0.0, standing: 0.6, weathering: 1.0e9 }
+    collapse(g, mut soft, held, soft_rock, passes: 400, years: 1.0)
+    var before = 0.0
+    var after = 0.0
+    for c in 0..g.cells() {
+        before += wall[c]
+        after += soft[c]
+    }
+    assert(abs(after - before) < 1.0e-2 * before, "the fall lost material")
+    for j in 0..3 {
+        for i in 1..40 {
+            let c = j * 40 + i
+            assert(
+                abs(soft[c] - soft[c - 1]) / 8.0 <= 0.6 + 0.05,
+                f"a slope stands too steep at {i}",
+            )
+        }
+    }
+    var hard = wall.clone()
+    let hard_rock = |p: vec3| Strength { erodibility: 0.0, standing: 5.0, weathering: 1.0e9 }
+    collapse(g, mut hard, held, hard_rock, passes: 400, years: 1.0)
+    for c in 0..g.cells() {
+        assert(hard[c] == wall[c], "a hard wall fell")
+    }
+}
+
+/// Hard rock over soft: a wall that cuts down through both stands where it's in the hard cap and
+/// falls back where it's in the soft rock under it, as a cap's cliff over its talus.
+@test
+fn a_hard_cap_stands_over_soft_rock_that_falls() {
+    let g = grid(nx: 60, nz: 1, cell: 4.0)
+    var h: Vec<f32> = Vec::from_fn(60, |i| if i < 30 { 60.0 } else { 0.0 })
+    let held: Vec<bool> = Vec::filled(60, value: false)
+    // The cap: the top 12 m, from 48 m up.
+    collapse(
+        g,
+        mut h,
+        held,
+        |p: vec3| Strength {
+            erodibility: 0.0,
+            standing: if p.y > 48.0 { 8.0 } else { 0.5 },
+            weathering: 1.0e9,
+        },
+        passes: 2000,
+        years: 1.0,
+    )
+    var cliff = false
+    for i in 1..60 {
+        let slope = (h[i - 1] - h[i]) / 4.0
+        if h[i - 1] > 52.0 && slope > 2.0 {
+            cliff = true
+        }
+        if h[i - 1] < 47.0 {
+            assert(slope <= 0.55, f"soft rock stands at {slope} at {i}")
+        }
+    }
+    assert(cliff, "the cap's cliff fell")
+}
+
+/// A cone of hard rock in a level land, a channel along a row and a lake: the cone's top is a
+/// summit, a tor and an overlook; the channel's first cell its spring; the lake a lake.
+@test
+fn a_lands_places_are_found_where_its_forms_are() {
+    let g = grid(nx: 64, nz: 64, cell: 8.0)
+    let top = g.index(i: 16, j: 16)
+    let heights: Vec<f32> = Vec::from_fn(g.cells(), |c| {
+        let d = length(g.centre(c) - g.centre(top))
+        max(60.0 - 0.5 * d, 0.0)
+    })
+    var down: Vec<u32> = Vec::filled(g.cells(), NONE)
+    var area: Vec<f32> = Vec::filled(g.cells(), 64.0)
+    for i in 1..51 {
+        let c = g.index(i, j: 40)
+        down[c] = c - 1
+        area[c] = f32(51 - i) * 4.0e3
+    }
+    var lakes: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    lakes[g.index(i: 50, j: 52)] = 2.0
+    let l = Landscape {
+        grid: g,
+        heights: heights.clone(),
+        down,
+        area,
+        uplift: Vec::filled(g.cells(), 0.0),
+        erodibility: Vec::from_fn(g.cells(), |c| if c == top { 1.0e-7 } else { 1.0e-5 }),
+        base: Vec::filled(g.cells(), value: false),
+        lakes,
+    }
+    let all: Vec<bool> = Vec::filled(g.cells(), value: true)
+    let f = Finding {
+        channel: 1.0e4,
+        summit_reach: 120.0,
+        summit_rise: 20.0,
+        tor_reach: 24.0,
+        tor_rise: 5.0,
+        tor_hard: 0.5,
+        overlook_reach: 80.0,
+        overlook_drop: 30.0,
+        falls_drop: 50.0,
+        gorge_walls: 50.0,
+        gorge_reach: 40.0,
+        lake_depth: 1.0,
+        confluence_area: 1.0e9,
+        apart: 100.0,
+        most: 4,
+    }
+    let found = places(l, heights, all, f)
+    let has = |kind: PlaceKind, at: vec2| {
+        var yes = false
+        for x in found {
+            yes = yes || x.kind == kind && length(x.at - at) < 1.0
+        }
+        yes
+    }
+    assert(has(PlaceKind::Summit, g.centre(top)), "the cone's top is no summit")
+    assert(has(PlaceKind::Tor, g.centre(top)), "the cone's hard top is no tor")
+    assert(has(PlaceKind::Overlook, g.centre(top)), "the cone's top overlooks nothing")
+    assert(has(PlaceKind::Spring, g.centre(g.index(i: 48, j: 40))), "the channel has no spring")
+    assert(has(PlaceKind::Lake, g.centre(g.index(i: 50, j: 52))), "the lake isn't found")
+    for x in found {
+        assert(
+            x.kind != PlaceKind::Falls && x.kind != PlaceKind::Gorge,
+            "a level channel has falls",
+        )
+    }
+}
+
+/// A face fails no faster than its rock weathers: over a year at 0.01 m a year, a wall that would
+/// fall 20 m sheds 0.01 m from its top.
+@test
+fn a_face_fails_no_faster_than_its_rock_weathers() {
+    let g = grid(nx: 4, nz: 1, cell: 8.0)
+    var h: Vec<f32> = Vec::from([40.0, 40.0, 0.0, 0.0])
+    let held: Vec<bool> = Vec::filled(4, value: false)
+    let slow = |p: vec3| Strength { erodibility: 0.0, standing: 0.6, weathering: 0.01 }
+    collapse(g, mut h, held, slow, passes: 1, years: 1.0)
+    assert(abs(h[1] - 39.99) < 1.0e-4 && abs(h[2] - 0.01) < 1.0e-4)
+}
+
+/// Where less water gathers than a channel needs, a slope isn't cut: a strip whose cells drain
+/// less than that holds; one that drains more is cut.
+@test
+fn only_water_enough_for_a_channel_cuts() {
+    let g = grid(nx: 8, nz: 1, cell: 10.0)
+    let slope: Vec<f32> = Vec::from_fn(8, |i| f32(i) * 5.0)
+    var base: Vec<bool> = Vec::filled(8, value: false)
+    base[0] = true
+    let still: Vec<f32> = Vec::filled(8, 0.0)
+    let rock = |p: vec3| Strength { erodibility: 1.0e-4, standing: 1.0e9, weathering: 0.0 }
+    let dry = Shaping { steps: 10, years: 1000.0, m: 0.5, creep: 0.0, channel: 1.0e4 }
+    let held = evolve(g, slope, base, still, rock, dry)
+    for i in 0..8 {
+        assert(abs(held.heights[i] - slope[i]) < 0.01, "a slope with no channel was cut")
+    }
+    let wet = Shaping { channel: 100.0, ..dry }
+    let cut = evolve(g, slope, base, still, rock, wet)
+    assert(cut.heights[7] < slope[7] - 1.0, "a channel didn't cut")
+}
+
+/// Bare hard rock doesn't creep: a bump of rock whose `ease` is 0 keeps its shape while the same
+/// bump in soil spreads, and what it loses its neighbours gain.
+@test
+fn hard_rock_does_not_creep_and_soil_does() {
+    let g = grid(nx: 9, nz: 9, cell: 4.0)
+    let bump: Vec<f32> = Vec::from_fn(81, |c| if c == 40 { 10.0 } else { 0.0 })
+    let held: Vec<bool> = Vec::filled(81, value: false)
+    var rock = bump.clone()
+    diffuse(g, mut rock, held, 2.0, Vec::filled(81, 0.0), Vec::filled(81, 0.0))
+    assert(rock[40] == 10.0, "hard rock crept")
+    var soil = bump.clone()
+    diffuse(g, mut soil, held, 2.0, Vec::filled(81, 1.0), Vec::filled(81, 0.0))
+    var total = 0.0
+    for v in soil {
+        total += v
+    }
+    assert(soil[40] < 10.0 && abs(total - 10.0) < 1.0e-4, "soil didn't creep, or lost material")
+}
+
+/// What the water cuts it carries down and lays where its load is heavy, losing none: a channel
+/// cut from a steep reach into a level one lays some of its load on the level reach, and what it
+/// laid and what left the land add up to what it cut.
+@test
+fn what_is_cut_is_laid_down_or_carried_away() {
+    let g = grid(nx: 12, nz: 1, cell: 10.0)
+    // Level for its first six cells from its outlet, then steep.
+    let was: Vec<f32> = Vec::from_fn(12, |i| if i < 6 { f32(i) * 0.01 } else { f32(i - 5) * 4.0 })
+    var h = was.clone()
+    var down: Vec<u32> = Vec::filled(12, NONE)
+    var area: Vec<f32> = Vec::filled(12, 100.0)
+    for i in 1..12 {
+        down[i] = i - 1
+        area[i] = f32(12 - i) * 100.0
+    }
+    area[0] = 1200.0
+    // The flood's order: each cell after its receiver.
+    let order: Vec<u32> = Vec::from_fn(12, |i| i)
+    // The steep reach cut 2 m a cell.
+    for i in 6..12 {
+        h[i] -= 2.0
+    }
+    let cut = h.clone()
+    settle(g, order, down, area, was, laying: 0.5, h: mut h)
+    var laid = 0.0
+    for i in 0..12 {
+        laid += (h[i] - cut[i]) * 100.0
+    }
+    assert(laid > 0.0, "nothing was laid down")
+    var level = 0.0
+    for i in 1..6 {
+        level += h[i] - cut[i]
+    }
+    assert(level > 0.0, "the level reach took none of the load")
+    // What left by the outlet: what reached it, which it can't lay (it has no receiver).
+    assert(laid <= 6.0 * 2.0 * 100.0 + 1.0e-3, "more was laid than was cut")
+    for i in 1..12 {
+        assert(h[i] > h[i - 1] - 1.0e-5 || i < 6, "a laid cell stands over its donor")
+    }
+}
+
+/// Land `h` over grid `g` as its water leaves it, unmade: drained to its border, its pits filled
+/// and their fill its lakes (as `evolve` leaves a land).
+fn still(g: Grid, h: [f32]) -> Landscape {
+    let outlets = border(g)
+    let d = drainage(g, h, outlets)
+    let down: Vec<u32> = Vec::from_fn(g.cells(), |c| if outlets[c] { NONE } else { d.down[c] })
+    var area: Vec<f32> = Vec::filled(g.cells(), 0.0)
+    gather(g, d.order, down, mut area)
+    Landscape {
+        grid: g,
+        heights: Vec::from_fn(g.cells(), |c| d.filled[c]),
+        down,
+        area,
+        uplift: Vec::filled(g.cells(), 0.0),
+        erodibility: Vec::filled(g.cells(), 0.0),
+        base: outlets,
+        lakes: Vec::from_fn(g.cells(), |c| if d.filled[c] - h[c] > LAKE {
+            d.filled[c] - h[c]
+        } else { 0.0 }),
+    }
+}
+
+/// Two bowls a cell's divide apart, and two touching only corner to corner, are each its own lake,
+/// each at the level its pit was filled to.
+@test
+fn lakes_a_divide_apart_are_two_basins() {
+    let g = grid(nx: 13, nz: 7, cell: 10.0)
+    // A plain falling west, with two pits in it: x 2..4 and x 6..8 (a divide at x 5), each 3 deep;
+    // and two cells meeting corner to corner at (10, 2) and (11, 3).
+    var h: Vec<f32> = Vec::from_fn(g.cells(), |c| 20.0 + 0.5 * f32(c % 13))
+    for c in 0..g.cells() {
+        let (i, j) = (c % 13, c / 13)
+        if j >= 2 && j <= 4 && ((i >= 2 && i <= 4) || (i >= 6 && i <= 8)) {
+            h[c] -= 3.0
+        }
+    }
+    h[2 * 13 + 10] -= 3.0
+    h[3 * 13 + 11] -= 3.0
+    let l = still(g, h)
+    let b = basins(l)
+    let (west, east) = (b.of[3 * 13 + 3], b.of[3 * 13 + 7])
+    assert(west != NONE && east != NONE && west != east, "the divided bowls are one lake")
+    assert(b.of[3 * 13 + 5] == NONE, "a lake over the divide")
+    assert(b.of[2 * 13 + 10] != b.of[3 * 13 + 11], "corner-to-corner cells are one lake")
+    for c in 0..g.cells() {
+        if b.of[c] != NONE {
+            assert(abs(l.heights[c] - b.level[b.of[c]]) < 0.05, "a lake's cell off its level")
+        }
+    }
+}
+
+/// The channels cover every channel cell outside a lake, the reach below a lake's spill among them
+/// (its head is where it leaves the lake), and a tributary ends on the stream it joins.
+@test
+fn channels_run_on_past_a_lake_and_join_where_they_meet() {
+    // A valley falling south (j) to its border, its floor at i = 6; a bowl across the floor at
+    // j 4..6; and a side valley joining from the east at j = 12.
+    let g = grid(nx: 13, nz: 20, cell: 10.0)
+    var h: Vec<f32> = Vec::from_fn(g.cells(), |c| {
+        let (i, j) = (f32(c % 13), f32(c / 13))
+        60.0 - 2.0 * j + 3.0 * abs(i - 6.0)
+    })
+    for c in 0..g.cells() {
+        let (i, j) = (c % 13, c / 13)
+        if j >= 4 && j <= 6 && i >= 5 && i <= 7 {
+            h[c] -= 6.0
+        }
+        if j == 12 && i > 6 {
+            h[c] -= 2.5 * f32(i - 6)
+        }
+    }
+    let l = still(g, h)
+    let b = basins(l)
+    assert(b.of[5 * 13 + 6] != NONE, "no lake in the bowl")
+    let courses = channels(l, 300.0, b)
+    var covered: Vec<bool> = Vec::filled(g.cells(), value: false)
+    for course in courses {
+        for c in course {
+            covered[c] = true
+        }
+    }
+    var below = false
+    for c in 0..g.cells() {
+        if l.area[c] >= 300.0 && b.of[c] == NONE {
+            assert(covered[c], f"channel cell {c} in no course")
+            below = below || (c / 13 > 7 && c % 13 == 6)
+        }
+    }
+    assert(below, "no channel below the lake")
+    // Each course ends in a lake, at an outlet, or on a cell of another course.
+    for k in 0..courses.len() {
+        let last = courses[k][courses[k].len() - 1]
+        var on = b.of[last] != NONE || l.down[last] == NONE
+        for m in 0..courses.len() {
+            if m != k {
+                for c in courses[m] {
+                    on = on || c == last
+                }
+            }
+        }
+        assert(on, f"course {k} ends nowhere")
+    }
+}

@@ -1,0 +1,53 @@
+// The grazer's walk cycle (spike 01's `pose`, grazer.js), as its type's `Poser`: run on the GPU,
+// one invocation per bone (#43 §8.1). An instance's pose is its gait phase and how far its head
+// is down; the cycle is a pelvis sway, the neck and head set by the head's lowering, a tail wave,
+// legs in a lateral-sequence walk, and a root bob.
+
+use engine::render::Poser
+use grazer::{HEAD, LEG0, NECK0, PELVIS, TAIL0}
+use std::math::TAU
+use std::transform::{identity, rotate_x, rotate_y, rotate_z, translate}
+
+/// The walk. A pose is (phase, head down, unused, unused).
+pub struct Walk: Copy + GpuData {}
+
+impl Poser for Walk {
+    fn local(self, bone: u32, pose: vec4) -> mat4 {
+        let phi = pose.x
+        let head_down = pose.y
+        if bone == PELVIS {
+            return rotate_x(0.02 * sin(2.0 * TAU * phi)) * rotate_z(0.03 * sin(TAU * phi))
+        }
+        if bone >= NECK0 && bone < HEAD {
+            let i = f32(bone - NECK0)
+            return rotate_x(head_down * 0.22 + 0.04 * sin(2.0 * TAU * phi + i * 0.5))
+        }
+        if bone == HEAD {
+            return rotate_x(-head_down * 0.3)
+        }
+        if bone >= TAIL0 && bone < LEG0 {
+            let i = f32(bone - TAIL0)
+            return rotate_y(0.15 * sin(TAU * phi - i * 0.6) * (i + 1.0) / 6.0) * rotate_x(0.05 * i)
+        }
+        if bone >= LEG0 && bone < LEG0 + 16 {
+            // A lateral-sequence walk: each leg a quarter of the cycle after the last.
+            let l = (bone - LEG0) / 4
+            let k = (bone - LEG0) % 4
+            let c = TAU * (phi + [0.25, 0.75, 0.0, 0.5][l])
+            let flex = max(0.0, -cos(c))
+            let fore = if l < 2 { 1.0 } else { -1.0 }
+            return if k == 0 { rotate_x(-0.30 * sin(c)) } else if k == 1 {
+                rotate_x(0.45 * flex * fore)
+            } else if k == 2 {
+                rotate_x(-0.5 * flex * fore)
+            } else { rotate_x(-0.2 * flex) }
+        }
+        identity()
+    }
+
+    /// The root bobs twice a cycle.
+    fn root(self, at: vec3, heading: f32, pose: vec4) -> mat4 {
+        let bob = 2.5cm * cos(2.0 * TAU * pose.x)
+        translate(vec3(at.x, at.y - bob, at.z)) * rotate_y(heading)
+    }
+}

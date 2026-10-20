@@ -1,0 +1,1779 @@
+// Plants: trees and shrubs as fields, authored like creatures, and cooked on the GPU into leaf
+// cards that the renderer draws.
+//
+// A plant is limbs (tapered tubes along curves) and a crown (clumps of leaves on the limbs,
+// blended into one soft field). Start with `plant` (its `Leaves` and `Bark`), then add limbs
+// (`Plant::limb`) and clumps (`Plant::clump`). Its leaf kind, card size and colours are
+// parameters. Its field is a `Surface`, so the lens draws it, probes it and drags its literals.
+//
+// Cooking a plant (once, on the GPU: `cook_cards`) turns its crown into leaf cards. Each card is
+// a cluster of leaves cut from a square by `discard`, placed over the clumps' surfaces, with the
+// crown's normal there and how deep in the crown it is (from the crown's field). The cards come
+// in three nested levels (`CARD_LEVELS`): level L draws the first half^L of them, each
+// sqrt(2)^L times its own size, so every level covers the crown as often, with far fewer cards
+// and no visible loss. Each level's own share is spread over all the clumps, so the first cards
+// are a coarse crown.
+//
+// A plant is cooked once as a kind; the world places instances of it (`Instance`: where,
+// turned, scaled, tinted). Near instances draw their kind's cards and limbs; impostors and
+// volumes stand in farther away (`vegetation`, `impostor`). The wind (`Wind`, `sway`) moves
+// every instance.
+
+use noise::{direction, hash2, pick, rand}
+use std::field::{Surface, PartName, Tube, unnamed}
+use std::gpu::{
+    ClipPosition, FragCoord, GlobalId, Oct32, Rgba8, Sampler, Slots, Texture, Unorm8x4, VertexIndex,
+    begin_pass, draw, texture,
+}
+use std::math::{PI, TAU}
+
+/// A clump of leaves on a limb: a sphere of them `radius` across, or, `squash` below 1, a
+/// cushion: as wide, `squash` as tall, so a broad lit top over a flat shaded underside.
+pub struct Clump: Copy + GpuData {
+    pub centre: vec3,
+    pub radius: f32,
+    pub squash: f32 = 1.0,
+}
+
+impl Clump {
+    /// How far `p` is outside it (m; below 0 inside): exact on its axes, and for a sphere.
+    pub fn distance(self, p: vec3) -> f32 {
+        let v = p - self.centre
+        let l = length(vec3(v.x, v.y / self.squash, v.z))
+        if l == 0.0 {
+            return -self.radius * min(self.squash, 1.0)
+        }
+        // In its unsquashed frame `p` is `l - radius` out; back in the world that's as much
+        // shorter as the ray from its centre is.
+        (l - self.radius) * length(v) / l
+    }
+
+    /// Its surface's normal at the point nearest `p` (unit).
+    pub fn normal(self, p: vec3) -> vec3 {
+        let v = p - self.centre
+        let n = vec3(v.x, v.y / (self.squash * self.squash), v.z)
+        let l = length(n)
+        if l < 1.0e-4 { vec3(0.0, 1.0, 0.0) } else { n / l }
+    }
+
+    /// The point of its surface (at `at` of its radius) in direction `dir` from its centre.
+    pub fn point(self, dir: vec3, at: f32) -> vec3 {
+        self.centre + vec3(dir.x, dir.y * self.squash, dir.z) * (self.radius * at)
+    }
+
+    /// Its surface's area over a sphere's of its radius: 1 for a sphere, less for a cushion
+    /// (a spheroid's, within a few per cent).
+    pub fn area_share(self) -> f32 {
+        pow((1.0 + 2.0 * pow(self.squash, 1.6)) / 3.0, 1.0 / 1.6)
+    }
+}
+
+/// A plant's leaves: a card's width at the nearest level (m), how many times the cards cover
+/// each clump's surface, the colours of young (lit) and old (deep) leaves and of the light
+/// they pass, linear, and how many leaves a card holds.
+pub struct Leaves: Copy + GpuData {
+    pub young: vec3 = vec3(0.17, 0.25, 0.035),
+    pub size: f32 = 0.9,
+    pub old: vec3 = vec3(0.045, 0.10, 0.03),
+    pub cover: f32 = 1.7,
+    pub through: vec3 = vec3(0.11, 0.16, 0.02),
+    pub per_card: u32 = 6,
+}
+
+impl Leaves {
+    /// About how wide one of its leaves is (m): a card's width over its leaves along a side.
+    pub fn leaf_width(self) -> f32 {
+        self.size / sqrt(f32(self.per_card))
+    }
+}
+
+/// A plant's bark: its dark and light tones, and its moss, linear; its grain: the shares of the
+/// cooked patterns (`cook_ridges`) in its tone: ridges (furrows that run along it: oak, alder),
+/// plates (scales with dark cracks between: pine, char) and mottle (soft patches on smooth
+/// bark: beech), adding to 1; how dark its bands mark it (birch's lenticels: short dark dashes
+/// across it), and how much its pattern turns its surface (0: smooth).
+pub struct Bark: Copy + GpuData {
+    pub dark: vec3 = vec3(0.16, 0.12, 0.09),
+    pub relief: f32 = 0.9,
+    pub light: vec3 = vec3(0.30, 0.25, 0.19),
+    pub bands: f32 = 0.0,
+    pub moss: vec3 = vec3(0.07, 0.085, 0.04),
+    pub grain: vec3 = vec3(1.0, 0.0, 0.0),
+    /// Another bark low on its trunk (rgb: its colour, its fissures the ridges'; w: how high it
+    /// reaches, m of the plant as it's built; 0 none): a pine's grey plates under its orange, a
+    /// birch's black fissured foot.
+    pub foot: vec4 = vec4(0.0),
+    /// Lichen in its pale patches (rgb, and w how much).
+    pub lichen: vec4 = vec4(0.0),
+}
+
+impl Bark {
+    /// Its tone (0 dark to 1 light) where the cooked patterns read `t` (`cook_ridges`'s texel).
+    pub fn tone(self, t: vec4) -> f32 {
+        let g = self.grain
+        let tone = (t.r * g.x + t.g * g.y + t.a * g.z) / max(g.x + g.y + g.z, 1.0e-4)
+        tone * (1.0 - self.bands * (1.0 - t.b))
+    }
+
+    /// How far its pattern raises its surface at `t` (-0.5 in a furrow or crack to 0.5 on a
+    /// ridge), times its relief.
+    pub fn raised(self, t: vec4) -> f32 {
+        let g = self.grain
+        let h = (t.r * g.x + t.g * g.y + t.a * g.z * 0.3) / max(g.x + g.y + g.z, 1.0e-4)
+        (h - 0.5) * self.relief
+    }
+}
+
+/// The most limbs and clumps a plant has (a crown of fine clumps over its whole shell takes over
+/// a hundred, and the branches that carry them out to it over thirty).
+pub const MAX_LIMBS: u32 = 48
+pub const MAX_CLUMPS: u32 = 128
+
+/// A plant: limbs (tubes through four points each) and a crown of clumps, in the plant's own
+/// frame (its base at the origin, +y up).
+pub struct Plant: Copy + GpuData {
+    pub limbs: Bounded<Tube<4>, MAX_LIMBS>,
+    pub clumps: Bounded<Clump, MAX_CLUMPS>,
+    pub leaves: Leaves,
+    pub bark: Bark,
+    /// How softly the crown's clumps blend (positive, per metre: higher is harder).
+    pub blend: f32,
+}
+
+/// A plant with no limbs or clumps yet, its leaves and bark as given.
+pub fn plant(leaves: Leaves, bark: Bark) -> Plant {
+    Plant { limbs: Bounded::new(), clumps: Bounded::new(), leaves, bark, blend: 1.1 }
+}
+
+impl Plant {
+    /// A limb from `from` to `to`, bending toward `bend` (a quadratic curve), its radius
+    /// `r_from` at its start and `r_to` at its end.
+    pub fn limb(mut self, from: vec3, bend: vec3, to: vec3, r_from: f32, r_to: f32) {
+        var points = [vec3(0.0); 4]
+        var radii = [0.0; 4]
+        for i in 0..4 {
+            let t = f32(i) / 3.0
+            let a = mix(from, bend, vec3(t))
+            let b = mix(bend, to, vec3(t))
+            points[i] = mix(a, b, vec3(t))
+            radii[i] = mix(r_from, r_to, t)
+        }
+        if !self.limbs.is_full() {
+            self.limbs.push(Tube { points, radii })
+        }
+    }
+
+    /// A limb through four points, its radius at each given: a trunk that flares at its root
+    /// and tapers in one tube, with no seam where two tubes cross.
+    pub fn tube(mut self, points: [vec3; 4], radii: [f32; 4]) {
+        if !self.limbs.is_full() {
+            self.limbs.push(Tube { points, radii })
+        }
+    }
+
+    /// A branch with a short collar that follows its parent's axis before turning outward.
+    /// The collar broadens below the shoulder, then the child tapers toward its tip.
+    pub fn branch(
+        mut self,
+        from: vec3,
+        parent: vec3,
+        bend: vec3,
+        to: vec3,
+        r_from: f32,
+        r_to: f32,
+    ) {
+        let span = length(to - from)
+        let out = limb_direction(to - from, parent)
+        let neck = limb_direction(parent * 0.7 + out * 0.3, out)
+        // The shoulder is a control of the whole path, not a short segment followed by
+        // a mandatory elbow. Sample a cubic so each authored chord already turns gently.
+        let shoulder = from + neck * (span * 0.3)
+        let outward = mix(bend, to, vec3(0.5))
+        var points = [from; 4]
+        var radii = [r_from; 4]
+        for i in 0..4 {
+            let t = f32(i) / 3.0
+            let u = 1.0 - t
+            points[i] = from * (u * u * u) +
+                shoulder * (3.0 * u * u * t) +
+                outward * (3.0 * u * t * t) +
+                to * (t * t * t)
+            radii[i] = mix(r_from * 1.08, r_to, t)
+        }
+        self.tube(points, radii)
+    }
+
+    /// A root: a buttress grown from a trunk `girth` thick (m) standing at `foot`, swelling down
+    /// from it toward `dir` in a hollow curve, running a little way along the ground, winding by
+    /// `across`, and diving under it `out` metres out; `r` thick where it leaves the trunk.
+    /// (Straight ramps from the trunk into the ground, all alike, read as radial wedges.)
+    pub fn root(mut self, foot: vec3, dir: vec3, girth: f32, out: f32, across: vec3, r: f32) {
+        self.tube(
+            [
+                foot + vec3(0.0, girth * 1.7, 0.0) + dir * (girth * 0.3),
+                foot + dir * (girth * 0.95) + vec3(0.0, girth * 0.5, 0.0),
+                foot + dir * (out * 0.62) + across * 0.5 + vec3(0.0, girth * 0.02, 0.0),
+                foot + dir * out + across + vec3(0.0, -0.35, 0.0),
+            ],
+            [r * 0.8, r * 0.72, r * 0.42, girth * 0.12],
+        )
+    }
+
+    /// A straight limb from `from` to `to`.
+    pub fn straight(mut self, from: vec3, to: vec3, r_from: f32, r_to: f32) {
+        self.limb(from, mix(from, to, vec3(0.5)), to, r_from, r_to)
+    }
+
+    /// A clump of leaves at `at`, `radius` across.
+    pub fn clump(mut self, at: vec3, radius: f32) {
+        self.cushion(at, radius, squash: 1.0)
+    }
+
+    /// A clump of leaves at `at`, `radius` across and `squash` as tall (`Clump`).
+    pub fn cushion(mut self, at: vec3, radius: f32, squash: f32) {
+        if !self.clumps.is_full() {
+            self.clumps.push(Clump { centre: at, radius, squash })
+        }
+    }
+
+    /// The crown's field at `p`: the soft union of its clumps (an exponential smooth minimum),
+    /// and its gradient. Its gradient is a mean of unit vectors, so it never exceeds 1.
+    pub fn crown(self, p: vec3) -> (f32, vec3) {
+        self.crown_offset(p, MAX_CLUMPS, by: 0.0)
+    }
+
+    // The same blend with clump `moved` offset by `by`, for the field's part editing.
+    fn crown_offset(self, p: vec3, moved: u32, by: f32) -> (f32, vec3) {
+        if self.clumps.is_empty() {
+            return (1.0e9, vec3(0.0, 1.0, 0.0))
+        }
+        let k = self.blend
+        var nearest = self.clumps[0].distance(p) + if moved == 0 { by } else { 0.0 }
+        var s = 0.0
+        var g = vec3(0.0)
+        for i in 0..self.clumps.len() {
+            let c = self.clumps[i]
+            let d = c.distance(p) + if i == moved { by } else { 0.0 }
+            // Keep all exponents nonpositive, rescaling the sum when a closer clump becomes
+            // its reference. Absolute distances can underflow or overflow the exponential.
+            if d < nearest {
+                let scale = exp(min(k * (d - nearest), 0.0))
+                s *= scale
+                g *= scale
+                nearest = d
+            }
+            let w = exp(min(k * (nearest - d), 1.0e-4))
+            s += w
+            g += c.normal(p) * w
+        }
+        // The nearest clump contributes 1. The weight's exponent is at most 0 and the sum
+        // at least 1; slack bounds avoid derivative ties at those valid endpoints (min/max
+        // average derivatives at a tie). The exponent's small slack keeps spatial bounds tight.
+        let sum = max(s, 0.5)
+        (nearest - log(sum) / k, g / sum)
+    }
+
+    /// The limbs' field at `p`: the nearest limb's distance.
+    pub fn wood(self, p: vec3) -> f32 {
+        var d = 1.0e9
+        for i in 0..self.limbs.len() {
+            d = min(d, self.limbs[i].distance(p))
+        }
+        d
+    }
+
+    /// How tall it stands (m): its crown's top, or its limbs'.
+    pub fn top(self) -> f32 {
+        var top = 0.0
+        for i in 0..self.clumps.len() {
+            let c = self.clumps[i]
+            top = max(top, c.centre.y + c.radius * c.squash)
+        }
+        for i in 0..self.limbs.len() {
+            for k in 0..(3 * RINGS + 1) {
+                let (at, _, radius) = limb_ring_axis(self.limbs[i], k)
+                top = max(top, at.y + radius)
+            }
+        }
+        top
+    }
+
+    /// The radius of a sphere round its base's axis that holds it all (m).
+    pub fn reach(self) -> f32 {
+        var r = 0.0
+        let mid = vec3(0.0, self.top() * 0.5, 0.0)
+        for i in 0..self.clumps.len() {
+            r = max(r, length(self.clumps[i].centre - mid) + self.clumps[i].radius)
+        }
+        for i in 0..self.limbs.len() {
+            for k in 0..(3 * RINGS + 1) {
+                let (at, _, radius) = limb_ring_axis(self.limbs[i], k)
+                r = max(r, length(at - mid) + radius)
+            }
+        }
+        r
+    }
+
+    /// How many leaf cards its nearest level has: enough to cover each clump `cover` times
+    /// with cards `size` wide, at least 16 a clump, in multiples of 16 (so every level's count
+    /// is whole).
+    pub fn cards(self) -> u32 {
+        var n = 0.0
+        let s = self.leaves.size
+        for i in 0..self.clumps.len() {
+            let r = self.clumps[i].radius
+            let area = 4.0 * PI * r * r * self.clumps[i].area_share()
+            n += max(area * self.leaves.cover / (s * s), 16.0)
+        }
+        (u32(n) + 15) / 16 * 16
+    }
+}
+
+/// A plant's field: its limbs, and its crown as one soft solid. The lens draws it as clay.
+impl Surface for Plant {
+    fn distance(self, p: vec3) -> f32 {
+        let (crown, _) = self.crown(p)
+        min(self.wood(p), crown)
+    }
+
+    fn parts(self) -> u32 {
+        self.limbs.len() + self.clumps.len()
+    }
+
+    fn part_at(self, p: vec3) -> (f32, u32) {
+        var best = 1.0e9
+        var which = 0
+        for i in 0..self.limbs.len() {
+            let d = self.limbs[i].distance(p)
+            if d < best {
+                best = d
+                which = i
+            }
+        }
+        let (crown, _) = self.crown(p)
+        if crown < best {
+            best = crown
+            // The clump nearest the point decides it most.
+            var nearest = 1.0e9
+            for i in 0..self.clumps.len() {
+                let d = self.clumps[i].distance(p)
+                if d < nearest {
+                    nearest = d
+                    which = self.limbs.len() + i
+                }
+            }
+        }
+        (best, which)
+    }
+
+    fn part_distance(self, p: vec3, i: u32) -> f32 {
+        if i < self.limbs.len() {
+            return self.limbs[i].distance(p)
+        }
+        self.clumps[min(i - self.limbs.len(), self.clumps.len() - 1)].distance(p)
+    }
+
+    fn part_name(self, i: u32) -> PartName {
+        if i < self.limbs.len() {
+            PartName { name: "limb", group: "wood", ..unnamed() }
+        } else {
+            PartName { name: "clump", group: "crown", ..unnamed() }
+        }
+    }
+
+    fn part_offset(self, p: vec3, i: u32, by: f32) -> f32 {
+        if i < self.limbs.len() {
+            var d = 1.0e9
+            for k in 0..self.limbs.len() {
+                let x = self.limbs[k].distance(p) + if k == i { by } else { 0.0 }
+                d = min(d, x)
+            }
+            let (crown, _) = self.crown(p)
+            return min(d, crown)
+        }
+        // A clump raised by `by`: its term in the crown's blend, moved.
+        let j = i - self.limbs.len()
+        let (crown, _) = self.crown_offset(p, j, by)
+        min(self.wood(p), crown)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+// ---- cooking: leaf cards ------------------------------------------------------------------------
+
+/// A leaf card, in its plant's frame: its centre and width (at the nearest level), the crown's
+/// normal there and how deep in the crown it is (m), its seed, and its tint.
+pub struct Card: Copy + GpuData {
+    pub centre: vec3,
+    pub size: f32,
+    pub normal: Oct32,
+    pub depth: f32,
+    pub seed: u32,
+    pub tint: Unorm8x4,
+}
+
+/// The levels of a plant's cards.
+pub const CARD_LEVELS: u32 = 3
+
+/// How many of a plant's `n` cards (`Plant::cards`) level `level` draws: all of them at level
+/// 0, a half at 1, a quarter at 2.
+pub fn level_cards(n: u32, level: u32) -> u32 {
+    n >> level
+}
+
+/// Card width at a nested density level. Half as many cards need sqrt(2) times the width,
+/// preserving area without the large individual leaves of quarter-density steps.
+pub fn card_scale(level: u32) -> f32 {
+    sqrt(f32(1 << level))
+}
+
+/// Card `id` of a plant's `n`: which level's own share it's in (the coarsest's first), and its
+/// place in that share as a fraction.
+fn card_share(id: u32, n: u32) -> (u32, f32) {
+    let n2 = level_cards(n, 2)
+    let n1 = level_cards(n, 1)
+    if id < n2 {
+        return (2, (f32(id) + 0.5) / f32(n2))
+    }
+    if id < n1 {
+        return (1, (f32(id - n2) + 0.5) / f32(n1 - n2))
+    }
+    (0, (f32(id - n1) + 0.5) / f32(n - n1))
+}
+
+/// The level share card `id` of a plant's `n` is in (`card_share`): its first card and its end.
+fn share_range(id: u32, n: u32) -> vec2u {
+    let n2 = level_cards(n, 2)
+    let n1 = level_cards(n, 1)
+    if id < n2 {
+        return vec2u(0, n2)
+    }
+    if id < n1 {
+        return vec2u(n2, n1)
+    }
+    vec2u(n1, n)
+}
+
+/// The corners a plant is seen from, for the orders its cards are drawn in: the eight ways round
+/// it, each axis's sign a bit (x, then y, then z).
+pub const CORNERS: u32 = 8
+
+fn corner_dir(o: u32) -> vec3 {
+    vec3(f32(o & 1) * 2.0 - 1.0, f32((o >> 1) & 1) * 2.0 - 1.0, f32((o >> 2) & 1) * 2.0 - 1.0)
+}
+
+/// Which corner a plant at `inst` is seen from by an eye at `eye` (`mid` metres up its middle,
+/// in its own frame).
+pub fn corner_of(inst: Instance, mid: f32, eye: vec3) -> u32 {
+    let v = unoriented(inst.yaw, inst.pitch, eye - inst.at)
+    let y = v.y - mid * inst.scale
+    u32(v.x > 0.0) | (u32(y > 0.0) << 1) | (u32(v.z > 0.0) << 2)
+}
+
+/// The plant's `n` cards (cooked by `seed`) in each corner's order (`CORNERS`, one after
+/// another): each level's own share front to back seen from the corner, the nearest it first,
+/// each share's run where it was (a level draws the first of them). A cut fragment behind the
+/// depth already written is dropped before it's cut, so the prepass draws a crown's cards so.
+/// Found once, at load, from where each card is (`card_place`).
+pub fn card_orders(plant: Plant, n: u32, seed: u32) -> Vec<u32> {
+    var centres: Vec<vec3> = Vec::new()
+    for c in 0..n {
+        let (_, p, _) = card_place(plant, n, seed, c)
+        centres.push(p)
+    }
+    var out: Vec<u32> = Vec::new()
+    for o in 0..CORNERS {
+        let dir = corner_dir(o)
+        var c = 0
+        while c < n {
+            let range = share_range(c, n)
+            // Each card's distance back from the corner, and the card.
+            var keyed: Vec<vec2> = Vec::new()
+            for j in range.x..range.y {
+                keyed.push(vec2(-dot(centres[j], dir), f32(j)))
+            }
+            keyed.sort_by(|a, b| a.x < b.x || a.x == b.x && a.y < b.y)
+            for e in keyed {
+                out.push(u32(e.y))
+            }
+            c = range.y
+        }
+    }
+    out
+}
+
+/// Card `id` of a plant's `n` (cooked by `seed`): its clump (each level's share spread over the
+/// clumps by their areas), where it is (on its clump's surface or a little inside), and its
+/// draws' seed.
+fn card_place(plant: Plant, n: u32, seed: u32, id: u32) -> (u32, vec3, u32) {
+    let (_, f) = card_share(id, n)
+    // The clump whose share of the total area holds `f`.
+    var total = 0.0
+    for i in 0..plant.clumps.len() {
+        let r = plant.clumps[i].radius
+        total += r * r * plant.clumps[i].area_share()
+    }
+    var at = f * total
+    var which = plant.clumps.len() - 1
+    for i in 0..plant.clumps.len() {
+        let r = plant.clumps[i].radius
+        let a = r * r * plant.clumps[i].area_share()
+        if at < a {
+            which = i
+            break
+        }
+        at -= a
+    }
+    let c = plant.clumps[which]
+    let k = seed.wrapping_mul(7919) ^ id.wrapping_mul(2654435761)
+    let dir = direction(rand(k, 3), rand(k, 4))
+    (which, c.point(dir, 0.72 + 0.28 * sqrt(rand(k, 5))), k)
+}
+
+/// Each of a plant's cards' middle and size as `cook_cards` places them (seed `seed`), on
+/// the CPU: for tests of what a camera's near plane meets.
+pub fn card_centres(plant: Plant, seed: u32) -> Vec<vec4> {
+    let n = plant.cards()
+    var out: Vec<vec4> = Vec::with_capacity(n)
+    for c in 0..n {
+        let (_, p, k) = card_place(plant, n, seed, c)
+        out.push(vec4(p, plant.leaves.size * pick(k, 6, lo: 0.8, hi: 1.2)))
+    }
+    out
+}
+
+/// The plant's cards: each level's share spread over the clumps by their areas, each card on
+/// its clump's surface or a little inside, its normal the crown's there (its mass's, so a mass
+/// turns from light to shade as one form), its depth in the crown.
+@compute(64)
+pub fn cook_cards(plant: Plant, n: u32, seed: u32, out: mut Slots<Card>, id: GlobalId) {
+    let (which, p, k) = card_place(plant, n, seed, id.x)
+    let (d, g) = plant.crown(p)
+    // The crown's normal alone: mixed with its own clump's, each clump read as its own lump of
+    // light, a crown as confetti.
+    let normal = normalize(g)
+    let size = plant.leaves.size * pick(k, 6, lo: 0.8, hi: 1.2)
+    let tint = vec4(rand(k, 7), rand(k, 8), rand(k, 9), rand(which, 10))
+    out[id] = Card {
+        centre: p,
+        size,
+        normal: Oct32::encode(normal),
+        depth: max(-d, 0.0),
+        seed: k,
+        tint: Unorm8x4::encode(tint),
+    }
+}
+
+/// A card's corner `q` (on its square, each in [-1, 1]) turned by the card's own turn, a draw of
+/// its seed: the same for every way a card is drawn (`vegetation::card_corner`, and the cards an
+/// impostor is baked from).
+pub fn card_turn(card: Card, q: vec2) -> vec2 {
+    let a = TAU * rand(card.seed, 11)
+    let (s, c) = (sin(a), cos(a))
+    vec2(c * q.x - s * q.y, s * q.x + c * q.y)
+}
+
+/// A card's own tint, added to its instance's: a little more or less red and green.
+pub fn card_tint(card: Card) -> vec3 {
+    (card.tint.decode().xyz - vec3(0.5)) * vec3(0.04, 0.05, 0.0)
+}
+
+// ---- a leaf's look (its cards', its impostor's and its volume's alike) -------------------------
+
+/// A leaf's colour by its age: young where its crown faces up (`up`, the y of the crown's
+/// normal), old deep down. A leaf has no tilt or age of its own: each leaf lit and coloured apart
+/// from its neighbours read as confetti, not as a mass turning from light to shade; a leaf's own
+/// shape shows at a mass's edge.
+pub fn leaf_age(leaves: Leaves, up: f32) -> vec3 {
+    mix(leaves.old, leaves.young, vec3(saturate(0.35 + 0.65 * up)))
+}
+
+/// A leaf's albedo: its colour (`leaf_age`) and half its tint (its instance's and its card's,
+/// `card_tint`), never black.
+pub fn tinted(colour: vec3, tint: vec3) -> vec3 {
+    max(colour + tint * 0.5, vec3(0.005))
+}
+
+/// The stem of a card's sprig (seed `seed`) at `t` along it (0 its foot, at the card's edge, to 1
+/// its tip), on the card's square ([-1, 1]²): rising up the card, bowed a little.
+pub fn stem_at(seed: u32, t: f32) -> vec2 {
+    vec2((rand(seed, 3) - 0.5) * 0.3 * sin(PI * t), mix(-0.98, 0.38, t))
+}
+
+/// Leaf `i` of a card's sprig of `n` (seed `seed`): where its stalk leaves the stem, the way it
+/// points, and its length, on the card's square. Its leaves alternate up the stem, each pointing
+/// out and up from it, the last at the stem's tip.
+pub fn sprig_leaf(seed: u32, i: u32, n: u32) -> (vec2, vec2, f32) {
+    if i + 1 == n {
+        let a = 0.25 * (rand(seed, 20 + i) - 0.5)
+        return (stem_at(seed, 1.0), vec2(sin(a), cos(a)), 0.5 + 0.1 * rand(seed, 40 + i))
+    }
+    let t = 0.22 + 0.72 * (f32(i) + 0.4 * rand(seed, 60 + i)) / f32(max(n, 2) - 1)
+    let side = if (i + seed) % 2 == 0 { 1.0 } else { -1.0 }
+    let a = side * (0.6 + 0.4 * rand(seed, 20 + i))
+    (stem_at(seed, t), vec2(sin(a), cos(a)), 0.5 + 0.22 * rand(seed, 40 + i))
+}
+
+/// How far `uv` is inside the leaf from `base` along `dir`, `len` long (over its length; below 0
+/// outside), and where it is along it (0 to 1) and across it (over its length). Pointed, widest a
+/// third of the way along, on a short stalk.
+fn in_leaf(uv: vec2, base: vec2, dir: vec2, len: f32) -> (f32, f32, f32) {
+    let q = uv - base - dir * (len * LEAF_STALK)
+    let s = dot(q, dir) / len
+    let t = dot(q, vec2(-dir.y, dir.x))
+    let half = 0.36 * len * sin(PI * clamp(s, 0.0, 1.0)) * (1.15 - 0.5 * s)
+    (min(half - abs(t), min(s, 1.0 - s) * len) / max(len, 0.01), saturate(s), t / len)
+}
+
+/// How much of a leaf's length its own stalk is, from the stem to its blade.
+const LEAF_STALK: f32 = 0.08
+
+/// How wide a sprig's stem is each side of its axis (on the card's square).
+const STEM: f32 = 0.022
+
+/// The sprig on a card at `uv` (in [-1, 1]²), `n` leaves on its stem (seed `seed`): how much is
+/// leaf or stem (0 to 1, a soft edge `w` wide), which leaf (its stem the first's), and its tissue:
+/// the light its midrib (or stem) lets through (0 none, 1 a blade's), and its fold. A card is a
+/// sprig cut from a twig, not leaves round its middle (as a rosette, the cards' leaves read as
+/// smears floating off the wood).
+pub fn sprig_on(uv: vec2, seed: u32, w: f32, n: u32) -> (f32, u32, vec2) {
+    var best = -1.0
+    var which = 0
+    var tissue = vec2(1.0, 0.5)
+    for i in 0..n {
+        let (base, dir, len) = sprig_leaf(seed, i, n)
+        let (inside, along, across) = in_leaf(uv, base, dir, len)
+        if inside > best {
+            best = inside
+            which = i
+            let rib = smoothstep(0.012, 0.065, abs(across))
+            let fold = 0.5 + 0.5 * sin(PI * along) * (1.0 - smoothstep(0.03, 0.3, abs(across)))
+            tissue = vec2(rib, fold)
+        }
+        // The leaf's own stalk, from the stem to its blade.
+        let stalk = uv - base
+        let l = clamp(dot(stalk, dir), 0.0, len * LEAF_STALK)
+        let reach = (STEM * 0.6 - length(stalk - dir * l)) / max(len, 0.01)
+        if reach > best {
+            best = reach
+            which = i
+            tissue = vec2(0.0, 0.5)
+        }
+    }
+    // The stem: from the card's foot to its tip.
+    let t = saturate((uv.y + 0.98) / 1.36)
+    let stem = (STEM * (1.0 - 0.5 * t) - abs(uv.x - stem_at(seed, t).x)) / 0.6
+    if uv.y <= 0.38 && stem > best {
+        best = stem
+        which = 0
+        tissue = vec2(0.0, 0.5)
+    }
+    (smoothstep(-w, w, best), which, tissue)
+}
+
+// ---- limbs as geometry -----------------------------------------------------------------------
+
+/// Sides round a limb's tube, and rings along each of its three curved pieces. Its middle
+/// rings follow the smooth axis; the final ring closes its tip.
+pub const SIDES: u32 = 14
+pub const RINGS: u32 = 4
+/// Vertices a limb draws: each piece's rings of quads round it.
+pub const LIMB_VERTICES: u32 = 3 * RINGS * SIDES * 6
+
+/// Points a limb has: each piece's rings' points round it, the first again at the end (where
+/// the bark's place round the limb comes back to 1).
+pub const LIMB_POINTS: u32 = 3 * (RINGS + 1) * (SIDES + 1)
+
+/// Which point (of `LIMB_POINTS`) a limb's vertex `k` (of `LIMB_VERTICES`) is: each piece's
+/// rings of quads, two triangles each.
+pub fn limb_corner(k: u32) -> u32 {
+    let qx = [0, 1, 1, 0, 1, 0]
+    let qz = [0, 0, 1, 0, 1, 1]
+    let q = k / 6
+    let c = k % 6
+    let piece = q / (RINGS * SIDES)
+    let r = q % (RINGS * SIDES)
+    let side = r % SIDES + qx[c]
+    let ring = r / SIDES + qz[c]
+    (piece * (RINGS + 1) + ring) * (SIDES + 1) + side
+}
+
+/// A limb's vertex `k` (of `LIMB_VERTICES`): where it is, its normal, and where it is round and
+/// along the limb (`limb_point`).
+pub fn limb_vertex(limb: Tube<4>, k: u32) -> (vec3, vec3, vec2) {
+    let (centre, n, radius, along) = limb_point(limb, limb_corner(k))
+    (centre + n * radius, n, along)
+}
+
+/// A collapsed segment or a reversing joint has no unique tangent. Keep a finite frame
+/// using the adjacent direction, or world up when the entire limb is collapsed.
+fn limb_direction(v: vec3, otherwise: vec3) -> vec3 {
+    let size = length(v)
+    if size > 1.0e-5 { v / size } else { otherwise }
+}
+
+/// The same joint derivative from either side. Its length cannot exceed either adjacent
+/// chord, so the cubic controls stay ordered along each piece instead of looping back.
+fn limb_tangents(limb: Tube<4>, piece: u32) -> (vec3, vec3) {
+    let a = limb.points[piece]
+    let b = limb.points[piece + 1]
+    let delta = b - a
+    let span = max(length(delta), 1.0e-5)
+    let dir = limb_direction(delta, vec3(0.0, 1.0, 0.0))
+    let before = if piece > 0 { a - limb.points[piece - 1] } else { delta }
+    let after = if piece < 2 { limb.points[piece + 2] - b } else { delta }
+    let start = limb_direction(dir + limb_direction(before, dir), dir) * min(span, length(before))
+    let end = limb_direction(dir + limb_direction(after, dir), dir) * min(span, length(after))
+    (start, end)
+}
+
+/// A smooth axis through the authored points. Radius does not limit its curvature: doing
+/// that flattened thin branches into long chords with a sudden elbow at their shared ring.
+fn limb_segment(limb: Tube<4>, piece: u32, t: f32) -> (vec3, vec3, f32) {
+    let a = limb.points[piece]
+    let b = limb.points[piece + 1]
+    let dir = limb_direction(b - a, vec3(0.0, 1.0, 0.0))
+    let (start, end) = limb_tangents(limb, piece)
+    let t2 = t * t
+    let t3 = t2 * t
+    let centre = if t <= 0.0 { a } else if t >= 1.0 { b } else {
+        a * (2.0 * t3 - 3.0 * t2 + 1.0) +
+            start * (t3 - 2.0 * t2 + t) +
+            b * (-2.0 * t3 + 3.0 * t2) +
+            end * (t3 - t2)
+    }
+    let tangent = a * (6.0 * t2 - 6.0 * t) +
+        start * (3.0 * t2 - 4.0 * t + 1.0) +
+        b * (-6.0 * t2 + 6.0 * t) +
+        end * (3.0 * t2 - 2.0 * t)
+    let radius = if t >= 1.0 { limb.radii[piece + 1] } else {
+        mix(limb.radii[piece], limb.radii[piece + 1], t)
+    }
+    (centre, limb_direction(tangent, dir), radius)
+}
+
+/// Where the final piece starts its short closing cap. Its length follows the end radius,
+/// rather than consuming a fixed share of a long branch and turning broken wood into a spike.
+fn cap_start(limb: Tube<4>) -> f32 {
+    let span = max(length(limb.points[3] - limb.points[2]), 1.0e-5)
+    1.0 - clamp(limb.radii[3] * 0.5 / span, 1.0e-4, 0.4)
+}
+
+/// Reserve the final ring interval for the cap; other rings describe the curved body.
+fn ring_t(limb: Tube<4>, piece: u32, ring: u32) -> f32 {
+    if piece < 2 { f32(ring) / f32(RINGS) } else if ring == RINGS { 1.0 } else {
+        cap_start(limb) * f32(ring) / f32(RINGS - 1)
+    }
+}
+
+pub fn limb_ring_axis(limb: Tube<4>, k: u32) -> (vec3, vec3, f32) {
+    let piece = min(k / RINGS, 2)
+    limb_segment(limb, piece, ring_t(limb, piece, k - piece * RINGS))
+}
+
+/// Position, tangent and radius on the axis the limb renderer uses, from root 0 to tip 1.
+/// Branches attach here so changing the curve cannot detach them from their parent.
+pub fn limb_axis(limb: Tube<4>, t: f32) -> (vec3, vec3, f32) {
+    let along = clamp(t, 0.0, 1.0) * 3.0
+    let piece = min(u32(floor(along)), 2)
+    let t = along - f32(piece)
+    let cap = cap_start(limb)
+    let ring = if piece < 2 { t * f32(RINGS) } else if t <= cap {
+        t / cap * f32(RINGS - 1)
+    } else { f32(RINGS - 1) + (t - cap) / (1.0 - cap) }
+    let first = min(u32(floor(ring)), RINGS - 1)
+    let f = ring - f32(first)
+    let (a, an, ar) = limb_segment(limb, piece, ring_t(limb, piece, first))
+    let (b, bn, br) = limb_segment(limb, piece, ring_t(limb, piece, first + 1))
+    (mix(a, b, vec3(f)), limb_direction(mix(an, bn, vec3(f)), an), mix(ar, br, f))
+}
+
+/// Position, tangent and radius at a height on a trunk whose points rise in order.
+pub fn limb_at_height(limb: Tube<4>, height: f32) -> (vec3, vec3, f32) {
+    var lo = 0.0
+    var hi = 1.0
+    for _ in 0..12 {
+        let mid = (lo + hi) * 0.5
+        let (p, _, _) = limb_axis(limb, mid)
+        if p.y < height { lo = mid } else { hi = mid }
+    }
+    limb_axis(limb, (lo + hi) * 0.5)
+}
+
+/// A limb's point `p` (of `LIMB_POINTS`), in the plant's frame: the point of its axis it's
+/// round, its normal and its distance out from the axis (the point is `centre + n * radius`),
+/// and where it is round and along the limb (for bark's ridges).
+pub fn limb_point(limb: Tube<4>, p: u32) -> (vec3, vec3, f32, vec2) {
+    let piece = p / ((RINGS + 1) * (SIDES + 1))
+    let r = p % ((RINGS + 1) * (SIDES + 1))
+    let side = f32(r % (SIDES + 1))
+    let ring = r / (SIDES + 1)
+    let along = ring_t(limb, piece, ring)
+    let a = limb.points[piece]
+    let b = limb.points[piece + 1]
+    let (centre, axis, r_axis) = limb_segment(limb, piece, along)
+    let whole = normalize(limb.points[3] - limb.points[0] + vec3(0.0, 1.0e-4, 0.0))
+    let ref_axis = if abs(whole.y) > 0.9 { vec3(1.0, 0.0, 0.0) } else { vec3(0.0, 1.0, 0.0) }
+    let ref_axis = if abs(dot(axis, ref_axis)) > 0.99 {
+        if abs(axis.y) < 0.9 { vec3(0.0, 1.0, 0.0) } else { vec3(1.0, 0.0, 0.0) }
+    } else { ref_axis }
+    let t1 = normalize(cross(axis, ref_axis))
+    let t2 = cross(axis, t1)
+    let ang = TAU * side / f32(SIDES)
+    let n = t1 * cos(ang) + t2 * sin(ang)
+    // The last piece closes to a point at the limb's end, so its tip is never an open tube.
+    let closing = if piece == 2 && ring == RINGS { 0.0 } else { 1.0 }
+    // A joint's ring is worked out twice, as one piece's end and the next's start: exactly the
+    // same both times (`mix(a, b, 1.0)` isn't always `b` on the GPU, and the two rings a rounding
+    // apart left a dotted crack round the limb: pale rings on logs).
+    let radius = r_axis * closing
+    // How far along the limb (m), from its start: the bark's ridges run on across the joints.
+    var walked = 0.0
+    for k in 0..piece {
+        walked += length(limb.points[k + 1] - limb.points[k])
+    }
+    (centre, n, radius, vec2(side / f32(SIDES), walked + along * length(b - a)))
+}
+
+// ---- instances ---------------------------------------------------------------------------------
+
+/// A plant placed in the world: where its base is, its turn about +y, its tint (added to its
+/// leaves' red and green, packed: `tint_of`), its size, its fork: how much higher its trunk
+/// forks than its kind's (below 0, lower), as a share of the height there (`bend`), so two trees
+/// of a kind don't fork at the same height; and how wide its crown is drawn against its
+/// kind's (below 1 where neighbours constrain it, above 1 for a distant group; its trunk and
+/// limbs keep their girth); and how thick its trunk and limbs are against its kind's at its size
+/// (`thick`: an old tree's thicker than its kind's, as tall).
+pub struct Instance: Copy + GpuData {
+    pub at: vec3,
+    pub yaw: f32,
+    pub tint: Unorm8x4,
+    pub scale: f32,
+    pub fork: f32,
+    pub wide: f32,
+    /// Tilt of local +z above the ground plane, in radians, before yaw.
+    pub pitch: f32 = 0.0,
+    pub thick: f32 = 1.0,
+}
+
+/// No plant: an empty place in an instances' buffer.
+pub const NO_INSTANCE = Instance {
+    at: vec3(0.0),
+    yaw: 0.0,
+    tint: tint_of(vec2(0.0)),
+    scale: 0.0,
+    fork: 0.0,
+    wide: 1.0,
+}
+
+/// An instance's tint (its leaves' red and green, each within ±0.08), packed.
+pub fn tint_of(t: vec2) -> Unorm8x4 {
+    let u = clamp((t + vec2(0.08)) / 0.16, vec2(0.0), vec2(1.0))
+    Unorm8x4::encode(vec4(u, 0.0, 0.0))
+}
+
+impl Instance {
+    /// A sphere remains conservative when a distant crown is widened to represent a group.
+    pub fn bound_radius(self, reach: f32) -> f32 {
+        reach * self.scale * max(self.wide, 1.0)
+    }
+
+    /// A point of the plant's frame in the world: its crown narrowed (`wide`), its foot spread as
+    /// its trunk is thickened (`thick`, below `FLARE_TO`), bent at its fork, sized and turned.
+    pub fn place(self, p: vec3) -> vec3 {
+        let out = self.wide * (1.0 + (self.thick - 1.0) * (1.0 - smoothstep(0.0, FLARE_TO, p.y)))
+        self.at +
+            oriented(
+                self.yaw,
+                self.pitch,
+                vec3(p.x * out, bend(p.y, self.fork), p.z * out) * self.scale,
+            )
+    }
+
+    /// A point of a limb's surface in the world: its axis's point `centre` placed, and the
+    /// surface's offset `off` from it sized, thickened (`thick`) and turned (a limb keeps its girth
+    /// where its crown is narrowed).
+    pub fn place_round(self, centre: vec3, off: vec3) -> vec3 {
+        self.place(centre) + self.turn(off * (self.scale * self.thick))
+    }
+
+    /// A direction of the plant's frame in the world.
+    pub fn turn(self, v: vec3) -> vec3 {
+        oriented(self.yaw, self.pitch, v)
+    }
+
+    /// A normal of the plant's frame at height `y` in it, in the world: bent as `place` bends
+    /// the plant there.
+    pub fn turn_normal(self, n: vec3, y: f32) -> vec3 {
+        self.turn(normalize(vec3(n.x, n.y / bend_slope(y, self.fork), n.z)))
+    }
+
+    /// Its tint (`tint_of`), as added to its leaves' colour.
+    pub fn tint_rgb(self) -> vec3 {
+        vec3(self.tint.decode().xy * 0.16 - vec2(0.08), 0.0)
+    }
+}
+
+/// How far up a plant's frame (m) a thickened trunk's foot spreads (`Instance::place`): its roots
+/// reach out as far as it's thick (only their girth thickened, an ancient's roots were knobs round
+/// its foot).
+pub const FLARE_TO: f32 = 1.5
+
+/// How far up a plant's frame (m) the bend of its fork reaches: nothing above it moves.
+pub const BEND_TO: f32 = 32.0
+
+/// A height `y` of a plant's frame bent by `fork`: its trunk and what's low on it stretched (or,
+/// below 0, squeezed) by up to `fork` of their height, the stretch fading to nothing at
+/// `BEND_TO`; its foot stays where it is. The bend keeps its order (its slope over 0) for a
+/// `fork` between -1 and 3.
+pub fn bend(y: f32, fork: f32) -> f32 {
+    let u = clamp(y / BEND_TO, 0.0, 1.0)
+    y + fork * y * (1.0 - u) * (1.0 - u)
+}
+
+/// `bend`'s slope at `y`.
+pub fn bend_slope(y: f32, fork: f32) -> f32 {
+    let u = clamp(y / BEND_TO, 0.0, 1.0)
+    1.0 + fork * (1.0 - u) * (1.0 - 3.0 * u)
+}
+
+/// The height of a plant's frame that `bend` takes to `h` (Newton's method).
+pub fn unbend(h: f32, fork: f32) -> f32 {
+    var y = h
+    for _ in 0..5 {
+        y -= (bend(y, fork) - h) / bend_slope(y, fork)
+    }
+    y
+}
+
+/// A direction of a plant's frame in the world, the plant turned `yaw` about +y.
+pub fn turned(yaw: f32, v: vec3) -> vec3 {
+    let (c, s) = (cos(yaw), sin(yaw))
+    vec3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z)
+}
+
+/// A direction of the world in the frame of a plant turned `yaw` about +y: turned back.
+pub fn unturned(yaw: f32, v: vec3) -> vec3 {
+    let (c, s) = (cos(yaw), sin(yaw))
+    vec3(c * v.x - s * v.z, v.y, s * v.x + c * v.z)
+}
+
+/// A direction tilted about local x so +z rises, then turned about world +y.
+pub fn oriented(yaw: f32, pitch: f32, v: vec3) -> vec3 {
+    let (c, s) = (cos(pitch), sin(pitch))
+    turned(yaw, vec3(v.x, c * v.y + s * v.z, -s * v.y + c * v.z))
+}
+
+/// A world direction returned to a plant's tilted, turned frame.
+pub fn unoriented(yaw: f32, pitch: f32, v: vec3) -> vec3 {
+    let q = unturned(yaw, v)
+    let (c, s) = (cos(pitch), sin(pitch))
+    vec3(q.x, c * q.y - s * q.z, s * q.y + c * q.z)
+}
+
+/// The wind: gusts carried over the land (`gust`), a function of time and
+/// place only: its mean direction, how far it bends a plant, its time, and how fast its gusts
+/// travel downwind (m/s).
+pub struct Wind: Copy + GpuData {
+    /// The render origin within `view::KEYED_PERIOD` (`Camera::keyed`): its gusts cross the
+    /// world, not render space, so they don't jump when the origin moves.
+    pub origin: vec3 = vec3(0.0),
+    pub time: f32,
+    pub dir: vec2,
+    pub speed: f32 = 5.0,
+    pub strength: f32,
+}
+
+/// The wind's gust at `p` (on the plane, in the world) at `time` (0 calm to about 1.4 in a strong
+/// gust): a field of gusts about 45 m across carried downwind at the wind's speed, its pattern
+/// slowly turning as it goes, so it never repeats; gust fronts sweep over the land, irregular in
+/// time and place (the sum of sines this replaced swayed every plant on one schedule). One
+/// lookup of noise: it's read for every vertex of every plant.
+pub fn gust(wind: Wind, p: vec2, time: f32) -> f32 {
+    let q = (p - wind.dir * (wind.speed * time)) / 45.0
+    let a = time * 0.013
+    let turned = vec2(q.x * cos(a) - q.y * sin(a), q.x * sin(a) + q.y * cos(a))
+    0.25 + 1.15 * smoothstep(0.35, 0.8, noise::noise2(turned + vec2(time * 0.021, 0.0)))
+}
+
+/// How far a point at `at` (render space), `height` up its plant (or `height` up a blade), sways at the
+/// wind's time: along the gust's direction, more with height, as the plant answers the gusts that
+/// reach it (`gust`): a little behind them (its bend follows the gust of a moment ago and of a
+/// second ago), rocking only while the gust it feels changes (a gust's front, its passing) and
+/// most at its own pace (taller sways slower), and its leaves fluttering more in a strong gust.
+/// A function of the wind (its time) and the place, nothing else.
+pub fn sway(wind: Wind, at: vec3, height: f32) -> vec3 {
+    let world = at + wind.origin
+    let t = wind.time
+    let lately = gust(wind, world.xz, t - 0.3)
+    let before = gust(wind, world.xz, t - 1.1)
+    let felt = 0.65 * lately + 0.35 * before
+    // The gust's turn of the wind, a little, as it varies.
+    let turn = 0.35 * (lately - before)
+    let (c, s) = (cos(turn), sin(turn))
+    let dir = vec2(wind.dir.x * c - wind.dir.y * s, wind.dir.x * s + wind.dir.y * c)
+    let d = vec3(dir.x, 0.0, dir.y)
+    let across = vec3(-dir.y, 0.0, dir.x)
+    let bend = wind.strength * height * height / (1.0 + height)
+    // Rocking at the plant's own pace, its phase its place's, as large as the gust's change; and
+    // the leaves' flutter, quicker, as large as the gust.
+    let pace = 2.6 / sqrt(1.0 + height)
+    let phase = hash2(i32(floor(world.x * 0.7)), i32(floor(world.z * 0.7))) * TAU
+    let rock = (lately - before) * sin(t * pace + phase)
+    let flutter = sin(t * 7.3 + phase * 3.0 + world.y * 2.1) * 0.25 * lately
+    d * (bend * (felt + 0.6 * rock)) + across * (bend * flutter)
+}
+
+// ---- the leaf atlas ----------------------------------------------------------------------------
+
+/// The leaf patterns a card can show, and each one's texels a side: cooked once into an atlas
+/// (`LEAF_PATTERNS` side by side, in a square), so cutting a card reads one texel, not its
+/// leaves' shapes (the prepass draws every layer of a crown).
+pub const LEAF_PATTERNS: u32 = 16
+pub const LEAF_TEXELS: u32 = 128
+pub const LEAF_ATLAS: u32 = 512
+/// The patterns along each side of the atlas.
+const LEAF_SIDE: u32 = LEAF_ATLAS / LEAF_TEXELS
+
+/// Pattern `k`'s leaves, from a seed of its own, `n` of them.
+fn pattern_seed(k: u32) -> u32 {
+    k.wrapping_mul(2246822519) ^ 3266489917
+}
+
+/// The leaf atlas's texels: each pattern's sprig (`sprig_on`): its coverage (a soft edge a texel
+/// wide) in red, and which of its leaves covers it (its index over 8) in green; the light its
+/// midrib and stem let through, and its fold, in blue and alpha (cooked once: no per-frame shape).
+@fragment
+pub fn cook_leaves(pixel: FragCoord, n: u32) -> vec4 {
+    let p = vec2u(pixel.position.xy)
+    let k = (p.y / LEAF_TEXELS) * LEAF_SIDE + p.x / LEAF_TEXELS
+    let local = (vec2(p % vec2u(LEAF_TEXELS)) + vec2(0.5)) / f32(LEAF_TEXELS)
+    let uv = local * 2.0 - vec2(1.0)
+    let (m, which, tissue) = sprig_on(uv, pattern_seed(k), w: 2.0 / f32(LEAF_TEXELS), n: n)
+    vec4(m, (f32(which) + 0.5) / 8.0, tissue.x, tissue.y)
+}
+
+/// Where a card of seed `seed` reads its pattern at `uv` (in [-1, 1]²): its pattern's cell in
+/// the atlas.
+pub fn leaf_uv(seed: u32, uv: vec2) -> vec2 {
+    let k = seed % LEAF_PATTERNS
+    let cell = vec2(f32(k % LEAF_SIDE), f32(k / LEAF_SIDE))
+    let local = clamp(
+        uv * 0.5 + vec2(0.5),
+        vec2(0.5 / f32(LEAF_TEXELS)),
+        vec2(1.0 - 0.5 / f32(LEAF_TEXELS)),
+    )
+    (cell + local) / f32(LEAF_SIDE)
+}
+
+/// The card of seed `seed` at `uv`, from the atlas: its coverage, and which leaf covers it.
+pub fn leaf_at(atlas: Texture<Rgba8>, s: Sampler, seed: u32, uv: vec2) -> (f32, u32) {
+    let t = atlas.sample_level(s, leaf_uv(seed, uv))
+    (t.r, u32(t.g * 8.0))
+}
+
+/// Corners an outline has: a card is drawn as the rectangle round what its cut can keep.
+pub const OUTLINE: u32 = 4
+
+/// Corner `id % OUTLINE` of pattern `id / OUTLINE`'s outline: the smallest rectangle (of 16
+/// turns) round every point of the card where its cut can keep a pixel, about 0.77 of the card.
+/// A bilinear sample reads the texels within one texel of its point, so wherever `leaf_at` is
+/// above 0 is in a square a texel each way round a covered texel's centre (clamped to the card).
+/// A card's corners are shaded once each (an indexed draw) and its cut runs on fewer pixels.
+/// More corners hold the leaves closer but cost more than they save (an octagon's six
+/// triangles).
+@compute(64)
+pub fn cook_outlines(atlas: Texture<Rgba8>, out: mut Slots<vec2>, id: GlobalId) {
+    let k = id.x / OUTLINE
+    let origin = vec2u((k % LEAF_SIDE) * LEAF_TEXELS, (k / LEAF_SIDE) * LEAF_TEXELS)
+    let texel = 2.0 / f32(LEAF_TEXELS)
+    // Each turn's bounds: its two axes' least and most.
+    var lo: [vec2; 16] = [vec2(9.0); 16]
+    var hi: [vec2; 16] = [vec2(-9.0); 16]
+    for y in 0..LEAF_TEXELS {
+        for x in 0..LEAF_TEXELS {
+            if atlas.load(x: origin.x + x, y: origin.y + y).r > 0.0 {
+                let centre = (vec2(f32(x), f32(y)) + vec2(0.5)) * texel - vec2(1.0)
+                for j in 0..2 {
+                    for i in 0..2 {
+                        let off = vec2(f32(i) * 2.0 - 1.0, f32(j) * 2.0 - 1.0) * texel
+                        let p = clamp(centre + off, vec2(-1.0), vec2(1.0))
+                        for t in 0..16 {
+                            let a = f32(t) * PI / 32.0
+                            let u = vec2(cos(a), sin(a))
+                            let q = vec2(dot(p, u), dot(p, vec2(-u.y, u.x)))
+                            lo[t] = min(lo[t], q)
+                            hi[t] = max(hi[t], q)
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var best = 0
+    for t in 1..16 {
+        let e = hi[t] - lo[t]
+        let b = hi[best] - lo[best]
+        if e.x * e.y < b.x * b.y {
+            best = t
+        }
+    }
+    let a = f32(best) * PI / 32.0
+    let u = vec2(cos(a), sin(a))
+    let c = id.x % OUTLINE
+    let q = vec2(if c == 1 || c == 2 { hi[best].x } else { lo[best].x }, if c >= 2 {
+        hi[best].y
+    } else { lo[best].y })
+    out[id] = u * q.x + vec2(-u.y, u.x) * q.y
+}
+
+/// The leaf atlas of `n` leaves a card, cooked.
+pub fn leaf_atlas(n: u32) -> Texture<Rgba8> {
+    var atlas = texture::<Rgba8>(width: LEAF_ATLAS, height: LEAF_ATLAS)
+    let p = begin_pass(mut atlas)
+    draw(p, full.bind(z: 0.5), cook_leaves.bind(n), vertices: 3)
+    p.end()
+    atlas
+}
+
+/// Bark's patterns, cooked once (no field per pixel per frame for bark): a tile
+/// `BARK_ACROSS` m across a limb (a limb round takes a whole number of them, `bark_round`) and
+/// `RIDGES_ALONG` m along it (down), read through a repeating sampler. Its channels are its shape,
+/// each 0 deep in a fissure or crack and 1 on its surface, so its tone and its relief are one
+/// (a pattern whose tone stepped from plate to plate raised each plate to its own height:
+/// shells): ridges (r: an oak's, `ridges_at`), plates (g: a pine's, `plates_at`),
+/// bands (b: 0 in a short dash across the limb, about 20 rows a metre: a birch's lenticels) and
+/// mottle (a: soft patches, 5 across, 0.8 a metre, 0.25 to 0.95).
+pub const RIDGES_ALONG: f32 = 40.0
+pub const BARK_ACROSS: f32 = 2.0
+
+/// How many of bark's tiles go round a limb `girth` m round (a whole number, so they meet).
+pub fn bark_round(girth: f32) -> f32 {
+    max(round(girth / BARK_ACROSS), 1.0)
+}
+
+pub const RIDGES_W: u32 = 256
+pub const RIDGES_H: u32 = 4096
+
+pub fn cook_ridges() -> Texture<Rgba8> {
+    var t = texture::<Rgba8>(width: RIDGES_W, height: RIDGES_H)
+    let p = begin_pass(mut t)
+    draw(p, full.bind(z: 0.5), ridge_texel, vertices: 3)
+    p.end()
+    t
+}
+
+/// How many of the patterns' texels a coarse texel holds each way (`cook_coarse`).
+pub const COARSE: u32 = 4
+
+/// The patterns' tile seen from farther (`cook_ridges`'s, each `COARSE` by `COARSE` of its texels
+/// a texel, their mean): textures have one level, and the tile read by a pixel many texels wide
+/// sparkled into dots (an old oak's fissures as stitches).
+pub fn cook_coarse(fine: Texture<Rgba8>) -> Texture<Rgba8> {
+    var t = texture::<Rgba8>(width: RIDGES_W / COARSE, height: RIDGES_H / COARSE)
+    let p = begin_pass(mut t)
+    draw(p, full.bind(z: 0.5), coarse_texel.bind(fine), vertices: 3)
+    p.end()
+    t
+}
+
+@fragment
+fn coarse_texel(pixel: FragCoord, fine: Texture<Rgba8>) -> vec4 {
+    let at = vec2u(pixel.position.xy) * COARSE
+    var sum = vec4(0.0)
+    for j in 0..COARSE {
+        for i in 0..COARSE {
+            sum += fine.load(x: at.x + i, y: at.y + j)
+        }
+    }
+    sum / f32(COARSE * COARSE)
+}
+
+/// The patterns at `uv` on their tile for a pixel `texels` of the fine tile's texels wide: the
+/// fine tile's, toward the coarse's as the pixel grows to `COARSE` texels, and toward the coarse's
+/// mean (`BARK_MEAN`) as it grows to `COARSE` of the coarse's. Its second value: how much of the
+/// pattern is left (1, all, to 0, its mean alone).
+pub fn bark_at(
+    fine: Texture<Rgba8>,
+    coarse: Texture<Rgba8>,
+    s: Sampler,
+    uv: vec2,
+    texels: f32,
+) -> (vec4, f32) {
+    let level = log2(max(texels, 1.0)) / log2(f32(COARSE))
+    let a = fine.sample_level(s, uv)
+    let b = coarse.sample_level(s, uv)
+    let shown = 1.0 - smoothstep(1.0, 2.0, level)
+    (mix(mix(a, b, vec4(saturate(level))), BARK_MEAN, vec4(1.0 - shown)), shown)
+}
+
+/// The patterns' mean texel, about: what a far trunk's bark shows (`bark_at`).
+pub const BARK_MEAN = vec4(0.75, 0.75, 0.92, 0.6)
+
+/// A texel of the patterns' tile, wrapping each way.
+@fragment
+fn ridge_texel(pixel: FragCoord) -> vec4 {
+    let uv = pixel.position.xy / vec2(f32(RIDGES_W), f32(RIDGES_H))
+    let bands = band_at(vec2(uv.x, uv.y * RIDGES_ALONG * 20.0), 800)
+    let mottle = noise::noise2_wrapped(
+        vec2(uv.x * 5.0, uv.y * RIDGES_ALONG * 0.8),
+        period: vec2i(5, 32),
+    ) *
+        0.65 +
+        noise::noise2_wrapped(vec2(uv.x * 10.0, uv.y * RIDGES_ALONG * 1.6), period: vec2i(10, 64)) *
+            0.35
+    vec4(ridges_at(uv), plates_at(uv), bands, 0.25 + 0.7 * smoothstep(0.15, 0.85, mottle))
+}
+
+/// Fissured bark at `uv` on the tile: 0 in a fissure, 1 on the face between. Its fissures are
+/// lenses, each a few tenths of a metre long: `lines` columns of them round the tile, their rows
+/// `rows` a metre along it, each column's rows set off by its own draw, each lens `0.8` to `1.6`
+/// rows long, so neighbours overlap and stagger, slanting across up to `slant` of a column from
+/// end to end, so they lean into their neighbours', and fading out at their ends (shallower, not
+/// narrower: a fissure's tip a texel wide broke into dashes). The faces between them merge and
+/// part round the lenses' ends, a network of ridges (fissures that ran the whole tile read as
+/// stripes; a noise's middle as the fissure, as its contours' loops; a
+/// Voronoi's cells as shells), each `half` to `half + spread` m wide each side at its middle,
+/// rounding over into it; and a `cross` share of the faces cut across, into plates.
+fn fissures(
+    uv: vec2,
+    lines: i32,
+    rows: f32,
+    slant: f32,
+    seed: i32,
+    half: f32,
+    spread: f32,
+    cross: f32,
+) -> f32 {
+    let x = uv.x * f32(lines)
+    let y = uv.y * RIDGES_ALONG * rows
+    let period = i32(RIDGES_ALONG * rows)
+    let across = BARK_ACROSS / f32(lines)
+    let k = i32(floor(x))
+    var face = 1.0
+    for dc in 0..3 {
+        let c = k - 1 + dc
+        let cw = noise::wrapped(c, lines)
+        let off = noise::hash2(cw, seed + 1)
+        let j = i32(floor(y - off))
+        for dr in 0..3 {
+            let r = j - 2 + dr
+            let rw = noise::wrapped(r, period)
+            let h = |n: i32| noise::hash2(cw * 131 + rw, seed + n)
+            let start = f32(r) + off + 0.3 * h(2)
+            let long = 0.8 + 0.8 * h(3)
+            let t = (y - start) / long
+            if t > 0.0 && t < 1.0 {
+                let x0 = f32(c) + 0.5 + 0.7 * (h(4) - 0.5)
+                let at = x0 + slant * (2.0 * h(5) - 1.0) * (t - 0.5)
+                let wide = half + spread * h(6)
+                let d = abs(x - at) * across
+                let depth = smoothstep(0.0, 0.18, min(t, 1.0 - t))
+                face = min(face, 1.0 - depth * (1.0 - smoothstep(wide, wide + 0.012, d)))
+            }
+        }
+    }
+    // Cracks across, between one column's fissures and the next's, at their own heights, a
+    // `cross` share of them: the faces cut into plates (all of them, evenly, read as a ladder).
+    let g = i32(floor(x - 0.5))
+    let gw = noise::wrapped(g, lines)
+    for dr in 0..3 {
+        let r = i32(floor(y)) - 1 + dr
+        let rw = noise::wrapped(r, period)
+        if noise::hash2(gw * 131 + rw, seed + 7) < cross {
+            let at = f32(r) + noise::hash2(gw * 131 + rw, seed + 8)
+            let d = abs(y - at) / rows
+            face = min(face, smoothstep(0.006, 0.012, d))
+        }
+    }
+    face
+}
+
+/// The ridges at `uv` on the tile (`ridge_texel`'s red): an oak's, alder's and char's bark, 24
+/// columns of fissures round a tile, mostly upright, 3 to 5 cm across at their middles, each
+/// about 30 to 55 cm long: an old oak's narrow interlaced ridges (sparse and leaning, its
+/// fissures read as hatching).
+pub fn ridges_at(uv: vec2) -> f32 {
+    fissures(uv, lines: 24, rows: 3.0, slant: 0.45, seed: 0, half: 0.012, spread: 0.012, cross: 0.0)
+}
+
+/// The plates at `uv` on the tile (`ridge_texel`'s green): a pine's, 14 columns of fissures round
+/// a tile, wide and deep, the faces between cut across here and there into plates longer than wide,
+/// each flaking faintly across. Every plate's face is as high as the next, and as pale: its tone
+/// is the bark's mottle. (A Voronoi's cells read as paving with a tone of their own, as shells
+/// with a height of their own, and their bent edges as stacked arcs.)
+pub fn plates_at(uv: vec2) -> f32 {
+    let flakes = noise::noise2_wrapped(
+        vec2(uv.x * 30.0, uv.y * RIDGES_ALONG * 9.0),
+        period: vec2i(30, 360),
+    )
+    let face = fissures(
+        uv,
+        lines: 14,
+        rows: 2.2,
+        slant: 0.5,
+        seed: 13,
+        half: 0.011,
+        spread: 0.014,
+        cross: 0.45,
+    )
+    // The flaking on its face alone, not down its edges into the fissures.
+    face * (1.0 - 0.14 * (1.0 - flakes) * smoothstep(0.6, 0.9, face))
+}
+
+/// Bands at `p` (`p.x` once round, `p.y` a row a unit, `rows` rows round the tile): each row a
+/// few short dashes across the limb at random places, a third of a row thick; 0 in a dash.
+fn band_at(p: vec2, rows: i32) -> f32 {
+    let row = i32(floor(p.y))
+    let f = p.y - floor(p.y)
+    let r = noise::wrapped(row, rows)
+    // Most rows have a dash, each a share of the tile across, from 3% to 15% of it.
+    if noise::hash2(r, 7) < 0.25 {
+        return 1.0
+    }
+    let start = noise::hash2(r, 11)
+    let wide = 0.03 + 0.12 * noise::hash2(r, 13)
+    let x = p.x - start - floor(p.x - start)
+    let across = smoothstep(0.0, 0.01, x) * (1.0 - smoothstep(wide - 0.01, wide, x))
+    let thick = smoothstep(0.25, 0.4, f) * (1.0 - smoothstep(0.6, 0.75, f))
+    1.0 - across * thick
+}
+
+/// A triangle that covers the target, at depth `z`.
+@vertex
+pub fn full(v: VertexIndex, z: f32) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, z, 1.0) }
+}
+
+// ---- tests -----------------------------------------------------------------------------------------
+
+@test
+fn a_clumps_centre_stays_inside_its_surface() {
+    let ball = Clump { centre: vec3(0.0), radius: 2.0 }
+    assert(ball.distance(ball.centre) == -2.0, "a sphere's centre is a radius inside")
+    for delta in [1.0e-6, 1.0e-5, 1.0e-4] {
+        assert(abs(ball.distance(vec3(delta, 0.0, 0.0)) - (delta - 2.0)) < 1.0e-5)
+    }
+    let cushion = Clump { squash: 0.5, ..ball }
+    assert(cushion.distance(cushion.centre) == -1.0, "the nearest surface is the cushion's top")
+}
+
+@test
+fn crown_blending_keeps_distant_values_finite() {
+    var p = plant(Leaves {}, Bark {})
+    p.clump(vec3(0.0), radius: 2.0)
+    let (far, normal) = p.crown(vec3(1000.0, 0.0, 0.0))
+    assert(abs(far - 998.0) < 1.0e-3, "a distant crown lost its distance to underflow")
+    assert(length(normal - vec3(1.0, 0.0, 0.0)) < 1.0e-5)
+}
+
+@test
+fn crown_blending_keeps_deep_values_finite() {
+    var p = plant(Leaves {}, Bark {})
+    p.blend = 100.0
+    p.clump(vec3(10.0, 0.0, 0.0), radius: 1.0)
+    p.clump(vec3(0.0), radius: 2.0)
+    p.clump(vec3(0.0), radius: 2.0)
+    let (deep, direction) = p.crown(vec3(0.0))
+    assert(abs(deep - (-2.0 - log(2.0) / 100.0)) < 1.0e-5)
+    assert(abs(length(direction) - 1.0) < 1.0e-5)
+}
+
+@test
+fn crown_part_offsets_preserve_distant_values() {
+    var p = plant(Leaves {}, Bark {})
+    p.clump(vec3(0.0), radius: 2.0)
+    let at = vec3(1000.0, 0.0, 0.0)
+    assert(abs(p.part_offset(at, 0, by: 0.0) - p.distance(at)) < 1.0e-3)
+    assert(abs(p.part_offset(at, 0, by: 10.0) - 1008.0) < 1.0e-3)
+}
+
+@test
+fn crown_part_offsets_preserve_deep_values() {
+    var p = plant(Leaves {}, Bark {})
+    p.blend = 100.0
+    p.clump(vec3(0.0), radius: 2.0)
+    p.clump(vec3(0.0), radius: 2.0)
+    let at = vec3(0.0)
+    assert(abs(p.part_offset(at, 0, by: 0.0) - p.distance(at)) < 1.0e-5)
+    assert(abs(p.part_offset(at, 0, by: 0.01) - (-2.0 - log(1.0 + exp(-1.0)) / 100.0)) < 1.0e-5)
+}
+
+@test
+fn crown_intervals_bound_wide_boxes_outside_the_plant() {
+    var p = plant(Leaves {}, Bark {})
+    p.clump(vec3(-10.0, 0.0, 0.0), radius: 2.0)
+    p.clump(vec3(10.0, 0.0, 0.0), radius: 2.0)
+    let b = std::derive::Box3 { lo: vec3(100.0, -100.0, -100.0), hi: vec3(100.1, 100.0, 100.0) }
+    let r = std::derive::interval(|q: vec3| p.distance(q), b)
+    assert(
+        r.lo > 0.0 && r.hi < 1000.0,
+        f"a far box has an unbounded crown interval: {r.lo} to {r.hi}",
+    )
+}
+
+@test
+fn tied_clumps_have_symmetric_derived_gradient() {
+    var p = plant(Leaves {}, Bark {})
+    p.clump(vec3(-2.0, 0.0, 0.0), radius: 1.0)
+    p.clump(vec3(2.0, 0.0, 0.0), radius: 1.0)
+    for x in [0.0, -0.1, 0.1] {
+        let at = vec3(x, 0.0, 0.0)
+        let derived = std::derive::gradient(|q: vec3| p.distance(q), at)
+        let (_, expected) = p.crown(at)
+        assert(
+            length(derived - expected) < 1.0e-5,
+            f"clump gradient {derived} differs from {expected}",
+        )
+    }
+    let weight = std::derive::gradient(|by: f32| p.part_offset(vec3(0.0), 0, by), 0.0)
+    assert(abs(weight - 0.5) < 1.0e-5, "equal clumps must share a part offset equally")
+}
+
+/// A cushion clump is as wide as its radius and `squash` as tall, its top faces up and its side
+/// out; at `squash` 1 it's the sphere it was.
+@test
+fn a_cushion_is_wide_and_flat_topped() {
+    let c = Clump { centre: vec3(1.0, 2.0, 3.0), radius: 2.0, squash: 0.5 }
+    let top = vec3(1.0, 3.0, 3.0)
+    let side = vec3(3.0, 2.0, 3.0)
+    assert(abs(c.distance(top)) < 1.0e-4, f"its top is {c.distance(top)} m off")
+    assert(abs(c.distance(side)) < 1.0e-4, f"its side is {c.distance(side)} m off")
+    assert(abs(c.distance(vec3(1.0, 4.0, 3.0)) - 1.0) < 1.0e-4, "a metre over its top")
+    assert(dot(c.normal(top + vec3(0.3, 0.0, 0.0)), vec3(0.0, 1.0, 0.0)) > 0.9, "a tilted top")
+    assert(dot(c.normal(side), vec3(1.0, 0.0, 0.0)) > 0.999, "its side faces out")
+    assert(abs(length(c.point(vec3(0.0, 1.0, 0.0), 1.0) - top)) < 1.0e-4, "its top's point")
+    assert(c.area_share() < 0.8 && c.area_share() > 0.6, f"area share {c.area_share()}")
+    let ball = Clump { centre: vec3(0.0), radius: 1.0, squash: 1.0 }
+    let p = vec3(0.7, 1.9, -0.4)
+    assert(abs(ball.distance(p) - (length(p) - 1.0)) < 1.0e-5, "a sphere")
+    assert(abs(ball.area_share() - 1.0) < 1.0e-5, "a sphere's area")
+}
+
+@test
+fn limb_curves_share_joint_position_and_tangent() {
+    let limb = Tube {
+        points: [
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.1, 2.0, 0.0),
+            vec3(1.4, 4.0, 0.2),
+            vec3(4.0, 5.0, 0.4),
+        ],
+        radii: [0.5, 0.4, 0.25, 0.05],
+    }
+    for joint in 0..2 {
+        let (a, an, ar) = limb_segment(limb, joint, 1.0)
+        let (b, bn, br) = limb_segment(limb, joint + 1, 0.0)
+        assert(length(a - b) < 1.0e-6 && abs(ar - br) < 1.0e-6, "limb joint has a gap")
+        assert(dot(an, bn) > 0.9999, "limb joint has an angular tangent")
+    }
+    let (middle, _, _) = limb_segment(limb, 1, 0.5)
+    assert(
+        length(middle - mix(limb.points[1], limb.points[2], vec3(0.5))) > 0.02,
+        "limb still follows straight pieces",
+    )
+    let (at, _, _) = limb_at_height(limb, 3.0)
+    assert(abs(at.y - 3.0) < 0.003, "branch attaches at the wrong height")
+}
+
+@test
+fn leaf_midrib_blocks_more_light_than_its_blade() {
+    let seed = pattern_seed(3)
+    var seen = 0
+    for i in 0..6 {
+        let (base, dir, len) = sprig_leaf(seed, i, 6)
+        let centre = base + dir * (len * (LEAF_STALK + 0.45))
+        let (_, which, rib) = sprig_on(centre, seed, w: 0.01, n: 6)
+        let side = centre + vec2(-dir.y, dir.x) * (len * 0.12)
+        let (_, _, blade) = sprig_on(side, seed, w: 0.01, n: 6)
+        if which == i {
+            assert(rib.x < 0.01 && blade.x > 0.99, "backlit leaf has no midrib")
+            assert(rib.y > blade.y, "leaf fold has no surface relief")
+            seen += 1
+        }
+    }
+    assert(seen >= 4, f"only {seen} of a sprig's leaves show their middles")
+}
+
+/// A card's leaves are on its sprig's stem: each leaf's stalk leaves the stem, and the stem runs
+/// from the card's edge, so a sprig reads as cut from a twig, every leaf and its stem in one piece
+/// that stays on its card.
+@test
+fn a_cards_leaves_grow_from_its_stem_and_stay_on_it() {
+    for k in 0..LEAF_PATTERNS {
+        let seed = pattern_seed(k)
+        let (foot, _, _) = sprig_on(stem_at(seed, 0.02), seed, w: 0.01, n: 6)
+        assert(foot > 0.5, f"pattern {k}'s stem doesn't reach its card's edge")
+        for i in 0..6 {
+            let (base, dir, len) = sprig_leaf(seed, i, 6)
+            let (m, _, _) = sprig_on(base, seed, w: 0.01, n: 6)
+            assert(m > 0.5, f"pattern {k}'s leaf {i} is off its stem")
+            for s in 0..9 {
+                let p = base + dir * (len * f32(s) / 8.0)
+                assert(
+                    abs(p.x) <= 1.0 && abs(p.y) <= 1.0,
+                    f"pattern {k}'s leaf {i} runs off its card",
+                )
+            }
+        }
+    }
+}
+
+@test
+fn plant_bounds_contain_curved_limb_rings() {
+    var p = plant(Leaves {}, Bark {})
+    p.tube(
+        [vec3(0.0), vec3(0.2, 2.0, 0.0), vec3(2.0, 3.0, 0.0), vec3(3.0, 3.1, 0.2)],
+        [0.5, 0.4, 0.25, 0.1],
+    )
+    let top = p.top()
+    let mid = vec3(0.0, top * 0.5, 0.0)
+    let reach = p.reach()
+    for k in 0..LIMB_POINTS {
+        let (at, normal, radius, _) = limb_point(p.limbs[0], k)
+        let point = at + normal * radius
+        assert(point.y <= top + 1.0e-5, "curved limb exceeds plant height")
+        assert(length(point - mid) <= reach + 1.0e-5, "curved limb exceeds plant reach")
+    }
+}
+
+@test
+fn collapsed_and_reversing_limbs_keep_finite_frames() {
+    for points in [
+        [vec3(0.0); 4],
+        [vec3(0.0), vec3(0.0), vec3(0.0, 1.0, 0.0), vec3(1.0, 1.0, 0.0)],
+        [vec3(0.0), vec3(1.0, 0.0, 0.0), vec3(0.0), vec3(-1.0, 0.0, 0.0)],
+    ] {
+        let limb = Tube { points, radii: [0.2, 0.15, 0.1, 0.02] }
+        for k in 0..LIMB_POINTS {
+            let (at, normal, radius, _) = limb_point(limb, k)
+            assert(length(at) < 2.0 && radius >= 0.0, "limb has a non-finite point")
+            assert(abs(length(normal) - 1.0) < 1.0e-4, "limb has a non-finite frame")
+        }
+    }
+}
+
+@test
+fn tilted_instances_place_round_sections_and_normals_in_one_frame() {
+    for yaw in [0.0, 0.73, 3.9] {
+        for pitch in [-0.6, 0.0, 0.45] {
+            var inst = NO_INSTANCE
+            inst.at = vec3(12.0, -4.0, 9.0)
+            inst.scale = 1.7
+            inst.yaw = yaw
+            inst.pitch = pitch
+            let p = vec3(0.2, 0.5, 8.0)
+            let n = normalize(vec3(0.3, 0.9, -0.1))
+            let world = inst.place_round(p, n * 0.4)
+            let local = unoriented(yaw, pitch, (world - inst.at) / inst.scale)
+            assert(length(local - (p + n * 0.4)) < 1.0e-4, "limb and instance frames disagree")
+            assert(
+                abs(dot(inst.turn(n), inst.turn(vec3(1.0, 0.0, 0.0))) - n.x) < 1.0e-5,
+                "tilt changes normal angle",
+            )
+            assert(
+                length(inst.turn_normal(n, p.y) - inst.turn(n)) < 1.0e-5,
+                "tilted normals disagree",
+            )
+            if pitch == 0.0 {
+                assert(length(inst.turn(p) - turned(yaw, p)) < 1.0e-6, "standing instance changed")
+            }
+        }
+    }
+}
+
+@test
+fn leaf_density_levels_preserve_area_without_oversized_cards() {
+    for n in [16, 64, 1024] {
+        for level in 0..CARD_LEVELS {
+            let scale = card_scale(level)
+            let area = f32(level_cards(n, level)) * scale * scale
+            assert(abs(area - f32(n)) < f32(n) * 1.0e-6, "leaf LOD changes aggregate coverage")
+            assert(scale <= 2.0, "a coarse card inflates into a leaf block")
+            if level > 0 {
+                assert(
+                    level_cards(n, level) * 2 == level_cards(n, level - 1),
+                    "nested card shares are inconsistent",
+                )
+            }
+        }
+    }
+}
+
+@test
+fn branch_collars_follow_parent_and_taper_to_the_tip() {
+    var p = plant(Leaves {}, Bark {})
+    let from = vec3(1.0, 3.0, 2.0)
+    let parent = normalize(vec3(0.1, 1.0, 0.1))
+    p.branch(from, parent, vec3(2.0, 4.0, 2.0), vec3(4.0, 4.5, 2.5), r_from: 0.25, r_to: 0.02)
+    let limb = p.limbs[0]
+    let neck = normalize(limb.points[1] - limb.points[0])
+    let out = normalize(limb.points[3] - limb.points[0])
+    assert(length(limb.points[0] - from) == 0.0, "branch leaves its attachment")
+    assert(dot(neck, parent) > dot(out, parent), "branch collar cuts straight across the parent")
+    for i in 0..3 {
+        assert(limb.radii[i] > limb.radii[i + 1], "branch thickens toward its tip")
+    }
+    for i in 0..2 {
+        let a = normalize(limb.points[i + 1] - limb.points[i])
+        let b = normalize(limb.points[i + 2] - limb.points[i + 1])
+        assert(dot(a, b) > 0.85, "authored branch has a sharp elbow")
+    }
+    for i in 0..(3 * RINGS + 1) {
+        let (point, tangent, radius) = limb_axis(limb, f32(i) / f32(3 * RINGS))
+        assert(
+            length(point - from) < 5.0 && abs(length(tangent) - 1.0) < 1.0e-4,
+            "collar curve has an invalid frame",
+        )
+        assert(radius > 0.0 && radius <= 0.271, "collar curve has invalid girth")
+    }
+}
+
+@test
+fn rendered_caps_keep_long_branches_blunt_and_axis_on_the_mesh() {
+    for span in [3.0, 20.0] {
+        for radius in [0.02, 0.3] {
+            let limb = Tube {
+                points: [
+                    vec3(0.0),
+                    vec3(0.0, 1.0, 0.0),
+                    vec3(span * 0.4, 1.2, 0.2),
+                    vec3(span, 1.4, 0.5),
+                ],
+                radii: [radius * 2.0, radius * 1.8, radius * 1.3, radius],
+            }
+            let last = (2 * (RINGS + 1) + RINGS - 1) * (SIDES + 1)
+            let (rim, _, girth, _) = limb_point(limb, last)
+            let (tip, _, end, _) = limb_point(limb, last + SIDES + 1)
+            assert(length(tip - rim) < radius, "rendered cap still consumes a long segment")
+            assert(girth >= radius && end == 0.0, "the last solid ring is already shrunk")
+            for ring in 0..RINGS {
+                let p = (2 * (RINGS + 1) + ring) * (SIDES + 1)
+                let (a, _, _, _) = limb_point(limb, p)
+                let (b, _, _, _) = limb_point(limb, p + SIDES + 1)
+                let t = (ring_t(limb, piece: 2, ring: ring) +
+                    ring_t(limb, piece: 2, ring: ring + 1)) *
+                    0.5
+                let (at, _, _) = limb_axis(limb, (2.0 + t) / 3.0)
+                assert(
+                    length(at - (a + b) * 0.5) < 1.0e-4,
+                    "attachment axis leaves the rendered ring lattice",
+                )
+            }
+        }
+    }
+}
+
+@test
+fn thin_branch_rings_turn_gradually_without_radius_clamping() {
+    let points = [vec3(0.0), vec3(1.0, 1.0, 0.0), vec3(4.0, 1.2, 0.0), vec3(7.0, 1.5, 0.0)]
+    let thin = Tube { points, radii: [0.03, 0.025, 0.02, 0.015] }
+    let thick = Tube { points, radii: [0.6, 0.5, 0.4, 0.3] }
+    for piece in 0..3 {
+        let a = points[piece]
+        let b = points[piece + 1]
+        let dir = normalize(b - a)
+        for ring in 0..(RINGS + 1) {
+            // Compare equal parameters: the last solid ring's cap position depends on girth.
+            let t = f32(ring) / f32(RINGS)
+            let (p, _, _) = limb_segment(thin, piece, t)
+            let (q, _, _) = limb_segment(thick, piece, t)
+            assert(length(p - q) < 1.0e-6, "thin wood flattens the branch's centreline")
+            let along = dot(p - a, dir)
+            assert(along >= -1.0e-5 && along <= length(b - a) + 1.0e-5, "curve doubles back")
+        }
+    }
+    // Read actual mesh ring centres, including both sides of each authored joint. A smooth
+    // formula is not sufficient if the renderer flattens the intervals back into an elbow.
+    for ring in 1..(3 * RINGS) {
+        let (a, _, _) = limb_ring_axis(thin, ring - 1)
+        let (b, _, _) = limb_ring_axis(thin, ring)
+        let (c, _, _) = limb_ring_axis(thin, ring + 1)
+        assert(
+            dot(normalize(b - a), normalize(c - b)) > 0.9,
+            "rendered thin branch still turns by more than 26 degrees at one ring",
+        )
+        let (at, _, _) = limb_axis(thin, f32(ring) / f32(3 * RINGS))
+        // Interior pieces use the uniform ring lattice; the final cap uses its own spacing.
+        if ring < 2 * RINGS {
+            assert(length(at - b) < 1.0e-5, "attachment axis leaves the mesh")
+        }
+    }
+}
+
+/// Bark's tiles go round a limb a whole number of times (so they meet), at least once, each about
+/// `BARK_ACROSS` wide: a twig's tile squeezed, an old trunk's many.
+@test
+fn barks_tiles_meet_round_a_limb_at_their_own_size() {
+    for girth in [0.05, 0.6, 1.9, 3.1, 7.4, 18.0] {
+        let k = bark_round(girth)
+        assert(k >= 1.0 && k == floor(k), f"{k} tiles round a limb {girth} m round")
+        if girth >= BARK_ACROSS {
+            let each = girth / k
+            assert(
+                each >= BARK_ACROSS * 0.66 && each <= BARK_ACROSS * 1.34,
+                f"a tile {each} m across round a limb {girth} m round",
+            )
+        }
+    }
+}
+
+/// Bark's faces stand at one height, plate to plate (each plate a tone and a height of its own,
+/// pine's bark read as shells: on main's plates, 36% of their faces stood at full height), past
+/// their rounded shoulders and their fissures' fading tips, 70% of them at least; and its
+/// fissures are two texels across at least (a texel's broke into dashes; their tips fade
+/// shallower, not narrower): the cooked patterns, read at their texels.
+@test
+fn barks_faces_stand_level_and_its_fissures_are_two_texels_wide() {
+    for which in 0..2 {
+        let f = |x: u32, y: u32| {
+            let uv = (vec2(f32(x), f32(y)) + vec2(0.5)) / vec2(f32(RIDGES_W), f32(RIDGES_H))
+            if which == 0 { ridges_at(uv) } else { plates_at(uv) }
+        }
+        var faces = 0
+        var level = 0
+        var narrowest = 1.0e9
+        // Across the limb (its fissures run along it), a row of texels every 16.
+        for l in 0..(RIDGES_H / 16) {
+            var run = 0
+            var started = false
+            for i in 0..RIDGES_W {
+                let t = f(i, l * 16)
+                if t > 0.5 {
+                    faces += 1
+                    if t >= 0.8 {
+                        level += 1
+                    }
+                    if started && run > 0 {
+                        narrowest = min(narrowest, f32(run))
+                    }
+                    started = true
+                    run = 0
+                } else {
+                    run += 1
+                }
+            }
+        }
+        let share = f32(level) / f32(max(faces, 1))
+        assert(share >= 0.7, f"pattern {which}: only {share} of its faces stand level")
+        assert(narrowest >= 2.0, f"pattern {which} has a fissure {narrowest} texels across")
+    }
+}
+
+/// Bark's tile meets itself each way, so a limb's round and length show no seam.
+@test
+fn barks_tile_wraps_each_way() {
+    for i in 0..32 {
+        let a = (f32(i) + 0.37) / 32.0
+        for which in 0..2 {
+            let f = |uv: vec2| if which == 0 { ridges_at(uv) } else { plates_at(uv) }
+            assert(abs(f(vec2(0.0, a)) - f(vec2(1.0, a))) < 1.0e-3, "the tile's sides don't meet")
+            assert(abs(f(vec2(a, 0.0)) - f(vec2(a, 1.0))) < 1.0e-3, "the tile's ends don't meet")
+        }
+    }
+}

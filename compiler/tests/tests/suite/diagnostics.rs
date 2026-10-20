@@ -35,6 +35,31 @@ fn compile(name: &str, text: &str, dir: Option<&std::path::Path>) -> Outcome {
     if let Some(dir) = dir {
         wrela_tests::copy_dir(dir, &pkg);
         std::fs::write(pkg.join("main.wrela"), text).expect("write main.wrela");
+        // The copy's path dependencies outside it, from where the case is (the frozen engine).
+        let manifest = pkg.join("wrela.toml");
+        if let Ok(m) = std::fs::read_to_string(&manifest) {
+            // Only a path that leads out of the case (a dependency inside it is copied with it).
+            let to = |rel: &str| match dir.join(rel).canonicalize() {
+                Ok(p) if !p.starts_with(dir.canonicalize().expect("the case")) => {
+                    Ok(p.display().to_string())
+                }
+                _ => Err(()),
+            };
+            let lines: Vec<String> = m
+                .lines()
+                .map(|l| {
+                    match l.split_once("path = \"").and_then(|(a, b)| Some((a, b.split_once('"')?)))
+                    {
+                        Some((a, (rel, rest))) => match to(rel) {
+                            Ok(abs) => format!("{a}path = {abs:?}{rest}"),
+                            Err(_) => l.to_string(),
+                        },
+                        None => l.to_string(),
+                    }
+                })
+                .collect();
+            std::fs::write(&manifest, lines.join("\n") + "\n").expect("write wrela.toml");
+        }
     }
     let built = wrela_driver::build(&pkg);
     let errors: Vec<_> = built.diagnostics.iter().filter(|d| d.is_error()).cloned().collect();

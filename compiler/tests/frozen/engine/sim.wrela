@@ -1,0 +1,459 @@
+// The simulation's vocabulary: the traits that mark sim state, and the sim's values for a
+// creature (its place, gait, pose and the ground it stands on).
+//
+// Sim state is ordinary values, rolled back by cloning and checked by the derived `StateHash`
+// (language.md §6.11). `SimState` is a declared trait with a structural check: every field of a
+// type that declares it must have it, so presentation data can't slip into what's rolled back.
+// The engine writes the check's error message (`@diagnostic` on `SimState`).
+
+use creature::{Bone, Chain, Skeleton}
+use rng::{Rng, Seed}
+use std::arena::{Arena, Handle, SortedMap}
+use std::hash::StateHash
+use std::serialize::Serialize
+use std::units::{cm, m}
+
+/// Data the simulation rolls back and hashes: the same on every client.
+@diagnostic(
+    "`{Self}` isn't sim state: sim state is rolled back and hashed, so it must be the same on every client. Presentation data (poses for drawing, springs, sounds) lives outside it; declare `SimState` on `{Self}` only if it's simulation data",
+)
+@fieldwise
+pub trait SimState {}
+
+/// Sim state that owns heap data: rolled back by cloning, hashed and saved.
+pub trait Sim = Clone + StateHash + Serialize + SimState
+
+/// Sim state that's a small value: copied, compared, hashed and saved.
+pub trait SimValue = Copy + Eq + StateHash + Serialize + SimState
+
+impl SimState for bool {}
+
+impl SimState for u8 {}
+
+impl SimState for u32 {}
+
+impl SimState for i32 {}
+
+impl SimState for u64 {}
+
+impl SimState for f32 {}
+
+impl SimState for f64 {}
+
+impl SimState for vec2 {}
+
+impl SimState for vec3 {}
+
+impl SimState for vec4 {}
+
+impl<T: SimState> SimState for Vec<T> {}
+
+impl<T: SimState> SimState for Option<T> {}
+
+impl<T: SimState> SimState for Arena<T> {}
+
+impl<T> SimState for Handle<T> {}
+
+impl<K: SimState, V: SimState> SimState for SortedMap<K, V> {}
+
+impl<T: SimState> SimState for Box<T> {}
+
+impl SimState for String {}
+
+impl SimState for Seed {}
+
+impl SimState for Rng {}
+
+impl SimState for Bone {}
+
+/// A simulation tick's number.
+pub type Tick = u32
+
+pub const DOWN: vec3 = vec3(0, -1, 0)
+
+/// Where a body is, and which way it faces (radians about +y, 0 facing +z).
+pub struct Transform: SimValue + Plain {
+    pub pos: vec3,
+    pub heading: f32,
+}
+
+impl Transform {
+    /// Moved by `motion`, in the body's own frame (x right, z forward), turned by `motion.y`.
+    pub fn advance(self, motion: vec3) -> Transform {
+        let (c, s) = (cos(self.heading), sin(self.heading))
+        let forward = vec3(s, 0, c) * motion.z + vec3(c, 0, -s) * motion.x
+        Transform { pos: self.pos + forward, heading: self.heading + motion.y }
+    }
+
+    pub fn forward(self) -> vec3 {
+        vec3(sin(self.heading), 0, cos(self.heading))
+    }
+
+    /// A point in the body's own space (x right, z forward), in the world.
+    pub fn to_world(self, p: vec3) -> vec3 {
+        let (c, s) = (cos(self.heading), sin(self.heading))
+        self.pos + vec3(c * p.x + s * p.z, p.y, -s * p.x + c * p.z)
+    }
+
+    /// A ray's hit, in the body's own space.
+    pub fn to_local(self, h: Hit) -> Hit {
+        let (c, s) = (cos(self.heading), sin(self.heading))
+        let d = h.point - self.pos
+        let n = h.normal
+        Hit {
+            point: vec3(c * d.x - s * d.z, d.y, s * d.x + c * d.z),
+            normal: vec3(c * n.x - s * n.z, n.y, s * n.x + c * n.z),
+            distance: h.distance,
+            hit: h.hit,
+        }
+    }
+}
+
+/// What a creature is, as sim state names it: a definition plus a seed, never a handle into
+/// something outside the state.
+pub struct CreatureKey: SimValue {
+    pub kind: u32,
+    pub seed: Seed,
+}
+
+/// How much of a creature the simulation runs: `Full`, its pose too; `Ambient`, its
+/// root and gait only.
+pub enum SimTier: SimValue {
+    Full,
+    Ambient,
+}
+
+pub enum Mode: SimValue {
+    Graze,
+    Walk,
+    Flee,
+}
+
+/// A gait: where in its stride, how fast (m/s), and in which mode.
+pub struct GaitState: SimValue {
+    pub phase: f32,
+    pub speed: f32,
+    pub turn: f32,
+    pub mode: Mode,
+}
+
+/// What a creature wants this tick: which way to turn (radians), how fast to go, and whether
+/// to flee.
+pub struct Intent: Copy + Eq + StateHash + Serialize {
+    pub turn: f32,
+    pub speed: f32,
+    pub flee: bool,
+}
+
+/// A stride's length, per metre of speed.
+const STRIDE: f32 = 1.4m
+
+impl GaitState {
+    /// A tick's motion, `dt` seconds long: forward by speed, turned by `turn`
+    /// (Transform::advance's frame).
+    pub fn root_motion(self, dt: f32) -> vec3 {
+        vec3(0, self.turn * dt, self.speed * dt)
+    }
+
+    /// The gait `dt` seconds later with no controller: the stride's phase advances as
+    /// `GaitNet::eval` advances it before its corrections.
+    pub fn advance(self, dt: f32) -> GaitState {
+        GaitState { phase: (self.phase + dt * (0.5 + self.speed / STRIDE)) % 1.0, ..self }
+    }
+
+    /// The pose the gait gives, on flat ground: each leg's foot swings with the stride.
+    pub fn pose(self) -> Pose {
+        var legs = [LegPose { hip: vec3(), foot: vec3(), planted: false }; 4]
+        for i in 0..4 {
+            // Diagonal pairs move together: a walk.
+            let offset = if i == 0 || i == 3 { 0.0 } else { 0.5 }
+            let t = (self.phase + offset) % 1.0
+            let side = if i % 2 == 0 { 25cm } else { -25cm }
+            let along = if i < 2 { 1.25m } else { 0.05m }
+            let swing = (t - 0.5) * STRIDE * min(self.speed, 2.0) * 0.5
+            let lift = if t > 0.5 { 8cm * sin((t - 0.5) * 6.2831855) } else { 0.0 }
+            legs[i] = LegPose {
+                hip: vec3(side, 1.2m, along),
+                foot: vec3(side, lift, along + swing),
+                planted: false,
+            }
+        }
+        Pose { joints: Vec::new(), legs }
+    }
+}
+
+/// A ray's hit: where, the surface's normal there, and how far along the ray. `hit` is false
+/// when nothing was found within reach.
+pub struct Hit: Copy + StateHash {
+    pub point: vec3,
+    pub normal: vec3,
+    pub distance: f32,
+    pub hit: bool,
+}
+
+/// One leg's pose: its hip and foot (rest-space metres), and whether the foot is planted.
+pub struct LegPose: SimValue {
+    pub hip: vec3,
+    pub foot: vec3,
+    pub planted: bool,
+}
+
+impl LegPose {
+    pub fn foot_pos(self) -> vec3 {
+        self.foot
+    }
+
+    /// Plants the foot on `on`, if the ground is within the leg's reach (two-bone IK keeps the
+    /// hip; the knee follows).
+    pub fn plant(mut self, on: Hit) {
+        if on.hit && length(on.point - self.hip) < 1.4m {
+            self.foot = on.point
+            self.planted = true
+        }
+    }
+}
+
+/// A creature's pose: its joints' positions, and its legs (a run, so a loop can change each).
+pub struct Pose: Clone + Eq + StateHash + Serialize + SimState {
+    pub joints: Vec<vec3>,
+    pub legs: [LegPose; 4],
+}
+
+/// Ground a body stands on: a signed distance, which the engine raycasts.
+pub trait Ground {
+    /// The signed distance to the ground's surface (negative below it).
+    fn ground(self, p: vec3) -> f32
+
+    /// Sphere tracing from `from` along `dir` (a unit vector), for up to 4 m. The magnitude of
+    /// the ground's distance must not overestimate, including when the ray starts inside.
+    fn raycast(self, from: vec3, dir: vec3) -> Hit {
+        var t = 0.0
+        for _ in 0..64 {
+            let p = from + dir * t
+            let d = self.ground(p)
+            if abs(d) < 1mm {
+                return Hit { point: p, normal: self.normal(p), distance: t, hit: true }
+            }
+            t += abs(d)
+            if t > 4m {
+                break
+            }
+        }
+        Hit { point: from, normal: vec3(0, 1, 0), distance: t, hit: false }
+    }
+
+    /// The ground's normal at `p`: its distance's gradient, by central differences (a ground
+    /// needn't be derivable: an edit log is data).
+    fn normal(self, p: vec3) -> vec3 {
+        let e = 1cm
+        let g = vec3(
+            self.ground(p + vec3(e, 0, 0)) - self.ground(p - vec3(e, 0, 0)),
+            self.ground(p + vec3(0, e, 0)) - self.ground(p - vec3(0, e, 0)),
+            self.ground(p + vec3(0, 0, e)) - self.ground(p - vec3(0, 0, e)),
+        )
+        if dot(g, g) > 0.0 { normalize(g) } else { vec3(0, 1, 0) }
+    }
+
+    /// How steep the ground is under a body, ahead of it: the slope (rise over run) along its
+    /// heading.
+    fn slope_under(self, at: Transform) -> f32 {
+        let n = self.normal(at.pos)
+        let f = at.forward()
+        -dot(n, f) / max(n.y, 0.1)
+    }
+}
+
+struct RayGround: Copy {}
+
+impl Ground for RayGround {
+    fn ground(self, p: vec3) -> f32 {
+        length(p) - 0.5
+    }
+}
+
+@test
+fn a_ground_raycast_from_inside_moves_forward_to_the_surface() {
+    let hit = RayGround {}.raycast(vec3(0.0), vec3(1.0, 0.0, 0.0))
+    assert(hit.hit && abs(hit.distance - 0.5) < 0.001, "the hit is ahead of the ray's origin")
+    assert(length(hit.point - vec3(0.5, 0.0, 0.0)) < 0.001)
+    assert(hit.normal.x > 0.99)
+}
+
+impl Pose {
+    /// The pose with its feet planted on `ground`, below each foot.
+    pub fn planted_on<G: Ground>(take self, ground: G) -> Pose {
+        var out = take self
+        for mut leg in out.legs {
+            let hit = ground.raycast(leg.foot + vec3(0, 1m, 0), DOWN)
+            leg.plant(hit)
+        }
+        out
+    }
+
+    /// The pose with `layer` applied: secondary motion over it.
+    pub fn layer<L: Layer>(take self, layer: L) -> Pose {
+        var out = take self
+        layer.apply(mut out)
+        out
+    }
+
+    /// The positions of a chain's joints, as this pose has them (the rest positions when the
+    /// pose has no joints of its own).
+    pub fn chain(self, c: Chain, rest: Skeleton) -> ChainPose {
+        var out = ChainPose { joints: Bounded::new() }
+        for i in 0..min(c.len(), out.joints.capacity()) {
+            let b = c.joint(i)
+            out.joints.push(if b.index < self.joints.len() { self.joints[b.index] } else {
+                rest.rest(b)
+            })
+        }
+        out
+    }
+}
+
+/// A chain's joint positions, at most 8.
+pub struct ChainPose: Copy {
+    pub joints: Bounded<vec3, 8>,
+}
+
+/// Secondary motion drawn over a pose.
+pub trait Layer {
+    fn apply(self, pose: mut Pose)
+}
+
+/// A damped spring: where it is, and how fast it's moving. A layer's are presentation only,
+/// never rolled back; a walker's (`gait::Walker`) are its sim's state.
+pub struct Spring: Copy + Eq + Plain + StateHash + Serialize + SimState {
+    pub pos: vec3,
+    pub vel: vec3,
+}
+
+/// Springs along a chain, following its joints a little late: a tail's sway.
+pub struct SpringChain: Copy {
+    pub springs: Bounded<Spring, 8>,
+    pub stiffness: f32,
+}
+
+impl Spring {
+    /// One step towards `target`, critically damped-ish.
+    pub fn follow(mut self, target: vec3, stiffness: f32, dt: f32) {
+        let a = (target - self.pos) * stiffness - self.vel * (2.0 * sqrt(stiffness))
+        self.vel += a * dt
+        self.pos += self.vel * dt
+    }
+}
+
+impl SpringChain {
+    pub fn new(count: u32, stiffness: f32) -> SpringChain {
+        var springs = Bounded::new()
+        for _ in 0..min(count, springs.capacity()) {
+            springs.push(Spring { pos: vec3(), vel: vec3() })
+        }
+        SpringChain { springs, stiffness }
+    }
+
+    /// Follows the chain's joints.
+    pub fn follow(mut self, target: ChainPose, dt: f32) {
+        for i in 0..min(self.springs.len(), target.joints.len()) {
+            self.springs[i].follow(target.joints[i], self.stiffness, dt)
+        }
+    }
+}
+
+impl Layer for SpringChain {
+    fn apply(self, pose: mut Pose) {
+        // The springs' sway moves the pose's last joints (a tail's tip); with no joints, nothing.
+        let n = min(self.springs.len(), pose.joints.len())
+        for i in 0..n {
+            let j = pose.joints.len() - n + i
+            pose.joints[j] = mix(pose.joints[j], self.springs[i].pos, 0.5)
+        }
+    }
+}
+
+impl Layer for [Spring; 2] {
+    fn apply(self, pose: mut Pose) {
+        // Ears: no joints of their own in the pose; they're drawn from the springs directly.
+    }
+}
+
+/// A frame's draw list: the engine finds each creature's realized mesh by its key.
+pub struct Frame {
+    pub items: Vec<DrawItem>,
+}
+
+pub struct DrawItem: Clone {
+    pub kind: CreatureKey,
+    pub pose: Pose,
+}
+
+impl Frame {
+    pub fn new() -> Frame {
+        Frame { items: Vec::new() }
+    }
+
+    pub fn draw(mut self, kind: CreatureKey, pose: take Pose) {
+        self.items.push(DrawItem { kind, pose })
+    }
+}
+
+/// A small learned controller, trained offline: a multilayer perceptron whose weights
+/// are embedded bytes, read in place (little-endian f32s: 8 inputs to 8 hidden units, tanh,
+/// to 4 outputs, each layer's weights row by row then its biases).
+pub struct GaitNet: Copy {
+    pub weights: Bytes,
+}
+
+const INPUTS: u32 = 8
+const HIDDEN: u32 = 8
+const OUTPUTS: u32 = 4
+
+impl GaitNet {
+    fn weight(self, i: u32) -> f32 {
+        self.weights.f32_le(4 * i)
+    }
+
+    /// The gait a tick (`dt` seconds) later, from this one, what the creature wants, and the
+    /// ground's slope.
+    @deterministic
+    pub fn eval(self, gait: GaitState, intent: Intent, slope: f32, dt: f32) -> GaitState {
+        let x = [
+            sin(gait.phase * 6.2831855),
+            cos(gait.phase * 6.2831855),
+            gait.speed,
+            intent.speed,
+            intent.turn,
+            if intent.flee { 1.0 } else { 0.0 },
+            slope,
+            1.0,
+        ]
+        var h = [0.0; 8]
+        for j in 0..HIDDEN {
+            var sum = self.weight(INPUTS * HIDDEN + j)
+            for i in 0..INPUTS {
+                sum += self.weight(j * INPUTS + i) * x[i]
+            }
+            h[j] = tanh(sum)
+        }
+        let base = INPUTS * HIDDEN + HIDDEN
+        var y = [0.0; 4]
+        for k in 0..OUTPUTS {
+            var sum = self.weight(base + HIDDEN * OUTPUTS + k)
+            for j in 0..HIDDEN {
+                sum += self.weight(base + k * HIDDEN + j) * h[j]
+            }
+            y[k] = sum
+        }
+        // Outputs: the stride's step, a speed correction, a turn correction, and fear.
+        let speed = max(0.0, mix(gait.speed, intent.speed, 0.1) + 0.05 * y[1])
+        let mode = if intent.flee || y[3] > 2.0 { Mode::Flee } else if speed > 0.2 {
+            Mode::Walk
+        } else { Mode::Graze }
+        GaitState {
+            phase: (gait.phase + dt * (0.5 + speed / STRIDE) * (1.0 + 0.05 * y[0])) % 1.0,
+            speed,
+            turn: mix(gait.turn, intent.turn, 0.2) + 0.01 * y[2],
+            mode,
+        }
+    }
+}

@@ -1,0 +1,8 @@
+# A frozen copy of examples/herd at dc0f28e0 (its modules, not its tests), on the frozen engine: an
+# input of the compiler's tests (herd.rs: its grazer against spike 01's WGSL and skin weights),
+# never updated with the example.
+[package]
+name = "herd"
+
+[dependencies]
+engine = { path = "../engine" }

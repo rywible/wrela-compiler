@@ -1,0 +1,194 @@
+// The herd's terrain (#43 §12): spike 01's two. The one drawn is a displaced grid, 256² quads
+// over 160 m, its height a sum of sines; the sim's is a CPU field, five noise octaves and 32
+// sphere edits, which the grazers' feet raycast. The two differ by metres; M5 replaces both with
+// one (#28).
+
+use engine::render::View
+use engine::sim::{Sim, SimState}
+use std::field::{smin, value_noise}
+use std::gpu::{ClipPosition, VertexIndex}
+use std::hash::StateHash
+use std::serialize::Serialize
+
+// ---- the terrain drawn --------------------------------------------------------------------------
+
+/// The drawn terrain's height at (x, z): spike 01's `terrainHeight` (draw.wgsl's `terrain_h`).
+pub fn height(x: f32, z: f32) -> f32 {
+    60cm * sin(0.11 * x) * cos(0.09 * z) +
+        30cm * sin(0.23 * x + 1.3) * sin(0.19 * z + 0.4) +
+        8cm * sin(0.9 * x) * cos(0.7 * z)
+}
+
+/// Quads along each side of the drawn grid, and its size (m).
+pub const GRID: u32 = 256
+pub const SIZE: f32 = 160m
+
+/// What the terrain's vertex shader passes on.
+pub struct Ground: Copy {
+    pub clip: ClipPosition,
+    pub world: vec3,
+    pub normal: vec3,
+}
+
+/// Vertex `v` of the drawn grid: quad `v / 6`, row by row, two triangles each.
+@vertex
+pub fn ground(v: VertexIndex, view: View) -> Ground {
+    let qx = [0, 1, 1, 0, 1, 0]
+    let qz = [0, 0, 1, 0, 1, 1]
+    let q = v.index / 6
+    let c = v.index % 6
+    let gx = f32(q % GRID + qx[c]) / f32(GRID) - 0.5
+    let gz = f32(q / GRID + qz[c]) / f32(GRID) - 0.5
+    let (x, z) = (gx * SIZE, gz * SIZE)
+    let e = 10cm
+    let world = vec3(x, height(x, z), z)
+    let n = vec3(height(x - e, z) - height(x + e, z), 2.0 * e, height(x, z - e) - height(x, z + e))
+    Ground {
+        clip: ClipPosition { position: view.view_proj * vec4(world, 1.0) },
+        world,
+        normal: normalize(n),
+    }
+}
+
+// ---- the sim's terrain ----------------------------------------------------------------------------
+
+/// An edit of the sim's terrain: a sphere added or cut.
+pub struct Edit: Copy + Eq + StateHash + Serialize + SimState {
+    pub at: vec3,
+    pub radius: f32,
+    pub add: bool,
+}
+
+/// Spike 01's xorshift32, and its draws in [0, 1).
+pub struct XorShift: Copy {
+    pub state: u32,
+}
+
+impl XorShift {
+    pub fn next(mut self) -> u32 {
+        var x = self.state
+        x = x ^ (x << 13)
+        x = x ^ (x >> 17)
+        x = x ^ (x << 5)
+        self.state = x
+        x
+    }
+
+    pub fn unit(mut self) -> f32 {
+        f32(self.next() >> 8) * (1.0 / 16777216.0)
+    }
+
+    /// A point in the box from `lo` to `hi`: three draws, for x, y and z.
+    pub fn point(mut self, lo: vec3, hi: vec3) -> vec3 {
+        let e = hi - lo
+        let x = self.unit()
+        let y = self.unit()
+        let z = self.unit()
+        lo + vec3(x * e.x, y * e.y, z * e.z)
+    }
+}
+
+/// The sim's terrain (spike 01's CPU `Terrain`): a height field of five noise octaves, and its
+/// edits, in order.
+pub struct Terrain: Sim {
+    pub edits: Vec<Edit>,
+}
+
+impl Terrain {
+    /// The spike's `Terrain::new(seed)`: 32 spheres of 1 to 4 m on the height field, every third
+    /// added, the rest cut.
+    pub fn new(seed: u32) -> Terrain {
+        var r = XorShift { state: seed | 1 }
+        var edits: Vec<Edit> = Vec::with_capacity(32)
+        for i in 0..32 {
+            let x = r.unit() * 120m - 60m
+            let z = r.unit() * 120m - 60m
+            let y = field_height(x, z)
+            edits.push(Edit { at: vec3(x, y, z), radius: 1m + 3m * r.unit(), add: i % 3 == 0 })
+        }
+        Terrain { edits }
+    }
+
+    /// The height field's height at (x, z).
+    pub fn height(self, x: f32, z: f32) -> f32 {
+        field_height(x, z)
+    }
+
+    /// The signed distance's bound: the height field's term halved (for slopes up to about 1.7),
+    /// then each edit.
+    @deterministic
+    pub fn distance(self, p: vec3) -> f32 {
+        self.distance_above(p, field_height(p.x, p.z))
+    }
+
+    /// The same distance with the height field already sampled, before the sphere edits.
+    fn distance_above(self, p: vec3, height: f32) -> f32 {
+        var d = (p.y - height) * 0.5
+        for e in self.edits {
+            let s = length(p - e.at) - e.radius
+            d = if e.add { smin(d, s, 50cm) } else { -smin(-d, s, 50cm) }
+        }
+        d
+    }
+
+    /// Sphere tracing from `from` along `dir`, at most 128 steps and `max_t` metres: how far
+    /// it went to a hit (nearer than 1 mm), or -1, and how many steps it took.
+    @deterministic
+    pub fn raycast(self, from: vec3, dir: vec3, max_t: f32) -> (f32, u32) {
+        // A foot's vertical ray stays in one column: sample its five noise octaves once.
+        // Use the first march point, including its signed-zero arithmetic. A nonfinite t
+        // changes zero * t to NaN, so that step still takes the ordinary distance path.
+        let vertical = dir.x == 0.0 && dir.z == 0.0
+        let first = from + dir * 0.0
+        let height = if vertical { field_height(first.x, first.z) } else { 0.0 }
+        var t = 0.0
+        for i in 1..129 {
+            let p = from + dir * t
+            let d = if vertical && (bitcast_u32(t) & 0x7f800000) != 0x7f800000 {
+                self.distance_above(p, height)
+            } else {
+                self.distance(p)
+            }
+            if d < 1mm {
+                return (t, i)
+            }
+            t += max(d, 1mm)
+            if t > max_t {
+                return (-1.0, i)
+            }
+        }
+        (-1.0, 128)
+    }
+}
+
+/// The sim terrain's height field: five octaves of value noise.
+fn field_height(x: f32, z: f32) -> f32 {
+    var s = 0.0
+    var a = 4m
+    var f = 0.02
+    for _ in 0..5 {
+        s += a * value_noise(vec3(x * f, 0.5, z * f))
+        a *= 0.5
+        f *= 2.0
+    }
+    s
+}
+
+/// The spike's raycast benchmark (`raycast_bench`): `n` rays straight down from 1.5 m above
+/// random points of the height field; the steps they took in all, and how many hit.
+@deterministic
+pub fn raycast_bench(t: Terrain, n: u32) -> (u32, u32) {
+    var r = XorShift { state: 4242 }
+    var steps = 0
+    var hits = 0
+    for _ in 0..n {
+        let x = r.unit() * 100m - 50m
+        let z = r.unit() * 100m - 50m
+        let (hit, e) = t.raycast(vec3(x, t.height(x, z) + 1.5m, z), vec3(0.0, -1.0, 0.0), 10m)
+        steps += e
+        if hit >= 0.0 {
+            hits += 1
+        }
+    }
+    (steps, hits)
+}

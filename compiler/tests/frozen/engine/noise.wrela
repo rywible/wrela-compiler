@@ -1,0 +1,291 @@
+// Cheap hashes and value noise for content that is cooked or placed: the same on the CPU and the
+// GPU, bit for bit where their arithmetic is (a lattice's hash is integer arithmetic).
+//
+// Use it for terrain, placement and brush dabs, which evaluate many points once each: hashes
+// and draws (`hash2`, `rand`, `pick`), value noise (`noise2`, `noise3`, `fbm2`, `ridged2`), noise
+// filtered for a sample's width (`noise2_seen`, `fbm2_seen`), and hashed thresholds that hold
+// still on a surface (`hashed_threshold_of`). A field drawn per pixel needs std's `value_noise`
+// instead, which hashes three times a corner and filters by a footprint.
+
+use std::field::hash_u32
+use std::math::TAU
+
+/// A hash's top 24 bits as a value in [0, 1).
+fn unit(h: u32) -> f32 {
+    f32(h >> 8) * (1.0 / 16777216.0)
+}
+
+/// A lattice point's hash, of a seed's lattice (`hash2`'s is seed 0).
+pub fn hash2u(x: i32, y: i32, seed: u32) -> u32 {
+    hash_u32(u32(x).wrapping_mul(1597334677) ^ u32(y).wrapping_mul(3812015801) ^ seed)
+}
+
+/// A lattice point's value in [0, 1).
+pub fn hash2(x: i32, y: i32) -> f32 {
+    unit(hash2u(x, y, 0))
+}
+
+/// A lattice point's value in [0, 1), in 3D.
+pub fn hash3(x: i32, y: i32, z: i32) -> f32 {
+    unit(
+        hash_u32(
+            u32(x).wrapping_mul(1597334677) ^
+                u32(y).wrapping_mul(3812015801) ^
+                u32(z).wrapping_mul(2798796415),
+        ),
+    )
+}
+
+/// A whole number's draw in [0, 1), for placing things: `n`'s `k`th.
+pub fn rand(n: u32, k: u32) -> f32 {
+    unit(hash_u32(n.wrapping_mul(2654435761) ^ hash_u32(k)))
+}
+
+/// `n`'s `k`th draw, in [lo, hi).
+pub fn pick(n: u32, k: u32, lo: f32, hi: f32) -> f32 {
+    lo + (hi - lo) * rand(n, k)
+}
+
+/// A unit vector from two draws in [0, 1), uniform over the sphere.
+pub fn direction(u: f32, v: f32) -> vec3 {
+    let z = 2.0 * u - 1.0
+    let a = TAU * v
+    let r = sqrt(max(1.0 - z * z, 0.0))
+    vec3(r * cos(a), z, r * sin(a))
+}
+
+/// Value noise in [0, 1], one cell per unit, faded smoothly between lattice points.
+pub fn noise2(p: vec2) -> f32 {
+    let i = floor(p)
+    let f = p - i
+    let u = f * f * (vec2(3.0) - 2.0 * f)
+    let (x, y) = (i32(i.x), i32(i.y))
+    let a = hash2(x, y)
+    let b = hash2(x + 1, y)
+    let c = hash2(x, y + 1)
+    let d = hash2(x + 1, y + 1)
+    mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+}
+
+/// `noise2` repeating every `period` cells each way (a tile that wraps: a cooked texture's).
+pub fn noise2_wrapped(p: vec2, period: vec2i) -> f32 {
+    let i = floor(p)
+    let f = p - i
+    let u = f * f * (vec2(3.0) - 2.0 * f)
+    let (x, y) = (i32(i.x), i32(i.y))
+    let (x0, x1) = (wrapped(x, period.x), wrapped(x + 1, period.x))
+    let (y0, y1) = (wrapped(y, period.y), wrapped(y + 1, period.y))
+    let a = hash2(x0, y0)
+    let b = hash2(x1, y0)
+    let c = hash2(x0, y1)
+    let d = hash2(x1, y1)
+    mix(mix(a, b, u.x), mix(c, d, u.x), u.y)
+}
+
+/// `v` wrapped into [0, `n`), for a positive period `n`.
+pub fn wrapped(v: i32, n: i32) -> i32 {
+    let r = v % n
+    if r < 0 { r + n } else { r }
+}
+
+/// Value noise in [0, 1], in 3D.
+pub fn noise3(p: vec3) -> f32 {
+    let i = floor(p)
+    let f = p - i
+    let u = f * f * (vec3(3.0) - 2.0 * f)
+    let (x, y, z) = (i32(i.x), i32(i.y), i32(i.z))
+    let a = mix(
+        mix(hash3(x, y, z), hash3(x + 1, y, z), u.x),
+        mix(hash3(x, y + 1, z), hash3(x + 1, y + 1, z), u.x),
+        u.y,
+    )
+    let b = mix(
+        mix(hash3(x, y, z + 1), hash3(x + 1, y, z + 1), u.x),
+        mix(hash3(x, y + 1, z + 1), hash3(x + 1, y + 1, z + 1), u.x),
+        u.y,
+    )
+    mix(a, b, u.z)
+}
+
+/// Fractal value noise in about [0, 1]: `octaves` layers, each turned and at twice the
+/// frequency and half the amplitude of the last; 0 with no layers.
+pub fn fbm2(p: vec2, octaves: u32) -> f32 {
+    if octaves == 0 {
+        return 0.0
+    }
+    var q = p
+    var s = 0.0
+    var a = 0.5
+    var total = 0.0
+    for _ in 0..octaves {
+        s += a * noise2(q)
+        total += a
+        q = vec2(1.6 * q.x - 1.2 * q.y, 1.2 * q.x + 1.6 * q.y) + vec2(17.3, -9.1)
+        a *= 0.5
+    }
+    s / total
+}
+
+/// How much of a layer of noise a sample `w` of its cells wide keeps: all of it while the sample
+/// is under a quarter of a cell, none past three quarters (it averages to the layer's mean).
+fn kept_at(w: f32) -> f32 {
+    1.0 - smoothstep(0.25, 0.75, w)
+}
+
+/// `noise2` as a sample `w` cells wide sees it: faded to its mean (0.5) as the sample grows past
+/// its cells, so what's cooked or drawn far off doesn't alias. 0 wide, `noise2` itself.
+pub fn noise2_seen(p: vec2, w: f32) -> f32 {
+    seen(p, kept_at(w))
+}
+
+/// `noise2` at `p` kept `k` of the way from its mean: a mix's weight of 0 keeps its first value
+/// exactly, so a layer faded out entirely isn't evaluated.
+fn seen(p: vec2, k: f32) -> f32 {
+    if k == 0.0 {
+        return 0.5
+    }
+    mix(0.5, noise2(p), k)
+}
+
+/// `fbm2` as a sample `w` of its first layer's cells wide sees it: each layer finer than the
+/// sample fades to its mean (each is twice as fine as the last), so a far level of a clipmap,
+/// whose texels are many cells apart, gets its broad shapes and not their aliases (a marbling on
+/// the far land). 0 wide, `fbm2` itself; 0 with no layers.
+pub fn fbm2_seen(p: vec2, octaves: u32, w: f32) -> f32 {
+    if octaves == 0 {
+        return 0.0
+    }
+    var q = p
+    var s = 0.0
+    var a = 0.5
+    var total = 0.0
+    var f = 1.0
+    for _ in 0..octaves {
+        s += a * seen(q, kept_at(w * f))
+        total += a
+        q = vec2(1.6 * q.x - 1.2 * q.y, 1.2 * q.x + 1.6 * q.y) + vec2(17.3, -9.1)
+        a *= 0.5
+        f *= 2.0
+    }
+    s / total
+}
+
+/// Ridged fractal noise in about [0, 1]: sharp crests where the noise crosses its middle; 0 with
+/// no layers.
+pub fn ridged2(p: vec2, octaves: u32) -> f32 {
+    if octaves == 0 {
+        return 0.0
+    }
+    var q = p
+    var s = 0.0
+    var a = 0.5
+    var total = 0.0
+    for _ in 0..octaves {
+        let n = 1.0 - abs(2.0 * noise2(q) - 1.0)
+        s += a * n * n
+        total += a
+        q = vec2(1.6 * q.x - 1.2 * q.y, 1.2 * q.x + 1.6 * q.y) + vec2(-4.7, 13.9)
+        a *= 0.5
+    }
+    s / total
+}
+
+/// A cell's draw in [0, 1): the cell at `c` (whole numbers) of a seed's lattice.
+pub fn cell_draw(c: vec2, seed: u32) -> f32 {
+    unit(hash2u(i32(c.x), i32(c.y), seed))
+}
+
+/// How wide a cell `cell` pixels wide is in `p`'s units (for `hashed_threshold_of`): a fragment
+/// shader's, in uniform control flow (its derivatives).
+pub fn cell_size(p: vec2, cell: f32) -> f32 {
+    max(length(dpdx(p)), length(dpdy(p))) * cell
+}
+
+/// The finer of the two powers of two round `size`, and how far `size` is from it toward the
+/// coarser (in [0, 1), in octaves).
+fn octave_of(size: f32) -> (f32, f32) {
+    let level = log2(max(size, 1.0e-8))
+    (exp2(floor(level)), fract(level))
+}
+
+/// A hashed alpha threshold: a draw in (0, 1] for the point `p` of
+/// a surface's own coordinates, which holds still on the surface. `p` is cut into cells `size`
+/// wide in its units (`cell_size`: a few pixels; at the two powers of two round that size, the
+/// draws blended by where it falls between them and made uniform again), so as temporal AA's
+/// jitter moves a pixel's sample over the surface, a pixel a part `c` covered is kept `c` of the
+/// time. It takes no derivatives, so a shader can draw it only where it needs it (a pixel a leaf
+/// covers in part).
+pub fn hashed_threshold_of(p: vec2, seed: u32, size: f32) -> f32 {
+    let (lo, f) = octave_of(size)
+    let a = cell_draw(floor(p / lo), seed)
+    let b = cell_draw(floor(p / (lo * 2.0)), seed ^ 2654435769)
+    let x = mix(a, b, f)
+    // The blend of two uniform draws is trapezoidal: its distribution maps it back to uniform.
+    let m = max(min(f, 1.0 - f), 1.0e-6)
+    let k = 2.0 * m * (1.0 - m)
+    let t = if x < m {
+        x * x / k
+    } else if x < 1.0 - m {
+        (x - 0.5 * m) / (1.0 - m)
+    } else {
+        1.0 - (1.0 - x) * (1.0 - x) / k
+    }
+    clamp(t, 1.0e-6, 1.0)
+}
+
+/// A draw in [0, 1) that holds still on a surface: the point `p` of its own coordinates cut
+/// into cells `cell` pixels wide (the finer power of two round that size), the `k`th draw of a
+/// seed's. For shading that varies pixel to pixel but not frame to frame. A fragment shader's,
+/// in uniform control flow (its derivatives).
+pub fn surface_draw(p: vec2, seed: u32, k: u32, cell: f32) -> f32 {
+    let (lo, _) = octave_of(cell_size(p, cell))
+    cell_draw(floor(p / lo), seed ^ hash_u32(k))
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+@test
+fn wrapping_large_positive_periods_does_not_overflow() {
+    assert(wrapped(v: 1500000000, n: 2000000000) == 1500000000)
+    assert(wrapped(v: -1500000000, n: 2000000000) == 500000000)
+    assert(wrapped(v: -2147483647 - 1, n: 2147483647) == 2147483646)
+    assert(wrapped(v: 2000000000, n: 2000000000) == 0)
+}
+
+/// An empty fractal has no contribution, rather than dividing its empty sum by an empty weight.
+@test
+fn zero_octaves_are_zero() {
+    let p = vec2(0.2, 0.7)
+    assert(fbm2(p, 0) == 0.0, "zero-octave value noise isn't zero")
+    assert(fbm2_seen(p, 0, 2.0) == 0.0, "zero-octave filtered noise isn't zero")
+    assert(ridged2(p, 0) == 0.0, "zero-octave ridged noise isn't zero")
+}
+
+/// Faded layers left out (`seen`) give the same bits as every layer mixed toward its mean, over
+/// widths from a fraction of a cell (all kept) to many cells (all faded) and the ramp between.
+@test
+fn faded_layers_left_out_give_the_same_bits() {
+    for i in 0..256 {
+        let p = vec2(rand(i, 0), rand(i, 1)) * 400.0 - vec2(200.0)
+        let w = exp2(rand(i, 2) * 12.0 - 6.0)
+        for octaves in 1..6 {
+            var q = p
+            var s = 0.0
+            var a = 0.5
+            var total = 0.0
+            var f = 1.0
+            for _ in 0..octaves {
+                s += a * mix(0.5, noise2(q), kept_at(w * f))
+                total += a
+                q = vec2(1.6 * q.x - 1.2 * q.y, 1.2 * q.x + 1.6 * q.y) + vec2(17.3, -9.1)
+                a *= 0.5
+                f *= 2.0
+            }
+            assert(fbm2_seen(p, octaves, w) == s / total, "a faded layer left out changed fbm")
+        }
+        assert(
+            noise2_seen(p, w) == mix(0.5, noise2(p), kept_at(w)),
+            "a faded layer left out changed noise",
+        )
+    }
+}

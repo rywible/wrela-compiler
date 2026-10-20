@@ -1,0 +1,125 @@
+// The grazer as a program. It realizes the grazer's mesh once (sketch 02's extraction) and walks
+// it on the spot with sketch 01's cycle, skinned by the palette the gait's pose gives
+// (`engine::walk`). Its exports give the tests (subjects.rs) the grazer's distance and points
+// around it; the lens draws it too (`wrela tool studio -- content/grazer`).
+
+use creature::{Coat, grazer}
+use engine::creature::Creature
+use engine::look::CreatureLook
+use engine::render::Shaded
+use engine::walk::{Walker, walker}
+use std::derive::Box3
+use std::field::{part_family, part_image}
+use std::lift::{Literal, count, gradient, literal, reads}
+use std::units::mm
+
+/// A box around the grazer, from the ground up: where its points are sampled.
+pub const AROUND: Box3 = Box3 { lo: vec3(-0.6, -0.02, -0.75), hi: vec3(0.6, 2.35, 2.25) }
+
+/// The grazer's distance at a point.
+pub fn distance(x: f32, y: f32, z: f32) -> f32 {
+    grazer().field().distance(vec3(x, y, z))
+}
+
+/// Point `i` of `AROUND`'s samples, seed `seed`.
+pub fn sample(seed: u32, i: u32) -> vec3 {
+    AROUND.sample(seed, i)
+}
+
+/// The grazer's gradient at a point.
+pub fn gradient_at(x: f32, y: f32, z: f32) -> vec3 {
+    grazer().field().gradient(vec3(x, y, z))
+}
+
+/// The part that decides the grazer's distance at a point, as its family (`part_family`): a part
+/// and its mirror image give the same number.
+pub fn part(x: f32, y: f32, z: f32) -> u32 {
+    let f = grazer().field()
+    part_family(f, f.part_at(vec3(x, y, z)).1)
+}
+
+/// Part `i`'s share in the distance at a point (`std::field::part_share`).
+pub fn part_share_at(x: f32, y: f32, z: f32, i: u32) -> f32 {
+    std::field::part_share(grazer().field(), vec3(x, y, z), i)
+}
+
+/// Part `i`'s mirror image (`part_image`: `i` if none).
+pub fn image_part(i: u32) -> u32 {
+    part_image(grazer().field(), i)
+}
+
+/// The part that decides the distance at a point (`Surface::part_at`'s index).
+pub fn part_index(x: f32, y: f32, z: f32) -> u32 {
+    grazer().field().part_at(vec3(x, y, z)).1
+}
+
+// ---- a lifted build's literals (`wrela build --lift grazer`), for the tests ------------------------
+
+/// How many literals the build lifted (0 in a build that isn't lifted).
+pub fn literals() -> u32 {
+    count()
+}
+
+pub fn value(i: u32) -> f32 {
+    if let Some(l) = literal(i) { l.value() } else { 0.0 }
+}
+
+pub fn set(i: u32, v: f32) {
+    if let Some(l) = literal(i) {
+        l.set(v)
+    }
+}
+
+/// The distance's derivative by literal `i` at a point.
+pub fn derivative(x: f32, y: f32, z: f32, i: u32) -> f32 {
+    let p = vec3(x, y, z)
+    let (_, d) = gradient(|| grazer().field().distance(p), [Literal { index: i }])
+    d[0]
+}
+
+/// How many literals the distance reads.
+pub fn reads_count() -> u32 {
+    reads(|| grazer().field().distance(vec3(0.0))).len()
+}
+
+/// The `k`th literal the distance reads, in index order.
+pub fn read_literal(k: u32) -> u32 {
+    reads(|| grazer().field().distance(vec3(0.0)))[k].index
+}
+
+impl Shaded for Coat {
+    fn albedo(self) -> vec3 {
+        vec3(self.albedo.r, self.albedo.g, self.albedo.b)
+    }
+
+    fn roughness(self) -> f32 {
+        0.8
+    }
+}
+
+/// The grazer's mesh: cells of 2 cm.
+const LOOK = CreatureLook { surface: engine::look::Mesh { tolerance: 1mm } }
+
+pub fn init() -> Walker {
+    walker(grazer(), LOOK)
+}
+
+pub fn frame(state: mut Walker, time: f32, width: u32, height: u32) {
+    state.frame(grazer(), width, height, eye: vec3(7.0, 2.6, 3.4), at: vec3(0.0, 1.1, 0.7))
+}
+
+/// Sketch 01's cycle for 120 frames: the legs keep their bones' lengths, each foot is where
+/// the gait puts it within 1 mm (or as near as its leg reaches: the gait's stride overreaches
+/// at its ends),
+/// the feet come down where they rest and lift, and every bone's matrix is finite.
+@test(frames: 120)
+fn walks_with_sketch_01s_cycle(state: Walker) {
+    let w = state.walked
+    assert(w.frames == 120)
+    assert(w.finite, "a bone's matrix isn't finite")
+    assert(w.length_error < 1.0e-4, f"a bone's length changed by {w.length_error} m")
+    assert(w.foot_error < 1mm, f"a foot is {w.foot_error} m from the gait's place, past its reach")
+    assert(w.overreached * 2 < 4 * w.frames, f"{w.overreached} feet were beyond their legs' reach")
+    assert(abs(w.lowest) < 1mm, f"the lowest a foot went is {w.lowest} m from its rest")
+    assert(w.highest > 2.0e-2, f"the highest a foot went is {w.highest} m above its rest")
+}

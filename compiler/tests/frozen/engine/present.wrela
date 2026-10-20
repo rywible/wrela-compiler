@@ -1,0 +1,116 @@
+// The sim as the frames see it: the snapshots a frame reads from the ticker's hand-off, kept
+// three deep, and where between two of them a frame draws.
+//
+// A frame draws sim time s = (now − t₀)·hz − MARGIN, in ticks run, where t₀ is the sim clock's
+// origin (`std::tick::origin`). It draws between the two kept snapshots around s, or the newest
+// (or oldest) if s is past it, with no extrapolation. In test mode's lockstep schedule t₀ is 0,
+// so s is the schedule's and frames compare across hosts.
+
+use run::Stamped
+use std::handoff::Latest
+use std::math::TAU
+use std::tick::origin
+
+/// How far behind the sim clock a frame draws, in ticks: a tick that's a little late (its
+/// compute time) is still in hand.
+pub const MARGIN: f32 = 0.25
+
+/// Two snapshots, and how far from the first to the second a frame draws, from 0 to 1.
+pub struct Between<S>: Copy {
+    pub a: S,
+    pub b: S,
+    pub alpha: f32,
+}
+
+/// The last three snapshots the frames read, oldest first, and the sim's rate.
+pub struct Snapshots<S: Copy + Plain> {
+    latest: Latest<Stamped<S>>,
+    kept: Bounded<Stamped<S>, 3>,
+    hz: f32,
+}
+
+impl<S: Copy + Plain> Snapshots<S> {
+    /// Snapshots from `latest`, a sim ticking `hz` times a second (`run`'s).
+    pub fn new(latest: take Latest<Stamped<S>>, hz: u32) -> Snapshots<S> {
+        var l = take latest
+        let first = l.read()
+        Snapshots { latest: l, kept: Bounded::from([first]), hz: f32(hz) }
+    }
+
+    /// Reads the newest snapshot, and keeps it if it's newer than those kept: the hand-off reuses
+    /// a slot after the next read, so they're copies.
+    pub fn update(mut self) {
+        let s = self.latest.read()
+        if s.ticks <= self.newest().ticks {
+            return
+        }
+        if self.kept.is_full() {
+            self.kept.remove(0)
+        }
+        self.kept.push(s)
+    }
+
+    /// The newest snapshot read.
+    pub fn newest(self) -> Stamped<S> {
+        self.kept[self.kept.len() - 1]
+    }
+
+    /// The sim time a frame at `now` (seconds, the frame's time) draws, in ticks run.
+    pub fn sim_time(self, now: f32) -> f32 {
+        f32((f64(now) - origin()) * f64(self.hz)) - MARGIN
+    }
+
+    /// The two kept snapshots around sim time `s` (ticks run), and how far between them it is.
+    pub fn at(self, s: f32) -> Between<S> {
+        let last = self.kept.len() - 1
+        let oldest = self.kept[0]
+        let newest = self.kept[last]
+        if s <= f32(oldest.ticks) {
+            return Between { a: oldest.snap, b: oldest.snap, alpha: 0.0 }
+        }
+        if s >= f32(newest.ticks) {
+            return Between { a: newest.snap, b: newest.snap, alpha: 0.0 }
+        }
+        var i = 0
+        while i < last - 1 && f32(self.kept[i + 1].ticks) <= s {
+            i += 1
+        }
+        let (a, b) = (self.kept[i], self.kept[i + 1])
+        Between { a: a.snap, b: b.snap, alpha: (s - f32(a.ticks)) / f32(b.ticks - a.ticks) }
+    }
+}
+
+/// `d` the short way round a cycle `period` long (positive): within half a period of 0.
+pub fn short_way(d: f32, period: f32) -> f32 {
+    // Repeated subtraction stops making progress when the period is below d's float step.
+    var w = d % period
+    if w > 0.5 * period {
+        w -= period
+    }
+    if w < -0.5 * period {
+        w += period
+    }
+    w
+}
+
+/// From angle `a` to angle `b` (radians) by `t`, the short way round.
+pub fn lerp_angle(a: f32, b: f32, t: f32) -> f32 {
+    a + short_way(b - a, TAU) * t
+}
+
+/// From phase `a` to phase `b` (each in [0, 1), a cycle's fraction) by `t`, the short way round.
+pub fn lerp_phase(a: f32, b: f32, t: f32) -> f32 {
+    let p = a + short_way(b - a, 1.0) * t
+    p - floor(p)
+}
+
+@test
+fn a_large_cycle_difference_still_takes_the_short_way() {
+    for d in [1.0e20, -1.0e20] {
+        assert(short_way(d, 1.0) == 0.0, "whole cycles did not wrap to zero")
+    }
+    assert(short_way(d: 0.5, period: 1.0) == 0.5)
+    assert(short_way(d: -0.5, period: 1.0) == -0.5)
+    assert(short_way(d: 3.75, period: 1.0) == -0.25)
+    assert(short_way(d: -3.75, period: 1.0) == 0.25)
+}

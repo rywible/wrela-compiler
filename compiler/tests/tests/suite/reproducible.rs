@@ -11,19 +11,22 @@ fn builds_are_reproducible() {
     let tmp = scratch("reproducible");
     // (what's copied, the package inside it): a package with path dependencies is copied
     // with them. Sketch 01 embeds a file, computes constants at build time and depends on the
-    // engine package; sketch 02 has GPU pipelines.
+    // frozen engine; sketch 02 has GPU pipelines; the frozen herd is a program of the engine's
+    // size, with dependencies.
     let pkgs = [
-        ("examples/hello-field", ""),
+        ("compiler/tests/frozen", "hello-field"),
         ("compiler/tests/fields", ""),
         ("compiler/tests/run/embed", ""),
         ("compiler/tests/run/packages", ""),
         ("compiler/tests/sketches", "01-creature"),
         ("compiler/tests/sketches", "02-drawing"),
+        ("compiler/tests/frozen", "herd"),
     ];
     // The sketches' engine, where their path dependency finds it from the copies:
-    // `../../../../engine` from somewhere/else/compiler-tests-sketches/<sketch>.
-    if !tmp.join("engine").exists() {
-        copy_dir(&repo_root().join("engine"), &tmp.join("engine"));
+    // `../../frozen/engine` from somewhere/else/compiler-tests-sketches/<sketch>.
+    let engine = tmp.join("somewhere/else/frozen/engine");
+    if !engine.exists() {
+        copy_dir(&repo_root().join("compiler/tests/frozen/engine"), &engine);
     }
     // Each package three times: from where it is, twice, and from a copy at another path.
     let sources: Vec<_> = pkgs

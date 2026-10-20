@@ -1,0 +1,380 @@
+// Levels of detail for plants without popping: each instance is drawn at the level its size on
+// screen and its distance ask, and near a switch it is drawn both ways, each way keeping its
+// share of the pixels.
+//
+// The levels, finest first: its cards' levels, then an impostor, then a volume, then nothing.
+// One function says where an instance is between its levels (`place`), on the CPU (which lists
+// it is drawn in) and on the GPU (each draw's share of it), so the shares always add to one.
+//
+//     level:   0 ──── 1 ──── 2 ═══ impostor ═══ volume ┄┄ nothing
+//              cards, by their size on screen ┊ by distance  ┊ by its size on screen
+//     a switch: the middle 20% of each step, a smoothstep of the shares (`SWITCH`)
+//
+// Which pixels a share holds is an ordered pattern anchored on the plant (where its middle falls
+// on the screen, `anchor`), the same for both ways at a pixel, so the two shares tile the pixel
+// with no gap and no overlap. The pattern moves with the plant as the camera moves, and steps
+// through its 16 places over temporal AA's cycle of 16 frames. So each pixel takes every
+// threshold once, and temporal AA blends the two ways. A small share neither stays a fixed grid
+// of dots nor swims over the plant as the camera moves.
+
+use noise::hash2
+use plant::CARD_LEVELS
+use view::Camera
+
+/// The ways an instance is drawn: its cards' levels, an impostor, a volume.
+pub const IMPOSTOR: u32 = 3
+pub const VOLUME: u32 = 4
+
+/// Where each card level ends, in pixels a card's width: an instance is drawn at the coarsest
+/// level whose cards look no wider than this on screen.
+pub const CARD_PX: f32 = 12.0
+/// The width on screen (the scene's pixels) below which a far crown fades out, by half again.
+/// Like `CARD_PX`, it's scaled by `Lod::card_px`: a scene drawn at another size chooses the
+/// same levels and fades by giving `card_px` in its own pixels.
+pub const FAINT_PX: f32 = 1.5
+
+/// What deciding a plant's level reads: where its cards hand over to an impostor and the
+/// impostor to a volume (m), its leaves' size, its height and reach (m, at scale 1), and how
+/// wide on screen a card level's cards grow before the next takes over (`CARD_PX`).
+pub struct Lod: Copy + GpuData {
+    pub cards_to: f32,
+    /// The farthest handover centre allowed for cards (m). A large crown can keep its cards
+    /// beyond `cards_to` until it fits `impostor_px`, but never past this range's fade band.
+    pub cards_limit: f32,
+    /// The desired maximum crown diameter when it becomes an impostor, in scene pixels.
+    pub impostor_px: f32,
+    pub impostors_to: f32,
+    pub leaf: f32,
+    pub top: f32,
+    pub reach: f32,
+    pub card_px: f32,
+    /// How wide a cut's hashed cell is, in the scene's pixels (`noise::hashed_threshold_of`): an
+    /// output pixel, so a scene drawn at half the output's size and one drawn at its size cut
+    /// the same cells, and temporal AA's jitter sweeps a sample over several.
+    pub cell: f32,
+}
+
+/// Where an instance at `at` (its base), `scale` large, is between its levels, seen from `cam`:
+/// its level as a number (each whole number a way, `CARD_LEVELS - 1` the coarsest cards, then
+/// `IMPOSTOR` and `VOLUME`), and how far it has faded out (0 to 1, by its size on screen).
+pub fn place(l: Lod, cam: Camera, at: vec3, scale: f32) -> (f32, f32) {
+    let r = l.reach * scale
+    let d = length(at + vec3(0.0, l.top * 0.5 * scale, 0.0) - cam.eye)
+    // The finest level whose cards look no wider than CARD_PX (each level grows them by sqrt(2)).
+    let px = card_width(l, cam, at, scale)
+    var level = clamp(2.0 * log2(l.card_px / max(px, 1.0e-4)), 0.0, f32(CARD_LEVELS - 1))
+    // A large crown or a narrow lens keeps its geometry until the impostor has enough
+    // samples across it. The owner bounds this extension to its loaded geometry's range.
+    let projected = 2.0 * r / max(cam.footprint(1.0) * l.impostor_px, 1.0e-6)
+    // Finish this whole band before the volume band begins, even if the owner's extension
+    // exceeds the impostor range. Otherwise the additive transitions can skip a level.
+    let last_cards = max(l.impostors_to * (0.92 / 1.08), 1.0e-4)
+    let first_cards = min(l.cards_to, last_cards)
+    let limit = clamp(l.cards_limit, first_cards, last_cards)
+    let cards_to = clamp(projected, first_cards, limit)
+    // Toward the impostors, the coarsest cards (the impostor's): from 60% of the way.
+    level = max(level, f32(CARD_LEVELS - 1) * smoothstep(0.6, 0.75, d / cards_to))
+    // Then the impostor, and then the volume, each over a tenth of its distance.
+    level += smoothstep(0.92, 1.08, d / cards_to) + smoothstep(0.92, 1.08, d / l.impostors_to)
+    // Beyond the cards, a crown fading as it shrinks to a pixel or two.
+    let crown = 2.0 * r / max(cam.footprint(d), 1.0e-6)
+    let fp = FAINT_PX * l.card_px / CARD_PX
+    let faint = if d > cards_to { 1.0 - smoothstep(fp, 2.0 * fp, crown) } else { 0.0 }
+    (level, faint)
+}
+
+/// How wide the cards of an instance at `at`, `scale` large, look from `cam` at its nearest
+/// level, in pixels (each level grows it by sqrt(2)): `place`'s measure.
+pub fn card_width(l: Lod, cam: Camera, at: vec3, scale: f32) -> f32 {
+    let r = l.reach * scale
+    let d = length(at + vec3(0.0, l.top * 0.5 * scale, 0.0) - cam.eye)
+    l.leaf * scale / max(cam.footprint(max(d - r * 0.5, 0.5)), 1.0e-4)
+}
+
+/// How much of each step between two ways an instance is drawn both ways (its middle): over
+/// 80%, a tree was between two of its card levels most of the time, and temporal AA (a fifth of
+/// a pixel from each frame) left their dither as a screen over most crowns.
+pub const SWITCH: f32 = 0.2
+
+/// How far through a step's switch an instance at `level` is (0 to 1).
+fn switched(level: f32) -> f32 {
+    let f = level - floor(level)
+    smoothstep(0.5 - 0.5 * SWITCH, 0.5 + 0.5 * SWITCH, f)
+}
+
+/// The part of [0, 1) that way `way` keeps of an instance at `level`, faded by `faint`: the
+/// lower way of a step keeps its start, the upper its end (each a smoothstep over the step's
+/// middle `SWITCH`), so the two tile it; and none of it at all past `1 - faint`.
+pub fn share(level: f32, faint: f32, way: u32) -> vec2 {
+    let k = floor(level)
+    let s = switched(level)
+    let kept = 1.0 - faint
+    let w = f32(way)
+    if w == k {
+        return vec2(0.0, (1.0 - s) * kept)
+    }
+    if w == k + 1.0 {
+        return vec2((1.0 - s) * kept, kept)
+    }
+    vec2(0.0)
+}
+
+/// Where the shares of an instance at `at`, `scale` large, its plant `top` tall, are anchored
+/// on the target (`keeps_packed`) this frame: where its middle falls (pixels, unjittered), moved
+/// by a few whole pixels by a draw of its own, so neighbours' patterns don't line up, and by the
+/// frame's place in the pattern's cycle.
+///
+/// A middle at or behind the eye's plane (the camera inside the crown) falls on no pixel: its
+/// anchor is the screen's corner, as good as any, since the plant is drawn whole there. (A
+/// player's camera does go inside crowns, and the infinite pixel would trap where the CPU makes
+/// it an integer: `packed`.)
+pub fn anchor(cam: Camera, at: vec3, top: f32, scale: f32) -> vec2 {
+    // Its own draw, keyed to where it stands in the world.
+    let w = at + cam.keyed()
+    let own = vec2(
+        hash2(i32(floor(w.x * 8.0)), i32(floor(w.z * 8.0))),
+        hash2(i32(floor(w.z * 8.0)) + 17, i32(floor(w.x * 8.0)) - 5),
+    )
+    // Each cycle takes the 16 places in another order (`cycle_shift`): in one order, a pixel
+    // was kept at the same frames of the jitter's cycle each time, so it was kept with the
+    // same few of the jitter's offsets, and a settled still kept a fixed pattern of stripes.
+    // On a still's grid the place and the jitter's cell are one (`view::jitter_of`).
+    let k = if cam.grid != 0 { cam.frame % 16 } else {
+        (cam.frame * 7 + cycle_shift(cam.frame / 16)) % 16
+    }
+    let step = vec2(f32(k % 4), f32(k / 4))
+    let middle = at + vec3(0.0, top * 0.5 * scale, 0.0)
+    let ahead = dot(middle - cam.eye, cam.forward) > cam.near
+    let on = if ahead { clamp(cam.pixel(middle), vec2(-1.0e6), vec2(1.0e6)) } else { vec2(0.0) }
+    on - floor(own * 4.0) - step
+}
+
+/// How far cycle `c` of the pattern's 16 places is shifted from the first: `c`'s low 4 bits
+/// reversed (0, 8, 4, 12, 2, ...), so 16 cycles in a row pair each of the jitter's offsets
+/// with each of the pattern's places once, and four from a multiple of four already spread
+/// them over the pattern.
+fn cycle_shift(c: u32) -> u32 {
+    ((c & 1) << 3) | ((c & 2) << 1) | ((c & 4) >> 1) | ((c & 8) >> 3)
+}
+
+/// The 4 × 4 Bayer matrix's threshold at `o` (each in 0 to 3), over 16, at its step's middle:
+/// (x xor y, y)'s bits interleaved and reversed (no table to look up: a table indexed by a
+/// pixel's place is memory, not registers).
+fn bayer(o: vec2u) -> f32 {
+    let a = o.x ^ o.y
+    let b = o.y
+    let v = ((a & 1) << 3) | ((b & 1) << 2) | (((a >> 1) & 1) << 1) | ((b >> 1) & 1)
+    f32(v) / 16.0 + 1.0 / 32.0
+}
+
+/// A way's share (its start and end in [0, 1), `share`) and the instance's anchor (`anchor`) in
+/// one word, for a vertex to pass on: the share's start and end in 14 bits each, and of the
+/// anchor only what a pixel's draw depends on (a pixel centre's offset from it is its whole pixel
+/// plus `floor(0.5 - anchor)`, and the pattern repeats every 4 pixels), 2 bits each way.
+pub fn packed(keep: vec4) -> u32 {
+    let s = vec2u(round(saturate(keep.xy) * 16383.0))
+    let c = vec2u(vec2i(floor(vec2(0.5) - keep.zw)) & vec2i(3))
+    s.x | (s.y << 14) | (c.x << 28) | (c.y << 30)
+}
+
+/// How much of the switch between its share's start and end a card shrinks over, by its own
+/// draw (`by_card`).
+pub const CARD_BAND: f32 = 0.1
+
+/// A share packed by `packed`, taken by one card of the instance whose draw in [0, 1) is `h`:
+/// the share the card keeps (all of it or none) and its size (0 to 1). The card is whole where
+/// `h` falls inside the share, gone where it falls outside, and smaller within `CARD_BAND` of
+/// its ends. A crown between two levels, or fading near the eye, then shows most of its cards
+/// whole and the rest gone. (Every card kept the same part of the pixels, so in a settled still,
+/// whose history evens the pattern, each was a see-through leaf. Cards in the band kept that
+/// part of the pixels, and a bush faded near the eye left only them, as see-through leaves on
+/// the ground.)
+pub fn by_card(k: u32, h: f32) -> (u32, f32) {
+    let start = f32(k & 16383) / 16383.0
+    let end = f32((k >> 14) & 16383) / 16383.0
+    if start <= 0.0 && end >= 1.0 {
+        return (k, 1.0)
+    }
+    let after = if start <= 0.0 { 1.0 } else { saturate((h - start) / CARD_BAND + 0.5) }
+    let before = if end >= 1.0 { 1.0 } else { saturate((end - h) / CARD_BAND + 0.5) }
+    let size = after * before
+    let whole = if size > 0.0 { 16383 } else { 0 }
+    ((k & 4026531840) | (whole << 14), size)
+}
+
+/// Whether a share packed by `packed` holds the pixel at `pixel` (a fragment's position): where
+/// the pixel's draw (`draw_packed`) is in the share. A whole share holds every pixel, with no
+/// draw.
+pub fn keeps_packed(k: u32, pixel: vec2) -> bool {
+    let start = f32(k & 16383) / 16383.0
+    let end = f32((k >> 14) & 16383) / 16383.0
+    if start <= 0.0 && end >= 1.0 {
+        return true
+    }
+    let c = vec2u((k >> 28) & 3, (k >> 30) & 3)
+    let u = bayer((vec2u(pixel) + c) & vec2u(3))
+    u >= start && u < end
+}
+
+/// A pixel's draw in [0, 1) for a share packed by `packed`, its pattern moved by `shift` pixels:
+/// a 4 × 4 Bayer matrix anchored on the instance, so each block of 4 × 4 takes every one of 16
+/// thresholds and the blend of two ways is even.
+pub fn draw_packed(k: u32, pixel: vec2, shift: vec2u) -> f32 {
+    let c = vec2u((k >> 28) & 3, (k >> 30) & 3)
+    bayer((vec2u(pixel) + c + shift) & vec2u(3))
+}
+
+/// Whether an instance is drawn at all, and its ways (the lower, and the upper when it's
+/// between two), at `level`, faded by `faint`.
+pub fn ways(level: f32, faint: f32) -> (bool, u32, u32) {
+    if faint >= 1.0 {
+        return (false, 0, 0)
+    }
+    let k = floor(level)
+    let s = switched(level)
+    let lower = u32(k)
+    let upper = if s > 0.0 && lower < VOLUME { lower + 1 } else { lower }
+    let both_kept = s < 1.0
+    if !both_kept {
+        return (true, upper, upper)
+    }
+    (true, lower, upper)
+}
+
+/// On a still's grid (`view::jitter_of`), 16 frames in a row keep each pixel of a share at
+/// exactly its share of the frames, and the jitter's cells of those frames spread over the
+/// pixel: their mean is within an eighth of a pixel of its middle (a 256-frame mean's, which
+/// meets every cell at every place). In play's order they were not tied: this is the still's.
+@test
+fn a_stills_sixteen_frames_keep_each_share_spread_over_the_pixel() {
+    let at = vec3(3.0, 0.0, 20.0)
+    for n in [4, 5, 8, 12] {
+        let share = f32(n) / 16.0
+        for q in 0..16 {
+            let pixel = vec2(f32(400 + q % 4), f32(300 + q / 4)) + vec2(0.5)
+            var kept = 0
+            var sum = vec2(0.0)
+            var last = view::blank()
+            for f in 37..53 {
+                let cam = view::camera(
+                    vec3(0.0, 1.7, 0.0),
+                    at,
+                    0.8,
+                    width: 960,
+                    height: 540,
+                    frame: u32(f),
+                    time: 0.0,
+                    last: last,
+                    grid: true,
+                )
+                last = cam
+                let k = packed(vec4(0.0, share, anchor(cam, at, top: 10.0, scale: 1.0)))
+                if keeps_packed(k, pixel) {
+                    kept += 1
+                    sum += view::jitter_of(u32(f), grid: true)
+                }
+            }
+            assert(kept == n, f"pixel {q}: kept {kept} of 16 frames, its share {n}")
+            let mean = sum / f32(kept)
+            assert(
+                abs(mean.x) <= 0.126 && abs(mean.y) <= 0.126,
+                f"pixel {q}, share {n}/16: its kept frames' jitter is {mean} from the middle",
+            )
+        }
+    }
+}
+
+/// A card keeps all of a share or none of it (never a part of the pixels, which a settled still
+/// shows as a see-through leaf), and near the share's ends it's drawn smaller instead.
+@test
+fn a_card_is_whole_or_gone_and_smaller_near_its_shares_end() {
+    let half = packed(vec4(0.0, 0.5, 0.0, 0.0))
+    let (inside, inside_size) = by_card(half, 0.2)
+    let (outside, outside_size) = by_card(half, 0.8)
+    let (edge, edge_size) = by_card(half, 0.5)
+    let full = vec2(0.0, 0.0)
+    for (k, name) in [(inside, "inside"), (edge, "at the end")] {
+        for x in 0..4 {
+            for y in 0..4 {
+                assert(keeps_packed(k, full + vec2(f32(x), f32(y))), f"{name}: a pixel left out")
+            }
+        }
+    }
+    assert(inside_size == 1.0, f"inside the share: size {inside_size}")
+    assert(outside_size == 0.0, f"outside the share: size {outside_size}")
+    for x in 0..4 {
+        assert(!keeps_packed(outside, vec2(f32(x), 0.0)), "outside the share: a pixel kept")
+    }
+    assert(abs(edge_size - 0.5) < 1.0e-3, f"at the share's end: size {edge_size}")
+    let whole = packed(vec4(0.0, 1.0, 0.0, 0.0))
+    assert(by_card(whole, 0.99).1 == 1.0, "a whole share")
+}
+
+/// A crown that is still large on screen keeps its geometry, within the owner's range.
+@test
+fn projected_crowns_delay_impostors_within_the_loaded_range() {
+    let l = Lod {
+        cards_to: 80.0,
+        cards_limit: 160.0,
+        impostors_to: 4000.0,
+        impostor_px: 128.0,
+        leaf: 0.9,
+        top: 10.0,
+        reach: 5.0,
+        card_px: 120.0,
+        cell: 1.0,
+    }
+    let cam = view::first_camera(vec3(0.0), vec3(0.0, 0.0, 1.0), 0.8, width: 1920, height: 1080)
+    let at = |distance: f32, scale: f32| vec3(0.0, -l.top * 0.5 * scale, distance)
+    let small = place(l, cam, at(90.0, 0.5), 0.5).0
+    let large = place(l, cam, at(90.0, 2.0), 2.0).0
+    assert(small >= f32(IMPOSTOR))
+    assert(large < f32(IMPOSTOR) - 0.5)
+    // A much larger crown still completes its handover at the bounded band's far edge.
+    let bounded = place(l, cam, at(174.0, 20.0), 20.0).0
+    assert(bounded >= f32(IMPOSTOR))
+    // Far-only aggregate kinds cannot accidentally acquire full geometry at any scale.
+    let far = Lod { cards_to: 0.001, cards_limit: 0.001, ..l }
+    assert(place(far, cam, at(1.0, 20.0), 20.0).0 >= f32(IMPOSTOR))
+    // An over-large extension cannot push geometry into the volume transition.
+    let ordered = Lod { cards_limit: 1000.0, impostors_to: 200.0, ..l }
+    assert(abs(place(ordered, cam, at(184.0, 20.0), 20.0).0 - f32(IMPOSTOR)) < 1.0e-4)
+    assert(place(ordered, cam, at(217.0, 20.0), 20.0).0 >= f32(VOLUME))
+}
+
+/// The threshold follows the lens and output pixels, independently of scene resolution.
+@test
+fn projected_crown_handover_follows_lens_and_output_pixels() {
+    let l = Lod {
+        cards_to: 80.0,
+        cards_limit: 160.0,
+        impostors_to: 4000.0,
+        impostor_px: 128.0,
+        leaf: 0.9,
+        top: 10.0,
+        reach: 5.0,
+        card_px: 120.0,
+        cell: 1.0,
+    }
+    let camera = |fov: f32, width: u32, height: u32| view::first_camera(
+        vec3(0.0),
+        vec3(0.0, 0.0, 1.0),
+        fov,
+        width: width,
+        height: height,
+    )
+    let normal = camera(0.8, 1920, 1080)
+    let zoomed = camera(0.4, 1920, 1080)
+    let smaller = camera(0.8, 960, 540)
+    let half = Lod { impostor_px: 64.0, card_px: 60.0, cell: 0.5, ..l }
+    let at = vec3(0.0, -5.0, 120.0)
+    assert(place(l, normal, at, 1.0).0 >= f32(IMPOSTOR))
+    assert(place(l, zoomed, at, 1.0).0 < f32(IMPOSTOR) - 0.5)
+    for distance in [40.0, 78.0, 95.0, 100.0, 104.0, 120.0, 172.0] {
+        let at = vec3(0.0, -5.0, distance)
+        let a = place(l, normal, at, 1.0)
+        let b = place(half, smaller, at, 1.0)
+        assert(abs(a.0 - b.0) < 1.0e-5)
+        assert(abs(a.1 - b.1) < 1.0e-5)
+    }
+}

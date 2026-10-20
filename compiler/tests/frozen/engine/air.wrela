@@ -1,0 +1,637 @@
+// A physically based sky and aerial perspective: the colour of the sky and of the air between the
+// eye and what it sees, for any sun.
+//
+// A planet's atmosphere scatters the sun's light: air molecules by Rayleigh scattering (blue more
+// than red), haze by Mie scattering (grey, mostly forward), and ozone absorbs some. Each ray is
+// marched for light scattered once; light scattered twice and more comes from a table.
+//
+// To use it, describe the air (`Air`, or `hazy` for Earth's air on a hazy afternoon), make its
+// tables (`tables`) and cook them on the GPU (`Tables::cook`). Cook them again only when the air
+// or the sun moves. Shading passes then read the tables (`light`, `lit`). The tables, each cooked
+// from the ones before:
+// - transmittance: how much light gets from a point to the atmosphere's top, by its height and
+//   the ray's angle (256 × 64);
+// - multiple scattering: the light scattered twice and more at a point, by its height and the
+//   sun's angle (32 × 32);
+// - the sky: the light along each direction from the eye's height (192 × 108), by azimuth from
+//   the sun and elevation;
+// - aerial perspective: along each direction from the eye, the light scattered toward the eye
+//   and how much gets through, out to `AERIAL_REACH` (a 3D table, 32 × 64 × 32: azimuth from
+//   the sun, elevation, distance). It does not follow the camera, so a still sun needs no cook
+//   each frame.
+//
+// Units: kilometres in this module's functions, with the planet's centre at the origin; the
+// world's metres elsewhere, its y = 0 `ALTITUDE` above the planet's surface. The light is in
+// the world's units: a white surface facing the sun reflects `sun_colour`.
+
+use std::gpu::{
+    GlobalId, Rgba16Float, Sampler, Texels, Texels3d, Texture, Texture3d, dispatch, label,
+    texture3d, writable_texture,
+}
+use std::math::PI
+
+/// The planet's surface and the atmosphere's top: their radii (km).
+pub const BOTTOM: f32 = 6360.0
+pub const TOP: f32 = 6460.0
+
+/// The world's y = 0, above the planet's surface (km).
+pub const ALTITUDE: f32 = 0.2
+
+/// The tables' sizes.
+pub const TRANSMITTANCE_W: u32 = 256
+pub const TRANSMITTANCE_H: u32 = 64
+pub const MULTIPLE_SIDE: u32 = 32
+pub const VIEW_W: u32 = 192
+pub const VIEW_H: u32 = 108
+pub const AERIAL_W: u32 = 32
+pub const AERIAL_H: u32 = 64
+pub const AERIAL_D: u32 = 32
+
+/// How far the aerial perspective's table reaches (km): beyond it, the light is its last
+/// slice's.
+pub const AERIAL_REACH: f32 = 40.0
+
+/// The air: what scatters and absorbs, the sun, and the eye's height the sky's tables are
+/// cooked for.
+pub struct Air: Copy + GpuData + Eq {
+    /// Rayleigh scattering at the planet's surface (per km), and its density's scale height
+    /// (km).
+    pub rayleigh: vec3,
+    pub rayleigh_height: f32,
+    /// Ozone's absorption where it's densest (25 km up, per km), and the haze's (Mie)
+    /// asymmetry: how much it scatters forward.
+    pub ozone: vec3,
+    pub mie_g: f32,
+    /// The sun's light above the air, and the haze's scattering at the surface (per km).
+    pub sun_top: vec3,
+    pub mie_scattering: f32,
+    /// Toward the sun (a unit vector), and the haze's absorption at the surface (per km).
+    pub sun: vec3,
+    pub mie_absorption: f32,
+    /// The ground's albedo under the sky (multiple scattering's light off it), and the haze's
+    /// scale height (km).
+    pub ground: vec3,
+    pub mie_height: f32,
+    /// The eye's height in the world (m): the sky's and aerial perspective's tables are
+    /// cooked from it.
+    pub eye: f32,
+    /// Mist: haze lying low, its scattering at the world's y = 0 (per km) and its scale height
+    /// (km); thick in the land's hollows and thin over its tops (none by default).
+    pub mist: f32 = 0.0,
+    pub mist_height: f32 = 0.06,
+}
+
+/// Earth's air on a hazy afternoon, the sun toward `sun` with `sun_top` its light above the air,
+/// seen from an eye at `eye` metres (the world's y). Rayleigh scattering and ozone are Earth's; the
+/// haze is thick, in a layer near the ground.
+pub fn hazy(sun: vec3, sun_top: vec3, eye: f32) -> Air {
+    Air {
+        rayleigh: vec3(5.802, 13.558, 33.1) * 0.001,
+        rayleigh_height: 8.0,
+        ozone: vec3(0.650, 1.881, 0.085) * 0.001,
+        mie_g: 0.76,
+        sun_top,
+        mie_scattering: 0.35,
+        sun: normalize(sun),
+        mie_absorption: 0.035,
+        ground: vec3(0.16, 0.2, 0.08),
+        mie_height: 0.5,
+        eye,
+    }
+}
+
+// ---- the medium -----------------------------------------------------------------------------
+
+/// What the air at height `h` (km above the surface) does: its scattering (Rayleigh's and
+/// the haze's), and its extinction (scattering and absorption).
+pub struct Medium: Copy {
+    pub rayleigh: vec3,
+    pub mie: f32,
+    pub extinction: vec3,
+}
+
+impl Medium {
+    pub fn scattering(self) -> vec3 {
+        self.rayleigh + vec3(self.mie)
+    }
+}
+
+pub fn medium(air: Air, h: f32) -> Medium {
+    let rayleigh = air.rayleigh * exp(-max(h, 0.0) / air.rayleigh_height)
+    let haze = exp(-max(h, 0.0) / air.mie_height)
+    let mist = air.mist * exp(-max(h - ALTITUDE, 0.0) / air.mist_height)
+    let mie = air.mie_scattering * haze + mist
+    let ozone = air.ozone * max(0.0, 1.0 - abs(h - 25.0) / 15.0)
+    Medium { rayleigh, mie, extinction: rayleigh + vec3(mie + air.mie_absorption * haze) + ozone }
+}
+
+/// Rayleigh's phase function, for the cosine `c` of the angle between the ray and the sun.
+pub fn rayleigh_phase(c: f32) -> f32 {
+    3.0 / (16.0 * PI) * (1.0 + c * c)
+}
+
+/// The haze's phase function (Cornette-Shanks), asymmetry `g`.
+pub fn mie_phase(g: f32, c: f32) -> f32 {
+    let k = 3.0 / (8.0 * PI) * (1.0 - g * g) / (2.0 + g * g)
+    k * (1.0 + c * c) / pow(max(1.0 + g * g - 2.0 * g * c, 1.0e-4), 1.5)
+}
+
+/// Where the ray from `o` along `d` (a unit vector) meets the sphere of radius `r` round the
+/// planet's centre: its nearest point ahead, or -1 for none.
+pub fn hit_sphere(o: vec3, d: vec3, r: f32) -> f32 {
+    let b = dot(o, d)
+    let c = dot(o, o) - r * r
+    let h = b * b - c
+    if h < 0.0 {
+        return -1.0
+    }
+    let s = sqrt(h)
+    if -b - s >= 0.0 { -b - s } else if -b + s >= 0.0 { -b + s } else { -1.0 }
+}
+
+/// The eye at world height `y` (m), as a radius from the planet's centre (km).
+pub fn radius_of(y: f32) -> f32 {
+    BOTTOM + ALTITUDE + y * 0.001
+}
+
+// ---- the tables' coordinates ----------------------------------------------------------------
+
+/// A coordinate in [0, 1] as a texture coordinate of `n` texels: 0 at the first texel's centre
+/// and 1 at the last's, so the ends are exact.
+pub fn to_texels(u: f32, n: u32) -> f32 {
+    (saturate(u) * f32(n - 1) + 0.5) / f32(n)
+}
+
+/// A texel's centre `x` (a texture coordinate) as the coordinate in [0, 1] it holds.
+pub fn from_texels(x: f32, n: u32) -> f32 {
+    (x * f32(n) - 0.5) / f32(n - 1)
+}
+
+/// Where the transmittance table holds radius `r` and the cosine `mu` of the ray's angle from
+/// the zenith (Bruneton's mapping: by the distance to the top, between its least and most).
+pub fn transmittance_uv(r: f32, mu: f32) -> vec2 {
+    let h = sqrt(TOP * TOP - BOTTOM * BOTTOM)
+    let rho = sqrt(max(r * r - BOTTOM * BOTTOM, 0.0))
+    let d = max(-r * mu + sqrt(max(r * r * (mu * mu - 1.0) + TOP * TOP, 0.0)), 0.0)
+    let (lo, hi) = (TOP - r, rho + h)
+    vec2(
+        to_texels((d - lo) / max(hi - lo, 1.0e-6), TRANSMITTANCE_W),
+        to_texels(rho / h, TRANSMITTANCE_H),
+    )
+}
+
+/// The radius and cosine the transmittance table holds at texel coordinate `uv`.
+fn transmittance_r_mu(uv: vec2) -> (f32, f32) {
+    let (xm, xr) = (from_texels(uv.x, TRANSMITTANCE_W), from_texels(uv.y, TRANSMITTANCE_H))
+    let h = sqrt(TOP * TOP - BOTTOM * BOTTOM)
+    let rho = h * xr
+    let r = sqrt(rho * rho + BOTTOM * BOTTOM)
+    let (lo, hi) = (TOP - r, rho + h)
+    let d = lo + xm * (hi - lo)
+    let mu = if d == 0.0 { 1.0 } else { (h * h - rho * rho - d * d) / (2.0 * r * d) }
+    (r, clamp(mu, -1.0, 1.0))
+}
+
+/// The transmittance from radius `r` along a ray `mu` from the zenith to the top, from the
+/// table.
+pub fn transmittance(t: Texture<Rgba16Float>, s: Sampler, r: f32, mu: f32) -> vec3 {
+    t.sample_level(s, transmittance_uv(r, mu)).rgb
+}
+
+/// How far inside the ground and the top (km) the multiple scattering table's radii stay, so a
+/// march from each still has a step to take.
+const MULTIPLE_INSET: f32 = 0.005
+
+/// Where the multiple scattering table holds radius `r` and the cosine `mu_s` of the sun's
+/// angle from the zenith.
+pub fn multiple_uv(r: f32, mu_s: f32) -> vec2 {
+    let h = (r - BOTTOM - MULTIPLE_INSET) / (TOP - BOTTOM - 2.0 * MULTIPLE_INSET)
+    vec2(to_texels(mu_s * 0.5 + 0.5, MULTIPLE_SIDE), to_texels(h, MULTIPLE_SIDE))
+}
+
+/// The radius and the sun's cosine the multiple scattering table holds at texel coordinate
+/// `uv`.
+fn multiple_r_mu_s(uv: vec2) -> (f32, f32) {
+    let h = saturate(from_texels(uv.y, MULTIPLE_SIDE))
+    let r = BOTTOM + MULTIPLE_INSET + h * (TOP - BOTTOM - 2.0 * MULTIPLE_INSET)
+    (r, from_texels(uv.x, MULTIPLE_SIDE) * 2.0 - 1.0)
+}
+
+/// The light scattered twice and more at radius `r`, the sun `mu_s` from the zenith, per unit
+/// of scattering, from the table.
+pub fn multiple(m: Texture<Rgba16Float>, s: Sampler, r: f32, mu_s: f32) -> vec3 {
+    m.sample_level(s, multiple_uv(r, mu_s)).rgb
+}
+
+/// The angle from straight down to the planet's horizon, seen from radius `r`.
+pub fn horizon_of(r: f32) -> f32 {
+    let horizon = sqrt(max(r * r - BOTTOM * BOTTOM, 0.0))
+    acos(clamp(horizon / r, -1.0, 1.0))
+}
+
+/// Where the sky's table holds the direction whose cosine from the zenith is `mu` and whose
+/// azimuth's cosine from the sun's is `c`, from radius `r`: elevations crowded toward the
+/// horizon, azimuths toward the sun.
+pub fn view_uv(r: f32, mu: f32, c: f32) -> vec2 {
+    view_uv_at(horizon_of(r), mu, c)
+}
+
+/// `view_uv` from where the horizon is (`horizon_of` the radius: `beta`), which a frame's sky
+/// finds once (`light::Light::horizon`).
+pub fn view_uv_at(beta: f32, mu: f32, c: f32) -> vec2 {
+    let zenith_horizon = PI - beta
+    let a = acos(clamp(mu, -1.0, 1.0))
+    let v = if a < zenith_horizon {
+        0.5 * (1.0 - sqrt(max(1.0 - a / zenith_horizon, 0.0)))
+    } else {
+        0.5 + 0.5 * sqrt(max((a - zenith_horizon) / beta, 0.0))
+    }
+    let u = sqrt(saturate(0.5 - 0.5 * c))
+    vec2(to_texels(u, VIEW_W), to_texels(v, VIEW_H))
+}
+
+/// The cosines from the zenith and from the sun's azimuth that the sky's table holds at texel
+/// coordinate `uv`, from radius `r`.
+fn view_mu_c(r: f32, uv: vec2) -> (f32, f32) {
+    let (u, v) = (from_texels(uv.x, VIEW_W), from_texels(uv.y, VIEW_H))
+    let beta = horizon_of(r)
+    let zenith_horizon = PI - beta
+    let mu = if v < 0.5 {
+        let k = 1.0 - 2.0 * v
+        cos(zenith_horizon * (1.0 - k * k))
+    } else {
+        let k = 2.0 * v - 1.0
+        cos(zenith_horizon + beta * k * k)
+    }
+    (mu, 1.0 - 2.0 * u * u)
+}
+
+/// The cosine of `dir`'s azimuth from the sun's (both world directions, y up): 1 toward the
+/// sun.
+pub fn azimuth_cos(sun: vec3, dir: vec3) -> f32 {
+    let a = dir.xz
+    let b = sun.xz
+    let l = length(a) * length(b)
+    if l < 1.0e-6 { 1.0 } else { clamp(dot(a, b) / l, -1.0, 1.0) }
+}
+
+/// The local direction whose cosines from the zenith and the sun's azimuth are `mu` and `c`:
+/// the sun's azimuth along +x.
+fn local_dir(mu: f32, c: f32) -> vec3 {
+    let s = sqrt(max(1.0 - mu * mu, 0.0))
+    vec3(s * c, mu, s * sqrt(max(1.0 - c * c, 0.0)))
+}
+
+/// The sun's direction in the same frame: `mu_s` from the zenith, its azimuth along +x.
+fn local_sun(mu_s: f32) -> vec3 {
+    vec3(sqrt(max(1.0 - mu_s * mu_s, 0.0)), mu_s, 0.0)
+}
+
+/// Where the aerial perspective's table holds direction `dir` (a world direction) at `d` km.
+pub fn aerial_uvw(sun: vec3, dir: vec3, d: f32) -> vec3 {
+    let u = sqrt(saturate(0.5 - 0.5 * azimuth_cos(sun, dir)))
+    let y = clamp(dir.y, -1.0, 1.0)
+    let v = 0.5 + 0.5 * sign(y) * sqrt(abs(y))
+    let w = sqrt(saturate(d / AERIAL_REACH))
+    vec3(to_texels(u, AERIAL_W), to_texels(v, AERIAL_H), to_texels(w, AERIAL_D))
+}
+
+/// The cosines from the zenith and from the sun's azimuth, and the distance (km), that the
+/// aerial perspective's table holds at texel coordinate `uvw`.
+fn aerial_mu_c_d(uvw: vec3) -> (f32, f32, f32) {
+    let u = from_texels(uvw.x, AERIAL_W)
+    let k = 2.0 * from_texels(uvw.y, AERIAL_H) - 1.0
+    let w = from_texels(uvw.z, AERIAL_D)
+    (sign(k) * k * k, 1.0 - 2.0 * u * u, w * w * AERIAL_REACH)
+}
+
+// ---- marching ---------------------------------------------------------------------------------
+
+/// What marching a ray gives: the light scattered toward its start, how much of what's behind
+/// gets through, and (for the multiple scattering table) the scattering's total, per unit of
+/// light.
+struct Marched: Copy {
+    light: vec3,
+    through: vec3,
+    as_one: vec3,
+}
+
+/// The light scattered toward `o` along `d` out to `reach` km (or the ground or the top, if
+/// nearer), `steps` samples crowded toward `o`. `isotropic`: every scattering even (the
+/// multiple scattering table's), with no table of it to read and light off the ground; else the
+/// phase functions and multiple scattering from `m`.
+fn march(
+    air: Air,
+    trans: Texture<Rgba16Float>,
+    m: Texture<Rgba16Float>,
+    s: Sampler,
+    o: vec3,
+    d: vec3,
+    sun: vec3,
+    reach: f32,
+    steps: u32,
+    isotropic: bool,
+) -> Marched {
+    let top = hit_sphere(o, d, TOP)
+    let ground = hit_sphere(o, d, BOTTOM)
+    var far = if top < 0.0 { 0.0 } else { top }
+    if ground > 0.0 {
+        far = min(far, ground)
+    }
+    far = min(far, reach)
+    let c = dot(d, sun)
+    let phase_r = if isotropic { 1.0 / (4.0 * PI) } else { rayleigh_phase(c) }
+    let phase_m = if isotropic { 1.0 / (4.0 * PI) } else { mie_phase(air.mie_g, c) }
+    var light = vec3(0.0)
+    var through = vec3(1.0)
+    var as_one = vec3(0.0)
+    var t0 = 0.0
+    for i in 0..steps {
+        // Samples crowded toward the start: the haze is near the ground.
+        let f1 = (f32(i) + 1.0) / f32(steps)
+        let t1 = far * f1 * f1
+        let dt = t1 - t0
+        let t = t0 + 0.3 * dt
+        t0 = t1
+        let p = o + d * t
+        let r = length(p)
+        let up = p / r
+        let md = medium(air, r - BOTTOM)
+        let mu_s = dot(up, sun)
+        let lit = if hit_sphere(p, sun, BOTTOM) > 0.0 {
+            vec3(0.0)
+        } else {
+            transmittance(trans, s, r, mu_s)
+        }
+        let scattered = md.rayleigh * phase_r + vec3(md.mie * phase_m)
+        var source = lit * scattered
+        if !isotropic {
+            source += multiple(m, s, r, mu_s) * md.scattering()
+        }
+        let step = exp(-md.extinction * dt)
+        // Each sample's light integrated over its step, as the step thins it.
+        let ext = max(md.extinction, vec3(1.0e-9))
+        light += through * (source - source * step) / ext
+        as_one += through * (md.scattering() - md.scattering() * step) / ext
+        through *= step
+    }
+    if isotropic && ground > 0.0 && ground <= far + 1.0e-3 {
+        // The ground's light, scattered off it.
+        let p = o + d * ground
+        let up = normalize(p)
+        let mu_s = dot(up, sun)
+        let lit = transmittance(trans, s, BOTTOM, mu_s) * saturate(mu_s)
+        light += through * lit * air.ground / PI
+    }
+    Marched { light, through, as_one }
+}
+
+/// The transmittance from radius `r` along a ray `mu` from the zenith to the top, marched (64
+/// steps, crowded toward the start: the haze is a layer near the ground, thinner than an even
+/// step of a low ray): the table's texels, and the sun's light at the eye on the CPU.
+pub fn to_top(air: Air, r: f32, mu: f32) -> vec3 {
+    let o = vec3(0.0, r, 0.0)
+    let d = local_dir(mu, 1.0)
+    let far = max(hit_sphere(o, d, TOP), 0.0)
+    let steps = 64
+    var depth = vec3(0.0)
+    var t0 = 0.0
+    for i in 0..steps {
+        let f1 = (f32(i) + 1.0) / f32(steps)
+        let t1 = far * f1 * f1
+        let p = o + d * (0.5 * (t0 + t1))
+        depth += medium(air, length(p) - BOTTOM).extinction * (t1 - t0)
+        t0 = t1
+    }
+    exp(-depth)
+}
+
+/// The sun's light at world height `y` (m): above the air's, through it.
+pub fn sun_at(air: Air, y: f32) -> vec3 {
+    air.sun_top * to_top(air, radius_of(y), air.sun.y)
+}
+
+// ---- cooking the tables ---------------------------------------------------------------------
+
+/// The sun's irradiance above the air: what the tables' light (marched for an irradiance of 1)
+/// is scaled by. `sun_top` is the light a white surface facing the sun reflects, so π times it.
+pub fn irradiance(air: Air) -> vec3 {
+    air.sun_top * PI
+}
+
+@compute(8, 8)
+pub fn cook_transmittance(air: Air, out: mut Texels<Rgba16Float>, id: GlobalId) {
+    let uv = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) /
+        vec2(f32(TRANSMITTANCE_W), f32(TRANSMITTANCE_H))
+    let (r, mu) = transmittance_r_mu(uv)
+    out.store(id, vec4(to_top(air, r, mu), 1.0))
+}
+
+/// The multiple scattering table's texel: from its height, the light scattered once more
+/// toward it from every direction (64, each marched 20 steps with even scattering), and the
+/// sum of every further scattering (a geometric series of the fraction scattered back).
+@compute(8, 8)
+pub fn cook_multiple(
+    air: Air,
+    trans: Texture<Rgba16Float>,
+    s: Sampler,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    let (r, mu_s) = multiple_r_mu_s((vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / f32(MULTIPLE_SIDE))
+    let o = vec3(0.0, r, 0.0)
+    let sun = local_sun(mu_s)
+    var light = vec3(0.0)
+    var as_one = vec3(0.0)
+    let n = 8
+    for i in 0..n {
+        for j in 0..n {
+            // Even over the sphere: cos θ even in [-1, 1], φ even round.
+            let ct = 1.0 - 2.0 * (f32(i) + 0.5) / f32(n)
+            let phi = 2.0 * PI * (f32(j) + 0.5) / f32(n)
+            let st = sqrt(max(1.0 - ct * ct, 0.0))
+            let d = vec3(st * cos(phi), ct, st * sin(phi))
+            let m = march(air, trans, trans, s, o, d, sun, 1.0e9, 20, isotropic: true)
+            light += m.light
+            as_one += m.as_one
+        }
+    }
+    let k = 1.0 / f32(n * n)
+    // Even scattering's phase (1 / 4π) over the sphere's 4π: the mean.
+    let l2 = light * k
+    let f = as_one * k
+    out.store(id, vec4(l2 / (vec3(1.0) - min(f, vec3(0.99))), 1.0))
+}
+
+/// The sky's table's texel: the light along its direction from the eye, through the air to the
+/// top (or the ground), 48 samples.
+@compute(8, 8)
+pub fn cook_view(
+    air: Air,
+    trans: Texture<Rgba16Float>,
+    m: Texture<Rgba16Float>,
+    s: Sampler,
+    out: mut Texels<Rgba16Float>,
+    id: GlobalId,
+) {
+    let r = radius_of(air.eye)
+    let uv = (vec2(f32(id.x), f32(id.y)) + vec2(0.5)) / vec2(f32(VIEW_W), f32(VIEW_H))
+    let (mu, c) = view_mu_c(r, uv)
+    let o = vec3(0.0, r, 0.0)
+    let sun = local_sun(air.sun.y)
+    let marched = march(air, trans, m, s, o, local_dir(mu, c), sun, 1.0e9, 48, isotropic: false)
+    out.store(id, vec4(marched.light * irradiance(air), 1.0))
+}
+
+/// The aerial perspective's texel: along its direction from the eye to its distance, the light
+/// scattered toward the eye and how much gets through (the mean of the three colours), 32
+/// samples.
+@compute(4, 4, 4)
+pub fn cook_aerial(
+    air: Air,
+    trans: Texture<Rgba16Float>,
+    m: Texture<Rgba16Float>,
+    s: Sampler,
+    out: mut Texels3d<Rgba16Float>,
+    id: GlobalId,
+) {
+    let at = vec3(f32(id.x), f32(id.y), f32(id.z)) + vec3(0.5)
+    let (mu, c, d) = aerial_mu_c_d(at / vec3(f32(AERIAL_W), f32(AERIAL_H), f32(AERIAL_D)))
+    let o = vec3(0.0, radius_of(air.eye), 0.0)
+    let sun = local_sun(air.sun.y)
+    let marched = march(air, trans, m, s, o, local_dir(mu, c), sun, d, 32, isotropic: false)
+    let t = marched.through
+    out.store(id, vec4(marched.light * irradiance(air), (t.x + t.y + t.z) / 3.0))
+}
+
+// ---- the tables on the GPU ------------------------------------------------------------------
+
+/// The air's tables (see the module's docs).
+pub struct Tables {
+    pub transmittance: Texture<Rgba16Float>,
+    pub multiple: Texture<Rgba16Float>,
+    pub view: Texture<Rgba16Float>,
+    pub aerial: Texture3d<Rgba16Float>,
+}
+
+/// The air's tables, uncooked.
+pub fn tables() -> Tables {
+    Tables {
+        transmittance: writable_texture::<Rgba16Float>(
+            width: TRANSMITTANCE_W,
+            height: TRANSMITTANCE_H,
+        ),
+        multiple: writable_texture::<Rgba16Float>(width: MULTIPLE_SIDE, height: MULTIPLE_SIDE),
+        view: writable_texture::<Rgba16Float>(width: VIEW_W, height: VIEW_H),
+        aerial: texture3d::<Rgba16Float>(AERIAL_W, AERIAL_H, AERIAL_D),
+    }
+}
+
+impl Tables {
+    /// Every table cooked for `air`, each from the ones before (read through `s`, a linear
+    /// sampler).
+    pub fn cook(mut self, air: Air, s: Sampler) {
+        label("air")
+        dispatch(
+            cook_transmittance.bind(air, out: mut self.transmittance),
+            over: self.transmittance,
+        )
+        dispatch(
+            cook_multiple.bind(air, self.transmittance, s, out: mut self.multiple),
+            over: self.multiple,
+        )
+        dispatch(
+            cook_view.bind(air, self.transmittance, self.multiple, s, out: mut self.view),
+            over: self.view,
+        )
+        dispatch(
+            cook_aerial.bind(air, self.transmittance, self.multiple, s, out: mut self.aerial),
+            over: self.aerial,
+        )
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// How far (in texels) `back` is from `uv`, in a table of `w` × `h` texels.
+fn texels_apart(uv: vec2, back: vec2, w: u32, h: u32) -> f32 {
+    max(abs(uv.x - back.x) * f32(w), abs(uv.y - back.y) * f32(h))
+}
+
+/// Each table's reader finds each texel where its cook wrote it: the coordinates a cook gives
+/// a texel's centre map back to that centre, within a thousandth of a texel (the multiple
+/// scattering table's reader had drifted 5 m over its 100 km, 0.0016 of a texel); the
+/// transmittance table's within a hundredth (its radii near the ground lose f32's precision in
+/// `r * r - BOTTOM * BOTTOM`).
+@test
+fn each_tables_reader_finds_its_cooks_texels() {
+    var worst = [0.0; 4]
+    for j in 0..TRANSMITTANCE_H {
+        for i in 0..TRANSMITTANCE_W {
+            let uv = (vec2(f32(i), f32(j)) + vec2(0.5)) /
+                vec2(f32(TRANSMITTANCE_W), f32(TRANSMITTANCE_H))
+            let (r, mu) = transmittance_r_mu(uv)
+            let back = transmittance_uv(r, mu)
+            worst[0] = max(worst[0], texels_apart(uv, back, TRANSMITTANCE_W, TRANSMITTANCE_H))
+        }
+    }
+    for j in 0..MULTIPLE_SIDE {
+        for i in 0..MULTIPLE_SIDE {
+            let uv = (vec2(f32(i), f32(j)) + vec2(0.5)) / f32(MULTIPLE_SIDE)
+            let (r, mu_s) = multiple_r_mu_s(uv)
+            worst[1] = max(
+                worst[1],
+                texels_apart(uv, multiple_uv(r, mu_s), MULTIPLE_SIDE, MULTIPLE_SIDE),
+            )
+        }
+    }
+    let r = radius_of(10.0)
+    for j in 0..VIEW_H {
+        for i in 0..VIEW_W {
+            let uv = (vec2(f32(i), f32(j)) + vec2(0.5)) / vec2(f32(VIEW_W), f32(VIEW_H))
+            let (mu, c) = view_mu_c(r, uv)
+            worst[2] = max(worst[2], texels_apart(uv, view_uv(r, mu, c), VIEW_W, VIEW_H))
+        }
+    }
+    let sun = local_sun(0.4)
+    for k in 0..AERIAL_D {
+        for j in 0..AERIAL_H {
+            for i in 0..AERIAL_W {
+                let n = vec3(f32(AERIAL_W), f32(AERIAL_H), f32(AERIAL_D))
+                let uvw = (vec3(f32(i), f32(j), f32(k)) + vec3(0.5)) / n
+                let (mu, c, d) = aerial_mu_c_d(uvw)
+                let back = aerial_uvw(sun, local_dir(mu, c), d)
+                let apart = abs(uvw - back) * n
+                // Straight up or down, every azimuth is the same direction.
+                let azimuth = if abs(mu) > 0.9999 { 0.0 } else { apart.x }
+                worst[3] = max(worst[3], max(azimuth, max(apart.y, apart.z)))
+            }
+        }
+    }
+    let names = ["transmittance", "multiple scattering", "sky", "aerial perspective"]
+    let bounds = [0.01, 0.001, 0.001, 0.001]
+    for t in 0..4 {
+        assert(
+            worst[t] < bounds[t],
+            f"the {names[t]} table's reader is {worst[t]} texels from its cook",
+        )
+    }
+}
+
+/// Mist lies low: none in an air that has none (the same medium as before at every height); with
+/// some, thickest at the world's y = 0, falling off by its scale height, a hill's top above it
+/// almost clear.
+@test
+fn mist_lies_in_the_hollows() {
+    let clear = hazy(vec3(0.6, 0.5, 0.0), vec3(5.0), eye: 0.0)
+    let misty = Air { mist: 2.0, mist_height: 0.05, ..clear }
+    for h in [0.0, 0.2, 0.25, 0.4, 2.0] {
+        let a = medium(clear, h)
+        let b = medium(Air { mist: 0.0, ..misty }, h)
+        assert(a.mie == b.mie && a.extinction == b.extinction, f"no mist changed the air at {h} km")
+    }
+    let low = medium(misty, ALTITUDE + 0.05).mie - medium(clear, ALTITUDE + 0.05).mie
+    let top = medium(misty, ALTITUDE + 0.2).mie - medium(clear, ALTITUDE + 0.2).mie
+    assert(abs(low - 2.0 * exp(-1.0)) < 1.0e-4, f"mist 50 m up is {low} per km")
+    assert(top < 0.04 && top > 0.0, f"mist 200 m up is {top} per km")
+}

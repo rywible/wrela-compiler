@@ -1,0 +1,749 @@
+// Drawing a user interface on the GPU: a frame's list of quads (rectangles, rounded or not,
+// ellipses, diamonds, lines, triangles and glyphs), each clipped to a rectangle, drawn by one
+// instanced draw in order, later quads over earlier ones. A program fills a `DrawList` each
+// frame, then a `Renderer` uploads it and draws it in a pass.
+//
+// A glyph's coverage comes from its distance field, so text is sharp at any size from one
+// atlas; a shape's comes from its own distance, so its edges are smooth at any angle.
+
+use raster::{Made, field, image}
+use std::host
+use std::io::Pending
+use text::{Face, Fonts, next_cluster}
+use std::gpu::{
+    ClipPosition, Flat, GpuBuffer, InstanceIndex, Over, RenderPass, Rgba8, Sampler, Texture,
+    Unorm8x4, VertexIndex, buffer, draw, sampler, texture, write,
+}
+
+/// A rectangle in pixels from the screen's top left.
+pub struct Rect: Copy + Eq {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    pub fn new(x: f32, y: f32, w: f32, h: f32) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    pub fn contains(self, p: vec2) -> bool {
+        p.x >= self.x && p.y >= self.y && p.x < self.x + self.w && p.y < self.y + self.h
+    }
+
+    /// Smaller by `d` on every side.
+    pub fn shrink(self, d: f32) -> Rect {
+        Rect {
+            x: self.x + d,
+            y: self.y + d,
+            w: max(self.w - 2.0 * d, 0.0),
+            h: max(self.h - 2.0 * d, 0.0),
+        }
+    }
+
+    /// Where it overlaps `o` (empty if they don't).
+    pub fn intersect(self, o: Rect) -> Rect {
+        let x0 = max(self.x, o.x)
+        let y0 = max(self.y, o.y)
+        let x1 = min(self.x + self.w, o.x + o.w)
+        let y1 = min(self.y + self.h, o.y + o.h)
+        Rect { x: x0, y: y0, w: max(x1 - x0, 0.0), h: max(y1 - y0, 0.0) }
+    }
+
+    pub fn center(self) -> vec2 {
+        vec2(self.x + 0.5 * self.w, self.y + 0.5 * self.h)
+    }
+
+    pub fn right(self) -> f32 {
+        self.x + self.w
+    }
+
+    pub fn bottom(self) -> f32 {
+        self.y + self.h
+    }
+}
+
+/// One quad: a rectangle (`scale` 0) with rounded corners of `radius` pixels, or a glyph,
+/// whose field's coverage is `(v − 0.5) × scale + 0.5 + radius`: a glyph's `radius` is the
+/// pixels of stroke its font's weight adds. `uv` is the glyph's corners in the
+/// atlas, from 0 to 1; for a rectangle, `uv.x` above 0 draws only a ring that many pixels
+/// wide inside its edge. `kind` makes it an ellipse or a diamond in `rect` instead (a ring the
+/// same way), a line from `uv.xy` to `uv.zw` (pixels), `radius` wide on each side, with
+/// round ends, or a triangle with corners `uv.xy`, `uv.zw` and `third` (a ring `radius` wide
+/// inside its edge when `radius` is above 0). `clip` indexes the list's clipping rectangles.
+pub struct Quad: Copy + GpuData {
+    pub rect: vec4,
+    pub uv: vec4,
+    pub color: Unorm8x4,
+    pub clip: u32,
+    pub scale: f32,
+    pub radius: f32,
+    pub kind: u32,
+    pub third: vec2,
+}
+
+/// A quad's `kind`: a rectangle, rounded or not, or a glyph's field.
+pub const BOX: u32 = 0
+/// A quad's `kind`: the ellipse that fills its rectangle.
+pub const ELLIPSE: u32 = 1
+/// A quad's `kind`: the diamond whose corners are the middles of its rectangle's sides.
+pub const DIAMOND: u32 = 2
+/// A quad's `kind`: a line with round ends.
+pub const LINE: u32 = 3
+/// A quad's `kind`: a triangle.
+pub const TRIANGLE: u32 = 5
+/// A colour glyph: the atlas's texels themselves (an emoji's), not a field.
+pub const IMAGE: u32 = 4
+
+/// A character group drawn with `?` because its face hasn't a glyph for it yet: the renderer
+/// asks the host for one (`Renderer::fetch`).
+pub struct Wanted: Clone + Eq {
+    pub face: Face,
+    pub text: String,
+}
+
+/// What a frame draws: quads in order, and the rectangles they're clipped to.
+pub struct DrawList: Clone {
+    pub quads: Vec<Quad>,
+    pub clips: Vec<vec4>,
+    /// The groups this frame's text drew as `?`, each once.
+    pub wanted: Vec<Wanted>,
+    stack: Vec<u32>,
+    clip: u32,
+}
+
+impl DrawList {
+    pub fn new() -> DrawList {
+        DrawList {
+            quads: Vec::new(),
+            clips: Vec::new(),
+            wanted: Vec::new(),
+            stack: Vec::new(),
+            clip: 0,
+        }
+    }
+
+    /// Empties it for a frame `screen` pixels wide and high: nothing clipped but by the screen.
+    pub fn clear(mut self, screen: vec2) {
+        self.quads.clear()
+        self.clips.clear()
+        self.wanted.clear()
+        self.stack.clear()
+        self.clips.push(vec4(0.0, 0.0, screen.x, screen.y))
+        self.clip = 0
+    }
+
+    /// The clipping rectangle now.
+    pub fn clip_rect(self) -> Rect {
+        let c = self.clips[self.clip]
+        Rect { x: c.x, y: c.y, w: c.z - c.x, h: c.w - c.y }
+    }
+
+    /// Clips what's drawn next to `r` too, until `pop_clip`.
+    pub fn push_clip(mut self, r: Rect) {
+        let c = self.clip_rect().intersect(r)
+        self.stack.push(self.clip)
+        self.clip = self.clips.len()
+        self.clips.push(vec4(c.x, c.y, c.x + c.w, c.y + c.h))
+    }
+
+    pub fn pop_clip(mut self) {
+        if let Some(c) = self.stack.pop() {
+            self.clip = c
+        }
+    }
+
+    /// A rectangle of `color`, its corners rounded by `radius` pixels.
+    pub fn rect(mut self, r: Rect, color: vec4, radius: f32 = 0.0) {
+        if r.w <= 0.0 || r.h <= 0.0 || color.w <= 0.0 {
+            return
+        }
+        self.quads.push(
+            Quad {
+                rect: vec4(r.x, r.y, r.w, r.h),
+                uv: vec4(0.0),
+                color: Unorm8x4::encode(color),
+                clip: self.clip,
+                scale: 0.0,
+                radius: min(radius, 0.5 * min(r.w, r.h)),
+                kind: BOX,
+                third: vec2(0.0),
+            },
+        )
+    }
+
+    /// The rounded outline of `r`, `width` pixels wide, inside it.
+    pub fn ring(mut self, r: Rect, color: vec4, radius: f32 = 0.0, width: f32 = 1.0) {
+        if r.w <= 0.0 || r.h <= 0.0 || color.w <= 0.0 || width <= 0.0 {
+            return
+        }
+        self.quads.push(
+            Quad {
+                rect: vec4(r.x, r.y, r.w, r.h),
+                uv: vec4(width, 0.0, width, 0.0),
+                color: Unorm8x4::encode(color),
+                clip: self.clip,
+                scale: 0.0,
+                radius: min(radius, 0.5 * min(r.w, r.h)),
+                kind: BOX,
+                third: vec2(0.0),
+            },
+        )
+    }
+
+    /// The ellipse that fills `r`; with `width` above 0, only its outline, that wide inside it.
+    pub fn ellipse(mut self, r: Rect, color: vec4, width: f32 = 0.0) {
+        self.shape(ELLIPSE, r, color, width)
+    }
+
+    /// The diamond whose corners are the middles of `r`'s sides; with `width` above 0, only its
+    /// outline, that wide inside it.
+    pub fn diamond(mut self, r: Rect, color: vec4, width: f32 = 0.0) {
+        self.shape(DIAMOND, r, color, width)
+    }
+
+    fn shape(mut self, kind: u32, r: Rect, color: vec4, width: f32) {
+        if r.w <= 0.0 || r.h <= 0.0 || color.w <= 0.0 {
+            return
+        }
+        self.quads.push(
+            Quad {
+                rect: vec4(r.x, r.y, r.w, r.h),
+                uv: vec4(width, 0.0, width, 0.0),
+                color: Unorm8x4::encode(color),
+                clip: self.clip,
+                scale: 0.0,
+                radius: 0.0,
+                kind,
+                third: vec2(0.0),
+            },
+        )
+    }
+
+    /// A line from `a` to `b`, `width` pixels wide, with round ends.
+    pub fn line(mut self, a: vec2, b: vec2, color: vec4, width: f32 = 1.0) {
+        if color.w <= 0.0 || width <= 0.0 {
+            return
+        }
+        // Its quad holds the ends' caps, and a pixel more for the edge's smoothing.
+        let h = 0.5 * width
+        let lo = min(a, b) - vec2(h + 1.0)
+        let hi = max(a, b) + vec2(h + 1.0)
+        self.quads.push(
+            Quad {
+                rect: vec4(lo, hi - lo),
+                uv: vec4(a, b),
+                color: Unorm8x4::encode(color),
+                clip: self.clip,
+                scale: 0.0,
+                radius: h,
+                kind: LINE,
+                third: vec2(0.0),
+            },
+        )
+    }
+
+    /// The triangle with corners `a`, `b` and `c`; with `width` above 0, only its outline, that
+    /// wide inside it.
+    pub fn triangle(mut self, a: vec2, b: vec2, c: vec2, color: vec4, width: f32 = 0.0) {
+        if color.w <= 0.0 {
+            return
+        }
+        // Its quad holds the corners, and a pixel more for the edge's smoothing.
+        let lo = min(min(a, b), c) - vec2(1.0)
+        let hi = max(max(a, b), c) + vec2(1.0)
+        self.quads.push(
+            Quad {
+                rect: vec4(lo, hi - lo),
+                uv: vec4(a, b),
+                color: Unorm8x4::encode(color),
+                clip: self.clip,
+                scale: 0.0,
+                radius: width,
+                kind: TRIANGLE,
+                third: c,
+            },
+        )
+    }
+
+    /// The outline of `r`, `width` pixels wide, inside it.
+    pub fn frame(mut self, r: Rect, color: vec4, width: f32 = 1.0) {
+        let width = min(width, 0.5 * min(r.w, r.h))
+        self.rect(Rect::new(r.x, r.y, r.w, width), color)
+        self.rect(Rect::new(r.x, r.bottom() - width, r.w, width), color)
+        self.rect(Rect::new(r.x, r.y + width, width, r.h - 2.0 * width), color)
+        self.rect(Rect::new(r.right() - width, r.y + width, width, r.h - 2.0 * width), color)
+    }
+
+    /// `text` in `face` at `size` pixels per em, its first line's top at `at` (its baseline
+    /// below by the font's ascent, on a whole pixel). How wide it was.
+    pub fn text(
+        mut self,
+        fonts: Fonts,
+        face: Face,
+        text: str,
+        size: f32,
+        at: vec2,
+        color: vec4,
+    ) -> f32 {
+        borrow font = fonts.font(face)
+        let k = size / font.em
+        let baseline = floor(at.y + font.ascender * size + 0.5)
+        let packed = Unorm8x4::encode(color)
+        let scale = 2.0 * font.spread * k
+        // The baker pads each field by its spread, rounded up, and a texel (ttf.wrela).
+        let pad = ceil(font.spread) + 1.0
+        let aw = f32(fonts.width)
+        let ah = f32(fonts.height)
+        let end = font.walk(text, size, at.x, |i, gi, pen| {
+            let g = font.glyph(gi)
+            if gi == font.missing() {
+                let group = text.slice(i, next_cluster(text, i))
+                if font.wants(group) {
+                    var seen = false
+                    for w in self.wanted {
+                        if w.face == face && w.text.as_str() == group {
+                            seen = true
+                        }
+                    }
+                    if !seen {
+                        self.wanted.push(Wanted { face, text: String::from(group) })
+                    }
+                }
+            }
+            if g.color {
+                // A colour glyph's texels are its image, a texel round the ink.
+                self.quads.push(
+                    Quad {
+                        rect: vec4(
+                            pen + g.left * k,
+                            baseline - g.top * k,
+                            f32(g.width) * k,
+                            f32(g.height) * k,
+                        ),
+                        uv: vec4(
+                            f32(g.atlas_x) / aw,
+                            f32(g.atlas_y) / ah,
+                            f32(g.atlas_x + g.width) / aw,
+                            f32(g.atlas_y + g.height) / ah,
+                        ),
+                        color: packed,
+                        clip: self.clip,
+                        scale: 0.0,
+                        radius: 0.0,
+                        kind: IMAGE,
+                        third: vec2(0.0),
+                    },
+                )
+            } else if g.width > 0 {
+                // The field reaches `pad` texels past the ink; only half a pixel of it is drawn,
+                // and the stroke the weight adds, so the quad covers the ink, those, and a half
+                // texel, for filtering.
+                let reach = (0.5 + font.weight * size) / k
+                let inset = clamp(pad - reach - 0.5, 0.0, 0.5 * min(f32(g.width), f32(g.height)))
+                let x = pen + (g.left + inset) * k
+                let y = baseline - (g.top - inset) * k
+                let fw = f32(g.width) - 2.0 * inset
+                let fh = f32(g.height) - 2.0 * inset
+                let u0 = (f32(g.atlas_x) + inset) / aw
+                let v0 = (f32(g.atlas_y) + inset) / ah
+                self.quads.push(
+                    Quad {
+                        rect: vec4(x, y, fw * k, fh * k),
+                        uv: vec4(u0, v0, u0 + fw / aw, v0 + fh / ah),
+                        color: packed,
+                        clip: self.clip,
+                        scale,
+                        radius: font.weight * size,
+                        kind: BOX,
+                        third: vec2(0.0),
+                    },
+                )
+            }
+            true
+        })
+        end - at.x
+    }
+}
+
+@test
+fn a_ring_is_one_quad_that_carries_its_width() {
+    var list = DrawList::new()
+    list.clear(vec2(100.0))
+    list.ring(Rect::new(x: 10.0, y: 20.0, w: 40.0, h: 20.0), vec4(1.0), radius: 10.0, width: 1.5)
+    assert(list.quads.len() == 1 && list.quads[0].uv.x == 1.5 && list.quads[0].scale == 0.0)
+    list.ring(Rect::new(x: 10.0, y: 20.0, w: 40.0, h: 20.0), vec4(1.0), width: 0.0)
+    assert(list.quads.len() == 1, "no width, no ring")
+}
+
+@test
+fn a_line_holds_its_ends_and_its_width() {
+    var list = DrawList::new()
+    list.clear(vec2(100.0))
+    list.line(vec2(30.0, 10.0), vec2(10.0, 40.0), vec4(1.0), width: 4.0)
+    let q = list.quads[0]
+    assert(q.kind == LINE && q.radius == 2.0 && q.uv == vec4(30.0, 10.0, 10.0, 40.0))
+    // The quad reaches past both ends by the half width.
+    assert(q.rect.x <= 8.0 && q.rect.y <= 8.0)
+    assert(q.rect.x + q.rect.z >= 32.0 && q.rect.y + q.rect.w >= 42.0)
+    list.ellipse(Rect::new(x: 0.0, y: 0.0, w: 10.0, h: 0.0), vec4(1.0))
+    assert(list.quads.len() == 1, "an empty ellipse draws nothing")
+}
+
+@test
+fn a_triangle_holds_its_corners() {
+    var list = DrawList::new()
+    list.clear(vec2(100.0))
+    list.triangle(vec2(10.0, 50.0), vec2(30.0, 10.0), vec2(50.0, 50.0), vec4(1.0), width: 2.0)
+    let q = list.quads[0]
+    assert(q.kind == TRIANGLE && q.third == vec2(50.0, 50.0) && q.radius == 2.0)
+    assert(q.rect == vec4(9.0, 9.0, 42.0, 42.0))
+    // Inside, on the edge and outside, whichever way round.
+    let (a, b, c) = (vec2(10.0, 50.0), vec2(30.0, 10.0), vec2(50.0, 50.0))
+    assert(triangle_distance(vec2(30.0, 40.0), a, b, c) < 0.0)
+    assert(triangle_distance(vec2(30.0, 40.0), c, b, a) < 0.0)
+    assert(abs(triangle_distance(vec2(30.0, 50.0), a, b, c)) < 1.0e-4)
+    assert(abs(triangle_distance(vec2(30.0, 60.0), a, b, c) - 10.0) < 1.0e-4)
+}
+
+@test
+fn a_font_s_tracking_and_weight_space_and_thicken_its_glyphs() {
+    // One glyph, `N`, with ink: a field 12 texels square, half an em wide.
+    let glyph = ttf::BakedGlyph {
+        codepoint: 78,
+        advance: 0.5,
+        left: 0.0,
+        top: 10.0,
+        width: 12,
+        height: 12,
+        offset: 0,
+    }
+    let baked = ttf::Baked {
+        em: 32.0,
+        spread: 4.0,
+        ascender: 0.8,
+        descender: -0.2,
+        line_gap: 0.0,
+        glyphs: Vec::from([glyph]),
+        kerning: Vec::new(),
+        fields: Vec::filled(144, u8(128)),
+    }
+    var fonts = Fonts::from_baked(baked.clone(), baked)
+    let plain = fonts.sans.measure("NNN", 20.0)
+    var list = DrawList::new()
+    list.clear(vec2(200.0))
+    let _ = list.text(fonts, Face::Sans, "N", 20.0, vec2(0.0), vec4(1.0))
+    let thin = list.quads[0]
+    assert(thin.radius == 0.0, "no weight unless the caller sets one")
+    fonts.sans.tracking = -0.02
+    fonts.sans.weight = 0.01
+    assert(abs(fonts.sans.measure("NNN", 20.0) - (plain - 3.0 * 0.02 * 20.0)) < 0.001)
+    let _ = list.text(fonts, Face::Sans, "N", 20.0, vec2(0.0), vec4(1.0))
+    let bold = list.quads[1]
+    assert(abs(bold.radius - 0.2) < 0.0001)
+    // Its quad grows to hold the stroke the weight adds.
+    assert(bold.rect.z > thin.rect.z && bold.rect.x < thin.rect.x)
+}
+
+@test
+fn a_thick_frame_stays_inside_its_rectangle() {
+    var list = DrawList::new()
+    list.clear(vec2(100.0))
+    let r = Rect::new(x: 10.0, y: 20.0, w: 4.0, h: 3.0)
+    list.frame(r, vec4(1.0), width: 5.0)
+    assert(list.quads.len() > 0)
+    for q in list.quads {
+        assert(q.rect.x >= r.x && q.rect.y >= r.y)
+        assert(q.rect.x + q.rect.z <= r.right())
+        assert(q.rect.y + q.rect.w <= r.bottom())
+    }
+}
+
+// ---- the GPU -------------------------------------------------------------------------------------
+
+/// What a quad's corner passes on.
+pub struct QuadVertex: Copy {
+    pub clip_pos: ClipPosition,
+    /// Where in the atlas, for a glyph.
+    pub uv: vec2,
+    /// From the quad's centre, in pixels, for a rounded rectangle.
+    pub local: vec2,
+    /// The pixel, for clipping.
+    pub pixel: vec2,
+    pub color: Flat<vec4>,
+    /// The clipping rectangle: left, top, right, bottom.
+    pub clip: Flat<vec4>,
+    /// `scale`, `radius`, and the quad's half width and height.
+    pub shape: Flat<vec4>,
+    /// The quad's `uv` as it was: a line's ends, or a triangle's first two corners.
+    pub ends: Flat<vec4>,
+    pub third: Flat<vec2>,
+    pub kind: Flat<u32>,
+}
+
+@vertex
+fn quad_corner(
+    v: VertexIndex,
+    i: InstanceIndex,
+    quads: [Quad],
+    clips: [vec4],
+    screen: vec2,
+) -> QuadVertex {
+    let q = quads[i.index]
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let c = corners[v.index]
+    let p = q.rect.xy + c * q.rect.zw
+    let ndc = vec2(2.0 * p.x / screen.x - 1.0, 1.0 - 2.0 * p.y / screen.y)
+    QuadVertex {
+        clip_pos: ClipPosition { position: vec4(ndc, 0.0, 1.0) },
+        uv: mix(q.uv.xy, q.uv.zw, c),
+        local: (c - vec2(0.5)) * q.rect.zw,
+        pixel: p,
+        color: Flat { value: q.color.decode() },
+        clip: Flat { value: clips[q.clip] },
+        shape: Flat { value: vec4(q.scale, q.radius, 0.5 * q.rect.zw) },
+        ends: Flat { value: q.uv },
+        third: Flat { value: q.third },
+        kind: Flat { value: q.kind },
+    }
+}
+
+// The ellipse's and the diamond's distances follow Inigo Quilez's published formulas
+// (docs/process.md, "A whiteboard").
+
+/// The distance from `p` to the edge of the ellipse with half axes `r`, about its centre:
+/// negative inside (near its edge, close to the true distance).
+fn ellipse_distance(p: vec2, r: vec2) -> f32 {
+    let k0 = length(p / r)
+    let k1 = length(p / (r * r))
+    if k1 > 0.0 { k0 * (k0 - 1.0) / k1 } else { -min(r.x, r.y) }
+}
+
+/// The distance from `p` to the edge of the diamond with half diagonals `b`, about its centre:
+/// negative inside.
+fn diamond_distance(p: vec2, b: vec2) -> f32 {
+    let q = abs(p)
+    let h = clamp(((b.x - 2.0 * q.x) * b.x - (b.y - 2.0 * q.y) * b.y) / dot(b, b), -1.0, 1.0)
+    let d = length(q - 0.5 * b * vec2(1.0 - h, 1.0 + h))
+    if q.x * b.y + q.y * b.x - b.x * b.y > 0.0 { d } else { -d }
+}
+
+/// The distance from `p` to the edge of the triangle `a`, `b`, `c`: negative inside, whichever
+/// way round its corners go.
+fn triangle_distance(p: vec2, a: vec2, b: vec2, c: vec2) -> f32 {
+    let e0 = b - a
+    let e1 = c - b
+    let e2 = a - c
+    let v0 = p - a
+    let v1 = p - b
+    let v2 = p - c
+    let q0 = v0 - e0 * clamp(dot(v0, e0) / max(dot(e0, e0), 1.0e-9), 0.0, 1.0)
+    let q1 = v1 - e1 * clamp(dot(v1, e1) / max(dot(e1, e1), 1.0e-9), 0.0, 1.0)
+    let q2 = v2 - e2 * clamp(dot(v2, e2) / max(dot(e2, e2), 1.0e-9), 0.0, 1.0)
+    let d = sqrt(min(min(dot(q0, q0), dot(q1, q1)), dot(q2, q2)))
+    // Inside when p is on the same side of all three edges.
+    let w = e0.x * e2.y - e0.y * e2.x
+    let s0 = (v0.x * e0.y - v0.y * e0.x) * w
+    let s1 = (v1.x * e1.y - v1.y * e1.x) * w
+    let s2 = (v2.x * e2.y - v2.y * e2.x) * w
+    if s0 >= 0.0 && s1 >= 0.0 && s2 >= 0.0 { -d } else { d }
+}
+
+/// The distance from `p` to the line from `a` to `b`.
+fn line_distance(p: vec2, a: vec2, b: vec2) -> f32 {
+    let ab = b - a
+    let along = dot(ab, ab)
+    let t = if along > 0.0 { clamp(dot(p - a, ab) / along, 0.0, 1.0) } else { 0.0 }
+    length(p - a - ab * t)
+}
+
+@fragment
+fn quad_color(v: QuadVertex, atlas: Texture<Rgba8>, linear: Sampler) -> Over {
+    let s = v.shape.value
+    var coverage = 1.0
+    let kind = v.kind.value
+    var rgb = v.color.value.xyz
+    if kind == IMAGE {
+        // A colour glyph: the texel's colour, its alpha the coverage.
+        let t = atlas.sample_level(linear, v.uv, 0.0)
+        rgb = t.xyz
+        coverage = t.w
+    } else if s.x > 0.0 {
+        // A glyph: the field's distance, scaled to this size's pixels.
+        let d = atlas.sample_level(linear, v.uv, 0.0).x
+        coverage = saturate((d - 0.5) * s.x + 0.5 + s.y)
+    } else if kind == TRIANGLE {
+        let e = v.ends.value
+        let d = triangle_distance(v.pixel, e.xy, e.zw, v.third.value)
+        coverage = saturate(0.5 - d)
+        if s.y > 0.0 { coverage *= saturate(0.5 + d + s.y) }
+    } else if kind == LINE {
+        let e = v.ends.value
+        coverage = saturate(0.5 - (line_distance(v.pixel, e.xy, e.zw) - s.y))
+    } else if kind == ELLIPSE || kind == DIAMOND {
+        // An ellipse or a diamond: the distance to its edge; a ring keeps only its outer band.
+        let d = if kind == ELLIPSE {
+            ellipse_distance(v.local, s.zw)
+        } else {
+            diamond_distance(v.local, s.zw)
+        }
+        coverage = saturate(0.5 - d)
+        if v.uv.x > 0.0 { coverage *= saturate(0.5 + d + v.uv.x) }
+    } else if s.y > 0.0 || v.uv.x > 0.0 {
+        // A rounded rectangle: the distance to its edge; a ring keeps only its outer band.
+        let q = abs(v.local) - s.zw + vec2(s.y)
+        let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - s.y
+        coverage = saturate(0.5 - d)
+        if v.uv.x > 0.0 { coverage *= saturate(0.5 + d + v.uv.x) }
+    }
+    let c = v.clip.value
+    let inside = v.pixel.x >= c.x && v.pixel.x < c.z && v.pixel.y >= c.y && v.pixel.y < c.w
+    let a = if inside { v.color.value.w * coverage } else { 0.0 }
+    Over { color: vec4(rgb, a) }
+}
+
+/// A glyph asked of the host: for which face and group, and its answer on its way.
+struct Asking {
+    face: Face,
+    text: String,
+    answer: Pending<u8>,
+}
+
+/// The pixels an em a host draws a glyph at: four times the fields' 32, for the field's edge.
+const DRAWN_PX: u32 = 128
+/// The most glyphs asked of the host at once.
+const ASKING: u32 = 16
+
+/// Draws lists on the GPU: the atlas, and buffers that grow to the largest list.
+pub struct Renderer {
+    atlas: Texture<Rgba8>,
+    asking: Vec<Asking>,
+    linear: Sampler,
+    quads: GpuBuffer<Quad>,
+    clips: GpuBuffer<vec4>,
+    quad_room: u32,
+    clip_room: u32,
+    count: u32,
+}
+
+impl Renderer {
+    /// Makes the atlas from `fonts`' glyphs.
+    pub fn new(fonts: Fonts) -> Renderer {
+        var atlas = texture::<Rgba8>(width: fonts.width, height: fonts.height)
+        atlas.write(x: 0, y: 0, width: fonts.width, height: fonts.baked, bytes: fonts.atlas())
+        Renderer {
+            atlas,
+            asking: Vec::new(),
+            linear: sampler(),
+            quads: buffer(1024),
+            clips: buffer(64),
+            quad_room: 1024,
+            clip_room: 64,
+            count: 0,
+        }
+    }
+
+    /// Asks the host for glyphs for the groups `list` drew as `?` (`font/glyph`, the system's
+    /// fonts), and makes those that have come into glyphs in `fonts` and the atlas: text drawn
+    /// next frame has them. A host without the service, or a group it can't draw, keeps `?`.
+    pub fn fetch(mut self, fonts: mut Fonts, list: DrawList) {
+        for w in list.wanted {
+            if self.asking.len() >= ASKING {
+                break
+            }
+            mut font = fonts.font_mut(w.face)
+            if !font.wants(w.text.as_str()) {
+                continue
+            }
+            font.ask(w.text.as_str())
+            let face = if w.face == Face::Sans { u8(0) } else { u8(1) }
+            self.asking.push(
+                Asking {
+                    face: w.face,
+                    text: w.text.clone(),
+                    answer: host::glyph(face, DRAWN_PX, w.text.as_str()),
+                },
+            )
+        }
+        var i = 0
+        while i < self.asking.len() {
+            let Some(answer) = self.asking[i].answer.poll() else {
+                i += 1
+                continue
+            }
+            let asked = self.asking.remove(i)
+            let Ok(bytes) = answer else { continue }
+            let Some(drawn) = host::read_glyph(bytes, f32(DRAWN_PX)) else { continue }
+            borrow font = fonts.font(asked.face)
+            let made = if drawn.colored { image(drawn, font.em) } else {
+                field(drawn, font.em, font.spread)
+            }
+            let _ = self.install(mut fonts, asked.face, asked.text.as_str(), made)
+        }
+    }
+
+    /// Whether glyphs asked of the host are on their way: a program that draws only when its
+    /// picture changes draws again until they come, as text drawn after has them.
+    pub fn waiting(self) -> bool {
+        !self.asking.is_empty()
+    }
+
+    /// Puts glyph `made` for `group` in the atlas and `face`'s font: false if the atlas's rows
+    /// for made glyphs are full, and the group keeps `?`.
+    pub fn install(mut self, fonts: mut Fonts, face: Face, group: str, made: Made) -> bool {
+        let Some(at) = fonts.place_made(w: made.width, h: made.height) else { return false }
+        self.atlas.write(
+            x: at.x,
+            y: at.y,
+            width: made.width,
+            height: made.height,
+            bytes: made.texels,
+        )
+        mut font = fonts.font_mut(face)
+        if font.wants(group) {
+            font.ask(group)
+        }
+        font.add(group, made, x: at.x, y: at.y)
+        true
+    }
+
+    /// Uploads `list`: before the pass that draws it begins.
+    pub fn upload(mut self, list: DrawList) {
+        if list.quads.len() > self.quad_room {
+            self.quad_room = max(list.quads.len(), 2 * self.quad_room)
+            self.quads = buffer(self.quad_room)
+        }
+        if list.clips.len() > self.clip_room {
+            self.clip_room = max(list.clips.len(), 2 * self.clip_room)
+            self.clips = buffer(self.clip_room)
+        }
+        if list.quads.len() > 0 {
+            write(mut self.quads, 0, list.quads)
+        }
+        if list.clips.len() > 0 {
+            write(mut self.clips, 0, list.clips)
+        }
+        self.count = list.quads.len()
+    }
+
+    /// Draws what was uploaded, in `pass`, on a target `screen` pixels wide and high.
+    pub fn draw<P: RenderPass>(self, pass: P, screen: vec2) {
+        if self.count > 0 {
+            draw(
+                pass,
+                quad_corner.bind(quads: self.quads, clips: self.clips, screen: screen),
+                quad_color.bind(atlas: self.atlas, linear: self.linear),
+                vertices: 6,
+                instances: self.count,
+            )
+        }
+    }
+}

@@ -1,0 +1,699 @@
+// Round 1's wolf (design-archive-2026-10: experiments/agent-authoring/wolf/creature.wgsl),
+// ported to the engine's creature API: the same joints, and the same parts in the same order,
+// each now a named part on a bone. It matches its WGSL within 0.5 mm near the surface (AC7);
+// where a port's numbers differ from the WGSL's, it's by rounding: a part written in its bone's
+// space subtracts the bone's position where the WGSL subtracted the part's.
+//
+// Units: metres. +y up, ground at y = 0, +z forward (nose), +x the wolf's left. Limbs, cheeks,
+// brows, eyes and ears are written for the left side (x > 0) and mirrored.
+//
+// Changed from the WGSL:
+// - Its colour (`albedo`, 80 lines of masks over the whole body) isn't ported. Each part carries
+//   a coat of its own instead (channels per part), from the WGSL's palette.
+// - The cheek ruff's fur is noise at the unmirrored point, and its ellipsoid at the mirrored
+//   one, so it's one part for both sides (`CheekRuff`), not a mirrored part.
+
+use engine::creature::{Creature, Frame, Modifier, Skeleton, creature, frame, group, hard, smooth}
+use round1::shapes::{
+    FurredEll, NOISE3_LIPSCHITZ, ell, fbm3, fbm3_lipschitz, fbm3_range, flat_cone, mirror_x, noise3,
+    rot_x, rot_y, rot_z, sd_box, sstep, sstep_slope,
+}
+use std::field::{Blend, Color, Surface, rgb, round_cone, smax, smin, sphere}
+use std::quat::Quat
+
+// ---- channels: a coat per part ------------------------------------------------------------------
+
+/// What a point of the wolf carries: its coat's colour (round 1's palette).
+pub struct Coat: Copy + GpuData + Blend {
+    pub albedo: Color,
+}
+
+const GREY = Coat { albedo: rgb(r: 0.26, g: 0.23, b: 0.19) }
+const TAWNY = Coat { albedo: rgb(r: 0.45, g: 0.30, b: 0.15) }
+const CREAM = Coat { albedo: rgb(r: 0.66, g: 0.57, b: 0.43) }
+const DARK = Coat { albedo: rgb(r: 0.032, g: 0.028, b: 0.024) }
+const BLACK = Coat { albedo: rgb(r: 0.014, g: 0.012, b: 0.010) }
+const AMBER = Coat { albedo: rgb(r: 0.60, g: 0.33, b: 0.05) }
+
+// ---- axial skeleton -----------------------------------------------------------------------------
+
+pub const J_PELVIS: vec3 = vec3(0.0, 0.632, -0.430) // root: sacrum / hip centre
+pub const J_LUMBAR: vec3 = vec3(0.0, 0.655, -0.180) // loin
+pub const J_CHEST: vec3 = vec3(0.0, 0.615, 0.095) // thorax centre
+pub const J_WITHERS: vec3 = vec3(0.0, 0.800, 0.200) // top of the scapulae (shoulder height)
+pub const J_NECK: vec3 = vec3(0.0, 0.680, 0.310) // neck base (C7)
+pub const J_HEAD: vec3 = vec3(0.0, 0.912, 0.592) // skull centre
+pub const HEAD_PITCH: f32 = 0.22 // nose-down tilt of the head bone (rad)
+pub const HEAD_SCALE: f32 = 1.13
+// tail chain (root -> tip), hanging down and back
+pub const J_TAIL0: vec3 = vec3(0.0, 0.668, -0.570)
+pub const J_TAIL1: vec3 = vec3(0.0, 0.585, -0.660)
+pub const J_TAIL2: vec3 = vec3(0.0, 0.450, -0.715)
+pub const J_TAIL3: vec3 = vec3(0.0, 0.270, -0.690)
+
+// ---- fore limb (left) ---------------------------------------------------------------------------
+
+pub const J_SCAPULA: vec3 = vec3(0.050, 0.750, 0.185)
+pub const J_SHOULDER: vec3 = vec3(0.065, 0.565, 0.335)
+pub const J_ELBOW: vec3 = vec3(0.078, 0.415, 0.245)
+pub const J_CARPUS: vec3 = vec3(0.072, 0.128, 0.270)
+pub const J_FPAW: vec3 = vec3(0.070, 0.000, 0.300)
+
+// ---- hind limb (left) ---------------------------------------------------------------------------
+
+pub const J_HIP: vec3 = vec3(0.070, 0.600, -0.420)
+pub const J_STIFLE: vec3 = vec3(0.085, 0.410, -0.320)
+pub const J_HOCK: vec3 = vec3(0.078, 0.210, -0.495)
+pub const J_HPAW: vec3 = vec3(0.075, 0.000, -0.445)
+
+/// The skeleton: the axial joints, the tail's, and four legs (fore left, fore right, hind
+/// left, hind right: the gait's order), each right one paired with its left.
+pub fn skeleton() -> Skeleton {
+    var s = Skeleton::new()
+    let pelvis = s.root("pelvis", J_PELVIS)
+    let lumbar = s.joint("lumbar", pelvis, J_LUMBAR)
+    let chest = s.joint("chest", lumbar, J_CHEST)
+    s.joint("withers", chest, J_WITHERS)
+    let neck = s.joint("neck", chest, J_NECK)
+    s.joint("head", neck, J_HEAD)
+    let t0 = s.joint("tail 0", pelvis, J_TAIL0)
+    let t1 = s.joint("tail 1", t0, J_TAIL1)
+    let t2 = s.joint("tail 2", t1, J_TAIL2)
+    s.joint("tail 3", t2, J_TAIL3)
+    let (scapula, _) = s.joint_pair("scapula left", "scapula right", chest, J_SCAPULA)
+    s.leg_pair(
+        ["shoulder left", "elbow left", "carpus left", "fore paw left"],
+        ["shoulder right", "elbow right", "carpus right", "fore paw right"],
+        scapula,
+        [J_SHOULDER, J_ELBOW, J_CARPUS, J_FPAW],
+    )
+    s.leg_pair(
+        ["hip left", "stifle left", "hock left", "hind paw left"],
+        ["hip right", "stifle right", "hock right", "hind paw right"],
+        pelvis,
+        [J_HIP, J_STIFLE, J_HOCK, J_HPAW],
+    )
+    s
+}
+
+// ---- shapes of the wolf's own -------------------------------------------------------------------
+
+/// Paw toes, in the paw's frame (unscaled), the +x half; mirrored.
+const TOE_IN: vec3 = vec3(0.011, 0.015, 0.030)
+const TOE_OUT: vec3 = vec3(0.029, 0.014, 0.017)
+
+/// A paw in its own frame: the origin on the ground under the paw's centre, +z forward;
+/// `s` times round 1's size.
+pub struct Paw: Copy + GpuData {
+    pub s: f32,
+}
+
+impl Surface for Paw {
+    fn distance(self, q: vec3) -> f32 {
+        let s = self.s
+        var d = ell(vec3(0.030, 0.024, 0.034) * s).distance(q - vec3(0.0, 0.022, -0.012) * s)
+        let mq = vec3(abs(q.x), q.y, q.z)
+        d = smin(d, ell(vec3(0.0125, 0.015, 0.017) * s).distance(mq - TOE_IN * s), 0.006 * s)
+        d = smin(d, ell(vec3(0.0115, 0.014, 0.016) * s).distance(mq - TOE_OUT * s), 0.006 * s)
+        smax(d, -q.y, 0.004)
+    }
+
+    /// Blends of the three ellipsoids and the ground plane (1): their largest bound, each
+    /// within `near` plus the blends' reach.
+    fn lipschitz(self, near: f32) -> f32 {
+        let s = self.s
+        let n = near + 1.25 * (0.006 * s * 2.0 + 0.004)
+        max(
+            ell(vec3(0.030, 0.024, 0.034) * s).lipschitz(n),
+            max(
+                ell(vec3(0.0125, 0.015, 0.017) * s).lipschitz(n),
+                ell(vec3(0.0115, 0.014, 0.016) * s).lipschitz(n),
+            ),
+        )
+    }
+}
+
+/// The muzzle: a box tapering along z, with a flat top and flat sides, in the head's frame.
+pub struct Muzzle: Copy + GpuData {
+    pub z0: f32,
+    pub z1: f32,
+}
+
+impl Surface for Muzzle {
+    fn distance(self, q: vec3) -> f32 {
+        let (z0, z1) = (self.z0, self.z1)
+        let t = clamp((q.z - z0) / (z1 - z0), 0.0, 1.0)
+        let cy = mix(0.004, -0.005, t)
+        let hx = mix(0.043, 0.022, t)
+        let hy = mix(0.040, 0.026, t)
+        let r = mix(0.028, 0.019, t)
+        let c = vec3(q.x, q.y - cy, q.z - 0.5 * (z0 + z1))
+        sd_box(c, vec3(hx - r, hy - r, 0.5 * (z1 - z0) - r)) - r
+    }
+
+    /// The box's distance is 1-Lipschitz in the point and in its half-extents. Along z, over
+    /// the taper (t' = 1 / (z1 - z0)), the centre moves by 0.009 t', the half-extents less
+    /// the radius by (0.012, 0.005, 0.009) t' (at most 0.0158 t' long), and the radius by
+    /// 0.009 t': at most 1 + (0.009 + 0.0158 + 0.009) t'.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0 + 0.0338 / abs(self.z1 - self.z0)
+    }
+}
+
+/// The ear's joint, in the head's frame (left; mirrored).
+const EAR_BASE: vec3 = vec3(0.046, 0.040, -0.036)
+const EAR_H: f32 = 0.086
+
+/// The ear's frame: x across the ear, y from base to tip, z through it (+z the inner face).
+fn ear_local(m: vec3) -> vec3 {
+    var e = m - EAR_BASE
+    e = rot_y(e, -0.35) // opening faces forward and a little outward
+    e = rot_z(e, 0.28) // splay outward
+    e = rot_x(e, 0.04) // stand up (head pitch already tips them forward a little)
+    e
+}
+
+/// The inner hollow of the ear (the opening), in the ear's frame.
+fn ear_cavity(e: vec3) -> f32 {
+    let ci = (e - vec3(0.0, 0.012, 0.020)) * vec3(1.12, 1.0, 1.45)
+    round_cone(vec3(), vec3(0.0, EAR_H - 0.024, 0.0), r_top: 0.030, r_bottom: 0.004).distance(ci) /
+        1.45
+}
+
+/// A cupped ear, in the head's frame: a cone flattened front to back, hollowed from the front.
+pub struct Ear: Copy + GpuData {
+    pub height: f32,
+}
+
+impl Surface for Ear {
+    fn distance(self, m: vec3) -> f32 {
+        let e = ear_local(m)
+        let outer = round_cone(
+            vec3(),
+            vec3(0.0, self.height, 0.0),
+            r_top: 0.038,
+            r_bottom: 0.012,
+        ).distance(
+            e * vec3(1.0, 1.0, 1.45),
+        ) /
+            1.45
+        smax(outer, -ear_cavity(e), 0.004)
+    }
+
+    /// Two cones in spaces stretched by at most 1.45 along one axis, divided by 1.45, so
+    /// 1-Lipschitz each, turned, and joined by a smooth maximum: 1.
+    fn lipschitz(self, near: f32) -> f32 {
+        1.0
+    }
+}
+
+/// The cheek ruffs, both sides: an ellipsoid at the mirrored point, less fur at the point as
+/// it is (round 1's head did both at once).
+pub struct CheekRuff: Copy + GpuData {
+    pub centre: vec3,
+    pub r: vec3,
+}
+
+impl Surface for CheekRuff {
+    fn distance(self, q: vec3) -> f32 {
+        ell(self.r).distance(mirror_x(q) - self.centre) - 0.004 * fbm3(q * 40.0, 2)
+    }
+
+    fn lipschitz(self, near: f32) -> f32 {
+        ell(self.r).lipschitz(near + 0.004 * fbm3_range(2)) + 0.004 * 40.0 * fbm3_lipschitz(2)
+    }
+}
+
+/// A furred ellipsoid on the neck: centred at `c` (in the creature's space) from the neck's
+/// joint, with fur `amp` deep at `freq` per metre, offset by `offset`.
+fn neck_fur(c: vec3, r: vec3, amp: f32, freq: f32, offset: f32) -> FurredEll {
+    FurredEll {
+        centre: c - J_NECK,
+        r,
+        amp,
+        freq: vec3(freq),
+        offset: vec3(offset),
+        octaves: 2,
+        origin: J_NECK,
+    }
+}
+
+// ---- modifiers ----------------------------------------------------------------------------------
+
+/// The hind leg's inner thigh, flat: the legs never meet at the midline.
+pub struct InnerThigh: Copy + GpuData {
+    pub x: f32,
+    pub k: f32,
+}
+
+impl Modifier for InnerThigh {
+    fn apply(self, d: f32, p: vec3) -> f32 {
+        smax(d, self.x - p.x, self.k)
+    }
+
+    /// A smooth maximum of the leg and a plane (1).
+    fn lipschitz(self, inner: f32, near: f32) -> f32 {
+        max(inner, 1.0)
+    }
+
+    /// Where both have weight, they're within `k` of each other.
+    fn widen(self, near: f32) -> f32 {
+        near + 1.25 * self.k
+    }
+}
+
+/// The tail's fur: three octaves of noise, stretched along the tail, then the whole scaled by
+/// 0.88 (round 1's author's guess at keeping it 1-Lipschitz).
+pub struct TailFur: Copy + GpuData {
+    pub amp: f32,
+    pub freq: vec3,
+    pub scale: f32,
+}
+
+impl Modifier for TailFur {
+    fn apply(self, d: f32, p: vec3) -> f32 {
+        self.scale * (d - self.amp * fbm3(p * self.freq, 3))
+    }
+
+    fn lipschitz(self, inner: f32, near: f32) -> f32 {
+        let f = max(self.freq.x, max(self.freq.y, self.freq.z))
+        self.scale * (inner + self.amp * f * fbm3_lipschitz(3))
+    }
+
+    fn widen(self, near: f32) -> f32 {
+        near / self.scale + self.amp * fbm3_range(3)
+    }
+}
+
+/// The coat: fur in clumps stretched along the body, less on the lower legs and thin on the
+/// head and ears (by the head's distance, `head`); tufts on the belly and the britches; the
+/// whole scaled by 0.9.
+pub struct Fur<H>: Copy + GpuData {
+    pub head: H,
+}
+
+/// The fur's depth, and its tufts'.
+const FUR: f32 = 0.0045
+const TUFTS: f32 = 0.010
+
+impl<H: Surface> Modifier for Fur<H> {
+    fn apply(self, d: f32, p: vec3) -> f32 {
+        let dh = self.head.distance(p)
+        let fur = fbm3(p * vec3(34.0, 30.0, 13.0), 3)
+        // thin ears and face: little fur noise
+        let amp = FUR *
+            sstep(p.y, from: 0.12, to: 0.35) *
+            mix(0.2, 1.0, sstep(dh, from: -0.01, to: 0.03))
+        let tufts = 0.5 + 0.5 * noise3(p * vec3(40.0, 9.0, 22.0))
+        let belly = (1.0 - sstep(p.y, from: 0.47, to: 0.56)) *
+            sstep(p.z, from: -0.22, to: -0.10) *
+            (1.0 - sstep(p.z, from: 0.18, to: 0.30)) *
+            sstep(p.y, from: 0.30, to: 0.40)
+        let britches = sstep(p.z, from: -0.48, to: -0.56) *
+            sstep(p.y, from: 0.30, to: 0.40) *
+            (1.0 - sstep(p.y, from: 0.58, to: 0.64)) *
+            sstep(abs(p.x), from: 0.02, to: 0.05)
+        0.9 * (d - amp * fur - TUFTS * tufts * max(belly, britches))
+    }
+
+    /// 0.9 times: the body's bound; the fur's (its depth times fbm3's bound at 34 per metre,
+    /// and fbm3's range times the depth's gradient, from its two steps, the second by the
+    /// head's distance, within 3 cm of the head); and the tufts' (the noise's bound at 40 per
+    /// metre over two, plus the masks' gradients: each step's slope, summed per axis).
+    fn lipschitz(self, inner: f32, near: f32) -> f32 {
+        let fur = FUR * 34.0 * fbm3_lipschitz(3)
+        let amp_grad = FUR *
+            (sstep_slope(from: 0.12, to: 0.35) +
+                0.8 * sstep_slope(from: -0.01, to: 0.03) * self.head.lipschitz(near: 0.03))
+        let tufts = 0.5 * 40.0 * NOISE3_LIPSCHITZ
+        let belly = length(
+            vec2(
+                sstep_slope(from: 0.47, to: 0.56) + sstep_slope(from: 0.30, to: 0.40),
+                sstep_slope(from: -0.22, to: -0.10) + sstep_slope(from: 0.18, to: 0.30),
+            ),
+        )
+        let britches = length(
+            vec3(
+                sstep_slope(from: 0.02, to: 0.05),
+                sstep_slope(from: 0.30, to: 0.40) + sstep_slope(from: 0.58, to: 0.64),
+                sstep_slope(from: -0.48, to: -0.56),
+            ),
+        )
+        0.9 * (inner + fur + fbm3_range(3) * amp_grad + TUFTS * (tufts + max(belly, britches)))
+    }
+
+    fn widen(self, near: f32) -> f32 {
+        near / 0.9 + FUR * fbm3_range(3) + TUFTS
+    }
+}
+
+// ---- the wolf ---------------------------------------------------------------------------------
+
+/// The head's space: at its joint, pitched nose-down, and 1.13 times round 1's first guess.
+pub fn head_frame() -> Frame {
+    frame(J_HEAD, turn: Quat::axis_angle(vec3(1.0, 0.0, 0.0), HEAD_PITCH), scale: HEAD_SCALE)
+}
+
+/// The left eye's centre, in the head's frame.
+const EYE_C: vec3 = vec3(0.040, 0.018, 0.052)
+
+/// The wolf, standing square on all four paws.
+pub fn wolf() -> Creature<Coat> {
+    let s = skeleton()
+    // The head, in its own space (`head_frame`): cranium, cheeks, ruffs, muzzle, jaw, nose,
+    // brows, eyes and ears. The fur reads it, so it's made on its own.
+    let bone = s.find("head")
+    let h = group(
+        s,
+        "head",
+        |g| {
+            g.join(
+                "cranium",
+                bone,
+                ell(vec3(0.064, 0.058, 0.072)).translate(vec3(0.0, 0.010, -0.025)).with(GREY),
+            )
+                .join(
+                    "cheek", // zygomatic and masseter
+                    bone,
+                    ell(vec3(0.046, 0.046, 0.056)).translate(vec3(0.040, -0.018, 0.0)).with(GREY),
+                    seam: smooth(0.03),
+                    mirror: true,
+                )
+                .join(
+                    "cheek ruff",
+                    bone,
+                    CheekRuff { centre: vec3(0.056, -0.040, -0.050), r: vec3(0.045, 0.066, 0.055) }
+                        .with(CREAM),
+                    seam: smooth(0.03),
+                )
+                .join(
+                    "muzzle",
+                    bone,
+                    Muzzle { z0: 0.020, z1: 0.192 }.with(TAWNY),
+                    seam: smooth(0.035),
+                )
+                .join(
+                    "lower jaw",
+                    bone,
+                    flat_cone(
+                        vec3(0.0, -0.044, -0.010),
+                        vec3(0.0, -0.036, 0.152),
+                        r1: 0.032,
+                        r2: 0.015,
+                        sx: 1.25,
+                    ).with(CREAM),
+                    seam: smooth(0.012),
+                )
+                .join(
+                    "nose",
+                    bone,
+                    ell(vec3(0.0155, 0.011, 0.011)).translate(vec3(0.0, 0.006, 0.188)).with(BLACK),
+                    seam: smooth(0.006),
+                )
+                .join(
+                    "brow",
+                    bone,
+                    ell(vec3(0.022, 0.014, 0.022)).translate(vec3(0.030, 0.034, 0.038)).with(CREAM),
+                    seam: smooth(0.02),
+                    mirror: true,
+                )
+                .join(
+                    "eye",
+                    bone,
+                    sphere(0.0100).translate(EYE_C).with(AMBER),
+                    seam: hard(),
+                    mirror: true,
+                )
+                .join(
+                    "ear",
+                    bone,
+                    Ear { height: EAR_H }.with(TAWNY),
+                    seam: smooth(0.014),
+                    mirror: true,
+                )
+        },
+        seam: smooth(0.05),
+        space: head_frame(),
+    )
+    let fore = [s.find("scapula left"), s.find("shoulder left"), s.find("elbow left")]
+    let carpus = s.find("carpus left")
+    let fpaw = s.find("fore paw left")
+    let (hip, stifle, hock, hpaw) = (
+        s.find("hip left"),
+        s.find("stifle left"),
+        s.find("hock left"),
+        s.find("hind paw left"),
+    )
+    creature(s)
+        .group(
+            "torso",
+            |g| {
+                g.join("ribcage", s.find("chest"), ell(vec3(0.130, 0.180, 0.305)).with(GREY))
+                    .join(
+                        "prosternum",
+                        s.find("chest"),
+                        ell(vec3(0.085, 0.105, 0.090))
+                            .translate(vec3(0.0, 0.565, 0.320) - J_CHEST)
+                            .with(CREAM),
+                        seam: smooth(0.07),
+                    )
+                    .join(
+                        "withers",
+                        s.find("withers"),
+                        ell(vec3(0.075, 0.070, 0.140))
+                            .translate(vec3(0.0, -0.070, 0.010))
+                            .with(DARK),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "loin",
+                        s.find("lumbar"),
+                        ell(vec3(0.066, 0.088, 0.240)).with(GREY),
+                        seam: smooth(0.08),
+                    )
+                    .join(
+                        "croup", // sloping to the tail
+                        s.find("pelvis"),
+                        ell(vec3(0.098, 0.112, 0.145))
+                            .rotate(Quat::axis_angle(vec3(1.0, 0.0, 0.0), -0.30))
+                            .translate(vec3(0.0, 0.0, -0.010))
+                            .with(GREY),
+                        seam: smooth(0.08),
+                    )
+            },
+        )
+        .group(
+            "neck",
+            |g| {
+                let neck = s.find("neck")
+                let b = J_HEAD + vec3(0.0, -0.030, -0.070)
+                g.join(
+                    "neck",
+                    neck,
+                    round_cone(vec3(), b - J_NECK, r_top: 0.122, r_bottom: 0.075).with(GREY),
+                )
+                    .join(
+                        "ruff", // fur on the throat and the sides of the neck
+                        neck,
+                        neck_fur(
+                            J_NECK + vec3(0.0, 0.075, 0.140),
+                            vec3(0.112, 0.130, 0.105),
+                            amp: 0.007,
+                            freq: 16.0,
+                            offset: 0.0,
+                        ).with(CREAM),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "mane", // over the withers
+                        neck,
+                        neck_fur(
+                            J_NECK + vec3(0.0, 0.090, -0.040),
+                            vec3(0.105, 0.075, 0.120),
+                            amp: 0.006,
+                            freq: 16.0,
+                            offset: 3.0,
+                        ).with(DARK),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "hackles", // raised fur along the top of the neck behind the head
+                        neck,
+                        neck_fur(
+                            J_NECK + vec3(0.0, 0.165, 0.090),
+                            vec3(0.075, 0.050, 0.110),
+                            amp: 0.006,
+                            freq: 20.0,
+                            offset: 7.0,
+                        ).with(DARK),
+                        seam: smooth(0.05),
+                    )
+            },
+            seam: smooth(0.08),
+        )
+        .add(h)
+        .group(
+            "fore leg",
+            |g| {
+                g.join(
+                    "scapula",
+                    fore[0],
+                    round_cone(vec3(), J_SHOULDER - J_SCAPULA, r_top: 0.045, r_bottom: 0.058)
+                        .with(GREY),
+                )
+                    .join(
+                        "humerus", // elbow tucked in
+                        fore[1],
+                        round_cone(
+                            vec3(),
+                            J_ELBOW + vec3(-0.008, 0.010, 0.0) - J_SHOULDER,
+                            r_top: 0.058,
+                            r_bottom: 0.040,
+                        ).with(TAWNY),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "triceps",
+                        fore[1],
+                        round_cone(
+                            vec3(0.055, 0.555, 0.245) - J_SHOULDER,
+                            J_ELBOW + vec3(-0.008, 0.008, -0.020) - J_SHOULDER,
+                            r_top: 0.055,
+                            r_bottom: 0.035,
+                        ).with(TAWNY),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "forearm", // muscle at the top, a slim wrist
+                        fore[2],
+                        flat_cone(
+                            vec3(0.0, -0.010, 0.005),
+                            J_CARPUS - J_ELBOW,
+                            r1: 0.050,
+                            r2: 0.025,
+                            sx: 1.2,
+                        ).with(TAWNY),
+                        seam: smooth(0.03),
+                    )
+                    .join(
+                        "pastern",
+                        carpus,
+                        round_cone(
+                            vec3(),
+                            J_FPAW + vec3(0.0, 0.040, -0.008) - J_CARPUS,
+                            r_top: 0.026,
+                            r_bottom: 0.024,
+                        ).with(CREAM),
+                        seam: smooth(0.015),
+                    )
+                    .join("paw", fpaw, Paw { s: 1.25 }.with(DARK), seam: smooth(0.02))
+            },
+            seam: smooth(0.05),
+            mirror: true,
+        )
+        .group(
+            "hind leg",
+            |g| {
+                g.join(
+                    "thigh", // broad, flattened sideways; its front edge runs to the stifle
+                    hip,
+                    flat_cone(
+                        vec3(-0.005, -0.005, -0.030),
+                        J_STIFLE + vec3(-0.010, 0.010, -0.045) - J_HIP,
+                        r1: 0.112,
+                        r2: 0.062,
+                        sx: 1.7,
+                    ).with(GREY),
+                )
+                    .join(
+                        "hamstrings", // the point of the buttock down to the gaskin
+                        hip,
+                        flat_cone(
+                            vec3(0.060, 0.610, -0.540) - J_HIP,
+                            vec3(0.072, 0.330, -0.505) - J_HIP,
+                            r1: 0.065,
+                            r2: 0.045,
+                            sx: 1.4,
+                        ).with(GREY),
+                        seam: smooth(0.06),
+                    )
+                    .join(
+                        "gaskin", // deep front to back at the top, tapering to the hock
+                        stifle,
+                        flat_cone(
+                            vec3(-0.007, -0.010, -0.070),
+                            J_HOCK + vec3(0.0, 0.020, -0.005) - J_STIFLE,
+                            r1: 0.058,
+                            r2: 0.027,
+                            sx: 1.6,
+                        ).with(TAWNY),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "achilles",
+                        stifle,
+                        round_cone(
+                            vec3(0.078, 0.360, -0.515) - J_STIFLE,
+                            J_HOCK + vec3(0.0, 0.005, -0.024) - J_STIFLE,
+                            r_top: 0.030,
+                            r_bottom: 0.018,
+                        ).with(TAWNY),
+                        seam: smooth(0.04),
+                    )
+                    .join(
+                        "flank fold", // skin from the belly to the stifle
+                        hip,
+                        flat_cone(
+                            vec3(0.045, 0.580, -0.220) - J_HIP,
+                            J_STIFLE + vec3(-0.012, 0.020, -0.010) - J_HIP,
+                            r1: 0.045,
+                            r2: 0.040,
+                            sx: 1.5,
+                        ).with(CREAM),
+                        seam: smooth(0.05),
+                    )
+                    .join(
+                        "metatarsus",
+                        hock,
+                        round_cone(
+                            vec3(),
+                            J_HPAW + vec3(0.0, 0.040, -0.010) - J_HOCK,
+                            r_top: 0.024,
+                            r_bottom: 0.021,
+                        ).with(TAWNY),
+                        seam: smooth(0.02),
+                    )
+                    .join("paw", hpaw, Paw { s: 1.12 }.with(DARK), seam: smooth(0.02))
+                    .then(InnerThigh { x: 0.022, k: 0.02 }) // the legs never meet at the midline
+            },
+            seam: smooth(0.07),
+            mirror: true,
+        )
+        .group(
+            "tail",
+            |g| {
+                g.join(
+                    "tail base",
+                    s.find("tail 0"),
+                    round_cone(vec3(), J_TAIL1 - J_TAIL0, r_top: 0.040, r_bottom: 0.064).with(GREY),
+                )
+                    .join(
+                        "tail middle",
+                        s.find("tail 1"),
+                        round_cone(vec3(), J_TAIL2 - J_TAIL1, r_top: 0.064, r_bottom: 0.054)
+                            .with(GREY),
+                        seam: smooth(0.02),
+                    )
+                    .join(
+                        "tail tip",
+                        s.find("tail 2"),
+                        round_cone(vec3(), J_TAIL3 - J_TAIL2, r_top: 0.054, r_bottom: 0.014)
+                            .with(BLACK),
+                        seam: smooth(0.03),
+                    )
+                    .then(TailFur { amp: 0.009, freq: vec3(16.0, 7.0, 16.0), scale: 0.88 })
+            },
+            seam: smooth(0.04),
+        )
+        .then(Fur { head: h })
+}

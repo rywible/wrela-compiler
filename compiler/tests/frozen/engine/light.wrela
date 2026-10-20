@@ -1,0 +1,320 @@
+// How surfaces are lit: the sun, its sky and the air between the eye and what it sees (from
+// `air`), and the shading models that use them.
+//
+// Every pass that shades reads one `Light` (from `sunlight`) and the air's tables. The world's
+// surfaces take continuous light (`world`: `matte` plus `gloss`); characters take two bands and
+// a soft terminator (`character`). `hazed` adds the air between the eye and a surface, and
+// `tone` and `display` turn the light into the output's colour.
+
+use air::{Air, aerial_uvw, azimuth_cos, horizon_of, radius_of, sun_at, view_uv_at}
+use std::gpu::{Rgba16Float, Sampler, Texture, Texture3d}
+use std::math::PI
+
+/// The light a frame is lit by: toward the sun, the sun's light at the ground (a white surface
+/// facing it reflects this), the tone curve's exposure, and the eye's height (m) the air's
+/// tables were cooked from, and the planet's horizon from there (`air::horizon_of`, which the
+/// sky's table is read by). And for a test of the sky light, `sky_test`: 1, every surface's sky
+/// light set to `sky_sh`, spherical harmonics' first two bands (`probes::sky_light`), so the
+/// test learns how each pixel answers to it; 2, the probes' as usual. Either way, no gloss
+/// reflects it (`probes::sky_lights`): the test measures the light a surface scatters. And
+/// `clay`, a debug view of form (1): every surface the same matte grey (`CLAY`), lit as usual,
+/// with no gloss; so a still shows the light on the forms alone, not their colours.
+pub struct Light: Copy + GpuData + Eq {
+    pub sun: vec3,
+    pub exposure: f32,
+    pub sun_colour: vec3,
+    pub sky_test: u32 = 0,
+    pub sky_sh: vec4 = vec4(0.0),
+    pub eye: f32,
+    pub horizon: f32,
+    pub clay: u32 = 0,
+}
+
+/// The clay view's albedo (`Light`'s `clay`): a mid grey.
+pub const CLAY = vec3(0.5)
+
+/// `albedo`, or the clay view's grey (`Light`'s `clay`).
+pub fn clay_or(light: Light, albedo: vec3) -> vec3 {
+    if light.clay != 0 { CLAY } else { albedo }
+}
+
+/// Luminance's weights (linear Rec. 709).
+pub const LUMA = vec3(0.2126, 0.7152, 0.0722)
+
+/// The sun's light above the air: white, as bright as makes a late afternoon's sun through
+/// `air::hazy`'s air about (3.3, 2.75, 2.05) at the ground.
+pub const SUN_TOP = vec3(5.21)
+
+/// The light of `air`'s sun, at the eye's height.
+pub fn sunlight(air: Air) -> Light {
+    Light {
+        sun: air.sun,
+        exposure: 0.62,
+        sun_colour: sun_at(air, air.eye),
+        eye: air.eye,
+        horizon: horizon_of(radius_of(air.eye)),
+    }
+}
+
+/// The sky seen along `dir` (a unit vector) from the eye, from the air's sky table (`view`,
+/// through `s`, a linear sampler): no sun's disc.
+pub fn sky(view: Texture<Rgba16Float>, s: Sampler, light: Light, dir: vec3) -> vec3 {
+    view.sample_level(s, view_uv_at(light.horizon, dir.y, azimuth_cos(light.sun, dir))).rgb
+}
+
+/// The sun's disc along `dir`: its light through the air, spread over the disc.
+pub fn sun_disc(light: Light, dir: vec3) -> vec3 {
+    let c = dot(dir, light.sun)
+    light.sun_colour * (12.0 * smoothstep(0.99985, 0.99993, c))
+}
+
+/// `colour` at `world` seen from `eye` through the air: dimmed by it, and with the light it
+/// scatters toward the eye on the way, from the air's aerial perspective table (`air`, through
+/// `s`, a linear sampler).
+pub fn hazed(
+    air: Texture3d<Rgba16Float>,
+    s: Sampler,
+    light: Light,
+    colour: vec3,
+    world: vec3,
+    eye: vec3,
+) -> vec3 {
+    let v = world - eye
+    let d = max(length(v), 1.0e-3)
+    let a = air.sample_level(s, aerial_uvw(light.sun, v / d, d * 0.001))
+    colour * a.a + a.rgb
+}
+
+/// A surface to light: its albedo, its shading normal, how much sun reaches it (its shadow),
+/// its sky light (from the probes, occluded) and bounce, and the light that passes through it
+/// (leaves, grass: a colour per unit of sun; zero for what's solid). And its gloss: its
+/// roughness (perceptual: 0 a mirror, 1 matte), and the light round it toward its reflection
+/// of the eye's ray (from the probes too: `lit::sun_and_gloss`), which a matte surface reflects
+/// little of and a mirror all; and how much of the sun's glint it shows (`glint`: 1 for a
+/// glossy surface). By default, none: neither glint nor reflection.
+pub struct Lit: Copy {
+    pub albedo: vec3,
+    pub n: vec3,
+    pub sun: f32,
+    pub sky: vec3,
+    pub through: vec3,
+    pub rough: f32 = 1.0,
+    /// Conducting share: metals reflect their albedo as coloured specular light, not diffuse.
+    pub metallic: f32 = 0.0,
+    pub reflected: vec3 = vec3(0.0),
+    pub glint: f32 = 0.0,
+}
+
+/// The reflectance of what the world is made of (leaves, bark, stone, soil: dielectrics) seen
+/// head on: Fresnel's F0.
+const F0: f32 = 0.04
+
+/// How much sun comes through a thin surface seen from `v`: most when the eye looks toward the
+/// sun through it.
+fn backlit(v: vec3, l: vec3) -> f32 {
+    0.25 + 0.75 * pow(max(dot(-v, l), 0.0), 3.0)
+}
+
+/// How much of the light toward a surface's reflection reaches it past what hides its own
+/// light (`ao`, the share of its sky light it keeps): a fit from its roughness and
+/// how square on it's seen (`nv`).
+pub fn gloss_occlusion(ao: f32, nv: f32, rough: f32) -> f32 {
+    saturate(pow(nv + ao, exp2(-16.0 * rough - 1.0)) - 1.0 + ao)
+}
+
+/// The world's light (gouache's continuous light): a little wrap round the terminator, the sky
+/// and bounce from the probes, the light through thin things, and its gloss (`gloss`). Before
+/// the haze.
+pub fn world(light: Light, s: Lit, world: vec3, eye: vec3) -> vec3 {
+    matte(light, s, world, eye) + gloss(light, s, normalize(eye - world))
+}
+
+/// `world`'s light without its gloss: what a matte surface shows.
+pub fn matte(light: Light, s: Lit, world: vec3, eye: vec3) -> vec3 {
+    let l = light.sun
+    let v = normalize(eye - world)
+    let ndl = dot(s.n, l)
+    let wrap = max((ndl + 0.15) / 1.15, 0.0)
+    // In the clay view, what passes through a leaf passes as grey (the same amount of light).
+    let passes = if light.clay != 0 { vec3(dot(s.through, LUMA)) } else { s.through }
+    let through = passes * light.sun_colour * (s.sun * backlit(v, l))
+    let diffuse = if light.clay != 0 { 1.0 } else { 1.0 - saturate(s.metallic) }
+    clay_or(light, s.albedo) * (light.sun_colour * (wrap * s.sun) + s.sky) * diffuse + through
+}
+
+/// The light a surface reflects as a glossy one does, seen along `v` (toward the eye): the sun's
+/// glint through its shadow (GGX's distribution of facets, Smith's height-correlated
+/// visibility, Schlick's Fresnel), and the light round it toward its reflection, by the split
+/// sum's scale and bias for its roughness (an analytic fit, for F0 of 0.04).
+pub fn gloss(light: Light, s: Lit, v: vec3) -> vec3 {
+    // Clay is matte.
+    if light.clay != 0 {
+        return vec3(0.0)
+    }
+    let n = s.n
+    let l = light.sun
+    let nv = max(dot(n, v), 1.0e-4)
+    let f0 = mix(vec3(F0), saturate(s.albedo), vec3(saturate(s.metallic)))
+    let glint = light.sun_colour * (sun_reflection_rgb(n, l, v, s.rough, f0) * s.sun * s.glint)
+    let c = vec4(-1.0, -0.0275, -0.572, 0.022) * s.rough + vec4(1.0, 0.0425, 1.04, -0.04)
+    let bias = min(c.x * c.x, exp2(-9.28 * nv)) * c.x + c.y
+    let ab = vec2(-1.04, 1.04) * bias + c.zw
+    glint + s.reflected * (f0 * ab.x + vec3(ab.y))
+}
+
+/// The direct sun's GGX reflection per unit `sun_colour`, including light incidence,
+/// masking and Fresnel at the reflecting facet. `rough` is perceptual roughness; `f0` is
+/// normal-incidence reflectance (0.04 for ordinary dielectrics, 0.02 for water).
+pub fn sun_reflection(n: vec3, l: vec3, v: vec3, rough: f32, f0: f32) -> f32 {
+    sun_reflection_rgb(n, l, v, rough, vec3(f0)).x
+}
+
+/// GGX for coloured conductor reflectance as well as neutral dielectrics.
+fn sun_reflection_rgb(n: vec3, l: vec3, v: vec3, rough: f32, f0: vec3) -> vec3 {
+    let nv = max(dot(n, v), 1.0e-4)
+    let nl = max(dot(n, l), 0.0)
+    let half = l + v
+    // Opposite light and view have no reflecting facet. This also keeps a back-facing
+    // water sample finite when it meets the sun direction exactly.
+    if dot(half, half) <= 1.0e-12 {
+        return vec3(0.0)
+    }
+    let h = normalize(half)
+    let nh = max(dot(n, h), 0.0)
+    let a = max(rough * rough, 0.002)
+    let a2 = a * a
+    let dd = nh * nh * (a2 - 1.0) + 1.0
+    let facets = a2 / (PI * dd * dd)
+    let k = nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2)
+    let seen = 0.5 / max(k, 1.0e-5)
+    let fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - max(dot(v, h), 0.0), 5.0)
+    // `sun_colour` is what a white surface facing the sun reflects: π times a BRDF of 1/π.
+    PI * facets * seen * fresnel * nl
+}
+
+/// A character's light (cel): two bands and a soft terminator; the shadow side cool and lit by
+/// the sky; a rim on the side away from the sun. `open` is the open sky's light on a surface
+/// facing up (`probes::open_light`). Before the haze.
+pub fn character(light: Light, s: Lit, open: vec3, world: vec3, eye: vec3) -> vec3 {
+    let l = light.sun
+    let v = normalize(eye - world)
+    let t = smoothstep(-0.02, 0.1, dot(s.n, l)) * s.sun
+    let lit = light.sun_colour * 0.75 + open * 0.5
+    let dark = vec3(0.30, 0.38, 0.62) * (0.45 + 0.55 * saturate(dot(s.sky, vec3(0.6))))
+    let rim = smoothstep(0.55, 0.85, 1.0 - max(dot(s.n, v), 0.0)) * (0.35 + 0.65 * (1.0 - t))
+    s.albedo * mix(dark, lit, vec3(t)) + open * (rim * 0.35)
+}
+
+/// sRGB's encoding of a linear value in [0, 1].
+pub fn srgb(x: f32) -> f32 {
+    if x <= 0.0031308 { x * 12.92 } else { 1.055 * pow(max(x, 0.0), 1.0 / 2.4) - 0.055 }
+}
+
+/// The tone curve at the light's exposure (`tone`).
+pub fn display(light: Light, c: vec3) -> vec3 {
+    tone(c, light.exposure)
+}
+
+/// The tone curve: `exposure`, a filmic shoulder (`aces`), then sRGB.
+pub fn tone(c: vec3, exposure: f32) -> vec3 {
+    let t = aces(c * exposure)
+    vec3(srgb(t.x), srgb(t.y), srgb(t.z))
+}
+
+/// A filmic shoulder: a fit of the ACES curve, from linear light to [0, 1].
+pub fn aces(x: vec3) -> vec3 {
+    clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), vec3(0.0), vec3(1.0))
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// A view directly away from the sun has no half vector. Its glint is zero, not NaN.
+@test
+fn gloss_is_finite_when_the_view_and_sun_are_opposite() {
+    let light = Light {
+        sun: vec3(0.0, 1.0, 0.0),
+        exposure: 1.0,
+        sun_colour: vec3(1.0),
+        eye: 0.0,
+        horizon: 0.0,
+    }
+    let surface = Lit {
+        albedo: vec3(1.0),
+        n: vec3(0.0, -1.0, 0.0),
+        sun: 1.0,
+        sky: vec3(0.0),
+        through: vec3(0.0),
+        rough: 0.5,
+        reflected: vec3(0.0),
+        glint: 1.0,
+    }
+    let c = gloss(light, surface, vec3(0.0, -1.0, 0.0))
+    assert(c == vec3(0.0), "opposite light and view made a glint or a NaN")
+}
+
+@test
+fn direct_sun_reflection_preserves_dielectric_normal_incidence() {
+    let up = vec3(0.0, 1.0, 0.0)
+    // At normal incidence the existing GGX response is F0 / (4 * roughness^4).
+    let dielectric = sun_reflection(up, up, up, rough: 0.5, f0: 0.04)
+    assert(abs(dielectric - 0.16) < 1.0e-6, "shared glint changed ordinary dielectric gloss")
+    let light = Light {
+        sun: up,
+        exposure: 1.0,
+        sun_colour: vec3(1.0, 0.8, 0.5),
+        eye: 0.0,
+        horizon: 0.0,
+    }
+    let surface = Lit {
+        albedo: vec3(1.0),
+        n: up,
+        sun: 0.75,
+        sky: vec3(0.0),
+        through: vec3(0.0),
+        rough: 0.5,
+        reflected: vec3(0.0),
+        glint: 0.8,
+    }
+    assert(
+        length(gloss(light, surface, up) - vec3(0.096, 0.0768, 0.048)) < 1.0e-6,
+        "ordinary gloss changed its sun colour, shadow, or glint weight",
+    )
+    let water = sun_reflection(up, up, up, rough: 0.5, f0: 0.02)
+    assert(abs(water - 0.08) < 1.0e-6, "water uses the wrong normal-incidence reflectance")
+    assert(
+        sun_reflection(up, -up, up, rough: 0.5, f0: 0.02) == 0.0,
+        "sun below the surface contributes a glint",
+    )
+}
+
+@test
+fn metallic_light_is_coloured_reflection_without_diffuse() {
+    let n = vec3(0.0, 0.0, 1.0)
+    let light = Light { sun: n, sun_colour: vec3(1.0), exposure: 1.0, eye: 0.0, horizon: 0.0 }
+    let s = Lit {
+        albedo: vec3(0.7, 0.3, 0.08),
+        n,
+        sun: 1.0,
+        sky: vec3(0.5),
+        through: vec3(0.0),
+        rough: 0.4,
+        metallic: 1.0,
+        glint: 1.0,
+    }
+    assert(matte(light, s, vec3(0.0), n) == vec3(0.0), "metal retained painted diffuse light")
+    let peak = gloss(light, s, n)
+    assert(peak.r > peak.g * 2.0 && peak.g > peak.b * 3.0, "metal lost coloured reflectance")
+    let off = gloss(light, s, normalize(vec3(0.8, 0.0, 1.0)))
+    assert(peak.r > off.r * 5.0, "metal highlight does not follow viewing angle")
+    let broad = Lit { rough: 0.75, ..s }
+    assert(gloss(light, broad, n).r < peak.r, "rough metal kept a polished peak")
+    assert(
+        gloss(light, broad, normalize(vec3(0.8, 0.0, 1.0))).r > off.r,
+        "rough metal did not spread its highlight",
+    )
+    let env = Lit { sun: 0.0, reflected: vec3(0.8, 0.4, 0.2), ..s }
+    assert(gloss(light, env, n).r > 0.2, "metal lost environment light away from the sun")
+    let clay = Light { clay: 1, ..light }
+    assert(gloss(clay, s, n) == vec3(0.0), "clay view retained metallic reflections")
+    assert(length(matte(clay, s, vec3(0.0), n)) > 0.1, "metal became black in clay view")
+}

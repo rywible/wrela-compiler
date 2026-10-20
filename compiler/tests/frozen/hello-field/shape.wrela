@@ -1,0 +1,14 @@
+// The field: a small creature-like blob. Its structure (which primitives, which combinators)
+// is its type; its numbers are data (D-070), so they reach the GPU as a uniform.
+use std::field::{Surface, ellipsoid, fbm, round_cone, sphere}
+
+/// A body, a neck and a head, smoothly joined, with a slow breathing swell and a little bark.
+pub fn creature(breath: f32) -> Surface {
+    let body = ellipsoid(vec3(0.62, 0.42 + 0.03 * breath, 0.42))
+    let neck = round_cone(vec3(0.35, 0.15, 0.0), vec3(0.75, 0.62, 0.0), r_top: 0.16, r_bottom: 0.1)
+    let head = sphere(radius: 0.2).translate(vec3(0.82, 0.72, 0.0))
+    body
+        .smooth_union(neck, k: 0.12)
+        .smooth_union(head, k: 0.08)
+        .displace(fbm(freq: 6.0, octaves: 3, offset: vec3(3.0, 1.0, 7.0)), amp: 0.015)
+}

@@ -1,0 +1,286 @@
+// Glyphs for the character groups that the baked fonts don't have, made from the host's drawing
+// (`font/glyph`): the system's fonts draw the group at a few times the fields' size. Ink without
+// colour of its own becomes a signed distance field like the baked ones (ttf.wrela), from the
+// drawing's exact Euclidean distance transform, so it's sharp at any size; an emoji's colour
+// stays a small image.
+//
+// The distance transform gives the squared distance to the nearest feature, one line at a time
+// as the lower envelope of parabolas, columns then rows.
+
+use std::host::GlyphImage
+
+/// A glyph made from a host's drawing (`GlyphImage`): its advance (ems), where its texels sit from
+/// the pen (left, and top above the baseline, in pixels at the font's em), their size, whether
+/// they're a colour image, and the texels, RGBA rows from the top (a field in red).
+pub struct Made: Clone {
+    pub advance: f32,
+    pub left: f32,
+    pub top: f32,
+    pub width: u32,
+    pub height: u32,
+    pub color: bool,
+    pub texels: Vec<u8>,
+}
+
+/// Bigger than any squared distance in a grid `w` × `h`: the transform's "no feature".
+fn far(w: u32, h: u32) -> f32 {
+    let n = f32(w + h + 2)
+    4.0 * n * n
+}
+
+/// Where the transform's envelope starts and ends: past any line's sample.
+const EDGE: f32 = 1.0e30
+
+/// One line of the transform: `d[q]` becomes the least `(q − p)² + f[p]` over the line's `n`
+/// samples, `f` read at `at + p * stride` (and `d` written there).
+fn line(f: [f32], d: mut [f32], at: u32, stride: u32, n: u32, v: mut [u32], z: mut [f32]) {
+    // The lower envelope of the parabolas rooted at each sample: `v` their roots, `z` where each
+    // takes over from the one before.
+    var k = 0
+    v[0] = 0
+    z[0] = -EDGE
+    z[1] = EDGE
+    for q in 1..n {
+        let fq = f[at + q * stride] + f32(q * q)
+        var p = v[k]
+        var s = (fq - (f[at + p * stride] + f32(p * p))) / (2.0 * f32(q) - 2.0 * f32(p))
+        while s <= z[k] {
+            k -= 1
+            p = v[k]
+            s = (fq - (f[at + p * stride] + f32(p * p))) / (2.0 * f32(q) - 2.0 * f32(p))
+        }
+        k += 1
+        v[k] = q
+        z[k] = s
+        z[k + 1] = EDGE
+    }
+    k = 0
+    for q in 0..n {
+        while z[k + 1] < f32(q) {
+            k += 1
+        }
+        let p = v[k]
+        let dq = f32(q) - f32(p)
+        d[at + q * stride] = dq * dq + f[at + p * stride]
+    }
+}
+
+/// The squared distance from each cell of a grid `w` × `h` (rows from the top) to the nearest
+/// cell where `feature` is true: 0 at a feature.
+pub fn squared_distances(feature: [bool], w: u32, h: u32) -> Vec<f32> {
+    let big = far(w, h)
+    var f: Vec<f32> = Vec::with_capacity(w * h)
+    for i in 0..w * h {
+        f.push(if feature[i] { 0.0 } else { big })
+    }
+    var d: Vec<f32> = Vec::filled(w * h, 0.0)
+    let n = max(w, h)
+    var v: Vec<u32> = Vec::filled(n, 0)
+    var z: Vec<f32> = Vec::filled(n + 1, 0.0)
+    for x in 0..w {
+        line(f, mut d, at: x, stride: w, n: h, v: mut v, z: mut z)
+    }
+    for y in 0..h {
+        line(d, mut f, at: y * w, stride: 1, n: w, v: mut v, z: mut z)
+    }
+    f
+}
+
+/// The distance from cell `i`'s centre to the edge of the ink, in drawn pixels: positive outside.
+fn signed(ink: [bool], inside: [f32], outside: [f32], i: u32) -> f32 {
+    if ink[i] { 0.5 - sqrt(inside[i]) } else { sqrt(outside[i]) - 0.5 }
+}
+
+/// A field glyph from `r`'s ink (its alpha), at `em` pixels an em, whose bytes stand for `spread`
+/// pixels each side of the edge, padded as the baker pads (`ceil(spread) + 1` texels).
+pub fn field(r: GlyphImage, em: f32, spread: f32) -> Made {
+    let k = em / r.px
+    let pad = ceil(spread) + 1.0
+    // The drawing, with room round it for the field's padding, as ink or not.
+    let room = u32(ceil(pad / k)) + 1
+    let w = r.width + 2 * room
+    let h = r.height + 2 * room
+    var ink: Vec<bool> = Vec::filled(w * h, value: false)
+    var paper: Vec<bool> = Vec::filled(w * h, value: true)
+    for y in 0..r.height {
+        for x in 0..r.width {
+            if r.pixels[(y * r.width + x) * 4 + 3] >= 128 {
+                let i = (y + room) * w + x + room
+                ink[i] = true
+                paper[i] = false
+            }
+        }
+    }
+    let outside = squared_distances(ink, w, h)
+    let inside = squared_distances(paper, w, h)
+    let fw = u32(ceil(f32(r.width) * k + 2.0 * pad))
+    let fh = u32(ceil(f32(r.height) * k + 2.0 * pad))
+    var texels: Vec<u8> = Vec::filled(fw * fh * 4, 0)
+    for fy in 0..fh {
+        for fx in 0..fw {
+            // The texel's centre in the padded drawing's cells, read between its four nearest.
+            let cx = clamp((f32(fx) + 0.5 - pad) / k + f32(room) - 0.5, 0.0, f32(w - 1))
+            let cy = clamp((f32(fy) + 0.5 - pad) / k + f32(room) - 0.5, 0.0, f32(h - 1))
+            let x0 = u32(floor(cx))
+            let y0 = u32(floor(cy))
+            let x1 = min(x0 + 1, w - 1)
+            let y1 = min(y0 + 1, h - 1)
+            let tx = cx - f32(x0)
+            let ty = cy - f32(y0)
+            let top = mix(
+                signed(ink, inside, outside, y0 * w + x0),
+                signed(ink, inside, outside, y0 * w + x1),
+                tx,
+            )
+            let bottom = mix(
+                signed(ink, inside, outside, y1 * w + x0),
+                signed(ink, inside, outside, y1 * w + x1),
+                tx,
+            )
+            let d = mix(top, bottom, ty) * k
+            let v = clamp(0.5 - d / (2.0 * spread), 0.0, 1.0)
+            let at = (fy * fw + fx) * 4
+            texels[at] = u8(u32(round(v * 255.0)))
+            texels[at + 3] = 255
+        }
+    }
+    Made {
+        advance: r.advance / r.px,
+        left: r.left * k - pad,
+        top: r.top * k + pad,
+        width: fw,
+        height: fh,
+        color: false,
+        texels,
+    }
+}
+
+/// A colour image glyph from `r`, at `em` pixels an em: each texel the average of the drawn
+/// pixels under it, weighted by their alpha, so its edges don't darken.
+pub fn image(r: GlyphImage, em: f32) -> Made {
+    let k = em / r.px
+    let cw = max(u32(ceil(f32(r.width) * k)), 1)
+    let ch = max(u32(ceil(f32(r.height) * k)), 1)
+    var texels: Vec<u8> = Vec::filled(cw * ch * 4, 0)
+    for cy in 0..ch {
+        for cx in 0..cw {
+            let x0 = u32(floor(f32(cx) / k))
+            let y0 = u32(floor(f32(cy) / k))
+            let x1 = min(u32(ceil(f32(cx + 1) / k)), r.width)
+            let y1 = min(u32(ceil(f32(cy + 1) / k)), r.height)
+            var sum = vec4(0.0)
+            var count = 0.0
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let at = (y * r.width + x) * 4
+                    let a = f32(r.pixels[at + 3]) / 255.0
+                    sum += vec4(
+                        f32(r.pixels[at]) * a,
+                        f32(r.pixels[at + 1]) * a,
+                        f32(r.pixels[at + 2]) * a,
+                        a,
+                    )
+                    count += 1.0
+                }
+            }
+            let at = (cy * cw + cx) * 4
+            if sum.w > 0.0 {
+                texels[at] = u8(u32(round(sum.x / sum.w)))
+                texels[at + 1] = u8(u32(round(sum.y / sum.w)))
+                texels[at + 2] = u8(u32(round(sum.z / sum.w)))
+                texels[at + 3] = u8(u32(round(255.0 * sum.w / max(count, 1.0))))
+            }
+        }
+    }
+    Made {
+        advance: r.advance / r.px,
+        left: r.left * k,
+        top: r.top * k,
+        width: cw,
+        height: ch,
+        color: true,
+        texels,
+    }
+}
+
+// ---- tests ------------------------------------------------------------------------------------
+
+/// A raster `w` × `h` whose ink is the rectangle from `lo` to `hi` (exclusive), black or a colour.
+fn drawn(w: u32, h: u32, lo: vec2u, hi: vec2u, rgb: vec3u) -> GlyphImage {
+    var pixels: Vec<u8> = Vec::filled(w * h * 4, 0)
+    for y in lo.y..hi.y {
+        for x in lo.x..hi.x {
+            let at = (y * w + x) * 4
+            pixels[at] = u8(rgb.x)
+            pixels[at + 1] = u8(rgb.y)
+            pixels[at + 2] = u8(rgb.z)
+            pixels[at + 3] = 255
+        }
+    }
+    GlyphImage {
+        px: 128.0,
+        advance: 64.0,
+        left: 2.0,
+        top: 40.0,
+        width: w,
+        height: h,
+        colored: rgb != vec3u(0),
+        pixels,
+    }
+}
+
+@test
+fn the_distance_transform_is_exact() {
+    // One feature in the middle of a 7 × 5 grid: every cell's squared distance to it.
+    var feature: Vec<bool> = Vec::filled(35, value: false)
+    feature[2 * 7 + 3] = true
+    let d = squared_distances(feature, w: 7, h: 5)
+    for y in 0..5 {
+        for x in 0..7 {
+            let dx = f32(x) - 3.0
+            let dy = f32(y) - 2.0
+            assert(d[y * 7 + x] == dx * dx + dy * dy, f"({x}, {y}): {d[y * 7 + x]}")
+        }
+    }
+    // Two features: the nearer one counts.
+    feature[0] = true
+    let two = squared_distances(feature, w: 7, h: 5)
+    assert(two[1 * 7 + 0] == 1.0 && two[2 * 7 + 6] == 9.0)
+}
+
+fn texel(m: Made, x: u32, y: u32) -> u32 {
+    u32(m.texels[(y * m.width + x) * 4])
+}
+
+@test
+fn a_drawn_square_becomes_a_field_whose_edge_is_its_edge() {
+    // A 64-pixel square drawn at 128 pixels an em: a quarter em, 8 field texels at 32.
+    let r = drawn(w: 80, h: 80, lo: vec2u(8), hi: vec2u(72), rgb: vec3u(0))
+    let m = field(r, em: 32.0, spread: 4.0)
+    assert(!m.color && m.advance == 0.5)
+    // 80 drawn pixels are 20 texels, padded by 5 each side.
+    assert(m.width == 30 && m.height == 30, f"{m.width} by {m.height}")
+    assert(m.left == 0.5 - 5.0 && m.top == 10.0 + 5.0)
+    // The square spans texels 7 to 23 (2 to 18 drawn, plus the padding): inside is above 128,
+    // outside below, and the field falls away from the edge.
+    assert(texel(m, x: 15, y: 15) == 255, f"centre {texel(m, x: 15, y: 15)}")
+    assert(texel(m, x: 1, y: 15) == 0, f"far outside {texel(m, x: 1, y: 15)}")
+    assert(
+        texel(m, x: 7, y: 15) > 128 && texel(m, x: 6, y: 15) < 128,
+        f"{texel(m, x: 6, y: 15)} | {texel(m, x: 7, y: 15)}",
+    )
+    assert(
+        texel(m, x: 4, y: 15) < texel(m, x: 5, y: 15) &&
+            texel(m, x: 5, y: 15) < texel(m, x: 6, y: 15),
+    )
+}
+
+@test
+fn an_emoji_stays_a_colour_image() {
+    let r = drawn(w: 8, h: 8, lo: vec2u(0), hi: vec2u(4, 8), rgb: vec3u(255, 128, 0))
+    let m = image(r, 32.0)
+    assert(m.color && m.width == 2 && m.height == 2)
+    // The left texel is all ink, the right none: no darkened mix at the edge.
+    assert(m.texels[0] == 255 && m.texels[1] == 128 && m.texels[3] == 255)
+    assert(m.texels[7] == 0)
+}
