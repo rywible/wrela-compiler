@@ -46,7 +46,9 @@
 //! table's lock, so a stuck worker can't hold up the release. A worker, a driven build or a
 //! server's thread still running after the grace makes the end the host's
 //! failure (status 71), whatever the tool's own end was, and `wrela tool` then ends the process,
-//! so no worker outlives it. The host keeps no compiled code: it compiles the tool's WASM, and a
+//! so no worker outlives it. Work found stuck while the tool runs gives the tool one grace to
+//! read the request that failed and end on its own ([`services::Stuck`]), so what it says comes
+//! before the host's message. The host keeps no compiled code: it compiles the tool's WASM, and a
 //! driven build's, for each run, so nothing it loads comes from a directory a tool could write.
 
 mod blobs;
@@ -557,7 +559,7 @@ impl Ticker {
 struct Reasons {
     interrupt: Option<Arc<AtomicBool>>,
     deadline: Option<Instant>,
-    stuck: Arc<std::sync::OnceLock<String>>,
+    stuck: Arc<services::Stuck>,
 }
 
 impl Reasons {
@@ -572,9 +574,9 @@ impl Reasons {
 fn stop_reason(
     interrupt: &Option<Arc<AtomicBool>>,
     deadline: Option<Instant>,
-    stuck: &std::sync::OnceLock<String>,
+    stuck: &services::Stuck,
 ) -> Option<End> {
-    if let Some(why) = stuck.get() {
+    if let Some(why) = stuck.due() {
         return Some(End::Host(why.clone()));
     }
     if interrupt.as_ref().is_some_and(|i| i.load(Ordering::Acquire)) {
@@ -607,6 +609,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         Err(e) => return failed(format!("the tool engine: {e:#}")),
     };
     let start = start_bytes(&options.args, options.caps.secrets());
+    let budget = options.timeout;
     let Options {
         caps,
         blob_budget,
@@ -636,7 +639,8 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         spawn_pause: testing.spawn_pause,
         resolve_stall: testing.resolve_stall,
         grace: testing.grace,
-        stuck: Arc::new(std::sync::OnceLock::new()),
+        stuck: Arc::new(services::Stuck::new(testing.grace)),
+        budget,
         toolchain: toolchain.map(|toolchain| toolchain::Service { toolchain, cache }),
         hold: testing.hold.clone(),
         write_fail: testing.write_fail.clone(),

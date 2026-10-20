@@ -53,7 +53,7 @@ pub mod build_memory {
 }
 pub use program::{
     BuildHelpers, Failure, HelperRun, HostHandler, PostHandler, QueuedPost, Stop, Ticked, Value,
-    metered_engine, refuse_host_functions,
+    metered_engine, refuse_host_functions, stoppable_metered_engine,
 };
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};

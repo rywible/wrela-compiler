@@ -10,8 +10,9 @@
 // The compiler reads only through the tool's roots: the package, its dependencies (one outside
 // the roots is an error), its workspace's manifest and members, and the files it embeds. Its
 // constants' cache is the host's, never beside a package. Each request has a deadline, 300 s
-// unless it asks for another (at most 600 s), from when the host takes it; past it, or when the
-// tool ends, the host stops the work, and kills `wasm-opt`'s process group if it runs.
+// unless it asks for another (at most 600 s, or the run's `--timeout` if that is longer), from
+// when the host takes it; past it, or when the tool ends, the host stops the work (a constant
+// being computed within about 10 ms), and kills `wasm-opt`'s process group if it runs.
 //
 // A program's errors aren't the request's: a build or a check with errors answers with them
 // (`ok` false). A request fails for what the host can't do: a path outside the roots, a

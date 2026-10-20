@@ -59,11 +59,20 @@ pub(crate) struct Fetch {
 
 /// A request's deadline: `seconds`, or `default` for 0.
 pub(crate) fn deadline(seconds: f64, default: Duration) -> Result<Duration, String> {
+    deadline_within(seconds, default, LONGEST)
+}
+
+/// [`deadline`], with `longest` seconds as the most a request may ask for.
+pub(crate) fn deadline_within(
+    seconds: f64,
+    default: Duration,
+    longest: f64,
+) -> Result<Duration, String> {
     if seconds == 0.0 {
         return Ok(default);
     }
-    if !(seconds > 0.0 && seconds <= LONGEST) {
-        return Err(format!("a deadline is more than 0 seconds and at most {LONGEST}"));
+    if !(seconds > 0.0 && seconds <= longest) {
+        return Err(format!("a deadline is more than 0 seconds and at most {longest}"));
     }
     Ok(Duration::from_secs_f64(seconds))
 }

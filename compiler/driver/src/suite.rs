@@ -163,10 +163,10 @@ pub fn ignored_by(
         }
         at = if at.is_empty() { part.to_string() } else { format!("{at}/{part}") };
         // The last rule that matches decides, as in git.
-        if let Some(r) = rules.iter().rev().find(|r| r.matches(&at, true)) {
-            if !r.negated {
-                return Some((file_in(&r.base), r.line));
-            }
+        if let Some(r) = rules.iter().rev().find(|r| r.matches(&at, true))
+            && !r.negated
+        {
+            return Some((file_in(&r.base), r.line));
         }
     }
     None

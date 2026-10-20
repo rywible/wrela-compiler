@@ -16,10 +16,12 @@
 //! **Every request can be stopped.** The compiler's work runs on a thread of its own; the worker
 //! that waits for it looks for the request's deadline (from when the host took it) and the
 //! tool's end every few milliseconds. Then it cancels the work, which the compiler sees between
-//! its phases, and a program the work runs (`wasm-opt`) has its process group killed at once
-//! ([`Job::run`]). If the work hasn't stopped within the grace after that, the run is the
-//! host's failure (status 71), as an HTTP client that won't return is. Files a failed build
-//! wrote are removed.
+//! its phases and, in a constant it computes, within about 10 ms; a program the work runs
+//! (`wasm-opt`) has its process group killed at once ([`Job::run`]). If the work hasn't stopped
+//! within the grace after that, the run is the host's failure (status 71), as an HTTP client
+//! that won't return is, once the tool has had its grace to say why its request failed. Files a
+//! failed build wrote are removed. A request may ask for a deadline as long as the run's own
+//! budget.
 
 use super::caps::MOST_BYTES;
 use super::services::{Answer, Body, Services, Task, Work};
@@ -30,6 +32,23 @@ use std::time::{Duration, Instant};
 
 /// A request's deadline unless it asks for another: builds of large packages take minutes.
 const DEADLINE: Duration = Duration::from_secs(300);
+
+/// The longest deadline a request may ask for: 600 s, or the run's whole budget if that is
+/// longer, so a tool with an hour can give one build most of it.
+fn longest(s: &Services) -> f64 {
+    s.budget.map_or(super::http::LONGEST, |b| b.as_secs_f64().max(super::http::LONGEST))
+}
+
+/// The deadline a request asks for, in seconds, as the host takes it: in a run with a budget,
+/// one longer than [`longest`] is cut to it, since the run ends by then anyway (so a tool that
+/// fits its builds to its declared budget still runs with `--timeout` narrowed). Without one,
+/// as asked, and past 600 s an error.
+fn asked(s: &Services, seconds: f64) -> f64 {
+    match s.budget {
+        Some(_) if seconds > longest(s) => longest(s),
+        _ => seconds,
+    }
+}
 
 /// How often the worker looks at the work it waits for.
 const POLL: Duration = Duration::from_millis(10);
@@ -412,7 +431,8 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
         Ok(op)
     })();
     let deadline = parsed.and_then(|op| {
-        let deadline = super::http::deadline(f64::from_bits(b.u64()?), DEADLINE)?;
+        let deadline =
+            super::http::deadline_within(asked(s, f64::from_bits(b.u64()?)), DEADLINE, longest(s))?;
         b.end()?;
         Ok((op, deadline))
     });
@@ -1048,4 +1068,30 @@ fn override_dirs(
         dirs.push((name, caps.dir_path(&path, false)?));
     }
     Ok(dirs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request may ask for as long as the run's whole budget, so a tool that grants itself an
+    /// hour can give one build most of it: never less than 600 s, as without a budget.
+    #[test]
+    fn a_requests_deadline_may_be_as_long_as_the_runs_budget() {
+        let mut s = super::super::services::for_test(super::super::BlobBudget::default());
+        assert_eq!(longest(&s), 600.0);
+        s.budget = Some(Duration::from_secs(5400));
+        assert_eq!(longest(&s), 5400.0);
+        let given = super::super::http::deadline_within(5000.0, DEADLINE, longest(&s));
+        assert_eq!(given, Ok(Duration::from_secs(5000)));
+        assert!(super::super::http::deadline_within(6000.0, DEADLINE, longest(&s)).is_err());
+        // Past the budget, cut to it; without one, an error.
+        assert_eq!(asked(&s, 6000.0), 5400.0);
+        s.budget = Some(Duration::from_secs(30));
+        assert_eq!(longest(&s), 600.0);
+        assert_eq!(asked(&s, 5100.0), 600.0);
+        s.budget = None;
+        assert_eq!(asked(&s, 5100.0), 5100.0);
+        assert!(super::super::http::deadline_within(5100.0, DEADLINE, longest(&s)).is_err());
+    }
 }

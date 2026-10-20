@@ -90,14 +90,25 @@ pub struct ConstStats {
 /// Computes the program's computed constants into `data` (whose files `embed` reads are
 /// already there): the errors computing them. A constant whose inputs are unchanged since a build
 /// computed it is read from the `cache` directories ([`crate::const_cache`]).
+///
+/// Once `cancel` is set, no other constant starts, and the one that runs (on any of its
+/// threads) stops within about 10 ms ([`wrela_host::Stop`]): the caller sees the flag and says
+/// the compile was cancelled. So a tool host's cancelled build stops within its grace, also in
+/// a constant that computes for minutes.
 pub fn compute(
     checked: &Checked,
     sources: &SourceMap,
     data: &mut BuildData,
     cache: &[std::path::PathBuf],
+    cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
 ) -> (Vec<Diagnostic>, ConstStats) {
     let mut diags = Vec::new();
     let mut stats = ConstStats::default();
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Acquire));
+    let stop = match cancel.map(|c| wrela_host::Stop::when_set(c.clone())).transpose() {
+        Ok(s) => s,
+        Err(e) => return (vec![Diagnostic::internal(format!("{e}"))], stats),
+    };
     let mut pending: Vec<(ConstId, BTreeSet<ConstId>)> = (0..checked.program.consts.len())
         .map(|i| ConstId(i as u32))
         .filter(|&c| wrela_lower::is_computed(checked, c))
@@ -105,7 +116,7 @@ pub fn compute(
         .collect();
     let mut failed = BTreeSet::new();
     let simd = !data.no_simd;
-    while !pending.is_empty() {
+    while !pending.is_empty() && !cancelled() {
         // Each constant in a module of its own, which holds only what it reads: its key. Those
         // that need a constant still to compute wait for the next round.
         let mut ready = Vec::new();
@@ -145,6 +156,9 @@ pub fn compute(
             break;
         }
         for (c, module, _) in ready {
+            if cancelled() {
+                break;
+            }
             let fuel = checked.program.const_(c).fuel.unwrap_or(FUEL);
             // The key is the module's WASM, so the cache is read before wasmtime compiles it:
             // a constant read from the cache isn't compiled at all.
@@ -162,10 +176,19 @@ pub fn compute(
                             let export = &module.exports[0].1;
                             let name = checked.program.const_(c).name.clone();
                             let trace = wrela_host::Trace::new(Some(format!("{name}: ")));
-                            let r = Compiled::of(engine(), out)
+                            let r = Compiled::of(engine(stop.is_some()), out)
                                 .map_err(|msg| Box::new(Diagnostic::internal(msg)))
                                 .and_then(|compiled| {
-                                    run_one(checked, sources, &compiled, export, c, fuel, &trace)
+                                    let at = (c, fuel);
+                                    run_one(
+                                        checked,
+                                        sources,
+                                        &compiled,
+                                        export,
+                                        at,
+                                        &trace,
+                                        stop.as_ref(),
+                                    )
                                 })
                                 .map(|(v, helped)| {
                                     stats.helped += u64::from(helped);
@@ -187,6 +210,10 @@ pub fn compute(
                     }
                 }
             };
+            // A constant stopped by the cancel failed for no fault of its own: nothing is said.
+            if cancelled() {
+                break;
+            }
             match result {
                 Ok(v) => {
                     data.values.insert(c, Rc::new(v));
@@ -207,9 +234,9 @@ pub fn compute(
 
 /// The engine for the code builds run (constants and tests): the native host's that counts
 /// fuel, one for the process, as wasmtime intends (an engine is costly to make, and cheap to
-/// share).
-fn engine() -> &'static wasmtime::Engine {
-    wrela_host::metered_engine()
+/// share); with `stoppable`, the one whose calls a [`wrela_host::Stop`] ends too.
+fn engine(stoppable: bool) -> &'static wasmtime::Engine {
+    if stoppable { wrela_host::stoppable_metered_engine() } else { wrela_host::metered_engine() }
 }
 
 /// E0328 for constants that read each other, through the functions that compute them: one
@@ -313,9 +340,13 @@ impl Compiled {
         engine: &wasmtime::Engine,
         shared: bool,
         trace: &wrela_host::Trace,
+        stop: Option<&wrela_host::Stop>,
     ) -> Result<Running, String> {
         let mut linker = wasmtime::Linker::new(engine);
         let mut store = wasmtime::Store::new(engine, ());
+        if let Some(stop) = stop {
+            stop.install(&mut store);
+        }
         store.set_fuel(FUEL).map_err(|e| format!("{e:#}"))?;
         let mut shared_memory = None;
         if shared {
@@ -408,17 +439,24 @@ fn run_one(
     sources: &SourceMap,
     compiled: &Compiled,
     export: &str,
-    c: ConstId,
-    fuel: u64,
+    (c, fuel): (ConstId, u64),
     trace: &wrela_host::Trace,
+    stop: Option<&wrela_host::Stop>,
 ) -> Result<(wrela_lower::Value, u32), Box<Diagnostic>> {
-    let mut running =
-        compiled.start(engine(), true, trace).map_err(|m| Box::new(Diagnostic::internal(m)))?;
+    let mut running = compiled
+        .start(engine(stop.is_some()), true, trace, stop)
+        .map_err(|m| Box::new(Diagnostic::internal(m)))?;
     let Mem::Shared(shared) = &running.memory else {
         return Err(Box::new(Diagnostic::internal("a constant's code runs on shared memory")));
     };
-    let helpers =
-        wrela_host::BuildHelpers::start(&compiled.module, shared, const_threads() - 1, fuel, trace);
+    let helpers = wrela_host::BuildHelpers::start(
+        &compiled.module,
+        shared,
+        const_threads() - 1,
+        fuel,
+        trace,
+        stop,
+    );
     let result = running.call(export, fuel);
     let main_used = running.used(fuel);
     let ran = helpers.finish();
@@ -500,7 +538,7 @@ pub fn run_tests(
         return (Vec::new(), diags);
     };
     // Its own memory, unshared: each test runs on one thread.
-    let compiled = match compile(engine(), &module.module, !data.no_simd, false) {
+    let compiled = match compile(engine(false), &module.module, !data.no_simd, false) {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
     };
@@ -514,7 +552,8 @@ pub fn run_tests(
         .collect();
     let ran = each_at_once(&exports, |(export, test, fuel)| {
         let trace = wrela_host::Trace::new(Some(format!("{test}: ")));
-        let ran = compiled.start(engine(), false, &trace).map(|mut r| r.call(export, *fuel));
+        let ran =
+            compiled.start(engine(false), false, &trace, None).map(|mut r| r.call(export, *fuel));
         (ran, trace.take())
     });
     let results = module

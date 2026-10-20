@@ -462,6 +462,47 @@ fn a_deadline_or_the_tools_end_kills_wasm_opt_and_ends_in_bounded_time() {
     assert!(!alive(pid.trim()), "the tool's end kills wasm-opt's group");
 }
 
+/// A build cancelled while a constant computes (one that would run for hours) stops within
+/// about 10 ms, on every thread of the constant: the request fails at its deadline and the tool
+/// says so, rather than the run ending as the host's failure (71) with work left running.
+#[test]
+fn a_build_cancelled_inside_a_long_constant_stops_within_the_grace() {
+    const LONG: &str = r#"
+use std::io::print
+
+fn spin(n: u64) -> u64 {
+    var s: u64 = 0
+    var i: u64 = 0
+    while i < n {
+        s = s ^ (i + (s >> 3))
+        i += 1
+    }
+    s
+}
+
+@fuel(2 ** 46)
+const LONG: u64 = spin(1 << 44)
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    print(f"{LONG}")
+}
+"#;
+    let subject =
+        [("subject/wrela.toml", manifest("subject")), ("subject/main.wrela", LONG.into())];
+    let subject: Vec<(&str, &str)> = subject.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let (tool, src, out) = packages("toolchain-long-constant", &subject);
+    let started = Instant::now();
+    let (code, printed) =
+        run(&mut probe(&tool, &src, &out, &["build-timed", "src/subject", "out/b"]));
+    assert_eq!(code, Some(1), "{printed}");
+    assert!(
+        printed.contains("error: ") && printed.contains("past its deadline of 2 s"),
+        "{printed}"
+    );
+    assert!(!printed.contains("still running"), "{printed}");
+    assert!(started.elapsed() < Duration::from_secs(30), "{:?}", started.elapsed());
+}
+
 /// A root granted as the package itself (`--read pkg=DIR`): its directory is outside it, and
 /// it's still a package to build, check and test, and a directory to format.
 #[test]

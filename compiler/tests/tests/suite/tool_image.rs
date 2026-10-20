@@ -19,7 +19,8 @@ use wrela_host::tool::{BlobBudget, Caps, End, Grants, Testing};
 ///   (`out/cover.webp`) decoded back (`out/cover-back.rgba`), and the frame as a PNG decoded
 ///   back (`out/frame-back.rgba`);
 /// - `huge`: `in/huge.png`, read as bytes, decoded: it prints why it can't be;
-/// - `stall`: starts a resize, and waits until it's interrupted.
+/// - `stall`: starts a resize, and waits until it's interrupted;
+/// - `stall-timed`: a resize with a deadline of 0.5 s: it prints why it failed, and exits 3.
 const IMAGE_TOOL: &str = r#"
 use std::io::{IoError, print}
 use std::job::{Job, Step}
@@ -98,6 +99,21 @@ fn main(given: take Vec<String>) -> u32 {
             print(f"{name}: {decoded.width}x{decoded.height}")
         }
         return 0
+    }
+    if what.as_str() == "stall-timed" {
+        let small = image::Image { width: 4, height: 4, rgba: Data::Bytes(Vec::filled(64, u8(9))) }
+        var r = image::resize(small, image::Size { width: 2, height: 2 }, timeout: 0.5)
+        var got = r.poll()
+        while got.is_none() {
+            yield
+            got = r.poll()
+        }
+        let Some(p) = take got else { return 90 }
+        match image::read_image(take p) {
+            Ok(_) => return 0,
+            Err(e) => print(f"error: {e.message()}"),
+        }
+        return 3
     }
     if what.as_str() == "stall" {
         // A resize that's still running when the tool ends.
@@ -599,4 +615,31 @@ fn a_codec_that_ignores_its_cancel_ends_the_run_as_the_hosts_failure() {
     assert!(why.contains("still running") && why.contains("didn't stop within"), "{why}");
     assert_eq!(ended.end.status(), 71);
     assert_eq!(ended.workers_left, 1, "the codec's thread is counted");
+}
+
+/// Work that doesn't stop is the host's failure, but the tool first reads the request that
+/// failed and ends on its own: what it says about the failure comes before the host's word.
+#[test]
+fn a_tool_says_why_its_request_failed_before_the_host_reports_stuck_work() {
+    let build = tool_build("image-tool-stall-timed", IMAGE_TOOL);
+    let input = scratch("image-stall-timed-in");
+    let grants = Grants::default().root("in", &input, false).root("out", &input, true);
+    let (lines, mut options) = printer(|_| {});
+    options.caps = Caps::open(&grants, |_| None).expect("granted");
+    options.args = vec!["stall-timed".into()];
+    let grace = std::time::Duration::from_millis(500);
+    options.testing =
+        Testing { grace, image_stall: std::time::Duration::from_secs(30), ..Testing::default() };
+    let started = std::time::Instant::now();
+    let ended = wrela_host::tool::run(&build, options);
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+    let End::Host(why) = &ended.end else { panic!("{:?} {lines:?}", ended.end) };
+    assert!(why.contains("still running") && why.contains("didn't stop within"), "{why}");
+    assert!(why.contains("the tool exited with status 3"), "the tool ended on its own: {why}");
+    assert_eq!(ended.end.status(), 71);
+    let lines = lines.lock().expect("the lines");
+    assert!(
+        lines.iter().any(|l| l.starts_with("error: ") && l.contains("deadline")),
+        "the tool's own word: {lines:?}"
+    );
 }

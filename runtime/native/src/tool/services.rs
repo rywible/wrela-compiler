@@ -74,7 +74,10 @@ pub(crate) struct Services {
     /// How long a cancelled HTTP client has to return before the run is the host's failure.
     pub grace: Duration,
     /// Set by a worker whose work can't be stopped: the host ends the run as its failure.
-    pub stuck: Arc<OnceLock<String>>,
+    pub stuck: Arc<Stuck>,
+    /// The run's budget as a whole (`--timeout`), if it has one: the toolchain's requests may
+    /// ask for a deadline as long as it.
+    pub budget: Option<Duration>,
     /// The compiler the toolchain service runs, if the host was given one, and its cache.
     pub toolchain: Option<super::toolchain::Service>,
     /// The builds the drive service holds.
@@ -98,6 +101,41 @@ pub(crate) struct Services {
     /// The threads of work given up on (it didn't stop within the grace after it was
     /// cancelled): the run's end waits for them with the rest, and counts those still running.
     pub strays: Mutex<Vec<std::thread::JoinHandle<()>>>,
+}
+
+/// Work that didn't stop within its grace of being cancelled: why, and when it was found. The
+/// run is the host's failure, but the tool first has one more grace to read the answer of the
+/// request that failed and end on its own, so what the tool says about its failure is shown
+/// before what the host says about its workers.
+pub(crate) struct Stuck {
+    why: OnceLock<String>,
+    at: OnceLock<std::time::Instant>,
+    grace: Duration,
+}
+
+impl Stuck {
+    /// Nothing stuck yet; the run ends `grace` after something is.
+    pub fn new(grace: Duration) -> Stuck {
+        Stuck { why: OnceLock::new(), at: OnceLock::new(), grace }
+    }
+
+    /// Records why work is stuck: the first reason given counts.
+    pub fn set(&self, why: String) -> Result<(), String> {
+        self.why.set(why)?;
+        let _ = self.at.set(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Why work is stuck, if it is.
+    pub fn get(&self) -> Option<&String> {
+        self.why.get()
+    }
+
+    /// Why the run must end now: work is stuck, and the tool's grace since has passed.
+    pub fn due(&self) -> Option<&String> {
+        let at = self.at.get()?;
+        if at.elapsed() >= self.grace { self.why.get() } else { None }
+    }
 }
 
 impl Services {
@@ -621,7 +659,8 @@ pub(crate) fn for_test(budget: super::BlobBudget) -> Services {
         spawn_pause: Duration::ZERO,
         resolve_stall: Duration::ZERO,
         grace: Duration::ZERO,
-        stuck: Arc::new(OnceLock::new()),
+        stuck: Arc::new(Stuck::new(Duration::ZERO)),
+        budget: None,
         toolchain: None,
         drives: Mutex::default(),
         servers: Mutex::default(),

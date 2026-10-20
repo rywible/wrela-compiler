@@ -41,10 +41,21 @@ static METERED: LazyLock<Engine> = LazyLock::new(|| engine(true));
 /// `drive`), whose calls a [`Stop`] ends on every thread, a deadline's or a cancel's.
 static INTERRUPTIBLE: LazyLock<Engine> = LazyLock::new(|| engine_with(false, true));
 
+/// [`METERED`], with epoch interruption too: for a build's constants that the tool host's
+/// `toolchain` service computes (language.md §15.5), whose calls a [`Stop`] ends when the
+/// request is cancelled, while the fuel still bounds their work.
+static METERED_STOPPABLE: LazyLock<Engine> = LazyLock::new(|| engine_with(true, true));
+
 /// The engine that counts fuel ([`METERED`]): the compiler runs a build's constants and tests
 /// under it too, so a process that builds and runs programs makes one.
 pub fn metered_engine() -> &'static Engine {
     &METERED
+}
+
+/// The engine that counts fuel and whose calls a [`Stop`] ends ([`METERED_STOPPABLE`]): a
+/// store of its must have a stop installed ([`Stop::install`]), or its first call traps.
+pub fn stoppable_metered_engine() -> &'static Engine {
+    &METERED_STOPPABLE
 }
 
 fn engine(fuel: bool) -> Engine {
@@ -64,11 +75,11 @@ fn engine_with(fuel: bool, interruptible: bool) -> Engine {
     Engine::new(&config).expect("wasmtime's configuration is valid")
 }
 
-/// How often the interruptible engine's epoch moves on: how soon a [`Stop`] ends a call.
+/// How often the interruptible engines' epoch moves on: how soon a [`Stop`] ends a call.
 const EPOCH: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// The thread that moves [`INTERRUPTIBLE`]'s epoch on, while a [`Stop`] is alive: how many are,
-/// and the thread with its flag to end.
+/// The thread that moves [`INTERRUPTIBLE`]'s and [`METERED_STOPPABLE`]'s epochs on, while a
+/// [`Stop`] is alive: how many are, and the thread with its flag to end.
 type Ticking = Option<(usize, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>;
 static TICKING: std::sync::Mutex<Ticking> = std::sync::Mutex::new(None);
 
@@ -108,6 +119,17 @@ impl Stop {
 
     /// A stop, not stopped, with no deadline.
     pub fn new() -> Result<Stop> {
+        Stop::ticking(None)
+    }
+
+    /// A stop that is due once `flag` is set: a cancelled compile's (the tool host's toolchain
+    /// requests, language.md §15.5), so its constants stop within about 10 ms.
+    pub fn when_set(flag: Arc<std::sync::atomic::AtomicBool>) -> Result<Stop> {
+        Stop::ticking(Some(Box::new(move || flag.load(std::sync::atomic::Ordering::Acquire))))
+    }
+
+    /// A stop whose epochs [`TICKING`]'s thread moves on, also due once `also` says so.
+    fn ticking(also: Option<Box<dyn Fn() -> bool + Send + Sync>>) -> Result<Stop> {
         let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         match ticking.as_mut() {
             Some((count, _, _)) => *count += 1,
@@ -120,6 +142,7 @@ impl Stop {
                         while r.load(std::sync::atomic::Ordering::Acquire) {
                             std::thread::sleep(EPOCH);
                             INTERRUPTIBLE.increment_epoch();
+                            METERED_STOPPABLE.increment_epoch();
                         }
                     })
                     .map_err(|e| {
@@ -132,7 +155,7 @@ impl Stop {
             stopped: std::sync::atomic::AtomicBool::new(false),
             deadline: std::sync::atomic::AtomicU64::new(u64::MAX),
             base: std::time::Instant::now(),
-            also: None,
+            also,
             ticks: true,
         })))
     }
@@ -165,7 +188,7 @@ impl Stop {
     }
 
     /// Makes `store`'s calls end when this is due.
-    pub(crate) fn install<T>(&self, store: &mut Store<T>) {
+    pub fn install<T>(&self, store: &mut Store<T>) {
         let stop = self.clone();
         store.set_epoch_deadline(1);
         store.epoch_deadline_callback(move |_| {
@@ -2090,13 +2113,15 @@ pub struct HelperRun {
 
 impl BuildHelpers {
     /// `count` helpers for `module`'s instances on `memory` (none if it has no `__worker`: it
-    /// runs no parallel jobs), each with `fuel`, printing and timing into `trace`.
+    /// runs no parallel jobs), each with `fuel`, printing and timing into `trace`, and ended by
+    /// `stop` (which a module of a stoppable engine needs: [`stoppable_metered_engine`]).
     pub fn start(
         module: &Module,
         memory: &SharedMemory,
         count: u32,
         fuel: u64,
         trace: &Trace,
+        stop: Option<&Stop>,
     ) -> BuildHelpers {
         let n = if module.get_export(EXPORT_WORKER).is_some() { count.min(MAX_WORKERS) } else { 0 };
         if module.get_export(EXPORT_WORKER).is_some() {
@@ -2105,12 +2130,18 @@ impl BuildHelpers {
         let threads = (0..n)
             .map(|i| {
                 let (module, memory, trace) = (module.clone(), memory.clone(), trace.clone());
+                let stop = stop.cloned();
                 let thread = memory::THREAD_HELPER0 + i;
                 std::thread::spawn(move || {
                     let mut used = HelperRun::default();
                     let run = |used: &mut HelperRun| -> wasmtime::Result<()> {
-                        let (mut store, instance) =
-                            other_instance(&module, &memory, "build-time code", &trace, None)?;
+                        let (mut store, instance) = other_instance(
+                            &module,
+                            &memory,
+                            "build-time code",
+                            &trace,
+                            stop.as_ref(),
+                        )?;
                         let metered = store.engine().get_consume_fuel();
                         if metered {
                             store.set_fuel(fuel)?;

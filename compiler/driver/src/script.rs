@@ -57,7 +57,7 @@ fn script_of(root: &Path, name: &str, lang: Lang) -> ScriptOutput {
                     &mut data,
                     &mut diagnostics,
                     &cache,
-                    &crate::reach::Reach::anywhere(),
+                    &crate::Scope::default(),
                 );
                 errors(&diagnostics)?;
                 json_of(&checked, &data, c).ok_or_else(|| format!("`{name}` has no computed value"))

@@ -454,8 +454,8 @@ pub fn with_partial_in<T: Send>(
         if lower && !has_errors(&diagnostics) {
             let mut data = wrela_lower::BuildData::default();
             let cache = scope.cache.clone().unwrap_or_else(|| const_cache::dirs_of(root));
-            let reach = scope.reach.clone();
-            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &reach);
+            prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, scope);
+            scope.stop()?;
             if !has_errors(&diagnostics) {
                 let roots = wrela_lower::Roots::every_fn(&checked);
                 lowered = Some(wrela_lower::lower(&checked, &roots, &data, false).0);
@@ -601,7 +601,7 @@ fn run_tests_in(
     let mut filtered_out = 0;
     stop()?;
     let cache = scope.cache_of(root);
-    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &scope.reach);
+    prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, scope);
     stop()?;
     let mut results = Vec::new();
     if !has_errors(&diagnostics) {
@@ -789,8 +789,7 @@ fn compile_loaded_in(
         ..Default::default()
     };
     let cache = scope.cache_of(root);
-    let stats =
-        prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, &scope.reach);
+    let stats = prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, scope);
     scope.stop()?;
     if !lift.is_empty() && !has_errors(&diagnostics) {
         data.lift = Some(lift::table(&checked, &sources, &lifted_files));
@@ -889,7 +888,9 @@ fn roles(checked: &wrela_sema::Checked) -> Vec<wrela_sema::defs::Role> {
 
 /// Reads the files `embed` reads, then computes the constants the build computes, into `data`,
 /// before what reads them is lowered (§13): each step only if no errors came before it. With
-/// `cache`, constants whose inputs are unchanged are read from it ([`const_cache`]).
+/// `cache`, constants whose inputs are unchanged are read from it ([`const_cache`]). Setting
+/// `scope`'s cancel stops the constants within about 10 ms ([`consts::compute`]); its
+/// reach is where `embed` may read.
 fn prepare(
     checked: &wrela_sema::Checked,
     sources: &SourceMap,
@@ -897,18 +898,18 @@ fn prepare(
     data: &mut wrela_lower::BuildData,
     diagnostics: &mut Vec<Diagnostic>,
     cache: &[std::path::PathBuf],
-    reach: &reach::Reach,
+    scope: &Scope,
 ) -> consts::ConstStats {
     if has_errors(diagnostics) {
         return consts::ConstStats::default();
     }
-    let (embeds, d) = consts::read_embeds_in(reach, checked, dirs);
+    let (embeds, d) = consts::read_embeds_in(&scope.reach, checked, dirs);
     data.embeds = embeds;
     diagnostics.extend(d);
     if has_errors(diagnostics) {
         return consts::ConstStats::default();
     }
-    let (d, stats) = consts::compute(checked, sources, data, cache);
+    let (d, stats) = consts::compute(checked, sources, data, cache, scope.cancel.as_ref());
     diagnostics.extend(d);
     stats
 }

@@ -617,7 +617,8 @@ fn build_helpers_end_phases_on_success_and_trap() {
         let memory =
             SharedMemory::new(compiled.module.engine(), compiled.memory.clone()).expect("memory");
         let trace = Trace::new(None);
-        let ran = BuildHelpers::start(&compiled.module, &memory, 1, u64::MAX, &trace).finish();
+        let ran =
+            BuildHelpers::start(&compiled.module, &memory, 1, u64::MAX, &trace, None).finish();
         assert_eq!(ran.len(), 1);
         assert_one_closed_phase(&trace, "worker");
     }
