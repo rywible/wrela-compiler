@@ -1,4 +1,0 @@
-# A small package of controlled docs, which the docs site's Chrome tests export
-# (`wrela doc --export`) and read: two modules, their items, code and links.
-[package]
-name = "docs_guide"

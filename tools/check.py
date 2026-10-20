@@ -40,7 +40,7 @@ SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "comp
            "compiler/tests/numerics", "compiler/tests/render", "compiler/tests/queries",
            "compiler/tests/simd", "compiler/tests/input", "compiler/tests/lift",
            "compiler/tests/texels", "compiler/tests/shader_params", "compiler/tests/unroll",
-           "compiler/tests/tool_tests", "compiler/tests/docs-guide")
+           "compiler/tests/tool_tests")
 # The toolchain's own packages, whose Wrela names this file runs; any other is the workspace's.
 TOOLCHAIN = ("compiler/", "runtime/")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes; the

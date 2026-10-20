@@ -63,8 +63,13 @@ def packaged(root, docs=False, extra_files=None):
         open=lambda path: image, Resampling=SimpleNamespace(LANCZOS=0),
     ))
     output = root / "release"
+    # The docs' fonts, under the stand-in root: the docs' files aren't the toolchain's.
+    for font, _ in console.pages.FONTS:
+        (root / font).parent.mkdir(parents=True, exist_ok=True)
+        (root / font).write_bytes(b"font")
     with (
         patch.object(console, "ROOT", root),
+        patch.object(console.pages, "ROOT", root),
         patch.object(console, "build_package", build),
         patch.object(console, "copy_licenses"),
         patch.object(console, "export_docs", export),

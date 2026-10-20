@@ -2,7 +2,6 @@
 
 mod common;
 mod doc;
-mod docs_chrome;
 mod drive;
 mod fix;
 mod profile;

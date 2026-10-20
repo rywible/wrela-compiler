@@ -10,8 +10,11 @@ import subprocess
 import sys
 import tempfile
 
-PACKAGES = ('examples/hello-field', 'compiler/tests/renderer', 'compiler/tests/workgroup',
-            'compiler/tests/texels', 'compiler/tests/groups', 'compiler/tests/domains', 'console')
+# The toolchain's own programs (hello-field is its frozen copy of the example); the
+# workspace's shipped programs are checked by their own tool tests (console/tests/build).
+PACKAGES = ('compiler/tests/frozen/hello-field', 'compiler/tests/renderer', 'compiler/tests/workgroup',
+            'compiler/tests/texels', 'compiler/tests/groups', 'compiler/tests/domains')
+HELLO = 'compiler/tests/frozen/hello-field'
 
 
 def main(wrela):
@@ -27,10 +30,10 @@ def main(wrela):
                 sys.exit(f'{pkg}: no shader pipelines')
             for shader in shaders:
                 data = shader.read_bytes()
-                budget = 128 * 1024 if pkg == 'examples/hello-field' else 256 * 1024
+                budget = 128 * 1024 if pkg == HELLO else 256 * 1024
                 if len(data) > budget:
                     sys.exit(f'{pkg}/{shader.name}: {len(data)} bytes over {budget}')
-                if pkg == 'examples/hello-field':
+                if pkg == HELLO:
                     compressed = len(gzip.compress(data))
                     if compressed > 24 * 1024:
                         sys.exit(f'{pkg}/{shader.name}: {compressed} compressed bytes over {24 * 1024}')

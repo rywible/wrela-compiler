@@ -1,9 +1,0 @@
-// Paths through the guide.
-
-/// The steps a walk takes past its own.
-pub const STEPS: u32 = 3
-
-/// Walks `n` steps, and [`STEPS`] more.
-pub fn walk(n: u32) -> u32 {
-    n + STEPS
-}

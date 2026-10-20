@@ -119,12 +119,14 @@ class WgslBudgetTest(unittest.TestCase):
     def test_only_compressed_budgets_compress_successful_shaders(self):
         original = gzip.compress
         with mock.patch("gzip.compress", wraps=original) as compress:
-            self.run_budgets({"examples/hello-field": b"hello", "examples/other": b"other"})
+            import wgsl_budgets
+            self.run_budgets({wgsl_budgets.HELLO: b"hello", "examples/other": b"other"})
         self.assertEqual(compress.call_count, 1)
         self.assertEqual(compress.call_args.args[0], b"hello")
 
     def test_compressed_and_raw_budget_failures_keep_the_sizes(self):
-        cases = [("examples/hello-field", random.Random(0).randbytes(30 * 1024)),
+        import wgsl_budgets
+        cases = [(wgsl_budgets.HELLO, random.Random(0).randbytes(30 * 1024)),
                  ("examples/other", b"x" * (256 * 1024 + 1))]
         for package, shader in cases:
             with self.subTest(package=package), self.assertRaises(SystemExit) as error:

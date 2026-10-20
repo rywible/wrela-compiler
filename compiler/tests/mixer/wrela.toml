@@ -1,7 +1,0 @@
-# engine::sound's mixer with every source sounding (compiler/tests/tests/suite/audio.rs): the
-# same samples in both hosts, and the voice's time on the audio thread at its busiest.
-[package]
-name = "mixer"
-
-[dependencies]
-engine = { path = "../../../engine" }

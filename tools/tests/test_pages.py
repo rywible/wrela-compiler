@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pages
@@ -68,7 +69,13 @@ class Write(unittest.TestCase):
                 {"path": "std/io.md", "title": "std::io", "summary": "Requests.", "kind": "module"},
                 {"path": "spec/language/6-memory.md", "title": "6. Memory", "summary": "Values.", "kind": "spec"},
             ]}))
-            self.assertEqual(pages.write_pages(d), 2)
+            # The fonts, from a root of the test's own: the docs' files aren't the toolchain's.
+            root = d / "root"
+            for font, _ in pages.FONTS:
+                (root / font).parent.mkdir(parents=True, exist_ok=True)
+                (root / font).write_bytes(b"font")
+            with mock.patch.object(pages, "ROOT", root):
+                self.assertEqual(pages.write_pages(d), 2)
             memory = (d / "spec/language/6-memory.html").read_text()
             # The language first: its page's next is std's.
             self.assertIn('<a class="next" href="../../std/io.html"><span>Next</span>std::io</a>', memory)
