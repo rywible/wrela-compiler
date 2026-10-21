@@ -4,18 +4,13 @@ Every retained test runs, including GPU and browser tests. There are no tiers, r
 passes or environment-selected sizes. Compiled artifacts are cached; test results are not.
 
 The suite runs Clippy and the doc tests, then two lanes at once: the light steps, in turn, and
-the Rust test programs, in turn, each running several tests at a time; then `wrela-suite`
-alone. It runs several members at a time, each testing on every core, so beside the Rust
-programs it loaded a machine of 10 cores to 75 runnable threads, and tests with deadlines in
-real time (Chrome's answers, a tool test's budget) missed them. Every check runs even when
-another fails, and each failure's output is shown at the end.
+the Rust test programs, in turn, each running several tests at a time. Every check runs even
+when another fails, and each failure's output is shown at the end.
 
-The workspace's Wrela (wrela.toml: the engine, content, examples, games, studio, ui, docsite,
-platform, console) is checked by one step, `wrela-suite`: `wrela suite`, which formats, allowlists
-and tests every member. A Wrela name of a member, `wrela::<package-path>::[<test>]`, passes
-through to `wrela suite`, which reads it as this file reads its own. The toolchain's own Wrela
-(compiler/std and compiler/tests' packages) is checked here: `wrela-fmt`, and its Wrela names.
-A name under one of the CLI crate's Rust programs (`wrela::suite::tool::`) is that program's.
+The toolchain's own Wrela (compiler/std and compiler/tests' packages) is checked here:
+`wrela-fmt` formats it, and a Wrela name, `wrela::<package-path>::[<test>]`, runs a package's
+tests. A name under one of the CLI crate's Rust programs (`wrela::suite::tool::`) is that
+program's.
 """
 
 from concurrent.futures import ThreadPoolExecutor
@@ -35,21 +30,17 @@ import xml.etree.ElementTree as ET
 import runner
 
 ROOT = Path(__file__).resolve().parents[1]
-# The toolchain's own Wrela that `wrela-fmt` formats; `wrela suite` formats the workspace's.
+# The toolchain's own Wrela that `wrela-fmt` formats.
 SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "compiler/tests/sketches",
            "compiler/tests/numerics", "compiler/tests/render", "compiler/tests/queries",
            "compiler/tests/simd", "compiler/tests/input", "compiler/tests/lift",
            "compiler/tests/texels", "compiler/tests/shader_params", "compiler/tests/unroll",
            "compiler/tests/tool_tests")
-# The toolchain's own packages, whose Wrela names this file runs; any other is the workspace's.
-TOOLCHAIN = ("compiler/", "runtime/")
-# Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes; the
-# workspace's suite uses every core, so it runs after them.
+# Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")
 LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",
                "browser", "wgsl")
-HEAVY_STEPS = ("wrela-suite",)
-STEPS = CARGO_STEPS + LIGHT_STEPS + HEAVY_STEPS
+STEPS = CARGO_STEPS + LIGHT_STEPS
 CONTROLS = ("WRELA_RUN_ONLY", "WRELA_BLESS", "WRELA_FUZZ_WORKER", "WRELA_CONST_CACHE")
 PRINT = threading.Lock()
 
@@ -209,7 +200,6 @@ def step(name, wrela, logs, out=None):
         "rustfmt": ["cargo", "fmt", "--all", "--", "--check"],
         "clippy": ["cargo", "clippy", "-q", "--workspace", "--all-targets", "--", "-D", "warnings"],
         "wrela-fmt": [str(wrela), "fmt", "--check", *SOURCES],
-        "wrela-suite": [str(wrela), "suite", "--workspace", str(ROOT)],
         "doc": ["cargo", "test", "-q", "--release", "--workspace", "--doc"],
         "wgsl": [sys.executable, "tools/wgsl_budgets.py", str(wrela)],
     }
@@ -243,16 +233,6 @@ def rust_named(programs, name):
     return any(name.startswith(program_name(program) + "::") for program in programs)
 
 
-def wrela_name(name, executable, logs):
-    """A Wrela name: a toolchain package's here (`wrela_test`), a workspace member's through
-    `wrela suite`, which takes the same names and refuses one it doesn't know."""
-    parts = name.split("::")
-    if len(parts) > 1 and parts[1].startswith(TOOLCHAIN):
-        wrela_test(name, executable, logs)
-    else:
-        call([str(executable), "suite", name, "--workspace", str(ROOT)])
-
-
 def wrela_test(name, executable, logs):
     """One Wrela test (`wrela::<package>::<test>`) or all of a package's (`wrela::<package>::`)."""
     parts = name.split("::")
@@ -283,8 +263,8 @@ def wrela_test(name, executable, logs):
 
 
 def log_name(name):
-    """A check's log file name: `::` keeps its own spelling, so `wrela::suite` (a Rust program)
-    and `wrela-suite` (a step) never share a log."""
+    """A check's log file name: `::` keeps its own spelling, so `browser::x` (a browser test
+    file) and `browser-x` (a step) never share a log."""
     return re.sub(r"[^\w.-]+", "-", name.replace("::", "__"))
 
 
@@ -325,8 +305,6 @@ def suite(wrela, logs):
             results.append(job(program_name(program), logs,
                                lambda out, program=program: counts.append(rust_run(program, out))))
         results += light.result()
-    results += [job(check, logs, lambda out, check=check: step(check, wrela, logs, out))
-                for check in HEAVY_STEPS]
     failures = [(name, failure, log) for name, failure, log in results if failure]
     for name, failure, log in failures:
         print(f"\n== {name}: {failure}\n{log.read_text(errors='replace')}", end="", flush=True)
@@ -350,7 +328,7 @@ def main(arguments):
         if name is None:
             status = suite(wrela, logs)
         elif name in STEPS or name.startswith(("tools::", "browser::")):
-            if name in ("wrela-fmt", "wrela-suite", "wgsl"):
+            if name in ("wrela-fmt", "wgsl"):
                 call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
             step(name, wrela, logs)
         else:
@@ -359,7 +337,7 @@ def main(arguments):
             if name.startswith("wrela::") and not rust_named(programs, name):
                 # `cargo test --no-run` builds the CLI's test harness, not its normal executable.
                 call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
-                wrela_name(name, wrela, logs)
+                wrela_test(name, wrela, logs)
             else:
                 if name.endswith("::"):
                     program, tests = group(programs, name)

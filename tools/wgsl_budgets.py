@@ -11,7 +11,8 @@ import sys
 import tempfile
 
 # The toolchain's own programs (hello-field is its frozen copy of the example); the
-# workspace's shipped programs are checked by their own tool tests (console/tests/shader-budget).
+# workspace's shipped programs are checked by their own tool tests (rywible/wrela's
+# console/tests/shader-budget).
 PACKAGES = ('compiler/tests/frozen/hello-field', 'compiler/tests/renderer', 'compiler/tests/workgroup',
             'compiler/tests/texels', 'compiler/tests/groups', 'compiler/tests/domains')
 HELLO = 'compiler/tests/frozen/hello-field'

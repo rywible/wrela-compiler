@@ -1,4 +1,4 @@
-# Run artefacts of test-mode pages (the lookbook and round tools, `wrela tool serve`)
+# Run artefacts of test-mode pages (`wrela tool serve`)
 **/results/DONE
 **/results/console.log
 **/results/*.png
@@ -11,6 +11,5 @@ __pycache__/
 node_modules/
 # The native host's compiled code, kept beside a build it loads (runtime/native cache.rs)
 .native/
-# Local tools' state, never the repository's: Claude Code's worktrees and Wrangler's cache
+# Local tools' state, never the repository's: Claude Code's worktrees
 .claude/worktrees/
-/.wrangler/

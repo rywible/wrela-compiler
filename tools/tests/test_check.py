@@ -17,7 +17,7 @@ import runner
 
 class Selection(unittest.TestCase):
     def test_a_step_and_a_program_never_share_a_log(self):
-        self.assertNotEqual(check.log_name("wrela-suite"), check.log_name("wrela::suite"))
+        self.assertNotEqual(check.log_name("browser-types"), check.log_name("browser::types"))
         self.assertEqual(check.log_name("wrela-tests::suite"), "wrela-tests__suite")
 
     def test_only_zero_or_one_name_is_valid(self):
@@ -78,31 +78,9 @@ class Selection(unittest.TestCase):
         self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two', 'three'])
         text = output.getvalue()
         for shown in ['step output for clippy', 'step output for rustfmt', 'step output for browser',
-                      'program output for one', 'one failed', '4 of 14 checks failed']:
+                      'program output for one', 'one failed', '4 of 13 checks failed']:
             self.assertIn(shown, text)
         self.assertIn('all checks failed', text)
-
-    def test_the_workspaces_suite_runs_alone_after_the_rust_programs(self):
-        # It tests on every core: beside the Rust programs, it overloaded the machine.
-        events = []
-        with tempfile.TemporaryDirectory() as temp, \
-                patch.object(check, 'ROOT', Path(temp)), \
-                patch.object(check, 'build_tests', return_value=['one', 'two']), \
-                patch.object(check, 'program_name', side_effect=str), \
-                patch.object(check, 'call'), \
-                patch.object(check, 'listed', return_value=['test']), \
-                patch.object(check, 'step', side_effect=lambda name, *a: events.append(name)), \
-                patch.object(check, 'rust_run',
-                             side_effect=lambda program, out: events.append(program) or 1), \
-                contextlib.redirect_stdout(io.StringIO()):
-            cwd = Path.cwd()
-            try:
-                self.assertEqual(check.main([]), 0)
-            finally:
-                os.chdir(cwd)
-        self.assertEqual(events[-1], 'wrela-suite')
-        self.assertEqual(events.count('wrela-suite'), 1)
-        self.assertLess(events.index('two'), events.index('wrela-suite'))
 
     def test_tests_run_two_to_six_at_a_time(self):
         for cores, expected in [(None, 2), (1, 2), (4, 2), (10, 5), (12, 6), (64, 6)]:
@@ -118,7 +96,7 @@ class Selection(unittest.TestCase):
     def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
         original = Path.cwd()
         try:
-            for arguments in ([], ['wrela::engine::alpha']):
+            for arguments in ([], ['wrela::compiler/std::alpha']):
                 with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary).resolve()
                     target = root / 'target'
@@ -140,7 +118,7 @@ class Selection(unittest.TestCase):
                             patch.object(check, 'program_name', side_effect=str), \
                             patch.object(check, 'call', side_effect=build) as build_cli, \
                             patch.object(check, 'step', side_effect=selected), \
-                            patch.object(check, 'wrela_name', side_effect=selected), \
+                            patch.object(check, 'wrela_test', side_effect=selected), \
                             patch.object(check, 'listed', return_value=['test']), \
                             patch.object(check, 'rust_run', return_value=1), \
                             contextlib.redirect_stdout(io.StringIO()):
@@ -252,32 +230,18 @@ if mode == 'failure': sys.exit(1)
 
 
 class WrelaSelection(unittest.TestCase):
-    def test_a_members_name_goes_to_the_suite_and_the_toolchains_stays_here(self):
-        with patch.object(check, 'call') as run, patch.object(check, 'wrela_test') as here:
-            for name in ['wrela::engine::alpha', 'wrela::games/leapling::', 'wrela::missing::']:
-                check.wrela_name(name, Path('wrela'), Path('logs'))
-                self.assertEqual(run.call_args.args[0],
-                                 ['wrela', 'suite', name, '--workspace', str(check.ROOT)])
-            here.assert_not_called()
-            run.reset_mock()
-            for name in ['wrela::compiler/std::x', 'wrela::compiler/tests/fields::',
-                         'wrela::runtime/fixtures/x::y']:
-                check.wrela_name(name, Path('wrela'), Path('logs'))
-                self.assertEqual(here.call_args.args[0], name)
-            run.assert_not_called()
-
     def test_a_name_under_the_clis_rust_programs_is_theirs(self):
         programs = [{'name': 'wrela::suite'}, {'name': 'wrela::wrela'}]
         names = ['tool::a', 'tool::b', 'other::c']
         for name, rust in [('wrela::suite::tool::', ['tool::a', 'tool::b']),
                            ('wrela::suite::tool::a', ['tool::a']),
-                           ('wrela::engine::alpha', None), ('wrela::suite', None)]:
+                           ('wrela::compiler/std::alpha', None), ('wrela::suite', None)]:
             with self.subTest(name=name), \
                     patch.object(check, 'build_tests', return_value=programs), \
                     patch.object(check, 'program_name', side_effect=lambda p: p['name']), \
                     patch.object(check, 'listed', side_effect=lambda p: names if p['name'] == 'wrela::suite' else []), \
                     patch.object(check, 'call'), \
-                    patch.object(check, 'wrela_name') as wrela, \
+                    patch.object(check, 'wrela_test') as wrela, \
                     patch.object(check, 'rust_run', return_value=1) as run, \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(check.main([name]), 0)
@@ -289,16 +253,10 @@ class WrelaSelection(unittest.TestCase):
                     self.assertEqual(wrela.call_args.args[0], name)
                     run.assert_not_called()
 
-    def test_the_workspace_is_the_suites_and_not_formatted_twice(self):
-        self.assertFalse([s for s in check.SOURCES if not s.startswith(check.TOOLCHAIN)])
-        with patch.object(check, 'call') as run:
-            check.step('wrela-suite', Path('wrela'), Path('logs'))
-        self.assertEqual(run.call_args.args[0], ['wrela', 'suite', '--workspace', str(check.ROOT)])
-
     def test_exact_results_required_and_package_paths_confined(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / 'engine').mkdir()
+            (root / 'fields').mkdir()
             logs = root / 'logs'; logs.mkdir()
             for tests in [[], [{'name': 'alphabet', 'passed': True}],
                           [{'name': 'alpha', 'passed': True}] * 2,
@@ -306,10 +264,10 @@ class WrelaSelection(unittest.TestCase):
                 with patch.object(check, 'ROOT', root), \
                         patch.object(check, 'call', return_value=subprocess.CompletedProcess(
                             [], 0, json.dumps({'tests': tests}))), self.assertRaises(ValueError):
-                    check.wrela_test('wrela::engine::alpha', Path('wrela'), logs)
+                    check.wrela_test('wrela::fields::alpha', Path('wrela'), logs)
             with patch.object(check, 'ROOT', root), patch.object(check, 'call') as run:
-                for name in ['wrela::../::alpha', 'wrela::::alpha', 'wrela::engine::alpha::extra',
-                             'wrela::engine::not-a-name']:
+                for name in ['wrela::../::alpha', 'wrela::::alpha', 'wrela::fields::alpha::extra',
+                             'wrela::fields::not-a-name']:
                     with self.assertRaises(ValueError): check.wrela_test(name, Path('wrela'), logs)
                 run.assert_not_called()
 
@@ -317,20 +275,20 @@ class WrelaSelection(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             # Resolved, as the checkout's ROOT is: macOS's /var is a link to /private/var.
             root = Path(temporary).resolve()
-            (root / 'engine').mkdir()
+            (root / 'fields').mkdir()
             logs = root / 'logs'; logs.mkdir()
             def report(tests):
                 return subprocess.CompletedProcess([], 0, json.dumps({'tests': tests}))
-            passed = [{'name': n, 'passed': True, 'at': 'engine/a.wrela:1'} for n in ['a', 'b']]
-            for tests in [[], [*passed, {'name': 'c', 'passed': False, 'at': 'engine/a.wrela:9'}]]:
+            passed = [{'name': n, 'passed': True, 'at': 'fields/a.wrela:1'} for n in ['a', 'b']]
+            for tests in [[], [*passed, {'name': 'c', 'passed': False, 'at': 'fields/a.wrela:9'}]]:
                 with patch.object(check, 'ROOT', root), patch.object(check, 'call', return_value=report(tests)), \
                         self.assertRaises(ValueError):
-                    check.wrela_test('wrela::engine::', Path('wrela'), logs)
+                    check.wrela_test('wrela::fields::', Path('wrela'), logs)
             with patch.object(check, 'ROOT', root), patch.object(check, 'call', return_value=report(passed)) as run, \
                     contextlib.redirect_stdout(io.StringIO()) as output:
-                check.wrela_test('wrela::engine::', Path('wrela'), logs)
-            self.assertEqual(run.call_args.args[0], ['wrela', 'test', str(root / 'engine'), '--json'])
-            self.assertIn('ok wrela::engine::b', output.getvalue())
+                check.wrela_test('wrela::fields::', Path('wrela'), logs)
+            self.assertEqual(run.call_args.args[0], ['wrela', 'test', str(root / 'fields'), '--json'])
+            self.assertIn('ok wrela::fields::b', output.getvalue())
 
 
 class BrowserSelection(unittest.TestCase):
