@@ -1,0 +1,77 @@
+// run: a generic call passed for a `[T]` or `str` parameter returns its own type, which then
+// passes as a run: an expected run never makes a run a type argument (§4.4)
+// expect: replaced() = (3, 0)
+// expect: replaced_text() = (2, 0)
+// expect: in_job() = 6
+// expect: own_generic() = (3, 0)
+
+use std::collections::{replace, swap}
+use std::job::{Job, Step}
+
+fn sum(bytes: [u8]) -> u32 {
+    var t: u32 = 0
+    for b in bytes {
+        t += u32(b)
+    }
+    t
+}
+
+fn length(text: str) -> u32 {
+    text.len()
+}
+
+fn parts() -> Vec<Vec<u8>> {
+    var out: Vec<Vec<u8>> = Vec::new()
+    out.push(Vec::from([1, 2]))
+    out.push(Vec::from([3]))
+    out
+}
+
+/// The sum of `parts[0]`, moved out, and what's left in its place.
+pub fn replaced() -> (u32, u32) {
+    var ps = parts()
+    let s = sum(replace(mut ps[0], Vec::new()))
+    (s, ps[0].len())
+}
+
+pub fn replaced_text() -> (u32, u32) {
+    var names: Vec<String> = Vec::new()
+    names.push(String::from("ab"))
+    let n = length(replace(mut names[0], String::new()))
+    (n, names[0].len())
+}
+
+/// Each part, moved out and summed a tick apart.
+@job
+fn add(given: take Vec<Vec<u8>>) -> u32 {
+    var ps = take given
+    var t: u32 = 0
+    for k in 0..ps.len() {
+        t += sum(replace(mut ps[k], Vec::new()))
+        yield
+    }
+    t
+}
+
+pub fn in_job() -> u32 {
+    var j = add.start(parts())
+    loop {
+        match j.resume() {
+            Step::Done(d) => return d,
+            Step::Yielded => {},
+        }
+    }
+}
+
+/// `replace` written in Wrela: inferred as `rep::<Vec<u8>>`, it empties the slot.
+fn rep<T>(place: mut T, value: take T) -> T {
+    var v = take value
+    swap(mut place, mut v)
+    take v
+}
+
+pub fn own_generic() -> (u32, u32) {
+    var ps = parts()
+    let s = sum(rep(mut ps[0], Vec::new()))
+    (s, ps[0].len())
+}

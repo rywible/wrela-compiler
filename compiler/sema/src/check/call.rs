@@ -642,8 +642,13 @@ impl<'p> Checker<'p> {
         // Let the expected type guide inference of the generics (`let x: T = f()`), but only
         // if it fits: a mismatch is reported where the value is used. One not known yet (a
         // literal's, in `0.5 * gradient(f, p)`) only after the arguments, which know better:
-        // a scalar times a vector is a vector.
-        let hint = expected.filter(|_| !matches!(self.kind(ret), TyKind::Opaque(..)));
+        // a scalar times a vector is a vector. An expected run guides only a result that is a
+        // run: a run is never a type argument (§4.4), so `replace(mut v[k], Vec::new())` passed
+        // for a `[u8]` returns the `Vec<u8>`, which then passes as a run.
+        let run = |c: &Self, t: TyId| matches!(c.kind(t), TyKind::Slice(_) | TyKind::Str);
+        let hint = expected.filter(|&e| {
+            !matches!(self.kind(ret), TyKind::Opaque(..)) && (!run(self, e) || run(self, ret))
+        });
         let early = hint.filter(|&e| self.infer.var_kind(&self.p.types, e).is_none());
         if let Some(e) = early {
             self.try_unify(ret, e);
