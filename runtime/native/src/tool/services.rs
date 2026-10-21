@@ -86,9 +86,9 @@ pub(crate) struct Services {
     pub servers: Mutex<super::serve::Servers>,
     /// The browsers the browser service holds.
     pub browsers: Mutex<super::browser::Browsers>,
-    /// Where a service that answers a request itself, later, sends the answer
-    /// ([`Work::Later`]): the run's own channel, until it ends.
-    pub answers: Mutex<Option<std::sync::mpsc::Sender<(u32, Answer)>>>,
+    /// Where a service that answers a request itself, later, gives the answer
+    /// ([`Work::Later`]): the run's shared state, until it ends.
+    pub answers: Mutex<Option<Arc<super::hub::Hub>>>,
     /// A test's held output write, and its output write that fails part way ([`super::Testing`]).
     pub hold: Option<(String, Duration)>,
     pub write_fail: Option<String>,
@@ -162,9 +162,9 @@ impl Services {
     /// Gives `answer` to `request`, which a service answers itself ([`Work::Later`]): nothing,
     /// once the run has ended.
     pub(crate) fn send(&self, request: u32, answer: Answer) {
-        let answers = self.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(to) = answers.as_ref() {
-            let _ = to.send((request, answer));
+        let hub = self.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if let Some(hub) = hub {
+            hub.deliver(request, answer);
         }
     }
 
@@ -305,13 +305,13 @@ pub(crate) enum Data {
 /// Work on a worker thread: given the services and the request's number.
 pub(crate) type Task = Box<dyn FnOnce(&Arc<Services>, u32) -> Answer + Send>;
 
-/// A request registered with the service that answers it, on the host's loop: its answer now,
+/// A request registered with the service that answers it, as the tool makes it: its answer now,
 /// or `None` if the service sends it later ([`Services::send`]).
 pub(crate) type Register = Box<dyn FnOnce(&Arc<Services>, u32) -> Option<Answer> + Send>;
 
 /// How a request is carried out.
 pub(crate) enum Work {
-    /// Answered now, after the call that made it.
+    /// Answered now, as the tool makes it.
     Now(Answer),
     /// Answered, with no bytes, once this time has passed (on the run's clock: a test's is
     /// fake).
@@ -330,7 +330,7 @@ pub(crate) enum Work {
     /// Answered by a worker of the pool for long waits, but given to the tool only once this
     /// much of a test's fake time has passed since the request: a fake site's delay.
     Held(Duration, Task),
-    /// Registered at once, after the call that made it, with the service that answers it when
+    /// Registered at once, as the tool makes it, with the service that answers it when
     /// something happens (a served post arrives), not by a worker that would wait for it.
     Later(Register),
     /// Answered with the date now, on the run's clock.

@@ -216,3 +216,47 @@ pub fn debug_build() -> bool {}
 /// of what only tests do, such as a view only tests show, nor of the pipelines only it draws.
 @intrinsic
 pub fn test_build() -> bool {}
+
+/// Makes a tool's request of the tool service `service` (`tool/files/read`), with `body`, at
+/// once (`wrela.tool_request`): the number the host gave it. Only a tool build imports it.
+@tool
+@intrinsic
+pub fn tool_request(service: str, body: [u8]) -> u32 {}
+
+/// Blocks this thread until tool request `request` is answered (`wrela.tool_wait`): the
+/// answer's length, or `REQUEST_FAILED`. If the run stops while it waits, the thread traps.
+@tool
+@intrinsic
+pub fn tool_wait(request: u32) -> i32 {}
+
+/// Blocks this thread until one of `requests` is answered (`wrela.tool_any`): its index.
+@tool
+@intrinsic
+pub fn tool_any(requests: [u32]) -> u32 {}
+
+/// Copies tool request `request`'s answer to `addr`, and forgets the request
+/// (`wrela.tool_take`). The caller makes room for the length `tool_wait` gave.
+@tool
+@intrinsic
+pub fn tool_take(request: u32, addr: u32) {}
+
+/// Tells the tool host this helper is about to wait for work, holding none (`wrela.tool_idle`).
+@tool
+@intrinsic
+pub fn tool_idle() {}
+
+/// Tells the tool host this helper woke, before it looks for work (`wrela.tool_active`).
+@tool
+@intrinsic
+pub fn tool_active() {}
+
+/// Blocks this thread in the tool host while the task in the slot at `slot` runs on another
+/// (`wrela.tool_join`).
+@tool
+@intrinsic
+pub fn tool_join(slot: u32) {}
+
+/// Tells the tool host a helper has finished a task, and written its slot (`wrela.tool_done`).
+@tool
+@intrinsic
+pub fn tool_done() {}

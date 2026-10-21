@@ -21,9 +21,8 @@ use std::time::{Duration, Instant};
 /// - `spin-forever`: the same with no deadline of its own (the tool's `--timeout` ends it).
 const TOOL: &str = r#"
 use std::input::{Key, Script}
-use std::io::{IoError, print}
-use std::job::{Job, Step}
-use std::tool::{RUNNING, ToolError, answer, args}
+use std::io::print
+use std::tool::{ToolError, args}
 use std::tool::blob::Data
 use std::tool::drive
 use std::tool::files
@@ -48,165 +47,79 @@ fn utf8(text: str) -> Vec<u8> {
     out
 }
 
-fn report(polled: take Result<Vec<u8>, IoError>) {
-    match drive::read_capture(take polled) {
+fn report(captured: take Result<drive::Capture, ToolError>) {
+    match take captured {
         Ok(_) => print("captured"),
         Err(e) => print(f"refused: {e.message()}"),
     }
 }
 
-@job
-fn two(n: take u32) -> u32 {
+fn two() -> u32 {
     // The fixture twice, a frame each, then both screens captured at once.
     var builds: Vec<drive::Build> = Vec::new()
     for _ in 0..2 {
-        var l = drive::load("fx", drive::gpu())
-        var lg = l.poll()
-        while lg.is_none() {
-            yield
-            lg = l.poll()
-        }
-        let Some(lp) = take lg else { return 90 }
-        let loaded = match drive::read_loaded(take lp) {
+        let loaded = match drive::load("fx", drive::gpu()).wait() {
             Ok(x) => x,
             Err(e) => return failed(e),
         }
-        var i = drive::init(loaded.build)
-        while i.poll().is_none() { yield }
-        var f = drive::frames(loaded.build, 1, Script::frames())
-        while f.poll().is_none() { yield }
+        let _ = drive::init(loaded.build).wait()
+        let _ = drive::frames(loaded.build, 1, Script::frames()).wait()
         builds.push(loaded.build)
     }
-    var a = drive::capture(builds[0])
-    var b = drive::capture(builds[1])
-    var ga = a.poll()
-    var gb = b.poll()
-    while ga.is_none() || gb.is_none() {
-        yield
-        if ga.is_none() {
-            ga = a.poll()
-        }
-        if gb.is_none() {
-            gb = b.poll()
-        }
-    }
-    let Some(pa) = take ga else { return 90 }
-    let Some(pb) = take gb else { return 90 }
-    report(take pa)
-    report(take pb)
-    n
+    let a = drive::capture(builds[0])
+    let b = drive::capture(builds[1])
+    report(take a.wait())
+    report(take b.wait())
+    0
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
+    if what.as_str() == "two" {
+        return two()
+    }
     var options = if what.as_str() == "gpu" || what.as_str() == "record" { drive::gpu() } else { drive::cpu() }
     options.workers = 2
     options.record = what.as_str() == "record"
     let at = if what.as_str() == "gpu" { "fx" } else { "src/build" }
-    var l = drive::load(at, options)
-    var lg = l.poll()
-    while lg.is_none() {
-        yield
-        lg = l.poll()
-    }
-    let Some(lp) = take lg else { return 90 }
-    let loaded = match drive::read_loaded(take lp) {
+    let loaded = match drive::load(at, options).wait() {
         Ok(x) => x,
         Err(e) => return failed(e),
     }
     let b = loaded.build
-    var i = drive::init(b)
-    var ig = i.poll()
-    while ig.is_none() {
-        yield
-        ig = i.poll()
-    }
-    let Some(ip) = take ig else { return 90 }
-    let Ok(init) = drive::read_ran(take ip) else { return 91 }
+    let Ok(init) = drive::init(b).wait() else { return 91 }
     assert(init.trap.is_none(), "init")
     if what.as_str() == "cpu" {
-        var w = files::write("out/script.json", utf8(SCRIPT.as_json()))
-        while w.poll().is_none() { yield }
-        var f = drive::frames(b, 8, SCRIPT)
-        var fg = f.poll()
-        while fg.is_none() {
-            yield
-            fg = f.poll()
-        }
-        let Some(fp) = take fg else { return 90 }
-        let ran = match drive::read_ran(take fp) {
+        let _ = files::write("out/script.json", utf8(SCRIPT.as_json())).wait()
+        let ran = match drive::frames(b, 8, SCRIPT).wait() {
             Ok(r) => take r,
             Err(e) => return failed(e),
         }
         print(f"frames {ran.steps.len()}")
-        var c = drive::call(b, "add", [drive::Scalar::I32(2), drive::Scalar::I32(40)])
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let Ok(called) = drive::read_ran(take cp) else { return 92 }
+        let Ok(called) = drive::call(b, "add", [drive::Scalar::I32(2), drive::Scalar::I32(40)]).wait() else { return 92 }
         let drive::Scalar::I32(sum) = called.results[0] else { return 93 }
         print(f"sum {sum}")
-        var t = drive::call(b, "boom", [drive::Scalar::I32(13)])
-        var tg = t.poll()
-        while tg.is_none() {
-            yield
-            tg = t.poll()
-        }
-        let Some(tp) = take tg else { return 90 }
-        let Ok(boomed) = drive::read_ran(take tp) else { return 94 }
+        let Ok(boomed) = drive::call(b, "boom", [drive::Scalar::I32(13)]).wait() else { return 94 }
         let Some(trap) = boomed.trap else { return 95 }
         print(f"trap call={trap.stage == drive::Stage::Call} panic={trap.panic.as_str()} at={trap.at.as_str()}")
-        var a = drive::frames(b, 1, Script::frames())
-        var ag = a.poll()
-        while ag.is_none() {
-            yield
-            ag = a.poll()
-        }
-        let Some(apol) = take ag else { return 90 }
-        if let Err(e) = drive::read_ran(take apol) {
+        if let Err(e) = drive::frames(b, 1, Script::frames()).wait() {
             print(f"after: {e.message()}")
         }
     } else if what.as_str() == "record" {
-        var f = drive::frames(b, 2, Script::frames())
-        while f.poll().is_none() { yield }
-        var l = drive::buffers(b)
-        var lg = l.poll()
-        while lg.is_none() {
-            yield
-            lg = l.poll()
-        }
-        let Some(lp) = take lg else { return 90 }
-        let held = match drive::read_buffers(take lp) {
+        let _ = drive::frames(b, 2, Script::frames()).wait()
+        let held = match drive::buffers(b).wait() {
             Ok(h) => take h,
             Err(e) => return failed(e),
         }
         print(f"buffers {held.len()}")
-        var r = drive::read_buffer(b, held[held.len() - 1])
-        var rg = r.poll()
-        while rg.is_none() {
-            yield
-            rg = r.poll()
-        }
-        let Some(rp) = take rg else { return 90 }
-        let bytes = match drive::read_bytes(take rp) {
+        let bytes = match drive::read_buffer(b, held[held.len() - 1]).wait() {
             Ok(d) => take d,
             Err(e) => return failed(e),
         }
         let Data::Blob(blob) = bytes else { return 96 }
-        var w = files::write_blob("out/buffer.bin", blob)
-        while w.poll().is_none() { yield }
-        var c = drive::commands(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let recorded = match drive::read_commands(take cp) {
+        let _ = files::write_blob("out/buffer.bin", blob).wait()
+        let recorded = match drive::commands(b).wait() {
             Ok(x) => take x,
             Err(e) => return failed(e),
         }
@@ -223,28 +136,14 @@ fn main(given: take Vec<String>) -> u32 {
             print(f"command {c.kind.as_str()} {c.label.as_str()} {c.pipeline.as_str()} {c.groups.x},{c.groups.y},{c.groups.z}{bound.as_str()} {c.target.as_str()}{carried.as_str()}")
         }
         print(f"waiting {recorded.waiting}")
-        var n = drive::read_buffer(b, 999999)
-        var ng = n.poll()
-        while ng.is_none() {
-            yield
-            ng = n.poll()
-        }
-        let Some(np) = take ng else { return 90 }
-        if let Err(e) = drive::read_bytes(take np) {
+        if let Err(e) = drive::read_buffer(b, 999999).wait() {
             print(f"missing: {e.message()}")
         }
     } else if what.as_str() == "at" {
         var steps = 0
         let times = [0.25, 3.0]
         for k in 0..2 {
-            var f = drive::frame_at(b, times[k])
-            var fg = f.poll()
-            while fg.is_none() {
-                yield
-                fg = f.poll()
-            }
-            let Some(fp) = take fg else { return 90 }
-            let ran = match drive::read_ran(take fp) {
+            let ran = match drive::frame_at(b, times[k]).wait() {
                 Ok(r) => take r,
                 Err(e) => return failed(e),
             }
@@ -254,112 +153,36 @@ fn main(given: take Vec<String>) -> u32 {
         print(f"frames {steps}")
     } else if what.as_str() == "fetch" {
         // Loaded: say so, and wait until the build's directory has been swapped.
-        var m = files::write("out/loaded", utf8("1"))
-        while m.poll().is_none() { yield }
-        var waiting = true
-        while waiting {
-            var st = files::stat("out/go")
-            var sg = st.poll()
-            while sg.is_none() {
-                yield
-                sg = st.poll()
-            }
-            let Some(sp) = take sg else { return 90 }
-            if answer(take sp).is_ok() {
-                waiting = false
-            } else {
-                var t = time::after(0.02)
-                while t.poll().is_none() { yield }
-            }
+        let _ = files::write("out/loaded", utf8("1")).wait()
+        while files::stat("out/go").wait().is_err() {
+            let _ = time::after(0.02).wait()
         }
-        var f = drive::frames(b, 2, Script::frames())
-        while f.poll().is_none() { yield }
-        var g = drive::logs(b)
-        var gg = g.poll()
-        while gg.is_none() {
-            yield
-            gg = g.poll()
-        }
-        let Some(gp) = take gg else { return 90 }
-        let Ok(logs) = drive::read_logs(take gp) else { return 98 }
+        let _ = drive::frames(b, 2, Script::frames()).wait()
+        let Ok(logs) = drive::logs(b).wait() else { return 98 }
         for line in logs.lines {
             print(f"log {line.as_str()}")
         }
     } else if what.as_str() == "gpu" {
-        var f = drive::frames(b, 3, Script::frames())
-        while f.poll().is_none() { yield }
-        var c = drive::capture(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let shot = match drive::read_capture(take cp) {
+        let _ = drive::frames(b, 3, Script::frames()).wait()
+        let shot = match drive::capture(b).wait() {
             Ok(s) => take s,
             Err(e) => return failed(e),
         }
         let Data::Blob(blob) = shot.rgba else { return 96 }
-        var w = files::write_blob("out/screen.rgba", blob)
-        var wg = w.poll()
-        while wg.is_none() {
-            yield
-            wg = w.poll()
-        }
-        let Some(wp) = take wg else { return 90 }
-        if let Err(e) = answer(take wp) {
+        if let Err(e) = files::write_blob("out/screen.rgba", blob).wait() {
             return failed(e)
         }
         print(f"captured {shot.width}x{shot.height}")
     } else {
         let timeout = if what.as_str() == "spin" { 1.0 } else { 0.0 }
-        var s = drive::call(b, "spin", [drive::Scalar::I32(0)], timeout: timeout)
-        var sg = s.poll()
-        while sg.is_none() {
-            yield
-            sg = s.poll()
-        }
-        let Some(sp) = take sg else { return 90 }
-        if let Err(e) = drive::read_ran(take sp) {
+        if let Err(e) = drive::call(b, "spin", [drive::Scalar::I32(0)], timeout: timeout).wait() {
             print(f"spin: {e.message()}")
         }
     }
-    var h = drive::hash(b)
-    var hg = h.poll()
-    while hg.is_none() {
-        yield
-        hg = h.poll()
-    }
-    let Some(hp) = take hg else { return 90 }
-    let Ok(hash) = drive::read_hash(take hp) else { return 97 }
+    let Ok(hash) = drive::hash(b).wait() else { return 97 }
     print(f"hash {hash}")
-    var x = drive::close(b)
-    while x.poll().is_none() { yield }
+    let _ = drive::close(b).wait()
     0
-}
-
-pub enum Running {
-    Main(Job<main>),
-    Two(Job<two>),
-}
-
-pub fn tool_init() -> Running {
-    let given = args()
-    if given.len() > 0 && given[0].as_str() == "two" {
-        return Running::Two(two.start(0))
-    }
-    Running::Main(main.start(take given))
-}
-
-pub fn tool(running: mut Running) -> u32 {
-    let step = match mut running {
-        Running::Main(j) => j.resume(),
-        Running::Two(j) => j.resume(),
-    }
-    match step {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -810,84 +633,32 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
 /// answered again (refused), then a frame, and the build closed with a post unanswered.
 const POST_TOOL: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args}
 use std::tool::blob::Data
 use std::tool::drive
 
-@job
-fn main(given: take Vec<String>) -> u32 {
-    var l = drive::load("src/build", drive::cpu())
-    var loaded = l.poll()
-    while loaded.is_none() {
-        yield
-        loaded = l.poll()
-    }
-    let Some(lp) = take loaded else { return 90 }
-    let Ok(it) = drive::read_loaded(take lp) else { return 91 }
+pub fn tool() -> u32 {
+    let Ok(it) = drive::load("src/build", drive::cpu()).wait() else { return 91 }
     let b = it.build
-    var i = drive::init(b)
-    while i.poll().is_none() { yield }
-    var f = drive::frames(b, 1, std::input::Script::frames())
-    while f.poll().is_none() { yield }
-    var p = drive::posts(b)
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(pp) = take got else { return 92 }
-    let Ok(posts) = drive::read_posts(take pp) else { return 93 }
+    let _ = drive::init(b).wait()
+    let _ = drive::frames(b, 1, std::input::Script::frames()).wait()
+    let Ok(posts) = drive::posts(b).wait() else { return 93 }
     for post in posts {
         let Data::Bytes(body) = post.body.clone() else { return 94 }
         print(f"posted {post.url.as_str()} {body.len()}")
     }
-    var a = drive::answer(b, posts[0].id, Data::Bytes(Vec::from([u8(7), 8, 9])))
-    var answered = a.poll()
-    while answered.is_none() {
-        yield
-        answered = a.poll()
-    }
-    let Some(ap) = take answered else { return 95 }
-    print(f"answered {answer(take ap).is_ok()}")
-    var x = drive::fail(b, posts[1].id, "no")
-    while x.poll().is_none() { yield }
-    var again = drive::answer(b, posts[0].id, Data::empty())
-    var twice = again.poll()
-    while twice.is_none() {
-        yield
-        twice = again.poll()
-    }
-    let Some(tp) = take twice else { return 96 }
-    print(f"answered twice {answer(take tp).is_ok()}")
-    var g = drive::frames(b, 1, std::input::Script::frames())
-    while g.poll().is_none() { yield }
-    var o = drive::logs(b)
-    var logged = o.poll()
-    while logged.is_none() {
-        yield
-        logged = o.poll()
-    }
-    let Some(op) = take logged else { return 97 }
-    let Ok(lines) = drive::read_logs(take op) else { return 98 }
+    let answered = drive::answer(b, posts[0].id, Data::Bytes(Vec::from([u8(7), 8, 9]))).wait()
+    print(f"answered {answered.is_ok()}")
+    let _ = drive::fail(b, posts[1].id, "no").wait()
+    let twice = drive::answer(b, posts[0].id, Data::empty()).wait()
+    print(f"answered twice {twice.is_ok()}")
+    let _ = drive::frames(b, 1, std::input::Script::frames()).wait()
+    let Ok(lines) = drive::logs(b).wait() else { return 98 }
     for line in lines.lines {
         print(f"log {line.as_str()}")
     }
     // The post to `notes/c` waits: closing the build gives it up.
-    var c = drive::close(b)
-    while c.poll().is_none() { yield }
+    let _ = drive::close(b).wait()
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -977,32 +748,23 @@ pub fn frame(p: mut Piece, time: f32, width: u32, height: u32) {
 /// 10 more each timed, written to `out/timed.f32`; and with `early`, the voice asked for before
 /// `init` and before the voice starts.
 const VOICE_TOOL: &str = r#"
-use std::io::{IoError, print}
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args}
+use std::io::print
+use std::tool::{ToolError, args}
 use std::tool::blob
 use std::tool::blob::Data
 use std::tool::drive
 use std::tool::files
 
-@job
-fn write(blob: take Data, path: take String) -> u32 {
+fn write(blob: take Data, path: str) -> u32 {
     let Data::Blob(b) = blob else { return 80 }
-    var w = files::write_blob(path.as_str(), b)
-    var got = w.poll()
-    while got.is_none() {
-        yield
-        got = w.poll()
-    }
-    let Some(polled) = take got else { return 81 }
-    if answer(take polled).is_err() {
+    if files::write_blob(path, b).wait().is_err() {
         return 82
     }
     0
 }
 
-fn rendered(polled: take Result<Vec<u8>, IoError>) -> Option<drive::Audio> {
-    match drive::read_audio(take polled) {
+fn rendered(answered: take Result<drive::Audio, ToolError>) -> Option<drive::Audio> {
+    match take answered {
         Ok(a) => Some(a),
         Err(e) => {
             print(f"refused: {e.message()}")
@@ -1011,103 +773,39 @@ fn rendered(polled: take Result<Vec<u8>, IoError>) -> Option<drive::Audio> {
     }
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
-    let early = !given.is_empty()
+pub fn tool() -> u32 {
+    let early = !args().is_empty()
     var options = drive::cpu()
     options.width = 16
     options.height = 16
-    var l = drive::load("src/build", options)
-    var lg = l.poll()
-    while lg.is_none() {
-        yield
-        lg = l.poll()
-    }
-    let Some(lp) = take lg else { return 90 }
-    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+    let Ok(loaded) = drive::load("src/build", options).wait() else { return 91 }
     let b = loaded.build
     if early {
-        var a = drive::audio(b, 1)
-        var ag = a.poll()
-        while ag.is_none() {
-            yield
-            ag = a.poll()
-        }
-        let Some(ap) = take ag else { return 92 }
-        let _ = rendered(take ap)
+        let _ = rendered(drive::audio(b, 1).wait())
     }
-    var i = drive::init(b)
-    while i.poll().is_none() { yield }
+    let _ = drive::init(b).wait()
     if early {
-        var a = drive::audio(b, 1)
-        var ag = a.poll()
-        while ag.is_none() {
-            yield
-            ag = a.poll()
-        }
-        let Some(ap) = take ag else { return 92 }
-        let _ = rendered(take ap)
+        let _ = rendered(drive::audio(b, 1).wait())
     }
-    var f = drive::frames(b, 1, std::input::Script::frames())
-    while f.poll().is_none() { yield }
-    var a = drive::audio(b, 300)
-    var ag = a.poll()
-    while ag.is_none() {
-        yield
-        ag = a.poll()
-    }
-    let Some(ap) = take ag else { return 92 }
-    let Some(voice) = rendered(take ap) else { return 0 }
+    let _ = drive::frames(b, 1, std::input::Script::frames()).wait()
+    let Some(voice) = rendered(drive::audio(b, 300).wait()) else { return 0 }
     if voice.times.is_some() {
         return 93
     }
-    var w = Box::new(write.start(take voice.samples, String::from("out/voice.f32")))
-    loop {
-        match w.get_mut().resume() {
-            Step::Yielded => yield,
-            Step::Done(0) => break,
-            Step::Done(status) => return status,
-        }
+    let wrote = write(take voice.samples, "out/voice.f32")
+    if wrote != 0 {
+        return wrote
     }
-    var t = drive::audio(b, 10, timed: true)
-    var tg = t.poll()
-    while tg.is_none() {
-        yield
-        tg = t.poll()
-    }
-    let Some(tp) = take tg else { return 94 }
-    let Some(timed) = rendered(take tp) else { return 0 }
+    let Some(timed) = rendered(drive::audio(b, 10, timed: true).wait()) else { return 0 }
     let Some(Data::Blob(times)) = timed.times.clone() else { return 95 }
-    var n = blob::len(times)
-    var ng = n.poll()
-    while ng.is_none() {
-        yield
-        ng = n.poll()
-    }
-    let Some(np) = take ng else { return 96 }
-    let Ok(len) = blob::read_len(take np) else { return 97 }
+    let Ok(len) = blob::len(times).wait() else { return 97 }
     print(f"times {len}")
-    var w2 = Box::new(write.start(take timed.samples, String::from("out/timed.f32")))
-    loop {
-        match w2.get_mut().resume() {
-            Step::Yielded => yield,
-            Step::Done(0) => break,
-            Step::Done(status) => return status,
-        }
+    let wrote = write(take timed.samples, "out/timed.f32")
+    if wrote != 0 {
+        return wrote
     }
     print("rendered")
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -1205,51 +903,20 @@ pub fn frame(p: mut Piece, time: f32, width: u32, height: u32) {
 /// A tool that asks the stuck voice for a quantum with a deadline of 1 s, then the build's hash.
 const STUCK_TOOL: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
 use std::tool::drive
 
-@job
-fn main(given: take Vec<String>) -> u32 {
-    var l = drive::load("src/build", drive::cpu())
-    var lg = l.poll()
-    while lg.is_none() {
-        yield
-        lg = l.poll()
-    }
-    let Some(lp) = take lg else { return 90 }
-    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+pub fn tool() -> u32 {
+    let Ok(loaded) = drive::load("src/build", drive::cpu()).wait() else { return 91 }
     let b = loaded.build
-    var i = drive::init(b)
-    while i.poll().is_none() { yield }
-    var f = drive::frames(b, 1, std::input::Script::frames())
-    while f.poll().is_none() { yield }
-    var a = drive::audio(b, 1, timeout: 1.0)
-    var ag = a.poll()
-    while ag.is_none() {
-        yield
-        ag = a.poll()
-    }
-    let Some(ap) = take ag else { return 92 }
-    match drive::read_audio(take ap) {
+    let _ = drive::init(b).wait()
+    let _ = drive::frames(b, 1, std::input::Script::frames()).wait()
+    match drive::audio(b, 1, timeout: 1.0).wait() {
         Ok(_) => print("rendered"),
         Err(e) => print(f"refused: {e.message()}"),
     }
-    var h = drive::hash(b)
-    while h.poll().is_none() { yield }
+    let _ = drive::hash(b).wait()
     print("hashed")
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -1300,59 +967,22 @@ fn pipeline_names(dir: &Path) -> Vec<String> {
 const HANDING_TOOL: &str = r#"
 use std::input::Script
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
 use std::tool::drive
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
     var options = drive::gpu()
     options.storage = String::from("out/store")
-    var l = drive::load("src/a", options)
-    var lg = l.poll()
-    while lg.is_none() {
-        yield
-        lg = l.poll()
-    }
-    let Some(lp) = take lg else { return 90 }
-    let Ok(loaded) = drive::read_loaded(take lp) else { return 91 }
+    let Ok(loaded) = drive::load("src/a", options).wait() else { return 91 }
     let b = loaded.build
-    var i = drive::init(b)
-    while i.poll().is_none() { yield }
-    var f = drive::frames(b, 3, Script::frames())
-    var fg = f.poll()
-    while fg.is_none() {
-        yield
-        fg = f.poll()
-    }
-    let Some(fp) = take fg else { return 90 }
-    let Ok(ran) = drive::read_ran(take fp) else { return 92 }
+    let _ = drive::init(b).wait()
+    let Ok(ran) = drive::frames(b, 3, Script::frames()).wait() else { return 92 }
     if let Some(trap) = ran.trap {
         print(f"trap {trap.message.as_str()}")
     }
-    var r = drive::running(b)
-    var rg = r.poll()
-    while rg.is_none() {
-        yield
-        rg = r.poll()
-    }
-    let Some(rp) = take rg else { return 90 }
-    let Ok(at) = drive::read_running(take rp) else { return 93 }
+    let Ok(at) = drive::running(b).wait() else { return 93 }
     print(f"running {at.as_str()}")
-    var x = drive::close(b)
-    while x.poll().is_none() { yield }
+    let _ = drive::close(b).wait()
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 

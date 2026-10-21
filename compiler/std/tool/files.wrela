@@ -5,13 +5,12 @@
 // through a symbolic link either, even one put in its place after a check. A path outside the
 // roots, or a change to a root granted for reading, fails the request.
 //
-// Each function makes one request; its answer is read by `std::tool::answer` (no bytes, or a
-// file's), `read_list`, `read_entry` or `blob::read_handle`. A whole file read or written at once
-// is at most 512 KiB (`MOST_BYTES`); a larger one goes through a blob (`read_blob`, `write_blob`).
+// Each function makes one request at once and gives its `Call`. A whole file read or written at
+// once is at most 512 KiB (`MOST_BYTES`); a larger one goes through a blob (`read_blob`,
+// `write_blob`).
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{MOST_BYTES, ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed}
 use std::tool::blob::Blob
 
 /// What a path names.
@@ -39,16 +38,16 @@ fn path_body(path: str) -> Vec<u8> {
 }
 
 /// The bytes of the file at `path`, at most 512 KiB: a larger file fails the request (read it
-/// with `read_blob`). `std::tool::answer` reads the answer.
+/// with `read_blob`).
 @tool
-pub fn read(path: str) -> Pending<u8> {
+pub fn read(path: str) -> Call<Vec<u8>> {
     ask("files/read", path_body(path))
 }
 
 /// Writes `bytes` as the whole file at `path`, in a write root, making the directories it needs.
 /// The bytes are at most 512 KiB; more panics (write a blob with `write_blob`).
 @tool
-pub fn write(path: str, bytes: [u8]) -> Pending<u8> {
+pub fn write(path: str, bytes: [u8]) -> Call<Done> {
     if bytes.len() > MOST_BYTES {
         panic("files::write: more than 512 KiB at once: write a blob (`write_blob`)")
     }
@@ -59,49 +58,47 @@ pub fn write(path: str, bytes: [u8]) -> Pending<u8> {
     ask("files/write", body)
 }
 
-/// The entries of the directory at `path`, sorted by name. `read_list` reads the answer.
+/// The entries of the directory at `path`, sorted by name.
 @tool
-pub fn list(path: str) -> Pending<u8> {
+pub fn list(path: str) -> Call<Vec<Entry>> {
     ask("files/list", path_body(path))
 }
 
-/// What's at `path`: its kind and size, following a link inside the root. `read_entry` reads
-/// the answer.
+/// What's at `path`: its kind and size, following a link inside the root.
 @tool
-pub fn stat(path: str) -> Pending<u8> {
+pub fn stat(path: str) -> Call<Entry> {
     ask("files/stat", path_body(path))
 }
 
 /// Removes the file, link or empty directory at `path`, in a write root.
 @tool
-pub fn remove(path: str) -> Pending<u8> {
+pub fn remove(path: str) -> Call<Done> {
     ask("files/remove", path_body(path))
 }
 
 /// Removes the directory at `path` and everything in it, in a write root. A root itself can't be
 /// removed.
 @tool
-pub fn remove_all(path: str) -> Pending<u8> {
+pub fn remove_all(path: str) -> Call<Done> {
     ask("files/remove_all", path_body(path))
 }
 
 /// Makes the directory at `path` and those above it that aren't there, in a write root.
 @tool
-pub fn make_dirs(path: str) -> Pending<u8> {
+pub fn make_dirs(path: str) -> Call<Done> {
     ask("files/make_dirs", path_body(path))
 }
 
-/// The file at `path`, whatever its size, as a new blob (`std::tool::blob`): `blob::read_handle`
-/// reads the answer.
+/// The file at `path`, whatever its size, as a new blob (`std::tool::blob`).
 @tool
-pub fn read_blob(path: str) -> Pending<u8> {
+pub fn read_blob(path: str) -> Call<Blob> {
     ask("files/read_blob", path_body(path))
 }
 
 /// Writes the bytes of `blob` as the whole file at `path`, in a write root, making the
 /// directories it needs. The blob stays the tool's.
 @tool
-pub fn write_blob(path: str, blob: Blob) -> Pending<u8> {
+pub fn write_blob(path: str, blob: Blob) -> Call<Done> {
     var body = path_body(path)
     var w = Writer::new()
     w.write_u32(blob.id())
@@ -121,39 +118,42 @@ fn read_kind(r: mut Reader) -> Option<Kind> {
     }
 }
 
-/// Reads a `list` answer: a count, then each entry's name, its kind (a byte: file, directory,
-/// link, other) and its size (a `u64`).
-pub fn read_list(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<Entry>, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(n) = r.read_u32() else { return Err(malformed("files/list")) }
-    var out: Vec<Entry> = Vec::new()
-    for _ in 0..n {
-        let Ok(name) = r.read_string() else { return Err(malformed("files/list")) }
-        let Some(kind) = read_kind(mut r) else { return Err(malformed("files/list")) }
-        let Ok(size) = r.read_u64() else { return Err(malformed("files/list")) }
-        out.push(Entry { name, kind, size })
+/// A `list` answer: a count, then each entry's name, its kind (a byte: file, directory, link,
+/// other) and its size (a `u64`).
+impl Answer for Vec<Entry> {
+    fn read(bytes: take Vec<u8>) -> Result<Vec<Entry>, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(n) = r.read_u32() else { return Err(malformed("a list of files")) }
+        var out: Vec<Entry> = Vec::new()
+        for _ in 0..n {
+            let Ok(name) = r.read_string() else { return Err(malformed("a list of files")) }
+            let Some(kind) = read_kind(mut r) else { return Err(malformed("a list of files")) }
+            let Ok(size) = r.read_u64() else { return Err(malformed("a list of files")) }
+            out.push(Entry { name, kind, size })
+        }
+        if !r.at_end() {
+            return Err(malformed("a list of files"))
+        }
+        Ok(out)
     }
-    if !r.at_end() {
-        return Err(malformed("files/list"))
-    }
-    Ok(out)
 }
 
-/// Reads a `stat` answer: its kind (a byte) and its size (a `u64`).
-pub fn read_entry(polled: take Result<Vec<u8>, IoError>) -> Result<Entry, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Some(kind) = read_kind(mut r) else { return Err(malformed("files/stat")) }
-    let Ok(size) = r.read_u64() else { return Err(malformed("files/stat")) }
-    if !r.at_end() {
-        return Err(malformed("files/stat"))
+/// A `stat` answer: its kind (a byte) and its size (a `u64`).
+impl Answer for Entry {
+    fn read(bytes: take Vec<u8>) -> Result<Entry, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(kind) = read_kind(mut r) else { return Err(malformed("a file's kind and size")) }
+        let Ok(size) = r.read_u64() else { return Err(malformed("a file's kind and size")) }
+        if !r.at_end() {
+            return Err(malformed("a file's kind and size"))
+        }
+        Ok(Entry { name: String::new(), kind, size })
     }
-    Ok(Entry { name: String::new(), kind, size })
 }
 
 @test
 fn a_list_has_the_hosts_layout() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u32(2)
     w.write_str("a.txt")
     w.write_u8(0)
@@ -161,13 +161,11 @@ fn a_list_has_the_hosts_layout() {
     w.write_str("sub")
     w.write_u8(1)
     w.write_u64(0)
-    let Ok(list) = read_list(Ok(take w.into_bytes())) else { panic("a list") }
+    let Ok(list) = Vec::<Entry>::read(take w.into_bytes()) else { panic("a list") }
     assert(list.len() == 2 && list[0].name.as_str() == "a.txt" && list[0].size == 5)
     assert(list[0].kind == Kind::File && list[1].kind == Kind::Dir)
-    assert(read_list(Ok(Vec::from([u8(0), 1, 0, 0, 0]))).is_err(), "a short list")
-    let Ok(e) = read_entry(Ok(Vec::from([u8(0), 2, 9, 0, 0, 0, 0, 0, 0, 0]))) else {
-        panic("an entry")
-    }
+    assert(Vec::<Entry>::read(Vec::from([u8(1), 0, 0, 0])).is_err(), "a short list")
+    let Ok(e) = Entry::read(Vec::from([u8(2), 9, 0, 0, 0, 0, 0, 0, 0])) else { panic("an entry") }
     assert(e.kind == Kind::Link && e.size == 9)
 }
 

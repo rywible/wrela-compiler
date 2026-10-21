@@ -5,9 +5,8 @@
 // handles unless `wrela tool --blob-budget` says otherwise: past that, a request fails, as any
 // failed request does. `release` gives a blob back, and every blob is released when the tool ends.
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{MOST_BYTES, ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed}
 
 /// A blob the host holds: its handle, from a `new` or `files::read_blob` answer.
 pub struct Blob: Copy + Eq {
@@ -86,15 +85,15 @@ pub(package) fn read_data(r: mut Reader) -> Option<Data> {
     }
 }
 
-/// A new, empty blob: `read_handle` reads the answer.
+/// A new, empty blob.
 @tool
-pub fn new() -> Pending<u8> {
+pub fn new() -> Call<Blob> {
     ask("blob/new", [u8(0); 0])
 }
 
 /// Adds `bytes` to the end of `blob`. At most 512 KiB at once; more panics.
 @tool
-pub fn append(blob: Blob, bytes: [u8]) -> Pending<u8> {
+pub fn append(blob: Blob, bytes: [u8]) -> Call<Done> {
     if bytes.len() > MOST_BYTES {
         panic("blob::append: more than 512 KiB at once")
     }
@@ -106,9 +105,9 @@ pub fn append(blob: Blob, bytes: [u8]) -> Pending<u8> {
 }
 
 /// Up to `len` of `blob`'s bytes from byte `offset`: fewer at its end. `len` is at most 512 KiB;
-/// more panics. An offset past the end fails the request. `std::tool::answer` reads the bytes.
+/// more panics. An offset past the end fails the request.
 @tool
-pub fn read(blob: Blob, offset: u64, len: u32) -> Pending<u8> {
+pub fn read(blob: Blob, offset: u64, len: u32) -> Call<Vec<u8>> {
     if len > MOST_BYTES {
         panic("blob::read: more than 512 KiB at once")
     }
@@ -118,36 +117,40 @@ pub fn read(blob: Blob, offset: u64, len: u32) -> Pending<u8> {
     ask("blob/read", take w.into_bytes())
 }
 
-/// How many bytes `blob` holds: `read_len` reads the answer.
+/// How many bytes `blob` holds.
 @tool
-pub fn len(blob: Blob) -> Pending<u8> {
+pub fn len(blob: Blob) -> Call<u64> {
     ask("blob/len", blob_body(blob).into_bytes())
 }
 
 /// Gives `blob` back to the host, which frees its bytes: the handle names nothing after this.
 @tool
-pub fn release(blob: Blob) -> Pending<u8> {
+pub fn release(blob: Blob) -> Call<Done> {
     ask("blob/release", blob_body(blob).into_bytes())
 }
 
-/// Reads a `new` or `files::read_blob` answer: the blob's handle, a `u32`.
-pub fn read_handle(polled: take Result<Vec<u8>, IoError>) -> Result<Blob, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(id) = r.read_u32() else { return Err(malformed("blob")) }
-    if !r.at_end() {
-        return Err(malformed("blob"))
+/// A `new` or `files::read_blob` answer: the blob's handle, a `u32`.
+impl Answer for Blob {
+    fn read(bytes: take Vec<u8>) -> Result<Blob, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(id) = r.read_u32() else { return Err(malformed("a blob")) }
+        if !r.at_end() {
+            return Err(malformed("a blob"))
+        }
+        Ok(Blob { id })
     }
-    Ok(Blob { id })
 }
 
-/// Reads a `len` answer: the blob's bytes, a `u64`.
-pub fn read_len(polled: take Result<Vec<u8>, IoError>) -> Result<u64, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(n) = r.read_u64() else { return Err(malformed("blob/len")) }
-    if !r.at_end() {
-        return Err(malformed("blob/len"))
+/// Bytes or a blob, alone in an answer (`write_data`'s layout): an encoded image's, a buffer's.
+impl Answer for Data {
+    fn read(bytes: take Vec<u8>) -> Result<Data, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(data) = read_data(mut r) else { return Err(malformed("bytes or a blob")) }
+        if !r.at_end() {
+            return Err(malformed("bytes or a blob"))
+        }
+        Ok(data)
     }
-    Ok(n)
 }
 
 @test
@@ -165,10 +168,11 @@ fn data_reads_back_as_written() {
 }
 
 @test
-fn a_handle_and_a_length_read_back() {
-    let Ok(b) = read_handle(Ok(Vec::from([u8(0), 3, 0, 0, 0]))) else { panic("a handle") }
+fn a_handle_and_data_read_back() {
+    let Ok(b) = Blob::read(Vec::from([u8(3), 0, 0, 0])) else { panic("a handle") }
     assert(b.id() == 3)
-    assert(read_handle(Ok(Vec::from([u8(0), 3, 0]))).is_err(), "a short handle")
-    let Ok(n) = read_len(Ok(Vec::from([u8(0), 0, 0, 0, 0, 1, 0, 0, 0]))) else { panic("a length") }
-    assert(n == u64(4294967296))
+    assert(Blob::read(Vec::from([u8(3), 0])).is_err(), "a short handle")
+    let Ok(Data::Blob(d)) = Data::read(Vec::from([u8(1), 4, 0, 0, 0])) else { panic("data") }
+    assert(d.id() == 4)
+    assert(Data::read(Vec::from([u8(1), 4, 0, 0, 0, 9])).is_err(), "bytes left over")
 }

@@ -227,7 +227,7 @@ pub const RULES: &[(&str, &str)] = &[
     // §13.2 tests
     (
         "const.tests",
-        "a `@test` is a free function of no parameters and no result, run as constants are; a tool test is such a `@job fn`, run on the tool host",
+        "a `@test` is a free function of no parameters and no result, run as constants are; a tool test (`@test(tool)`) is one too, run on the tool host",
     ),
     // §14.2 how they're derived
     ("derive.gradient", "`gradient` of a closure or function of an `f32` or a float vector"),
@@ -238,7 +238,7 @@ pub const RULES: &[(&str, &str)] = &[
     // §15.3 client, server and tool roles
     (
         "gpu.roles",
-        "a client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool_init` and `tool`, and `@client`, `@server` and `@tool` code stays in its role",
+        "a client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool`, and `@client`, `@server` and `@tool` code stays in its role",
     ),
     // §16.3 work over several frames
     (

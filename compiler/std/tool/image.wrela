@@ -14,9 +14,8 @@
 // Covers are made as Pillow's `thumbnail` and `save(..., "WEBP")` make them: `fit` gives the
 // size within a box, `resize` resamples to it, and `encode_webp` encodes at a quality and method.
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, ToolError, ask, malformed}
 use std::tool::blob::{Data, read_data, write_data}
 
 /// An image's size in pixels.
@@ -57,17 +56,16 @@ pub fn fit(size: Size, within: Size) -> Size {
     Size { width: within.width, height: u32(max(pick, 1.0)) }
 }
 
-fn timed(service: str, w: take Writer, timeout: f64) -> Pending<u8> {
+fn timed<T: Answer>(service: str, w: take Writer, timeout: f64) -> Call<T> {
     var w = take w
     w.write_u64(bitcast_u64(timeout))
     ask(service, take w.into_bytes())
 }
 
 /// Decodes `bytes`, a PNG (its first frame, if it has several), a JPEG or a still WebP, as RGBA8:
-/// `read_image` reads the answer. Grey, indexed and 16-bit PNGs come out as RGBA8, and an image
-/// with no alpha comes out opaque.
+/// grey, indexed and 16-bit PNGs come out as RGBA8, and an image with no alpha comes out opaque.
 @tool
-pub fn decode(bytes: Data, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn decode(bytes: Data, timeout: f64 = 0.0) -> Call<Image> {
     var w = Writer::new()
     write_data(mut w, bytes)
     timed("image/decode", take w, timeout)
@@ -75,26 +73,26 @@ pub fn decode(bytes: Data, timeout: f64 = 0.0) -> Pending<u8> {
 
 /// Resizes `image` to `to` with Lanczos3, as Pillow's `Image.Resampling.LANCZOS` weighs pixels
 /// (its kernel widened by the scale when it shrinks), over premultiplied alpha, horizontally then
-/// vertically: `read_image` reads the answer.
+/// vertically.
 @tool
-pub fn resize(image: Image, to: Size, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn resize(image: Image, to: Size, timeout: f64 = 0.0) -> Call<Image> {
     var w = pixels(image)
     w.write_u32(to.width)
     w.write_u32(to.height)
     timed("image/resize", take w, timeout)
 }
 
-/// Encodes `image` as a PNG of RGBA8: `read_encoded` reads the answer.
+/// Encodes `image` as a PNG of RGBA8: the file's bytes.
 @tool
-pub fn encode_png(image: Image, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn encode_png(image: Image, timeout: f64 = 0.0) -> Call<Data> {
     timed("image/encode_png", pixels(image), timeout)
 }
 
 /// Encodes `image` (at most 16383 pixels each way) as a lossy WebP through libwebp, at `quality`
 /// (0 to 100) and `method` (0, the fastest, to 6, the smallest), with its alpha, if it has any,
-/// at quality 100: `read_encoded` reads the answer. An opaque image has no alpha in the file.
+/// at quality 100: the file's bytes. An opaque image has no alpha in the file.
 @tool
-pub fn encode_webp(image: Image, quality: f64, method: u8, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn encode_webp(image: Image, quality: f64, method: u8, timeout: f64 = 0.0) -> Call<Data> {
     var w = pixels(image)
     w.write_u64(bitcast_u64(quality))
     w.write_u8(method)
@@ -117,27 +115,19 @@ impl Image {
     }
 }
 
-/// Reads a `decode` or `resize` answer: the width and height (`u32`s), then the pixels
+/// A `decode` or `resize` answer: the width and height (`u32`s), then the pixels
 /// (`blob::Data`).
-pub fn read_image(polled: take Result<Vec<u8>, IoError>) -> Result<Image, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(width) = r.read_u32() else { return Err(malformed("image")) }
-    let Ok(height) = r.read_u32() else { return Err(malformed("image")) }
-    let Some(rgba) = read_data(mut r) else { return Err(malformed("image")) }
-    if !r.at_end() {
-        return Err(malformed("image"))
+impl Answer for Image {
+    fn read(bytes: take Vec<u8>) -> Result<Image, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(width) = r.read_u32() else { return Err(malformed("an image")) }
+        let Ok(height) = r.read_u32() else { return Err(malformed("an image")) }
+        let Some(rgba) = read_data(mut r) else { return Err(malformed("an image")) }
+        if !r.at_end() {
+            return Err(malformed("an image"))
+        }
+        Ok(Image { width, height, rgba })
     }
-    Ok(Image { width, height, rgba })
-}
-
-/// Reads an `encode_png` or `encode_webp` answer: the file's bytes (`blob::Data`).
-pub fn read_encoded(polled: take Result<Vec<u8>, IoError>) -> Result<Data, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Some(bytes) = read_data(mut r) else { return Err(malformed("image/encode")) }
-    if !r.at_end() {
-        return Err(malformed("image/encode"))
-    }
-    Ok(bytes)
 }
 
 @test
@@ -161,18 +151,13 @@ fn an_image_fits_its_box_as_pillows_thumbnail_does() {
 @test
 fn an_image_answer_reads_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u32(3)
     w.write_u32(2)
     w.write_u8(1)
     w.write_u32(9)
-    let Ok(image) = read_image(Ok(take w.into_bytes())) else { panic("an image") }
+    let Ok(image) = Image::read(take w.into_bytes()) else { panic("an image") }
     assert(image.width == 3 && image.height == 2)
     let Data::Blob(b) = image.rgba else { panic("a blob") }
     assert(b.id() == 9)
-    assert(read_image(Ok(Vec::from([u8(0), 3, 0, 0, 0]))).is_err(), "a short answer")
-    let Ok(Data::Blob(e)) = read_encoded(Ok(Vec::from([u8(0), 1, 4, 0, 0, 0]))) else {
-        panic("encoded bytes")
-    }
-    assert(e.id() == 4)
+    assert(Image::read(Vec::from([u8(3), 0, 0, 0])).is_err(), "a short answer")
 }

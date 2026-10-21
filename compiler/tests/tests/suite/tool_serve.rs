@@ -29,8 +29,7 @@ use wrela_host::tool::{BlobBudget, Caps, End, Ended, Grants, Testing};
 /// Its posts each wait at most 0.3 s for an answer (600 s for `end`).
 const SERVE_TOOL: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args}
+use std::tool::args
 use std::tool::blob
 use std::tool::blob::Data
 use std::tool::serve
@@ -44,8 +43,8 @@ fn utf8(text: str) -> Vec<u8> {
     out
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
     let root = given[1].clone()
     var port = u32(0)
@@ -55,57 +54,34 @@ fn main(given: take Vec<String>) -> u32 {
     }
     // Long enough, for `end`, that a post is still waiting when the tool ends.
     let post_timeout = if what.as_str() == "end" { 600.0 } else { 0.3 }
-    var s = serve::start(root.as_str(), u16(port), post_timeout)
+    let s = serve::start(root.as_str(), u16(port), post_timeout)
     if what.as_str() == "unread" {
-        var t = time::after(600.0)
-        while t.poll().is_none() { yield }
+        let _ = time::after(600.0).wait()
         return 0
     }
-    var sg = s.poll()
-    while sg.is_none() {
-        yield
-        sg = s.poll()
-    }
-    let Some(sp) = take sg else { return 90 }
-    let started = match serve::read_started(take sp) {
+    let started = match take s.wait() {
         Ok(x) => take x,
         Err(e) => {
             print(f"error: {e.message()}")
             // Until the test, having seen the failed start's server gone, interrupts it.
-            var t = time::after(600.0)
-            while t.poll().is_none() { yield }
+            let _ = time::after(600.0).wait()
             return 1
         },
     }
     print(f"serving {started.origin.as_str()}")
     if what.as_str() == "end" {
-        var t = time::after(600.0)
-        while t.poll().is_none() { yield }
+        let _ = time::after(600.0).wait()
         return 0
     }
     if what.as_str() == "nothing" {
-        var n = serve::next_post(started.server, 0.2)
-        var ng = n.poll()
-        while ng.is_none() {
-            yield
-            ng = n.poll()
-        }
-        let Some(np) = take ng else { return 90 }
-        match serve::read_post(take np) {
+        match serve::next_post(started.server, 0.2).wait() {
             Ok(_) => print("a post"),
             Err(e) => print(f"no post: {e.message()}"),
         }
         return 0
     }
     while true {
-        var n = serve::next_post(started.server)
-        var ng = n.poll()
-        while ng.is_none() {
-            yield
-            ng = n.poll()
-        }
-        let Some(np) = take ng else { return 90 }
-        let post = match serve::read_post(take np) {
+        let post = match serve::next_post(started.server).wait() {
             Ok(p) => take p,
             Err(e) => {
                 print(f"next_post: {e.message()}")
@@ -123,27 +99,13 @@ fn main(given: take Vec<String>) -> u32 {
         match post.body.clone() {
             Data::Bytes(b) => size = f"{b.len()} bytes",
             Data::Blob(b) => {
-                var l = blob::len(b)
-                var lg = l.poll()
-                while lg.is_none() {
-                    yield
-                    lg = l.poll()
-                }
-                let Some(lp) = take lg else { return 90 }
-                let Ok(n) = blob::read_len(take lp) else { return 91 }
+                let Ok(n) = blob::len(b).wait() else { return 91 }
                 size = f"a blob of {n} bytes"
             },
         }
         let quit = post.path.as_str() == "/quit"
         let reply = if quit { String::from("bye") } else { f"{post.path.as_str()}: {size.as_str()}" }
-        var a = serve::answer(started.server, post.id, Data::Bytes(utf8(reply.as_str())))
-        var ag = a.poll()
-        while ag.is_none() {
-            yield
-            ag = a.poll()
-        }
-        let Some(ap) = take ag else { return 90 }
-        if let Err(e) = answer(take ap) {
+        if let Err(e) = serve::answer(started.server, post.id, Data::Bytes(utf8(reply.as_str()))).wait() {
             print(f"answer: {e.message()}")
             return 4
         }
@@ -152,17 +114,6 @@ fn main(given: take Vec<String>) -> u32 {
         }
     }
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 

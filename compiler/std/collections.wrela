@@ -988,3 +988,16 @@ fn a_run_says_whether_it_is_empty() {
 fn run_is_empty(xs: [u32]) -> bool {
     xs.is_empty()
 }
+
+impl Vec<u8> {
+    /// For `std::tool`: the `bytes` bytes of tool request `request`'s answer, which the host
+    /// then forgets.
+    pub(package) fn from_tool_answer(request: u32, bytes: u32) -> Vec<u8> {
+        var v: Vec<u8> = Vec::with_capacity(max(bytes, 1))
+        unsafe {
+            std::mem::tool_take(request, v.data)
+        }
+        v.len = bytes
+        v
+    }
+}

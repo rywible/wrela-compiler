@@ -1,7 +1,8 @@
 // A `@job fn` that can't be a job, or a job used as a function. A job runs over several frames
 // (§16.3): it's started (`f.start(...)`, with its `take` parameters) and resumed
 // (`job.resume(...)`, with its `borrow` and `mut` ones), never called or passed. It's a free
-// function: not a method, not an entry point, and it returns what it owns.
+// function: not a method, not an entry point, not a test (a tool test waits on its calls
+// instead), and it returns what it owns.
 // ---- wrong
 @job
 fn count(n: take u32) -> u32 {

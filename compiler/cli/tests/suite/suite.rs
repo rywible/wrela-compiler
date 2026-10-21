@@ -11,12 +11,8 @@ const TOOLED: &str = r#"pub fn tool() -> u32 {
 }
 
 @test(tool)
-@job
 fn waits_a_minute_of_fake_time() {
-    var t = std::tool::time::after(60.0)
-    while t.poll().is_none() {
-        yield
-    }
+    let _ = std::tool::time::after(60.0).wait()
 }
 "#;
 
@@ -289,7 +285,6 @@ fn a_failing_tests_lines_are_in_its_report_once() {
 }
 
 @test(tool)
-@job
 fn prints_then_fails() {
     std::io::print("tool-marker-5c1e")
     panic("the tool test fails")

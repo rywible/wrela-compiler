@@ -13,9 +13,8 @@
 // with the request's working directory as its one write root, under the same name. A tool test
 // fakes its programs this way (§13.2).
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, ToolError, ask, malformed}
 use std::tool::blob::{Data, read_data, write_data}
 
 /// An environment variable a program gets: its name and value.
@@ -58,10 +57,9 @@ pub struct Ran: Clone {
     pub stderr: Data,
 }
 
-/// Runs `command`: `read_ran` reads the answer. Standard input of bytes over 512 KiB panics:
-/// give it as a blob.
+/// Runs `command`. Standard input of bytes over 512 KiB panics: give it as a blob.
 @tool
-pub fn run(command: Command) -> Pending<u8> {
+pub fn run(command: Command) -> Call<Ran> {
     var w = Writer::new()
     w.write_str(command.program.as_str())
     w.write_u32(command.args.len())
@@ -83,27 +81,28 @@ pub fn run(command: Command) -> Pending<u8> {
     ask("run/run", take w.into_bytes())
 }
 
-/// Reads a `run` answer: the status (an `i32`'s bits), then the standard output and error
+/// A `run` answer: the status (an `i32`'s bits), then the standard output and error
 /// (`blob::Data`).
-pub fn read_ran(polled: take Result<Vec<u8>, IoError>) -> Result<Ran, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(status) = r.read_u32() else { return Err(malformed("run/run")) }
-    let Some(stdout) = read_data(mut r) else { return Err(malformed("run/run")) }
-    let Some(stderr) = read_data(mut r) else { return Err(malformed("run/run")) }
-    if !r.at_end() {
-        return Err(malformed("run/run"))
+impl Answer for Ran {
+    fn read(bytes: take Vec<u8>) -> Result<Ran, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(status) = r.read_u32() else { return Err(malformed("a program's run")) }
+        let Some(stdout) = read_data(mut r) else { return Err(malformed("a program's run")) }
+        let Some(stderr) = read_data(mut r) else { return Err(malformed("a program's run")) }
+        if !r.at_end() {
+            return Err(malformed("a program's run"))
+        }
+        Ok(Ran { status: i32(status), stdout, stderr })
     }
-    Ok(Ran { status: i32(status), stdout, stderr })
 }
 
 @test
 fn a_ran_reads_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u32(4294967287)
     write_data(mut w, Data::Bytes(Vec::from([u8(104), 105])))
     write_data(mut w, Data::empty())
-    let Ok(ran) = read_ran(Ok(take w.into_bytes())) else { panic("a ran") }
+    let Ok(ran) = Ran::read(take w.into_bytes()) else { panic("a ran") }
     assert(ran.status == -9, "minus the signal")
     let Data::Bytes(out) = ran.stdout else { panic("bytes") }
     assert(out.len() == 2 && out[0] == 104)

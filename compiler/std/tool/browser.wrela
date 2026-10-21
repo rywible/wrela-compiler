@@ -35,9 +35,8 @@
 
 use std::fmt::{json_number, json_text}
 use std::input::{Key, Mods}
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, Done, ToolError, ask, malformed}
 use std::tool::blob::{Data, read_data}
 
 /// How a text is matched: exactly, by its start, by its end, or by a part of it.
@@ -384,10 +383,10 @@ fn handle_body(b: Browser) -> Writer {
     w
 }
 
-/// Opens `url` in a browser of its own, its viewport `width` × `height`: `read_opened` reads
-/// the answer. It fails if the browser offers no hardware WebGPU adapter.
+/// Opens `url` in a browser of its own, its viewport `width` × `height`. It fails if the browser
+/// offers no hardware WebGPU adapter.
 @tool
-pub fn open(url: str, width: u32 = 1280, height: u32 = 720, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn open(url: str, width: u32 = 1280, height: u32 = 720, timeout: f64 = 0.0) -> Call<Browser> {
     var w = Writer::new()
     w.write_str(url)
     w.write_u32(width)
@@ -396,10 +395,10 @@ pub fn open(url: str, width: u32 = 1280, height: u32 = 720, timeout: f64 = 0.0) 
     ask("browser/open", take w.into_bytes())
 }
 
-/// Runs `script`'s steps on `b`'s page, in order: `std::tool::answer` reads the answer, which
-/// fails with the step that failed, and what the page had.
+/// Runs `script`'s steps on `b`'s page, in order: the request fails with the step that failed,
+/// and what the page had.
 @tool
-pub fn run(b: Browser, script: Script, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn run(b: Browser, script: Script, timeout: f64 = 0.0) -> Call<Done> {
     var w = handle_body(b)
     w.write_str(script.as_json())
     timeout_of(mut w, timeout)
@@ -413,174 +412,126 @@ fn observe(b: Browser, kind: u8, timeout: f64) -> Writer {
     w
 }
 
-/// The page's title: `read_text` reads the answer.
+/// The page's title.
 @tool
-pub fn title(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn title(b: Browser, timeout: f64 = 0.0) -> Call<String> {
     ask("browser/observe", observe(b, 0, timeout).into_bytes())
 }
 
-/// The page's location, its whole URL: `read_text` reads the answer.
+/// The page's location, its whole URL.
 @tool
-pub fn location(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn location(b: Browser, timeout: f64 = 0.0) -> Call<String> {
     ask("browser/observe", observe(b, 1, timeout).into_bytes())
 }
 
-/// What the clipboard holds, as the page reads it (it needs the permission and the focus):
-/// `read_text` reads the answer.
+/// What the clipboard holds, as the page reads it (it needs the permission and the focus).
 @tool
-pub fn clipboard(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn clipboard(b: Browser, timeout: f64 = 0.0) -> Call<String> {
     ask("browser/observe", observe(b, 2, timeout).into_bytes())
 }
 
-/// How many elements match `on`: `read_count` reads the answer.
+/// How many elements match `on`.
 @tool
-pub fn count(b: Browser, on: Element, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn count(b: Browser, on: Element, timeout: f64 = 0.0) -> Call<u32> {
     var w = observe(b, 3, timeout)
     on.write(mut w)
     ask("browser/observe", take w.into_bytes())
 }
 
-/// The texts of the elements `selector` matches, in document order: `read_texts` reads the
-/// answer.
+/// The texts of the elements `selector` matches, in document order.
 @tool
-pub fn texts(b: Browser, selector: str, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn texts(b: Browser, selector: str, timeout: f64 = 0.0) -> Call<Vec<String>> {
     var w = observe(b, 4, timeout)
     w.write_str(selector)
     ask("browser/observe", take w.into_bytes())
 }
 
-/// The attribute `name` of the element `on`, if it's there and has it: `read_attribute` reads
-/// the answer.
+/// The attribute `name` of the element `on`, if it's there and has it.
 @tool
-pub fn attribute(b: Browser, on: Element, name: str, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn attribute(b: Browser, on: Element, name: str, timeout: f64 = 0.0) -> Call<Option<String>> {
     var w = observe(b, 5, timeout)
     on.write(mut w)
     w.write_str(name)
     ask("browser/observe", take w.into_bytes())
 }
 
-/// The element with the focus, if one has it: `read_active` reads the answer.
+/// The element with the focus, if one has it.
 @tool
-pub fn active(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn active(b: Browser, timeout: f64 = 0.0) -> Call<Option<Focused>> {
     ask("browser/observe", observe(b, 6, timeout).into_bytes())
 }
 
 /// Every console line of the page and its workers so far, the host's notes of what it refused
-/// among them: `read_texts` reads the answer.
+/// among them.
 @tool
-pub fn console(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn console(b: Browser, timeout: f64 = 0.0) -> Call<Vec<String>> {
     ask("browser/observe", observe(b, 7, timeout).into_bytes())
 }
 
 /// What the page's server has kept of its `results/DONE` since the page opened (test mode's
-/// result: `ok`, or why it failed), if it has: `read_attribute` reads the answer.
+/// result: `ok`, or why it failed), if it has.
 @tool
-pub fn results(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn results(b: Browser, timeout: f64 = 0.0) -> Call<Option<String>> {
     ask("browser/observe", observe(b, 8, timeout).into_bytes())
 }
 
-/// The page's screen, the viewport at its size, as a PNG: `read_capture` reads the answer. The
-/// host reserves the blob's most bytes in the budget before it asks for the screen.
+/// The page's screen, the viewport at its size, as a PNG. The host reserves the blob's most
+/// bytes in the budget before it asks for the screen.
 @tool
-pub fn capture(b: Browser, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn capture(b: Browser, timeout: f64 = 0.0) -> Call<Capture> {
     var w = handle_body(b)
     timeout_of(mut w, timeout)
     ask("browser/capture", take w.into_bytes())
 }
 
-/// Closes `b`: its page, and the browser's process group and profile. `std::tool::answer`
-/// reads the answer.
+/// Closes `b`: its page, and the browser's process group and profile.
 @tool
-pub fn close(b: Browser) -> Pending<u8> {
+pub fn close(b: Browser) -> Call<Done> {
     ask("browser/close", handle_body(b).into_bytes())
 }
 
-/// Reads an `open` answer: the handle (a `u32`).
-pub fn read_opened(polled: take Result<Vec<u8>, IoError>) -> Result<Browser, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(id) = r.read_u32() else { return Err(malformed("browser/open")) }
-    if !r.at_end() {
-        return Err(malformed("browser/open"))
+/// An `open` answer: the handle (a `u32`).
+impl Answer for Browser {
+    fn read(bytes: take Vec<u8>) -> Result<Browser, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(id) = r.read_u32() else { return Err(malformed("a browser")) }
+        if !r.at_end() {
+            return Err(malformed("a browser"))
+        }
+        Ok(Browser { id })
     }
-    Ok(Browser { id })
 }
 
-/// Reads a text an observation gives (`title`, `location`, `clipboard`).
-pub fn read_text(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
-    if !r.at_end() {
-        return Err(malformed("browser/observe"))
+/// An `active` answer: 0, or 1, the tag and the id.
+impl Answer for Option<Focused> {
+    fn read(bytes: take Vec<u8>) -> Result<Option<Focused>, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(there) = r.read_u8() else { return Err(malformed("the focus")) }
+        var out: Option<Focused> = None
+        if there == 1 {
+            let Ok(tag) = r.read_string() else { return Err(malformed("the focus")) }
+            let Ok(id) = r.read_string() else { return Err(malformed("the focus")) }
+            out = Some(Focused { tag, id })
+        }
+        if !r.at_end() || there > 1 {
+            return Err(malformed("the focus"))
+        }
+        Ok(out)
     }
-    Ok(t)
 }
 
-/// Reads texts an observation gives (`texts`, `console`): a count, then each.
-pub fn read_texts(polled: take Result<Vec<u8>, IoError>) -> Result<Vec<String>, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(n) = r.read_u32() else { return Err(malformed("browser/observe")) }
-    var out: Vec<String> = Vec::new()
-    for _ in 0..n {
-        let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
-        out.push(take t)
+/// A `capture` answer: the width and height (`u32`s), then the PNG (`blob::Data`).
+impl Answer for Capture {
+    fn read(bytes: take Vec<u8>) -> Result<Capture, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(width) = r.read_u32() else { return Err(malformed("a browser's screen")) }
+        let Ok(height) = r.read_u32() else { return Err(malformed("a browser's screen")) }
+        let Some(png) = read_data(mut r) else { return Err(malformed("a browser's screen")) }
+        if !r.at_end() {
+            return Err(malformed("a browser's screen"))
+        }
+        Ok(Capture { width, height, png })
     }
-    if !r.at_end() {
-        return Err(malformed("browser/observe"))
-    }
-    Ok(out)
-}
-
-/// Reads a `count` answer.
-pub fn read_count(polled: take Result<Vec<u8>, IoError>) -> Result<u32, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(n) = r.read_u32() else { return Err(malformed("browser/observe")) }
-    if !r.at_end() {
-        return Err(malformed("browser/observe"))
-    }
-    Ok(n)
-}
-
-/// Reads a text that may not be there (`attribute`, `results`): 0, or 1 and the text.
-pub fn read_attribute(polled: take Result<Vec<u8>, IoError>) -> Result<Option<String>, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(there) = r.read_u8() else { return Err(malformed("browser/observe")) }
-    var out: Option<String> = None
-    if there == 1 {
-        let Ok(t) = r.read_string() else { return Err(malformed("browser/observe")) }
-        out = Some(take t)
-    }
-    if !r.at_end() || there > 1 {
-        return Err(malformed("browser/observe"))
-    }
-    Ok(out)
-}
-
-/// Reads an `active` answer: 0, or 1, the tag and the id.
-pub fn read_active(polled: take Result<Vec<u8>, IoError>) -> Result<Option<Focused>, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(there) = r.read_u8() else { return Err(malformed("browser/observe")) }
-    var out: Option<Focused> = None
-    if there == 1 {
-        let Ok(tag) = r.read_string() else { return Err(malformed("browser/observe")) }
-        let Ok(id) = r.read_string() else { return Err(malformed("browser/observe")) }
-        out = Some(Focused { tag, id })
-    }
-    if !r.at_end() || there > 1 {
-        return Err(malformed("browser/observe"))
-    }
-    Ok(out)
-}
-
-/// Reads a `capture` answer: the width and height (`u32`s), then the PNG (`blob::Data`).
-pub fn read_capture(polled: take Result<Vec<u8>, IoError>) -> Result<Capture, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(width) = r.read_u32() else { return Err(malformed("browser/capture")) }
-    let Ok(height) = r.read_u32() else { return Err(malformed("browser/capture")) }
-    let Some(png) = read_data(mut r) else { return Err(malformed("browser/capture")) }
-    if !r.at_end() {
-        return Err(malformed("browser/capture"))
-    }
-    Ok(Capture { width, height, png })
 }
 
 @test
@@ -612,20 +563,14 @@ fn a_match_compares_as_it_says() {
 @test
 fn observations_read_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u8(1)
     w.write_str("input")
     w.write_str("name")
-    let Ok(Some(f)) = read_active(Ok(take w.into_bytes())) else { panic("focused") }
+    let Ok(Some(f)) = Option::<Focused>::read(take w.into_bytes()) else { panic("focused") }
     assert(f.tag.as_str() == "input" && f.id.as_str() == "name")
-    var t = Writer::new()
-    t.write_u8(0)
-    t.write_u32(2)
-    t.write_str("a")
-    t.write_str("b")
-    let Ok(texts) = read_texts(Ok(take t.into_bytes())) else { panic("texts") }
-    assert(texts.len() == 2 && texts[1].as_str() == "b")
-    let Ok(none) = read_attribute(Ok(Vec::from([u8(0), 0]))) else { panic("no attribute") }
+    let Ok(none) = Option::<Focused>::read(Vec::from([u8(0)])) else { panic("no focus") }
     assert(none.is_none())
-    assert(read_count(Ok(Vec::from([u8(0), 5]))).is_err(), "a short count")
+    assert(Option::<Focused>::read(Vec::from([u8(2)])).is_err(), "a bad flag")
+    let Ok(b) = Browser::read(Vec::from([u8(5), 0, 0, 0])) else { panic("a browser") }
+    assert(b.id == 5)
 }

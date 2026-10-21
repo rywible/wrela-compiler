@@ -11,12 +11,12 @@
 // a connection reset does (`http::is_transport`), and the ones after answer as set. `Clear`
 // takes back all that was set.
 //
-// The fake clock moves only when every request the test waits on is answered by the clock
-// (timers, delayed fakes): then it jumps to the soonest. `utc_now` reads it.
+// The fake clock moves only when every thread of the test waits, on requests the clock answers
+// (timers, delayed fakes) or on tasks that wait so: then it jumps to the soonest. `utc_now`
+// reads it.
 
-use std::io::Pending
 use std::serialize::Writer
-use std::tool::ask
+use std::tool::{Call, Done, ask}
 use std::tool::time::Utc
 
 /// A fake for a fake site's URL.
@@ -35,9 +35,9 @@ pub enum Fake: Clone {
     Fail(u32),
 }
 
-/// Sets `fake` for the URL `url`. `std::tool::answer` reads the answer.
+/// Sets `fake` for the URL `url`.
 @tool
-pub fn fake(url: str, fake: Fake) -> Pending<u8> {
+pub fn fake(url: str, fake: Fake) -> Call<Done> {
     var w = Writer::new()
     w.write_str(url)
     match fake {
@@ -68,7 +68,7 @@ pub fn fake(url: str, fake: Fake) -> Pending<u8> {
 /// Sets the fake clock's date to `now`: `time::utc_now` reads it from here on, moved on as the
 /// fake clock moves.
 @tool
-pub fn set_utc(now: Utc) -> Pending<u8> {
+pub fn set_utc(now: Utc) -> Call<Done> {
     var w = Writer::new()
     w.write_u64(now.seconds)
     w.write_u32(now.nanos)

@@ -1,55 +1,59 @@
 //! The tool host: the native host's tool profile (language.md §15.5), which runs a tool build,
-//! `tool/tool.wasm`. It calls `tool_init` once, then `tool`, then `tool` again each time at least
-//! one of the tool's outstanding requests is answered, until `tool` returns an exit status
-//! instead of `std::tool::RUNNING`. A tool that returns `RUNNING` with nothing outstanding waits
-//! on nothing, and the host stops it (exit status 70) rather than spin.
+//! `tool/tool.wasm`. It calls `tool` once, on the tool's thread; its result is the exit status.
+//! The tool waits for its requests in the host: `tool_request` makes one at once (the host
+//! numbers it and hands it to its service's work), `tool_wait` and `tool_any` block the calling
+//! thread until an answer comes, and `tool_take` copies it ([`hub`]).
 //!
 //! A tool has no GPU, no ticker and no voice; its memory may grow to 4 GiB, and no call has a
 //! deadline of its own (a tool may compute for minutes between requests). A run as a whole may
-//! have one (`--timeout`), and an interrupt (Ctrl-C) stops it, inside a call too.
+//! have one (`--timeout`), and an interrupt (Ctrl-C) stops it, inside a call too: a thread that
+//! computes is stopped by the engine's epoch, and one that waits in the host wakes at least every
+//! 10 ms to look ([`hub::Hub::block`]).
 //!
-//! **A tool has helpers** for `std::par`'s work ([`Options::workers`], language.md §16.1), as a
-//! client build does: its memory is shared, and each helper is an instance of the module on it,
-//! on a thread of its own (`crate::program`'s helpers). They are the run's: the interrupt, the
-//! timeout and the end of the run stop their calls as they stop the tool's own (the first thread
-//! that sees a reason latches the stop for every other), a helper's trap ends the call that
-//! waits for its work, with its message, and the run's end shuts them down within the grace,
-//! else the run is the host's failure.
+//! **A tool has helpers** for `std::par`'s work and its own tasks (`std::tool::spawn`,
+//! [`Options::workers`], language.md §16.1, §16.2): its memory is shared, and each helper is an
+//! instance of the module on it, on a thread of its own, with the tool's host functions, so a
+//! task's waits block only its own thread. They are the run's: the interrupt, the timeout and the
+//! end of the run stop their calls and waits as they stop the tool's own (the first thread that
+//! sees a reason latches the stop for every other), a helper's trap ends the run with its message
+//! (status 70), and the run's end shuts them down within the grace, else the run is the host's
+//! failure.
 //!
-//! **Services run beside the tool.** A call never waits on one: the requests a call makes are
-//! carried out after it returns, on the host's worker threads (files, blobs, HTTP, programs, the
-//! toolchain, driven builds, images, servers) or by the host's own loop (timers, the date, a
-//! served post's wait, which the server answers when a post comes), and each answer reaches the
-//! tool no sooner than its next call. Every service is given one capability context ([`Caps`]), made from the
-//! command line's grants, and reaches files, secrets, hosts and programs through it alone.
+//! **Services run beside the tool.** The requests are carried out on the host's worker threads
+//! (files, blobs, HTTP, programs, the toolchain, driven builds, images, servers) or by the host
+//! itself (timers, the date, a served post's wait, which the server answers when a post comes),
+//! and each answer wakes the threads that wait. Every service is given one capability context
+//! ([`Caps`]), made from the command line's grants, and reaches files, secrets, hosts and programs
+//! through it alone.
 //!
 //! **A tool test's clock is fake** ([`Options::fake_clock`], language.md §13.2). It moves only
 //! when every outstanding request is one the clock answers (a timer, or a fake site's answer
-//! held for its delay), or one that waits on an event no tool test makes (a served post): then
-//! it jumps to the soonest. While a worker has a request, it waits.
+//! held for its delay), or one that waits on an event no tool test makes (a served post), and
+//! every thread of the tool waits ([`hub`]'s rule): then it jumps to the soonest. While a worker
+//! has a request, it waits.
 //!
 //! **Printing never waits.** A line the tool prints goes on a bounded queue, and a thread of the
 //! host's own hands it to the [`Printer`]; a full queue drops the line and counts it. So a
 //! console nobody reads can't hold a call where the clock thread can't stop it.
 //!
 //! **Every end is clean.** However the tool ends (its exit status, a trap, `--timeout`, an
-//! interrupt, waiting on nothing), the host stops its workers (work not started is dropped,
-//! work in progress gets a bounded grace), stops the clock thread that interrupts calls, and
-//! releases every blob, those of requests the tool never read first ([`Ended`] says what was
-//! left). A worker running a program kills its process group as it sees the end, one
-//! waiting for an HTTP response shuts its connection down and joins the client's thread, one
-//! waiting for the toolchain or an image cancels its work, and every driven build's calls are
-//! stopped and every browser's connection closed, then each build, each server and each browser
-//! (its process group and its profile) is closed, with the same grace (a server's listener
-//! and connections are shut and its threads joined, so its port is closed when the run
-//! returns); then the directory the run's programs had is removed. No file work holds the blob
-//! table's lock, so a stuck worker can't hold up the release. A worker, a driven build or a
-//! server's thread still running after the grace makes the end the host's
-//! failure (status 71), whatever the tool's own end was, and `wrela tool` then ends the process,
-//! so no worker outlives it. Work found stuck while the tool runs gives the tool one grace to
-//! read the request that failed and end on its own ([`services::Stuck`]), so what it says comes
-//! before the host's message. The host keeps no compiled code: it compiles the tool's WASM, and a
-//! driven build's, for each run, so nothing it loads comes from a directory a tool could write.
+//! interrupt), the host stops its workers (work not started is dropped, work in progress gets a
+//! bounded grace), stops the clock thread that interrupts calls, and releases every blob, those
+//! of requests the tool never read first ([`Ended`] says what was left). A worker running a
+//! program kills its process group as it sees the end, one waiting for an HTTP response shuts
+//! its connection down and joins the client's thread, one waiting for the toolchain or an image
+//! cancels its work, and every driven build's calls are stopped and every browser's connection
+//! closed, then each build, each server and each browser (its process group and its profile) is
+//! closed, with the same grace (a server's listener and connections are shut and its threads
+//! joined, so its port is closed when the run returns); then the directory the run's programs
+//! had is removed. No file work holds the blob table's lock, so a stuck worker can't hold up the
+//! release. A worker, a driven build or a server's thread still running after the grace makes
+//! the end the host's failure (status 71), whatever the tool's own end was, and `wrela tool`
+//! then ends the process, so no worker outlives it. Work found stuck while the tool runs gives
+//! the tool one grace to read the request that failed and end on its own ([`services::Stuck`]),
+//! so what it says comes before the host's message. The host keeps no compiled code: it
+//! compiles the tool's WASM, and a driven build's, for each run, so nothing it loads comes from
+//! a directory a tool could write.
 
 mod blobs;
 mod browser;
@@ -57,6 +61,7 @@ mod caps;
 mod console;
 mod drive;
 mod http;
+mod hub;
 mod image;
 mod run;
 mod serve;
@@ -69,28 +74,26 @@ pub use run::{GROUPS_ENV, launch};
 pub use toolchain::Toolchain;
 
 use console::Console;
+use hub::{Hub, Thread};
 use services::{Answer, Services, Task, Work};
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use wasmtime::{Caller, Config, Engine, Linker, Module, SharedMemory, Store, UpdateDeadline};
-use wrela_abi::memory::{MAX_WORKERS, TOOL_MAX_PAGES};
-use wrela_abi::stream::{self, Command};
+use wrela_abi::memory::{MAX_WORKERS, THREAD_HELPER0, THREAD_MAIN, TOOL_MAX_PAGES};
+use wrela_abi::stream;
 use wrela_abi::{
-    EXPORT_MEMORY, EXPORT_TOOL, EXPORT_TOOL_INIT, IMPORT_CLOCK, IMPORT_KEEP, IMPORT_KEPT,
+    EXPORT_MEMORY, EXPORT_TOOL, EXPORT_TOOL_WORKER, IMPORT_CLOCK, IMPORT_KEEP, IMPORT_KEPT,
     IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT, IMPORT_REQUEST_STATUS,
-    IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, TOOL_RUNNING,
+    IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TOOL_ACTIVE, IMPORT_TOOL_ANY, IMPORT_TOOL_DONE,
+    IMPORT_TOOL_IDLE, IMPORT_TOOL_JOIN, IMPORT_TOOL_REQUEST, IMPORT_TOOL_TAKE, IMPORT_TOOL_WAIT,
 };
 
 /// How often the run's clock thread ticks: how soon an interrupt or `--timeout` stops a call.
 const EPOCH: Duration = Duration::from_millis(10);
-
-/// How often the host's loop looks for an interrupt while it waits for answers.
-const WAKE: Duration = Duration::from_millis(20);
 
 /// The worker threads that carry out files and blobs, those that wait on the network and on
 /// programs, those that wait on the compiler and images, and those that run driven builds' work:
@@ -138,8 +141,8 @@ pub struct Options {
     /// Where the tool's `print` lines go, from a thread of the host's own: the tool never waits
     /// on it.
     pub print: Printer,
-    /// The exports the host calls: `tool_init` and `tool`, or a tool test's (§13.2).
-    pub entries: (String, String),
+    /// The export the host calls: `tool`, or a tool test's (§13.2).
+    pub entry: String,
     /// A tool test's fake clock, from this date (seconds and nanoseconds since 1970): timers
     /// fire, in the order of their deadlines, as soon as the tool waits on nothing else, and
     /// `std::tool::testing` sets fakes. `None`: the system's clock, and no fakes.
@@ -168,7 +171,8 @@ pub struct Options {
 /// and one that fails part way (each chosen by its path's end, or `#n` for a request's `n`th
 /// write), a server's start that fails once it
 /// listens, image work that holds a while, seeing no cancel, a [`Signal`] of the moments a
-/// test waits for, and helpers slow to start.
+/// test waits for, helpers slow to start, a helper that can't start, and a pause between
+/// `any`'s check of its requests and its wait.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct Testing {
@@ -185,6 +189,10 @@ pub struct Testing {
     pub signal: Option<Signal>,
     /// How long each helper waits before it starts running work.
     pub helper_delay: Duration,
+    /// The helper, by its index, whose thread fails to start.
+    pub fail_helper: Option<u32>,
+    /// How long `tool_any` waits between checking its requests and blocking.
+    pub any_pause: Duration,
 }
 
 /// What a test is told as the host reaches a moment it waits for, so it acts then rather than
@@ -218,6 +226,8 @@ impl Default for Testing {
             image_stall: Duration::ZERO,
             signal: None,
             helper_delay: Duration::ZERO,
+            fail_helper: None,
+            any_pause: Duration::ZERO,
         }
     }
 }
@@ -234,7 +244,7 @@ impl Options {
             blob_budget: BlobBudget::default(),
             interrupt: None,
             print: Arc::new(|line| println!("{line}")),
-            entries: (EXPORT_TOOL_INIT.to_string(), EXPORT_TOOL.to_string()),
+            entry: EXPORT_TOOL.to_string(),
             fake_clock: None,
             real_clock: false,
             groups: None,
@@ -250,9 +260,10 @@ impl Options {
 pub enum End {
     /// `tool` returned this exit status.
     Exit(u8),
-    /// `tool` returned `RUNNING` with no request outstanding.
+    /// The tool waited on nothing: on no request, or on one it had made no wait for (already
+    /// taken, or never made).
     WaitsOnNothing,
-    /// `tool` returned a number that's neither `RUNNING` nor an exit status.
+    /// `tool` returned a number that isn't an exit status.
     BadStatus(u32),
     /// The tool trapped, with its panic's message if it panicked.
     Trap(String),
@@ -266,8 +277,8 @@ pub enum End {
 
 impl End {
     /// The process's exit status for this end: the tool's own, 70 for the tool's failure (a
-    /// trap, waiting on nothing, a status out of range), 71 for the host's, 124 past the
-    /// timeout, 130 interrupted.
+    /// trap, a helper's among them, waiting on nothing, a status out of range), 71 for the
+    /// host's, 124 past the timeout, 130 interrupted.
     pub fn status(&self) -> u8 {
         match self {
             End::Exit(n) => *n,
@@ -284,12 +295,11 @@ impl std::fmt::Display for End {
         match self {
             End::Exit(n) => write!(f, "the tool exited with status {n}"),
             End::WaitsOnNothing => f.write_str(
-                "the tool waits on nothing: `tool` returned RUNNING with no request outstanding",
+                "the tool waits on nothing: on no request, or on one that isn't outstanding",
             ),
-            End::BadStatus(n) => write!(
-                f,
-                "`tool` returned {n}, which is neither RUNNING nor an exit status (0 to 255)"
-            ),
+            End::BadStatus(n) => {
+                write!(f, "`tool` returned {n}, which isn't an exit status (0 to 255)")
+            }
             End::Trap(why) => write!(f, "the tool trapped: {why}"),
             End::Timeout => f.write_str("the tool ran past its timeout"),
             End::Interrupted => f.write_str("the tool was interrupted"),
@@ -334,27 +344,6 @@ impl ToolBuild {
     }
 }
 
-/// The tool's part of the host, in its store.
-struct ToolState {
-    /// What `kept` gives: the arguments and the granted secrets.
-    start: Vec<u8>,
-    /// The tool's memory, which its helpers share.
-    memory: SharedMemory,
-    /// What stops the run: a call that a helper's stop ended learns why from it.
-    reasons: Reasons,
-    /// What the host couldn't do, which fails the call.
-    refused: Option<String>,
-    /// Why the clock thread stopped the call, if it did.
-    stopped: Option<End>,
-    /// The requests the current call made: number, service and bytes.
-    made: Vec<(u32, String, Vec<u8>)>,
-    /// Answers the tool may read.
-    answered: HashMap<u32, Answer>,
-    /// The requests whose answers the current call read.
-    taken: Vec<u32>,
-    console: Console,
-}
-
 /// What `std::tool::args` and `secret` read: a count and each argument, then a count and each
 /// secret's name and value (text as a `u32` byte count, then UTF-8).
 fn start_bytes(args: &[String], secrets: &[(String, String)]) -> Vec<u8> {
@@ -377,8 +366,8 @@ fn start_bytes(args: &[String], secrets: &[(String, String)]) -> Vec<u8> {
 
 /// The worker threads, which carry out services.
 struct Pool {
-    jobs: Option<mpsc::Sender<(u32, Task)>>,
-    handles: Vec<std::thread::JoinHandle<()>>,
+    jobs: Mutex<Option<mpsc::Sender<(u32, Task)>>>,
+    handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     /// How many workers are running, which each lowers as it returns.
     alive: Arc<(Mutex<usize>, Condvar)>,
     /// Set once the tool has ended: work not started yet is dropped.
@@ -386,12 +375,7 @@ struct Pool {
 }
 
 impl Pool {
-    fn start(
-        services: &Arc<Services>,
-        done: &mpsc::Sender<(u32, Answer)>,
-        name: &str,
-        workers: usize,
-    ) -> Pool {
+    fn start(services: &Arc<Services>, hub: &Arc<Hub>, name: &str, workers: usize) -> Pool {
         let (jobs, queue) = mpsc::channel::<(u32, Task)>();
         let queue = Arc::new(Mutex::new(queue));
         let alive = Arc::new((Mutex::new(workers), Condvar::new()));
@@ -400,7 +384,7 @@ impl Pool {
         let mut handles = Vec::new();
         for i in 0..workers {
             let (queue, running, closing) = (queue.clone(), alive.clone(), closing.clone());
-            let (services, done) = (services.clone(), done.clone());
+            let (services, hub) = (services.clone(), hub.clone());
             let spawned = std::thread::Builder::new().name(format!("wrela-tool-{name}-{i}")).spawn(
                 move || {
                     loop {
@@ -416,35 +400,9 @@ impl Pool {
                         // A failed request's answer names no blob or build: those made for it go
                         // back.
                         if matches!(&answer, Answer::Bytes(b) if b.first() == Some(&1)) {
-                            services.blobs().rollback(request);
-                            let made = services.drives().rollback(request);
-                            for d in made {
-                                if !d.close(services.grace) {
-                                    let _ = services
-                                        .stuck
-                                        .set("a failed request's driven build didn't close".into());
-                                }
-                            }
-                            let made = services.servers().rollback(request);
-                            for server in made {
-                                if !server.close(&services, services.grace) {
-                                    let _ = services
-                                        .stuck
-                                        .set("a failed request's server didn't close".into());
-                                }
-                            }
-                            let made = services.browsers().rollback(request);
-                            for browser in made {
-                                if !browser.close() {
-                                    let _ = services.stuck.set(
-                                        "a failed request's browser didn't end cleanly".into(),
-                                    );
-                                }
-                            }
+                            rollback(&services, request);
                         }
-                        if done.send((request, answer)).is_err() {
-                            break;
-                        }
+                        hub.deliver(request, answer);
                     }
                     let (count, wake) = &*running;
                     *count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
@@ -459,11 +417,12 @@ impl Pool {
                 }
             }
         }
-        Pool { jobs: Some(jobs), handles, alive, closing }
+        Pool { jobs: Mutex::new(Some(jobs)), handles: Mutex::new(handles), alive, closing }
     }
 
     fn send(&self, request: u32, task: Task) {
-        if let Some(jobs) = &self.jobs {
+        let jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(jobs) = jobs.as_ref() {
             // A pool with no workers left drops the task; the request stays outstanding until
             // the run ends.
             let _ = jobs.send((request, task));
@@ -471,15 +430,15 @@ impl Pool {
     }
 
     /// Tells the workers to stop: work not started is dropped, and an idle worker returns.
-    fn close(&mut self) {
+    fn close(&self) {
         self.closing.store(true, Ordering::Release);
-        self.jobs = None;
+        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     }
 
     /// Stops the workers: work not started is dropped, and work in progress has until `until`
     /// to finish. How many are still running then (they're left to finish alone, and the run
     /// doesn't end cleanly).
-    fn stop(mut self, until: Instant) -> usize {
+    fn stop(&self, until: Instant) -> usize {
         self.close();
         let grace = until.saturating_duration_since(Instant::now());
         let (count, wake) = &*self.alive;
@@ -489,11 +448,38 @@ impl Pool {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let left = *left;
         if left == 0 {
-            for h in self.handles.drain(..) {
+            let handles = std::mem::take(
+                &mut *self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for h in handles {
                 let _ = h.join();
             }
         }
         left
+    }
+}
+
+/// What a failed request made goes back: its blobs, and the driven builds, servers and
+/// browsers made for it, each closed.
+fn rollback(services: &Services, request: u32) {
+    services.blobs().rollback(request);
+    let made = services.drives().rollback(request);
+    for d in made {
+        if !d.close(services.grace) {
+            let _ = services.stuck.set("a failed request's driven build didn't close".into());
+        }
+    }
+    let made = services.servers().rollback(request);
+    for server in made {
+        if !server.close(services, services.grace) {
+            let _ = services.stuck.set("a failed request's server didn't close".into());
+        }
+    }
+    let made = services.browsers().rollback(request);
+    for browser in made {
+        if !browser.close() {
+            let _ = services.stuck.set("a failed request's browser didn't end cleanly".into());
+        }
     }
 }
 
@@ -508,15 +494,16 @@ struct Pools {
 
 impl Pools {
     /// Stops all four, their work in progress sharing one `grace`: how many workers are left.
-    fn stop(self, grace: Duration) -> usize {
+    fn stop(&self, grace: Duration) -> usize {
         let until = Instant::now() + grace;
-        let Pools { mut files, mut long, mut heavy, mut drive } = self;
         // All are told first, so none's work waits on another's grace.
-        files.close();
-        long.close();
-        heavy.close();
-        drive.close();
-        drive.stop(until) + heavy.stop(until) + long.stop(until) + files.stop(until)
+        for p in [&self.files, &self.long, &self.heavy, &self.drive] {
+            p.close();
+        }
+        self.drive.stop(until)
+            + self.heavy.stop(until)
+            + self.long.stop(until)
+            + self.files.stop(until)
     }
 }
 
@@ -554,38 +541,47 @@ impl Ticker {
     }
 }
 
-/// What stops a run: an interrupt, its timeout and a worker whose work can't be stopped.
+/// What stops a run: work that can't be stopped, a helper's trap, an interrupt and its
+/// timeout; and the latch the first thread that sees one sets, so every other stops too.
 #[derive(Clone)]
-struct Reasons {
+pub(crate) struct Reasons {
     interrupt: Option<Arc<AtomicBool>>,
-    deadline: Option<Instant>,
+    pub(crate) deadline: Option<Instant>,
     stuck: Arc<services::Stuck>,
+    /// The first trap of a helper's: the tool's failure.
+    trapped: Arc<OnceLock<End>>,
+    /// Set by the first thread that sees a reason, and once the tool's own thread has
+    /// returned.
+    stop: Arc<AtomicBool>,
 }
 
 impl Reasons {
-    /// Why the run must stop now, if it must.
-    fn now(&self) -> Option<End> {
-        stop_reason(&self.interrupt, self.deadline, &self.stuck)
+    /// Why the run must stop now, if it must: a worker whose work can't be stopped (the
+    /// host's failure), a helper's trap, an interrupt, or the timeout.
+    pub(crate) fn now(&self) -> Option<End> {
+        if let Some(why) = self.stuck.due() {
+            return Some(End::Host(why.clone()));
+        }
+        if let Some(trap) = self.trapped.get() {
+            return Some(trap.clone());
+        }
+        if self.interrupt.as_ref().is_some_and(|i| i.load(Ordering::Acquire)) {
+            return Some(End::Interrupted);
+        }
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            return Some(End::Timeout);
+        }
+        None
     }
-}
 
-/// Why the run must stop now, if it must: a worker whose work can't be stopped (the host's
-/// failure), an interrupt, or the timeout.
-fn stop_reason(
-    interrupt: &Option<Arc<AtomicBool>>,
-    deadline: Option<Instant>,
-    stuck: &services::Stuck,
-) -> Option<End> {
-    if let Some(why) = stuck.due() {
-        return Some(End::Host(why.clone()));
+    /// Every thread's call stops from now on.
+    pub(crate) fn latch(&self) {
+        self.stop.store(true, Ordering::Release);
     }
-    if interrupt.as_ref().is_some_and(|i| i.load(Ordering::Acquire)) {
-        return Some(End::Interrupted);
+
+    pub(crate) fn latched(&self) -> bool {
+        self.stop.load(Ordering::Acquire)
     }
-    if deadline.is_some_and(|d| Instant::now() >= d) {
-        return Some(End::Timeout);
-    }
-    None
 }
 
 /// Runs the tool to its end, and cleans up after it.
@@ -616,7 +612,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         interrupt,
         print,
         testing,
-        entries,
+        entry,
         fake_clock,
         real_clock,
         groups,
@@ -653,16 +649,14 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         browsers: Mutex::default(),
         answers: Mutex::new(None),
     });
-    let (done, answers) = mpsc::channel();
-    *services.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(done.clone());
-    let pools = Pools {
-        files: Pool::start(&services, &done, "files", WORKERS),
-        long: Pool::start(&services, &done, "long", LONG_WORKERS),
-        heavy: Pool::start(&services, &done, "heavy", HEAVY_WORKERS),
-        drive: Pool::start(&services, &done, "drive", drive_workers()),
-    };
-    drop(done);
+    let hub = Arc::new(Hub::new(fake_clock.filter(|_| !real_clock)));
+    *services.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hub.clone());
+    let pools = Arc::new(Pools {
+        files: Pool::start(&services, &hub, "files", WORKERS),
+        long: Pool::start(&services, &hub, "long", LONG_WORKERS),
+        heavy: Pool::start(&services, &hub, "heavy", HEAVY_WORKERS),
+        drive: Pool::start(&services, &hub, "drive", drive_workers()),
+    });
     let (console, writer) = match Console::start(print) {
         Ok(c) => c,
         Err(why) => {
@@ -680,32 +674,29 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
             return Ended { workers_left, lines_dropped, ..failed(why) };
         }
     };
-    let mut run = Run {
-        pools: &pools,
-        services: &services,
-        answers: &answers,
-        interrupt: &interrupt,
+    let reasons = Reasons {
+        interrupt,
         deadline,
-        outstanding: HashSet::new(),
-        origin: Instant::now(),
-        fake: fake_clock
-            .filter(|_| !real_clock)
-            .map(|(s, n)| Fake { now: Duration::ZERO, utc: Duration::new(s, n) }),
-        timed: BinaryHeap::new(),
-        timed_answers: HashMap::new(),
-        due: HashMap::new(),
-        arrived: Vec::new(),
-        later: HashSet::new(),
+        stuck: services.stuck.clone(),
+        trapped: Arc::new(OnceLock::new()),
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    let tool = Tool {
+        hub,
+        services: services.clone(),
+        pools: pools.clone(),
+        reasons,
+        start,
+        console,
         workers,
         helper_delay: testing.helper_delay,
+        fail_helper: testing.fail_helper,
+        any_pause: testing.any_pause,
         grace: testing.grace,
-        helpers_left: 0,
-        helped: 0,
     };
-    // The store, and the console's sending end in it, go when `drive` returns, and its helpers
-    // have stopped by then (or are counted as left).
-    let mut end = run.drive(&engine, build, &entries, start, console);
-    let (helpers_left, run_helped) = (run.helpers_left, run.helped);
+    // The stores, and the console's sending ends in them, go when `drive` returns, and its
+    // helpers have stopped by then (or are counted as left).
+    let (mut end, helpers_left, run_helped) = tool.drive(&engine, build, &entry);
     ticker.stop();
     // Driven builds' running calls stop first, and every browser's connection closes, so the
     // workers waiting on them return.
@@ -776,380 +767,312 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     Ended { end, blobs_released, workers_left, lines_dropped, helped: run_helped }
 }
 
-/// A tool test's fake clock: the time since the run started, which moves only when the tool
-/// waits on nothing but the clock, and the date at the start.
-struct Fake {
-    now: Duration,
-    utc: Duration,
+/// What every thread of the tool reaches through its store: the run's shared state, the
+/// services and their workers, what stops the run, the tool's start and its memory.
+pub(crate) struct Shared {
+    hub: Arc<Hub>,
+    services: Arc<Services>,
+    pools: Arc<Pools>,
+    reasons: Reasons,
+    /// What `kept` gives: the arguments and the granted secrets.
+    start: Vec<u8>,
+    /// The tool's memory, which its helpers share.
+    memory: SharedMemory,
+    /// A test's pause in `tool_any` ([`Testing::any_pause`]).
+    any_pause: Duration,
 }
 
-/// A run in progress: what's outstanding, and where answers come from.
-struct Run<'a> {
-    pools: &'a Pools,
-    services: &'a Arc<Services>,
-    answers: &'a mpsc::Receiver<(u32, Answer)>,
-    interrupt: &'a Option<Arc<AtomicBool>>,
-    deadline: Option<Instant>,
-    /// Requests made and not answered yet.
-    outstanding: HashSet<u32>,
-    /// When the run started: the system clock's times are from it.
-    origin: Instant,
-    /// A tool test's fake clock, if this is one.
-    fake: Option<Fake>,
-    /// Answers given to the tool at a time on the run's clock, soonest first: timers', and a
-    /// fake site's held for its delay.
-    timed: BinaryHeap<Reverse<(Duration, u32)>>,
-    timed_answers: HashMap<u32, Answer>,
-    /// When requests a worker carries out may be answered, if not at once: a fake site's delay.
-    due: HashMap<u32, Duration>,
-    /// Answers that have arrived since the last call.
-    arrived: Vec<(u32, Answer)>,
-    /// Requests a service answers itself when something happens ([`Work::Later`]), not answered
-    /// yet: in a tool test, nothing makes that happen (nothing posts to its server), so the fake
-    /// clock moves while they wait.
-    later: HashSet<u32>,
+/// A run about to start: what [`run`] made for it.
+struct Tool {
+    hub: Arc<Hub>,
+    services: Arc<Services>,
+    pools: Arc<Pools>,
+    reasons: Reasons,
+    start: Vec<u8>,
+    console: Console,
     /// How many helpers the tool has, how long each waits before it starts (a test's), and how
     /// long they have to stop once it ends.
     workers: u32,
     helper_delay: Duration,
+    fail_helper: Option<u32>,
+    any_pause: Duration,
     grace: Duration,
-    /// The helpers still running the grace after the tool ended, and the chunks they ran.
-    helpers_left: usize,
-    helped: u32,
 }
 
-impl Run<'_> {
-    /// The time on the run's clock: since its start, real or fake.
-    fn now(&self) -> Duration {
-        match &self.fake {
-            Some(f) => f.now,
-            None => self.origin.elapsed(),
-        }
-    }
+/// A thread's part of the host, in its store: the tool's own thread's, or a helper's.
+struct ToolState {
+    /// The thread's number (wrela_abi `memory`'s threads).
+    thread: u32,
+    shared: Arc<Shared>,
+    /// What the host refused to do, or the tool's own misuse of it, which fails the call.
+    refused: Option<End>,
+    /// Why the run stopped the call, if it did.
+    stopped: Option<End>,
+    console: Console,
+}
 
-    /// The date now, as `time/utc` answers it: the system's, or the fake clock's.
-    fn utc(&self) -> Answer {
-        let now = match &self.fake {
-            Some(f) => f.utc + f.now,
-            None => std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default(),
-        };
-        let mut payload = vec![0];
-        payload.extend_from_slice(&now.as_secs().to_le_bytes());
-        payload.extend_from_slice(&now.subsec_nanos().to_le_bytes());
-        Answer::Bytes(payload)
-    }
-
-    /// `answer` to `request`, given to the tool now, or at the time it's due.
-    fn answered(&mut self, request: u32, answer: Answer) {
-        match self.due.remove(&request) {
-            Some(at) if at > self.now() => {
-                self.timed.push(Reverse((at, request)));
-                self.timed_answers.insert(request, answer);
-            }
-            _ => self.arrived.push((request, answer)),
-        }
-    }
-
-    fn drive(
-        &mut self,
-        engine: &Engine,
-        build: &ToolBuild,
-        entries: &(String, String),
-        start: Vec<u8>,
-        console: Console,
-    ) -> End {
+impl Tool {
+    /// Compiles the tool, calls its entry on its thread with its helpers beside it, and stops
+    /// them: how it ended, the helpers left past the grace, and the chunks they ran.
+    fn drive(self, engine: &Engine, build: &ToolBuild, entry: &str) -> (End, usize, u32) {
         let module = match Module::new(engine, &build.wasm) {
             Ok(m) => m,
-            Err(e) => return End::Host(format!("compiling the tool build: {e:#}")),
+            Err(e) => return (End::Host(format!("compiling the tool build: {e:#}")), 0, 0),
         };
-        // Its memory is shared with its helpers, and capped at 4 GiB.
-        let memory_type = module.imports().find_map(|i| match i.ty() {
-            wasmtime::ExternType::Memory(m)
-                if (i.module(), i.name()) == (IMPORT_MODULE, IMPORT_MEMORY) && m.is_shared() =>
-            {
-                Some(m)
-            }
-            _ => None,
-        });
-        let Some(memory_type) = memory_type.filter(|_| module.get_export(EXPORT_MEMORY).is_some())
-        else {
-            return End::Host(format!(
-                "this isn't a tool build: it doesn't import its memory, shared, as `{IMPORT_MODULE}.{IMPORT_MEMORY}`"
-            ));
-        };
-        if memory_type.maximum().is_none_or(|m| m > u64::from(TOOL_MAX_PAGES)) {
-            return End::Host(format!(
-                "this isn't a tool build: its memory may grow past {TOOL_MAX_PAGES} pages"
-            ));
-        }
-        if module.get_export(&entries.1).is_none() {
-            return End::Host(format!(
-                "this isn't a tool build: it doesn't export `{}`",
-                entries.1
-            ));
-        }
-        let memory = match SharedMemory::new(engine, memory_type) {
+        let memory = match check_tool(&module, engine, entry) {
             Ok(m) => m,
-            Err(e) => return End::Host(format!("the tool's memory: {e:#}")),
+            Err(why) => return (End::Host(why), 0, 0),
         };
-        let reasons = Reasons {
-            interrupt: self.interrupt.clone(),
-            deadline: self.deadline,
-            stuck: self.services.stuck.clone(),
-        };
-        // What stops the helpers' calls: the run's reasons, or its end. The first thread that
-        // sees one latches it, so a helper held in a wait stops too once it runs again.
-        let r = reasons.clone();
-        let stop = crate::program::Stop::beside(move || r.now().is_some());
-        let state = ToolState {
-            start,
+        let shared = Arc::new(Shared {
+            hub: self.hub.clone(),
+            services: self.services.clone(),
+            pools: self.pools.clone(),
+            reasons: self.reasons.clone(),
+            start: self.start,
             memory: memory.clone(),
-            reasons: reasons.clone(),
-            refused: None,
-            stopped: None,
-            made: Vec::new(),
-            answered: HashMap::new(),
-            taken: Vec::new(),
-            console: console.clone(),
-        };
-        let mut store = Store::new(engine, state);
-        store.set_epoch_deadline(1);
-        let latch = stop.clone();
-        store.epoch_deadline_callback(move |mut cx| {
-            if let Some(why) = cx.data().reasons.now() {
-                latch.stop();
-                cx.data_mut().stopped = Some(why);
-                return Ok(UpdateDeadline::Interrupt);
-            }
-            Ok(UpdateDeadline::Continue(1))
+            any_pause: self.any_pause,
         });
-        let mut linker = match linker(engine) {
+        let linker = match linker(engine) {
             Ok(l) => l,
-            Err(e) => return End::Host(format!("{e:#}")),
+            Err(e) => return (End::Host(format!("{e:#}")), 0, 0),
         };
-        if let Err(e) = linker.define(&store, IMPORT_MODULE, IMPORT_MEMORY, memory.clone()) {
-            return End::Host(format!("{e:#}"));
-        }
-        let instance = match linker.instantiate(&mut store, &module) {
+        let mut store = new_store(engine, &shared, THREAD_MAIN, &self.console);
+        let instance = match instantiate(&linker, &mut store, &module) {
             Ok(i) => i,
-            Err(e) => return classify(&mut store, &e),
+            Err(e) => return (classify(&mut store, &e), 0, 0),
         };
         let exported = instance.get_shared_memory(&mut store, EXPORT_MEMORY);
         if !exported.is_some_and(|m| std::ptr::eq(m.data().as_ptr(), memory.data().as_ptr())) {
-            return End::Host(format!(
+            let why = format!(
                 "this isn't a tool build: its `{EXPORT_MEMORY}` export isn't its imported memory"
-            ));
+            );
+            return (End::Host(why), 0, 0);
         }
-        // Its helpers print to its console, as the tool does.
-        let trace = crate::trace::Trace::to(move |line| console.print(line));
-        let mut helpers = match crate::program::Helpers::start(
-            &module,
-            &memory,
-            self.workers,
-            &trace,
-            Some(&stop),
-            self.helper_delay,
-        ) {
-            Ok(h) => h,
-            Err(why) => return End::Host(format!("the tool's helpers: {why}")),
-        };
-        drop(trace);
-        let end = self.calls(&mut store, &instance, entries);
-        // However it ended, every helper's call stops now, and the helpers return.
-        stop.stop();
-        self.helpers_left = helpers.shut_down(Some(self.grace));
-        self.helped = crate::shared::load_u32(&memory, wrela_abi::memory::PAR_HELPED);
-        end
-    }
-
-    /// Calls `tool_init` once, then `tool` until it returns a status, carrying out the requests
-    /// each call makes: how the tool ended.
-    fn calls(
-        &mut self,
-        store: &mut Store<ToolState>,
-        instance: &wasmtime::Instance,
-        (init_export, tool_export): &(String, String),
-    ) -> End {
-        let tool = match instance.get_typed_func::<(), u32>(&mut *store, tool_export) {
+        let tool = match instance.get_typed_func::<(), u32>(&mut store, entry) {
             Ok(f) => f,
-            Err(e) => return End::Host(format!("`{tool_export}`: {e:#}")),
+            Err(e) => return (End::Host(format!("`{entry}`: {e:#}")), 0, 0),
         };
-        if instance.get_export(&mut *store, init_export).is_some() {
-            let init = match instance.get_typed_func::<(), ()>(&mut *store, init_export) {
-                Ok(f) => f,
-                Err(e) => return End::Host(format!("`{init_export}`: {e:#}")),
-            };
-            if let Err(end) = call(store, |s| init.call(s, ())) {
-                return end;
-            }
-            self.after_call(store);
-        }
-        loop {
-            if let Some(why) = stop_reason(self.interrupt, self.deadline, &self.services.stuck) {
-                return why;
-            }
-            let status = match call(store, |s| tool.call(s, ())) {
-                Ok(status) => status,
-                Err(end) => return end,
-            };
-            self.after_call(store);
-            if status != TOOL_RUNNING {
-                return match u8::try_from(status) {
-                    Ok(n) => End::Exit(n),
-                    Err(_) => End::BadStatus(status),
-                };
-            }
-            if let Err(end) = self.wait() {
-                return end;
-            }
-            let s = store.data_mut();
-            for (request, answer) in self.arrived.drain(..) {
-                self.outstanding.remove(&request);
-                self.later.remove(&request);
-                s.answered.insert(request, answer);
-            }
-        }
-    }
-
-    /// Carries out the requests the call made, and gives the blobs of the answers it read to
-    /// the tool.
-    fn after_call(&mut self, store: &mut Store<ToolState>) {
-        let s = store.data_mut();
-        if !s.taken.is_empty() {
-            let mut blobs =
-                self.services.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut drives = self.services.drives();
-            let mut servers = self.services.servers();
-            let mut browsers = self.services.browsers();
-            for request in s.taken.drain(..) {
-                blobs.publish(request);
-                drives.publish(request);
-                servers.publish(request);
-                browsers.publish(request);
-            }
-        }
-        for (request, service, body) in std::mem::take(&mut s.made) {
-            self.outstanding.insert(request);
-            match services::route(self.services, &service, &body) {
-                Work::Now(answer) => self.arrived.push((request, answer)),
-                Work::Timer(after) => {
-                    let at = self.now() + after;
-                    self.timed.push(Reverse((at, request)));
-                    self.timed_answers.insert(request, Answer::Bytes(vec![0]));
-                }
-                Work::Worker(task) => self.pools.files.send(request, task),
-                Work::Long(task) => self.pools.long.send(request, task),
-                Work::Heavy(task) => self.pools.heavy.send(request, task),
-                Work::Drive(task) => self.pools.drive.send(request, task),
-                Work::Held(after, task) => {
-                    self.due.insert(request, self.now() + after);
-                    self.pools.long.send(request, task);
-                }
-                Work::Later(register) => match register(self.services, request) {
-                    Some(answer) => self.arrived.push((request, answer)),
-                    None => {
-                        self.later.insert(request);
-                    }
-                },
-                Work::Utc => self.arrived.push((request, self.utc())),
-                Work::SetUtc(seconds, nanos) => {
-                    let answer = match &mut self.fake {
-                        Some(f) => {
-                            let set = Duration::new(seconds, nanos);
-                            // The fake time since the start stays; the date it reads moves.
-                            f.utc = set.saturating_sub(f.now);
-                            Answer::Bytes(vec![0])
-                        }
-                        None => Answer::Bytes(
-                            b"\x01only a tool test's fake clock is set: not the system's".to_vec(),
-                        ),
+        self.hub.set(THREAD_MAIN, Thread::Running);
+        let (mut helpers, started) = Helpers::start(
+            &module,
+            &linker,
+            &shared,
+            self.workers,
+            &self.console,
+            (self.helper_delay, self.fail_helper),
+        );
+        drop(self.console);
+        // A reason to stop that came first wins: before the tool runs (a budget spent while it
+        // compiled, an interrupt already given), and over a status it returns.
+        let end = match started {
+            Err(why) => End::Host(format!("the tool's helpers: {why}")),
+            Ok(()) => match self.reasons.now() {
+                Some(why) => why,
+                None => {
+                    store.data_mut().refused = None;
+                    let ended = match tool.call(&mut store, ()) {
+                        Ok(status) => match u8::try_from(status) {
+                            Ok(n) => End::Exit(n),
+                            Err(_) => End::BadStatus(status),
+                        },
+                        Err(e) => classify(&mut store, &e),
                     };
-                    self.arrived.push((request, answer));
-                }
-            }
-        }
-    }
-
-    /// Waits until at least one answer has arrived: an error to end the run if nothing is
-    /// outstanding, the timeout passes or an interrupt comes first. On a fake clock, once every
-    /// outstanding request waits on the clock alone, the clock jumps to the soonest.
-    fn wait(&mut self) -> Result<(), End> {
-        loop {
-            while let Ok((request, answer)) = self.answers.try_recv() {
-                self.answered(request, answer);
-            }
-            let now = self.now();
-            while let Some(&Reverse((at, request))) = self.timed.peek()
-                && at <= now
-            {
-                self.timed.pop();
-                let answer = self.timed_answers.remove(&request).unwrap_or(Answer::Failed);
-                self.arrived.push((request, answer));
-            }
-            if !self.arrived.is_empty() {
-                return Ok(());
-            }
-            if self.outstanding.is_empty() {
-                return Err(End::WaitsOnNothing);
-            }
-            if let Some(why) = stop_reason(self.interrupt, self.deadline, &self.services.stuck) {
-                return Err(why);
-            }
-            // Quiescent: nothing outstanding but what the clock answers, and what waits on an
-            // event no tool test makes.
-            if let Some(fake) = &mut self.fake
-                && self.outstanding.len() == self.timed_answers.len() + self.later.len()
-                && let Some(&Reverse((at, _))) = self.timed.peek()
-            {
-                fake.now = fake.now.max(at);
-                continue;
-            }
-            let mut wait = WAKE;
-            if self.fake.is_none()
-                && let Some(&Reverse((at, _))) = self.timed.peek()
-            {
-                wait = wait.min(at.saturating_sub(now));
-            }
-            if let Some(d) = self.deadline {
-                wait = wait.min(d.saturating_duration_since(Instant::now()));
-            }
-            match self.answers.recv_timeout(wait) {
-                Ok((request, answer)) => self.answered(request, answer),
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    // No worker is left to answer: only the clock can.
-                    if self.timed.is_empty() {
-                        return Err(End::Host("the host's workers stopped".into()));
+                    match (&ended, self.reasons.now()) {
+                        (End::Exit(_) | End::BadStatus(_), Some(why)) => why,
+                        _ => ended,
                     }
-                    std::thread::sleep(wait);
                 }
-            }
-        }
+            },
+        };
+        self.hub.gone(THREAD_MAIN);
+        // However it ended, every helper's call stops now, and the helpers return.
+        self.reasons.latch();
+        self.hub.notify();
+        let left = helpers.shut_down(&memory, &self.hub, self.grace);
+        let helped = crate::shared::load_u32(&memory, wrela_abi::memory::PAR_HELPED);
+        (end, left, helped)
     }
 }
 
-/// A call into the tool: its result, or how the run ends.
-fn call<R>(
-    store: &mut Store<ToolState>,
-    f: impl FnOnce(&mut Store<ToolState>) -> wasmtime::Result<R>,
-) -> Result<R, End> {
-    store.data_mut().refused = None;
-    f(store).map_err(|e| classify(store, &e))
+/// Checks `module` is a tool build with the export `entry`: its memory, shared, capped at
+/// 4 GiB, which it makes.
+fn check_tool(module: &Module, engine: &Engine, entry: &str) -> Result<SharedMemory, String> {
+    let memory_type = module.imports().find_map(|i| match i.ty() {
+        wasmtime::ExternType::Memory(m)
+            if (i.module(), i.name()) == (IMPORT_MODULE, IMPORT_MEMORY) && m.is_shared() =>
+        {
+            Some(m)
+        }
+        _ => None,
+    });
+    let Some(memory_type) = memory_type.filter(|_| module.get_export(EXPORT_MEMORY).is_some())
+    else {
+        return Err(format!(
+            "this isn't a tool build: it doesn't import its memory, shared, as `{IMPORT_MODULE}.{IMPORT_MEMORY}`"
+        ));
+    };
+    if memory_type.maximum().is_none_or(|m| m > u64::from(TOOL_MAX_PAGES)) {
+        return Err(format!(
+            "this isn't a tool build: its memory may grow past {TOOL_MAX_PAGES} pages"
+        ));
+    }
+    if module.get_export(entry).is_none() {
+        return Err(format!("this isn't a tool build: it doesn't export `{entry}`"));
+    }
+    SharedMemory::new(engine, memory_type).map_err(|e| format!("the tool's memory: {e:#}"))
 }
 
-/// Why `e`, a call's error, happened: the clock thread's stop first (also one a helper saw:
-/// the call that waited for it traps when the stopped helper does), then the host's refusals,
-/// then the tool's own trap, with its panic's message if it panicked (a helper's, if it was a
-/// helper's: std copies it into the tool's thread's block).
+/// A store for thread `thread` of the tool: its calls stop within about 10 ms of a reason to
+/// stop the run, or of another thread's stop.
+fn new_store(
+    engine: &Engine,
+    shared: &Arc<Shared>,
+    thread: u32,
+    console: &Console,
+) -> Store<ToolState> {
+    let state = ToolState {
+        thread,
+        shared: shared.clone(),
+        refused: None,
+        stopped: None,
+        console: console.clone(),
+    };
+    let mut store = Store::new(engine, state);
+    store.set_epoch_deadline(1);
+    store.epoch_deadline_callback(move |mut cx| {
+        let reasons = &cx.data().shared.reasons;
+        let why = reasons.now().or_else(|| reasons.latched().then_some(End::Interrupted));
+        if let Some(why) = why {
+            reasons.latch();
+            cx.data_mut().stopped = Some(why);
+            return Ok(UpdateDeadline::Interrupt);
+        }
+        Ok(UpdateDeadline::Continue(1))
+    });
+    store
+}
+
+/// The tool's helpers: each an instance of the module on the tool's memory, on a thread of its
+/// own, running `__tool_worker` with the tool's host functions until the tool ends.
+struct Helpers {
+    threads: Vec<std::thread::JoinHandle<()>>,
+}
+
+impl Helpers {
+    /// `count` helpers (at most `MAX_WORKERS`), each waiting `delay` before it starts (a test's;
+    /// and a test's helper that fails to start, by its index); none if the module exports no
+    /// `__tool_worker` (it runs no parallel work). The memory's `PAR_HELPERS` says how many.
+    /// Each is running from the start, as the fake clock reads it, until it first waits for
+    /// work. If one can't start, those started are kept, to be shut down as the run ends, and
+    /// why is given beside them.
+    fn start(
+        module: &Module,
+        linker: &Linker<ToolState>,
+        shared: &Arc<Shared>,
+        count: u32,
+        console: &Console,
+        (delay, fail): (Duration, Option<u32>),
+    ) -> (Helpers, Result<(), String>) {
+        let mut helpers = Helpers { threads: Vec::new() };
+        if module.get_export(EXPORT_TOOL_WORKER).is_none() {
+            return (helpers, Ok(()));
+        }
+        for i in 0..count.min(MAX_WORKERS) {
+            let thread = THREAD_HELPER0 + i;
+            shared.hub.set(thread, Thread::Running);
+            let (module, linker, mine) = (module.clone(), linker.clone(), shared.clone());
+            let console = console.clone();
+            let spawned = if fail == Some(i) {
+                Err(std::io::Error::other("a test's injected failure"))
+            } else {
+                std::thread::Builder::new().name(format!("wrela-tool-helper-{thread}")).spawn(
+                    move || {
+                        if !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        let engine = module.engine().clone();
+                        let mut store = new_store(&engine, &mine, thread, &console);
+                        let ran = instantiate(&linker, &mut store, &module).and_then(|instance| {
+                            let worker = instance
+                                .get_typed_func::<u32, ()>(&mut store, EXPORT_TOOL_WORKER)?;
+                            worker.call(&mut store, thread)
+                        });
+                        if let Err(e) = ran {
+                            helper_failed(&mut store, &e);
+                        }
+                        mine.hub.gone(thread);
+                    },
+                )
+            };
+            match spawned {
+                Ok(h) => helpers.threads.push(h),
+                Err(e) => {
+                    shared.hub.gone(thread);
+                    return (helpers, Err(format!("can't start helper {i}: {e}")));
+                }
+            }
+        }
+        crate::shared::store_u32(
+            &shared.memory,
+            wrela_abi::memory::PAR_HELPERS,
+            helpers.threads.len() as u32,
+        );
+        (helpers, Ok(()))
+    }
+
+    /// Tells the helpers to return (each sees it once it waits for work, or once a wait in the
+    /// host sees the run's latch) and waits for them, at most `grace`: how many it left.
+    fn shut_down(&mut self, memory: &SharedMemory, hub: &Hub, grace: Duration) -> usize {
+        if self.threads.is_empty() {
+            return 0;
+        }
+        crate::shared::store_u32(memory, wrela_abi::memory::PAR_SHUTDOWN, 1);
+        crate::shared::add_u32(memory, wrela_abi::memory::PAR_WAKE, 1);
+        let _ = memory.atomic_notify(u64::from(wrela_abi::memory::PAR_WAKE), u32::MAX);
+        hub.notify();
+        let until = Instant::now() + grace;
+        let mut left = 0;
+        for t in self.threads.drain(..) {
+            while !t.is_finished() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            } else {
+                left += 1;
+            }
+        }
+        left
+    }
+}
+
+/// A helper's call failed with `e`. The thread that waits for what it ran learns it, as a
+/// `std::par` wait in WASM isn't interrupted (wrela_abi `memory`'s helpers). Unless the run
+/// stopped it, its trap (or what the host refused it) is the tool's failure, which ends the run.
+fn helper_failed(store: &mut Store<ToolState>, e: &wasmtime::Error) {
+    let (thread, shared) = (store.data().thread, store.data().shared.clone());
+    if store.data().stopped.is_none() {
+        // Before the waiting thread wakes, so it ends with this reason.
+        let end = classify(store, e);
+        let _ = shared.reasons.trapped.set(end);
+    }
+    crate::program::helper_trapped(&shared.memory, thread);
+    shared.hub.notify();
+}
+
+/// Why `e`, a call's error, happened: the run's stop first (also one another thread saw), then
+/// the host's refusals, then the thread's own trap, with its panic's message if it panicked (a
+/// helper's, if it was a helper's: std copies it into the waiting thread's block).
 fn classify(store: &mut Store<ToolState>, e: &wasmtime::Error) -> End {
     let s = store.data_mut();
-    if let Some(why) = s.stopped.take().or_else(|| s.reasons.now()) {
+    if let Some(why) = s.stopped.take() {
         return why;
     }
     if let Some(why) = s.refused.take() {
-        return End::Host(why);
+        return why;
+    }
+    if let Some(why) = s.shared.reasons.now() {
+        return why;
     }
     match e.downcast_ref::<wasmtime::Trap>() {
         Some(wasmtime::Trap::Interrupt) => End::Interrupted,
@@ -1157,9 +1080,9 @@ fn classify(store: &mut Store<ToolState>, e: &wasmtime::Error) -> End {
             End::Trap("the call went deeper than the stack allows".into())
         }
         Some(t) => {
-            use wrela_abi::memory::{PANIC_CAP, THREAD_MAIN, panic_at, panic_message};
-            let at = panic_at(THREAD_MAIN) as usize;
-            let message = crate::shared::read(&s.memory, at, 4 + PANIC_CAP as usize)
+            use wrela_abi::memory::{PANIC_CAP, panic_at, panic_message};
+            let at = panic_at(s.thread) as usize;
+            let message = crate::shared::read(&s.shared.memory, at, 4 + PANIC_CAP as usize)
                 .and_then(|bytes| panic_message(&bytes));
             End::Trap(message.unwrap_or_else(|| t.to_string()))
         }
@@ -1169,22 +1092,98 @@ fn classify(store: &mut Store<ToolState>, e: &wasmtime::Error) -> End {
 
 /// Bytes `[at, at + len)` of the tool's memory.
 fn read(c: &mut Caller<'_, ToolState>, at: u32, len: u32) -> wasmtime::Result<Vec<u8>> {
-    crate::shared::read(&c.data().memory, at as usize, len as usize).ok_or_else(|| {
+    crate::shared::read(&c.data().shared.memory, at as usize, len as usize).ok_or_else(|| {
         wasmtime::format_err!("({at}, {len}) reaches past the end of the tool's memory")
     })
 }
 
 /// Writes `bytes` at `at` in the tool's memory.
 fn write(c: &mut Caller<'_, ToolState>, at: u32, bytes: &[u8], what: &str) -> wasmtime::Result<()> {
-    if crate::shared::write(&c.data().memory, at as usize, bytes) {
+    if crate::shared::write(&c.data().shared.memory, at as usize, bytes) {
         return Ok(());
     }
     Err(wasmtime::format_err!("{what}({at}) reaches past the end of the tool's memory"))
 }
 
+/// Fails the host function that's running with `end`, which the call ends with.
+fn refuse(c: &mut Caller<'_, ToolState>, end: End) -> wasmtime::Error {
+    let message = end.to_string();
+    c.data_mut().refused = Some(end);
+    wasmtime::format_err!("{message}")
+}
+
+/// Blocks the calling thread in `state` until `ready` gives something, or traps it with the
+/// run's stop reason.
+fn block<R>(
+    c: &mut Caller<'_, ToolState>,
+    state: Thread,
+    ready: impl FnMut(&hub::State) -> Option<R>,
+) -> wasmtime::Result<R> {
+    let (thread, shared) = (c.data().thread, c.data().shared.clone());
+    match shared.hub.block(thread, state, &shared.memory, &shared.reasons, ready) {
+        Ok(r) => Ok(r),
+        // The tool's own failure (a helper's too), not the run's stop.
+        Err(End::WaitsOnNothing) => Err(refuse(c, End::WaitsOnNothing)),
+        Err(why) => {
+            let message = why.to_string();
+            c.data_mut().stopped = Some(why);
+            Err(wasmtime::format_err!("{message}"))
+        }
+    }
+}
+
+/// Makes request `service` with `body`: numbers it, and hands it to the service's work, at
+/// once (language.md §15.5's deadlines count from here).
+fn make_request(shared: &Shared, service: &str, body: &[u8]) -> u32 {
+    let request = shared.hub.make();
+    let hub = &shared.hub;
+    match services::route(&shared.services, service, body) {
+        Work::Now(answer) => hub.deliver(request, answer),
+        Work::Timer(after) => {
+            hub.lock().timer(request, after);
+            hub.notify();
+        }
+        Work::Worker(task) => shared.pools.files.send(request, task),
+        Work::Long(task) => shared.pools.long.send(request, task),
+        Work::Heavy(task) => shared.pools.heavy.send(request, task),
+        Work::Drive(task) => shared.pools.drive.send(request, task),
+        Work::Held(after, task) => {
+            hub.lock().hold(request, after);
+            shared.pools.long.send(request, task);
+        }
+        Work::Later(register) => {
+            hub.lock().wait_later(request);
+            if let Some(answer) = register(&shared.services, request) {
+                hub.deliver(request, answer);
+            }
+        }
+        Work::Utc => {
+            let answer = hub.lock().utc();
+            hub.deliver(request, answer);
+        }
+        Work::SetUtc(seconds, nanos) => {
+            let answer = match &mut hub.lock().fake {
+                Some(f) => {
+                    let set = Duration::new(seconds, nanos);
+                    // The fake time since the start stays; the date it reads moves.
+                    f.utc = set.saturating_sub(f.now);
+                    Answer::Bytes(vec![0])
+                }
+                None => Answer::Bytes(
+                    b"\x01only a tool test's fake clock is set: not the system's".to_vec(),
+                ),
+            };
+            hub.deliver(request, answer);
+        }
+    }
+    request
+}
+
 /// The host functions a tool build may import; any other import refuses to link.
 fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
     let mut linker = Linker::new(engine);
+    // A tool's requests go through `tool_request`: what the command stream carries is a
+    // client's (storage, fetches, posts) or GPU work, which a tool has none of.
     linker.func_wrap(
         IMPORT_MODULE,
         IMPORT_SUBMIT,
@@ -1194,57 +1193,137 @@ fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
                 Ok(commands) => commands,
                 Err(e) => return Err(wasmtime::format_err!("a malformed command batch: {e}")),
             };
-            for cmd in commands {
-                let s = c.data_mut();
-                match cmd {
-                    Command::HostRequest { request, service, body } => {
-                        s.made.push((request, service.to_string(), body.to_vec()));
-                    }
-                    other => {
-                        // A tool's requests are its services': storage, fetches and posts are a
-                        // client's, and a tool records no GPU work.
-                        let why = format!(
-                            "a tool host can't carry out {:?}: a tool's files are `std::tool::files`",
-                            other.opcode()
-                        );
-                        s.refused = Some(why.clone());
-                        return Err(wasmtime::format_err!(why));
-                    }
+            match commands.first() {
+                None => Ok(()),
+                Some(cmd) => {
+                    let why = format!(
+                        "a tool host can't carry out {:?}: a tool's files are `std::tool::files`",
+                        cmd.opcode()
+                    );
+                    Err(refuse(&mut c, End::Host(why)))
                 }
             }
-            Ok(())
+        },
+    )?;
+    for name in [IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE] {
+        let why = format!(
+            "a tool host has no `{name}`: a tool waits on its requests (`std::tool::Call::wait`)"
+        );
+        if name == IMPORT_REQUEST_STATUS {
+            linker.func_wrap(
+                IMPORT_MODULE,
+                name,
+                move |mut c: Caller<'_, ToolState>, _: u32| {
+                    Err::<i32, _>(refuse(&mut c, End::Host(why.clone())))
+                },
+            )?;
+        } else {
+            linker.func_wrap(
+                IMPORT_MODULE,
+                name,
+                move |mut c: Caller<'_, ToolState>, _: u32, _: u32| {
+                    Err::<(), _>(refuse(&mut c, End::Host(why.clone())))
+                },
+            )?;
+        }
+    }
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_TOOL_REQUEST,
+        |mut c: Caller<'_, ToolState>, sat: u32, slen: u32, bat: u32, blen: u32| {
+            let service = read(&mut c, sat, slen)?;
+            let Ok(service) = String::from_utf8(service) else {
+                return Err(wasmtime::format_err!("a tool request's service isn't UTF-8"));
+            };
+            let body = read(&mut c, bat, blen)?;
+            let shared = c.data().shared.clone();
+            Ok(make_request(&shared, &service, &body))
         },
     )?;
     linker.func_wrap(
         IMPORT_MODULE,
-        IMPORT_REQUEST_STATUS,
-        |c: Caller<'_, ToolState>, request: u32| -> i32 {
-            match c.data().answered.get(&request) {
-                None => wrela_abi::REQUEST_PENDING,
-                Some(Answer::Failed) => wrela_abi::REQUEST_FAILED,
-                Some(Answer::Bytes(b)) => b.len() as i32,
+        IMPORT_TOOL_WAIT,
+        |mut c: Caller<'_, ToolState>, request: u32| -> wasmtime::Result<i32> {
+            if !Hub::known(&c.data().shared.hub.lock(), request) {
+                return Err(refuse(&mut c, End::WaitsOnNothing));
             }
+            block(&mut c, Thread::Waiting(vec![request]), |s| Hub::status(s, request))
         },
     )?;
     linker.func_wrap(
         IMPORT_MODULE,
-        IMPORT_REQUEST_TAKE,
+        IMPORT_TOOL_ANY,
+        |mut c: Caller<'_, ToolState>, at: u32, count: u32| -> wasmtime::Result<u32> {
+            let bytes = read(&mut c, at, count.saturating_mul(4))?;
+            let requests: Vec<u32> = bytes
+                .chunks_exact(4)
+                .map(|w| u32::from_le_bytes(w.try_into().expect("four bytes")))
+                .collect();
+            let known = {
+                let s = c.data().shared.hub.lock();
+                requests.iter().all(|&r| Hub::known(&s, r))
+            };
+            if requests.is_empty() || !known {
+                return Err(refuse(&mut c, End::WaitsOnNothing));
+            }
+            let pause = c.data().shared.any_pause;
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            let set = requests.clone();
+            block(&mut c, Thread::Waiting(set), move |s| Hub::first(s, &requests))
+        },
+    )?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_TOOL_TAKE,
         |mut c: Caller<'_, ToolState>, request: u32, at: u32| {
-            let Some(answer) = c.data_mut().answered.remove(&request) else {
+            let shared = c.data().shared.clone();
+            let Some(answer) = shared.hub.take(request) else {
                 return Err(wasmtime::format_err!(
-                    "request_take({request}): the request isn't answered"
+                    "tool_take({request}): the request isn't answered"
                 ));
             };
             let bytes = match &answer {
                 Answer::Bytes(b) => b.clone(),
                 Answer::Failed => Vec::new(),
             };
-            if let Err(e) = write(&mut c, at, &bytes, "request_take") {
-                c.data_mut().answered.insert(request, answer);
+            if let Err(e) = write(&mut c, at, &bytes, "tool_take") {
+                shared.hub.untake(request, answer);
                 return Err(e);
             }
-            c.data_mut().taken.push(request);
+            // What the request made is the tool's now.
+            let services = &shared.services;
+            services.blobs().publish(request);
+            services.drives().publish(request);
+            services.servers().publish(request);
+            services.browsers().publish(request);
             Ok(())
+        },
+    )?;
+    linker.func_wrap(IMPORT_MODULE, IMPORT_TOOL_IDLE, |c: Caller<'_, ToolState>| {
+        c.data().shared.hub.set(c.data().thread, Thread::Idle);
+    })?;
+    linker.func_wrap(IMPORT_MODULE, IMPORT_TOOL_ACTIVE, |c: Caller<'_, ToolState>| {
+        c.data().shared.hub.set(c.data().thread, Thread::Running);
+    })?;
+    linker.func_wrap(IMPORT_MODULE, IMPORT_TOOL_DONE, |c: Caller<'_, ToolState>| {
+        // Under the lock: a thread about to block in `tool_join` sees the slot, or this wakes it.
+        drop(c.data().shared.hub.lock());
+        c.data().shared.hub.notify();
+    })?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_TOOL_JOIN,
+        |mut c: Caller<'_, ToolState>, slot: u32| -> wasmtime::Result<()> {
+            use wrela_abi::memory::{TASK_SLOT_SIZE, TASK_SLOTS, TASK_SLOTS_END};
+            if !(TASK_SLOTS..TASK_SLOTS_END).contains(&slot)
+                || !(slot - TASK_SLOTS).is_multiple_of(TASK_SLOT_SIZE)
+            {
+                return Err(wasmtime::format_err!("tool_join({slot}): that isn't a task's slot"));
+            }
+            let memory = c.data().shared.memory.clone();
+            block(&mut c, Thread::Joining(slot), move |_| Hub::joined(&memory, slot).then_some(()))
         },
     )?;
     // A tool has no GPU: every limit is 0.
@@ -1260,7 +1339,7 @@ fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
             Ok(())
         },
     )?;
-    // The same clock as its helpers read.
+    // Every thread reads the same clock.
     linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, |mut c: Caller<'_, ToolState>, at: u32| {
         let bytes = crate::program::clock_seconds().to_le_bytes();
         write(&mut c, at, &bytes, "clock")
@@ -1274,13 +1353,25 @@ fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
         IMPORT_MODULE,
         IMPORT_KEPT,
         |mut c: Caller<'_, ToolState>, at: u32, cap: u32| -> wasmtime::Result<i32> {
-            let start = c.data().start.clone();
-            let n = start.len().min(cap as usize);
-            write(&mut c, at, &start[..n], "kept")?;
-            Ok(start.len() as i32)
+            let shared = c.data().shared.clone();
+            let n = shared.start.len().min(cap as usize);
+            write(&mut c, at, &shared.start[..n], "kept")?;
+            Ok(shared.start.len() as i32)
         },
     )?;
     Ok(linker)
+}
+
+/// An instance of `module` in `store`, with the tool's host functions and its memory.
+fn instantiate(
+    linker: &Linker<ToolState>,
+    store: &mut Store<ToolState>,
+    module: &Module,
+) -> wasmtime::Result<wasmtime::Instance> {
+    let mut linker = linker.clone();
+    let memory = store.data().shared.memory.clone();
+    linker.define(&*store, IMPORT_MODULE, IMPORT_MEMORY, memory)?;
+    linker.instantiate(store, module)
 }
 
 #[cfg(test)]

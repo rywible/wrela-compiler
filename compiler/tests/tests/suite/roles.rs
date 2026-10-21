@@ -266,13 +266,8 @@ pub fn serve(time: f32) {
     let _ = shared(2)
 }
 
-pub fn tool_init() -> u32 {
-    tool_only(0)
-}
-
-pub fn tool(state: mut u32) -> u32 {
-    state = shared(state)
-    state
+pub fn tool() -> u32 {
+    shared(tool_only(0))
 }
 "#;
 
@@ -293,7 +288,7 @@ fn a_tool_build_has_only_the_tools_code() {
     let (tool_exports, tool_shared) = exports_and_memory(tool);
     let mut sorted = tool_exports.clone();
     sorted.sort();
-    assert_eq!(sorted, ["memory", "tool", "tool_init"], "{tool_exports:?}");
+    assert_eq!(sorted, ["memory", "tool"], "{tool_exports:?}");
     // Its memory shared with its helpers (std::par), with room to grow to 4 GiB less a page.
     assert!(tool_shared);
     assert_eq!(memory_max(tool), Some(65535));
@@ -393,20 +388,112 @@ pub fn tool() -> u32 {
 }
 
 #[test]
-fn the_tool_entries_signatures_are_checked() {
-    let main = r#"
-pub fn tool_init(seed: u32) -> u32 {
-    seed
+fn the_tool_entrys_signature_is_checked() {
+    for (name, main) in [
+        ("tool-signature-params", "pub fn tool(state: mut u32, extra: u32) -> u32 {\n    0\n}\n"),
+        ("tool-signature-result", "pub fn tool() -> f32 {\n    0.0\n}\n"),
+    ] {
+        let (codes, text) = errors(name, main);
+        assert_eq!(codes, ["E0703"], "{text}");
+        assert!(text.contains("`tool`'s signature is `tool() -> u32`"), "{text}");
+    }
 }
 
-pub fn tool(state: mut u32, extra: u32) -> f32 {
-    0.0
+#[test]
+fn a_client_or_a_server_that_drops_tool_tasks_is_e0708() {
+    // A tool task's drop waits for it in the tool host: no other role's build may reach it,
+    // also through a container's destructor.
+    let client = r#"
+pub struct State {
+    tasks: Vec<std::tool::Task<u32>>,
+}
+
+pub fn init() -> State {
+    State { tasks: Vec::new() }
+}
+
+pub fn frame(state: mut State, time: f32, width: u32, height: u32) {
+    state.tasks.clear()
 }
 "#;
-    let (codes, text) = errors("tool-signatures", main);
-    assert_eq!(codes, ["E0703", "E0703"], "{text}");
-    assert!(text.contains("`tool_init`'s signature is `tool_init() -> State`"), "{text}");
-    assert!(text.contains("`tool`'s signature is `tool() -> u32`"), "{text}");
+    let server = r#"
+pub struct Room {
+    tasks: Vec<std::tool::Task<u32>>,
+}
+
+pub fn serve_init() -> Room {
+    Room { tasks: Vec::new() }
+}
+
+pub fn serve(room: mut Room, time: f32) {
+    room.tasks.clear()
+}
+"#;
+    for (name, main, role) in
+        [("client-drops-tasks", client, "client"), ("server-drops-tasks", server, "server")]
+    {
+        let (codes, text) = errors(name, main);
+        assert!(!codes.is_empty() && codes.iter().all(|c| c == "E0708"), "{text}");
+        assert!(
+            text.contains(&format!("runs only in a tool build, and this is the {role} build's"))
+        );
+    }
+}
+
+#[test]
+fn dropping_what_holds_no_tool_task_stays_deterministic() {
+    // A type argument that names a task, where nothing holds one: a label's, a handle's.
+    let main = r#"
+use std::arena::Handle
+
+struct Label<T> {
+    name: String,
+}
+
+struct Holder {
+    at: Handle<std::tool::Task<u32>>,
+}
+
+@deterministic
+fn drop_label(l: take Label<std::tool::Task<u32>>) -> u32 {
+    let _ = take l
+    0
+}
+
+@deterministic
+fn drop_holder(h: take Holder) -> u32 {
+    let _ = take h
+    0
+}
+
+pub fn tool() -> u32 {
+    drop_label(Label { name: String::from("a") })
+}
+"#;
+    let (codes, text) = errors("drops-no-tool-task", main);
+    assert!(!codes.contains(&"E0600".to_string()), "{text}");
+    // A `Vec` of tasks holds them: dropping it waits for each.
+    let main = "@deterministic\nfn drop_all(tasks: take Vec<std::tool::Task<u32>>) -> u32 {\n    let _ = take tasks\n    0\n}\n\npub fn tool() -> u32 {\n    0\n}\n";
+    let (codes, text) = errors("drops-tool-tasks", main);
+    assert!(codes.contains(&"E0600".to_string()), "{text}");
+}
+
+#[test]
+fn joining_or_dropping_a_tool_task_isnt_deterministic() {
+    for (name, body) in [
+        ("joins-a-tool-task", "take task.join()"),
+        (
+            "drops-a-tool-task",
+            "let _ = take task
+    0",
+        ),
+    ] {
+        let main = format!(
+            "@deterministic\nfn finish(task: take std::tool::Task<u32>) -> u32 {{\n    {body}\n}}\n\npub fn tool() -> u32 {{\n    0\n}}\n"
+        );
+        let (codes, text) = errors(name, &main);
+        assert!(codes.contains(&"E0600".to_string()), "{name}: {text}");
+    }
 }
 
 // ---- the server host's rooms ------------------------------------------------------------------

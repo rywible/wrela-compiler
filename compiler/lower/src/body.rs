@@ -25,7 +25,7 @@ use wrela_sema::ty::*;
 use wrela_syntax::ast::{BinOp, UnOp};
 
 /// What E0708 notes: each role's build and the entries it's lowered from (§15.3).
-const ROLE_ENTRIES: &str = "a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve`; its tool build `tool_init` and `tool` (§15.3)";
+const ROLE_ENTRIES: &str = "a program's client build runs `init` and `frame` and what they reach; its server build `serve_init` and `serve`; its tool build `tool` (§15.3)";
 
 /// How a MIR local exists in the IR function.
 #[derive(Clone, Debug)]
@@ -2376,7 +2376,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
         let role = self.cx.data.role;
         let Some((only, _)) = self.cx.checked.program.func(func).attrs.role else { return };
-        if only == role {
+        if only == role || self.in_other_role() {
             return;
         }
         let name = self.cx.checked.program.fn_display_name(func);
@@ -2391,6 +2391,29 @@ impl<'c, 'a> Fl<'c, 'a> {
         )
         .with_note(ROLE_ENTRIES);
         self.cx.err(crate::gpu::with_call_chain(self, d));
+    }
+
+    /// Whether this function, or one that calls it on the way from the build's entries, is
+    /// marked for another role: the call into it was E0708 already, so what it reaches isn't
+    /// reported again (`std::tool`'s services and the host functions they call).
+    fn in_other_role(&self) -> bool {
+        let p = &self.cx.checked.program;
+        let role = self.cx.data.role;
+        let mut at = self.id;
+        for _ in 0..64 {
+            let source = self
+                .mb
+                .instances
+                .iter()
+                .find(|&(_, &id)| id == at)
+                .and_then(|(k, _)| k.source_fn());
+            if source.and_then(|f| p.func(f).attrs.role).is_some_and(|(r, _)| r != role) {
+                return true;
+            }
+            let Some(&(caller, _)) = self.mb.callers.get(&at) else { return false };
+            at = caller;
+        }
+        false
     }
 
     /// E0708 for GPU work recorded by a server's or a tool's build, which runs where there's no

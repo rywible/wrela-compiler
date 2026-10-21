@@ -2,7 +2,7 @@
 // tests.wrela: its scratch root, its fake clock, its fake sites (`std::tool::http`) and a fake
 // program (`std::tool::run`) that is a tool package, fakes/wrangler.
 
-/// The package's tool, which does nothing: its tests run their own jobs on its tool build.
+/// The package's tool, which does nothing: its tests run on its tool build.
 pub fn tool() -> u32 {
     0
 }
