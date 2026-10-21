@@ -6,7 +6,8 @@
 //!
 //! `<build-dir>` is a `wrela build` of a program with a server role: its `server/game.wasm`.
 //! Rooms' journals go in `--data` (default `<build-dir>/rooms`), each server build's in a
-//! directory of its own. The port defaults to 4433.
+//! directory of its own. The port defaults to 4433. `wrela-serve --version` says its release and
+//! source revision.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -22,6 +23,11 @@ fn usage() -> ExitCode {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["--version"] {
+        let revision = option_env!("WRELA_REVISION").unwrap_or("development build");
+        println!("wrela-serve {} ({revision})", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let Some(dir) = args.first().map(PathBuf::from) else { return usage() };
     let mut port: u16 = 4433;
     let mut data = dir.join("rooms");

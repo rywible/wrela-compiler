@@ -1,0 +1,60 @@
+# Builds a toolchain release for each pushed tag `vX.Y.Z` (tools/package.py) on Linux x86-64 and
+# macOS arm64, and publishes the tarballs and one SHA256SUMS as the tag's GitHub release: what
+# `wrela` downloads for a workspace that pins `toolchain = "X.Y.Z"` (spec/language.md §3.6). It
+# only builds and publishes: every check stays local (tools/check.sh). It belongs to
+# rywible/wrela-compiler and runs there alone; the tag must be Cargo's version.
+name: Toolchain release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    if: github.repository == 'rywible/wrela-compiler'
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Package
+        run: python3 tools/package.py --version "${GITHUB_REF_NAME#v}" --target "${{ matrix.target }}" --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    if: github.repository == 'rywible/wrela-compiler'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        working-directory: dist
+        run: |
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" \
+            --notes "The wrela toolchain ${GITHUB_REF_NAME#v}: wrela, wrela-host, wrela-serve and Binaryen's wasm-opt for each target. A workspace pins it with toolchain = \"${GITHUB_REF_NAME#v}\"." \
+            *.tar.gz SHA256SUMS

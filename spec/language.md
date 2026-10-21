@@ -410,10 +410,23 @@ members = [
 - **A workspace's manifest is a package's too only if it has `[package]`.** Without one, its directory isn't a package, and checking or building it is E0223.
 - **Each member is a package with a name of its own.** A member that isn't a directory with a `wrela.toml`, a `/*` that names no package, and two members with one name are E0223. So is a member that the workspace's versioned `.gitignore` files ignore, read as `wrela suite` reads them (a directory inside an ignored one is ignored too): git would never commit it, so the workspace would break in every other checkout. A directory listed twice is one member. A workspace dependency with no workspace above it, or with no member of that name, is E0220.
 - **`path` dependencies work in a workspace and outside it.**
-- **`[workspace]`'s keys are arrays of strings.** Any other key, a value of another kind, or a section declared twice, is E0219.
-  - `members`, above.
-  - `allow`, `exclude` and `pending`: globs of the workspace's files, for `wrela suite allow` (§13.2). A glob is a path from this file, with `/` between its parts, and no part empty, `.` or `..`. `*` and `?` match within a part, and a part `**` matches any number of parts.
-  - `untested`: members, by their directories, whose tests `wrela suite` runs only when they are named. A directory that isn't a member is E0223.
+- **`[workspace]` has these keys.** Any other key, a value of another kind, or a section declared twice, is E0219.
+  - `members`, above: an array of strings.
+  - `allow`, `exclude` and `pending`: arrays of globs of the workspace's files, for `wrela suite allow` (§13.2). A glob is a path from this file, with `/` between its parts, and no part empty, `.` or `..`. `*` and `?` match within a part, and a part `**` matches any number of parts.
+  - `untested`: an array of members, by their directories, whose tests `wrela suite` runs only when they are named. A directory that isn't a member is E0223.
+  - `toolchain`: the toolchain release that the workspace runs, a string of three whole numbers such as `"0.1.0"` (below).
+
+#### The toolchain
+
+A workspace pins the toolchain release it is built with: `toolchain = "0.1.0"` under `[workspace]`. A release is `wrela`, `wrela-host`, `wrela-serve` and Binaryen's `wasm-opt` for one target (`x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`). `wrela` holds std and the browser runtime, so a release needs nothing else.
+
+- **A `wrela` runs the release that the workspace pins.** The workspace is the nearest `wrela.toml` with `[workspace]` at or above the current directory. If its `toolchain` isn't this `wrela`'s release, `wrela` runs that release's `wrela` instead, with the same arguments, and exits as it does. With no pin, or with this release, it runs as itself.
+- **Releases are kept in `~/.wrela/toolchains/X.Y.Z`.** A release that isn't there is downloaded over HTTPS from `https://github.com/rywible/wrela-compiler/releases/download/vX.Y.Z/`: `wrela-X.Y.Z-<target>.tar.gz` and `SHA256SUMS`. A tarball whose SHA-256 isn't the one that `SHA256SUMS` gives is refused. It is unpacked into a temporary directory, which is then renamed into place. A release that doesn't exist, a checksum that doesn't match, and a network that can't be reached each stop the command with an error (status 2). `WRELA_TOOLCHAIN_RELEASES` names another place to download releases from.
+- **`WRELA_TOOLCHAIN` overrides the pin.** It is the path of a `wrela-compiler` checkout (a directory with a `Cargo.toml`), which `wrela` builds (`cargo build --release -p wrela -p wrela-host -p wrela-serve --bins`) and runs from its `target/release`, or of an unpacked release, which it runs from its `bin/`.
+- **The `wrela` that runs is never replaced again.** It runs with `WRELA_TOOLCHAIN_CHOSEN` set to why it was chosen, and a `wrela` with that variable set runs as itself.
+- **`wrela toolchain` says which toolchain runs,** where it is and why. `wrela --version` (and `wrela-host --version`, `wrela-serve --version`) says the release and the source revision that it was built from.
+- **An optimized build uses the release's own `wasm-opt`** (`wrela build --optimize`): the one beside `wrela`, which must be Binaryen 133 exactly. A `wrela` without one, such as a checkout's, uses `WRELA_WASM_OPT` or the `wasm-opt` on `PATH`, Binaryen 133 or later.
+- **A release's reference docs link std to the toolchain's source** (`wrela doc --export`): `https://github.com/rywible/wrela-compiler` at the revision the release was built from. A package's items link to the repository and commit that the export is given.
 
 A workspace also declares its tools (§15.5), each in a `[tools.<name>]`: a member with a tool build, and the most that `wrela tool <name>` grants it.
 

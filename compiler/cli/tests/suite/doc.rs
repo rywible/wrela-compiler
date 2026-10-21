@@ -172,6 +172,9 @@ fn the_export_writes_pages_an_index_and_a_map() {
         serde_json::from_slice(&std::fs::read(root.join("out/index.json")).expect("index.json"))
             .expect("JSON");
     assert_eq!(index["commit"], "abcdef1");
+    // A development build's std is the packages' repository's, at their commit.
+    assert_eq!(index["toolchain"]["repository"], index["repository"]);
+    assert_eq!(index["toolchain"]["commit"], "abcdef1");
     let area = index["items"]
         .as_array()
         .expect("items")

@@ -12,6 +12,7 @@
 //!   hash.
 //! - `wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]`: a tick log's ticks,
 //!   each with its records, checking each state hash; it fails at the first that differs.
+//! - `wrela-host --version`: its release and source revision.
 //!
 //! A build of this binary without the `gpu` feature has the last two only (an x86-64 build run
 //! under Rosetta, say, which checks the sim's bits on x86's code generation).
@@ -298,6 +299,11 @@ fn run(args: &Args) -> Result<(), Failure> {
 }
 
 fn main() -> ExitCode {
+    if std::env::args().skip(1).eq(["--version"]) {
+        let revision = option_env!("WRELA_REVISION").unwrap_or("development build");
+        println!("wrela-host {} ({revision})", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     let args = match parse(std::env::args().skip(1)) {
         Ok(args) => args,
         Err(message) => {

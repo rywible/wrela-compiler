@@ -3,19 +3,22 @@
 //! a trap still says where it happened. The table leaves the module for a file of its own beside
 //! it ([`wrela_abi::lines::SIDECAR`]), which a host reads only when a trap needs it.
 //!
-//! `wasm-opt` is found on `PATH`, or at `WRELA_WASM_OPT`. [`optimize_with`] runs it through a
-//! caller's runner: the tool host's `toolchain` service runs it in a process group the host owns,
-//! and kills that group when the request is cancelled, past its deadline, or when the tool ends
-//! (language.md §15.5). It may use only the features the
-//! back end emits: plain SIMD (never relaxed, [`wrela_wasm::check_no_relaxed_simd`]), threads,
-//! bulk memory, sign extension and multiple results. It assumes traps happen, so it keeps every
-//! one, and isn't given fast math, so float operations keep their IEEE results.
+//! `wasm-opt` is the toolchain's own, beside the `wrela` executable in a release's `bin/`, which
+//! must be exactly [`WASM_OPT_VERSION`]; else the one at `WRELA_WASM_OPT`, or on `PATH`, that
+//! release or later. [`optimize_with`] runs it through a caller's runner: the tool host's
+//! `toolchain` service runs it in a process group the host owns, and kills that group when the
+//! request is cancelled, past its deadline, or when the tool ends (language.md §15.5). It may use
+//! only the features the back end emits: plain SIMD (never relaxed,
+//! [`wrela_wasm::check_no_relaxed_simd`]), threads, bulk memory, sign extension and multiple
+//! results. It assumes traps happen, so it keeps every one, and isn't given fast math, so float
+//! operations keep their IEEE results.
 
 use std::path::PathBuf;
 use std::process::Command;
 use wrela_abi::lines::{self, Lines};
 
-/// The oldest Binaryen release whose source maps keep segments with no location.
+/// The Binaryen release a toolchain release ships: the oldest whose source maps keep segments
+/// with no location.
 pub const WASM_OPT_VERSION: u32 = 133;
 
 /// The features `wasm-opt` may use: exactly those the back end emits.
@@ -107,21 +110,45 @@ pub fn optimize_with(wasm: &[u8], run: &mut Runner) -> Result<(Vec<u8>, Vec<u8>)
     Ok((optimized, table.encode()))
 }
 
-/// The `wasm-opt` to run, checked to be [`WASM_OPT_VERSION`] or later.
+/// The `wasm-opt` to run: the toolchain's own, beside this executable (a release's `bin/`),
+/// which must be exactly [`WASM_OPT_VERSION`]; else `WRELA_WASM_OPT`'s, else the one on `PATH`,
+/// either [`WASM_OPT_VERSION`] or later.
 fn wasm_opt(run: &mut Runner) -> Result<PathBuf, String> {
-    let program = std::env::var_os("WRELA_WASM_OPT").map_or("wasm-opt".into(), PathBuf::from);
+    let bundled = std::env::current_exe()
+        .and_then(|e| e.canonicalize())
+        .ok()
+        .and_then(|e| Some(e.parent()?.join("wasm-opt")))
+        .filter(|p| p.is_file());
+    let exact = bundled.is_some();
+    let program = bundled.unwrap_or_else(|| {
+        std::env::var_os("WRELA_WASM_OPT").map_or("wasm-opt".into(), PathBuf::from)
+    });
     let missing = |why: String| {
-        format!(
-            "an optimized build needs Binaryen's `wasm-opt` {WASM_OPT_VERSION} or later \
-             (on PATH, or at WRELA_WASM_OPT): {why}"
-        )
+        if exact {
+            format!(
+                "an optimized build needs the toolchain's own `wasm-opt`, Binaryen \
+                 {WASM_OPT_VERSION}, at `{}`: {why}",
+                program.display()
+            )
+        } else {
+            format!(
+                "an optimized build needs Binaryen's `wasm-opt` {WASM_OPT_VERSION} or later \
+                 (on PATH, or at WRELA_WASM_OPT): {why}"
+            )
+        }
     };
     let out = run(&program, &["--version".into()]).map_err(missing)?;
     let text = String::from_utf8_lossy(&out.stdout);
     match version(&text) {
-        Some(v) if v >= WASM_OPT_VERSION => Ok(program),
+        Some(v) if accepts(v, exact) => Ok(program),
         _ => Err(missing(format!("it says `{}`", text.trim()))),
     }
+}
+
+/// Whether `wasm-opt` release `v` is used: exactly [`WASM_OPT_VERSION`] if it's the toolchain's
+/// own (`exact`), and that or later if it's the machine's.
+fn accepts(v: u32, exact: bool) -> bool {
+    if exact { v == WASM_OPT_VERSION } else { v >= WASM_OPT_VERSION }
 }
 
 /// The release in `wasm-opt --version`'s `wasm-opt version 133 (version_133)`.
@@ -159,5 +186,12 @@ mod tests {
         assert_eq!(version("wasm-opt version 133 (version_133)\n"), Some(133));
         assert_eq!(version("wasm-opt version 99\n"), Some(99));
         assert_eq!(version("something else"), None);
+    }
+
+    #[test]
+    fn the_toolchain_s_own_wasm_opt_is_exactly_its_release_and_the_machine_s_is_that_or_later() {
+        assert!(accepts(WASM_OPT_VERSION, true) && accepts(WASM_OPT_VERSION, false));
+        assert!(!accepts(WASM_OPT_VERSION + 1, true) && accepts(WASM_OPT_VERSION + 1, false));
+        assert!(!accepts(WASM_OPT_VERSION - 1, true) && !accepts(WASM_OPT_VERSION - 1, false));
     }
 }

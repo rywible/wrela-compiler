@@ -7,7 +7,9 @@
 //! input gives the same bytes.
 //!
 //! The items come from the index `wrela doc` reads (`doc.rs`), so a page says what a lookup
-//! says. The spec is the one this compiler was built with.
+//! says. The spec is the one this compiler was built with. A package's items link to their
+//! source in the repository given, at its commit; std's link to the toolchain's, which for a
+//! release is its own repository at the revision it was built from (`index.json`'s `toolchain`).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -139,9 +141,13 @@ pub(crate) fn files_of(
         sections.extend(sections_of(p));
     }
     let source = format!("{repository}/blob/{}/", commit.unwrap_or("main"));
+    let (std_repository, std_commit) = toolchain_source(repository, commit, crate::pin::REVISION);
+    let std_source = format!("{std_repository}/blob/{}/", std_commit.unwrap_or("main"));
     let mut items: Vec<Value> = Vec::new();
     for m in 0..index.modules.len() {
-        let (page, mut records) = module_page(&index, m, &source);
+        let in_std = index.modules[m].path.first().is_some_and(|p| p == "std");
+        let (page, mut records) =
+            module_page(&index, m, if in_std { &std_source } else { &source });
         if page.text.is_empty() {
             continue;
         }
@@ -161,6 +167,7 @@ pub(crate) fn files_of(
         "version": version,
         "commit": commit,
         "repository": repository,
+        "toolchain": { "version": version, "repository": std_repository, "commit": std_commit },
         "pages": pages.iter().map(|p| json!({
             "path": p.path, "title": p.title, "summary": p.summary, "kind": p.kind,
         })).collect::<Vec<_>>(),
@@ -185,6 +192,20 @@ pub(crate) fn files_of(
     files.push(("llms.txt".into(), map.into_bytes()));
     files.push(("llms-full.txt".into(), all.into_bytes()));
     Ok((pages.len(), files))
+}
+
+/// Where std's and the spec's source is, and its revision: a release's toolchain repository at
+/// the revision it was built from (`release`), else the packages' (`repository` at `commit`),
+/// which a development build's toolchain is built beside.
+fn toolchain_source<'a>(
+    repository: &'a str,
+    commit: Option<&'a str>,
+    release: Option<&'a str>,
+) -> (&'a str, Option<&'a str>) {
+    match release {
+        Some(revision) => (crate::pin::REPOSITORY, Some(revision)),
+        None => (repository, commit),
+    }
 }
 
 /// The pages by group, in the order a reader learns them: the spec, then std, then the packages
@@ -717,6 +738,16 @@ mod tests {
             first_sentence("Goals:\n\n- **Memory-safe** without a collector, always.\n"),
             "Memory-safe without a collector, always."
         );
+    }
+
+    #[test]
+    fn std_s_source_is_the_toolchain_release_s_and_the_packages_otherwise() {
+        let ws = "https://github.com/rywible/wrela";
+        assert_eq!(
+            toolchain_source(ws, Some("abcdef1"), Some("1234567")),
+            ("https://github.com/rywible/wrela-compiler", Some("1234567"))
+        );
+        assert_eq!(toolchain_source(ws, Some("abcdef1"), None), (ws, Some("abcdef1")));
     }
 
     #[test]

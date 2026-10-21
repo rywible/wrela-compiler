@@ -25,6 +25,10 @@ sha2 = "0.10"
 mimalloc.workspace = true
 # `wrela tool`'s Ctrl-C: it stops the tool, and the host cleans up after it.
 ctrlc = "3"
+# The toolchain a workspace pins (`pin`): its release downloaded over HTTPS, and unpacked.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+flate2 = "1"
+tar = { version = "0.4", default-features = false }
 
 [lints]
 workspace = true

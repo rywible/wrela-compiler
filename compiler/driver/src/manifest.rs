@@ -22,6 +22,7 @@
 //! exclude = ["compiler/**"]          # globs the allowlist check doesn't look at
 //! pending = ["games/console.toml"]   # files not allowed yet, reported until they go
 //! untested = ["games/big"]           # members whose tests the whole suite doesn't run yet
+//! toolchain = "0.1.0"                # the toolchain release that runs in it (`wrela toolchain`)
 //!
 //! [tools.release]
 //! package = "tools/release"         # a member with a tool build
@@ -89,6 +90,9 @@ pub struct WorkspaceDecl {
     /// `untested`: members, by their directories, whose tests the whole suite doesn't run yet;
     /// it says so, and naming them still runs them.
     pub untested: Vec<(String, Span)>,
+    /// `toolchain`: the release of the toolchain the workspace is pinned to, `X.Y.Z`. A `wrela`
+    /// of another version runs that one instead (the CLI's `pin`).
+    pub toolchain: Option<(String, Span)>,
     /// Each `[tools.<name>]`.
     pub tools: Vec<ToolDecl>,
 }
@@ -205,6 +209,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                         exclude: Vec::new(),
                         pending: Vec::new(),
                         untested: Vec::new(),
+                        toolchain: None,
                         tools: Vec::new(),
                     })
                 }
@@ -372,6 +377,16 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                     w.untested = dirs;
                 }
             }
+            ("workspace", "toolchain", Value::Str(s)) => {
+                if !is_release(&s) {
+                    errors.push(
+                        bad(at, content.len(), format!("`{s}` isn't a toolchain release"))
+                            .with_note("a release is three numbers with `.` between them, such as `toolchain = \"0.1.0\"`"),
+                    );
+                } else if let Some(w) = &mut out.workspace {
+                    w.toolchain = Some((s, span));
+                }
+            }
             ("workspace", key @ ("allow" | "exclude" | "pending"), Value::Array(items)) => {
                 let mut globs = Vec::new();
                 for (v, vspan) in items {
@@ -406,7 +421,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                 .with_note(match sec {
                     "package" => "`[package]` has `name = \"...\"` and `unsafe = true`",
                     "dependencies" => "`[dependencies]` has `name = { path = \"...\" }` and `name = { workspace = true }`",
-                    _ => "`[workspace]` has `members`, `allow`, `exclude`, `pending` and `untested`, each `[\"...\", ...]`",
+                    _ => "`[workspace]` has `members`, `allow`, `exclude`, `pending` and `untested`, each `[\"...\", ...]`, and `toolchain = \"X.Y.Z\"`",
                 })),
         }
     }
@@ -436,6 +451,19 @@ pub fn is_tool_name(s: &str) -> bool {
 /// digits, `_`, `-` and `.`.
 fn is_grant_name(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+}
+
+/// Whether `s` names a toolchain release: three whole numbers with `.` between them, such as
+/// `0.1.0`, none with a leading zero.
+pub fn is_release(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() == 3
+        && parts.iter().all(|p| {
+            !p.is_empty()
+                && p.len() <= 9
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && (p.len() == 1 || !p.starts_with('0'))
+        })
 }
 
 /// Whether `s` is a path from the workspace's directory that stays inside it: `.`, or parts
@@ -803,10 +831,29 @@ package = "tools/lint"
     }
 
     #[test]
+    fn a_workspace_pins_a_toolchain_release() {
+        let w = parse(file(), "[workspace]\nmembers = []\ntoolchain = \"0.12.3\"\n")
+            .expect("parses")
+            .workspace
+            .expect("a workspace");
+        assert_eq!(w.toolchain.map(|(v, _)| v).as_deref(), Some("0.12.3"));
+        let none = parse(file(), "[workspace]\n").expect("parses").workspace.expect("one");
+        assert!(none.toolchain.is_none());
+        assert!(is_release("0.1.0") && is_release("10.0.20"));
+        for bad in ["0.1", "0.1.0.0", "0.1.x", "00.1.0", "", "1..0", "+1.0.0"] {
+            assert!(!is_release(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn rejects_what_it_doesnt_know() {
         for text in [
             "[workspaces]\n",
-            "[workspace]\ntoolchain = \"0.1.0\"\n",
+            "[workspace]\ntoolchain = \"0.1\"\n",
+            "[workspace]\ntoolchain = \"v0.1.0\"\n",
+            "[workspace]\ntoolchain = \"0.01.0\"\n",
+            "[workspace]\ntoolchain = 1\n",
+            "[package]\ntoolchain = \"0.1.0\"\n",
             "[workspace]\nmembers = \"geo\"\n",
             "[workspace]\nmembers = [\"geo\"\n",
             "[workspace]\nmembers = [\"a\" \"b\"]\n",

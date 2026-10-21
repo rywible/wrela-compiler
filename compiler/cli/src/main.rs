@@ -63,7 +63,12 @@
 //!                                         every check of the workspace: its members' format,
 //!                                         its allowlist and its members' tests; or one
 //!                                         (`fmt`, `allow`, `wrela::<package-path>::[<test>]`)
+//! wrela toolchain                         which toolchain runs here, where it is and why
+//! wrela --version                         this toolchain's release and source revision
 //! ```
+//!
+//! In a workspace whose manifest pins another toolchain release (`toolchain = "X.Y.Z"`), or with
+//! `WRELA_TOOLCHAIN` set, every command runs that toolchain instead (`pin`).
 //!
 //! Exit status: 0 success, 1 the program has errors (or `fmt --check` found unformatted
 //! files, or a test failed), 2 a usage or I/O error.
@@ -82,6 +87,7 @@ mod explain;
 mod export;
 mod fix;
 mod fmt;
+mod pin;
 mod pipelines;
 mod primer;
 mod profile;
@@ -120,12 +126,17 @@ pub(crate) fn usage() -> ExitCode {
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
+        "wrela toolchain",
+        "wrela --version",
     ];
     eprintln!("usage:\n  {}\nqueries: {}", lines.join("\n  "), wrela_driver::query::KINDS);
     ExitCode::from(2)
 }
 
 fn main() -> ExitCode {
+    if let Some(status) = pin::redirect() {
+        return status;
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else { return usage() };
     let rest = &args[1..];
@@ -173,6 +184,11 @@ fn main() -> ExitCode {
         "context" => query::context(rest),
         "trace" => trace::trace(rest),
         "bisect" => trace::bisect(rest),
+        "toolchain" => pin::run(rest),
+        "--version" | "-V" if rest.is_empty() => {
+            println!("{}", pin::version_line());
+            ExitCode::SUCCESS
+        }
         "--help" | "-h" | "help" => {
             usage();
             ExitCode::SUCCESS
