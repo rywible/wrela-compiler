@@ -47,6 +47,9 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("TASK_SLOT_SIZE", TASK_SLOT_SIZE, "The bytes of each slot."),
     ("SLOT_THREAD", SLOT_THREAD, "The thread a slot's job ran on: the host writes it on a trap."),
     ("SLOT_FREE", SLOT_FREE, "A slot's state when it holds no job."),
+    ("SLOT_QUEUED", SLOT_QUEUED, "A slot's state while its job waits for a thread to start it."),
+    ("SLOT_STARTED", SLOT_STARTED, "A slot's state while a thread runs its job."),
+    ("SLOT_FINISHED", SLOT_FINISHED, "A slot's state once its job has finished."),
     ("SLOT_FAILED", SLOT_FAILED, "A slot's state when its job trapped: the host writes it."),
     ("TICK_RECORDS", TICK_RECORDS, "The next tick's records: a `u32` count, then input events."),
     ("MAX_TICK_RECORDS", MAX_TICK_RECORDS, "The most records a tick takes."),
@@ -63,11 +66,6 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         "How many samples one `__audio` call renders, in each channel.",
     ),
     ("AUDIO_CHANNELS", crate::AUDIO_CHANNELS, "The voice's channels: left, then right."),
-    (
-        "TOOL_RUNNING",
-        crate::TOOL_RUNNING,
-        "What a tool's `tool` returns to be called again, rather than an exit status.",
-    ),
     (
         "MAX_TEXTURE_3D",
         crate::stream::MAX_TEXTURE_3D,

@@ -1,8 +1,7 @@
-//! Tool tests (language.md §13.2): `@test(tool, ...) @job fn name() { ... }`, a job run on the
-//! package's tool build, on the tool host (§15.5). The package is lowered once as a tool build
-//! whose entries are the tests' (each test's job started and resumed by
-//! `tool_test_init.<i>` and `tool_test.<i>`), and each test runs in a `wrela` process of its
-//! own (`wrela tool --test <dir>`), in a process group of its own, so a test that doesn't end
+//! Tool tests (language.md §13.2): `@test(tool, ...) fn name() { ... }`, run on the package's
+//! tool build, on the tool host (§15.5). The package is lowered once as a tool build whose
+//! entries are the tests' (each test run by `tool_test.<i>`), and each test runs in a `wrela`
+//! process of its own (`wrela tool --test <dir>`), in a process group of its own, so a test that doesn't end
 //! is killed with everything in its group.
 //!
 //! Each test's run gets: a new, empty write root `scratch`; its budget (`budget: s`, 10 s
@@ -12,7 +11,7 @@
 //! only; and the toolchain and drive services, within those roots; and, with `browser: true`,
 //! Chrome (`std::tool::browser`), on the real clock. Nothing else: no other file, no network,
 //! no secret, no other program. It passes if
-//! the job ends, and fails if it panics or traps, if its budget runs out, or if the host fails.
+//! it returns, and fails if it panics or traps, if its budget runs out, or if the host fails.
 //! If the process itself is still running [`MARGIN`] past the budget, it's killed, and the test
 //! fails.
 //!
@@ -56,9 +55,8 @@ pub fn set_runner(wrela: PathBuf) {
 pub struct Spec {
     /// The tool build's module.
     pub wasm: PathBuf,
-    /// The exports that start and resume the test's job.
-    pub init: String,
-    pub resume: String,
+    /// The export that runs the test.
+    pub entry: String,
     /// The run's budget, in seconds.
     pub budget: f64,
     /// The new write root `scratch`.
@@ -89,7 +87,7 @@ pub struct Spec {
 /// How a tool test's run ended, as its process writes it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ended {
-    /// Whether the job ended: the test passed.
+    /// Whether the test returned: it passed.
     pub passed: bool,
     /// How the run ended, in the host's words.
     pub end: String,
@@ -177,7 +175,7 @@ pub(crate) fn run(
                     p.func(f).name_span,
                     format!("the tool test `{name}` failed: {why}"),
                 )
-                .with_note("a tool test passes if its job ends; a panic, a trap, its budget running out or the host's failure fail it (§13.2)")
+                .with_note("a tool test passes if it returns; a panic, a trap, its budget running out or the host's failure fail it (§13.2)")
             };
             let (failed, lines) = match ran {
                 Ok((ended, lines)) => ((!ended.passed).then(|| fail(ended.end)), lines),
@@ -231,8 +229,7 @@ fn one(
     }
     let spec = Spec {
         wasm: module.to_path_buf(),
-        init: format!("{}.{i}", wrela_lower::TOOL_TEST_INIT),
-        resume: format!("{}.{i}", wrela_lower::TOOL_TEST),
+        entry: format!("{}.{i}", wrela_lower::TOOL_TEST),
         budget: test.budget,
         scratch,
         net: test.net.clone(),

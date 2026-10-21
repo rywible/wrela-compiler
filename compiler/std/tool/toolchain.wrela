@@ -18,9 +18,8 @@
 // (`ok` false). A request fails for what the host can't do: a path outside the roots, a
 // deadline passed.
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, ToolError, ask, malformed}
 
 /// A diagnostic: whether it's an error (else a warning), its code (`E0220`), its message, where
 /// it is (`file:line:column`, or empty), and the whole of it as `wrela check` shows it.
@@ -117,10 +116,9 @@ pub struct Formatted: Clone {
 
 /// Builds the package at `pkg` into `out`, a directory in a write root, as `wrela build -o`
 /// does: the same files, byte for byte. A file an earlier build wrote there and this one doesn't
-/// is removed, and one no build wrote is left, and stops the build. `read_built` reads the
-/// answer.
+/// is removed, and one no build wrote is left, and stops the build.
 @tool
-pub fn build(pkg: str, out: str, options: BuildOptions) -> Pending<u8> {
+pub fn build(pkg: str, out: str, options: BuildOptions) -> Call<Built> {
     var w = Writer::new()
     w.write_str(pkg)
     w.write_str(out)
@@ -142,17 +140,17 @@ pub fn build(pkg: str, out: str, options: BuildOptions) -> Pending<u8> {
 }
 
 /// Runs the tests of the package at `pkg` whose names hold `filter` (all, for ""), as `wrela
-/// test` does: `read_tested` reads the answer. A tool test isn't run here (it needs `wrela
+/// test` does. A tool test isn't run here (it needs `wrela
 /// test`'s processes): it fails, saying so.
 @tool
-pub fn test(pkg: str, filter: str, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn test(pkg: str, filter: str, timeout: f64 = 0.0) -> Call<Tested> {
     let none: [Override; 0] = []
     test_with(pkg, filter, none, timeout)
 }
 
 /// `test`, its dependencies read from other packages as `overrides` says (as a build's are).
 @tool
-pub fn test_with(pkg: str, filter: str, overrides: [Override], timeout: f64 = 0.0) -> Pending<u8> {
+pub fn test_with(pkg: str, filter: str, overrides: [Override], timeout: f64 = 0.0) -> Call<Tested> {
     var w = Writer::new()
     w.write_str(pkg)
     w.write_str(filter)
@@ -161,16 +159,16 @@ pub fn test_with(pkg: str, filter: str, overrides: [Override], timeout: f64 = 0.
     ask("toolchain/test", take w.into_bytes())
 }
 
-/// Checks the package at `pkg`, as `wrela check` does: `read_checked` reads the answer.
+/// Checks the package at `pkg`, as `wrela check` does.
 @tool
-pub fn check(pkg: str, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn check(pkg: str, timeout: f64 = 0.0) -> Call<Checked> {
     let none: [Override; 0] = []
     check_with(pkg, none, timeout)
 }
 
 /// `check`, its dependencies read from other packages as `overrides` says (as a build's are).
 @tool
-pub fn check_with(pkg: str, overrides: [Override], timeout: f64 = 0.0) -> Pending<u8> {
+pub fn check_with(pkg: str, overrides: [Override], timeout: f64 = 0.0) -> Call<Checked> {
     var w = Writer::new()
     w.write_str(pkg)
     write_overrides(mut w, overrides)
@@ -189,9 +187,9 @@ fn write_overrides(w: mut Writer, overrides: [Override]) {
 
 /// Formats the `.wrela` files at `paths` (root paths of files, or of directories, each package's
 /// files as `wrela check` reads them), as `wrela fmt` does; with `check`, writes nothing and
-/// only says which aren't formatted (`wrela fmt --check`). `read_formatted` reads the answer.
+/// only says which aren't formatted (`wrela fmt --check`).
 @tool
-pub fn fmt(paths: [String], check: bool, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn fmt(paths: [String], check: bool, timeout: f64 = 0.0) -> Call<Formatted> {
     var w = Writer::new()
     w.write_u32(paths.len())
     for p in paths {
@@ -204,8 +202,7 @@ pub fn fmt(paths: [String], check: bool, timeout: f64 = 0.0) -> Pending<u8> {
 
 /// Writes the reference docs of std and `packages` into `out`, a new or empty directory in a
 /// write root, as `wrela doc --export` does: their source is `repository` at `revision` ("" for
-/// `main`), each package's files named by their paths in its root. `read_exported` reads the
-/// answer.
+/// `main`), each package's files named by their paths in its root.
 @tool
 pub fn doc_export(
     packages: [String],
@@ -213,7 +210,7 @@ pub fn doc_export(
     repository: str,
     revision: str,
     timeout: f64 = 0.0,
-) -> Pending<u8> {
+) -> Call<u32> {
     var w = Writer::new()
     w.write_u32(packages.len())
     for p in packages {
@@ -229,14 +226,14 @@ pub fn doc_export(
 /// Answers `queries` (as `wrela query` takes them: `type main.wrela:3:9`, `fields
 /// main.wrela:3:9`, `callees main::step`) on the package at `pkg`, with one check, its
 /// dependencies read from other packages as `overrides` says (as a build's are):
-/// `read_queried` reads the answer, `wrela query --json`'s JSON.
+/// `wrela query --json`'s JSON.
 @tool
 pub fn query(
     pkg: str,
     queries: [String],
     overrides: [Override],
     timeout: f64 = 0.0,
-) -> Pending<u8> {
+) -> Call<String> {
     var w = Writer::new()
     w.write_str(pkg)
     w.write_u32(queries.len())
@@ -250,9 +247,8 @@ pub fn query(
 
 /// The literals of the lifted build in `build` (a directory with its `lift.json`) of the program
 /// at `program`: their values as the build has them, and in the files it lifted as they are now.
-/// `read_literals` reads the answer.
 @tool
-pub fn literals(program: str, build: str, timeout: f64 = 0.0) -> Pending<u8> {
+pub fn literals(program: str, build: str, timeout: f64 = 0.0) -> Call<Literals> {
     var w = Writer::new()
     w.write_str(program)
     w.write_str(build)
@@ -264,10 +260,10 @@ pub fn literals(program: str, build: str, timeout: f64 = 0.0) -> Pending<u8> {
 /// `program`, each by its index in the build, into the files as they are now, through `wrela
 /// edit`'s code: each literal keeps its form, and nothing is written if a file has changed past
 /// its literals since the build, or if `wrela edit` refuses. The files are in write roots, and
-/// each is replaced whole. `read_edited` reads the answer: `wrela edit --json`'s, on one line,
+/// each is replaced whole. The answer is `wrela edit --json`'s, on one line,
 /// with `written` true, or `{"file", "why", "written": false}`.
 @tool
-pub fn edit(program: str, build: str, edits: [(u32, f32)], timeout: f64 = 0.0) -> Pending<u8> {
+pub fn edit(program: str, build: str, edits: [(u32, f32)], timeout: f64 = 0.0) -> Call<String> {
     var w = Writer::new()
     w.write_str(program)
     w.write_str(build)
@@ -322,114 +318,105 @@ fn read_diagnostics(r: mut Reader) -> Option<Vec<Diagnostic>> {
     Some(out)
 }
 
-/// Reads a `build` answer.
-pub fn read_built(polled: take Result<Vec<u8>, IoError>) -> Result<Built, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/build")) }
-    let Some(files) = read_strings(mut r) else { return Err(malformed("toolchain/build")) }
-    let Some(diagnostics) = read_diagnostics(mut r) else {
-        return Err(malformed("toolchain/build"))
+/// A `build` answer.
+impl Answer for Built {
+    fn read(bytes: take Vec<u8>) -> Result<Built, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(ok) = r.read_u8() else { return Err(malformed("a build")) }
+        let Some(files) = read_strings(mut r) else { return Err(malformed("a build")) }
+        let Some(diagnostics) = read_diagnostics(mut r) else {
+            return Err(malformed("a build"))
+        }
+        let Ok(computed) = r.read_u32() else { return Err(malformed("a build")) }
+        let Ok(cached) = r.read_u32() else { return Err(malformed("a build")) }
+        if !r.at_end() {
+            return Err(malformed("a build"))
+        }
+        Ok(Built { ok: ok != 0, files, diagnostics, computed, cached })
     }
-    let Ok(computed) = r.read_u32() else { return Err(malformed("toolchain/build")) }
-    let Ok(cached) = r.read_u32() else { return Err(malformed("toolchain/build")) }
-    if !r.at_end() {
-        return Err(malformed("toolchain/build"))
-    }
-    Ok(Built { ok: ok != 0, files, diagnostics, computed, cached })
 }
 
-/// Reads a `test` answer.
-pub fn read_tested(polled: take Result<Vec<u8>, IoError>) -> Result<Tested, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(passed) = r.read_u8() else { return Err(malformed("toolchain/test")) }
-    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/test")) }
-    if n > r.left() {
-        return Err(malformed("toolchain/test"))
+/// A `test` answer.
+impl Answer for Tested {
+    fn read(bytes: take Vec<u8>) -> Result<Tested, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(passed) = r.read_u8() else { return Err(malformed("a test run")) }
+        let Ok(n) = r.read_u32() else { return Err(malformed("a test run")) }
+        if n > r.left() {
+            return Err(malformed("a test run"))
+        }
+        var results: Vec<TestResult> = Vec::with_capacity(n)
+        for _ in 0..n {
+            let Ok(name) = r.read_string() else { return Err(malformed("a test run")) }
+            let Ok(at) = r.read_string() else { return Err(malformed("a test run")) }
+            let Ok(ok) = r.read_u8() else { return Err(malformed("a test run")) }
+            let Ok(message) = r.read_string() else { return Err(malformed("a test run")) }
+            let Some(printed) = read_strings(mut r) else { return Err(malformed("a test run")) }
+            results.push(TestResult { name, at, passed: ok != 0, message, printed })
+        }
+        let Some(diagnostics) = read_diagnostics(mut r) else { return Err(malformed("a test run")) }
+        let Ok(filtered_out) = r.read_u32() else { return Err(malformed("a test run")) }
+        if !r.at_end() {
+            return Err(malformed("a test run"))
+        }
+        Ok(Tested { passed: passed != 0, results, diagnostics, filtered_out })
     }
-    var results: Vec<TestResult> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(name) = r.read_string() else { return Err(malformed("toolchain/test")) }
-        let Ok(at) = r.read_string() else { return Err(malformed("toolchain/test")) }
-        let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/test")) }
-        let Ok(message) = r.read_string() else { return Err(malformed("toolchain/test")) }
-        let Some(printed) = read_strings(mut r) else { return Err(malformed("toolchain/test")) }
-        results.push(TestResult { name, at, passed: ok != 0, message, printed })
-    }
-    let Some(diagnostics) = read_diagnostics(mut r) else { return Err(malformed("toolchain/test")) }
-    let Ok(filtered_out) = r.read_u32() else { return Err(malformed("toolchain/test")) }
-    if !r.at_end() {
-        return Err(malformed("toolchain/test"))
-    }
-    Ok(Tested { passed: passed != 0, results, diagnostics, filtered_out })
 }
 
-/// Reads a `check` answer.
-pub fn read_checked(polled: take Result<Vec<u8>, IoError>) -> Result<Checked, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(ok) = r.read_u8() else { return Err(malformed("toolchain/check")) }
-    let Some(diagnostics) = read_diagnostics(mut r) else {
-        return Err(malformed("toolchain/check"))
+/// A `check` answer.
+impl Answer for Checked {
+    fn read(bytes: take Vec<u8>) -> Result<Checked, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(ok) = r.read_u8() else { return Err(malformed("a check")) }
+        let Some(diagnostics) = read_diagnostics(mut r) else {
+            return Err(malformed("a check"))
+        }
+        if !r.at_end() {
+            return Err(malformed("a check"))
+        }
+        Ok(Checked { ok: ok != 0, diagnostics })
     }
-    if !r.at_end() {
-        return Err(malformed("toolchain/check"))
-    }
-    Ok(Checked { ok: ok != 0, diagnostics })
 }
 
-/// Reads a `fmt` answer.
-pub fn read_formatted(polled: take Result<Vec<u8>, IoError>) -> Result<Formatted, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Some(changed) = read_strings(mut r) else { return Err(malformed("toolchain/fmt")) }
-    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/fmt")) }
-    if n > r.left() {
-        return Err(malformed("toolchain/fmt"))
+/// A `fmt` answer.
+impl Answer for Formatted {
+    fn read(bytes: take Vec<u8>) -> Result<Formatted, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(changed) = read_strings(mut r) else { return Err(malformed("what was formatted")) }
+        let Ok(n) = r.read_u32() else { return Err(malformed("what was formatted")) }
+        if n > r.left() {
+            return Err(malformed("what was formatted"))
+        }
+        var failed: Vec<Unformatted> = Vec::with_capacity(n)
+        for _ in 0..n {
+            let Ok(path) = r.read_string() else { return Err(malformed("what was formatted")) }
+            let Ok(why) = r.read_string() else { return Err(malformed("what was formatted")) }
+            failed.push(Unformatted { path, why })
+        }
+        if !r.at_end() {
+            return Err(malformed("what was formatted"))
+        }
+        Ok(Formatted { changed, failed })
     }
-    var failed: Vec<Unformatted> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(path) = r.read_string() else { return Err(malformed("toolchain/fmt")) }
-        let Ok(why) = r.read_string() else { return Err(malformed("toolchain/fmt")) }
-        failed.push(Unformatted { path, why })
-    }
-    if !r.at_end() {
-        return Err(malformed("toolchain/fmt"))
-    }
-    Ok(Formatted { changed, failed })
 }
 
-/// Reads a `query` answer: the JSON of the answers, an array with one for each query.
-pub fn read_queried(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
-    read_text(take polled, "toolchain/query")
-}
-
-/// Reads an `edit` answer: its JSON.
-pub fn read_edited(polled: take Result<Vec<u8>, IoError>) -> Result<String, ToolError> {
-    read_text(take polled, "toolchain/edit")
-}
-
-fn read_text(polled: take Result<Vec<u8>, IoError>, service: str) -> Result<String, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(text) = r.read_string() else { return Err(malformed(service)) }
-    if !r.at_end() {
-        return Err(malformed(service))
+/// A `literals` answer: the files, whether the values follow, then their count and each.
+impl Answer for Literals {
+    fn read(bytes: take Vec<u8>) -> Result<Literals, ToolError> {
+        var r = Reader::new(take bytes)
+        let Some(files) = read_strings(mut r) else { return Err(malformed("literals")) }
+        let Some(built) = read_floats(mut r) else { return Err(malformed("literals")) }
+        let Ok(has) = r.read_u8() else { return Err(malformed("literals")) }
+        var values: Option<Vec<f32>> = None
+        if has == 1 {
+            let Some(v) = read_floats(mut r) else { return Err(malformed("literals")) }
+            values = Some(take v)
+        }
+        if !r.at_end() {
+            return Err(malformed("literals"))
+        }
+        Ok(Literals { files, built, values })
     }
-    Ok(text)
-}
-
-/// Reads a `literals` answer: the files, whether the values follow, then their count and each.
-pub fn read_literals(polled: take Result<Vec<u8>, IoError>) -> Result<Literals, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Some(files) = read_strings(mut r) else { return Err(malformed("toolchain/literals")) }
-    let Some(built) = read_floats(mut r) else { return Err(malformed("toolchain/literals")) }
-    let Ok(has) = r.read_u8() else { return Err(malformed("toolchain/literals")) }
-    var values: Option<Vec<f32>> = None
-    if has == 1 {
-        let Some(v) = read_floats(mut r) else { return Err(malformed("toolchain/literals")) }
-        values = Some(take v)
-    }
-    if !r.at_end() {
-        return Err(malformed("toolchain/literals"))
-    }
-    Ok(Literals { files, built, values })
 }
 
 /// A count of `f32`s, then each's bits, or `None`.
@@ -446,20 +433,9 @@ fn read_floats(r: mut Reader) -> Option<Vec<f32>> {
     Some(v)
 }
 
-/// Reads a `doc_export` answer: how many files it wrote.
-pub fn read_exported(polled: take Result<Vec<u8>, IoError>) -> Result<u32, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(n) = r.read_u32() else { return Err(malformed("toolchain/doc_export")) }
-    if !r.at_end() {
-        return Err(malformed("toolchain/doc_export"))
-    }
-    Ok(n)
-}
-
 @test
 fn a_build_reads_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u8(1)
     w.write_u32(1)
     w.write_str("game.wasm")
@@ -471,17 +447,16 @@ fn a_build_reads_back() {
     w.write_str("warning[W0003]: a warning")
     w.write_u32(2)
     w.write_u32(3)
-    let Ok(built) = read_built(Ok(take w.into_bytes())) else { panic("a build") }
+    let Ok(built) = Built::read(take w.into_bytes()) else { panic("a build") }
     assert(built.ok && built.files.len() == 1 && built.files[0].as_str() == "game.wasm")
     assert(built.diagnostics.len() == 1 && !built.diagnostics[0].error)
     assert(built.computed == 2 && built.cached == 3)
-    assert(read_built(Ok(Vec::from([u8(0), 1, 9, 0, 0, 0]))).is_err(), "more files than bytes")
+    assert(Built::read(Vec::from([u8(1), 9, 0, 0, 0])).is_err(), "more files than bytes")
 }
 
 @test
 fn a_test_run_reads_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u8(0)
     w.write_u32(1)
     w.write_str("fails")
@@ -492,7 +467,7 @@ fn a_test_run_reads_back() {
     w.write_str("a line")
     w.write_u32(0)
     w.write_u32(2)
-    let Ok(t) = read_tested(Ok(take w.into_bytes())) else { panic("a run") }
+    let Ok(t) = Tested::read(take w.into_bytes()) else { panic("a run") }
     assert(!t.passed && t.results.len() == 1 && !t.results[0].passed)
     assert(t.results[0].printed.len() == 1 && t.filtered_out == 2)
 }
@@ -500,7 +475,6 @@ fn a_test_run_reads_back() {
 @test
 fn literals_read_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u32(1)
     w.write_str("ws/content/ball/subject.wrela")
     w.write_u32(2)
@@ -510,20 +484,19 @@ fn literals_read_back() {
     w.write_u32(2)
     w.write_u32(bitcast_u32(0.25))
     w.write_u32(bitcast_u32(-1.5))
-    let Ok(l) = read_literals(Ok(take w.into_bytes())) else { panic("literals") }
+    let Ok(l) = Literals::read(take w.into_bytes()) else { panic("literals") }
     assert(l.files.len() == 1 && l.files[0].as_str() == "ws/content/ball/subject.wrela")
     assert(l.built.len() == 2 && l.built[0] == 0.5, "the build's values")
     let Some(v) = l.values else { panic("values") }
     assert(v.len() == 2 && v[0] == 0.25 && v[1] == -1.5)
     var x = Writer::new()
-    x.write_u8(0)
     x.write_u32(0)
     x.write_u32(0)
     x.write_u8(0)
-    let Ok(stale) = read_literals(Ok(take x.into_bytes())) else { panic("no values") }
+    let Ok(stale) = Literals::read(take x.into_bytes()) else { panic("no values") }
     assert(stale.values.is_none(), "a file changed past its literals")
     assert(
-        read_literals(Ok(Vec::from([u8(0), 0, 0, 0, 0, 0, 0, 0, 0, 1, 9]))).is_err(),
+        Literals::read(Vec::from([u8(0), 0, 0, 0, 0, 0, 0, 0, 1, 9])).is_err(),
         "a short answer",
     )
 }

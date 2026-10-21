@@ -331,6 +331,24 @@ pub enum HostOp {
     Kept,
     /// `wrela.clock(address)`: writes the seconds since the program started, an `f64`.
     Clock,
+    /// A tool build's `wrela.tool_request(service_at, service_len, body_at, body_len)`: the
+    /// request's number, a `u32`.
+    ToolRequest,
+    /// `wrela.tool_wait(request)`: blocks until it's answered; its length, or -2 (an `i32`).
+    ToolWait,
+    /// `wrela.tool_any(at, count)`: blocks until one of the requests at `at` is answered; its
+    /// index (a `u32`).
+    ToolAny,
+    /// `wrela.tool_take(request, address)`: copies the answer to the address.
+    ToolTake,
+    /// `wrela.tool_idle()`: a helper waits for work.
+    ToolIdle,
+    /// `wrela.tool_active()`: a helper woke.
+    ToolActive,
+    /// `wrela.tool_join(slot)`: blocks while the task in the slot runs on another thread.
+    ToolJoin,
+    /// `wrela.tool_done()`: a helper finished a task.
+    ToolDone,
     /// `wrela.print(address, length)`: a line for the host's console, shown now.
     Print,
     /// `wrela.phase(address, length)`: this thread's time from now counts under that name.
@@ -814,6 +832,10 @@ pub struct Module {
     /// CPU only: whether the program prints or times a phase (`std::io::print`,
     /// `std::time::phase`), so the module imports `wrela.print` and `wrela.phase`.
     pub trace: bool,
+    /// CPU only: whether the program makes a tool's requests or runs its tasks (`std::tool`),
+    /// so the module imports the tool host's functions (wrela_abi's `TOOL_FUNCTIONS`). Only a
+    /// tool build does.
+    pub tool: bool,
 }
 
 impl Module {

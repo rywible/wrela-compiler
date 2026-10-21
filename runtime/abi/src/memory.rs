@@ -39,6 +39,7 @@
 //! | Export | Thread | Arguments after the thread's number |
 //! |---|---|---|
 //! | `__worker` | each helper | none: it runs jobs until [`PAR_SHUTDOWN`] |
+//! | `__tool_worker` | each helper of a tool build | the same, telling the tool host when it waits for work (`crate::IMPORT_TOOL_IDLE`) |
 //! | `__audio` | the voice's | the task and context `wrela.audio` gave: one render quantum |
 //! | `__tick` | the ticker's | the task and context `wrela.tick` gave, and the tick's number |
 //!
@@ -190,11 +191,19 @@ pub const TASK_SLOT_COUNT: u32 = 256;
 pub const TASK_SLOT_SIZE: u32 = 16;
 /// The end of the job slots.
 pub const TASK_SLOTS_END: u32 = TASK_SLOTS + TASK_SLOT_COUNT * TASK_SLOT_SIZE;
-/// A slot's state: [`SLOT_FREE`], being filled, queued, running, done or [`SLOT_FAILED`].
+/// A slot's state: [`SLOT_FREE`], being filled, [`SLOT_QUEUED`], [`SLOT_STARTED`],
+/// [`SLOT_FINISHED`] or [`SLOT_FAILED`].
 pub const SLOT_STATE: u32 = 0;
 /// The thread a job ran on: the host writes it when the job trapped.
 pub const SLOT_THREAD: u32 = 12;
 pub const SLOT_FREE: u32 = 0;
+/// A slot's state while its task waits for a thread to start it: a tool host reads it, as its
+/// fake clock decides whether every thread waits (language.md §13.2).
+pub const SLOT_QUEUED: u32 = 2;
+/// While a thread runs its task.
+pub const SLOT_STARTED: u32 = 3;
+/// Once its task has finished, and its result waits for the join.
+pub const SLOT_FINISHED: u32 = 4;
 pub const SLOT_FAILED: u32 = 5;
 
 /// The records of the tick about to run (`std::tick`): a `u32` count, then each an input event

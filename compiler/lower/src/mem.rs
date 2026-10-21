@@ -372,6 +372,14 @@ impl Fl<'_, '_> {
                 | L::MemTask
                 | L::MemThreadBlock
                 | L::MemWaitFor
+                | L::ToolRequest
+                | L::ToolWait
+                | L::ToolAny
+                | L::ToolTake
+                | L::ToolIdle
+                | L::ToolActive
+                | L::ToolJoin
+                | L::ToolDone
                 | L::StartVoice
                 | L::StartTicker
                 | L::MemAbort
@@ -490,6 +498,46 @@ impl Fl<'_, '_> {
             Lang::MemThreadBlock => mem(self, M::ThreadBlock, 0, Some(u)),
             Lang::MemWaitFor => mem(self, M::WaitFor, 3, Some(u)),
             Lang::MemTask => crate::task::task(self, substs, c),
+            Lang::ToolRequest => {
+                let service = self.str_arg(&c.args[0])?;
+                let body = arg(self, 1)?;
+                let mut args = Vec::new();
+                for (run, k) in [(service, 0), (service, 1), (body, 0), (body, 1)] {
+                    args.push(self.value(u, ir::Expr::Extract(run, k)));
+                }
+                self.mb.m.tool |= self.cx.data.role == wrela_sema::defs::Role::Tool;
+                Some(self.value(u, ir::Expr::Host(ir::HostOp::ToolRequest, args)))
+            }
+            Lang::ToolAny => {
+                let list = arg(self, 0)?;
+                let at = self.value(u, ir::Expr::Extract(list, 0));
+                let count = self.value(u, ir::Expr::Extract(list, 1));
+                self.mb.m.tool |= self.cx.data.role == wrela_sema::defs::Role::Tool;
+                Some(self.value(u, ir::Expr::Host(ir::HostOp::ToolAny, vec![at, count])))
+            }
+            Lang::ToolWait => {
+                let r = arg(self, 0)?;
+                self.mb.m.tool |= self.cx.data.role == wrela_sema::defs::Role::Tool;
+                let i = self.mb.m.types.scalar(ir::Scalar::I32);
+                Some(self.value(i, ir::Expr::Host(ir::HostOp::ToolWait, vec![r])))
+            }
+            Lang::ToolTake
+            | Lang::ToolJoin
+            | Lang::ToolIdle
+            | Lang::ToolActive
+            | Lang::ToolDone => {
+                let (op, n) = match lang {
+                    Lang::ToolTake => (ir::HostOp::ToolTake, 2),
+                    Lang::ToolJoin => (ir::HostOp::ToolJoin, 1),
+                    Lang::ToolIdle => (ir::HostOp::ToolIdle, 0),
+                    Lang::ToolActive => (ir::HostOp::ToolActive, 0),
+                    _ => (ir::HostOp::ToolDone, 0),
+                };
+                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
+                self.mb.m.tool |= self.cx.data.role == wrela_sema::defs::Role::Tool;
+                self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args?)));
+                None
+            }
             Lang::StartVoice | Lang::StartTicker => {
                 let (op, n) = if lang == Lang::StartVoice {
                     self.mb.m.audio = true;

@@ -13,8 +13,7 @@ use std::time::{Duration, Instant};
 /// `fmt PATH` and `fmt-check PATH`. A request that fails prints `error: ...` and exits 1.
 const TOOL: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, ToolError, args}
+use std::tool::{ToolError, args}
 use std::tool::toolchain
 
 fn failed(e: ToolError) -> u32 {
@@ -28,13 +27,13 @@ fn diagnostics(ds: [toolchain::Diagnostic]) {
     }
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
     var paths: Vec<String> = Vec::new()
     paths.push(given[1].clone())
     let building = what.as_str() == "build" || what.as_str() == "build-optimized" || what.as_str() == "build-timed" || what.as_str() == "build-testing"
-    var p = if building {
+    if building {
         var options = toolchain::options()
         options.testing = what.as_str() == "build-testing"
         if what.as_str() == "build-optimized" {
@@ -44,41 +43,21 @@ fn main(given: take Vec<String>) -> u32 {
         if what.as_str() == "build-timed" {
             options.timeout = 2.0
         }
-        toolchain::build(given[1].as_str(), given[2].as_str(), options)
-    } else if what.as_str() == "test" {
-        toolchain::test(given[1].as_str(), "")
-    } else if what.as_str() == "check" {
-        toolchain::check(given[1].as_str())
-    } else if what.as_str() == "test-with" || what.as_str() == "check-with" {
-        // `test-with PKG NAME DIR`: the dependency `NAME` read from `DIR`.
-        var overrides: Vec<toolchain::Override> = Vec::new()
-        overrides.push(toolchain::Override { name: given[2].clone(), dir: given[3].clone() })
-        if what.as_str() == "test-with" {
-            toolchain::test_with(given[1].as_str(), "", overrides)
-        } else {
-            toolchain::check_with(given[1].as_str(), overrides)
-        }
-    } else if what.as_str() == "doc" || what.as_str() == "doc-timed" {
-        let timeout = if what.as_str() == "doc-timed" { 2.0 } else { 0.0 }
-        toolchain::doc_export(paths, given[2].as_str(), "https://example.test/repo", "", timeout)
-    } else {
-        toolchain::fmt(paths, what.as_str() == "fmt-check")
-    }
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    if building {
-        let built = match toolchain::read_built(take polled) {
+        let built = match toolchain::build(given[1].as_str(), given[2].as_str(), options).wait() {
             Ok(b) => take b,
             Err(e) => return failed(e),
         }
         print(f"built ok={built.ok} files={built.files.len()}")
         diagnostics(built.diagnostics)
     } else if what.as_str() == "test" || what.as_str() == "test-with" {
-        let tested = match toolchain::read_tested(take polled) {
+        // `test-with PKG NAME DIR`: the dependency `NAME` read from `DIR`.
+        let call = if what.as_str() == "test" {
+            toolchain::test(given[1].as_str(), "")
+        } else {
+            let overrides = [toolchain::Override { name: given[2].clone(), dir: given[3].clone() }]
+            toolchain::test_with(given[1].as_str(), "", overrides)
+        }
+        let tested = match take call.wait() {
             Ok(t) => take t,
             Err(e) => return failed(e),
         }
@@ -90,20 +69,28 @@ fn main(given: take Vec<String>) -> u32 {
             }
         }
     } else if what.as_str() == "doc" || what.as_str() == "doc-timed" {
-        let pages = match toolchain::read_exported(take polled) {
+        let timeout = if what.as_str() == "doc-timed" { 2.0 } else { 0.0 }
+        let exported = toolchain::doc_export(paths, given[2].as_str(), "https://example.test/repo", "", timeout).wait()
+        let pages = match exported {
             Ok(n) => n,
             Err(e) => return failed(e),
         }
         print(f"exported {pages}")
     } else if what.as_str() == "check" || what.as_str() == "check-with" {
-        let checked = match toolchain::read_checked(take polled) {
+        let call = if what.as_str() == "check" {
+            toolchain::check(given[1].as_str())
+        } else {
+            let overrides = [toolchain::Override { name: given[2].clone(), dir: given[3].clone() }]
+            toolchain::check_with(given[1].as_str(), overrides)
+        }
+        let checked = match take call.wait() {
             Ok(c) => take c,
             Err(e) => return failed(e),
         }
         print(f"checked ok={checked.ok}")
         diagnostics(checked.diagnostics)
     } else {
-        let formatted = match toolchain::read_formatted(take polled) {
+        let formatted = match toolchain::fmt(paths, what.as_str() == "fmt-check").wait() {
             Ok(f) => take f,
             Err(e) => return failed(e),
         }
@@ -115,17 +102,6 @@ fn main(given: take Vec<String>) -> u32 {
         }
     }
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -650,46 +626,27 @@ fn a_request_that_doesnt_finish_leaves_none_of_its_outputs() {
 /// prints `error: ...` and exits 1.
 const LIFT_TOOL: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
+use std::tool::{ToolError, args}
 use std::tool::toolchain
 use std::tool::toolchain::Override
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+fn failed(e: ToolError) -> u32 {
+    print(f"error: {e.message()}")
+    1
+}
+
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
-    var p = if what.as_str() == "lift" {
+    if what.as_str() == "lift" {
         var options = toolchain::options()
         options.lift.push(given[3].clone())
-        toolchain::build(given[1].as_str(), given[2].as_str(), options)
-    } else if what.as_str() == "literals" {
-        toolchain::literals(given[1].as_str(), given[2].as_str())
-    } else if what.as_str() == "edit" || what.as_str() == "edit-timed" {
-        let Some(i) = given[3].as_str().parse_u32() else { return 2 }
-        let Some(v) = given[4].as_str().parse_f32() else { return 2 }
-        let timeout = if what.as_str() == "edit-timed" { 1.0 } else { 0.0 }
-        toolchain::edit(given[1].as_str(), given[2].as_str(), [(i, v)], timeout)
-    } else {
-        var queries: Vec<String> = Vec::new()
-        queries.push(given[2].clone())
-        toolchain::query(given[1].as_str(), queries, [Override { name: given[3].clone(), dir: given[4].clone() }])
-    }
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    if what.as_str() == "lift" {
-        match toolchain::read_built(take polled) {
+        match toolchain::build(given[1].as_str(), given[2].as_str(), options).wait() {
             Ok(b) => print(f"built ok={b.ok}"),
-            Err(e) => {
-                print(f"error: {e.message()}")
-                return 1
-            },
+            Err(e) => return failed(e),
         }
     } else if what.as_str() == "literals" {
-        match toolchain::read_literals(take polled) {
+        match toolchain::literals(given[1].as_str(), given[2].as_str()).wait() {
             Ok(l) => {
                 for f in l.files {
                     print(f"file {f.as_str()}")
@@ -706,37 +663,25 @@ fn main(given: take Vec<String>) -> u32 {
                     None => print("values none"),
                 }
             },
-            Err(e) => {
-                print(f"error: {e.message()}")
-                return 1
-            },
+            Err(e) => return failed(e),
         }
     } else {
-        let answer = if what.as_str() != "query" {
-            toolchain::read_edited(take polled)
+        let call = if what.as_str() == "edit" || what.as_str() == "edit-timed" {
+            let Some(i) = given[3].as_str().parse_u32() else { return 2 }
+            let Some(v) = given[4].as_str().parse_f32() else { return 2 }
+            let timeout = if what.as_str() == "edit-timed" { 1.0 } else { 0.0 }
+            toolchain::edit(given[1].as_str(), given[2].as_str(), [(i, v)], timeout)
         } else {
-            toolchain::read_queried(take polled)
+            var queries: Vec<String> = Vec::new()
+            queries.push(given[2].clone())
+            toolchain::query(given[1].as_str(), queries, [Override { name: given[3].clone(), dir: given[4].clone() }])
         }
-        match answer {
+        match take call.wait() {
             Ok(text) => print(text.as_str()),
-            Err(e) => {
-                print(f"error: {e.message()}")
-                return 1
-            },
+            Err(e) => return failed(e),
         }
     }
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 

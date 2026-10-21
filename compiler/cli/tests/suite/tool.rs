@@ -8,49 +8,23 @@ use std::process::Command;
 /// length, and exits with as many arguments as it was given.
 const COPY: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args, secret}
+use std::tool::{args, secret}
 use std::tool::files
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     if given.len() == 0 {
         return 64
     }
     let name = given[0].clone()
-    var p = files::read(f"in/{name.as_str()}")
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(read) = take got else { return 90 }
-    let Ok(bytes) = answer(take read) else { return 91 }
-    var w = files::write(f"out/copy/{name.as_str()}", bytes)
-    var wrote = w.poll()
-    while wrote.is_none() {
-        yield
-        wrote = w.poll()
-    }
-    let Some(done) = take wrote else { return 92 }
-    if answer(take done).is_err() {
+    let Ok(bytes) = files::read(f"in/{name.as_str()}").wait() else { return 91 }
+    if files::write(f"out/copy/{name.as_str()}", bytes).wait().is_err() {
         return 93
     }
     if let Some(s) = secret("WRELA_TOOL_TEST_TOKEN") {
         print(f"copied {name.as_str()}; the token is {s.len()} bytes")
     }
     u32(given.len())
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -206,8 +180,7 @@ pub fn tool() -> u32 {
 /// `work`. It prints the program's standard output, then `status N`; or `error: ...` and exits 1.
 const RUN: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
+use std::tool::args
 use std::tool::blob::Data
 use std::tool::run
 
@@ -230,8 +203,8 @@ fn split(text: str) -> (String, String) {
     (String::from(text), String::new())
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     var c = run::command(given[0].as_str(), "work")
     var i = 1
     while i < given.len() {
@@ -256,14 +229,7 @@ fn main(given: take Vec<String>) -> u32 {
         c.args.push(given[i].clone())
         i += 1
     }
-    var r = run::run(c)
-    var got = r.poll()
-    while got.is_none() {
-        yield
-        got = r.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    match run::read_ran(take polled) {
+    match run::run(c).wait() {
         Ok(ran) => {
             if let Data::Bytes(out) = ran.stdout {
                 if let Some(text) = String::from_utf8(out.clone()) {
@@ -277,17 +243,6 @@ fn main(given: take Vec<String>) -> u32 {
             print(f"error: {e.message()}")
             1
         }
-    }
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
     }
 }
 "#;
@@ -450,24 +405,16 @@ fn a_deadline_or_the_tools_end_kills_the_programs_whole_process_group() {
 /// `short`: it prints the status, or `error: ...` and exits 1.
 const FETCH: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
+use std::tool::args
 use std::tool::http
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     var request = http::get(given[0].as_str())
     if given.len() > 1 {
         request.timeout = 0.5
     }
-    var f = http::fetch(request)
-    var got = f.poll()
-    while got.is_none() {
-        yield
-        got = f.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    match http::read_response(take polled) {
+    match http::fetch(request).wait() {
         Ok(response) => {
             print(f"status {response.status}")
             0
@@ -476,17 +423,6 @@ fn main(given: take Vec<String>) -> u32 {
             print(f"error: {e.message()}")
             1
         }
-    }
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
     }
 }
 "#;
@@ -565,50 +501,21 @@ fn http_reaches_only_a_granted_host_and_a_stuck_server_holds_up_no_end() {
 /// and waits until it's stopped.
 const BROWSE: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::RUNNING
 use std::tool::browser
 use std::tool::serve
 use std::tool::time
 
-@job
-fn main() -> u32 {
-    var s = serve::start("scratch")
-    var sg = s.poll()
-    while sg.is_none() {
-        yield
-        sg = s.poll()
-    }
-    let Some(sp) = take sg else { return 90 }
-    let Ok(started) = serve::read_started(take sp) else { return 91 }
-    var o = browser::open(f"{started.origin.as_str()}/".as_str())
-    var og = o.poll()
-    while og.is_none() {
-        yield
-        og = o.poll()
-    }
-    let Some(op) = take og else { return 90 }
-    match browser::read_opened(take op) {
+pub fn tool() -> u32 {
+    let Ok(started) = serve::start("scratch").wait() else { return 91 }
+    match browser::open(f"{started.origin.as_str()}/".as_str()).wait() {
         Ok(_) => print("opened"),
         Err(e) => {
             print(f"open: {e.message()}")
             return 1
         },
     }
-    var t = time::after(600.0)
-    while t.poll().is_none() { yield }
+    let _ = time::after(600.0).wait()
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start()
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 

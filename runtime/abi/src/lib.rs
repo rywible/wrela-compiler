@@ -39,6 +39,10 @@
 //! Nothing else is imported, so nothing host-dependent can reach the program's arithmetic
 //! (D-015). Other exports are the program's own `pub fn`s, which tests may call.
 //!
+//! A tool build (language.md §15.5) exports `tool` ([`EXPORT_TOOL`]) in place of `frame`, and
+//! `__tool_worker` in place of `__worker`; it imports [`TOOL_FUNCTIONS`], which no other build
+//! does, and makes its requests through them, not through `submit`.
+//!
 //! ## The state hash
 //!
 //! [`hash::StateHash`] is FNV-1a 64 over every byte of every batch the program submits, in
@@ -166,13 +170,59 @@ pub const EXPORT_INIT: &str = "init";
 /// starts the program, and `serve` whenever something happens (an event, a timer).
 pub const EXPORT_SERVE_INIT: &str = "serve_init";
 pub const EXPORT_SERVE: &str = "serve";
-/// A tool build's exports (language.md §15.3, §15.5): the tool host calls `tool_init` once, when
-/// it starts the tool, then `tool` once, and again each time a request of the tool's is
-/// answered. `tool` returns [`TOOL_RUNNING`] to be called again, or the tool's exit status.
-pub const EXPORT_TOOL_INIT: &str = "tool_init";
+/// A tool build's export (language.md §15.3, §15.5): `tool() -> u32`, which the tool host calls
+/// once, on the tool's thread. It runs the whole tool, waiting on its requests in the host
+/// ([`TOOL_FUNCTIONS`]), and its result is the tool's exit status (0 to 255).
 pub const EXPORT_TOOL: &str = "tool";
-/// What a tool's `tool` returns to be called again, rather than an exit status (0 to 255).
-pub const TOOL_RUNNING: u32 = u32::MAX;
+/// `__tool_worker(thread)`: a tool build's helpers' thread entry, in place of
+/// [`EXPORT_WORKER`]: the same loop, which tells the host when the helper waits for work and
+/// when it wakes ([`IMPORT_TOOL_IDLE`], [`IMPORT_TOOL_ACTIVE`]).
+pub const EXPORT_TOOL_WORKER: &str = "__tool_worker";
+/// `tool_request(service_at, service_len, body_at, body_len) -> request`: makes a request of
+/// the tool service named by that UTF-8 (`tool/files/read`), with those bytes, at once, and
+/// gives the number the host chose for it. Any thread of a tool build may call it. The tool
+/// host carries the request out beside the tool (language.md §15.5).
+pub const IMPORT_TOOL_REQUEST: &str = "tool_request";
+/// `tool_wait(request) -> length`: blocks the calling thread until the request is answered,
+/// and gives the answer's length in bytes, or [`REQUEST_FAILED`] if the host has no such
+/// service. If the run must stop while it waits (its timeout, an interrupt, a helper's trap,
+/// stuck work), it traps the calling thread instead, with that reason.
+pub const IMPORT_TOOL_WAIT: &str = "tool_wait";
+/// `tool_any(at, count) -> index`: blocks until one of the `count` requests whose numbers
+/// (`u32`s) are at `at` is answered, and gives its index there; it reads none of them. It
+/// traps as [`IMPORT_TOOL_WAIT`] does.
+pub const IMPORT_TOOL_ANY: &str = "tool_any";
+/// `tool_take(request, at)`: copies an answered request's answer to `at` and forgets the
+/// request. What the request made (blobs, driven builds, servers, browsers) is the tool's from
+/// here on.
+pub const IMPORT_TOOL_TAKE: &str = "tool_take";
+/// `tool_idle()`: a helper is about to wait for work, holding none ([`EXPORT_TOOL_WORKER`]).
+/// A tool test's fake clock reads it (language.md §13.2).
+pub const IMPORT_TOOL_IDLE: &str = "tool_idle";
+/// `tool_active()`: a helper woke, before it looks for work.
+pub const IMPORT_TOOL_ACTIVE: &str = "tool_active";
+/// `tool_join(slot)`: blocks the calling thread while the task in slot `slot` (its address) is
+/// [`memory::SLOT_STARTED`] on another thread, as a tool task's join (`std::tool::Task`). It
+/// traps as [`IMPORT_TOOL_WAIT`] does.
+pub const IMPORT_TOOL_JOIN: &str = "tool_join";
+/// `tool_done()`: a helper finished a task and wrote its slot: a thread in `tool_join` may go
+/// on.
+pub const IMPORT_TOOL_DONE: &str = "tool_done";
+
+/// The functions only a tool build imports, besides [`HOST_FUNCTIONS`]: a tool's requests, and
+/// what its threads tell the host. A tool build makes no request through `submit` (the tool
+/// host refuses `submit`, `request_status` and `request_take`), and no other build imports
+/// these.
+pub const TOOL_FUNCTIONS: [HostFunction; 8] = [
+    HostFunction { name: IMPORT_TOOL_REQUEST, params: 4, results: 1 },
+    HostFunction { name: IMPORT_TOOL_WAIT, params: 1, results: 1 },
+    HostFunction { name: IMPORT_TOOL_ANY, params: 2, results: 1 },
+    HostFunction { name: IMPORT_TOOL_TAKE, params: 2, results: 0 },
+    HostFunction { name: IMPORT_TOOL_IDLE, params: 0, results: 0 },
+    HostFunction { name: IMPORT_TOOL_ACTIVE, params: 0, results: 0 },
+    HostFunction { name: IMPORT_TOOL_JOIN, params: 1, results: 0 },
+    HostFunction { name: IMPORT_TOOL_DONE, params: 0, results: 0 },
+];
 /// The custom section both of a program's builds carry (language.md §15.3): eight bytes,
 /// little-endian, the [`pair_id`] of its client and server modules, which a client and a server
 /// compare to know they're one program's.

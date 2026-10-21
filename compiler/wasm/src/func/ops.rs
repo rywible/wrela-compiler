@@ -1438,6 +1438,37 @@ pub(super) fn host(
                 None => fe.ins.push(I::Drop),
             }
         }
+        ir::HostOp::ToolRequest
+        | ir::HostOp::ToolWait
+        | ir::HostOp::ToolAny
+        | ir::HostOp::ToolTake
+        | ir::HostOp::ToolIdle
+        | ir::HostOp::ToolActive
+        | ir::HostOp::ToolJoin
+        | ir::HostOp::ToolDone => {
+            // In wrela_abi's `TOOL_FUNCTIONS` order.
+            let k = match op {
+                ir::HostOp::ToolRequest => 0,
+                ir::HostOp::ToolWait => 1,
+                ir::HostOp::ToolAny => 2,
+                ir::HostOp::ToolTake => 3,
+                ir::HostOp::ToolIdle => 4,
+                ir::HostOp::ToolActive => 5,
+                ir::HostOp::ToolJoin => 6,
+                _ => 7,
+            };
+            debug_assert_eq!(wrela_abi::TOOL_FUNCTIONS[k].params, args.len());
+            for &a in args {
+                fe.ins.push(I::LocalGet(fe.v(a)));
+            }
+            fe.ins.push(I::Call(fe.at.helpers.tool + k as u32));
+            if wrela_abi::TOOL_FUNCTIONS[k].results == 1 {
+                match result {
+                    Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
+                    None => fe.ins.push(I::Drop),
+                }
+            }
+        }
         ir::HostOp::Audio | ir::HostOp::RequestTake | ir::HostOp::Tick => {
             let h = fe.at.helpers;
             let helper = match op {

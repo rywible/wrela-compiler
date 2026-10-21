@@ -11,9 +11,8 @@
 // `scratch/sites/<host>/<path>`, or 404, unless the test set a fake for the URL
 // (`std::tool::testing`). A tool test never reaches the network.
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, ToolError, ask, malformed}
 use std::tool::blob::{Data, read_data, write_data}
 
 /// A header of a request or a response: its name and value. A response's names are lowercase.
@@ -74,10 +73,9 @@ impl Response {
     }
 }
 
-/// Sends `request`: `read_response` reads the answer. A body of bytes over 512 KiB panics: send
-/// it as a blob.
+/// Sends `request`. A body of bytes over 512 KiB panics: send it as a blob.
 @tool
-pub fn fetch(request: Request) -> Pending<u8> {
+pub fn fetch(request: Request) -> Call<Response> {
     var w = Writer::new()
     w.write_str(request.method.as_str())
     w.write_str(request.url.as_str())
@@ -91,40 +89,41 @@ pub fn fetch(request: Request) -> Pending<u8> {
     ask("http/fetch", take w.into_bytes())
 }
 
-/// Reads a `fetch` answer: the status (a `u32`), the headers (a count, then each name and
-/// value), then the body (`blob::Data`).
-pub fn read_response(polled: take Result<Vec<u8>, IoError>) -> Result<Response, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(status) = r.read_u32() else { return Err(malformed("http/fetch")) }
-    let Ok(n) = r.read_u32() else { return Err(malformed("http/fetch")) }
-    var headers: Vec<Header> = Vec::new()
-    for _ in 0..n {
-        let Ok(name) = r.read_string() else { return Err(malformed("http/fetch")) }
-        let Ok(value) = r.read_string() else { return Err(malformed("http/fetch")) }
-        headers.push(Header { name, value })
+/// A `fetch` answer: the status (a `u32`), the headers (a count, then each name and value),
+/// then the body (`blob::Data`).
+impl Answer for Response {
+    fn read(bytes: take Vec<u8>) -> Result<Response, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(status) = r.read_u32() else { return Err(malformed("a response")) }
+        let Ok(n) = r.read_u32() else { return Err(malformed("a response")) }
+        var headers: Vec<Header> = Vec::new()
+        for _ in 0..n {
+            let Ok(name) = r.read_string() else { return Err(malformed("a response")) }
+            let Ok(value) = r.read_string() else { return Err(malformed("a response")) }
+            headers.push(Header { name, value })
+        }
+        let Some(body) = read_data(mut r) else { return Err(malformed("a response")) }
+        if !r.at_end() || status > 999 {
+            return Err(malformed("a response"))
+        }
+        Ok(Response { status: u16(status), headers, body })
     }
-    let Some(body) = read_data(mut r) else { return Err(malformed("http/fetch")) }
-    if !r.at_end() || status > 999 {
-        return Err(malformed("http/fetch"))
-    }
-    Ok(Response { status: u16(status), headers, body })
 }
 
 @test
 fn a_response_reads_back() {
     var w = Writer::new()
-    w.write_u8(0)
     w.write_u32(404)
     w.write_u32(1)
     w.write_str("content-length")
     w.write_str("0")
     write_data(mut w, Data::empty())
-    let Ok(response) = read_response(Ok(take w.into_bytes())) else { panic("a response") }
+    let Ok(response) = Response::read(take w.into_bytes()) else { panic("a response") }
     assert(response.status == 404 && response.headers.len() == 1)
     let Some(length) = response.header("content-length") else { panic("its header") }
     assert(length.as_str() == "0")
     assert(response.header("location").is_none())
-    assert(read_response(Ok(Vec::from([u8(0), 200, 0, 0, 0]))).is_err(), "a short response")
+    assert(Response::read(Vec::from([u8(200), 0, 0, 0])).is_err(), "a short response")
 }
 
 @test
@@ -137,7 +136,7 @@ fn a_failure_in_transport_is_told_from_the_requests_own() {
         for b in String::from(reason).as_bytes() {
             failed.push(b)
         }
-        let Err(e) = read_response(Ok(take failed)) else { panic("a failure") }
+        let Err(e) = std::tool::answer(take failed) else { panic("a failure") }
         assert(is_transport(e) == transport, e.message())
     }
 }

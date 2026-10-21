@@ -67,18 +67,14 @@ pub struct Roots {
     /// Frame tests (§13), each exported as `test.<index>`, with the program's state when it
     /// takes it: a name no wrela function has.
     pub tests: Vec<FnId>,
-    /// Tool tests (§13.2), jobs: each exported as [`TOOL_TEST_INIT`] and [`TOOL_TEST`] with
-    /// `.<index>`, a tool's entries that start and resume it. A tool build with them exports
-    /// neither the program's own `tool_init` and `tool` nor anything else.
+    /// Tool tests (§13.2): each exported as [`TOOL_TEST`] with `.<index>`, a tool's entry that
+    /// runs it. A tool build with them exports neither the program's own `tool` nor anything
+    /// else.
     pub tool_tests: Vec<FnId>,
 }
 
-/// The export, `tool_test_init.<index>`, that starts tool test `index` (§13.2): as `tool_init`,
-/// with no result; the job is kept in the module's data.
-pub const TOOL_TEST_INIT: &str = "tool_test_init";
-
-/// The export, `tool_test.<index>`, that resumes tool test `index`: as `tool`, it returns
-/// `std::tool::RUNNING` while the job yields, then 0 once it has ended.
+/// The export, `tool_test.<index>`, that runs tool test `index` (§13.2): as `tool`, it returns
+/// the exit status, 0 once the test has ended.
 pub const TOOL_TEST: &str = "tool_test";
 
 impl Roots {
@@ -205,12 +201,27 @@ fn on_gpu_in(p: &Program, t: TyId, known: &mut HashMap<TyId, bool>) -> bool {
 /// std's thread entries (`@thread_entry`) the program uses: each one whose module the program
 /// uses, by any of the module's other functions (std's `std::par` for the helpers' `worker`,
 /// `std::audio` for `audio`, `std::tick` for `tick`). Each is lowered and exported as `__` and
-/// its name (wrela_abi `memory`'s threads).
+/// its name (wrela_abi `memory`'s threads). A `@tool` entry is a tool build's alone, and there
+/// takes the place of its module's others (`std::par`'s `tool_worker`, the tool's helpers').
 pub(crate) fn thread_entries(cx: &mut Cx, cpu: &mut ModuleBuilder) {
+    use wrela_sema::defs::Role;
     let p = &cx.checked.program;
-    let entries: Vec<(FnId, String, wrela_sema::ty::ModuleId)> = (0..p.fns.len() as u32)
+    let tool_entry = |f: FnId| p.func(f).attrs.role.is_some_and(|(r, _)| r == Role::Tool);
+    let all: Vec<FnId> = (0..p.fns.len() as u32)
         .map(FnId)
         .filter(|f| p.func(*f).attrs.thread_entry.is_some() && cx.checked.mir.contains_key(f))
+        .collect();
+    let tool = cx.data.role == Role::Tool;
+    let entries: Vec<(FnId, String, wrela_sema::ty::ModuleId)> = all
+        .iter()
+        .copied()
+        .filter(|&f| {
+            if tool_entry(f) {
+                return tool;
+            }
+            let module = p.func(f).module;
+            !(tool && all.iter().any(|&g| tool_entry(g) && p.func(g).module == module))
+        })
         .map(|f| (f, p.func(f).name.clone(), p.func(f).module))
         .collect();
     let mut done = Vec::new();
@@ -401,10 +412,9 @@ fn lower_in(
         };
         cx.instance(&mut cpu, key, None);
     }
-    // The program's state (§15): what `init` returns (a server's `serve_init`, a tool's
-    // `tool_init`), which the other exports take first.
-    // A tool build for tool tests keeps their jobs as its state (§13.2), not `tool_init`'s.
-    let state = if roots.tool_tests.is_empty() { state_type(checked, data.role) } else { None };
+    // The program's state (§15): what `init` returns (a server's `serve_init`), which the
+    // other exports take first. A tool has none: `tool` runs the whole tool (§15.5).
+    let state = state_type(checked, data.role);
     if let Some((init, s)) = state {
         let span = checked.program.func(init).sig_span;
         if let Some(t) = cx.lower_ty(&mut cpu, s, span) {
@@ -420,8 +430,8 @@ fn lower_in(
         if checked.program.func(f).attrs.testing.is_some() && !data.testing {
             continue;
         }
-        // A server build exports `serve_init` and `serve` alone, a tool build `tool_init` and
-        // `tool`; a client build every other export (§15.3).
+        // A server build exports `serve_init` and `serve` alone, a tool build `tool`; a client
+        // build every other export (§15.3).
         let name = &checked.program.func(f).name;
         if export_role(name) != role {
             continue;
@@ -751,8 +761,8 @@ impl<'a> Cx<'a> {
         if def.name == wrela_abi::EXPORT_SERVE_INIT || def.name == wrela_abi::EXPORT_SERVE {
             return self.check_server_export(f, state);
         }
-        if def.name == wrela_abi::EXPORT_TOOL_INIT || def.name == wrela_abi::EXPORT_TOOL {
-            return self.check_tool_export(f, state);
+        if def.name == wrela_abi::EXPORT_TOOL {
+            return self.check_tool_export(f);
         }
         if def.name == wrela_abi::EXPORT_INIT {
             let t = &self.checked.program.types;
@@ -923,44 +933,23 @@ impl<'a> Cx<'a> {
         ok
     }
 
-    /// A tool build's export (§15.5): `tool_init() -> State`, then `tool(state: mut State) ->
-    /// u32` (`tool() -> u32` without state). E0703 otherwise.
-    fn check_tool_export(&mut self, f: FnId, state: Option<TyId>) -> bool {
-        use wrela_sema::defs::{Mode, RetMode};
+    /// A tool build's export (§15.5): `tool() -> u32`, which the tool host calls once. E0703
+    /// otherwise.
+    fn check_tool_export(&mut self, f: FnId) -> bool {
+        use wrela_sema::defs::RetMode;
         let def = self.checked.program.func(f);
         let t = &self.checked.program.types;
         let generic = !self.checked.program.fn_all_generics(f).is_empty();
-        if def.name == wrela_abi::EXPORT_TOOL_INIT {
-            let ok = def.params.is_empty()
-                && !t.is_unit(def.ret)
-                && def.ret_mode == RetMode::Owned
-                && !generic;
-            if !ok {
-                self.err(
-                    Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`tool_init`'s signature is `tool_init() -> State`: it makes the tool's state, which the host keeps")
-                        .with_note("the tool host calls `tool_init` once, then passes its result to `tool` (§15.5)"),
-                );
-            }
-            return ok;
-        }
-        let ok = match (state, def.params.as_slice()) {
-            (Some(s), [p]) => p.ty == s && p.mode == Mode::Mut,
-            (None, []) => true,
-            _ => false,
-        } && def.ret == t.u32
-            && def.ret_mode == RetMode::Owned
-            && !generic;
+        let ok =
+            def.params.is_empty() && def.ret == t.u32 && def.ret_mode == RetMode::Owned && !generic;
         if !ok {
-            let msg = match state {
-                Some(s) => format!(
-                    "`tool`'s signature is `tool(state: mut {}) -> u32`: the tool host calls it until it returns an exit status",
-                    self.checked.program.display_ty(s)
-                ),
-                None => "`tool`'s signature is `tool() -> u32`: the tool host calls it until it returns an exit status".into(),
-            };
             self.err(
-                Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
-                    .with_note("`tool` returns `std::tool::RUNNING` to be called again once a request is answered, or an exit status from 0 to 255 (§15.5)"),
+                Diagnostic::new(
+                    wrela_diag::codes::E0703,
+                    def.sig_span,
+                    "`tool`'s signature is `tool() -> u32`: the tool host calls it once, and its result is the exit status",
+                )
+                .with_note("a tool waits for its requests where it needs their answers (`call.wait()`), so it keeps its state in its own locals (§15.5)"),
             );
         }
         ok
@@ -1137,12 +1126,12 @@ fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
 const MAX_INSTANCE_DEPTH: u32 = 256;
 
 /// The role whose build has the export `name` (§15.3): `serve_init` and `serve` are a
-/// server's, `tool_init` and `tool` a tool's, and every other export a client's.
+/// server's, `tool` a tool's, and every other export a client's.
 fn export_role(name: &str) -> wrela_sema::defs::Role {
     use wrela_sema::defs::Role;
     match name {
         wrela_abi::EXPORT_SERVE_INIT | wrela_abi::EXPORT_SERVE => Role::Server,
-        wrela_abi::EXPORT_TOOL_INIT | wrela_abi::EXPORT_TOOL => Role::Tool,
+        wrela_abi::EXPORT_TOOL => Role::Tool,
         _ => Role::Client,
     }
 }
@@ -1159,14 +1148,14 @@ fn entry_export(role: wrela_sema::defs::Role) -> &'static str {
 /// The std function implementing a transcendental builtin on the CPU (language.md §11): the
 /// one the built-in function that lowers to it names.
 /// The program's `init` (§15): `pub fn init() -> S` in main.wrela, and its state type `S`; for
-/// a server build, its `serve_init`, and for a tool build, its `tool_init`.
+/// a server build, its `serve_init`. A tool build has none.
 fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
     let p = &checked.program;
     let main = p.main?;
     let init = match role {
         wrela_sema::defs::Role::Client => wrela_abi::EXPORT_INIT,
         wrela_sema::defs::Role::Server => wrela_abi::EXPORT_SERVE_INIT,
-        wrela_sema::defs::Role::Tool => wrela_abi::EXPORT_TOOL_INIT,
+        wrela_sema::defs::Role::Tool => return None,
     };
     p.fns.iter().enumerate().find_map(|(i, f)| {
         (f.module == main
@@ -1277,55 +1266,18 @@ fn add_wrapper(
     mb.m.add_function(w)
 }
 
-/// The tool tests' entries (§13.2), the jobs `tests`. The module's state is a struct of their
-/// jobs, a field each. Test `i`'s `tool_test_init.<i>` stores its job's start in its field (a
-/// job of no parameters starts as zeros), and `tool_test.<i>` resumes it there and returns
-/// `std::tool::RUNNING` if it yielded, else 0.
+/// The tool tests' entries (§13.2), the functions `tests`: test `i`'s `tool_test.<i>` calls it,
+/// and returns 0 once it has ended.
 fn tool_test_entries(cx: &mut Cx, mb: &mut ModuleBuilder, tests: &[FnId]) {
-    if tests.is_empty() {
-        return;
-    }
-    let mut jobs = Vec::new();
-    for &f in tests {
-        let resume = cx.instance(mb, InstanceKey::JobResume { func: f, substs: Vec::new() }, None);
-        let Some(layout) = cx.job_layout(mb, f, &[]) else { return };
-        let Some(step) = mb.m.functions[resume.index()].ret else { return };
-        jobs.push((resume, layout.ty, step));
-    }
-    let fields = jobs.iter().enumerate().map(|(i, j)| (format!("test_{i}"), j.1)).collect();
-    let ty = mb.m.types.intern(ir::TypeDef::Struct { name: "ToolTests".into(), fields });
-    let value = eval::zero(&mb.m.types, ty);
-    let data = mb.m.add_data(ir::Data { name: "state".into(), ty, value });
-    mb.m.state = Some(data);
     let u32_ty = mb.m.types.u32();
-    let bool_ty = mb.m.types.bool();
-    for (i, (resume, job, step)) in jobs.into_iter().enumerate() {
-        let at = ir::Place::root(ir::PlaceRoot::Data(data)).with(ir::Proj::Field(i as u32));
-        let mut init = ir::Function::new(format!("{TOOL_TEST_INIT}_{i}"), Vec::new(), None);
-        let mut body = Vec::new();
-        let zero = init.let_(&mut body, job, ir::Expr::Zero(job));
-        body.push(ir::Stmt::Store(at.clone(), zero));
-        body.push(ir::Stmt::Return(None));
-        init.body = body;
-        let init = mb.m.add_function(init);
+    for (i, &f) in tests.iter().enumerate() {
+        let test = cx.instance(mb, InstanceKey::plain(f, Vec::new()), None);
         let mut tool = ir::Function::new(format!("{TOOL_TEST}_{i}"), Vec::new(), Some(u32_ty));
-        let mut body = Vec::new();
-        let call = ir::Expr::Call(resume, vec![ir::Arg::Place(at)]);
-        let stepped = tool.let_(&mut body, step, call);
-        let tag = tool.let_(&mut body, u32_ty, ir::Expr::Extract(stepped, 0));
-        // `Step::Yielded` is the first variant.
-        let yielded = ir::Expr::Const(ir::Const::U32(mb.m.types.tag(step, 0)));
-        let yielded = tool.let_(&mut body, u32_ty, yielded);
-        let running = tool.let_(&mut body, bool_ty, ir::Expr::Binary(ir::BinOp::Eq, tag, yielded));
-        let more = ir::Expr::Const(ir::Const::U32(wrela_abi::TOOL_RUNNING));
-        let more = tool.let_(&mut body, u32_ty, more);
+        let mut body = vec![ir::Stmt::Eval(ir::Expr::Call(test, Vec::new()))];
         let done = tool.let_(&mut body, u32_ty, ir::Expr::Const(ir::Const::U32(0)));
-        let select = ir::Expr::Select { cond: running, if_true: more, if_false: done };
-        let status = tool.let_(&mut body, u32_ty, select);
-        body.push(ir::Stmt::Return(Some(status)));
+        body.push(ir::Stmt::Return(Some(done)));
         tool.body = body;
         let tool = mb.m.add_function(tool);
-        mb.m.exports.push((format!("{TOOL_TEST_INIT}.{i}"), init));
         mb.m.exports.push((format!("{TOOL_TEST}.{i}"), tool));
     }
 }

@@ -138,8 +138,7 @@ pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
         let other = [
             (a.entry.map(|e| e.1), "a GPU entry point"),
             (a.gpu, "`@gpu`"),
-            // A tool test is a job (§13.2); any other test isn't.
-            (a.test.filter(|_| a.test_tool.is_none()), "a test"),
+            (a.test, "a test"),
             (a.testing, "`@testing`"),
             (a.audio, "`@audio`"),
             (a.thread_entry, "a thread's entry"),

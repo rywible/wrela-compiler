@@ -1,24 +1,23 @@
 // A tool's time (language.md §15.5): a timer, which a tool waits on as on any request, and the
-// date. Both are requests, so a tool that waits on a timer has something outstanding, and its
-// host calls it again when the timer fires. The date is the system's clock, which can go back;
-// for how long work takes, `std::time::now` is the clock that never does.
+// date. Both are requests: `after(s).wait()` sleeps, and a timer's `Call` can be waited on with
+// others (`std::tool::any`). The date is the system's clock, which can go back; for how long
+// work takes, `std::time::now` is the clock that never does.
 
-use std::io::{IoError, Pending}
 use std::serialize::{Reader, Writer}
-use std::tool::{ToolError, answer, ask, malformed}
+use std::tool::{Answer, Call, Done, ToolError, ask, malformed}
 
 /// Answered, with no bytes, once `seconds` have passed. A negative or not-finite time fails the
 /// request.
 @tool
-pub fn after(seconds: f64) -> Pending<u8> {
+pub fn after(seconds: f64) -> Call<Done> {
     var w = Writer::new()
     w.write_u64(bitcast_u64(seconds))
     ask("time/after", take w.into_bytes())
 }
 
-/// The date and time now, in UTC, from the system's clock: `read_utc` reads the answer.
+/// The date and time now, in UTC, from the system's clock.
 @tool
-pub fn utc_now() -> Pending<u8> {
+pub fn utc_now() -> Call<Utc> {
     ask("time/utc", [u8(0); 0])
 }
 
@@ -28,22 +27,24 @@ pub struct Utc: Copy + Eq {
     pub nanos: u32,
 }
 
-/// Reads a `utc_now` answer: the seconds (a `u64`), then the nanoseconds (a `u32`).
-pub fn read_utc(polled: take Result<Vec<u8>, IoError>) -> Result<Utc, ToolError> {
-    var r = Reader::new(answer(take polled)?)
-    let Ok(seconds) = r.read_u64() else { return Err(malformed("time/utc")) }
-    let Ok(nanos) = r.read_u32() else { return Err(malformed("time/utc")) }
-    if !r.at_end() || nanos >= 1000000000 {
-        return Err(malformed("time/utc"))
+/// A `utc_now` answer: the seconds (a `u64`), then the nanoseconds (a `u32`).
+impl Answer for Utc {
+    fn read(bytes: take Vec<u8>) -> Result<Utc, ToolError> {
+        var r = Reader::new(take bytes)
+        let Ok(seconds) = r.read_u64() else { return Err(malformed("a date")) }
+        let Ok(nanos) = r.read_u32() else { return Err(malformed("a date")) }
+        if !r.at_end() || nanos >= 1000000000 {
+            return Err(malformed("a date"))
+        }
+        Ok(Utc { seconds, nanos })
     }
-    Ok(Utc { seconds, nanos })
 }
 
 @test
 fn a_utc_answer_reads_back() {
-    let Ok(t) = read_utc(Ok(Vec::from([u8(0), 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]))) else {
+    let Ok(t) = Utc::read(Vec::from([u8(1), 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0])) else {
         panic("a time")
     }
     assert(t.seconds == 1 && t.nanos == 2)
-    assert(read_utc(Ok(Vec::from([u8(0), 1]))).is_err(), "a short time")
+    assert(Utc::read(Vec::from([u8(1)])).is_err(), "a short time")
 }

@@ -22,40 +22,23 @@ use wrela_host::tool::{BlobBudget, Caps, End, Grants, Testing};
 /// - `stall`: starts a resize, and waits until it's interrupted;
 /// - `stall-timed`: a resize with a deadline of 0.5 s: it prints why it failed, and exits 3.
 const IMAGE_TOOL: &str = r#"
-use std::io::{IoError, print}
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args}
-use std::tool::blob
+use std::io::print
+use std::tool::{Done, ToolError, args}
 use std::tool::blob::{Blob, Data}
 use std::tool::files
 use std::tool::image
 use std::tool::time
 
-fn blob_of(polled: take Result<Vec<u8>, IoError>, what: str) -> Data {
-    match blob::read_handle(take polled) {
-        Ok(b) => Data::Blob(b),
+/// What a call gave, or a panic with why it failed.
+fn got<T>(answered: take Result<T, ToolError>, what: str) -> T {
+    match take answered {
+        Ok(x) => x,
         Err(e) => panic(f"{what}: {e.message()}"),
     }
 }
 
-fn image_of(polled: take Result<Vec<u8>, IoError>, what: str) -> image::Image {
-    match image::read_image(take polled) {
-        Ok(i) => i,
-        Err(e) => panic(f"{what}: {e.message()}"),
-    }
-}
-
-fn encoded_of(polled: take Result<Vec<u8>, IoError>, what: str) -> Data {
-    match image::read_encoded(take polled) {
-        Ok(d) => d,
-        Err(e) => panic(f"{what}: {e.message()}"),
-    }
-}
-
-fn done(polled: take Result<Vec<u8>, IoError>, what: str) {
-    if let Err(e) = answer(take polled) {
-        panic(f"{what}: {e.message()}")
-    }
+fn done(answered: take Result<Done, ToolError>, what: str) {
+    let _ = got(take answered, what)
 }
 
 fn blob_in(d: Data) -> Blob {
@@ -65,51 +48,23 @@ fn blob_in(d: Data) -> Blob {
     }
 }
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
     if what.as_str() == "decode" {
         let names = [String::from("quadrants.png"), String::from("quadrants.jpg"), String::from("quadrants.webp")]
         for i in 0..3 {
             let name = names[i].clone()
-            var r = files::read_blob(f"in/{name}".as_str())
-            var got = r.poll()
-            while got.is_none() {
-                yield
-                got = r.poll()
-            }
-            let Some(p) = take got else { return 90 }
-            let file = blob_of(take p, "read")
-            var d = image::decode(file)
-            var dg = d.poll()
-            while dg.is_none() {
-                yield
-                dg = d.poll()
-            }
-            let Some(dp) = take dg else { return 90 }
-            let decoded = image_of(take dp, "decode")
-            var w = files::write_blob(f"out/{name}.rgba".as_str(), blob_in(decoded.rgba))
-            var wg = w.poll()
-            while wg.is_none() {
-                yield
-                wg = w.poll()
-            }
-            let Some(wp) = take wg else { return 90 }
-            done(take wp, "write")
+            let file = got(files::read_blob(f"in/{name}".as_str()).wait(), "read")
+            let decoded = got(image::decode(Data::Blob(file)).wait(), "decode")
+            done(files::write_blob(f"out/{name}.rgba".as_str(), blob_in(decoded.rgba)).wait(), "write")
             print(f"{name}: {decoded.width}x{decoded.height}")
         }
         return 0
     }
     if what.as_str() == "stall-timed" {
         let small = image::Image { width: 4, height: 4, rgba: Data::Bytes(Vec::filled(64, u8(9))) }
-        var r = image::resize(small, image::Size { width: 2, height: 2 }, timeout: 0.5)
-        var got = r.poll()
-        while got.is_none() {
-            yield
-            got = r.poll()
-        }
-        let Some(p) = take got else { return 90 }
-        match image::read_image(take p) {
+        match image::resize(small, image::Size { width: 2, height: 2 }, timeout: 0.5).wait() {
             Ok(_) => return 0,
             Err(e) => print(f"error: {e.message()}"),
         }
@@ -119,27 +74,12 @@ fn main(given: take Vec<String>) -> u32 {
         // A resize that's still running when the tool ends.
         let small = image::Image { width: 4, height: 4, rgba: Data::Bytes(Vec::filled(64, u8(9))) }
         let _r = image::resize(small, image::Size { width: 2, height: 2 })
-        var t = time::after(600.0)
-        while t.poll().is_none() { yield }
+        let _ = time::after(600.0).wait()
         return 0
     }
     if what.as_str() == "huge" {
-        var r = files::read("in/huge.png")
-        var got = r.poll()
-        while got.is_none() {
-            yield
-            got = r.poll()
-        }
-        let Some(p) = take got else { return 90 }
-        let Ok(bytes) = answer(take p) else { return 91 }
-        var d = image::decode(Data::Bytes(take bytes))
-        var dg = d.poll()
-        while dg.is_none() {
-            yield
-            dg = d.poll()
-        }
-        let Some(dp) = take dg else { return 90 }
-        match image::read_image(take dp) {
+        let Ok(bytes) = files::read("in/huge.png").wait() else { return 91 }
+        match image::decode(Data::Bytes(take bytes)).wait() {
             Ok(_) => print("decoded"),
             Err(e) => print(f"refused: {e.message()}"),
         }
@@ -148,133 +88,49 @@ fn main(given: take Vec<String>) -> u32 {
     let source = if what.as_str() == "frame" { "in/frame.rgba" } else { "in/pattern.rgba" }
     let w0 = if what.as_str() == "frame" { u32(1920) } else { u32(37) }
     let h0 = if what.as_str() == "frame" { u32(1080) } else { u32(23) }
-    var r = files::read_blob(source)
-    var got = r.poll()
-    while got.is_none() {
-        yield
-        got = r.poll()
-    }
-    let Some(p) = take got else { return 90 }
-    let source = image::Image { width: w0, height: h0, rgba: blob_of(take p, "read") }
+    let pixels = got(files::read_blob(source).wait(), "read")
+    let source = image::Image { width: w0, height: h0, rgba: Data::Blob(pixels) }
     // Each output: what to write, and where.
     var outs: Vec<Data> = Vec::new()
     var paths: Vec<String> = Vec::new()
     if what.as_str() == "resize" {
-        var a = image::resize(source.clone(), image::Size { width: 16, height: 11 })
-        var b = image::resize(source.clone(), image::Size { width: 50, height: 40 })
-        var ag = a.poll()
-        var bg = b.poll()
-        while ag.is_none() || bg.is_none() {
-            yield
-            if ag.is_none() {
-                ag = a.poll()
-            }
-            if bg.is_none() {
-                bg = b.poll()
-            }
-        }
-        let Some(ap) = take ag else { return 90 }
-        let Some(bp) = take bg else { return 90 }
-        outs.push(image_of(take ap, "down").rgba)
+        let a = image::resize(source.clone(), image::Size { width: 16, height: 11 })
+        let b = image::resize(source.clone(), image::Size { width: 50, height: 40 })
+        outs.push(got(take a.wait(), "down").rgba)
         paths.push(String::from("out/down.rgba"))
-        outs.push(image_of(take bp, "up").rgba)
+        outs.push(got(take b.wait(), "up").rgba)
         paths.push(String::from("out/up.rgba"))
     }
     if what.as_str() == "round" {
-        var e = image::encode_png(source.clone())
-        var eg = e.poll()
-        while eg.is_none() {
-            yield
-            eg = e.poll()
-        }
-        let Some(ep) = take eg else { return 90 }
-        let png = encoded_of(take ep, "encode_png")
-        var d = image::decode(png.clone())
-        var dg = d.poll()
-        while dg.is_none() {
-            yield
-            dg = d.poll()
-        }
-        let Some(dp) = take dg else { return 90 }
+        let png = got(image::encode_png(source.clone()).wait(), "encode_png")
+        let decoded = got(image::decode(png.clone()).wait(), "decode png")
         outs.push(take png)
         paths.push(String::from("out/pattern.png"))
-        outs.push(image_of(take dp, "decode png").rgba)
+        outs.push(take decoded.rgba)
         paths.push(String::from("out/png.rgba"))
-        var wa = image::encode_webp(source.clone(), 90.0, 6)
-        var wb = image::encode_webp(source.clone(), 90.0, 6)
-        var ga = wa.poll()
-        var gb = wb.poll()
-        while ga.is_none() || gb.is_none() {
-            yield
-            if ga.is_none() {
-                ga = wa.poll()
-            }
-            if gb.is_none() {
-                gb = wb.poll()
-            }
-        }
-        let Some(pa) = take ga else { return 90 }
-        let Some(pb) = take gb else { return 90 }
-        let a = encoded_of(take pa, "encode_webp")
-        let b = encoded_of(take pb, "encode_webp")
-        var dw = image::decode(a.clone())
-        var dwg = dw.poll()
-        while dwg.is_none() {
-            yield
-            dwg = dw.poll()
-        }
-        let Some(dwp) = take dwg else { return 90 }
+        let wa = image::encode_webp(source.clone(), 90.0, 6)
+        let wb = image::encode_webp(source.clone(), 90.0, 6)
+        let a = got(take wa.wait(), "encode_webp")
+        let b = got(take wb.wait(), "encode_webp")
+        let back = got(image::decode(a.clone()).wait(), "decode webp")
         outs.push(take a)
         paths.push(String::from("out/a.webp"))
         outs.push(take b)
         paths.push(String::from("out/b.webp"))
-        outs.push(image_of(take dwp, "decode webp").rgba)
+        outs.push(take back.rgba)
         paths.push(String::from("out/webp.rgba"))
     }
     if what.as_str() == "frame" {
         let size = image::fit(source.size(), image::Size { width: 960, height: 540 })
-        var c = image::resize(source.clone(), size)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let cover = image_of(take cp, "resize")
-        var e = image::encode_webp(cover.clone(), 90.0, 6)
-        var f = image::encode_png(source.clone())
-        var eg = e.poll()
-        var fg = f.poll()
-        while eg.is_none() || fg.is_none() {
-            yield
-            if eg.is_none() {
-                eg = e.poll()
-            }
-            if fg.is_none() {
-                fg = f.poll()
-            }
-        }
-        let Some(ep) = take eg else { return 90 }
-        let Some(fp) = take fg else { return 90 }
-        let webp = encoded_of(take ep, "encode_webp")
-        let png = encoded_of(take fp, "encode_png")
-        var dw = image::decode(webp.clone())
-        var dp = image::decode(png)
-        var dwg = dw.poll()
-        var dpg = dp.poll()
-        while dwg.is_none() || dpg.is_none() {
-            yield
-            if dwg.is_none() {
-                dwg = dw.poll()
-            }
-            if dpg.is_none() {
-                dpg = dp.poll()
-            }
-        }
-        let Some(dwp) = take dwg else { return 90 }
-        let Some(dpp) = take dpg else { return 90 }
-        let back = image_of(take dwp, "decode webp")
-        let frame = image_of(take dpp, "decode png")
+        let cover = got(image::resize(source.clone(), size).wait(), "resize")
+        let e = image::encode_webp(cover.clone(), 90.0, 6)
+        let f = image::encode_png(source.clone())
+        let webp = got(take e.wait(), "encode_webp")
+        let png = got(take f.wait(), "encode_png")
+        let dw = image::decode(webp.clone())
+        let dp = image::decode(png)
+        let back = got(take dw.wait(), "decode webp")
+        let frame = got(take dp.wait(), "decode png")
         print(f"cover {cover.width}x{cover.height}, back {back.width}x{back.height}, frame {frame.width}x{frame.height}")
         outs.push(take cover.rgba)
         paths.push(String::from("out/cover.rgba"))
@@ -286,27 +142,9 @@ fn main(given: take Vec<String>) -> u32 {
         paths.push(String::from("out/frame-back.rgba"))
     }
     for i in 0..outs.len() {
-        var w = files::write_blob(paths[i].as_str(), blob_in(outs[i].clone()))
-        var wg = w.poll()
-        while wg.is_none() {
-            yield
-            wg = w.poll()
-        }
-        let Some(wp) = take wg else { return 90 }
-        done(take wp, "write")
+        done(files::write_blob(paths[i].as_str(), blob_in(outs[i].clone())).wait(), "write")
     }
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 

@@ -29,8 +29,7 @@ use wrela_host::tool::{Caps, End, Ended, Grants, Signal, Testing};
 const BROWSER_TOOL: &str = r##"
 use std::input::{Key, Mods}
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args}
+use std::tool::{Call, Done, args}
 use std::tool::blob
 use std::tool::blob::Data
 use std::tool::browser
@@ -39,19 +38,24 @@ use std::tool::files
 use std::tool::serve
 use std::tool::time
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+/// Prints how a run and a close, asked at once, ended: the run's first.
+fn both(r: take Call<Done>, c: take Call<Done>) {
+    match take r.wait() {
+        Ok(_) => print("run: done"),
+        Err(e) => print(f"run: {e.message()}"),
+    }
+    match take c.wait() {
+        Ok(_) => print("close: closed"),
+        Err(e) => print(f"close: {e.message()}"),
+    }
+}
+
+pub fn tool() -> u32 {
+    let given = args()
     let what = given[0].clone()
     let page = given[1].clone()
     let root = if given.len() > 2 { given[2].clone() } else { String::from("scratch") }
-    var s = serve::start(root.as_str())
-    var sg = s.poll()
-    while sg.is_none() {
-        yield
-        sg = s.poll()
-    }
-    let Some(sp) = take sg else { return 90 }
-    let started = match serve::read_started(take sp) {
+    let started = match serve::start(root.as_str()).wait() {
         Ok(x) => take x,
         Err(e) => {
             print(f"serve: {e.message()}")
@@ -59,14 +63,7 @@ fn main(given: take Vec<String>) -> u32 {
         },
     }
     let url = f"{started.origin.as_str()}/{page.as_str()}"
-    var o = browser::open(url.as_str(), width: 320, height: 240)
-    var og = o.poll()
-    while og.is_none() {
-        yield
-        og = o.poll()
-    }
-    let Some(op) = take og else { return 90 }
-    let b = match browser::read_opened(take op) {
+    let b = match browser::open(url.as_str(), width: 320, height: 240).wait() {
         Ok(b) => b,
         Err(e) => {
             print(f"open: {e.message()}")
@@ -103,31 +100,9 @@ fn main(given: take Vec<String>) -> u32 {
     }
     if what.as_str() == "closing" {
         // A wait of 600 s, and the browser closed while it waits.
-        var r = browser::run(b, Script::new().wait(Until::done(), timeout: 600.0), timeout: 600.0)
-        var t = time::after(0.3)
-        while t.poll().is_none() { yield }
-        var c = browser::close(b)
-        var cg = c.poll()
-        var rg = r.poll()
-        while cg.is_none() || rg.is_none() {
-            yield
-            if cg.is_none() {
-                cg = c.poll()
-            }
-            if rg.is_none() {
-                rg = r.poll()
-            }
-        }
-        let Some(rp) = take rg else { return 90 }
-        match answer(take rp) {
-            Ok(_) => print("run: done"),
-            Err(e) => print(f"run: {e.message()}"),
-        }
-        let Some(cp) = take cg else { return 90 }
-        match answer(take cp) {
-            Ok(_) => print("close: closed"),
-            Err(e) => print(f"close: {e.message()}"),
-        }
+        let r = browser::run(b, Script::new().wait(Until::done(), timeout: 600.0), timeout: 600.0)
+        let _ = time::after(0.3).wait()
+        both(take r, browser::close(b))
         return 0
     }
     if what.as_str() == "rejected" {
@@ -138,45 +113,18 @@ fn main(given: take Vec<String>) -> u32 {
         var all: Vec<browser::Browser> = Vec::new()
         all.push(b)
         for _ in 0..3 {
-            var o2 = browser::open(url.as_str(), width: 320, height: 240)
-            var og2 = o2.poll()
-            while og2.is_none() {
-                yield
-                og2 = o2.poll()
-            }
-            let Some(op2) = take og2 else { return 90 }
-            let Ok(b2) = browser::read_opened(take op2) else { return 91 }
+            let Ok(b2) = browser::open(url.as_str(), width: 320, height: 240).wait() else { return 91 }
             all.push(b2)
         }
-        var waits: Vec<std::io::Pending<u8>> = Vec::new()
+        var waits: Vec<Call<Done>> = Vec::new()
         for x in all {
             waits.push(browser::run(x, Script::new().wait(Until::done(), timeout: 600.0), timeout: 600.0))
         }
-        var t = time::after(1.0)
-        while t.poll().is_none() { yield }
+        let _ = time::after(1.0).wait()
         // The first is closed, its close queued behind the four waits.
-        var c = browser::close(b)
-        var cg = c.poll()
-        var rg = waits[0].poll()
-        while cg.is_none() || rg.is_none() {
-            yield
-            if cg.is_none() {
-                cg = c.poll()
-            }
-            if rg.is_none() {
-                rg = waits[0].poll()
-            }
-        }
-        let Some(rp) = take rg else { return 90 }
-        match answer(take rp) {
-            Ok(_) => print("run: done"),
-            Err(e) => print(f"run: {e.message()}"),
-        }
-        let Some(cp) = take cg else { return 90 }
-        match answer(take cp) {
-            Ok(_) => print("close: closed"),
-            Err(e) => print(f"close: {e.message()}"),
-        }
+        let c = browser::close(b)
+        var first = waits.remove(0)
+        both(take first, take c)
         return 0
     }
     if what.as_str() == "gather" {
@@ -184,33 +132,12 @@ fn main(given: take Vec<String>) -> u32 {
     }
     if what.as_str() == "two" {
         // A second browser, on the same server, whose page puts its result.
-        var o2 = browser::open(f"{started.origin.as_str()}/done.html".as_str())
-        var og2 = o2.poll()
-        while og2.is_none() {
-            yield
-            og2 = o2.poll()
-        }
-        let Some(op2) = take og2 else { return 90 }
-        let Ok(b2) = browser::read_opened(take op2) else { return 91 }
-        var r2 = browser::run(b2, Script::new().wait(Until::done()))
-        var rg2 = r2.poll()
-        while rg2.is_none() {
-            yield
-            rg2 = r2.poll()
-        }
-        let Some(rp2) = take rg2 else { return 90 }
-        match answer(take rp2) {
+        let Ok(b2) = browser::open(f"{started.origin.as_str()}/done.html".as_str()).wait() else { return 91 }
+        match browser::run(b2, Script::new().wait(Until::done())).wait() {
             Ok(_) => print("the second's page is done"),
             Err(e) => print(f"the second: {e.message()}"),
         }
-        var d = browser::results(b)
-        var dg = d.poll()
-        while dg.is_none() {
-            yield
-            dg = d.poll()
-        }
-        let Some(dp) = take dg else { return 90 }
-        match browser::read_attribute(take dp) {
+        match browser::results(b).wait() {
             Ok(Some(t)) => print(f"the first's result: {t.as_str()}"),
             Ok(None) => print("the first has no result"),
             Err(e) => print(f"results: {e.message()}"),
@@ -218,14 +145,7 @@ fn main(given: take Vec<String>) -> u32 {
         script = Script::new().wait(Until::done(), timeout: 1.0)
     }
     if what.as_str() == "clipboard" {
-        var c = browser::clipboard(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        match browser::read_text(take cp) {
+        match browser::clipboard(b).wait() {
             Ok(t) => print(f"clipboard before: {t.as_str()}"),
             Err(_) => print("clipboard before: refused"),
         }
@@ -241,24 +161,10 @@ fn main(given: take Vec<String>) -> u32 {
     if what.as_str() == "never" {
         script = Script::new().wait(Until::done(), timeout: 0.3)
     }
-    var r = browser::run(b, script)
-    var rg = r.poll()
-    while rg.is_none() {
-        yield
-        rg = r.poll()
-    }
-    let Some(rp) = take rg else { return 90 }
-    if let Err(e) = answer(take rp) {
+    if let Err(e) = browser::run(b, script).wait() {
         print(f"run: {e.message()}")
         if what.as_str() == "rejected" {
-            var f = files::read(f"{root.as_str()}/results/DONE".as_str())
-            var fg = f.poll()
-            while fg.is_none() {
-                yield
-                fg = f.poll()
-            }
-            let Some(fp) = take fg else { return 90 }
-            match answer(take fp) {
+            match files::read(f"{root.as_str()}/results/DONE".as_str()).wait() {
                 Ok(_) => print("kept a DONE"),
                 Err(_) => print("kept no DONE"),
             }
@@ -268,14 +174,7 @@ fn main(given: take Vec<String>) -> u32 {
             return 0
         }
         if what.as_str() == "huge" {
-            var d = browser::results(b)
-            var dg = d.poll()
-            while dg.is_none() {
-                yield
-                dg = d.poll()
-            }
-            let Some(dp) = take dg else { return 90 }
-            match browser::read_attribute(take dp) {
+            match browser::results(b).wait() {
                 Ok(Some(t)) => print(f"results: {t.as_str()}"),
                 Ok(None) => print("results: none"),
                 Err(e) => print(f"results: {e.message()}"),
@@ -286,81 +185,26 @@ fn main(given: take Vec<String>) -> u32 {
             return 1
         }
         // The request's own deadline, sooner than its wait's.
-        var d = browser::run(b, Script::new().wait(Until::done(), timeout: 30.0), timeout: 0.5)
-        var dg = d.poll()
-        while dg.is_none() {
-            yield
-            dg = d.poll()
-        }
-        let Some(dp) = take dg else { return 90 }
-        if let Err(e) = answer(take dp) {
+        let late = browser::run(b, Script::new().wait(Until::done(), timeout: 30.0), timeout: 0.5)
+        if let Err(e) = take late.wait() {
             print(f"deadline: {e.message()}")
         }
         return 0
     }
     if what.as_str() == "act" {
-        var t = browser::title(b)
-        var tg = t.poll()
-        while tg.is_none() {
-            yield
-            tg = t.poll()
-        }
-        let Some(tp) = take tg else { return 90 }
-        let Ok(title) = browser::read_text(take tp) else { return 2 }
+        let Ok(title) = browser::title(b).wait() else { return 2 }
         print(f"title {title.as_str()}")
-        var x = browser::texts(b, "li")
-        var xg = x.poll()
-        while xg.is_none() {
-            yield
-            xg = x.poll()
-        }
-        let Some(xp) = take xg else { return 90 }
-        let Ok(items) = browser::read_texts(take xp) else { return 2 }
+        let Ok(items) = browser::texts(b, "li").wait() else { return 2 }
         print(f"items {items.len()} {items[0].as_str()} {items[1].as_str()}")
-        var n = browser::count(b, Element::css("li").with_text("two"))
-        var ng = n.poll()
-        while ng.is_none() {
-            yield
-            ng = n.poll()
-        }
-        let Some(np) = take ng else { return 90 }
-        let Ok(count) = browser::read_count(take np) else { return 2 }
+        let Ok(count) = browser::count(b, Element::css("li").with_text("two")).wait() else { return 2 }
         print(f"count {count}")
-        var a = browser::attribute(b, Element::css("#next"), "href")
-        var ag = a.poll()
-        while ag.is_none() {
-            yield
-            ag = a.poll()
-        }
-        let Some(ap) = take ag else { return 90 }
-        let Ok(Some(href)) = browser::read_attribute(take ap) else { return 2 }
+        let Ok(Some(href)) = browser::attribute(b, Element::css("#next"), "href").wait() else { return 2 }
         print(f"href {href.as_str()}")
-        var f = browser::active(b)
-        var fg = f.poll()
-        while fg.is_none() {
-            yield
-            fg = f.poll()
-        }
-        let Some(fp) = take fg else { return 90 }
-        let Ok(Some(focused)) = browser::read_active(take fp) else { return 2 }
+        let Ok(Some(focused)) = browser::active(b).wait() else { return 2 }
         print(f"active {focused.tag.as_str()} {focused.id.as_str()}")
-        var l = browser::location(b)
-        var lg = l.poll()
-        while lg.is_none() {
-            yield
-            lg = l.poll()
-        }
-        let Some(lp) = take lg else { return 90 }
-        let Ok(location) = browser::read_text(take lp) else { return 2 }
+        let Ok(location) = browser::location(b).wait() else { return 2 }
         print(f"page {Match::ends("/form.html").matches(location.as_str())}")
-        var k = browser::capture(b)
-        var kg = k.poll()
-        while kg.is_none() {
-            yield
-            kg = k.poll()
-        }
-        let Some(kp) = take kg else { return 90 }
-        let capture = match browser::read_capture(take kp) {
+        let capture = match browser::capture(b).wait() {
             Ok(c) => take c,
             Err(e) => {
                 print(f"capture: {e.message()}")
@@ -368,122 +212,48 @@ fn main(given: take Vec<String>) -> u32 {
             },
         }
         let Data::Blob(png) = capture.png else { return 3 }
-        var h = blob::read(png, 0, 8)
-        var hg = h.poll()
-        while hg.is_none() {
-            yield
-            hg = h.poll()
-        }
-        let Some(hp) = take hg else { return 90 }
-        let Ok(head) = answer(take hp) else { return 2 }
+        let Ok(head) = blob::read(png, 0, 8).wait() else { return 2 }
         print(f"capture {capture.width}x{capture.height} png {head.len() == 8 && head[1] == 80 && head[2] == 78 && head[3] == 71}")
     }
     if what.as_str() == "refused" || what.as_str() == "act" || what.as_str() == "gather" {
-        var c = browser::console(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let Ok(lines) = browser::read_texts(take cp) else { return 2 }
+        let Ok(lines) = browser::console(b).wait() else { return 2 }
         for line in lines {
             print(f"console {line.as_str()}")
         }
-        var t = browser::title(b)
-        var tg = t.poll()
-        while tg.is_none() {
-            yield
-            tg = t.poll()
-        }
-        let Some(tp) = take tg else { return 90 }
-        let Ok(title) = browser::read_text(take tp) else { return 2 }
+        let Ok(title) = browser::title(b).wait() else { return 2 }
         print(f"title {title.as_str()}")
     }
     if what.as_str() == "clipboard" {
-        var c = browser::clipboard(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        let Ok(t) = browser::read_text(take cp) else { return 2 }
+        let Ok(t) = browser::clipboard(b).wait() else { return 2 }
         print(f"clipboard after: {t.as_str()}")
     }
     if what.as_str() == "whole" {
-        var x = browser::texts(b, "li")
-        var xg = x.poll()
-        while xg.is_none() {
-            yield
-            xg = x.poll()
-        }
-        let Some(xp) = take xg else { return 90 }
-        match browser::read_texts(take xp) {
+        match browser::texts(b, "li").wait() {
             Ok(items) => print(f"items {items.len()}, the last {items[items.len() - 1].as_str()}"),
             Err(e) => print(f"texts: {e.message()}"),
         }
-        var c = browser::clipboard(b)
-        var cg = c.poll()
-        while cg.is_none() {
-            yield
-            cg = c.poll()
-        }
-        let Some(cp) = take cg else { return 90 }
-        match browser::read_text(take cp) {
+        match browser::clipboard(b).wait() {
             Ok(t) => print(f"clipboard {t.len()} bytes"),
             Err(e) => print(f"clipboard: {e.message()}"),
         }
     }
     if what.as_str() == "delayed" {
         // The result the browser saw is the one its server kept: on disk before close.
-        var f = files::read(f"{root.as_str()}/results/DONE".as_str())
-        var fg = f.poll()
-        while fg.is_none() {
-            yield
-            fg = f.poll()
-        }
-        let Some(fp) = take fg else { return 90 }
-        match answer(take fp) {
+        match files::read(f"{root.as_str()}/results/DONE".as_str()).wait() {
             Ok(bytes) => print(f"kept {bytes.len()} bytes"),
             Err(e) => print(f"kept nothing: {e.message()}"),
         }
     }
     if what.as_str() == "done" {
-        var d = browser::results(b)
-        var dg = d.poll()
-        while dg.is_none() {
-            yield
-            dg = d.poll()
-        }
-        let Some(dp) = take dg else { return 90 }
-        let Ok(Some(done)) = browser::read_attribute(take dp) else { return 2 }
+        let Ok(Some(done)) = browser::results(b).wait() else { return 2 }
         print(f"done {done.as_str()}")
     }
-    var z = browser::close(b)
-    var zg = z.poll()
-    while zg.is_none() {
-        yield
-        zg = z.poll()
-    }
-    let Some(zp) = take zg else { return 90 }
-    if let Err(e) = answer(take zp) {
+    if let Err(e) = browser::close(b).wait() {
         print(f"close: {e.message()}")
         return 1
     }
     print("closed")
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "##;
 

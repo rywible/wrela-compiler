@@ -59,6 +59,8 @@ pub(crate) struct Helpers {
     pub phase: u32,
     /// The import `wrela.tick(task, context, hz)`, in a module that starts a ticker.
     pub tick: u32,
+    /// The first of a tool build's imports, wrela_abi's `TOOL_FUNCTIONS` in their order.
+    pub tool: u32,
     /// The type of a task function ([`ir::MemOp::RunTask`]): (context, chunk) -> ().
     pub task_type: u32,
     /// `flush()`: submits the pending commands, if any.
@@ -269,6 +271,13 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         let ty = types.get(vec![ValType::I32; 3], vec![]);
         imports.import(wrela_abi::IMPORT_MODULE, wrela_abi::IMPORT_TICK, EntityType::Function(ty));
     }
+    let tool = imports.len();
+    if m.tool {
+        for f in wrela_abi::TOOL_FUNCTIONS {
+            let ty = types.get(vec![ValType::I32; f.params], vec![ValType::I32; f.results]);
+            imports.import(wrela_abi::IMPORT_MODULE, f.name, EntityType::Function(ty));
+        }
+    }
     let nimports = imports.len();
     // The memory, shared: workers' instances get the same one (wrela_abi::memory).
     let memory_type = MemoryType {
@@ -299,6 +308,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
         print,
         phase: print + 1,
         tick,
+        tool,
         flush: nimports,
         reserve: nimports + 1,
         write: nimports + 2,

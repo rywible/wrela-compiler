@@ -1,6 +1,6 @@
-//! The tool host (language.md §15.5, `wrela_host::tool`): a tool build run as a job resumed on
-//! answers, with only what its grants reach. Each program here is a `@job fn` that `tool_init`
-//! starts and `tool` resumes, waiting on each request with `yield`. The tests run its core
+//! The tool host (language.md §15.5, `wrela_host::tool`): a tool build whose `tool` runs once,
+//! waiting on each request where it needs the answer, with only what its grants reach. The
+//! tests run its core
 //! services (arguments, secrets, files, blobs, time), its refusals (paths outside the roots,
 //! `..`, symbolic links out of a root, one swapped in after a check, writes to a read root,
 //! secrets not granted, a blob budget spent), and each way it ends: its status, waiting on
@@ -85,32 +85,16 @@ pub(crate) fn run(build: &ToolBuild, options: Options) -> Ended {
     ended
 }
 
-/// The `tool_init` and `tool` that start and resume a job `main` of no parameters.
-pub(crate) const ENTRIES: &str = r#"
-pub fn tool_init() -> Job<main> {
-    main.start()
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
-}
-"#;
-
 const SERVICES: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, args, secret}
+use std::tool::{args, secret}
 use std::tool::blob
 use std::tool::files
 use std::tool::time
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
     var line = String::from("args:")
-    for a in given {
+    for a in args() {
         line.push_str(" ")
         line.push_str(a.as_str())
     }
@@ -123,34 +107,13 @@ fn main(given: take Vec<String>) -> u32 {
         print("no PATH: it isn't granted")
     }
 
-    var p = files::read("in/a.txt")
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(read) = take got else { return 90 }
-    let Ok(bytes) = answer(take read) else { return 91 }
+    let Ok(bytes) = files::read("in/a.txt").wait() else { return 91 }
     let Some(text) = String::from_utf8(take bytes) else { return 92 }
     print(f"in/a.txt: {text.as_str()}")
 
-    var w = files::write("out/sub/b.txt", [u8(104), 105])
-    var wrote = w.poll()
-    while wrote.is_none() {
-        yield
-        wrote = w.poll()
-    }
-    let Some(done) = take wrote else { return 93 }
-    if answer(take done).is_err() { return 94 }
+    if files::write("out/sub/b.txt", [u8(104), 105]).wait().is_err() { return 94 }
 
-    var l = files::list("in")
-    var listed = l.poll()
-    while listed.is_none() {
-        yield
-        listed = l.poll()
-    }
-    let Some(polled) = take listed else { return 95 }
-    let Ok(entries) = files::read_list(take polled) else { return 96 }
+    let Ok(entries) = files::list("in").wait() else { return 96 }
     for e in entries {
         let kind = match e.kind {
             files::Kind::File => "file",
@@ -160,104 +123,35 @@ fn main(given: take Vec<String>) -> u32 {
         }
         print(f"in has {e.name.as_str()}, a {kind} of {e.size} bytes")
     }
-    var s = files::stat("out/sub")
-    var stated = s.poll()
-    while stated.is_none() {
-        yield
-        stated = s.poll()
-    }
-    let Some(st) = take stated else { return 97 }
-    let Ok(entry) = files::read_entry(take st) else { return 98 }
+    let Ok(entry) = files::stat("out/sub").wait() else { return 98 }
     if entry.kind == files::Kind::Dir {
         print("out/sub is a directory")
     }
 
     // 1.5 MiB in three chunks, out to a file, and back in as another blob.
-    var nb = blob::new()
-    var made = nb.poll()
-    while made.is_none() {
-        yield
-        made = nb.poll()
-    }
-    let Some(m) = take made else { return 99 }
-    let Ok(b) = blob::read_handle(take m) else { return 100 }
+    let Ok(b) = blob::new().wait() else { return 100 }
     for k in 0..3 {
         let chunk = Vec::filled(524288, u8(k + 1))
-        var ap = blob::append(b, chunk)
-        var app = ap.poll()
-        while app.is_none() {
-            yield
-            app = ap.poll()
-        }
-        let Some(a) = take app else { return 101 }
-        if answer(take a).is_err() { return 102 }
+        if blob::append(b, chunk).wait().is_err() { return 102 }
     }
-    var wb = files::write_blob("out/big.bin", b)
-    var wbs = wb.poll()
-    while wbs.is_none() {
-        yield
-        wbs = wb.poll()
-    }
-    let Some(x) = take wbs else { return 103 }
-    if answer(take x).is_err() { return 104 }
-    var rel = blob::release(b)
-    while rel.poll().is_none() { yield }
-    var rb = files::read_blob("out/big.bin")
-    var rbs = rb.poll()
-    while rbs.is_none() {
-        yield
-        rbs = rb.poll()
-    }
-    let Some(y) = take rbs else { return 105 }
-    let Ok(back) = blob::read_handle(take y) else { return 106 }
-    var n = blob::len(back)
-    var ns = n.poll()
-    while ns.is_none() {
-        yield
-        ns = n.poll()
-    }
-    let Some(z) = take ns else { return 107 }
-    let Ok(size) = blob::read_len(take z) else { return 108 }
-    var c = blob::read(back, u64(1048576) + 10, 4)
-    var cs = c.poll()
-    while cs.is_none() {
-        yield
-        cs = c.poll()
-    }
-    let Some(q) = take cs else { return 109 }
-    let Ok(piece) = answer(take q) else { return 110 }
+    if files::write_blob("out/big.bin", b).wait().is_err() { return 104 }
+    let _ = blob::release(b).wait()
+    let Ok(back) = files::read_blob("out/big.bin").wait() else { return 106 }
+    let Ok(size) = blob::len(back).wait() else { return 108 }
+    let Ok(piece) = blob::read(back, u64(1048576) + 10, 4).wait() else { return 110 }
     print(f"a blob of {size} bytes, at 1 MiB + 10: {piece[0]} {piece[3]}, {piece.len()} bytes")
 
     let waited = std::time::now()
-    var t = time::after(0.05)
-    while t.poll().is_none() { yield }
+    let _ = time::after(0.05).wait()
     if std::time::since(waited) >= 0.05 {
         print("the timer fired after 50 ms")
     }
-    var u = time::utc_now()
-    var us = u.poll()
-    while us.is_none() {
-        yield
-        us = u.poll()
-    }
-    let Some(v) = take us else { return 111 }
-    let Ok(now) = time::read_utc(take v) else { return 112 }
+    let Ok(now) = time::utc_now().wait() else { return 112 }
     if now.seconds > u64(1700000000) {
         print("the date is after 2023")
     }
     // `back` isn't released: the host releases it as the tool ends.
     7
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -302,97 +196,53 @@ fn a_tool_uses_its_arguments_files_blobs_and_time() {
 }
 
 const REFUSALS: &str = r#"
-use std::io::{IoError, Pending, print}
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer, secret}
+use std::io::print
+use std::tool::{ToolError, secret}
 use std::tool::files
-use std::tool::time::after
 
 /// Prints what an answer says: `ok`, or why the request failed.
-fn say(what: str, polled: take Result<Vec<u8>, IoError>) {
-    match answer(take polled) {
-        Ok(bytes) => print(f"{what}: ok, {bytes.len()} bytes"),
+fn say<T>(what: str, answered: take Result<T, ToolError>) {
+    match take answered {
+        Ok(_) => print(f"{what}: ok"),
         Err(e) => print(f"{what}: {e.message()}"),
     }
 }
 
-@job
-fn main() -> u32 {
+pub fn tool() -> u32 {
     // Asked all at once, each answered when it's done; printed in the order asked.
-    var names: Vec<String> = Vec::new()
-    var asked: Vec<Pending<u8>> = Vec::new()
-    names.push(String::from("read in/../in/a.txt"))
-    asked.push(files::read("in/../in/a.txt"))
-    names.push(String::from("read /etc/hosts"))
-    asked.push(files::read("/etc/hosts"))
-    names.push(String::from("read elsewhere/a.txt"))
-    asked.push(files::read("elsewhere/a.txt"))
-    names.push(String::from("read in/link/secret.txt"))
-    asked.push(files::read("in/link/secret.txt"))
-    names.push(String::from("read in/escape.txt"))
-    asked.push(files::read("in/escape.txt"))
-    names.push(String::from("write in/new.txt"))
-    asked.push(files::write("in/new.txt", [u8(1)]))
-    names.push(String::from("remove_all out"))
-    asked.push(files::remove_all("out"))
-    names.push(String::from("stat in/swap"))
-    asked.push(files::stat("in/swap"))
-    var answers: Vec<Option<Result<Vec<u8>, IoError>>> = Vec::new()
-    for _ in 0..asked.len() {
-        answers.push(None)
-    }
-    var left = asked.len()
-    while left > 0 {
-        for i in 0..asked.len() {
-            if let Some(a) = asked[i].poll() {
-                answers[i] = Some(take a)
-                left -= 1
-            }
-        }
-        if left > 0 {
-            yield
-        }
-    }
-    for i in 0..answers.len() {
-        if let Some(a) = replace(mut answers[i], None) {
-            say(names[i].as_str(), take a)
-        }
-    }
+    let r0 = files::read("in/../in/a.txt")
+    let r1 = files::read("/etc/hosts")
+    let r2 = files::read("elsewhere/a.txt")
+    let r3 = files::read("in/link/secret.txt")
+    let r4 = files::read("in/escape.txt")
+    let w5 = files::write("in/new.txt", [u8(1)])
+    let d6 = files::remove_all("out")
+    let s7 = files::stat("in/swap")
+    say("read in/../in/a.txt", take r0.wait())
+    say("read /etc/hosts", take r1.wait())
+    say("read elsewhere/a.txt", take r2.wait())
+    say("read in/link/secret.txt", take r3.wait())
+    say("read in/escape.txt", take r4.wait())
+    say("write in/new.txt", take w5.wait())
+    say("remove_all out", take d6.wait())
+    say("stat in/swap", take s7.wait())
     if secret("PATH").is_none() {
         print("secret PATH: not granted")
     }
     // A directory checked, then swapped for a link out of the root before it's read: the test's
     // printer swaps it, on the host's console thread, and the tool waits until it sees the swap.
     print("checked in/swap")
-    loop {
-        var s = files::stat("in/swap")
-        var st = s.poll()
-        while st.is_none() {
-            yield
-            st = s.poll()
-        }
-        let Some(a) = take st else { return 91 }
-        if answer(take a).is_err() {
-            break
-        }
-        var t = after(0.01)
-        while t.poll().is_none() { yield }
+    while files::stat("in/swap").wait().is_ok() {
+        let _ = std::tool::time::after(0.01).wait()
     }
-    var p = files::read("in/swap/secret.txt")
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(r) = take got else { return 90 }
-    say("read in/swap/secret.txt", take r)
+    say("read in/swap/secret.txt", files::read("in/swap/secret.txt").wait())
     0
 }
 "#;
 
 #[test]
 fn requests_outside_the_grants_fail_and_the_tool_goes_on() {
-    let build = tool_build("refusals", &format!("{REFUSALS}{ENTRIES}"));
+    let build = tool_build("refusals", REFUSALS);
     let root = scratch("refusals");
     let (input, output, outside) = (root.join("in"), root.join("out"), root.join("outside"));
     for d in [&input.join("swap"), &output, &outside] {
@@ -426,7 +276,7 @@ fn requests_outside_the_grants_fail_and_the_tool_goes_on() {
         "read in/escape.txt: `in/escape.txt` leads outside its root",
         "write in/new.txt: the path `in/new.txt` is in `in`, which is granted for reading only",
         "remove_all out: `out` is a root, not a file in one",
-        "stat in/swap: ok, 9 bytes",
+        "stat in/swap: ok",
         "secret PATH: not granted",
         "checked in/swap",
         "read in/swap/secret.txt: `in/swap/secret.txt` leads outside its root",
@@ -438,50 +288,25 @@ fn requests_outside_the_grants_fail_and_the_tool_goes_on() {
 
 const BUDGET: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer}
 use std::tool::blob
 
-@job
-fn main() -> u32 {
+pub fn tool() -> u32 {
     var handles: Vec<blob::Blob> = Vec::new()
     for _ in 0..3 {
-        var p = blob::new()
-        var got = p.poll()
-        while got.is_none() {
-            yield
-            got = p.poll()
-        }
-        let Some(a) = take got else { return 90 }
-        match blob::read_handle(take a) {
+        match blob::new().wait() {
             Ok(b) => handles.push(b),
             Err(e) => print(f"new: {e.message()}"),
         }
     }
     let sizes = [u32(524288), 524288, 1]
     for i in 0..3 {
-        var p = blob::append(handles[i % 2], Vec::filled(sizes[i], u8(9)))
-        var got = p.poll()
-        while got.is_none() {
-            yield
-            got = p.poll()
-        }
-        let Some(a) = take got else { return 91 }
-        match answer(take a) {
+        match blob::append(handles[i % 2], Vec::filled(sizes[i], u8(9))).wait() {
             Ok(_) => print(f"append {sizes[i]}: ok"),
             Err(e) => print(f"append {sizes[i]}: {e.message()}"),
         }
     }
-    var r = blob::release(handles[1])
-    while r.poll().is_none() { yield }
-    var p = blob::append(handles[0], [u8(1)])
-    var got = p.poll()
-    while got.is_none() {
-        yield
-        got = p.poll()
-    }
-    let Some(a) = take got else { return 92 }
-    if answer(take a).is_ok() {
+    let _ = blob::release(handles[1]).wait()
+    if blob::append(handles[0], [u8(1)]).wait().is_ok() {
         print("append 1 after a release: ok")
     }
     0
@@ -490,7 +315,7 @@ fn main() -> u32 {
 
 #[test]
 fn a_spent_blob_budget_fails_the_request_not_the_tool() {
-    let build = tool_build("budget", &format!("{BUDGET}{ENTRIES}"));
+    let build = tool_build("budget", BUDGET);
     let (lines, mut options) = printer(|_| {});
     options.blob_budget = BlobBudget { bytes: 1 << 20, handles: 2 };
     let ended = run(&build, options);
@@ -512,17 +337,15 @@ fn a_spent_blob_budget_fails_the_request_not_the_tool() {
 #[test]
 fn a_tool_that_waits_on_nothing_is_stopped() {
     let main = r#"
-use std::job::{Job, Step}
-use std::tool::RUNNING
+use std::tool::{Request, any}
 
-@job
-fn main() -> u32 {
-    // Yields with no request made: nothing would call it again.
-    yield
-    0
+pub fn tool() -> u32 {
+    // Waits for the first of no requests: nothing would answer it.
+    let none: [Request; 0] = []
+    any(none)
 }
 "#;
-    let build = tool_build("nothing", &format!("{main}{ENTRIES}"));
+    let build = tool_build("nothing", main);
     let (_, options) = printer(|_| {});
     let ended = run(&build, options);
     assert_eq!(ended.end, End::WaitsOnNothing);
@@ -532,26 +355,18 @@ fn main() -> u32 {
 #[test]
 fn a_trap_ends_the_tool_with_its_message_and_releases_its_blobs() {
     let main = r#"
-use std::job::{Job, Step}
-use std::tool::RUNNING
 use std::tool::blob
 use std::tool::time::after
 
-@job
-fn main() -> u32 {
-    var read = blob::new()
-    while read.poll().is_none() { yield }
+pub fn tool() -> u32 {
+    let _ = blob::new().wait()
     // Made and answered, but its answer never read: the host releases it too.
-    var unread = blob::new()
-    var t = after(0.05)
-    while t.poll().is_none() { yield }
-    if !unread.is_done() {
-        panic("the tool broke after its blobs")
-    }
-    0
+    let unread = blob::new()
+    let _ = after(0.05).wait()
+    panic("the tool broke after its blobs")
 }
 "#;
-    let build = tool_build("trap", &format!("{main}{ENTRIES}"));
+    let build = tool_build("trap", main);
     let (_, options) = printer(|_| {});
     let ended = run(&build, options);
     assert_eq!(ended.end, End::Trap("the tool broke after its blobs".into()));
@@ -560,32 +375,17 @@ fn main() -> u32 {
 }
 
 const FOREVER: &str = r#"
-use std::job::{Job, Step}
-use std::tool::RUNNING
 use std::tool::time::after
 
-@job
-fn main(spin: take bool) -> u32 {
-    if spin {
+pub fn tool() -> u32 {
+    if std::tool::args().len() > 0 {
         var n: u32 = 0
         loop {
             n = n.wrapping_add(1)
         }
     }
-    var t = after(3600.0)
-    while t.poll().is_none() { yield }
+    let _ = after(3600.0).wait()
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(std::tool::args().len() > 0)
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -625,51 +425,33 @@ fn an_interrupt_stops_a_tool_inside_a_call() {
 
 const FIFO: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer}
+use std::tool::ToolError
 use std::tool::blob
 use std::tool::files
 
-@job
-fn main() -> u32 {
-    var nb = blob::new()
-    var made = nb.poll()
-    while made.is_none() {
-        yield
-        made = nb.poll()
+fn said<T>(name: str, answered: take Result<T, ToolError>) {
+    match take answered {
+        Ok(_) => print(f"{name}: ok"),
+        Err(e) => print(f"{name}: {e.message()}"),
     }
-    let Some(m) = take made else { return 90 }
-    let Ok(b) = blob::read_handle(take m) else { return 91 }
-    var ap = blob::append(b, [u8(1), 2, 3])
-    while ap.poll().is_none() { yield }
+}
+
+pub fn tool() -> u32 {
+    let Ok(b) = blob::new().wait() else { return 91 }
+    let _ = blob::append(b, [u8(1), 2, 3]).wait()
     // A FIFO with nothing at its other end: each is refused at once, and the tool goes on. One
     // at a time, so no two opens meet at the FIFO's ends.
-    let names = ["write_blob", "read", "write", "read_blob"]
-    for i in 0..4 {
-        var p = match i {
-            0 => files::write_blob("out/fifo", b),
-            1 => files::read("out/fifo"),
-            2 => files::write("out/fifo", [u8(1)]),
-            _ => files::read_blob("out/fifo"),
-        }
-        var got = p.poll()
-        while got.is_none() {
-            yield
-            got = p.poll()
-        }
-        let Some(a) = take got else { return 92 }
-        match answer(take a) {
-            Ok(_) => print(f"{names[i]}: ok"),
-            Err(e) => print(f"{names[i]}: {e.message()}"),
-        }
-    }
+    said("write_blob", files::write_blob("out/fifo", b).wait())
+    said("read", files::read("out/fifo").wait())
+    said("write", files::write("out/fifo", [u8(1)]).wait())
+    said("read_blob", files::read_blob("out/fifo").wait())
     0
 }
 "#;
 
 #[test]
 fn files_that_arent_regular_files_are_refused_without_waiting() {
-    let build = tool_build("fifo", &format!("{FIFO}{ENTRIES}"));
+    let build = tool_build("fifo", FIFO);
     let out = scratch("fifo");
     let made = std::process::Command::new("mkfifo").arg(out.join("fifo")).status();
     assert!(made.is_ok_and(|s| s.success()), "mkfifo");
@@ -689,32 +471,20 @@ fn files_that_arent_regular_files_are_refused_without_waiting() {
 }
 
 const SLOW_WRITE: &str = r#"
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer}
 use std::tool::blob
 use std::tool::files
 
-@job
-fn main() -> u32 {
-    var nb = blob::new()
-    var made = nb.poll()
-    while made.is_none() {
-        yield
-        made = nb.poll()
-    }
-    let Some(m) = take made else { return 90 }
-    let Ok(b) = blob::read_handle(take m) else { return 91 }
-    var ap = blob::append(b, Vec::filled(1024, u8(7)))
-    while ap.poll().is_none() { yield }
-    var w = files::write_blob("out/slow.bin", b)
-    while w.poll().is_none() { yield }
+pub fn tool() -> u32 {
+    let Ok(b) = blob::new().wait() else { return 91 }
+    let _ = blob::append(b, Vec::filled(1024, u8(7))).wait()
+    let _ = files::write_blob("out/slow.bin", b).wait()
     0
 }
 "#;
 
 #[test]
 fn a_worker_stuck_in_a_file_write_ends_the_run_in_bounded_time_as_the_hosts() {
-    let build = tool_build("slow-write", &format!("{SLOW_WRITE}{ENTRIES}"));
+    let build = tool_build("slow-write", SLOW_WRITE);
     let out = scratch("slow-write");
     // How late a thread may wake, past what the host itself waits.
     let late = Duration::from_secs(1);
@@ -770,24 +540,10 @@ fn a_worker_stuck_in_a_file_write_ends_the_run_in_bounded_time_as_the_hosts() {
 fn a_clock_thread_that_cant_start_ends_the_run_before_any_wasm() {
     let main = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::RUNNING
 
-@job
-fn main() -> u32 {
+pub fn tool() -> u32 {
+    print("tool ran")
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    print("tool_init ran")
-    main.start()
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
     let build = tool_build("no-clock", main);
@@ -802,47 +558,23 @@ pub fn tool(job: mut Job<main>) -> u32 {
 
 const ROLLBACK: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, answer}
 use std::tool::blob
 use std::tool::run
 
-@job
-fn main() -> u32 {
+pub fn tool() -> u32 {
     // Its standard output fits the budget, as a blob; its standard error doesn't.
     var c = run::command("sh", "out")
     c.args.push(String::from("-c"))
     c.args.push(String::from("/usr/bin/head -c 614400 /dev/zero; /usr/bin/head -c 614400 /dev/zero >&2"))
-    var r = run::run(c)
-    var got = r.poll()
-    while got.is_none() {
-        yield
-        got = r.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    match run::read_ran(take polled) {
+    match run::run(c).wait() {
         Ok(_) => print("ran"),
         Err(e) => print(f"failed: {e.message()}"),
     }
     print("after the failure")
     // The whole budget is free again.
-    var nb = blob::new()
-    var made = nb.poll()
-    while made.is_none() {
-        yield
-        made = nb.poll()
-    }
-    let Some(m) = take made else { return 91 }
-    let Ok(b) = blob::read_handle(take m) else { return 92 }
+    let Ok(b) = blob::new().wait() else { return 92 }
     for _ in 0..2 {
-        var ap = blob::append(b, Vec::filled(524288, u8(1)))
-        var app = ap.poll()
-        while app.is_none() {
-            yield
-            app = ap.poll()
-        }
-        let Some(a) = take app else { return 93 }
-        if answer(take a).is_err() {
+        if blob::append(b, Vec::filled(524288, u8(1))).wait().is_err() {
             print("the budget wasn't given back")
             return 1
         }
@@ -853,7 +585,7 @@ fn main() -> u32 {
 
 #[test]
 fn a_request_that_fails_part_way_gives_back_its_blobs_and_files() {
-    let build = tool_build("rollback", &format!("{ROLLBACK}{ENTRIES}"));
+    let build = tool_build("rollback", ROLLBACK);
     let root = scratch("rollback");
     let (out, work) = (root.join("out"), root.join("work"));
     std::fs::create_dir_all(&out).expect("out");
@@ -889,15 +621,13 @@ fn a_request_that_fails_part_way_gives_back_its_blobs_and_files() {
 
 const STARVE: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::RUNNING
+use std::tool::Call
 use std::tool::files
 use std::tool::run
 
-@job
-fn main() -> u32 {
+pub fn tool() -> u32 {
     // Four programs fill the long waits' workers; a fifth queues behind them past its deadline.
-    var waits: Vec<std::io::Pending<u8>> = Vec::new()
+    var waits: Vec<Call<run::Ran>> = Vec::new()
     for i in 0..5 {
         var c = run::command("sleep", "out")
         c.args.push(String::from(if i < 4 { "2" } else { "0" }))
@@ -908,36 +638,23 @@ fn main() -> u32 {
     }
     // A file isn't held up by them.
     let asked = std::time::now()
-    var s = files::stat("out")
-    while s.poll().is_none() { yield }
+    let _ = files::stat("out").wait()
     if std::time::since(asked) < 1.0 {
         print("the file was answered at once")
     }
-    var answered: Vec<Option<Result<run::Ran, std::tool::ToolError>>> = Vec::new()
-    for _ in 0..5 {
-        answered.push(None)
+    var last_first: Vec<Call<run::Ran>> = Vec::new()
+    loop {
+        let Some(w) = waits.pop() else { break }
+        last_first.push(take w)
     }
-    var left = 5
-    while left > 0 {
-        for i in 0..5 {
-            if answered[i].is_none() {
-                if let Some(polled) = waits[i].poll() {
-                    answered[i] = Some(run::read_ran(take polled))
-                    left -= 1
-                }
-            }
+    var i = 0
+    loop {
+        let Some(w) = last_first.pop() else { break }
+        match take w.wait() {
+            Ok(ran) => print(f"{i}: status {ran.status}"),
+            Err(e) => print(f"{i}: {e.message()}"),
         }
-        if left > 0 {
-            yield
-        }
-    }
-    for i in 0..5 {
-        if let Some(a) = replace(mut answered[i], None) {
-            match a {
-                Ok(ran) => print(f"{i}: status {ran.status}"),
-                Err(e) => print(f"{i}: {e.message()}"),
-            }
-        }
+        i += 1
     }
     0
 }
@@ -945,7 +662,7 @@ fn main() -> u32 {
 
 #[test]
 fn long_waits_hold_up_no_file_and_a_deadline_counts_from_the_request() {
-    let build = tool_build("starve", &format!("{STARVE}{ENTRIES}"));
+    let build = tool_build("starve", STARVE);
     let out = scratch("starve");
     let grants = Grants::default()
         .root("out", &out, true)
@@ -965,37 +682,18 @@ fn long_waits_hold_up_no_file_and_a_deadline_counts_from_the_request() {
 
 const FETCH_ONE: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::{RUNNING, args}
+use std::tool::args
 use std::tool::http
 
-@job
-fn main(given: take Vec<String>) -> u32 {
+pub fn tool() -> u32 {
+    let given = args()
     var request = http::get(given[0].as_str())
     request.timeout = if given.len() > 1 { 0.3 } else { 60.0 }
-    var f = http::fetch(request)
-    var got = f.poll()
-    while got.is_none() {
-        yield
-        got = f.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    match http::read_response(take polled) {
+    match http::fetch(request).wait() {
         Ok(r) => print(f"status {r.status}"),
         Err(e) => print(f"error: {e.message()}"),
     }
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start(args())
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -1073,20 +771,10 @@ fn build_of_fetch() -> ToolBuild {
 
 const FAKE_BIG: &str = r#"
 use std::io::print
-use std::job::{Job, Step}
-use std::tool::RUNNING
 use std::tool::http
 
-@job
-fn main() -> u32 {
-    var f = http::fetch(http::get("https://game.example/big.bin"))
-    var got = f.poll()
-    while got.is_none() {
-        yield
-        got = f.poll()
-    }
-    let Some(polled) = take got else { return 90 }
-    match http::read_response(take polled) {
+pub fn tool() -> u32 {
+    match http::fetch(http::get("https://game.example/big.bin")).wait() {
         Ok(r) => print(f"status {r.status}"),
         Err(e) => print(f"error: {e.message()}"),
     }
@@ -1096,7 +784,7 @@ fn main() -> u32 {
 
 #[test]
 fn a_fake_sites_body_has_a_real_ones_limit() {
-    let build = tool_build("fake-big", &format!("{FAKE_BIG}{ENTRIES}"));
+    let build = tool_build("fake-big", FAKE_BIG);
     let scratch_root = scratch("fake-big");
     let site = scratch_root.join("sites/game.example");
     std::fs::create_dir_all(&site).expect("the site");

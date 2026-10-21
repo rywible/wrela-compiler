@@ -11,9 +11,9 @@
 //! before; a word that names a tool is the tool, else a directory.
 //!
 //! `wrela tool --test <dir>` runs one tool test (§13.2), as `wrela test` asks: the test's
-//! build, entries and grants are in `<dir>/test.json` (`wrela_driver::tool_tests::Spec`), and
+//! build, entry and grants are in `<dir>/test.json` (`wrela_driver::tool_tests::Spec`), and
 //! how its run ended goes to the file the spec names. The process's exit status is the tool's: its own, or 70 if
-//! it trapped or waits on nothing, 71 if the host couldn't run it or end it cleanly (it can't
+//! it (or a helper) trapped or it waits on nothing, 71 if the host couldn't run it or end it cleanly (it can't
 //! take Ctrl-C, or a worker still runs after the grace), 124 past `--timeout`, 130 on Ctrl-C. A
 //! package that doesn't build exits 1 with its diagnostics, and a usage error (a timeout the
 //! clock can't reach among them) 2. The process ends with the tool, so no worker outlives it.
@@ -431,7 +431,7 @@ fn test(dir: &std::path::Path) -> ExitCode {
                     }
                 }
             }
-            options.entries = (spec.init.clone(), spec.resume.clone());
+            options.entry = spec.entry.clone();
             options.workers = spec.workers;
             options.fake_clock = Some((spec.utc, 0));
             // A live browser keeps the system's time: the clock doesn't jump past its page.

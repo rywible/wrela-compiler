@@ -1,10 +1,10 @@
-// The tool tests (language.md §13.2): each a job on the package's tool build, in a process of
-// its own, with a new `scratch` root and a fake clock. `wrela test` runs them;
+// The tool tests (language.md §13.2): each a function run on the package's tool build, in a
+// process of its own, with a new `scratch` root and a fake clock. `wrela test` runs them;
 // compiler/cli/tests/suite/tool_tests.rs checks they pass, and the ways a tool test fails.
 
 use std::hash::sha256::{Sha256, sha256}
-use std::io::{IoError, print}
-use std::tool::answer
+use std::io::print
+use std::tool::{Done, ToolError, all, any, spawn}
 use std::tool::blob
 use std::tool::blob::Data
 use std::tool::files
@@ -15,11 +15,6 @@ use std::tool::testing
 use std::tool::testing::Fake
 use std::tool::time
 
-/// Whether an answer says the request succeeded.
-fn succeeded(polled: take Result<Vec<u8>, IoError>) -> bool {
-    answer(take polled).is_ok()
-}
-
 /// The bytes of `text`.
 fn utf8(text: str) -> Vec<u8> {
     var out: Vec<u8> = Vec::new()
@@ -29,163 +24,91 @@ fn utf8(text: str) -> Vec<u8> {
     out
 }
 
+/// Panics with the host's reason if the call failed.
+fn done(result: take Result<Done, ToolError>, what: str) {
+    let Err(e) = take result else { return }
+    panic(f"{what}: {e.message()}")
+}
+
+/// The fake clock's seconds since 1970 now.
+fn fake_seconds() -> u64 {
+    let Ok(date) = time::utc_now().wait() else { panic("a date") }
+    date.seconds
+}
+
 @test(tool)
-@job
 fn a_tool_test_writes_and_reads_its_scratch() {
-    var w = files::write("scratch/notes/a.txt", utf8("kept"))
-    var wrote = w.poll()
-    while wrote.is_none() {
-        yield
-        wrote = w.poll()
-    }
-    let Some(done) = take wrote else { panic("no answer") }
-    assert(succeeded(take done), "scratch is a write root")
-    var r = files::read("scratch/notes/a.txt")
-    var got = r.poll()
-    while got.is_none() {
-        yield
-        got = r.poll()
-    }
-    let Some(read) = take got else { panic("no answer") }
-    let Ok(bytes) = answer(take read) else { panic("the file is there") }
+    done(files::write("scratch/notes/a.txt", utf8("kept")).wait(), "scratch is a write root")
+    let Ok(bytes) = files::read("scratch/notes/a.txt").wait() else { panic("the file is there") }
     assert(bytes.len() == 4 && bytes[0] == 107)
     print("scratch holds notes/a.txt")
 }
 
 @test(tool)
-@job
 fn each_tool_test_has_a_scratch_of_its_own() {
     // What another test wrote in its scratch isn't in this one's.
-    var s = files::stat("scratch/notes/a.txt")
-    var got = s.poll()
-    while got.is_none() {
-        yield
-        got = s.poll()
-    }
-    let Some(stated) = take got else { panic("no answer") }
-    assert(!succeeded(take stated), "a new scratch")
-    var l = files::list("scratch")
-    var listed = l.poll()
-    while listed.is_none() {
-        yield
-        listed = l.poll()
-    }
-    let Some(polled) = take listed else { panic("no answer") }
-    let Ok(entries) = files::read_list(take polled) else { panic("scratch lists") }
+    assert(files::stat("scratch/notes/a.txt").wait().is_err(), "a new scratch")
+    let Ok(entries) = files::list("scratch").wait() else { panic("scratch lists") }
     assert(entries.len() == 0, "scratch starts empty")
 }
 
 @test(tool, net: ["game.example"])
-@job
 fn the_fake_clock_fires_a_timer_while_a_fake_site_waits() {
     let started = std::time::now()
-    var set = testing::set_utc(time::Utc { seconds: 2000000000, nanos: 0 })
-    while set.poll().is_none() { yield }
-    var page = files::write("scratch/sites/game.example/slow.txt", utf8("late"))
-    while page.poll().is_none() { yield }
-    var slow = testing::fake("https://game.example/slow.txt", Fake::Delay(10.0))
-    while slow.poll().is_none() { yield }
+    done(testing::set_utc(time::Utc { seconds: 2000000000, nanos: 0 }).wait(), "set the date")
+    done(files::write("scratch/sites/game.example/slow.txt", utf8("late")).wait(), "the page")
+    done(testing::fake("https://game.example/slow.txt", Fake::Delay(10.0)).wait(), "the fake")
     // The site answers after 10 s of fake time; the timer fires after 1 s, first.
-    var f = http::fetch(http::get("https://game.example/slow.txt"))
-    var t = time::after(1.0)
-    var order: Vec<u32> = Vec::new()
-    var fetched: Option<http::Response> = None
-    var fired = false
-    while fetched.is_none() || !fired {
-        if !fired && t.poll().is_some() {
-            fired = true
-            order.push(1)
-        }
-        if fetched.is_none() {
-            if let Some(polled) = f.poll() {
-                let Ok(r) = http::read_response(take polled) else { panic("a response") }
-                fetched = Some(take r)
-                order.push(2)
-            }
-        }
-        if fetched.is_none() || !fired {
-            yield
-        }
-    }
-    assert(order.len() == 2 && order[0] == 1 && order[1] == 2, "the timer fired first")
-    let Some(response) = take fetched else { panic("a response") }
+    let f = http::fetch(http::get("https://game.example/slow.txt"))
+    let t = time::after(1.0)
+    let first = any([f.request(), t.request()])
+    assert(first == 1, "the timer fired first")
+    done(take t.wait(), "the timer")
+    let Ok(response) = take f.wait() else { panic("a response") }
     assert(response.status == 200)
     let Data::Bytes(body) = response.body else { panic("a small body") }
     assert(body.len() == 4 && body[0] == 108)
-    var u = time::utc_now()
-    var now = u.poll()
-    while now.is_none() {
-        yield
-        now = u.poll()
-    }
-    let Some(polled) = take now else { panic("no answer") }
-    let Ok(date) = time::read_utc(take polled) else { panic("a date") }
+    let Ok(date) = time::utc_now().wait() else { panic("a date") }
     assert(date.seconds == 2000000010 && date.nanos == 0, "10 s of fake time passed")
     assert(std::time::since(started) < 5.0, "and no real 10 s")
 }
 
 @test(tool, net: ["game.example"])
-@job
 fn a_fake_delay_past_the_deadline_fails_at_the_deadline() {
-    var page = files::write("scratch/sites/game.example/late.txt", utf8("late"))
-    while page.poll().is_none() { yield }
-    var slow = testing::fake("https://game.example/late.txt", Fake::Delay(20.0))
-    while slow.poll().is_none() { yield }
+    done(files::write("scratch/sites/game.example/late.txt", utf8("late")).wait(), "the page")
+    done(testing::fake("https://game.example/late.txt", Fake::Delay(20.0)).wait(), "the fake")
     var request = http::get("https://game.example/late.txt")
     request.timeout = 5.0
-    var f = http::fetch(request)
-    var got = f.poll()
-    while got.is_none() {
-        yield
-        got = f.poll()
-    }
-    let Some(polled) = take got else { panic("no answer") }
-    assert(http::read_response(take polled).is_err(), "a real site would have timed out")
-    var u = time::utc_now()
-    var now = u.poll()
-    while now.is_none() {
-        yield
-        now = u.poll()
-    }
-    let Some(p) = take now else { panic("no answer") }
-    let Ok(date) = time::read_utc(take p) else { panic("a date") }
-    assert(date.seconds == 1767225605, "it failed at 5 s of fake time, not 20")
+    assert(http::fetch(request).wait().is_err(), "a real site would have timed out")
+    assert(fake_seconds() == 1767225605, "it failed at 5 s of fake time, not 20")
 }
 
 @test(tool)
-@job
 fn fake_timers_fire_in_the_order_of_their_deadlines() {
     let seconds = [3.0, 1.0, 2.0, 1.0]
-    var timers: Vec<std::io::Pending<u8>> = Vec::new()
+    var timers: Vec<std::tool::Call<Done>> = Vec::new()
     for s in seconds {
         timers.push(time::after(s))
     }
+    // Each `any` is over the timers not fired yet, by their index here.
+    var waiting: Vec<u32> = Vec::from([u32(0), 1, 2, 3])
     var fired: Vec<u32> = Vec::new()
-    while fired.len() < 4 {
-        for i in 0..4 {
-            var seen = false
-            for f in fired {
-                if f == i {
-                    seen = true
-                }
-            }
-            if !seen && timers[i].poll().is_some() {
-                fired.push(i)
-            }
+    while waiting.len() > 0 {
+        var requests: Vec<std::tool::Request> = Vec::new()
+        for i in waiting {
+            requests.push(timers[i].request())
         }
-        if fired.len() < 4 {
-            yield
-        }
+        let k = any(requests)
+        fired.push(waiting[k])
+        let _ = waiting.remove(k)
     }
     // 1 s twice (in the order made), then 2 s, then 3 s.
     assert(fired[0] == 1 && fired[1] == 3 && fired[2] == 2 && fired[3] == 0)
 }
 
 @test(tool, net: ["game.example"])
-@job
 fn a_fake_site_serves_its_scratch_and_fakes_change_a_url() {
-    var page = files::write("scratch/sites/game.example/index.html", utf8("home"))
-    while page.poll().is_none() { yield }
+    done(files::write("scratch/sites/game.example/index.html", utf8("home")).wait(), "the page")
     // Each URL in turn: the file, a missing one, then each fake.
     let urls = [
         "https://game.example/",
@@ -198,28 +121,15 @@ fn a_fake_site_serves_its_scratch_and_fakes_change_a_url() {
     let statuses = [u16(200), 404, 503, 404, 200, 200]
     let lengths = [u32(4), 0, 4, 0, 5, 4]
     for i in 0..6 {
-        var faked = match i {
+        let faked = match i {
             2 => testing::fake(urls[i], Fake::Status(503)),
             3 => testing::fake(urls[i], Fake::Missing),
             4 => testing::fake(urls[i], Fake::Bytes(utf8("other"))),
             5 => testing::fake(urls[i], Fake::Clear),
             _ => testing::fake(urls[i], Fake::Delay(0.0)),
         }
-        var answered = faked.poll()
-        while answered.is_none() {
-            yield
-            answered = faked.poll()
-        }
-        let Some(a) = take answered else { panic("no answer") }
-        assert(succeeded(take a), "a fake is set")
-        var f = http::fetch(http::get(urls[i]))
-        var got = f.poll()
-        while got.is_none() {
-            yield
-            got = f.poll()
-        }
-        let Some(polled) = take got else { panic("no answer") }
-        let Ok(response) = http::read_response(take polled) else { panic("a response") }
+        done(take faked.wait(), "a fake is set")
+        let Ok(response) = http::fetch(http::get(urls[i])).wait() else { panic("a response") }
         let Data::Bytes(body) = response.body else { panic("a small body") }
         assert(response.status == statuses[i], f"{urls[i]}: status {response.status}")
         assert(body.len() == lengths[i], f"{urls[i]}: {body.len()} bytes")
@@ -227,19 +137,11 @@ fn a_fake_site_serves_its_scratch_and_fakes_change_a_url() {
 }
 
 @test(tool, net: ["game.example"])
-@job
 fn only_https_to_a_granted_host_is_fetched() {
     let urls = ["https://elsewhere.example/", "http://game.example/", "https://game.example:8443/"]
     let words = ["isn't granted", "isn't an `https://` URL", "isn't granted"]
     for i in 0..3 {
-        var f = http::fetch(http::get(urls[i]))
-        var got = f.poll()
-        while got.is_none() {
-            yield
-            got = f.poll()
-        }
-        let Some(polled) = take got else { panic("no answer") }
-        let Err(e) = http::read_response(take polled) else { panic(f"{urls[i]} was fetched") }
+        let Err(e) = http::fetch(http::get(urls[i])).wait() else { panic(f"{urls[i]} was fetched") }
         let message = e.message()
         var found = false
         let want = words[i]
@@ -253,47 +155,25 @@ fn only_https_to_a_granted_host_is_fetched() {
 }
 
 @test(tool, net: ["game.example"], budget: 30)
-@job
 fn a_body_over_512_kib_comes_as_a_blob() {
     // 600 KiB, two chunks into a blob, then a file of the fake site.
-    var nb = blob::new()
-    var made = nb.poll()
-    while made.is_none() {
-        yield
-        made = nb.poll()
-    }
-    let Some(m) = take made else { panic("no answer") }
-    let Ok(b) = blob::read_handle(take m) else { panic("a blob") }
+    let Ok(b) = blob::new().wait() else { panic("a blob") }
     var whole = Sha256::new()
     for k in 0..2 {
         let chunk = Vec::filled(307200, u8(k + 1))
         whole.update(chunk)
-        var ap = blob::append(b, chunk)
-        while ap.poll().is_none() { yield }
+        done(blob::append(b, chunk).wait(), "an append")
     }
-    var wb = files::write_blob("scratch/sites/game.example/big.bin", b)
-    while wb.poll().is_none() { yield }
-    var f = http::fetch(http::get("https://game.example/big.bin"))
-    var got = f.poll()
-    while got.is_none() {
-        yield
-        got = f.poll()
+    done(files::write_blob("scratch/sites/game.example/big.bin", b).wait(), "the file")
+    let Ok(response) = http::fetch(http::get("https://game.example/big.bin")).wait() else {
+        panic("a response")
     }
-    let Some(polled) = take got else { panic("no answer") }
-    let Ok(response) = http::read_response(take polled) else { panic("a response") }
     let Data::Blob(body) = response.body else { panic("a body over 512 KiB is a blob") }
     // Its digest, a chunk at a time, is the digest of what was written.
     var digest = Sha256::new()
     var at: u64 = 0
     loop {
-        var r = blob::read(body, at, 131072)
-        var piece = r.poll()
-        while piece.is_none() {
-            yield
-            piece = r.poll()
-        }
-        let Some(p) = take piece else { panic("no answer") }
-        let Ok(bytes) = answer(take p) else { panic("a chunk") }
+        let Ok(bytes) = blob::read(body, at, 131072).wait() else { panic("a chunk") }
         if bytes.len() == 0 {
             break
         }
@@ -306,70 +186,43 @@ fn a_body_over_512_kib_comes_as_a_blob() {
 }
 
 @test(tool, net: ["game.example"], run: [("wrangler", "fakes/wrangler")], budget: 60)
-@job
 fn a_fake_program_is_a_tool_package() {
-    var page = files::write("scratch/release/index.html", utf8("v2"))
-    while page.poll().is_none() { yield }
+    done(files::write("scratch/release/index.html", utf8("v2")).wait(), "the page")
     // A timer of fake time doesn't fire while a real program runs: the clock moves only when
     // the test waits on nothing else.
-    var tick = time::after(0.001)
+    let tick = time::after(0.001)
     var deploy = run::command("wrangler", "scratch")
     deploy.args.push(String::from("deploy"))
     deploy.args.push(String::from("release"))
     deploy.args.push(String::from("game.example"))
-    var r = run::run(deploy)
-    var got = r.poll()
-    while got.is_none() {
-        yield
-        got = r.poll()
-    }
-    assert(!tick.is_done(), "the clock waited for the program")
-    while tick.poll().is_none() { yield }
-    let Some(polled) = take got else { panic("no answer") }
-    let Ok(ran) = run::read_ran(take polled) else { panic("it ran") }
+    let r = run::run(deploy)
+    let first = any([r.request(), tick.request()])
+    assert(first == 0, "the clock waited for the program")
+    done(take tick.wait(), "the timer")
+    let Ok(ran) = take r.wait() else { panic("it ran") }
     let Data::Bytes(out) = ran.stdout else { panic("a short output") }
     let Some(said) = String::from_utf8(out.clone()) else { panic("UTF-8") }
     assert(ran.status == 0, f"wrangler exited {ran.status}: {said.as_str()}")
     let expected = "deployed game.example\n"
     assert(said.as_str() == expected, said.as_str())
-    var f = http::fetch(http::get("https://game.example/"))
-    var fetched = f.poll()
-    while fetched.is_none() {
-        yield
-        fetched = f.poll()
+    let Ok(response) = http::fetch(http::get("https://game.example/")).wait() else {
+        panic("a response")
     }
-    let Some(p) = take fetched else { panic("no answer") }
-    let Ok(response) = http::read_response(take p) else { panic("a response") }
     let Data::Bytes(body) = response.body else { panic("a small body") }
     assert(response.status == 200 && body.len() == 2 && body[1] == 50, "the deployed page")
     // A program the test doesn't name isn't granted.
-    var other = run::run(run::command("npx", "scratch"))
-    var refused = other.poll()
-    while refused.is_none() {
-        yield
-        refused = other.poll()
-    }
-    let Some(o) = take refused else { panic("no answer") }
-    assert(run::read_ran(take o).is_err(), "npx isn't granted")
+    assert(run::run(run::command("npx", "scratch")).wait().is_err(), "npx isn't granted")
 }
 
 @test(tool)
-@job
 fn a_served_post_waits_while_the_fake_clock_moves() {
-    var s = serve::start("scratch")
-    var sg = s.poll()
-    while sg.is_none() {
-        yield
-        sg = s.poll()
-    }
-    let Some(sp) = take sg else { panic("no answer") }
-    let Ok(started) = serve::read_started(take sp) else { panic("it serves its scratch") }
+    let Ok(started) = serve::start("scratch").wait() else { panic("it serves its scratch") }
     // Nothing in a tool test posts to its server: the fake clock moves while a post is waited
-    // for, so an hour's timer fires at once.
+    // for, so an hour's timer fires at once, and first.
     let post = serve::next_post(started.server, 600.0)
-    var t = time::after(3600.0)
-    while t.poll().is_none() { yield }
-    assert(!post.is_done(), "no post came")
+    let t = time::after(3600.0)
+    assert(any([post.request(), t.request()]) == 1, "no post came")
+    done(take t.wait(), "the timer")
 }
 
 /// `i` stepped a few times: a value that a fold's order shows in.
@@ -382,7 +235,6 @@ fn stepped(i: u32) -> u32 {
 }
 
 @test(tool, workers: 7)
-@job
 fn a_parallel_job_on_seven_helpers_folds_as_one_thread_does() {
     var xs: Vec<u32> = Vec::new()
     for i in 0..10000 {
@@ -405,4 +257,153 @@ fn a_parallel_job_on_seven_helpers_folds_as_one_thread_does() {
         chunk += 1
     }
     assert(folded == alone, f"{folded} is {alone}")
+}
+
+// The fake clock with tasks (§13.2): each scenario runs with 0, 1 and 8 helpers, and none may
+// hang: the clock moves only when every thread waits, and then it moves. With no helpers, each
+// task runs inside its join; with a helper idle, the clock waits for it to take a queued task.
+
+/// Sleeps `s` seconds of fake time: the seconds of the fake date when it woke.
+fn sleeper(s: take f64) -> u64 {
+    done(time::after(s).wait(), "a task's timer")
+    fake_seconds()
+}
+
+/// A task already running (on a helper) when it's joined; with no helper, the join runs it.
+fn a_timer_task_joined_after_it_started(helpers: u32) {
+    let t0 = fake_seconds()
+    let t = spawn(10.0, sleeper)
+    done(time::after(1.0).wait(), "the tool's own timer")
+    let woke = take t.join() - t0
+    let want: u64 = if helpers == 0 { 11 } else { 10 }
+    assert(woke == want, f"the task woke after {woke} s")
+    assert(fake_seconds() - t0 == want)
+}
+
+/// `n` stepped many times: a few milliseconds of work.
+fn busy(n: u32) -> u32 {
+    var x = n
+    for _ in 0..2000000 {
+        x = x.wrapping_mul(1664525).wrapping_add(1013904223)
+    }
+    x
+}
+
+/// Computes, then sleeps `s` seconds of fake time.
+fn computes_then_sleeps(s: take f64) -> u64 {
+    let _ = busy(u32(s))
+    sleeper(s)
+}
+
+/// A task that computes on a helper while the tool's thread waits on a timer: the clock waits
+/// for it, as it would for a request in progress.
+fn a_task_that_computes_holds_the_clock(helpers: u32) {
+    let t0 = fake_seconds()
+    let t = spawn(1.0, computes_then_sleeps)
+    done(time::after(1.0).wait(), "the tool's own timer")
+    let woke = take t.join() - t0
+    let want: u64 = if helpers == 0 { 2 } else { 1 }
+    assert(woke == want, f"the task woke after {woke} s with {helpers} helpers")
+}
+
+/// A task joined at once: no helper may have started it yet.
+fn a_join_of_an_unstarted_task() {
+    let t0 = fake_seconds()
+    let woke = spawn(5.0, sleeper).join() - t0
+    assert(woke == 5, f"the task woke after {woke} s")
+}
+
+/// A task that joins a task of its own, after waiting half its time.
+fn nested(s: take f64) -> u64 {
+    let inner = spawn(s, sleeper)
+    done(time::after(s / 2.0).wait(), "the outer task's timer")
+    take inner.join()
+}
+
+fn nested_joins(helpers: u32) {
+    let t0 = fake_seconds()
+    let woke = spawn(4.0, nested).join() - t0
+    // With no helper free for the inner task, the outer one's join runs it after its wait.
+    let ok = if helpers == 0 { woke == 6 } else if helpers == 1 { woke == 4 || woke == 6 } else {
+        woke == 4
+    }
+    assert(ok, f"the inner task woke after {woke} s with {helpers} helpers")
+}
+
+/// A task dropped without its join: the drop waits for it.
+fn an_implicit_drop() {
+    let t0 = fake_seconds()
+    {
+        let _ = spawn(3.0, sleeper)
+    }
+    assert(fake_seconds() - t0 == 3, "the drop waited for the task")
+}
+
+/// Tasks of `all`, each woken no sooner than its time, in the inputs' order; then simultaneous
+/// timers, which fire in the order made.
+fn all_and_simultaneous_timers(helpers: u32) {
+    let times = [u64(2), 1, 2, 1, 3]
+    let t0 = fake_seconds()
+    let woke = all(Vec::from([2.0, 1.0, 2.0, 1.0, 3.0]), sleeper)
+    assert(woke.len() == 5)
+    var sum: u64 = 0
+    for i in 0..5 {
+        sum += times[i]
+        let after = woke[i] - t0
+        assert(after >= times[i], f"task {i} woke after {after} s")
+        if helpers == 0 {
+            assert(after == sum, f"task {i} woke after {after} s, one after another")
+        }
+        if helpers == 8 {
+            assert(after == times[i], f"task {i} woke after {after} s, all at once")
+        }
+    }
+    let t1 = fake_seconds()
+    let a = time::after(1.0)
+    let b = time::after(1.0)
+    assert(any([b.request(), a.request()]) == 1, "the one made first fires first")
+    done(take a.wait(), "a")
+    done(take b.wait(), "b")
+    assert(fake_seconds() - t1 == 1)
+}
+
+/// An event loop: a timer and a post that never comes, each turn.
+fn an_event_loop() {
+    let t0 = fake_seconds()
+    let Ok(started) = serve::start("scratch").wait() else { panic("a server") }
+    let post = serve::next_post(started.server, 600.0)
+    var ticks = 0
+    while ticks < 3 {
+        let t = time::after(10.0)
+        let k = any([post.request(), t.request()])
+        assert(k == 1, "only the timer answers")
+        done(take t.wait(), "the tick")
+        ticks += 1
+    }
+    assert(fake_seconds() - t0 == 30, "three ticks of 10 s")
+}
+
+fn each_scenario(helpers: u32) {
+    a_timer_task_joined_after_it_started(helpers)
+    a_task_that_computes_holds_the_clock(helpers)
+    a_join_of_an_unstarted_task()
+    nested_joins(helpers)
+    an_implicit_drop()
+    all_and_simultaneous_timers(helpers)
+    an_event_loop()
+}
+
+@test(tool, workers: 0)
+fn the_fake_clock_moves_with_tasks_and_no_helpers() {
+    each_scenario(0)
+}
+
+@test(tool, workers: 1)
+fn the_fake_clock_moves_with_tasks_and_one_helper() {
+    each_scenario(1)
+}
+
+@test(tool, workers: 8)
+fn the_fake_clock_moves_with_tasks_and_eight_helpers() {
+    each_scenario(8)
 }

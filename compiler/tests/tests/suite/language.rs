@@ -73,7 +73,7 @@ const CONTEXTS: &[Context] = &[
     },
     Context { first: "pub struct Look {", ..NONE },
     Context {
-        first: "// A tool that waits a moment, reads a file, and exits with its size.",
+        first: "// A tool that reads two files at once, waits a moment, and exits with their sizes.",
         ..NONE
     },
     Context { first: "use std::derive::Box3", ..NONE },

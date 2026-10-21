@@ -103,6 +103,15 @@ pub(package) const SLOT_THREAD: u32 = 12
 /// A slot's state when it holds no job.
 pub(package) const SLOT_FREE: u32 = 0
 
+/// A slot's state while its job waits for a thread to start it.
+pub(package) const SLOT_QUEUED: u32 = 2
+
+/// A slot's state while a thread runs its job.
+pub(package) const SLOT_STARTED: u32 = 3
+
+/// A slot's state once its job has finished.
+pub(package) const SLOT_FINISHED: u32 = 4
+
 /// A slot's state when its job trapped: the host writes it.
 pub(package) const SLOT_FAILED: u32 = 5
 
@@ -126,9 +135,6 @@ pub(package) const AUDIO_QUANTUM: u32 = 128
 
 /// The voice's channels: left, then right.
 pub(package) const AUDIO_CHANNELS: u32 = 2
-
-/// What a tool's `tool` returns to be called again, rather than an exit status.
-pub(package) const TOOL_RUNNING: u32 = 4294967295
 
 /// The widest, tallest and deepest 3D texture.
 pub(package) const MAX_TEXTURE_3D: u32 = 2048

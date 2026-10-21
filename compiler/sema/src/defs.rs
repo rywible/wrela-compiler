@@ -218,6 +218,7 @@ macro_rules! lang_items {
                         | Lang::HandOverCommand
                         | Lang::Keep
                         | Lang::Kept
+                        | Lang::ToolRequest
                 )
             }
 
@@ -240,6 +241,10 @@ macro_rules! lang_items {
                         | Lang::PayloadTake
                         | Lang::Kept
                         | Lang::ReadClock
+                        | Lang::ToolWait
+                        | Lang::ToolAny
+                        | Lang::ToolTake
+                        | Lang::ToolJoin
                 )
             }
 
@@ -484,6 +489,14 @@ lang_items! {
     MemWait = "std::mem::wait",
     MemNotify = "std::mem::notify",
     MemRunTask = "std::mem::run_task",
+    ToolRequest = "std::mem::tool_request",
+    ToolWait = "std::mem::tool_wait",
+    ToolAny = "std::mem::tool_any",
+    ToolTake = "std::mem::tool_take",
+    ToolIdle = "std::mem::tool_idle",
+    ToolActive = "std::mem::tool_active",
+    ToolJoin = "std::mem::tool_join",
+    ToolDone = "std::mem::tool_done",
     MemTask = "std::mem::task",
     MemThreadBlock = "std::mem::thread_block",
     MemWaitFor = "std::mem::wait_for",
@@ -710,7 +723,7 @@ pub const MAX_TOOL_TEST_BUDGET: f64 = 600.0;
 /// alike everywhere.
 pub const TOOL_TEST_WORKERS: u32 = 2;
 
-/// `@test(tool, ...)` (§13.2): a `@job fn` run on the package's tool build, in a process of its
+/// `@test(tool, ...)` (§13.2): a function run on the package's tool build, in a process of its
 /// own, with a new write root `scratch`, a budget, and fakes for what it reaches.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolTest {
@@ -774,7 +787,7 @@ pub struct FnAttrs {
     /// `@test(frames: n, gpu: true)`: the frames run on the native host's GPU, which answers
     /// their readbacks (§13).
     pub test_gpu: bool,
-    /// `@test(tool, ...)`: a tool test, a job run on the tool host (§13.2).
+    /// `@test(tool, ...)`: a tool test, run on the tool host (§13.2).
     pub test_tool: Option<ToolTest>,
     /// `@fuel(n)` on a `@test` of code: the work it may do, in place of a test's limit, and
     /// where it's written (§13).
@@ -861,7 +874,7 @@ pub enum TestInput {
 /// std's unsafe core (language.md §20, §6.12): the only modules that use `unsafe`, and the
 /// only ones whose functions may state `@effects` or be a `@thread_entry`.
 pub const UNSAFE_CORE: &[&str] =
-    &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff", "time"];
+    &["mem", "alloc", "collections", "string", "par", "audio", "tick", "handoff", "time", "tool"];
 
 #[derive(Clone, Debug)]
 pub struct FnDef {

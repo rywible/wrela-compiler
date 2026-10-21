@@ -1193,7 +1193,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             self.diags.push(
                 Diagnostic::new(codes::E0222, span, format!("`@test(tool, ...)`: {why}"))
                     .with_secondary(a.span, "in this tool test")
-                    .with_note("`@test(tool, budget: 5, net: [\"game.example\"], run: [(\"wrangler\", \"fakes/wrangler\")])` runs a `@job fn` on the package's tool build, with fake sites and programs (§13.2)"),
+                    .with_note("`@test(tool, budget: 5, net: [\"game.example\"], run: [(\"wrangler\", \"fakes/wrangler\")])` runs a function on the package's tool build, with fake sites and programs (§13.2)"),
             );
             return None;
         }
@@ -2127,7 +2127,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         }
     }
 
-    /// E0222: a tool test is a free `@job fn` of no parameters and no result, of a package with
+    /// E0222: a tool test is a free function of no parameters and no result, of a package with
     /// a tool build (main.wrela exports `tool`, §15.5).
     fn tool_test_signature(&mut self, id: FnId, at: Span) {
         let def = self.p.func(id);
@@ -2136,9 +2136,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 f.module == main && f.public && f.owner == FnOwner::Free && f.name == "tool"
             })
         });
-        let why = if def.attrs.job.is_none() {
-            Some("a tool test is a `@job fn`, which the tool host resumes as its answers come")
-        } else if def.owner != FnOwner::Free {
+        let why = if def.owner != FnOwner::Free {
             Some("it's a method, and a test is a function of its own")
         } else if !def.params.is_empty() {
             Some("it takes parameters, and nothing passes them")
@@ -2159,7 +2157,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     format!("`{}` can't be a tool test: {why}", def.name),
                 )
                 .with_secondary(at, "declared a tool test here")
-                .with_note("a tool test is `@test(tool) @job fn name() { ... }`, run on the package's tool build: it passes if the job ends, and fails on a panic, a trap or its budget (§13.2)"),
+                .with_note("a tool test is `@test(tool) fn name() { ... }`, run on the package's tool build: it passes if it returns, and fails on a panic, a trap or its budget (§13.2)"),
             );
         }
     }

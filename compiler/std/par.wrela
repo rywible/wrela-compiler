@@ -505,3 +505,63 @@ fn dropping_a_task_drops_its_owned_result() {
         free(reused, 16)
     }
 }
+
+// A tool build's helpers and tasks (`std::tool`, language.md §16.2): these come after the rest, so
+// a client's and a server's builds, which reach none of them, keep their source places.
+
+/// A tool's helper's life (wrela_abi's `__tool_worker`, in place of `__worker` in a tool build):
+/// `worker`'s, telling the tool host when it is about to wait for work, holding none, and when
+/// it wakes, and that it has finished work, so a join that waits in the host goes on and a tool
+/// test's fake clock knows when every thread waits (language.md §13.2).
+@tool
+@thread_entry
+pub(package) fn tool_worker(thread: u32) {
+    unsafe {
+        loop {
+            if atomic_load(PAR_SHUTDOWN) != 0 {
+                return
+            }
+            let seen = atomic_load(PAR_WAKE)
+            if find_work() {
+                std::mem::tool_done()
+            } else {
+                if atomic_load(PAR_SHUTDOWN) != 0 {
+                    return
+                }
+                std::mem::tool_idle()
+                let _ = wait(PAR_WAKE, seen)
+                std::mem::tool_active()
+            }
+        }
+    }
+}
+
+/// Puts task `t`, with its context at `context`, in a free slot and wakes the helpers: the
+/// slot's address, or 0 if every slot is taken, and then it has run here, now.
+pub(package) fn queue_task(t: u32, context: u32) -> u32 {
+    unsafe {
+        for s in 0..TASK_SLOT_COUNT {
+            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
+            if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
+                atomic_store(slot + SLOT_TASK, t)
+                atomic_store(slot + SLOT_CONTEXT, context)
+                atomic_store(slot, QUEUED)
+                wake()
+                return slot
+            }
+        }
+        run_task(t, context, 0)
+        0
+    }
+}
+
+/// Runs the queued task in `slot`, which this thread has started (`run_spawned`).
+pub(package) fn run_started(slot: u32) {
+    run_spawned(slot)
+}
+
+@test
+fn the_slots_states_are_the_hosts() {
+    assert(QUEUED == std::abi::SLOT_QUEUED && STARTED == std::abi::SLOT_STARTED)
+    assert(FINISHED == std::abi::SLOT_FINISHED)
+}

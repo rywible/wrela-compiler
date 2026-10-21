@@ -937,6 +937,10 @@ fn node(
                         if heap {
                             n.direct.push((Effect::Alloc, s.span, "drop frees heap memory".into()));
                         }
+                        for (e, ty) in declared_drop_effects(p, t) {
+                            let why = format!("drop of a `{ty}` is declared `{}`", e.name());
+                            n.direct.push((e, s.span, why));
+                        }
                     }
                     continue;
                 }
@@ -1083,6 +1087,50 @@ fn drop_effects(p: &Program, t: TyId) -> (bool, bool) {
         }
     }
     let mut out = (false, false);
+    walk(p, t, &mut Vec::new(), &mut out);
+    out
+}
+
+/// The effects that the destructors dropping a value of type `t` runs declare (`@effects` on
+/// std's `drop`: a tool task's waits in the host), each with the type whose destructor it is.
+fn declared_drop_effects(p: &Program, t: TyId) -> Vec<(Effect, String)> {
+    fn walk(p: &Program, t: TyId, seen: &mut Vec<TyId>, out: &mut Vec<(Effect, String)>) {
+        if seen.contains(&t) || !traits::may_need_drop(p, t) {
+            return;
+        }
+        seen.push(t);
+        match p.types.kind(t) {
+            TyKind::Tuple(ts) => ts.iter().for_each(|&e| walk(p, e, seen, out)),
+            TyKind::Array(e, _) | TyKind::ArrayN(e, _) => walk(p, *e, seen, out),
+            TyKind::Adt(a, args) => {
+                let destructor = traits::explicit_drop(p, *a);
+                if let Some(i) = destructor {
+                    for &m in &p.impl_(i).methods {
+                        for &e in &p.func(m).attrs.effects {
+                            out.push((e, p.adt(*a).name.clone()));
+                        }
+                    }
+                }
+                // What its fields hold, as the drop glue drops them.
+                for v in p.field_lists(*a) {
+                    for f in p.fields_of(*a, args, v) {
+                        walk(p, f, seen, out);
+                    }
+                }
+                // A type with a destructor of its own (std's containers: `Vec`, `Box`, a task)
+                // holds its type arguments' values in storage that no field names, and drops
+                // them there. Another type's arguments are only what its fields hold (a
+                // `Handle<T>` holds no `T`).
+                if destructor.is_some() {
+                    for &arg in args.iter() {
+                        walk(p, arg, seen, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
     walk(p, t, &mut Vec::new(), &mut out);
     out
 }

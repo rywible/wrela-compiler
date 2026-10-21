@@ -28,7 +28,7 @@ fn ran(dir: &std::path::Path) -> Vec<(String, bool, String)> {
 fn the_tool_tests_fixture_passes() {
     let dir = wrela_root().join("compiler/tests/tool_tests");
     let tests = ran(&dir);
-    assert_eq!(tests.len(), 11, "{tests:?}");
+    assert_eq!(tests.len(), 14, "{tests:?}");
     for (name, passed, message) in &tests {
         assert!(passed, "{name}: {message}");
     }
@@ -46,64 +46,38 @@ use std::tool::files
 use std::tool::time
 
 @test(tool)
-@job
 fn waits_an_hour_of_fake_time() {
-    var t = time::after(3600.0)
-    while t.poll().is_none() { yield }
+    let _ = time::after(3600.0).wait()
 }
 
 @test(tool)
-@job
 fn panics() {
-    var t = time::after(1.0)
-    while t.poll().is_none() { yield }
+    let _ = time::after(1.0).wait()
     assert(1 + 1 == 3, "on purpose")
 }
 
 @test(tool)
-@job
 fn traps() {
-    var l = files::list("scratch")
-    var got = l.poll()
-    while got.is_none() {
-        yield
-        got = l.poll()
-    }
+    let listed = files::list("scratch").wait()
     // An overflow, with a count the build can't know.
     var n: u32 = 4294967295
-    if got.is_some() {
+    if listed.is_ok() {
         n += 1
     }
 }
 
 @test(tool, blobs: "1K")
-@job
 fn holds_its_blob_budget() {
     // 2 KiB in a blob, past a budget of 1 KiB: the append fails, as a request past it does.
-    var n = std::tool::blob::new()
-    var made = n.poll()
-    while made.is_none() {
-        yield
-        made = n.poll()
-    }
-    let Some(mp) = take made else { panic("no answer") }
-    let Ok(b) = std::tool::blob::read_handle(take mp) else { panic("a blob") }
+    let Ok(b) = std::tool::blob::new().wait() else { panic("a blob") }
     var bytes: Vec<u8> = Vec::new()
     for _ in 0..2048 {
         bytes.push(0)
     }
-    var a = std::tool::blob::append(b, bytes)
-    var got = a.poll()
-    while got.is_none() {
-        yield
-        got = a.poll()
-    }
-    let Some(ap) = take got else { panic("no answer") }
-    assert(std::tool::answer(take ap).is_ok(), "past the test's blob budget")
+    assert(std::tool::blob::append(b, bytes).wait().is_ok(), "past the test's blob budget")
 }
 
 @test(tool, budget: 1)
-@job
 fn spins_past_its_budget() {
     var n: u32 = 0
     loop {
@@ -129,7 +103,7 @@ fn spins_past_its_budget() {
 }
 
 #[test]
-fn a_tool_test_is_a_job_of_no_parameters_in_a_package_with_a_tool_build() {
+fn a_tool_test_is_a_function_of_no_parameters_in_a_package_with_a_tool_build() {
     let check = |name: &str, main: &str| -> Vec<(String, String)> {
         let dir = package(
             name,
@@ -151,16 +125,18 @@ fn a_tool_test_is_a_job_of_no_parameters_in_a_package_with_a_tool_build() {
     };
     let tool = "pub fn tool() -> u32 {\n    0\n}\n";
     let cases = [
-        ("@test(tool)\nfn not_a_job() {}\n", "E0222", "is a `@job fn`"),
-        ("@test(tool)\n@job\nfn takes(n: take u32) {}\n", "E0222", "takes parameters"),
-        ("@test(tool, budget: 0)\n@job\nfn none() {}\n", "E0222", "`budget` is seconds"),
-        ("@test(tool, net: [\"Game.Example\"])\n@job\nfn upper() {}\n", "E0222", "`net`"),
-        ("@test(tool, run: [(\"x\", \"../out\")])\n@job\nfn out() {}\n", "E0222", "`run`"),
-        ("@test(tool, frames: 3)\n@job\nfn frames() {}\n", "E0222", "takes `budget`"),
-        ("@test(tool, blobs: \"8X\")\n@job\nfn blobs() {}\n", "E0222", "`blobs` is a blob budget"),
-        ("@test(tool, workers: 9)\n@job\nfn many() {}\n", "E0222", "`workers` is how many"),
-        ("@test(tool)\n@fuel(100)\n@job\nfn fuel() {}\n", "E0108", "`@fuel`"),
-        // A test of code is no job, and keeps a constant's effects.
+        ("@test(tool)\nfn takes(n: take u32) {}\n", "E0222", "takes parameters"),
+        ("@test(tool)\nfn gives() -> u32 {\n    0\n}\n", "E0222", "returns a value"),
+        ("@test(tool, budget: 0)\nfn none() {}\n", "E0222", "`budget` is seconds"),
+        ("@test(tool, net: [\"Game.Example\"])\nfn upper() {}\n", "E0222", "`net`"),
+        ("@test(tool, run: [(\"x\", \"../out\")])\nfn out() {}\n", "E0222", "`run`"),
+        ("@test(tool, frames: 3)\nfn frames() {}\n", "E0222", "takes `budget`"),
+        ("@test(tool, blobs: \"8X\")\nfn blobs() {}\n", "E0222", "`blobs` is a blob budget"),
+        ("@test(tool, workers: 9)\nfn many() {}\n", "E0222", "`workers` is how many"),
+        ("@test(tool)\n@fuel(100)\nfn fuel() {}\n", "E0108", "`@fuel`"),
+        // No test is a job: a tool test waits on its calls, and a test of code keeps a
+        // constant's effects.
+        ("@test(tool)\n@job\nfn a_job() {}\n", "E0336", "can't be a job"),
         ("@test\n@job\nfn plain() {}\n", "E0336", "can't be a job"),
         (
             "@test\nfn reads() {\n    let p = std::tool::time::utc_now()\n}\n",
@@ -175,39 +151,24 @@ fn a_tool_test_is_a_job_of_no_parameters_in_a_package_with_a_tool_build() {
     // Without a tool build, there's nothing to run it on.
     let errors = check(
         "tool-tests-rules-no-tool",
-        "pub fn frame(time: f32, width: u32, height: u32) {}\n@test(tool)\n@job\nfn t() {}\n",
+        "pub fn frame(time: f32, width: u32, height: u32) {}\n@test(tool)\nfn t() {}\n",
     );
     assert!(errors.iter().any(|(c, m)| c == "E0222" && m.contains("no tool build")), "{errors:?}");
     // A good one checks clean.
     let errors = check(
         "tool-tests-rules-ok",
-        &format!("{tool}@test(tool, budget: 2.5, net: [\"a.example\"])\n@job\nfn t() {{}}\n"),
+        &format!("{tool}@test(tool, budget: 2.5, net: [\"a.example\"])\nfn t() {{}}\n"),
     );
     assert!(errors.is_empty(), "{errors:?}");
 }
 
 /// A fake program that waits a minute on the system's clock, then exits.
 const SLEEPER: &str = r#"
-use std::job::{Job, Step}
-use std::tool::RUNNING
 use std::tool::time::after
 
-@job
-fn main() -> u32 {
-    var t = after(60.0)
-    while t.poll().is_none() { yield }
+pub fn tool() -> u32 {
+    let _ = after(60.0).wait()
     0
-}
-
-pub fn tool_init() -> Job<main> {
-    main.start()
-}
-
-pub fn tool(job: mut Job<main>) -> u32 {
-    match job.resume() {
-        Step::Yielded => RUNNING,
-        Step::Done(status) => status,
-    }
 }
 "#;
 
@@ -220,10 +181,8 @@ fn sleeper_package(name: &str, budget: u32) -> (std::path::PathBuf, String) {
 }}
 
 @test(tool, run: [("sleeper", "fakes/sleeper")], budget: {budget})
-@job
 fn waits_for_its_program() {{
-    var r = std::tool::run::run(std::tool::run::command("sleeper", "scratch"))
-    while r.poll().is_none() {{ yield }}
+    let _ = std::tool::run::run(std::tool::run::command("sleeper", "scratch")).wait()
 }}
 "#
     );
@@ -361,31 +320,12 @@ fn a_program_started_but_not_yet_recorded_ends_with_its_tests_host() {
 fn a_tool_test_with_a_browser_passes_and_one_that_fails_leaves_nothing() {
     // Each test serves a page of its scratch and opens it: `opened` is what `open` gave.
     let open = r#"
-    var w = files::write("scratch/page.html", utf8("<!doctype html><title>Guide</title>"))
-    var wg = w.poll()
-    while wg.is_none() {
-        yield
-        wg = w.poll()
-    }
-    var s = serve::start("scratch")
-    var sg = s.poll()
-    while sg.is_none() {
-        yield
-        sg = s.poll()
-    }
-    let Some(sp) = take sg else { panic("no answer") }
-    let Ok(started) = serve::read_started(take sp) else { panic("no server") }
-    var o = browser::open(f"{started.origin.as_str()}/page.html".as_str())
-    var og = o.poll()
-    while og.is_none() {
-        yield
-        og = o.poll()
-    }
-    let Some(op) = take og else { panic("no answer") }
-    let opened = browser::read_opened(take op)
+    let wrote = files::write("scratch/page.html", utf8("<!doctype html><title>Guide</title>")).wait()
+    assert(wrote.is_ok(), "the page")
+    let Ok(started) = serve::start("scratch").wait() else { panic("no server") }
+    let opened = browser::open(f"{started.origin.as_str()}/page.html".as_str()).wait()
 "#;
     let tests = r#"
-use std::tool::answer
 use std::tool::browser
 use std::tool::files
 use std::tool::serve
@@ -400,40 +340,22 @@ fn utf8(text: str) -> Vec<u8> {
 }
 
 @test(tool, browser: true, budget: 60)
-@job
 fn serves_opens_observes_and_closes() {
 OPEN
     let Ok(b) = opened else { panic("no browser") }
-    var t = browser::title(b)
-    var tg = t.poll()
-    while tg.is_none() {
-        yield
-        tg = t.poll()
-    }
-    let Some(tp) = take tg else { panic("no answer") }
-    let Ok(title) = browser::read_text(take tp) else { panic("no title") }
+    let Ok(title) = browser::title(b).wait() else { panic("no title") }
     assert(title.as_str() == "Guide", title.as_str())
-    var c = browser::close(b)
-    var cg = c.poll()
-    while cg.is_none() {
-        yield
-        cg = c.poll()
-    }
-    let Some(cp) = take cg else { panic("no answer") }
-    assert(answer(take cp).is_ok(), "closed")
+    assert(browser::close(b).wait().is_ok(), "closed")
 }
 
 @test(tool, browser: true, budget: 3)
-@job
 fn runs_past_its_budget_with_a_browser_open() {
 OPEN
     assert(opened.is_ok(), "a browser")
-    var t = time::after(600.0)
-    while t.poll().is_none() { yield }
+    let _ = time::after(600.0).wait()
 }
 
 @test(tool, browser: true, budget: 60)
-@job
 fn traps_with_a_browser_open() {
 OPEN
     assert(opened.is_ok(), "a browser")
@@ -441,7 +363,6 @@ OPEN
 }
 
 @test(tool)
-@job
 fn has_no_browser_without_the_grant() {
 OPEN
     let Err(why) = opened else { panic("a browser without the grant") }

@@ -94,7 +94,10 @@ fn only_the_core_states_effects_and_thread_entries() {
         }
         entries += text.lines().filter(|l| l.trim_start().starts_with("@thread_entry")).count();
     }
-    assert_eq!(entries, 3, "std's thread entries: the helpers', the voice's and the ticker's");
+    assert_eq!(
+        entries, 4,
+        "std's thread entries: the helpers', a tool's helpers', the voice's and the ticker's"
+    );
     let dir = crate::package(
         "closed_list_attrs",
         "@effects(nondet)\nfn now() -> u32 {\n    0\n}\n\n@thread_entry\nfn run(thread: u32) {}\n\npub fn frame(time: f32, width: u32, height: u32) {\n    let _ = now()\n}\n",
