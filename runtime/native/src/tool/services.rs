@@ -558,7 +558,8 @@ pub(crate) fn route(s: &Services, service: &str, body: &[u8]) -> Work {
 
 /// A change to a fake site's URL, as std's `testing::fake` writes it: the URL, then what to
 /// change: 0 a status (a `u32`), 1 missing, 2 bytes (the rest), each in place of the one set
-/// before; 3 a delay (an `f64`'s bits); 4 nothing faked.
+/// before; 3 a delay (an `f64`'s bits); 4 nothing faked; 5 how many of the next requests fail
+/// in transport (a `u32`).
 #[allow(clippy::type_complexity)]
 fn testing_fake(b: &mut Body) -> Result<(String, Box<dyn FnOnce(&mut Fake)>), String> {
     let url = b.str()?;
@@ -587,6 +588,10 @@ fn testing_fake(b: &mut Body) -> Result<(String, Box<dyn FnOnce(&mut Fake)>), St
             Box::new(move |f| f.delay = delay)
         }
         4 => Box::new(|f| *f = Fake::default()),
+        5 => {
+            let fails = b.u32()?;
+            Box::new(move |f| f.fails = fails)
+        }
         k => return Err(format!("{k} isn't a fake")),
     };
     b.end()?;

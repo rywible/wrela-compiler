@@ -4,7 +4,8 @@
 // followed: the tool gets the
 // response, with its `location` header, and decides. A body over 512 KiB goes through a blob,
 // both ways; a response's body is at most 256 MiB. Each request has a deadline, 30 s unless it
-// asks for another (`timeout`, at most 600 s); past it, the request fails.
+// asks for another (`timeout`, at most 600 s); past it, the request fails. A request that gets
+// no response fails in transport (`is_transport`), which a retry may mend.
 //
 // In a tool test (§13.2), the hosts are fake sites: the host answers `GET` with the file at
 // `scratch/sites/<host>/<path>`, or 404, unless the test set a fake for the URL
@@ -29,6 +30,18 @@ pub struct Request: Clone {
     pub headers: Vec<Header>,
     pub body: Data,
     pub timeout: f64,
+}
+
+/// How the host's reason starts when a request failed in transport (runtime/native's
+/// `tool::http::TRANSPORT`).
+const TRANSPORT: Text = "transport: "
+
+/// Whether a `fetch` failed in transport: no response came, because the connection failed, was
+/// refused or reset, or the deadline passed. A retry may succeed. Any other failure (a host
+/// that isn't granted, a header the tool can't set, a body past its limits) is the request's
+/// own, and a retry fails the same way; a response, whatever its status, isn't a failure.
+pub fn is_transport(e: ToolError) -> bool {
+    e.message().starts_with(TRANSPORT)
 }
 
 /// A `GET` of `url`, with no headers and no body.
@@ -112,4 +125,19 @@ fn a_response_reads_back() {
     assert(length.as_str() == "0")
     assert(response.header("location").is_none())
     assert(read_response(Ok(Vec::from([u8(0), 200, 0, 0, 0]))).is_err(), "a short response")
+}
+
+@test
+fn a_failure_in_transport_is_told_from_the_requests_own() {
+    for (reason, transport) in [
+        ("transport: https://a.example/x: connection reset", true),
+        ("the host `a.example` isn't granted", false),
+    ] {
+        var failed: Vec<u8> = Vec::from([u8(1)])
+        for b in String::from(reason).as_bytes() {
+            failed.push(b)
+        }
+        let Err(e) = read_response(Ok(take failed)) else { panic("a failure") }
+        assert(is_transport(e) == transport, e.message())
+    }
 }

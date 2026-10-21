@@ -7,7 +7,9 @@
 // status `n` and the file, if there is one; `Missing` with 404 and no body; `Bytes(b)` with
 // 200 and these bytes, whatever the method. Each of the three takes the place of the one set
 // before. `Delay(s)` makes the answer come after `s` seconds of the test's fake time, so a
-// timer can fire first. `Clear` takes back all that was set.
+// timer can fire first. `Fail(n)` makes the next `n` requests for the URL fail in transport, as
+// a connection reset does (`http::is_transport`), and the ones after answer as set. `Clear`
+// takes back all that was set.
 //
 // The fake clock moves only when every request the test waits on is answered by the clock
 // (timers, delayed fakes): then it jumps to the soonest. `utc_now` reads it.
@@ -29,6 +31,8 @@ pub enum Fake: Clone {
     Delay(f64),
     /// Nothing faked: the file again.
     Clear,
+    /// The next requests, this many, fail in transport, as a connection reset does.
+    Fail(u32),
 }
 
 /// Sets `fake` for the URL `url`. `std::tool::answer` reads the answer.
@@ -53,6 +57,10 @@ pub fn fake(url: str, fake: Fake) -> Pending<u8> {
             w.write_u64(bitcast_u64(s))
         },
         Fake::Clear => w.write_u8(4),
+        Fake::Fail(n) => {
+            w.write_u8(5)
+            w.write_u32(n)
+        },
     }
     ask("testing/fake", take w.into_bytes())
 }

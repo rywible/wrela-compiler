@@ -19,8 +19,10 @@
 //! A tool test's hosts are fake sites (`Caps::host` says which): the host answers a `GET` (or a
 //! `HEAD`) with the file at `scratch/sites/<host>/<path>`, through the capability context like
 //! any file, or 404 if there's none, unless the test set a fake for that URL
-//! (`std::tool::testing::fake`): a status, a missing page, other bytes, or a delay in the
-//! test's fake time. A fake's answers obey a real one's limits. No tool test reaches the
+//! (`std::tool::testing::fake`): a status, a missing page, other bytes, a delay in the
+//! test's fake time, or failures in transport. A request that gets no response (the connection
+//! fails, is refused or reset, or the deadline passes) fails with a reason that starts with
+//! [`TRANSPORT`], so a tool can tell a failure a retry may mend from a definite one. A fake's answers obey a real one's limits. No tool test reaches the
 //! network.
 
 use super::services::{Body, Data, Services};
@@ -33,6 +35,11 @@ use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{
     Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, RustlsConnector, Transport,
 };
+
+/// How the reason of a request that failed in transport starts (`std::tool::http::is_transport`):
+/// no response came, whether the connection failed, was refused or reset, or the deadline
+/// passed. A retry may succeed. Any other failure is the request's own, and the same again.
+pub(crate) const TRANSPORT: &str = "transport: ";
 
 /// A request's deadline unless it asks for another.
 pub(crate) const DEADLINE: Duration = Duration::from_secs(30);
@@ -142,6 +149,8 @@ pub(crate) struct Fake {
     pub answer: Option<Faked>,
     /// Seconds of the test's fake time before the answer.
     pub delay: f64,
+    /// How many of the next requests fail in transport, as a connection reset does.
+    pub fails: u32,
 }
 
 /// What a fake site answers for a URL in place of its file.
@@ -207,14 +216,26 @@ pub(crate) fn fetch(s: &Services, request: u32, f: Fetch) -> Result<Vec<u8>, Str
 
 /// Why `f` failed at its deadline.
 pub(crate) fn expired(f: &Fetch) -> String {
-    format!("{}: no response within its deadline of {} s", f.url, f.deadline.as_secs_f64())
+    format!(
+        "{TRANSPORT}{}: no response within its deadline of {} s",
+        f.url,
+        f.deadline.as_secs_f64()
+    )
 }
 
 /// A fake site's answer: the test's fake for the URL, else the file under
 /// `scratch/sites/<host>/` (a path ending in `/` is its `index.html`), for `GET` and `HEAD`,
 /// within a real response's limits.
 fn fake(s: &Services, request: u32, f: &Fetch, host: &str, path: &str) -> Result<Vec<u8>, String> {
-    let set = s.fakes().get(fake_key(&f.url)).cloned().unwrap_or_default();
+    let set = {
+        let mut fakes = s.fakes();
+        let set = fakes.get_mut(fake_key(&f.url));
+        if let Some(set) = set.filter(|set| set.fails > 0) {
+            set.fails -= 1;
+            return Err(format!("{TRANSPORT}{}: connection reset (a fake site's failure)", f.url));
+        }
+        fakes.get(fake_key(&f.url)).cloned().unwrap_or_default()
+    };
     let length = |n: u64| vec![("content-length".to_string(), n.to_string())];
     let status = match set.answer {
         Some(Faked::Missing) => return respond(s, request, 404, &length(0), &[]),
@@ -487,7 +508,7 @@ fn send(
         let r = builder.body(body).map_err(|e| failed(&e))?;
         agent.run(r)
     };
-    let mut response = response.map_err(|e| failed(&e))?;
+    let mut response = response.map_err(|e| format!("{TRANSPORT}{}", failed(&e)))?;
     let status = response.status().as_u16();
     let headers: Vec<(String, String)> = response
         .headers()
@@ -495,10 +516,26 @@ fn send(
         .map(|(n, v)| (n.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
         .collect();
     let mut out = head(status, &headers);
-    let mut reader = response.body_mut().with_config().limit(MOST_RESPONSE + 1).reader();
-    s.put_read(request, &mut out, &mut reader, MOST_RESPONSE, "the response's body")
-        .map_err(|e| failed(&e))?;
+    let reader = response.body_mut().with_config().limit(MOST_RESPONSE + 1).reader();
+    let mut reader = Watched { inner: reader, broke: false };
+    let read = s.put_read(request, &mut out, &mut reader, MOST_RESPONSE, "the response's body");
+    // A body the connection broke off is a transport failure; one past a limit isn't.
+    read.map_err(|e| if reader.broke { format!("{TRANSPORT}{}", failed(&e)) } else { failed(&e) })?;
     Ok(out)
+}
+
+/// A reader that says whether reading it failed.
+struct Watched<R> {
+    inner: R,
+    broke: bool,
+}
+
+impl<R: Read> Read for Watched<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let r = self.inner.read(buf);
+        self.broke |= r.is_err();
+        r
+    }
 }
 
 #[cfg(test)]
