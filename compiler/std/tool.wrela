@@ -78,12 +78,18 @@ pub fn secret(name: str) -> Option<String> {
 }
 
 /// Why a tool's request failed, in the host's words: a path outside the roots, a file that
-/// isn't there, a budget spent.
+/// isn't there, a budget spent. A tool's own failures can be `ToolError`s too (`new`), so its
+/// work fails with one type, and `?` passes the host's reasons and its own up alike.
 pub struct ToolError: Clone {
     message: String,
 }
 
 impl ToolError {
+    /// A failure of the tool's own, said as `message`.
+    pub fn new(message: str) -> ToolError {
+        ToolError { message: String::from(message) }
+    }
+
     /// What the host said.
     pub fn message(self) -> borrow str {
         self.message
@@ -451,6 +457,7 @@ fn an_answer_reads_as_its_bytes_or_its_reason() {
     let Err(e) = answer(Vec::from([u8(1), 110, 111])) else { panic("a failure") }
     assert(e.message() == "no")
     assert(answer(Vec::new()).is_err(), "an empty answer")
+    assert(ToolError::new("the tool's own").message() == "the tool's own")
 }
 
 /// `bytes` read as a `T`, as a call reads its answer.

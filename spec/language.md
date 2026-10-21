@@ -654,7 +654,7 @@ A parameter's mode says what the callee may do with its argument and what the ca
 
 **Method receivers** are written `self`, `mut self` and `take self`.
 - **A `mut self` receiver isn't marked at the call site:** `list.push(x)`, not `mut list.push(x)`. This is the one exception to "every transfer is visible".
-- **A consuming (`take self`) method on a named place is marked:** `take builder.finish()`. On a temporary, no marker is needed: `Builder::new().finish()`.
+- **A consuming (`take self`) method on a named place is marked:** `take builder.finish()`. On a temporary, no marker is needed: `Builder::new().finish()`. The mark is the call's when a `?` follows it: `take call.wait()?` is `(take call.wait())?`.
 
 `[T]` is a **run** of `T` (§4.4). As a parameter, a run is borrowed like anything else. `mut [T]` is a mutable run.
 
@@ -1096,7 +1096,7 @@ Wrela separates recoverable failures, which are `Result` values, from bugs, whic
 
 ### 10.1 Results and panics
 
-- **A recoverable failure is a `Result<T, E>`,** passed up with `?`. `x?` returns a `None` or an `Err` from a function that returns the same kind.
+- **A recoverable failure is a `Result<T, E>`,** passed up with `?`. `x?` returns a `None` or an `Err` from a function that returns the same kind, with the same error type: `x.map_err(f)?` makes the error the function's first.
 - **A bug panics.** On the CPU, a panic is a trap, and its message says where in the source it happened, from the `wrela.lines` section of the program's WASM.
   - An optimized build (`wrela build --optimize`) keeps that table beside its WASM, in `game.lines`. A browser fetches the file only when a trap needs it. Without the file, the message gives the trap's code offset.
   - GPU code can't panic. An index out of range sets a debug flag or reads a value from inside the buffer (§11.3).
@@ -1622,7 +1622,7 @@ wrela tool <package> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME].
 - A resource that a request makes belongs to that request until the tool reads the answer. If the tool ends first, the host releases it with the rest. The host keeps compiled code only in its code cache (`drive`, below), outside every root that it grants.
 
 **A tool waits for what it asks.** A tool has its own thread and no frame, so nothing in it must not stall (§17.1 holds for clients and servers). Each service's function makes its request at once, and gives a `Call<T>`, `T` being what the service gives:
-- `call.wait()` blocks the thread until the answer comes, and gives a `Result<T, ToolError>`: what the service gives, or the host's reason for its failure. A stop of the run (`--timeout`, Ctrl-C, a helper's trap, stuck work) ends the tool there instead: it can't catch the stop, and the host says why.
+- `call.wait()` blocks the thread until the answer comes, and gives a `Result<T, ToolError>`: what the service gives, or the host's reason for its failure. `ToolError::new(message)` is a failure of the tool's own, so a tool's work can fail with one type, and `?` passes both up. A stop of the run (`--timeout`, Ctrl-C, a helper's trap, stuck work) ends the tool there instead: it can't catch the stop, and the host says why.
 - Requests made before a `wait` are already being carried out, so `let a = build(x)` then `let b = build(y)` builds both at once, whichever is waited on first.
 - `std::tool::any(requests)` blocks until the first of several requests is answered, and gives its index. `call.request()` gives a call's request, a `Copy` number; the other calls are untouched, and each still waits for its own answer. So one thread answers events as they come: a served post, a timer, a rebuild.
 - A `Call` dropped without `wait` leaves its request to finish. Its answer, and what the request made, is released when the tool ends.

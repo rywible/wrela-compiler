@@ -99,6 +99,30 @@ impl<T, E> Result<T, E> {
             Err(_) => None,
         }
     }
+
+    /// The same value, or its error made into another by `f`: so `x.map_err(f)?` passes an
+    /// error up from a function whose error type is `f`'s result.
+    pub fn map_err<E2>(take self, f: fn(take E) -> E2) -> Result<T, E2> {
+        match take self {
+            Ok(x) => Ok(x),
+            Err(e) => Err(f(take e)),
+        }
+    }
+}
+
+@test
+fn an_error_is_mapped_and_a_value_kept() {
+    let failed: Result<u32, u32> = Err(3)
+    let Err(said) = failed.map_err(|n| n * 10) else { panic("an error stays an error") }
+    assert(said == 30)
+    // A closure that borrows what it says goes straight to the parameter.
+    let what = String::from("code")
+    let again: Result<u32, u32> = Err(4)
+    let Err(text) = again.map_err(|n| String::from(f"{what} {n}")) else { panic("an error") }
+    assert(text.as_str() == "code 4")
+    let worked: Result<u32, u32> = Ok(7)
+    let Ok(kept) = worked.map_err(|n| n * 10) else { panic("a value stays a value") }
+    assert(kept == 7)
 }
 
 /// Deep-copied with `.clone()` (§6.1). A type declares it, `struct S: Clone { ... }`, and the
