@@ -1,27 +1,32 @@
 // A tool's driven builds (language.md §15.5): a build loaded on the native host beside the
-// tool, with the GPU or on the CPU alone, and run as the tool says: `init`, frames and ticks with
-// a `std::input::Script`, the screen captured, the state's hash, what it printed and timed, and
-// its other exports called. It's the host `wrela-host` runs, so the same build and script give
-// the same hash.
+// tool, with the GPU or on the CPU alone, in a process of its own, and run in steps: `init`,
+// frames and ticks with a `std::input::Script`, its exports called and its voice rendered, the
+// screen captured, the state's hash, its phases, its GPU buffers and the commands it recorded.
+// It's the host `wrela-host` runs, so the same build and script give the same hash.
 //
-// A build is a directory in a root (what `toolchain::build` writes); the host reads its files
-// through the grants and compiles its WASM for each load, keeping no compiled code. Each
-// operation has a deadline, 60 s unless it asks for another (at most 600 s), from when the host
-// takes it: past it, or when the tool ends, the host stops the build's WASM on every thread. A
-// build that trapped, or was stopped, runs nothing more, but its screen, hash, lines and phases
-// can be read. One operation runs at a time on a build: another fails while it runs. The host
-// closes every build when the tool ends.
+// `steps` runs a list of steps on a loaded build, in order, in one request, and gives what they
+// saw (a `Seen`); `run` loads a build, runs its steps and closes it, in one request. After a
+// trap, the steps that run code are skipped, and those that only observe still run: a build
+// that trapped can still be observed, by later requests too.
 //
-// Every operation that runs the program says when it started (seconds since the build loaded),
-// how long it took, and when each frame or tick started and ended, so a tool can time them.
+// A build is a directory in a root (what `toolchain::build` writes). The host opens it, its
+// root and its storage through the grants, and gives them, open, to the build's process, which
+// opens nothing by a path. The host compiles each build once in a run, and keeps its code in
+// the code cache, outside every root. Each request has a deadline, 60 s unless it asks for
+// another (at most 600 s), from when the host takes it: past it, or when the tool ends, the
+// host kills the build's process, and the build can't be observed after it. One request runs
+// at a time on a build: another fails while one runs. The host closes every build when the
+// tool ends.
 //
-// A build's voice (`std::audio::play`) renders offline: `audio` gives its next quanta, the
-// samples Chrome's AudioWorklet renders, in a blob whose bytes are reserved in the tool's blob
-// budget before the first quantum runs.
+// An answer's inline part (all but its blobs) is at most 512 KiB: a request whose steps would
+// see more fails, saying which step. Every blob (a screen, a buffer's bytes, a voice's samples)
+// is reserved in the tool's blob budget before its bytes are read back or rendered: one that
+// doesn't fit fails the request before it's read.
 //
 // A driven build's posts (`std::io::post`) go to the tool: `posts` gives those it made, and
-// `answer` answers each (or `fail` fails it), which the program reads from its next call on. A build holds at most 64
-// posts unanswered, each of at most 512 KiB; past them, a post fails at once.
+// `answer` answers each (or `fail` fails it), which the program reads from its next call on.
+// A build holds at most 64 posts unanswered, each of at most 512 KiB; past them, a post fails
+// at once.
 
 use std::input::Script
 use std::serialize::{Reader, Writer}
@@ -93,10 +98,19 @@ impl Build {
     }
 }
 
-/// A loaded build, and how long loading it took, in seconds.
+/// Where a load's code came from: compiled for it, read from the code cache (an earlier run
+/// compiled it), or compiled earlier in this run (a load of the same build).
+pub enum Code: Copy + Eq {
+    Compiled,
+    Cached,
+    Reused,
+}
+
+/// A loaded build, how long loading it took, in seconds, and where its code came from.
 pub struct Loaded: Copy {
     pub build: Build,
     pub elapsed: f64,
+    pub code: Code,
 }
 
 /// A number an export takes or returns (§15.2): an `i32` (a `u32`, a `bool` or a small integer
@@ -108,39 +122,73 @@ pub enum Scalar: Copy {
     F64(f64),
 }
 
-/// What a trap happened in: `init`, a frame, a tick or an export's call.
+/// A step of a `steps` request. Those that run the build's code: `Init`, its `init`, once,
+/// before any other; `Frames(n, script)`, its next `n` frames in lockstep with its ticker if it
+/// has one (as `wrela-host` runs them), with `script`'s events by their frames counted from the
+/// build's first; `FrameAt(time)`, one frame at `time` seconds, outside lockstep (the program's
+/// `frame(time, width, height)`, waiting for no ticks: a camera's, a light's or a jitter's
+/// time); `Ticks(n, script)`, the next `n` ticks of a build loaded on the CPU alone, with no
+/// frames, each with `script`'s records of it (as `wrela-host --no-gpu`); `Call(export, args)`,
+/// an export called with at most 64 arguments; and `Audio(quanta, timed)`, the voice's next
+/// quanta rendered offline (`std::audio::QUANTUM` samples each, in each channel, as
+/// `wrela-host` renders them), and with `timed` one at a time, each timed. Those that observe:
+/// `Capture`, a GPU build's screen; `Hash`, the state hash of everything it submitted since it
+/// loaded (FNV-1a 64, as `wrela-host` prints it); `Phases`, the phases it timed on all its
+/// threads; `Buffers`, the GPU buffers a GPU build holds, oldest first; `ReadBuffer(handle)`,
+/// one's bytes, read back from the GPU; `Commands`, the commands a build loaded with `record`
+/// submitted since the last `Commands`; and `Running`, the root path of the build that runs
+/// (after a hand-over, `std::reload::hand_over`, the one handed over to).
+pub enum Step: Clone {
+    Init,
+    Frames(u32, Script),
+    FrameAt(f32),
+    Ticks(u32, Script),
+    Call(String, Vec<Scalar>),
+    Audio(u32, bool),
+    Capture,
+    Hash,
+    Phases,
+    Buffers,
+    ReadBuffer(u32),
+    Commands,
+    Running,
+}
+
+/// What a trap happened in: `init`, a frame, a tick, an export's call or the voice.
 pub enum Stage: Copy + Eq {
     Init,
     Frame,
     Tick,
     Call,
+    Audio,
 }
 
 /// A trap: the host's message (which says the tick, for a trap in one, and where), the panic's
 /// own message (empty if it wasn't a panic), where in the source (empty if the build doesn't
-/// say), what it happened in, and the frame's or tick's number.
+/// say), what it happened in, the frame's or tick's number, and the index of the step it ended
+/// (in the request where it happened).
 pub struct Trap: Clone {
     pub message: String,
     pub panic: String,
     pub at: String,
     pub stage: Stage,
     pub number: u32,
+    pub step: u32,
 }
 
 /// When a frame or a tick started and ended: seconds since the build loaded.
-pub struct Step: Copy {
+pub struct Span: Copy {
     pub start: f64,
     pub end: f64,
 }
 
-/// What running gave: when it started and how long it took (seconds), each frame or tick that
-/// ran to its end, an export's results, and the trap that ended it, if one did.
+/// What a step that runs code gave: when it started and how long it took (seconds), each frame
+/// or tick that ran to its end, and an export's results.
 pub struct Ran: Clone {
     pub started: f64,
     pub elapsed: f64,
-    pub steps: Vec<Step>,
+    pub spans: Vec<Span>,
     pub results: Vec<Scalar>,
-    pub trap: Option<Trap>,
 }
 
 /// A GPU build's screen: its size, and its pixels, RGBA8, rows top to bottom, in a blob.
@@ -148,14 +196,6 @@ pub struct Capture: Clone {
     pub width: u32,
     pub height: u32,
     pub rgba: Data,
-}
-
-/// The lines a build printed since the last `logs`, the oldest first, and how many more wait
-/// for the next `logs`: an answer holds at most 4096 lines and 512 KiB of them (a line of more
-/// than 256 KiB is cut, with a note).
-pub struct Logs: Clone {
-    pub lines: Vec<String>,
-    pub waiting: u32,
 }
 
 /// A buffer a command binds: its handle, and the range bound (offset and size in bytes; a size
@@ -182,8 +222,9 @@ pub struct Recorded: Clone {
     pub bytes: Vec<u8>,
 }
 
-/// The commands a build recorded since the last `commands`, the oldest first, and how many more
-/// wait for the next: an answer holds at most 65,536 of them and 512 KiB of their names.
+/// The commands a build recorded since the last `Commands`, the oldest first, and how many more
+/// wait for the next: a step gives at most 65,536 of them, and as many as the answer has room
+/// for. One that no answer holds fails the request, and is dropped.
 pub struct Commands: Clone {
     pub commands: Vec<Recorded>,
     pub waiting: u32,
@@ -202,6 +243,27 @@ pub struct Phase: Clone {
 pub struct Audio: Clone {
     pub samples: Data,
     pub times: Option<Data>,
+}
+
+/// What a request's steps saw, each kind in the order of its steps: a `Ran` for each step that
+/// ran code (`Init`, `Frames`, `FrameAt`, `Ticks`, `Call`; one that trapped too, with the frames
+/// or ticks it finished), and each observation; the lines the build printed during the steps
+/// (as many as the answer has room for, at most 4096 lines and 512 KiB between two requests'
+/// ends, a line of more than 256 KiB cut, with a note) and how many more it printed, which were
+/// dropped; and the build's first trap, in this request or before it.
+pub struct Seen: Clone {
+    pub ran: Vec<Ran>,
+    pub captures: Vec<Capture>,
+    pub hashes: Vec<u64>,
+    pub phases: Vec<Vec<Phase>>,
+    pub audio: Vec<Audio>,
+    pub buffers: Vec<Vec<u32>>,
+    pub bytes: Vec<Data>,
+    pub commands: Vec<Commands>,
+    pub running: Vec<String>,
+    pub lines: Vec<String>,
+    pub dropped_lines: u32,
+    pub trap: Option<Trap>,
 }
 
 /// A post the build made (`std::io::post`), which waits for the tool's answer: its number,
@@ -224,10 +286,8 @@ fn timeout_ask<T: Answer>(service: str, w: take Writer, timeout: f64) -> Call<T>
     ask(service, take w.into_bytes())
 }
 
-/// Loads the build in `build` (a root path) as `options` says, without running its `init`.
-@tool
-pub fn load(build: str, options: Load) -> Call<Loaded> {
-    var w = Writer::new()
+/// Writes `options` as the host reads a load, its timeout last.
+fn write_load(w: mut Writer, build: str, options: Load) {
     w.write_str(build)
     w.write_u8(if options.gpu { 1 } else { 0 })
     w.write_u32(options.width)
@@ -242,146 +302,98 @@ pub fn load(build: str, options: Load) -> Call<Loaded> {
     w.write_u32(options.hold)
     w.write_u8(if options.record { 1 } else { 0 })
     w.write_str(options.storage.as_str())
-    timeout_ask("drive/load", take w, options.timeout)
+    w.write_u64(bitcast_u64(options.timeout))
 }
 
-/// Runs the build's `init`, once, before anything else runs.
-@tool
-pub fn init(b: Build, timeout: f64 = 0.0) -> Call<Ran> {
-    timeout_ask("drive/init", handle_body(b), timeout)
-}
-
-/// Runs the build's next `n` frames, in lockstep with its ticker if it has one (as `wrela-host`
-/// runs them), with `script`'s events, by their frames counted from the build's first.
-@tool
-pub fn frames(b: Build, n: u32, script: Script, timeout: f64 = 0.0) -> Call<Ran> {
-    var w = handle_body(b)
-    w.write_u32(n)
-    w.write_str(script.as_json())
-    timeout_ask("drive/frames", take w, timeout)
-}
-
-/// Runs one frame at `time`, in seconds, outside lockstep: the program's `frame(time, width,
-/// height)`, as `wrela_host::Host::run_frames` calls it, with no ticks waited for. So a tool can
-/// draw a frame at any time, a camera's, a light's or a jitter's, in any order.
-@tool
-pub fn frame_at(b: Build, time: f32, timeout: f64 = 0.0) -> Call<Ran> {
-    var w = handle_body(b)
-    w.write_u32(bitcast_u32(time))
-    timeout_ask("drive/frame_at", take w, timeout)
-}
-
-/// Runs the next `n` ticks of a build loaded on the CPU alone, with no frames, each with
-/// `script`'s records of it, by their ticks counted from the first (as `wrela-host --no-gpu`
-/// runs them).
-@tool
-pub fn ticks(b: Build, n: u32, script: Script, timeout: f64 = 0.0) -> Call<Ran> {
-    var w = handle_body(b)
-    w.write_u32(n)
-    w.write_str(script.as_json())
-    timeout_ask("drive/ticks", take w, timeout)
-}
-
-/// A GPU build's screen after its last frame, in a blob. The
-/// pixels' bytes and their blob are reserved in the tool's blob budget before they're read
-/// back, so a capture that doesn't fit fails before it's read.
-@tool
-pub fn capture(b: Build, timeout: f64 = 0.0) -> Call<Capture> {
-    timeout_ask("drive/capture", handle_body(b), timeout)
-}
-
-/// The state hash of everything the build submitted since it loaded (FNV-1a 64, as `wrela-host`
-/// prints it).
-@tool
-pub fn hash(b: Build) -> Call<u64> {
-    timeout_ask("drive/hash", handle_body(b), 0.0)
-}
-
-/// The lines the build printed since the last `logs`, as many as an answer holds (the rest
-/// wait for the next).
-@tool
-pub fn logs(b: Build) -> Call<Logs> {
-    timeout_ask("drive/logs", handle_body(b), 0.0)
-}
-
-/// The GPU buffers a GPU build holds, oldest first, by their handles (a buffer the program
-/// dropped is gone).
-@tool
-pub fn buffers(b: Build) -> Call<Vec<u32>> {
-    timeout_ask("drive/buffers", handle_body(b), 0.0)
-}
-
-/// The bytes of a GPU build's buffer `handle` (one `buffers` names), read back from the GPU into
-/// a blob, whose bytes are reserved in the tool's blob budget before they're read.
-@tool
-pub fn read_buffer(b: Build, handle: u32, timeout: f64 = 0.0) -> Call<Data> {
-    var w = handle_body(b)
-    w.write_u32(handle)
-    timeout_ask("drive/read_buffer", take w, timeout)
-}
-
-/// The commands a build loaded with `record` submitted since the last `commands`, as many as an
-/// answer holds (the rest wait for the next).
-@tool
-pub fn commands(b: Build) -> Call<Commands> {
-    timeout_ask("drive/commands", handle_body(b), 0.0)
-}
-
-/// The root path of the build that runs: the one loaded, or after a hand-over
-/// (`std::reload::hand_over`), the one handed over to.
-@tool
-pub fn running(b: Build) -> Call<String> {
-    timeout_ask("drive/running", handle_body(b), 0.0)
-}
-
-/// The phases the build timed, on all its threads.
-@tool
-pub fn phases(b: Build) -> Call<Vec<Phase>> {
-    timeout_ask("drive/phases", handle_body(b), 0.0)
-}
-
-/// Calls the build's export `export` with `args` (at most 64): its results are the `Ran`'s
-/// `results`.
-@tool
-pub fn call(b: Build, export: str, args: [Scalar], timeout: f64 = 0.0) -> Call<Ran> {
-    var w = handle_body(b)
-    w.write_str(export)
-    w.write_u32(args.len())
-    for a in args {
-        match a {
-            Scalar::I32(x) => {
-                w.write_u8(0)
-                w.write_u64(u64(u32(x)))
-            },
-            Scalar::I64(bits) => {
+/// Writes `list` as the host reads steps: a count, then each step's kind and what it carries.
+fn write_steps(w: mut Writer, list: [Step]) {
+    w.write_u32(list.len())
+    for s in list {
+        match s {
+            Step::Init => w.write_u8(0),
+            Step::Frames(n, script) => {
                 w.write_u8(1)
-                w.write_u64(bits)
+                w.write_u32(n)
+                w.write_str(script.as_json())
             },
-            Scalar::F32(x) => {
+            Step::FrameAt(time) => {
                 w.write_u8(2)
-                w.write_u64(u64(bitcast_u32(x)))
+                w.write_u32(bitcast_u32(time))
             },
-            Scalar::F64(x) => {
+            Step::Ticks(n, script) => {
                 w.write_u8(3)
-                w.write_u64(bitcast_u64(x))
+                w.write_u32(n)
+                w.write_str(script.as_json())
             },
+            Step::Call(export, args) => {
+                w.write_u8(4)
+                w.write_str(export.as_str())
+                w.write_u32(args.len())
+                for a in args {
+                    match a {
+                        Scalar::I32(x) => {
+                            w.write_u8(0)
+                            w.write_u64(u64(u32(x)))
+                        },
+                        Scalar::I64(bits) => {
+                            w.write_u8(1)
+                            w.write_u64(bits)
+                        },
+                        Scalar::F32(x) => {
+                            w.write_u8(2)
+                            w.write_u64(u64(bitcast_u32(x)))
+                        },
+                        Scalar::F64(x) => {
+                            w.write_u8(3)
+                            w.write_u64(bitcast_u64(x))
+                        },
+                    }
+                }
+            },
+            Step::Audio(quanta, timed) => {
+                w.write_u8(5)
+                w.write_u32(quanta)
+                w.write_u8(if timed { 1 } else { 0 })
+            },
+            Step::Capture => w.write_u8(6),
+            Step::Hash => w.write_u8(7),
+            Step::Phases => w.write_u8(8),
+            Step::Buffers => w.write_u8(9),
+            Step::ReadBuffer(handle) => {
+                w.write_u8(10)
+                w.write_u32(handle)
+            },
+            Step::Commands => w.write_u8(11),
+            Step::Running => w.write_u8(12),
         }
     }
-    timeout_ask("drive/call", take w, timeout)
 }
 
-/// Renders the voice's next `quanta` quanta (`std::audio::QUANTUM` samples each, in each
-/// channel) offline, as `wrela-host` renders them, after `init`.
-/// With `timed`, the quanta render one at a time, and each is timed. The samples' bytes and
-/// their blobs are reserved in the tool's blob budget first: a render that doesn't fit fails
-/// before a quantum runs. A trap in the voice fails the request and ends the build, as a call's
-/// trap does; a build without a voice fails the request alone.
+/// Loads the build in `build` (a root path) as `options` says, in a process of its own,
+/// without running its `init`.
 @tool
-pub fn audio(b: Build, quanta: u32, timed: bool = false, timeout: f64 = 0.0) -> Call<Audio> {
+pub fn load(build: str, options: Load) -> Call<Loaded> {
+    var w = Writer::new()
+    write_load(mut w, build, options)
+    ask("drive/load", take w.into_bytes())
+}
+
+/// Runs `list` (at most 1024 steps) on the build, in order, in one request: what they saw.
+@tool
+pub fn steps(b: Build, list: [Step], timeout: f64 = 0.0) -> Call<Seen> {
     var w = handle_body(b)
-    w.write_u32(quanta)
-    w.write_u8(if timed { 1 } else { 0 })
-    timeout_ask("drive/audio", take w, timeout)
+    write_steps(mut w, list)
+    timeout_ask("drive/steps", take w, timeout)
+}
+
+/// Loads the build in `build` as `options` says (within the load's timeout), runs `list` on it
+/// (within `timeout` from the load's end), and closes it, in one request: what the steps saw.
+@tool
+pub fn run(build: str, options: Load, list: [Step], timeout: f64 = 0.0) -> Call<Seen> {
+    var w = Writer::new()
+    write_load(mut w, build, options)
+    write_steps(mut w, list)
+    timeout_ask("drive/run", take w, timeout)
 }
 
 /// The posts the build made since the last `posts`, the oldest first: as many as an answer
@@ -411,123 +423,274 @@ pub fn fail(b: Build, post: u32, why: str) -> Call<Done> {
     timeout_ask("drive/fail", take w, 0.0)
 }
 
-/// Closes the build: its host and threads go, and the handle names nothing after this.
+/// Closes the build: its process goes, and the handle names nothing after this.
 @tool
 pub fn close(b: Build) -> Call<Done> {
     ask("drive/close", handle_body(b).into_bytes())
 }
 
-/// A `load` answer: the handle (a `u32`), then the seconds loading took (an `f64`'s bits).
+/// A `load` answer: the handle (a `u32`), the seconds loading took (an `f64`'s bits), then
+/// where its code came from (a `u8`).
 impl Answer for Loaded {
     fn read(bytes: take Vec<u8>) -> Result<Loaded, ToolError> {
         var r = Reader::new(take bytes)
         let Ok(id) = r.read_u32() else { return Err(malformed("a loaded build")) }
         let Ok(elapsed) = r.read_u64() else { return Err(malformed("a loaded build")) }
+        let code = match r.read_u8() {
+            Ok(0) => Code::Compiled,
+            Ok(1) => Code::Cached,
+            Ok(2) => Code::Reused,
+            _ => return Err(malformed("a loaded build")),
+        }
         if !r.at_end() {
             return Err(malformed("a loaded build"))
         }
-        Ok(Loaded { build: Build { id }, elapsed: bitcast_f64(elapsed) })
+        Ok(Loaded { build: Build { id }, elapsed: bitcast_f64(elapsed), code })
     }
 }
 
-/// An answer of `init`, `frames`, `ticks` or `call`.
-impl Answer for Ran {
-    fn read(bytes: take Vec<u8>) -> Result<Ran, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(started) = r.read_u64() else { return Err(malformed("a run")) }
-        let Ok(elapsed) = r.read_u64() else { return Err(malformed("a run")) }
-        let Ok(n) = r.read_u32() else { return Err(malformed("a run")) }
-        if n > r.left() {
-            return Err(malformed("a run"))
-        }
-        var steps: Vec<Step> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(start) = r.read_u64() else { return Err(malformed("a run")) }
-            let Ok(end) = r.read_u64() else { return Err(malformed("a run")) }
-            steps.push(Step { start: bitcast_f64(start), end: bitcast_f64(end) })
-        }
-        let Ok(count) = r.read_u32() else { return Err(malformed("a run")) }
-        if count > r.left() {
-            return Err(malformed("a run"))
-        }
-        var results: Vec<Scalar> = Vec::with_capacity(count)
-        for _ in 0..count {
-            let Ok(kind) = r.read_u8() else { return Err(malformed("a run")) }
-            let Ok(bits) = r.read_u64() else { return Err(malformed("a run")) }
-            let low = u32(bits & 4294967295)
-            results.push(match kind {
-                0 => Scalar::I32(i32(low)),
-                1 => Scalar::I64(bits),
-                2 => Scalar::F32(bitcast_f32(low)),
-                3 => Scalar::F64(bitcast_f64(bits)),
-                _ => return Err(malformed("a run")),
-            })
-        }
-        let Ok(trapped) = r.read_u8() else { return Err(malformed("a run")) }
-        var trap: Option<Trap> = None
-        if trapped == 1 {
-            let Ok(message) = r.read_string() else { return Err(malformed("a run")) }
-            let Ok(panic_message) = r.read_string() else { return Err(malformed("a run")) }
-            let Ok(at) = r.read_string() else { return Err(malformed("a run")) }
-            let Ok(stage) = r.read_u8() else { return Err(malformed("a run")) }
-            let Ok(number) = r.read_u32() else { return Err(malformed("a run")) }
-            let stage = match stage {
-                0 => Stage::Init,
-                1 => Stage::Frame,
-                2 => Stage::Tick,
-                3 => Stage::Call,
-                _ => return Err(malformed("a run")),
-            }
-            trap = Some(Trap { message, panic: panic_message, at, stage, number })
-        }
-        if !r.at_end() {
-            return Err(malformed("a run"))
-        }
-        Ok(
-            Ran {
-                started: bitcast_f64(started),
-                elapsed: bitcast_f64(elapsed),
-                steps,
-                results,
-                trap,
-            },
-        )
+/// A count read before as many items, each of at least a byte: `None` if fewer bytes are left.
+fn count(r: mut Reader) -> Option<u32> {
+    let Ok(n) = r.read_u32() else { return None }
+    if n > r.left() {
+        return None
     }
+    Some(n)
 }
 
-/// A `capture` answer: the width and height (`u32`s), then the pixels (`blob::Data`).
-impl Answer for Capture {
-    fn read(bytes: take Vec<u8>) -> Result<Capture, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(width) = r.read_u32() else { return Err(malformed("a screen")) }
-        let Ok(height) = r.read_u32() else { return Err(malformed("a screen")) }
-        let Some(rgba) = read_data(mut r) else { return Err(malformed("a screen")) }
-        if !r.at_end() {
-            return Err(malformed("a screen"))
-        }
-        Ok(Capture { width, height, rgba })
+/// A `Ran`: when it started and how long it took, each frame's or tick's start and end, then
+/// each result's kind and bits.
+fn read_ran(r: mut Reader) -> Option<Ran> {
+    let Ok(started) = r.read_u64() else { return None }
+    let Ok(elapsed) = r.read_u64() else { return None }
+    let Some(n) = count(mut r) else { return None }
+    var spans: Vec<Span> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(start) = r.read_u64() else { return None }
+        let Ok(end) = r.read_u64() else { return None }
+        spans.push(Span { start: bitcast_f64(start), end: bitcast_f64(end) })
     }
+    let Some(m) = count(mut r) else { return None }
+    var results: Vec<Scalar> = Vec::with_capacity(m)
+    for _ in 0..m {
+        let Ok(kind) = r.read_u8() else { return None }
+        let Ok(bits) = r.read_u64() else { return None }
+        let low = u32(bits & 4294967295)
+        results.push(match kind {
+            0 => Scalar::I32(i32(low)),
+            1 => Scalar::I64(bits),
+            2 => Scalar::F32(bitcast_f32(low)),
+            3 => Scalar::F64(bitcast_f64(bits)),
+            _ => return None,
+        })
+    }
+    Some(Ran { started: bitcast_f64(started), elapsed: bitcast_f64(elapsed), spans, results })
 }
 
-/// An `audio` answer: the samples (`blob::Data`), then 1 and the times (`blob::Data`), or
-/// 0.
-impl Answer for Audio {
-    fn read(bytes: take Vec<u8>) -> Result<Audio, ToolError> {
+/// A `Capture`: the width and height (`u32`s), then the pixels (`blob::Data`).
+fn read_capture(r: mut Reader) -> Option<Capture> {
+    let Ok(width) = r.read_u32() else { return None }
+    let Ok(height) = r.read_u32() else { return None }
+    let Some(rgba) = read_data(mut r) else { return None }
+    Some(Capture { width, height, rgba })
+}
+
+/// An `Audio`: the samples (`blob::Data`), then 1 and the times (`blob::Data`), or 0.
+fn read_audio(r: mut Reader) -> Option<Audio> {
+    let Some(samples) = read_data(mut r) else { return None }
+    var times: Option<Data> = None
+    match r.read_u8() {
+        Ok(0) => {},
+        Ok(1) => {
+            let Some(t) = read_data(mut r) else { return None }
+            times = Some(take t)
+        },
+        _ => return None,
+    }
+    Some(Audio { samples, times })
+}
+
+/// The phases of a `Phases` step: a count, then each phase's name, seconds and times.
+fn read_phases(r: mut Reader) -> Option<Vec<Phase>> {
+    let Some(n) = count(mut r) else { return None }
+    var out: Vec<Phase> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(name) = r.read_string() else { return None }
+        let Ok(seconds) = r.read_u64() else { return None }
+        let Ok(times) = r.read_u32() else { return None }
+        out.push(Phase { name, seconds: bitcast_f64(seconds), times })
+    }
+    Some(out)
+}
+
+/// The handles of a `Buffers` step: a count, then each.
+fn read_buffers(r: mut Reader) -> Option<Vec<u32>> {
+    let Some(n) = count(mut r) else { return None }
+    var out: Vec<u32> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(h) = r.read_u32() else { return None }
+        out.push(h)
+    }
+    Some(out)
+}
+
+/// A `Commands`: a count, each command's kind, label, pipeline, workgroups, bindings, target
+/// and bytes, then how many wait.
+fn read_commands(r: mut Reader) -> Option<Commands> {
+    let Some(n) = count(mut r) else { return None }
+    var commands: Vec<Recorded> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(kind) = r.read_string() else { return None }
+        let Ok(label) = r.read_string() else { return None }
+        let Ok(pipeline) = r.read_string() else { return None }
+        var groups = vec3u(0)
+        for k in 0..3 {
+            let Ok(g) = r.read_u32() else { return None }
+            groups[k] = g
+        }
+        let Some(m) = count(mut r) else { return None }
+        var bindings: Vec<Bound> = Vec::with_capacity(m)
+        for _ in 0..m {
+            let Ok(handle) = r.read_u32() else { return None }
+            let Ok(offset) = r.read_u32() else { return None }
+            let Ok(size) = r.read_u32() else { return None }
+            bindings.push(Bound { handle, offset, size })
+        }
+        let Ok(target) = r.read_string() else { return None }
+        let Ok(len) = r.read_u32() else { return None }
+        if len > r.left() {
+            return None
+        }
+        var bytes: Vec<u8> = Vec::with_capacity(len)
+        for _ in 0..len {
+            let Ok(b) = r.read_u8() else { return None }
+            bytes.push(b)
+        }
+        commands.push(Recorded { kind, label, pipeline, groups, bindings, target, bytes })
+    }
+    let Ok(waiting) = r.read_u32() else { return None }
+    Some(Commands { commands, waiting })
+}
+
+/// A `Trap`: its message, panic and place, its stage, its number and its step.
+fn read_trap(r: mut Reader) -> Option<Trap> {
+    let Ok(message) = r.read_string() else { return None }
+    let Ok(panic_message) = r.read_string() else { return None }
+    let Ok(at) = r.read_string() else { return None }
+    let Ok(stage) = r.read_u8() else { return None }
+    let Ok(number) = r.read_u32() else { return None }
+    let Ok(step) = r.read_u32() else { return None }
+    let stage = match stage {
+        0 => Stage::Init,
+        1 => Stage::Frame,
+        2 => Stage::Tick,
+        3 => Stage::Call,
+        4 => Stage::Audio,
+        _ => return None,
+    }
+    Some(Trap { message, panic: panic_message, at, stage, number, step })
+}
+
+/// Reads a `Seen` from `r`: each kind, a count then each, in `Seen`'s order; the lines, a count
+/// then each, and how many were dropped; then 1 and the trap, or 0.
+fn read_seen(r: mut Reader) -> Option<Seen> {
+    let Some(n) = count(mut r) else { return None }
+    var ran: Vec<Ran> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_ran(mut r) else { return None }
+        ran.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var captures: Vec<Capture> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_capture(mut r) else { return None }
+        captures.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var hashes: Vec<u64> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(x) = r.read_u64() else { return None }
+        hashes.push(x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var phases: Vec<Vec<Phase>> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_phases(mut r) else { return None }
+        phases.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var audio: Vec<Audio> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_audio(mut r) else { return None }
+        audio.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var buffers: Vec<Vec<u32>> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_buffers(mut r) else { return None }
+        buffers.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var bytes: Vec<Data> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_data(mut r) else { return None }
+        bytes.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var commands: Vec<Commands> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Some(x) = read_commands(mut r) else { return None }
+        commands.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var running: Vec<String> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(x) = r.read_string() else { return None }
+        running.push(take x)
+    }
+    let Some(n) = count(mut r) else { return None }
+    var lines: Vec<String> = Vec::with_capacity(n)
+    for _ in 0..n {
+        let Ok(x) = r.read_string() else { return None }
+        lines.push(take x)
+    }
+    let Ok(dropped_lines) = r.read_u32() else { return None }
+    var trap: Option<Trap> = None
+    match r.read_u8() {
+        Ok(0) => {},
+        Ok(1) => {
+            let Some(t) = read_trap(mut r) else { return None }
+            trap = Some(take t)
+        },
+        _ => return None,
+    }
+    Some(
+        Seen {
+            ran,
+            captures,
+            hashes,
+            phases,
+            audio,
+            buffers,
+            bytes,
+            commands,
+            running,
+            lines,
+            dropped_lines,
+            trap,
+        },
+    )
+}
+
+/// A `steps` or `run` answer: what the steps saw.
+impl Answer for Seen {
+    fn read(bytes: take Vec<u8>) -> Result<Seen, ToolError> {
         var r = Reader::new(take bytes)
-        let Some(samples) = read_data(mut r) else { return Err(malformed("a voice's samples")) }
-        var times: Option<Data> = None
-        match r.read_u8() {
-            Ok(0) => {},
-            Ok(1) => {
-                let Some(t) = read_data(mut r) else { return Err(malformed("a voice's samples")) }
-                times = Some(take t)
-            },
-            _ => return Err(malformed("a voice's samples")),
-        }
+        let Some(seen) = read_seen(mut r) else { return Err(malformed("what steps saw")) }
         if !r.at_end() {
-            return Err(malformed("a voice's samples"))
+            return Err(malformed("what steps saw"))
         }
-        Ok(Audio { samples, times })
+        Ok(seen)
     }
 }
 
@@ -535,10 +698,7 @@ impl Answer for Audio {
 impl Answer for Vec<Post> {
     fn read(bytes: take Vec<u8>) -> Result<Vec<Post>, ToolError> {
         var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("posts")) }
-        if n > r.left() {
-            return Err(malformed("posts"))
-        }
+        let Some(n) = count(mut r) else { return Err(malformed("posts")) }
         var out: Vec<Post> = Vec::with_capacity(n)
         for _ in 0..n {
             let Ok(id) = r.read_u32() else { return Err(malformed("posts")) }
@@ -553,122 +713,16 @@ impl Answer for Vec<Post> {
     }
 }
 
-/// A `logs` answer: a count, each line, then how many more wait.
-impl Answer for Logs {
-    fn read(bytes: take Vec<u8>) -> Result<Logs, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("lines")) }
-        if n > r.left() {
-            return Err(malformed("lines"))
-        }
-        var lines: Vec<String> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(l) = r.read_string() else { return Err(malformed("lines")) }
-            lines.push(take l)
-        }
-        let Ok(waiting) = r.read_u32() else { return Err(malformed("lines")) }
-        if !r.at_end() {
-            return Err(malformed("lines"))
-        }
-        Ok(Logs { lines, waiting })
-    }
-}
-
-/// A `buffers` answer: a count, then each handle.
-impl Answer for Vec<u32> {
-    fn read(bytes: take Vec<u8>) -> Result<Vec<u32>, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("buffers")) }
-        if n > r.left() {
-            return Err(malformed("buffers"))
-        }
-        var out: Vec<u32> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(h) = r.read_u32() else { return Err(malformed("buffers")) }
-            out.push(h)
-        }
-        if !r.at_end() {
-            return Err(malformed("buffers"))
-        }
-        Ok(out)
-    }
-}
-
-/// A `commands` answer: a count, each command's kind, label, pipeline, workgroups and
-/// bindings, then how many wait.
-impl Answer for Commands {
-    fn read(bytes: take Vec<u8>) -> Result<Commands, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("commands")) }
-        if n > r.left() {
-            return Err(malformed("commands"))
-        }
-        var commands: Vec<Recorded> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(kind) = r.read_string() else { return Err(malformed("commands")) }
-            let Ok(label) = r.read_string() else { return Err(malformed("commands")) }
-            let Ok(pipeline) = r.read_string() else { return Err(malformed("commands")) }
-            var groups = vec3u(0)
-            for k in 0..3 {
-                let Ok(g) = r.read_u32() else { return Err(malformed("commands")) }
-                groups[k] = g
-            }
-            let Ok(m) = r.read_u32() else { return Err(malformed("commands")) }
-            if m > r.left() {
-                return Err(malformed("commands"))
-            }
-            var bindings: Vec<Bound> = Vec::with_capacity(m)
-            for _ in 0..m {
-                let Ok(handle) = r.read_u32() else { return Err(malformed("commands")) }
-                let Ok(offset) = r.read_u32() else { return Err(malformed("commands")) }
-                let Ok(size) = r.read_u32() else { return Err(malformed("commands")) }
-                bindings.push(Bound { handle, offset, size })
-            }
-            let Ok(target) = r.read_string() else { return Err(malformed("commands")) }
-            let Ok(len) = r.read_u32() else { return Err(malformed("commands")) }
-            if len > r.left() {
-                return Err(malformed("commands"))
-            }
-            var bytes: Vec<u8> = Vec::with_capacity(len)
-            for _ in 0..len {
-                let Ok(b) = r.read_u8() else { return Err(malformed("commands")) }
-                bytes.push(b)
-            }
-            commands.push(Recorded { kind, label, pipeline, groups, bindings, target, bytes })
-        }
-        let Ok(waiting) = r.read_u32() else { return Err(malformed("commands")) }
-        if !r.at_end() {
-            return Err(malformed("commands"))
-        }
-        Ok(Commands { commands, waiting })
-    }
-}
-
-/// A `phases` answer: a count, then each phase's name, seconds and times.
-impl Answer for Vec<Phase> {
-    fn read(bytes: take Vec<u8>) -> Result<Vec<Phase>, ToolError> {
-        var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("phases")) }
-        if n > r.left() {
-            return Err(malformed("phases"))
-        }
-        var out: Vec<Phase> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(name) = r.read_string() else { return Err(malformed("phases")) }
-            let Ok(seconds) = r.read_u64() else { return Err(malformed("phases")) }
-            let Ok(times) = r.read_u32() else { return Err(malformed("phases")) }
-            out.push(Phase { name, seconds: bitcast_f64(seconds), times })
-        }
-        if !r.at_end() {
-            return Err(malformed("phases"))
-        }
-        Ok(out)
-    }
+/// Writes an empty kind: a count of 0.
+fn none(w: mut Writer) {
+    w.write_u32(0)
 }
 
 @test
-fn a_run_with_a_trap_reads_back() {
+fn what_steps_saw_reads_back_in_its_order() {
     var w = Writer::new()
+    // One `Ran`: at 1.5 s for 0.25 s, one frame, one result.
+    w.write_u32(1)
     w.write_u64(bitcast_u64(f64(1.5)))
     w.write_u64(bitcast_u64(f64(0.25)))
     w.write_u32(1)
@@ -677,33 +731,67 @@ fn a_run_with_a_trap_reads_back() {
     w.write_u32(1)
     w.write_u8(0)
     w.write_u64(u64(u32(i32(-3))))
+    // One capture, 2×1, in blob 9.
+    w.write_u32(1)
+    w.write_u32(2)
+    w.write_u32(1)
+    w.write_u8(1)
+    w.write_u32(9)
+    // Two hashes.
+    w.write_u32(2)
+    w.write_u64(7)
+    w.write_u64(8)
+    // One `Phases`, of one phase.
+    w.write_u32(1)
+    w.write_u32(1)
+    w.write_str("survey")
+    w.write_u64(bitcast_u64(f64(0.5)))
+    w.write_u32(3)
+    // One voice, timed.
+    w.write_u32(1)
+    write_data(mut w, Data::Bytes(Vec::from([u8(0), 0, 128, 63])))
+    w.write_u8(1)
+    write_data(mut w, Data::Bytes(Vec::from([u8(1), 2, 3, 4, 5, 6, 7, 8])))
+    // One `Buffers` of two; no bytes, no commands.
+    w.write_u32(1)
+    w.write_u32(2)
+    w.write_u32(4)
+    w.write_u32(5)
+    none(mut w)
+    none(mut w)
+    // One `Running`; a line, two dropped; a trap in tick 20, at step 3.
+    w.write_u32(1)
+    w.write_str("src/b")
+    w.write_u32(1)
+    w.write_str("hello")
+    w.write_u32(2)
     w.write_u8(1)
     w.write_str("in tick 20: panic: no")
     w.write_str("no")
     w.write_str("main.wrela:9:5")
     w.write_u8(2)
     w.write_u32(20)
-    let Ok(ran) = Ran::read(take w.into_bytes()) else { panic("a run") }
-    assert(ran.started == 1.5 && ran.elapsed == 0.25 && ran.steps.len() == 1)
+    w.write_u32(3)
+    let Ok(seen) = Seen::read(take w.into_bytes()) else { panic("what steps saw") }
+    let ran = seen.ran[0].clone()
+    assert(ran.started == 1.5 && ran.elapsed == 0.25 && ran.spans.len() == 1)
     let Scalar::I32(x) = ran.results[0] else { panic("an i32") }
     assert(x == -3)
-    let Some(trap) = ran.trap else { panic("a trap") }
-    assert(trap.stage == Stage::Tick && trap.number == 20 && trap.panic.as_str() == "no")
-    assert(Ran::read(Vec::from([u8(1)])).is_err(), "a short run")
-}
-
-@test
-fn audio_reads_back() {
-    var w = Writer::new()
-    write_data(mut w, Data::Bytes(Vec::from([u8(0), 0, 128, 63])))
-    w.write_u8(1)
-    write_data(mut w, Data::Bytes(Vec::from([u8(1), 2, 3, 4, 5, 6, 7, 8])))
-    let Ok(a) = Audio::read(take w.into_bytes()) else { panic("audio") }
-    let Data::Bytes(s) = a.samples else { panic("bytes") }
-    assert(s.len() == 4 && s[3] == 63)
-    let Some(Data::Bytes(t)) = a.times else { panic("times") }
+    assert(seen.captures[0].width == 2 && seen.captures[0].height == 1)
+    let Data::Blob(id) = seen.captures[0].rgba.clone() else { panic("a blob") }
+    assert(id.id() == 9)
+    assert(seen.hashes.len() == 2 && seen.hashes[1] == 8)
+    assert(seen.phases[0][0].name.as_str() == "survey" && seen.phases[0][0].times == 3)
+    let Some(Data::Bytes(t)) = seen.audio[0].times.clone() else { panic("times") }
     assert(t.len() == 8)
-    assert(Audio::read(Vec::from([u8(0), 0, 0, 0, 0, 2])).is_err(), "a bad flag")
+    assert(seen.buffers[0].len() == 2 && seen.buffers[0][1] == 5)
+    assert(seen.bytes.is_empty() && seen.commands.is_empty())
+    assert(seen.running[0].as_str() == "src/b")
+    assert(seen.lines[0].as_str() == "hello" && seen.dropped_lines == 2)
+    let Some(trap) = seen.trap else { panic("a trap") }
+    assert(trap.stage == Stage::Tick && trap.number == 20 && trap.step == 3)
+    assert(trap.panic.as_str() == "no")
+    assert(Seen::read(Vec::from([u8(1)])).is_err(), "a short answer")
 }
 
 @test
@@ -718,4 +806,22 @@ fn posts_read_back() {
     let Data::Bytes(b) = posts[0].body.clone() else { panic("bytes") }
     assert(b.len() == 2 && b[0] == 123)
     assert(Vec::<Post>::read(Vec::from([u8(1), 0, 0, 0])).is_err(), "a short answer")
+}
+
+@test
+fn steps_are_written_as_the_host_reads_them() {
+    var w = Writer::new()
+    write_steps(
+        mut w,
+        [
+            Step::Init,
+            Step::FrameAt(0.5),
+            Step::Call(String::from("add"), Vec::from([Scalar::I32(2)])),
+            Step::Hash,
+        ],
+    )
+    let bytes = take w.into_bytes()
+    // 4 steps; 0; 2 and the time's bits; 4, "add", one i32; 7.
+    assert(bytes.len() == 4 + 1 + 5 + (1 + 4 + 3 + 4 + 9) + 1)
+    assert(bytes[0] == 4 && bytes[4] == 0 && bytes[5] == 2 && bytes[bytes.len() - 1] == 7)
 }

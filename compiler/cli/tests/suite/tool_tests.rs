@@ -287,6 +287,101 @@ fn a_test_host_that_cant_end_its_programs_has_them_ended_by_wrela_test() {
     assert!(gone, "the fake program, in a process group of its own, ended too");
 }
 
+/// A package whose one tool test, of budget 3 s, loads the build in `built` (a subject that
+/// exports `spin`, which never ends) and calls `spin` with no end in sight.
+fn spinner_package(name: &str) -> std::path::PathBuf {
+    let main = r#"use std::tool::drive
+use std::tool::drive::{Scalar, Step}
+
+pub fn tool() -> u32 {
+    0
+}
+
+@test(tool, read: [("built", "built")], budget: 3)
+fn spins_a_driven_build() {
+    let Ok(loaded) = drive::load("built", drive::cpu()).wait() else { panic("loaded") }
+    let spin = Step::Call(String::from("spin"), Vec::from([Scalar::I32(0)]))
+    let _ = drive::steps(loaded.build, [Step::Init, take spin], timeout: 600.0).wait()
+}
+"#;
+    let subject = "pub fn frame(time: f32, width: u32, height: u32) {}\n\npub fn spin(n: i32) -> i32 {\n    var i = n\n    while i >= 0 {\n        i = (i + 1) % 1000\n    }\n    i\n}\n";
+    let dir = package(
+        name,
+        &[
+            ("wrela.toml", &manifest(&name.replace('-', "_"))),
+            ("main.wrela", main),
+            ("subject/wrela.toml", &manifest("subject")),
+            ("subject/main.wrela", subject),
+        ],
+    );
+    let built = wrela()
+        .arg("build")
+        .arg(dir.join("subject"))
+        .arg("-o")
+        .arg(dir.join("built"))
+        .output()
+        .expect("wrela build");
+    assert!(built.status.success(), "{}", String::from_utf8_lossy(&built.stderr));
+    dir
+}
+
+/// A test's host that is stopped, so it can't end the driven build's process it started, has
+/// that process ended by `wrela test` once the test runs out of budget: the process's group is
+/// in the test's file of groups before the build runs.
+#[test]
+fn a_driven_builds_process_left_by_a_test_past_its_budget_is_ended_by_wrela_test() {
+    let dir = spinner_package("tool-tests-driven");
+    let mut child = wrela()
+        .arg("test")
+        .arg(&dir)
+        .arg("--json")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("run wrela test");
+    let host = || {
+        running("tool --test").into_iter().find(|pid| {
+            let parent = std::process::Command::new("ps").args(["-o", "ppid=", "-p", pid]).output();
+            parent
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).trim() == child.id().to_string())
+        })
+    };
+    let mut found = None;
+    let started = within(std::time::Duration::from_secs(60), || {
+        found = host().and_then(|h| {
+            let driven = running(&format!("tool --drive {h}$"));
+            (!driven.is_empty()).then_some((h, driven))
+        });
+        found.is_some()
+    });
+    assert!(started, "the driven build's process started");
+    let (host, driven) = found.expect("found");
+    // Its group is in the test's file of groups, which `wrela test` keeps in a directory of its
+    // own: the process leads it.
+    let prefix = format!("wrela-tool-tests-{}-", child.id());
+    let listed: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+        .expect("the temporary directory")
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(&prefix))
+        .filter_map(|e| std::fs::read_to_string(e.path().join("0/groups.txt")).ok())
+        .flat_map(|t| t.lines().map(str::to_string).collect::<Vec<_>>())
+        .collect();
+    assert!(listed.contains(&driven[0]), "{driven:?} in {listed:?}");
+    // The test's host is stopped, so it can't end its build's process at its budget.
+    let stopped = std::process::Command::new("kill").args(["-STOP", &host]).status().expect("kill");
+    assert!(stopped.success());
+    let bound = std::time::Duration::from_secs(3 + 10 + 20);
+    assert_eq!(exit_within(&mut child, bound), Some(1), "the test failed");
+    let mut out = String::new();
+    std::io::Read::read_to_string(child.stdout.as_mut().expect("its output"), &mut out)
+        .expect("read");
+    assert!(out.contains("was killed"), "{out}");
+    let gone = within(std::time::Duration::from_secs(3), || {
+        running(&format!("tool --drive {host}$")).is_empty()
+    });
+    assert!(gone, "the driven build's process {driven:?}, in a group of its own, ended too");
+}
+
 #[test]
 fn a_program_started_but_not_yet_recorded_ends_with_its_tests_host() {
     let (dir, sleeper) = sleeper_package("tool-tests-unrecorded", 60);

@@ -13,7 +13,7 @@
 
 use crate::gpu::{Builder, Gpu, Ready, pipeline_key};
 use crate::program::{Handing, Retired};
-use crate::{Build, BuildDir, Error, Host, Result, Stop, compile_build, driven_build};
+use crate::{Build, BuildDir, CodeFor, Error, Host, Result, compile_build, driven_build};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
@@ -58,18 +58,17 @@ fn prepare(dir: PathBuf, builder: Builder, have: std::collections::HashSet<u64>)
     })
 }
 
-/// Compiles the build opened as `handle` (root path `at`) to be driven, its calls ended by
-/// `stop`, and builds the pipelines `builder`'s device doesn't hold (`have`): on a thread of its
-/// own.
+/// Reads the build opened as `handle` (root path `at`) to be driven, its code from `code`, and
+/// builds the pipelines `builder`'s device doesn't hold (`have`): on a thread of its own.
 fn prepare_driven(
     at: String,
     handle: BuildDir,
-    stop: Stop,
+    code: CodeFor,
     builder: Builder,
     have: std::collections::HashSet<u64>,
 ) -> Preparation {
     std::thread::spawn(move || {
-        let mut build = driven_build(&handle, stop, true).map_err(|e| e.to_string())?;
+        let mut build = driven_build(&handle, true, &code).map_err(|e| e.to_string())?;
         build.driven = Some((at, std::sync::Arc::new(handle)));
         let ready =
             builder.build_all(&build.manifest, &build.shaders, &have).map_err(|e| e.to_string())?;
@@ -168,7 +167,7 @@ impl Host {
     }
 
     /// The directory a request's `path` names from the running build, and for a driven host,
-    /// that build opened through the tool's grants (`Beside`), by its root path.
+    /// that build opened within its root (`Beside`), by its root path.
     fn resolve(&self, path: &str) -> std::result::Result<(PathBuf, Opened), String> {
         let Some(b) = &self.beside else { return Ok((beside(&self.dir, path), None)) };
         let at = self.driven_at().unwrap_or(&b.at);
@@ -183,11 +182,11 @@ impl Host {
         if self.prepared.contains_key(dir) {
             return;
         }
-        let stop = self.beside.as_ref().map(|b| b.stop.clone());
+        let code = self.beside.as_ref().map(|b| b.code.clone());
         let gpu: &mut Gpu = self.p().executor();
-        let job = match (opened, stop) {
-            (Some((at, handle)), Some(stop)) => {
-                prepare_driven(at, handle, stop, gpu.builder(), gpu.pipeline_keys())
+        let job = match (opened, code) {
+            (Some((at, handle)), Some(code)) => {
+                prepare_driven(at, handle, code, gpu.builder(), gpu.pipeline_keys())
             }
             _ => prepare(dir.to_path_buf(), gpu.builder(), gpu.pipeline_keys()),
         };

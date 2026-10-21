@@ -60,6 +60,11 @@ struct State {
     /// What's shown before each line on stderr (`wrela: `, a constant's name); `None`: quiet.
     shown: Option<String>,
     traced: Traced,
+    /// The most lines, and bytes of them, kept between takes, if there's a bound
+    /// ([`Trace::keep_at_most`]); the bytes of those kept; and how many were dropped past it.
+    bound: Option<(usize, usize)>,
+    kept_bytes: usize,
+    dropped: u64,
     /// Each thread's phase: its index in `traced.phases`, and when it started.
     open: HashMap<ThreadId, (usize, Instant)>,
 }
@@ -70,6 +75,9 @@ impl Trace {
         Trace(Arc::new(Mutex::new(State {
             shown,
             traced: Traced::default(),
+            bound: None,
+            kept_bytes: 0,
+            dropped: 0,
             open: HashMap::new(),
         })))
     }
@@ -84,12 +92,24 @@ impl Trace {
         if let Some(shown) = &s.shown {
             eprintln!("{shown}{line}");
         }
-        s.traced.lines.push(line);
+        s.push(line);
     }
 
     /// A line the host says of the program, kept with its lines but not shown.
     pub fn keep(&self, line: String) {
-        self.state().traced.lines.push(line);
+        self.state().push(line);
+    }
+
+    /// Keeps at most `lines` lines, and `bytes` bytes of them, between takes: a line past either
+    /// is dropped as it's printed, and counted ([`Trace::take_dropped`]). So a program that
+    /// prints without end holds no more than that (a driven build's, language.md §15.5).
+    pub fn keep_at_most(&self, lines: usize, bytes: usize) {
+        self.state().bound = Some((lines, bytes));
+    }
+
+    /// How many lines were dropped past the bound since the last call.
+    pub fn take_dropped(&self) -> u64 {
+        std::mem::take(&mut self.state().dropped)
     }
 
     /// Ends this thread's phase, and starts phase `name` on it (none, if `name` is empty).
@@ -139,7 +159,9 @@ impl Trace {
 
     /// The lines kept since the last call.
     pub fn take_lines(&self) -> Vec<String> {
-        std::mem::take(&mut self.state().traced.lines)
+        let mut s = self.state();
+        s.kept_bytes = 0;
+        std::mem::take(&mut s.traced.lines)
     }
 
     /// The phases so far, those still open counted to now.
@@ -164,6 +186,7 @@ impl Trace {
         let mut s = self.state();
         s.end_all(Instant::now());
         between();
+        s.kept_bytes = 0;
         std::mem::take(&mut s.traced)
     }
 
@@ -230,6 +253,18 @@ impl Trace {
 }
 
 impl State {
+    /// Keeps `line`, unless it's past the bound: then it's counted as dropped.
+    fn push(&mut self, line: String) {
+        if let Some((lines, bytes)) = self.bound {
+            if self.traced.lines.len() >= lines || self.kept_bytes + line.len() > bytes {
+                self.dropped += 1;
+                return;
+            }
+            self.kept_bytes += line.len();
+        }
+        self.traced.lines.push(line);
+    }
+
     fn end(&mut self, thread: ThreadId, now: Instant) {
         if let Some((i, start)) = self.open.remove(&thread) {
             self.traced.phases[i].seconds += (now - start).as_secs_f64();
@@ -286,6 +321,21 @@ mod tests {
             traced.phases.iter().map(|p| (p.name.as_str(), p.times)).collect();
         assert_eq!(names, vec![("a", 2), ("b", 1)]);
         assert!(traced.phases.iter().all(|p| p.seconds >= 0.0));
+    }
+
+    #[test]
+    fn a_bound_drops_lines_past_it_until_the_next_take_and_counts_them() {
+        let t = Trace::new(None);
+        t.keep_at_most(2, 5);
+        for line in ["ab", "cd", "e", "f"] {
+            t.print(line.into());
+        }
+        assert_eq!(t.take_lines(), ["ab", "cd"], "two lines at most");
+        assert_eq!(t.take_dropped(), 2);
+        t.print("abcdef".into());
+        t.print("abc".into());
+        assert_eq!(t.take_lines(), ["abc"], "five bytes at most, counted afresh");
+        assert_eq!(t.take_dropped(), 1);
     }
 
     #[test]

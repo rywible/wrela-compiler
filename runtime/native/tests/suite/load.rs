@@ -79,13 +79,13 @@ fn rejects_a_program_with_other_imports() {
 }
 
 /// A driven build (the tool host's `drive`, language.md §15.5), read through its directory's
-/// handle and compiled to be stopped, runs as a loaded one: the same frames give the same hash.
+/// handle, its code given for the engine `wrela-host` runs on, runs as a loaded one: the same
+/// frames give the same hash.
 #[test]
 fn a_driven_build_runs_as_a_loaded_one() {
     let dir = common::first_light_copy("driven");
     let handle = wrela_host::open_build_dir(&dir).expect("the build's directory");
-    let stop = wrela_host::Stop::new().expect("a stop");
-    let driven = CpuBuild::load_driven(handle, &dir, stop).expect("driven");
+    let driven = CpuBuild::load_driven(handle, &dir, &wrela_host::compiling()).expect("driven");
     let loaded = CpuBuild::load(&dir).expect("loaded");
     let mut hashes = Vec::new();
     for build in [driven, loaded] {
