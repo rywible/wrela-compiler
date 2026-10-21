@@ -1,12 +1,18 @@
 //! Files and directories reached through a directory handle one part at a time, without
 //! following a symbolic link anywhere on the way (`openat` with `O_NOFOLLOW`): what the tool
 //! host reads and writes in a root, and what a driven build fetches from its build (language.md
-//! §15.5). A link in place of a part, put there before or after a check, is refused, so nothing
+//! §15.5), and what it stores. A link in place of a part, put there before or after a check, is refused, so nothing
 //! leaves the handle's directory, and nothing inside it is reached by a link's other name. A file
 //! is opened without waiting (`O_NONBLOCK`) and must be a regular file.
 
 use cap_std::fs::Dir;
 use std::io::Read;
+
+/// Whether the open file `file` has more than one name (hard links): what a confined write
+/// refuses, so no write through a root changes a file that's also somewhere else.
+pub(crate) fn linked_elsewhere(file: &impl std::os::fd::AsFd) -> bool {
+    rustix::fs::fstat(file).is_ok_and(|st| st.st_nlink > 1)
+}
 
 /// `path`'s parts, `/` between them, none empty, `.` or `..`.
 pub(crate) fn parts(path: &str) -> Result<Vec<&str>, String> {
@@ -62,6 +68,13 @@ mod unix {
             std::fs::File::from(rustix::fs::openat(dir, name, flags, Mode::from_raw_mode(0o666))?);
         if !file.metadata()?.is_file() {
             return Err(std::io::Error::other("it isn't a regular file"));
+        }
+        // A file with another name (a hard link) isn't written: its other names would change
+        // too.
+        if write && linked_elsewhere(&file) {
+            return Err(std::io::Error::other(
+                "it has other names (hard links), so it isn't written",
+            ));
         }
         Ok(file)
     }
@@ -122,20 +135,20 @@ pub(crate) fn read(dir: &Dir, path: &str, most: u64) -> Result<Vec<u8>, String> 
     Ok(bytes)
 }
 
+/// Writes `bytes` as the whole regular file at `path` in `dir`, making the directories it needs.
+pub(crate) fn write(dir: &Dir, path: &str, bytes: &[u8]) -> Result<(), String> {
+    use std::io::Write;
+    let parts = parts(path)?;
+    let (name, above) = parts.split_last().expect("a path has a part");
+    let at = open_dir(dir, above, true).map_err(|e| format!("`{path}`: {e}"))?;
+    let mut file = open_file(&at, name, true).map_err(|e| format!("`{path}`: {e}"))?;
+    file.set_len(0).map_err(|e| format!("`{path}`: {e}"))?;
+    file.write_all(bytes).map_err(|e| format!("`{path}`: {e}"))
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::io::Write;
-
-    /// Writes `bytes` as the whole regular file at `path` in `dir`, making the directories it needs.
-    fn write(dir: &Dir, path: &str, bytes: &[u8]) -> Result<(), String> {
-        let parts = parts(path)?;
-        let (name, above) = parts.split_last().expect("a path has a part");
-        let at = open_dir(dir, above, true).map_err(|e| format!("`{path}`: {e}"))?;
-        let mut file = open_file(&at, name, true).map_err(|e| format!("`{path}`: {e}"))?;
-        file.set_len(0).map_err(|e| format!("`{path}`: {e}"))?;
-        file.write_all(bytes).map_err(|e| format!("`{path}`: {e}"))
-    }
 
     #[test]
     fn no_link_is_followed_on_the_way_or_at_the_end() {

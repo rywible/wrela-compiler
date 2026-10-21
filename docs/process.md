@@ -38,10 +38,10 @@ All are used as libraries, through Cargo; no code was copied from them.
 | [serde](https://serde.rs/) and serde_json | MIT or Apache-2.0 | The JSON of diagnostics, manifests, reports and the ABI |
 | [mimalloc](https://github.com/purpleKarrot/mimalloc-rs) (Microsoft's [mimalloc](https://github.com/microsoft/mimalloc)) | MIT | The CLI's and the tests' allocator |
 | [elsa](https://github.com/Manishearth/elsa) | MIT or Apache-2.0 | Append-only vectors in sema's type tables |
-| [sha2](https://github.com/RustCrypto/hashes) | MIT or Apache-2.0 | Keys of the constant cache, and the check of a downloaded toolchain release |
+| [sha2](https://github.com/RustCrypto/hashes) | MIT or Apache-2.0 | Keys of the constant cache and of the code cache (and of a run's driven builds' code), and the check of a downloaded toolchain release |
 | [tokio](https://tokio.rs/) and [wtransport](https://github.com/BiagioFesta/wtransport) 0.7 (over [quinn](https://github.com/quinn-rs/quinn)'s QUIC) | MIT; MIT or Apache-2.0 | `wrela-serve` runs a server build's rooms over WebTransport; the tests' client |
 | [cap-std](https://github.com/bytecodealliance/cap-std) and [rustix](https://github.com/bytecodealliance/rustix) | Apache-2.0 with the LLVM exception, Apache-2.0 or MIT | The tool host opens files relative to a root's directory handle, so no path or link leaves the root; process groups are killed without `unsafe` |
-| [libc](https://github.com/rust-lang/libc) | MIT or Apache-2.0 | `O_NONBLOCK` for a tool's files, and Chrome's pipe between `fork` and `exec` |
+| [libc](https://github.com/rust-lang/libc) | MIT or Apache-2.0 | `O_NONBLOCK` for a tool's files; Chrome's pipe, and a driven build's pipes and directories, between `fork` and `exec`; a driven build's process's `_exit` and, on Linux, `PR_SET_PDEATHSIG` |
 | [ctrlc](https://github.com/Detegr/rust-ctrlc) | MIT or Apache-2.0 | `wrela tool` stops a tool on Ctrl-C and cleans up after it |
 | [ureq](https://github.com/algesten/ureq) 3, over [rustls](https://github.com/rustls/rustls), with [webpki-roots](https://github.com/rustls/webpki-roots) | MIT or Apache-2.0; rustls also ISC; webpki-roots CDLA-Permissive-2.0 (Mozilla's root certificates, as data) | `std::tool::http`'s client, and the download of a pinned toolchain release |
 | [tar](https://github.com/alexcrichton/tar-rs) and [flate2](https://github.com/rust-lang/flate2-rs) | MIT or Apache-2.0 | Unpack a downloaded toolchain release |

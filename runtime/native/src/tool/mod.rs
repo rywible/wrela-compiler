@@ -42,18 +42,21 @@
 //! of requests the tool never read first ([`Ended`] says what was left). A worker running a
 //! program kills its process group as it sees the end, one waiting for an HTTP response shuts
 //! its connection down and joins the client's thread, one waiting for the toolchain or an image
-//! cancels its work, and every driven build's calls are stopped and every browser's connection
-//! closed, then each build, each server and each browser (its process group and its profile) is
-//! closed, with the same grace (a server's listener and connections are shut and its threads
+//! cancels its work, and every driven build's process group is killed and every browser's
+//! connection closed, then each build (its process reaped), each server and each browser (its
+//! process group and its profile) is closed, with the same grace (a server's listener and connections are shut and its threads
 //! joined, so its port is closed when the run returns); then the directory the run's programs
 //! had is removed. No file work holds the blob table's lock, so a stuck worker can't hold up the
 //! release. A worker, a driven build or a server's thread still running after the grace makes
 //! the end the host's failure (status 71), whatever the tool's own end was, and `wrela tool`
 //! then ends the process, so no worker outlives it. Work found stuck while the tool runs gives
 //! the tool one grace to read the request that failed and end on its own ([`services::Stuck`]),
-//! so what it says comes before the host's message. The host keeps no compiled code: it
-//! compiles the tool's WASM, and a driven build's, for each run, so nothing it loads comes from
-//! a directory a tool could write.
+//! so what it says comes before the host's message.
+//!
+//! **Compiled code is kept only in the code cache** ([`Options::code_cache`], `crate::code`): the
+//! tool's own build's, and each driven build's, which the drive service compiles once in a run.
+//! `wrela tool` refuses a grant whose directory is at or above the cache, so nothing it loads
+//! comes from a directory a tool could write.
 
 mod blobs;
 mod browser;
@@ -70,6 +73,7 @@ pub mod toolchain;
 
 pub use blobs::BlobBudget;
 pub use caps::{Caps, Grants, Opened, Program, ProgramGrant};
+pub use drive::run_child as drive_child;
 pub use run::{GROUPS_ENV, launch};
 pub use toolchain::Toolchain;
 
@@ -159,6 +163,10 @@ pub struct Options {
     /// The directory, the host's own, where the toolchain keeps its constants' cache: never one
     /// a tool is granted. `None`: one of the run's own, removed with it.
     pub cache: Option<std::path::PathBuf>,
+    /// The code cache's directory (`crate::code::cache_dir`), which no root the run grants may
+    /// hold (`Caps::refuse_code_cache`): the tool's build's code, and its driven builds', are
+    /// kept there from one run to the next. `None`: none is kept.
+    pub code_cache: Option<crate::code::Cache>,
     /// What only tests change.
     #[doc(hidden)]
     pub testing: Testing,
@@ -193,6 +201,11 @@ pub struct Testing {
     pub fail_helper: Option<u32>,
     /// How long `tool_any` waits between checking its requests and blocking.
     pub any_pause: Duration,
+    /// How long the drive service waits before it reads each blob's bytes from a driven
+    /// build's process.
+    pub drive_hold: Duration,
+    /// How long the drive service waits before it compiles a driven build's code.
+    pub compile_hold: Duration,
 }
 
 /// What a test is told as the host reaches a moment it waits for, so it acts then rather than
@@ -228,6 +241,8 @@ impl Default for Testing {
             helper_delay: Duration::ZERO,
             fail_helper: None,
             any_pause: Duration::ZERO,
+            drive_hold: Duration::ZERO,
+            compile_hold: Duration::ZERO,
         }
     }
 }
@@ -250,6 +265,7 @@ impl Options {
             groups: None,
             toolchain: None,
             cache: None,
+            code_cache: None,
             testing: Testing::default(),
         }
     }
@@ -465,7 +481,7 @@ fn rollback(services: &Services, request: u32) {
     services.blobs().rollback(request);
     let made = services.drives().rollback(request);
     for d in made {
-        if !d.close(services.grace) {
+        if !d.close(services.grace, &services.strays) {
             let _ = services.stuck.set("a failed request's driven build didn't close".into());
         }
     }
@@ -618,6 +634,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         groups,
         toolchain,
         cache,
+        code_cache,
         workers,
         ..
     } = options;
@@ -645,6 +662,9 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         signal: testing.signal.clone(),
         strays: Mutex::default(),
         drives: Mutex::default(),
+        codes: drive::Codes::new(code_cache.clone()),
+        drive_hold: testing.drive_hold,
+        compile_hold: testing.compile_hold,
         servers: Mutex::default(),
         browsers: Mutex::default(),
         answers: Mutex::new(None),
@@ -696,19 +716,19 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
     };
     // The stores, and the console's sending ends in them, go when `drive` returns, and its
     // helpers have stopped by then (or are counted as left).
-    let (mut end, helpers_left, run_helped) = tool.drive(&engine, build, &entry);
+    let (mut end, helpers_left, run_helped) = tool.drive(&engine, build, &entry, code_cache);
     ticker.stop();
-    // Driven builds' running calls stop first, and every browser's connection closes, so the
+    // Driven builds' processes are killed first, and every browser's connection closes, so the
     // workers waiting on them return.
     services.drives().stop_all();
     services.browsers().disconnect_all();
     let mut workers_left = pools.stop(testing.grace) + helpers_left;
-    // Then each driven build closes, on its own thread: one that doesn't within the grace is
+    // Then each driven build closes, its process reaped: one that isn't within the grace is
     // left, as a stuck worker is.
     let driven = services.drives().take_all();
     let until = Instant::now() + testing.grace;
     for d in driven {
-        if !d.close(until.saturating_duration_since(Instant::now())) {
+        if !d.close(until.saturating_duration_since(Instant::now()), &services.strays) {
             workers_left += 1;
         }
     }
@@ -812,12 +832,23 @@ struct ToolState {
 }
 
 impl Tool {
-    /// Compiles the tool, calls its entry on its thread with its helpers beside it, and stops
-    /// them: how it ended, the helpers left past the grace, and the chunks they ran.
-    fn drive(self, engine: &Engine, build: &ToolBuild, entry: &str) -> (End, usize, u32) {
-        let module = match Module::new(engine, &build.wasm) {
+    /// Compiles the tool (or reads its code back from `cache`), calls its entry on its thread
+    /// with its helpers beside it, and stops them: how it ended, the helpers left past the
+    /// grace, and the chunks they ran.
+    fn drive(
+        self,
+        engine: &Engine,
+        build: &ToolBuild,
+        entry: &str,
+        cache: Option<crate::code::Cache>,
+    ) -> (End, usize, u32) {
+        let module = match &cache {
+            Some(cache) => cache.module(engine, &build.wasm),
+            None => Module::new(engine, &build.wasm).map_err(|e| format!("{e:#}")),
+        };
+        let module = match module {
             Ok(m) => m,
-            Err(e) => return (End::Host(format!("compiling the tool build: {e:#}")), 0, 0),
+            Err(e) => return (End::Host(format!("compiling the tool build: {e}")), 0, 0),
         };
         let memory = match check_tool(&module, engine, entry) {
             Ok(m) => m,

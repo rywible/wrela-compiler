@@ -1098,6 +1098,7 @@ fn requests_are_answered_from_the_next_call_then_taken_once() {
             build: Some(build),
             build_dir: None,
             storage: None,
+            storage_dir: None,
             post: None,
             host: None,
             quiet: false,
@@ -1132,6 +1133,7 @@ fn storage_keeps_bytes_at_paths() {
         build: None,
         build_dir: None,
         storage: Some(storage.clone()),
+        storage_dir: None,
         post: None,
         host: None,
         quiet: false,
@@ -1147,6 +1149,36 @@ fn storage_keeps_bytes_at_paths() {
     assert_eq!(call_i32(&mut p, "status"), 4);
     assert_eq!(call_i32(&mut p, "take"), 0x0607_0809);
     assert_eq!(std::fs::read(storage.join("saves/a")).expect("stored"), [9, 8, 7, 6]);
+}
+
+/// A driven build's storage goes through its opened directory alone: a link in it, to a file or a
+/// directory, isn't followed, and its path is never opened.
+#[cfg(unix)]
+#[test]
+fn storage_through_a_handle_follows_no_link() {
+    let storage = scratch_dir("storage-handle");
+    let outside = scratch_dir("storage-outside");
+    std::fs::write(outside.join("secret"), "x").expect("a file outside");
+    std::os::unix::fs::symlink(outside.join("secret"), storage.join("link")).expect("a link");
+    std::os::unix::fs::symlink(&outside, storage.join("away")).expect("a link");
+    let dir = cap_std::fs::Dir::open_ambient_dir(&storage, cap_std::ambient_authority())
+        .expect("the storage");
+    let io = Io {
+        storage: Some(PathBuf::from("/nowhere")),
+        storage_dir: Some(Arc::new(dir)),
+        ..Io::default()
+    };
+    let write = Encoder::new().storage_write(4, "saves/a", &[9, 8, 7, 6]).finish();
+    let mut p = requester(&write, io.clone());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), 0);
+    assert_eq!(std::fs::read(storage.join("saves/a")).expect("stored"), [9, 8, 7, 6]);
+    for path in ["link", "away/secret"] {
+        let read = Encoder::new().storage_read(4, path).finish();
+        let mut p = requester(&read, io.clone());
+        p.call("ask", &[]).expect("ask");
+        assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED, "{path}");
+    }
 }
 
 #[test]

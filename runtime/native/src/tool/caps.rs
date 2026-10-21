@@ -338,6 +338,10 @@ fn open_file(dir: &Dir, rel: &str, path: &str, write: bool) -> Result<File, Stri
     if !kind.is_file() {
         return Err(format!("`{path}` isn't a regular file"));
     }
+    // A file with another name (a hard link) isn't written: its other names would change too.
+    if write && crate::confined::linked_elsewhere(&file) {
+        return Err(format!("`{path}` has other names (hard links), so it isn't written"));
+    }
     // Emptied only once it's known to be a file.
     if write {
         file.set_len(0).map_err(|e| failed(path, e))?;
@@ -545,12 +549,58 @@ impl Caps {
     /// part at a time, following no link: its real path, and the handle, which later reads go
     /// through, so a link put in its place after this leads nowhere.
     pub(crate) fn open_dir(&self, path: &str) -> Result<(PathBuf, Dir), String> {
-        let (root, rel) = self.resolve(path, false)?;
+        self.open_dir_in(path, false)
+    }
+
+    /// [`Caps::open_dir`], in a root granted for writing if `write`: a driven build's storage.
+    pub(crate) fn open_dir_in(&self, path: &str, write: bool) -> Result<(PathBuf, Dir), String> {
+        let (root, rel) = self.resolve(path, write)?;
         let parts: Vec<&str> = rel.map_or_else(Vec::new, |r| r.split('/').collect());
         let dir =
             crate::confined::open_dir(&root.dir, &parts, false).map_err(|e| failed(path, e))?;
         let real = parts.iter().fold(root.path.clone(), |p, part| p.join(part));
         Ok((real, dir))
+    }
+
+    /// A handle of the root that `path` (a root path) is in: what a driven build's process gets,
+    /// to open the builds it hands over to within the root, one part at a time.
+    pub(crate) fn root_handle(&self, path: &str) -> Result<Dir, String> {
+        let (root, _) = self.resolve(path, false)?;
+        root.dir.try_clone().map_err(|e| failed(path, e))
+    }
+
+    /// Refuses a root at or above `cache`, the code cache's directory (`crate::code`): a tool
+    /// that could write there could put code in the place of a build's, which later runs read
+    /// back and run natively. Each root is its handle's directory, and each of the cache's
+    /// directories is found by its real path, links followed, and known by its device and inode,
+    /// so no other name of a directory, nor a link, hides one. The cache's directory is the
+    /// one it opened: one put in its path's place since is refused too.
+    #[allow(clippy::unnecessary_cast)]
+    pub fn refuse_code_cache(&self, cache: &crate::code::Cache) -> Result<(), String> {
+        let path = cache.dir();
+        let real =
+            path.canonicalize().map_err(|e| format!("the code cache ({}): {e}", path.display()))?;
+        let mut above = Vec::new();
+        for dir in real.ancestors() {
+            let st = rustix::fs::stat(dir)
+                .map_err(|e| format!("the code cache's directory {}: {e}", dir.display()))?;
+            above.push((st.st_dev as u64, st.st_ino as u64));
+        }
+        if above.first() != Some(&cache.identity()?) {
+            return Err(format!("the code cache ({}) changed as it was opened", real.display()));
+        }
+        for (name, root) in &self.roots {
+            let st = rustix::fs::fstat(&root.dir).map_err(|e| format!("the root `{name}`: {e}"))?;
+            if above.contains(&(st.st_dev as u64, st.st_ino as u64)) {
+                return Err(format!(
+                    "the root `{name}` ({}) holds the code cache ({}), which no tool may reach: grant a directory beside it, or move the cache (`{}=<dir>`, or `off`)",
+                    root.path.display(),
+                    real.display(),
+                    crate::code::CODE_CACHE_ENV
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The directory above the file at `path` in a write root, opened one part at a time

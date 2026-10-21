@@ -38,6 +38,9 @@ png = "0.18"
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
 zune-core = "0.5"
 webp = { version = "0.3", default-features = false }
+# Compiled code's names in the code cache (`code`), and the drive service's builds by their
+# WASM: SHA-256, already the CLI's.
+sha2 = "0.10"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 

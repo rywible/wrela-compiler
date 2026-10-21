@@ -82,6 +82,12 @@ pub(crate) struct Services {
     pub toolchain: Option<super::toolchain::Service>,
     /// The builds the drive service holds.
     pub drives: Mutex<super::drive::Drives>,
+    /// The run's compiled code of its driven builds.
+    pub codes: super::drive::Codes,
+    /// A test's wait before the drive service reads each blob's bytes ([`super::Testing`]).
+    pub drive_hold: Duration,
+    /// A test's wait before the drive service compiles a build's code ([`super::Testing`]).
+    pub compile_hold: Duration,
     /// The servers the serve service holds.
     pub servers: Mutex<super::serve::Servers>,
     /// The browsers the browser service holds.
@@ -389,7 +395,8 @@ impl<'a> Body<'a> {
         }
     }
 
-    fn rest(&mut self) -> &'a [u8] {
+    /// The bytes left, all of them.
+    pub(crate) fn rest(&mut self) -> &'a [u8] {
         let out = &self.bytes[self.at..];
         self.at = self.bytes.len();
         out
@@ -668,6 +675,9 @@ pub(crate) fn for_test(budget: super::BlobBudget) -> Services {
         budget: None,
         toolchain: None,
         drives: Mutex::default(),
+        codes: super::drive::Codes::default(),
+        drive_hold: Duration::ZERO,
+        compile_hold: Duration::ZERO,
         servers: Mutex::default(),
         browsers: Mutex::default(),
         answers: Mutex::new(None),

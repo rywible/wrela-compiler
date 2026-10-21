@@ -98,6 +98,16 @@ pub fn platform_args(os: &str) -> &'static [&'static str] {
     }
 }
 
+/// Held while this process makes a pipe or starts a process: every host in it takes it (Chrome
+/// here, and the tool host's programs and driven builds). On macOS a new pipe's ends become
+/// close-on-exec only a moment after they're made (there's no `pipe2`), so a process started on
+/// another thread in that moment would keep them open, and a process waiting for its pipe's end
+/// would wait on it. Taken around the making of pipes and each start alone, never a wait.
+pub fn spawning() -> std::sync::MutexGuard<'static, ()> {
+    static SPAWNING: Mutex<()> = Mutex::new(());
+    SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Starts Chrome for the driver: the command it runs, and, once it has started, the process
 /// group it leads. The tool host's records the group for its supervisor before it lets Chrome
 /// run (`wrela tool --launch`).
@@ -440,6 +450,8 @@ impl Browser {
         let started = (|| {
             let log = std::fs::File::create(&log_path).map_err(|e| format!("Chrome's log: {e}"))?;
             let err = log.try_clone().map_err(|e| format!("Chrome's log: {e}"))?;
+            // The pipes are made and Chrome started while no other process starts.
+            let spawning = spawning();
             let (chrome_reads, to) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
             let (from, chrome_writes) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
             let mut c =
@@ -453,6 +465,7 @@ impl Browser {
             let mut child = c
                 .spawn()
                 .map_err(|e| format!("can't run Chrome ({}): {e}", launch.binary.display()))?;
+            drop(spawning);
             // Chrome's ends are its own now: ours close, so its exit ends the pipe.
             drop((chrome_reads, chrome_writes));
             let group = match spawner.started(&mut child) {

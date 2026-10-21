@@ -126,7 +126,7 @@ const LAUNCH_WAIT: Duration = Duration::from_secs(30);
 /// Linux, where the host adopts its descendants once it has started a browser
 /// (`PR_SET_CHILD_SUBREAPER`), it then reaps what of the group it adopted, waiting at most
 /// [`REAP`], so no zombie of a program's accumulates.
-fn kill_group(group: i32) {
+pub(crate) fn kill_group(group: i32) {
     if let Some(pid) = rustix::process::Pid::from_raw(group) {
         let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
         #[cfg(target_os = "linux")]
@@ -166,7 +166,7 @@ impl Drop for Files {
 
 /// Writes `group` to the supervisor's file of groups, if there is one: before the program can
 /// start anything, a supervisor that has to can kill it.
-fn record(s: &Services, group: i32) -> Result<(), String> {
+pub(crate) fn record(s: &Services, group: i32) -> Result<(), String> {
     let Some(path) = &s.groups else { return Ok(()) };
     let mut f = std::fs::OpenOptions::new()
         .create(true)
@@ -219,7 +219,12 @@ pub(crate) fn start_owned(
     go: &Path,
     program: &str,
 ) -> Result<(std::process::Child, i32), String> {
-    let mut child = command.spawn().map_err(|e| format!("can't run `{program}`: {e}"))?;
+    // While no pipe is being made: a pipe's ends kept by this program could hold up its owner.
+    let spawned = {
+        let _spawning = wrela_chrome::spawning();
+        command.spawn()
+    };
+    let mut child = spawned.map_err(|e| format!("can't run `{program}`: {e}"))?;
     let group = let_go(s, &mut child, go)?;
     Ok((child, group))
 }
@@ -395,4 +400,30 @@ pub(crate) fn run(s: &Services, request: u32, r: Run) -> Result<Vec<u8>, String>
         s.put_read(request, &mut out, &mut f, MOST_OUTPUT, &format!("`{}`'s {what}", r.program))?;
     }
     Ok(out)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A program starts only while no pipe is being made (`wrela_chrome::spawning`): one started
+    /// in the moment a pipe's ends aren't yet close-on-exec (macOS) would keep them open.
+    #[test]
+    fn a_program_waits_to_start_while_a_pipe_is_being_made() {
+        let s = super::super::services::for_test(super::super::BlobBudget::default());
+        let making = wrela_chrome::spawning();
+        let (started, seen) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let mut c = Command::new("true");
+                let go = std::env::temp_dir().join("wrela-spawning-go");
+                let (mut child, _) = start_owned(&s, &mut c, &go, "true").expect("started");
+                let _ = child.wait();
+                let _ = started.send(());
+            });
+            assert!(seen.recv_timeout(Duration::from_millis(300)).is_err(), "it waited");
+            drop(making);
+            assert!(seen.recv_timeout(Duration::from_secs(10)).is_ok(), "then it started");
+        });
+    }
 }

@@ -134,6 +134,17 @@ pub(crate) fn usage() -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // A driven build's process (`wrela tool --drive <parent>`), which the tool host starts: this
+    // toolchain's, whatever a workspace pins.
+    let mut args = std::env::args().skip(1);
+    if let (Some(tool), Some(drive), Some(parent), None) =
+        (args.next(), args.next(), args.next(), args.next())
+        && tool == "tool"
+        && drive == "--drive"
+        && let Ok(parent) = parent.parse()
+    {
+        wrela_host::tool::drive_child(parent);
+    }
     if let Some(status) = pin::redirect() {
         return status;
     }

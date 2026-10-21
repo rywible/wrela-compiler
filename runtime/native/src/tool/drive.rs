@@ -1,76 +1,70 @@
 //! `std::tool::drive` (language.md §15.5): a build loaded on the native host, beside the tool,
-//! and run as the tool says: `init`, frames and ticks with a `std::input::Script`, the screen
-//! captured, the state's hash, what it printed and timed, its other exports called. It's the
-//! native host's own `Host` (with a GPU) or `CpuHost`, not another.
+//! and run as the tool says, in steps: `init`, frames and ticks with a `std::input::Script`, its
+//! exports called and its voice rendered, the screen captured, the state's hash, its phases, its
+//! GPU buffers, the commands it recorded, and which build runs. It's the native host's own
+//! `Host` (with a GPU) or `CpuHost`, not another.
+//!
+//! **Each driven build has a process of its own** ([`child`]): this `wrela`, run again as
+//! `wrela tool --drive`. Its calls are never interrupted from inside: a deadline is the host's kill
+//! of the process's group, which stops every thread of the build at once, a join or a large
+//! answer half written too, which an interrupted call can't. The host opens the build's directory, its root and its
+//! storage through the grants, as before, and gives the process those directories, open; the
+//! process opens nothing by a path. Commands and answers cross a pair of pipes, in frames
+//! ([`wire`]). The process leads a process group of its own, which a supervisor's file of groups
+//! has before the process gets its first command; it ends at once when its commands end, so a
+//! host that dies, however it dies, leaves none behind.
 //!
 //! **A driven build is a resource of its request.** `load` makes it, and it's registered under
 //! the request before the answer that names it reaches the tool: until the tool reads that
 //! answer it's the request's, and if the request fails, or the tool ends first, the host closes
-//! it. The host closes every driven build when the tool ends.
+//! it. The host closes every driven build when the tool ends. `run` loads a build, runs its
+//! steps and closes it, in one request.
 //!
-//! **Each driven build has a thread of its own**, which owns its host and carries out its
-//! operations in order, one at a time (another while one runs fails: the build is busy). The
-//! worker that waits for an operation looks for its deadline (from when the host took the
-//! request) and the tool's end every few milliseconds.
+//! **One request at a time** runs on a build: another fails while one runs. The worker that
+//! waits for its answer looks for its deadline (from when the host took the request) and the
+//! tool's end every few milliseconds; past either, the host kills the build's process group, and
+//! the build can't be observed again. A build whose code trapped stays alive: what doesn't run
+//! code can still be observed.
 //!
-//! **Driven WASM can be stopped.** The build is compiled for an engine with epoch interruption,
-//! and every call into it, on any of its threads, has the operation's deadline: past it, or when
-//! the tool ends, the call traps within about 10 ms. A build whose call was stopped, or trapped,
-//! runs nothing more (its state is a call's middle); its screen, hash, lines and phases can
-//! still be read. A call that waits and so isn't stopped (a job's join on a job that never
-//! ends) makes the run the host's failure once the grace after the deadline has passed, as an
-//! HTTP client that won't return does.
+//! **Blobs are reserved before they're read.** Before the build's process reads a screen or a
+//! buffer back, or renders a voice, it asks the host to reserve the blob's bytes in the tool's
+//! budget, under the request: one that doesn't fit isn't read. The bytes then come in a frame
+//! the size of which the host checks against what it reserved before it reads them.
 //!
-//! **A voice renders offline** (`audio`): its quanta, the samples a browser's AudioWorklet
-//! renders, as `wrela-host` renders them, into a blob whose bytes are reserved in the budget
-//! before the first quantum runs, so a render that doesn't fit runs nothing.
-//!
-//! **A GPU build's buffers and a build's commands can be read** (`buffers`, `read_buffer`,
-//! `commands`): a buffer's size first, from the build's thread, so its blob and bytes are
-//! reserved before it's read back; and a recording build's commands, decoded, as many as an
-//! answer holds, the rest kept for the next `commands`.
-//!
-//! **A GPU build hands over to the builds beside it** (`std::reload`): each is opened through
-//! the grants by its root path, from the running build's (none outside the root), and compiled
-//! to be stopped as the first was. `running` says which runs. A load can name its storage, a
-//! write root's directory, which stays when the build closes.
-//!
-//! **No compiled code is kept or read**: each `load` compiles the build's WASM, which the host
-//! reads through the grants, as it reads the build's other files. The build's storage is a
-//! directory of the host's own, removed when the build closes.
+//! **Compiled code is shared.** The host compiles each build's WASM once in a run, for the
+//! engine the build's process runs on, by its SHA-256 ([`Codes`]), and keeps the code: every
+//! load of the build, and every hand-over to it, is given that code. Between runs, the code is
+//! kept in the host's code cache (`crate::code`), which no grant reaches.
 
-use super::caps::MOST_BYTES;
+mod child;
+mod wire;
+
+pub use child::run as run_child;
+
 use super::services::{Answer, Body, Data, Services, Task, Work};
 use super::toolchain::Out;
 use std::collections::HashMap;
+use std::fs::File;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
-use wrela_abi::input::Scripted;
+use wire::{Load, Step};
 
-/// An operation's deadline unless the request asks for another.
+/// A request's deadline unless it asks for another.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// How often the worker looks at the operation it waits for.
+/// How often the worker looks at the request it waits for.
 const POLL: Duration = Duration::from_millis(10);
 
-/// The most lines `logs` gives at once, and the most bytes of them: the rest wait for the next
-/// `logs`. A line longer than an answer holds is cut, with a note.
-const MOST_LINES: usize = 4096;
+/// The most bytes of a build's WASM its process sends for the host to compile.
+const MOST_WASM: usize = 512 << 20;
 
-/// The most commands `commands` gives at once, and the most bytes of their labels: the rest
-/// wait for the next `commands`.
-const MOST_COMMANDS: usize = 65536;
-
-/// The most buffers `buffers` names: past it, the answer would be cut, so it fails.
-const MOST_BUFFERS: usize = 65536;
-
-/// The most frames or ticks one request runs.
-const MOST_STEPS: u32 = 1 << 20;
-
-/// The bytes of one quantum of a voice's samples: its channels' samples, `f32`s.
-const QUANTUM_BYTES: u64 = wrela_abi::AUDIO_QUANTUM as u64 * wrela_abi::AUDIO_CHANNELS as u64 * 4;
+/// Where a build's code came from, as `drive::Code` numbers it: compiled for this load, read
+/// from the code cache, or compiled earlier in the run.
+const COMPILED: u8 = 0;
+const CACHED: u8 = 1;
+const REUSED: u8 = 2;
 
 /// The driven builds of one run: each by its handle, and each request's that the tool hasn't
 /// been told of.
@@ -99,821 +93,303 @@ impl Drives {
         self.held.drain().map(|(_, d)| d).collect()
     }
 
-    /// Stops every running call of every build: the tool has ended.
+    /// Kills every build's process group: the tool has ended.
     pub(crate) fn stop_all(&self) {
         for d in self.held.values() {
-            d.stop.stop();
+            d.stop("the tool ended");
         }
     }
 }
 
-/// What a driven build's thread is sent: an operation, and where its reply goes.
-type Sent = (Command, mpsc::Sender<Result<Reply, String>>);
+/// The request a build's process works for: its number, and the blobs reserved for it, each
+/// with its bytes reserved and whether they've come.
+struct Current {
+    request: u32,
+    reserved: HashMap<u32, (u64, bool)>,
+}
 
-/// A driven build: what sends its thread operations, what stops its calls, whether an operation
-/// is running, its thread, and its screen's size.
+/// A driven build: its process, the process group it leads, the pipe its commands go down, the
+/// answers its reader thread passes on, the request it works for, whether a request runs,
+/// why it can't be observed (it was stopped, or its process ended), where its code came from,
+/// and the storage directory the host made for it (removed with it).
 pub(crate) struct Driven {
-    commands: Mutex<Option<mpsc::Sender<Sent>>>,
-    stop: crate::Stop,
+    process: Lifecycle<Spawned>,
+    to: Mutex<File>,
+    answers: Mutex<mpsc::Receiver<Result<Vec<u8>, String>>>,
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    current: Mutex<Option<Current>>,
     busy: AtomicBool,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-    size: (u32, u32),
+    stopped: Mutex<Option<String>>,
+    code: Mutex<Option<u8>>,
+    storage: Option<PathBuf>,
+}
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Driven {
-    /// Closes it: its thread is told to end, and its host goes with it. Whether the thread
-    /// ended within `grace` (if not, it's left, and the run isn't clean).
-    pub(crate) fn close(&self, grace: Duration) -> bool {
-        self.stop.stop();
-        self.commands.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        let Some(thread) =
-            self.thread.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take()
-        else {
-            return true;
-        };
+    /// Kills its process group, saying `why` it can't be observed now (the first reason
+    /// stays): unless it's reaped already.
+    fn stop(&self, why: &str) {
+        locked(&self.stopped).get_or_insert_with(|| why.to_string());
+        self.process.signal();
+    }
+
+    /// Kills its process group, saying `why`, and reaps its process: whether it was reaped
+    /// within `grace`.
+    fn kill(&self, why: &str, grace: Duration) -> bool {
+        locked(&self.stopped).get_or_insert_with(|| why.to_string());
+        self.process.reap(grace)
+    }
+
+    /// Closes it: its process group is killed and its process reaped, and its storage goes if
+    /// the host made it. Its reader, which ends with the process's pipe, is joined if it has
+    /// ended; one still at work (compiling the build's code, say) is put with `strays`, which
+    /// the run's end waits for within its grace. Whether its process was reaped within `grace`
+    /// (if not, it's left, and the run isn't clean).
+    pub(crate) fn close(
+        &self,
+        grace: Duration,
+        strays: &Mutex<Vec<std::thread::JoinHandle<()>>>,
+    ) -> bool {
+        let reaped = self.kill("it was closed", grace);
+        if let Some(reader) = locked(&self.reader).take() {
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                locked(strays).push(reader);
+            }
+        }
+        if let Some(dir) = &self.storage {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        reaped
+    }
+
+    /// Why it can't be observed, if it can't.
+    fn unobservable(&self, handle: u32) -> Result<(), String> {
+        match locked(&self.stopped).as_ref() {
+            Some(why) => Err(format!("the driven build {handle} can't be observed: {why}")),
+            None => Ok(()),
+        }
+    }
+
+    /// A reply to its process's ask `id`.
+    fn reply(&self, id: u32, status: u8, bytes: &[u8]) -> std::io::Result<()> {
+        wire::write_frame(
+            &mut *locked(&self.to),
+            wire::REPLY,
+            &[&id.to_le_bytes(), &[status], bytes],
+        )
+    }
+}
+
+/// What the host does to a driven build's process: kill its process group, a signal alone
+/// (nothing is reaped), and reap it.
+trait Process: Send {
+    fn signal(&mut self);
+    /// Whether it has ended, reaped now if it has.
+    fn reaped(&mut self) -> bool;
+}
+
+/// A driven build's process, which leads its process group.
+struct Spawned {
+    child: std::process::Child,
+    group: i32,
+}
+
+impl Process for Spawned {
+    fn signal(&mut self) {
+        if let Some(pid) = rustix::process::Pid::from_raw(self.group) {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+    }
+
+    fn reaped(&mut self) -> bool {
+        // An error is a process reaped elsewhere: gone too.
+        !matches!(self.child.try_wait(), Ok(None))
+    }
+}
+
+/// A process the host signals and reaps under one lock, reaped only through what owns it: once
+/// it's reaped, its group's number may be another's, so it's never signalled after.
+struct Lifecycle<P> {
+    process: Mutex<Option<P>>,
+}
+
+impl<P: Process> Lifecycle<P> {
+    fn new(p: P) -> Lifecycle<P> {
+        Lifecycle { process: Mutex::new(Some(p)) }
+    }
+
+    /// Kills its group, unless it's reaped.
+    fn signal(&self) {
+        if let Some(p) = locked(&self.process).as_mut() {
+            p.signal();
+        }
+    }
+
+    /// Kills its group and reaps it: whether it was reaped within `grace`.
+    fn reap(&self, grace: Duration) -> bool {
         let since = Instant::now();
-        while !thread.is_finished() {
+        let mut signalled = false;
+        loop {
+            {
+                let mut held = locked(&self.process);
+                let Some(p) = held.as_mut() else { return true };
+                if !signalled {
+                    p.signal();
+                    signalled = true;
+                }
+                if p.reaped() {
+                    *held = None;
+                    return true;
+                }
+            }
             if since.elapsed() >= grace {
                 return false;
             }
             std::thread::sleep(POLL);
         }
-        let _ = thread.join();
-        true
     }
 }
 
-/// How a build is loaded: with a GPU or on the CPU alone, its screen's size, its frames' rate,
-/// how many threads run its parallel jobs (0: one per core), how its GPU work is timed, and how
-/// long each helper holds a job's result back (microseconds: a test's slow jobs), whether it
-/// records the commands it submits (`commands`), and where its storage is (a write root's
-/// directory, kept; empty: a directory of the host's, removed with the build).
-#[derive(Clone, Debug)]
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-struct Load {
-    path: String,
-    gpu: bool,
-    width: u32,
-    height: u32,
-    fps: f64,
-    workers: u32,
-    timing: crate::Timing,
-    hold: u32,
-    record: bool,
-    storage: String,
-}
+/// A build's code, once it's compiled (or why it wasn't): what a load waits for while another
+/// load of the build compiles it.
+type Compiling = OnceLock<Result<Arc<Vec<u8>>, String>>;
 
-/// An operation of a driven build's.
-enum Command {
-    Init,
-    Frames(u32, Vec<Scripted>),
-    /// One frame at a time the tool gives, outside lockstep (`Host::run_frames`'s frame).
-    FrameAt(f32),
-    Ticks(u32, Vec<Scripted>),
-    Capture,
-    /// The GPU buffers the program holds, oldest first.
-    Buffers,
-    /// A GPU buffer's size, then its bytes: the size first, so they're reserved before they're
-    /// read back.
-    BufferSize(u32),
-    ReadBuffer(u32),
-    /// The commands it recorded since the last time.
-    Commands,
-    /// The root path of the build that runs: after a hand-over, the one handed over to.
-    Running,
-    Hash,
-    Logs,
-    Phases,
-    Call(String, Vec<crate::Value>),
-    /// The voice's next quanta, and whether each is timed.
-    Audio(u32, bool),
-    Posts,
-    Answer(u32, Result<Data, String>),
-}
-
-impl Command {
-    fn name(&self) -> &'static str {
-        match self {
-            Command::Init => "init",
-            Command::Frames(..) => "frames",
-            Command::FrameAt(..) => "frame_at",
-            Command::Ticks(..) => "ticks",
-            Command::Capture => "capture",
-            Command::Buffers => "buffers",
-            Command::BufferSize(..) | Command::ReadBuffer(..) => "read_buffer",
-            Command::Commands => "commands",
-            Command::Running => "running",
-            Command::Hash => "hash",
-            Command::Logs => "logs",
-            Command::Phases => "phases",
-            Command::Call(..) => "call",
-            Command::Audio(..) => "audio",
-            Command::Posts => "posts",
-            Command::Answer(..) => "answer",
-        }
-    }
-}
-
-/// What an operation gives.
-#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
-enum Reply {
-    Loaded(f64),
-    Ran(Ran),
-    Screen(u32, u32, Vec<u8>),
-    Buffers(Vec<u32>),
-    Size(u64),
-    Bytes(Vec<u8>),
-    /// The commands, and how many wait for the next.
-    Commands(Vec<Recorded>, usize),
-    Text(String),
-    Hash(u64),
-    Logs(Vec<String>, usize),
-    Phases(Vec<crate::Phase>),
-    Posts(Vec<crate::QueuedPost>),
-    /// A voice's samples (`f32`s, little-endian, the channels interleaved) and, if asked, each
-    /// quantum's seconds (`f64`s).
-    Audio(Vec<u8>, Vec<u8>),
-    Answered,
-}
-
-/// What running gave: when it started (seconds since the build loaded) and how long it took,
-/// each frame's or tick's start and end, an export's results, and its trap, if it trapped.
+/// What the run's builds' code is: each build's, by its WASM's SHA-256, compiled at most once,
+/// and the code cache, if the run has one.
 #[derive(Default)]
-struct Ran {
-    started: f64,
-    elapsed: f64,
-    steps: Vec<(f64, f64)>,
-    results: Vec<crate::Value>,
-    trap: Option<Trap>,
+pub(crate) struct Codes {
+    kept: Mutex<HashMap<[u8; 32], Arc<Compiling>>>,
+    cache: Option<crate::code::Cache>,
 }
 
-/// A trap: the host's message, the panic's, where in the source, and in what: `init` (0), a
-/// frame (1), a tick (2) or a call (3), with the frame's or tick's number.
-struct Trap {
-    message: String,
-    panic: String,
-    at: String,
-    step: u8,
-    number: u32,
-}
-
-/// A driven build's host, on its thread.
-enum Hosted {
-    Cpu(crate::CpuHost),
-    #[cfg(feature = "gpu")]
-    Gpu(Box<crate::Host>),
-}
-
-/// A driven build's thread's state.
-struct Actor {
-    host: Hosted,
-    load: Load,
-    origin: Instant,
-    inited: bool,
-    next_frame: u32,
-    /// Why it runs nothing more: it trapped, or a call was stopped.
-    ended: Option<String>,
-    /// The posts the program made that the tool hasn't been given yet.
-    posts: std::collections::VecDeque<crate::QueuedPost>,
-    /// The lines the program printed that the tool hasn't been given yet.
-    lines: std::collections::VecDeque<String>,
-    /// The commands it recorded that the tool hasn't been given yet.
-    recorded: std::collections::VecDeque<Recorded>,
-    /// Its pipelines' names, by index (the manifest's).
-    pipelines: Vec<String>,
-}
-
-/// A command a build recorded, as `commands` gives it: its opcode's name; a label's name; the
-/// name of the pipeline a dispatch or draw uses; a dispatch's workgroups; the buffers it binds
-/// (each one's handle, offset and size; 0 for the whole); what a host-facing command names (a
-/// storage path, a fetch's or a post's URL, a host request's service, a build's path); and the
-/// bytes a storage write, a post or a host request carries.
-#[derive(Default)]
-struct Recorded {
-    kind: &'static str,
-    label: String,
-    pipeline: String,
-    groups: [u32; 3],
-    bindings: Vec<[u32; 3]>,
-    target: String,
-    bytes: Vec<u8>,
-}
-
-impl Recorded {
-    /// `c`, its pipeline named from `pipelines`.
-    fn of(c: &wrela_abi::stream::Command, pipelines: &[String]) -> Recorded {
-        use wrela_abi::stream::Command as C;
-        let named = |p: u32| pipelines.get(p as usize).cloned().unwrap_or_default();
-        let bound = |b: &[wrela_abi::stream::Binding]| -> Vec<[u32; 3]> {
-            b.iter().map(|b| [b.handle, b.offset, b.size]).collect()
-        };
-        let mut r = Recorded { kind: c.opcode().name(), ..Recorded::default() };
-        match c {
-            C::Label { name } => r.label = bounded(name),
-            C::Dispatch { pipeline, groups, bindings, .. } => {
-                (r.pipeline, r.groups, r.bindings) = (named(*pipeline), *groups, bound(bindings));
-            }
-            C::StorageRead { path, .. }
-            | C::Fetch { url: path, .. }
-            | C::Prepare { path, .. }
-            | C::Unprepare { path }
-            | C::HandOver { path, .. } => r.target = bounded(path),
-            C::StorageWrite { path, data: bytes, .. }
-            | C::Post { url: path, body: bytes, .. }
-            | C::HostRequest { service: path, body: bytes, .. } => {
-                (r.target, r.bytes) = (bounded(path), bytes.to_vec());
-            }
-            C::Draw { pipeline, bindings, .. }
-            | C::DispatchIndirect { pipeline, bindings, .. }
-            | C::DrawIndirect { pipeline, bindings, .. }
-            | C::DrawIndexedIndirect { pipeline, bindings, .. } => {
-                (r.pipeline, r.bindings) = (named(*pipeline), bound(bindings));
-            }
-            _ => {}
-        }
-        r
+impl Codes {
+    /// The run's code, kept in `cache` from one run to the next if it's given.
+    pub(crate) fn new(cache: Option<crate::code::Cache>) -> Codes {
+        Codes { kept: Mutex::default(), cache }
     }
 
-    /// Its bytes in an answer.
-    fn size(&self) -> usize {
-        self.kind.len()
-            + self.label.len()
-            + self.pipeline.len()
-            + self.target.len()
-            + self.bytes.len()
-            + 36
-            + 12 * self.bindings.len()
+    /// The code of the WASM whose SHA-256 is `sha`, if the run has it or the cache does, and
+    /// where it came from.
+    fn known(&self, sha: &[u8; 32]) -> Option<(Arc<Vec<u8>>, u8)> {
+        let cell = locked(&self.kept).get(sha).cloned();
+        if let Some(Ok(code)) = cell.as_ref().and_then(|c| c.get()) {
+            return Some((code.clone(), REUSED));
+        }
+        if cell.is_some() {
+            // Being compiled, or failed: the WASM comes, and waits for that compile.
+            return None;
+        }
+        let engine = crate::program::driven_engine();
+        let bytes = Arc::new(self.cache.as_ref()?.get(engine, sha)?);
+        let cell = locked(&self.kept).entry(*sha).or_default().clone();
+        let _ = cell.set(Ok(bytes.clone()));
+        Some((bytes, CACHED))
+    }
+
+    /// The code of `wasm`, compiled now unless the run has compiled it (or another load is
+    /// compiling it, which this waits for), and where it came from.
+    fn compile(&self, wasm: &[u8]) -> Result<(Arc<Vec<u8>>, u8), String> {
+        let sha = crate::code::sha256(wasm);
+        let cell = locked(&self.kept).entry(sha).or_default().clone();
+        let mut from = REUSED;
+        let code = cell.get_or_init(|| {
+            from = COMPILED;
+            let engine = crate::program::driven_engine();
+            let bytes = crate::code::compile(engine, wasm)?;
+            if let Some(cache) = &self.cache {
+                cache.put(engine, &sha, &bytes);
+            }
+            Ok(Arc::new(bytes))
+        });
+        code.clone().map(|c| (c, from))
     }
 }
 
-impl Actor {
-    fn failure(&self) -> Option<crate::Failure> {
-        match &self.host {
-            Hosted::Cpu(h) => h.last_failure().cloned(),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(h) => h.last_failure().cloned(),
-        }
-    }
-
-    /// A trap of `e` in `step` number `number`, or in the tick the host says it happened in:
-    /// a lockstep frame runs ticks too, and the ticker numbers them, not this.
-    fn trap(&mut self, e: &crate::Error, step: u8, number: u32) -> Trap {
-        let failure = self.failure();
-        let message = e.to_string();
-        self.ended = Some(format!("it trapped: {message}"));
-        let (step, number) = match failure.as_ref().and_then(|f| f.tick) {
-            Some(k) => (2, k),
-            None => (step, number),
-        };
-        Trap {
-            message,
-            panic: failure.as_ref().and_then(|f| f.panic.clone()).unwrap_or_default(),
-            at: failure.and_then(|f| f.at).unwrap_or_default(),
-            step,
-            number,
-        }
-    }
-
-    /// A GPU buffer's operation: the buffers it holds, one's size, or one's bytes.
-    #[cfg(feature = "gpu")]
-    fn buffer_op(&mut self, c: Command) -> Result<Reply, String> {
-        let Hosted::Gpu(host) = &mut self.host else {
-            return Err("a build loaded without the GPU holds no GPU buffers".into());
-        };
-        match c {
-            Command::Buffers => {
-                let held = host.buffers();
-                if held.len() > MOST_BUFFERS {
-                    return Err(format!(
-                        "the build holds {} buffers, more than an answer names ({MOST_BUFFERS})",
-                        held.len()
-                    ));
-                }
-                Ok(Reply::Buffers(held))
-            }
-            Command::BufferSize(h) => {
-                host.buffer_size(h).map(Reply::Size).map_err(|e| e.to_string())
-            }
-            Command::ReadBuffer(h) => {
-                host.read_buffer(h).map(Reply::Bytes).map_err(|e| e.to_string())
-            }
-            _ => Err("not a buffer's operation".into()),
-        }
-    }
-
-    #[cfg(not(feature = "gpu"))]
-    fn buffer_op(&mut self, _: Command) -> Result<Reply, String> {
-        Err("a build loaded without the GPU holds no GPU buffers".into())
-    }
-
-    /// Its host, if it's a CPU host.
-    fn cpu(&mut self) -> Option<&mut crate::CpuHost> {
-        match &mut self.host {
-            Hosted::Cpu(host) => Some(host),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(_) => None,
-        }
-    }
-
-    fn since(&self) -> f64 {
-        self.origin.elapsed().as_secs_f64()
-    }
-
-    fn carry_out(&mut self, command: Command) -> Result<Reply, String> {
-        let running = matches!(
-            command,
-            Command::Init
-                | Command::Frames(..)
-                | Command::FrameAt(..)
-                | Command::Ticks(..)
-                | Command::Call(..)
-                | Command::Audio(..)
-        );
-        if running {
-            if let Some(why) = &self.ended {
-                return Err(format!("the build runs nothing more: {why}"));
-            }
-            let first = matches!(command, Command::Init);
-            if first == self.inited {
-                return Err(if first {
-                    "`init` has run already".into()
-                } else {
-                    format!("`{}` runs after `init`", command.name())
-                });
-            }
-        }
-        let mut ran = Ran { started: self.since(), ..Ran::default() };
-        let (w, h, fps) = (self.load.width, self.load.height, self.load.fps);
-        match command {
-            Command::Init => {
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.init(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.init(),
-                };
-                self.inited = true;
-                if let Err(e) = done {
-                    ran.trap = Some(self.trap(&e, 0, 0));
-                }
-            }
-            Command::Frames(n, script) => {
-                for _ in 0..n {
-                    let i = self.next_frame;
-                    let start = self.since();
-                    let done = match &mut self.host {
-                        Hosted::Cpu(host) => host.lockstep_frame(i, fps, w, h, &script),
-                        #[cfg(feature = "gpu")]
-                        Hosted::Gpu(host) => host.lockstep_frame(i, fps, w, h, &script),
-                    };
-                    self.next_frame += 1;
-                    if let Err(e) = done {
-                        ran.trap = Some(self.trap(&e, 1, i));
-                        break;
-                    }
-                    ran.steps.push((start, self.since()));
-                }
-            }
-            Command::FrameAt(time) => {
-                let i = self.next_frame;
-                let start = self.since();
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.frame(time, w, h),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.frame(time, w, h),
-                };
-                self.next_frame += 1;
-                match done {
-                    Ok(()) => ran.steps.push((start, self.since())),
-                    Err(e) => ran.trap = Some(self.trap(&e, 1, i)),
-                }
-            }
-            Command::Ticks(n, script) => {
-                if self.cpu().is_none() {
-                    return Err("ticks alone run on a build loaded without the GPU".into());
-                }
-                for _ in 0..n {
-                    let start = self.since();
-                    let done = self.cpu().map_or(Ok(()), |host| host.scripted_tick(&script));
-                    match done {
-                        Ok(()) => {}
-                        // No ticker, say: not a trap.
-                        Err(crate::Error::Program(why)) => return Err(why),
-                        Err(e) => {
-                            // A tick's trap: the host numbers it.
-                            ran.trap = Some(self.trap(&e, 2, 0));
-                            break;
-                        }
-                    }
-                    ran.steps.push((start, self.since()));
-                }
-            }
-            Command::Call(export, args) => {
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.call_export(&export, &args),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.call_export(&export, &args),
-                };
-                match done {
-                    Ok(values) => ran.results = values,
-                    // An export that isn't there, or arguments of the wrong types, isn't a trap.
-                    Err(crate::Error::Program(why)) => return Err(why),
-                    Err(e) => ran.trap = Some(self.trap(&e, 3, 0)),
-                }
-            }
-            Command::Audio(quanta, timed) => return self.audio(quanta, timed),
-            Command::Capture => {
-                return match &mut self.host {
-                    Hosted::Cpu(_) => Err("a build loaded without the GPU has no screen".into()),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => {
-                        let rgba = host.read_screen().map_err(|e| e.to_string())?;
-                        Ok(Reply::Screen(w, h, rgba))
-                    }
-                };
-            }
-            c @ (Command::Buffers | Command::BufferSize(_) | Command::ReadBuffer(_)) => {
-                return self.buffer_op(c);
-            }
-            Command::Running => {
-                return Ok(Reply::Text(match &self.host {
-                    Hosted::Cpu(_) => self.load.path.clone(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.driven_at().unwrap_or(&self.load.path).to_string(),
-                }));
-            }
-            Command::Commands => {
-                if !self.load.record {
-                    return Err("the build wasn't loaded to record its commands (`record`)".into());
-                }
-                let batches = match &mut self.host {
-                    Hosted::Cpu(host) => host.take_batches(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => {
-                        // The build that runs names the pipelines: after a hand-over, another.
-                        self.pipelines = host.pipeline_names();
-                        host.take_batches()
-                    }
-                };
-                for batch in &batches {
-                    let commands = wrela_abi::stream::decode(batch)
-                        .map_err(|e| format!("a recorded batch doesn't decode: {e}"))?;
-                    // A batch begins with a mark of its own: a label counts to its batch's end.
-                    self.recorded.push_back(Recorded { kind: "Batch", ..Recorded::default() });
-                    for c in &commands {
-                        self.recorded.push_back(Recorded::of(c, &self.pipelines));
-                    }
-                }
-                // As many as an answer holds, the oldest first; the rest wait for the next.
-                let mut given = Vec::new();
-                let mut bytes = 0;
-                // A command no answer holds is dropped, and this answer fails, saying so: an
-                // observation is whole or isn't given.
-                if let Some(r) = self.recorded.front()
-                    && r.size() > MOST_BYTES
-                {
-                    let why = format!(
-                        "a recorded `{}` of {} bytes is more than an answer holds, so it's dropped",
-                        r.kind,
-                        r.size()
-                    );
-                    self.recorded.pop_front();
-                    return Err(why);
-                }
-                while let Some(r) = self.recorded.front() {
-                    let size = r.size();
-                    if given.len() == MOST_COMMANDS
-                        || (!given.is_empty() && bytes + size > MOST_BYTES)
-                    {
-                        break;
-                    }
-                    bytes += size;
-                    given.extend(self.recorded.pop_front());
-                }
-                return Ok(Reply::Commands(given, self.recorded.len()));
-            }
-            Command::Hash => {
-                return Ok(Reply::Hash(match &mut self.host {
-                    Hosted::Cpu(host) => host.hash(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.hash(),
-                }));
-            }
-            Command::Logs => {
-                let printed = match &mut self.host {
-                    Hosted::Cpu(host) => host.take_logs(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.take_logs(),
-                };
-                self.lines.extend(printed);
-                // As many as an answer holds, the oldest first; the rest wait for the next.
-                let mut given = Vec::new();
-                let mut bytes = 0;
-                while let Some(l) = self.lines.front() {
-                    let size = l.len().min(MOST_BYTES / 2) + 4;
-                    if given.len() == MOST_LINES || (!given.is_empty() && bytes + size > MOST_BYTES)
-                    {
-                        break;
-                    }
-                    bytes += size;
-                    given.extend(self.lines.pop_front());
-                }
-                return Ok(Reply::Logs(given, self.lines.len()));
-            }
-            Command::Posts => {
-                let made = match &mut self.host {
-                    Hosted::Cpu(host) => host.take_posts(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.take_posts(),
-                };
-                self.posts.extend(made);
-                // As many as an answer holds, the oldest first; the rest wait for the next.
-                let mut given = Vec::new();
-                let mut bytes = 0;
-                while let Some(p) = self.posts.front() {
-                    let size = p.body.len() + p.url.len() + 16;
-                    if !given.is_empty() && bytes + size > MOST_BYTES {
-                        break;
-                    }
-                    bytes += size;
-                    given.extend(self.posts.pop_front());
-                }
-                return Ok(Reply::Posts(given));
-            }
-            Command::Answer(request, data) => {
-                let answer = match data {
-                    Ok(Data::Bytes(bytes)) => Ok(bytes),
-                    Ok(Data::Blob(_)) => {
-                        return Err("an answer's blob is read before it's sent".into());
-                    }
-                    Err(why) => Err(why),
-                };
-                match &mut self.host {
-                    Hosted::Cpu(host) => host.answer_post(request, answer),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.answer_post(request, answer),
-                }?;
-                return Ok(Reply::Answered);
-            }
-            Command::Phases => {
-                let trace = match &mut self.host {
-                    Hosted::Cpu(host) => host.trace(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.trace(),
-                };
-                return Ok(Reply::Phases(trace.phases()));
-            }
-        }
-        ran.elapsed = self.since() - ran.started;
-        Ok(Reply::Ran(ran))
-    }
-}
-
-impl Actor {
-    /// The voice's next `quanta` quanta, rendered offline as `CpuHost::render_audio` renders
-    /// them: all at once, or one at a time and each timed. A trap ends the build, as a call's
-    /// does, and fails the request.
-    fn audio(&mut self, quanta: u32, timed: bool) -> Result<Reply, String> {
-        let mut samples = Vec::with_capacity((u64::from(quanta) * QUANTUM_BYTES) as usize);
-        let mut times = Vec::new();
-        let mut render = |n: u32| match &mut self.host {
-            Hosted::Cpu(host) => host.render_audio(n),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(host) => host.render_audio(n),
-        };
-        let mut done = Ok(());
-        if timed {
-            times.reserve(8 * quanta as usize);
-            for _ in 0..quanta {
-                let started = Instant::now();
-                match render(1) {
-                    Ok(s) => {
-                        times.extend_from_slice(&started.elapsed().as_secs_f64().to_le_bytes());
-                        samples.extend(s.iter().flat_map(|x| x.to_le_bytes()));
-                    }
-                    Err(e) => {
-                        done = Err(e);
-                        break;
-                    }
-                }
-            }
-        } else {
-            match render(quanta) {
-                Ok(s) => samples.extend(s.iter().flat_map(|x| x.to_le_bytes())),
-                Err(e) => done = Err(e),
-            }
-        }
-        match done {
-            Ok(()) => Ok(Reply::Audio(samples, times)),
-            // No voice, say: not a trap.
-            Err(crate::Error::Program(why)) => Err(why),
-            Err(e) => {
-                let message = e.to_string();
-                self.ended = Some(format!("its voice trapped: {message}"));
-                Err(message)
-            }
-        }
-    }
-}
-
-/// The host for `load`, made on the build's own thread: its directory opened through the grants
-/// once, now, and its files and its program's fetches read through that handle alone.
-fn start(
-    s: &Arc<Services>,
-    load: &Load,
-    stop: crate::Stop,
-    storage: PathBuf,
-) -> Result<(Hosted, Vec<String>), String> {
-    let (dir, handle) = s.caps.open_dir(&load.path)?;
-    if load.gpu {
-        #[cfg(feature = "gpu")]
-        {
-            let options = crate::Options {
-                timing: load.timing,
-                storage: Some(storage),
-                workers: load.workers,
-                quiet: true,
-                defer_init: true,
-                record: load.record,
-                ..crate::Options::default()
-            };
-            // It hands over to the builds it names beside it, each opened through the grants,
-            // as its own directory was: the tool's services held weakly, so the host doesn't
-            // keep them past the tool's end.
-            let weak = Arc::downgrade(s);
-            let beside = crate::Beside {
-                at: load.path.clone(),
-                open: Arc::new(move |root: &str| match weak.upgrade() {
-                    Some(services) => services.caps.open_dir(root),
-                    None => Err("the tool has ended".into()),
-                }),
-                stop: stop.clone(),
-            };
-            let mut host = crate::Host::load_driven(handle, &dir, stop, &options, Some(beside))
-                .map_err(|e| e.to_string())?;
-            // Only if asked: the word is the jobs' protocol's, which a program without jobs may
-            // keep other bytes in.
-            if load.hold > 0 {
-                host.hold_jobs(load.hold);
-            }
-            let names = host.pipeline_names();
-            return Ok((Hosted::Gpu(Box::new(host)), names));
-        }
-        #[cfg(not(feature = "gpu"))]
-        return Err("this tool host was built without the GPU".into());
-    }
-    let mut build = crate::CpuBuild::load_driven(handle, &dir, stop).map_err(|e| e.to_string())?;
-    if load.record {
-        build = build.recording();
-    }
-    let names = build.pipeline_names();
-    let host = build.instantiate_in(load.workers, Some(&storage)).map_err(|e| e.to_string())?;
-    if load.hold > 0 {
-        host.hold_jobs(load.hold);
-    }
-    Ok((Hosted::Cpu(host), names))
-}
-
-/// A request's deadline: the `f64` of seconds at its end (0: [`DEADLINE`]).
+/// A request's deadline: the `f64` of seconds next in `b` (0: [`DEADLINE`]).
 fn deadline(b: &mut Body) -> Result<Duration, String> {
-    let d = super::http::deadline(f64::from_bits(b.u64()?), DEADLINE)?;
-    b.end()?;
-    Ok(d)
+    super::http::deadline(f64::from_bits(b.u64()?), DEADLINE)
 }
 
 fn failed(why: String) -> Work {
     Work::Now(Answer::Bytes([&[1u8][..], why.as_bytes()].concat()))
 }
 
-/// A script as `std::input::Script::as_json` writes it, or none for empty text.
-fn script(text: &str) -> Result<Vec<Scripted>, String> {
-    if text.is_empty() {
-        return Ok(Vec::new());
-    }
-    crate::parse_script(text).map_err(|e| format!("the script: {e}"))
+/// A load's request, read: how to load it, its storage, its deadline.
+fn load_request(b: &mut Body) -> Result<(Load, String, Duration), String> {
+    let load = Load::parse(b)?;
+    let storage = b.str()?;
+    Ok((load, storage, deadline(b)?))
 }
 
 /// How request `name` of the drive service, with `b`, is carried out.
 pub(crate) fn route(name: &str, b: &mut Body) -> Work {
-    let entered = Instant::now();
-    if name == "load" {
-        let parsed = (|| {
-            let path = b.str()?;
-            let gpu = b.u8()? != 0;
-            let (width, height) = (b.u32()?, b.u32()?);
-            let fps = f64::from_bits(b.u64()?);
-            let workers = b.u32()?;
-            let timing = match b.u8()? {
-                0 => crate::Timing::Off,
-                1 => crate::Timing::Span,
-                2 => crate::Timing::Serial,
-                k => return Err(format!("{k} isn't a timing mode")),
-            };
-            let hold = b.u32()?;
-            let record = b.u8()? != 0;
-            let storage = b.str()?;
-            if !(fps.is_finite() && fps > 0.0) {
-                return Err(format!("frames' rate is more than 0, not {fps}"));
-            }
-            if width == 0 || height == 0 || width > 16384 || height > 16384 {
-                return Err(format!("a screen of {width}×{height} isn't 1 to 16384 each way"));
-            }
-            if workers > wrela_abi::memory::MAX_WORKERS + 1 {
-                return Err(format!("at most {} workers", wrela_abi::memory::MAX_WORKERS + 1));
-            }
-            let load =
-                Load { path, gpu, width, height, fps, workers, timing, hold, record, storage };
-            Ok((load, deadline(b)?))
-        })();
-        return match parsed {
-            Ok((load, deadline)) => {
-                let task: Task =
-                    Box::new(move |s, request| loaded(s, request, load, entered + deadline));
-                Work::Drive(task)
-            }
-            Err(why) => failed(why),
-        };
-    }
-    let parsed = (|| {
-        let handle = b.u32()?;
-        let command = match name {
-            "init" => Command::Init,
-            "frames" | "ticks" => {
-                let n = b.u32()?;
-                if n > MOST_STEPS {
-                    return Err(format!("at most {MOST_STEPS} at once"));
-                }
-                let s = script(&b.str()?)?;
-                if name == "frames" { Command::Frames(n, s) } else { Command::Ticks(n, s) }
-            }
-            "frame_at" => {
-                let time = f32::from_bits(b.u32()?);
-                if !time.is_finite() {
-                    return Err(format!("a frame's time is finite, not {time}"));
-                }
-                Command::FrameAt(time)
-            }
-            "capture" => Command::Capture,
-            "buffers" => Command::Buffers,
-            "read_buffer" => Command::ReadBuffer(b.u32()?),
-            "commands" => Command::Commands,
-            "running" => Command::Running,
-            "hash" => Command::Hash,
-            "logs" => Command::Logs,
-            "phases" => Command::Phases,
-            "posts" => Command::Posts,
-            "audio" => {
-                let quanta = b.u32()?;
-                let timed = b.u8()? != 0;
-                Command::Audio(quanta, timed)
-            }
-            "answer" => {
-                let post = b.u32()?;
-                Command::Answer(post, Ok(b.data()?))
-            }
-            "fail" => {
-                let post = b.u32()?;
-                Command::Answer(post, Err(b.str()?))
-            }
-            "call" => {
-                let export = b.str()?;
-                let n = b.u32()?;
-                if n > 64 {
-                    return Err("an export takes at most 64 arguments".into());
-                }
-                let mut args = Vec::new();
-                for _ in 0..n {
-                    let (kind, bits) = (b.u8()?, b.u64()?);
-                    args.push(match kind {
-                        0 => crate::Value::I32(bits as u32 as i32),
-                        1 => crate::Value::I64(bits as i64),
-                        2 => crate::Value::F32(f32::from_bits(bits as u32)),
-                        3 => crate::Value::F64(f64::from_bits(bits)),
-                        k => return Err(format!("{k} isn't a scalar's kind")),
-                    });
-                }
-                Command::Call(export, args)
-            }
-            "close" => {
-                b.end()?;
-                return Ok((handle, None, Duration::ZERO));
-            }
-            _ => return Err(format!("the drive service has no `{name}`")),
-        };
-        Ok((handle, Some(command), deadline(b)?))
-    })();
-    match parsed {
-        Ok((handle, None, _)) => {
-            let task: Task = Box::new(move |s, _| closed(s, handle));
-            Work::Drive(task)
-        }
-        Ok((handle, Some(command), deadline)) => {
-            let task: Task = Box::new(move |s, request| {
-                operate(s, request, handle, command, entered + deadline, deadline)
-            });
-            Work::Drive(task)
-        }
+    match task(name, b, Instant::now()) {
+        Ok(task) => Work::Drive(task),
         Err(why) => failed(why),
     }
+}
+
+/// The work of request `name`, with `b`, which the host took at `entered`.
+fn task(name: &str, b: &mut Body, entered: Instant) -> Result<Task, String> {
+    let task: Task = match name {
+        "load" => {
+            let (load, storage, deadline) = load_request(b)?;
+            b.end()?;
+            Box::new(move |s, request| {
+                super::services::answer(loaded(s, request, load, storage, entered + deadline))
+            })
+        }
+        "run" => {
+            let (load, storage, load_deadline) = load_request(b)?;
+            let steps = wire::parse_steps(b)?;
+            let deadline = deadline(b)?;
+            b.end()?;
+            Box::new(move |s, request| {
+                let due = entered + load_deadline;
+                super::services::answer(run(s, request, load, storage, due, steps, deadline))
+            })
+        }
+        "close" => {
+            let handle = b.u32()?;
+            b.end()?;
+            Box::new(move |s, _| closed(s, handle))
+        }
+        "answer" | "fail" => {
+            let (handle, post) = (b.u32()?, b.u32()?);
+            let answer = if name == "answer" { Ok(b.data()?) } else { Err(b.str()?) };
+            let deadline = deadline(b)?;
+            b.end()?;
+            Box::new(move |s, request| {
+                let due = entered + deadline;
+                super::services::answer(answered(s, request, handle, post, answer, due, deadline))
+            })
+        }
+        "steps" | "posts" => {
+            let handle = b.u32()?;
+            let (kind, bytes) = if name == "steps" {
+                let mut out = Out::default();
+                wire::write_steps(&mut out, &wire::parse_steps(b)?);
+                (wire::STEPS, out.0)
+            } else {
+                (wire::POSTS, Vec::new())
+            };
+            let deadline = deadline(b)?;
+            b.end()?;
+            let what = if name == "steps" { "steps" } else { "posts" };
+            Box::new(move |s, request| {
+                let due = entered + deadline;
+                let done = operate(s, request, handle, kind, bytes, what, due, deadline);
+                super::services::answer(done)
+            })
+        }
+        _ => return Err(format!("the drive service has no `{name}`")),
+    };
+    Ok(task)
 }
 
 /// The handle `handle`'s build.
@@ -925,56 +401,268 @@ fn find(s: &Services, handle: u32) -> Result<Arc<Driven>, String> {
         .ok_or_else(|| format!("the tool holds no driven build {handle}"))
 }
 
-/// Waits for `reply` until `due`: what it gave, or why it didn't come. Past `due`, or when the
-/// tool ends, `stop` stops the build's calls, and the reply gets the grace; if it hasn't come
-/// then, the run is the host's failure.
-fn wait(
+/// Why a request that ran past its deadline failed.
+fn past_deadline(what: &str, deadline: Duration) -> String {
+    format!(
+        "`{what}` ran past its deadline of {} s, and the host stopped the build",
+        deadline.as_secs_f64()
+    )
+}
+
+/// Sends `driven`'s process command `kind` with `bytes`, for `request`, and waits for its
+/// answer until `due`: the answer, or why it didn't come. Past `due`, or when the tool ends,
+/// the build's process group is killed, and the build can't be observed again. Blobs reserved
+/// for the request that the answer doesn't name are released.
+#[allow(clippy::too_many_arguments)]
+fn exchange(
     s: &Services,
-    reply: &mpsc::Receiver<Result<Reply, String>>,
-    stop: &crate::Stop,
+    driven: &Driven,
+    handle: u32,
+    request: u32,
+    kind: u8,
+    bytes: &[u8],
     due: Instant,
     what: &str,
     deadline: Duration,
-) -> Result<Reply, String> {
-    let (why, grace) = loop {
-        match reply.recv_timeout(POLL) {
-            Ok(r) => return r,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(format!("the build's thread ended during `{what}`"));
+) -> Result<Vec<u8>, String> {
+    driven.unobservable(handle)?;
+    let answers = locked(&driven.answers);
+    *locked(&driven.current) = Some(Current { request, reserved: HashMap::new() });
+    let sent = wire::write_frame(&mut *locked(&driven.to), kind, &[bytes]);
+    let got = match sent {
+        Err(_) => Err(None),
+        Ok(()) => loop {
+            match answers.recv_timeout(POLL) {
+                Ok(answer) => break Ok(answer),
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Err(None),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-        }
-        if s.closing.load(Ordering::Acquire) {
-            // Half the grace: the pool waits for this worker the whole grace.
-            break (format!("the tool ended during `{what}`"), s.grace / 2);
-        }
-        if Instant::now() >= due {
-            let why = format!(
-                "`{what}` ran past its deadline of {} s, and the host stopped the build",
-                deadline.as_secs_f64()
-            );
-            break (why, s.grace);
-        }
+            if s.closing.load(Ordering::Acquire) {
+                killed(s, driven, handle, "the tool ended");
+                break Err(Some(format!("the tool ended during `{what}`")));
+            }
+            if Instant::now() >= due {
+                let why = format!("`{what}` ran past its deadline, and the host stopped it");
+                killed(s, driven, handle, &why);
+                break Err(Some(past_deadline(what, deadline)));
+            }
+        },
     };
-    stop.stop();
-    if reply.recv_timeout(grace).is_ok() {
-        return Err(why);
+    let current = locked(&driven.current).take();
+    match got {
+        Ok(Ok(answer)) => {
+            // What was reserved and never filled isn't the answer's: it goes back now.
+            let unfilled = current.into_iter().flat_map(|c| c.reserved).filter(|(_, (_, f))| !f);
+            let mut blobs = s.blobs();
+            for (id, _) in unfilled {
+                let _ = blobs.release(id);
+            }
+            Ok(answer)
+        }
+        Ok(Err(why)) => Err(why),
+        Err(Some(why)) => Err(why),
+        Err(None) => {
+            // The process ended, or was killed, on its own or by `close`.
+            let why = locked(&driven.stopped).clone();
+            killed(s, driven, handle, "its process ended");
+            Err(match why {
+                Some(why) => format!("the driven build {handle} ended during `{what}`: {why}"),
+                None => format!("the driven build {handle}'s process ended during `{what}`"),
+            })
+        }
     }
-    let _ = s.stuck.set(format!("a driven build didn't stop within {grace:?} of `{what}`'s end"));
-    Err(why)
 }
 
-/// Loads `load` for `request` by `due`: its handle, and how long loading took.
-fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
+/// Kills `driven`'s process group, saying `why`, and reaps its process: one that isn't reaped
+/// within the grace makes the run the host's failure.
+fn killed(s: &Services, driven: &Driven, handle: u32, why: &str) {
+    if !driven.kill(why, s.grace) {
+        let _ = s.stuck.set(format!("the driven build {handle}'s process didn't end when killed"));
+    }
+}
+
+/// Reads `driven`'s process's frames until they end: its asks answered (blobs reserved under
+/// the request it works for, code given), each blob's bytes put in the blob reserved for them,
+/// and each command's answer passed on through `answers`. A frame that breaks the protocol kills
+/// the process.
+fn read_answers(
+    services: Weak<Services>,
+    driven: Weak<Driven>,
+    mut from: File,
+    answers: mpsc::Sender<Result<Vec<u8>, String>>,
+) {
+    let broken = |d: &Driven, why: &str| d.stop(&format!("its process broke the protocol: {why}"));
+    loop {
+        let Ok(Some((kind, len))) = wire::read_head(&mut from) else { return };
+        let (Some(s), Some(d)) = (services.upgrade(), driven.upgrade()) else { return };
+        match kind {
+            wire::ASK => {
+                if !(5..=MOST_WASM + 5).contains(&len) {
+                    return broken(&d, "an ask's size");
+                }
+                let Ok(bytes) = wire::read_bytes(&mut from, len) else { return };
+                let id = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+                let (status, reply) = ask(&s, &d, bytes[4], &bytes[5..]);
+                if d.reply(id, status, &reply).is_err() {
+                    return;
+                }
+            }
+            wire::BLOB => {
+                let mut id = [0u8; 4];
+                if len < 4 || std::io::Read::read_exact(&mut from, &mut id).is_err() {
+                    return broken(&d, "a blob's handle");
+                }
+                let id = u32::from_le_bytes(id);
+                let size = (len - 4) as u64;
+                // Known, and no larger than reserved, before a byte of it is read.
+                let room = locked(&d.current)
+                    .as_ref()
+                    .and_then(|c| c.reserved.get(&id).filter(|(_, filled)| !filled).map(|r| r.0));
+                if room.is_none_or(|room| size > room) {
+                    return broken(&d, "a blob that wasn't reserved, or past what was");
+                }
+                std::thread::sleep(s.drive_hold);
+                let Ok(bytes) = wire::read_bytes(&mut from, len - 4) else { return };
+                if let Err(why) = s.blobs().fill(id, bytes) {
+                    return broken(&d, &why);
+                }
+                if let Some(c) = locked(&d.current).as_mut()
+                    && let Some(r) = c.reserved.get_mut(&id)
+                {
+                    r.1 = true;
+                }
+            }
+            wire::DONE => {
+                if len == 0 || len > wire::MOST_FRAME {
+                    return broken(&d, "an answer's size");
+                }
+                let Ok(bytes) = wire::read_bytes(&mut from, len) else { return };
+                let answer = match bytes[0] {
+                    0 => Ok(bytes[1..].to_vec()),
+                    _ => Err(String::from_utf8_lossy(&bytes[1..]).into_owned()),
+                };
+                if answers.send(answer).is_err() {
+                    return;
+                }
+            }
+            _ => return broken(&d, "a frame of no kind it sends"),
+        }
+    }
+}
+
+/// The host's answer to its build's process's ask `what`, with `bytes`: a status and bytes.
+fn ask(s: &Services, d: &Driven, what: u8, bytes: &[u8]) -> (u8, Arc<Vec<u8>>) {
+    let refused = |why: String| (wire::REFUSED, Arc::new(why.into_bytes()));
+    match what {
+        wire::ASK_RESERVE => {
+            let Ok(size) = bytes.try_into().map(u64::from_le_bytes) else {
+                return refused("a reservation's size".into());
+            };
+            let mut current = locked(&d.current);
+            let Some(c) = current.as_mut() else {
+                return refused("no request is running".into());
+            };
+            match s.blobs().create_reserved(c.request, size) {
+                Ok(id) => {
+                    c.reserved.insert(id, (size, false));
+                    (wire::GIVEN, Arc::new(id.to_le_bytes().to_vec()))
+                }
+                Err(why) => refused(why),
+            }
+        }
+        wire::ASK_CODE => {
+            let Ok(sha) = <[u8; 32]>::try_from(bytes) else {
+                return refused("a code's SHA-256".into());
+            };
+            match s.codes.known(&sha) {
+                Some((code, from)) => {
+                    locked(&d.code).get_or_insert(from);
+                    (wire::GIVEN, code)
+                }
+                None => (wire::SEND_WASM, Arc::default()),
+            }
+        }
+        wire::ASK_WASM => {
+            // A test's slow compile.
+            std::thread::sleep(s.compile_hold);
+            match s.codes.compile(bytes) {
+                Ok((code, from)) => {
+                    locked(&d.code).get_or_insert(from);
+                    (wire::GIVEN, code)
+                }
+                Err(why) => refused(why),
+            }
+        }
+        k => refused(format!("{k} isn't an ask")),
+    }
+}
+
+/// Hands the pipes' and directories' ends `fds` to the process as its fds 3 up, in order, as
+/// [`child`] takes them.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn hand_fds(c: &mut std::process::Command, fds: [std::os::fd::RawFd; 5]) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the closure runs in the child between `fork` and `exec`, and calls only `fcntl`
+    // and `dup2`, which are async-signal-safe; it allocates nothing and touches no lock. Each
+    // end is first copied above 10 (closed at `exec`), so no `dup2` can overwrite another's
+    // source; `dup2` gives fds 3 to 7 without close-on-exec.
+    unsafe {
+        c.pre_exec(move || {
+            let mut high = [0; 5];
+            for (h, fd) in high.iter_mut().zip(fds) {
+                *h = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+                if *h < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            for (h, to) in high.into_iter().zip(child::FDS) {
+                if libc::dup2(h, to) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Loads `load` for `request` by `due`: its handle, and its answer's bytes as std's `Loaded`
+/// reads them.
+fn loaded(
+    s: &Arc<Services>,
+    request: u32,
+    load: Load,
+    storage: String,
+    due: Instant,
+) -> Result<Vec<u8>, String> {
+    let started = Instant::now();
+    let (handle, driven) = start(s, request, load, storage, due)?;
+    let mut out = Out::default();
+    out.u32(handle).f64(started.elapsed().as_secs_f64());
+    out.u8(locked(&driven.code).unwrap_or(COMPILED));
+    Ok(out.0)
+}
+
+/// Starts `load`'s process for `request`, registered under the request, and loads the build in
+/// it by `due`: its handle and the build.
+fn start(
+    s: &Arc<Services>,
+    request: u32,
+    load: Load,
+    storage: String,
+    due: Instant,
+) -> Result<(u32, Arc<Driven>), String> {
     let what = format!("load {}", load.path);
     let deadline = due.saturating_duration_since(Instant::now());
     if deadline.is_zero() {
-        return super::services::answer(Err(format!("`{what}` didn't start within its deadline")));
+        return Err(format!("`{what}` didn't start within its deadline"));
     }
-    let stop = match crate::Stop::new() {
-        Ok(s) => s,
-        Err(e) => return super::services::answer(Err(e.to_string())),
+    let Some(runner) = s.caps.runner() else {
+        return Err("a driven build runs in a process of its own, which `wrela tool` starts, and nothing here runs one".into());
     };
+    // Opened through the grants, once, now: the process gets these directories alone.
+    let (_, build) = s.caps.open_dir(&load.path)?;
+    let root = s.caps.root_handle(&load.path)?;
     let handle = {
         let mut d = s.drives();
         d.next += 1;
@@ -982,80 +670,77 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
     };
     // The build's storage: a write root's directory the tool names, which it keeps, or a
     // directory of the host's, removed with the build.
-    let owned = load.storage.is_empty();
-    let storage = if owned {
-        match s.work_dir() {
-            Ok(dir) => dir.join(format!("drive-{handle}")),
-            Err(why) => return super::services::answer(Err(why)),
-        }
+    let (owned, storage) = if storage.is_empty() {
+        let dir = s.work_dir()?.join(format!("drive-{handle}"));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("the build's storage: {e}"))?;
+        let opened = cap_std::fs::Dir::open_ambient_dir(&dir, cap_std::ambient_authority())
+            .map_err(|e| format!("the build's storage: {e}"))?;
+        (Some(dir), opened)
     } else {
-        match s.caps.dir_path(&load.storage, true) {
-            Ok(dir) => dir,
-            Err(why) => return super::services::answer(Err(format!("the build's storage: {why}"))),
-        }
+        let (_, dir) = s
+            .caps
+            .open_dir_in(&storage, true)
+            .map_err(|why| format!("the build's storage: {why}"))?;
+        (None, dir)
     };
-    let (commands, received) = mpsc::channel::<Sent>();
-    let (sent, reply) = mpsc::channel();
-    let size = (load.width, load.height);
-    let (services, load2, stop2, dir) = (s.clone(), load, stop.clone(), storage);
-    let spawned =
-        std::thread::Builder::new().name(format!("wrela-drive-{handle}")).spawn(move || {
-            let since = Instant::now();
-            let _ = std::fs::create_dir_all(&dir);
-            let host = start(&services, &load2, stop2, dir.clone());
-            drop(services);
-            let (host, pipelines) = match host {
-                Ok(h) => h,
-                Err(why) => {
-                    let _ = sent.send(Err(why));
-                    if owned {
-                        let _ = std::fs::remove_dir_all(&dir);
-                    }
-                    return;
-                }
-            };
-            let mut actor = Actor {
-                host,
-                load: load2,
-                origin: Instant::now(),
-                inited: false,
-                next_frame: 0,
-                ended: None,
-                posts: std::collections::VecDeque::new(),
-                lines: std::collections::VecDeque::new(),
-                recorded: std::collections::VecDeque::new(),
-                pipelines,
-            };
-            if sent.send(Ok(Reply::Loaded(since.elapsed().as_secs_f64()))).is_err() {
-                drop(actor);
-                if owned {
-                    let _ = std::fs::remove_dir_all(&dir);
-                }
-                return;
-            }
-            while let Ok((command, answer)) = received.recv() {
-                let run = std::panic::AssertUnwindSafe(|| actor.carry_out(command));
-                let result = std::panic::catch_unwind(run)
-                    .unwrap_or_else(|_| Err("the native host failed (it panicked)".into()));
-                let _ = answer.send(result);
-            }
-            drop(actor);
-            if owned {
-                let _ = std::fs::remove_dir_all(&dir);
-            }
-        });
-    let thread = match spawned {
-        Ok(t) => t,
+    // The pipes are made, and the process started, while no other process starts
+    // (`wrela_chrome::spawning`): only the build's process holds their other ends, so its
+    // commands end when this host does.
+    let spawning = wrela_chrome::spawning();
+    let (child_reads, to) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    let (from, child_writes) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    let mut command = std::process::Command::new(runner);
+    command.arg("tool").arg("--drive").arg(std::process::id().to_string());
+    command.stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        hand_fds(
+            &mut command,
+            [
+                child_reads.as_raw_fd(),
+                child_writes.as_raw_fd(),
+                build.as_raw_fd(),
+                root.as_raw_fd(),
+                storage.as_raw_fd(),
+            ],
+        );
+    }
+    let spawned = command.spawn();
+    drop(spawning);
+    // The process's ends and directories are its own now: ours close, so its end ends the pipe.
+    drop((child_reads, child_writes, build, root, storage));
+    let child = match spawned {
+        Ok(c) => c,
         Err(e) => {
-            return super::services::answer(Err(format!("can't start the build's thread: {e}")));
+            if let Some(dir) = &owned {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return Err(format!("can't start the build's process: {e}"));
         }
     };
+    let group = child.id() as i32;
+    // Recorded for a supervisor before the process gets its first command: until then it only
+    // waits, and it ends with this host.
+    if let Err(why) = super::run::record(s, group) {
+        Lifecycle::new(Spawned { child, group }).reap(s.grace);
+        if let Some(dir) = &owned {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        return Err(why);
+    }
+    let (sent, answers) = mpsc::channel();
     let driven = Arc::new(Driven {
-        commands: Mutex::new(Some(commands)),
-        stop: stop.clone(),
+        process: Lifecycle::new(Spawned { child, group }),
+        to: Mutex::new(File::from(std::os::fd::OwnedFd::from(to))),
+        answers: Mutex::new(answers),
+        reader: Mutex::new(None),
+        current: Mutex::new(None),
         busy: AtomicBool::new(true),
-        thread: Mutex::new(Some(thread)),
-        size,
+        stopped: Mutex::new(None),
+        code: Mutex::new(None),
+        storage: owned,
     });
     // Registered under its request before any answer names it.
     {
@@ -1063,264 +748,99 @@ fn loaded(s: &Arc<Services>, request: u32, load: Load, due: Instant) -> Answer {
         d.held.insert(handle, driven.clone());
         d.unpublished.entry(request).or_default().push(handle);
     }
-    // Loading runs no WASM: past its deadline, it's the compile that's waited for.
-    stop.set_deadline(Some(due));
-    let result = wait(s, &reply, &stop, due, &what, deadline);
-    stop.set_deadline(None);
+    let (services, weak) = (Arc::downgrade(s), Arc::downgrade(&driven));
+    let from = File::from(std::os::fd::OwnedFd::from(from));
+    let reader = std::thread::Builder::new()
+        .name(format!("wrela-drive-{handle}"))
+        .spawn(move || read_answers(services, weak, from, sent))
+        .map_err(|e| format!("can't start the thread that reads the build's process: {e}"))?;
+    *locked(&driven.reader) = Some(reader);
+    let mut out = Out::default();
+    load.write(&mut out);
+    let done = exchange(s, &driven, handle, request, wire::LOAD, &out.0, due, &what, deadline);
     driven.busy.store(false, Ordering::Release);
-    let answer = match result {
-        Ok(Reply::Loaded(elapsed)) => {
-            let mut out = Out::default();
-            out.u32(handle).f64(elapsed);
-            Ok(out.0)
-        }
-        Ok(_) => Err("the build's thread answered something else".into()),
-        Err(why) => Err(why),
-    };
     // A failed load's build is closed by the worker, which rolls the request back.
-    super::services::answer(answer)
+    done.map(|_| (handle, driven))
 }
 
-/// Carries out `command` on `handle`'s build for `request` by `due`.
+/// Carries out command `kind` with `bytes` (`what`, as a failure names it) on `handle`'s build
+/// for `request` by `due`: the process's answer.
+#[allow(clippy::too_many_arguments)]
 fn operate(
     s: &Arc<Services>,
     request: u32,
     handle: u32,
-    command: Command,
+    kind: u8,
+    bytes: Vec<u8>,
+    what: &str,
     due: Instant,
     deadline: Duration,
-) -> Answer {
-    let what = command.name();
-    super::services::answer((|| {
-        if Instant::now() >= due {
-            return Err(format!("`{what}` didn't start within its deadline"));
-        }
-        let driven = find(s, handle)?;
-        if driven.busy.swap(true, Ordering::AcqRel) {
-            return Err(format!("the driven build {handle} is busy with another operation"));
-        }
-        struct Idle<'a>(&'a Driven);
-        impl Drop for Idle<'_> {
-            fn drop(&mut self) {
-                self.0.stop.set_deadline(None);
-                self.0.busy.store(false, Ordering::Release);
-            }
-        }
-        let _idle = Idle(&driven);
-        // An answer's blob is read now: the build's thread has no blobs.
-        let command = match command {
-            Command::Answer(post, Ok(Data::Blob(id))) => {
-                Command::Answer(post, Ok(Data::Bytes(s.blobs().get(id)?.as_ref().clone())))
-            }
-            c => c,
-        };
-        // The screen's bytes and its blob are reserved before it's read back: a capture that
-        // doesn't fit isn't read. The blob is the request's, so a failure gives them back.
-        let mut screen = None;
-        if matches!(command, Command::Capture) {
-            let (w, h) = driven.size;
-            let bytes = u64::from(w) * u64::from(h) * 4;
-            let id = s
-                .blobs()
-                .create_reserved(request, bytes)
-                .map_err(|why| format!("the screen's {bytes} bytes: {why}"))?;
-            screen = Some(id);
-        }
-        // A voice's samples, and its times if asked, are reserved before it renders.
-        let mut voice = None;
-        if let Command::Audio(quanta, timed) = command {
-            let bytes = u64::from(quanta) * QUANTUM_BYTES;
-            let id = s
-                .blobs()
-                .create_reserved(request, bytes)
-                .map_err(|why| format!("the voice's {bytes} bytes: {why}"))?;
-            let times = if timed {
-                let bytes = u64::from(quanta) * 8;
-                Some(
-                    s.blobs()
-                        .create_reserved(request, bytes)
-                        .map_err(|why| format!("the quanta's times, {bytes} bytes: {why}"))?,
-                )
-            } else {
-                None
-            };
-            voice = Some((id, times));
-        }
-        // A buffer's bytes and their blob are reserved before it's read back: its size first,
-        // from the build's thread, then the blob, then the bytes. The blob is the request's.
-        let mut bytes_blob = None;
-        if let Command::ReadBuffer(h) = command {
-            let size =
-                match exchange(s, &driven, handle, Command::BufferSize(h), due, what, deadline)? {
-                    Reply::Size(n) => n,
-                    _ => return Err("the build's thread answered something else".into()),
-                };
-            let id = s
-                .blobs()
-                .create_reserved(request, size)
-                .map_err(|why| format!("buffer {h}'s {size} bytes: {why}"))?;
-            bytes_blob = Some(id);
-        }
-        let reply = exchange(s, &driven, handle, command, due, what, deadline)?;
-        let mut out = Out::default();
-        match reply {
-            Reply::Buffers(held) => {
-                out.u32(held.len() as u32);
-                for h in held {
-                    out.u32(h);
-                }
-            }
-            Reply::Bytes(bytes) => {
-                let id = bytes_blob.ok_or("a buffer's bytes nobody asked for")?;
-                s.blobs().fill(id, bytes)?;
-                out.u8(1).u32(id);
-            }
-            Reply::Commands(given, waiting) => {
-                out.u32(given.len() as u32);
-                for r in &given {
-                    out.str(r.kind).str(&r.label).str(&r.pipeline);
-                    out.u32(r.groups[0]).u32(r.groups[1]).u32(r.groups[2]);
-                    out.u32(r.bindings.len() as u32);
-                    for b in &r.bindings {
-                        out.u32(b[0]).u32(b[1]).u32(b[2]);
-                    }
-                    out.str(&r.target).u32(r.bytes.len() as u32);
-                    out.0.extend_from_slice(&r.bytes);
-                }
-                out.u32(waiting as u32);
-            }
-            Reply::Text(text) => {
-                out.str(&text);
-            }
-            Reply::Size(_) => return Err("the build's thread answered something else".into()),
-            Reply::Ran(ran) => write_ran(&mut out, &ran, &driven.stop, due, what, deadline)?,
-            Reply::Screen(w, h, rgba) => {
-                let id = screen.ok_or("a screen nobody asked for")?;
-                s.blobs().fill(id, rgba)?;
-                out.u32(w).u32(h).u8(1).u32(id);
-            }
-            Reply::Audio(samples, times) => {
-                let (id, timed) = voice.ok_or("a voice nobody asked for")?;
-                s.blobs().fill(id, samples)?;
-                out.u8(1).u32(id);
-                match timed {
-                    Some(t) => {
-                        s.blobs().fill(t, times)?;
-                        out.u8(1).u8(1).u32(t);
-                    }
-                    None => {
-                        out.u8(0);
-                    }
-                }
-            }
-            Reply::Hash(hash) => {
-                out.u64(hash);
-            }
-            Reply::Logs(lines, waiting) => {
-                out.u32(lines.len() as u32);
-                for l in &lines {
-                    out.str(&bounded(l));
-                }
-                out.u32(waiting as u32);
-            }
-            Reply::Phases(phases) => {
-                out.u32(phases.len() as u32);
-                for p in &phases {
-                    out.str(&p.name).f64(p.seconds).u32(p.times);
-                }
-            }
-            Reply::Posts(posts) => {
-                out.u32(posts.len() as u32);
-                for p in &posts {
-                    out.u32(p.request).str(&p.url).u8(0).u32(p.body.len() as u32);
-                    out.0.extend_from_slice(&p.body);
-                }
-            }
-            Reply::Answered => {}
-            Reply::Loaded(_) => return Err("the build's thread answered something else".into()),
-        }
-        Ok(out.0)
-    })())
+) -> Result<Vec<u8>, String> {
+    if Instant::now() >= due {
+        return Err(format!("`{what}` didn't start within its deadline"));
+    }
+    let driven = find(s, handle)?;
+    if driven.busy.swap(true, Ordering::AcqRel) {
+        return Err(format!("the driven build {handle} is busy with another request"));
+    }
+    let done = exchange(s, &driven, handle, request, kind, &bytes, due, what, deadline);
+    driven.busy.store(false, Ordering::Release);
+    done
 }
 
-/// Sends `command` to the build's thread and waits for its reply, within the deadline.
-fn exchange(
-    s: &Services,
-    driven: &Driven,
+/// Answers post `post` of `handle`'s build with `answer` (a blob's bytes read now: the build's
+/// process has no blobs), for `request` by `due`.
+fn answered(
+    s: &Arc<Services>,
+    request: u32,
     handle: u32,
-    command: Command,
+    post: u32,
+    answer: Result<Data, String>,
     due: Instant,
-    what: &str,
     deadline: Duration,
-) -> Result<Reply, String> {
-    let (sent, reply) = mpsc::channel();
-    {
-        let commands = driven.commands.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(commands) = commands.as_ref() else {
-            return Err(format!("the driven build {handle} is closed"));
-        };
-        driven.stop.set_deadline(Some(due));
-        commands
-            .send((command, sent))
-            .map_err(|_| format!("the driven build {handle}'s thread has ended"))?;
-    }
-    let reply = wait(s, &reply, &driven.stop, due, what, deadline).map_err(|why| {
-        // A voice the deadline stopped is the request's failure, as a call's is.
-        if why.contains("interrupt") && (driven.stop.is_stopped() || Instant::now() >= due) {
-            past_deadline(what, deadline)
-        } else {
-            why
+) -> Result<Vec<u8>, String> {
+    let mut out = Out::default();
+    out.u32(post);
+    match answer {
+        Ok(Data::Bytes(bytes)) => {
+            out.u8(0).0.extend_from_slice(&bytes);
         }
-    })?;
-    Ok(reply)
+        Ok(Data::Blob(id)) => {
+            let bytes = s.blobs().get(id)?;
+            out.u8(0).0.extend_from_slice(&bytes);
+        }
+        Err(why) => {
+            out.u8(1).0.extend_from_slice(why.as_bytes());
+        }
+    }
+    operate(s, request, handle, wire::ANSWER, out.0, "answer", due, deadline)
 }
 
-/// Writes `ran` as `drive::read_ran` reads it. A call that the deadline stopped (the trap is
-/// an interrupt, and the deadline has passed) is the request's failure, not a trap.
-fn write_ran(
-    out: &mut Out,
-    ran: &Ran,
-    stop: &crate::Stop,
-    due: Instant,
-    what: &str,
+/// `run`: loads `load` by `load_due`, runs `steps` within `deadline` of the load's end, and
+/// closes the build: what the steps saw.
+fn run(
+    s: &Arc<Services>,
+    request: u32,
+    load: Load,
+    storage: String,
+    load_due: Instant,
+    steps: Vec<Step>,
     deadline: Duration,
-) -> Result<(), String> {
-    if ran.trap.as_ref().is_some_and(|t| t.message.contains("interrupt"))
-        && (stop.is_stopped() || Instant::now() >= due)
-    {
-        return Err(past_deadline(what, deadline));
-    }
-    out.f64(ran.started).f64(ran.elapsed).u32(ran.steps.len() as u32);
-    for (start, end) in &ran.steps {
-        out.f64(*start).f64(*end);
-    }
-    out.u32(ran.results.len() as u32);
-    for v in &ran.results {
-        let (kind, bits) = match *v {
-            crate::Value::I32(x) => (0, x as u32 as u64),
-            crate::Value::I64(x) => (1, x as u64),
-            crate::Value::F32(x) => (2, u64::from(x.to_bits())),
-            crate::Value::F64(x) => (3, x.to_bits()),
-        };
-        out.u8(kind).u64(bits);
-    }
-    match &ran.trap {
-        None => {
-            out.u8(0);
-        }
-        Some(t) => {
-            out.u8(1).str(&t.message).str(&t.panic).str(&t.at).u8(t.step).u32(t.number);
+) -> Result<Vec<u8>, String> {
+    let (handle, driven) = start(s, request, load, storage, load_due)?;
+    let mut out = Out::default();
+    wire::write_steps(&mut out, &steps);
+    let due = Instant::now() + deadline;
+    let seen = exchange(s, &driven, handle, request, wire::STEPS, &out.0, due, "steps", deadline);
+    // No answer names the build: it closes now, whatever the steps gave.
+    let rolled = s.drives().rollback(request);
+    for d in rolled {
+        if !d.close(s.grace, &s.strays) {
+            let _ =
+                s.stuck.set(format!("the driven build {handle} didn't close within {:?}", s.grace));
         }
     }
-    Ok(())
-}
-
-/// Why a request whose operation ran past its deadline failed.
-fn past_deadline(what: &str, deadline: Duration) -> String {
-    format!(
-        "`{what}` ran past its deadline of {} s, and the host stopped the build",
-        deadline.as_secs_f64()
-    )
+    seen
 }
 
 /// Closes `handle`'s build.
@@ -1329,23 +849,87 @@ fn closed(s: &Services, handle: u32) -> Answer {
     let Some(driven) = driven else {
         return super::services::answer(Err(format!("the tool holds no driven build {handle}")));
     };
-    if !driven.close(s.grace) {
+    if !driven.close(s.grace, &s.strays) {
         let _ = s.stuck.set(format!("the driven build {handle} didn't close within {:?}", s.grace));
         return super::services::answer(Err(format!("the driven build {handle} didn't close")));
     }
     super::services::answer(Ok(Vec::new()))
 }
 
-/// `line`, at most half an answer's bytes of it (cut at a character), with a note if it was
-/// cut.
-fn bounded(line: &str) -> String {
-    let most = MOST_BYTES / 2;
-    if line.len() <= most {
-        return line.to_string();
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A process whose signals and reaping are recorded, reaped at its `after`th look.
+    struct Recorded {
+        log: Arc<Mutex<Vec<&'static str>>>,
+        looks: u32,
+        after: u32,
     }
-    let mut end = most;
-    while !line.is_char_boundary(end) {
-        end -= 1;
+
+    impl Process for Recorded {
+        fn signal(&mut self) {
+            locked(&self.log).push("signal");
+        }
+
+        fn reaped(&mut self) -> bool {
+            self.looks += 1;
+            let done = self.looks >= self.after;
+            if done {
+                locked(&self.log).push("reaped");
+            }
+            done
+        }
     }
-    format!("{}… ({} more bytes)", &line[..end], line.len() - end)
+
+    /// A real process signalled through `Spawned` is still its owner's to reap: the owner's wait
+    /// reports the kill, not a process reaped elsewhere (ECHILD). This guards the Linux reap: a
+    /// group kill that also reaps (`run::kill_group`, through `waitpgid`) would leave the owner's
+    /// pid free for another process, which a later signal could reach. It runs on macOS too.
+    #[cfg(unix)]
+    #[test]
+    fn a_signalled_process_is_its_owners_to_reap() {
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command.spawn().expect("sleep");
+        let group = child.id() as i32;
+        let mut spawned = Spawned { child, group };
+        spawned.signal();
+        let status = spawned.child.wait().expect("the owner reaps it, not something else");
+        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(9), "{status}");
+    }
+
+    /// Closes and the tool's end at once: the process is signalled, then reaped once, and never
+    /// signalled after it's reaped, whoever asks.
+    #[test]
+    fn a_reaped_process_is_never_signalled() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let life = Arc::new(Lifecycle::new(Recorded { log: log.clone(), looks: 0, after: 3 }));
+        let signals = {
+            let life = life.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    life.signal();
+                }
+            })
+        };
+        let closes: Vec<_> = (0..2)
+            .map(|_| {
+                let life = life.clone();
+                std::thread::spawn(move || life.reap(Duration::from_secs(5)))
+            })
+            .collect();
+        for c in closes {
+            assert!(c.join().expect("a close"), "reaped");
+        }
+        signals.join().expect("the signals");
+        life.signal();
+        let log = locked(&log).clone();
+        let reaped: Vec<usize> =
+            log.iter().enumerate().filter(|(_, e)| **e == "reaped").map(|(i, _)| i).collect();
+        assert_eq!(reaped.len(), 1, "reaped once: {log:?}");
+        assert!(log[reaped[0]..].iter().all(|e| *e != "signal"), "a signal after the reap");
+        assert_eq!(log.first(), Some(&"signal"), "signalled before it's reaped");
+    }
 }

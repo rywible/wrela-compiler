@@ -23,6 +23,7 @@
 //! of it, so export tests need no GPU.
 
 mod cache;
+pub mod code;
 mod confined;
 mod error;
 #[cfg(feature = "gpu")]
@@ -94,6 +95,10 @@ pub struct Options {
     /// directory of the build the host loaded (or restarted), which every build after it in
     /// the host, by a hot reload or a hand-over, shares.
     pub storage: Option<std::path::PathBuf>,
+    /// The storage directory, opened: when it's given, storage requests go through it alone,
+    /// one part at a time, following no link, and `storage`'s path is never opened (a driven
+    /// build's, which its process gets from the tool host as an open directory).
+    pub storage_dir: Option<std::sync::Arc<BuildDir>>,
     /// How many threads run a parallel job's chunks, the program's own included (at most
     /// `wrela_abi::memory::MAX_WORKERS + 1`); 0 for [`default_workers`].
     pub workers: u32,
@@ -116,7 +121,10 @@ impl Options {
     /// Where a build in `dir` loaded this way reads and writes ([`io`]).
     #[cfg(feature = "gpu")]
     fn io(&self, dir: &Path) -> program::Io {
-        io(dir, self.storage.as_deref(), self.post.clone(), self.host.clone(), self.quiet)
+        let mut io =
+            io(dir, self.storage.as_deref(), self.post.clone(), self.host.clone(), self.quiet);
+        io.storage_dir = self.storage_dir.clone();
+        io
     }
 
     /// These options with their storage in the build in `dir`'s, unless they name it: the
@@ -153,6 +161,7 @@ fn io(
         build: Some(dir.to_path_buf()),
         build_dir: None,
         storage: Some(storage.map_or_else(|| dir.join("storage"), Path::to_path_buf)),
+        storage_dir: None,
         post,
         host,
         quiet,
@@ -299,11 +308,25 @@ pub fn open_build_dir(path: &Path) -> std::io::Result<BuildDir> {
 /// The most bytes a driven build's file may have.
 const MOST_DRIVEN_FILE: u64 = 512 << 20;
 
-/// A build read through its directory's handle `build`, compiled to be driven (the tool host's
-/// `drive`, language.md §15.5): on the interruptible engine, its calls ended by `stop`, and with
-/// no compiled code read from or kept anywhere. `shaders` reads its WGSL too. No file is
-/// reached through a link.
-fn driven_build(build: &BuildDir, stop: Stop, shaders: bool) -> Result<Build> {
+/// What gives a driven build its code (the tool host's `drive`, language.md §15.5): given the
+/// build's WASM, its module compiled for the engine a driven build runs on. A driven build's
+/// process asks the tool host, which compiles each build once in a run ([`compiling`] compiles
+/// here, for a test).
+pub type CodeFor =
+    std::sync::Arc<dyn Fn(&[u8]) -> std::result::Result<wasmtime::Module, String> + Send + Sync>;
+
+/// Code compiled here, for each build, for the engine a driven build runs on: a test's
+/// [`CodeFor`].
+pub fn compiling() -> CodeFor {
+    std::sync::Arc::new(|wasm: &[u8]| {
+        wasmtime::Module::new(program::driven_engine(), wasm).map_err(|e| format!("{e:#}"))
+    })
+}
+
+/// A build read through its directory's handle `build`, to be driven (the tool host's `drive`,
+/// language.md §15.5), its code from `code`, for the engine `wrela-host` runs on. `shaders`
+/// reads its WGSL too. No file is reached through a link.
+fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build> {
     let read = |name: &str| confined::read(build, name, MOST_DRIVEN_FILE);
     let file = |name: &str| read(name).map_err(|why| Error::Program(format!("{name}: {why}")));
     let text = |bytes: Vec<u8>, name: &str| {
@@ -323,7 +346,8 @@ fn driven_build(build: &BuildDir, stop: Stop, shaders: bool) -> Result<Build> {
     let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
     let sidecar = Path::new(&manifest.wasm).with_extension(wrela_abi::lines::SIDECAR);
     let sidecar = read(&sidecar.to_string_lossy()).ok();
-    let compiled = program::compile_interruptible(&wasm, sidecar.as_deref(), stop)?;
+    let module = code(&wasm).map_err(|why| Error::Program(format!("its code: {why}")))?;
+    let compiled = program::compile_driven(module, &wasm, sidecar.as_deref())?;
     Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
@@ -351,9 +375,9 @@ fn read_file<T>(
 }
 
 /// What a driven host needs to hand over to another build (`std::reload`): the root path of
-/// the build it loaded, how to open another build by its root path (within the tool's grants,
-/// as the build's own directory was: its real path and its directory, opened), and what stops
-/// every build's calls. The builds it hands over to are compiled to be driven too.
+/// the build it loaded, how to open another build by its root path (within the build's root,
+/// as the build's own directory was: the path it goes by and its directory, opened), and what
+/// gives each build its code, as the first build's was given.
 #[cfg(feature = "gpu")]
 pub struct Beside {
     pub at: String,
@@ -361,7 +385,7 @@ pub struct Beside {
     pub open: std::sync::Arc<
         dyn Fn(&str) -> std::result::Result<(PathBuf, BuildDir), String> + Send + Sync,
     >,
-    pub stop: Stop,
+    pub code: CodeFor,
 }
 
 /// A loaded program, ready to run.
@@ -623,28 +647,28 @@ impl Host {
         Host::start(build, dir, options, true)
     }
 
-    /// The build in the directory `build`, opened at `dir`, to be driven (the tool host's
-    /// `drive`, language.md §15.5): its calls end when `stop` is due, on each of its threads,
-    /// and it keeps and reads no compiled code. Its files, and its program's fetches, are read
-    /// through `build` alone, so a link put in place of `dir` later leads nowhere. It can't hot
-    /// reload. Its storage is `options.storage`, which a driven build must name.
+    /// The build in the directory `build`, which goes by `dir` (a name: it's never opened), to
+    /// be driven (the tool host's `drive`, language.md §15.5), its code from `code`. Its files,
+    /// and its program's fetches, are read through `build` alone, so a link put in place of its
+    /// directory later leads nowhere. It can't hot reload. Its storage is
+    /// `options.storage_dir`, which a driven build must give.
     ///
     /// With `beside`, it hands over to other builds (`std::reload`), each opened by its root path
-    /// through `beside`'s grants and compiled to be driven, as this one is; without, it can't
-    /// (a request to fails).
+    /// through `beside` and given its code by `beside`, as this one is; without, it can't (a
+    /// request to fails).
     pub fn load_driven(
         build: BuildDir,
         dir: &Path,
-        stop: Stop,
+        code: &CodeFor,
         options: &Options,
         beside: Option<Beside>,
     ) -> Result<Host> {
-        if options.storage.is_none() || options.reloadable {
+        if options.storage_dir.is_none() || options.reloadable {
             return Err(Error::Program(
-                "a driven build names its storage, and isn't reloadable".into(),
+                "a driven build gives its storage, and isn't reloadable".into(),
             ));
         }
-        let mut compiled = driven_build(&build, stop, true)?;
+        let mut compiled = driven_build(&build, true, code)?;
         let at = beside.as_ref().map(|b| b.at.clone()).unwrap_or_default();
         compiled.driven = Some((at, std::sync::Arc::new(build)));
         let mut host = Host::start(compiled, dir, options, beside.is_some())?;
@@ -1097,12 +1121,11 @@ impl CpuBuild {
         Ok(Self::from_build(dir, compile_build(dir, fuel)?))
     }
 
-    /// The build in the directory `build`, opened at `dir`, to be driven (the tool host's
-    /// `drive`, language.md §15.5): its hosts' calls end when `stop` is due, on each of their
-    /// threads, and it keeps and reads no compiled code. Its shaders aren't read. Its files, and
-    /// its programs' fetches, are read through `build` alone.
-    pub fn load_driven(build: BuildDir, dir: &Path, stop: Stop) -> Result<CpuBuild> {
-        let mut out = Self::from_build(dir, driven_build(&build, stop, false)?).quiet();
+    /// The build in the directory `build`, which goes by `dir` (a name: it's never opened), to
+    /// be driven (the tool host's `drive`, language.md §15.5), its code from `code`. Its shaders
+    /// aren't read. Its files, and its programs' fetches, are read through `build` alone.
+    pub fn load_driven(build: BuildDir, dir: &Path, code: &CodeFor) -> Result<CpuBuild> {
+        let mut out = Self::from_build(dir, driven_build(&build, false, code)?).quiet();
         out.handle = Some(std::sync::Arc::new(build));
         Ok(out)
     }
@@ -1190,7 +1213,23 @@ impl CpuBuild {
     /// `storage` (by default, `storage/` in the build's directory), and without running
     /// `init`: call [`CpuHost::init`] next, which says why it failed if it does.
     pub fn instantiate_in(&self, workers: u32, storage: Option<&Path>) -> Result<CpuHost> {
-        let mut io = io(&self.dir, storage, None, None, self.quiet);
+        self.instantiate_with(workers, io(&self.dir, storage, None, None, self.quiet))
+    }
+
+    /// [`CpuBuild::instantiate_in`], with the program's storage requests going through the
+    /// opened directory `storage` alone, following no link: a driven build's.
+    pub fn instantiate_stored(
+        &self,
+        workers: u32,
+        storage: std::sync::Arc<BuildDir>,
+    ) -> Result<CpuHost> {
+        let mut io = io(&self.dir, None, None, None, self.quiet);
+        io.storage = None;
+        io.storage_dir = Some(storage);
+        self.instantiate_with(workers, io)
+    }
+
+    fn instantiate_with(&self, workers: u32, mut io: program::Io) -> Result<CpuHost> {
         io.build_dir = self.handle.clone();
         // A driven build's posts go to its tool (`std::tool::drive`).
         io.queue_posts = self.handle.is_some();

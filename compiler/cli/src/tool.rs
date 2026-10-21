@@ -18,10 +18,15 @@
 //! package that doesn't build exits 1 with its diagnostics, and a usage error (a timeout the
 //! clock can't reach among them) 2. The process ends with the tool, so no worker outlives it.
 //!
-//! The build is made in memory and its WASM compiled for this run: nothing is written beside
-//! the package. Its constants' cache, and the toolchain service's (`std::tool::toolchain`, which
-//! this command gives the host: `crate::toolchain`), is the user's own
-//! (`crate::toolchain::cache_dir`), never one in a root the tool is granted.
+//! The build is made in memory: nothing is written beside the package. Its constants' cache, and
+//! the toolchain service's (`std::tool::toolchain`, which this command gives the host:
+//! `crate::toolchain`), is the user's own (`crate::toolchain::cache_dir`), never one in a root
+//! the tool is granted. The compiled code of its WASM, and of the builds it drives, is kept in the
+//! code cache (`wrela_host::code`); a grant at or above the cache's directory is a usage error,
+//! as is any other bad grant.
+//!
+//! `wrela tool --drive <parent>` is a driven build's process, which the tool host `parent`
+//! starts (`wrela_host::tool::drive_child`): `main` runs it before anything else.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -153,6 +158,13 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    let code_cache = match code_cache(&caps) {
+        Ok(c) => c,
+        Err(why) => {
+            eprintln!("error: {why}");
+            return ExitCode::from(2);
+        }
+    };
     let cache = crate::toolchain::cache_dir();
     let scope = wrela_driver::Scope {
         cache: Some(cache.iter().cloned().collect()),
@@ -203,6 +215,7 @@ pub fn run(args: &[String]) -> ExitCode {
     options.groups = std::env::var_os(wrela_host::tool::GROUPS_ENV).map(std::path::PathBuf::from);
     options.toolchain = Some(Arc::new(crate::toolchain::Compiler));
     options.cache = cache;
+    options.code_cache = code_cache;
     options.testing = testing();
     let ended = wrela_host::tool::run(&ToolBuild::from_wasm(wasm.clone()), options);
     if !matches!(ended.end, wrela_host::tool::End::Exit(_)) {
@@ -418,9 +431,12 @@ fn test(dir: &std::path::Path) -> ExitCode {
     for (name, dir) in &spec.read {
         grants = grants.root(name, dir, false);
     }
-    let ended = match (Caps::open(&grants, |_| None), std::fs::read(&spec.wasm)) {
-        (Ok(caps), Ok(wasm)) => {
+    let opened =
+        Caps::open(&grants, |_| None).and_then(|caps| code_cache(&caps).map(|cache| (caps, cache)));
+    let ended = match (opened, std::fs::read(&spec.wasm)) {
+        (Ok((caps, code_cache)), Ok(wasm)) => {
             let mut options = Options::new(caps);
+            options.code_cache = code_cache;
             options.timeout = Some(Duration::from_secs_f64(spec.budget));
             if let Some(b) = &spec.blobs {
                 match BlobBudget::parse(b) {
@@ -464,6 +480,15 @@ fn test(dir: &std::path::Path) -> ExitCode {
     std::process::exit(if ended.passed { 0 } else { 1 })
 }
 
+/// The code cache's directory (`wrela_host::code`), unless it's off, once it's known that no
+/// root `caps` grants holds it: a grant at or above it is refused (language.md §15.5).
+fn code_cache(caps: &Caps) -> Result<Option<wrela_host::code::Cache>, String> {
+    let Some(dir) = wrela_host::code::cache_dir()? else { return Ok(None) };
+    let cache = wrela_host::code::Cache::open(dir)?;
+    caps.refuse_code_cache(&cache)?;
+    Ok(Some(cache))
+}
+
 /// For the command's own tests (`WRELA_TESTING_GRANTS_HOLD`, a directory): once the grants are
 /// checked, before they are opened, says so (the file `checked`) and waits for the file `go`, so
 /// a test can change the directories in between at a moment it knows.
@@ -484,7 +509,9 @@ fn held(at: &std::path::Path) -> Result<(), String> {
 /// stalls (`WRELA_TESTING_RESOLVE_STALL`) and a slow disk under each output written
 /// (`WRELA_TESTING_IO_DELAY`), each in seconds; one output write held (`WRELA_TESTING_HOLD`,
 /// `which:seconds`), and one that fails part way (`WRELA_TESTING_WRITE_FAIL`, `which`), each
-/// chosen by its path's end or `#n`, the request's `n`th write.
+/// chosen by its path's end or `#n`, the request's `n`th write; and a wait before each driven
+/// build's blob is read from its process (`WRELA_TESTING_DRIVE_HOLD`, seconds), and before
+/// each driven build's code is compiled (`WRELA_TESTING_COMPILE_HOLD`, seconds).
 fn testing() -> wrela_host::tool::Testing {
     let seconds = |name: &str| {
         std::env::var(name)
@@ -502,6 +529,8 @@ fn testing() -> wrela_host::tool::Testing {
             Some((which.to_string(), Duration::try_from_secs_f64(s.parse().ok()?).ok()?))
         }),
         write_fail: std::env::var("WRELA_TESTING_WRITE_FAIL").ok().filter(|v| !v.is_empty()),
+        drive_hold: seconds("WRELA_TESTING_DRIVE_HOLD"),
+        compile_hold: seconds("WRELA_TESTING_COMPILE_HOLD"),
         ..wrela_host::tool::Testing::default()
     }
 }
