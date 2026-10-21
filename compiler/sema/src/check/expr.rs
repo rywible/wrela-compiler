@@ -1376,6 +1376,17 @@ impl<'p> Checker<'p> {
     }
 
     fn check_take(&mut self, inner: &ast::Expr, expected: Option<TyId>, span: Span) -> Expr {
+        // `take b.finish()?`: the mark is the call's, and `?` passes on what the marked call
+        // gives, as `(take b.finish())?` would.
+        if let ast::ExprKind::Try(call) = &inner.kind
+            && matches!(call.kind, ast::ExprKind::MethodCall { .. })
+        {
+            let marked = ast::Expr {
+                kind: ast::ExprKind::Take(call.clone()),
+                span: Span::new(span.file, span.start, call.span.end),
+            };
+            return self.check_try(&marked, span);
+        }
         let i = self.check_expr(inner, expected);
         // `take recv.method()`: a method that consumes its receiver, a named place. (One that
         // returns a projection is a place, which `take` moves out of.)

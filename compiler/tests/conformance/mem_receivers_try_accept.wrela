@@ -1,0 +1,17 @@
+// accepts: mem.receivers
+// `take b.finish()?` marks the consuming call, and `?` passes on what it gives.
+struct Builder {
+    n: u32,
+}
+
+impl Builder {
+    fn finish(take self) -> Option<u32> {
+        if self.n > 0 { Some(self.n) } else { None }
+    }
+}
+
+fn f() -> Option<u32> {
+    let b = Builder { n: 1 }
+    let n = take b.finish()?
+    Some(n + 1)
+}
