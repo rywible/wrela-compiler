@@ -7,15 +7,19 @@
 //! site's page may put, and these servers answer no such question.
 //!
 //! Every answer is cross-origin isolated (COOP and COEP, which `SharedArrayBuffer` needs, and
-//! CORP, as tools/serve.py sends), and keeps nothing cached. Files are reached through a
+//! CORP), and keeps nothing cached. Files are reached through a
 //! directory handle one part at a time, following no symbolic link (`confined`).
 
 use cap_std::fs::Dir;
 use std::io::{BufRead, Read, Write};
 use std::net::TcpListener;
 
-/// The largest request body a server takes (a test's frame, an edit's JSON, a page's result).
+/// The largest request body a server takes (a test's frame, an edit's JSON), but a put's.
 pub const MAX_BODY: usize = 16 << 20;
+
+/// The largest page's result a server takes (`PUT /results/<name>`: a screen, a clip), which
+/// goes to its file as it arrives.
+pub const MAX_RESULT: usize = 256 << 20;
 
 /// The most bytes a request's head (its line and headers) may have.
 const MAX_HEAD: u64 = 64 << 10;
@@ -48,7 +52,8 @@ pub fn listen(port: u16) -> Result<(TcpListener, u16), String> {
 
 /// Reads a request's head from `reader`, for a server on `port`: `None` if it was refused (the
 /// refusal is answered on `out`): one for another host, a post from another origin, a body past
-/// [`MAX_BODY`], a body framed other than by its length, or a head past 64 KiB.
+/// [`MAX_BODY`] ([`MAX_RESULT`] for a put), a body framed other than by its length, or a head
+/// past 64 KiB.
 pub fn read_head(
     reader: &mut impl BufRead,
     out: &mut impl Write,
@@ -115,8 +120,9 @@ pub fn read_head(
         return Ok(None);
     };
     // A body past the cap is refused, not cut short (and then written as if whole).
-    if length > MAX_BODY {
-        let why = format!("a request's body is at most {MAX_BODY} bytes");
+    let most = if method == "PUT" { MAX_RESULT } else { MAX_BODY };
+    if length > most {
+        let why = format!("a request's body is at most {most} bytes");
         respond(out, 413, "text/plain", why.as_bytes())?;
         return Ok(None);
     }
@@ -256,8 +262,8 @@ pub fn put_result(
     if !plain {
         return respond(out, 403, "text/plain", b"a result is a plain file name").map(|()| false);
     }
-    if length > MAX_BODY as u64 {
-        let why = format!("a result is at most {MAX_BODY} bytes");
+    if length > MAX_RESULT as u64 {
+        let why = format!("a result is at most {MAX_RESULT} bytes");
         return respond(out, 413, "text/plain", why.as_bytes()).map(|()| false);
     }
     let refused = |out: &mut dyn Write| {
@@ -326,5 +332,17 @@ mod tests {
         let isolated = head_of("GET / HTTP/1.1\r\nHost: x\r\n\r\n").1;
         assert!(isolated.contains("Cross-Origin-Embedder-Policy: require-corp"));
         assert!(isolated.contains("Cross-Origin-Resource-Policy: same-origin"));
+    }
+
+    #[test]
+    fn a_put_may_carry_a_result_larger_than_another_body() {
+        let sized = |method: &str, length: usize| {
+            head_of(&format!(
+                "{method} /results/clip.webm HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\nContent-Length: {length}\r\n\r\n"
+            ))
+        };
+        assert_eq!(sized("PUT", MAX_BODY + 1).0.map(|h| h.length), Some(MAX_BODY + 1));
+        assert!(sized("PUT", MAX_RESULT + 1).1.starts_with("HTTP/1.1 413"));
+        assert!(sized("POST", MAX_BODY + 1).1.starts_with("HTTP/1.1 413"));
     }
 }

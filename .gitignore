@@ -1,4 +1,4 @@
-# Run artefacts from tools/headless.py and tools/serve.py
+# Run artefacts of test-mode pages (the lookbook and round tools, `wrela tool serve`)
 **/results/DONE
 **/results/console.log
 **/results/*.png

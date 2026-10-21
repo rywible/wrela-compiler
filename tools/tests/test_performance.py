@@ -1,105 +1,17 @@
-"""Regression checks for the tools' caches, size budgets and round reports."""
+"""Regression checks for the WGSL size budgets (tools/wgsl_budgets.py)."""
 
-import concurrent.futures
 import contextlib
 import gzip
 import io
-import json
 import os
 import pathlib
 import random
 import sys
-import tempfile
-import threading
 import unittest
 from unittest import mock
 
 TOOLS = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, TOOLS)
-
-import round as rounds  # noqa: E402
-import serve  # noqa: E402
-
-
-class GzipCacheTest(unittest.TestCase):
-    def test_rebuilds_replace_the_cached_version(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "game.wasm")
-            original = gzip.compress
-            with mock.patch.object(serve.gzip, "compress", wraps=original) as compress:
-                for i, version in enumerate((b"first", b"other", b"new build")):
-                    pathlib.Path(path).write_bytes(version)
-                    stamp = 1_000_000_000 + i
-                    os.utime(path, ns=(stamp, stamp))
-                    body = serve.gzipped(path)
-                    self.assertEqual(gzip.decompress(body), version)
-                    self.assertIs(serve.gzipped(path), body)
-                self.assertEqual(compress.call_count, 3)
-                self.assertEqual(serve._GZIPPED[path].body, body)
-            with serve._GZIPPED_LOCK:
-                del serve._GZIPPED[path]
-
-    def test_simultaneous_requests_compress_a_version_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "game.wasm")
-            pathlib.Path(path).write_bytes(b"wasm" * 100)
-            started, release = threading.Event(), threading.Event()
-            original = gzip.compress
-
-            def compress(data, **kwargs):
-                started.set()
-                self.assertTrue(release.wait(5))
-                return original(data, **kwargs)
-
-            with mock.patch.object(serve.gzip, "compress", side_effect=compress) as packed:
-                with concurrent.futures.ThreadPoolExecutor(8) as pool:
-                    pending = [pool.submit(serve.gzipped, path) for _ in range(8)]
-                    self.assertTrue(started.wait(5))
-                    release.set()
-                    bodies = [p.result(5) for p in pending]
-                self.assertEqual(packed.call_count, 1)
-                self.assertTrue(all(body is bodies[0] for body in bodies))
-            with serve._GZIPPED_LOCK:
-                del serve._GZIPPED[path]
-
-    def test_atomic_replacement_with_matching_size_and_mtime_replaces_cached_bytes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "game.wasm"
-            path.write_bytes(b"first")
-            stamp = path.stat().st_mtime_ns
-            self.assertEqual(gzip.decompress(serve.gzipped(str(path))), b"first")
-            replacement = pathlib.Path(tmp) / "replacement"
-            replacement.write_bytes(b"other")
-            os.utime(replacement, ns=(stamp, stamp))
-            replacement.replace(path)
-            self.assertEqual(gzip.decompress(serve.gzipped(str(path))), b"other")
-            with serve._GZIPPED_LOCK:
-                del serve._GZIPPED[str(path)]
-
-
-class RoundSummaryTest(unittest.TestCase):
-    def test_nearest_report_keeps_original_ties_and_duplicate_frames(self):
-        frames = [8, 2, 8, 14]
-        names = ["first", "earlier", "duplicate", "last"]
-        reports = [json.dumps({"report": True, "region": name, "site_m": 10,
-                              "site": name, "at": [0, 0], "water": 0})
-                   for name in names]
-        # Every interval is a hitch, so this covers both endpoints, exact hits and midpoints.
-        timing = {"began_ms": [40 * i for i in range(18)]}
-        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
-            summary = rounds.summarize(tmp, timing, reports, frames, snaps={3})
-        self.assertNotIn(4, [h["frame"] for h in summary["hitches"]])
-        for hitch in summary["hitches"]:
-            frame = hitch["frame"]
-            nearest = min(range(len(frames)), key=lambda i: abs(frames[i] - frame))
-            self.assertTrue(hitch["where"].startswith(names[nearest] + ","), hitch)
-        self.assertEqual(summary["regions"], names)
-        self.assertEqual(summary["reports"], len(reports))
-
-    def test_missing_reports_and_frames_are_empty(self):
-        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stdout(io.StringIO()):
-            summary = rounds.summarize(tmp, {"began_ms": []}, [], [])
-        self.assertEqual((summary["hitches"], summary["reports"]), ([], 0))
 
 
 class WgslBudgetTest(unittest.TestCase):

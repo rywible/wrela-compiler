@@ -3,7 +3,7 @@
 // threads (the program's own included), then saves the last frame, the state hash, the lines
 // the program printed (`log.txt`) and each frame's CPU time, when it began, and the frame each
 // printed line came in (`frames.json`) to `results/` for whoever runs the page (the compiler's
-// tests' `wrela_host::pages`, a tool's browser, tools/headless.py). With `audio`, the main thread also renders that many
+// tests' `wrela_host::pages`, a tool's browser). With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples (and how long
 // the render took, `audio-ms.json`); with `live=s`, it plays the voice in real time for s seconds
 // instead and saves what the browser says of the playback (`live.json`: its underruns, where it
@@ -167,7 +167,7 @@ export const inputUrl = pathUrl;
  * vectors check): `i / fps` (the WASM call rounds it to f32). */
 export const frameTime = (i: number, fps: number) => i / fps;
 
-/** PUTs a file into the page's `results/` directory (see tools/serve.py). */
+/** PUTs a file into the page's `results/` directory (a tool's server, `std::tool::serve`, or `wrela run`'s). */
 export async function putResult(base: string, name: string, body: BodyInit): Promise<void> {
   const url = new URL(`results/${name}`, base);
   const response = await fetch(url, { method: "PUT", body });

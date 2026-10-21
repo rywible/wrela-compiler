@@ -5,7 +5,7 @@
   Spike 01's scene pipelines created cold, all at once, as its main.js's `pipelines(salt, true)`
   does: the same 12 pipelines from the same files, the same layouts, unique source (its SALT).
   main.js runs its whole benchmark on load and exports nothing, so this copies that one function
-  and its layouts. tools/headless.py runs it; it PUTs results/pipelines.json ({ms, count}) and
+  and its layouts. The herd's test runs it in Chrome (`wrela_host::pages`); it PUTs results/pipelines.json ({ms, count}) and
   results/DONE (#42 AC4, herd::the_herds_pipelines_load_cold_as_fast).
 -->
 <script type="module">
