@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn unlifted_numbers_and_binary_minus_changes_require_a_rebuild() {
-        let dir = std::env::temp_dir().join(format!("wrela-lift-unlifted-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wrela-lift-rebuild-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("directory");
         let text = "fn f() { let n: u32 = 2; let x = n - 0.5 }\n";
