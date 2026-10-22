@@ -610,6 +610,15 @@ fn reports_are_json_for_strings_and_nonfinite_numbers() {
 }
 
 @test
+fn a_gradient_by_no_literals_gives_the_value_and_an_empty_gradient() {
+    let none: [Literal; 0] = []
+    let x = 1.5
+    let (v, d) = gradient(|| x * x + 1.0, none)
+    assert(v == 3.25)
+    assert(d.len() == 0)
+}
+
+@test
 fn rounding_tolerance_is_sign_safe() {
     assert(abs(rounding_limit(100.0) - 105.0) < 0.000001)
     assert(abs(rounding_limit(-100.0) + 95.0) < 0.000001)
