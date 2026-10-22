@@ -1796,6 +1796,13 @@ impl<'a> Ivx<'a> {
             if self.m.types.is_vector(ta) {
                 return Err(Error::internal("a vector comparison"));
             }
+            if matches!(op, BinOp::Eq | BinOp::Ne)
+                && os.is_float()
+                && !self.gpu()
+                && self.track.same_value(a, b)
+            {
+                return Ok(self.self_equal(out, op, ra, ta));
+            }
             return Ok(self.compare(out, op, ra, rb, os));
         }
         if os == Scalar::Bool {
@@ -2026,6 +2033,29 @@ impl<'a> Ivx<'a> {
                 }
             }
             _ => unreachable!("not a comparison"),
+        }
+    }
+
+    /// `x == x` (or `x != x`) for a float `x` of type `ty` with range `x`, on the CPU: false
+    /// only where `x` is NaN. A NaN shows in a range as a NaN bound, which the CPU's widening
+    /// makes infinite, so a range with finite bounds holds no NaN (as `compare` takes a single
+    /// value's range to hold none), and there the answer is decided. That is what lets an
+    /// interval nest (§14.2): the guards that make a NaN bound infinite (`unless_nan`, and
+    /// `interval`'s at the end) test `b == b` on bounds that are themselves ranges in an outer
+    /// interval, and pass them through rather than join them with an infinity. The GPU, which
+    /// has no such guards, keeps `compare`.
+    fn self_equal(&mut self, out: &mut Block, op: BinOp, x: Iv, ty: TypeId) -> Iv {
+        let bt = self.bool_ty();
+        let (neg_inf, inf) = (self.fc(out, ty, f64::NEG_INFINITY), self.fc(out, ty, f64::INFINITY));
+        let lo_finite = self.cmp(out, BinOp::Gt, x.0, neg_inf);
+        let hi_finite = self.cmp(out, BinOp::Lt, x.1, inf);
+        let surely = self.bin(out, BinOp::And, lo_finite, hi_finite, bt);
+        if op == BinOp::Eq {
+            let yes = self.emit(out, bt, Expr::Const(Const::Bool(true)));
+            (surely, yes)
+        } else {
+            let no = self.emit(out, bt, Expr::Const(Const::Bool(false)));
+            (no, self.not(out, surely))
         }
     }
 
