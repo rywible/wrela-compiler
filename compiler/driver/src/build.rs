@@ -45,11 +45,8 @@ pub fn emit_headless(
     simd: bool,
     role: wrela_sema::defs::Role,
 ) -> BuildOutput {
-    let module = match role {
-        wrela_sema::defs::Role::Tool => TOOL_WASM,
-        _ => SERVER_WASM,
-    };
     let tool = role == wrela_sema::defs::Role::Tool;
+    let module = if tool { TOOL_WASM } else { SERVER_WASM };
     let max_pages =
         if tool { wrela_abi::memory::TOOL_MAX_PAGES } else { wrela_abi::memory::MAX_PAGES };
     let options = wrela_wasm::Options { simd, shared_memory: tool, max_pages };

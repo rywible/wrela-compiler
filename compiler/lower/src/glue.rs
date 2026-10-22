@@ -192,6 +192,14 @@ impl G<'_, '_> {
         self.value(ty, ir::Expr::Load(p.clone()))
     }
 
+    /// A new local of type `ty`, holding zeros: where a clone is built.
+    fn zeroed(&mut self, ty: ir::TypeId) -> ir::Place {
+        let out = ir::Place::local(self.f.new_local("clone", ty));
+        let z = self.value(ty, ir::Expr::Zero(ty));
+        self.emit(ir::Stmt::Store(out.clone(), z));
+        out
+    }
+
     /// `if cond { body }`.
     fn when(&mut self, cond: ir::ValueId, body: impl FnOnce(&mut Self)) {
         self.blocks.push(Vec::new());
@@ -291,7 +299,7 @@ impl G<'_, '_> {
             .collect()
     }
 
-    /// The variants of enum `t` (empty for any other type).
+    /// How many variants enum `t` has (0 for any other type).
     fn variants(&self, t: TyId) -> u32 {
         let program = &self.cx.checked.program;
         match program.types.kind(t) {
@@ -380,20 +388,16 @@ impl G<'_, '_> {
         match program.types.kind(t).clone() {
             TyKind::Array(e, n) => {
                 let et = self.cx.lower_ty(self.mb, e, self.span)?;
-                let out = self.f.new_local("clone", ty);
-                let z = self.value(ty, ir::Expr::Zero(ty));
-                self.emit(ir::Stmt::Store(ir::Place::local(out), z));
+                let out = self.zeroed(ty);
                 self.counted(n, |g, i| {
                     if let Some(v) = g.clone_of(e, et, &p.with(ir::Proj::Index(i))) {
-                        g.emit(ir::Stmt::Store(ir::Place::local(out).with(ir::Proj::Index(i)), v));
+                        g.emit(ir::Stmt::Store(out.with(ir::Proj::Index(i)), v));
                     }
                 });
-                Some(self.load(&ir::Place::local(out), ty))
+                Some(self.load(&out, ty))
             }
             TyKind::Adt(..) if self.is_enum(t) => {
-                let out = self.f.new_local("clone", ty);
-                let z = self.value(ty, ir::Expr::Zero(ty));
-                self.emit(ir::Stmt::Store(ir::Place::local(out), z));
+                let out = self.zeroed(ty);
                 self.each_variant(t, p, |g, v| {
                     let mut vals = Vec::new();
                     for (fp, ft) in g.parts(t, p, Some(v)) {
@@ -408,25 +412,23 @@ impl G<'_, '_> {
                             .field(ty, 1 + v)
                             .map(|pt| g.value(pt, ir::Expr::Construct(pt, vals)));
                     let x = g.value(ty, ir::Expr::Variant(ty, v, payload));
-                    g.emit(ir::Stmt::Store(ir::Place::local(out), x));
+                    g.emit(ir::Stmt::Store(out.clone(), x));
                 });
-                Some(self.load(&ir::Place::local(out), ty))
+                Some(self.load(&out, ty))
             }
             // A job's value: its parts cloned into their fields, zeros in its temporaries'
             // (`fn.job-values`).
             TyKind::Adt(..) if self.cx.job_of(t).is_some() => {
-                let out = self.f.new_local("clone", ty);
-                let z = self.value(ty, ir::Expr::Zero(ty));
-                self.emit(ir::Stmt::Store(ir::Place::local(out), z));
+                let out = self.zeroed(ty);
                 let map = self.cx.field_map(self.mb, t, None, self.span);
                 for (k, ft) in map {
                     let Some(k) = k else { continue };
                     let ft = self.cx.checked.reveal(ft);
                     let fty = self.cx.lower_ty(self.mb, ft, self.span)?;
                     let x = self.clone_of(ft, fty, &p.with(ir::Proj::Field(k)))?;
-                    self.emit(ir::Stmt::Store(ir::Place::local(out).with(ir::Proj::Field(k)), x));
+                    self.emit(ir::Stmt::Store(out.with(ir::Proj::Field(k)), x));
                 }
-                Some(self.load(&ir::Place::local(out), ty))
+                Some(self.load(&out, ty))
             }
             TyKind::Adt(..) | TyKind::Tuple(_) => {
                 let mut vals = Vec::new();

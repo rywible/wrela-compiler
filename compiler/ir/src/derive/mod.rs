@@ -159,11 +159,17 @@ fn field_bits(types: &Types, t: TypeId, i: u32) -> (u32, u32) {
     (off, flat(types, fields[i as usize].1))
 }
 
+/// The `n` leaves of `whole` from `off`, as a value of type `ty` has them: all of its leaves
+/// when one is active and it has another number of them.
+fn part_bits(types: &Types, whole: Bits, off: u32, n: u32, ty: TypeId) -> Bits {
+    let bits = (whole >> off) & span(0, n);
+    if bits != 0 && n != leaves(types, ty) { all_bits(types, ty) } else { bits }
+}
+
 /// The leaves of `whole` (a value of type `t`) that its field `i` holds, as that field's own.
 fn field_of(types: &Types, t: TypeId, whole: Bits, i: u32, field_ty: TypeId) -> Bits {
     let (off, n) = field_bits(types, t, i);
-    let bits = (whole >> off) & span(0, n);
-    if bits != 0 && n != leaves(types, field_ty) { all_bits(types, field_ty) } else { bits }
+    part_bits(types, whole, off, n, field_ty)
 }
 
 /// Which values, locals and parameters depend on the active input, by leaf.
@@ -245,16 +251,21 @@ impl Activity {
             PlaceRoot::Param(i) => self.params[*i as usize],
             _ => 0,
         };
-        let bits = (root >> off) & span(0, n);
-        if bits != 0 && n != leaves(types, ty) { all_bits(types, ty) } else { bits }
+        part_bits(types, root, off, n, ty)
     }
 
-    /// Whether what a place holds is active in any leaf (`place_type` gives its type).
-    pub(crate) fn place(&self, m: &Module, f: &Function, p: &Place) -> bool {
+    /// The active leaves of what a place of `f` holds: [`Activity::place_bits`] of its type, or
+    /// one leaf, active with its root or an index, when the place has no type.
+    fn held_bits(&self, m: &Module, f: &Function, p: &Place) -> Bits {
         match m.place_ty(f, p) {
-            Some(ty) => self.place_bits(&m.types, p, ty) != 0,
-            None => self.index_active(p) || self.root(&p.root),
+            Some(ty) => self.place_bits(&m.types, p, ty),
+            None => (self.index_active(p) || self.root(&p.root)) as Bits,
         }
+    }
+
+    /// Whether what a place holds is active in any leaf.
+    pub(crate) fn place(&self, m: &Module, f: &Function, p: &Place) -> bool {
+        self.held_bits(m, f, p) != 0
     }
 
     /// Marks the leaves `bits` (of the place's type `ty`) of a local or parameter active; all
@@ -298,10 +309,7 @@ pub(crate) enum Mode {
 pub(crate) fn arg_bits(m: &Module, f: &Function, a: &Activity, arg: &Arg) -> Bits {
     match arg {
         Arg::Value(v) => a.values[v.index()],
-        Arg::Place(p) => match m.place_ty(f, p) {
-            Some(ty) => a.place_bits(&m.types, p, ty),
-            None => (a.index_active(p) || a.root(&p.root)) as Bits,
-        },
+        Arg::Place(p) => a.held_bits(m, f, p),
     }
 }
 

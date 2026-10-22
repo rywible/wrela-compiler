@@ -28,13 +28,9 @@ pub const FUEL: u64 = 1 << 34;
 /// 137 billion instructions: a few seconds.
 pub const TEST_FUEL: u64 = 1 << 37;
 
-/// Reads the files `embed` names, relative to the package's root at `root` (§13): a file that
-/// can't be read, or whose path leaves the package, is E0218.
-pub fn read_embeds(checked: &Checked, dirs: &[std::path::PathBuf]) -> (Embeds, Vec<Diagnostic>) {
-    read_embeds_in(&crate::reach::Reach::anywhere(), checked, dirs)
-}
-
-/// [`read_embeds`], reading only what `reach` may: a file outside it is E0218 too.
+/// Reads the files `embed` names, each relative to the directory in `dirs` of the package that
+/// embeds it (§13), reading only what `reach` may: a file that can't be read, whose path leaves
+/// the package, or that `reach` doesn't cover, is E0218.
 pub fn read_embeds_in(
     reach: &crate::reach::Reach,
     checked: &Checked,
@@ -306,16 +302,6 @@ fn emit(m: &wrela_ir::Module, simd: bool, shared: bool) -> Result<wrela_wasm::Em
         .map_err(|e| format!("the WASM back end failed on the build's code: {e}"))
 }
 
-/// The build's code, compiled for wasmtime ([`emit`]'s options).
-fn compile(
-    engine: &wasmtime::Engine,
-    m: &wrela_ir::Module,
-    simd: bool,
-    shared: bool,
-) -> Result<Compiled, String> {
-    Compiled::of(engine, emit(m, simd, shared)?)
-}
-
 fn refusal(results: u32) -> &'static str {
     if results == 0 {
         "build-time code can't call the host"
@@ -462,7 +448,7 @@ fn run_one(
     let ran = helpers.finish();
     let helped = running.read(|bytes| {
         let at = wrela_abi::memory::PAR_HELPED as usize;
-        bytes.get(at..at + 4).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        bytes.get(at..at + 4).and_then(|b| b.try_into().ok()).map_or(0, u32::from_le_bytes)
     });
     let used: u64 = main_used + ran.iter().map(|r| r.used).sum::<u64>();
     let helper_out_of_fuel = ran.iter().any(|r| r.out_of_fuel);
@@ -472,57 +458,46 @@ fn run_one(
         panic: None,
         text: "out of fuel".into(),
     };
-    match result {
-        Ok(addr) if used <= fuel => running.read(|bytes| {
-            let mem = Memory { bytes };
-            wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
-                let def = checked.program.const_(c);
-                Box::new(match e {
-                    wrela_lower::ReadError::TooDeep => Diagnostic::new(
-                        codes::E0704,
-                        def.span,
-                        format!("computing {} failed: {e}", def.shown()),
-                    ),
-                    _ => Diagnostic::internal(format!("reading the value of `{}`: {e}", def.name)),
+    let fault = match result {
+        Ok(addr) if used <= fuel => {
+            return running.read(|bytes| {
+                let mem = Memory { bytes };
+                wrela_lower::read_value(checked, c, &mem, addr).map(|v| (v, helped)).map_err(|e| {
+                    let def = checked.program.const_(c);
+                    Box::new(match e {
+                        wrela_lower::ReadError::TooDeep => Diagnostic::new(
+                            codes::E0704,
+                            def.span,
+                            format!("computing {} failed: {e}", def.shown()),
+                        ),
+                        _ => Diagnostic::internal(format!(
+                            "reading the value of `{}`: {e}",
+                            def.name
+                        )),
+                    })
                 })
-            })
-        }),
+            });
+        }
         // Its threads' work together was past its fuel.
-        Ok(_) => {
-            let fault = out_of_fuel(Vec::new());
-            Err(Box::new(failure(
-                checked,
-                sources,
-                &compiled.lines,
-                Item::Const(c, fuel),
-                &fault,
-                None,
-            )))
+        Ok(_) => out_of_fuel(Vec::new()),
+        Err(CallError::Internal(e)) => {
+            return Err(Box::new(Diagnostic::internal(format!("{e:#}"))));
         }
-        Err(CallError::Internal(e)) => Err(Box::new(Diagnostic::internal(format!("{e:#}")))),
-        Err(CallError::Failed(e, panic)) => {
-            let mut fault = Fault::of(&e, panic);
-            // A helper that ran out of fuel stops the job it ran, and its join traps: the
-            // constant ran out of fuel.
-            if helper_out_of_fuel {
-                fault = out_of_fuel(fault.frames);
-            }
-            Err(Box::new(failure(
-                checked,
-                sources,
-                &compiled.lines,
-                Item::Const(c, fuel),
-                &fault,
-                None,
-            )))
+        // A helper that ran out of fuel stops the job it ran, and its join traps: the constant
+        // ran out of fuel.
+        Err(CallError::Failed(e, panic)) if helper_out_of_fuel => {
+            out_of_fuel(Fault::of(&e, panic).frames)
         }
-    }
+        Err(CallError::Failed(e, panic)) => Fault::of(&e, panic),
+    };
+    let item = Item::Const(c, fuel);
+    Err(Box::new(failure(checked, sources, &compiled.lines, item, &fault, None)))
 }
 
-/// Runs the program package's `@test` functions (§13), after its constants are computed into
 /// A test that ran: which, why it failed if it did, and what it printed and timed.
 pub type Ran = (wrela_sema::ty::FnId, Option<Diagnostic>, wrela_host::Traced);
 
+/// Runs the program package's `@test` functions (§13), after its constants are computed into
 /// `data`: each test that ran (what it printed shown as it was made), with the errors lowering
 /// them found. A failure is E0706 or E0705. Each test runs on new memory, so one test can't
 /// change what another sees.
@@ -538,7 +513,9 @@ pub fn run_tests(
         return (Vec::new(), diags);
     };
     // Its own memory, unshared: each test runs on one thread.
-    let compiled = match compile(engine(false), &module.module, !data.no_simd, false) {
+    let compiled = match emit(&module.module, !data.no_simd, false)
+        .and_then(|out| Compiled::of(engine(false), out))
+    {
         Ok(c) => c,
         Err(msg) => return (Vec::new(), vec![Diagnostic::internal(msg)]),
     };
@@ -663,8 +640,6 @@ fn take_panic_message(data: &mut [u8]) -> Option<String> {
     Some(msg)
 }
 
-/// E0704, E0705 or E0706: why computing a constant or a test failed, where, and the calls that
-/// led there.
 /// How a call into the build's code failed: the WASM offset of each frame, innermost first;
 /// the trap, if it was one; the message a panic left; and the error as text.
 pub(crate) struct Fault {
@@ -687,6 +662,8 @@ impl Fault {
     }
 }
 
+/// E0704, E0705 or E0706: why computing a constant or a test failed, where, and the calls that
+/// led there.
 pub(crate) fn failure(
     checked: &Checked,
     sources: &SourceMap,
@@ -750,15 +727,9 @@ pub(crate) fn failure(
     if !in_item(&primary) && !chain.iter().any(in_item) {
         d = d.with_secondary(item_span, item.within(p));
     }
-    let names: Vec<String> = chain.iter().rev().filter_map(|&s| enclosing_fn(checked, s)).fold(
-        Vec::new(),
-        |mut v, n| {
-            if v.last() != Some(&n) {
-                v.push(n);
-            }
-            v
-        },
-    );
+    let mut names: Vec<String> =
+        chain.iter().rev().filter_map(|&s| enclosing_fn(checked, s)).collect();
+    names.dedup();
     if names.len() > 1 {
         d = d.with_note(format!("the call chain: {}", names.join(" → ")));
     }

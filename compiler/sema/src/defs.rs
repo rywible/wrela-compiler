@@ -115,6 +115,13 @@ pub struct ParamDef {
     pub fn_bound: Option<TyId>,
 }
 
+impl ParamDef {
+    /// A type parameter named `name`, with no bounds yet.
+    pub fn new(name: String, span: Span) -> ParamDef {
+        ParamDef { name, bounds: Vec::new(), span, is_self: false, is_const: false, fn_bound: None }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FieldDef {
     pub name: String,
@@ -534,7 +541,8 @@ lang_items! {
 }
 
 impl Lang {
-    /// `Copy`, `Clone` and `GpuData`: traits a type has through its fields, by opting in.
+    /// `Copy`, `Clone`, `GpuData`, `Fieldless` and `Packed`: traits a type has by opting in,
+    /// which hold through its fields or variants, not through an impl.
     pub fn is_structural(self) -> bool {
         matches!(self, Lang::Copy | Lang::Clone | Lang::GpuData | Lang::Fieldless | Lang::Packed)
     }
@@ -829,9 +837,8 @@ impl JobHeld {
         let mut locals = Vec::new();
         for (i, d) in body.locals.iter().enumerate() {
             // A value with nothing in it (`()`, a function named as a value) has no field.
-            let empty =
-                matches!(p.types.kind(d.ty), TyKind::Never | TyKind::Error | TyKind::FnDef(..))
-                    || matches!(p.types.kind(d.ty), TyKind::Tuple(ts) if ts.is_empty());
+            let empty = d.ty == p.types.unit
+                || matches!(p.types.kind(d.ty), TyKind::Never | TyKind::Error | TyKind::FnDef(..));
             if !d.kind.owns_value() || d.closure.is_some() || empty {
                 continue;
             }
@@ -841,12 +848,9 @@ impl JobHeld {
             locals.push((name, i as u32, d.ty));
         }
         // FNV-1a 64 of the job's text: its signature and its body.
-        let text = p.text(p.func(f).span).unwrap_or("");
-        let mut code: u64 = 0xcbf29ce484222325;
-        for b in text.bytes() {
-            code = (code ^ u64::from(b)).wrapping_mul(0x100000001b3);
-        }
-        JobHeld { locals, code }
+        let mut code = wrela_abi::hash::StateHash::new();
+        code.update(p.text(p.func(f).span).unwrap_or("").as_bytes());
+        JobHeld { locals, code: code.value() }
     }
 }
 

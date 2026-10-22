@@ -179,6 +179,13 @@ impl<S, T> Step<S, T> {
     }
 }
 
+impl<S: Clone + Pack, T: Clone + Pack> Step<S, T> {
+    /// Sends `down` on connection `conn`.
+    fn send(mut self, conn: u32, down: Down<S, T>) {
+        self.sends.push((conn, pack(down)))
+    }
+}
+
 /// How many entries a peer is sent to catch up after a hello: one further behind is sent the
 /// state instead, so a welcome is a bounded number of messages.
 pub const CATCH_UP: u64 = 128
@@ -303,6 +310,12 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         }
     }
 
+    /// Applies record `r`, and gives it to the host to keep durably.
+    fn journal(mut self, out: mut Step<S, T>, r: take Record<S, T>) {
+        self.keep(r.clone())
+        out.records.push(take r)
+    }
+
     /// Notes a peer's proposal settled. A room takes counter `c` only once its peer has every
     /// outcome through `c - WINDOW`, so those go, even in a replay, which has no acknowledgements:
     /// a peer's kept outcomes are at most `WINDOW`.
@@ -356,7 +369,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
 
     /// Refuses connection `conn`: tells it why, and closes it.
     fn refuse(mut self, out: mut Step<S, T>, conn: u32, why: u32) {
-        out.sends.push((conn, pack(Down::<S, T>::Refused { why })))
+        out.send(conn, Down::Refused { why })
         out.closes.push(conn)
         self.closed(conn)
     }
@@ -455,9 +468,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         } else {
             // A token the room hasn't seen: it joins, once, whatever happens to the replies.
             let id = self.next_peer
-            let joined = Record::Joined { peer: id, token }
-            self.keep(joined.clone())
-            out.records.push(take joined)
+            self.journal(mut out, Record::Joined { peer: id, token })
             i = self.peer_at(id).unwrap()
         }
         let id = self.peers[i].id
@@ -466,9 +477,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
             return
         }
         if session > self.peers[i].session {
-            let started = Record::Session { peer: id, session }
-            self.keep(started.clone())
-            out.records.push(take started)
+            self.journal(mut out, Record::Session { peer: id, session })
         } else if !self.ack(i, acked) {
             self.refuse(mut out, conn, BAD_ACK)
             return
@@ -480,46 +489,24 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         }
         // One live connection a peer: an older one is closed.
         self.attach(mut out, conn, i)
-        out.sends.push(
-            (
-                conn,
-                pack(
-                    Down::<S, T>::Welcome {
-                        peer: id,
-                        session: self.peers[i].session,
-                        seq: self.seq,
-                    },
-                ),
-            ),
-        )
+        out.send(conn, Down::Welcome { peer: id, session: self.peers[i].session, seq: self.seq })
         // The log it lacks: the state instead, if it has less than the room's snapshot or is
         // more than `CATCH_UP` entries behind.
         let whole = have < self.base || self.seq - have > CATCH_UP
         if whole {
-            out.sends.push(
-                (conn, pack(Down::<S, T>::State { seq: self.seq, state: self.state.clone() })),
-            )
+            out.send(conn, Down::State { seq: self.seq, state: self.state.clone() })
         } else {
             for k in have..self.seq {
-                out.sends.push(
-                    (
-                        conn,
-                        pack(
-                            Down::<S, T>::Committed { entry: self.log[u32(k - self.base)].clone() },
-                        ),
-                    ),
-                )
+                out.send(conn, Down::Committed { entry: self.log[u32(k - self.base)].clone() })
             }
         }
         // Its refusals it hasn't acknowledged; its commits are in the log it was sent, or done
         // if they're in the state it was sent.
         for o in self.peers[i].outcomes {
             if o.seq == 0 {
-                out.sends.push(
-                    (conn, pack(Down::<S, T>::Rejected { counter: o.counter, reason: o.reason })),
-                )
+                out.send(conn, Down::Rejected { counter: o.counter, reason: o.reason })
             } else if whole {
-                out.sends.push((conn, pack(Down::<S, T>::Done { counter: o.counter })))
+                out.send(conn, Down::Done { counter: o.counter })
             }
         }
     }
@@ -536,10 +523,8 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
             return out
         }
         let id = ProposalId { peer: self.peers[i].id, session: self.peers[i].session, counter }
-        let record = Record::Rejected { id, reason: TRAPPED }
-        self.keep(record.clone())
-        out.records.push(take record)
-        out.sends.push((conn, pack(Down::<S, T>::Rejected { counter, reason: TRAPPED })))
+        self.journal(mut out, Record::Rejected { id, reason: TRAPPED })
+        out.send(conn, Down::Rejected { counter, reason: TRAPPED })
         out
     }
 
@@ -568,7 +553,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         let id = self.peers[i].id
         for k in 0..self.conns.len() {
             if self.conns[k].1 == id && self.conns[k].0 != conn {
-                out.sends.push((self.conns[k].0, pack(Down::<S, T>::Refused { why: REPLACED })))
+                out.send(self.conns[k].0, Down::Refused { why: REPLACED })
                 out.closes.push(self.conns[k].0)
             }
         }
@@ -594,22 +579,20 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         if counter < p.next {
             // Sent again: its outcome, if it's still kept; else it was acknowledged.
             if counter <= p.acked {
-                out.sends.push((conn, pack(Down::<S, T>::Done { counter })))
+                out.send(conn, Down::Done { counter })
                 return
             }
             for o in p.outcomes {
                 if o.counter == counter {
                     let again = if o.seq == 0 {
-                        Down::<S, T>::Rejected { counter, reason: o.reason }
+                        Down::Rejected { counter, reason: o.reason }
                     } else if o.seq <= self.base {
                         // Its entry is in the snapshot, which the peer has.
-                        Down::<S, T>::Done { counter }
+                        Down::Done { counter }
                     } else {
-                        Down::<S, T>::Committed {
-                            entry: self.log[u32(o.seq - 1 - self.base)].clone(),
-                        }
+                        Down::Committed { entry: self.log[u32(o.seq - 1 - self.base)].clone() }
                     }
-                    out.sends.push((conn, pack(again)))
+                    out.send(conn, again)
                 }
             }
             return
@@ -626,9 +609,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         let entry = Entry { seq: self.seq + 1, id, at, value }
         match checked(self.state, entry) {
             Verdict::Accept => {
-                let record = Record::Committed { entry: entry.clone() }
-                self.keep(record.clone())
-                out.records.push(take record)
+                self.journal(mut out, Record::Committed { entry: entry.clone() })
                 // Every peer's connection gets the entry, the proposer's too.
                 let bytes = pack(Down::<S, T>::Committed { entry })
                 for c in self.conns {
@@ -638,10 +619,8 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
                 }
             },
             Verdict::Reject(reason) => {
-                let record = Record::Rejected { id, reason }
-                self.keep(record.clone())
-                out.records.push(take record)
-                out.sends.push((conn, pack(Down::<S, T>::Rejected { counter, reason })))
+                self.journal(mut out, Record::Rejected { id, reason })
+                out.send(conn, Down::Rejected { counter, reason })
             },
         }
     }
@@ -760,19 +739,15 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Log<S, T> {
         }
         var out: Vec<Vec<u8>> = Vec::new()
         if self.connected && self.welcomed {
-            out.push(
-                pack(
-                    Up::Propose {
-                        peer: self.peer,
-                        session: self.session,
-                        counter,
-                        value: value.clone(),
-                    },
-                ),
-            )
+            out.push(self.proposal(counter, value))
         }
         self.pending.push((counter, take value))
         Ok(out)
+    }
+
+    /// Its proposal `counter` of `value`, as the room reads it.
+    fn proposal(self, counter: u32, value: T) -> Vec<u8> {
+        pack(Up::Propose { peer: self.peer, session: self.session, counter, value: value.clone() })
     }
 
     /// Whether proposal `counter` is one of its unsettled ones.
@@ -825,16 +800,7 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Log<S, T> {
                 // Now its unsettled proposals go, again, with their counters.
                 self.welcomed = true
                 for p in self.pending {
-                    out.push(
-                        pack(
-                            Up::Propose {
-                                peer: self.peer,
-                                session: self.session,
-                                counter: p.0,
-                                value: p.1.clone(),
-                            },
-                        ),
-                    )
+                    out.push(self.proposal(p.0, p.1))
                 }
             },
             Down::State { seq, state } => {
@@ -1552,9 +1518,7 @@ pub fn compact(snapshot: [u8]) {
 pub fn open(conn: u32, room: str) {
     var body: Vec<u8> = Vec::with_capacity(4 + room.len())
     word(mut body, conn)
-    for i in 0..room.len() {
-        body.push(room.byte(i))
-    }
+    body.append_text(room)
     let _ = request("net/open", body)
 }
 

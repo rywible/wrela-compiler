@@ -2,7 +2,9 @@
 // them: little-endian words, an f32 as its bits, a string as its length in bytes then its UTF-8.
 
 const ENCODER = new TextEncoder();
-const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+/** Strict UTF-8 that keeps a leading byte-order mark: wasm.ts's `UTF8`, made again here so the
+ * main thread's bundle doesn't take in the WASM reader. */
+export const UTF8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /** Reads a request's body from the start; each read past its end throws. */
 export class Reader {
@@ -29,11 +31,11 @@ export class Reader {
   str(): string {
     const n = this.u32();
     const at = this.#need(n);
-    return DECODER.decode(this.bytes.subarray(at, at + n));
+    return UTF8.decode(this.bytes.subarray(at, at + n));
   }
   /** What's left, as text. */
   rest(): string {
-    return DECODER.decode(this.bytes.subarray(this.#need(this.bytes.length - this.#at)));
+    return UTF8.decode(this.bytes.subarray(this.#need(this.bytes.length - this.#at)));
   }
 }
 

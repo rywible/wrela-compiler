@@ -13,12 +13,13 @@
 //! it's called by the code it's passed to on the maker's behalf).
 
 use crate::borrowck;
+use crate::builtins::BuiltinFn;
 use crate::defs::*;
 use crate::mir::{self, Body, Callee, Rvalue, StatementKind, TerminatorKind};
 use crate::program::Program;
 use crate::traits;
 use crate::ty::*;
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use wrela_diag::{Diagnostic, Span, codes};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -98,34 +99,37 @@ pub struct Effects<'p> {
     /// Each body's effects, everything it reaches included.
     all: HashMap<BodyId, Vec<Effect>>,
     /// The bodies that reach a call whose effects aren't known here ([`Node::open`]).
-    open: std::collections::HashSet<BodyId>,
+    open: HashSet<BodyId>,
 }
 
 /// Each body's own effects: where each happens, and what it is. Lowering checks them again for
 /// what a `@deterministic` function reaches through calls whose targets only instantiation knows
 /// (a trait method of a generic parameter), which [`check`] can't see.
-pub fn direct_effects(
-    p: &Program,
-    mir: &BTreeMap<FnId, Body>,
-) -> BTreeMap<BodyId, Vec<(Effect, Span, String)>> {
+pub type Direct = BTreeMap<BodyId, Vec<(Effect, Span, String)>>;
+
+/// Each body's [`Node`]: each function's, and its closures'.
+fn nodes(p: &Program, mir: &BTreeMap<FnId, Body>) -> BTreeMap<BodyId, Node> {
     let hidden: HashMap<FnId, TyId> =
         mir.iter().filter_map(|(&f, b)| b.hidden_ret.map(|h| (f, h))).collect();
     let mut out = BTreeMap::new();
     for (&f, body) in mir {
         for (k, code) in body.fns.iter().enumerate() {
             let closure = (k > 0).then(|| ClosureId(k as u32 - 1));
-            let direct = node(p, f, body, code, &hidden).direct;
-            if !direct.is_empty() {
-                out.insert(BodyId { func: f, closure }, direct);
-            }
+            out.insert(BodyId { func: f, closure }, node(p, f, body, code, &hidden));
         }
     }
     out
 }
 
-/// Checks every context's effects (E0600).
-pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
-    let fx = Effects::build(p, mir);
+/// Checks every context's effects (E0600), and gives each body's own effects ([`Direct`]).
+pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direct) {
+    let nodes = nodes(p, mir);
+    let direct = nodes
+        .iter()
+        .filter(|(_, n)| !n.direct.is_empty())
+        .map(|(&id, n)| (id, n.direct.clone()))
+        .collect();
+    let fx = Effects::of(p, nodes);
     let mut out = Vec::new();
     for (&f, body) in mir {
         let def = p.func(f);
@@ -185,7 +189,7 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
             }
         }
     }
-    out
+    (out, direct)
 }
 
 /// E0333: a statement that calls a function only to throw its value away, where the call
@@ -193,7 +197,6 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> Vec<Diagnostic> {
 /// `grow(p, 2.0)` written as statements look like changes in place to a reader used to them,
 /// and do nothing. `let _ = f()` discards on purpose.
 fn discarded_results(p: &Program, body: &Body, fx: &Effects) -> Vec<Diagnostic> {
-    use crate::builtins::BuiltinFn;
     let mut out = Vec::new();
     for (callee, lends_mut, ty, span) in &body.discarded {
         if *lends_mut
@@ -277,7 +280,7 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
                 _ => param.ty,
             };
             let TyKind::FnPtr(_, _, flags) = p.types.kind(fn_ty) else { continue };
-            if !(flags.deterministic || flags.parallel || flags.audio) {
+            if !flags.attrs().iter().any(|a| a.1) {
                 continue;
             }
             let Some(target) = a.place().and_then(|place| callable_body(p, f, body, place, held))
@@ -305,7 +308,7 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
                 let TyKind::FnPtr(_, _, flags) = p.types.kind(p.types.subst(bound, &subst)) else {
                     continue;
                 };
-                if !(flags.deterministic || flags.parallel || flags.audio) {
+                if !flags.attrs().iter().any(|a| a.1) {
                     continue;
                 }
                 let Some(target) = subst.get(g).and_then(|ty| callable_type_body(p, f, ty)) else {
@@ -328,7 +331,7 @@ fn typed_callables(p: &Program, f: FnId, body: &Body) -> Vec<TypedArg> {
             let TyKind::Param(g) = p.types.kind(field.ty) else { continue };
             let Some(bound) = p.param(*g).fn_bound else { continue };
             let TyKind::FnPtr(_, _, flags) = p.types.kind(bound) else { continue };
-            if !(flags.deterministic || flags.parallel || flags.audio) {
+            if !flags.attrs().iter().any(|a| a.1) {
                 continue;
             }
             let Some(target) = op.place().and_then(|place| callable_body(p, f, body, place, held))
@@ -353,41 +356,11 @@ fn adts_with_held(
     body: &Body,
     mut visit: impl FnMut(AdtId, &[mir::Operand], &HashMap<mir::Local, BodyId>),
 ) {
-    let mut held: HashMap<mir::Local, BodyId> = HashMap::new();
-    for code in &body.fns {
-        for b in &code.blocks {
-            for s in &b.stmts {
-                let (StatementKind::Assign(_, r) | StatementKind::Eval(r)) = &s.kind else {
-                    continue;
-                };
-                if let StatementKind::Assign(place, r) = &s.kind
-                    && place.proj.is_empty()
-                {
-                    match r {
-                        Rvalue::Closure(id) => {
-                            held.insert(place.local, BodyId { func: f, closure: Some(*id) });
-                        }
-                        Rvalue::FnRef(g, _) => {
-                            held.insert(place.local, BodyId { func: *g, closure: None });
-                        }
-                        Rvalue::Use(op) => {
-                            if let mir::OperandKind::Copy(from) | mir::OperandKind::Move(from, _) =
-                                &op.kind
-                                && from.proj.is_empty()
-                                && let Some(&b) = held.get(&from.local)
-                            {
-                                held.insert(place.local, b);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                if let Rvalue::Adt { adt, variant: None, fields, .. } = r {
-                    visit(*adt, fields, &held);
-                }
-            }
+    rvalues_with_held(f, body, true, |r, held| {
+        if let Rvalue::Adt { adt, variant: None, fields, .. } = r {
+            visit(*adt, fields, held);
         }
-    }
+    });
 }
 
 /// Calls `visit` on each call in `body` (in its closures too), with what each local holds at
@@ -397,31 +370,45 @@ fn calls_with_held(
     body: &Body,
     mut visit: impl FnMut(&mir::Call, &HashMap<mir::Local, BodyId>),
 ) {
+    rvalues_with_held(f, body, false, |r, held| {
+        if let Rvalue::Call(c) = r {
+            visit(c, held);
+        }
+    });
+}
+
+/// Calls `visit` on each value `body` computes (in its closures too), with what each local
+/// holds at that point: a closure or a named function. With `copies`, a local given a whole
+/// copy of one that holds one holds it too.
+fn rvalues_with_held(
+    f: FnId,
+    body: &Body,
+    copies: bool,
+    mut visit: impl FnMut(&Rvalue, &HashMap<mir::Local, BodyId>),
+) {
     let mut held: HashMap<mir::Local, BodyId> = HashMap::new();
-    for code in &body.fns {
-        for b in &code.blocks {
-            for s in &b.stmts {
-                let (StatementKind::Assign(_, r) | StatementKind::Eval(r)) = &s.kind else {
-                    continue;
-                };
-                if let StatementKind::Assign(place, r) = &s.kind
-                    && place.proj.is_empty()
-                {
-                    match r {
-                        Rvalue::Closure(id) => {
-                            held.insert(place.local, BodyId { func: f, closure: Some(*id) });
-                        }
-                        Rvalue::FnRef(g, _) => {
-                            held.insert(place.local, BodyId { func: *g, closure: None });
-                        }
-                        _ => {}
+    for (s, r) in mir::rvalues(body) {
+        if let StatementKind::Assign(place, _) = &s.kind
+            && place.proj.is_empty()
+        {
+            let holds = match r {
+                Rvalue::Closure(id) => Some(BodyId { func: f, closure: Some(*id) }),
+                Rvalue::FnRef(g, _) => Some(BodyId { func: *g, closure: None }),
+                Rvalue::Use(op) if copies => match &op.kind {
+                    mir::OperandKind::Copy(from) | mir::OperandKind::Move(from, _)
+                        if from.proj.is_empty() =>
+                    {
+                        held.get(&from.local).copied()
                     }
-                }
-                if let Rvalue::Call(c) = r {
-                    visit(c, &held);
-                }
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(b) = holds {
+                held.insert(place.local, b);
             }
         }
+        visit(r, &held);
     }
 }
 
@@ -541,16 +528,10 @@ pub struct EffectWhy {
 impl<'p> Effects<'p> {
     /// The effect graph of every body in `mir`.
     pub fn build(p: &'p Program, mir: &BTreeMap<FnId, Body>) -> Effects<'p> {
-        let hidden: HashMap<FnId, TyId> =
-            mir.iter().filter_map(|(&f, b)| b.hidden_ret.map(|h| (f, h))).collect();
-        let mut nodes = BTreeMap::new();
-        for (&f, body) in mir {
-            for (k, code) in body.fns.iter().enumerate() {
-                let closure = (k > 0).then(|| ClosureId(k as u32 - 1));
-                let id = BodyId { func: f, closure };
-                nodes.insert(id, node(p, f, body, code, &hidden));
-            }
-        }
+        Effects::of(p, nodes(p, mir))
+    }
+
+    fn of(p: &'p Program, nodes: BTreeMap<BodyId, Node>) -> Effects<'p> {
         // std functions without bodies here (intrinsics) have their effects by what they are.
         let mut fx = Effects { p, nodes, all: HashMap::new(), open: Default::default() };
         fx.mark_recursion();
@@ -749,7 +730,7 @@ impl<'p> Effects<'p> {
     fn witness(&self, root: BodyId, e: Effect) -> Option<(Vec<BodyId>, Span, String)> {
         let mut prev: HashMap<BodyId, BodyId> = HashMap::new();
         let mut queue = VecDeque::from([root]);
-        let mut seen = std::collections::HashSet::from([root]);
+        let mut seen = HashSet::from([root]);
         let mut drop = None;
         while let Some(b) = queue.pop_front() {
             let node = self.nodes.get(&b)?;
@@ -784,13 +765,7 @@ impl<'p> Effects<'p> {
 /// Function and closure values that can reach a use beyond copying into an unused binding.
 /// Constructing an unused callable does not execute its body. Values that may be passed or
 /// called keep the usual conservative effect link.
-fn used_callables(
-    p: &Program,
-    body: &Body,
-    code: &mir::FnBody,
-) -> std::collections::HashSet<(usize, usize)> {
-    use std::collections::HashSet;
-
+fn used_callables(p: &Program, body: &Body, code: &mir::FnBody) -> HashSet<(usize, usize)> {
     if !code.blocks.iter().any(|b| {
         b.stmts.iter().any(|s| {
             matches!(&s.kind, StatementKind::Assign(_, Rvalue::FnRef(..) | Rvalue::Closure(_)))
@@ -952,10 +927,11 @@ fn node(
             };
             match r {
                 Rvalue::Call(c) => match &c.callee {
-                    Callee::Fn { func, .. } => call_to(&mut n, *func, c.span),
                     // Resuming a job runs its body to its next `yield`; starting one moves its
                     // arguments into its value.
-                    Callee::JobResume { func, .. } => call_to(&mut n, *func, c.span),
+                    Callee::Fn { func, .. } | Callee::JobResume { func, .. } => {
+                        call_to(&mut n, *func, c.span)
+                    }
                     Callee::JobStart { .. } => {}
                     Callee::TraitMethod { method, self_ty, trait_args, method_args } => {
                         // Resolved here only when the type is known; otherwise lowering checks
@@ -987,10 +963,10 @@ fn node(
                             }
                         }
                     }
-                    Callee::Builtin(crate::builtins::BuiltinFn::Panic) => {
+                    Callee::Builtin(BuiltinFn::Panic) => {
                         n.direct.push((Effect::Panic, c.span, "`panic`".into()));
                     }
-                    Callee::Builtin(crate::builtins::BuiltinFn::Assert) => {
+                    Callee::Builtin(BuiltinFn::Assert) => {
                         n.direct.push((Effect::Panic, c.span, "`assert`".into()));
                     }
                     Callee::Clone => {
@@ -1215,6 +1191,13 @@ mod tests {
     use std::collections::HashSet;
     use wrela_diag::FileId;
 
+    /// The diagnostics of checking `source` as a program, with std.
+    fn check_source(source: &str) -> Vec<wrela_diag::Diagnostic> {
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        diagnostics
+    }
+
     #[test]
     fn attributed_function_fields_check_projected_callables() {
         for callable in ["now", "|| now()"] {
@@ -1227,8 +1210,7 @@ mod tests {
                      let _ = Checked {{ value: held.value }}\n\
                  }}\n"
             );
-            let mut diagnostics = Vec::new();
-            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            let diagnostics = check_source(&source);
             assert!(
                 diagnostics.iter().any(|d| d.code == codes::E0600),
                 "{callable}: {diagnostics:#?}"
@@ -1249,8 +1231,7 @@ mod tests {
                      1\n\
                  }}\n"
             );
-            let mut diagnostics = Vec::new();
-            crate::check_program(crate::test_units(&source), &mut diagnostics);
+            let diagnostics = check_source(&source);
             assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
         }
         let source = "
@@ -1262,8 +1243,7 @@ pub fn inspect() -> u32 {
     1
 }
 ";
-        let mut diagnostics = Vec::new();
-        crate::check_program(crate::test_units(source), &mut diagnostics);
+        let diagnostics = check_source(source);
         assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
         let source = "
 use std::time::now
@@ -1273,8 +1253,7 @@ pub fn inspect() -> f64 {
     clock()
 }
 ";
-        let mut diagnostics = Vec::new();
-        crate::check_program(crate::test_units(source), &mut diagnostics);
+        let diagnostics = check_source(source);
         assert!(diagnostics.iter().any(|d| d.code.as_str() == "E0600"), "{diagnostics:#?}");
     }
 

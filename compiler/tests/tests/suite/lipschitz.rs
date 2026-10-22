@@ -4,7 +4,7 @@
 //! sphere tracing can step by; and a debug build catches a wrong bound.
 
 use crate::built;
-use wrela_host::{CpuBuild, CpuHost, Value};
+use wrela_host::{CpuHost, Value};
 use wrela_tests::{one_f32, one_u32};
 
 const NAMES: [&str; 10] = [
@@ -25,7 +25,7 @@ const SCALES: [f32; 10] = [1.0, 1.0, 1.0, 0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 const SCOPES: [f32; 2] = [0.02, 0.1];
 
 fn host() -> CpuHost {
-    CpuBuild::load(built("fields")).expect("load").start_with(1).expect("start")
+    crate::cpu_host(&built("fields"))
 }
 
 #[test]
@@ -92,10 +92,10 @@ fn the_corpus_bounds_at_10_cm() {
 #[test]
 fn a_debug_build_catches_a_wrong_bound() {
     let release = crate::built("lipschitz");
-    let mut host = CpuBuild::load(&release).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(&release);
     assert_eq!(one_f32(&mut host, "bound_at", &[]), 0.2);
     let debug = crate::built_debug("lipschitz");
-    let mut host = CpuBuild::load(&debug).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(&debug);
     let err = host.call_export("bound_at", &[]).expect_err("a panic").to_string();
     assert!(err.contains("a Lipschitz bound of 0.5 for |distance| < 0.1 is too small"), "{err}");
 }

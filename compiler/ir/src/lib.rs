@@ -22,10 +22,6 @@ pub mod print;
 pub mod scalarize;
 mod single_exit;
 mod types;
-
-/// Texture formats and render targets are the ABI's: what the manifest and the stream carry.
-pub use wrela_abi::manifest::RenderTarget;
-pub use wrela_abi::stream::TextureFormat;
 pub mod uniformity;
 mod unroll;
 mod verify;
@@ -35,6 +31,9 @@ pub mod workgroup;
 pub use error::{Error, Result};
 pub use types::*;
 pub use verify::verify;
+/// Texture formats and render targets are the ABI's: what the manifest and the stream carry.
+pub use wrela_abi::manifest::RenderTarget;
+pub use wrela_abi::stream::TextureFormat;
 
 use std::fmt;
 
@@ -572,6 +571,13 @@ pub struct Param {
     pub mutable: bool,
 }
 
+impl Param {
+    /// A parameter passed by value.
+    pub fn value(name: impl Into<String>, ty: TypeId) -> Param {
+        Param { name: name.into(), ty, by_ref: false, mutable: false }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalDecl {
     pub name: String,
@@ -930,10 +936,6 @@ impl Module {
     }
 }
 
-/// A name as an identifier both back ends accept: letters, digits and single underscores, not
-/// starting with a digit or an underscore (WGSL reserves names starting with `__`). The WGSL
-/// writer may still rename one (a WGSL keyword, a name ending in a digit, a name used twice),
-/// so the manifest takes entry points' names from the written shader (`wrela_wgsl::emit`).
 /// The name of a tuple's element `i`, or a closure's capture: a letter (`a` to `z`), short
 /// because a nested tuple's paths repeat it at each level (a creature's parts are pairs of
 /// pairs: `u.field.parts.a.a.a.b` in every read of its uniform data, on the GPU), then `e26` on.
@@ -941,6 +943,10 @@ pub fn element_name(i: usize) -> String {
     if i < 26 { char::from(b'a' + i as u8).to_string() } else { format!("e{i}") }
 }
 
+/// A name as an identifier both back ends accept: letters, digits and single underscores, not
+/// starting with a digit or an underscore (WGSL reserves names starting with `__`). The WGSL
+/// writer may still rename one (a WGSL keyword, a name ending in a digit, a name used twice),
+/// so the manifest takes entry points' names from the written shader (`wrela_wgsl::emit`).
 pub fn ident(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     for c in name.chars() {

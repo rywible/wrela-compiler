@@ -297,8 +297,8 @@ impl Report {
         let mut log = self.stderr.clone();
         let mut lines = Vec::new();
         let mut failed = Vec::new();
-        let tests = self.json["tests"].as_array().cloned().unwrap_or_default();
-        for t in &tests {
+        let tests = self.json["tests"].as_array().map_or(&[][..], Vec::as_slice);
+        for t in tests {
             let name = t["name"].as_str().unwrap_or("?");
             let at = t["at"].as_str().unwrap_or("?");
             let passed = t["passed"].as_bool() == Some(true);

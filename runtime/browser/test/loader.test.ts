@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MANIFEST_VERSION } from "../src/abi.gen.ts";
-import { pathProblem } from "../src/check.ts";
+import { pathProblem } from "../src/path.ts";
 import { browserIo, type Fetch, loadBuild, loadScript } from "../src/loader.ts";
 import { ManifestError } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";

@@ -20,7 +20,7 @@
 //! **A script** ([`wrela_chrome::script`]) gives the page trusted input while it runs, and the run
 //! passes only once the script has finished too; a step that fails fails the run.
 
-use crate::loopback;
+use crate::{locked, loopback};
 use cap_std::fs::Dir;
 use std::io::BufReader;
 use std::net::{Shutdown, TcpListener, TcpStream};
@@ -47,10 +47,6 @@ pub struct Page<'a> {
     pub fragment: &'a str,
     pub timeout: Duration,
     pub script: Option<&'a [Step]>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// The process's Chrome: who holds it, and why it couldn't start, if it couldn't.
@@ -91,27 +87,24 @@ impl Lease {
         launch: impl FnOnce() -> Result<Browser, String>,
     ) -> Result<Lease, String> {
         let held = shared;
-        let mut shared = lock(held);
+        let mut shared = locked(held);
         if let Some(why) = &shared.failed {
             return Err(why.clone());
         }
         let browser = match &shared.browser {
             Some(b) => b.clone(),
-            None => {
-                let launched = launch();
-                match launched {
-                    Ok(b) => {
-                        let b = Arc::new(b);
-                        shared.browser = Some(b.clone());
-                        b
-                    }
-                    Err(why) => {
-                        let why = format!("the test browser failed to start: {why}");
-                        shared.failed = Some(why.clone());
-                        return Err(why);
-                    }
+            None => match launch() {
+                Ok(b) => {
+                    let b = Arc::new(b);
+                    shared.browser = Some(b.clone());
+                    b
                 }
-            }
+                Err(why) => {
+                    let why = format!("the test browser failed to start: {why}");
+                    shared.failed = Some(why.clone());
+                    return Err(why);
+                }
+            },
         };
         shared.users += 1;
         Ok(Lease { browser, shared: held })
@@ -121,7 +114,7 @@ impl Lease {
 impl Drop for Lease {
     fn drop(&mut self) {
         let last = {
-            let mut shared = lock(self.shared);
+            let mut shared = locked(self.shared);
             shared.users -= 1;
             if shared.users == 0 { shared.browser.take() } else { None }
         };
@@ -159,7 +152,7 @@ pub fn run(page: Page) -> Result<(), String> {
     let server = Server::start(page.root, page.page)?;
     let url = format!("http://127.0.0.1:{}/{}/{}", server.port, page.page, page.fragment);
     let done = server.done.clone();
-    drive(&url, &results, page.timeout, page.script, &|| lock(&done).clone())
+    drive(&url, &results, page.timeout, page.script, &|| locked(&done).clone())
 }
 
 /// Runs the page another server serves at `url` (`wrela run`'s) in Chrome, its results going to
@@ -187,6 +180,18 @@ fn drive(
     let tab = lease.browser.open(url, options, deadline)?;
     let stopped = AtomicBool::new(false);
     let stop = || stopped.load(Ordering::Acquire).then(|| "the page's run ended".to_string());
+    // Why the page can't pass any more, if it can't.
+    let trouble = || {
+        if !lease.browser.alive() {
+            Some("chrome exited early".to_string())
+        } else if tab.crashed() {
+            Some("the page crashed".to_string())
+        } else if Instant::now() >= deadline {
+            Some(format!("timed out after {:.0}s", timeout.as_secs_f64()))
+        } else {
+            None
+        }
+    };
     let outcome = std::thread::scope(|sc| {
         let driving = script.map(|steps| {
             let (tab, stop) = (&tab, &stop);
@@ -204,14 +209,8 @@ fn drive(
             if finished && driving.is_some() {
                 break Ok(());
             }
-            if !lease.browser.alive() {
-                break Err("chrome exited early".into());
-            }
-            if tab.crashed() {
-                break Err("the page crashed".into());
-            }
-            if Instant::now() >= deadline {
-                break Err(format!("timed out after {:.0}s", timeout.as_secs_f64()));
+            if let Some(why) = trouble() {
+                break Err(why);
             }
             std::thread::sleep(LOOK);
         };
@@ -226,12 +225,10 @@ fn drive(
                 match done().as_deref() {
                     Some("ok") => break Ok(()),
                     Some(why) => break Err(format!("page failed: {why}")),
-                    None if !lease.browser.alive() => break Err("chrome exited early".into()),
-                    None if tab.crashed() => break Err("the page crashed".into()),
-                    None if Instant::now() >= deadline => {
-                        break Err(format!("timed out after {:.0}s", timeout.as_secs_f64()));
-                    }
-                    None => std::thread::sleep(LOOK),
+                    None => match trouble() {
+                        Some(why) => break Err(why),
+                        None => std::thread::sleep(LOOK),
+                    },
                 }
             },
             (Ok(()), None) => Ok(()),
@@ -252,8 +249,8 @@ fn drive(
 /// The console's last 20 lines.
 fn tab_tail(console: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(console).unwrap_or_default();
-    let lines: Vec<String> = text.lines().map(str::to_string).collect();
-    lines[lines.len().saturating_sub(20)..].to_vec()
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(20)..].iter().map(|l| l.to_string()).collect()
 }
 
 /// The test page server: its port, what the page put in `results/DONE`, and its threads.
@@ -291,7 +288,7 @@ impl Server {
 impl Drop for Server {
     fn drop(&mut self) {
         self.stopping.store(true, Ordering::Release);
-        for c in lock(&self.conns).values() {
+        for c in locked(&self.conns).values() {
             let _ = c.shutdown(Shutdown::Both);
         }
         if let Some(t) = self.thread.take() {
@@ -318,28 +315,28 @@ fn accept(
                 let Ok(kept) = stream.try_clone() else { continue };
                 next += 1;
                 let id = next;
-                lock(conns).insert(id, kept);
+                locked(conns).insert(id, kept);
                 let (dir, done, page, open) =
                     (dir.clone(), done.clone(), page.to_string(), conns.clone());
                 let spawned =
                     std::thread::Builder::new().name("wrela-pages-conn".into()).spawn(move || {
                         let _ = connection(stream, &dir, port, &page, &done);
                         // One request a connection: its end is the response's.
-                        if let Some(c) = lock(&open).remove(&id) {
+                        if let Some(c) = locked(&open).remove(&id) {
                             let _ = c.shutdown(Shutdown::Write);
                         }
                     });
                 match spawned {
                     Ok(t) => threads.push(t),
                     Err(_) => {
-                        lock(conns).remove(&id);
+                        locked(conns).remove(&id);
                     }
                 }
             }
             Err(_) => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    for c in lock(conns).values() {
+    for c in locked(conns).values() {
         let _ = c.shutdown(Shutdown::Both);
     }
     for t in threads {
@@ -407,7 +404,7 @@ fn connection(
                     Ok(t) => String::from_utf8_lossy(&t).trim().to_string(),
                     Err(why) => format!("its results/DONE can't be read: {why}"),
                 };
-                *lock(done) = Some(text);
+                *locked(done) = Some(text);
             }
             Ok(())
         }
@@ -433,7 +430,7 @@ mod tests {
         assert_eq!(first, "the test browser failed to start: it exited with status 1");
         assert_eq!(later, first);
         assert_eq!(starts.load(Ordering::Relaxed), 1);
-        assert_eq!(lock(&SHARED).users, 0, "nobody holds a browser that never started");
+        assert_eq!(locked(&SHARED).users, 0, "nobody holds a browser that never started");
     }
 
     fn exchange(port: u16, request: &str) -> String {
@@ -473,9 +470,9 @@ mod tests {
         assert!(put("/p/notes.txt", "x").starts_with("HTTP/1.1 403"), "only into results/");
         assert!(put("/p/results/frame.json", "{}").starts_with("HTTP/1.1 201"));
         assert_eq!(std::fs::read_to_string(root.join("p/results/frame.json")).expect("put"), "{}");
-        assert!(lock(&server.done).is_none());
+        assert!(locked(&server.done).is_none());
         assert!(put("/p/results/DONE", "ok\n").starts_with("HTTP/1.1 201"));
-        assert_eq!(lock(&server.done).as_deref(), Some("ok"));
+        assert_eq!(locked(&server.done).as_deref(), Some("ok"));
         drop(server);
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "its port is closed");
         let _ = std::fs::remove_dir_all(&root);

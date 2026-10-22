@@ -257,14 +257,7 @@ fn load(
     crate::generated_path(dir, &built)?;
     let out = wrela_driver::build(dir);
     crate::write_build(&out, &built)?;
-    let script = match input {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("can't read {}: {e}", p.display()))?;
-            wrela_abi::input::parse_script(&text)?
-        }
-        None => Vec::new(),
-    };
+    let script = crate::read_script(input)?;
     let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
     Ok((host, script, built))
 }

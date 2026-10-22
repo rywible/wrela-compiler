@@ -583,22 +583,18 @@ fn buffer_binding(
     let stride_v = fl.u32c(stride);
     let mul =
         |fl: &mut Fl, a: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Mul, a, stride_v));
-    if lang == Some(Lang::GpuField) {
-        // One element (or a field of one): its buffer's handle, its offset, its size.
-        let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
-        let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
-        let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
-        let handle = fl.value(u, ir::Expr::Load(at));
-        let offset = fl.value(u, ir::Expr::Extract(v, 1));
-        return Some([handle, offset, stride_v]);
-    }
-    if matches!(lang, Some(Lang::GpuSpan | Lang::GpuSpanMut)) {
-        // Through the span's projection of its buffer.
+    if matches!(lang, Some(Lang::GpuField | Lang::GpuSpan | Lang::GpuSpanMut)) {
+        // Through its projection of its buffer: the buffer's handle.
         let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
         let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
         let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
         let handle = fl.value(u, ir::Expr::Load(at));
         let start = fl.value(u, ir::Expr::Extract(v, 1));
+        if lang == Some(Lang::GpuField) {
+            // One element (or a field of one): its byte offset, and its size.
+            return Some([handle, start, stride_v]);
+        }
+        // A span: its first element and its count.
         let count = fl.value(u, ir::Expr::Extract(v, 2));
         let offset = mul(fl, start);
         let size = mul(fl, count);
@@ -614,15 +610,21 @@ fn buffer_binding(
     Some([handle, zero, size])
 }
 
+/// The elements of the buffer at `place`: its first type argument (`u32` words, structs of
+/// them, or a command's typed arguments such as `DrawArgs`), else `u32`.
+fn buffer_elem(fl: &mut Fl, place: &mir::Place) -> TyId {
+    let t = fl.place_src_ty(place);
+    let types = &fl.cx.checked.program.types;
+    match types.kind(t) {
+        TyKind::Adt(_, args) if !args.is_empty() => args[0],
+        _ => types.u32,
+    }
+}
+
 /// An indirect dispatch's or draw's counts: their buffer's handle, and the byte offset where
 /// they start.
 fn indirect_binding(fl: &mut Fl, place: &mir::Place, span: Span) -> Option<[ir::ValueId; 2]> {
-    // Its elements: `u32` words, or a command's typed arguments (`DrawArgs`, ...).
-    let t = fl.place_src_ty(place);
-    let elem = match fl.cx.checked.program.types.kind(t) {
-        TyKind::Adt(_, args) if !args.is_empty() => args[0],
-        _ => fl.cx.checked.program.types.u32,
-    };
+    let elem = buffer_elem(fl, place);
     let [handle, offset, _] = buffer_binding(fl, place, elem, span)?;
     Some([handle, offset])
 }
@@ -864,11 +866,7 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
     if let Some((place, at)) = &d.indices {
-        let t = fl.place_src_ty(place);
-        let elem = match fl.cx.checked.program.types.kind(t) {
-            TyKind::Adt(_, args) if !args.is_empty() => args[0],
-            _ => fl.cx.checked.program.types.u32,
-        };
+        let elem = buffer_elem(fl, place);
         let b = buffer_binding(fl, place, elem, *at)?;
         counts.extend(b);
     }
@@ -981,7 +979,8 @@ pub(crate) fn intrinsic(
     c: &mir::Call,
     ty: Option<TyId>,
 ) -> Option<ir::ValueId> {
-    let lang = fl.cx.checked.program.func(func).lang;
+    let def = fl.cx.checked.program.func(func);
+    let (lang, name) = (def.lang, &def.name);
     let span = c.span;
     match lang {
         Some(
@@ -1006,7 +1005,6 @@ pub(crate) fn intrinsic(
             | Lang::LiftFile),
         ) => {
             if fl.is_gpu() {
-                let name = fl.cx.checked.program.func(func).name.clone();
                 fl.cx.err(Diagnostic::new(
                     codes::E0600,
                     span,
@@ -1020,7 +1018,6 @@ pub(crate) fn intrinsic(
             return crate::lift::intrinsic(fl, l, c, ty);
         }
         Some(l) if l.records_gpu_work() && fl.is_gpu() => {
-            let name = fl.cx.checked.program.func(func).name.clone();
             host_effect(fl, &format!("`{name}`"), span);
             return None;
         }
@@ -1046,7 +1043,7 @@ pub(crate) fn intrinsic(
             let h = fl.arg_value(&c.args[0])?;
             let at = fl.arg_value(&c.args[1])?;
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(elem));
-            let run = fl.run_arg(c.args[2].place()?, run_t)?;
+            let run = fl.run_of(c.args[2].place()?, run_t)?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(
                 ir::HostOp::WriteBuffer { elem, elem_size },
                 vec![h, at, run],
@@ -1059,10 +1056,7 @@ pub(crate) fn intrinsic(
             None
         }
         Some(Lang::CopyBuffer) => {
-            let mut args = Vec::new();
-            for a in &c.args {
-                args.push(fl.arg_value(a)?);
-            }
+            let args = fl.arg_values(&c.args)?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Host(ir::HostOp::CopyBuffer, args)));
             None
         }
@@ -1096,10 +1090,7 @@ pub(crate) fn intrinsic(
                 Lang::BeginPass => (Opcode::BeginPass, 9, false),
                 _ => (Opcode::EndPass, 0, false),
             };
-            let mut args = Vec::new();
-            for a in &c.args {
-                args.push(fl.arg_value(a)?);
-            }
+            let args = fl.arg_values(&c.args)?;
             if l == Lang::BeginPass {
                 fl.upload_literals();
             }
@@ -1124,7 +1115,6 @@ pub(crate) fn intrinsic(
             | Lang::PrintCommand
             | Lang::PhaseCommand),
         ) if fl.is_gpu() => {
-            let name = fl.cx.checked.program.func(func).name.clone();
             fl.cx.err(Diagnostic::new(
                 codes::E0600,
                 span,
@@ -1186,10 +1176,7 @@ pub(crate) fn intrinsic(
             Some(fl.value(u, ir::Expr::Host(ir::HostOp::Input, vec![at, cap])))
         }
         Some(Lang::PayloadTake) => {
-            let mut args = Vec::new();
-            for a in &c.args[..4] {
-                args.push(fl.arg_value(a)?);
-            }
+            let args = fl.arg_values(&c.args[..4])?;
             fl.mb.m.payload = true;
             let i = fl.mb.m.types.scalar(ir::Scalar::I32);
             Some(fl.value(i, ir::Expr::Host(ir::HostOp::Payload, args)))
@@ -1226,10 +1213,7 @@ pub(crate) fn intrinsic(
                 Lang::HandOverCommand => (Opcode::HandOver, 1),
                 _ => (Opcode::Fetch, 1),
             };
-            let mut args = Vec::new();
-            for a in &c.args[..words as usize] {
-                args.push(fl.arg_value(a)?);
-            }
+            let mut args = fl.arg_values(&c.args[..words as usize])?;
             for a in &c.args[words as usize..] {
                 args.push(fl.str_arg(a)?);
             }
@@ -1240,13 +1224,10 @@ pub(crate) fn intrinsic(
         }
         Some(Lang::WriteTexture) => {
             // handle, x, y, width, height, then bytes `from..from + count` of the run.
-            let mut args = Vec::new();
-            for a in &c.args[..5] {
-                args.push(fl.arg_value(a)?);
-            }
+            let mut args = fl.arg_values(&c.args[..5])?;
             let u8_ = fl.mb.m.types.scalar(ir::Scalar::U8);
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(u8_));
-            let run = fl.run_arg(c.args[5].place()?, run_t)?;
+            let run = fl.run_of(c.args[5].place()?, run_t)?;
             let from = fl.arg_value(&c.args[6])?;
             let count = fl.arg_value(&c.args[7])?;
             let u = fl.mb.m.types.u32();
@@ -1354,7 +1335,6 @@ pub(crate) fn intrinsic(
             Some(fl.value(u, ir::Expr::Extract(v, 2)))
         }
         _ => {
-            let name = fl.cx.checked.program.func(func).name.clone();
             fl.cx.err(Diagnostic::internal(format!("the intrinsic `{name}` has no lowering")));
             None
         }
@@ -1472,10 +1452,7 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
         }
         Lang::TexelsStore | Lang::Texels3dStore => {
             let r = resource_arg(fl, c, 0, msg)?;
-            let mut vals = Vec::new();
-            for a in &c.args[1..] {
-                vals.push(fl.arg_value(a)?);
-            }
+            let mut vals = fl.arg_values(&c.args[1..])?;
             // The texel, written as four of its format's scalar (the channels it lacks, 0).
             if let ir::ResourceKind::StorageTexture { format, .. } =
                 fl.mb.m.resources[r.index()].kind
@@ -1570,10 +1547,7 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
             };
             let r = resource_arg(fl, c, 0, msg)?;
             let i = fl.arg_value(&c.args[1])?;
-            let mut vals = Vec::new();
-            for a in &c.args[2..] {
-                vals.push(fl.arg_value(a)?);
-            }
+            let vals = fl.arg_values(&c.args[2..])?;
             let place =
                 ir::Place { root: ir::PlaceRoot::Resource(r), path: vec![ir::Proj::Index(i)] };
             let t = fl.ty(ty?, span)?;
@@ -1644,10 +1618,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let texture = resource_arg(fl, c, 0, msg)?;
     let sampled = !matches!(op, T::Load | T::Width | T::Height | T::Depth);
     let sampler = if sampled { Some(resource_arg(fl, c, 1, msg)?) } else { None };
-    let mut vals = Vec::new();
-    for a in &c.args[1 + usize::from(sampled)..] {
-        vals.push(fl.arg_value(a)?);
-    }
+    let vals = fl.arg_values(&c.args[1 + usize::from(sampled)..])?;
     let t = fl.ty(ty?, span)?;
     // A colour texel is read as four of its format's scalar: the format's texel is their first.
     let colour = match fl.mb.m.resources[texture.index()].kind {
@@ -2285,12 +2256,13 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
     check_recursion(cx, &mb);
-    check_workgroup(cx, &mb, entry, &entry_inputs(&iface.entries[0], true, iface.over));
+    let inputs = entry_inputs(&iface.entries[0], true, iface.over);
+    check_workgroup(cx, &mb, entry, &inputs);
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(name),
         stage: ir::Stage::Compute { workgroup_size: wg },
         function: entry,
-        inputs: entry_inputs(&iface.entries[0], true, iface.over),
+        inputs,
     });
     verify(cx, &mut mb, name)?;
     let instances = mb.fn_instances();
@@ -2347,7 +2319,8 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         unwrap_returns(f, v4);
     }
     check_recursion(cx, &mb);
-    check_uniformity(cx, &mb, fentry, &entry_inputs(fragment, false, false));
+    let finputs = entry_inputs(fragment, false, false);
+    check_uniformity(cx, &mb, fentry, &finputs);
     let varyings = varying_layout(cx, &mut mb, vret, vdef.sig_span)?;
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(&vdef.name),
@@ -2363,7 +2336,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
             uint: output.uint(),
         },
         function: fentry,
-        inputs: entry_inputs(fragment, false, false),
+        inputs: finputs,
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
     verify(cx, &mut mb, &name)?;
@@ -2542,9 +2515,7 @@ fn entry_function(
     ret: Option<ir::TypeId>,
     varyings: Option<ir::TypeId>,
 ) -> ir::FuncId {
-    let params = varyings
-        .map(|t| vec![ir::Param { name: "varyings".into(), ty: t, by_ref: false, mutable: false }])
-        .unwrap_or_default();
+    let params = varyings.map(|t| vec![ir::Param::value("varyings", t)]).unwrap_or_default();
     let f = ir::Function::new(ir::ident(name), params, ret);
     let id = mb.m.add_function(f);
     mb.instances.insert(key.clone(), id);
@@ -2777,7 +2748,6 @@ fn verify(cx: &mut Cx, mb: &mut ModuleBuilder, name: &str) -> Option<()> {
 /// What a `@gpu` function's parameter of type `t` is bound to for its check: a resource of its
 /// own for a buffer, texture or sampler, and for each of a group's (`check_standalone`); `None`
 /// for a value. `next` is the next binding.
-#[allow(clippy::too_many_arguments)]
 fn stand_in(
     cx: &mut Cx,
     mb: &mut ModuleBuilder,

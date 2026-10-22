@@ -213,18 +213,41 @@ const STORE_PIPELINES: &str = r#"[
       "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
   ]"#;
 
+/// A build of a program submitting `frames` (`common::wat::program`), with `pipelines` (a JSON
+/// array) and `shaders`.
+fn program_build(
+    name: &str,
+    pipelines: &str,
+    shaders: &[(&str, &str)],
+    frames: &[Vec<Vec<u8>>],
+) -> TempDir {
+    let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
+    common::build(name, &common::manifest(pipelines), shaders, &wasm)
+}
+
+/// The store and cell pipelines' shaders.
+const STORE_SHADERS: [(&str, &str); 2] = [("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)];
+
 /// A program submitting `frames`, loaded with the store and cell pipelines. The build's
 /// directory comes first, so `let (_dir, host) = ...` drops the host before the directory.
 fn store_host(name: &str, frames: &[Vec<Vec<u8>>], options: &Options) -> (TempDir, Host) {
-    let wasm = wat::parse_str(common::wat::program(frames)).expect("compiles");
-    let dir = common::build(
-        name,
-        &common::manifest(STORE_PIPELINES),
-        &[("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)],
-        &wasm,
-    );
+    let dir = program_build(name, STORE_PIPELINES, &STORE_SHADERS, frames);
     let host = Host::load_with(&dir, options).expect("loads");
     (dir, host)
+}
+
+/// A copy of first-light whose program traps as it starts: a build that never loads.
+fn bad_start(name: &str) -> TempDir {
+    let wasm = wat::parse_str(
+        r#"(module
+  (import "wrela" "memory" (memory 1 16384 shared))
+  (export "memory" (memory 0))
+  (func $start unreachable)
+  (start $start)
+  (func (export "frame") (param f32 i32 i32)))"#,
+    )
+    .expect("wasm");
+    common::first_light_with(name, &wasm)
 }
 
 /// A comparison's next package starts as a cold load would, without preparing its unchanged
@@ -256,13 +279,8 @@ fn restarting_in_another_build_reuses_pipelines_but_starts_fresh() {
         .finish();
     // The first frame submits nothing; the second exercises fresh WASM globals, resources
     // and request IDs (the previous program already used buffer 1 and request 4).
-    let wasm = wat::parse_str(common::wat::program(&[vec![], vec![next]])).expect("compiles");
-    let next_dir = common::build(
-        "restart-next",
-        &common::manifest(STORE_PIPELINES),
-        &[("store.wgsl", STORE_WGSL), ("cell.wgsl", CELL_WGSL)],
-        &wasm,
-    );
+    let next_dir =
+        program_build("restart-next", STORE_PIPELINES, &STORE_SHADERS, &[vec![], vec![next]]);
     host.restart_in(&next_dir, &options).expect("restarts in the next directory");
     assert_eq!(host.pipelines_built(), pipelines, "unchanged pipelines are reused");
     assert!(host.take_batches().is_empty(), "old recorded commands are gone");
@@ -308,18 +326,7 @@ fn failed_reload_and_restart_leave_the_old_build_usable() {
     let old_dir = common::first_light_copy("recover-old");
     let bad_shader = common::first_light_copy("recover-bad-shader");
     std::fs::write(bad_shader.join("fill.wgsl"), "this is not WGSL;").expect("bad shader");
-    let bad_start = common::first_light_with(
-        "recover-bad-start",
-        &wat::parse_str(
-            r#"(module
-  (import "wrela" "memory" (memory 1 16384 shared))
-  (export "memory" (memory 0))
-  (func $start unreachable)
-  (start $start)
-  (func (export "frame") (param f32 i32 i32)))"#,
-        )
-        .expect("wasm"),
-    );
+    let bad_start = bad_start("recover-bad-start");
     let options = Options { reloadable: true, ..Options::default() };
     let mut host = Host::load_with(&old_dir, &options).expect("old build loads");
     host.run_frames(&[0.0], 8, 8).expect("old build starts");
@@ -355,18 +362,7 @@ fn failed_restart_does_not_run_a_deferred_old_init() {
         )
         .expect("wasm"),
     );
-    let bad_start = common::first_light_with(
-        "deferred-bad-start",
-        &wat::parse_str(
-            r#"(module
-  (import "wrela" "memory" (memory 1 16384 shared))
-  (export "memory" (memory 0))
-  (func $start unreachable)
-  (start $start)
-  (func (export "frame") (param f32 i32 i32)))"#,
-        )
-        .expect("wasm"),
-    );
+    let bad_start = bad_start("deferred-bad-start");
     let options = Options { defer_init: true, ..Options::default() };
     let mut host = Host::load_with(&old_dir, &options).expect("loads without running init");
 
@@ -396,18 +392,7 @@ fn failed_old_init_still_leaves_a_callable_host() {
         )
         .expect("wasm"),
     );
-    let bad_start = common::first_light_with(
-        "recover-init-bad-candidate",
-        &wat::parse_str(
-            r#"(module
-  (import "wrela" "memory" (memory 1 16384 shared))
-  (export "memory" (memory 0))
-  (func $start unreachable)
-  (start $start)
-  (func (export "frame") (param f32 i32 i32)))"#,
-        )
-        .expect("wasm"),
-    );
+    let bad_start = bad_start("recover-init-bad-candidate");
     let options = Options { reloadable: true, ..Options::default() };
     let mut host = Host::load_with(&old_dir, &options).expect("old init first succeeds");
 
@@ -418,18 +403,7 @@ fn failed_old_init_still_leaves_a_callable_host() {
 #[test]
 #[ignore = "needs a GPU"]
 fn failed_hand_over_keeps_the_old_build_usable_with_fresh_request_numbers() {
-    let bad_start = common::first_light_with(
-        "hand-over-bad-start",
-        &wat::parse_str(
-            r#"(module
-  (import "wrela" "memory" (memory 1 16384 shared))
-  (export "memory" (memory 0))
-  (func $start unreachable)
-  (start $start)
-  (func (export "frame") (param f32 i32 i32)))"#,
-        )
-        .expect("wasm"),
-    );
+    let bad_start = bad_start("hand-over-bad-start");
     let path = format!("../{}", bad_start.file_name().expect("name").to_string_lossy());
     let command = Encoder::new().hand_over(1, &path).finish();
     let next = Encoder::new().storage_read(1, "missing").finish();
@@ -616,13 +590,11 @@ fn cached_bind_groups_follow_resource_lifetimes() {
             encoder.dispatch(pipeline, [1; 3], &bindings, &[]);
         }
     }
-    let wasm =
-        wat::parse_str(common::wat::program(&[vec![encoder.finish()]])).expect("test program");
-    let dir = common::build(
+    let dir = program_build(
         "bind-group-lifetimes",
-        &common::manifest(&format!("[{}]", pipelines.join(","))),
+        &format!("[{}]", pipelines.join(",")),
         &[("sum.wgsl", shader)],
-        &wasm,
+        &[vec![encoder.finish()]],
     );
     let mut host = Host::load(&dir).expect("loads");
     host.frame(0.0, 16, 16).expect("dispatches");
@@ -695,13 +667,11 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
     {
         encoder.draw(pipeline, vertices, 1, &[], &words(&[cell, 0, 2, 1, colour, 0, 0, 0]));
     }
-    let wasm = wat::parse_str(common::wat::program(&[vec![encoder.present().finish()]]))
-        .expect("test program");
-    let dir = common::build(
+    let dir = program_build(
         "serial-draw-order",
-        &common::manifest(&format!("[{}]", pipelines.join(","))),
+        &format!("[{}]", pipelines.join(",")),
         &[("cell.wgsl", CELL_WGSL)],
-        &wasm,
+        &[vec![encoder.present().finish()]],
     );
     let options = Options { timing: Timing::Serial, ..Options::default() };
     let mut host = Host::load_with(&dir, &options).expect("loads");
@@ -781,13 +751,8 @@ fn a_two_byte_texture_upload_reaches_the_shader() {
         .write_texture(1, [0, 0], [1, 1], &[0x00, 0x3c])
         .dispatch(0, [1, 1, 1], &[Binding::of(1), Binding::range(2, 0, 4)], &[])
         .finish();
-    let wasm = wat::parse_str(common::wat::program(&[vec![batch]])).unwrap();
-    let dir = common::build(
-        "two-byte-texture",
-        &common::manifest(pipelines),
-        &[("read.wgsl", shader)],
-        &wasm,
-    );
+    let dir =
+        program_build("two-byte-texture", pipelines, &[("read.wgsl", shader)], &[vec![batch]]);
     let mut host = Host::load(&dir).unwrap();
     host.frame(0.0, 4, 4).expect("the two-byte half-float texel uploads");
     assert_eq!(host.read_buffer(2).unwrap(), 1.0f32.to_le_bytes());
@@ -803,16 +768,10 @@ fn hot_reload_clears_the_retired_builds_debug_flag() {
         @compute @workgroup_size(1) fn flag_error() { atomicStore(&flag, 1u); }
     "#;
     let failing = Encoder::new().dispatch(0, [1, 1, 1], &[], &[]).finish();
-    let wasm = wat::parse_str(common::wat::program(&[vec![failing]])).unwrap();
-    let old = common::build(
-        "reload-debug-old",
-        &common::manifest(pipelines),
-        &[("flag.wgsl", shader)],
-        &wasm,
-    );
+    let old =
+        program_build("reload-debug-old", pipelines, &[("flag.wgsl", shader)], &[vec![failing]]);
     let clean = Encoder::new().begin_screen_pass([0.0, 1.0, 0.0, 1.0]).present().finish();
-    let wasm = wat::parse_str(common::wat::program(&[vec![clean]])).unwrap();
-    let next = common::build("reload-debug-next", &common::manifest("[]"), &[], &wasm);
+    let next = program_build("reload-debug-next", "[]", &[], &[vec![clean]]);
     let options = Options { reloadable: true, ..Options::default() };
     let mut host = Host::load_with(&old, &options).unwrap();
     assert!(host.frame(0.0, 4, 4).unwrap_err().to_string().contains("indexed an array"));
@@ -876,12 +835,11 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
         .draw(1, 3, 1, &[Binding::range(1, 0, 16)], &[])
         .end_pass()
         .finish();
-    let wasm = wat::parse_str(common::wat::program(&[vec![batch]])).unwrap();
-    let dir = common::build(
+    let dir = program_build(
         "incompatible-pass-join",
-        &common::manifest(pipelines),
+        pipelines,
         &[("read.wgsl", &read), ("write.wgsl", &write)],
-        &wasm,
+        &[vec![batch]],
     );
     let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
         .expect("both render pipelines are valid");
@@ -1020,13 +978,8 @@ fn indexed_indirect_draws_cull_and_bias() {
         e.draw_indexed_indirect(pipeline, [2, 0, 48], 3, 0, &pos, &words(&[colour, f(0.5), 0, 0]));
     }
     e.present();
-    let wasm = wat::parse_str(common::wat::program(&[vec![e.finish()]])).expect("compiles");
-    let dir = common::build(
-        "indexed",
-        &common::manifest(MESH_PIPELINES),
-        &[("mesh.wgsl", MESH_WGSL)],
-        &wasm,
-    );
+    let dir =
+        program_build("indexed", MESH_PIPELINES, &[("mesh.wgsl", MESH_WGSL)], &[vec![e.finish()]]);
     let mut host = Host::load(&dir).expect("loads");
     let run = host.run_frames(&[0.0], w, h).expect("runs");
     for y in 0..h {
@@ -1035,7 +988,6 @@ fn indexed_indirect_draws_cull_and_bias() {
             assert_eq!(pixel(&run.frame, w, x, y), want, "pixel ({x}, {y})");
         }
     }
-    drop(host);
 }
 
 /// An indirect draw starts at the instance named by its arguments, including indexed draws.
@@ -1066,12 +1018,11 @@ fn indirect_draws_keep_their_first_instance() {
             encoder.draw_indirect(0, 1, 0, &[], &[]);
         }
         encoder.present();
-        let wasm = wat::parse_str(common::wat::program(&[vec![encoder.finish()]])).unwrap();
-        let dir = common::build(
+        let dir = program_build(
             "indirect-first-instance",
-            &common::manifest(pipelines),
+            pipelines,
             &[("instance.wgsl", source)],
-            &wasm,
+            &[vec![encoder.finish()]],
         );
         let mut host = Host::load(&dir).expect("loads");
         let run = host.run_frames(&[0.0], 4, 4).expect("runs");

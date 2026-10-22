@@ -220,7 +220,7 @@ impl Hub {
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::locked(&self.state)
     }
 
     /// Wakes every blocked thread to look again.

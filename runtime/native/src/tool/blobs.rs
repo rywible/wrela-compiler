@@ -90,7 +90,7 @@ impl Blobs {
     /// count on the same room. [`Blobs::fill`] puts the bytes in; a release gives the
     /// reservation back.
     pub(crate) fn create_reserved(&mut self, request: u32, bytes: u64) -> Result<u32, String> {
-        self.reserve(bytes)?;
+        self.fits(bytes)?;
         let id = self.create(request)?;
         self.bytes += bytes;
         self.reserved.insert(id, bytes);
@@ -121,7 +121,7 @@ impl Blobs {
     /// body, from the moment its length is known until it's a blob or it's gone
     /// ([`Blobs::refund`], [`Blobs::adopt`]).
     pub(crate) fn charge(&mut self, bytes: u64) -> Result<(), String> {
-        self.reserve(bytes)?;
+        self.fits(bytes)?;
         self.bytes += bytes;
         Ok(())
     }
@@ -151,8 +151,8 @@ impl Blobs {
         (self.bytes, held)
     }
 
-    /// Whether `more` bytes fit the budget beside what the blobs hold.
-    fn reserve(&self, more: u64) -> Result<(), String> {
+    /// Checks that `more` bytes fit the budget beside what the blobs hold, before they're read.
+    pub(crate) fn fits(&self, more: u64) -> Result<(), String> {
         if self.bytes.saturating_add(more) > self.budget.bytes {
             return Err(format!(
                 "{more} more bytes would take the tool's blobs past their budget of {} bytes",
@@ -164,7 +164,7 @@ impl Blobs {
 
     /// Adds `bytes` to the end of blob `id`, within the budget.
     pub(crate) fn append(&mut self, id: u32, bytes: &[u8]) -> Result<(), String> {
-        self.reserve(bytes.len() as u64)?;
+        self.fits(bytes.len() as u64)?;
         let blob = self.held.get_mut(&id).ok_or_else(|| no_blob(id))?;
         // A blob being written to a file is shared with the writer: it isn't copied to grow.
         let Some(blob) = Arc::get_mut(blob) else {
@@ -173,11 +173,6 @@ impl Blobs {
         blob.extend_from_slice(bytes);
         self.bytes += bytes.len() as u64;
         Ok(())
-    }
-
-    /// Checks that `more` bytes fit the budget now, before they're read.
-    pub(crate) fn fits(&self, more: u64) -> Result<(), String> {
-        self.reserve(more)
     }
 
     /// Up to `len` bytes of blob `id` from `offset`.
@@ -233,14 +228,10 @@ impl Blobs {
         self.unpublished.remove(&request);
     }
 
-    /// Releases every blob, unread requests' first: how many there were, and their bytes.
+    /// Releases every blob, unread requests' too: how many there were, and their bytes.
     pub(crate) fn release_all(&mut self) -> (usize, u64) {
         let ended = (self.held.len(), self.bytes);
-        for (_, ids) in std::mem::take(&mut self.unpublished) {
-            for id in ids {
-                self.held.remove(&id);
-            }
-        }
+        self.unpublished.clear();
         self.held.clear();
         self.reserved.clear();
         self.bytes = 0;

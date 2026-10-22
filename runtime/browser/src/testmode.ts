@@ -44,7 +44,7 @@
 // bind 127.0.0.1) enters it: a game's public URL ignores `#test`.
 
 import type { Loaded } from "./messages.ts";
-import { pathUrl } from "./path.ts";
+import { pathProblem, pathUrl } from "./path.ts";
 
 export interface TestParams {
   frames: number;
@@ -137,12 +137,7 @@ export function parseTestParams(hash: string): TestParams | null {
     const key = separator < 0 ? pair : pair.slice(0, separator);
     const value = separator < 0 ? "" : pair.slice(separator + 1);
     if (key === "input") {
-      if (
-        value === "" ||
-        value.startsWith("/") ||
-        /[\\:?#]/.test(value) ||
-        value.split("/").some((p) => p === "" || p === "." || p === "..")
-      ) {
+      if (pathProblem(value) !== undefined) {
         throw new Error(`test parameter input=${value} must be a path relative to the page`);
       }
       params.input = value;

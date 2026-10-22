@@ -56,13 +56,11 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let q: Vec<&str> = query.split("::").collect();
+    let q: Vec<String> = query.split("::").map(String::from).collect();
     let exact: Vec<usize> =
         (0..index.entries.len()).filter(|&i| index.entries[i].path == q).collect();
     let matches: Vec<usize> = if exact.is_empty() {
-        (0..index.entries.len())
-            .filter(|&i| index.entries[i].path.ends_with(&q_owned(&q)))
-            .collect()
+        (0..index.entries.len()).filter(|&i| index.entries[i].path.ends_with(&q)).collect()
     } else {
         exact
     };
@@ -88,13 +86,8 @@ pub fn run(args: &[String]) -> ExitCode {
     let builtins = wrela_driver::builtins();
     if q == ["builtins"] {
         println!("the built-in functions (no import; most work on scalars and vectors alike):");
-        for (name, arity, method) in &builtins {
-            let args = ["x", "y", "z"][..(*arity).min(3)].join(", ");
-            if *method {
-                println!("  x.{name}({})", ["", "y", "y, z"][arity.saturating_sub(1).min(2)]);
-            } else {
-                println!("  {name}({args})");
-            }
+        for &(name, arity, method) in &builtins {
+            println!("  {}", builtin_call(name, arity, method));
         }
         return ExitCode::SUCCESS;
     }
@@ -128,7 +121,7 @@ pub fn run(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     eprintln!("error: nothing public is named `{query}`");
-    let last = q.last().copied().unwrap_or_default().to_lowercase();
+    let last = q.last().map_or(String::new(), |l| l.to_lowercase());
     let near: Vec<&Entry> = index
         .entries
         .iter()
@@ -144,8 +137,13 @@ pub fn run(args: &[String]) -> ExitCode {
     ExitCode::from(1)
 }
 
-fn q_owned(q: &[&str]) -> Vec<String> {
-    q.iter().map(|s| s.to_string()).collect()
+/// A built-in function as a call: `name(x, y)`, or a method's `x.name(y)`.
+pub(crate) fn builtin_call(name: &str, arity: usize, method: bool) -> String {
+    if method {
+        format!("x.{name}({})", ["", "y", "y, z"][arity.saturating_sub(1).min(2)])
+    } else {
+        format!("{name}({})", ["x", "y", "z"][..arity.min(3)].join(", "))
+    }
 }
 
 pub(crate) fn first_sentence(doc: &str) -> String {
@@ -282,10 +280,11 @@ pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
         .collect();
     let mut index = Index { entries: Vec::new(), modules: Vec::new() };
     for s in &sources {
+        let intro = intro(&s.text);
         index.modules.push(Module {
             path: s.module.clone(),
-            summary: first_sentence(&intro(&s.text)),
-            intro: intro(&s.text),
+            summary: first_sentence(&intro),
+            intro,
         });
         for item in &s.parsed.file.items {
             add_item(&mut index, s, item);

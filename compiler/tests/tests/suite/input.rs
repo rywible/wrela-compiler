@@ -51,7 +51,7 @@ fn both_hosts_read_the_same_events() {
         ..wrela_tests::ChromeRun::new(12, 64, 64, 60.0)
     };
     let chrome = wrela_tests::run_in_chrome_with(&rel, run);
-    let times: Vec<f32> = (0..12).map(|i| wrela_host::frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(12);
     let native = wrela_host::Host::load(&dir)
         .expect("load")
         .run_frames_with(&times, 64, 64, &script())

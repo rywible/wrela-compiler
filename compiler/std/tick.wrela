@@ -147,8 +147,5 @@ pub(package) fn tick(thread: u32, task: u32, ticker: u32, k: u32) {
 /// `nondet` (§8): it depends on timing.
 @effects(nondet)
 pub fn origin() -> f64 {
-    unsafe {
-        let bits = u64(load_u32(TICK_ORIGIN)) | (u64(load_u32(TICK_ORIGIN + 4)) << 32)
-        bitcast_f64(bits)
-    }
+    unsafe { read::<f64>(TICK_ORIGIN) }
 }

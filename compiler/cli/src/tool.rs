@@ -113,23 +113,13 @@ pub fn run(args: &[String]) -> ExitCode {
     match named(&dir) {
         Ok(None) => {}
         Ok(Some((ws, tool))) => {
-            let declared = match declared(&ws, &tool) {
-                Ok(d) => d,
-                Err(why) => {
-                    eprintln!("error: the tool `{}`: {why}", tool.name);
-                    return ExitCode::from(2);
-                }
-            };
             let most = tool.timeout.map(Duration::from_secs);
-            match narrowed(&declared, grants, timeout, most) {
-                Ok((g, t)) => (grants, timeout) = (g, t),
-                Err(why) => {
-                    eprintln!("error: the tool `{}`: {why}", tool.name);
-                    return ExitCode::from(2);
-                }
-            }
-            match fewer_workers(workers, tool.workers) {
-                Ok(n) => workers = n,
+            let chosen = declared(&ws, &tool).and_then(|d| {
+                let (g, t) = narrowed(&d, grants, timeout, most)?;
+                Ok((g, t, fewer_workers(workers, tool.workers)?))
+            });
+            match chosen {
+                Ok(chosen) => (grants, timeout, workers) = chosen,
                 Err(why) => {
                     eprintln!("error: the tool `{}`: {why}", tool.name);
                     return ExitCode::from(2);
@@ -151,15 +141,10 @@ pub fn run(args: &[String]) -> ExitCode {
         eprintln!("error: {why}");
         return ExitCode::from(71);
     }
-    let caps = match Caps::open(&grants, |name| std::env::var(name).ok()) {
-        Ok(c) => c,
-        Err(why) => {
-            eprintln!("error: {why}");
-            return ExitCode::from(2);
-        }
-    };
-    let code_cache = match code_cache(&caps) {
-        Ok(c) => c,
+    let opened = Caps::open(&grants, |name| std::env::var(name).ok())
+        .and_then(|caps| code_cache(&caps).map(|cache| (caps, cache)));
+    let (caps, code_cache) = match opened {
+        Ok(o) => o,
         Err(why) => {
             eprintln!("error: {why}");
             return ExitCode::from(2);

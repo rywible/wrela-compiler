@@ -189,6 +189,19 @@ pub(package) fn count(word: take u32, by: u32) {
     }
 }
 
+/// Puts `new` in the `u32` at `addr`, atomically: the value that was there. (`addr` is taken, as
+/// `count`'s `word` is, so a constant comes as its value.)
+pub(package) fn exchange(addr: take u32, new: u32) -> u32 {
+    unsafe {
+        loop {
+            let old = atomic_load(addr)
+            if compare_swap(addr, old, new) == old {
+                return old
+            }
+        }
+    }
+}
+
 /// Waits as `wait` does, for at most `micros` microseconds: 0 when woken, 1 when it wasn't
 /// `expected`, 2 when the time ran out.
 @intrinsic

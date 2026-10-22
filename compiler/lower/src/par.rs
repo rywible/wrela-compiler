@@ -98,14 +98,14 @@ pub(crate) fn par_job(
     let ct = fl.mb.m.types.intern(ir::TypeDef::Struct { name: "TaskContext".into(), fields });
     let v = fl.value(ct, ir::Expr::Construct(ct, vals));
     let l = fl.f.new_local("task_context", ct);
-    let place = ir::Place::root(ir::PlaceRoot::Local(l));
+    let place = ir::Place::local(l);
     fl.emit(ir::Stmt::Store(place.clone(), v));
     let pt = fl.mb.m.types.intern(ir::TypeDef::Ptr(ct));
     let p = fl.value(pt, ir::Expr::Addr(place));
     let ctx = fl.value(u, ir::Expr::Mem(ir::MemOp::Addr, vec![p]));
     // The task passes the chunk function the context's fields, each a value or, where
     // `is_place`, a place's address.
-    let k = add_task(fl, "task", callee, ct, |f, body, p| {
+    let k = add_task(fl, callee, ct, |f, body, p| {
         let mut args = Vec::new();
         for (i, (t, place)) in field_tys.into_iter().zip(is_place).enumerate() {
             let at =
@@ -113,7 +113,7 @@ pub(crate) fn par_job(
             let v = f.new_value(t);
             body.push(ir::Stmt::Let(v, ir::Expr::Load(at)));
             args.push(if place {
-                ir::Arg::Place(ir::Place { root: ir::PlaceRoot::Ptr(v), path: Vec::new() })
+                ir::Arg::Place(ir::Place::root(ir::PlaceRoot::Ptr(v)))
             } else {
                 ir::Arg::Value(v)
             });
@@ -129,11 +129,10 @@ pub(crate) fn par_job(
 }
 
 /// Adds the module's next task, `k`, and returns `k`: a function `(context, chunk)` named
-/// `{name}{k}`, which calls `callee` with the chunk and the arguments `args` makes (in the
+/// `task{k}`, which calls `callee` with the chunk and the arguments `args` makes (in the
 /// function, before the call) from a pointer to the context, of type `context`.
 pub(crate) fn add_task(
     fl: &mut Fl,
-    name: &str,
     callee: ir::FuncId,
     context: ir::TypeId,
     args: impl FnOnce(&mut ir::Function, &mut ir::Block, ir::ValueId) -> Vec<ir::Arg>,
@@ -142,8 +141,8 @@ pub(crate) fn add_task(
     let types = &mut fl.mb.m.types;
     let u = types.u32();
     let pt = types.intern(ir::TypeDef::Ptr(context));
-    let param = |name: &str| ir::Param { name: name.into(), ty: u, by_ref: false, mutable: false };
-    let mut f = ir::Function::new(format!("{name}{k}"), vec![param("ctx"), param("chunk")], None);
+    let param = |name: &str| ir::Param::value(name, u);
+    let mut f = ir::Function::new(format!("task{k}"), vec![param("ctx"), param("chunk")], None);
     let ctx = f.new_value(u);
     let chunk = f.new_value(u);
     let p = f.new_value(pt);

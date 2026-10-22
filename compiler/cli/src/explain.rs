@@ -7,11 +7,12 @@ pub fn run(args: &[String]) -> ExitCode {
     let [code] = args else { return crate::usage() };
     let Some(c) = wrela_diag::codes::Code::lookup(&code.to_uppercase()) else {
         let retired = wrela_diag::codes::RETIRED.iter().find(|(r, _)| r.eq_ignore_ascii_case(code));
-        match retired {
-            Some((r, why)) => println!("{r} is retired: {why}"),
-            None => eprintln!("error: `{code}` isn't a diagnostic code (they look like E0518)"),
-        }
-        return if retired.is_some() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+        let Some((r, why)) = retired else {
+            eprintln!("error: `{code}` isn't a diagnostic code (they look like E0518)");
+            return ExitCode::from(1);
+        };
+        println!("{r} is retired: {why}");
+        return ExitCode::SUCCESS;
     };
     println!("{c}: {}\n", c.title());
     let Some(e) = wrela_driver::explain::get(c.as_str()) else {

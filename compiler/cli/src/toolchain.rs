@@ -122,15 +122,7 @@ impl wrela_host::tool::Toolchain for Compiler {
     }
 
     fn format(&self, text: &str) -> Result<String, String> {
-        wrela_driver::on_compiler_thread(|| {
-            let parsed = wrela_syntax::parse(wrela_diag::FileId(0), text);
-            if parsed.has_errors() {
-                let mut map = wrela_diag::SourceMap::new();
-                map.add("the file", text.to_string());
-                return Err(wrela_diag::render::render_all(&map, &parsed.diagnostics));
-            }
-            Ok(wrela_syntax::fmt::format(&parsed, text))
-        })
+        wrela_driver::on_compiler_thread(|| crate::fmt::formatted("the file", text))
     }
 
     fn doc_export(

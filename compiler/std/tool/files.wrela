@@ -51,11 +51,10 @@ pub fn write(path: str, bytes: [u8]) -> Call<Done> {
     if bytes.len() > MOST_BYTES {
         panic("files::write: more than 512 KiB at once: write a blob (`write_blob`)")
     }
-    var body = path_body(path)
-    for b in bytes {
-        body.push(b)
-    }
-    ask("files/write", body)
+    var w = Writer::new()
+    w.write_str(path)
+    w.write_bytes(bytes)
+    ask("files/write", take w.into_bytes())
 }
 
 /// The entries of the directory at `path`, sorted by name.
@@ -99,13 +98,10 @@ pub fn read_blob(path: str) -> Call<Blob> {
 /// directories it needs. The blob stays the tool's.
 @tool
 pub fn write_blob(path: str, blob: Blob) -> Call<Done> {
-    var body = path_body(path)
     var w = Writer::new()
+    w.write_str(path)
     w.write_u32(blob.id())
-    for b in take w.into_bytes() {
-        body.push(b)
-    }
-    ask("files/write_blob", body)
+    ask("files/write_blob", take w.into_bytes())
 }
 
 fn read_kind(r: mut Reader) -> Option<Kind> {
@@ -194,7 +190,7 @@ pub fn rooted(root: str, path: str) -> Option<String> {
             return None
         }
     }
-    Some(String::from(f"{root}/{p}"))
+    Some(f"{root}/{p}")
 }
 
 @test

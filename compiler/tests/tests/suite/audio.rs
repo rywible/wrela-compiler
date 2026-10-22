@@ -1,7 +1,6 @@
 //! `@audio` (AC6, language.md §16.4): compiler/tests/audio's modal-synthesis voice, rendered
 //! offline by the native host and in Chrome's AudioWorklet, gives the same samples, bit for bit.
 
-use wrela_host::CpuBuild;
 use wrela_tests::page;
 
 /// Two seconds at 48 kHz, in quanta of 128 samples.
@@ -9,7 +8,7 @@ const QUANTA: u32 = 750;
 
 /// The voice's samples from the native host's offline run.
 fn native(dir: &std::path::Path) -> Vec<f32> {
-    let mut host = CpuBuild::load(dir).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(dir);
     host.frame(0.0, 16, 16).expect("frame");
     host.render_audio(QUANTA).expect("render")
 }

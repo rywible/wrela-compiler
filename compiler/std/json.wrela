@@ -7,7 +7,7 @@
 // walk over a document allocates nothing. `std::fmt`'s `json_text` and `json_number` write JSON.
 
 use std::collections::Vec
-use std::fmt::json_text
+use std::fmt::json_string
 use std::string::String
 use std::string::parse_f64_at
 
@@ -102,17 +102,8 @@ fn value(d: mut Doc, t: str, at: mut u32, depth: u32) -> Option<u32> {
             let kid = value(mut d, t, mut at, depth + 1)?
             d.nodes[me].keys.push(take key)
             d.nodes[me].kids.push(kid)
-            at = blanks(t, at)
-            if at >= t.len() {
-                return None
-            }
-            if t.byte(at) == 44 {
-                at += 1
-            } else if t.byte(at) == 125 {
-                at += 1
+            if member_end(t, mut at, 125)? {
                 return Some(me)
-            } else {
-                return None
             }
         }
     }
@@ -127,17 +118,8 @@ fn value(d: mut Doc, t: str, at: mut u32, depth: u32) -> Option<u32> {
         loop {
             let kid = value(mut d, t, mut at, depth + 1)?
             d.nodes[me].kids.push(kid)
-            at = blanks(t, at)
-            if at >= t.len() {
-                return None
-            }
-            if t.byte(at) == 44 {
-                at += 1
-            } else if t.byte(at) == 93 {
-                at += 1
+            if member_end(t, mut at, 93)? {
                 return Some(me)
-            } else {
-                return None
             }
         }
     }
@@ -156,6 +138,21 @@ fn value(d: mut Doc, t: str, at: mut u32, depth: u32) -> Option<u32> {
     let text = t.slice(start, at)
     number_of(text)?
     Some(node(mut d, Kind::Num, String::from(text)))
+}
+
+/// Moves `at` past the `,` or the `close` that follows a list's or an object's member in `t`:
+/// whether it was `close`, the end; `None` if neither follows.
+fn member_end(t: str, at: mut u32, close: u8) -> Option<bool> {
+    at = blanks(t, at)
+    if at >= t.len() {
+        return None
+    }
+    let b = t.byte(at)
+    if b != 44 && b != close {
+        return None
+    }
+    at += 1
+    Some(b == close)
 }
 
 fn digit(b: u8) -> bool {
@@ -392,9 +389,7 @@ impl Doc {
             Kind::Null => out.push_str("null"),
             Kind::Bool | Kind::Num => out.push_str(o.text.as_str()),
             Kind::Text => {
-                out.push_str("\"")
-                json_text(mut out, o.text.as_str())
-                out.push_str("\"")
+                json_string(mut out, o.text.as_str())
             },
             Kind::List => {
                 out.push_str("[")
@@ -412,9 +407,8 @@ impl Doc {
                     if k > 0 {
                         out.push_str(",")
                     }
-                    out.push_str("\"")
-                    json_text(mut out, o.keys[k].as_str())
-                    out.push_str("\":")
+                    json_string(mut out, o.keys[k].as_str())
+                    out.push_str(":")
                     self.write_into(o.kids[k], mut out)
                 }
                 out.push_str("}")

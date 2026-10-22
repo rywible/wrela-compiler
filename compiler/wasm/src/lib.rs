@@ -332,11 +332,11 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     }
     // The program's functions, and each one's locations.
     let mut body_lines = Vec::with_capacity(m.functions.len());
+    let at = func::At { first_fn, helpers: &helpers, data: &data_at, heap_base, simd };
     for (i, f) in m.functions.iter().enumerate() {
         let (params, results) = signature(m, f, simd);
         let ty = types.get(params, results);
         functions.function(ty);
-        let at = func::At { first_fn, helpers: &helpers, data: &data_at, heap_base, simd };
         let (body, lines) =
             func::emit_function(m, i, &at).map_err(|e| format!("{}: {e}", f.name))?;
         code.function(&body);
@@ -347,8 +347,7 @@ pub fn emit_with(m: &ir::Module, options: Options) -> Result<Emitted, String> {
     exports.export(wrela_abi::EXPORT_MEMORY, ExportKind::Memory, 0);
     let wrappers = first_fn + m.functions.len() as u32..;
     for (next, (name, f)) in wrappers.zip(&m.exports) {
-        let (params, results, body) =
-            func::export_wrapper(m, *f, first_fn + f.0, &helpers, memory::STACK_TOP, simd)?;
+        let (params, results, body) = func::export_wrapper(m, *f, first_fn + f.0, &helpers, simd)?;
         let ty = types.get(params, results);
         functions.function(ty);
         code.function(&body);
@@ -703,12 +702,7 @@ mod tests {
         let mut m = wrela_ir::Module::default();
         let f32t = m.types.f32();
         let mut f = wrela_ir::Function::new("double", Vec::new(), Some(f32t));
-        f.params.push(wrela_ir::Param {
-            name: "x".into(),
-            ty: f32t,
-            by_ref: false,
-            mutable: false,
-        });
+        f.params.push(wrela_ir::Param::value("x", f32t));
         let x = f.new_value(f32t);
         let y = f.new_value(f32t);
         f.body = vec![
@@ -733,7 +727,7 @@ mod tests {
         let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
         let run = m.types.intern(TypeDef::Run(f32t));
         let xs = Param { name: "xs".into(), ty: run, by_ref: true, mutable: true };
-        let n = Param { name: "n".into(), ty: u32t, by_ref: false, mutable: false };
+        let n = Param::value("n", u32t);
         let mut f = wrela_ir::Function::new("f", vec![xs, n], None);
         for l in locals {
             f.new_local(*l, f32t);
@@ -821,12 +815,7 @@ mod tests {
         let mut m = wrela_ir::Module::default();
         let f32t = m.types.f32();
         let mut f = wrela_ir::Function::new("chain", Vec::new(), Some(f32t));
-        f.params.push(wrela_ir::Param {
-            name: "x".into(),
-            ty: f32t,
-            by_ref: false,
-            mutable: false,
-        });
+        f.params.push(wrela_ir::Param::value("x", f32t));
         let x = f.new_value(f32t);
         let mut body = vec![Stmt::Let(x, Expr::Param(0))];
         let chain = |f: &mut wrela_ir::Function, out: &mut Vec<Stmt>, mut at| {
@@ -950,7 +939,7 @@ mod tests {
         use wrela_ir::{BinOp, Const, Expr, Param, Stmt};
         let mut m = wrela_ir::Module::default();
         let f32t = m.types.f32();
-        let x_param = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let x_param = Param::value("x", f32t);
         let mut f = wrela_ir::Function::new("f", vec![x_param], Some(f32t));
         let (x, mark, out) = (f.new_value(f32t), f.new_value(f32t), f.new_value(f32t));
         f.body = vec![
@@ -980,8 +969,7 @@ mod tests {
             let mut f = wrela_ir::Function::new("f", vec![p], Some(f32t));
             let (ctr, sum) = (f.new_local("i", u32t), f.new_local("s", f32t));
             let v = |f: &mut wrela_ir::Function, t| f.new_value(t);
-            let (zero, n, zf, mark) =
-                (v(&mut f, u32t), v(&mut f, u32t), v(&mut f, f32t), v(&mut f, f32t));
+            let (zero, n, mark) = (v(&mut f, u32t), v(&mut f, u32t), v(&mut f, f32t));
             let (i, done, x, s0, s1) = (
                 v(&mut f, u32t),
                 v(&mut f, boolt),
@@ -994,7 +982,6 @@ mod tests {
             f.body = vec![
                 Stmt::Let(zero, Expr::Const(Const::U32(0))),
                 Stmt::Let(n, Expr::Const(Const::U32(len))),
-                Stmt::Let(zf, Expr::Const(Const::F32(0.0))),
                 Stmt::Let(mark, Expr::Const(Const::F32(1234.5))),
                 Stmt::Store(Place::local(ctr), zero),
                 Stmt::Store(Place::local(sum), mark),
@@ -1021,7 +1008,6 @@ mod tests {
                 Stmt::Let(out, Expr::Load(Place::local(sum))),
                 Stmt::Return(Some(out)),
             ];
-            let _ = zf;
             m.add_function(f);
             wrela_ir::verify(&m).expect("valid IR");
             let out = emit_with(&m, Options { simd: false, ..Options::default() }).expect("emits");

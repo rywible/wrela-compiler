@@ -19,7 +19,7 @@
 // deadline passed.
 
 use std::serialize::{Reader, Writer}
-use std::tool::{Answer, Call, ToolError, ask, malformed}
+use std::tool::{Answer, Call, ToolError, ask, malformed, read_list, read_strings}
 
 /// A diagnostic: whether it's an error (else a warning), its code (`E0220`), its message, where
 /// it is (`file:line:column`, or empty), and the whole of it as `wrela check` shows it.
@@ -130,11 +130,7 @@ pub fn build(pkg: str, out: str, options: BuildOptions) -> Call<Built> {
     for l in options.lift {
         w.write_str(l.as_str())
     }
-    w.write_u32(options.overrides.len())
-    for o in options.overrides {
-        w.write_str(o.name.as_str())
-        w.write_str(o.dir.as_str())
-    }
+    write_overrides(mut w, options.overrides)
     w.write_u64(bitcast_u64(options.timeout))
     ask("toolchain/build", take w.into_bytes())
 }
@@ -286,36 +282,14 @@ pub struct Literals: Clone {
     pub values: Option<Vec<f32>>,
 }
 
-/// A count of texts, then each, or `None`.
-fn read_strings(r: mut Reader) -> Option<Vec<String>> {
-    let Ok(n) = r.read_u32() else { return None }
-    if n > r.left() {
-        return None
-    }
-    var out: Vec<String> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(s) = r.read_string() else { return None }
-        out.push(take s)
-    }
-    Some(out)
-}
-
-/// A count of diagnostics, then each: whether it's an error, its code, message, place and text.
-fn read_diagnostics(r: mut Reader) -> Option<Vec<Diagnostic>> {
-    let Ok(n) = r.read_u32() else { return None }
-    if n > r.left() {
-        return None
-    }
-    var out: Vec<Diagnostic> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(error) = r.read_u8() else { return None }
-        let Ok(code) = r.read_string() else { return None }
-        let Ok(message) = r.read_string() else { return None }
-        let Ok(at) = r.read_string() else { return None }
-        let Ok(rendered) = r.read_string() else { return None }
-        out.push(Diagnostic { error: error != 0, code, message, at, rendered })
-    }
-    Some(out)
+/// A diagnostic: whether it's an error, its code, message, place and text.
+fn read_diagnostic(r: mut Reader) -> Option<Diagnostic> {
+    let Ok(error) = r.read_u8() else { return None }
+    let Ok(code) = r.read_string() else { return None }
+    let Ok(message) = r.read_string() else { return None }
+    let Ok(at) = r.read_string() else { return None }
+    let Ok(rendered) = r.read_string() else { return None }
+    Some(Diagnostic { error: error != 0, code, message, at, rendered })
 }
 
 /// A `build` answer.
@@ -324,7 +298,7 @@ impl Answer for Built {
         var r = Reader::new(take bytes)
         let Ok(ok) = r.read_u8() else { return Err(malformed("a build")) }
         let Some(files) = read_strings(mut r) else { return Err(malformed("a build")) }
-        let Some(diagnostics) = read_diagnostics(mut r) else {
+        let Some(diagnostics) = read_list(mut r, read_diagnostic) else {
             return Err(malformed("a build"))
         }
         let Ok(computed) = r.read_u32() else { return Err(malformed("a build")) }
@@ -341,20 +315,12 @@ impl Answer for Tested {
     fn read(bytes: take Vec<u8>) -> Result<Tested, ToolError> {
         var r = Reader::new(take bytes)
         let Ok(passed) = r.read_u8() else { return Err(malformed("a test run")) }
-        let Ok(n) = r.read_u32() else { return Err(malformed("a test run")) }
-        if n > r.left() {
+        let Some(results) = read_list(mut r, read_result) else {
             return Err(malformed("a test run"))
         }
-        var results: Vec<TestResult> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(name) = r.read_string() else { return Err(malformed("a test run")) }
-            let Ok(at) = r.read_string() else { return Err(malformed("a test run")) }
-            let Ok(ok) = r.read_u8() else { return Err(malformed("a test run")) }
-            let Ok(message) = r.read_string() else { return Err(malformed("a test run")) }
-            let Some(printed) = read_strings(mut r) else { return Err(malformed("a test run")) }
-            results.push(TestResult { name, at, passed: ok != 0, message, printed })
+        let Some(diagnostics) = read_list(mut r, read_diagnostic) else {
+            return Err(malformed("a test run"))
         }
-        let Some(diagnostics) = read_diagnostics(mut r) else { return Err(malformed("a test run")) }
         let Ok(filtered_out) = r.read_u32() else { return Err(malformed("a test run")) }
         if !r.at_end() {
             return Err(malformed("a test run"))
@@ -363,12 +329,22 @@ impl Answer for Tested {
     }
 }
 
+/// A test's result: its name, place, whether it passed, its message and what it printed.
+fn read_result(r: mut Reader) -> Option<TestResult> {
+    let Ok(name) = r.read_string() else { return None }
+    let Ok(at) = r.read_string() else { return None }
+    let Ok(ok) = r.read_u8() else { return None }
+    let Ok(message) = r.read_string() else { return None }
+    let printed = read_strings(mut r)?
+    Some(TestResult { name, at, passed: ok != 0, message, printed })
+}
+
 /// A `check` answer.
 impl Answer for Checked {
     fn read(bytes: take Vec<u8>) -> Result<Checked, ToolError> {
         var r = Reader::new(take bytes)
         let Ok(ok) = r.read_u8() else { return Err(malformed("a check")) }
-        let Some(diagnostics) = read_diagnostics(mut r) else {
+        let Some(diagnostics) = read_list(mut r, read_diagnostic) else {
             return Err(malformed("a check"))
         }
         if !r.at_end() {
@@ -383,21 +359,21 @@ impl Answer for Formatted {
     fn read(bytes: take Vec<u8>) -> Result<Formatted, ToolError> {
         var r = Reader::new(take bytes)
         let Some(changed) = read_strings(mut r) else { return Err(malformed("what was formatted")) }
-        let Ok(n) = r.read_u32() else { return Err(malformed("what was formatted")) }
-        if n > r.left() {
+        let Some(failed) = read_list(mut r, read_unformatted) else {
             return Err(malformed("what was formatted"))
-        }
-        var failed: Vec<Unformatted> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(path) = r.read_string() else { return Err(malformed("what was formatted")) }
-            let Ok(why) = r.read_string() else { return Err(malformed("what was formatted")) }
-            failed.push(Unformatted { path, why })
         }
         if !r.at_end() {
             return Err(malformed("what was formatted"))
         }
         Ok(Formatted { changed, failed })
     }
+}
+
+/// A file `fmt` couldn't format: its path and why.
+fn read_unformatted(r: mut Reader) -> Option<Unformatted> {
+    let Ok(path) = r.read_string() else { return None }
+    let Ok(why) = r.read_string() else { return None }
+    Some(Unformatted { path, why })
 }
 
 /// A `literals` answer: the files, whether the values follow, then their count and each.
@@ -421,16 +397,7 @@ impl Answer for Literals {
 
 /// A count of `f32`s, then each's bits, or `None`.
 fn read_floats(r: mut Reader) -> Option<Vec<f32>> {
-    let Ok(n) = r.read_u32() else { return None }
-    if n > r.left() {
-        return None
-    }
-    var v: Vec<f32> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(bits) = r.read_u32() else { return None }
-        v.push(bitcast_f32(bits))
-    }
-    Some(v)
+    read_list(mut r, |r| Some(bitcast_f32(r.read_u32().ok()?)))
 }
 
 @test

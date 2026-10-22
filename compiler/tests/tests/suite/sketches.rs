@@ -7,7 +7,7 @@ use crate::{built, tests_pass};
 use wrela_host::{CpuBuild, CpuHost, Value};
 
 fn cpu(pkg: &str) -> CpuHost {
-    CpuBuild::load(built(pkg)).expect("load").start_with(1).expect("start")
+    crate::cpu_host(&built(pkg))
 }
 
 fn vec2_of(v: &[Value]) -> [f32; 2] {
@@ -58,7 +58,7 @@ fn sketch_02_draws_the_grazer_in_both_hosts() {
     let (w, h) = (192, 128);
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/02-drawing", "sketch-02");
     let chrome = wrela_tests::run_in_chrome(&rel, FRAMES, w, h, 60.0);
-    let times: Vec<f32> = (0..FRAMES).map(|i| wrela_host::frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(FRAMES);
     let run = wrela_host::Host::load(&dir).expect("load").run_frames(&times, w, h).expect("run");
     run.write_png(dir.join("results/native.png")).expect("png");
     let diff = image::compare(&chrome.frame, &run.frame).expect("same size");
@@ -96,13 +96,6 @@ fn sketch_02s_herd_shares_its_pipelines() {
     assert_eq!(draws.sites.len(), 1, "drawn from one site: {:?}", draws.sites);
 }
 
-fn u64_of(v: &[Value]) -> u64 {
-    match v {
-        [Value::I64(x)] => *x as u64,
-        other => panic!("expected a u64, got {other:?}"),
-    }
-}
-
 /// The tick's parallel loop gives the same world with 1, 2 and 4 threads (§16.1).
 #[test]
 fn sketch_03s_tick_doesnt_depend_on_the_workers() {
@@ -112,7 +105,7 @@ fn sketch_03s_tick_doesnt_depend_on_the_workers() {
             .start_with(workers)
             .expect("start");
         one(&mut host, "run", &[Value::I32(120)]);
-        u64_of(&one(&mut host, "checksum", &[]))
+        wrela_tests::one_u64(&mut host, "checksum", &[])
     };
     let one_thread = run(1);
     assert_eq!(run(2), one_thread);
@@ -158,7 +151,7 @@ const GAMEPLAY_FRAMES: u32 = 60;
 fn the_gameplay_systems_run_in_both_hosts() {
     let (dir, rel) = wrela_tests::page("compiler/tests/sketches/gameplay", "gameplay-hosts");
     let chrome = wrela_tests::run_in_chrome(&rel, GAMEPLAY_FRAMES, 192, 128, 60.0);
-    let times: Vec<f32> = (0..GAMEPLAY_FRAMES).map(|i| wrela_host::frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(GAMEPLAY_FRAMES);
     let run =
         wrela_host::Host::load(&dir).expect("load").run_frames(&times, 192, 128).expect("run");
     assert_eq!(chrome.hash, run.hash_hex(), "the hosts' state hashes differ");

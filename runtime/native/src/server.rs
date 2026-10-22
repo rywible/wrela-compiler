@@ -10,7 +10,7 @@
 
 use std::path::Path;
 use std::sync::LazyLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use wasmtime::{Caller, Config, Engine, Linker, Module, Store, TypedFunc};
 use wrela_abi::input::{EVENT_SIZE, Event, Queue};
 use wrela_abi::stream::{self, Command};
@@ -26,9 +26,6 @@ const EPOCH: Duration = Duration::from_millis(1);
 /// At most this many printed lines are kept for each room; past it, lines are counted, not
 /// kept, so printing can't grow the host's memory or make it wait.
 const PRINTED_CAP: usize = 256;
-
-/// Every room reads the same clock, including a room started again after a failure.
-static CLOCK_ZERO: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 /// The server engine: a call can be interrupted at its deadline (epochs advance on a thread of
 /// their own), and modules may use atomics on their own memory.
@@ -208,6 +205,15 @@ fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
         },
         _ => return None,
     })
+}
+
+impl RoomState {
+    /// The host can't do what the program asked: `why` fails the call, as the host's.
+    fn refuse(&mut self, why: String) -> wasmtime::Error {
+        let error = wasmtime::format_err!("{why}");
+        self.refused = Some(why);
+        error
+    }
 }
 
 impl wasmtime::ResourceLimiter for RoomState {
@@ -428,20 +434,13 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                         if let Some(net) = net_command(service, body) {
                             s.command_bytes += body.len();
                             if s.command_bytes > s.command_cap {
-                                let why = format!(
-                                    "a call's network commands past {} bytes",
-                                    s.command_cap
-                                );
-                                s.refused = Some(why.clone());
-                                return Err(wasmtime::format_err!(why));
+                                let cap = s.command_cap;
+                                return Err(s.refuse(format!(
+                                    "a call's network commands past {cap} bytes"
+                                )));
                             }
-                            match net {
-                                Ok(n) => s.commands.push(n),
-                                Err(why) => {
-                                    s.refused = Some(why.clone());
-                                    return Err(wasmtime::format_err!(why));
-                                }
-                            }
+                            let net = net.map_err(|why| s.refuse(why))?;
+                            s.commands.push(net);
                             continue;
                         }
                         let answer = match &s.answers {
@@ -454,8 +453,7 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
                         // A server build records no GPU work and makes no other request yet: the
                         // host refuses, which fails the call as the host's.
                         let why = format!("a server host can't carry out {:?}", other.opcode());
-                        s.refused = Some(why.clone());
-                        return Err(wasmtime::format_err!(why));
+                        return Err(s.refuse(why));
                     }
                 }
             }
@@ -559,8 +557,9 @@ fn linker() -> wasmtime::Result<Linker<RoomState>> {
             Ok(bytes.len() as i32)
         },
     )?;
+    // Every room reads the host's one clock, a room started again after a failure too.
     linker.func_wrap(IMPORT_MODULE, IMPORT_CLOCK, |mut c: Caller<'_, RoomState>, at: u32| {
-        let bytes = CLOCK_ZERO.elapsed().as_secs_f64().to_le_bytes();
+        let bytes = crate::program::clock_seconds().to_le_bytes();
         let m = memory(&mut c)?;
         m.write(&mut c, at as usize, &bytes).map_err(|_| {
             wasmtime::format_err!("clock({at}) reaches past the end of the program's memory")

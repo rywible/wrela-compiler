@@ -12,6 +12,7 @@
 //! same channel before its first event can arrive. A caller waits at most until its deadline.
 //! When the pipe closes or fails, every waiting caller is told why, and every channel ends.
 
+use crate::lock;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -39,10 +40,6 @@ struct Shared {
     routes: Mutex<HashMap<String, (u64, mpsc::Sender<Event>)>>,
     /// Why the connection ended, once it has.
     ended: Mutex<Option<String>>,
-}
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Shared {
@@ -203,12 +200,8 @@ impl Connection {
 fn join(t: &Mutex<Option<std::thread::JoinHandle<()>>>, grace: Duration) -> bool {
     let mut held = lock(t);
     let Some(thread) = held.as_ref() else { return true };
-    let until = Instant::now() + grace;
-    while !thread.is_finished() {
-        if Instant::now() >= until {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(2));
+    if !crate::finished_within(thread, grace) {
+        return false;
     }
     if let Some(thread) = held.take() {
         let _ = thread.join();

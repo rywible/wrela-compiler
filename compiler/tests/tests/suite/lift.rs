@@ -13,7 +13,7 @@
 //!   program reads it.
 
 use std::path::{Path, PathBuf};
-use wrela_host::{CpuHost, Host, Value, frame_time, image};
+use wrela_host::{CpuHost, Host, Value, image};
 use wrela_tests::{one_f32, one_u32, repo_root};
 
 fn package() -> PathBuf {
@@ -338,7 +338,7 @@ fn edits_round_trip_through_the_source() {
 #[ignore = "needs a GPU"]
 fn the_gpu_draws_the_same_and_reads_a_change_next_frame() {
     let (w, h) = (256, 256);
-    let times: Vec<f32> = (0..2).map(|i| frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(2);
     let normal =
         Host::load(built("lift-gpu-normal", false)).unwrap().run_frames(&times, w, h).unwrap();
     let dir = built("lift-gpu-lifted", true);

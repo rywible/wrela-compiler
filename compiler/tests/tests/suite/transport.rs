@@ -29,8 +29,7 @@ fn start_build(
     runtime: &tokio::runtime::Runtime,
     bounds: wrela_serve::Bounds,
 ) -> (u16, [u8; 32], wrela_serve::Server) {
-    let data =
-        wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("transport-{name}"));
+    let data = crate::scratch_root().join(format!("transport-{name}"));
     let _ = std::fs::remove_dir_all(&data);
     let port = std::net::UdpSocket::bind("127.0.0.1:0")
         .expect("a free port")

@@ -48,9 +48,7 @@ pub fn fake(url: str, fake: Fake) -> Call<Done> {
         Fake::Missing => w.write_u8(1),
         Fake::Bytes(b) => {
             w.write_u8(2)
-            for x in b {
-                w.write_u8(x)
-            }
+            w.write_bytes(b)
         },
         Fake::Delay(s) => {
             w.write_u8(3)

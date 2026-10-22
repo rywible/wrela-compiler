@@ -206,7 +206,7 @@ impl Lines {
             last = Some(offset);
             lines.entries.push((offset, k));
         }
-        if r.at != payload.len() {
+        if !r.rest().is_empty() {
             return Err("bytes after the entries".into());
         }
         Ok(lines)
@@ -256,6 +256,7 @@ fn unvlq(bytes: &mut std::str::Bytes) -> Result<i64, String> {
     Err("a number in a segment is too long".into())
 }
 
+/// Reads a WASM module, or a section's payload: unsigned LEB128 numbers and runs of bytes.
 struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
@@ -281,30 +282,48 @@ impl<'a> Reader<'a> {
     }
 
     fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let s = self.bytes.get(self.at..self.at + n).ok_or("the section ends early")?;
-        self.at += n;
+        let end = self.at.checked_add(n).ok_or("the section ends early")?;
+        let s = self.bytes.get(self.at..end).ok_or("the section ends early")?;
+        self.at = end;
         Ok(s)
+    }
+
+    /// What's left to read.
+    fn rest(&self) -> &'a [u8] {
+        self.bytes.get(self.at..).unwrap_or_default()
     }
 }
 
 /// The payload of the custom section `name` in a WASM module, if it has one.
 pub fn custom_section<'a>(module: &'a [u8], name: &str) -> Option<&'a [u8]> {
-    sections(module).filter(|&(id, _)| id == 0).find_map(|(_, body)| {
-        let mut b = Reader { bytes: body, at: 0 };
-        let n = b.leb().ok()? as usize;
-        (b.take(n).ok()? == name.as_bytes()).then(|| &body[b.at..])
+    sections(module)
+        .map_while(|s| s)
+        .filter(|&(id, _)| id == 0)
+        .find_map(|(_, body)| custom(body).filter(|(n, _)| *n == name.as_bytes()).map(|(_, p)| p))
+}
+
+/// A WASM module's sections after its header, as (id, body): `None` for the first one it can't
+/// read, and nothing after it.
+pub(crate) fn sections(module: &[u8]) -> impl Iterator<Item = Option<(u8, &[u8])>> {
+    let mut r = Reader { bytes: module, at: 8 };
+    let mut failed = false;
+    std::iter::from_fn(move || {
+        if failed {
+            return None;
+        }
+        let &id = r.rest().first()?;
+        r.at += 1;
+        let section = r.leb().ok().and_then(|size| r.take(size as usize).ok());
+        failed = section.is_none();
+        Some(section.map(|body| (id, body)))
     })
 }
 
-/// A WASM module's sections, as (id, body), up to the first one it can't read.
-pub(crate) fn sections(module: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
-    let mut r = Reader { bytes: module, at: 8 };
-    std::iter::from_fn(move || {
-        let id = *r.bytes.get(r.at)?;
-        r.at += 1;
-        let size = r.leb().ok()? as usize;
-        Some((id, r.take(size).ok()?))
-    })
+/// A custom section's body as its name and its payload, if its name reads.
+pub(crate) fn custom(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    let mut b = Reader { bytes: body, at: 0 };
+    let n = b.leb().ok()? as usize;
+    Some((b.take(n).ok()?, b.rest()))
 }
 
 #[cfg(test)]
@@ -329,6 +348,22 @@ mod tests {
         let bytes = lines.encode();
         assert_eq!(Lines::decode(&bytes), Ok(lines));
         assert!(Lines::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+
+    /// A module's custom section reads back by its name; a cut module, or one shorter than its
+    /// header, has none.
+    #[test]
+    fn a_custom_section_reads_back_by_name() {
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        for (name, payload) in [("other", &b"x"[..]), (SECTION, b"table")] {
+            module.extend([0, (1 + name.len() + payload.len()) as u8, name.len() as u8]);
+            module.extend(name.as_bytes());
+            module.extend(payload);
+        }
+        assert_eq!(custom_section(&module, SECTION), Some(&b"table"[..]));
+        assert_eq!(custom_section(&module, "missing"), None);
+        assert_eq!(custom_section(&module[..module.len() - 1], SECTION), None);
+        assert_eq!(custom_section(b"\0asm", SECTION), None);
     }
 
     #[test]

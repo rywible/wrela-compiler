@@ -254,9 +254,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
             ));
             continue;
         }
-        let vat = at
-            + (content.len() - content[content.find('=').unwrap_or(0) + 1..].trim_start().len())
-                as u32;
+        let vat = at + (content.len() - value.trim_start().len()) as u32;
         // An array may run over lines: its text is to the end of the line it ends on.
         let value = if value.trim_start().starts_with('[') {
             let from = vat as usize;

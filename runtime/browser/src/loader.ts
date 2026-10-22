@@ -1,12 +1,12 @@
 // Loads a build (manifest.json, the WASM, each pipeline's WGSL) and assembles a running program:
 // pipelines built up front, then the WASM instantiated against the decoder.
 
-import { Checker, limitsOf, pathProblem } from "./check.ts";
+import { Checker, limitsOf } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { Lines, LINES_SIDECAR } from "./lines.ts";
 import { type Manifest, parseManifest } from "./manifest.ts";
-import { pathUrl } from "./path.ts";
+import { pathProblem, pathUrl } from "./path.ts";
 import { type Compiled, type Io, Program, type ProgramOptions } from "./program.ts";
 import type { Bytes } from "./stream.ts";
 import { UTF8 } from "./wasm.ts";

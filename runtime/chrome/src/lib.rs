@@ -105,7 +105,7 @@ pub fn platform_args(os: &str) -> &'static [&'static str] {
 /// would wait on it. Taken around the making of pipes and each start alone, never a wait.
 pub fn spawning() -> std::sync::MutexGuard<'static, ()> {
     static SPAWNING: Mutex<()> = Mutex::new(());
-    SPAWNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock(&SPAWNING)
 }
 
 /// Starts Chrome for the driver: the command it runs, and, once it has started, the process
@@ -238,8 +238,21 @@ fn runnable(path: &Path) -> bool {
     std::fs::metadata(path).is_ok_and(|m| m.is_file() && runs(&m))
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+/// `m`'s guard, also after a thread panicked holding it.
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Whether `thread` finishes within `grace`, looking every 2 ms.
+pub(crate) fn finished_within(thread: &std::thread::JoinHandle<()>, grace: Duration) -> bool {
+    let since = Instant::now();
+    while !thread.is_finished() {
+        if since.elapsed() >= grace {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    true
 }
 
 /// Whether process `pid` still runs (as anyone's).
@@ -375,21 +388,15 @@ impl Process {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        let mut removed = false;
-        for _ in 0..50 {
-            match std::fs::remove_dir_all(&self.profile) {
-                Ok(()) => {
-                    removed = true;
-                    break;
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    removed = true;
-                    break;
-                }
-                // A process of the group writing as it died: once more.
-                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+        let removed = (0..50).any(|_| match std::fs::remove_dir_all(&self.profile) {
+            Ok(()) => true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+            // A process of the group writing as it died: once more.
+            Err(_) => {
+                std::thread::sleep(Duration::from_millis(20));
+                false
             }
-        }
+        });
         *ended = Some(gone && removed);
         gone && removed
     }
@@ -513,8 +520,8 @@ impl Browser {
             Err(why) => {
                 process.end();
                 let log = std::fs::read_to_string(&log_path).unwrap_or_default();
-                let tail: Vec<&str> = log.lines().rev().take(12).collect();
-                let tail: Vec<&str> = tail.into_iter().rev().collect();
+                let lines: Vec<&str> = log.lines().collect();
+                let tail = &lines[lines.len().saturating_sub(12)..];
                 if let Some(p) = &proxy {
                     p.close(Duration::from_secs(1));
                 }
@@ -723,9 +730,10 @@ impl TabState {
 
 /// A console message's text: its arguments, each as the console shows it, between spaces.
 fn console_text(params: &Value) -> String {
-    let args = params["args"].as_array().cloned().unwrap_or_default();
-    let parts: Vec<String> = args
-        .iter()
+    let parts: Vec<String> = params["args"]
+        .as_array()
+        .into_iter()
+        .flatten()
         .map(|a| match &a["value"] {
             Value::String(s) => s.clone(),
             Value::Null => {
@@ -737,6 +745,14 @@ fn console_text(params: &Value) -> String {
     parts.join(" ")
 }
 
+/// What DevTools' `exceptionDetails` say was thrown.
+fn exception_text(details: &Value) -> &str {
+    details["exception"]["description"]
+        .as_str()
+        .or(details["text"].as_str())
+        .unwrap_or("an exception")
+}
+
 /// Handles event `e` of a tab's page or one of its workers.
 fn handle(inner: &Inner, state: &TabState, e: &Event) {
     let conn = &inner.conn;
@@ -744,9 +760,7 @@ fn handle(inner: &Inner, state: &TabState, e: &Event) {
     match e.method.as_str() {
         "Runtime.consoleAPICalled" => state.line(console_text(&e.params)),
         "Runtime.exceptionThrown" => {
-            let d = &e.params["exceptionDetails"];
-            let text = d["exception"]["description"].as_str().or(d["text"].as_str());
-            state.line(format!("Uncaught {}", text.unwrap_or("an exception")));
+            state.line(format!("Uncaught {}", exception_text(&e.params["exceptionDetails"])));
         }
         "Log.entryAdded" => {
             let entry = &e.params["entry"];
@@ -818,8 +832,7 @@ impl Tab {
             deadline,
         )?;
         if let Some(d) = r.get("exceptionDetails") {
-            let why = d["exception"]["description"].as_str().or(d["text"].as_str());
-            return Err(format!("the page threw: {}", why.unwrap_or("an exception")));
+            return Err(format!("the page threw: {}", exception_text(d)));
         }
         Ok(r["result"]["value"].clone())
     }
@@ -945,16 +958,12 @@ impl Tab {
 impl Drop for Tab {
     fn drop(&mut self) {
         let _ = self.close(Instant::now() + Duration::from_secs(5));
-        if let Some(t) = self.thread.take() {
-            // Unrouted, its channel ends, and the thread with it, once an event it's handling
-            // is done.
-            let since = Instant::now();
-            while !t.is_finished() && since.elapsed() < EVENT_CALL {
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            if t.is_finished() {
-                let _ = t.join();
-            }
+        // Unrouted, its channel ends, and the thread with it, once an event it's handling is
+        // done.
+        if let Some(t) = self.thread.take()
+            && finished_within(&t, EVENT_CALL)
+        {
+            let _ = t.join();
         }
     }
 }

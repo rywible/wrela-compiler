@@ -195,12 +195,12 @@ fn solve(
     )
     .map_err(|e| e.to_string())?;
     // The literals on the lines named.
-    let files = report["files"].as_array().cloned().unwrap_or_default();
+    let files = report["files"].as_array().map_or(&[][..], Vec::as_slice);
     let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
     let wanted: Vec<(PathBuf, &Free)> =
         free.iter().map(|f| (canonical(&dir.join(&f.file)), f)).collect();
     let mut lits = Vec::new();
-    for l in report["literals"].as_array().cloned().unwrap_or_default() {
+    for l in report["literals"].as_array().into_iter().flatten() {
         let f = &files[l["file"].as_u64().unwrap_or(0) as usize];
         let path = canonical(&glue_dir.join(f["path"].as_str().unwrap_or("")));
         let line = l["line"].as_u64().unwrap_or(0) as u32;

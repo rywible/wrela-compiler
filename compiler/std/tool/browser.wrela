@@ -33,7 +33,7 @@
 //     .wait(Until::printed("down 37"), timeout: 5.0)
 // ```
 
-use std::fmt::{json_number, json_text}
+use std::fmt::{json_number, json_string}
 use std::input::{Key, Mods}
 use std::serialize::{Reader, Writer}
 use std::tool::{Answer, Call, Done, ToolError, ask, malformed}
@@ -84,9 +84,9 @@ impl Match {
             2 => "ends",
             _ => "contains",
         }
-        var out = String::from(f"{{\"{key}\": \"")
-        json_text(mut out, self.text.as_str())
-        out.push_str("\"}")
+        var out = f"{{\"{key}\": "
+        json_string(mut out, self.text.as_str())
+        out.push_str("}")
         out
     }
 }
@@ -115,13 +115,11 @@ impl Element {
     }
 
     fn json(self) -> String {
-        var out = String::from("{\"css\": \"")
-        json_text(mut out, self.css.as_str())
-        out.push_str("\"")
-        if let Some(t) = self.text.clone() {
-            out.push_str(", \"text\": \"")
-            json_text(mut out, t.as_str())
-            out.push_str("\"")
+        var out = String::from("{\"css\": ")
+        json_string(mut out, self.css.as_str())
+        if let Some(t) = self.text {
+            out.push_str(", \"text\": ")
+            json_string(mut out, t.as_str())
         }
         out.push_str("}")
         out
@@ -129,7 +127,7 @@ impl Element {
 
     fn write(self, w: mut Writer) {
         w.write_str(self.css.as_str())
-        match self.text.clone() {
+        match self.text {
             Some(t) => {
                 w.write_u8(1)
                 w.write_str(t.as_str())
@@ -145,9 +143,8 @@ pub struct Until: Clone {
 }
 
 fn text_json(text: str) -> String {
-    var out = String::from("\"")
-    json_text(mut out, text)
-    out.push_str("\"")
+    var out = String::new()
+    json_string(mut out, text)
     out
 }
 
@@ -174,7 +171,7 @@ impl Until {
             if i > 0 {
                 list.push_str(", ")
             }
-            list.push_str(text_json(are[i].to_string().as_str()).as_str())
+            list.push_str(text_json(are[i]).as_str())
         }
         Until { json: f"{{\"texts\": {text_json(selector).as_str()}, \"are\": [{list.as_str()}]}}" }
     }

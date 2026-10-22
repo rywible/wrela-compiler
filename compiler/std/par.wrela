@@ -263,6 +263,25 @@ pub struct Task<O> {
     out: u32,
 }
 
+/// Puts task `t`, with its context at `context`, in a free slot and wakes the helpers: the
+/// slot's address, or 0 if every slot is taken, and then it has run here, now.
+pub(package) fn queue_task(t: u32, context: u32) -> u32 {
+    unsafe {
+        for s in 0..TASK_SLOT_COUNT {
+            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
+            if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
+                atomic_store(slot + SLOT_TASK, t)
+                atomic_store(slot + SLOT_CONTEXT, context)
+                atomic_store(slot, QUEUED)
+                wake()
+                return slot
+            }
+        }
+        run_task(t, context, 0)
+        0
+    }
+}
+
 /// Starts `f(input)` on a helper: a task, which holds that helper while it runs. Its result
 /// is a function of `input` alone (`f` is `@deterministic`), whichever thread runs it and
 /// whenever; `join` it. A task no helper has started yet runs inside `join`, so with no helpers
@@ -295,20 +314,8 @@ pub fn spawn<I, O, F: @deterministic fn(take I) -> O>(input: take I, f: F) -> Ta
         let c: TaskContext<I, O, F> = TaskContext { input: Some(take input), f: Some(f), out }
         let context = place(take c)
         let size = size_of::<TaskContext<I, O, F>>()
-        let t = task(run_task_context::<I, O, F>)
-        for s in 0..TASK_SLOT_COUNT {
-            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
-            if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
-                atomic_store(slot + SLOT_TASK, t)
-                atomic_store(slot + SLOT_CONTEXT, context)
-                atomic_store(slot, QUEUED)
-                wake()
-                return Task { slot, context, context_size: size, out }
-            }
-        }
-        // Every slot is taken: it runs now, here.
-        run_task(t, context, 0)
-        Task { slot: 0, context, context_size: size, out }
+        let slot = queue_task(task(run_task_context::<I, O, F>), context)
+        Task { slot, context, context_size: size, out }
     }
 }
 
@@ -533,25 +540,6 @@ pub(package) fn tool_worker(thread: u32) {
                 std::mem::tool_active()
             }
         }
-    }
-}
-
-/// Puts task `t`, with its context at `context`, in a free slot and wakes the helpers: the
-/// slot's address, or 0 if every slot is taken, and then it has run here, now.
-pub(package) fn queue_task(t: u32, context: u32) -> u32 {
-    unsafe {
-        for s in 0..TASK_SLOT_COUNT {
-            let slot = TASK_SLOTS + s * TASK_SLOT_SIZE
-            if compare_swap(slot, SLOT_FREE, FILLING) == SLOT_FREE {
-                atomic_store(slot + SLOT_TASK, t)
-                atomic_store(slot + SLOT_CONTEXT, context)
-                atomic_store(slot, QUEUED)
-                wake()
-                return slot
-            }
-        }
-        run_task(t, context, 0)
-        0
     }
 }
 

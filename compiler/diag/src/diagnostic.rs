@@ -186,7 +186,7 @@ pub fn sort_and_dedup(diags: &mut Vec<Diagnostic>) {
         let s = d.span();
         (s.is_some(), s.map(|s| (s.file, s.start, s.end)), d.code.as_str())
     };
-    diags.sort_by(|a, b| key(a).cmp(&key(b)));
+    diags.sort_by_key(key);
     diags.dedup_by(|a, b| {
         let same = a.code == b.code
             && a.span() == b.span()

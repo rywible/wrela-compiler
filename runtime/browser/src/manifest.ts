@@ -16,15 +16,16 @@ import {
   STREAM_VERSION,
   TEXTURE_FORMATS,
 } from "./abi.gen.ts";
-import type { TextureFormat } from "./stream.ts";
+import type { Compare, TextureFormat } from "./stream.ts";
 import { errorMessage } from "./errors.ts";
 import { parseJson } from "./json.ts";
 
 export type UniformSpace = "uniform" | "storage";
-/** How two depths compare, in WebGPU's names. */
-export type Compare = Exclude<(typeof COMPARES)[number], null>;
 /** What a binding binds: a storage buffer read or read-write, a texture, or a sampler. */
 export type BindingKind = (typeof BINDING_KINDS)[number];
+
+/** Every texture format's name, as the manifest gives one. */
+const FORMAT_NAMES = TEXTURE_FORMATS.map((t) => t.name);
 
 const traitsOf = (k: BindingKind) => BINDING_KIND_TRAITS.find((t) => t.name === k)!;
 /** Whether a binding is a colour texture, which names its format. */
@@ -177,12 +178,11 @@ function oneOfOr<T extends string, F extends string>(o: Json, key: string, where
 function renderTargets(o: Json, where: string): RenderTarget[] {
   const ts = o["targets"];
   if (!Array.isArray(ts)) throw new ManifestError(`${where}.targets must be an array`);
-  const names = TEXTURE_FORMATS.map((t) => t.name);
   return ts.map((v: unknown, k) => {
     const tw = `${where}.targets[${k}]`;
     const to = object(v, tw);
     if (!("color" in to)) throw new ManifestError(`${tw}.color must be a format or null`);
-    const color = to["color"] === null ? null : (oneOf(to, "color", tw, names) as TextureFormat);
+    const color = to["color"] === null ? null : (oneOf(to, "color", tw, FORMAT_NAMES) as TextureFormat);
     if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
     return { color, depth: to["depth"] };
   });
@@ -224,7 +224,7 @@ function pipeline(v: unknown, i: number): Pipeline {
     if (!hasFormat(kind)) {
       if (bo["format"] !== undefined) throw new ManifestError(`${bw}: only a colour texture has a \`format\``);
     } else {
-      const f = TEXTURE_FORMATS.find((t) => t.name === oneOf(bo, "format", bw, TEXTURE_FORMATS.map((t) => t.name)))!;
+      const f = TEXTURE_FORMATS.find((t) => t.name === oneOf(bo, "format", bw, FORMAT_NAMES))!;
       if (f.depth) throw new ManifestError(`${bw}: a colour texture's format isn't a depth one`);
       if (isStorage(kind) && !f.storable) {
         throw new ManifestError(`${bw}: kernels can't write ${f.name} textures`);

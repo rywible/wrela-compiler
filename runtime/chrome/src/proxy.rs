@@ -14,12 +14,13 @@
 //! browser's session ([`SESSION_HEADER`]), set by the proxy (a page's own is dropped), so a
 //! server of the tool's knows which browser's page put a result.
 
+use crate::lock;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Where a connection would go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,10 +48,6 @@ const MOST_CONNECTIONS: usize = 256;
 
 /// How long a connection waits for a read, a write or its destination.
 const IDLE: Duration = Duration::from_secs(30);
-
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 /// A running proxy: its port, and its threads and sockets, which [`Proxy::close`] ends.
 pub(crate) struct Proxy {
@@ -88,12 +85,8 @@ impl Proxy {
             let _ = c.shutdown(Shutdown::Both);
         }
         let Some(t) = lock(&self.thread).take() else { return true };
-        let until = Instant::now() + grace;
-        while !t.is_finished() {
-            if Instant::now() >= until {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(5));
+        if !crate::finished_within(&t, grace) {
+            return false;
         }
         let _ = t.join();
         true

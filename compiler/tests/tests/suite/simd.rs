@@ -15,7 +15,7 @@
 //! wrela-tests --test suite simd_speed -- --ignored --nocapture` prints it.
 
 use std::path::Path;
-use wrela_host::{CpuBuild, CpuHost, Error, Value, frame_time};
+use wrela_host::{CpuHost, Error, Value, frame_time};
 use wrela_tests::{one_u32, page, scalar_page};
 
 fn simd_instructions(dir: &Path) -> usize {
@@ -67,8 +67,7 @@ fn every_vector_operation_has_the_same_bits_with_simd() {
 #[test]
 fn loops_four_at_a_time_have_the_same_bits() {
     let (simd, scalar) = both("compiler/tests/simd", "loops");
-    let mut hosts =
-        [&simd, &scalar].map(|d| CpuBuild::load(d).expect("load").start_with(1).expect("start"));
+    let mut hosts = [&simd, &scalar].map(|d| crate::cpu_host(d));
     let seeds: i32 = 40;
     for seed in 0..seeds {
         for n in 0..=64 {
@@ -162,8 +161,7 @@ fn command_streams_are_the_same_with_simd() {
         || (),
         |(), &(pkg, frames)| {
             let (simd, scalar) = both(pkg, "hashes");
-            let mut hosts = [simd, scalar]
-                .map(|d| CpuBuild::load(&d).expect("load").start_with(1).expect("start"));
+            let mut hosts = [simd, scalar].map(|d| crate::cpu_host(&d));
             for i in 0..frames {
                 for h in &mut hosts {
                     h.frame(frame_time(i, 60.0), 64, 48).expect("frame");
@@ -192,8 +190,7 @@ fn world_hashes_are_the_same_with_simd() {
 #[test]
 fn a_voice_renders_the_same_samples_with_simd() {
     let (simd, scalar) = both("compiler/tests/audio", "voice");
-    let mut hosts =
-        [simd, scalar].map(|d| CpuBuild::load(&d).expect("load").start_with(1).expect("start"));
+    let mut hosts = [simd, scalar].map(|d| crate::cpu_host(&d));
     for h in &mut hosts {
         h.frame(0.0, 16, 16).expect("frame");
     }

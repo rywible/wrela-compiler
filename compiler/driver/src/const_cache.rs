@@ -92,7 +92,7 @@ pub fn key(wasm: &[u8], fuel: u64) -> String {
     h.update(fuel.to_le_bytes());
     h.update((wasm.len() as u64).to_le_bytes());
     h.update(wasm);
-    let mut key = String::with_capacity(64);
+    let mut key = String::with_capacity(KEY_BYTES);
     for b in h.finalize() {
         write!(key, "{b:02x}").expect("write a cache key");
     }
@@ -174,11 +174,10 @@ pub fn clean(dir: &Path) {
 /// else's.
 fn cache_name(name: &std::ffi::OsStr) -> Option<bool> {
     let name = name.to_str()?;
-    let key = name.get(..64)?;
-    if !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_key(name.get(..KEY_BYTES)?) {
         return None;
     }
-    let rest = &name[64..];
+    let rest = &name[KEY_BYTES..];
     if rest == ".wcv" {
         return Some(false);
     }
@@ -196,7 +195,7 @@ fn cache_name(name: &std::ffi::OsStr) -> Option<bool> {
 /// valid entry copied or renamed under another key a miss; the checksum makes a damaged entry
 /// one too.
 pub fn encode(key: &str, v: &Value) -> Option<Vec<u8>> {
-    if key.len() != KEY_BYTES || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_key(key) {
         return None;
     }
     let mut out = MAGIC.to_vec();
@@ -209,7 +208,7 @@ pub fn encode(key: &str, v: &Value) -> Option<Vec<u8>> {
 
 /// The value `bytes` hold for `key`, or none if they aren't one whole, intact entry for it.
 pub fn decode(key: &str, bytes: &[u8]) -> Option<Value> {
-    if key.len() != KEY_BYTES || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !is_key(key) {
         return None;
     }
     let checksum_at = bytes.len().checked_sub(CHECKSUM_BYTES)?;
@@ -222,6 +221,11 @@ pub fn decode(key: &str, bytes: &[u8]) -> Option<Value> {
     let mut r = Reader { bytes: rest, at: 0 };
     let v = r.value(0)?;
     (r.at == r.bytes.len()).then_some(v)
+}
+
+/// Whether `s` is a key as [`key`] writes it: [`KEY_BYTES`] hex digits.
+fn is_key(s: &str) -> bool {
+    s.len() == KEY_BYTES && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn put_u32(out: &mut Vec<u8>, x: u32) {

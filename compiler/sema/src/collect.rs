@@ -303,14 +303,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                         .with_fix("make it a `u32`", t.span, "u32"),
                     );
                 }
-                self.p.new_param(ParamDef {
-                    name: g.name.name.clone(),
-                    bounds: Vec::new(),
-                    span: g.name.span,
-                    is_self: false,
-                    is_const: g.const_ty.is_some(),
-                    fn_bound: None,
-                })
+                let param = ParamDef::new(g.name.name.clone(), g.name.span);
+                self.p.new_param(ParamDef { is_const: g.const_ty.is_some(), ..param })
             })
             .collect()
     }
@@ -437,14 +431,8 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             ast::ItemKind::Trait(t) => {
                 let id = TraitId(self.p.traits.len() as u32);
-                let self_param = self.p.new_param(ParamDef {
-                    name: "Self".into(),
-                    bounds: Vec::new(),
-                    span: t.name.span,
-                    is_self: true,
-                    is_const: false,
-                    fn_bound: None,
-                });
+                let param = ParamDef::new("Self".into(), t.name.span);
+                let self_param = self.p.new_param(ParamDef { is_self: true, ..param });
                 let generics = self.declare_generics(&t.generics);
                 self.p.traits.push(TraitDef {
                     name: t.name.name.clone(),
@@ -465,14 +453,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 // A field a method's walk visits: any type with this trait (its bound is set
                 // with the trait's header).
                 if fieldwise {
-                    let g = self.p.new_param(ParamDef {
-                        name: "field".into(),
-                        bounds: Vec::new(),
-                        span: t.name.span,
-                        is_self: false,
-                        is_const: false,
-                        fn_bound: None,
-                    });
+                    let g = self.p.new_param(ParamDef::new("field".into(), t.name.span));
                     self.p.traits[id.index()].field_param = Some(g);
                 }
                 let mut methods = Vec::new();
@@ -535,27 +516,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             ast::ItemKind::Const(c) => {
                 let id = ConstId(self.p.consts.len() as u32);
                 let fuel = self.const_attrs(&item.attrs);
-                // Its type, once it's known, is the function's result (`check_program`).
-                self.p.fns.push(FnDef {
-                    name: c.name.name.clone(),
-                    module: m,
-                    owner: FnOwner::Const(id),
-                    generics: Vec::new(),
-                    params: Vec::new(),
-                    ret: self.p.types.error,
-                    ret_mode: RetMode::Owned,
-                    opaque: None,
-                    attrs: FnAttrs::default(),
-                    body: None,
-                    public: false,
-                    package_only: false,
-                    span: item.span,
-                    name_span: c.name.span,
-                    sig_span: item.span,
-                    lang: None,
-                    derived: None,
-                });
-                let eval = FnId(self.p.fns.len() as u32 - 1);
+                let eval = self.const_eval_fn(id, &c.name.name, m, item.span, c.name.span);
                 self.p.consts.push(ConstDef {
                     name: c.name.name.clone(),
                     module: m,
@@ -629,16 +590,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                     fieldwise = true;
                 }
                 "diagnostic" => {
-                    let text = a.args.as_deref().and_then(|args| match args {
-                        [
-                            ast::Arg {
-                                value: ast::Expr { kind: ast::ExprKind::Lit(l), .. }, ..
-                            },
-                        ] if l.kind == ast::LitKind::Str => {
-                            Some(wrela_syntax::lexer::string_value(&l.text))
-                        }
+                    let text = match a.args.as_deref() {
+                        Some([arg]) => str_lit(&arg.value),
                         _ => None,
-                    });
+                    };
                     match text {
                         Some(t) => diagnostic = Some(t),
                         None => self.diags.push(
@@ -726,6 +681,38 @@ impl<'d, 'u> Collector<'d, 'u> {
         }
     }
 
+    /// The function the build runs to compute constant `id` ([`FnOwner::Const`]), written at
+    /// `span`. Its type, once it's known, is the function's result (`check_program`).
+    fn const_eval_fn(
+        &mut self,
+        id: ConstId,
+        name: &str,
+        m: ModuleId,
+        span: Span,
+        name_span: Span,
+    ) -> FnId {
+        self.p.fns.push(FnDef {
+            name: name.to_string(),
+            module: m,
+            owner: FnOwner::Const(id),
+            generics: Vec::new(),
+            params: Vec::new(),
+            ret: self.p.types.error,
+            ret_mode: RetMode::Owned,
+            opaque: None,
+            attrs: FnAttrs::default(),
+            body: None,
+            public: false,
+            package_only: false,
+            span,
+            name_span,
+            sig_span: span,
+            lang: None,
+            derived: None,
+        });
+        FnId(self.p.fns.len() as u32 - 1)
+    }
+
     /// Declares a struct or enum; its fields or variants come with the signatures.
     fn declare_adt(
         &mut self,
@@ -760,14 +747,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                 if matches!(f.ty.kind, ast::TypeExprKind::Fn(_))
                     && !self.p.adts[id.index()].fn_fields.iter().any(|(n, _)| *n == f.name.name)
                 {
-                    let g = self.p.new_param(ParamDef {
-                        name: format!("fn {}", f.name.name),
-                        bounds: Vec::new(),
-                        span: f.ty.span,
-                        is_self: false,
-                        is_const: false,
-                        fn_bound: None,
-                    });
+                    let g =
+                        self.p.new_param(ParamDef::new(format!("fn {}", f.name.name), f.ty.span));
                     let def = &mut self.p.adts[id.index()];
                     def.generics.push(g);
                     def.fn_fields.push((f.name.name.clone(), g));
@@ -1044,12 +1025,6 @@ impl<'d, 'u> Collector<'d, 'u> {
         };
         let mut bad: Option<(Span, &str)> = None;
         let mut seen: Vec<&str> = Vec::new();
-        let text = |e: &ast::Expr| match &e.kind {
-            ast::ExprKind::Lit(l @ ast::Lit { kind: ast::LitKind::Str, .. }) => {
-                Some(wrela_syntax::lexer::string_value(&l.text))
-            }
-            _ => None,
-        };
         for arg in args {
             let Some(name) = &arg.name else {
                 if !is_tool_arg(arg) || seen.contains(&"tool") {
@@ -1085,7 +1060,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         }
                     }
                 }
-                "blobs" => match text(&arg.value).filter(|b| is_blob_budget(b)) {
+                "blobs" => match str_lit(&arg.value).filter(|b| is_blob_budget(b)) {
                     Some(b) => test.blobs = Some(b),
                     None => {
                         bad = bad.or(Some((
@@ -1116,7 +1091,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 "net" => {
                     let hosts = match &arg.value.kind {
                         ast::ExprKind::Array(items) => {
-                            items.iter().map(text).collect::<Option<Vec<String>>>()
+                            items.iter().map(str_lit).collect::<Option<Vec<String>>>()
                         }
                         _ => None,
                     };
@@ -1136,7 +1111,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                             .iter()
                             .map(|i| match &i.kind {
                                 ast::ExprKind::Tuple(parts) if parts.len() == 2 => {
-                                    Some((text(&parts[0])?, text(&parts[1])?))
+                                    Some((str_lit(&parts[0])?, str_lit(&parts[1])?))
                                 }
                                 _ => None,
                             })
@@ -1238,12 +1213,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         };
         let path = |name: &str| match named(name) {
             None => Ok(None),
-            Some(x) => match &x.value.kind {
-                ast::ExprKind::Lit(l @ ast::Lit { kind: ast::LitKind::Str, .. }) => {
-                    Ok(Some((wrela_syntax::lexer::string_value(&l.text), x.value.span)))
-                }
-                _ => Err(()),
-            },
+            Some(x) => str_lit(&x.value).map(|path| Some((path, x.value.span))).ok_or(()),
         };
         let input = match named("input").map(|x| (&x.value.kind, x.value.span)) {
             Some((ast::ExprKind::Path(p), span)) => Ok(Some((TestInput::Named(p.clone()), span))),
@@ -1700,13 +1670,13 @@ impl<'d, 'u> Collector<'d, 'u> {
                     }
                 }
             }
-            for (span, msg) in problems.iter().cloned() {
-                self.diags.push(
-                    Diagnostic::new(codes::E0407, span, msg)
-                        .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)"),
-                );
-            }
             if !problems.is_empty() {
+                for (span, msg) in problems {
+                    self.diags.push(
+                        Diagnostic::new(codes::E0407, span, msg)
+                            .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)"),
+                    );
+                }
                 continue;
             }
             let word = FieldDef {
@@ -2548,26 +2518,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         let id = ConstId(self.p.consts.len() as u32);
         // `·` can't be in a name, so this one can't clash with an item's.
         let name = ast::Ident { name: format!("default·{of}·{}", id.index()), span: d.span };
-        self.p.fns.push(FnDef {
-            name: of.to_string(),
-            module: m,
-            owner: FnOwner::Const(id),
-            generics: Vec::new(),
-            params: Vec::new(),
-            ret: self.p.types.error,
-            ret_mode: RetMode::Owned,
-            opaque: None,
-            attrs: FnAttrs::default(),
-            body: None,
-            public: false,
-            package_only: false,
-            span: d.span,
-            name_span: d.span,
-            sig_span: d.span,
-            lang: None,
-            derived: None,
-        });
-        let eval = FnId(self.p.fns.len() as u32 - 1);
+        let eval = self.const_eval_fn(id, of, m, d.span, d.span);
         self.p.consts.push(ConstDef {
             name: of.to_string(),
             module: m,
@@ -2761,14 +2712,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     let t = if *mode == Mode::Take && matches!(ty.kind, ast::TypeExprKind::Fn(_)) {
                         let bound =
                             resolve::resolve_type(&self.p, self.diags, &scope, ty, TyPos::FnBound);
-                        let g = implicit.add_def(ParamDef {
-                            name: format!("take {}", name.name),
-                            bounds: Vec::new(),
-                            span: ty.span,
-                            is_self: false,
-                            is_const: false,
-                            fn_bound: Some(bound),
-                        });
+                        let param = ParamDef::new(format!("take {}", name.name), ty.span);
+                        let g = implicit.add_def(ParamDef { fn_bound: Some(bound), ..param });
                         self.p.types.param(g)
                     } else {
                         resolve::resolve_type(
@@ -2808,7 +2753,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     TyPos::Return(&mut opaque),
                 );
                 // A run is a projection: returning one borrows the arguments (§6.6).
-                let run = matches!(self.p.types.kind(t), TyKind::Slice(_) | TyKind::Str);
+                let run = self.p.types.is_run(t);
                 (t, if run && r.mode == RetMode::Owned { RetMode::Borrow } else { r.mode })
             }
             None => (self.p.types.unit, RetMode::Owned),
@@ -2997,7 +2942,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             {
                 continue;
             }
-            let def = self.p.func(m).clone();
+            let def = self.p.func(m);
             let params = def
                 .params
                 .iter()
@@ -3008,14 +2953,15 @@ impl<'d, 'u> Collector<'d, 'u> {
                 })
                 .collect();
             let ret = self.p.types.subst(def.ret, &subst);
+            let (name, generics, ret_mode) = (def.name.clone(), def.generics.clone(), def.ret_mode);
             self.p.fns.push(FnDef {
-                name: def.name.clone(),
+                name,
                 module: imp.module,
                 owner: FnOwner::Impl(id),
-                generics: def.generics.clone(),
+                generics,
                 params,
                 ret,
-                ret_mode: def.ret_mode,
+                ret_mode,
                 opaque: None,
                 attrs: FnAttrs::default(),
                 body: None,
@@ -3070,14 +3016,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     continue;
                 }
                 let param = |p: &mut Program, name: String, is_const: bool| {
-                    p.new_param(ParamDef {
-                        name,
-                        bounds: Vec::new(),
-                        span: tr.span,
-                        is_self: false,
-                        is_const,
-                        fn_bound: None,
-                    })
+                    p.new_param(ParamDef { is_const, ..ParamDef::new(name, tr.span) })
                 };
                 let trait_params: Vec<ParamId> = tr
                     .generics
@@ -3868,6 +3807,16 @@ fn is_job(p: &Program, t: TyId) -> bool {
 
 /// What a test's input is (§13.2), for its errors.
 const INPUT_NOTE: &str = "a test's input is a `std::input::Script` constant (`input: SCRIPT`), or a file in the package (`input: \"path\"`): a script in runtime/abi `input`'s format, or with `ticks` a tick log";
+
+/// The text of `e`, a string literal.
+fn str_lit(e: &ast::Expr) -> Option<String> {
+    match &e.kind {
+        ast::ExprKind::Lit(l) if l.kind == ast::LitKind::Str => {
+            Some(wrela_syntax::lexer::string_value(&l.text))
+        }
+        _ => None,
+    }
+}
 
 /// Whether `arg` is `tool`, alone, which makes a `@test` a tool test (§13.2).
 fn is_tool_arg(arg: &ast::Arg) -> bool {

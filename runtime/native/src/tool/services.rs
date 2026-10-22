@@ -8,6 +8,7 @@
 use super::blobs::Blobs;
 use super::caps::{Caps, Entry, MOST_BYTES};
 use super::http::{Fake, Faked};
+use crate::locked;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
@@ -24,7 +25,7 @@ pub(crate) enum Answer {
 }
 
 /// A success, giving `payload`.
-fn ok(payload: &[u8]) -> Answer {
+pub(crate) fn ok(payload: &[u8]) -> Answer {
     let mut bytes = Vec::with_capacity(payload.len() + 1);
     bytes.push(0);
     bytes.extend_from_slice(payload);
@@ -32,7 +33,7 @@ fn ok(payload: &[u8]) -> Answer {
 }
 
 /// A failure, for `why`.
-fn err(why: &str) -> Answer {
+pub(crate) fn err(why: &str) -> Answer {
     let mut bytes = vec![1];
     bytes.extend_from_slice(why.as_bytes());
     Answer::Bytes(bytes)
@@ -146,29 +147,37 @@ impl Stuck {
 
 impl Services {
     pub(crate) fn blobs(&self) -> std::sync::MutexGuard<'_, Blobs> {
-        // A worker that panicked while it held them leaves them as they were.
-        self.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.blobs)
     }
 
     /// The driven builds.
     pub(crate) fn drives(&self) -> std::sync::MutexGuard<'_, super::drive::Drives> {
-        self.drives.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.drives)
     }
 
     /// The servers.
     pub(crate) fn servers(&self) -> std::sync::MutexGuard<'_, super::serve::Servers> {
-        self.servers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.servers)
     }
 
     /// The browsers.
     pub(crate) fn browsers(&self) -> std::sync::MutexGuard<'_, super::browser::Browsers> {
-        self.browsers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.browsers)
+    }
+
+    /// The bytes `data` names: its own, or its blob's, shared (while they're held, the blob
+    /// can't be appended to or released, as while a file is written from it).
+    pub(crate) fn data(&self, data: Data) -> Result<Arc<Vec<u8>>, String> {
+        match data {
+            Data::Bytes(b) => Ok(Arc::new(b)),
+            Data::Blob(id) => self.blobs().get(id),
+        }
     }
 
     /// Gives `answer` to `request`, which a service answers itself ([`Work::Later`]): nothing,
     /// once the run has ended.
     pub(crate) fn send(&self, request: u32, answer: Answer) {
-        let hub = self.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let hub = locked(&self.answers).clone();
         if let Some(hub) = hub {
             hub.deliver(request, answer);
         }
@@ -183,7 +192,7 @@ impl Services {
 
     /// The fakes a tool test set, by URL (none outside a test).
     pub(crate) fn fakes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Fake>> {
-        self.fakes.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.fakes)
     }
 
     /// The run's own directory, with `home/` in it, made the first time it's needed.
@@ -299,6 +308,69 @@ impl Drop for Sink<'_> {
         if let Some(id) = self.blob.take() {
             let _ = self.s.blobs().release(id);
         }
+    }
+}
+
+/// What a service holds for the tool (driven builds, servers, browsers), each by its handle,
+/// and each request's that the tool hasn't been told of. Each is registered under the request
+/// that made it before the answer that names it reaches the tool: until the tool reads that
+/// answer it's the request's, and if the request fails, or the tool ends first, the host
+/// closes it.
+pub(crate) struct Resources<T> {
+    held: HashMap<u32, Arc<T>>,
+    next: u32,
+    unpublished: HashMap<u32, Vec<u32>>,
+}
+
+impl<T> Default for Resources<T> {
+    fn default() -> Resources<T> {
+        Resources { held: HashMap::new(), next: 0, unpublished: HashMap::new() }
+    }
+}
+
+impl<T> Resources<T> {
+    /// A new handle, which holds nothing yet.
+    pub(crate) fn reserve(&mut self) -> u32 {
+        self.next += 1;
+        self.next
+    }
+
+    /// Holds `item` as `handle`, made for `request`.
+    pub(crate) fn hold(&mut self, request: u32, handle: u32, item: Arc<T>) {
+        self.held.insert(handle, item);
+        self.unpublished.entry(request).or_default().push(handle);
+    }
+
+    /// The `what` held as `handle`.
+    pub(crate) fn find(&self, handle: u32, what: &str) -> Result<Arc<T>, String> {
+        self.held.get(&handle).cloned().ok_or_else(|| format!("the tool holds no {what} {handle}"))
+    }
+
+    /// Takes the `what` held as `handle`, to close.
+    pub(crate) fn take(&mut self, handle: u32, what: &str) -> Result<Arc<T>, String> {
+        self.held.remove(&handle).ok_or_else(|| format!("the tool holds no {what} {handle}"))
+    }
+
+    /// Everything held.
+    pub(crate) fn all(&self) -> impl Iterator<Item = &Arc<T>> {
+        self.held.values()
+    }
+
+    /// The tool has read request `request`'s answer: what it made is the tool's now.
+    pub(crate) fn publish(&mut self, request: u32) {
+        self.unpublished.remove(&request);
+    }
+
+    /// Request `request` failed: what was made for it, which no answer names, to close.
+    pub(crate) fn rollback(&mut self, request: u32) -> Vec<Arc<T>> {
+        let ids = self.unpublished.remove(&request).unwrap_or_default();
+        ids.iter().filter_map(|id| self.held.remove(id)).collect()
+    }
+
+    /// Takes everything, to close: the tool has ended.
+    pub(crate) fn take_all(&mut self) -> Vec<Arc<T>> {
+        self.unpublished.clear();
+        self.held.drain().map(|(_, item)| item).collect()
     }
 }
 

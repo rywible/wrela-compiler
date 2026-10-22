@@ -25,8 +25,8 @@ pub fn literal_gradient(
     ret: TypeId,
     target: Target,
 ) -> Result<FuncId> {
-    let n = match m.types.get(which_ty) {
-        TypeDef::Array(_, n) => *n,
+    let (lit_t, n) = match m.types.get(which_ty) {
+        TypeDef::Array(e, n) => (*e, *n),
         _ => return Err(Error::internal("a parameter gradient's literals aren't an array")),
     };
     if n > 255 {
@@ -34,7 +34,7 @@ pub fn literal_gradient(
             "a parameter gradient takes at most 255 literals at once; ask in parts",
         ));
     }
-    let func = m.functions[f.index()].clone();
+    let func = m.functions[f.index()].clone_signature();
     if func.ret != Some(m.types.f32()) || func.ret_ref {
         return Err(Error::not_derivable(
             "a parameter gradient needs a function that returns an `f32`",
@@ -49,7 +49,7 @@ pub fn literal_gradient(
     };
     let mut w =
         Function::new(format!("{}_literal_gradient", func.name), func.params.clone(), Some(ret));
-    w.params.push(Param { name: "which".into(), ty: which_ty, by_ref: false, mutable: false });
+    w.params.push(Param::value("which", which_ty));
     let mut body = Vec::new();
     let args: Vec<Arg> = (0..func.params.len() as u32).map(|i| w.param_arg(i, &mut body)).collect();
     let zero = w.let_(&mut body, f32_t, Expr::Const(Const::F32(0.0)));
@@ -63,10 +63,6 @@ pub fn literal_gradient(
             // The seeds: the unit vector of each chosen literal.
             let which = w.let_(&mut body, which_ty, Expr::Param(func.params.len() as u32));
             let one = w.let_(&mut body, f32_t, Expr::Const(Const::F32(1.0)));
-            let lit_t = match m.types.get(which_ty) {
-                TypeDef::Array(e, _) => *e,
-                _ => unreachable!("checked above"),
-            };
             let u = m.types.u32();
             let mut args = args;
             args.push(Arg::Place(Place::root(PlaceRoot::Data(table))));

@@ -25,7 +25,7 @@ pub(super) fn value_and_gradient(
     target: Target,
     with: bool,
 ) -> Result<FuncId> {
-    let func = m.functions[f.index()].clone();
+    let func = m.functions[f.index()].clone_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
@@ -64,32 +64,17 @@ pub(super) fn value_and_gradient(
         Some(tuple),
     );
     let mut body = Vec::new();
-    let mut args: Vec<Arg> =
-        (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
-    // Seeds: the unit vectors along each component of x, passed the way `x` is (a tangent
-    // parameter is passed like its original).
-    let x_by_ref = func.params[xi].by_ref;
-    for k in 0..n {
-        let one = g.let_(&mut body, f32, Expr::Const(Const::F32(1.0)));
-        let seed = if n == 1 {
-            one
-        } else {
-            let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
-            let comps = (0..n).map(|c| if c == k { one } else { zero }).collect();
-            g.let_(&mut body, x_ty, Expr::Construct(x_ty, comps))
-        };
-        if x_by_ref {
-            let l = g.new_local(format!("seed{k}"), x_ty);
-            body.push(Stmt::Store(Place::local(l), seed));
-            args.push(Arg::Place(Place::local(l)));
-        } else {
-            args.push(Arg::Value(seed));
+    let args: Vec<Arg> = (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+    // Seeds: the unit vectors along each component of x.
+    let r = call_seeded(m, &mut g, &mut body, d, args, &func.params[xi], n, |g, body, k| {
+        let one = g.let_(body, f32, Expr::Const(Const::F32(1.0)));
+        if n == 1 {
+            return one;
         }
-    }
-    let dual_ty = m.functions[d.index()]
-        .ret
-        .ok_or_else(|| Error::internal("derived function returns nothing"))?;
-    let r = g.let_(&mut body, dual_ty, Expr::Call(d, args));
+        let zero = g.let_(body, f32, Expr::Const(Const::F32(0.0)));
+        let comps = (0..n).map(|c| if c == k { one } else { zero }).collect();
+        g.let_(body, x_ty, Expr::Construct(x_ty, comps))
+    })?;
     // The value (with a payload, the first field of `f`'s result), and the payload.
     let ret = func.ret.ok_or_else(|| Error::internal("no result"))?;
     let first = |g: &mut Function, body: &mut Block, of: ValueId| {
@@ -122,7 +107,36 @@ pub(super) fn value_and_gradient(
     Ok(m.add_function(g))
 }
 
-/// The derivative of `f` with active parameters `mask` and `n` directions.
+/// Calls `d`, a derivation of a function by its parameter `x` (`n` components), in `g`: with
+/// `args`, then a seed for each direction (`seed` makes direction `k`'s), passed the way `x` is
+/// (a tangent parameter is passed like its original). The call's result.
+#[allow(clippy::too_many_arguments)]
+fn call_seeded(
+    m: &Module,
+    g: &mut Function,
+    body: &mut Block,
+    d: FuncId,
+    mut args: Vec<Arg>,
+    x: &Param,
+    n: u8,
+    mut seed: impl FnMut(&mut Function, &mut Block, u8) -> ValueId,
+) -> Result<ValueId> {
+    for k in 0..n {
+        let s = seed(g, body, k);
+        if x.by_ref {
+            let l = g.new_local(format!("seed{k}"), x.ty);
+            body.push(Stmt::Store(Place::local(l), s));
+            args.push(Arg::Place(Place::local(l)));
+        } else {
+            args.push(Arg::Value(s));
+        }
+    }
+    let dual_ty = m.functions[d.index()]
+        .ret
+        .ok_or_else(|| Error::internal("derived function returns nothing"))?;
+    Ok(g.let_(body, dual_ty, Expr::Call(d, args)))
+}
+
 /// The top bit of a derivation's directions in the cache's key: a filtering one.
 const FILTERED: u8 = 0x80;
 
@@ -162,7 +176,7 @@ pub(super) fn filtered_value(
     ncap: u32,
     target: Target,
 ) -> Result<FuncId> {
-    let func = m.functions[f.index()].clone();
+    let func = m.functions[f.index()].clone_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     let n = dims(m, x_ty)?;
@@ -176,41 +190,29 @@ pub(super) fn filtered_value(
     let returns = returns_active(m, cache, f, mask, Mode::Ad) != 0;
     let mut params = func.params.clone();
     let width_param = params.len() as u32;
-    params.push(Param { name: "width".into(), ty: x_ty, by_ref: false, mutable: false });
+    params.push(Param::value("width", x_ty));
     let mut g = Function::new(format!("{}_filtered", func.name), params, Some(f32));
     let mut body = Vec::new();
-    let mut args: Vec<Arg> =
-        (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
+    let args: Vec<Arg> = (0..func.params.len() as u32).map(|i| g.param_arg(i, &mut body)).collect();
     let width = g.let_(&mut body, x_ty, Expr::Param(width_param));
     // Seeds: each component of x's axis, its width long.
-    let x_by_ref = func.params[xi].by_ref;
-    for k in 0..n {
-        let seed = if n == 1 {
-            width
-        } else {
-            let zero = g.let_(&mut body, f32, Expr::Const(Const::F32(0.0)));
-            let wk = g.let_(&mut body, f32, Expr::Extract(width, k as u32));
-            let comps = (0..n).map(|c| if c == k { wk } else { zero }).collect();
-            g.let_(&mut body, x_ty, Expr::Construct(x_ty, comps))
-        };
-        if x_by_ref {
-            let l = g.new_local(format!("seed{k}"), x_ty);
-            body.push(Stmt::Store(Place::local(l), seed));
-            args.push(Arg::Place(Place::local(l)));
-        } else {
-            args.push(Arg::Value(seed));
+    let r = call_seeded(m, &mut g, &mut body, d, args, &func.params[xi], n, |g, body, k| {
+        if n == 1 {
+            return width;
         }
-    }
-    let dual_ty = m.functions[d.index()]
-        .ret
-        .ok_or_else(|| Error::internal("derived function returns nothing"))?;
-    let r = g.let_(&mut body, dual_ty, Expr::Call(d, args));
+        let zero = g.let_(body, f32, Expr::Const(Const::F32(0.0)));
+        let wk = g.let_(body, f32, Expr::Extract(width, k as u32));
+        let comps = (0..n).map(|c| if c == k { wk } else { zero }).collect();
+        g.let_(body, x_ty, Expr::Construct(x_ty, comps))
+    })?;
     let value = if returns { g.let_(&mut body, f32, Expr::Extract(r, 0)) } else { r };
     body.push(Stmt::Return(Some(value)));
     g.body = body;
     Ok(m.add_function(g))
 }
 
+/// The derivative of `f` with active parameters `mask` and `n` directions; with `filter`, a
+/// filtering one (see [`Ad::filter`]).
 pub(super) fn derive(
     m: &mut Module,
     cache: &mut DeriveCache,
@@ -807,10 +809,7 @@ impl Ad<'_> {
                     if b == B::Clamp { (args[1], args[2]) } else { (self.zero(out, ty), one) };
                 // Each bound's kink over the footprint of `x` less it (a bound with no tangent
                 // shares `x`'s).
-                let (wl, wh) = match bounds {
-                    Some((l, h)) => (l, h),
-                    None => (None, None),
-                };
+                let (wl, wh) = bounds.unwrap_or_default();
                 let wl = match wl {
                     Some(l) => self.widened(out, l, ty),
                     None => w,
@@ -1340,11 +1339,7 @@ mod tests {
     fn f64_vector_normalization_has_a_valid_derivative() {
         let mut m = Module::default();
         let ty = m.types.vector_of(Scalar::F64, 2);
-        let mut f = Function::new(
-            "normalize_double",
-            vec![Param { name: "x".into(), ty, by_ref: false, mutable: false }],
-            Some(ty),
-        );
+        let mut f = Function::new("normalize_double", vec![Param::value("x", ty)], Some(ty));
         let mut body = Vec::new();
         let x = f.let_(&mut body, ty, Expr::Param(0));
         let normalized = f.let_(&mut body, ty, Expr::Builtin(Builtin::Normalize, vec![x]));

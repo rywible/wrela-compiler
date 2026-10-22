@@ -1,7 +1,7 @@
 //! `wrela tool`: builds a package's tool and runs it with the command line's grants and
 //! arguments; the process's exit status is the tool's.
 
-use crate::common::{manifest, package, wrela};
+use crate::common::{exit_within, group_alive, manifest, package, run, walk, within, wrela};
 use std::process::Command;
 
 /// A tool that copies the file its first argument names from `in` to `out`, prints its secret's
@@ -111,20 +111,6 @@ pub fn tool() -> u32 {
         .expect("run");
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("isn't set in the environment"));
-}
-
-/// Waits for `child` at most `bound`: its exit code, or `None` (and it's killed) past it.
-fn exit_within(child: &mut std::process::Child, bound: std::time::Duration) -> Option<i32> {
-    let started = std::time::Instant::now();
-    while started.elapsed() < bound {
-        if let Some(status) = child.try_wait().expect("wait") {
-            return status.code();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-    None
 }
 
 #[test]
@@ -519,15 +505,6 @@ pub fn tool() -> u32 {
 }
 "#;
 
-/// Whether process group `group` still has a process.
-fn group_alive(group: i32) -> bool {
-    Command::new("kill")
-        .args(["-0", &format!("-{group}")])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
 /// The browse tool's package, with its site and a temporary directory of its own.
 fn browse_package(name: &str) -> std::path::PathBuf {
     package(
@@ -621,20 +598,6 @@ fn a_killed_tool_host_leaves_no_chrome_and_its_profile_goes_at_the_next_start() 
     assert_eq!(profiles(&dir.join("tmp")), 0);
 }
 
-/// The files under `dir`, at any depth.
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            out.extend(walk(&p));
-        } else {
-            out.push(p);
-        }
-    }
-    out
-}
-
 /// A workspace with the tool `copy` (the package `copier`, [`COPY`]), its grants `extra` added to
 /// what it declares: `in` to read, `out` to write (not made yet), its secret, and a minute.
 fn copy_workspace(name: &str, extra: &str) -> std::path::PathBuf {
@@ -657,16 +620,7 @@ fn copy_workspace(name: &str, extra: &str) -> std::path::PathBuf {
 
 /// `wrela tool <name>` in `dir` with `args`: its status and what it printed.
 fn named(dir: &std::path::Path, args: &[&str]) -> (Option<i32>, String) {
-    let out = wrela()
-        .arg("tool")
-        .args(args)
-        .current_dir(dir)
-        .env("WRELA_TOOL_TEST_TOKEN", "abcd")
-        .output()
-        .expect("run wrela tool");
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.code(), text)
+    run(wrela().arg("tool").args(args).current_dir(dir).env("WRELA_TOOL_TEST_TOKEN", "abcd"))
 }
 
 #[test]
@@ -822,16 +776,4 @@ fn a_directory_swapped_after_the_grants_are_checked_leads_nowhere_new() {
     let copied = std::fs::read_to_string(ws.join("data-kept/out/copy/notes.txt"));
     assert_eq!(copied.expect("copied into the checked root").as_str(), "narrowed");
     assert!(!outside.join("out/copy").exists(), "nothing was made outside the workspace");
-}
-
-/// Whether `done` holds within `bound`, asked every few milliseconds.
-fn within(bound: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
-    let until = std::time::Instant::now() + bound;
-    while std::time::Instant::now() < until {
-        if done() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    done()
 }

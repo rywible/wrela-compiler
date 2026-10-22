@@ -5,7 +5,7 @@
 use crate::defs::{Entry, FieldDef, Lang, Mode, RetMode};
 use crate::program::Program;
 use crate::ty::{FloatTy, FnId, IntTy, TyId, TyKind, VecElem};
-use wrela_diag::{Diagnostic, codes};
+use wrela_diag::{Diagnostic, Span, codes};
 
 /// Every entry point's signature.
 pub fn check_entries(p: &Program) -> Vec<Diagnostic> {
@@ -38,7 +38,7 @@ pub fn shares_memory(p: &Program, f: FnId) -> bool {
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
 /// domain at `span`.
-pub fn shared_over_domain(p: &Program, f: FnId, span: wrela_diag::Span) -> Diagnostic {
+pub fn shared_over_domain(p: &Program, f: FnId, span: Span) -> Diagnostic {
     let name = &p.func(f).name;
     Diagnostic::new(
         codes::E0603,
@@ -174,7 +174,7 @@ pub fn varying_count(p: &Program, t: TyId) -> Option<usize> {
 }
 
 /// E0602: a vertex output's field that can't pass to the fragment shader.
-pub fn not_varying(p: &Program, field: &str, ty: TyId, span: wrela_diag::Span) -> Diagnostic {
+pub fn not_varying(p: &Program, field: &str, ty: TyId, span: Span) -> Diagnostic {
     Diagnostic::new(
         codes::E0602,
         span,
@@ -283,7 +283,7 @@ impl FragmentOutput {
 /// E0604: data a GPU entry point receives by value (a uniform) whose type isn't `GpuData`.
 /// Reported where the entry point is declared, or, for a type a generic entry point is
 /// instantiated with, where it's dispatched.
-pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: wrela_diag::Span) -> Diagnostic {
+pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: Span) -> Diagnostic {
     let shown = p.display_ty(ty);
     let mut d = Diagnostic::new(
         codes::E0604,
@@ -313,7 +313,7 @@ fn elems_not_gpu_data(
     p: &Program,
     param: &str,
     elem: TyId,
-    span: wrela_diag::Span,
+    span: Span,
     message: impl FnOnce(&str) -> String,
 ) -> Option<Diagnostic> {
     if p.types.has_params(elem) || crate::traits::implements_builtin(p, elem, Lang::GpuData) {
@@ -337,7 +337,7 @@ fn check_group(
     p: &Program,
     path: &str,
     t: TyId,
-    span: wrela_diag::Span,
+    span: Span,
     stage: &str,
     out: &mut Vec<Diagnostic>,
 ) {

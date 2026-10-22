@@ -140,32 +140,27 @@ pub fn format_like(old: &str, v: f32) -> Option<String> {
     };
     let decimals = mant.split_once('.').map_or(0, |(_, f)| f.trim_end_matches('_').len());
     let reads = |s: &str| literal_value(&format!("{s}{suffix}")) == Some(v);
-    if let Some(e) = exp_text {
+    let (m, e) = match exp_text {
         // Keep the exponent: the mantissa carries the change.
-        let k: i32 = e[1..].replace('_', "").parse().ok()?;
-        let m = target / 10f64.powi(k);
-        for d in decimals.max(1)..=decimal_limit(m, decimals) {
-            let s = format!("{m:.d$}{e}");
-            if reads(&s) {
-                return Some(format!("{s}{suffix}"));
+        Some(e) => {
+            let k: i32 = e[1..].replace('_', "").parse().ok()?;
+            (target / 10f64.powi(k), e)
+        }
+        None => {
+            // A whole number stays an integer where its value reads back as one.
+            if decimals == 0 && target < 1e15 {
+                let s = format!("{}", target.round() as u64);
+                if reads(&s) {
+                    return Some(format!("{s}{suffix}"));
+                }
             }
+            (target, "")
         }
-        return None;
-    }
-    // A whole number stays an integer where its value reads back as one.
-    if decimals == 0 && target < 1e15 {
-        let s = format!("{}", target.round() as u64);
-        if reads(&s) {
-            return Some(format!("{s}{suffix}"));
-        }
-    }
-    for d in decimals.max(1)..=decimal_limit(target, decimals) {
-        let s = format!("{target:.d$}");
-        if reads(&s) {
-            return Some(format!("{s}{suffix}"));
-        }
-    }
-    None
+    };
+    (decimals.max(1)..=decimal_limit(m, decimals))
+        .map(|d| format!("{m:.d$}{e}"))
+        .find(|s| reads(s))
+        .map(|s| format!("{s}{suffix}"))
 }
 
 /// Seventeen significant decimal digits round-trip an `f64`; fixed-point text also needs
@@ -466,9 +461,11 @@ pub fn parse_edits(text: &str) -> Result<Vec<LiteralEdit>, String> {
                     .ok_or(format!("edit {i}: `{k}` is missing"))
             };
             let n = |k: &str| {
-                e.get(k)
+                let n = e
+                    .get(k)
                     .and_then(serde_json::Value::as_u64)
-                    .ok_or(format!("edit {i}: `{k}` is missing"))
+                    .ok_or(format!("edit {i}: `{k}` is missing"))?;
+                u32::try_from(n).map_err(|_| format!("edit {i}: `{k}` is too large"))
             };
             let value = e
                 .get("value")
@@ -476,10 +473,8 @@ pub fn parse_edits(text: &str) -> Result<Vec<LiteralEdit>, String> {
                 .ok_or(format!("edit {i}: `value` is missing"))?;
             Ok(LiteralEdit {
                 file: s("file")?,
-                start: u32::try_from(n("start")?)
-                    .map_err(|_| format!("edit {i}: `start` is too large"))?,
-                end: u32::try_from(n("end")?)
-                    .map_err(|_| format!("edit {i}: `end` is too large"))?,
+                start: n("start")?,
+                end: n("end")?,
                 text: s("text")?,
                 hash: s("hash")?,
                 value: value as f32,

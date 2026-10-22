@@ -70,7 +70,7 @@ import { Inbox, type Net } from "./net.ts";
 import type { Scripted } from "./input.ts";
 import { type Bytes, type Command, decode, type OpcodeName, Sequencer } from "./stream.ts";
 import type { TickerOptions, VoiceOptions } from "./messages.ts";
-import { functionTypes, type MemoryLimits } from "./wasm.ts";
+import { functionTypes, type MemoryLimits, UTF8 } from "./wasm.ts";
 
 /** The WASM module is invalid or breaks the program ABI. */
 export class ProgramError extends Error {
@@ -682,7 +682,7 @@ export class Program {
         let room: string;
         try {
           // A copy: the body is a view into the program's shared memory, which a decoder refuses.
-          room = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(body.slice(4));
+          room = UTF8.decode(body.slice(4));
         } catch {
           throw new TrapError("`net/open`'s room isn't UTF-8");
         }

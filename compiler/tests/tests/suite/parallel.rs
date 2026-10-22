@@ -74,7 +74,7 @@ fn a_panic_on_a_worker_is_the_programs() {
 fn native(dir: &std::path::Path, workers: u32) -> String {
     let options = Options { workers, ..Options::default() };
     let mut host = Host::load_with(dir, &options).expect("load");
-    let times: Vec<f32> = (0..FRAMES).map(|i| frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(FRAMES);
     host.run_frames(&times, 16, 16).expect("run").hash_hex()
 }
 

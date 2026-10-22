@@ -201,22 +201,17 @@ pub fn serve(time: f32) {}
 
 /// The server build of `program` (a package's main.wrela), in scratch directory `name`.
 pub(crate) fn server_wasm(name: &str, program: &str) -> Vec<u8> {
-    {
-        let root = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(name);
-        let _ = std::fs::remove_dir_all(&root);
-        let pkg = root.join("pkg");
-        std::fs::create_dir_all(&pkg).expect("scratch package");
-        std::fs::write(pkg.join("wrela.toml"), "[package]\nname = \"rooms\"\n").expect("manifest");
-        std::fs::write(pkg.join("main.wrela"), program).expect("main");
-        let out = root.join("build");
-        wrela_tests::must_build(&pkg, &out);
-        std::fs::read(out.join("server/game.wasm")).expect("the server build")
-    }
+    let root = super::scratch(name);
+    let pkg = root.join("pkg");
+    super::write_package(&pkg, "rooms", program);
+    let out = root.join("build");
+    wrela_tests::must_build(&pkg, &out);
+    std::fs::read(out.join("server/game.wasm")).expect("the server build")
 }
 
 /// The server build, its WASM's hash, and a fresh directory for the test's rooms.
 fn build(name: &str) -> (std::sync::Arc<ServerBuild>, u64, PathBuf) {
-    let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("rooms-{name}"));
+    let dir = crate::scratch_root().join(format!("rooms-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
     let build = std::sync::Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build"));
     (build, wrela_abi::ticks::wasm_hash(wasm()), dir)
@@ -228,6 +223,17 @@ fn limits() -> Limits {
         deadline: std::time::Duration::from_millis(500),
         ..Limits::default()
     }
+}
+
+/// Room "a" of `build`, opened with `limits`, with peer 1 connected and greeted: what it sent
+/// taken.
+fn greeted(build: &std::sync::Arc<ServerBuild>, hash: u64, dir: &Path, limits: Limits) -> RoomHost {
+    let mut room = RoomHost::open(build.clone(), hash, dir, "a", limits).expect("open");
+    room.connect(1);
+    room.receive(1, hello(5, 1, 0, 0));
+    room.wake(0.1).expect("hello");
+    room.take_outbox();
+    room
 }
 
 // ---- the tests ---------------------------------------------------------------------------------
@@ -276,11 +282,7 @@ fn what_a_room_commits_survives_a_restart() {
 #[test]
 fn nothing_is_sent_before_its_records_are_kept() {
     let (build, hash, dir) = build("unkept");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, limits());
     // The journal fails to keep the commit: nothing is sent, the connection closes, and the
     // room starts again from what it kept.
     room.inject(Fault::Append);
@@ -385,11 +387,7 @@ fn a_proposal_past_its_deadline_keeps_nothing() {
         deadline: std::time::Duration::from_millis(100),
         ..Limits::default()
     };
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", fast).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, fast);
     let before = room.journal().expect("journal").len();
     room.receive(1, propose(1, 1, 1, 99));
     // The host's limit, not the program's: nothing is kept or refused, and the event waits;
@@ -404,11 +402,7 @@ fn a_proposal_past_its_deadline_keeps_nothing() {
 #[test]
 fn a_compaction_that_fails_leaves_the_old_journal() {
     let (build, hash, dir) = build("compact");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, limits());
     // Past `COMPACT_AFTER` (1024) entries the room compacts; the first try fails before its
     // new journal is renamed into place.
     room.inject(Fault::Compact);
@@ -548,11 +542,7 @@ fn a_wake_past_a_calls_bytes_gives_the_room_all_of_it() {
 #[test]
 fn a_journal_renamed_but_not_reopened_is_reopened() {
     let (build, hash, dir) = build("renamed");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, limits());
     // The compaction's new journal is renamed into place, then the host fails before it holds
     // the new file: the room starts again, and what it keeps from then on is on the disk.
     room.inject(Fault::AfterRename);
@@ -573,11 +563,7 @@ fn a_journal_renamed_but_not_reopened_is_reopened() {
 #[test]
 fn a_connection_is_its_peers_only_through_its_hello() {
     let (build, hash, dir) = build("tags");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits()).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, limits());
     // Another connection names peer 1, whose id every entry shows, without its token: refused,
     // and the peer keeps its connection.
     room.connect(2);
@@ -601,7 +587,7 @@ fn a_connection_is_its_peers_only_through_its_hello() {
 #[test]
 fn a_server_that_doesnt_read_its_events_is_quarantined() {
     let wasm = server_wasm("deaf-program", DEAF);
-    let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join("rooms-deaf");
+    let dir = crate::scratch_root().join("rooms-deaf");
     let _ = std::fs::remove_dir_all(&dir);
     let build = std::sync::Arc::new(ServerBuild::from_wasm(&wasm).expect("a server build"));
     let hash = wrela_abi::ticks::wasm_hash(&wasm);
@@ -622,11 +608,7 @@ fn a_server_that_doesnt_read_its_events_is_quarantined() {
 fn an_event_past_the_hosts_limits_while_isolating_waits_with_those_after_it() {
     let (build, hash, dir) = build("isolate-limits");
     let fast = Limits { deadline: std::time::Duration::from_millis(100), ..limits() };
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", fast).expect("open");
-    room.connect(1);
-    room.receive(1, hello(5, 1, 0, 0));
-    room.wake(0.1).expect("hello");
-    room.take_outbox();
+    let mut room = greeted(&build, hash, &dir, fast);
     // 13 traps the room, so the call is taken one event at a time: 13 is refused, then 99 runs
     // past its deadline, and it and 4 wait.
     room.receive(1, propose(1, 1, 1, 13));

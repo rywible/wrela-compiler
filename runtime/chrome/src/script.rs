@@ -390,34 +390,18 @@ impl Until {
             Some(Seen::Text(t)) => Some(t),
             _ => None,
         };
-        let shown =
-            |t: &Option<String>| t.as_ref().map_or("nothing yet".into(), |t| format!("{t:?}"));
+        // Whether text `t` matches `m`, and `what` it was.
+        let matched = |m: &Match, t: Option<String>, what: &str| {
+            let shown = t.as_ref().map_or("nothing yet".into(), |t| format!("{t:?}"));
+            (t.is_some_and(|t| m.matches(&t)), format!("{what} {shown}"))
+        };
         Ok(match self {
-            Until::Title(m) => {
-                let t = text(read(Query::Title)?);
-                (t.as_ref().is_some_and(|t| m.matches(t)), format!("the title was {}", shown(&t)))
-            }
-            Until::Location(m) => {
-                let t = text(read(Query::Location)?);
-                (
-                    t.as_ref().is_some_and(|t| m.matches(t)),
-                    format!("the location was {}", shown(&t)),
-                )
-            }
-            Until::Hash(m) => {
-                let t = text(read(Query::Hash)?);
-                (
-                    t.as_ref().is_some_and(|t| m.matches(t)),
-                    format!("the location's hash was {}", shown(&t)),
-                )
-            }
+            Until::Title(m) => matched(m, text(read(Query::Title)?), "the title was"),
+            Until::Location(m) => matched(m, text(read(Query::Location)?), "the location was"),
+            Until::Hash(m) => matched(m, text(read(Query::Hash)?), "the location's hash was"),
+            // A page that may not read the clipboard yet (it hasn't the focus) holds nothing.
             Until::Clipboard(m) => {
-                // A page that may not read the clipboard yet (it hasn't the focus) holds nothing.
-                let t = read(Query::Clipboard).ok().and_then(text);
-                (
-                    t.as_ref().is_some_and(|t| m.matches(t)),
-                    format!("the clipboard held {}", shown(&t)),
-                )
+                matched(m, read(Query::Clipboard).ok().and_then(text), "the clipboard held")
             }
             Until::Exists(e) | Until::Count(e, _) => {
                 let n = match read(Query::Count(e.clone()))? {
@@ -442,10 +426,7 @@ impl Until {
                     Some(Seen::Attribute(a)) => a,
                     _ => None,
                 };
-                (
-                    a.as_ref().is_some_and(|a| m.matches(a)),
-                    format!("{}'s `{name}` was {}", e.describe(), shown(&a)),
-                )
+                matched(m, a, &format!("{}'s `{name}` was", e.describe()))
             }
             Until::Active(tag) => {
                 let a = match read(Query::Active)? {

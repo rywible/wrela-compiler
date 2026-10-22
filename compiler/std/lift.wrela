@@ -9,7 +9,7 @@
 // each file's hash when it was built, so a tool can show a literal's line and write a change
 // back (`wrela edit`). In a build that isn't lifted there are no literals: `count()` is 0.
 
-use std::fmt::{json_number, json_text}
+use std::fmt::{json_number, json_string}
 use std::string::String
 
 /// A lifted literal: its place in the table.
@@ -243,13 +243,6 @@ impl Report {
     }
 }
 
-/// Adds `s` as a JSON string, including its quotes.
-fn push_json_string(out: mut String, s: str) {
-    out.push_byte(34)
-    json_text(mut out, s)
-    out.push_byte(34)
-}
-
 impl Checks for Report {
     fn check(mut self, name: Text, kind: Text, value: f32, target: f32, miss: f32, within: f32) {
         let ok = abs(miss) <= within
@@ -262,9 +255,9 @@ impl Checks for Report {
             self.json.push_str(",")
         }
         self.json.push_str("{\"name\":")
-        push_json_string(mut self.json, name)
+        json_string(mut self.json, name)
         self.json.push_str(",\"check\":")
-        push_json_string(mut self.json, kind)
+        json_string(mut self.json, kind)
         self.json.push_str(",\"value\":")
         json_number(mut self.json, value)
         self.json.push_str(",\"target\":")
@@ -408,7 +401,7 @@ impl Minimize {
             let (enough, most) = if left == 0 {
                 (rounding_limit(solved), 7)
             } else {
-                (rounding_limit(loss_at(self.free, f, x)), min(self.decimals[k] + 3, 7))
+                (rounding_limit(loss_at(self.free, f, x)), min(d + 3, 7))
             }
             while d < most {
                 var trial = x.clone()

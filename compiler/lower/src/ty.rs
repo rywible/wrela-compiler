@@ -293,7 +293,6 @@ impl<'a> Cx<'a> {
         self.not_on_gpu(mb, name, note, span);
     }
 
-    /// E0326: a type GPU code can't hold.
     /// E0702: a run or a buffer of `elem`, a type whose values hold nothing (`()`, a struct
     /// with no fields). It would have a length and no bytes, which neither back end has a form
     /// for yet; dropping it would lose the length (and a dispatch that takes one).
@@ -309,6 +308,7 @@ impl<'a> Cx<'a> {
         );
     }
 
+    /// E0326: a type GPU code can't hold.
     fn not_on_gpu(&mut self, mb: &ModuleBuilder, name: &str, note: &str, span: Span) {
         let what = mb.gpu.as_ref().map_or("GPU code", |g| g.what.as_str());
         self.err(
@@ -459,13 +459,7 @@ impl<'a> Cx<'a> {
         let info = body.closures.get(c.id.0 as usize)?;
         for &(l, written) in &info.captures {
             let t = self.concrete(body.local(l).ty, &subst);
-            if written
-                || !wrela_sema::traits::implements_builtin(
-                    &checked.program,
-                    t,
-                    wrela_sema::defs::Lang::Copy,
-                )
-            {
+            if written || !self.is_copy(t) {
                 return None;
             }
         }
@@ -502,7 +496,7 @@ impl<'a> Cx<'a> {
                 }
                 None => {
                     let Some(t) = self.lower_ty(mb, ft, span) else { continue };
-                    out.push(ir::Param { name: field, ty: t, by_ref: false, mutable: false });
+                    out.push(ir::Param::value(field, t));
                 }
             }
         }

@@ -174,8 +174,7 @@ impl<'p> Checker<'p> {
                 self.call_type_relative(ty, &name, generics, args, expected, span)
             }
             ValueRes::TraitRelative(t, name) => {
-                let trait_params = self.p.trait_(t).generics.clone();
-                let ntraits = trait_params.len();
+                let tr = self.p.trait_(t);
                 // `Trait::<A>::method(x)` names the trait's arguments; without them they're
                 // inferred.
                 let written = path
@@ -183,19 +182,9 @@ impl<'p> Checker<'p> {
                     .len()
                     .checked_sub(2)
                     .and_then(|i| path.segments[i].generics.as_deref());
-                let trait_args: Vec<TyId> = match written {
-                    Some(g) if g.len() == ntraits => g
-                        .iter()
-                        .zip(&trait_params)
-                        .map(|(t, &param)| self.resolve_generic_arg(t, param))
-                        .collect(),
-                    Some(g) => {
-                        let tname = &self.p.trait_(t).name;
-                        self.err(resolve::wrong_generic_count(span, tname, ntraits, g.len()));
-                        (0..ntraits).map(|_| self.p.types.error).collect()
-                    }
-                    None => (0..ntraits).map(|_| self.new_var(VarKind::General, span)).collect(),
-                };
+                let trait_args = self
+                    .given_args(&tr.generics, written, &tr.name, span)
+                    .unwrap_or_else(|| vec![self.p.types.error; tr.generics.len()]);
                 let own = TraitRef { trait_: t, args: trait_args };
                 // The method is the trait's own or a supertrait's (`Sub::base(x)`).
                 let error = self.p.types.error;
@@ -347,14 +336,8 @@ impl<'p> Checker<'p> {
     /// A closure's parameter types, return type and parameter modes.
     fn closure_sig(&self, def: &ClosureDef) -> (Vec<TyId>, TyId, Vec<Mode>) {
         let tys = def.params.iter().map(|p| self.locals[p.index()].ty).collect();
-        let modes = def
-            .params
-            .iter()
-            .map(|p| match self.locals[p.index()].kind {
-                LocalKind::Param(m) => m,
-                _ => Mode::Borrow,
-            })
-            .collect();
+        let modes =
+            def.params.iter().map(|p| super::param_mode(self.locals[p.index()].kind)).collect();
         (tys, def.ret, modes)
     }
 
@@ -645,7 +628,7 @@ impl<'p> Checker<'p> {
         // a scalar times a vector is a vector. An expected run guides only a result that is a
         // run: a run is never a type argument (§4.4), so `replace(mut v[k], Vec::new())` passed
         // for a `[u8]` returns the `Vec<u8>`, which then passes as a run.
-        let run = |c: &Self, t: TyId| matches!(c.kind(t), TyKind::Slice(_) | TyKind::Str);
+        let run = |c: &Self, t: TyId| c.p.types.is_run(c.shallow(t));
         let hint = expected.filter(|&e| {
             !matches!(self.kind(ret), TyKind::Opaque(..)) && (!run(self, e) || run(self, ret))
         });
@@ -1038,10 +1021,7 @@ impl<'p> Checker<'p> {
                     modes.iter().enumerate().find(|(i, m)| **m != flags.mode(*i))
                 {
                     let name = &self.locals[locals[i].index()].name;
-                    let want = match flags.mode(i) {
-                        Mode::Borrow => "by borrow".to_string(),
-                        m => format!("as `{}`", m.keyword()),
-                    };
+                    let want = passed(flags.mode(i));
                     self.err(Diagnostic::new(
                         codes::E0300,
                         e.span,
@@ -1065,10 +1045,7 @@ impl<'p> Checker<'p> {
                     params.iter().enumerate().find(|(i, p)| p.mode != flags.mode(*i))
                 {
                     let fname = &self.p.func(f).name;
-                    let want = match flags.mode(i) {
-                        Mode::Borrow => "by borrow".to_string(),
-                        m => format!("as `{}`", m.keyword()),
-                    };
+                    let want = passed(flags.mode(i));
                     self.err(
                         Diagnostic::new(
                             codes::E0300,
@@ -1487,12 +1464,21 @@ impl<'p> Checker<'p> {
         for &i in written {
             let (ty, at) = (xs[i].ty, xs[i].span);
             let e = std::mem::replace(&mut xs[i], Expr { ty, span: at, kind: ExprKind::Error });
-            let l = self.declare_unnamed(ty, LocalKind::Owned { mutable: false }, at);
-            let pat = Pat { ty, kind: PatKind::Bind(l), span: at };
-            stmts.push(Stmt { kind: StmtKind::Bind { pat, init: e, else_: None }, span: at });
-            xs[i] = Expr { ty, span: at, kind: ExprKind::Local(l) };
+            let (bind, local) = self.bind_unnamed(e, ty, LocalKind::Owned { mutable: false });
+            stmts.push(bind);
+            xs[i] = local;
         }
         stmts
+    }
+
+    /// `init`, bound first to a new unnamed local of type `ty` and kind `kind`: the binding,
+    /// and the local, read at `init`'s span.
+    fn bind_unnamed(&mut self, init: Expr, ty: TyId, kind: LocalKind) -> (Stmt, Expr) {
+        let at = init.span;
+        let l = self.declare_unnamed(ty, kind, at);
+        let pat = Pat { ty, kind: PatKind::Bind(l), span: at };
+        let bind = Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span: at };
+        (bind, Expr { ty, span: at, kind: ExprKind::Local(l) })
     }
 
     /// `embed("path")` (§13): `Bytes` of the file at `path`, relative to the package's root.
@@ -1639,11 +1625,10 @@ impl<'p> Checker<'p> {
                 LocalKind::Owned { mutable: false }
             };
             let init = std::mem::replace(e, Expr { ty, span: at, kind: ExprKind::Error });
-            let l = self.declare_unnamed(ty, kind, at);
-            let pat = Pat { ty, kind: PatKind::Bind(l), span: at };
-            stmts.push(Stmt { kind: StmtKind::Bind { pat, init, else_: None }, span: at });
-            *e = Expr { ty, span: at, kind: ExprKind::Local(l) };
-            out.push(Expr { ty, span: at, kind: ExprKind::Local(l) });
+            let (bind, local) = self.bind_unnamed(init, ty, kind);
+            stmts.push(bind);
+            out.push(local.clone());
+            *e = local;
         }
         out
     }
@@ -1886,11 +1871,9 @@ impl<'p> Checker<'p> {
         let mut stmts = Vec::new();
         for &i in written {
             let Some(x) = comps[i].take() else { continue };
-            let at = x.span;
-            let l = self.declare_unnamed(comp, LocalKind::Owned { mutable: false }, at);
-            let pat = Pat { ty: comp, kind: PatKind::Bind(l), span: at };
-            stmts.push(Stmt { kind: StmtKind::Bind { pat, init: x, else_: None }, span: at });
-            comps[i] = Some(Expr { ty: comp, span: at, kind: ExprKind::Local(l) });
+            let (bind, local) = self.bind_unnamed(x, comp, LocalKind::Owned { mutable: false });
+            stmts.push(bind);
+            comps[i] = Some(local);
         }
         let xs = comps.into_iter().map(|c| c.unwrap_or_else(|| zero.clone())).collect();
         let tail = Expr { ty, span, kind: ExprKind::Construct(xs) };
@@ -1912,10 +1895,7 @@ impl<'p> Checker<'p> {
         if let &TyKind::Adt(a, _) = self.kind(ty)
             && let Some(v) = self.p.adt(a).variants().iter().position(|v| v.name == name.name)
         {
-            let path = ast::Path {
-                segments: vec![ast::PathSegment { ident: name.clone(), generics: None }],
-                span: name.span,
-            };
+            let path = super::expr::name_path(name);
             return self.call_variant(a, v as u32, &path, args, expected.or(Some(ty)), span);
         }
         match self.find_associated(ty, name) {
@@ -2009,16 +1989,16 @@ impl<'p> Checker<'p> {
             return self.str_method(name);
         }
         let TyKind::Adt(a, _) = self.kind(ty) else { return self.builtin_method(ty, name, span) };
-        if self.is_stringy(ty) && !self.has_associated_fn(*a, name) {
+        if self.is_stringy(ty) && p.inherent_method(*a, name).is_none() {
             return self.str_method(name);
         }
         let mut fitting = Vec::new();
+        let receiver = self.infer.resolve(&p.types, ty);
         for &i in p.inherent_impls.get(a).into_iter().flatten() {
             let imp = p.impl_(i);
             let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == name) else {
                 continue;
             };
-            let receiver = self.infer.resolve(&p.types, ty);
             if !traits::could_unify(p, imp.self_ty, receiver) {
                 continue;
             }
@@ -2071,11 +2051,11 @@ impl<'p> Checker<'p> {
         Inherent::Method(f, vars)
     }
 
-    /// Method `name` of std's `impl str`.
     /// A method of std's `impl` of another built-in type, such as a fixed array's
     /// (`impl<S: Surface, const N: u32> [S; N]`), whose type fits `ty`.
     fn builtin_method(&mut self, ty: TyId, name: &str, span: Span) -> Inherent {
         let p = self.p;
+        let receiver = self.infer.resolve(&p.types, ty);
         for &i in &p.builtin_inherent {
             let imp = p.impl_(i);
             if matches!(p.types.kind(imp.self_ty), TyKind::Str) {
@@ -2089,7 +2069,6 @@ impl<'p> Checker<'p> {
             }
             // Variables are made only for an impl that could fit: one left unbound would be
             // reported as a type that can't be inferred.
-            let receiver = self.infer.resolve(&p.types, ty);
             if !traits::could_unify(p, imp.self_ty, receiver) {
                 continue;
             }
@@ -2105,6 +2084,7 @@ impl<'p> Checker<'p> {
         Inherent::Missing
     }
 
+    /// Method `name` of std's `impl str`.
     fn str_method(&self, name: &str) -> Inherent {
         let p = self.p;
         for &i in &p.builtin_inherent {
@@ -2396,11 +2376,12 @@ impl<'p> Checker<'p> {
             ];
             // A trait's method, on a type that doesn't implement the trait. Traits that share
             // a name are told apart by their modules' paths.
-            let traits: Vec<&TraitDef> = self
+            let traits: Vec<(usize, &TraitDef)> = self
                 .p
                 .traits
                 .iter()
-                .filter(|t| {
+                .enumerate()
+                .filter(|(_, t)| {
                     t.methods
                         .iter()
                         .any(|&m| self.p.func(m).name == name.name && self.p.func(m).has_self())
@@ -2408,11 +2389,11 @@ impl<'p> Checker<'p> {
                 .collect();
             let owners: Vec<String> = traits
                 .iter()
-                .map(|t| {
+                .map(|(_, t)| {
                     let path = &self.p.module(t.module).path;
                     // The entry module's names are written bare (`use` starts at the root).
                     let entry = path.len() == 1 && path[0] == "main";
-                    if traits.iter().filter(|o| o.name == t.name).count() > 1 && !entry {
+                    if traits.iter().filter(|(_, o)| o.name == t.name).count() > 1 && !entry {
                         format!("`{}::{}`", path.join("::"), t.name)
                     } else {
                         format!("`{}`", t.name)
@@ -2428,9 +2409,7 @@ impl<'p> Checker<'p> {
                 ));
                 // A closure has a trait through an impl for every function of one signature.
                 if matches!(self.kind(rt), TyKind::Closure(..) | TyKind::FnDef(..)) {
-                    for t in &traits {
-                        let id = self.p.traits.iter().position(|x| std::ptr::eq(x, *t));
-                        let Some(id) = id else { continue };
+                    for &(id, t) in &traits {
                         for &i in self.p.impls_of(TraitId(id as u32)) {
                             let imp = self.p.impl_(i);
                             if let TyKind::Param(g) = self.p.types.kind(imp.self_ty)
@@ -2947,7 +2926,6 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// Whether a parameter type is a GPU builtin (supplied by the GPU, not the caller).
     /// Whether an entry point's parameter of type `t` is supplied by the GPU, not passed: a
     /// builtin input, or workgroup memory.
     pub(crate) fn is_gpu_builtin(&self, t: TyId) -> bool {
@@ -3338,9 +3316,6 @@ impl<'p> Checker<'p> {
         }
     }
 
-    /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
-    /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
-    /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
     /// A draw's pass: an open pass's value, which its `begin_` function gave, or a parameter
     /// bounded by `RenderPass` (§18). Its type says what the draw draws into.
     fn render_pass(&mut self, e: &ast::Expr) -> Option<Expr> {
@@ -3380,6 +3355,9 @@ impl<'p> Checker<'p> {
         Some(x)
     }
 
+    /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
+    /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
+    /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
     fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
@@ -3826,6 +3804,14 @@ struct BoundValue {
     varyings: Option<TyId>,
 }
 
+/// How a function type passes a parameter of mode `m`, for a message: "by borrow", "as `mut`".
+fn passed(m: Mode) -> String {
+    match m {
+        Mode::Borrow => "by borrow".to_string(),
+        m => format!("as `{}`", m.keyword()),
+    }
+}
+
 /// Whether `e` is a bare literal: `Some(true)` for a `bool`, `Some(false)` for a number (with a
 /// unit suffix or a minus too), `None` otherwise.
 fn bare_literal(e: &ast::Expr) -> Option<bool> {
@@ -3884,7 +3870,6 @@ fn comparison_operands<'e>(
     }
 }
 
-/// For a number literal, possibly negated or parenthesized: whether it's negative.
 /// The value of a negated integer literal (`-3000000000`), if `e` is one.
 fn negative_literal(e: &ast::Expr) -> Option<i128> {
     fn int(e: &ast::Expr) -> Option<i128> {
@@ -3903,6 +3888,7 @@ fn negative_literal(e: &ast::Expr) -> Option<i128> {
     }
 }
 
+/// For a number literal, possibly negated or parenthesized: whether it's negative.
 fn literal_sign(e: &ast::Expr) -> Option<bool> {
     match &e.kind {
         ast::ExprKind::Lit(ast::Lit {

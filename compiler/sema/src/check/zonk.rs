@@ -350,8 +350,7 @@ pub(super) fn finish_common(c: &mut Checker) {
     // infer from it follows from that.
     let bad_sig = c.fn_id.is_some_and(|f| {
         let def = c.p.func(f);
-        let error = |t: TyId| c.p.types.any(t, &mut |k| matches!(k, TyKind::Error));
-        error(def.ret) || def.params.iter().any(|ps| error(ps.ty))
+        c.has_error(def.ret) || def.params.iter().any(|ps| c.has_error(ps.ty))
     });
     if let Some(&span) = unknown.first()
         && !wrela_diag::has_errors(&c.diags)
@@ -370,7 +369,7 @@ pub(super) fn finish_common(c: &mut Checker) {
         let ty = c.infer.resolve(&c.p.types, c.locals[id.index()].ty);
         if matches!(c.p.types.kind(ty), TyKind::Error | TyKind::Slice(_) | TyKind::Str)
             || crate::mir::is_callable(&c.p.types, ty)
-            || crate::traits::implements_builtin(c.p, ty, crate::defs::Lang::Copy)
+            || traits::implements_builtin(c.p, ty, Lang::Copy)
         {
             continue;
         }
@@ -383,7 +382,7 @@ pub(super) fn finish_common(c: &mut Checker) {
         )
         .with_note("`let x = place` copies only a `Copy` value (§6.3)")
         .with_fix("read it in place: `borrow`", keyword, "borrow");
-        if crate::traits::implements_builtin(c.p, ty, crate::defs::Lang::Clone) {
+        if traits::implements_builtin(c.p, ty, Lang::Clone) {
             d = d.with_choice("copy it: `.clone()`", at.shrink_to_end(), ".clone()");
         }
         d = d.with_choice("move it: `take`", at.shrink_to_start(), "take ");
@@ -633,15 +632,7 @@ pub(super) fn finish(
         resolve(&mut cl.ret);
         walk_tys(&mut cl.body, &mut resolve);
         let sig = cl.params.iter().map(|p| locals[p.index()].ty).collect();
-        let modes = cl
-            .params
-            .iter()
-            .map(|p| match locals[p.index()].kind {
-                LocalKind::Param(m) => m,
-                LocalKind::ClosureParam => Mode::Borrow,
-                _ => Mode::Borrow,
-            })
-            .collect();
+        let modes = cl.params.iter().map(|p| super::param_mode(locals[p.index()].kind)).collect();
         let id = ClosureRef { owner: c.fn_id, id: ClosureId(k as u32) };
         c.p.closure_sigs.borrow_mut().insert(id, (sig, cl.ret, modes));
         closures.push(cl);

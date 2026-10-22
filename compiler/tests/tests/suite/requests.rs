@@ -22,7 +22,7 @@ fn native(dir: &Path) -> (String, [f32; 4]) {
     let _ = std::fs::remove_dir_all(&storage);
     let options = Options { storage: Some(storage), ..Options::default() };
     let mut host = Host::load_with(dir, &options).expect("load");
-    let times: Vec<f32> = (0..FRAMES).map(|i| frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(FRAMES);
     let run = host.run_frames(&times, 16, 16).expect("run");
     let answers = wrela_tests::one_vec4(&mut host, "answers", &[]);
     (run.hash_hex(), answers)
@@ -224,7 +224,7 @@ const SHIPPED_FRAMES: u32 = 41;
 
 fn shipped_native(dir: &Path) -> (String, [f32; 4]) {
     let mut host = Host::load_with(dir, &Options::default()).expect("load");
-    let times: Vec<f32> = (0..SHIPPED_FRAMES).map(|i| frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(SHIPPED_FRAMES);
     let run = host.run_frames(&times, 16, 16).expect("run");
     let answers = wrela_tests::one_vec4(&mut host, "answers", &[]);
     (run.hash_hex(), answers)

@@ -49,14 +49,12 @@ impl<'p> Checker<'p> {
 
     /// The job a value of type `t` is of (`Job<f>`'s `f`), and its generics.
     pub(crate) fn job_of(&self, t: TyId) -> Option<(FnId, Vec<TyId>)> {
-        match self.kind(t) {
-            TyKind::Adt(a, args) if self.p.is_lang_adt(*a, Lang::Job) => match args.first() {
-                Some(&f) => match self.kind(f) {
-                    TyKind::FnDef(f, args) => Some((*f, args.clone())),
-                    _ => None,
-                },
-                None => None,
-            },
+        let TyKind::Adt(a, args) = self.kind(t) else { return None };
+        if !self.p.is_lang_adt(*a, Lang::Job) {
+            return None;
+        }
+        match self.kind(*args.first()?) {
+            TyKind::FnDef(f, args) => Some((*f, args.clone())),
             _ => None,
         }
     }

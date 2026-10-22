@@ -95,7 +95,7 @@ export class ByteReader {
     return t;
   }
 
-    /** Limits: 0x01 has a maximum, 0x02 shared. */
+  /** Limits: 0x01 has a maximum, 0x02 shared. */
   limits(): MemoryLimits {
     const flags = this.byte();
     const initial = this.uleb();
@@ -110,7 +110,7 @@ export function functionTypes(bytes: Uint8Array): FunctionTypes {
   r.at = 8; // magic and version
   const types: string[] = [];
   const funcs: string[] = []; // the type of each function index: imports first
-    const out: FunctionTypes = { imports: [], exports: new Map(), memories: new Map() };
+  const out: FunctionTypes = { imports: [], exports: new Map(), memories: new Map() };
   while (r.at < bytes.length) {
     const id = r.byte();
     const size = r.uleb();

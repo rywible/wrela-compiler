@@ -136,15 +136,7 @@ fn start(a: &Args) -> Result<(Runner, Vec<wrela_abi::input::Scripted>), String> 
                 .map_err(|e| e.to_string())?,
         ))
     };
-    let script = match &a.input {
-        Some(p) => {
-            let text = std::fs::read_to_string(p)
-                .map_err(|e| format!("can't read {}: {e}", p.display()))?;
-            wrela_abi::input::parse_script(&text)?
-        }
-        None => Vec::new(),
-    };
-    Ok((runner, script))
+    Ok((runner, crate::read_script(a.input.as_deref())?))
 }
 
 /// Runs frame `i` (its scripted events first): its time, in seconds.

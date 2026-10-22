@@ -134,24 +134,6 @@ fn export(root: &std::path::Path, out: &str, extra: &[&str]) -> std::process::Ou
         .expect("run wrela")
 }
 
-/// Every file under `dir`, by its path there, with its bytes.
-fn files(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
-    let mut out = std::collections::BTreeMap::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for entry in std::fs::read_dir(&d).expect("read the export") {
-            let path = entry.expect("an entry").path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                let name = path.strip_prefix(dir).expect("inside").to_string_lossy().into_owned();
-                out.insert(name, std::fs::read(&path).expect("read"));
-            }
-        }
-    }
-    out
-}
-
 /// The export writes a page per module, an index of every item and every section of the spec,
 /// and a map of the pages: each item with its page, its anchor there and its source, and the
 /// spec's prose searchable by its words.
@@ -229,7 +211,7 @@ fn the_export_is_the_same_each_time_and_writes_only_into_a_new_directory() {
     let root = shapes("doc-export-again");
     assert!(export(&root, "a", &[]).status.success());
     assert!(export(&root, "b", &[]).status.success());
-    let (a, b) = (files(&root.join("a")), files(&root.join("b")));
+    let (a, b) = (common::files(&root.join("a")), common::files(&root.join("b")));
     assert!(a.len() > 30, "{} files", a.len());
     assert!(a == b, "two exports of the same sources differ");
     let again = export(&root, "a", &[]);

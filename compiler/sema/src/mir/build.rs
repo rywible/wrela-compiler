@@ -111,6 +111,14 @@ pub fn is_literal(consts: &Consts, e: &thir::Expr) -> bool {
     }
 }
 
+/// `e` without the `mut` that marks a `mut` argument (`mut place`).
+fn unmut(e: &thir::Expr) -> &thir::Expr {
+    match &e.kind {
+        ExprKind::MutArg(x) => x,
+        _ => e,
+    }
+}
+
 fn constant(l: Lit, ty: TyId, span: Span) -> Operand {
     Operand { kind: OperandKind::Const(l), ty, span }
 }
@@ -901,15 +909,12 @@ impl<'a> Builder<'a> {
                     let d = &decls[i as usize];
                     // The declared type decides: a run field may be given an array.
                     let projected = d.mode != RetMode::Owned
-                        || matches!(self.p.types.kind(d.ty), TyKind::Slice(_) | TyKind::Str)
+                        || self.p.types.is_run(d.ty)
                         || self.p.is_borrow_struct(d.ty);
                     let arg = if !projected {
                         Arg::Take(self.value(f, Want::Read)?)
                     } else {
-                        let inner = match &f.kind {
-                            ExprKind::MutArg(x) => x.as_ref(),
-                            _ => f,
-                        };
+                        let inner = unmut(f);
                         let p = self.place(inner)?;
                         self.check_indices(&p, inner.span);
                         if d.mode == RetMode::Mut {
@@ -980,19 +985,12 @@ impl<'a> Builder<'a> {
                 }
                 Rvalue::Adt { adt: *adt, args: args.clone(), variant: *variant, fields: out }
             }
-            ExprKind::Tuple(xs) => {
-                let vs = self.values(xs, part)?;
-                Rvalue::Tuple(vs.into_iter().map(|v| self.consume(v)).collect())
-            }
-            ExprKind::Array(xs) => {
-                let vs = self.values(xs, part)?;
-                Rvalue::Array(vs.into_iter().map(|v| self.consume(v)).collect())
-            }
+            ExprKind::Tuple(xs) => Rvalue::Tuple(self.consumed(xs, part)?),
+            ExprKind::Array(xs) => Rvalue::Array(self.consumed(xs, part)?),
             ExprKind::ArrayFill(xs, fill, n) => {
                 // The elements in order, then the fill once: a `Copy` value, so each place it
                 // fills reads the same operand.
-                let vs = self.values(xs, part)?;
-                let mut ops: Vec<Operand> = vs.into_iter().map(|v| self.consume(v)).collect();
+                let mut ops = self.consumed(xs, part)?;
                 let f = self.value(fill, Want::Read)?;
                 ops.resize(*n as usize, f);
                 Rvalue::Array(ops)
@@ -1057,6 +1055,12 @@ impl<'a> Builder<'a> {
 
     fn values(&mut self, xs: &[thir::Expr], want: Want) -> Option<Vec<Operand>> {
         xs.iter().map(|x| self.value(x, want)).collect()
+    }
+
+    /// [`Self::values`], each consumed by what they're parts of.
+    fn consumed(&mut self, xs: &[thir::Expr], want: Want) -> Option<Vec<Operand>> {
+        let vs = self.values(xs, want)?;
+        Some(vs.into_iter().map(|v| self.consume(v)).collect())
     }
 
     fn short_circuit(
@@ -1173,10 +1177,7 @@ impl<'a> Builder<'a> {
                     Arg::Take(self.consume(v))
                 }
                 Mode::Mut => {
-                    let inner = match &a.kind {
-                        ExprKind::MutArg(x) => x.as_ref(),
-                        _ => a,
-                    };
+                    let inner = unmut(a);
                     let p = self.place(inner)?;
                     Arg::Mut(self.arg_local(p, true, inner.span), a.span)
                 }
@@ -1447,17 +1448,29 @@ impl<'a> Builder<'a> {
         if b.inline {
             return self.inline_block(b, want);
         }
+        let declared = self.open_block(b);
+        let v = b.tail.as_ref().and_then(|t| self.value(t, want));
+        self.close_block(declared, b.span);
+        v
+    }
+
+    /// Opens block `b`'s scope and runs its statements: returns the locals they declare.
+    fn open_block(&mut self, b: &thir::Block) -> Vec<Local> {
         self.open_scope(ScopeKind::Block);
         let mut declared = Vec::new();
         for s in &b.stmts {
             self.stmt(s, &mut declared);
         }
-        let v = b.tail.as_ref().and_then(|t| self.value(t, want));
+        declared
+    }
+
+    /// Closes the innermost scope, a block's, dropping what it owns; then the scopes of its
+    /// locals, `declared`, end at `span`.
+    fn close_block(&mut self, declared: Vec<Local>, span: Span) {
         self.close_scope();
         for l in declared.into_iter().rev() {
-            self.push(StatementKind::Dead(l), b.span);
+            self.push(StatementKind::Dead(l), span);
         }
-        v
     }
 
     /// A block that's part of the statement it's in ([`thir::Block::inline`]): its statements
@@ -1525,18 +1538,11 @@ impl<'a> Builder<'a> {
 
     /// [`Self::bind_chosen`] to the place block `b` ends in, after its statements.
     fn bind_chosen_block(&mut self, l: Local, b: &thir::Block, mutable: bool) {
-        self.open_scope(ScopeKind::Block);
-        let mut declared = Vec::new();
-        for s in &b.stmts {
-            self.stmt(s, &mut declared);
-        }
+        let declared = self.open_block(b);
         if let Some(t) = &b.tail {
             self.bind_chosen(l, t, mutable);
         }
-        self.close_scope();
-        for d in declared.into_iter().rev() {
-            self.push(StatementKind::Dead(d), b.span);
-        }
+        self.close_block(declared, b.span);
     }
 
     fn if_(
@@ -1552,25 +1558,10 @@ impl<'a> Builder<'a> {
         self.diamond(
             c,
             e.span,
-            // Each branch's temporaries end in the branch: its value is moved out first.
-            |this| {
-                this.open_scope(ScopeKind::Temps);
-                let v = this.block(then, want);
-                if let (Some(r), Some(v)) = (r, v) {
-                    let v = this.consume(v);
-                    this.set(r, v, then.span);
-                }
-                this.close_scope();
-            },
+            |this| this.branch_into(r, then.span, |this| this.block(then, want)),
             |this| {
                 if let Some(x) = else_ {
-                    this.open_scope(ScopeKind::Temps);
-                    let v = this.value(x, want);
-                    if let (Some(r), Some(v)) = (r, v) {
-                        let v = this.consume(v);
-                        this.set(r, v, x.span);
-                    }
-                    this.close_scope();
+                    this.branch_into(r, x.span, |this| this.value(x, want));
                 }
             },
         );
@@ -1580,7 +1571,23 @@ impl<'a> Builder<'a> {
         })
     }
 
-    /// The scrutinee's place: its own if it's a named place, else a temporary.
+    /// A branch of an `if` or an arm of a `match`: its value, moved into `r`, the local that
+    /// holds the one chosen. The branch's temporaries end in it, after its value is moved out.
+    fn branch_into(
+        &mut self,
+        r: Option<Local>,
+        span: Span,
+        value: impl FnOnce(&mut Self) -> Option<Operand>,
+    ) {
+        self.open_scope(ScopeKind::Temps);
+        let v = value(self);
+        if let (Some(r), Some(v)) = (r, v) {
+            let v = self.consume(v);
+            self.set(r, v, span);
+        }
+        self.close_scope();
+    }
+
     /// Checks `place`'s indices where it's evaluated, if it has any ([`StatementKind::Check`]).
     fn check_indices(&mut self, place: &Place, span: Span) {
         if place.proj.iter().any(|p| matches!(p, Proj::Index(_))) {
@@ -1588,6 +1595,7 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// The scrutinee's place: its own if it's a named place, else a temporary.
     fn scrutinee(&mut self, s: &thir::Expr) -> Option<Place> {
         if self.is_named_place(s) {
             // Its patterns may read nothing (`_`): its indices are checked anyway.
@@ -1604,10 +1612,7 @@ impl<'a> Builder<'a> {
     /// projection the arms' tests read through, so a guard can't change what a later arm
     /// tests (E0507). A `match mut` borrows it mutably, for its bindings.
     fn match_scrutinee(&mut self, s: &thir::Expr, mutable: bool) -> Option<Place> {
-        let s = match &s.kind {
-            ExprKind::MutArg(x) => x.as_ref(),
-            _ => s,
-        };
+        let s = unmut(s);
         let p = self.scrutinee(s)?;
         if !self.is_named_place(s) {
             return Some(p);
@@ -1630,14 +1635,7 @@ impl<'a> Builder<'a> {
         let sp = self.match_scrutinee(scrutinee, mutable)?;
         let r = (!self.is_unit(e.ty)).then(|| self.temp(e.ty, LocalKind::TempVar, "match", e.span));
         self.arms(&sp, arms, e.span, |b, arm| {
-            // The arm's temporaries end in the arm: its value is moved out first.
-            b.open_scope(ScopeKind::Temps);
-            let v = b.value(&arm.body, want);
-            if let (Some(r), Some(v)) = (r, v) {
-                let v = b.consume(v);
-                b.set(r, v, arm.body.span);
-            }
-            b.close_scope();
+            b.branch_into(r, arm.body.span, |b| b.value(&arm.body, want));
             true
         });
         r.map(|r| {
@@ -1681,10 +1679,7 @@ impl<'a> Builder<'a> {
             }
             self.commit_moves(&arm.pat, sp);
             let falls_through = body(self, arm);
-            self.close_scope();
-            for l in bound.into_iter().rev() {
-                self.push(StatementKind::Dead(l), arm.span);
-            }
+            self.close_block(bound, arm.span);
             if falls_through {
                 self.terminate(TerminatorKind::ArmMatched(m), arm.span);
             } else {
@@ -1930,11 +1925,7 @@ impl<'a> Builder<'a> {
 
     /// [`Self::place_tail`] of a block: its statements, then its value's place.
     fn place_tail_block(&mut self, b: &thir::Block) {
-        self.open_scope(ScopeKind::Block);
-        let mut declared = Vec::new();
-        for s in &b.stmts {
-            self.stmt(s, &mut declared);
-        }
+        self.open_block(b);
         match &b.tail {
             Some(t) => self.place_tail(t),
             None => self.terminate(TerminatorKind::Unreachable, b.span),
@@ -2065,10 +2056,7 @@ impl<'a> Builder<'a> {
                 self.bind_chosen(l, init, mutable);
             }
             LocalKind::User(thir::LocalKind::Projection { mutable }) => {
-                let inner = match &init.kind {
-                    ExprKind::MutArg(x) => x.as_ref(),
-                    _ => init,
-                };
+                let inner = unmut(init);
                 let p = if self.is_named_place(inner) {
                     self.place(inner)
                 } else {

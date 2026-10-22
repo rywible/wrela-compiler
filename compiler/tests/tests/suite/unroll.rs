@@ -4,7 +4,7 @@
 //! kernel's 64 results, summed, are what the CPU's arithmetic gives.
 //! `cargo test -p wrela-tests --test suite unroll:: -- --ignored`.
 
-use wrela_host::{Host, Value, frame_time};
+use wrela_host::{Host, Value};
 use wrela_tests::{one_u32, page};
 
 #[test]
@@ -24,7 +24,7 @@ fn small_counted_loops_are_written_out_and_give_the_same_results() {
     assert_eq!(loops("long"), 1, "twenty passes stay a loop");
 
     let mut host = Host::load(&dir).expect("load");
-    let times: Vec<f32> = (0..4).map(|i| frame_time(i, 60.0)).collect();
+    let times = crate::frame_times(4);
     host.run_frames(&times, 16, 16).expect("run");
     let mut sum = |k: u32| one_u32(&mut host, "sum", &[Value::I32(k as i32)]);
     let ids = 0..64u32;

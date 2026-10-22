@@ -110,16 +110,12 @@ impl Cx<'_> {
     /// The job `t` is a value of (`Job<f>`'s `f`), and its generics.
     pub(crate) fn job_of(&self, t: TyId) -> Option<(FnId, Vec<TyId>)> {
         let p = &self.checked.program;
-        match p.types.kind(t) {
-            TyKind::Adt(a, args) if p.is_lang_adt(*a, Lang::Job) => match args.first() {
-                Some(&f) => match p.types.kind(f) {
-                    TyKind::FnDef(f, args) => Some((*f, args.clone())),
-                    _ => None,
-                },
-                None => None,
-            },
-            _ => None,
+        let TyKind::Adt(a, args) = p.types.kind(t) else { return None };
+        if !p.is_lang_adt(*a, Lang::Job) {
+            return None;
         }
+        let TyKind::FnDef(f, args) = p.types.kind(*args.first()?) else { return None };
+        Some((*f, args.clone()))
     }
 
     /// `Step<R>`, for job `f`'s result `R`, its generics `substs`.
@@ -220,7 +216,7 @@ pub(crate) fn resume(
             out.push(ir::Arg::Place(place?));
         } else {
             let v = match a.place() {
-                Some(pl) if run => fl.run_arg(pl, ty)?,
+                Some(pl) if run => fl.run_of(pl, ty)?,
                 _ => fl.arg_value(a)?,
             };
             out.push(ir::Arg::Value(v));

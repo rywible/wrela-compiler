@@ -387,26 +387,21 @@ fn live(code: Block) -> Block {
 /// compute, reads only locals and uniforms, indexes only by constants in range (`known`), and
 /// isn't a derivative (which wants the uniform control flow it's in).
 fn select_safe(m: &Module, f: &Function, e: &Expr, known: &HashMap<ValueId, u64>) -> bool {
-    let in_range = |i: &ValueId, n: u32| known.get(i).is_some_and(|&k| k < u64::from(n));
+    // An index into a value of type `t` that's known in range.
+    let in_range = |i: &ValueId, t: TypeId| {
+        let n = m.types.index_len(t);
+        known.get(i).zip(n).is_some_and(|(&k, n)| k < u64::from(n))
+    };
     match e {
         Expr::Builtin(Builtin::Dpdx | Builtin::Dpdy | Builtin::Fwidth, _) => false,
-        Expr::ExtractDyn(x, i) => match m.types.get(f.value_ty(*x)) {
-            TypeDef::Array(_, n) => in_range(i, *n),
-            TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => in_range(i, u32::from(*n)),
-            _ => false,
-        },
+        Expr::ExtractDyn(x, i) => in_range(i, f.value_ty(*x)),
         Expr::Load(p) if p.has_index() => {
             let Some((mut t, path)) = m.place_start(f, p) else { return false };
             for proj in path {
-                if let Proj::Index(i) = proj {
-                    let ok = match m.types.get(t) {
-                        TypeDef::Array(_, n) => in_range(i, *n),
-                        TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => in_range(i, u32::from(*n)),
-                        _ => false,
-                    };
-                    if !ok {
-                        return false;
-                    }
+                if let Proj::Index(i) = proj
+                    && !in_range(i, t)
+                {
+                    return false;
                 }
                 let Some(next) = m.proj_ty(t, proj) else { return false };
                 t = next;
@@ -565,11 +560,26 @@ fn cse_block(b: &mut Block, rename: &mut [Option<ValueId>], seen: &mut HashMap<C
 /// load reads go (`dce`). A branch or a loop that writes the local ends what's known of it. A
 /// local whose address is taken, or that's written in part, isn't read this way.
 fn forward_stores(m: &Module, f: &mut Function) {
+    let (_, excluded) = local_writes(f);
+    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
+    let mut body = std::mem::take(&mut f.body);
+    store_block(m, f, &mut body, &excluded, &mut HashMap::new(), &mut rename);
+    f.body = body;
+}
+
+/// By local: how many stores write it whole, and whether it's written in part or lent (its
+/// address or its run taken).
+fn local_writes(f: &Function) -> (Vec<u32>, Vec<bool>) {
+    let mut whole_stores = vec![0u32; f.locals.len()];
     let mut excluded = vec![false; f.locals.len()];
     visit::walk(&f.body, &mut |s| match s {
-        Stmt::Store(p, _) if !p.path.is_empty() => {
+        Stmt::Store(p, _) => {
             if let Some(l) = p.root_local() {
-                excluded[l.index()] = true;
+                if p.path.is_empty() {
+                    whole_stores[l.index()] += 1;
+                } else {
+                    excluded[l.index()] = true;
+                }
             }
         }
         Stmt::Let(_, Expr::Addr(p) | Expr::Run(p)) => {
@@ -579,10 +589,38 @@ fn forward_stores(m: &Module, f: &mut Function) {
         }
         _ => {}
     });
-    let mut rename: Vec<Option<ValueId>> = vec![None; f.values.len()];
-    let mut body = std::mem::take(&mut f.body);
-    store_block(m, f, &mut body, &excluded, &mut HashMap::new(), &mut rename);
-    f.body = body;
+    (whole_stores, excluded)
+}
+
+/// `x` as `rename` renames it (once).
+fn renamed(rename: &[Option<ValueId>], x: ValueId) -> ValueId {
+    rename.get(x.index()).copied().flatten().unwrap_or(x)
+}
+
+/// A load of `p`, a path of fields and components into a local that holds `at`, as an extract
+/// of `at` for each projection, appended to `b`: the last defines `v`, and `made` is given each
+/// value defined.
+fn extract_path(
+    m: &Module,
+    f: &mut Function,
+    b: &mut Block,
+    mut at: ValueId,
+    p: &Place,
+    v: ValueId,
+    made: &mut impl FnMut(ValueId),
+) {
+    for (k, proj) in p.path.iter().enumerate() {
+        let i = match proj {
+            Proj::Field(i) => *i,
+            Proj::Comp(c) => u32::from(*c),
+            Proj::Index(_) => unreachable!("a path without an index"),
+        };
+        let t = m.proj_ty(f.value_ty(at), proj).unwrap_or(f.value_ty(v));
+        let w = if k + 1 == p.path.len() { v } else { f.new_value(t) };
+        b.push(Stmt::Let(w, Expr::Extract(at, i)));
+        made(w);
+        at = w;
+    }
 }
 
 /// The locals a block writes whole, anywhere in it.
@@ -606,9 +644,6 @@ fn store_block(
     known: &mut HashMap<LocalId, ValueId>,
     rename: &mut Vec<Option<ValueId>>,
 ) {
-    let renamed = |rename: &[Option<ValueId>], x: ValueId| {
-        rename.get(x.index()).copied().flatten().unwrap_or(x)
-    };
     let old = std::mem::take(b);
     for mut s in old {
         s.for_each_value_mut(&mut |x| *x = renamed(rename, *x));
@@ -626,8 +661,7 @@ fn store_block(
             Stmt::Let(v, Expr::Load(ref p))
                 if !p.has_index() && p.root_local().is_some_and(|l| known.contains_key(&l)) =>
             {
-                let l = p.root_local().expect("a local");
-                let mut at = known[&l];
+                let at = known[&p.root_local().expect("a local")];
                 if p.path.is_empty() {
                     if rename.len() < f.values.len() {
                         rename.resize(f.values.len(), None);
@@ -635,17 +669,7 @@ fn store_block(
                     rename[v.index()] = Some(at);
                     continue;
                 }
-                for (k, proj) in p.path.iter().enumerate() {
-                    let i = match proj {
-                        Proj::Field(i) => *i,
-                        Proj::Comp(c) => u32::from(*c),
-                        Proj::Index(_) => unreachable!("checked above"),
-                    };
-                    let t = m.proj_ty(f.value_ty(at), proj).unwrap_or(f.value_ty(v));
-                    let w = if k + 1 == p.path.len() { v } else { f.new_value(t) };
-                    b.push(Stmt::Let(w, Expr::Extract(at, i)));
-                    at = w;
-                }
+                extract_path(m, f, b, at, p, v, &mut |_| {});
                 if rename.len() < f.values.len() {
                     rename.resize(f.values.len(), None);
                 }
@@ -723,9 +747,6 @@ fn promote_block(
     let old = std::mem::take(b);
     // A value passed down through inlined calls is a local read from a local read from a
     // local: a value stored is read as it's renamed, so one pass follows the whole chain.
-    let renamed = |rename: &[Option<ValueId>], x: ValueId| {
-        rename.get(x.index()).copied().flatten().unwrap_or(x)
-    };
     for mut s in old {
         s.for_each_value_mut(&mut |x| *x = renamed(rename, *x));
         match s {
@@ -735,26 +756,15 @@ fn promote_block(
                     .is_some_and(|&x| visible.contains(&renamed(rename, x)))
                     && !p.has_index() =>
             {
-                let l = p.root_local().expect("a local");
-                let mut at = renamed(rename, stored[&l]);
+                let at = renamed(rename, stored[&p.root_local().expect("a local")]);
                 if p.path.is_empty() {
                     rename[v.index()] = Some(at);
                     continue;
                 }
-                // Each projection of the path an extract of the value.
-                for (k, proj) in p.path.iter().enumerate() {
-                    let i = match proj {
-                        Proj::Field(i) => *i,
-                        Proj::Comp(c) => u32::from(*c),
-                        Proj::Index(_) => unreachable!("checked above"),
-                    };
-                    let t = m.proj_ty(f.value_ty(at), proj).unwrap_or(f.value_ty(v));
-                    let w = if k + 1 == p.path.len() { v } else { f.new_value(t) };
-                    b.push(Stmt::Let(w, Expr::Extract(at, i)));
+                extract_path(m, f, b, at, p, v, &mut |w| {
                     visible.insert(w);
                     added.push(w);
-                    at = w;
-                }
+                });
                 if rename.len() < f.values.len() {
                     rename.resize(f.values.len(), None);
                 }
@@ -2342,25 +2352,7 @@ fn forwardable_locals(f: &Function) -> HashSet<LocalId> {
     let n = f.locals.len();
     // Whole stores, and writes or pointers that rule a local out. (No calls are left to write
     // one through a by-reference argument.)
-    let mut whole_stores = vec![0u32; n];
-    let mut excluded = vec![false; n];
-    visit::walk(&f.body, &mut |s| match s {
-        Stmt::Store(p, _) => {
-            if let Some(l) = p.root_local() {
-                if p.path.is_empty() {
-                    whole_stores[l.index()] += 1;
-                } else {
-                    excluded[l.index()] = true;
-                }
-            }
-        }
-        Stmt::Let(_, Expr::Addr(p) | Expr::Run(p)) => {
-            if let Some(l) = p.root_local() {
-                excluded[l.index()] = true;
-            }
-        }
-        _ => {}
-    });
+    let (whole_stores, excluded) = local_writes(f);
     // Every mention of each local, the stores included.
     let mut mentions = vec![0u32; n];
     visit::count_local_mentions(&f.body, &mut mentions);
@@ -2646,7 +2638,7 @@ mod tests {
     fn a_dead_chain_through_locals_goes_at_once() {
         let mut m = Module::default();
         let f32t = m.types.f32();
-        let x_param = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let x_param = Param::value("x", f32t);
         let mut f = Function::new("f", vec![x_param], Some(f32t));
         let x = f.new_value(f32t);
         let mut body = vec![Stmt::Let(x, Expr::Param(0))];
@@ -2742,7 +2734,7 @@ mod tests {
     fn a_continue_keeps_a_local_unknown_in_the_continuing_block() {
         let mut m = Module::default();
         let boolt = m.types.bool();
-        let param = Param { name: "c".into(), ty: boolt, by_ref: false, mutable: false };
+        let param = Param::value("c", boolt);
         let mut f = Function::new("f", vec![param], None);
         let (flag, fixed) = (f.new_local("flag", boolt), f.new_local("fixed", boolt));
         let [c, yes, no, late, same] = [(); 5].map(|_| f.new_value(boolt));
@@ -2778,8 +2770,7 @@ mod tests {
         const STEPS: usize = 20;
         let mut m = Module::default();
         let (f32t, boolt) = (m.types.f32(), m.types.bool());
-        let param =
-            |name: &str| Param { name: name.into(), ty: f32t, by_ref: false, mutable: false };
+        let param = |name: &str| Param::value(name, f32t);
         let mut f = Function::new("f", vec![param("x"), param("y")], Some(f32t));
         let (x, y, c) = (f.new_value(f32t), f.new_value(f32t), f.new_value(boolt));
         let (v, w) = (f.new_local("v", f32t), f.new_local("w", f32t));
@@ -2861,7 +2852,7 @@ mod tests {
             let mut m = Module::default();
             let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
             let table = m.types.intern(TypeDef::Array(f32t, 4));
-            let param = Param { name: "i".into(), ty: u32t, by_ref: false, mutable: false };
+            let param = Param::value("i", u32t);
             let mut f = Function::new("f", vec![param], Some(f32t));
             let (a, v) = (f.new_local("a", table), f.new_local("v", f32t));
             let [i, zero, one, prev] = [(); 4].map(|_| f.new_value(u32t));
@@ -2918,10 +2909,7 @@ mod tests {
         let scale = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(1));
         // fn pick(t: [f32; 64], x: f32) -> f32 { x }, and fn twice(s: f32, x: f32) -> f32 { x }
         let callee = |m: &mut Module, name: &str, first: TypeId| {
-            let ps = vec![
-                Param { name: "t".into(), ty: first, by_ref: false, mutable: false },
-                Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false },
-            ];
+            let ps = vec![Param::value("t", first), Param::value("x", f32t)];
             let mut f = Function::new(name, ps, Some(f32t));
             let (t, x) = (f.new_value(first), f.new_value(f32t));
             f.body = vec![
@@ -2934,7 +2922,7 @@ mod tests {
         let pick = callee(&mut m, "pick", table);
         let twice = callee(&mut m, "twice", f32t);
         // fn main(x: f32) -> f32 { pick(u.table, pick(u.table, twice(u.scale, twice(u.scale, x)))) }
-        let ps = vec![Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false }];
+        let ps = vec![Param::value("x", f32t)];
         let mut main = Function::new("main", ps, Some(f32t));
         let x = main.new_value(f32t);
         let mut body = vec![Stmt::Let(x, Expr::Param(0))];
@@ -2994,7 +2982,7 @@ mod tests {
         });
         let whole = Place::root(PlaceRoot::Resource(u)).with(Proj::Field(0));
         // fn pick(t: [f32; 64]) -> f32 { 1.0 }
-        let ps = vec![Param { name: "t".into(), ty: table, by_ref: false, mutable: false }];
+        let ps = vec![Param::value("t", table)];
         let mut pick = Function::new("pick", ps, Some(f32t));
         let (t, one) = (pick.new_value(table), pick.new_value(f32t));
         pick.body = vec![
@@ -3004,7 +2992,7 @@ mod tests {
         ];
         let pick = m.add_function(pick);
         // fn main(c: bool) -> f32 { var l; if c { l = u.table; pick(l) } ; pick(l) }
-        let ps = vec![Param { name: "c".into(), ty: boolt, by_ref: false, mutable: false }];
+        let ps = vec![Param::value("c", boolt)];
         let mut main = Function::new("main", ps, Some(f32t));
         let l = main.new_local("l", table);
         let c = main.new_value(boolt);
@@ -3301,10 +3289,7 @@ mod tests {
         let mut m = Module::default();
         let (f32t, u32t, boolt) = (m.types.f32(), m.types.u32(), m.types.bool());
         let array = m.types.intern(TypeDef::Array(f32t, 4));
-        let params = vec![
-            Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false },
-            Param { name: "i".into(), ty: u32t, by_ref: false, mutable: false },
-        ];
+        let params = vec![Param::value("x", f32t), Param::value("i", u32t)];
         let mut f = Function::new("f", params, Some(f32t));
         let (x, i, cond, checked, indexed) = (
             f.new_value(f32t),
@@ -3361,7 +3346,7 @@ mod tests {
     fn a_call_in_a_loop_inlines_a_larger_body() {
         let mut m = Module::default();
         let f32t = m.types.f32();
-        let x_param = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let x_param = Param::value("x", f32t);
         // fn g(x) -> f32: a chain of 300 additions.
         let mut g = Function::new("g", vec![x_param], Some(f32t));
         let x = g.new_value(f32t);
@@ -3417,7 +3402,7 @@ mod tests {
     fn calls_kept(len: usize, outside: usize) -> (usize, bool) {
         let mut m = Module::default();
         let f32t = m.types.f32();
-        let p = Param { name: "x".into(), ty: f32t, by_ref: false, mutable: false };
+        let p = Param::value("x", f32t);
         let mut g = Function::new("g", vec![p], Some(f32t));
         let x = g.new_value(f32t);
         let mut body = vec![Stmt::Let(x, Expr::Param(0))];

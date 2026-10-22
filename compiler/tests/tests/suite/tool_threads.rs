@@ -13,7 +13,7 @@ use crate::tool::{printer, run, tool_build};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use wrela_host::tool::End;
+use wrela_host::tool::{End, Ended, Options, ToolBuild};
 
 /// A CPU-heavy job: each of 40,000 numbers stepped 20,000 times, folded with a `reduce` that
 /// depends on the order it folds in, and summed as floats.
@@ -156,6 +156,32 @@ pub fn tool() -> u32 {
 }
 "#;
 
+/// Runs `build` with `options`, stopped after 300 ms by its timeout, or by an interrupt if
+/// `interrupted` (`run` checks no worker or helper is left): how it ended, how long it took, and
+/// the grace it had.
+fn stopped(
+    build: &ToolBuild,
+    mut options: Options,
+    interrupted: bool,
+) -> (Ended, Duration, Duration) {
+    let flag = Arc::new(AtomicBool::new(false));
+    if interrupted {
+        options.interrupt = Some(flag.clone());
+    } else {
+        options.timeout = Some(Duration::from_millis(300));
+    }
+    let grace = options.testing.grace;
+    let set = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        flag.store(true, Ordering::Release);
+    });
+    let started = Instant::now();
+    let ended = run(build, options);
+    let took = started.elapsed();
+    set.join().expect("the interrupting thread");
+    (ended, took, grace)
+}
+
 #[test]
 fn the_timeout_and_an_interrupt_stop_a_parallel_job_within_the_grace() {
     let build = tool_build("threads-spin", SPINS);
@@ -163,21 +189,7 @@ fn the_timeout_and_an_interrupt_stop_a_parallel_job_within_the_grace() {
         for interrupted in [false, true] {
             let (_, mut options) = printer(|_| {});
             options.workers = workers;
-            let flag = Arc::new(AtomicBool::new(false));
-            if interrupted {
-                options.interrupt = Some(flag.clone());
-            } else {
-                options.timeout = Some(Duration::from_millis(300));
-            }
-            let grace = options.testing.grace;
-            let set = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(300));
-                flag.store(true, Ordering::Release);
-            });
-            let started = Instant::now();
-            let ended = run(&build, options);
-            let took = started.elapsed();
-            set.join().expect("the interrupting thread");
+            let (ended, took, grace) = stopped(&build, options, interrupted);
             let want = if interrupted { End::Interrupted } else { End::Timeout };
             assert_eq!(ended.end, want, "{workers} helpers");
             assert!(took < Duration::from_millis(300) + grace, "{workers} helpers: {took:?}");
@@ -291,22 +303,7 @@ fn the_timeout_and_an_interrupt_stop_a_thread_blocked_anywhere() {
                 let (_, mut options) = printer(|_| {});
                 options.workers = workers;
                 options.args = vec![how.into()];
-                let flag = Arc::new(AtomicBool::new(false));
-                if interrupted {
-                    options.interrupt = Some(flag.clone());
-                } else {
-                    options.timeout = Some(Duration::from_millis(300));
-                }
-                let grace = options.testing.grace;
-                let set = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(300));
-                    flag.store(true, Ordering::Release);
-                });
-                let started = Instant::now();
-                // `run` checks no worker or helper is left.
-                let ended = run(&build, options);
-                let took = started.elapsed();
-                set.join().expect("the interrupting thread");
+                let (ended, took, grace) = stopped(&build, options, interrupted);
                 let case = format!("{how}, {workers} helpers, interrupted: {interrupted}");
                 let (want, status) =
                     if interrupted { (End::Interrupted, 130) } else { (End::Timeout, 124) };

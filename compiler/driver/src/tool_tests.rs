@@ -93,29 +93,6 @@ pub struct Ended {
     pub end: String,
 }
 
-/// A directory of the test run's own, removed when it's dropped.
-struct Dir(PathBuf);
-
-impl Dir {
-    fn new() -> std::io::Result<Dir> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.subsec_nanos());
-        let dir = std::env::temp_dir()
-            .join(format!("wrela-tool-tests-{}-{n}-{nanos}", std::process::id()));
-        std::fs::create_dir_all(&dir)?;
-        Ok(Dir(dir))
-    }
-}
-
-impl Drop for Dir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 /// Runs tool tests `tests` (§13.2) of the package at `root`, its constants computed into
 /// `data`: each test's failure, if it failed, and what it printed, with the errors building
 /// them found.
@@ -139,7 +116,7 @@ pub(crate) fn run(
     let Some((_, wasm)) = out.files.into_iter().find(|(p, _)| p == crate::build::TOOL_WASM) else {
         return (Vec::new(), diags);
     };
-    let dir = match Dir::new() {
+    let dir = match crate::Scratch::new("wrela-tool-tests") {
         Ok(d) => d,
         Err(e) => {
             diags.push(Diagnostic::internal(format!("a tool test's directory: {e}")));
@@ -187,8 +164,6 @@ pub(crate) fn run(
     (results, diags)
 }
 
-/// Runs tool test `i`, `test`, of the package at `root` in a process of its own, with what its
-/// attribute grants, in a directory of its own under `dir`: how it ended, and what it printed.
 /// How many of a package's tool tests run at once: half the cores, at least 2. Each is a
 /// process that uses many cores itself (its builds' constants, its driven builds, its helpers),
 /// so a test per core loaded a machine of 10 cores to 38 runnable threads, and a test's budget,
@@ -198,6 +173,8 @@ fn at_once() -> usize {
     (cores / 2).max(2)
 }
 
+/// Runs tool test `i`, `test`, of the package at `root` in a process of its own, with what its
+/// attribute grants, in a directory of its own under `dir`: how it ended, and what it printed.
 fn one(
     runner: &Path,
     dir: &Path,
@@ -298,7 +275,7 @@ fn one(
     }
     let ended = std::fs::read(&spec.ended).ok().and_then(|b| serde_json::from_slice(&b).ok());
     // A host that ended without saying how didn't end its programs either.
-    if killed || ended.is_none() {
+    if ended.is_none() {
         kill_tree(group, &spec.groups);
     }
     forget(group);

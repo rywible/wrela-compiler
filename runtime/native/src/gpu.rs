@@ -74,21 +74,9 @@ pub struct GpuTiming {
 /// Each frame's span in `timings` (ms): from its first timed piece's start to its last's end,
 /// by frame, for the frames that have any.
 pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
-    spans_by(timings, |t| t.frame)
-}
-
-/// Each submission's span in `timings` (ms), by submission: what the GPU safety rule bounds (no
-/// submission over 100 ms). A frame can be several submissions with time between them: in the
-/// browser host, a frame whose commands wait for a pipeline being built.
-pub fn submission_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
-    spans_by(timings, |t| t.submission)
-}
-
-/// The span of each group of `timings` with the same `key` (ms), by key.
-fn spans_by(timings: &[GpuTiming], key: impl Fn(&GpuTiming) -> usize) -> Vec<(usize, f64)> {
     let mut spans: std::collections::BTreeMap<usize, (f64, f64)> = Default::default();
     for t in timings {
-        let e = spans.entry(key(t)).or_insert((t.start, t.end));
+        let e = spans.entry(t.frame).or_insert((t.start, t.end));
         e.0 = e.0.min(t.start);
         e.1 = e.1.max(t.end);
     }
@@ -431,13 +419,11 @@ impl Gpu {
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
         device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| {
-            sink.lock().unwrap_or_else(|p| p.into_inner()).push(e.to_string());
+            crate::locked(&sink).push(e.to_string());
         }));
         let sink = errors.clone();
         device.set_device_lost_callback(move |reason, message| {
-            sink.lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(format!("device lost ({reason:?}): {message}"));
+            crate::locked(&sink).push(format!("device lost ({reason:?}): {message}"));
         });
 
         let limits = device.limits();
@@ -522,13 +508,6 @@ impl Gpu {
         }
         self.bind_groups = vec![HashMap::new(); manifest.pipelines.len()];
         self.check_errors()
-    }
-
-    /// Hot reload: finishes the old build's work, forgets its resources, and takes the new
-    /// build's pipelines. The device, the screen and the rings stay.
-    fn reload_build(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
-        self.finish_build()?;
-        self.take_pipelines(manifest, shaders)
     }
 
     /// A fresh program on the same device: only immutable pipelines and upload allocations
@@ -651,7 +630,7 @@ impl Builder {
                         let i = next.fetch_add(1, Ordering::Relaxed);
                         let Some((p, source)) = jobs.get(i) else { break };
                         let r = self.build(p, source);
-                        done.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+                        crate::locked(&done)[i] = Some(r);
                     }
                 });
             }
@@ -901,7 +880,7 @@ impl Gpu {
 
     /// Reports (and clears) errors the device raised outside an error scope.
     fn check_errors(&self) -> Result<()> {
-        let mut errors = self.errors.lock().unwrap_or_else(|p| p.into_inner());
+        let mut errors = crate::locked(&self.errors);
         if errors.is_empty() {
             return Ok(());
         }
@@ -914,6 +893,14 @@ impl Gpu {
         match &self.resources[&handle] {
             Resource::Buffer(b) => b,
             _ => unreachable!("the checker checked {handle} is a buffer"),
+        }
+    }
+
+    /// The texture `handle`, its view and its format.
+    fn texture(&self, handle: u32) -> (&wgpu::Texture, &wgpu::TextureView, TextureFormat) {
+        match &self.resources[&handle] {
+            Resource::Texture { texture, view, format } => (texture, view, *format),
+            _ => unreachable!("the checker checked {handle} is a texture"),
         }
     }
 
@@ -1197,21 +1184,15 @@ impl Gpu {
         if data.is_empty() {
             return Ok(());
         }
-        let Resource::Texture { format, .. } = &self.resources[&handle] else {
-            unreachable!("the checker checked {handle} is a texture");
-        };
-        let row = u64::from(size[0]) * u64::from(format.bytes_per_texel());
+        let row = u64::from(size[0]) * u64::from(self.texture(handle).2.bytes_per_texel());
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let bytes = padded * u64::from(size[1]);
         let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
         let origin = wgpu::Origin3d { x: origin[0], y: origin[1], z: 0 };
         if bytes > u64::from(stream::UPLOAD_MAX) {
             self.flush()?;
-            let Resource::Texture { texture, .. } = &self.resources[&handle] else {
-                unreachable!("the checker checked {handle} is a texture");
-            };
             self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { origin, ..texture.as_image_copy() },
+                wgpu::TexelCopyTextureInfo { origin, ..self.texture(handle).0.as_image_copy() },
                 data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
@@ -1236,9 +1217,7 @@ impl Gpu {
             }
         }
         let mut encoder = self.take_encoder();
-        let Resource::Texture { texture, .. } = &self.resources[&handle] else {
-            unreachable!("the checker checked {handle} is a texture");
-        };
+        let texture = self.texture(handle).0;
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.upload.buffer,
@@ -1319,6 +1298,12 @@ impl Gpu {
             self.device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
         }
         Ok(())
+    }
+
+    /// Opens `pass`, named by the label in force.
+    fn begin_pass(&mut self, pass: Pass) {
+        let label = self.label.clone();
+        self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None });
     }
 
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
@@ -1420,16 +1405,13 @@ impl Gpu {
                 "there's no screen: the host draws only while running frames",
             ));
         }
-        let format_of = |gpu: &Gpu, h: u32| match &gpu.resources[&h] {
-            Resource::Texture { format, .. } => wgpu_format(*format),
-            _ => unreachable!("the checker checked {h} is a texture"),
-        };
+        let format_of = |h: u32| wgpu_format(self.texture(h).2);
         let color_format = match pass.color {
             stream::SCREEN => Some(SCREEN_FORMAT),
             stream::NONE => None,
-            h => Some(format_of(self, h)),
+            h => Some(format_of(h)),
         };
-        let depth_format = (pass.depth != stream::NONE).then(|| format_of(self, pass.depth));
+        let depth_format = (pass.depth != stream::NONE).then(|| format_of(pass.depth));
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
         let formats = (color_format, depth_format);
@@ -1447,18 +1429,13 @@ impl Gpu {
             prepared.push((bind_group, offset));
         }
         let mut encoder = self.take_encoder();
-        let view_of = |gpu: &'_ Gpu, h: u32| -> wgpu::TextureView {
-            match &gpu.resources[&h] {
-                Resource::Texture { view, .. } => view.clone(),
-                _ => unreachable!("the checker checked {h} is a texture"),
-            }
-        };
+        let view_of = |h: u32| self.texture(h).1.clone();
         let color_view = match pass.color {
             stream::SCREEN => Some(self.screen.as_ref().expect("checked above").view.clone()),
             stream::NONE => None,
-            h => Some(view_of(self, h)),
+            h => Some(view_of(h)),
         };
-        let depth_view = (pass.depth != stream::NONE).then(|| view_of(self, pass.depth));
+        let depth_view = (pass.depth != stream::NONE).then(|| view_of(pass.depth));
         let color_attachment = color_view.as_ref().map(|view| wgpu::RenderPassColorAttachment {
             view,
             depth_slice: None,
@@ -1550,9 +1527,7 @@ impl Gpu {
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_buffer_to_buffer(source, offset, staging, 0, size);
         self.queue.submit([encoder.finish()]);
-        let mut bytes = map_read(&self.device, staging)?;
-        bytes.truncate(size as usize);
-        Ok(bytes)
+        map_read_with(&self.device, staging, |bytes| bytes[..size as usize].to_vec())
     }
 
     /// The handles of the buffers that exist, oldest first: for tests.
@@ -1584,7 +1559,6 @@ impl Gpu {
 
     /// Copies the screen back: RGBA8, rows top to bottom, no padding (waits for the GPU).
     pub(crate) fn read_screen(&mut self) -> Result<Vec<u8>> {
-        self.flush()?;
         let screen =
             self.screen.as_ref().ok_or_else(|| Error::Gpu("there's no screen yet".into()))?;
         let (width, height) = (screen.width, screen.height);
@@ -1732,23 +1706,16 @@ impl Executor for Gpu {
             Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
                 return self.dispatch(*pipeline, Err((*arguments, *offset)), bindings, uniforms);
             }
-            Command::BeginScreenPass { clear } => {
-                let pass = Pass {
-                    color: stream::SCREEN,
-                    keep_color: false,
-                    join: false,
-                    clear: *clear,
-                    depth: stream::NONE,
-                    keep_depth: false,
-                    clear_depth: 1.0,
-                };
-                let label = self.label.clone();
-                self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None });
-            }
-            Command::BeginPass(pass) => {
-                let label = self.label.clone();
-                self.pass = Some(OpenPass { pass: *pass, draws: Vec::new(), label, uses: None })
-            }
+            Command::BeginScreenPass { clear } => self.begin_pass(Pass {
+                color: stream::SCREEN,
+                keep_color: false,
+                join: false,
+                clear: *clear,
+                depth: stream::NONE,
+                keep_depth: false,
+                clear_depth: 1.0,
+            }),
+            Command::BeginPass(pass) => self.begin_pass(*pass),
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
                 self.draw(*pipeline, how, bindings, uniforms);
@@ -1816,8 +1783,11 @@ impl Executor for Gpu {
         limits_of(&self.limits)
     }
 
+    /// Finishes the old build's work, forgets its resources, and takes the new build's
+    /// pipelines. The device, the screen and the rings stay.
     fn reload(&mut self, manifest: &Manifest, shaders: &[String]) -> Result<()> {
-        self.reload_build(manifest, shaders)
+        self.finish_build()?;
+        self.take_pipelines(manifest, shaders)
     }
 }
 
@@ -2081,9 +2051,8 @@ mod tests {
         let row = align_to(width * format.bytes_per_texel(), wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
         let buffer = gpu.readback_buffer(u64::from(row) * u64::from(height));
         let mut encoder = gpu.take_encoder();
-        let Resource::Texture { texture, .. } = &gpu.resources[&handle] else { unreachable!() };
         encoder.copy_texture_to_buffer(
-            texture.as_image_copy(),
+            gpu.texture(handle).0.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {

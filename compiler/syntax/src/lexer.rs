@@ -21,6 +21,14 @@ const TYPE_SUFFIXES: &[&str] =
     &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "f32", "f64"];
 
 pub fn lex(file: FileId, text: &str) -> Lexed {
+    let mut lexed = lex_raw(file, text);
+    lexed.tokens = insert_newlines(lexed.tokens);
+    lexed
+}
+
+/// [`lex`] without NEWLINEs: the parser decides them as it reads (it can change what's open),
+/// and the formatter's code tokens leave them out.
+pub(crate) fn lex_raw(file: FileId, text: &str) -> Lexed {
     let mut lx = Lexer {
         file,
         src: text.as_bytes(),
@@ -30,9 +38,7 @@ pub fn lex(file: FileId, text: &str) -> Lexed {
         holes: Vec::new(),
     };
     lx.run();
-    let mut lexed = lx.out;
-    lexed.tokens = insert_newlines(lexed.tokens, file);
-    lexed
+    lx.out
 }
 
 struct Lexer<'a> {
@@ -74,6 +80,11 @@ impl<'a> Lexer<'a> {
 
     fn char_at(&self, pos: usize) -> Option<char> {
         self.text.get(pos..).and_then(|s| s.chars().next())
+    }
+
+    /// Steps over the character at the current position.
+    fn bump_char(&mut self) {
+        self.pos += self.char_at(self.pos).map_or(1, char::len_utf8);
     }
 
     /// Identifier continuation for L3's recovery too: a non-ASCII name stays one token.
@@ -466,7 +477,7 @@ impl<'a> Lexer<'a> {
                         self.push(TokenKind::FStringTail, start, line_break_before);
                         return;
                     }
-                    Some(_) => self.pos += self.char_at(self.pos).map_or(1, char::len_utf8),
+                    Some(_) => self.bump_char(),
                 }
             }
         }
@@ -519,7 +530,7 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 Some(b'\\') => self.escape(),
-                Some(_) => self.pos += self.char_at(self.pos).map_or(1, char::len_utf8),
+                Some(_) => self.bump_char(),
             }
         }
     }
@@ -575,10 +586,7 @@ impl<'a> Lexer<'a> {
                     break;
                 }
                 Some(b'\\') => self.escape(),
-                Some(_) => {
-                    let c = self.char_at(self.pos).map_or(1, char::len_utf8);
-                    self.pos += c;
-                }
+                Some(_) => self.bump_char(),
             }
         }
         self.push(TokenKind::Str, start, line_break_before);
@@ -807,38 +815,30 @@ impl Brackets {
     }
 }
 
-/// L17–L19: inserts NEWLINE tokens into the raw token stream.
-fn insert_newlines(raw: Vec<Token>, file: FileId) -> Vec<Token> {
-    let mut out = Vec::with_capacity(raw.len() + raw.len() / 4);
-    newlines_after(None, Brackets::default(), raw, file, &mut out);
-    out
+/// The NEWLINE that a line break between `prev` and `next` makes (L17), at `prev`'s end, if it
+/// makes one. `in_brace` is as for [`line_break_is_newline`].
+pub(crate) fn newline_between(in_brace: bool, prev: &Token, next: &Token) -> Option<Token> {
+    (next.line_break_before && line_break_is_newline(in_brace, prev.kind, next.kind)).then(|| {
+        Token {
+            kind: TokenKind::Newline,
+            span: prev.span.shrink_to_end(),
+            line_break_before: false,
+        }
+    })
 }
 
-/// [`insert_newlines`] for the raw tokens that follow `prev`, with `brackets` open before them:
-/// appends them to `out`, NEWLINEs inserted.
-pub(crate) fn newlines_after(
-    mut prev: Option<Token>,
-    mut brackets: Brackets,
-    raw: Vec<Token>,
-    file: FileId,
-    out: &mut Vec<Token>,
-) {
+/// L17–L19: inserts NEWLINE tokens into the raw token stream.
+fn insert_newlines(raw: Vec<Token>) -> Vec<Token> {
+    let mut out = Vec::with_capacity(raw.len() + raw.len() / 4);
+    let mut brackets = Brackets::default();
     for tok in raw {
-        if tok.line_break_before
-            && let Some(p) = prev
-            && line_break_is_newline(brackets.in_brace(), p.kind, tok.kind)
-        {
-            let at = p.span.end;
-            out.push(Token {
-                kind: TokenKind::Newline,
-                span: Span::new(file, at, at),
-                line_break_before: false,
-            });
+        if let Some(n) = out.last().and_then(|p| newline_between(brackets.in_brace(), p, &tok)) {
+            out.push(n);
         }
         brackets.track(tok.kind);
         out.push(tok);
-        prev = Some(tok);
     }
+    out
 }
 
 /// The text a STRING token's source spells: quotes removed, escapes decoded (L14).

@@ -101,12 +101,13 @@ impl Verifier<'_> {
         }
     }
 
-    /// The type of a place (whose values the caller has checked are visible).
-    /// Whether a place is in constant data: everything but the program's state.
+    /// Whether a place is in constant data: everything but the program's state and its other
+    /// writable data.
     fn constant(&self, p: &Place) -> bool {
         matches!(p.root, PlaceRoot::Data(d) if self.m.state != Some(d) && !self.m.writable.contains(&d))
     }
 
+    /// The type of a place (whose values the caller has checked are visible).
     fn place(&self, p: &Place) -> Result<TypeId> {
         match &p.root {
             PlaceRoot::Local(l) if l.index() >= self.f.locals.len() => {
@@ -167,9 +168,9 @@ impl Verifier<'_> {
                     return Err(bug(format!("{op:?} with the wrong arguments")));
                 }
                 match op {
-                    // A struct of the old value and whether it stored.
-                    AtomicOp::CompareExchange => return Ok(None),
-                    AtomicOp::Store => return Ok(None),
+                    // A store makes nothing; a compare-exchange a struct of the old value and
+                    // whether it stored (checked by its `let`).
+                    AtomicOp::CompareExchange | AtomicOp::Store => return Ok(None),
                     _ => types.lookup(&TypeDef::Scalar(s)),
                 }
             }
@@ -437,7 +438,6 @@ impl Verifier<'_> {
         // first.
         // `M * v`: C components in, R out; `v * M`: R in, C out; `A * B`: A's columns are B's
         // rows, giving B's columns of A's rows.
-        let types = &self.m.types;
         let made = |t: Option<TypeId>| t.ok_or_else(|| bug("a matrix product's type isn't made"));
         match (self.def(ta), self.def(tb)) {
             (TypeDef::Matrix(..), TypeDef::Scalar(Scalar::F32)) => Ok(ta),

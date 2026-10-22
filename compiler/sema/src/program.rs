@@ -3,6 +3,7 @@
 
 use crate::defs::*;
 use crate::ty::*;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
@@ -45,29 +46,29 @@ pub struct Program {
     pub packed: HashMap<AdtId, Vec<PackedField>>,
     /// The constants code names, where the name resolves: a literal one is folded before the
     /// memory IR, which so doesn't show its uses (W0008).
-    pub(crate) used_consts: std::cell::RefCell<HashSet<ConstId>>,
+    pub(crate) used_consts: RefCell<HashSet<ConstId>>,
     /// Whether dropping a type may do something: worked out once per type.
-    pub(crate) drop_cache: std::cell::RefCell<HashMap<TyId, bool>>,
+    pub(crate) drop_cache: RefCell<HashMap<TyId, bool>>,
     /// Each closure's parameter and return types, in its owner's generic terms, for whether
     /// it fits a function-type bound (`impl<F: fn(vec3) -> f32> Tr for F`). Recorded when the
     /// closure is checked, and again when its body's types are final.
-    pub(crate) closure_sigs: std::cell::RefCell<HashMap<ClosureRef, ClosureSignature>>,
+    pub(crate) closure_sigs: RefCell<HashMap<ClosureRef, ClosureSignature>>,
     /// Whether a type implements a structural trait (`Copy`, `Clone`, `GpuData`): worked out
     /// once per type, since struct types share their fields' types.
-    pub(crate) builtin_impls: std::cell::RefCell<HashMap<(TyId, Lang), bool>>,
+    pub(crate) builtin_impls: RefCell<HashMap<(TyId, Lang), bool>>,
     /// Whether a type that declares a `@fieldwise` trait has it: its fields all do. Worked out
     /// once per type and trait.
-    pub(crate) fieldwise_impls: std::cell::RefCell<HashMap<(TyId, TraitRef), bool>>,
+    pub(crate) fieldwise_impls: RefCell<HashMap<(TyId, TraitRef), bool>>,
     /// The solver's goals in the order it took them up, and where each derivation of a
     /// `@fieldwise` trait in progress started in that order: a goal met again after one
     /// started is met (a type that holds itself through a `Box` has the trait if the rest of
     /// its fields do).
-    pub(crate) goal_order: std::cell::RefCell<GoalOrder>,
+    pub(crate) goal_order: RefCell<GoalOrder>,
     /// The goals the trait solver is working on: an impl's bounds can lead back to one of
     /// them. The first one's size, while there are any.
-    pub(crate) solving: std::cell::RefCell<(HashSet<(TyId, TraitRef)>, u32)>,
+    pub(crate) solving: RefCell<(HashSet<(TyId, TraitRef)>, u32)>,
     /// [`crate::traits::impl_args`]'s queries in progress, and its answers so far.
-    pub(crate) impl_queries: std::cell::RefCell<crate::traits::ImplQueries>,
+    pub(crate) impl_queries: RefCell<crate::traits::ImplQueries>,
     /// Where the source's syntax errors are.
     pub syntax_errors: Vec<wrela_diag::Span>,
     /// The unit suffixes: `std::units`' constants by name (§5).
@@ -99,7 +100,7 @@ impl Program {
     }
     /// What's written at `span`, if its file is known.
     pub fn text(&self, span: wrela_diag::Span) -> Option<&str> {
-        self.texts.get(&span.file)?.get(span.start as usize..span.end as usize)
+        self.texts.get(&span.file)?.get(span.range())
     }
 
     pub fn trait_(&self, t: TraitId) -> &TraitDef {
@@ -404,7 +405,6 @@ impl Program {
         s
     }
 
-    /// The declared fields of a struct (`variant` is `None`) or of one of an enum's variants.
     /// A job's value's parts, when `a` with `args` is a `Job<f>` (§16.3): where it stopped, a
     /// `u32` named `at` with a hash of the job's code (a save made by another build doesn't
     /// load), then each local it holds, by name, its type with the job's generics. To the traits
@@ -421,6 +421,7 @@ impl Program {
         Some(out)
     }
 
+    /// The declared fields of a struct (`variant` is `None`) or of one of an enum's variants.
     pub fn adt_fields(&self, a: AdtId, variant: Option<u32>) -> &[FieldDef] {
         let def = self.adt(a);
         match variant {
@@ -506,7 +507,6 @@ impl Program {
         })
     }
 
-    /// Whether a module is part of std.
     /// Whether module `m` is std's: std's privileges come from its package (language.md §3).
     pub fn is_std(&self, m: ModuleId) -> bool {
         self.package_of(m).kind == PackageKind::Std

@@ -69,7 +69,7 @@ mod warnings;
 mod workgroup;
 
 use std::path::{Path, PathBuf};
-use wrela_host::{CpuBuild, ReplayError, TickLog};
+use wrela_host::{CpuBuild, CpuHost, ReplayError, TickLog};
 
 /// An empty directory `name` (a relative path) for a test's files, under the binary's scratch
 /// directory.
@@ -83,6 +83,32 @@ fn scratch(name: &str) -> PathBuf {
 /// This process's test files, isolated by the gate or in Cargo's usual scratch directory.
 fn scratch_root() -> PathBuf {
     wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR"))
+}
+
+/// Writes a package into `dir` (made if it isn't there): a wrela.toml that names it `name`, and
+/// `main` as its `main.wrela`.
+fn write_package(dir: &Path, name: &str, main: &str) {
+    std::fs::create_dir_all(dir).expect("make the package's directory");
+    std::fs::write(dir.join("wrela.toml"), format!("[package]\nname = \"{name}\"\n"))
+        .expect("write wrela.toml");
+    std::fs::write(dir.join("main.wrela"), main).expect("write main.wrela");
+}
+
+/// What checking the package in `dir` finds: each diagnostic's code, and all of them rendered.
+fn checked(dir: &Path) -> (Vec<String>, String) {
+    let out = wrela_driver::check(dir);
+    let codes = out.diagnostics.iter().map(|d| d.code.as_str().to_string()).collect();
+    (codes, wrela_diag::render::render_all(&out.sources, &out.diagnostics))
+}
+
+/// The times of the first `n` frames at 60 fps, as the hosts give them.
+fn frame_times(n: u32) -> Vec<f32> {
+    (0..n).map(|i| wrela_host::frame_time(i, 60.0)).collect()
+}
+
+/// The build in `dir`, loaded on the CPU and started with one thread.
+fn cpu_host(dir: &Path) -> CpuHost {
+    CpuBuild::load(dir).expect("load").start_with(1).expect("start")
 }
 
 /// A one-file package: [`scratch`] directory `name` with `text` as its `main.wrela`, plus an

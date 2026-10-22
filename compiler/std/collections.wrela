@@ -37,27 +37,6 @@ pub struct Vec<T>: Clone {
     cap: u32,
 }
 
-impl<T: Plain> Vec<T> {
-    /// For std's requests: the `bytes` bytes of request `request`'s answer, as `T`s. Any bytes
-    /// are a `Plain` value; a partial last element is dropped.
-    pub(package) fn from_answer(request: u32, bytes: u32) -> Vec<T> {
-        let n = bytes / size_of::<T>()
-        var v: Vec<T> = Vec::with_capacity(max(n, 1))
-        unsafe {
-            if n * size_of::<T>() == bytes {
-                take_answer(request, v.data)
-            } else {
-                // Room for the whole answer, then only whole elements kept.
-                let raw: Vec<u8> = Vec::with_capacity(bytes)
-                take_answer(request, raw.data)
-                copy(v.data, raw.data, n * size_of::<T>())
-            }
-        }
-        v.len = n
-        v
-    }
-}
-
 impl Vec<u8> {
     /// For strings and serialized text: adds UTF-8 in one copy, after making room for it.
     pub(package) fn append_text(mut self, text: str) {
@@ -90,9 +69,39 @@ impl Vec<u8> {
             keep_bytes(bytes)
         }
     }
+
+    /// For `std::tool`: the `bytes` bytes of tool request `request`'s answer, which the host
+    /// then forgets.
+    pub(package) fn from_tool_answer(request: u32, bytes: u32) -> Vec<u8> {
+        var v: Vec<u8> = Vec::with_capacity(max(bytes, 1))
+        unsafe {
+            std::mem::tool_take(request, v.data)
+        }
+        v.len = bytes
+        v
+    }
 }
 
 impl<T: Plain> Vec<T> {
+    /// For std's requests: the `bytes` bytes of request `request`'s answer, as `T`s. Any bytes
+    /// are a `Plain` value; a partial last element is dropped.
+    pub(package) fn from_answer(request: u32, bytes: u32) -> Vec<T> {
+        let n = bytes / size_of::<T>()
+        var v: Vec<T> = Vec::with_capacity(max(n, 1))
+        unsafe {
+            if n * size_of::<T>() == bytes {
+                take_answer(request, v.data)
+            } else {
+                // Room for the whole answer, then only whole elements kept.
+                let raw: Vec<u8> = Vec::with_capacity(bytes)
+                take_answer(request, raw.data)
+                copy(v.data, raw.data, n * size_of::<T>())
+            }
+        }
+        v.len = n
+        v
+    }
+
     /// For `std::input`: every input event the host has queued, each a `T` of 24 bytes.
     pub(package) fn from_input() -> Vec<T> {
         var v: Vec<T> = Vec::new()
@@ -112,8 +121,7 @@ impl<T: Plain> Vec<T> {
     /// `serial_hi`, if the current call was given it. `T` is a byte.
     pub(package) fn from_payload(serial_lo: u32, serial_hi: u32, len: u32) -> Option<Vec<T>> {
         assert(size_of::<T>() == 1, "a payload is bytes")
-        var v: Vec<T> = Vec::new()
-        v.reserve(len)
+        var v: Vec<T> = Vec::with_capacity(len)
         let n = unsafe { take_payload(serial_lo, serial_hi, v.data, len) }
         if n < 0 || u32(n) != len {
             return None
@@ -1055,17 +1063,4 @@ fn a_run_says_whether_it_is_empty() {
 
 fn run_is_empty(xs: [u32]) -> bool {
     xs.is_empty()
-}
-
-impl Vec<u8> {
-    /// For `std::tool`: the `bytes` bytes of tool request `request`'s answer, which the host
-    /// then forgets.
-    pub(package) fn from_tool_answer(request: u32, bytes: u32) -> Vec<u8> {
-        var v: Vec<u8> = Vec::with_capacity(max(bytes, 1))
-        unsafe {
-            std::mem::tool_take(request, v.data)
-        }
-        v.len = bytes
-        v
-    }
 }

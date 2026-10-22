@@ -3,11 +3,11 @@
 //! CPU does.
 
 use crate::built;
-use wrela_host::{CpuBuild, CpuHost, Host, Value};
+use wrela_host::{CpuHost, Host, Value};
 use wrela_tests::{f32s, one_f32, one_u32};
 
 fn host() -> CpuHost {
-    CpuBuild::load(built("encodings")).expect("load").start_with(1).expect("start")
+    crate::cpu_host(&built("encodings"))
 }
 
 fn args(seed: i32, n: i32) -> [Value; 2] {

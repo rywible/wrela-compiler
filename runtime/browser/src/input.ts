@@ -4,6 +4,7 @@
 // frame: it doesn't wait behind other messages.
 
 import { ASSIST_ACTIONS, BUTTONS, COMPOSE_MAX, EVENT_SIZE, EventKind, KEYS, MODIFIER_ALT, MODIFIER_CONTROL, MODIFIER_META, MODIFIER_SHIFT, PAD_AXES, PAD_BUTTONS, PADS } from "./abi.gen.ts";
+import { errorMessage } from "./errors.ts";
 import { parseJson } from "./json.ts";
 
 /** One event's EVENT_SIZE bytes: its kind, its modifiers, then four words. */
@@ -121,7 +122,7 @@ export function parseScript(text: string): Scripted[] {
   try {
     value = parseJson(text);
   } catch (e) {
-    throw new Error(`the script isn't JSON: ${e instanceof Error ? e.message : String(e)}`);
+    throw new Error(`the script isn't JSON: ${errorMessage(e)}`);
   }
   if (!Array.isArray(value)) throw new Error("a script is a JSON array of events");
   const out: Scripted[] = [];

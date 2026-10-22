@@ -14,7 +14,7 @@
 
 use std::alloc::alloc
 use std::mem::{
-    at, atomic_load, compare_swap, copy, debug_build, load_u32, load_u8, size_of, store_u32, write,
+    at, atomic_load, copy, debug_build, exchange, load_u32, load_u8, size_of, store_u32, write,
 }
 
 /// The bit of the middle word that says the reader hasn't seen the middle slot's value.
@@ -117,18 +117,6 @@ fn slot_at<T>(block: u32, i: u32) -> u32 {
     block + SLOTS + i * slot_size::<T>()
 }
 
-/// Puts `new` in the middle word at `block`, atomically: the word that was there.
-fn exchange(block: u32, new: u32) -> u32 {
-    unsafe {
-        loop {
-            let old = atomic_load(block)
-            if compare_swap(block, old, new) == old {
-                return old
-            }
-        }
-    }
-}
-
 /// FNV-1a 32 of `n` bytes at `addr`.
 fn checksum(addr: u32, n: u32) -> u32 {
     var h: u32 = 2166136261
@@ -153,7 +141,7 @@ impl<T: Plain> Publisher<T> {
             }
         }
         // The back slot becomes the middle, new; the old middle becomes the back.
-        self.back = exchange(self.block, self.back | NEW) & 3
+        self.back = unsafe { exchange(self.block, self.back | NEW) } & 3
     }
 }
 

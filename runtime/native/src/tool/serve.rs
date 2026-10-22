@@ -19,8 +19,9 @@
 //! `next_post` that no post comes for fails at its own. Both are on the system's clock, also in
 //! a tool test.
 
-use super::services::{Answer, Body, Data, Services, Work};
+use super::services::{Body, Data, Resources, Services, Work, err, ok};
 use super::toolchain::Out;
+use crate::locked;
 use cap_std::fs::Dir;
 use std::collections::{HashMap, VecDeque};
 use std::io::BufReader;
@@ -48,41 +49,18 @@ const IDLE: Duration = Duration::from_secs(10);
 /// How often the server's thread looks for a connection, its end and its waiters' deadlines.
 const POLL: Duration = Duration::from_millis(10);
 
-/// The servers of one run: each by its handle, and each request's that the tool hasn't been
-/// told of.
-#[derive(Default)]
-pub(crate) struct Servers {
-    held: HashMap<u32, Arc<Server>>,
-    next: u32,
-    unpublished: HashMap<u32, Vec<u32>>,
-}
+/// The servers of one run ([`Resources`]).
+pub(crate) type Servers = Resources<Server>;
 
 impl Servers {
-    /// The tool has read request `request`'s answer: its server is the tool's now.
-    pub(crate) fn publish(&mut self, request: u32) {
-        self.unpublished.remove(&request);
-    }
-
-    /// Request `request` failed: the servers made for it, which no answer names, to close.
-    pub(crate) fn rollback(&mut self, request: u32) -> Vec<Arc<Server>> {
-        let ids = self.unpublished.remove(&request).unwrap_or_default();
-        ids.iter().filter_map(|id| self.held.remove(id)).collect()
-    }
-
     /// The ports of the servers running: what a browser of the tool's may reach.
     pub(crate) fn ports(&self) -> Vec<u16> {
-        self.held.values().map(|s| s.port).collect()
+        self.all().map(|s| s.port).collect()
     }
 
     /// The server on `port`, if one runs there.
     pub(crate) fn on_port(&self, port: u16) -> Option<Arc<Server>> {
-        self.held.values().find(|s| s.port == port).cloned()
-    }
-
-    /// Takes every server, to close: the tool has ended.
-    pub(crate) fn take_all(&mut self) -> Vec<Arc<Server>> {
-        self.unpublished.clear();
-        self.held.drain().map(|(_, s)| s).collect()
+        self.all().find(|s| s.port == port).cloned()
     }
 }
 
@@ -164,12 +142,12 @@ pub(crate) struct Server {
 
 impl Server {
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        locked(&self.state)
     }
 
     /// The `results/DONE` it has kept for browser session `session`, if it has.
     pub(crate) fn done(&self, session: &str) -> Option<Result<String, String>> {
-        self.done.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(session).cloned()
+        locked(&self.done).get(session).cloned()
     }
 
     /// Closes it: its waiters fail, its posts' bytes are given back, its listener and
@@ -180,31 +158,25 @@ impl Server {
             let mut st = self.state();
             st.closed = true;
             for (request, _, _) in st.waiting.drain(..) {
-                s.send(request, failure("the server closed"));
+                s.send(request, err("the server closed"));
             }
             let charged: u64 = st.queued.drain(..).map(|p| p.charged).sum();
             s.blobs().refund(charged);
             st.given.clear();
         }
-        for c in self.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
+        for c in locked(&self.conns).values() {
             let _ = c.shutdown(Shutdown::Both);
         }
         let until = Instant::now() + grace;
         loop {
-            let threads = std::mem::take(
-                &mut *self.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            let threads = std::mem::take(&mut *locked(&self.threads));
             if threads.is_empty() {
                 return true;
             }
             for t in threads {
-                while !t.is_finished() {
-                    if Instant::now() >= until {
-                        return false;
-                    }
-                    std::thread::sleep(POLL);
+                if !super::join_by(t, until, POLL) {
+                    return false;
                 }
-                let _ = t.join();
             }
         }
     }
@@ -230,13 +202,13 @@ impl Server {
                     Err((why, body)) => {
                         // The post stays first, its bytes still charged, for the next waiter.
                         st.queued.push_front(Post { body, ..post });
-                        s.send(request, failure(&format!("the post's body: {why}")));
+                        s.send(request, err(&format!("the post's body: {why}")));
                         continue;
                     }
                 }
             }
             st.given.insert(post.id, (post.reply, post.due));
-            s.send(request, super::services::answer(Ok(out.0)));
+            s.send(request, ok(&out.0));
         }
     }
 }
@@ -263,14 +235,6 @@ impl std::io::Read for Tee<'_> {
     }
 }
 
-fn failure(why: &str) -> Answer {
-    super::services::answer(Err(why.to_string()))
-}
-
-fn failed(why: String) -> Work {
-    Work::Now(failure(&why))
-}
-
 /// How request `name` of the serve service, with `b`, is carried out.
 pub(crate) fn route(name: &str, b: &mut Body) -> Work {
     let entered = Instant::now();
@@ -291,13 +255,13 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 let deadline = super::http::deadline(f64::from_bits(b.u64()?), NEXT_DEADLINE)?;
                 b.end()?;
                 Work::Later(Box::new(move |s, request| {
-                    let server = match find(s, handle) {
+                    let server = match s.servers().find(handle, "server") {
                         Ok(server) => server,
-                        Err(why) => return Some(failure(&why)),
+                        Err(why) => return Some(err(&why)),
                     };
                     let mut st = server.state();
                     if st.closed {
-                        return Some(failure("the server closed"));
+                        return Some(err("the server closed"));
                     }
                     st.waiting.push_back((request, entered + deadline, deadline));
                     server.deliver(s, &mut st);
@@ -317,39 +281,28 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
                 let handle = b.u32()?;
                 b.end()?;
                 Work::Long(Box::new(move |s, _| {
-                    let server = s.servers().held.remove(&handle);
-                    let Some(server) = server else {
-                        return failure(&format!("the tool holds no server {handle}"));
+                    let server = s.servers().take(handle, "server");
+                    let server = match server {
+                        Ok(server) => server,
+                        Err(why) => return err(&why),
                     };
                     if !server.close(s, s.grace) {
                         let _ = s.stuck.set(format!("the server {handle} didn't close"));
-                        return failure(&format!("the server {handle} didn't close"));
+                        return err(&format!("the server {handle} didn't close"));
                     }
-                    super::services::answer(Ok(Vec::new()))
+                    ok(&[])
                 }))
             }
             _ => return Err(format!("the serve service has no `{name}`")),
         })
     })();
-    parsed.unwrap_or_else(failed)
-}
-
-/// The handle `handle`'s server.
-fn find(s: &Services, handle: u32) -> Result<Arc<Server>, String> {
-    s.servers()
-        .held
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| format!("the tool holds no server {handle}"))
+    parsed.unwrap_or_else(|why| Work::Now(err(&why)))
 }
 
 /// Answers post `post` of `handle`'s server with `data`'s bytes.
 fn answer(s: &Services, handle: u32, post: u32, data: Data) -> Result<(), String> {
-    let server = find(s, handle)?;
-    let bytes = match data {
-        Data::Bytes(b) => Arc::new(b),
-        Data::Blob(id) => s.blobs().get(id)?,
-    };
+    let server = s.servers().find(handle, "server")?;
+    let bytes = s.data(data)?;
     let reply = server.state().claim(post, Instant::now())?;
     reply.send(bytes).map_err(|_| format!("post {post}'s connection closed before the answer"))
 }
@@ -381,10 +334,8 @@ fn start(
     // Registered under its request before anything runs, and before any answer names it.
     let handle = {
         let mut servers = s.servers();
-        servers.next += 1;
-        let handle = servers.next;
-        servers.held.insert(handle, server.clone());
-        servers.unpublished.entry(request).or_default().push(handle);
+        let handle = servers.reserve();
+        servers.hold(request, handle, server.clone());
         handle
     };
     let (services, accepting) = (s.clone(), server.clone());
@@ -393,7 +344,7 @@ fn start(
         .spawn(move || accept(&services, &accepting, listener));
     // A failed start's server is closed by the worker, which rolls the request back.
     let thread = spawned.map_err(|e| format!("can't start the server's thread: {e}"))?;
-    server.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
+    locked(&server.threads).push(thread);
     s.signal("listening");
     if s.fail_server_start {
         return Err("a test's failure, once the server listens".into());
@@ -413,8 +364,7 @@ fn accept(s: &Arc<Services>, server: &Arc<Server>, listener: TcpListener) {
             Ok((stream, _)) => {
                 // A post's deadline counts from here.
                 let taken = Instant::now();
-                let mut conns =
-                    server.conns.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut conns = locked(&server.conns);
                 // Under the lock `close` shuts the connections in: one taken after it is
                 // dropped.
                 if server.stopping.load(Ordering::SeqCst) || conns.len() >= MOST_CONNECTIONS {
@@ -429,23 +379,14 @@ fn accept(s: &Arc<Services>, server: &Arc<Server>, listener: TcpListener) {
                 let spawned =
                     std::thread::Builder::new().name("wrela-serve-conn".into()).spawn(move || {
                         let _ = connection(&services, &serving, stream, taken);
-                        serving
-                            .conns
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&id);
+                        locked(&serving.conns).remove(&id);
                     });
-                let mut threads =
-                    server.threads.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut threads = locked(&server.threads);
                 threads.retain(|t| !t.is_finished());
                 match spawned {
                     Ok(t) => threads.push(t),
                     Err(_) => {
-                        server
-                            .conns
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .remove(&id);
+                        locked(&server.conns).remove(&id);
                     }
                 }
             }
@@ -469,7 +410,7 @@ fn expire(s: &Services, server: &Server) {
     drop(st);
     for (request, _, deadline) in late {
         let why = format!("no post came within the deadline of {} s", deadline.as_secs_f64());
-        s.send(request, failure(&why));
+        s.send(request, err(&why));
     }
 }
 
@@ -535,11 +476,7 @@ fn connection(
                     } else {
                         Ok(String::from_utf8_lossy(&body.kept).trim().to_string())
                     };
-                    server
-                        .done
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(session.clone(), text);
+                    locked(&server.done).insert(session.clone(), text);
                 }
                 put.map(|_| ())
             }

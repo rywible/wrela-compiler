@@ -5,6 +5,7 @@
 
 import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
 import { type BindingKind, is3d, isStorage, type Manifest, type RenderTarget, targetName } from "./manifest.ts";
+import { buildPathProblem, pathProblem } from "./path.ts";
 import type { Binding, Command, OpcodeName, TextureFormat } from "./stream.ts";
 
 /** The limits a program sees, in `wrela.limit`'s order (runtime/abi `Limits`). */
@@ -40,28 +41,6 @@ export class CommandError extends Error {
     super(`${opcode} failed: ${why}`);
     this.name = "CommandError";
   }
-}
-
-/**
- * What's wrong with a storage path or a fetched URL, if anything: it's relative to the program's
- * storage (or its build), with `/` between its parts, and none of them empty, `.` or `..`.
- */
-export function pathProblem(path: string): string | undefined {
-  if (path === "") return "is empty";
-  if (path.startsWith("/") || /[\\:?#]/.test(path)) return "must be relative, with `/` between its parts";
-  if (path.split("/").some((p) => p === "" || p === "." || p === "..")) return "has an empty, `.` or `..` part";
-  return undefined;
-}
-
-/**
- * What's wrong with the path of a build to hand over to, if anything: as `pathProblem`'s, except
- * that it may start with one `..` part, so a build can name one beside it (runtime/abi's
- * `build_path_problem`).
- */
-export function buildPathProblem(path: string): string | undefined {
-  const rest = path.startsWith("../") ? path.slice(3) : path;
-  if (rest === ".." || rest.startsWith("../")) return "climbs more than one directory: a build names its own or one beside it";
-  return pathProblem(rest);
 }
 
 const formatOf = (f: TextureFormat) => TEXTURE_FORMATS.find((t) => t.name === f)!;
@@ -116,7 +95,7 @@ export class Checker {
   #attachments: number[] = [];
   /** The open pass's colour target's format (the screen's, a texture's, or none), and whether it
    * has a depth target: which pipelines its draws may draw with. */
-  #targets: { colour: TextureFormat | null; depth: boolean } = { colour: null, depth: false };
+  #targets: RenderTarget = { color: null, depth: false };
   /** The current frame's screen size, when a frame has begun. */
   #screenSize: [number, number] | undefined;
 
@@ -163,7 +142,7 @@ export class Checker {
     this.#scope.clear();
     this.#spareScope.clear();
     this.#attachments = [];
-    this.#targets = { colour: null, depth: false };
+    this.#targets = { color: null, depth: false };
     this.#written.length = 0;
   }
 
@@ -250,18 +229,15 @@ export class Checker {
         return;
       case "DestroyBuffer":
         this.#buffer(op, cmd.handle);
-        this.#remember(cmd.handle);
-        this.#resources.delete(cmd.handle);
+        this.#destroy(cmd.handle);
         return;
       case "DestroyTexture":
         this.#texture(op, cmd.handle);
-        this.#remember(cmd.handle);
-        this.#resources.delete(cmd.handle);
+        this.#destroy(cmd.handle);
         return;
       case "DestroySampler":
         this.#sampler(op, cmd.handle);
-        this.#remember(cmd.handle);
-        this.#resources.delete(cmd.handle);
+        this.#destroy(cmd.handle);
         return;
       case "WriteBuffer":
         this.#range(op, cmd.handle, cmd.offset, cmd.data.length, "writing");
@@ -291,7 +267,6 @@ export class Checker {
         return;
       }
       case "Dispatch": {
-        this.#scope.clear();
         this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
         const max = this.#limits[9]!;
         if (cmd.groups.some((g) => g > max)) {
@@ -300,7 +275,6 @@ export class Checker {
         return;
       }
       case "DispatchIndirect":
-        this.#scope.clear();
         this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
         this.#arguments(op, cmd.arguments, cmd.offset, 12);
         return;
@@ -308,7 +282,7 @@ export class Checker {
         this.#clearColour(op, cmd.clear);
         this.#scope.clear();
         this.#attachments = [];
-        this.#targets = { colour: SCREEN_FORMAT, depth: false };
+        this.#targets = { color: SCREEN_FORMAT, depth: false };
         return;
       case "BeginPass": {
         const pass = cmd.pass;
@@ -317,7 +291,6 @@ export class Checker {
         if (pass.depth !== NONE && !pass.keepDepth && !(pass.clearDepth >= 0 && pass.clearDepth <= 1)) {
           throw err("the clear depth isn't from 0 to 1");
         }
-        this.#scope.clear();
         this.#attachments = [];
         for (const t of [pass.color, pass.depth]) {
           const r = this.#resources.get(t);
@@ -343,7 +316,7 @@ export class Checker {
           this.#attachments.push(pass.depth);
         }
         if (pass.color === NONE && pass.depth === NONE) throw err("a pass needs a colour target or a depth target");
-        this.#targets = { colour, depth: pass.depth !== NONE };
+        this.#targets = { color: colour, depth: pass.depth !== NONE };
         return;
       }
       case "Draw":
@@ -355,7 +328,7 @@ export class Checker {
         return;
       case "DrawIndexedIndirect":
         this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
-        if (cmd.index_size === 0) throw new CommandError(op, `the index range of buffer ${cmd.indices} is empty`);
+        if (cmd.index_size === 0) throw err(`the index range of buffer ${cmd.indices} is empty`);
         this.#range(op, cmd.indices, cmd.index_offset, cmd.index_size, "reading indices:");
         this.#used(op, "buffer", cmd.indices, false);
         this.#arguments(op, cmd.arguments, cmd.offset, 20);
@@ -403,6 +376,11 @@ export class Checker {
     if (old !== undefined) throw new CommandError(op, `handle ${handle} already names a ${old.kind}`);
     this.#remember(handle);
     this.#resources.set(handle, r);
+  }
+
+  #destroy(handle: number): void {
+    this.#remember(handle);
+    this.#resources.delete(handle);
   }
 
   #buffer(op: OpcodeName, handle: number): number {
@@ -470,7 +448,7 @@ export class Checker {
     }
     // A draw's pass's targets are one of its pipeline's.
     if (!dispatch) {
-      const here = { color: this.#targets.colour, depth: this.#targets.depth };
+      const here = this.#targets;
       if (!p.targets.some((t) => t.color === here.color && t.depth === here.depth)) {
         throw err(`\`${name}\` is drawn into ${targetName(here)}, which isn't one of its targets (${p.targets.map(targetName).join(", ")})`);
       }

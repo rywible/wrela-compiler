@@ -199,7 +199,6 @@ struct Specializer<'a> {
     /// Per production and position: the bracket (or hole) the position is inside, if the
     /// production itself opened it.
     inner: Vec<Vec<Option<Inner>>>,
-    excluded: HashSet<Terminal>,
     /// For each (nonterminal, bracket, class before): the classes it can end in.
     outs: BTreeMap<(usize, Ctx, Prev), u8>,
 }
@@ -221,7 +220,7 @@ fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Inner>>>, ExportError> {
         let mut stack: Vec<TokenKind> = Vec::new();
         let mut ctxs = Vec::new();
         for s in &p.rhs {
-            let here = if hole.is_some() && *s == Sym::N(hole.unwrap_or(usize::MAX)) {
+            let here = if hole.is_some_and(|h| *s == Sym::N(h)) {
                 Some(Inner::Hole)
             } else {
                 stack
@@ -255,9 +254,6 @@ fn bracket_contexts(cfg: &Cfg) -> Result<Vec<Vec<Option<Inner>>>, ExportError> {
 
 impl Specializer<'_> {
     fn allowed(&self, t: Terminal, prev: Prev, ctx: Ctx) -> bool {
-        if self.excluded.contains(&t) {
-            return false;
-        }
         if t == NEWLINE {
             return ctx == Ctx::Brace && prev.can_end();
         }
@@ -623,8 +619,7 @@ pub fn export(g: &Grammar) -> Result<String, ExportError> {
     let mut cfg = Cfg::lower(g, Recursion::Right);
     mark_tuple_indexes(&mut cfg);
     let inner = bracket_contexts(&cfg)?;
-    let excluded: HashSet<Terminal> = HashSet::new();
-    let mut sp = Specializer { cfg: &cfg, inner, excluded, outs: BTreeMap::new() };
+    let mut sp = Specializer { cfg: &cfg, inner, outs: BTreeMap::new() };
     sp.solve();
 
     // The variants reachable from the root.

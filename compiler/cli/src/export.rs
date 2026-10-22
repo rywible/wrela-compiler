@@ -510,15 +510,7 @@ fn builtins_page() -> Page {
         "# Built-in functions\n\nNo import is needed; most work on scalars and vectors alike (language.md §4).\n\n",
     );
     for (name, arity, method) in wrela_driver::builtins() {
-        let args = ["x", "y", "z"][..arity.min(3)].join(", ");
-        if method {
-            text.push_str(&format!(
-                "- `x.{name}({})`\n",
-                ["", "y", "y, z"][arity.saturating_sub(1).min(2)]
-            ));
-        } else {
-            text.push_str(&format!("- `{name}({args})`\n"));
-        }
+        text.push_str(&format!("- `{}`\n", doc::builtin_call(name, arity, method)));
     }
     Page {
         path: "std/builtins.md".to_string(),

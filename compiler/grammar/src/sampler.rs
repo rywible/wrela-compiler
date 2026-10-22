@@ -12,6 +12,7 @@ use crate::agree::Checker;
 use crate::earley::Scratch;
 use crate::rng::{FxHashMap, FxHashSet, Rng, par_seeded};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use wrela_diag::FileId;
 
 #[derive(Clone, Debug)]
@@ -658,10 +659,11 @@ impl SampleStats {
             self.disagreements.len(),
         );
         for (i, src, why) in self.rejected.iter().chain(&self.disagreements).take(5) {
-            s.push_str(&format!(
-                "\nFAILURE seed {} program {i}: {why}\n--- source ---\n{src}\n--------------\n",
+            let _ = writeln!(
+                s,
+                "\nFAILURE seed {} program {i}: {why}\n--- source ---\n{src}\n--------------",
                 self.seed
-            ));
+            );
         }
         s
     }

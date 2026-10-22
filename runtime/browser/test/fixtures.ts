@@ -43,8 +43,6 @@ export interface Vectors {
 /** The ABI's test vectors (runtime/abi/vectors.json). */
 export const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, "../../abi/vectors.json"), "utf8"));
 
-/** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only
- * buffer then a read-write one (runtime/native/src/program/tests.rs uses the same shapes). */
 /** Every target a render pipeline whose fragment shader returns a colour may be drawn into:
  * each colour format, with depth or without, and depth alone. */
 export function everyTarget(): RenderTarget[] {
@@ -52,6 +50,8 @@ export function everyTarget(): RenderTarget[] {
   return [...colours.flatMap((color) => [false, true].map((depth) => ({ color, depth }))), { color: null, depth: true }];
 }
 
+/** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only
+ * buffer then a read-write one (runtime/native/src/program/tests.rs uses the same shapes). */
 export function shapes(): Manifest {
   const m: Manifest = {
     manifest_version: MANIFEST_VERSION,

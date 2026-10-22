@@ -127,6 +127,13 @@ export function listen(
     for (const button of pointer.buttons) put(pointerEvent(EventKind.PointerUp, pointer.x, pointer.y, button, 0));
     pointers.delete(id);
   };
+  // A key pressed or let go: held keys are let go again by `release`.
+  const keyChange = (e: KeyboardEvent, down: boolean) => {
+    const key = keyCode(e.code);
+    if (down) keys.add(key);
+    else keys.delete(key);
+    put(keyEvent(down, key, down && e.repeat, modifiersOf(e)));
+  };
   const releaseKeys = () => {
     for (const key of keys) put(keyEvent(false, key, false, 0));
     keys.clear();
@@ -281,9 +288,7 @@ export function listen(
     if (texting()) {
       // An input method's keys are its own.
       if (e.isComposing || e.keyCode === 229) return;
-      const key = keyCode(e.code);
-      keys.add(key);
-      put(keyEvent(true, key, e.repeat, modifiersOf(e)));
+      keyChange(e, true);
       if (EDITING.has(e.code)) e.preventDefault();
       return;
     }
@@ -294,9 +299,7 @@ export function listen(
         return;
       }
     }
-    const key = keyCode(e.code);
-    keys.add(key);
-    put(keyEvent(true, key, e.repeat, modifiersOf(e)));
+    keyChange(e, true);
     // A printable key types its text, unless Control or Meta make it a shortcut.
     if (e.key.length > 0 && [...e.key].length === 1 && !e.ctrlKey && !e.metaKey) {
       put(textEvent(e.key.codePointAt(0)!));
@@ -305,10 +308,7 @@ export function listen(
     if (["Tab", "Space", "Backspace", "ArrowUp", "ArrowDown", "PageUp", "PageDown"].includes(e.code)) e.preventDefault();
   });
   window.addEventListener("keyup", (e) => {
-    if (inOverlay()) return;
-    const key = keyCode(e.code);
-    keys.delete(key);
-    put(keyEvent(false, key, false, modifiersOf(e)));
+    if (!inOverlay()) keyChange(e, false);
   });
   window.addEventListener("blur", release);
   window.addEventListener("focusin", () => { if (inOverlay()) releaseKeys(); });
@@ -316,12 +316,7 @@ export function listen(
     wheel,
     move,
     press,
-    key(e, down) {
-      const key = keyCode(e.code);
-      if (down) keys.add(key);
-      else keys.delete(key);
-      put(keyEvent(down, key, down && e.repeat, modifiersOf(e)));
-    },
+    key: keyChange,
   });
 
   return {
