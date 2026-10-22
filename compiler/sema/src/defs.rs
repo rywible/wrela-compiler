@@ -466,6 +466,7 @@ lang_items! {
     MemSizeOf = "std::mem::size_of",
     MemAlignOf = "std::mem::align_of",
     MemNeedsDrop = "std::mem::needs_drop",
+    MemIsCopy = "std::mem::is_copy",
     MemRead = "std::mem::read",
     MemZeroed = "std::mem::zeroed",
     MemWrite = "std::mem::write",

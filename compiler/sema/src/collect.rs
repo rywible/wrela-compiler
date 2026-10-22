@@ -338,6 +338,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                 "size_of"
                     | "align_of"
                     | "needs_drop"
+                    | "is_copy"
                     | "allocations"
                     | "debug_build"
                     | "test_build"
