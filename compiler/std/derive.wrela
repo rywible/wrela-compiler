@@ -251,6 +251,36 @@ fn samples_stay_finite_when_their_ranges_span_large_values() {
     }
 }
 
+/// A field that moves with time `t`, for the nested intervals: each variable occurs once (and
+/// `p.x` as a square), so an interval of it bounds its true range, up to rounding, however the
+/// variables are split between the derivations.
+fn swept(p: vec3, t: f32) -> f32 {
+    p.x * p.x + sin(p.y) * t + p.z
+}
+
+/// An interval over time of an interval over space (§14.2): finite, holding every sample, and as
+/// tight as the interval over both at once, within a few ulps. (On the CPU each bound passes a
+/// guard that makes a NaN infinite, `b == b`; the outer interval decides it where `b`'s range is
+/// finite.)
+@test
+fn a_nested_interval_is_as_tight_as_the_flat_one() {
+    let space = Box3 { lo: vec3(-0.25, 0.5, 1.0), hi: vec3(0.5, 0.75, 1.125) }
+    let time = Interval { lo: 0.5, hi: 1.5 }
+    let lo = interval(|t: f32| interval(|p: vec3| swept(p, t), space).lo, time).lo
+    let hi = interval(|t: f32| interval(|p: vec3| swept(p, t), space).hi, time).hi
+    let both = Box4 { lo: vec4(space.lo, time.lo), hi: vec4(space.hi, time.hi) }
+    let flat = interval(|q: vec4| swept(q.xyz, q.w), both)
+    assert(abs(lo) < 1.0 / 0.0 && abs(hi) < 1.0 / 0.0, f"the nested interval is [{lo}, {hi}]")
+    for i in 0..256 {
+        let v = swept(space.sample(5, i), time.sample(6, i))
+        assert(lo <= v && v <= hi, f"{v} is outside [{lo}, {hi}]")
+    }
+    assert(
+        abs(lo - flat.lo) <= 2.0e-6 && abs(hi - flat.hi) <= 2.0e-6,
+        f"nested [{lo}, {hi}], flat [{flat.lo}, {flat.hi}]",
+    )
+}
+
 /// A footprint's mean of `f`, from `n` samples spread evenly across `[x - w/2, x + w/2]`.
 fn mean_over(f: fn(f32) -> f32, x: f32, w: f32, n: u32) -> f32 {
     var s = 0.0

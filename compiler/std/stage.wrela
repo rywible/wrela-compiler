@@ -267,7 +267,14 @@ impl Tape {
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
     /// intervals over `over` don't overlap (by the smooth minimum's width, for one) becomes the
     /// operand it always picks, then the operations the value no longer uses are dropped. Inside
-    /// `over`, the result is the same as the original at every point; outside, it may not be.
+    /// `over`, the result has the same value and the same derived gradient as the original at
+    /// every point; outside, it may not.
+    ///
+    /// Intervals that only touch overlap: the operands can tie there, and at a tie a minimum's
+    /// or maximum's gradient is the average of both operands' (§14.2), not either one's. A
+    /// smooth minimum exactly its width apart is the lower operand, value and gradient (`smin`'s
+    /// `m` is 0 there, so `m * (m * s)` and its tangent are 0), but `a.hi + k` rounds: a sum
+    /// equal to `b.lo` doesn't show that `b - a >= k` at every point, while one below it does.
     pub fn prune(self, over: Box3) -> Tape {
         let iv = self.register_intervals(over)
         var ops = self.ops
@@ -278,8 +285,8 @@ impl Tape {
                 let b = iv[op.b]
                 // The width a smooth minimum blends over; 0 for the others.
                 let k = if op.code == SMIN { max(op.c, 0.0) } else { 0.0 }
-                let a_low = a.hi + k <= b.lo
-                let b_low = b.hi + k <= a.lo
+                let a_low = a.hi + k < b.lo
+                let b_low = b.hi + k < a.lo
                 let keep_a = if op.code == MAX { b_low } else { a_low }
                 let keep_b = if op.code == MAX { a_low } else { b_low }
                 if keep_a {
@@ -423,22 +430,34 @@ fn tape_of(ops: [(u32, u32, u32, f32)]) -> Tape {
     t
 }
 
-@test
-fn pruning_at_a_tie_is_unchanged() {
-    // What `prune` does today where operands' intervals only touch: `a.hi + k <= b.lo` (or
-    // `b`'s, for a maximum) isn't strict, so it picks the first operand. This pins that
-    // behaviour, not its correctness: where the values tie, the original's gradient is the
-    // average of both operands' (§14.2), and the pruned tape's is the first's.
+/// `(code, 0, 1, c)` over the constants `a` and `b`, pruned to a box.
+fn pruned(code: u32, a: f32, b: f32, c: f32) -> Tape {
     let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    tape_of([(CONST, 0, 0, a), (CONST, 0, 0, b), (code, 0, 1, c)]).prune(over)
+}
+
+/// Whether `t` is the one constant `c`.
+fn is_constant(t: Tape, c: f32) -> bool {
+    t.len == 2 && t.ops[0].code == CONST && t.ops[0].c == c && t.ops[1].code == COPY
+}
+
+@test
+fn pruning_keeps_both_operands_at_a_tie() {
+    // A tie's gradient is the average of both operands' (§14.2), so where the intervals touch
+    // both stay; one ulp apart, the operation is the operand it picks.
+    let up = 1.0000001
     for code in [MIN, MAX] {
-        let p = tape_of([(CONST, 0, 0, 1.0), (CONST, 0, 0, 1.0), (code, 0, 1, 0.0)]).prune(over)
-        assert(p.len == 2 && p.ops[1].code == COPY && p.ops[1].a == 0, "a tie keeps the first")
+        assert(pruned(code, a: 1.0, b: 1.0, c: 0.0).len == 3, "a tie keeps both")
     }
-    // A smooth minimum picks an operand only where they're its whole width apart.
-    let blend = |k: f32| tape_of([(CONST, 0, 0, 0.0), (CONST, 0, 0, 0.5), (SMIN, 0, 1, k)])
-    let p = blend(0.5).prune(over)
-    assert(p.len == 2 && p.ops[1].code == COPY && p.ops[1].a == 0, "the width apart picks one")
-    assert(blend(0.50000006).prune(over).len == 3, "a little nearer blends")
+    assert(is_constant(pruned(MIN, a: 1.0, b: up, c: 0.0), 1.0), "an ulp apart: min")
+    assert(is_constant(pruned(MAX, a: 1.0, b: up, c: 0.0), up), "an ulp apart: max")
+    // A smooth minimum blends nearer than its width. Exactly the width apart it keeps both,
+    // as the rounded `a.hi + k` can't tell that from nearer: 2³⁰ + 1 is 2³⁰, so the second
+    // pair would prune, though its operands tie and blend half each.
+    let big = 1073741824.0
+    assert(pruned(SMIN, a: 0.0, b: 0.5, c: 0.5).len == 3, "the width apart")
+    assert(pruned(SMIN, a: big, b: big, c: 1.0).len == 3, "a tie at 2^30")
+    assert(is_constant(pruned(SMIN, a: 0.0, b: 0.5, c: 0.49999997), 0.0), "an ulp more")
 }
 
 @test

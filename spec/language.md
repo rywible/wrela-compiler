@@ -1509,7 +1509,7 @@ A field built while the program runs is a tape: `std::stage::Tape` holds up to 1
 - `stage::interpret(tape, p)` evaluates a tape. A `Tape` is a `Surface`, so it goes wherever a compiled field goes, on the CPU and the GPU (as a uniform).
 - Nothing about a tape is special to the compiler: its gradient and interval are derived from `interpret`'s own code.
 - Tapes of three corpus fields agree with their compiled twins within 1e-5 at 10⁶ points on both targets, and pass the corpus's gradient and enclosure tests.
-- `tape.prune(over)` is interval pruning. Each `min`, `max` or `smooth_min` whose operands' intervals over the box do not overlap becomes the operand it always picks, and the tape drops what the value no longer uses. So the pruned tape gives the same values inside the box with less work.
+- `tape.prune(over)` is interval pruning. Each `min`, `max` or `smooth_min` whose operands' intervals over the box do not overlap (intervals that only touch overlap) becomes the operand it always picks, and the tape drops what the value no longer uses. So the pruned tape gives the same values and gradients inside the box with less work.
 - The compiler does not prune compiled fields (no `LiveMask`). The engine's part masks use each part's derived interval instead.
 
 ### 14.5 Bounds as methods
