@@ -269,15 +269,28 @@ pub fn tool() -> u32 {
         report(drive::steps(b, [Step::Capture]).wait())
     } else if what.as_str() == "many-lines" {
         match drive::steps(b, [Step::Init, call("chatter", 30000)]).wait() {
-            Ok(seen) => {
-                let Ok(all) = drive::lines(seen.clone()) else { return 99 }
-                print(f"all {all.len()} first {all[0].as_str()} last {all[all.len() - 1].as_str()} inline {seen.lines.len()} log {seen.log.is_some()} dropped {seen.dropped_lines}")
+            Ok(got) => {
+                var seen = take got
+                let log = seen.log.is_some()
+                let Ok(all) = drive::lines(mut seen) else { return 99 }
+                print(f"all {all.len()} first {all[0].as_str()} last {all[all.len() - 1].as_str()} inline {seen.lines.len()} log {log} dropped {seen.dropped_lines} kept {seen.log.is_some()}")
             },
             Err(e) => print(f"refused: {e.message()}"),
         }
-        let Ok(one) = drive::steps(b, [call("chatter", 1)]).wait() else { return 98 }
-        let Ok(all) = drive::lines(one.clone()) else { return 99 }
-        print(f"then {all.len()} inline {one.lines.len()} log {one.log.is_some()}")
+        let Ok(got) = drive::steps(b, [call("chatter", 1)]).wait() else { return 98 }
+        var one = take got
+        let log = one.log.is_some()
+        let Ok(all) = drive::lines(mut one) else { return 99 }
+        print(f"then {all.len()} inline {one.lines.len()} log {log}")
+    } else if what.as_str() == "many-lines-again" {
+        // Each log is released once read: a budget for one log holds them one after another.
+        let Ok(_) = drive::steps(b, [Step::Init]).wait() else { return 97 }
+        for k in 0..3 {
+            let Ok(got) = drive::steps(b, [call("chatter", 30000)]).wait() else { return 98 }
+            var seen = take got
+            let Ok(all) = drive::lines(mut seen) else { return 99 }
+            print(f"again {k}: {all.len()}")
+        }
     } else if what.as_str() == "lines" {
         if let Err(e) = drive::steps(b, [Step::Init, call("chatter", 5000), call("missing", 0)]).wait() {
             print(f"failed with its lines={e.message().len() > 10000}")
@@ -1430,7 +1443,15 @@ fn every_printed_line_comes_back_through_a_blob_when_the_answer_cant_hold_them()
             .contains("all 30000 first chatter 0 last chatter 29999 inline 0 log true dropped 0"),
         "{printed}"
     );
+    assert!(printed.contains("dropped 0 kept false"), "the log is released: {printed}");
     assert!(printed.contains("then 1 inline 1 log false"), "{printed}");
+    // A budget that holds one log, not two: each is released once read, so three in turn fit.
+    let mut c = budgeted(drive(&tool, &src, &out, "60", &["many-lines-again"]), "600K");
+    let (code, printed) = run(&mut c);
+    assert_eq!(code, Some(0), "{printed}");
+    for k in 0..3 {
+        assert!(printed.contains(&format!("again {k}: 30000")), "{printed}");
+    }
     let mut c = budgeted(drive(&tool, &src, &out, "60", &["many-lines"]), "100K");
     let (code, printed) = run(&mut c);
     assert_eq!(code, Some(0), "{printed}");

@@ -249,7 +249,7 @@ pub struct Audio: Clone {
 /// What a request's steps saw, each kind in the order of its steps: a `Ran` for each step that
 /// ran code (`Init`, `Frames`, `FrameAt`, `Ticks`, `Call`; one that trapped too, with the frames
 /// or ticks it finished), and each observation; the lines the build printed during the steps,
-/// every one up to 256 MiB of them (`dropped_lines` counts those past it), which `lines(seen)`
+/// every one up to 256 MiB of them (`dropped_lines` counts those past it), which `lines(mut seen)`
 /// gives: in `lines` if they all fit the answer (a line of more than 256 KiB cut, with a note),
 /// else whole in the blob `log`, each followed by a newline (and `lines` empty); and the
 /// build's first trap, in this request or before it.
@@ -270,26 +270,23 @@ pub struct Seen: Clone {
 }
 
 /// Every line the build printed during the steps that saw `seen`, in order, whether they came
-/// in the answer or in its blob (read now, 512 KiB at a time). A line holding a newline of its
-/// own is two lines here.
+/// in the answer or in its blob (read now, 512 KiB at a time). The blob is the tool's to hold
+/// until it is released, so this releases it, also when it can't be read, and leaves `seen.log`
+/// empty: its bytes go back to the blob budget. A line holding a newline of its own is two
+/// lines here.
 @tool
-pub fn lines(seen: Seen) -> Result<Vec<String>, ToolError> {
-    var bytes: Vec<u8> = Vec::new()
-    match seen.log.clone() {
+pub fn lines(seen: mut Seen) -> Result<Vec<String>, ToolError> {
+    let bytes = match replace(mut seen.log, None) {
         None => return Ok(seen.lines.clone()),
-        Some(Data::Bytes(b)) => bytes = take b,
+        Some(Data::Bytes(b)) => take b,
         Some(Data::Blob(blob)) => {
-            let total = blob::len(blob).wait()?
-            var at: u64 = 0
-            while at < total {
-                let chunk = blob::read(blob, at, MOST_BYTES).wait()?
-                if chunk.is_empty() {
-                    return Err(malformed("a build's printed lines"))
-                }
-                at += u64(chunk.len())
-                for b in chunk {
-                    bytes.push(b)
-                }
+            let read = read_log(blob)
+            if let Err(e) = blob::release(blob).wait() {
+                return Err(take e)
+            }
+            match take read {
+                Ok(b) => take b,
+                Err(e) => return Err(take e),
             }
         },
     }
@@ -297,6 +294,25 @@ pub fn lines(seen: Seen) -> Result<Vec<String>, ToolError> {
         Some(out) => Ok(out),
         None => Err(malformed("a build's printed lines")),
     }
+}
+
+/// The bytes of a log's blob, 512 KiB at a time.
+@tool
+fn read_log(blob: blob::Blob) -> Result<Vec<u8>, ToolError> {
+    let total = blob::len(blob).wait()?
+    var bytes: Vec<u8> = Vec::new()
+    var at: u64 = 0
+    while at < total {
+        let chunk = blob::read(blob, at, MOST_BYTES).wait()?
+        if chunk.is_empty() {
+            return Err(malformed("a build's printed lines"))
+        }
+        at += u64(chunk.len())
+        for b in chunk {
+            bytes.push(b)
+        }
+    }
+    Ok(bytes)
 }
 
 /// The lines of `bytes`, each followed by a newline, as UTF-8: `None` if they aren't.
