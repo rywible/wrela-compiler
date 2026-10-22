@@ -3153,7 +3153,7 @@ dependencies = [
 
 [[package]]
 name = "wrela"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ctrlc",
  "flate2",
@@ -3173,7 +3173,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-abi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-chrome"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "base64 0.22.1",
  "libc",
@@ -3193,7 +3193,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-diag"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -3201,7 +3201,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-driver"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cap-std",
  "libc",
@@ -3223,7 +3223,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-grammar"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wrela-diag",
  "wrela-syntax",
@@ -3231,7 +3231,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-host"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cap-std",
  "libc",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-ir"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wrela-abi",
  "wrela-diag",
@@ -3260,7 +3260,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-lower"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wrela-abi",
  "wrela-diag",
@@ -3271,7 +3271,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-sema"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "elsa",
  "wrela-abi",
@@ -3281,7 +3281,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-serve"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "tokio",
  "wrela-abi",
@@ -3291,14 +3291,14 @@ dependencies = [
 
 [[package]]
 name = "wrela-syntax"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wrela-diag",
 ]
 
 [[package]]
 name = "wrela-tests"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "mimalloc",
  "pollster",
@@ -3322,7 +3322,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "wasm-encoder 0.261.0",
  "wasmparser 0.261.0",
@@ -3334,7 +3334,7 @@ dependencies = [
 
 [[package]]
 name = "wrela-wgsl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "naga",
  "wrela-ir",
