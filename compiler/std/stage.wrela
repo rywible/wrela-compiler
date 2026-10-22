@@ -250,7 +250,7 @@ impl Tape {
         for i in 0..self.len {
             let op = self.ops[i]
             r[i] = if op.code < ADD {
-                interval(|q: vec3| apply(op, q, 0.0, 0.0), over)
+                interval(|q: vec3| apply(op, q, a: 0.0, b: 0.0), over)
             } else if finite[op.a] && finite[op.b] {
                 let a = r[op.a]
                 let b = r[op.b]
