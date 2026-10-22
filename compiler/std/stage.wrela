@@ -8,7 +8,8 @@
 // constant; the last register is the field's value. A tape is fixed-size, so it's `GpuData`
 // and passes to a kernel as a uniform.
 
-use std::derive::{Box3, Interval, interval}
+use std::derive::{Box2, Box3, Interval, interval}
+use std::math::is_finite
 use std::field::{Surface, smin}
 
 /// The most operations a tape holds.
@@ -61,28 +62,34 @@ pub fn interpret(tape: Tape, p: vec3) -> f32 {
     var r = [0.0; 128]
     for i in 0..tape.len {
         let op = tape.ops[i]
-        r[i] = match op.code {
-            X => p.x - op.c,
-            Y => p.y - op.c,
-            Z => p.z - op.c,
-            CONST => op.c,
-            ADD => r[op.a] + r[op.b],
-            SUB => r[op.a] - r[op.b],
-            MUL => r[op.a] * r[op.b],
-            DIV => r[op.a] / r[op.b],
-            MIN => min(r[op.a], r[op.b]),
-            MAX => max(r[op.a], r[op.b]),
-            SMIN => smin(r[op.a], r[op.b], op.c),
-            NEG => -r[op.a],
-            ABS => abs(r[op.a]),
-            SQRT => sqrt(r[op.a]),
-            SIN => sin(r[op.a]),
-            COS => cos(r[op.a]),
-            EXP => exp(r[op.a]),
-            _ => r[op.a],
-        }
+        r[i] = apply(op, p, r[op.a], r[op.b])
     }
     if tape.len == 0 { 0.0 } else { r[tape.len - 1] }
+}
+
+/// What operation `op` writes at `p`, given the values `a` and `b` of its registers `op.a` and
+/// `op.b`: one step of `interpret`, and `Tape::prune`'s step of the registers' intervals.
+fn apply(op: Op, p: vec3, a: f32, b: f32) -> f32 {
+    match op.code {
+        X => p.x - op.c,
+        Y => p.y - op.c,
+        Z => p.z - op.c,
+        CONST => op.c,
+        ADD => a + b,
+        SUB => a - b,
+        MUL => a * b,
+        DIV => a / b,
+        MIN => min(a, b),
+        MAX => max(a, b),
+        SMIN => smin(a, b, op.c),
+        NEG => -a,
+        ABS => abs(a),
+        SQRT => sqrt(a),
+        SIN => sin(a),
+        COS => cos(a),
+        EXP => exp(a),
+        _ => a,
+    }
 }
 
 impl Surface for Tape {
@@ -230,17 +237,45 @@ impl Tape {
         interval(|q| interpret(upto, q), over)
     }
 
+    /// Each register's `register_interval` over `over`, from one pass: each operation's interval
+    /// is `interval` of `apply`, the step `interpret` takes, over its operands' intervals. That
+    /// is `interpret`'s own derived arithmetic, an operation at a time, because an interval
+    /// follows no value's identity through a register. One difference remains: `interval` makes
+    /// a NaN bound infinite, at the end of the function it derives, so a bound that isn't finite
+    /// may stand for a NaN that the whole tape's derivation would carry on. An operation that
+    /// reads such a register takes its `register_interval` instead.
+    fn register_intervals(self, over: Box3) -> [Interval; 128] {
+        var r = [Interval { lo: 0.0, hi: 0.0 }; 128]
+        var finite = [false; 128]
+        for i in 0..self.len {
+            let op = self.ops[i]
+            r[i] = if op.code < ADD {
+                interval(|q: vec3| apply(op, q, 0.0, 0.0), over)
+            } else if finite[op.a] && finite[op.b] {
+                let a = r[op.a]
+                let b = r[op.b]
+                let ab = Box2 { lo: vec2(a.lo, b.lo), hi: vec2(a.hi, b.hi) }
+                interval(|v: vec2| apply(op, vec3(0.0), v.x, v.y), ab)
+            } else {
+                self.register_interval(i, over)
+            }
+            finite[i] = is_finite(r[i].lo) && is_finite(r[i].hi)
+        }
+        r
+    }
+
     /// The same field within `over`, with less work: each minimum or maximum whose operands'
     /// intervals over `over` don't overlap (by the smooth minimum's width, for one) becomes the
     /// operand it always picks, then the operations the value no longer uses are dropped. Inside
     /// `over`, the result is the same as the original at every point; outside, it may not be.
     pub fn prune(self, over: Box3) -> Tape {
+        let iv = self.register_intervals(over)
         var ops = self.ops
         for i in 0..self.len {
             let op = ops[i]
             if op.code == MIN || op.code == MAX || op.code == SMIN {
-                let a = self.register_interval(op.a, over)
-                let b = self.register_interval(op.b, over)
+                let a = iv[op.a]
+                let b = iv[op.b]
                 // The width a smooth minimum blends over; 0 for the others.
                 let k = if op.code == SMIN { max(op.c, 0.0) } else { 0.0 }
                 let a_low = a.hi + k <= b.lo
@@ -254,6 +289,11 @@ impl Tape {
                 }
             }
         }
+        self.drop_unused(ops)
+    }
+
+    /// The tape with operations `ops`: the ones its value uses, in order, renumbered.
+    fn drop_unused(self, ops: [Op; 128]) -> Tape {
         if self.len == 0 {
             return self
         }
@@ -292,4 +332,133 @@ impl Tape {
         }
         out
     }
+}
+
+// ---- tests (the suite runs std's: `std_tests_pass`) --------------------------------------------
+
+/// A 32-bit integer hash (`lowbias32`), for the tests' tapes and boxes.
+fn mix(x: u32) -> u32 {
+    var h = x ^ (x >> 16)
+    h = h.wrapping_mul(2146121005)
+    h = h ^ (h >> 15)
+    h = h.wrapping_mul(2221713035)
+    h ^ (h >> 16)
+}
+
+/// The kinds of operation `random_tape` draws: all but division and `exp`, whose unbounded
+/// ranges would make NaNs, which a debug build (as tests run) stops at.
+const DRAWN: [u32; 15] = [X, Y, Z, CONST, ADD, SUB, MUL, MIN, MAX, SMIN, NEG, ABS, SQRT, SIN, COS]
+
+/// `n` operations from `seed`, each over random earlier registers. A constant is often 0, 1 or
+/// 2, so operands tie; a smooth minimum's width is from 1/4 to 2.
+fn random_tape(n: u32, seed: u32) -> Tape {
+    var t = Tape::new()
+    let _ = t.x()
+    for i in 1..n {
+        let h = mix(seed * 1024 + i)
+        let code = DRAWN[mix(h) % 15]
+        let a = Reg { index: mix(h + 1) % i }
+        let b = if code > SMIN { a } else { Reg { index: mix(h + 2) % i } }
+        let c = if code == SMIN {
+            f32(1 + mix(h + 3) % 8) / 4.0
+        } else if h & 1 == 0 {
+            f32(mix(h + 3) % 3)
+        } else {
+            f32(mix(h + 3) % 1024) / 256.0 - 2.0
+        }
+        let _ = t.op(code, a, b, c)
+    }
+    t
+}
+
+/// A box about a point in [-1.5, 1.5]³, up to 1 wide; one in four is a single point.
+fn random_box(seed: u32) -> Box3 {
+    let h = mix(seed + 77)
+    let c = vec3(f32(mix(h) % 768), f32(mix(h + 1) % 768), f32(mix(h + 2) % 768)) / 256.0
+    let w = if h % 4 == 0 { 0.0 } else { f32(mix(h + 3) % 256) / 512.0 }
+    Box3 { lo: c - vec3(1.5 + w), hi: c - vec3(1.5 - w) }
+}
+
+/// Checks that each of `t`'s registers' interval from the one pass is the tape's up to it, bit
+/// for bit.
+fn check_intervals(t: Tape, over: Box3) {
+    let iv = t.register_intervals(over)
+    for k in 0..t.len {
+        let want = t.register_interval(k, over)
+        assert(
+            bitcast_u32(iv[k].lo) == bitcast_u32(want.lo) &&
+                bitcast_u32(iv[k].hi) == bitcast_u32(want.hi),
+            "a register's interval differs from the tape's up to it",
+        )
+    }
+}
+
+@test
+fn each_registers_interval_is_the_tapes_up_to_it() {
+    // Over random tapes and boxes, and the tapes pruned to them (which can end in a copy).
+    var shorter = 0
+    for n in [16, 32, 64, 128] {
+        for seed in 0..2 {
+            let t = random_tape(n, seed)
+            for j in 0..3 {
+                let over = random_box(n * 16 + seed * 4 + j)
+                check_intervals(t, over)
+                let p = t.prune(over)
+                check_intervals(p, over)
+                if p.len < t.len {
+                    shorter += 1
+                }
+            }
+        }
+    }
+    assert(shorter > 0, "the sample prunes nothing")
+}
+
+/// `ops`, a tape: each `(code, a, b, c)`.
+fn tape_of(ops: [(u32, u32, u32, f32)]) -> Tape {
+    var t = Tape::new()
+    for (code, a, b, c) in ops {
+        let _ = t.op(code, Reg { index: a }, Reg { index: b }, c)
+    }
+    t
+}
+
+@test
+fn pruning_at_a_tie_is_unchanged() {
+    // What `prune` does today where operands' intervals only touch: `a.hi + k <= b.lo` (or
+    // `b`'s, for a maximum) isn't strict, so it picks the first operand. This pins that
+    // behaviour, not its correctness: where the values tie, the original's gradient is the
+    // average of both operands' (§14.2), and the pruned tape's is the first's.
+    let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    for code in [MIN, MAX] {
+        let p = tape_of([(CONST, 0, 0, 1.0), (CONST, 0, 0, 1.0), (code, 0, 1, 0.0)]).prune(over)
+        assert(p.len == 2 && p.ops[1].code == COPY && p.ops[1].a == 0, "a tie keeps the first")
+    }
+    // A smooth minimum picks an operand only where they're its whole width apart.
+    let blend = |k: f32| tape_of([(CONST, 0, 0, 0.0), (CONST, 0, 0, 0.5), (SMIN, 0, 1, k)])
+    let p = blend(0.5).prune(over)
+    assert(p.len == 2 && p.ops[1].code == COPY && p.ops[1].a == 0, "the width apart picks one")
+    assert(blend(0.50000006).prune(over).len == 3, "a little nearer blends")
+}
+
+@test
+fn an_unbounded_operand_takes_the_tapes_interval() {
+    // 1 / x over a box where x crosses 0 is unbounded; what reads it takes the interval of the
+    // tape up to it. |1 / x| is at least 0, so its maximum with -1 is it.
+    let t = tape_of(
+        [
+            (X, 0, 0, 0.0),
+            (CONST, 0, 0, 1.0),
+            (DIV, 1, 0, 0.0),
+            (ABS, 2, 2, 0.0),
+            (CONST, 0, 0, -1.0),
+            (MAX, 3, 4, 0.0),
+        ],
+    )
+    let over = Box3 { lo: vec3(-1.0), hi: vec3(1.0) }
+    check_intervals(t, over)
+    let iv = t.register_intervals(over)
+    assert(iv[2].lo == -1.0 / 0.0 && iv[3].lo == 0.0 && iv[3].hi == 1.0 / 0.0)
+    let p = t.prune(over)
+    assert(p.len == 5 && p.ops[4].code == COPY && p.ops[4].a == 3, "the maximum is |1 / x|")
 }
