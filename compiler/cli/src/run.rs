@@ -115,10 +115,13 @@ impl Rooms {
         }
         let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
         let (identity, certificate) = wrela_serve::dev_identity().map_err(|e| e.to_string())?;
+        // The store outlives each new server build, as on a server.
+        let services = wrela_host::services::Services::open(&self.data.join("store.sqlite"))?;
         let config = wrela_serve::Config {
             build,
             build_hash: hash,
             data: self.data.clone(),
+            services: Some(Arc::new(services)),
             port: self.port,
             identity,
             limits: wrela_host::server::Limits::default(),

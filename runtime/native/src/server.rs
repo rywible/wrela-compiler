@@ -183,6 +183,9 @@ pub enum Net {
     /// Tag a connection, once the call's records are kept (`net/tag`): its `Connection` event
     /// carries the tag when the room starts again.
     Tag(u32, u32),
+    /// Write to the server's store, committed with the call's other writes before its records
+    /// are kept (`store/write`, [`crate::services`]).
+    Write(Vec<u8>),
 }
 
 /// A network command from a host request's service and body, if it's one.
@@ -195,6 +198,7 @@ fn net_command(service: &str, body: &[u8]) -> Option<Result<Net, String>> {
     Some(match service {
         "net/keep" => Ok(Net::Keep(body.to_vec())),
         "net/compact" => Ok(Net::Compact(body.to_vec())),
+        "store/write" => Ok(Net::Write(body.to_vec())),
         "net/send" => conn(body).map(|c| Net::Send(c, body[4..].to_vec())),
         "net/close" => conn(body).map(Net::Close),
         "net/tag" => match body.get(4..8) {

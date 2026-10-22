@@ -6,7 +6,8 @@
 //!
 //! `<build-dir>` is a `wrela build` of a program with a server role: its `server/game.wasm`.
 //! Rooms' journals go in `--data` (default `<build-dir>/rooms`), each server build's in a
-//! directory of its own. The port defaults to 4433. `wrela-serve --version` says its release and
+//! directory of its own, and the server's store beside them (`store.sqlite`, language.md §19.4),
+//! which every build shares. The port defaults to 4433. `wrela-serve --version` says its release and
 //! source revision.
 
 use std::path::PathBuf;
@@ -79,9 +80,13 @@ fn main() -> ExitCode {
             }
             _ => return Err(std::io::Error::other("give --cert and --key, or --dev")),
         };
+        // The store is the server's, beside the builds' journals, so it outlives a build.
+        let services = wrela_host::services::Services::open(&data.join("store.sqlite"))
+            .map_err(std::io::Error::other)?;
         let config = wrela_serve::Config {
             build,
             build_hash: wrela_abi::ticks::wasm_hash(&wasm),
+            services: Some(Arc::new(services)),
             data,
             port,
             identity,

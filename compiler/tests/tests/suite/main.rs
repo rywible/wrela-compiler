@@ -49,6 +49,7 @@ mod roles;
 mod rooms;
 mod run_pass;
 mod semantics;
+mod server_services;
 mod simd;
 mod sketches;
 mod snapshots;

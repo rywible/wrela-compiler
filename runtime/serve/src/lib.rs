@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wrela_host::rooms::{Out, RoomHost, Status};
 use wrela_host::server::{Limits, ServerBuild};
+use wrela_host::services::Services;
 use wtransport::endpoint::IncomingSession;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
@@ -78,6 +79,9 @@ pub struct Config {
     pub build: Arc<ServerBuild>,
     pub build_hash: u64,
     pub data: PathBuf,
+    /// The services every room shares: its store, which outlives the build (none: a room's
+    /// requests fail).
+    pub services: Option<Arc<Services>>,
     pub port: u16,
     pub identity: Identity,
     pub limits: Limits,
@@ -169,6 +173,7 @@ struct State {
 struct Rooms {
     state: Mutex<State>,
     data: PathBuf,
+    services: Option<Arc<Services>>,
     limits: Limits,
     bounds: Bounds,
     next_conn: AtomicU32,
@@ -308,13 +313,14 @@ fn run(
     stop: &Arc<AtomicBool>,
 ) {
     let data = rooms.data.join(format!("{hash:016x}"));
-    let mut room = match RoomHost::open(build, hash, &data, name, rooms.limits) {
-        Ok(room) => Some(room),
-        Err(e) => {
-            eprintln!("wrela-serve: room {name} doesn't open: {e}");
-            None
-        }
-    };
+    let mut room =
+        match RoomHost::open(build, hash, &data, name, rooms.limits, rooms.services.clone()) {
+            Ok(room) => Some(room),
+            Err(e) => {
+                eprintln!("wrela-serve: room {name} doesn't open: {e}");
+                None
+            }
+        };
     let mut outs: HashMap<u32, Link> = HashMap::new();
     let mut carried: Vec<ToRoom> = Vec::new();
     // The bytes of the messages waiting in the room, held until it has none waiting.
@@ -589,6 +595,7 @@ pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Resu
             rooms: HashMap::new(),
         }),
         data: config.data,
+        services: config.services,
         limits: config.limits,
         bounds: config.bounds,
         next_conn: AtomicU32::new(1),

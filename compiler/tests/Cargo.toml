@@ -31,6 +31,8 @@ wasm-encoder = { version = "0.261", features = ["wasmparser"] }
 wasmparser = "0.261"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"] }
 pollster = "0.4"
+# A P-256 key that signs what the server checks (`server_services`).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
 # The tests' allocator: macOS's spent 30% of the suite's time in malloc, its threads contending.
 mimalloc.workspace = true
 

@@ -29,10 +29,12 @@
 //! ends the journal there (a crash in the middle of a write), and it's truncated to the records
 //! before it.
 
-use crate::server::{Failure, Limits, Net, Room, ServerBuild};
+use crate::server::{Answers, Failure, Limits, Net, Room, ServerBuild};
+use crate::services::Services;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// The connection a room's journal comes from (`std::net::JOURNAL`).
 pub const JOURNAL: u32 = 0;
@@ -271,6 +273,9 @@ pub struct RoomHost {
     build_hash: u64,
     name: String,
     limits: Limits,
+    /// The server's services, which answer its requests and keep its writes; none, and each
+    /// request fails and a write fails the call.
+    services: Option<Arc<Services>>,
     journal: Journal,
     room: Option<Room>,
     status: Status,
@@ -285,14 +290,15 @@ pub struct RoomHost {
 
 impl RoomHost {
     /// Opens room `name` of `build` (whose WASM hash is `build_hash`) in `dir`: its journal is
-    /// read back into a new instance, within `limits`. A journal of another build or room isn't
-    /// read, and a room its own journal traps is quarantined.
+    /// read back into a new instance, within `limits`, with the server's `services`. A journal of
+    /// another build or room isn't read, and a room its own journal traps is quarantined.
     pub fn open(
         build: std::sync::Arc<ServerBuild>,
         build_hash: u64,
         dir: &Path,
         name: &str,
         limits: Limits,
+        services: Option<Arc<Services>>,
     ) -> Result<RoomHost, Failure> {
         std::fs::create_dir_all(dir).map_err(host)?;
         let dir = dir.canonicalize().map_err(host)?;
@@ -304,6 +310,7 @@ impl RoomHost {
             build_hash,
             name: name.to_string(),
             limits,
+            services,
             journal,
             room: None,
             status: Status::Unavailable(0),
@@ -341,7 +348,12 @@ impl RoomHost {
             Journal::open(&self.journal.path, self.build_hash, &self.name)?;
         journal.fault = self.journal.fault.take();
         self.journal = journal;
-        let mut room = Room::start(&self.build, self.limits, None)?;
+        let answers: Option<Answers> = self.services.clone().map(|s| {
+            let answer: Answers =
+                Arc::new(move |service: &str, body: &[u8]| s.answer(service, body));
+            answer
+        });
+        let mut room = Room::start(&self.build, self.limits, answers)?;
         for r in &records {
             room.push_message(JOURNAL, r.clone());
         }
@@ -360,7 +372,8 @@ impl RoomHost {
                 Err(f) => return Err(f),
             }
             // Reading back keeps nothing new but a compaction, which it carries out: the
-            // snapshot, then the records not read yet, which it doesn't hold.
+            // snapshot, then the records not read yet, which it doesn't hold. Its writes to the
+            // store were committed when the records were first kept.
             for c in room.take_commands() {
                 if let Net::Compact(snapshot) = c {
                     let unread = &records[records.len() - room.queued()..];
@@ -522,15 +535,30 @@ impl RoomHost {
         Ok(())
     }
 
-    /// Keeps a call's records (and a compaction), then releases its sends and closes. If the
-    /// records can't be kept, nothing is released and the room starts again from its journal.
+    /// Commits a call's writes to the store, keeps its records (and a compaction), then releases
+    /// its sends and closes. If the writes or the records can't be kept, nothing is released and
+    /// the room starts again from its journal. Writes are committed first: a crash between them
+    /// and the records leaves the writes kept and the call's event not settled, so its peer sends
+    /// it again, and a program's writes should be the same when they are made again.
     fn carry_out(&mut self, commands: Vec<Net>) -> Result<(), Failure> {
         let mut records = Vec::new();
         let mut held = Vec::new();
         let mut tags = Vec::new();
-        let mut kept = Ok(());
+        let writes: Vec<Vec<u8>> = commands
+            .iter()
+            .filter_map(|c| if let Net::Write(w) = c { Some(w.clone()) } else { None })
+            .collect();
+        let mut kept = if writes.is_empty() {
+            Ok(())
+        } else {
+            match &self.services {
+                Some(s) => s.write(&writes).map_err(std::io::Error::other),
+                None => Err(std::io::Error::other("this server has no store")),
+            }
+        };
         for c in commands {
             match c {
+                Net::Write(_) => {}
                 Net::Keep(r) => records.push(r),
                 Net::Compact(snapshot) => {
                     // The records before it go into the journal first, then the snapshot
@@ -639,13 +667,15 @@ mod tests {
         )
         .expect("server module");
         let build = Arc::new(super::ServerBuild::from_wasm(&wasm).expect("server build"));
-        let first = super::RoomHost::open(build.clone(), 1, &dir, "a", super::Limits::default())
-            .expect("first room");
+        let first =
+            super::RoomHost::open(build.clone(), 1, &dir, "a", super::Limits::default(), None)
+                .expect("first room");
         let alias = dir.join("nested/..");
         let (tx, rx) = mpsc::channel();
         let second = std::thread::spawn(move || {
-            let _room = super::RoomHost::open(build, 1, &alias, "a", super::Limits::default())
-                .expect("second room once the first closes");
+            let _room =
+                super::RoomHost::open(build, 1, &alias, "a", super::Limits::default(), None)
+                    .expect("second room once the first closes");
             tx.send(()).expect("report open");
         });
         let early = rx.recv_timeout(Duration::from_millis(100));
