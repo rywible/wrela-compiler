@@ -30,7 +30,8 @@
 
 use std::input::Script
 use std::serialize::{Reader, Writer}
-use std::tool::{Answer, Call, Done, ToolError, ask, malformed}
+use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed}
+use std::tool::blob
 use std::tool::blob::{Data, read_data, write_data}
 
 /// How a GPU build's passes and dispatches are timed (`wrela-host --timestamps`): not at all,
@@ -247,10 +248,11 @@ pub struct Audio: Clone {
 
 /// What a request's steps saw, each kind in the order of its steps: a `Ran` for each step that
 /// ran code (`Init`, `Frames`, `FrameAt`, `Ticks`, `Call`; one that trapped too, with the frames
-/// or ticks it finished), and each observation; the lines the build printed during the steps
-/// (as many as the answer has room for, at most 4096 lines and 512 KiB between two requests'
-/// ends, a line of more than 256 KiB cut, with a note) and how many more it printed, which were
-/// dropped; and the build's first trap, in this request or before it.
+/// or ticks it finished), and each observation; the lines the build printed during the steps,
+/// every one up to 256 MiB of them (`dropped_lines` counts those past it), which `lines(seen)`
+/// gives: in `lines` if they all fit the answer (a line of more than 256 KiB cut, with a note),
+/// else whole in the blob `log`, each followed by a newline (and `lines` empty); and the
+/// build's first trap, in this request or before it.
 pub struct Seen: Clone {
     pub ran: Vec<Ran>,
     pub captures: Vec<Capture>,
@@ -262,8 +264,55 @@ pub struct Seen: Clone {
     pub commands: Vec<Commands>,
     pub running: Vec<String>,
     pub lines: Vec<String>,
+    pub log: Option<Data>,
     pub dropped_lines: u32,
     pub trap: Option<Trap>,
+}
+
+/// Every line the build printed during the steps that saw `seen`, in order, whether they came
+/// in the answer or in its blob (read now, 512 KiB at a time). A line holding a newline of its
+/// own is two lines here.
+@tool
+pub fn lines(seen: Seen) -> Result<Vec<String>, ToolError> {
+    var bytes: Vec<u8> = Vec::new()
+    match seen.log.clone() {
+        None => return Ok(seen.lines.clone()),
+        Some(Data::Bytes(b)) => bytes = take b,
+        Some(Data::Blob(blob)) => {
+            let total = blob::len(blob).wait()?
+            var at: u64 = 0
+            while at < total {
+                let chunk = blob::read(blob, at, MOST_BYTES).wait()?
+                if chunk.is_empty() {
+                    return Err(malformed("a build's printed lines"))
+                }
+                at += u64(chunk.len())
+                for b in chunk {
+                    bytes.push(b)
+                }
+            }
+        },
+    }
+    match split_lines(take bytes) {
+        Some(out) => Ok(out),
+        None => Err(malformed("a build's printed lines")),
+    }
+}
+
+/// The lines of `bytes`, each followed by a newline, as UTF-8: `None` if they aren't.
+fn split_lines(bytes: take Vec<u8>) -> Option<Vec<String>> {
+    var out: Vec<String> = Vec::new()
+    var line: Vec<u8> = Vec::new()
+    for b in bytes {
+        if b == 10 {
+            let Some(text) = String::from_utf8(take line) else { return None }
+            out.push(take text)
+            line = Vec::new()
+        } else {
+            line.push(b)
+        }
+    }
+    Some(out)
 }
 
 /// A post the build made (`std::io::post`), which waits for the tool's answer: its number,
@@ -592,7 +641,8 @@ fn read_trap(r: mut Reader) -> Option<Trap> {
 }
 
 /// Reads a `Seen` from `r`: each kind, a count then each, in `Seen`'s order; the lines, a count
-/// then each, and how many were dropped; then 1 and the trap, or 0.
+/// then each, and how many were dropped; 1 and the log (`blob::Data`), or 0; then 1 and the
+/// trap, or 0.
 fn read_seen(r: mut Reader) -> Option<Seen> {
     let Some(n) = count(mut r) else { return None }
     var ran: Vec<Ran> = Vec::with_capacity(n)
@@ -655,6 +705,15 @@ fn read_seen(r: mut Reader) -> Option<Seen> {
         lines.push(take x)
     }
     let Ok(dropped_lines) = r.read_u32() else { return None }
+    var log: Option<Data> = None
+    match r.read_u8() {
+        Ok(0) => {},
+        Ok(1) => {
+            let Some(d) = read_data(mut r) else { return None }
+            log = Some(take d)
+        },
+        _ => return None,
+    }
     var trap: Option<Trap> = None
     match r.read_u8() {
         Ok(0) => {},
@@ -676,6 +735,7 @@ fn read_seen(r: mut Reader) -> Option<Seen> {
             commands,
             running,
             lines,
+            log,
             dropped_lines,
             trap,
         },
@@ -765,6 +825,7 @@ fn what_steps_saw_reads_back_in_its_order() {
     w.write_u32(1)
     w.write_str("hello")
     w.write_u32(2)
+    w.write_u8(0)
     w.write_u8(1)
     w.write_str("in tick 20: panic: no")
     w.write_str("no")
@@ -787,7 +848,7 @@ fn what_steps_saw_reads_back_in_its_order() {
     assert(seen.buffers[0].len() == 2 && seen.buffers[0][1] == 5)
     assert(seen.bytes.is_empty() && seen.commands.is_empty())
     assert(seen.running[0].as_str() == "src/b")
-    assert(seen.lines[0].as_str() == "hello" && seen.dropped_lines == 2)
+    assert(seen.lines[0].as_str() == "hello" && seen.dropped_lines == 2 && seen.log.is_none())
     let Some(trap) = seen.trap else { panic("a trap") }
     assert(trap.stage == Stage::Tick && trap.number == 20 && trap.step == 3)
     assert(trap.panic.as_str() == "no")
@@ -824,4 +885,22 @@ fn steps_are_written_as_the_host_reads_them() {
     // 4 steps; 0; 2 and the time's bits; 4, "add", one i32; 7.
     assert(bytes.len() == 4 + 1 + 5 + (1 + 4 + 3 + 4 + 9) + 1)
     assert(bytes[0] == 4 && bytes[4] == 0 && bytes[5] == 2 && bytes[bytes.len() - 1] == 7)
+}
+
+@test
+fn a_logs_lines_are_split_at_its_newlines() {
+    var w = Writer::new()
+    for _ in 0..9 {
+        w.write_u32(0)
+    }
+    w.write_u32(0)
+    w.write_u32(0)
+    w.write_u8(1)
+    write_data(mut w, Data::Bytes(Vec::from([u8(97), 10, 10, 98, 99, 10])))
+    w.write_u8(0)
+    let Ok(seen) = Seen::read(take w.into_bytes()) else { panic("what steps saw") }
+    let Some(Data::Bytes(log)) = seen.log.clone() else { panic("a log") }
+    let Some(all) = split_lines(take log) else { panic("lines") }
+    assert(split_lines(Vec::from([u8(255), 10])).is_none(), "not UTF-8")
+    assert(all.len() == 3 && all[0].as_str() == "a" && all[1].is_empty() && all[2].as_str() == "bc")
 }

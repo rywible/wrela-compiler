@@ -32,10 +32,9 @@ use std::time::Instant;
 /// The file descriptors the tool host gives the process.
 pub(crate) const FDS: [i32; 5] = [3, 4, 5, 6, 7];
 
-/// The most lines, and bytes of them, a build keeps between two requests' ends: the rest are
-/// dropped as they're printed, and counted.
-const MOST_KEPT_LINES: usize = 4096;
-const MOST_KEPT_LINE_BYTES: usize = 512 << 10;
+/// The most bytes of lines a build keeps during a request (as a program's output is bounded,
+/// `std::tool::run`): the lines past it are dropped as they're printed, and counted.
+const MOST_KEPT_LINE_BYTES: usize = 256 << 20;
 
 /// The most commands one `Commands` step gives: the rest wait for the next.
 const MOST_COMMANDS: usize = 65536;
@@ -446,7 +445,13 @@ impl Seen {
     }
 
     /// The answer: each kind in order, the lines and how many were dropped, then the trap.
-    fn finish(self, lines: &[String], dropped: u64, trap: Option<&Trap>) -> Vec<u8> {
+    fn finish(
+        self,
+        lines: &[String],
+        dropped: u64,
+        log: Option<u32>,
+        trap: Option<&Trap>,
+    ) -> Vec<u8> {
         let mut out = Out::default();
         for (n, bytes) in [
             self.ran,
@@ -467,6 +472,14 @@ impl Seen {
             out.str(l);
         }
         out.u32(u32::try_from(dropped).unwrap_or(u32::MAX));
+        match log {
+            None => {
+                out.u8(0);
+            }
+            Some(id) => {
+                out.u8(1).u8(1).u32(id);
+            }
+        }
         match trap {
             None => {
                 out.u8(0);
@@ -592,7 +605,7 @@ impl Actor {
     /// if they fit an answer.
     fn steps(&mut self, steps: Vec<Step>, link: &Link) -> Result<Vec<u8>, String> {
         let trace = self.trace();
-        trace.keep_at_most(MOST_KEPT_LINES, MOST_KEPT_LINE_BYTES);
+        trace.keep_at_most(usize::MAX, MOST_KEPT_LINE_BYTES);
         let _ = (trace.take_lines(), trace.take_dropped());
         let mut seen = Seen::default();
         for (i, step) in steps.into_iter().enumerate() {
@@ -612,21 +625,27 @@ impl Actor {
             }
         }
         let printed = trace.take_lines();
-        let mut dropped = trace.take_dropped();
-        // As many lines as the answer holds, the oldest first; the rest are counted.
-        let mut lines = Vec::new();
-        let mut left = seen.left();
-        for l in printed {
-            let l = bounded(&l);
-            if l.len() + 4 > left {
-                dropped += 1;
-                continue;
+        let dropped = trace.take_dropped();
+        // Every line, in the answer if they all fit it (each cut at half an answer), else as a
+        // blob, newline after newline, reserved before its bytes cross.
+        let inline: usize = printed.iter().map(|l| l.len().min(MOST_BYTES / 2) + 4).sum();
+        let (lines, log) = if inline <= seen.left() {
+            (printed.iter().map(|l| bounded(l)).collect(), None)
+        } else {
+            let bytes: usize = printed.iter().map(|l| l.len() + 1).sum();
+            let id = link.reserve(bytes as u64).map_err(|why| {
+                format!("the {} lines it printed, {bytes} bytes: {why}", printed.len())
+            })?;
+            let mut text = Vec::with_capacity(bytes);
+            for l in &printed {
+                text.extend_from_slice(l.as_bytes());
+                text.push(b'\n');
             }
-            left -= l.len() + 4;
-            lines.push(l);
-        }
+            link.send(wire::BLOB, &[&id.to_le_bytes(), &text]);
+            (Vec::new(), Some(id))
+        };
         let trap = self.trap.clone();
-        Ok(seen.finish(&lines, dropped, trap.as_ref()))
+        Ok(seen.finish(&lines, dropped, log, trap.as_ref()))
     }
 
     fn step(&mut self, i: usize, step: Step, seen: &mut Seen, link: &Link) -> Result<(), String> {

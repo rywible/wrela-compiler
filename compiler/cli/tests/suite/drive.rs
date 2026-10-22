@@ -267,6 +267,17 @@ pub fn tool() -> u32 {
             print(f"past: {e.message()}")
         }
         report(drive::steps(b, [Step::Capture]).wait())
+    } else if what.as_str() == "many-lines" {
+        match drive::steps(b, [Step::Init, call("chatter", 30000)]).wait() {
+            Ok(seen) => {
+                let Ok(all) = drive::lines(seen.clone()) else { return 99 }
+                print(f"all {all.len()} first {all[0].as_str()} last {all[all.len() - 1].as_str()} inline {seen.lines.len()} log {seen.log.is_some()} dropped {seen.dropped_lines}")
+            },
+            Err(e) => print(f"refused: {e.message()}"),
+        }
+        let Ok(one) = drive::steps(b, [call("chatter", 1)]).wait() else { return 98 }
+        let Ok(all) = drive::lines(one.clone()) else { return 99 }
+        print(f"then {all.len()} inline {one.lines.len()} log {one.log.is_some()}")
     } else if what.as_str() == "lines" {
         if let Err(e) = drive::steps(b, [Step::Init, call("chatter", 5000), call("missing", 0)]).wait() {
             print(f"failed with its lines={e.message().len() > 10000}")
@@ -1404,4 +1415,26 @@ fn a_held_compile_bounds_the_end_and_a_loads_deadline_answers_on_time() {
     assert!(line.contains("past its deadline"), "{printed}");
     let took: f64 = line.rsplit(' ').next().and_then(|t| t.parse().ok()).expect("a time");
     assert!(took < 2.5, "the deadline answered on time: {took}");
+}
+
+/// Lines past what the answer holds come back whole, in a blob, which `drive::lines` reads; a
+/// blob past the budget fails the request before its bytes cross, and gives its reservation
+/// back; lines that fit stay in the answer.
+#[test]
+fn every_printed_line_comes_back_through_a_blob_when_the_answer_cant_hold_them() {
+    let (tool, src, out) = setup("drive-many-lines");
+    let (code, printed) = run(&mut drive(&tool, &src, &out, "60", &["many-lines"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(
+        printed
+            .contains("all 30000 first chatter 0 last chatter 29999 inline 0 log true dropped 0"),
+        "{printed}"
+    );
+    assert!(printed.contains("then 1 inline 1 log false"), "{printed}");
+    let mut c = budgeted(drive(&tool, &src, &out, "60", &["many-lines"]), "100K");
+    let (code, printed) = run(&mut c);
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("refused: the 30000 lines it printed, "), "{printed}");
+    assert!(printed.contains("budget"), "{printed}");
+    assert!(printed.contains("then 1 inline 1 log false"), "{printed}");
 }
