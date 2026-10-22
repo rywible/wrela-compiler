@@ -64,6 +64,7 @@ Each is used as facts or as a method; no code was copied.
 | FIPS 180-4 (SHA-256); NIST CAVP's short-message vectors | US government publications | `std::hash::sha256`, and its test vectors |
 | RFC 3720, appendix B.4 (CRC-32C) | IETF | The rooms' journal records' check (`runtime/native/src/rooms.rs`) |
 | RFC 8259 (JSON) | IETF | `std::json` |
+| W3C Web Authentication Level 3; RFC 8949 (CBOR), RFC 9053 (COSE keys), RFC 4648 (base64url) | W3C and IETF | Passkeys: the browser host's `passkey/create` and `passkey/get` (`runtime/browser/src/platform.ts`), and `std::webauthn`'s checks of what an authenticator answers (§7's steps but attestation), with the CBOR and COSE it reads and the base64url of a challenge |
 | RFC 1950 (Adler-32) | IETF | The browser host's PNG writer (`runtime/browser/src/png.ts`) |
 | gitignore(5), git's documented pattern format | Git documentation | `wrela suite allow` reads a workspace's `.gitignore` files as git does |
 | Pillow's Lanczos3 resize and `thumbnail` size rule (HPND), from its documentation and source | Read as a description | `std::tool::image`'s resize and `image::fit`; the resize's test computes its reference from the Lanczos formula itself |

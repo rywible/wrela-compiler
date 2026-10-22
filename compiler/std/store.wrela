@@ -17,8 +17,9 @@
 use std::host::request
 use std::io::Pending
 
-/// The longest key, and the longest value (bytes).
+/// The longest key (bytes).
 pub const MAX_KEY: u32 = 1024
+/// The longest value (bytes).
 pub const MAX_VALUE: u32 = 1048576
 
 /// Asks for the value of `key`: `value` reads the answer.

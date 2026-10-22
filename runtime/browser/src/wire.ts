@@ -33,6 +33,16 @@ export class Reader {
     const at = this.#need(n);
     return UTF8.decode(this.bytes.subarray(at, at + n));
   }
+  /** Bytes as a length, then them: a copy. */
+  chunk(): Uint8Array<ArrayBuffer> {
+    const n = this.u32();
+    const at = this.#need(n);
+    return this.bytes.slice(at, at + n);
+  }
+  /** Throws if bytes are left. */
+  end(): void {
+    if (this.#at !== this.bytes.length) throw new Error("the request is longer than it says");
+  }
   /** What's left, as text. */
   rest(): string {
     return UTF8.decode(this.bytes.subarray(this.#need(this.bytes.length - this.#at)));
@@ -60,6 +70,12 @@ export class Writer {
   }
   str(s: string): this {
     const b = ENCODER.encode(s);
+    this.u32(b.length);
+    this.#parts.push(b);
+    return this;
+  }
+  /** Bytes as a length, then them. */
+  chunk(b: Uint8Array): this {
     this.u32(b.length);
     this.#parts.push(b);
     return this;

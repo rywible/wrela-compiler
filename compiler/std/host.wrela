@@ -480,6 +480,135 @@ pub fn claim_find(on: bool) -> Pending<u8> {
     request("keys/find", [if on { u8(1) } else { u8(0) }])
 }
 
+// ---- passkeys (runtime/browser: platform.ts) ----------------------------------------------------
+
+// A passkey is a key pair an authenticator keeps (the phone, the computer, a security key) for one
+// site and one account: the page asks it to make one (`create_passkey`), or to sign a server's
+// challenge with one (`use_passkey`). The program chooses the site (the relying party's ID, a
+// domain the page is on), the account and the challenge; the host makes every passkey discoverable
+// (so a person signs in without typing a name), asks for the person's verification (a fingerprint,
+// a face, a PIN) every time, and asks for no attestation. The keys are ES256, Ed25519 or RS256.
+// What the authenticator answers is a server's to check (std::webauthn): the host carries the
+// bytes. A person who cancels, or a page whose site isn't its own, fails the request.
+
+/// The account a new passkey is for: its handle (a server's random bytes, never a name or an
+/// email), the name a person knows it by, and the name shown for it.
+pub struct PasskeyUser: Clone {
+    pub id: Vec<u8>,
+    pub name: String,
+    pub display_name: String,
+}
+
+/// Asks the person's authenticator to make a passkey for `user` at relying party `rp_id` (shown
+/// as `rp_name`), over the server's `challenge`, unless it already holds one of `exclude` (each a
+/// credential's ID), within `timeout_ms`. `read_new_passkey` reads the answer.
+@client
+pub fn create_passkey(
+    rp_id: str,
+    rp_name: str,
+    user: PasskeyUser,
+    challenge: [u8],
+    exclude: [Vec<u8>],
+    timeout_ms: u32,
+) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(rp_id)
+    w.write_str(rp_name)
+    write_bytes(mut w, user.id)
+    w.write_str(user.name.as_str())
+    w.write_str(user.display_name.as_str())
+    write_bytes(mut w, challenge)
+    w.write_u32(exclude.len())
+    for id in exclude {
+        write_bytes(mut w, id)
+    }
+    w.write_u32(timeout_ms)
+    request("passkey/create", take w.into_bytes())
+}
+
+/// A new passkey, as the authenticator answers: its credential's ID, the client's data (JSON, which
+/// names the challenge and the page's origin), and the attestation object (CBOR, which holds the
+/// public key).
+pub struct NewPasskey: Clone {
+    pub id: Vec<u8>,
+    pub client_data: Vec<u8>,
+    pub attestation: Vec<u8>,
+}
+
+/// Reads a `create_passkey` answer.
+pub fn read_new_passkey(bytes: [u8]) -> Option<NewPasskey> {
+    var r = Reader::new(Vec::from(bytes))
+    let id = read_bytes(mut r)?
+    let client_data = read_bytes(mut r)?
+    let attestation = read_bytes(mut r)?
+    if !r.at_end() {
+        return None
+    }
+    Some(NewPasskey { id, client_data, attestation })
+}
+
+/// Asks the person's authenticator to sign the server's `challenge` with a passkey for relying
+/// party `rp_id`: one of `allow` (each a credential's ID), or with none given, any the person
+/// chooses. `read_passkey_use` reads the answer.
+@client
+pub fn use_passkey(rp_id: str, challenge: [u8], allow: [Vec<u8>], timeout_ms: u32) -> Pending<u8> {
+    var w = Writer::new()
+    w.write_str(rp_id)
+    write_bytes(mut w, challenge)
+    w.write_u32(allow.len())
+    for id in allow {
+        write_bytes(mut w, id)
+    }
+    w.write_u32(timeout_ms)
+    request("passkey/get", take w.into_bytes())
+}
+
+/// A passkey's signature, as the authenticator answers: the credential's ID, the client's data
+/// (JSON), the authenticator's data, the signature over both, and the account's handle that the
+/// passkey was made for.
+pub struct PasskeyUse: Clone {
+    pub id: Vec<u8>,
+    pub client_data: Vec<u8>,
+    pub authenticator_data: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub user: Vec<u8>,
+}
+
+/// Reads a `use_passkey` answer.
+pub fn read_passkey_use(bytes: [u8]) -> Option<PasskeyUse> {
+    var r = Reader::new(Vec::from(bytes))
+    let id = read_bytes(mut r)?
+    let client_data = read_bytes(mut r)?
+    let authenticator_data = read_bytes(mut r)?
+    let signature = read_bytes(mut r)?
+    let user = read_bytes(mut r)?
+    if !r.at_end() {
+        return None
+    }
+    Some(PasskeyUse { id, client_data, authenticator_data, signature, user })
+}
+
+/// Bytes as a service takes them: their length, then them.
+fn write_bytes(w: mut Writer, bytes: [u8]) {
+    w.write_u32(bytes.len())
+    for b in bytes {
+        w.write_u8(b)
+    }
+}
+
+/// Bytes as `write_bytes` wrote them, or none if the answer ends early.
+fn read_bytes(r: mut Reader) -> Option<Vec<u8>> {
+    let n = r.read_u32().ok()?
+    if r.left() < n {
+        return None
+    }
+    var out: Vec<u8> = Vec::with_capacity(n)
+    for _ in 0..n {
+        out.push(r.read_u8().ok()?)
+    }
+    Some(out)
+}
+
 @test
 fn a_paste_has_the_hosts_layout() {
     var w = Writer::new()
@@ -555,4 +684,23 @@ fn a_call_and_a_surface_read_back() {
     assert(read_call([1, 2, 3]).is_none())
     assert(read_surface([7, 0, 0, 0]) == Some(7))
     assert(read_surface([7, 0]).is_none())
+}
+
+@test
+fn a_passkeys_answers_read_back_and_a_cut_one_does_not() {
+    // ID [1, 2], client data "{}", attestation [9].
+    let made = [2, 0, 0, 0, 1, 2, 2, 0, 0, 0, 123, 125, 1, 0, 0, 0, 9]
+    let Some(p) = read_new_passkey(made) else { panic("a new passkey") }
+    assert(p.id.len() == 2 && p.client_data[0] == 123 && p.attestation[0] == 9)
+    assert(read_new_passkey([2, 0, 0, 0, 1]).is_none(), "cut short")
+    assert(
+        read_new_passkey([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]).is_none(),
+        "bytes past its end",
+    )
+    // ID [5], client data [], authenticator data [6, 6], signature [7], no user handle.
+    let used = [1, 0, 0, 0, 5, 0, 0, 0, 0, 2, 0, 0, 0, 6, 6, 1, 0, 0, 0, 7, 0, 0, 0, 0]
+    let Some(u) = read_passkey_use(used) else { panic("a passkey's use") }
+    assert(
+        u.id[0] == 5 && u.authenticator_data.len() == 2 && u.signature[0] == 7 && u.user.len() == 0,
+    )
 }

@@ -3768,6 +3768,7 @@ dependencies = [
  "p256",
  "pollster",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "wasm-encoder 0.261.0",
  "wasmparser 0.261.0",
