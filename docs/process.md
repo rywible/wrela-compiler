@@ -570,6 +570,67 @@ The strongest measured results are fusion (17x on a memory-bound chain), sparse 
 at 0.1% changed inputs) and region residuals (6–12x on separated branches). Each is a fixture
 result on one machine, not a frame-rate result. The frame effect follows Amdahl's formula above.
 
+### Follow-through, 2026-10-21
+
+Ryan then gave the orchestrating Claude session full autonomy to do what it judged best, and to
+merge pull requests. It chose the cheap correctness fixes, the local codegen wins, and checks of
+real code before any large pass. Five more Opus 5.5 subagents worked in their own worktrees,
+through the same lock. The lock now also stops each command's systemd scope when it ends, so a
+process that a test leaves behind is killed.
+
+Merged:
+
+- [#10](https://github.com/rywible/wrela-compiler/pull/10): `Tape::prune` finds each register's
+  interval in one pass.
+- [#12](https://github.com/rywible/wrela-compiler/pull/12): #10 passed two literals by position
+  (W0005), which failed `warnings::std_has_no_warnings`; the operands are now named.
+- [#11](https://github.com/rywible/wrela-compiler/pull/11): `std::lift::gradient` by no literals
+  gives an empty gradient. The derived type was `[f32; n.max(1)]`, which disagreed with sema's
+  `[f32; 0]`.
+- [#13](https://github.com/rywible/wrela-compiler/pull/13): intervals nest on the CPU. A float
+  `x == x` or `x != x` is decided where `x`'s range is finite, which agrees with the documented
+  convention that an interval bounds a function's non-NaN values. A nested interval that was
+  [-∞, ∞] is now within about 4 ulps of the flat 4D one. `Tape::prune`'s dominance tests are
+  strict, so a tie keeps both operands and the derived gradient matches the original's.
+- [#14](https://github.com/rywible/wrela-compiler/pull/14): `Vec::clone` and `clone_into` copy
+  `Copy` elements with one `copy`, through a std-only `std::mem::is_copy` intrinsic. A
+  16,384-element `Vec<f32>` snapshot went from 22.2 µs to 2.5 µs (MEASURED, 7 pairs).
+- [#15](https://github.com/rywible/wrela-compiler/pull/15): two lift tests shared one temporary
+  package directory. In parallel, one removed the other's, so one test failed in every full check
+  and passed alone.
+
+After these merges, the full `tools/check.sh` on `main` passed 29 of 31 checks. The failures were
+the five environment tests below and the lift race, which #15 fixes.
+
+Checked and stopped, because real code does not have the case:
+
+- **Dispatch fusion.** A MIR survey of the frozen programs and every test package found 0
+  fusible pairs. Different domains or workgroup sizes, texture or neighbourhood reads, atomics
+  and indirect groups block all of them. Read-only, `rywible/wrela`'s engine has one per-frame
+  candidate (wood `cull` → `hide`), worth tens of µs at most and only after a proof that an
+  intermediate field is dead. The planned pass would be about 2,100 lines. Not built.
+- **Merging duplicate math calls.** Normal builds of herd, grazer and hello-field have 0
+  duplicate transcendental calls. Duplicates occur only in lifted builds' literal-gradient
+  functions, where d/dθ sin θ computes a second cos θ beside the primal's.
+- **Binaryen for native builds.** `--optimize` is already opt-in, and `rywible/wrela` uses it only
+  for releases, so native runs already skip `wasm-opt`. Choosing a browser level needs a V8
+  measurement.
+
+A real scene, `rywible/wrela`'s `examples/clearing` at 108dc7ae, run with this toolchain at
+1280×720 on the AMD Lucienne iGPU (one profile, 30 warmup and 60 measured frames): the GPU frame
+span is 20.4 ms, and the clouds take 10.0 ms of it (49%). In the cloud march loop, 8 of 58
+statements per step are loop-invariant, and 4 of those are constants (MEASURED with an
+experimental survey). So the clouds' cost is steps times density evaluations, the engine's
+algorithm, and not missing hoisting. Interval-based region skipping, which the engine can already
+write with `interval`, is the lever there. `games/last-green` was not profiled, because its world
+bake takes minutes.
+
+Environment limits found in the agents' sandbox: Chrome does not start there, so the three Chrome
+tests fail on unchanged `main`. Both `drive::` process-group tests also fail on unchanged `main`
+there, with or without the lock's scope; they passed in the same sandbox earlier in the day.
+Bun 1.4.2 aborts in about half of full `browser` runs, on `main` too. Each needs a run in a normal
+terminal.
+
 ## Keeping this record
 
 AGENTS.md tells every agent to update this file in the same change when it adds an outside
