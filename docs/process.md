@@ -17,7 +17,7 @@ anything here.
 
 | Tool | What it does here |
 |---|---|
-| [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Writes the code, tests and docs, on Ryan's MacBook Air and in cloud sessions. Its deep-research workflow searches the web, reads sources and has subagents vote on each claim (see "A second check, by Claude deep research") |
+| [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Writes the code, tests and docs, on Ryan's MacBook Air and in cloud sessions. Its deep-research workflow searches the web, reads sources and has subagents vote on each claim (see "A second check, by Claude deep research"). One session can orchestrate parallel Opus subagents, each in its own git worktree, sharing the machine through a lock (see "Exploration of each opportunity") |
 | [OpenAI Codex](https://openai.com/codex/) (GPT-6, GPT-6.1) and parallel subagents | Reviews performance across the compiler, the hosts and the tools, implements optimizations and regression tests, and measures their effects |
 | [GPT-6.1-Sol and GPT-6-Astra](https://openai.com/) (OpenAI), as T3 Code child tasks or `codex exec` runs | Reviewers in a council on an implementation plan or a pull request: each reads the brief and the checkout read-only, returns findings, and rebuts the leader's answers; they don't edit. Claude leads, decides, implements and verifies |
 | Claude Sonnet 5.5 subagents | The agent syntax test (`tools/agent-test`): fresh agents write small programs from the spec alone, to measure how learnable the language is |
@@ -454,6 +454,121 @@ The pass list adds these gaps to "What the compiler already does":
 The pass list missed `Tape::prune`, which the section above names. The run used the sources
 only as descriptions of methods and evidence. It imported no code, figures or substantial quoted
 text, and it added no crate.
+
+### Exploration of each opportunity, 2026-10-21
+
+Ryan then asked Claude Code (Opus 5.5) to explore every opportunity above. One orchestrating
+session started nine Opus 5.5 subagents, each in its own git worktree with its own branch from
+`main`. They shared one Linux machine: a Ryzen 7 5700U with 13 GB RAM and its AMD Lucienne
+integrated GPU (RADV). A file lock let one build, test, GPU or profile run happen at a time, with
+cargo at 6 jobs and each run capped at 7 GB. A watchdog reported work outside the lock and low
+memory. Ryan asked for cheap estimates rather than full workloads, so each agent counted
+operations, bytes or code size first and timed at most a few small cases. A number is MEASURED
+when it was timed or counted from real output, and ESTIMATE when it comes from a model. Most
+timings are one run without repetitions. The agents changed no default. Eight kept their
+experiments as local commits. One opened a pull request (`Tape::prune`, below).
+
+Each verdict comes with what the agent found in the code. Where an agent corrected the research
+above, the correction is given.
+
+- **1. Region residuals: Ryan's decision; leaning towards a narrow form.**
+  - On 128 separated spheres, exact residuals gave 6.2x for the CPU value, 12x for the CPU
+    gradient and colour, and 8x on the GPU (MEASURED). They were 1.0–1.3x for overlapping
+    smooth minima and 1–2x for noise.
+  - A region proof costs 4.4 µs. It pays back after about 22 value queries or 3 gradient queries.
+  - Compiled per-region variants grow with regions times kept branches; at 128 spheres the
+    gradient shader exceeds the 256 KiB limit. The tape interpreter costs 72x compiled code on
+    the CPU. Skipping subtrees with a per-site mask, or an index list over data, matched the
+    hand-written residual.
+  - The interval derivation must output its min/max choices, with site IDs that stay stable
+    through AD, inlining and CSE. The IR has no summary of what a function can trap on, and
+    every call counts as having an effect.
+  - `Tape::prune` keeps an operand at an exact tie (`<=`), where the original gradient averages
+    both operands' tangents (§14.2). A tie can therefore change the gradient. Pruning one
+    operation at a time keeps 23 of 128 spheres where global dominance keeps about 8.
+  - The straight-line full gradient for 128 spheres takes 8.2 ms on the GPU, 16x the loop form.
+    That is a separate codegen issue.
+- **2. Invariants before AD: rejected as a general loop-hoisting pass for now.**
+  - Correction: the Enzyme O(N²)→O(N) result comes from caching in reverse mode. Wrela's forward
+    mode copies inactive code as is, so hoisting before or after AD gives the same arithmetic
+    counts.
+  - Correction to the pass list above: CPU `reuse_loads` does merge redundant loads. Only calls
+    are never merged.
+  - A hand-hoisted fixture ran 10.7x faster (MEASURED). But in the frozen programs, invariant
+    work is only 0.7–1% of derived-loop statements, 2–5% of CPU loops and 7.5–15.6% of GPU loops
+    (ESTIMATE). Debug NaN checks and zero-trip loops make float hoisting change traps.
+  - The pass worth trying is narrower: about 40% of the fixture's transcendental calls were
+    duplicates. They become calls in `rewrite_cpu_math`, after derivation, and nothing merges
+    them later.
+- **3. Sparse exact updates: worth pursuing as a std library first.**
+  - The fixture was 65,536 elements, a map with a 3-point stencil and an ordered f32 sum.
+    Correctness was checked bit for bit, including signed zero, branch and index changes, and
+    rollback.
+  - At 0.1% changed inputs, a hand-written update was 42.9x faster than recomputing everything:
+    4.10 ms against 175.8 ms for 20 updates (MEASURED). The model predicted about 44x. Replaying
+    the strict ordered sum was 91% of the sparse cost. At 100% changed inputs, it was 0.84x.
+  - Comparing values misses a change from +0 to −0. `total - old + new` gives different bits.
+  - A compiler-generated update needs memory read/write facts that the IR does not keep, and a
+    source for the changed set. Both are language or architecture choices for Ryan.
+- **4. Certificates across time: Ryan's decision; leaning towards folding it into proposal 1.**
+  - Time does not destroy certificates. About 89% of one-frame proofs still held after 64
+    frames, for slow deformation and drifting noise; 35% held for a fast crossing (MEASURED).
+  - Plain intervals are already loose in one frame: they decide 0.28 of cells, where sampling
+    allows up to 0.55. A box over more than 4 inputs cannot be expressed today.
+  - An interval of an interval is infinite everywhere on the CPU. The CPU's NaN guard,
+    `select(x == x, x, ±inf)`, cannot be decided over a range. So the "derivations nest" promise
+    of §14.2 holds for the interval of a gradient, not of an interval.
+- **5. Reverse-mode AD: Ryan's decision.**
+  - At 16 directions, each forward direction cost about 0.69x of the primal. A hand-written
+    reverse pass got all 256 derivatives at 3.1x of the primal, about 61x faster than forward
+    mode's 16 calls (MEASURED). 132 of 256 derivatives were bitwise equal; the worst differed
+    by 96 ulps. Reverse mode therefore needs a spec decision.
+  - Code grows linearly with directions, but wasmtime's load time grows about as the largest
+    function's size to the power 2.5. That was 1 s at 16 directions; a 255-direction run reached
+    9 GB and was stopped. Above about 32 directions, the generated code is not usable today.
+  - Sparse forward mode is not value-preserving here: skipping a direction gives +0 where the
+    dense tangent can be −0 or NaN.
+  - `gradient` with N = 0 makes malformed IR, because of `n.max(1)` in `derive/literal.rs`.
+- **6. Container representation: Ryan's decision; leaning against a compiler-chosen layout.**
+  - Correction: `layout.rs` lays out element types only. Std's `Vec` (about 42 raw
+    `data + i*size` uses), lowering, the constant evaluator and address projections fix
+    array-of-structs.
+  - With 16,384 bodies of 112 bytes, hand-written struct-of-arrays was 14x faster on the hot
+    pass and uploaded the hot field in 22.7 µs, against 2.0 ms for the whole buffer (MEASURED).
+    A snapshot was slower, 309 µs against 209 µs, because `Vec::clone_into` copies one element
+    at a time.
+  - Struct-of-arrays wins only if a conversion back to array-of-structs bytes happens less than
+    about once every 10 frames (ESTIMATE).
+  - `vloop` never vectorizes a loop over struct fields or over `Vec` indexing.
+- **7. Dispatch fusion: worth pursuing as a narrow pass in MIR.**
+  - A chain of 16 maps over 1M slots took 3.87 ms of GPU time unfused and 0.22 ms fused, 17x,
+    as the bandwidth model predicted (MEASURED). The fused kernel matched bit for bit on RADV.
+  - MIR dispatches keep the kernel, buffers and domain. Lowering turns them into runtime
+    handles, and the hosts give each dispatch its own compute pass. So only the compiler can
+    fuse.
+  - Ryan's decisions: whether fusion must keep the same bits or only §11.3's GPU tolerance, an
+    output type that can scatter for sparse schedules, and the change to the pipeline count.
+- **8. Synthesis: rejected as an e-graph for now.**
+  - Commutative CSE and repeated CPU cleanup changed sizes by less than 1%. Running the GPU
+    cleanup to a fixed point cut WGSL by 4.1% (herd) and 2.1% (grazer), for 32–108 ms of
+    compile time (MEASURED; GPU time not measured). The CPU inline limit moves WASM size by up
+    to 24%, in different directions for different programs.
+  - Binaryen levels, MEASURED: on wasmtime, herd's CPU simulation was fastest without
+    `wasm-opt`. It was 5.2% slower at `-Oz` and up to 13% slower at other levels. `-Oz` took 24 s
+    on grazer. `-O4` gave the smallest gzip size on grazer (−8%) and wolf (−6.6%). The browser
+    was not measured. The level choice is Ryan's.
+- **`Tape::prune` preparation: a pull request.**
+  - [rywible/wrela-compiler#10](https://github.com/rywible/wrela-compiler/pull/10) finds every
+    register's interval in one pass of `interval` over each operation. It keeps the old prefix
+    derivation where a bound is not finite. Pruned tapes and intervals are bit-identical.
+  - Prune time on 128-operation tapes went from 31.2 µs to 5.57 µs (CSG) and from 142 µs to
+    7.24 µs (dense), MEASURED.
+  - Its Chrome tests could not start Chrome in the agents' sandbox. They also fail there on
+    unchanged `main`, so they need a run from a normal terminal.
+
+The strongest measured results are fusion (17x on a memory-bound chain), sparse updates (42.9x
+at 0.1% changed inputs) and region residuals (6–12x on separated branches). Each is a fixture
+result on one machine, not a frame-rate result. The frame effect follows Amdahl's formula above.
 
 ## Keeping this record
 
