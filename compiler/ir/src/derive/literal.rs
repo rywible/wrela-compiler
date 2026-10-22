@@ -41,7 +41,7 @@ pub fn literal_gradient(
         ));
     }
     let f32_t = m.types.f32();
-    let grads_t = m.types.intern(TypeDef::Array(f32_t, n.max(1)));
+    let grads_t = m.types.intern(TypeDef::Array(f32_t, n));
     // What reads the table, and the copies that take it.
     let readers = match table {
         Some(t) => readers(m, f, t),
@@ -97,7 +97,6 @@ pub fn literal_gradient(
             (v, vec![zero; n as usize])
         }
     };
-    let grads = if grads.is_empty() { vec![zero] } else { grads };
     let g = w.let_(&mut body, grads_t, Expr::Construct(grads_t, grads));
     let out = w.let_(&mut body, ret, Expr::Construct(ret, vec![value, g]));
     body.push(Stmt::Return(Some(out)));
