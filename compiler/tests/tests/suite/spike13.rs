@@ -4,7 +4,7 @@
 //! 90° apart (0 ∉ ⟨□∇f, □∇f⟩), so the surface crosses it as one sheet; else it's split.
 
 use crate::built;
-use wrela_host::{CpuBuild, CpuHost, Value};
+use wrela_host::{CpuHost, Value};
 use wrela_tests::{one_f32, one_u32};
 
 /// An axis-aligned box.
@@ -40,7 +40,7 @@ impl Aabb {
 }
 
 fn host() -> CpuHost {
-    CpuBuild::load(built("spike13")).expect("load").start_with(1).expect("start")
+    crate::cpu_host(&built("spike13"))
 }
 
 fn pv_class(host: &mut CpuHost, fi: u32, b: &Aabb) -> u32 {

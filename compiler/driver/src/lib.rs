@@ -211,20 +211,9 @@ pub struct BuildKind {
 /// `kind` makes it a debug build, a test build, or both. An error if a name isn't one of the
 /// program's packages.
 pub fn build_lifted(root: &Path, lift: &[String], kind: BuildKind) -> Result<Output, String> {
-    on_compiler_thread(|| {
-        let loaded = load(root);
-        if let Some(l) = &loaded.2 {
-            let names: Vec<&str> = l.packages.iter().skip(1).map(|p| p.name.as_str()).collect();
-            if let Some(bad) = lift.iter().map(|n| lift_package(n)).find(|n| !names.contains(n)) {
-                return Err(format!(
-                    "--lift: the program has no package named `{bad}` (it has {})",
-                    names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>().join(", ")
-                ));
-            }
-        }
-        let mode = Mode { debug: kind.debug, testing: kind.testing, ..Mode::RELEASE };
-        Ok(compile_loaded(root, mode, wrela_lower::Roots::of, lift, loaded))
-    })
+    // Unscoped, [`build_in`]'s only error is its `lift:` one, which the command line names
+    // `--lift`.
+    build_in(root, kind, true, lift, &Scope::default()).map_err(|e| format!("--{e}"))
 }
 
 /// What a compile reaches beyond its package, and what stops it: where it may read, where it
@@ -384,6 +373,27 @@ pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     })
 }
 
+/// A new, empty directory of this process's own in the system's temporary directory, named
+/// `<prefix>-<pid>-<n>`, removed when dropped: for a test run's or an optimizer's files.
+pub(crate) struct Scratch(pub std::path::PathBuf);
+
+impl Scratch {
+    pub(crate) fn new(prefix: &str) -> Result<Scratch, String> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("{prefix}-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
+        Ok(Scratch(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// `v` as the JSON files and answers the tools write: pretty, with a newline at the end.
 pub(crate) fn pretty(v: &serde_json::Value) -> String {
     let mut s = serde_json::to_string_pretty(v).expect("JSON values serialize");
@@ -453,7 +463,7 @@ pub fn with_partial_in<T: Send>(
         let mut lowered = None;
         if lower && !has_errors(&diagnostics) {
             let mut data = wrela_lower::BuildData::default();
-            let cache = scope.cache.clone().unwrap_or_else(|| const_cache::dirs_of(root));
+            let cache = scope.cache_of(root);
             prepare(&checked, &sources, &dirs, &mut data, &mut diagnostics, &cache, scope);
             scope.stop()?;
             if !has_errors(&diagnostics) {
@@ -723,22 +733,13 @@ fn compile_with(
     lift: &[String],
     overlay: &Overlay,
 ) -> Output {
-    compile_loaded(root, mode, roots, lift, load_with(root, overlay))
-}
-
-/// [`compile_with`] of the program [`load_with`] read.
-fn compile_loaded(
-    root: &Path,
-    mode: Mode,
-    roots: fn(&wrela_sema::Checked) -> wrela_lower::Roots,
-    lift: &[String],
-    loaded: (SourceMap, Vec<Diagnostic>, Option<Loaded>),
-) -> Output {
+    let loaded = load_with(root, overlay);
     compile_loaded_in(root, mode, roots, lift, loaded, &Scope::default())
         .expect("an unscoped compile isn't cancelled")
 }
 
-/// [`compile_loaded`] within `scope`, which may cancel it between its phases.
+/// A compile of the program [`load_scoped`] read, within `scope`, which may cancel it between
+/// its phases.
 fn compile_loaded_in(
     root: &Path,
     mode: Mode,
@@ -1173,7 +1174,8 @@ impl Loader {
         // The manifest, if there is one: shown in diagnostics by its path in the package.
         let prefix = if program { String::new() } else { format!("[{}] ", name.unwrap_or("?")) };
         let manifest_path = dir.join("wrela.toml");
-        let cached = self.manifests.iter().find(|m| m.0 == canon.join("wrela.toml"));
+        let canon_manifest = canon.join("wrela.toml");
+        let cached = self.manifests.iter().find(|m| m.0 == canon_manifest);
         let manifest = if let Some((_, m)) = cached {
             // Read already, as a workspace's or a member's: its errors are reported.
             m.clone().unwrap_or_default()
@@ -1182,8 +1184,8 @@ impl Loader {
             match text {
                 Ok(text) => {
                     let f = self.sources.add(display, text);
-                    let parsed = manifest::parse(f, &self.sources.file(f).text.clone());
-                    self.manifests.push((canon.join("wrela.toml"), parsed.clone().ok()));
+                    let parsed = manifest::parse(f, &self.sources.file(f).text);
+                    self.manifests.push((canon_manifest.clone(), parsed.as_ref().ok().cloned()));
                     match parsed {
                         Ok(m) => m,
                         Err(errors) => {
@@ -1207,7 +1209,7 @@ impl Loader {
         };
         // A workspace it declares is checked whether or not a dependency is found through it.
         if manifest.workspace.is_some() {
-            self.workspace(&canon.join("wrela.toml"));
+            self.workspace(&canon_manifest);
         }
         if let Some(w) = manifest.workspace.as_ref().filter(|_| !manifest.package) {
             self.diags.push(
@@ -1391,7 +1393,7 @@ impl Loader {
         let parsed = match self.reach.read_to_string(path) {
             Ok(text) => {
                 let f = self.sources.add(shown, text);
-                manifest::parse(f, &self.sources.file(f).text.clone())
+                manifest::parse(f, &self.sources.file(f).text)
                     .map_err(|errors| self.diags.extend(errors))
                     .ok()
             }

@@ -69,14 +69,10 @@ impl SourceFile {
         // A byte-order mark isn't part of the first line (L2): columns count from after it.
         let mut line_starts = vec![if text.starts_with('\u{feff}') { 3 } else { 0 }];
         let bytes = text.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            match bytes[i] {
-                b'\n' => line_starts.push(i as u32 + 1),
-                b'\r' if bytes.get(i + 1) != Some(&b'\n') => line_starts.push(i as u32 + 1),
-                _ => {}
+        for (i, &b) in bytes.iter().enumerate() {
+            if b == b'\n' || (b == b'\r' && bytes.get(i + 1) != Some(&b'\n')) {
+                line_starts.push(i as u32 + 1);
             }
-            i += 1;
         }
         SourceFile { name: name.into(), text, line_starts }
     }

@@ -83,6 +83,8 @@ pub const IMPORT_AUDIO: &str = "audio";
 pub const IMPORT_TICK: &str = "tick";
 /// The memory, which the module imports, shared (`memory`), and also exports.
 pub const IMPORT_MEMORY: &str = "memory";
+/// The same memory, as the module exports it.
+pub const EXPORT_MEMORY: &str = "memory";
 /// `__worker(thread)`: a helper's thread entry (`memory`'s threads and helpers).
 pub const EXPORT_WORKER: &str = "__worker";
 /// `__audio(thread, task, context)`: renders one quantum of the voice `wrela.audio` started, at
@@ -244,45 +246,22 @@ pub fn pair_id(client: Option<&[u8]>, server: Option<&[u8]>) -> u64 {
 /// The pair id in a module's [`PAIR_SECTION`], if it has one: the module's sections are read
 /// in order, and anything malformed gives `None`.
 pub fn read_pair(wasm: &[u8]) -> Option<u64> {
-    fn leb(b: &[u8], at: &mut usize) -> Option<usize> {
-        let mut x = 0u32;
-        for shift in (0..35).step_by(7) {
-            let byte = *b.get(*at)?;
-            *at += 1;
-            if shift == 28 && byte > 15 {
-                return None;
-            }
-            x |= u32::from(byte & 127) << shift;
-            if byte < 128 {
-                return Some(x as usize);
-            }
-        }
-        None
-    }
-    let mut at = 8;
     if wasm.get(..8)? != b"\0asm\x01\0\0\0" {
         return None;
     }
     let mut pair = None;
-    while at < wasm.len() {
-        let id = wasm[at];
-        at += 1;
-        let size = leb(wasm, &mut at)?;
-        let body = wasm.get(at..at.checked_add(size)?)?;
-        at += size;
+    for section in lines::sections(wasm) {
+        let (id, body) = section?;
         if id != 0 {
             continue;
         }
-        let mut k = 0;
-        let len = leb(body, &mut k)?;
-        if body.get(k..k.checked_add(len)?)? == PAIR_SECTION.as_bytes() {
-            let id: [u8; 8] = body.get(k + len..)?.try_into().ok()?;
-            pair.get_or_insert(u64::from_le_bytes(id));
+        let (name, payload) = lines::custom(body)?;
+        if name == PAIR_SECTION.as_bytes() {
+            pair.get_or_insert(u64::from_le_bytes(payload.try_into().ok()?));
         }
     }
     pair
 }
-pub const EXPORT_MEMORY: &str = "memory";
 
 /// The GPU limits a program can ask for (`wrela.limit(index)`, by index in this order) and the
 /// hosts check commands against. Each host opens its device with the adapter's own limits, so

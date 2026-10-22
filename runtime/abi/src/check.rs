@@ -400,8 +400,8 @@ impl Checker {
                     ));
                 }
             }
+            // A dispatch and a pass start from the empty scope `check` swapped in.
             Command::Dispatch { pipeline, groups, bindings, uniforms } => {
-                self.scope.clear();
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
                 let max = self.limits.max_workgroups_per_dimension;
                 if groups.iter().any(|&g| g > max) {
@@ -412,7 +412,6 @@ impl Checker {
                 }
             }
             Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
-                self.scope.clear();
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
                 self.read_range(op, *arguments, *offset, 12, "reading arguments:")?;
             }
@@ -433,7 +432,6 @@ impl Checker {
                 {
                     return err("the clear depth isn't from 0 to 1".into());
                 }
-                self.scope.clear();
                 self.attachments.clear();
                 let mut size = if pass.color == SCREEN { self.screen_size } else { None };
                 for t in [pass.color, pass.depth] {

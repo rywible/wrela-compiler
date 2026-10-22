@@ -101,8 +101,6 @@ pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
         .map_err(|e| format!("internal: the generated shader is invalid: {}", e.emit_to_string("")))
 }
 
-/// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
-/// payload of variant `k - 1` among the variants that have one.
 /// How many elements an index into a value of type `t` can reach, when the type says.
 fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
     match types.get(t) {
@@ -112,6 +110,8 @@ fn static_len(types: &ir::Types, t: ir::TypeId) -> Option<u32> {
     }
 }
 
+/// The struct member that holds field `k` of a value of type `t`: for an enum, its tag, or the
+/// payload of variant `k - 1` among the variants that have one.
 fn member(types: &ir::Types, t: ir::TypeId, k: u32) -> u32 {
     match types.get(t) {
         ir::TypeDef::Enum { variants, .. } if k > 0 => {
@@ -181,7 +181,7 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
             helpers_of(cx, g, entries, done)?;
         }
         if !entries.contains(&f) {
-            let func = cx.helper(f)?;
+            let func = cx.build(f, None)?;
             let h = cx.out.functions.append(func, Span::UNDEFINED);
             cx.fns.insert(f, h);
         }
@@ -191,7 +191,7 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
         helpers_of(&mut cx, e.function, &entries, &mut done)?;
     }
     for e in m.entry_points.iter() {
-        let func = cx.function(e)?;
+        let func = cx.build(e.function, Some(e))?;
         let (stage, wg) = match &e.stage {
             ir::Stage::Compute { workgroup_size } => (ShaderStage::Compute, *workgroup_size),
             ir::Stage::Vertex { .. } => (ShaderStage::Vertex, [0; 3]),
@@ -386,10 +386,6 @@ impl<'m> Cx<'m> {
         ))
     }
 
-    fn ty_vec4(&mut self) -> Handle<Type> {
-        self.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 })
-    }
-
     fn ty_inner(&mut self, inner: TypeInner) -> Handle<Type> {
         self.out.types.insert(Type { name: None, inner }, Span::UNDEFINED)
     }
@@ -417,15 +413,8 @@ impl<'m> Cx<'m> {
         }
     }
 
-    fn function(&mut self, entry: &'m ir::EntryPoint) -> R<Function> {
-        self.build(entry.function, Some(entry))
-    }
-
-    /// A function that stays a call: its parameters, its result, and its body.
-    fn helper(&mut self, f: ir::FuncId) -> R<Function> {
-        self.build(f, None)
-    }
-
+    /// Function `id` as naga's: entry point `entry`, or, for `None`, a function that stays a
+    /// call (its parameters, its result, and its body).
     fn build(&mut self, id: ir::FuncId, entry: Option<&'m ir::EntryPoint>) -> R<Function> {
         let f = &self.m.functions[id.index()];
         let mut func = Function { name: Some(ir::ident(&f.name)), ..Function::default() };
@@ -612,7 +601,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                 let (ct, size) = if *uint {
                     (self.cx.ty_inner(TypeInner::Scalar(Scalar::U32)), 4)
                 } else {
-                    (self.cx.ty_vec4(), 16)
+                    let vec4 = TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 };
+                    (self.cx.ty_inner(vec4), 16)
                 };
                 if *depth {
                     // A `WithDepth`: its colour, and its depth as the fragment's.
@@ -1007,14 +997,14 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             ir::Expr::Param(i) => {
                 // In a fragment shader, parameter 0 is the varyings: rebuild the IR struct.
+                let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
                 if let Some((_, _, vt)) = self.io
                     && let Some(ir::EntryPoint { stage: ir::Stage::Fragment { .. }, .. }) =
                         self.entry
                 {
-                    let arg = self.expr(Expression::FunctionArgument(self.param_base + *i), out);
                     self.rebuild(arg, vt, &mut Vec::new(), out)?
                 } else {
-                    self.expr(Expression::FunctionArgument(self.param_base + *i), out)
+                    arg
                 }
             }
             ir::Expr::EntryInput(i) => {
@@ -1060,7 +1050,6 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.texture(*op, *tex, *sampler, args, out)?
             }
             ir::Expr::Atomic(op, p, args) => {
-                let t = self.f.value_ty(v);
                 self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
@@ -1221,20 +1210,10 @@ impl<'a, 'm> Fb<'a, 'm> {
                     // WGSL's `^` is for integers; on bools it's `!=`.
                     ir::BinOp::BitXor if is_bool => BinaryOperator::NotEqual,
                     ir::BinOp::BitXor => BinaryOperator::ExclusiveOr,
-                    ir::BinOp::And => {
-                        if is_bool {
-                            BinaryOperator::LogicalAnd
-                        } else {
-                            BinaryOperator::And
-                        }
-                    }
-                    ir::BinOp::Or => {
-                        if is_bool {
-                            BinaryOperator::LogicalOr
-                        } else {
-                            BinaryOperator::InclusiveOr
-                        }
-                    }
+                    ir::BinOp::And if is_bool => BinaryOperator::LogicalAnd,
+                    ir::BinOp::And => BinaryOperator::And,
+                    ir::BinOp::Or if is_bool => BinaryOperator::LogicalOr,
+                    ir::BinOp::Or => BinaryOperator::InclusiveOr,
                     ir::BinOp::Eq => BinaryOperator::Equal,
                     ir::BinOp::Ne => BinaryOperator::NotEqual,
                     ir::BinOp::Lt => BinaryOperator::Less,
@@ -1322,9 +1301,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                 // (`ir::gpu_memory`).
                 let types = &self.cx.m.types;
                 if types.field(t, 1).and_then(|b| types.as_scalar(b)) == Some(ir::Scalar::U32) {
-                    let (kind, width) = (ScalarKind::Uint, 4);
+                    let kind = ScalarKind::Uint;
                     stored =
-                        self.expr(Expression::As { expr: stored, kind, convert: Some(width) }, out);
+                        self.expr(Expression::As { expr: stored, kind, convert: Some(4) }, out);
                 }
                 let ty = self.cx.ty(t)?;
                 Some(self.expr(Expression::Compose { ty, components: vec![old, stored] }, out))
@@ -1595,11 +1574,7 @@ mod tests {
             name: "Outer".into(),
             fields: vec![("position".into(), v4), ("inner".into(), inner)],
         });
-        let mut f = ir::Function::new(
-            "fragment",
-            vec![ir::Param { name: "input".into(), ty: outer, by_ref: false, mutable: false }],
-            Some(v4),
-        );
+        let mut f = ir::Function::new("fragment", vec![ir::Param::value("input", outer)], Some(v4));
         let (input, nested, colour) = (f.new_value(outer), f.new_value(inner), f.new_value(v4));
         f.body = vec![
             ir::Stmt::Let(input, ir::Expr::Param(0)),

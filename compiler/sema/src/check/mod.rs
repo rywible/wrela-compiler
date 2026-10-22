@@ -46,13 +46,13 @@ struct PendingMatch {
 /// name, so a lookup doesn't walk every shadowed binding.
 #[derive(Default)]
 struct Env {
-    names: Vec<String>,
+    names: Vec<(String, LocalId)>,
     by_name: HashMap<String, Vec<LocalId>>,
 }
 
 impl Env {
     fn push(&mut self, name: &str, id: LocalId) {
-        self.names.push(name.into());
+        self.names.push((name.into(), id));
         self.by_name.entry(name.into()).or_default().push(id);
     }
 
@@ -62,7 +62,7 @@ impl Env {
 
     /// Forgets the names declared after the first `len`.
     fn truncate(&mut self, len: usize) {
-        for name in self.names.drain(len..) {
+        for (name, _) in self.names.drain(len..) {
             if let Some(ids) = self.by_name.get_mut(&name) {
                 ids.pop();
                 if ids.is_empty() {
@@ -72,13 +72,20 @@ impl Env {
         }
     }
 
+    /// Forgets the names declared after the first `len`, and gives them back in order.
+    fn split_off(&mut self, len: usize) -> Vec<(String, LocalId)> {
+        let gone = self.names[len..].to_vec();
+        self.truncate(len);
+        gone
+    }
+
     /// The innermost local named `name`.
     fn lookup(&self, name: &str) -> Option<LocalId> {
         self.by_name.get(name).and_then(|ids| ids.last()).copied()
     }
 
     fn names(&self) -> impl Iterator<Item = &str> {
-        self.names.iter().map(String::as_str)
+        self.names.iter().map(|(n, _)| n.as_str())
     }
 }
 
@@ -360,11 +367,8 @@ impl<'p> Checker<'p> {
                 d = d.with_help(format!("convert it explicitly: `{e}(...)`")).with_fix_edits(
                     format!("convert it: `{e}(...)`"),
                     vec![
-                        wrela_diag::Edit {
-                            span: span.shrink_to_start(),
-                            replacement: format!("{e}("),
-                        },
-                        wrela_diag::Edit { span: span.shrink_to_end(), replacement: ")".into() },
+                        Edit { span: span.shrink_to_start(), replacement: format!("{e}(") },
+                        Edit { span: span.shrink_to_end(), replacement: ")".into() },
                     ],
                 );
             }
@@ -475,14 +479,7 @@ impl<'p> Checker<'p> {
                 let p = self.check_pat(pat, ty, from_place);
                 self.bound_once(&p);
                 // The `else` block can't see the pattern's names.
-                let bound: Vec<(String, LocalId)> = self
-                    .env
-                    .names()
-                    .skip(env_len)
-                    .map(String::from)
-                    .zip(self.env_ids_after(env_len))
-                    .collect();
-                self.env.truncate(env_len);
+                let bound = self.env.split_off(env_len);
                 let eb = self.check_block(else_, None);
                 if !matches!(self.kind(eb.ty), TyKind::Never | TyKind::Error) {
                     let mut d = Diagnostic::new(
@@ -654,22 +651,6 @@ impl<'p> Checker<'p> {
         Stmt { kind: StmtKind::Assign { place, op: bin, value }, span }
     }
 
-    /// The locals the environment has bound after its first `len` names, in order.
-    fn env_ids_after(&self, len: usize) -> Vec<LocalId> {
-        let names: Vec<&str> = self.env.names().skip(len).collect();
-        // Each name's innermost binding is the one declared last: walk them in reverse.
-        let mut seen: HashMap<&str, usize> = HashMap::new();
-        let mut out = Vec::new();
-        for n in names.iter().rev() {
-            let depth = seen.entry(n).or_insert(0);
-            let ids = &self.env.by_name[*n];
-            out.push(ids[ids.len() - 1 - *depth]);
-            *depth += 1;
-        }
-        out.reverse();
-        out
-    }
-
     /// An assignment writes a place: a local, a field, component or element of one, or what a
     /// `mut` projection-returning call returned. Whether that place may be written is the
     /// memory checker's question; whether it's a place at all is this one.
@@ -703,7 +684,6 @@ impl<'p> Checker<'p> {
         self.err(d);
     }
 
-    /// A loop's body: `break` and `continue` are allowed in it, and it has no value.
     /// `for f in fields(self)` in a `@fieldwise` trait's method: `f` projects each field in
     /// turn, any type with the trait (`trait.fieldwise-walk`). The body is checked once, here;
     /// each type that declares the trait unrolls it over its own fields.
@@ -719,10 +699,10 @@ impl<'p> Checker<'p> {
     ) -> Option<StmtKind> {
         let owner = self.fn_id.map(|f| self.p.func(f).owner);
         let walk = match owner {
-            Some(crate::defs::FnOwner::Trait(t)) => self.p.trait_(t).field_param.map(|g| (t, g)),
+            Some(FnOwner::Trait(t)) => self.p.trait_(t).field_param,
             _ => None,
         };
-        let Some((_, field)) = walk else {
+        let Some(field) = walk else {
             self.err(
                 Diagnostic::new(
                     codes::E0337,
@@ -769,6 +749,7 @@ impl<'p> Checker<'p> {
         Some(StmtKind::ForFields { var, mutable, reverse, body: b })
     }
 
+    /// A loop's body: `break` and `continue` are allowed in it, and it has no value.
     fn check_loop_body(&mut self, body: &ast::Block) -> Block {
         self.loop_depth += 1;
         let b = self.check_block(body, None);
@@ -1193,14 +1174,8 @@ impl<'p> Checker<'p> {
             .iter()
             .map(|p| self.infer.resolve(&self.p.types, self.locals[p.index()].ty))
             .collect();
-        let modes: Vec<Mode> = params
-            .iter()
-            .map(|p| match self.locals[p.index()].kind {
-                LocalKind::Param(m) => m,
-                LocalKind::ClosureParam => Mode::Borrow,
-                _ => Mode::Borrow,
-            })
-            .collect();
+        let modes: Vec<Mode> =
+            params.iter().map(|p| param_mode(self.locals[p.index()].kind)).collect();
         let r = self.infer.resolve(&self.p.types, ret);
         self.p
             .closure_sigs
@@ -1265,6 +1240,15 @@ fn has_break(b: &Block) -> bool {
     }) || b.tail.as_ref().is_some_and(|t| in_expr(t))
 }
 
+/// The mode a closure's parameter of local kind `kind` takes its argument in: a `Param`'s own,
+/// else by borrow.
+pub(crate) fn param_mode(kind: LocalKind) -> Mode {
+    match kind {
+        LocalKind::Param(m) => m,
+        _ => Mode::Borrow,
+    }
+}
+
 /// The local a place expression is rooted at, through `mut` and `take` markers.
 pub fn root_local(e: &Expr) -> Option<LocalId> {
     match &e.place_root().kind {
@@ -1282,8 +1266,6 @@ pub struct FnCheck {
     pub incomplete: bool,
 }
 
-/// Checks one function's body. `body` is `None` when there's no body to check (a required
-/// trait method, or a std intrinsic).
 /// E0400 for each struct or enum in `ty` whose arguments don't have its generics' bounds
 /// (`S<i32>` where `struct S<T: Tr>`): no such type can exist, and its fields' types (`T::K`)
 /// can't be found. Arguments not inferred yet are left to the obligations of the code that
@@ -1428,6 +1410,8 @@ fn check_borrow_structs(p: &Program) -> Vec<Diagnostic> {
     out
 }
 
+/// Checks one function's body. `body` is `None` when there's no body to check (a required
+/// trait method, or a std intrinsic).
 pub fn check_fn(p: &Program, consts: &ConstTypes, f: FnId) -> FnCheck {
     let def = p.func(f);
     if def.derived.is_some() {

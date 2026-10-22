@@ -245,6 +245,11 @@ impl Rewriter<'_> {
         self.val(out, u32t, Expr::Convert(x, Scalar::U32))
     }
 
+    /// `x`, member `k` of a value of type `t`, as memory holds it: a `bool` member as its word.
+    fn member_word(&mut self, t: TypeId, k: u32, x: ValueId, out: &mut Block) -> ValueId {
+        if self.tm.bool_member(&self.m.types, t, k) { self.bool_to_word(x, out) } else { x }
+    }
+
     fn is_words(&self, t: TypeId) -> bool {
         self.tm.words.contains(&t)
     }
@@ -514,17 +519,8 @@ impl Rewriter<'_> {
                 self.extract_dyn(x, t, i, out)
             }
             Expr::Construct(t, xs) => {
-                let xs = xs
-                    .into_iter()
-                    .zip(0..)
-                    .map(|(x, k)| {
-                        if self.tm.bool_member(&self.m.types, t, k) {
-                            self.bool_to_word(x, out)
-                        } else {
-                            x
-                        }
-                    })
-                    .collect();
+                let xs =
+                    xs.into_iter().zip(0..).map(|(x, k)| self.member_word(t, k, x, out)).collect();
                 Expr::Construct(self.stored(t), xs)
             }
             Expr::Variant(t, v, payload) if self.is_words(t) => self.variant(t, v, payload, out),
@@ -535,13 +531,7 @@ impl Rewriter<'_> {
                 Expr::Construct(st, vec![tag])
             }
             Expr::Variant(t, v, payload) => {
-                let payload = payload.map(|x| {
-                    if self.tm.bool_member(&self.m.types, t, v + 1) {
-                        self.bool_to_word(x, out)
-                    } else {
-                        x
-                    }
-                });
+                let payload = payload.map(|x| self.member_word(t, v + 1, x, out));
                 Expr::Variant(self.stored(t), v, payload)
             }
             Expr::Zero(t) => Expr::Zero(self.stored(t)),
@@ -585,12 +575,9 @@ impl Rewriter<'_> {
                 let spt = self.stored(pt);
                 let whole = self.decode(&words, et, spt, 0, out)?;
                 let whole = self.val(out, spt, whole);
-                let local = self.f.new_local("enum_payload", pt);
-                let root = Place { root: PlaceRoot::Local(local), path: Vec::new() };
+                let root = Place::local(self.f.new_local("enum_payload", pt));
                 out.push(Stmt::Store(root.clone(), whole));
-                let mut part = root.clone();
-                part.path = rest;
-                self.store(part, x, out)?;
+                self.store(Place { path: rest, ..root.clone() }, x, out)?;
                 let updated = self.val(out, spt, Expr::Load(root));
                 (updated, spt, 0)
             };

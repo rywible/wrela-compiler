@@ -13,7 +13,7 @@
 
 use crate::build;
 use crate::consts::{Fault, Item, failure};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use wrela_diag::{Diagnostic, SourceMap, codes, has_errors};
 use wrela_lower::BuildData;
 use wrela_sema::Checked;
@@ -68,13 +68,19 @@ pub fn run(
     if has_errors(&diags) {
         return (Vec::new(), diags);
     }
-    let dir = Scratch::new();
-    for (path, bytes) in &out.files {
-        if let Err(e) = std::fs::write(dir.0.join(path), bytes) {
+    let written = crate::Scratch::new("wrela-test").and_then(|dir| {
+        for (path, bytes) in &out.files {
+            std::fs::write(dir.0.join(path), bytes).map_err(|e| e.to_string())?;
+        }
+        Ok(dir)
+    });
+    let dir = match written {
+        Ok(dir) => dir,
+        Err(e) => {
             diags.push(Diagnostic::internal(format!("writing a test's build: {e}")));
             return (Vec::new(), diags);
         }
-    }
+    };
     let loaded = if full_build {
         wrela_host::CpuBuild::load_metered(&dir.0, fuel)
     } else {
@@ -165,6 +171,8 @@ struct Failed {
 /// The host's error, or its screen too far from its golden.
 enum Why {
     Host(wrela_host::Error),
+    /// Only a GPU frame test has a golden.
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     Golden(String),
 }
 
@@ -251,6 +259,10 @@ fn read_input(
     wrela_host::parse_script(&text).map(Input::Script).map_err(|e| format!("isn't a script: {e}"))
 }
 
+/// A GPU frame test's golden, with the package's root, whether to bless it, and where it may be
+/// read ([`against_golden`]).
+type GoldenAt<'a> = (&'a Golden, &'a Path, bool, &'a crate::reach::Reach);
+
 /// The native host the GPU frame tests of a run share (none yet, or none after one failed):
 /// loading the build and opening the device and its pipelines once.
 #[derive(Default)]
@@ -271,7 +283,7 @@ fn run_gpu(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
-    golden: Option<(&Golden, &Path, bool, &crate::reach::Reach)>,
+    golden: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
     let options = wrela_host::Options {
@@ -304,7 +316,7 @@ fn run_gpu_frames(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
-    golden: Option<(&Golden, &Path, bool, &crate::reach::Reach)>,
+    golden: Option<GoldenAt>,
 ) -> Option<Failed> {
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
@@ -375,7 +387,8 @@ fn against_golden(
 
 /// A golden's path inside the package, with no symbolic link through which reading or blessing
 /// it could escape. The package root itself may have been named through a link.
-fn golden_path(root: &Path, path: &str) -> Result<PathBuf, String> {
+#[cfg(any(feature = "gpu", test))]
+fn golden_path(root: &Path, path: &str) -> Result<std::path::PathBuf, String> {
     if wrela_abi::check::path_problem(path).is_some() {
         return Err(format!(
             "its golden `{path}` must be a path inside the package, with `/` between its parts"
@@ -399,7 +412,7 @@ fn run_gpu(
     _: usize,
     _: u32,
     _: &[wrela_host::Scripted],
-    _: Option<(&Golden, &Path, bool)>,
+    _: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
     let failed = Failed {
@@ -500,27 +513,6 @@ fn run_on(host: &mut wrela_host::CpuHost, i: usize, run: TestRun, input: &Input)
     }
 }
 
-/// A directory of its own for a run's build and storage, removed when dropped.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Scratch {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wrela-test-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::create_dir_all(&dir);
-        Scratch(dir)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,7 +522,7 @@ mod tests {
     fn test_input_stays_inside_its_package() {
         use std::os::unix::fs::symlink;
 
-        let scratch = Scratch::new();
+        let scratch = crate::Scratch::new("wrela-test").expect("a scratch directory");
         let pkg = scratch.0.join("package");
         let outside = scratch.0.join("outside");
         std::fs::create_dir_all(&pkg).expect("package");
@@ -562,7 +554,7 @@ mod tests {
     fn a_golden_cannot_escape_the_package_through_a_symbolic_link() {
         use std::os::unix::fs::symlink;
 
-        let scratch = Scratch::new();
+        let scratch = crate::Scratch::new("wrela-test").expect("a scratch directory");
         let pkg = scratch.0.join("package");
         let outside = scratch.0.join("outside");
         std::fs::create_dir_all(&pkg).expect("package");
@@ -581,7 +573,7 @@ mod tests {
     #[cfg(all(unix, feature = "gpu"))]
     #[test]
     fn a_golden_is_read_through_the_roots_alone() {
-        let scratch = Scratch::new();
+        let scratch = crate::Scratch::new("wrela-test").expect("a scratch directory");
         let (root, outside) = (scratch.0.join("root"), scratch.0.join("outside"));
         std::fs::create_dir_all(root.join("package/goldens")).expect("package");
         std::fs::create_dir_all(outside.join("goldens")).expect("outside");

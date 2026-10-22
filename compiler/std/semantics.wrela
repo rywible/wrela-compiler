@@ -9,7 +9,7 @@
 use std::input::Assist
 use std::serialize::{LoadError, Reader, Writer}
 
-/// What a node is.
+/// What a node is. Its discriminant is its byte in `structure`.
 pub enum Role: Copy + Eq {
     /// Nodes that belong together, or none in particular.
     Group,
@@ -50,6 +50,7 @@ pub enum Role: Copy + Eq {
 }
 
 /// What a field holds: the host shows the matching keyboard, and fills it from what it knows.
+/// Its discriminant is its byte in `structure`.
 pub enum FieldKind: Copy + Eq {
     Text,
     Password,
@@ -127,46 +128,6 @@ pub struct FieldState: Clone + Eq {
     pub compose_end: u32,
 }
 
-fn role_byte(r: Role) -> u8 {
-    match r {
-        Role::Group => 0,
-        Role::Button => 1,
-        Role::ListBox => 2,
-        Role::Option => 3,
-        Role::Heading => 4,
-        Role::Text => 5,
-        Role::Link => 6,
-        Role::Code => 7,
-        Role::Field => 8,
-        Role::Checkbox => 9,
-        Role::Switch => 10,
-        Role::Slider => 11,
-        Role::TabList => 12,
-        Role::Tab => 13,
-        Role::TabPanel => 14,
-        Role::Dialog => 15,
-        Role::Menu => 16,
-        Role::MenuItem => 17,
-        Role::Table => 18,
-        Role::Row => 19,
-        Role::Cell => 20,
-        Role::Separator => 21,
-    }
-}
-
-fn kind_byte(k: FieldKind) -> u8 {
-    match k {
-        FieldKind::Text => 0,
-        FieldKind::Password => 1,
-        FieldKind::Email => 2,
-        FieldKind::Search => 3,
-        FieldKind::Url => 4,
-        FieldKind::Tel => 5,
-        FieldKind::Numeric => 6,
-        FieldKind::Multiline => 7,
-    }
-}
-
 /// The tree's structure as the host reads it (`semantics/tree`): its name, then each node in
 /// reading order, a parent before its children.
 pub fn structure(name: str, nodes: [Node]) -> Vec<u8> {
@@ -176,7 +137,7 @@ pub fn structure(name: str, nodes: [Node]) -> Vec<u8> {
     for n in nodes {
         w.write_u32(n.id)
         w.write_u32(n.parent)
-        w.write_u8(role_byte(n.role))
+        w.write_u8(u8(u32(n.role)))
         var flags = 0
         if n.pressed { flags = flags | 1 }
         if n.selected { flags = flags | 2 }
@@ -194,7 +155,7 @@ pub fn structure(name: str, nodes: [Node]) -> Vec<u8> {
         match n.field {
             Some(f) => {
                 w.write_u8(1)
-                w.write_u8(kind_byte(f.kind))
+                w.write_u8(u8(u32(f.kind)))
                 w.write_u8(if f.spellcheck { 1 } else { 0 })
                 for x in [f.form, f.replace, f.seen, f.start, f.end] { w.write_u32(x) }
                 w.write_str(f.name.as_str())

@@ -61,9 +61,8 @@ impl Fl<'_, '_> {
         self.cx.checked.program.lang_of_ty(t)
     }
 
-    /// The address of text `s` in the build, and its length.
-    fn text_parts(&mut self, s: &str) -> (ir::ValueId, ir::ValueId) {
-        let (d, n) = self.cx.text_data(self.mb, s);
+    /// The address of constant data `d` in the build, and the `u32` `n`, its length.
+    fn data_parts(&mut self, d: ir::DataId, n: u32) -> (ir::ValueId, ir::ValueId) {
         let data_ty = self.mb.m.data[d.index()].ty;
         let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(data_ty));
         let ptr = self.value(pt, ir::Expr::Addr(ir::Place::root(ir::PlaceRoot::Data(d))));
@@ -71,6 +70,12 @@ impl Fl<'_, '_> {
         let addr = self.value(u, ir::Expr::Mem(ir::MemOp::Addr, vec![ptr]));
         let len = self.u32c(n);
         (addr, len)
+    }
+
+    /// The address of text `s` in the build, and its length.
+    fn text_parts(&mut self, s: &str) -> (ir::ValueId, ir::ValueId) {
+        let (d, n) = self.cx.text_data(self.mb, s);
+        self.data_parts(d, n)
     }
 
     /// A string literal: a `Text`, the address and length of its UTF-8 in the build.
@@ -100,12 +105,7 @@ impl Fl<'_, '_> {
         }
         let t = self.ty(ty, span)?;
         let (d, n) = self.cx.embed_data(self.mb, path)?;
-        let data_ty = self.mb.m.data[d.index()].ty;
-        let pt = self.mb.m.types.intern(ir::TypeDef::Ptr(data_ty));
-        let ptr = self.value(pt, ir::Expr::Addr(ir::Place::root(ir::PlaceRoot::Data(d))));
-        let u = self.u32_ty();
-        let addr = self.value(u, ir::Expr::Mem(ir::MemOp::Addr, vec![ptr]));
-        let len = self.u32c(n);
+        let (addr, len) = self.data_parts(d, n);
         Some(self.value(t, ir::Expr::Construct(t, vec![addr, len])))
     }
 
@@ -309,7 +309,7 @@ impl Fl<'_, '_> {
         }
         if self.cx.is_copy(t) {
             if let Some(v) = self.read(sp) {
-                self.store_mir(dp, v);
+                self.store(dp, v);
             }
             return;
         }
@@ -334,8 +334,7 @@ impl Fl<'_, '_> {
         let elem = |fl: &mut Self, k: usize| fl.cx.lower_ty(fl.mb, *substs.get(k)?, span);
         let arg = |fl: &mut Self, k: usize| fl.arg_value(c.args.get(k)?);
         let mem = |fl: &mut Self, op: M, n: usize, t: Option<ir::TypeId>| -> Option<ir::ValueId> {
-            let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| fl.arg_value(&c.args[k])).collect();
-            let e = ir::Expr::Mem(op, args?);
+            let e = ir::Expr::Mem(op, fl.arg_values(&c.args[..n])?);
             match t {
                 Some(t) => Some(fl.value(t, e)),
                 None => {
@@ -538,7 +537,7 @@ impl Fl<'_, '_> {
                     Lang::ToolActive => (ir::HostOp::ToolActive, 0),
                     _ => (ir::HostOp::ToolDone, 0),
                 };
-                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
+                let args = c.args.get(..n).and_then(|args| self.arg_values(args));
                 self.mb.m.tool |= self.cx.data.role == wrela_sema::defs::Role::Tool;
                 self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args?)));
                 None
@@ -551,8 +550,8 @@ impl Fl<'_, '_> {
                     self.mb.m.tick = true;
                     (ir::HostOp::Tick, 3)
                 };
-                let args: Option<Vec<ir::ValueId>> = (0..n).map(|k| arg(self, k)).collect();
-                self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args?)));
+                let args = self.arg_values(c.args.get(..n)?)?;
+                self.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
                 None
             }
             Lang::DebugBuild => Some(self.konst(ir::Const::Bool(self.cx.data.debug))),
@@ -653,8 +652,8 @@ impl Fl<'_, '_> {
                 };
                 let (va, vb) = (self.read(a), self.read(b));
                 if let (Some(va), Some(vb)) = (va, vb) {
-                    self.store_mir(a, vb);
-                    self.store_mir(b, va);
+                    self.store(a, vb);
+                    self.store(b, va);
                 }
                 None
             }
@@ -662,7 +661,7 @@ impl Fl<'_, '_> {
                 let p = c.args[0].place()?;
                 let old = self.read(p);
                 if let Some(v) = arg(self, 1) {
-                    self.store_mir(p, v);
+                    self.store(p, v);
                 }
                 old
             }
@@ -776,7 +775,7 @@ impl Fl<'_, '_> {
         }
         values.push(Some(self.u32c(quoted)));
         let mut args = Vec::new();
-        for (p, v) in def.params.clone().iter().zip(values) {
+        for (p, v) in def.params.iter().zip(values) {
             let pt = self.cx.concrete(p.ty, &subst);
             let (Some(ty), Some(v)) = (self.cx.lower_ty(self.mb, pt, p.span), v) else { return };
             let (by_ref, _) = crate::ty::param_passing(
@@ -788,7 +787,7 @@ impl Fl<'_, '_> {
             );
             args.push(if by_ref { ir::Arg::Place(self.temp_place(v)) } else { ir::Arg::Value(v) });
         }
-        let key = InstanceKey::Fn { func: f, substs, callables: Vec::new(), resources: Vec::new() };
+        let key = InstanceKey::plain(f, substs);
         let callee = self.cx.instance(self.mb, key, Some((self.id, span)));
         self.emit_call(callee, args);
         self.emit(ir::Stmt::Trap);

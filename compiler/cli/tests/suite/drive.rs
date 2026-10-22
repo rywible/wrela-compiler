@@ -4,7 +4,7 @@
 //! says what and where and skips the later steps that run code, a deadline kills the build's
 //! process, and a killed tool host leaves no build's process behind.
 
-use crate::common::{manifest, package, wrela};
+use crate::common::{group_alive, manifest, package, run, within, wrela};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -441,30 +441,10 @@ fn budgeted(command: Command, budget: &str) -> Command {
     c
 }
 
-/// Runs `command`: its exit code and what it printed.
-fn run(command: &mut Command) -> (Option<i32>, String) {
-    let out = command.output().expect("run wrela tool");
-    let text =
-        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-    (out.status.code(), text)
-}
-
 /// The number after `key ` in `text`'s line that starts with it.
 fn value<'a>(text: &'a str, key: &str) -> &'a str {
     let line = text.lines().find(|l| l.starts_with(key)).unwrap_or_else(|| panic!("{text}"));
     line[key.len()..].trim()
-}
-
-/// Waits up to `bound` for `done`.
-fn within(bound: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let started = Instant::now();
-    while started.elapsed() < bound {
-        if done() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    done()
 }
 
 /// The pids of the driven builds' processes of the tool host `host`: their command lines name it.
@@ -472,15 +452,6 @@ fn driven_by(host: u32) -> Vec<i32> {
     let marker = format!("tool --drive {host}$");
     let out = Command::new("pgrep").args(["-f", &marker]).output().expect("pgrep");
     String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse().ok()).collect()
-}
-
-/// Whether process group `group` still has a process.
-fn group_alive(group: i32) -> bool {
-    Command::new("kill")
-        .args(["-0", &format!("-{group}")])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
 }
 
 #[test]

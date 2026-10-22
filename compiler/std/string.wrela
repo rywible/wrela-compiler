@@ -271,6 +271,19 @@ fn utf8_scalar(byte: fn(u32) -> u32, left: u32) -> Option<(u32, u32)> {
     Some((cp, k + 1))
 }
 
+/// Whether `s` holds all of `needle` from byte `i`.
+fn has_at(s: str, i: u32, needle: str) -> bool {
+    if i > s.len() || s.len() - i < needle.len() {
+        return false
+    }
+    for j in 0..needle.len() {
+        if s.byte(i + j) != needle.byte(j) {
+            return false
+        }
+    }
+    true
+}
+
 /// Whether byte `i` starts a character (the end of the string does too). `i` is inside `s` or
 /// one past it.
 fn is_char_boundary(s: str, i: u32) -> bool {
@@ -304,31 +317,12 @@ impl str {
 
     /// Whether it starts with `prefix`.
     pub fn starts_with(self, prefix: str) -> bool {
-        let n = prefix.len()
-        if n > self.len() {
-            return false
-        }
-        for i in 0..n {
-            if self.byte(i) != prefix.byte(i) {
-                return false
-            }
-        }
-        true
+        has_at(self, 0, prefix)
     }
 
     /// Whether it ends with `suffix`.
     pub fn ends_with(self, suffix: str) -> bool {
-        let n = suffix.len()
-        let m = self.len()
-        if n > m {
-            return false
-        }
-        for i in 0..n {
-            if self.byte(m - n + i) != suffix.byte(i) {
-                return false
-            }
-        }
-        true
+        suffix.len() <= self.len() && has_at(self, self.len() - suffix.len(), suffix)
     }
 
     /// Where `needle` first occurs, in bytes; `None` if it doesn't.
@@ -338,14 +332,7 @@ impl str {
             return None
         }
         for i in 0..m - n + 1 {
-            var hit = true
-            for j in 0..n {
-                if self.byte(i + j) != needle.byte(j) {
-                    hit = false
-                    break
-                }
-            }
-            if hit {
+            if has_at(self, i, needle) {
                 return Some(i)
             }
         }
@@ -383,14 +370,7 @@ impl str {
         let n = sep.len()
         var i = 0
         while n > 0 && i + n <= self.len() {
-            var hit = true
-            for j in 0..n {
-                if self.byte(i + j) != sep.byte(j) {
-                    hit = false
-                    break
-                }
-            }
-            if hit {
+            if has_at(self, i, sep) {
                 out.push((from, i))
                 i += n
                 from = i
@@ -1017,16 +997,7 @@ fn decimals_read_as_the_nearest_f64() {
 
 impl Eq for str {
     fn eq(self, other: str) -> bool {
-        let n = self.len()
-        if n != other.len() {
-            return false
-        }
-        for i in 0..n {
-            if self.byte(i) != other.byte(i) {
-                return false
-            }
-        }
-        true
+        self.len() == other.len() && has_at(self, 0, other)
     }
 }
 

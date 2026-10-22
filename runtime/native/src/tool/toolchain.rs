@@ -24,7 +24,7 @@
 //! budget.
 
 use super::caps::MOST_BYTES;
-use super::services::{Answer, Body, Services, Task, Work};
+use super::services::{Body, Services, Task, Work, err};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -256,15 +256,7 @@ impl Job {
             dir.join(format!("{stem}.err")),
             dir.join(format!("{stem}.go")),
         );
-        struct Files(Vec<PathBuf>);
-        impl Drop for Files {
-            fn drop(&mut self) {
-                for p in &self.0 {
-                    let _ = std::fs::remove_file(p);
-                }
-            }
-        }
-        let _files = Files(vec![out.clone(), err.clone(), go.clone()]);
+        let _files = super::run::Files(vec![out.clone(), err.clone(), go.clone()]);
         let file =
             |p: &Path| std::fs::File::create(p).map_err(|e| format!("`{name}`'s output: {e}"));
         let mut command = super::run::owned_command(s, program, args.to_vec(), &go)?;
@@ -322,14 +314,28 @@ impl Out {
         self.0.extend_from_slice(v.as_bytes());
         self
     }
+
+    /// A count, then each of `items`.
+    pub(crate) fn strs(&mut self, items: &[impl AsRef<str>]) -> &mut Out {
+        self.u32(items.len() as u32);
+        for item in items {
+            self.str(item.as_ref());
+        }
+        self
+    }
 }
 
 /// `text`, at most [`MOST_TEXT`] bytes of it (cut at a character), with a note if it was cut.
 pub(crate) fn bounded(text: &str) -> String {
-    if text.len() <= MOST_TEXT {
+    bounded_to(text, MOST_TEXT)
+}
+
+/// `text`, at most `most` bytes of it (cut at a character), with a note if it was cut.
+pub(crate) fn bounded_to(text: &str, most: usize) -> String {
+    if text.len() <= most {
         return text.to_string();
     }
-    let mut end = MOST_TEXT;
+    let mut end = most;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -364,9 +370,7 @@ fn strs(b: &mut Body) -> Result<Vec<String>, String> {
 /// How request `name` of the toolchain, with `b`, is carried out.
 pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
     let Some(service) = &s.toolchain else {
-        return Work::Now(Answer::Bytes(
-            b"\x01this tool host has no toolchain: `wrela tool` gives one".to_vec(),
-        ));
+        return Work::Now(err("this tool host has no toolchain: `wrela tool` gives one"));
     };
     let toolchain = service.toolchain.clone();
     let entered = Instant::now();
@@ -378,11 +382,7 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
                 let (optimize, simd, debug) = (b.u8()? != 0, b.u8()? != 0, b.u8()? != 0);
                 let testing = b.u8()? != 0;
                 let lift = strs(b)?;
-                let n = b.u32()?;
-                let mut overrides = Vec::new();
-                for _ in 0..n.min(MOST_BYTES as u32) {
-                    overrides.push((b.str()?, b.str()?));
-                }
+                let overrides = overrides_of(b)?;
                 Op::Build { package, out, optimize, simd, debug, testing, lift, overrides }
             }
             "test" => {
@@ -438,7 +438,7 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
     });
     let (op, deadline) = match deadline {
         Ok(v) => v,
-        Err(why) => return Work::Now(Answer::Bytes([&[1u8][..], why.as_bytes()].concat())),
+        Err(why) => return Work::Now(err(&why)),
     };
     let task: Task = Box::new(move |s, request| {
         let due = entered + deadline;
@@ -560,7 +560,7 @@ fn carry_out(
     let _ = s.stuck.set(format!(
         "the toolchain's work for request {request} didn't stop within {grace:?} of being cancelled"
     ));
-    s.strays.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
+    crate::locked(&s.strays).push(thread);
     Err(why)
 }
 
@@ -573,21 +573,15 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
             let dir = caps.dir_path(&package, false)?;
             // The output's root is a write root, checked before any work.
             caps.writable(&into)?;
-            let mut options =
-                BuildOptions { optimize, lift, simd, debug, testing, overrides: Vec::new() };
-            for (name, path) in overrides {
-                options.overrides.push((name, caps.dir_path(&path, false)?));
-            }
+            let overrides = override_dirs(caps, overrides)?;
+            let options = BuildOptions { optimize, lift, simd, debug, testing, overrides };
             let built = toolchain.build(job, &dir, &options)?;
             if job.cancelled() {
                 return Err(CANCELLED.into());
             }
             let ok = !built.diagnostics.iter().any(|d| d.error);
             let written = write_build(s, job, toolchain, &into, &built.files, ok)?;
-            out.u8(u8::from(ok)).u32(written.len() as u32);
-            for f in &written {
-                out.str(f);
-            }
+            out.u8(u8::from(ok)).strs(&written);
             write_diagnostics(&mut out, &built.diagnostics);
             out.u32(built.consts.0).u32(built.consts.1);
         }
@@ -618,11 +612,7 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
         }
         Op::Fmt { paths, check } => {
             let (changed, failed) = format(s, job, toolchain, &paths, check)?;
-            out.u32(changed.len() as u32);
-            for p in &changed {
-                out.str(p);
-            }
-            out.u32(failed.len() as u32);
+            out.strs(&changed).u32(failed.len() as u32);
             for (p, why) in &failed {
                 out.str(p).str(&bounded(why));
             }
@@ -667,11 +657,7 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
                 roots.push(lifted.root_path(p)?);
             }
             let values = toolchain.literal_values(&lifted.report, &|p| lifted.read(p))?;
-            out.u32(roots.len() as u32);
-            for r in &roots {
-                out.str(r);
-            }
-            out.u32(built.len() as u32);
+            out.strs(&roots).u32(built.len() as u32);
             for x in built {
                 out.u32(x.to_bits());
             }

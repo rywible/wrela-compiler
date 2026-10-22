@@ -14,12 +14,7 @@ use wrela_sema::ty::ConstId;
 /// The bytes of a `String`'s value (a `Vec<u8>`'s: its bytes, length and capacity).
 pub(crate) fn string_of(v: &Value) -> Option<String> {
     let Value::Parts(s) = v else { return None };
-    let Value::Parts(vec) = s.first()? else { return None };
-    match vec.first()? {
-        Value::Bytes(b) => String::from_utf8(b.clone()).ok(),
-        Value::Points(p) if p.is_empty() => Some(String::new()),
-        _ => None,
-    }
+    String::from_utf8(bytes_of(s.first()?)?).ok()
 }
 
 /// The elements of a `Vec`'s value.

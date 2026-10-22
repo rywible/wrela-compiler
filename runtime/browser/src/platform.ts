@@ -4,10 +4,9 @@ import { glyph, type Paper } from "./glyph.ts";
 import type { Listener } from "./listen.ts";
 import type { Bytes } from "./stream.ts";
 import type { Semantics } from "./semantics.ts";
-import { Reader, Writer } from "./wire.ts";
+import { Reader, UTF8, Writer } from "./wire.ts";
 
 export const MESSAGE_LIMIT = 1024 * 1024 - 512;
-const DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const ENCODER = new TextEncoder();
 
 /** The longest address or link a program may give (`nav/*`). */
@@ -55,14 +54,14 @@ export const wordAt = (b: Bytes): number => {
 export function exportName(body: Bytes): { name: string; offset: number } {
   const n = wordAt(body);
   if (n > 240 || body.length < 4 + n) throw new Error("invalid export filename");
-  const name = DECODER.decode(body.subarray(4, 4 + n));
+  const name = UTF8.decode(body.subarray(4, 4 + n));
   if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name)) throw new Error("invalid export filename");
   return { name, offset: 4 + n };
 }
 // One of the page's icons, `rel size path`: a square PNG the build shipped, under `files/`.
 const ICON = /^(icon|apple-touch-icon) ([1-9][0-9]{0,3}) (files\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\/[A-Za-z0-9_-][A-Za-z0-9_.-]*\.png)$/;
 export function iconLink(body: Bytes, base: string): { rel: string; sizes: string; href: string } {
-  const match = ICON.exec(DECODER.decode(body));
+  const match = ICON.exec(UTF8.decode(body));
   if (!match || Number(match[2]) > 1024) throw new Error("invalid icon");
   const [, rel, size, path] = match;
   return { rel: rel!, sizes: `${size}x${size}`, href: new URL(path!, base).href };
@@ -72,7 +71,6 @@ const checked = (body: unknown): Bytes => {
   return new Uint8Array(body);
 };
 
-/** A bounded request/reply channel. Closing it rejects every outstanding request. */
 /** The environment a program asks for (compiler/std/host.wrela): whether the system asks for reduced
  * motion, the seconds since 1970, the device pixel ratio × 1024, whether this page load is a
  * reload of the tab (its navigation's type), rather than a visit, what this host has, and whether
@@ -140,6 +138,7 @@ async function browserDecode(image: Bytes): Promise<Decoded> {
   } finally { bitmap.close(); }
 }
 
+/** A bounded request/reply channel. Closing it rejects every outstanding request. */
 export class PortRpc {
   #next = 1;
   #closed = false;
@@ -194,7 +193,7 @@ export class PortRpc {
 const SHOWN_NAME = /^[a-z0-9-]{1,64}$/;
 export function shownName(body: Bytes): string | null {
   if (body.length <= 4) return null;
-  const name = DECODER.decode(body.subarray(4));
+  const name = UTF8.decode(body.subarray(4));
   if (!SHOWN_NAME.test(name)) throw new Error("invalid program name");
   return name;
 }
@@ -350,7 +349,7 @@ export class BrowserPlatform {
     if (service === "image/decode") return decodeImage(body, browserDecode);
     if (service === "cursor") {
       // The pointer's shape over the program's canvas: a named CSS cursor, from a short list.
-      const name = DECODER.decode(body);
+      const name = UTF8.decode(body);
       if (!CURSORS.has(name)) throw new Error(`unsupported cursor: ${name.slice(0, 32)}`);
       this.canvas.style.cursor = name; return new Uint8Array();
     }
@@ -367,7 +366,7 @@ export class BrowserPlatform {
     if (service === "clipboard/write") {
       // Text on the system clipboard now, as a person's press asked (a copy button): the browser
       // refuses it without that press, and the program hears why.
-      await navigator.clipboard.writeText(DECODER.decode(body)); return new Uint8Array();
+      await navigator.clipboard.writeText(UTF8.decode(body)); return new Uint8Array();
     }
     if (service === "clipboard/pasted") {
       const pasted = this.#input?.pasted(new Reader(body).u32());
@@ -381,7 +380,7 @@ export class BrowserPlatform {
       if (service === "semantics/geometry") { o.geometry(body); return new Uint8Array(); }
       if (service === "field/state") return o.fieldState(new Reader(body).u32());
       if (service === "form/submit") { o.submit(new Reader(body).u32()); return new Uint8Array(); }
-      if (service === "a11y/announce") { o.announce(DECODER.decode(body)); return new Uint8Array(); }
+      if (service === "a11y/announce") { o.announce(UTF8.decode(body)); return new Uint8Array(); }
     }
     if (service === "font/glyph") return glyph(body, this.paper);
     if (service === "icon") {
@@ -395,8 +394,8 @@ export class BrowserPlatform {
       }
       link.href = href; return new Uint8Array();
     }
-    if (service === "surface/open") return this.#open(DECODER.decode(body));
-    if (service === "prefetch") return prefetch(DECODER.decode(body), document.baseURI, this.#prefetching.signal, fetch);
+    if (service === "surface/open") return this.#open(UTF8.decode(body));
+    if (service === "prefetch") return prefetch(UTF8.decode(body), document.baseURI, this.#prefetching.signal, fetch);
     if (service === "channel/receive") {
       if (!this.#parent) throw new Error("this program has no parent channel");
       if (this.#receiving) throw new Error("a channel receive is already pending");
@@ -418,17 +417,17 @@ export class BrowserPlatform {
         if (this.#navigated) { this.#navigated = false; return here(); }
         return new Promise<Bytes>(resolve => { this.#navigating.add(() => resolve(here())); });
       }
-      const address = sameOriginAddress(DECODER.decode(body), location.href);
+      const address = sameOriginAddress(UTF8.decode(body), location.href);
       if (service === "nav/push") history.pushState(null, "", address);
       else history.replaceState(null, "", address);
       return new Uint8Array();
     }
     if (service === "nav/open") {
       // A new tab with no way back to this page.
-      window.open(linkUrl(DECODER.decode(body)), "_blank", "noopener,noreferrer"); return new Uint8Array();
+      window.open(linkUrl(UTF8.decode(body)), "_blank", "noopener,noreferrer"); return new Uint8Array();
     }
     if (service === "nav/go") {
-      location.assign(sameOriginAddress(DECODER.decode(body), location.href)); return new Uint8Array();
+      location.assign(sameOriginAddress(UTF8.decode(body), location.href)); return new Uint8Array();
     }
     if (service === "keys/find") {
       if (!this.#input) throw new Error("this host has no keys to claim yet");

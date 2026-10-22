@@ -3,7 +3,7 @@
 //! passes (its scratch, fake clock, fake sites and fake program); here, the ways a tool test
 //! fails, each within its budget, and the attribute's rules.
 
-use crate::common::{json, manifest, package, wrela};
+use crate::common::{exit_within, json, manifest, package, walk, within, wrela};
 
 /// A package with a tool build, of `tests` (each a tool test or not).
 fn tool_package(name: &str, tests: &str) -> std::path::PathBuf {
@@ -203,35 +203,6 @@ fn waits_for_its_program() {{
 fn running(marker: &str) -> Vec<String> {
     let out = std::process::Command::new("pgrep").args(["-f", marker]).output().expect("pgrep");
     String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
-}
-
-/// Waits up to `bound` for `done`.
-fn within(bound: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
-    let started = std::time::Instant::now();
-    while started.elapsed() < bound {
-        if done() {
-            return true;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    false
-}
-
-/// Waits for `child` up to `bound`: its exit code, or `None` (and it's killed) past it.
-fn exit_within(child: &mut std::process::Child, bound: std::time::Duration) -> Option<i32> {
-    let mut code = None;
-    let exited = within(bound, || match child.try_wait() {
-        Ok(Some(status)) => {
-            code = status.code();
-            true
-        }
-        _ => false,
-    });
-    if !exited {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-    code
 }
 
 #[test]
@@ -495,18 +466,4 @@ OPEN
         .filter(|l| l.contains(&*tmp.to_string_lossy()))
         .count();
     assert_eq!(named, 0, "no Chrome is left");
-}
-
-/// The files under `dir`, at any depth.
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            out.extend(walk(&p));
-        } else {
-            out.push(p);
-        }
-    }
-    out
 }

@@ -30,6 +30,13 @@ enum Root {
     Value(ir::ValueId),
 }
 
+impl Root {
+    /// The root of element place `p`: the place without its index.
+    fn of(p: &ir::Place) -> Root {
+        Root::Place(ir::Place::root(p.root.clone()))
+    }
+}
+
 /// A loop that runs four iterations at a time.
 pub(super) struct Plan<'a> {
     /// The counter's WASM local.
@@ -196,7 +203,6 @@ impl Planner<'_, '_> {
         if *i != self.index {
             return None;
         }
-        let root = ir::Place { root: p.root.clone(), path: Vec::new() };
         let ty = match &p.root {
             ir::PlaceRoot::Local(l) if *l != self.ctr && !self.temps.contains(l) => {
                 self.fe.f.locals[l.index()].ty
@@ -206,7 +212,7 @@ impl Planner<'_, '_> {
             }
             _ => return None,
         };
-        self.element(Root::Place(root), ty)
+        self.element(Root::of(p), ty)
     }
 
     fn check(&mut self, body: &[&ir::Stmt]) -> Option<()> {
@@ -402,8 +408,7 @@ pub(super) fn emit(fe: &mut Fe, plan: &Plan) -> R<()> {
                     fe.ins.push(I::LocalSet(t));
                 }
                 _ => {
-                    let root = Root::Place(ir::Place { root: p.root.clone(), path: Vec::new() });
-                    element_addr(fe, plan, &bases, &root)?;
+                    element_addr(fe, plan, &bases, &Root::of(p))?;
                     push(fe, &vals, *x)?;
                     fe.ins.push(I::V128Store(mem(0, 2)));
                 }
@@ -479,8 +484,7 @@ fn expr(
                 LocalRepr::Slot(_) => return Err("internal: a planned load from memory".into()),
             },
             _ => {
-                let root = Root::Place(ir::Place { root: p.root.clone(), path: Vec::new() });
-                element_addr(fe, plan, bases, &root)?;
+                element_addr(fe, plan, bases, &Root::of(p))?;
                 fe.ins.push(I::V128Load(mem(0, 2)));
             }
         },

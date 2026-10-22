@@ -165,20 +165,9 @@ impl<'p> Checker<'p> {
                         xs.len() as u32
                     }
                 };
-                let ft = self.infer.resolve(&self.p.types, f.ty);
-                if self.p.types.has_vars(ft) {
-                    if let Some(copy) = self.p.lang_trait(Lang::Copy) {
-                        let r = crate::defs::TraitRef { trait_: copy, args: Vec::new() };
-                        self.obligation(ft, r, f.span, "`..fill`, which copies the fill,".into());
-                    }
-                } else if !crate::traits::implements_builtin(self.p, ft, Lang::Copy) {
-                    let shown = self.display(f.ty);
-                    self.err(Diagnostic::new(
-                        codes::E0400,
-                        f.span,
-                        format!("`..fill` copies the fill to each place left, so it must be `Copy`, and `{shown}` isn't"),
-                    ));
-                }
+                self.require_copy(f.ty, f.span, "`..fill`, which copies the fill,", |shown| {
+                    format!("`..fill` copies the fill to each place left, so it must be `Copy`, and `{shown}` isn't")
+                });
                 let ty = self.p.types.array(elem, n);
                 Expr { ty, span, kind: ExprKind::ArrayFill(xs, Box::new(f), n) }
             }
@@ -228,21 +217,9 @@ impl<'p> Checker<'p> {
                         0
                     }
                 };
-                let vt = self.infer.resolve(&self.p.types, v.ty);
-                if self.p.types.has_vars(vt) {
-                    // Decided once inference is done.
-                    if let Some(copy) = self.p.lang_trait(Lang::Copy) {
-                        let r = crate::defs::TraitRef { trait_: copy, args: Vec::new() };
-                        self.obligation(vt, r, v.span, "`[x; n]`, which copies `x`,".into());
-                    }
-                } else if !crate::traits::implements_builtin(self.p, vt, Lang::Copy) {
-                    let shown = self.display(v.ty);
-                    self.err(Diagnostic::new(
-                        codes::E0400,
-                        v.span,
-                        format!("`[x; n]` copies `x`, so it must be `Copy`, and `{shown}` isn't"),
-                    ));
-                }
+                self.require_copy(v.ty, v.span, "`[x; n]`, which copies `x`,", |shown| {
+                    format!("`[x; n]` copies `x`, so it must be `Copy`, and `{shown}` isn't")
+                });
                 let ty = match param_len {
                     Some(g) => self.p.types.intern(TyKind::ArrayN(v.ty, self.p.types.param(g))),
                     None => self.p.types.array(v.ty, n),
@@ -310,6 +287,22 @@ impl<'p> Checker<'p> {
                 self.saw_syntax_error = true;
                 self.error_expr(span)
             }
+        }
+    }
+
+    /// A value of type `ty` at `span` that's copied must be `Copy`: an obligation while its type
+    /// isn't known (needed by `why`), else E0400 with `msg` of its type if it isn't.
+    fn require_copy(&mut self, ty: TyId, span: Span, why: &str, msg: impl FnOnce(&str) -> String) {
+        let t = self.infer.resolve(&self.p.types, ty);
+        if self.p.types.has_vars(t) {
+            // Decided once inference is done.
+            if let Some(copy) = self.p.lang_trait(Lang::Copy) {
+                let r = TraitRef { trait_: copy, args: Vec::new() };
+                self.obligation(t, r, span, why.into());
+            }
+        } else if !crate::traits::implements_builtin(self.p, t, Lang::Copy) {
+            let shown = self.display(ty);
+            self.err(Diagnostic::new(codes::E0400, span, msg(&shown)));
         }
     }
 
@@ -460,12 +453,10 @@ impl<'p> Checker<'p> {
             if let Some(r) = resolve::lookup_name(self.p, self.scope.module, &first.name) {
                 return Some(ValueRes::Item(r));
             }
-            if let Some(g) = self.scope.param(&first.name)
-                && self.p.param(g).is_const
-            {
-                return Some(ValueRes::ConstParam(g));
-            }
-            if self.scope.param(&first.name).is_some() {
+            if let Some(g) = self.scope.param(&first.name) {
+                if self.p.param(g).is_const {
+                    return Some(ValueRes::ConstParam(g));
+                }
                 self.err(Diagnostic::new(
                     codes::E0212,
                     first.span,
@@ -502,11 +493,7 @@ impl<'p> Checker<'p> {
                 return None;
             }
             if segs[0].generics.is_some() {
-                self.err(Diagnostic::new(
-                    codes::E0322,
-                    first.span,
-                    format!("`{}` takes no generic arguments", first.name),
-                ));
+                self.err(resolve::no_generics(first));
             }
             let base = if first.name == "Self" {
                 match self.scope.self_ty {
@@ -546,28 +533,11 @@ impl<'p> Checker<'p> {
                 {
                     match r {
                         Res::Adt(a) => {
-                            let params = self.p.adt(a).generics.clone();
-                            let n = params.len();
-                            let args: Vec<TyId> = match &segs[segs.len() - 2].generics {
-                                Some(g) if g.len() == n => g
-                                    .iter()
-                                    .zip(&params)
-                                    .map(|(t, &param)| self.resolve_generic_arg(t, param))
-                                    .collect(),
-                                Some(g) => {
-                                    let name = &self.p.adt(a).name;
-                                    self.err(resolve::wrong_generic_count(
-                                        path.span,
-                                        name,
-                                        n,
-                                        g.len(),
-                                    ));
-                                    (0..n).map(|_| self.p.types.error).collect()
-                                }
-                                None => (0..n)
-                                    .map(|_| self.new_var(VarKind::General, path.span))
-                                    .collect(),
-                            };
+                            let adt = self.p.adt(a);
+                            let given = segs[segs.len() - 2].generics.as_deref();
+                            let args = self
+                                .given_args(&adt.generics, given, &adt.name, path.span)
+                                .unwrap_or_else(|| vec![self.p.types.error; adt.generics.len()]);
                             let ty = self.p.types.adt(a, args);
                             return Some(ValueRes::TypeRelative(ty, last));
                         }
@@ -746,7 +716,7 @@ impl<'p> Checker<'p> {
                 // called.
                 if let &TyKind::Adt(a, _) = self.kind(ty)
                     && self.p.adt(a).is_enum()
-                    && !self.has_associated_fn(a, &name.name)
+                    && self.p.inherent_method(a, &name.name).is_none()
                 {
                     let adt = self.p.adt(a);
                     let mut d = Diagnostic::new(
@@ -798,17 +768,8 @@ impl<'p> Checker<'p> {
     /// deliberately ignores the generic syntax attached to path segments.
     fn reject_const_path_generics(&mut self, path: &ast::Path) -> bool {
         let Some(seg) = path.segments.iter().find(|s| s.generics.is_some()) else { return false };
-        self.err(Diagnostic::new(
-            codes::E0322,
-            seg.ident.span,
-            format!("`{}` takes no generic arguments", seg.ident.name),
-        ));
+        self.err(resolve::no_generics(&seg.ident));
         true
-    }
-
-    /// Whether a type has an inherent associated function or method of this name.
-    pub(crate) fn has_associated_fn(&self, a: AdtId, name: &str) -> bool {
-        self.p.inherent_method(a, name).is_some()
     }
 
     /// An ADT's generic arguments for a path: explicit (`Option::<u32>::None`), or fresh
@@ -820,22 +781,12 @@ impl<'p> Checker<'p> {
         expected: Option<TyId>,
         span: Span,
     ) -> Vec<TyId> {
-        let params = self.p.adt(a).generics.clone();
-        let n = params.len();
+        let adt = self.p.adt(a);
+        let n = adt.generics.len();
         let explicit = path.segments.iter().rev().find_map(|s| s.generics.as_deref());
-        let args: Vec<TyId> = match explicit {
-            Some(g) if g.len() == n => g
-                .iter()
-                .zip(&params)
-                .map(|(t, &param)| self.resolve_generic_arg(t, param))
-                .collect(),
-            Some(g) => {
-                let name = &self.p.adt(a).name;
-                self.err(resolve::wrong_generic_count(span, name, n, g.len()));
-                (0..n).map(|_| self.p.types.error).collect()
-            }
-            None => (0..n).map(|_| self.new_var(VarKind::General, span)).collect(),
-        };
+        let args = self
+            .given_args(&adt.generics, explicit, &adt.name, span)
+            .unwrap_or_else(|| vec![self.p.types.error; n]);
         if let Some(e) = expected
             && let &TyKind::Adt(b, _) = self.kind(e)
             && b == a
@@ -844,11 +795,31 @@ impl<'p> Checker<'p> {
             let _ = self.infer.unify(&self.p.types, ty, e);
         }
         // The arguments must have the generics' bounds (`S { t: 1 }` for `struct S<T: Tr>`).
-        let adt = self.p.adt(a);
         let subst = Subst::from_pairs(&adt.generics, &args);
-        let name = adt.name.clone();
-        self.bound_obligations(&adt.generics, &args, &subst, &vec![span; n], &name);
+        self.bound_obligations(&adt.generics, &args, &subst, &vec![span; n], &adt.name);
         args
+    }
+
+    /// The arguments for the generics `params` of the item `name`: the types `given` with
+    /// `::<...>`, or fresh variables when none are. `None` when the wrong number are given
+    /// (E0322, reported at `span`).
+    pub(crate) fn given_args(
+        &mut self,
+        params: &[ParamId],
+        given: Option<&[ast::TypeExpr]>,
+        name: &str,
+        span: Span,
+    ) -> Option<Vec<TyId>> {
+        match given {
+            Some(g) if g.len() == params.len() => {
+                Some(g.iter().zip(params).map(|(t, &q)| self.resolve_generic_arg(t, q)).collect())
+            }
+            Some(g) => {
+                self.err(resolve::wrong_generic_count(span, name, params.len(), g.len()));
+                None
+            }
+            None => Some(params.iter().map(|_| self.new_var(VarKind::General, span)).collect()),
+        }
     }
 
     /// Fresh variables (or turbofish types) for all of a function's generics.
@@ -1079,23 +1050,13 @@ impl<'p> Checker<'p> {
         } else {
             bool_ty
         };
-        let call = Expr {
-            ty: ret,
-            span,
-            kind: ExprKind::Call(Call {
-                callee: Callee::TraitMethod {
-                    method,
-                    self_ty,
-                    trait_args: Vec::new(),
-                    method_args: Vec::new(),
-                },
-                args: vec![a, b],
-                modes: vec![Mode::Borrow, Mode::Borrow],
-                order: vec![0, 1],
-                receiver: true,
-                ret_mode: RetMode::Owned,
-            }),
+        let callee = Callee::TraitMethod {
+            method,
+            self_ty,
+            trait_args: Vec::new(),
+            method_args: Vec::new(),
         };
+        let call = plain_call(callee, vec![a, b], true, ret, span);
         if !ordered {
             return Ok(if op == BinOp::Eq {
                 call
@@ -1113,19 +1074,7 @@ impl<'p> Checker<'p> {
         let TyKind::Adt(ordering, _) = *self.kind(ret) else {
             return Err(Box::new((call, self.error_expr(span))));
         };
-        let k = Expr {
-            ty: ret,
-            span,
-            kind: ExprKind::Adt {
-                adt: ordering,
-                args: Vec::new(),
-                variant: Some(variant),
-                fields: Vec::new(),
-                order: Vec::new(),
-                base: None,
-                literal: false,
-            },
-        };
+        let k = variant_expr(ret, span, ordering, Vec::new(), variant, Vec::new());
         Ok(Expr { ty: bool_ty, span, kind: ExprKind::Binary(test, Box::new(call), Box::new(k)) })
     }
 
@@ -1623,18 +1572,8 @@ impl<'p> Checker<'p> {
         let ty = self.p.types.adt(gf, vec![outer, ft]);
         // The field's index is a type argument, so lowering knows it as it does the types.
         let k = self.p.types.intern(TyKind::ConstU32(i as u32));
-        Expr {
-            ty,
-            span,
-            kind: ExprKind::Call(Call {
-                callee: Callee::Fn { func: at, args: vec![outer, inner, ft, k] },
-                args: vec![f],
-                modes: vec![Mode::Borrow],
-                order: vec![0],
-                receiver: false,
-                ret_mode: RetMode::Owned,
-            }),
-        }
+        let callee = Callee::Fn { func: at, args: vec![outer, inner, ft, k] };
+        plain_call(callee, vec![f], false, ty, span)
     }
 
     fn check_index(&mut self, base: &ast::Expr, index: &ast::Expr, span: Span) -> Expr {
@@ -1839,22 +1778,9 @@ impl<'p> Checker<'p> {
         if def.defined_by.is_some() {
             return None;
         }
-        let (generics, ty) = (def.generics.clone(), def.ty);
         let given = path.segments.last().and_then(|s| s.generics.as_deref());
-        let args: Vec<TyId> = match given {
-            Some(g) if g.len() == generics.len() => g
-                .iter()
-                .zip(&generics)
-                .map(|(t, &param)| self.resolve_generic_arg(t, param))
-                .collect(),
-            Some(g) => {
-                let name = self.p.aliases[al.index()].name.clone();
-                self.err(resolve::wrong_generic_count(span, &name, generics.len(), g.len()));
-                return None;
-            }
-            None => generics.iter().map(|_| self.new_var(VarKind::General, span)).collect(),
-        };
-        let t = self.p.types.subst(ty, &Subst::from_pairs(&generics, &args));
+        let args = self.given_args(&def.generics, given, &def.name, span)?;
+        let t = self.p.types.subst(def.ty, &Subst::from_pairs(&def.generics, &args));
         match self.kind(t) {
             TyKind::Adt(a, args) if !self.p.adt(*a).is_enum() => Some((*a, args.clone())),
             _ => None,
@@ -1915,18 +1841,16 @@ impl<'p> Checker<'p> {
     /// `v`, a `u32`, fitted to `width` bits of a `Packed` field and moved to `shift` (§3).
     pub(crate) fn packed_bits(&self, v: Expr, width: u32, shift: u32, span: Span) -> Expr {
         let fit = match self.p.lang_fn(Lang::PackedFit) {
-            Some(func) if width < 32 => Expr {
-                ty: self.p.types.u32,
-                span,
-                kind: ExprKind::Call(Call {
-                    callee: Callee::Fn { func, args: Vec::new() },
-                    args: vec![v, self.u32_lit(u64::from(width), span)],
-                    modes: vec![Mode::Borrow, Mode::Borrow],
-                    receiver: false,
-                    order: vec![0, 1],
-                    ret_mode: RetMode::Owned,
-                }),
-            },
+            Some(func) if width < 32 => {
+                let args = vec![v, self.u32_lit(u64::from(width), span)];
+                plain_call(
+                    Callee::Fn { func, args: Vec::new() },
+                    args,
+                    false,
+                    self.p.types.u32,
+                    span,
+                )
+            }
             _ => v,
         };
         if shift == 0 {
@@ -1970,11 +1894,10 @@ impl<'p> Checker<'p> {
                 Some(v) => self.check_expect(v, u),
                 // `S { x }`: the local of the field's name.
                 None => {
-                    let path = ast::Path {
-                        segments: vec![ast::PathSegment { ident: f.name.clone(), generics: None }],
+                    let e = ast::Expr {
+                        kind: ast::ExprKind::Path(name_path(&f.name)),
                         span: f.name.span,
                     };
-                    let e = ast::Expr { kind: ast::ExprKind::Path(path), span: f.name.span };
                     self.check_expect(&e, u)
                 }
             };
@@ -2178,14 +2101,8 @@ impl<'p> Checker<'p> {
             let expect = fn_bound.unwrap_or(fty);
             let value = match &f.value {
                 Some(v) => self.check_expr(v, Some(expect)),
-                None => {
-                    // `S { time }`: the local `time`.
-                    let p = ast::Path {
-                        segments: vec![ast::PathSegment { ident: f.name.clone(), generics: None }],
-                        span: f.name.span,
-                    };
-                    self.check_path_expr(&p, Some(expect), f.name.span)
-                }
+                // `S { time }`: the local `time`.
+                None => self.check_path_expr(&name_path(&f.name), Some(expect), f.name.span),
             };
             if let Some(b) = fn_bound {
                 match *self.kind(value.ty) {
@@ -2447,12 +2364,9 @@ impl<'p> Checker<'p> {
                     let x = self.check_expr(expr, None);
                     let r = TraitRef { trait_: format, args: Vec::new() };
                     let shown = self.display(x.ty);
-                    if !self.p.types.has_vars(self.infer.resolve(&self.p.types, x.ty))
-                        && !crate::traits::implements(
-                            self.p,
-                            self.infer.resolve(&self.p.types, x.ty),
-                            &r,
-                        )
+                    let xt = self.infer.resolve(&self.p.types, x.ty);
+                    if !self.p.types.has_vars(xt)
+                        && !crate::traits::implements(self.p, xt, &r)
                         && !matches!(self.kind(x.ty), TyKind::Error)
                     {
                         self.err(
@@ -2477,11 +2391,7 @@ impl<'p> Checker<'p> {
                         }
                     };
                     let spec_ty = p.types.adt(spec_adt, Vec::new());
-                    let u32_lit = |v: u32| Expr {
-                        ty: p.types.u32,
-                        span: *hole,
-                        kind: ExprKind::Lit(Lit::Int(i128::from(v))),
-                    };
+                    let u32_lit = |v: u32| self.u32_lit(u64::from(v), *hole);
                     let bool_lit = |b: bool| Expr {
                         ty: p.types.bool,
                         span: *hole,
@@ -2632,8 +2542,7 @@ impl<'p> Checker<'p> {
         let value_ty = args[0];
         let from_place = x.is_place();
         let declare = |c: &mut Self, name: &str, ty: TyId| {
-            let kind =
-                super::pat::binding_kind_of(c.p, c.infer.resolve(&c.p.types, ty), from_place);
+            let kind = super::pat::binding_kind(c.p, c.infer.resolve(&c.p.types, ty), from_place);
             let id = c.declare_unnamed(ty, kind, x.span);
             c.locals[id.index()].name = name.into();
             id
@@ -2678,20 +2587,7 @@ impl<'p> Checker<'p> {
             },
             span: x.span,
         };
-        let order = (0..ret_fields.len() as u32).collect();
-        let ret_value = Expr {
-            ty: ret_ty,
-            span,
-            kind: ExprKind::Adt {
-                adt,
-                args: ret_args,
-                variant: Some(err_variant),
-                fields: ret_fields,
-                order,
-                base: None,
-                literal: false,
-            },
-        };
+        let ret_value = variant_expr(ret_ty, span, adt, ret_args, err_variant, ret_fields);
         let never = self.p.types.never;
         let ret = Expr { ty: never, span, kind: ExprKind::Return(Some(Box::new(ret_value))) };
         let arms = vec![
@@ -2708,7 +2604,7 @@ impl<'p> Checker<'p> {
     fn check_return(&mut self, value: Option<&ast::Expr>, span: Span) -> Expr {
         let target = self.closure_ret().unwrap_or(self.ret_ty);
         let v = match value {
-            Some(v) if matches!(self.kind(target), TyKind::Slice(_) | TyKind::Str) => {
+            Some(v) if self.p.types.is_run(self.shallow(target)) => {
                 // A run result: an array, a `Vec` or a string passes as one.
                 let e = self.check_expr(v, None);
                 if !self.run_coerces(e.ty, target) {
@@ -2819,7 +2715,7 @@ impl<'p> Checker<'p> {
     }
 
     /// The enclosing function's generic parameters, as types (a closure's environment).
-    pub(crate) fn scope_args(&mut self) -> Vec<TyId> {
+    pub(crate) fn scope_args(&self) -> Vec<TyId> {
         match self.fn_id {
             Some(f) => {
                 let gens = self.p.fn_all_generics(f);
@@ -2853,6 +2749,12 @@ pub(super) fn variant_expr(
             literal: false,
         },
     }
+}
+
+/// The path that is `name` alone.
+pub(super) fn name_path(name: &ast::Ident) -> ast::Path {
+    let segments = vec![ast::PathSegment { ident: name.clone(), generics: None }];
+    ast::Path { segments, span: name.span }
 }
 
 /// How one side of `a + b` goes in an f-string: a string literal's text (its braces doubled),

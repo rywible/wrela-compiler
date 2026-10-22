@@ -11,13 +11,24 @@ import tempfile
 import unittest
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
-TOOLS = os.path.dirname(TESTS)
+AGENT_TEST = os.path.join(os.path.dirname(TESTS), "agent-test")
+
+
+def agent_test_json(name):
+    with open(os.path.join(AGENT_TEST, name)) as f:
+        return json.load(f)
+
+
+def score(run):
+    """score.py's report on the run directory `run`."""
+    out = subprocess.run([sys.executable, os.path.join(AGENT_TEST, "score.py"), run],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
 
 
 class ScoreTest(unittest.TestCase):
     def test_partial_attempts_and_stray_files(self):
-        with open(os.path.join(TOOLS, "agent-test", "tasks.json")) as f:
-            first = json.load(f)[0]["id"]
+        first = agent_test_json("tasks.json")[0]["id"]
         with tempfile.TemporaryDirectory() as run:
             attempts = os.path.join(run, first, "attempts")
 
@@ -34,13 +45,7 @@ class ScoreTest(unittest.TestCase):
             write("3", "diagnostics.json", '{"diagnostics": []}')
             with open(os.path.join(attempts, ".DS_Store"), "w") as f:
                 f.write("Finder")
-            out = subprocess.run(
-                [sys.executable, os.path.join(TOOLS, "agent-test", "score.py"), run],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-        report = json.loads(out)
+            report = score(run)
         task = next(p for p in report["per_task"] if p["task"] == first)
         self.assertEqual(task["attempts"], 3)
         self.assertEqual(task["built_at"], 3)
@@ -50,23 +55,16 @@ class ScoreTest(unittest.TestCase):
         self.assertEqual(report["built_eventually"], 1)
 
     def test_attempts_past_the_limit_dont_count(self):
-        with open(os.path.join(TOOLS, "agent-test", "tasks.json")) as f:
-            first = json.load(f)[0]["id"]
-        with open(os.path.join(TOOLS, "agent-test", "config.json")) as f:
-            limit = json.load(f)["max_attempts"]
+        first = agent_test_json("tasks.json")[0]["id"]
+        limit = agent_test_json("config.json")["max_attempts"]
         with tempfile.TemporaryDirectory() as run:
             for n in range(1, limit + 2):
                 at = os.path.join(run, first, "attempts", str(n))
                 os.makedirs(at)
                 with open(os.path.join(at, "status"), "w") as f:
                     f.write("0\n" if n == limit + 1 else "1\n")
-            out = subprocess.run(
-                [sys.executable, os.path.join(TOOLS, "agent-test", "score.py"), run],
-                capture_output=True,
-                text=True,
-                check=True,
-            ).stdout
-        task = next(p for p in json.loads(out)["per_task"] if p["task"] == first)
+            report = score(run)
+        task = next(p for p in report["per_task"] if p["task"] == first)
         self.assertEqual(task["attempts"], limit)
         self.assertIsNone(task["built_at"])
         self.assertEqual(task["over_limit"], [limit + 1])

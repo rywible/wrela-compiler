@@ -8,13 +8,8 @@ use std::path::{Path, PathBuf};
 
 /// A package in a scratch directory of its own, with `main.wrela` holding `main`.
 fn package(name: &str, main: &str) -> PathBuf {
-    let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("roles-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch package");
-    let ident = name.replace('-', "_");
-    std::fs::write(dir.join("wrela.toml"), format!("[package]\nname = \"{ident}\"\n"))
-        .expect("write the manifest");
-    std::fs::write(dir.join("main.wrela"), main).expect("write main");
+    let dir = super::scratch(&format!("roles-{name}"));
+    super::write_package(&dir, &name.replace('-', "_"), main);
     dir
 }
 
@@ -48,10 +43,7 @@ fn exports_and_memory(wasm: &[u8]) -> (Vec<String>, bool) {
 
 /// The rendered errors of checking `main`.
 fn errors(name: &str, main: &str) -> (Vec<String>, String) {
-    let dir = package(name, main);
-    let out = wrela_driver::check(&dir);
-    let codes = out.diagnostics.iter().map(|d| d.code.as_str().to_string()).collect();
-    (codes, wrela_diag::render::render_all(&out.sources, &out.diagnostics))
+    super::checked(&package(name, main))
 }
 
 const BOTH: &str = r#"

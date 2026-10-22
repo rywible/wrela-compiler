@@ -11,7 +11,7 @@
 // same order in Chrome and in the native host, which plays a script of them for tests. A
 // `Script` is one, written as a constant: a frame test's input, and what `wrela script` writes.
 
-use std::fmt::{json_number, json_text}
+use std::fmt::{json_number, json_string}
 use std::hash::StateHash
 use std::math::is_finite
 use std::serialize::Serialize
@@ -263,7 +263,7 @@ impl Composer {
                 self.building.push(char)
                 if self.building.len() == length {
                     let changed = self.text != self.building
-                    self.text = self.building.clone()
+                    swap(mut self.text, mut self.building)
                     self.building.clear()
                     self.length = 0
                     return changed
@@ -619,10 +619,7 @@ impl Input {
                     self.keys[k / 32] = self.keys[k / 32] & !(1 << (k % 32))
                     self.mods = mods
                 },
-                Event::Text { .. } => {
-                    let _ = self.composer.apply(e)
-                },
-                Event::Compose { .. } => {
+                Event::Text { .. } | Event::Compose { .. } => {
                     let _ = self.composer.apply(e)
                 },
                 // A paste, an assistive action and the network's events hold nothing down.
@@ -1025,9 +1022,8 @@ impl Script {
     }
 
     fn string(mut self, key: str, text: str) {
-        self.json.push_str(f", \"{key}\": \"")
-        json_text(mut self.json, text)
-        self.json.push_str("\"")
+        self.json.push_str(f", \"{key}\": ")
+        json_string(mut self.json, text)
     }
 
     fn point(mut self, p: vec2) {

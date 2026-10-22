@@ -17,7 +17,7 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     let dir = &args.dir;
     let out = args.out.unwrap_or_else(|| dir.join("build"));
-    let output = if !args.lift.is_empty() {
+    let mut output = if !args.lift.is_empty() {
         let kind = wrela_driver::BuildKind { debug: args.debug, testing: args.testing };
         match wrela_driver::build_lifted(dir, &args.lift, kind) {
             Ok(o) => o,
@@ -34,7 +34,6 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
-    let mut output = output;
     if args.optimize
         && !failed
         && let Err(e) = optimized(&mut output.files)

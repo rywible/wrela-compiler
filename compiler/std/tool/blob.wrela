@@ -50,9 +50,7 @@ pub(package) fn write_data(w: mut Writer, data: Data) {
             }
             w.write_u8(0)
             w.write_u32(b.len())
-            for x in b {
-                w.write_u8(x)
-            }
+            w.write_bytes(b)
         },
         Data::Blob(blob) => {
             w.write_u8(1)
@@ -67,14 +65,7 @@ pub(package) fn read_data(r: mut Reader) -> Option<Data> {
     match r.read_u8() {
         Ok(0) => {
             let Ok(n) = r.read_u32() else { return None }
-            if n > r.left() {
-                return None
-            }
-            var bytes: Vec<u8> = Vec::with_capacity(n)
-            for _ in 0..n {
-                let Ok(x) = r.read_u8() else { return None }
-                bytes.push(x)
-            }
+            let Ok(bytes) = r.read_bytes(n) else { return None }
             Some(Data::Bytes(bytes))
         },
         Ok(1) => {
@@ -97,11 +88,9 @@ pub fn append(blob: Blob, bytes: [u8]) -> Call<Done> {
     if bytes.len() > MOST_BYTES {
         panic("blob::append: more than 512 KiB at once")
     }
-    var body = blob_body(blob).into_bytes()
-    for b in bytes {
-        body.push(b)
-    }
-    ask("blob/append", body)
+    var w = blob_body(blob)
+    w.write_bytes(bytes)
+    ask("blob/append", take w.into_bytes())
 }
 
 /// Up to `len` of `blob`'s bytes from byte `offset`: fewer at its end. `len` is at most 512 KiB;

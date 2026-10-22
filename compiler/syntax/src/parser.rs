@@ -7,7 +7,7 @@
 mod expr;
 
 use crate::ast::*;
-use crate::lexer::{Brackets, Lexed, line_break_is_newline};
+use crate::lexer::{Brackets, Lexed, newline_between};
 use crate::token::{Comment, Token, TokenKind as T};
 use wrela_diag::{Diagnostic, FileId, Span, codes};
 
@@ -26,17 +26,18 @@ impl Parsed {
 }
 
 pub fn parse(file: FileId, text: &str) -> Parsed {
-    let lexed = crate::lexer::lex(file, text);
-    parse_tokens(file, text, lexed)
+    parse_tokens(file, text, crate::lexer::lex_raw(file, text))
 }
 
+/// Parses what [`crate::lex`] made of `text`. Its NEWLINEs are left out: the parser decides
+/// them as it reads.
 pub fn parse_tokens(file: FileId, text: &str, lexed: Lexed) -> Parsed {
     let mut p = Parser {
         file,
         text,
         lifetimes: lexed.lifetimes,
         field_of: None,
-        tokens: Tokens::new(file, lexed.tokens),
+        tokens: Tokens::new(lexed.tokens),
         brackets: (0, Brackets::default()),
         pos: 0,
         diags: lexed.diagnostics,
@@ -95,7 +96,6 @@ pub(crate) struct Parser<'a> {
 /// there (L17). So a NEWLINE is decided only once the parser reaches it: then reading a closer
 /// as another redoes only the few tokens read ahead, not the rest of the file.
 struct Tokens {
-    file: FileId,
     /// The tokens reached, NEWLINEs decided.
     head: Vec<Token>,
     /// The rest, without NEWLINEs, last first.
@@ -105,23 +105,11 @@ struct Tokens {
 }
 
 impl Tokens {
-    fn new(file: FileId, tokens: Vec<Token>) -> Tokens {
+    fn new(tokens: Vec<Token>) -> Tokens {
         let mut tail: Vec<Token> = tokens.into_iter().filter(|t| t.kind != T::Newline).collect();
         tail.reverse();
         let head = Vec::with_capacity(tail.len() + tail.len() / 4);
-        Tokens { file, head, tail, open: Brackets::default() }
-    }
-
-    /// Whether a NEWLINE goes between `prev` and `next`, with `open` open (L17).
-    fn newline(&self, open: &Brackets, prev: Option<&Token>, next: &Token) -> Option<Token> {
-        let p = prev?;
-        (next.line_break_before && line_break_is_newline(open.in_brace(), p.kind, next.kind)).then(
-            || Token {
-                kind: T::Newline,
-                span: Span::new(self.file, p.span.end, p.span.end),
-                line_break_before: false,
-            },
-        )
+        Tokens { head, tail, open: Brackets::default() }
     }
 
     /// Reaches token `i` (or the end).
@@ -129,7 +117,9 @@ impl Tokens {
         while self.head.len() <= i
             && let Some(t) = self.tail.pop()
         {
-            if let Some(n) = self.newline(&self.open, self.head.last(), &t) {
+            if let Some(n) =
+                self.head.last().and_then(|p| newline_between(self.open.in_brace(), p, &t))
+            {
                 self.head.push(n);
             }
             self.open.track(t.kind);
@@ -147,7 +137,7 @@ impl Tokens {
         let mut prev = self.head.last().copied();
         let mut at = self.head.len();
         for t in self.tail.iter().rev() {
-            if let Some(n) = self.newline(&open, prev.as_ref(), t) {
+            if let Some(n) = prev.and_then(|p| newline_between(open.in_brace(), &p, t)) {
                 if at == i {
                     return Some(n);
                 }
@@ -285,6 +275,11 @@ impl<'a> Parser<'a> {
     /// Consumes a token of this kind if it's next, and returns its span.
     fn eat_span(&mut self, kind: T) -> Option<Span> {
         self.at(kind).then(|| self.bump().span)
+    }
+
+    /// Where the file's text starts: after a byte-order mark (L2), if it has one.
+    fn text_start(&self) -> usize {
+        if self.text.starts_with('\u{feff}') { 3 } else { 0 }
     }
 
     fn text_of(&self, span: Span) -> &'a str {
@@ -619,8 +614,8 @@ impl<'a> Parser<'a> {
     /// before `a`'s line.
     fn join_lines(&self, a: Span, b: Span) -> Vec<wrela_diag::Edit> {
         let between = &self.text[a.end as usize..b.start as usize];
-        let first = if self.text.starts_with('\u{feff}') { 3 } else { 0 };
-        let line_start = self.text[..a.start as usize].rfind('\n').map_or(first, |i| i + 1);
+        let line_start =
+            self.text[..a.start as usize].rfind('\n').map_or(self.text_start(), |i| i + 1);
         let line = &self.text[line_start..a.start as usize];
         let indent = &line[..line.len() - line.trim_start_matches([' ', '\t']).len()];
         // Only space and comments lie between two tokens, so each `//` starts a comment.
@@ -765,7 +760,7 @@ impl<'a> Parser<'a> {
         });
         // L2 permits a UTF-8 BOM only at the start of a file. Imports inserted by a fix belong
         // after it; inserting at byte zero would make the BOM an invalid character on line two.
-        let start = if self.text.starts_with('\u{feff}') { 3 } else { 0 };
+        let start = self.text_start() as u32;
         let import = wrela_diag::Edit {
             span: Span::new(self.file, start, start),
             replacement: "use std::io::print\n\n".into(),
@@ -816,25 +811,8 @@ impl<'a> Parser<'a> {
         );
         // A new line helps only before something that can start a statement or an item.
         let starts = self.starts_expr()
-            || matches!(
-                t.kind,
-                T::Let
-                    | T::Var
-                    | T::Borrow
-                    | T::For
-                    | T::While
-                    | T::Loop
-                    | T::Fn
-                    | T::Struct
-                    | T::Enum
-                    | T::Trait
-                    | T::Impl
-                    | T::Const
-                    | T::Use
-                    | T::Type
-                    | T::Pub
-                    | T::At
-            );
+            || starts_item(t.kind)
+            || matches!(t.kind, T::Let | T::Var | T::For | T::While | T::Loop);
         self.error(match t.kind {
             T::As => d.with_help("a conversion is a call of the type: `f32(x)`, not `x as f32`"),
             T::DotDot | T::DotDotEq => {
@@ -855,20 +833,7 @@ impl<'a> Parser<'a> {
                 T::RParen | T::RBracket | T::RBrace => depth = (depth - 1).max(0),
                 T::Newline | T::Semi if depth == 0 => {
                     self.bump();
-                    if matches!(
-                        self.kind(),
-                        T::Fn
-                            | T::Struct
-                            | T::Enum
-                            | T::Trait
-                            | T::Impl
-                            | T::Const
-                            | T::Use
-                            | T::Type
-                            | T::Borrow
-                            | T::Pub
-                            | T::At
-                    ) {
+                    if starts_item(self.kind()) {
                         return;
                     }
                     continue;
@@ -1008,19 +973,16 @@ impl<'a> Parser<'a> {
         self.expect(T::Lt, "`<`")?;
         let mut out = Vec::new();
         while !self.at_gt_close() {
-            if self.eat(T::Const) {
+            out.push(if self.eat(T::Const) {
                 let name = self.ident("a constant parameter name")?;
                 self.expect(T::Colon, "`:` and the constant's type")?;
                 let ty = self.parse_type()?;
-                out.push(GenericParam { name, bounds: Vec::new(), const_ty: Some(ty) });
-                if !self.eat(T::Comma) {
-                    break;
-                }
-                continue;
-            }
-            let name = self.ident("a generic parameter name")?;
-            let bounds = self.opt_bounds()?;
-            out.push(GenericParam { name, bounds, const_ty: None });
+                GenericParam { name, bounds: Vec::new(), const_ty: Some(ty) }
+            } else {
+                let name = self.ident("a generic parameter name")?;
+                let bounds = self.opt_bounds()?;
+                GenericParam { name, bounds, const_ty: None }
+            });
             if !self.eat(T::Comma) {
                 break;
             }
@@ -1670,6 +1632,24 @@ impl<'a> Parser<'a> {
         }
         self.parse_type()
     }
+}
+
+/// Whether a token can start an item: its first keyword, `pub`, or an attribute's `@`.
+fn starts_item(k: T) -> bool {
+    matches!(
+        k,
+        T::Fn
+            | T::Struct
+            | T::Enum
+            | T::Trait
+            | T::Impl
+            | T::Const
+            | T::Use
+            | T::Type
+            | T::Borrow
+            | T::Pub
+            | T::At
+    )
 }
 
 /// Calls `f` with each name a `use` binds and the path it binds the name to (`prefix` is the

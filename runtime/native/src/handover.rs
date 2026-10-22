@@ -13,7 +13,7 @@
 
 use crate::gpu::{Builder, Gpu, Ready, pipeline_key};
 use crate::program::{Handing, Retired};
-use crate::{Build, BuildDir, CodeFor, Error, Host, Result, compile_build, driven_build};
+use crate::{Build, BuildDir, Error, Host, Result, compile_build, driven_build};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::thread::JoinHandle;
@@ -47,29 +47,15 @@ fn beside(dir: &Path, path: &str) -> PathBuf {
     out
 }
 
-/// Compiles the build in `dir` and builds the pipelines `builder`'s device doesn't hold
-/// (`have`): on a thread of its own.
-fn prepare(dir: PathBuf, builder: Builder, have: std::collections::HashSet<u64>) -> Preparation {
-    std::thread::spawn(move || {
-        let build = compile_build(&dir, None).map_err(|e| e.to_string())?;
-        let ready =
-            builder.build_all(&build.manifest, &build.shaders, &have).map_err(|e| e.to_string())?;
-        Ok((build, ready))
-    })
-}
-
-/// Reads the build opened as `handle` (root path `at`) to be driven, its code from `code`, and
-/// builds the pipelines `builder`'s device doesn't hold (`have`): on a thread of its own.
-fn prepare_driven(
-    at: String,
-    handle: BuildDir,
-    code: CodeFor,
+/// Loads a build with `load` and builds the pipelines `builder`'s device doesn't hold (`have`):
+/// on a thread of its own.
+fn prepare(
+    load: impl FnOnce() -> Result<Build> + Send + 'static,
     builder: Builder,
     have: std::collections::HashSet<u64>,
 ) -> Preparation {
     std::thread::spawn(move || {
-        let mut build = driven_build(&handle, true, &code).map_err(|e| e.to_string())?;
-        build.driven = Some((at, std::sync::Arc::new(handle)));
+        let build = load().map_err(|e| e.to_string())?;
         let ready =
             builder.build_all(&build.manifest, &build.shaders, &have).map_err(|e| e.to_string())?;
         Ok((build, ready))
@@ -184,11 +170,22 @@ impl Host {
         }
         let code = self.beside.as_ref().map(|b| b.code.clone());
         let gpu: &mut Gpu = self.p().executor();
+        let (builder, have) = (gpu.builder(), gpu.pipeline_keys());
         let job = match (opened, code) {
-            (Some((at, handle)), Some(code)) => {
-                prepare_driven(at, handle, code, gpu.builder(), gpu.pipeline_keys())
+            // A driven build is read through its handle (root path `at`), its code from `code`.
+            (Some((at, handle)), Some(code)) => prepare(
+                move || {
+                    let mut build = driven_build(&handle, true, &code)?;
+                    build.driven = Some((at, std::sync::Arc::new(handle)));
+                    Ok(build)
+                },
+                builder,
+                have,
+            ),
+            _ => {
+                let dir = dir.to_path_buf();
+                prepare(move || compile_build(&dir, None), builder, have)
             }
-            _ => prepare(dir.to_path_buf(), gpu.builder(), gpu.pipeline_keys()),
         };
         self.prepared.insert(dir.to_path_buf(), Prepared::Going(job, Vec::new()));
     }
@@ -300,6 +297,12 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::program::{Io, Program};
+    use crate::{Options, Timing};
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use wrela_abi::Manifest;
+    use wrela_abi::stream::Encoder;
 
     /// A driven build's hand-over path is resolved from its root path, and none leaves the root.
     #[test]
@@ -316,12 +319,6 @@ mod tests {
         assert!(beside_root("out/stair", "../..").is_err(), "the root's name stays");
         assert!(beside_root("out", "../elsewhere").is_err());
     }
-    use crate::program::{Io, Program};
-    use crate::{Options, Timing};
-    use std::sync::mpsc;
-    use std::time::Duration;
-    use wrela_abi::Manifest;
-    use wrela_abi::stream::Encoder;
 
     #[test]
     #[ignore = "needs a GPU"]

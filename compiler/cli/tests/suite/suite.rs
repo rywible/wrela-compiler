@@ -2,7 +2,7 @@
 //! its allowlist and its members' tests, of every kind, or exactly one of them, chosen by name as
 //! `tools/check.sh` chooses; every check runs when another fails, and the status says if any did.
 
-use crate::common::{package, wrela};
+use crate::common::{package, run, wrela};
 use std::path::Path;
 
 /// A tool test's package: a tool build, and a tool test that waits on the fake clock.
@@ -100,10 +100,7 @@ fn workspace(name: &str) -> std::path::PathBuf {
 
 /// Runs `wrela suite` with `args` in `dir`: its status and its standard output and error.
 fn suite(dir: &Path, args: &[&str]) -> (Option<i32>, String) {
-    let out = wrela().arg("suite").args(args).current_dir(dir).output().expect("run wrela suite");
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.code(), text)
+    run(wrela().arg("suite").args(args).current_dir(dir))
 }
 
 #[test]

@@ -14,12 +14,12 @@ pub mod mir;
 pub mod program;
 pub mod resolve;
 pub mod thir;
+pub mod traits;
+pub mod ty;
 
 /// Directories at a package's top level that hold outputs, never modules: builds, results a
 /// page saves, and the tools' own.
 pub const OUTPUT_DIRS: &[&str] = &["build", "results", "node_modules", "target"];
-pub mod traits;
-pub mod ty;
 
 use std::collections::{BTreeMap, HashMap};
 use wrela_diag::Diagnostic;
@@ -110,8 +110,8 @@ pub struct Checked {
     pub consts: BTreeMap<ty::ConstId, (ty::TyId, thir::Expr)>,
     /// The type each function that returns by naming its traits (`-> Creature<Coat>`) returns.
     pub hidden: HashMap<ty::FnId, ty::TyId>,
-    /// Each body's own effects ([`effects::direct_effects`]), for lowering's checks.
-    pub direct: BTreeMap<effects::BodyId, Vec<(effects::Effect, wrela_diag::Span, String)>>,
+    /// Each body's own effects, for lowering's checks.
+    pub direct: effects::Direct,
 }
 
 impl Checked {
@@ -121,8 +121,6 @@ impl Checked {
     }
 }
 
-/// Every file `embed` reads, with where it's read: from the bodies' MIR and the constants'
-/// values (§13). A path may appear more than once.
 /// How an `embed` names its file: the package that embeds it (its index, std's 0 and the
 /// program's 1) and its path in that package, as `index:path`.
 pub fn embed_key(package: usize, path: &str) -> String {
@@ -135,7 +133,8 @@ pub fn split_embed_key(key: &str) -> Option<(usize, &str)> {
     Some((package.parse().ok()?, path))
 }
 
-/// Every `embed` in the program: its key (`embed_key`), and where it's written.
+/// Every `embed` in the program (§13): its key ([`embed_key`]), and where it's written, from the
+/// bodies' MIR and the constants' values. A key may appear more than once.
 pub fn embeds(checked: &Checked) -> Vec<(std::sync::Arc<str>, wrela_diag::Span)> {
     let mut out = Vec::new();
     for body in checked.mir.values() {
@@ -279,7 +278,8 @@ fn check(
         }
     }
     diags.extend(check::opaque_cycles(p, &hidden));
-    diags.extend(effects::check(p, &mir));
+    let (effect_diags, direct) = effects::check(p, &mir);
+    diags.extend(effect_diags);
     for i in 0..p.adts.len() {
         diags.extend(check::check_field_defaults(p, &const_tys, ty::AdtId(i as u32)));
     }
@@ -287,7 +287,6 @@ fn check(
         diags.extend(unused_items(p, &mir));
     }
     let hidden = hidden.into_iter().collect();
-    let direct = effects::direct_effects(&program, &mir);
     Checked { program, mir, consts, hidden, direct }
 }
 

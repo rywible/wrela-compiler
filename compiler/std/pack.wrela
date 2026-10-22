@@ -74,16 +74,7 @@ impl BitWriter {
 
     /// Writes `x` as a varint.
     pub fn write_varint(mut self, x: u32) {
-        var rest = x
-        loop {
-            let group = rest & 127
-            rest = rest >> 7
-            if rest == 0 {
-                self.write_bits(group, 8)
-                return
-            }
-            self.write_bits(group | 128, 8)
-        }
+        self.write_varint64(u64(x))
     }
 
     /// Writes `x` as a varint.
@@ -170,14 +161,14 @@ impl BitReader {
         Ok(self.read_bits(1)? == 1)
     }
 
-    /// A varint of at most `bits` bits (16 or 32).
-    fn read_varint_of(mut self, bits: u32) -> Result<u32, PackError> {
+    /// A varint of at most `bits` bits (16, 32 or 64).
+    fn read_varint_of(mut self, bits: u32) -> Result<u64, PackError> {
         let start = self.at
-        var x: u32 = 0
-        var shift = 0
+        var x: u64 = 0
+        var shift: u32 = 0
         loop {
             let byte = self.read_bits(8)?
-            let group = byte & 127
+            let group = u64(byte & 127)
             if shift + 7 > bits && (group >> (bits - shift)) != 0 {
                 return Err(PackError { at: start, what: "a varint is larger than its type" })
             }
@@ -197,32 +188,12 @@ impl BitReader {
 
     /// A varint.
     pub fn read_varint(mut self) -> Result<u32, PackError> {
-        self.read_varint_of(32)
+        Ok(u32(self.read_varint_of(32)?))
     }
 
     /// A varint.
     pub fn read_varint64(mut self) -> Result<u64, PackError> {
-        let start = self.at
-        var x: u64 = 0
-        var shift: u32 = 0
-        loop {
-            let byte = self.read_bits(8)?
-            let group = u64(byte & 127)
-            if shift + 7 > 64 && (group >> (64 - shift)) != 0 {
-                return Err(PackError { at: start, what: "a varint is larger than its type" })
-            }
-            x = x | (group << shift)
-            if byte < 128 {
-                if group == 0 && shift > 0 {
-                    return Err(PackError { at: start, what: "a varint isn't in its shortest form" })
-                }
-                return Ok(x)
-            }
-            shift += 7
-            if shift >= 64 {
-                return Err(PackError { at: start, what: "a varint is larger than its type" })
-            }
-        }
+        self.read_varint_of(64)
     }
 
     /// Counts `n` elements against the budget, before they're read or allocated.
@@ -408,7 +379,7 @@ impl Pack for i16 {
     }
 
     fn unpack(r: mut BitReader) -> Result<i16, PackError> {
-        Ok(i16(unzigzag(r.read_varint_of(16)?)))
+        Ok(i16(unzigzag(u32(r.read_varint_of(16)?))))
     }
 }
 

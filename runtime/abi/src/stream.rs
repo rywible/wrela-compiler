@@ -532,12 +532,13 @@ pub enum Command<'a> {
         url: &'a str,
         body: &'a [u8],
     },
-    /// Another build made ready to start (`std::reload::prepare`).
+    /// A request of a host service, by its name, with opaque bytes.
     HostRequest {
         request: u32,
         service: &'a str,
         body: &'a [u8],
     },
+    /// Another build made ready to start (`std::reload::prepare`).
     Prepare {
         request: u32,
         path: &'a str,

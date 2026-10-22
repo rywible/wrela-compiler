@@ -62,6 +62,14 @@ impl Writer {
         self.write_u32(n)
         self.bytes.append_text(s)
     }
+
+    /// Writes `bytes` as they are, with no count: for a tool's requests (`std::tool`).
+    pub(package) fn write_bytes(mut self, bytes: [u8]) {
+        self.bytes.reserve(bytes.len())
+        for b in bytes {
+            self.bytes.push(b)
+        }
+    }
 }
 
 /// Why bytes couldn't be loaded: where, and what was wrong.
@@ -140,15 +148,21 @@ impl Reader {
         Ok(x)
     }
 
-    /// Text written by `write_str`: it must be UTF-8.
-    pub fn read_string(mut self) -> Result<String, LoadError> {
-        let n = self.read_u32()?
+    /// The next `n` bytes, or an error if fewer are left.
+    pub(package) fn read_bytes(mut self, n: u32) -> Result<Vec<u8>, LoadError> {
         let at = self.take_bytes(n)?
         var bytes: Vec<u8> = Vec::with_capacity(n)
         for i in 0..n {
             bytes.push(self.bytes[at + i])
         }
-        let Some(s) = String::from_utf8(take bytes) else {
+        Ok(bytes)
+    }
+
+    /// Text written by `write_str`: it must be UTF-8.
+    pub fn read_string(mut self) -> Result<String, LoadError> {
+        let n = self.read_u32()?
+        let at = self.at
+        let Some(s) = String::from_utf8(self.read_bytes(n)?) else {
             return Err(LoadError { at, what: "the text isn't UTF-8" })
         }
         Ok(s)
@@ -159,13 +173,8 @@ impl Reader {
         let at = self.at
         let n = self.read_u32()?
         let start = self.take_bytes(n)?
-        if n != want.len() {
+        if !self.is_name(start, n, want) {
             return Err(LoadError { at, what: "a field's name isn't the one expected" })
-        }
-        for i in 0..n {
-            if self.bytes[start + i] != want.byte(i) {
-                return Err(LoadError { at, what: "a field's name isn't the one expected" })
-            }
         }
         Ok(())
     }
@@ -176,21 +185,24 @@ impl Reader {
         let n = self.read_u32()?
         let start = self.take_bytes(n)?
         for k in 0..names.len() {
-            let name = names[k]
-            if name.len() == n {
-                var same = true
-                for i in 0..n {
-                    if self.bytes[start + i] != name.byte(i) {
-                        same = false
-                        break
-                    }
-                }
-                if same {
-                    return Ok(k)
-                }
+            if self.is_name(start, n, names[k]) {
+                return Ok(k)
             }
         }
         Err(LoadError { at, what: "the variant's name isn't one of the enum's" })
+    }
+
+    /// Whether the `n` bytes at `start` are `name`.
+    fn is_name(self, start: u32, n: u32, name: str) -> bool {
+        if n != name.len() {
+            return false
+        }
+        for i in 0..n {
+            if self.bytes[start + i] != name.byte(i) {
+                return false
+            }
+        }
+        true
     }
 }
 

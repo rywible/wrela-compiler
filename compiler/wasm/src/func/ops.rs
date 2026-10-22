@@ -865,7 +865,7 @@ pub(super) fn convert(fe: &mut Fe, from: ir::Scalar, to: ir::Scalar) -> R<()> {
 
 // ---- built-ins --------------------------------------------------------------------------------
 
-/// Pushes the scalar built-in `b` of the f32 locals `xs`.
+/// Pushes the scalar built-in `b` of the locals `xs`, of scalar type `s`.
 fn scalar_builtin(fe: &mut Fe, b: ir::Builtin, s: ir::Scalar, xs: &[u32]) -> R<()> {
     use ir::Builtin as B;
     let g = |i: usize| I::LocalGet(xs[i]);
@@ -1228,6 +1228,27 @@ fn checked_bytes(fe: &mut Fe, x: u32, elem_size: u32) {
     fe.ins.extend([I::LocalGet(wide), I::I32WrapI64]);
 }
 
+/// Takes the next resource handle: returns the local that holds it.
+fn new_handle(fe: &mut Fe) -> u32 {
+    let handle = fe.new_local(ValType::I32);
+    fe.ins.extend([
+        I::GlobalGet(globals::NEXT_HANDLE),
+        I::LocalTee(handle),
+        I::I32Const(1),
+        I::I32Add,
+        I::GlobalSet(globals::NEXT_HANDLE),
+    ]);
+    handle
+}
+
+/// Sets `result` to the value on top of the stack, or drops it when nothing uses it.
+fn set_or_drop(fe: &mut Fe, result: Option<ir::ValueId>) {
+    match result {
+        Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
+        None => fe.ins.push(I::Drop),
+    }
+}
+
 pub(super) fn host(
     fe: &mut Fe,
     op: &ir::HostOp,
@@ -1249,14 +1270,7 @@ pub(super) fn host(
                 I::LocalSet(size),
                 I::End,
             ]);
-            let handle = fe.new_local(ValType::I32);
-            fe.ins.extend([
-                I::GlobalGet(globals::NEXT_HANDLE),
-                I::LocalTee(handle),
-                I::I32Const(1),
-                I::I32Add,
-                I::GlobalSet(globals::NEXT_HANDLE),
-            ]);
+            let handle = new_handle(fe);
             // Payload: the handle and the size.
             let a = begin_command(fe, Opcode::CreateBuffer, 8);
             fe.ins.extend(put(a, CMD_HEADER, I::LocalGet(handle)));
@@ -1392,50 +1406,42 @@ pub(super) fn host(
                 I::GlobalSet(globals::NEXT_REQUEST),
             ]);
         }
-        ir::HostOp::RequestStatus | ir::HostOp::Limit => {
-            // A request made in this call is pending until the next one, so its command
-            // needn't reach the host before its status is read.
+        ir::HostOp::RequestStatus
+        | ir::HostOp::Limit
+        | ir::HostOp::Payload
+        | ir::HostOp::Input
+        | ir::HostOp::Kept
+        | ir::HostOp::Keep
+        | ir::HostOp::Clock
+        | ir::HostOp::Print
+        | ir::HostOp::Phase
+        | ir::HostOp::Audio
+        | ir::HostOp::RequestTake
+        | ir::HostOp::Tick => {
+            // A call of the host's import, with the arguments in order. (A request made in
+            // this call is pending until the next one, so its command needn't reach the host
+            // before its status is read.)
             let h = fe.at.helpers;
-            let helper = if matches!(op, ir::HostOp::Limit) { h.limit } else { h.request_status };
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::Call(helper)]);
-            match result {
-                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
-                None => fe.ins.push(I::Drop),
-            }
-        }
-        ir::HostOp::Keep => {
-            let h = fe.at.helpers;
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
-            fe.ins.push(I::Call(h.keep));
-        }
-        ir::HostOp::Clock => {
-            let h = fe.at.helpers;
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::Call(h.clock)]);
-        }
-        ir::HostOp::Print | ir::HostOp::Phase => {
-            let h = fe.at.helpers;
-            let helper = if matches!(op, ir::HostOp::Print) { h.print } else { h.phase };
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
-            fe.ins.push(I::Call(helper));
-        }
-        ir::HostOp::Payload => {
-            let h = fe.at.helpers;
-            for &a in &args[..4] {
+            let (helper, returns) = match op {
+                ir::HostOp::RequestStatus => (h.request_status, true),
+                ir::HostOp::Limit => (h.limit, true),
+                ir::HostOp::Payload => (h.payload, true),
+                ir::HostOp::Input => (h.input, true),
+                ir::HostOp::Kept => (h.kept, true),
+                ir::HostOp::Keep => (h.keep, false),
+                ir::HostOp::Clock => (h.clock, false),
+                ir::HostOp::Print => (h.print, false),
+                ir::HostOp::Phase => (h.phase, false),
+                ir::HostOp::Audio => (h.audio, false),
+                ir::HostOp::RequestTake => (h.request_take, false),
+                _ => (h.tick, false),
+            };
+            for &a in args {
                 fe.ins.push(I::LocalGet(fe.v(a)));
             }
-            fe.ins.push(I::Call(h.payload));
-            match result {
-                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
-                None => fe.ins.push(I::Drop),
-            }
-        }
-        ir::HostOp::Input | ir::HostOp::Kept => {
-            let h = fe.at.helpers;
-            fe.ins.extend([I::LocalGet(fe.v(args[0])), I::LocalGet(fe.v(args[1]))]);
-            fe.ins.push(I::Call(if matches!(op, ir::HostOp::Input) { h.input } else { h.kept }));
-            match result {
-                Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
-                None => fe.ins.push(I::Drop),
+            fe.ins.push(I::Call(helper));
+            if returns {
+                set_or_drop(fe, result);
             }
         }
         ir::HostOp::ToolRequest
@@ -1463,23 +1469,8 @@ pub(super) fn host(
             }
             fe.ins.push(I::Call(fe.at.helpers.tool + k as u32));
             if wrela_abi::TOOL_FUNCTIONS[k].results == 1 {
-                match result {
-                    Some(r) => fe.ins.push(I::LocalSet(fe.v(r))),
-                    None => fe.ins.push(I::Drop),
-                }
+                set_or_drop(fe, result);
             }
-        }
-        ir::HostOp::Audio | ir::HostOp::RequestTake | ir::HostOp::Tick => {
-            let h = fe.at.helpers;
-            let helper = match op {
-                ir::HostOp::Audio => h.audio,
-                ir::HostOp::RequestTake => h.request_take,
-                _ => h.tick,
-            };
-            for &a in args {
-                fe.ins.push(I::LocalGet(fe.v(a)));
-            }
-            fe.ins.push(I::Call(helper));
         }
     }
     Ok(())
@@ -1530,14 +1521,7 @@ fn command_op(
     fe.ins.extend(put(a, 4, I::LocalGet(size)));
     let mut off = CMD_HEADER;
     if handle {
-        let new = fe.new_local(ValType::I32);
-        fe.ins.extend([
-            I::GlobalGet(globals::NEXT_HANDLE),
-            I::LocalTee(new),
-            I::I32Const(1),
-            I::I32Add,
-            I::GlobalSet(globals::NEXT_HANDLE),
-        ]);
+        let new = new_handle(fe);
         fe.ins.extend(put(a, off, I::LocalGet(new)));
         off += 4;
         if let Some(v) = result {
@@ -1602,8 +1586,14 @@ fn command_op(
 pub(crate) fn panic_with(data: &[u32], msg: (ir::DataId, u32)) -> R<Vec<I<'static>>> {
     let (d, n) = msg;
     let at = *data.get(d.index()).ok_or("internal: a missing message")?;
+    Ok(panic_at(at, n))
+}
+
+/// A panic with the `n` bytes at address `at` as its message (cut to the room there is), then
+/// a trap.
+fn panic_at(at: u32, n: u32) -> Vec<I<'static>> {
     let n = n.min(memory::PANIC_CAP);
-    Ok(vec![
+    vec![
         I::GlobalGet(globals::THREAD),
         I::I32Const(n as i32),
         I::I32Store(mem(memory::PANIC, 2)),
@@ -1614,7 +1604,7 @@ pub(crate) fn panic_with(data: &[u32], msg: (ir::DataId, u32)) -> R<Vec<I<'stati
         I::I32Const(n as i32),
         I::MemoryCopy { src_mem: 0, dst_mem: 0 },
         I::Unreachable,
-    ])
+    ]
 }
 
 /// The offsets of the f32s of a value of type `t` that holds floats as a vector or matrix
@@ -1961,24 +1951,7 @@ pub(crate) fn helper_bodies(
     // reserve(n) -> addr
     // A command larger than the buffer panics with the backstop's message (the program's
     // thread's block's panic message), or traps if there's none.
-    let too_large: Vec<I<'static>> = match command_message {
-        Some((at, n)) => {
-            let n = n.min(memory::PANIC_CAP);
-            vec![
-                I::GlobalGet(globals::THREAD),
-                I::I32Const(n as i32),
-                I::I32Store(mem(memory::PANIC, 2)),
-                I::GlobalGet(globals::THREAD),
-                I::I32Const(memory::PANIC as i32 + 4),
-                I::I32Add,
-                I::I32Const(at as i32),
-                I::I32Const(n as i32),
-                I::MemoryCopy { src_mem: 0, dst_mem: 0 },
-                I::Unreachable,
-            ]
-        }
-        None => vec![I::Unreachable],
-    };
+    let too_large = command_message.map_or(vec![I::Unreachable], |(at, n)| panic_at(at, n));
     let mut reserve = vec![
         I::GlobalGet(globals::CMD_LEN),
         I::LocalGet(0),

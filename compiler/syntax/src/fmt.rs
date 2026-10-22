@@ -56,20 +56,7 @@ pub fn format(parsed: &Parsed, text: &str) -> String {
 /// `before` formatted. Formatting keeps the tokens and their order, but `,`, `;` and line
 /// breaks, so a place is found by the token it's in or before: the n-th of the others.
 pub fn move_offsets(before: &str, after: &str, offsets: &mut [u32]) {
-    let kept = |text: &str| -> Vec<Span> {
-        crate::lexer::lex(FileId(0), text)
-            .tokens
-            .into_iter()
-            .filter(|t| {
-                !matches!(
-                    t.kind,
-                    TokenKind::Comma | TokenKind::Semi | TokenKind::Newline | TokenKind::Eof
-                )
-            })
-            .map(|t| t.span)
-            .collect()
-    };
-    let (a, b) = (kept(before), kept(after));
+    let (a, b) = (code_spans(before), code_spans(after));
     for at in offsets {
         let i = a.partition_point(|s| s.end <= *at);
         *at = match (a.get(i), b.get(i)) {
@@ -144,7 +131,7 @@ pub fn check_round_trip(parsed: &Parsed, src: &str) -> Result<String, String> {
 /// and removes. Formatting keeps these. For tests.
 #[doc(hidden)]
 pub fn comment_places(src: &str) -> Vec<(String, usize, bool)> {
-    let lexed = crate::lexer::lex(FileId(0), src);
+    let lexed = crate::lexer::lex_raw(FileId(0), src);
     let mut code = lexed.tokens.iter().filter(|t| is_code(t.kind)).peekable();
     let mut before = 0;
     lexed
@@ -176,13 +163,14 @@ fn is_code(k: TokenKind) -> bool {
     !matches!(k, TokenKind::Newline | TokenKind::Eof | TokenKind::Comma | TokenKind::Semi)
 }
 
+/// Where each of `text`'s code tokens ([`is_code`]) is.
+fn code_spans(text: &str) -> Vec<Span> {
+    let tokens = crate::lexer::lex_raw(FileId(0), text).tokens;
+    tokens.into_iter().filter(|t| is_code(t.kind)).map(|t| t.span).collect()
+}
+
 fn format_once(parsed: &Parsed, text: &str) -> String {
-    let code = crate::lexer::lex(FileId(0), text)
-        .tokens
-        .into_iter()
-        .filter(|t| is_code(t.kind))
-        .map(|t| t.span)
-        .collect();
+    let code = code_spans(text);
     let mut b = Builder { comments: &parsed.comments, next: 0, text, code, at: (0, 0) };
     let d = b.file(&parsed.file);
     let mut out = doc::print(&d, MAX_WIDTH);
@@ -890,15 +878,17 @@ impl<'a> Builder<'a> {
         concat(out)
     }
 
+    /// A parameter's mode and the space after it; nothing for the default, borrow.
+    fn mode(&mut self, m: Mode) -> Doc {
+        if m == Mode::Borrow { nil() } else { self.tok(&format!("{} ", m.keyword())) }
+    }
+
     fn param(&mut self, p: &Param) -> Doc {
-        let mode = |b: &mut Self, m: Mode| {
-            if m == Mode::Borrow { nil() } else { b.tok(&format!("{} ", m.keyword())) }
-        };
         match p {
-            Param::SelfParam { mode: m, .. } => concat([mode(self, *m), self.tok("self")]),
-            Param::Named { name, mode: m, ty, default, .. } => {
+            Param::SelfParam { mode, .. } => concat([self.mode(*mode), self.tok("self")]),
+            Param::Named { name, mode, ty, default, .. } => {
                 let name = self.tok(&format!("{}: ", name.name));
-                let mode = mode(self, *m);
+                let mode = self.mode(*mode);
                 let ty = self.ty(ty);
                 let default = match default {
                     Some(d) => concat([self.tok(" = "), self.expr(d)]),
@@ -940,16 +930,7 @@ impl<'a> Builder<'a> {
                 let close = self.inline_close(t.span.end - 1);
                 concat([open, list, lone, close, self.tok(")")])
             }
-            TypeExprKind::Traits(tys) => {
-                let mut parts = Vec::new();
-                for (i, t) in tys.iter().enumerate() {
-                    if i > 0 {
-                        parts.push(self.tok(" + "));
-                    }
-                    parts.push(self.ty(t));
-                }
-                concat(parts)
-            }
+            TypeExprKind::Traits(tys) => self.bounds(tys),
             TypeExprKind::Paren(inner) => {
                 let open = self.tok("(");
                 let inner = self.ty(inner);
@@ -959,13 +940,7 @@ impl<'a> Builder<'a> {
                 let attrs: Vec<Doc> =
                     attrs.iter().map(|a| self.tok(&format!("@{} ", a.name))).collect();
                 let open = concat([concat(attrs), self.tok("fn(")]);
-                let list = self.flat_list(params, |b, p| {
-                    let mode = match p.mode {
-                        Mode::Borrow => nil(),
-                        m => b.tok(&format!("{} ", m.keyword())),
-                    };
-                    concat([mode, b.ty(&p.ty)])
-                });
+                let list = self.flat_list(params, |b, p| concat([b.mode(p.mode), b.ty(&p.ty)]));
                 let close = concat([self.close_before(')'), self.tok(")")]);
                 let ret = match ret {
                     Some(r) => concat([self.tok(" -> "), self.ty(r)]),
@@ -1025,6 +1000,13 @@ impl<'a> Builder<'a> {
             return block(concat([open, indent(concat([Doc::HardLine, s])), Doc::HardLine, close]));
         }
         self.members(&b.stmts, |s| s.span, b.span.end, Self::stmt)
+    }
+
+    /// Whether the first of an array literal's `items` starts on a line after the literal's `[`.
+    fn first_on_own_line(&self, array: &Expr, items: &[Expr]) -> bool {
+        items.first().is_some_and(|x| {
+            self.text[array.span.start as usize..x.span.start as usize].contains('\n')
+        })
     }
 
     fn spans_lines(&self, s: Span) -> bool {
@@ -1156,21 +1138,17 @@ impl<'a> Builder<'a> {
                 self.list(items, |_, x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
             ExprKind::Array(items) => {
-                let multiline = items.first().is_some_and(|x| {
-                    self.text[e.span.start as usize..x.span.start as usize].contains('\n')
-                });
+                let multiline = self.first_on_own_line(e, items);
                 // A table of short numbers fills its lines (as rustfmt does), unless it has
                 // comments in it, which keep their places one element to a line.
-                let span = &self.text[e.span.start as usize..e.span.end as usize];
-                let fill =
-                    items.len() > 1 && items.iter().all(short_number) && !span.contains("//");
+                let fill = items.len() > 1
+                    && items.iter().all(short_number)
+                    && !self.text[e.span.range()].contains("//");
                 let l = List { open: "[", close: "]", multiline, fill, ..PARENS };
                 self.list(items, |_, x| x.span.start, |b, x| b.expr(x), e.span.end, l)
             }
             ExprKind::ArrayFill { items, fill } => {
-                let multiline = items.first().is_some_and(|x| {
-                    self.text[e.span.start as usize..x.span.start as usize].contains('\n')
-                });
+                let multiline = self.first_on_own_line(e, items);
                 let mut parts: Vec<(&Expr, bool)> = items.iter().map(|x| (x, false)).collect();
                 parts.push((fill, true));
                 let start =

@@ -33,6 +33,8 @@ import { type Binding, type Bytes, type Command, joins, type OpcodeName, type Pa
 
 const RING_START = 64 * 1024;
 
+const ENCODER = new TextEncoder();
+
 /** A pipeline failed to build: its WGSL didn't compile, or its layout or entry points are wrong. */
 export class ShaderError extends Error {
   constructor(
@@ -290,7 +292,7 @@ export type PipelineCache = Map<string, Promise<BuiltPipeline>>;
  * dropped before it moves it, and the next build keeps it all the same. */
 function pipelineKey(p: Pipeline, source: string): string {
   const hash = new StateHash();
-  hash.update(new TextEncoder().encode(`${JSON.stringify({ ...p, shader: "" })}\n${source}`));
+  hash.update(ENCODER.encode(`${JSON.stringify({ ...p, shader: "" })}\n${source}`));
   return hash.hex();
 }
 
@@ -746,6 +748,11 @@ export class GpuExecutor {
   #fail(e: unknown): void {
     if (this.#retired || this.#failed !== null) return;
     this.#failed = e;
+    this.#rejectAll(e);
+  }
+
+  /** Drops every queued command and rejects every queued readback, and `caughtUp`, with `e`. */
+  #rejectAll(e: unknown): void {
     this.#rejectDeferred(this.#waiting, e);
     if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, e);
     for (const batch of this.#draining) this.#rejectDeferred(batch, e);
@@ -818,13 +825,10 @@ export class GpuExecutor {
         if ("cmd" in d) {
           // Its timings and its label are the frame's that recorded it, which may have been
           // before the one being recorded now.
-          this.#running = d.at;
           try {
-            this.#run(d.cmd, true);
+            this.#runAs(d.at, d.cmd);
           } catch (e) {
             throw new Error(`serial mode, ${d.cmd.op}: ${errorMessage(e)}`);
-          } finally {
-            this.#running = null;
           }
           const op = d.cmd.op;
           if (op === "Dispatch" || op === "DispatchIndirect" || op === "EndPass" || op === "Present") {
@@ -938,15 +942,10 @@ export class GpuExecutor {
         this.#dispatch(cmd.op, cmd.pipeline, { buffer: cmd.arguments, offset: cmd.offset }, cmd.bindings, cmd.uniforms);
         return;
       case "BeginScreenPass":
-        this.#pass = {
-          pass: { color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 },
-          draws: [],
-          label: this.#label,
-          at: this.#running ?? { frame: this.#frame, generation: this.#generation },
-        };
+        this.#begin({ color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 });
         return;
       case "BeginPass":
-        this.#pass = { pass: cmd.pass, draws: [], label: this.#label, at: this.#running ?? { frame: this.#frame, generation: this.#generation } };
+        this.#begin(cmd.pass);
         return;
       case "Draw":
       case "DrawIndirect":
@@ -975,6 +974,11 @@ export class GpuExecutor {
       case "Fetch":
         return;
     }
+  }
+
+  /** Opens `pass`, named by the label in force, in the frame of the command running. */
+  #begin(pass: Pass): void {
+    this.#pass = { pass, draws: [], label: this.#label, at: this.#running ?? { frame: this.#frame, generation: this.#generation } };
   }
 
   /** Submits everything recorded so far, after writing its uniform bytes, then destroys the
@@ -1041,12 +1045,7 @@ export class GpuExecutor {
   destroyAll(): void {
     if (this.#retired) return;
     this.#retired = true;
-    const retired = new Error("the GPU executor was retired");
-    this.#rejectDeferred(this.#waiting, retired);
-    if (this.#deferred !== null) this.#rejectDeferred(this.#deferred, retired);
-    for (const batch of this.#draining) this.#rejectDeferred(batch, retired);
-    this.#idle?.reject(retired);
-    this.#idle = null;
+    this.#rejectAll(new Error("the GPU executor was retired"));
     this.#pass = null;
     // An ended pass still needs the live attachment and binding handles to be recorded.
     this.#recordEnded();
@@ -1068,8 +1067,7 @@ export class GpuExecutor {
     if (r.kind === "buffer") {
       this.#doomed.push(r.buffer);
       this.#allocated(-r.buffer.size);
-    }
-    if (r.kind === "texture") {
+    } else if (r.kind === "texture") {
       this.#doomed.push(r.texture);
       this.#allocated(-r.bytes);
     }
@@ -1346,12 +1344,9 @@ export class GpuExecutor {
   #recordPass(op: OpcodeName, open: OpenPass): void {
     const pass = open.pass;
     const onScreen = pass.color === SCREEN;
-    const colorView = onScreen ? this.screen.texture().createView() : pass.color === NONE ? null : this.#texture(pass.color).view;
-    const colorFormat: GPUTextureFormat | null = onScreen
-      ? SCREEN_FORMAT
-      : pass.color === NONE
-        ? null
-        : this.#texture(pass.color).format;
+    const color = onScreen || pass.color === NONE ? null : this.#texture(pass.color);
+    const colorView = onScreen ? this.screen.texture().createView() : (color?.view ?? null);
+    const colorFormat: GPUTextureFormat | null = onScreen ? SCREEN_FORMAT : (color?.format ?? null);
     const depth = pass.depth === NONE ? null : this.#texture(pass.depth);
     // Everything that can flush happens before anything is recorded for this pass.
     this.#reserveTimestamps();

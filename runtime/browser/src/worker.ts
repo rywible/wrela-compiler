@@ -45,7 +45,6 @@ function salt(build: Build, n: number): Build {
   return { ...build, shaders };
 }
 
-
 let base = "";
 /** The build that's running's base: the page's, until a hot reload swaps another in. Its files
  * are fetched from there (the server deletes old builds, the page's among them). */
@@ -113,7 +112,6 @@ function requestHost(service: string, bytes: Uint8Array<ArrayBuffer>): Promise<U
     self.postMessage({ type: "host-request", id, service, bytes } satisfies FromWorker);
   });
 }
-
 
 function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPUCanvasContext {
   const ctx = canvas.getContext("webgpu");
@@ -358,9 +356,14 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
       { cache: pipelineCache },
     );
   running = build;
-  let program = await start(build, null);
-  (program.executor as GpuExecutor).built.catch(fatal);
-  ticker.control.go(TickerMode.CLOCK);
+  let program!: Program;
+  // `p` runs from the next frame: its pipelines' failure is fatal, and its ticks go on the clock.
+  const adopt = (p: Program) => {
+    program = p;
+    (p.executor as GpuExecutor).built.catch(fatal);
+    ticker.control.go(TickerMode.CLOCK);
+  };
+  adopt(await start(build, null));
   const max = device.limits.maxTextureDimension2D;
   // A debug build's bounds checks: the flag is read after a frame, one read at a time.
   let checking = false;
@@ -381,9 +384,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         }
         swapping = true;
         swap(program, next, frames, start).then((p) => {
-          program = p;
-          (p.executor as GpuExecutor).built.catch(fatal);
-          ticker.control.go(TickerMode.CLOCK);
+          adopt(p);
           live!.swapped();
           swapping = false;
         }, fatal);
@@ -420,11 +421,7 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, liv
         if (asked !== null) {
           swapping = true;
           handOver(program, asked, frames, start).then((p) => {
-            if (p !== program) {
-              program = p;
-              (p.executor as GpuExecutor).built.catch(fatal);
-              ticker.control.go(TickerMode.CLOCK);
-            }
+            if (p !== program) adopt(p);
             swapping = false;
           }, fatal);
         }

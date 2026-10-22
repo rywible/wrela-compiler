@@ -53,7 +53,7 @@ pub(super) fn interval(
     box_ty: TypeId,
     interval_ty: TypeId,
 ) -> R<FuncId> {
-    let func = m.functions[f.index()].clone();
+    let func = m.functions[f.index()].clone_signature();
     let xi = ncap as usize;
     let x_ty = func.params.get(xi).ok_or_else(|| Error::internal("no input parameter"))?.ty;
     if !matches!(m.types.get(x_ty), TypeDef::Scalar(Scalar::F32) | TypeDef::Vector(Scalar::F32, _))
@@ -79,16 +79,13 @@ pub(super) fn interval(
     let returns = returns_active(m, cache, f, mask, Mode::Interval) != 0;
 
     let mut params = func.params[..xi].to_vec();
-    params.push(Param { name: "over".into(), ty: box_ty, by_ref: false, mutable: false });
+    params.push(Param::value("over", box_ty));
     let mut g = Function::new(format!("{}_interval", func.name), params, Some(interval_ty));
     let mut body = Vec::new();
     let mut args: Vec<Arg> = (0..xi as u32).map(|i| g.param_arg(i, &mut body)).collect();
-    let over = g.new_value(box_ty);
-    body.push(Stmt::Let(over, Expr::Param(xi as u32)));
-    let lo = g.new_value(x_ty);
-    body.push(Stmt::Let(lo, Expr::Extract(over, 0)));
-    let hi = g.new_value(x_ty);
-    body.push(Stmt::Let(hi, Expr::Extract(over, 1)));
+    let over = g.let_(&mut body, box_ty, Expr::Param(xi as u32));
+    let lo = g.let_(&mut body, x_ty, Expr::Extract(over, 0));
+    let hi = g.let_(&mut body, x_ty, Expr::Extract(over, 1));
     // The input's `lo` takes its own slot; its `hi` is appended after the originals. Each is
     // passed the way `x` is (a borrowed vector by reference on the CPU).
     for (v, name) in [(lo, "lo"), (hi, "hi")] {
@@ -103,14 +100,11 @@ pub(super) fn interval(
     let rty = m.functions[d.index()]
         .ret
         .ok_or_else(|| Error::internal("a derived function returns nothing"))?;
-    let r = g.new_value(rty);
-    body.push(Stmt::Let(r, Expr::Call(d, args)));
+    let r = g.let_(&mut body, rty, Expr::Call(d, args));
     let (mut rlo, mut rhi) = (r, r);
     if returns {
-        rlo = g.new_value(out_ty);
-        body.push(Stmt::Let(rlo, Expr::Extract(r, 0)));
-        rhi = g.new_value(out_ty);
-        body.push(Stmt::Let(rhi, Expr::Extract(r, 1)));
+        rlo = g.let_(&mut body, out_ty, Expr::Extract(r, 0));
+        rhi = g.let_(&mut body, out_ty, Expr::Extract(r, 1));
     }
     if target == Target::Cpu {
         // A NaN bound means "unknown": make it infinite, a component at a time.
@@ -123,33 +117,21 @@ pub(super) fn interval(
             let mut parts = Vec::new();
             for c in 0..n.unwrap_or(1) {
                 let x = match n {
-                    Some(_) => {
-                        let x = g.new_value(f32);
-                        body.push(Stmt::Let(x, Expr::Extract(*v, c)));
-                        x
-                    }
+                    Some(_) => g.let_(&mut body, f32, Expr::Extract(*v, c)),
                     None => *v,
                 };
-                let ok = g.new_value(b);
-                body.push(Stmt::Let(ok, Expr::Binary(BinOp::Eq, x, x)));
-                let k = g.new_value(f32);
-                body.push(Stmt::Let(k, Expr::Const(Const::F32(inf))));
-                let s = g.new_value(f32);
-                body.push(Stmt::Let(s, Expr::Select { cond: ok, if_true: x, if_false: k }));
+                let ok = g.let_(&mut body, b, Expr::Binary(BinOp::Eq, x, x));
+                let k = g.let_(&mut body, f32, Expr::Const(Const::F32(inf)));
+                let s = g.let_(&mut body, f32, Expr::Select { cond: ok, if_true: x, if_false: k });
                 parts.push(s);
             }
             *v = match n {
-                Some(_) => {
-                    let w = g.new_value(out_ty);
-                    body.push(Stmt::Let(w, Expr::Construct(out_ty, parts)));
-                    w
-                }
+                Some(_) => g.let_(&mut body, out_ty, Expr::Construct(out_ty, parts)),
                 None => parts[0],
             };
         }
     }
-    let out = g.new_value(interval_ty);
-    body.push(Stmt::Let(out, Expr::Construct(interval_ty, vec![rlo, rhi])));
+    let out = g.let_(&mut body, interval_ty, Expr::Construct(interval_ty, vec![rlo, rhi]));
     body.push(Stmt::Return(Some(out)));
     g.body = body;
     Ok(m.add_function(g))
@@ -822,8 +804,7 @@ impl<'a> Ivx<'a> {
         let hi = self.nf.new_local("hull_hi", ty);
         out.push(Stmt::Store(Place::local(k), first));
         let e = element(self, out, first)?;
-        out.push(Stmt::Store(Place::local(lo), e.0));
-        out.push(Stmt::Store(Place::local(hi), e.1));
+        Self::store_pair(out, (lo, hi), e);
         let mut body = Vec::new();
         let i = self.emit(&mut body, u32t, Expr::Load(Place::local(k)));
         let one = self.emit(&mut body, u32t, Expr::Const(Const::U32(1)));
@@ -832,18 +813,11 @@ impl<'a> Ivx<'a> {
         body.push(Stmt::If { cond: past, then: vec![Stmt::Break], else_: Vec::new() });
         body.push(Stmt::Store(Place::local(k), next));
         let e = element(self, &mut body, next)?;
-        let acc = (
-            self.emit(&mut body, ty, Expr::Load(Place::local(lo))),
-            self.emit(&mut body, ty, Expr::Load(Place::local(hi))),
-        );
+        let acc = self.load_pair(&mut body, (lo, hi), ty);
         let joined = self.hull(&mut body, ty, acc, e)?;
-        body.push(Stmt::Store(Place::local(lo), joined.0));
-        body.push(Stmt::Store(Place::local(hi), joined.1));
+        Self::store_pair(&mut body, (lo, hi), joined);
         out.push(Stmt::Loop { body, continuing: Vec::new() });
-        Ok((
-            self.emit(out, ty, Expr::Load(Place::local(lo))),
-            self.emit(out, ty, Expr::Load(Place::local(hi))),
-        ))
+        Ok(self.load_pair(out, (lo, hi), ty))
     }
 
     /// The hull of two ranges of type `ty`.
@@ -865,6 +839,20 @@ impl<'a> Ivx<'a> {
                 Err(Error::internal("the range of a resource, pointer or constant as a whole"))
             }
         }
+    }
+
+    /// The range a pair of locals, its `lo`'s and its `hi`'s, holds.
+    fn load_pair(&mut self, out: &mut Block, (lo, hi): (LocalId, LocalId), ty: TypeId) -> Iv {
+        (
+            self.emit(out, ty, Expr::Load(Place::local(lo))),
+            self.emit(out, ty, Expr::Load(Place::local(hi))),
+        )
+    }
+
+    /// Stores a range in a pair of locals, its `lo`'s and its `hi`'s.
+    fn store_pair(out: &mut Block, (lo, hi): (LocalId, LocalId), x: Iv) {
+        out.push(Stmt::Store(Place::local(lo), x.0));
+        out.push(Stmt::Store(Place::local(hi), x.1));
     }
 
     fn load_root(&mut self, out: &mut Block, r: &PlaceRoot) -> R<Iv> {
@@ -1084,15 +1072,10 @@ impl<'a> Ivx<'a> {
         let mut first_stores = Vec::new();
         let mut later_stores = Vec::new();
         for (l, h, t, g) in ends {
-            first_stores.push(Stmt::Store(Place::local(l), g.0));
-            first_stores.push(Stmt::Store(Place::local(h), g.1));
-            let acc = (
-                self.emit(&mut later_stores, t, Expr::Load(Place::local(l))),
-                self.emit(&mut later_stores, t, Expr::Load(Place::local(h))),
-            );
+            Self::store_pair(&mut first_stores, (l, h), g);
+            let acc = self.load_pair(&mut later_stores, (l, h), t);
             let j = self.merge(&mut later_stores, t, (no, yes), g, acc)?;
-            later_stores.push(Stmt::Store(Place::local(l), j.0));
-            later_stores.push(Stmt::Store(Place::local(h), j.1));
+            Self::store_pair(&mut later_stores, (l, h), j);
         }
         each.push(Stmt::If { cond: is_first, then: first_stores, else_: later_stores });
         each.push(Stmt::Store(Place::local(first), no));
@@ -1108,17 +1091,11 @@ impl<'a> Ivx<'a> {
             None => self.iv.remove(&v),
         };
         for (r, &(l, h, t)) in roots.iter().zip(&accs) {
-            let j = (
-                self.emit(out, t, Expr::Load(Place::local(l))),
-                self.emit(out, t, Expr::Load(Place::local(h))),
-            );
+            let j = self.load_pair(out, (l, h), t);
             self.store_root(out, r, j)?;
         }
         if let (Some(r), Some((l, h, t))) = (returned, ret_acc) {
-            let j = (
-                self.emit(out, t, Expr::Load(Place::local(l))),
-                self.emit(out, t, Expr::Load(Place::local(h))),
-            );
+            let j = self.load_pair(out, (l, h), t);
             self.iv.insert(r, j);
         }
         Ok(())
@@ -1968,14 +1945,18 @@ impl<'a> Ivx<'a> {
         // WGSL: 2.5 ulp; WASM: correctly rounded.
         let ulps = if self.gpu() { 6.0 } else { 1.0 };
         let r = self.widen(out, r, ty, ulps, 0.0);
-        // A divisor that could be zero: unbounded.
         let z = self.fc(out, ty, 0.0);
+        Ok(self.unless_divisor_zero(out, ty, b, z, r))
+    }
+
+    /// `r`, or the whole range where the divisor's range `b` holds zero (`z`, a zero of `ty`).
+    fn unless_divisor_zero(&mut self, out: &mut Block, ty: TypeId, b: Iv, z: ValueId, r: Iv) -> Iv {
         let le = self.cmp(out, BinOp::Le, b.0, z);
         let ge = self.cmp(out, BinOp::Ge, b.1, z);
         let bt = self.bool_ty();
         let zero_in = self.bin(out, BinOp::And, le, ge, bt);
         let (fl, fh) = self.full(out, ty);
-        Ok((self.select(out, zero_in, fl, r.0), self.select(out, zero_in, fh, r.1)))
+        (self.select(out, zero_in, fl, r.0), self.select(out, zero_in, fh, r.1))
     }
 
     /// `a - b trunc(a / b)`: the sign of `a`, smaller than `|b|`, and within rounding of that.
@@ -1997,12 +1978,7 @@ impl<'a> Ivx<'a> {
         let mag = self.bin(out, BinOp::Add, am, bm, ty);
         let ulps = if self.gpu() { 16.0 } else { 4.0 };
         let r = self.widen_mag(out, (lo, hi), ty, (mag, mag), ulps, 0.0);
-        let le = self.cmp(out, BinOp::Le, b.0, z);
-        let ge = self.cmp(out, BinOp::Ge, b.1, z);
-        let bt = self.bool_ty();
-        let zero_in = self.bin(out, BinOp::And, le, ge, bt);
-        let (fl, fh) = self.full(out, ty);
-        Ok((self.select(out, zero_in, fl, r.0), self.select(out, zero_in, fh, r.1)))
+        Ok(self.unless_divisor_zero(out, ty, b, z, r))
     }
 
     fn compare(&mut self, out: &mut Block, op: BinOp, a: Iv, b: Iv, s: Scalar) -> Iv {
@@ -2515,12 +2491,11 @@ impl<'a> Ivx<'a> {
         let far = self.builtin(out, Builtin::Max, vec![cl, ch], ty);
         let zero = self.fc(out, ty, 0.0);
         let one = self.fc(out, ty, 1.0);
-        let bt = self.m.types.bool();
-        let below = self.emit(out, bt, Expr::Binary(BinOp::Le, lo, zero));
-        let above = self.emit(out, bt, Expr::Binary(BinOp::Ge, hi, zero));
-        let holds = self.emit(out, bt, Expr::Binary(BinOp::And, below, above));
-        let low = self.emit(out, ty, Expr::Select { cond: holds, if_true: one, if_false: near });
-        Ok((low, far))
+        let below = self.cmp(out, BinOp::Le, lo, zero);
+        let above = self.cmp(out, BinOp::Ge, hi, zero);
+        let bt = self.bool_ty();
+        let holds = self.bin(out, BinOp::And, below, above, bt);
+        Ok((self.select(out, holds, one, near), far))
     }
 
     fn sin(&mut self, out: &mut Block, ty: TypeId, x: &[Iv]) -> R<Iv> {
@@ -2814,11 +2789,7 @@ mod tests {
         let float = m.types.f32();
         let index_ty = m.types.scalar(index_scalar);
         let array = m.types.intern(TypeDef::Array(float, n));
-        let mut f = Function::new(
-            "array_index",
-            vec![Param { name: "x".into(), ty: float, by_ref: false, mutable: false }],
-            Some(float),
-        );
+        let mut f = Function::new("array_index", vec![Param::value("x", float)], Some(float));
         let mut body = Vec::new();
         let x = f.let_(&mut body, float, Expr::Param(0));
         let index = f.let_(&mut body, index_ty, Expr::Convert(x, index_scalar));
@@ -2844,11 +2815,7 @@ mod tests {
     ) {
         let mut m = Module::default();
         let ty = m.types.vector_of(scalar, 2);
-        let mut f = Function::new(
-            "vector",
-            vec![Param { name: "x".into(), ty, by_ref: false, mutable: false }],
-            Some(ty),
-        );
+        let mut f = Function::new("vector", vec![Param::value("x", ty)], Some(ty));
         let mut body = Vec::new();
         let x = f.let_(&mut body, ty, Expr::Param(0));
         let result = op(&mut m.types, &mut f, &mut body, ty, x);

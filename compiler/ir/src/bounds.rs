@@ -14,13 +14,15 @@ use std::collections::HashSet;
 /// indexes nothing it checks, so it needs no flag.
 pub fn add_checks(m: &mut Module, binding: u32, code: u32) -> Option<ResourceId> {
     let skip = vertex_reach(m);
-    let any = (0..m.functions.len()).any(|i| {
+    let any = m.functions.iter().enumerate().any(|(i, f)| {
         let mut found = false;
-        visit::walk(&m.functions[i].body, &mut |s| {
-            s.for_each_place(&mut |p| found |= p.has_index());
-            found |= matches!(s.expr(), Some(Expr::ExtractDyn(..)));
-        });
-        found && !skip.contains(&FuncId(i as u32))
+        if !skip.contains(&FuncId(i as u32)) {
+            visit::walk(&f.body, &mut |s| {
+                s.for_each_place(&mut |p| found |= p.has_index());
+                found |= matches!(s.expr(), Some(Expr::ExtractDyn(..)));
+            });
+        }
+        found
     });
     if !any {
         return None;
@@ -84,15 +86,10 @@ impl Checks<'_> {
     fn stmt(&mut self, s: Stmt, out: &mut Block) {
         let mut checks = Vec::new();
         s.for_each_place(&mut |p| self.place_checks(p, &mut checks));
-        if let Some(Expr::ExtractDyn(x, i)) = s.expr() {
-            let n = match self.m.types.get(self.f.value_ty(*x)) {
-                TypeDef::Array(_, n) => Some(*n),
-                TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => Some(u32::from(*n)),
-                _ => None,
-            };
-            if let Some(n) = n {
-                checks.push((*i, Len::Const(n)));
-            }
+        if let Some(Expr::ExtractDyn(x, i)) = s.expr()
+            && let Some(n) = self.m.types.index_len(self.f.value_ty(*x))
+        {
+            checks.push((*i, Len::Const(n)));
         }
         for (i, len) in checks {
             self.check(out, i, len);
@@ -113,14 +110,10 @@ impl Checks<'_> {
         }
         let Some((mut t, path)) = self.m.place_start(self.f, p) else { return };
         for proj in path {
-            if let Proj::Index(i) = proj {
-                match self.m.types.get(t) {
-                    TypeDef::Array(_, n) => out.push((*i, Len::Const(*n))),
-                    TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => {
-                        out.push((*i, Len::Const(u32::from(*n))))
-                    }
-                    _ => {}
-                }
+            if let Proj::Index(i) = proj
+                && let Some(n) = self.m.types.index_len(t)
+            {
+                out.push((*i, Len::Const(n)));
             }
             let Some(next) = self.m.proj_ty(t, proj) else { return };
             t = next;

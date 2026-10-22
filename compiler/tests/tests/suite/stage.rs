@@ -4,7 +4,7 @@
 //! and intervals are in the corpus's gradient and enclosure tests (derive.rs).
 
 use crate::built;
-use wrela_host::{CpuBuild, Host, Value};
+use wrela_host::{Host, Value};
 use wrela_tests::{f32s, one_f32, one_u32};
 
 const TWINS: [&str; 3] = ["sphere", "waves", "blob"];
@@ -15,7 +15,7 @@ const TOLERANCE: f32 = 1e-5;
 #[test]
 fn tapes_match_their_compiled_fields_on_the_cpu() {
     let dir = built("fields");
-    let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(&dir);
     for (k, name) in TWINS.iter().enumerate() {
         let args = [Value::I32(k as i32), Value::I32(17), Value::I32(POINTS as i32)];
         let worst = one_f32(&mut host, "tape_error_cpu", &args);
@@ -48,7 +48,7 @@ fn tapes_match_their_compiled_fields_on_the_gpu() {
 #[test]
 fn pruning_keeps_the_value_in_its_box() {
     let dir = built("fields");
-    let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(&dir);
     assert_eq!(one_u32(&mut host, "blob_tape_len", &[]), 35);
     // Beside the first and third spheres: the second, and its blend, go. Inside the third:
     // all but it go, and the last blend becomes a copy of it.

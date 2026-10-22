@@ -8,30 +8,18 @@ use wrela_host::{CpuBuild, Value};
 
 /// `main` built into a scratch directory of its own: the build's directory.
 fn built(name: &str, main: &str) -> PathBuf {
-    let root =
-        wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("messages-{name}"));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = super::scratch(&format!("messages-{name}"));
     let pkg = root.join("pkg");
-    std::fs::create_dir_all(&pkg).expect("scratch package");
-    std::fs::write(pkg.join("wrela.toml"), format!("[package]\nname = \"{name}\"\n"))
-        .expect("manifest");
-    std::fs::write(pkg.join("main.wrela"), main).expect("main");
+    super::write_package(&pkg, name, main);
     let out = root.join("build");
     wrela_tests::must_build(&pkg, &out);
     out
 }
 
 fn errors(name: &str, main: &str) -> (Vec<String>, String) {
-    let dir =
-        wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("messages-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("scratch package");
-    std::fs::write(dir.join("wrela.toml"), format!("[package]\nname = \"{name}\"\n"))
-        .expect("manifest");
-    std::fs::write(dir.join("main.wrela"), main).expect("main");
-    let out = wrela_driver::check(&dir);
-    let codes = out.diagnostics.iter().map(|d| d.code.as_str().to_string()).collect();
-    (codes, wrela_diag::render::render_all(&out.sources, &out.diagnostics))
+    let dir = super::scratch(&format!("messages-{name}"));
+    super::write_package(&dir, name, main);
+    super::checked(&dir)
 }
 
 const CLIENT: &str = r#"

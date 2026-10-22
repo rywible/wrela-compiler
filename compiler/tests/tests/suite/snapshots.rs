@@ -2,18 +2,11 @@
 //! with `clone_into`, checksums are the derived `StateHash`, and rollback restores a keyframe
 //! and replays the inputs since.
 
-use wrela_host::{CpuBuild, CpuHost, Value};
-use wrela_tests::{one_u32, page};
+use wrela_host::{CpuHost, Value};
+use wrela_tests::{one_u32, one_u64, page};
 
 fn call(host: &mut CpuHost, name: &str, args: &[Value]) -> Vec<Value> {
     host.call_export(name, args).unwrap_or_else(|e| panic!("{name}: {e}"))
-}
-
-fn u64_of(v: &[Value]) -> u64 {
-    match v {
-        [Value::I64(x)] => *x as u64,
-        other => panic!("returned {other:?}"),
-    }
 }
 
 /// xorshift64*: the test's inputs and choices, the same every run.
@@ -41,11 +34,11 @@ const EVERY: u32 = 25;
 #[test]
 fn replayed_ticks_give_the_same_hashes() {
     let (dir, _) = page("compiler/tests/snapshots", "snapshots-replay");
-    let mut host = CpuBuild::load(&dir).expect("load").start_with(1).expect("start");
+    let mut host = crate::cpu_host(&dir);
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     // The count works: a clone allocates its 3 `Vec`s and 4 strings' buffers.
     assert_eq!(one_u32(&mut host, "clone_allocations", &[]), 7);
-    let initial = u64_of(&call(&mut host, "hash", &[]));
+    let initial = one_u64(&mut host, "hash", &[]);
     // `inputs[t]` is tick t's input; `hashes[t]` the hash after it.
     let mut inputs: Vec<u32> = Vec::new();
     let mut hashes: Vec<u64> = Vec::new();
@@ -58,7 +51,7 @@ fn replayed_ticks_give_the_same_hashes() {
             let slot = (t / EVERY) as usize % SLOTS;
             call(&mut host, "keyframe", &[Value::I32(slot as i32)]);
             assert_eq!(one_u32(&mut host, "allocated", &[]), 0, "a keyframe at tick {t}");
-            let kept = u64_of(&call(&mut host, "keyframe_hash", &[Value::I32(slot as i32)]));
+            let kept = one_u64(&mut host, "keyframe_hash", &[Value::I32(slot as i32)]);
             assert_eq!(kept, hash_at(&hashes, t), "the keyframe of tick {t}");
             slots[slot] = Some(t);
         }
@@ -66,10 +59,10 @@ fn replayed_ticks_give_the_same_hashes() {
             let input = rng.below(1000) as u32;
             inputs.push(input);
             call(&mut host, "tick", &[Value::I32(input as i32)]);
-            hashes.push(u64_of(&call(&mut host, "hash", &[])));
+            hashes.push(one_u64(&mut host, "hash", &[]));
         } else {
             call(&mut host, "tick", &[Value::I32(inputs[t as usize] as i32)]);
-            let h = u64_of(&call(&mut host, "hash", &[]));
+            let h = one_u64(&mut host, "hash", &[]);
             assert_eq!(h, hashes[t as usize], "tick {t}, replayed");
             replayed += 1;
         }
@@ -80,11 +73,7 @@ fn replayed_ticks_give_the_same_hashes() {
             call(&mut host, "restore", &[Value::I32(slot as i32)]);
             assert_eq!(one_u32(&mut host, "allocated", &[]), 0, "a restore");
             let k = slots[slot].expect("kept");
-            assert_eq!(
-                u64_of(&call(&mut host, "hash", &[])),
-                hash_at(&hashes, k),
-                "restored to {k}"
-            );
+            assert_eq!(one_u64(&mut host, "hash", &[]), hash_at(&hashes, k), "restored to {k}");
             restores += 1;
         }
     }

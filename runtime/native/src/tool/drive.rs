@@ -41,8 +41,9 @@ mod wire;
 
 pub use child::run as run_child;
 
-use super::services::{Answer, Body, Data, Services, Task, Work};
+use super::services::{Answer, Body, Data, Resources, Services, Task, Work, err, ok};
 use super::toolchain::Out;
+use crate::locked;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::PathBuf;
@@ -66,36 +67,13 @@ const COMPILED: u8 = 0;
 const CACHED: u8 = 1;
 const REUSED: u8 = 2;
 
-/// The driven builds of one run: each by its handle, and each request's that the tool hasn't
-/// been told of.
-#[derive(Default)]
-pub(crate) struct Drives {
-    held: HashMap<u32, Arc<Driven>>,
-    next: u32,
-    unpublished: HashMap<u32, Vec<u32>>,
-}
+/// The driven builds of one run ([`Resources`]).
+pub(crate) type Drives = Resources<Driven>;
 
 impl Drives {
-    /// The tool has read request `request`'s answer: its driven build is the tool's now.
-    pub(crate) fn publish(&mut self, request: u32) {
-        self.unpublished.remove(&request);
-    }
-
-    /// Request `request` failed: the builds made for it, which no answer names, are closed.
-    pub(crate) fn rollback(&mut self, request: u32) -> Vec<Arc<Driven>> {
-        let ids = self.unpublished.remove(&request).unwrap_or_default();
-        ids.iter().filter_map(|id| self.held.remove(id)).collect()
-    }
-
-    /// Takes every build, to close: the tool has ended.
-    pub(crate) fn take_all(&mut self) -> Vec<Arc<Driven>> {
-        self.unpublished.clear();
-        self.held.drain().map(|(_, d)| d).collect()
-    }
-
     /// Kills every build's process group: the tool has ended.
     pub(crate) fn stop_all(&self) {
-        for d in self.held.values() {
+        for d in self.all() {
             d.stop("the tool ended");
         }
     }
@@ -122,10 +100,6 @@ pub(crate) struct Driven {
     stopped: Mutex<Option<String>>,
     code: Mutex<Option<u8>>,
     storage: Option<PathBuf>,
-}
-
-fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl Driven {
@@ -315,10 +289,6 @@ fn deadline(b: &mut Body) -> Result<Duration, String> {
     super::http::deadline(f64::from_bits(b.u64()?), DEADLINE)
 }
 
-fn failed(why: String) -> Work {
-    Work::Now(Answer::Bytes([&[1u8][..], why.as_bytes()].concat()))
-}
-
 /// A load's request, read: how to load it, its storage, its deadline.
 fn load_request(b: &mut Body) -> Result<(Load, String, Duration), String> {
     let load = Load::parse(b)?;
@@ -330,7 +300,7 @@ fn load_request(b: &mut Body) -> Result<(Load, String, Duration), String> {
 pub(crate) fn route(name: &str, b: &mut Body) -> Work {
     match task(name, b, Instant::now()) {
         Ok(task) => Work::Drive(task),
-        Err(why) => failed(why),
+        Err(why) => Work::Now(err(&why)),
     }
 }
 
@@ -371,16 +341,15 @@ fn task(name: &str, b: &mut Body, entered: Instant) -> Result<Task, String> {
         }
         "steps" | "posts" => {
             let handle = b.u32()?;
-            let (kind, bytes) = if name == "steps" {
+            let (kind, bytes, what) = if name == "steps" {
                 let mut out = Out::default();
                 wire::write_steps(&mut out, &wire::parse_steps(b)?);
-                (wire::STEPS, out.0)
+                (wire::STEPS, out.0, "steps")
             } else {
-                (wire::POSTS, Vec::new())
+                (wire::POSTS, Vec::new(), "posts")
             };
             let deadline = deadline(b)?;
             b.end()?;
-            let what = if name == "steps" { "steps" } else { "posts" };
             Box::new(move |s, request| {
                 let due = entered + deadline;
                 let done = operate(s, request, handle, kind, bytes, what, due, deadline);
@@ -390,15 +359,6 @@ fn task(name: &str, b: &mut Body, entered: Instant) -> Result<Task, String> {
         _ => return Err(format!("the drive service has no `{name}`")),
     };
     Ok(task)
-}
-
-/// The handle `handle`'s build.
-fn find(s: &Services, handle: u32) -> Result<Arc<Driven>, String> {
-    s.drives()
-        .held
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| format!("the tool holds no driven build {handle}"))
 }
 
 /// Why a request that ran past its deadline failed.
@@ -663,11 +623,7 @@ fn start(
     // Opened through the grants, once, now: the process gets these directories alone.
     let (_, build) = s.caps.open_dir(&load.path)?;
     let root = s.caps.root_handle(&load.path)?;
-    let handle = {
-        let mut d = s.drives();
-        d.next += 1;
-        d.next
-    };
+    let handle = s.drives().reserve();
     // The build's storage: a write root's directory the tool names, which it keeps, or a
     // directory of the host's, removed with the build.
     let (owned, storage) = if storage.is_empty() {
@@ -743,11 +699,7 @@ fn start(
         storage: owned,
     });
     // Registered under its request before any answer names it.
-    {
-        let mut d = s.drives();
-        d.held.insert(handle, driven.clone());
-        d.unpublished.entry(request).or_default().push(handle);
-    }
+    s.drives().hold(request, handle, driven.clone());
     let (services, weak) = (Arc::downgrade(s), Arc::downgrade(&driven));
     let from = File::from(std::os::fd::OwnedFd::from(from));
     let reader = std::thread::Builder::new()
@@ -779,7 +731,7 @@ fn operate(
     if Instant::now() >= due {
         return Err(format!("`{what}` didn't start within its deadline"));
     }
-    let driven = find(s, handle)?;
+    let driven = s.drives().find(handle, "driven build")?;
     if driven.busy.swap(true, Ordering::AcqRel) {
         return Err(format!("the driven build {handle} is busy with another request"));
     }
@@ -802,12 +754,8 @@ fn answered(
     let mut out = Out::default();
     out.u32(post);
     match answer {
-        Ok(Data::Bytes(bytes)) => {
-            out.u8(0).0.extend_from_slice(&bytes);
-        }
-        Ok(Data::Blob(id)) => {
-            let bytes = s.blobs().get(id)?;
-            out.u8(0).0.extend_from_slice(&bytes);
+        Ok(data) => {
+            out.u8(0).0.extend_from_slice(&s.data(data)?);
         }
         Err(why) => {
             out.u8(1).0.extend_from_slice(why.as_bytes());
@@ -845,15 +793,16 @@ fn run(
 
 /// Closes `handle`'s build.
 fn closed(s: &Services, handle: u32) -> Answer {
-    let driven = s.drives().held.remove(&handle);
-    let Some(driven) = driven else {
-        return super::services::answer(Err(format!("the tool holds no driven build {handle}")));
+    let driven = s.drives().take(handle, "driven build");
+    let driven = match driven {
+        Ok(d) => d,
+        Err(why) => return err(&why),
     };
     if !driven.close(s.grace, &s.strays) {
         let _ = s.stuck.set(format!("the driven build {handle} didn't close within {:?}", s.grace));
-        return super::services::answer(Err(format!("the driven build {handle} didn't close")));
+        return err(&format!("the driven build {handle} didn't close"));
     }
-    super::services::answer(Ok(Vec::new()))
+    ok(&[])
 }
 
 #[cfg(test)]

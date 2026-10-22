@@ -154,7 +154,7 @@ fn stop(child: &mut std::process::Child, group: i32) {
 }
 
 /// A request's files in the run's directory, removed however the request ends.
-struct Files(Vec<std::path::PathBuf>);
+pub(crate) struct Files(pub(crate) Vec<std::path::PathBuf>);
 
 impl Drop for Files {
     fn drop(&mut self) {

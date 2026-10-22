@@ -429,21 +429,8 @@ impl Cx<'_> {
                 }
                 Value::Parts(out)
             }
-            ir::TypeDef::Struct { fields, .. } => {
-                let mut out = Vec::new();
-                for (k, ft) in self.field_map(mb, t, None, span) {
-                    let Some(k) = k else { continue };
-                    let (_, fit) = fields[k as usize];
-                    out.push(self.read(
-                        mb,
-                        (ft, fit),
-                        mem,
-                        at + offsets[k as usize],
-                        span,
-                        depth,
-                    )?);
-                }
-                Value::Parts(out)
+            ir::TypeDef::Struct { .. } => {
+                self.read_fields(mb, t, None, it, mem, at, span, depth)?
             }
             ir::TypeDef::Enum { variants, .. } => {
                 // Memory holds the variant's tag, its discriminant: its variant, by index.
@@ -457,25 +444,8 @@ impl Cx<'_> {
                 let payload = match payload {
                     Some(pt) => {
                         let base = at + offsets[1 + k as usize];
-                        let poffsets = field_offsets(&mb.m.types, *pt).to_vec();
-                        let pfields = match mb.m.types.get(*pt) {
-                            ir::TypeDef::Struct { fields, .. } => fields.clone(),
-                            _ => Vec::new(),
-                        };
-                        let mut out = Vec::new();
-                        for (j, ft) in self.field_map(mb, t, Some(k), span) {
-                            let Some(j) = j else { continue };
-                            let (_, fit) = pfields[j as usize];
-                            out.push(self.read(
-                                mb,
-                                (ft, fit),
-                                mem,
-                                base + poffsets[j as usize],
-                                span,
-                                depth,
-                            )?);
-                        }
-                        Some(Box::new(Value::Parts(out)))
+                        let v = self.read_fields(mb, t, Some(k), *pt, mem, base, span, depth)?;
+                        Some(Box::new(v))
                     }
                     None => None,
                 };
@@ -485,6 +455,34 @@ impl Cx<'_> {
                 return Err(format!("a value of type {} points into memory", self.show(t)).into());
             }
         })
+    }
+
+    /// Reads the fields of a struct `t` or (with `variant`) of a variant's payload, at `at`:
+    /// `st` is its IR struct.
+    #[allow(clippy::too_many_arguments)]
+    fn read_fields(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        t: TyId,
+        variant: Option<u32>,
+        st: ir::TypeId,
+        mem: &Memory,
+        at: u32,
+        span: Span,
+        depth: u32,
+    ) -> Result<Value, ReadError> {
+        let offsets = ir::layout::field_offsets(&mb.m.types, st).to_vec();
+        let fields = match mb.m.types.get(st) {
+            ir::TypeDef::Struct { fields, .. } => fields.clone(),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        for (k, ft) in self.field_map(mb, t, variant, span) {
+            let Some(k) = k else { continue };
+            let (_, fit) = fields[k as usize];
+            out.push(self.read(mb, (ft, fit), mem, at + offsets[k as usize], span, depth)?);
+        }
+        Ok(Value::Parts(out))
     }
 
     fn show(&self, t: TyId) -> String {
@@ -551,17 +549,12 @@ impl Cx<'_> {
                 return None;
             };
             // GPU code has no addresses: a text there is its length alone (`gpu_run`).
-            if mb.target() == ir::Target::Gpu {
-                return Some(ir::ConstValue::Parts(vec![
-                    ir::ConstValue::Scalar(ir::Const::U32(0)),
-                    ir::ConstValue::Scalar(len.clone()),
-                ]));
-            }
-            let d = self.bytes_data(mb, bs);
-            return Some(ir::ConstValue::Parts(vec![
-                ir::ConstValue::Addr(d),
-                ir::ConstValue::Scalar(len.clone()),
-            ]));
+            let data = if mb.target() == ir::Target::Gpu {
+                ir::ConstValue::Scalar(ir::Const::U32(0))
+            } else {
+                ir::ConstValue::Addr(self.bytes_data(mb, bs))
+            };
+            return Some(ir::ConstValue::Parts(vec![data, ir::ConstValue::Scalar(len.clone())]));
         }
         let def = mb.m.types.get(it).clone();
         Some(match (def, v) {
@@ -579,35 +572,16 @@ impl Cx<'_> {
                 ir::ConstValue::Parts(out)
             }
             (ir::TypeDef::Struct { fields, .. }, Value::Parts(xs)) => {
-                let map: Vec<TyId> = self
-                    .field_map(mb, t, None, span)
-                    .into_iter()
-                    .filter_map(|(k, ft)| k.map(|_| ft))
-                    .collect();
-                let mut out = Vec::with_capacity(xs.len());
-                for ((x, ft), (_, fit)) in xs.iter().zip(map).zip(fields) {
-                    out.push(self.place_value(mb, ft, fit, x, span)?);
-                }
-                ir::ConstValue::Parts(out)
+                self.place_fields(mb, t, None, &fields, xs, span)?
             }
             (ir::TypeDef::Enum { variants, .. }, Value::Variant(k, payload)) => {
                 let payload = match (payload, variants.get(*k as usize)?.1) {
                     (Some(p), Some(pt)) => {
                         let Value::Parts(xs) = p.as_ref() else { return None };
-                        let pfields = match mb.m.types.get(pt) {
-                            ir::TypeDef::Struct { fields, .. } => fields.clone(),
-                            _ => return None,
+                        let ir::TypeDef::Struct { fields, .. } = mb.m.types.get(pt).clone() else {
+                            return None;
                         };
-                        let map: Vec<TyId> = self
-                            .field_map(mb, t, Some(*k), span)
-                            .into_iter()
-                            .filter_map(|(k, ft)| k.map(|_| ft))
-                            .collect();
-                        let mut out = Vec::with_capacity(xs.len());
-                        for ((x, ft), (_, fit)) in xs.iter().zip(map).zip(pfields) {
-                            out.push(self.place_value(mb, ft, fit, x, span)?);
-                        }
-                        Some(Box::new(ir::ConstValue::Parts(out)))
+                        Some(Box::new(self.place_fields(mb, t, Some(*k), &fields, xs, span)?))
                     }
                     _ => None,
                 };
@@ -615,6 +589,26 @@ impl Cx<'_> {
             }
             _ => return None,
         })
+    }
+
+    /// The fields `xs` of a struct `t` or (with `variant`) of a variant's payload, as constant
+    /// data: `fields` are its IR fields.
+    fn place_fields(
+        &mut self,
+        mb: &mut ModuleBuilder,
+        t: TyId,
+        variant: Option<u32>,
+        fields: &[(String, ir::TypeId)],
+        xs: &[Value],
+        span: Span,
+    ) -> Option<ir::ConstValue> {
+        let map = self.field_map(mb, t, variant, span);
+        let tys = map.into_iter().filter_map(|(k, ft)| k.map(|_| ft));
+        let mut out = Vec::with_capacity(xs.len());
+        for ((x, ft), &(_, fit)) in xs.iter().zip(tys).zip(fields) {
+            out.push(self.place_value(mb, ft, fit, x, span)?);
+        }
+        Some(ir::ConstValue::Parts(out))
     }
 
     /// Constant data holding `bytes`: text's, shared with string literals.

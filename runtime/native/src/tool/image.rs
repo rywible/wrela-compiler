@@ -19,7 +19,7 @@
 //! doesn't stop), the run is the host's failure (status 71), as an HTTP client that won't return
 //! is.
 
-use super::services::{Answer, Body, Data, Services, Task, Work};
+use super::services::{Body, Data, Services, Task, Work};
 use super::toolchain::Out;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -110,16 +110,7 @@ pub(crate) fn route(name: &str, b: &mut Body) -> Work {
             });
             Work::Heavy(task)
         }
-        Err(why) => Work::Now(Answer::Bytes([&[1u8][..], why.as_bytes()].concat())),
-    }
-}
-
-/// The bytes `data` names: its own, or its blob's, shared (while they're held, the blob can't be
-/// appended to or released, as while a file is written from it).
-fn bytes(s: &Services, data: Data) -> Result<Arc<Vec<u8>>, String> {
-    match data {
-        Data::Bytes(b) => Ok(Arc::new(b)),
-        Data::Blob(id) => s.blobs().get(id),
+        Err(why) => Work::Now(super::services::err(&why)),
     }
 }
 
@@ -186,7 +177,7 @@ fn carry_out(
     // that the budget doesn't hold.
     let (reserve, sized, job): (u64, bool, Job) = match op {
         Op::Decode(data) => {
-            let input = bytes(s, data)?;
+            let input = s.data(data)?;
             let layout = header(&input)?;
             side(layout.width, layout.height)?;
             // The RGBA, and the most the decoder holds besides.
@@ -194,7 +185,7 @@ fn carry_out(
             (rgba + layout.working, true, Box::new(move |cancel| decode(&input, cancel)))
         }
         Op::Resize { rgba, size, to } => {
-            let input = bytes(s, rgba)?;
+            let input = s.data(rgba)?;
             pixels(&input, size)?;
             let job: Job = Box::new(move |cancel| {
                 let (out, _) = lanczos(&input, size, to, cancel)?;
@@ -203,7 +194,7 @@ fn carry_out(
             (resize_most(size, to), true, job)
         }
         Op::Png { rgba, size } => {
-            let input = bytes(s, rgba)?;
+            let input = s.data(rgba)?;
             pixels(&input, size)?;
             let most = png_most(size.0, size.1);
             let job: Job = Box::new(move |cancel| {
@@ -214,7 +205,7 @@ fn carry_out(
             (2 * most + 4 * u64::from(size.0) + (1 << 20), false, job)
         }
         Op::Webp { rgba, size, quality, method } => {
-            let input = bytes(s, rgba)?;
+            let input = s.data(rgba)?;
             pixels(&input, size)?;
             let most = webp_most(size.0, size.1);
             let n = input.len() as u64;
@@ -301,7 +292,7 @@ fn apart(
         "`{what}` for request {request} didn't stop within {grace:?} of being cancelled"
     ));
     // Left to the run's end, which counts it if it still runs.
-    s.strays.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(thread);
+    crate::locked(&s.strays).push(thread);
     Err(why)
 }
 

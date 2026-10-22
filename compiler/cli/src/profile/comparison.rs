@@ -51,10 +51,6 @@ pub(super) fn lease(path: &Path) -> Result<File, String> {
     Ok(file)
 }
 
-fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
 pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
     let machine = std::fs::read("/etc/machine-id")
         .or_else(|_| {
@@ -71,17 +67,17 @@ pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
     }
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     Ok(value!({
-        "machine_sha256": digest(&machine), "os": std::env::consts::OS,
+        "machine_sha256": crate::sha256_hex(&machine), "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH, "adapter": host.adapter(),
         "logical_cpus": std::thread::available_parallelism().map_err(|e| e.to_string())?.get(),
-        "host_sha256": digest(&std::fs::read(executable).map_err(|e| e.to_string())?),
+        "host_sha256": crate::sha256_hex(&std::fs::read(executable).map_err(|e| e.to_string())?),
     }))
 }
 
 pub(super) fn workload(a: &Args, script: &[Scripted]) -> Value {
     value!({ "scenario": a.scenario, "frames": a.frames, "warmup": a.warmup,
         "size": [a.size.0, a.size.1], "fps": 60, "serial": a.serial, "workers": a.workers,
-        "input_sha256": digest(format!("{script:?}").as_bytes()) })
+        "input_sha256": crate::sha256_hex(format!("{script:?}").as_bytes()) })
 }
 
 pub(super) fn compatible(before: &Value, after: &Value, what: &str) -> Result<(), String> {

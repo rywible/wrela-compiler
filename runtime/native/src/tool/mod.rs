@@ -77,6 +77,7 @@ pub use drive::run_child as drive_child;
 pub use run::{GROUPS_ENV, launch};
 pub use toolchain::Toolchain;
 
+use crate::locked;
 use console::Console;
 use hub::{Hub, Thread};
 use services::{Answer, Services, Task, Work};
@@ -117,6 +118,19 @@ fn drive_workers() -> usize {
 
 /// How long, once the tool has ended, the host waits for work in progress to finish.
 const GRACE: Duration = Duration::from_secs(5);
+
+/// Joins `t` once it has finished, looking every `poll` until `until`: whether it finished (if
+/// not, it's left to run).
+fn join_by(t: std::thread::JoinHandle<()>, until: Instant, poll: Duration) -> bool {
+    while !t.is_finished() && Instant::now() < until {
+        std::thread::sleep(poll);
+    }
+    let finished = t.is_finished();
+    if finished {
+        let _ = t.join();
+    }
+    finished
+}
 
 /// How many helpers a tool has unless it says ([`Options::workers`]): one fewer than the
 /// machine's cores (the tool's own thread runs on one), at most `wrela_abi`'s `MAX_WORKERS`.
@@ -363,21 +377,12 @@ impl ToolBuild {
 /// What `std::tool::args` and `secret` read: a count and each argument, then a count and each
 /// secret's name and value (text as a `u32` byte count, then UTF-8).
 fn start_bytes(args: &[String], secrets: &[(String, String)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    let text = |out: &mut Vec<u8>, s: &str| {
-        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
-        out.extend_from_slice(s.as_bytes());
-    };
-    out.extend_from_slice(&(args.len() as u32).to_le_bytes());
-    for a in args {
-        text(&mut out, a);
-    }
-    out.extend_from_slice(&(secrets.len() as u32).to_le_bytes());
+    let mut out = toolchain::Out::default();
+    out.strs(args).u32(secrets.len() as u32);
     for (name, value) in secrets {
-        text(&mut out, name);
-        text(&mut out, value);
+        out.str(name).str(value);
     }
-    out
+    out.0
 }
 
 /// The worker threads, which carry out services.
@@ -410,9 +415,8 @@ impl Pool {
                             continue;
                         }
                         let run = std::panic::AssertUnwindSafe(|| task(&services, request));
-                        let answer = std::panic::catch_unwind(run).unwrap_or_else(|_| {
-                            Answer::Bytes(b"\x01the host's service failed".to_vec())
-                        });
+                        let answer = std::panic::catch_unwind(run)
+                            .unwrap_or_else(|_| services::err("the host's service failed"));
                         // A failed request's answer names no blob or build: those made for it go
                         // back.
                         if matches!(&answer, Answer::Bytes(b) if b.first() == Some(&1)) {
@@ -421,7 +425,7 @@ impl Pool {
                         hub.deliver(request, answer);
                     }
                     let (count, wake) = &*running;
-                    *count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+                    *locked(count) -= 1;
                     wake.notify_all();
                 },
             );
@@ -429,7 +433,7 @@ impl Pool {
                 Ok(h) => handles.push(h),
                 Err(_) => {
                     let (count, _) = &*alive;
-                    *count.lock().unwrap_or_else(std::sync::PoisonError::into_inner) -= 1;
+                    *locked(count) -= 1;
                 }
             }
         }
@@ -437,7 +441,7 @@ impl Pool {
     }
 
     fn send(&self, request: u32, task: Task) {
-        let jobs = self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let jobs = locked(&self.jobs);
         if let Some(jobs) = jobs.as_ref() {
             // A pool with no workers left drops the task; the request stays outstanding until
             // the run ends.
@@ -448,7 +452,7 @@ impl Pool {
     /// Tells the workers to stop: work not started is dropped, and an idle worker returns.
     fn close(&self) {
         self.closing.store(true, Ordering::Release);
-        self.jobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        locked(&self.jobs).take();
     }
 
     /// Stops the workers: work not started is dropped, and work in progress has until `until`
@@ -458,16 +462,13 @@ impl Pool {
         self.close();
         let grace = until.saturating_duration_since(Instant::now());
         let (count, wake) = &*self.alive;
-        let left = count.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let left = locked(count);
         let (left, _) = wake
             .wait_timeout_while(left, grace, |n| *n > 0)
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let left = *left;
         if left == 0 {
-            let handles = std::mem::take(
-                &mut *self.handles.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-            for h in handles {
+            for h in std::mem::take(&mut *locked(&self.handles)) {
                 let _ = h.join();
             }
         }
@@ -670,7 +671,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         answers: Mutex::new(None),
     });
     let hub = Arc::new(Hub::new(fake_clock.filter(|_| !real_clock)));
-    *services.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hub.clone());
+    *locked(&services.answers) = Some(hub.clone());
     let pools = Arc::new(Pools {
         files: Pool::start(&services, &hub, "files", WORKERS),
         long: Pool::start(&services, &hub, "long", LONG_WORKERS),
@@ -747,18 +748,11 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
             workers_left += 1;
         }
     }
-    services.answers.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    locked(&services.answers).take();
     // Work given up on as it ran past its grace: each thread still running now is left.
-    let strays = std::mem::take(
-        &mut *services.strays.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
-    );
+    let strays = std::mem::take(&mut *locked(&services.strays));
     for t in strays {
-        while !t.is_finished() && Instant::now() < until {
-            std::thread::sleep(EPOCH);
-        }
-        if t.is_finished() {
-            let _ = t.join();
-        } else {
+        if !join_by(t, until, EPOCH) {
             workers_left += 1;
         }
     }
@@ -782,8 +776,7 @@ pub fn run(build: &ToolBuild, options: Options) -> Ended {
         end = End::Host(format!("{why} ({end})"));
     }
     // No file work holds the table's lock, so a stuck worker can't keep this waiting.
-    let blobs_released =
-        services.blobs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).release_all();
+    let blobs_released = locked(&services.blobs).release_all();
     Ended { end, blobs_released, workers_left, lines_dropped, helped: run_helped }
 }
 
@@ -1057,23 +1050,14 @@ impl Helpers {
         if self.threads.is_empty() {
             return 0;
         }
-        crate::shared::store_u32(memory, wrela_abi::memory::PAR_SHUTDOWN, 1);
-        crate::shared::add_u32(memory, wrela_abi::memory::PAR_WAKE, 1);
-        let _ = memory.atomic_notify(u64::from(wrela_abi::memory::PAR_WAKE), u32::MAX);
+        crate::program::shut_down_helpers(memory);
         hub.notify();
         let until = Instant::now() + grace;
-        let mut left = 0;
-        for t in self.threads.drain(..) {
-            while !t.is_finished() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            if t.is_finished() {
-                let _ = t.join();
-            } else {
-                left += 1;
-            }
-        }
-        left
+        self.threads
+            .drain(..)
+            .map(|t| join_by(t, until, Duration::from_millis(1)))
+            .filter(|joined| !joined)
+            .count()
     }
 }
 
@@ -1198,11 +1182,9 @@ fn make_request(shared: &Shared, service: &str, body: &[u8]) -> u32 {
                     let set = Duration::new(seconds, nanos);
                     // The fake time since the start stays; the date it reads moves.
                     f.utc = set.saturating_sub(f.now);
-                    Answer::Bytes(vec![0])
+                    services::ok(&[])
                 }
-                None => Answer::Bytes(
-                    b"\x01only a tool test's fake clock is set: not the system's".to_vec(),
-                ),
+                None => services::err("only a tool test's fake clock is set: not the system's"),
             };
             hub.deliver(request, answer);
         }
@@ -1236,28 +1218,25 @@ fn linker(engine: &Engine) -> wasmtime::Result<Linker<ToolState>> {
             }
         },
     )?;
-    for name in [IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE] {
-        let why = format!(
+    let no = |name: &str| {
+        End::Host(format!(
             "a tool host has no `{name}`: a tool waits on its requests (`std::tool::Call::wait`)"
-        );
-        if name == IMPORT_REQUEST_STATUS {
-            linker.func_wrap(
-                IMPORT_MODULE,
-                name,
-                move |mut c: Caller<'_, ToolState>, _: u32| {
-                    Err::<i32, _>(refuse(&mut c, End::Host(why.clone())))
-                },
-            )?;
-        } else {
-            linker.func_wrap(
-                IMPORT_MODULE,
-                name,
-                move |mut c: Caller<'_, ToolState>, _: u32, _: u32| {
-                    Err::<(), _>(refuse(&mut c, End::Host(why.clone())))
-                },
-            )?;
-        }
-    }
+        ))
+    };
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_REQUEST_STATUS,
+        move |mut c: Caller<'_, ToolState>, _: u32| {
+            Err::<i32, _>(refuse(&mut c, no(IMPORT_REQUEST_STATUS)))
+        },
+    )?;
+    linker.func_wrap(
+        IMPORT_MODULE,
+        IMPORT_REQUEST_TAKE,
+        move |mut c: Caller<'_, ToolState>, _: u32, _: u32| {
+            Err::<(), _>(refuse(&mut c, no(IMPORT_REQUEST_TAKE)))
+        },
+    )?;
     linker.func_wrap(
         IMPORT_MODULE,
         IMPORT_TOOL_REQUEST,

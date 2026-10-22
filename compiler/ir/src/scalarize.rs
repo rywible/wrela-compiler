@@ -129,13 +129,7 @@ fn scalarize_let(m: &mut Module, f: &mut Function, v: ValueId, e: &Expr, out: &m
         }
         // To or from another vector: each component converted.
         Expr::Convert(x, to) => {
-            let parts = (0..u32::from(n))
-                .map(|i| {
-                    let c = em.comp(*x, i);
-                    let t = em.m.types.scalar(*to);
-                    em.let_(t, Expr::Convert(c, *to))
-                })
-                .collect();
+            let parts = em.each(*to, n, |em, i| Expr::Convert(em.comp(*x, i), *to));
             Expr::Construct(vt, parts)
         }
         Expr::Splat(x, k) => Expr::Construct(vt, vec![*x; usize::from(*k)]),

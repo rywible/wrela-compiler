@@ -20,9 +20,10 @@
 #![allow(unsafe_code)]
 
 use super::wire::{self, Load, Step};
+use crate::locked;
 use crate::tool::caps::MOST_BYTES;
 use crate::tool::services::Body;
-use crate::tool::toolchain::Out;
+use crate::tool::toolchain::{Out, bounded_to};
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -40,6 +41,7 @@ const MOST_KEPT_LINE_BYTES: usize = 256 << 20;
 const MOST_COMMANDS: usize = 65536;
 
 /// The most buffers a `Buffers` step names: past it, the request fails.
+#[cfg(feature = "gpu")]
 const MOST_BUFFERS: usize = 65536;
 
 /// The room an answer keeps for its counts and its trap: what its steps may fill is
@@ -100,7 +102,7 @@ struct Link {
 impl Link {
     /// Sends a frame; a tool host that can't be written to has ended, and so does this.
     fn send(&self, kind: u8, parts: &[&[u8]]) {
-        let mut out = self.out.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut out = locked(&self.out);
         if wire::write_frame(&mut *out, kind, parts).is_err() {
             exit_now();
         }
@@ -110,7 +112,7 @@ impl Link {
     fn ask(&self, what: u8, parts: &[&[u8]]) -> Reply {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (sent, reply) = mpsc::channel();
-        self.waiting.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, sent);
+        locked(&self.waiting).insert(id, sent);
         let id_bytes = id.to_le_bytes();
         let mut all: Vec<&[u8]> = vec![&id_bytes, std::slice::from_ref(&what)];
         all.extend_from_slice(parts);
@@ -178,11 +180,7 @@ pub fn run(parent: u32) -> ! {
                         exit_now();
                     }
                     let id = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
-                    let waiting = reader
-                        .waiting
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&id);
+                    let waiting = locked(&reader.waiting).remove(&id);
                     let Some(waiting) = waiting else { exit_now() };
                     let _ = waiting.send((bytes[4], bytes[5..].to_vec()));
                 } else if given.send((kind, bytes)).is_err() {
@@ -304,6 +302,17 @@ enum Hosted {
     Cpu(crate::CpuHost),
     #[cfg(feature = "gpu")]
     Gpu(Box<crate::Host>),
+}
+
+/// `$call` on `$hosted`'s host, named `$h`, whichever host it is: what both hosts do alike.
+macro_rules! on_host {
+    ($hosted:expr, $h:ident => $call:expr) => {
+        match $hosted {
+            Hosted::Cpu($h) => $call,
+            #[cfg(feature = "gpu")]
+            Hosted::Gpu($h) => $call,
+        }
+    };
 }
 
 /// A trap: the host's message, the panic's, where in the source, what it happened in (`init`
@@ -467,11 +476,7 @@ impl Seen {
             out.u32(n);
             out.0.extend_from_slice(&bytes.0);
         }
-        out.u32(lines.len() as u32);
-        for l in lines {
-            out.str(l);
-        }
-        out.u32(u32::try_from(dropped).unwrap_or(u32::MAX));
+        out.strs(lines).u32(u32::try_from(dropped).unwrap_or(u32::MAX));
         match log {
             None => {
                 out.u8(0);
@@ -524,11 +529,7 @@ impl Ran {
 
 impl Actor {
     fn failure(&self) -> Option<crate::Failure> {
-        match &self.host {
-            Hosted::Cpu(h) => h.last_failure().cloned(),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(h) => h.last_failure().cloned(),
-        }
+        on_host!(&self.host, h => h.last_failure().cloned())
     }
 
     /// Its first trap, `e`, in `stage` number `number` (or in the tick the host says it
@@ -565,11 +566,7 @@ impl Actor {
     }
 
     fn trace(&mut self) -> crate::Trace {
-        match &mut self.host {
-            Hosted::Cpu(host) => host.trace(),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(host) => host.trace(),
-        }
+        on_host!(&mut self.host, host => host.trace())
     }
 
     /// Carries out the tool host's command `kind`, with `bytes`: its answer.
@@ -588,11 +585,7 @@ impl Actor {
                     0 => Ok(b.rest().to_vec()),
                     _ => Err(String::from_utf8_lossy(b.rest()).into_owned()),
                 };
-                match &mut self.host {
-                    Hosted::Cpu(host) => host.answer_post(post, answer),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.answer_post(post, answer),
-                }?;
+                on_host!(&mut self.host, host => host.answer_post(post, answer))?;
                 Ok(Vec::new())
             }
             k => Err(format!("{k} isn't a command")),
@@ -667,11 +660,7 @@ impl Actor {
         match step {
             Step::Init => {
                 seen.room(Ran::size(0, 0))?;
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.init(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.init(),
-                };
+                let done = on_host!(&mut self.host, host => host.init());
                 self.inited = true;
                 if let Err(e) = done {
                     self.trapped(&e, 0, 0, i);
@@ -683,11 +672,7 @@ impl Actor {
                 for _ in 0..n {
                     let k = self.next_frame;
                     let start = self.since();
-                    let done = match &mut self.host {
-                        Hosted::Cpu(host) => host.lockstep_frame(k, fps, w, h, &script),
-                        #[cfg(feature = "gpu")]
-                        Hosted::Gpu(host) => host.lockstep_frame(k, fps, w, h, &script),
-                    };
+                    let done = on_host!(&mut self.host, host => host.lockstep_frame(k, fps, w, h, &script));
                     self.next_frame += 1;
                     if let Err(e) = done {
                         self.trapped(&e, 1, k, i);
@@ -700,11 +685,7 @@ impl Actor {
                 seen.room(Ran::size(1, 0))?;
                 let k = self.next_frame;
                 let start = self.since();
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.frame(time, w, h),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.frame(time, w, h),
-                };
+                let done = on_host!(&mut self.host, host => host.frame(time, w, h));
                 self.next_frame += 1;
                 match done {
                     Ok(()) => ran.spans.push((start, self.since())),
@@ -735,11 +716,7 @@ impl Actor {
             }
             Step::Call(export, args) => {
                 seen.room(Ran::size(0, 0))?;
-                let done = match &mut self.host {
-                    Hosted::Cpu(host) => host.call_export(&export, &args),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.call_export(&export, &args),
-                };
+                let done = on_host!(&mut self.host, host => host.call_export(&export, &args));
                 match done {
                     Ok(values) => {
                         seen.room(9 * values.len())?;
@@ -825,11 +802,7 @@ impl Actor {
             }
             Step::Hash => {
                 seen.room(8)?;
-                let hash = match &mut self.host {
-                    Hosted::Cpu(host) => host.hash(),
-                    #[cfg(feature = "gpu")]
-                    Hosted::Gpu(host) => host.hash(),
-                };
+                let hash = on_host!(&mut self.host, host => host.hash());
                 let (n, out) = &mut seen.hashes;
                 *n += 1;
                 out.u64(hash);
@@ -938,11 +911,7 @@ impl Actor {
         };
         let mut samples = Vec::with_capacity(bytes as usize);
         let mut times = Vec::new();
-        let mut render = |n: u32| match &mut self.host {
-            Hosted::Cpu(host) => host.render_audio(n),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(host) => host.render_audio(n),
-        };
+        let mut render = |n: u32| on_host!(&mut self.host, host => host.render_audio(n));
         let mut done = Ok(());
         if timed {
             times.reserve(8 * quanta as usize);
@@ -994,11 +963,7 @@ impl Actor {
     /// The posts the program made since the tool was last given them: as many as an answer
     /// holds, the oldest first; the rest at the next.
     fn posts(&mut self) -> Vec<u8> {
-        let made = match &mut self.host {
-            Hosted::Cpu(host) => host.take_posts(),
-            #[cfg(feature = "gpu")]
-            Hosted::Gpu(host) => host.take_posts(),
-        };
+        let made = on_host!(&mut self.host, host => host.take_posts());
         self.posts.extend(made);
         let mut given = Vec::new();
         let mut bytes = 0;
@@ -1024,15 +989,4 @@ impl Actor {
 /// cut.
 fn bounded(line: &str) -> String {
     bounded_to(line, MOST_BYTES / 2)
-}
-
-fn bounded_to(line: &str, most: usize) -> String {
-    if line.len() <= most {
-        return line.to_string();
-    }
-    let mut end = most;
-    while !line.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… ({} more bytes)", &line[..end], line.len() - end)
 }

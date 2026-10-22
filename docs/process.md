@@ -646,6 +646,22 @@ there, with or without the lock's scope; they passed in the same sandbox earlier
 Bun 1.4.2 aborts in about half of full `browser` runs, on `main` too. Each needs a run in a normal
 terminal.
 
+## Whole-codebase cleanup, 2026-10-22
+
+Ryan asked Claude Code (Opus 5.5) to run its `/simplify` review over the whole toolchain, not
+only a diff, and to apply the fixes. The review looks for code quality, not bugs, from four
+angles: reuse of an existing helper, simpler code, wasted work, and fixes at the root rather
+than special cases. One orchestrating session split the source into 16 areas (the compiler
+crates, std in two halves, each host, the tests and the tools). It started one Opus 5.5 subagent
+per area, all in the same checkout, each editing only its own files. Each subagent read its
+whole area, applied only changes that keep behaviour, and ran its crate's or package's checks.
+It reported any change that crossed into another area, and the orchestrator made those changes
+after both areas' agents finished. The change removed about 2,900 lines net across 204 files. It
+also made some calls cheaper, for example the allocator's size class and float formatting. The
+wasm agent built every package under `compiler/tests` with and without its changes and compared
+the outputs: they were byte for byte the same. The full `tools/check.sh` passed before the
+change was committed.
+
 ## Keeping this record
 
 AGENTS.md tells every agent to update this file in the same change when it adds an outside

@@ -55,12 +55,10 @@ pub fn environment() -> Pending<u8> {
 /// bottom, as the file holds them. It must be `width` by `height`: another size fails.
 @client
 pub fn decode_image(bytes: [u8], width: u32, height: u32) -> Pending<u8> {
-    var body: Vec<u8> = Vec::new()
-    for n in [width, height] {
-        for shift in [0, 8, 16, 24] { body.push(u8((n >> shift) & 255)) }
-    }
-    for b in bytes { body.push(b) }
-    request("image/decode", body)
+    var w = Writer::new()
+    w.write_u32(width)
+    w.write_u32(height)
+    request("image/decode", then(take w.into_bytes(), bytes))
 }
 
 /// Fetches each URL of `list` (absolute, one a line) into the host's cache ahead of time, at
@@ -74,9 +72,7 @@ pub fn prefetch(list: [u8]) -> Pending<u8> {
 /// `crosshair`, `move`, `nwse-resize` or `nesw-resize`.
 @client
 pub fn cursor(name: str) -> Pending<u8> {
-    var bytes: Vec<u8> = Vec::new()
-    for i in 0..name.len() { bytes.push(name.byte(i)) }
-    request("cursor", bytes)
+    request("cursor", utf8(name))
 }
 
 /// One of the page's icons: `rel` is `icon` or `apple-touch-icon`, `size` its pixels on a side,
@@ -84,9 +80,7 @@ pub fn cursor(name: str) -> Pending<u8> {
 @client
 pub fn icon(rel: str, size: u32, path: str) -> Pending<u8> {
     let text = f"{rel} {size} {path}"
-    var bytes: Vec<u8> = Vec::new()
-    for i in 0..text.len() { bytes.push(text.byte(i)) }
-    request("icon", bytes)
+    request("icon", text.as_bytes())
 }
 
 /// Opens the program at `url` (relative to this build) in a surface of its own, hidden until it's
@@ -94,9 +88,7 @@ pub fn icon(rel: str, size: u32, path: str) -> Pending<u8> {
 /// fails if the program can't be opened.
 @client
 pub fn open(url: str) -> Pending<u8> {
-    var bytes: Vec<u8> = Vec::new()
-    for i in 0..url.len() { bytes.push(url.byte(i)) }
-    request("surface/open", bytes)
+    request("surface/open", utf8(url))
 }
 
 /// Waits for the program in surface `id` to say it shows its first useful frame (its `ready`).
@@ -118,10 +110,21 @@ pub fn close(id: u32) -> Pending<u8> {
     request("surface/close", id_bytes(id))
 }
 
+/// `id` as a request's body: a little-endian word.
 fn id_bytes(id: u32) -> Vec<u8> {
     var w = Writer::new()
     w.write_u32(id)
     take w.into_bytes()
+}
+
+/// `body`, then `bytes`.
+fn then(body: take Vec<u8>, bytes: [u8]) -> Vec<u8> {
+    var out = take body
+    out.reserve(bytes.len())
+    for b in bytes {
+        out.push(b)
+    }
+    out
 }
 
 /// The surface's id in an `open` answer.
@@ -133,10 +136,8 @@ pub fn read_surface(bytes: [u8]) -> Option<u32> {
 /// address, so the browser's Back asks it to return.
 @client
 pub fn show(id: u32, name: str) -> Pending<u8> {
-    var w = Writer::new()
-    w.write_u32(id)
-    var body = take w.into_bytes()
-    for i in 0..name.len() { body.push(name.byte(i)) }
+    var body = id_bytes(id)
+    body.append_text(name)
     request("surface/show", body)
 }
 
@@ -144,11 +145,7 @@ pub fn show(id: u32, name: str) -> Pending<u8> {
 /// (`reply`), and fails if it replied that it failed or it closed first.
 @client
 pub fn send(id: u32, bytes: [u8]) -> Pending<u8> {
-    var w = Writer::new()
-    w.write_u32(id)
-    var body = take w.into_bytes()
-    for b in bytes { body.push(b) }
-    request("surface/call", body)
+    request("surface/call", then(id_bytes(id), bytes))
 }
 
 /// The next call from the program that shows this one: the call's id (a word) and then its bytes.
@@ -179,9 +176,7 @@ pub fn reply(id: u32, bytes: [u8], ok: bool = true) -> Pending<u8> {
     var w = Writer::new()
     w.write_u32(id)
     w.write_u8(if ok { 1 } else { 0 })
-    var body = take w.into_bytes()
-    for b in bytes { body.push(b) }
-    request("channel/reply", body)
+    request("channel/reply", then(take w.into_bytes(), bytes))
 }
 
 /// A file the person chooses: its bytes. Fails if they cancel, or the file is over 1 MiB.
@@ -195,9 +190,7 @@ pub fn import_file() -> Pending<u8> {
 pub fn export_file(name: str, bytes: [u8]) -> Pending<u8> {
     var w = Writer::new()
     w.write_str(name)
-    var body = take w.into_bytes()
-    for b in bytes { body.push(b) }
-    request("file/export", body)
+    request("file/export", then(take w.into_bytes(), bytes))
 }
 
 /// Tells the program that shows this one in its place that this one shows its first useful frame.
@@ -217,14 +210,11 @@ pub fn failed() -> Pending<u8> {
 /// host's glyph bitmap and metrics for it.
 @client
 pub fn glyph(face: u8, px: u32, text: str) -> Pending<u8> {
-    var body: Vec<u8> = Vec::new()
-    body.push(face)
-    for k in 0..4 {
-        body.push(u8((px >> (8 * k)) & 255))
-    }
-    for i in 0..text.len() {
-        body.push(text.byte(i))
-    }
+    var w = Writer::new()
+    w.write_u8(face)
+    w.write_u32(px)
+    var body = take w.into_bytes()
+    body.append_text(text)
     request("font/glyph", body)
 }
 
@@ -275,10 +265,7 @@ pub fn read_glyph(bytes: [u8], px: f32) -> Option<GlyphImage> {
 }
 
 fn word32(b: [u8], at: u32) -> u32 {
-    match word(b, at) {
-        Some(w) => w,
-        None => 0,
-    }
+    word(b, at).unwrap_or(0)
 }
 
 /// A service that the program's embedding host defines, under `app/` (`app/<service>`): for a
@@ -326,16 +313,15 @@ pub struct Environment: Copy {
 
 /// Reads an `environment` answer.
 pub fn read_environment(bytes: [u8]) -> Environment {
-    var ratio: Option<f32> = None
-    if let Some(r) = word(bytes, 5) { ratio = Some(f32(r) / 1024.0) }
-    var capabilities = 0
-    if let Some(c) = word(bytes, 10) { capabilities = c }
     Environment {
         reduced_motion: bytes.len() > 0 && bytes[0] != 0,
         seconds: word(bytes, 1),
-        pixel_ratio: ratio,
+        pixel_ratio: match word(bytes, 5) {
+            Some(r) => Some(f32(r) / 1024.0),
+            None => None,
+        },
         reloaded: bytes.len() > 9 && bytes[9] != 0,
-        capabilities,
+        capabilities: word(bytes, 10).unwrap_or(0),
         prefers_light: bytes.len() > 14 && bytes[14] != 0,
     }
 }
@@ -359,8 +345,7 @@ pub fn text_input(active: bool, caret: vec4) -> Pending<u8> {
     var w = Writer::new()
     w.write_u8(if active { 1 } else { 0 })
     write_rect(mut w, caret)
-    let body = take w.into_bytes()
-    request("text/input", body)
+    request("text/input", take w.into_bytes())
 }
 
 /// What a copy or cut puts on the system clipboard from now on (`clipboard/offer`), as plain text
@@ -371,8 +356,7 @@ pub fn offer(text: str, html: str) -> Pending<u8> {
     var w = Writer::new()
     w.write_str(text)
     w.write_str(html)
-    let body = take w.into_bytes()
-    request("clipboard/offer", body)
+    request("clipboard/offer", take w.into_bytes())
 }
 
 /// Puts `text` on the system clipboard now (`clipboard/write`), as a person's press asked, such as
@@ -386,10 +370,7 @@ pub fn copy(text: str) -> Pending<u8> {
 /// answer.
 @client
 pub fn pasted(serial: u32) -> Pending<u8> {
-    var w = Writer::new()
-    w.write_u32(serial)
-    let body = take w.into_bytes()
-    request("clipboard/pasted", body)
+    request("clipboard/pasted", id_bytes(serial))
 }
 
 /// A paste's plain text and HTML.
@@ -428,19 +409,13 @@ pub fn publish(told: mut Vec<Pending<u8>>, sent: mut Sent, name: str, nodes: [No
 /// reads the answer. Reading it tells the host the program has seen that revision.
 @client
 pub fn field_state(node: u32) -> Pending<u8> {
-    var w = Writer::new()
-    w.write_u32(node)
-    let body = take w.into_bytes()
-    request("field/state", body)
+    request("field/state", id_bytes(node))
 }
 
 /// Submits form `form` as a person would (`form/submit`): a password manager offers to save it.
 @client
 pub fn submit(form: u32) -> Pending<u8> {
-    var w = Writer::new()
-    w.write_u32(form)
-    let body = take w.into_bytes()
-    request("form/submit", body)
+    request("form/submit", id_bytes(form))
 }
 
 /// Says `text` to a screen reader, after what it's saying (`a11y/announce`).
@@ -449,9 +424,10 @@ pub fn announce(text: str) -> Pending<u8> {
     request("a11y/announce", utf8(text))
 }
 
+/// `text`'s UTF-8, as a request's body.
 fn utf8(text: str) -> Vec<u8> {
     var bytes: Vec<u8> = Vec::new()
-    for i in 0..text.len() { bytes.push(text.byte(i)) }
+    bytes.append_text(text)
     bytes
 }
 

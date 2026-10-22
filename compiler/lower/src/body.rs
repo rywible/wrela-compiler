@@ -164,40 +164,8 @@ pub(crate) fn lower_body(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey,
         InstanceKey::Closure { id: cid, .. } => mir.closure_fn(*cid),
         _ => &mir.fns[0],
     };
-    let subst = cx.instance_subst(key);
-    let f = std::mem::take(&mut mb.m.functions[id.index()]);
-    let mut fl = Fl {
-        cx,
-        mb,
-        key: key.clone(),
-        id,
-        f,
-        mir,
-        code,
-        subst,
-        locals: vec![Repr::Unbound; mir.locals.len()],
-        blocks: vec![Open::new(0)],
-        defined: HashMap::new(),
-        next_block: 1,
-        preds: reachable_preds(code),
-        matched: HashMap::new(),
-        unmatched: HashMap::new(),
-        rebound: rebound(code),
-        job: false,
-    };
+    let mut fl = Fl::new(cx, mb, key, id, mir, code, false);
     fl.unmatched = unmatched(code, &fl.preds);
-    // The constants this code names: places that live as long as the program (§13).
-    let closure = match key {
-        InstanceKey::Closure { id, .. } => Some(*id),
-        _ => None,
-    };
-    for (i, d) in mir.locals.iter().enumerate() {
-        if let LocalKind::Const(c) = d.kind
-            && d.closure == closure
-        {
-            fl.locals[i] = fl.table(c);
-        }
-    }
     match key {
         InstanceKey::Fn { .. } => fl.bind_fn_params(),
         InstanceKey::Closure { id: cid, .. } => fl.bind_closure_params(*cid),
@@ -221,34 +189,7 @@ fn lower_job(cx: &mut Cx, mb: &mut ModuleBuilder, func: FnId, key: &InstanceKey,
     let code = &mir.fns[0];
     let substs = key.substs().to_vec();
     let Some(layout) = cx.job_layout(mb, func, &substs) else { return };
-    let subst = cx.instance_subst(key);
-    let f = std::mem::take(&mut mb.m.functions[id.index()]);
-    let mut fl = Fl {
-        cx,
-        mb,
-        key: key.clone(),
-        id,
-        f,
-        mir,
-        code,
-        subst,
-        locals: vec![Repr::Unbound; mir.locals.len()],
-        blocks: vec![Open::new(0)],
-        defined: HashMap::new(),
-        next_block: 1,
-        preds: reachable_preds(code),
-        matched: HashMap::new(),
-        unmatched: HashMap::new(),
-        rebound: rebound(code),
-        job: true,
-    };
-    for (i, d) in mir.locals.iter().enumerate() {
-        if let LocalKind::Const(c) = d.kind
-            && d.closure.is_none()
-        {
-            fl.locals[i] = fl.table(c);
-        }
-    }
+    let mut fl = Fl::new(cx, mb, key, id, mir, code, true);
     // The job's `borrow` and `mut` parameters: this function's, after the job.
     let def = checked.program.func(func);
     let mut k = 1u32;
@@ -373,6 +314,53 @@ fn unmatched(code: &mir::FnBody, preds: &[u32]) -> HashMap<BlockId, BlockId> {
 }
 
 impl<'c, 'a> Fl<'c, 'a> {
+    /// Starts lowering `code`, of `mir`, into instance `key`'s function `id` (a job's `resume`
+    /// with `job`): its constants bound, its parameters not yet.
+    fn new(
+        cx: &'c mut Cx<'a>,
+        mb: &'c mut ModuleBuilder,
+        key: &InstanceKey,
+        id: ir::FuncId,
+        mir: &'a mir::Body,
+        code: &'a mir::FnBody,
+        job: bool,
+    ) -> Fl<'c, 'a> {
+        let subst = cx.instance_subst(key);
+        let f = std::mem::take(&mut mb.m.functions[id.index()]);
+        let mut fl = Fl {
+            cx,
+            mb,
+            key: key.clone(),
+            id,
+            f,
+            mir,
+            code,
+            subst,
+            locals: vec![Repr::Unbound; mir.locals.len()],
+            blocks: vec![Open::new(0)],
+            defined: HashMap::new(),
+            next_block: 1,
+            preds: reachable_preds(code),
+            matched: HashMap::new(),
+            unmatched: HashMap::new(),
+            rebound: rebound(code),
+            job,
+        };
+        // The constants this code names: places that live as long as the program (§13).
+        let closure = match key {
+            InstanceKey::Closure { id, .. } => Some(*id),
+            _ => None,
+        };
+        for (i, d) in mir.locals.iter().enumerate() {
+            if let LocalKind::Const(c) = d.kind
+                && d.closure == closure
+            {
+                fl.locals[i] = fl.table(c);
+            }
+        }
+        fl
+    }
+
     // ---- emission --------------------------------------------------------------------------
 
     pub fn emit(&mut self, s: ir::Stmt) {
@@ -637,11 +625,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 Some(g @ Bound::Group(_)) => self.group_params(ft, &g, k),
                 None if self.cx.lower_ty(self.mb, ft, self.code.span).is_none() => Repr::Erased,
                 None => {
-                    let r = if self.f.params[*k as usize].by_ref {
-                        Repr::Place(ir::Place::root(ir::PlaceRoot::Param(*k)))
-                    } else {
-                        Repr::Var(self.param_local(*k))
-                    };
+                    let r = self.param_repr(*k);
                     *k += 1;
                     r
                 }
@@ -650,14 +634,19 @@ impl<'c, 'a> Fl<'c, 'a> {
         Repr::Group(out)
     }
 
-    /// Binds MIR local `l` to IR parameter `k`: a by-reference parameter is its place; a value
-    /// is copied into a new local, which can be assigned.
+    /// Binds MIR local `l` to IR parameter `k` ([`Fl::param_repr`]).
     fn bind_param(&mut self, l: Local, k: u32) {
-        self.locals[l.index()] = if self.f.params[k as usize].by_ref {
+        self.locals[l.index()] = self.param_repr(k);
+    }
+
+    /// IR parameter `k`'s representation: a by-reference parameter is its place; a value is
+    /// copied into a new local, which can be assigned.
+    fn param_repr(&mut self, k: u32) -> Repr {
+        if self.f.params[k as usize].by_ref {
             Repr::Place(ir::Place::root(ir::PlaceRoot::Param(k)))
         } else {
             Repr::Var(self.param_local(k))
-        };
+        }
     }
 
     /// A new local holding the value of IR parameter `k`.
@@ -1234,10 +1223,9 @@ impl<'c, 'a> Fl<'c, 'a> {
     /// chosen projection's pointer is read in the current block.
     fn fresh(&mut self, r: Repr) -> Repr {
         match r {
-            Repr::Callable(c @ Callable::Closure { .. }, _) if self.job => {
-                let Callable::Closure { owner, id } = &c else { unreachable!() };
-                let srcs = self.capture_sources(&owner.clone(), *id);
-                Repr::Callable(c, srcs)
+            Repr::Callable(Callable::Closure { owner, id }, _) if self.job => {
+                let srcs = self.capture_sources(&owner, id);
+                Repr::Callable(Callable::Closure { owner, id }, srcs)
             }
             r => r,
         }
@@ -1277,11 +1265,7 @@ impl<'c, 'a> Fl<'c, 'a> {
             // A `Copy` value the closure only reads is copied when it's made (§6.7).
             let decl_ty = self.concrete(self.mir.local(l).ty);
             if !written
-                && wrela_sema::traits::implements_builtin(
-                    &self.cx.checked.program,
-                    decl_ty,
-                    Lang::Copy,
-                )
+                && self.cx.is_copy(decl_ty)
                 && let Some(v) = self.read(&mir::Place::local(l))
             {
                 let copy = self.local_of("capture", v);
@@ -1538,7 +1522,7 @@ impl<'c, 'a> Fl<'c, 'a> {
         match r {
             Repr::Chosen(var, pt) => {
                 let v = self.load(ir::Place::local(var), pt);
-                Repr::Place(ir::Place { root: ir::PlaceRoot::Ptr(v), path: Vec::new() })
+                Repr::Place(ir::Place::root(ir::PlaceRoot::Ptr(v)))
             }
             r => r,
         }
@@ -1792,12 +1776,7 @@ impl<'c, 'a> Fl<'c, 'a> {
     }
 
     /// Writes `v` to a place; a swizzle's components one by one.
-    pub fn store_mir(&mut self, p: &mir::Place, v: ir::ValueId) {
-        self.store(p, v)
-    }
-
-    /// Writes `v` to a place; a swizzle's components one by one.
-    fn store(&mut self, p: &mir::Place, v: ir::ValueId) {
+    pub fn store(&mut self, p: &mir::Place, v: ir::ValueId) {
         let Some((place, _, swizzle)) = self.place_parts(p) else { return };
         match swizzle {
             Some(cs) => {
@@ -2239,6 +2218,11 @@ impl<'c, 'a> Fl<'c, 'a> {
         }
     }
 
+    /// Each argument's value ([`Fl::arg_value`]); `None` if one has none.
+    pub fn arg_values(&mut self, args: &[mir::Arg]) -> Option<Vec<ir::ValueId>> {
+        args.iter().map(|a| self.arg_value(a)).collect()
+    }
+
     /// The callable an argument passes: a closure or function a local holds, including a
     /// closure environment stored as an ordinary value.
     pub fn callable_arg(&mut self, a: &mir::Arg) -> Option<Repr> {
@@ -2253,12 +2237,6 @@ impl<'c, 'a> Fl<'c, 'a> {
         Some(Repr::Callable(callable, srcs))
     }
 
-    /// A place passed for a `[T]` parameter (`run_t`): a run of it if it's a fixed array, else
-    /// its value (a run already).
-    pub fn run_arg(&mut self, p: &mir::Place, run_t: ir::TypeId) -> Option<ir::ValueId> {
-        self.run_of(p, run_t)
-    }
-
     fn call(&mut self, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
         let span = c.span;
         match &c.callee {
@@ -2271,9 +2249,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 None
             }
             mir::Callee::Builtin(b) => {
-                let args: Option<Vec<ir::ValueId>> =
-                    c.args.iter().map(|a| self.arg_value(a)).collect();
-                let args = args?;
+                let args = self.arg_values(&c.args)?;
                 let t = self.ty(ty?, span)?;
                 self.builtin(*b, args, t, span)
             }
@@ -2357,11 +2333,10 @@ impl<'c, 'a> Fl<'c, 'a> {
                     )));
                     return None;
                 };
+                self.check_role(func, span);
                 if program.func(func).attrs.intrinsic {
-                    self.check_role(func, span);
                     return crate::gpu::intrinsic(self, func, &substs, c, ty);
                 }
-                self.check_role(func, span);
                 self.call_fn(func, substs, &c.args, span)
             }
         }
@@ -2545,7 +2520,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                                 TyKind::Array(..) | TyKind::Adt(..)
                             ) =>
                     {
-                        let v = self.run_arg(pl, ty)?;
+                        let v = self.run_of(pl, ty)?;
                         Some(self.temp_place(v))
                     }
                     mir::Arg::Mut(pl, _) => {
@@ -2581,7 +2556,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 continue;
             }
             let v = match a.place() {
-                Some(pl) if run => self.run_arg(pl, ty)?,
+                Some(pl) if run => self.run_of(pl, ty)?,
                 _ => self.arg_value(a)?,
             };
             out.push(ir::Arg::Value(v));
@@ -2682,7 +2657,7 @@ impl<'c, 'a> Fl<'c, 'a> {
                 .flatten()
                 .filter(|&t| matches!(self.mb.m.types.get(t), ir::TypeDef::Run(_)));
             let v = match (a.place(), run) {
-                (Some(pl), Some(rt)) => self.run_arg(pl, rt),
+                (Some(pl), Some(rt)) => self.run_of(pl, rt),
                 _ => self.arg_value(a),
             };
             if let Some(v) = v {

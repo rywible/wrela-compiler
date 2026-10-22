@@ -5,7 +5,6 @@
 //! The one check runs every retained CPU, GPU and browser regression. Samples have one bounded
 //! size; historical milestone benchmarks and full-scene tours are not part of verification.
 
-pub mod camera;
 pub mod spike01;
 
 use std::collections::BTreeMap;
@@ -96,28 +95,6 @@ pub fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// Copies the package at `from` to `to` ([`copy_dir`]), each relative `path = "…"` in its
-/// wrela.toml made absolute against `from`, and each `{ workspace = true }` the absolute path of
-/// the member it is: its dependencies are found from the copy too.
-pub fn copy_package(from: &Path, to: &Path) {
-    copy_dir(from, to);
-    let manifest = to.join("wrela.toml");
-    let text = std::fs::read_to_string(&manifest).expect("wrela.toml");
-    let text = wrela_driver::workspace::detached(from, &text).expect("its workspace dependencies");
-    const KEY: &str = "path = \"";
-    let (mut out, mut rest) = (String::new(), text.as_str());
-    while let Some(at) = rest.find(KEY) {
-        let start = at + KEY.len();
-        let end = start + rest[start..].find('"').expect("a path's closing quote");
-        let path = Path::new(&rest[start..end]);
-        let path = if path.is_absolute() { path.to_path_buf() } else { from.join(path) };
-        out += &format!("{}path = {:?}", &rest[..at], path.display().to_string());
-        rest = &rest[end + 1..];
-    }
-    out += rest;
-    std::fs::write(&manifest, out).expect("write wrela.toml");
-}
-
 /// Writes `edit` of the file `file` of the package at `pkg`, which must change it: when it was
 /// written.
 pub fn write_edit(pkg: &Path, file: &str, edit: impl Fn(&str) -> String) -> std::time::Instant {
@@ -129,8 +106,6 @@ pub fn write_edit(pkg: &Path, file: &str, edit: impl Fn(&str) -> String) -> std:
     std::time::Instant::now()
 }
 
-/// Waits until the `wrela run` server has had `n` changes shown: the `n`th. Panics after
-/// `limit`.
 /// Waits until a page is running on the `wrela run` server: it has asked for changes. Panics
 /// after `limit`. A test edits after this, so its page sees each edit as a change, not as part of
 /// the build it loaded (Chrome opens after the machine's Chrome lock, and a build is quicker).
@@ -142,6 +117,8 @@ pub fn wait_polling(server: &wrela_driver::live::Server, limit: std::time::Durat
     }
 }
 
+/// Waits until the `wrela run` server has had `n` changes shown: the `n`th. Panics after
+/// `limit`.
 pub fn wait_shown(
     server: &wrela_driver::live::Server,
     n: usize,
@@ -231,6 +208,14 @@ pub fn one_u32(host: &mut impl Exports, name: &str, args: &[Value]) -> u32 {
     }
 }
 
+/// Calls the export `name`, which must return one `u64` (an `i64` in WASM).
+pub fn one_u64(host: &mut impl Exports, name: &str, args: &[Value]) -> u64 {
+    match host.call(name, args).expect(name).as_slice() {
+        [Value::I64(x)] => *x as u64,
+        other => panic!("{name} returned {other:?}"),
+    }
+}
+
 /// Calls the export `name`, which must return one `vec3` (three `f32`s).
 pub fn one_vec3(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 3] {
     match host.call(name, args).expect(name).as_slice() {
@@ -247,29 +232,6 @@ pub fn one_vec4(host: &mut impl Exports, name: &str, args: &[Value]) -> [f32; 4]
     }
 }
 
-/// The mean of |a − b| over the colour channels of some pixels (`pixels`, their indices) of two
-/// RGBA8 images, in /255; the share of those pixels with a channel more than 8/255 apart; and
-/// how many pixels there were.
-pub fn image_difference_over(
-    a: &[u8],
-    b: &[u8],
-    pixels: impl IntoIterator<Item = usize>,
-) -> (f64, f64, usize) {
-    let (mut sum, mut over, mut n) = (0.0, 0usize, 0usize);
-    for p in pixels {
-        let mut most = 0u8;
-        for c in 0..3 {
-            let d = a[4 * p + c].abs_diff(b[4 * p + c]);
-            sum += f64::from(d);
-            most = most.max(d);
-        }
-        over += usize::from(most > 8);
-        n += 1;
-    }
-    let n_f = n.max(1) as f64;
-    (sum / (3.0 * n_f), over as f64 / n_f, n)
-}
-
 /// A little-endian `f32` array from bytes.
 pub fn f32s(bytes: &[u8]) -> Vec<f32> {
     bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
@@ -283,28 +245,9 @@ pub fn bytes_of(xs: &[f32]) -> Vec<u8> {
     xs.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
-/// The rest positions of the first `n` of a buffer's skinned vertices (`SkinVertex`, as the
-/// spike wrote them too): 48 bytes each, the position first.
-pub fn positions(bytes: &[u8], n: usize) -> Vec<[f32; 3]> {
-    bytes.chunks_exact(48).take(n).map(|v| f32s(&v[..12]).try_into().expect("3 floats")).collect()
-}
-
 /// The larger error; NaN if either is (`f64::max` drops a NaN, which would pass every check).
 pub fn worse(a: f64, b: f64) -> f64 {
     if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) }
-}
-
-/// The median of some durations.
-pub fn median(xs: &[f64]) -> f64 {
-    percentile(xs, 0.5)
-}
-
-/// The `p` quantile of some durations (0.99: the 99th percentile): the ⌊n·p⌋th of the n
-/// sorted (from 0), or the last.
-pub fn percentile(xs: &[f64], p: f64) -> f64 {
-    let mut v = xs.to_vec();
-    v.sort_by(f64::total_cmp);
-    v[((v.len() as f64 * p) as usize).min(v.len() - 1)]
 }
 
 /// The manifest of the build in `dir`.
@@ -465,12 +408,6 @@ pub fn page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "release", |p| wrela_driver::build_for_tests(p, false))
 }
 
-/// [`page`] with the build a player loads: a release build, not a test build (no `@testing`
-/// exports, and none of the pipelines only tests reach).
-pub fn shipped_page(pkg: &str, name: &str) -> (PathBuf, String) {
-    page_built_by(pkg, name, "shipped", wrela_driver::build)
-}
-
 /// [`page`] with a debug build (language.md §11's checks).
 pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "debug", |p| wrela_driver::build_for_tests(p, true))
@@ -479,12 +416,6 @@ pub fn debug_page(pkg: &str, name: &str) -> (PathBuf, String) {
 /// [`page`] with a build whose WASM uses no SIMD (language.md §11).
 pub fn scalar_page(pkg: &str, name: &str) -> (PathBuf, String) {
     page_built_by(pkg, name, "scalar", wrela_driver::build_without_simd)
-}
-
-/// The build of the package at `pkg` that [`page`] copies, made once per process: for a test
-/// that only reads its files (its manifest, its WGSL). Nothing may load it or write beside it.
-pub fn page_build(pkg: &str) -> PathBuf {
-    built_once(pkg, "release", |p| wrela_driver::build_for_tests(p, false))
 }
 
 /// [`page`], the package built by `build` (`kind` names it).
@@ -555,13 +486,12 @@ pub fn run_page(
 /// [`browser_script`] reads). Whether the run passed; its printed lines are in
 /// `results/log.txt`.
 pub fn run_page_with_script(rel: &str, fragment: &str, script: &[Step], timeout: u32) -> bool {
-    match run_page(rel, fragment, timeout, Some(script)) {
-        Ok(()) => true,
-        Err(why) => {
-            eprintln!("{why}");
-            false
-        }
-    }
+    passed(run_page(rel, fragment, timeout, Some(script)))
+}
+
+/// Whether a page's run passed; why it failed, if it did, goes to standard error.
+fn passed(run: Result<(), String>) -> bool {
+    run.map_err(|why| eprintln!("{why}")).is_ok()
 }
 
 /// The `std::tool::browser::Script` constant `name` of the package at `pkg` (from the repo
@@ -728,13 +658,7 @@ impl ChromeRun {
         if let Some(script) = &self.script {
             std::fs::write(repo_root().join(rel).join(SCRIPT), script).expect("write the script");
         }
-        match run_page(rel, &self.fragment(), self.timeout(), None) {
-            Ok(()) => true,
-            Err(why) => {
-                eprintln!("{why}");
-                false
-            }
-        }
+        passed(run_page(rel, &self.fragment(), self.timeout(), None))
     }
 }
 

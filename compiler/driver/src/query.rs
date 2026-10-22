@@ -306,16 +306,24 @@ fn show(ix: &Index, f: Option<FnId>, d: &Diagnostic) -> Value {
 
 /// The innermost function whose source holds byte `offset` of `file`, whether it checked or not.
 fn innermost_fn(p: &Program, file: FileId, offset: u32) -> Option<FnId> {
-    (0..p.fns.len() as u32)
-        .map(FnId)
-        .filter(|&f| {
-            let s = p.func(f).span;
-            s.file == file && s.start <= offset && offset < s.end
-        })
-        .min_by_key(|&f| {
-            let s = p.func(f).span;
-            s.end - s.start
-        })
+    innermost_of(p, (0..p.fns.len() as u32).map(FnId), file, offset)
+}
+
+/// The innermost of `fns` whose source holds byte `offset` of `file`.
+fn innermost_of(
+    p: &Program,
+    fns: impl Iterator<Item = FnId>,
+    file: FileId,
+    offset: u32,
+) -> Option<FnId> {
+    fns.filter(|&f| {
+        let s = p.func(f).span;
+        s.file == file && s.start <= offset && offset < s.end
+    })
+    .min_by_key(|&f| {
+        let s = p.func(f).span;
+        s.end - s.start
+    })
 }
 
 /// How a use is named in the queries' answers.
@@ -330,7 +338,7 @@ fn how(u: &Use) -> &'static str {
 }
 
 /// Each use `body` makes of a function, and where ([`mir::fn_uses`]).
-fn uses(p: &Program, body: &mir::Body) -> Vec<(Use, Span)> {
+pub(crate) fn uses(p: &Program, body: &mir::Body) -> Vec<(Use, Span)> {
     let mut out = Vec::new();
     for (s, r) in rvalues(body) {
         mir::fn_uses(p, s, r, |u, span| out.push((u, span)));
@@ -696,18 +704,7 @@ impl<'a> Index<'a> {
 
     /// The function whose body holds byte `offset` of `file` (the innermost, for a method).
     fn fn_at(&self, file: FileId, offset: u32) -> Option<FnId> {
-        self.checked
-            .mir
-            .keys()
-            .filter(|f| {
-                let s = self.p.func(**f).span;
-                s.file == file && s.start <= offset && offset < s.end
-            })
-            .min_by_key(|f| {
-                let s = self.p.func(**f).span;
-                s.end - s.start
-            })
-            .copied()
+        innermost_of(self.p, self.checked.mir.keys().copied(), file, offset)
     }
 
     /// The byte offset of `line` and `column` (1-based, in characters) in `file`.

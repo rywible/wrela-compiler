@@ -10,6 +10,7 @@ use crate::earley::Scratch;
 use crate::ebnf::Grammar;
 use crate::generate::{Coverage, GenConfig, Generator};
 use crate::rng::{Rng, default_threads, par_seeded};
+use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 use wrela_syntax::fmt::check_round_trip;
 
@@ -167,17 +168,18 @@ impl RunStats {
             g.rules.len(),
         );
         for gap in gaps {
-            s.push_str(&format!("  not covered: {gap}\n"));
+            let _ = writeln!(s, "  not covered: {gap}");
         }
         for f in &self.failures {
-            s.push_str(&format!(
-                "\nFAILURE ({}) seed {} program {}: {}\n--- source ---\n{}\n--------------\n",
+            let _ = writeln!(
+                s,
+                "\nFAILURE ({}) seed {} program {}: {}\n--- source ---\n{}\n--------------",
                 f.what.as_str(),
                 f.seed,
                 f.index,
                 f.message,
                 f.source
-            ));
+            );
         }
         s
     }

@@ -292,39 +292,38 @@ class WrelaSelection(unittest.TestCase):
 
 
 class BrowserSelection(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.directory = root / 'runtime/browser/test'
+        self.directory.mkdir(parents=True)
+        (self.directory / 'x.test.ts').write_text('')
+        self.logs = root / 'logs'
+        self.logs.mkdir()
+        at_root = patch.object(check, 'ROOT', root)
+        at_root.start(); self.addCleanup(at_root.stop)
+
     def test_no_tests_and_multiple_tests_fail_exact_selection(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            directory = root / 'runtime/browser/test'
-            directory.mkdir(parents=True)
-            (directory / 'x.test.ts').write_text('')
-            logs = root / 'logs'; logs.mkdir()
-            for xml in ['<testsuites/>', '<testsuites><testcase/><testcase/></testsuites>']:
-                (logs / 'browser.xml').write_text(xml)
-                with patch.object(check, 'ROOT', root), patch.object(check, 'call'), \
-                        self.assertRaises(ValueError):
-                    check.browser_test('browser::x.test.ts::a', logs)
-            with patch.object(check, 'ROOT', root), self.assertRaises(ValueError):
-                check.browser_test('browser::../../outside::a', logs)
+        for xml in ['<testsuites/>', '<testsuites><testcase/><testcase/></testsuites>']:
+            (self.logs / 'browser.xml').write_text(xml)
+            with patch.object(check, 'call'), self.assertRaises(ValueError):
+                check.browser_test('browser::x.test.ts::a', self.logs)
+        with self.assertRaises(ValueError):
+            check.browser_test('browser::../../outside::a', self.logs)
 
     def test_a_file_group_runs_every_test_in_the_file(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            directory = root / 'runtime/browser/test'
-            directory.mkdir(parents=True)
-            (directory / 'x.test.ts').write_text('')
-            logs = root / 'logs'; logs.mkdir()
-            for xml, ok in [('<testsuites><testcase/><testcase/></testsuites>', True),
-                            ('<testsuites><testcase/><testcase><skipped/></testcase></testsuites>', False),
-                            ('<testsuites/>', False)]:
-                (logs / 'browser.xml').write_text(xml)
-                with patch.object(check, 'ROOT', root), patch.object(check, 'call') as run:
-                    if ok:
-                        self.assertEqual(check.browser_test('browser::x.test.ts::', logs), 2)
-                        self.assertEqual(run.call_args.args[0][-1], str(directory / 'x.test.ts'))
-                    else:
-                        with self.assertRaises(ValueError):
-                            check.browser_test('browser::x.test.ts::', logs)
+        for xml, ok in [('<testsuites><testcase/><testcase/></testsuites>', True),
+                        ('<testsuites><testcase/><testcase><skipped/></testcase></testsuites>', False),
+                        ('<testsuites/>', False)]:
+            (self.logs / 'browser.xml').write_text(xml)
+            with patch.object(check, 'call') as run:
+                if ok:
+                    self.assertEqual(check.browser_test('browser::x.test.ts::', self.logs), 2)
+                    self.assertEqual(run.call_args.args[0][-1], str(self.directory / 'x.test.ts'))
+                else:
+                    with self.assertRaises(ValueError):
+                        check.browser_test('browser::x.test.ts::', self.logs)
 
 
 class BrowserPackages(unittest.TestCase):

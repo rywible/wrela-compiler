@@ -35,8 +35,8 @@ pub(crate) fn task(fl: &mut Fl, substs: &[TyId], c: &mir::Call) -> Option<ir::Va
             return None;
         }
     };
-    let k = crate::par::add_task(fl, "task", callee, context, |_, _, p| {
-        vec![ir::Arg::Place(ir::Place { root: ir::PlaceRoot::Ptr(p), path: Vec::new() })]
+    let k = crate::par::add_task(fl, callee, context, |_, _, p| {
+        vec![ir::Arg::Place(ir::Place::root(ir::PlaceRoot::Ptr(p)))]
     });
     Some(fl.u32c(k))
 }

@@ -50,7 +50,7 @@ fn walk(
     errors: &mut Vec<LayoutError>,
 ) {
     let display = |p: &Path| p.strip_prefix(root).unwrap_or(p).display().to_string();
-    let entries = match reach.entries(dir) {
+    let mut entries = match reach.entries(dir) {
         Ok(e) => e,
         Err(e) => {
             errors.push(LayoutError {
@@ -62,7 +62,6 @@ fn walk(
             return;
         }
     };
-    let mut entries = entries;
     entries.sort_by(|a, b| a.0.cmp(&b.0));
     for (file_name, kind) in entries {
         let path = dir.join(&file_name);

@@ -54,6 +54,8 @@ const T: [f64; 6] = [
     0.00946564784943673166728,
 ]
 
+// atan's table (atan of 0.5, 1, 1.5 and ∞, each in two parts) and polynomial, for f32's and
+// f64's.
 const ATAN_HI: [f64; 4] = [
     0.463647609000806093515,
     0.785398163397448278999,
@@ -489,11 +491,7 @@ fn wide_atan2(y: f64, x: f64) -> f64 {
 
 /// The angle whose tangent is `x`, in [-π/2, π/2].
 pub fn atan(x: f32) -> f32 {
-    // Keeps -0's sign.
-    if x == 0.0 {
-        return x
-    }
-    f32(wide_atan(f64(x)))
+    f32(atan_f64(f64(x)))
 }
 
 /// The angle from the positive x axis to the point `(x, y)`, in [-π, π].
@@ -563,33 +561,6 @@ const D_C3: f64 = bitcast_f64(u64(0x3EFA01A019CB1590))
 const D_C4: f64 = bitcast_f64(u64(0xBE927E4F809C52AD))
 const D_C5: f64 = bitcast_f64(u64(0x3E21EE9EBDB4B1C4))
 const D_C6: f64 = bitcast_f64(u64(0xBDA8FAE9BE8838D4))
-
-// atan's table (atan of 0.5, 1, 1.5 and ∞, each in two parts) and polynomial.
-const D_ATAN_HI: [f64; 4] = [
-    0.463647609000806093515,
-    0.785398163397448278999,
-    0.982793723247329054082,
-    1.57079632679489655800,
-]
-const D_ATAN_LO: [f64; 4] = [
-    0.0000000000000000226987774529616870924,
-    0.0000000000000000306161699786838301793,
-    0.0000000000000000139033110312309984516,
-    0.0000000000000000612323399573676603587,
-]
-const D_AT: [f64; 11] = [
-    0.333333333333329318027,
-    -0.199999999998764832476,
-    0.142857142725034663711,
-    -0.111111104054623557880,
-    0.0909088713343650656196,
-    -0.0769187620504482999495,
-    0.0666107313738753120669,
-    -0.0583357013379057348645,
-    0.0497687799461593236017,
-    -0.0365315727442169155270,
-    0.0162858201153657823623,
-]
 
 // exp's and log's: ln 2 in two parts (the first with 32 bits to spare), 1/ln 2, and their
 // polynomials.
@@ -724,52 +695,11 @@ pub fn cos_f64(x: f64) -> f64 {
 
 /// The angle whose tangent is `x`, in [-π/2, π/2].
 pub fn atan_f64(x: f64) -> f64 {
-    if x != x {
+    // Keeps -0's sign.
+    if x == 0.0 {
         return x
     }
-    let neg = x < 0.0
-    var a = abs(x)
-    if a > 100000000000000000000.0 {
-        return if neg { -D_ATAN_HI[3] } else { D_ATAN_HI[3] }
-    }
-    if a < 0.0000000074505805969238281 {
-        return x
-    }
-    var id: i32 = -1
-    if a >= 0.4375 {
-        if a < 0.6875 {
-            id = 0
-            a = (2.0 * a - 1.0) / (2.0 + a)
-        } else if a < 1.1875 {
-            id = 1
-            a = (a - 1.0) / (a + 1.0)
-        } else if a < 2.4375 {
-            id = 2
-            a = (a - 1.5) / (1.0 + 1.5 * a)
-        } else {
-            id = 3
-            a = -1.0 / a
-        }
-    }
-    let z = a * a
-    let w = z * z
-    let s1 = z *
-        (D_AT[0] + w * (D_AT[2] + w * (D_AT[4] + w * (D_AT[6] + w * (D_AT[8] + w * D_AT[10])))))
-    let s2 = w * (D_AT[1] + w * (D_AT[3] + w * (D_AT[5] + w * (D_AT[7] + w * D_AT[9]))))
-    let r = if id < 0 {
-        a - a * (s1 + s2)
-    } else {
-        D_ATAN_HI[u32(id)] - ((a * (s1 + s2) - D_ATAN_LO[u32(id)]) - a)
-    }
-    if neg {
-        -r
-    } else {
-        r
-    }
-}
-
-fn d_sign_bit(x: f64) -> bool {
-    (bitcast_u64(x) >> 63) == 1
+    wide_atan(x)
 }
 
 /// The angle from the positive x axis to the point (`x`, `y`), in [-π, π].
@@ -781,10 +711,10 @@ pub fn atan2_f64(y: f64, x: f64) -> f64 {
         return atan_f64(y)
     }
     if y == 0.0 {
-        if !d_sign_bit(x) {
+        if !sign_bit(x) {
             return y
         }
-        return if d_sign_bit(y) { -PI_F64 } else { PI_F64 }
+        return if sign_bit(y) { -PI_F64 } else { PI_F64 }
     }
     if x == 0.0 {
         return if y > 0.0 { 0.5 * PI_F64 } else { -0.5 * PI_F64 }

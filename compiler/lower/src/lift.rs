@@ -285,10 +285,7 @@ fn set_export(mb: &mut ModuleBuilder, table: ir::DataId, state: ir::DataId, n: u
     let u = mb.m.types.u32();
     let b = mb.m.types.bool();
     let f32_t = mb.m.types.f32();
-    let params = vec![
-        ir::Param { name: "i".into(), ty: u, by_ref: false, mutable: false },
-        ir::Param { name: "value".into(), ty: f32_t, by_ref: false, mutable: false },
-    ];
+    let params = vec![ir::Param::value("i", u), ir::Param::value("value", f32_t)];
     let mut f = ir::Function::new("lift_set", params, None);
     let mut body = Vec::new();
     let i = f.let_(&mut body, u, ir::Expr::Param(0));

@@ -84,7 +84,7 @@ pub struct Config {
     pub bounds: Bounds,
 }
 
-/// A share of a bound: `n` of what `count` counts, given back when it's dropped.
+/// A share of a bound: `n` of what each of `counts` counts, given back when it's dropped.
 struct Share {
     n: usize,
     counts: Vec<Arc<AtomicUsize>>,
@@ -104,9 +104,7 @@ impl Share {
         }
         Some(share)
     }
-}
 
-impl Share {
     /// `n` bytes for a connection whose messages hold `conn` (at most `cap`): from its reserve
     /// while it holds less than [`RESERVED`], else from what every queue shares too (`shared`,
     /// at most `shared_cap`).
@@ -136,6 +134,13 @@ impl Drop for Share {
 struct Link {
     tx: tokio::sync::mpsc::Sender<(Out, Option<Share>)>,
     held: Arc<AtomicUsize>,
+}
+
+impl Link {
+    /// Tells its session to close, if its queue has room.
+    fn close(&self) {
+        let _ = self.tx.try_send((Out::Close(0), None));
+    }
 }
 
 /// What a room's thread is told.
@@ -331,12 +336,10 @@ fn run(
             }
         }
         if stop.load(Ordering::Acquire) || batch.iter().any(|e| matches!(e, ToRoom::Stop)) {
-            for link in outs.values() {
-                let _ = link.tx.try_send((Out::Close(0), None));
-            }
+            outs.values().for_each(Link::close);
             for e in batch {
                 if let ToRoom::Opened(_, link) = e {
-                    let _ = link.tx.try_send((Out::Close(0), None));
+                    link.close();
                 }
             }
             return;
@@ -347,7 +350,7 @@ fn run(
             let mut joined = false;
             for e in batch {
                 if let ToRoom::Opened(_, link) = e {
-                    let _ = link.tx.try_send((Out::Close(0), None));
+                    link.close();
                     joined = true;
                 }
             }
@@ -381,13 +384,14 @@ fn run(
         }
         // A session that ended without telling the room (its queue was full) has dropped its
         // end of the link.
-        let gone: Vec<u32> =
-            outs.iter().filter(|(_, l)| l.tx.is_closed()).map(|(&c, _)| c).collect();
-        for conn in gone {
-            outs.remove(&conn);
-            host.disconnect(conn);
-            woken = true;
-        }
+        outs.retain(|&conn, link| {
+            let gone = link.tx.is_closed();
+            if gone {
+                host.disconnect(conn);
+                woken = true;
+            }
+            !gone
+        });
         if woken {
             if let Err(e) = host.wake(rooms.started.elapsed().as_secs_f32()) {
                 eprintln!("wrela-serve: room {name}: {e}");
@@ -420,10 +424,7 @@ fn run(
             if let Status::Quarantined(why) = host.status() {
                 // Its connections were closed (above): it takes no more, until it opens again.
                 eprintln!("wrela-serve: room {name} is quarantined: {why}");
-                for link in outs.values() {
-                    let _ = link.tx.try_send((Out::Close(0), None));
-                }
-                outs.clear();
+                outs.drain().for_each(|(_, link)| link.close());
                 shares.clear();
                 room = None;
             }

@@ -1424,8 +1424,7 @@ pub struct AppendBuffer<T> {
 
 /// An `AppendBuffer` with room for `capacity` `T`s, empty.
 pub fn append_buffer<T: GpuData>(capacity: u32) -> AppendBuffer<T> {
-    var count: GpuBuffer<u32> = buffer(3)
-    write(mut count, 0, [0, 1, 1])
+    let count: GpuBuffer<u32> = buffer_of([0, 1, 1])
     AppendBuffer { items: buffer(capacity), count }
 }
 
@@ -1442,13 +1441,12 @@ impl<T: GpuData> AppendBuffer<T> {
 
     /// The items: the first `count` of them were pushed (to read back, or pass on).
     pub fn items(self) -> GpuSpan<T> {
-        self.items.span(0, self.items.len())
+        self.items.items()
     }
 
     /// The items, for a kernel to change in place (where it takes `mut Slots<T>`).
     pub fn items_mut(mut self) -> GpuSpanMut<T> {
-        let n = self.items.len()
-        self.items.span_mut(0, n)
+        self.items.items_mut()
     }
 
     /// How many were pushed, the first of three `u32`s (then 1 and 1): to read back, or as an
@@ -1551,19 +1549,14 @@ pub struct AtomicMapBuffer {
 
 /// An empty `AtomicMapBuffer` with room for `capacity` keys.
 pub fn atomic_map_buffer(capacity: u32) -> AtomicMapBuffer {
-    var entries: GpuBuffer<u32> = buffer(2 * capacity)
-    var initial: Vec<u32> = Vec::filled(2 * capacity, 0)
-    for i in 0..capacity {
-        initial[2 * i] = EMPTY
-    }
-    write(mut entries, 0, initial)
-    AtomicMapBuffer { entries }
+    let initial = Vec::from_fn(2 * capacity, |i| if i % 2 == 0 { EMPTY } else { 0 })
+    AtomicMapBuffer { entries: buffer_of(initial) }
 }
 
 impl AtomicMapBuffer {
     /// Its entries, key then value: an unused slot's key is `EMPTY`, its value 0. To read back.
     pub fn entries(self) -> GpuSpan<u32> {
-        self.entries.span(0, self.entries.len())
+        self.entries.items()
     }
 }
 

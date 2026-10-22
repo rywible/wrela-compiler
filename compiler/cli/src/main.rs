@@ -344,6 +344,20 @@ pub(crate) fn parse_size(s: &str) -> Option<(u32, u32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
+/// The input script `--input` names, read and parsed; none without it.
+pub(crate) fn read_script(input: Option<&Path>) -> Result<Vec<wrela_abi::input::Scripted>, String> {
+    let Some(p) = input else { return Ok(Vec::new()) };
+    let text =
+        std::fs::read_to_string(p).map_err(|e| format!("can't read {}: {e}", p.display()))?;
+    wrela_abi::input::parse_script(&text)
+}
+
+/// `bytes`' SHA-256, in lowercase hexadecimal.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(bytes))
+}
+
 fn check(dir: &Path, json: bool) -> ExitCode {
     let out = wrela_driver::check(dir);
     if report(&out, json) { ExitCode::from(1) } else { ExitCode::SUCCESS }

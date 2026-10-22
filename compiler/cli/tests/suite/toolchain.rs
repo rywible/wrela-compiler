@@ -2,7 +2,7 @@
 //! in its roots by the compiler's own code, reading only through its grants, keeping its
 //! constants' cache outside them, and stopping (`wasm-opt` too) at its deadline or its end.
 
-use crate::common::{manifest, package, wrela};
+use crate::common::{files, manifest, package, run, wrela};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -159,33 +159,6 @@ fn probe(tool: &Path, src: &Path, out: &Path, args: &[&str]) -> Command {
     c
 }
 
-/// Runs `command`: its exit code and standard output.
-fn run(command: &mut Command) -> (Option<i32>, String) {
-    let out = command.output().expect("run wrela tool");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    (out.status.code(), format!("{stdout}{stderr}"))
-}
-
-/// The files under `dir`, by their paths in it, with their bytes.
-fn files(dir: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).expect("read_dir").map(|e| e.expect("entry")) {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-            } else {
-                let rel = p.strip_prefix(dir).expect("inside").display().to_string();
-                out.push((rel, std::fs::read(&p).expect("read")));
-            }
-        }
-    }
-    out.sort();
-    out
-}
-
 /// The names in `dir`.
 fn names(dir: &Path) -> Vec<String> {
     let mut n: Vec<String> = std::fs::read_dir(dir)
@@ -211,11 +184,7 @@ fn a_build_through_the_toolchain_is_wrela_builds_byte_for_byte_and_writes_nothin
     assert_eq!(names(&src.join("subject")), ["main.wrela", "wrela.toml"]);
     assert_eq!(names(&tool), ["main.wrela", "wrela.toml"], "`wrela tool` keeps no cache there");
     let (a, b) = (files(&out.join("a")), files(&out.join("b")));
-    assert!(
-        a.iter().any(|(f, _)| f == "game.wasm"),
-        "{:?}",
-        a.iter().map(|f| &f.0).collect::<Vec<_>>()
-    );
+    assert!(a.contains_key("game.wasm"), "{:?}", a.keys().collect::<Vec<_>>());
     assert_eq!(a, b, "two builds through the service are the same bytes");
     let reference = out.join("reference");
     let built = wrela()

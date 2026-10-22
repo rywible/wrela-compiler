@@ -521,6 +521,18 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 Some(v) => v.as_bool().ok_or_else(|| at(&format!("`{key}` must be true or false"))),
             }
         };
+        // A whole number, or `default` where the key is missing.
+        let whole = |key: &str, default: Option<u32>| {
+            number(key)
+                .unwrap_or(default)
+                .ok_or_else(|| at(&format!("`{key}` must be a whole number")))
+        };
+        let required = |key: &str| match o.get(key) {
+            Some(_) => Ok(()),
+            None => Err(at(&format!("`{key}` is missing"))),
+        };
+        // The text a `text` or `compose` event types.
+        let typed = || o.get("text").and_then(Value::as_str).ok_or_else(|| at("`text` is missing"));
         let modifiers = [("shift", SHIFT), ("ctrl", CONTROL), ("alt", ALT), ("meta", META)]
             .iter()
             .try_fold(0, |m, (k, bit)| flag(k).map(|on| if on { m | bit } else { m }))?;
@@ -601,15 +613,12 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 push(Event::key(false, k, false, modifiers));
             }
             "text" => {
-                let t =
-                    o.get("text").and_then(Value::as_str).ok_or_else(|| at("`text` is missing"))?;
-                for c in t.chars() {
+                for c in typed()?.chars() {
                     push(Event::text(c));
                 }
             }
             "compose" => {
-                let t =
-                    o.get("text").and_then(Value::as_str).ok_or_else(|| at("`text` is missing"))?;
+                let t = typed()?;
                 if t.chars().count() > COMPOSE_MAX as usize {
                     return Err(at(&format!("`text` is more than {COMPOSE_MAX} characters")));
                 }
@@ -617,18 +626,9 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                     push(e);
                 }
             }
-            "paste" => {
-                let serial = match o.get("serial") {
-                    None => 0,
-                    Some(_) => number("serial")
-                        .flatten()
-                        .ok_or_else(|| at("`serial` must be a whole number"))?,
-                };
-                push(Event::paste(serial));
-            }
+            "paste" => push(Event::paste(whole("serial", Some(0))?)),
             "assist" => {
-                let node =
-                    number("node").flatten().ok_or_else(|| at("`node` must be a whole number"))?;
+                let node = whole("node", None)?;
                 let action = match index("action", &ASSIST_ACTIONS) {
                     None => 0,
                     Some(a) => a.ok_or_else(|| {
@@ -637,23 +637,14 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 };
                 push(Event::assist(node, action));
             }
-            "field" => {
-                let node =
-                    number("node").flatten().ok_or_else(|| at("`node` must be a whole number"))?;
-                let revision = number("revision")
-                    .flatten()
-                    .ok_or_else(|| at("`revision` must be a whole number"))?;
-                push(Event::field(node, revision));
-            }
+            "field" => push(Event::field(whole("node", None)?, whole("revision", None)?)),
             "message" | "connection" if matches!(when, At::Tick(_)) => {
                 return Err(at(
                     "a tick has no network events: give a message or a connection a `frame`",
                 ));
             }
             "message" => {
-                let conn = number("conn")
-                    .unwrap_or(Some(0))
-                    .ok_or_else(|| at("`conn` must be a whole number"))?;
+                let conn = whole("conn", Some(0))?;
                 let payload = match (o.get("bytes"), o.get("text")) {
                     (Some(b), None) => b
                         .as_array()
@@ -677,21 +668,14 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
                 out.push(Scripted { at: when, event: Event::message(conn, 0, len), payload });
             }
             "connection" => {
-                let conn = number("conn")
-                    .unwrap_or(Some(0))
-                    .ok_or_else(|| at("`conn` must be a whole number"))?;
-                let open = match o.get("open") {
-                    Some(v) => v.as_bool().ok_or_else(|| at("`open` must be true or false"))?,
-                    None => return Err(at("`open` is missing")),
-                };
-                push(Event::connection(conn, open, 0));
+                let conn = whole("conn", Some(0))?;
+                required("open")?;
+                push(Event::connection(conn, flag("open")?, 0));
             }
             "padbutton" => {
                 let (p, b) = (pad()?, named("button", &PAD_BUTTONS)?);
-                let pressed = match o.get("pressed") {
-                    Some(v) => v.as_bool().ok_or_else(|| at("`pressed` must be true or false"))?,
-                    None => return Err(at("`pressed` is missing")),
-                };
+                required("pressed")?;
+                let pressed = flag("pressed")?;
                 let value = match o.get("value") {
                     None => f32::from(u8::from(pressed)),
                     Some(_) => num("value")?,
@@ -708,9 +692,7 @@ pub fn parse_script(text: &str) -> Result<Vec<Scripted>, String> {
             }
             "padaxis" => {
                 let (p, a) = (pad()?, named("axis", &PAD_AXES)?);
-                if o.get("value").is_none() {
-                    return Err(at("`value` is missing"));
-                }
+                required("value")?;
                 let value = num("value")?;
                 if !(-1.0..=1.0).contains(&value) {
                     return Err(at("an axis's `value` is from -1 to 1"));

@@ -289,50 +289,27 @@ pub(crate) fn write_steps(out: &mut Out, steps: &[Step]) {
     out.u32(steps.len() as u32);
     for s in steps {
         match s {
-            Step::Init => {
-                out.u8(0);
-            }
-            Step::Frames(n, text) => {
-                out.u8(1).u32(*n).str(text);
-            }
-            Step::FrameAt(t) => {
-                out.u8(2).u32(t.to_bits());
-            }
-            Step::Ticks(n, text) => {
-                out.u8(3).u32(*n).str(text);
-            }
+            Step::Init => out.u8(0),
+            Step::Frames(n, text) => out.u8(1).u32(*n).str(text),
+            Step::FrameAt(t) => out.u8(2).u32(t.to_bits()),
+            Step::Ticks(n, text) => out.u8(3).u32(*n).str(text),
             Step::Call(export, args) => {
                 out.u8(4).str(export).u32(args.len() as u32);
                 for v in args {
                     let (kind, bits) = scalar(*v);
                     out.u8(kind).u64(bits);
                 }
+                &mut *out
             }
-            Step::Audio(quanta, timed) => {
-                out.u8(5).u32(*quanta).u8(u8::from(*timed));
-            }
-            Step::Capture => {
-                out.u8(6);
-            }
-            Step::Hash => {
-                out.u8(7);
-            }
-            Step::Phases => {
-                out.u8(8);
-            }
-            Step::Buffers => {
-                out.u8(9);
-            }
-            Step::ReadBuffer(h) => {
-                out.u8(10).u32(*h);
-            }
-            Step::Commands => {
-                out.u8(11);
-            }
-            Step::Running => {
-                out.u8(12);
-            }
-        }
+            Step::Audio(quanta, timed) => out.u8(5).u32(*quanta).u8(u8::from(*timed)),
+            Step::Capture => out.u8(6),
+            Step::Hash => out.u8(7),
+            Step::Phases => out.u8(8),
+            Step::Buffers => out.u8(9),
+            Step::ReadBuffer(h) => out.u8(10).u32(*h),
+            Step::Commands => out.u8(11),
+            Step::Running => out.u8(12),
+        };
     }
 }
 

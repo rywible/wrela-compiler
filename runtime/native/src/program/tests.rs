@@ -61,7 +61,7 @@ fn run_err(frames: &[Vec<Vec<u8>>]) -> Error {
 #[test]
 fn a_trapped_call_discards_its_submitted_commands() {
     let batch = Encoder::new().create_buffer(1, 64).finish();
-    let escaped: String = batch.iter().map(|b| format!("\\{b:02x}")).collect();
+    let escaped = wat_gen::escape(&batch);
     let mut program = load_wat(&format!(
         r#"(module
             (import "wrela" "submit" (func $submit (param i32 i32)))
@@ -368,6 +368,7 @@ fn host_controls_without_control_words_do_not_panic() {
 }
 
 /// The ABI's default limits are WebGPU's, as wgpu has them (`wrela_abi` can't see wgpu).
+#[cfg(feature = "gpu")]
 #[test]
 fn the_default_limits_are_webgpus() {
     assert_eq!(crate::gpu::limits_of(&wgpu::Limits::default()), wrela_abi::Limits::DEFAULT);

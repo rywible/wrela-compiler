@@ -30,7 +30,7 @@
 
 use std::input::Script
 use std::serialize::{Reader, Writer}
-use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed}
+use std::tool::{Answer, Call, Done, MOST_BYTES, ToolError, ask, malformed, read_list, read_strings}
 use std::tool::blob
 use std::tool::blob::{Data, read_data, write_data}
 
@@ -303,14 +303,12 @@ fn read_log(blob: blob::Blob) -> Result<Vec<u8>, ToolError> {
     var bytes: Vec<u8> = Vec::new()
     var at: u64 = 0
     while at < total {
-        let chunk = blob::read(blob, at, MOST_BYTES).wait()?
+        var chunk = blob::read(blob, at, MOST_BYTES).wait()?
         if chunk.is_empty() {
             return Err(malformed("a build's printed lines"))
         }
         at += u64(chunk.len())
-        for b in chunk {
-            bytes.push(b)
-        }
+        bytes.append(mut chunk)
     }
     Ok(bytes)
 }
@@ -359,11 +357,7 @@ fn write_load(w: mut Writer, build: str, options: Load) {
     w.write_u32(options.height)
     w.write_u64(bitcast_u64(options.fps))
     w.write_u32(options.workers)
-    w.write_u8(match options.timing {
-        Timing::Off => 0,
-        Timing::Span => 1,
-        Timing::Serial => 2,
-    })
+    w.write_u8(u8(u32(options.timing)))
     w.write_u32(options.hold)
     w.write_u8(if options.record { 1 } else { 0 })
     w.write_str(options.storage.as_str())
@@ -514,42 +508,35 @@ impl Answer for Loaded {
     }
 }
 
-/// A count read before as many items, each of at least a byte: `None` if fewer bytes are left.
-fn count(r: mut Reader) -> Option<u32> {
-    let Ok(n) = r.read_u32() else { return None }
-    if n > r.left() {
-        return None
-    }
-    Some(n)
-}
-
 /// A `Ran`: when it started and how long it took, each frame's or tick's start and end, then
 /// each result's kind and bits.
 fn read_ran(r: mut Reader) -> Option<Ran> {
     let Ok(started) = r.read_u64() else { return None }
     let Ok(elapsed) = r.read_u64() else { return None }
-    let Some(n) = count(mut r) else { return None }
-    var spans: Vec<Span> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(start) = r.read_u64() else { return None }
-        let Ok(end) = r.read_u64() else { return None }
-        spans.push(Span { start: bitcast_f64(start), end: bitcast_f64(end) })
-    }
-    let Some(m) = count(mut r) else { return None }
-    var results: Vec<Scalar> = Vec::with_capacity(m)
-    for _ in 0..m {
-        let Ok(kind) = r.read_u8() else { return None }
-        let Ok(bits) = r.read_u64() else { return None }
-        let low = u32(bits & 4294967295)
-        results.push(match kind {
-            0 => Scalar::I32(i32(low)),
-            1 => Scalar::I64(bits),
-            2 => Scalar::F32(bitcast_f32(low)),
-            3 => Scalar::F64(bitcast_f64(bits)),
-            _ => return None,
-        })
-    }
+    let spans = read_list(mut r, read_span)?
+    let results = read_list(mut r, read_scalar)?
     Some(Ran { started: bitcast_f64(started), elapsed: bitcast_f64(elapsed), spans, results })
+}
+
+/// A `Span`: its start and end.
+fn read_span(r: mut Reader) -> Option<Span> {
+    let Ok(start) = r.read_u64() else { return None }
+    let Ok(end) = r.read_u64() else { return None }
+    Some(Span { start: bitcast_f64(start), end: bitcast_f64(end) })
+}
+
+/// A `Scalar`: its kind, then its bits.
+fn read_scalar(r: mut Reader) -> Option<Scalar> {
+    let Ok(kind) = r.read_u8() else { return None }
+    let Ok(bits) = r.read_u64() else { return None }
+    let low = u32(bits & 4294967295)
+    match kind {
+        0 => Some(Scalar::I32(i32(low))),
+        1 => Some(Scalar::I64(bits)),
+        2 => Some(Scalar::F32(bitcast_f32(low))),
+        3 => Some(Scalar::F64(bitcast_f64(bits))),
+        _ => None,
+    }
 }
 
 /// A `Capture`: the width and height (`u32`s), then the pixels (`blob::Data`).
@@ -563,78 +550,57 @@ fn read_capture(r: mut Reader) -> Option<Capture> {
 /// An `Audio`: the samples (`blob::Data`), then 1 and the times (`blob::Data`), or 0.
 fn read_audio(r: mut Reader) -> Option<Audio> {
     let Some(samples) = read_data(mut r) else { return None }
-    var times: Option<Data> = None
-    match r.read_u8() {
-        Ok(0) => {},
-        Ok(1) => {
-            let Some(t) = read_data(mut r) else { return None }
-            times = Some(take t)
-        },
-        _ => return None,
-    }
+    let times = read_maybe(mut r, read_data)?
     Some(Audio { samples, times })
 }
 
-/// The phases of a `Phases` step: a count, then each phase's name, seconds and times.
-fn read_phases(r: mut Reader) -> Option<Vec<Phase>> {
-    let Some(n) = count(mut r) else { return None }
-    var out: Vec<Phase> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(name) = r.read_string() else { return None }
-        let Ok(seconds) = r.read_u64() else { return None }
-        let Ok(times) = r.read_u32() else { return None }
-        out.push(Phase { name, seconds: bitcast_f64(seconds), times })
+/// 0, or 1 and an item `item` reads: `None` if it's neither.
+fn read_maybe<T>(r: mut Reader, item: fn(mut Reader) -> Option<T>) -> Option<Option<T>> {
+    match r.read_u8() {
+        Ok(0) => Some(None),
+        Ok(1) => Some(Some(item(mut r)?)),
+        _ => None,
     }
-    Some(out)
 }
 
-/// The handles of a `Buffers` step: a count, then each.
-fn read_buffers(r: mut Reader) -> Option<Vec<u32>> {
-    let Some(n) = count(mut r) else { return None }
-    var out: Vec<u32> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(h) = r.read_u32() else { return None }
-        out.push(h)
-    }
-    Some(out)
+/// A phase of a `Phases` step: its name, seconds and times.
+fn read_phase(r: mut Reader) -> Option<Phase> {
+    let Ok(name) = r.read_string() else { return None }
+    let Ok(seconds) = r.read_u64() else { return None }
+    let Ok(times) = r.read_u32() else { return None }
+    Some(Phase { name, seconds: bitcast_f64(seconds), times })
 }
 
-/// A `Commands`: a count, each command's kind, label, pipeline, workgroups, bindings, target
-/// and bytes, then how many wait.
+/// A `Commands`: a count, each command (`read_recorded`), then how many wait.
 fn read_commands(r: mut Reader) -> Option<Commands> {
-    let Some(n) = count(mut r) else { return None }
-    var commands: Vec<Recorded> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(kind) = r.read_string() else { return None }
-        let Ok(label) = r.read_string() else { return None }
-        let Ok(pipeline) = r.read_string() else { return None }
-        var groups = vec3u(0)
-        for k in 0..3 {
-            let Ok(g) = r.read_u32() else { return None }
-            groups[k] = g
-        }
-        let Some(m) = count(mut r) else { return None }
-        var bindings: Vec<Bound> = Vec::with_capacity(m)
-        for _ in 0..m {
-            let Ok(handle) = r.read_u32() else { return None }
-            let Ok(offset) = r.read_u32() else { return None }
-            let Ok(size) = r.read_u32() else { return None }
-            bindings.push(Bound { handle, offset, size })
-        }
-        let Ok(target) = r.read_string() else { return None }
-        let Ok(len) = r.read_u32() else { return None }
-        if len > r.left() {
-            return None
-        }
-        var bytes: Vec<u8> = Vec::with_capacity(len)
-        for _ in 0..len {
-            let Ok(b) = r.read_u8() else { return None }
-            bytes.push(b)
-        }
-        commands.push(Recorded { kind, label, pipeline, groups, bindings, target, bytes })
-    }
+    let commands = read_list(mut r, read_recorded)?
     let Ok(waiting) = r.read_u32() else { return None }
     Some(Commands { commands, waiting })
+}
+
+/// A `Recorded`: its kind, label, pipeline, workgroups, bindings, target and bytes.
+fn read_recorded(r: mut Reader) -> Option<Recorded> {
+    let Ok(kind) = r.read_string() else { return None }
+    let Ok(label) = r.read_string() else { return None }
+    let Ok(pipeline) = r.read_string() else { return None }
+    var groups = vec3u(0)
+    for k in 0..3 {
+        let Ok(g) = r.read_u32() else { return None }
+        groups[k] = g
+    }
+    let bindings = read_list(mut r, read_bound)?
+    let Ok(target) = r.read_string() else { return None }
+    let Ok(len) = r.read_u32() else { return None }
+    let Ok(bytes) = r.read_bytes(len) else { return None }
+    Some(Recorded { kind, label, pipeline, groups, bindings, target, bytes })
+}
+
+/// A `Bound`: its handle, offset and size.
+fn read_bound(r: mut Reader) -> Option<Bound> {
+    let Ok(handle) = r.read_u32() else { return None }
+    let Ok(offset) = r.read_u32() else { return None }
+    let Ok(size) = r.read_u32() else { return None }
+    Some(Bound { handle, offset, size })
 }
 
 /// A `Trap`: its message, panic and place, its stage, its number and its step.
@@ -660,85 +626,19 @@ fn read_trap(r: mut Reader) -> Option<Trap> {
 /// then each, and how many were dropped; 1 and the log (`blob::Data`), or 0; then 1 and the
 /// trap, or 0.
 fn read_seen(r: mut Reader) -> Option<Seen> {
-    let Some(n) = count(mut r) else { return None }
-    var ran: Vec<Ran> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_ran(mut r) else { return None }
-        ran.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var captures: Vec<Capture> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_capture(mut r) else { return None }
-        captures.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var hashes: Vec<u64> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(x) = r.read_u64() else { return None }
-        hashes.push(x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var phases: Vec<Vec<Phase>> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_phases(mut r) else { return None }
-        phases.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var audio: Vec<Audio> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_audio(mut r) else { return None }
-        audio.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var buffers: Vec<Vec<u32>> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_buffers(mut r) else { return None }
-        buffers.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var bytes: Vec<Data> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_data(mut r) else { return None }
-        bytes.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var commands: Vec<Commands> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Some(x) = read_commands(mut r) else { return None }
-        commands.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var running: Vec<String> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(x) = r.read_string() else { return None }
-        running.push(take x)
-    }
-    let Some(n) = count(mut r) else { return None }
-    var lines: Vec<String> = Vec::with_capacity(n)
-    for _ in 0..n {
-        let Ok(x) = r.read_string() else { return None }
-        lines.push(take x)
-    }
+    let ran = read_list(mut r, read_ran)?
+    let captures = read_list(mut r, read_capture)?
+    let hashes = read_list(mut r, |r| r.read_u64().ok())?
+    let phases = read_list(mut r, |r| read_list(mut r, read_phase))?
+    let audio = read_list(mut r, read_audio)?
+    let buffers = read_list(mut r, |r| read_list(mut r, |r| r.read_u32().ok()))?
+    let bytes = read_list(mut r, read_data)?
+    let commands = read_list(mut r, read_commands)?
+    let running = read_strings(mut r)?
+    let lines = read_strings(mut r)?
     let Ok(dropped_lines) = r.read_u32() else { return None }
-    var log: Option<Data> = None
-    match r.read_u8() {
-        Ok(0) => {},
-        Ok(1) => {
-            let Some(d) = read_data(mut r) else { return None }
-            log = Some(take d)
-        },
-        _ => return None,
-    }
-    var trap: Option<Trap> = None
-    match r.read_u8() {
-        Ok(0) => {},
-        Ok(1) => {
-            let Some(t) = read_trap(mut r) else { return None }
-            trap = Some(take t)
-        },
-        _ => return None,
-    }
+    let log = read_maybe(mut r, read_data)?
+    let trap = read_maybe(mut r, read_trap)?
     Some(
         Seen {
             ran,
@@ -774,19 +674,20 @@ impl Answer for Seen {
 impl Answer for Vec<Post> {
     fn read(bytes: take Vec<u8>) -> Result<Vec<Post>, ToolError> {
         var r = Reader::new(take bytes)
-        let Some(n) = count(mut r) else { return Err(malformed("posts")) }
-        var out: Vec<Post> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(id) = r.read_u32() else { return Err(malformed("posts")) }
-            let Ok(url) = r.read_string() else { return Err(malformed("posts")) }
-            let Some(body) = read_data(mut r) else { return Err(malformed("posts")) }
-            out.push(Post { id, url, body })
-        }
+        let Some(out) = read_list(mut r, read_post) else { return Err(malformed("posts")) }
         if !r.at_end() {
             return Err(malformed("posts"))
         }
         Ok(out)
     }
+}
+
+/// A post: its number, URL and body (`blob::Data`).
+fn read_post(r: mut Reader) -> Option<Post> {
+    let Ok(id) = r.read_u32() else { return None }
+    let Ok(url) = r.read_string() else { return None }
+    let Some(body) = read_data(mut r) else { return None }
+    Some(Post { id, url, body })
 }
 
 /// Writes an empty kind: a count of 0.

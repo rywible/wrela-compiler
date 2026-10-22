@@ -432,11 +432,11 @@ fn lower_in(
         }
         // A server build exports `serve_init` and `serve` alone, a tool build `tool`; a client
         // build every other export (§15.3).
-        let name = &checked.program.func(f).name;
+        let def = checked.program.func(f);
+        let name = &def.name;
         if export_role(name) != role {
             continue;
         }
-        let def = checked.program.func(f);
         if let Some((only, _)) = def.attrs.role
             && only != data.role
         {
@@ -460,20 +460,17 @@ fn lower_in(
         }
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
-        let name = cx.checked.program.func(f).name.clone();
         has_entry |= name == entry_export(role);
         if cx.check_export(f, state.map(|s| s.1)) {
             let id = enum_wrapper(&cx, &mut cpu, f, id);
             let id = match (cpu.m.state, state) {
                 (Some(d), Some((init, _))) if f == init => state_wrapper(&mut cpu, id, d, true),
-                (Some(d), Some((_, s)))
-                    if checked.program.func(f).params.first().is_some_and(|p| p.ty == s) =>
-                {
+                (Some(d), Some((_, s))) if def.params.first().is_some_and(|p| p.ty == s) => {
                     state_wrapper(&mut cpu, id, d, false)
                 }
                 _ => id,
             };
-            cpu.m.exports.push((name, id));
+            cpu.m.exports.push((name.clone(), id));
         }
     }
     for (i, &f) in roots.tests.iter().enumerate() {
@@ -606,12 +603,15 @@ fn recorded_pipelines_only(cx: &mut Cx, cpu: &mut ir::Module) {
             }
         });
     }
+    retain_used(&mut cx.pipelines, &used);
+    retain_used(&mut cx.pipeline_sites, &used);
+    retain_used(&mut cx.pipeline_targets, &used);
+}
+
+/// Keeps the items of `v` whose entry in `used` is true.
+fn retain_used<T>(v: &mut Vec<T>, used: &[bool]) {
     let mut keep = used.iter();
-    cx.pipelines.retain(|_| *keep.next().unwrap_or(&false));
-    let mut keep = used.iter();
-    cx.pipeline_sites.retain(|_| *keep.next().unwrap_or(&false));
-    let mut keep = used.iter();
-    cx.pipeline_targets.retain(|_| *keep.next().unwrap_or(&false));
+    v.retain(|_| *keep.next().unwrap_or(&false));
 }
 
 impl<'a> Cx<'a> {
@@ -1145,8 +1145,6 @@ fn entry_export(role: wrela_sema::defs::Role) -> &'static str {
     }
 }
 
-/// The std function implementing a transcendental builtin on the CPU (language.md §11): the
-/// one the built-in function that lowers to it names.
 /// The program's `init` (§15): `pub fn init() -> S` in main.wrela, and its state type `S`; for
 /// a server build, its `serve_init`. A tool build has none.
 fn state_type(checked: &Checked, role: wrela_sema::defs::Role) -> Option<(FnId, TyId)> {
@@ -1202,9 +1200,7 @@ fn enum_wrapper(cx: &Cx, mb: &mut ModuleBuilder, f: FnId, inner: ir::FuncId) -> 
         .iter()
         .zip(&enums)
         .map(|(q, e)| match e {
-            Some(_) => {
-                ir::Param { name: q.name.clone(), ty: u32_ty, by_ref: false, mutable: false }
-            }
+            Some(_) => ir::Param::value(q.name.clone(), u32_ty),
             None => q.clone(),
         })
         .collect();
@@ -1372,6 +1368,8 @@ fn mark_counted(cx: &mut Cx, mb: &mut ModuleBuilder) {
     mb.m.stack_message = Some((d, len));
 }
 
+/// The std function implementing a transcendental builtin on the CPU (language.md §11): the
+/// one the built-in function that lowers to it names.
 pub(crate) fn cpu_math_lang(b: ir::Builtin) -> Option<Lang> {
     BuiltinFn::ALL.iter().find_map(|&f| match body::builtin_ir(f) {
         body::BuiltinIr::Math(m) if m == b => f.cpu_impl(),

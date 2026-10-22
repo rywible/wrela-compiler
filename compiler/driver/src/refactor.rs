@@ -208,29 +208,35 @@ fn tokens_named(text: &str, name: &str) -> Vec<(u32, u32)> {
         .collect()
 }
 
+/// [`crate::with_checked_in`]: what `f` gives, or refused with `why` and the errors if the
+/// program, with `overlay`'s texts in place, doesn't check.
+fn checked_or<T: Send>(
+    root: &Path,
+    overlay: &Overlay,
+    why: &str,
+    f: impl FnOnce(&Checked, &SourceMap) -> T + Send,
+) -> Result<T, Refusal> {
+    crate::with_checked_in(root, overlay, f)
+        .map_err(|errors| Refusal { why: why.into(), errors: Some(errors) })
+}
+
 /// Checks the program loads, and gives `f` what it found.
 fn inspect<T: Send>(
     root: &Path,
     f: impl FnOnce(&Checked, &SourceMap) -> Result<T, Refusal> + Send,
 ) -> Result<T, Refusal> {
-    crate::with_checked(root, f).map_err(|errors| Refusal {
-        why: "the program doesn't check as it is: fix its errors first".into(),
-        errors: Some(errors),
-    })?
+    let why = "the program doesn't check as it is: fix its errors first";
+    checked_or(root, &Overlay::new(), why, f)?
 }
 
 /// How many uses the compiler records of the function at `path` (after a change, in `texts`).
 fn uses_now(root: &Path, texts: &Texts, path: &str) -> Result<usize, Refusal> {
-    crate::with_checked_in(root, &texts.overlay(), |checked, sources| {
+    checked_or(root, &texts.overlay(), "the changed program doesn't check", |checked, sources| {
         let ix = Index::new(checked, sources);
         match ix.one(path) {
             Ok((Item::Fn(f), _)) => Ok(ix.uses_of(f).len()),
             _ => refuse(format!("after the change, `{path}` isn't one function")),
         }
-    })
-    .map_err(|errors| Refusal {
-        why: "the changed program doesn't check".into(),
-        errors: Some(errors),
     })?
 }
 
@@ -425,10 +431,8 @@ fn call_targets(
     let mut calls = BTreeMap::new();
     for (&f, body) in &checked.mir {
         let caller = name(f);
-        for (s, r) in wrela_sema::mir::rvalues(body) {
-            wrela_sema::mir::fn_uses(ix.p, s, r, |u, _| {
-                *calls.entry((caller.clone(), name(u.func()))).or_default() += 1;
-            });
+        for (u, _) in crate::query::uses(ix.p, body) {
+            *calls.entry((caller.clone(), name(u.func()))).or_default() += 1;
         }
     }
     calls
@@ -767,12 +771,9 @@ pub fn move_item(root: &Path, item: &str, module: &str) -> Result<Plan, Refusal>
     for (f, p) in &imported {
         notes.push(format!("{f} imports `{p}`"));
     }
-    let calls = crate::with_checked_in(root, &texts.overlay(), |checked, sources| {
+    let why = "the program wouldn't check after the move";
+    let calls = checked_or(root, &texts.overlay(), why, |checked, sources| {
         call_targets(checked, sources, &BTreeMap::new())
-    })
-    .map_err(|errors| Refusal {
-        why: "the program wouldn't check after the move".into(),
-        errors: Some(errors),
     })?;
     if calls != info.calls {
         return refuse("moving the item would make a call go to another function");

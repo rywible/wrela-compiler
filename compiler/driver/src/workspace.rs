@@ -9,6 +9,7 @@
 //! tool build. Tools that only need the directories use [`dependency_dirs`]; `wrela suite` and
 //! `wrela tool <name>` read a whole workspace with [`Workspace::open`].
 
+use crate::lift::relative;
 use crate::manifest::{self, Source, WorkspaceDecl};
 use crate::reach::{Kind, Reach};
 use std::path::{Path, PathBuf};
@@ -344,11 +345,6 @@ fn read(path: &Path) -> Result<manifest::Manifest, String> {
         std::fs::read_to_string(path).map_err(|e| format!("can't read {}: {e}", path.display()))?;
     manifest::parse(FileId(0), &text)
         .map_err(|e| format!("{} doesn't read: {}", path.display(), e[0].message))
-}
-
-/// `path` relative to `base`, with `/` between its parts: how a message names a member.
-fn relative(path: &Path, base: &Path) -> String {
-    crate::lift::relative(path, base)
 }
 
 /// The directory of each dependency the manifest of the package at `pkg` declares, by name,

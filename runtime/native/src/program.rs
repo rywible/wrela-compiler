@@ -9,6 +9,7 @@ use crate::shared;
 use crate::trace::Trace;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use wasmtime::SharedMemory;
 use wasmtime::{
@@ -97,7 +98,7 @@ const EPOCH: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// The thread that moves [`METERED_STOPPABLE`]'s epoch on, while a [`Stop`] is alive: how many
 /// are, and the thread with its flag to end.
-type Ticking = Option<(usize, Arc<std::sync::atomic::AtomicBool>, std::thread::JoinHandle<()>)>;
+type Ticking = Option<(usize, Arc<AtomicBool>, std::thread::JoinHandle<()>)>;
 static TICKING: std::sync::Mutex<Ticking> = std::sync::Mutex::new(None);
 
 /// What ends the calls of a build's constants that the tool host's `toolchain` service computes
@@ -112,9 +113,9 @@ static TICKING: std::sync::Mutex<Ticking> = std::sync::Mutex::new(None);
 pub struct Stop(Arc<StopState>);
 
 struct StopState {
-    stopped: std::sync::atomic::AtomicBool,
+    stopped: AtomicBool,
     /// Nanoseconds after `base` from which calls stop; `u64::MAX`: none.
-    deadline: std::sync::atomic::AtomicU64,
+    deadline: AtomicU64,
     base: std::time::Instant,
     /// Another reason to stop, asked on each epoch ([`Stop::when_set`]).
     also: Option<Box<dyn Fn() -> bool + Send + Sync>>,
@@ -123,22 +124,22 @@ struct StopState {
 impl Stop {
     /// A stop that is due once `flag` is set: a cancelled compile's (the tool host's toolchain
     /// requests, language.md §15.5), so its constants stop within about 10 ms.
-    pub fn when_set(flag: Arc<std::sync::atomic::AtomicBool>) -> Result<Stop> {
-        Stop::ticking(Some(Box::new(move || flag.load(std::sync::atomic::Ordering::Acquire))))
+    pub fn when_set(flag: Arc<AtomicBool>) -> Result<Stop> {
+        Stop::ticking(Some(Box::new(move || flag.load(Ordering::Acquire))))
     }
 
     /// A stop whose epochs [`TICKING`]'s thread moves on, also due once `also` says so.
     fn ticking(also: Option<Box<dyn Fn() -> bool + Send + Sync>>) -> Result<Stop> {
-        let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ticking = crate::locked(&TICKING);
         match ticking.as_mut() {
             Some((count, _, _)) => *count += 1,
             None => {
-                let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                let running = Arc::new(AtomicBool::new(true));
                 let r = running.clone();
                 let thread = std::thread::Builder::new()
                     .name("wrela-stop-epochs".into())
                     .spawn(move || {
-                        while r.load(std::sync::atomic::Ordering::Acquire) {
+                        while r.load(Ordering::Acquire) {
                             std::thread::sleep(EPOCH);
                             METERED_STOPPABLE.increment_epoch();
                         }
@@ -150,8 +151,8 @@ impl Stop {
             }
         }
         Ok(Stop(Arc::new(StopState {
-            stopped: std::sync::atomic::AtomicBool::new(false),
-            deadline: std::sync::atomic::AtomicU64::new(u64::MAX),
+            stopped: AtomicBool::new(false),
+            deadline: AtomicU64::new(u64::MAX),
             base: std::time::Instant::now(),
             also,
         })))
@@ -159,7 +160,7 @@ impl Stop {
 
     /// Stops every call from now on.
     pub fn stop(&self) {
-        self.0.stopped.store(true, std::sync::atomic::Ordering::Release);
+        self.0.stopped.store(true, Ordering::Release);
     }
 
     /// Calls stop from `at` on (`None`: no deadline).
@@ -167,21 +168,20 @@ impl Stop {
         let nanos = at.map_or(u64::MAX, |at| {
             u64::try_from(at.saturating_duration_since(self.0.base).as_nanos()).unwrap_or(u64::MAX)
         });
-        self.0.deadline.store(nanos, std::sync::atomic::Ordering::Release);
+        self.0.deadline.store(nanos, Ordering::Release);
     }
 
     /// Whether calls stop now: it's stopped, or past its deadline.
     pub fn is_due(&self) -> bool {
         let s = &self.0;
-        s.stopped.load(std::sync::atomic::Ordering::Acquire)
-            || s.base.elapsed().as_nanos()
-                >= u128::from(s.deadline.load(std::sync::atomic::Ordering::Acquire))
+        s.stopped.load(Ordering::Acquire)
+            || s.base.elapsed().as_nanos() >= u128::from(s.deadline.load(Ordering::Acquire))
             || s.also.as_ref().is_some_and(|also| also())
     }
 
     /// Whether it was stopped ([`Stop::stop`]), not only past a deadline.
     pub fn is_stopped(&self) -> bool {
-        self.0.stopped.load(std::sync::atomic::Ordering::Acquire)
+        self.0.stopped.load(Ordering::Acquire)
     }
 
     /// Makes `store`'s calls end when this is due.
@@ -203,13 +203,13 @@ impl Stop {
 
 impl Drop for StopState {
     fn drop(&mut self) {
-        let mut ticking = TICKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut ticking = crate::locked(&TICKING);
         if let Some((count, _, _)) = ticking.as_mut() {
             *count -= 1;
             if *count == 0
                 && let Some((_, running, thread)) = ticking.take()
             {
-                running.store(false, std::sync::atomic::Ordering::Release);
+                running.store(false, Ordering::Release);
                 let _ = thread.join();
             }
         }
@@ -498,17 +498,26 @@ impl Requests {
         }
     }
 
+    /// The bytes of the file `path` names: through `handle` if it's opened, else under `dir`.
+    fn read(
+        handle: &Option<Arc<cap_std::fs::Dir>>,
+        dir: &Option<PathBuf>,
+        path: &str,
+        what: &str,
+    ) -> std::result::Result<Vec<u8>, String> {
+        match handle {
+            Some(handle) => crate::confined::read(handle, path, u64::MAX),
+            None => Self::file(dir, path, what)
+                .and_then(|f| std::fs::read(f).map_err(|e| e.to_string())),
+        }
+    }
+
     /// Carries out an IO request now; its answer arrives at the end of the call.
     fn io(&mut self, cmd: &Command<'_>) -> Result<()> {
         let (request, answer) = match cmd {
             Command::StorageRead { request, path } => {
                 self.start(*request, cmd.opcode())?;
-                let a = match &self.io.storage_dir {
-                    Some(dir) => crate::confined::read(dir, path, u64::MAX),
-                    None => Self::file(&self.io.storage, path, "storage")
-                        .and_then(|f| std::fs::read(f).map_err(|e| e.to_string())),
-                };
-                (*request, a)
+                (*request, Self::read(&self.io.storage_dir, &self.io.storage, path, "storage"))
             }
             Command::StorageWrite { request, path, data } => {
                 self.start(*request, cmd.opcode())?;
@@ -525,12 +534,8 @@ impl Requests {
             }
             Command::Fetch { request, url } => {
                 self.start(*request, cmd.opcode())?;
-                let a = match &self.io.build_dir {
-                    Some(dir) => crate::confined::read(dir, url, u64::MAX),
-                    None => Self::file(&self.io.build, url, "build to fetch from")
-                        .and_then(|f| std::fs::read(f).map_err(|e| e.to_string())),
-                };
-                (*request, a)
+                let what = "build to fetch from";
+                (*request, Self::read(&self.io.build_dir, &self.io.build, url, what))
             }
             Command::HostRequest { request, service, body } => {
                 self.start(*request, cmd.opcode())?;
@@ -830,6 +835,7 @@ pub(crate) struct Retired<E> {
 }
 
 /// The carried data kept aside while a restart starts a fresh program on the old device.
+#[cfg(feature = "gpu")]
 pub(crate) struct RestartState {
     kept: Vec<u8>,
     ticks: u32,
@@ -841,6 +847,7 @@ pub(crate) struct RestartState {
     tick_from: Option<u32>,
 }
 
+#[cfg(feature = "gpu")]
 impl RestartState {
     /// Reattaches the old program's data to the executor returned by a failed restart.
     pub(crate) fn restore<E>(self, failed: Retired<E>) -> Retired<E> {
@@ -859,6 +866,7 @@ impl RestartState {
 }
 
 /// What a failed replacement's `init` must not consume from the retiring program.
+#[cfg(feature = "gpu")]
 pub(crate) struct CarryCheckpoint {
     kept: Vec<u8>,
     ticks: u32,
@@ -869,6 +877,7 @@ pub(crate) struct CarryCheckpoint {
     tick_from: Option<u32>,
 }
 
+#[cfg(feature = "gpu")]
 impl CarryCheckpoint {
     pub(crate) fn restore<E>(self, mut failed: Retired<E>) -> Retired<E> {
         failed.kept = self.kept;
@@ -887,7 +896,24 @@ impl CarryCheckpoint {
 }
 
 impl<E> Retired<E> {
+    /// What a program that replaces none starts with: `executor` alone, and with `record`, a
+    /// place for its batches.
+    fn new(executor: E, record: bool) -> Retired<E> {
+        Retired {
+            executor,
+            kept: Vec::new(),
+            ticks: 0,
+            ran: None,
+            input: Queue::default(),
+            records: Default::default(),
+            trace: None,
+            batches: record.then(Vec::new),
+            tick_from: None,
+        }
+    }
+
     /// Saves the bytes, unread input and recorded batches a replacement's `init` can change.
+    #[cfg(feature = "gpu")]
     pub(crate) fn checkpoint(&self) -> CarryCheckpoint {
         CarryCheckpoint {
             kept: self.kept.clone(),
@@ -902,22 +928,12 @@ impl<E> Retired<E> {
 
     /// Starts a fresh program on this executor while keeping the old program's data for
     /// rollback if the restart fails.
+    #[cfg(feature = "gpu")]
     pub(crate) fn fresh_for_restart(self, record: bool) -> (Retired<E>, RestartState) {
         let Retired { executor, kept, ticks, ran, input, records, trace, batches, tick_from } =
             self;
         let saved = RestartState { kept, ticks, ran, input, records, trace, batches, tick_from };
-        let fresh = Retired {
-            executor,
-            kept: Vec::new(),
-            ticks: 0,
-            ran: None,
-            input: Queue::default(),
-            records: Default::default(),
-            trace: None,
-            batches: record.then(Vec::new),
-            tick_from: None,
-        };
-        (fresh, saved)
+        (Retired::new(executor, record), saved)
     }
 
     /// What a build handed over to gets (`std::reload::hand_over`): the executor, what was
@@ -1002,13 +1018,19 @@ impl Drop for Helpers {
         if self.threads.is_empty() {
             return;
         }
-        shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
-        shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
-        let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
+        shut_down_helpers(&self.memory);
         for t in self.threads.drain(..) {
             let _ = t.join();
         }
     }
+}
+
+/// Tells the helpers on `memory` to return: each sees it once it waits for work
+/// ([`memory::PAR_SHUTDOWN`]).
+pub(crate) fn shut_down_helpers(memory: &SharedMemory) {
+    shared::store_u32(memory, memory::PAR_SHUTDOWN, 1);
+    shared::add_u32(memory, memory::PAR_WAKE, 1);
+    let _ = memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
 }
 
 /// Checks a module against the program ABI before instantiating it: it imports its memory,
@@ -1211,17 +1233,7 @@ impl<E: Executor> Program<E> {
         workers: u32,
         run_init: bool,
     ) -> Result<Program<E>> {
-        let carried = Retired {
-            executor,
-            kept: Vec::new(),
-            ticks: 0,
-            ran: None,
-            input: Queue::default(),
-            records: Default::default(),
-            trace: None,
-            batches: record.then(Vec::new),
-            tick_from: None,
-        };
+        let carried = Retired::new(executor, record);
         Program::instantiate_carrying(compiled, manifest, carried, io, workers, run_init)
     }
 
@@ -1404,7 +1416,7 @@ impl<E: Executor> Program<E> {
         mut self,
     ) -> std::result::Result<Program<E>, (Error, Box<Retired<E>>)> {
         let kept = self.store.data().kept.clone();
-        match self.init() {
+        match self.run_init() {
             Ok(()) => Ok(self),
             Err(error) => Err((error, Box::new(self.retire().with_kept(kept)))),
         }
@@ -1507,18 +1519,14 @@ impl<E: Executor> Program<E> {
         &self.store.data().keeping
     }
 
-    /// Runs `init`, for a program [`Program::instantiate_with`] made without running it.
-    pub(crate) fn run_init(&mut self) -> Result<()> {
-        self.init()
-    }
-
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     pub(crate) fn init_done(&self) -> bool {
         self.init_done
     }
 
-    /// A program with state makes it once, before anything else runs (language.md §15).
-    fn init(&mut self) -> Result<()> {
+    /// Runs `init`, for a program [`Program::instantiate_with`] made without running it: a
+    /// program with state makes it once, before anything else runs (language.md §15).
+    pub(crate) fn run_init(&mut self) -> Result<()> {
         let Ok(init) = self.instance.get_typed_func::<(), ()>(&mut self.store, EXPORT_INIT) else {
             self.init_done = true;
             return Ok(());
@@ -1685,7 +1693,6 @@ impl<E: Executor> Program<E> {
         }
     }
 
-    /// FNV-1a 64 of every byte submitted since the program loaded.
     /// Renders `quanta` quanta of the program's voice ([`wrela_abi::AUDIO_QUANTUM`] samples
     /// each, at [`wrela_abi::AUDIO_SAMPLE_RATE`]) on an instance of its own, as the audio
     /// thread does, here and now: an offline run. The samples are the two channels
@@ -1746,7 +1753,7 @@ impl<E: Executor> Program<E> {
         if self.memory.data().len() < memory::PAR_HELPED as usize + 4 {
             0
         } else {
-            crate::shared::load_u32(&self.memory, memory::PAR_HELPED)
+            shared::load_u32(&self.memory, memory::PAR_HELPED)
         }
     }
 
@@ -1755,7 +1762,7 @@ impl<E: Executor> Program<E> {
     /// threads that take them wait.
     pub(crate) fn hold_jobs(&self, micros: u32) {
         if self.memory.data().len() >= memory::PAR_HOLD as usize + 4 {
-            crate::shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
+            shared::store_u32(&self.memory, memory::PAR_HOLD, micros);
         }
     }
 
@@ -1963,6 +1970,7 @@ impl<E: Executor> Program<E> {
         }
     }
 
+    /// FNV-1a 64 of every byte submitted since the program loaded.
     pub(crate) fn hash(&self) -> StateHash {
         self.store.data().hash
     }
@@ -1996,7 +2004,10 @@ impl<E: Executor> Program<E> {
         self.store.data_mut().batches.as_mut().map(std::mem::take).unwrap_or_default()
     }
 
-    #[cfg_attr(not(feature = "gpu"), expect(dead_code, reason = "only `Host` reaches its GPU"))]
+    #[cfg_attr(
+        not(any(feature = "gpu", test)),
+        expect(dead_code, reason = "only `Host` reaches its GPU")
+    )]
     pub(crate) fn executor(&mut self) -> &mut E {
         &mut self.store.data_mut().executor
     }
@@ -2044,14 +2055,9 @@ fn other_instance(
         },
     )?;
     trace.link_checked(&mut linker, Some(memory), check_thread_started)?;
-    let answered = [IMPORT_CLOCK, IMPORT_PRINT, IMPORT_PHASE];
-    for f in HOST_FUNCTIONS.iter().filter(|f| !answered.contains(&f.name)) {
-        let i32s = |n| std::iter::repeat_n(ValType::I32, n);
-        let ty = FuncType::new(engine, i32s(f.params), i32s(f.results));
-        linker.func_new(IMPORT_MODULE, f.name, ty, move |_, _, _| {
-            Err(wasmtime::format_err!("{who} can't call the host"))
-        })?;
-    }
+    refuse(&mut linker, engine, [IMPORT_CLOCK, IMPORT_PRINT, IMPORT_PHASE], |_| {
+        format!("{who} can't call the host")
+    })?;
     let instance = linker.instantiate(&mut store, module)?;
     *store.data_mut() = true;
     Ok((store, instance))
@@ -2085,10 +2091,13 @@ impl BuildHelpers {
         trace: &Trace,
         stop: Option<&Stop>,
     ) -> BuildHelpers {
-        let n = if module.get_export(EXPORT_WORKER).is_some() { count.min(MAX_WORKERS) } else { 0 };
-        if module.get_export(EXPORT_WORKER).is_some() {
-            crate::shared::store_u32(memory, memory::PAR_HELPERS, n);
-        }
+        let n = if module.get_export(EXPORT_WORKER).is_some() {
+            let n = count.min(MAX_WORKERS);
+            shared::store_u32(memory, memory::PAR_HELPERS, n);
+            n
+        } else {
+            0
+        };
         let threads = (0..n)
             .map(|i| {
                 let (module, memory, trace) = (module.clone(), memory.clone(), trace.clone());
@@ -2139,9 +2148,7 @@ impl BuildHelpers {
         if self.threads.is_empty() {
             return Vec::new();
         }
-        shared::store_u32(&self.memory, memory::PAR_SHUTDOWN, 1);
-        shared::add_u32(&self.memory, memory::PAR_WAKE, 1);
-        let _ = self.memory.atomic_notify(u64::from(memory::PAR_WAKE), u32::MAX);
+        shut_down_helpers(&self.memory);
         self.threads.drain(..).map(|t| t.join().unwrap_or_default()).collect()
     }
 }
@@ -2163,7 +2170,17 @@ pub fn refuse_host_functions<T: 'static>(
     memory: Option<&SharedMemory>,
 ) -> wasmtime::Result<()> {
     trace.link(linker, memory)?;
-    let answered = [IMPORT_AUDIO, IMPORT_PRINT, IMPORT_PHASE];
+    refuse(linker, engine, [IMPORT_AUDIO, IMPORT_PRINT, IMPORT_PHASE], why)
+}
+
+/// Defines each host function but those `answered` as one that traps with `why`, given how many
+/// results it has.
+fn refuse<T: 'static, W: std::fmt::Display + Send + Sync + 'static>(
+    linker: &mut Linker<T>,
+    engine: &Engine,
+    answered: [&str; 3],
+    why: impl Fn(u32) -> W,
+) -> wasmtime::Result<()> {
     for f in HOST_FUNCTIONS.iter().filter(|f| !answered.contains(&f.name)) {
         let why = why(f.results as u32);
         let i32s = |n| std::iter::repeat_n(ValType::I32, n);

@@ -1,4 +1,3 @@
-import { BrowserPlatform } from "./platform.ts";
 // The main-thread shim: hands the canvas to the render worker, forwards its size (in device
 // pixels) and the page's visibility, and shows fatal errors on the page and in the console.
 
@@ -9,6 +8,7 @@ import { epochNow, InputRing } from "./input.ts";
 import { Semantics } from "./semantics.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
+import { BrowserPlatform } from "./platform.ts";
 import { asksForTest, isLoopback, loaded, parseTestParams, putResult, sleepUntil, type TestParams } from "./testmode.ts";
 
 let shown = false;
@@ -32,30 +32,25 @@ function showFatal(text: string, unsupported = false): void {
   const box = document.createElement("pre");
   box.id = "wrela-error";
   box.setAttribute("role", "alert");
-  const own = pageText();
   if (unsupported) {
     box.className = "unsupported";
     box.textContent = `This needs WebGPU on a hardware GPU, which this browser can't give it (${text}).\nA current Chrome, Edge or Safari has it, on a computer or a phone.`;
-    if (own) {
-      document.documentElement.classList.add("text-shown");
-      own.before(box);
-      return;
-    }
-    // A page that is text as well (its Markdown alternate) says where that text is.
-    const alternate = document.querySelector<HTMLLinkElement>('link[rel="alternate"][type="text/markdown"]');
-    if (alternate && typeof alternate.href === "string" && alternate.href) {
-      const a = document.createElement("a");
-      a.href = alternate.href;
-      a.textContent = "Read the same pages as plain text.";
-      box.append("\n", a);
-    }
   } else {
     box.textContent = `wrela stopped: ${text}`;
-    if (own) {
-      document.documentElement.classList.add("text-shown");
-      own.before(box);
-      return;
-    }
+  }
+  const own = pageText();
+  if (own) {
+    document.documentElement.classList.add("text-shown");
+    own.before(box);
+    return;
+  }
+  // A page that is text as well (its Markdown alternate) says where that text is.
+  const alternate = unsupported ? document.querySelector<HTMLLinkElement>('link[rel="alternate"][type="text/markdown"]') : null;
+  if (alternate && typeof alternate.href === "string" && alternate.href) {
+    const a = document.createElement("a");
+    a.href = alternate.href;
+    a.textContent = "Read the same pages as plain text.";
+    box.append("\n", a);
   }
   document.body.append(box);
 }

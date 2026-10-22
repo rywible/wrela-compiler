@@ -194,13 +194,6 @@ pub fn relative(path: &Path, base: &Path) -> String {
 
 // ---- a lifted build's literals in the files as they are now ---------------------------------------
 
-/// A lifted build's report (`lift.json`) in the build's directory `dir`.
-pub fn read_report(dir: &Path) -> Result<Report, String> {
-    let text = std::fs::read_to_string(dir.join("lift.json"))
-        .map_err(|e| format!("the build has no lift.json: {e}"))?;
-    parse_report(&text)
-}
-
 /// A lifted build's report, from its text.
 pub fn parse_report(text: &str) -> Result<Report, String> {
     serde_json::from_str(text).map_err(|e| format!("lift.json doesn't read: {e}"))
@@ -247,10 +240,6 @@ impl Numbers {
             i += 1;
         }
         Numbers { text, tokens, shape }
-    }
-
-    pub fn text(&self) -> &str {
-        &self.text
     }
 
     /// Whether `other` lexes to the same tokens but for numbers, and the minus signs before a
@@ -365,37 +354,38 @@ pub fn values_now(
 /// The literals' values in the lifted files' texts `now`, each file then (`then`) as the build
 /// saw it, if each has changed in its literals alone.
 fn values_in(then: &[&Numbers], now: Vec<Numbers>, literals: &[ReportLiteral]) -> Option<Vec<f32>> {
-    if then.len() != now.len() {
+    if then.len() != now.len() || then.iter().zip(&now).any(|(t, n)| !t.same_but_numbers(n)) {
         return None;
     }
+    // Each literal's place now. `moved` already includes the literal's own sign: another minus
+    // before it is an operator in the code and must remain unchanged for a table-only update.
+    let places: Vec<(u32, u32)> = literals
+        .iter()
+        .map(|l| {
+            let file = l.file as usize;
+            moved(then.get(file)?, now.get(file)?, l.start, l.end)
+        })
+        .collect::<Option<_>>()?;
     for (file, (then, current)) in then.iter().zip(&now).enumerate() {
-        if !then.same_but_numbers(current) {
-            return None;
-        }
-        let mut before_ranges = Vec::new();
-        let mut now_ranges = Vec::new();
-        for l in literals.iter().filter(|l| l.file as usize == file) {
-            let (start, end) = moved(then, current, l.start, l.end)?;
-            // `moved` already includes the literal's own sign. Another minus before it is
-            // an operator in the code and must remain unchanged for a table-only update.
-            before_ranges.push((l.start, l.end));
-            now_ranges.push((start, end));
-        }
-        if then.outside_literals(before_ranges) != current.outside_literals(now_ranges) {
+        let (before, after): (Vec<_>, Vec<_>) = literals
+            .iter()
+            .zip(&places)
+            .filter(|(l, _)| l.file as usize == file)
+            .map(|(l, &place)| ((l.start, l.end), place))
+            .unzip();
+        if then.outside_literals(before) != current.outside_literals(after) {
             return None;
         }
     }
-    let mut values = Vec::with_capacity(literals.len());
-    for l in literals {
-        let current = now.get(l.file as usize)?;
-        let (s, e) = moved(then[l.file as usize], current, l.start, l.end)?;
-        let value = crate::edit::signed_value(&current.text()[s as usize..e as usize])?;
-        if !value.is_finite() {
-            return None;
-        }
-        values.push(value);
-    }
-    Some(values)
+    literals
+        .iter()
+        .zip(places)
+        .map(|(l, (s, e))| {
+            let value =
+                crate::edit::signed_value(&now[l.file as usize].text[s as usize..e as usize])?;
+            value.is_finite().then_some(value)
+        })
+        .collect()
 }
 
 /// Edits of a lifted build's literals, each by its index in the build (`report`) and its new

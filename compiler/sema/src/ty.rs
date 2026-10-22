@@ -371,6 +371,11 @@ impl Types {
         &self.kinds[t.index()]
     }
 
+    /// Whether `t` is a run: a slice or `str`.
+    pub fn is_run(&self, t: TyId) -> bool {
+        matches!(self.kind(t), TyKind::Str | TyKind::Slice(_))
+    }
+
     /// The nodes of the type's tree, counting a shared part each time it appears (saturating):
     /// what a walk over it that doesn't remember where it's been would visit. See
     /// [`MAX_TYPE_SIZE`].

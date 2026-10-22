@@ -39,9 +39,9 @@
 //! than 512 KiB fails, saying so.
 
 use super::caps::MOST_BYTES;
-use super::services::{Answer, Body, Services, Work};
+use super::services::{Body, Resources, Services, Work, err, ok};
 use super::toolchain::Out;
-use std::collections::HashMap;
+use crate::locked;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -51,37 +51,14 @@ use wrela_chrome::{Browser, Dest, Launch, Spawner, TabOptions};
 /// A request's deadline unless it asks for another.
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The browsers of one run: each by its handle, and each request's that the tool hasn't been
-/// told of.
-#[derive(Default)]
-pub(crate) struct Browsers {
-    held: HashMap<u32, Arc<Held>>,
-    next: u32,
-    unpublished: HashMap<u32, Vec<u32>>,
-}
+/// The browsers of one run ([`Resources`]).
+pub(crate) type Browsers = Resources<Held>;
 
 impl Browsers {
-    /// The tool has read request `request`'s answer: its browser is the tool's now.
-    pub(crate) fn publish(&mut self, request: u32) {
-        self.unpublished.remove(&request);
-    }
-
-    /// Request `request` failed: the browsers made for it, which no answer names, to close.
-    pub(crate) fn rollback(&mut self, request: u32) -> Vec<Arc<Held>> {
-        let ids = self.unpublished.remove(&request).unwrap_or_default();
-        ids.iter().filter_map(|id| self.held.remove(id)).collect()
-    }
-
-    /// Takes every browser, to close: the tool has ended.
-    pub(crate) fn take_all(&mut self) -> Vec<Arc<Held>> {
-        self.unpublished.clear();
-        self.held.drain().map(|(_, b)| b).collect()
-    }
-
     /// Cancels every browser's requests and closes its pipe: each request waiting on Chrome, or
     /// on what it's seen, fails at once.
     pub(crate) fn disconnect_all(&self) {
-        for b in self.held.values() {
+        for b in self.all() {
             b.cancel();
         }
     }
@@ -133,10 +110,6 @@ impl Held {
         let ended = self.browser.close();
         took && ended
     }
-}
-
-fn failure(why: String) -> Answer {
-    super::services::answer(Err(why))
 }
 
 /// A request's deadline: the `f64` of seconds at its end (0: [`DEADLINE`]).
@@ -250,29 +223,30 @@ pub(crate) fn route(s: &Services, name: &str, b: &mut Body) -> Work {
             "close" => {
                 let handle = b.u32()?;
                 b.end()?;
-                let held = s.browsers().held.get(&handle).cloned();
-                if let Some(held) = held {
+                let held = s.browsers().find(handle, "browser");
+                if let Ok(held) = held {
                     held.cut();
                 }
                 s.signal("closing");
                 Work::Long(Box::new(move |s, _| {
                     s.signal("close");
-                    let held = s.browsers().held.remove(&handle);
-                    let Some(held) = held else {
-                        return failure(format!("the tool holds no browser {handle}"));
+                    let held = s.browsers().take(handle, "browser");
+                    let held = match held {
+                        Ok(held) => held,
+                        Err(why) => return err(&why),
                     };
                     if !held.close() {
                         let why = format!("the browser {handle} didn't end cleanly");
                         let _ = s.stuck.set(why.clone());
-                        return failure(why);
+                        return err(&why);
                     }
-                    super::services::answer(Ok(Vec::new()))
+                    ok(&[])
                 }))
             }
             _ => return Err(format!("the browser service has no `{name}`")),
         })
     })();
-    parsed.unwrap_or_else(|why| Work::Now(failure(why)))
+    parsed.unwrap_or_else(|why| Work::Now(err(&why)))
 }
 
 /// Whether a connection of the tool's browser may go to `dest`: plain HTTP only to one of its
@@ -352,11 +326,7 @@ fn open(
     if left.is_zero() {
         return Err("`open` didn't start within its deadline".into());
     }
-    let handle = {
-        let mut b = s.browsers();
-        b.next += 1;
-        b.next
-    };
+    let handle = s.browsers().reserve();
     let profile = s.work_dir()?.join(format!("browser-{handle}"));
     let mut launch = Launch::new(profile)?;
     launch.window = size;
@@ -380,11 +350,7 @@ fn open(
         grace: s.grace,
     });
     // Registered under its request before its page opens, and before any answer names it.
-    {
-        let mut b = s.browsers();
-        b.held.insert(handle, held.clone());
-        b.unpublished.entry(request).or_default().push(handle);
-    }
+    s.browsers().hold(request, handle, held.clone());
     if s.closing.load(Ordering::Acquire) {
         // The tool ended as it started: its end may have closed every pipe already.
         return Err("the tool ended before the browser opened".into());
@@ -407,7 +373,7 @@ fn open(
             Err(why) => return Err(why),
         }
     }
-    *held.tab.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tab);
+    *locked(&held.tab) = Some(tab);
     held.busy.store(false, Ordering::Release);
     s.signal("browser");
     let mut out = Out::default();
@@ -425,12 +391,7 @@ fn using(
     if Instant::now() >= due {
         return Err("the request didn't start within its deadline".into());
     }
-    let held = s
-        .browsers()
-        .held
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| format!("the tool holds no browser {handle}"))?;
+    let held = s.browsers().find(handle, "browser")?;
     if held.cancelled.load(Ordering::Acquire) {
         return Err(format!("the browser {handle} was closed"));
     }
@@ -444,7 +405,7 @@ fn using(
         }
     }
     let _idle = Idle(&held.busy);
-    let tab = held.tab.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tab = locked(&held.tab);
     let Some(tab) = tab.as_ref() else { return Err(format!("the browser {handle} has no page")) };
     work(&held, tab)
 }
@@ -463,15 +424,9 @@ fn whole(out: Out, what: &str) -> Result<Vec<u8>, String> {
 /// What `look` reads of `tab`'s page, as `std::tool::browser`'s readers read it, whole.
 fn observe(tab: &wrela_chrome::Tab, look: &Look, due: Instant) -> Result<Vec<u8>, String> {
     let mut out = Out::default();
-    let texts = |out: &mut Out, lines: &[String]| {
-        out.u32(lines.len() as u32);
-        for l in lines {
-            out.str(l);
-        }
-    };
     match look {
         Look::Console => {
-            texts(&mut out, &tab.console()?);
+            out.strs(&tab.console()?);
             return whole(out, "the console");
         }
         Look::Results => {
@@ -490,7 +445,9 @@ fn observe(tab: &wrela_chrome::Tab, look: &Look, due: Instant) -> Result<Vec<u8>
             Seen::Text(t) => {
                 out.str(&t);
             }
-            Seen::Texts(t) => texts(&mut out, &t),
+            Seen::Texts(t) => {
+                out.strs(&t);
+            }
             Seen::Count(n) => {
                 out.u32(n);
             }

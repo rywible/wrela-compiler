@@ -126,7 +126,8 @@ export function readGeometry(body: Uint8Array): Map<number, [number, number, num
 }
 
 /** UTF-16 offset `i` of `s` as a UTF-8 byte offset, and back. */
-export const utf8At = (s: string, i: number): number => new TextEncoder().encode(s.slice(0, i)).length;
+const ENCODER = new TextEncoder();
+export const utf8At = (s: string, i: number): number => ENCODER.encode(s.slice(0, i)).length;
 export function utf16At(s: string, byte: number): number {
   let bytes = 0;
   for (let i = 0; i < s.length;) {
@@ -176,9 +177,18 @@ interface FieldState {
   composeText: string;
 }
 
-
 /** Roles named by `aria-label` rather than by their text. */
 const NAMED = new Set<number>([...CONTAINERS, Role.Field, Role.Slider]);
+
+/** The elements that take the keyboard's focus. */
+const FOCUSABLE = "button, a, input, textarea, [tabindex='0']";
+
+/** The node an element is (its id is `wrela-node-<id>`). */
+const nodeId = (el: Element) => Number(el.id.replace("wrela-node-", ""));
+
+/** The children of `parent` that are nodes of role `role`. */
+const withRole = (parent: Element | null, role: number) =>
+  [...(parent?.children ?? [])].filter((c) => (c as HTMLElement).dataset.role === String(role)) as HTMLElement[];
 
 export class Semantics implements Overlay {
   #root: HTMLDivElement | null = null;
@@ -246,7 +256,7 @@ export class Semantics implements Overlay {
   enter(): boolean {
     if (this.#root === null) return false;
     const asked = this.#els.get(this.#focused);
-    const first = asked ?? this.#root.querySelector<HTMLElement>("[tabindex='0'], button, a, input, textarea");
+    const first = asked ?? this.#root.querySelector<HTMLElement>(FOCUSABLE);
     if (!first) return false;
     first.focus();
     return true;
@@ -612,7 +622,7 @@ export class Semantics implements Overlay {
     for (const id of open) {
       if (this.#returns.has(id)) continue;
       this.#returns.set(id, document.activeElement);
-      const first = this.#els.get(id)?.querySelector<HTMLElement>("button, a, input, textarea, [tabindex='0']");
+      const first = this.#els.get(id)?.querySelector<HTMLElement>(FOCUSABLE);
       first?.focus();
     }
     for (const [id, back] of this.#returns) {
@@ -629,7 +639,7 @@ export class Semantics implements Overlay {
   #key(e: KeyboardEvent): void {
     const el = document.activeElement as HTMLElement | null;
     if (!el || !this.#root?.contains(el)) return;
-    const id = Number(el.id.replace("wrela-node-", ""));
+    const id = nodeId(el);
     const n = this.#nodes.get(id);
     const role = n?.role ?? -1;
     const dialog = el.closest<HTMLElement>("[role=dialog]");
@@ -637,13 +647,13 @@ export class Semantics implements Overlay {
     if (e.key === "Escape") {
       if (role === Role.Field) return;
       const holder = dialog ?? menu;
-      if (holder) this.write(assistEvent(Number(holder.id.replace("wrela-node-", "")), Action.Dismiss));
+      if (holder) this.write(assistEvent(nodeId(holder), Action.Dismiss));
       else this.canvas.focus();
       e.preventDefault();
       return;
     }
     if (e.key === "Tab" && dialog?.getAttribute("aria-modal") === "true") {
-      const stops = [...dialog.querySelectorAll<HTMLElement>("button, a, input, textarea, [tabindex='0']")];
+      const stops = [...dialog.querySelectorAll<HTMLElement>(FOCUSABLE)];
       const i = stops.indexOf(el);
       const next = stops[(i + (e.shiftKey ? stops.length - 1 : 1)) % stops.length];
       next?.focus();
@@ -664,23 +674,21 @@ export class Semantics implements Overlay {
         if (!n?.href && e.key === "Enter") { this.write(assistEvent(id, Action.Activate)); e.preventDefault(); }
         break;
       case Role.Tab: {
-        const tabs = [...(el.parentElement?.children ?? [])].filter((c) => (c as HTMLElement).dataset.role === String(Role.Tab)) as HTMLElement[];
-        const next = step(tabs, true);
+        const next = step(withRole(el.parentElement, Role.Tab), true);
         if (next) {
           next.focus();
-          this.write(assistEvent(Number(next.id.replace("wrela-node-", "")), Action.Select));
+          this.write(assistEvent(nodeId(next), Action.Select));
         }
         break;
       }
       case Role.MenuItem: {
-        const items = [...(el.parentElement?.children ?? [])].filter((c) => (c as HTMLElement).dataset.role === String(Role.MenuItem)) as HTMLElement[];
-        const next = step(items, false);
+        const next = step(withRole(el.parentElement, Role.MenuItem), false);
         if (next) next.focus();
         else if (e.key === "Enter" || e.key === " ") { this.write(assistEvent(id, Action.Activate)); e.preventDefault(); }
         break;
       }
       case Role.ListBox: {
-        const options = [...el.children].filter((c) => (c as HTMLElement).dataset.role === String(Role.Option)) as HTMLElement[];
+        const options = withRole(el, Role.Option);
         if (options.length === 0) break;
         const current = options.findIndex((o) => o.classList.contains("wrela-active"));
         const i = current < 0 ? -1 : current;
@@ -688,10 +696,10 @@ export class Semantics implements Overlay {
         const to = e.key === "ArrowDown" || e.key === "ArrowRight" ? Math.min(i + 1, last) :
           e.key === "ArrowUp" || e.key === "ArrowLeft" ? Math.max(i - 1, 0) : e.key === "Home" ? 0 : e.key === "End" ? last : null;
         if (to !== null) {
-          this.write(assistEvent(Number(options[to]!.id.replace("wrela-node-", "")), Action.Select));
+          this.write(assistEvent(nodeId(options[to]!), Action.Select));
           e.preventDefault();
         } else if ((e.key === "Enter" || e.key === " ") && current >= 0) {
-          this.write(assistEvent(Number(options[current]!.id.replace("wrela-node-", "")), e.key === "Enter" ? Action.Activate : Action.Select));
+          this.write(assistEvent(nodeId(options[current]!), e.key === "Enter" ? Action.Activate : Action.Select));
           e.preventDefault();
         }
         break;

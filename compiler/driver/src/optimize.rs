@@ -74,7 +74,7 @@ pub fn optimize_with(wasm: &[u8], run: &mut Runner) -> Result<(Vec<u8>, Vec<u8>)
         }
         None => Lines::default(),
     };
-    let scratch = Scratch::new()?;
+    let scratch = crate::Scratch::new("wrela-optimize")?;
     let path = |name: &str| scratch.0.join(name);
     let write = |name: &str, bytes: &[u8]| {
         std::fs::write(path(name), bytes).map_err(|e| format!("can't write {name}: {e}"))
@@ -154,27 +154,6 @@ fn accepts(v: u32, exact: bool) -> bool {
 /// The release in `wasm-opt --version`'s `wasm-opt version 133 (version_133)`.
 fn version(text: &str) -> Option<u32> {
     text.split_whitespace().skip_while(|w| *w != "version").nth(1)?.parse().ok()
-}
-
-/// A directory of the optimizer's files, removed when done.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new() -> Result<Scratch, String> {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static NEXT: AtomicU32 = AtomicU32::new(0);
-        let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!("wrela-optimize-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).map_err(|e| format!("can't make {}: {e}", dir.display()))?;
-        Ok(Scratch(dir))
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
 }
 
 #[cfg(test)]

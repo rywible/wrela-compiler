@@ -16,6 +16,7 @@ import {
   TEXTURE_FORMATS,
   TEXTURE_WRITABLE,
 } from "./abi.gen.ts";
+import { UTF8 } from "./wasm.ts";
 
 export type OpcodeName = keyof typeof Opcode;
 
@@ -148,8 +149,6 @@ const EXPECTED: Readonly<Record<number, string>> = {
 /** `n` rounded up to a multiple of 4: text and data in a payload are padded to whole words. */
 const padded = (n: number) => Math.ceil(n / 4) * 4;
 
-const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-
 /**
  * Decodes one batch: its header, then every command. Byte payloads are views into `batch`, so
  * copy any you keep past the call that submitted it. It doesn't check pass sequencing (that
@@ -208,7 +207,7 @@ export function decode(batch: Bytes): Command[] {
     const text = (from: number, n: number, what: string) => {
       try {
         // A copy: TextDecoder doesn't read shared memory.
-        return utf8.decode(batch.slice(start + from, start + from + n));
+        return UTF8.decode(batch.slice(start + from, start + from + n));
       } catch {
         throw bad(`the ${what} isn't UTF-8`);
       }

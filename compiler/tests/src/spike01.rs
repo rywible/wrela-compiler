@@ -1,27 +1,14 @@
 //! Spike 01's harness, ported to Rust (#42, "The harness is new code"): its kernels and its
-//! `grazer.js`, unchanged, run the way its `main.js` runs them. `encodeExtract`, `extractHerd`,
-//! `update` and `encodeFrame` are ported here; the numbers that come from `grazer.js` (each
-//! seed's parameters and bounds, the herd's placement, the scenes' views and the bone palettes)
+//! `grazer.js`, unchanged, run the way its `main.js` runs them. `encodeExtract` and `extractHerd`
+//! are ported here; the numbers that come from `grazer.js` (each seed's parameters and bounds)
 //! come from it, run by bun (compiler/tests/spike01/data.mjs). The spike ran in Chrome; this runs
-//! on the native host's wgpu, so the herd's own build can run beside it in one process
-//! (M1's method: alternating, after a warm-up).
-//!
-//! Its frames are drawn as the spike's are: into an `rgba8unorm-srgb` target, then `blit.wgsl`
-//! raises each value to 1/2.2 into the canvas (here an `rgba8unorm` texture, read back).
+//! on the native host's wgpu, so the herd's own build can run beside it in one process.
 
 use crate::{RawGpu, bytes_of, f32s, repo_root, u32s};
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 use wgpu::util::DeviceExt;
 
-/// The spike's screen, and its herd.
-pub const W: u32 = 1920;
-pub const H: u32 = 1080;
-pub const HERD: usize = 40;
-const BONES: usize = 29;
-const PALETTE_STRIDE: u64 = 2048;
-const TERRAIN_VERTS: u32 = 256 * 256 * 6;
 /// Sketch 02's root iterations and the 6 cm skin falloff.
 const ITERS: u32 = 4;
 const FALLOFF: f32 = 0.06;
@@ -72,32 +59,6 @@ fn {entry}(@builtin(global_invocation_id) id: vec3u) {{
     )
 }
 
-/// A compute pipeline of the build in `dir`: its WGSL and entry point, and the uniform bytes of
-/// its first dispatch in `batches`.
-pub fn compiled_kernel(dir: &Path, name: &str, batches: &[Vec<u8>]) -> (String, String, Vec<u8>) {
-    use wrela_abi::manifest::Stage;
-    use wrela_abi::stream::{Command, decode};
-    let manifest = crate::manifest(dir);
-    let (index, p) = manifest
-        .pipelines
-        .iter()
-        .enumerate()
-        .find(|(_, p)| p.name == name)
-        .unwrap_or_else(|| panic!("no pipeline `{name}`"));
-    let Stage::Compute { entry, .. } = &p.stage else { panic!("`{name}` isn't a kernel") };
-    let wgsl = std::fs::read_to_string(dir.join(&p.shader)).expect("the shader");
-    for batch in batches {
-        for cmd in decode(batch).expect("a valid batch") {
-            if let Command::Dispatch { pipeline, uniforms, .. } = cmd
-                && pipeline as usize == index
-            {
-                return (wgsl, entry.clone(), uniforms.to_vec());
-            }
-        }
-    }
-    panic!("nothing dispatched `{name}`")
-}
-
 /// One seed's numbers, as `makeGrazer` gives them.
 struct Seed {
     /// The `Grazer` uniform: 328 floats.
@@ -105,30 +66,6 @@ struct Seed {
     /// Its rest-space bounds, in f64 as JavaScript computed them.
     min: [f64; 3],
     max: [f64; 3],
-}
-
-/// A scene: the herd (seeds 1 to 40, as placed) or the close-up (seed 1 at the origin).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SceneKind {
-    Herd,
-    CloseUp,
-}
-
-impl SceneKind {
-    fn name(self) -> &'static str {
-        match self {
-            SceneKind::Herd => "herd",
-            SceneKind::CloseUp => "closeup",
-        }
-    }
-}
-
-/// What `grazer.js` gives: the seeds, and each scene's `View` uniform at t = 0 (its fourth
-/// vec4's w is t).
-struct SpikeData {
-    seeds: Vec<Seed>,
-    herd_view: Vec<f32>,
-    closeup_view: Vec<f32>,
 }
 
 fn bun<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Vec<u8> {
@@ -143,10 +80,10 @@ fn bun<S: AsRef<std::ffi::OsStr>>(args: &[S]) -> Vec<u8> {
     out.stdout
 }
 
-/// `grazer.js`'s numbers, once per process.
-fn data() -> &'static SpikeData {
-    static DATA: OnceLock<SpikeData> = OnceLock::new();
-    DATA.get_or_init(|| {
+/// `grazer.js`'s seeds, once per process.
+fn seeds() -> &'static [Seed] {
+    static SEEDS: OnceLock<Vec<Seed>> = OnceLock::new();
+    SEEDS.get_or_init(|| {
         let v: serde_json::Value = serde_json::from_slice(&bun(&["seeds"])).expect("JSON");
         let f = |x: &serde_json::Value| x.as_f64().expect("a number");
         let v3 = |x: &serde_json::Value| {
@@ -156,28 +93,13 @@ fn data() -> &'static SpikeData {
         let floats = |x: &serde_json::Value| {
             x.as_array().expect("floats").iter().map(|n| f(n) as f32).collect::<Vec<f32>>()
         };
-        let seeds = v["seeds"]
+        v["seeds"]
             .as_array()
             .expect("seeds")
             .iter()
             .map(|s| Seed { params: floats(&s["params"]), min: v3(&s["min"]), max: v3(&s["max"]) })
-            .collect();
-        SpikeData {
-            seeds,
-            herd_view: floats(&v["views"]["herd"]),
-            closeup_view: floats(&v["views"]["closeup"]),
-        }
+            .collect()
     })
-}
-
-/// Bone palettes for `scene` at each time in `times`: for each time, each instance's 29 mat4s.
-/// `grazer.js` computes each scene's at each list of times once per process.
-fn palettes(scene: SceneKind, times: &[f64]) -> Arc<[f32]> {
-    static MADE: Mutex<BTreeMap<Vec<String>, Arc<[f32]>>> = Mutex::new(BTreeMap::new());
-    let mut args = vec!["palettes".to_string(), scene.name().to_string()];
-    args.extend(times.iter().map(f64::to_string));
-    let mut made = MADE.lock().unwrap_or_else(|p| p.into_inner());
-    made.entry(args).or_insert_with_key(|args| f32s(&bun(args)).into()).clone()
 }
 
 /// A grid for one individual at one cell size (main.js's `gridFor`), in f64 as JavaScript.
@@ -212,9 +134,7 @@ pub struct Individual {
     grid: Grid,
     pub vcap: u32,
     pub icap: u32,
-    params: wgpu::Buffer,
     verts: wgpu::Buffer,
-    indices: wgpu::Buffer,
     draw: wgpu::Buffer,
     cull_bg: wgpu::BindGroup,
     place_bg: wgpu::BindGroup,
@@ -230,104 +150,35 @@ struct Scratch {
     draw_init: wgpu::Buffer,
 }
 
-/// The spike's GPU work, on a device of its own: its pipelines and frame resources.
+/// The spike's extraction, on a device of its own: its pipelines.
 pub struct Spike {
     cull_layout: wgpu::BindGroupLayout,
     place_layout: wgpu::BindGroupLayout,
-    frame_layout: wgpu::BindGroupLayout,
-    shadow_frame_layout: wgpu::BindGroupLayout,
-    grazer_layout: wgpu::BindGroupLayout,
-    blit_layout: wgpu::BindGroupLayout,
     cull: wgpu::ComputePipeline,
     place: wgpu::ComputePipeline,
     emit: wgpu::ComputePipeline,
-    shadow: wgpu::RenderPipeline,
-    shade: wgpu::RenderPipeline,
-    terrain: wgpu::RenderPipeline,
-    blit: wgpu::RenderPipeline,
-    frame: Option<FrameResources>,
     // Declared last: dropped after what it made.
     gpu: RawGpu,
 }
 
-struct FrameResources {
-    color: wgpu::TextureView,
-    depth: wgpu::TextureView,
-    shadow: wgpu::TextureView,
-    canvas: wgpu::Texture,
-    view: wgpu::Buffer,
-    palette: wgpu::Buffer,
-    frame_bg: wgpu::BindGroup,
-    shadow_frame_bg: wgpu::BindGroup,
-    blit_bg: wgpu::BindGroup,
-}
-
-/// A scene ready to draw (main.js's `scene`).
-pub struct Scene<'a> {
-    pub kind: SceneKind,
-    inds: Vec<&'a Individual>,
-    draws: Vec<wgpu::BindGroup>,
-}
-
-/// One frame's GPU times, ms: the shadow pass, the terrain, the two creature passes (shadow and
-/// shading), and the three passes' own times summed: the frame's GPU work, however they overlap
-/// (on the native host the terrain's runs beside the shadow pass).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameTimes {
-    pub shadow: f64,
-    pub terrain: f64,
-    pub creatures: f64,
-    pub passes: f64,
-}
-
-fn vertex_layout() -> [wgpu::VertexAttribute; 5] {
-    [
-        wgpu::VertexAttribute {
-            shader_location: 0,
-            offset: 0,
-            format: wgpu::VertexFormat::Float32x3,
-        },
-        wgpu::VertexAttribute {
-            shader_location: 1,
-            offset: 12,
-            format: wgpu::VertexFormat::Uint8x4,
-        },
-        wgpu::VertexAttribute {
-            shader_location: 2,
-            offset: 16,
-            format: wgpu::VertexFormat::Float32x3,
-        },
-        wgpu::VertexAttribute {
-            shader_location: 3,
-            offset: 28,
-            format: wgpu::VertexFormat::Unorm8x4,
-        },
-        wgpu::VertexAttribute {
-            shader_location: 4,
-            offset: 32,
-            format: wgpu::VertexFormat::Uint32,
-        },
-    ]
-}
-
 impl Spike {
-    /// Opens a device (with timestamps) and builds the spike's pipelines: the scene's seven
-    /// (cull, place, emit, shadow, field shading without a prepass, terrain) and the blit.
+    /// Opens a device (with timestamps) and builds the extraction's three pipelines (cull,
+    /// place, emit).
     pub fn new() -> Spike {
         use wgpu::{BindGroupLayoutEntry as E, BindingType as B, ShaderStages as S};
         let gpu = RawGpu::new().expect("a GPU with timestamps");
         let device = gpu.device();
-        let buf = |binding, visibility, ty| E {
+        let buf = |binding, ty| E {
             binding,
-            visibility,
+            visibility: S::COMPUTE,
             ty: B::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
             count: None,
         };
         let storage = wgpu::BufferBindingType::Storage { read_only: false };
         let uniform = wgpu::BufferBindingType::Uniform;
         let extract_layout = |skip: u32| {
-            let mut entries = vec![buf(0, S::COMPUTE, uniform), buf(1, S::COMPUTE, uniform)];
-            entries.extend((2..9).filter(|b| *b != skip).map(|b| buf(b, S::COMPUTE, storage)));
+            let mut entries = vec![buf(0, uniform), buf(1, uniform)];
+            entries.extend((2..9).filter(|b| *b != skip).map(|b| buf(b, storage)));
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: None,
                 entries: &entries,
@@ -336,99 +187,21 @@ impl Spike {
         let cull_layout = extract_layout(99);
         // live_args is the indirect buffer here, so it can't also be bound.
         let place_layout = extract_layout(3);
-        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("frame"),
-            entries: &[
-                buf(0, S::VERTEX | S::FRAGMENT, uniform),
-                E {
-                    binding: 1,
-                    visibility: S::FRAGMENT,
-                    ty: B::Texture {
-                        sample_type: wgpu::TextureSampleType::Depth,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                E {
-                    binding: 2,
-                    visibility: S::FRAGMENT,
-                    ty: B::Sampler(wgpu::SamplerBindingType::Comparison),
-                    count: None,
-                },
-                E {
-                    binding: 3,
-                    visibility: S::FRAGMENT,
-                    ty: B::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                E {
-                    binding: 4,
-                    visibility: S::FRAGMENT,
-                    ty: B::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
+        let em = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("extract"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}{}", fixture("field.wgsl"), fixture("extract.wgsl")).into(),
+            ),
         });
-        let shadow_frame_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("shadow frame"),
-                entries: &[buf(0, S::VERTEX | S::FRAGMENT, uniform)],
-            });
-        let grazer_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("grazer"),
-            entries: &[
-                buf(0, S::FRAGMENT, uniform),
-                buf(1, S::VERTEX, wgpu::BufferBindingType::Storage { read_only: true }),
-            ],
-        });
-        let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("blit"),
-            entries: &[
-                E {
-                    binding: 0,
-                    visibility: S::FRAGMENT,
-                    ty: B::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                E {
-                    binding: 1,
-                    visibility: S::FRAGMENT,
-                    ty: B::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-        let field = fixture("field.wgsl");
-        let module = |label: &str, code: String| {
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(label),
-                source: wgpu::ShaderSource::Wgsl(code.into()),
-            })
-        };
-        let em = module("extract", format!("{field}{}", fixture("extract.wgsl")));
-        let dm = module("draw", format!("{field}{}", fixture("draw.wgsl")));
-        let bm = module("blit", fixture("blit.wgsl"));
-        let layout = |bgls: &[&wgpu::BindGroupLayout]| {
-            let bgls: Vec<Option<&wgpu::BindGroupLayout>> = bgls.iter().map(|b| Some(*b)).collect();
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: None,
-                bind_group_layouts: &bgls,
-                immediate_size: 0,
-            })
-        };
         let compute = |entry: &str, bgl: &wgpu::BindGroupLayout| {
+            let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: None,
+                bind_group_layouts: &[Some(bgl)],
+                immediate_size: 0,
+            });
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(entry),
-                layout: Some(&layout(&[bgl])),
+                layout: Some(&layout),
                 module: &em,
                 entry_point: Some(entry),
                 compilation_options: Default::default(),
@@ -438,128 +211,7 @@ impl Spike {
         let cull = compute("cull_blocks", &cull_layout);
         let place = compute("place_vertices", &place_layout);
         let emit = compute("emit_quads", &place_layout);
-        let attrs = vertex_layout();
-        let vbuf = [Some(wgpu::VertexBufferLayout {
-            array_stride: 48,
-            step_mode: wgpu::VertexStepMode::Vertex,
-            attributes: &attrs,
-        })];
-        let depth = |compare, bias: wgpu::DepthBiasState| wgpu::DepthStencilState {
-            format: wgpu::TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(compare),
-            stencil: Default::default(),
-            bias,
-        };
-        let prim = |cull_mode| wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            front_face: wgpu::FrontFace::Ccw,
-            cull_mode,
-            ..Default::default()
-        };
-        let target = |format| {
-            Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })
-        };
-        let srgb = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let shadow = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shadow"),
-            layout: Some(&layout(&[&shadow_frame_layout, &grazer_layout])),
-            vertex: wgpu::VertexState {
-                module: &dm,
-                entry_point: Some("skin_shadow"),
-                compilation_options: Default::default(),
-                buffers: &vbuf,
-            },
-            primitive: prim(None),
-            depth_stencil: Some(depth(
-                wgpu::CompareFunction::Less,
-                wgpu::DepthBiasState { constant: 4, slope_scale: 2.0, clamp: 0.0 },
-            )),
-            multisample: Default::default(),
-            fragment: None,
-            multiview_mask: None,
-            cache: None,
-        });
-        let shade = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("shade_field_np"),
-            layout: Some(&layout(&[&frame_layout, &grazer_layout])),
-            vertex: wgpu::VertexState {
-                module: &dm,
-                entry_point: Some("skin"),
-                compilation_options: Default::default(),
-                buffers: &vbuf,
-            },
-            primitive: prim(Some(wgpu::Face::Back)),
-            depth_stencil: Some(depth(wgpu::CompareFunction::Less, Default::default())),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &dm,
-                entry_point: Some("shade_field"),
-                compilation_options: Default::default(),
-                targets: &[target(srgb)],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let terrain = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&layout(&[&frame_layout])),
-            vertex: wgpu::VertexState {
-                module: &dm,
-                entry_point: Some("terrain_vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: prim(None),
-            depth_stencil: Some(depth(wgpu::CompareFunction::Less, Default::default())),
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &dm,
-                entry_point: Some("terrain_fs"),
-                compilation_options: Default::default(),
-                targets: &[target(srgb)],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        let blit = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("blit"),
-            layout: Some(&layout(&[&blit_layout])),
-            vertex: wgpu::VertexState {
-                module: &bm,
-                entry_point: Some("blit_vs"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            primitive: Default::default(),
-            depth_stencil: None,
-            multisample: Default::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &bm,
-                entry_point: Some("blit_fs"),
-                compilation_options: Default::default(),
-                targets: &[target(wgpu::TextureFormat::Rgba8Unorm)],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
-        Spike {
-            cull_layout,
-            place_layout,
-            frame_layout,
-            shadow_frame_layout,
-            grazer_layout,
-            blit_layout,
-            cull,
-            place,
-            emit,
-            shadow,
-            shade,
-            terrain,
-            blit,
-            frame: None,
-            gpu,
-        }
+        Spike { cull_layout, place_layout, cull, place, emit, gpu }
     }
 
     fn buffer(&self, size: u64, usage: wgpu::BufferUsages, data: Option<&[u8]>) -> wgpu::Buffer {
@@ -599,7 +251,7 @@ impl Spike {
 
     fn individual(&self, seed: usize, cell: f64, vcap: u32, icap: u32, ex: &Scratch) -> Individual {
         use wgpu::BufferUsages as U;
-        let s = &data().seeds[seed];
+        let s = &seeds()[seed];
         let grid = grid_for(s, cell);
         let mut raw = Vec::with_capacity(48);
         for o in grid.origin {
@@ -648,7 +300,7 @@ impl Spike {
         };
         let cull_bg = group(&self.cull_layout, 99);
         let place_bg = group(&self.place_layout, 3);
-        Individual { grid, vcap, icap, params, verts, indices, draw, cull_bg, place_bg }
+        Individual { grid, vcap, icap, verts, draw, cull_bg, place_bg }
     }
 
     /// main.js's `encodeExtract`: three passes, each timed at `q0..q0 + 6` if `qs` is given.
@@ -694,7 +346,7 @@ impl Spike {
     /// last run's.
     pub fn extract_herd(&self, cell: f64, count: usize) -> (Vec<Extracted>, Vec<Individual>) {
         use wgpu::BufferUsages as U;
-        let seeds = &data().seeds[..count];
+        let seeds = &seeds()[..count];
         let grids: Vec<Grid> = seeds.iter().map(|s| grid_for(s, cell)).collect();
         let max_blocks = grids.iter().map(|g| g.blocks).max().expect("a grid");
         let ex = self.scratch(max_blocks);
@@ -758,15 +410,6 @@ impl Spike {
         u32s(&self.gpu.read(&ind.draw, 32))
     }
 
-    /// An individual's mesh: its vertices' rest positions and its triangles' indices.
-    pub fn mesh(&self, ind: &Individual) -> (Vec<[f32; 3]>, Vec<u32>) {
-        let positions =
-            self.vertices(ind).iter().map(|v| [v[0], v[1], v[2]].map(f32::from_bits)).collect();
-        let ni = self.draw_args(ind)[0].min(ind.icap) as usize;
-        let indices = u32s(&self.gpu.read(&ind.indices, (ni as u64 * 4).max(16)));
-        (positions, indices[..ni].to_vec())
-    }
-
     /// An individual's vertices as the spike wrote them: 48 bytes each (position, four bones a
     /// byte each, normal, four weights a byte each, the part mask, padding).
     pub fn vertices(&self, ind: &Individual) -> Vec<[u32; 12]> {
@@ -774,376 +417,10 @@ impl Spike {
         let words = u32s(&self.gpu.read(&ind.verts, (nv as u64 * 48).max(16)));
         words.chunks_exact(12).take(nv).map(|v| v.try_into().expect("12 words")).collect()
     }
-
-    fn frame_resources(&mut self) {
-        if self.frame.is_some() {
-            return;
-        }
-        use wgpu::{BufferUsages as U, TextureUsages as T};
-        let tex = |w, h, format, usage| {
-            self.gpu.device().create_texture(&wgpu::TextureDescriptor {
-                label: None,
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage,
-                view_formats: &[],
-            })
-        };
-        let color = tex(
-            W,
-            H,
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            T::RENDER_ATTACHMENT | T::TEXTURE_BINDING,
-        )
-        .create_view(&Default::default());
-        let depth = tex(W, H, wgpu::TextureFormat::Depth32Float, T::RENDER_ATTACHMENT)
-            .create_view(&Default::default());
-        let shadow = tex(
-            2048,
-            2048,
-            wgpu::TextureFormat::Depth32Float,
-            T::RENDER_ATTACHMENT | T::TEXTURE_BINDING,
-        )
-        .create_view(&Default::default());
-        let canvas = tex(W, H, wgpu::TextureFormat::Rgba8Unorm, T::RENDER_ATTACHMENT | T::COPY_SRC);
-        // Only the lookup mode samples the detail texture: field shading binds it unread.
-        let detail = self
-            .gpu
-            .device()
-            .create_texture(&wgpu::TextureDescriptor {
-                label: Some("detail"),
-                size: wgpu::Extent3d { width: 4, height: 4, depth_or_array_layers: 4 },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D3,
-                format: wgpu::TextureFormat::Rgba8Unorm,
-                usage: T::TEXTURE_BINDING,
-                view_formats: &[],
-            })
-            .create_view(&Default::default());
-        let view = self.buffer(160, U::UNIFORM | U::COPY_DST, None);
-        let palette = self.buffer(HERD as u64 * PALETTE_STRIDE, U::STORAGE | U::COPY_DST, None);
-        let shadow_sampler = self.gpu.device().create_sampler(&wgpu::SamplerDescriptor {
-            compare: Some(wgpu::CompareFunction::Less),
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let linear = self.gpu.device().create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            ..Default::default()
-        });
-        let frame_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.frame_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: view.as_entire_binding() },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&shadow),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&detail),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::Sampler(&linear),
-                },
-            ],
-        });
-        let shadow_frame_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.shadow_frame_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: view.as_entire_binding() }],
-        });
-        let blit_bg = self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.blit_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&color),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&linear),
-                },
-            ],
-        });
-        self.frame = Some(FrameResources {
-            color,
-            depth,
-            shadow,
-            canvas,
-            view,
-            palette,
-            frame_bg,
-            shadow_frame_bg,
-            blit_bg,
-        });
-    }
-
-    /// main.js's `scene`: these individuals drawn, in slot order.
-    pub fn scene<'a>(&mut self, kind: SceneKind, inds: Vec<&'a Individual>) -> Scene<'a> {
-        self.frame_resources();
-        let fr = self.frame.as_ref().expect("frame resources");
-        let draws = inds
-            .iter()
-            .enumerate()
-            .map(|(slot, ind)| {
-                self.gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None,
-                    layout: &self.grazer_layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: ind.params.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                                buffer: &fr.palette,
-                                offset: slot as u64 * PALETTE_STRIDE,
-                                size: wgpu::BufferSize::new((BONES * 64) as u64),
-                            }),
-                        },
-                    ],
-                })
-            })
-            .collect();
-        Scene { kind, inds, draws }
-    }
-
-    /// main.js's `update`: the view at time `t`, and the palettes `pal` (one time's, from
-    /// [`palettes`]).
-    fn update(&self, scene: &Scene, t: f64, pal: &[f32]) {
-        let fr = self.frame.as_ref().expect("frame resources");
-        let d = data();
-        let mut v = match scene.kind {
-            SceneKind::Herd => d.herd_view.clone(),
-            SceneKind::CloseUp => d.closeup_view.clone(),
-        };
-        v[35] = t as f32;
-        self.gpu.queue().write_buffer(&fr.view, 0, &bytes_of(&v));
-        let mut out = vec![0u8; scene.inds.len() * PALETTE_STRIDE as usize];
-        for (i, m) in pal.chunks_exact(BONES * 16).enumerate().take(scene.inds.len()) {
-            let at = i * PALETTE_STRIDE as usize;
-            for (k, x) in m.iter().enumerate() {
-                out[at + 4 * k..at + 4 * k + 4].copy_from_slice(&x.to_le_bytes());
-            }
-        }
-        self.gpu.queue().write_buffer(&fr.palette, 0, &out);
-    }
-
-    /// main.js's `encodeFrame` in field mode with no prepass: the shadow pass, the terrain and
-    /// the creatures, timed at `q0..q0 + 6` (pass 0, 1 and 2) if `qs` is given.
-    fn encode_frame(
-        &self,
-        enc: &mut wgpu::CommandEncoder,
-        scene: &Scene,
-        qs: Option<(&wgpu::QuerySet, u32)>,
-    ) {
-        let fr = self.frame.as_ref().expect("frame resources");
-        let writes = |i: u32| {
-            qs.map(|(q, q0)| wgpu::RenderPassTimestampWrites {
-                query_set: q,
-                beginning_of_pass_write_index: Some(q0 + 2 * i),
-                end_of_pass_write_index: Some(q0 + 2 * i + 1),
-            })
-        };
-        let draw_all = |p: &mut wgpu::RenderPass| {
-            for (ind, bg) in scene.inds.iter().zip(&scene.draws) {
-                p.set_bind_group(1, bg, &[]);
-                p.set_vertex_buffer(0, ind.verts.slice(..));
-                p.set_index_buffer(ind.indices.slice(..), wgpu::IndexFormat::Uint32);
-                p.draw_indexed_indirect(&ind.draw, 0);
-            }
-        };
-        let depth = |view, load| {
-            Some(wgpu::RenderPassDepthStencilAttachment {
-                view,
-                depth_ops: Some(wgpu::Operations { load, store: wgpu::StoreOp::Store }),
-                stencil_ops: None,
-            })
-        };
-        {
-            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shadow"),
-                color_attachments: &[],
-                depth_stencil_attachment: depth(&fr.shadow, wgpu::LoadOp::Clear(1.0)),
-                timestamp_writes: writes(0),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            p.set_pipeline(&self.shadow);
-            p.set_bind_group(0, &fr.shadow_frame_bg, &[]);
-            draw_all(&mut p);
-        }
-        {
-            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terrain"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fr.color,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.42,
-                            g: 0.55,
-                            b: 0.75,
-                            a: 1.0,
-                        }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: depth(&fr.depth, wgpu::LoadOp::Clear(1.0)),
-                timestamp_writes: writes(1),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            p.set_pipeline(&self.terrain);
-            p.set_bind_group(0, &fr.frame_bg, &[]);
-            p.draw(0..TERRAIN_VERTS, 0..1);
-        }
-        {
-            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("shade"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &fr.color,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
-                })],
-                depth_stencil_attachment: depth(&fr.depth, wgpu::LoadOp::Load),
-                timestamp_writes: writes(2),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            p.set_pipeline(&self.shade);
-            p.set_bind_group(0, &fr.frame_bg, &[]);
-            draw_all(&mut p);
-        }
-    }
-
-    /// One frame at `t`, as the spike's canvas shows it: RGBA8, rows top to bottom.
-    pub fn render(&self, scene: &Scene, t: f64) -> Vec<u8> {
-        let pal = palettes(scene.kind, &[t]);
-        self.update(scene, t, &pal);
-        let fr = self.frame.as_ref().expect("frame resources");
-        let mut enc = self.gpu.device().create_command_encoder(&Default::default());
-        self.encode_frame(&mut enc, scene, None);
-        {
-            let view = fr.canvas.create_view(&Default::default());
-            let mut p = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("blit"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            p.set_pipeline(&self.blit);
-            p.set_bind_group(0, &fr.blit_bg, &[]);
-            p.draw(0..3, 0..1);
-        }
-        let size = u64::from(W) * u64::from(H) * 4;
-        let rb = self.gpu.device().create_buffer(&wgpu::BufferDescriptor {
-            label: Some("canvas"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        enc.copy_texture_to_buffer(
-            wgpu::TexelCopyTextureInfo {
-                texture: &fr.canvas,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyBufferInfo {
-                buffer: &rb,
-                layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(W * 4),
-                    rows_per_image: Some(H),
-                },
-            },
-            wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
-        );
-        self.gpu.queue().submit([enc.finish()]);
-        wrela_host::map_read(self.gpu.device(), &rb).expect("the canvas")
-    }
-
-    /// main.js's `measure`: `warm` untimed frames, then `frames` timed ones, back to back, at
-    /// t = f / 60. Each frame's times.
-    pub fn measure(&self, scene: &Scene, warm: u32, frames: u32) -> Vec<FrameTimes> {
-        let times: Vec<f64> = (0..warm.max(frames)).map(|f| f64::from(f) / 60.0).collect();
-        let pal = palettes(scene.kind, &times);
-        let per = scene.inds.len() * BONES * 16;
-        let frame = |f: usize| &pal[f * per..(f + 1) * per];
-        for (f, &t) in times.iter().enumerate().take(warm as usize) {
-            self.update(scene, t, frame(f));
-            let mut enc = self.gpu.device().create_command_encoder(&Default::default());
-            self.encode_frame(&mut enc, scene, None);
-            self.gpu.queue().submit([enc.finish()]);
-        }
-        let q = 6;
-        let qs = self.gpu.device().create_query_set(&wgpu::QuerySetDescriptor {
-            label: None,
-            ty: wgpu::QueryType::Timestamp,
-            count: frames * q,
-        });
-        for (f, &t) in times.iter().enumerate().take(frames as usize) {
-            self.update(scene, t, frame(f));
-            let mut enc = self.gpu.device().create_command_encoder(&Default::default());
-            self.encode_frame(&mut enc, scene, Some((&qs, f as u32 * q)));
-            self.gpu.queue().submit([enc.finish()]);
-        }
-        let nanos =
-            wrela_host::read_timestamps(self.gpu.device(), self.gpu.queue(), &qs, frames * 3)
-                .expect("the timestamps");
-        nanos
-            .chunks_exact(3)
-            .map(|t| {
-                let ms = |i: usize| t[i] / 1e6;
-                FrameTimes {
-                    shadow: ms(0),
-                    terrain: ms(1),
-                    creatures: ms(0) + ms(2),
-                    passes: ms(0) + ms(1) + ms(2),
-                }
-            })
-            .collect()
-    }
 }
 
 impl Default for Spike {
     fn default() -> Spike {
         Spike::new()
     }
-}
-
-/// The mean of |a − b| over the colour channels of two RGBA8 images, in /255, and the share of
-/// pixels with a channel more than 8/255 apart (#42's image comparison).
-pub fn image_difference(a: &[u8], b: &[u8]) -> (f64, f64) {
-    assert_eq!(a.len(), b.len(), "the images differ in size");
-    let (mean, far, _) = crate::image_difference_over(a, b, 0..a.len() / 4);
-    (mean, far)
 }

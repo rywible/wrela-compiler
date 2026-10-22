@@ -2,11 +2,11 @@
 //! `Blend` is derived field by field, on a body and a hoof joined by a smooth union.
 
 use crate::built;
-use wrela_host::{CpuBuild, CpuHost, Host, Value};
+use wrela_host::{CpuHost, Host, Value};
 use wrela_tests::{f32s, one_f32, one_u32, one_vec3, u32s};
 
 fn host() -> CpuHost {
-    CpuBuild::load(built("channels")).expect("load").start_with(1).expect("start")
+    crate::cpu_host(&built("channels"))
 }
 
 fn at(x: f32, y: f32, z: f32) -> [Value; 3] {

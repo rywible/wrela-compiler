@@ -362,7 +362,7 @@ fn cases() -> Vec<Case> {
                 text.lines()
                     .take_while(|l| l.starts_with("//"))
                     .filter_map(|l| l.strip_prefix(prefix.as_str()))
-                    .flat_map(|v| v.split_whitespace().map(String::from).collect::<Vec<_>>())
+                    .flat_map(|v| v.split_whitespace().map(String::from))
                     .collect()
             };
             Case { path, accepts: header("accepts"), rejects: header("rejects"), text }

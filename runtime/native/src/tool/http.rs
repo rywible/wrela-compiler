@@ -172,16 +172,12 @@ pub(crate) fn fake_key(url: &str) -> &str {
 /// A response's status and headers, as std's `http::read_response` reads them; its body
 /// follows (`Sink::finish`).
 fn head(status: u16, headers: &[(String, String)]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&u32::from(status).to_le_bytes());
-    out.extend_from_slice(&(headers.len() as u32).to_le_bytes());
+    let mut out = super::toolchain::Out::default();
+    out.u32(u32::from(status)).u32(headers.len() as u32);
     for (name, value) in headers {
-        for t in [name, value] {
-            out.extend_from_slice(&(t.len() as u32).to_le_bytes());
-            out.extend_from_slice(t.as_bytes());
-        }
+        out.str(name).str(value);
     }
-    out
+    out.0
 }
 
 /// A whole response of `body`, for `request`.
@@ -227,14 +223,12 @@ pub(crate) fn expired(f: &Fetch) -> String {
 /// `scratch/sites/<host>/` (a path ending in `/` is its `index.html`), for `GET` and `HEAD`,
 /// within a real response's limits.
 fn fake(s: &Services, request: u32, f: &Fetch, host: &str, path: &str) -> Result<Vec<u8>, String> {
-    let set = {
-        let mut fakes = s.fakes();
-        let set = fakes.get_mut(fake_key(&f.url));
-        if let Some(set) = set.filter(|set| set.fails > 0) {
+    let set = match s.fakes().get_mut(fake_key(&f.url)) {
+        Some(set) if set.fails > 0 => {
             set.fails -= 1;
             return Err(format!("{TRANSPORT}{}: connection reset (a fake site's failure)", f.url));
         }
-        fakes.get(fake_key(&f.url)).cloned().unwrap_or_default()
+        set => set.cloned().unwrap_or_default(),
     };
     let length = |n: u64| vec![("content-length".to_string(), n.to_string())];
     let status = match set.answer {
@@ -273,14 +267,10 @@ fn fake(s: &Services, request: u32, f: &Fetch, host: &str, path: &str) -> Result
         },
         |chunk| sink.push(chunk, what),
     );
-    match read {
-        Ok(()) => {
-            let mut out = head(status.unwrap_or(200), &length(entry.size));
-            sink.finish(&mut out);
-            Ok(out)
-        }
-        Err(why) => Err(why),
-    }
+    read?;
+    let mut out = head(status.unwrap_or(200), &length(entry.size));
+    sink.finish(&mut out);
+    Ok(out)
 }
 
 /// A socket the worker can shut down while the client waits on it.
@@ -294,16 +284,14 @@ impl Socket {
     /// Shuts the connection down, and any made from now on: what the client waits on returns.
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
-        if let Some(s) =
-            self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref()
-        {
+        if let Some(s) = crate::locked(&self.stream).as_ref() {
             let _ = s.shutdown(Shutdown::Both);
         }
     }
 
     fn keep(&self, stream: &TcpStream) -> std::io::Result<()> {
         let kept = stream.try_clone()?;
-        *self.stream.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(kept);
+        *crate::locked(&self.stream) = Some(kept);
         if self.cancelled.load(Ordering::Acquire) {
             let _ = stream.shutdown(Shutdown::Both);
         }

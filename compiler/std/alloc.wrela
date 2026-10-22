@@ -19,7 +19,7 @@
 
 use std::abi::{ALLOCATIONS, ALLOC_STATE, LOCK_SPINS, LOCK_WAITS, SEEN_END}
 use std::mem::{
-    align_of, atomic_load, atomic_store, compare_swap, copy, count, heap_base, load_u32,
+    align_of, atomic_load, atomic_store, compare_swap, copy, count, exchange, heap_base, load_u32,
     memory_grow, memory_pages, notify, size_of, store_u32, thread_block, wait, write,
 }
 
@@ -149,11 +149,8 @@ pub fn realloc(addr: u32, old: u32, new: u32, align: u32) -> u32 {
 /// The size class of `size` bytes: the smallest `k` with `16 << k >= size`; `CLASSES` and up
 /// for a large block.
 fn class(size: u32) -> u32 {
-    var k = 0
-    while k < CLASSES && SMALLEST << k < size {
-        k += 1
-    }
-    k
+    // `16 << k >= size` first holds where `k + 4` is the bit length of `size - 1`.
+    if size <= SMALLEST { 0 } else { 28 - (size - 1).leading_zeros() }
 }
 
 fn round_up(n: u32, to: u32) -> u32 {
@@ -274,7 +271,7 @@ fn lock() {
                 }
             } else {
                 // Taken with the mark of a sleeper on it: whoever lets it go wakes one.
-                if exchange_lock(2) == 0 {
+                if exchange(LOCK, 2) == 0 {
                     break
                 }
                 let _ = wait(LOCK, 2)
@@ -289,20 +286,8 @@ fn lock() {
 /// Lets the allocator's lock go, waking a thread asleep on it if one may be.
 fn unlock() {
     unsafe {
-        if exchange_lock(0) == 2 {
+        if exchange(LOCK, 0) == 2 {
             let _ = notify(LOCK, 1)
-        }
-    }
-}
-
-/// Puts `new` in the lock's word, atomically: what was there.
-fn exchange_lock(new: u32) -> u32 {
-    unsafe {
-        loop {
-            let old = atomic_load(LOCK)
-            if compare_swap(LOCK, expected: old, new: new) == old {
-                return old
-            }
         }
     }
 }

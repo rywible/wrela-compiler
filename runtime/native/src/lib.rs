@@ -43,7 +43,7 @@ mod trace;
 
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps, submission_spans};
+pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps};
 pub use trace::{Phase, Trace, Traced};
 /// Chrome over the DevTools protocol, which the browser service and the page runs drive.
 pub use wrela_chrome as chrome;
@@ -58,6 +58,11 @@ pub use program::{
 };
 pub use wrela_abi::input::{Event, Scripted, parse_script};
 pub use wrela_abi::ticks::{TickLog, frame_time, lockstep_ticks};
+
+/// `m`, locked: a thread that panicked while it held it leaves it as it was.
+pub(crate) fn locked<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 #[cfg(feature = "gpu")]
 use gpu::Gpu;
@@ -118,12 +123,16 @@ pub struct Options {
 }
 
 impl Options {
-    /// Where a build in `dir` loaded this way reads and writes ([`io`]).
+    /// Where `build`, in `dir`, loaded this way reads and writes ([`io`]): a driven build's
+    /// fetches go through its directory's handle, and its posts to its tool
+    /// (`std::tool::drive`).
     #[cfg(feature = "gpu")]
-    fn io(&self, dir: &Path) -> program::Io {
+    fn io(&self, build: &Build, dir: &Path) -> program::Io {
         let mut io =
             io(dir, self.storage.as_deref(), self.post.clone(), self.host.clone(), self.quiet);
         io.storage_dir = self.storage_dir.clone();
+        io.build_dir = build.driven.as_ref().map(|(_, handle)| handle.clone());
+        io.queue_posts = io.build_dir.is_some();
         io
     }
 
@@ -335,11 +344,11 @@ fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build
     let manifest = Manifest::parse(&text(file("manifest.json")?, "manifest.json")?)?;
     let wasm = file(&manifest.wasm)?;
     let shaders = if shaders {
-        let mut out = Vec::new();
-        for p in &manifest.pipelines {
-            out.push(text(file(&p.shader)?, &p.shader)?);
-        }
-        out
+        manifest
+            .pipelines
+            .iter()
+            .map(|p| text(file(&p.shader)?, &p.shader))
+            .collect::<Result<_>>()?
     } else {
         Vec::new()
     };
@@ -435,16 +444,11 @@ impl Host {
         {
             return Err((error, Box::new(carried)));
         }
-        let mut io = self.options.io(dir);
-        if let Some((_, handle)) = &build.driven {
-            io.queue_posts = true;
-            io.build_dir = Some(handle.clone());
-        }
         let mut program = Program::instantiate_carrying_recover(
             &build.compiled,
             &build.manifest,
             carried,
-            io,
+            self.options.io(build, dir),
             workers(self.options.workers),
             false,
         )?;
@@ -581,7 +585,7 @@ impl Host {
                 &build.compiled,
                 &build.manifest,
                 fresh,
-                options.io(dir),
+                options.io(&build, dir),
                 workers(options.workers),
                 false,
             )
@@ -601,7 +605,7 @@ impl Host {
                 &build.compiled,
                 &build.manifest,
                 executor,
-                options.io(dir),
+                options.io(&build, dir),
                 options.record,
                 workers(options.workers),
                 false,
@@ -619,7 +623,6 @@ impl Host {
         if options.reloadable {
             program.keep_ticks();
         }
-        program.hand_over_here();
         self.install_program(program);
         self.build = build;
         self.dir = dir.to_path_buf();
@@ -686,19 +689,13 @@ impl Host {
     /// and its fetches read through its directory's handle if it's driven.
     fn start(build: Build, dir: &Path, options: &Options, hands_over: bool) -> Result<Host> {
         let gpu = Gpu::new(&build.manifest, &build.shaders, options.timing)?;
-        let n = workers(options.workers);
-        let mut io = options.io(dir);
-        let handle = build.driven.as_ref().map(|(_, h)| h.clone());
-        // A driven build's posts go to its tool (`std::tool::drive`).
-        io.queue_posts = handle.is_some();
-        io.build_dir = handle;
         let mut program = Program::instantiate_with(
             &build.compiled,
             &build.manifest,
             gpu,
-            io,
+            options.io(&build, dir),
             options.record,
-            n,
+            workers(options.workers),
             false,
         )?;
         if options.reloadable {
@@ -1025,8 +1022,7 @@ impl Host {
     /// The GPU durations recorded since the last call (or load), with [`Options::timing`]:
     /// for timing work an export submits. It waits for the GPU.
     pub fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
-        let gpu = self.p().executor();
-        gpu.take_timings()
+        self.p().executor().take_timings()
     }
 
     /// The GPU this host runs on: its adapter's name and driver.

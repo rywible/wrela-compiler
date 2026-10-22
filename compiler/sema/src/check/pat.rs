@@ -351,30 +351,26 @@ impl<'p> Checker<'p> {
             }
         };
         let resolved = self.infer.resolve(&self.p.types, ty);
-        match lit.kind {
-            ast::LitKind::Bool(b) => Some(Lit::Bool(b)),
+        let value = match lit.kind {
+            ast::LitKind::Bool(b) => Lit::Bool(b),
             ast::LitKind::Int(v) if self.p.types.is_float(resolved) => {
-                let (d, f) = (v.ok()? as f64, v.ok()? as f32);
-                Some(if neg { Lit::Float(-d, -f) } else { Lit::Float(d, f) })
+                Lit::Float(v.ok()? as f64, v.ok()? as f32)
             }
-            ast::LitKind::Int(v) => {
-                let v = v.ok()?;
-                Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
-            }
+            ast::LitKind::Int(v) => Lit::Int(i128::from(v.ok()?)),
             ast::LitKind::Float(v) => {
-                let f = wrela_syntax::lexer::float_value_f32(&lit.text);
-                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
+                Lit::Float(v, wrela_syntax::lexer::float_value_f32(&lit.text))
             }
             ast::LitKind::Suffixed => {
                 let e = self.check_suffixed(&lit, Some(resolved));
                 let ExprKind::Lit(Lit::Float(v, f)) = e.kind else { return None };
-                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
+                Lit::Float(v, f)
             }
             _ => {
                 self.err(not_a_number());
-                None
+                return None;
             }
-        }
+        };
+        Some(negated(value, neg))
     }
 
     fn check_lit_pattern(&mut self, neg: bool, lit: &ast::Lit, ty: TyId) -> Option<Lit> {
@@ -418,14 +414,14 @@ impl<'p> Checker<'p> {
                         _ => self.negated_ints.push((ty, lit.span)),
                     }
                 }
-                Some(Lit::Int(if neg { -i128::from(v) } else { i128::from(v) }))
+                Some(negated(Lit::Int(i128::from(v)), neg))
             }
             ast::LitKind::Float(v) => {
                 let var = self.new_var(VarKind::Float, lit.span);
                 self.expect(var, ty, lit.span);
                 let f = wrela_syntax::lexer::float_value_f32(&lit.text);
                 self.float_literals.push((ty, v, f, lit.span));
-                Some(if neg { Lit::Float(-v, -f) } else { Lit::Float(v, f) })
+                Some(negated(Lit::Float(v, f), neg))
             }
             _ => {
                 self.err(Diagnostic::new(
@@ -787,11 +783,7 @@ impl<'p> Checker<'p> {
                 DPat::Ctor(Ctor::Single, ps.iter().map(|x| self.dpat(x)).collect())
             }
             PatKind::Adt { adt, variant, fields, .. } => {
-                let n = match variant {
-                    Some(v) => self.p.adt(*adt).variants()[*v as usize].fields.len(),
-                    None => self.p.adt(*adt).fields().len(),
-                };
-                let mut subs = vec![DPat::Wild; n];
+                let mut subs = vec![DPat::Wild; self.p.adt_fields(*adt, *variant).len()];
                 for (i, f) in fields {
                     subs[*i as usize] = self.dpat(f);
                 }
@@ -807,15 +799,20 @@ impl<'p> Checker<'p> {
 }
 
 /// How a pattern binding of the known type `ty` holds its value.
-pub(super) fn binding_kind_of(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
-    binding_kind(p, ty, from_place)
-}
-
-fn binding_kind(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
+pub(super) fn binding_kind(p: &Program, ty: TyId, from_place: bool) -> LocalKind {
     if from_place && !crate::traits::implements_builtin(p, ty, Lang::Copy) {
         LocalKind::Projection { mutable: false }
     } else {
         LocalKind::Owned { mutable: false }
+    }
+}
+
+/// `lit`, negated if `neg` (a `bool` stays as it is).
+fn negated(lit: Lit, neg: bool) -> Lit {
+    match lit {
+        Lit::Int(v) if neg => Lit::Int(-v),
+        Lit::Float(d, f) if neg => Lit::Float(-d, -f),
+        l => l,
     }
 }
 
@@ -1060,18 +1057,10 @@ fn has_error_pat(p: &ast::Pat) -> bool {
 }
 
 /// The names in a pattern that are constants in scope (so they compare, not bind).
-fn constant_names(
-    p: &crate::program::Program,
-    m: crate::ty::ModuleId,
-    pat: &ast::Pat,
-    out: &mut Vec<(String, wrela_diag::Span)>,
-) {
+fn constant_names(p: &Program, m: ModuleId, pat: &ast::Pat, out: &mut Vec<(String, Span)>) {
     match &pat.kind {
         ast::PatKind::Ident(id) => {
-            if matches!(
-                crate::resolve::lookup_name(p, m, &id.name),
-                Some(crate::defs::Res::Const(_))
-            ) {
+            if matches!(resolve::lookup_name(p, m, &id.name), Some(Res::Const(_))) {
                 out.push((id.name.clone(), id.span));
             }
         }

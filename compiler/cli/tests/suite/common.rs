@@ -1,8 +1,10 @@
-//! What the command's tests share: a package in a scratch directory, the `wrela` command, and
-//! what it prints. Each module uses some of it.
+//! What the command's tests share: a package in a scratch directory, the `wrela` command, what
+//! it prints, waits on processes, and the files a run leaves. Each module uses some of it.
 
-use std::path::PathBuf;
-use std::process::Command;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
 
 /// A program with a struct, a trait, an impl, generics, borrows and moves: what queries and
 /// refactors read.
@@ -117,4 +119,79 @@ pub fn stdout(command: &mut Command) -> String {
 /// Runs `command`, which must succeed: its standard output, as JSON.
 pub fn answer(command: &mut Command) -> serde_json::Value {
     serde_json::from_str(&stdout(command)).expect("JSON")
+}
+
+/// Runs `command`: its exit code, and its standard output and error together.
+pub fn run(command: &mut Command) -> (Option<i32>, String) {
+    let out = command.output().expect("run wrela");
+    let text =
+        format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    (out.status.code(), text)
+}
+
+/// Waits up to `bound` for `done`.
+pub fn within(bound: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let started = Instant::now();
+    while started.elapsed() < bound {
+        if done() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    done()
+}
+
+/// `child`'s exit code if it ends within `bound`; else it is killed, and `None`.
+pub fn exit_within(child: &mut Child, bound: Duration) -> Option<i32> {
+    let started = Instant::now();
+    while started.elapsed() < bound {
+        if let Some(status) = child.try_wait().expect("wait") {
+            return status.code();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// Whether a process of the process group `group` still runs.
+pub fn group_alive(group: i32) -> bool {
+    Command::new("kill")
+        .args(["-0", &format!("-{group}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Every file under `dir`.
+pub fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+/// Every file under `dir`, by its path there, with its bytes.
+pub fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    let mut out = BTreeMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).expect("read the directory") {
+            let path = entry.expect("an entry").path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let name = path.strip_prefix(dir).expect("inside").to_string_lossy().into_owned();
+                out.insert(name, std::fs::read(&path).expect("read"));
+            }
+        }
+    }
+    out
 }

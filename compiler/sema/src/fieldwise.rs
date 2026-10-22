@@ -36,7 +36,9 @@ use crate::defs::*;
 use crate::program::Program;
 use crate::thir::*;
 use crate::ty::*;
+use std::collections::HashMap;
 use wrela_diag::{Diagnostic, Span, codes};
+use wrela_syntax::ast::{BinOp, UnOp};
 
 /// What a derivable method returns: how the fields' results combine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,40 +89,24 @@ pub fn is_fields_of_self(e: &wrela_syntax::ast::Expr) -> bool {
 
 /// Where block `b` makes a closure, if it does.
 pub fn closure_in(b: &Block) -> Option<Span> {
-    fn expr(e: &Expr) -> Option<Span> {
-        if matches!(e.kind, ExprKind::Closure(_)) {
-            return Some(e.span);
-        }
+    fn child(c: Child) -> Option<Span> {
         let mut found = None;
-        e.for_each_child(&mut |c| {
-            if found.is_none() {
-                found = match c {
-                    Child::Expr(x) => expr(x),
-                    Child::Block(b) => closure_in(b),
-                };
-            }
-        });
+        match c {
+            Child::Expr(e) if matches!(e.kind, ExprKind::Closure(_)) => return Some(e.span),
+            Child::Expr(e) => e.for_each_child(&mut |c| {
+                if found.is_none() {
+                    found = child(c);
+                }
+            }),
+            Child::Block(b) => block_children(b, &mut |c| {
+                if found.is_none() {
+                    found = child(c);
+                }
+            }),
+        }
         found
     }
-    for s in &b.stmts {
-        let found = match &s.kind {
-            StmtKind::Bind { init, else_, .. } => {
-                expr(init).or_else(|| else_.as_ref().and_then(closure_in))
-            }
-            StmtKind::Assign { place, value, .. } => expr(place).or_else(|| expr(value)),
-            StmtKind::Expr(e) => expr(e),
-            StmtKind::While { cond, body } => expr(cond).or_else(|| closure_in(body)),
-            StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => closure_in(body),
-            StmtKind::ForRange { start, end, body, .. } => {
-                expr(start).or_else(|| expr(end)).or_else(|| closure_in(body))
-            }
-            StmtKind::ForEach { array, body, .. } => expr(array).or_else(|| closure_in(body)),
-        };
-        if found.is_some() {
-            return found;
-        }
-    }
-    b.tail.as_deref().and_then(expr)
+    child(Child::Block(b))
 }
 
 /// Whether method `m`'s default body walks `self`'s fields anywhere.
@@ -499,15 +485,8 @@ fn derive_walk(
     }
     for (i, c) in closures.iter().enumerate() {
         let sig = c.params.iter().map(|l| w.locals[l.index()].ty).collect();
-        let modes = c
-            .params
-            .iter()
-            .map(|l| match w.locals[l.index()].kind {
-                LocalKind::Param(m) => m,
-                LocalKind::ClosureParam => Mode::Borrow,
-                _ => Mode::Borrow,
-            })
-            .collect();
+        let modes =
+            c.params.iter().map(|l| crate::check::param_mode(w.locals[l.index()].kind)).collect();
         let id = ClosureRef { owner: Some(f), id: ClosureId(i as u32) };
         p.closure_sigs.borrow_mut().insert(id, (sig, c.ret, modes));
     }
@@ -537,60 +516,21 @@ impl Walker<'_> {
                     self.expand_expr(x, me);
                 }
             }
-            ExprKind::Match { scrutinee, arms, .. } => {
-                self.expand_expr(scrutinee, me);
-                for a in arms {
-                    if let Some(g) = &mut a.guard {
-                        self.expand_expr(g, me);
-                    }
-                    self.expand_expr(&mut a.body, me);
-                }
-            }
             _ => crate::check::zonk::for_each_child_mut(e, &mut |x| self.expand_expr(x, me)),
         }
     }
 
     fn expand_block(&mut self, b: &mut Block, me: LocalId) {
-        let stmts = std::mem::take(&mut b.stmts);
-        for mut s in stmts {
-            match s.kind {
-                StmtKind::ForFields { var, mutable, reverse, body } => {
-                    for one in self.unroll(var, mutable, reverse, body, me, s.span) {
-                        b.stmts.push(one);
-                    }
-                }
-                ref mut k => {
-                    match k {
-                        StmtKind::Bind { init, else_, .. } => {
-                            self.expand_expr(init, me);
-                            if let Some(eb) = else_ {
-                                self.expand_block(eb, me);
-                            }
-                        }
-                        StmtKind::Assign { place, value, .. } => {
-                            self.expand_expr(place, me);
-                            self.expand_expr(value, me);
-                        }
-                        StmtKind::Expr(x) => self.expand_expr(x, me),
-                        StmtKind::While { cond, body } => {
-                            self.expand_expr(cond, me);
-                            self.expand_block(body, me);
-                        }
-                        StmtKind::Loop { body } => self.expand_block(body, me),
-                        StmtKind::ForRange { start, end, body, .. } => {
-                            self.expand_expr(start, me);
-                            self.expand_expr(end, me);
-                            self.expand_block(body, me);
-                        }
-                        StmtKind::ForEach { array, body, .. } => {
-                            self.expand_expr(array, me);
-                            self.expand_block(body, me);
-                        }
-                        StmtKind::ForFields { .. } => unreachable!(),
-                    }
-                    b.stmts.push(s);
-                }
+        for mut s in std::mem::take(&mut b.stmts) {
+            if let StmtKind::ForFields { var, mutable, reverse, body } = s.kind {
+                b.stmts.extend(self.unroll(var, mutable, reverse, body, me, s.span));
+                continue;
             }
+            stmt_parts_mut(&mut s.kind, &mut |part| match part {
+                PartMut::Expr(x) => self.expand_expr(x, me),
+                PartMut::Block(b) => self.expand_block(b, me),
+            });
+            b.stmts.push(s);
         }
         if let Some(t) = &mut b.tail {
             self.expand_expr(t, me);
@@ -598,7 +538,6 @@ impl Walker<'_> {
     }
 
     /// One walk's statements: for each field, its projection bound and the body for its type.
-    #[allow(clippy::too_many_arguments)]
     fn unroll(
         &mut self,
         var: LocalId,
@@ -616,9 +555,8 @@ impl Walker<'_> {
         let fields: Vec<TyId> = match &self.of {
             Of::Adt(a, args) => p.fields_of(*a, args, None),
             Of::Tuple(ts) => ts.clone(),
-            &Of::Array(elem, n) if !reverse => {
+            &Of::Array(elem, _) if !reverse => {
                 // An array's elements are of one type: a loop over them.
-                let _ = n;
                 let (v, b) = self.instance(var, &body, elem, me);
                 return vec![Stmt {
                     kind: StmtKind::ForEach { var: v, array: me_expr, mutable, body: b },
@@ -644,17 +582,13 @@ impl Walker<'_> {
                 let last = Expr {
                     ty: u,
                     span,
-                    kind: ExprKind::Binary(
-                        wrela_syntax::ast::BinOp::Sub,
-                        Box::new(len.clone()),
-                        Box::new(lit(1)),
-                    ),
+                    kind: ExprKind::Binary(BinOp::Sub, Box::new(len.clone()), Box::new(lit(1))),
                 };
                 let at = Expr {
                     ty: u,
                     span,
                     kind: ExprKind::Binary(
-                        wrela_syntax::ast::BinOp::Sub,
+                        BinOp::Sub,
                         Box::new(last),
                         Box::new(Expr { ty: u, span, kind: ExprKind::Local(j) }),
                     ),
@@ -709,7 +643,7 @@ impl Walker<'_> {
         let subst = Subst::from_pairs(&[self.field], &[fty]);
         let mut declared = vec![var];
         declared_in_block(body, &mut declared);
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         for l in declared {
             let mut d = self.locals[l.index()].clone();
             d.ty = p.types.subst(d.ty, &subst);
@@ -737,66 +671,42 @@ fn declared_in_block(b: &Block, out: &mut Vec<LocalId>) {
             PatKind::Wild | PatKind::Lit(_) | PatKind::Text(_) => {}
         }
     }
-    fn expr(e: &Expr, out: &mut Vec<LocalId>) {
-        if let ExprKind::Match { arms, .. } = &e.kind {
-            for a in arms {
-                pat(&a.pat, out);
+    fn child(c: Child, out: &mut Vec<LocalId>) {
+        match c {
+            Child::Expr(e) => {
+                if let ExprKind::Match { arms, .. } = &e.kind {
+                    for a in arms {
+                        pat(&a.pat, out);
+                    }
+                }
+                e.for_each_child(&mut |c| child(c, out));
             }
-        }
-        e.for_each_child(&mut |c| match c {
-            Child::Expr(x) => expr(x, out),
             Child::Block(b) => declared_in_block(b, out),
-        });
+        }
     }
     for s in &b.stmts {
         match &s.kind {
-            StmtKind::Bind { pat: q, init, else_ } => {
-                pat(q, out);
-                expr(init, out);
-                if let Some(eb) = else_ {
-                    declared_in_block(eb, out);
-                }
-            }
-            StmtKind::Assign { place, value, .. } => {
-                expr(place, out);
-                expr(value, out);
-            }
-            StmtKind::Expr(e) => expr(e, out),
-            StmtKind::While { cond, body } => {
-                expr(cond, out);
-                declared_in_block(body, out);
-            }
-            StmtKind::Loop { body } => declared_in_block(body, out),
-            StmtKind::ForRange { var, start, end, body, .. } => {
-                out.push(*var);
-                expr(start, out);
-                expr(end, out);
-                declared_in_block(body, out);
-            }
-            StmtKind::ForEach { var, array, body, .. } => {
-                out.push(*var);
-                expr(array, out);
-                declared_in_block(body, out);
-            }
-            StmtKind::ForFields { var, body, .. } => {
-                out.push(*var);
-                declared_in_block(body, out);
-            }
+            StmtKind::Bind { pat: q, .. } => pat(q, out),
+            StmtKind::ForRange { var, .. }
+            | StmtKind::ForEach { var, .. }
+            | StmtKind::ForFields { var, .. } => out.push(*var),
+            _ => {}
         }
+        stmt_children(&s.kind, &mut |c| child(c, out));
     }
     if let Some(t) = &b.tail {
-        expr(t, out);
+        child(Child::Expr(t), out);
     }
 }
 
 /// `b` with each local in `map` replaced by its image.
-fn remap_block(b: &mut Block, map: &std::collections::HashMap<LocalId, LocalId>) {
-    fn id(l: &mut LocalId, map: &std::collections::HashMap<LocalId, LocalId>) {
+fn remap_block(b: &mut Block, map: &HashMap<LocalId, LocalId>) {
+    fn id(l: &mut LocalId, map: &HashMap<LocalId, LocalId>) {
         if let Some(n) = map.get(l) {
             *l = *n;
         }
     }
-    fn pat(p: &mut Pat, map: &std::collections::HashMap<LocalId, LocalId>) {
+    fn pat(p: &mut Pat, map: &HashMap<LocalId, LocalId>) {
         match &mut p.kind {
             PatKind::Bind(l) => id(l, map),
             PatKind::Adt { fields, .. } => fields.iter_mut().for_each(|(_, q)| pat(q, map)),
@@ -804,7 +714,7 @@ fn remap_block(b: &mut Block, map: &std::collections::HashMap<LocalId, LocalId>)
             PatKind::Wild | PatKind::Lit(_) | PatKind::Text(_) => {}
         }
     }
-    fn expr(e: &mut Expr, map: &std::collections::HashMap<LocalId, LocalId>) {
+    fn expr(e: &mut Expr, map: &HashMap<LocalId, LocalId>) {
         match &mut e.kind {
             ExprKind::Local(l) => id(l, map),
             ExprKind::Call(c) => {
@@ -828,56 +738,102 @@ fn remap_block(b: &mut Block, map: &std::collections::HashMap<LocalId, LocalId>)
                     expr(x, map);
                 }
             }
-            ExprKind::Match { scrutinee, arms, .. } => {
-                expr(scrutinee, map);
-                for a in arms {
-                    if let Some(g) = &mut a.guard {
-                        expr(g, map);
-                    }
-                    expr(&mut a.body, map);
-                }
-            }
             _ => crate::check::zonk::for_each_child_mut(e, &mut |x| expr(x, map)),
         }
     }
     for s in &mut b.stmts {
         match &mut s.kind {
-            StmtKind::Bind { pat: q, init, else_ } => {
-                pat(q, map);
-                expr(init, map);
-                if let Some(eb) = else_ {
-                    remap_block(eb, map);
-                }
-            }
-            StmtKind::Assign { place, value, .. } => {
-                expr(place, map);
-                expr(value, map);
-            }
-            StmtKind::Expr(e) => expr(e, map),
-            StmtKind::While { cond, body } => {
-                expr(cond, map);
-                remap_block(body, map);
-            }
-            StmtKind::Loop { body } => remap_block(body, map),
-            StmtKind::ForRange { var, start, end, body, .. } => {
-                id(var, map);
-                expr(start, map);
-                expr(end, map);
-                remap_block(body, map);
-            }
-            StmtKind::ForEach { var, array, body, .. } => {
-                id(var, map);
-                expr(array, map);
-                remap_block(body, map);
-            }
-            StmtKind::ForFields { var, body, .. } => {
-                id(var, map);
-                remap_block(body, map);
-            }
+            StmtKind::Bind { pat: q, .. } => pat(q, map),
+            StmtKind::ForRange { var, .. }
+            | StmtKind::ForEach { var, .. }
+            | StmtKind::ForFields { var, .. } => id(var, map),
+            _ => {}
         }
+        stmt_parts_mut(&mut s.kind, &mut |part| match part {
+            PartMut::Expr(x) => expr(x, map),
+            PartMut::Block(b) => remap_block(b, map),
+        });
     }
     if let Some(t) = &mut b.tail {
         expr(t, map);
+    }
+}
+
+/// Calls `f` on each statement's expressions and blocks in `b`, in order, then on its tail.
+fn block_children<'a>(b: &'a Block, f: &mut impl FnMut(Child<'a>)) {
+    for s in &b.stmts {
+        stmt_children(&s.kind, f);
+    }
+    if let Some(t) = &b.tail {
+        f(Child::Expr(t));
+    }
+}
+
+/// Calls `f` on each expression and block directly in statement `s`, in order.
+fn stmt_children<'a>(s: &'a StmtKind, f: &mut impl FnMut(Child<'a>)) {
+    match s {
+        StmtKind::Bind { init, else_, .. } => {
+            f(Child::Expr(init));
+            if let Some(eb) = else_ {
+                f(Child::Block(eb));
+            }
+        }
+        StmtKind::Assign { place, value, .. } => {
+            f(Child::Expr(place));
+            f(Child::Expr(value));
+        }
+        StmtKind::Expr(e) => f(Child::Expr(e)),
+        StmtKind::While { cond, body } => {
+            f(Child::Expr(cond));
+            f(Child::Block(body));
+        }
+        StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => f(Child::Block(body)),
+        StmtKind::ForRange { start, end, body, .. } => {
+            f(Child::Expr(start));
+            f(Child::Expr(end));
+            f(Child::Block(body));
+        }
+        StmtKind::ForEach { array, body, .. } => {
+            f(Child::Expr(array));
+            f(Child::Block(body));
+        }
+    }
+}
+
+/// [`Child`], to change.
+enum PartMut<'a> {
+    Expr(&'a mut Expr),
+    Block(&'a mut Block),
+}
+
+/// [`stmt_children`], to change.
+fn stmt_parts_mut(s: &mut StmtKind, f: &mut impl FnMut(PartMut)) {
+    match s {
+        StmtKind::Bind { init, else_, .. } => {
+            f(PartMut::Expr(init));
+            if let Some(eb) = else_ {
+                f(PartMut::Block(eb));
+            }
+        }
+        StmtKind::Assign { place, value, .. } => {
+            f(PartMut::Expr(place));
+            f(PartMut::Expr(value));
+        }
+        StmtKind::Expr(e) => f(PartMut::Expr(e)),
+        StmtKind::While { cond, body } => {
+            f(PartMut::Expr(cond));
+            f(PartMut::Block(body));
+        }
+        StmtKind::Loop { body } | StmtKind::ForFields { body, .. } => f(PartMut::Block(body)),
+        StmtKind::ForRange { start, end, body, .. } => {
+            f(PartMut::Expr(start));
+            f(PartMut::Expr(end));
+            f(PartMut::Block(body));
+        }
+        StmtKind::ForEach { array, body, .. } => {
+            f(PartMut::Expr(array));
+            f(PartMut::Block(body));
+        }
     }
 }
 
@@ -938,13 +894,20 @@ impl Builder<'_> {
         self.e(self.locals[l.index()].ty, ExprKind::Local(l))
     }
 
-    fn block(&self, stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
+    /// A block of `stmts`, then `tail`.
+    fn block_of(&self, stmts: Vec<Stmt>, tail: Option<Expr>) -> Block {
         let ty = tail.as_ref().map_or(self.p.types.unit, |t| t.ty);
-        let span = self.span;
-        self.e(
-            ty,
-            ExprKind::Block(Block { stmts, tail: tail.map(Box::new), ty, span, inline: false }),
-        )
+        Block { stmts, tail: tail.map(Box::new), ty, span: self.span, inline: false }
+    }
+
+    fn block(&self, stmts: Vec<Stmt>, tail: Option<Expr>) -> Expr {
+        let b = self.block_of(stmts, tail);
+        self.e(b.ty, ExprKind::Block(b))
+    }
+
+    /// `a op b`, a `bool`: a comparison, or `&&`.
+    fn test(&self, op: BinOp, a: Expr, b: Expr) -> Expr {
+        self.e(self.p.types.bool, ExprKind::Binary(op, Box::new(a), Box::new(b)))
     }
 
     fn stmt(&self, e: Expr) -> Stmt {
@@ -1244,14 +1207,7 @@ impl Builder<'_> {
             Shape::All => {
                 let mut acc = self.e(bool_ty, ExprKind::Lit(Lit::Bool(true)));
                 for (_, call) in calls.into_iter().rev() {
-                    acc = self.e(
-                        bool_ty,
-                        ExprKind::Binary(
-                            wrela_syntax::ast::BinOp::And,
-                            Box::new(call),
-                            Box::new(acc),
-                        ),
-                    );
+                    acc = self.test(BinOp::And, call, acc);
                 }
                 acc
             }
@@ -1260,21 +1216,8 @@ impl Builder<'_> {
                 for (_, call) in calls.into_iter().rev() {
                     let ty = call.ty;
                     let (o, bind) = self.bind("order", call, false);
-                    let decided = self.e(
-                        bool_ty,
-                        ExprKind::Binary(
-                            wrela_syntax::ast::BinOp::Ne,
-                            Box::new(self.var(o)),
-                            Box::new(self.ordering(1)),
-                        ),
-                    );
-                    let then = Block {
-                        stmts: Vec::new(),
-                        tail: Some(Box::new(self.var(o))),
-                        ty,
-                        span: self.span,
-                        inline: false,
-                    };
+                    let decided = self.test(BinOp::Ne, self.var(o), self.ordering(1));
+                    let then = self.block_of(Vec::new(), Some(self.var(o)));
                     let choice = self.e(
                         ty,
                         ExprKind::If { cond: Box::new(decided), then, else_: Some(Box::new(acc)) },
@@ -1339,27 +1282,20 @@ impl Builder<'_> {
                 .collect();
             b.field_call(e, parts)
         };
-        let block = |b: &Self, stmts: Vec<Stmt>| Block {
-            stmts,
-            tail: None,
-            ty: unit,
-            span: b.span,
-            inline: false,
-        };
         let each = |b: &Self, from: Expr, body: Vec<Stmt>| Stmt {
             kind: StmtKind::ForRange {
                 var: i,
                 start: from,
                 end: len.clone(),
                 inclusive: false,
-                body: block(b, body),
+                body: b.block_of(body, None),
             },
             span: b.span,
         };
         // `if cond { return value }`.
         let return_if = |b: &Self, cond: Expr, value: Expr| {
             let ret = b.e(never, ExprKind::Return(Some(Box::new(value))));
-            let then = block(b, vec![b.stmt(ret)]);
+            let then = b.block_of(vec![b.stmt(ret)], None);
             b.stmt(b.e(unit, ExprKind::If { cond: Box::new(cond), then, else_: None }))
         };
         let at_i = self.var(i);
@@ -1377,8 +1313,7 @@ impl Builder<'_> {
             }
             Shape::All => {
                 let call = call_at(self, &at_i);
-                let not =
-                    self.e(bool_ty, ExprKind::Unary(wrela_syntax::ast::UnOp::Not, Box::new(call)));
+                let not = self.e(bool_ty, ExprKind::Unary(UnOp::Not, Box::new(call)));
                 let no = self.e(bool_ty, ExprKind::Lit(Lit::Bool(false)));
                 let check = return_if(self, not, no);
                 let l = each(self, self.u32_lit(0), vec![check]);
@@ -1388,14 +1323,7 @@ impl Builder<'_> {
             Shape::Order => {
                 let call = call_at(self, &at_i);
                 let (o, bind) = self.bind("order", call, false);
-                let decided = self.e(
-                    bool_ty,
-                    ExprKind::Binary(
-                        wrela_syntax::ast::BinOp::Ne,
-                        Box::new(self.var(o)),
-                        Box::new(self.ordering(1)),
-                    ),
-                );
+                let decided = self.test(BinOp::Ne, self.var(o), self.ordering(1));
                 let check = return_if(self, decided, self.var(o));
                 let l = each(self, self.u32_lit(0), vec![bind, check]);
                 let equal = self.ordering(1);
@@ -1404,14 +1332,7 @@ impl Builder<'_> {
             Shape::Build | Shape::TryBuild => {
                 let tries = self.shape.tries();
                 // Empty: zeroed, with no call.
-                let empty = self.e(
-                    bool_ty,
-                    ExprKind::Binary(
-                        wrela_syntax::ast::BinOp::Eq,
-                        Box::new(len.clone()),
-                        Box::new(self.u32_lit(0)),
-                    ),
-                );
+                let empty = self.test(BinOp::Eq, len.clone(), self.u32_lit(0));
                 let zeroed = match self.p.lang_fn(Lang::MemZeroed) {
                     Some(z) => {
                         let callee = Callee::Fn { func: z, args: vec![self.self_ty] };
@@ -1617,23 +1538,9 @@ impl Builder<'_> {
         for (v, (_, fields, names)) in variants.iter().enumerate().rev() {
             let parts = vec![Vec::new(); fields.len()];
             let built = self.combine(Some(v as u32), fields, Some(names), parts);
-            let bool_ty = self.p.types.bool;
-            let test = self.e(
-                bool_ty,
-                ExprKind::Binary(
-                    wrela_syntax::ast::BinOp::Eq,
-                    Box::new(self.var(k)),
-                    Box::new(self.u32_lit(v as u32)),
-                ),
-            );
+            let test = self.test(BinOp::Eq, self.var(k), self.u32_lit(v as u32));
             let ty = built.ty;
-            let then = Block {
-                stmts: Vec::new(),
-                tail: Some(Box::new(built)),
-                ty,
-                span: self.span,
-                inline: false,
-            };
+            let then = self.block_of(Vec::new(), Some(built));
             acc =
                 self.e(ty, ExprKind::If { cond: Box::new(test), then, else_: Some(Box::new(acc)) });
         }

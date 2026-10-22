@@ -88,8 +88,26 @@ pub fn run(args: &[String]) -> ExitCode {
 /// `text` formatted, or `None` when it has syntax errors. Call it on a thread with the
 /// compiler's stack, as [`run`] does.
 pub(crate) fn format_text(text: &str) -> Option<String> {
+    parse_and_format(text).ok()
+}
+
+/// `text` formatted, or its syntax errors rendered as in the file `name`. Call it on a thread
+/// with the compiler's stack, as [`run`] does.
+pub(crate) fn formatted(name: &str, text: &str) -> Result<String, String> {
+    parse_and_format(text).map_err(|diagnostics| {
+        let mut map = SourceMap::new();
+        map.add(name, text);
+        wrela_diag::render::render_all(&map, &diagnostics)
+    })
+}
+
+/// `text` formatted, or its diagnostics when it has syntax errors.
+fn parse_and_format(text: &str) -> Result<String, Vec<wrela_diag::Diagnostic>> {
     let parsed = wrela_syntax::parse(FileId(0), text);
-    (!parsed.has_errors()).then(|| wrela_syntax::fmt::format(&parsed, text))
+    if parsed.has_errors() {
+        return Err(parsed.diagnostics);
+    }
+    Ok(wrela_syntax::fmt::format(&parsed, text))
 }
 
 fn format_files(args: &[String]) -> ExitCode {
@@ -130,16 +148,15 @@ fn format_files(args: &[String]) -> ExitCode {
                 continue;
             }
         };
-        let parsed = wrela_syntax::parse(FileId(0), &text);
-        if parsed.has_errors() {
-            let mut map = SourceMap::new();
-            map.add(f.display().to_string(), text);
-            eprint!("{}", wrela_diag::render::render_all(&map, &parsed.diagnostics));
-            eprintln!("`{}` has syntax errors, so it wasn't formatted", f.display());
-            failed = true;
-            continue;
-        }
-        let formatted = wrela_syntax::fmt::format(&parsed, &text);
+        let formatted = match formatted(&f.display().to_string(), &text) {
+            Ok(formatted) => formatted,
+            Err(rendered) => {
+                eprint!("{rendered}");
+                eprintln!("`{}` has syntax errors, so it wasn't formatted", f.display());
+                failed = true;
+                continue;
+            }
+        };
         if formatted == text {
             continue;
         }

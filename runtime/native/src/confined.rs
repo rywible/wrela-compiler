@@ -1,9 +1,9 @@
 //! Files and directories reached through a directory handle one part at a time, without
 //! following a symbolic link anywhere on the way (`openat` with `O_NOFOLLOW`): what the tool
 //! host reads and writes in a root, and what a driven build fetches from its build (language.md
-//! §15.5), and what it stores. A link in place of a part, put there before or after a check, is refused, so nothing
-//! leaves the handle's directory, and nothing inside it is reached by a link's other name. A file
-//! is opened without waiting (`O_NONBLOCK`) and must be a regular file.
+//! §15.5), and what it stores. A link in place of a part, put there before or after a check, is
+//! refused, so nothing leaves the handle's directory, and nothing inside it is reached by a
+//! link's other name. A file is opened without waiting (`O_NONBLOCK`) and must be a regular file.
 
 use cap_std::fs::Dir;
 use std::io::Read;
@@ -37,11 +37,7 @@ mod unix {
         let mut at = dir.try_clone()?;
         for part in parts {
             if create {
-                match rustix::fs::mkdirat(&at, *part, Mode::from_raw_mode(0o777)) {
-                    Ok(()) => {}
-                    Err(e) if e == rustix::io::Errno::EXIST => {}
-                    Err(e) => return Err(e.into()),
-                }
+                make_dir(&at, part)?;
             }
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let fd = rustix::fs::openat(&at, *part, flags, Mode::empty())?;

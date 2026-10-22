@@ -16,19 +16,13 @@ use wrela_host::tool::{BlobBudget, Caps, End, Ended, Grants, Options, Signal, Te
 
 /// A scratch directory of its own.
 pub(crate) fn scratch(name: &str) -> PathBuf {
-    let dir = wrela_tests::scratch_root(env!("CARGO_TARGET_TMPDIR")).join(format!("tool-{name}"));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("a scratch directory");
-    dir
+    super::scratch(&format!("tool-{name}"))
 }
 
 /// The tool build of a package whose `main.wrela` is `main`.
 pub(crate) fn tool_build(name: &str, main: &str) -> ToolBuild {
     let dir = scratch(&format!("{name}-package"));
-    let ident = name.replace('-', "_");
-    std::fs::write(dir.join("wrela.toml"), format!("[package]\nname = \"{ident}\"\n"))
-        .expect("write the manifest");
-    std::fs::write(dir.join("main.wrela"), main).expect("write main");
+    super::write_package(&dir, &name.replace('-', "_"), main);
     let built = wrela_driver::build(&dir);
     assert!(
         !built.has_errors(),

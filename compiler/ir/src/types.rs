@@ -257,6 +257,16 @@ impl Types {
         }
     }
 
+    /// How many elements a dynamic index into a value of type `t` can reach: an array's length,
+    /// a vector's components or a matrix's columns. `None` for other types.
+    pub fn index_len(&self, t: TypeId) -> Option<u32> {
+        match self.get(t) {
+            TypeDef::Array(_, n) => Some(*n),
+            TypeDef::Vector(_, n) | TypeDef::Matrix(n, _) => Some(u32::from(*n)),
+            _ => None,
+        }
+    }
+
     pub fn is_vector(&self, t: TypeId) -> bool {
         matches!(self.get(t), TypeDef::Vector(..))
     }

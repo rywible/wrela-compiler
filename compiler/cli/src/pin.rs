@@ -188,7 +188,7 @@ pub fn install(version: &str, base: &str, root: &Path) -> Result<PathBuf, String
         })
         .ok_or_else(|| format!("the release {version}'s SHA256SUMS has no line for {name}"))?;
     let tarball = fetch(&format!("{at}/{name}"), version)?;
-    let got = sha256(&tarball);
+    let got = crate::sha256_hex(&tarball);
     if got != want {
         return Err(format!(
             "the download of {name} doesn't match the release's SHA256SUMS (it is {got}, the \
@@ -244,12 +244,6 @@ fn fetch(url: &str, version: &str) -> Result<Vec<u8>, String> {
         .limit(MOST)
         .read_to_vec()
         .map_err(|e| format!("can't download {url}: {e}"))
-}
-
-/// `bytes`' SHA-256, in lowercase hexadecimal.
-fn sha256(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Unpacks the gzipped tarball `bytes` into `dir`, which it makes. An entry that would land

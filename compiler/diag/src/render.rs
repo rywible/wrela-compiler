@@ -58,14 +58,11 @@ pub fn render(map: &SourceMap, d: &Diagnostic) -> String {
                 .map(|c| if c == '\t' { 4 } else { 1 })
                 .sum();
             let marks = mark.repeat(wide.max(1));
-            match &label.message {
-                Some(m) => {
-                    let _ = writeln!(out, "{pad} | {prefix}{marks} {m}");
-                }
-                None => {
-                    let _ = writeln!(out, "{pad} | {prefix}{marks}");
-                }
+            let _ = write!(out, "{pad} | {prefix}{marks}");
+            if let Some(m) = &label.message {
+                let _ = write!(out, " {m}");
             }
+            out.push('\n');
         }
     }
     for label in d.secondary.iter().filter(|l| l.span.file != primary.span.file) {

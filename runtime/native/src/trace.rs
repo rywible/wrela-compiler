@@ -83,7 +83,7 @@ impl Trace {
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
-        self.0.lock().unwrap_or_else(|p| p.into_inner())
+        crate::locked(&self.0)
     }
 
     /// A line the program printed: shown now, unless quiet, and kept.

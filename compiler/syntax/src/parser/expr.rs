@@ -263,25 +263,30 @@ impl<'a> Parser<'a> {
             _ => {
                 // An expression, or an assignment whose target is a postfix expression.
                 let e = self.parse_expr()?;
-                if let Some(op) = AssignOp::from_token(self.kind()) {
-                    if !is_postfix_shaped(&e) {
-                        let t = self.tok();
-                        self.error(Diagnostic::new(
-                            codes::E0100,
-                            t.span,
-                            "only a name, a field, an element or a call result can be assigned to",
-                        ));
-                        return Err(Failed);
-                    }
-                    self.bump();
-                    let value = self.parse_expr()?;
-                    StmtKind::Assign { target: e, op, value }
-                } else {
-                    StmtKind::Expr(e)
+                match self.opt_assign(&e)? {
+                    Some((op, value)) => StmtKind::Assign { target: e, op, value },
+                    None => StmtKind::Expr(e),
                 }
             }
         };
         Ok(Stmt { kind, span: start.to(self.prev_span()) })
+    }
+
+    /// `assign_op expr` after `target`, if an assignment operator is next: an error unless
+    /// `target` is a postfix expression, as the grammar's assignment target is.
+    fn opt_assign(&mut self, target: &Expr) -> PResult<Option<(AssignOp, Expr)>> {
+        let Some(op) = AssignOp::from_token(self.kind()) else { return Ok(None) };
+        if !is_postfix_shaped(target) {
+            let t = self.tok();
+            self.error(Diagnostic::new(
+                codes::E0100,
+                t.span,
+                "only a name, a field, an element or a call result can be assigned to",
+            ));
+            return Err(Failed);
+        }
+        self.bump();
+        Ok(Some((op, self.parse_expr()?)))
     }
 
     fn expect_bind_eq(&mut self) -> PResult<()> {
@@ -1247,18 +1252,7 @@ impl<'a> Parser<'a> {
                 self.expect(T::FatArrow, "`=>`")?;
                 // arm ::= ... "=>" (expr | postfix_expr assign_op expr)
                 let mut body = self.parse_expr()?;
-                if let Some(op) = AssignOp::from_token(self.kind()) {
-                    if !is_postfix_shaped(&body) {
-                        let t = self.tok();
-                        self.error(Diagnostic::new(
-                            codes::E0100,
-                            t.span,
-                            "only a name, a field, an element or a call result can be assigned to",
-                        ));
-                        return Err(Failed);
-                    }
-                    self.bump();
-                    let value = self.parse_expr()?;
+                if let Some((op, value)) = self.opt_assign(&body)? {
                     let span = body.span.to(value.span);
                     body = Expr::new(
                         ExprKind::Assign { target: Box::new(body), op, value: Box::new(value) },

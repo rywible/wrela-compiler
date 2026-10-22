@@ -118,101 +118,6 @@ fn chunks(size: u32, simd: bool) -> impl Iterator<Item = (u32, Width)> + Clone {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn codegen_perf_copy_chunks_cover_every_byte_in_order() {
-        for simd in [false, true] {
-            for size in 0..=INLINE_ZERO_BYTES {
-                let mut end = 0;
-                let mut widths = Vec::new();
-                let mut parts = chunks(size, simd);
-                let first = parts.next().map(|(off, w)| (off, w.log2()));
-                let tail: Vec<_> = parts.clone().map(|(off, w)| (off, w.log2())).collect();
-                assert_eq!(parts.map(|(off, w)| (off, w.log2())).collect::<Vec<_>>(), tail);
-                for (off, log2) in first.into_iter().chain(tail) {
-                    assert_eq!(off, end);
-                    let max_log2 = if simd { 4 } else { 3 };
-                    let expected = (0..=max_log2).rev().find(|&w| 1 << w <= size - end).unwrap();
-                    assert_eq!(log2, expected);
-                    end += 1 << log2;
-                    widths.push(log2);
-                }
-                assert_eq!(end, size);
-                if size <= INLINE_BYTES {
-                    assert!(widths.len() <= (INLINE_BYTES / 8 + 3) as usize);
-                }
-            }
-        }
-    }
-
-    /// Nested uses keep a value alive through its enclosing statement, including both
-    /// branches and a loop's continuing block. Value IDs need not follow statement order,
-    /// and the optimizer can leave unused IDs behind.
-    #[test]
-    fn releases_follow_defining_scopes() {
-        use ir::{BinOp, Const, Expr, Stmt, ValueId as V};
-        let mut m = ir::Module::default();
-        let (float, boolean) = (m.types.f32(), m.types.bool());
-        let mut f = ir::Function::new("scopes", Vec::new(), Some(float));
-        for id in 0..11 {
-            f.new_value(if id == 9 { boolean } else { float });
-        }
-        let add = |out, a, b| Stmt::Let(V(out), Expr::Binary(BinOp::Add, V(a), V(b)));
-        f.body = vec![
-            Stmt::Let(V(10), Expr::Const(Const::F32(2.0))),
-            Stmt::Let(V(7), Expr::Const(Const::F32(1.0))),
-            Stmt::Let(V(9), Expr::Const(Const::Bool(true))),
-            add(3, 7, 7),
-            Stmt::If {
-                cond: V(9),
-                then: vec![
-                    Stmt::Let(V(5), Expr::Const(Const::F32(3.0))),
-                    Stmt::Loop {
-                        body: vec![
-                            add(1, 7, 5),
-                            Stmt::If {
-                                cond: V(9),
-                                then: vec![add(0, 1, 10)],
-                                else_: vec![add(6, 1, 5)],
-                            },
-                            Stmt::Break,
-                        ],
-                        continuing: vec![add(2, 7, 5)],
-                    },
-                ],
-                else_: vec![add(4, 7, 7)],
-            },
-            Stmt::Return(Some(V(7))),
-        ];
-        m.add_function(f);
-        ir::verify(&m).expect("valid IR");
-        let f = &m.functions[0];
-        let Stmt::If { then, else_, .. } = &f.body[4] else { unreachable!() };
-        let Stmt::Loop { body, continuing } = &then[1] else { unreachable!() };
-        let Stmt::If { then: inner_then, else_: inner_else, .. } = &body[1] else { unreachable!() };
-        let expected: HashMap<_, _> = [
-            (&f.body[3], vec![V(3)]),
-            (&f.body[4], vec![V(9), V(10)]),
-            (&f.body[5], vec![V(7)]),
-            (&then[1], vec![V(5)]),
-            (&body[1], vec![V(1)]),
-            (&inner_then[0], vec![V(0)]),
-            (&inner_else[0], vec![V(6)]),
-            (&continuing[0], vec![V(2)]),
-            (&else_[0], vec![V(4)]),
-        ]
-        .into_iter()
-        .map(|(s, values)| (std::ptr::from_ref(s), values))
-        .collect();
-        let mut actual = HashMap::new();
-        releases(f, &mut actual);
-        assert_eq!(actual, expected);
-    }
-}
-
 /// Zero, of WASM type `t`.
 fn zero(t: ValType) -> I<'static> {
     match t {
@@ -969,30 +874,18 @@ impl<'m> Fe<'m> {
             }
             (&ir::TypeDef::Vector(s, n), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, n as u32);
-                let size = s.bytes() as i32;
-                self.ins.extend([I::LocalGet(self.v(*i)), I::I32Const(size), I::I32Mul, I::I32Add]);
+                self.add_index(*i, s.bytes());
             }
             (ir::TypeDef::Matrix(c, r), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, *c as u32);
-                self.ins.extend([
-                    I::LocalGet(self.v(*i)),
-                    I::I32Const(column_stride(*r) as i32),
-                    I::I32Mul,
-                    I::I32Add,
-                ]);
+                self.add_index(*i, column_stride(*r));
             }
             (ir::TypeDef::Array(e, n), ir::Proj::Index(i)) => {
                 self.bounds_check(*i, *n);
-                self.ins.extend([
-                    I::LocalGet(self.v(*i)),
-                    I::I32Const(array_stride(&self.m.types, *e) as i32),
-                    I::I32Mul,
-                    I::I32Add,
-                ]);
+                self.add_index(*i, array_stride(&self.m.types, *e));
             }
             (ir::TypeDef::Run(e), ir::Proj::Index(i)) => {
                 // The run is {ptr, len}: check the index against len, then ptr + i * stride.
-                let stride = array_stride(&self.m.types, *e);
                 let base = self.new_local(ValType::I32);
                 self.ins.push(I::LocalSet(base));
                 self.ins.extend([
@@ -1002,18 +895,17 @@ impl<'m> Fe<'m> {
                     I::I32GeU,
                 ]);
                 self.trap_if();
-                self.ins.extend([
-                    I::LocalGet(base),
-                    I::I32Load(mem(0, 2)),
-                    I::LocalGet(self.v(*i)),
-                    I::I32Const(stride as i32),
-                    I::I32Mul,
-                    I::I32Add,
-                ]);
+                self.ins.extend([I::LocalGet(base), I::I32Load(mem(0, 2))]);
+                self.add_index(*i, array_stride(&self.m.types, *e));
             }
             (d, p) => return Err(format!("internal: projection {p:?} of {d:?}")),
         }
         self.m.proj_ty(t, proj).ok_or_else(|| format!("internal: projection {proj:?} has no type"))
+    }
+
+    /// Adds `i * stride` to the address on top of the stack.
+    fn add_index(&mut self, i: ir::ValueId, stride: u32) {
+        self.ins.extend([I::LocalGet(self.v(i)), I::I32Const(stride as i32), I::I32Mul, I::I32Add]);
     }
 
     fn bounds_check(&mut self, i: ir::ValueId, n: u32) {
@@ -1839,7 +1731,6 @@ pub(crate) fn export_wrapper(
     f: ir::FuncId,
     index: u32,
     h: &Helpers,
-    stack_top: u32,
     simd: bool,
 ) -> R<(Vec<ValType>, Vec<ValType>, Function)> {
     let func = &m.functions[f.index()];
@@ -1908,7 +1799,7 @@ pub(crate) fn export_wrapper(
     // do): the shadow stack empty, and the batch the trap left unsubmitted dropped. The
     // resources it made, the host never saw, so their handles are made again.
     let mut ins: Vec<I<'static>> = vec![
-        I::I32Const(stack_top as i32),
+        I::I32Const(memory::STACK_TOP as i32),
         I::GlobalSet(globals::SP),
         I::I32Const(0),
         I::GlobalSet(globals::DEPTH),
@@ -1985,4 +1876,99 @@ pub(crate) fn export_wrapper(
     }
     ins.push(I::End);
     Ok((params, results, function(locals, &ins)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codegen_perf_copy_chunks_cover_every_byte_in_order() {
+        for simd in [false, true] {
+            for size in 0..=INLINE_ZERO_BYTES {
+                let mut end = 0;
+                let mut widths = Vec::new();
+                let mut parts = chunks(size, simd);
+                let first = parts.next().map(|(off, w)| (off, w.log2()));
+                let tail: Vec<_> = parts.clone().map(|(off, w)| (off, w.log2())).collect();
+                assert_eq!(parts.map(|(off, w)| (off, w.log2())).collect::<Vec<_>>(), tail);
+                for (off, log2) in first.into_iter().chain(tail) {
+                    assert_eq!(off, end);
+                    let max_log2 = if simd { 4 } else { 3 };
+                    let expected = (0..=max_log2).rev().find(|&w| 1 << w <= size - end).unwrap();
+                    assert_eq!(log2, expected);
+                    end += 1 << log2;
+                    widths.push(log2);
+                }
+                assert_eq!(end, size);
+                if size <= INLINE_BYTES {
+                    assert!(widths.len() <= (INLINE_BYTES / 8 + 3) as usize);
+                }
+            }
+        }
+    }
+
+    /// Nested uses keep a value alive through its enclosing statement, including both
+    /// branches and a loop's continuing block. Value IDs need not follow statement order,
+    /// and the optimizer can leave unused IDs behind.
+    #[test]
+    fn releases_follow_defining_scopes() {
+        use ir::{BinOp, Const, Expr, Stmt, ValueId as V};
+        let mut m = ir::Module::default();
+        let (float, boolean) = (m.types.f32(), m.types.bool());
+        let mut f = ir::Function::new("scopes", Vec::new(), Some(float));
+        for id in 0..11 {
+            f.new_value(if id == 9 { boolean } else { float });
+        }
+        let add = |out, a, b| Stmt::Let(V(out), Expr::Binary(BinOp::Add, V(a), V(b)));
+        f.body = vec![
+            Stmt::Let(V(10), Expr::Const(Const::F32(2.0))),
+            Stmt::Let(V(7), Expr::Const(Const::F32(1.0))),
+            Stmt::Let(V(9), Expr::Const(Const::Bool(true))),
+            add(3, 7, 7),
+            Stmt::If {
+                cond: V(9),
+                then: vec![
+                    Stmt::Let(V(5), Expr::Const(Const::F32(3.0))),
+                    Stmt::Loop {
+                        body: vec![
+                            add(1, 7, 5),
+                            Stmt::If {
+                                cond: V(9),
+                                then: vec![add(0, 1, 10)],
+                                else_: vec![add(6, 1, 5)],
+                            },
+                            Stmt::Break,
+                        ],
+                        continuing: vec![add(2, 7, 5)],
+                    },
+                ],
+                else_: vec![add(4, 7, 7)],
+            },
+            Stmt::Return(Some(V(7))),
+        ];
+        m.add_function(f);
+        ir::verify(&m).expect("valid IR");
+        let f = &m.functions[0];
+        let Stmt::If { then, else_, .. } = &f.body[4] else { unreachable!() };
+        let Stmt::Loop { body, continuing } = &then[1] else { unreachable!() };
+        let Stmt::If { then: inner_then, else_: inner_else, .. } = &body[1] else { unreachable!() };
+        let expected: HashMap<_, _> = [
+            (&f.body[3], vec![V(3)]),
+            (&f.body[4], vec![V(9), V(10)]),
+            (&f.body[5], vec![V(7)]),
+            (&then[1], vec![V(5)]),
+            (&body[1], vec![V(1)]),
+            (&inner_then[0], vec![V(0)]),
+            (&inner_else[0], vec![V(6)]),
+            (&continuing[0], vec![V(2)]),
+            (&else_[0], vec![V(4)]),
+        ]
+        .into_iter()
+        .map(|(s, values)| (std::ptr::from_ref(s), values))
+        .collect();
+        let mut actual = HashMap::new();
+        releases(f, &mut actual);
+        assert_eq!(actual, expected);
+    }
 }

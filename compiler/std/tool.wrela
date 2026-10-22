@@ -200,15 +200,7 @@ impl Answer for String {
 impl Answer for Vec<String> {
     fn read(bytes: take Vec<u8>) -> Result<Vec<String>, ToolError> {
         var r = Reader::new(take bytes)
-        let Ok(n) = r.read_u32() else { return Err(malformed("texts")) }
-        if n > r.left() {
-            return Err(malformed("texts"))
-        }
-        var out: Vec<String> = Vec::with_capacity(n)
-        for _ in 0..n {
-            let Ok(t) = r.read_string() else { return Err(malformed("texts")) }
-            out.push(take t)
-        }
+        let Some(out) = read_strings(mut r) else { return Err(malformed("texts")) }
         if !r.at_end() {
             return Err(malformed("texts"))
         }
@@ -257,18 +249,33 @@ impl Answer for u64 {
     }
 }
 
+/// A count, then as many items, each read by `item`: `None` if one doesn't read, or the count
+/// is past the bytes left (each item takes at least a byte).
+pub(package) fn read_list<T>(r: mut Reader, item: fn(mut Reader) -> Option<T>) -> Option<Vec<T>> {
+    let n = r.read_u32().ok()?
+    if n > r.left() {
+        return None
+    }
+    var out: Vec<T> = Vec::with_capacity(n)
+    for _ in 0..n {
+        out.push(item(mut r)?)
+    }
+    Some(out)
+}
+
+/// A count of texts, then each (`read_list`).
+pub(package) fn read_strings(r: mut Reader) -> Option<Vec<String>> {
+    read_list(mut r, |r| r.read_string().ok())
+}
+
 /// A tool service's answer, read: the bytes after its first, or the reason it gives for its
 /// failure.
 pub(package) fn answer(bytes: take Vec<u8>) -> Result<Vec<u8>, ToolError> {
-    let bytes = take bytes
-    if bytes.len() == 0 {
+    var rest = take bytes
+    if rest.is_empty() {
         return Err(ToolError { message: String::from("the host's answer is empty") })
     }
-    var rest: Vec<u8> = Vec::with_capacity(bytes.len() - 1)
-    for i in 1..bytes.len() {
-        rest.push(bytes[i])
-    }
-    if bytes[0] == 0 {
+    if rest.remove(0) == 0 {
         return Ok(rest)
     }
     match String::from_utf8(take rest) {
@@ -279,7 +286,7 @@ pub(package) fn answer(bytes: take Vec<u8>) -> Result<Vec<u8>, ToolError> {
 
 /// A `ToolError` for an answer that doesn't read as `what`, the value a service gives.
 pub(package) fn malformed(what: str) -> ToolError {
-    ToolError { message: String::from(f"the host's answer doesn't read as {what}") }
+    ToolError { message: f"the host's answer doesn't read as {what}" }
 }
 
 /// The most bytes of data one tool request carries or one answer gives: whole files, and a
@@ -350,27 +357,19 @@ pub fn spawn<I, O, F: fn(take I) -> O>(input: take I, f: F) -> Task<O> {
 pub fn all<I, O, F: Copy + fn(take I) -> O>(inputs: take Vec<I>, f: F) -> Vec<O> {
     var rest = take inputs
     let n = rest.len()
-    // Spawned in the inputs' order, so the helpers start from the first.
-    var backwards: Vec<I> = Vec::with_capacity(max(n, 1))
-    loop {
-        let Some(x) = rest.pop() else { break }
-        backwards.push(take x)
+    // Spawned in the inputs' order, so the helpers start from the first: reversed, then popped.
+    for i in 0..n / 2 {
+        rest.swap(i, n - 1 - i)
     }
     var tasks: Vec<Task<O>> = Vec::with_capacity(max(n, 1))
     loop {
-        let Some(x) = backwards.pop() else { break }
+        let Some(x) = rest.pop() else { break }
         tasks.push(spawn(take x, f))
     }
     // Joined in the inputs' order too: with no helpers, each runs in turn, from the first.
-    var last_first: Vec<Task<O>> = Vec::with_capacity(max(n, 1))
-    loop {
-        let Some(t) = tasks.pop() else { break }
-        last_first.push(take t)
-    }
     var out: Vec<O> = Vec::with_capacity(max(n, 1))
-    loop {
-        let Some(t) = last_first.pop() else { break }
-        out.push(take t.join())
+    for mut t in tasks {
+        out.push(t.finish())
     }
     out
 }

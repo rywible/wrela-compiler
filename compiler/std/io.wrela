@@ -210,13 +210,12 @@ pub fn ship(dir: str, files: take Vec<(String, Vec<u8>)>) -> Shipped {
     var names: Vec<String> = Vec::new()
     var sizes: Vec<u32> = Vec::new()
     var bytes: Vec<Vec<u8>> = Vec::new()
-    var rest = take files
-    while !rest.is_empty() {
-        let (name, b) = rest.remove(0)
+    var all = take files
+    for mut (name, b) in all {
         check_name("ship", name.as_str())
         sizes.push(b.len())
-        names.push(take name)
-        bytes.push(take b)
+        names.push(replace(mut name, String::new()))
+        bytes.push(replace(mut b, Vec::new()))
     }
     Shipped { dir: String::from(dir), names, sizes, bytes }
 }

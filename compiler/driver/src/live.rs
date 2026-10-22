@@ -60,7 +60,7 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
             }
             let Ok(kind) = e.file_type() else { continue };
             if kind.is_dir() {
-                if !(top && ["build", "results", "target"].contains(&name.as_str())) {
+                if !(top && wrela_sema::OUTPUT_DIRS.contains(&name.as_str())) {
                     walk(&path, false, before, out);
                 }
             } else if name.ends_with(".wrela") || name == "wrela.toml" {
@@ -395,7 +395,7 @@ pub fn serve(
             std::thread::sleep(SCAN);
             let Some(change) = watcher.poll() else { continue };
             let seen = Instant::now();
-            let json = match &change {
+            let mut json = match &change {
                 Change::Literals(values) => {
                     if !quiet {
                         println!("{} literal(s) changed", values.len());
@@ -420,7 +420,6 @@ pub fn serve(
             if let Change::Built { version, .. } = change {
                 s.version = version;
             }
-            let mut json = json;
             json["seq"] = (s.events.len() as u64 + 1).into();
             s.events.push(Event { json, seen, saved: watcher.saved });
             watching.changed.notify_all();
@@ -451,12 +450,12 @@ fn check_output_path(pkg: &Path, out: &Path) -> Result<(), String> {
         .map_err(|e| format!("can't use {}: {e}", out.display()))
 }
 
-/// What `/` and a build's `index.html` get: the mark that tells the runtime the page is live.
-/// What marks a served page as live: the changes it already holds (the newest build's, and the
-/// literals before it), after which it asks for more, and the build's directory, which its
-/// files are fetched from. A page opened after hot reloads starts from the newest build, not from
-/// the server's first change (playing spike 17: it replayed old builds' changes and asked for a
-/// build the server had deleted, `/2/manifest.json`, 404).
+/// What `/` and a build's `index.html` get, which marks a served page as live: the changes it
+/// already holds (the newest build's, and the literals before it), after which it asks for more,
+/// and the build's directory, which its files are fetched from. A page opened after hot reloads
+/// starts from the newest build, not from the server's first change (playing spike 17: it
+/// replayed old builds' changes and asked for a build the server had deleted,
+/// `/2/manifest.json`, 404).
 fn mark(seq: u64, version: u64) -> String {
     format!(r#"<meta name="wrela-live" content="{seq}"><base href="/{version}/">"#)
 }
@@ -549,21 +548,22 @@ fn handle(
                 // not literal-only edits made since. A newly opened page must replay those.
                 (version, s.built_at(version))
             };
-            let (dir, rel, version, seq) = match trimmed.split_once('/') {
+            let built =
+                trimmed.split_once('/').and_then(|(v, rest)| Some((v.parse::<u64>().ok()?, rest)));
+            let (dir, rel, version, seq) = match built {
                 // The runtime's own scripts are the same in every build, and a page's threads
                 // start from the script its render worker came from: a build the server has
                 // since deleted (it keeps two) still gives them, from the newest. (A page open
                 // through three hot reloads stopped: its next ticker's script was gone.)
-                Some((v, rest)) if v.parse::<u64>().is_ok() && RUNTIME_SCRIPTS.contains(&rest) => {
+                Some((_, rest)) if RUNTIME_SCRIPTS.contains(&rest) => {
                     (state.out.join(version.to_string()), rest, version, seq)
                 }
-                Some((v, rest)) if v.parse::<u64>().is_ok() => {
-                    let v: u64 = v.parse().unwrap_or(0);
+                Some((v, rest)) => {
                     // The change that made build `v`, or none (the first build).
                     let made = state.live.lock().expect("the state").built_at(v);
                     (state.out.join(v.to_string()), rest, v, made)
                 }
-                _ => (state.out.join(version.to_string()), trimmed, version, seq),
+                None => (state.out.join(version.to_string()), trimmed, version, seq),
             };
             let rel = if rel.is_empty() { "index.html" } else { rel };
             http::get_file(&mut out, &dir, rel, |html| {

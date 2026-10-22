@@ -142,12 +142,18 @@ impl Journal {
         out
     }
 
-    /// Appends `records` and flushes them to disk.
-    fn append(&mut self, records: &[Vec<u8>]) -> std::io::Result<()> {
-        if self.fault == Some(Fault::Append) {
+    /// Fails, once, if a test injected `fault`.
+    fn injected(&mut self, fault: Fault) -> std::io::Result<()> {
+        if self.fault == Some(fault) {
             self.fault = None;
             return Err(std::io::Error::other("an injected fault"));
         }
+        Ok(())
+    }
+
+    /// Appends `records` and flushes them to disk.
+    fn append(&mut self, records: &[Vec<u8>]) -> std::io::Result<()> {
+        self.injected(Fault::Append)?;
         let file = match &mut self.file {
             Some(file) => file,
             None => {
@@ -170,15 +176,9 @@ impl Journal {
         let mut bytes = self.header.clone();
         bytes.extend_from_slice(&Journal::framed(records));
         write_synced(&tmp, &bytes)?;
-        if self.fault == Some(Fault::Compact) {
-            self.fault = None;
-            return Err(std::io::Error::other("an injected fault"));
-        }
+        self.injected(Fault::Compact)?;
         std::fs::rename(&tmp, &self.path)?;
-        if self.fault == Some(Fault::AfterRename) {
-            self.fault = None;
-            return Err(std::io::Error::other("an injected fault"));
-        }
+        self.injected(Fault::AfterRename)?;
         sync_dir(&self.path)?;
         self.file = Some(std::fs::OpenOptions::new().append(true).open(&self.path)?);
         Ok(())
@@ -382,6 +382,11 @@ impl RoomHost {
     fn quarantine(&mut self, why: String) {
         self.room = None;
         self.status = Status::Quarantined(why);
+        self.close_all();
+    }
+
+    /// What waits for it goes, and its connections close.
+    fn close_all(&mut self) {
         self.incoming.clear();
         for (c, _) in self.conns.drain(..) {
             self.outbox.push(Out::Close(c));
@@ -403,17 +408,13 @@ impl RoomHost {
         if self.failures >= RETRIES {
             // It can't get through what's waiting: its peers go, and come back later.
             self.failures = 0;
-            self.incoming.clear();
-            for (c, _) in self.conns.drain(..) {
-                self.outbox.push(Out::Close(c));
-            }
+            self.close_all();
             self.status = Status::Unavailable(0);
         } else {
             self.status = Status::Unavailable(self.failures);
         }
     }
 
-    /// Connection `conn` opened.
     /// Connection `conn` opened: a quarantined room closes it.
     pub fn connect(&mut self, conn: u32) {
         assert!(conn != JOURNAL && conn < POISONED, "connection {conn} is reserved");
@@ -550,10 +551,7 @@ impl RoomHost {
             // from what was kept: they send what wasn't settled again.
             self.room = None;
             self.status = Status::Unavailable(0);
-            self.incoming.clear();
-            for (c, _) in self.conns.drain(..) {
-                self.outbox.push(Out::Close(c));
-            }
+            self.close_all();
             return Err(host(format!("the journal: {e}")));
         }
         for (conn, tag) in tags {

@@ -103,7 +103,7 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
                 None => Some(None),
             };
             if let (Some(x), Some(with)) = (x, with) {
-                params.push(ir::Param { name: "x".into(), ty: x, by_ref: false, mutable: false });
+                params.push(ir::Param::value("x", x));
                 let tuple = ir::derive::value_gradient_ty(&mut mb.m.types, x, with);
                 return ir::Function::new("value_and_gradient", params, Some(tuple));
             }
@@ -112,26 +112,16 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
         DeriveKind::Filtered => {
             let f32 = mb.m.types.f32();
             if let Some(x) = x {
-                params.push(ir::Param { name: "x".into(), ty: x, by_ref: false, mutable: false });
-                params.push(ir::Param {
-                    name: "width".into(),
-                    ty: x,
-                    by_ref: false,
-                    mutable: false,
-                });
+                params.push(ir::Param::value("x", x));
+                params.push(ir::Param::value("width", x));
             }
             ir::Function::new("filtered", params, Some(f32))
         }
+        // `input` is the literals' array type.
         DeriveKind::Literals => {
-            let w = cx.lower_ty(mb, *input, span);
             let r = output.and_then(|o| cx.lower_ty(mb, o, span));
-            if let Some(w) = w {
-                params.push(ir::Param {
-                    name: "which".into(),
-                    ty: w,
-                    by_ref: false,
-                    mutable: false,
-                });
+            if let Some(w) = x {
+                params.push(ir::Param::value("which", w));
             }
             ir::Function::new("literal_gradient", params, r)
         }
@@ -153,12 +143,7 @@ pub(crate) fn signature(cx: &mut Cx, mb: &mut ModuleBuilder, key: &InstanceKey) 
             let bt = box_ty.and_then(|b| cx.lower_ty(mb, b, span));
             let it = interval.and_then(|i| cx.lower_ty(mb, i, span));
             if let Some(bt) = bt {
-                params.push(ir::Param {
-                    name: "over".into(),
-                    ty: bt,
-                    by_ref: false,
-                    mutable: false,
-                });
+                params.push(ir::Param::value("over", bt));
             }
             ir::Function::new("interval", params, it)
         }
@@ -352,10 +337,9 @@ fn build(
                 _ => Err(ir::Error::internal("a parameter gradient's signature is incomplete")),
             }
         }
-        // The captures are every parameter but the last, the input.
         DeriveKind::ValueAndGradient => {
             // The captures are every parameter but the last, the input; a signature without
-            // one (which `derived_signature` couldn't make) has no derivation.
+            // one (which `signature` couldn't make) has no derivation.
             match (mb.m.functions[id.index()].params.len() as u32).checked_sub(1) {
                 Some(ncap) => ir::derive::value_and_gradient(
                     &mut mb.m,
