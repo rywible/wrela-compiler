@@ -616,6 +616,21 @@ Checked and stopped, because real code does not have the case:
   for releases, so native runs already skip `wasm-opt`. Choosing a browser level needs a V8
   measurement.
 
+Three codegen settings were then measured on `rywible/wrela`'s `examples/clearing` (108dc7ae).
+Each run used `wrela profile --compare` with 3 alternating pairs of 30 warmup and 60 measured
+frames, at 1280×720 on the AMD Lucienne iGPU, with experimental switches that were not kept:
+
+- **GPU cleanup run to a fixed point.** It cut shader statements by 2–10%, but no label's GPU
+  time moved (all within ±0.5%, inconclusive). The driver's shader compiler already does this
+  work. Rejected.
+- **No GPU unrolling.** `look` was 8.3% slower and nothing else changed measurably, so the
+  current policy (at most 16 passes and 2,000 statements) stays.
+- **CPU inline limit 125 instead of 250.** `clearing`'s `-Oz` WASM was 4.8% smaller (5.0%, 35 KB,
+  gzipped) and its build was 5.5% faster. The herd's CPU benchmarks (`bench_eval` whole and
+  pruned, `mass` at 2 cm, `raycast`; 7 alternating rounds in one wasmtime) were 0.2–1.1% slower,
+  with identical results. The frames of `clearing` and the grazer are GPU-bound and did not
+  change. A small size-against-speed trade, not changed without a V8 measurement.
+
 A real scene, `rywible/wrela`'s `examples/clearing` at 108dc7ae, run with this toolchain at
 1280×720 on the AMD Lucienne iGPU (one profile, 30 warmup and 60 measured frames): the GPU frame
 span is 20.4 ms, and the clouds take 10.0 ms of it (49%). In the cloud march loop, 8 of 58
