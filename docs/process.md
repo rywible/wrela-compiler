@@ -17,7 +17,7 @@ anything here.
 
 | Tool | What it does here |
 |---|---|
-| [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Writes the code, tests and docs, on Ryan's MacBook Air and in cloud sessions |
+| [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Writes the code, tests and docs, on Ryan's MacBook Air and in cloud sessions. Its deep-research workflow searches the web, reads sources and has subagents vote on each claim (see "A second check, by Claude deep research") |
 | [OpenAI Codex](https://openai.com/codex/) (GPT-6, GPT-6.1) and parallel subagents | Reviews performance across the compiler, the hosts and the tools, implements optimizations and regression tests, and measures their effects |
 | [GPT-6.1-Sol and GPT-6-Astra](https://openai.com/) (OpenAI), as T3 Code child tasks or `codex exec` runs | Reviewers in a council on an implementation plan or a pull request: each reads the brief and the checkout read-only, returns findings, and rebuts the leader's answers; they don't edit. Claude leads, decides, implements and verifies |
 | Claude Sonnet 5.5 subagents | The agent syntax test (`tools/agent-test`): fresh agents write small programs from the spec alone, to measure how learnable the language is |
@@ -370,6 +370,90 @@ All external papers and specifications in this section were read as descriptions
 and published evidence. No source code, figures or substantial quoted text were imported; no
 new crate or runtime dependency was added. Paper publication/access rights remain with their
 authors and publishers. Individual reported gains retain their original workload and baseline.
+
+### A second check, by Claude deep research
+
+Ryan also asked Claude Code (Opus 5.5) the same question, through its deep-research workflow.
+Five subagents searched the web, each on one angle. Other subagents fetched 19 sources and
+extracted 87 falsifiable claims. Three independent subagents then tried to refute each of 25
+claims. Two refutations removed a claim. 19 claims survived and 6 were removed. The other
+62 claims were not checked. A last subagent merged the survivors. A separate
+read-only subagent listed the current compiler passes. The run used 101 subagents. It changed
+no code and made no Wrela performance run.
+
+The result agrees with the section above. The first experiment is region-certified compiled
+residualization. Sparse exact updates are second. Layout, fusion and synthesis support them.
+This subsection adds only the vote results and the numbers that the check confirmed. The vote
+is given as votes for the claim against votes to refute it.
+
+- **Region pruning** ([MPR](https://www.mattkeeter.com/research/mpr/keeter_mpr20.pdf),
+  [Fidget slides](https://mattkeeter.com/research/fidget-2024.pdf)), 3-0. The text model's tape
+  has 6056 clauses, 2354 of them min/max. The mean pruned tape is 356±125 clauses for 64x64
+  tiles and 28±13 for 8x8 subtiles. These means count only ambiguous tiles. On a GTX 1080 Ti,
+  the brute-force interpreter costs about 58 ms per megapixel and the compiled expression about
+  3 ms, so the interpreter costs 19x. The pruned renderer takes 7.4 ms at 4096x4096. It is
+  faster than the compiled kernel from about 1536x1536. The "6x faster than compiled" and
+  "more than 100x faster than brute force" multiples come from fitted slopes; the brute-force
+  line is extrapolated past about 4 megapixels.
+- **Code quality alone** (Fidget slides), 3-0. Fidget's CPU JIT is about 2.4-2.6x faster than
+  its VM and 2.7-2.8x faster than libfive. It is near the GPU MPR at 1024³ (23.6 ms against
+  22.6 ms). So better instruction selection gives less than 3x here.
+- **Lipschitz pruning** ([CGF 44(2), 2025](https://diglib.eg.org/handle/10.1111/cgf70057)). Only
+  the abstract was readable, because the publisher refused the full paper. This check did not
+  confirm a speedup factor, so the 629x above is from the first research only.
+- **Fusion, coalescing and tiling** ([Halide 2012](https://people.csail.mit.edu/jrk/halide12/halide12.pdf),
+  [Futhark PLDI 2017](https://www.futhark-lang.org/publications/pldi17.pdf)), 3-0. These are
+  Futhark ablations on a GTX 780 Ti, each with one pass off:
+  - fusion: 1.2-10.1x; without it, three benchmarks fail from storage;
+  - coalescing transposes: 4.2-9.3x;
+  - tiling: 1.3-2.3x.
+
+  Against expert code the gains are small. Halide is within 5% of hand-written NEON on the camera
+  pipeline and 2.1x faster than OpenMP plus IPP on the local Laplacian. Futhark ranges from 0.6x
+  to 16x, with a 1.81x geometric mean on the 12 benchmarks that have CUDA or OpenCL references.
+  Its 16x comes from a sequential reduction in the reference.
+- **Incremental computation** ([Chen, Dunfield and Acar, PLDI 2012](https://research.cs.queensu.ca/home/jana/papers/incr),
+  [Acar et al. 2009](https://www.cs.cmu.edu/~guyb/papers/ABBHT09.pdf)). The PLDI 2012 results
+  were confirmed 3-0: `map` at n=10⁶ updates 4.6x10⁴ times faster, and a 1000x1000 blocked matrix
+  multiply 1200 times faster. The ray tracer gains only 0.22-4.29x, and it is slower than
+  recomputing when 57% of pixels change. A from-scratch run costs 2-30x more, and memory is
+  about 10x the input. The 2009 result, more than 10⁴x for one list insert at n=10⁶, passed only
+  2-1.
+- **Accuracy-aware e-graph rewriting** ([Chassis, preprint](https://arxiv.org/pdf/2410.14025)),
+  3-0. It is 3.5x faster in aggregate, and up to 8.9x faster than Clang at equal accuracy on
+  the C99 target. Against Herbie it is up to about 2x faster, but only a few percent faster on
+  hardware instruction sets. It changes float results, so it cannot apply to strict CPU code.
+- **Dex's `Accum` effect** ([ICFP 2021](https://research.google/pubs/getting-to-the-point-index-sets-and-parallelism-preserving-autodiff-for-pointful-array-programming/)),
+  3-0 but low value. It keeps reverse-mode AD parallel over in-place updates, but it has no
+  measured gain, and its reduction order conflicts with strict float sums.
+
+The check refuted six claims:
+
+- A static ahead-of-time compiler could close MPR's 19x interpreter gap (0-3). The paper does not
+  show this. It remains the open question of proposal 1's first experiment.
+- Lipschitz pruning needs only the Lipschitz property and supports smooth CSG as such (0-3).
+- Spores gives a 1.2-5x end-to-end gain (1-2).
+- Halide's choice to recompute or store needs purity in the way the claim stated (0-3).
+- Self-adjusting computation is more than 1000x faster on the geometry benchmarks (1-2).
+- Dex's effect typing alone makes its parallelization legal (1-2).
+
+The check confirmed nothing on these angles: superoptimization, supercompilation and staging,
+learned cost models, subgroup and register-pressure work, f16 tuning, loop perforation, shader
+variant pruning, struct-of-arrays layout for WASM SIMD, and optimization after AD. No source
+measured WebGPU or WASM. The hardware ranges from Fermi to Pascal.
+
+The pass list adds these gaps to "What the compiler already does":
+
+- No pass hoists loop invariants. `sink_values` never moves code into a loop.
+- CSE never merges loads or calls.
+- CPU and GPU cleanup decide purity from IR expression kinds, not from the source effects. They
+  approximate no-aliasing with an `address_taken` scan in each function.
+- [Layout](../compiler/ir/src/layout.rs) gives every type the same WGSL array-of-structs layout.
+- `vloop` takes only counted `u32` loops of straight-line f32 code.
+
+The pass list missed `Tape::prune`, which the section above names. The run used the sources
+only as descriptions of methods and evidence. It imported no code, figures or substantial quoted
+text, and it added no crate.
 
 ## Keeping this record
 
