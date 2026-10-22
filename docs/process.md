@@ -74,6 +74,303 @@ The image fixtures in `compiler/tests/images` are four flat colours that Claude 
 frozen copies under `compiler/tests/frozen` are copies of programs from `rywible/wrela`, whose
 `docs/process.md` records their sources.
 
+## Compiler optimization research, 2026-10-21
+
+Ryan asked Codex and research subagents to find compiler changes that could produce orders of
+magnitude faster programs. Six subagents audited the compiler and investigated spatial bounds,
+incremental computation, program synthesis, GPU scheduling and representation. Exa found source
+papers and author projects. This section records the findings and proposed experiments. No
+optimization was implemented and no Wrela performance comparison was run. Research includes
+publications through 2026-10-21; it does not establish that an idea is unprecedented.
+
+Across five external-research workstreams and the lead's coverage checks, successful Exa
+searches returned 309 result entries, including repeated papers and mirrors. Failed schema
+requests are excluded. The subagents report 46 primary documents or URLs read in relevant
+sections, before cross-workstream deduplication; this is not a count of 46 independent studies.
+Only claims supported by the linked original sources are retained below.
+
+The strongest opportunity is to remove whole computations using facts about their domain,
+dependencies and consumers. Ordinary instruction selection seldom changes how much work a
+program must do. A function that currently evaluates N branches but needs only k of them in a
+region has a possible N/k work reduction. An independent computation with k changed inputs out
+of N has a similar opportunity. These are conditional work ratios, before preparation, memory,
+dispatches and other program costs. They are not measured speedups.
+
+No pass below is something that only Wrela could implement. Wrela's useful combination is
+whole-program callable specialization, derived interpretations, exclusive mutation, no observable
+addresses, strict CPU arithmetic, and control of both CPU and GPU compilation. Compilers given
+the same contracts can perform the same transformations. The research opportunity is to use
+these contracts together, without teaching the compiler what an engine or a surface is.
+
+### What the compiler already does
+
+The source audit used the checked-out compiler and the language spec, rather than assuming a
+general-purpose optimizer's feature set:
+
+- [Lowering](../compiler/lower/src/lib.rs) specializes generic functions, callable identities
+  and GPU resources. CPU optimization already includes inlining, scalar replacement, load
+  forwarding, CSE, dead code and store removal, branch folding and sinking.
+- [GPU optimization](../compiler/ir/src/opt.rs) already forwards uniform reads, specializes
+  fixed uniform paths, controls inlining and outlining, unrolls small loops and converts eligible
+  branches to selects. Its opening comment records a historical 19x gap caused by uniform copies,
+  and the existing fix. That gap is not a new opportunity.
+- [Derivation](../compiler/ir/src/derive/mod.rs) already tracks active leaves, produces gradients
+  and target-aware intervals, and combines values, gradients and payloads. The spec's section 14
+  describes guard narrowing, indexed-table bounds and splitting narrow floor crossings.
+- [Tape pruning](../compiler/std/stage.wrela) already eliminates dominated min/max/smooth-min
+  operands. Section 14.4 explicitly says compiled fields are not pruned.
+- [WASM loop SIMD](../compiler/wasm/src/func/vloop.rs), vector SIMD, some bounds-check removal,
+  build-time constants and their cache already exist. Explicit result caches and lifted-literal
+  dependency watches also exist. `--optimize` runs Binaryen with `-Oz`; a speed-oriented option
+  comparison would be a useful baseline, without being novel research.
+
+`tools/wrela primer derive` and `primer mem` supplied checked language examples. There is no
+`primer compiler` area; Rust source inspection supplied the architecture. This is a tooling
+discoverability limit, not a missing language feature.
+
+### Proposed passes and experiments
+
+The order below favors structural work removal. Each proposal needs a small falsifiable
+experiment before an implementation plan. A prerequisite is retaining useful ownership,
+read/write-region, trap and dependency facts in optimization IR; the current broad effects
+and conservative invalidation of nonlocal loads do not supply all of those facts.
+
+**1. Generate region proofs and residual compiled functions.** Derive intermediate ranges from
+ordinary numeric code. For `min(a(p), b(p))`, a proof that `a(B).hi < b(B).lo` permits the result
+inside box B to use a alone, subject to effects, traps and the required interpretations. Remove
+the dead producer computations too. A caller chooses regions, batching and lifetime; the compiler
+supplies a generic transformation, without recognizing `Surface` or rendering policy.
+
+Specialize for what the consumer observes too. A threshold-only query may need a proof of one
+comparison rather than an exact scalar, all payload channels and a gradient. Generate a cheap
+decision program with exact fallback, preserving any effects and traps of the original call.
+Do not count removal of unused tuple fields as new: existing value/gradient fusion and dead-code
+elimination already cover some of this case. Generic staging has substantial prior art,
+including [AnyDSL](https://anydsl.github.io/).
+
+The high ceiling is replacing a large expression by a small local program before thousands of
+point queries. [Keeter's MPR paper (2020)](https://www.mattkeeter.com/research/mpr/keeter_mpr20.pdf)
+is direct prior art for interval-based arithmetic-tape simplification. Its example's 17x and 216x
+reductions measure average tape length, not frame speed. The paper also measures substantial
+interpreter overhead. [Lipschitz Pruning (2025)](https://doi.org/10.1111/cgf.70057) reports a
+629x rendering example against naive sphere tracing on a 6023-node scene. Its operand and blend
+contracts do not hold for arbitrary Wrela functions. Wrela's scoped `lipschitz(near)` is not a
+global 1-Lipschitz certificate, and an engine may already remove much of this work.
+The paper also uses conservative far-field replacement, which changes distance values. Its
+headline result does not isolate transparent exact residualization; such replacement needs a
+consumer contract that accepts bounds instead of the original values.
+
+The difficult design problem is representing local programs. A shader compiled for every tile
+would cost too much; every branch-choice combination compiled ahead of time grows exponentially.
+Compare capped ahead-of-time variants, coherent compiled subtree skipping and shortened tapes.
+Keep an original-function fallback. Use the existing interval transform before GPU if-conversion,
+then the current forwarding/CSE/dead-code passes on the residual IR.
+
+First experiment: frozen functions with 32, 128 and 512 separated branches, overlapping smooth
+branches, and a noise-heavy control. Compare current compiled queries, existing tape pruning and
+regional residual queries. Use the tape baseline only when the complete function fits its
+128-operation capacity; larger cases compare compiled and residual queries. Charge proof
+construction, lookup, variant creation, transfer, memory,
+shader size and query execution. Reject if realistic reuse cannot repay preparation or if gains
+vanish when gradients and payloads are included. This is the strongest possible large-factor
+rendering direction found, with no measured Wrela gain yet.
+
+**2. Optimize invariants before derived-code expansion.** Classify inputs by when they change:
+build, edit/instance, frame/dispatch, workgroup and invocation. Extract repeated invariant work
+and preserve it across derivation. Examples include transform coefficients and bounded-loop
+subexpressions that do not depend on the differentiated input. Existing uniform-path
+specialization avoids copies; it does not generally precompute arbitrary uniform-only work.
+
+[Enzyme (2020)](https://arxiv.org/abs/2010.01709) shows that optimization and differentiation do
+not commute in cost: hoisting before AD can produce an O(N) derivative where AD followed by
+hoisting leaves O(N squared). Its reported 4.5x geometric mean belongs to its benchmarks, not
+Wrela. Wrela currently derives during lowering and runs major CPU/GPU cleanup later. This is a
+concrete pass-ordering question worth testing.
+
+Only interpretation-preserving transformations qualify. Primal equivalence alone need not
+preserve rounded tangents, interval enclosures, filtering or tie rules. Preserve the target of
+numeric computation: CPU and GPU transcendental results are not interchangeable. Hoisting from
+a zero-iteration loop must not introduce a trap. First compare current lowering with safe
+invariant extraction before AD on bounded loops, for 1, 4, 32 and 128 active parameters. Count
+derived operations, code size and total execution. Reject when cached storage and preparation
+outweigh saved computation. This is established compiler research with a Wrela-specific seam.
+
+**3. Generate exact sparse update programs and owned caches.** Extend dependency analysis to
+parameter fields, literal reads and bounded buffer regions, including control and index
+dependencies. Generate initialization and update functions for independent maps and bounded
+stencils. Given an explicit dirty set, reexecute affected leaves with the original arithmetic;
+keep unchanged outputs and profitable intermediates in caller-owned state. Avoid an O(N) scan
+just to discover k changes.
+
+The foundations are [Incremental Lambda Calculus (2014)](https://doi.org/10.1145/2594291.2594304),
+[cache-transfer style (2019)](https://doi.org/10.1007/978-3-030-17184-1_20), and
+[DBSP (2023)](https://www.vldb.org/pvldb/vol16/p1601-budiu.pdf).
+[Differential Execution (2025)](https://drops.dagstuhl.de/entities/document/10.4230/LIPIcs.ECOOP.2025.20)
+adds a proved imperative formulation for assignments, branches and loops. Its large Bellman-Ford
+update gains require context: the tested inserted edges do not change shortest paths, table
+indices are assumed stable, and initialization has substantial overhead. It does not establish
+fast changing scenes or GPU execution.
+
+Start with fixed-size pure maps, then stencils, before general loops. Existing `std::cache`
+rebuilds a whole result after a key change; this proposal updates within it. Numerical gradients
+are not exact finite changes. A strict float sum cannot generally use
+`new_sum = old_sum - old_term + new_term`, or change its reduction tree. Cached expensive leaves
+may still help while the original ordered fold is replayed. Checked integer overflow also
+prevents unrestricted reassociation.
+
+First experiment: a seeded expensive map with dirty fractions 0, 0.001, 0.01, 0.1 and 1. Compare
+full recomputation, a manual sparse-update oracle and generated updates. Check every resulting
+CPU value by canonical bits, including signed zero, branch/index changes and rollback. Measure
+initialization, 100 updates, dense-update slowdown, dirty-list cost and cache bytes. A proposed
+success target is a net 10x update gain at 0.1% changes, close to the manual oracle. That target
+is a test of the idea, not a prediction. Global coupling may make every output dirty.
+
+**4. Keep spatial certificates valid across time and parameter changes.** Combine proposals 1
+and 3: prove a branch gap stays positive over a spatial cell and a bounded parameter/time box.
+Reuse its local program until an input leaves that box. The useful output is a validity region
+and its dependencies, rather than a per-frame flag that discards everything.
+
+This is a research composition of parametric partial evaluation, interval proofs and
+incrementalization. [ShortCut (2019)](https://doi.org/10.1145/3341301.3359659) is prior art for
+guarded executable slices with fallback; guarded residual programs are not unprecedented.
+Wrela already supports a nested spatial-gradient interval with time in a fourth component.
+General capture-domain proofs need more than the current at-most-four-component derivation API.
+Test slow deformation, fast crossings and noise discontinuities. Charge certificate refreshes
+and failed guards. Reject when boxes become too loose or expire too frequently. Hot reload and
+every relevant captured input must invalidate or leave the certificate's validity domain.
+
+Use cheap intervals first. If a valuable decision remains unknown, try a bounded correlated
+domain or centered enclosure. [Knoll et al. (2009)](https://doi.org/10.1111/j.1467-8659.2008.01189.x)
+demonstrate reduced affine arithmetic, including cases that improve on intervals and cases
+where its extra cost loses. This is a selective proof-strengthening tool, not a default 100x
+optimization. Target rounding and nonlinear remainder error must be enclosed too.
+
+**5. Choose AD mode for many editable parameters.**
+[Literal gradients](../compiler/ir/src/derive/literal.rs) propagate up to 255 forward directions
+and build dense seeds. For one scalar objective with P inputs and evaluation cost C, reverse
+mode can replace roughly O(P C) work by O(C + P), plus saved state and checkpointing. This is a
+credible large-factor authoring/solver opportunity; spatial gradients have only 1-4 inputs.
+Compare reverse, sparse forward and vector forward at increasing P, including memory and
+initialization. Vector forward can be competitive on SIMD/SIMT hardware; parameter count alone
+does not select a winner.
+
+The current spec explicitly promises forward-mode parameter gradients. Reverse mode can change
+rounded derivative values and accumulation order, so it requires a defined API/spec contract,
+not a silent optimizer substitution. It must preserve the chosen branch and nonsmooth tie rules.
+This is a proposed language/tooling decision for Ryan, not an adopted architecture change.
+
+**6. Plan container representation across consumers and byte boundaries.** Section 6.10 already
+permits SoA, AoSoA and hot/cold storage, while current containers use AoS. Choose representations
+using field-use summaries and total conversion cost, with canonical `GpuData`, bitcast, upload
+and network bytes at the points where bytes are observed. Fold conversion into an existing
+boundary traversal where legal. No addresses and nonescaping projections make this easier than
+in a language with arbitrary pointer observation.
+
+SoA alone is established work and no blanket large-factor claim follows. Large cold fields,
+repeated gathers or bad scalarization are promising cases. Profile complete producer/consumer
+pipelines, not only a field-streaming loop. Include cloning, canonicalization, upload and readback.
+Reject plans that save one kernel but add more conversion traffic elsewhere. Persistent
+representation planning is more distinctive than a local AoS-to-SoA rewrite.
+[Automatic GPU layout research (2015)](https://d-nb.info/1160593248/34) and
+[C++ data views (2025)](https://arxiv.org/abs/2502.16517) establish the prior art and conversion
+tradeoffs. The current `Vec` data/length/capacity representation is assumed by both std's unsafe
+core and lowering; changing only the IR layout table would be unsound.
+
+Snapshot-heavy programs offer a separate representation experiment: chunked copy-on-write may
+turn full copies into shared roots plus copies of written chunks. It is established mutable
+value-semantics work, not a new algorithm. Do not apply it to arbitrary `Clone`: element cloning
+can have effects, and snapshot timing, ownership and resource lifetimes matter. Restrict an
+experiment to proven exact copies, with sparse writes and explicit lifecycle assertions. See
+[Implementation Strategies for Mutable Value Semantics (2022)](https://www.jot.fm/issues/issue_2022_02/article2.pdf).
+Whole-array copy-on-write still copies the whole array on its first write; chunking is needed
+for sparse-write benefits.
+
+**7. Fuse proven independent dispatches and generate sparse schedules.** Retain typed dispatches
+and resource dependence information before the command stream is serialized. Consecutive maps
+over the same domain can sometimes keep per-slot state in registers and remove intermediate
+buffer traffic. Reject fusion with neighbor dependencies, observed intermediates, incompatible
+domains, atomics, append operations, or synchronization that cannot be preserved. Portable WGSL
+barriers synchronize a workgroup, not an entire dispatch
+([WGSL memory model](https://www.w3.org/TR/2026/CRD-WGSL-20261021/#memory-model)). CUDA persistent task graphs cannot
+simply become WGSL megakernels.
+
+[AsyncTaichi (2021, final v2)](https://arxiv.org/abs/2012.08141v2) is prior art for whole-program sparse
+kernel optimization. [TACO asymptotic autoscheduling (2022)](https://tensor-compiler.org/files/ahrens-pldi22-taco-autoscheduling.pdf)
+shows why sparse schedules can change asymptotic work, rather than only constants.
+[Futhark incremental flattening (2019)](https://www.futhark-lang.org/publications/ppopp19.pdf)
+uses multiple equivalent versions selected by input shape; a single static GPU schedule is not
+always sufficient. These are mechanisms to adapt, not evidence of an exclusive Wrela pass.
+
+First test 4, 16 and 64 independent repeated maps, then explicit sparse domains, against the
+current stream and a manual fused kernel. Charge compilation, command recording, spills and
+memory. Compaction of a divergent branch does not give 1000x just because only 1/1000 lanes are
+active: subgroup width, work distribution and prior early exits bound the useful savings.
+
+**8. Use synthesis to select structural plans, with bounded search.** Equality saturation can
+explore schedules and equivalent residual forms after legality is established. It should not
+be a license to reassociate strict floats. Score plans by repeated work, memory traffic,
+register pressure, code size and preparation amortization, then benchmark finalists. The
+search itself is supporting infrastructure; it does not supply an algorithmic speedup.
+
+[Guided Equality Saturation (2024)](https://doi.org/10.1145/3632900) demonstrates much cheaper
+search with sketches, which is a compiler-time result.
+[Axon (2026)](https://arxiv.org/abs/2606.26344) and other recent synthesis work must be checked
+for their numeric contracts: proving real arithmetic and accepting a floating-point tolerance
+does not prove strict CPU equivalence. A useful small experiment compares a bounded set of
+legal plans against the best existing compiler/manual plan, with total search time reported.
+
+Other research was considered but does not justify a large runtime claim here.
+[Synthesized data compression (October 2026)](https://arxiv.org/abs/2610.09913) suggests an offline
+experiment for immutable tables: generate a bounded decoder and exhaustively verify every
+reconstructed byte. Its textual-codec results do not establish faster numeric tables or frames.
+Correctly rounded math and mixed-precision tuning likewise need their own numeric contracts;
+they are not permission to change current CPU results silently.
+
+### Concrete preparation improvement
+
+Before the larger residualization experiment, measure `Tape::prune` preparation. It calls
+`register_interval` twice per eligible binary operation, and that helper re-evaluates a tape
+prefix. One forward abstract evaluation producing all intermediate ranges, followed by reverse
+liveness and remapping, could avoid repeated prefixes. Share the generated target arithmetic
+rules rather than writing a divergent second interval implementation. Test 16/32/64/128-op tapes
+and enclosure/tie cases. The 128-op limit bounds the absolute upside; this is an established
+linear-work technique and a preparation improvement, not a new 100x frame optimization.
+
+### Correctness and evidence requirements
+
+CPU strict floats, ordered reductions, canonical NaNs, signed zero and observable trap order
+remain contracts. Deterministic code may allocate, trace or panic; determinism is not enough
+to justify caching or deleting computations. Unknown proof results take the general fallback.
+Min/max ties average tangents, so non-strict dominance that preserves a value can still change
+its gradient. Payloads and filtering need their own preservation argument. Existing GPU interval
+NaN and transcendental-domain limits must be resolved or excluded before using them as a proof
+oracle. Samples are useful regressions, not universal soundness proofs.
+
+Do not multiply paper speedups. The [Fidget author's comparison](https://www.mattkeeter.com/projects/fidget/)
+is a useful warning: JIT improves its brute-force example by 31x, but after pruning the comparison
+is 6 ms versus 4.6 ms. The two mechanisms eliminate overlapping costs. The project is prior art,
+not a dependency; its [source](https://github.com/mkeeter/fidget) is MPL-2.0 and no code was copied.
+
+For every experiment record current-compiler, manual-oracle and candidate results; preparation,
+invalidation, memory, code size, compilation, warm and total time; and dense/adversarial controls.
+Use frozen fixtures here. Keep correctness assertions separate from performance thresholds.
+Run paired `tools/wrela profile` with equal scene, input, size, workers and timing mode on each
+Linux hardware GPU, without concurrent builds/GPU work. Keep periodic M4 Air reports separate.
+Distinguish GPU times, synchronized CPU frame calls and Chrome frame rates. No such performance
+run was made for this research. If a kernel occupies fraction f of total time and speeds up by
+s, total speedup is `1 / ((1 - f) + f/s)`; even a 100x improvement of 10% of a frame is only
+about 1.11x for the frame.
+
+The proposed first research spike is region-certified compiled residualization, with dependency
+and trap summaries as its narrow prerequisite. Optimize-before-AD and sparse exact updates are
+separate experiments with strong source-level seams. Reverse AD targets authoring tools. Layout,
+fusion and synthesis support these directions; none is evidence for a universal 100x compiler.
+
+All external papers and specifications in this section were read as descriptions of methods
+and published evidence. No source code, figures or substantial quoted text were imported; no
+new crate or runtime dependency was added. Paper publication/access rights remain with their
+authors and publishers. Individual reported gains retain their original workload and baseline.
+
 ## Keeping this record
 
 AGENTS.md tells every agent to update this file in the same change when it adds an outside
