@@ -5,8 +5,8 @@
 use std::alloc::{alloc, free, realloc}
 use std::par::{chunks_for, par_each}
 use std::mem::{
-    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, keep_bytes, kept_bytes, read, size_of,
-    take_answer, take_input, take_payload, write, zeroed,
+    Drop, align_of, at, at_mut, at_mut_pair, copy, drop_at, is_copy, keep_bytes, kept_bytes, read,
+    size_of, take_answer, take_input, take_payload, write, zeroed,
 }
 pub use std::mem::Pair
 use std::serialize::Serialize
@@ -698,9 +698,18 @@ impl<T: Clone> Vec<T> {
     }
 }
 
+/// A `Copy` element's clone is its bytes (§6.1), so a `Vec` of them is cloned with one `copy`;
+/// other elements are cloned one at a time, in order.
 impl<T: Clone> Clone for Vec<T> {
     fn clone(self) -> Vec<T> {
         var out = Vec::with_capacity(self.len)
+        if is_copy::<T>() {
+            unsafe {
+                copy(out.data, self.data, self.len * size_of::<T>())
+            }
+            out.len = self.len
+            return out
+        }
         for x in self {
             out.push(x.clone())
         }
@@ -709,6 +718,16 @@ impl<T: Clone> Clone for Vec<T> {
 
     /// Reuses `into`'s buffer: no allocation once it has grown to size.
     fn clone_into(self, into: mut Vec<T>) {
+        if is_copy::<T>() {
+            // A `Copy` element has nothing to drop, so `into`'s go without a call each.
+            into.len = 0
+            into.reserve(self.len)
+            unsafe {
+                copy(into.data, self.data, self.len * size_of::<T>())
+            }
+            into.len = self.len
+            return
+        }
         into.truncate(self.len)
         for i in 0..into.len {
             self[i].clone_into(mut into[i])
@@ -939,6 +958,55 @@ fn a_sort_in_its_room_allocates_nothing_more() {
     let cap = room.capacity()
     v.sort_by_in(|a, b| a > b, mut room)
     assert(room.capacity() == cap && v[0] == 299 && v[299] == 0)
+}
+
+struct Grain: Copy + Eq {
+    tag: u8,
+    weight: f32,
+}
+
+struct Sack: Clone + Eq {
+    tag: u8,
+    weights: Vec<f32>,
+}
+
+fn grain(i: u32) -> Grain {
+    Grain { tag: u8(i), weight: f32(i) * -0.5 }
+}
+
+fn sack(i: u32) -> Sack {
+    Sack { tag: u8(i), weights: Vec::filled(i % 3 + 1, f32(i)) }
+}
+
+/// Clones `src` into `into`, and on its own: both come out equal to it.
+fn clones_whole<T: Clone + Eq>(src: Vec<T>, into: mut Vec<T>) {
+    src.clone_into(mut into)
+    assert(into.len() == src.len() && into == src)
+    let copied = src.clone()
+    assert(copied.len() == src.len() && copied == src)
+}
+
+/// A `Vec` of `Copy` elements is cloned with one copy, and others an element at a time: the
+/// results are alike, whatever the lengths.
+@test
+fn a_vec_clones_alike_whether_its_elements_copy_or_not() {
+    assert(is_copy::<f32>() && is_copy::<Grain>() && !is_copy::<Sack>())
+    // Empty, growing and shrinking, into an empty, a shorter, a longer and an equal destination.
+    for (from, to) in [(0, 0), (0, 4), (3, 0), (3, 9), (9, 3), (5, 5)] {
+        var floats = Vec::from_fn(to, |i| f32(i) + 100.0)
+        clones_whole(Vec::from_fn(from, |i| f32(i) * -0.5), mut floats)
+        var grains = Vec::from_fn(to, |i| grain(i + 100))
+        clones_whole(Vec::from_fn(from, grain), mut grains)
+        var sacks = Vec::from_fn(to, |i| sack(i + 100))
+        clones_whole(Vec::from_fn(from, sack), mut sacks)
+    }
+    // A `Sack` is cloned into the one in its place, whose `Vec` keeps its room.
+    var sacks = Vec::from_fn(2, |i| sack(i + 100))
+    sacks[0].weights.reserve(64)
+    let room = sacks[0].weights.capacity()
+    let one = Vec::from_fn(1, sack)
+    one.clone_into(mut sacks)
+    assert(sacks.len() == 1 && sacks[0].weights.capacity() == room && sacks == one)
 }
 
 @test

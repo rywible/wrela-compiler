@@ -394,6 +394,7 @@ impl Fl<'_, '_> {
                     | L::MemAlignOf
                     | L::MemZeroed
                     | L::MemNeedsDrop
+                    | L::MemIsCopy
                     | L::Swap
                     | L::Replace
                     | L::DebugBuild
@@ -434,6 +435,10 @@ impl Fl<'_, '_> {
             Lang::MemNeedsDrop => {
                 let d = self.cx.needs_drop(substs[0]);
                 Some(self.konst(ir::Const::Bool(d)))
+            }
+            Lang::MemIsCopy => {
+                let c = self.cx.is_copy(substs[0]);
+                Some(self.konst(ir::Const::Bool(c)))
             }
             Lang::MemRead => {
                 let Some(et) = elem(self, 0) else { return Some(None) };

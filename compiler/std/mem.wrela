@@ -24,6 +24,12 @@ pub fn align_of<T>() -> u32 {}
 @intrinsic
 pub fn needs_drop<T>() -> bool {}
 
+/// Whether `T` is `Copy`: then cloning a `T` copies its bytes and does nothing else (§6.1), so
+/// std can clone a run of them with one `copy`. Only std asks: generic code outside it works
+/// through its bounds alone (§7).
+@intrinsic
+pub(package) fn is_copy<T>() -> bool {}
+
 /// The `T` at `addr`, moved out. The memory is left as it was: what's there mustn't be dropped
 /// again.
 @intrinsic
