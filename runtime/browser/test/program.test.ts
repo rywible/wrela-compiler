@@ -707,8 +707,8 @@ test("first-light's CPU side gives the native host's state hash", async () => {
   const manifest = parseManifest(readFixtureText("manifest.json"));
   const program = await Program.load(readFixture("game.wasm"), checker(manifest), new Recorder(), { hash: true });
   for (let i = 0; i < 60; i++) program.frame(i / 60, 640, 360);
-  // Stream v10 changes the batch headers; the native reference encoder checks the same bytes.
-  expect(program.hash!.hex()).toBe("8e2f6b0e68d2873b");
+  // Stream v11 changes the batch headers; the native reference encoder checks the same bytes.
+  expect(program.hash!.hex()).toBe("c9dc27b26ee232ba");
   const log = (program.executor as Recorder).log;
   expect(log.slice(0, 7)).toEqual(["CreateBuffer", "WriteBuffer", "Dispatch", "BeginScreenPass", "Draw", "Present", "end"]);
   expect(log.length).toBe(3 + 60 * 4);

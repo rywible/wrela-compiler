@@ -824,7 +824,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       handed = new Handed(msg.given);
-      Promise.all([openDevice((test?.timestamps ?? 0) > 0, fatal), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
+      Promise.all([openDevice(fatal), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
           handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);

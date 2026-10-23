@@ -38,6 +38,7 @@ test("the test encoder writes the vectors' golden batch", () => {
     .unprepare("../floor")
     .handOver(7, "next")
     .hostRequest(8, "test/echo", Uint8Array.of(3, 2, 1))
+    .timed(9, "shadows")
     .finish();
   expect(Buffer.from(batch).toString("hex")).toBe(golden);
   expect(NONE).toBe(0xffffffff);

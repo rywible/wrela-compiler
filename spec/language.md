@@ -1977,9 +1977,10 @@ A **request** is work that the program asks the host for, and reads the answer o
 - A call submits the request and returns a `Pending<T>` handle at once:
   - `std::io::load(path)`, `store(path, bytes)` and `fetch(url)`, for the program's storage ("bytes at a path") and its build's files;
   - `std::gpu::read(span)`, for a GPU readback.
+  - `std::gpu::timed(label)`, the GPU time of the passes and dispatches labelled `label` (`std::gpu::label`), in microseconds: their time in the first frame from the one that asks that runs one, summed, once the host has read it. A host times a program's work only from its first ask, so the first answer may wait a frame; it fails on a host that can't time GPU work (the CPU host, a GPU without timestamp queries). A program measures its own costs with it; a test checks that a cost was measured, never how small it is (§13).
 - The program polls the handle on a later tick or frame. `p.poll()` returns `None` until the answer arrives. Then it returns, once, `Some(Ok(values))` or `Some(Err(e))`. `values` is a `Vec<T>`: bytes for IO, a buffer's elements for a readback.
 - The host answers a request no sooner than the next call. A browser's IO takes as long as it takes.
-- A request has the `io` effect to make (a readback `nondet` and `host`), and the `nondet` effect to poll. So `@deterministic` code can't make or poll one (E0600). A result reaches the sim only through a tick's input, so it enters on a known tick.
+- A request has the `io` effect to make (a readback or a time `nondet` and `host`), and the `nondet` effect to poll. So `@deterministic` code can't make or poll one (E0600). A result reaches the sim only through a tick's input, so it enters on a known tick.
 - A path is relative, with `/` between its parts. No part may be empty, `.` or `..`; another path panics when the request is made.
 - Storage is files under the host's storage directory on the native host, and the origin's private file system in a browser.
 - A `load` of a path that holds nothing (neither the file nor a directory on its way) fails with an `IoError` whose `missing()` is true: nothing was stored there. Every other failure, a storage that can't be read among them, has `missing()` false and says nothing of what's stored, so a program that would store over it doesn't take it as empty.
@@ -2522,7 +2523,7 @@ The compiler knows the language, a closed list of std items and its targets; the
 | `std::quat` | `Quat`: rotations as unit quaternions, on the CPU and the GPU |
 | `std::derive` | `gradient`, `value_and_gradient`, `interval`, and the boxes that they range over (§14.1). Each box has `sample(seed, i)`: points spread evenly through it, to check a property at many points (§13.2) |
 | `std::stage` | `Tape`, `Op`, `Reg` and `interpret`: fields built at run time (§14.4) |
-| `std::gpu` | Buffers (`GpuBuffer<T>`, `GpuSpan<T>`, `buffer`, `write`, `copy`, `read`), textures and samplers, passes, `dispatch` and `draw`, kernel outputs (`Slots<T>`, `Shared<T, N>`, `Atomics<T>`, `Append<T>`, `AtomicMap`, `Texels`, `Texels3d`), typed builtins, lossy encodings, `limits()` (§18) |
+| `std::gpu` | Buffers (`GpuBuffer<T>`, `GpuSpan<T>`, `buffer`, `write`, `copy`, `read`), the GPU time of labelled work (`label`, `timed`), textures and samplers, passes, `dispatch` and `draw`, kernel outputs (`Slots<T>`, `Shared<T, N>`, `Atomics<T>`, `Append<T>`, `AtomicMap`, `Texels`, `Texels3d`), typed builtins, lossy encodings, `limits()` (§18) |
 | `std::io` | `load`, `store`, `fetch` and `post`, polled through `Pending<T>`; `print` (§17.1, §17.3) |
 | `std::tool` | A tool's start, its calls and its tasks (§15.5): `args`, `secret`; `Call<T>` (`wait`, `request`), `Request`, `any`, `Answer`, `Done`, `ToolError`; `spawn`, `Task`, `all` |
 | `std::tool::files` | A tool's files in its granted roots: `read`, `write`, `list`, `stat`, `remove`, `remove_all`, `make_dirs`, `read_blob`, `write_blob`; `Entry`, `Kind`; `rooted(root, path)`, a command line's relative path as a path in a root, or `None` if it isn't a plain one |

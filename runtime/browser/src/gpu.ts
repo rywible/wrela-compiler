@@ -506,13 +506,22 @@ class Timer {
   #pending: { frame: number; label: string }[] = [];
   /** The first timestamp read, which the others are measured from. */
   #origin: bigint | null = null;
+  /** Each label's latest time: the frame it ran in and its nanoseconds there, summed. */
+  readonly latest = new Map<string, { frame: number; nanos: number }>();
+  /** Called after each readback: what waits for a label's time looks again. */
+  onRead: (() => void) | null = null;
   /** The submissions timed so far. */
   #submissions = 0;
   /** The readbacks under way. */
   readonly #reading: Promise<void>[] = [];
   readonly results: GpuTiming[] = [];
 
-  constructor(readonly device: GPUDevice) {
+  /** `keep`: every timing is kept (`settled`), for a run timed from its start; a timer the
+   * program started (`std::gpu::timed`) keeps only each label's latest. */
+  constructor(
+    readonly device: GPUDevice,
+    readonly keep = true,
+  ) {
     this.#queries = device.createQuerySet({ label: "timestamps", type: "timestamp", count: 2 * TIMED_PASSES });
     this.#resolve = device.createBuffer({
       label: "timestamps",
@@ -551,9 +560,14 @@ class Timer {
           const start = Number(a - this.#origin);
           // An end before its start (a clock that wrapped) is taken as the start.
           const end = Math.max(start, Number(b - this.#origin));
-          this.results.push({ ...p, nanos: end - start, start, end, submission });
+          const nanos = end - start;
+          const l = this.latest.get(p.label);
+          if (l === undefined || l.frame < p.frame) this.latest.set(p.label, { frame: p.frame, nanos });
+          else if (l.frame === p.frame) l.nanos += nanos;
+          if (this.keep) this.results.push({ ...p, nanos, start, end, submission });
         });
         staging.unmap();
+        this.onRead?.();
       }).finally(() => staging.destroy());
       // A failed map may arrive before timings() waits for it.
       void reading.catch(() => {});
@@ -600,7 +614,10 @@ export class GpuExecutor {
   /** A pass that ended, not yet recorded: the next pass in its frame continues it if it may join
    * it, on the same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
   #ended: OpenPass | null = null;
-  readonly #timer: Timer | null;
+  #timer: Timer | null;
+  /** The program's asks for a label's time (`std::gpu::timed`): each one's label, the frame it
+   * was asked in, and its answer's resolver. */
+  readonly #asked: { label: string; from: number; answer: (bytes: Bytes) => void }[] = [];
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
@@ -734,6 +751,33 @@ export class GpuExecutor {
   /** Whether passes are timed. */
   get timed(): boolean {
     return this.#timer !== null;
+  }
+
+  /** The GPU time of the passes and dispatches labelled `label` in the first frame from this
+   * one on that runs one, summed: an `f32` of microseconds, once read back. The first ask starts
+   * a timer, on a device with "timestamp-query"; without it, this rejects. */
+  timeLabel(label: string): Promise<Bytes> {
+    if (this.#timer === null) {
+      if (!this.device.features.has("timestamp-query")) {
+        return Promise.reject(new Error("this GPU can't time its work: it has no timestamp queries"));
+      }
+      this.#timer = new Timer(this.device, false);
+    }
+    this.#timer.onRead ??= () => this.#answerTimes();
+    return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer }));
+  }
+
+  /** Answers each ask whose label has been timed in a frame from the one it was asked in. */
+  #answerTimes(): void {
+    const latest = this.#timer?.latest;
+    if (latest === undefined) return;
+    for (let i = this.#asked.length - 1; i >= 0; i--) {
+      const ask = this.#asked[i]!;
+      const l = latest.get(ask.label);
+      if (l === undefined || l.frame < ask.from) continue;
+      this.#asked.splice(i, 1);
+      ask.answer(new Uint8Array(new Float32Array([l.nanos / 1000]).buffer));
+    }
   }
 
   /** Each timed pass's GPU time so far, once read back. */
@@ -998,6 +1042,7 @@ export class GpuExecutor {
       case "StorageRead":
       case "StorageWrite":
       case "Fetch":
+      case "Timed":
         return;
     }
   }

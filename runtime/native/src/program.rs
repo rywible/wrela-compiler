@@ -245,6 +245,16 @@ pub(crate) trait Executor: 'static {
     fn limits(&self) -> wrela_abi::Limits {
         wrela_abi::Limits::DEFAULT
     }
+    /// Asks for the GPU time of the work labelled `label` from the current call on, for request
+    /// `request` (`std::gpu::timed`): why not, if this host can't time it.
+    fn ask_time(&mut self, _request: u32, _label: &str) -> std::result::Result<(), String> {
+        Err("this host has no GPU whose work it times".into())
+    }
+    /// The asks for a time that are answered now: each request, and its time's bytes (an `f32`
+    /// of microseconds).
+    fn times(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        Vec::new()
+    }
     /// Hot reload: forget the old build's resources, and take the new build's pipelines.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn reload(&mut self, _manifest: &Manifest, _shaders: &[String]) -> Result<()> {
@@ -674,7 +684,8 @@ impl<E: Executor> State<E> {
                 | Command::Post { request, .. }
                 | Command::HostRequest { request, .. }
                 | Command::Prepare { request, .. }
-                | Command::HandOver { request, .. } => {
+                | Command::HandOver { request, .. }
+                | Command::Timed { request, .. } => {
                     self.requests.start(*request, cmd.opcode())?;
                     self.requests.reserved.insert(*request);
                 }
@@ -715,6 +726,13 @@ impl<E: Executor> State<E> {
                 } else {
                     self.requests.waiting.push(*request);
                     self.handing.push(Handing::HandOver { request: *request, path });
+                }
+            }
+            Command::Timed { request, label } => {
+                self.requests.start(*request, cmd.opcode())?;
+                match self.executor.ask_time(*request, label) {
+                    Ok(()) => self.requests.waiting.push(*request),
+                    Err(why) => self.requests.arriving.push((*request, Err(why))),
                 }
             }
             Command::Unprepare { path } if self.hands_over => {
@@ -1660,6 +1678,12 @@ impl<E: Executor> Program<E> {
         let result = state.executor.end_frame();
         if let Err(error) = &result {
             state.failed = Some(error.to_string());
+        }
+        // The times asked for that this call's work answered: the program sees them from its
+        // next call on.
+        for (request, answer) in state.executor.times() {
+            state.requests.waiting.retain(|&r| r != request);
+            state.requests.answered.insert(request, answer);
         }
         result
     }

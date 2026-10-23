@@ -1128,6 +1128,22 @@ pub fn read<T: GpuData + Plain>(span: GpuSpan<T>) -> Pending<T> {
 @intrinsic
 fn read_buffer_command(request: u32, handle: u32, offset: u32, size: u32) {}
 
+/// The GPU time of the passes and dispatches labelled `name` (`label`), in microseconds: a
+/// request, answered with their time in the first frame from this one on that runs one, summed,
+/// once the host has read it. It fails on a host that can't time GPU work (the CPU host, or a
+/// GPU without timestamp queries). A host times a program's work only once it asks, so the
+/// first answer may wait a frame. It's `nondet`: the time is the device's. A program measures
+/// its own costs with it (a planner's, say); a test can check that a cost was measured, but no
+/// test asserts how small it is.
+pub fn timed(name: str) -> Pending<f32> {
+    let request = next_request()
+    timed_command(request, name)
+    Pending::new(request)
+}
+
+@intrinsic
+fn timed_command(request: u32, name: str) {}
+
 /// The GPU's limits: the hosts open the device with the adapter's own, which are at least
 /// WebGPU's defaults (8192-texel textures, 128 MiB buffers, and so on). A program that wants
 /// more than the defaults asks, and adapts. It's `nondet`: another GPU gives other numbers.

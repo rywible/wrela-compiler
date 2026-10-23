@@ -527,6 +527,11 @@ impl Checker {
                 }
             }
             Command::Label { .. } => {}
+            Command::Timed { label, .. } => {
+                if label.is_empty() {
+                    return err("a timed label is empty: it names no pass or dispatch".into());
+                }
+            }
         }
         Ok(())
     }

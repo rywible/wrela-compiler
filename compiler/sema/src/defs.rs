@@ -208,6 +208,7 @@ macro_rules! lang_items {
                         | Lang::EndPass
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
+                        | Lang::TimedCommand
                 )
             }
 
@@ -243,6 +244,7 @@ macro_rules! lang_items {
                     Lang::RequestStatus
                         | Lang::RequestTake
                         | Lang::ReadBufferCommand
+                        | Lang::TimedCommand
                         | Lang::Limit
                         | Lang::InputTake
                         | Lang::PayloadTake
@@ -377,6 +379,7 @@ lang_items! {
     TextureDepth = "std::gpu::texture_depth",
     SpanLen = "std::gpu::span_len",
     ReadBufferCommand = "std::gpu::read_buffer_command",
+    TimedCommand = "std::gpu::timed_command",
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",
     RequestTake = "std::mem::take_answer",

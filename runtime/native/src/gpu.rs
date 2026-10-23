@@ -319,6 +319,11 @@ struct Timer {
     /// What each pair of queries in this submission times.
     pending: Vec<Timed>,
     results: Vec<GpuTiming>,
+    /// Whether every timing is kept for [`Gpu::take_timings`] (a run timed from its start): a
+    /// timer the program started (`std::gpu::timed`) keeps only each label's latest.
+    keep: bool,
+    /// Each label's latest time: the call it ran in and its nanoseconds there, summed.
+    latest: HashMap<String, (usize, f64)>,
     /// Each pass and dispatch submitted and waited for alone, so none overlaps another: each
     /// one's own time (the serial mode).
     serial: bool,
@@ -326,9 +331,10 @@ struct Timer {
     submissions: usize,
 }
 
-/// A pass or dispatch timed in this submission.
+/// A pass or dispatch timed in this submission, the frame and the call it's in.
 struct Timed {
     frame: usize,
+    call: usize,
     label: String,
 }
 
@@ -369,6 +375,13 @@ pub(crate) struct Gpu {
     /// Each label's pass's target, the last pass of that label that drew into a texture: its
     /// colour, else its depth ([`Gpu::read_target`], a test's golden of a pass).
     labelled: HashMap<String, u32>,
+    /// Whether the device has timestamp queries, so a program may ask for its work's time.
+    can_time: bool,
+    /// The program's asks for a label's time (`std::gpu::timed`): each request, its label and
+    /// the call it was asked in.
+    asked: Vec<(u32, String, usize)>,
+    /// The calls ended so far: a timing's call, and an ask's.
+    calls: usize,
     timer: Option<Timer>,
     /// The name the program gave the passes and dispatches after it in this frame (`Label`).
     label: Option<Arc<str>>,
@@ -412,6 +425,15 @@ fn gpu_err(e: impl std::fmt::Display) -> Error {
 /// Opens the high-performance adapter's device with `features` and the adapter's limits, as the
 /// browser runtime asks for them: the program sees the GPU's real limits (`wrela.limit`).
 pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Device, wgpu::Queue)> {
+    open_device_with(label, features, wgpu::Features::empty())
+}
+
+/// [`open_device`], with `optional` features too wherever the adapter has them.
+pub fn open_device_with(
+    label: &str,
+    features: wgpu::Features,
+    optional: wgpu::Features,
+) -> Result<(wgpu::Device, wgpu::Queue)> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: wgpu::Backends::PRIMARY,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
@@ -427,6 +449,7 @@ pub fn open_device(label: &str, features: wgpu::Features) -> Result<(wgpu::Devic
     if !missing.is_empty() {
         return Err(Error::Gpu(format!("{} doesn't support {missing:?}", info.name)));
     }
+    let features = features | (optional & adapter.features());
     pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some(label),
         required_features: features,
@@ -456,7 +479,10 @@ impl Gpu {
         if timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
-        let (device, queue) = open_device("wrela-host", features)?;
+        // Timestamps wherever the adapter has them: a program may ask for its work's time.
+        let (device, queue) =
+            open_device_with("wrela-host", features, wgpu::Features::TIMESTAMP_QUERY)?;
+        let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
 
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -480,7 +506,7 @@ impl Gpu {
         let ring = Ring::new(&device, "uniform ring", usage, RING_START);
         let usage = wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST;
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
-        let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial));
+        let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
             device,
             queue,
@@ -502,6 +528,9 @@ impl Gpu {
             buffer_readback: None,
             screen_readback: None,
             labelled: HashMap::new(),
+            can_time: device_times,
+            asked: Vec::new(),
+            calls: 0,
             timer,
             label: None,
             errors,
@@ -562,9 +591,14 @@ impl Gpu {
         self.frame = 0;
         self.debug_flag = None;
         self.spare.clear();
-        if let Some(timer) = &mut self.timer {
-            *timer = Timer::new(&self.device, timer.serial);
-        }
+        // A timer the host runs from the start begins again; one the last program asked for
+        // goes with it, as its asks and its labels' targets do.
+        self.timer = match self.timer.take() {
+            Some(t) if t.keep => Some(Timer::new(&self.device, t.serial, true)),
+            _ => None,
+        };
+        self.asked.clear();
+        self.labelled.clear();
         self.take_pipelines(manifest, shaders)
     }
 
@@ -1305,7 +1339,7 @@ impl Gpu {
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1472,7 +1506,7 @@ impl Gpu {
         if let (Some(name), Some(target)) = (&open.label, target) {
             self.labelled.insert(name.to_string(), target);
         }
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
+        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
@@ -1888,7 +1922,8 @@ impl Executor for Gpu {
             | Command::HostRequest { .. }
             | Command::Prepare { .. }
             | Command::Unprepare { .. }
-            | Command::HandOver { .. } => {}
+            | Command::HandOver { .. }
+            | Command::Timed { .. } => {}
             // The passes and dispatches after it share it; a name given again is kept.
             Command::Label { name } => {
                 if self.label.as_deref() != Some(*name) {
@@ -1902,8 +1937,33 @@ impl Executor for Gpu {
     fn end_frame(&mut self) -> Result<()> {
         self.flush()?;
         self.collect()?;
+        self.calls += 1;
         self.check_errors()?;
         self.check_debug_flag()
+    }
+
+    fn ask_time(&mut self, request: u32, label: &str) -> std::result::Result<(), String> {
+        if self.timer.is_none() {
+            if !self.can_time {
+                return Err("this GPU can't time its work: it has no timestamp queries".into());
+            }
+            self.timer = Some(Timer::new(&self.device, false, false));
+        }
+        self.asked.push((request, label.to_string(), self.calls));
+        Ok(())
+    }
+
+    fn times(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        let Some(timer) = &self.timer else { return Vec::new() };
+        let mut answered = Vec::new();
+        self.asked.retain(|(request, label, from)| match timer.latest.get(label) {
+            Some(&(call, nanos)) if call >= *from => {
+                answered.push((*request, Ok(((nanos / 1000.0) as f32).to_le_bytes().to_vec())));
+                false
+            }
+            _ => true,
+        });
+        answered
     }
 
     fn read_back(&mut self, handle: u32, offset: u32, size: u32) -> Result<Vec<u8>> {
@@ -2039,10 +2099,12 @@ fn map_read_with<T>(
 }
 
 impl Timer {
-    fn new(device: &wgpu::Device, serial: bool) -> Timer {
+    fn new(device: &wgpu::Device, serial: bool, keep: bool) -> Timer {
         let (resolved, readback) = query_buffers(device, TIMESTAMP_QUERIES);
         Timer {
             serial,
+            keep,
+            latest: HashMap::new(),
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -2058,8 +2120,8 @@ impl Timer {
 
     /// Notes a pass about to be timed; returns the first of its two query indices.
     /// [`Gpu::reserve_timestamps`] must have made room.
-    fn next(&mut self, frame: usize, label: &str) -> u32 {
-        self.pending.push(Timed { frame, label: label.to_string() });
+    fn next(&mut self, frame: usize, call: usize, label: &str) -> u32 {
+        self.pending.push(Timed { frame, call, label: label.to_string() });
         (self.pending.len() as u32 - 1) * 2
     }
 
@@ -2076,16 +2138,19 @@ impl Timer {
             self.pending.len() as u32,
         )?;
         for (timed, (start, end)) in self.pending.drain(..).zip(times) {
-            let Timed { frame, label } = timed;
+            let Timed { frame, call, label } = timed;
             let submission = self.submissions;
-            self.results.push(GpuTiming {
-                frame,
-                label,
-                nanos: end - start,
-                start,
-                end,
-                submission,
-            });
+            let nanos = end - start;
+            match self.latest.get_mut(&label) {
+                Some(l) if l.0 == call => l.1 += nanos,
+                Some(l) if l.0 > call => {}
+                _ => {
+                    self.latest.insert(label.clone(), (call, nanos));
+                }
+            }
+            if self.keep {
+                self.results.push(GpuTiming { frame, label, nanos, start, end, submission });
+            }
             if self.serial {
                 self.submissions += 1;
             }

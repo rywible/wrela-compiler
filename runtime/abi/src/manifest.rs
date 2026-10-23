@@ -980,7 +980,7 @@ mod tests {
         let json = sample().to_json();
         let expected = r#"{
   "manifest_version": 9,
-  "stream_version": 10,
+  "stream_version": 11,
   "wasm": "game.wasm",
   "pipelines": [
     {

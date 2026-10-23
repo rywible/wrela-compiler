@@ -107,7 +107,8 @@ export type Command =
   | { op: "HostRequest"; request: number; service: string; body: Bytes }
   | { op: "Prepare"; request: number; path: string }
   | { op: "Unprepare"; path: string }
-  | { op: "HandOver"; request: number; path: string };
+  | { op: "HandOver"; request: number; path: string }
+  | { op: "Timed"; request: number; label: string };
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -370,12 +371,15 @@ export function decode(batch: Bytes): Command[] {
       case "StorageRead":
       case "Fetch":
       case "Prepare":
-      case "HandOver": {
+      case "HandOver":
+      case "Timed": {
         if (words < 2) throw bad("expected at least 2 words");
         const n = w(1);
         if (padded(n) !== len - 8) throw bad("the text's length doesn't match the payload");
         const t = text(8, n, "text");
-        cmd = name === "Fetch" ? { op: name, request: w(0), url: t } : { op: name, request: w(0), path: t };
+        if (name === "Fetch") cmd = { op: name, request: w(0), url: t };
+        else if (name === "Timed") cmd = { op: name, request: w(0), label: t };
+        else cmd = { op: name, request: w(0), path: t };
         break;
       }
       case "Label":

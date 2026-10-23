@@ -14,16 +14,16 @@ test("software and unclassified adapters fail before a device is requested", asy
     Object.defineProperty(navigator, "gpu", { configurable: true, value: {
       requestAdapter: async () => ({ info: { isFallbackAdapter }, requestDevice }),
     } });
-    await expect(openDevice(false, () => {})).rejects.toThrow("hardware GPU required");
-    await expect(openDevice(false, () => {})).rejects.toBeInstanceOf(UnsupportedError);
+    await expect(openDevice(() => {})).rejects.toThrow("hardware GPU required");
+    await expect(openDevice(() => {})).rejects.toBeInstanceOf(UnsupportedError);
   }
   expect(requestDevice).not.toHaveBeenCalled();
 });
 
 test("a missing adapter reports its cause, as a machine that can't run a program", async () => {
   Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter: async () => null } });
-  await expect(openDevice(false, () => {})).rejects.toThrow("no adapter");
-  await expect(openDevice(false, () => {})).rejects.toBeInstanceOf(UnsupportedError);
+  await expect(openDevice(() => {})).rejects.toThrow("no adapter");
+  await expect(openDevice(() => {})).rejects.toBeInstanceOf(UnsupportedError);
 });
 
 test("hardware adapters retain limits and enable indirect first instances and timestamps", async () => {
@@ -32,7 +32,7 @@ test("hardware adapters retain limits and enable indirect first instances and ti
   const requestAdapter = mock(async (_options: GPURequestAdapterOptions) => ({ info: { isFallbackAdapter: false }, limits: {},
     features: new Set(["timestamp-query", "indirect-first-instance"]), requestDevice }));
   Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter } });
-  expect(await openDevice(true, () => {})).toBe(device as unknown as GPUDevice);
+  expect(await openDevice(() => {})).toBe(device as unknown as GPUDevice);
   expect(requestAdapter).toHaveBeenCalledWith({ powerPreference: "high-performance" });
   expect(requestDevice.mock.calls[0]).toEqual([{ requiredLimits: expect.any(Object), requiredFeatures: ["indirect-first-instance", "timestamp-query"] }]);
 });
@@ -42,7 +42,7 @@ test("an adapter without indirect first instances fails before requesting a devi
   Object.defineProperty(navigator, "gpu", { configurable: true, value: {
     requestAdapter: async () => ({ info: { isFallbackAdapter: false }, features: new Set(), requestDevice }),
   } });
-  await expect(openDevice(false, () => {})).rejects.toThrow("indirect-first-instance");
-  await expect(openDevice(false, () => {})).rejects.toBeInstanceOf(UnsupportedError);
+  await expect(openDevice(() => {})).rejects.toThrow("indirect-first-instance");
+  await expect(openDevice(() => {})).rejects.toBeInstanceOf(UnsupportedError);
   expect(requestDevice).not.toHaveBeenCalled();
 });

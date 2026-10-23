@@ -1,7 +1,7 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
-export const STREAM_VERSION = 10;
+export const STREAM_VERSION = 11;
 export const MANIFEST_VERSION = 9;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
@@ -44,6 +44,7 @@ export const Opcode = {
   Unprepare: 27,
   HandOver: 28,
   HostRequest: 29,
+  Timed: 30,
 } as const;
 
 /** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
