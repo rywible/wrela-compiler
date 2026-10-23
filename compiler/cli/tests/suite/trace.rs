@@ -168,3 +168,67 @@ fn a_debug_build_stops_at_the_nan_a_release_build_goes_on_with() {
     let a: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(a["frame"].as_u64(), Some(below), "{a}");
 }
+
+/// A program whose ticker counts its ticks at 60 Hz and hands each count to the frames.
+const TICKED: &str = "use std::handoff::{Latest, Publisher, handoff}
+use std::hash::state_hash
+use std::tick::{Ticked, start}
+
+struct Sim {
+    ticks: u32,
+    out: Publisher<u32>,
+}
+
+@deterministic
+fn step(sim: mut Sim, t: Ticked) {
+    sim.out.publish(t.tick)
+    sim.ticks += 1
+}
+
+@deterministic
+fn hash(sim: Sim) -> u64 {
+    state_hash(sim.ticks)
+}
+
+pub struct Game {
+    latest: Latest<u32>,
+    newest: u32,
+}
+
+pub fn init() -> Game {
+    let (out, latest) = handoff(0)
+    start(Sim { ticks: 0, out: take out }, hz: 60, step: step, hash: hash)
+    Game { latest: take latest, newest: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    game.newest = game.latest.read()
+}
+
+pub fn tick(game: Game) -> u32 {
+    game.newest
+}
+";
+
+/// A ticked program's frames run in lockstep with its ticker, as `wrela-host` runs them: at
+/// 60 Hz and 60 frames a second, frame `i` sees tick `i`, in a trace and in a bisect.
+#[test]
+fn trace_and_bisect_run_a_ticked_programs_ticks() {
+    let dir = common::package(
+        "trace-ticked",
+        &[("wrela.toml", &common::manifest("ticked")), ("main.wrela", TICKED)],
+    );
+    let d = dir.to_str().unwrap();
+    let out = wrela(&["trace", d, "--watch", "tick", "--frames", "10", "--csv"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let ticks: Vec<u64> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .skip(1)
+        .map(|r| r.split(',').nth(2).unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(ticks, (0..10).collect::<Vec<u64>>(), "{}", text(&out));
+    let out = wrela(&["bisect", d, "--until", "tick >= 5", "--json"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let a: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(a["frame"].as_u64(), Some(5), "{a}");
+}
