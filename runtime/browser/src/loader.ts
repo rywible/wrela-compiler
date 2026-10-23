@@ -102,8 +102,14 @@ export function browserIo(
       return new Uint8Array(await response.arrayBuffer());
     },
     async storageRead(path) {
-      const f = await (await file(path, false)).getFile();
-      return new Uint8Array(await f.arrayBuffer());
+      try {
+        const f = await (await file(path, false)).getFile();
+        return new Uint8Array(await f.arrayBuffer());
+      } catch (error) {
+        // The private file system has nothing there: the file, or a directory on its way.
+        if ((error as { name?: unknown } | null)?.name === "NotFoundError") return null;
+        throw error;
+      }
     },
     async storageWrite(path, data) {
       const w = await (await file(path, true)).createWritable();

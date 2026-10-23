@@ -1,5 +1,6 @@
 //! Requests (language.md §17.1, AC6): compiler/tests/requests makes a readback, a store and a
-//! load of its storage, and two fetches (one of a missing file), and polls them on later frames.
+//! load of its storage, a load of a path nothing was stored at, and two fetches (one of a missing
+//! file), and polls them on later frames.
 //! The native host answers each as the program expects, and headless Chrome gives the same
 //! answers: its state hash, which covers a buffer write of every answer, is the native host's.
 //! `cargo test -p wrela-tests --test suite requests:: -- --ignored`.
@@ -37,7 +38,10 @@ fn requests_are_answered_on_later_frames() {
     // The kernel wrote i² for i < 64; each answer is 1 + its sum (0 would be "not yet").
     let squares: u32 = (0..64).map(|i| i * i).sum();
     assert_eq!(readback, (1 + squares) as f32, "the readback");
-    assert_eq!(saved_missing, 11.0, "the store succeeded and the missing file failed");
+    assert_eq!(
+        saved_missing, 111.0,
+        "the store succeeded, the missing file failed, and the load of nothing stored was missing"
+    );
     assert_eq!(loaded, 16.0, "the load gave back what was stored: 1 + 1 + 2 + 3 + 4 + 5");
     let level: u32 = LEVEL.iter().map(|&b| u32::from(b)).sum();
     assert_eq!(fetched, (1 + level) as f32, "the fetch");

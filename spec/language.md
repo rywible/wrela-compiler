@@ -1977,6 +1977,7 @@ A **request** is work that the program asks the host for, and reads the answer o
 - A request has the `io` effect to make (a readback `nondet` and `host`), and the `nondet` effect to poll. So `@deterministic` code can't make or poll one (E0600). A result reaches the sim only through a tick's input, so it enters on a known tick.
 - A path is relative, with `/` between its parts. No part may be empty, `.` or `..`; another path panics when the request is made.
 - Storage is files under the host's storage directory on the native host, and the origin's private file system in a browser.
+- A `load` of a path that holds nothing (neither the file nor a directory on its way) fails with an `IoError` whose `missing()` is true: nothing was stored there. Every other failure, a storage that can't be read among them, has `missing()` false and says nothing of what's stored, so a program that would store over it doesn't take it as empty.
 
 A game already has a suspension point, the tick or the frame, so the language doesn't need another. A handle is an ordinary value, so nothing needs `Pin`.
 

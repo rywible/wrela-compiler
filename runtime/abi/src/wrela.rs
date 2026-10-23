@@ -87,6 +87,11 @@ const NUMBERS: &[(&str, u32, &str)] = &[
 const SIGNED: &[(&str, i32, &str)] = &[
     ("REQUEST_PENDING", crate::REQUEST_PENDING, "A request's status while it isn't answered."),
     ("REQUEST_FAILED", crate::REQUEST_FAILED, "A request's status once it has failed."),
+    (
+        "REQUEST_MISSING",
+        crate::REQUEST_MISSING,
+        "A storage read's status once it has failed because its path holds nothing.",
+    ),
 ];
 
 /// The wrela module `compiler/std/abi.wrela`.

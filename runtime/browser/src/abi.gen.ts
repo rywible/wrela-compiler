@@ -194,6 +194,7 @@ export const TICK_LOG_VERSION = 1;
 export const TICK_LOG_HEADER_LEN = 32;
 export const REQUEST_PENDING = -1;
 export const REQUEST_FAILED = -2;
+export const REQUEST_MISSING = -3;
 export const EXPORT_FRAME = "frame";
 export const EXPORT_INIT = "init";
 export const EXPORT_MEMORY = "memory";

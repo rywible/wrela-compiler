@@ -151,6 +151,9 @@ pub(package) const REQUEST_PENDING: i32 = -1
 /// A request's status once it has failed.
 pub(package) const REQUEST_FAILED: i32 = -2
 
+/// A storage read's status once it has failed because its path holds nothing.
+pub(package) const REQUEST_MISSING: i32 = -3
+
 /// The stream's code for the texture format `rgba8unorm`.
 pub(package) const FORMAT_RGBA8UNORM: u32 = 0
 

@@ -1152,6 +1152,37 @@ fn storage_keeps_bytes_at_paths() {
     assert_eq!(std::fs::read(storage.join("saves/a")).expect("stored"), [9, 8, 7, 6]);
 }
 
+/// A storage read of a path that holds nothing, its file or a directory on its way, says so
+/// (`REQUEST_MISSING`), by the storage's path and through its opened directory; a host without
+/// storage fails it as before, and a missing file in the build is a failed fetch. Once taken, the
+/// number is free and says nothing of the read before.
+#[test]
+fn a_storage_read_of_nothing_stored_says_so() {
+    let storage = scratch_dir("storage-missing");
+    let dir = cap_std::fs::Dir::open_ambient_dir(&storage, cap_std::ambient_authority())
+        .expect("the storage");
+    let by_path = Io { storage: Some(storage.clone()), ..Io::default() };
+    let by_handle = Io { storage_dir: Some(Arc::new(dir)), ..Io::default() };
+    for io in [by_path, by_handle] {
+        for path in ["saves/a", "none"] {
+            let read = Encoder::new().storage_read(4, path).finish();
+            let mut p = requester(&read, io.clone());
+            p.call("ask", &[]).expect("ask");
+            assert_eq!(call_i32(&mut p, "status"), REQUEST_MISSING, "{path}");
+            assert_eq!(call_i32(&mut p, "take"), 0);
+            assert_eq!(call_i32(&mut p, "status"), REQUEST_PENDING, "forgotten");
+        }
+    }
+    let read = Encoder::new().storage_read(4, "saves/a").finish();
+    let mut p = requester(&read, Io::default());
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED, "no storage");
+    let fetch = Encoder::new().fetch(4, "none").finish();
+    let mut p = requester(&fetch, Io { build: Some(storage), ..Io::default() });
+    p.call("ask", &[]).expect("ask");
+    assert_eq!(call_i32(&mut p, "status"), REQUEST_FAILED, "a fetch");
+}
+
 /// A driven build's storage goes through its opened directory alone: a link in it, to a file or a
 /// directory, isn't followed, and its path is never opened.
 #[cfg(unix)]

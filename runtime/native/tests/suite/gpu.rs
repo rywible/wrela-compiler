@@ -435,8 +435,8 @@ fn failed_hand_over_keeps_the_old_build_usable_with_fresh_request_numbers() {
     host.call_export("request", &[]).expect("reuses request ID 1");
     assert_eq!(
         host.call_export("status", &[]).expect("old build remains callable"),
-        [Value::I32(-2)],
-        "the new request was answered"
+        [Value::I32(-3)],
+        "the new request was answered: nothing is stored at its path"
     );
 }
 
