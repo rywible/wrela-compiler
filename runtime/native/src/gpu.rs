@@ -83,6 +83,40 @@ pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
     spans.into_iter().map(|(k, (a, b))| (k, (b - a) / 1e6)).collect()
 }
 
+/// One texel of `format` (its bytes, little-endian) as RGBA8, as [`Gpu::read_target`] gives it.
+fn as_rgba8(format: TextureFormat, t: &[u8]) -> [u8; 4] {
+    let unit = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let half = |i: usize| f16_to_f32(u16::from_le_bytes([t[i], t[i + 1]]));
+    let single = |i: usize| f32::from_le_bytes([t[i], t[i + 1], t[i + 2], t[i + 3]]);
+    match format {
+        TextureFormat::Rgba8 => [t[0], t[1], t[2], t[3]],
+        TextureFormat::Rgba16Float => [unit(half(0)), unit(half(2)), unit(half(4)), unit(half(6))],
+        TextureFormat::Rg16Float => [unit(half(0)), unit(half(2)), 0, 255],
+        TextureFormat::R16Float => {
+            let g = unit(half(0));
+            [g, g, g, 255]
+        }
+        TextureFormat::R32Float | TextureFormat::Depth32Float => {
+            let g = unit(single(0));
+            [g, g, g, 255]
+        }
+        TextureFormat::R32Uint => [0, 0, 0, 255],
+    }
+}
+
+/// An IEEE half's value.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let exponent = i32::from((h >> 10) & 0x1f);
+    let fraction = f32::from(h & 0x3ff);
+    match exponent {
+        0 => sign * fraction * 2f32.powi(-24),
+        31 if fraction == 0.0 => sign * f32::INFINITY,
+        31 => f32::NAN,
+        e => sign * (1.0 + fraction / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
 /// A texture format in wgpu's spelling.
 fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
     match f {
@@ -332,6 +366,9 @@ pub(crate) struct Gpu {
     buffer_readback: Option<wgpu::Buffer>,
     /// Reused between screen captures: mapping is finished before the next copy uses it.
     screen_readback: Option<wgpu::Buffer>,
+    /// Each label's pass's target, the last pass of that label that drew into a texture: its
+    /// colour, else its depth ([`Gpu::read_target`], a test's golden of a pass).
+    labelled: HashMap<String, u32>,
     timer: Option<Timer>,
     /// The name the program gave the passes and dispatches after it in this frame (`Label`).
     label: Option<Arc<str>>,
@@ -464,6 +501,7 @@ impl Gpu {
             screen: None,
             buffer_readback: None,
             screen_readback: None,
+            labelled: HashMap::new(),
             timer,
             label: None,
             errors,
@@ -1426,6 +1464,14 @@ impl Gpu {
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
         let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
+        let target = match (pass.color, pass.depth) {
+            (stream::SCREEN, _) | (stream::NONE, stream::NONE) => None,
+            (stream::NONE, depth) => Some(depth),
+            (colour, _) => Some(colour),
+        };
+        if let (Some(name), Some(target)) = (&open.label, target) {
+            self.labelled.insert(name.to_string(), target);
+        }
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, label));
         let [r, g, b, a] = pass.clear.map(f64::from);
         let mut prepared = Vec::with_capacity(open.draws.len());
@@ -1641,6 +1687,77 @@ impl Gpu {
         })?;
         self.check_errors()?;
         Ok(frame)
+    }
+
+    /// The target of the last pass labelled `label` (`std::gpu::label`) that drew into a texture
+    /// (its colour, else its depth), copied back as RGBA8 rows top to bottom: an 8-bit texture as
+    /// it is; a float one's channels clamped to 0 to 1, one channel grey, two red and green, its
+    /// alpha opaque unless it has one; a depth texture's depth grey. Its width and height too.
+    /// Waits for the GPU.
+    pub(crate) fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
+        self.flush()?;
+        let handle = *self
+            .labelled
+            .get(label)
+            .ok_or_else(|| Error::Gpu(format!("no pass labelled `{label}` drew into a texture")))?;
+        let Some(Resource::Texture { texture, format, .. }) = self.resources.get(&handle) else {
+            return Err(Error::Gpu(format!(
+                "the target of the pass labelled `{label}` was dropped after it"
+            )));
+        };
+        let (width, height, format) = (texture.width(), texture.height(), *format);
+        let texel: u64 = match format {
+            TextureFormat::Rgba8 | TextureFormat::Rg16Float | TextureFormat::R32Float => 4,
+            TextureFormat::Depth32Float => 4,
+            TextureFormat::Rgba16Float => 8,
+            TextureFormat::R16Float => 2,
+            TextureFormat::R32Uint => {
+                return Err(Error::Gpu(format!(
+                    "the target of the pass labelled `{label}` holds integers, not an image"
+                )));
+            }
+        };
+        let row = u64::from(width) * texel;
+        let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+        let staging = self.readback_buffer(padded * u64::from(height));
+        let mut encoder =
+            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let aspect = if format == TextureFormat::Depth32Float {
+            wgpu::TextureAspect::DepthOnly
+        } else {
+            wgpu::TextureAspect::All
+        };
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &staging,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded as u32),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+        );
+        self.queue.submit([encoder.finish()]);
+        let rgba = map_read_with(&self.device, &staging, |bytes| {
+            let mut out = Vec::with_capacity(width as usize * height as usize * 4);
+            for y in 0..height as usize {
+                let at = y * padded as usize;
+                let texels = &bytes[at..at + row as usize];
+                for t in texels.chunks_exact(texel as usize) {
+                    out.extend_from_slice(&as_rgba8(format, t));
+                }
+            }
+            out
+        })?;
+        self.check_errors()?;
+        Ok((width, height, rgba))
     }
 
     /// A debug build's: an error if a pipeline indexed an array out of range (its number, from
@@ -2299,5 +2416,24 @@ mod tests {
         assert_eq!(key, pipeline_key(&p("pipeline_3.wgsl", "main"), "fn main() {}"));
         assert_ne!(key, pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() { }"));
         assert_ne!(key, pipeline_key(&p("pipeline_0.wgsl", "fill"), "fn main() {}"));
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+
+    #[test]
+    fn a_float_targets_texels_become_rgba8_clamped() {
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0x3800), 0.5);
+        assert_eq!(f16_to_f32(0xc000), -2.0);
+        assert_eq!(f16_to_f32(0x0001), 2f32.powi(-24));
+        let half = |x: u16| x.to_le_bytes();
+        let t: Vec<u8> = [half(0x3800), half(0x3c00), half(0x4000), half(0xbc00)].concat();
+        assert_eq!(as_rgba8(TextureFormat::Rgba16Float, &t), [128, 255, 255, 0]);
+        let grey = 0.25f32.to_le_bytes();
+        assert_eq!(as_rgba8(TextureFormat::Depth32Float, &grey), [64, 64, 64, 255]);
+        assert_eq!(as_rgba8(TextureFormat::Rg16Float, &t[..4]), [128, 255, 0, 255]);
     }
 }

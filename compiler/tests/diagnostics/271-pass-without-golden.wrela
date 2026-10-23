@@ -1,0 +1,15 @@
+// mistake: a pass named with no golden to compare it with
+// expect: E0222
+// fix: no
+pub struct S {
+    n: u32,
+}
+
+pub fn init() -> S {
+    S { n: 0 }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {}
+
+@test(frames: 2, gpu: true, pass: "scene")
+fn scene() {}

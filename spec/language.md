@@ -1329,7 +1329,8 @@ pub const PEN: Script = Script::frames()
   - GPU results differ a little between devices (§11.3). So a golden is a frame and a tolerance, not exact bits.
   - `wrela test --bless` first writes each golden it runs from this machine's screen. A test whose golden is missing fails, and says so.
   - A golden or `within` anywhere else is E0222: on a CPU frame test, on a tick test, or `within` with no golden.
-  - A failure says how far the screen is from the golden, the largest difference in one channel, and how many channels differ.
+  - A failure says how far the screen is from the golden, the largest difference in one channel, and how many channels differ. Under `wrela test` (not under a tool's roots), it also writes what it saw and how far each pixel is (each channel's difference times 8) under the package's `build/goldens/`, beside the golden's own path (`build/goldens/goldens/frame.actual.png`, `frame.diff.png`), and names them.
+- **A golden can be of a pass's target:** `golden: "goldens/scene.png", pass: "scene"` compares the target of the last pass labelled `scene` (`std::gpu::label`) that drew into a texture, its colour, else its depth, at the target's own size. An 8-bit target is compared as it is; a float one's channels are clamped to 0 to 1 (one channel grey, two red and green, alpha opaque unless it has one); a depth target's depth is grey. A label that no such pass had, a target dropped since, or one that holds integers fails the test, and says so. `pass` without a golden is E0222.
 
 #### Tool tests
 

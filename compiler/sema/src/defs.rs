@@ -765,6 +765,9 @@ pub struct Golden {
     pub path: String,
     pub span: Span,
     pub within: f64,
+    /// `pass: "label"`: the golden is of the target of the last pass so labelled, not of the
+    /// screen.
+    pub pass: Option<String>,
 }
 
 /// A golden's `within` unless the test says: half an 8-bit step, on average.

@@ -992,6 +992,12 @@ impl Host {
         self.p().executor().read_screen_region([x, y], [width, height])
     }
 
+    /// The target of the last pass labelled `label` that drew into a texture, as RGBA8 (floats
+    /// clamped, depth grey), and its width and height: a test's golden of a pass (§13.2).
+    pub fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
+        self.p().executor().read_target(label)
+    }
+
     /// The lines the program printed (`std::io::print`) since the last call.
     pub fn take_logs(&mut self) -> Vec<String> {
         self.p().take_logs()

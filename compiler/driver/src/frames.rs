@@ -338,11 +338,15 @@ fn run_gpu_frames(
     }
     if let Some((g, root, bless, reach)) = golden {
         let after = format!("after {frames} frames");
-        let screen = match host.read_screen() {
-            Ok(s) => s,
+        let image = match &g.pass {
+            None => host.read_screen().map(|s| (WIDTH, HEIGHT, s)),
+            Some(label) => host.read_target(label),
+        };
+        let (w, h, image) = match image {
+            Ok(i) => i,
             Err(e) => return failed(e, None, after),
         };
-        if let Err(why) = against_golden(g, root, &screen, bless, reach) {
+        if let Err(why) = against_golden(g, root, (w, h, &image), bless, reach) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
     }
@@ -352,7 +356,8 @@ fn run_gpu_frames(
     }
 }
 
-/// The screen after a GPU frame test's frames against its golden (§13): within its mean
+/// The screen (or a pass's target: `image`, its width, height and RGBA8) after a GPU frame
+/// test's frames against its golden (§13): within its mean
 /// difference, or why not. With `bless`, the golden is written from the screen first. It's read
 /// through `reach`: in a tool's toolchain, through its roots' handles, so a package swapped
 /// for a link out of them reads nothing.
@@ -360,17 +365,21 @@ fn run_gpu_frames(
 fn against_golden(
     g: &Golden,
     root: &Path,
-    screen: &[u8],
+    (width, height, screen): (u32, u32, &[u8]),
     bless: bool,
     reach: &crate::reach::Reach,
 ) -> Result<(), String> {
     let path = &g.path;
     let full = golden_path(root, path)?;
+    let what = match &g.pass {
+        None => "the screen".to_string(),
+        Some(label) => format!("the target of the pass `{label}`"),
+    };
     if bless {
         if let Some(dir) = full.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        wrela_host::image::write_png(&full, WIDTH, HEIGHT, screen)
+        wrela_host::image::write_png(&full, width, height, screen)
             .map_err(|e| format!("writing its golden `{path}`: {e}"))?;
     }
     let (w, h, want) = reach
@@ -378,21 +387,60 @@ fn against_golden(
         .map_err(|e| e.to_string())
         .and_then(|bytes| wrela_host::image::png_of(&bytes, &full).map_err(|e| e.to_string()))
         .map_err(|why| {
-            format!("it has no golden `{path}` to compare the screen with ({why}): `wrela test --bless` writes it from this machine's")
+            format!("it has no golden `{path}` to compare {what} with ({why}): `wrela test --bless` writes it from this machine's")
         })?;
-    if (w, h) != (WIDTH, HEIGHT) {
-        return Err(format!(
-            "its golden `{path}` is {w}×{h}, and a frame test's screen is {WIDTH}×{HEIGHT}"
-        ));
+    if (w, h) != (width, height) {
+        return Err(format!("its golden `{path}` is {w}×{h}, and {what} is {width}×{height}"));
     }
     let d = wrela_host::image::compare(screen, &want)?;
     if d.mean > g.within {
+        let shown = shown_beside(root, path, (width, height, screen), &want, reach);
         return Err(format!(
-            "the screen is {:.3}/255 from its golden `{path}` on average, more than the {} it may be (a channel differs by {}/255 at most; {} of {} channels differ)",
+            "{what} is {:.3}/255 from its golden `{path}` on average, more than the {} it may be (a channel differs by {}/255 at most; {} of {} channels differ){shown}",
             d.mean, g.within, d.max, d.differing, d.channels
         ));
     }
     Ok(())
+}
+
+/// What a failed golden saw, and how far each pixel is from the golden (each channel's
+/// difference times 8, opaque), written under the package's `build/goldens/` beside the
+/// golden's own path (`frame.actual.png`, `frame.diff.png`) for `wrela test` run on the
+/// package: the failure's words for them. Not under a tool's roots (a confined compile writes
+/// nothing beside a package), and nothing if the writes fail.
+#[cfg(feature = "gpu")]
+fn shown_beside(
+    root: &Path,
+    path: &str,
+    (width, height, seen): (u32, u32, &[u8]),
+    want: &[u8],
+    reach: &crate::reach::Reach,
+) -> String {
+    if reach.is_confined() {
+        return String::new();
+    }
+    let stem = path.strip_suffix(".png").unwrap_or(path);
+    let at = root.join("build/goldens");
+    let (actual, diff) =
+        (at.join(format!("{stem}.actual.png")), at.join(format!("{stem}.diff.png")));
+    let difference: Vec<u8> = seen
+        .chunks_exact(4)
+        .zip(want.chunks_exact(4))
+        .flat_map(|(a, b)| {
+            let d = |i: usize| a[i].abs_diff(b[i]).saturating_mul(8);
+            [d(0), d(1), d(2), 255]
+        })
+        .collect();
+    let written = actual.parent().map_or(Ok(()), std::fs::create_dir_all).is_ok()
+        && wrela_host::image::write_png(&actual, width, height, seen).is_ok()
+        && wrela_host::image::write_png(&diff, width, height, &difference).is_ok();
+    if written {
+        format!(
+            ": what it saw is `build/goldens/{stem}.actual.png`, and how far, `build/goldens/{stem}.diff.png`"
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// A golden's path inside the package, with no symbolic link through which reading or blessing
@@ -611,14 +659,16 @@ mod tests {
             path: "goldens/frame.png".into(),
             span: wrela_diag::Span::new(wrela_diag::FileId(0), 0, 0),
             within: 0.5,
+            pass: None,
         };
         let reach = crate::reach::Reach::within(std::slice::from_ref(&root)).expect("the root");
         let pkg = root.join("package");
-        against_golden(&golden, &pkg, &screen, false, &reach).expect("the package's golden");
+        let seen = (WIDTH, HEIGHT, screen.as_slice());
+        against_golden(&golden, &pkg, seen, false, &reach).expect("the package's golden");
         // The package, swapped for a link to a directory outside the root.
         std::fs::rename(&pkg, root.join("moved")).expect("move");
         std::os::unix::fs::symlink(&outside, &pkg).expect("a link out");
-        let refused = against_golden(&golden, &pkg, &screen, false, &reach).expect_err("outside");
+        let refused = against_golden(&golden, &pkg, seen, false, &reach).expect_err("outside");
         assert!(refused.contains("outside the roots"), "{refused}");
     }
 }

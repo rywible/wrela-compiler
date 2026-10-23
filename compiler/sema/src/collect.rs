@@ -1202,7 +1202,7 @@ impl<'d, 'u> Collector<'d, 'u> {
             !x.name.as_ref().is_some_and(|n| {
                 matches!(
                     n.name.as_str(),
-                    "frames" | "ticks" | "input" | "gpu" | "golden" | "within" | "hold"
+                    "frames" | "ticks" | "input" | "gpu" | "golden" | "within" | "pass" | "hold"
                 )
             })
         });
@@ -1245,10 +1245,15 @@ impl<'d, 'u> Collector<'d, 'u> {
             }
             Some(_) => Err(()),
         };
-        let golden = match (path("golden"), within, gpu) {
-            (Ok(None), _, _) if named("within").is_none() => Ok(None),
-            (Ok(Some((path, span))), Ok(within), Ok(true)) => {
-                Ok(Some(Golden { path, span, within }))
+        // `pass: "label"`: a golden of that pass's target, not the screen.
+        let pass = match named("pass") {
+            None => Ok(None),
+            Some(x) => str_lit(&x.value).filter(|l| !l.is_empty()).map(Some).ok_or(()),
+        };
+        let golden = match (path("golden"), within, gpu, pass) {
+            (Ok(None), _, _, Ok(None)) if named("within").is_none() => Ok(None),
+            (Ok(Some((path, span))), Ok(within), Ok(true), Ok(pass)) => {
+                Ok(Some(Golden { path, span, within, pass }))
             }
             _ => Err(()),
         };
@@ -1289,7 +1294,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead); `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
                 );
                 (None, None, false, None, Vec::new())
             }

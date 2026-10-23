@@ -653,7 +653,9 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
 /// Frame tests on the GPU (§13, `@test(frames: n, gpu: true)`): compiler/tests/gpu-frames has a
 /// kernel square numbers and reads them back between frames; one test finds the squares, and
 /// one that expects a wrong square fails with the values it compared. Its frames draw a ramp:
-/// the screen is within its golden, and far from a black one.
+/// the screen is within its golden, and far from a black one (the failure writes what it saw
+/// and how far beside the package's build); and the ramp's float target, named by its pass's
+/// label, is within a golden of its own.
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
@@ -668,12 +670,18 @@ fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
             ("a_wrong_square_fails", false),
             ("the_ramp_is_its_golden", true),
             ("a_ramp_is_not_black", false),
+            ("the_ramp_target_is_its_golden", true),
         ]
     );
     let why =
         |i: usize| out.results[i].failure.as_ref().map(|d| d.message.clone()).unwrap_or_default();
     assert!(why(1).contains("9"), "{}", why(1));
     assert!(why(3).contains("from its golden `goldens/black.png`"), "{}", why(3));
+    assert!(why(3).contains("`build/goldens/goldens/black.diff.png`"), "{}", why(3));
+    let diff = dir.join("build/goldens/goldens/black.diff.png");
+    let (w, h, _) =
+        wrela_host::image::png_of(&std::fs::read(&diff).expect("the diff"), &diff).expect("a PNG");
+    assert_eq!((w, h), (640, 480));
 }
 
 /// A golden is written by `--bless` (`wrela test --bless`), from this machine's screen, and a
