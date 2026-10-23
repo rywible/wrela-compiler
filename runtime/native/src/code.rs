@@ -212,7 +212,7 @@ impl Cache {
     }
 
     /// The module of `wasm` for `engine`: its code read back from the cache, else compiled and
-    /// kept.
+    /// kept. A fresh compile is returned directly, without deserializing its saved copy.
     pub fn module(&self, engine: &Engine, wasm: &[u8]) -> Result<Module, String> {
         let sha = sha256(wasm);
         if let Some(bytes) = self.get(engine, &sha)
@@ -220,9 +220,11 @@ impl Cache {
         {
             return Ok(m);
         }
-        let bytes = compile(engine, wasm)?;
-        self.put(engine, &sha, &bytes);
-        load(engine, &bytes)
+        let module = Module::new(engine, wasm).map_err(|e| format!("{e:#}"))?;
+        if let Ok(bytes) = module.serialize() {
+            self.put(engine, &sha, &bytes);
+        }
+        Ok(module)
     }
 }
 
@@ -244,8 +246,11 @@ mod tests {
         let other = Engine::new(&config).expect("engine");
         assert_ne!(fingerprint(&plain), fingerprint(&other), "the settings are in the name");
         assert!(cache.get(&plain, &sha256(&wasm)).is_none());
-        cache.module(&plain, &wasm).expect("compiled and kept");
+        let fresh = cache.module(&plain, &wasm).expect("compiled and kept");
+        assert!(fresh.get_export("f").is_some(), "the fresh module has the WASM's export");
         assert!(cache.get(&plain, &sha256(&wasm)).is_some(), "kept for its WASM");
+        let warm = cache.module(&plain, &wasm).expect("loaded from the cache");
+        assert!(warm.get_export("f").is_some(), "the cached module has the same export");
         assert!(cache.get(&other, &sha256(&wasm)).is_none(), "not for another engine");
         assert!(cache.get(&plain, &sha256(b"other")).is_none(), "nor for other WASM");
         let names: Vec<_> = std::fs::read_dir(&dir).expect("read").flatten().collect();

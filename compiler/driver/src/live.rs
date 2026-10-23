@@ -18,6 +18,7 @@
 use crate::http;
 use crate::lift::{Numbers, lifted_files, literal_values};
 use crate::lift::{Report, ReportLiteral};
+use cap_std::fs::Dir;
 use std::collections::BTreeMap;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,9 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// How often the watcher looks at the files.
 pub const SCAN: Duration = Duration::from_millis(20);
+
+/// Large literal edits become a build, keeping one live event small enough to deliver.
+const MAX_LITERAL_EDITS: usize = 16_384;
 
 /// A file as a watcher saw it: when it was last changed, its length, and its text.
 #[derive(Clone, Debug)]
@@ -128,6 +132,8 @@ pub struct Watcher {
     kind: crate::BuildKind,
     /// Where the builds go: `out/<version>`, the last two kept.
     out: PathBuf,
+    /// A held directory for deleting old builds even if the output path is later replaced.
+    out_dir: Dir,
     version: u64,
     /// The packages' directories, and the manifests of the workspaces they were found through
     /// (watched alone: a workspace's directory holds far more than the program's files).
@@ -156,6 +162,11 @@ impl Watcher {
         kind: crate::BuildKind,
     ) -> Result<Watcher, String> {
         check_output_path(pkg, out)?;
+        std::fs::create_dir_all(out)
+            .map_err(|e| format!("can't create live output {}: {e}", out.display()))?;
+        check_output_path(pkg, out)?;
+        let out_dir = Dir::open_ambient_dir(out, cap_std::ambient_authority())
+            .map_err(|e| format!("can't open live output {}: {e}", out.display()))?;
         let inputs = crate::inputs(pkg)?;
         let lift = if lift.is_empty() { vec![inputs.packages[0].0.clone()] } else { lift.to_vec() };
         let dirs: Vec<PathBuf> = inputs.packages.into_iter().map(|(_, d)| d).collect();
@@ -164,6 +175,7 @@ impl Watcher {
             lift,
             kind,
             out: out.to_path_buf(),
+            out_dir,
             version: 0,
             seen: Files::new(),
             dirs,
@@ -218,6 +230,9 @@ impl Watcher {
             .filter(|(i, v)| self.values[*i].to_bits() != v.to_bits())
             .map(|(i, v)| (i as u32, *v))
             .collect();
+        if edits.len() > MAX_LITERAL_EDITS {
+            return Some(self.build());
+        }
         self.values = values;
         // A change of a literal back and forth since the last look is no change.
         (!edits.is_empty()).then_some(Change::Literals(edits))
@@ -225,6 +240,9 @@ impl Watcher {
 
     /// Builds the program as its files are now, into the next version's directory.
     fn build(&mut self) -> Change {
+        if let Err(why) = check_output_path(&self.pkg, &self.out) {
+            return Change::Failed(why);
+        }
         if let Ok(inputs) = crate::inputs(&self.pkg) {
             self.dirs = inputs.packages.into_iter().map(|(_, dir)| dir).collect();
             self.workspaces = inputs.workspaces;
@@ -259,10 +277,14 @@ impl Watcher {
         self.version = version;
         // The build before the last goes: a page still swapping to the last one fetches its
         // files, and nothing reads an older one (a session's builds would fill the disk).
-        if version > 2 {
-            let _ = std::fs::remove_dir_all(self.out.join((version - 2).to_string()));
-        }
+        retire_old_build(&self.out_dir, version);
         Change::Built { version, dir }
+    }
+}
+
+fn retire_old_build(output: &Dir, version: u64) {
+    if version > 2 {
+        let _ = output.remove_dir_all((version - 2).to_string());
     }
 }
 
@@ -294,7 +316,7 @@ pub struct Shown {
 }
 
 struct State {
-    out: PathBuf,
+    out: Dir,
     port: u16,
     live: Mutex<Live>,
     changed: Condvar,
@@ -383,9 +405,10 @@ pub fn serve(
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     built(&watcher.dir());
+    let output = watcher.out_dir.try_clone().map_err(|e| format!("can't hold live output: {e}"))?;
     let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
-        out: out.to_path_buf(),
+        out: output,
         port,
         live: Mutex::new(Live {
             version: watcher.version(),
@@ -420,7 +443,7 @@ pub fn serve(
                     if !quiet {
                         eprint!("{why}");
                     }
-                    serde_json::json!({ "kind": "error", "text": why })
+                    serde_json::json!({ "kind": "error", "text": short_error(why) })
                 }
             };
             let mut s = watching.live.lock().expect("the state");
@@ -480,13 +503,44 @@ fn results_file(path: &str) -> Option<&str> {
 /// How long a long poll waits for a change before it answers that there's none.
 const LONG_POLL: Duration = Duration::from_secs(15);
 
+/// A single error may contain many source diagnostics. Bound its live wire form.
+const MAX_LIVE_ERROR_BYTES: usize = 64 << 10;
+
+fn short_error(error: &str) -> &str {
+    let mut end = error.len().min(MAX_LIVE_ERROR_BYTES);
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    &error[..end]
+}
+
+/// Each poll advances through a bounded part of the retained history.
+const MAX_LIVE_BATCH_EVENTS: usize = 32;
+const MAX_LIVE_BATCH_BYTES: usize = 1 << 20;
+
+fn event_batch(events: &[Event], after: usize) -> Vec<u8> {
+    let mut body = Vec::from(&b"["[..]);
+    for (count, event) in events.iter().skip(after).take(MAX_LIVE_BATCH_EVENTS).enumerate() {
+        let Ok(encoded) = serde_json::to_vec(&event.json) else { break };
+        if count > 0 && body.len() + encoded.len() + 2 > MAX_LIVE_BATCH_BYTES {
+            break;
+        }
+        if count > 0 {
+            body.push(b',');
+        }
+        body.extend_from_slice(&encoded);
+    }
+    body.push(b']');
+    body
+}
+
 fn handle(
     stream: TcpStream,
     state: &State,
     stopping: &AtomicBool,
     quiet: bool,
 ) -> std::io::Result<()> {
-    let Some(req) = http::read(&stream, state.port)? else { return Ok(()) };
+    let Some(mut req) = http::read(&stream, state.port)? else { return Ok(()) };
     let mut out = stream;
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/live/next") => {
@@ -502,9 +556,7 @@ fn handle(
                 s = state.changed.wait_timeout(s, left).expect("the state").0;
             }
             let after = usize::try_from(after).unwrap_or(usize::MAX);
-            let events: Vec<&serde_json::Value> =
-                s.events.iter().skip(after).map(|e| &e.json).collect();
-            let body = serde_json::to_vec(&events).unwrap_or_default();
+            let body = event_batch(&s.events, after);
             drop(s);
             http::respond(&mut out, 200, "application/json", &body)
         }
@@ -538,12 +590,10 @@ fn handle(
         }
         // A page's results, from the server's root or (a page pinned to its build's directory,
         // `mark`) the build's.
-        ("PUT", path) if results_file(path).is_some() => http::put_result(
-            &mut out,
-            &state.out,
-            results_file(path).unwrap_or_default(),
-            &req.body,
-        ),
+        ("PUT", path) if results_file(path).is_some() => {
+            let name = results_file(path).unwrap_or_default().to_string();
+            http::put_result(&mut out, &state.out, &name, &mut req)
+        }
         ("GET", path) => {
             // `/<version>/file` is that build's; any other path, the newest build's. A page is
             // marked with the changes its build holds (`mark`), read with the build's number.
@@ -557,22 +607,23 @@ fn handle(
             };
             let built =
                 trimmed.split_once('/').and_then(|(v, rest)| Some((v.parse::<u64>().ok()?, rest)));
-            let (dir, rel, version, seq) = match built {
+            let (version_dir, rel, version, seq) = match built {
                 // The runtime's own scripts are the same in every build, and a page's threads
                 // start from the script its render worker came from: a build the server has
                 // since deleted (it keeps two) still gives them, from the newest. (A page open
                 // through three hot reloads stopped: its next ticker's script was gone.)
-                Some((_, rest)) if RUNTIME_SCRIPTS.contains(&rest) => {
-                    (state.out.join(version.to_string()), rest, version, seq)
-                }
+                Some((_, rest)) if RUNTIME_SCRIPTS.contains(&rest) => (version, rest, version, seq),
                 Some((v, rest)) => {
                     // The change that made build `v`, or none (the first build).
                     let made = state.live.lock().expect("the state").built_at(v);
-                    (state.out.join(v.to_string()), rest, v, made)
+                    (v, rest, v, made)
                 }
-                None => (state.out.join(version.to_string()), trimmed, version, seq),
+                None => (version, trimmed, version, seq),
             };
             let rel = if rel.is_empty() { "index.html" } else { rel };
+            let Ok(dir) = state.out.open_dir(version_dir.to_string()) else {
+                return http::respond(&mut out, 404, "text/plain", b"not found");
+            };
             http::get_file(&mut out, &dir, rel, |html| {
                 html.replacen("<head>", &format!("<head>{}", mark(seq, version)), 1)
             })
@@ -600,6 +651,33 @@ mod tests {
         }
         assert!(check_output_path(&pkg, &pkg.join("build/live")).is_ok());
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retiring_an_old_build_uses_the_held_output_directory() {
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("wrela-retire-held-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        let moved = root.with_extension("moved");
+        for path in [&root, &outside, &moved] {
+            let _ = std::fs::remove_dir_all(path);
+        }
+        std::fs::create_dir_all(root.join("1")).expect("old build");
+        std::fs::create_dir_all(outside.join("1")).expect("outside directory");
+        std::fs::write(outside.join("1/keep"), "private").expect("outside file");
+        let held = Dir::open_ambient_dir(&root, cap_std::ambient_authority()).expect("held root");
+        std::fs::rename(&root, &moved).expect("move root");
+        symlink(&outside, &root).expect("replace root path");
+
+        retire_old_build(&held, 3);
+        assert!(!moved.join("1").exists());
+        assert_eq!(std::fs::read(outside.join("1/keep")).expect("outside file"), b"private");
+
+        std::fs::remove_file(&root).expect("remove link");
+        let _ = std::fs::remove_dir_all(moved);
+        let _ = std::fs::remove_dir_all(outside);
     }
 
     /// A workspace's manifest is watched, alone: a change to its members can change which
@@ -719,6 +797,53 @@ mod tests {
 
     use std::io::{Read, Write};
 
+    #[test]
+    fn live_event_batches_advance_by_sequence_without_copying_the_whole_history() {
+        let events: Vec<Event> = (1..=100)
+            .map(|seq| Event {
+                json: serde_json::json!({"seq": seq, "kind": "build", "base": format!("/{seq}/")}),
+                seen: Instant::now(),
+                saved: None,
+            })
+            .collect();
+        let mut after = 0;
+        let mut collected = Vec::new();
+        loop {
+            let body = event_batch(&events, after);
+            let batch: Vec<serde_json::Value> = serde_json::from_slice(&body).expect("batch JSON");
+            if batch.is_empty() {
+                break;
+            }
+            assert!(batch.len() <= MAX_LIVE_BATCH_EVENTS);
+            after =
+                batch.last().and_then(|event| event["seq"].as_u64()).expect("last seq") as usize;
+            collected.extend(batch.into_iter().map(|event| event["seq"].as_u64().expect("seq")));
+        }
+        assert_eq!(collected, (1..=100).collect::<Vec<_>>());
+        assert_eq!(short_error(&"x".repeat(MAX_LIVE_ERROR_BYTES + 1)).len(), MAX_LIVE_ERROR_BYTES);
+    }
+
+    #[test]
+    fn live_event_batch_stops_before_its_byte_limit_and_resumes() {
+        let text = "x".repeat(40_000);
+        let events: Vec<Event> = (1..=40)
+            .map(|seq| Event {
+                json: serde_json::json!({"seq": seq, "kind": "error", "text": text}),
+                seen: Instant::now(),
+                saved: None,
+            })
+            .collect();
+        let first = event_batch(&events, 0);
+        assert!(first.len() <= MAX_LIVE_BATCH_BYTES);
+        let first_events: Vec<serde_json::Value> = serde_json::from_slice(&first).expect("first");
+        assert!(first_events.len() < MAX_LIVE_BATCH_EVENTS);
+        let after = first_events.last().and_then(|event| event["seq"].as_u64()).expect("seq");
+        let second: Vec<serde_json::Value> =
+            serde_json::from_slice(&event_batch(&events, after as usize)).expect("second");
+        assert_eq!(second.first().and_then(|event| event["seq"].as_u64()), Some(after + 1));
+        assert_eq!(second.last().and_then(|event| event["seq"].as_u64()), Some(40));
+    }
+
     /// A page opened after a literal-only edit loads the newest build, then receives that edit:
     /// the build itself doesn't already hold it.
     #[test]
@@ -731,7 +856,7 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen");
         let port = listener.local_addr().expect("address").port();
         let state = State {
-            out: out.clone(),
+            out: Dir::open_ambient_dir(&out, cap_std::ambient_authority()).expect("output handle"),
             port,
             live: Mutex::new(Live {
                 version: 1,

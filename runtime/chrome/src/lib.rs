@@ -21,8 +21,9 @@
 //! driver's one function in the page reads what an observation names.
 //!
 //! Chrome is `WRELA_CHROME` if set, else the macOS app or the first of Linux's names on `PATH`
-//! ([`chrome_binary`]); `WRELA_CHROME_ARGS` adds arguments, split as a shell splits them. A
-//! Chrome that isn't there, or that offers only a software WebGPU adapter, fails loudly
+//! ([`chrome_binary`]); `WRELA_CHROME_ARGS` adds arguments to an unrestricted launch, split as a
+//! shell splits them. A browser held to network grants rejects extra arguments. A Chrome that
+//! isn't there, or that offers only a software WebGPU adapter, fails loudly
 //! ([`Tab::hardware_adapter`]): the driver never renders in software.
 
 pub mod cdp;
@@ -180,6 +181,17 @@ impl Launch {
             cancel: None,
             session: None,
         })
+    }
+
+    /// Extra Chrome flags can undo the proxy and UDP settings that hold a browser to its
+    /// network grants. A restricted launch therefore takes only the flags set here.
+    fn check_args(&self) -> Result<(), String> {
+        if self.policy.is_some() && !self.args.is_empty() {
+            return Err(
+                "WRELA_CHROME_ARGS cannot be used with a browser held to network grants".into()
+            );
+        }
+        Ok(())
     }
 
     /// The command line: Chrome's flags, a proxy's if it has one, then the platform's and the
@@ -422,6 +434,7 @@ impl Browser {
     /// Starts Chrome as `launch` says, through `spawner`, and connects to it. A browser that
     /// doesn't start is ended, and its profile removed, before this returns.
     pub fn launch(launch: Launch, spawner: &dyn Spawner) -> Result<Browser, String> {
+        launch.check_args()?;
         #[cfg(target_os = "linux")]
         adopt_descendants()?;
         let tabs: Tabs = Arc::default();
@@ -550,8 +563,8 @@ impl Browser {
     }
 
     /// Opens `url` in a new window of its own, by `deadline`: its tab. With a size, its viewport
-    /// is that size at a device scale of 1; with a console file, each console line of its page
-    /// and workers is appended there as it comes; with `done`, what the page's results/DONE
+    /// is that size at a device scale of 1; with a console file, its page's and workers' lines
+    /// are appended up to 16 MiB, then a truncation marker; with `done`, what results/DONE
     /// holds once its server has kept it.
     pub fn open(&self, url: &str, options: TabOptions, deadline: Instant) -> Result<Tab, String> {
         let conn = &self.inner.conn;
@@ -583,7 +596,7 @@ impl Browser {
         let session =
             attached["sessionId"].as_str().ok_or("Target.attachToTarget gave no session")?;
         tab.session = session.to_string();
-        let (to, events) = mpsc::channel();
+        let (to, events) = mpsc::sync_channel(cdp::MOST_EVENTS);
         tab.tag = conn.route(session, to);
         let (inner, st) = (Arc::downgrade(&self.inner), state.clone());
         let thread = std::thread::Builder::new()
@@ -663,51 +676,78 @@ pub struct TabOptions {
 struct TabState {
     seen: Mutex<Seen>,
     changed: Condvar,
-    console: Option<Mutex<std::fs::File>>,
+    console: Option<Mutex<ConsoleFile>>,
+}
+
+struct ConsoleFile {
+    file: std::fs::File,
+    bytes: usize,
+    truncated: bool,
 }
 
 #[derive(Default)]
 struct Seen {
     console: Vec<String>,
     printed: Vec<String>,
-    /// The lines past [`MOST_LINES`] that weren't kept, of the console and of what was printed.
+    console_bytes: usize,
+    printed_bytes: usize,
+    /// The lines past [`MOST_LINES`] or [`MOST_CONSOLE_BYTES`] that weren't kept.
     console_dropped: usize,
     printed_dropped: usize,
     crashed: bool,
     size: Option<(u32, u32)>,
 }
 
-/// The most console lines a tab keeps (the file gets them all): past them, an observation of
-/// the console, or a wait for a printed line, fails, saying so.
+/// The most console lines a tab keeps: past them, an observation of the console or a wait for a
+/// printed line fails, saying so.
 const MOST_LINES: usize = 100_000;
+
+/// The most text a tab keeps for each of its console and printed lines.
+const MOST_CONSOLE_BYTES: usize = 16 << 20;
+
+const CONSOLE_TRUNCATED: &str = "[console truncated after 16 MiB]\n";
 
 impl TabState {
     fn new(console: Option<&Path>) -> Result<TabState, String> {
         let console = match console {
             None => None,
-            Some(p) => Some(Mutex::new(
-                std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?,
-            )),
+            Some(p) => Some(Mutex::new(ConsoleFile {
+                file: std::fs::File::create(p).map_err(|e| format!("{}: {e}", p.display()))?,
+                bytes: 0,
+                truncated: false,
+            })),
         };
         Ok(TabState { seen: Mutex::new(Seen::default()), changed: Condvar::new(), console })
     }
 
     fn line(&self, text: String) {
         if let Some(f) = &self.console {
-            let mut f = lock(f);
-            let _ = f.write_all(text.as_bytes());
-            let _ = f.write_all(b"\n");
-            let _ = f.flush();
+            let mut log = lock(f);
+            if !log.truncated {
+                if text.len() < MOST_CONSOLE_BYTES - CONSOLE_TRUNCATED.len() - log.bytes {
+                    let _ = log.file.write_all(text.as_bytes());
+                    let _ = log.file.write_all(b"\n");
+                    log.bytes += text.len() + 1;
+                } else {
+                    let _ = log.file.write_all(CONSOLE_TRUNCATED.as_bytes());
+                    log.truncated = true;
+                }
+                let _ = log.file.flush();
+            }
         }
         let mut seen = lock(&self.seen);
         if let Some(p) = text.strip_prefix("wrela: ") {
-            if seen.printed.len() < MOST_LINES {
+            if seen.printed.len() < MOST_LINES && p.len() <= MOST_CONSOLE_BYTES - seen.printed_bytes
+            {
+                seen.printed_bytes += p.len();
                 seen.printed.push(p.to_string());
             } else {
                 seen.printed_dropped += 1;
             }
         }
-        if seen.console.len() < MOST_LINES {
+        if seen.console.len() < MOST_LINES && text.len() <= MOST_CONSOLE_BYTES - seen.console_bytes
+        {
+            seen.console_bytes += text.len();
             seen.console.push(text);
         } else {
             seen.console_dropped += 1;
@@ -864,12 +904,12 @@ impl Tab {
     }
 
     /// Every console line of the page and its workers so far: an error if there were more than
-    /// a tab keeps (100 000), rather than some of them.
+    /// a tab keeps (100 000 lines or 16 MiB), rather than some of them.
     pub fn console(&self) -> Result<Vec<String>, String> {
         let seen = lock(&self.state.seen);
         if seen.console_dropped > 0 {
             return Err(format!(
-                "the console had more than {MOST_LINES} lines: {} more weren't kept",
+                "the console exceeded {MOST_LINES} lines or {MOST_CONSOLE_BYTES} bytes: {} more weren't kept",
                 seen.console_dropped
             ));
         }
@@ -882,7 +922,7 @@ impl Tab {
         let seen = lock(&self.state.seen);
         if seen.printed_dropped > 0 {
             return Err(format!(
-                "the program printed more than {MOST_LINES} lines: {} more weren't kept",
+                "the program printed more than {MOST_LINES} lines or {MOST_CONSOLE_BYTES} bytes: {} more weren't kept",
                 seen.printed_dropped
             ));
         }
@@ -1026,6 +1066,28 @@ mod tests {
     }
 
     #[test]
+    fn a_restricted_browser_rejects_extra_chrome_flags() {
+        let mut l = Launch {
+            binary: "chrome".into(),
+            profile: "/p".into(),
+            window: (640, 480),
+            args: vec!["--no-proxy-server".into()],
+            startup: STARTUP,
+            policy: Some(Arc::new(|_| true)),
+            cancel: None,
+            session: None,
+        };
+        assert!(l.check_args().unwrap_err().contains("WRELA_CHROME_ARGS"));
+        l.args = vec!["--proxy-bypass-list=*".into()];
+        assert!(l.check_args().is_err());
+        l.args.clear();
+        assert!(l.check_args().is_ok());
+        l.policy = None;
+        l.args.push("--no-proxy-server".into());
+        assert!(l.check_args().is_ok());
+    }
+
+    #[test]
     fn a_dead_processs_profiles_are_swept_and_a_living_ones_kept() {
         let base = std::env::temp_dir().join(format!("wrela-sweep-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
@@ -1073,5 +1135,41 @@ mod tests {
         let p = json!({"args": [{"type": "string", "value": "wrela: text"}, {"type": "number", "value": 3},
                                  {"type": "undefined"}, {"type": "object", "description": "Array(2)"}]});
         assert_eq!(console_text(&p), "wrela: text 3 undefined Array(2)");
+    }
+
+    #[test]
+    fn a_page_cannot_keep_unbounded_console_text() {
+        let state = TabState::new(None).expect("a tab");
+        state.line("x".repeat(MOST_CONSOLE_BYTES));
+        state.line("y".into());
+        let seen = lock(&state.seen);
+        assert_eq!(seen.console_bytes, MOST_CONSOLE_BYTES);
+        assert_eq!(seen.console.len(), 1);
+        assert_eq!(seen.console_dropped, 1);
+        drop(seen);
+
+        let printed = TabState::new(None).expect("a tab");
+        printed.line(format!("wrela: {}", "x".repeat(MOST_CONSOLE_BYTES)));
+        printed.line("wrela: y".into());
+        let seen = lock(&printed.seen);
+        assert_eq!(seen.printed_bytes, MOST_CONSOLE_BYTES);
+        assert_eq!(seen.printed.len(), 1);
+        assert_eq!(seen.printed_dropped, 1);
+    }
+
+    #[test]
+    fn a_page_cannot_write_unbounded_console_text_to_a_file() {
+        let path =
+            std::env::temp_dir().join(format!("wrela-chrome-console-test-{}", std::process::id()));
+        let state = TabState::new(Some(&path)).expect("a console file");
+        state.line("x".repeat(MOST_CONSOLE_BYTES - CONSOLE_TRUNCATED.len() - 1));
+        state.line("y".into());
+        let size = std::fs::metadata(&path).expect("the file").len();
+        assert_eq!(size, MOST_CONSOLE_BYTES as u64);
+        state.line("z".into());
+        assert_eq!(std::fs::metadata(&path).expect("the file").len(), size);
+        assert!(std::fs::read(&path).expect("read").ends_with(CONSOLE_TRUNCATED.as_bytes()));
+        drop(state);
+        std::fs::remove_file(path).expect("remove the file");
     }
 }

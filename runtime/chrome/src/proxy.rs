@@ -16,11 +16,11 @@
 
 use crate::lock;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{Shutdown, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Where a connection would go.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,6 +48,9 @@ const MOST_CONNECTIONS: usize = 256;
 
 /// How long a connection waits for a read, a write or its destination.
 const IDLE: Duration = Duration::from_secs(30);
+
+/// A request's complete head must arrive within this time, even if bytes keep arriving.
+const HEAD_TIME: Duration = Duration::from_secs(30);
 
 /// A running proxy: its port, and its threads and sockets, which [`Proxy::close`] ends.
 pub(crate) struct Proxy {
@@ -174,6 +177,64 @@ fn respond(out: &mut TcpStream, status: &str, why: &str) -> std::io::Result<()> 
     )
 }
 
+/// A field's name, as the local server reads it. In particular, whitespace before `:` must not
+/// let a page pass its own browser session through the proxy.
+fn field_name(line: &str) -> Option<&str> {
+    line.split_once(':').map(|(name, _)| name.trim())
+}
+
+enum HeadRead {
+    Lines(Vec<String>),
+    Ended,
+    TooLong,
+    TimedOut,
+}
+
+/// Reads a request's head through its blank line, retaining any body bytes in `reader` for the
+/// relay. Each socket read gets only the time left for the entire head.
+fn read_head(reader: &mut BufReader<TcpStream>, deadline: Instant) -> std::io::Result<HeadRead> {
+    let mut head = Vec::new();
+    let mut line = Vec::new();
+    let mut read = 0u64;
+    loop {
+        if read == MOST_HEAD {
+            return Ok(HeadRead::TooLong);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(HeadRead::TimedOut);
+        }
+        reader.get_mut().set_read_timeout(Some(left))?;
+        let available = match reader.fill_buf() {
+            Ok([]) => return Ok(HeadRead::Ended),
+            Ok(bytes) => bytes,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(HeadRead::TimedOut);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        let allowed = available.len().min((MOST_HEAD - read) as usize);
+        let n = available[..allowed].iter().position(|b| *b == b'\n').map_or(allowed, |at| at + 1);
+        line.extend_from_slice(&available[..n]);
+        reader.consume(n);
+        read += n as u64;
+        if line.ends_with(b"\n") {
+            let blank = line == b"\r\n" || line == b"\n";
+            head.push(String::from_utf8_lossy(&line).into_owned());
+            line.clear();
+            if blank {
+                return Ok(HeadRead::Lines(head));
+            }
+        }
+    }
+}
+
 /// One connection's request: refused, or let through to its destination.
 fn serve(
     client: TcpStream,
@@ -188,26 +249,21 @@ fn serve(
     client.set_write_timeout(Some(IDLE))?;
     let mut out = client.try_clone()?;
     let mut reader = BufReader::new(client);
-    let mut head = Vec::new();
-    // The head's bytes so far: each read takes at most what's left of the allowance.
-    let mut read = 0u64;
-    loop {
-        let mut line = Vec::new();
-        let n = (&mut reader).take(MOST_HEAD - read).read_until(b'\n', &mut line)? as u64;
-        read += n;
-        if n == 0 {
+    let head = match read_head(&mut reader, Instant::now() + HEAD_TIME)? {
+        HeadRead::Lines(head) => head,
+        HeadRead::Ended => {
             return respond(&mut out, "400 Bad Request", "a request's head ended too soon");
         }
-        if !line.ends_with(b"\n") {
+        HeadRead::TooLong => {
             let why = format!("a request's head is at most {MOST_HEAD} bytes");
             return respond(&mut out, "431 Request Header Fields Too Large", &why);
         }
-        let blank = line == b"\r\n" || line == b"\n";
-        head.push(String::from_utf8_lossy(&line).into_owned());
-        if blank {
-            break;
+        HeadRead::TimedOut => {
+            return respond(&mut out, "408 Request Timeout", "a request's head took too long");
         }
-    }
+    };
+    // The deadline applies only to the head. A tunnel or WebSocket can stay active afterward.
+    reader.get_mut().set_read_timeout(Some(IDLE))?;
     let first = head[0].trim_end().to_string();
     let mut parts = first.split(' ');
     let (method, target, version) =
@@ -239,17 +295,18 @@ fn serve(
         refused(format!("the host refused {method} http://{authority}{path}: it isn't granted"));
         return respond(&mut out, "403 Forbidden", "the tool isn't granted this origin");
     }
-    let upgrade = head.iter().any(|h| h.to_ascii_lowercase().starts_with("upgrade:"));
+    let upgrade =
+        head.iter().any(|h| field_name(h).is_some_and(|name| name.eq_ignore_ascii_case("upgrade")));
     let mut dest = connect(&host, port)?;
     let mut sent = format!("{method} {path} {version}\r\n");
     for h in &head[1..] {
-        let lower = h.to_ascii_lowercase();
-        let hop = ["proxy-connection:", "proxy-authorization:", "keep-alive:"];
-        let named = format!("{}:", SESSION_HEADER.to_ascii_lowercase());
+        let name = field_name(h).unwrap_or("");
         if h.trim().is_empty()
-            || hop.iter().any(|p| lower.starts_with(p))
-            || lower.starts_with(&named)
-            || (!upgrade && lower.starts_with("connection:"))
+            || ["proxy-connection", "proxy-authorization", "keep-alive"]
+                .iter()
+                .any(|hop| name.eq_ignore_ascii_case(hop))
+            || name.eq_ignore_ascii_case(SESSION_HEADER)
+            || (!upgrade && name.eq_ignore_ascii_case("connection"))
         {
             continue;
         }
@@ -309,6 +366,7 @@ fn relay(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn hosts_and_ports_read_as_a_connection_names_them() {
@@ -317,6 +375,30 @@ mod tests {
         assert_eq!(host_port("[::1]:9", 443), Some(("::1".into(), 9)));
         assert_eq!(host_port("127.0.0.1:x", 80), None);
         assert_eq!(host_port(":80", 80), None);
+    }
+
+    #[test]
+    fn a_trickling_request_head_has_an_absolute_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listen");
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        let running = Arc::new(AtomicBool::new(true));
+        let writing = running.clone();
+        let sender = std::thread::spawn(move || {
+            while writing.load(Ordering::Acquire) {
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let began = Instant::now();
+        let got = read_head(&mut BufReader::new(server), began + Duration::from_millis(120))
+            .expect("read the head");
+        running.store(false, Ordering::Release);
+        sender.join().expect("the sender");
+        assert!(matches!(got, HeadRead::TimedOut));
+        assert!(began.elapsed() < Duration::from_secs(2));
     }
 
     /// A proxy that grants only `http://127.0.0.1:<served>` and tunnels to `localhost:443`:
@@ -363,13 +445,13 @@ mod tests {
             (head, served)
         });
         let through = ask(format!(
-            "GET http://127.0.0.1:{sp}/page HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nProxy-Connection: keep-alive\r\nX-Wrela-Browser: forged\r\n\r\n"
+            "GET http://127.0.0.1:{sp}/page HTTP/1.1\r\nHost: 127.0.0.1:{sp}\r\nProxy-Connection: keep-alive\r\nConnection : keep-alive\r\nX-Wrela-Browser: forged\r\nx-wrela-browser \t: forged-again\r\n\r\n"
         ));
         assert!(through.ends_with("hi"), "{through}");
         let (head, served) = server.join().expect("the server");
         served.set_nonblocking(true).expect("nonblocking");
         assert!(head.starts_with("GET /page HTTP/1.1\r\n"), "{head}");
-        assert!(head.contains("Connection: close") && !head.contains("Proxy-Connection"), "{head}");
+        assert!(head.contains("Connection: close") && !head.contains("keep-alive"), "{head}");
         assert!(head.contains("X-Wrela-Browser: b7") && !head.contains("forged"), "{head}");
         for refused in [
             format!("GET http://127.0.0.1:{op}/ HTTP/1.1\r\nHost: x\r\n\r\n"),

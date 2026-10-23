@@ -33,15 +33,16 @@ export class Live {
     this.#seq = after;
   }
 
-  /** Asks the server for what's new, again and again, until the page goes away. */
-  start(): void {
-    void this.#poll();
+  /** Asks the server for what's new, again and again, until the page goes away or `signal`
+   * aborts. */
+  start(signal?: AbortSignal): Promise<void> {
+    return this.#poll(signal);
   }
 
-  async #poll(): Promise<void> {
-    for (;;) {
+  async #poll(signal?: AbortSignal): Promise<void> {
+    while (!signal?.aborted) {
       try {
-        const response = await fetch(new URL(`/live/next?after=${this.#seq}`, this.base), { cache: "no-store" });
+        const response = await fetch(new URL(`/live/next?after=${this.#seq}`, this.base), { cache: "no-store", redirect: "error", ...(signal ? { signal } : {}) });
         if (!response.ok) throw new Error(`${response.status}`);
         for (const e of (await response.json()) as LiveEvent[]) {
           if (e.seq <= this.#seq) continue;
@@ -49,6 +50,7 @@ export class Live {
           this.#seq = e.seq;
         }
       } catch {
+        if (signal?.aborted) return;
         // The server is gone or restarting: ask again soon.
         await pause(250);
       }
@@ -60,7 +62,14 @@ export class Live {
   take(program: Program): string | null {
     while (this.#events.length > 0) {
       const e = this.#events[0]!;
-      if (e.kind === "build") return new URL(e.base, this.base).href;
+      if (e.kind === "build") {
+        const url = new URL(e.base, this.base);
+        const page = new URL(this.base);
+        if (url.origin !== page.origin || url.protocol !== page.protocol || url.username || url.password) {
+          throw new Error("a live build must stay on the page's origin");
+        }
+        return url.href;
+      }
       this.#events.shift();
       if (e.kind === "literals") {
         for (const [i, v] of e.values) program.setLiteral(i, v);
@@ -83,6 +92,6 @@ export class Live {
     if (this.#unshown === null) return;
     const body = JSON.stringify({ seq: this.#unshown, frame });
     this.#unshown = null;
-    void fetch(new URL("/live/shown", this.base), { method: "POST", body }).catch(() => {});
+    void fetch(new URL("/live/shown", this.base), { method: "POST", body, redirect: "manual" }).catch(() => {});
   }
 }

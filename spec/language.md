@@ -375,6 +375,8 @@ use std::gpu::dispatch
 
 A package is a directory of modules. One that has dependencies, or uses `unsafe`, has a `wrela.toml`; one with neither needs none.
 
+A manifest value can nest arrays and inline tables at most 128 levels deep; deeper values are E0219.
+
 ```text
 [package]
 name = "herd"                          # how diagnostics name it
@@ -1653,7 +1655,7 @@ A request's deadline counts from when the tool makes it (below), so a call that 
 - `--secret NAME` reads the environment variable `NAME` when the tool starts. `std::tool::secret(name)` gives it, and gives `None` for a name that is not granted. The host never shows a secret.
 - `--net HOST` grants a host to `std::tool::http`, over HTTPS. The URL's host must be the grant exactly: `--net HOST:PORT` grants that port, and a URL with a user is refused.
 - `--allow-run NAME` grants the program `NAME` to `std::tool::run`. The host finds it on `PATH` when the grants are opened and keeps its absolute path, so a later change to `PATH` does not change which file runs. `--allow-run NAME=PATH` names the file itself. `--allow-run NAME=tool:DIR` names the tool build of the package at `DIR`, which this `wrela` runs as `wrela tool`.
-- `--browser` grants `std::tool::browser`: the host may start Chrome stable for the tool. Chrome is `WRELA_CHROME` if that is set, else the macOS app or the first Chrome on Linux's `PATH`; `WRELA_CHROME_ARGS` adds arguments.
+- `--browser` grants `std::tool::browser`: the host may start Chrome stable for the tool. Chrome is `WRELA_CHROME` if that is set, else the macOS app or the first Chrome on Linux's `PATH`. `WRELA_CHROME_ARGS` adds arguments to an unrestricted launch; a browser held to network grants refuses extra arguments, since Chrome flags can bypass its proxy.
 - **`wrela tool <name>`** runs the tool that the workspace at or above the current directory declares as `[tools.<name>]`: its package's tool build, with the grants that the workspace declares, each path from the workspace's directory. A word that names a declared tool is the tool; any other argument is a package's directory.
   - **The command line can only narrow the declared grants.** If it grants nothing, the run has the declared grants. If it grants anything, its grants are the run's grants instead, and each must be within a declared grant: a root at or below a declared root of the same name (a declared write root, to write), a program as it is declared (`--allow-run NAME` alone keeps the declared one), and a host, a secret or `--browser` that is declared. `--timeout` can only shorten a declared `timeout`, and `--workers` can only lower a declared `workers`. Any other grant stops the command before the tool starts (status 2). `--blob-budget` is a limit, not a grant, and the command line sets it as for a package.
   - Each declared root is opened from the workspace's directory one part at a time, following no link, and a missing write root is made the same way. A narrowed root is opened from its declared root's directory the same way. The run gets these opened directories, not their paths opened again: so a directory replaced after the check, by a link or anything else, leads nowhere new, and nothing outside the workspace is made or granted.
@@ -2420,6 +2422,8 @@ A journal that the program traps on, or a poisoned message that it traps on, qua
 
 - A connection is a session at `/room/<name>?pair=<id>`. The name is 1 to 64 of a-z, 0-9, `-` and `_`. The id is the client's pair id, 16 hex digits.
 - A session has one bidirectional stream. Each message on it is a frame: its length (a varint) and its bytes. A frame is at most 64 KiB, and 64 bytes less from a client, so a room's answer to a message fits a frame.
+- A client that sends no first byte of its next frame for 60 s, or takes more than 10 s to finish a frame after its first byte, is closed. QUIC keepalives do not count as messages. QUIC stream and receive windows bound traffic on streams the room does not use.
+- A browser's WebTransport Origin must be allowed before it joins a room. A production `wrela-serve` names each allowed page origin with `--origin`; each value uses the browser's serialized HTTP(S) origin form, with a scheme and host, an optional non-default port, and no path, user information, query or fragment. The page and room server may have different origins. `wrela-serve --dev` and `wrela run` accept local page origins only. A client without an Origin is not a browser and the room's protocol must decide whether to admit it.
 - A room's time (`serve`'s `time`) counts from the server's start, so a room that stops and starts again continues from that time.
 
 **Bounds** (`Bounds`): what a server holds is bounded.
@@ -2437,6 +2441,7 @@ A journal that the program traps on, or a poisoned message that it traps on, qua
 #### Finding and running the server
 
 - The browser host finds the server in `net.json` beside the build: its address and, for a development certificate, the certificate's hash, which the browser trusts in place of a certificate authority's signature. `wrela-serve --dev` writes both.
+- Development room servers bind only to loopback addresses. A production `wrela-serve` binds to all interfaces and requires `--cert`, `--key` and at least one `--origin`.
 - Each server build's rooms are kept apart (`<data>/<build hash>/`), because only the build that wrote a journal reads it. A server given a new build closes its rooms' connections, and their peers come back to the new build's rooms.
 - `wrela run` serves a program's rooms beside its page (`--rooms-port`, 4433 by default), writes each build's `net.json`, and gives the rooms each new server build.
 
@@ -2764,11 +2769,13 @@ A lifted build reads a package's `f32` literals from a table instead of building
 ```
 
 - **A literal edit** is an edit after which the file's tokens are the build's, except for numbers. It changes the literals' values at the next frame, and a `Watch` cooks again what it reads.
+- If one save changes more than 16,384 lifted literals, the watcher builds again. A live poll sends at most 32 changes or 1 MiB at once; the page requests the remaining changes by their sequence. The text of one build error in a live event is at most 64 KiB.
 - **Any other edit** builds the program again. The host swaps the new build in where the old one ran, on the same device: the page is not reloaded, and the native host's `Host::reload` stays in its process. The host keeps each pipeline whose WGSL and manifest entry are unchanged. The new build starts with `init`:
   - **`std::reload::keep(bytes)`** gives the host bytes to keep, in place of the bytes the program kept before. The next build's **`kept()`** returns them (no bytes if it replaced no build). The program decides what it carries and how, for example with `std::serialize`'s `save` and `load`, which fail cleanly when the type has changed.
   - **The ticker first runs the old build's ticks again,** each with the records it had. So the sim is where it was, or where the new code takes the same input.
   - Input that the old build did not read goes to the new one. A program that plays a voice (`std::audio`) is reloaded with its page.
 - The page tells the server the first frame that drew each change (`/live/shown`), and `wrela run` prints how long after the save that frame was.
+- The live server handles at most 64 open requests at once; an extra connection gets 503. A request must finish its headers and body within 10 seconds, even if its bytes keep arriving. A `/live/shown` report is at most 64 KiB. A `PUT /results/<name>` streams its body into a temporary file, up to 256 MiB, before the file takes the result's name.
 
 ### 23.3 Provenance
 

@@ -154,6 +154,17 @@ test("a link is an <a> to its address: a plain click is the program's, a modifie
   expect([el(1).style.left, el(1).style.top]).toEqual(["5px", "15px"]);
 }));
 
+test("a program cannot put executable URLs into real links", () => onPage((page) => {
+  const { o, el } = overlay(page);
+  o.tree(tree([{ id: 1, role: Role.Link, label: "Safe", href: "https://docs.example/page" }]));
+  for (const href of ["javascript:alert(1)", "\nJaVaScRiPt:alert(1)", "data:text/html,hello", "blob:https://docs.example/id"]) {
+    const bad = tree([{ id: 1, role: Role.Link, label: "Unsafe", href }]);
+    expect(() => readTree(bad)).toThrow("link 1's address must be http or https");
+    expect(() => o.tree(bad)).toThrow("link 1's address must be http or https");
+    expect(el(1).href).toBe("https://docs.example/page");
+  }
+}));
+
 test("a link without an address activates from the keyboard", () => onPage((page) => {
   const { o, events, el } = overlay(page);
   o.tree(tree([{ id: 1, role: Role.Link, label: "Run" }]));

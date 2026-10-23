@@ -141,11 +141,12 @@ export class Frames {
   #body: Uint8Array | null = null;
   #used = 0;
 
-  /** The whole frames `chunk` completes, oldest first; an error for a frame too long, or whose
-   * length isn't a varint of at most three bytes. */
-  push(chunk: Uint8Array): Uint8Array[] {
+  /** The whole frames `chunk` completes, oldest first. `available` bounds the messages returned
+   * by this read, including their overhead. Each frame owns only its own bytes. */
+  push(chunk: Uint8Array, available = HELD): Uint8Array[] {
     const out: Uint8Array[] = [];
     let at = 0;
+    let held = 0;
     while (at < chunk.length) {
       if (this.#body === null) {
         const byte = chunk[at++]!;
@@ -155,6 +156,7 @@ export class Frames {
           continue;
         }
         if (this.#length > MAX_FRAME) throw new Error(`a frame of ${this.#length} bytes, past ${MAX_FRAME}`);
+        if (held + this.#length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
         // Allocate once per frame: each chunk copies only the bytes it adds, and a delivered
         // frame keeps its own storage when the stream reuses its chunk or the next frame starts.
         this.#body = new Uint8Array(this.#length);
@@ -163,11 +165,14 @@ export class Frames {
         this.#used = 0;
       }
       const body = this.#body;
+      // Other connections may have used the budget since this frame's prefix arrived.
+      if (held + body.length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
       const n = Math.min(body.length - this.#used, chunk.length - at);
       body.set(chunk.subarray(at, at + n), this.#used);
       this.#used += n;
       at += n;
       if (this.#used === body.length) {
+        held += body.length + OVERHEAD;
         out.push(body);
         this.#body = null;
       }
@@ -188,7 +193,13 @@ export function parseServer(text: string): Server {
   const v: unknown = JSON.parse(text);
   if (typeof v !== "object" || v === null) throw new Error("net.json isn't an object");
   const { url, certificateHash } = v as Record<string, unknown>;
-  if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error("net.json's `url` isn't an https URL");
+  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https URL");
+  let address: URL;
+  try { address = new URL(url); }
+  catch { throw new Error("net.json's `url` isn't an https URL"); }
+  if (address.protocol !== "https:" || address.username || address.password || url.includes("?") || url.includes("#")) {
+    throw new Error("net.json's `url` isn't an https URL without credentials, query or fragment");
+  }
   if (certificateHash === undefined) return { url };
   const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
   if (!whole) throw new Error("net.json's `certificateHash` isn't 32 bytes");
@@ -263,7 +274,7 @@ export class Net {
   #fetchServer(): Promise<Server> {
     const url = new URL("net.json", this.base()).href;
     if (this.#server?.url === url) return this.#server.ready;
-    const ready = fetch(url)
+    const ready = fetch(url, { redirect: "error" })
       .then((r) => {
         if (!r.ok) throw new Error(`net.json: ${r.status}`);
         return r.text();
@@ -322,10 +333,7 @@ export class Net {
       for (;;) {
         const { value, done } = await reader.read();
         if (done || session.closed) break;
-        for (const bytes of frames.push(value)) {
-          if (this.#held + bytes.length + OVERHEAD > HELD) {
-            throw new Error(`more than ${HELD} bytes wait for the program`);
-          }
+        for (const bytes of frames.push(value, HELD - this.#held)) {
           this.#held += bytes.length + OVERHEAD;
           this.arrived.push({ conn, bytes });
         }

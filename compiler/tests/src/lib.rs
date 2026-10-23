@@ -443,7 +443,7 @@ fn page_built_by(
 /// The package at `pkg` built by `build` (`kind` names it), once per process: its directory.
 fn built_once(pkg: &str, kind: &str, build: fn(&Path) -> wrela_driver::Output) -> PathBuf {
     static BUILDS: OncePerKey = OncePerKey::new();
-    // No host loads the build here (it would keep its compiled code beside it), only copies.
+    // Hosts load copies of this shared build from their own scratch directories.
     let base =
         page_scratch_root().join("page-builds").join(format!("{}-{kind}", pkg.replace('/', "-")));
     BUILDS.run(&base.display().to_string(), || {

@@ -26,8 +26,11 @@
 
 use crate::query::{Index, Item};
 use crate::{Overlay, SourceMap};
+use cap_std::ambient_authority;
+use cap_std::fs::{Dir, OpenOptions};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceFile, Span};
 use wrela_sema::Checked;
@@ -1211,21 +1214,38 @@ pub fn refusal_json(r: &Refusal) -> String {
     crate::pretty(&json!({ "version": 1, "refused": r.why, "errors": r.errors }))
 }
 
+/// The package's source modules are the only files a refactor plan may change. A plan can be
+/// read from JSON, so a relative path alone does not establish that it belongs to the program.
+fn source_files(root: &Path) -> Result<BTreeSet<String>, Refusal> {
+    let files = crate::package::find_files(root)
+        .map_err(|_| Refusal::from("can't find the package's source files".to_string()))?;
+    Ok(files.into_iter().map(|f| f.display).collect())
+}
+
+fn source_path(root: &Path, file: &str, files: &BTreeSet<String>) -> Result<PathBuf, Refusal> {
+    if wrela_abi::check::path_problem(file).is_some() || !files.contains(file) {
+        return refuse(format!("{file} isn't a source file in the package"));
+    }
+    let path = root.join(file);
+    crate::ensure_no_symlink_path(root, &path)
+        .map_err(|e| Refusal::from(format!("{file} isn't a plain source path: {e}")))?;
+    Ok(path)
+}
+
 /// Reads a plan `to_json` printed, and checks it against the files now: each must still hash
 /// as it did, and the program must check with the plan's texts.
 pub fn read_plan(root: &Path, text: &str) -> Result<Plan, Refusal> {
     let v: Value = serde_json::from_str(text).map_err(|e| format!("the plan isn't JSON: {e}"))?;
     let bad = |what: &str| Refusal::from(format!("the plan has no {what}"));
     let op = v["op"].as_str().ok_or_else(|| bad("`op`"))?.to_string();
+    let files = source_files(root)?;
     let mut texts = Texts::new(root);
     for f in v["files"].as_array().ok_or_else(|| bad("`files`"))? {
         let file = f["file"].as_str().ok_or_else(|| bad("file name"))?;
         let (old_hash, new_hash) =
             (f["old_hash"].as_str().unwrap_or(""), f["new_hash"].as_str().unwrap_or(""));
         let new = f["text"].as_str().ok_or_else(|| bad("file text"))?;
-        if wrela_abi::check::path_problem(file).is_some() {
-            return refuse(format!("{file} isn't in the package"));
-        }
+        source_path(root, file, &files)?;
         let now = texts.get(file)?;
         let hash = crate::lift::file_hash(now.as_bytes());
         if hash != old_hash {
@@ -1258,8 +1278,28 @@ pub fn read_plan(root: &Path, text: &str) -> Result<Plan, Refusal> {
 /// Writes the plan's files, each whole (a temporary file renamed over it), after checking once
 /// more that each is as the plan found it.
 pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
+    // Keep the package directory open while checking and writing. A later replacement of a
+    // source directory with a link cannot redirect the write outside this handle.
+    let dir = Dir::open_ambient_dir(root, ambient_authority())
+        .map_err(|e| Refusal::from(format!("can't open the package: {e}")))?;
+    let files = source_files(root)?;
+    // Check every destination before writing any of them.
     for f in &plan.files {
-        let now = std::fs::read_to_string(root.join(&f.file))
+        source_path(root, &f.file, &files)?;
+    }
+    for f in &plan.files {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+        let mut file = dir
+            .open_with(&f.file, &options)
+            .map_err(|e| format!("can't read {} before writing the plan: {e}", f.file))?;
+        if !file.metadata().is_ok_and(|m| m.is_file()) {
+            return refuse(format!("{} isn't a regular source file", f.file));
+        }
+        let mut now = String::new();
+        file.read_to_string(&mut now)
             .map_err(|e| format!("can't read {} before writing the plan: {e}", f.file))?;
         if now != f.old {
             return refuse(format!(
@@ -1269,15 +1309,129 @@ pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
         }
     }
     for f in &plan.files {
-        crate::write_atomic(&root.join(&f.file), f.new.as_bytes())
+        write_atomic_in(&dir, Path::new(&f.file), f.new.as_bytes())
             .map_err(|e| format!("can't write {}: {e}", f.file))?;
     }
     Ok(())
 }
 
+/// Writes a plan's source through the package handle. The temporary name must be new even if
+/// another process knows it, and the final rename stays within the opened directory.
+fn write_atomic_in(dir: &Dir, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = dir.open_with(&tmp, &options)?;
+        file.write_all(bytes)?;
+        drop(file);
+        dir.rename(&tmp, dir, path)
+    })();
+    if result.is_err() {
+        let _ = dir.remove_file(&tmp);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plan_changes_only_plain_source_modules() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-refactor-plan-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let source = "pub fn frame(time: f32, width: u32, height: u32) {}\n";
+        std::fs::write(dir.join("main.wrela"), source).expect("source");
+        std::fs::write(dir.join("wrela.toml"), "[package]\nname = \"game\"\n").expect("manifest");
+        std::fs::write(dir.join(".hidden.wrela"), source).expect("hidden file");
+
+        for file in ["wrela.toml", ".hidden.wrela"] {
+            let old = std::fs::read_to_string(dir.join(file)).expect("file");
+            let forged = Plan {
+                op: "change an unrelated file".into(),
+                files: vec![FileChange {
+                    file: file.into(),
+                    old: old.clone(),
+                    new: "changed\n".into(),
+                }],
+                notes: Vec::new(),
+            };
+            assert!(read_plan(&dir, &to_json(&forged, false)).is_err(), "{file}");
+            assert!(write(&dir, &forged).is_err(), "{file}");
+            assert_eq!(std::fs::read_to_string(dir.join(file)).expect("unchanged"), old);
+        }
+
+        let valid = Plan {
+            op: "change source".into(),
+            files: vec![FileChange {
+                file: "main.wrela".into(),
+                old: source.into(),
+                new: "pub fn frame(time: f32, width: u32, height: u32) { }\n".into(),
+            }],
+            notes: Vec::new(),
+        };
+        let read = read_plan(&dir, &to_json(&valid, false));
+        assert!(read.is_ok(), "{read:?}");
+        write(&dir, &valid).expect("plain source module");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("main.wrela")).expect("source"),
+            valid.files[0].new
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plan_refuses_a_linked_source_file() {
+        let dir =
+            std::env::temp_dir().join(format!("wrela-refactor-plan-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let outside = dir.with_extension("wrela");
+        std::fs::write(&outside, "fn main() {}\n").expect("outside source");
+        std::os::unix::fs::symlink(&outside, dir.join("main.wrela")).expect("link");
+        let forged = Plan {
+            op: "change a linked source".into(),
+            files: vec![FileChange {
+                file: "main.wrela".into(),
+                old: "fn main() {}\n".into(),
+                new: "fn main() { }\n".into(),
+            }],
+            notes: Vec::new(),
+        };
+        assert!(read_plan(&dir, &to_json(&forged, false)).is_err());
+        assert!(write(&dir, &forged).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).expect("outside source"), forged.files[0].old);
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_file(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_source_directory_cannot_redirect_a_write() {
+        let root = std::env::temp_dir()
+            .join(format!("wrela-refactor-replaced-dir-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(root.join("module")).expect("source directory");
+        std::fs::create_dir_all(&outside).expect("outside directory");
+        std::fs::write(outside.join("a.wrela"), b"outside").expect("outside source");
+        let held = Dir::open_ambient_dir(&root, ambient_authority()).expect("package handle");
+        std::fs::rename(root.join("module"), root.join("old-module"))
+            .expect("replace source directory");
+        std::os::unix::fs::symlink(&outside, root.join("module")).expect("replacement link");
+        assert!(write_atomic_in(&held, Path::new("module/a.wrela"), b"changed").is_err());
+        assert_eq!(std::fs::read(outside.join("a.wrela")).expect("outside source"), b"outside");
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
 
     #[test]
     fn a_move_refuses_to_change_call_targets() {

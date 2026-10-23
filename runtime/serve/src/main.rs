@@ -1,8 +1,9 @@
 //! `wrela-serve`: a server build's rooms over WebTransport.
 //!
-//! - `wrela-serve <build-dir> [--port N] [--data DIR] --cert CERT.pem --key KEY.pem`
+//! - `wrela-serve <build-dir> [--port N] [--data DIR] --cert CERT.pem --key KEY.pem --origin PAGE_ORIGIN [--origin PAGE_ORIGIN ...]`
 //! - `wrela-serve <build-dir> [--port N] [--data DIR] --dev`: a development certificate, whose
-//!   address and hash it writes to `<build-dir>/net.json` for the client build beside it.
+//!   address and hash it writes to `<build-dir>/net.json` for the client build beside it. This
+//!   server listens on loopback addresses only; a certificate server listens on all interfaces.
 //!
 //! `<build-dir>` is a `wrela build` of a program with a server role: its `server/game.wasm`.
 //! Rooms' journals go in `--data` (default `<build-dir>/rooms`), each server build's in a
@@ -17,7 +18,7 @@ use wrela_host::server::{Limits, ServerBuild};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: wrela-serve <build-dir> [--port N] [--data DIR] (--cert CERT.pem --key KEY.pem | --dev)"
+        "usage: wrela-serve <build-dir> [--port N] [--data DIR] (--cert CERT.pem --key KEY.pem --origin PAGE_ORIGIN [--origin PAGE_ORIGIN ...] | --dev)"
     );
     ExitCode::from(2)
 }
@@ -33,6 +34,7 @@ fn main() -> ExitCode {
     let mut port: u16 = 4433;
     let mut data = dir.join("rooms");
     let (mut cert, mut key, mut dev) = (None, None, false);
+    let mut origins = Vec::new();
     let mut i = 1;
     while i < args.len() {
         let value = args.get(i + 1);
@@ -44,6 +46,7 @@ fn main() -> ExitCode {
             ("--data", Some(v)) => data = PathBuf::from(v),
             ("--cert", Some(v)) => cert = Some(PathBuf::from(v)),
             ("--key", Some(v)) => key = Some(PathBuf::from(v)),
+            ("--origin", Some(v)) if !v.is_empty() => origins.push(v.to_string()),
             ("--dev", _) => {
                 dev = true;
                 i += 1;
@@ -69,16 +72,19 @@ fn main() -> ExitCode {
     };
     let runtime = tokio::runtime::Runtime::new().expect("an async runtime");
     let result: std::io::Result<()> = (|| {
-        let identity = match (cert, key, dev) {
-            (Some(c), Some(k), false) => runtime
-                .block_on(wtransport::Identity::load_pemfiles(c, k))
-                .map_err(std::io::Error::other)?,
-            (None, None, true) => {
+        let (identity, origin_policy) = match (cert, key, dev) {
+            (Some(c), Some(k), false) if !origins.is_empty() => (
+                runtime
+                    .block_on(wtransport::Identity::load_pemfiles(c, k))
+                    .map_err(std::io::Error::other)?,
+                wrela_serve::Origins::Exact(origins),
+            ),
+            (None, None, true) if origins.is_empty() => {
                 let (identity, hash) = wrela_serve::dev_identity()?;
                 std::fs::write(dir.join("net.json"), wrela_serve::net_json(port, Some(&hash)))?;
-                identity
+                (identity, wrela_serve::Origins::Local)
             }
-            _ => return Err(std::io::Error::other("give --cert and --key, or --dev")),
+            _ => return Err(std::io::Error::other("give --cert, --key and --origin, or --dev")),
         };
         // The store is the server's, beside the builds' journals, so it outlives a build.
         let services = wrela_host::services::Services::open(&data.join("store.sqlite"))
@@ -92,8 +98,13 @@ fn main() -> ExitCode {
             identity,
             limits: Limits::default(),
             bounds: wrela_serve::Bounds::default(),
+            origins: origin_policy,
         };
-        let _server = wrela_serve::start(config, &runtime)?;
+        let _server = if dev {
+            wrela_serve::start_local(config, &runtime)?
+        } else {
+            wrela_serve::start(config, &runtime)?
+        };
         eprintln!("wrela-serve: rooms of {} on port {port}", dir.display());
         runtime.block_on(std::future::pending::<()>());
         Ok(())

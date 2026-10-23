@@ -109,6 +109,16 @@ export function readTree(body: Uint8Array): { name: string; nodes: Node[] } {
     if (!CONTAINERS.has(holder)) throw new Error(`node ${id}'s parent ${parent} holds no nodes`);
     if (role >= ROLES) throw new Error(`no semantic role ${role}`);
     if (role === Role.Field && field === null) throw new Error(`field ${id} has no field`);
+    if (role === Role.Link && href) {
+      let protocol: string;
+      try {
+        protocol = new URL(href, "https://wrela.invalid/").protocol;
+      } catch {
+        throw new Error(`link ${id}'s address isn't a URL`);
+      }
+      // A link is a real <a>; a modified click uses its browser action, outside the program.
+      if (protocol !== "http:" && protocol !== "https:") throw new Error(`link ${id}'s address must be http or https`);
+    }
     roles.set(id, role);
     nodes.push({ id, parent, role, flags, level, value, min, max, step, controls, label, href, field });
   }

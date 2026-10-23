@@ -24,7 +24,9 @@ export type Fetch = (url: URL, init?: RequestInit) => Promise<Response>;
 async function get(fetchFn: Fetch, url: URL): Promise<Response> {
   let response: Response;
   try {
-    response = await fetchFn(url);
+    // A build's files and a program's fetches stay at their checked URL. A server redirect
+    // must not turn a relative path into a request to another origin.
+    response = await fetchFn(url, { redirect: "manual" });
   } catch (e) {
     throw new Error(`can't fetch ${url}: ${errorMessage(e)}`);
   }
@@ -44,7 +46,7 @@ async function getText(fetchFn: Fetch, url: URL): Promise<string> {
 }
 
 /** Loads a test's input script, with the native host's text and input rules. */
-export async function loadScript(url: URL, fetchFn: Fetch = (url) => fetch(url)): Promise<Scripted[]> {
+export async function loadScript(url: URL, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Scripted[]> {
   return parseScript(await getText(fetchFn, url));
 }
 
@@ -86,7 +88,7 @@ export class Handed {
 }
 
 /** Fetches and validates a build; its files resolve against `base`. */
-export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(url)): Promise<Build> {
+export async function loadBuild(base: string, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Build> {
   const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
   const [wasm, shaders] = await Promise.all([
     get(fetchFn, new URL(manifest.wasm, base)).then(async (r) => new Uint8Array(await r.arrayBuffer())),
@@ -97,7 +99,7 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(ur
 
 /** An optimized build's trap locations, from beside its WASM (`game.lines` for `game.wasm`);
  * null if it has none or they don't arrive. */
-export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = (url) => fetch(url)): Promise<Lines | null> {
+export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Lines | null> {
   const name = manifest.wasm.replace(/\.wasm$/, "") + "." + LINES_SIDECAR;
   try {
     return Lines.decode(new Uint8Array(await (await get(fetchFn, new URL(name, base))).arrayBuffer()));
@@ -160,8 +162,9 @@ export function browserIo(
       }
     },
     async post(url, body) {
-      // Only to the build's own origin: the path is relative (`pathProblem`).
-      const response = await fetchFn(pathUrl(files, url), { method: "POST", body });
+      // Only to the build's own origin: the path is relative (`pathProblem`), and a redirect
+      // must not send the body anywhere else.
+      const response = await fetchFn(pathUrl(files, url), { method: "POST", body, redirect: "manual" });
       if (!response.ok) throw new Error(`POST ${url} failed: ${response.status} ${response.statusText}`);
       return new Uint8Array(await response.arrayBuffer());
     },

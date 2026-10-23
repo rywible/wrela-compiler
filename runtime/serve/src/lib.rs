@@ -1,7 +1,9 @@
 //! The server host (language.md §19): a server build's rooms, over WebTransport. A session at
 //! `/room/<name>?pair=<id>` is a connection of room `<name>`, from a client build whose pair id
-//! is `<id>` (16 hex digits): one of another pair is refused before it reaches a room. It opens
-//! one bidirectional stream, on which each message is a frame: its length (a varint, at most
+//! is `<id>` (16 hex digits): one of another pair is refused before it reaches a room. The pair
+//! identifies a build, not a trusted peer. A browser's Origin must be allowed; a room's program
+//! decides who may use it. A session opens one bidirectional stream, on which each message is a
+//! frame: its length (a varint, at most
 //! [`MAX_FRAME`] bytes, and [`MAX_UP`] from a client), then its bytes. Each room runs on a
 //! thread of its own
 //! ([`wrela_host::rooms::RoomHost`]), which keeps it durably in the data directory and releases
@@ -15,18 +17,24 @@
 //! A connection that sends faster than its room takes ([`CONN_IN`] waiting), or takes what its
 //! room sends slower than the room sends it ([`CONN_OUT`] waiting, or a write that takes
 //! [`WRITE`]), is closed, and its peer comes back. At most, then, the queues hold
-//! `2 × sessions × RESERVED + queued` bytes.
+//! `2 × sessions × RESERVED + queued` bytes. QUIC stream, receive and send windows bound its
+//! buffers as well. An idle reader closes after 60 seconds; an unfinished frame after 10.
 
 use std::collections::HashMap;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use url::{Host, Url};
 use wrela_host::rooms::{Out, RoomHost, Status};
 use wrela_host::server::{Limits, ServerBuild};
 use wrela_host::services::Services;
+use wtransport::config::{IpBindConfig, QuicTransportConfig};
 use wtransport::endpoint::IncomingSession;
+use wtransport::quinn::VarInt;
 use wtransport::{Endpoint, Identity, ServerConfig};
 
 /// The largest frame, in bytes.
@@ -47,6 +55,10 @@ pub const CONN_IN: usize = 1 << 20;
 pub const CONN_OUT: usize = 16 << 20;
 /// How long a session may take to open, and to open its stream.
 const OPENING: Duration = Duration::from_secs(10);
+/// How long an established connection may send no message, and how long it may take to finish a
+/// frame after its first byte. QUIC keepalives do not count as messages.
+const READ_IDLE: Duration = Duration::from_secs(60);
+const FRAME_READ: Duration = Duration::from_secs(10);
 /// How long a write to a connection may take.
 pub const WRITE: Duration = Duration::from_secs(10);
 /// How often a room with nothing to do looks at its connections and whether to stop.
@@ -86,6 +98,56 @@ pub struct Config {
     pub identity: Identity,
     pub limits: Limits,
     pub bounds: Bounds,
+    /// Which browser page origins may open a session. Clients without an Origin header are not
+    /// browsers and must be authorized by the room's own protocol.
+    pub origins: Origins,
+}
+
+/// Browser origins allowed to open rooms. A production server names each page origin exactly;
+/// a local development server accepts only localhost and loopback page origins, at any port.
+pub enum Origins {
+    Local,
+    Exact(Vec<String>),
+}
+
+impl Origins {
+    fn permits(&self, origin: Option<&str>) -> bool {
+        let Some(origin) = origin else { return true };
+        let Some(parsed) = parsed_origin(origin) else { return false };
+        match self {
+            Origins::Local => matches!(
+                parsed.host(),
+                Some(Host::Domain("localhost"))
+                    | Some(Host::Ipv4(Ipv4Addr::LOCALHOST))
+                    | Some(Host::Ipv6(Ipv6Addr::LOCALHOST))
+            ),
+            Origins::Exact(allowed) => allowed.iter().any(|x| x == origin),
+        }
+    }
+
+    fn validate(&self) -> std::io::Result<()> {
+        if let Origins::Exact(allowed) = self {
+            if allowed.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "at least one page origin is required",
+                ));
+            }
+            if let Some(bad) = allowed.iter().find(|origin| parsed_origin(origin).is_none()) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("invalid page origin {bad:?}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn parsed_origin(origin: &str) -> Option<Url> {
+    let parsed = Url::parse(origin).ok()?;
+    (matches!(parsed.scheme(), "http" | "https") && parsed.origin().ascii_serialization() == origin)
+        .then_some(parsed)
 }
 
 /// A share of a bound: `n` of what each of `counts` counts, given back when it's dropped.
@@ -137,13 +199,14 @@ impl Drop for Share {
 /// What carries a room's messages to a connection, and the bytes they hold.
 struct Link {
     tx: tokio::sync::mpsc::Sender<(Out, Option<Share>)>,
+    stop: tokio::sync::watch::Sender<bool>,
     held: Arc<AtomicUsize>,
 }
 
 impl Link {
-    /// Tells its session to close, if its queue has room.
+    /// Tells its session to close even when its outbound queue is full.
     fn close(&self) {
-        let _ = self.tx.try_send((Out::Close(0), None));
+        self.stop.send_replace(true);
     }
 }
 
@@ -176,6 +239,7 @@ struct Rooms {
     services: Option<Arc<Services>>,
     limits: Limits,
     bounds: Bounds,
+    origins: Origins,
     next_conn: AtomicU32,
     /// When it started: its rooms' time, which a room that stops and starts again goes on with.
     started: Instant,
@@ -423,6 +487,7 @@ fn run(
                 };
                 if !sent {
                     // It can't take what it's sent fast enough: it goes, and comes back.
+                    link.close();
                     outs.remove(&conn);
                     host.disconnect(conn);
                 }
@@ -466,36 +531,53 @@ pub fn frame(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reads one frame from a client: `None` at the stream's end, or for a frame past [`MAX_UP`]
-/// or whose length isn't a varint.
-async fn read_frame(recv: &mut wtransport::RecvStream) -> Option<Vec<u8>> {
-    let mut len = 0usize;
-    for k in 0..3 {
-        let mut byte = [0u8];
-        recv.read_exact(&mut byte).await.ok()?;
-        len |= usize::from(byte[0] & 127) << (7 * k);
-        if byte[0] < 128 {
-            if len > MAX_UP {
-                return None;
+/// Reads one frame from a client: `None` at the stream's end, on a deadline, or for a frame past
+/// [`MAX_UP`] or whose length isn't a varint.
+async fn read_frame<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    idle: Duration,
+    frame_read: Duration,
+) -> Option<Vec<u8>> {
+    let mut first = [0u8];
+    tokio::time::timeout(idle, recv.read_exact(&mut first)).await.ok()?.ok()?;
+    tokio::time::timeout(frame_read, async {
+        let mut len = 0usize;
+        let mut byte = first;
+        for k in 0..3 {
+            len |= usize::from(byte[0] & 127) << (7 * k);
+            if byte[0] < 128 {
+                if len > MAX_UP {
+                    return None;
+                }
+                let mut bytes = vec![0u8; len];
+                recv.read_exact(&mut bytes).await.ok()?;
+                return Some(bytes);
             }
-            let mut bytes = vec![0u8; len];
-            recv.read_exact(&mut bytes).await.ok()?;
-            return Some(bytes);
+            if k < 2 {
+                recv.read_exact(&mut byte).await.ok()?;
+            }
         }
-    }
-    None
+        None
+    })
+    .await
+    .ok()?
 }
 
 /// One session: a connection of the room its path names. `_permit` is its share of the
 /// sessions the server may hold.
 async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
     let Ok(Ok(request)) = tokio::time::timeout(OPENING, incoming).await else { return };
+    if !rooms.origins.permits(request.origin()) {
+        request.forbidden().await;
+        return;
+    }
     let Some((name, pair)) = session_path(request.path()).map(|(n, p)| (n.to_string(), p)) else {
         request.not_found().await;
         return;
     };
     let (tx, mut from_room) = tokio::sync::mpsc::channel(QUEUE);
-    let link = Link { tx, held: Arc::new(AtomicUsize::new(0)) };
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let link = Link { tx, stop, held: Arc::new(AtomicUsize::new(0)) };
     let (conn, to_room) = match rooms.join(&name, pair, link) {
         Ok(joined) => joined,
         Err(Refusal::Pair) => return request.forbidden().await,
@@ -513,7 +595,7 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
     };
     let held = Arc::new(AtomicUsize::new(0));
     let reading = async {
-        while let Some(bytes) = read_frame(&mut recv).await {
+        while let Some(bytes) = read_frame(&mut recv, READ_IDLE, FRAME_READ).await {
             let share = Share::bytes(
                 bytes.len() + OVERHEAD,
                 (&held, CONN_IN),
@@ -544,6 +626,8 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
         true
     };
     let finish = tokio::select! {
+        biased;
+        _ = stopped.changed() => false,
         () = reading => false,
         finish = writing => finish,
     };
@@ -562,9 +646,15 @@ async fn session(incoming: IncomingSession, rooms: Arc<Rooms>, _permit: Share) {
 /// A running server: what changes the build its rooms run.
 pub struct Server {
     rooms: Arc<Rooms>,
+    local_addr: SocketAddr,
 }
 
 impl Server {
+    /// The address the server socket actually uses.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
     /// From now on, rooms run `build` (its WASM's hash `hash`), kept apart from the last build's:
     /// each room running closes its connections, and its peers come back to the new build's.
     pub fn set_build(&self, build: Arc<ServerBuild>, hash: u64) {
@@ -581,13 +671,41 @@ impl Server {
 /// Starts serving `config`'s rooms on `runtime`, until it ends: the server, or why its port can't
 /// be had.
 pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Result<Server> {
+    start_with_bind(config, runtime, IpBindConfig::InAddrAnyDual)
+}
+
+/// Starts a development server on loopback addresses only.
+pub fn start_local(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Result<Server> {
+    start_with_bind(config, runtime, IpBindConfig::LocalDual)
+}
+
+fn transport_config() -> QuicTransportConfig {
+    let mut transport = QuicTransportConfig::default();
+    // HTTP/3 uses a CONNECT stream and control streams. The room uses one more bidirectional
+    // stream. Unused streams and datagrams must not bypass the room's queue bounds.
+    transport.max_concurrent_bidi_streams(VarInt::from_u32(2));
+    transport.max_concurrent_uni_streams(VarInt::from_u32(4));
+    transport.stream_receive_window(VarInt::from_u32(128 << 10));
+    transport.receive_window(VarInt::from_u32(512 << 10));
+    transport.send_window(512 << 10);
+    transport.datagram_receive_buffer_size(Some(1024));
+    transport
+}
+
+fn start_with_bind(
+    config: Config,
+    runtime: &tokio::runtime::Runtime,
+    bind: IpBindConfig,
+) -> std::io::Result<Server> {
+    config.origins.validate()?;
     let _entered = runtime.enter();
     let server = ServerConfig::builder()
-        .with_bind_default(config.port)
-        .with_identity(config.identity)
+        .with_bind_config(bind, config.port)
+        .with_custom_transport(config.identity, transport_config())
         .keep_alive_interval(Some(Duration::from_secs(3)))
         .build();
     let endpoint = Endpoint::server(server)?;
+    let local_addr = endpoint.local_addr()?;
     let rooms = Arc::new(Rooms {
         state: Mutex::new(State {
             build: config.build,
@@ -598,6 +716,7 @@ pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Resu
         services: config.services,
         limits: config.limits,
         bounds: config.bounds,
+        origins: config.origins,
         next_conn: AtomicU32::new(1),
         started: Instant::now(),
         sessions: Arc::new(AtomicUsize::new(0)),
@@ -615,7 +734,7 @@ pub fn start(config: Config, runtime: &tokio::runtime::Runtime) -> std::io::Resu
             }
         }
     });
-    Ok(Server { rooms })
+    Ok(Server { rooms, local_addr })
 }
 
 /// A development certificate (self-signed, valid under 14 days, as browsers take one by its hash)
@@ -645,6 +764,102 @@ pub fn net_json(port: u16, certificate_hash: Option<&[u8; 32]>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn a_full_outbound_queue_does_not_block_session_shutdown() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (stop, mut stopped) = tokio::sync::watch::channel(false);
+        tx.try_send((wrela_host::rooms::Out::Send(1, vec![0]), None))
+            .expect("fill the outbound queue");
+        let link = super::Link { tx, stop, held: Arc::new(AtomicUsize::new(0)) };
+        link.close();
+        tokio::time::timeout(Duration::from_secs(1), stopped.changed())
+            .await
+            .expect("shutdown signal is not queued")
+            .expect("shutdown sender remains open");
+        assert!(*stopped.borrow());
+    }
+
+    #[test]
+    fn browser_origins_are_checked_before_a_room_opens() {
+        let local = super::Origins::Local;
+        for origin in ["http://localhost:8000", "https://127.0.0.1", "http://[::1]:1234"] {
+            assert!(local.permits(Some(origin)), "{origin}");
+        }
+        for origin in [
+            "https://attacker.example",
+            "http://localhost.attacker.example",
+            "http://localhost:12/path",
+            "http://localhost:99999",
+            "null",
+        ] {
+            assert!(!local.permits(Some(origin)), "{origin}");
+        }
+        let exact = super::Origins::Exact(vec!["https://game.example:8443".to_string()]);
+        assert!(exact.validate().is_ok());
+        assert!(exact.permits(Some("https://game.example:8443")));
+        assert!(!exact.permits(Some("https://game.example")));
+        assert!(!exact.permits(Some("https://other.example:8443")));
+        assert!(exact.permits(None), "non-browser clients have no Origin header");
+    }
+
+    #[test]
+    fn a_production_origin_must_be_a_serialized_http_origin() {
+        assert!(super::Origins::Exact(Vec::new()).validate().is_err());
+        for invalid in [
+            "null",
+            "file:///tmp/game.html",
+            "https://user@game.example",
+            "https://game.example/path",
+            "https://game.example?query",
+            "https://game.example#fragment",
+            "https://game.example:443",
+            "HTTPS://GAME.EXAMPLE",
+            "http://localhost:99999",
+        ] {
+            let policy = super::Origins::Exact(vec![invalid.to_string()]);
+            assert!(policy.validate().is_err(), "accepted {invalid}");
+            assert!(!policy.permits(Some(invalid)), "permitted {invalid}");
+        }
+        for valid in ["http://localhost:8080", "https://game.example", "https://[::1]:4433"] {
+            assert!(super::Origins::Exact(vec![valid.to_string()]).validate().is_ok(), "{valid}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_or_partly_sent_frame_cannot_hold_a_session_forever() {
+        let (mut peer, mut recv) = tokio::io::duplex(256);
+        let idle = Duration::from_millis(30);
+        let frame = Duration::from_millis(30);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), super::read_frame(&mut recv, idle, frame))
+                .await
+                .expect("read deadline")
+                .is_none()
+        );
+        peer.write_all(&[0x80, 0x01]).await.expect("partial frame");
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), super::read_frame(&mut recv, idle, frame))
+                .await
+                .expect("frame deadline")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_complete_frame_is_read_with_the_deadline() {
+        let (mut peer, mut recv) = tokio::io::duplex(256);
+        peer.write_all(&super::frame(b"hello")).await.expect("frame");
+        assert_eq!(
+            super::read_frame(&mut recv, Duration::from_secs(1), Duration::from_secs(1)).await,
+            Some(b"hello".to_vec())
+        );
+    }
+
     #[test]
     fn a_sessions_path_names_its_room_and_pair() {
         let path = super::session_path;
