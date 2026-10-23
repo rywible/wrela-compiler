@@ -95,10 +95,22 @@ pub struct Tested: Clone {
     pub filtered_out: u32,
 }
 
-/// A check: whether it found no errors, and what it found.
+/// A check: whether it found no errors, what it found, and (with no errors) the pipelines the
+/// package's build makes, as `wrela pipelines` counts them.
 pub struct Checked: Clone {
     pub ok: bool,
     pub diagnostics: Vec<Diagnostic>,
+    pub pipelines: Vec<Pipeline>,
+}
+
+/// A pipeline of a build (`wrela pipelines --json`): `compute` or `render`, its entry points
+/// with their type arguments (`shade::<f32>`), and where CPU code dispatches or draws it
+/// (`file:line:column`). A test asserts what a program reaches with them: no pipeline it didn't
+/// reach before, say.
+pub struct Pipeline: Clone {
+    pub kind: String,
+    pub entries: Vec<String>,
+    pub sites: Vec<String>,
 }
 
 /// A file `fmt` couldn't format, and why (its syntax errors).
@@ -292,6 +304,13 @@ fn read_diagnostic(r: mut Reader) -> Option<Diagnostic> {
     Some(Diagnostic { error: error != 0, code, message, at, rendered })
 }
 
+fn read_pipeline(r: mut Reader) -> Option<Pipeline> {
+    let Ok(kind) = r.read_string() else { return None }
+    let Some(entries) = read_strings(mut r) else { return None }
+    let Some(sites) = read_strings(mut r) else { return None }
+    Some(Pipeline { kind, entries, sites })
+}
+
 /// A `build` answer.
 impl Answer for Built {
     fn read(bytes: take Vec<u8>) -> Result<Built, ToolError> {
@@ -347,10 +366,13 @@ impl Answer for Checked {
         let Some(diagnostics) = read_list(mut r, read_diagnostic) else {
             return Err(malformed("a check"))
         }
+        let Some(pipelines) = read_list(mut r, read_pipeline) else {
+            return Err(malformed("a check"))
+        }
         if !r.at_end() {
             return Err(malformed("a check"))
         }
-        Ok(Checked { ok: ok != 0, diagnostics })
+        Ok(Checked { ok: ok != 0, diagnostics, pipelines })
     }
 }
 
