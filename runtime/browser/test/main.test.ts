@@ -41,7 +41,7 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean } = {}): Promise<Page> {
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean; preload?: string[] } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], canvasEvents: new Map(), worker: null, text: [], classes: [] };
   // The page's own text records a box put before it, and its removal.
   const own = options.text ? {
@@ -65,6 +65,8 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     hasFocus: () => options.focused ?? true,
     // The canvas, or the page's Markdown alternate when a test gives one.
     querySelector: (selector: string) => selector.startsWith("link") ? (options.alternate ? { href: options.alternate } : null) : selector.startsWith("main") ? own : canvas,
+    // The build's files the page preloads.
+    querySelectorAll: (selector: string) => selector.startsWith("link[rel=\"preload\"]") ? (options.preload ?? []).map((href) => ({ href })) : [],
     documentElement: { classList: { add: (name: string) => page.classes.push(name) } },
     createElement: (tag: string) => tag === "a"
       ? { href: "", textContent: "" }
@@ -125,6 +127,13 @@ test("a public page ignores #test", async () => {
   expect(page.shown).toEqual([]);
   expect(page.puts).toEqual([]);
   expect(page.posted.map((m) => m.type)).toEqual(["start", "visibility"]);
+});
+
+test("the page names the build's files it preloads to the worker, and fetches them for it", async () => {
+  const page = await load("https://example.com/game/", { preload: ["https://example.com/game/manifest.json", "https://example.com/game/game.wasm"] });
+  const start = page.posted.find((msg) => msg.type === "start");
+  expect(start?.type === "start" && start.given).toEqual(["https://example.com/game/manifest.json", "https://example.com/game/game.wasm"]);
+  expect(page.puts).toEqual(["undefined https://example.com/game/manifest.json", "undefined https://example.com/game/game.wasm"]);
 });
 
 test("a browser without WebGPU is told what a program needs, not that it failed", async () => {

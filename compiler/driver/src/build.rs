@@ -210,10 +210,30 @@ fn emit_in(
     files.push(("manifest.json".to_string(), manifest.to_json().into_bytes()));
     if shaders {
         for (path, bytes) in RUNTIME_FILES {
-            files.push((path.to_string(), bytes.to_vec()));
+            let bytes = if *path == "index.html" { page(bytes, &manifest) } else { bytes.to_vec() };
+            files.push((path.to_string(), bytes));
         }
     }
     BuildOutput { files, diagnostics, lines: code_lines }
+}
+
+/// The runtime's page for a build: it preloads the build's manifest, WASM and shaders as soon as
+/// it is parsed, and its script hands them to the render worker (runtime/browser `preload.ts`),
+/// which would otherwise ask for them only once its own script and then the manifest had come.
+/// `crossorigin` makes each preload what the page's `fetch` asks for, so the fetch takes it.
+fn page(runtime: &[u8], manifest: &wrela_abi::Manifest) -> Vec<u8> {
+    let mut files = vec!["manifest.json", manifest.wasm.as_str()];
+    for p in &manifest.pipelines {
+        if !files.contains(&p.shader.as_str()) {
+            files.push(&p.shader);
+        }
+    }
+    let links: String = files
+        .iter()
+        .map(|f| format!("<link rel=\"preload\" href=\"{f}\" as=\"fetch\" crossorigin>\n"))
+        .collect();
+    let page = String::from_utf8_lossy(runtime);
+    page.replacen("</head>", &format!("{links}</head>"), 1).into_bytes()
 }
 
 /// E0707: a shipped build over one of its budgets, at the command that records what's over.
@@ -271,6 +291,27 @@ fn records_commands() {}
 
     fn file<'a>(out: &'a BuildOutput, name: &str) -> &'a [u8] {
         &out.files.iter().find(|(path, _)| path == name).expect("built file").1
+    }
+
+    #[test]
+    fn a_builds_page_preloads_its_manifest_wasm_and_shaders() {
+        let root = package("page", CPU_FRAMES);
+        crate::with_checked(&root, |checked, sources| {
+            let roots = wrela_lower::Roots::of(checked);
+            let data = wrela_lower::BuildData::default();
+            let (full, errors) = wrela_lower::lower(checked, &roots, &data, true);
+            assert!(!wrela_diag::has_errors(&errors), "{errors:?}");
+            let out = emit(&full, sources, true, false);
+            let page = String::from_utf8(file(&out, "index.html").to_vec()).expect("UTF-8");
+            let head = &page[..page.find("</head>").expect("a head")];
+            for f in ["manifest.json", "game.wasm", "pipeline_0.wgsl", "pipeline_1.wgsl"] {
+                let link = format!("<link rel=\"preload\" href=\"{f}\" as=\"fetch\" crossorigin>");
+                assert_eq!(head.matches(&link).count(), 1, "{f} preloaded once, in the head");
+            }
+            assert_eq!(page.matches("rel=\"preload\"").count(), 4, "nothing else");
+        })
+        .expect("checked package");
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -48,6 +48,43 @@ export async function loadScript(url: URL, fetchFn: Fetch = (url) => fetch(url))
   return parseScript(await getText(fetchFn, url));
 }
 
+/**
+ * The build's files that the page fetched ahead for the worker (`preloaded` in main.ts): the
+ * page asks for them as soon as it is parsed, before its script, the worker's script and the
+ * manifest have each come over the network in turn. A fetch of one takes its bytes, once; a
+ * fetch of any other, or of one the page couldn't fetch, goes to the network.
+ */
+export class Handed {
+  readonly #files = new Map<
+    string,
+    { bytes: Promise<Uint8Array<ArrayBuffer> | null>; give: (b: Uint8Array<ArrayBuffer> | null) => void; taken: boolean }
+  >();
+
+  constructor(urls: readonly string[]) {
+    for (const url of urls) {
+      let give: (b: Uint8Array<ArrayBuffer> | null) => void = () => {};
+      const bytes = new Promise<Uint8Array<ArrayBuffer> | null>((resolve) => (give = resolve));
+      this.#files.set(url, { bytes, give, taken: false });
+    }
+  }
+
+  /** The page's fetch of `url` ended: its bytes, or null if it failed. */
+  give(url: string, bytes: Uint8Array<ArrayBuffer> | null): void {
+    this.#files.get(url)?.give(bytes);
+  }
+
+  /** `fetchFn`, but taking what the page fetched. */
+  fetch(fetchFn: Fetch): Fetch {
+    return async (url, init) => {
+      const handed = this.#files.get(url.href);
+      if (handed === undefined || handed.taken) return fetchFn(url, init);
+      handed.taken = true;
+      const bytes = await handed.bytes;
+      return bytes === null ? fetchFn(url, init) : new Response(bytes);
+    };
+  }
+}
+
 /** Fetches and validates a build; its files resolve against `base`. */
 export async function loadBuild(base: string, fetchFn: Fetch = (url) => fetch(url)): Promise<Build> {
   const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
