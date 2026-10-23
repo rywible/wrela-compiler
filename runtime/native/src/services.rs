@@ -74,22 +74,33 @@ impl Services {
     }
 
     /// Commits writes (`store/write` commands' bodies) in one transaction: all of them, or none.
-    pub fn write(&self, batches: &[Vec<u8>]) -> Result<(), String> {
+    pub fn write(&self, batches: &[impl AsRef<[u8]>]) -> Result<(), String> {
         let mut ops = Vec::new();
         for b in batches {
-            ops.extend(writes(b)?);
+            ops.extend(writes(b.as_ref())?);
         }
         let mut db = self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
-        for (key, value) in ops {
-            match value {
-                Some(v) => tx
-                    .execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)", (key, v))
-                    .map_err(|e| e.to_string())?,
-                None => tx
-                    .execute("DELETE FROM kv WHERE key = ?1", (key,))
-                    .map_err(|e| e.to_string())?,
-            };
+        {
+            let mut put = None;
+            let mut delete = None;
+            for (key, value) in ops {
+                match value {
+                    Some(v) => put
+                        .get_or_insert_with(|| {
+                            tx.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
+                        })
+                        .as_mut()
+                        .map_err(|e| e.to_string())?
+                        .execute((key, v)),
+                    None => delete
+                        .get_or_insert_with(|| tx.prepare("DELETE FROM kv WHERE key = ?1"))
+                        .as_mut()
+                        .map_err(|e| e.to_string())?
+                        .execute((key,)),
+                }
+                .map_err(|e| e.to_string())?;
+            }
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -98,17 +109,18 @@ impl Services {
     fn get(&self, body: &[u8]) -> Result<Vec<u8>, String> {
         let key = key(body)?;
         let db = self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())?;
-        let found: Option<Vec<u8>> = db
-            .query_row("SELECT value FROM kv WHERE key = ?1", (key,), |r| r.get(0))
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                e => Err(e.to_string()),
-            })?;
-        Ok(match found {
-            Some(v) => [&[1u8][..], &v].concat(),
-            None => vec![0],
+        db.query_row("SELECT value FROM kv WHERE key = ?1", (key,), |row| {
+            let value = blob(row, 0)?;
+            let mut out = Vec::with_capacity(value.len() + 1);
+            out.push(1);
+            out.extend_from_slice(value);
+            Ok(out)
         })
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(vec![0]),
+            e => Err(e),
+        })
+        .map_err(|e| e.to_string())
     }
 
     /// `store/scan`: from (a key), to (a key; empty: no end), at most `limit` entries, and 1 to go
@@ -138,29 +150,42 @@ impl Services {
         let mut rows =
             if to.is_empty() { stmt.query((from, limit)) } else { stmt.query((from, limit, to)) }
                 .map_err(|e| e.to_string())?;
-        let (mut out, mut count, mut bytes) = (Vec::new(), 0u32, 0usize);
+        let (mut out, mut count, mut bytes) = (vec![0u8; 4], 0u32, 0usize);
         while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let k: Vec<u8> = row.get(0).map_err(|e| e.to_string())?;
-            let v: Vec<u8> = row.get(1).map_err(|e| e.to_string())?;
+            let k = blob(row, 0).map_err(|e| e.to_string())?;
+            let v = blob(row, 1).map_err(|e| e.to_string())?;
             bytes += k.len() + v.len();
             if count > 0 && bytes > MAX_SCAN {
                 break;
             }
-            for part in [&k, &v] {
-                out.extend((part.len() as u32).to_le_bytes());
-                out.extend(part.iter());
+            for part in [k, v] {
+                out.extend_from_slice(&(part.len() as u32).to_le_bytes());
+                out.extend_from_slice(part);
             }
             count += 1;
         }
-        Ok([&count.to_le_bytes()[..], &out].concat())
+        out[..4].copy_from_slice(&count.to_le_bytes());
+        Ok(out)
+    }
+}
+
+/// A row's bytes, borrowed until the next row, with the same type error as `Row::get`.
+fn blob<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> rusqlite::Result<&'a [u8]> {
+    match row.get_ref(index)? {
+        rusqlite::types::ValueRef::Blob(bytes) => Ok(bytes),
+        value => Err(rusqlite::Error::InvalidColumnType(
+            index,
+            row.as_ref().column_name(index)?.into(),
+            value.data_type(),
+        )),
     }
 }
 
 /// A write to one key: its new value, or none to delete it.
-type Write = (Vec<u8>, Option<Vec<u8>>);
+type Write<'a> = (&'a [u8], Option<&'a [u8]>);
 
 /// A write's body: entries, each a kind (1 put, 2 delete), a key, and for a put its value.
-fn writes(body: &[u8]) -> Result<Vec<Write>, String> {
+fn writes(body: &[u8]) -> Result<Vec<Write<'_>>, String> {
     let mut r = Bytes(body);
     let mut ops = Vec::new();
     while !r.0.is_empty() {
@@ -175,12 +200,12 @@ fn writes(body: &[u8]) -> Result<Vec<Write>, String> {
                 if v.len() > MAX_VALUE {
                     return Err(format!("a value is longer than {MAX_VALUE} bytes"));
                 }
-                Some(v.to_vec())
+                Some(v)
             }
             DELETE => None,
             _ => return Err(format!("a store write of kind {kind}")),
         };
-        ops.push((k.to_vec(), value));
+        ops.push((k, value));
     }
     Ok(ops)
 }
@@ -363,6 +388,48 @@ mod tests {
         let bad = vec![9, 0, 0, 0, 0];
         assert!(s.write(&[good, bad]).is_err());
         assert_eq!(s.answer("store/get", b"k").expect("get"), vec![0]);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn borrowed_write_batches_keep_operation_order_and_empty_values() {
+        let d = dir("borrowed");
+        let s = Services::open(&d.join("store.sqlite")).expect("open");
+        let first = [put(b"key", b"first"), put(b"", b"")].concat();
+        let second =
+            [[&[DELETE][..], &chunk(b"key")].concat(), put(b"key", b"last"), put(b"empty", b"")]
+                .concat();
+        s.write(&[first.as_slice(), second.as_slice()]).expect("borrowed batches");
+        assert_eq!(s.answer("store/get", b"key").expect("get"), b"\x01last");
+        assert_eq!(s.answer("store/get", b"").expect("empty key"), [1]);
+        assert_eq!(s.answer("store/get", b"empty").expect("empty value"), [1]);
+        assert_eq!(
+            scan(&s, b"", b"", 10, false),
+            vec![
+                (Vec::new(), Vec::new()),
+                (b"empty".to_vec(), Vec::new()),
+                (b"key".to_vec(), b"last".to_vec()),
+            ]
+        );
+        assert_eq!(
+            scan(&s, b"empty", b"l", 10, true),
+            vec![(b"key".to_vec(), b"last".to_vec()), (b"empty".to_vec(), Vec::new())]
+        );
+        assert!(scan(&s, b"", b"", 0, false).is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_scan_keeps_its_first_entry_at_and_past_the_byte_limit() {
+        let d = dir("scan-limit");
+        let s = Services::open(&d.join("store.sqlite")).expect("open");
+        let mut value = vec![7u8; MAX_SCAN - 1];
+        s.write(&[[put(b"a", &value), put(b"b", b"")].concat()]).expect("write");
+        assert_eq!(scan(&s, b"", b"", 10, false), vec![(b"a".to_vec(), value.clone())]);
+        assert_eq!(scan(&s, b"b", b"", 10, false), vec![(b"b".to_vec(), Vec::new())]);
+        value.push(8);
+        s.write(&[put(b"a", &value)]).expect("largest value");
+        assert_eq!(scan(&s, b"", b"", 10, false), vec![(b"a".to_vec(), value)]);
         let _ = std::fs::remove_dir_all(&d);
     }
 

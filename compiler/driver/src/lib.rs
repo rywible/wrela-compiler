@@ -674,8 +674,12 @@ fn run_tests_in(
             ran.extend(r);
             diagnostics.extend(d);
         }
-        // In the order written.
-        ran.sort_by_key(|&(f, _, _)| tests.iter().position(|&t| t == f));
+        // In the order written. Function ids retain the collection order when spans tie,
+        // as the stable sort of `tests` above does.
+        ran.sort_by_key(|&(f, _, _)| {
+            let span = p.func(f).span;
+            (span.file, span.start, f)
+        });
         for (f, failure, traced) in ran {
             let def = p.func(f);
             let at = sources.file(def.name_span.file).location(def.name_span.start);

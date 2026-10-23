@@ -71,16 +71,23 @@ pub fn lay_out_gpu_memory(m: &mut Module) -> Result<()> {
 /// The aggregates memory holds: those in a resource's type, at any depth.
 fn memory_types(m: &Module) -> HashSet<TypeId> {
     fn walk(types: &Types, t: TypeId, out: &mut HashSet<TypeId>) {
-        let parts: Vec<TypeId> = match types.get(t) {
-            TypeDef::Struct { fields, .. } => fields.iter().map(|(_, f)| *f).collect(),
-            TypeDef::Enum { variants, .. } => variants.iter().filter_map(|(_, p)| *p).collect(),
-            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) => vec![*e],
-            _ => return,
-        };
-        if out.insert(t) {
-            for p in parts {
-                walk(types, p, out);
+        match types.get(t) {
+            TypeDef::Struct { fields, .. } if out.insert(t) => {
+                for (_, f) in fields {
+                    walk(types, *f, out);
+                }
             }
+            TypeDef::Enum { variants, .. } if out.insert(t) => {
+                for (_, p) in variants {
+                    if let Some(p) = p {
+                        walk(types, *p, out);
+                    }
+                }
+            }
+            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) if out.insert(t) => {
+                walk(types, *e, out);
+            }
+            _ => {}
         }
     }
     let mut out = HashSet::new();
@@ -596,5 +603,49 @@ impl Rewriter<'_> {
             out.push(Stmt::Store(p, x));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn memory_types_include_shared_aggregates_from_repeated_resources() {
+        let mut m = Module::default();
+        let scalar = m.types.bool();
+        let unused = m.types.intern(TypeDef::Struct {
+            name: "unused".into(),
+            fields: vec![("value".into(), scalar)],
+        });
+        let mut t = m.types.intern(TypeDef::Array(scalar, 4));
+        let mut expected = HashSet::from([t]);
+        t = m.types.intern(TypeDef::Enum {
+            name: "choice".into(),
+            variants: vec![("empty".into(), None), ("values".into(), Some(t))],
+            tags: vec![3, 9],
+        });
+        expected.insert(t);
+        for depth in 0..8 {
+            t = m.types.intern(TypeDef::Struct {
+                name: format!("shared{depth}"),
+                fields: vec![("left".into(), t), ("right".into(), t)],
+            });
+            expected.insert(t);
+        }
+        let array = m.types.intern(TypeDef::RuntimeArray(t));
+        expected.insert(array);
+        for (binding, ty) in [t, array, t, array].into_iter().enumerate() {
+            m.resources.push(Resource {
+                name: format!("resource{binding}"),
+                binding: binding as u32,
+                kind: ResourceKind::Uniform { storage: true },
+                ty,
+            });
+        }
+        let memory = memory_types(&m);
+        assert_eq!(memory, expected);
+        assert!(!memory.contains(&scalar));
+        assert!(!memory.contains(&unused));
     }
 }

@@ -48,7 +48,8 @@ impl Seen {
 pub(crate) type Files = BTreeMap<PathBuf, Seen>;
 
 /// The source files (modules and manifests, not build output) of the packages in `dirs`, each
-/// read again only where its time or length has changed since `before`.
+/// read again only where its time or length has changed since `before`. A nested package's
+/// manifest is watched alone: removing it makes that directory part of this package again.
 pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
     fn walk(dir: &Path, top: bool, before: &Files, out: &mut Files) {
         let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -60,7 +61,13 @@ pub(crate) fn scan(dirs: &[PathBuf], before: &Files) -> Files {
             }
             let Ok(kind) = e.file_type() else { continue };
             if kind.is_dir() {
-                if !(top && wrela_sema::OUTPUT_DIRS.contains(&name.as_str())) {
+                if top && wrela_sema::OUTPUT_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                let manifest = path.join("wrela.toml");
+                if manifest.is_file() {
+                    see(manifest, before, out);
+                } else {
                     walk(&path, false, before, out);
                 }
             } else if name.ends_with(".wrela") || name == "wrela.toml" {
@@ -757,6 +764,45 @@ mod tests {
             "{response}"
         );
         let _ = std::fs::remove_dir_all(out);
+    }
+
+    #[test]
+    fn scan_skips_nested_package_contents_and_watches_explicit_dependencies() {
+        let d = crate::Scratch::new("wrela-live-nested").expect("scratch");
+        let nested = d.0.join("library");
+        std::fs::create_dir_all(nested.join("build")).expect("directories");
+        let main = d.0.join("main.wrela");
+        let manifest = nested.join("wrela.toml");
+        let source = nested.join("value.wrela");
+        let artifact = nested.join("build/generated.wrela");
+        std::fs::write(&main, "").expect("program source");
+        std::fs::write(&manifest, "[package]\nname = \"library\"\n").expect("manifest");
+        std::fs::write(&source, "first\n").expect("nested source");
+        std::fs::write(&artifact, "generated\n").expect("build output");
+
+        let first = scan(std::slice::from_ref(&d.0), &Files::new());
+        assert_eq!(first.len(), 2, "only the program and the package boundary are watched");
+        assert!(first.contains_key(&main) && first.contains_key(&manifest));
+        std::fs::write(&source, "second, and longer\n").expect("nested edit");
+        std::fs::write(&artifact, "new build output\n").expect("build edit");
+        let unrelated = scan(std::slice::from_ref(&d.0), &first);
+        assert_eq!(changed(&first, &unrelated).count(), 0, "nested contents are unrelated");
+
+        let dirs = [d.0.clone(), nested.clone()];
+        let dependency = scan(&dirs, &unrelated);
+        assert!(dependency.contains_key(&source), "a dependency is scanned from its own root");
+        assert!(!dependency.contains_key(&artifact), "a dependency's build output is skipped");
+        std::fs::write(&source, "third, longer again\n").expect("dependency edit");
+        let edited = scan(&dirs, &dependency);
+        assert_eq!(changed(&dependency, &edited).collect::<Vec<_>>(), [&source]);
+
+        std::fs::remove_file(&manifest).expect("remove package boundary");
+        let modules = scan(std::slice::from_ref(&d.0), &unrelated);
+        assert!(modules.contains_key(&source), "the directory is now part of the program");
+        assert!(
+            changed(&unrelated, &modules).any(|p| p == &manifest),
+            "removing the boundary must trigger a rebuild"
+        );
     }
 
     /// Source-file symlinks are package modules. A scan keys their cached contents by the

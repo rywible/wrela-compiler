@@ -51,14 +51,27 @@ const MAGIC: &[u8; 4] = b"WRJ1";
 /// The largest record a journal holds: a snapshot of a room's whole state at most.
 const MAX_RECORD: u32 = 64 << 20;
 
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut byte = 0;
+    while byte < table.len() {
+        let mut crc = byte as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+            bit += 1;
+        }
+        table[byte] = crc;
+        byte += 1;
+    }
+    table
+};
+
 /// CRC-32C (Castagnoli), as storage formats use it.
 pub fn crc32c(bytes: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in bytes {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
-        }
+        crc = (crc >> 8) ^ CRC32C_TABLE[((crc ^ u32::from(b)) & 255) as usize];
     }
     !crc
 }
@@ -304,7 +317,7 @@ impl RoomHost {
         let dir = dir.canonicalize().map_err(host)?;
         let path = dir.join(format!("{name}.journal"));
         let held = Held::take(&path)?;
-        let (journal, _) = Journal::open(&path, build_hash, name)?;
+        let (journal, records) = Journal::open(&path, build_hash, name)?;
         let mut room = RoomHost {
             build,
             build_hash,
@@ -320,7 +333,7 @@ impl RoomHost {
             failures: 0,
             _held: held,
         };
-        room.start()?;
+        room.restore(records)?;
         Ok(room)
     }
 
@@ -348,6 +361,11 @@ impl RoomHost {
             Journal::open(&self.journal.path, self.build_hash, &self.name)?;
         journal.fault = self.journal.fault.take();
         self.journal = journal;
+        self.restore(records)
+    }
+
+    /// Starts an instance with the records from the journal just opened.
+    fn restore(&mut self, records: Vec<Vec<u8>>) -> Result<(), Failure> {
         let answers: Option<Answers> = self.services.clone().map(|s| {
             let answer: Answers =
                 Arc::new(move |service: &str, body: &[u8]| s.answer(service, body));
@@ -544,9 +562,9 @@ impl RoomHost {
         let mut records = Vec::new();
         let mut held = Vec::new();
         let mut tags = Vec::new();
-        let writes: Vec<Vec<u8>> = commands
+        let writes: Vec<&[u8]> = commands
             .iter()
-            .filter_map(|c| if let Net::Write(w) = c { Some(w.clone()) } else { None })
+            .filter_map(|c| if let Net::Write(w) = c { Some(w.as_slice()) } else { None })
             .collect();
         let mut kept = if writes.is_empty() {
             Ok(())
@@ -696,5 +714,33 @@ mod tests {
     fn crc32c_is_castagnolis() {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(crc32c(b""), 0);
+    }
+
+    #[test]
+    fn crc32c_matches_the_bitwise_rule_on_seeded_bytes() {
+        fn bitwise(bytes: &[u8]) -> u32 {
+            let mut crc = !0u32;
+            for &byte in bytes {
+                crc ^= u32::from(byte);
+                for _ in 0..8 {
+                    crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82F6_3B78 } else { crc >> 1 };
+                }
+            }
+            !crc
+        }
+
+        let mut seed = 0x73A9_4B21u32;
+        let mut bytes = [0u8; 4096];
+        for _ in 0..16 {
+            for byte in &mut bytes {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                *byte = seed as u8;
+            }
+            for len in [0, 1, 2, 3, 7, 8, 15, 16, 31, 32, 63, 64, 255, 256, 257, 1024, 4096] {
+                assert_eq!(crc32c(&bytes[..len]), bitwise(&bytes[..len]), "length {len}");
+            }
+        }
     }
 }

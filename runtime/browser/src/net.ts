@@ -136,32 +136,42 @@ export function frame(bytes: Uint8Array): Uint8Array {
 
 /** Reads frames from a stream's chunks, however they're split. */
 export class Frames {
-  #buffer = new Uint8Array(0);
+  #length = 0;
+  #prefix = 0;
+  #body: Uint8Array | null = null;
+  #used = 0;
 
   /** The whole frames `chunk` completes, oldest first; an error for a frame too long, or whose
    * length isn't a varint of at most three bytes. */
   push(chunk: Uint8Array): Uint8Array[] {
-    const b = new Uint8Array(this.#buffer.length + chunk.length);
-    b.set(this.#buffer);
-    b.set(chunk, this.#buffer.length);
     const out: Uint8Array[] = [];
     let at = 0;
-    for (;;) {
-      let length = 0;
-      let k = 0;
-      for (; k < 3 && at + k < b.length; k++) {
-        length |= (b[at + k]! & 127) << (7 * k);
-        if (b[at + k]! < 128) break;
+    while (at < chunk.length) {
+      if (this.#body === null) {
+        const byte = chunk[at++]!;
+        this.#length |= (byte & 127) << (7 * this.#prefix++);
+        if (byte >= 128) {
+          if (this.#prefix === 3) throw new Error("a frame's length isn't a varint of at most three bytes");
+          continue;
+        }
+        if (this.#length > MAX_FRAME) throw new Error(`a frame of ${this.#length} bytes, past ${MAX_FRAME}`);
+        // Allocate once per frame: each chunk copies only the bytes it adds, and a delivered
+        // frame keeps its own storage when the stream reuses its chunk or the next frame starts.
+        this.#body = new Uint8Array(this.#length);
+        this.#length = 0;
+        this.#prefix = 0;
+        this.#used = 0;
       }
-      if (k === 3) throw new Error("a frame's length isn't a varint of at most three bytes");
-      if (at + k >= b.length) break;
-      if (length > MAX_FRAME) throw new Error(`a frame of ${length} bytes, past ${MAX_FRAME}`);
-      const start = at + k + 1;
-      if (start + length > b.length) break;
-      out.push(b.slice(start, start + length));
-      at = start + length;
+      const body = this.#body;
+      const n = Math.min(body.length - this.#used, chunk.length - at);
+      body.set(chunk.subarray(at, at + n), this.#used);
+      this.#used += n;
+      at += n;
+      if (this.#used === body.length) {
+        out.push(body);
+        this.#body = null;
+      }
     }
-    this.#buffer = b.slice(at);
     return out;
   }
 }
@@ -381,6 +391,7 @@ export class Net {
    * hold (HELD) closes its connection: its later messages go, and its closing comes next. */
   deliver(inbox: Inbox): void {
     const arrived = this.arrived;
+    if (arrived.length === 0) return;
     this.arrived = [];
     this.#held = 0;
     const full = new Set<number>();

@@ -279,6 +279,9 @@ impl Ring {
 
 struct Timer {
     queries: wgpu::QuerySet,
+    /// Reused after each collection has finished mapping its result.
+    resolved: wgpu::Buffer,
+    readback: wgpu::Buffer,
     /// What each pair of queries in this submission times.
     pending: Vec<Timed>,
     results: Vec<GpuTiming>,
@@ -325,6 +328,8 @@ pub(crate) struct Gpu {
     /// targets and keeps them (`Pass::joins`).
     ended: Option<OpenPass>,
     screen: Option<Screen>,
+    /// Reused between buffer reads: mapping is finished before the next copy uses it.
+    buffer_readback: Option<wgpu::Buffer>,
     /// Reused between screen captures: mapping is finished before the next copy uses it.
     screen_readback: Option<wgpu::Buffer>,
     timer: Option<Timer>,
@@ -457,6 +462,7 @@ impl Gpu {
             pass: None,
             ended: None,
             screen: None,
+            buffer_readback: None,
             screen_readback: None,
             timer,
             label: None,
@@ -1508,7 +1514,15 @@ impl Gpu {
         let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
             return Err(Error::Gpu(format!("there's no buffer {handle}")));
         };
-        let staging = self.readback_buffer(u64::from(size.max(4)));
+        let size_bytes = u64::from(size.max(4));
+        let staging = match &self.buffer_readback {
+            Some(buffer) if buffer.size() >= size_bytes => buffer.clone(),
+            _ => {
+                let buffer = self.readback_buffer(size_bytes);
+                self.buffer_readback = Some(buffer.clone());
+                buffer
+            }
+        };
         let bytes = self.copy_back(buffer, u64::from(offset), u64::from(size), &staging)?;
         self.check_errors()?;
         Ok(bytes)
@@ -1884,22 +1898,32 @@ fn map_read_with<T>(
     buffer: &wgpu::Buffer,
     read: impl FnOnce(&[u8]) -> T,
 ) -> Result<T> {
+    struct UnmapOnExit<'a>(&'a wgpu::Buffer);
+    impl Drop for UnmapOnExit<'_> {
+        fn drop(&mut self) {
+            self.0.unmap();
+        }
+    }
+
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
     });
+    // A failed map or poll must also release the buffer for its next copy. Declare the guard
+    // before the mapped view, so that view is dropped first on every exit.
+    let _unmap = UnmapOnExit(buffer);
     device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
     rx.recv().map_err(gpu_err)?.map_err(gpu_err)?;
     let mapped = slice.get_mapped_range().map_err(gpu_err)?;
     let out = read(&mapped);
     drop(mapped);
-    buffer.unmap();
     Ok(out)
 }
 
 impl Timer {
     fn new(device: &wgpu::Device, serial: bool) -> Timer {
+        let (resolved, readback) = query_buffers(device, TIMESTAMP_QUERIES);
         Timer {
             serial,
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
@@ -1907,6 +1931,8 @@ impl Timer {
                 ty: wgpu::QueryType::Timestamp,
                 count: TIMESTAMP_QUERIES,
             }),
+            resolved,
+            readback,
             pending: Vec::new(),
             results: Vec::new(),
             submissions: 0,
@@ -1924,7 +1950,14 @@ impl Timer {
     /// calls it at every flush, so it measures GPU durations, not throughput; the serial mode,
     /// which waits after each pass anyway, once a frame.
     fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
-        let times = read_timestamp_spans(device, queue, &self.queries, self.pending.len() as u32)?;
+        let times = read_timestamp_spans(
+            device,
+            queue,
+            &self.queries,
+            &self.resolved,
+            &self.readback,
+            self.pending.len() as u32,
+        )?;
         for (timed, (start, end)) in self.pending.drain(..).zip(times) {
             let Timed { frame, label } = timed;
             let submission = self.submissions;
@@ -1959,7 +1992,11 @@ pub fn read_timestamps(
     queries: &wgpu::QuerySet,
     passes: u32,
 ) -> Result<Vec<f64>> {
-    let spans = read_timestamp_spans(device, queue, queries, passes)?;
+    if passes == 0 {
+        return Ok(Vec::new());
+    }
+    let (resolved, readback) = query_buffers(device, passes * 2);
+    let spans = read_timestamp_spans(device, queue, queries, &resolved, &readback, passes)?;
     Ok(spans.into_iter().map(|(start, end)| end - start).collect())
 }
 
@@ -1969,9 +2006,11 @@ fn read_timestamp_spans(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     queries: &wgpu::QuerySet,
+    resolved: &wgpu::Buffer,
+    readback: &wgpu::Buffer,
     passes: u32,
 ) -> Result<Vec<(f64, f64)>> {
-    let ticks = resolve(device, queue, queries, passes * 2)?;
+    let ticks = resolve(device, queue, queries, resolved, readback, passes * 2)?;
     let period = f64::from(queue.get_timestamp_period());
     Ok(ticks
         .chunks_exact(2)
@@ -1979,18 +2018,8 @@ fn read_timestamp_spans(
         .collect())
 }
 
-/// The values of the first `n` timestamp queries, in a submission already made. Waits for
-/// the GPU.
-fn resolve(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    queries: &wgpu::QuerySet,
-    n: u32,
-) -> Result<Vec<u64>> {
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+/// Storage for resolving and reading back `n` timestamp queries.
+fn query_buffers(device: &wgpu::Device, n: u32) -> (wgpu::Buffer, wgpu::Buffer) {
     let size = u64::from(n) * 8;
     let buffer = |label, usage| {
         device.create_buffer(&wgpu::BufferDescriptor {
@@ -2004,12 +2033,33 @@ fn resolve(
         buffer("queries", wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC);
     let readback =
         buffer("queries readback", wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST);
+    (resolved, readback)
+}
+
+/// The values of the first `n` timestamp queries, in a submission already made. Waits for
+/// the GPU, then resolves through buffers whose previous mapping has finished.
+fn resolve(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    queries: &wgpu::QuerySet,
+    resolved: &wgpu::Buffer,
+    readback: &wgpu::Buffer,
+    n: u32,
+) -> Result<Vec<u64>> {
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    device.poll(wgpu::PollType::wait_indefinitely()).map_err(gpu_err)?;
+    let size = u64::from(n) * 8;
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    encoder.resolve_query_set(queries, 0..n, &resolved, 0);
-    encoder.copy_buffer_to_buffer(&resolved, 0, &readback, 0, size);
+    encoder.resolve_query_set(queries, 0..n, resolved, 0);
+    encoder.copy_buffer_to_buffer(resolved, 0, readback, 0, size);
     queue.submit([encoder.finish()]);
-    map_read_with(device, &readback, |bytes| {
-        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
+    map_read_with(device, readback, |bytes| {
+        bytes[..size as usize]
+            .chunks_exact(8)
+            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+            .collect()
     })
 }
 
@@ -2037,6 +2087,107 @@ mod tests {
     fn indirect_draws_enable_nonzero_first_instances() {
         let gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
         assert!(gpu.device.features().contains(wgpu::Features::INDIRECT_FIRST_INSTANCE));
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn buffer_readback_reuses_storage_and_reads_only_the_requested_range() {
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
+        gpu.create_buffer(1, 64);
+        let mut previous: Option<wgpu::Buffer> = None;
+        for (frame, size) in [16, 8, 16, 32, 4, 32, 0].into_iter().enumerate() {
+            let bytes: Vec<u8> = (0..64).map(|i| (frame * 29 + i) as u8).collect();
+            let offset = (frame % 3 * 4) as u32;
+            gpu.write_buffer(1, 0, &bytes).unwrap();
+            assert_eq!(
+                gpu.read_range(1, offset, size).unwrap(),
+                bytes[offset as usize..(offset + size) as usize],
+            );
+            let staging = gpu.buffer_readback.as_ref().unwrap();
+            if let Some(before) = &previous {
+                if before.size() >= u64::from(size.max(4)) {
+                    assert_eq!(staging, before, "a read that fits reuses its storage");
+                } else {
+                    assert_ne!(staging, before, "a larger read grows its storage");
+                }
+            }
+            previous = Some(staging.clone());
+        }
+        gpu.check_errors().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_failed_map_releases_cached_readback_for_the_next_copy() {
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
+        gpu.create_buffer(1, 4);
+        gpu.write_buffer(1, 0, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(gpu.read_range(1, 0, 4).unwrap(), [1, 2, 3, 4]);
+        let staging = gpu.buffer_readback.as_ref().unwrap().clone();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        staging.slice(..).map_async(wgpu::MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        gpu.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        rx.recv().unwrap().unwrap();
+        // wgpu rejects a second map through its callback. No mapped view is held, so the
+        // failed read must unmap the buffer and leave global validation enabled.
+        assert!(map_read(&gpu.device, &staging).is_err());
+
+        gpu.write_buffer(1, 0, &[9, 10, 11, 12]).unwrap();
+        assert_eq!(gpu.read_range(1, 0, 4).unwrap(), [9, 10, 11, 12]);
+        assert_eq!(gpu.buffer_readback.as_ref().unwrap(), &staging);
+        gpu.check_errors().unwrap();
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn timestamp_collections_reuse_buffers_and_return_only_current_passes() {
+        let mut manifest = Manifest::new("game.wasm");
+        manifest.pipelines.push(Pipeline {
+            name: "increment".into(),
+            shader: "increment.wgsl".into(),
+            stage: Stage::Compute { entry: "increment".into(), workgroup_size: [1, 1, 1] },
+            uniform: None,
+            bindings: vec![ResourceBinding {
+                binding: 0,
+                kind: BindingKind::ReadWrite,
+                stage: BindingStage::Both,
+                format: None,
+            }],
+            debug_flag: None,
+        });
+        let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
+                      @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
+        for timing in [Timing::Span, Timing::Serial] {
+            let mut gpu = Gpu::new(&manifest, &[shader.into()], timing).unwrap();
+            gpu.create_buffer(1, 4);
+            let timer = gpu.timer.as_ref().unwrap();
+            let resolved = timer.resolved.clone();
+            let readback = timer.readback.clone();
+            let mut count = 0u32;
+            for (frame, passes) in [3, 1, 5, 2].into_iter().enumerate() {
+                gpu.set_frame(frame);
+                for _ in 0..passes {
+                    gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+                    count += 1;
+                }
+                let timings = gpu.take_timings().unwrap();
+                assert_eq!(timings.len(), passes);
+                for t in timings {
+                    assert_eq!(t.frame, frame);
+                    assert_eq!(t.label, "increment");
+                    assert!(t.nanos.is_finite() && t.nanos >= 0.0 && t.end >= t.start);
+                }
+                let timer = gpu.timer.as_ref().unwrap();
+                assert_eq!(timer.resolved, resolved);
+                assert_eq!(timer.readback, readback);
+                assert_eq!(gpu.read_buffer(1).unwrap(), count.to_le_bytes());
+            }
+            assert!(gpu.take_timings().unwrap().is_empty());
+            gpu.check_errors().unwrap();
+        }
     }
 
     /// Copies a texture before a later write can replace it, leaving the copy in the current

@@ -293,6 +293,8 @@ pub struct Types {
     /// Each type's size: the nodes of its tree, shared parts counted each time they appear
     /// (saturating).
     sizes: RefCell<Vec<u32>>,
+    /// Whether each immutable type mentions variables, parameters or projections.
+    flags: RefCell<Vec<u8>>,
     pub bool: TyId,
     pub i32: TyId,
     pub u32: TyId,
@@ -318,6 +320,7 @@ impl Types {
             kinds: FrozenVec::new(),
             map: RefCell::new(HashMap::new()),
             sizes: RefCell::new(Vec::new()),
+            flags: RefCell::new(Vec::new()),
             bool: TyId(0),
             i32: TyId(0),
             u32: TyId(0),
@@ -360,8 +363,22 @@ impl Types {
         };
         let id = TyId(self.kinds.len() as u32);
         let mut size = 1u32;
-        children(new.key(), &mut |c| size = size.saturating_add(self.size(c)));
+        let mut flags = match new.key() {
+            TyKind::Var(_) => HAS_VARS,
+            TyKind::Param(_) => HAS_PARAMS,
+            TyKind::Projection { .. } => HAS_PARAMS | HAS_PROJECTIONS,
+            _ => 0,
+        };
+        {
+            let sizes = self.sizes.borrow();
+            let child_flags = self.flags.borrow();
+            children(new.key(), &mut |c| {
+                size = size.saturating_add(sizes[c.index()]);
+                flags |= child_flags[c.index()];
+            });
+        }
         self.sizes.borrow_mut().push(size);
+        self.flags.borrow_mut().push(flags);
         self.kinds.push(Box::new(new.key().clone()));
         new.insert(id);
         id
@@ -444,17 +461,17 @@ impl Types {
 
     /// Whether a type mentions inference variables.
     pub fn has_vars(&self, t: TyId) -> bool {
-        self.any(t, &mut |k| matches!(k, TyKind::Var(_)))
+        self.flags.borrow()[t.index()] & HAS_VARS != 0
     }
 
     /// Whether a type mentions generic parameters or projections.
     pub fn has_params(&self, t: TyId) -> bool {
-        self.any(t, &mut |k| matches!(k, TyKind::Param(_) | TyKind::Projection { .. }))
+        self.flags.borrow()[t.index()] & HAS_PARAMS != 0
     }
 
     /// Whether a type mentions projections.
     pub fn has_projections(&self, t: TyId) -> bool {
-        self.any(t, &mut |k| matches!(k, TyKind::Projection { .. }))
+        self.flags.borrow()[t.index()] & HAS_PROJECTIONS != 0
     }
 
     /// Whether any part of `t` satisfies `f`, a test of the part alone.
@@ -584,6 +601,10 @@ pub const MAX_TYPE_SIZE: u32 = 4096;
 /// Types larger than this are walked remembering the parts they share.
 const SHARING: u32 = 64;
 
+const HAS_VARS: u8 = 1;
+const HAS_PARAMS: u8 = 2;
+const HAS_PROJECTIONS: u8 = 4;
+
 /// Each of `ts` mapped by `m`, in order; `None` when none of them changed.
 fn map_list(ts: &[TyId], m: &mut impl FnMut(TyId) -> TyId) -> Option<Vec<TyId>> {
     // Most walks leave a list unchanged: don't allocate its replacement until the first
@@ -604,6 +625,78 @@ fn map_list(ts: &[TyId], m: &mut impl FnMut(TyId) -> TyId) -> Option<Vec<TyId>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_type_flags_match_structural_walks() {
+        let types = Types::new();
+        let var = types.var(VarId(0));
+        let param = types.param(ParamId(0));
+        let projection = types.intern(TyKind::Projection {
+            self_ty: types.i32,
+            trait_: TraitId(0),
+            trait_args: Vec::new(),
+            name: "Item".into(),
+        });
+        let length = types.intern(TyKind::ConstU32(4));
+        for seed in [types.i32, var, param, projection] {
+            let kinds = [
+                TyKind::Tuple(vec![types.i32, seed]),
+                TyKind::Array(seed, 4),
+                TyKind::ArrayN(types.i32, seed),
+                TyKind::ArrayN(seed, length),
+                TyKind::Slice(seed),
+                TyKind::Adt(AdtId(0), vec![seed]),
+                TyKind::Opaque(FnId(0), vec![seed]),
+                TyKind::Closure(ClosureRef { owner: None, id: ClosureId(0) }, vec![seed]),
+                TyKind::FnDef(FnId(0), vec![seed]),
+                TyKind::FnPtr(vec![seed], types.unit, FnFlags::default()),
+                TyKind::FnPtr(vec![types.unit], seed, FnFlags::default()),
+                TyKind::Projection {
+                    self_ty: seed,
+                    trait_: TraitId(0),
+                    trait_args: Vec::new(),
+                    name: "Item".into(),
+                },
+                TyKind::Projection {
+                    self_ty: types.i32,
+                    trait_: TraitId(0),
+                    trait_args: vec![seed],
+                    name: "Item".into(),
+                },
+            ];
+            for kind in kinds {
+                let ty = types.intern(kind.clone());
+                assert_eq!(types.intern(kind), ty);
+                let mut shared = ty;
+                for _ in 0..7 {
+                    shared = types.tuple(vec![shared, shared]);
+                }
+                assert_eq!(types.has_vars(shared), types.has_vars(seed));
+            }
+        }
+        for i in 0..types.len() {
+            let ty = TyId(i as u32);
+            assert_eq!(
+                types.has_vars(ty),
+                types.any(ty, &mut |k| matches!(k, TyKind::Var(_))),
+                "{ty:?} variables"
+            );
+            assert_eq!(
+                types.has_params(ty),
+                types.any(ty, &mut |k| matches!(k, TyKind::Param(_) | TyKind::Projection { .. })),
+                "{ty:?} parameters"
+            );
+            assert_eq!(
+                types.has_projections(ty),
+                types.any(ty, &mut |k| matches!(k, TyKind::Projection { .. })),
+                "{ty:?} projections"
+            );
+        }
+        assert!(matches!(
+            types.kind(types.intern(TyKind::ArrayN(var, length))),
+            TyKind::Array(_, 4)
+        ));
+    }
 
     #[test]
     fn frontend_perf_type_mapping_preserves_order_and_unchanged_ids() {
