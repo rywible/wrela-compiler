@@ -2,6 +2,37 @@
 use super::common::{answer, package, wrela};
 
 #[test]
+fn mixed_test_results_keep_source_order_across_modules() {
+    let dir = package(
+        "mixed-test-order",
+        &[
+            ("alpha.wrela", "@test\nfn first_module() {}\n"),
+            (
+                "main.wrela",
+                concat!(
+                    "@test(frames: 1)\nfn frame_first() {}\n\n",
+                    "@test\nfn plain_between() {}\n\n",
+                    "@test(frames: 1)\nfn frame_last() {}\n\n",
+                    "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+                ),
+            ),
+            ("zeta.wrela", "@test\nfn last_module() {}\n"),
+        ],
+    );
+    let report = answer(wrela().args(["test", dir.to_str().unwrap(), "--json"]));
+    let names: Vec<_> = report["tests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|test| test["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["first_module", "frame_first", "plain_between", "frame_last", "last_module"]
+    );
+}
+
+#[test]
 fn a_test_filter_cannot_pass_a_package_without_tests() {
     let dir = package("filter-without-tests", &[("main.wrela", super::common::FRAME)]);
     let out = wrela().args(["test", dir.to_str().unwrap(), "missing"]).output().unwrap();

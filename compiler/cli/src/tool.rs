@@ -167,7 +167,8 @@ pub fn run(args: &[String]) -> ExitCode {
     if crate::report(&built, false) {
         return ExitCode::from(1);
     }
-    let Some((_, wasm)) = built.files.iter().find(|(p, _)| p == wrela_driver::build::TOOL_WASM)
+    let Some((_, wasm)) =
+        built.files.into_iter().find(|(p, _)| p == wrela_driver::build::TOOL_WASM)
     else {
         eprintln!(
             "error: `{}` has no tool build: its main.wrela doesn't export `tool` (§15.5)",
@@ -203,7 +204,7 @@ pub fn run(args: &[String]) -> ExitCode {
     options.cache = cache;
     options.code_cache = code_cache;
     options.testing = testing();
-    let ended = wrela_host::tool::run(&ToolBuild::from_wasm(wasm.clone()), options);
+    let ended = wrela_host::tool::run(&ToolBuild::from_wasm(wasm), options);
     if !matches!(ended.end, wrela_host::tool::End::Exit(_)) {
         say(format!("error: {}", ended.end));
     }

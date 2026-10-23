@@ -705,19 +705,34 @@ impl<'a, 'm> Fb<'a, 'm> {
         vs: [ir::ValueId; N],
         out: &mut Block,
     ) -> R<[Handle<Expression>; N]> {
-        let hs = self.operands_of(&vs, out)?;
-        hs.try_into().map_err(|_| "internal: operands".to_string())
+        let mut hs = [None; N];
+        for (h, v) in hs.iter_mut().zip(vs) {
+            *h = Some(self.val(v)?);
+        }
+        let mut hs = hs.map(|h| h.expect("every operand was resolved"));
+        self.runtime_operands(&vs, &mut hs, out)?;
+        Ok(hs)
     }
 
     fn operands_of(&mut self, vs: &[ir::ValueId], out: &mut Block) -> R<Vec<Handle<Expression>>> {
         let mut hs = vs.iter().map(|&v| self.val(v)).collect::<R<Vec<_>>>()?;
+        self.runtime_operands(vs, &mut hs, out)?;
+        Ok(hs)
+    }
+
+    fn runtime_operands(
+        &mut self,
+        vs: &[ir::ValueId],
+        hs: &mut [Handle<Expression>],
+        out: &mut Block,
+    ) -> R<()> {
         if let Some(&first) = vs.first()
             && vs.iter().all(|v| self.consts.contains(v))
         {
             let ty = self.cx.ty(self.f.value_ty(first))?;
             hs[0] = self.through_variable(hs[0], ty, out);
         }
-        Ok(hs)
+        Ok(())
     }
 
     /// Marks `v` a const-expression if all its `parts` are: it only gathers them.
@@ -1685,6 +1700,78 @@ mod tests {
             inputs: vec![ir::BuiltinInput::GlobalInvocationId],
         });
         m
+    }
+
+    #[test]
+    fn fixed_operands_keep_order_and_run_constant_operations_at_runtime() {
+        let mut m = ir::Module::default();
+        let (float, boolean) = (m.types.f32(), m.types.bool());
+        let mut f = ir::Function::new("constants", Vec::new(), None);
+        let (a, b, cond) = (f.new_value(float), f.new_value(float), f.new_value(boolean));
+        let (neg, diff, selected) = (f.new_value(float), f.new_value(float), f.new_value(float));
+        f.body = vec![
+            ir::Stmt::Let(a, ir::Expr::Const(ir::Const::F32(9.0))),
+            ir::Stmt::Let(b, ir::Expr::Const(ir::Const::F32(4.0))),
+            ir::Stmt::Let(cond, ir::Expr::Const(ir::Const::Bool(true))),
+            ir::Stmt::Let(neg, ir::Expr::Unary(ir::UnOp::Neg, a)),
+            ir::Stmt::Let(diff, ir::Expr::Binary(ir::BinOp::Sub, a, b)),
+            ir::Stmt::Let(selected, ir::Expr::Select { cond, if_true: a, if_false: b }),
+            ir::Stmt::Return(None),
+        ];
+        let function = m.add_function(f);
+        m.entry_points.push(ir::EntryPoint {
+            name: "constants".into(),
+            stage: ir::Stage::Compute { workgroup_size: [1, 1, 1] },
+            function,
+            inputs: Vec::new(),
+        });
+        ir::verify(&m).expect("valid IR");
+        let module = to_naga(&m).expect("constant operations emit");
+        validate(&module).expect("valid constant operations");
+        let f = &module.entry_points[0].function;
+        let literal = |h| match f.expressions[h] {
+            Expression::Literal(l) => l,
+            ref other => panic!("not a literal: {other:?}"),
+        };
+        let through_variable = |h| {
+            let Expression::Load { pointer } = f.expressions[h] else {
+                panic!("a constant operation's first operand didn't pass through a variable")
+            };
+            assert!(matches!(f.expressions[pointer], Expression::LocalVariable(_)));
+        };
+        let stores: Vec<_> = f
+            .body
+            .iter()
+            .filter_map(|s| match s {
+                Statement::Store { value, .. } => Some(literal(*value)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(stores, [Literal::F32(9.0), Literal::F32(9.0), Literal::Bool(true)]);
+        let mut found = [false; 3];
+        for (_, e) in f.expressions.iter() {
+            match *e {
+                Expression::Unary { op: UnaryOperator::Negate, expr } => {
+                    through_variable(expr);
+                    found[0] = true;
+                }
+                Expression::Binary { op: BinaryOperator::Subtract, left, right } => {
+                    through_variable(left);
+                    assert_eq!(literal(right), Literal::F32(4.0));
+                    found[1] = true;
+                }
+                Expression::Select { condition, accept, reject } => {
+                    through_variable(condition);
+                    assert_eq!(literal(accept), Literal::F32(9.0));
+                    assert_eq!(literal(reject), Literal::F32(4.0));
+                    found[2] = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(found, [true; 3]);
+        naga::front::wgsl::parse_str(&emit(&m).expect("valid WGSL").text)
+            .expect("constant operations parse back");
     }
 
     #[test]

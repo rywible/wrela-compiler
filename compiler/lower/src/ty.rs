@@ -632,7 +632,7 @@ impl Cx<'_> {
         let layouts: Vec<ir::layout::Layout> =
             fields.iter().map(|(_, f)| wgsl.get(&mb.m.types, *f).0).collect();
         let size =
-            |order: &[usize]| ir::layout::pack_layouts(order.iter().map(|&i| layouts[i])).1.size;
+            |order: &[usize]| ir::layout::packed_layout(order.iter().map(|&i| layouts[i])).size;
         let declared: Vec<usize> = (0..fields.len()).collect();
         let now = size(&declared);
         // No order takes less than the fields' bytes, rounded up to the largest alignment.

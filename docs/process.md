@@ -669,6 +669,93 @@ wasm agent built every package under `compiler/tests` with and without its chang
 the outputs: they were byte for byte the same. The full `tools/check.sh` passed before the
 change was committed.
 
+## Performance audit, 2026-10-23
+
+Ryan asked Codex to look for as many performance improvements as possible. One Codex session
+and seven parallel subagents inspected the compiler, std and hosts in the MacBook Air's normal
+checkout. The agents first returned source-based findings, then each changed a separate set of
+files. Other agents reviewed the changes for correctness. No new outside source, crate or
+generated asset was used. The CRC table is computed from the journal's existing CRC-32C rule.
+
+The retained changes remove work without changing the language or the host protocol:
+
+- Sema records three structural type flags when it interns a type, and moves removed scope
+  names rather than cloning them. WGSL fixed-size operands use stack arrays. Padding searches
+  do not collect unused offsets, and GPU memory traversal borrows children after checking
+  whether the type was already visited.
+- Test results sort by their source location rather than repeatedly searching the test list.
+  Documentation finds preceding comments by binary search. The tool host takes ownership of
+  its WASM bytes. The watcher skips nested packages' contents while watching their boundary
+  manifests and each declared dependency.
+- Std stops the free-list search at its first exact fit.
+- Both command checkers reuse draw rollback storage. Browser network framing copies each
+  incoming body byte once, instead of recopying the accumulated partial frame for every chunk.
+  Idle network delivery and pointer resampling return before allocating.
+- The native GPU host reuses buffer and timestamp readback storage. A cleanup guard unmaps it
+  even when reading fails. Room startup reads its journal once, CRC-32C uses a lookup table,
+  store writes borrow bodies and decoded bytes, and each SQL statement is prepared only on
+  its first use in a transaction. Store responses copy borrowed SQLite blobs straight into
+  their final output. The Chrome driver moves parsed JSON payloads instead of cloning them.
+
+Focused regressions cover structural flags, shadowed names, layout saturation, shared GPU
+types, shader operand order, test order, watcher boundaries, free-list selection and splitting,
+fragmented messages and ownership, checker rollback, real GPU buffer reuse and failed-map
+recovery, journal replay, transaction ordering, scan limits and CDP payloads. Timings are kept
+out of correctness assertions.
+
+Larger candidates remain unimplemented: sharing package loading during hot reload, throttling
+constant-cache cleanup, indexing traits by method name, caching lowered field maps, reducing
+nested optimizer scans, allocation-free short float parsing, and SIMD NaN canonicalization.
+Bulk copying runs in std needs an intrinsic or another API. Draw payload arenas need more
+ownership work. Additional native pipeline/bind-group state caches were rejected because wgpu
+already removes those repeated assignments.
+
+One implemented experiment was removed after measurement: keeping a large `realloc` in place
+when its rounded page count stayed the same. It increased three frozen programs' WASM by
+2,268–16,093 bytes. The only production caller, `Vec::grow`, at least doubles the capacity, so
+it cannot use that case once the old allocation is large. A helper to hide the added code
+would retain work with no benefit for the existing callers, so the change and its tests were
+removed.
+
+The browser framing fixture was measured on the M4 Air in Bun, with a 65,536-byte payload,
+pre-split input chunks and output checksums. Seven alternating pairs each assembled three
+frames per sample after warmup. Medians per frame were:
+
+| Incoming chunk | Before | After |
+|---|---:|---:|
+| 1 byte | 203.529 ms | 2.680 ms |
+| 64 bytes | 3.355 ms | 0.054 ms |
+| 4,096 bytes | 0.043 ms | 0.004 ms |
+| One whole frame | 0.0038 ms | 0.0017 ms |
+
+The roughly 76-fold gain for one-byte chunks is an adversarial fragmentation result, not a
+game frame-rate measurement.
+
+The final branch passed `tools/check.sh`: 1,058 Rust tests and every infrastructure check,
+including hardware GPU and Chrome scenarios, in 147.9 seconds. This is not a gate-time
+comparison: no paired gate baseline was recorded.
+
+Seven alternating pairs of warmed CLI builds on the M4 Air, with Cargo builds and GPU work
+idle, gave these elapsed medians. These results do not establish an overall compiler speedup:
+
+| Frozen program | Before | After | Change |
+|---|---:|---:|---:|
+| hello-field | 93.0 ms | 92.1 ms | -0.9% |
+| herd | 521.4 ms | 526.5 ms | +1.0% |
+| grazer | 1,082.4 ms | 1,095.2 ms | +1.2% |
+| wolf | 762.8 ms | 765.4 ms | +0.3% |
+
+All 25 shaders from these four builds were byte-identical. Hello-field's WASM was also
+identical; the other WASM files grew by 350–681 bytes with the allocator's exact-fit branch.
+
+Five alternating old/new `wrela profile` pairs on the M4 Air used frozen hello-field, no input
+events, 1 worker, 1280×720, span timing, 30 warmup frames and 60 measured frames. The old
+executable was saved before editing; the candidate ran through `tools/wrela profile`, with
+other builds and test GPU work idle. The medians of run medians were 3.882 → 3.873 ms for the
+GPU span and 4.546 → 4.458 ms for the synchronized CPU frame call. Paired changes varied from
+-20.1% to +8.5% on the GPU and -20.4% to +7.9% on the CPU, so no frame-time gain is established.
+No Linux hardware GPU measurement or Chrome frame-rate comparison was run.
+
 ## Keeping this record
 
 AGENTS.md tells every agent to update this file in the same change when it adds an outside

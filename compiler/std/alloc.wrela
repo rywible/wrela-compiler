@@ -173,6 +173,9 @@ fn large(n: u32) -> u32 {
                 best = at
                 best_link = link
                 best_size = size
+                if size == n {
+                    break
+                }
             }
             link = at
             at = load_u32(at)
@@ -294,3 +297,47 @@ fn unlock() {
 
 /// How many tries a thread spins on the lock before it sleeps on it.
 const SPINS_BEFORE_SLEEPING: u32 = 2048
+
+@test
+fn large_allocations_take_the_first_exact_fit_before_a_larger_block() {
+    let size = 1048576 + PAGE
+    let first = unsafe { alloc(size, 16) }
+    let larger = unsafe { alloc(size + PAGE, 16) }
+    let last = unsafe { alloc(size, 16) }
+    var nodes = [first, larger, last]
+    // A temporary list of these three blocks, in address order. Restore the real list before
+    // freeing them: no assertion or allocation runs while the lock is held.
+    for i in 1..3 {
+        var j = i
+        while j > 0 && nodes[j] < nodes[j - 1] {
+            let t = nodes[j]
+            nodes[j] = nodes[j - 1]
+            nodes[j - 1] = t
+            j -= 1
+        }
+    }
+    lock()
+    let (a, b, c, rest, left) = unsafe {
+        let saved = load_u32(LARGE)
+        store_u32(LARGE, nodes[0])
+        for i in 0..3 {
+            store_u32(nodes[i], if i < 2 { nodes[i + 1] } else { 0 })
+            store_u32(nodes[i] + 4, if nodes[i] == larger { size + PAGE } else { size })
+        }
+        let a = large(size)
+        let b = large(size)
+        let c = large(size)
+        let rest = load_u32(LARGE)
+        let left = load_u32(rest + 4)
+        store_u32(LARGE, saved)
+        (a, b, c, rest, left)
+    }
+    unlock()
+    unsafe {
+        free(first, size)
+        free(larger, size + PAGE)
+        free(last, size)
+    }
+    assert(a == min(first, last) && b == max(first, last) && c == larger)
+    assert(rest == larger + size && left == PAGE)
+}

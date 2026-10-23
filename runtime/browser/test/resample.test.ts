@@ -17,6 +17,21 @@ function read(bytes: Uint8Array): { kind: number; x: number; y: number }[] {
   }));
 }
 
+test("empty frames reuse idle input and still advance a held pointer", () => {
+  const r = new Resampler();
+  const empty = new Uint8Array(0);
+  expect(r.take(empty, [], 0)).toBe(empty);
+  r.take(pointerEvent(EventKind.PointerDown, 0, 0, 0, 0), [0], 0);
+  const first = read(r.take(pointerEvent(EventKind.PointerMove, 0, 10, 0, 0), [10], 10));
+  expect(first).toHaveLength(1);
+  expect(first[0]).toMatchObject({ kind: EventKind.PointerMove, x: 0 });
+  expect(first[0]!.y).toBeGreaterThan(0);
+  expect(first[0]!.y).toBeLessThan(10);
+  expect(read(r.take(empty, [], 20))).toEqual([{ kind: EventKind.PointerMove, x: 0, y: 10 }]);
+  r.take(pointerEvent(EventKind.PointerUp, 0, 10, 0, 0), [21], 21);
+  expect(r.take(empty, [], 30)).toBe(empty);
+});
+
 test("a held finger moves evenly from frame to frame, however unevenly its moves arrive", () => {
   const r = new Resampler();
   const frame = 1000 / 60;

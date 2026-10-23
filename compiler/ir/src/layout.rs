@@ -130,15 +130,25 @@ pub fn pack(types: &Types, fields: impl IntoIterator<Item = TypeId>) -> (Vec<u32
 /// [`pack`], from the fields' layouts.
 pub fn pack_layouts(fields: impl IntoIterator<Item = Layout>) -> (Vec<u32>, Layout) {
     let mut offsets = Vec::new();
+    let layout = pack_fields(fields, |at| offsets.push(at));
+    (offsets, layout)
+}
+
+/// The layout of fields packed as [`pack_layouts`] packs them, without collecting offsets.
+pub fn packed_layout(fields: impl IntoIterator<Item = Layout>) -> Layout {
+    pack_fields(fields, |_| {})
+}
+
+fn pack_fields(fields: impl IntoIterator<Item = Layout>, mut offset: impl FnMut(u32)) -> Layout {
     let mut end = 0u32;
     let mut align = 1;
     for l in fields {
         let at = round_up(l.align, end);
-        offsets.push(at);
+        offset(at);
         end = at.saturating_add(l.size);
         align = align.max(l.align);
     }
-    (offsets, Layout { size: round_up(align, end.max(1)), align })
+    Layout { size: round_up(align, end.max(1)), align }
 }
 
 /// Each field's byte offset in a struct or an enum (whose payloads all start at one offset).
@@ -250,6 +260,38 @@ pub fn uniform_compatible(types: &Types, t: TypeId) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_layout_matches_offsets_for_seeded_fields() {
+        assert_eq!(packed_layout([]), Layout { size: 1, align: 1 });
+        assert_eq!(
+            packed_layout([Layout { size: 12, align: 16 }, Layout { size: 4, align: 4 }]),
+            Layout { size: 16, align: 16 }
+        );
+        let mut seed = 0x9753_2468u32;
+        let mut next = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed
+        };
+        for len in 0..=12 {
+            for sample in 0..64 {
+                let fields: Vec<_> = (0..len)
+                    .map(|_| {
+                        let align = 1 << (next() % 5);
+                        let size = match sample {
+                            0 => u32::MAX,
+                            1 => u32::MAX - 8,
+                            _ => next() % 512,
+                        };
+                        Layout { size, align }
+                    })
+                    .collect();
+                let (offsets, full) = pack_layouts(fields.iter().copied());
+                assert_eq!(packed_layout(fields.iter().copied()), full, "{fields:?}");
+                assert_eq!(offsets.len(), fields.len());
+            }
+        }
+    }
 
     #[test]
     fn wgsl_examples() {

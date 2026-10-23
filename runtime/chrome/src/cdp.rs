@@ -383,21 +383,23 @@ fn json_string<'a>(bytes: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
 
 /// Gives a message to the caller waiting for its answer, or to its session's channel.
 fn dispatch(s: &Shared, bytes: &[u8]) {
-    let Ok(message) = serde_json::from_slice::<Value>(bytes) else { return };
+    let Ok(mut message) = serde_json::from_slice::<Value>(bytes) else { return };
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
         let Some(pending) = lock(&s.pending).remove(&id) else { return };
         let answer = match message.get("error") {
             Some(e) => {
                 Err(e.get("message").and_then(Value::as_str).unwrap_or("an error").to_string())
             }
-            None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
+            None => Ok(message.get_mut("result").map(Value::take).unwrap_or(Value::Null)),
         };
         let _ = pending.reply.send(answer);
         return;
     }
-    let Some(method) = message.get("method").and_then(Value::as_str) else { return };
+    let Some(method) = message.get("method").and_then(Value::as_str).map(str::to_string) else {
+        return;
+    };
     let session = message.get("sessionId").and_then(Value::as_str).unwrap_or("").to_string();
-    let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let params = message.get_mut("params").map(Value::take).unwrap_or(Value::Null);
     let mut routes = lock(&s.routes);
     let Some((tag, to)) = routes.get(&session).cloned() else { return };
     // A session this one attached to is routed with it before any of its own events come.
@@ -408,7 +410,7 @@ fn dispatch(s: &Shared, bytes: &[u8]) {
     }
     drop(routes);
     let key = session.clone();
-    match to.try_send(Event { session, method: method.to_string(), params }) {
+    match to.try_send(Event { session, method, params }) {
         Ok(()) => {}
         Err(mpsc::TrySendError::Full(_)) => {
             s.end(format!("DevTools queued more than {MOST_EVENTS} events for a tab"));
@@ -442,7 +444,8 @@ mod tests {
                 m.pop();
                 let m: Value = serde_json::from_slice(&m).expect("json");
                 seen.push(m["method"].as_str().unwrap_or("").to_string());
-                let event = json!({"method": "Page.event", "sessionId": "s", "params": {}});
+                let event =
+                    json!({"method": "Page.event", "sessionId": "s", "params": m["params"]});
                 let mut out = event.to_string().into_bytes();
                 out.push(0);
                 if let Some(mut a) = answer(&m) {
@@ -477,6 +480,25 @@ mod tests {
         assert!(conn.close(Duration::from_secs(5)), "its writer ends, and the pipe with it");
         assert_eq!(chrome.join().expect("the fake"), ["Input.insertText", "Browser.getVersion"]);
         assert!(conn.join_reader(Duration::from_secs(5)), "Chrome's end closed: the reader ends");
+    }
+
+    #[test]
+    fn nested_reply_and_event_values_survive_dispatch() {
+        let (conn, chrome) = fake(|m| Some(json!({"result": m["params"]})));
+        let (to, events) = mpsc::sync_channel(MOST_EVENTS);
+        conn.route("s", to);
+        let params = json!({
+            "data": "large reply ".repeat(16_384),
+            "nested": [null, {"values": [true, 7, "か"]}]
+        });
+        let reply = conn.call(Some("s"), "Runtime.evaluate", params.clone(), soon());
+        assert_eq!(reply.expect("reply"), params);
+        let event = events.recv_timeout(Duration::from_secs(5)).expect("event");
+        assert_eq!(event.params, params);
+        assert_eq!((event.session.as_str(), event.method.as_str()), ("s", "Page.event"));
+        assert!(conn.close(Duration::from_secs(5)));
+        chrome.join().expect("fake Chrome");
+        assert!(conn.join_reader(Duration::from_secs(5)));
     }
 
     #[test]
