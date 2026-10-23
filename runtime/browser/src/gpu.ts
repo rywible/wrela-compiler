@@ -516,6 +516,8 @@ class Timer {
   readonly #reading = new Set<Promise<void>>();
   /** How many readbacks under way hold each frame's passes. */
   readonly #outstanding = new Map<number, number>();
+  /** Why a readback failed, if one did, for `settled`: it's no longer held once done. */
+  #failure: unknown = null;
   readonly results: GpuTiming[] = [];
 
   /** `keep`: every timing is kept (`settled`), for a run timed from its start; a timer the
@@ -581,8 +583,10 @@ class Timer {
         }
         this.onRead?.();
       });
-      // A failed map may arrive before timings() waits for it.
-      void reading.catch(() => {});
+      // A failed map may arrive before timings() waits for it: kept for settled().
+      void reading.catch((e: unknown) => {
+        this.#failure ??= e;
+      });
       this.#reading.add(reading);
     };
   }
@@ -596,6 +600,7 @@ class Timer {
   /** Every timing read back so far, once the readbacks under way are done. */
   async settled(): Promise<GpuTiming[]> {
     await Promise.all([...this.#reading]);
+    if (this.#failure !== null) throw this.#failure;
     return this.results;
   }
 
@@ -791,6 +796,22 @@ export class GpuExecutor {
     return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer }));
   }
 
+  /** Whether a command recorded in frame `frame` or earlier still waits to run (behind a
+   * pipeline being built, or for the serial mode's `drain`): its passes aren't timed yet. */
+  #holds(frame: number): boolean {
+    const waits = (q: (Deferred | undefined)[], from: number) => {
+      for (let i = from; i < q.length; i++) {
+        const d = q[i];
+        if (d !== undefined && "cmd" in d && d.at.frame <= frame) return true;
+      }
+      return false;
+    };
+    if (waits(this.#waiting, this.#waitingAt) || (this.#deferred !== null && waits(this.#deferred, 0))) return true;
+    // A batch the serial drain is running holds its frames until it's done.
+    for (const batch of this.#draining) if (waits(batch, 0)) return true;
+    return false;
+  }
+
   /** Answers each ask whose label has been timed in a frame from the one it was asked in, once
    * that frame has ended and all its timestamps are read: its whole time, not a submission's. */
   #answerTimes(): void {
@@ -799,7 +820,7 @@ export class GpuExecutor {
     for (let i = this.#asked.length - 1; i >= 0; i--) {
       const ask = this.#asked[i]!;
       const l = timer.latest.get(ask.label);
-      if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame)) continue;
+      if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame) || this.#holds(l.frame)) continue;
       this.#asked.splice(i, 1);
       ask.answer(new Uint8Array(new Float32Array([l.nanos / 1000]).buffer));
     }
@@ -939,6 +960,7 @@ export class GpuExecutor {
       throw error;
     } finally {
       this.#draining.delete(batch);
+      if (this.#asked.length > 0) this.#answerTimes();
     }
   }
 

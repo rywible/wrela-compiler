@@ -992,6 +992,8 @@ test("a failed timestamp read releases its staging buffer and retirement release
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
     .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
   executor.flush();
+  // The failed readback is done before timings() asks: its failure is kept all the same.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   await expect(executor.timings()).rejects.toThrow("timestamps couldn't map");
   expect(device.buffers.filter((buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0)
     .every((buffer) => buffer.destroyed)).toBe(true);
@@ -1158,4 +1160,30 @@ test("a GPU without timestamp queries refuses an ask for a time", async () => {
   const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
   const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
   await expect(executor.timeLabel("look")).rejects.toThrow("no timestamp queries");
+});
+
+test("in the serial mode, a label's time waits for its frame's drained passes", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const m = shapes();
+  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "serial");
+  let answered: Uint8Array | null = null;
+  const asked = executor.timeLabel("look").then((b) => (answered = b));
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
+  run(dispatch(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look"))));
+  // The drain waits after its first dispatch, while the next frame begins.
+  const held = Promise.withResolvers<undefined>();
+  let waits = 0;
+  device.gpu.queue.onSubmittedWorkDone = () => (waits++ === 0 ? held.promise : Promise.resolve(undefined));
+  const drained = executor.drain();
+  executor.frame = 1;
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  expect(answered).toBeNull();
+  held.resolve(undefined);
+  await drained;
+  await asked;
+  expect(answered!.length).toBe(4);
+  executor.destroyAll();
 });
