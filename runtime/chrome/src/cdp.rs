@@ -23,6 +23,15 @@ use std::time::{Duration, Instant};
 /// The largest message Chrome may send: a screenshot's base64 at 16384 pixels each way.
 const MOST_MESSAGE: usize = 1536 << 20;
 
+/// Other replies and page events must not use a screenshot's allowance. A page can make a
+/// console event arbitrarily large, without a screenshot request or blob budget.
+const MOST_ORDINARY_MESSAGE: usize = 1 << 20;
+
+/// A page can produce events faster than its tab handles them. Bound the route before console
+/// events from that page can grow the driver's memory without limit.
+pub(crate) const MOST_EVENTS: usize = 64;
+const _: () = assert!(MOST_EVENTS * MOST_ORDINARY_MESSAGE <= 64 << 20);
+
 /// An event of a session: its method and parameters.
 #[derive(Clone, Debug)]
 pub struct Event {
@@ -31,13 +40,16 @@ pub struct Event {
     pub params: Value,
 }
 
-type Reply = mpsc::Sender<Result<Value, String>>;
+struct Pending {
+    reply: mpsc::Sender<Result<Value, String>>,
+    screenshot: bool,
+}
 
 /// What the threads and the callers share.
 struct Shared {
-    pending: Mutex<HashMap<u64, Reply>>,
+    pending: Mutex<HashMap<u64, Pending>>,
     /// Each session's channel, with the tag of the route it came from.
-    routes: Mutex<HashMap<String, (u64, mpsc::Sender<Event>)>>,
+    routes: Mutex<HashMap<String, (u64, mpsc::SyncSender<Event>)>>,
     /// Why the connection ended, once it has.
     ended: Mutex<Option<String>>,
 }
@@ -50,8 +62,8 @@ impl Shared {
             *ended = Some(why.clone());
         }
         drop(ended);
-        for (_, reply) in lock(&self.pending).drain() {
-            let _ = reply.send(Err(why.clone()));
+        for (_, pending) in lock(&self.pending).drain() {
+            let _ = pending.reply.send(Err(why.clone()));
         }
         lock(&self.routes).clear();
     }
@@ -114,7 +126,7 @@ impl Connection {
 
     /// Routes session `session`'s events (`""`: the browser's own) to `to`, and those of each
     /// session it attaches to: the route's tag, which [`Connection::unroute`] takes.
-    pub fn route(&self, session: &str, to: mpsc::Sender<Event>) -> u64 {
+    pub fn route(&self, session: &str, to: mpsc::SyncSender<Event>) -> u64 {
         let tag = self.tags.fetch_add(1, Ordering::Relaxed);
         if self.ended().is_none() {
             lock(&self.shared.routes).insert(session.to_string(), (tag, to));
@@ -150,7 +162,8 @@ impl Connection {
             message["sessionId"] = Value::String(s.to_string());
         }
         let (reply, answer) = mpsc::channel();
-        lock(&self.shared.pending).insert(id, reply);
+        lock(&self.shared.pending)
+            .insert(id, Pending { reply, screenshot: method == "Page.captureScreenshot" });
         // The connection may have ended between the check and the insert: it drained `pending`.
         if let Some(why) = self.ended() {
             lock(&self.shared.pending).remove(&id);
@@ -231,19 +244,41 @@ fn read_all(from: impl Read, s: &Shared) {
     let mut from = BufReader::with_capacity(1 << 20, from);
     let why = loop {
         let mut message = Vec::new();
-        let read = (&mut from).take(MOST_MESSAGE as u64 + 1).read_until(0, &mut message);
+        let read = (&mut from).take(MOST_ORDINARY_MESSAGE as u64 + 1).read_until(0, &mut message);
         match read {
             Ok(0) => break "Chrome closed its DevTools pipe".to_string(),
-            Ok(_) if message.last() != Some(&0) => {
-                break if message.len() > MOST_MESSAGE {
-                    format!("DevTools sent a message of more than {MOST_MESSAGE} bytes")
-                } else {
-                    "Chrome closed its DevTools pipe".to_string()
-                };
-            }
             Ok(_) => {
+                let ended = message.last() == Some(&0);
+                let size = message.len() - usize::from(ended);
+                if size > MOST_ORDINARY_MESSAGE {
+                    if !screenshot_reply(&message, s) {
+                        break format!(
+                            "DevTools sent a non-screenshot message of more than {MOST_ORDINARY_MESSAGE} bytes"
+                        );
+                    }
+                    if !ended {
+                        let left = MOST_MESSAGE + 1 - message.len();
+                        match (&mut from).take(left as u64).read_until(0, &mut message) {
+                            Ok(_) if message.last() == Some(&0) => {}
+                            Ok(_) if message.len() > MOST_MESSAGE => {
+                                break format!(
+                                    "DevTools sent a message of more than {MOST_MESSAGE} bytes"
+                                );
+                            }
+                            Ok(_) => break "Chrome closed its DevTools pipe".to_string(),
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            Err(e) => break format!("DevTools: {e}"),
+                        }
+                    }
+                }
+                if message.last() != Some(&0) {
+                    break "Chrome closed its DevTools pipe".to_string();
+                }
                 message.pop();
                 dispatch(s, &message);
+                if let Some(why) = lock(&s.ended).clone() {
+                    break why;
+                }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) => break format!("DevTools: {e}"),
@@ -252,18 +287,112 @@ fn read_all(from: impl Read, s: &Shared) {
     s.end(why);
 }
 
+/// A screenshot reply has a top-level `result` whose `data` is a string. Chrome may put its
+/// top-level fields in any order: if `id` is after `data`, the pending screenshot call is checked
+/// when the complete reply is dispatched. Events have `method`, not this `result` shape.
+fn screenshot_reply(prefix: &[u8], s: &Shared) -> bool {
+    let mut i = 0;
+    skip_ws(prefix, &mut i);
+    if prefix.get(i) != Some(&b'{') {
+        return false;
+    }
+    i += 1;
+    let mut id = None;
+    loop {
+        skip_ws(prefix, &mut i);
+        let Some(key) = json_string(prefix, &mut i) else { return false };
+        skip_ws(prefix, &mut i);
+        if prefix.get(i) != Some(&b':') {
+            return false;
+        }
+        i += 1;
+        skip_ws(prefix, &mut i);
+        if key == b"id" {
+            let start = i;
+            while prefix.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            let Ok(n) = std::str::from_utf8(&prefix[start..i]).unwrap_or("").parse::<u64>() else {
+                return false;
+            };
+            id = Some(n);
+        } else if key == b"sessionId" {
+            if json_string(prefix, &mut i).is_none() {
+                return false;
+            }
+        } else if key == b"result" {
+            if prefix.get(i) != Some(&b'{') {
+                return false;
+            }
+            i += 1;
+            skip_ws(prefix, &mut i);
+            if json_string(prefix, &mut i) != Some(b"data".as_slice()) {
+                return false;
+            }
+            skip_ws(prefix, &mut i);
+            if prefix.get(i) != Some(&b':') {
+                return false;
+            }
+            i += 1;
+            skip_ws(prefix, &mut i);
+            if prefix.get(i) != Some(&b'"') {
+                return false;
+            }
+            let pending = lock(&s.pending);
+            return match id {
+                Some(id) => pending.get(&id).is_some_and(|p| p.screenshot),
+                None => pending.values().any(|p| p.screenshot),
+            };
+        } else {
+            return false;
+        }
+        skip_ws(prefix, &mut i);
+        if prefix.get(i) != Some(&b',') {
+            return false;
+        }
+        i += 1;
+    }
+}
+
+fn skip_ws(bytes: &[u8], i: &mut usize) {
+    while bytes.get(*i).is_some_and(u8::is_ascii_whitespace) {
+        *i += 1;
+    }
+}
+
+/// A JSON string's raw bytes, with escaped quotes skipped. CDP's field names are ASCII.
+fn json_string<'a>(bytes: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    if bytes.get(*i) != Some(&b'"') {
+        return None;
+    }
+    *i += 1;
+    let start = *i;
+    while let Some(&b) = bytes.get(*i) {
+        match b {
+            b'"' => {
+                let out = &bytes[start..*i];
+                *i += 1;
+                return Some(out);
+            }
+            b'\\' => *i += 2,
+            _ => *i += 1,
+        }
+    }
+    None
+}
+
 /// Gives a message to the caller waiting for its answer, or to its session's channel.
 fn dispatch(s: &Shared, bytes: &[u8]) {
     let Ok(message) = serde_json::from_slice::<Value>(bytes) else { return };
     if let Some(id) = message.get("id").and_then(Value::as_u64) {
-        let Some(reply) = lock(&s.pending).remove(&id) else { return };
+        let Some(pending) = lock(&s.pending).remove(&id) else { return };
         let answer = match message.get("error") {
             Some(e) => {
                 Err(e.get("message").and_then(Value::as_str).unwrap_or("an error").to_string())
             }
             None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
         };
-        let _ = reply.send(answer);
+        let _ = pending.reply.send(answer);
         return;
     }
     let Some(method) = message.get("method").and_then(Value::as_str) else { return };
@@ -279,9 +408,15 @@ fn dispatch(s: &Shared, bytes: &[u8]) {
     }
     drop(routes);
     let key = session.clone();
-    if to.send(Event { session, method: method.to_string(), params }).is_err() {
-        // Nobody reads this session's events any more.
-        lock(&s.routes).remove(&key);
+    match to.try_send(Event { session, method: method.to_string(), params }) {
+        Ok(()) => {}
+        Err(mpsc::TrySendError::Full(_)) => {
+            s.end(format!("DevTools queued more than {MOST_EVENTS} events for a tab"));
+        }
+        Err(mpsc::TrySendError::Disconnected(_)) => {
+            // Nobody reads this session's events any more.
+            lock(&s.routes).remove(&key);
+        }
     }
 }
 
@@ -331,7 +466,7 @@ mod tests {
     #[test]
     fn calls_are_answered_in_order_and_events_reach_their_session() {
         let (conn, chrome) = fake(|m| Some(json!({"result": {"ok": m["method"]}})));
-        let (to, events) = mpsc::channel();
+        let (to, events) = mpsc::sync_channel(MOST_EVENTS);
         conn.route("s", to);
         let a = conn.call(Some("s"), "Input.insertText", json!({"text": "か"}), soon());
         assert_eq!(a.expect("answered"), json!({"ok": "Input.insertText"}));
@@ -388,5 +523,78 @@ mod tests {
         chrome.join().expect("the fake");
         assert!(conn.join_reader(Duration::from_secs(5)));
         assert_eq!(conn.ended().as_deref(), Some("the DevTools connection was closed"));
+    }
+
+    #[test]
+    fn a_page_cannot_queue_unbounded_events() {
+        let shared = Shared {
+            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            ended: Mutex::new(None),
+        };
+        let (to, events) = mpsc::sync_channel(MOST_EVENTS);
+        lock(&shared.routes).insert("s".into(), (1, to));
+        let event = br#"{"sessionId":"s","method":"Runtime.consoleAPICalled","params":{}}"#;
+        for _ in 0..MOST_EVENTS {
+            dispatch(&shared, event);
+        }
+        assert!(lock(&shared.ended).is_none());
+        dispatch(&shared, event);
+        assert!(lock(&shared.ended).as_deref().is_some_and(|e| e.contains("queued more than")));
+        assert_eq!(events.try_iter().count(), MOST_EVENTS);
+    }
+
+    #[test]
+    fn a_large_page_event_cannot_use_the_screenshot_message_limit() {
+        let shared = Shared {
+            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            ended: Mutex::new(None),
+        };
+        let (reply, _answer) = mpsc::channel();
+        lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
+        let mut event =
+            br#"{"method":"Runtime.consoleAPICalled","params":{"result":{"data":""#.to_vec();
+        event.resize(MOST_ORDINARY_MESSAGE + 1, b'x');
+        read_all(std::io::Cursor::new(event), &shared);
+        assert!(
+            lock(&shared.ended)
+                .as_deref()
+                .is_some_and(|why| why.contains("non-screenshot message"))
+        );
+    }
+
+    #[test]
+    fn a_screenshot_reply_may_exceed_the_ordinary_message_limit() {
+        let shared = Shared {
+            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            ended: Mutex::new(None),
+        };
+        let (reply, answer) = mpsc::channel();
+        lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
+        let mut message = b"{\"id\":7,\"result\":{\"data\":\"".to_vec();
+        message.resize(message.len() + MOST_ORDINARY_MESSAGE, b'A');
+        message.extend_from_slice(b"\"}}\0");
+        read_all(std::io::Cursor::new(message), &shared);
+        let got = answer.try_recv().expect("the screenshot reply").expect("no CDP error");
+        assert_eq!(got["data"].as_str().unwrap().len(), MOST_ORDINARY_MESSAGE);
+    }
+
+    #[test]
+    fn a_screenshot_reply_may_put_its_id_after_its_data() {
+        let shared = Shared {
+            pending: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            ended: Mutex::new(None),
+        };
+        let (reply, answer) = mpsc::channel();
+        lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
+        let mut message = b"{\"sessionId\":\"s\",\"result\":{\"data\":\"".to_vec();
+        message.resize(message.len() + MOST_ORDINARY_MESSAGE, b'A');
+        message.extend_from_slice(b"\"},\"id\":7}\0");
+        read_all(std::io::Cursor::new(message), &shared);
+        let got = answer.try_recv().expect("the screenshot reply").expect("no CDP error");
+        assert_eq!(got["data"].as_str().unwrap().len(), MOST_ORDINARY_MESSAGE);
     }
 }

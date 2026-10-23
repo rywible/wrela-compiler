@@ -24,8 +24,10 @@ pub const REVISION: Option<&str> = option_env!("WRELA_REVISION");
 pub const REPOSITORY: &str = "https://github.com/rywible/wrela-compiler";
 /// Set, in the environment of the `wrela` chosen, to why it was: that `wrela` runs as itself.
 const CHOSEN: &str = "WRELA_TOOLCHAIN_CHOSEN";
-/// The most a download may be.
+/// The most a download or unpacked tar stream may be.
 const MOST: u64 = 1 << 30;
+/// A SHA256SUMS file contains a few short lines, never a binary payload.
+const SUMS_MOST: u64 = 1 << 20;
 
 /// `wrela --version`'s line: the release and the revision it was built from.
 pub fn version_line() -> String {
@@ -178,7 +180,7 @@ pub fn install(version: &str, base: &str, root: &Path) -> Result<PathBuf, String
     let name = format!("wrela-{version}-{}.tar.gz", target()?);
     let at = format!("{base}/v{version}");
     eprintln!("wrela: this workspace pins the toolchain {version}: downloading {at}/{name}");
-    let sums = fetch(&format!("{at}/SHA256SUMS"), version)?;
+    let sums = fetch(&format!("{at}/SHA256SUMS"), version, SUMS_MOST)?;
     let sums = String::from_utf8_lossy(&sums);
     let want = sums
         .lines()
@@ -187,7 +189,7 @@ pub fn install(version: &str, base: &str, root: &Path) -> Result<PathBuf, String
             (file.trim_start().trim_start_matches('*') == name).then(|| sum.to_ascii_lowercase())
         })
         .ok_or_else(|| format!("the release {version}'s SHA256SUMS has no line for {name}"))?;
-    let tarball = fetch(&format!("{at}/{name}"), version)?;
+    let tarball = fetch(&format!("{at}/{name}"), version, MOST)?;
     let got = crate::sha256_hex(&tarball);
     if got != want {
         return Err(format!(
@@ -220,15 +222,20 @@ pub fn install(version: &str, base: &str, root: &Path) -> Result<PathBuf, String
 }
 
 /// The body of `url`, the release `version`'s: over HTTPS, or HTTP to this machine (a test's
-/// server).
-fn fetch(url: &str, version: &str) -> Result<Vec<u8>, String> {
-    let local = ["http://127.0.0.1:", "http://localhost:", "http://[::1]:"];
-    if !url.starts_with("https://") && !local.iter().any(|l| url.starts_with(l)) {
+/// server). An HTTPS redirect must stay on HTTPS; a local HTTP response must not redirect.
+fn fetch(url: &str, version: &str, limit: u64) -> Result<Vec<u8>, String> {
+    let uri: ureq::http::Uri = url.parse().map_err(|_| format!("`{url}` isn't a URL"))?;
+    let local = uri.scheme_str() == Some("http")
+        && uri.port_u16().is_some()
+        && matches!(uri.host(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    if uri.scheme_str() != Some("https") && !local {
         return Err(format!("`{url}` isn't HTTPS, so the toolchain isn't downloaded from it"));
     }
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_connect(Some(std::time::Duration::from_secs(30)))
         .timeout_global(Some(std::time::Duration::from_secs(900)))
+        .https_only(!local)
+        .max_redirects(if local { 0 } else { 10 })
         .build()
         .into();
     let mut response = agent.get(url).call().map_err(|e| match e {
@@ -238,10 +245,13 @@ fn fetch(url: &str, version: &str) -> Result<Vec<u8>, String> {
         ureq::Error::StatusCode(code) => format!("{url} answered {code}"),
         e => format!("can't download {url} (is the network reachable?): {e}"),
     })?;
+    if response.status().is_redirection() {
+        return Err(format!("{url} redirected, so the toolchain isn't downloaded from it"));
+    }
     response
         .body_mut()
         .with_config()
-        .limit(MOST)
+        .limit(limit)
         .read_to_vec()
         .map_err(|e| format!("can't download {url}: {e}"))
 }
@@ -249,13 +259,25 @@ fn fetch(url: &str, version: &str) -> Result<Vec<u8>, String> {
 /// Unpacks the gzipped tarball `bytes` into `dir`, which it makes. An entry that would land
 /// outside `dir` is refused.
 fn unpack(bytes: &[u8], dir: &Path) -> Result<(), String> {
+    unpack_with_limit(bytes, dir, MOST)
+}
+
+fn unpack_with_limit(bytes: &[u8], dir: &Path, limit: u64) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("can't make `{}`: {e}", dir.display()))?;
-    let mut gz = flate2::read::GzDecoder::new(bytes);
-    let mut tar = Vec::new();
-    gz.read_to_end(&mut tar).map_err(|e| format!("the toolchain's tarball isn't gzip: {e}"))?;
-    tar::Archive::new(&tar[..])
-        .unpack(dir)
-        .map_err(|e| format!("can't unpack the toolchain's tarball: {e}"))
+    let gz = flate2::read::GzDecoder::new(bytes);
+    let mut archive = tar::Archive::new(gz.take(limit + 1));
+    let unpacked = archive.unpack(dir);
+    let mut remaining = archive.into_inner();
+    if remaining.limit() == 0 {
+        return Err("the toolchain's tarball expands beyond the size limit".into());
+    }
+    unpacked.map_err(|e| format!("can't unpack the toolchain's tarball: {e}"))?;
+    std::io::copy(&mut remaining, &mut std::io::sink())
+        .map_err(|e| format!("the toolchain's tarball isn't gzip: {e}"))?;
+    if remaining.limit() == 0 {
+        return Err("the toolchain's tarball expands beyond the size limit".into());
+    }
+    Ok(())
 }
 
 /// Builds the checkout `dir`'s toolchain with Cargo: its `wrela`.
@@ -356,9 +378,31 @@ mod tests {
 
     #[test]
     fn only_https_or_this_machine_is_downloaded_from() {
-        let e = fetch("http://example.com/x", "0.1.0").expect_err("plain HTTP");
+        let e = fetch("http://example.com/x", "0.1.0", MOST).expect_err("plain HTTP");
         assert!(e.contains("isn't HTTPS"), "{e}");
-        assert!(fetch("file:///etc/passwd", "0.1.0").is_err());
+        assert!(fetch("file:///etc/passwd", "0.1.0", MOST).is_err());
+        for url in ["http://localhost:123@example.com/x", "http://127.0.0.1:123@example.com/x"] {
+            let e = fetch(url, "0.1.0", MOST).expect_err("userinfo changes the actual host");
+            assert!(e.contains("isn't HTTPS"), "{e}");
+        }
+    }
+
+    #[test]
+    fn local_http_release_cannot_redirect() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/release", listener.local_addr().expect("address"));
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .write_all(b"HTTP/1.1 302 Found\r\nLocation: http://example.com/release\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .expect("reply");
+        });
+        let e = fetch(&url, "0.1.0", MOST).expect_err("redirect");
+        assert!(e.contains("redirected"), "{e}");
+        server.join().expect("server");
     }
 
     #[test]
@@ -376,6 +420,22 @@ mod tests {
         let tarball = gzip(&b.into_inner().expect("tar"));
         let _ = unpack(&tarball, &dir.join("in"));
         assert!(!dir.join("escape").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_archive_cannot_expand_beyond_the_limit() {
+        let dir = scratch("expansion");
+        let body = vec![0; 8192];
+        let mut header = tar::Header::new_gnu();
+        header.set_size(body.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        let mut tar = tar::Builder::new(Vec::new());
+        tar.append_data(&mut header, "large", &body[..]).expect("append");
+        let compressed = gzip(&tar.into_inner().expect("tar"));
+        let e = unpack_with_limit(&compressed, &dir.join("in"), 2048).expect_err("expansion");
+        assert!(e.contains("expands beyond the size limit"), "{e}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

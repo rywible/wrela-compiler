@@ -138,14 +138,21 @@ export function frame(bytes: Uint8Array): Uint8Array {
 export class Frames {
   #buffer = new Uint8Array(0);
 
-  /** The whole frames `chunk` completes, oldest first; an error for a frame too long, or whose
-   * length isn't a varint of at most three bytes. */
-  push(chunk: Uint8Array): Uint8Array[] {
+  /** The whole frames `chunk` completes, oldest first. `available` bounds what they may hold
+   * before any message bytes are copied. An error for a frame too long, a length that isn't a
+   * varint of at most three bytes, or messages past that bound. */
+  push(chunk: Uint8Array, available = HELD): Uint8Array[] {
+    // At most one incomplete frame can follow the completed ones. Reject a huge read before
+    // copying it, even if it contains millions of tiny frames.
+    if (this.#buffer.length + chunk.length > available + MAX_FRAME + 3) {
+      throw new Error(`more than ${HELD} bytes wait for the program`);
+    }
     const b = new Uint8Array(this.#buffer.length + chunk.length);
     b.set(this.#buffer);
     b.set(chunk, this.#buffer.length);
     const out: Uint8Array[] = [];
     let at = 0;
+    let held = 0;
     for (;;) {
       let length = 0;
       let k = 0;
@@ -158,6 +165,8 @@ export class Frames {
       if (length > MAX_FRAME) throw new Error(`a frame of ${length} bytes, past ${MAX_FRAME}`);
       const start = at + k + 1;
       if (start + length > b.length) break;
+      held += length + OVERHEAD;
+      if (held > available) throw new Error(`more than ${HELD} bytes wait for the program`);
       out.push(b.slice(start, start + length));
       at = start + length;
     }
@@ -178,7 +187,13 @@ export function parseServer(text: string): Server {
   const v: unknown = JSON.parse(text);
   if (typeof v !== "object" || v === null) throw new Error("net.json isn't an object");
   const { url, certificateHash } = v as Record<string, unknown>;
-  if (typeof url !== "string" || !/^https:\/\//.test(url)) throw new Error("net.json's `url` isn't an https URL");
+  if (typeof url !== "string") throw new Error("net.json's `url` isn't an https URL");
+  let address: URL;
+  try { address = new URL(url); }
+  catch { throw new Error("net.json's `url` isn't an https URL"); }
+  if (address.protocol !== "https:" || address.username || address.password || url.includes("?") || url.includes("#")) {
+    throw new Error("net.json's `url` isn't an https URL without credentials, query or fragment");
+  }
   if (certificateHash === undefined) return { url };
   const whole = Array.isArray(certificateHash) && certificateHash.length === 32 && certificateHash.every((x) => Number.isInteger(x) && x >= 0 && x < 256);
   if (!whole) throw new Error("net.json's `certificateHash` isn't 32 bytes");
@@ -253,7 +268,7 @@ export class Net {
   #fetchServer(): Promise<Server> {
     const url = new URL("net.json", this.base()).href;
     if (this.#server?.url === url) return this.#server.ready;
-    const ready = fetch(url)
+    const ready = fetch(url, { redirect: "error" })
       .then((r) => {
         if (!r.ok) throw new Error(`net.json: ${r.status}`);
         return r.text();
@@ -312,10 +327,7 @@ export class Net {
       for (;;) {
         const { value, done } = await reader.read();
         if (done || session.closed) break;
-        for (const bytes of frames.push(value)) {
-          if (this.#held + bytes.length + OVERHEAD > HELD) {
-            throw new Error(`more than ${HELD} bytes wait for the program`);
-          }
+        for (const bytes of frames.push(value, HELD - this.#held)) {
           this.#held += bytes.length + OVERHEAD;
           this.arrived.push({ conn, bytes });
         }

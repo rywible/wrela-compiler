@@ -11,7 +11,7 @@
 //! source in the repository given, at its commit; std's link to the toolchain's, which for a
 //! release is its own repository at the revision it was built from (`index.json`'s `toolchain`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -128,8 +128,13 @@ pub(crate) fn files_of(
             .map_err(|e| format!("`{}` isn't a package: {e}", dir.display()))?;
         let name = package_name(&manifest)
             .ok_or_else(|| format!("`{}`'s wrela.toml has no valid package name", dir.display()))?;
-        if name == "std" || names.contains(&name) {
-            return Err(format!("two packages are named `{name}`"));
+        if name.eq_ignore_ascii_case("std") || name.eq_ignore_ascii_case("spec") {
+            return Err(format!("`{name}` is reserved by the toolchain's reference docs"));
+        }
+        if names.iter().any(|prior: &String| prior.eq_ignore_ascii_case(&name)) {
+            return Err(format!(
+                "two packages have the name `{name}` on a case-insensitive filesystem"
+            ));
         }
         sources.extend(doc::package_sources_in(reach, base, dir, Some(&name))?);
         names.push(name);
@@ -191,7 +196,21 @@ pub(crate) fn files_of(
     let map = llms(&groups, &sizes, all.len(), version, commit, repository);
     files.push(("llms.txt".into(), map.into_bytes()));
     files.push(("llms-full.txt".into(), all.into_bytes()));
+    unique_paths(&files)?;
     Ok((pages.len(), files))
+}
+
+/// Refuse output names that would overwrite each other on a case-insensitive filesystem.
+fn unique_paths(files: &Files) -> Result<(), String> {
+    let mut paths = BTreeSet::new();
+    for (path, _) in files {
+        if !paths.insert(path.to_ascii_lowercase()) {
+            return Err(format!(
+                "two reference files use `{path}` on a case-insensitive filesystem"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Where std's and the spec's source is, and its revision: a release's toolchain repository at
@@ -660,6 +679,13 @@ fn title_of(group: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_paths_must_be_unique_on_case_insensitive_filesystems() {
+        let files =
+            vec![("Foo/shapes.md".into(), Vec::new()), ("foo/Shapes.md".into(), Vec::new())];
+        assert!(unique_paths(&files).is_err());
+    }
 
     #[test]
     fn a_heading_s_anchor_is_its_slug_and_repeats_are_numbered() {

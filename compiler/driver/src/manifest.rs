@@ -616,6 +616,18 @@ fn strip_comment(line: &str) -> &str {
 
 /// Reads a value at the start of `s` (at offset `at` in the file): it and the text after it.
 fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagnostic>> {
+    read_value_at_depth(s, at, file, 0)
+}
+
+/// Bounds recursion on manifest input before building its nested arrays and inline tables.
+const MAX_VALUE_NESTING: u32 = 128;
+
+fn read_value_at_depth(
+    s: &str,
+    at: u32,
+    file: FileId,
+    depth: u32,
+) -> Result<(Value, &str), Box<Diagnostic>> {
     let bad = |msg: &str| {
         Diagnostic::new(
             codes::E0219,
@@ -623,6 +635,9 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
             msg.to_string(),
         )
     };
+    if depth > MAX_VALUE_NESTING {
+        return Err(Box::new(bad("a manifest value nests more than 128 levels")));
+    }
     if let Some(rest) = s.strip_prefix("true") {
         return Ok((Value::Bool(true), rest));
     }
@@ -666,7 +681,7 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
             let off = at + (s.len() - rest.len()) as u32;
             let kspan = Span::new(file, off, off + key.len() as u32);
             let vat = at + (s.len() - after.trim_start().len()) as u32;
-            let (v, r) = read_value(after.trim_start(), vat, file)?;
+            let (v, r) = read_value_at_depth(after.trim_start(), vat, file, depth + 1)?;
             fields.push((key, v, kspan));
             rest = r.trim_start();
             if let Some(r) = rest.strip_prefix(',') {
@@ -684,7 +699,7 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
                 return Ok((Value::Array(items), r));
             }
             let vat = at + (s.len() - rest.len()) as u32;
-            let (v, r) = read_value(rest, vat, file)?;
+            let (v, r) = read_value_at_depth(rest, vat, file, depth + 1)?;
             items.push((v, Span::new(file, vat, at + (s.len() - r.len()) as u32)));
             rest = r.trim_start();
             if let Some(r) = rest.strip_prefix(',') {
@@ -702,6 +717,23 @@ fn read_value(s: &str, at: u32, file: FileId) -> Result<(Value, &str), Box<Diagn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deeply_nested_manifest_values_are_diagnosed() {
+        for (open, close) in [("[", "]"), ("{ value = ", " }")] {
+            let nested = format!(
+                "{}true{}",
+                open.repeat(MAX_VALUE_NESTING as usize + 1),
+                close.repeat(MAX_VALUE_NESTING as usize + 1)
+            );
+            let manifest = format!("[workspace]\nmembers = {nested}\n");
+            let errors = parse(file(), &manifest).expect_err("excessive nesting is an error");
+            assert!(
+                errors.iter().any(|d| d.message.contains("nests more than 128 levels")),
+                "{errors:?}"
+            );
+        }
+    }
 
     fn file() -> FileId {
         FileId(0)

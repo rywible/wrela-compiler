@@ -22,7 +22,7 @@ pub enum Role: Copy + Eq {
     Heading,
     /// A paragraph.
     Text,
-    /// A link to `href`.
+    /// A link to `href`, which resolves to an HTTP or HTTPS URL in the browser host.
     Link,
     /// Code.
     Code,
@@ -109,6 +109,7 @@ pub struct Node: Clone + Eq {
     pub max: f32 = 0.0,
     pub step: f32 = 0.0,
     pub controls: u32 = 0,
+    /// A relative or HTTP(S) URL for a link; empty makes an action-only node.
     pub href: String = String::new(),
     pub field: Option<Field> = None,
 }

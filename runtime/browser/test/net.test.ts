@@ -4,7 +4,7 @@
 import { describe, expect, test } from "bun:test";
 import { EVENT_SIZE } from "../src/abi.gen.ts";
 import { connectionEvent, isNetwork, textEvent } from "../src/input.ts";
-import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, PENDING, parseServer, roomName } from "../src/net.ts";
+import { Frames, frame, HELD, Inbox, MAX_FRAME, MAX_UP, Net, OVERHEAD, PENDING, parseServer, roomName } from "../src/net.ts";
 
 const word = (e: Uint8Array, i: number) => new DataView(e.buffer, e.byteOffset, EVENT_SIZE).getUint32(4 * i, true);
 
@@ -54,6 +54,14 @@ describe("frames", () => {
     expect(() => new Frames().push(frame(new Uint8Array(MAX_FRAME + 1)).subarray(0, 3))).toThrow("past 65536");
     expect(() => new Frames().push(Uint8Array.of(128, 128, 128, 1))).toThrow("isn't a varint of at most three bytes");
   });
+
+  test("a read with many small frames stays inside the available message budget", () => {
+    const f = new Frames();
+    expect(f.push(Uint8Array.of(0, 0), OVERHEAD * 2)).toEqual([new Uint8Array(), new Uint8Array()]);
+    expect(() => f.push(new Uint8Array(11), OVERHEAD * 10)).toThrow(`more than ${HELD} bytes`);
+    // Even an unparsed read cannot be copied before its size is checked.
+    expect(() => new Frames().push(new Uint8Array(MAX_FRAME + OVERHEAD + 4), OVERHEAD)).toThrow(`more than ${HELD} bytes`);
+  });
 });
 
 describe("connections", () => {
@@ -66,7 +74,9 @@ describe("connections", () => {
     expect(parseServer('{"url": "https://localhost:4433"}')).toEqual({ url: "https://localhost:4433" });
     const hash = Array.from({ length: 32 }, (_, i) => i);
     expect(parseServer(JSON.stringify({ url: "https://x", certificateHash: hash })).certificateHash).toEqual(hash);
-    expect(() => parseServer('{"url": "http://x"}')).toThrow("isn't an https URL");
+    for (const url of ["http://x", "https://", "https://trusted.example@attacker.example", "https://x/?redirect=other", "https://x/#room", "https://x/?", "https://x/#"]) {
+      expect(() => parseServer(JSON.stringify({ url }))).toThrow("isn't an https URL");
+    }
     expect(() => parseServer('{"url": "https://x", "certificateHash": [1]}')).toThrow("isn't 32 bytes");
   });
 
@@ -195,8 +205,10 @@ describe("what a connection holds", () => {
   test("a replacement build reads its own server configuration", async () => {
     await withServer([], async (urls) => {
       const fetched: string[] = [];
-      globalThis.fetch = (async (url: string | URL | Request) => {
+      const redirects: (RequestRedirect | undefined)[] = [];
+      globalThis.fetch = (async (url: string | URL | Request, init?: RequestInit) => {
         fetched.push(String(url));
+        redirects.push(init?.redirect);
         return new Response(JSON.stringify({ url: fetched.length === 1 ? "https://first.example" : "https://next.example" }));
       }) as typeof fetch;
       let base = "https://site.example/first/";
@@ -208,6 +220,7 @@ describe("what a connection holds", () => {
       net.open(2, "lobby", 2n);
       await settle(() => net.arrived.length > 0);
       expect(fetched).toEqual(["https://site.example/first/net.json", "https://site.example/next/net.json"]);
+      expect(redirects).toEqual(["error", "error"]);
       expect(urls).toEqual(["https://first.example/room/lobby?pair=0000000000000001", "https://next.example/room/lobby?pair=0000000000000002"]);
       net.closeAll();
     });

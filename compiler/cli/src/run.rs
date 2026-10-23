@@ -6,7 +6,7 @@
 //! `<package>/build/run/`.
 //!
 //! A program with a server role gets its rooms beside the page (`wrela-serve`, on
-//! `--rooms-port`, 4433 by default), with a development certificate: each build's `net.json`
+//! `--rooms-port`, 4433 by default) on 127.0.0.1, with a development certificate: each build's `net.json`
 //! names them, and a build whose server changed replaces the rooms' build. Rooms' journals go in
 //! `<package>/build/rooms/`, each server build's apart, so they last from run to run.
 
@@ -124,10 +124,11 @@ impl Rooms {
             services: Some(Arc::new(services)),
             port: self.port,
             identity,
+            origins: wrela_serve::Origins::Local,
             limits: wrela_host::server::Limits::default(),
             bounds: wrela_serve::Bounds::default(),
         };
-        let server = wrela_serve::start(config, &runtime)
+        let server = wrela_serve::start_local(config, &runtime)
             .map_err(|e| format!("can't serve on port {}: {e}", self.port))?;
         println!("its rooms: https://localhost:{} (WebTransport)", self.port);
         self.runtime = Some(runtime);

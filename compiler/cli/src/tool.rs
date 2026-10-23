@@ -28,6 +28,7 @@
 //! `wrela tool --drive <parent>` is a driven build's process, which the tool host `parent`
 //! starts (`wrela_host::tool::drive_child`): `main` runs it before anything else.
 
+use std::collections::HashSet;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -267,6 +268,12 @@ fn named(
 /// missing `write` root is made the same way ([`Opened::within`]): so it is inside the
 /// workspace, and the run gets that handle, not the path opened again.
 fn declared(ws: &Workspace, tool: &wrela_driver::manifest::ToolDecl) -> Result<Grants, String> {
+    let mut names = HashSet::new();
+    for (name, _) in tool.read.iter().chain(&tool.write) {
+        if !names.insert(name) {
+            return Err(format!("the root `{name}` is granted twice"));
+        }
+    }
     let top = Opened::at(&ws.root)?;
     let mut g = Grants::default();
     for (roots, write) in [(&tool.read, false), (&tool.write, true)] {

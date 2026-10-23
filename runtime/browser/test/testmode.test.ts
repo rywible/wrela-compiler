@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { asksForTest, frameTime, inputUrl, isLoopback, parseTestParams, TEST_DEFAULTS } from "../src/testmode.ts";
+import { asksForTest, frameTime, inputUrl, isLoopback, parseTestParams, putResult, TEST_DEFAULTS } from "../src/testmode.ts";
 
 test("only #test fragments ask for test mode", () => {
   expect(parseTestParams("")).toBeNull();
@@ -90,4 +90,20 @@ test("frame times are i / fps, rounded to f32 like the native host's", () => {
 test("only a page served from this machine may enter test mode", () => {
   for (const host of ["localhost", "127.0.0.1", "[::1]"]) expect(isLoopback(host)).toBe(true);
   for (const host of ["example.com", "192.168.1.5", "localhost.example.com", ""]) expect(isLoopback(host)).toBe(false);
+});
+
+test("test results stay at the page's result endpoint", async () => {
+  const saved = globalThis.fetch;
+  let request: { url: string; init: RequestInit | undefined } | undefined;
+  globalThis.fetch = (async (url: URL, init?: RequestInit) => {
+    request = { url: url.href, init };
+    return new Response(null, { status: 204 });
+  }) as typeof fetch;
+  try {
+    await putResult("http://127.0.0.1:8000/game/index.html#test", "log.txt", "private result");
+    expect(request).toEqual({
+      url: "http://127.0.0.1:8000/game/results/log.txt",
+      init: { method: "PUT", body: "private result", redirect: "error" },
+    });
+  } finally { globalThis.fetch = saved; }
 });

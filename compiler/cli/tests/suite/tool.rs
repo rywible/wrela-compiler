@@ -707,6 +707,26 @@ fn the_command_line_may_narrow_a_named_tools_grants_and_never_widen_them() {
 }
 
 #[test]
+fn a_duplicate_declared_root_cannot_rebind_a_write_grant_to_a_read_directory() {
+    let ws = copy_workspace("tool-duplicate-root", "");
+    let manifest = ws.join("wrela.toml");
+    let text = std::fs::read_to_string(&manifest).expect("manifest");
+    std::fs::write(
+        &manifest,
+        text.replace("read = [\"in=data/in\"]", "read = [\"in=data/in\", \"out=data/in\"]"),
+    )
+    .expect("duplicate declaration");
+    std::fs::create_dir_all(ws.join("data/out/sub")).expect("write directory");
+    let read = format!("in={}", ws.join("data/in").canonicalize().expect("read").display());
+    let write = format!("out={}", ws.join("data/out/sub").canonicalize().expect("write").display());
+    let (status, out) =
+        named(&ws, &["copy", "--read", &read, "--write", &write, "--", "notes.txt"]);
+    assert_eq!(status, Some(2), "{out}");
+    assert!(out.contains("the root `out` is granted twice"), "{out}");
+    assert!(!ws.join("data/in/sub/copy/notes.txt").exists());
+}
+
+#[test]
 fn a_workspaces_tools_are_checked_when_it_is_read() {
     let tool = |body: &str| {
         format!("[workspace]\nmembers = [\"copier\", \"plain\"]\n\n[tools.copy]\n{body}")

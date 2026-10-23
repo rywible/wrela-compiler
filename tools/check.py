@@ -140,8 +140,7 @@ def rust_run(program, out=None, names=None):
     """Runs every test of `program`, or exactly `names`: how many passed. The output goes to
     `out` (standard output by default) when the run fails or when one test was named."""
     out = out or sys.stdout
-    cache = os.environ.get("WRELA_NATIVE_CACHE", str(Path(os.environ.get("CARGO_TARGET_DIR", "target")) / "native-cache"))
-    command, env, cwd, scratch = runner.start(program, runner.scratch_root(), os.path.abspath(cache), threads())
+    command, env, cwd, scratch = runner.start(program, runner.scratch_root(), threads())
     args = ["--include-ignored"]
     if names:
         args += ["--exact", *names]

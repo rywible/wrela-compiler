@@ -78,6 +78,51 @@ fn rejects_a_program_with_other_imports() {
     );
 }
 
+#[test]
+fn a_build_cannot_supply_executable_code_from_its_native_cache() {
+    let wasm = wat::parse_str(
+        r#"(module
+            (import "wrela" "memory" (memory 1 16384 shared))
+            (export "memory" (memory 0))
+            (func (export "frame") (param f32 i32 i32))
+            (func (export "cache_marker") (result i32) i32.const 17))"#,
+    )
+    .expect("program WASM");
+    let dir = common::build("poisoned-native-cache", &common::manifest("[]"), &[], &wasm);
+
+    // A build could place an artifact with the old cache's exact name. The artifact is valid
+    // Wasmtime code for this engine but contains a different module than the build's WASM.
+    let mut config = wasmtime::Config::new();
+    config.wasm_threads(true).shared_memory(true).consume_fuel(false);
+    config.epoch_interruption(false).native_unwind_info(false);
+    let engine = wasmtime::Engine::new(&config).expect("engine");
+    let wrong = wat::parse_str("(module)").expect("other WASM");
+    let poison = wasmtime::Module::new(&engine, &wrong)
+        .expect("other module")
+        .serialize()
+        .expect("artifact");
+    let old_cache = dir.join(".native");
+    std::fs::create_dir_all(&old_cache).expect("legacy cache directory");
+    let name = format!(
+        "game-{}-{}.cwasm",
+        wrela_abi::hash::hex(wrela_abi::ticks::wasm_hash(&wasm)),
+        std::env::consts::ARCH
+    );
+    let planted = old_cache.join(name);
+    std::fs::write(&planted, &poison).expect("planted artifact");
+
+    let mut host = CpuBuild::load_cpu(&dir)
+        .expect("build WASM, not its planted native code")
+        .start_with(1)
+        .expect("start");
+    assert_eq!(
+        host.call_export("cache_marker", &[]).expect("the build's export"),
+        [wrela_host::Value::I32(17)]
+    );
+    assert_eq!(std::fs::read(&planted).expect("planted artifact remains"), poison);
+    let _ = std::fs::remove_file(&planted);
+}
+
 /// A driven build (the tool host's `drive`, language.md §15.5), read through its directory's
 /// handle, its code given for the engine `wrela-host` runs on, runs as a loaded one: the same
 /// frames give the same hash.

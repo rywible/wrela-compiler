@@ -165,7 +165,7 @@ export const frameTime = (i: number, fps: number) => i / fps;
 /** PUTs a file into the page's `results/` directory (a tool's server, `std::tool::serve`, or `wrela run`'s). */
 export async function putResult(base: string, name: string, body: BodyInit): Promise<void> {
   const url = new URL(`results/${name}`, base);
-  const response = await fetch(url, { method: "PUT", body });
+  const response = await fetch(url, { method: "PUT", body, redirect: "error" });
   if (!response.ok) throw new Error(`PUT ${url} failed: ${response.status} ${response.statusText}`);
 }
 

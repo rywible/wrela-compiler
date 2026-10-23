@@ -3,8 +3,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { MANIFEST_VERSION } from "../src/abi.gen.ts";
 import { pathProblem } from "../src/path.ts";
-import { browserIo, type Fetch, loadBuild, loadScript } from "../src/loader.ts";
-import { ManifestError } from "../src/manifest.ts";
+import { browserIo, type Fetch, loadBuild, loadLines, loadScript } from "../src/loader.ts";
+import { ManifestError, parseManifest } from "../src/manifest.ts";
 import { FIRST_LIGHT, readFixture, readFixtureText } from "./fixtures.ts";
 
 const BASE = "http://localhost/game/index.html";
@@ -73,6 +73,46 @@ test("names a file it can't fetch", async () => {
     throw new TypeError("network down");
   };
   await expect(loadBuild(BASE, failing)).rejects.toThrow("can't fetch http://localhost/game/manifest.json: network down");
+});
+
+test("build and program requests refuse redirects before they leave the build's origin", async () => {
+  const requested: { url: string; method: string; redirect: RequestRedirect | undefined }[] = [];
+  const fetch: Fetch = async (url, init) => {
+    requested.push({ url: url.href, method: init?.method ?? "GET", redirect: init?.redirect });
+    return new Response(null, { status: 302, statusText: "Found", headers: { Location: "https://elsewhere.example/receive" } });
+  };
+  await expect(loadBuild(BASE, fetch)).rejects.toThrow("can't fetch http://localhost/game/manifest.json: 302 Found");
+  const io = browserIo(BASE, fetch);
+  await expect(io.fetch("data.bin")).rejects.toThrow("can't fetch http://localhost/game/data.bin: 302 Found");
+  await expect(io.post("save", Uint8Array.of(1))).rejects.toThrow("POST save failed: 302 Found");
+  expect(requested).toEqual([
+    { url: "http://localhost/game/manifest.json", method: "GET", redirect: "manual" },
+    { url: "http://localhost/game/data.bin", method: "GET", redirect: "manual" },
+    { url: "http://localhost/game/save", method: "POST", redirect: "manual" },
+  ]);
+});
+
+test("default browser fetches keep the no-redirect policy", async () => {
+  const original = globalThis.fetch;
+  const requested: { url: string; redirect: RequestRedirect | undefined }[] = [];
+  globalThis.fetch = (async (url: URL, init?: RequestInit) => {
+    requested.push({ url: url.href, redirect: init?.redirect });
+    return new Response(null, { status: 302, statusText: "Found" });
+  }) as typeof fetch;
+  try {
+    await expect(loadBuild(BASE)).rejects.toThrow("302 Found");
+    await expect(loadScript(new URL("input.json", BASE))).rejects.toThrow("302 Found");
+    expect(await loadLines(BASE, parseManifest(readFixtureText("manifest.json")))).toBeNull();
+    await expect(browserIo(BASE).fetch("data.bin")).rejects.toThrow("302 Found");
+  } finally {
+    globalThis.fetch = original;
+  }
+  expect(requested).toEqual([
+    { url: "http://localhost/game/manifest.json", redirect: "manual" },
+    { url: "http://localhost/game/input.json", redirect: "manual" },
+    { url: "http://localhost/game/game.lines", redirect: "manual" },
+    { url: "http://localhost/game/data.bin", redirect: "manual" },
+  ]);
 });
 
 test("fetches and posts literal percent escapes inside the build", async () => {

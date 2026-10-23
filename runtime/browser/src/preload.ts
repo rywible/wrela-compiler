@@ -16,7 +16,8 @@ export function preloaded(page: ParentNode): string[] {
  * soon as it is parsed; the worker would ask only once its script and the manifest had come. */
 export function handOver(worker: Pick<Worker, "postMessage">, urls: readonly string[], fetchFn: typeof fetch = fetch): void {
   for (const url of urls) {
-    fetchFn(url)
+    // The worker's own fetch rejects redirects. Keep the early fetch on that same boundary.
+    fetchFn(url, { redirect: "manual" })
       .then((r) => (r.ok ? r.arrayBuffer() : null))
       .catch(() => null)
       .then((b) => {

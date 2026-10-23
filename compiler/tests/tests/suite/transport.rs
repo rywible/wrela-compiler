@@ -29,6 +29,16 @@ fn start_build(
     runtime: &tokio::runtime::Runtime,
     bounds: wrela_serve::Bounds,
 ) -> (u16, [u8; 32], wrela_serve::Server) {
+    start_build_with_origins(name, server, runtime, bounds, wrela_serve::Origins::Local)
+}
+
+fn start_build_with_origins(
+    name: &str,
+    server: &[u8],
+    runtime: &tokio::runtime::Runtime,
+    bounds: wrela_serve::Bounds,
+    origins: wrela_serve::Origins,
+) -> (u16, [u8; 32], wrela_serve::Server) {
     let data = crate::scratch_root().join(format!("transport-{name}"));
     let _ = std::fs::remove_dir_all(&data);
     let port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -46,8 +56,11 @@ fn start_build(
         identity,
         limits: Limits::default(),
         bounds,
+        origins,
     };
-    (port, hash, wrela_serve::start(config, runtime).expect("the server starts"))
+    let server = wrela_serve::start_local(config, runtime).expect("the server starts");
+    assert!(server.local_addr().ip().is_loopback(), "the development socket is local");
+    (port, hash, server)
 }
 
 /// A peer's session and its stream.
@@ -58,16 +71,30 @@ struct Peer {
 }
 
 async fn connect(port: u16, hash: [u8; 32], path: &str) -> Result<Peer, String> {
+    connect_with_origin(port, hash, path, None).await
+}
+
+async fn connect_with_origin(
+    port: u16,
+    hash: [u8; 32],
+    path: &str,
+    origin: Option<&str>,
+) -> Result<Peer, String> {
     let config = ClientConfig::builder()
         .with_bind_default()
         .with_server_certificate_hashes([wtransport::tls::Sha256Digest::new(hash)])
         .build();
     let endpoint = Endpoint::client(config).map_err(|e| e.to_string())?;
     let url = format!("https://localhost:{port}{path}");
+    let mut options = wtransport::endpoint::ConnectOptions::builder(url);
+    if let Some(origin) = origin {
+        options = options.add_header("origin", origin);
+    }
+    let options = options.build();
     // The server may be starting: try for a while.
     let mut last = String::new();
     for _ in 0..50 {
-        match endpoint.connect(&url).await {
+        match endpoint.connect(options.clone()).await {
             Ok(connection) => {
                 let (send, recv) = connection
                     .open_bi()
@@ -316,6 +343,64 @@ fn a_client_of_another_program_is_refused() {
         let mut a = connect(port, hash, &room("pairs")).await.expect("its own program's client");
         a.put(&hello(5, 1, 0, 0)).await;
         assert_eq!(a.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+    });
+}
+
+#[test]
+fn a_browser_origin_must_be_allowed_before_it_joins_a_room() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let allowed = wrela_serve::Origins::Exact(vec!["https://game.example".to_string()]);
+    let (port, hash, _server) = start_build_with_origins(
+        "origins",
+        wasm(),
+        &runtime,
+        wrela_serve::Bounds::default(),
+        allowed,
+    );
+    runtime.block_on(async {
+        let path = room("origins");
+        let refused =
+            connect_with_origin(port, hash, &path, Some("https://other.example")).await.err();
+        assert!(refused.is_some_and(|e| e.contains("rejected")), "foreign browser origin");
+        let mut peer = connect_with_origin(port, hash, &path, Some("https://game.example"))
+            .await
+            .expect("allowed browser origin");
+        peer.put(&hello(5, 1, 0, 0)).await;
+        assert_eq!(peer.next().await, Some(Down::Welcome { peer: 1, seq: 0 }));
+    });
+}
+
+#[test]
+fn an_opaque_browser_origin_cannot_be_configured() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (identity, _) = wrela_serve::dev_identity().expect("a certificate");
+    let config = wrela_serve::Config {
+        build: Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build")),
+        build_hash: wrela_abi::ticks::wasm_hash(wasm()),
+        data: crate::scratch_root().join("transport-invalid-origin"),
+        services: None,
+        port: 0,
+        identity,
+        limits: Limits::default(),
+        bounds: wrela_serve::Bounds::default(),
+        origins: wrela_serve::Origins::Exact(vec!["null".to_string()]),
+    };
+    let error = wrela_serve::start(config, &runtime).err().expect("invalid origin is rejected");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+}
+
+#[test]
+fn a_session_cannot_open_a_second_room_stream() {
+    let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+    let (port, hash) = start("streams", &runtime);
+    runtime.block_on(async {
+        let peer = connect(port, hash, &room("streams")).await.expect("first room stream");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), peer._connection.open_bi())
+                .await
+                .is_err(),
+            "a second room stream bypassed the session's buffer limit"
+        );
     });
 }
 

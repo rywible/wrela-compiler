@@ -249,6 +249,48 @@ fn the_export_rejects_package_names_that_escape_its_directory() {
     assert!(!root.join("out").exists());
 }
 
+#[test]
+fn the_export_reserves_spec_and_std_on_case_insensitive_filesystems() {
+    let root = shapes("doc-export-spec-name");
+    std::fs::write(
+        root.join("fixture/lexical.wrela"),
+        "/// A package page with the spec's path.\npub fn example() -> u32 { 1 }\n",
+    )
+    .expect("package page");
+    for name in ["spec", "Spec", "std", "Std"] {
+        std::fs::write(root.join("fixture/wrela.toml"), common::manifest(name))
+            .expect("package manifest");
+        let out = export(&root, "out", &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&format!("`{name}` is reserved")),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!root.join("out").exists());
+    }
+}
+
+#[test]
+fn the_export_rejects_package_names_that_only_differ_by_case() {
+    let root = shapes("doc-export-case-collision");
+    std::fs::write(root.join("fixture/wrela.toml"), common::manifest("Foo"))
+        .expect("first manifest");
+    std::fs::create_dir(root.join("other")).expect("second package");
+    std::fs::write(root.join("other/wrela.toml"), common::manifest("foo"))
+        .expect("second manifest");
+    std::fs::write(root.join("other/shapes.wrela"), "pub fn sample() -> u32 { 1 }\n")
+        .expect("second source");
+    let out = export(&root, "out", &["other"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("case-insensitive filesystem"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!root.join("out").exists());
+}
+
 /// A lookup reads the package as it is now, not an export: an edited doc comment shows at once.
 #[test]
 fn a_lookup_reads_the_package_as_it_is_now() {

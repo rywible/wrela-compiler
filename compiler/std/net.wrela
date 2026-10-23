@@ -78,7 +78,8 @@ pub const WINDOW: u32 = 256
 pub enum Up<T>: Pack {
     /// Opening a connection: who it is (its token, which it chose and keeps; the room gives each
     /// token one id, however many hellos carry it), its session, that it has every outcome
-    /// through counter `acked`, and the log through entry `have`.
+    /// through counter `acked`, and the log through entry `have`. A new token has no outcomes
+    /// yet, so `acked` is 0. A new session may acknowledge the prior session's outcomes.
     Hello { token: u64, session: u32, acked: u32, have: u64 },
     /// A proposal, which says whose it is (the id and session its `Welcome` gave): the room
     /// takes it only from that peer's connection.
@@ -117,7 +118,8 @@ pub const OLD_SESSION: u32 = 4
 pub const GAP: u32 = 5
 /// A proposal past `WINDOW` outcomes the peer hasn't acknowledged.
 pub const PAST_WINDOW: u32 = 6
-/// An acknowledgement of a proposal not yet settled, or a hello with more of the log than the room.
+/// An acknowledgement of a proposal not yet settled, a new token with an acknowledgement,
+/// or a hello with more of the log than the room.
 pub const BAD_ACK: u32 = 7
 /// Another connection of the same peer said hello.
 pub const REPLACED: u32 = 8
@@ -463,27 +465,38 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
             self.refuse(mut out, conn, HELLO_AGAIN)
             return
         }
+        // Reject an impossible log position before a new token or session can add durable
+        // records. Otherwise invalid hellos can fill the journal and its snapshots with peers
+        // that never joined.
+        if have > self.seq {
+            self.refuse(mut out, conn, BAD_ACK)
+            return
+        }
         if let Some(k) = self.token_at(token) {
+            if session < self.peers[k].session {
+                self.refuse(mut out, conn, OLD_SESSION)
+                return
+            }
+            if acked >= self.peers[k].next {
+                self.refuse(mut out, conn, BAD_ACK)
+                return
+            }
             i = k
         } else {
+            if acked != 0 {
+                // A new peer has no outcomes to acknowledge, even in its first session.
+                self.refuse(mut out, conn, BAD_ACK)
+                return
+            }
             // A token the room hasn't seen: it joins, once, whatever happens to the replies.
             let id = self.next_peer
             self.journal(mut out, Record::Joined { peer: id, token })
             i = self.peer_at(id).unwrap()
         }
         let id = self.peers[i].id
-        if session < self.peers[i].session {
-            self.refuse(mut out, conn, OLD_SESSION)
-            return
-        }
         if session > self.peers[i].session {
             self.journal(mut out, Record::Session { peer: id, session })
         } else if !self.ack(i, acked) {
-            self.refuse(mut out, conn, BAD_ACK)
-            return
-        }
-        // It can't have more of the log than the room.
-        if have > self.seq {
             self.refuse(mut out, conn, BAD_ACK)
             return
         }
@@ -1131,6 +1144,66 @@ fn peers_converge_and_apply_each_proposal_once() {
             all.compactions > 2000,
         f"{all.crashes} crashes, {all.lost} records lost, {all.drops} drops, {all.refused} refused",
     )
+}
+
+@test
+fn invalid_hellos_do_not_keep_peers_or_sessions() {
+    var room: Room<Tags, u32> = Room::new(Tags { all: Vec::new() })
+    for token in 1..20 {
+        let step = room.receive(
+            token,
+            pack(Up::<u32>::Hello { token: u64(token), session: 1, acked: 0, have: 1 }),
+            0,
+        )
+        assert(step.records.is_empty() && step.closes == Vec::from([token]))
+    }
+    let bad_ack = room.receive(
+        20,
+        pack(Up::<u32>::Hello { token: 1, session: 0, acked: 1, have: 0 }),
+        0,
+    )
+    assert(bad_ack.records.is_empty() && bad_ack.closes == Vec::from([20]))
+    let invented_ack = room.receive(
+        21,
+        pack(Up::<u32>::Hello { token: 2, session: 1, acked: 1, have: 0 }),
+        0,
+    )
+    assert(invented_ack.records.is_empty() && invented_ack.closes == Vec::from([21]))
+    assert(room.peers.is_empty() && room.since_snapshot() == 0)
+
+    let joined = room.receive(
+        22,
+        pack(Up::<u32>::Hello { token: 1, session: 1, acked: 0, have: 0 }),
+        0,
+    )
+    assert(joined.records.len() == 2 && room.peers[0].id == 1)
+
+    let bad_session = room.receive(
+        23,
+        pack(Up::<u32>::Hello { token: 1, session: 2, acked: 1, have: 0 }),
+        0,
+    )
+    assert(bad_session.records.is_empty() && bad_session.closes == Vec::from([23]))
+    let bad_have = room.receive(
+        24,
+        pack(Up::<u32>::Hello { token: 1, session: 2, acked: 0, have: 1 }),
+        0,
+    )
+    assert(bad_have.records.is_empty() && bad_have.closes == Vec::from([24]))
+    assert(room.peers[0].session == 1 && room.since_snapshot() == 2)
+
+    let settled = room.receive(
+        22,
+        pack(Up::<u32>::Propose { peer: 1, session: 1, counter: 1, value: 5 }),
+        0,
+    )
+    assert(settled.records.len() == 1)
+    let next_session = room.receive(
+        25,
+        pack(Up::<u32>::Hello { token: 1, session: 2, acked: 1, have: 1 }),
+        0,
+    )
+    assert(next_session.records.len() == 1 && room.peers[0].session == 2)
 }
 
 @test

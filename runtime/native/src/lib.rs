@@ -287,8 +287,8 @@ struct Build {
 }
 
 /// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. An
-/// unmetered build's compiled code is kept beside it (`cache`): the loads that follow read it
-/// back.
+/// loaded build's compiled code is kept in the host's private cache (`cache`): the loads that
+/// follow read it back.
 fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
     compile_build_with_shaders(dir, fuel, true)
 }
@@ -297,12 +297,11 @@ fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
 fn compile_build_with_shaders(dir: &Path, fuel: Option<u64>, shaders: bool) -> Result<Build> {
     let (manifest, wasm, shaders) = read_build(dir, shaders)?;
     let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
-    let beside = fuel.is_none().then_some(dir);
     // An optimized build keeps its trap locations beside its WASM; without them, a trap gives
     // its code offset.
     let sidecar = Path::new(&manifest.wasm).with_extension(wrela_abi::lines::SIDECAR);
     let sidecar = std::fs::read(dir.join(sidecar)).ok();
-    let compiled = program::compile_cached(&wasm, wasm_hash, beside, fuel, sidecar.as_deref())?;
+    let compiled = program::compile_cached(&wasm, fuel, sidecar.as_deref())?;
     Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
@@ -1083,7 +1082,7 @@ impl CpuBuild {
     }
 
     /// Loads the build in `dir`; its shaders must exist but aren't compiled. Its compiled code
-    /// is kept beside it, as a [`Host`]'s is.
+    /// is kept in the host's private cache, as a [`Host`]'s is.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {
         CpuBuild::load_compiled(dir.as_ref(), None)
     }
@@ -1099,8 +1098,7 @@ impl CpuBuild {
     /// [`CpuBuild::load`], with each call (`init`, a frame, a tick, an export) given `fuel`
     /// units of work (about one per WASM instruction): a call that does more traps, after the
     /// same work on every machine. For tests that run a program's frames, whose build is made
-    /// for the run: its compiled code isn't kept beside it, only in the directory every build
-    /// shares, if there is one (`WRELA_NATIVE_CACHE`).
+    /// for the run: its compiled code is kept in the host's private cache, if available.
     pub fn load_metered(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
         CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
     }
