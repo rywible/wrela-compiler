@@ -8,17 +8,25 @@
 // `nondet`, so `@deterministic` code does neither: an answer reaches the simulation only
 // through a tick's input.
 
-use std::abi::{REQUEST_FAILED, REQUEST_PENDING}
+use std::abi::{REQUEST_FAILED, REQUEST_MISSING, REQUEST_PENDING}
 
 /// Why a request failed.
 pub struct IoError: Clone {
     message: String,
+    missing: bool,
 }
 
 impl IoError {
     /// What the host said, in its words.
     pub fn message(self) -> borrow str {
         self.message
+    }
+
+    /// Whether it was a `load` of a path that holds nothing: nothing was ever stored there. Any
+    /// other failure (the storage couldn't be read) says nothing of what's stored, so a program
+    /// that would store over it waits, or asks again.
+    pub fn missing(self) -> bool {
+        self.missing
     }
 }
 
@@ -48,12 +56,14 @@ impl<T: Plain> Pending<T> {
             return None
         }
         self.done = true
-        if status == REQUEST_FAILED {
+        if status == REQUEST_FAILED || status == REQUEST_MISSING {
             // Forgets the request.
             let _gone: Vec<u8> = Vec::from_answer(self.request, 0)
-            return Some(
-                Err(IoError { message: String::from("the host couldn't answer the request") }),
-            )
+            let missing = status == REQUEST_MISSING
+            let message = if missing { "nothing is stored there" } else {
+                "the host couldn't answer the request"
+            }
+            return Some(Err(IoError { message: String::from(message), missing }))
         }
         Some(Ok(Vec::from_answer(self.request, u32(status))))
     }
@@ -98,7 +108,8 @@ fn check_path(what: Text, path: str) {
 }
 
 /// Reads the bytes stored at `path` in the program's storage: the host's files in the native
-/// host, the origin's private file system in a browser.
+/// host, the origin's private file system in a browser. If nothing is stored there, the answer is
+/// an error whose `missing` is true.
 pub fn load(path: str) -> Pending<u8> {
     check_path("load", path)
     let request = next_request()

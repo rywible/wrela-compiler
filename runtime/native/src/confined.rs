@@ -117,18 +117,28 @@ pub(crate) fn remove(_: &Dir, _: &str, _: bool) -> std::io::Result<()> {
 
 /// The bytes of the regular file at `path` in `dir`, at most `most`.
 pub(crate) fn read(dir: &Dir, path: &str, most: u64) -> Result<Vec<u8>, String> {
+    read_if_there(dir, path, most)?.ok_or_else(|| format!("`{path}`: nothing is there"))
+}
+
+/// The same, or `None` if nothing is at `path`: neither the file nor a directory on its way.
+pub(crate) fn read_if_there(dir: &Dir, path: &str, most: u64) -> Result<Option<Vec<u8>>, String> {
     let parts = parts(path)?;
     let (name, above) = parts.split_last().expect("a path has a part");
-    let at = open_dir(dir, above, false).map_err(|e| format!("`{path}`: {e}"))?;
-    let file = open_file(&at, name, false).map_err(|e| format!("`{path}`: {e}"))?;
+    let failed = |e: std::io::Error| format!("`{path}`: {e}");
+    let at = match open_dir(dir, above, false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        at => at.map_err(failed)?,
+    };
+    let file = match open_file(&at, name, false) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        file => file.map_err(failed)?,
+    };
     let mut bytes = Vec::new();
-    file.take(most.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("`{path}`: {e}"))?;
+    file.take(most.saturating_add(1)).read_to_end(&mut bytes).map_err(failed)?;
     if bytes.len() as u64 > most {
         return Err(format!("`{path}` is more than {most} bytes"));
     }
-    Ok(bytes)
+    Ok(Some(bytes))
 }
 
 /// Writes `bytes` as the whole regular file at `path` in `dir`, making the directories it needs.

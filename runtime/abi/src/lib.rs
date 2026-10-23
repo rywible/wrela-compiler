@@ -125,9 +125,11 @@ pub const AUDIO_SAMPLE_RATE: u32 = 48000;
 pub const AUDIO_QUANTUM: u32 = 128;
 /// The voice's channels: left, then right.
 pub const AUDIO_CHANNELS: u32 = 2;
-/// What `request_status` says of a request that isn't answered yet, and of one that failed.
+/// What `request_status` says of a request that isn't answered yet, of one that failed, and of a
+/// storage read of a path that holds nothing (nothing was stored there), which failed too.
 pub const REQUEST_PENDING: i32 = -1;
 pub const REQUEST_FAILED: i32 = -2;
+pub const REQUEST_MISSING: i32 = -3;
 
 /// A function the host gives a program, in [`IMPORT_MODULE`]: its name, and how many `i32`s it
 /// takes and gives.

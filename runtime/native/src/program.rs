@@ -27,7 +27,7 @@ use wrela_abi::{
     EXPORT_WORKER, HOST_FUNCTIONS, IMPORT_AUDIO, IMPORT_CLOCK, IMPORT_INPUT, IMPORT_KEEP,
     IMPORT_KEPT, IMPORT_LIMIT, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PAYLOAD, IMPORT_PHASE,
     IMPORT_PRINT, IMPORT_REQUEST_STATUS, IMPORT_REQUEST_TAKE, IMPORT_SUBMIT, IMPORT_TICK, Manifest,
-    REQUEST_FAILED, REQUEST_PENDING,
+    REQUEST_FAILED, REQUEST_MISSING, REQUEST_PENDING,
 };
 
 /// The process's one wasmtime engine: every program compiles and runs under it, as wasmtime
@@ -449,6 +449,8 @@ struct Requests {
     io: Io,
     answered: HashMap<u32, std::result::Result<Vec<u8>, String>>,
     arriving: Vec<(u32, std::result::Result<Vec<u8>, String>)>,
+    /// The storage reads among them that failed because their path holds nothing.
+    missing: HashSet<u32>,
     /// Requests the host answers after a call ([`Program::answer`]): another build's.
     waiting: Vec<u32>,
     /// IDs in this call's checked batches, before their requests are carried out.
@@ -498,17 +500,20 @@ impl Requests {
         }
     }
 
-    /// The bytes of the file `path` names: through `handle` if it's opened, else under `dir`.
+    /// The bytes of the file `path` names: through `handle` if it's opened, else under `dir`;
+    /// `None` if nothing is there.
     fn read(
         handle: &Option<Arc<cap_std::fs::Dir>>,
         dir: &Option<PathBuf>,
         path: &str,
         what: &str,
-    ) -> std::result::Result<Vec<u8>, String> {
+    ) -> std::result::Result<Option<Vec<u8>>, String> {
         match handle {
-            Some(handle) => crate::confined::read(handle, path, u64::MAX),
-            None => Self::file(dir, path, what)
-                .and_then(|f| std::fs::read(f).map_err(|e| e.to_string())),
+            Some(handle) => crate::confined::read_if_there(handle, path, u64::MAX),
+            None => Self::file(dir, path, what).and_then(|f| match std::fs::read(f) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                read => read.map(Some).map_err(|e| e.to_string()),
+            }),
         }
     }
 
@@ -517,7 +522,14 @@ impl Requests {
         let (request, answer) = match cmd {
             Command::StorageRead { request, path } => {
                 self.start(*request, cmd.opcode())?;
-                (*request, Self::read(&self.io.storage_dir, &self.io.storage, path, "storage"))
+                let read = Self::read(&self.io.storage_dir, &self.io.storage, path, "storage");
+                if let Ok(None) = read {
+                    self.missing.insert(*request);
+                }
+                (
+                    *request,
+                    read.and_then(|r| r.ok_or_else(|| format!("nothing is stored at `{path}`"))),
+                )
             }
             Command::StorageWrite { request, path, data } => {
                 self.start(*request, cmd.opcode())?;
@@ -535,7 +547,8 @@ impl Requests {
             Command::Fetch { request, url } => {
                 self.start(*request, cmd.opcode())?;
                 let what = "build to fetch from";
-                (*request, Self::read(&self.io.build_dir, &self.io.build, url, what))
+                let read = Self::read(&self.io.build_dir, &self.io.build, url, what);
+                (*request, read.and_then(|r| r.ok_or_else(|| format!("`{url}`: nothing is there"))))
             }
             Command::HostRequest { request, service, body } => {
                 self.start(*request, cmd.opcode())?;
@@ -2486,7 +2499,7 @@ fn limit<E: Executor>(
 }
 
 /// `wrela.request_status(request) -> i32`: -1 while the request is pending, -2 if it failed,
-/// else its answer's length in bytes.
+/// -3 if it was a storage read of a path that holds nothing, else its answer's length in bytes.
 fn request_status<E: Executor>(
     mut caller: wasmtime::Caller<'_, State<E>>,
     request: u32,
@@ -2495,6 +2508,7 @@ fn request_status<E: Executor>(
     check_started(state)?;
     Ok(match state.requests.answered.get(&request) {
         None => REQUEST_PENDING,
+        Some(Err(_)) if state.requests.missing.contains(&request) => REQUEST_MISSING,
         Some(Err(_)) => REQUEST_FAILED,
         Some(Ok(bytes)) => bytes.len() as i32,
     })
@@ -2519,6 +2533,7 @@ fn request_take<E: Executor>(
         ));
     }
     state.requests.answered.remove(&request);
+    state.requests.missing.remove(&request);
     Ok(())
 }
 

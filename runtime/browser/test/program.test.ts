@@ -835,6 +835,18 @@ describe("requests", () => {
     expect(p.call("status")).toBe(-1);
   });
 
+  test("a storage read of nothing stored says so, and other failures don't", async () => {
+    for (const [read, status] of [[async () => null, -3], [async () => Promise.reject(new Error("locked")), -2]] as const) {
+      const io = { fetch: async () => new Uint8Array(0), storageRead: read, storageWrite: async () => {}, post: async () => new Uint8Array(0) };
+      const p = await program(new Encoder().storageRead(4, "saves/slot1").finish(), { io });
+      p.call("ask");
+      await later();
+      expect(p.call("status")).toBe(status);
+      expect(p.call("take")).toBe(0);
+      expect(p.call("status")).toBe(-1);
+    }
+  });
+
   test("fail without a place to go, and a request number is used once at a time", async () => {
     const p = await program(new Encoder().storageRead(4, "saves/slot1").finish());
     p.call("ask");

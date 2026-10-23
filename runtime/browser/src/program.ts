@@ -59,6 +59,7 @@ import {
   TICK_RECORDS,
   PANIC_CAP,
   REQUEST_FAILED,
+  REQUEST_MISSING,
   REQUEST_PENDING,
 } from "./abi.gen.ts";
 import { type Checker, CommandError } from "./check.ts";
@@ -101,7 +102,8 @@ export interface Executor {
 /** Where a program's requests read and write: its storage (bytes at paths) and its build, and
  * where its posts go: the host that serves the build. */
 export interface Io {
-  storageRead(path: string): Promise<Bytes>;
+  /** The bytes stored at `path`, or null if nothing is stored there. */
+  storageRead(path: string): Promise<Bytes | null>;
   storageWrite(path: string, data: Bytes): Promise<void>;
   fetch(url: string): Promise<Bytes>;
   post(url: string, body: Bytes): Promise<Bytes>;
@@ -121,8 +123,9 @@ export interface Builds {
   handOver(path: string): Promise<void>;
 }
 
-/** An answer: the bytes, or why the request failed. */
-type Answer = { bytes: Bytes } | { error: string };
+/** An answer: the bytes, or why the request failed, and whether that was because a storage read's
+ * path holds nothing. */
+type Answer = { bytes: Bytes } | { error: string; missing?: true };
 
 /** The program's requests: in flight, arrived during or between calls (seen from the next
  * call), and answered but not taken. */
@@ -149,18 +152,18 @@ class Requests {
     this.#reserved.clear();
   }
 
-  /** Starts request `request`, whose answer `work` gives. */
-  start(op: OpcodeName, request: number, work: () => Promise<Bytes>): void {
+  /** Starts request `request`, whose answer `work` gives: null for a storage read of nothing. */
+  start(op: OpcodeName, request: number, work: () => Promise<Bytes | null>): void {
     this.#check(op, request);
     this.#inFlight.add(request);
-    let promise: Promise<Bytes>;
+    let promise: Promise<Bytes | null>;
     try {
       promise = work();
     } catch (e) {
       promise = Promise.reject(e);
     }
     promise.then(
-      (bytes) => this.#arrive(request, { bytes }),
+      (bytes) => this.#arrive(request, bytes === null ? { error: "nothing is stored there", missing: true } : { bytes }),
       (e: unknown) => this.#arrive(request, { error: errorMessage(e) }),
     );
   }
@@ -705,13 +708,14 @@ export class Program {
     }
   }
 
-  /** `wrela.request_status(request)`: -1 while it's pending, -2 if it failed, else its
-   * answer's length in bytes. */
+  /** `wrela.request_status(request)`: -1 while it's pending, -2 if it failed, -3 if it was a
+   * storage read of a path that holds nothing, else its answer's length in bytes. */
   #requestStatus(request: number): number {
     this.#starting();
     const a = this.#requests.answered.get(request);
     if (a === undefined) return REQUEST_PENDING;
-    return "error" in a ? REQUEST_FAILED : a.bytes.length;
+    if ("error" in a) return a.missing ? REQUEST_MISSING : REQUEST_FAILED;
+    return a.bytes.length;
   }
 
   /** `wrela.request_take(request, ptr)`: copies an answered request's bytes to `ptr`, and

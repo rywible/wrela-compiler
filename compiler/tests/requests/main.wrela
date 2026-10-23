@@ -1,6 +1,6 @@
 // Requests (compiler/tests/tests/suite/requests.rs): a readback of what a kernel wrote, a store
-// then a load of the program's storage, a fetch of a file of the build, and a fetch of one
-// that isn't there. Each is made on a fixed frame and polled on every frame after, so the
+// then a load of the program's storage, a load of a path nothing was stored at, a fetch of a
+// file of the build, and a fetch of one that isn't there. Each is made on a fixed frame and polled on every frame after, so the
 // commands the program submits don't depend on when answers arrive. Frame 40 writes the
 // answers into a buffer.
 use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, read, write}
@@ -12,7 +12,7 @@ fn squares(out: mut Slots<u32>, id: GlobalId) {
 }
 
 /// What each answer was: 0 while it hasn't come, 1 + what it held when it has, and 1 for
-/// failed.
+/// failed as expected: the load of nothing stored as `missing`, the missing fetch not.
 pub struct Requests {
     frame: u32,
     out: GpuBuffer<u32>,
@@ -22,11 +22,13 @@ pub struct Requests {
     loaded: Option<Pending<u8>>,
     fetched: Pending<u8>,
     missing: Pending<u8>,
+    nothing: Pending<u8>,
     readback_sum: u32,
     saved_ok: u32,
     loaded_sum: u32,
     fetched_sum: u32,
     missing_failed: u32,
+    nothing_stored: u32,
 }
 
 pub fn init() -> Requests {
@@ -36,17 +38,19 @@ pub fn init() -> Requests {
     Requests {
         frame: 0,
         out,
-        report: buffer(5),
+        report: buffer(6),
         readback,
         saved: store("saves/slot", [1, 2, 3, 4, 5]),
         loaded: None,
         fetched: fetch("data/level.bin"),
         missing: fetch("data/missing.bin"),
+        nothing: load("saves/none"),
         readback_sum: 0,
         saved_ok: 0,
         loaded_sum: 0,
         fetched_sum: 0,
         missing_failed: 0,
+        nothing_stored: 0,
     }
 }
 
@@ -90,8 +94,11 @@ pub fn frame(state: mut Requests, time: f32, width: u32, height: u32) {
     if let Some(Ok(bytes)) = state.fetched.poll() {
         state.fetched_sum = 1 + sum8(bytes)
     }
-    if let Some(Err(_)) = state.missing.poll() {
-        state.missing_failed = 1
+    if let Some(Err(e)) = state.missing.poll() {
+        state.missing_failed = if e.missing() { 0 } else { 1 }
+    }
+    if let Some(Err(e)) = state.nothing.poll() {
+        state.nothing_stored = if e.missing() { 1 } else { 0 }
     }
     // The answers, into a buffer on the last frame: the hosts' state hashes agree only if their
     // answers do.
@@ -102,16 +109,17 @@ pub fn frame(state: mut Requests, time: f32, width: u32, height: u32) {
             state.loaded_sum,
             state.fetched_sum,
             state.missing_failed,
+            state.nothing_stored,
         ]
         write(mut state.report, 0, answers)
     }
 }
 
-/// The answers, packed: readback, saved, loaded, fetched, missing.
+/// The answers, packed: readback; saved, missing and nothing stored; loaded; fetched.
 pub fn answers(state: Requests) -> vec4 {
     vec4(
         f32(state.readback_sum),
-        f32(state.saved_ok * 10 + state.missing_failed),
+        f32(state.saved_ok * 100 + state.missing_failed * 10 + state.nothing_stored),
         f32(state.loaded_sum),
         f32(state.fetched_sum),
     )
