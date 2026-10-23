@@ -139,6 +139,8 @@ pub struct Checker {
     scope: HashMap<u32, (bool, bool)>,
     /// An empty map for a new scope: the previous scope stays intact until the command passes.
     spare_scope: HashMap<u32, (bool, bool)>,
+    /// The uses a draw may change, kept for rollback and reused by the next command.
+    scope_undo: Vec<(u32, Option<(bool, bool)>)>,
     /// The open pass's attachments.
     attachments: Vec<u32>,
     /// Read-write buffers in this command: reused across draws and dispatches.
@@ -183,6 +185,7 @@ impl Checker {
             in_call: false,
             scope: HashMap::new(),
             spare_scope: HashMap::new(),
+            scope_undo: Vec::new(),
             attachments: Vec::new(),
             written: Vec::new(),
             targets: RenderTarget::default(),
@@ -246,11 +249,11 @@ impl Checker {
         }
         let pass_state =
             matches!(cmd, Command::BeginPass(_)).then(|| (self.attachments.clone(), self.targets));
-        let mut entries = Vec::new();
+        debug_assert!(self.scope_undo.is_empty());
         {
             let mut remember = |handle: u32| {
-                if !entries.iter().any(|(h, _)| *h == handle) {
-                    entries.push((handle, self.scope.get(&handle).copied()));
+                if !self.scope_undo.iter().any(|(h, _)| *h == handle) {
+                    self.scope_undo.push((handle, self.scope.get(&handle).copied()));
                 }
             };
             match cmd {
@@ -280,7 +283,7 @@ impl Checker {
             if whole_scope {
                 std::mem::swap(&mut self.scope, &mut self.spare_scope);
             } else {
-                for (handle, used) in entries {
+                for (handle, used) in self.scope_undo.drain(..) {
                     match used {
                         Some(used) => {
                             self.scope.insert(handle, used);
@@ -299,6 +302,7 @@ impl Checker {
         if whole_scope {
             self.spare_scope.clear();
         }
+        self.scope_undo.clear();
         result
     }
 
@@ -1097,6 +1101,45 @@ mod tests {
         checker.check(&dispatch([1; 3], 2, 1)).expect("the next dispatch can reverse uses");
         assert_eq!(checker.scope.get(&1), Some(&(false, true)));
         assert_eq!(checker.scope.get(&2), Some(&(true, false)));
+    }
+
+    #[test]
+    fn draw_rollback_storage_is_reused_across_successes_and_failures() {
+        let mut checker = Checker::new(&crate::vectors::check_manifest());
+        for handle in 1..=3 {
+            checker.check(&Command::CreateBuffer { handle, size: 64 }).expect("buffer");
+        }
+        let bad = Command::Draw {
+            pipeline: 0,
+            vertices: 3,
+            instances: 1,
+            bindings: vec![Binding::range(3, 0, 64), Binding::range(99, 0, 64)],
+            uniforms: &[0; 16],
+        };
+        let good = Command::Draw {
+            pipeline: 2,
+            vertices: 3,
+            instances: 1,
+            bindings: vec![Binding::range(3, 0, 64), Binding::range(2, 0, 64)],
+            uniforms: &[0; 16],
+        };
+        let mut storage = None;
+        for _ in 0..8 {
+            checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("pass");
+            assert!(checker.check(&bad).is_err());
+            assert!(checker.scope.is_empty(), "a partial failed draw leaves no uses");
+            assert!(checker.scope_undo.is_empty());
+            let allocation = checker.scope_undo.as_ptr();
+            assert_eq!(*storage.get_or_insert(allocation), allocation);
+            checker.check(&good).expect("failed draw's read-only use was removed");
+            let scope = checker.scope.clone();
+            assert!(checker.check(&bad).is_err());
+            assert_eq!(checker.scope, scope, "failed draws preserve preceding valid uses");
+            checker.check(&good).expect("valid draw after failure");
+            assert!(checker.scope_undo.is_empty());
+            assert_eq!(checker.scope_undo.as_ptr(), allocation);
+            checker.check(&Command::Present).expect("end pass");
+        }
     }
 
     #[test]

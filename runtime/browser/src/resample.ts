@@ -38,6 +38,7 @@ export class Resampler {
   /** The events a frame at `now` gets of `events`, those read since the last frame, written at
    * `times` (ms, on `now`'s clock). */
   take(events: Uint8Array, times: readonly number[], now: number): Uint8Array {
+    if (events.length === 0 && this.#buttons === 0) return events;
     const view = new DataView(events.buffer, events.byteOffset, events.byteLength);
     const out: Uint8Array[] = [];
     let stepped = false;

@@ -127,6 +127,31 @@ test("rejected indexed draws restore new binding and index uses", () => {
   expect(() => checker.check(draw(2, 1))).toThrow("buffer 2 is used both read-only and read-write in one pass");
 });
 
+test("draw rollback scratch preserves uses across successes, failures and passes", () => {
+  const checker = new Checker(shapes());
+  for (const handle of [1, 2, 3, 4, 5]) checker.check({ op: "CreateBuffer", handle, size: 64 });
+  const binding = (handle: number): Binding => ({ handle, offset: 0, size: 64 });
+  const draw = (a: number, b: number): Command => ({
+    op: "Draw", pipeline: 0, vertices: 3, instances: 1,
+    bindings: [binding(a), binding(b)], uniforms: new Uint8Array(16),
+  });
+  for (const [a, b, c, d] of [[1, 2, 3, 4], [2, 1, 4, 3], [1, 2, 3, 4]] as const) {
+    checker.check({ op: "BeginScreenPass", clear: [0, 0, 0, 1] });
+    checker.check(draw(a, b));
+    expect(() => checker.check({
+      op: "DrawIndirect", pipeline: 0, arguments: 5, offset: 64,
+      bindings: [binding(c), binding(d)], uniforms: new Uint8Array(16),
+    })).toThrow("reading arguments: 16 bytes at offset 64 overruns buffer 5");
+    // The failed draw's new uses go; the successful draws' uses stay after later failures.
+    checker.check(draw(d, c));
+    expect(() => checker.check(draw(b, a))).toThrow(`buffer ${b} is used both read-only and read-write in one pass`);
+    expect(() => checker.check(draw(c, d))).toThrow(`buffer ${c} is used both read-only and read-write in one pass`);
+    expect(() => checker.check(draw(a, b))).not.toThrow();
+    expect(() => checker.check(draw(d, c))).not.toThrow();
+    checker.check({ op: "Present" });
+  }
+});
+
 test("a screen pass requires its depth target to fit the frame", () => {
   const checker = new Checker(shapes());
   checker.setScreenSize(640, 360);

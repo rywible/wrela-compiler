@@ -504,8 +504,8 @@ fn elide(s: &Source, span: Span, holes: &[Span]) -> String {
 fn doc_comments(s: &Source, start: u32) -> Vec<&str> {
     let mut lines = Vec::new();
     let mut end = start as usize;
-    let before = s.parsed.comments.iter().rev().filter(|c| (c.span.end as usize) <= start as usize);
-    for c in before {
+    let before = s.parsed.comments.partition_point(|c| c.span.end <= start);
+    for c in s.parsed.comments[..before].iter().rev() {
         let between = &s.text[c.span.end as usize..end];
         let gap_ok = between.trim().is_empty() && between.matches('\n').count() <= 1;
         if !c.doc || !c.own_line || !gap_ok {
@@ -555,6 +555,36 @@ fn intro(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn docs_keep_only_adjacent_preceding_comments() {
+        let text = concat!(
+            "pub fn before() {}\n\n",
+            "/// First line.\n/// Second line.\npub fn documented() {}\n\n",
+            "/// On an attribute.\n@test\npub fn attributed() {}\n\n",
+            "/// Detached.\n\npub fn detached() {}\n\n",
+            "/// Interrupted.\n// An ordinary comment.\npub fn interrupted() {}\n\n",
+            "/// Later.\npub fn later() {}\n",
+        );
+        let s = Source {
+            module: vec!["test".into()],
+            name: "test.wrela".into(),
+            file: "test.wrela".into(),
+            text: text.into(),
+            parsed: wrela_syntax::parse(FileId(0), text),
+        };
+        assert!(!wrela_diag::has_errors(&s.parsed.diagnostics));
+        for (at, expected) in [
+            ("pub fn before", ""),
+            ("pub fn documented", "First line.\nSecond line."),
+            ("@test", "On an attribute."),
+            ("pub fn detached", ""),
+            ("pub fn interrupted", ""),
+            ("pub fn later", "Later."),
+        ] {
+            assert_eq!(doc_before(&s, text.find(at).expect("item") as u32), expected, "{at}");
+        }
+    }
 
     #[test]
     fn an_intro_keeps_its_lines_and_a_summary_is_its_first_sentence() {

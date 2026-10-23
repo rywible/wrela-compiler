@@ -91,6 +91,8 @@ export class Checker {
   #scope = new Map<number, number>();
   /** An empty map for the next fresh scope; a rejected command restores the current one. */
   #spareScope = new Map<number, number>();
+  /** A draw's prior uses, reused and cleared after each check, whether it passes or fails. */
+  readonly #beforeDraw = new Map<number, number | undefined>();
   /** Read-write buffers in this command, reused across draws and dispatches. */
   readonly #written: number[] = [];
   /** The open pass's attachments. */
@@ -184,14 +186,10 @@ export class Checker {
       return;
     }
     // A draw can only change the entries it names, so keep only those prior uses.
-    const entries = new Map<number, number | undefined>();
-    const remember = (handle: number) => {
-      if (entries.has(handle)) return;
-      entries.set(handle, this.#scope.get(handle));
-    };
-    for (const binding of cmd.bindings) remember(binding.handle);
-    if (cmd.op !== "Draw") remember(cmd.arguments);
-    if (cmd.op === "DrawIndexedIndirect") remember(cmd.indices);
+    const entries = this.#beforeDraw;
+    for (const binding of cmd.bindings) this.#rememberUse(binding.handle);
+    if (cmd.op !== "Draw") this.#rememberUse(cmd.arguments);
+    if (cmd.op === "DrawIndexedIndirect") this.#rememberUse(cmd.indices);
     try {
       this.#check(cmd);
     } catch (e) {
@@ -200,7 +198,13 @@ export class Checker {
         else this.#scope.set(handle, used);
       }
       throw e;
+    } finally {
+      entries.clear();
     }
+  }
+
+  #rememberUse(handle: number): void {
+    if (!this.#beforeDraw.has(handle)) this.#beforeDraw.set(handle, this.#scope.get(handle));
   }
 
   #check(cmd: Command): void {

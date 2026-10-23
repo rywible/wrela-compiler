@@ -74,8 +74,15 @@ impl Env {
 
     /// Forgets the names declared after the first `len`, and gives them back in order.
     fn split_off(&mut self, len: usize) -> Vec<(String, LocalId)> {
-        let gone = self.names[len..].to_vec();
-        self.truncate(len);
+        let gone = self.names.split_off(len);
+        for (name, _) in &gone {
+            if let Some(ids) = self.by_name.get_mut(name) {
+                ids.pop();
+                if ids.is_empty() {
+                    self.by_name.remove(name);
+                }
+            }
+        }
         gone
     }
 
@@ -1599,4 +1606,43 @@ fn check_const(p: &Program, consts: &ConstTypes, id: ConstId) -> (TyId, Body, Ve
         c.expect(e.ty, ret, e.span);
     }
     zonk::finish_const(c, e, ret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn environment_removal_restores_shadowed_names() {
+        let mut env = Env::default();
+        env.push("x", LocalId(0));
+        env.push("x", LocalId(1));
+        env.push("y", LocalId(2));
+        env.push("x", LocalId(3));
+        env.push("y", LocalId(4));
+        assert_eq!(env.lookup("x"), Some(LocalId(3)));
+        assert_eq!(env.lookup("y"), Some(LocalId(4)));
+
+        let removed = env.split_off(2);
+        assert_eq!(
+            removed,
+            vec![("y".into(), LocalId(2)), ("x".into(), LocalId(3)), ("y".into(), LocalId(4))]
+        );
+        assert_eq!(env.lookup("x"), Some(LocalId(1)));
+        assert_eq!(env.lookup("y"), None);
+        assert!(!env.by_name.contains_key("y"));
+        assert!(env.split_off(env.len()).is_empty());
+
+        for (name, id) in removed {
+            env.push(&name, id);
+        }
+        assert_eq!(env.lookup("x"), Some(LocalId(3)));
+        assert_eq!(env.lookup("y"), Some(LocalId(4)));
+        env.truncate(1);
+        assert_eq!(env.lookup("x"), Some(LocalId(0)));
+        assert_eq!(env.lookup("y"), None);
+        env.truncate(0);
+        assert!(env.names.is_empty());
+        assert!(env.by_name.is_empty());
+    }
 }

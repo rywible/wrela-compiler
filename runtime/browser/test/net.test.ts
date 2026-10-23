@@ -50,6 +50,45 @@ describe("frames", () => {
     }
   });
 
+  test("a largest frame can arrive one byte at a time", () => {
+    const payload = Uint8Array.from({ length: MAX_FRAME }, (_, i) => (37 * i + 11) & 255);
+    const bytes = frame(payload);
+    const f = new Frames();
+    const got: Uint8Array[] = [];
+    for (let i = 0; i < bytes.length; i++) got.push(...f.push(bytes.subarray(i, i + 1)));
+    expect(got).toEqual([payload]);
+  });
+
+  test("frames own their bytes while chunks and later frames change", () => {
+    const f = new Frames();
+    const first = Uint8Array.of(3, 7);
+    expect(f.push(first)).toEqual([]);
+    first.fill(0);
+    // Finish the first body, then begin a second in the same chunk.
+    const next = Uint8Array.of(8, 9, 2, 4);
+    const got = f.push(next);
+    next.fill(0);
+    expect(got).toEqual([Uint8Array.of(7, 8, 9)]);
+    expect(f.push(Uint8Array.of(5, 0, 1, 6))).toEqual([Uint8Array.of(4, 5), new Uint8Array(0), Uint8Array.of(6)]);
+    expect(got).toEqual([Uint8Array.of(7, 8, 9)]);
+    const whole = frame(Uint8Array.of(10, 11));
+    const complete = f.push(whole);
+    whole.fill(0);
+    expect(complete).toEqual([Uint8Array.of(10, 11)]);
+  });
+
+  test("split invalid lengths are refused before their body arrives", () => {
+    const large = new Frames();
+    const prefix = frame(new Uint8Array(MAX_FRAME + 1)).subarray(0, 3);
+    expect(large.push(prefix.subarray(0, 1))).toEqual([]);
+    expect(large.push(prefix.subarray(1, 2))).toEqual([]);
+    expect(() => large.push(prefix.subarray(2))).toThrow("past 65536");
+    const long = new Frames();
+    expect(long.push(Uint8Array.of(128))).toEqual([]);
+    expect(long.push(Uint8Array.of(128))).toEqual([]);
+    expect(() => long.push(Uint8Array.of(128))).toThrow("isn't a varint of at most three bytes");
+  });
+
   test("past the largest, or with a length too long, are refused", () => {
     expect(() => new Frames().push(frame(new Uint8Array(MAX_FRAME + 1)).subarray(0, 3))).toThrow("past 65536");
     expect(() => new Frames().push(Uint8Array.of(128, 128, 128, 1))).toThrow("isn't a varint of at most three bytes");
@@ -57,6 +96,19 @@ describe("frames", () => {
 });
 
 describe("connections", () => {
+  test("empty deliveries keep their queue and later arrivals are delivered once", () => {
+    const net = new Net(() => "https://site.example/game/", () => {});
+    const inbox = new Inbox();
+    const empty = net.arrived;
+    net.deliver(inbox);
+    expect(net.arrived).toBe(empty);
+    expect(inbox.length).toBe(0);
+    net.arrived.push({ conn: 4, open: true });
+    net.deliver(inbox);
+    net.deliver(inbox);
+    expect(inbox.events.map((e) => [word(e, 0), word(e, 2), word(e, 3)])).toEqual([[14, 4, 1]]);
+  });
+
   test("a room's name is plain", () => {
     expect(roomName("board-7f3a_1")).toBe(true);
     for (const bad of ["", "../etc", "Big", "a".repeat(65)]) expect(roomName(bad)).toBe(false);
