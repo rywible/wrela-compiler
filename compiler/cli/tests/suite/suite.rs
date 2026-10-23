@@ -122,9 +122,10 @@ fn the_suite_runs_every_check_and_every_kind_of_test() {
         "ok wrela::gpu::squares_come_back (",
         "ok wrela::gpu::the_ramp_is_its_golden (",
         "ok wrela::gpu::the_ramp_target_is_its_golden (",
+        "ok wrela::gpu::both_hosts_draw_the_same_frame (",
         "ok wrela::lib:: in",
         "ok wrela::gpu:: in",
-        "6 checks passed, with 7 tests",
+        "6 checks passed, with 8 tests",
         "all checks passed in",
     ] {
         assert!(out.contains(line), "`{line}` in:\n{out}");

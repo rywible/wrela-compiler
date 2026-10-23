@@ -101,7 +101,7 @@ pub fn run(
         let run = attrs.test_run.unwrap_or(TestRun::Frames(1));
         let ticks = matches!(run, TestRun::Ticks(_));
         let input = match &attrs.test_input {
-            None => Input::Script(Vec::new()),
+            None => Input::Script(Vec::new(), "[]".to_string()),
             Some((input, span)) => match input_of(checked, data, root, input, ticks, reach) {
                 Ok(s) => s,
                 Err((shown, why)) => {
@@ -118,9 +118,11 @@ pub fn run(
         };
         let storage = dir.0.join(format!("storage.{i}"));
         let (ran, traced) = match (attrs.test_gpu, run, &input) {
-            (true, TestRun::Frames(n), Input::Script(script)) => {
+            (true, TestRun::Frames(n), Input::Script(script, json)) => {
                 let golden = attrs.test_golden.as_ref().map(|g| (g, root, bless, reach));
-                run_gpu(&mut gpu, &dir.0, &storage, i, n, script, &attrs.test_hold, golden)
+                let both = attrs.test_both.then_some(json.as_str());
+                let given = Given { script, hold: &attrs.test_hold, both };
+                run_gpu(&mut gpu, &dir.0, &storage, i, n, given, golden)
             }
             _ => run_one(&built, &storage, i, run, &input, &attrs.test_hold),
         };
@@ -192,10 +194,20 @@ fn failed(
     Some(Failed { why: Why::Host(error), fault, phase })
 }
 
-/// What a test's runs get: a script of input events, or (a tick test) a tick log.
+/// What a test's runs get: a script of input events (and its JSON, runtime/abi `input`'s, for
+/// Chrome), or (a tick test) a tick log.
 enum Input {
-    Script(Vec<wrela_host::Scripted>),
+    Script(Vec<wrela_host::Scripted>, String),
     Log(wrela_host::TickLog),
+}
+
+/// What a GPU frame test's frames get: its script's events, the paths it holds until a frame,
+/// and with `hosts: both`, the script's JSON for Chrome's run.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+struct Given<'a> {
+    script: &'a [wrela_host::Scripted],
+    hold: &'a [(String, u32)],
+    both: Option<&'a str>,
 }
 
 /// A test's input (a tick test's, with `ticks`): a `Script` constant's computed value, or the
@@ -223,7 +235,7 @@ fn input_of(
                 let why = "has events at frames, and a tick test runs no frames: start it with `Script::ticks()`";
                 return Err((shown, why.into()));
             }
-            Ok(Input::Script(script))
+            Ok(Input::Script(script, json))
         }
         // Names resolve as the program is checked: one that didn't was reported then.
         TestInput::Named(_) => Err(("name".into(), "names no constant".into())),
@@ -256,7 +268,8 @@ fn read_input(
         return Ok(Input::Log(log));
     }
     let text = String::from_utf8(bytes).map_err(|_| "isn't UTF-8".to_string())?;
-    wrela_host::parse_script(&text).map(Input::Script).map_err(|e| format!("isn't a script: {e}"))
+    let script = wrela_host::parse_script(&text).map_err(|e| format!("isn't a script: {e}"))?;
+    Ok(Input::Script(script, text))
 }
 
 /// A GPU frame test's golden, with the package's root, whether to bless it, and where it may be
@@ -277,15 +290,13 @@ struct GpuHost(#[cfg(feature = "gpu")] Option<wrela_host::Host>);
 /// With a golden (and the package's root, and whether to bless it), the screen after the
 /// frames is compared with it.
 #[cfg(feature = "gpu")]
-#[allow(clippy::too_many_arguments)]
 fn run_gpu(
     gpu: &mut GpuHost,
     dir: &Path,
     storage: &Path,
     i: usize,
     frames: u32,
-    script: &[wrela_host::Scripted],
-    hold: &[(String, u32)],
+    given: Given,
     golden: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
@@ -304,7 +315,7 @@ fn run_gpu(
         Ok(h) => h,
         Err(e) => return (failed(e, None, "as it started".to_string()), Default::default()),
     };
-    let ran = run_gpu_frames(&mut host, i, frames, script, hold, golden);
+    let ran = run_gpu_frames(&mut host, dir, i, frames, &given, golden);
     let traced = host.trace().take();
     if ran.is_none() {
         gpu.0 = Some(host);
@@ -316,12 +327,13 @@ fn run_gpu(
 #[cfg(feature = "gpu")]
 fn run_gpu_frames(
     host: &mut wrela_host::Host,
+    dir: &Path,
     i: usize,
     frames: u32,
-    script: &[wrela_host::Scripted],
-    hold: &[(String, u32)],
+    given: &Given,
     golden: Option<GoldenAt>,
 ) -> Option<Failed> {
+    let Given { script, hold, both } = *given;
     for (path, _) in hold {
         host.hold(path);
     }
@@ -347,6 +359,13 @@ fn run_gpu_frames(
             Err(e) => return failed(e, None, after),
         };
         if let Err(why) = against_golden(g, root, (w, h, &image), bless, reach) {
+            return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
+        }
+    }
+    if let Some(json) = both {
+        let after = format!("after {frames} frames");
+        let within = golden.map_or(wrela_sema::defs::GOLDEN_WITHIN, |g| g.0.within);
+        if let Err(why) = against_chrome(host, dir, frames, json, within) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
     }
@@ -443,6 +462,57 @@ fn shown_beside(
     }
 }
 
+/// The native host's last frame and state hash after `frames` frames against Chrome's: the
+/// same build (in `dir`) run in headless Chrome's test mode with the same frames, screen, rate,
+/// one worker and the script `json`, whose state hash must be the same and whose last frame
+/// must be within `within` (a mean difference in 8-bit steps) of the native host's (§13,
+/// `hosts: both`).
+#[cfg(feature = "gpu")]
+fn against_chrome(
+    host: &mut wrela_host::Host,
+    dir: &Path,
+    frames: u32,
+    json: &str,
+    within: f64,
+) -> Result<(), String> {
+    let screen = host.read_screen().map_err(|e| e.to_string())?;
+    let hash = format!("{:016x}", host.hash());
+    let (Some(root), Some(page)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
+        return Err("its build has no directory Chrome can serve".into());
+    };
+    std::fs::write(dir.join("input.json"), json).map_err(|e| format!("its script: {e}"))?;
+    let fragment = format!(
+        "#test&frames={frames}&width={WIDTH}&height={HEIGHT}&fps={FPS}&workers=1&input=input.json"
+    );
+    let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / FPS * 3.0).max(120.0));
+    wrela_host::pages::run(wrela_host::pages::Page {
+        root,
+        page,
+        fragment: &fragment,
+        timeout,
+        script: None,
+    })
+    .map_err(|why| format!("Chrome's run failed: {why}"))?;
+    let results = dir.join("results");
+    let read = |name: &str| {
+        std::fs::read(results.join(name)).map_err(|e| format!("Chrome's `{name}`: {e}"))
+    };
+    let chrome_hash = String::from_utf8_lossy(&read("hash.txt")?).trim().to_string();
+    if chrome_hash != hash {
+        return Err(format!(
+            "Chrome's state hash is {chrome_hash}, and the native host's {hash}: the hosts submitted different commands"
+        ));
+    }
+    let d = wrela_host::image::compare(&screen, &read("frame.rgba")?)?;
+    if d.mean > within {
+        return Err(format!(
+            "Chrome's last frame is {:.3}/255 from the native host's on average, more than the {within} it may be (a channel differs by {}/255 at most; {} of {} channels differ)",
+            d.mean, d.max, d.differing, d.channels
+        ));
+    }
+    Ok(())
+}
+
 /// A golden's path inside the package, with no symbolic link through which reading or blessing
 /// it could escape. The package root itself may have been named through a link.
 #[cfg(any(feature = "gpu", test))]
@@ -469,8 +539,7 @@ fn run_gpu(
     _: &Path,
     _: usize,
     _: u32,
-    _: &[wrela_host::Scripted],
-    _: &[(String, u32)],
+    _: Given,
     _: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
@@ -514,7 +583,7 @@ fn run_on(
 ) -> Option<Failed> {
     let (log, script): (_, &[wrela_host::Scripted]) = match input {
         Input::Log(log) => (Some(log), &[]),
-        Input::Script(s) => (None, s),
+        Input::Script(s, _) => (None, s),
     };
     host.want_hashes(log.is_some());
     for (path, _) in hold {

@@ -654,8 +654,9 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
 /// kernel square numbers and reads them back between frames; one test finds the squares, and
 /// one that expects a wrong square fails with the values it compared. Its frames draw a ramp:
 /// the screen is within its golden, and far from a black one (the failure writes what it saw
-/// and how far beside the package's build); and the ramp's float target, named by its pass's
-/// label, is within a golden of its own.
+/// and how far beside the package's build); the ramp's float target, named by its pass's
+/// label, is within a golden of its own; and Chrome, running the same frames, ends on the same
+/// state hash and frame.
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
@@ -671,6 +672,7 @@ fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
             ("the_ramp_is_its_golden", true),
             ("a_ramp_is_not_black", false),
             ("the_ramp_target_is_its_golden", true),
+            ("both_hosts_draw_the_same_frame", true),
         ]
     );
     let why =

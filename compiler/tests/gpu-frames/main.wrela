@@ -3,7 +3,8 @@
 // tests check it. Each frame draws a ramp on the screen, which two tests compare with a golden
 // PNG, and into a float target in a pass labelled `ramp target`, which a test compares with a
 // golden of that pass. `squares_come_back`, `the_ramp_is_its_golden` and
-// `the_ramp_target_is_its_golden` pass; `a_wrong_square_fails` and `a_ramp_is_not_black` fail,
+// `the_ramp_target_is_its_golden` pass, as does `both_hosts_draw_the_same_frame`, whose frames run in
+// Chrome too; `a_wrong_square_fails` and `a_ramp_is_not_black` fail,
 // as a test that finds a mistake should (compiler/tests/tests/suite/test_items.rs).
 use std::gpu::{
     ClipPosition, FragCoord, GlobalId, GpuBuffer, Rgba16Float, Slots, Texture, VertexIndex,
@@ -96,3 +97,6 @@ fn a_ramp_is_not_black(s: State) {}
 
 @test(frames: 2, gpu: true, golden: "goldens/ramp-target.png", pass: "ramp target")
 fn the_ramp_target_is_its_golden(s: State) {}
+
+@test(frames: 3, gpu: true, hosts: both)
+fn both_hosts_draw_the_same_frame(s: State) {}

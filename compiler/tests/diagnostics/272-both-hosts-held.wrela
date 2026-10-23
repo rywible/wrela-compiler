@@ -1,0 +1,15 @@
+// mistake: both hosts asked of a test that holds a request, which the browser can't hold
+// expect: E0222
+// fix: no
+pub struct S {
+    n: u32,
+}
+
+pub fn init() -> S {
+    S { n: 0 }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {}
+
+@test(frames: 4, gpu: true, hosts: both, hold: [("data.bin", 2)])
+fn late() {}

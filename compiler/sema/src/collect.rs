@@ -833,13 +833,13 @@ impl<'d, 'u> Collector<'d, 'u> {
                             out.test_tool = self.tool_test(a, args);
                         }
                         Some(args) => {
-                            (
-                                out.test_run,
-                                out.test_input,
-                                out.test_gpu,
-                                out.test_golden,
-                                out.test_hold,
-                            ) = self.test_run(a, args);
+                            let t = self.test_run(a, args);
+                            out.test_run = t.run;
+                            out.test_input = t.input;
+                            out.test_gpu = t.gpu;
+                            out.test_golden = t.golden;
+                            out.test_hold = t.hold;
+                            out.test_both = t.both;
                         }
                         None => {}
                     }
@@ -1189,20 +1189,22 @@ impl<'d, 'u> Collector<'d, 'u> {
     /// mean difference; and with `hold: [("path", k), ...]` on frames, the paths whose fetches
     /// and storage reads wait until frame `k` begins.
     /// Anything else is E0222.
-    #[allow(clippy::type_complexity)]
-    fn test_run(
-        &mut self,
-        a: &ast::Attribute,
-        args: &[ast::Arg],
-    ) -> (Option<TestRun>, Option<(TestInput, Span)>, bool, Option<Golden>, Vec<(String, u32)>)
-    {
+    fn test_run(&mut self, a: &ast::Attribute, args: &[ast::Arg]) -> FrameTest {
         let named =
             |name: &str| args.iter().find(|x| x.name.as_ref().is_some_and(|n| n.name == name));
         let others = args.iter().any(|x| {
             !x.name.as_ref().is_some_and(|n| {
                 matches!(
                     n.name.as_str(),
-                    "frames" | "ticks" | "input" | "gpu" | "golden" | "within" | "pass" | "hold"
+                    "frames"
+                        | "ticks"
+                        | "input"
+                        | "gpu"
+                        | "golden"
+                        | "within"
+                        | "pass"
+                        | "hold"
+                        | "hosts"
                 )
             })
         });
@@ -1281,11 +1283,24 @@ impl<'d, 'u> Collector<'d, 'u> {
                 .ok_or(()),
             Some(_) => Err(()),
         };
-        match (n, input, gpu, golden, hold) {
-            (Some(n), Ok(input), Ok(gpu), Ok(golden), Ok(hold)) if !others => {
+        // `hosts: both` on GPU frames that hold nothing (the browser holds no request).
+        let both = match named("hosts").map(|x| &x.value.kind) {
+            None => Ok(false),
+            Some(ast::ExprKind::Path(p))
+                if p.is_single()
+                    && p.segments[0].ident.name == "both"
+                    && gpu == Ok(true)
+                    && named("hold").is_none() =>
+            {
+                Ok(true)
+            }
+            Some(_) => Err(()),
+        };
+        match (n, input, gpu, golden, hold, both) {
+            (Some(n), Ok(input), Ok(gpu), Ok(golden), Ok(hold), Ok(both)) if !others => {
                 let n = n as u32;
                 let run = if frames { TestRun::Frames(n) } else { TestRun::Ticks(n) };
-                (Some(run), input, gpu, golden, hold)
+                FrameTest { run: Some(run), input, gpu, golden, hold, both }
             }
             _ => {
                 self.diags.push(
@@ -1294,9 +1309,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead); `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
                 );
-                (None, None, false, None, Vec::new())
+                FrameTest::default()
             }
         }
     }
@@ -3845,6 +3860,17 @@ fn is_job(p: &Program, t: TyId) -> bool {
 const INPUT_NOTE: &str = "a test's input is a `std::input::Script` constant (`input: SCRIPT`), or a file in the package (`input: \"path\"`): a script in runtime/abi `input`'s format, or with `ticks` a tick log";
 
 /// The text of `e`, a string literal.
+/// A frame or tick test's options, as `@test(frames: n, ...)` gives them (`test_run`).
+#[derive(Default)]
+struct FrameTest {
+    run: Option<TestRun>,
+    input: Option<(TestInput, Span)>,
+    gpu: bool,
+    golden: Option<Golden>,
+    hold: Vec<(String, u32)>,
+    both: bool,
+}
+
 fn str_lit(e: &ast::Expr) -> Option<String> {
     match &e.kind {
         ast::ExprKind::Lit(l) if l.kind == ast::LitKind::Str => {
