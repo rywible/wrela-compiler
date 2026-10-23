@@ -904,18 +904,67 @@ impl Caps {
     }
 
     /// Writes the whole file at `path` from `write`, which is given the file to write to, making
-    /// the directories it needs.
+    /// the directories it needs. The bytes go to a new file beside it, which then takes its
+    /// place with the old one's permissions, so a reader sees the old file or the whole new one,
+    /// and a write that fails leaves the old one. A link at `path` is written through, in place:
+    /// a new file in its place would replace the link.
     pub(crate) fn write_with(
         &self,
         path: &str,
         write: impl FnOnce(&mut dyn std::io::Write) -> std::io::Result<()>,
     ) -> Result<(), String> {
         let (dir, rel) = self.file(path, true)?;
-        if let Some((parent, _)) = rel.rsplit_once('/') {
+        let (parent, name) = match rel.rsplit_once('/') {
+            Some((parent, name)) => (Some(parent), name),
+            None => (None, rel),
+        };
+        if let Some(parent) = parent {
             dir.create_dir_all(parent).map_err(|e| failed(path, e))?;
         }
-        let mut file = open_file(dir, rel, path, true)?;
-        write(&mut file).map_err(|e| failed(path, e))
+        let there = match dir.symlink_metadata(rel) {
+            Ok(meta) => Some(meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(failed(path, e)),
+        };
+        if there.as_ref().is_some_and(|m| m.is_symlink()) {
+            let mut file = open_file(dir, rel, path, true)?;
+            return write(&mut file).map_err(|e| failed(path, e));
+        }
+        // What's there is checked as a write in place would check it: a regular file, with no
+        // other names.
+        let permissions = match &there {
+            Some(meta) => {
+                let file = open_file(dir, rel, path, false)?;
+                if crate::confined::linked_elsewhere(&file) {
+                    return Err(format!(
+                        "`{path}` has other names (hard links), so it isn't written"
+                    ));
+                }
+                Some(meta.permissions())
+            }
+            None => None,
+        };
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp_name = format!(".{name}.tmp-{}-{n}", std::process::id());
+        let tmp = match parent {
+            Some(parent) => format!("{parent}/{tmp_name}"),
+            None => tmp_name,
+        };
+        let written = (|| {
+            let mut file = dir.open_with(&tmp, OpenOptions::new().write(true).create_new(true))?;
+            if let Some(p) = permissions {
+                file.set_permissions(p)?;
+            }
+            write(&mut file)?;
+            file.sync_all()?;
+            dir.rename(&tmp, dir, rel)
+        })()
+        .map_err(|e| failed(path, e));
+        if written.is_err() {
+            let _ = dir.remove_file(&tmp);
+        }
+        written
     }
 }
 
@@ -989,5 +1038,55 @@ mod tests {
         assert!(Caps::open(&missing, |_| Some("/nowhere".into())).is_err(), "not on PATH");
         let tool = Grants::default().program("t", ProgramGrant::Tool(PathBuf::from("/")));
         assert!(Caps::open(&tool, |_| None).unwrap_err().contains("nothing here runs one"));
+    }
+
+    #[test]
+    fn a_write_replaces_the_file_whole_or_leaves_it_as_it_was() {
+        let dir = scratch("replace");
+        let caps = Caps::open(&Grants::default().root("w", &dir, true), |_| None).expect("opened");
+        caps.write("w/sub/a.txt", b"old").expect("made, with its directory");
+        // A write that fails part way leaves the old bytes, and nothing beside them.
+        let failed = caps.write_with("w/sub/a.txt", |f| {
+            f.write_all(b"half")?;
+            Err(std::io::Error::other("the disk is full"))
+        });
+        assert!(failed.expect_err("it failed").contains("the disk is full"));
+        assert_eq!(std::fs::read(dir.join("sub/a.txt")).expect("read"), b"old");
+        let names: Vec<_> = std::fs::read_dir(dir.join("sub")).expect("list").collect();
+        assert_eq!(names.len(), 1, "no new file left beside it");
+        // One that succeeds replaces it whole, keeping its permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::Permissions::from_mode(0o750);
+            std::fs::set_permissions(dir.join("sub/a.txt"), mode).expect("chmod");
+        }
+        caps.write("w/sub/a.txt", b"new").expect("written");
+        assert_eq!(std::fs::read(dir.join("sub/a.txt")).expect("read"), b"new");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta = std::fs::metadata(dir.join("sub/a.txt")).expect("stat");
+            assert_eq!(meta.permissions().mode() & 0o777, 0o750, "its permissions kept");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_write_goes_through_a_link_and_not_to_a_file_with_other_names() {
+        let dir = scratch("links");
+        std::fs::write(dir.join("target.txt"), "t").expect("write");
+        std::os::unix::fs::symlink("target.txt", dir.join("link.txt")).expect("symlink");
+        std::fs::write(dir.join("one.txt"), "1").expect("write");
+        std::fs::hard_link(dir.join("one.txt"), dir.join("two.txt")).expect("hard link");
+        let caps = Caps::open(&Grants::default().root("w", &dir, true), |_| None).expect("opened");
+        caps.write("w/link.txt", b"through").expect("written");
+        assert!(std::fs::symlink_metadata(dir.join("link.txt")).expect("stat").is_symlink());
+        assert_eq!(std::fs::read(dir.join("target.txt")).expect("read"), b"through");
+        let refused = caps.write("w/two.txt", b"2").expect_err("a hard link");
+        assert!(refused.contains("other names"), "{refused}");
+        assert_eq!(std::fs::read(dir.join("one.txt")).expect("read"), b"1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
