@@ -45,7 +45,8 @@ pub fn read(path: str) -> Call<Vec<u8>> {
 }
 
 /// Writes `bytes` as the whole file at `path`, in a write root, making the directories it needs.
-/// The bytes are at most 512 KiB; more panics (write a blob with `write_blob`).
+/// It replaces the file whole: a reader sees the old file or the new one, and a write that fails
+/// leaves the old one. The bytes are at most 512 KiB; more panics (write a blob with `write_blob`).
 @tool
 pub fn write(path: str, bytes: [u8]) -> Call<Done> {
     if bytes.len() > MOST_BYTES {
@@ -95,7 +96,7 @@ pub fn read_blob(path: str) -> Call<Blob> {
 }
 
 /// Writes the bytes of `blob` as the whole file at `path`, in a write root, making the
-/// directories it needs. The blob stays the tool's.
+/// directories it needs, replacing it whole as `write` does. The blob stays the tool's.
 @tool
 pub fn write_blob(path: str, blob: Blob) -> Call<Done> {
     var w = Writer::new()
