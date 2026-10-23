@@ -115,14 +115,14 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
         build.onLoad({ filter: /.*/, namespace: "ticker-test" }, ({ path }) => ({ loader: "js", contents: path.endsWith("device.ts")
           ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; }"
           : path.endsWith("live.ts") ? "export class Live { start() {} take() { return globalThis.__tickerTest.takeReload(); } swapped() {} drawn() {} }"
-          : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
+          : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export class Handed { give() {} fetch(f) { return f; } } export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
       },
     }] });
     expect(bundle.success).toBe(true);
     const source = `${await bundle.outputs[0]!.text()}\n// ticker scenario ${scenarios++}\n`;
     await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
     self.onmessage!({ data: {
-      type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, canvas: { getContext: () => ({ configure: (c: GPUCanvasConfiguration) => configured.push(c.format) }) },
+      type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, given: [], canvas: { getContext: () => ({ configure: (c: GPUCanvasConfiguration) => configured.push(c.format) }) },
       input: InputRing.create().buffer, width: 1, height: 1, test: { ...TEST_DEFAULTS, frames: 4, width: 1, height: 1, fps: 60, saturate: 1 },
     } } as unknown as MessageEvent<ToWorker>);
     const failure = await Promise.race([stopped.promise, Bun.sleep(2000).then(() => "timed out")]);

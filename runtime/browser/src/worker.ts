@@ -10,7 +10,7 @@ import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
-import { browserIo, type Build, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
+import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
@@ -50,6 +50,8 @@ let base = "";
  * are fetched from there (the server deletes old builds, the page's among them). */
 let buildBase = "";
 let testing = false;
+/** The build's files the page fetched for this worker (loader.ts `Handed`). */
+let handed = new Handed([]);
 let failed = false;
 /** Input events from the main thread (input.ts). */
 let ring: InputRing | null = null;
@@ -821,7 +823,8 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       // The device and the build are fetched at once.
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
-      Promise.all([openDevice((test?.timestamps ?? 0) > 0, fatal), loadBuild(base)])
+      handed = new Handed(msg.given);
+      Promise.all([openDevice((test?.timestamps ?? 0) > 0, fatal), loadBuild(base, handed.fetch((url) => fetch(url)))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
           handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);
@@ -830,6 +833,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
         .catch(fatal);
       return;
     }
+    case "file":
+      handed.give(msg.url, msg.bytes);
+      return;
     case "host-reply": {
       const waiting = hostRequests.get(msg.id);
       if (waiting) { hostRequests.delete(msg.id); if (msg.error === null) waiting.resolve(msg.bytes); else waiting.reject(new Error(msg.error)); }

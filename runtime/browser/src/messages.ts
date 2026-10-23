@@ -23,7 +23,12 @@ export type ToWorker =
        * (hot reload, live.ts), after the change numbered here, the last its build holds; null
        * otherwise. */
       live: number | null;
+      /** The build's files the page is fetching for the worker (loader.ts `Handed`): each comes
+       * in a `file` message. */
+      given: string[];
     }
+  /** A file of `given`: its bytes, or null if the page couldn't fetch it. */
+  | { type: "file"; url: string; bytes: Uint8Array<ArrayBuffer> | null }
   | { type: "resize"; width: number; height: number }
   | { type: "visibility"; visible: boolean }
   | { type: "host-reply"; id: number; bytes: Uint8Array<ArrayBuffer>; error: string | null }

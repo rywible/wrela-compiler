@@ -5,6 +5,7 @@ import { AUDIO_CHANNELS, AUDIO_QUANTUM, AUDIO_SAMPLE_RATE } from "./abi.gen.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize } from "./frame.ts";
 import { epochNow, InputRing } from "./input.ts";
+import { handOver, preloaded } from "./preload.ts";
 import { Semantics } from "./semantics.ts";
 import { listen, pollPads } from "./listen.ts";
 import { type FromVoice, type FromWorker, type ToWorker, VOICE_PROCESSOR, type VoiceOptions } from "./messages.ts";
@@ -371,8 +372,10 @@ function start(): void {
     const mark = document.querySelector<HTMLMetaElement>('meta[name="wrela-live"]');
     const live = mark === null ? null : Number(mark.content ?? "0") || 0;
     const storage = document.querySelector<HTMLMetaElement>('meta[name="wrela-storage"]')?.content ?? null;
-    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, storage, width, height, test, input: ring.buffer, live };
+    const given = preloaded(document);
+    const msg: ToWorker = { type: "start", canvas: offscreen, base: document.baseURI, storage, width, height, test, input: ring.buffer, live, given };
     worker.postMessage(msg, [offscreen]);
+    handOver(worker, given);
     if (!test) {
       const resize = (entry?: ResizeObserverEntry) => {
         const pixels = devicePixels(canvas, entry);
