@@ -2917,7 +2917,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela fix <package-dir> [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13) |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
-| `wrela trace <package> --watch <exports>` | Runs frames and prints what the exports say after each frame (`--csv`) |
+| `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |

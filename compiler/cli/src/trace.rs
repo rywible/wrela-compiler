@@ -11,7 +11,8 @@
 //! simulation that indexes out of bounds stops at the frame it did), unless `--release`; it runs
 //! on the GPU if it has pipelines, else on the CPU. `--no-gpu` checks submitted commands but
 //! skips their execution, for CPU state that needs no GPU readbacks. Frame `i` runs at time
-//! `i / fps` (60 unless said). Exit status: 0; for `bisect`, 1 if the condition never held; 2 a usage error or a
+//! `i / fps` (60 unless said), in lockstep with the program's ticker if it started one: the
+//! ticks due by the frame's time run before it, as `wrela-host` and frame tests run them. Exit status: 0; for `bisect`, 1 if the condition never held; 2 a usage error or a
 //! failure to build or run.
 
 use std::path::PathBuf;
@@ -88,10 +89,19 @@ enum Runner {
 }
 
 impl Runner {
-    fn frame(&mut self, t: f32, size: (u32, u32)) -> Result<(), String> {
+    /// Frame `i` at `fps`, `script`'s events for it first, in lockstep with the ticker if the
+    /// program started one (its ticks due by the frame's time run before it), as `wrela-host`
+    /// and frame tests run frames.
+    fn frame(
+        &mut self,
+        i: u32,
+        fps: f64,
+        size: (u32, u32),
+        script: &[wrela_abi::input::Scripted],
+    ) -> Result<(), String> {
         match self {
-            Runner::Gpu(h) => h.frame(t, size.0, size.1),
-            Runner::Cpu(h) => h.frame(t, size.0, size.1),
+            Runner::Gpu(h) => h.lockstep_frame(i, fps, size.0, size.1, script),
+            Runner::Cpu(h) => h.lockstep_frame(i, fps, size.0, size.1, script),
         }
         .map_err(|e| e.to_string())
     }
@@ -102,13 +112,6 @@ impl Runner {
             Runner::Cpu(h) => h.call_export(name, &[]),
         }
         .map_err(|e| format!("`{name}`: {e}"))
-    }
-
-    fn push(&mut self, e: &wrela_abi::input::Scripted) {
-        match self {
-            Runner::Gpu(h) => h.push_scripted(e),
-            Runner::Cpu(h) => h.push_scripted(e),
-        }
     }
 }
 
@@ -139,17 +142,14 @@ fn start(a: &Args) -> Result<(Runner, Vec<wrela_abi::input::Scripted>), String> 
     Ok((runner, crate::read_script(a.input.as_deref())?))
 }
 
-/// Runs frame `i` (its scripted events first): its time, in seconds.
+/// Runs frame `i` (its scripted events first, and the ticks due by it): its time, in seconds.
 fn step(
     r: &mut Runner,
     a: &Args,
     script: &[wrela_abi::input::Scripted],
     i: u32,
 ) -> Result<f64, String> {
-    for e in wrela_abi::input::events_at(script, i) {
-        r.push(e);
-    }
-    r.frame(wrela_host::frame_time(i, a.fps), a.size).map_err(|e| format!("frame {i}: {e}"))?;
+    r.frame(i, a.fps, a.size, script).map_err(|e| format!("frame {i}: {e}"))?;
     Ok(f64::from(i) / a.fps)
 }
 
