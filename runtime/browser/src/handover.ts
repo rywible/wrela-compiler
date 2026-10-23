@@ -42,12 +42,14 @@ export class HandOvers implements Builds {
   #asked: Asked | null = null;
 
   /**
-   * `base` gives the running build's base, which paths are from. `held` gives the pipelines the
-   * device holds: the running build's, and those kept for the way back. `fetchFn` fetches the
-   * builds' files.
+   * `screenFormat` is the format the screen's pipelines draw in (`ScreenTarget.format`). `base`
+   * gives the running build's base, which paths are from. `held` gives the pipelines the device
+   * holds: the running build's, and those kept for the way back. `fetchFn` fetches the builds'
+   * files.
    */
   constructor(
     readonly device: GPUDevice,
+    readonly screenFormat: GPUTextureFormat,
     readonly base: () => string,
     readonly held: () => readonly PipelineCache[],
     readonly fetchFn?: Fetch,
@@ -113,7 +115,7 @@ export class HandOvers implements Builds {
     try {
       const build = await loadBuild(base, this.fetchFn);
       const others = [...this.#prepared.values()].map((p) => p.pipelines).filter((c) => c !== null);
-      const pipelines = preparePipelines(this.device, build.manifest, build.shaders, [...this.held(), ...others]);
+      const pipelines = preparePipelines(this.device, build.manifest, build.shaders, this.screenFormat, [...this.held(), ...others]);
       started(pipelines);
       const [compiled] = await Promise.all([Program.compile(build.wasm), Promise.all(pipelines.values())]);
       return { ...build, compiled, pipelines };

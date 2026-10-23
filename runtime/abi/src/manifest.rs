@@ -1,4 +1,4 @@
-//! # The manifest, version 8
+//! # The manifest, version 9
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -22,14 +22,16 @@
 //!   manifest's list, from 1 (the largest such number stays).
 //! - A render pipeline draws a triangle list into its pass's colour target: the screen, whose
 //!   format is [`SCREEN_FORMAT`] without sRGB encoding (so hosts produce the same bytes), or a
-//!   texture. With a depth target, a fragment is kept where its depth is less than what's
+//!   texture. A host may draw the screen in another 8-bit unorm format that holds the same
+//!   bytes (a browser's canvas in the device's preferred format, `bgra8unorm` on some), so a
+//!   screen target says it is one. With a depth target, a fragment is kept where its depth is less than what's
 //!   there, which it replaces, unless its `"depth"` says otherwise: `"compare"`, how its depth
 //!   compares with what's there for it to be kept (WebGPU's names, `"less"` by default), and
 //!   `"write"`, whether it replaces it (`true` by default). A render pipeline's `"targets"`
 //!   are every combination of targets the program draws it into, as the compiler knows them
 //!   from each draw's pass: each a colour format (`null` in a pass that draws only depths; the
-//!   screen's is [`SCREEN_FORMAT`]) and whether there's a depth target (`depth32float`), at
-//!   least one. Hosts make one pipeline for each when the program loads, and refuse a draw into
+//!   screen's is [`SCREEN_FORMAT`], with `"screen": true`) and whether there's a depth target
+//!   (`depth32float`), at least one. Hosts make one pipeline for each when the program loads, and refuse a draw into
 //!   any other. A render pipeline with `"blend": true` draws its colour over what's
 //!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
 //!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it. One
@@ -50,8 +52,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 8;
-/// The screen's texture format, in WebGPU's spelling.
+pub const VERSION: u32 = 9;
+/// The screen's texture format, in WebGPU's spelling: what a screen target's colour is, and
+/// the format of the bytes a host reads back from the screen.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
 /// WebGPU's default limits that the manifest is checked against ([`Limits::DEFAULT`]).
 pub const MAX_WORKGROUP_SIZE: [u32; 3] = Limits::DEFAULT.max_workgroup_size;
@@ -170,30 +173,34 @@ pub enum Stage {
 }
 
 /// What a render pipeline draws into: a colour target of a format (none in a pass that draws
-/// only depths; the screen's is [`SCREEN_FORMAT`]), and a depth target (`depth32float`) or
-/// none.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// only depths), and a depth target (`depth32float`) or none. The screen's colour target says
+/// it's the screen (`"screen": true`, which a texture's leaves out): its format is
+/// [`SCREEN_FORMAT`] here, and a host may draw it in another (a browser's canvas).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RenderTarget {
     pub color: Option<TextureFormat>,
     pub depth: bool,
+    pub screen: bool,
 }
 
 impl RenderTarget {
     /// The screen's target, with depth or without.
     pub fn screen(depth: bool) -> RenderTarget {
         let color = TextureFormat::ALL.into_iter().find(|f| f.name() == SCREEN_FORMAT);
-        RenderTarget { color, depth }
+        RenderTarget { color, depth, screen: true }
     }
 }
 
 impl fmt::Display for RenderTarget {
-    /// As errors name it: `rgba16float with depth`, `depth alone`.
+    /// As errors name it: `rgba16float with depth`, `depth alone`, `the screen`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.color, self.depth) {
-            (Some(c), true) => write!(f, "{} with depth", c.name()),
-            (Some(c), false) => write!(f, "{}", c.name()),
-            (None, true) => write!(f, "depth alone"),
-            (None, false) => write!(f, "nothing"),
+        match (self.screen, self.color, self.depth) {
+            (true, _, true) => write!(f, "the screen with depth"),
+            (true, _, false) => write!(f, "the screen"),
+            (false, Some(c), true) => write!(f, "{} with depth", c.name()),
+            (false, Some(c), false) => write!(f, "{}", c.name()),
+            (false, None, true) => write!(f, "depth alone"),
+            (false, None, false) => write!(f, "nothing"),
         }
     }
 }
@@ -201,9 +208,12 @@ impl fmt::Display for RenderTarget {
 impl Serialize for RenderTarget {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        let mut o = s.serialize_struct("RenderTarget", 2)?;
+        let mut o = s.serialize_struct("RenderTarget", 2 + usize::from(self.screen))?;
         o.serialize_field("color", &self.color.map(TextureFormat::name))?;
         o.serialize_field("depth", &self.depth)?;
+        if self.screen {
+            o.serialize_field("screen", &true)?;
+        }
         o.end()
     }
 }
@@ -617,6 +627,12 @@ impl Manifest {
                                 "pipeline {i}'s target {k} draws into nothing: a target has a colour, a depth, or both"
                             ));
                         }
+                        if t.screen && t.color.map(TextureFormat::name) != Some(SCREEN_FORMAT) {
+                            let color = t.color.map_or("none", TextureFormat::name);
+                            return err(format!(
+                                "pipeline {i}'s target {k} is the screen, whose colour is {SCREEN_FORMAT}, not {color}"
+                            ));
+                        }
                         let integer = t.color.is_some_and(|c| c.is_uint());
                         let why = if *writes_depth && !t.depth {
                             Some("its fragments give their depth, so a target has depth")
@@ -755,7 +771,8 @@ mod read {
         if o.contains_key(key) { one_of(o, key, place, options) } else { Ok(default) }
     }
 
-    /// A render pipeline's `targets`: each a colour format or `null`, and whether it has depth.
+    /// A render pipeline's `targets`: each a colour format or `null`, whether it has depth, and
+    /// whether it's the screen (`false` where the key is missing).
     fn render_targets(o: &Json, place: &str) -> Result<Vec<RenderTarget>> {
         let Some(Value::Array(ts)) = o.get("targets") else {
             return fail(format!("{place}.targets must be an array"));
@@ -775,7 +792,8 @@ mod read {
                     Some(Value::Bool(b)) => *b,
                     _ => return fail(format!("{tp}.depth must be true or false")),
                 };
-                Ok(RenderTarget { color, depth })
+                let screen = flag(to, "screen", &tp, false)?;
+                Ok(RenderTarget { color, depth, screen })
             })
             .collect()
     }
@@ -961,7 +979,7 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 8,
+  "manifest_version": 9,
   "stream_version": 10,
   "wasm": "game.wasm",
   "pipelines": [
@@ -996,7 +1014,8 @@ mod tests {
       "targets": [
         {
           "color": "rgba8unorm",
-          "depth": false
+          "depth": false,
+          "screen": true
         }
       ],
       "uniform": null,
@@ -1120,7 +1139,7 @@ mod tests {
             if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
                 *blend = true;
                 *uint = format.is_uint();
-                *targets = vec![RenderTarget { color: Some(format), depth: false }];
+                *targets = vec![RenderTarget { color: Some(format), ..RenderTarget::default() }];
             }
             let result = Manifest::parse(&m.to_json());
             if blendable {
@@ -1138,8 +1157,38 @@ mod tests {
         let mut m = sample();
         if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
             *blend = true;
-            *targets = vec![RenderTarget { color: None, depth: true }];
+            *targets = vec![RenderTarget { depth: true, ..RenderTarget::default() }];
         }
         Manifest::parse(&m.to_json()).expect("a depth-only variant has no colour blend");
+    }
+
+    #[test]
+    fn screen_targets_say_so() {
+        // The screen and a texture of the screen's format are two targets: only the screen's
+        // JSON says it's the screen.
+        let mut m = sample();
+        let texture = RenderTarget { color: Some(TextureFormat::Rgba8), ..RenderTarget::default() };
+        if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+            targets.push(texture);
+            targets.push(RenderTarget::screen(true));
+        }
+        let json = m.to_json();
+        assert_eq!(json.matches("\"screen\": true").count(), 2);
+        let parsed = Manifest::parse(&json).expect("the screen and a texture of its format");
+        let Stage::Render { targets, .. } = &parsed.pipelines[1].stage else { panic!("render") };
+        assert_eq!(targets, &[RenderTarget::screen(false), texture, RenderTarget::screen(true)]);
+        // A screen target's colour is the screen's format.
+        for (color, name) in [(Some(TextureFormat::Rgba16Float), "rgba16float"), (None, "none")] {
+            let mut m = sample();
+            if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                targets[0] = RenderTarget { color, depth: true, screen: true };
+            }
+            assert_eq!(
+                Manifest::parse(&m.to_json()).expect_err("a screen of another format").0,
+                format!(
+                    "pipeline 1's target 0 is the screen, whose colour is rgba8unorm, not {name}"
+                )
+            );
+        }
     }
 }

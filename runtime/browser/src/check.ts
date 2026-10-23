@@ -4,7 +4,7 @@
 // asynchronous WebGPU error that names no command.
 
 import { BINDING_OFFSET_ALIGNMENT, DEFAULT_LIMITS, MAX_TEXTURE_3D, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS } from "./abi.gen.ts";
-import { type BindingKind, is3d, isStorage, type Manifest, type RenderTarget, targetName } from "./manifest.ts";
+import { type BindingKind, is3d, isStorage, type Manifest, type RenderTarget, sameTarget, targetName } from "./manifest.ts";
 import { buildPathProblem, pathProblem } from "./path.ts";
 import type { Binding, Command, OpcodeName, TextureFormat } from "./stream.ts";
 
@@ -60,6 +60,8 @@ export function sampleType(f: TextureFormat): GPUTextureSampleType {
 export const isDepth = (f: TextureFormat) => formatOf(f).depth;
 /** The bytes of one texel of a texture format. */
 export const bytesPerTexel = (f: TextureFormat) => formatOf(f).bytes;
+/** The targets outside a pass: none. */
+const NO_TARGET: RenderTarget = { color: null, depth: false, screen: false };
 
 interface Shape {
   name: string;
@@ -93,9 +95,9 @@ export class Checker {
   readonly #written: number[] = [];
   /** The open pass's attachments. */
   #attachments: number[] = [];
-  /** The open pass's colour target's format (the screen's, a texture's, or none), and whether it
-   * has a depth target: which pipelines its draws may draw with. */
-  #targets: RenderTarget = { color: null, depth: false };
+  /** The open pass's targets (the screen or a texture's format or none, and a depth target or
+   * none): which pipelines its draws may draw with. */
+  #targets: RenderTarget = NO_TARGET;
   /** The current frame's screen size, when a frame has begun. */
   #screenSize: [number, number] | undefined;
 
@@ -142,7 +144,7 @@ export class Checker {
     this.#scope.clear();
     this.#spareScope.clear();
     this.#attachments = [];
-    this.#targets = { color: null, depth: false };
+    this.#targets = NO_TARGET;
     this.#written.length = 0;
   }
 
@@ -282,7 +284,7 @@ export class Checker {
         this.#clearColour(op, cmd.clear);
         this.#scope.clear();
         this.#attachments = [];
-        this.#targets = { color: SCREEN_FORMAT, depth: false };
+        this.#targets = { color: SCREEN_FORMAT, depth: false, screen: true };
         return;
       case "BeginPass": {
         const pass = cmd.pass;
@@ -316,7 +318,7 @@ export class Checker {
           this.#attachments.push(pass.depth);
         }
         if (pass.color === NONE && pass.depth === NONE) throw err("a pass needs a colour target or a depth target");
-        this.#targets = { color: colour, depth: pass.depth !== NONE };
+        this.#targets = { color: colour, depth: pass.depth !== NONE, screen: pass.color === SCREEN };
         return;
       }
       case "Draw":
@@ -449,7 +451,7 @@ export class Checker {
     // A draw's pass's targets are one of its pipeline's.
     if (!dispatch) {
       const here = this.#targets;
-      if (!p.targets.some((t) => t.color === here.color && t.depth === here.depth)) {
+      if (!p.targets.some((t) => sameTarget(t, here))) {
         throw err(`\`${name}\` is drawn into ${targetName(here)}, which isn't one of its targets (${p.targets.map(targetName).join(", ")})`);
       }
     }

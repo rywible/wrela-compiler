@@ -310,6 +310,16 @@ fn records_commands() {}
                     value
                 };
                 assert_eq!(interfaces(&full), interfaces(&cpu));
+                // A draw on the screen draws into the screen's target, which says it's the
+                // screen: a host may draw the screen in its own format (the browser's canvas).
+                let manifest: serde_json::Value =
+                    serde_json::from_slice(file(&full, "manifest.json")).expect("manifest JSON");
+                let pipelines = manifest["pipelines"].as_array().expect("pipelines");
+                let render = pipelines.iter().find(|p| p["kind"] == "render").expect("render");
+                assert_eq!(
+                    render["targets"],
+                    serde_json::json!([{ "color": "rgba8unorm", "depth": false, "screen": true }])
+                );
             }
         })
         .expect("checked package");

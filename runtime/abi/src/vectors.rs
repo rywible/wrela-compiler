@@ -485,9 +485,14 @@ pub fn check_manifest() -> Manifest {
 fn target_bound(writes_depth: bool, uint: bool) -> Stage {
     let colors = TextureFormat::ALL.into_iter().filter(|f| !f.is_depth() && f.is_uint() == uint);
     let mut targets: Vec<RenderTarget> = colors
-        .flat_map(|c| [false, true].map(|depth| RenderTarget { color: Some(c), depth }))
+        .flat_map(|c| {
+            [false, true].map(|depth| RenderTarget { color: Some(c), depth, screen: false })
+        })
         .collect();
-    targets.push(RenderTarget { color: None, depth: true });
+    targets.push(RenderTarget { color: None, depth: true, screen: false });
+    if !uint {
+        targets.extend([false, true].map(RenderTarget::screen));
+    }
     targets.retain(|t| t.depth || !writes_depth);
     render_stage(writes_depth, uint, targets)
 }
@@ -1200,7 +1205,7 @@ fn manifests() -> Vec<Value> {
                 if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
                     *blend = true;
                     *uint = true;
-                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Uint), depth: false }];
+                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Uint), ..RenderTarget::default() }];
                 }
             }),
         ),
@@ -1209,7 +1214,7 @@ fn manifests() -> Vec<Value> {
             edited(&|m| {
                 if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
                     *blend = true;
-                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Float), depth: false }];
+                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Float), ..RenderTarget::default() }];
                 }
             }),
         ),
@@ -1218,7 +1223,7 @@ fn manifests() -> Vec<Value> {
             edited(&|m| {
                 if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
                     *blend = true;
-                    *targets = vec![RenderTarget { color: None, depth: true }];
+                    *targets = vec![RenderTarget { depth: true, ..RenderTarget::default() }];
                 }
             }),
         ),
@@ -1305,7 +1310,7 @@ fn manifests() -> Vec<Value> {
             "colour fragments with an r32uint target",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0].color = Some(TextureFormat::R32Uint);
+                    targets[0] = RenderTarget { color: Some(TextureFormat::R32Uint), ..RenderTarget::default() };
                 }
             }),
         ),
@@ -1313,15 +1318,35 @@ fn manifests() -> Vec<Value> {
             "a target whose colour is a depth format",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0].color = Some(TextureFormat::Depth32Float);
+                    targets[0] = RenderTarget { color: Some(TextureFormat::Depth32Float), ..RenderTarget::default() };
                 }
             }),
+        ),
+        manifest(
+            "a screen target whose colour isn't the screen's",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets[0].color = Some(TextureFormat::Rgba16Float);
+                }
+            }),
+        ),
+        manifest(
+            "a texture target of the screen's format beside the screen",
+            edited(&|m| {
+                if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+                    targets.push(RenderTarget { color: Some(TextureFormat::Rgba8), ..RenderTarget::default() });
+                }
+            }),
+        ),
+        manifest(
+            "a target whose screen is null",
+            golden.replace("\"screen\": true", "\"screen\": null"),
         ),
         manifest(
             "a target with neither a colour nor a depth",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0] = RenderTarget { color: None, depth: false };
+                    targets[0] = RenderTarget::default();
                 }
             }),
         ),

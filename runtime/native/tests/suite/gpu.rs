@@ -209,7 +209,7 @@ const STORE_PIPELINES: &str = r#"[
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
       "bindings": [{ "binding": 1, "kind": "read_write" }] },
     { "name": "cell", "shader": "cell.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
-      "targets": [{ "color": "rgba8unorm", "depth": false }],
+      "targets": [{ "color": "rgba8unorm", "depth": false, "screen": true }],
       "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
   ]"#;
 
@@ -653,7 +653,7 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
             format!(
                 r#"{{ "name": "{name}", "shader": "cell.wgsl", "kind": "render",
                     "vertex_entry": "vs", "fragment_entry": "fs",
-                    "targets": [{{ "color": "rgba8unorm", "depth": false }}],
+                    "targets": [{{ "color": "rgba8unorm", "depth": false, "screen": true }}],
                     "uniform": {{ "binding": 0, "size": 32, "space": "uniform" }},
                     "bindings": [] }}"#
             )
@@ -921,15 +921,15 @@ struct M { colour: u32, z: f32, _pad: vec2u }
 "#;
 const MESH_PIPELINES: &str = r#"[
     { "name": "plain", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
-      "targets": [{ "color": "rgba8unorm", "depth": true }],
+      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
     { "name": "biased", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back", "depth_bias": { "constant": -1000, "slope_scale": 0, "clamp": 0 },
-      "targets": [{ "color": "rgba8unorm", "depth": true }],
+      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
     { "name": "culled", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back",
-      "targets": [{ "color": "rgba8unorm", "depth": true }],
+      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] }
   ]"#;
 
@@ -1005,7 +1005,7 @@ fn indirect_draws_keep_their_first_instance() {
 "#;
     let pipelines = r#"[{ "name": "instance", "shader": "instance.wgsl", "kind": "render",
         "vertex_entry": "vs", "fragment_entry": "fs",
-        "targets": [{ "color": "rgba8unorm", "depth": false }], "bindings": [] }]"#;
+        "targets": [{ "color": "rgba8unorm", "depth": false, "screen": true }], "bindings": [] }]"#;
     for indexed in [false, true] {
         let mut encoder = Encoder::new();
         encoder.create_buffer(1, 20).create_buffer(2, 12);
