@@ -208,6 +208,7 @@ macro_rules! lang_items {
                         | Lang::EndPass
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
+                        | Lang::TimedCommand
                 )
             }
 
@@ -243,6 +244,7 @@ macro_rules! lang_items {
                     Lang::RequestStatus
                         | Lang::RequestTake
                         | Lang::ReadBufferCommand
+                        | Lang::TimedCommand
                         | Lang::Limit
                         | Lang::InputTake
                         | Lang::PayloadTake
@@ -377,6 +379,7 @@ lang_items! {
     TextureDepth = "std::gpu::texture_depth",
     SpanLen = "std::gpu::span_len",
     ReadBufferCommand = "std::gpu::read_buffer_command",
+    TimedCommand = "std::gpu::timed_command",
     NextRequest = "std::io::next_request",
     RequestStatus = "std::io::request_status",
     RequestTake = "std::mem::take_answer",
@@ -765,6 +768,9 @@ pub struct Golden {
     pub path: String,
     pub span: Span,
     pub within: f64,
+    /// `pass: "label"`: the golden is of the target of the last pass so labelled, not of the
+    /// screen.
+    pub pass: Option<String>,
 }
 
 /// A golden's `within` unless the test says: half an 8-bit step, on average.
@@ -804,6 +810,12 @@ pub struct FnAttrs {
     /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
     /// frames is within a mean difference `m` of that PNG in the package (§13).
     pub test_golden: Option<Golden>,
+    /// `@test(frames: n, hold: [("far.bin", 120)])`: paths whose fetches and storage reads the
+    /// host holds until the frame each names begins (§13): a test's late files.
+    pub test_hold: Vec<(String, u32)>,
+    /// `@test(frames: n, gpu: true, hosts: both)`: the frames run in Chrome's test mode too, and
+    /// its last frame and state hash must be the native host's (§13).
+    pub test_both: bool,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
     pub thread_entry: Option<Span>,

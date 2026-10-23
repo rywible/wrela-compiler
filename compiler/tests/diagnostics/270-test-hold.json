@@ -1,0 +1,28 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0222",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`@test` takes `frames: n` or `ticks: n`, from 1 to 36000: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)",
+      "notes": [
+        "`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 1,
+        "end": 250,
+        "end_column": 45,
+        "end_line": 14,
+        "line": 14,
+        "start": 206
+      },
+      "title": "a `@test` that `wrela test` can't run"
+    }
+  ],
+  "version": 2
+}

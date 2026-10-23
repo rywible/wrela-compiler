@@ -83,13 +83,14 @@ pub trait Toolchain: Send + Sync {
         filter: Option<&str>,
         overrides: &[(String, PathBuf)],
     ) -> Result<Tested, String>;
-    /// The package's diagnostics, as `wrela check` finds them.
+    /// The package's diagnostics, as `wrela check` finds them, and the pipelines its build
+    /// makes, as `wrela pipelines` counts them.
     fn check(
         &self,
         job: &Job,
         package: &Path,
         overrides: &[(String, PathBuf)],
-    ) -> Result<Vec<Diagnostic>, String>;
+    ) -> Result<Checked, String>;
     /// Whether a build writes a file named `name` into its output: what the list of the files
     /// the last build wrote ([`LIST`]) may name (`wrela build`'s rule).
     fn owns(&self, name: &str) -> bool;
@@ -180,6 +181,23 @@ pub struct Built {
     pub files: Vec<(String, Vec<u8>)>,
     pub diagnostics: Vec<Diagnostic>,
     pub consts: (u32, u32),
+}
+
+/// A check: its diagnostics, and (with no errors) the pipelines the build makes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Checked {
+    pub diagnostics: Vec<Diagnostic>,
+    pub pipelines: Vec<Pipeline>,
+}
+
+/// A pipeline of a build, as `wrela pipelines --json` gives it: `compute` or `render`, its
+/// entry points with their type arguments (`shade::<f32>`), and where CPU code dispatches or
+/// draws it (`file:line:column`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Pipeline {
+    pub kind: String,
+    pub entries: Vec<String>,
+    pub sites: Vec<String>,
 }
 
 /// A test run: each test's result, the errors that kept the tests from running, and how many
@@ -606,9 +624,13 @@ fn work(s: &Services, job: &Job, toolchain: &dyn Toolchain, op: Op) -> Result<Ve
         Op::Check { package, overrides } => {
             let dir = caps.dir_path(&package, false)?;
             let dirs = override_dirs(caps, overrides)?;
-            let diagnostics = toolchain.check(job, &dir, &dirs)?;
-            out.u8(u8::from(!diagnostics.iter().any(|d| d.error)));
-            write_diagnostics(&mut out, &diagnostics);
+            let checked = toolchain.check(job, &dir, &dirs)?;
+            out.u8(u8::from(!checked.diagnostics.iter().any(|d| d.error)));
+            write_diagnostics(&mut out, &checked.diagnostics);
+            out.u32(checked.pipelines.len() as u32);
+            for p in &checked.pipelines {
+                out.str(&p.kind).strs(&p.entries).strs(&p.sites);
+            }
         }
         Op::Fmt { paths, check } => {
             let (changed, failed) = format(s, job, toolchain, &paths, check)?;

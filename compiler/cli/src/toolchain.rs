@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use wrela_driver::Scope;
 use wrela_driver::reach::Reach;
 use wrela_host::tool::toolchain::{
-    BuildOptions, Built, Diagnostic, Job, LiteralEdits, TestResult, Tested,
+    BuildOptions, Built, Checked, Diagnostic, Job, LiteralEdits, Pipeline, TestResult, Tested,
 };
 
 /// The compiler.
@@ -101,10 +101,19 @@ impl wrela_host::tool::Toolchain for Compiler {
         job: &Job,
         package: &Path,
         overrides: &[(String, PathBuf)],
-    ) -> Result<Vec<Diagnostic>, String> {
+    ) -> Result<Checked, String> {
         let scope = scope_of(job, overrides)?;
         let out = wrela_driver::check_in(package, &scope)?;
-        Ok(diagnostics_of(&out.sources, &out.diagnostics))
+        let pipelines = out
+            .pipelines
+            .iter()
+            .map(|p| Pipeline {
+                kind: p.kind.to_string(),
+                entries: p.entries.clone(),
+                sites: p.sites.clone(),
+            })
+            .collect();
+        Ok(Checked { diagnostics: diagnostics_of(&out.sources, &out.diagnostics), pipelines })
     }
 
     fn owns(&self, name: &str) -> bool {

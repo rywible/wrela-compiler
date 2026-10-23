@@ -992,6 +992,8 @@ test("a failed timestamp read releases its staging buffer and retirement release
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
     .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
   executor.flush();
+  // The failed readback is done before timings() asks: its failure is kept all the same.
+  await new Promise((resolve) => setTimeout(resolve, 0));
   await expect(executor.timings()).rejects.toThrow("timestamps couldn't map");
   expect(device.buffers.filter((buffer) => (buffer.usage & GPUBufferUsage.MAP_READ) !== 0)
     .every((buffer) => buffer.destroyed)).toBe(true);
@@ -1123,4 +1125,65 @@ test("background preparations share a bounded queue and a failed shader cannot p
     finish.resolve();
     spy.mockRestore();
   }
+});
+
+test("a program's ask for a label's time is answered once its frame has ended and all its timestamps are read", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const m = shapes();
+  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  expect(executor.timed).toBe(false);
+  let answered: Uint8Array | null = null;
+  const asked = executor.timeLabel("look").then((b) => (answered = b));
+  expect(executor.timed).toBe(true);
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
+  // Frame 0's labelled work spans two submissions.
+  run(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look")));
+  executor.flush();
+  run(dispatch(new Encoder().label("look")));
+  executor.flush();
+  await Promise.resolve();
+  await Promise.resolve();
+  expect(answered).toBeNull();
+  executor.frame = 1;
+  await asked;
+  expect(answered!.length).toBe(4);
+  expect(new Float32Array(answered!.buffer)[0]).toBe(0);
+  executor.destroyAll();
+});
+
+test("a GPU without timestamp queries refuses an ask for a time", async () => {
+  const device = new FakeDevice();
+  const m = shapes();
+  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  await expect(executor.timeLabel("look")).rejects.toThrow("no timestamp queries");
+});
+
+test("in the serial mode, a label's time waits for its frame's drained passes", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const m = shapes();
+  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "serial");
+  let answered: Uint8Array | null = null;
+  const asked = executor.timeLabel("look").then((b) => (answered = b));
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
+  run(dispatch(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look"))));
+  // The drain waits after its first dispatch, while the next frame begins.
+  const held = Promise.withResolvers<undefined>();
+  let waits = 0;
+  device.gpu.queue.onSubmittedWorkDone = () => (waits++ === 0 ? held.promise : Promise.resolve(undefined));
+  const drained = executor.drain();
+  executor.frame = 1;
+  for (let i = 0; i < 5; i++) await Promise.resolve();
+  expect(answered).toBeNull();
+  held.resolve(undefined);
+  await drained;
+  await asked;
+  expect(answered!.length).toBe(4);
+  executor.destroyAll();
 });

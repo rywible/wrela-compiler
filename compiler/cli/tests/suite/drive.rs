@@ -866,6 +866,76 @@ fn a_driven_fetch_reads_the_build_opened_at_load() {
     assert!(!printed.contains("17 bytes"), "nothing from where the link leads: {printed}");
 }
 
+/// A program that fetches `data.txt` in `init`, and says on the frame it arrives how many bytes
+/// it holds.
+const LATE: &str = r#"
+use std::io::{Pending, fetch, print}
+
+pub struct Game {
+    data: Pending<u8>,
+    frames: u32,
+}
+
+pub fn init() -> Game {
+    Game { data: fetch("data.txt"), frames: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if let Some(Ok(bytes)) = game.data.poll() {
+        print(f"fetched {bytes.len()} bytes on frame {game.frames}")
+    }
+    game.frames += 1
+}
+"#;
+
+/// A tool that holds the late program's `data.txt`, runs three frames, then lets it go and runs
+/// one more: the fetch arrives on that frame alone.
+const HOLD_TOOL: &str = r#"
+use std::input::Script
+use std::io::print
+use std::tool::drive
+use std::tool::drive::Step
+
+pub fn tool() -> u32 {
+    let Ok(it) = drive::load("src/build", drive::cpu()).wait() else { return 91 }
+    let b = it.build
+    let held = [Step::Hold(String::from("data.txt")), Step::Init, Step::Frames(3, Script::frames())]
+    let Ok(seen) = drive::steps(b, held).wait() else { return 92 }
+    print(f"held {seen.lines.len()} lines")
+    let let_go = [Step::Release(String::from("data.txt")), Step::Frames(1, Script::frames())]
+    let Ok(seen) = drive::steps(b, let_go).wait() else { return 93 }
+    for line in seen.lines {
+        print(f"log {line.as_str()}")
+    }
+    let _ = drive::close(b).wait()
+    0
+}
+"#;
+
+/// A held path's fetch is carried out but not answered while it's held, and arrives on the first
+/// frame after it's let go (`Step::Hold`, `Step::Release`).
+#[test]
+fn a_held_fetch_arrives_once_its_path_is_let_go() {
+    let dir = package(
+        "drive-hold",
+        &[
+            ("tool/wrela.toml", &manifest("hold_tool")),
+            ("tool/main.wrela", HOLD_TOOL),
+            ("subject/wrela.toml", &manifest("late")),
+            ("subject/main.wrela", LATE),
+        ],
+    );
+    let (tool, src, out) = (dir.join("tool"), dir.join("src"), dir.join("out"));
+    std::fs::create_dir_all(&out).expect("out");
+    build(&dir.join("subject"), &src.join("build"));
+    std::fs::write(src.join("build/data.txt"), "inside").expect("data");
+    let output = drive(&tool, &src, &out, "60", &[]).output().expect("wrela tool");
+    let printed = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{printed}");
+    assert!(printed.contains("held 0 lines"), "nothing arrived while held: {printed}");
+    assert!(printed.contains("log fetched 6 bytes on frame 3"), "{printed}");
+}
+
 /// A program that posts to `notes/a` and `notes/b` on its first frame, and on each later frame
 /// says what each post got, and posts to `notes/c`, which nothing answers.
 const POSTER: &str = r#"

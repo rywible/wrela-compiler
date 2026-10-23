@@ -1,4 +1,4 @@
-//! # The command stream, version 10
+//! # The command stream, version 11
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -47,6 +47,7 @@
 //! | 27 | `Unprepare` | `path length`, then the path's UTF-8, padded to 4 bytes: lets go of what `Prepare` got ready for that build (its pipelines that the running build doesn't use) |
 //! | 28 | `HandOver` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: after this call, the build at the path takes this program's place, with what it kept (`std::reload`). The request is answered only if the hand-over fails, and then this program goes on |
 //! | 29 | `HostRequest` | `request`, `service length`, `body length`, then UTF-8 service and opaque bytes, each padded to 4 bytes: a host capability request |
+//! | 30 | `Timed` | `request`, `label length`, then the label's UTF-8, padded to 4 bytes: the GPU time of the passes and dispatches with that `Label` in the first frame from this one that runs one and whose time the host has read, summed: an `f32` of microseconds, a request. It fails on a host that can't time GPU work. |
 //!
 //! **Requests** (language.md §17.1) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -79,7 +80,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
@@ -128,10 +129,11 @@ pub enum Opcode {
     Unprepare = 27,
     HandOver = 28,
     HostRequest = 29,
+    Timed = 30,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 28] = [
+    pub const ALL: [Opcode; 29] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -160,6 +162,7 @@ impl Opcode {
         Opcode::Unprepare,
         Opcode::HandOver,
         Opcode::HostRequest,
+        Opcode::Timed,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -196,6 +199,7 @@ impl Opcode {
             Opcode::Unprepare => "Unprepare",
             Opcode::HandOver => "HandOver",
             Opcode::HostRequest => "HostRequest",
+            Opcode::Timed => "Timed",
         }
     }
 }
@@ -551,6 +555,11 @@ pub enum Command<'a> {
         request: u32,
         path: &'a str,
     },
+    /// The GPU time of a label's work in a frame (`std::gpu::timed`).
+    Timed {
+        request: u32,
+        label: &'a str,
+    },
 }
 
 impl Command<'_> {
@@ -584,6 +593,7 @@ impl Command<'_> {
             Command::Unprepare { .. } => Opcode::Unprepare,
             Command::HandOver { .. } => Opcode::HandOver,
             Command::HostRequest { .. } => Opcode::HostRequest,
+            Command::Timed { .. } => Opcode::Timed,
         }
     }
 }
@@ -940,7 +950,11 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
                 Command::ReadBuffer { request: w(0), handle: w(1), offset: w(2), size: w(3) }
             }
-            Opcode::StorageRead | Opcode::Fetch | Opcode::Prepare | Opcode::HandOver => {
+            Opcode::StorageRead
+            | Opcode::Fetch
+            | Opcode::Prepare
+            | Opcode::HandOver
+            | Opcode::Timed => {
                 if words < 2 {
                     return Err(bad("expected at least 2 words"));
                 }
@@ -953,6 +967,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     Opcode::Fetch => Command::Fetch { request: w(0), url: text },
                     Opcode::Prepare => Command::Prepare { request: w(0), path: text },
                     Opcode::HandOver => Command::HandOver { request: w(0), path: text },
+                    Opcode::Timed => Command::Timed { request: w(0), label: text },
                     _ => Command::StorageRead { request: w(0), path: text },
                 }
             }
@@ -1356,6 +1371,11 @@ impl Encoder {
     pub fn storage_write(&mut self, request: u32, path: &str, data: &[u8]) -> &mut Self {
         let words = [request, path.len() as u32, data.len() as u32];
         self.padded_command(Opcode::StorageWrite, &words, &[path.as_bytes(), data]);
+        self
+    }
+
+    pub fn timed(&mut self, request: u32, label: &str) -> &mut Self {
+        self.padded_command(Opcode::Timed, &[request, label.len() as u32], &[label.as_bytes()]);
         self
     }
 

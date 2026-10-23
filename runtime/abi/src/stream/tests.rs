@@ -58,6 +58,8 @@ fn golden_bytes() {
         words(&[29, 28, 8, 9, 3]), // HostRequest
         b"test/echo\0\0\0".to_vec(),
         vec![3, 2, 1, 0],
+        words(&[30, 16, 9, 7]), // Timed
+        b"shadows\0".to_vec(),
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));

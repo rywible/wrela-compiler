@@ -653,7 +653,10 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
 /// Frame tests on the GPU (§13, `@test(frames: n, gpu: true)`): compiler/tests/gpu-frames has a
 /// kernel square numbers and reads them back between frames; one test finds the squares, and
 /// one that expects a wrong square fails with the values it compared. Its frames draw a ramp:
-/// the screen is within its golden, and far from a black one.
+/// the screen is within its golden, and far from a black one (the failure writes what it saw
+/// and how far beside the package's build); the ramp's float target, named by its pass's
+/// label, is within a golden of its own; and Chrome, running the same frames, ends on the same
+/// state hash and frame.
 #[test]
 #[ignore = "needs a GPU"]
 fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
@@ -668,12 +671,57 @@ fn gpu_frame_tests_read_back_what_the_gpu_wrote() {
             ("a_wrong_square_fails", false),
             ("the_ramp_is_its_golden", true),
             ("a_ramp_is_not_black", false),
+            ("the_ramp_target_is_its_golden", true),
+            ("both_hosts_draw_the_same_frame", true),
         ]
     );
     let why =
         |i: usize| out.results[i].failure.as_ref().map(|d| d.message.clone()).unwrap_or_default();
     assert!(why(1).contains("9"), "{}", why(1));
     assert!(why(3).contains("from its golden `goldens/black.png`"), "{}", why(3));
+    assert!(why(3).contains("`build/goldens/goldens/black.diff.png`"), "{}", why(3));
+    let diff = dir.join("build/goldens/goldens/black.diff.png");
+    let (w, h, _) =
+        wrela_host::image::png_of(&std::fs::read(&diff).expect("the diff"), &diff).expect("a PNG");
+    assert_eq!((w, h), (640, 480));
+}
+
+/// Held requests (§13.2, `hold: [...]`): compiler/tests/held's fetch and storage read arrive on
+/// the frames their holds name, a hold past the last frame never arrives, and unheld ones arrive
+/// on the first frame.
+#[test]
+fn frame_tests_hold_requests_until_their_frames() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/held");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let ran: Vec<_> = out.results.iter().map(|r| (r.name.as_str(), r.failure.is_none())).collect();
+    assert_eq!(
+        ran,
+        [
+            ("requests_arrive_on_the_first_frame", true),
+            ("held_requests_arrive_on_their_frames", true),
+            ("a_hold_past_the_last_frame_never_arrives", true),
+        ],
+        "{:?}",
+        out.results
+    );
+}
+
+/// A program's GPU time (§17.1, `std::gpu::timed`): compiler/tests/timed's labelled kernel is
+/// timed on the GPU after the frame it's asked in, and the CPU host's request fails.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_labelled_kernels_gpu_time_comes_back() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/timed");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let ran: Vec<_> = out.results.iter().map(|r| (r.name.as_str(), r.failure.is_none())).collect();
+    assert_eq!(
+        ran,
+        [("a_labelled_kernels_time_comes_back", true), ("a_cpu_host_times_nothing", true)],
+        "{:?}",
+        out.results
+    );
 }
 
 /// A golden is written by `--bless` (`wrela test --bless`), from this machine's screen, and a

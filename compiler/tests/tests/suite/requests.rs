@@ -59,6 +59,20 @@ fn the_browser_gives_the_same_answers() {
     assert_eq!(browser.hash, hash, "the hosts' answers differ (their state hashes do)");
 }
 
+/// A labelled kernel's GPU time (`std::gpu::timed`) comes back in Chrome too: compiler/tests/timed
+/// prints it on the frame it arrives.
+#[test]
+#[ignore = "needs the runtime"]
+fn the_browser_times_a_labelled_kernel() {
+    let (_, rel) = page("compiler/tests/timed", "timed-browser");
+    let browser = run_in_chrome(&rel, 30, 16, 16, 60.0);
+    let lines: Vec<&str> = browser.printed.iter().map(|(_, l)| l.as_str()).collect();
+    let timed = lines.iter().find(|l| l.starts_with("squares took")).expect("a time");
+    let us: f32 = timed["squares took ".len()..].split(' ').next().unwrap().parse().unwrap();
+    assert!(us > 0.0 && us.is_finite(), "{timed}");
+    assert!(!lines.iter().any(|l| l.contains("weren't timed")), "{lines:?}");
+}
+
 /// `std::io::print` puts its line on the host's console: the native host prints it, and keeps it
 /// for a test to read. `@deterministic` code prints too (`trace`, not `io`); `@audio` code
 /// doesn't.

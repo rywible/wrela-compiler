@@ -89,6 +89,11 @@ pub fn tool() -> u32 {
         }
         print(f"checked ok={checked.ok}")
         diagnostics(checked.diagnostics)
+        for p in checked.pipelines {
+            for e in p.entries {
+                print(f"pipeline {p.kind.as_str()} {e.as_str()} sites={p.sites.len()}")
+            }
+        }
     } else {
         let formatted = match toolchain::fmt(paths, what.as_str() == "fmt-check").wait() {
             Ok(f) => take f,
@@ -292,6 +297,23 @@ fn test_and_check_read_dependencies_through_overrides() {
     let (code, printed) = run(&mut probe(&tool, &src, &out, &["check", "src/subject"]));
     assert_eq!(code, Some(0), "{printed}");
     assert!(printed.contains("checked ok=false") && printed.contains("E0220"), "{printed}");
+}
+
+/// A check gives the pipelines the build makes, as `wrela pipelines` counts them: a kernel
+/// dispatched from two places is one pipeline with two sites, and a generic one dispatched for
+/// two types is two.
+#[test]
+fn a_check_gives_the_pipelines_the_build_makes() {
+    let main = "use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}\n\n@compute(64)\nfn fill(out: mut Slots<u32>, id: GlobalId) {\n    out[id] = id.x\n}\n\n@compute(64)\nfn zero<T: GpuData>(out: mut Slots<T>, id: GlobalId) {}\n\npub fn frame(time: f32, width: u32, height: u32) {\n    var a: GpuBuffer<u32> = buffer(64)\n    dispatch(fill.bind(out: mut a), groups: 1)\n    dispatch(fill.bind(out: mut a), groups: 2)\n    dispatch(zero.bind(out: mut a), groups: 1)\n    var b: GpuBuffer<f32> = buffer(64)\n    dispatch(zero.bind(out: mut b), groups: 1)\n}\n";
+    let (tool, src, out) = packages(
+        "toolchain-pipelines",
+        &[("subject/wrela.toml", &manifest("subject")), ("subject/main.wrela", main)],
+    );
+    let (code, printed) = run(&mut probe(&tool, &src, &out, &["check", "src/subject"]));
+    assert_eq!(code, Some(0), "{printed}");
+    assert!(printed.contains("checked ok=true"), "{printed}");
+    assert!(printed.contains("pipeline compute fill sites=2"), "{printed}");
+    assert_eq!(printed.matches("pipeline compute zero::<").count(), 2, "{printed}");
 }
 
 #[test]

@@ -821,6 +821,14 @@ impl Actor {
                 return Ok(());
             }
             Step::Commands => return self.commands(seen),
+            Step::Hold(path) => {
+                on_host!(&mut self.host, host => host.hold(&path));
+                return Ok(());
+            }
+            Step::Release(path) => {
+                on_host!(&mut self.host, host => host.release(&path));
+                return Ok(());
+            }
         }
         ran.elapsed = self.since() - ran.started;
         let (n, out) = &mut seen.ran;

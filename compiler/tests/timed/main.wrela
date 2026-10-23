@@ -1,0 +1,70 @@
+// A program's GPU time (language.md §17.1, `std::gpu::timed`): each frame dispatches a kernel
+// labelled `squares`, and frame 2 asks for its time; the answer arrives on a later frame. On the
+// GPU it's a time (finite, and more than nothing: the kernel ran), in the native host and in
+// Chrome (compiler/tests/tests/suite/requests.rs); on the CPU host, which has no GPU, the request
+// fails. It prints what came.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label, timed}
+use std::io::{Pending, print}
+
+@compute(64)
+fn square(out: mut Slots<u32>, id: GlobalId) {
+    out[id] = id.x * id.x
+}
+
+pub struct State {
+    frame: u32,
+    out: GpuBuffer<u32>,
+    asked: Option<Pending<f32>>,
+    pub us: f32,
+    pub came: u32,
+    pub failed: bool,
+}
+
+/// Not arrived.
+pub const NEVER: u32 = 0xFFFFFFFF
+
+pub fn init() -> State {
+    State { frame: 0, out: buffer(65536), asked: None, us: -1.0, came: NEVER, failed: false }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    label("squares")
+    dispatch(square.bind(out: mut s.out), over: 65536)
+    if s.frame == 2 {
+        s.asked = Some(timed("squares"))
+    }
+    match mut s.asked {
+        Some(p) => match p.poll() {
+            Some(Ok(v)) => {
+                if s.came == NEVER {
+                    s.us = v[0]
+                    s.came = s.frame
+                    print(f"squares took {s.us} us, on frame {s.came}")
+                }
+            },
+            Some(Err(e)) => {
+                if !s.failed {
+                    print(f"squares weren't timed: {e.message()}")
+                }
+                s.failed = true
+            },
+            None => {},
+        },
+        None => {},
+    }
+    s.frame += 1
+}
+
+/// On the GPU the time comes back after the frame it's asked in, and it's a time.
+@test(frames: 8, gpu: true)
+fn a_labelled_kernels_time_comes_back(s: State) {
+    assert(!s.failed && s.came != NEVER, "the time didn't come")
+    assert(s.came > 2, f"it came on frame {s.came}, before it could be timed")
+    assert(s.us > 0.0 && s.us < 1.0e7, f"{s.us} us isn't a kernel's time")
+}
+
+/// The CPU host times nothing: the request fails.
+@test(frames: 4)
+fn a_cpu_host_times_nothing(s: State) {
+    assert(s.failed && s.came == NEVER)
+}

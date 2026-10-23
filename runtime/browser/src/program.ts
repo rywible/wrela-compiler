@@ -97,6 +97,9 @@ export interface Executor {
   /** A buffer's bytes, for a `ReadBuffer` request, once the GPU's work recorded so far is
    * done. An executor without a GPU doesn't have it. */
   readBack?(handle: number, offset: number, size: number): Promise<Bytes>;
+  /** The GPU time of the work labelled `label` from this frame on, for a `Timed` request: an
+   * `f32` of microseconds, once read back. An executor without a GPU doesn't have it. */
+  timeLabel?(label: string): Promise<Bytes>;
 }
 
 /** Where a program's requests read and write: its storage (bytes at paths) and its build, and
@@ -630,6 +633,11 @@ export class Program {
       case "StorageRead":
         this.#requests.start(cmd.op, cmd.request, io ? () => io.storageRead(cmd.path) : none("storage"));
         return;
+      case "Timed": {
+        const time = this.executor.timeLabel?.bind(this.executor);
+        this.#requests.start(cmd.op, cmd.request, time ? () => time(cmd.label) : none("GPU whose work it times"));
+        return;
+      }
       case "StorageWrite": {
         // Give the request its own bytes, independent of the staged batch.
         const data = cmd.data.slice();

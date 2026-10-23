@@ -355,6 +355,9 @@ export class Checker {
         if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
         return;
       }
+      case "Timed":
+        if (cmd.label === "") throw err("a timed label is empty: it names no pass or dispatch");
+        return;
       case "Prepare":
       case "Unprepare":
       case "HandOver": {

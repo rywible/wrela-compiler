@@ -92,7 +92,10 @@ fn workspace(name: &str) -> std::path::PathBuf {
         ],
     );
     std::fs::create_dir_all(ws.join("gpu/goldens")).expect("goldens");
-    std::fs::copy(gpu.join("goldens/ramp.png"), ws.join("gpu/goldens/ramp.png")).expect("golden");
+    for golden in ["ramp.png", "ramp-target.png"] {
+        let to = ws.join("gpu/goldens").join(golden);
+        std::fs::copy(gpu.join("goldens").join(golden), to).expect("golden");
+    }
     // What the failing tests leave is formatted as the rest.
     crate::common::stdout(wrela().arg("fmt").arg(ws.join("gpu")));
     ws
@@ -118,9 +121,11 @@ fn the_suite_runs_every_check_and_every_kind_of_test() {
         "ok wrela::tooled::waits_a_minute_of_fake_time (",
         "ok wrela::gpu::squares_come_back (",
         "ok wrela::gpu::the_ramp_is_its_golden (",
+        "ok wrela::gpu::the_ramp_target_is_its_golden (",
+        "ok wrela::gpu::both_hosts_draw_the_same_frame (",
         "ok wrela::lib:: in",
         "ok wrela::gpu:: in",
-        "6 checks passed, with 6 tests",
+        "6 checks passed, with 8 tests",
         "all checks passed in",
     ] {
         assert!(out.contains(line), "`{line}` in:\n{out}");

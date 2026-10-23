@@ -245,6 +245,16 @@ pub(crate) trait Executor: 'static {
     fn limits(&self) -> wrela_abi::Limits {
         wrela_abi::Limits::DEFAULT
     }
+    /// Asks for the GPU time of the work labelled `label` from the current call on, for request
+    /// `request` (`std::gpu::timed`): why not, if this host can't time it.
+    fn ask_time(&mut self, _request: u32, _label: &str) -> std::result::Result<(), String> {
+        Err("this host has no GPU whose work it times".into())
+    }
+    /// The asks for a time that are answered now: each request, and its time's bytes (an `f32`
+    /// of microseconds).
+    fn times(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
+        Vec::new()
+    }
     /// Hot reload: forget the old build's resources, and take the new build's pipelines.
     #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
     fn reload(&mut self, _manifest: &Manifest, _shaders: &[String]) -> Result<()> {
@@ -459,6 +469,12 @@ struct Requests {
     posts: Vec<QueuedPost>,
     /// The requests of posts taken and not yet answered.
     taken: HashSet<u32>,
+    /// Paths whose fetches and storage reads wait until they're released (a test's held
+    /// requests: [`Program::hold`]).
+    held: HashSet<String>,
+    /// Requests of a held path, carried out already: each one's path, number and answer, which
+    /// the program sees once the path is released.
+    holding: Vec<(String, u32, std::result::Result<Vec<u8>, String>)>,
 }
 
 impl Requests {
@@ -468,6 +484,7 @@ impl Requests {
             || self.arriving.iter().any(|a| a.0 == request)
             || self.waiting.contains(&request)
             || self.reserved.contains(&request)
+            || self.holding.iter().any(|h| h.1 == request)
         {
             return Err(Error::Command(CommandError {
                 opcode: op,
@@ -588,7 +605,15 @@ impl Requests {
             }
             _ => return Ok(()),
         };
-        self.arriving.push((request, answer));
+        let held = match cmd {
+            Command::StorageRead { path, .. } => self.held.contains(*path).then_some(*path),
+            Command::Fetch { url, .. } => self.held.contains(*url).then_some(*url),
+            _ => None,
+        };
+        match held {
+            Some(path) => self.holding.push((path.to_string(), request, answer)),
+            None => self.arriving.push((request, answer)),
+        }
         Ok(())
     }
 
@@ -659,7 +684,8 @@ impl<E: Executor> State<E> {
                 | Command::Post { request, .. }
                 | Command::HostRequest { request, .. }
                 | Command::Prepare { request, .. }
-                | Command::HandOver { request, .. } => {
+                | Command::HandOver { request, .. }
+                | Command::Timed { request, .. } => {
                     self.requests.start(*request, cmd.opcode())?;
                     self.requests.reserved.insert(*request);
                 }
@@ -700,6 +726,13 @@ impl<E: Executor> State<E> {
                 } else {
                     self.requests.waiting.push(*request);
                     self.handing.push(Handing::HandOver { request: *request, path });
+                }
+            }
+            Command::Timed { request, label } => {
+                self.requests.start(*request, cmd.opcode())?;
+                match self.executor.ask_time(*request, label) {
+                    Ok(()) => self.requests.waiting.push(*request),
+                    Err(why) => self.requests.arriving.push((*request, Err(why))),
                 }
             }
             Command::Unprepare { path } if self.hands_over => {
@@ -1499,6 +1532,26 @@ impl<E: Executor> Program<E> {
         requests.answered.insert(request, answer);
     }
 
+    /// Holds the fetches and storage reads of `path` from now on: each is carried out, but the
+    /// program sees its answer only once [`Program::release`] lets the path go (a test's late
+    /// file).
+    pub(crate) fn hold(&mut self, path: &str) {
+        self.store.data_mut().requests.held.insert(path.to_string());
+    }
+
+    /// Lets `path` go: the program sees the answers of its held requests from its next call on,
+    /// and its later requests are answered as usual.
+    pub(crate) fn release(&mut self, path: &str) {
+        let requests = &mut self.store.data_mut().requests;
+        requests.held.remove(path);
+        let (released, kept) =
+            std::mem::take(&mut requests.holding).into_iter().partition(|h| h.0 == path);
+        requests.holding = kept;
+        for (_, request, answer) in released {
+            requests.answered.insert(request, answer);
+        }
+    }
+
     /// The posts that wait for the host's user since the last time ([`Io::queue_posts`]): each
     /// waits until [`Program::answer_post`] answers it.
     pub(crate) fn take_posts(&mut self) -> Vec<QueuedPost> {
@@ -1625,6 +1678,12 @@ impl<E: Executor> Program<E> {
         let result = state.executor.end_frame();
         if let Err(error) = &result {
             state.failed = Some(error.to_string());
+        }
+        // The times asked for that this call's work answered: the program sees them from its
+        // next call on.
+        for (request, answer) in state.executor.times() {
+            state.requests.waiting.retain(|&r| r != request);
+            state.requests.answered.insert(request, answer);
         }
         result
     }
