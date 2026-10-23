@@ -50,6 +50,9 @@ All are used as libraries, through Cargo; no code was copied from them.
 | [webp](https://github.com/jaredforth/webp) and [libwebp-sys](https://github.com/NoXF/libwebp-sys), building Google's [libwebp](https://chromium.googlesource.com/webm/libwebp) 1.3.1 | MIT or Apache-2.0; MIT; libwebp BSD-3-Clause with Google's patent grant | `std::tool::image` decodes WebPs and encodes lossy ones |
 | [base64](https://github.com/marshallpierce/rust-base64) and [shlex](https://github.com/comex/rust-shlex) | MIT or Apache-2.0 | `runtime/chrome`: DevTools screenshots, and `WRELA_CHROME_ARGS` split as a shell splits it |
 | [pollster](https://github.com/zesterer/pollster) | MIT or Apache-2.0 | Waits on wgpu's futures in the native host and the tests |
+| [rusqlite](https://github.com/rusqlite/rusqlite) 0.37, building [SQLite](https://sqlite.org/) | MIT; SQLite is in the public domain | A server's store (`std::store`, `wrela_host::services`): one SQLite file that every room shares and that outlives a build |
+| [p256](https://github.com/RustCrypto/elliptic-curves) 0.13, [rsa](https://github.com/RustCrypto/RSA) 0.9 (RustCrypto) and [ed25519-dalek](https://github.com/dalek-cryptography/curve25519-dalek) 2 | MIT or Apache-2.0; BSD-3-Clause | A server's signature checks (`std::crypto::verify`): ES256, RS256 and Ed25519, the algorithms passkeys use. No cryptography is written here; the tests sign with the same crates (and rand_chacha, MIT or Apache-2.0, seeds a test's RSA key) |
+| [getrandom](https://github.com/rust-random/getrandom) 0.3 | MIT or Apache-2.0 | A server's randomness (`std::crypto::random`), from the operating system |
 
 ## Specifications and published methods
 
@@ -61,6 +64,7 @@ Each is used as facts or as a method; no code was copied.
 | FIPS 180-4 (SHA-256); NIST CAVP's short-message vectors | US government publications | `std::hash::sha256`, and its test vectors |
 | RFC 3720, appendix B.4 (CRC-32C) | IETF | The rooms' journal records' check (`runtime/native/src/rooms.rs`) |
 | RFC 8259 (JSON) | IETF | `std::json` |
+| W3C Web Authentication Level 3; RFC 8949 (CBOR), RFC 9053 (COSE keys), RFC 4648 (base64url) | W3C and IETF | Passkeys: the browser host's `passkey/create` and `passkey/get` (`runtime/browser/src/platform.ts`), and `std::webauthn`'s checks of what an authenticator answers (§7's steps but attestation), with the CBOR and COSE it reads and the base64url of a challenge |
 | RFC 1950 (Adler-32) | IETF | The browser host's PNG writer (`runtime/browser/src/png.ts`) |
 | gitignore(5), git's documented pattern format | Git documentation | `wrela suite allow` reads a workspace's `.gitignore` files as git does |
 | Pillow's Lanczos3 resize and `thumbnail` size rule (HPND), from its documentation and source | Read as a description | `std::tool::image`'s resize and `image::fit`; the resize's test computes its reference from the Lanczos formula itself |

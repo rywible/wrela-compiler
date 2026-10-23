@@ -1,0 +1,553 @@
+// What a server checks of a passkey (WebAuthn Level 3, §7): the bytes an authenticator answered
+// a page with (std::host's `create_passkey` and `use_passkey`), checked against what the server
+// expects. Every check is here but the signature's, which the host makes (std::crypto::verify):
+// `registration` and `assertion` give what it needs.
+//
+// A registration (a new passkey) is accepted when:
+// - the client's data is a `webauthn.create`, over the server's challenge, from the expected
+//   origin, and not from inside another site's frame;
+// - the authenticator's data is for the relying party's ID (its SHA-256), says the person was
+//   present and verified, and holds the credential the browser named, with a public key of
+//   ES256, Ed25519 or RS256.
+// Its attestation is not checked: the host asks for none (a statement of the authenticator's
+// make), so the key is taken on trust at registration, as a password would be.
+//
+// An assertion (a sign-in) is accepted when its client's data is a `webauthn.get` over the
+// challenge from the origin, its authenticator's data is for the relying party and says the person
+// was present and verified, its signature counter went up (or both it and the stored one are 0,
+// as a synced passkey's are), and its signature is the stored key's over the authenticator's data
+// and the client's data's SHA-256 (`Signed::message`).
+
+use std::crypto::{Signature, p256_key, rsa_key}
+use std::hash::sha256::sha256
+use std::json::{Kind, TOP, parse}
+use std::serialize::Serialize
+
+/// What a server expects of a ceremony: the relying party's ID (a domain, `wrela.dev`), the page's
+/// origin (`https://wrela.dev`), and the challenge it gave.
+pub struct Expected: Clone {
+    pub rp_id: String,
+    pub origin: String,
+    pub challenge: Vec<u8>,
+}
+
+/// A registered passkey, as a server keeps it: its credential's ID, its algorithm (COSE's number:
+/// -7 ES256, -8 Ed25519, -257 RS256), its public key in the form std::crypto takes it, and the
+/// signature counter it last gave.
+pub struct Credential: Clone + Serialize {
+    pub id: Vec<u8>,
+    pub algorithm: i32,
+    pub key: Vec<u8>,
+    pub counter: u32,
+}
+
+impl Credential {
+    /// The algorithm as std::crypto names it.
+    pub fn signature(self) -> Signature {
+        if self.algorithm == -7 {
+            Signature::Es256
+        } else if self.algorithm == -8 { Signature::Ed25519 } else { Signature::Rs256 }
+    }
+}
+
+/// An assertion that passed every check but its signature: the bytes the signature must be the
+/// credential's over, and the counter to keep once it is.
+pub struct Signed: Clone {
+    pub message: Vec<u8>,
+    pub counter: u32,
+}
+
+/// The authenticator's data's flags (WebAuthn §6.1).
+const PRESENT: u32 = 1
+const VERIFIED: u32 = 4
+const ATTESTED: u32 = 64
+
+/// The longest credential ID (WebAuthn §5.8.3).
+const MAX_ID: u32 = 1023
+
+/// The passkey a registration made, if every check passes: `id`, `client_data` and `attestation`
+/// as `std::host::read_new_passkey` reads them.
+pub fn registration(
+    id: [u8],
+    client_data: [u8],
+    attestation: [u8],
+    expected: Expected,
+) -> Result<Credential, Text> {
+    if id.len() == 0 || id.len() > MAX_ID {
+        return Err("a credential's ID is 1 to 1023 bytes")
+    }
+    check_client(client_data, "webauthn.create", expected)?
+    let Some(data) = auth_data(attestation) else { return Err("the attestation isn't one") }
+    let flags = check_auth(data, expected)?
+    if flags & ATTESTED == 0 {
+        return Err("the authenticator's data holds no credential")
+    }
+    let counter = counter_of(data)
+    // The attested credential: its authenticator's GUID, its ID's length and its ID, and its key.
+    var at = 37 + 16
+    if data.len() < at + 2 {
+        return Err("the authenticator's data ends early")
+    }
+    let n = (u32(data[at]) << 8) | u32(data[at + 1])
+    at += 2
+    if n != id.len() || data.len() < at + n {
+        return Err("the authenticator's data names another credential")
+    }
+    for i in 0..n {
+        if data[at + i] != id[i] {
+            return Err("the authenticator's data names another credential")
+        }
+    }
+    at += n
+    let (algorithm, key) = cose_key(data, mut at)?
+    var owned: Vec<u8> = Vec::with_capacity(id.len())
+    for b in id {
+        owned.push(b)
+    }
+    Ok(Credential { id: owned, algorithm, key, counter })
+}
+
+/// What an assertion's signature must cover, if every other check passes, against the credential
+/// that `stored` is: `client_data` and `authenticator_data` as `std::host::read_passkey_use` reads
+/// them.
+pub fn assertion(
+    client_data: [u8],
+    authenticator_data: [u8],
+    expected: Expected,
+    stored: Credential,
+) -> Result<Signed, Text> {
+    check_client(client_data, "webauthn.get", expected)?
+    let _ = check_auth(authenticator_data, expected)?
+    let counter = counter_of(authenticator_data)
+    if (counter != 0 || stored.counter != 0) && counter <= stored.counter {
+        return Err("the signature counter didn't go up: the passkey may have been copied")
+    }
+    let hash = sha256(client_data)
+    var message: Vec<u8> = Vec::with_capacity(authenticator_data.len() + 32)
+    for b in authenticator_data {
+        message.push(b)
+    }
+    for b in hash {
+        message.push(b)
+    }
+    Ok(Signed { message, counter })
+}
+
+/// The bytes of `s`.
+fn bytes_of(s: str) -> Vec<u8> {
+    var out: Vec<u8> = Vec::with_capacity(s.len())
+    for i in 0..s.len() {
+        out.push(s.byte(i))
+    }
+    out
+}
+
+/// Whether `bytes` are `s`'s.
+fn same(bytes: [u8], s: str) -> bool {
+    if bytes.len() != s.len() {
+        return false
+    }
+    for i in 0..s.len() {
+        if bytes[i] != s.byte(i) {
+            return false
+        }
+    }
+    true
+}
+
+/// `bytes` in base64url without padding (RFC 4648 §5), as WebAuthn writes a challenge.
+pub fn base64url(bytes: [u8]) -> String {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    var out: Vec<u8> = Vec::with_capacity((bytes.len() * 4 + 2) / 3)
+    var i = 0
+    while i < bytes.len() {
+        let left = bytes.len() - i
+        let a = u32(bytes[i])
+        let b = if left > 1 { u32(bytes[i + 1]) } else { 0 }
+        let c = if left > 2 { u32(bytes[i + 2]) } else { 0 }
+        let x = (a << 16) | (b << 8) | c
+        out.push(alphabet.byte((x >> 18) & 63))
+        out.push(alphabet.byte((x >> 12) & 63))
+        if left > 1 {
+            out.push(alphabet.byte((x >> 6) & 63))
+        }
+        if left > 2 {
+            out.push(alphabet.byte(x & 63))
+        }
+        i += 3
+    }
+    let Some(s) = String::from_utf8(take out) else { panic("base64url is ASCII") }
+    s
+}
+
+/// Checks the client's data: its type, its challenge, its origin, and that it wasn't made inside
+/// another site's frame.
+fn check_client(client_data: [u8], kind: str, expected: Expected) -> Result<(), Text> {
+    var copy: Vec<u8> = Vec::with_capacity(client_data.len())
+    for b in client_data {
+        copy.push(b)
+    }
+    let Some(text) = String::from_utf8(take copy) else {
+        return Err("the client's data isn't UTF-8")
+    }
+    let Some(doc) = parse(text.as_str()) else { return Err("the client's data isn't JSON") }
+    if doc.kind(TOP) != Kind::Obj {
+        return Err("the client's data isn't a JSON object")
+    }
+    let field = |name: str| -> Option<String> {
+        let n = doc.get(TOP, name)?
+        if doc.kind(n) != Kind::Text { return None }
+        doc.text(n)
+    }
+    if field("type") != Some(String::from(kind)) {
+        return Err("the client's data is for another ceremony")
+    }
+    if field("challenge") != Some(base64url(expected.challenge)) {
+        return Err("the client's data is over another challenge")
+    }
+    if field("origin") != Some(expected.origin.clone()) {
+        return Err("the client's data is from another origin")
+    }
+    if let Some(n) = doc.get(TOP, "crossOrigin") {
+        if doc.is_true(n) {
+            return Err("the ceremony ran inside another site's frame")
+        }
+    }
+    Ok(())
+}
+
+/// Checks the authenticator's data's relying party and flags: its flags, if they pass.
+fn check_auth(data: [u8], expected: Expected) -> Result<u32, Text> {
+    if data.len() < 37 {
+        return Err("the authenticator's data ends early")
+    }
+    let hash = sha256(expected.rp_id.as_bytes())
+    for i in 0..32 {
+        if data[i] != hash[i] {
+            return Err("the authenticator's data is for another relying party")
+        }
+    }
+    let flags = u32(data[32])
+    if flags & PRESENT == 0 {
+        return Err("the person wasn't present")
+    }
+    if flags & VERIFIED == 0 {
+        return Err("the person wasn't verified")
+    }
+    Ok(flags)
+}
+
+/// The authenticator's data's signature counter: four bytes, big-endian, after its flags.
+fn counter_of(data: [u8]) -> u32 {
+    (u32(data[33]) << 24) | (u32(data[34]) << 16) | (u32(data[35]) << 8) | u32(data[36])
+}
+
+// ---- CBOR (RFC 8949), as much as WebAuthn needs -------------------------------------------------
+
+/// An item's head at `at` (`at` moves past it): its major type and its argument. None for what
+/// this reader doesn't take: indefinite lengths, and bytes that end early.
+fn head(b: [u8], at: mut u32) -> Option<(u32, u64)> {
+    if at >= b.len() {
+        return None
+    }
+    let first = u32(b[at])
+    at += 1
+    let info = first & 31
+    if info < 24 {
+        return Some((first >> 5, u64(info)))
+    }
+    let n = if info == 24 {
+        1
+    } else if info == 25 {
+        2
+    } else if info == 26 {
+        4
+    } else if info == 27 { 8 } else { return None }
+    if b.len() - at < n {
+        return None
+    }
+    var x: u64 = 0
+    for k in 0..n {
+        x = (x << 8) | u64(b[at + k])
+    }
+    at += n
+    Some((first >> 5, x))
+}
+
+/// A byte string's or a text's bytes at `at` (`at` moves past them), if the item is of `major`.
+fn string(b: [u8], at: mut u32, major: u32) -> Option<Vec<u8>> {
+    let (m, n) = head(b, mut at)?
+    if m != major || u64(b.len() - at) < n {
+        return None
+    }
+    var out: Vec<u8> = Vec::with_capacity(u32(n))
+    for i in 0..u32(n) {
+        out.push(b[at + i])
+    }
+    at += u32(n)
+    Some(out)
+}
+
+/// An integer at `at` (`at` moves past it): a major 0 or 1 item within an `i32`.
+fn integer(b: [u8], at: mut u32) -> Option<i32> {
+    let (m, x) = head(b, mut at)?
+    if x > 2147483647 {
+        return None
+    }
+    if m == 0 {
+        Some(i32(x))
+    } else if m == 1 { Some(-1 - i32(x)) } else { None }
+}
+
+/// Moves `at` past the item there, at most `depth` arrays and maps deep: whether it could.
+fn skip(b: [u8], at: mut u32, depth: u32) -> bool {
+    let Some((m, n)) = head(b, mut at) else { return false }
+    if m == 2 || m == 3 {
+        if u64(b.len() - at) < n {
+            return false
+        }
+        at += u32(n)
+        return true
+    }
+    if m == 4 || m == 5 {
+        if depth == 0 || n > u64(b.len()) {
+            return false
+        }
+        let items = if m == 5 { n * 2 } else { n }
+        for _ in 0..u32(items) {
+            if !skip(b, mut at, depth - 1) {
+                return false
+            }
+        }
+        return true
+    }
+    if m == 6 {
+        return depth > 0 && skip(b, mut at, depth - 1)
+    }
+    true
+}
+
+/// The authenticator's data in an attestation object: a map whose `authData` is a byte string.
+fn auth_data(attestation: [u8]) -> Option<Vec<u8>> {
+    var at = 0
+    let (m, n) = head(attestation, mut at)?
+    if m != 5 {
+        return None
+    }
+    var found: Option<Vec<u8>> = None
+    for _ in 0..u32(n) {
+        let key = string(attestation, mut at, 3)?
+        if same(key, "authData") {
+            found = Some(string(attestation, mut at, 2)?)
+        } else if !skip(attestation, mut at, 8) {
+            return None
+        }
+    }
+    found
+}
+
+/// A COSE public key at `at` (RFC 9053), as std::crypto takes it, with its algorithm: an EC2 key
+/// on P-256 for ES256, an OKP key on Ed25519, or an RSA key for RS256.
+fn cose_key(b: [u8], at: mut u32) -> Result<(i32, Vec<u8>), Text> {
+    let Some((m, n)) = head(b, mut at) else { return Err("the credential's key isn't CBOR") }
+    if m != 5 || n > 16 {
+        return Err("the credential's key isn't a COSE key")
+    }
+    var kty = 0
+    var alg = 0
+    var crv = 0
+    var a: Vec<u8> = Vec::new()
+    var c: Vec<u8> = Vec::new()
+    var d: Vec<u8> = Vec::new()
+    for _ in 0..u32(n) {
+        let Some(label) = integer(b, mut at) else {
+            return Err("a COSE key's label isn't a number")
+        }
+        if label == 1 || label == 3 || (label == -1 && kty != 3) {
+            let Some(v) = integer(b, mut at) else { return Err("a COSE key's number isn't one") }
+            if label == 1 {
+                kty = v
+            } else if label == 3 { alg = v } else { crv = v }
+        } else if label == -1 || label == -2 || label == -3 {
+            let Some(v) = string(b, mut at, 2) else { return Err("a COSE key's part isn't bytes") }
+            if label == -1 {
+                a = take v
+            } else if label == -2 { c = take v } else { d = take v }
+        } else if !skip(b, mut at, 4) {
+            return Err("the credential's key isn't CBOR")
+        }
+    }
+    if alg == -7 && kty == 2 && crv == 1 && c.len() == 32 && d.len() == 32 {
+        return Ok((alg, p256_key(c, d)))
+    }
+    if alg == -8 && kty == 1 && crv == 6 && c.len() == 32 {
+        return Ok((alg, c))
+    }
+    if alg == -257 && kty == 3 && a.len() >= 256 && c.len() > 0 {
+        // An RSA key's modulus is label -1 and its exponent -2.
+        return Ok((alg, rsa_key(a, c)))
+    }
+    Err("the credential's key isn't ES256, Ed25519 or RS256 of 2048 bits or more")
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+/// A CBOR head of `major` and `n`.
+fn cbor(out: mut Vec<u8>, major: u32, n: u32) {
+    if n < 24 {
+        out.push(u8((major << 5) | n))
+    } else if n < 256 {
+        out.push(u8((major << 5) | 24))
+        out.push(u8(n))
+    } else {
+        out.push(u8((major << 5) | 25))
+        out.push(u8(n >> 8))
+        out.push(u8(n & 255))
+    }
+}
+
+fn cbor_bytes(out: mut Vec<u8>, major: u32, bytes: [u8]) {
+    cbor(mut out, major: major, n: bytes.len())
+    for b in bytes {
+        out.push(b)
+    }
+}
+
+fn expected() -> Expected {
+    Expected {
+        rp_id: String::from("wrela.dev"),
+        origin: String::from("https://wrela.dev"),
+        challenge: Vec::from([1, 2, 3, 250, 255]),
+    }
+}
+
+/// The authenticator's data for `rp_id` with `flags` and `counter`, and then `rest`.
+fn data(rp_id: str, flags: u32, counter: u32, rest: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new()
+    for b in sha256(bytes_of(rp_id)) {
+        out.push(b)
+    }
+    out.push(u8(flags))
+    for k in 0..4 {
+        out.push(u8((counter >> (24 - 8 * k)) & 255))
+    }
+    for b in rest {
+        out.push(b)
+    }
+    out
+}
+
+/// An attestation object, its format "none", over the authenticator's data `auth`.
+fn attestation(auth: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::new()
+    cbor(mut out, major: 5, n: 3)
+    cbor_bytes(mut out, 3, bytes_of("fmt"))
+    cbor_bytes(mut out, 3, bytes_of("none"))
+    cbor_bytes(mut out, 3, bytes_of("attStmt"))
+    cbor(mut out, major: 5, n: 0)
+    cbor_bytes(mut out, 3, bytes_of("authData"))
+    cbor_bytes(mut out, 2, auth)
+    out
+}
+
+/// A credential's attested data: no GUID, `id`, and an ES256 key whose x is 7s and y 9s.
+fn attested(id: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::filled(16, u8(0))
+    out.push(0)
+    out.push(u8(id.len()))
+    for b in id {
+        out.push(b)
+    }
+    cbor(mut out, major: 5, n: 5)
+    for (label, value) in [(1, 2), (3, -7), (-1, 1)] {
+        if label >= 0 { cbor(mut out, major: 0, n: u32(label)) } else {
+            cbor(mut out, major: 1, n: u32(-1 - label))
+        }
+        if value >= 0 { cbor(mut out, major: 0, n: u32(value)) } else {
+            cbor(mut out, major: 1, n: u32(-1 - value))
+        }
+    }
+    cbor(mut out, major: 1, n: 1)
+    cbor_bytes(mut out, 2, [7; 32])
+    cbor(mut out, major: 1, n: 2)
+    cbor_bytes(mut out, 2, [9; 32])
+    out
+}
+
+fn client(kind: str, challenge: str, origin: str) -> Vec<u8> {
+    let text = f"{{\"type\":\"{kind}\",\"challenge\":\"{challenge}\",\"origin\":\"{origin}\",\"crossOrigin\":false}}"
+    Vec::from(text.as_bytes())
+}
+
+@test
+fn base64url_is_rfc_4648s_without_padding() {
+    assert(base64url([]) == String::from(""))
+    assert(base64url([251, 255]) == String::from("-_8"))
+    assert(base64url(bytes_of("foobar")) == String::from("Zm9vYmFy"))
+    assert(base64url(bytes_of("fooba")) == String::from("Zm9vYmE"))
+}
+
+@test
+fn a_registration_gives_its_key_and_every_check_refuses_what_it_should() {
+    let e = expected()
+    let challenge = base64url(e.challenge)
+    let id = [5, 6, 7]
+    let good = client("webauthn.create", challenge.as_str(), "https://wrela.dev")
+    let made = attestation(data("wrela.dev", PRESENT | VERIFIED | ATTESTED, 0, attested(id)))
+    let Ok(c) = registration(id, good, made, e) else { panic("a registration") }
+    assert(
+        c.algorithm == -7 && c.key.len() == 65 && c.key[0] == 4 && c.key[1] == 7 && c.key[64] == 9,
+    )
+    assert(c.id.len() == 3 && c.counter == 0 && c.signature() == Signature::Es256)
+    let refused = [
+        registration(id, client("webauthn.get", challenge.as_str(), "https://wrela.dev"), made, e),
+        registration(id, client("webauthn.create", "AQID", "https://wrela.dev"), made, e),
+        registration(
+            id,
+            client("webauthn.create", challenge.as_str(), "https://evil.example"),
+            made,
+            e,
+        ),
+        registration(
+            id,
+            good,
+            attestation(data("evil.example", PRESENT | VERIFIED | ATTESTED, 0, attested(id))),
+            e,
+        ),
+        registration(
+            id,
+            good,
+            attestation(data("wrela.dev", PRESENT | ATTESTED, 0, attested(id))),
+            e,
+        ),
+        registration([5, 6, 8], good, made, e),
+        registration(id, good, [1, 2, 3], e),
+    ]
+    for r in refused {
+        assert(r.is_err(), "refused")
+    }
+}
+
+@test
+fn an_assertion_gives_what_its_signature_covers_and_its_counter_must_go_up() {
+    let e = expected()
+    let challenge = base64url(e.challenge)
+    let stored = Credential { id: Vec::from([1]), algorithm: -7, key: Vec::new(), counter: 4 }
+    let cd = client("webauthn.get", challenge.as_str(), "https://wrela.dev")
+    let auth = data("wrela.dev", PRESENT | VERIFIED, 5, [])
+    let Ok(s) = assertion(cd, auth, e, stored) else { panic("an assertion") }
+    assert(s.counter == 5 && s.message.len() == 37 + 32, f"{s.message.len()} bytes")
+    let hash = sha256(cd)
+    assert(s.message[36] == 5 && s.message[37] == hash[0] && s.message[68] == hash[31])
+    assert(
+        assertion(cd, data("wrela.dev", PRESENT | VERIFIED, 4, []), e, stored).is_err(),
+        "a counter that didn't go up",
+    )
+    var synced = stored.clone()
+    synced.counter = 0
+    assert(
+        assertion(cd, data("wrela.dev", PRESENT | VERIFIED, 0, []), e, synced).is_ok(),
+        "both 0: a synced passkey",
+    )
+    assert(assertion(cd, data("wrela.dev", PRESENT, 5, []), e, stored).is_err(), "not verified")
+}

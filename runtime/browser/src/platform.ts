@@ -36,6 +36,79 @@ export function linkUrl(text: string): string {
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) throw new Error("a link is an http or https URL");
   return url.href;
 }
+/** The passkeys' algorithms, by their COSE numbers, in the order a site prefers them: ES256,
+ * Ed25519 and RS256 (std::crypto checks each). */
+export const PASSKEY_ALGORITHMS = [-7, -8, -257];
+
+/** What a page's `navigator.credentials` gives for passkeys. */
+export type Credentials = Pick<CredentialsContainer, "create" | "get">;
+
+/** Credential IDs, as a count then each. */
+function credentialIds(r: Reader): Uint8Array<ArrayBuffer>[] {
+  const n = r.u32();
+  if (n > 64) throw new Error("too many credentials");
+  return Array.from({ length: n }, () => r.chunk());
+}
+
+/** `passkey/create` (compiler/std/host.wrela's `create_passkey`): the relying party's ID and name,
+ * the user's handle, name and shown name, the challenge, the credentials to exclude, and a
+ * timeout in milliseconds → the new credential's ID, the client's data and the attestation
+ * object. Every passkey is discoverable and verifies its person, with no attestation. */
+export async function createPasskey(body: Bytes, credentials: Credentials): Promise<Bytes> {
+  const r = new Reader(body);
+  const rp = { id: r.str(), name: r.str() };
+  const user = { id: r.chunk(), name: r.str(), displayName: r.str() };
+  const challenge = r.chunk();
+  const exclude = credentialIds(r);
+  const timeout = r.u32();
+  r.end();
+  const credential = await credentials.create({
+    publicKey: {
+      rp, user, challenge, timeout,
+      pubKeyCredParams: PASSKEY_ALGORITHMS.map(alg => ({ type: "public-key" as const, alg })),
+      excludeCredentials: exclude.map(id => ({ type: "public-key" as const, id })),
+      authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "required" },
+      attestation: "none",
+    },
+  }) as PublicKeyCredential | null;
+  if (!credential || credential.type !== "public-key") throw new Error("no passkey was made");
+  const response = credential.response as AuthenticatorAttestationResponse;
+  return new Writer()
+    .chunk(new Uint8Array(credential.rawId))
+    .chunk(new Uint8Array(response.clientDataJSON))
+    .chunk(new Uint8Array(response.attestationObject))
+    .bytes();
+}
+
+/** `passkey/get` (compiler/std/host.wrela's `use_passkey`): the relying party's ID, the challenge,
+ * the credentials allowed (none: any the person chooses), and a timeout in milliseconds → the
+ * credential's ID, the client's data, the authenticator's data, the signature and the user's
+ * handle (empty if the authenticator gave none). The person's verification is required. */
+export async function usePasskey(body: Bytes, credentials: Credentials): Promise<Bytes> {
+  const r = new Reader(body);
+  const rpId = r.str();
+  const challenge = r.chunk();
+  const allow = credentialIds(r);
+  const timeout = r.u32();
+  r.end();
+  const credential = await credentials.get({
+    publicKey: {
+      rpId, challenge, timeout,
+      allowCredentials: allow.map(id => ({ type: "public-key" as const, id })),
+      userVerification: "required",
+    },
+  }) as PublicKeyCredential | null;
+  if (!credential || credential.type !== "public-key") throw new Error("no passkey was used");
+  const response = credential.response as AuthenticatorAssertionResponse;
+  return new Writer()
+    .chunk(new Uint8Array(credential.rawId))
+    .chunk(new Uint8Array(response.clientDataJSON))
+    .chunk(new Uint8Array(response.authenticatorData))
+    .chunk(new Uint8Array(response.signature))
+    .chunk(response.userHandle ? new Uint8Array(response.userHandle) : new Uint8Array())
+    .bytes();
+}
+
 const CURSORS = new Set(["default", "pointer", "text", "grab", "grabbing", "crosshair", "move", "ew-resize", "nwse-resize", "nesw-resize"]);
 /** What `environment`'s capabilities word says this host has (runtime/browser): its bits. */
 export const PASTE_EVENTS = 1;
@@ -472,6 +545,8 @@ export class BrowserPlatform {
         input.click();
       });
     }
+    if (service === "passkey/create") return createPasskey(body, navigator.credentials);
+    if (service === "passkey/get") return usePasskey(body, navigator.credentials);
     throw new Error(`this host has no capability ${service}`);
   }
 }

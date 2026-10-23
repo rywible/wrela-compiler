@@ -41,11 +41,21 @@ webp = { version = "0.3", default-features = false }
 # Compiled code's names in the code cache (`code`), and the drive service's builds by their
 # WASM: SHA-256, already the CLI's.
 sha2 = "0.10"
+# A server's store (`services`): SQLite, built in, so the host needs no system library.
+rusqlite = { version = "0.37", features = ["bundled"] }
+# A server's signature checks and randomness (`services`): the RustCrypto and dalek crates, so
+# no cryptography is written here.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
+getrandom = "0.3"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 wat = "1.260"
+# A seeded generator for the RSA key a test signs with.
+rand_chacha = "0.3"
 
 [lints]
 workspace = true

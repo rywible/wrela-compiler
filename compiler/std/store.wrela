@@ -1,0 +1,206 @@
+// A server's store (language.md §19.4): keys and values, both bytes, kept in order of their keys,
+// which every room of the server shares and which outlives a build (a room's journal is its
+// build's alone). A leaderboard, an account, anything a server keeps for longer than a room lives
+// here; a room's log is for what its peers share.
+//
+// Reading is a request, answered on a later call from what is committed when the host takes it:
+// `get` one key, or `scan` the keys in a range, in order either way. Writing is a command:
+// `put` and `delete` take effect when the call returns, all of a call's writes in one transaction,
+// before the call's records are kept and before anything it sent goes. So a peer never hears of a
+// write that isn't kept. A crash after the writes and before the records leaves the writes kept and
+// the call's event not settled: its peer sends it again, so a write should be the same when it is
+// made again (a put of a key made from the event, not of a counter).
+//
+// Keys sort as bytes, so a number in a key sorts as a number only big-endian and of a fixed width:
+// `append_u32` and `append_u64` put one there.
+
+use std::host::request
+use std::io::Pending
+
+/// The longest key (bytes).
+pub const MAX_KEY: u32 = 1024
+/// The longest value (bytes).
+pub const MAX_VALUE: u32 = 1048576
+
+/// Asks for the value of `key`: `value` reads the answer.
+@server
+pub fn get(key: [u8]) -> Pending<u8> {
+    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
+    request("store/get", key)
+}
+
+/// The value a `get` answered with, or none if the key has none.
+pub fn value(answer: [u8]) -> Option<Vec<u8>> {
+    if answer.len() == 0 || answer[0] != 1 {
+        return None
+    }
+    var v: Vec<u8> = Vec::with_capacity(answer.len() - 1)
+    for i in 1..answer.len() {
+        v.push(answer[i])
+    }
+    Some(v)
+}
+
+/// Asks for at most `limit` entries whose keys are at or after `from` and before `to` (an empty
+/// `to`: no end), in order of their keys, or from the last down with `down`: `entries` reads the
+/// answer. It may hold fewer than `limit` (past 1 MiB of keys and values it stops early): the
+/// next scan starts after the last key it gave.
+@server
+pub fn scan(from: [u8], to: [u8], limit: u32, down: bool = false) -> Pending<u8> {
+    assert(from.len() <= MAX_KEY && to.len() <= MAX_KEY, "a store key is at most 1024 bytes")
+    var body: Vec<u8> = Vec::with_capacity(from.len() + to.len() + 13)
+    chunk(mut body, from)
+    chunk(mut body, to)
+    word(mut body, limit)
+    body.push(if down { 1 } else { 0 })
+    request("store/scan", body)
+}
+
+/// A key and its value.
+pub struct Entry: Clone {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// The entries a `scan` answered with, in its order, or none if the answer isn't one.
+pub fn entries(answer: [u8]) -> Option<Vec<Entry>> {
+    var at = 0
+    let n = read_word(answer, mut at)?
+    var out: Vec<Entry> = Vec::new()
+    for _ in 0..n {
+        let key = read_chunk(answer, mut at)?
+        let value = read_chunk(answer, mut at)?
+        out.push(Entry { key, value })
+    }
+    if at != answer.len() {
+        return None
+    }
+    Some(out)
+}
+
+/// Sets `key`'s value to `value` when the call returns.
+@server
+pub fn put(key: [u8], value: [u8]) {
+    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
+    assert(value.len() <= MAX_VALUE, "a store value is at most 1 MiB")
+    var body: Vec<u8> = Vec::with_capacity(key.len() + value.len() + 9)
+    body.push(1)
+    chunk(mut body, key)
+    chunk(mut body, value)
+    let _ = request("store/write", body)
+}
+
+/// Removes `key` and its value when the call returns.
+@server
+pub fn delete(key: [u8]) {
+    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
+    var body: Vec<u8> = Vec::with_capacity(key.len() + 5)
+    body.push(2)
+    chunk(mut body, key)
+    let _ = request("store/write", body)
+}
+
+/// `key` with `x` at its end, big-endian, so keys sort by it as a number.
+pub fn append_u32(key: mut Vec<u8>, x: u32) {
+    for k in 0..4 {
+        key.push(u8((x >> (24 - 8 * k)) & 255))
+    }
+}
+
+/// `key` with `x` at its end, big-endian.
+pub fn append_u64(key: mut Vec<u8>, x: u64) {
+    for k in 0..8 {
+        key.push(u8((x >> (56 - 8 * k)) & 255))
+    }
+}
+
+/// The key just past every key that starts with `prefix`: a scan from `prefix` to it gives the
+/// keys that start with `prefix`. None if there's none (`prefix` is all 255s).
+pub fn past(prefix: [u8]) -> Option<Vec<u8>> {
+    var out: Vec<u8> = Vec::new()
+    for b in prefix {
+        out.push(b)
+    }
+    while out.len() > 0 {
+        let last = out[out.len() - 1]
+        if last < 255 {
+            out[out.len() - 1] = last + 1
+            return Some(out)
+        }
+        let _ = out.pop()
+    }
+    None
+}
+
+fn word(body: mut Vec<u8>, x: u32) {
+    for k in 0..4 {
+        body.push(u8((x >> (8 * k)) & 255))
+    }
+}
+
+fn chunk(body: mut Vec<u8>, bytes: [u8]) {
+    word(mut body, bytes.len())
+    for b in bytes {
+        body.push(b)
+    }
+}
+
+fn read_word(bytes: [u8], at: mut u32) -> Option<u32> {
+    if bytes.len() < at + 4 {
+        return None
+    }
+    var x = 0
+    for k in 0..4 {
+        x = x | (u32(bytes[at + k]) << (8 * k))
+    }
+    at += 4
+    Some(x)
+}
+
+fn read_chunk(bytes: [u8], at: mut u32) -> Option<Vec<u8>> {
+    let n = read_word(bytes, mut at)?
+    if bytes.len() - at < n {
+        return None
+    }
+    var out: Vec<u8> = Vec::with_capacity(n)
+    for i in 0..n {
+        out.push(bytes[at + i])
+    }
+    at += n
+    Some(out)
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+@test
+fn numbers_in_keys_sort_as_numbers() {
+    var a: Vec<u8> = Vec::new()
+    var b: Vec<u8> = Vec::new()
+    append_u32(mut a, 255)
+    append_u32(mut b, 256)
+    // As bytes: 0 0 0 255 against 0 0 1 0, so 255 first.
+    assert(a[2] < b[2], "big-endian")
+    var c: Vec<u8> = Vec::new()
+    append_u64(mut c, 1 << 40)
+    assert(c.len() == 8 && c[2] == 1 && c[7] == 0)
+}
+
+@test
+fn past_a_prefix_is_the_first_key_after_all_of_its_keys() {
+    let p = past([7, 255, 255]).expect("one after")
+    assert(p.len() == 1 && p[0] == 8)
+    assert(past([255, 255]).is_none())
+    let q = past([1, 2]).expect("one after")
+    assert(q.len() == 2 && q[1] == 3)
+}
+
+@test
+fn a_scans_answer_reads_back_and_a_cut_one_does_not() {
+    // Two entries: "a" = [1], "bc" = [].
+    let answer = [2, 0, 0, 0, 1, 0, 0, 0, 97, 1, 0, 0, 0, 1, 2, 0, 0, 0, 98, 99, 0, 0, 0, 0]
+    let es = entries(answer).expect("two entries")
+    assert(es.len() == 2 && es[0].key[0] == 97 && es[0].value[0] == 1 && es[1].value.len() == 0)
+    assert(entries([2, 0, 0, 0, 1, 0, 0, 0, 97]).is_none(), "cut short")
+    assert(value([1, 5, 6]).expect("found").len() == 2)
+    assert(value([0]).is_none())
+}

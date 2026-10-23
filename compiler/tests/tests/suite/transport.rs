@@ -41,6 +41,7 @@ fn start_build(
         build: Arc::new(ServerBuild::from_wasm(server).expect("a server build")),
         build_hash: wrela_abi::ticks::wasm_hash(server),
         data,
+        services: None,
         port,
         identity,
         limits: Limits::default(),

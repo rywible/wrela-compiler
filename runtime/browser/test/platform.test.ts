@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import type { Semantics } from "../src/semantics.ts";
-import { BrowserPlatform, decodeImage, environment, exportName, iconLink, linkUrl, MESSAGE_LIMIT, PASTE_EVENTS, PortRpc, prefetch, programUrl, sameOriginAddress, SEMANTICS, shownName, TEXT_INPUT, wordAt, wordBytes } from "../src/platform.ts";
+import { BrowserPlatform, createPasskey, decodeImage, PASSKEY_ALGORITHMS, usePasskey, environment, exportName, iconLink, linkUrl, MESSAGE_LIMIT, PASTE_EVENTS, PortRpc, prefetch, programUrl, sameOriginAddress, SEMANTICS, shownName, TEXT_INPUT, wordAt, wordBytes } from "../src/platform.ts";
 import { Reader, Writer } from "../src/wire.ts";
 
 test("program channels correlate replies and close outstanding requests", async () => {
@@ -453,4 +453,68 @@ test("a top-level program moves through its own addresses, and hears Back and Fo
     platform.dispose();
     names.forEach((n, i) => { const d = saved[i]; if (d) Object.defineProperty(globalThis, n, d); else Reflect.deleteProperty(globalThis, n); });
   }
+});
+
+const buffer = (bytes: number[]): ArrayBuffer => new Uint8Array(bytes).buffer;
+
+test("making a passkey asks for a discoverable, verified key of passkeys' algorithms, and answers its bytes", async () => {
+  let asked: CredentialCreationOptions | undefined;
+  const credentials = {
+    create: async (options: CredentialCreationOptions) => {
+      asked = options;
+      return { type: "public-key", rawId: buffer([1, 2]), response: { clientDataJSON: buffer([123, 125]), attestationObject: buffer([9]) } };
+    },
+    get: async () => null,
+  } as unknown as Parameters<typeof createPasskey>[1];
+  const body = new Writer().str("wrela.dev").str("wrela").chunk(new Uint8Array([7, 7])).str("bea").str("Bea")
+    .chunk(new Uint8Array([5, 6, 7])).u32(1).chunk(new Uint8Array([3])).u32(60_000).bytes();
+  const answer = new Reader(await createPasskey(body, credentials));
+  expect([...answer.chunk()]).toEqual([1, 2]);
+  expect([...answer.chunk()]).toEqual([123, 125]);
+  expect([...answer.chunk()]).toEqual([9]);
+  answer.end();
+  const o = asked!.publicKey!;
+  expect(o.rp).toEqual({ id: "wrela.dev", name: "wrela" });
+  expect(o.user.name).toBe("bea");
+  expect([...new Uint8Array(o.user.id as ArrayBuffer)]).toEqual([7, 7]);
+  expect([...new Uint8Array(o.challenge as ArrayBuffer)]).toEqual([5, 6, 7]);
+  expect(o.pubKeyCredParams.map(p => p.alg)).toEqual(PASSKEY_ALGORITHMS);
+  expect(o.authenticatorSelection).toEqual({ residentKey: "required", requireResidentKey: true, userVerification: "required" });
+  expect(o.attestation).toBe("none");
+  expect(o.excludeCredentials!.length).toBe(1);
+  expect(o.timeout).toBe(60_000);
+});
+
+test("using a passkey asks for the person's verification and answers the assertion's bytes", async () => {
+  let asked: CredentialRequestOptions | undefined;
+  const credentials = {
+    create: async () => null,
+    get: async (options: CredentialRequestOptions) => {
+      asked = options;
+      return { type: "public-key", rawId: buffer([4]), response: { clientDataJSON: buffer([1]), authenticatorData: buffer([2, 2]), signature: buffer([3]), userHandle: null } };
+    },
+  } as unknown as Parameters<typeof usePasskey>[1];
+  const body = new Writer().str("wrela.dev").chunk(new Uint8Array([8])).u32(0).u32(30_000).bytes();
+  const answer = new Reader(await usePasskey(body, credentials));
+  expect([...answer.chunk()]).toEqual([4]);
+  expect([...answer.chunk()]).toEqual([1]);
+  expect([...answer.chunk()]).toEqual([2, 2]);
+  expect([...answer.chunk()]).toEqual([3]);
+  expect([...answer.chunk()]).toEqual([]); // no user handle
+  answer.end();
+  expect(asked!.publicKey!.rpId).toBe("wrela.dev");
+  expect(asked!.publicKey!.userVerification).toBe("required");
+  expect(asked!.publicKey!.allowCredentials).toEqual([]);
+});
+
+test("a passkey request with bytes past its end, or a person who cancels, fails", async () => {
+  const credentials = {
+    create: async () => { throw new DOMException("cancelled", "NotAllowedError"); },
+    get: async () => null,
+  } as unknown as Parameters<typeof usePasskey>[1];
+  const body = new Writer().str("wrela.dev").chunk(new Uint8Array([8])).u32(0).u32(30_000).bytes();
+  await expect(usePasskey(new Writer().raw(body).u8(0).bytes(), credentials)).rejects.toThrow("longer than it says");
+  await expect(usePasskey(body, credentials)).rejects.toThrow("no passkey was used");
+  const create = new Writer().str("a").str("b").chunk(new Uint8Array([1])).str("c").str("d").chunk(new Uint8Array([2])).u32(0).u32(1).bytes();
+  await expect(createPasskey(create, credentials)).rejects.toThrow("cancelled");
 });

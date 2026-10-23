@@ -1,0 +1,103 @@
+// A server's cryptography (language.md §19.4): randomness from the operating system, and signature
+// checks by the algorithms passkeys use, done by the server host with vetted libraries. Nothing
+// here is cryptography of std's own: each function is a request, answered on a later call.
+//
+// - `random(n)`: `n` bytes no one can guess, for a challenge, a session's token or a recovery code.
+// - `verify(algorithm, key, message, signature)`: whether `signature` is `key`'s over `message`.
+//   `verified` reads the answer. A key that isn't one of the algorithm's fails the request; a
+//   signature that's malformed is simply not the key's.
+
+use std::host::request
+use std::io::Pending
+
+/// The most bytes `random` gives at once.
+pub const MAX_RANDOM: u32 = 1024
+
+/// A signature algorithm, and the form of its keys and signatures.
+pub enum Signature: Copy + Eq {
+    /// ECDSA on P-256 with SHA-256 (COSE -7): a key is a SEC1 point, 65 bytes uncompressed
+    /// (`p256_key` makes one), and a signature is DER-encoded, as WebAuthn gives it.
+    Es256,
+    /// Ed25519 (COSE -8): a key is 32 bytes, and a signature 64.
+    Ed25519,
+    /// RSA PKCS #1 v1.5 with SHA-256 (COSE -257): a key is its modulus and exponent (`rsa_key`
+    /// makes one).
+    Rs256,
+}
+
+/// Asks for `n` random bytes (at most `MAX_RANDOM`).
+@server
+pub fn random(n: u32) -> Pending<u8> {
+    assert(n <= MAX_RANDOM, "at most 1024 random bytes at once")
+    var body: Vec<u8> = Vec::new()
+    word(mut body, n)
+    request("crypto/random", body)
+}
+
+/// Asks whether `signature` is `key`'s over `message`, by `algorithm`: `verified` reads the
+/// answer.
+@server
+pub fn verify(algorithm: Signature, key: [u8], message: [u8], signature: [u8]) -> Pending<u8> {
+    var body: Vec<u8> = Vec::with_capacity(key.len() + message.len() + signature.len() + 13)
+    body.push(match algorithm {
+        Signature::Es256 => 1,
+        Signature::Ed25519 => 2,
+        Signature::Rs256 => 3,
+    })
+    chunk(mut body, key)
+    chunk(mut body, message)
+    chunk(mut body, signature)
+    request("crypto/verify", body)
+}
+
+/// Whether a `verify`'s answer says the signature is the key's.
+pub fn verified(answer: [u8]) -> bool {
+    answer.len() == 1 && answer[0] == 1
+}
+
+/// A P-256 key as `verify` takes it, from its coordinates (32 bytes each, big-endian, as COSE
+/// gives them): the uncompressed SEC1 point.
+pub fn p256_key(x: [u8], y: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::with_capacity(65)
+    out.push(4)
+    for b in x {
+        out.push(b)
+    }
+    for b in y {
+        out.push(b)
+    }
+    out
+}
+
+/// An RSA key as `verify` takes it, from its modulus and exponent (big-endian, as COSE gives
+/// them).
+pub fn rsa_key(modulus: [u8], exponent: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::with_capacity(modulus.len() + exponent.len() + 8)
+    chunk(mut out, modulus)
+    chunk(mut out, exponent)
+    out
+}
+
+fn word(body: mut Vec<u8>, x: u32) {
+    for k in 0..4 {
+        body.push(u8((x >> (8 * k)) & 255))
+    }
+}
+
+fn chunk(body: mut Vec<u8>, bytes: [u8]) {
+    word(mut body, bytes.len())
+    for b in bytes {
+        body.push(b)
+    }
+}
+
+// ---- tests -------------------------------------------------------------------------------------
+
+@test
+fn keys_take_the_forms_the_host_reads() {
+    let p = p256_key([1; 32], [2; 32])
+    assert(p.len() == 65 && p[0] == 4 && p[1] == 1 && p[64] == 2)
+    let r = rsa_key([9, 9, 9], [1, 0, 1])
+    assert(r.len() == 14 && r[0] == 3 && r[7] == 3 && r[13] == 1)
+    assert(verified([1]) && !verified([0]) && !verified([]))
+}

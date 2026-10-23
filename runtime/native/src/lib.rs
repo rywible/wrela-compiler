@@ -37,6 +37,7 @@ pub mod pages;
 mod program;
 pub mod rooms;
 pub mod server;
+pub mod services;
 mod shared;
 pub mod tool;
 mod trace;
