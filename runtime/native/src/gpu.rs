@@ -592,13 +592,11 @@ impl Gpu {
         self.debug_flag = None;
         self.spare.clear();
         // A timer the host runs from the start begins again; one the last program asked for
-        // goes with it, as its asks and its labels' targets do.
+        // goes with it.
         self.timer = match self.timer.take() {
             Some(t) if t.keep => Some(Timer::new(&self.device, t.serial, true)),
             _ => None,
         };
-        self.asked.clear();
-        self.labelled.clear();
         self.take_pipelines(manifest, shaders)
     }
 
@@ -612,6 +610,10 @@ impl Gpu {
         self.resources.clear();
         self.bound_in.clear();
         self.debug_flag = None;
+        // The retiring program's asks for a time and its labels' targets go with it: a later
+        // build's requests reuse its numbers, and its handles name other resources.
+        self.asked.clear();
+        self.labelled.clear();
         Ok(())
     }
 
@@ -2368,6 +2370,60 @@ mod tests {
                 assert_eq!(gpu.read_buffer(1).unwrap(), count.to_le_bytes());
             }
             assert!(gpu.take_timings().unwrap().is_empty());
+            gpu.check_errors().unwrap();
+        }
+    }
+
+    /// A program's ask for a label's time (`std::gpu::timed`) is answered once, after a call
+    /// that ran the label's work, with its microseconds; a build that retires drops its asks, so
+    /// the next build's request numbers get no stale answer; and a run timed from its start still
+    /// keeps every timing beside a program's asks.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_timed_ask_is_answered_once_and_a_retired_build_drops_its_asks() {
+        use crate::program::Executor;
+        let mut manifest = Manifest::new("game.wasm");
+        manifest.pipelines.push(Pipeline {
+            name: "increment".into(),
+            shader: "increment.wgsl".into(),
+            stage: Stage::Compute { entry: "increment".into(), workgroup_size: [1, 1, 1] },
+            uniform: None,
+            bindings: vec![ResourceBinding {
+                binding: 0,
+                kind: BindingKind::ReadWrite,
+                stage: BindingStage::Both,
+                format: None,
+            }],
+            debug_flag: None,
+        });
+        let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
+                      @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
+        let shaders = [shader.to_string()];
+        for timing in [Timing::Off, Timing::Span] {
+            let mut gpu = Gpu::new(&manifest, &shaders, timing).unwrap();
+            let run = |gpu: &mut Gpu| {
+                gpu.create_buffer(1, 4);
+                gpu.execute(&Command::Label { name: "count" }).unwrap();
+                gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+                gpu.end_frame().unwrap();
+            };
+            gpu.ask_time(1, "count").unwrap();
+            assert!(gpu.times().is_empty(), "answered before the work ran");
+            run(&mut gpu);
+            let answered = gpu.times();
+            assert_eq!(answered.len(), 1);
+            let (request, us) = &answered[0];
+            let us = f32::from_le_bytes(us.clone().unwrap().try_into().unwrap());
+            assert!(*request == 1 && us.is_finite() && us >= 0.0, "{us}");
+            run(&mut gpu);
+            assert!(gpu.times().is_empty(), "answered twice");
+            if timing == Timing::Span {
+                assert_eq!(gpu.take_timings().unwrap().len(), 2, "the profiled run's timings");
+            }
+            gpu.ask_time(2, "count").unwrap();
+            gpu.reload(&manifest, &shaders).unwrap();
+            run(&mut gpu);
+            assert!(gpu.times().is_empty(), "a retired build's ask was answered");
             gpu.check_errors().unwrap();
         }
     }

@@ -512,8 +512,10 @@ class Timer {
   onRead: (() => void) | null = null;
   /** The submissions timed so far. */
   #submissions = 0;
-  /** The readbacks under way. */
-  readonly #reading: Promise<void>[] = [];
+  /** The readbacks under way, each until it's done. */
+  readonly #reading = new Set<Promise<void>>();
+  /** How many readbacks under way hold each frame's passes. */
+  readonly #outstanding = new Map<number, number>();
   readonly results: GpuTiming[] = [];
 
   /** `keep`: every timing is kept (`settled`), for a run timed from its start; a timer the
@@ -551,6 +553,8 @@ class Timer {
     const staging = this.device.createBuffer({ label: "timestamps", size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
     encoder.resolveQuerySet(this.#queries, 0, 2 * passes.length, this.#resolve, 0);
     encoder.copyBufferToBuffer(this.#resolve, 0, staging, 0, bytes);
+    const frames = [...new Set(passes.map((p) => p.frame))];
+    for (const f of frames) this.#outstanding.set(f, (this.#outstanding.get(f) ?? 0) + 1);
     return () => {
       const reading = staging.mapAsync(GPUMapMode.READ).then(() => {
         const t = new BigUint64Array(staging.getMappedRange());
@@ -567,11 +571,19 @@ class Timer {
           if (this.keep) this.results.push({ ...p, nanos, start, end, submission });
         });
         staging.unmap();
+      }).finally(() => {
+        staging.destroy();
+        this.#reading.delete(reading);
+        for (const f of frames) {
+          const n = this.#outstanding.get(f)! - 1;
+          if (n === 0) this.#outstanding.delete(f);
+          else this.#outstanding.set(f, n);
+        }
         this.onRead?.();
-      }).finally(() => staging.destroy());
+      });
       // A failed map may arrive before timings() waits for it.
       void reading.catch(() => {});
-      this.#reading.push(reading);
+      this.#reading.add(reading);
     };
   }
 
@@ -583,8 +595,19 @@ class Timer {
 
   /** Every timing read back so far, once the readbacks under way are done. */
   async settled(): Promise<GpuTiming[]> {
-    await Promise.all(this.#reading.splice(0));
+    await Promise.all([...this.#reading]);
     return this.results;
+  }
+
+  /** Whether every readback that holds frame `frame`'s passes, or an earlier frame's, is done. */
+  complete(frame: number): boolean {
+    for (const f of this.#outstanding.keys()) if (f <= frame) return false;
+    return true;
+  }
+
+  /** How many readbacks are under way. */
+  get reading(): number {
+    return this.#reading.size;
   }
 }
 
@@ -644,6 +667,7 @@ export class GpuExecutor {
   set frame(i: number) {
     this.#frame = i;
     this.#generation++;
+    if (this.#asked.length > 0) this.#answerTimes();
   }
   /** The serial timing mode's commands, waiting for `drain` to run them each pass and dispatch
    * alone; null in the other modes, which run each command as it comes. */
@@ -767,14 +791,15 @@ export class GpuExecutor {
     return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer }));
   }
 
-  /** Answers each ask whose label has been timed in a frame from the one it was asked in. */
+  /** Answers each ask whose label has been timed in a frame from the one it was asked in, once
+   * that frame has ended and all its timestamps are read: its whole time, not a submission's. */
   #answerTimes(): void {
-    const latest = this.#timer?.latest;
-    if (latest === undefined) return;
+    const timer = this.#timer;
+    if (timer === null) return;
     for (let i = this.#asked.length - 1; i >= 0; i--) {
       const ask = this.#asked[i]!;
-      const l = latest.get(ask.label);
-      if (l === undefined || l.frame < ask.from) continue;
+      const l = timer.latest.get(ask.label);
+      if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame)) continue;
       this.#asked.splice(i, 1);
       ask.answer(new Uint8Array(new Float32Array([l.nanos / 1000]).buffer));
     }
