@@ -1,5 +1,5 @@
 {
-  "manifest_version": 8,
+  "manifest_version": 9,
   "stream_version": 10,
   "wasm": "game.wasm",
   "pipelines": [
@@ -12,7 +12,8 @@
       "targets": [
         {
           "color": "rgba8unorm",
-          "depth": false
+          "depth": false,
+          "screen": true
         }
       ],
       "uniform": {

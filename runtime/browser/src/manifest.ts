@@ -12,6 +12,7 @@ import {
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
   MAX_WORKGROUP_INVOCATIONS,
   MAX_WORKGROUP_SIZE,
+  SCREEN_FORMAT,
   STAGE_LIMITS,
   STREAM_VERSION,
   TEXTURE_FORMATS,
@@ -75,16 +76,24 @@ export type Stage =
     };
 
 /** What a render pipeline draws into: a colour target's format (null in a pass that draws only
- * depths; the screen's is `SCREEN_FORMAT`), and a depth target (`depth32float`) or none. */
+ * depths), and a depth target (`depth32float`) or none. The screen's says it's the screen: its
+ * format is `SCREEN_FORMAT` here, and the canvas may be in another (`ScreenTarget.format`). */
 export interface RenderTarget {
   color: TextureFormat | null;
   depth: boolean;
+  screen: boolean;
 }
 
-/** A target as errors name it: `rgba16float with depth`, `depth alone` (runtime/abi
+/** Whether two targets are the same. */
+export const sameTarget = (a: RenderTarget, b: RenderTarget) =>
+  a.color === b.color && a.depth === b.depth && a.screen === b.screen;
+
+/** A target as errors name it: `rgba16float with depth`, `depth alone`, `the screen` (runtime/abi
  * `RenderTarget`'s `Display`). */
 export const targetName = (t: RenderTarget) =>
-  t.color === null ? (t.depth ? "depth alone" : "nothing") : t.depth ? `${t.color} with depth` : t.color;
+  t.screen
+    ? t.depth ? "the screen with depth" : "the screen"
+    : t.color === null ? (t.depth ? "depth alone" : "nothing") : t.depth ? `${t.color} with depth` : t.color;
 
 export type Cull = "none" | "front" | "back";
 
@@ -174,7 +183,8 @@ function oneOfOr<T extends string, F extends string>(o: Json, key: string, where
   return o[key] === undefined ? fallback : oneOf(o, key, where, options);
 }
 
-/** A render pipeline's `targets`: each a colour format or null, and whether it has depth. */
+/** A render pipeline's `targets`: each a colour format or null, whether it has depth, and
+ * whether it's the screen (false where the key is missing). */
 function renderTargets(o: Json, where: string): RenderTarget[] {
   const ts = o["targets"];
   if (!Array.isArray(ts)) throw new ManifestError(`${where}.targets must be an array`);
@@ -184,7 +194,7 @@ function renderTargets(o: Json, where: string): RenderTarget[] {
     if (!("color" in to)) throw new ManifestError(`${tw}.color must be a format or null`);
     const color = to["color"] === null ? null : (oneOf(to, "color", tw, FORMAT_NAMES) as TextureFormat);
     if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
-    return { color, depth: to["depth"] };
+    return { color, depth: to["depth"], screen: flag(to, "screen", tw, false) };
   });
 }
 
@@ -397,13 +407,16 @@ export function validateManifest(m: Manifest): void {
       if (p.targets.length === 0) throw err(`pipeline ${i} names no targets`);
       p.targets.forEach((t, k) => {
         const name = targetName(t);
-        if (p.targets.slice(0, k).some((s) => s.color === t.color && s.depth === t.depth)) {
+        if (p.targets.slice(0, k).some((s) => sameTarget(s, t))) {
           throw err(`pipeline ${i} names the target ${name} twice`);
         }
         const format = TEXTURE_FORMATS.find((f) => f.name === t.color);
         const integer = format?.uint ?? false;
         if (t.color === null && !t.depth) {
           throw err(`pipeline ${i}'s target ${k} draws into nothing: a target has a colour, a depth, or both`);
+        }
+        if (t.screen && t.color !== SCREEN_FORMAT) {
+          throw err(`pipeline ${i}'s target ${k} is the screen, whose colour is ${SCREEN_FORMAT}, not ${t.color ?? "none"}`);
         }
         const why =
           p.writes_depth && !t.depth

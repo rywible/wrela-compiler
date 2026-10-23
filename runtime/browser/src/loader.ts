@@ -156,7 +156,7 @@ export async function startProgram(
   gpu: GpuOptions = {},
 ): Promise<Program> {
   const started = performance.now();
-  const pipelines = buildPipelines(device, build.manifest, build.shaders, gpu.cache);
+  const pipelines = buildPipelines(device, build.manifest, build.shaders, screen.format, gpu.cache);
   const compiled = build.compiled ?? (await Program.compile(build.wasm));
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);

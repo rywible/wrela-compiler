@@ -920,14 +920,14 @@ fn draw_target(
     let t = fl.concrete(t);
     let p = &fl.cx.checked.program;
     // `Pass<F>`'s and `DepthPass<F>`'s `F` is the target texture's format, as `Texture<F>`'s.
-    let format = Some(texture_format(fl.cx, t));
-    let screen = Some(ir::TextureFormat::Rgba8);
+    let texture =
+        |depth| ir::RenderTarget { color: Some(texture_format(fl.cx, t)), depth, screen: false };
     let target = match p.lang_of_ty(t) {
-        Some(Lang::Pass) => ir::RenderTarget { color: format, depth: false },
-        Some(Lang::DepthPass) => ir::RenderTarget { color: format, depth: true },
-        Some(Lang::DepthOnlyPass) => ir::RenderTarget { color: None, depth: true },
-        Some(Lang::ScreenPass) => ir::RenderTarget { color: screen, depth: false },
-        Some(Lang::ScreenDepthPass) => ir::RenderTarget { color: screen, depth: true },
+        Some(Lang::Pass) => texture(false),
+        Some(Lang::DepthPass) => texture(true),
+        Some(Lang::DepthOnlyPass) => ir::RenderTarget { color: None, depth: true, screen: false },
+        Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
+        Some(Lang::ScreenDepthPass) => ir::RenderTarget::screen(true),
         _ => {
             let what = format!("a draw's pass is a `{}`, not a pass", p.display_ty(t));
             fl.cx.err(Diagnostic::internal(what));

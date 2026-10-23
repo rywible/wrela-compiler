@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MANIFEST_VERSION, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
+import { MANIFEST_VERSION, SCREEN_FORMAT, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
 import { Checker } from "../src/check.ts";
 import { type Manifest, type RenderTarget, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
@@ -47,7 +47,11 @@ export const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, ".
  * each colour format, with depth or without, and depth alone. */
 export function everyTarget(): RenderTarget[] {
   const colours = TEXTURE_FORMATS.filter((f) => !f.depth && !f.uint).map((f) => f.name as TextureFormat);
-  return [...colours.flatMap((color) => [false, true].map((depth) => ({ color, depth }))), { color: null, depth: true }];
+  return [
+    ...colours.flatMap((color) => [false, true].map((depth) => ({ color, depth, screen: false }))),
+    { color: null, depth: true, screen: false },
+    ...[false, true].map((depth): RenderTarget => ({ color: SCREEN_FORMAT, depth, screen: true })),
+  ];
 }
 
 /** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only

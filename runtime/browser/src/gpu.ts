@@ -77,10 +77,23 @@ export interface BuiltPipeline {
 
 /** Where passes on the screen draw. */
 export interface ScreenTarget {
-  /** The texture this frame's screen pass renders into (`SCREEN_FORMAT`). */
+  /** The format of the screen's textures, which the manifest's screen targets are built in: the
+   * canvas's preferred format in a normal run (`bgra8unorm` on some devices, which hold the same
+   * bytes as `SCREEN_FORMAT` in another order), `SCREEN_FORMAT` in test mode, which reads the
+   * screen back. Every program of a worker draws the screen in one format, so the pipelines a
+   * hot reload or a hand-over keeps (`PipelineCache`) are built in it. */
+  readonly format: GPUTextureFormat;
+  /** The texture this frame's screen pass renders into, of `format`. */
   texture(): GPUTexture;
   /** Called after a screen pass is recorded, with its encoder, before it's submitted. */
   afterPass?(encoder: GPUCommandEncoder): void;
+}
+
+/** The format the screen is drawn in. Test mode's is `SCREEN_FORMAT`, which it reads back and
+ * copies to the canvas. A normal run draws straight into the canvas in the device's preferred
+ * format (`bgra8unorm` on some), which spares the browser a copy of each frame. */
+export function screenFormat(testing: boolean): GPUTextureFormat {
+  return testing ? SCREEN_FORMAT : navigator.gpu.getPreferredCanvasFormat();
 }
 
 function compilationMessages(info: GPUCompilationInfo): string | null {
@@ -136,7 +149,8 @@ function colourFormat(b: ResourceBinding): TextureFormat {
   return b.format;
 }
 
-async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Promise<BuiltPipeline> {
+/** Builds pipeline `p` from its WGSL; its screen targets' variants draw in `screenFormat`. */
+async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, screenFormat: GPUTextureFormat): Promise<BuiltPipeline> {
   const fail = (message: string) => new ShaderError(p.name, p.shader, message);
   const visibility =
     p.kind === "compute" ? GPUShaderStage.COMPUTE : GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT;
@@ -251,15 +265,17 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string): Pr
       };
       // A variant for each of its targets (the passes the program draws it in, which the
       // compiler knows), side by side: a shader's errors come at load, and no frame waits to
-      // compile one.
-      const targets = p.targets.map((t): [GPUTextureFormat | null, GPUTextureFormat | null] => [
-        t.color,
-        t.depth ? "depth32float" : null,
-      ]);
+      // compile one. The screen and a texture of its format share one.
+      const targets = new Map<string, [GPUTextureFormat | null, GPUTextureFormat | null]>();
+      for (const t of p.targets) {
+        const color = t.screen ? screenFormat : t.color;
+        const depth = t.depth ? "depth32float" : null;
+        targets.set(targetsKey(color, depth), [color, depth]);
+      }
       const made = await Promise.all(
-        targets.map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
+        [...targets.values()].map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
       );
-      targets.forEach(([c, d], i) => render!.variants.set(targetsKey(c, d), made[i]!));
+      [...targets.keys()].forEach((key, i) => render!.variants.set(key, made[i]!));
     }
   } catch (e) {
     throw fail(errorMessage(e));
@@ -273,11 +289,12 @@ export async function timeEachPipeline(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
+  screenFormat: GPUTextureFormat,
 ): Promise<{ name: string; kind: "compute" | "render"; ms: number }[]> {
   const each = [];
   for (const [i, p] of manifest.pipelines.entries()) {
     const started = performance.now();
-    await buildPipeline(device, p, shaders[i]!);
+    await buildPipeline(device, p, shaders[i]!, screenFormat);
     each.push({ name: p.name, kind: p.kind, ms: performance.now() - started });
   }
   return each;
@@ -308,11 +325,11 @@ function biggestFirst(shaders: string[]): number[] {
 // drawing between shaders. Foreground startup still builds its pipelines together.
 const preparations = new WeakMap<GPUDevice, Promise<void>>();
 
-function preparePipeline(device: GPUDevice, pipeline: Pipeline, shader: string): Promise<BuiltPipeline> {
+function preparePipeline(device: GPUDevice, pipeline: Pipeline, shader: string, screenFormat: GPUTextureFormat): Promise<BuiltPipeline> {
   const previous = preparations.get(device) ?? Promise.resolve();
   const built = previous
     .then(() => new Promise<void>((resolve) => setTimeout(resolve, 16)))
-    .then(() => buildPipeline(device, pipeline, shader));
+    .then(() => buildPipeline(device, pipeline, shader, screenFormat));
   // A bad shader fails its caller, but must not poison the next preparation on this device.
   const settled = built.then(() => {}, () => {});
   preparations.set(device, settled);
@@ -321,39 +338,48 @@ function preparePipeline(device: GPUDevice, pipeline: Pipeline, shader: string):
 }
 
 /** Queues the pipelines of a build got ready for a hand-over (`std::reload::prepare`)
- * that none of `have` holds: the build's pipelines by key, including pending preparations. */
-export function preparePipelines(device: GPUDevice, manifest: Manifest, shaders: string[], have: readonly PipelineCache[]): PipelineCache {
+ * that none of `have` holds: the build's pipelines by key, including pending preparations. Its
+ * screen targets draw in `screenFormat` (`ScreenTarget.format`). */
+export function preparePipelines(
+  device: GPUDevice,
+  manifest: Manifest,
+  shaders: string[],
+  screenFormat: GPUTextureFormat,
+  have: readonly PipelineCache[],
+): PipelineCache {
   const out: PipelineCache = new Map();
   for (const i of biggestFirst(shaders)) {
     const p = manifest.pipelines[i]!;
     const key = pipelineKey(p, shaders[i]!);
     if (out.has(key)) continue;
     const held = have.map((c) => c.get(key)).find((b) => b !== undefined);
-    out.set(key, held ?? preparePipeline(device, p, shaders[i]!));
+    out.set(key, held ?? preparePipeline(device, p, shaders[i]!, screenFormat));
   }
   return out;
 }
 
 /** Starts building every pipeline, all at once: each one's promise. `shaders[i]` is pipeline
- * `i`'s WGSL. With `cache` (a hot reload), a pipeline whose manifest entry and WGSL are the same
- * as one of the last build's is kept, and the cache then holds this build's pipelines alone. */
+ * `i`'s WGSL, and screen targets draw in `screenFormat` (`ScreenTarget.format`). With `cache` (a
+ * hot reload), a pipeline whose manifest entry and WGSL are the same as one of the last build's
+ * is kept, and the cache then holds this build's pipelines alone. */
 export function buildPipelines(
   device: GPUDevice,
   manifest: Manifest,
   shaders: string[],
+  screenFormat: GPUTextureFormat,
   cache?: PipelineCache,
 ): Promise<BuiltPipeline>[] {
   const order = biggestFirst(shaders);
   const built: Promise<BuiltPipeline>[] = [];
   if (!cache) {
-    for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!);
+    for (const i of order) built[i] = buildPipeline(device, manifest.pipelines[i]!, shaders[i]!, screenFormat);
     return built;
   }
   const used: PipelineCache = new Map();
   for (const i of order) {
     const p = manifest.pipelines[i]!;
     const key = pipelineKey(p, shaders[i]!);
-    const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!);
+    const pipeline = used.get(key) ?? cache.get(key) ?? buildPipeline(device, p, shaders[i]!, screenFormat);
     used.set(key, pipeline);
     built[i] = pipeline;
   }
@@ -1346,7 +1372,7 @@ export class GpuExecutor {
     const onScreen = pass.color === SCREEN;
     const color = onScreen || pass.color === NONE ? null : this.#texture(pass.color);
     const colorView = onScreen ? this.screen.texture().createView() : (color?.view ?? null);
-    const colorFormat: GPUTextureFormat | null = onScreen ? SCREEN_FORMAT : (color?.format ?? null);
+    const colorFormat: GPUTextureFormat | null = onScreen ? this.screen.format : (color?.format ?? null);
     const depth = pass.depth === NONE ? null : this.#texture(pass.depth);
     // Everything that can flush happens before anything is recorded for this pass.
     this.#reserveTimestamps();

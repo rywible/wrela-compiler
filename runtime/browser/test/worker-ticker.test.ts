@@ -1,7 +1,7 @@
 // The render worker's ticker scheduling and failures, with CPU stand-ins for its GPU and program.
 import { expect, test } from "bun:test";
 import { InputRing } from "../src/input.ts";
-import { TICK_ORIGIN } from "../src/abi.gen.ts";
+import { SCREEN_FORMAT, TICK_ORIGIN } from "../src/abi.gen.ts";
 import { Inbox } from "../src/net.ts";
 import { TickerControl } from "../src/ticker.ts";
 import { TEST_DEFAULTS } from "../src/testmode.ts";
@@ -24,6 +24,7 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
   const stopped = Promise.withResolvers<string>();
   const reported = Promise.withResolvers<void>();
   const done: string[] = [];
+  const configured: GPUTextureFormat[] = [];
   const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {} };
   const device = {
     createTexture: () => ({ width: 1, height: 1 }), pushErrorScope() {}, popErrorScope: async () => null,
@@ -121,10 +122,13 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
     const source = `${await bundle.outputs[0]!.text()}\n// ticker scenario ${scenarios++}\n`;
     await import(`data:text/javascript;base64,${Buffer.from(source).toString("base64")}`);
     self.onmessage!({ data: {
-      type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, canvas: { getContext: () => ({ configure() {} }) },
+      type: "start", base: "https://site.example/", storage: null, live: reloading ? 0 : null, canvas: { getContext: () => ({ configure: (c: GPUCanvasConfiguration) => configured.push(c.format) }) },
       input: InputRing.create().buffer, width: 1, height: 1, test: { ...TEST_DEFAULTS, frames: 4, width: 1, height: 1, fps: 60, saturate: 1 },
     } } as unknown as MessageEvent<ToWorker>);
     const failure = await Promise.race([stopped.promise, Bun.sleep(2000).then(() => "timed out")]);
+    // Test mode reads the screen back in SCREEN_FORMAT and copies it to the canvas, whatever
+    // format the device prefers.
+    expect(configured).toEqual([SCREEN_FORMAT]);
     expect(await Promise.race([reported.promise.then(() => true), Bun.sleep(2000).then(() => false)])).toBe(true);
     if (asynchronousFailure !== null) {
       expect(failure).toContain(asynchronousFailure === "frame" ? "audio stopped during the frame" : asynchronousFailure === "readback" ? "readback mapping failed" : "audio stopped during results");

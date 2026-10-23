@@ -7,7 +7,7 @@ import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
 import { GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type GpuExecutor, type PipelineCache, type Timing, timeEachPipeline } from "./gpu.ts";
+import { alignTo, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
@@ -113,10 +113,11 @@ function requestHost(service: string, bytes: Uint8Array<ArrayBuffer>): Promise<U
   });
 }
 
-function context(canvas: OffscreenCanvas, device: GPUDevice, usage: number): GPUCanvasContext {
+/** The canvas's WebGPU context, configured in `format`. */
+function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureFormat, usage: number): GPUCanvasContext {
   const ctx = canvas.getContext("webgpu");
   if (!ctx) throw new GpuError("the canvas has no WebGPU context");
-  ctx.configure({ device, format: SCREEN_FORMAT, alphaMode: "opaque", usage });
+  ctx.configure({ device, format, alphaMode: "opaque", usage });
   return ctx;
 }
 
@@ -342,11 +343,12 @@ const startVoice = (voice: VoiceOptions, onPrint: PrintSink) => {
  * and the ticker's thread, at most MAX_WORKERS (#43 §2.1). The program's own thread counts too. */
 const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency || 1) - 3, MAX_WORKERS)) + 1;
 
-async function run(canvas: OffscreenCanvas, device: GPUDevice, build: Build, live: Live | null): Promise<void> {
+/** Runs the program, drawing the screen straight into the canvas in `format`. */
+async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureFormat, build: Build, live: Live | null): Promise<void> {
   self.postMessage({ type: "screen-limit", max: device.limits.maxTextureDimension2D } satisfies FromWorker);
-  const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT);
+  const ctx = context(canvas, device, format, GPUTextureUsage.RENDER_ATTACHMENT);
   clock.startAt(epochNow());
-  const screen = { texture: () => ctx.getCurrentTexture() };
+  const screen = { format, texture: () => ctx.getCurrentTexture() };
   const start: Start = (b, carried) =>
     startProgram(
       device,
@@ -535,7 +537,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   let frameNow = 0;
   canvas.width = width;
   canvas.height = height;
-  const ctx = context(canvas, device, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST);
+  const ctx = context(canvas, device, SCREEN_FORMAT, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST);
   // Screen passes render into a texture that can be read back; each is also copied to the
   // canvas so the page shows what ran.
   const screen = device.createTexture({
@@ -555,7 +557,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   };
   hostLine = print;
   const salted = params.salt > 0 ? salt(build, params.salt) : build;
-  const target = {
+  const target: ScreenTarget = {
+    format: SCREEN_FORMAT,
     texture: () => screen,
       // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
       // pace the frames by the display's.
@@ -702,7 +705,7 @@ async function saveResults(
   const { frames, width, height } = params;
   // Where the pipelines' time went: each built again alone, from code no cache has seen.
   const again = params.salt > 0 ? salt(build, params.salt + 7919) : null;
-  const each = again ? await timeEachPipeline(device, again.manifest, again.shaders) : [];
+  const each = again ? await timeEachPipeline(device, again.manifest, again.shaders, screen.format) : [];
   const hash = program.hash;
   if (hz > 0) {
     ticker.control.stop();
@@ -820,8 +823,9 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       live?.start();
       Promise.all([openDevice((test?.timestamps ?? 0) > 0, fatal), loadBuild(base)])
         .then(([device, build]) => {
-          handOvers = new HandOvers(device, () => buildBase, () => [pipelineCache, leftovers]);
-          return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, build, live);
+          const format = screenFormat(test !== null);
+          handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);
+          return test ? runTest(msg.canvas, device, build, test, live) : run(msg.canvas, device, format, build, live);
         })
         .catch(fatal);
       return;

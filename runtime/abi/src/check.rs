@@ -143,9 +143,9 @@ pub struct Checker {
     attachments: Vec<u32>,
     /// Read-write buffers in this command: reused across draws and dispatches.
     written: Vec<u32>,
-    /// The open pass's colour target's format (the screen's, a texture's, or none), and whether
-    /// it has a depth target: which pipelines its draws may draw with.
-    targets: (Option<TextureFormat>, bool),
+    /// The open pass's targets (the screen or a texture's format or none, and a depth target or
+    /// none): which pipelines its draws may draw with.
+    targets: RenderTarget,
     /// The current frame's screen size, when the host has begun a frame.
     screen_size: Option<(u32, u32)>,
 }
@@ -185,7 +185,7 @@ impl Checker {
             spare_scope: HashMap::new(),
             attachments: Vec::new(),
             written: Vec::new(),
-            targets: (None, false),
+            targets: RenderTarget::default(),
             screen_size: None,
         }
     }
@@ -225,7 +225,7 @@ impl Checker {
         self.spare_scope.clear();
         self.attachments.clear();
         self.written.clear();
-        self.targets = (None, false);
+        self.targets = RenderTarget::default();
     }
 
     /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
@@ -419,7 +419,7 @@ impl Checker {
                 self.clear_colour(op, clear)?;
                 self.scope.clear();
                 self.attachments.clear();
-                self.targets = (Some(SCREEN_FORMAT), false);
+                self.targets = RenderTarget::screen(false);
             }
             Command::BeginPass(pass) => {
                 self.clear_colour(op, &pass.clear)?;
@@ -469,7 +469,11 @@ impl Checker {
                 if pass.color == NONE && pass.depth == NONE {
                     return err("a pass needs a colour target or a depth target".into());
                 }
-                self.targets = (colour, pass.depth != NONE);
+                self.targets = RenderTarget {
+                    color: colour,
+                    depth: pass.depth != NONE,
+                    screen: pass.color == SCREEN,
+                };
             }
             Command::Draw { pipeline, bindings, uniforms, .. } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
@@ -694,8 +698,7 @@ impl Checker {
             ));
         }
         // A draw's pass's targets are one of its pipeline's.
-        let (color, depth) = self.targets;
-        let here = RenderTarget { color, depth };
+        let here = self.targets;
         if !dispatch && !p.targets.contains(&here) {
             let theirs: Vec<String> = p.targets.iter().map(|t| t.to_string()).collect();
             return err(format!(
@@ -877,7 +880,7 @@ mod tests {
         assert!(checker.spare_scope.is_empty());
         assert!(checker.attachments.is_empty());
         assert!(checker.written.is_empty());
-        assert_eq!(checker.targets, (None, false));
+        assert_eq!(checker.targets, RenderTarget::default());
         assert!(checker.resource_undo.is_empty());
     }
 
@@ -1147,6 +1150,6 @@ mod tests {
             "there's no texture 99"
         );
         assert!(checker.attachments.is_empty());
-        assert_eq!(checker.targets, (Some(SCREEN_FORMAT), false));
+        assert_eq!(checker.targets, RenderTarget::screen(false));
     }
 }

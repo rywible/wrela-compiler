@@ -4,6 +4,7 @@
 import { expect, spyOn, test } from "bun:test";
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
+import { SCREEN_FORMAT } from "../src/abi.gen.ts";
 import { buildPipelines, type PipelineCache } from "../src/gpu.ts";
 import { HandOvers } from "../src/handover.ts";
 import { type Fetch, loadBuild } from "../src/loader.ts";
@@ -35,9 +36,9 @@ async function running() {
   const { fetch, requested } = server();
   const first = await loadBuild(RUNNING, fetch);
   const cache: PipelineCache = new Map();
-  await Promise.all(buildPipelines(device.gpu, first.manifest, first.shaders, cache));
+  await Promise.all(buildPipelines(device.gpu, first.manifest, first.shaders, SCREEN_FORMAT, cache));
   const compiled = spyOn(device, "createShaderModule");
-  const handOvers = new HandOvers(device.gpu, () => RUNNING, () => [cache], fetch);
+  const handOvers = new HandOvers(device.gpu, SCREEN_FORMAT, () => RUNNING, () => [cache], fetch);
   return { handOvers, compiled, requested };
 }
 
@@ -53,13 +54,13 @@ test("a build got ready builds only the pipelines the device doesn't hold, once"
 
 test("a build path's percent escapes stay literal during resolution", () => {
   const device = new FakeDevice();
-  const handOvers = new HandOvers(device.gpu, () => RUNNING, () => []);
+  const handOvers = new HandOvers(device.gpu, SCREEN_FORMAT, () => RUNNING, () => []);
   expect(handOvers.baseOf("%2e%2e/second")).toBe("http://localhost/tower/first/%252e%252e/second/");
   expect(handOvers.baseOf("../%2e%2e/second")).toBe("http://localhost/tower/%252e%252e/second/");
 });
 
 test("build paths keep spaces and controls literal while allowing one parent", () => {
-  const handOvers = new HandOvers(new FakeDevice().gpu, () => RUNNING, () => []);
+  const handOvers = new HandOvers(new FakeDevice().gpu, SCREEN_FORMAT, () => RUNNING, () => []);
   expect(handOvers.baseOf(" /admin")).toBe("http://localhost/tower/first/%20/admin/");
   expect(handOvers.baseOf("\t/admin")).toBe("http://localhost/tower/first/%09/admin/");
   expect(handOvers.baseOf("../next ")).toBe("http://localhost/tower/next%20/");
