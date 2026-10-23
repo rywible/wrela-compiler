@@ -459,6 +459,12 @@ struct Requests {
     posts: Vec<QueuedPost>,
     /// The requests of posts taken and not yet answered.
     taken: HashSet<u32>,
+    /// Paths whose fetches and storage reads wait until they're released (a test's held
+    /// requests: [`Program::hold`]).
+    held: HashSet<String>,
+    /// Requests of a held path, carried out already: each one's path, number and answer, which
+    /// the program sees once the path is released.
+    holding: Vec<(String, u32, std::result::Result<Vec<u8>, String>)>,
 }
 
 impl Requests {
@@ -468,6 +474,7 @@ impl Requests {
             || self.arriving.iter().any(|a| a.0 == request)
             || self.waiting.contains(&request)
             || self.reserved.contains(&request)
+            || self.holding.iter().any(|h| h.1 == request)
         {
             return Err(Error::Command(CommandError {
                 opcode: op,
@@ -588,7 +595,15 @@ impl Requests {
             }
             _ => return Ok(()),
         };
-        self.arriving.push((request, answer));
+        let held = match cmd {
+            Command::StorageRead { path, .. } => self.held.contains(*path).then_some(*path),
+            Command::Fetch { url, .. } => self.held.contains(*url).then_some(*url),
+            _ => None,
+        };
+        match held {
+            Some(path) => self.holding.push((path.to_string(), request, answer)),
+            None => self.arriving.push((request, answer)),
+        }
         Ok(())
     }
 
@@ -1497,6 +1512,26 @@ impl<E: Executor> Program<E> {
         let requests = &mut self.store.data_mut().requests;
         requests.waiting.retain(|&r| r != request);
         requests.answered.insert(request, answer);
+    }
+
+    /// Holds the fetches and storage reads of `path` from now on: each is carried out, but the
+    /// program sees its answer only once [`Program::release`] lets the path go (a test's late
+    /// file).
+    pub(crate) fn hold(&mut self, path: &str) {
+        self.store.data_mut().requests.held.insert(path.to_string());
+    }
+
+    /// Lets `path` go: the program sees the answers of its held requests from its next call on,
+    /// and its later requests are answered as usual.
+    pub(crate) fn release(&mut self, path: &str) {
+        let requests = &mut self.store.data_mut().requests;
+        requests.held.remove(path);
+        let (released, kept) =
+            std::mem::take(&mut requests.holding).into_iter().partition(|h| h.0 == path);
+        requests.holding = kept;
+        for (_, request, answer) in released {
+            requests.answered.insert(request, answer);
+        }
     }
 
     /// The posts that wait for the host's user since the last time ([`Io::queue_posts`]): each

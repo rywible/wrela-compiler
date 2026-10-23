@@ -1,0 +1,65 @@
+// Held requests (language.md §13.2): a fetch of the build's own manifest and a storage read,
+// each made in `init` and polled on every frame, and the frame each answer arrives on. A test's
+// `hold` holds a path's requests until a frame: the answer arrives on that frame, not before.
+use std::io::{Pending, fetch, load, store}
+
+/// Not arrived yet.
+pub const NEVER: u32 = 0xFFFFFFFF
+
+pub struct State {
+    frame: u32,
+    stored: Pending<u8>,
+    fetched: Pending<u8>,
+    loaded: Pending<u8>,
+    pub fetched_at: u32,
+    pub loaded_at: u32,
+    pub loaded_bytes: u32,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        stored: store("slot", [7, 8, 9]),
+        fetched: fetch("manifest.json"),
+        loaded: load("slot"),
+        fetched_at: NEVER,
+        loaded_at: NEVER,
+        loaded_bytes: 0,
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let _ = s.stored.poll()
+    if s.fetched_at == NEVER {
+        if let Some(Ok(_)) = s.fetched.poll() {
+            s.fetched_at = s.frame
+        }
+    }
+    if s.loaded_at == NEVER {
+        if let Some(Ok(b)) = s.loaded.poll() {
+            s.loaded_at = s.frame
+            s.loaded_bytes = b.len()
+        }
+    }
+    s.frame += 1
+}
+
+/// Unheld, both answers arrive on the first frame.
+@test(frames: 4)
+fn requests_arrive_on_the_first_frame(s: State) {
+    assert(s.fetched_at == 0 && s.loaded_at == 0, f"{s.fetched_at}, {s.loaded_at}")
+}
+
+/// Each held path's answer arrives on the frame its hold names: the fetch's on frame 10, the
+/// storage read's on frame 15, and what was stored is what it reads.
+@test(frames: 20, hold: [("manifest.json", 10), ("slot", 15)])
+fn held_requests_arrive_on_their_frames(s: State) {
+    assert(s.fetched_at == 10, f"the fetch arrived on frame {s.fetched_at}")
+    assert(s.loaded_at == 15 && s.loaded_bytes == 3, f"the read arrived on frame {s.loaded_at}")
+}
+
+/// A hold past the test's last frame never lets the path go.
+@test(frames: 8, hold: [("manifest.json", 100)])
+fn a_hold_past_the_last_frame_never_arrives(s: State) {
+    assert(s.fetched_at == NEVER && s.loaded_at == 0)
+}

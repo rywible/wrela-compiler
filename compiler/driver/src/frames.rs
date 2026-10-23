@@ -120,9 +120,9 @@ pub fn run(
         let (ran, traced) = match (attrs.test_gpu, run, &input) {
             (true, TestRun::Frames(n), Input::Script(script)) => {
                 let golden = attrs.test_golden.as_ref().map(|g| (g, root, bless, reach));
-                run_gpu(&mut gpu, &dir.0, &storage, i, n, script, golden)
+                run_gpu(&mut gpu, &dir.0, &storage, i, n, script, &attrs.test_hold, golden)
             }
-            _ => run_one(&built, &storage, i, run, &input),
+            _ => run_one(&built, &storage, i, run, &input, &attrs.test_hold),
         };
         let name = &checked.program.func(f).name;
         let failed = ran.map(|Failed { why, fault, phase }| match (fault, why) {
@@ -273,9 +273,11 @@ struct GpuHost(#[cfg(feature = "gpu")] Option<wrela_host::Host>);
 /// then the test. Why it failed, if it did. The GPU host meters no fuel: it runs the program as
 /// `wrela run` does. Each test is a new program, nothing of the last one's left; the host is
 /// `gpu`'s, loaded for the first, and loaded again after one that failed. What it printed and
-/// timed comes with it. With a golden (and the package's root, and whether to bless it), the
-/// screen after the frames is compared with it.
+/// timed comes with it. The paths `hold` names are held from `init` on, each until its frame.
+/// With a golden (and the package's root, and whether to bless it), the screen after the
+/// frames is compared with it.
 #[cfg(feature = "gpu")]
+#[allow(clippy::too_many_arguments)]
 fn run_gpu(
     gpu: &mut GpuHost,
     dir: &Path,
@@ -283,6 +285,7 @@ fn run_gpu(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
+    hold: &[(String, u32)],
     golden: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
@@ -301,7 +304,7 @@ fn run_gpu(
         Ok(h) => h,
         Err(e) => return (failed(e, None, "as it started".to_string()), Default::default()),
     };
-    let ran = run_gpu_frames(&mut host, i, frames, script, golden);
+    let ran = run_gpu_frames(&mut host, i, frames, script, hold, golden);
     let traced = host.trace().take();
     if ran.is_none() {
         gpu.0 = Some(host);
@@ -316,12 +319,19 @@ fn run_gpu_frames(
     i: usize,
     frames: u32,
     script: &[wrela_host::Scripted],
+    hold: &[(String, u32)],
     golden: Option<GoldenAt>,
 ) -> Option<Failed> {
+    for (path, _) in hold {
+        host.hold(path);
+    }
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
     }
     for k in 0..frames {
+        for (path, _) in hold.iter().filter(|h| h.1 == k) {
+            host.release(path);
+        }
         if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
             return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
@@ -412,6 +422,7 @@ fn run_gpu(
     _: usize,
     _: u32,
     _: &[wrela_host::Scripted],
+    _: &[(String, u32)],
     _: Option<GoldenAt>,
 ) -> (Option<Failed>, wrela_host::Traced) {
     let why = "its frames run on the GPU, and this build of the compiler has no GPU host";
@@ -424,19 +435,21 @@ fn run_gpu(
 }
 
 /// Runs test `i`: `init`, its frames (and ticks in lockstep) or its ticks, with `input`, then
-/// the test. Why it failed, if it did, and what it printed and timed.
+/// the test; the paths `hold` names are held from `init` on, each until its frame. Why it
+/// failed, if it did, and what it printed and timed.
 fn run_one(
     built: &wrela_host::CpuBuild,
     storage: &Path,
     i: usize,
     run: TestRun,
     input: &Input,
+    hold: &[(String, u32)],
 ) -> (Option<Failed>, wrela_host::Traced) {
     let _ = std::fs::create_dir_all(storage);
     // One thread: a parallel job's chunks all run on it, and the result is the same (§16.1).
     match built.instantiate_in(1, Some(storage)) {
         Ok(mut host) => {
-            let failed = run_on(&mut host, i, run, input);
+            let failed = run_on(&mut host, i, run, input, hold);
             (failed, host.trace().take())
         }
         Err(e) => (failed(e, None, "as it started".to_string()), Default::default()),
@@ -444,12 +457,21 @@ fn run_one(
 }
 
 /// [`run_one`] on its host.
-fn run_on(host: &mut wrela_host::CpuHost, i: usize, run: TestRun, input: &Input) -> Option<Failed> {
+fn run_on(
+    host: &mut wrela_host::CpuHost,
+    i: usize,
+    run: TestRun,
+    input: &Input,
+    hold: &[(String, u32)],
+) -> Option<Failed> {
     let (log, script): (_, &[wrela_host::Scripted]) = match input {
         Input::Log(log) => (Some(log), &[]),
         Input::Script(s) => (None, s),
     };
     host.want_hashes(log.is_some());
+    for (path, _) in hold {
+        host.hold(path);
+    }
     if let Err(e) = host.init() {
         return failed(e, host.last_failure(), "in `init`".to_string());
     }
@@ -463,6 +485,9 @@ fn run_on(host: &mut wrela_host::CpuHost, i: usize, run: TestRun, input: &Input)
     let after = match run {
         TestRun::Frames(frames) => {
             for k in 0..frames {
+                for (path, _) in hold.iter().filter(|h| h.1 == k) {
+                    host.release(path);
+                }
                 if let Err(e) = host.lockstep_frame(k, FPS, WIDTH, HEIGHT, script) {
                     return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
                 }

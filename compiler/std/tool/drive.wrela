@@ -138,7 +138,11 @@ pub enum Scalar: Copy {
 /// threads; `Buffers`, the GPU buffers a GPU build holds, oldest first; `ReadBuffer(handle)`,
 /// one's bytes, read back from the GPU; `Commands`, the commands a build loaded with `record`
 /// submitted since the last `Commands`; and `Running`, the root path of the build that runs
-/// (after a hand-over, `std::reload::hand_over`, the one handed over to).
+/// (after a hand-over, `std::reload::hand_over`, the one handed over to). Those that change
+/// what its requests see: `Hold(path)`, its fetches and storage reads of `path` (inside its
+/// build or its storage) held from then on, each carried out but not answered, as a late file
+/// is; and `Release(path)`, the path let go, its held requests answered from the build's next
+/// call on.
 pub enum Step: Clone {
     Init,
     Frames(u32, Script),
@@ -153,6 +157,8 @@ pub enum Step: Clone {
     ReadBuffer(u32),
     Commands,
     Running,
+    Hold(String),
+    Release(String),
 }
 
 /// What a trap happened in: `init`, a frame, a tick, an export's call or the voice.
@@ -424,6 +430,14 @@ fn write_steps(w: mut Writer, list: [Step]) {
             },
             Step::Commands => w.write_u8(11),
             Step::Running => w.write_u8(12),
+            Step::Hold(path) => {
+                w.write_u8(13)
+                w.write_str(path.as_str())
+            },
+            Step::Release(path) => {
+                w.write_u8(14)
+                w.write_str(path.as_str())
+            },
         }
     }
 }

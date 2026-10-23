@@ -804,6 +804,9 @@ pub struct FnAttrs {
     /// `@test(frames: n, gpu: true, golden: "frame.png", within: m)`: the screen after the
     /// frames is within a mean difference `m` of that PNG in the package (§13).
     pub test_golden: Option<Golden>,
+    /// `@test(frames: n, hold: [("far.bin", 120)])`: paths whose fetches and storage reads the
+    /// host holds until the frame each names begins (§13): a test's late files.
+    pub test_hold: Vec<(String, u32)>,
     /// `@thread_entry` (std's unsafe core): a host calls it on a thread of its own, with that
     /// thread's number first (wrela_abi `memory`'s threads); exported as `__` and its name.
     pub thread_entry: Option<Span>,

@@ -175,6 +175,8 @@ pub(crate) enum Step {
     ReadBuffer(u32),
     Commands,
     Running,
+    Hold(String),
+    Release(String),
 }
 
 impl Step {
@@ -194,6 +196,8 @@ impl Step {
             Step::ReadBuffer(..) => "read_buffer",
             Step::Commands => "commands",
             Step::Running => "running",
+            Step::Hold(..) => "hold",
+            Step::Release(..) => "release",
         }
     }
 
@@ -275,6 +279,13 @@ pub(crate) fn parse_steps(b: &mut Body) -> Result<Vec<Step>, String> {
                 10 => Step::ReadBuffer(b.u32()?),
                 11 => Step::Commands,
                 12 => Step::Running,
+                k @ (13 | 14) => {
+                    let path = b.str()?;
+                    if let Some(why) = wrela_abi::check::path_problem(&path) {
+                        return Err(format!("a held path {why}"));
+                    }
+                    if k == 13 { Step::Hold(path) } else { Step::Release(path) }
+                }
                 k => return Err(format!("{k} isn't a step")),
             })
         })()
@@ -309,6 +320,8 @@ pub(crate) fn write_steps(out: &mut Out, steps: &[Step]) {
             Step::ReadBuffer(h) => out.u8(10).u32(*h),
             Step::Commands => out.u8(11),
             Step::Running => out.u8(12),
+            Step::Hold(path) => out.u8(13).str(path),
+            Step::Release(path) => out.u8(14).str(path),
         };
     }
 }
@@ -343,6 +356,8 @@ mod tests {
             Step::ReadBuffer(7),
             Step::Commands,
             Step::Running,
+            Step::Hold("tiles/far.bin".into()),
+            Step::Release("tiles/far.bin".into()),
         ];
         let mut out = Out::default();
         write_steps(&mut out, &steps);
@@ -357,6 +372,10 @@ mod tests {
         write_steps(&mut out, &[Step::Hash, Step::FrameAt(f32::NAN)]);
         let why = parse_steps(&mut Body::new(&out.0)).expect_err("a time that isn't finite");
         assert!(why.starts_with("step 1: "), "{why}");
+        let mut out = Out::default();
+        write_steps(&mut out, &[Step::Hold("../outside".into())]);
+        let why = parse_steps(&mut Body::new(&out.0)).expect_err("a path out of the build");
+        assert!(why.starts_with("step 0: a held path"), "{why}");
     }
 
     #[test]

@@ -1,0 +1,15 @@
+// mistake: a held path that leaves the build
+// expect: E0222
+// fix: no
+pub struct S {
+    n: u32,
+}
+
+pub fn init() -> S {
+    S { n: 0 }
+}
+
+pub fn frame(s: mut S, time: f32, width: u32, height: u32) {}
+
+@test(frames: 4, hold: [("../save.bin", 2)])
+fn late() {}

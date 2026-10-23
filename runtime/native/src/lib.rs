@@ -944,6 +944,17 @@ impl Host {
         self.p().answer_post(request, answer)
     }
 
+    /// Holds the program's fetches and storage reads of `path` until [`Host::release`] lets it
+    /// go: a test's late file (language.md §13.2, §15.5).
+    pub fn hold(&mut self, path: &str) {
+        self.p().hold(path);
+    }
+
+    /// Lets `path` go: the program sees its held requests' answers from its next call on.
+    pub fn release(&mut self, path: &str) {
+        self.p().release(path);
+    }
+
     /// Calls `frame(time, width, height)` once, and ends the frame: for a caller that drives
     /// the program a frame at a time (a session a person types), and reads the screen when it wants.
     pub fn frame(&mut self, time: f32, width: u32, height: u32) -> Result<()> {
@@ -1279,6 +1290,17 @@ impl CpuHost {
         answer: std::result::Result<Vec<u8>, String>,
     ) -> std::result::Result<(), String> {
         self.program.answer_post(request, answer)
+    }
+
+    /// Holds the program's fetches and storage reads of `path` until [`CpuHost::release`] lets
+    /// it go: a test's late file (language.md §13.2, §15.5).
+    pub fn hold(&mut self, path: &str) {
+        self.program.hold(path);
+    }
+
+    /// Lets `path` go: the program sees its held requests' answers from its next call on.
+    pub fn release(&mut self, path: &str) {
+        self.program.release(path);
     }
 
     /// Queues a script's event (a message with its bytes).
