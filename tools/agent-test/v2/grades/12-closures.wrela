@@ -1,0 +1,7 @@
+use main::scaled
+
+@test
+fn grade_scaled() {
+    assert(abs(scaled(3.0) - 22.0) < 0.0001, f"`scaled(3.0)` is {scaled(3.0)}, not 22.0")
+    assert(abs(scaled(0.5) - 2.0) < 0.0001, f"`scaled(0.5)` is {scaled(0.5)}, not 2.0")
+}

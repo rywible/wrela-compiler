@@ -1,0 +1,8 @@
+use main::total
+
+@test
+fn grade_total() {
+    assert(total(4) == 10.0, f"`total(4)` is {total(4)}")
+    assert(total(0) == 0.0)
+    assert(total(100) == 5050.0)
+}

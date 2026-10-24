@@ -1,0 +1,18 @@
+fn first_negative(xs: [f32]) -> Option<u32> {
+    for i in 0..xs.len() {
+        if xs[i] < 0.0 {
+            return Some(i)
+        }
+    }
+    None
+}
+
+pub fn where_negative() -> u32 {
+    first_negative([2.0, 7.0, -1.0, 3.0]).unwrap_or(0)
+}
+
+pub fn none_negative() -> u32 {
+    first_negative([2.0, 7.0, 1.0, 3.0]).unwrap_or(0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,15 @@
+use main::range_over
+
+@test
+fn grade_range_over() {
+    let bounds = [vec2(0.0, 1.0), vec2(-1.0, 2.0), vec2(3.0, 3.5)]
+    for b in bounds {
+        let r = range_over(b.x, b.y)
+        for i in 0..65 {
+            let t = b.x + (b.y - b.x) * f32(i) / 64.0
+            let v = sin(t) * t
+            assert(r.x <= v && v <= r.y, f"{v} at {t} is outside ({r.x}, {r.y})")
+        }
+        assert(r.y - r.x < 4.0, f"({r.x}, {r.y}) is far wider than the values")
+    }
+}

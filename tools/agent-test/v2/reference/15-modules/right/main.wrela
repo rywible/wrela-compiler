@@ -1,0 +1,7 @@
+use geometry::rotate
+
+pub fn rotated_x(angle: f32) -> f32 {
+    rotate(vec2(1.0, 0.0), angle).x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

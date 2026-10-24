@@ -1,0 +1,14 @@
+use main::simulate
+
+@test
+fn grade_simulate() {
+    assert(
+        abs(simulate(10, 0.5) - 5.0) < 0.0001,
+        f"`simulate(10, 0.5)` is {simulate(10, 0.5)}, not 5.0",
+    )
+    assert(
+        abs(simulate(3, 2.0) - 6.0) < 0.0001,
+        f"`simulate(3, 2.0)` is {simulate(3, 2.0)}, not 6.0",
+    )
+    assert(simulate(0, 1.0) == 0.0)
+}

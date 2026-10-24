@@ -1,0 +1,21 @@
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+struct Params: Copy + GpuData {
+    factor: f32,
+}
+
+@compute(64)
+fn scale(src: [f32], params: Params, dst: mut Slots<f32>, id: GlobalId) {
+    dst[id] = src[id.x] * params.factor
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var values = [0.0; 64]
+    for i in 0..64 {
+        values[i] = f32(i)
+    }
+    var input: GpuBuffer<f32> = buffer(64)
+    var output: GpuBuffer<f32> = buffer(64)
+    write(mut input, 0, values)
+    let _o = take output
+}

@@ -1,0 +1,26 @@
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
+
+struct Screen: Copy + GpuData {
+    resolution: vec2,
+}
+
+/// One triangle over the whole screen.
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32(v.index % 2) * 4.0 - 1.0
+    let y = f32(v.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// Deep blue at the top of the screen, white at the bottom: a pixel's y grows downwards.
+@fragment
+fn sky(pixel: FragCoord, screen: Screen) -> vec4 {
+    let t = clamp(pixel.position.y / screen.resolution.y, 0.0, 1.0)
+    vec4(mix(vec3(0.02, 0.08, 0.45), vec3(1.0), t), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(screen, cover, sky.bind(Screen { resolution: vec2(f32(width), f32(height)) }), vertices: 3)
+    screen.present()
+}

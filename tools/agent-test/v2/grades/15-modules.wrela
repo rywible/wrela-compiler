@@ -1,0 +1,13 @@
+use geometry::rotate
+use main::rotated_x
+
+@test
+fn grade_rotate() {
+    assert(abs(rotated_x(0.0) - 1.0) < 0.0001, f"`rotated_x(0.0)` is {rotated_x(0.0)}, not 1.0")
+    assert(
+        abs(rotated_x(3.1415927) - -1.0) < 0.0001,
+        f"`rotated_x(3.1415927)` is {rotated_x(3.1415927)}, not -1.0",
+    )
+    let r = rotate(vec2(0.0, 1.0), 1.5707964)
+    assert(length(r - vec2(-1.0, 0.0)) < 0.0001, f"(0, 1) turned a quarter is ({r.x}, {r.y})")
+}

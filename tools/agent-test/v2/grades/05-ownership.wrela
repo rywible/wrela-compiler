@@ -1,0 +1,6 @@
+use main::run
+
+@test
+fn grade_run() {
+    assert(run() == 5, f"`run()` is {run()}, not 5")
+}

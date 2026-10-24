@@ -1,0 +1,8 @@
+use main::fib_export
+
+@test
+fn grade_fib() {
+    assert(fib_export(10) == 55, f"`fib_export(10)` is {fib_export(10)}")
+    assert(fib_export(0) == 0)
+    assert(fib_export(20) == 6765)
+}

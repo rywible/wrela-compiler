@@ -1,0 +1,22 @@
+enum Cmd: Copy {
+    Move(vec2),
+    Stop,
+}
+
+fn first_move(cmds: [Cmd]) -> Option<vec2> {
+    var last: Option<vec2> = None
+    for c in cmds {
+        if let Cmd::Move(v) = c {
+            last = Some(v)
+        }
+    }
+    last
+}
+
+pub fn where_first() -> vec2 {
+    first_move([Cmd::Stop, Cmd::Move(vec2(1.0, 2.0)), Cmd::Move(vec2(3.0, 4.0))]).unwrap_or(
+        vec2(0.0),
+    )
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,7 @@
+use main::{none_negative, where_negative}
+
+@test
+fn grade_negatives() {
+    assert(where_negative() == 2, f"`where_negative()` is {where_negative()}")
+    assert(none_negative() == 99, f"`none_negative()` is {none_negative()}")
+}

@@ -1,0 +1,13 @@
+use main::bound
+
+@test
+fn grade_bound() {
+    let r = bound(0.0, 2.0)
+    assert(r.x <= -1.0 && r.y >= 0.0, f"({r.x}, {r.y}) misses the values")
+    assert(r.y - r.x < 10.0, f"({r.x}, {r.y}) is far wider than the values")
+    for i in 0..33 {
+        let x = 2.0 * f32(i) / 32.0
+        let v = x * x - 2.0 * x
+        assert(r.x <= v && v <= r.y, f"{v} at {x} is outside ({r.x}, {r.y})")
+    }
+}

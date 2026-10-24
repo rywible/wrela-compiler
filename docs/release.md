@@ -36,7 +36,16 @@ the author's choice.
 3. Run any Cargo build (for example `cargo check --workspace`) so that `Cargo.lock` takes the
    new version of each workspace crate. Commit `Cargo.toml` and `Cargo.lock` together.
 4. Run `tools/check.sh`.
-5. Push the branch and open a pull request against `main`, titled
+5. Run the agent syntax test with the release's compiler, and put its headline numbers (first
+   try correct, mean attempts to correct, mean tokens) in the pull request:
+
+   ```bash
+   cargo build --release -p wrela && tools/agent-test/v2/run.py release-X.Y.Z --wrela "$PWD/target/release/wrela"
+   ```
+
+   It runs an agent per task and costs money (at most `budget_usd` in its `config.json` a task,
+   30 tasks), so it runs once per release. `--dry-run` shows what it would run.
+6. Push the branch and open a pull request against `main`, titled
    `Release X.Y.Z: <what the release brings>`. The bump can be in the same pull request as the
    change that it releases.
 

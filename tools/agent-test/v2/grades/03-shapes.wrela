@@ -1,0 +1,6 @@
+use main::total
+
+@test
+fn grade_total() {
+    assert(abs(total() - 10.141593) < 0.002, f"`total()` is {total()}, not 10.141593")
+}

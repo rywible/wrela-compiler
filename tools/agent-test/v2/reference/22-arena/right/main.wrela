@@ -1,0 +1,31 @@
+use std::arena::Arena
+
+struct Unit {
+    hp: f32,
+}
+
+fn units() -> Arena<Unit> {
+    var a: Arena<Unit> = Arena::new()
+    let _first = a.insert(Unit { hp: 1.0 })
+    let _second = a.insert(Unit { hp: 2.0 })
+    let third = a.insert(Unit { hp: 3.0 })
+    let _fourth = a.insert(Unit { hp: 4.0 })
+    let _fifth = a.insert(Unit { hp: 5.0 })
+    let _gone = a.remove(third)
+    take a
+}
+
+pub fn alive() -> u32 {
+    units().len()
+}
+
+pub fn hp_sum() -> f32 {
+    let a = units()
+    var sum = 0.0
+    for u in a {
+        sum += u.hp
+    }
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

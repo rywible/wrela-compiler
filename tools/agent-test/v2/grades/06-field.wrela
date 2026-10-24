@@ -1,0 +1,21 @@
+use main::distance_at
+use std::field::{Surface, round_cone, sphere}
+
+@test
+fn grade_distance_at() {
+    let want = sphere(radius: 0.5)
+        .smooth_union(round_cone(vec3(), vec3(y: 1.0), r_top: 0.3, r_bottom: 0.1), k: 0.1)
+        .translate(vec3(0.0, -0.5, 0.0))
+    let points = [
+        vec3(0.0),
+        vec3(0.0, 0.6, 0.0),
+        vec3(0.7, -0.5, 0.1),
+        vec3(0.2, 0.3, -0.4),
+        vec3(1.0),
+    ]
+    for p in points {
+        let got = distance_at(p.x, p.y, p.z)
+        let w = want.distance(p)
+        assert(abs(got - w) < 0.0001, f"at {p.x}, {p.y}, {p.z}: {got}, not {w}")
+    }
+}

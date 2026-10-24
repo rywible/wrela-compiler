@@ -1,0 +1,9 @@
+use circle::Circle
+use shape::Shape
+use square::Square
+
+pub fn areas() -> vec2 {
+    vec2(Circle { r: 1.0 }.area(), Square { side: 1.0 }.area())
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

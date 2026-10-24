@@ -1,0 +1,41 @@
+trait Measured {
+    fn size(self) -> f32
+
+    fn double(self) -> f32 {
+        self.size() + 2.0
+    }
+}
+
+struct Rod {
+    length: f32,
+}
+
+struct Disc {
+    r: f32,
+}
+
+impl Measured for Rod {
+    fn size(self) -> f32 {
+        self.length
+    }
+}
+
+impl Measured for Disc {
+    fn size(self) -> f32 {
+        3.14159265 * self.r * self.r
+    }
+}
+
+fn sum_doubles<T: Measured>(a: T, b: T) -> f32 {
+    a.double() + b.double()
+}
+
+pub fn rods(a: f32, b: f32) -> f32 {
+    sum_doubles(Rod { length: a }, Rod { length: b })
+}
+
+pub fn discs(a: f32, b: f32) -> f32 {
+    sum_doubles(Disc { r: a }, Disc { r: b })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

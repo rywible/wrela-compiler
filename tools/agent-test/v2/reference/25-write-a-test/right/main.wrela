@@ -1,0 +1,23 @@
+fn fib(n: u32) -> u32 {
+    var a = 0
+    var b = 1
+    for _ in 0..n {
+        let next = a + b
+        a = b
+        b = next
+    }
+    a
+}
+
+@test
+fn fib_is_right() {
+    assert(fib(0) == 0)
+    assert(fib(1) == 1)
+    assert(fib(10) == 55)
+}
+
+pub fn fib_export(n: u32) -> u32 {
+    fib(n)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

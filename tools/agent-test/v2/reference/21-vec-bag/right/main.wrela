@@ -1,0 +1,21 @@
+struct Bag {
+    items: Vec<f32>,
+}
+
+fn add(b: mut Bag, x: f32) {
+    b.items.push(x)
+}
+
+pub fn total(n: u32) -> f32 {
+    var bag = Bag { items: Vec::new() }
+    for i in 1..=n {
+        add(mut bag, f32(i))
+    }
+    var sum = 0.0
+    for x in bag.items {
+        sum += x
+    }
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

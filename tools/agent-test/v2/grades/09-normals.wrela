@@ -1,0 +1,22 @@
+use main::normal_at
+use std::field::{Surface, sphere}
+
+@test
+fn grade_normal_at() {
+    let f = sphere(radius: 0.5).smooth_union(
+        sphere(radius: 0.3).translate(vec3(0.6, 0.0, 0.0)),
+        k: 0.1,
+    )
+    let points = [
+        vec3(1.0, 0.0, 0.0),
+        vec3(0.9, 0.2, 0.0),
+        vec3(0.0, 0.7, 0.0),
+        vec3(0.4, 0.4, 0.3),
+    ]
+    for p in points {
+        let want = normalize(f.gradient(p))
+        let got = normal_at(p.x, p.y, p.z)
+        assert(length(got - want) < 0.001, f"at {p.x}, {p.y}, {p.z}: ({got.x}, {got.y}, {got.z})")
+        assert(abs(length(got) - 1.0) < 0.001, "a unit normal")
+    }
+}
