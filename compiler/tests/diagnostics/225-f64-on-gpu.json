@@ -4,7 +4,9 @@
       "code": "E0326",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "keep `f64` on the CPU, and pass the GPU an `f32` (or a vector of them) computed from it"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

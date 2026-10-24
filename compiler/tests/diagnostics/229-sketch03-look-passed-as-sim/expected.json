@@ -4,7 +4,9 @@
       "code": "E0400",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "opt in where `GrazerLook` is declared: `struct GrazerLook: SimState { ... }`, or pass a value of a type that has it"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

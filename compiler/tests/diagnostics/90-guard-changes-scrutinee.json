@@ -4,7 +4,9 @@
       "code": "E0507",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "change it after the `match`, or copy what the arms test into a local first and match on that"
+      ],
       "internal": false,
       "label": null,
       "labels": [

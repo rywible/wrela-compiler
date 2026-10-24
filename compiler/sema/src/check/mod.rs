@@ -391,7 +391,9 @@ impl<'p> Checker<'p> {
                 ));
             }
             (TyKind::Tuple(t), _) if t.is_empty() => {
-                d = d.with_note("a block's value is its last line when that's an expression; a statement has no value");
+                d = d
+                    .with_note("a block's value is its last line when that's an expression; a statement has no value")
+                    .with_help(format!("end the block with a `{e}` as its last line"));
             }
             // An alias that names traits: one function decides its type (§4).
             (_, TyKind::Opaque(f, args))
@@ -404,7 +406,11 @@ impl<'p> Checker<'p> {
                     ))
                     .with_help(format!("use a value of it, such as `{name}(...)`'s"));
             }
-            _ => {}
+            _ => {
+                d = d.with_help(format!(
+                    "give it a value of type `{e}` here, or change what expects one (`wrela query type <file>:<line>:<col>` shows a place's type)"
+                ));
+            }
         }
         self.err(d);
         false
@@ -716,16 +722,20 @@ impl<'p> Checker<'p> {
                     e.span,
                     "`fields(self)` walks the fields of a type that declares a `@fieldwise` trait, in that trait's methods",
                 )
+.with_help("write the walk inside a method of a `@fieldwise` trait, or name the fields one by one")
                 .with_note("each type that declares the trait runs the method with the loop unrolled over its own fields (§3)"),
             );
             return None;
         };
         if !matches!(pat.kind, ast::PatKind::Ident(_) | ast::PatKind::Wild) {
-            self.err(Diagnostic::new(
-                codes::E0337,
-                pat.span,
-                "a walk over the fields binds each to one name: fields have types of their own",
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0337,
+                    pat.span,
+                    "a walk over the fields binds each to one name: fields have types of their own",
+                )
+                .with_help("bind one name: `for f in fields(self) { ... }`"),
+            );
             return None;
         }
         let self_mut = self.fn_id.is_some_and(|f| {
@@ -1133,6 +1143,9 @@ impl<'p> Checker<'p> {
                     codes::E0324,
                     bad.span,
                     format!("a {owner}'s default of a generic type must be a literal value"),
+                )
+                .with_help(
+                    "write the default as a literal, or remove it and pass the value at each call",
                 )
                 .with_note("a constant expression has one type, which a generic type isn't (§13)"),
             );

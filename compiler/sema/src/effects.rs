@@ -464,8 +464,28 @@ fn parallel_writes(body: &Body, arg: &TypedArg) -> Vec<Diagnostic> {
         .with_note(
             "to combine a value from each element, compute it in the closure and combine them \
              with `par_map_reduce`",
-        ),
+        )
+        .with_help(format!(
+            "write only the closure's own element, or compute each element's part and combine them with `par_map_reduce` instead of writing `{first}`"
+        )),
     ]
+}
+
+/// What to do about effect `e` where a context forbids it: the help of E0600.
+pub fn effect_help(e: Effect) -> &'static str {
+    match e {
+        Effect::Alloc => {
+            "keep the memory in the state and reuse it (`v.clear()` keeps its capacity), or move the allocation out of this context"
+        }
+        Effect::Io => "do the IO outside it, and pass what it read in as data",
+        Effect::Trace => "print outside it, from code this context calls into rather than from",
+        Effect::Nondet => {
+            "read it outside, and pass the value in as data (a tick's records, or the state)"
+        }
+        Effect::Recursion => "write the recursion as a loop",
+        Effect::Host => "record the GPU work outside it, in `frame`",
+        Effect::Panic => "check the condition and return a value instead of panicking",
+    }
 }
 
 // What each context forbids. A line printed or a phase timed changes no value the program
@@ -718,7 +738,7 @@ impl<'p> Effects<'p> {
                 },
                 e.name()
             ));
-            out.push(d);
+            out.push(d.with_help(effect_help(e)));
         }
         out
     }

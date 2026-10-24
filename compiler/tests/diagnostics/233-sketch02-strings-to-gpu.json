@@ -4,7 +4,9 @@
       "code": "E0604",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "pass the GPU numbers, vectors, matrices and structs of them; keep text, `Vec`s and handles on the CPU"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

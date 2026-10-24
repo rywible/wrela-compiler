@@ -4,7 +4,9 @@
       "code": "E0300",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "make the function return `Option<_>`, or handle the `None` here: `let Some(x) = ... else { ... }`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

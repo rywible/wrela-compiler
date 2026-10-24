@@ -4,7 +4,9 @@
       "code": "E0305",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "pass `sqrt` the kind of value it says; `wrela doc builtins` lists what each built-in takes"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

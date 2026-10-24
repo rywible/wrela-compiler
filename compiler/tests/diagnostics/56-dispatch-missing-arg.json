@@ -4,7 +4,9 @@
       "code": "E0303",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "pass it by name: `fill.bind(..., scale: <f32>)`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

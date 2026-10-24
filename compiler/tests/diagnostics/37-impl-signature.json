@@ -4,7 +4,9 @@
       "code": "E0405",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it as the trait does: `fn distance(self, p: vec3) -> f32`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

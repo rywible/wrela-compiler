@@ -4,7 +4,9 @@
       "code": "E0507",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "use `top` for the last time before this, or copy what it needs into a local so the borrow ends sooner"
+      ],
       "internal": false,
       "label": null,
       "labels": [

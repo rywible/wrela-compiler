@@ -4,7 +4,9 @@
       "code": "E0322",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give `Option` exactly 1: `Option<_>`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
@@ -25,7 +27,9 @@
       "code": "E0322",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give `first` exactly 1: `first<_>`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

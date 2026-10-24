@@ -4,7 +4,9 @@
       "code": "E0100",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "put an expression here"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
@@ -25,7 +27,9 @@
       "code": "E0300",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give it a value of type `i32` here, or change what expects one (`wrela query type <file>:<line>:<col>` shows a place's type)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

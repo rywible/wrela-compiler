@@ -4,7 +4,9 @@
       "code": "E0417",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare `SimState` on the field's type too, keep the field out of `World`, or remove `SimState` from `World`"
+      ],
       "internal": false,
       "label": null,
       "labels": [
@@ -40,7 +42,9 @@
       "code": "E0400",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it where `World` is declared, and it's derived from the fields: `struct World: StateHash { ... }`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

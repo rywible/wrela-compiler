@@ -4,7 +4,9 @@
       "code": "E0701",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "make the loop run a fixed count: `for _ in 0..n { ... }`, leaving it early with `break`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

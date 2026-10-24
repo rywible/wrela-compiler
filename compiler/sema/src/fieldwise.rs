@@ -334,6 +334,7 @@ fn bad_hook(p: &Program, h: FnId, want: &str) -> Diagnostic {
         format!("the hook `{}` doesn't fit its method", p.func(h).name),
     )
     .with_note(format!("a derivation calls it as {want} (§3)"))
+    .with_help(format!("give the hook that signature: {want}"))
 }
 
 /// The derived body of `f`, a method of a type's `@fieldwise` impl.
@@ -432,7 +433,8 @@ fn derive_walk(
                     p.func(d.method).name,
                     p.display_ty(self_ty)
                 ),
-            );
+            )
+.with_help("declare the trait only on structs, tuples and arrays, or implement this method by hand for the type");
             return (None, vec![d]);
         }
     };

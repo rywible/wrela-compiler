@@ -4,7 +4,9 @@
       "code": "E0320",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "a `Option<Mood>` matches its own variants: `Option::None`, `Option::Some`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

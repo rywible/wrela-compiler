@@ -4,7 +4,9 @@
       "code": "E0200",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it first (`let clock_now = ...`), or import it with `use`; `wrela doc clock_now` finds what std has by that name"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

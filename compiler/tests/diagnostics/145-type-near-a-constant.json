@@ -4,7 +4,9 @@
       "code": "E0200",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it (`struct Radiu { ... }`), or import it with `use`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

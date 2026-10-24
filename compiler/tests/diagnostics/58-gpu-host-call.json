@@ -4,7 +4,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "record the GPU work outside it, in `frame`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

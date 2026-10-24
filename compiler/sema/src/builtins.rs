@@ -210,9 +210,17 @@ pub fn f64_math(what: &str, span: wrela_diag::Span) -> wrela_diag::Diagnostic {
         format!("`{what}` of an `f64` isn't supported yet"),
     )
     .with_note("std's CPU math works in `f32`; convert with `f32(x)`")
+    .with_help(format!(
+        "compute it in `f32`: `{what}(f32(x))`, then `f64(...)` if the result must be one"
+    ))
 }
 
 impl BuiltinFn {
+    /// Whether it can be called as a method, on its first argument (`v.length()`).
+    pub fn is_method(self) -> bool {
+        self.call() != Call::Free
+    }
+
     /// The free function of this name.
     pub fn lookup(name: &str) -> Option<BuiltinFn> {
         BuiltinFn::ALL.iter().copied().find(|b| b.name() == name && b.call() != Call::Method)

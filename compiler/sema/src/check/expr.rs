@@ -51,6 +51,7 @@ impl<'p> Checker<'p> {
                         "this value's type is too large: it has more than {MAX_TYPE_SIZE} parts"
                     ),
                 )
+                .with_help("keep the parts in a `Vec`, or give the type a fixed shape")
                 .with_note(
                     "a type that doubles with each step, like `(a, a)`, grows past any machine",
                 ),
@@ -211,6 +212,7 @@ impl<'p> Checker<'p> {
                         // A variable isn't a constant; anything else says why it isn't a length.
                         self.err(if local_len {
                             Diagnostic::new(codes::E0325, count.span, "an array length is an integer literal or a constant holding one, not a variable")
+.with_help("use a constant (`const N: u32 = 8`), or a `Vec` for a length known only at run time: `Vec::filled(n, x)`")
                         } else {
                             resolve::length_error(self.p, self.scope.module, count)
                         });
@@ -275,11 +277,12 @@ impl<'p> Checker<'p> {
                     _ => ("continue", ExprKind::Continue),
                 };
                 if !self.in_loop() {
-                    self.err(Diagnostic::new(
-                        codes::E0315,
-                        span,
-                        format!("`{what}` outside a loop"),
-                    ));
+                    self.err(
+                        Diagnostic::new(codes::E0315, span, format!("`{what}` outside a loop"))
+                            .with_help(format!(
+                                "`{what}` acts on the innermost `while`, `loop` or `for`; outside one, use `return`"
+                            )),
+                    );
                 }
                 Expr { ty: self.p.types.never, span, kind }
             }
@@ -399,6 +402,10 @@ impl<'p> Checker<'p> {
             if let Some(s) = resolve::closest(suffix, names) {
                 let at = Span::new(span.file, span.start + digits.len() as u32, span.end);
                 d = d.with_fix(format!("did you mean `{s}`?"), at, s);
+            } else {
+                d = d.with_help(format!(
+                    "write it in an SI unit (`{digits}m`, `{digits}s`, `{digits}kg`), or multiply by a constant of your own"
+                ));
             }
             self.err(d);
             return self.error_expr(span);
@@ -476,6 +483,11 @@ impl<'p> Checker<'p> {
             );
             if let Some(s) = resolve::closest(&first.name, names.iter().map(String::as_str)) {
                 d = d.with_fix(format!("did you mean `{s}`?"), first.span, s);
+            } else {
+                d = d.with_help(format!(
+                    "declare it first (`let {} = ...`), or import it with `use`; `wrela doc {}` finds what std has by that name",
+                    first.name, first.name
+                ));
             }
             let d = resolve::with_std_import(self.p, d, &first.name, first.span);
             self.err(d);
@@ -719,16 +731,19 @@ impl<'p> Checker<'p> {
                     && self.p.inherent_method(a, &name.name).is_none()
                 {
                     let adt = self.p.adt(a);
-                    let mut d = Diagnostic::new(
+                    let d = Diagnostic::new(
                         codes::E0211,
                         name.span,
                         format!("`{}` has no variant `{}`", adt.name, name.name),
                     );
                     let names = adt.variants().iter().map(|v| v.name.as_str());
-                    if let Some(s) = resolve::closest(&name.name, names) {
-                        d = d.with_fix(format!("did you mean `{s}`?"), name.span, s);
-                    }
-                    self.err(d);
+                    self.err(resolve::suggest_or_list(
+                        d,
+                        &name.name,
+                        name.span,
+                        names,
+                        "its variants are",
+                    ));
                     return self.error_expr(span);
                 }
                 // `T::f` as a value: an associated function of the type, its own or a trait's.
@@ -1471,7 +1486,8 @@ impl<'p> Checker<'p> {
                                 "a `{}`'s components are {}",
                                 self.display(b.ty),
                                 ["x", "y", "z", "w"][..*n as usize].join(", ")
-                            )),
+                            ))
+                            .with_help("a swizzle takes one to four of those, all from `xyzw` or all from `rgba`: `.x`, `.xy`, `.yx`"),
                         );
                         self.error_expr(span)
                     }
@@ -1496,11 +1512,23 @@ impl<'p> Checker<'p> {
                         format!("`.{}`", name.text())
                     }
                 };
-                self.err(Diagnostic::new(
-                    codes::E0311,
-                    name.span(),
-                    format!("`{shown}` has no field {what}"),
-                ));
+                let help = match self.kind(b.ty) {
+                    TyKind::Int(_) | TyKind::Float(_) | TyKind::Bool => {
+                        "a scalar has no fields or components; `vec2`, `vec3` and `vec4` have `.x`, `.y`, `.z`, `.w`".to_string()
+                    }
+                    TyKind::Adt(a, _) if self.p.adt(*a).is_enum() => {
+                        "an enum has no fields: `match` on it to reach a variant's values".to_string()
+                    }
+                    _ => format!("`wrela doc {shown}` shows what a `{shown}` has"),
+                };
+                self.err(
+                    Diagnostic::new(
+                        codes::E0311,
+                        name.span(),
+                        format!("`{shown}` has no field {what}"),
+                    )
+                    .with_help(help),
+                );
                 self.error_expr(span)
             }
         }
@@ -1535,7 +1563,12 @@ impl<'p> Checker<'p> {
                     n.span,
                     format!("the field `{}` of `{}` is private", n.name, self.p.adt(a).name),
                 )
-                .with_secondary(f.span, "declared here without `pub`"),
+                .with_secondary(f.span, "declared here without `pub`")
+                .with_help(format!(
+                    "use the methods `{}` offers (`wrela doc {}`), or mark the field `pub` where it's declared",
+                    self.p.adt(a).name,
+                    self.p.adt(a).name
+                )),
             );
         }
         Some(i)
@@ -1624,7 +1657,8 @@ impl<'p> Checker<'p> {
                         i.span,
                         format!("an arena is indexed by a `{want}`, not `{shown}`"),
                     )
-                    .with_note("an arena's values are named by their handles (§6.8)"),
+                    .with_note("an arena's values are named by their handles (§6.8)")
+                    .with_help(format!("index it with a `{want}`: the handle `insert` gave")),
                 );
             }
             return Expr { ty: elem, span, kind: ExprKind::Index(Box::new(b), Box::new(i)) };
@@ -1675,11 +1709,14 @@ impl<'p> Checker<'p> {
         {
             let shown = self.display(b.ty);
             let what = if matches!(k, TyKind::Vec(..)) { "components" } else { "columns" };
-            self.err(Diagnostic::new(
-                codes::E0312,
-                i.span,
-                format!("index {v} is out of range: a `{shown}` has {n} {what}"),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0312,
+                    i.span,
+                    format!("index {v} is out of range: a `{shown}` has {n} {what}"),
+                )
+                .with_help(format!("its {what} are 0 to {}", n - 1)),
+            );
         }
         let elem = match k {
             TyKind::Array(t, _) | TyKind::ArrayN(t, _) | TyKind::Slice(t) => *t,
@@ -1882,11 +1919,14 @@ impl<'p> Checker<'p> {
                 continue;
             };
             if given.contains(&view.name) {
-                self.err(Diagnostic::new(
-                    codes::E0308,
-                    f.name.span,
-                    format!("the field `{}` is given twice", view.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0308,
+                        f.name.span,
+                        format!("the field `{}` is given twice", view.name),
+                    )
+                    .with_help("give each field one value: remove one of them"),
+                );
                 continue;
             }
             given.push(view.name.clone());
@@ -2078,11 +2118,14 @@ impl<'p> Checker<'p> {
                 );
             }
             if given[i].is_some() {
-                self.err(Diagnostic::new(
-                    codes::E0308,
-                    f.name.span,
-                    format!("the field `{}` is given twice", f.name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0308,
+                        f.name.span,
+                        format!("the field `{}` is given twice", f.name.name),
+                    )
+                    .with_help("give each field one value: remove one of them"),
+                );
                 continue;
             }
             let fty = field_tys[i];
@@ -2385,7 +2428,8 @@ impl<'p> Checker<'p> {
                         Err(why) => {
                             self.err(
                                 Diagnostic::new(codes::E0217, *hole, format!("this format spec isn't valid: {why}"))
-                                    .with_note("a spec is `[<^>][0][width][.precision][x]`, as in `{x:>8.2}` (§4)"),
+                                    .with_note("a spec is `[<^>][0][width][.precision][x]`, as in `{x:>8.2}` (§4)")
+                                    .with_help("write the spec in that form, or drop it: `{x}`"),
                             );
                             continue;
                         }
@@ -2527,6 +2571,11 @@ impl<'p> Checker<'p> {
                 ),
             )
             .with_note(format!("so the function must return {what}: `{want}`"));
+            if !is_result {
+                d = d.with_help(format!(
+                    "make the function return `{want}`, or handle the `None` here: `let Some(x) = ... else {{ ... }}`"
+                ));
+            }
             if is_result
                 && let TyKind::Adt(a, targs) = self.kind(target)
                 && *a == result
@@ -2535,6 +2584,10 @@ impl<'p> Checker<'p> {
                 let ours = self.display(args[1]);
                 d = d.with_help(format!(
                     "convert the error first: `x.map_err(..)?` turns a `{ours}` into a `{theirs}`"
+                ));
+            } else if is_result {
+                d = d.with_help(format!(
+                    "make the function return `{want}`, or handle the `Err` here: `match x {{ Ok(v) => ..., Err(e) => ... }}`"
                 ));
             }
             self.err(d);

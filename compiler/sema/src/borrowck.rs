@@ -1962,6 +1962,9 @@ impl<'a> FnCheck<'a> {
             )
             .with_secondary(l.span, format!("`{other}` is passed here"))
             .with_note("in one call, arguments can't overlap when one of them is `mut` (§6.5)")
+            .with_help(format!(
+                "pass parts that don't overlap (sibling fields), or copy what's read into a local first: `let x = {what}.clone()`"
+            ))
         } else {
             let hn = self.holder_text(l.holder);
             let msg = if l.mutable {
@@ -1983,6 +1986,14 @@ impl<'a> FnCheck<'a> {
                 && target.proj.len() < l.place.proj.len()
             {
                 d = d.with_help(format!("pass only the parts that don't overlap `{other}`"));
+            } else if self.is_match_holder(l.holder) {
+                d = d.with_help(
+                    "change it after the `match`, or copy what the arms test into a local first and match on that",
+                );
+            } else {
+                d = d.with_help(format!(
+                    "use {hn} for the last time before this, or copy what it needs into a local so the borrow ends sooner"
+                ));
             }
             d
         };

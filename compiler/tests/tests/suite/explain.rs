@@ -1,5 +1,7 @@
 //! AC13: `wrela explain <code>` covers every code. Each explanation's wrong program gives its
-//! code, and its fixed program compiles with no diagnostic at all. A code no program
+//! code, and its fixed program compiles with no diagnostic at all. Every error the wrong
+//! program gives carries a next step of its own (a help or a fix), not only the general one
+//! that points back here (`Diagnostic::with_next_step`). A code no program
 //! can show says why (`// ---- untested:`); the list of those is pinned here.
 
 use crate::scratch;
@@ -86,6 +88,13 @@ fn explanations_programs_do_what_they_say() {
                     "the wrong program gives {found:?}, not {}:\n{}",
                     e.code,
                     wrela_diag::render::render_all(&wrong.0, &wrong.1)
+                ));
+            }
+            for d in wrong.1.iter().filter(|d| d.is_error() && d.has_only_general_help()) {
+                problems.push(format!(
+                    "{} has no help or fix of its own: {}",
+                    d.code.as_str(),
+                    d.message
                 ));
             }
             let mut fixed = diagnose(e.code, &write("fixed", &e.fixed));

@@ -1,0 +1,16 @@
+// mistake: a method's name with two letters swapped
+// expect: E0207
+// fix: yes
+struct Ball {
+    radius: f32,
+}
+
+impl Ball {
+    fn area(self) -> f32 {
+        3.14159 * self.radius * self.radius
+    }
+}
+
+fn size(b: Ball) -> f32 {
+    b.aera()
+}

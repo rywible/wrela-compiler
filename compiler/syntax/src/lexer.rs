@@ -403,6 +403,8 @@ impl<'a> Lexer<'a> {
                     sp,
                     " ",
                 );
+            } else {
+                d = d.with_help("remove it, or put it in a comment or a string");
             }
             self.error(d);
             return false;
@@ -650,11 +652,10 @@ impl<'a> Lexer<'a> {
                 kind
             }
             Err(NumberError::Malformed(why)) => {
-                self.error(Diagnostic::new(
-                    codes::E0004,
-                    sp,
-                    format!("`{text}` isn't a number: {why}"),
-                ));
+                self.error(
+                    Diagnostic::new(codes::E0004, sp, format!("`{text}` isn't a number: {why}"))
+                        .with_help("a number is digits, then an optional `.` and digits, then an optional exponent with digits: `1.5`, `2e3`, `0x1f`"),
+                );
                 TokenKind::Int
             }
         };

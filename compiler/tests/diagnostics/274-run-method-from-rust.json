@@ -1,0 +1,30 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [],
+      "help": [
+        "`wrela doc [T]` lists what it has"
+      ],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`[f32]` has no method `size`",
+      "notes": [
+        "its methods are `is_empty`, `len`"
+      ],
+      "severity": "error",
+      "span": {
+        "column": 8,
+        "end": 146,
+        "end_column": 12,
+        "end_line": 5,
+        "line": 5,
+        "start": 142
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

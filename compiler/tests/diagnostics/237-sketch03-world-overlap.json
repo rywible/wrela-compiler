@@ -4,7 +4,9 @@
       "code": "E0513",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "pass parts that don't overlap (sibling fields), or copy what's read into a local first: `let x = w.grazers[_].clone()`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

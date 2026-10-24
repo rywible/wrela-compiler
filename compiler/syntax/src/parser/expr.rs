@@ -42,7 +42,8 @@ impl<'a> Parser<'a> {
         if self.at(T::Eof) {
             self.error(
                 Diagnostic::new(codes::E0101, open, "this `{` is never closed")
-                    .with_secondary(self.span(), "the file ends here"),
+                    .with_secondary(self.span(), "the file ends here")
+                    .with_help("add the `}` that closes it"),
             );
             return Err(Failed);
         }
@@ -57,7 +58,8 @@ impl<'a> Parser<'a> {
                     format!(
                         "this `{closer}` closes a bracket opened before it, and the block with it"
                     ),
-                ),
+                )
+                .with_help("add the `}` that closes the block before it"),
             );
             return Ok(Block { stmts, span: open.to(self.prev_span()) });
         }
@@ -256,6 +258,8 @@ impl<'a> Parser<'a> {
                             ],
                         );
                     }
+                } else {
+                    d = d.with_help("put the operator at the end of the line before, where the expression it continues ends");
                 }
                 self.error(d);
                 return Err(Failed);

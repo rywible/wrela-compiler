@@ -4,7 +4,9 @@
       "code": "E0607",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "call it in a `@fragment` function, or pass the footprint in as a value (`std::derive::filtered` takes one)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0200",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 134,
+              "file": "main.wrela",
+              "replacement": "width",
+              "start": 129
+            }
+          ],
+          "message": "did you mean `width`?"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "there's no `widht` in scope",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 5,
+        "end": 134,
+        "end_column": 10,
+        "end_line": 5,
+        "line": 5,
+        "start": 129
+      },
+      "title": "an unknown name"
+    }
+  ],
+  "version": 2
+}

@@ -81,11 +81,14 @@ impl Fl<'_, '_> {
     /// A string literal: a `Text`, the address and length of its UTF-8 in the build.
     pub fn text(&mut self, s: &str, ty: TyId, span: Span) -> Option<ir::ValueId> {
         if self.is_gpu() {
-            self.cx.err(Diagnostic::new(
-                codes::E0326,
-                span,
-                "GPU code can't hold text: strings live on the CPU (language.md §4)",
-            ));
+            self.cx.err(
+                Diagnostic::new(
+                    codes::E0326,
+                    span,
+                    "GPU code can't hold text: strings live on the CPU (language.md §4)",
+                )
+                .with_help("pass the GPU numbers computed from the text on the CPU"),
+            );
             return None;
         }
         let t = self.ty(ty, span)?;
@@ -96,11 +99,14 @@ impl Fl<'_, '_> {
     /// `embed("path")`: `Bytes`, the address and length of the file's bytes in the build.
     pub fn embedded(&mut self, path: &str, ty: TyId, span: Span) -> Option<ir::ValueId> {
         if self.is_gpu() {
-            self.cx.err(Diagnostic::new(
-                codes::E0326,
-                span,
-                "GPU code can't hold `Bytes`: embedded files live on the CPU (language.md §13)",
-            ));
+            self.cx.err(
+                Diagnostic::new(
+                    codes::E0326,
+                    span,
+                    "GPU code can't hold `Bytes`: embedded files live on the CPU (language.md §13)",
+                )
+                .with_help("read the bytes on the CPU and upload them to a `GpuBuffer`"),
+            );
             return None;
         }
         let t = self.ty(ty, span)?;

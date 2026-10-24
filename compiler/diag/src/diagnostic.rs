@@ -79,7 +79,33 @@ pub struct Diagnostic {
     pub fixes: Vec<Fix>,
 }
 
+/// The help a diagnostic gets where the code that made it gave neither a help nor a fix
+/// ([`Diagnostic::with_next_step`]): every code has an explanation with a program that has it
+/// and the program fixed.
+fn explain_help(code: Code) -> String {
+    format!(
+        "`wrela explain {}` shows a program with this error and the same program fixed",
+        code.as_str()
+    )
+}
+
 impl Diagnostic {
+    /// The diagnostic with a next step: if it has no help and no fix, the help that points at
+    /// `wrela explain`. Every diagnostic leaves the driver through this, so none is a message
+    /// alone; a site that can say more says it itself (the test suite holds every error that a
+    /// test program reaches to that).
+    pub fn with_next_step(mut self) -> Diagnostic {
+        if self.help.is_empty() && self.fixes.is_empty() && !self.code.is_internal() {
+            self.help.push(explain_help(self.code));
+        }
+        self
+    }
+
+    /// Whether its only next step is the general one [`Self::with_next_step`] gives.
+    pub fn has_only_general_help(&self) -> bool {
+        self.fixes.is_empty() && self.help.len() == 1 && self.help[0] == explain_help(self.code)
+    }
+
     /// An error with `code`'s severity, at `span`.
     pub fn new(code: Code, span: Span, message: impl Into<String>) -> Diagnostic {
         Diagnostic {
@@ -200,4 +226,27 @@ pub fn sort_and_dedup(diags: &mut Vec<Diagnostic>) {
         }
         same
     });
+}
+
+#[cfg(test)]
+mod next_step_tests {
+    use super::*;
+    use crate::codes;
+    use crate::source::{FileId, Span};
+
+    #[test]
+    fn a_diagnostic_with_no_next_step_gets_the_general_one() {
+        let at = Span::new(FileId(0), 0, 1);
+        let bare = Diagnostic::new(codes::E0200, at, "there's no `x` in scope").with_next_step();
+        assert_eq!(bare.help.len(), 1);
+        assert!(bare.help[0].contains("wrela explain E0200"), "{:?}", bare.help);
+        assert!(bare.has_only_general_help());
+        let helped =
+            Diagnostic::new(codes::E0200, at, "m").with_help("declare it").with_next_step();
+        assert_eq!(helped.help, ["declare it"]);
+        assert!(!helped.has_only_general_help());
+        let fixed = Diagnostic::new(codes::E0200, at, "m").with_fix("f", at, "y").with_next_step();
+        assert!(fixed.help.is_empty() && !fixed.has_only_general_help());
+        assert!(Diagnostic::internal("a bug").with_next_step().help.is_empty());
+    }
 }

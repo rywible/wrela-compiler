@@ -136,14 +136,16 @@ pub fn run(
                 attrs.test_golden.as_ref().map_or(checked.program.func(f).span, |g| g.span),
                 format!("the test `{name}` failed {phase}: {why}"),
             )
-            .with_note("a GPU's results differ a little from another's (§11): `within` is how far its screen may be from the golden, a mean in 8-bit steps, 0.5 unless the test says"),
+            .with_note("a GPU's results differ a little from another's (§11): `within` is how far its screen may be from the golden, a mean in 8-bit steps, 0.5 unless the test says")
+            .with_help("compare the images it wrote under `build/goldens/`; if the new frame is right, `wrela test --bless` writes it as the golden"),
             // Not a trap: a command the host can't carry out, say.
             (None, Why::Host(error)) => Diagnostic::new(
                 codes::E0706,
                 checked.program.func(f).span,
                 format!("the test `{name}` failed {phase}: {error}"),
             )
-            .with_note("a frame test passes unless its frames or the test fail (§13)"),
+            .with_note("a frame test passes unless its frames or the test fail (§13)")
+            .with_help("fix the command the host refused; `wrela trace <package> --frames n` runs the frames up to it"),
         });
         results.push((f, failed, traced));
     }

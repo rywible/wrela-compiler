@@ -4,7 +4,9 @@
       "code": "E0301",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "it's declared as `fn area(width: f32, height: f32) -> f32`: pass one argument for each parameter"
+      ],
       "internal": false,
       "label": null,
       "labels": [

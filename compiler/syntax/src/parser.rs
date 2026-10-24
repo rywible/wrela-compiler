@@ -349,7 +349,7 @@ impl<'a> Parser<'a> {
             // A NEWLINE token is the line's end, which is where the error points.
             d = d.with_note("a line break ends a statement unless the line ends with an operator or the next line starts with `.` (L17)");
         }
-        self.error(d);
+        self.error(d.with_help(format!("put {what} here")));
         Failed
     }
 
@@ -819,7 +819,7 @@ impl<'a> Parser<'a> {
                 d.with_help("a range is written only in a `for` loop: `for i in 0..10`")
             }
             _ if starts => d.with_fix("start a new line here", at, "\n"),
-            _ => d,
+            _ => d.with_help("end the statement with a line break or `;` before this"),
         });
     }
 

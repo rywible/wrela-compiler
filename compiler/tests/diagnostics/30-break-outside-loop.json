@@ -4,7 +4,9 @@
       "code": "E0315",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "`break` acts on the innermost `while`, `loop` or `for`; outside one, use `return`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

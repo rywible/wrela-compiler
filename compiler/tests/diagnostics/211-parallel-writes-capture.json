@@ -4,7 +4,9 @@
       "code": "E0520",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "write only the closure's own element, or compute each element's part and combine them with `par_map_reduce` instead of writing `total`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

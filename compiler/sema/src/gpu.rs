@@ -303,6 +303,10 @@ pub fn not_gpu_data(p: &Program, param: &str, ty: TyId, span: Span) -> Diagnosti
         && let Some((at, text)) = p.opt_in_fix(*a, "GpuData")
     {
         d = d.with_fix(format!("opt `{shown}` in to `GpuData`"), at, text);
+    } else {
+        d = d.with_help(
+            "pass the GPU numbers, vectors, matrices and structs of them; keep text, `Vec`s and handles on the CPU",
+        );
     }
     d
 }

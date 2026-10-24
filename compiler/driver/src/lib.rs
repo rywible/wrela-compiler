@@ -597,7 +597,7 @@ fn run_tests_in(
     stop()?;
     let (sources, mut diagnostics, loaded) = load_scoped(root, &Overlay::new(), scope);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
-        split_std_warnings(&sources, &mut diagnostics);
+        finish_diagnostics(&sources, &mut diagnostics);
         return Ok(TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 });
     };
     // std's own tests memory-check its bodies, which other programs leave out.
@@ -687,7 +687,7 @@ fn run_tests_in(
         }
     }
     sort_and_dedup(&mut diagnostics);
-    split_std_warnings(&sources, &mut diagnostics);
+    finish_diagnostics(&sources, &mut diagnostics);
     Ok(TestOutput { sources, diagnostics, results, filtered_out })
 }
 
@@ -754,7 +754,7 @@ fn compile_loaded_in(
 ) -> Result<Output, String> {
     scope.stop()?;
     let Some(Loaded { units, mut packages, dirs, files: all_files, .. }) = loaded else {
-        let std_warnings = split_std_warnings(&sources, &mut diagnostics);
+        let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
         return Ok(Output {
             sources,
             diagnostics,
@@ -857,7 +857,7 @@ fn compile_loaded_in(
     if has_errors(&diagnostics) {
         files.clear();
     }
-    let std_warnings = split_std_warnings(&sources, &mut diagnostics);
+    let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
     Ok(Output {
         sources,
         diagnostics,
@@ -919,8 +919,11 @@ fn prepare(
     stats
 }
 
-/// Takes the warnings in std's own code out of `diags`, and returns them.
-fn split_std_warnings(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<Diagnostic> {
+/// Readies `diags` to leave the driver: each gets a next step if it has none
+/// (`Diagnostic::with_next_step`), and the warnings in std's own code are taken out and
+/// returned.
+fn finish_diagnostics(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<Diagnostic> {
+    *diags = std::mem::take(diags).into_iter().map(Diagnostic::with_next_step).collect();
     let in_std = |d: &Diagnostic| {
         !d.is_error() && d.span().is_some_and(|s| sources.file(s.file).name.starts_with("<std::"))
     };

@@ -4,7 +4,9 @@
       "code": "E0300",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give it a value of type `bool` here, or change what expects one (`wrela query type <file>:<line>:<col>` shows a place's type)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

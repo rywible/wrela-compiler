@@ -4,7 +4,9 @@
       "code": "E0323",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give 3 numbers, vectors whose sizes add up to 3, or one number for every component: `vec3(0.0)`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

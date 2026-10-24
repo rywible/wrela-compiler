@@ -2364,7 +2364,11 @@ impl<'c, 'a> Fl<'c, 'a> {
                 role.name()
             ),
         )
-        .with_note(ROLE_ENTRIES);
+        .with_note(ROLE_ENTRIES)
+        .with_help(format!(
+            "call it only from {} code, or move what both builds need into a function with no role",
+            only.name()
+        ));
         self.cx.err(crate::gpu::with_call_chain(self, d));
     }
 

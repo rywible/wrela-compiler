@@ -1,0 +1,38 @@
+{
+  "diagnostics": [
+    {
+      "code": "E0207",
+      "file": "main.wrela",
+      "fixes": [
+        {
+          "edits": [
+            {
+              "end": 244,
+              "file": "main.wrela",
+              "replacement": "area",
+              "start": 240
+            }
+          ],
+          "message": "did you mean `area`?"
+        }
+      ],
+      "help": [],
+      "internal": false,
+      "label": null,
+      "labels": [],
+      "message": "`Ball` has no method `aera`",
+      "notes": [],
+      "severity": "error",
+      "span": {
+        "column": 7,
+        "end": 244,
+        "end_column": 11,
+        "end_line": 15,
+        "line": 15,
+        "start": 240
+      },
+      "title": "an unknown method"
+    }
+  ],
+  "version": 2
+}

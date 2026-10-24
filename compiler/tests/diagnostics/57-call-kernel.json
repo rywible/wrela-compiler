@@ -4,7 +4,9 @@
       "code": "E0606",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "record it from `frame`: `dispatch(kernel.bind(...), groups: n)`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

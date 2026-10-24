@@ -4,7 +4,9 @@
       "code": "E0401",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "add it to the impl: `fn distance(self, p: vec3) -> f32 { ... }`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

@@ -1692,6 +1692,7 @@ pub(crate) fn check_derivative(fl: &mut Fl, v: Option<ir::ValueId>, span: Span) 
             format!("derivatives exist only in fragment shaders, and this is {ctx}"),
         )
         .with_note("`dpdx`, `dpdy` and `fwidth` compare neighbouring pixels")
+        .with_help("call it in a `@fragment` function, or pass the footprint in as a value (`std::derive::filtered` takes one)")
     });
 }
 

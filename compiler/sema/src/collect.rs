@@ -944,6 +944,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                     .with_note("attributes are a closed set defined by the language (D-037)");
                     if let Some(s) = resolve::closest(name, known.iter().copied()) {
                         d = d.with_fix(format!("did you mean `@{s}`?"), a.name.span, s);
+                    } else {
+                        let all: Vec<String> = known.iter().map(|k| format!("`@{k}`")).collect();
+                        d = d.with_help(format!(
+                            "remove it; the attributes are {}, `@fuel`, `@fieldwise` and `@unsafe_call`",
+                            all.join(", ")
+                        ));
                     }
                     self.diags.push(d);
                 }
@@ -1309,7 +1315,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame")
+                    .with_help("write `@test`, `@test(frames: 60)` or `@test(ticks: 60)`, with only the options that note lists for that kind"),
                 );
                 FrameTest::default()
             }
@@ -1374,7 +1381,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     .with_note(format!(
                         "WebGPU's default limits: {}, {} and {}, and {MAX_WORKGROUP_INVOCATIONS} invocations in all",
                         limits[0], limits[1], limits[2]
-                    )),
+                    ))
+                    .with_help(format!("use a workgroup of at most {} along {axis}, and dispatch more groups", limits[i])),
                 );
                 return None;
             }
@@ -2144,7 +2152,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     format!("`{}` can't be a `@test`: {why}", def.name),
                 )
                 .with_secondary(at, "declared a test here")
-                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics"),
+                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics")
+                .with_help("make it a free function of no parameters and no result, and move the values it needs inside it"),
             );
         }
     }
@@ -2375,6 +2384,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         span,
                         format!("`{name}` is its own supertrait, through {}", and_list(&through)),
                     )
+                    .with_help("remove one of the supertraits that leads back to it")
                 };
                 for &(_, &(_, s)) in &cycle[..cycle.len() - 1] {
                     d = d.with_secondary(s, "a supertrait in the cycle");
@@ -2433,6 +2443,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                             d.span,
                             format!("`{}` holds fields, so its enum's variants have no discriminants", v.name.name),
                         )
+.with_help("remove the discriminants, or make the variants hold nothing")
                         .with_secondary(v.span, "holds fields")
                         .with_note("a discriminant is a variant's tag and its `u32`: an enum whose variants hold nothing has them (§3)"),
                     );
@@ -2451,7 +2462,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                                         "`{}`'s discriminant is a `u32`, and `{}` isn't one",
                                         v.name.name, lit.text
                                     ),
-                                ));
+                                )
+.with_help("write the discriminant as a whole number from 0 to 4294967295"));
                                 None
                             }
                         },
@@ -2465,7 +2477,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                                     codes::E0334,
                                     v.name.span,
                                     format!("`{}`'s discriminant, one past the variant's before it, is past `u32`'s range", v.name.name),
-                                ));
+                                )
+.with_help("give the variants before it smaller discriminants"));
                             }
                             0
                         }
@@ -2485,6 +2498,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                                     v.name.name, prev.name
                                 ),
                             )
+.with_help(format!("give `{}` a discriminant larger than {pd}, or reorder the variants", v.name.name))
                             .with_secondary(ps, "the variant before it")
                             .with_note("discriminants increase down the enum, so its variants are ordered as they're declared, and each has its own (§3)"),
                         );
@@ -2651,7 +2665,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     codes::E0324,
                     d.span,
                     "variant fields can't have defaults",
-                ));
+                )
+.with_help("remove the default: a variant's fields are given wherever the variant is built"));
             }
             out.push(FieldDef {
                 name: f.name.name.clone(),
@@ -3537,7 +3552,8 @@ fn check_members(
                         format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
                     )
                     .with_secondary(tdef.sig_span, "declared here")
-                    .with_note("its body walks the fields of a type that declares the trait, so an impl written by hand gives its own (§3)"),
+                    .with_note("its body walks the fields of a type that declares the trait, so an impl written by hand gives its own (§3)")
+                    .with_help(format!("add `fn {}` to the impl, or remove the impl and declare the trait on the type", tdef.name)),
                 );
             }
             None if tdef.body.is_none() && !imp.from_opt_in => {
@@ -3547,7 +3563,11 @@ fn check_members(
                         imp.span,
                         format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
                     )
-                    .with_secondary(tdef.sig_span, "declared here"),
+                    .with_secondary(tdef.sig_span, "declared here")
+                    .with_help(match p.text(tdef.sig_span) {
+                        Some(sig) => format!("add it to the impl: `{sig} {{ ... }}`"),
+                        None => format!("add `fn {}` to the impl", tdef.name),
+                    }),
                 );
             }
             None => {}
@@ -3643,6 +3663,10 @@ fn compare_signatures(
             format!("`{}` doesn't match the trait's signature: {what}", a.name),
         )
         .with_secondary(b.sig_span, "the trait declares it here")
+        .with_help(match p.text(b.sig_span) {
+            Some(sig) => format!("declare it as the trait does: `{sig}`"),
+            None => "declare it as the trait does".into(),
+        })
     };
     if a.generics.len() != b.generics.len() {
         return diags.push(mismatch(format!(
@@ -3845,7 +3869,11 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
                         p.display_ty(f.ty)
                     ),
                 )
-                .with_secondary(imp.span, format!("`{}` opted in here", tr.name)),
+                .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
+                .with_help(format!(
+                    "remove `{}` from `{}`, or give `{}` a type that is `{}` (`Text` rather than `String`, a handle rather than a `Vec`)",
+                    tr.name, adt.name, f.name, tr.name
+                )),
             );
         }
     }
@@ -3964,7 +3992,8 @@ pub fn check_job_fields(p: &Program) -> Vec<Diagnostic> {
                         ),
                     )
                     .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
-                    .with_note("a job's value holds its body's locals, and has a trait when they do (§16.3)"),
+                    .with_note("a job's value holds its body's locals, and has a trait when they do (§16.3)")
+                    .with_help(format!("remove `{}` from the type, or keep the job's locals `{}`", tr.name, tr.name)),
                 );
             }
         }
@@ -4006,6 +4035,10 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
                 .with_note(format!(
                     "`{}` declares `{}`, which is derived field by field, so the field `{}` needs it too (§3)",
                     adt.name, tr.name, f.name
+                ))
+                .with_help(format!(
+                    "declare `{}` on the field's type too, keep the field out of `{}`, or remove `{}` from `{}`",
+                    tr.name, adt.name, tr.name, adt.name
                 )),
         );
     }
@@ -4106,7 +4139,8 @@ fn check_overlap(p: &Program, diags: &mut Vec<Diagnostic>) {
                             p.display_ty(b.self_ty)
                         ),
                     )
-                    .with_secondary(a.span, "the other impl"),
+                    .with_secondary(a.span, "the other impl")
+                    .with_help("remove one of the two impls; a type implements a trait once"),
                 );
             }
         }

@@ -450,7 +450,11 @@ fn lower_in(
                         data.role.name()
                     ),
                 )
-                .with_note("each build's exports are entry points for that role (§15.3)"),
+                .with_note("each build's exports are entry points for that role (§15.3)")
+                .with_help(format!(
+                    "remove the export from this build, or mark it for the {} build",
+                    data.role.name()
+                )),
             );
         }
         if !checked.program.fn_all_generics(f).is_empty() {
@@ -717,7 +721,8 @@ impl<'a> Cx<'a> {
                 format!("instantiating `{name}` never ends: each instance calls one with a larger type"),
             )
             .with_note(when)
-            .with_note("generics are monomorphized (§7), so a generic function can't call itself with an ever-growing type"),
+            .with_note("generics are monomorphized (§7), so a generic function can't call itself with an ever-growing type")
+            .with_help("give the recursion a fixed type: call it with the same type arguments, or keep the growing part in a `Vec`"),
         );
     }
 
@@ -773,7 +778,8 @@ impl<'a> Cx<'a> {
             if !ok {
                 self.err(
                     Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, "`init`'s signature is `init() -> State`: it makes the program's state, which the host keeps")
-                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§15)"),
+                        .with_note("the host calls `init` once, then passes its result to `frame` and the other exports that take the state first (§15)")
+                    .with_help("declare it as `pub fn init() -> State`, with no parameters"),
                 );
             }
             return ok;
@@ -800,7 +806,8 @@ impl<'a> Cx<'a> {
             };
             self.err(
                 Diagnostic::new(wrela_diag::codes::E0703, def.sig_span, msg)
-                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§15)"),
+                    .with_note("a host program exports `frame`: the time in seconds, and the screen's size in pixels; a program with `init` gets its state first (§15)")
+                    .with_help("declare it with exactly that signature, and keep what it computes in the state"),
             );
             return false;
         }
@@ -1103,7 +1110,8 @@ fn check_deterministic(cx: &mut Cx, mb: &ModuleBuilder) {
                     if chain.len() > 1 {
                         d = d.with_note(format!("the call chain: {}", chain.join(" → ")));
                     }
-                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§12)");
+                    d = d.with_note("it's reached through a call that only the types it's instantiated with decide, such as a trait method of a generic parameter (§12)")
+                        .with_help(wrela_sema::effects::effect_help(*e));
                     diags.push(d);
                 }
             }

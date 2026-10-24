@@ -4,7 +4,9 @@
       "code": "E0325",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "use a constant (`const N: u32 = 8`), or a `Vec` for a length known only at run time: `Vec::filled(n, x)`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

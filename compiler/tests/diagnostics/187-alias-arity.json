@@ -4,7 +4,9 @@
       "code": "E0322",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "give `Pair` exactly 1: `Pair<_>`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

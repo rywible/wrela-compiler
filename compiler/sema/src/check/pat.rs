@@ -157,11 +157,16 @@ impl<'p> Checker<'p> {
                 // A string matches text: a `str`, `Text` or `String` (§2's string patterns).
                 if !self.is_stringy(ty) && !matches!(self.kind(ty), TyKind::Error) {
                     let shown = self.display(ty);
-                    self.err(Diagnostic::new(
-                        codes::E0320,
-                        lit.span,
-                        format!("a string pattern matches text, not `{shown}`"),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0320,
+                            lit.span,
+                            format!("a string pattern matches text, not `{shown}`"),
+                        )
+                        .with_help(format!(
+                            "match a `{shown}` with a pattern of its own type, such as a number"
+                        )),
+                    );
                     return self.unmatched(pat, ty);
                 }
                 PatKind::Text(wrela_syntax::lexer::string_value(&lit.text).into())
@@ -441,11 +446,23 @@ impl<'p> Checker<'p> {
         let at = self.p.types.adt(a, args.clone());
         if self.infer.unify(&self.p.types, at, ty).is_err() {
             let (x, y) = (self.display(at), self.display(ty));
-            self.err(Diagnostic::new(
-                codes::E0320,
-                span,
-                format!("a `{x}` pattern can't match a `{y}`"),
-            ));
+            let help = match self.kind(ty) {
+                TyKind::Adt(b, _) if self.p.adt(*b).is_enum() => {
+                    let adt = self.p.adt(*b);
+                    let vs: Vec<String> = adt
+                        .variants()
+                        .iter()
+                        .take(4)
+                        .map(|v| format!("`{}::{}`", adt.name, v.name))
+                        .collect();
+                    format!("a `{y}` matches its own variants: {}", vs.join(", "))
+                }
+                _ => format!("match it with a pattern of `{y}`"),
+            };
+            self.err(
+                Diagnostic::new(codes::E0320, span, format!("a `{x}` pattern can't match a `{y}`"))
+                    .with_help(help),
+            );
             return None;
         }
         Some(args.iter().map(|&t| self.shallow(t)).collect())

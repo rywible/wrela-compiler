@@ -4,7 +4,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "keep the memory in the state and reuse it (`v.clear()` keeps its capacity), or move the allocation out of this context"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

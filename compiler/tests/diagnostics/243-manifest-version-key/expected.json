@@ -4,7 +4,9 @@
       "code": "E0219",
       "file": "wrela.toml",
       "fixes": [],
-      "help": [],
+      "help": [
+        "remove `version`, or give it the type that note says"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
