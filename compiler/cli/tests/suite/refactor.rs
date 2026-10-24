@@ -267,6 +267,11 @@ fn two(x: f32) -> f32 {
     assert!(r["refused"].as_str().is_some_and(|w| w.contains("more than one value")), "{r}");
     let r = plan(&dir, &["extract-fn", "main.wrela:6-8", "early", "--json"]);
     assert!(r["refused"].as_str().is_some_and(|w| w.contains("leave early")), "{r}");
+    // The call would be a local's (`b`) or a built-in's (`sqrt`), not the new function's.
+    for name in ["b", "sqrt"] {
+        let r = plan(&dir, &["extract-fn", "main.wrela:4-4", name, "--json"]);
+        assert!(r["refused"].as_str().is_some_and(|w| w.contains("has already")), "{name}: {r}");
+    }
 }
 
 const INLINES: &str = "pub fn frame(time: f32, width: u32, height: u32) {}
@@ -308,6 +313,63 @@ fn values_hold() {
     assert(uses() == 1.5 + 0.0 + 2.0 + 2.0 + 2.0 + 1.0 + 2.0 + 1.0 + 0.0)
 }
 ";
+
+#[test]
+fn an_inlined_body_names_what_it_named_in_its_function() {
+    let dir = common::package(
+        "refactor-inline-names",
+        &[
+            ("wrela.toml", &common::manifest("shapes")),
+            (
+                "main.wrela",
+                "use util::shift
+
+const K: f32 = 2.0
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn shifted() -> f32 {
+    let one: f32 = 1.0
+    shift(one) + K
+}
+
+fn unit() -> f32 {
+    3.0
+}
+
+fn grow(x: f32) -> f32 {
+    x * unit()
+}
+
+fn grown() -> f32 {
+    let unit = || f32(10.0)
+    let one: f32 = 1.0
+    grow(one) + unit()
+}
+
+@test
+fn values_hold() {
+    assert(shifted() == 4.0)
+    assert(grown() == 13.0)
+}
+",
+            ),
+            (
+                "util.wrela",
+                "pub const K: f32 = 1.0\n\npub(package) fn shift(x: f32) -> f32 {\n    x + K\n}\n",
+            ),
+        ],
+    );
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    let before = main_text(&dir);
+    // `K` in `shift` is util's; where it's called, `K` is main's.
+    let r = plan(&dir, &["inline", "shift", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("names something else")), "{r}");
+    // `unit` in `grow` is the function; where it's called, `unit` is a local closure.
+    let r = plan(&dir, &["inline", "grow", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("would name the local")), "{r}");
+    assert_eq!(main_text(&dir), before, "nothing written");
+}
 
 #[test]
 fn a_call_becomes_the_body_where_nothing_about_it_can_change() {

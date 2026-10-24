@@ -272,11 +272,16 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
         // Each parameter used exactly once, in the parameter order.
         let mut uses: Vec<Vec<Span>> = vec![Vec::new(); def.params.len()];
         let mut numbers = false;
+        // The other names the body uses (a path's first): each must name the same where it's
+        // inlined.
+        let mut names = BTreeSet::new();
         tail.walk(&mut |x| {
             if let Some(n) = name_of(x)
                 && let Some(i) = def.params.iter().position(|q| q.name == n)
             {
                 uses[i].push(x.span);
+            } else if let ExprKind::Path(path) = &x.kind {
+                names.insert(path.segments[0].ident.name.clone());
             }
             if let ExprKind::Lit(l) = &x.kind {
                 numbers |=
@@ -324,6 +329,30 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
             // declared are the arguments that can be passed through.
             let caller =
                 ix.fn_at(call.span.file, call.span.start).ok_or("a call outside a function")?;
+            let locals: BTreeSet<&str> = checked.mir[&caller]
+                .locals
+                .iter()
+                .filter(|l| matches!(l.kind, wrela_sema::mir::LocalKind::User(_)))
+                .map(|l| l.name.as_str())
+                .chain(p.func(caller).params.iter().map(|q| q.name.as_str()))
+                .collect();
+            let module = p.func(caller).module;
+            for n in &names {
+                if locals.contains(n.as_str()) {
+                    return refuse(format!(
+                        "the body's `{n}` would name the local `{n}` of the call at {}: rename one first",
+                        ix.at(call.span)
+                    ));
+                }
+                if wrela_sema::resolve::lookup_name(p, module, n)
+                    != wrela_sema::resolve::lookup_name(p, def.module, n)
+                {
+                    return refuse(format!(
+                        "the body's `{n}` names something else at the call at {}: qualify it in `{path}` first",
+                        ix.at(call.span)
+                    ));
+                }
+            }
             let typed = typed_names(p, caller);
             let mut args = Vec::new();
             for &(span, _) in &call.args {
@@ -591,8 +620,11 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
                 result = Some((d.name.clone(), p.display_ty(d.ty), var));
             }
         }
-        if p.module(def.module).scope.contains_key(name) {
-            return refuse(format!("`{name}` is a name its module has already"));
+        // The call is a bare name: one a local, an item or a built-in has would call that.
+        if wrela_sema::resolve::lookup_name(p, def.module, name).is_some()
+            || user.iter().any(|l| l.name == name)
+        {
+            return refuse(format!("`{name}` is a name its module or function has already"));
         }
         // The new function goes after the top-level item the lines are in.
         let parsed = wrela_syntax::parse(fid, text);
