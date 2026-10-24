@@ -507,6 +507,28 @@ pub fn builtins() -> Vec<(&'static str, usize, bool)> {
         .collect()
 }
 
+/// The built-in functions a value of type `ty` takes as a method (`x.sqrt()`), by sema's own
+/// rules: each one's name and how many arguments it takes, the others of the receiver's type.
+/// `ty` is `f32`, `u32`, `vec3`, `vec3u` or `[f32]`; any other gives none.
+pub fn builtin_methods(ty: &str) -> Vec<(&'static str, usize)> {
+    use wrela_sema::builtins::BuiltinFn;
+    use wrela_sema::ty::{TyKind, VecElem};
+    let p = wrela_sema::Program::default();
+    let t = match ty {
+        "f32" => p.types.f32,
+        "u32" => p.types.u32,
+        "vec3" => p.types.vec3,
+        "vec3u" => p.types.intern(TyKind::Vec(VecElem::U32, 3)),
+        "[f32]" => p.types.intern(TyKind::Slice(p.types.f32)),
+        _ => return Vec::new(),
+    };
+    BuiltinFn::ALL
+        .iter()
+        .filter(|b| b.is_method() && b.arity() >= 1 && b.result(&p, &vec![t; b.arity()]).is_ok())
+        .map(|b| (b.name(), b.arity()))
+        .collect()
+}
+
 /// What running a package's tests found (`wrela test`, §13).
 #[derive(Debug)]
 pub struct TestOutput {

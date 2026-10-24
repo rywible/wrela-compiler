@@ -123,38 +123,25 @@ const TYPES: &[Builtin] = &[
     },
 ];
 
-/// The built-in functions called as methods of a type of kind `takes`, as their calls.
+/// The built-in functions called as methods of a type of kind `takes`, as their calls: those
+/// sema takes on the kind's first type (`f32` for the floats), so the list is the checker's.
 fn methods_of(takes: Takes) -> Vec<String> {
-    const INTEGER_ONLY: &[&str] = &[
-        "count_ones",
-        "leading_zeros",
-        "trailing_zeros",
-        "wrapping_add",
-        "wrapping_sub",
-        "wrapping_mul",
-    ];
-    // The componentwise built-ins that also take integers (WGSL's), not only floats.
-    const ALSO_INTEGER: &[&str] = &["abs", "min", "max", "clamp", "sign", "dot"];
-    // Called as functions, not methods: `select` names its arguments (W0005), and the
-    // derivatives are a fragment shader's.
-    const NOT_METHODS: &[&str] =
-        &["select", "dpdx", "dpdy", "fwidth", "len", "panic", "assert", "embed"];
-    let mut out = Vec::new();
-    for (name, arity, _) in wrela_driver::builtins() {
-        let fits = match takes {
-            Takes::Sequence => name == "len",
-            Takes::Nothing => false,
-            _ if NOT_METHODS.contains(&name) => false,
-            Takes::Integer | Takes::IntegerVector => {
-                INTEGER_ONLY.contains(&name) || ALSO_INTEGER.contains(&name)
-            }
-            Takes::Float | Takes::FloatVector => !INTEGER_ONLY.contains(&name),
-        };
-        if fits {
-            out.push(crate::doc::builtin_call(name, arity, true));
-        }
-    }
-    out
+    // Called as functions, not methods, though they can be: the derivatives are a fragment
+    // shader's.
+    const NOT_METHODS: &[&str] = &["dpdx", "dpdy", "fwidth"];
+    let ty = match takes {
+        Takes::Float => "f32",
+        Takes::FloatVector => "vec3",
+        Takes::Integer => "u32",
+        Takes::IntegerVector => "vec3u",
+        Takes::Sequence => "[f32]",
+        Takes::Nothing => return Vec::new(),
+    };
+    wrela_driver::builtin_methods(ty)
+        .into_iter()
+        .filter(|(name, _)| !NOT_METHODS.contains(name))
+        .map(|(name, arity)| crate::doc::builtin_call(name, arity, true))
+        .collect()
 }
 
 /// The text of the spec's section under `heading`, up to the next heading of any level.
@@ -235,5 +222,11 @@ mod tests {
         assert!(methods_of(Takes::Integer).contains(&"x.count_ones()".to_string()));
         assert!(!methods_of(Takes::Integer).contains(&"x.sqrt()".to_string()));
         assert!(methods_of(Takes::Nothing).is_empty());
+        // Only what sema takes on the type: no vector function on a scalar, no free function.
+        for not in ["x.cross(y)", "x.normalize()", "x.bitcast_u32()", "x.select(y, z)"] {
+            assert!(!methods_of(Takes::Float).contains(&not.to_string()), "{not}");
+        }
+        assert!(methods_of(Takes::FloatVector).contains(&"x.cross(y)".to_string()));
+        assert!(methods_of(Takes::FloatVector).contains(&"x.normalize()".to_string()));
     }
 }
