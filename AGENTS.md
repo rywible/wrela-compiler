@@ -15,7 +15,7 @@ MIT-licensed toolchain of Wrela, a language for browser games with AAA ambition:
 ## Context and layers
 
 - `spec/language.md`: current spec. Find headings with `rg -n '^#' spec/language.md`; read relevant sections. `spec/lexical.md`, `spec/grammar.ebnf` and `spec/wrela.gbnf` are the lexical rules and the grammar.
-- `docs/process.md`: public record of this repo's human/AI work and outside sources.
+- `docs/citations.md`: every outside source and tool, its rights, and how and why it is used. `docs/release.md`: how to cut a release.
 - Prefer `tools/wrela context <item> <package>`, `tools/wrela query`, `tools/wrela doc` and `tools/wrela primer <area>` for Wrela. Fall back to `rg`; report tool gaps as findings.
 - `tools/wrela doc --export <dir> <package-dir>...` writes the reference docs: the spec by section and a page per module, in Markdown, with `index.json` (every item and spec section, with its page, anchor and source) and `llms.txt`. Doc comments and each file's opening comment are that reference; keep them true when you change an item.
 
@@ -40,8 +40,8 @@ MIT-licensed toolchain of Wrela, a language for browser games with AAA ambition:
 
 ## Releases
 
-- A release is a tag `vX.Y.Z` on `main`. First bump `version` under `[workspace.package]` in `Cargo.toml` to `X.Y.Z` in a PR; after Ryan merges it, tag that commit on `main` and push the tag.
-- The tag starts `.github/workflows/toolchain-release.yml`: it runs `tools/package.py` for Linux x86-64 and macOS arm64 and publishes the tarballs and one `SHA256SUMS` as the tag's GitHub release. It only builds and publishes; add no checks to it. A tarball holds `wrela`, `wrela-host`, `wrela-serve` and Binaryen's `wasm-opt`, with their licences.
+- A release is a tag `vX.Y.Z` on `main`, after a merged PR that bumps `version` under `[workspace.package]` in `Cargo.toml`. Follow `docs/release.md`; keep it true when the release process changes.
+- `.github/workflows/toolchain-release.yml` only builds and publishes; add no checks to it.
 - `rywible/wrela` pins a release in its root `wrela.toml` (`[workspace] toolchain = "X.Y.Z"`); `wrela` downloads, checks and runs it (`compiler/cli/src/pin.rs`, language.md §3.6). Moving the pin is a change in that repository.
 
 ## Working across both repositories
@@ -51,7 +51,7 @@ MIT-licensed toolchain of Wrela, a language for browser games with AAA ambition:
 
 ## Records
 
-- `AGENTS.md` is the sole repo instruction file. Add no prose docs beyond the spec (`spec/`) and `docs/process.md`: reference docs come from source through `wrela doc --export`; remove any temporary task notes before committing. Run checks locally.
-- Update `docs/process.md` for new outside crates, assets, algorithms or specifications, AI tools/models or kinds of AI work: source, rights, what it teaches and how used. The full record of the project, and of this toolchain before the split on 2026-10-21, stays in `rywible/wrela`'s `docs/process.md`.
+- `AGENTS.md` is the sole repo instruction file. Add no prose docs beyond the spec (`spec/`), `docs/citations.md` and `docs/release.md`: reference docs come from source through `wrela doc --export`; remove any temporary task notes before committing. Run checks locally.
+- Update `docs/citations.md` in the same change that adds an outside crate, tool, asset, algorithm, specification or AI model: what it is, its rights, and how and why it is used. Keep it to that; no work logs or measurements. The record of this toolchain before the split on 2026-10-21 stays in `rywible/wrela`'s `docs/process.md`.
 - Never create assets with generative image/audio/music/voice/video models.
 - Use clear, concrete English, roughly 80% ASD-STE100.

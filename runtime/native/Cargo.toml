@@ -32,7 +32,7 @@ rustix = { version = "1", features = ["process", "fs"] }
 # `std::tool::http`'s client: blocking, on the tool host's worker threads, over rustls.
 ureq = { version = "3", default-features = false, features = ["rustls"] }
 # `std::tool::image`: PNG (already the GPU host's, for frames), JPEG, and WebP through libwebp,
-# which decodes it and encodes it lossily, as Pillow does (docs/process.md).
+# which decodes it and encodes it lossily, as Pillow does (docs/citations.md).
 png = "0.18"
 # Without its SIMD paths, so a JPEG decodes to the same pixels on every machine.
 zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
