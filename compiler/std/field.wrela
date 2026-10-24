@@ -505,7 +505,7 @@ pub fn certify_positive(f: fn(vec3) -> f32, region: Box3, depth: u32) -> Certifi
         if r.lo > 0.0 {
             continue
         }
-        let c = 0.5 * (b.lo + b.hi)
+        let c = b.center()
         if r.hi <= 0.0 || !(f(c) > 0.0) {
             return Certified::Fails(c)
         }
@@ -515,10 +515,8 @@ pub fn certify_positive(f: fn(vec3) -> f32, region: Box3, depth: u32) -> Certifi
             }
             continue
         }
-        let h = 0.5 * (b.hi - b.lo)
-        for j in 0..8 {
-            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
-            stack.push((Box3 { lo: b.lo + o, hi: b.lo + o + h }, d + 1))
+        for o in b.split() {
+            stack.push((o, d + 1))
         }
     }
     match unknown {

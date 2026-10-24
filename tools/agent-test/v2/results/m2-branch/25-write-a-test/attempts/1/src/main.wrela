@@ -1,0 +1,30 @@
+/// The n-th Fibonacci number, with fib(0) = 0 and fib(1) = 1. It computes no value past fib(n),
+/// so every n up to 47 fits a u32.
+fn fib(n: u32) -> u32 {
+    if n == 0 {
+        return 0
+    }
+    var a: u32 = 0
+    var b: u32 = 1
+    for _ in 1..n {
+        let next = a + b
+        a = b
+        b = next
+    }
+    b
+}
+
+pub fn fib_export(n: u32) -> u32 {
+    fib(n)
+}
+
+@test
+fn fib_is_right() {
+    assert(fib(0) == 0)
+    assert(fib(1) == 1)
+    assert(fib(2) == 1)
+    assert(fib(10) == 55)
+    assert(fib(20) == 6765)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

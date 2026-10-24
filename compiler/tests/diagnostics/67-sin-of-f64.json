@@ -4,7 +4,9 @@
       "code": "E0702",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "compute it in `f32`: `sin(f32(x))`, then `f64(...)` if the result must be one"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

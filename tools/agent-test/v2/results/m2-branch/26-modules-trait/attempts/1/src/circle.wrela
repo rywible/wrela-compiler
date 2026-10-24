@@ -1,0 +1,12 @@
+use shape::Shape
+use std::math::PI
+
+pub struct Circle {
+    pub r: f32,
+}
+
+impl Shape for Circle {
+    fn area(self) -> f32 {
+        PI * self.r * self.r
+    }
+}

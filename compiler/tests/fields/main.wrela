@@ -3,9 +3,9 @@
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound. Also AC3's corpus (compiler/tests/tests/suite/derive.rs).
 use corpus::{
-    Branchy, Cells, Hyperbolic, Logs, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves, blob_,
-    blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, oval_,
-    sphere_, sphere_tape, table_, tube_, waves_tape,
+    Branchy, Cells, Hyperbolic, Logs, March, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves,
+    blob_, blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_,
+    oval_, sphere_, sphere_tape, table_, tube_, waves_tape,
 }
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::{Box3, interval}
@@ -316,6 +316,35 @@ fn misses<F: Surface>(f: F, b: Box3, seed: u32, i: u32) -> u32 {
     miss
 }
 
+/// How tight the derived interval of box `i` is: its width over the spread of the values at the
+/// 16 points `misses` samples (a ratio of 1 is as tight as sampling shows), and 1 if it decides
+/// the sign (excludes 0), else 0. The tightness ratchet (derive.rs) keeps both from worsening.
+fn tightness<F: Surface>(f: F, b: Box3, seed: u32, i: u32) -> vec2 {
+    let r = f.interval(b)
+    var lo = 1.0 / 0.0
+    var hi = -1.0 / 0.0
+    for k in 0..16 {
+        var p = vec3(
+            if (k & 1) == 0 { b.lo.x } else { b.hi.x },
+            if (k & 2) == 0 { b.lo.y } else { b.hi.y },
+            if (k & 4) == 0 { b.lo.z } else { b.hi.z },
+        )
+        if k >= 8 {
+            let u = vec3(
+                rnd(seed, i, 9 + 3 * k),
+                rnd(seed, i, 10 + 3 * k),
+                rnd(seed, i, 11 + 3 * k),
+            )
+            p = clamp(b.lo + (b.hi - b.lo) * u, b.lo, b.hi)
+        }
+        let d = f.distance(p)
+        lo = min(lo, d)
+        hi = max(hi, d)
+    }
+    let decided = if r.lo > 0.0 || r.hi < 0.0 { 1.0 } else { 0.0 }
+    vec2((r.hi - r.lo) / (hi - lo + 0.000001), decided)
+}
+
 /// Whether the interval over a single point fails to hold the point's value strictly inside:
 /// both ends must be widened past it.
 fn unwidened<F: Surface>(f: F, b: Box3) -> u32 {
@@ -357,7 +386,8 @@ fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
         20 => v.visit(closures_(5.0)),
         21 => v.visit(table_()),
         22 => v.visit(Hyperbolic { s: 1.7 }),
-        _ => v.visit(Powers { n: 2.4 }),
+        23 => v.visit(Powers { n: 2.4 }),
+        _ => v.visit(March { dir: vec3(0.0, 0.0, 1.0) }),
     }
 }
 
@@ -373,6 +403,21 @@ impl Visit for Misses {
 
     fn visit<F: Surface>(self, f: F) -> u32 {
         misses(f, self.b, self.seed, self.i)
+    }
+}
+
+/// `tightness` of a box.
+struct Tightness: Copy {
+    b: Box3,
+    seed: u32,
+    i: u32,
+}
+
+impl Visit for Tightness {
+    type Out = vec2
+
+    fn visit<F: Surface>(self, f: F) -> vec2 {
+        tightness(f, self.b, self.seed, self.i)
     }
 }
 
@@ -399,6 +444,11 @@ pub fn misses_cpu(fi: u32, seed: u32, first: u32, count: u32) -> u32 {
         total += missed
     }
     total
+}
+
+/// On the CPU: the tightness of corpus function `fi`'s interval over random box `i` (`tightness`).
+pub fn tightness_cpu(fi: u32, seed: u32, i: u32) -> vec2 {
+    with_function(fi, Tightness { b: random_box(seed, i), seed, i })
 }
 
 /// On the CPU: over `n` random points, how many intervals over a single point don't hold its

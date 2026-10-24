@@ -4,7 +4,9 @@
       "code": "E0605",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "use a workgroup of at most 256 along x, and dispatch more groups"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

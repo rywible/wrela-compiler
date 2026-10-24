@@ -4,7 +4,9 @@
       "code": "E0407",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "remove `Copy` from `Pair`, or give `log` a type that is `Copy` (`Text` rather than `String`, a handle rather than a `Vec`)"
+      ],
       "internal": false,
       "label": null,
       "labels": [

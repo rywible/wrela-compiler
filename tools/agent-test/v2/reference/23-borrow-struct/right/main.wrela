@@ -1,0 +1,19 @@
+borrow struct Ctx {
+    xs: borrow Vec<f32>,
+    k: f32,
+}
+
+fn scaled_sum(c: Ctx) -> f32 {
+    var sum = 0.0
+    for x in c.xs {
+        sum += x * c.k
+    }
+    sum
+}
+
+pub fn run() -> f32 {
+    let xs = Vec::from([1.0, 2.0, 3.0])
+    scaled_sum(Ctx { xs, k: 2.0 })
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

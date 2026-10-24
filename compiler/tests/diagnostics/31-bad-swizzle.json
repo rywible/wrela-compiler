@@ -4,7 +4,9 @@
       "code": "E0317",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "a swizzle takes one to four of those, all from `xyzw` or all from `rgba`: `.x`, `.xy`, `.yx`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

@@ -1,14 +1,18 @@
-//! `wrela fix <package-dir> [--json]`: makes every fix a tool can make, and reports each one.
+//! `wrela fix <package-dir> [--dry-run] [--json]`: makes every fix a tool can make, and
+//! reports each one; and `wrela migrate`, which makes only the migrations' fixes (`migrate.rs`).
 //!
 //! A diagnostic with exactly one fix gets it, unless the fix is the author's choice: the others
 //! are what the compiler would do. One with several fixes offers choices (`borrow`, `.clone()`
 //! or `take`), and so does a fix that changes what the program owns or costs (`.clone()` copies
 //! heap memory, and an index, `remove` or a parameter that borrows may be what was meant): only
 //! the author can make those, so they're listed and left. Fixes go in rounds, since one fix can
-//! let checking reach code it didn't before: each round checks the package and makes the fixes
-//! it can, and the rounds stop when one makes none. Then each changed file is formatted, and
-//! the report comes from a check of the files as they are now, so every place it names is in
-//! them. Only the package's own files change, and running it again changes nothing.
+//! let checking reach code it didn't before: each round checks the package's texts as the
+//! fixes so far left them (in memory, `wrela_driver::check_with`) and makes the fixes it can,
+//! and the rounds stop when one makes none. Then each changed text is formatted, each changed
+//! file is written once, whole (a write that fails leaves the file as it was), and the report
+//! comes from a check of the texts as they are now, so every place it names is in them. Only
+//! the package's own files change, and running it again changes nothing. `--dry-run` writes
+//! nothing and prints the diff it would make.
 //!
 //! A diagnostic's one fix isn't made when it edits std's files or a dependency's (reported:
 //! that package's authors fix it), when it replaces code that has another error with no fix of
@@ -18,10 +22,12 @@
 //!
 //! With `--json`, the report is the diagnostics' JSON (wrela_diag::json) with two keys more:
 //! `"fixed"`, each fix made, as `{"code", "message", "file", "line", "column"}` (where its
-//! diagnostic was, in the file as it is now), and `"changed"`, the names of the files changed.
+//! diagnostic was, in the file as it is now; a migration's also has `"since"`, the release it
+//! came in), and `"changed"`, the names of the files changed.
 //!
-//! Exit status: 0 when the package has no errors after, 1 when it has (or the fixes didn't
-//! settle, an internal error), 2 when a file can't be written.
+//! Exit status: 0 when the package has no errors after (for `migrate`, and no migration left),
+//! 1 when it has (or the fixes didn't settle, an internal error), 2 when a file can't be
+//! written or the arguments are wrong.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -32,9 +38,25 @@ use wrela_driver::Output;
 /// At most this many rounds: a fix removes its diagnostic, so more would mean one doesn't.
 const ROUNDS: usize = 16;
 
+/// Which fixes a run makes, and how it says so.
+pub(crate) struct Fixes {
+    /// Whether a diagnostic's fix is this run's to make.
+    pub keep: fn(&Diagnostic) -> bool,
+    /// The verb of a fix made: `fixed`, `migrated`.
+    pub verb: &'static str,
+    /// The report when there's nothing to do: `nothing to fix`.
+    pub nothing: &'static str,
+    /// Whether the report lists the fixes left for the author to choose (`wrela fix`'s).
+    pub choices: bool,
+}
+
+/// `wrela fix`: every fix a tool can make.
+const FIX: Fixes =
+    Fixes { keep: |_| true, verb: "fixed", nothing: "nothing to fix", choices: true };
+
 /// On a thread with the compiler's stack, for the formatter (see `fmt::run`).
 pub fn run(args: &[String]) -> ExitCode {
-    wrela_driver::on_compiler_thread(|| fix(args))
+    wrela_driver::on_compiler_thread(|| fix_with(args, &FIX))
 }
 
 /// A fix made: its diagnostic's code, its message, and where it is in its file's text as it
@@ -58,21 +80,30 @@ enum Skip<'a> {
     Clash,
 }
 
-fn fix(args: &[String]) -> ExitCode {
-    let args = match crate::package_args(args, false) {
+/// The texts that stand in for files on disk, by canonical path, for `check_with`.
+fn overlay(texts: &BTreeMap<PathBuf, String>) -> wrela_driver::Overlay {
+    texts.iter().map(|(p, t)| (p.canonicalize().unwrap_or_else(|_| p.clone()), t.clone())).collect()
+}
+
+/// Makes the fixes `kind` keeps, in rounds, in memory; then writes the changed files (or with
+/// `--dry-run`, prints the diff) and reports.
+pub(crate) fn fix_with(args: &[String], kind: &Fixes) -> ExitCode {
+    let dry = args.iter().any(|a| a == "--dry-run");
+    let rest: Vec<String> = args.iter().filter(|a| *a != "--dry-run").cloned().collect();
+    let args = match crate::package_args(&rest, false) {
         Ok(a) => a,
         Err(status) => return status,
     };
-    // Each file changed, with its text now.
-    let mut changed: BTreeMap<PathBuf, String> = BTreeMap::new();
+    // Each file changed, with its text before any fix and its text now.
+    let mut before: BTreeMap<PathBuf, String> = BTreeMap::new();
+    let mut texts: BTreeMap<PathBuf, String> = BTreeMap::new();
     let mut made: Vec<Made> = Vec::new();
-    // The check of the files as they are, once a round makes no fix.
+    // The check of the texts as they are, once a round makes no fix.
     let mut last = None;
-    let mut write_failed = false;
     for _ in 0..ROUNDS {
-        let out = wrela_driver::check(&args.dir);
+        let out = wrela_driver::check_with(&args.dir, &overlay(&texts));
         let paths: BTreeMap<FileId, PathBuf> = out.program_files.iter().cloned().collect();
-        let fixes = plan(&out, &paths).make;
+        let fixes = plan(&out, &paths, kind.keep).make;
         if fixes.is_empty() {
             last = Some(out);
             break;
@@ -96,35 +127,22 @@ fn fix(args: &[String]) -> ExitCode {
         for (file, mut es) in edits {
             let path = &paths[&file];
             es.sort_by_key(|e| (e.span.start, e.span.end));
-            let next = wrela_diag::apply_edits(&out.sources.file(file).text, es.iter().copied());
-            if let Err(e) = std::fs::write(path, &next) {
-                eprintln!("error: can't write `{}`: {e}", path.display());
-                write_failed = true;
-                // This round's fixes in it aren't made; the earlier rounds' still are.
-                round.retain(|m| &m.path != path);
-                continue;
-            }
+            let now = &out.sources.file(file).text;
+            let next = wrela_diag::apply_edits(now, es.iter().copied());
+            before.entry(path.clone()).or_insert_with(|| now.clone());
             for m in made.iter_mut().chain(&mut round).filter(|m| &m.path == path) {
                 m.at = after_edits(&es, m.at);
             }
-            changed.insert(path.clone(), next);
+            texts.insert(path.clone(), next);
         }
         made.extend(round);
-        if write_failed {
-            break;
-        }
     }
-    let settled = last.is_some() || write_failed;
-    // The changed files, formatted (one that doesn't parse is left as the fixes made it).
-    for (path, text) in &mut changed {
+    let settled = last.is_some();
+    // The changed texts, formatted (one that doesn't parse is left as the fixes made it).
+    for (path, text) in &mut texts {
         let Some(formatted) = crate::fmt::format_text(text).filter(|f| f != text) else {
             continue;
         };
-        if let Err(e) = std::fs::write(path, &formatted) {
-            eprintln!("error: can't write `{}`: {e}", path.display());
-            write_failed = true;
-            continue;
-        }
         let mut at: Vec<u32> = made.iter().filter(|m| &m.path == path).map(|m| m.at).collect();
         wrela_syntax::fmt::move_offsets(text, &formatted, &mut at);
         for (m, a) in made.iter_mut().filter(|m| &m.path == path).zip(at) {
@@ -133,17 +151,56 @@ fn fix(args: &[String]) -> ExitCode {
         *text = formatted;
         last = None;
     }
-    let mut out = last.unwrap_or_else(|| wrela_driver::check(&args.dir));
+    let mut out = last.unwrap_or_else(|| wrela_driver::check_with(&args.dir, &overlay(&texts)));
     if !settled {
         out.diagnostics.push(Diagnostic::internal(format!(
             "the fixes didn't settle in {ROUNDS} rounds: a fix doesn't remove its diagnostic, so \
              running `wrela fix` again changes the files again"
         )));
     }
-    report(&out, &made, &changed, args.json);
+    // Write each changed file once, whole; or show what would change.
+    let mut write_failed = false;
+    if dry {
+        let files = texts
+            .iter()
+            .map(|(path, new)| wrela_driver::refactor::FileChange {
+                file: path.strip_prefix(&args.dir).unwrap_or(path).display().to_string(),
+                old: before.get(path).cloned().unwrap_or_default(),
+                new: new.clone(),
+            })
+            .collect();
+        let plan = wrela_driver::refactor::Plan { op: kind.verb.into(), files, notes: Vec::new() };
+        if !args.json {
+            print!("{}", wrela_driver::refactor::diff(&plan));
+        }
+    } else {
+        let mut unwritten = Vec::new();
+        for (path, text) in &texts {
+            // A file the user can't write (read-only) isn't replaced, though its directory
+            // would let a rename replace it: the write is refused as an in-place one would be.
+            let written = std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .and_then(|_| wrela_driver::write_atomic(path, text.as_bytes()));
+            if let Err(e) = written {
+                eprintln!("error: can't write `{}`: {e}", path.display());
+                unwritten.push(path.clone());
+            }
+        }
+        if !unwritten.is_empty() {
+            // A file that wasn't written keeps its old text, so the report is of what's on
+            // disk, and of the fixes in the files written.
+            write_failed = true;
+            made.retain(|m| !unwritten.contains(&m.path));
+            texts.retain(|p, _| !unwritten.contains(p));
+            out = wrela_driver::check(&args.dir);
+        }
+    }
+    report(&out, &made, &texts, args.json, kind, dry);
+    let left = out.diagnostics.iter().any(|d| (kind.keep)(d) && !kind.choices);
     if write_failed {
         ExitCode::from(2)
-    } else if out.has_errors() {
+    } else if out.has_errors() || left {
         ExitCode::from(1)
     } else {
         ExitCode::SUCCESS
@@ -158,10 +215,14 @@ struct Plan<'a> {
     skip: Vec<(&'a Diagnostic, Skip<'a>)>,
 }
 
-fn plan<'a>(out: &'a Output, paths: &BTreeMap<FileId, PathBuf>) -> Plan<'a> {
+fn plan<'a>(
+    out: &'a Output,
+    paths: &BTreeMap<FileId, PathBuf>,
+    keep: fn(&Diagnostic) -> bool,
+) -> Plan<'a> {
     let mut taken: BTreeMap<FileId, Vec<&Edit>> = BTreeMap::new();
     let mut plan = Plan { make: Vec::new(), skip: Vec::new() };
-    for d in &out.diagnostics {
+    for d in out.diagnostics.iter().filter(|d| keep(d)) {
         let [fix] = d.fixes.as_slice() else { continue };
         if fix.choice {
             continue;
@@ -254,7 +315,14 @@ fn after_edits(edits: &[&Edit], at: u32) -> u32 {
 
 /// Prints what was fixed, what's left to choose, the fixes not made, and the diagnostics left:
 /// for people, or as JSON.
-fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json: bool) {
+fn report(
+    out: &Output,
+    made: &[Made],
+    changed: &BTreeMap<PathBuf, String>,
+    json: bool,
+    kind: &Fixes,
+    dry: bool,
+) {
     let paths: BTreeMap<FileId, PathBuf> = out.program_files.iter().cloned().collect();
     let ids: BTreeMap<&PathBuf, FileId> = paths.iter().map(|(id, p)| (p, *id)).collect();
     let name = |path: &PathBuf| match ids.get(path) {
@@ -274,15 +342,22 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
                     }
                     None => (0, 0),
                 };
-                serde_json::json!({
+                let mut v = serde_json::json!({
                     "code": m.code, "message": m.message,
                     "file": name(&m.path), "line": line, "column": column,
-                })
+                });
+                if let Some(since) =
+                    wrela_diag::codes::Code::lookup(m.code).and_then(|c| c.migration_since())
+                {
+                    v["since"] = since.into();
+                }
+                v
             })
             .collect();
         let mut v = wrela_diag::json::to_json(&out.sources, &out.diagnostics);
         v["fixed"] = fixed.into();
         v["changed"] = changed.keys().map(name).collect::<Vec<_>>().into();
+        v["written"] = (!dry).into();
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
         return;
     }
@@ -291,9 +366,9 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
             Some(&id) => out.sources.file(id).location(m.at),
             None => m.path.display().to_string(),
         };
-        println!("{at}: fixed {}: {}", m.code, m.message);
+        println!("{at}: {} {}: {}", kind.verb, m.code, m.message);
     }
-    for d in out.diagnostics.iter() {
+    for d in out.diagnostics.iter().filter(|_| kind.choices) {
         match d.fixes.as_slice() {
             [f] if f.choice => println!(
                 "{}: {}'s fix is yours to choose, since it changes what the program owns or costs:",
@@ -307,7 +382,7 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
             println!("  - {}", f.message);
         }
     }
-    let skipped = plan(out, &paths).skip;
+    let skipped = plan(out, &paths, kind.keep).skip;
     let mut unmade = 0;
     for (d, skip) in &skipped {
         let why = match skip {
@@ -325,12 +400,13 @@ fn report(out: &Output, made: &[Made], changed: &BTreeMap<PathBuf, String>, json
     }
     let errors = out.diagnostics.iter().filter(|d| d.is_error()).count();
     let head = match (made.len(), unmade, errors) {
-        (0, 0, 0) => "nothing to fix".to_string(),
+        (0, 0, 0) => kind.nothing.to_string(),
         (0, 0, _) => "nothing a tool can fix".to_string(),
         (0, _, _) => "no fix made".to_string(),
         (n, _, _) => {
             let files = crate::count(changed.len(), "file", "files");
-            format!("{} in {files}", crate::count(n, "fix", "fixes"))
+            let done = if dry { " would be made" } else { "" };
+            format!("{}{done} in {files}", crate::count(n, "fix", "fixes"))
         }
     };
     if errors > 0 {

@@ -63,7 +63,8 @@ pub fn read_embeds_in(
             }
             Err(why) => diags.push(
                 Diagnostic::new(codes::E0218, span, format!("`embed` can't read `{path}`: {why}"))
-                    .with_note("a path is relative to the package's root: the directory with `main.wrela` (§13)"),
+                    .with_note("a path is relative to the package's root: the directory with `main.wrela` (§13)")
+                    .with_help("put the file inside the package, or correct the path"),
             ),
         }
     }
@@ -720,6 +721,12 @@ pub(crate) fn failure(
     // std, or the item itself.
     let primary = chain.iter().copied().find(|s| !in_std(s)).unwrap_or(item_span);
     let mut d = Diagnostic::new(code, primary, format!("{} {verb}{phase}{detail}", item.what(p)));
+    if code != codes::E0705 {
+        d = d.with_help(match item {
+            Item::Const(..) => "fix what failed in the code the constant runs, or compute the value at load instead",
+            Item::Test(..) => "fix the code it tests, or the test's expectation if that's what's wrong; `wrela test <package> <name>` runs it alone",
+        });
+    }
     for s in chain.iter().filter(|s| !in_std(s) && **s != primary) {
         let label = if in_item(s) { item.within(p) } else { "called from here".to_string() };
         d = d.with_secondary(*s, label);

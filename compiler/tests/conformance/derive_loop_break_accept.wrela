@@ -1,0 +1,23 @@
+// accepts: derive.interval
+use std::derive::{Interval, interval}
+
+// A sphere trace of a fixed count of steps, which stops early once it's close: the stop
+// depends on the input, the count doesn't, so its interval is bounded (§14.2).
+fn travel(t0: f32) -> f32 {
+    var t = t0
+    for _ in 0..16 {
+        let d = abs(t - 3.0) - 0.5
+        if d < 0.001 {
+            break
+        }
+        t += d
+    }
+    t
+}
+
+pub fn range(lo: f32, hi: f32) -> vec2 {
+    let r = interval(travel, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

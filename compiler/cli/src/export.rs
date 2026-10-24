@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 
 use crate::doc::{self, Entry, Index};
 
-const LANGUAGE: &str = include_str!("../../../spec/language.md");
+pub(crate) const LANGUAGE: &str = include_str!("../../../spec/language.md");
 const LEXICAL: &str = include_str!("../../../spec/lexical.md");
 const GRAMMAR: &str = include_str!("../../../spec/grammar.ebnf");
 const REPOSITORY: &str = "https://github.com/rywible/wrela";
@@ -150,16 +150,26 @@ pub(crate) fn files_of(
     let std_source = format!("{std_repository}/blob/{}/", std_commit.unwrap_or("main"));
     let mut items: Vec<Value> = Vec::new();
     for m in 0..index.modules.len() {
-        let in_std = index.modules[m].path.first().is_some_and(|p| p == "std");
-        let (page, mut records) =
+        let first = index.modules[m].path.first();
+        let builtins = first.is_some_and(|p| p == crate::builtin_types::MODULE);
+        let in_std = builtins || first.is_some_and(|p| p == "std");
+        let (mut page, mut records) =
             module_page(&index, m, if in_std { &std_source } else { &source });
         if page.text.is_empty() {
             continue;
         }
+        if builtins {
+            page.title = "Built-in types and functions".to_string();
+            page.text = page.text.replacen(
+                &format!("# {}\n", crate::builtin_types::MODULE),
+                &format!("# {}\n", page.title),
+                1,
+            );
+            page.text.push_str(&builtin_functions());
+        }
         items.append(&mut records);
         pages.push(page);
     }
-    pages.push(builtins_page());
     // The spec in its own order, then the modules by path.
     let spec = pages.iter().filter(|p| p.kind == "spec").count();
     pages[spec..].sort_by(|a, b| a.path.cmp(&b.path));
@@ -442,7 +452,12 @@ fn sections_of(page: &Page) -> Vec<Section> {
 fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
     let module = &index.modules[m];
     let name = module.path.join("::");
-    let path = format!("{}.md", module.path.join("/"));
+    // The built-in types' page is std's, beside its modules', with the built-in functions.
+    let path = if module.path == [crate::builtin_types::MODULE] {
+        "std/builtins.md".to_string()
+    } else {
+        format!("{}.md", module.path.join("/"))
+    };
     let top: Vec<usize> = (0..index.entries.len())
         .filter(|&i| {
             let e = &index.entries[i];
@@ -523,21 +538,15 @@ fn record(e: &Entry, page: &str, anchor: &str) -> Value {
     })
 }
 
-/// The built-in functions, which no module declares.
-fn builtins_page() -> Page {
+/// The built-in functions, which no module declares: the end of the built-ins' page.
+fn builtin_functions() -> String {
     let mut text = String::from(
-        "# Built-in functions\n\nNo import is needed; most work on scalars and vectors alike (language.md §4).\n\n",
+        "## Built-in functions\n\nNo import is needed; most work on scalars and vectors alike (language.md §4).\n\n",
     );
     for (name, arity, method) in wrela_driver::builtins() {
         text.push_str(&format!("- `{}`\n", doc::builtin_call(name, arity, method)));
     }
-    Page {
-        path: "std/builtins.md".to_string(),
-        title: "Built-in functions".to_string(),
-        summary: "The functions every program has without an import.".to_string(),
-        kind: "module",
-        text,
-    }
+    text
 }
 
 /// Where each numbered part of the spec is: `6` and `6.15` to their page and the anchor on it

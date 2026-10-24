@@ -1,0 +1,12 @@
+use main::Game
+use std::input::{Key, Mods, Script}
+
+pub const GRADE: Script = Script::frames()
+    .press(3, Key::Space, Mods {})
+    .press(4, Key::Space, Mods {})
+    .press(7, Key::Space, Mods {})
+
+@test(frames: 10, input: GRADE)
+fn grade_presses(game: Game) {
+    assert(game.presses == 3, f"{game.presses} presses counted, not 3")
+}

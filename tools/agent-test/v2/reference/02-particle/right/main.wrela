@@ -1,0 +1,18 @@
+struct Particle {
+    position: vec3,
+    velocity: vec3,
+}
+
+fn step(p: mut Particle, dt: f32) {
+    p.position += p.velocity * dt
+}
+
+pub fn simulate(steps: u32, dt: f32) -> f32 {
+    var p = Particle { position: vec3(), velocity: vec3(1.0, 2.0, 0.0) }
+    for _ in 0..steps {
+        step(mut p, dt)
+    }
+    p.position.x
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

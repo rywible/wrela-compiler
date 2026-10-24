@@ -47,6 +47,9 @@ pub fn run(args: &[String]) -> ExitCode {
             refactor::add_param(&dir, func, param, value.as_deref(), default.as_deref())
         }
         ("change-mode", [func, param, mode]) => refactor::change_mode(&dir, func, param, mode),
+        ("extract-const", [at, name]) => refactor::extract_const(&dir, at, name),
+        ("inline", [func]) => refactor::inline(&dir, func),
+        ("extract-fn", [lines, name]) => refactor::extract_fn(&dir, lines, name),
         ("apply", [plan]) => match std::fs::read_to_string(plan) {
             Ok(text) => refactor::read_plan(&dir, &text),
             Err(e) => {

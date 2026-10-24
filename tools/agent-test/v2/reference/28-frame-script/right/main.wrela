@@ -1,0 +1,26 @@
+use std::input::{Event, Key, Mods, Script, events}
+
+pub struct Game {
+    pub presses: u32,
+}
+
+pub fn init() -> Game {
+    Game { presses: 0 }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    for e in events() {
+        if let Event::KeyDown { key: Key::Space, repeat: false, .. } = e {
+            game.presses += 1
+        }
+    }
+}
+
+pub const SPACES: Script = Script::frames()
+    .press(2, Key::Space, Mods {})
+    .press(5, Key::Space, Mods {})
+
+@test(frames: 10, input: SPACES)
+fn counts_presses(game: Game) {
+    assert(game.presses == 2)
+}

@@ -1,0 +1,19 @@
+use std::field::{Surface, sphere}
+use std::gpu::{GlobalId, Slots}
+
+struct Grid: Copy + GpuData {
+    origin: vec3,
+    cell: f32,
+    n: u32,
+}
+
+@compute(64)
+fn sample<F: Surface>(field: F, grid: Grid, out: mut Slots<f32>, id: GlobalId) {
+    let i = id.x
+    let c = vec3(f32(i % grid.n), f32((i / grid.n) % grid.n), f32(i / (grid.n * grid.n)))
+    out[id] = field.distance(grid.origin + c * grid.cell)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _grid = Grid { origin: vec3(-1.0), cell: 0.125, n: 16 }
+}

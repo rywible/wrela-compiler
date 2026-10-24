@@ -1,0 +1,48 @@
+{
+  "date": "2026-10-24T19:49:43+00:00",
+  "model": "claude-sonnet-5-5",
+  "context": "full",
+  "wrela": {
+    "path": "(frozen copy: wrela 0.5.0 (development build))",
+    "sha256": "adb952d68dc5dcba3b5f8987228304dad91d36d0107af2e9ae4fad9f24cc7743",
+    "version": "wrela 0.5.0 (development build)"
+  },
+  "validator": {
+    "path": "(frozen copy: wrela 0.5.0 (development build))",
+    "sha256": "adb952d68dc5dcba3b5f8987228304dad91d36d0107af2e9ae4fad9f24cc7743",
+    "version": "wrela 0.5.0 (development build)"
+  },
+  "revision": "28a592c0e99b3d163a09c3f1277a4723a13d0b15",
+  "tasks": [
+    "01-area",
+    "02-particle",
+    "03-shapes",
+    "04-traits",
+    "05-ownership",
+    "06-field",
+    "07-kernel",
+    "08-sky",
+    "09-normals",
+    "10-interval",
+    "11-projection",
+    "12-closures",
+    "13-arrays",
+    "14-option",
+    "15-modules",
+    "16-constants",
+    "17-reflect",
+    "18-surface",
+    "19-raymarch",
+    "20-uniforms",
+    "21-vec-bag",
+    "22-arena",
+    "23-borrow-struct",
+    "24-enum-option",
+    "25-write-a-test",
+    "26-modules-trait",
+    "27-certify",
+    "28-frame-script",
+    "29-gpu-uniform",
+    "30-interval"
+  ]
+}

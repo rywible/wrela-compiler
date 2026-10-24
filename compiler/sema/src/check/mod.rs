@@ -391,7 +391,9 @@ impl<'p> Checker<'p> {
                 ));
             }
             (TyKind::Tuple(t), _) if t.is_empty() => {
-                d = d.with_note("a block's value is its last line when that's an expression; a statement has no value");
+                d = d
+                    .with_note("a block's value is its last line when that's an expression; a statement has no value")
+                    .with_help(format!("end the block with a `{e}` as its last line"));
             }
             // An alias that names traits: one function decides its type (§4).
             (_, TyKind::Opaque(f, args))
@@ -404,7 +406,11 @@ impl<'p> Checker<'p> {
                     ))
                     .with_help(format!("use a value of it, such as `{name}(...)`'s"));
             }
-            _ => {}
+            _ => {
+                d = d.with_help(format!(
+                    "give it a value of type `{e}` here, or change what expects one (`wrela query type <file>:<line>:<col>` shows a place's type)"
+                ));
+            }
         }
         self.err(d);
         false
@@ -676,7 +682,7 @@ impl<'p> Checker<'p> {
                     codes::E0505,
                     place.span,
                     "can't assign to part of a temporary value",
-                )
+                ).with_help("bind the value to a `var` first (`var x = ...`), then change `x`'s part")
                 .with_note(format!("{name} returns a value, not a projection, so the change would be lost"))
             }
             ExprKind::Const(c) => Diagnostic::new(
@@ -685,7 +691,7 @@ impl<'p> Checker<'p> {
                 format!("can't assign to the constant `{}`", self.p.const_(*c).name),
             )
             .with_help("copy it into a `var` to change it"),
-            _ => Diagnostic::new(codes::E0505, place.span, "can't assign to a temporary value")
+            _ => Diagnostic::new(codes::E0505, place.span, "can't assign to a temporary value").with_help("assign to a `var` instead: bind the value first (`var x = ...`), then change `x`")
                 .with_note("an assignment's target is a place: a variable, or a field, component or element of one"),
         };
         self.err(d);
@@ -716,16 +722,20 @@ impl<'p> Checker<'p> {
                     e.span,
                     "`fields(self)` walks the fields of a type that declares a `@fieldwise` trait, in that trait's methods",
                 )
+.with_help("write the walk inside a method of a `@fieldwise` trait, or name the fields one by one")
                 .with_note("each type that declares the trait runs the method with the loop unrolled over its own fields (§3)"),
             );
             return None;
         };
         if !matches!(pat.kind, ast::PatKind::Ident(_) | ast::PatKind::Wild) {
-            self.err(Diagnostic::new(
-                codes::E0337,
-                pat.span,
-                "a walk over the fields binds each to one name: fields have types of their own",
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0337,
+                    pat.span,
+                    "a walk over the fields binds each to one name: fields have types of their own",
+                )
+                .with_help("bind one name: `for f in fields(self) { ... }`"),
+            );
             return None;
         }
         let self_mut = self.fn_id.is_some_and(|f| {
@@ -1134,6 +1144,9 @@ impl<'p> Checker<'p> {
                     bad.span,
                     format!("a {owner}'s default of a generic type must be a literal value"),
                 )
+                .with_help(
+                    "write the default as a literal, or remove it and pass the value at each call",
+                )
                 .with_note("a constant expression has one type, which a generic type isn't (§13)"),
             );
         }
@@ -1305,9 +1318,24 @@ pub(crate) fn adt_bounds(p: &Program, ty: TyId, span: Span, out: &mut Vec<Diagno
                     "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
                     param.name, adt.name
                 );
+                // A structural trait is declared where the type is, not implemented (§3).
+                let help = if p.trait_(r.trait_).lang.is_some_and(crate::defs::Lang::is_structural)
+                {
+                    format!(
+                        "use a type that is `{tr}` for `{}`, or declare `{t}` `{tr}` where it's declared (`struct S: {tr}`)",
+                        param.name
+                    )
+                } else {
+                    format!(
+                        "use a type that implements `{tr}` for `{}`, or implement it: `impl {tr} for {t}`",
+                        param.name
+                    )
+                };
                 out.push(match p.custom_message(arg, &r) {
-                    Some(msg) => Diagnostic::new(codes::E0400, span, msg).with_note(default),
-                    None => Diagnostic::new(codes::E0400, span, default),
+                    Some(msg) => {
+                        Diagnostic::new(codes::E0400, span, msg).with_note(default).with_help(help)
+                    }
+                    None => Diagnostic::new(codes::E0400, span, default).with_help(help),
                 });
             }
         }
@@ -1369,7 +1397,7 @@ fn check_borrow_structs(p: &Program) -> Vec<Diagnostic> {
                         codes::E0327,
                         f.span,
                         format!("`{}` is a borrow struct, a projection, so it can't be a field of an ordinary type", p.display_ty(f.ty)),
-                    )
+                    ).with_help("make the outer type a borrow struct too (`borrow struct`), or hold the borrowed value's owner instead")
                     .with_note("a borrow struct lives only as long as the places it borrows (§6.6)"),
                 );
             }

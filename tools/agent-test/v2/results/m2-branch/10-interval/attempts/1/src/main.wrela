@@ -1,0 +1,9 @@
+use std::derive::{Interval, interval}
+
+/// Every value of sin(t) * t for t between `lo` and `hi`, as (low, high).
+pub fn range_over(lo: f32, hi: f32) -> vec2 {
+    let r = interval(|t: f32| sin(t) * t, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

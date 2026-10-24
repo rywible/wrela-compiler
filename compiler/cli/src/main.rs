@@ -11,7 +11,11 @@
 //!                                         --lift reads that package's literals from a
 //!                                         table the program can change (§23)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
-//! wrela fix <package-dir> [--json]        make every fix a tool can make, and report each
+//! wrela fix <package-dir> [--dry-run] [--json]
+//!                                         make every fix a tool can make, and report each
+//! wrela migrate <package-dir> [--dry-run] [--json]
+//!                                         make every migration's fix (a form the language
+//!                                         moved away from), and nothing else
 //! wrela edit <package-dir> [--edits <file>] [--dry-run] [--json]
 //!                                         write new values into literals (§23), from
 //!                                         JSON edits; refuses a file that has changed
@@ -36,6 +40,10 @@
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
 //!                                         make the package's spec hold (§23)
+//! wrela same <package-dir> --against <build-dir> [--frames n] [--within x] [--no-gpu] [--json]
+//!                                         whether the package built now behaves as a saved
+//!                                         build does: the same commands each frame, the
+//!                                         same last frame within x, the same pipelines
 //! wrela trace <package-dir> --watch <export>,...
 //!                                         run frames and print what exports say after each
 //! wrela bisect <package-dir> --until "<export> <op> <number>"
@@ -49,7 +57,8 @@
 //!                                         an item's source and what's around it, in a budget,
 //!                                         with errors too
 //! wrela refactor <package-dir> <change> [--dry-run] [--json]
-//!                                         rename, move, add-param, change-mode: checked
+//!                                         rename, move, add-param, change-mode,
+//!                                         extract-const, inline, extract-fn: checked
 //!                                         before written, refused on a stale plan
 //! wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
 //!     [--timeout S] [--workers N] [--blob-budget B] [-- args...]
@@ -81,12 +90,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod build;
+mod builtin_types;
 mod doc;
 mod edit;
 mod explain;
 mod export;
 mod fix;
 mod fmt;
+mod migrate;
 mod pin;
 mod pipelines;
 mod primer;
@@ -94,6 +105,7 @@ mod profile;
 mod query;
 mod refactor;
 mod run;
+mod same;
 mod script;
 mod solve;
 mod suite;
@@ -107,7 +119,8 @@ pub(crate) fn usage() -> ExitCode {
         "wrela check <package-dir> [--json]",
         "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]",
         "wrela fmt <file-or-dir>... [--check]",
-        "wrela fix <package-dir> [--json]",
+        "wrela fix <package-dir> [--dry-run] [--json]",
+        "wrela migrate <package-dir> [--dry-run] [--json]",
         "wrela edit <package-dir> [--edits <file.json>] [--dry-run] [--json]",
         "wrela explain <code>",
         "wrela doc <item> [<package-dir>]",
@@ -120,10 +133,11 @@ pub(crate) fn usage() -> ExitCode {
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
         "wrela context <item> [<package-dir>] [--budget n]",
-        "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | apply <plan.json>) [--dry-run] [--json]",
+        "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
         "wrela toolchain",
@@ -159,6 +173,7 @@ fn main() -> ExitCode {
         "build" => build::run(rest),
         "fmt" => fmt::run(rest),
         "fix" => fix::run(rest),
+        "migrate" => migrate::run(rest),
         "edit" => edit::run(rest),
         "explain" => explain::run(rest),
         "doc" if rest.iter().any(|a| a == "--export") => export::run(rest),
@@ -186,6 +201,7 @@ fn main() -> ExitCode {
         }
         "suite" => suite::run(rest),
         "run" => run::run(rest),
+        "same" => same::run(rest),
         "tool" => tool::run(rest),
         "solve" => solve::run(rest),
         "script" => script::run(rest),

@@ -4,7 +4,9 @@
       "code": "E0218",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "write the path from the package's root, inside it: `embed(\"data/table.bin\")`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

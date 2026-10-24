@@ -58,7 +58,12 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                 "  {} ({}), {verb} at {}\n",
                 p.entries.join(" + "),
                 p.kind,
-                p.sites.join(", ")
+                p.sites
+                    .iter()
+                    .zip(&p.conditional)
+                    .map(|(s, &c)| if c { format!("{s} (under a condition)") } else { s.clone() })
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
     }
@@ -74,10 +79,11 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .iter()
         .map(|p| {
             format!(
-                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}}}",
+                "{{\"kind\": {}, \"entries\": {}, \"sites\": {}, \"conditional\": [{}]}}",
                 q(p.kind),
                 list(&p.entries),
-                list(&p.sites)
+                list(&p.sites),
+                p.conditional.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(", ")
             )
         })
         .collect();

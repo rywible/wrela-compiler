@@ -4,7 +4,9 @@
       "code": "E0320",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "match a `u32` with a pattern of its own type, such as a number"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

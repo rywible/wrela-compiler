@@ -1,0 +1,6 @@
+// mistake: a method a run doesn't have, named as Rust or TypeScript names it
+// expect: E0207
+// fix: no
+fn count(xs: [f32]) -> u32 {
+    xs.size()
+}

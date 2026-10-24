@@ -447,7 +447,11 @@ pub(super) fn finish_common(c: &mut Checker) {
             Ok(_) => {}
             Err(msg) => c.err(
                 Diagnostic::new(codes::E0305, span, msg)
-                    .with_note("a literal argument's type was inferred from how it's used later"),
+                    .with_note("a literal argument's type was inferred from how it's used later")
+                    .with_help(format!(
+                        "pass `{}` the kind of value it says; `wrela doc builtins` lists what each built-in takes",
+                        b.name()
+                    )),
             ),
         }
     }
@@ -469,7 +473,7 @@ pub(super) fn finish_common(c: &mut Checker) {
                     codes::E0305,
                     span,
                     format!("`**` doesn't apply to `{bs}` and `{es}`"),
-                )
+                ).with_help("convert the exponent: an integer's is a `u32` (`x ** u32(n)`), a float's its own type (`x ** f32(n)`)")
                 .with_note("an integer's exponent is a `u32`; a float's is the same float type"),
             );
         }
@@ -540,6 +544,10 @@ pub(super) fn finish_common(c: &mut Checker) {
                 span,
                 format!("this number is too large for an `{shown}`"),
             )
+            .with_help(format!(
+                "write a number that fits, or give it a wider type, as in `let x: {} = ...`",
+                if c.p.types.is_float(t) { "f64" } else { "u64" }
+            ))
             .with_note(format!("an `{shown}`'s largest value is about {largest}")),
         );
     }
@@ -562,11 +570,21 @@ pub(super) fn finish_common(c: &mut Checker) {
             let (t, tr) = (c.p.display_ty(ty), c.p.display_trait_ref(&r));
             // A library's own message replaces the default (§7), at the user's code.
             if let Some(msg) = c.p.custom_message(ty, &r) {
+                let declared =
+                    c.p.trait_(r.trait_).lang.is_some() || c.p.trait_(r.trait_).fieldwise;
+                let help = match (declared, c.p.types.kind(ty)) {
+                    (true, TyKind::Adt(a, _)) => {
+                        let name = &c.p.adt(*a).name;
+                        format!(
+                            "opt in where `{name}` is declared: `struct {name}: {tr} {{ ... }}`, or pass a value of a type that has it"
+                        )
+                    }
+                    _ => format!("pass a value of a type that implements `{tr}`"),
+                };
                 c.diags.push(
-                    Diagnostic::new(o.code, o.span, msg).with_note(format!(
-                        "`{t}` doesn't implement `{tr}`, which {} needs",
-                        o.why
-                    )),
+                    Diagnostic::new(o.code, o.span, msg)
+                        .with_note(format!("`{t}` doesn't implement `{tr}`, which {} needs", o.why))
+                        .with_help(help),
                 );
                 continue;
             }
@@ -594,6 +612,20 @@ pub(super) fn finish_common(c: &mut Checker) {
             } else if let TyKind::Param(p) = c.p.types.kind(ty) {
                 let pname = &c.p.param(*p).name;
                 d = d.with_help(format!("add the bound: `{pname}: {tr}`"));
+            } else if c.p.trait_(r.trait_).fieldwise
+                && let TyKind::Adt(a, _) = c.p.types.kind(ty)
+            {
+                // A fieldwise trait is derived where a type declares it (§3).
+                let name = &c.p.adt(*a).name;
+                // No fix: whether a type should be (say) sim state is the author's decision.
+                d = d.with_help(format!(
+                    "declare it where `{name}` is declared, and it's derived from the fields: `struct {name}: {tr} {{ ... }}`"
+                ));
+            } else {
+                d = d.with_help(format!(
+                    "implement it: `impl {tr} for {t} {{ ... }}` (`wrela doc {}` lists its methods), or pass a value of a type that has it",
+                    c.p.trait_(r.trait_).name
+                ));
             }
             c.err(d);
         }
@@ -620,11 +652,14 @@ pub(super) fn finish(
     if !c.too_large
         && let Some(l) = locals.iter().find(|l| types.size(l.ty) > MAX_TYPE_SIZE)
     {
-        c.diags.push(Diagnostic::new(
-            codes::E0329,
-            l.span,
-            format!("`{}`'s type is too large: it has more than {MAX_TYPE_SIZE} parts", l.name),
-        ));
+        c.diags.push(
+            Diagnostic::new(
+                codes::E0329,
+                l.span,
+                format!("`{}`'s type is too large: it has more than {MAX_TYPE_SIZE} parts", l.name),
+            )
+            .with_help("keep the parts in a `Vec`, or give the type a fixed shape"),
+        );
     }
     let mut closures: Vec<ClosureDef> = Vec::new();
     for (k, cl) in std::mem::take(&mut c.closures).into_iter().enumerate() {
@@ -944,6 +979,7 @@ pub(super) fn finish_const(c: Checker, e: Expr, ret: TyId) -> (TyId, Body, Vec<D
                 body.value.span,
                 format!("a constant can't hold {what}: its type is `{}`", p.display_ty(ty)),
             )
+.with_help("make it a function the program calls, or a constant of the values the function computes")
             .with_note("a constant is an owned value that lives as long as the program; the build computes it and lays it out as read-only data (§13)"),
         );
         return (error, body, diags);

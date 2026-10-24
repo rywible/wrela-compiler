@@ -4,7 +4,9 @@
       "code": "E0300",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "make the function return `Result<_, Text>`, or handle the `Err` here: `match x { Ok(v) => ..., Err(e) => ... }`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

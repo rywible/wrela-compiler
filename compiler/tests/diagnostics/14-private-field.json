@@ -4,7 +4,9 @@
       "code": "E0210",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "use the methods `GpuBuffer` offers (`wrela doc GpuBuffer`), or mark the field `pub` where it's declared"
+      ],
       "internal": false,
       "label": null,
       "labels": [

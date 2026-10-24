@@ -1,0 +1,8 @@
+/// The direction (x, y, z), normalized, then reflected about the surface normal (0, 1, 0).
+pub fn reflect_y(x: f32, y: f32, z: f32) -> vec3 {
+    let d = normalize(vec3(x, y, z))
+    let n = vec3(y: 1.0)
+    d - n * (2.0 * dot(d, n))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

@@ -1,0 +1,7 @@
+use main::{alive, hp_sum}
+
+@test
+fn grade_arena() {
+    assert(alive() == 4, f"`alive()` is {alive()}")
+    assert(hp_sum() == 12.0, f"`hp_sum()` is {hp_sum()}")
+}

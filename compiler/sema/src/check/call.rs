@@ -119,11 +119,14 @@ impl<'p> Checker<'p> {
             } else {
                 format!("the module `{}`", seg.ident.name)
             };
-            self.err(Diagnostic::new(
-                codes::E0322,
-                seg.ident.span,
-                format!("{what} takes no generic arguments"),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0322,
+                    seg.ident.span,
+                    format!("{what} takes no generic arguments"),
+                )
+                .with_help("remove the `::<...>`"),
+            );
         }
         match res {
             ValueRes::Local(l) => self.call_local(l, args, expected, span),
@@ -156,7 +159,11 @@ impl<'p> Checker<'p> {
                             callee.span,
                             format!("`{}` is a GPU {kind}", self.p.func(f).name),
                         )
-                        .with_note("entry points run on the GPU and can't be called directly"),
+                        .with_note("entry points run on the GPU and can't be called directly")
+                        .with_help(match e {
+                            Entry::Compute(_) => "record it from `frame`: `dispatch(kernel.bind(...), groups: n)`",
+                            Entry::Vertex | Entry::Fragment => "record it from `frame`: `draw(target, vs.bind(...), fs.bind(...), vertices: n)`",
+                        }),
                     );
                     // Its arguments are still checked, but not against its parameters.
                     return self.failed_call(args, span);
@@ -309,11 +316,16 @@ impl<'p> Checker<'p> {
             _ => {
                 let shown = self.display(ty);
                 let name = self.locals[l.index()].name.clone();
-                self.err(Diagnostic::new(
-                    codes::E0310,
-                    span,
-                    format!("`{name}` is a `{shown}`, which can't be called"),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0310,
+                        span,
+                        format!("`{name}` is a `{shown}`, which can't be called"),
+                    )
+                    .with_help(format!(
+                        "use `{name}` as a value (`{name} * x`), or give the function you meant another name than the local"
+                    )),
+                );
                 return self.error_expr(span);
             }
         };
@@ -617,7 +629,8 @@ impl<'p> Checker<'p> {
                         "`{name}` is part of std's unsafe core, so it's called only inside `unsafe`"
                     ),
                 )
-                .with_note("nothing checks what it does with memory (§6.12)"),
+                .with_note("nothing checks what it does with memory (§6.12)")
+                .with_help("use std's safe API around it; inside a package whose `wrela.toml` says `unsafe = true`, write the call in an `unsafe { ... }` block"),
             );
         }
         let (params, ret) = self.sig_under(f, &subst);
@@ -724,7 +737,11 @@ impl<'p> Checker<'p> {
                                     wrela_diag::plural(takes)
                                 ),
                             )
-                            .with_secondary(self.p.func(f).sig_span, "declared here"),
+                            .with_secondary(self.p.func(f).sig_span, "declared here")
+                            .with_help(match self.p.text(self.p.func(f).sig_span) {
+                                Some(sig) => format!("it's declared as `{sig}`: pass one argument for each parameter"),
+                                None => "pass one argument for each parameter".into(),
+                            }),
                         );
                         self.check_expr(&a.value, None);
                         continue;
@@ -749,7 +766,11 @@ impl<'p> Checker<'p> {
                         } else {
                             let names: Vec<String> =
                                 params[offset..].iter().map(|p| format!("`{}`", p.name)).collect();
-                            d = d.with_note(format!("its parameters are {}", names.join(", ")));
+                            d = d
+                                .with_note(format!("its parameters are {}", names.join(", ")))
+                                .with_help(
+                                    "name one of those parameters, or pass the value by position",
+                                );
                         }
                         self.err(d);
                         self.check_expr(&a.value, None);
@@ -759,11 +780,10 @@ impl<'p> Checker<'p> {
             };
             if slots[idx].is_some() {
                 let pname = params[idx].name;
-                self.err(Diagnostic::new(
-                    codes::E0304,
-                    a.span,
-                    format!("`{pname}` is given twice"),
-                ));
+                self.err(
+                    Diagnostic::new(codes::E0304, a.span, format!("`{pname}` is given twice"))
+                        .with_help("give each parameter one argument: remove one of them"),
+                );
                 continue;
             }
             let p = &params[idx];
@@ -799,7 +819,17 @@ impl<'p> Checker<'p> {
                     span,
                     format!("this call to `{name}` is missing {list}"),
                 )
-                .with_secondary(self.p.func(f).sig_span, "declared here"),
+                .with_secondary(self.p.func(f).sig_span, "declared here")
+                .with_help({
+                    let shown: Vec<String> = missing
+                        .iter()
+                        .map(|m| match params.iter().find(|p| p.name == *m) {
+                            Some(p) => format!("{m}: <{}>", self.display(p.ty)),
+                            None => format!("{m}: ..."),
+                        })
+                        .collect();
+                    format!("pass it by name: `{name}(..., {})`", shown.join(", "))
+                }),
             );
         }
         // Arguments missing (already reported) are placeholders; evaluate them last.
@@ -956,7 +986,11 @@ impl<'p> Checker<'p> {
                 codes::E0300,
                 span,
                 format!("expected `{}`, found `{}`", self.display(want), self.display(have)),
-            );
+            )
+            .with_help(format!(
+                "pass a function or closure of exactly that signature, its parameters' modes included: `{}`",
+                self.display(want)
+            ));
             for attr in lacks {
                 d = d.with_note(format!(
                     "the parameter's bound isn't `@{attr}`, so the function it holds may not be"
@@ -1006,15 +1040,22 @@ impl<'p> Checker<'p> {
                 let locals = def.params.clone();
                 let (params, ret, modes) = self.closure_sig(def);
                 if params.len() != ps.len() {
-                    self.err(Diagnostic::new(
-                        codes::E0301,
-                        e.span,
-                        format!(
-                            "this closure takes {} parameters, but {} are expected",
-                            params.len(),
-                            ps.len()
-                        ),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0301,
+                            e.span,
+                            format!(
+                                "this closure takes {} parameters, but {} are expected",
+                                params.len(),
+                                ps.len()
+                            ),
+                        )
+                        .with_help(format!(
+                            "write {} parameters, as in `|{}| ...`",
+                            ps.len(),
+                            (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
+                        )),
+                    );
                     return;
                 }
                 if let Some((i, mode)) =
@@ -1029,7 +1070,7 @@ impl<'p> Checker<'p> {
                             "this closure takes `{name}` as `{}`, but the function type passes it {want}",
                             mode.keyword()
                         ),
-                    ));
+                    ).with_help(format!("declare the parameter as the function type passes it: {want}")));
                     return;
                 }
                 for (l, &pt) in params.iter().zip(ps) {
@@ -1055,7 +1096,7 @@ impl<'p> Checker<'p> {
                                 p.name,
                                 p.mode.keyword()
                             ),
-                        )
+                        ).with_help(format!("declare `{}` as the function type passes it: {want}", p.name))
                         .with_help(format!("pass a closure that calls it: `|..| {fname}(..)`")),
                     );
                     return;
@@ -1341,7 +1382,10 @@ impl<'p> Checker<'p> {
                 }
             }
             Err(msg) => {
-                self.err(Diagnostic::new(codes::E0305, span, msg));
+                self.err(Diagnostic::new(codes::E0305, span, msg).with_help(format!(
+                    "pass `{}` the kind of value it says; `wrela doc builtins` lists what each built-in takes",
+                    b.name()
+                )));
                 self.error_expr(span)
             }
         }
@@ -1372,11 +1416,14 @@ impl<'p> Checker<'p> {
                 Some(n) => match names.iter().position(|p| *p == n.name) {
                     Some(i) if slots[i].is_none() && !written.contains(&i) => i,
                     Some(_) => {
-                        self.err(Diagnostic::new(
-                            codes::E0304,
-                            n.span,
-                            format!("`{}` is given twice", n.name),
-                        ));
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0304,
+                                n.span,
+                                format!("`{}` is given twice", n.name),
+                            )
+                            .with_help("give each argument once: remove one of them"),
+                        );
                         ok = false;
                         continue;
                     }
@@ -1500,14 +1547,16 @@ impl<'p> Checker<'p> {
                     span,
                     "`embed` takes one string literal: the path of a file in the package",
                 )
-                .with_note("the build reads the file, so its path is known when the program is built (§13)"),
+                .with_note("the build reads the file, so its path is known when the program is built (§13)")
+                .with_help("pass the path as a literal: `embed(\"data/table.bin\")`"),
             );
             return self.failed_call(args, span);
         };
         if let Some(why) = embed_path_problem(&path) {
             self.err(
                 Diagnostic::new(codes::E0218, at, format!("`embed` can't read `{path}`: {why}"))
-                    .with_note("a path is relative to the package's root, and uses `/` (§13)"),
+                    .with_note("a path is relative to the package's root, and uses `/` (§13)")
+                    .with_help("write the path from the package's root, inside it: `embed(\"data/table.bin\")`"),
             );
             return self.error_expr(span);
         }
@@ -1659,22 +1708,33 @@ impl<'p> Checker<'p> {
                 let col = self.p.types.vec(r);
                 let name = self.display(ty);
                 if args.len() != c as usize {
-                    self.err(Diagnostic::new(
-                        codes::E0323,
-                        span,
-                        format!("`{name}` is built from {c} column vectors, each a `vec{r}`"),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0323,
+                            span,
+                            format!("`{name}` is built from {c} column vectors, each a `vec{r}`"),
+                        )
+                        .with_help(format!(
+                            "pass {c} `vec{r}`s, or {} numbers, one column after another",
+                            c * r
+                        )),
+                    );
                     return self.error_expr(span);
                 }
                 let mut cols = Vec::new();
                 for a in args {
                     // Columns are positional: a name would read as a choice of column.
                     if let Some(label) = &a.name {
-                        self.err(Diagnostic::new(
-                            codes::E0302,
-                            label.span,
-                            format!("`{name}` takes its {c} columns as positional arguments"),
-                        ));
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0302,
+                                label.span,
+                                format!("`{name}` takes its {c} columns as positional arguments"),
+                            )
+                            .with_help(format!(
+                                "remove the label: `{name}(c0, c1, ...)` takes its columns in order"
+                            )),
+                        );
                     }
                     cols.push(self.check_expect(&a.value, col));
                 }
@@ -1747,11 +1807,22 @@ impl<'p> Checker<'p> {
                         && !matches!(self.kind(x.ty), TyKind::Bool | TyKind::Error))
                 {
                     let shown = self.display(x.ty);
-                    self.err(Diagnostic::new(
-                        codes::E0319,
-                        x.span,
-                        format!("`{shown}` can't be converted to `{}`", self.p.display_ty(ty)),
-                    ));
+                    let to = self.p.display_ty(ty);
+                    let help = if matches!(self.kind(x.ty), TyKind::Vec(..)) {
+                        "a vector converts only to a vector of its size; take a component (`v.x`) or its `length(v)`".to_string()
+                    } else {
+                        format!(
+                            "a conversion takes a number or a `bool`; compute a number from the `{shown}` first"
+                        )
+                    };
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0319,
+                            x.span,
+                            format!("`{shown}` can't be converted to `{to}`"),
+                        )
+                        .with_help(help),
+                    );
                     return self.error_expr(span);
                 }
                 Expr { ty, span, kind: ExprKind::Convert(Box::new(x)) }
@@ -1788,11 +1859,14 @@ impl<'p> Checker<'p> {
                 };
                 let x = self.check_expect(&a.value, comp);
                 if comps[i].is_some() {
-                    self.err(Diagnostic::new(
-                        codes::E0304,
-                        field.span,
-                        format!("`{}` is given twice", field.name),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0304,
+                            field.span,
+                            format!("`{}` is given twice", field.name),
+                        )
+                        .with_help("give each component once: remove one of them"),
+                    );
                     continue;
                 }
                 comps[i] = Some(x);
@@ -1840,11 +1914,16 @@ impl<'p> Checker<'p> {
             xs.push(x);
         }
         if !(count == n as u32 || (single && count == 1)) {
-            self.err(Diagnostic::new(
-                codes::E0323,
-                span,
-                format!("`{name}` needs {n} components, but these make {count}"),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0323,
+                    span,
+                    format!("`{name}` needs {n} components, but these make {count}"),
+                )
+                .with_help(format!(
+                    "give {n} numbers, vectors whose sizes add up to {n}, or one number for every component: `{name}(0.0)`"
+                )),
+            );
         }
         Expr { ty, span, kind: ExprKind::Construct(xs) }
     }
@@ -1924,11 +2003,14 @@ impl<'p> Checker<'p> {
             Assoc::Ambiguous => self.failed_call(args, span),
             Assoc::Missing => {
                 let shown = self.display(ty);
-                self.err(Diagnostic::new(
-                    codes::E0207,
-                    name.span,
-                    format!("`{shown}` has no associated function `{}`", name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0207,
+                        name.span,
+                        format!("`{shown}` has no associated function `{}`", name.name),
+                    )
+                    .with_help(format!("`wrela doc {shown}` lists what it has")),
+                );
                 self.failed_call(args, span)
             }
         }
@@ -2346,10 +2428,12 @@ impl<'p> Checker<'p> {
                 name.span,
                 format!("`{shown}` has no method `{}`", name.name),
             );
-            if let &TyKind::Adt(a, _) = self.kind(rt)
-                && self.p.adt(a).fields().iter().any(|f| f.name == name.name)
-            {
-                d = d.with_note(format!("`{}` is a field; a field can't be called", name.name));
+            let field = matches!(self.kind(rt), &TyKind::Adt(a, _)
+                if self.p.adt(a).fields().iter().any(|f| f.name == name.name));
+            if field {
+                d = d
+                    .with_note(format!("`{}` is a field; a field can't be called", name.name))
+                    .with_help(format!("read it without the call: `x.{}`", name.name));
             } else if let &TyKind::Param(p) = self.kind(rt) {
                 let pname = &self.p.param(p).name;
                 d = d.with_help(format!("add a bound that has `{}`: `{pname}: Trait`", name.name));
@@ -2433,6 +2517,12 @@ impl<'p> Checker<'p> {
                 let names = self.method_names(rt);
                 if let Some(s) = resolve::closest(&name.name, names.iter().map(String::as_str)) {
                     d = d.with_fix(format!("did you mean `{s}`?"), name.span, s);
+                } else if !field && d.help.is_empty() {
+                    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+                    if let Some(note) = resolve::listed("its methods are", &names) {
+                        d = d.with_note(note);
+                    }
+                    d = d.with_help(format!("`wrela doc {}` lists what it has", self.doc_name(rt)));
                 }
             }
             self.err(d);
@@ -2465,7 +2555,10 @@ impl<'p> Checker<'p> {
     ) -> Expr {
         let rt = self.shallow(recv.ty);
         if generics.is_some() && matches!(pick, Pick::Builtin(_) | Pick::Clone) {
-            self.err(Diagnostic::new(codes::E0322, span, "this method takes no generic arguments"));
+            self.err(
+                Diagnostic::new(codes::E0322, span, "this method takes no generic arguments")
+                    .with_help("remove the `::<...>`"),
+            );
         }
         match pick {
             Pick::Inherent(f, impl_args) => {
@@ -2933,11 +3026,50 @@ impl<'p> Checker<'p> {
             || matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::Shared))
     }
 
-    /// The methods a value of type `t` has: its inherent ones, and those of every trait it
-    /// implements (or, for a generic parameter, of its bounds). For suggestions.
+    /// How `wrela doc` names type `t`'s page: a struct's or an enum's name, `[T]` for a run,
+    /// `[T; N]` for an array, and a built-in type's own name.
+    fn doc_name(&self, t: TyId) -> String {
+        match self.kind(t) {
+            TyKind::Adt(a, _) => self.p.adt(*a).name.clone(),
+            TyKind::Slice(_) => "[T]".into(),
+            TyKind::Array(..) | TyKind::ArrayN(..) => "[T; N]".into(),
+            _ => {
+                let shown = self.display(t);
+                shown.split('<').next().unwrap_or(&shown).to_string()
+            }
+        }
+    }
+
+    /// The methods a value of type `t` has: its inherent ones, std's impls of a built-in type
+    /// (a run's, an array's, `str`'s), the built-in functions that take it as a method, and
+    /// those of every trait it implements (or, for a generic parameter, of its bounds). For
+    /// suggestions, so sorted and without repeats.
     fn method_names(&self, t: TyId) -> Vec<String> {
         let p = self.p;
         let mut out = Vec::new();
+        let is_str = matches!(self.kind(t), TyKind::Str);
+        for &i in &p.builtin_inherent {
+            let imp = p.impl_(i);
+            let fits = if matches!(p.types.kind(imp.self_ty), TyKind::Str) {
+                is_str
+            } else {
+                !is_str && traits::could_unify(p, imp.self_ty, t)
+            };
+            if !fits {
+                continue;
+            }
+            for &f in &imp.methods {
+                let def = p.func(f);
+                if def.has_self() && (def.public || def.module == self.scope.module) {
+                    out.push(def.name.clone());
+                }
+            }
+        }
+        for &b in BuiltinFn::ALL {
+            if b.is_method() && b.arity() >= 1 && b.result(p, &vec![t; b.arity()]).is_ok() {
+                out.push(b.name().to_string());
+            }
+        }
         if let TyKind::Adt(a, _) = self.kind(t)
             && let Some(impls) = p.inherent_impls.get(a)
         {
@@ -2965,6 +3097,8 @@ impl<'p> Checker<'p> {
                 out.push(p.func(f).name.clone());
             }
         }
+        out.sort();
+        out.dedup();
         out
     }
 
@@ -3038,11 +3172,14 @@ impl<'p> Checker<'p> {
                 Lang::DrawArgs => "a draw's",
                 _ => "an indexed draw's",
             };
-            self.err(Diagnostic::new(
-                codes::E0603,
-                e.span,
-                format!("{what} arguments are {}, and these are {}", name(want), name(got)),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    e.span,
+                    format!("{what} arguments are {}, and these are {}", name(want), name(got)),
+                )
+                .with_help(format!("pass a buffer of {}", name(want))),
+            );
         }
     }
 
@@ -3229,11 +3366,16 @@ impl<'p> Checker<'p> {
             }
             let e = self.check_expr(&a.value, None);
             if groups.is_some() {
-                self.err(Diagnostic::new(
-                    codes::E0304,
-                    a.span,
-                    "`dispatch` takes `groups:` or `over:`, once",
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0304,
+                        a.span,
+                        "`dispatch` takes `groups:` or `over:`, once",
+                    )
+                    .with_help(
+                        "give one of them: `groups:` counts workgroups, `over:` counts invocations",
+                    ),
+                );
                 continue;
             }
             if a.name.as_ref().is_some_and(|n| n.name == "over") {
@@ -3307,7 +3449,7 @@ impl<'p> Checker<'p> {
                 codes::E0300,
                 e.span,
                 format!("`over:` is a count, a `(u32, u32)`, a `(u32, u32, u32)` or a texture, not `{shown}`"),
-            ));
+            ).with_help("pass the count of invocations (`over: n`), a size as a tuple (`over: (w, h)`), or the texture written"));
         }
         // A kernel known only as a bound kernel's type is checked when lowering knows it.
         let Some(kernel) = kernel else { return };
@@ -3445,7 +3587,7 @@ impl<'p> Checker<'p> {
                         codes::E0603,
                         x.span,
                         format!("this fragment shader takes `{takes}` from the vertex shader, which gives `{gives}`"),
-                    ));
+                    ).with_help(format!("make the fragment shader take `{gives}`, or the vertex shader give `{takes}`")));
                 }
             }
         }
@@ -3478,11 +3620,10 @@ impl<'p> Checker<'p> {
             // A count given twice is still checked, for its own errors.
             let twice = seen.contains(&n.name.as_str());
             if twice {
-                self.err(Diagnostic::new(
-                    codes::E0304,
-                    a.span,
-                    format!("`{}` is given twice", n.name),
-                ));
+                self.err(
+                    Diagnostic::new(codes::E0304, a.span, format!("`{}` is given twice", n.name))
+                        .with_help("give each argument once: remove one of them"),
+                );
             } else {
                 seen.push(&n.name);
             }
@@ -3567,7 +3708,7 @@ impl<'p> Checker<'p> {
                     codes::E0603,
                     span,
                     "an indexed draw takes its counts from `indirect:`",
-                )
+                ).with_help("pass `indirect:` with a buffer of `DrawIndexedArgs`, or draw without `indices:`")
                 .with_note("the buffer holds the index count, the instance count, the first index, the base vertex and the first instance"),
             );
         }
@@ -3626,7 +3767,8 @@ impl<'p> Checker<'p> {
                     e.span,
                     format!("`{name}:` takes {takes}, not a `{shown}`"),
                 )
-                .with_note(note),
+                .with_note(note)
+                .with_help(format!("pass `{name}:` {takes}")),
             );
         }
         e

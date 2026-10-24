@@ -4,7 +4,9 @@
       "code": "E0207",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "`wrela doc Gait` lists what it has"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

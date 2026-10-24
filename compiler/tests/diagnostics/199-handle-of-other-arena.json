@@ -4,7 +4,9 @@
       "code": "E0312",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "index it with a `Handle<Lever>`: the handle `insert` gave"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

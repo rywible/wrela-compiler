@@ -1,0 +1,9 @@
+use main::reflect_y
+
+@test
+fn grade_reflect_y() {
+    let a = reflect_y(1.0, 1.0, 0.0)
+    assert(length(a - vec3(0.70710677, -0.70710677, 0.0)) < 0.0001, f"({a.x}, {a.y}, {a.z})")
+    let b = reflect_y(0.0, 2.0, 0.0)
+    assert(length(b - vec3(0.0, -1.0, 0.0)) < 0.0001, f"({b.x}, {b.y}, {b.z})")
+}

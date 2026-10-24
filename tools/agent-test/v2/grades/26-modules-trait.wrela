@@ -1,0 +1,12 @@
+use circle::Circle
+use main::areas
+use shape::Shape
+use square::Square
+
+@test
+fn grade_areas() {
+    let a = areas()
+    assert(length(a - vec2(3.1415927, 1.0)) < 0.001, f"`areas()` is ({a.x}, {a.y})")
+    assert(abs(Circle { r: 2.0 }.area() - 12.566371) < 0.004)
+    assert(Square { side: 3.0 }.area() == 9.0)
+}

@@ -1123,6 +1123,8 @@ Each error and warning has a code, whose number and meaning never change once re
 
 - **`wrela explain <code>`** gives a code's meaning, with a program that breaks the rule and the same program fixed.
 - **A diagnostic can carry fixes:** edits that a tool can make. `wrela fix` makes each fix that's the only one, unless it's the author's choice (§6.13).
+- **Every diagnostic has a next step:** a help or a fix of its own, or, where its code has nothing more to say there, a help that points at `wrela explain`.
+- **A migration** is a warning for a form the language moved away from, whose one fix a tool always makes; `wrela migrate` makes every one of a package's, and nothing else (§23.9). The old form compiles for at least two minor releases before the error that replaces it.
 - **`--json`** gives diagnostics for tools, in a versioned format: each has its code, severity, message, file, span, labels, notes, helps and fixes.
 
 ### 10.3 Failed asserts
@@ -1481,7 +1483,7 @@ The compiler derives them from the function's body, and from every function it c
   - On the CPU, each rounded result is widened by its rounding: an ulp, or four for std's transcendentals.
   - On the GPU, each result is widened by twice its WGSL error bound, at least one ulp, plus 2⁻¹²⁶ for flushed subnormals.
   - A branch on the input that could go either way runs both sides and joins their results.
-  - A loop whose exit depends on the input cannot be bounded, and nor can a recursion that runs under a branch on the input (E0701).
+  - A loop runs its fixed count. A `break` or `continue` under a branch on the input is joined with the other passes, as a branch is: the rest of each pass runs where it didn't leave, and the result holds both. A loop whose own count depends on the input (a `while` on it, or a `loop` that only such a `break` leaves) cannot be bounded, and nor can a recursion that runs under a branch on the input (E0701).
   - Integers are exact when single-valued, and otherwise their type's whole range.
   - The test corpus encloses every sample of 10⁶ boxes per function, on both targets.
 - **What cannot be derived (E0700):**
@@ -1496,7 +1498,7 @@ The compiler derives them from the function's body, and from every function it c
   - std's `cuboid`, written with one branch on inside or outside, has its face's normal as the bound of its gradient on a face.
   - `normalize`'s range is computed one component at a time from the others' squares. So it is exact where the other components are exactly 0, and a vector's `length` is at least its largest component's least magnitude.
 - **A table read at an index that depends on the input** (an array's or a vector's element, as a loft reads its radii) gives the hull of the elements that the index's range reaches, held to the array's bounds. The derivation joins them in a loop it makes, so the code does not grow with the array, and a read near a point, whose index's range is a few elements, stays tight. Each place has at most one such index, into an array of known length whose elements hold no enum (E0700 otherwise). An index can be a `u32` or an `i32`.
-- **`floor` splits into cases.** Where a component's range crosses one integer, its floor is not one integer, and what is computed from it, such as value noise's hashed lattice values, would get its whole range. So the rest of the block runs once for each case of which integer each component's floor is, in a loop the derivation makes, and the cases are joined. A component that crosses no integer, or more than one, is not split. The bound of a gradient then tends to the sampled gradient as the boxes shrink.
+- **`floor` splits into cases.** Where a component's range crosses one or two integers, its floor is not one integer, and what is computed from it, such as value noise's hashed lattice values, would get its whole range. So the rest of the block runs once for each case of which integer each component's floor is, in a loop the derivation makes, and the cases are joined. A component that crosses no integer, or more than two, is not split. The bound of a gradient then tends to the sampled gradient as the boxes shrink.
 - **On the GPU, an interval derivation stays a function** where it is big and takes only scalars, vectors and structs of them without arrays, so nested derivations do not multiply the code. Other calls are inlined, because reading a field's uniform data through a copy is slow.
 
 ### 14.3 Known limits of the intervals
@@ -2336,7 +2338,7 @@ Each gives a value that borrows its targets until `end()` (or `present()`), so t
 
 A pipeline is an entry point compiled for one set of type arguments: a generic kernel or shader has a pipeline for each instantiation that the program records (§7), and a field's numbers travel as data, so one pipeline serves every field of one structure.
 
-- **The pipeline-count query** reports how many instantiations each GPU entry point has, and why. `wrela pipelines <package>` lists each entry point's pipelines, their type arguments, and where CPU code dispatches or draws each. `--json` gives the same list for tools.
+- **The pipeline-count query** reports how many instantiations each GPU entry point has, and why. `wrela pipelines <package>` lists each entry point's pipelines, their type arguments, and where CPU code dispatches or draws each. A site that runs only under a runtime condition of its function is marked `(under a condition)` (in `--json`, `conditional`): its pipeline is in the build however rarely the condition holds, so a stage to leave out is left out by the program's structure. `--json` gives the same list for tools.
 - **A shipped build keeps a budget for its shaders:** at most 256 KiB of WGSL for each pipeline. A browser compiles each pipeline while the scene loads, and the GPU's compile time grows faster than the shader's size.
   - A release build over the budget is E0707, at the command that records the large pipeline.
   - The budget isn't checked for a test build, a debug build or a lifted build.
@@ -2899,7 +2901,7 @@ std and the engine give an author forms for building subjects such as creatures,
   - `Paint`: colour that changes with height across a part;
   - `canine(wolf(), coat)`: a whole canine from a few proportions (`wolf()` gives a grey wolf's), on a rigged skeleton. Its `ruff` and `brush` are the coat's mass, built into the forms of the neck and the tail.
 - **Colour across a part:** std::field's `with_at(|p| ...)` gives a surface channels from a function of the point, where `with(c)` gives one value.
-- **`wrela doc`** reads the packages that a package depends on (`wrela doc engine::quadruped <package>`), shows a struct's fields with their doc comments, and lists the built-in functions (`wrela doc builtins`).
+- **`wrela doc`** reads the packages that a package depends on (`wrela doc engine::quadruped <package>`), shows a struct's fields with their doc comments, and lists the built-in functions and types (`wrela doc builtins`). A built-in type has a page too: `wrela doc vec3` (or `u8`, `str`, `[T]`, `run`, `[T; N]`) shows its section of this spec, the built-in functions that take it as a method, and std's methods of it.
 - **`wrela doc --export <dir> [--commit <sha>] [<package-dir>...]`** writes the reference docs into a new directory, from the same index as `wrela doc`. The same sources give the same bytes. It writes:
   - in Markdown: this spec split at its sections, the lexical structure, the grammar, and a page for each module of std and of each package given;
   - `index.json`: each public item (its path, kind, signature, doc, page, anchor, and source file and line) and each section of the spec's prose;
@@ -2913,12 +2915,14 @@ These commands let an agent read what the compiler knows about a package, instea
 |---|---|
 | `wrela query <package> <query>...` | Answers a batch of queries with one check (below) |
 | `wrela context <item> [<package>] --budget n` | Gives the item's source, the types it names, what it calls, where it is called and its impls, in about `n` tokens. On a program with errors, it says at the end what the errors keep from being known |
-| `wrela refactor <package> <change>` | Makes a change across the package: `rename`, `move`, `add-param` or `change-mode` (below) |
-| `wrela fix <package-dir> [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13) |
+| `wrela refactor <package> <change>` | Makes a change across the package: `rename`, `move`, `add-param`, `change-mode`, `extract-const`, `inline` or `extract-fn` (below) |
+| `wrela fix <package-dir> [--dry-run] [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13). `--dry-run` prints the diff and writes nothing |
+| `wrela migrate <package-dir> [--dry-run] [--json]` | Makes every migration's fix and nothing else (§10.2): after a workspace moves its toolchain pin, one command brings each member to the new forms |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
+| `wrela same <package> --against <build-dir>` | Whether the package built now behaves as a saved build of it does (below) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |
 
@@ -2933,6 +2937,12 @@ These commands let an agent read what the compiler knows about a package, instea
 It also answers on a program with errors. A function whose body has an error has no memory IR, so what it calls, borrows and does is not known. An answer that such a function, or an error outside every body, could change lists those errors as `unsure`.
 
 **`wrela refactor`** plans the change and checks the new texts before it writes anything. It refuses the change, with the errors, if the program would not check, and refuses it if a call would quietly bind to another function. `--dry-run --json` gives a plan with each file's hash; `apply <plan>` refuses the plan if a file has changed since.
+
+- `extract-const <file>:<line>:<col> <NAME>` makes the expression there, of literals, unit suffixes and constants alone, a constant of its module, with the type the program gives it there.
+- `inline <fn>` makes each call of a free function whose body is one expression that expression, and removes the function if it is private. It inlines only where nothing about a call can be observed to move: each parameter is used exactly once and in its order, and each argument is a parameter or a local whose type is written where it is declared; a body with a bare number is wrapped in a conversion to the function's result. Anything else is refused, with why.
+- `extract-fn <file>:<first>-<last> <name>` makes whole lines of statements of one block a function after the item they are in, which takes the locals they use that are bound before them and returns the one they bind that the code after uses; a parameter the lines change is `mut`, and one they move is `take`. Lines that leave early, or that make two values used after them, are refused.
+
+**`wrela same`** runs a saved build (`wrela build -o <dir>`) and the package built now, from `init`, on one worker, each with storage of its own and the same input (`--input`), for `--frames` frames (60 unless said), numbered from 0. Two builds are the same when every command byte each submits is the same, frame by frame, their last frames are within a tolerance (`--within`, a mean over every channel in 8-bit steps, 0.5 unless said, as a golden is compared), and they reach the same pipelines. It reports the first frame whose commands differ, how far the last frames are apart, and the pipelines added or removed (`--json` for tools); with `--no-gpu`, or for a program with no pipelines, it compares the commands only. So a refactor, a change to std or a new toolchain can be checked to keep what a program does.
 
 **`wrela profile`** builds the program as `wrela build` builds it and runs it on the native host's GPU. It reports:
 
@@ -3043,7 +3053,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `const.fuel` | `@fuel(n)` on a `const` or a test sets the work it may do, its threads' together | §13.1 |
 | `const.tests` | A `@test` is a free function of no parameters and no result, run as constants are; a tool test (`@test(tool)`) is one too, run on the tool host | §13.2 |
 | `derive.gradient` | `gradient` of a closure or function of an `f32` or a float vector | §14.2 |
-| `derive.interval` | `interval` over a box, of a function whose loops don't depend on its input | §14.2 |
+| `derive.interval` | `interval` over a box, of a function whose loops run a fixed count, whatever its input | §14.2 |
 | `gpu.roles` | A client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool`, and `@client`, `@server` and `@tool` code stays in its role | §15.3 |
 | `fn.jobs` | A `@job fn` runs over several frames, to each `yield`: `f.start(...)` takes its `take` parameters, and `job.resume(...)` its `borrow` and `mut` ones | §16.3 |
 | `fn.job-values` | A job's value is `Clone`, `StateHash` and `Serialize` when the locals it holds are | §16.3 |

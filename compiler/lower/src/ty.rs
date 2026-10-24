@@ -284,7 +284,8 @@ impl<'a> Cx<'a> {
         let max = ir::layout::WGSL_MAX_TYPE_SIZE;
         self.err(
             Diagnostic::new(codes::E0702, span, format!("`{shown}` is too large for {what}"))
-                .with_note(format!("a WGSL type is at most {max} bytes")),
+                .with_note(format!("a WGSL type is at most {max} bytes"))
+                .with_help("keep the data in a `GpuBuffer` and pass the GPU a span of it"),
         );
     }
 
@@ -317,6 +318,7 @@ impl<'a> Cx<'a> {
                 span,
                 format!("`{name}` is CPU-only, and this is {what}"),
             )
+.with_help(format!("keep `{name}` on the CPU, and pass the GPU an `f32` (or a vector of them) computed from it"))
             .with_note(note),
         );
     }

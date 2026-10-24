@@ -1,0 +1,11 @@
+use circle::Circle
+use shape::Shape
+use square::Square
+
+pub fn areas() -> vec2 {
+    let c = Circle { r: 1.0 }
+    let s = Square { side: 1.0 }
+    vec2(c.area(), s.area())
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

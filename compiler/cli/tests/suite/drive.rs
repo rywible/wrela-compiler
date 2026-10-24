@@ -112,7 +112,7 @@ fn loads() -> u32 {
 
 pub fn tool() -> u32 {
     let given = args()
-    let what = given[0].clone()
+    borrow what = given[0]
     if what.as_str() == "two" {
         return two()
     }

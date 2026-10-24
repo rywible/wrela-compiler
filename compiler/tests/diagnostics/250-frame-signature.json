@@ -4,7 +4,9 @@
       "code": "E0703",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it with exactly that signature, and keep what it computes in the state"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

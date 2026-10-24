@@ -1,0 +1,32 @@
+use std::arena::Arena
+
+struct Unit: Clone {
+    hp: f32,
+}
+
+fn build() -> Arena<Unit> {
+    var units: Arena<Unit> = Arena::new()
+    let _a = units.insert(Unit { hp: 1.0 })
+    let _b = units.insert(Unit { hp: 2.0 })
+    let c = units.insert(Unit { hp: 3.0 })
+    let _d = units.insert(Unit { hp: 4.0 })
+    let _e = units.insert(Unit { hp: 5.0 })
+    let _gone = units.remove(c)
+    units
+}
+
+pub fn alive() -> u32 {
+    let units = build()
+    units.len()
+}
+
+pub fn hp_sum() -> f32 {
+    let units = build()
+    var total = 0.0
+    for u in units {
+        total += u.hp
+    }
+    total
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

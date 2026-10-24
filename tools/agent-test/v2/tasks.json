@@ -1,0 +1,222 @@
+[
+  {
+    "id": "01-area",
+    "task": "Export `pub fn circle_area(r: f32) -> f32`, the area of a circle of radius `r`.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "02-particle",
+    "task": "Define a struct `Particle` with `position: vec3` and `velocity: vec3`, and `fn step(p: mut Particle, dt: f32)` that advances the position by the velocity times `dt`. Export `pub fn simulate(steps: u32, dt: f32) -> f32`: a particle starting at the origin with velocity (1, 2, 0), stepped `steps` times; return its final x.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "03-shapes",
+    "task": "Define `enum Shape` with variants `Circle { r: f32 }`, `Rect { w: f32, h: f32 }` and `Square { side: f32 }`, and `fn area(s: Shape) -> f32` using `match`. Export `pub fn total() -> f32`: the summed area of a circle of radius 1, a rectangle 2 by 3, and a square of side 1.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "04-traits",
+    "task": "Define `trait Measured` with a required method `fn size(self) -> f32` and a default method `fn double(self) -> f32` that returns twice the size. Implement it for `struct Rod { length: f32 }` (its size is its length) and `struct Disc { r: f32 }` (its size is its area). Write `fn sum_doubles<T: Measured>(a: T, b: T) -> f32`, the sum of `double()` of the two. Export `pub fn rods(a: f32, b: f32) -> f32`, `sum_doubles` of rods of lengths `a` and `b`, and `pub fn discs(a: f32, b: f32) -> f32`, `sum_doubles` of discs of radii `a` and `b`.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "05-ownership",
+    "task": "Define a struct `Log { count: u32 }` that isn't `Copy`, with `fn bump(log: mut Log)` adding one and `fn archive(log: take Log) -> u32` returning its count. Export `pub fn run() -> u32`: make a log at 0, bump it twice, make a copy of it, bump the original once more, archive the copy, and return the original's count plus what `archive` returned.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "06-field",
+    "task": "Using `std::field`, build a field: a sphere of radius 0.5, smoothly united (k = 0.1) with a round cone from the origin to (0, 1, 0), of radius 0.3 at the origin and 0.1 at (0, 1, 0); the whole translated by (0, -0.5, 0). Export `pub fn distance_at(x: f32, y: f32, z: f32) -> f32`, the field's distance at that point.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "07-kernel",
+    "task": "Write a compute kernel that writes, for each point of a 16\u00d716\u00d716 grid with cell size 0.125 starting at (-1, -1, -1), the distance to a sphere of radius 0.75 (centred at the origin) into a buffer, one value per point. Each frame, dispatch it over the whole grid.",
+    "grade": {
+      "pipelines": [
+        "compute"
+      ]
+    }
+  },
+  {
+    "id": "08-sky",
+    "task": "Each frame, draw a full-screen sky: a vertex shader that covers the screen with one triangle, and a fragment shader whose colour goes from deep blue at the top of the screen to white at the bottom. Pass the screen size to the shader.",
+    "grade": {
+      "pipelines": [
+        "render"
+      ]
+    }
+  },
+  {
+    "id": "09-normals",
+    "task": "Export `pub fn normal_at(x: f32, y: f32, z: f32) -> vec3`: the unit normal at that point of a field made of two spheres (radius 0.5 at the origin, radius 0.3 at (0.6, 0, 0)) smoothly united with k = 0.1, from the gradient the compiler derives.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "10-interval",
+    "task": "Export `pub fn range_over(lo: f32, hi: f32) -> vec2`: a range holding every value of f(t) = sin(t) * t for t between `lo` and `hi`, from the compiler's derived interval, as (low, high).",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "11-projection",
+    "task": "Define a struct `World` holding `values: [f32; 8]`, and `fn element(w: mut World, i: u32) -> mut f32`, a mutable projection of element `i`. Export `pub fn bump_fourth() -> f32`: make a world of zeros, add 1 to element 3 through the projection, and return element 3.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "12-closures",
+    "task": "Write `fn apply_twice(f: fn(f32) -> f32, x: f32) -> f32` that applies `f` twice. Export `pub fn scaled(s: f32) -> f32`, which calls `apply_twice` with a closure that multiplies by `s` and then adds 1, starting from 2.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "13-arrays",
+    "task": "Write `fn sum(xs: [f32]) -> f32`, the sum of a run, and `fn largest(xs: [f32; 5]) -> f32`, its largest element. Export `pub fn stats() -> vec2` returning (sum, largest) of the array [3, -1, 4, 1, 5].",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "14-option",
+    "task": "Write `fn first_negative(xs: [f32]) -> Option<u32>`, the index of the first negative element if there is one. Export `pub fn where_negative() -> u32`: that index for [2, 7, -1, 3], or 99 if there is none; and `pub fn none_negative() -> u32`: the same for [2, 7, 1, 3].",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "15-modules",
+    "task": "Put a public function `rotate(v: vec2, angle: f32) -> vec2` (rotation about the origin, counter-clockwise) in its own module file `geometry.wrela`, use it from `main.wrela`, and export `pub fn rotated_x(angle: f32) -> f32`: the x of (1, 0) rotated by `angle`.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "16-constants",
+    "task": "Define `pub const WEIGHTS: [f32; 5]`, the weights 0.1, 0.2, 0.4, 0.2, 0.1. Export `pub fn smooth(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32`: the weighted sum of its arguments, `a` taking the first weight.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "17-reflect",
+    "task": "Export `pub fn reflect_y(x: f32, y: f32, z: f32) -> vec3`: the direction (x, y, z), normalized, then reflected about the surface normal (0, 1, 0).",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "18-surface",
+    "task": "Define a struct `Cuboid` with half-extents (a `vec3`) that implements `std::field::Surface` with the exact signed distance of a box centred at the origin. Smoothly unite a `Cuboid` of half-extents (0.5, 0.3, 0.2) with a sphere of radius 0.4 at (0.5, 0, 0), with k = 0.05, and export `pub fn dist(x: f32, y: f32, z: f32) -> f32`, the union's distance at that point.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "19-raymarch",
+    "task": "Each frame, draw a sphere of radius 1 at the origin, seen from a camera at (0, 0, -3) looking at the origin: a full-screen triangle, and a fragment shader that sphere-traces the sphere's field (at most 64 steps) and shades hits by the normal from the derived gradient, and misses in a dark grey.",
+    "grade": {
+      "pipelines": [
+        "render"
+      ]
+    }
+  },
+  {
+    "id": "20-uniforms",
+    "task": "Write a compute kernel that multiplies each element of an input buffer of 64 floats by a factor passed as a uniform, writing an output buffer. Each frame, upload 64 values (0, 1, 2, ...) to the input and dispatch the kernel with factor 2.",
+    "grade": {
+      "pipelines": [
+        "compute"
+      ]
+    }
+  },
+  {
+    "id": "21-vec-bag",
+    "task": "Define `struct Bag { items: Vec<f32> }` and `fn add(b: mut Bag, x: f32)`, which adds `x` to its items. Export `pub fn total(n: u32) -> f32`: a new bag with 1, 2, ..., `n` added, and the sum of its items.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "22-arena",
+    "task": "Use `std::arena::Arena<Unit>` with `struct Unit { hp: f32 }`: insert five units with hp 1, 2, 3, 4 and 5, then remove the third one inserted (hp 3) by its handle. Export `pub fn alive() -> u32`, how many units remain, and `pub fn hp_sum() -> f32`, their total hp.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "23-borrow-struct",
+    "task": "Define `borrow struct Ctx { xs: borrow Vec<f32>, k: f32 }` and `fn scaled_sum(c: Ctx) -> f32`: the sum of each element times `k`. Export `pub fn run() -> f32`: `scaled_sum` over a `Vec` of 1, 2 and 3 with k = 2.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "24-enum-option",
+    "task": "Define `enum Cmd { Move(vec2), Stop }` and `fn first_move(cmds: [Cmd]) -> Option<vec2>`: the vector of the first `Move`, if there is one. Export `pub fn where_first() -> vec2`: `first_move` of [Stop, Move((1, 2)), Move((3, 4))], or (0, 0) if there is none.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "25-write-a-test",
+    "task": "Write `fn fib(n: u32) -> u32`, the Fibonacci numbers (fib(0) = 0, fib(1) = 1), and a test `@test fn fib_is_right()` that asserts at least three of its values. Export `pub fn fib_export(n: u32) -> u32`, which returns `fib(n)`.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "26-modules-trait",
+    "task": "Put `pub trait Shape` with `fn area(self) -> f32` in `shape.wrela`; `pub struct Circle { pub r: f32 }`, implementing it, in `circle.wrela`; and `pub struct Square { pub side: f32 }`, implementing it, in `square.wrela`. Export `pub fn areas() -> vec2`: the areas of a circle of radius 1 and of a square of side 1.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "27-certify",
+    "task": "Export `pub fn clear(height: f32) -> bool`: whether `std::field::certify_clear` proves, at depth 5, that nothing of a sphere of radius 1 centred at (0, `height`, 0) is inside the box from (-2, -1, -2) to (2, 0, 2).",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "28-frame-script",
+    "task": "Write a program whose state is `pub struct Game { pub presses: u32 }`, made by `pub fn init() -> Game`, and whose `frame` counts the presses of the space bar (`std::input`). Add a frame test, `@test(frames: 10, input: SPACES)`, with a `std::input::Script` constant `SPACES` that presses space at frames 2 and 5, and asserts that 2 presses were counted.",
+    "grade": {
+      "tests": true
+    }
+  },
+  {
+    "id": "29-gpu-uniform",
+    "task": "Write a `GpuData` struct `Params { scale: f32, offset: f32 }`, passed as a uniform, and a compute kernel over 64 floats that writes `out[i] = in[i] * scale + offset` into an output buffer. Each frame, upload the values 0 to 63 and dispatch it with scale 2 and offset 1.",
+    "grade": {
+      "pipelines": [
+        "compute"
+      ]
+    }
+  },
+  {
+    "id": "30-interval",
+    "task": "Export `pub fn bound(lo: f32, hi: f32) -> vec2`: the interval that `std::derive::interval` derives for x * x - 2 * x over [`lo`, `hi`], as (low, high).",
+    "grade": {
+      "tests": true
+    }
+  }
+]

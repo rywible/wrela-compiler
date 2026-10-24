@@ -233,7 +233,7 @@ pub const RULES: &[(&str, &str)] = &[
     ("derive.gradient", "`gradient` of a closure or function of an `f32` or a float vector"),
     (
         "derive.interval",
-        "`interval` over a box, of a function whose loops don't depend on its input",
+        "`interval` over a box, of a function whose loops run a fixed count, whatever its input",
     ),
     // §15.3 client, server and tool roles
     (

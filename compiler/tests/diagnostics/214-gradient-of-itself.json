@@ -4,7 +4,9 @@
       "code": "E0700",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "compute its gradient outside the function and pass it in as a value it captures"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

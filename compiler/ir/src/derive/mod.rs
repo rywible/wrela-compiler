@@ -8,6 +8,7 @@
 //! counts) costs nothing extra; only the arithmetic on the input's path is transformed.
 
 pub mod ad;
+mod exits;
 pub mod interval;
 pub mod literal;
 

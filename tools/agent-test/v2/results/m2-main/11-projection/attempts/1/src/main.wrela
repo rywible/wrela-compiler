@@ -1,0 +1,16 @@
+pub struct World {
+    pub values: [f32; 8],
+}
+
+fn element(w: mut World, i: u32) -> mut f32 {
+    mut w.values[i]
+}
+
+pub fn bump_fourth() -> f32 {
+    var w = World { values: [0.0; 8] }
+    mut e = element(mut w, 3)
+    e += 1.0
+    w.values[3]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

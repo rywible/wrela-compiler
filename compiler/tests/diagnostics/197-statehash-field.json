@@ -4,7 +4,9 @@
       "code": "E0417",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare `StateHash` on the field's type too, keep the field out of `World`, or remove `StateHash` from `World`"
+      ],
       "internal": false,
       "label": null,
       "labels": [

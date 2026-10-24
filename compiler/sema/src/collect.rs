@@ -283,6 +283,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         g.name.span,
                         format!("the generic parameter `{}` is declared twice", g.name.name),
                     )
+                    .with_help("rename one of them")
                     .with_secondary(prev.name.span, "first declared here"),
                 );
             }
@@ -944,6 +945,12 @@ impl<'d, 'u> Collector<'d, 'u> {
                     .with_note("attributes are a closed set defined by the language (D-037)");
                     if let Some(s) = resolve::closest(name, known.iter().copied()) {
                         d = d.with_fix(format!("did you mean `@{s}`?"), a.name.span, s);
+                    } else {
+                        let all: Vec<String> = known.iter().map(|k| format!("`@{k}`")).collect();
+                        d = d.with_help(format!(
+                            "remove it; the attributes are {}, `@fuel`, `@fieldwise` and `@unsafe_call`",
+                            all.join(", ")
+                        ));
                     }
                     self.diags.push(d);
                 }
@@ -1309,7 +1316,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                         a.span,
                         format!("`@test` takes `frames: n` or `ticks: n`, from 1 to {MAX_TEST_FRAMES}: how many of the program's frames, or ticks, run before the test; and may take `input: NAME`, a `std::input::Script` constant of input events for them, or `input: \"path\"`, a file in the package (a script, or with `ticks` a tick log to check them against)"),
                     )
-                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame"),
+                    .with_note("`@test` alone is a test of code; `@test(frames: 600)` runs the program for 600 frames, then the test with its state; `gpu: true` runs them on the GPU (§13), and `golden: \"frame.png\", within: 0.5` with it compares the screen after them with that PNG, within a mean difference in 8-bit steps (`pass: \"label\"`: that pass's target instead), and `hosts: both` runs them in Chrome too, whose last frame and state hash must be the same; `hold: [(\"far.bin\", 120)]` holds the fetches and storage reads of a path until a frame")
+                    .with_help("write `@test`, `@test(frames: 60)` or `@test(ticks: 60)`, with only the options that note lists for that kind"),
                 );
                 FrameTest::default()
             }
@@ -1374,7 +1382,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     .with_note(format!(
                         "WebGPU's default limits: {}, {} and {}, and {MAX_WORKGROUP_INVOCATIONS} invocations in all",
                         limits[0], limits[1], limits[2]
-                    )),
+                    ))
+                    .with_help(format!("use a workgroup of at most {} along {axis}, and dispatch more groups", limits[i])),
                 );
                 return None;
             }
@@ -1725,7 +1734,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                 for (span, msg) in problems {
                     self.diags.push(
                         Diagnostic::new(codes::E0407, span, msg)
-                            .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)"),
+                            .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)")
+                            .with_help("give each field a `Bits<N>` type, N from 1 to 32 and at most 32 bits in all, with no default; or don't declare `Packed`"),
                     );
                 }
                 continue;
@@ -1818,15 +1828,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                     for &(fid, f) in methods {
                         self.fn_bounds(fid, f);
                         self.fn_signature(fid, f);
-                        self.test_signature(fid);
                     }
                 }
-                PendingItem::Fn(id, f) => {
-                    self.fn_signature(*id, f);
-                    self.test_signature(*id);
-                    self.test_input(*id);
-                    self.testing_export(*id);
-                }
+                PendingItem::Fn(id, f) => self.fn_signature(*id, f),
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
                 PendingItem::Alias(..) | PendingItem::TraitSet(..) => {}
                 PendingItem::Const(id, c) => {
@@ -1837,6 +1841,24 @@ impl<'d, 'u> Collector<'d, 'u> {
                         self.p.consts[id.index()].ty = Some(ty);
                     }
                 }
+            }
+        }
+        // A test's signature names the program's state, which `init`'s signature gives, in any
+        // module of the package: so the tests are checked once every signature is resolved,
+        // whatever order the modules' files come in.
+        for (_, item) in &pending {
+            match item {
+                PendingItem::Trait(_, _, methods) | PendingItem::Impl(_, _, methods) => {
+                    for &(fid, _) in methods {
+                        self.test_signature(fid);
+                    }
+                }
+                PendingItem::Fn(id, _) => {
+                    self.test_signature(*id);
+                    self.test_input(*id);
+                    self.testing_export(*id);
+                }
+                _ => {}
             }
         }
     }
@@ -1951,6 +1973,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                     codes::E0410,
                     t.name.span,
                     format!("`{name}` names traits, so it has no parameters"),
+                )
+                .with_help(
+                    "remove the generic arguments: a trait alias stands for its traits as they are",
                 )
                 .with_note("it names the one type a function returns (§4)"),
             );
@@ -2087,7 +2112,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     codes::E0222,
                     at,
                     "`@testing` marks an export, a `pub fn` of `main.wrela`, which only a test build has",
-                )
+                ).with_help("remove `@testing`, or put the function in `main.wrela` and make it `pub fn`")
                 .with_note("what only a test export calls is left out of a shipped build with it; elsewhere, `std::mem::test_build()` asks"),
             );
         }
@@ -2144,7 +2169,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     format!("`{}` can't be a `@test`: {why}", def.name),
                 )
                 .with_secondary(at, "declared a test here")
-                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics"),
+                .with_note("a test is `@test fn name() { ... }`, or `@test(frames: n) fn name(state: State) { ... }` to run the program's frames first (`ticks: n`, its ticks): it passes unless it panics, and a failed `assert` panics")
+                .with_help("make it a free function of no parameters and no result, and move the values it needs inside it"),
             );
         }
     }
@@ -2202,7 +2228,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0222,
                         span,
                         format!("a test's input `{name}` names {what}, not a constant"),
-                    )
+                    ).with_help("name a `std::input::Script` constant, or give the path of a file in the package as a string")
                     .with_note(INPUT_NOTE),
                 );
                 None
@@ -2364,7 +2390,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0411,
                         span,
                         format!("`{name}` can't be its own supertrait"),
-                    )
+                    ).with_help("remove it from its own supertraits; a trait's supertraits are other traits")
                 } else {
                     let through: Vec<String> = cycle[1..]
                         .iter()
@@ -2375,6 +2401,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         span,
                         format!("`{name}` is its own supertrait, through {}", and_list(&through)),
                     )
+                    .with_help("remove one of the supertraits that leads back to it")
                 };
                 for &(_, &(_, s)) in &cycle[..cycle.len() - 1] {
                     d = d.with_secondary(s, "a supertrait in the cycle");
@@ -2433,6 +2460,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                             d.span,
                             format!("`{}` holds fields, so its enum's variants have no discriminants", v.name.name),
                         )
+.with_help("remove the discriminants, or make the variants hold nothing")
                         .with_secondary(v.span, "holds fields")
                         .with_note("a discriminant is a variant's tag and its `u32`: an enum whose variants hold nothing has them (§3)"),
                     );
@@ -2451,7 +2479,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                                         "`{}`'s discriminant is a `u32`, and `{}` isn't one",
                                         v.name.name, lit.text
                                     ),
-                                ));
+                                )
+.with_help("write the discriminant as a whole number from 0 to 4294967295"));
                                 None
                             }
                         },
@@ -2465,7 +2494,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                                     codes::E0334,
                                     v.name.span,
                                     format!("`{}`'s discriminant, one past the variant's before it, is past `u32`'s range", v.name.name),
-                                ));
+                                )
+.with_help("give the variants before it smaller discriminants"));
                             }
                             0
                         }
@@ -2485,6 +2515,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                                     v.name.name, prev.name
                                 ),
                             )
+.with_help(format!("give `{}` a discriminant larger than {pd}, or reorder the variants", v.name.name))
                             .with_secondary(ps, "the variant before it")
                             .with_note("discriminants increase down the enum, so its variants are ordered as they're declared, and each has its own (§3)"),
                         );
@@ -2651,7 +2682,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                     codes::E0324,
                     d.span,
                     "variant fields can't have defaults",
-                ));
+                )
+.with_help("remove the default: a variant's fields are given wherever the variant is built"));
             }
             out.push(FieldDef {
                 name: f.name.name.clone(),
@@ -2822,7 +2854,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0410,
                         f.name.span,
                         format!("`{}` decides what `{}` names, so it can't be generic", f.name.name, a.name),
-                    )
+                    ).with_help("remove its generic parameters: what it names is the same for every use")
                     .with_note("an alias that names traits names one type: the first function in its module that returns it decides it (§4)"),
                 );
             } else {
@@ -2965,7 +2997,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                             "`type {name} = {}` holds itself through its fields, so it would be infinitely large",
                             self.p.display_ty(ty)
                         ),
-                    ));
+                    ).with_help("hold the inner values in a `Vec`, or an index into one, instead of the value itself"));
                     cyclic.push((i, name.clone()));
                 }
             }
@@ -3281,7 +3313,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                     codes::E0402,
                     imp.span,
                     format!("an inherent impl can't define the associated type `{name}`"),
-                )
+                ).with_help("put it in the impl of the trait that declares it, or use a `const` or a method here")
                 .with_note("associated types belong to traits"),
             );
         }
@@ -3314,7 +3346,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 codes::E0415,
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: {what} bound to its arguments has it", tr.name),
-            )
+            ).with_help("remove the `impl`: binding the entry point (`name.bind(...)`) gives the trait")
             .with_note("`name.bind(...)` makes a value of the entry point's bound type, which has the trait (§18)"),
         );
         return;
@@ -3326,7 +3358,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 codes::E0415,
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: std's passes have it", tr.name),
-            )
+            ).with_help("remove the `impl`: std's passes have this trait already")
             .with_note("a draw draws into the pass a `begin_` function gives, and its type says the pass's targets (§18)"),
         );
         return;
@@ -3374,6 +3406,11 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                     ],
                 );
             }
+        } else {
+            d = d.with_help(format!(
+                "remove the `impl`: a struct or an enum declares `{}` where it's declared (`struct S: {}`)",
+                tr.name, tr.name
+            ));
         }
         diags.push(d);
         return;
@@ -3454,15 +3491,18 @@ fn check_members(
         let Some(&ty) = imp.assoc_types.get(&at.name) else { continue };
         let ty = crate::traits::normalize(p, ty, Some(imp));
         if let Some(cycle) = crate::traits::cyclic_projection(p, ty) {
-            diags.push(Diagnostic::new(
-                codes::E0318,
-                imp.span,
-                format!(
-                    "`type {}` is defined in terms of itself: `{}` never resolves to a type",
-                    at.name,
-                    p.display_ty(cycle)
-                ),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0318,
+                    imp.span,
+                    format!(
+                        "`type {}` is defined in terms of itself: `{}` never resolves to a type",
+                        at.name,
+                        p.display_ty(cycle)
+                    ),
+                )
+                .with_help("give the associated type a concrete type, as in `type Out = f32`"),
+            );
             continue;
         }
         for b in &at.bounds {
@@ -3482,7 +3522,7 @@ fn check_members(
                         p.display_trait_ref(&b),
                         tr.name
                     ),
-                ));
+                ).with_help("give it a type that implements the bound, or implement the trait for this type"));
             }
         }
     }
@@ -3537,7 +3577,8 @@ fn check_members(
                         format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
                     )
                     .with_secondary(tdef.sig_span, "declared here")
-                    .with_note("its body walks the fields of a type that declares the trait, so an impl written by hand gives its own (§3)"),
+                    .with_note("its body walks the fields of a type that declares the trait, so an impl written by hand gives its own (§3)")
+                    .with_help(format!("add `fn {}` to the impl, or remove the impl and declare the trait on the type", tdef.name)),
                 );
             }
             None if tdef.body.is_none() && !imp.from_opt_in => {
@@ -3547,7 +3588,11 @@ fn check_members(
                         imp.span,
                         format!("this impl of `{}` is missing `fn {}`", tr.name, tdef.name),
                     )
-                    .with_secondary(tdef.sig_span, "declared here"),
+                    .with_secondary(tdef.sig_span, "declared here")
+                    .with_help(match p.text(tdef.sig_span) {
+                        Some(sig) => format!("add it to the impl: `{sig} {{ ... }}`"),
+                        None => format!("add `fn {}` to the impl", tdef.name),
+                    }),
                 );
             }
             None => {}
@@ -3581,6 +3626,7 @@ fn report_duplicate_methods(p: &Program, diags: &mut Vec<Diagnostic>, methods: &
                     d.name_span,
                     format!("`{}` is defined twice", d.name),
                 )
+                .with_help("rename one of them")
                 .with_secondary(ps, "first defined here"),
             );
         } else {
@@ -3614,7 +3660,7 @@ fn check_inherent_names(p: &Program, diags: &mut Vec<Diagnostic>) {
                                     d.name,
                                     p.display_ty(b.self_ty)
                                 ),
-                            )
+                            ).with_help("rename one of them, or remove one: a type has one item of each name across its impls")
                             .with_secondary(p.func(g).name_span, "first defined here"),
                         );
                     }
@@ -3643,6 +3689,10 @@ fn compare_signatures(
             format!("`{}` doesn't match the trait's signature: {what}", a.name),
         )
         .with_secondary(b.sig_span, "the trait declares it here")
+        .with_help(match p.text(b.sig_span) {
+            Some(sig) => format!("declare it as the trait does: `{sig}`"),
+            None => "declare it as the trait does".into(),
+        })
     };
     if a.generics.len() != b.generics.len() {
         return diags.push(mismatch(format!(
@@ -3808,7 +3858,7 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
                     codes::E0407,
                     imp.span,
                     format!("`{}` can't be `Fieldless`: {why}", adt.name),
-                )
+                ).with_help("`Fieldless` is declared by an enum whose variants hold nothing: remove it from this declaration, or remove the variants' fields")
                 .with_note("`Fieldless` is an enum's whose variants hold nothing: each is its discriminant (§3)"),
             );
         }
@@ -3845,7 +3895,11 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
                         p.display_ty(f.ty)
                     ),
                 )
-                .with_secondary(imp.span, format!("`{}` opted in here", tr.name)),
+                .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
+                .with_help(format!(
+                    "remove `{}` from `{}`, or give `{}` a type that is `{}` (`Text` rather than `String`, a handle rather than a `Vec`)",
+                    tr.name, adt.name, f.name, tr.name
+                )),
             );
         }
     }
@@ -3913,7 +3967,7 @@ pub fn check_test_inputs(p: &Program, tys: &crate::check::ConstTypes) -> Vec<Dia
                         p.const_(*c).short(),
                         p.display_ty(t)
                     ),
-                )
+                ).with_help("make the constant a `std::input::Script`, or give the path of a file in the package as a string")
                 .with_note(INPUT_NOTE),
             );
         }
@@ -3964,7 +4018,8 @@ pub fn check_job_fields(p: &Program) -> Vec<Diagnostic> {
                         ),
                     )
                     .with_secondary(imp.span, format!("`{}` opted in here", tr.name))
-                    .with_note("a job's value holds its body's locals, and has a trait when they do (§16.3)"),
+                    .with_note("a job's value holds its body's locals, and has a trait when they do (§16.3)")
+                    .with_help(format!("remove `{}` from the type, or keep the job's locals `{}`", tr.name, tr.name)),
                 );
             }
         }
@@ -4006,6 +4061,10 @@ fn check_fieldwise_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDe
                 .with_note(format!(
                     "`{}` declares `{}`, which is derived field by field, so the field `{}` needs it too (§3)",
                     adt.name, tr.name, f.name
+                ))
+                .with_help(format!(
+                    "declare `{}` on the field's type too, keep the field out of `{}`, or remove `{}` from `{}`",
+                    tr.name, adt.name, tr.name, adt.name
                 )),
         );
     }
@@ -4106,7 +4165,8 @@ fn check_overlap(p: &Program, diags: &mut Vec<Diagnostic>) {
                             p.display_ty(b.self_ty)
                         ),
                     )
-                    .with_secondary(a.span, "the other impl"),
+                    .with_secondary(a.span, "the other impl")
+                    .with_help("remove one of the two impls; a type implements a trait once"),
                 );
             }
         }

@@ -157,7 +157,9 @@ fn res_module(p: &Program, r: Res) -> Option<ModuleId> {
 pub fn with_std_import(p: &Program, mut d: Diagnostic, name: &str, at: Span) -> Diagnostic {
     match std_home(p, name) {
         Some(home) => {
+            // The import is the fix: what was suggested for a name nothing declares isn't.
             d.fixes.clear();
+            d.help.clear();
             // L2 permits a UTF-8 BOM only at the start of a file. Keep an inserted import after
             // it, or applying the fix turns the formerly leading BOM into an invalid character.
             let start =
@@ -174,6 +176,40 @@ pub fn with_std_import(p: &Program, mut d: Diagnostic, name: &str, at: Span) -> 
     }
 }
 
+/// `d` with what fixes an unknown `name` among `candidates`: the closest as a fix ("did you
+/// mean"), or, when none is close, a help that lists them after `what` ("its variants are").
+/// With no candidates at all, `d` as it is.
+pub fn suggest_or_list<'a>(
+    d: Diagnostic,
+    name: &str,
+    at: Span,
+    candidates: impl IntoIterator<Item = &'a str>,
+    what: &str,
+) -> Diagnostic {
+    let mut all: Vec<&str> = candidates.into_iter().filter(|c| *c != name).collect();
+    all.sort_unstable();
+    all.dedup();
+    if let Some(s) = closest(name, all.iter().copied()) {
+        return d.with_fix(format!("did you mean `{s}`?"), at, s);
+    }
+    match listed(what, &all) {
+        Some(help) => d.with_help(help),
+        None => d,
+    }
+}
+
+/// `what` and then `names` in backticks, at most eight and then `…`; `None` for no names.
+pub fn listed(what: &str, names: &[&str]) -> Option<String> {
+    if names.is_empty() {
+        return None;
+    }
+    let mut shown: Vec<String> = names.iter().take(8).map(|n| format!("`{n}`")).collect();
+    if names.len() > 8 {
+        shown.push("…".into());
+    }
+    Some(format!("{what} {}", shown.join(", ")))
+}
+
 /// The closest of `candidates` to `name` by edit distance, if it's close enough to suggest.
 pub fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let limit = (name.len() / 3).max(1);
@@ -185,20 +221,32 @@ pub fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Opt
         .map(|(_, c)| c)
 }
 
+/// Optimal string alignment distance: Levenshtein's, where swapping two neighbouring characters
+/// costs one edit too, so the commonest typos (`widht`, `aera`) are one edit from the name.
 fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
     let b: Vec<char> = b.chars().collect();
-    let mut row: Vec<usize> = (0..=b.len()).collect();
-    for (i, a) in a.chars().enumerate() {
-        let mut diagonal = row[0];
-        row[0] = i + 1;
-        for (j, &b) in b.iter().enumerate() {
-            let above = row[j + 1];
-            let cost = usize::from(a != b);
-            row[j + 1] = (above + 1).min(row[j] + 1).min(diagonal + cost);
-            diagonal = above;
+    let w = b.len() + 1;
+    let mut d = vec![0usize; (a.len() + 1) * w];
+    for i in 0..=a.len() {
+        d[i * w] = i;
+    }
+    for (j, cell) in d.iter_mut().take(w).enumerate() {
+        *cell = j;
+    }
+    for i in 1..=a.len() {
+        for j in 1..=b.len() {
+            let cost = usize::from(a[i - 1] != b[j - 1]);
+            let mut best = (d[(i - 1) * w + j] + 1)
+                .min(d[i * w + j - 1] + 1)
+                .min(d[(i - 1) * w + j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                best = best.min(d[(i - 2) * w + j - 2] + 1);
+            }
+            d[i * w + j] = best;
         }
     }
-    row[b.len()]
+    d[a.len() * w + b.len()]
 }
 
 /// The std prelude's module, once std is loaded.
@@ -375,6 +423,11 @@ pub fn resolve_module_path_in(
         names.extend(package.deps.keys().cloned());
         if let Some(s) = closest(&first.name, names.iter().map(String::as_str)) {
             d = d.with_fix(format!("did you mean `{s}`?"), first.span, s);
+        } else {
+            d = d.with_help(format!(
+                "a module is a file of the package (`{0}.wrela` is `{0}`), and another package is named in `wrela.toml`'s `[dependencies]`",
+                first.name
+            ));
         }
         if segs.len() == 1 {
             d = with_std_import(p, d, &first.name, first.span);
@@ -398,7 +451,8 @@ pub fn resolve_module_path_in(
                             ),
                         )
                         .with_secondary(b.span, "declared `pub(package)` here")
-                        .with_note("only a package's `pub` items cross to the packages that depend on it (§3)");
+                        .with_note("only a package's `pub` items cross to the packages that depend on it (§3)")
+                        .with_help("make it `pub` in its package, or use a `pub` item of that package instead");
                         return PathLookup::Error(Box::new(d));
                     }
                     if !b.public && m != from {
@@ -420,19 +474,23 @@ pub fn resolve_module_path_in(
                     if !final_pass {
                         return PathLookup::NotYet(m, seg.name.clone());
                     }
-                    let mut d = Diagnostic::new(
+                    let d = Diagnostic::new(
                         codes::E0200,
                         seg.span,
                         format!("`{}` has no item `{}`", module.name(), seg.name),
                     );
-                    let names: Vec<&str> = module
+                    let names = module
                         .scope
                         .keys()
                         .map(String::as_str)
-                        .chain(module.children.keys().map(String::as_str))
-                        .collect();
-                    if let Some(s) = closest(&seg.name, names.into_iter()) {
-                        d = d.with_fix(format!("did you mean `{s}`?"), seg.span, s);
+                        .chain(module.children.keys().map(String::as_str));
+                    let mut d = suggest_or_list(d, &seg.name, seg.span, names, "its items are");
+                    if d.help.is_empty() && d.fixes.is_empty() {
+                        d = d.with_help(format!(
+                            "`{}` has nothing in it yet: declare `{}` there",
+                            module.name(),
+                            seg.name
+                        ));
                     }
                     return PathLookup::Error(Box::new(d));
                 }
@@ -441,16 +499,18 @@ pub fn resolve_module_path_in(
                 match p.adt(a).variants().iter().position(|v| v.name == seg.name) {
                     Some(i) => Res::Variant(a, i as u32),
                     None => {
-                        let mut d = Diagnostic::new(
+                        let d = Diagnostic::new(
                             codes::E0211,
                             seg.span,
                             format!("`{}` has no variant `{}`", p.adt(a).name, seg.name),
                         );
-                        if let Some(s) =
-                            closest(&seg.name, p.adt(a).variants().iter().map(|v| v.name.as_str()))
-                        {
-                            d = d.with_fix(format!("did you mean `{s}`?"), seg.span, s);
-                        }
+                        let d = suggest_or_list(
+                            d,
+                            &seg.name,
+                            seg.span,
+                            p.adt(a).variants().iter().map(|v| v.name.as_str()),
+                            "its variants are",
+                        );
                         return PathLookup::Error(Box::new(d));
                     }
                 }
@@ -493,6 +553,7 @@ pub fn lookup_or_report(
 /// E0322: `name` is written with generic arguments, and names something that takes none.
 pub(crate) fn no_generics(name: &ast::Ident) -> Diagnostic {
     Diagnostic::new(codes::E0322, name.span, format!("`{}` takes no generic arguments", name.name))
+        .with_help(format!("write `{}` without `<...>`", name.name))
 }
 
 /// E0322: `name` takes `want` generic arguments, but `given` are written.
@@ -503,6 +564,11 @@ pub(crate) fn wrong_generic_count(span: Span, name: &str, want: usize, given: us
         span,
         format!("`{name}` takes {want} generic argument{s}, not {given}"),
     )
+    .with_help(if want == 0 {
+        format!("write `{name}` without `<...>`")
+    } else {
+        format!("give `{name}` exactly {want}: `{name}<{}>`", vec!["_"; want].join(", "))
+    })
 }
 
 /// Resolves one argument for declared generic parameter `param`, enforcing whether it is a type
@@ -521,11 +587,17 @@ pub(crate) fn resolve_generic_arg(
             && let Some(g) = scope.param(&path.segments[0].ident.name)
             && p.param(g).is_const
         {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                arg.span,
-                format!("`{}` is a constant parameter, not a type", p.param(g).name),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    arg.span,
+                    format!("`{}` is a constant parameter, not a type", p.param(g).name),
+                )
+                .with_help(format!(
+                    "`{}` is a type parameter: pass a type here, such as `f32`",
+                    p.param(param).name
+                )),
+            );
             return p.types.error;
         }
         return resolve_type(p, diags, scope, arg, TyPos::Normal);
@@ -538,7 +610,10 @@ pub(crate) fn resolve_generic_arg(
             {
                 return p.types.intern(TyKind::ConstU32(v));
             }
-            diags.push(Diagnostic::new(codes::E0212, arg.span, "a const argument is a `u32`"));
+            diags.push(
+                Diagnostic::new(codes::E0212, arg.span, "a const argument is a `u32`")
+                    .with_help("pass a whole number from 0 to 4294967295"),
+            );
             return p.types.error;
         }
         ast::TypeExprKind::Path(path) => {
@@ -552,11 +627,20 @@ pub(crate) fn resolve_generic_arg(
                 if p.param(g).is_const {
                     return p.types.param(g);
                 }
-                diags.push(Diagnostic::new(
-                    codes::E0212,
-                    arg.span,
-                    format!("`{}` is a type parameter, not a constant", p.param(g).name),
-                ));
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0212,
+                        arg.span,
+                        format!("`{}` is a type parameter, not a constant", p.param(g).name),
+                    )
+                    .with_help(format!(
+                        "`{}` is `const {}: u32`: pass a number, a `u32` constant or a const parameter, or declare `{}` as `const {}: u32`",
+                        p.param(param).name,
+                        p.param(param).name,
+                        p.param(g).name,
+                        p.param(g).name
+                    )),
+                );
                 return p.types.error;
             }
             if let Some(Res::Const(c)) = resolve_value_item(p, scope.module, path) {
@@ -570,11 +654,18 @@ pub(crate) fn resolve_generic_arg(
         }
         _ => {}
     }
-    diags.push(Diagnostic::new(
-        codes::E0212,
-        arg.span,
-        "a const argument is a number, a `u32` constant or a const parameter",
-    ));
+    diags.push(
+        Diagnostic::new(
+            codes::E0212,
+            arg.span,
+            "a const argument is a number, a `u32` constant or a const parameter",
+        )
+        .with_help(format!(
+            "`{}` is `const {}: u32`, a number, not a type: pass one such as `4`",
+            p.param(param).name,
+            p.param(param).name
+        )),
+    );
     p.types.error
 }
 
@@ -680,6 +771,7 @@ pub fn resolve_trait_ref(
                 te.span,
                 format!("{} isn't a trait", describe_res(p, res)),
             )
+            .with_help("name a trait here: `wrela doc` lists them")
             .with_note("a bound or an opt-in names a trait, such as `Copy` or `Surface`"),
         );
         return None;
@@ -839,11 +931,16 @@ pub fn resolve_type(
             p.types.intern(TyKind::FnPtr(ps, r, flags))
         }
         ast::TypeExprKind::Int(_) => {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                te.span,
-                "a number is a constant generic argument, not a type",
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    te.span,
+                    "a number is a constant generic argument, not a type",
+                )
+                .with_help(
+                    "a type goes here, such as `f32`; a number is for a `const N: u32` parameter",
+                ),
+            );
             p.types.error
         }
         ast::TypeExprKind::Path(path) => resolve_type_path(p, diags, scope, te, path, pos),
@@ -893,6 +990,7 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
                         len.span,
                         format!("`{name}` can't be an array's length: an enum is one when its variants hold nothing and its discriminants are 0, 1, 2 and on"),
                     )
+.with_help("give the array a number or a `const N: u32` as its length, or make the enum's variants hold nothing")
                     .with_note("each variant's discriminant is its element's index (§4)")
                 } else {
                     Diagnostic::new(
@@ -902,6 +1000,7 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
                             "`{name}` is a struct; an array's length is a number, a constant holding one, or an enum (one element a variant)"
                         ),
                     )
+.with_help("give the array a number, a `const N: u32`, or a fieldless enum as its length")
                 };
             }
             if found.is_none() && !is_broken(p, module, name) {
@@ -909,7 +1008,10 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
                     codes::E0200,
                     len.span,
                     format!("there's no constant `{name}` here"),
-                );
+                )
+                .with_help(format!(
+                    "declare it (`const {name}: u32 = 4`), or write the number itself"
+                ));
             }
         }
         ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(_), .. }) => {
@@ -917,7 +1019,8 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
                 codes::E0325,
                 len.span,
                 format!("an array length is at most {} (a `u32`)", u32::MAX),
-            );
+            )
+            .with_help("use a `Vec` for this many elements");
         }
         _ => {}
     }
@@ -926,6 +1029,7 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
         len.span,
         "an array length is an integer constant expression with no calls",
     )
+    .with_help("write the length as a literal or a constant: `const N: u32 = 8`")
     .with_note("its value must fit a `u32`, without overflow or division by zero")
 }
 
@@ -1161,11 +1265,16 @@ fn resolve_type_path(
         }
     } else if let Some(id) = scope.param(first) {
         if p.param(id).is_const {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                segs[0].ident.span,
-                format!("`{first}` is a constant parameter, not a type"),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    segs[0].ident.span,
+                    format!("`{first}` is a constant parameter, not a type"),
+                )
+                .with_help(format!(
+                    "`{first}` is a number: use it as a length (`[f32; {first}]`) or a value, or declare a type parameter for the type"
+                )),
+            );
             return p.types.error;
         }
         Some(p.types.param(id))
@@ -1206,6 +1315,14 @@ fn resolve_type_path(
                 );
                 if let Some(s) = closest(first, names.iter().map(String::as_str)) {
                     d = d.with_fix(format!("did you mean `{s}`?"), segs[0].ident.span, s);
+                } else if lookup_name(p, scope.module, &first.to_lowercase()).is_some()
+                    || p.module(scope.module).scope.contains_key(first)
+                {
+                    d = d.with_help(format!("`{first}` is a value here; a type is a struct, an enum, a type alias or a built-in type such as `f32`"));
+                } else {
+                    d = d.with_help(format!(
+                        "declare it (`struct {first} {{ ... }}`), or import it with `use`"
+                    ));
                 }
                 let d = with_std_import(p, d, first, segs[0].ident.span);
                 diags.push(d);
@@ -1243,11 +1360,17 @@ fn resolve_type_path(
                     && let Some(Res::Fn(f)) = resolve_value_item(p, scope.module, path) =>
             {
                 if p.func(f).attrs.job.is_none() {
-                    diags.push(Diagnostic::new(
-                        codes::E0336,
-                        a.span,
-                        format!("`{}` isn't a job: `Job<F>` takes a `@job fn`", p.func(f).name),
-                    ));
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E0336,
+                            a.span,
+                            format!("`{}` isn't a job: `Job<F>` takes a `@job fn`", p.func(f).name),
+                        )
+                        .with_help(format!(
+                            "mark it `@job` (`@job fn {}(...)`), or call it directly",
+                            p.func(f).name
+                        )),
+                    );
                     return p.types.error;
                 }
                 // A generic job's types: `Job<realize<Coat, Fawn>>`.
@@ -1365,11 +1488,22 @@ fn resolve_type_path(
             })
         }
         other => {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                te.span,
-                format!("{} isn't a type", describe_res(p, other)),
-            ));
+            let help = match other {
+                Res::BuiltinFn(f) => format!(
+                    "a type is a scalar, a vector, a struct or an enum here; `{0}` is a function, called as `{0}(x)`",
+                    f.name()
+                ),
+                _ => "name a struct, an enum, a type alias or a built-in type such as `f32` here"
+                    .into(),
+            };
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    te.span,
+                    format!("{} isn't a type", describe_res(p, other)),
+                )
+                .with_help(help),
+            );
             p.types.error
         }
     }
@@ -1442,7 +1576,8 @@ fn projection(
                 codes::E0408,
                 name.span,
                 format!("`{}` has no associated type `{}`", p.display_ty(base), name.name),
-            ));
+            )
+            .with_help("name an associated type that a bound of it declares (`T::Box` with `T: Domain`), or declare it in the trait: `type Name`"));
             p.types.error
         }
         _ => {
@@ -1454,7 +1589,7 @@ fn projection(
                     name.name,
                     p.display_ty(base)
                 ),
-            ));
+            ).with_help(format!("rename it in one of the traits, or bound `{}` by only the trait whose `{}` this is", p.display_ty(base), name.name)));
             p.types.error
         }
     }
@@ -1584,6 +1719,9 @@ mod tests {
                     rows[i][j] = (rows[i - 1][j] + 1)
                         .min(rows[i][j - 1] + 1)
                         .min(rows[i - 1][j - 1] + usize::from(a[i - 1] != b[j - 1]));
+                    if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                        rows[i][j] = rows[i][j].min(rows[i - 2][j - 2] + 1);
+                    }
                 }
             }
             rows[a.len()][b.len()]
@@ -1599,5 +1737,12 @@ mod tests {
         assert_eq!(closest("cat", ["cut", "bat", "cat"].into_iter()), Some("bat"));
         assert_eq!(closest("αβ", ["αa", "αβ"].into_iter()), Some("αa"));
         assert_eq!(closest("cat", ["different"].into_iter()), None);
+        // A swap of two neighbours is one edit, so short names' transpositions are suggested.
+        assert_eq!(edit_distance("ab", "ba"), 1);
+        assert_eq!(closest("widht", ["width", "height"].into_iter()), Some("width"));
+        assert_eq!(closest("aera", ["area", "perimeter"].into_iter()), Some("area"));
+        assert_eq!(closest("lenght", ["length"].into_iter()), Some("length"));
+        assert_eq!(closest("x", ["y"].into_iter()), Some("y"));
+        assert_eq!(closest("xyz", ["abc"].into_iter()), None);
     }
 }

@@ -1,0 +1,8 @@
+use main::clear
+
+@test
+fn grade_clear() {
+    assert(clear(1.2), "a ball whose bottom is at 0.2 is clear of the box below 0")
+    assert(clear(3.0))
+    assert(!clear(0.5), "a ball whose bottom is at -0.5 isn't")
+}

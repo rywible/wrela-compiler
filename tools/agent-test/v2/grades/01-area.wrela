@@ -1,0 +1,14 @@
+use main::circle_area
+
+@test
+fn grade_circle_area() {
+    assert(
+        abs(circle_area(1.0) - 3.1415927) < 0.001,
+        f"`circle_area(1.0)` is {circle_area(1.0)}, not 3.1415927",
+    )
+    assert(
+        abs(circle_area(2.0) - 12.566371) < 0.004,
+        f"`circle_area(2.0)` is {circle_area(2.0)}, not 12.566371",
+    )
+    assert(circle_area(0.0) == 0.0)
+}

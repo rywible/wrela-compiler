@@ -73,6 +73,9 @@ pub struct PipelineSummary {
     pub names: Vec<String>,
     /// Where CPU code dispatches or draws it, as `file:line:column`.
     pub sites: Vec<String>,
+    /// For each site, whether it runs only under a runtime condition of its function
+    /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
+    pub conditional: Vec<bool>,
 }
 
 impl Output {
@@ -361,16 +364,24 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 }
 
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
-/// it, so a reader sees the old file or the whole new one.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+/// it, so a reader sees the old file or the whole new one. A file that was there keeps its
+/// permissions.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // A temporary file of this write's own: several threads may write one file at once.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()));
-    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let was = std::fs::metadata(path).ok().map(|m| m.permissions());
+    std::fs::write(&tmp, bytes)
+        .and_then(|()| match was {
+            Some(perms) => std::fs::set_permissions(&tmp, perms),
+            None => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 /// A new, empty directory of this process's own in the system's temporary directory, named
@@ -504,6 +515,28 @@ pub fn builtins() -> Vec<(&'static str, usize, bool)> {
         .collect()
 }
 
+/// The built-in functions a value of type `ty` takes as a method (`x.sqrt()`), by sema's own
+/// rules: each one's name and how many arguments it takes, the others of the receiver's type.
+/// `ty` is `f32`, `u32`, `vec3`, `vec3u` or `[f32]`; any other gives none.
+pub fn builtin_methods(ty: &str) -> Vec<(&'static str, usize)> {
+    use wrela_sema::builtins::BuiltinFn;
+    use wrela_sema::ty::{TyKind, VecElem};
+    let p = wrela_sema::Program::default();
+    let t = match ty {
+        "f32" => p.types.f32,
+        "u32" => p.types.u32,
+        "vec3" => p.types.vec3,
+        "vec3u" => p.types.intern(TyKind::Vec(VecElem::U32, 3)),
+        "[f32]" => p.types.intern(TyKind::Slice(p.types.f32)),
+        _ => return Vec::new(),
+    };
+    BuiltinFn::ALL
+        .iter()
+        .filter(|b| b.is_method() && b.arity() >= 1 && b.result(&p, &vec![t; b.arity()]).is_ok())
+        .map(|b| (b.name(), b.arity()))
+        .collect()
+}
+
 /// What running a package's tests found (`wrela test`, §13).
 #[derive(Debug)]
 pub struct TestOutput {
@@ -597,7 +630,7 @@ fn run_tests_in(
     stop()?;
     let (sources, mut diagnostics, loaded) = load_scoped(root, &Overlay::new(), scope);
     let Some(Loaded { units, packages, dirs, .. }) = loaded else {
-        split_std_warnings(&sources, &mut diagnostics);
+        finish_diagnostics(&sources, &mut diagnostics);
         return Ok(TestOutput { sources, diagnostics, results: Vec::new(), filtered_out: 0 });
     };
     // std's own tests memory-check its bodies, which other programs leave out.
@@ -687,7 +720,7 @@ fn run_tests_in(
         }
     }
     sort_and_dedup(&mut diagnostics);
-    split_std_warnings(&sources, &mut diagnostics);
+    finish_diagnostics(&sources, &mut diagnostics);
     Ok(TestOutput { sources, diagnostics, results, filtered_out })
 }
 
@@ -754,7 +787,7 @@ fn compile_loaded_in(
 ) -> Result<Output, String> {
     scope.stop()?;
     let Some(Loaded { units, mut packages, dirs, files: all_files, .. }) = loaded else {
-        let std_warnings = split_std_warnings(&sources, &mut diagnostics);
+        let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
         return Ok(Output {
             sources,
             diagnostics,
@@ -857,7 +890,7 @@ fn compile_loaded_in(
     if has_errors(&diagnostics) {
         files.clear();
     }
-    let std_warnings = split_std_warnings(&sources, &mut diagnostics);
+    let std_warnings = finish_diagnostics(&sources, &mut diagnostics);
     Ok(Output {
         sources,
         diagnostics,
@@ -919,8 +952,11 @@ fn prepare(
     stats
 }
 
-/// Takes the warnings in std's own code out of `diags`, and returns them.
-fn split_std_warnings(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<Diagnostic> {
+/// Readies `diags` to leave the driver: each gets a next step if it has none
+/// (`Diagnostic::with_next_step`), and the warnings in std's own code are taken out and
+/// returned.
+fn finish_diagnostics(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<Diagnostic> {
+    *diags = std::mem::take(diags).into_iter().map(Diagnostic::with_next_step).collect();
     let in_std = |d: &Diagnostic| {
         !d.is_error() && d.span().is_some_and(|s| sources.file(s.file).name.starts_with("<std::"))
     };
@@ -928,6 +964,34 @@ fn split_std_warnings(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<D
         std::mem::take(diags).into_iter().partition(in_std);
     *diags = rest;
     std
+}
+
+/// Each dispatch and draw of the program, by its statement's span, and whether it runs only
+/// under a runtime condition of its function.
+fn conditional_commands(checked: &wrela_sema::Checked) -> std::collections::HashMap<Span, bool> {
+    use wrela_sema::mir::{Rvalue, StatementKind};
+    let command = |k: &StatementKind| {
+        matches!(
+            k,
+            StatementKind::Assign(_, Rvalue::Dispatch(_) | Rvalue::Draw(_))
+                | StatementKind::Eval(Rvalue::Dispatch(_) | Rvalue::Draw(_))
+        )
+    };
+    let mut out = std::collections::HashMap::new();
+    for body in checked.mir.values() {
+        for f in &body.fns {
+            if !f.blocks.iter().any(|b| b.stmts.iter().any(|s| command(&s.kind))) {
+                continue;
+            }
+            let under = wrela_sema::mir::control::under_condition(f);
+            for (i, b) in f.blocks.iter().enumerate() {
+                for s in b.stmts.iter().filter(|s| command(&s.kind)) {
+                    out.insert(s.span, under[i]);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// What the pipeline-count query reports of each pipeline (§18.9).
@@ -945,6 +1009,16 @@ fn summarize(
             let args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
             (format!("{name}::<{}>", args.join(", ")), name)
         }
+    };
+    let commands = conditional_commands(checked);
+    // A site is the span lowering recorded: the command's statement, or inside it.
+    let conditional = |s: &Span| {
+        commands.get(s).copied().unwrap_or_else(|| {
+            commands
+                .iter()
+                .find(|(k, _)| k.file == s.file && k.start <= s.start && s.end <= k.end)
+                .is_some_and(|(_, &c)| c)
+        })
     };
     lowered
         .pipelines
@@ -964,6 +1038,7 @@ fn summarize(
                 entries: parts.iter().map(|(e, _)| e.clone()).collect(),
                 names: parts.into_iter().map(|(_, n)| n).collect(),
                 sites,
+                conditional: out.sites.iter().map(conditional).collect(),
             }
         })
         .collect()

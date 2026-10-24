@@ -4,7 +4,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "read it outside, and pass the value in as data (a tick's records, or the state)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
@@ -28,7 +30,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "read it outside, and pass the value in as data (a tick's records, or the state)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
@@ -52,7 +56,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "read it outside, and pass the value in as data (a tick's records, or the state)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
@@ -76,7 +82,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "read it outside, and pass the value in as data (a tick's records, or the state)"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

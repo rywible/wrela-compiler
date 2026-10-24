@@ -17,9 +17,13 @@ impl<'p> Checker<'p> {
         let in_job = self.fn_id.is_some_and(|f| self.p.func(f).attrs.job.is_some());
         if !in_job || !self.closure_stack.is_empty() {
             let what = if in_job { "a closure in a job" } else { "a function that isn't a job" };
-            self.err(Diagnostic::new(codes::E0335, span, format!("`yield` in {what}")).with_note(
-                "`yield` ends a `@job fn`'s work for this frame, in its own body (§16.3)",
-            ));
+            self.err(
+                Diagnostic::new(codes::E0335, span, format!("`yield` in {what}"))
+                    .with_help("make the function a `@job fn`, or return instead")
+                    .with_note(
+                        "`yield` ends a `@job fn`'s work for this frame, in its own body (§16.3)",
+                    ),
+            );
             return self.error_expr(span);
         }
         Expr { ty: self.p.types.unit, span, kind: ExprKind::Yield }
@@ -154,7 +158,7 @@ pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
         };
         if let Some(why) = why {
             out.push(
-                Diagnostic::new(codes::E0336, at, format!("`{}` can't be a job: {why}", def.name))
+                Diagnostic::new(codes::E0336, at, format!("`{}` can't be a job: {why}", def.name)).with_help("a job is a free `@job fn` whose result is owned: make it one, or call this code from one")
                     .with_secondary(def.sig_span, "declared here"),
             );
         }

@@ -1,0 +1,12 @@
+use std::derive::Box3
+use std::field::{Surface, certify_clear, sphere}
+
+/// Whether `certify_clear` proves, at depth 5, that a unit sphere centred at (0, `height`, 0)
+/// has nothing inside the box from (-2, -1, -2) to (2, 0, 2).
+pub fn clear(height: f32) -> bool {
+    let ball = sphere(radius: 1.0).translate(vec3(0.0, height, 0.0))
+    let region = Box3 { lo: vec3(-2.0, -1.0, -2.0), hi: vec3(2.0, 0.0, 2.0) }
+    certify_clear(ball, region, depth: 5).holds()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

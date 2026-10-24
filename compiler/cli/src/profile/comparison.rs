@@ -104,7 +104,7 @@ pub(super) fn compatible_hardware(before: &Value, after: &Value) -> Result<(), S
 }
 
 /// Hash the manifest, WASM, shaders and packaged files, with their names and lengths.
-pub(super) fn build_hash(dir: &Path) -> Result<String, String> {
+pub(crate) fn build_hash(dir: &Path) -> Result<String, String> {
     let manifest = std::fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?;
     let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;

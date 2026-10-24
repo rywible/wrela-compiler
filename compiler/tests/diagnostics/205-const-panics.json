@@ -4,7 +4,9 @@
       "code": "E0704",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "fix what failed in the code the constant runs, or compute the value at load instead"
+      ],
       "internal": false,
       "label": null,
       "labels": [

@@ -4,7 +4,9 @@
       "code": "E0101",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "add the `}` that closes the block before it"
+      ],
       "internal": false,
       "label": null,
       "labels": [

@@ -438,3 +438,171 @@ pub fn frame(time: f32, width: u32, height: u32) {}
         w[0].message
     );
 }
+
+/// W0010: a copy that nothing changes, of a place nothing changes, is a borrow's job; a copy
+/// that's changed, moved, returned, or taken while its source changes (or is replaced) isn't
+/// reported, and neither is a `Copy` value's.
+#[test]
+fn a_copy_only_read_is_reported() {
+    let src = "pub struct F {
+    pub hs: Vec<f32>,
+    pub n: u32,
+}
+
+fn read(f: F) -> f32 {
+    let hs = f.hs.clone()
+    hs[0]
+}
+
+fn changes_the_copy(f: F) -> f32 {
+    var hs = f.hs.clone()
+    hs.push(1.0)
+    hs[0]
+}
+
+fn changes_the_source(f: mut F) -> f32 {
+    let hs = f.hs.clone()
+    f.hs.push(1.0)
+    hs[0]
+}
+
+fn returns_it(f: F) -> Vec<f32> {
+    let hs = f.hs.clone()
+    take hs
+}
+
+fn copies_a_number(f: F) -> u32 {
+    let n = f.n.clone()
+    n
+}
+
+fn replaces_the_source() -> f32 {
+    var hs = Vec::from([1.0])
+    let first = hs.clone()
+    hs = Vec::from([2.0])
+    first[0] + hs[0]
+}
+
+fn replaces_a_parameter(hs: mut Vec<f32>) -> f32 {
+    let first = hs.clone()
+    hs = Vec::from([2.0])
+    first[0]
+}
+
+fn _uses() -> f32 {
+    var f = F { hs: Vec::from([1.0]), n: 1 }
+    let a = read(f) + changes_the_copy(f) + changes_the_source(mut f)
+    let b = returns_it(f)
+    a + b[0] + f32(copies_a_number(f)) + replaces_the_source() + replaces_a_parameter(mut f.hs)
+}";
+    let w = warnings("copy-read", src);
+    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0010").map(|(_, l)| *l).collect();
+    assert_eq!(lines, [7], "{w:?}");
+}
+
+/// W0011: a test of code that reaches no `assert` and no panic passes whatever it computes; one
+/// that asserts, or that reaches a panic through what it calls, isn't reported.
+#[test]
+fn a_test_that_cant_fail_is_reported() {
+    let src = "fn double(x: f32) -> f32 {
+    x * 2.0
+}
+
+fn checked(x: f32) -> f32 {
+    assert(x > 0.0, \"positive\")
+    x
+}
+
+@test
+fn computes_only() {
+    let _y = double(2.0)
+}
+
+@test
+fn asserts() {
+    assert(double(2.0) == 4.0)
+}
+
+@test
+fn reaches_a_panic() {
+    let _y = checked(1.0)
+}";
+    let w = warnings("test-cant-fail", src);
+    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0011").map(|(_, l)| *l).collect();
+    assert_eq!(lines, [11], "{w:?}");
+}
+
+/// W0012: a request's handle polled in the call that made it is `None` every time; one kept in
+/// the state and polled in a later frame isn't reported, nor is a local given that one.
+#[test]
+fn a_request_polled_at_once_is_reported() {
+    let src = "use std::io::{Pending, load}
+
+pub struct Game {
+    size: u32,
+    save: Pending<u8>,
+    queue: Vec<Pending<u8>>,
+}
+
+pub fn init() -> Game {
+    var now = load(\"a.bin\")
+    var size = 0
+    if let Some(Ok(b)) = now.poll() {
+        size = b.len()
+    }
+    Game { size, save: load(\"b.bin\"), queue: Vec::new() }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if let Some(Ok(b)) = game.save.poll() {
+        game.size = b.len()
+    }
+    var r = load(\"c.bin\")
+    r = std::collections::replace(mut game.save, take r)
+    if let Some(Ok(b)) = r.poll() {
+        game.size = b.len()
+    }
+    if game.queue.len() > 0 {
+        var q = game.queue.remove(0)
+        if let Some(Ok(b)) = q.poll() {
+            game.size = b.len()
+        }
+    }
+}";
+    let w = warnings("polled-at-once", src);
+    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0012").map(|(_, l)| *l).collect();
+    assert_eq!(lines, [12], "{w:?}");
+}
+
+/// W0013: a counted `while` over a run that only indexes it is a `for` loop; one whose index
+/// means more (it's kept, it leaves early, the body changes what holds the run) isn't reported.
+#[test]
+fn a_counted_while_over_a_run_is_reported() {
+    let src = "fn total(xs: [f32]) -> f32 {
+    var sum = 0.0
+    var i = 0
+    while i < xs.len() {
+        sum += xs[i]
+        i += 1
+    }
+    sum
+}
+
+fn first_negative(xs: [f32]) -> u32 {
+    var i = 0
+    while i < xs.len() {
+        if xs[i] < 0.0 {
+            break
+        }
+        i += 1
+    }
+    i
+}
+
+fn _uses() -> f32 {
+    total([1.0]) + f32(first_negative([1.0]))
+}";
+    let w = warnings("counted-while", src);
+    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0013").map(|(_, l)| *l).collect();
+    assert_eq!(lines, [4], "{w:?}");
+}

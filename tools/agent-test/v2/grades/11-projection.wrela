@@ -1,0 +1,6 @@
+use main::bump_fourth
+
+@test
+fn grade_bump_fourth() {
+    assert(bump_fourth() == 1.0, f"`bump_fourth()` is {bump_fourth()}")
+}

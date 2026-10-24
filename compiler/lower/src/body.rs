@@ -2364,7 +2364,11 @@ impl<'c, 'a> Fl<'c, 'a> {
                 role.name()
             ),
         )
-        .with_note(ROLE_ENTRIES);
+        .with_note(ROLE_ENTRIES)
+        .with_help(format!(
+            "call it only from {} code, or move what both builds need into a function with no role",
+            only.name()
+        ));
         self.cx.err(crate::gpu::with_call_chain(self, d));
     }
 
@@ -2730,7 +2734,7 @@ fn span_read_on_cpu(span: Span, note: &str) -> Diagnostic {
         codes::E0607,
         span,
         "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
-    )
+    ).with_help("read it in a kernel or a shader, or read the buffer back with `std::gpu::read`, answered on a later frame (§17)")
     .with_note(note)
 }
 

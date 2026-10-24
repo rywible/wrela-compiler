@@ -17,12 +17,19 @@
 //! leave a program that compiles. `WRELA_BLESS=1` rewrites the goldens. Where in std a label
 //! or note points (its line, column and offsets) isn't compared: std's lines move whenever std
 //! is edited, and which std file it names still is.
+//!
+//! Every error a case gives carries a next step of its own: a help or a fix. The general help
+//! that the driver adds where a site gives none (`Diagnostic::with_next_step`, which points at
+//! `wrela explain`) doesn't count: a mistake curated here is one agents make, so its error says
+//! what to do.
 
 use crate::package;
 use wrela_tests::{apply_fixes, cases, files_under, header, par_map, repo_root};
 
 struct Outcome {
     codes: Vec<String>,
+    /// The errors with no next step of their own: each as its code and message.
+    bare: Vec<String>,
     json: String,
     text: String,
     fixed: Option<String>,
@@ -68,6 +75,11 @@ fn compile(name: &str, text: &str, dir: Option<&std::path::Path>) -> Outcome {
     let fixed = main.map(|id| apply_fixes(text, id, &errors));
     Outcome {
         codes: errors.iter().map(|d| d.code.as_str().to_string()).collect(),
+        bare: errors
+            .iter()
+            .filter(|d| d.has_only_general_help())
+            .map(|d| format!("{}: {}", d.code.as_str(), d.message))
+            .collect(),
         json: wrela_diag::json::to_json_string(&built.sources, &errors),
         text: wrela_diag::render::render_all(&built.sources, &errors),
         fixed: fixed.filter(|f| f != text),
@@ -101,6 +113,9 @@ fn diagnostics_meet_the_bar() {
         let mut problems = Vec::new();
         if out.codes != expect {
             problems.push(format!("codes {:?}, expected {expect:?}", out.codes));
+        }
+        for b in &out.bare {
+            problems.push(format!("no help or fix of its own: {b}"));
         }
         let golden =
             if path.is_dir() { path.join("expected.json") } else { path.with_extension("json") };

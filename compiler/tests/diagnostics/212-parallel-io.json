@@ -4,7 +4,9 @@
       "code": "E0600",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "do the IO outside it, and pass what it read in as data"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

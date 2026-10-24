@@ -169,7 +169,7 @@ fn derive(
     no_gpu_work(&orig.body)?;
     let exit = single_exit(m, &orig);
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
-    let (func, result, act) = match exit {
+    let (mut func, result, mut act) = match exit {
         None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
         Some((func, result)) => {
             let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
@@ -178,6 +178,19 @@ fn derive(
             (func, result, act)
         }
     };
+    // A loop that leaves early on the input runs its own count instead, with flags
+    // (`exits.rs`); what's left is a loop whose own count depends on the input.
+    if act.active_loop_exit.is_some()
+        && let Some(flagged) = super::exits::flag_exits(&func, &mut m.types, &|v| act.value(v))
+    {
+        let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
+            effect(m, cache, g, mk, Mode::Interval)
+        });
+        if again.active_loop_exit.is_none() {
+            func = flagged;
+            act = again;
+        }
+    }
     if let Some(at) = act.active_loop_exit {
         return Err(Error::ActiveLoopExit(
             "a loop exits here depending on the input; an interval needs loops that run the \
@@ -971,16 +984,21 @@ impl<'a> Ivx<'a> {
         let comp = |me: &mut Self, out: &mut Block, w: ValueId, c: u32| {
             if n == 1 { w } else { me.emit(out, f32t, Expr::Extract(w, c)) }
         };
-        // Each component's floors at its ends, and whether they're one integer apart.
+        // Each component's floors at its ends; the one and two integers above the low one; and
+        // whether the range crosses one or two integers (it's split), and two.
         let mut fl = Vec::new();
         for c in 0..n {
             let (l, h) = (comp(self, out, xl, c), comp(self, out, xh, c));
             let fl_lo = self.builtin(out, Builtin::Floor, vec![l], f32t);
             let fl_hi = self.builtin(out, Builtin::Floor, vec![h], f32t);
             let one = self.fc(out, f32t, 1.0);
+            let two_f = self.fc(out, f32t, 2.0);
             let next = self.bin(out, BinOp::Add, fl_lo, one, f32t);
-            let two = self.cmp(out, BinOp::Eq, fl_hi, next);
-            fl.push((fl_lo, fl_hi, next, two));
+            let after = self.bin(out, BinOp::Add, fl_lo, two_f, f32t);
+            let crosses_one = self.cmp(out, BinOp::Eq, fl_hi, next);
+            let crosses_two = self.cmp(out, BinOp::Eq, fl_hi, after);
+            let split = self.bin(out, BinOp::Or, crosses_one, crosses_two, bt);
+            fl.push((fl_lo, fl_hi, next, after, split, crosses_two));
         }
         let mut roots = Vec::new();
         self.written(rest, &mut roots);
@@ -1017,24 +1035,36 @@ impl<'a> Ivx<'a> {
         };
         let mut body = Vec::new();
         let i = self.emit(&mut body, u32t, Expr::Load(Place::local(case)));
-        let cases = self.emit(&mut body, u32t, Expr::Const(Const::U32(1 << n)));
+        let cases = self.emit(&mut body, u32t, Expr::Const(Const::U32(3u32.pow(n))));
         let done = self.cmp(&mut body, BinOp::Eq, i, cases);
         body.push(Stmt::If { cond: done, then: vec![Stmt::Break], else_: Vec::new() });
-        // This case's floor: per component, its low integer (bit 0) or the next one (bit 1);
-        // where the component isn't split, its whole range, and bit 1 doesn't hold.
+        // This case's floor: per component, the case's digit in base 3 says which integer: the
+        // low one (0), the next (1) or the one after (2). Where the component isn't split, digit 0
+        // is its whole range and the others don't hold; where it crosses one integer, digit 2
+        // doesn't hold.
         let (mut los, mut his) = (Vec::new(), Vec::new());
         let mut holds = self.emit(&mut body, bt, Expr::Const(Const::Bool(true)));
-        let one_u = self.emit(&mut body, u32t, Expr::Const(Const::U32(1)));
-        for (c, &(fl_lo, fl_hi, next, two)) in fl.iter().enumerate() {
-            let cc = self.emit(&mut body, u32t, Expr::Const(Const::U32(c as u32)));
-            let shifted = self.emit(&mut body, u32t, Expr::Binary(BinOp::Shr, i, cc));
-            let b = self.emit(&mut body, u32t, Expr::Binary(BinOp::BitAnd, shifted, one_u));
-            let bit = self.cmp(&mut body, BinOp::Eq, b, one_u);
-            let whole = self.select(&mut body, two, fl_lo, fl_hi);
-            los.push(self.select(&mut body, bit, next, fl_lo));
-            his.push(self.select(&mut body, bit, next, whole));
-            let nb = self.not(&mut body, bit);
-            let ok = self.bin(&mut body, BinOp::Or, nb, two, bt);
+        let (zero_u, one_u, two_u, three_u) = (
+            self.emit(&mut body, u32t, Expr::Const(Const::U32(0))),
+            self.emit(&mut body, u32t, Expr::Const(Const::U32(1))),
+            self.emit(&mut body, u32t, Expr::Const(Const::U32(2))),
+            self.emit(&mut body, u32t, Expr::Const(Const::U32(3))),
+        );
+        for (c, &(fl_lo, fl_hi, next, after, split, crosses_two)) in fl.iter().enumerate() {
+            let place = self.emit(&mut body, u32t, Expr::Const(Const::U32(3u32.pow(c as u32))));
+            let shifted = self.emit(&mut body, u32t, Expr::Binary(BinOp::Div, i, place));
+            let d = self.emit(&mut body, u32t, Expr::Binary(BinOp::Rem, shifted, three_u));
+            let is0 = self.cmp(&mut body, BinOp::Eq, d, zero_u);
+            let is1 = self.cmp(&mut body, BinOp::Eq, d, one_u);
+            let is2 = self.cmp(&mut body, BinOp::Eq, d, two_u);
+            let whole = self.select(&mut body, split, fl_lo, fl_hi);
+            let upper = self.select(&mut body, is2, after, next);
+            los.push(self.select(&mut body, is0, fl_lo, upper));
+            his.push(self.select(&mut body, is0, whole, upper));
+            let two_ok = self.bin(&mut body, BinOp::And, is2, crosses_two, bt);
+            let one_or_two = self.bin(&mut body, BinOp::Or, is1, two_ok, bt);
+            let split_ok = self.bin(&mut body, BinOp::And, split, one_or_two, bt);
+            let ok = self.bin(&mut body, BinOp::Or, is0, split_ok, bt);
             holds = self.bin(&mut body, BinOp::And, holds, ok, bt);
         }
         let floor = if n == 1 {

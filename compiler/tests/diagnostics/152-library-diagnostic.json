@@ -4,7 +4,9 @@
       "code": "E0400",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "pass a value of a type that implements `SimState`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

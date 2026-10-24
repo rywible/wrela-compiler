@@ -33,6 +33,8 @@ use wrela_host::{GpuTiming, Host, Options, Timing};
 
 mod comparison;
 
+pub(crate) use comparison::build_hash;
+
 struct Args {
     dir: PathBuf,
     frames: u32,

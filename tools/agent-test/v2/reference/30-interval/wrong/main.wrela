@@ -1,0 +1,5 @@
+pub fn bound(lo: f32, hi: f32) -> vec2 {
+    vec2(-100.0, 100.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

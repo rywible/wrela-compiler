@@ -42,6 +42,32 @@ pub struct Box3: Copy + GpuData {
 }
 
 impl Box2 {
+    /// Its centre.
+    pub fn center(self) -> vec2 {
+        0.5 * (self.lo + self.hi)
+    }
+
+    /// Half its size along each axis.
+    pub fn half(self) -> vec2 {
+        0.5 * (self.hi - self.lo)
+    }
+
+    /// Whether `p` is in it, its edges included.
+    pub fn contains(self, p: vec2) -> bool {
+        self.lo.x <= p.x && p.x <= self.hi.x && self.lo.y <= p.y && p.y <= self.hi.y
+    }
+
+    /// Its four quarters, halved along each axis: lower x and y first, then x before y.
+    pub fn split(self) -> [Box2; 4] {
+        let h = self.half()
+        var out = [self; 4]
+        for j in 0..4 {
+            let o = vec2(f32(j & 1), f32((j >> 1) & 1)) * h
+            out[j] = Box2 { lo: self.lo + o, hi: self.lo + o + h }
+        }
+        out
+    }
+
     /// Point `i` of a sequence that spreads evenly through the box: `seed` chooses the sequence
     /// (`Interval::sample`).
     pub fn sample(self, seed: u32, i: u32) -> vec2 {
@@ -54,6 +80,38 @@ impl Box2 {
 }
 
 impl Box3 {
+    /// Its centre.
+    pub fn center(self) -> vec3 {
+        0.5 * (self.lo + self.hi)
+    }
+
+    /// Half its size along each axis.
+    pub fn half(self) -> vec3 {
+        0.5 * (self.hi - self.lo)
+    }
+
+    /// Whether `p` is in it, its faces included.
+    pub fn contains(self, p: vec3) -> bool {
+        self.lo.x <= p.x &&
+            p.x <= self.hi.x &&
+            self.lo.y <= p.y &&
+            p.y <= self.hi.y &&
+            self.lo.z <= p.z &&
+            p.z <= self.hi.z
+    }
+
+    /// Its eight octants, halved along each axis: octant `j` is above the centre along x where
+    /// bit 0 of `j` is set, along y where bit 1 is, and along z where bit 2 is.
+    pub fn split(self) -> [Box3; 8] {
+        let h = self.half()
+        var out = [self; 8]
+        for j in 0..8 {
+            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
+            out[j] = Box3 { lo: self.lo + o, hi: self.lo + o + h }
+        }
+        out
+    }
+
     /// Point `i` of a sequence that spreads evenly through the box: `seed` chooses the sequence
     /// (`Interval::sample`). For checking a field at many points:
     ///
@@ -382,4 +440,26 @@ fn filtered_builtins_are_their_footprints_average() {
     near(filtered(sign_of, at: 0.25, width: 1.0), 0.5, "sign beside 0")
     let step_of = |u: f32| step(0.0, u)
     near(filtered(step_of, at: 0.25, width: 1.0), 0.75, "step beside 0")
+}
+
+@test
+fn a_box_splits_into_what_it_holds() {
+    let b = Box3 { lo: vec3(-1.0, 0.0, 2.0), hi: vec3(1.0, 4.0, 3.0) }
+    assert(b.center() == vec3(0.0, 2.0, 2.5))
+    assert(b.half() == vec3(1.0, 2.0, 0.5))
+    assert(b.contains(b.lo) && b.contains(b.hi) && b.contains(b.center()))
+    assert(!b.contains(vec3(1.5, 2.0, 2.5)))
+    var volume = 0.0
+    for o in b.split() {
+        assert(b.contains(o.lo) && b.contains(o.hi))
+        let s = o.hi - o.lo
+        volume += s.x * s.y * s.z
+    }
+    assert(volume == 8.0, f"the octants' volumes add to {volume}")
+    let last = b.split()[7]
+    assert(last.lo == b.center() && last.hi == b.hi)
+    let q = Box2 { lo: vec2(0.0), hi: vec2(2.0, 4.0) }
+    assert(q.center() == vec2(1.0, 2.0) && q.half() == vec2(1.0, 2.0))
+    assert(q.split()[3].lo == q.center() && q.split()[0].hi == q.center())
+    assert(q.contains(vec2(2.0, 4.0)) && !q.contains(vec2(-0.1, 0.0)))
 }

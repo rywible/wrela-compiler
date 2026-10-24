@@ -16,7 +16,7 @@ pub fn tool() -> u32 {
     if given.len() == 0 {
         return 64
     }
-    let name = given[0].clone()
+    borrow name = given[0]
     let Ok(bytes) = files::read(f"in/{name.as_str()}").wait() else { return 91 }
     if files::write(f"out/copy/{name.as_str()}", bytes).wait().is_err() {
         return 93

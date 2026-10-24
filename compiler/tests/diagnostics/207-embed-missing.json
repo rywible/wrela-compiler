@@ -4,7 +4,9 @@
       "code": "E0218",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "put the file inside the package, or correct the path"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

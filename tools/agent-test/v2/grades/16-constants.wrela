@@ -1,0 +1,18 @@
+use main::{WEIGHTS, smooth}
+
+@test
+fn grade_smooth() {
+    assert(
+        abs(smooth(1.0, 1.0, 1.0, 1.0, 1.0) - 1.0) < 0.0001,
+        f"`smooth(1.0, 1.0, 1.0, 1.0, 1.0)` is {smooth(1.0, 1.0, 1.0, 1.0, 1.0)}, not 1.0",
+    )
+    assert(
+        abs(smooth(0.0, 0.0, 1.0, 0.0, 0.0) - 0.4) < 0.0001,
+        f"`smooth(0.0, 0.0, 1.0, 0.0, 0.0)` is {smooth(0.0, 0.0, 1.0, 0.0, 0.0)}, not 0.4",
+    )
+    assert(
+        abs(smooth(1.0, 0.0, 0.0, 0.0, 0.0) - 0.1) < 0.0001,
+        f"`smooth(1.0, 0.0, 0.0, 0.0, 0.0)` is {smooth(1.0, 0.0, 0.0, 0.0, 0.0)}, not 0.1",
+    )
+    assert(WEIGHTS[2] == 0.4)
+}

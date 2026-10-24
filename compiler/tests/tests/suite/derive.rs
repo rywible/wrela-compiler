@@ -13,7 +13,7 @@ use wrela_host::{CpuBuild, CpuHost, Host, Value};
 use wrela_tests::{Rng, one_f32, one_u32, par_each, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
-const NAMES: [&str; 24] = [
+const NAMES: [&str; 25] = [
     "sphere",
     "ellipsoid",
     "round cone",
@@ -38,6 +38,7 @@ const NAMES: [&str; 24] = [
     "table",
     "hyperbolic",
     "powers",
+    "march",
 ];
 /// Bounded boxes per function on the GPU (a whole number of 64-thread workgroups).
 const BOXES: u32 = 1024;
@@ -229,4 +230,82 @@ fn the_interval_of_a_vector_is_its_components_on_the_gpu() {
     let out = *host.buffers().last().expect("a buffer");
     let same = u32s(&host.read_buffer(out).expect("read"));
     assert_eq!(same.iter().filter(|&&s| s == 1).count(), n as usize);
+}
+
+/// The tightness ratchet: on the enclosure test's boxes, each corpus function's interval is no
+/// looser than recorded in compiler/tests/fields/tightness.json. `ratio` is the median, over
+/// the boxes, of the interval's width over the spread of the 16 sampled values (1 is as tight
+/// as sampling shows), and `decided` the share of boxes whose interval excludes 0. A ratio that
+/// grows by more than 5%, or a share that falls by more than 0.01, fails; `WRELA_BLESS=1`
+/// records the numbers as they are (after a change that makes them better, say so).
+#[test]
+fn intervals_stay_as_tight_as_recorded() {
+    let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
+    let boxes = 512;
+    let path = wrela_tests::repo_root().join("compiler/tests/fields/tightness.json");
+    let measured: Mutex<Vec<(usize, f64, f64)>> = Mutex::new(Vec::new());
+    let fis: Vec<usize> = (0..NAMES.len()).collect();
+    par_each(
+        &fis,
+        || corpus.start().expect("start the corpus"),
+        |host, &fi| {
+            let mut ratios = Vec::with_capacity(boxes);
+            let mut decided = 0.0;
+            for i in 0..boxes {
+                let args = [Value::I32(fi as i32), Value::I32(7), Value::I32(i as i32)];
+                let out = host.call_export("tightness_cpu", &args).expect("tightness_cpu");
+                let (Value::F32(r), Value::F32(d)) = (out[0], out[1]) else { panic!("{out:?}") };
+                ratios.push(if r.is_nan() { f64::INFINITY } else { f64::from(r) });
+                decided += f64::from(d);
+            }
+            ratios.sort_by(f64::total_cmp);
+            let median = ratios[boxes / 2];
+            measured.lock().unwrap().push((fi, median, decided / boxes as f64));
+        },
+    );
+    let mut measured = measured.into_inner().unwrap();
+    measured.sort_by_key(|m| m.0);
+    let now: serde_json::Map<String, serde_json::Value> = measured
+        .iter()
+        .map(|&(fi, ratio, decided)| {
+            let round = |x: f64| if x.is_finite() { (x * 1e4).round() / 1e4 } else { 1e30 };
+            (
+                NAMES[fi].to_string(),
+                serde_json::json!({ "ratio": round(ratio), "decided": round(decided) }),
+            )
+        })
+        .collect();
+    let report: Vec<String> = now
+        .iter()
+        .map(|(n, v)| format!("  {n:>13}: ratio {}, decided {}", v["ratio"], v["decided"]))
+        .collect();
+    println!("interval tightness on {boxes} boxes:\n{}", report.join("\n"));
+    if std::env::var_os("WRELA_BLESS").is_some() {
+        let text = serde_json::to_string_pretty(&serde_json::Value::Object(now)).unwrap() + "\n";
+        std::fs::write(&path, text).expect("bless tightness.json");
+        return;
+    }
+    let recorded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("tightness.json; bless it"))
+            .expect("JSON");
+    let mut worse_than = Vec::new();
+    for (name, v) in &now {
+        let Some(was) = recorded.get(name) else {
+            worse_than.push(format!("{name}: not recorded; bless with WRELA_BLESS=1"));
+            continue;
+        };
+        let (r, d) = (v["ratio"].as_f64().unwrap(), v["decided"].as_f64().unwrap());
+        let (r0, d0) = (was["ratio"].as_f64().unwrap(), was["decided"].as_f64().unwrap());
+        if r > r0 * 1.05 + 1e-9 {
+            worse_than.push(format!("{name}: ratio {r}, recorded {r0}"));
+        }
+        if d < d0 - 0.01 {
+            worse_than.push(format!("{name}: decided {d}, recorded {d0}"));
+        }
+    }
+    assert!(
+        worse_than.is_empty(),
+        "intervals are looser than recorded:\n{}",
+        worse_than.join("\n")
+    );
 }

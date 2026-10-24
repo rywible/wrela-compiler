@@ -317,7 +317,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                         (k, _) => {
                             other = true;
                             errors.push(
-                            Diagnostic::new(codes::E0219, kspan, format!("a dependency has a `path` or `workspace = true`, not `{k}`"))
+                            Diagnostic::new(codes::E0219, kspan, format!("a dependency has a `path` or `workspace = true`, not `{k}`")).with_help(format!("write `name = {{ path = \"../name\" }}`, or `name = {{ workspace = true }}` in a workspace; remove `{k}`"))
                                 .with_note("dependencies are local packages; versions and registries come later (#31)"),
                             )
                         }
@@ -416,6 +416,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
             ("", _, _) => errors.push(bad(at, content.len(), "a key outside a section".into())
                 .with_help("put it under `[package]`, `[dependencies]` or `[workspace]`")),
             (sec, key, _) => errors.push(bad(at, content.len(), format!("`{key}` isn't a key of `[{sec}]`, or its value has the wrong type"))
+                .with_help(format!("remove `{key}`, or give it the type that note says"))
                 .with_note(match sec {
                     "package" => "`[package]` has `name = \"...\"` and `unsafe = true`",
                     "dependencies" => "`[dependencies]` has `name = { path = \"...\" }` and `name = { workspace = true }`",

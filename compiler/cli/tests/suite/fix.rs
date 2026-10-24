@@ -269,3 +269,21 @@ fn fix_reports_a_file_it_cant_write() {
     let main = read(&dir.join("main.wrela"));
     assert!(main.contains("print(f\"a {time}\")") && !main.contains("\n\n\n"), "{main}");
 }
+
+/// A file fixed keeps its permissions: it's written through a temporary file renamed over it.
+#[cfg(unix)]
+#[test]
+fn a_fixed_file_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = package(
+        "fix-permissions",
+        "pub fn frame(time: f32, width: u32, height: u32) {\n    println!(\"a {}\", time)\n}\n",
+    );
+    let main = dir.join("main.wrela");
+    std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    assert_eq!(code, Some(0), "{report}");
+    assert!(read(&main).contains("print(f\"a {time}\")"), "{report}");
+    let mode = std::fs::metadata(&main).expect("metadata").permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+}

@@ -10,6 +10,7 @@ pub mod effects;
 pub mod fieldwise;
 pub mod gpu;
 mod graph;
+pub mod lints;
 pub mod mir;
 pub mod program;
 pub mod resolve;
@@ -276,6 +277,7 @@ fn check(
                 if memory_check(f) {
                     diags.extend(borrowck::check(p, &m));
                 }
+                diags.extend(lints::lint_fn(p, f, &m));
                 mir.insert(f, m);
             }
         }

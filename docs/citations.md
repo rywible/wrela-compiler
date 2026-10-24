@@ -13,7 +13,7 @@ model makes anything here.
 | Tool | Rights | How and why we use it |
 |---|---|---|
 | [Claude Code](https://claude.com/claude-code) (Anthropic), mostly Claude Opus 5.5 | Service | Writes the code, tests and docs, and researches sources |
-| Claude Sonnet 5.5 subagents | Service | The agent syntax test (`tools/agent-test`): fresh agents write small programs from the spec alone, to measure how learnable the language is |
+| Claude Sonnet 5.5, through the Claude CLI (`claude -p`) | Service | The agent syntax test (`tools/agent-test`; version 2 in `tools/agent-test/v2`): fresh agents write programs from the spec alone, each attempt graded by hidden tests, to measure how learnable the language is |
 | [OpenAI Codex](https://openai.com/codex/) (GPT-6, GPT-6.1) | Service | Reviews performance and security, and implements fixes with their regression tests |
 | GPT-6.1-Sol and GPT-6-Astra (OpenAI) | Service | Read-only reviewers in a council on a plan or a pull request; they do not edit |
 | [Binaryen](https://github.com/WebAssembly/binaryen) `wasm-opt` 133 | Apache-2.0 | Shrinks a released build's WASM (`wrela build --optimize`, `-Oz`) and keeps its trap locations as a source map. A release ships it with its licence, checked against a pinned SHA-256 (`tools/package.py`). It runs at build time; nothing of it ships in a game |

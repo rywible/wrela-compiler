@@ -4,7 +4,9 @@
       "code": "E0217",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "write the spec in that form, or drop it: `{x}`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

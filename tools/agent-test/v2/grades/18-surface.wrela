@@ -1,0 +1,31 @@
+use main::dist
+use std::field::{Surface, sphere}
+
+struct Block: Copy + GpuData {
+    half: vec3,
+}
+
+impl Surface for Block {
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        length(max(q, vec3(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0)
+    }
+}
+
+@test
+fn grade_dist() {
+    let want = Block { half: vec3(0.5, 0.3, 0.2) }
+        .smooth_union(sphere(radius: 0.4).translate(vec3(0.5, 0.0, 0.0)), k: 0.05)
+    let points = [
+        vec3(0.0),
+        vec3(1.0, 1.0, 1.0),
+        vec3(-1.0, 0.5, 0.3),
+        vec3(0.9, 0.0, 0.0),
+        vec3(-0.6, -0.4, 0.3),
+    ]
+    for p in points {
+        let got = dist(p.x, p.y, p.z)
+        let w = want.distance(p)
+        assert(abs(got - w) < 0.0001, f"at {p.x}, {p.y}, {p.z}: {got}, not {w}")
+    }
+}

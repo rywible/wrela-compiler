@@ -4,7 +4,9 @@
       "code": "E0103",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "put the operator at the end of the line before, where the expression it continues ends"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

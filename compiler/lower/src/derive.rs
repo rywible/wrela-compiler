@@ -232,7 +232,9 @@ pub(crate) fn build_next(cx: &mut Cx, mb: &mut ModuleBuilder) {
             )
         };
         cx.err(match at {
-            Some(at) => Diagnostic::new(codes::E0700, at, msg),
+            Some(at) => Diagnostic::new(codes::E0700, at, msg).with_help(format!(
+                "compute {what} outside the function and pass it in as a value it captures"
+            )),
             None => Diagnostic::internal(msg),
         });
     }
@@ -439,7 +441,11 @@ fn build(
                 }
                 _ => Diagnostic::new(code, call, format!("can't derive this function: {e}")),
             };
-            cx.err(d);
+            cx.err(d.with_help(if code == codes::E0701 {
+                "make the loop run a fixed count: `for _ in 0..n { ... }`, leaving it early with `break`"
+            } else {
+                "move what can't be derived out of the function, and pass its result in as a value the function captures"
+            }));
         }
     }
 }

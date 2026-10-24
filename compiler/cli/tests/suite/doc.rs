@@ -83,6 +83,32 @@ fn builtins_are_listed() {
     assert!(ok && page.starts_with("mix: a built-in function of 3 arguments"), "{page}");
 }
 
+/// The built-in types have pages: each is its spec section, with the built-in functions that
+/// take it as a method and std's impls of it; another name of one finds its page.
+#[test]
+fn builtin_types_are_documented() {
+    let (ok, vec3, _) = doc(&["vec3"]);
+    assert!(ok && vec3.starts_with("builtins::vec3 (type"), "{vec3}");
+    for part in ["vec3(x, y, z)", "v.zyx", "x.normalize()", "language.md §4.2", "implements:"] {
+        assert!(vec3.contains(part), "{part:?} isn't on vec3's page:\n{vec3}");
+    }
+    let (ok, run, _) = doc(&["[T]"]);
+    assert!(ok && run.contains("x.len()") && run.contains("pub fn is_empty(self)"), "{run}");
+    let (ok, again, _) = doc(&["run"]);
+    assert!(ok && again == run, "`run` is `[T]`'s page:\n{again}");
+    let (ok, array, _) = doc(&["[T; N]"]);
+    assert!(ok && array.contains("[x; N]"), "{array}");
+    let (ok, ints, _) = doc(&["u8"]);
+    assert!(ok && ints.starts_with("builtins::u32") && ints.contains("x.count_ones()"), "{ints}");
+    assert!(!ints.contains("x.sqrt()"), "an integer has no `sqrt`:\n{ints}");
+    let (ok, f, _) = doc(&["f32"]);
+    assert!(ok && f.contains("x.sqrt()"), "{f}");
+    let (ok, text, _) = doc(&["str"]);
+    assert!(ok && text.contains("parse_f32"), "std's `impl str` is on its page:\n{text}");
+    let (ok, list, _) = doc(&["builtins"]);
+    assert!(ok && list.contains("the built-in types") && list.contains("[T; N]"), "{list}");
+}
+
 /// The packages a package depends on are read: their items are found under the dependency's
 /// name, and a struct's page shows its fields with their doc comments.
 #[test]
@@ -175,6 +201,24 @@ fn the_export_writes_pages_an_index_and_a_map() {
     );
     // std is there too, and the spec's prose is found by words only it has.
     assert!(index["items"].as_array().unwrap().iter().any(|i| i["path"] == "std::arena::Arena"));
+    // So are the built-in types, on the built-ins' page with the built-in functions.
+    let vec3 = index["items"].as_array().unwrap().iter().find(|i| i["path"] == "builtins::vec3");
+    let vec3 = vec3.expect("the built-in types are indexed");
+    assert_eq!(
+        (&vec3["page"], &vec3["source"]),
+        (&"std/builtins.md".into(), &"spec/language.md".into())
+    );
+    let builtins = std::fs::read_to_string(root.join("out/std/builtins.md")).expect("built-ins");
+    assert!(builtins.starts_with("# Built-in types and functions\n"), "{builtins}");
+    for part in [
+        "## vec3\n",
+        "## [T]\n",
+        "### [T]::is_empty\n",
+        "## Built-in functions",
+        "`clamp(x, y, z)`",
+    ] {
+        assert!(builtins.contains(part), "{part:?} isn't on the built-ins' page");
+    }
     let sections = index["sections"].as_array().expect("sections");
     let found = sections
         .iter()

@@ -4,7 +4,9 @@
       "code": "E0400",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "declare it where `Snap` is declared, and it's derived from the fields: `struct Snap: Plain { ... }`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

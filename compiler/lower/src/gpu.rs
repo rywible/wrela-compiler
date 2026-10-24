@@ -965,7 +965,7 @@ fn draw_target(
             codes::E0603,
             span,
             format!("this draw's pass can't take it: {why}"),
-        ));
+        ).with_help("draw it in a pass whose target takes what its fragment shader returns, or change what the shader returns to the pass's format"));
         return None;
     }
     Some(target)
@@ -1612,6 +1612,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
             user_span(fl, span),
             "a texture's texels are read in GPU code, and this is CPU code",
         )
+        .with_help("read it in a shader, or keep the CPU's own copy of what it writes")
         .with_note("CPU code can write a texture and pass it to shaders, but not read it");
         fl.cx.err(with_call_chain(fl, d));
         return None;
@@ -1692,6 +1693,7 @@ pub(crate) fn check_derivative(fl: &mut Fl, v: Option<ir::ValueId>, span: Span) 
             format!("derivatives exist only in fragment shaders, and this is {ctx}"),
         )
         .with_note("`dpdx`, `dpdy` and `fwidth` compare neighbouring pixels")
+        .with_help("call it in a `@fragment` function, or pass the footprint in as a value (`std::derive::filtered` takes one)")
     });
 }
 

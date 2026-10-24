@@ -39,7 +39,7 @@ fn script_of(root: &Path, name: &str, lang: Lang) -> ScriptOutput {
         let (sources, mut diagnostics, loaded) = load(root);
         let Some(loaded) = loaded else {
             let script = Err("the package couldn't be read".into());
-            crate::split_std_warnings(&sources, &mut diagnostics);
+            crate::finish_diagnostics(&sources, &mut diagnostics);
             return ScriptOutput { sources, diagnostics, script };
         };
         let checked = wrela_sema::check_packages(loaded.units, &loaded.packages, &mut diagnostics);
@@ -62,7 +62,7 @@ fn script_of(root: &Path, name: &str, lang: Lang) -> ScriptOutput {
                 errors(&diagnostics)?;
                 json_of(&checked, &data, c).ok_or_else(|| format!("`{name}` has no computed value"))
             });
-        crate::split_std_warnings(&sources, &mut diagnostics);
+        crate::finish_diagnostics(&sources, &mut diagnostics);
         ScriptOutput { sources, diagnostics, script }
     })
 }

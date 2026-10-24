@@ -27,7 +27,9 @@
       "code": "E0100",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "put `,` or `)` here"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

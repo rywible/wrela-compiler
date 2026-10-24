@@ -134,6 +134,8 @@ struct FnState {
     cur: BlockId,
     /// Enclosing loops' `Loop` blocks, innermost last.
     loops: Vec<BlockId>,
+    /// The blocks that end in a loop's own test ([`FnBody::loop_tests`]).
+    loop_tests: Vec<BlockId>,
     /// The scopes that own values to drop, innermost last.
     scopes: Vec<Scope>,
     ret_mode: RetMode,
@@ -152,6 +154,7 @@ impl FnState {
             blocks: Vec::new(),
             cur: BlockId(0),
             loops: Vec::new(),
+            loop_tests: Vec::new(),
             scopes: Vec::new(),
             ret_mode,
             closure,
@@ -228,6 +231,7 @@ impl<'a> Builder<'a> {
             blocks: std::mem::take(&mut self.fs.blocks),
             ret_mode,
             span,
+            loop_tests: std::mem::take(&mut self.fs.loop_tests),
         }
     }
 
@@ -762,8 +766,12 @@ impl<'a> Builder<'a> {
             // parameter that borrows may be what was meant: the author's choice.
             if traits::implements_builtin(self.p, ty, Lang::Clone) {
                 d.with_choice("copy it: `.clone()`", span.shrink_to_end(), ".clone()")
-            } else {
+            } else if arena.is_some() {
                 d
+            } else if indexed {
+                d.with_help("`std::collections::replace(mut xs[i], value)` takes an element out and leaves another in its place")
+            } else {
+                d.with_help("use it where it is, as a `borrow` or `mut` argument; only a value this code owns moves")
             }
         };
         self.diags.push(d);
@@ -2264,9 +2272,10 @@ impl<'a> Builder<'a> {
         self.fs.cur = exit;
     }
 
-    /// `if cond { break }`.
+    /// `if cond { break }`: a loop's own test.
     fn break_if(&mut self, cond: Operand, lp: BlockId, span: Span) {
         let (t, e, m) = (self.new_block(), self.new_block(), self.new_block());
+        self.fs.loop_tests.push(self.fs.cur);
         self.terminate(TerminatorKind::If { cond, then: t, else_: e, merge: m }, span);
         self.fs.cur = t;
         self.terminate(TerminatorKind::Break(lp), span);

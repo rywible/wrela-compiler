@@ -4,7 +4,9 @@
       "code": "E0222",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "write `@test`, `@test(frames: 60)` or `@test(ticks: 60)`, with only the options that note lists for that kind"
+      ],
       "internal": false,
       "label": null,
       "labels": [],

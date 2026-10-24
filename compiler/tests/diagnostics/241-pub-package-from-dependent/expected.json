@@ -4,7 +4,9 @@
       "code": "E0203",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "make it `pub` in its package, or use a `pub` item of that package instead"
+      ],
       "internal": false,
       "label": null,
       "labels": [

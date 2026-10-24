@@ -4,7 +4,9 @@
       "code": "E0204",
       "file": "main.wrela",
       "fixes": [],
-      "help": [],
+      "help": [
+        "remove it; the attributes are `@compute`, `@vertex`, `@fragment`, `@gpu`, `@deterministic`, `@audio`, `@test`, `@testing`, `@job`, `@client`, `@server`, `@tool`, `@fuel`, `@fieldwise` and `@unsafe_call`"
+      ],
       "internal": false,
       "label": null,
       "labels": [],
