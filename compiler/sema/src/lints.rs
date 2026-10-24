@@ -9,7 +9,7 @@ use crate::mir::{Arg, Body, Callee, Local, LocalKind, OperandKind, Place, Rvalue
 use crate::program::Program;
 use crate::thir;
 use crate::ty::{FnId, TyKind};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use wrela_diag::{Diagnostic, Span, codes};
 use wrela_syntax::ast::{self, AssignOp, BinOp, ExprKind, StmtKind};
 
@@ -49,13 +49,18 @@ fn is_poll(p: &Program, f: FnId) -> bool {
 /// W0012: `let r = load(path)` then `r.poll()` in the same call. The host answers a request no
 /// sooner than the next call (§17.1), so that poll is `None` every time, and code that waits for
 /// its answer never runs. The handle belongs in the state, polled on a later frame or tick.
+///
+/// Only a local whose every value is a request made here is reported: one given another handle
+/// (`r = old`), lent `mut` to anything but its poll, or written through a projection, may hold
+/// a request made earlier.
 fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
     // What each projection local aliases, and which temporaries hold a call's result.
     let mut alias: HashMap<Local, Place> = HashMap::new();
     let mut from_call: Vec<Local> = Vec::new();
-    // The `let` locals given a request's handle made here, with where they're bound.
+    // Each `let` or `var` of a handle: where it's first given a request made here, and whether
+    // anything else could have given it its value.
     let mut made: HashMap<Local, Span> = HashMap::new();
-    let mut out = Vec::new();
+    let mut other = HashSet::new();
     let root = |alias: &HashMap<Local, Place>, mut l: Local| {
         for _ in 0..16 {
             match alias.get(&l) {
@@ -65,65 +70,94 @@ fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
         }
         l
     };
+    let handle = |x: Local| is_pending(p, body.local(x).ty) && is_user_owned(body, x);
+    // The poll a call is, and its receiver's local.
+    let polled =
+        |alias: &HashMap<Local, Place>, c: &crate::mir::Call| match (&c.callee, c.args.first()) {
+            (Callee::Fn { func, .. }, Some(Arg::Mut(recv, _) | Arg::Borrow(recv, _)))
+                if is_poll(p, *func) =>
+            {
+                Some(root(alias, recv.local))
+            }
+            _ => None,
+        };
+    // A request std makes (`load`, a buffer's `fetch`): a call of std's given no handle, so it
+    // can't give back one made earlier (`replace(mut r, old)` can); not one of the program's,
+    // which may give back one it kept.
+    let makes_request = |c: &crate::mir::Call| {
+        let gets_one = c.args.iter().any(|a| {
+            let ty = match a {
+                Arg::Borrow(pl, _) | Arg::Mut(pl, _) => crate::mir::place_ty(p, &body.locals, pl),
+                Arg::Take(o) => o.ty,
+            };
+            is_pending(p, ty)
+        });
+        matches!(&c.callee, Callee::Fn { func, .. } if p.is_std(p.func(*func).module)) && !gets_one
+    };
+    let mut polls = Vec::new();
     for f in &body.fns {
         for b in &f.blocks {
             for s in &b.stmts {
+                let call = match &s.kind {
+                    StatementKind::Assign(_, Rvalue::Call(c))
+                    | StatementKind::Eval(Rvalue::Call(c)) => Some(c),
+                    _ => None,
+                };
+                if let Some(c) = call {
+                    let poll = polled(&alias, c);
+                    if let Some(r) = poll {
+                        polls.push((r, c.span));
+                    }
+                    for a in &c.args {
+                        if let Arg::Mut(pl, _) = a
+                            && poll != Some(root(&alias, pl.local))
+                        {
+                            other.insert(root(&alias, pl.local));
+                        }
+                    }
+                }
                 match &s.kind {
                     StatementKind::Bind { local, place, .. } => {
                         alias.insert(*local, place.clone());
                     }
+                    // Through a `mut` projection: what it aliases is given another value.
+                    StatementKind::Assign(place, _) if alias.contains_key(&place.local) => {
+                        other.insert(root(&alias, place.local));
+                    }
                     StatementKind::Assign(place, r) if place.proj.is_empty() => {
                         let x = place.local;
-                        match r {
-                            Rvalue::Call(c) => {
-                                if let Callee::Fn { func, .. } = &c.callee
-                                    && is_poll(p, *func)
-                                    && let Some(Arg::Mut(recv, _) | Arg::Borrow(recv, _)) =
-                                        c.args.first()
-                                    && let Some(&at) = made.get(&root(&alias, recv.local))
-                                {
-                                    out.push(poll_warning(
-                                        p,
-                                        body,
-                                        root(&alias, recv.local),
-                                        at,
-                                        c.span,
-                                    ));
-                                }
-                                if is_pending(p, body.local(x).ty) && is_user_owned(body, x) {
-                                    made.insert(x, s.span);
-                                }
+                        let fresh = match r {
+                            Rvalue::Call(c) if makes_request(c) => {
                                 from_call.push(x);
+                                true
                             }
-                            Rvalue::Use(o) => {
-                                // A `Pending` is `Copy`: its value comes through a copy.
-                                if let OperandKind::Move(tmp, _) | OperandKind::Copy(tmp) = &o.kind
-                                    && tmp.proj.is_empty()
-                                    && from_call.contains(&tmp.local)
-                                    && is_pending(p, body.local(x).ty)
-                                    && is_user_owned(body, x)
-                                {
-                                    made.insert(x, s.span);
-                                }
+                            // A `Pending` is `Copy`: its value comes through a copy.
+                            Rvalue::Use(o) => matches!(&o.kind,
+                                OperandKind::Move(tmp, _) | OperandKind::Copy(tmp)
+                                    if tmp.proj.is_empty() && from_call.contains(&tmp.local)),
+                            _ => false,
+                        };
+                        if handle(x) {
+                            if fresh {
+                                made.entry(x).or_insert(s.span);
+                            } else {
+                                other.insert(x);
                             }
-                            _ => {}
                         }
                     }
-                    StatementKind::Eval(Rvalue::Call(c)) => {
-                        if let Callee::Fn { func, .. } = &c.callee
-                            && is_poll(p, *func)
-                            && let Some(Arg::Mut(recv, _) | Arg::Borrow(recv, _)) = c.args.first()
-                            && let Some(&at) = made.get(&root(&alias, recv.local))
-                        {
-                            out.push(poll_warning(p, body, root(&alias, recv.local), at, c.span));
-                        }
+                    StatementKind::Assign(place, _) => {
+                        other.insert(root(&alias, place.local));
                     }
                     _ => {}
                 }
             }
         }
     }
-    out
+    polls
+        .into_iter()
+        .filter(|(r, _)| !other.contains(r))
+        .filter_map(|(r, at)| made.get(&r).map(|&m| poll_warning(p, body, r, m, at)))
+        .collect()
 }
 
 /// Whether `x` is a `let` or `var` of the source that owns its value.

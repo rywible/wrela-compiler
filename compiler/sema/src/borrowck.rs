@@ -2437,6 +2437,7 @@ fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
             || assigned[x.index()] > 1
             || touched[x.index()]
             || touched[src.local.index()]
+            || assigned[src.local.index()] > 1
             || !named(src.local)
             || crate::traits::implements_builtin(p, d.ty, Lang::Copy)
         {

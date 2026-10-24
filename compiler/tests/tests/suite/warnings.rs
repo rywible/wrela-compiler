@@ -440,8 +440,8 @@ pub fn frame(time: f32, width: u32, height: u32) {}
 }
 
 /// W0010: a copy that nothing changes, of a place nothing changes, is a borrow's job; a copy
-/// that's changed, moved, returned, or taken while its source changes isn't reported, and
-/// neither is a `Copy` value's.
+/// that's changed, moved, returned, or taken while its source changes (or is replaced) isn't
+/// reported, and neither is a `Copy` value's.
 #[test]
 fn a_copy_only_read_is_reported() {
     let src = "pub struct F {
@@ -476,11 +476,18 @@ fn copies_a_number(f: F) -> u32 {
     n
 }
 
+fn replaces_the_source() -> f32 {
+    var hs = Vec::from([1.0])
+    let first = hs.clone()
+    hs = Vec::from([2.0])
+    first[0] + hs[0]
+}
+
 fn _uses() -> f32 {
     var f = F { hs: Vec::from([1.0]), n: 1 }
     let a = read(f) + changes_the_copy(f) + changes_the_source(mut f)
     let b = returns_it(f)
-    a + b[0] + f32(copies_a_number(f))
+    a + b[0] + f32(copies_a_number(f)) + replaces_the_source()
 }";
     let w = warnings("copy-read", src);
     let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0010").map(|(_, l)| *l).collect();
@@ -520,7 +527,7 @@ fn reaches_a_panic() {
 }
 
 /// W0012: a request's handle polled in the call that made it is `None` every time; one kept in
-/// the state and polled in a later frame isn't reported.
+/// the state and polled in a later frame isn't reported, nor is a local given that one.
 #[test]
 fn a_request_polled_at_once_is_reported() {
     let src = "use std::io::{Pending, load}
@@ -541,6 +548,11 @@ pub fn init() -> Game {
 
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     if let Some(Ok(b)) = game.save.poll() {
+        game.size = b.len()
+    }
+    var r = load(\"c.bin\")
+    r = std::collections::replace(mut game.save, take r)
+    if let Some(Ok(b)) = r.poll() {
         game.size = b.len()
     }
 }";
