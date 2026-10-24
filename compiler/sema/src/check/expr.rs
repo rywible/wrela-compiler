@@ -150,7 +150,7 @@ impl<'p> Checker<'p> {
                             codes::E0300,
                             span,
                             format!("this array is `[_; {n}]`, and {} elements are written before its fill", xs.len()),
-                        ).with_help(format!("write at most {} elements before `..fill`, or make the array longer", n.saturating_sub(1))));
+                        ).with_help(format!("write at most {n} elements before `..fill`, or make the array longer")));
                         xs.len() as u32
                     }
                     None => {

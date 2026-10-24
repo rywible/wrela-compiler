@@ -272,16 +272,11 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
         // Each parameter used exactly once, in the parameter order.
         let mut uses: Vec<Vec<Span>> = vec![Vec::new(); def.params.len()];
         let mut numbers = false;
-        // The other names the body uses (a path's first): each must name the same where it's
-        // inlined.
-        let mut names = BTreeSet::new();
         tail.walk(&mut |x| {
             if let Some(n) = name_of(x)
                 && let Some(i) = def.params.iter().position(|q| q.name == n)
             {
                 uses[i].push(x.span);
-            } else if let ExprKind::Path(path) = &x.kind {
-                names.insert(path.segments[0].ident.name.clone());
             }
             if let ExprKind::Lit(l) = &x.kind {
                 numbers |=
@@ -317,6 +312,26 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
             None
         };
         let body_text = p.text(tail.span).unwrap_or_default();
+        // The other names the body uses, each must name the same where it's inlined: every name
+        // that starts a path, a struct literal's or a type's too, read off the tokens so none is
+        // missed. Not a field or a method (after `.`), a path's later part (after `::`), or a
+        // label (before `:`).
+        let tokens: Vec<_> = crate::edit::lex(body_text).collect();
+        let mut names = BTreeSet::new();
+        for (i, t) in tokens.iter().enumerate() {
+            use wrela_syntax::token::TokenKind as K;
+            let after = |k: K| i > 0 && tokens[i - 1].kind == k;
+            if t.kind == K::Ident
+                && !after(K::Dot)
+                && !after(K::ColonColon)
+                && tokens.get(i + 1).is_none_or(|n| n.kind != K::Colon)
+            {
+                let n = &body_text[t.span.range()];
+                if !def.params.iter().any(|q| q.name == n) {
+                    names.insert(n.to_string());
+                }
+            }
+        }
         let mut edits = Vec::new();
         for call in calls {
             if call.args.len() != def.params.len() {

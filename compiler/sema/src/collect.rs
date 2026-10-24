@@ -1735,7 +1735,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     self.diags.push(
                         Diagnostic::new(codes::E0407, span, msg)
                             .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)")
-                            .with_help("give each field a `Bits<N>` type, N from 1 to 32 and 32 bits in all, with no default; or don't declare `Packed`"),
+                            .with_help("give each field a `Bits<N>` type, N from 1 to 32 and at most 32 bits in all, with no default; or don't declare `Packed`"),
                     );
                 }
                 continue;

@@ -2442,7 +2442,13 @@ fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
             || assigned[x.index()] > 1
             || touched[x.index()]
             || touched[src.local.index()]
-            || assigned[src.local.index()] > 1
+            // Given another value after the copy: a parameter starts with one, a `let` or `var`
+            // gets its first.
+            || assigned[src.local.index()]
+                > u32::from(!matches!(
+                    body.local(src.local).kind,
+                    LocalKind::User(thir::LocalKind::Param(_))
+                ))
             || !named(src.local)
             || crate::traits::implements_builtin(p, d.ty, Lang::Copy)
         {

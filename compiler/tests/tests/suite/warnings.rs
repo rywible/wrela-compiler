@@ -483,11 +483,17 @@ fn replaces_the_source() -> f32 {
     first[0] + hs[0]
 }
 
+fn replaces_a_parameter(hs: mut Vec<f32>) -> f32 {
+    let first = hs.clone()
+    hs = Vec::from([2.0])
+    first[0]
+}
+
 fn _uses() -> f32 {
     var f = F { hs: Vec::from([1.0]), n: 1 }
     let a = read(f) + changes_the_copy(f) + changes_the_source(mut f)
     let b = returns_it(f)
-    a + b[0] + f32(copies_a_number(f)) + replaces_the_source()
+    a + b[0] + f32(copies_a_number(f)) + replaces_the_source() + replaces_a_parameter(mut f.hs)
 }";
     let w = warnings("copy-read", src);
     let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0010").map(|(_, l)| *l).collect();
@@ -535,6 +541,7 @@ fn a_request_polled_at_once_is_reported() {
 pub struct Game {
     size: u32,
     save: Pending<u8>,
+    queue: Vec<Pending<u8>>,
 }
 
 pub fn init() -> Game {
@@ -543,7 +550,7 @@ pub fn init() -> Game {
     if let Some(Ok(b)) = now.poll() {
         size = b.len()
     }
-    Game { size, save: load(\"b.bin\") }
+    Game { size, save: load(\"b.bin\"), queue: Vec::new() }
 }
 
 pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
@@ -555,10 +562,16 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     if let Some(Ok(b)) = r.poll() {
         game.size = b.len()
     }
+    if game.queue.len() > 0 {
+        var q = game.queue.remove(0)
+        if let Some(Ok(b)) = q.poll() {
+            game.size = b.len()
+        }
+    }
 }";
     let w = warnings("polled-at-once", src);
     let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0012").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [11], "{w:?}");
+    assert_eq!(lines, [12], "{w:?}");
 }
 
 /// W0013: a counted `while` over a run that only indexes it is a `for` loop; one whose index

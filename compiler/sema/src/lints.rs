@@ -81,18 +81,16 @@ fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
             }
             _ => None,
         };
-    // A request std makes (`load`, a buffer's `fetch`): a call of std's given no handle, so it
-    // can't give back one made earlier (`replace(mut r, old)` can); not one of the program's,
-    // which may give back one it kept.
-    let makes_request = |c: &crate::mir::Call| {
-        let gets_one = c.args.iter().any(|a| {
-            let ty = match a {
-                Arg::Borrow(pl, _) | Arg::Mut(pl, _) => crate::mir::place_ty(p, &body.locals, pl),
-                Arg::Take(o) => o.ty,
-            };
-            is_pending(p, ty)
-        });
-        matches!(&c.callee, Callee::Fn { func, .. } if p.is_std(p.func(*func).module)) && !gets_one
+    // A request std makes (`load`, `std::gpu::read`): a function of std's declared to return a
+    // `Pending`, which makes one. Not one declared to return a `T` that's a `Pending` here
+    // (`replace`, `remove`, `unwrap`), which gives back one made earlier; nor one of the
+    // program's, which may give back one it kept.
+    let makes_request = |c: &crate::mir::Call| match &c.callee {
+        Callee::Fn { func, .. } => {
+            let d = p.func(*func);
+            p.is_std(d.module) && is_pending(p, d.ret)
+        }
+        _ => false,
     };
     let mut polls = Vec::new();
     for f in &body.fns {

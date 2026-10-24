@@ -1318,10 +1318,19 @@ pub(crate) fn adt_bounds(p: &Program, ty: TyId, span: Span, out: &mut Vec<Diagno
                     "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
                     param.name, adt.name
                 );
-                let help = format!(
-                    "use a type that implements `{tr}` for `{}`, or implement it: `impl {tr} for {t}`",
-                    param.name
-                );
+                // A structural trait is declared where the type is, not implemented (§3).
+                let help = if p.trait_(r.trait_).lang.is_some_and(crate::defs::Lang::is_structural)
+                {
+                    format!(
+                        "use a type that is `{tr}` for `{}`, or declare `{t}` `{tr}` where it's declared (`struct S: {tr}`)",
+                        param.name
+                    )
+                } else {
+                    format!(
+                        "use a type that implements `{tr}` for `{}`, or implement it: `impl {tr} for {t}`",
+                        param.name
+                    )
+                };
                 out.push(match p.custom_message(arg, &r) {
                     Some(msg) => {
                         Diagnostic::new(codes::E0400, span, msg).with_note(default).with_help(help)

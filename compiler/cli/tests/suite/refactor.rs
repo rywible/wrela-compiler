@@ -322,9 +322,18 @@ fn an_inlined_body_names_what_it_named_in_its_function() {
             ("wrela.toml", &common::manifest("shapes")),
             (
                 "main.wrela",
-                "use util::shift
+                "use util::{made, shift}
 
 const K: f32 = 2.0
+
+struct S {
+    x: f32,
+}
+
+fn rebuilt() -> f32 {
+    let one: f32 = 1.0
+    made(one) + S { x: 1.0 }.x
+}
 
 pub fn frame(time: f32, width: u32, height: u32) {}
 
@@ -351,12 +360,13 @@ fn grown() -> f32 {
 fn values_hold() {
     assert(shifted() == 4.0)
     assert(grown() == 13.0)
+    assert(rebuilt() == 2.0)
 }
 ",
             ),
             (
                 "util.wrela",
-                "pub const K: f32 = 1.0\n\npub(package) fn shift(x: f32) -> f32 {\n    x + K\n}\n",
+                "pub const K: f32 = 1.0\n\npub(package) fn shift(x: f32) -> f32 {\n    x + K\n}\n\npub struct S {\n    pub x: f32,\n}\n\npub(package) fn made(x: f32) -> f32 {\n    S { x: x }.x\n}\n",
             ),
         ],
     );
@@ -366,6 +376,9 @@ fn values_hold() {
     let r = plan(&dir, &["inline", "shift", "--json"]);
     assert!(r["refused"].as_str().is_some_and(|w| w.contains("names something else")), "{r}");
     // `unit` in `grow` is the function; where it's called, `unit` is a local closure.
+    // `S` in `made`'s struct literal is util's; where it's called, main's.
+    let r = plan(&dir, &["inline", "made", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("`S` names something else")), "{r}");
     let r = plan(&dir, &["inline", "grow", "--json"]);
     assert!(r["refused"].as_str().is_some_and(|w| w.contains("would name the local")), "{r}");
     assert_eq!(main_text(&dir), before, "nothing written");
