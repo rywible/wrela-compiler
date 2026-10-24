@@ -16,10 +16,19 @@ pub fn typescript() -> String {
         .enumerate()
         .map(|(i, &f)| {
             assert_eq!(f as usize, i, "texture formats are numbered from 0");
-            let (name, bytes, depth) = (f.name(), f.bytes_per_texel(), f.is_depth());
-            let (storable, filterable, uint) = (f.storable(), f.filterable(), f.is_uint());
+            let i = f.info();
+            let (name, bytes, depth) = (i.name, i.block_bytes, i.depth);
+            let (storable, filterable, uint) = (f.storable(), f.filterable(), i.uint);
+            let (renderable, blendable) = (f.renderable(), f.blendable());
+            let (block, channels, cost, align) = (i.block, i.channels, i.target_cost, i.target_align);
+            let needs = |c: stream::Can| match c.feature() {
+                Some(feature) => format!("{:?}", feature.name()),
+                None => "null".to_string(),
+            };
+            let (nf, ns, nr, nb) =
+                (needs(i.filterable), needs(i.storable), needs(i.renderable), needs(i.blendable));
             format!(
-                "  {{ name: {name:?}, bytes: {bytes}, depth: {depth}, storable: {storable}, filterable: {filterable}, uint: {uint} }},\n"
+                "  {{ name: {name:?}, bytes: {bytes}, block: {block}, channels: {channels}, depth: {depth}, storable: {storable}, filterable: {filterable}, renderable: {renderable}, blendable: {blendable}, uint: {uint}, target_cost: {cost}, target_align: {align}, needs: {{ filter: {nf}, store: {ns}, render: {nr}, blend: {nb} }} }},\n"
             )
         })
         .collect();
@@ -81,10 +90,16 @@ export const UPLOAD_MAX = {upload_max};
 export const Opcode = {{
 {opcodes}}} as const;
 
-/** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
- * whether it's a depth format. */
+/** A texture's format, by its number in the stream: the format table (runtime/abi
+ * `TextureFormat::info`). WebGPU's name; the bytes of a block (a texel, or a compressed format's
+ * 4 × 4 texels) and its side; the channels GPU code reads; what it can do on every device
+ * (`filterable`) or on some (`storable`, `renderable`, `blendable`); its render target cost and
+ * alignment; and the device feature each capability needs, if one. */
 export const TEXTURE_FORMATS = [
 {texture_formats}] as const;
+/** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
+export const MAX_COLOR_ATTACHMENT_BYTES = {max_color_bytes};
+export const MAX_COLOR_ATTACHMENTS = {max_color_attachments};
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = {texture_writable};
 /** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
@@ -229,6 +244,8 @@ export const PANIC = {panic};
 export const PANIC_CAP = {panic_cap};
 "#,
         stream_version = stream::VERSION,
+        max_color_bytes = stream::MAX_COLOR_ATTACHMENT_BYTES,
+        max_color_attachments = stream::MAX_COLOR_ATTACHMENTS,
         manifest_version = manifest::VERSION,
         magic = u32::from_le_bytes(stream::MAGIC),
         header_len = stream::HEADER_LEN,

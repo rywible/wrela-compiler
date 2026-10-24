@@ -117,7 +117,7 @@ pub fn wrela() -> String {
             "\n/// The stream's code for the texture format `{name}`.\npub(package) const FORMAT_{n}: u32 = {code}\n"
         );
         out += &format!(
-            "\n/// The bytes of a texel of `{name}`.\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
+            "\n/// The bytes of a texel of `{name}` (of a compressed format, of a 4 × 4 block).\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
         );
     }
     for c in Compare::ALL {

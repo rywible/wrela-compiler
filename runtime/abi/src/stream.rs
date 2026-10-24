@@ -26,12 +26,12 @@
 //! | 6 | `Present` | none. Ends the screen pass and shows it. |
 //! | 7 | `DestroyBuffer` | `handle`. Later commands can't use the buffer; work already recorded still can. |
 //! | 8 | `CopyBuffer` | `source`, `source offset`, `destination`, `destination offset`, `size` (bytes, multiples of 4) |
-//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, a storage texture too, of a format [`TextureFormat::storable`]), and for a 3D texture its `depth` (a fifth word, at least 1). It starts zeroed. |
-//! | 10 | `WriteTexture` | `handle`, `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels, top to bottom, no row padding; the byte run is padded to 4 bytes |
+//! | 9 | `CreateTexture` | `handle`, `width`, `height`, `format` ([`TextureFormat`]; bit 16 set: kernels write it, a storage texture too, of a format [`TextureFormat::storable`]), `kind` ([`TextureKind`]: 2D, 3D, 2D array or cube), `depth or layers` (a 3D texture's depth, an array's layers, 6 for a cube, 1 for a 2D texture), `levels` (mip levels, at least 1; a 3D texture has 1). It starts zeroed. |
+//! | 10 | `WriteTexture` | `handle`, `level`, `layer` (a 3D texture's: its slice), `x`, `y`, `width`, `height`, `length`, then `length` bytes: rows of `width` texels (of a compressed format, rows of blocks, `width` and `height` in texels, whole blocks but at the level's edge), top to bottom, no row padding; the byte run is padded to 4 bytes |
 //! | 11 | `DestroyTexture` | `handle` |
-//! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare) |
+//! | 12 | `CreateSampler` | `handle`, `filter` (0 nearest, 1 linear), `address` (0 clamp, 1 repeat), `compare` ([`Compare`]; 0 for a sampler that doesn't compare), `mip filter` (0 nearest, 1 linear: between mip levels), `anisotropy` (1 to 16; above 1 only with `filter` and `mip filter` linear) |
 //! | 13 | `DestroySampler` | `handle` |
-//! | 14 | `BeginPass` | `colour` (a texture, [`SCREEN`] or [`NONE`]), `load` (0 clear, 1 keep; plus 2: it may join the pass before, `Pass::join`), the clear colour `r`, `g`, `b`, `a` as f32, `depth` (a depth texture or [`NONE`]), `depth load`, `clear depth` as f32 |
+//! | 14 | `BeginPass` | `colours` (0 to 4), `join` (1: it may join the pass before, [`Pass::join`]), then for each colour target `texture` (a texture, or [`SCREEN`] alone), `level`, `layer` (of an array or a cube; 0 of a 2D texture), `load` (0 clear, 1 keep), the clear colour `r`, `g`, `b`, `a` as f32; then `depth` (a depth texture or [`NONE`]), `depth layer`, `depth load`, `clear depth` as f32 |
 //! | 15 | `EndPass` | none. Ends a pass that isn't on the screen. |
 //! | 16 | `DispatchIndirect` | `pipeline`, `arguments buffer`, `offset` (three `u32` group counts there), the bindings, the uniforms |
 //! | 17 | `DrawIndirect` | `pipeline`, `arguments buffer`, `offset` (vertex count, instance count, first vertex, first instance there), the bindings, the uniforms |
@@ -48,6 +48,14 @@
 //! | 28 | `HandOver` | `request`, `path length`, then the path's UTF-8, padded to 4 bytes: after this call, the build at the path takes this program's place, with what it kept (`std::reload`). The request is answered only if the hand-over fails, and then this program goes on |
 //! | 29 | `HostRequest` | `request`, `service length`, `body length`, then UTF-8 service and opaque bytes, each padded to 4 bytes: a host capability request |
 //! | 30 | `Timed` | `request`, `label length`, then the label's UTF-8, padded to 4 bytes: the GPU time of the passes and dispatches with that `Label` in the first frame from this one that runs one and whose time the host has read, summed: an `f32` of microseconds, a request. It fails on a host that can't time GPU work. |
+//! | 31 | `CopyTexture` | `source`, `source level`, `source layer`, `x`, `y`, `destination`, `destination level`, `destination layer`, `x`, `y`, `width`, `height`: texels between two textures of the same format |
+//! | 32 | `CopyTextureToBuffer` | `texture`, `level`, `layer`, `x`, `y`, `width`, `height`, `buffer`, `offset` (a multiple of 256), `bytes per row` (a multiple of 256, at least a row's): texels into a buffer, row by row |
+//! | 33 | `CopyBufferToTexture` | `buffer`, `offset` (a multiple of 4), `bytes per row` (a multiple of 256), `texture`, `level`, `layer`, `x`, `y`, `width`, `height`: the reverse |
+//! | 34 | `SetScissor` | `x`, `y`, `width`, `height`: the draws after it in its pass touch only that rectangle of its targets. Inside a pass only. |
+//! | 35 | `SetViewport` | `x`, `y`, `width`, `height`, `min depth`, `max depth`, all f32: the draws after it in its pass map clip space to that rectangle and depth range. Inside a pass only. |
+//! | 36 | `DrawIndexed` | `pipeline`, `index buffer`, `index offset`, `index size` (as `DrawIndexedIndirect`'s), `indices`, `instances`, `first index`, `base vertex` (an `i32`), `first instance`, the bindings, the uniforms |
+//! | 37 | `MultiDrawIndirect` | `pipeline`, `arguments buffer`, `offset`, `count` (the most draws: `DrawArgs` one after another there), `count buffer` (a `u32` there holds how many of them to draw, or [`NONE`]: all of them), `count offset`, the bindings, the uniforms |
+//! | 38 | `MultiDrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size`, `arguments buffer`, `offset`, `count`, `count buffer`, `count offset` (as `MultiDrawIndirect`'s, of `DrawIndexedArgs`), the bindings, the uniforms |
 //!
 //! **Requests** (language.md §17.1) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -56,8 +64,11 @@
 //! Storage is "bytes at a path": a path is relative, `/`-separated, with no `.` or `..` parts.
 //!
 //! **Bindings** are a count, then three words each, in the order the pipeline's manifest entry
-//! lists its bindings: a buffer's `handle`, `offset` and `size` in bytes; a texture's or a
-//! sampler's `handle`, `0`, `0`. **Uniforms** are a byte count, then the uniform block's bytes
+//! lists its bindings: a buffer's `handle`, `offset` and `size` in bytes; a sampler's `handle`,
+//! `0`, `0`; a texture's `handle`, its levels and its layers: `0` for all of them, or one more
+//! than the one level, or the one layer (bound as a 2D texture), that its view holds
+//! ([`View`]). A level view's level counts from the texture's first, and its layer view's
+//! levels are all of them. **Uniforms** are a byte count, then the uniform block's bytes
 //! (exactly `uniform.size` bytes, or none when the pipeline has no uniform block).
 //!
 //! - **Handles** are chosen by the program: small integers, each naming one live resource (a
@@ -68,9 +79,11 @@
 //!   a draw a render pipeline.
 //! - **Order:** commands take effect in the order they're recorded. A host that batches GPU
 //!   work must flush recorded dispatches before applying a later `WriteBuffer`.
-//! - **Passes:** `BeginScreenPass` or `BeginPass`, then any number of `Draw`s,
-//!   `DrawIndirect`s and `DrawIndexedIndirect`s, then `Present` (a pass on the screen) or `EndPass` (any other). Draws
-//!   happen only inside a pass; everything else only outside one. A pass closes in the same
+//! - **Passes:** `BeginScreenPass` or `BeginPass`, then any number of draws (`Draw`,
+//!   `DrawIndirect`, `DrawIndexed`, `DrawIndexedIndirect`, `MultiDrawIndirect`,
+//!   `MultiDrawIndexedIndirect`), `SetScissor`s and `SetViewport`s, then `Present` (a pass on the
+//!   screen) or `EndPass` (any other). Those happen only inside a pass; everything else only
+//!   outside one. A pass closes in the same
 //!   call that opened it (a browser's canvas texture lives only until the frame's task ends):
 //!   [`Sequencer::end_frame`].
 //!
@@ -130,10 +143,18 @@ pub enum Opcode {
     HandOver = 28,
     HostRequest = 29,
     Timed = 30,
+    CopyTexture = 31,
+    CopyTextureToBuffer = 32,
+    CopyBufferToTexture = 33,
+    SetScissor = 34,
+    SetViewport = 35,
+    DrawIndexed = 36,
+    MultiDrawIndirect = 37,
+    MultiDrawIndexedIndirect = 38,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 29] = [
+    pub const ALL: [Opcode; 37] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -163,6 +184,14 @@ impl Opcode {
         Opcode::HandOver,
         Opcode::HostRequest,
         Opcode::Timed,
+        Opcode::CopyTexture,
+        Opcode::CopyTextureToBuffer,
+        Opcode::CopyBufferToTexture,
+        Opcode::SetScissor,
+        Opcode::SetViewport,
+        Opcode::DrawIndexed,
+        Opcode::MultiDrawIndirect,
+        Opcode::MultiDrawIndexedIndirect,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -200,21 +229,112 @@ impl Opcode {
             Opcode::HandOver => "HandOver",
             Opcode::HostRequest => "HostRequest",
             Opcode::Timed => "Timed",
+            Opcode::CopyTexture => "CopyTexture",
+            Opcode::CopyTextureToBuffer => "CopyTextureToBuffer",
+            Opcode::CopyBufferToTexture => "CopyBufferToTexture",
+            Opcode::SetScissor => "SetScissor",
+            Opcode::SetViewport => "SetViewport",
+            Opcode::DrawIndexed => "DrawIndexed",
+            Opcode::MultiDrawIndirect => "MultiDrawIndirect",
+            Opcode::MultiDrawIndexedIndirect => "MultiDrawIndexedIndirect",
         }
+    }
+
+    /// Whether it's a draw: it happens inside a pass.
+    pub fn is_draw(self) -> bool {
+        matches!(
+            self,
+            Opcode::Draw
+                | Opcode::DrawIndirect
+                | Opcode::DrawIndexed
+                | Opcode::DrawIndexedIndirect
+                | Opcode::MultiDrawIndirect
+                | Opcode::MultiDrawIndexedIndirect
+        )
     }
 }
 
 /// `CreateTexture`'s format word with this bit set: kernels write the texture's texels.
 pub const WRITABLE: u32 = 1 << 16;
 
-/// `BeginPass`'s colour load word with this bit set: the pass may join the one before it
-/// ([`Pass::join`]).
-pub const PASS_JOIN: u32 = 2;
+/// `BeginPass`'s join word: the pass may join the one before it ([`Pass::join`]).
+pub const PASS_JOIN: u32 = 1;
+
+/// The most mip levels a texture has: a side of WebGPU's largest 2D texture, 8192 texels, halved
+/// 13 times.
+pub const MAX_LEVELS: u32 = 14;
+/// The most layers of a 2D array: WebGPU's default `maxTextureArrayLayers`.
+pub const MAX_LAYERS: u32 = 256;
+/// The most anisotropy a sampler takes (WebGPU's `maxAnisotropy` is clamped to 16).
+pub const MAX_ANISOTROPY: u32 = 16;
+/// Where a copy between a buffer and a texture starts in the buffer, and how its rows are
+/// padded: WebGPU's `bytesPerRow` alignment.
+pub const ROW_ALIGNMENT: u32 = 256;
+
+/// What a texture is: its dimension, and how many 2D layers it has.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(u32)]
+pub enum TextureKind {
+    #[default]
+    D2 = 0,
+    D3 = 1,
+    /// A 2D array: `layers` 2D textures of one size, sampled by layer.
+    Array = 2,
+    /// Six square layers, sampled by direction.
+    Cube = 3,
+}
+
+impl TextureKind {
+    pub const ALL: [TextureKind; 4] =
+        [TextureKind::D2, TextureKind::D3, TextureKind::Array, TextureKind::Cube];
+
+    pub fn from_u32(v: u32) -> Option<TextureKind> {
+        TextureKind::ALL.into_iter().find(|k| *k as u32 == v)
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TextureKind::D2 => "2d",
+            TextureKind::D3 => "3d",
+            TextureKind::Array => "2d-array",
+            TextureKind::Cube => "cube",
+        }
+    }
+}
+
+/// Which part of a texture a binding or a target holds: its levels from `level` on, `levels` of
+/// them, and its layers from `layer` on, `layers` of them. The stream's two words for a binding
+/// (see the module doc) give it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct View {
+    /// One level, or `None`: all of them.
+    pub level: Option<u32>,
+    /// One layer (bound as a 2D texture), or `None`: all of them.
+    pub layer: Option<u32>,
+}
+
+impl View {
+    pub const WHOLE: View = View { level: None, layer: None };
+
+    /// A binding's view, from its two words: 0 all, else one more than the one level or layer.
+    pub fn of_words(level: u32, layer: u32) -> View {
+        let one = |w: u32| w.checked_sub(1);
+        View { level: one(level), layer: one(layer) }
+    }
+
+    /// The two words that say it.
+    pub fn words(self) -> (u32, u32) {
+        let word = |x: Option<u32>| x.map_or(0, |x| x + 1);
+        (word(self.level), word(self.layer))
+    }
+}
 
 /// The most texels a side of a 3D texture: WebGPU's default `maxTextureDimension3D`.
 pub const MAX_TEXTURE_3D: u32 = 2048;
 
-/// A texture's format: how its texels are stored and sampled.
+/// A texture's format: how its texels are stored and sampled. Every capability of each one is
+/// in [`TextureFormat::info`], the one table the compiler, both checkers and both hosts read
+/// (WebGPU's "Texture Format Capabilities").
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum TextureFormat {
@@ -228,14 +348,128 @@ pub enum TextureFormat {
     R16Float = 3,
     /// Two 16-bit floats.
     Rg16Float = 4,
-    /// One 32-bit float, not filtered.
+    /// One 32-bit float, not filtered without `float32-filterable`.
     R32Float = 5,
-    /// One 32-bit unsigned integer, not filtered.
+    /// One 32-bit unsigned integer, never filtered.
     R32Uint = 6,
+    /// One 8-bit channel, read as a float in [0, 1].
+    R8 = 7,
+    /// Two 8-bit channels, read as floats in [0, 1].
+    Rg8 = 8,
+    /// Red, green and blue of 10 bits and alpha of 2, read as floats in [0, 1].
+    Rgb10a2 = 9,
+    /// Two 32-bit floats.
+    Rg32Float = 10,
+    /// Four 32-bit floats.
+    Rgba32Float = 11,
+    /// Two 32-bit unsigned integers.
+    Rg32Uint = 12,
+    /// Red and green of 11 bits and blue of 10, unsigned floats: HDR colour in 4 bytes.
+    Rg11b10Float = 13,
+    /// BC1: 4 × 4 texels of RGB (and 1-bit alpha) in 8 bytes.
+    Bc1 = 14,
+    /// BC4: 4 × 4 texels of one channel in 8 bytes.
+    Bc4 = 15,
+    /// BC5: 4 × 4 texels of two channels in 16 bytes (normals).
+    Bc5 = 16,
+    /// BC7: 4 × 4 texels of RGBA in 16 bytes.
+    Bc7 = 17,
+    /// ETC2: 4 × 4 texels of RGB in 8 bytes.
+    Etc2Rgb8 = 18,
+    /// ASTC: 4 × 4 texels of RGBA in 16 bytes.
+    Astc4x4 = 19,
+}
+
+/// A device feature a format's capability needs (WebGPU's names). A format in WebGPU's core
+/// with the capability needs none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FormatFeature {
+    Float32Filterable,
+    Float32Blendable,
+    Rg11b10Renderable,
+    TextureCompressionBc,
+    TextureCompressionEtc2,
+    TextureCompressionAstc,
+}
+
+impl FormatFeature {
+    /// WebGPU's name for it.
+    pub fn name(self) -> &'static str {
+        match self {
+            FormatFeature::Float32Filterable => "float32-filterable",
+            FormatFeature::Float32Blendable => "float32-blendable",
+            FormatFeature::Rg11b10Renderable => "rg11b10ufloat-renderable",
+            FormatFeature::TextureCompressionBc => "texture-compression-bc",
+            FormatFeature::TextureCompressionEtc2 => "texture-compression-etc2",
+            FormatFeature::TextureCompressionAstc => "texture-compression-astc",
+        }
+    }
+}
+
+/// A capability a format has: always, never, or with a device feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Can {
+    No,
+    Yes,
+    With(FormatFeature),
+}
+
+impl Can {
+    /// Whether it has it on a device with `features` (each a WebGPU name).
+    pub fn on(self, has: impl Fn(&str) -> bool) -> bool {
+        match self {
+            Can::No => false,
+            Can::Yes => true,
+            Can::With(f) => has(f.name()),
+        }
+    }
+
+    /// Whether it has it on some device.
+    pub fn ever(self) -> bool {
+        self != Can::No
+    }
+
+    /// The feature it needs, if one.
+    pub fn feature(self) -> Option<FormatFeature> {
+        match self {
+            Can::With(f) => Some(f),
+            _ => None,
+        }
+    }
+}
+
+/// One row of the format table: what a texture of the format is and can do. The render target
+/// cost and alignment are WebGPU's "render target pixel byte cost" and "render target component
+/// alignment", which the colour attachment limit (`maxColorAttachmentBytesPerSample`, 32) sums
+/// over a pass's targets: not the storage size (`rgba8unorm` costs 8 as an attachment).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FormatInfo {
+    /// WebGPU's name.
+    pub name: &'static str,
+    /// The bytes of one block: a texel, or a compressed format's 4 × 4 texels.
+    pub block_bytes: u32,
+    /// A block's side in texels: 1, or 4 for a compressed format.
+    pub block: u32,
+    /// How many channels GPU code reads (a texel's type: a scalar, `vec2`, `vec3` or `vec4`).
+    pub channels: u32,
+    pub filterable: Can,
+    /// Kernels write it (a storage texture).
+    pub storable: Can,
+    /// Passes draw into it.
+    pub renderable: Can,
+    /// Draws blend into it (`Blend` other than `Replace`).
+    pub blendable: Can,
+    /// Its texels are unsigned integers, read and written as `u32`s.
+    pub uint: bool,
+    pub depth: bool,
+    /// As a colour attachment: its byte cost and the alignment the running total is rounded to
+    /// before it's added (0 for a format that is never a colour target).
+    pub target_cost: u32,
+    pub target_align: u32,
 }
 
 impl TextureFormat {
-    pub const ALL: [TextureFormat; 7] = [
+    pub const ALL: [TextureFormat; 20] = [
         TextureFormat::Rgba8,
         TextureFormat::Rgba16Float,
         TextureFormat::Depth32Float,
@@ -243,70 +477,210 @@ impl TextureFormat {
         TextureFormat::Rg16Float,
         TextureFormat::R32Float,
         TextureFormat::R32Uint,
+        TextureFormat::R8,
+        TextureFormat::Rg8,
+        TextureFormat::Rgb10a2,
+        TextureFormat::Rg32Float,
+        TextureFormat::Rgba32Float,
+        TextureFormat::Rg32Uint,
+        TextureFormat::Rg11b10Float,
+        TextureFormat::Bc1,
+        TextureFormat::Bc4,
+        TextureFormat::Bc5,
+        TextureFormat::Bc7,
+        TextureFormat::Etc2Rgb8,
+        TextureFormat::Astc4x4,
     ];
 
     pub fn from_u32(v: u32) -> Option<TextureFormat> {
         TextureFormat::ALL.iter().copied().find(|f| *f as u32 == v)
     }
 
-    /// WebGPU's name for it.
-    pub fn name(self) -> &'static str {
+    /// The format table's row (WebGPU's "Texture Format Capabilities").
+    pub const fn info(self) -> FormatInfo {
+        use Can::{No, With, Yes};
+        use FormatFeature as F;
+        // name, block bytes, block side, channels, filter, store, render, blend, uint, depth,
+        // target cost, target alignment
+        const fn row(
+            name: &'static str,
+            block_bytes: u32,
+            block: u32,
+            channels: u32,
+            filterable: Can,
+            storable: Can,
+            renderable: Can,
+            blendable: Can,
+            target: (u32, u32),
+        ) -> FormatInfo {
+            FormatInfo {
+                name,
+                block_bytes,
+                block,
+                channels,
+                filterable,
+                storable,
+                renderable,
+                blendable,
+                uint: false,
+                depth: false,
+                target_cost: target.0,
+                target_align: target.1,
+            }
+        }
+        const fn uint(mut i: FormatInfo) -> FormatInfo {
+            i.uint = true;
+            i
+        }
+        const fn compressed(name: &'static str, block_bytes: u32, channels: u32, f: F) -> FormatInfo {
+            row(name, block_bytes, 4, channels, With(f), No, No, No, (0, 0))
+        }
         match self {
-            TextureFormat::Rgba8 => "rgba8unorm",
-            TextureFormat::Rgba16Float => "rgba16float",
-            TextureFormat::Depth32Float => "depth32float",
-            TextureFormat::R16Float => "r16float",
-            TextureFormat::Rg16Float => "rg16float",
-            TextureFormat::R32Float => "r32float",
-            TextureFormat::R32Uint => "r32uint",
+            TextureFormat::Rgba8 => row("rgba8unorm", 4, 1, 4, Yes, Yes, Yes, Yes, (8, 1)),
+            TextureFormat::Rgba16Float => row("rgba16float", 8, 1, 4, Yes, Yes, Yes, Yes, (8, 2)),
+            TextureFormat::Depth32Float => {
+                let mut i = row("depth32float", 4, 1, 1, No, No, Yes, No, (0, 0));
+                i.depth = true;
+                i
+            }
+            TextureFormat::R16Float => row("r16float", 2, 1, 1, Yes, No, Yes, Yes, (2, 2)),
+            TextureFormat::Rg16Float => row("rg16float", 4, 1, 2, Yes, No, Yes, Yes, (4, 2)),
+            TextureFormat::R32Float => row(
+                "r32float",
+                4,
+                1,
+                1,
+                With(F::Float32Filterable),
+                Yes,
+                Yes,
+                With(F::Float32Blendable),
+                (4, 4),
+            ),
+            TextureFormat::R32Uint => uint(row("r32uint", 4, 1, 1, No, Yes, Yes, No, (4, 4))),
+            TextureFormat::R8 => row("r8unorm", 1, 1, 1, Yes, No, Yes, Yes, (1, 1)),
+            TextureFormat::Rg8 => row("rg8unorm", 2, 1, 2, Yes, No, Yes, Yes, (2, 1)),
+            TextureFormat::Rgb10a2 => row("rgb10a2unorm", 4, 1, 4, Yes, No, Yes, Yes, (8, 4)),
+            TextureFormat::Rg32Float => row(
+                "rg32float",
+                8,
+                1,
+                2,
+                With(F::Float32Filterable),
+                Yes,
+                Yes,
+                With(F::Float32Blendable),
+                (8, 4),
+            ),
+            TextureFormat::Rgba32Float => row(
+                "rgba32float",
+                16,
+                1,
+                4,
+                With(F::Float32Filterable),
+                Yes,
+                Yes,
+                With(F::Float32Blendable),
+                (16, 4),
+            ),
+            TextureFormat::Rg32Uint => uint(row("rg32uint", 8, 1, 2, No, Yes, Yes, No, (8, 4))),
+            TextureFormat::Rg11b10Float => row(
+                "rg11b10ufloat",
+                4,
+                1,
+                3,
+                Yes,
+                No,
+                With(F::Rg11b10Renderable),
+                With(F::Rg11b10Renderable),
+                (8, 4),
+            ),
+            TextureFormat::Bc1 => compressed("bc1-rgba-unorm", 8, 4, F::TextureCompressionBc),
+            TextureFormat::Bc4 => compressed("bc4-r-unorm", 8, 1, F::TextureCompressionBc),
+            TextureFormat::Bc5 => compressed("bc5-rg-unorm", 16, 2, F::TextureCompressionBc),
+            TextureFormat::Bc7 => compressed("bc7-rgba-unorm", 16, 4, F::TextureCompressionBc),
+            TextureFormat::Etc2Rgb8 => {
+                compressed("etc2-rgb8unorm", 8, 3, F::TextureCompressionEtc2)
+            }
+            TextureFormat::Astc4x4 => {
+                compressed("astc-4x4-unorm", 16, 4, F::TextureCompressionAstc)
+            }
         }
     }
 
-    /// The bytes of one texel.
+    /// WebGPU's name for it.
+    pub fn name(self) -> &'static str {
+        self.info().name
+    }
+
+    /// The bytes of one texel; of a compressed format, of one 4 × 4 block.
     pub fn bytes_per_texel(self) -> u32 {
-        match self {
-            TextureFormat::R16Float => 2,
-            TextureFormat::Rgba8
-            | TextureFormat::Depth32Float
-            | TextureFormat::Rg16Float
-            | TextureFormat::R32Float
-            | TextureFormat::R32Uint => 4,
-            TextureFormat::Rgba16Float => 8,
-        }
+        self.info().block_bytes
+    }
+
+    /// A block's side in texels: 4 for a compressed format, else 1.
+    pub fn block(self) -> u32 {
+        self.info().block
+    }
+
+    pub fn is_compressed(self) -> bool {
+        self.info().block > 1
+    }
+
+    /// The bytes of a `width` × `height` rectangle of it, whole blocks.
+    pub fn bytes_of(self, width: u32, height: u32) -> u64 {
+        let b = u64::from(self.block());
+        u64::from(width).div_ceil(b) * u64::from(height).div_ceil(b) * u64::from(self.bytes_per_texel())
     }
 
     pub fn is_depth(self) -> bool {
-        self == TextureFormat::Depth32Float
+        self.info().depth
     }
 
-    /// Whether kernels can write it: a storage format in WebGPU's core.
+    /// Whether kernels can write it on some device (a storage texture).
     pub fn storable(self) -> bool {
-        matches!(
-            self,
-            TextureFormat::Rgba8
-                | TextureFormat::Rgba16Float
-                | TextureFormat::R32Float
-                | TextureFormat::R32Uint
-        )
+        self.info().storable.ever()
     }
 
-    /// Whether a shader can filter between its texels (a colour format's sample type is then
-    /// `float`, else `unfilterable-float` or `uint`).
+    /// Whether a shader can filter between its texels on every device (a colour format's sample
+    /// type is then `float`, else `unfilterable-float` or `uint`). A format filterable only with
+    /// a feature (`r32float` with `float32-filterable`) binds as `unfilterable-float`.
     pub fn filterable(self) -> bool {
-        matches!(
-            self,
-            TextureFormat::Rgba8
-                | TextureFormat::Rgba16Float
-                | TextureFormat::R16Float
-                | TextureFormat::Rg16Float
-        )
+        // A compressed texture exists only on a device with its feature, so it always filters.
+        self.info().filterable == Can::Yes || self.is_compressed()
+    }
+
+    /// Whether a pass can draw into it on some device.
+    pub fn renderable(self) -> bool {
+        self.info().renderable.ever()
+    }
+
+    /// Whether a draw can blend into it on some device.
+    pub fn blendable(self) -> bool {
+        self.info().blendable.ever()
     }
 
     /// Whether its texels are integers, read and written as `u32`s.
     pub fn is_uint(self) -> bool {
-        self == TextureFormat::R32Uint
+        self.info().uint
     }
 }
+
+/// The colour attachments' bytes per sample of a pass drawing into `formats`, in order, by
+/// WebGPU's algorithm ("calculating color attachment bytes per sample"): for each target, the
+/// running total is rounded up to the format's component alignment, then its byte cost is
+/// added. The order matters: `[rgba32float, rgba8unorm, rgba8unorm, rgba16float]` is 40, and
+/// `[rgba16float, rg16float, r8unorm, r32uint]` is 8, 12, 13, then 16 + 4 = 20.
+pub fn color_attachment_bytes(formats: &[TextureFormat]) -> u32 {
+    formats.iter().fold(0, |total, f| {
+        let i = f.info();
+        total.next_multiple_of(i.target_align.max(1)) + i.target_cost
+    })
+}
+
+/// WebGPU's default `maxColorAttachmentBytesPerSample`.
+pub const MAX_COLOR_ATTACHMENT_BYTES: u32 = 32;
+/// WebGPU's default `maxColorAttachments`.
+pub const MAX_COLOR_ATTACHMENTS: usize = 4;
 
 impl serde::Serialize for TextureFormat {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
@@ -382,32 +756,125 @@ impl Binding {
     }
 }
 
+/// One colour target of a pass: a texture's level and layer, or the screen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorTarget {
+    /// A texture, or [`SCREEN`].
+    pub texture: u32,
+    pub level: u32,
+    pub layer: u32,
+    /// Keep what's there rather than clear it.
+    pub keep: bool,
+    pub clear: [f32; 4],
+}
+
+impl ColorTarget {
+    /// Texture `texture`'s first level and layer, cleared to `clear` or kept.
+    pub fn of(texture: u32, keep: bool, clear: [f32; 4]) -> ColorTarget {
+        ColorTarget { texture, level: 0, layer: 0, keep, clear }
+    }
+
+    /// The screen, cleared to `clear`.
+    pub fn screen(clear: [f32; 4]) -> ColorTarget {
+        ColorTarget::of(SCREEN, false, clear)
+    }
+
+    /// Whether it draws into the same texel as `other` (the same texture, level and layer).
+    pub fn same_place(&self, other: &ColorTarget) -> bool {
+        (self.texture, self.level, self.layer) == (other.texture, other.level, other.layer)
+    }
+}
+
 /// A pass's attachments (`BeginPass`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Pass {
-    /// A texture, [`SCREEN`] or [`NONE`].
-    pub color: u32,
-    /// Keep what's there rather than clear it.
-    pub keep_color: bool,
+    /// The colour targets: the first `count` of them.
+    pub colors: [ColorTarget; MAX_COLOR_ATTACHMENTS],
+    pub count: u32,
     /// It may run as part of the pass before it, if that one ended right before it on the
     /// same targets and this one keeps them (the host's choice; serial timing times it alone).
     pub join: bool,
-    pub clear: [f32; 4],
     /// A depth texture, or [`NONE`].
     pub depth: u32,
+    /// Its layer (of a depth array; 0 of a depth texture).
+    pub depth_layer: u32,
     pub keep_depth: bool,
     pub clear_depth: f32,
 }
 
 impl Pass {
+    /// A pass with these colour targets (at most [`MAX_COLOR_ATTACHMENTS`]) and no depth.
+    pub fn new(colors: &[ColorTarget]) -> Pass {
+        assert!(colors.len() <= MAX_COLOR_ATTACHMENTS, "at most four colour targets");
+        let mut all = [ColorTarget::of(NONE, false, [0.0; 4]); MAX_COLOR_ATTACHMENTS];
+        all[..colors.len()].copy_from_slice(colors);
+        Pass {
+            colors: all,
+            count: colors.len() as u32,
+            join: false,
+            depth: NONE,
+            depth_layer: 0,
+            keep_depth: false,
+            clear_depth: 1.0,
+        }
+    }
+
+    /// A pass into one colour target, `texture` (or [`SCREEN`]), or none ([`NONE`]).
+    pub fn one(texture: u32, keep: bool, clear: [f32; 4]) -> Pass {
+        if texture == NONE {
+            return Pass::new(&[]);
+        }
+        Pass::new(&[ColorTarget::of(texture, keep, clear)])
+    }
+
+    /// With `depth` as its depth target.
+    pub fn with_depth(self, depth: u32, keep_depth: bool, clear_depth: f32) -> Pass {
+        Pass { depth, keep_depth, clear_depth, ..self }
+    }
+
+    /// With its colour target `texture` alone ([`NONE`]: none), keeping the first one's load
+    /// and clear.
+    pub fn with_color(self, texture: u32) -> Pass {
+        let first = self.colors().first().copied().unwrap_or(ColorTarget::of(NONE, false, [0.0; 4]));
+        let colors = if texture == NONE { Vec::new() } else { vec![ColorTarget { texture, ..first }] };
+        Pass { join: self.join, depth: self.depth, depth_layer: self.depth_layer, keep_depth: self.keep_depth, clear_depth: self.clear_depth, ..Pass::new(&colors) }
+    }
+
+    /// With every colour target kept (or cleared).
+    pub fn keeping_color(mut self, keep: bool) -> Pass {
+        for c in &mut self.colors {
+            c.keep = keep;
+        }
+        self
+    }
+
+    /// With every colour target cleared to `clear`.
+    pub fn clearing_to(mut self, clear: [f32; 4]) -> Pass {
+        for c in &mut self.colors {
+            c.clear = clear;
+        }
+        self
+    }
+
+    /// Its colour targets.
+    pub fn colors(&self) -> &[ColorTarget] {
+        &self.colors[..self.count as usize]
+    }
+
+    /// Whether it draws on the screen.
+    pub fn on_screen(&self) -> bool {
+        self.colors().iter().any(|c| c.texture == SCREEN)
+    }
+
     /// Whether this pass, beginning right after `ended` ended, may run as part of it, as one
     /// render pass: it may join, on the same targets, kept (not cleared), and not the screen.
     pub fn joins(&self, ended: &Pass) -> bool {
         self.join
-            && self.color != SCREEN
-            && self.color == ended.color
+            && !self.on_screen()
+            && self.count == ended.count
+            && self.colors().iter().zip(ended.colors()).all(|(a, b)| a.same_place(b) && a.keep)
             && self.depth == ended.depth
-            && (self.color == NONE || self.keep_color)
+            && self.depth_layer == ended.depth_layer
             && (self.depth == NONE || self.keep_depth)
     }
 }
@@ -458,11 +925,15 @@ pub enum Command<'a> {
         format: TextureFormat,
         /// Kernels write its texels (a storage texture): a format [`TextureFormat::storable`].
         writable: bool,
-        /// A 3D texture's depth in texels; 0 for a 2D texture.
-        depth: u32,
+        kind: TextureKind,
+        /// A 3D texture's depth in texels, an array's layers (6 for a cube), 1 for a 2D texture.
+        layers: u32,
+        levels: u32,
     },
     WriteTexture {
         handle: u32,
+        level: u32,
+        layer: u32,
         x: u32,
         y: u32,
         width: u32,
@@ -477,6 +948,9 @@ pub enum Command<'a> {
         linear: bool,
         repeat: bool,
         compare: Option<Compare>,
+        /// Linear between mip levels.
+        mip_linear: bool,
+        anisotropy: u32,
     },
     DestroySampler {
         handle: u32,
@@ -560,6 +1034,83 @@ pub enum Command<'a> {
         request: u32,
         label: &'a str,
     },
+    CopyTexture {
+        source: TexelRect,
+        destination: TexelAt,
+    },
+    CopyTextureToBuffer {
+        source: TexelRect,
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+    },
+    CopyBufferToTexture {
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+        destination: TexelRect,
+    },
+    SetScissor {
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
+    SetViewport {
+        rect: [f32; 4],
+        min_depth: f32,
+        max_depth: f32,
+    },
+    DrawIndexed {
+        pipeline: u32,
+        indices: u32,
+        index_offset: u32,
+        index_size: u32,
+        index_count: u32,
+        instances: u32,
+        first_index: u32,
+        base_vertex: i32,
+        first_instance: u32,
+        bindings: Vec<Binding>,
+        uniforms: &'a [u8],
+    },
+    /// Up to `count` indirect draws, their arguments one after another from `offset` (with
+    /// `indices`, indexed: the index buffer's handle, offset and size); `count_buffer` (or
+    /// [`NONE`]) holds how many.
+    MultiDrawIndirect {
+        pipeline: u32,
+        indices: Option<[u32; 3]>,
+        arguments: u32,
+        offset: u32,
+        count: u32,
+        count_buffer: u32,
+        count_offset: u32,
+        bindings: Vec<Binding>,
+        uniforms: &'a [u8],
+    },
+}
+
+/// A rectangle of texels at one level and layer of a texture: a copy's source, or what a copy
+/// writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexelRect {
+    pub texture: u32,
+    pub level: u32,
+    pub layer: u32,
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Where a texture-to-texture copy writes: a texture's level and layer, and the corner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TexelAt {
+    pub texture: u32,
+    pub level: u32,
+    pub layer: u32,
+    pub x: u32,
+    pub y: u32,
 }
 
 impl Command<'_> {
@@ -594,6 +1145,16 @@ impl Command<'_> {
             Command::HandOver { .. } => Opcode::HandOver,
             Command::HostRequest { .. } => Opcode::HostRequest,
             Command::Timed { .. } => Opcode::Timed,
+            Command::CopyTexture { .. } => Opcode::CopyTexture,
+            Command::CopyTextureToBuffer { .. } => Opcode::CopyTextureToBuffer,
+            Command::CopyBufferToTexture { .. } => Opcode::CopyBufferToTexture,
+            Command::SetScissor { .. } => Opcode::SetScissor,
+            Command::SetViewport { .. } => Opcode::SetViewport,
+            Command::DrawIndexed { .. } => Opcode::DrawIndexed,
+            Command::MultiDrawIndirect { indices: None, .. } => Opcode::MultiDrawIndirect,
+            Command::MultiDrawIndirect { indices: Some(_), .. } => {
+                Opcode::MultiDrawIndexedIndirect
+            }
         }
     }
 }
@@ -859,27 +1420,38 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 }
             }
             Opcode::CreateTexture => {
-                if words != 4 && words != 5 {
-                    return Err(bad("expected 4 or 5 words"));
-                }
-                let depth = if words == 5 { w(4) } else { 0 };
-                if words == 5 && depth == 0 {
-                    return Err(bad("a 3D texture's depth is positive"));
-                }
+                exactly(7)?;
                 let writable = w(3) & WRITABLE != 0;
                 let Some(format) = TextureFormat::from_u32(w(3) & !WRITABLE) else {
                     return Err(bad("unknown texture format"));
                 };
-                if w(1) == 0 || w(2) == 0 {
-                    return Err(bad("a texture's width and height are positive"));
+                let Some(kind) = TextureKind::from_u32(w(4)) else {
+                    return Err(bad("unknown texture kind"));
+                };
+                let (layers, levels) = (w(5), w(6));
+                if w(1) == 0 || w(2) == 0 || layers == 0 {
+                    return Err(bad("a texture's width, height and depth or layers are positive"));
+                }
+                if levels == 0 || levels > MAX_LEVELS {
+                    return Err(bad("a texture has 1 to 14 mip levels"));
                 }
                 if writable && !format.storable() {
-                    return Err(bad(
-                        "kernels write only rgba8unorm, rgba16float, r32float and r32uint textures",
-                    ));
+                    return Err(bad("kernels write only a format the format table says they can"));
                 }
-                if depth > 0 && format.is_depth() {
-                    return Err(bad("a 3D texture holds colours"));
+                match kind {
+                    TextureKind::D2 if layers != 1 => {
+                        return Err(bad("a 2D texture has one layer"));
+                    }
+                    TextureKind::Cube if layers != 6 || w(1) != w(2) => {
+                        return Err(bad("a cube has six square layers"));
+                    }
+                    TextureKind::D3 if format.is_depth() || format.is_compressed() => {
+                        return Err(bad("a 3D texture holds uncompressed colours"));
+                    }
+                    TextureKind::D3 if levels != 1 => {
+                        return Err(bad("a 3D texture has one level"));
+                    }
+                    _ => {}
                 }
                 Command::CreateTexture {
                     handle: w(0),
@@ -887,30 +1459,40 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     height: w(2),
                     format,
                     writable,
-                    depth,
+                    kind,
+                    layers,
+                    levels,
                 }
             }
             Opcode::WriteTexture => {
-                if words < 6 {
-                    return Err(bad("expected at least 6 words"));
+                if words < 8 {
+                    return Err(bad("expected at least 8 words"));
                 }
-                let n = w(5) as usize;
-                if padded(n) != len - 24 {
+                let n = w(7) as usize;
+                if padded(n) != len - 32 {
                     return Err(bad("data length doesn't match the payload"));
                 }
                 Command::WriteTexture {
                     handle: w(0),
-                    x: w(1),
-                    y: w(2),
-                    width: w(3),
-                    height: w(4),
-                    data: &p[24..24 + n],
+                    level: w(1),
+                    layer: w(2),
+                    x: w(3),
+                    y: w(4),
+                    width: w(5),
+                    height: w(6),
+                    data: &p[32..32 + n],
                 }
             }
             Opcode::CreateSampler => {
-                exactly(4)?;
-                if w(1) > 1 || w(2) > 1 {
-                    return Err(bad("a sampler's filter and address are 0 or 1"));
+                exactly(6)?;
+                if w(1) > 1 || w(2) > 1 || w(4) > 1 {
+                    return Err(bad("a sampler's filters and address are 0 or 1"));
+                }
+                if w(5) == 0 || w(5) > MAX_ANISOTROPY {
+                    return Err(bad("a sampler's anisotropy is 1 to 16"));
+                }
+                if w(5) > 1 && (w(1) == 0 || w(4) == 0) {
+                    return Err(bad("an anisotropic sampler filters linearly, between levels too"));
                 }
                 let compare = match w(3) {
                     0 => None,
@@ -924,24 +1506,172 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     linear: w(1) == 1,
                     repeat: w(2) == 1,
                     compare,
+                    mip_linear: w(4) == 1,
+                    anisotropy: w(5),
                 }
             }
             Opcode::BeginPass => {
-                exactly(9)?;
-                if w(1) > 3 || w(7) > 1 {
+                if words < 2 {
+                    return Err(bad("expected at least 2 words"));
+                }
+                let n = w(0) as usize;
+                if n > MAX_COLOR_ATTACHMENTS {
+                    return Err(bad("a pass has at most four colour targets"));
+                }
+                if words != 2 + 8 * n + 4 {
+                    return Err(bad("the colour targets don't fill the payload"));
+                }
+                if w(1) > 1 {
+                    return Err(bad("the join word is 0 or 1"));
+                }
+                let mut colors = Vec::with_capacity(n);
+                for k in 0..n {
+                    let at = 2 + 8 * k;
+                    if w(at + 3) > 1 {
+                        return Err(bad("a load is 0 (clear) or 1 (keep)"));
+                    }
+                    colors.push(ColorTarget {
+                        texture: w(at),
+                        level: w(at + 1),
+                        layer: w(at + 2),
+                        keep: w(at + 3) == 1,
+                        clear: [4, 5, 6, 7].map(|i| f32::from_bits(w(at + i))),
+                    });
+                }
+                if colors.iter().any(|c| c.texture == SCREEN) && n != 1 {
+                    return Err(bad("a pass on the screen has the screen as its one colour"));
+                }
+                let d = 2 + 8 * n;
+                if w(d + 2) > 1 {
+                    return Err(bad("a load is 0 (clear) or 1 (keep)"));
+                }
+                let mut pass = Pass::new(&colors);
+                pass.join = w(1) == 1;
+                pass.depth = w(d);
+                pass.depth_layer = w(d + 1);
+                pass.keep_depth = w(d + 2) == 1;
+                pass.clear_depth = f32::from_bits(w(d + 3));
+                Command::BeginPass(pass)
+            }
+            Opcode::CopyTexture => {
+                exactly(12)?;
+                Command::CopyTexture {
+                    source: TexelRect {
+                        texture: w(0),
+                        level: w(1),
+                        layer: w(2),
+                        x: w(3),
+                        y: w(4),
+                        width: w(10),
+                        height: w(11),
+                    },
+                    destination: TexelAt {
+                        texture: w(5),
+                        level: w(6),
+                        layer: w(7),
+                        x: w(8),
+                        y: w(9),
+                    },
+                }
+            }
+            Opcode::CopyTextureToBuffer => {
+                exactly(10)?;
+                if w(8) % ROW_ALIGNMENT != 0 || w(9) % ROW_ALIGNMENT != 0 || w(9) == 0 {
+                    return Err(bad("the buffer's offset and bytes per row are multiples of 256"));
+                }
+                let source = TexelRect {
+                    texture: w(0),
+                    level: w(1),
+                    layer: w(2),
+                    x: w(3),
+                    y: w(4),
+                    width: w(5),
+                    height: w(6),
+                };
+                Command::CopyTextureToBuffer { source, buffer: w(7), offset: w(8), bytes_per_row: w(9) }
+            }
+            Opcode::CopyBufferToTexture => {
+                exactly(10)?;
+                if w(1) % 4 != 0 || w(2) % ROW_ALIGNMENT != 0 || w(2) == 0 {
                     return Err(bad(
-                        "a load is 0 (clear) or 1 (keep); the colour's may add 2 (join)",
+                        "the buffer's offset is a multiple of 4, its bytes per row of 256",
                     ));
                 }
-                Command::BeginPass(Pass {
-                    color: w(0),
-                    keep_color: w(1) & 1 == 1,
-                    join: w(1) & PASS_JOIN != 0,
-                    clear: [2, 3, 4, 5].map(|i| f32::from_bits(w(i))),
-                    depth: w(6),
-                    keep_depth: w(7) == 1,
-                    clear_depth: f32::from_bits(w(8)),
-                })
+                let destination = TexelRect {
+                    texture: w(3),
+                    level: w(4),
+                    layer: w(5),
+                    x: w(6),
+                    y: w(7),
+                    width: w(8),
+                    height: w(9),
+                };
+                Command::CopyBufferToTexture {
+                    buffer: w(0),
+                    offset: w(1),
+                    bytes_per_row: w(2),
+                    destination,
+                }
+            }
+            Opcode::SetScissor => {
+                exactly(4)?;
+                Command::SetScissor { x: w(0), y: w(1), width: w(2), height: w(3) }
+            }
+            Opcode::SetViewport => {
+                exactly(6)?;
+                let f = |i: usize| f32::from_bits(w(i));
+                let (rect, min_depth, max_depth) = ([f(0), f(1), f(2), f(3)], f(4), f(5));
+                if !rect.iter().all(|x| x.is_finite()) || rect[2] < 0.0 || rect[3] < 0.0 {
+                    return Err(bad("a viewport is a finite rectangle of positive size"));
+                }
+                if !(0.0..=1.0).contains(&min_depth)
+                    || !(0.0..=1.0).contains(&max_depth)
+                    || min_depth > max_depth
+                {
+                    return Err(bad("a viewport's depths are in [0, 1], the least first"));
+                }
+                Command::SetViewport { rect, min_depth, max_depth }
+            }
+            Opcode::DrawIndexed => {
+                let (bindings, uniforms) = bindings_and_uniforms(p, 9).map_err(bad)?;
+                if w(2) % 4 != 0 || w(3) % 4 != 0 {
+                    return Err(bad("the indices' offset and size must be multiples of 4"));
+                }
+                Command::DrawIndexed {
+                    pipeline: w(0),
+                    indices: w(1),
+                    index_offset: w(2),
+                    index_size: w(3),
+                    index_count: w(4),
+                    instances: w(5),
+                    first_index: w(6),
+                    base_vertex: w(7) as i32,
+                    first_instance: w(8),
+                    bindings,
+                    uniforms,
+                }
+            }
+            Opcode::MultiDrawIndirect | Opcode::MultiDrawIndexedIndirect => {
+                let indexed = opcode == Opcode::MultiDrawIndexedIndirect;
+                let at = if indexed { 4 } else { 1 };
+                let (bindings, uniforms) = bindings_and_uniforms(p, at + 5).map_err(bad)?;
+                if indexed && (w(2) % 4 != 0 || w(3) % 4 != 0) {
+                    return Err(bad("the indices' offset and size must be multiples of 4"));
+                }
+                if w(at + 1) % 4 != 0 || w(at + 4) % 4 != 0 {
+                    return Err(bad("the arguments' and the count's offsets must be multiples of 4"));
+                }
+                Command::MultiDrawIndirect {
+                    pipeline: w(0),
+                    indices: indexed.then(|| [w(1), w(2), w(3)]),
+                    arguments: w(at),
+                    offset: w(at + 1),
+                    count: w(at + 2),
+                    count_buffer: w(at + 3),
+                    count_offset: w(at + 4),
+                    bindings,
+                    uniforms,
+                }
             }
             Opcode::ReadBuffer => {
                 exactly(4)?;
@@ -1028,7 +1758,10 @@ fn expected(words: usize) -> &'static str {
         2 => "expected 2 words",
         4 => "expected 4 words",
         5 => "expected 5 words",
-        9 => "expected 9 words",
+        6 => "expected 6 words",
+        7 => "expected 7 words",
+        10 => "expected 10 words",
+        12 => "expected 12 words",
         _ => unreachable!("no command has exactly {words} words"),
     }
 }
@@ -1059,7 +1792,7 @@ impl Sequencer {
         match (cmd, self.at) {
             (Command::BeginScreenPass { .. } | Command::BeginPass(_), Place::Outside) => {
                 let screen = match cmd {
-                    Command::BeginPass(p) => p.color == SCREEN,
+                    Command::BeginPass(p) => p.on_screen(),
                     _ => true,
                 };
                 self.at = if screen { Place::ScreenPass } else { Place::Pass };
@@ -1068,14 +1801,16 @@ impl Sequencer {
             (Command::BeginScreenPass { .. } | Command::BeginPass(_), _) => {
                 err("a pass is already open")
             }
-            (
-                Command::Draw { .. }
-                | Command::DrawIndirect { .. }
-                | Command::DrawIndexedIndirect { .. },
-                at,
-            ) => {
+            (_, at) if op.is_draw() => {
                 if at == Place::Outside {
                     err("a draw must come inside a pass")
+                } else {
+                    Ok(())
+                }
+            }
+            (Command::SetScissor { .. } | Command::SetViewport { .. }, at) => {
+                if at == Place::Outside {
+                    err("a scissor or a viewport is set inside a pass")
                 } else {
                     Ok(())
                 }
@@ -1091,7 +1826,7 @@ impl Sequencer {
             }
             (Command::EndPass, _) => err("EndPass must close a pass that isn't on the screen"),
             (_, Place::Outside) => Ok(()),
-            (_, _) => err("only draws can happen inside a pass"),
+            (_, _) => err("only draws, scissors and viewports can happen inside a pass"),
         }
     }
 
@@ -1224,6 +1959,7 @@ impl Encoder {
         self
     }
 
+    /// A 2D texture of one level.
     pub fn create_texture(
         &mut self,
         handle: u32,
@@ -1232,9 +1968,7 @@ impl Encoder {
         format: TextureFormat,
         writable: bool,
     ) -> &mut Self {
-        let f = format as u32 | if writable { WRITABLE } else { 0 };
-        self.command(Opcode::CreateTexture, &[handle, width, height, f], &[]);
-        self
+        self.create_texture_of(handle, [width, height, 1], format, writable, TextureKind::D2, 1)
     }
 
     /// A 3D texture: `create_texture`'s, with its depth.
@@ -1247,11 +1981,26 @@ impl Encoder {
         format: TextureFormat,
         writable: bool,
     ) -> &mut Self {
+        self.create_texture_of(handle, [width, height, depth], format, writable, TextureKind::D3, 1)
+    }
+
+    /// Any texture: `size` is its width, height and depth or layers.
+    pub fn create_texture_of(
+        &mut self,
+        handle: u32,
+        size: [u32; 3],
+        format: TextureFormat,
+        writable: bool,
+        kind: TextureKind,
+        levels: u32,
+    ) -> &mut Self {
         let f = format as u32 | if writable { WRITABLE } else { 0 };
-        self.command(Opcode::CreateTexture, &[handle, width, height, f, depth], &[]);
+        let words = [handle, size[0], size[1], f, kind as u32, size[2], levels];
+        self.command(Opcode::CreateTexture, &words, &[]);
         self
     }
 
+    /// Texels into level 0 and layer 0.
     pub fn write_texture(
         &mut self,
         handle: u32,
@@ -1259,8 +2008,110 @@ impl Encoder {
         size: [u32; 2],
         data: &[u8],
     ) -> &mut Self {
-        let words = [handle, origin[0], origin[1], size[0], size[1], data.len() as u32];
+        self.write_texture_at(handle, 0, 0, origin, size, data)
+    }
+
+    pub fn write_texture_at(
+        &mut self,
+        handle: u32,
+        level: u32,
+        layer: u32,
+        origin: [u32; 2],
+        size: [u32; 2],
+        data: &[u8],
+    ) -> &mut Self {
+        let n = data.len() as u32;
+        let words = [handle, level, layer, origin[0], origin[1], size[0], size[1], n];
         self.padded_command(Opcode::WriteTexture, &words, &[data]);
+        self
+    }
+
+    pub fn copy_texture(&mut self, source: TexelRect, destination: TexelAt) -> &mut Self {
+        let (s, d) = (source, destination);
+        let words = [
+            s.texture, s.level, s.layer, s.x, s.y, d.texture, d.level, d.layer, d.x, d.y, s.width,
+            s.height,
+        ];
+        self.command(Opcode::CopyTexture, &words, &[]);
+        self
+    }
+
+    pub fn copy_texture_to_buffer(
+        &mut self,
+        s: TexelRect,
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+    ) -> &mut Self {
+        let words =
+            [s.texture, s.level, s.layer, s.x, s.y, s.width, s.height, buffer, offset, bytes_per_row];
+        self.command(Opcode::CopyTextureToBuffer, &words, &[]);
+        self
+    }
+
+    pub fn copy_buffer_to_texture(
+        &mut self,
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+        d: TexelRect,
+    ) -> &mut Self {
+        let words =
+            [buffer, offset, bytes_per_row, d.texture, d.level, d.layer, d.x, d.y, d.width, d.height];
+        self.command(Opcode::CopyBufferToTexture, &words, &[]);
+        self
+    }
+
+    pub fn set_scissor(&mut self, x: u32, y: u32, width: u32, height: u32) -> &mut Self {
+        self.command(Opcode::SetScissor, &[x, y, width, height], &[]);
+        self
+    }
+
+    pub fn set_viewport(&mut self, rect: [f32; 4], min_depth: f32, max_depth: f32) -> &mut Self {
+        let words = [rect[0], rect[1], rect[2], rect[3], min_depth, max_depth].map(f32::to_bits);
+        self.command(Opcode::SetViewport, &words, &[]);
+        self
+    }
+
+    /// `indices` is the index buffer's handle, offset and size in bytes; `counts` the index
+    /// count, the instance count, the first index, the base vertex (as its bits) and the first
+    /// instance.
+    pub fn draw_indexed(
+        &mut self,
+        pipeline: u32,
+        indices: [u32; 3],
+        counts: [u32; 5],
+        bindings: &[Binding],
+        uniforms: &[u8],
+    ) -> &mut Self {
+        let c = counts;
+        let words = [pipeline, indices[0], indices[1], indices[2], c[0], c[1], c[2], c[3], c[4]];
+        self.bound_command(Opcode::DrawIndexed, &words, bindings, uniforms);
+        self
+    }
+
+    /// `arguments` is the arguments buffer's handle and offset; `count` the most draws, then
+    /// the count buffer (or [`NONE`]) and its offset.
+    pub fn multi_draw_indirect(
+        &mut self,
+        pipeline: u32,
+        indices: Option<[u32; 3]>,
+        arguments: [u32; 2],
+        count: [u32; 3],
+        bindings: &[Binding],
+        uniforms: &[u8],
+    ) -> &mut Self {
+        let mut words = vec![pipeline];
+        let op = match indices {
+            Some(i) => {
+                words.extend(i);
+                Opcode::MultiDrawIndexedIndirect
+            }
+            None => Opcode::MultiDrawIndirect,
+        };
+        words.extend(arguments);
+        words.extend(count);
+        self.bound_command(op, &words, bindings, uniforms);
         self
     }
 
@@ -1276,7 +2127,26 @@ impl Encoder {
         repeat: bool,
         compare: Option<Compare>,
     ) -> &mut Self {
-        let words = [handle, u32::from(linear), u32::from(repeat), compare.map_or(0, |c| c as u32)];
+        self.create_sampler_with(handle, linear, repeat, compare, false, 1)
+    }
+
+    pub fn create_sampler_with(
+        &mut self,
+        handle: u32,
+        linear: bool,
+        repeat: bool,
+        compare: Option<Compare>,
+        mip_linear: bool,
+        anisotropy: u32,
+    ) -> &mut Self {
+        let words = [
+            handle,
+            u32::from(linear),
+            u32::from(repeat),
+            compare.map_or(0, |c| c as u32),
+            u32::from(mip_linear),
+            anisotropy,
+        ];
         self.command(Opcode::CreateSampler, &words, &[]);
         self
     }
@@ -1287,18 +2157,17 @@ impl Encoder {
     }
 
     pub fn begin_pass(&mut self, pass: Pass) -> &mut Self {
-        let c = pass.clear.map(f32::to_bits);
-        let words = [
-            pass.color,
-            u32::from(pass.keep_color) | if pass.join { PASS_JOIN } else { 0 },
-            c[0],
-            c[1],
-            c[2],
-            c[3],
+        let mut words = vec![pass.count, u32::from(pass.join)];
+        for c in pass.colors() {
+            words.extend([c.texture, c.level, c.layer, u32::from(c.keep)]);
+            words.extend(c.clear.map(f32::to_bits));
+        }
+        words.extend([
             pass.depth,
+            pass.depth_layer,
             u32::from(pass.keep_depth),
             pass.clear_depth.to_bits(),
-        ];
+        ]);
         self.command(Opcode::BeginPass, &words, &[]);
         self
     }

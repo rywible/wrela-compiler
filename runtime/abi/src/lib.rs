@@ -323,6 +323,30 @@ impl Limits {
     }
 }
 
+/// The optional WebGPU features the hosts request when the adapter has them, and report to a
+/// program (`std::gpu::features`), in the order `wrela.features` sets their bits: WebGPU's names.
+/// None is required: a program checks before it records what needs one. A pipeline's manifest
+/// entry names the ones its shader needs (`requires`).
+pub const FEATURES: [&str; 12] = [
+    "shader-f16",
+    "subgroups",
+    "texture-compression-bc",
+    "texture-compression-etc2",
+    "texture-compression-astc",
+    "float32-filterable",
+    "float32-blendable",
+    "rg11b10ufloat-renderable",
+    "bgra8unorm-storage",
+    "timestamp-query",
+    "chromium-experimental-multi-draw-indirect",
+    "indirect-first-instance",
+];
+
+/// The bit of `wrela.features`' answer that says a device has feature `name` ([`FEATURES`]).
+pub fn feature_bit(name: &str) -> Option<u32> {
+    FEATURES.iter().position(|f| *f == name).map(|i| 1 << i)
+}
+
 /// The checked-in files generated from this crate, each as (path, contents): the browser
 /// runtime's constants ([`typescript`]), std's ([`wrela`]) and the test vectors ([`vectors`]).
 /// `cargo run -p wrela-abi --bin generate` writes them.
