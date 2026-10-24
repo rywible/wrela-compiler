@@ -208,8 +208,10 @@ impl Surface for Powers {
 }
 
 /// A sphere trace: the distance travelled along `dir` from the point toward a sphere, in at
-/// most 24 steps, stopping once it's close (`break` on the input: language.md §14.2). Its
-/// interval runs the steps' count, and joins where the stop differs between the box's points.
+/// most 24 steps, stopping once it's close (`break` on the input: language.md §14.2), and a
+/// little for each step taken, counted before the test. Its interval runs the steps' count, and
+/// joins where the stop differs between the box's points; once a point has stopped, no later
+/// pass counts it.
 pub struct March: Copy + GpuData {
     pub dir: vec3,
 }
@@ -217,14 +219,16 @@ pub struct March: Copy + GpuData {
 impl Surface for March {
     fn distance(self, p: vec3) -> f32 {
         var t = 0.0
+        var steps = 0.0
         for _ in 0..24 {
+            steps += 1.0
             let d = length(p + self.dir * t - vec3(0.0, 0.0, 3.0)) - 0.8
             if d < 0.001 {
                 break
             }
             t += d
         }
-        t - 2.0
+        t - 2.0 + 0.01 * steps
     }
 }
 

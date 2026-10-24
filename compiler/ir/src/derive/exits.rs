@@ -10,17 +10,23 @@
 //! ```text
 //! loop {                                 done = false
 //!     if i >= n { break }                loop {
-//!     if d(p) < e { break }       =>         skip = false
-//!     p += step                              if i >= n { break }
-//! } continuing { i += 1 }                    if d(p) < e { done = true }
-//!                                            if !(done || skip) { p += step }
+//!     k += 1                                 skip = false
+//!     if d(p) < e { break }       =>         if i >= n { break }
+//!     p += step                              if !done {
+//! } continuing { i += 1 }                        k += 1
+//!                                                if d(p) < e { done = true }
+//!                                                if !(done || skip) { p += step }
+//!                                            }
 //!                                        } continuing { i += 1 }
 //! ```
 //!
-//! A pass's later statements are wrapped in an `if`; a value one of them makes that the
-//! `continuing` block reads would then be unset on the other side, so such a loop is left as it
-//! is (and is E0701, as before). So is a loop whose own exit test comes after an exit on the
-//! input: wrapped, it would be under a condition on the input itself.
+//! A pass is its head, up to its own exit test, which runs on every pass, and the rest, which
+//! runs only until an exit on the input is taken. The head may only compute values and test
+//! them: whatever it changed would go on changing after the exit. The rest is wrapped in an
+//! `if`, so a value it makes that the `continuing` block reads would be unset on the other side.
+//! A loop that breaks either rule is left as it is (and is E0701, as before), as is one whose own
+//! exit test comes after an exit on the input: wrapped, it would be under a condition on the
+//! input itself.
 
 use crate::*;
 use std::collections::HashSet;
@@ -55,11 +61,10 @@ fn rewrite(
             changed |= rewrite(g, inner, bool_ty, active);
         }
         if let Stmt::Loop { body, continuing } = &mut s
-            && let Some((done, skip, new_body)) = flag_loop(g, body, continuing, bool_ty, active)
+            && let Some((done, new_body)) = flag_loop(g, body, continuing, bool_ty, active)
         {
             let f = g.let_(&mut out, bool_ty, Expr::Const(Const::Bool(false)));
             out.push(Stmt::Store(Place::local(done), f));
-            let _ = skip;
             *body = new_body;
             changed = true;
         }
@@ -69,17 +74,24 @@ fn rewrite(
     changed
 }
 
-/// The loop's body with its exits under conditions on the input made flags, and the flags'
-/// locals; `None` when it has none, or when a value the wrapped statements make is read outside
-/// them.
+/// The loop's body with its exits under conditions on the input made flags, and the local of a
+/// `break`'s flag, which must start false before the loop; `None` when it has none, or when its
+/// head or its rest breaks a rule above.
 fn flag_loop(
     g: &mut Function,
     body: &Block,
     continuing: &Block,
     bool_ty: TypeId,
     active: &dyn Fn(ValueId) -> bool,
-) -> Option<(LocalId, LocalId, Block)> {
+) -> Option<(LocalId, Block)> {
     if !has_active_exit(body, false, active) {
+        return None;
+    }
+    // The head: up to the loop's own exit test, the last `break` before an exit on the input.
+    let first_exit =
+        body.iter().position(|s| has_active_exit(std::slice::from_ref(s), false, active))?;
+    let head = body[..first_exit].iter().rposition(|s| breaks(std::slice::from_ref(s)))? + 1;
+    if !body[..head].iter().all(computes_only) {
         return None;
     }
     let done = g.new_local("exit_done", bool_ty);
@@ -87,15 +99,18 @@ fn flag_loop(
     let mut new = Vec::new();
     let f = g.let_(&mut new, bool_ty, Expr::Const(Const::Bool(false)));
     new.push(Stmt::Store(Place::local(skip), f));
-    let mut guarded = HashSet::new();
-    let (flagged, _) = flag(g, body.clone(), false, done, skip, bool_ty, active, &mut guarded);
-    new.extend(flagged);
-    // The loop must still end by itself: its own count, a `break` not on the input. A `while`
-    // on the input has none left, and stays E0701.
-    if !breaks(&new) {
+    new.extend(body[..head].iter().cloned());
+    let (rest, _) = flag(g, body[head..].to_vec(), false, done, skip, bool_ty, active);
+    // The rest runs while no exit on the input has been taken; the loop ends by its head's.
+    if breaks(&rest) {
         return None;
     }
-    // Each value the wrapped statements make must be read only inside them.
+    let mut guarded = HashSet::new();
+    visit::walk(&rest, &mut |s| {
+        if let Stmt::Let(v, _) = s {
+            guarded.insert(*v);
+        }
+    });
     let mut read_outside = false;
     visit::walk(continuing, &mut |s| {
         s.for_each_value(&mut |v| read_outside |= guarded.contains(&v))
@@ -103,7 +118,23 @@ fn flag_loop(
     if read_outside {
         return None;
     }
-    Some((done, skip, new))
+    let d = g.let_(&mut new, bool_ty, Expr::Load(Place::local(done)));
+    let go = g.let_(&mut new, bool_ty, Expr::Unary(UnOp::Not, d));
+    new.push(Stmt::If { cond: go, then: rest, else_: Vec::new() });
+    Some((done, new))
+}
+
+/// Whether `s`, in a loop's head, only computes values and tests them: no call (which may change
+/// what it's given), no store, no exit but a `break`.
+fn computes_only(s: &Stmt) -> bool {
+    match s {
+        Stmt::Let(_, Expr::Call(..)) => false,
+        Stmt::Let(..) | Stmt::At(_) | Stmt::Break => true,
+        Stmt::If { then, else_, .. } => {
+            then.iter().all(computes_only) && else_.iter().all(computes_only)
+        }
+        _ => false,
+    }
 }
 
 /// Whether `b` has a `break` of the loop around it (one in a loop inside it is that loop's).
@@ -140,7 +171,6 @@ fn flag(
     skip: LocalId,
     bool_ty: TypeId,
     active: &dyn Fn(ValueId) -> bool,
-    guarded: &mut HashSet<ValueId>,
 ) -> (Block, bool) {
     let mut out = Vec::new();
     let mut sets = false;
@@ -159,8 +189,8 @@ fn flag(
             }
             Stmt::If { cond, then, else_ } => {
                 let u = under || active(cond);
-                let (then, a) = flag(g, then, u, done, skip, bool_ty, active, guarded);
-                let (else_, b) = flag(g, else_, u, done, skip, bool_ty, active, guarded);
+                let (then, a) = flag(g, then, u, done, skip, bool_ty, active);
+                let (else_, b) = flag(g, else_, u, done, skip, bool_ty, active);
                 out.push(Stmt::If { cond, then, else_ });
                 sets |= a || b;
             }
@@ -172,12 +202,7 @@ fn flag(
             if remaining.is_empty() {
                 break;
             }
-            let (inner, _) = flag(g, remaining, under, done, skip, bool_ty, active, guarded);
-            visit::walk(&inner, &mut |s| {
-                if let Stmt::Let(v, _) = s {
-                    guarded.insert(*v);
-                }
-            });
+            let (inner, _) = flag(g, remaining, under, done, skip, bool_ty, active);
             let d = g.let_(&mut out, bool_ty, Expr::Load(Place::local(done)));
             let k = g.let_(&mut out, bool_ty, Expr::Load(Place::local(skip)));
             let either = g.let_(&mut out, bool_ty, Expr::Binary(BinOp::Or, d, k));
