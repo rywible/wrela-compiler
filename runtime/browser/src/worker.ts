@@ -128,6 +128,45 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureF
 /** Visible time, which frames and ticks count (frame.ts). */
 const clock = VisibleClock.create();
 
+/** A thread of the render worker's: this script again, started by the main thread at the render
+ * worker's word, since a worker can't start one in every browser (the Claude app's browser pane
+ * can't), and spoken to through a channel of its own. Its messages and failures come as a
+ * `Worker`'s would. */
+class Thread {
+  static #next = 0;
+  static readonly #all = new Map<number, Thread>();
+  readonly #id = Thread.#next++;
+  readonly #port: MessagePort;
+  /** It failed, or couldn't start: why. */
+  onerror: ((message: string) => void) | null = null;
+
+  constructor(name: string) {
+    const { port1, port2 } = new MessageChannel();
+    this.#port = port1;
+    Thread.#all.set(this.#id, this);
+    self.postMessage({ type: "spawn", id: this.#id, name, port: port2 } satisfies FromWorker, [port2]);
+  }
+
+  set onmessage(f: ((event: MessageEvent) => void) | null) {
+    this.#port.onmessage = f;
+  }
+
+  postMessage(message: ToWorker): void {
+    this.#port.postMessage(message);
+  }
+
+  terminate(): void {
+    if (!Thread.#all.delete(this.#id)) return;
+    this.#port.close();
+    self.postMessage({ type: "stop-thread", id: this.#id } satisfies FromWorker);
+  }
+
+  /** The main thread says thread `id` failed. */
+  static failed(id: number, message: string): void {
+    Thread.#all.get(id)?.onerror?.(message);
+  }
+}
+
 /** The ticker's thread, once the program starts its ticker. A hot reload gives the new
  * build's ticker a new one. */
 const ticker = {
@@ -135,7 +174,7 @@ const ticker = {
   memory: null as WebAssembly.Memory | null,
   /** Resolved with the ticks when the ticker's thread has stopped (test mode, a hot reload). */
   report: null as Promise<{ report: TickReport; log: Uint8Array<ArrayBuffer> | null; replay: Replay }> | null,
-  thread: null as Worker | null,
+  thread: null as Thread | null,
 };
 
 /** How the ticker's thread runs the ticks: test mode's settings, or none (`NORMAL_TICKS`), and
@@ -158,7 +197,7 @@ function tickerStarter(
     const framesBeforeStart = ticker.control.frames;
     ticker.memory = options.memory;
     if (replay === null) ring?.attachTicker();
-    const thread = new Worker(self.location.href, { type: "module", name: "wrela sim" });
+    const thread = new Thread("wrela sim");
     ticker.thread = thread;
     ticker.report = new Promise((resolve) => {
       thread.onmessage = (event: MessageEvent<FromTicker>) => {
@@ -168,10 +207,7 @@ function tickerStarter(
         else resolve(msg);
       };
     });
-    thread.onerror = (event) => {
-      event.preventDefault();
-      fatal(new Error(`the ticker's thread failed: ${event.message || "it couldn't start"}`));
-    };
+    thread.onerror = (message) => fatal(new Error(`the ticker's thread failed: ${message}`));
     thread.postMessage({
       type: "ticker",
       ...options,
@@ -195,7 +231,7 @@ const pipelineCache: PipelineCache = new Map();
 let running: Build | null = null;
 
 /** The helper threads the running program started: a hot reload stops them. */
-const helpers: Worker[] = [];
+const helpers: Thread[] = [];
 
 /** What a replaced program hands on to its new build: what it kept, its input not yet read,
  * and its ticks to run again. */
@@ -758,8 +794,9 @@ async function saveResults(
 
 /** Starts a worker thread for the program's parallel jobs: this script again, told to run them. */
 const spawnWorker: SpawnWorker = (module, memory, index, onPrint) => {
-  const thread = new Worker(self.location.href, { type: "module", name: `wrela thread ${index}` });
+  const thread = new Thread(`wrela thread ${index}`);
   helpers.push(thread);
+  thread.onerror = (message) => fatal(new Error(`worker thread ${index} failed: ${message}`));
   thread.onmessage = (event: MessageEvent<FromHelper>) => onPrint(event.data.line);
   thread.postMessage({ type: "thread", module, memory, index } satisfies ToWorker);
 };
@@ -779,16 +816,25 @@ const clipSaved = Promise.withResolvers<void>();
 /** Test mode: resolved with what the page loaded, when the main thread answers. */
 const pageLoaded = Promise.withResolvers<{ opened_ms: number; resources: Loaded[] }>();
 
-self.onmessage = (event: MessageEvent<ToWorker>) => {
-  const msg = event.data;
+/** What a message to this script does: from the main thread, or, on a thread of the render
+ * worker's, from the render worker over the channel `reply` answers on. */
+function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => void): void {
   switch (msg.type) {
+    case "parent":
+      // This is a thread the main thread started for the render worker: its work comes on this
+      // channel.
+      msg.port.onmessage = (e: MessageEvent<ToWorker>) => receive(e.data, (m) => msg.port.postMessage(m));
+      return;
+    case "thread-failed":
+      Thread.failed(msg.id, msg.message);
+      return;
     case "load":
       pageLoaded.resolve(msg);
       return;
     case "ticker": {
       // This is the ticker's thread: it runs until it's stopped, or the page goes away.
       const { type: _, ...start } = msg;
-      void runTicker(start, (m) => self.postMessage(m));
+      void runTicker(start, reply);
       return;
     }
     case "audio-rendered":
@@ -808,9 +854,7 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       return;
     case "thread":
       // It runs until the program shuts it down, or the page goes away.
-      void runWorker(msg.module, msg.memory, msg.index, (line) => {
-        self.postMessage({ type: "print", line } satisfies FromHelper);
-      });
+      void runWorker(msg.module, msg.memory, msg.index, (line) => reply({ type: "print", line }));
       return;
     case "start": {
       base = msg.base;
@@ -850,4 +894,6 @@ self.onmessage = (event: MessageEvent<ToWorker>) => {
       ticker.control.wake();
       return;
   }
-};
+}
+
+self.onmessage = (event: MessageEvent<ToWorker>) => receive(event.data, (m) => self.postMessage(m));

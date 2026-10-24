@@ -1,5 +1,6 @@
 // Messages between the threads: the main thread (main.ts), the render worker (worker.ts), and the
-// threads the render worker starts (the ticker's, ticker.ts, and the helpers).
+// threads the render worker asks the main thread to start (the ticker's, ticker.ts, and the
+// helpers), which it then speaks to through a channel of each one's own.
 
 import type { Scripted } from "./input.ts";
 import type { TestParams } from "./testmode.ts";
@@ -32,6 +33,11 @@ export type ToWorker =
   | { type: "resize"; width: number; height: number }
   | { type: "visibility"; visible: boolean }
   | { type: "host-reply"; id: number; bytes: Uint8Array<ArrayBuffer>; error: string | null }
+  /** To a thread the main thread started for the render worker: its channel to the render
+   * worker, on which its work comes and its answers go. */
+  | { type: "parent"; port: MessagePort }
+  /** A thread the render worker asked for failed, or couldn't start. */
+  | { type: "thread-failed"; id: number; message: string }
   /** To a worker thread the render worker starts: run the program's jobs (`runWorker`). */
   | { type: "thread"; module: WebAssembly.Module; memory: WebAssembly.Memory; index: number }
   /** Test mode: the main thread has rendered the voice and saved its samples. */
@@ -64,6 +70,11 @@ export type FromWorker =
   | { type: "fatal"; message: string; unsupported: boolean }
   | { type: "host-request"; id: number; service: string; bytes: Uint8Array<ArrayBuffer> }
   | { type: "presented" }
+  /** Start a thread, this script again, named `name`, and hand it `port` (a `parent` message):
+   * a worker can't start one in every browser (the Claude app's browser pane can't). */
+  | { type: "spawn"; id: number; name: string; port: MessagePort }
+  /** Stop thread `id`. */
+  | { type: "stop-thread"; id: number }
   /** Test mode, `latency` or `keylatency`: the frames have started; send the events over `ms`
    * milliseconds. */
   | { type: "latency-start"; ms: number }

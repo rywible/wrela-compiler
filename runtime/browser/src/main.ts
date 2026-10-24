@@ -311,9 +311,29 @@ function start(): void {
     const platform = new BrowserPlatform(canvas, visible => worker.postMessage({ type: "visibility", visible: visible && document.visibilityState === "visible" } satisfies ToWorker));
     const clip = new Clip();
     let maxScreen = Infinity;
+    // The render worker's threads (the ticker's, the helpers): started here, since a worker
+    // can't start one in every browser, and handed its channel to the render worker.
+    const threads = new Map<number, Worker>();
+    const threadFailed = (id: number, message: string) =>
+      worker.postMessage({ type: "thread-failed", id, message } satisfies ToWorker);
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
-      if (msg.type === "screen-limit") {
+      if (msg.type === "spawn") {
+        const thread = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: msg.name });
+        threads.set(msg.id, thread);
+        thread.onerror = (e) => {
+          e.preventDefault();
+          threadFailed(msg.id, e.message || "it couldn't start");
+        };
+        // A thread's own failure outside its work (the script's) comes to its starter.
+        thread.onmessage = (e: MessageEvent<FromWorker>) => {
+          if (e.data.type === "fatal") threadFailed(msg.id, e.data.message);
+        };
+        thread.postMessage({ type: "parent", port: msg.port } satisfies ToWorker, [msg.port]);
+      } else if (msg.type === "stop-thread") {
+        threads.get(msg.id)?.terminate();
+        threads.delete(msg.id);
+      } else if (msg.type === "screen-limit") {
         maxScreen = msg.max;
         Object.assign(sized, fitSize(sized.width, sized.height, maxScreen));
       } else if (msg.type === "host-request") {
