@@ -29,7 +29,7 @@ fn diagnostics(ds: [toolchain::Diagnostic]) {
 
 pub fn tool() -> u32 {
     let given = args()
-    let what = given[0].clone()
+    borrow what = given[0]
     var paths: Vec<String> = Vec::new()
     paths.push(given[1].clone())
     let building = what.as_str() == "build" || what.as_str() == "build-optimized" || what.as_str() == "build-timed" || what.as_str() == "build-testing"
@@ -628,7 +628,7 @@ fn failed(e: ToolError) -> u32 {
 
 pub fn tool() -> u32 {
     let given = args()
-    let what = given[0].clone()
+    borrow what = given[0]
     if what.as_str() == "lift" {
         var options = toolchain::options()
         options.lift.push(given[3].clone())
