@@ -2899,7 +2899,7 @@ std and the engine give an author forms for building subjects such as creatures,
   - `Paint`: colour that changes with height across a part;
   - `canine(wolf(), coat)`: a whole canine from a few proportions (`wolf()` gives a grey wolf's), on a rigged skeleton. Its `ruff` and `brush` are the coat's mass, built into the forms of the neck and the tail.
 - **Colour across a part:** std::field's `with_at(|p| ...)` gives a surface channels from a function of the point, where `with(c)` gives one value.
-- **`wrela doc`** reads the packages that a package depends on (`wrela doc engine::quadruped <package>`), shows a struct's fields with their doc comments, and lists the built-in functions (`wrela doc builtins`).
+- **`wrela doc`** reads the packages that a package depends on (`wrela doc engine::quadruped <package>`), shows a struct's fields with their doc comments, and lists the built-in functions and types (`wrela doc builtins`). A built-in type has a page too: `wrela doc vec3` (or `u8`, `str`, `[T]`, `run`, `[T; N]`) shows its section of this spec, the built-in functions that take it as a method, and std's methods of it.
 - **`wrela doc --export <dir> [--commit <sha>] [<package-dir>...]`** writes the reference docs into a new directory, from the same index as `wrela doc`. The same sources give the same bytes. It writes:
   - in Markdown: this spec split at its sections, the lexical structure, the grammar, and a page for each module of std and of each package given;
   - `index.json`: each public item (its path, kind, signature, doc, page, anchor, and source file and line) and each section of the spec's prose;

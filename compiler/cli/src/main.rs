@@ -81,6 +81,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod build;
+mod builtin_types;
 mod doc;
 mod edit;
 mod explain;

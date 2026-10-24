@@ -21,7 +21,7 @@ pub(crate) struct Entry {
     pub(crate) signature: String,
     pub(crate) doc: String,
     /// `file:line` of its declaration, as a diagnostic names the file.
-    at: String,
+    pub(crate) at: String,
     /// Its declaration's file in the repository (`compiler/std/io.wrela`) and line.
     pub(crate) source: String,
     pub(crate) line: usize,
@@ -56,6 +56,8 @@ pub fn run(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // Another name of a built-in type is its page's: `u8` is on `u32`'s, `run` is `[T]`.
+    let query = crate::builtin_types::resolve_alias(query).unwrap_or(query);
     let q: Vec<String> = query.split("::").map(String::from).collect();
     let exact: Vec<usize> =
         (0..index.entries.len()).filter(|&i| index.entries[i].path == q).collect();
@@ -88,6 +90,10 @@ pub fn run(args: &[String]) -> ExitCode {
         println!("the built-in functions (no import; most work on scalars and vectors alike):");
         for &(name, arity, method) in &builtins {
             println!("  {}", builtin_call(name, arity, method));
+        }
+        println!("\nthe built-in types (`wrela doc <type>` shows one):");
+        for (name, summary) in crate::builtin_types::summaries() {
+            println!("  {name:<10} {summary}");
         }
         return ExitCode::SUCCESS;
     }
@@ -290,6 +296,7 @@ pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
             add_item(&mut index, s, item);
         }
     }
+    crate::builtin_types::add(&mut index);
     // Each type's and trait's methods, and the traits a type implements, wherever the impl is.
     for s in &sources {
         for item in &s.parsed.file.items {
@@ -324,10 +331,13 @@ pub(crate) fn index_of(sources: Vec<SourceFile>) -> Index {
     index
 }
 
-/// A type's name as an impl names it: `Arena<T>` is `Arena`.
+/// A type's name as an impl names it: `Arena<T>` is `Arena`; std's impls of a run and of an
+/// array are of the built-in types `[T]` and `[T; N]` (`crate::builtin_types`).
 fn type_name(t: &ast::TypeExpr) -> Option<String> {
     match &t.kind {
         ast::TypeExprKind::Path(p) => p.segments.last().map(|s| s.ident.name.clone()),
+        ast::TypeExprKind::Array(_, None) => Some("[T]".into()),
+        ast::TypeExprKind::Array(_, Some(_)) => Some("[T; N]".into()),
         _ => None,
     }
 }
