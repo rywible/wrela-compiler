@@ -213,7 +213,8 @@ pub fn max_levels(width: u32, height: u32) -> u32 {
 }
 
 impl Checker {
-    /// A checker for a device with WebGPU's default limits and no optional features.
+    /// A checker for a device with WebGPU's default limits and no optional features (its
+    /// features are its limits' `features`).
     pub fn new(manifest: &Manifest) -> Checker {
         Checker::with_limits(manifest, crate::Limits::DEFAULT)
     }
@@ -241,7 +242,7 @@ impl Checker {
             .collect();
         Checker {
             limits,
-            features: Vec::new(),
+            features: limits.feature_names().into_iter().map(String::from).collect(),
             pipelines,
             resources: HashMap::new(),
             resource_undo: Vec::new(),
@@ -345,7 +346,9 @@ impl Checker {
                     handles.extend(bindings.iter().map(|b| b.handle));
                     handles.push(*indices);
                 }
-                Command::MultiDrawIndirect { indices, arguments, count_buffer, bindings, .. } => {
+                Command::MultiDrawIndirect {
+                    indices, arguments, count_buffer, bindings, ..
+                } => {
                     handles.extend(bindings.iter().map(|b| b.handle));
                     handles.push(*arguments);
                     handles.extend(indices.map(|i| i[0]));
@@ -401,7 +404,16 @@ impl Checker {
                 }
                 self.create(op, *handle, Resource::Buffer { size: *size })?;
             }
-            Command::CreateTexture { handle, width, height, format, writable, kind, layers, levels } => {
+            Command::CreateTexture {
+                handle,
+                width,
+                height,
+                format,
+                writable,
+                kind,
+                layers,
+                levels,
+            } => {
                 let max = self.limits.max_texture_size;
                 if *width > max || *height > max {
                     return err(format!(
@@ -742,7 +754,10 @@ impl Checker {
         for c in pass.colors().iter().filter(|c| c.texture != SCREEN) {
             let t = self.texture(op, c.texture)?;
             if t.kind == TextureKind::D3 {
-                return err(format!("texture {} is a 3D texture, so it can't be a target", c.texture));
+                return err(format!(
+                    "texture {} is a 3D texture, so it can't be a target",
+                    c.texture
+                ));
             }
             if t.format.is_depth() {
                 return err(format!(
@@ -753,7 +768,11 @@ impl Checker {
             let renderable = t.format.info().renderable;
             if !self.can(renderable) {
                 let why = match renderable.feature() {
-                    Some(f) => format!("drawing into {} needs the device feature `{}`", t.format.name(), f.name()),
+                    Some(f) => format!(
+                        "drawing into {} needs the device feature `{}`",
+                        t.format.name(),
+                        f.name()
+                    ),
                     None => format!("a pass can't draw into {}", t.format.name()),
                 };
                 return err(format!("texture {}: {why}", c.texture));
@@ -792,7 +811,11 @@ impl Checker {
                 return err("the pass's colour and depth targets differ in size".into());
             }
             size = Some(t.size(0));
-            self.attachments.push(Attachment { handle: pass.depth, level: 0, layer: pass.depth_layer });
+            self.attachments.push(Attachment {
+                handle: pass.depth,
+                level: 0,
+                layer: pass.depth_layer,
+            });
         }
         if pass.count == 0 && pass.depth == NONE {
             return err("a pass needs a colour target or a depth target".into());
@@ -803,7 +826,14 @@ impl Checker {
     }
 
     /// That level `level` and layer `layer` of texture `handle` (`t`) exist.
-    fn subresource(&self, op: Opcode, t: &Texture, handle: u32, level: u32, layer: u32) -> Result<()> {
+    fn subresource(
+        &self,
+        op: Opcode,
+        t: &Texture,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<()> {
         if level >= t.levels || layer >= t.subresource_layers() {
             return Err(CommandError {
                 opcode: op,
@@ -860,7 +890,10 @@ impl Checker {
         if u64::from(bytes_per_row) < row {
             return Err(CommandError {
                 opcode: op,
-                why: format!("a row of {} texels is {row} bytes, more than {bytes_per_row} a row", r.width),
+                why: format!(
+                    "a row of {} texels is {row} bytes, more than {bytes_per_row} a row",
+                    r.width
+                ),
             });
         }
         let rows = u64::from(r.height.div_ceil(b));
@@ -1224,7 +1257,9 @@ mod tests {
                 handle: 3,
                 linear: true,
                 repeat: false,
-                compare: None, mip_linear: false, anisotropy: 1,
+                compare: None,
+                mip_linear: false,
+                anisotropy: 1,
             })
             .expect("sampler");
 
@@ -1252,7 +1287,10 @@ mod tests {
         checker.check(&Command::CreateBuffer { handle: 5, size: 16 }).expect("temporary buffer");
         checker.check(&Command::DestroyBuffer { handle: 5 }).expect("drop temporary buffer");
         checker
-            .check(&Command::BeginPass(Pass { join: false, ..Pass::one(3, false, [0.0; 4]).with_depth(NONE, false, 1.0) }))
+            .check(&Command::BeginPass(Pass {
+                join: false,
+                ..Pass::one(3, false, [0.0; 4]).with_depth(NONE, false, 1.0)
+            }))
             .expect("unfinished pass");
         checker
             .check(&Command::Draw {
@@ -1320,7 +1358,9 @@ mod tests {
                 handle: 2,
                 linear: true,
                 repeat: false,
-                compare: None, mip_linear: false, anisotropy: 1,
+                compare: None,
+                mip_linear: false,
+                anisotropy: 1,
             })
             .expect("sampler");
         checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("pass");
@@ -1376,7 +1416,8 @@ mod tests {
                 levels: 1,
             })
             .expect("depth texture");
-        let pass = Pass { join: false, ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0) };
+        let pass =
+            Pass { join: false, ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0) };
         for clear_depth in [-0.01, 1.01, f32::MIN, f32::MAX] {
             assert_eq!(
                 checker
@@ -1414,7 +1455,10 @@ mod tests {
                 levels: 1,
             })
             .expect("depth texture");
-        let pass = Command::BeginPass(Pass { join: false, ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0) });
+        let pass = Command::BeginPass(Pass {
+            join: false,
+            ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0)
+        });
         checker.set_screen_size(16, 8);
         assert_eq!(
             checker.check(&pass).expect_err("different attachment sizes").why,
@@ -1481,11 +1525,23 @@ mod tests {
         }
         checker.check(&dispatch([1; 3], 3, 4)).expect("a new scope after rejected dispatches");
         assert_eq!(checker.scope.len(), 2);
-        assert_eq!(checker.scope.get(&3), Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }]));
-        assert_eq!(checker.scope.get(&4), Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }]));
+        assert_eq!(
+            checker.scope.get(&3),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }])
+        );
+        assert_eq!(
+            checker.scope.get(&4),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }])
+        );
         checker.check(&dispatch([1; 3], 2, 1)).expect("the next dispatch can reverse uses");
-        assert_eq!(checker.scope.get(&1), Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }]));
-        assert_eq!(checker.scope.get(&2), Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }]));
+        assert_eq!(
+            checker.scope.get(&1),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }])
+        );
+        assert_eq!(
+            checker.scope.get(&2),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }])
+        );
     }
 
     #[test]
@@ -1566,7 +1622,10 @@ mod tests {
             .expect("texture");
         checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("screen pass");
         checker.check(&Command::Present).expect("end screen pass");
-        let bad_pass = Command::BeginPass(Pass { join: false, ..Pass::one(3, false, [0.0; 4]).with_depth(99, false, 1.0) });
+        let bad_pass = Command::BeginPass(Pass {
+            join: false,
+            ..Pass::one(3, false, [0.0; 4]).with_depth(99, false, 1.0)
+        });
         assert_eq!(
             checker.check(&bad_pass).expect_err("missing depth target").why,
             "there's no texture 99"

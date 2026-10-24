@@ -148,13 +148,18 @@ pub(crate) enum ParamClass {
         elem: TyId,
         len: u32,
     },
-    /// A `Texture`, a `DepthTexture` or a `Texture3d` (`three`), bound by its handle; or a
-    /// kernel's `Texels` or `Texels3d` (`storage`), bound by its texture's. Its texels' format
-    /// (a depth texture's is `R32Float`).
+    /// A texture of any kind (`dim`), bound by its handle and view; or a kernel's `Texels`,
+    /// `TexelsArray` or `Texels3d` (`storage`), bound by its texture's. Its texels' format (a
+    /// depth texture's is `R32Float`).
     Texture {
         depth: bool,
         storage: bool,
-        three: bool,
+        dim: ir::TexDim,
+        format: ir::TextureFormat,
+    },
+    /// A kernel's `MipStep<F>`: bound to two views of one texture, the level it reads (a
+    /// sampled texture), then the level it writes (a storage texture).
+    MipStep {
         format: ir::TextureFormat,
     },
     /// A `Sampler` or a `ComparisonSampler`, bound by its handle.
@@ -198,9 +203,17 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
         return class;
     }
     // A kernel's texels to write (the textures it reads are `resource_class`'s).
-    if let Some(l @ (Lang::Texels | Lang::Texels3d)) = p.lang_of_ty(ty) {
-        let (three, format) = (l == Lang::Texels3d, texture_format(cx, ty));
-        return ParamClass::Texture { depth: false, storage: true, three, format };
+    if let Some(l @ (Lang::Texels | Lang::Texels3d | Lang::TexelsArray)) = p.lang_of_ty(ty) {
+        let dim = match l {
+            Lang::Texels3d => ir::TexDim::D3,
+            Lang::TexelsArray => ir::TexDim::D2Array,
+            _ => ir::TexDim::D2,
+        };
+        let format = texture_format(cx, ty);
+        return ParamClass::Texture { depth: false, storage: true, dim, format };
+    }
+    if p.lang_of_ty(ty) == Some(Lang::MipStep) {
+        return ParamClass::MipStep { format: texture_format(cx, ty) };
     }
     match p.types.kind(ty) {
         TyKind::Adt(_, args) if matches!(p.lang_of_ty(ty), Some(Lang::Slots | Lang::One)) => {
@@ -235,25 +248,25 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
 /// texture, sampler or span. `None` for the rest.
 fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
     let p = &cx.checked.program;
+    let colour = |dim| ParamClass::Texture {
+        depth: false,
+        storage: false,
+        dim,
+        format: texture_format(cx, ty),
+    };
+    let depth = |dim| ParamClass::Texture {
+        depth: true,
+        storage: false,
+        dim,
+        format: ir::TextureFormat::R32Float,
+    };
     Some(match (p.lang_of_ty(ty)?, p.types.kind(ty)) {
-        (Lang::Texture, _) => ParamClass::Texture {
-            depth: false,
-            storage: false,
-            three: false,
-            format: texture_format(cx, ty),
-        },
-        (Lang::DepthTexture, _) => ParamClass::Texture {
-            depth: true,
-            storage: false,
-            three: false,
-            format: ir::TextureFormat::R32Float,
-        },
-        (Lang::Texture3d, _) => ParamClass::Texture {
-            depth: false,
-            storage: false,
-            three: true,
-            format: texture_format(cx, ty),
-        },
+        (Lang::Texture, _) => colour(ir::TexDim::D2),
+        (Lang::TextureArray, _) => colour(ir::TexDim::D2Array),
+        (Lang::Cubemap, _) => colour(ir::TexDim::Cube),
+        (Lang::Texture3d, _) => colour(ir::TexDim::D3),
+        (Lang::DepthTexture, _) => depth(ir::TexDim::D2),
+        (Lang::DepthTextureArray, _) => depth(ir::TexDim::D2Array),
         (Lang::Sampler, _) => ParamClass::Sampler { comparison: false },
         (Lang::ComparisonSampler, _) => ParamClass::Sampler { comparison: true },
         (Lang::GpuSpan, TyKind::Adt(_, args)) => {
@@ -268,14 +281,8 @@ fn resource_class(cx: &Cx, ty: TyId) -> Option<ParamClass> {
 pub(crate) fn texture_format(cx: &Cx, ty: TyId) -> ir::TextureFormat {
     let p = &cx.checked.program;
     let TyKind::Adt(_, args) = p.types.kind(ty) else { return ir::TextureFormat::R32Float };
-    match args.first().and_then(|&f| p.lang_of_ty(f)) {
-        Some(Lang::Rgba8) => ir::TextureFormat::Rgba8,
-        Some(Lang::Rgba16Float) => ir::TextureFormat::Rgba16Float,
-        Some(Lang::R16Float) => ir::TextureFormat::R16Float,
-        Some(Lang::Rg16Float) => ir::TextureFormat::Rg16Float,
-        Some(Lang::R32Uint) => ir::TextureFormat::R32Uint,
-        _ => ir::TextureFormat::R32Float,
-    }
+    format_of_lang(args.first().and_then(|&f| p.lang_of_ty(f)))
+        .unwrap_or(ir::TextureFormat::R32Float)
 }
 
 /// How a group's field of type `ty` is passed: bound, a group of its own, or a value in the
@@ -436,6 +443,7 @@ impl Interface {
             ParamClass::Buffer { .. }
             | ParamClass::Append { .. }
             | ParamClass::Texture { .. }
+            | ParamClass::MipStep { .. }
             | ParamClass::Sampler { .. } => self.bound.push(leaf),
             ParamClass::Uniform => self.uniforms.push(leaf),
             ParamClass::Group => {
@@ -507,13 +515,58 @@ fn resource_bindings(
     })
 }
 
-/// The binding of a texture or sampler argument: its handle, and no range.
-fn handle_binding(fl: &mut Fl, arg: &mir::Place) -> Option<[ir::ValueId; 3]> {
+/// The bindings of a texture or sampler argument: its handle, and its view's level and layer
+/// words (`wrela_abi::stream::View`: 0 the whole texture, else one more than the one level or
+/// layer). A view (`tex.level(i)`, `arr.layer(i)`) names its texture through its borrow; a
+/// cube's handle is its array's; a mip step binds two views, the level it reads then the one it
+/// writes.
+fn handle_binding(fl: &mut Fl, arg: &mir::Place) -> Option<Vec<ir::ValueId>> {
     let u = fl.mb.m.types.u32();
+    let t = fl.place_src_ty(arg);
+    let lang = fl.cx.checked.program.lang_of_ty(t);
     let v = fl.read(arg)?;
-    let handle = fl.value(u, ir::Expr::Extract(v, 0));
     let zero = fl.u32c(0);
-    Some([handle, zero, zero])
+    let one = fl.u32c(1);
+    // The handle of the texture a view's field 0 borrows.
+    let through = |fl: &mut Fl| -> Option<ir::ValueId> {
+        let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
+        let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
+        let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
+        Some(fl.value(u, ir::Expr::Load(at)))
+    };
+    let plus_one =
+        |fl: &mut Fl, x: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Add, x, one));
+    Some(match lang {
+        Some(Lang::TextureLevel | Lang::TextureLevelMut) => {
+            let handle = through(fl)?;
+            let level = fl.value(u, ir::Expr::Extract(v, 1));
+            vec![handle, plus_one(fl, level), zero]
+        }
+        Some(Lang::TextureLayer) => {
+            let handle = through(fl)?;
+            let layer = fl.value(u, ir::Expr::Extract(v, 1));
+            vec![handle, zero, plus_one(fl, layer)]
+        }
+        Some(Lang::TextureLayerMut) => {
+            let handle = through(fl)?;
+            let layer = fl.value(u, ir::Expr::Extract(v, 1));
+            let level = fl.value(u, ir::Expr::Extract(v, 2));
+            vec![handle, plus_one(fl, level), plus_one(fl, layer)]
+        }
+        // The level before (read: its word is `level`, one more than `level - 1`), then the
+        // level (written).
+        Some(Lang::TextureStep) => {
+            let handle = through(fl)?;
+            let level = fl.value(u, ir::Expr::Extract(v, 1));
+            vec![handle, level, zero, handle, plus_one(fl, level), zero]
+        }
+        Some(Lang::Cubemap) => {
+            let at = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
+            let array = fl.value(at, ir::Expr::Extract(v, 0));
+            vec![fl.value(u, ir::Expr::Extract(array, 0)), zero, zero]
+        }
+        _ => vec![fl.value(u, ir::Expr::Extract(v, 0)), zero, zero],
+    })
 }
 
 /// The bindings of argument `arg` for an entry point's parameter of type `pt` that `class`
@@ -529,7 +582,7 @@ fn bindings_for(
         ParamClass::Buffer { .. } | ParamClass::Append { .. } => {
             resource_bindings(fl, pt, arg, span)
         }
-        _ => handle_binding(fl, arg).map(Vec::from),
+        _ => handle_binding(fl, arg),
     }
 }
 
@@ -862,26 +915,58 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     if !targets.contains(&target) {
         targets.push(target);
     }
+    let u = fl.mb.m.types.u32();
+    let kind = match (&d.indirect, &d.indices, d.multi) {
+        (None, None, _) => ir::DrawKind::Direct,
+        (None, Some(_), _) => ir::DrawKind::Indexed,
+        (Some(_), None, false) => ir::DrawKind::Indirect,
+        (Some(_), Some(_), false) => ir::DrawKind::IndexedIndirect,
+        (Some(_), indices, true) => ir::DrawKind::Multi { indexed: indices.is_some() },
+    };
     // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
     // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
+    let mut index_size = None;
     if let Some((place, at)) = &d.indices {
         let elem = buffer_elem(fl, place);
         let b = buffer_binding(fl, place, elem, *at)?;
+        index_size = Some(b[2]);
         counts.extend(b);
     }
-    // The counts, or where their buffer holds them.
-    match &d.indirect {
-        Some((place, at)) => {
+    match kind {
+        ir::DrawKind::Direct => {
+            counts.extend([fl.operand(&d.vertices)?, fl.operand(&d.instances)?]);
+        }
+        ir::DrawKind::Indexed => {
+            // The index count (`u32::MAX`: all the indices past the first), the instances, the
+            // first index, the base vertex and the first instance.
+            let given = fl.operand(&d.vertices)?;
+            let first = fl.operand(&d.more[0])?;
+            let size = index_size?;
+            let four = fl.u32c(4);
+            let all = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, size, four));
+            let rest = fl.value(u, ir::Expr::Binary(ir::BinOp::Sub, all, first));
+            let max = fl.u32c(u32::MAX);
+            let b = fl.mb.m.types.bool();
+            let every = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, given, max));
+            let count =
+                fl.value(u, ir::Expr::Select { cond: every, if_true: rest, if_false: given });
+            let instances = fl.operand(&d.instances)?;
+            let base = fl.operand(&d.more[1])?;
+            let first_instance = fl.operand(&d.more[2])?;
+            counts.extend([count, instances, first, base, first_instance]);
+        }
+        ir::DrawKind::Indirect | ir::DrawKind::IndexedIndirect | ir::DrawKind::Multi { .. } => {
+            let (place, at) = d.indirect.as_ref()?;
             let [handle, offset] = indirect_binding(fl, place, *at)?;
             counts.extend([handle, offset]);
+            if let ir::DrawKind::Multi { .. } = kind {
+                // The most draws, and no count buffer.
+                let n = fl.operand(&d.vertices)?;
+                counts.extend([n, fl.u32c(wrela_abi::stream::NONE), fl.u32c(0)]);
+            }
         }
-        None => {
-            let vertices = fl.operand(&d.vertices)?;
-            let instances = fl.operand(&d.instances)?;
-            counts.extend([vertices, instances]);
-        }
-    };
+    }
     let arg = |e: usize, i: usize| {
         let args = d.args.iter().filter(|a| a.0 == e).map(|(_, i, p, s)| (*i, p, *s));
         shaders[e].arg(i, args)
@@ -894,22 +979,17 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     let mut args = counts;
     args.extend(handles);
     let uniform = uniform_block(fl, &fields, &vals, &mut args, "draw", span);
-    let op = ir::HostOp::Draw {
-        pipeline: pindex,
-        bindings,
-        uniform,
-        indirect: d.indirect.is_some(),
-        indexed: d.indices.is_some(),
-        target,
-    };
+    let op = ir::HostOp::Draw { pipeline: pindex, bindings, uniform, kind, target };
     fl.emit(ir::Stmt::Eval(ir::Expr::Host(op, args)));
     Some(())
 }
 
-/// What a draw draws into: its pass's targets, as the pass's type says (§18). A draw whose
-/// fragment shader's output its pass's targets can't take is E0603: one that gives its
-/// fragments their depth (`WithDepth`) needs a depth target, one that returns a `u32` an
-/// `R32Uint` texture, which nothing else is drawn into.
+/// What a draw draws into: its pass's targets, as the pass's type says (§18): its colour
+/// formats (a pass type's type arguments), whether it has depth, and whether it's the screen. A
+/// draw whose fragment shader's output its pass's targets can't take is E0603: as many colours
+/// as targets, an integer colour exactly where the format holds integers, a depth target for
+/// one that gives its fragments their depth (`WithDepth`), and a blend only into a format that
+/// blends.
 fn draw_target(
     fl: &mut Fl,
     d: &mir::Draw,
@@ -919,13 +999,24 @@ fn draw_target(
     let t = fl.place_src_ty(&d.pass.0);
     let t = fl.concrete(t);
     let p = &fl.cx.checked.program;
-    // `Pass<F>`'s and `DepthPass<F>`'s `F` is the target texture's format, as `Texture<F>`'s.
-    let texture =
-        |depth| ir::RenderTarget { color: Some(texture_format(fl.cx, t)), depth, screen: false };
+    let formats: Vec<ir::TextureFormat> = match p.types.kind(t) {
+        TyKind::Adt(_, args) => {
+            args.iter().filter_map(|&a| format_of_lang(p.lang_of_ty(a))).collect()
+        }
+        _ => Vec::new(),
+    };
     let target = match p.lang_of_ty(t) {
-        Some(Lang::Pass) => texture(false),
-        Some(Lang::DepthPass) => texture(true),
-        Some(Lang::DepthOnlyPass) => ir::RenderTarget { color: None, depth: true, screen: false },
+        Some(Lang::Pass | Lang::LayerPass | Lang::Pass2 | Lang::Pass3 | Lang::Pass4) => {
+            ir::RenderTarget::of(&formats, false)
+        }
+        Some(
+            Lang::DepthPass
+            | Lang::LayerDepthPass
+            | Lang::DepthPass2
+            | Lang::DepthPass3
+            | Lang::DepthPass4,
+        ) => ir::RenderTarget::of(&formats, true),
+        Some(Lang::DepthOnlyPass | Lang::DepthLayerPass) => ir::RenderTarget::of(&[], true),
         Some(Lang::ScreenPass) => ir::RenderTarget::screen(false),
         Some(Lang::ScreenDepthPass) => ir::RenderTarget::screen(true),
         _ => {
@@ -938,37 +1029,112 @@ fn draw_target(
     let ret = ret_type(fl.cx, fragment.func, &fragment.substs);
     let p = &fl.cx.checked.program;
     let output = FragmentOutput::of(p, ret)?;
-    let (writes_depth, uint) = (output.writes_depth(), output.uint());
-    let integer = target.color == Some(ir::TextureFormat::R32Uint);
     let pass = p.display_ty(t);
-    let why = if writes_depth && !target.depth {
+    let colours: Vec<ir::TextureFormat> = target.colors().collect();
+    let blends = blends_of(&d.state, &output);
+    let why = if output.writes_depth() && !target.depth {
         Some(format!(
             "its fragment shader gives its fragments their depth (`WithDepth`), so it draws in a pass with a depth target, and a `{pass}` has none"
         ))
-    } else if uint && target.color.is_some() && !integer {
+    } else if d.state.blend_given && output.over {
+        Some("its fragment shader returns an `Over` to blend, and the draw gives `blend:` too: give one".to_string())
+    } else if !colours.is_empty() && colours.len() != output.colours.len() {
         Some(format!(
-            "its fragment shader returns a `u32`, so it draws into an `R32Uint` texture, and a `{pass}` draws into another format"
+            "its fragment shader writes {} colours, and a `{pass}` has {} targets",
+            output.colours.len(),
+            colours.len()
         ))
-    } else if !uint && integer {
+    } else if d.state.blend_count > 0 && usize::from(d.state.blend_count) != output.colours.len() {
         Some(format!(
-            "its fragment shader returns a colour, which an `R32Uint` texture doesn't take, and a `{pass}` draws into one"
-        ))
-    } else if output.blends() && target.color.is_some_and(|format| !format.filterable()) {
-        Some(format!(
-            "its fragment shader returns an `Over` colour to blend, and a `{pass}` draws into a format that doesn't support alpha blending"
+            "`blends:` gives {} blends for {} colours",
+            d.state.blend_count,
+            output.colours.len()
         ))
     } else {
-        None
+        colours.iter().zip(&output.colours).enumerate().find_map(|(k, (f, (c, _)))| {
+            if c.uint != f.is_uint() {
+                Some(format!(
+                    "its fragment shader writes {} to target {k}, and a `{pass}`'s is {}, which holds {}",
+                    if c.uint { "integers" } else { "floats" },
+                    f.name(),
+                    if f.is_uint() { "integers" } else { "floats" }
+                ))
+            } else if blends[k] != wrela_abi::manifest::Blend::Replace && !f.blendable() {
+                Some(format!(
+                    "its colour {k} is blended, and a `{pass}`'s target {k} is {}, which doesn't blend",
+                    f.name()
+                ))
+            } else {
+                None
+            }
+        })
     };
     if let Some(why) = why {
         fl.cx.err(Diagnostic::new(
             codes::E0603,
             span,
             format!("this draw's pass can't take it: {why}"),
-        ).with_help("draw it in a pass whose target takes what its fragment shader returns, or change what the shader returns to the pass's format"));
+        ).with_help("draw it in a pass whose targets take what its fragment shader returns, or change what the shader returns to the pass's formats"));
+        return None;
+    }
+    let bytes = wrela_abi::stream::color_attachment_bytes(&colours);
+    if bytes > wrela_abi::stream::MAX_COLOR_ATTACHMENT_BYTES {
+        let names: Vec<&str> = colours.iter().map(|f| f.name()).collect();
+        fl.cx.err(
+            Diagnostic::new(
+                codes::E0602,
+                span,
+                format!(
+                    "this draw's pass draws into {}, which take {bytes} bytes a sample: WebGPU's limit is 32",
+                    names.join(", ")
+                ),
+            )
+            .with_note("each target's cost is rounded up to its alignment before the next's is added (WebGPU's algorithm): `rgba8unorm` and `rgba16float` cost 8, `rgba32float` 16, `r32uint` and `r32float` 4")
+            .with_help("draw into fewer or smaller targets, or put the larger ones first"),
+        );
         return None;
     }
     Some(target)
+}
+
+/// The blend of each of a draw's colours: what the draw says (`blend:` for all, `blends:` for
+/// each), else `Over` for a shader returning `Over`, else `Replace`.
+pub fn blends_of(
+    state: &wrela_sema::thir::RenderState,
+    output: &FragmentOutput,
+) -> Vec<wrela_abi::manifest::Blend> {
+    use wrela_abi::manifest::Blend;
+    (0..output.colours.len())
+        .map(|k| {
+            if state.blend_given {
+                state.blends[k.min(3)]
+            } else if output.over {
+                Blend::Over
+            } else {
+                Blend::Replace
+            }
+        })
+        .collect()
+}
+
+/// The texture format a format type is (`std::gpu::Rgba8`, ...).
+fn format_of_lang(l: Option<Lang>) -> Option<ir::TextureFormat> {
+    Some(match l? {
+        Lang::Rgba8 => ir::TextureFormat::Rgba8,
+        Lang::Rgba16Float => ir::TextureFormat::Rgba16Float,
+        Lang::R16Float => ir::TextureFormat::R16Float,
+        Lang::Rg16Float => ir::TextureFormat::Rg16Float,
+        Lang::R32Float => ir::TextureFormat::R32Float,
+        Lang::R32Uint => ir::TextureFormat::R32Uint,
+        Lang::R8 => ir::TextureFormat::R8,
+        Lang::Rg8 => ir::TextureFormat::Rg8,
+        Lang::Rgb10a2 => ir::TextureFormat::Rgb10a2,
+        Lang::Rg32Float => ir::TextureFormat::Rg32Float,
+        Lang::Rgba32Float => ir::TextureFormat::Rgba32Float,
+        Lang::Rg32Uint => ir::TextureFormat::Rg32Uint,
+        Lang::Rg11b10Float => ir::TextureFormat::Rg11b10Float,
+        _ => return None,
+    })
 }
 
 /// `std::gpu`'s and `std::derive`'s intrinsics.
@@ -1073,25 +1239,49 @@ pub(crate) fn intrinsic(
         }
         Some(
             l @ (Lang::CreateTexture
-            | Lang::CreateTexture3d
             | Lang::DestroyTexture
             | Lang::CreateSampler
             | Lang::DestroySampler
-            | Lang::BeginPass
-            | Lang::EndPass),
+            | Lang::BeginPass0
+            | Lang::BeginPass1
+            | Lang::BeginPass2
+            | Lang::BeginPass3
+            | Lang::BeginPass4
+            | Lang::EndPass
+            | Lang::CopyTextureCommand
+            | Lang::CopyTextureToBufferCommand
+            | Lang::CopyBufferToTextureCommand
+            | Lang::ScissorCommand
+            | Lang::ViewportCommand),
         ) => {
             // (opcode, payload words, whether the first is a new handle)
             let (opcode, words, handle) = match l {
-                Lang::CreateTexture => (Opcode::CreateTexture, 4, true),
-                Lang::CreateTexture3d => (Opcode::CreateTexture, 5, true),
+                Lang::CreateTexture => (Opcode::CreateTexture, 7, true),
                 Lang::DestroyTexture => (Opcode::DestroyTexture, 1, false),
-                Lang::CreateSampler => (Opcode::CreateSampler, 4, true),
+                Lang::CreateSampler => (Opcode::CreateSampler, 6, true),
                 Lang::DestroySampler => (Opcode::DestroySampler, 1, false),
-                Lang::BeginPass => (Opcode::BeginPass, 9, false),
+                // A pass: its count and join, 8 words a colour target, 4 for depth.
+                Lang::BeginPass0 => (Opcode::BeginPass, 6, false),
+                Lang::BeginPass1 => (Opcode::BeginPass, 14, false),
+                Lang::BeginPass2 => (Opcode::BeginPass, 22, false),
+                Lang::BeginPass3 => (Opcode::BeginPass, 30, false),
+                Lang::BeginPass4 => (Opcode::BeginPass, 38, false),
+                Lang::CopyTextureCommand => (Opcode::CopyTexture, 12, false),
+                Lang::CopyTextureToBufferCommand => (Opcode::CopyTextureToBuffer, 10, false),
+                Lang::CopyBufferToTextureCommand => (Opcode::CopyBufferToTexture, 10, false),
+                Lang::ScissorCommand => (Opcode::SetScissor, 4, false),
+                Lang::ViewportCommand => (Opcode::SetViewport, 6, false),
                 _ => (Opcode::EndPass, 0, false),
             };
             let args = fl.arg_values(&c.args)?;
-            if l == Lang::BeginPass {
+            if matches!(
+                l,
+                Lang::BeginPass0
+                    | Lang::BeginPass1
+                    | Lang::BeginPass2
+                    | Lang::BeginPass3
+                    | Lang::BeginPass4
+            ) {
                 fl.upload_literals();
             }
             let op = ir::HostOp::Command { opcode: opcode as u32, words, runs: 0, handle };
@@ -1225,20 +1415,21 @@ pub(crate) fn intrinsic(
             None
         }
         Some(Lang::WriteTexture) => {
-            // handle, x, y, width, height, then bytes `from..from + count` of the run.
-            let mut args = fl.arg_values(&c.args[..5])?;
+            // handle, level, layer, x, y, width, height, then bytes `from..from + count` of the
+            // run.
+            let mut args = fl.arg_values(&c.args[..7])?;
             let u8_ = fl.mb.m.types.scalar(ir::Scalar::U8);
             let run_t = fl.mb.m.types.intern(ir::TypeDef::Run(u8_));
-            let run = fl.run_of(c.args[5].place()?, run_t)?;
-            let from = fl.arg_value(&c.args[6])?;
-            let count = fl.arg_value(&c.args[7])?;
+            let run = fl.run_of(c.args[7].place()?, run_t)?;
+            let from = fl.arg_value(&c.args[8])?;
+            let count = fl.arg_value(&c.args[9])?;
             let u = fl.mb.m.types.u32();
             let addr = fl.value(u, ir::Expr::Extract(run, 0));
             let start = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, addr, from));
             args.push(fl.value(run_t, ir::Expr::Construct(run_t, vec![start, count])));
             let op = ir::HostOp::Command {
                 opcode: Opcode::WriteTexture as u32,
-                words: 5,
+                words: 7,
                 runs: 1,
                 handle: false,
             };
@@ -1266,6 +1457,8 @@ pub(crate) fn intrinsic(
             | Lang::AppendPush
             | Lang::TexelsStore
             | Lang::Texels3dStore
+            | Lang::TexelsArrayStore
+            | Lang::MipStepStore
             | Lang::OneGet
             | Lang::OneSet),
         ) => shared_op(fl, l, c, ty),
@@ -1288,15 +1481,32 @@ pub(crate) fn intrinsic(
         Some(
             l @ (Lang::TextureSample
             | Lang::TextureSampleLevel
+            | Lang::TextureSampleGrad
+            | Lang::TextureSampleBias
             | Lang::TextureSampleCompare
             | Lang::TextureSampleCompareLevel
             | Lang::TextureLoad
             | Lang::DepthLoad
             | Lang::Texture3dSampleLevel
             | Lang::Texture3dLoad
+            | Lang::ArraySample
+            | Lang::ArraySampleLevel
+            | Lang::ArraySampleGrad
+            | Lang::ArrayLoad
+            | Lang::CubeSample
+            | Lang::CubeSampleLevel
+            | Lang::DepthArrayCompare
+            | Lang::DepthArrayCompareLevel
+            | Lang::DepthArrayLoad
+            | Lang::MipStepLoad
+            | Lang::MipStepSample
+            | Lang::MipStepWidth
+            | Lang::MipStepHeight
             | Lang::TextureWidth
             | Lang::TextureHeight
-            | Lang::TextureDepth),
+            | Lang::TextureDepth
+            | Lang::TextureLevels
+            | Lang::TextureLayers),
         ) => texture_read(fl, l, c, ty),
         // A field of what a `GpuField` names: its offset moved by the field's in the struct's
         // layout. CPU code only (GPU code doesn't name buffers).
@@ -1452,8 +1662,10 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
             fl.emit(ir::Stmt::Eval(ir::Expr::Barrier));
             None
         }
-        Lang::TexelsStore | Lang::Texels3dStore => {
+        Lang::TexelsStore | Lang::Texels3dStore | Lang::TexelsArrayStore | Lang::MipStepStore => {
             let r = resource_arg(fl, c, 0, msg)?;
+            // A mip step writes through its second resource, the level it writes.
+            let r = if l == Lang::MipStepStore { ir::ResourceId(r.0 + 1) } else { r };
             let mut vals = fl.arg_values(&c.args[1..])?;
             // The texel, written as four of its format's scalar (the channels it lacks, 0).
             if let ir::ResourceKind::StorageTexture { format, .. } =
@@ -1586,22 +1798,42 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let span = c.span;
     let u = fl.mb.m.types.u32();
     let op = match l {
-        Lang::TextureSample => T::Sample,
-        Lang::TextureSampleLevel | Lang::Texture3dSampleLevel => T::SampleLevel,
-        Lang::TextureSampleCompare => T::SampleCompare,
-        Lang::TextureSampleCompareLevel => T::SampleCompareLevel,
-        Lang::TextureLoad | Lang::DepthLoad | Lang::Texture3dLoad => T::Load,
-        Lang::TextureWidth => T::Width,
+        Lang::TextureSample | Lang::ArraySample | Lang::CubeSample => T::Sample,
+        Lang::TextureSampleLevel
+        | Lang::Texture3dSampleLevel
+        | Lang::ArraySampleLevel
+        | Lang::CubeSampleLevel
+        | Lang::MipStepSample => T::SampleLevel,
+        Lang::TextureSampleGrad | Lang::ArraySampleGrad => T::SampleGrad,
+        Lang::TextureSampleBias => T::SampleBias,
+        Lang::TextureSampleCompare | Lang::DepthArrayCompare => T::SampleCompare,
+        Lang::TextureSampleCompareLevel | Lang::DepthArrayCompareLevel => T::SampleCompareLevel,
+        Lang::TextureLoad
+        | Lang::DepthLoad
+        | Lang::Texture3dLoad
+        | Lang::ArrayLoad
+        | Lang::DepthArrayLoad
+        | Lang::MipStepLoad => T::Load,
+        Lang::TextureWidth | Lang::MipStepWidth => T::Width,
         Lang::TextureDepth => T::Depth,
+        Lang::TextureLevels => T::Levels,
+        Lang::TextureLayers => T::Layers,
         _ => T::Height,
     };
     if !fl.is_gpu() {
-        if matches!(op, T::Width | T::Height | T::Depth) {
-            // `Texture`, `DepthTexture` and `Texture3d` hold their handle, width and height
-            // first (and a `Texture3d` its depth next).
-            let field = match op {
-                T::Width => 1,
-                T::Height => 2,
+        if op.is_query() {
+            // A texture's handle, width and height come first; then a 2D texture's levels, a
+            // 3D texture's depth, an array's layers and levels.
+            let t = fl.place_src_ty(c.args[0].place()?);
+            let lang = fl.cx.checked.program.lang_of_ty(t);
+            let field = match (op, lang) {
+                (T::Width, _) => 1,
+                (T::Height, _) => 2,
+                (T::Depth | T::Levels | T::Layers, Some(Lang::Texture | Lang::Texture3d)) => 3,
+                (T::Layers, Some(Lang::TextureArray | Lang::DepthTextureArray)) => 3,
+                (T::Levels, Some(Lang::TextureArray)) => 4,
+                // A depth texture has one level.
+                (T::Levels, _) => return Some(fl.u32c(1)),
                 _ => 3,
             };
             let v = fl.arg_value(&c.args[0])?;
@@ -1619,18 +1851,22 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     }
     let msg = "GPU code can pass a texture or sampler on only as the shader received it";
     let texture = resource_arg(fl, c, 0, msg)?;
-    let sampled = !matches!(op, T::Load | T::Width | T::Height | T::Depth);
+    let sampled = op.is_sampled();
     let sampler = if sampled { Some(resource_arg(fl, c, 1, msg)?) } else { None };
-    let vals = fl.arg_values(&c.args[1 + usize::from(sampled)..])?;
+    let mut vals = fl.arg_values(&c.args[1 + usize::from(sampled)..])?;
+    // A mip step samples the one level its view holds.
+    if l == Lang::MipStepSample {
+        let f = fl.mb.m.types.f32();
+        vals.push(fl.value(f, ir::Expr::Const(ir::Const::F32(0.0))));
+    }
     let t = fl.ty(ty?, span)?;
     // A colour texel is read as four of its format's scalar: the format's texel is their first.
     let colour = match fl.mb.m.resources[texture.index()].kind {
         ir::ResourceKind::Texture { depth: false, format, .. } => Some(format),
         _ => None,
     };
-    let texel = !matches!(op, T::Width | T::Height | T::Depth);
     let read = match colour {
-        Some(f) if texel => fl.mb.m.types.vector_of(ir::texel_scalar(f), 4),
+        Some(f) if !op.is_query() => fl.mb.m.types.vector_of(ir::texel_scalar(f), 4),
         _ => t,
     };
     let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
@@ -1645,7 +1881,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
                 at,
                 format!("sampling picks its detail from neighbouring pixels, so it's in fragment shaders only, and this is {ctx}"),
             )
-            .with_help("use `sample_level` (or `sample_compare_level`), which any GPU code can call")
+            .with_help("use `sample_level` or `sample_grad` (or `sample_compare_level`), which any GPU code can call")
         });
     }
     Some(v)
@@ -2055,20 +2291,48 @@ fn add_bound(
                 (ir::ResourceKind::StorageRead, ty, BindingKind::Read, None)
             }
         }
-        ParamClass::Texture { storage: true, three, format, .. } => {
-            let bk =
-                if three { BindingKind::StorageTexture3d } else { BindingKind::StorageTexture };
-            let kind = ir::ResourceKind::StorageTexture { three, format };
+        ParamClass::Texture { storage: true, dim, format, .. } => {
+            let bk = match dim {
+                ir::TexDim::D3 => BindingKind::StorageTexture3d,
+                ir::TexDim::D2Array => BindingKind::StorageTextureArray,
+                _ => BindingKind::StorageTexture,
+            };
+            let kind = ir::ResourceKind::StorageTexture { dim, format };
             (kind, mb.m.types.u32(), bk, Some(format))
         }
-        ParamClass::Texture { depth, three, format, .. } => {
-            let bk = match (depth, three) {
+        ParamClass::Texture { depth, dim, format, .. } => {
+            let bk = match (depth, dim) {
+                (true, ir::TexDim::D2Array) => BindingKind::DepthTextureArray,
                 (true, _) => BindingKind::DepthTexture,
-                (false, true) => BindingKind::Texture3d,
-                (false, false) => BindingKind::Texture,
+                (false, ir::TexDim::D3) => BindingKind::Texture3d,
+                (false, ir::TexDim::D2Array) => BindingKind::TextureArray,
+                (false, ir::TexDim::Cube) => BindingKind::TextureCube,
+                (false, ir::TexDim::D2) => BindingKind::Texture,
             };
-            let kind = ir::ResourceKind::Texture { depth, three, format };
+            let kind = ir::ResourceKind::Texture { depth, dim, format };
             (kind, mb.m.types.u32(), bk, (!depth).then_some(format))
+        }
+        // The level read (a texture), then the level written (a storage texture): the second
+        // resource's id is the first's plus one.
+        ParamClass::MipStep { format } => {
+            let u = mb.m.types.u32();
+            let read = ir::ResourceKind::Texture { depth: false, dim: ir::TexDim::D2, format };
+            let id = mb.m.add_resource(ir::Resource {
+                name: name.to_string(),
+                binding,
+                kind: read,
+                ty: u,
+            });
+            let write = ir::ResourceKind::StorageTexture { dim: ir::TexDim::D2, format };
+            let name = format!("{name}_out");
+            mb.m.add_resource(ir::Resource { name, binding: binding + 1, kind: write, ty: u });
+            return Some((
+                id,
+                vec![
+                    (BindingKind::Texture, Some(format)),
+                    (BindingKind::StorageTexture, Some(format)),
+                ],
+            ));
         }
         ParamClass::Sampler { comparison } => {
             let bk = if comparison { BindingKind::ComparisonSampler } else { BindingKind::Sampler };
@@ -2203,11 +2467,11 @@ fn check_stage_limits(cx: &mut Cx, iface: &Interface) {
     type Is = fn(&ParamClass) -> bool;
     let kinds: [(&str, usize, Is); 3] = [
         ("textures", MAX_SAMPLED_TEXTURES_PER_STAGE, |c| {
-            matches!(c, ParamClass::Texture { storage: false, .. })
+            matches!(c, ParamClass::Texture { storage: false, .. } | ParamClass::MipStep { .. })
         }),
         ("samplers", MAX_SAMPLERS_PER_STAGE, |c| matches!(c, ParamClass::Sampler { .. })),
         ("storage textures (`Texels`)", MAX_STORAGE_TEXTURES_PER_STAGE, |c| {
-            matches!(c, ParamClass::Texture { storage: true, .. })
+            matches!(c, ParamClass::Texture { storage: true, .. } | ParamClass::MipStep { .. })
         }),
     ];
     for e in 0..iface.entries.len() {
@@ -2316,12 +2580,6 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         if takes_varyings { Some(vret_ir) } else { None },
     );
     cx.drain(&mut mb);
-    if output.blends() {
-        // An `Over` is its colour: the entry point returns the `vec4` WGSL blends.
-        let v4 = mb.m.types.vector(4);
-        let f = &mut mb.m.functions[fentry.index()];
-        unwrap_returns(f, v4);
-    }
     check_recursion(cx, &mb);
     let finputs = entry_inputs(fragment, false, false);
     check_uniformity(cx, &mb, fentry, &finputs);
@@ -2336,8 +2594,16 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         name: ir::ident(&fdef.name),
         stage: ir::Stage::Fragment {
             varyings: takes_varyings.then_some((vret_ir, varyings)),
-            depth: output.writes_depth(),
-            uint: output.uint(),
+            outputs: output
+                .colours
+                .iter()
+                .map(|(c, path)| ir::FragmentColour {
+                    path: path.clone(),
+                    scalar: if c.uint { ir::Scalar::U32 } else { ir::Scalar::F32 },
+                    components: c.components,
+                })
+                .collect(),
+            depth: output.depth.clone(),
         },
         function: fentry,
         inputs: finputs,
@@ -2357,36 +2623,6 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         targets: Vec::new(),
         instances,
     })
-}
-
-/// Makes `f` return field 0 of what it returned (an `Over`'s colour), of type `v4`.
-fn unwrap_returns(f: &mut ir::Function, v4: ir::TypeId) {
-    fn walk(f: &mut ir::Function, block: ir::Block, v4: ir::TypeId) -> ir::Block {
-        let mut out = Vec::with_capacity(block.len());
-        for s in block {
-            match s {
-                ir::Stmt::Return(Some(v)) => {
-                    let c = f.let_(&mut out, v4, ir::Expr::Extract(v, 0));
-                    out.push(ir::Stmt::Return(Some(c)));
-                }
-                ir::Stmt::If { cond, then, else_ } => {
-                    let then = walk(f, then, v4);
-                    let else_ = walk(f, else_, v4);
-                    out.push(ir::Stmt::If { cond, then, else_ });
-                }
-                ir::Stmt::Loop { body, continuing } => {
-                    let body = walk(f, body, v4);
-                    let continuing = walk(f, continuing, v4);
-                    out.push(ir::Stmt::Loop { body, continuing });
-                }
-                other => out.push(other),
-            }
-        }
-        out
-    }
-    let body = std::mem::take(&mut f.body);
-    f.body = walk(f, body, v4);
-    f.ret = Some(v4);
 }
 
 fn is_clip_position(cx: &Cx, t: TyId) -> bool {
@@ -2551,6 +2787,7 @@ pub(crate) fn bind_entry_params(fl: &mut Fl, func: FnId, entry: Entry) {
             | ParamClass::Append { .. }
             | ParamClass::Workgroup { .. }
             | ParamClass::Texture { .. }
+            | ParamClass::MipStep { .. }
             | ParamClass::Sampler { .. } => {
                 resource_repr(fl.key.resources().get(i).and_then(Option::as_ref))
             }
@@ -3054,10 +3291,21 @@ pub fn frame(time: f32, width: u32, height: u32) {
     pass.end()
 }
 "#;
-        for format in ["Rgba8", "Rgba16Float", "R16Float", "Rg16Float", "R32Float"] {
+        // A float32 format blends on a device with `float32-blendable`, which the host checks at
+        // the draw; an integer one never does.
+        for format in [
+            "Rgba8",
+            "Rgba16Float",
+            "R16Float",
+            "Rg16Float",
+            "R8",
+            "Rgb10a2",
+            "R32Float",
+            "R32Uint",
+        ] {
             let (_, errors) = lower_source(&source.replace("FORMAT", format));
             let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
-            if format == "R32Float" {
+            if format == "R32Uint" {
                 assert_eq!(errors.len(), 1, "{format}: {errors:?}");
                 assert_eq!(errors[0].code, codes::E0603);
             } else {

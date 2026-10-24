@@ -1,0 +1,445 @@
+// Toolchain 0.6's GPU capabilities, each used once and read back (language.md §18.8): texture
+// copies and readback, the new formats, mip chains (`generate_mips`, trilinear sampling), blend
+// states, several colour targets, scissors, texture arrays, cubes, depth arrays, and direct
+// indexed draws and multi-draws. Frame 0 records the work and asks for each texture back;
+// later frames take the answers; each test checks one.
+use std::gpu::{
+    Blend, ClipPosition, Cubemap, DepthTextureArray, DrawArgs, FragCoord, GlobalId, GpuBuffer,
+    R32Uint, R8, Rg32Float, Rg32Uint, Rg8, Rgb10a2, Rgba16Float, Rgba32Float, Rgba8, Sampler,
+    Targets3, Texels, TextureArray, TextureRead, VertexIndex, begin_depth_layer_pass,
+    begin_face_pass, begin_layer_pass, begin_pass, begin_pass3, buffer_of, comparison_sampler,
+    copy_texture, cubemap, depth_texture_array, dispatch, draw, draw_multi, generate_mips,
+    read_texture, sampler, texture, texture_array, writable_texture, writable_texture_array, Filter,
+    Address, ComparisonSampler,
+}
+
+pub struct State {
+    frame: u32,
+    // The textures, kept until their reads come back.
+    copied: Texture<Rgba8>,
+    mipped: Texture<Rgba16Float>,
+    mipped_out: Texture<Rgba16Float>,
+    blended: Vec<Texture<Rgba16Float>>,
+    mrt: (Texture<Rgba16Float>, Texture<Rgb10a2>, Texture<R32Uint>),
+    scissored: Texture<Rgba8>,
+    layered: TextureArray<Rgba16Float>,
+    layered_out: Texture<Rgba16Float>,
+    cube: Cubemap<Rgba8>,
+    cube_out: Texture<Rgba8>,
+    shadows: DepthTextureArray,
+    shadow_out: Texture<Rgba8>,
+    indexed: Texture<Rgba8>,
+    multi: Texture<Rgba8>,
+    indices: GpuBuffer<u32>,
+    args: GpuBuffer<DrawArgs>,
+    linear: Sampler,
+    compare: ComparisonSampler,
+    // What came back: each texture's bytes, in the order the reads were asked.
+    reads: Vec<TextureRead>,
+    got: Vec<Vec<u8>>,
+}
+
+use std::gpu::Texture
+
+/// One triangle that covers the target.
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// A square of half the target's side, at its centre: two triangles of six indices.
+@vertex
+fn square(corners: [vec2], v: VertexIndex) -> ClipPosition {
+    let c = corners[v.index]
+    ClipPosition { position: vec4(c.x, c.y, 0.5, 1.0) }
+}
+
+@fragment
+fn colour(c: vec4) -> vec4 {
+    c
+}
+
+@fragment
+fn red8() -> f32 {
+    0.25
+}
+
+@fragment
+fn rg8() -> vec2 {
+    vec2(0.25, 0.75)
+}
+
+@fragment
+fn rg32() -> vec2 {
+    vec2(1.5, -2.25)
+}
+
+@fragment
+fn rg32u() -> vec2u {
+    vec2u(7, 4000000000)
+}
+
+@fragment
+fn three() -> Targets3<vec4, vec4, u32> {
+    Targets3 { first: vec4(0.5, 0.25, 1.0, 1.0), second: vec4(1.0, 0.0, 0.5, 1.0), third: 77 }
+}
+
+/// Level 0 of a 16 × 16 texture: red x / 15, green y / 15.
+@compute(8, 8)
+fn gradient(out: mut Texels<Rgba16Float>, id: GlobalId) {
+    out.store(id, vec4(f32(id.x) / 15.0, f32(id.y) / 15.0, 0.0, 1.0))
+}
+
+/// Level 2 of the mipped texture, sampled at a pixel's centre, into a 4 × 4 target.
+@fragment
+fn sample_level_two(p: FragCoord, t: Texture<Rgba16Float>, s: Sampler) -> vec4 {
+    t.sample_level(s, p.position.xy / 4.0, level: 2.0)
+}
+
+/// Layer `id.z`: its number over 2 in red.
+@compute(4, 4, 1)
+fn layers(out: mut Texels<Rgba16Float>, layer: f32, id: GlobalId) {
+    out.store(id, vec4(layer / 2.0, 0.0, 0.0, 1.0))
+}
+
+/// Pixel x of a 3 × 1 target shows layer x of the array.
+@fragment
+fn show_layers(p: FragCoord, arr: TextureArray<Rgba16Float>, s: Sampler) -> vec4 {
+    arr.sample_level(s, vec2(0.5), u32(p.position.x), level: 0.0)
+}
+
+/// Pixel x of a 6 × 1 target looks along face x's axis.
+@fragment
+fn show_faces(p: FragCoord, cube: Cubemap<Rgba8>, s: Sampler) -> vec4 {
+    let i = u32(p.position.x)
+    var dir = vec3(0.0)
+    if i == 0 { dir = vec3(1.0, 0.0, 0.0) }
+    if i == 1 { dir = vec3(-1.0, 0.0, 0.0) }
+    if i == 2 { dir = vec3(0.0, 1.0, 0.0) }
+    if i == 3 { dir = vec3(0.0, -1.0, 0.0) }
+    if i == 4 { dir = vec3(0.0, 0.0, 1.0) }
+    if i == 5 { dir = vec3(0.0, 0.0, -1.0) }
+    cube.sample_level(s, dir, level: 0.0)
+}
+
+/// Pixel x of a 2 × 1 target compares 0.75 with layer x of the depth array (cleared to 0.5 and
+/// 1.0): white where the reference is at most the depth.
+@fragment
+fn show_shadow(p: FragCoord, depths: DepthTextureArray, s: ComparisonSampler) -> vec4 {
+    let lit = depths.sample_compare_level(s, vec2(0.5), u32(p.position.x), reference: 0.75)
+    vec4(lit, lit, lit, 1.0)
+}
+
+/// The face colours: +x red, -x green, +y blue, -y white, +z yellow, -z cyan.
+fn face_colour(i: u32) -> vec4 {
+    if i == 0 { return vec4(1.0, 0.0, 0.0, 1.0) }
+    if i == 1 { return vec4(0.0, 1.0, 0.0, 1.0) }
+    if i == 2 { return vec4(0.0, 0.0, 1.0, 1.0) }
+    if i == 3 { return vec4(1.0, 1.0, 1.0, 1.0) }
+    if i == 4 { return vec4(1.0, 1.0, 0.0, 1.0) }
+    vec4(0.0, 1.0, 1.0, 1.0)
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        copied: texture(width: 4, height: 4),
+        mipped: writable_texture(width: 16, height: 16, levels: 5),
+        mipped_out: texture(width: 4, height: 4),
+        blended: Vec::new(),
+        mrt: (
+            texture(width: 2, height: 2),
+            texture(width: 2, height: 2),
+            texture(width: 2, height: 2),
+        ),
+        scissored: texture(width: 4, height: 2),
+        layered: writable_texture_array(width: 4, height: 4, layers: 3),
+        layered_out: texture(width: 3, height: 1),
+        cube: cubemap(side: 2),
+        cube_out: texture(width: 6, height: 1),
+        shadows: depth_texture_array(width: 2, height: 2, layers: 2),
+        shadow_out: texture(width: 2, height: 1),
+        indexed: texture(width: 4, height: 4),
+        multi: texture(width: 4, height: 4),
+        indices: buffer_of([0, 1, 2, 0, 2, 3]),
+        args: buffer_of(
+            [
+                DrawArgs { vertices: 3, instances: 1, first_vertex: 0, first_instance: 0 },
+                DrawArgs { vertices: 3, instances: 0, first_vertex: 0, first_instance: 0 },
+            ],
+        ),
+        linear: sampler(filter: Filter::Linear, address: Address::Clamp, mip: Filter::Linear),
+        compare: comparison_sampler(),
+        reads: Vec::new(),
+        got: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        record(mut s)
+    } else {
+        var k = 0
+        while k < s.reads.len() {
+            if s.got.len() == k {
+                match s.reads[k].poll() {
+                    Some(Ok(bytes)) => {
+                        s.got.push(take bytes)
+                    },
+                    Some(Err(_)) => {
+                        s.got.push(Vec::new())
+                    },
+                    None => {},
+                }
+            }
+            k += 1
+        }
+    }
+    s.frame += 1
+}
+
+fn record(s: mut State) {
+    // 0: a pass clears a texture, a copy moves it, and it's read back.
+    var source: Texture<Rgba8> = texture(width: 4, height: 4)
+    let p = begin_pass(mut source, clear: vec4(0.2, 0.4, 0.6, 0.8))
+    p.end()
+    copy_texture(source.level(0), s.copied.level_mut(0))
+    s.reads.push(read_texture(s.copied.level(0)))
+    // 1–5: a draw into each new format.
+    var r8: Texture<R8> = texture(width: 1, height: 1)
+    let p = begin_pass(mut r8)
+    draw(p, cover, red8, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(r8.level(0)))
+    var rg: Texture<Rg8> = texture(width: 1, height: 1)
+    let p = begin_pass(mut rg)
+    draw(p, cover, rg8, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(rg.level(0)))
+    var r10: Texture<Rgb10a2> = texture(width: 1, height: 1)
+    let p = begin_pass(mut r10)
+    draw(p, cover, colour.bind(vec4(1.0, 0.5, 0.0, 1.0)), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(r10.level(0)))
+    var f32x2: Texture<Rg32Float> = texture(width: 1, height: 1)
+    let p = begin_pass(mut f32x2)
+    draw(p, cover, rg32, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(f32x2.level(0)))
+    var u32x2: Texture<Rg32Uint> = texture(width: 1, height: 1)
+    let p = begin_pass(mut u32x2)
+    draw(p, cover, rg32u, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(u32x2.level(0)))
+    // 6: a mip chain, filled from level 0, level 2 sampled trilinear.
+    dispatch(gradient.bind(mut s.mipped), groups: (2, 2, 1))
+    generate_mips(mut s.mipped, s.linear)
+    let p = begin_pass(mut s.mipped_out)
+    draw(p, cover, sample_level_two.bind(s.mipped, s.linear), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.mipped_out.level(0)))
+    // 7–8: a quad over a cleared target, added and premultiplied.
+    for b in 0..2 {
+        var t: Texture<Rgba16Float> = texture(width: 1, height: 1)
+        let p = begin_pass(mut t, clear: vec4(0.25, 0.25, 0.25, 0.5))
+        if b == 0 {
+            draw(p, cover, colour.bind(vec4(0.5, 0.25, 0.0, 0.5)), vertices: 3, blend: Blend::Add)
+        } else {
+            draw(
+                p,
+                cover,
+                colour.bind(vec4(0.5, 0.25, 0.0, 0.5)),
+                vertices: 3,
+                blend: Blend::Premultiplied,
+            )
+        }
+        p.end()
+        s.reads.push(read_texture(t.level(0)))
+        s.blended.push(take t)
+    }
+    // 9–11: three targets in one pass.
+    let p = begin_pass3(mut s.mrt.0, mut s.mrt.1, mut s.mrt.2)
+    draw(p, cover, three, vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.mrt.0.level(0)))
+    s.reads.push(read_texture(s.mrt.1.level(0)))
+    s.reads.push(read_texture(s.mrt.2.level(0)))
+    // 12: a full-screen triangle scissored to the left half.
+    let p = begin_pass(mut s.scissored, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    p.scissor(x: 0, y: 0, width: 2, height: 2)
+    draw(p, cover, colour.bind(vec4(1.0, 1.0, 1.0, 1.0)), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.scissored.level(0)))
+    // 13: three layers written by three kernels, each layer by its own, sampled by layer.
+    for l in 0..3 {
+        dispatch(layers.bind(s.layered.layer_mut(l), f32(l)), groups: (1, 1, 1))
+    }
+    let p = begin_pass(mut s.layered_out)
+    draw(p, cover, show_layers.bind(s.layered, s.linear), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.layered_out.level(0)))
+    // 14: a cube drawn face by face, sampled by direction.
+    for f in 0..6 {
+        let p = begin_face_pass(mut s.cube, f, clear: face_colour(f))
+        p.end()
+    }
+    let p = begin_pass(mut s.cube_out)
+    draw(p, cover, show_faces.bind(s.cube, s.linear), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.cube_out.level(0)))
+    // 15: a depth array's layers cleared to 0.5 and 1.0, compared.
+    for l in 0..2 {
+        let p = begin_depth_layer_pass(mut s.shadows, l, clear_depth: 0.5 + 0.5 * f32(l))
+        p.end()
+    }
+    let p = begin_pass(mut s.shadow_out)
+    draw(p, cover, show_shadow.bind(s.shadows, s.compare), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(s.shadow_out.level(0)))
+    // 16: a square drawn directly from its indices.
+    let corners = buffer_of([vec2(-0.5, -0.5), vec2(0.5, -0.5), vec2(0.5, 0.5), vec2(-0.5, 0.5)])
+    let p = begin_pass(mut s.indexed, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw(
+        p,
+        square.bind(corners),
+        colour.bind(vec4(0.0, 1.0, 0.0, 1.0)),
+        indices: s.indices,
+        index_count: 6,
+    )
+    p.end()
+    s.reads.push(read_texture(s.indexed.level(0)))
+    // 17: two indirect draws in one command, the second of no instances.
+    let p = begin_pass(mut s.multi, clear: vec4(0.0, 0.0, 0.0, 1.0))
+    draw_multi(p, cover, colour.bind(vec4(0.0, 0.0, 1.0, 1.0)), indirect: s.args, count: 2)
+    p.end()
+    s.reads.push(read_texture(s.multi.level(0)))
+}
+
+/// The little-endian `u32` at byte `i` of `b`.
+fn word(b: [u8], i: u32) -> u32 {
+    u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
+}
+
+/// Half float `i` (its bytes from `2i`) of `b`.
+fn half(b: [u8], i: u32) -> f32 {
+    std::gpu::Half2 { bits: u32(b[2 * i]) | (u32(b[2 * i + 1]) << 8) }.decode().x
+}
+
+/// Whether a difference is within a half float's error at these magnitudes.
+fn close(d: f32) -> bool {
+    abs(d) <= 0.002
+}
+
+@test(frames: 6, gpu: true)
+fn every_read_came_back(s: State) {
+    assert(s.got.len() == 18)
+    for k in 0..18 {
+        assert(s.got[k].len() > 0)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_copy_and_its_readback_hold_the_cleared_texels(s: State) {
+    assert(s.got[0].len() == 64)
+    for t in 0..16 {
+        assert(u32(s.got[0][4 * t]) == 51 && u32(s.got[0][4 * t + 1]) == 102)
+        assert(u32(s.got[0][4 * t + 2]) == 153 && u32(s.got[0][4 * t + 3]) == 204)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn each_new_format_holds_what_was_drawn(s: State) {
+    assert(u32(s.got[1][0]) == 64)
+    assert(u32(s.got[2][0]) == 64 && u32(s.got[2][1]) == 191)
+    let w = word(s.got[3], 0)
+    assert(
+        (w & 1023) == 1023 &&
+            ((w >> 10) & 1023) == 512 &&
+            ((w >> 20) & 1023) == 0 &&
+            (w >> 30) == 3,
+    )
+    assert(bitcast_f32(word(s.got[4], 0)) == 1.5 && bitcast_f32(word(s.got[4], 4)) == -2.25)
+    assert(word(s.got[5], 0) == 7 && word(s.got[5], 4) == 4000000000)
+}
+
+@test(frames: 6, gpu: true)
+fn a_generated_mip_level_is_the_gradients_mean(s: State) {
+    // Level 2 is 4 × 4: its texel (1, 1) averages level 0's texels 4 to 7, whose red is 4/15 to
+    // 7/15: 5.5/15.
+    let red = half(s.got[6], 4 * 5)
+    let green = half(s.got[6], 4 * 5 + 1)
+    assert(abs(red - 5.5 / 15.0) <= 0.01 && abs(green - 5.5 / 15.0) <= 0.01)
+}
+
+@test(frames: 6, gpu: true)
+fn blends_are_their_arithmetic(s: State) {
+    // Add: (0.25 + 0.5, 0.25 + 0.25, 0.25, 0.5 + 0.5).
+    assert(close(half(s.got[7], 0) - 0.75) && close(half(s.got[7], 1) - 0.5))
+    assert(close(half(s.got[7], 2) - 0.25) && close(half(s.got[7], 3) - 1.0))
+    // Premultiplied: src + dst × (1 − 0.5).
+    assert(close(half(s.got[8], 0) - 0.625) && close(half(s.got[8], 1) - 0.375))
+    assert(close(half(s.got[8], 2) - 0.125) && close(half(s.got[8], 3) - 0.75))
+}
+
+@test(frames: 6, gpu: true)
+fn a_pass_of_three_targets_writes_each(s: State) {
+    assert(close(half(s.got[9], 0) - 0.5) && close(half(s.got[9], 2) - 1.0))
+    let w = word(s.got[10], 0)
+    assert((w & 1023) == 1023 && ((w >> 20) & 1023) == 512)
+    assert(word(s.got[11], 0) == 77)
+}
+
+@test(frames: 6, gpu: true)
+fn a_scissor_keeps_the_draw_to_its_rectangle(s: State) {
+    // Row 0: pixels 0 and 1 white, 2 and 3 black.
+    assert(u32(s.got[12][0]) == 255 && u32(s.got[12][4]) == 255)
+    assert(u32(s.got[12][8]) == 0 && u32(s.got[12][12]) == 0)
+}
+
+@test(frames: 6, gpu: true)
+fn an_arrays_layers_are_each_their_own(s: State) {
+    assert(close(half(s.got[13], 0) - 0.0))
+    assert(close(half(s.got[13], 4) - 0.5))
+    assert(close(half(s.got[13], 8) - 1.0))
+}
+
+@test(frames: 6, gpu: true)
+fn a_cube_is_sampled_by_direction(s: State) {
+    let want = [
+        [255, 0, 0],
+        [0, 255, 0],
+        [0, 0, 255],
+        [255, 255, 255],
+        [255, 255, 0],
+        [0, 255, 255],
+    ]
+    for f in 0..6 {
+        for c in 0..3 {
+            assert(u32(s.got[14][4 * f + c]) == want[f][c])
+        }
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_depth_arrays_layers_compare_apart(s: State) {
+    // Layer 0 holds 0.5: 0.75 isn't at most it, so dark; layer 1 holds 1.0: lit.
+    assert(u32(s.got[15][0]) == 0)
+    assert(u32(s.got[15][4]) == 255)
+}
+
+@test(frames: 6, gpu: true)
+fn a_direct_indexed_draw_draws_its_square(s: State) {
+    // The square covers the middle 2 × 2 pixels: (1, 1) is green, (0, 0) black.
+    assert(u32(s.got[16][4 * 5 + 1]) == 255)
+    assert(u32(s.got[16][1]) == 0)
+}
+
+@test(frames: 6, gpu: true)
+fn a_multi_draw_draws_each_of_its_draws(s: State) {
+    assert(u32(s.got[17][2]) == 255 && u32(s.got[17][4 * 15 + 2]) == 255)
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn both_hosts_record_the_same_capabilities(s: State) {}

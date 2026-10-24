@@ -27,7 +27,8 @@ const GOLDEN = `{
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
-      "targets": [{ "color": "rgba8unorm", "depth": false, "screen": true }],
+      "outputs": ["float"],
+      "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }],
       "uniform": null,
       "bindings": [{ "binding": 0, "kind": "texture", "format": "rgba8unorm" }, { "binding": 1, "kind": "sampler" }]
     }
@@ -56,6 +57,7 @@ test("parses the Rust crate's golden manifest", () => {
         uniform: { binding: 0, size: 32, space: "uniform" },
         bindings: [{ binding: 1, kind: "read_write", stage: "both", format: null }],
         debug_flag: null,
+        requires: [],
       },
       {
         kind: "render",
@@ -63,19 +65,20 @@ test("parses the Rust crate's golden manifest", () => {
         shader: "pipeline_1.wgsl",
         vertex_entry: "vs",
         fragment_entry: "fs",
-        blend: false,
+        blends: [],
         cull: "none",
         depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         depth: { compare: "less", write: true },
         writes_depth: false,
-        uint: false,
-        targets: [{ color: "rgba8unorm", depth: false, screen: true }],
+        outputs: ["float"],
+        targets: [{ colors: ["rgba8unorm"], depth: false, screen: true }],
         uniform: null,
         bindings: [
           { binding: 0, kind: "texture", stage: "both", format: "rgba8unorm" },
           { binding: 1, kind: "sampler", stage: "both", format: null },
         ],
         debug_flag: null,
+        requires: [],
       },
     ],
   });

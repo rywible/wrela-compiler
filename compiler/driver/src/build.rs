@@ -147,7 +147,7 @@ fn emit_in(
             ) => wrela_abi::manifest::Stage::Render {
                 vertex_entry: vertex.clone(),
                 fragment_entry: fragment.clone(),
-                blend: output.blends(),
+                blends: wrela_lower::blends_of(state, output),
                 cull: state.cull,
                 depth_bias: wrela_abi::manifest::DepthBias {
                     constant: state.bias_constant,
@@ -156,7 +156,17 @@ fn emit_in(
                 },
                 depth: state.depth,
                 writes_depth: output.writes_depth(),
-                uint: output.uint(),
+                outputs: output
+                    .colours
+                    .iter()
+                    .map(|(c, _)| {
+                        if c.uint {
+                            wrela_abi::manifest::Output::Uint
+                        } else {
+                            wrela_abi::manifest::Output::Float
+                        }
+                    })
+                    .collect(),
                 targets: p.targets.clone(),
             },
             _ => {
@@ -187,6 +197,7 @@ fn emit_in(
         if let Some(wgsl) = wgsl {
             files.push((shader.clone(), wgsl.text.into_bytes()));
         }
+        let requires = p.module.requires();
         manifest.pipelines.push(wrela_abi::manifest::Pipeline {
             name: p.name.clone(),
             shader,
@@ -202,6 +213,7 @@ fn emit_in(
             }),
             bindings: p.bindings.clone(),
             debug_flag: p.debug_flag,
+            requires,
         });
     }
     if let Err(e) = manifest.validate() {

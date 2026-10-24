@@ -19,7 +19,9 @@
 // (`latency.json`); with `keylatency=n`, n presses of the right arrow key instead, at least
 // 250 ms apart; with `clip=n` (and `clipfrom=i`), the canvas recorded from frame i (0 unless
 // given) for n frames, as a video (`clip.webm`: the main thread's MediaRecorder; paced frames
-// play at their speed).
+// play at their speed). With `features=none` (or a comma list of the ones to keep), the program
+// sees only those optional device features (`std::gpu::features()`), though the device has them
+// all: its fallback paths, measured on a device that has the features.
 //
 // A program with a ticker (`std::tick::start`) runs it on the lockstep schedule (#43 §2.3):
 // before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
@@ -69,6 +71,9 @@ export interface TestParams {
   snapfrom: number;
   /** A script of input events, relative to the page; "" for none. */
   input: string;
+  /** The optional features the program may see: null for all the device has, else `none` or a
+   * comma list. */
+  features: string | null;
   /** Pointer events to send through the DOM while the frames run (0: none). */
   latency: number;
   /** Key presses to send through the DOM while the frames run (0: none). */
@@ -103,6 +108,7 @@ export const TEST_DEFAULTS: TestParams = {
   snap: 0,
   snapfrom: 0,
   input: "",
+  features: null,
   latency: 0,
   keylatency: 0,
   paced: 0,
@@ -141,6 +147,13 @@ export function parseTestParams(hash: string): TestParams | null {
         throw new Error(`test parameter input=${value} must be a path relative to the page`);
       }
       params.input = value;
+      continue;
+    }
+    if (key === "features") {
+      if (value !== "none" && !/^[a-z0-9-]+(,[a-z0-9-]+)*$/.test(value)) {
+        throw new Error(`test parameter features=${value} must be none or a comma list of features`);
+      }
+      params.features = value;
       continue;
     }
     if (!KEYS.some((k) => k === key)) {

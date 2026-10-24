@@ -11,7 +11,7 @@ export const words = (ws: number[]): Uint8Array<ArrayBuffer> => {
   return out;
 };
 
-const f32bits = (f: number) => {
+export const f32bits = (f: number) => {
   const view = new DataView(new ArrayBuffer(4));
   view.setFloat32(0, f, true);
   return view.getUint32(0, true);
@@ -75,13 +75,15 @@ export class Encoder {
     return this.#command(Opcode.CopyBuffer, [source, sourceOffset, destination, destinationOffset, size]);
   }
 
-  createTexture(handle: number, width: number, height: number, format: TextureFormat): this {
-    const f = TEXTURE_FORMATS.findIndex((t) => t.name === format);
-    return this.#command(Opcode.CreateTexture, [handle, width, height, f]);
+  /** A texture: a 2D one of one level unless `kind`, `layers` and `levels` say otherwise
+   * (kind 0 2D, 1 3D, 2 array, 3 cube). */
+  createTexture(handle: number, width: number, height: number, format: TextureFormat, writable = false, kind = 0, layers = 1, levels = 1): this {
+    const f = TEXTURE_FORMATS.findIndex((t) => t.name === format) | (writable ? 1 << 16 : 0);
+    return this.#command(Opcode.CreateTexture, [handle, width, height, f, kind, layers, levels]);
   }
 
-  writeTexture(handle: number, origin: [number, number], size: [number, number], data: Uint8Array): this {
-    return this.#command(Opcode.WriteTexture, [handle, ...origin, ...size, data.length], data);
+  writeTexture(handle: number, origin: [number, number], size: [number, number], data: Uint8Array, level = 0, layer = 0): this {
+    return this.#command(Opcode.WriteTexture, [handle, level, layer, ...origin, ...size, data.length], data);
   }
 
   destroyTexture(handle: number): this {
@@ -90,7 +92,7 @@ export class Encoder {
 
   createSampler(handle: number, linear: boolean, repeat: boolean, compare: Compare | null): this {
     const c = compare === null ? 0 : COMPARES.indexOf(compare);
-    return this.#command(Opcode.CreateSampler, [handle, Number(linear), Number(repeat), c]);
+    return this.#command(Opcode.CreateSampler, [handle, Number(linear), Number(repeat), c, 0, 1]);
   }
 
   destroySampler(handle: number): this {
@@ -98,12 +100,19 @@ export class Encoder {
   }
 
   beginPass(p: Pass): this {
-    const ws = [p.color, Number(p.keepColor) | (Number(p.join) << 1), ...p.clear.map(f32bits), p.depth, Number(p.keepDepth), f32bits(p.clearDepth)];
+    const ws = [p.colors.length, Number(p.join)];
+    for (const c of p.colors) ws.push(c.texture, c.level, c.layer, Number(c.keep), ...c.clear.map(f32bits));
+    ws.push(p.depth, p.depthLayer, Number(p.keepDepth), f32bits(p.clearDepth));
     return this.#command(Opcode.BeginPass, ws);
   }
 
   endPass(): this {
     return this.#command(Opcode.EndPass, []);
+  }
+
+  /** Any command, its payload's words as given. */
+  words(op: number, ws: number[]): this {
+    return this.#command(op, ws);
   }
 
   dispatchIndirect(pipeline: number, args: number, offset: number, bindings: B[], uniforms: Uint8Array): this {

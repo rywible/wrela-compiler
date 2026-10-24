@@ -4,11 +4,13 @@
 import { expect, test } from "bun:test";
 import { NONE } from "../src/abi.gen.ts";
 import { Encoder } from "./encoder.ts";
-import { vectors } from "./fixtures.ts";
+import { vectors, passOf } from "./fixtures.ts";
+import { Opcode } from "../src/abi.gen.ts";
+import { f32bits } from "./encoder.ts";
 
 test("the test encoder writes the vectors' golden batch", () => {
   const golden = vectors.batches.find((b) => b.name === "golden")!.bytes;
-  const offscreen = { color: 8, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 9, keepDepth: false, clearDepth: 1 };
+  const offscreen = passOf({ color: 8, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 9, keepDepth: false, clearDepth: 1 });
   const batch = new Encoder()
     .createBuffer(7, 16)
     .writeBuffer(7, 4, Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8))
@@ -39,6 +41,14 @@ test("the test encoder writes the vectors' golden batch", () => {
     .handOver(7, "next")
     .hostRequest(8, "test/echo", Uint8Array.of(3, 2, 1))
     .timed(9, "shadows")
+    .words(Opcode.CopyTexture, [8, 1, 0, 0, 0, 12, 0, 3, 4, 4, 2, 2])
+    .words(Opcode.CopyTextureToBuffer, [8, 0, 0, 1, 1, 2, 2, 3, 256, 256])
+    .words(Opcode.CopyBufferToTexture, [3, 0, 256, 8, 2, 0, 0, 0, 4, 4])
+    .words(Opcode.SetScissor, [1, 2, 3, 4])
+    .words(Opcode.SetViewport, [0, 0, 64, 32, 0, 1].map(f32bits))
+    .words(Opcode.DrawIndexed, [1, 3, 0, 12, 6, 2, 1, 0xffff_ffff, 4, 0, 0])
+    .words(Opcode.MultiDrawIndirect, [1, 3, 16, 4, NONE, 0, 0, 0])
+    .words(Opcode.MultiDrawIndexedIndirect, [1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0])
     .finish();
   expect(Buffer.from(batch).toString("hex")).toBe(golden);
   expect(NONE).toBe(0xffffffff);

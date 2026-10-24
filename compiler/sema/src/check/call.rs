@@ -137,7 +137,8 @@ impl<'p> Checker<'p> {
             ValueRes::Item(Res::Fn(f)) => {
                 match self.p.func(f).lang {
                     Some(Lang::Dispatch) => return self.check_dispatch(args, span),
-                    Some(Lang::Draw) => return self.check_draw(args, span),
+                    Some(Lang::Draw) => return self.check_draw(args, false, span),
+                    Some(Lang::DrawMulti) => return self.check_draw(args, true, span),
                     _ => {}
                 }
                 if self.p.func(f).attrs.job.is_some() {
@@ -2858,6 +2859,18 @@ impl<'p> Checker<'p> {
     /// `mut` for a `mut Slots<T>` as a `GpuSpanMut<T>`. A projection field takes a place (E0508).
     fn held_arg(&mut self, x: Expr, fty: TyId, mode: RetMode, name: &str) -> Expr {
         let xt = self.infer.resolve(&self.p.types, x.ty);
+        let view = self.p.lang_of_ty(xt).is_some_and(Lang::is_texture_view);
+        let whole = self.p.lang_of_ty(fty).is_some_and(|l| l.is_texture_or_sampler());
+        if view && whole {
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    x.span,
+                    format!("a bound entry point's value holds `{name}` whole: a texture, not part of one"),
+                )
+                .with_help("give the level or layer where the entry point is bound in its command: `dispatch(k.bind(tex.level(1)), ...)`"),
+            );
+        }
         let whole = match (self.p.lang_of_ty(fty), self.p.lang_of_ty(xt)) {
             (Some(Lang::GpuSpan), Some(Lang::GpuBuffer)) => Some(("items", Mode::Borrow)),
             (Some(Lang::GpuSpanMut), Some(Lang::GpuBuffer)) => Some(("items_mut", Mode::Mut)),
@@ -3188,6 +3201,69 @@ impl<'p> Checker<'p> {
     /// `GpuSpan<T>`; for `mut Slots<T>` (or `mut [T]`), `mut buf` or a `GpuSpanMut<T>`. Any
     /// other parameter takes its own type.
     fn gpu_arg(&mut self, p: &CallParam, value: &ast::Expr) -> Expr {
+        // A texture parameter takes part of one too: a `Texture<F>` a level or a layer to read,
+        // a `Texels<F>` one to write, a `MipStep<F>` a texture's step (§18.8).
+        if let TyKind::Adt(s, args) = self.kind(p.ty).clone() {
+            let lang = self.p.adt(s).lang;
+            let (whole, views): (Option<Lang>, &[Lang]) = match lang {
+                Some(Lang::Texture) => {
+                    (Some(Lang::Texture), &[Lang::TextureLevel, Lang::TextureLayer])
+                }
+                Some(Lang::Texels) => {
+                    (Some(Lang::Texture), &[Lang::TextureLevelMut, Lang::TextureLayerMut])
+                }
+                Some(Lang::MipStep) => (None, &[Lang::TextureStep]),
+                _ => (None, &[]),
+            };
+            if !views.is_empty() {
+                let e = self.check_expr(value, None);
+                let t = self.infer.resolve(&self.p.types, e.ty);
+                let given = match self.kind(t) {
+                    TyKind::Adt(a, _) => self.p.adt(*a).lang,
+                    _ => None,
+                };
+                let of = |this: &mut Self, l: Lang| {
+                    this.p
+                        .lang_adt(l)
+                        .map_or(this.p.types.error, |g| this.p.types.adt(g, args.clone()))
+                };
+                match given {
+                    Some(v) if views.contains(&v) => {
+                        let want = of(self, v);
+                        self.expect(e.ty, want, e.span);
+                    }
+                    _ => {
+                        let want = match whole {
+                            Some(w) => of(self, w),
+                            None => of(self, views[0]),
+                        };
+                        self.expect(e.ty, want, e.span);
+                        let written = lang == Some(Lang::Texels);
+                        if written && !matches!(e.kind, ExprKind::MutArg(_)) && e.is_place() {
+                            self.err(
+                                Diagnostic::new(
+                                    codes::E0503,
+                                    e.span,
+                                    format!(
+                                        "`{}` is written by the GPU, so it's passed `mut ...`",
+                                        p.name
+                                    ),
+                                )
+                                .with_note(
+                                    "every mutation is visible where it happens (§6.2, §18.3)",
+                                )
+                                .with_fix(
+                                    "add `mut`",
+                                    e.span.shrink_to_start(),
+                                    "mut ",
+                                ),
+                            );
+                        }
+                    }
+                }
+                return e;
+            }
+        }
         // An `Append<T>` takes `mut` an `AppendBuffer<T>`, an `AtomicMap` an `AtomicMapBuffer`.
         let container = match self.kind(p.ty) {
             TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::Append) => {
@@ -3196,9 +3272,9 @@ impl<'p> Checker<'p> {
             TyKind::Adt(s, _) if self.p.is_lang_adt(*s, Lang::AtomicMap) => {
                 Some((Lang::AtomicMapBuffer, Vec::new()))
             }
-            // `Texels<F>` takes `mut` a `Texture<F>` made by `writable_texture`.
-            TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::Texels) => {
-                Some((Lang::Texture, args.clone()))
+            // `TexelsArray<F>` takes `mut` a `TextureArray<F>` made by `writable_texture_array`.
+            TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::TexelsArray) => {
+                Some((Lang::TextureArray, args.clone()))
             }
             // `Texels3d<F>`, a `Texture3d<F>`.
             TyKind::Adt(s, args) if self.p.is_lang_adt(*s, Lang::Texels3d) => {
@@ -3464,16 +3540,7 @@ impl<'p> Checker<'p> {
         let x = self.check_expr(e, None);
         let is_pass = match self.kind(x.ty) {
             TyKind::Error => return None,
-            TyKind::Adt(a, _) => matches!(
-                self.p.adt(*a).lang,
-                Some(
-                    Lang::Pass
-                        | Lang::DepthPass
-                        | Lang::DepthOnlyPass
-                        | Lang::ScreenPass
-                        | Lang::ScreenDepthPass
-                )
-            ),
+            TyKind::Adt(a, _) => self.p.adt(*a).lang.is_some_and(Lang::is_pass),
             TyKind::Param(g) => self
                 .p
                 .param(*g)
@@ -3498,14 +3565,31 @@ impl<'p> Checker<'p> {
     }
 
     /// `draw(vs.bind(...), fs.bind(...), vertices: n)`, with `instances: m` or, for both,
-    /// `indirect: buf`; `indices: buf` with `indirect:` for an indexed draw; and the render
-    /// state, `cull:`, `depth_bias:` and `depth:`, build-time constants.
-    fn check_draw(&mut self, args: &[ast::Arg], span: Span) -> Expr {
+    /// `indirect: buf`; `indices: buf` for an indexed draw, with `indirect:` or with
+    /// `index_count:`, `first_index:`, `base_vertex:` and `first_instance:`; and the render
+    /// state, `cull:`, `depth_bias:`, `depth:` and `blend:` (or `blends:`), build-time
+    /// constants. `draw_multi` (`multi`) takes `indirect:` and `count:`, the number of draws.
+    fn check_draw(&mut self, args: &[ast::Arg], multi: bool, span: Span) -> Expr {
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
+        let i32_ty = self.p.types.intern(TyKind::Int(crate::ty::IntTy::I32));
         // `draw`'s own named arguments.
-        const OWN: [&str; 7] =
-            ["vertices", "instances", "indirect", "indices", "cull", "depth_bias", "depth"];
+        const OWN: [&str; 14] = [
+            "vertices",
+            "instances",
+            "indirect",
+            "indices",
+            "cull",
+            "depth_bias",
+            "depth",
+            "index_count",
+            "first_index",
+            "base_vertex",
+            "first_instance",
+            "count",
+            "blend",
+            "blends",
+        ];
         let own = |a: &ast::Arg| a.name.as_ref().is_some_and(|n| OWN.contains(&n.name.as_str()));
         // The form before binding: the shaders' arguments among `draw`'s own, by name.
         let extra: Vec<&ast::Arg> =
@@ -3601,6 +3685,11 @@ impl<'p> Checker<'p> {
         let mut instances = None;
         let mut indirect: Option<Box<Expr>> = None;
         let mut indices: Option<Box<Expr>> = None;
+        // The first index, the base vertex and the first instance of a direct indexed draw.
+        let lit = |v: i128, ty| Expr { ty, span, kind: ExprKind::Lit(Lit::Int(v)) };
+        let mut more = vec![lit(0, u32_ty), lit(0, i32_ty), lit(0, u32_ty)];
+        let mut index_count: Option<Expr> = None;
+        let mut count: Option<Expr> = None;
         let mut state = RenderState::default();
         let mut counts = Vec::new();
         let mut seen: Vec<&str> = Vec::new();
@@ -3655,7 +3744,75 @@ impl<'p> Checker<'p> {
                     }
                 }
                 // The render state given twice isn't checked again.
-                "cull" | "depth_bias" | "depth" if twice => {}
+                "cull" | "depth_bias" | "depth" | "blend" | "blends" if twice => {}
+                "blend" | "blends" if state.blend_given => {
+                    self.err(Diagnostic::new(
+                        codes::E0304,
+                        a.span,
+                        "a draw takes `blend:` for every target or `blends:` for each, not both",
+                    ));
+                }
+                "blend" => {
+                    if let Some(c) = self.render_constant(&a.value, Lang::Blend) {
+                        let b = wrela_abi::manifest::Blend::ALL
+                            [(c[0] as usize).min(wrela_abi::manifest::Blend::ALL.len() - 1)];
+                        state.blends = [b; 4];
+                        state.blend_given = true;
+                    }
+                }
+                "blends" => {
+                    let ast::ExprKind::Array(items) = &a.value.kind else {
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0603,
+                                a.span,
+                                "`blends:` is a list of `Blend`s, written out: one for each of the pass's targets",
+                            )
+                            .with_help("e.g. `blends: [Blend::Replace, Blend::Add]`"),
+                        );
+                        self.check_expr(&a.value, None);
+                        continue;
+                    };
+                    if items.is_empty() || items.len() > 4 {
+                        self.err(Diagnostic::new(
+                            codes::E0603,
+                            a.span,
+                            "`blends:` gives one `Blend` for each of 1 to 4 targets",
+                        ));
+                    }
+                    for (k, item) in items.iter().enumerate().take(4) {
+                        if let Some(c) = self.render_constant(item, Lang::Blend) {
+                            state.blends[k] = wrela_abi::manifest::Blend::ALL
+                                [(c[0] as usize).min(wrela_abi::manifest::Blend::ALL.len() - 1)];
+                        }
+                    }
+                    state.blend_count = items.len().min(4) as u8;
+                    state.blend_given = true;
+                }
+                "index_count" | "count" => {
+                    let e = self.check_expect(&a.value, u32_ty);
+                    if !twice {
+                        if n.name == "count" {
+                            count = Some(e);
+                        } else {
+                            index_count = Some(e);
+                        }
+                        counts.push(DrawCount::Vertices);
+                    }
+                }
+                "first_index" | "base_vertex" | "first_instance" => {
+                    let k = match n.name.as_str() {
+                        "first_index" => 0,
+                        "base_vertex" => 1,
+                        _ => 2,
+                    };
+                    let want = if k == 1 { i32_ty } else { u32_ty };
+                    let e = self.check_expect(&a.value, want);
+                    if !twice {
+                        more[k] = e;
+                        counts.push(DrawCount::More(k as u8));
+                    }
+                }
                 "cull" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Cull) {
                         use wrela_abi::manifest::Cull;
@@ -3702,14 +3859,47 @@ impl<'p> Checker<'p> {
             let want = if indices.is_some() { Lang::DrawIndexedArgs } else { Lang::DrawArgs };
             self.args_kind(e, want);
         }
-        if indices.is_some() && indirect.is_none() {
+        let direct_indexed = indices.is_some() && indirect.is_none();
+        let gave_more = counts.iter().any(|c| matches!(c, DrawCount::More(_)));
+        if multi {
+            if indirect.is_none() || count.is_none() {
+                self.err(
+                    Diagnostic::new(
+                        codes::E0603,
+                        span,
+                        "`draw_multi` takes `indirect:`, the draws' arguments one after another, and `count:`, how many",
+                    )
+                    .with_help("e.g. `draw_multi(pass, vs, fs, indirect: lists.items(), count: n)`"),
+                );
+            }
+            if vertices.is_some() || instances.is_some() || index_count.is_some() || gave_more {
+                self.err(Diagnostic::new(
+                    codes::E0603,
+                    span,
+                    "`draw_multi` takes each draw's counts from `indirect:`",
+                ));
+            }
+        } else if count.is_some() {
+            self.err(
+                Diagnostic::new(codes::E0302, span, "`draw` takes no `count:`")
+                    .with_help("`draw_multi` records several indirect draws: give it `count:`"),
+            );
+        }
+        if !direct_indexed && (index_count.is_some() || gave_more) {
             self.err(
                 Diagnostic::new(
                     codes::E0603,
                     span,
-                    "an indexed draw takes its counts from `indirect:`",
-                ).with_help("pass `indirect:` with a buffer of `DrawIndexedArgs`, or draw without `indices:`")
-                .with_note("the buffer holds the index count, the instance count, the first index, the base vertex and the first instance"),
+                    "`index_count:`, `first_index:`, `base_vertex:` and `first_instance:` are a direct indexed draw's: with `indices:` and no `indirect:`",
+                ),
+            );
+        }
+        if direct_indexed && vertices.is_some() {
+            self.err(
+                Diagnostic::new(codes::E0603, span, "an indexed draw counts indices, not vertices")
+                    .with_help(
+                        "give `index_count:` (all of `indices` past `first_index:` if not given)",
+                    ),
             );
         }
         if indirect.is_some() && (vertices.is_some() || instances.is_some()) {
@@ -3721,7 +3911,12 @@ impl<'p> Checker<'p> {
         }
         let vertices = match (vertices, &indirect) {
             (Some(v), _) => v,
-            (None, Some(_)) => Expr { ty: u32_ty, span, kind: ExprKind::Lit(Lit::Int(0)) },
+            (None, Some(_)) => count.unwrap_or(lit(0, u32_ty)),
+            // A direct indexed draw's index count: all of its indices past the first, if not
+            // given (`u32::MAX` says so to lowering).
+            (None, None) if direct_indexed => {
+                index_count.unwrap_or(lit(i128::from(u32::MAX), u32_ty))
+            }
             (None, None) => {
                 self.err(Diagnostic::new(
                     codes::E0603,
@@ -3741,6 +3936,8 @@ impl<'p> Checker<'p> {
             instances,
             indirect,
             indices,
+            more,
+            multi,
             state,
             args: bound,
             counts,
@@ -3795,7 +3992,9 @@ impl<'p> Checker<'p> {
             }
         }
         let got = match (&e.kind, lang) {
-            (ExprKind::Adt { variant: Some(v), fields, .. }, Lang::Cull) if fields.is_empty() => {
+            (ExprKind::Adt { variant: Some(v), fields, .. }, Lang::Cull | Lang::Blend)
+                if fields.is_empty() =>
+            {
                 Some([f64::from(*v), 0.0, 0.0])
             }
             (ExprKind::Adt { variant: None, fields, base: None, .. }, Lang::Depth) => {
@@ -3826,6 +4025,7 @@ impl<'p> Checker<'p> {
         if got.is_none() {
             let (what, example) = match lang {
                 Lang::Cull => ("cull mode", "`cull: Cull::Back`"),
+                Lang::Blend => ("blend", "`blend: Blend::Add`"),
                 Lang::Depth => {
                     ("depth state", "`depth: Depth { compare: Compare::Equal, write: false }`")
                 }
@@ -3872,7 +4072,7 @@ fn declared_render_constant(
     }
     let adt = p.adt(a);
     match (&p.const_(c).value.kind, lang) {
-        (ast::ExprKind::Path(path), Lang::Cull) => {
+        (ast::ExprKind::Path(path), Lang::Cull | Lang::Blend) => {
             let name = &path.segments.last()?.ident.name;
             let v = adt.variants().iter().position(|v| &v.name == name)?;
             Some([v as f64, 0.0, 0.0])

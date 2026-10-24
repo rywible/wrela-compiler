@@ -22,21 +22,21 @@ fn golden_bytes() {
         words(&[4, 16, 0, f(0.5), f(1.0), f(1.0)]), // BeginScreenPass
         words(&[5, 28, 1, 3, 1, 0, 8]),             // Draw
         vec![1, 0, 0, 0, 2, 0, 0, 0],
-        words(&[6, 0]),                     // Present
-        words(&[7, 4, 7]),                  // DestroyBuffer
-        words(&[8, 20, 1, 4, 2, 8, 12]),    // CopyBuffer
+        words(&[6, 0]),                           // Present
+        words(&[7, 4, 7]),                        // DestroyBuffer
+        words(&[8, 20, 1, 4, 2, 8, 12]),          // CopyBuffer
         words(&[9, 28, 8, 2, 1, 0, 0, 1, 1]),     // CreateTexture
         words(&[10, 40, 8, 0, 0, 0, 0, 2, 1, 8]), // WriteTexture
         vec![1, 2, 3, 4, 5, 6, 7, 8],
-        words(&[11, 4, 8]),                      // DestroyTexture
-        words(&[12, 24, 10, 1, 0, 1, 0, 1]),     // CreateSampler
-        words(&[13, 4, 10]),                     // DestroySampler
+        words(&[11, 4, 8]),                  // DestroyTexture
+        words(&[12, 24, 10, 1, 0, 1, 0, 1]), // CreateSampler
+        words(&[13, 4, 10]),                 // DestroySampler
         words(&[14, 56, 1, 0, 8, 0, 0, 0, 0, 0, 0, f(1.0), 9, 0, 0, f(1.0)]), // BeginPass
-        words(&[15, 0]),                                       // EndPass
-        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]),              // DispatchIndirect
-        words(&[17, 20, 1, 3, 16, 0, 0]),                      // DrawIndirect
-        words(&[18, 16, 1, 3, 0, 8]),                          // ReadBuffer
-        words(&[19, 20, 2, 11]),                               // StorageRead
+        words(&[15, 0]),                     // EndPass
+        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]), // DispatchIndirect
+        words(&[17, 20, 1, 3, 16, 0, 0]),    // DrawIndirect
+        words(&[18, 16, 1, 3, 0, 8]),        // ReadBuffer
+        words(&[19, 20, 2, 11]),             // StorageRead
         b"saves/slot1\0".to_vec(),
         words(&[20, 28, 3, 7, 5]), // StorageWrite
         b"saves/a\0".to_vec(),
@@ -65,9 +65,9 @@ fn golden_bytes() {
         words(&[33, 40, 3, 0, 256, 8, 2, 0, 0, 0, 4, 4]),      // CopyBufferToTexture
         words(&[34, 16, 1, 2, 3, 4]),                          // SetScissor
         words(&[35, 24, f(0.0), f(0.0), f(64.0), f(32.0), f(0.0), f(1.0)]), // SetViewport
-        words(&[36, 44, 1, 3, 0, 12, 6, 2, 1, u32::MAX, 4, 0, 0]),       // DrawIndexed
-        words(&[37, 32, 1, 3, 16, 4, NONE, 0, 0, 0]),                    // MultiDrawIndirect
-        words(&[38, 44, 1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0]), // MultiDrawIndexedIndirect
+        words(&[36, 44, 1, 3, 0, 12, 6, 2, 1, u32::MAX, 4, 0, 0]), // DrawIndexed
+        words(&[37, 32, 1, 3, 16, 4, NONE, 0, 0, 0]),          // MultiDrawIndirect
+        words(&[38, 44, 1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0]),    // MultiDrawIndexedIndirect
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));
@@ -123,7 +123,16 @@ fn texture_write_pads_only_the_command_payload() {
     let cmds = decode(&batch).expect("a two-byte texture write is word-aligned");
     assert_eq!(
         cmds[1],
-        Command::WriteTexture { handle: 1, level: 0, layer: 0, x: 0, y: 0, width: 1, height: 1, data: &[0x00, 0x3c] }
+        Command::WriteTexture {
+            handle: 1,
+            level: 0,
+            layer: 0,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            data: &[0x00, 0x3c]
+        }
     );
     assert_eq!(cmds[2], Command::DestroyTexture { handle: 1 });
     let mut checker = crate::check::Checker::new(&crate::Manifest::new("game.wasm"));

@@ -868,7 +868,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       handed = new Handed(msg.given);
-      Promise.all([openDevice(fatal), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
+      Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
           handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);

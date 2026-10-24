@@ -8,8 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, BindingStage, Blend, Cull, DepthBias, DepthState, Manifest, Output, Pipeline, RenderTarget,
-    ResourceBinding, Stage, UniformBlock, UniformSpace,
+    BindingKind, BindingStage, Blend, Cull, DepthBias, DepthState, Manifest, Output, Pipeline,
+    RenderTarget, ResourceBinding, Stage, UniformBlock, UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -71,7 +71,16 @@ fn command(c: &Command) -> Value {
                 "destination": destination, "destinationOffset": destination_offset, "size": size,
             })
         }
-        Command::CreateTexture { handle, width, height, format, writable, kind, layers, levels } => {
+        Command::CreateTexture {
+            handle,
+            width,
+            height,
+            format,
+            writable,
+            kind,
+            layers,
+            levels,
+        } => {
             json!({
                 "op": "CreateTexture", "handle": handle, "width": width, "height": height,
                 "format": format.name(), "writable": writable, "kind": kind.name(),
@@ -569,9 +578,8 @@ fn target_bound(writes_depth: bool, uint: bool) -> Stage {
     let colors = TextureFormat::ALL
         .into_iter()
         .filter(|f| !f.is_depth() && f.renderable() && f.is_uint() == uint);
-    let mut targets: Vec<RenderTarget> = colors
-        .flat_map(|c| [false, true].map(|depth| RenderTarget::of(&[c], depth)))
-        .collect();
+    let mut targets: Vec<RenderTarget> =
+        colors.flat_map(|c| [false, true].map(|depth| RenderTarget::of(&[c], depth))).collect();
     targets.push(RenderTarget::of(&[], true));
     if !uint {
         targets.extend([false, true].map(RenderTarget::screen));
@@ -966,7 +974,8 @@ fn checks() -> Value {
             "a 3D texture as a pass's target",
             &m,
             &with_textures(&|e| {
-                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false).begin_pass(Pass { depth: stream::NONE, ..pass.with_color(13) });
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false)
+                    .begin_pass(Pass { depth: stream::NONE, ..pass.with_color(13) });
             }),
         ),
         check(
@@ -1038,7 +1047,9 @@ fn checks() -> Value {
         check(
             "a depth texture as a colour target",
             &m,
-            &with_textures(&|e| _ = e.begin_pass(Pass { depth: stream::NONE, ..pass.with_color(9) })),
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { depth: stream::NONE, ..pass.with_color(9) })
+            }),
         ),
         check(
             "a colour texture as a depth target",
@@ -1116,9 +1127,7 @@ fn checks() -> Value {
         check(
             "a pipeline drawn on the screen with depth, which isn't one of its targets",
             &m,
-            &with_textures(&|e| {
-                _ = e.begin_pass(pass.with_color(SCREEN)).draw(9, 3, 1, &[], &[])
-            }),
+            &with_textures(&|e| _ = e.begin_pass(pass.with_color(SCREEN)).draw(9, 3, 1, &[], &[])),
         ),
         check("a readback past the end", &m, &with_buffers(&|e| _ = e.read_buffer(0, 1, 256, 260))),
         check(
@@ -1932,11 +1941,7 @@ fn joins() -> Vec<Value> {
         ("another depth target", ended, Pass { depth: 12, ..next }),
         ("its colour cleared", ended, next.keeping_color(false)),
         ("its depth cleared", ended, Pass { keep_depth: false, ..next }),
-        (
-            "depth alone, kept",
-            ended.with_color(NONE),
-            next.with_color(NONE).keeping_color(false),
-        ),
+        ("depth alone, kept", ended.with_color(NONE), next.with_color(NONE).keeping_color(false)),
         (
             "colour alone, kept",
             Pass { depth: NONE, ..ended },

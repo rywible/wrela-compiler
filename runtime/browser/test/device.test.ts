@@ -34,7 +34,7 @@ test("hardware adapters retain limits and enable indirect first instances and ti
   Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter } });
   expect(await openDevice(() => {})).toBe(device as unknown as GPUDevice);
   expect(requestAdapter).toHaveBeenCalledWith({ powerPreference: "high-performance" });
-  expect(requestDevice.mock.calls[0]).toEqual([{ requiredLimits: expect.any(Object), requiredFeatures: ["indirect-first-instance", "timestamp-query"] }]);
+  expect(requestDevice.mock.calls[0]).toEqual([{ requiredLimits: expect.any(Object), requiredFeatures: ["timestamp-query", "indirect-first-instance"] }]);
 });
 
 test("an adapter without indirect first instances fails before requesting a device", async () => {

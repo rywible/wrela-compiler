@@ -532,7 +532,12 @@ impl TextureFormat {
             i.uint = true;
             i
         }
-        const fn compressed(name: &'static str, block_bytes: u32, channels: u32, f: F) -> FormatInfo {
+        const fn compressed(
+            name: &'static str,
+            block_bytes: u32,
+            channels: u32,
+            f: F,
+        ) -> FormatInfo {
             row(name, block_bytes, 4, channels, With(f), No, No, No, (0, 0))
         }
         match self {
@@ -629,7 +634,9 @@ impl TextureFormat {
     /// The bytes of a `width` × `height` rectangle of it, whole blocks.
     pub fn bytes_of(self, width: u32, height: u32) -> u64 {
         let b = u64::from(self.block());
-        u64::from(width).div_ceil(b) * u64::from(height).div_ceil(b) * u64::from(self.bytes_per_texel())
+        u64::from(width).div_ceil(b)
+            * u64::from(height).div_ceil(b)
+            * u64::from(self.bytes_per_texel())
     }
 
     pub fn is_depth(self) -> bool {
@@ -835,9 +842,18 @@ impl Pass {
     /// With its colour target `texture` alone ([`NONE`]: none), keeping the first one's load
     /// and clear.
     pub fn with_color(self, texture: u32) -> Pass {
-        let first = self.colors().first().copied().unwrap_or(ColorTarget::of(NONE, false, [0.0; 4]));
-        let colors = if texture == NONE { Vec::new() } else { vec![ColorTarget { texture, ..first }] };
-        Pass { join: self.join, depth: self.depth, depth_layer: self.depth_layer, keep_depth: self.keep_depth, clear_depth: self.clear_depth, ..Pass::new(&colors) }
+        let first =
+            self.colors().first().copied().unwrap_or(ColorTarget::of(NONE, false, [0.0; 4]));
+        let colors =
+            if texture == NONE { Vec::new() } else { vec![ColorTarget { texture, ..first }] };
+        Pass {
+            join: self.join,
+            depth: self.depth,
+            depth_layer: self.depth_layer,
+            keep_depth: self.keep_depth,
+            clear_depth: self.clear_depth,
+            ..Pass::new(&colors)
+        }
     }
 
     /// With every colour target kept (or cleared).
@@ -1152,9 +1168,7 @@ impl Command<'_> {
             Command::SetViewport { .. } => Opcode::SetViewport,
             Command::DrawIndexed { .. } => Opcode::DrawIndexed,
             Command::MultiDrawIndirect { indices: None, .. } => Opcode::MultiDrawIndirect,
-            Command::MultiDrawIndirect { indices: Some(_), .. } => {
-                Opcode::MultiDrawIndexedIndirect
-            }
+            Command::MultiDrawIndirect { indices: Some(_), .. } => Opcode::MultiDrawIndexedIndirect,
         }
     }
 }
@@ -1588,7 +1602,12 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     width: w(5),
                     height: w(6),
                 };
-                Command::CopyTextureToBuffer { source, buffer: w(7), offset: w(8), bytes_per_row: w(9) }
+                Command::CopyTextureToBuffer {
+                    source,
+                    buffer: w(7),
+                    offset: w(8),
+                    bytes_per_row: w(9),
+                }
             }
             Opcode::CopyBufferToTexture => {
                 exactly(10)?;
@@ -1659,7 +1678,9 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("the indices' offset and size must be multiples of 4"));
                 }
                 if w(at + 1) % 4 != 0 || w(at + 4) % 4 != 0 {
-                    return Err(bad("the arguments' and the count's offsets must be multiples of 4"));
+                    return Err(bad(
+                        "the arguments' and the count's offsets must be multiples of 4",
+                    ));
                 }
                 Command::MultiDrawIndirect {
                     pipeline: w(0),
@@ -2043,8 +2064,18 @@ impl Encoder {
         offset: u32,
         bytes_per_row: u32,
     ) -> &mut Self {
-        let words =
-            [s.texture, s.level, s.layer, s.x, s.y, s.width, s.height, buffer, offset, bytes_per_row];
+        let words = [
+            s.texture,
+            s.level,
+            s.layer,
+            s.x,
+            s.y,
+            s.width,
+            s.height,
+            buffer,
+            offset,
+            bytes_per_row,
+        ];
         self.command(Opcode::CopyTextureToBuffer, &words, &[]);
         self
     }
@@ -2056,8 +2087,18 @@ impl Encoder {
         bytes_per_row: u32,
         d: TexelRect,
     ) -> &mut Self {
-        let words =
-            [buffer, offset, bytes_per_row, d.texture, d.level, d.layer, d.x, d.y, d.width, d.height];
+        let words = [
+            buffer,
+            offset,
+            bytes_per_row,
+            d.texture,
+            d.level,
+            d.layer,
+            d.x,
+            d.y,
+            d.width,
+            d.height,
+        ];
         self.command(Opcode::CopyBufferToTexture, &words, &[]);
         self
     }

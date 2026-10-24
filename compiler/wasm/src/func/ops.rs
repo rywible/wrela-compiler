@@ -1291,18 +1291,15 @@ pub(super) fn host(
             checked_bytes(fe, n, *elem_size);
             fe.ins.push(I::Call(fe.at.helpers.write));
         }
-        ir::HostOp::Dispatch { pipeline, bindings, uniform, indirect }
-        | ir::HostOp::Draw { pipeline, bindings, uniform, indirect, .. } => {
-            let dispatch = matches!(op, ir::HostOp::Dispatch { .. });
-            let indexed = matches!(op, ir::HostOp::Draw { indexed: true, .. });
-            // The pipeline, then the counts: three groups, two counts, or a buffer and offset
-            // (after the index buffer's handle, offset and size, for an indexed draw).
-            let fixed = if indexed {
-                6
-            } else if dispatch && !*indirect {
-                4
-            } else {
-                3
+        ir::HostOp::Dispatch { pipeline, bindings, uniform, .. }
+        | ir::HostOp::Draw { pipeline, bindings, uniform, .. } => {
+            // The pipeline, then the counts: three groups, or a buffer and offset for a
+            // dispatch; a draw's as its kind says (`ir::DrawKind::counts`).
+            let (fixed, opc) = match op {
+                ir::HostOp::Dispatch { indirect: false, .. } => (4, Opcode::Dispatch),
+                ir::HostOp::Dispatch { indirect: true, .. } => (3, Opcode::DispatchIndirect),
+                ir::HostOp::Draw { kind, .. } => (kind.counts() as u32 + 1, kind.opcode()),
+                _ => unreachable!("matched a dispatch or a draw"),
             };
             let nb = *bindings as usize;
             let usize_ = uniform.map_or(0, |t| round_up(16, layout(&fe.m.types, t).size));
@@ -1312,13 +1309,6 @@ pub(super) fn host(
             if CMD_HEADER.saturating_add(payload) > memory::CMD_CAP {
                 return Err(format!("internal: a {payload}-byte command overflows the buffer"));
             }
-            let opc = match (dispatch, *indirect) {
-                (true, false) => Opcode::Dispatch,
-                (true, true) => Opcode::DispatchIndirect,
-                (false, false) => Opcode::Draw,
-                (false, true) if indexed => Opcode::DrawIndexedIndirect,
-                (false, true) => Opcode::DrawIndirect,
-            };
             let a = begin_command(fe, opc, payload);
             fe.ins.extend(put(a, CMD_HEADER, I::I32Const(*pipeline as i32)));
             for (k, x) in args.iter().take(fixed as usize - 1).enumerate() {

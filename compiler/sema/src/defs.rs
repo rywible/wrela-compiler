@@ -199,13 +199,21 @@ macro_rules! lang_items {
                         | Lang::BeginScreenPass
                         | Lang::Present
                         | Lang::CreateTexture
-                        | Lang::CreateTexture3d
                         | Lang::WriteTexture
                         | Lang::DestroyTexture
                         | Lang::CreateSampler
                         | Lang::DestroySampler
-                        | Lang::BeginPass
+                        | Lang::BeginPass0
+                        | Lang::BeginPass1
+                        | Lang::BeginPass2
+                        | Lang::BeginPass3
+                        | Lang::BeginPass4
                         | Lang::EndPass
+                        | Lang::CopyTextureCommand
+                        | Lang::CopyTextureToBufferCommand
+                        | Lang::CopyBufferToTextureCommand
+                        | Lang::ScissorCommand
+                        | Lang::ViewportCommand
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
                         | Lang::TimedCommand
@@ -270,6 +278,8 @@ macro_rules! lang_items {
                         | Lang::AtomicMap
                         | Lang::Texels
                         | Lang::Texels3d
+                        | Lang::TexelsArray
+                        | Lang::MipStep
                 )
             }
 
@@ -280,8 +290,45 @@ macro_rules! lang_items {
                     Lang::Texture
                         | Lang::DepthTexture
                         | Lang::Texture3d
+                        | Lang::TextureArray
+                        | Lang::Cubemap
+                        | Lang::DepthTextureArray
                         | Lang::Sampler
                         | Lang::ComparisonSampler
+                )
+            }
+
+            /// Whether it's a view of part of a texture, given for a texture parameter: a level,
+            /// a layer, a mip step.
+            pub fn is_texture_view(self) -> bool {
+                matches!(
+                    self,
+                    Lang::TextureLevel
+                        | Lang::TextureLevelMut
+                        | Lang::TextureLayer
+                        | Lang::TextureLayerMut
+                        | Lang::TextureStep
+                )
+            }
+
+            /// Whether it's an open pass's type: what a draw draws into.
+            pub fn is_pass(self) -> bool {
+                matches!(
+                    self,
+                    Lang::Pass
+                        | Lang::DepthPass
+                        | Lang::DepthOnlyPass
+                        | Lang::ScreenPass
+                        | Lang::ScreenDepthPass
+                        | Lang::LayerPass
+                        | Lang::LayerDepthPass
+                        | Lang::DepthLayerPass
+                        | Lang::Pass2
+                        | Lang::Pass3
+                        | Lang::Pass4
+                        | Lang::DepthPass2
+                        | Lang::DepthPass3
+                        | Lang::DepthPass4
                 )
             }
 
@@ -345,29 +392,83 @@ lang_items! {
     DepthOnlyPass = "std::gpu::DepthOnlyPass",
     ScreenPass = "std::gpu::ScreenPass",
     ScreenDepthPass = "std::gpu::ScreenDepthPass",
+    LayerPass = "std::gpu::LayerPass",
+    LayerDepthPass = "std::gpu::LayerDepthPass",
+    DepthLayerPass = "std::gpu::DepthLayerPass",
+    Pass2 = "std::gpu::Pass2",
+    Pass3 = "std::gpu::Pass3",
+    Pass4 = "std::gpu::Pass4",
+    DepthPass2 = "std::gpu::DepthPass2",
+    DepthPass3 = "std::gpu::DepthPass3",
+    DepthPass4 = "std::gpu::DepthPass4",
+    Targets2 = "std::gpu::Targets2",
+    Targets3 = "std::gpu::Targets3",
+    Targets4 = "std::gpu::Targets4",
+    Blend = "std::gpu::Blend",
+    DrawMulti = "std::gpu::draw_multi",
     Present = "std::gpu::present",
     Texture = "std::gpu::Texture",
     DepthTexture = "std::gpu::DepthTexture",
     Texture3d = "std::gpu::Texture3d",
+    TextureArray = "std::gpu::TextureArray",
+    Cubemap = "std::gpu::Cubemap",
+    DepthTextureArray = "std::gpu::DepthTextureArray",
+    TextureLevel = "std::gpu::TextureLevel",
+    TextureLevelMut = "std::gpu::TextureLevelMut",
+    TextureLayer = "std::gpu::TextureLayer",
+    TextureLayerMut = "std::gpu::TextureLayerMut",
+    TextureStep = "std::gpu::TextureStep",
     Rgba8 = "std::gpu::Rgba8",
     Rgba16Float = "std::gpu::Rgba16Float",
     R16Float = "std::gpu::R16Float",
     Rg16Float = "std::gpu::Rg16Float",
     R32Float = "std::gpu::R32Float",
     R32Uint = "std::gpu::R32Uint",
+    R8 = "std::gpu::R8",
+    Rg8 = "std::gpu::Rg8",
+    Rgb10a2 = "std::gpu::Rgb10a2",
+    Rg32Float = "std::gpu::Rg32Float",
+    Rgba32Float = "std::gpu::Rgba32Float",
+    Rg32Uint = "std::gpu::Rg32Uint",
+    Rg11b10Float = "std::gpu::Rg11b10Float",
     Sampler = "std::gpu::Sampler",
     ComparisonSampler = "std::gpu::ComparisonSampler",
-    CreateTexture = "std::gpu::create_texture",
-    CreateTexture3d = "std::gpu::create_texture_3d",
+    CreateTexture = "std::gpu::create_texture_of",
     WriteTexture = "std::gpu::write_texture_rows",
     DestroyTexture = "std::gpu::destroy_texture",
     CreateSampler = "std::gpu::create_sampler",
     DestroySampler = "std::gpu::destroy_sampler",
-    BeginPass = "std::gpu::begin_pass_command",
+    BeginPass0 = "std::gpu::begin_pass0_command",
+    BeginPass1 = "std::gpu::begin_pass1_command",
+    BeginPass2 = "std::gpu::begin_pass2_command",
+    BeginPass3 = "std::gpu::begin_pass3_command",
+    BeginPass4 = "std::gpu::begin_pass4_command",
+    CopyTextureCommand = "std::gpu::copy_texture_command",
+    CopyTextureToBufferCommand = "std::gpu::copy_texture_to_buffer_command",
+    CopyBufferToTextureCommand = "std::gpu::copy_buffer_to_texture_command",
+    ScissorCommand = "std::gpu::scissor_command",
+    ViewportCommand = "std::gpu::viewport_command",
     LabelCommand = "std::gpu::label_command",
     EndPass = "std::gpu::end_pass_command",
     TextureSample = "std::gpu::texture_sample",
     TextureSampleLevel = "std::gpu::texture_sample_level",
+    TextureSampleGrad = "std::gpu::texture_sample_grad",
+    TextureSampleBias = "std::gpu::texture_sample_bias",
+    ArraySample = "std::gpu::array_sample",
+    ArraySampleLevel = "std::gpu::array_sample_level",
+    ArraySampleGrad = "std::gpu::array_sample_grad",
+    ArrayLoad = "std::gpu::array_load",
+    CubeSample = "std::gpu::cube_sample",
+    CubeSampleLevel = "std::gpu::cube_sample_level",
+    DepthArrayCompare = "std::gpu::depth_array_compare",
+    DepthArrayCompareLevel = "std::gpu::depth_array_compare_level",
+    DepthArrayLoad = "std::gpu::depth_array_load",
+    MipStepLoad = "std::gpu::mip_step_load",
+    MipStepSample = "std::gpu::mip_step_sample",
+    MipStepWidth = "std::gpu::mip_step_width",
+    MipStepHeight = "std::gpu::mip_step_height",
+    TextureLevels = "std::gpu::texture_levels",
+    TextureLayers = "std::gpu::texture_layers",
     TextureSampleCompare = "std::gpu::texture_sample_compare",
     TextureSampleCompareLevel = "std::gpu::texture_sample_compare_level",
     TextureLoad = "std::gpu::texture_load",
@@ -417,6 +518,10 @@ lang_items! {
     TexelsStore = "std::gpu::texels_store",
     Texels3d = "std::gpu::Texels3d",
     Texels3dStore = "std::gpu::texels3d_store",
+    TexelsArray = "std::gpu::TexelsArray",
+    TexelsArrayStore = "std::gpu::texels_array_store",
+    MipStep = "std::gpu::MipStep",
+    MipStepStore = "std::gpu::mip_step_store",
     Append = "std::gpu::Append",
     AtomicMap = "std::gpu::AtomicMap",
     AppendBuffer = "std::gpu::AppendBuffer",

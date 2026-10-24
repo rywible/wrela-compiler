@@ -1150,6 +1150,9 @@ impl<'a> FnCheck<'a> {
             Rvalue::Draw(d) => {
                 self.operand(st, at, &d.vertices);
                 self.operand(st, at, &d.instances);
+                for m in &d.more {
+                    self.operand(st, at, m);
+                }
             }
         }
     }
@@ -2263,6 +2266,9 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
             }
             operand(&d.vertices, add);
             operand(&d.instances, add);
+            for m in &d.more {
+                operand(m, add);
+            }
             for (_, _, p, _) in &d.args {
                 add(p, false);
             }

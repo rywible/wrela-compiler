@@ -195,7 +195,10 @@ impl RenderTarget {
     /// The screen's target, with depth or without.
     pub fn screen(depth: bool) -> RenderTarget {
         let color = TextureFormat::ALL.into_iter().find(|f| f.name() == SCREEN_FORMAT);
-        RenderTarget { screen: true, ..RenderTarget::of(&color.into_iter().collect::<Vec<_>>(), depth) }
+        RenderTarget {
+            screen: true,
+            ..RenderTarget::of(&color.into_iter().collect::<Vec<_>>(), depth)
+        }
     }
 
     /// Textures of these formats, with depth or without.
@@ -204,7 +207,12 @@ impl RenderTarget {
         for (slot, &f) in all.iter_mut().zip(colors) {
             *slot = Some(f);
         }
-        RenderTarget { colors: all, count: colors.len().min(MAX_COLOR_ATTACHMENTS) as u8, depth, screen: false }
+        RenderTarget {
+            colors: all,
+            count: colors.len().min(MAX_COLOR_ATTACHMENTS) as u8,
+            depth,
+            screen: false,
+        }
     }
 
     /// Its colour formats.
@@ -223,7 +231,11 @@ impl fmt::Display for RenderTarget {
     /// `the screen`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.screen {
-            return write!(f, "{}", if self.depth { "the screen with depth" } else { "the screen" });
+            return write!(
+                f,
+                "{}",
+                if self.depth { "the screen with depth" } else { "the screen" }
+            );
         }
         let names: Vec<&str> = self.colors().map(TextureFormat::name).collect();
         match (names.is_empty(), self.depth) {
@@ -303,10 +315,9 @@ impl Blend {
     pub fn components(self) -> Option<(BlendComponent, BlendComponent)> {
         Some(match self {
             Blend::Replace => return None,
-            Blend::Over => (
-                ("src-alpha", "one-minus-src-alpha", "add"),
-                ("one", "one-minus-src-alpha", "add"),
-            ),
+            Blend::Over => {
+                (("src-alpha", "one-minus-src-alpha", "add"), ("one", "one-minus-src-alpha", "add"))
+            }
             Blend::Premultiplied => {
                 let c = ("one", "one-minus-src-alpha", "add");
                 (c, c)
@@ -510,9 +521,7 @@ impl BindingKind {
     /// A texture binding's view dimension (WebGPU's `viewDimension`); `None` for the rest.
     pub fn dimension(self) -> Option<&'static str> {
         Some(match self {
-            BindingKind::Texture | BindingKind::DepthTexture | BindingKind::StorageTexture => {
-                "2d"
-            }
+            BindingKind::Texture | BindingKind::DepthTexture | BindingKind::StorageTexture => "2d",
             BindingKind::Texture3d | BindingKind::StorageTexture3d => "3d",
             BindingKind::TextureArray
             | BindingKind::DepthTextureArray
@@ -823,7 +832,8 @@ impl Manifest {
                             ));
                         }
                         if t.screen
-                            && (t.count != 1 || t.color().map(TextureFormat::name) != Some(SCREEN_FORMAT))
+                            && (t.count != 1
+                                || t.color().map(TextureFormat::name) != Some(SCREEN_FORMAT))
                         {
                             return err(format!(
                                 "pipeline {i}'s target {k} is the screen, whose one colour is {SCREEN_FORMAT}"
@@ -832,7 +842,9 @@ impl Manifest {
                         let colors: Vec<TextureFormat> = t.colors().collect();
                         let blend = |c: usize| blends.get(c).copied().unwrap_or_default();
                         let why = if *writes_depth && !t.depth {
-                            Some("its fragments give their depth, so a target has depth".to_string())
+                            Some(
+                                "its fragments give their depth, so a target has depth".to_string(),
+                            )
                         } else if !colors.is_empty() && colors.len() != outputs.len() {
                             Some(format!(
                                 "its fragment shader writes {} colours, and it has {}",
@@ -1123,7 +1135,10 @@ mod read {
                             .enumerate()
                             .map(|(k, b)| match names.iter().find(|(n, _)| b.as_str() == Some(n)) {
                                 Some(&(_, b)) => Ok(b),
-                                None => fail(format!("{place}.blends[{k}] must be a blend, not {}", show(b))),
+                                None => fail(format!(
+                                    "{place}.blends[{k}] must be a blend, not {}",
+                                    show(b)
+                                )),
                             })
                             .collect::<Result<_>>()?
                     }
@@ -1181,7 +1196,10 @@ mod read {
                         .map(|(k, x)| match x.as_str() {
                             Some("float") => Ok(Output::Float),
                             Some("uint") => Ok(Output::Uint),
-                            _ => fail(format!("{place}.outputs[{k}] must be float or uint, not {}", show(x))),
+                            _ => fail(format!(
+                                "{place}.outputs[{k}] must be float or uint, not {}",
+                                show(x)
+                            )),
                         })
                         .collect::<Result<_>>()?,
                     _ => return fail(format!("{place}.outputs must be an array")),
@@ -1202,7 +1220,10 @@ mod read {
                 .enumerate()
                 .map(|(k, f)| match f.as_str() {
                     Some(name) if crate::FEATURES.contains(&name) => Ok(name.to_string()),
-                    _ => fail(format!("{place}.requires[{k}] must be a feature this host knows, not {}", show(f))),
+                    _ => fail(format!(
+                        "{place}.requires[{k}] must be a feature this host knows, not {}",
+                        show(f)
+                    )),
                 })
                 .collect::<Result<_>>()?,
             Some(_) => return fail(format!("{place}.requires must be an array")),

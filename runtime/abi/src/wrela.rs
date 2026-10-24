@@ -76,11 +76,12 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         crate::stream::WRITABLE,
         "A texture's format code with this bit set: kernels write its texels.",
     ),
-    (
-        "PASS_JOIN",
-        crate::stream::PASS_JOIN,
-        "A pass's colour load word with this bit set: it may join the pass before it.",
-    ),
+    ("PASS_JOIN", crate::stream::PASS_JOIN, "A pass's join word: it may join the pass before it."),
+    ("KIND_2D", crate::stream::TextureKind::D2 as u32, "A 2D texture's kind."),
+    ("KIND_3D", crate::stream::TextureKind::D3 as u32, "A 3D texture's kind."),
+    ("KIND_ARRAY", crate::stream::TextureKind::Array as u32, "A 2D array's kind."),
+    ("KIND_CUBE", crate::stream::TextureKind::Cube as u32, "A cube's kind."),
+    ("MAX_LAYERS", crate::stream::MAX_LAYERS, "The most layers of a 2D array."),
 ];
 
 /// The same, for the `i32`s.

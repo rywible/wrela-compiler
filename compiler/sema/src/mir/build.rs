@@ -1380,8 +1380,13 @@ impl<'a> Builder<'a> {
             args.push((*e, *i, p, a.span));
         }
         let (mut vertices, mut instances, mut indirect, mut indices) = (None, None, None, None);
+        let mut more: Vec<Option<Operand>> = vec![None; d.more.len()];
         for c in &d.counts {
             match c {
+                thir::DrawCount::More(k) => {
+                    let k = usize::from(*k);
+                    more[k] = Some(self.value(&d.more[k], Want::Read)?);
+                }
                 thir::DrawCount::Vertices => vertices = Some(self.value(&d.vertices, Want::Read)?),
                 thir::DrawCount::Instances => {
                     instances = Some(self.value(&d.instances, Want::Read)?);
@@ -1405,7 +1410,16 @@ impl<'a> Builder<'a> {
         if instances.is_none() {
             instances = Some(self.value(&d.instances, Want::Read)?);
         }
+        let mut given = Vec::with_capacity(more.len());
+        for (k, m) in more.into_iter().enumerate() {
+            given.push(match m {
+                Some(m) => m,
+                None => self.value(&d.more[k], Want::Read)?,
+            });
+        }
         Some(Rvalue::Draw(Box::new(Draw {
+            more: given,
+            multi: d.multi,
             pass,
             vertex,
             fragment,

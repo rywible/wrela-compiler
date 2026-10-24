@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MANIFEST_VERSION, SCREEN_FORMAT, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
+import { MANIFEST_VERSION, NONE, SCREEN_FORMAT, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
 import { Checker } from "../src/check.ts";
 import { type Manifest, type RenderTarget, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
@@ -46,12 +46,26 @@ export const vectors: Vectors = JSON.parse(readFileSync(join(import.meta.dir, ".
 /** Every target a render pipeline whose fragment shader returns a colour may be drawn into:
  * each colour format, with depth or without, and depth alone. */
 export function everyTarget(): RenderTarget[] {
-  const colours = TEXTURE_FORMATS.filter((f) => !f.depth && !f.uint).map((f) => f.name as TextureFormat);
+  const colours = TEXTURE_FORMATS.filter((f) => !f.depth && !f.uint && f.renderable).map((f) => f.name as TextureFormat);
   return [
-    ...colours.flatMap((color) => [false, true].map((depth) => ({ color, depth, screen: false }))),
-    { color: null, depth: true, screen: false },
-    ...[false, true].map((depth): RenderTarget => ({ color: SCREEN_FORMAT, depth, screen: true })),
+    ...colours.flatMap((color) => [false, true].map((depth) => ({ colors: [color], depth, screen: false }))),
+    { colors: [], depth: true, screen: false },
+    ...[false, true].map((depth): RenderTarget => ({ colors: [SCREEN_FORMAT], depth, screen: true })),
   ];
+}
+
+/** A pass into one colour target, as the old tests wrote them: `color` (or SCREEN or NONE),
+ * cleared to `clear` or kept, and `depth` (or NONE). */
+export function passOf(o: { color: number; keepColor?: boolean; join?: boolean; clear?: [number, number, number, number]; depth?: number; keepDepth?: boolean; clearDepth?: number }): Pass {
+  const clear = o.clear ?? [0, 0, 0, 1];
+  return {
+    colors: o.color === NONE ? [] : [{ texture: o.color, level: 0, layer: 0, keep: o.keepColor ?? false, clear }],
+    join: o.join ?? false,
+    depth: o.depth ?? NONE,
+    depthLayer: 0,
+    keepDepth: o.keepDepth ?? false,
+    clearDepth: o.clearDepth ?? 1,
+  };
 }
 
 /** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only
@@ -68,12 +82,12 @@ export function shapes(): Manifest {
         shader: "draw.wgsl",
         vertex_entry: "vs",
         fragment_entry: "fs",
-        blend: false,
+        blends: [],
         cull: "none",
         depth_bias: { constant: 0, slope_scale: 0, clamp: 0 },
         depth: { compare: "less", write: true },
         writes_depth: false,
-        uint: false,
+        outputs: ["float"],
         targets: everyTarget(),
         uniform: { binding: 0, size: 16, space: "uniform" },
         bindings: [
@@ -81,6 +95,7 @@ export function shapes(): Manifest {
           { binding: 2, kind: "read_write", stage: "both", format: null },
         ],
         debug_flag: null,
+        requires: [],
       },
       {
         kind: "compute",
@@ -94,6 +109,7 @@ export function shapes(): Manifest {
           { binding: 2, kind: "read_write", stage: "both", format: null },
         ],
         debug_flag: null,
+        requires: [],
       },
     ],
   };

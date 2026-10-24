@@ -9,9 +9,14 @@
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "outputs": [
+        "float"
+      ],
       "targets": [
         {
-          "color": "rgba8unorm",
+          "colors": [
+            "rgba8unorm"
+          ],
           "depth": false,
           "screen": true
         }

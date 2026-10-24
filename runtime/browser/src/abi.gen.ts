@@ -45,23 +45,70 @@ export const Opcode = {
   HandOver: 28,
   HostRequest: 29,
   Timed: 30,
+  CopyTexture: 31,
+  CopyTextureToBuffer: 32,
+  CopyBufferToTexture: 33,
+  SetScissor: 34,
+  SetViewport: 35,
+  DrawIndexed: 36,
+  MultiDrawIndirect: 37,
+  MultiDrawIndexedIndirect: 38,
 } as const;
 
-/** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
- * whether it's a depth format. */
+/** A texture's format, by its number in the stream: the format table (runtime/abi
+ * `TextureFormat::info`). WebGPU's name; the bytes of a block (a texel, or a compressed format's
+ * 4 × 4 texels) and its side; the channels GPU code reads; what it can do on every device
+ * (`filterable`) or on some (`storable`, `renderable`, `blendable`); its render target cost and
+ * alignment; and the device feature each capability needs, if one. */
 export const TEXTURE_FORMATS = [
-  { name: "rgba8unorm", bytes: 4, depth: false, storable: true, filterable: true, uint: false },
-  { name: "rgba16float", bytes: 8, depth: false, storable: true, filterable: true, uint: false },
-  { name: "depth32float", bytes: 4, depth: true, storable: false, filterable: false, uint: false },
-  { name: "r16float", bytes: 2, depth: false, storable: false, filterable: true, uint: false },
-  { name: "rg16float", bytes: 4, depth: false, storable: false, filterable: true, uint: false },
-  { name: "r32float", bytes: 4, depth: false, storable: true, filterable: false, uint: false },
-  { name: "r32uint", bytes: 4, depth: false, storable: true, filterable: false, uint: true },
+  { name: "rgba8unorm", bytes: 4, block: 1, channels: 4, depth: false, storable: true, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 8, target_align: 1, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rgba16float", bytes: 8, block: 1, channels: 4, depth: false, storable: true, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 8, target_align: 2, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "depth32float", bytes: 4, block: 1, channels: 1, depth: true, storable: false, filterable: false, renderable: true, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "r16float", bytes: 2, block: 1, channels: 1, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 2, target_align: 2, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rg16float", bytes: 4, block: 1, channels: 2, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 4, target_align: 2, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "r32float", bytes: 4, block: 1, channels: 1, depth: false, storable: true, filterable: false, renderable: true, blendable: true, uint: false, target_cost: 4, target_align: 4, needs: { filter: "float32-filterable", store: null, render: null, blend: "float32-blendable" } },
+  { name: "r32uint", bytes: 4, block: 1, channels: 1, depth: false, storable: true, filterable: false, renderable: true, blendable: false, uint: true, target_cost: 4, target_align: 4, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "r8unorm", bytes: 1, block: 1, channels: 1, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 1, target_align: 1, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rg8unorm", bytes: 2, block: 1, channels: 2, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 2, target_align: 1, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rgb10a2unorm", bytes: 4, block: 1, channels: 4, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 8, target_align: 4, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rg32float", bytes: 8, block: 1, channels: 2, depth: false, storable: true, filterable: false, renderable: true, blendable: true, uint: false, target_cost: 8, target_align: 4, needs: { filter: "float32-filterable", store: null, render: null, blend: "float32-blendable" } },
+  { name: "rgba32float", bytes: 16, block: 1, channels: 4, depth: false, storable: true, filterable: false, renderable: true, blendable: true, uint: false, target_cost: 16, target_align: 4, needs: { filter: "float32-filterable", store: null, render: null, blend: "float32-blendable" } },
+  { name: "rg32uint", bytes: 8, block: 1, channels: 2, depth: false, storable: true, filterable: false, renderable: true, blendable: false, uint: true, target_cost: 8, target_align: 4, needs: { filter: null, store: null, render: null, blend: null } },
+  { name: "rg11b10ufloat", bytes: 4, block: 1, channels: 3, depth: false, storable: false, filterable: true, renderable: true, blendable: true, uint: false, target_cost: 8, target_align: 4, needs: { filter: null, store: null, render: "rg11b10ufloat-renderable", blend: "rg11b10ufloat-renderable" } },
+  { name: "bc1-rgba-unorm", bytes: 8, block: 4, channels: 4, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-bc", store: null, render: null, blend: null } },
+  { name: "bc4-r-unorm", bytes: 8, block: 4, channels: 1, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-bc", store: null, render: null, blend: null } },
+  { name: "bc5-rg-unorm", bytes: 16, block: 4, channels: 2, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-bc", store: null, render: null, blend: null } },
+  { name: "bc7-rgba-unorm", bytes: 16, block: 4, channels: 4, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-bc", store: null, render: null, blend: null } },
+  { name: "etc2-rgb8unorm", bytes: 8, block: 4, channels: 3, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-etc2", store: null, render: null, blend: null } },
+  { name: "astc-4x4-unorm", bytes: 16, block: 4, channels: 4, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-astc", store: null, render: null, blend: null } },
 ] as const;
+/** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
+export const MAX_COLOR_ATTACHMENT_BYTES = 32;
+export const MAX_COLOR_ATTACHMENTS = 4;
+/** The most mip levels a texture has, layers an array has, and anisotropy a sampler takes;
+ * WebGPU's alignment of a copy's buffer offset and rows. */
+export const MAX_LEVELS = 14;
+export const MAX_LAYERS = 256;
+export const MAX_ANISOTROPY = 16;
+export const ROW_ALIGNMENT = 256;
+/** The optional features the hosts request and report, in `wrela.limit(10)`'s bit order
+ * (runtime/abi `FEATURES`). */
+export const FEATURES = ["shader-f16", "subgroups", "texture-compression-bc", "texture-compression-etc2", "texture-compression-astc", "float32-filterable", "float32-blendable", "rg11b10ufloat-renderable", "bgra8unorm-storage", "timestamp-query", "chromium-experimental-multi-draw-indirect", "indirect-first-instance"] as const;
+/** The blends (runtime/abi `Blend`): each one's colour and alpha components, WebGPU's names
+ * (`null` for `replace`). */
+export const BLENDS = {
+  replace: null,
+  over: { color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" }, alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" } },
+  premultiplied: { color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" }, alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" } },
+  add: { color: { srcFactor: "one", dstFactor: "one", operation: "add" }, alpha: { srcFactor: "one", dstFactor: "one", operation: "add" } },
+  multiply: { color: { srcFactor: "dst", dstFactor: "zero", operation: "add" }, alpha: { srcFactor: "dst-alpha", dstFactor: "zero", operation: "add" } },
+  min: { color: { srcFactor: "one", dstFactor: "one", operation: "min" }, alpha: { srcFactor: "one", dstFactor: "one", operation: "min" } },
+  max: { color: { srcFactor: "one", dstFactor: "one", operation: "max" }, alpha: { srcFactor: "one", dstFactor: "one", operation: "max" } },
+} as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = 65536;
 /** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
-export const PASS_JOIN = 2;
+export const PASS_JOIN = 1;
 /** The most texels a side of a 3D texture. */
 export const MAX_TEXTURE_3D = 2048;
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
@@ -201,20 +248,24 @@ export const EXPORT_INIT = "init";
 export const EXPORT_MEMORY = "memory";
 export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
-export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d"] as const;
+export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d", "texture_2d_array", "texture_cube", "depth_texture_2d_array", "storage_texture_2d_array"] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
  * format; a texture kernels write (a storage texture); a 3D texture; and the per-stage limit it
  * counts against. */
 export const BINDING_KIND_TRAITS = [
-  { name: "read", has_format: false, is_storage: false, is_3d: false, limit: "storage buffers" },
-  { name: "read_write", has_format: false, is_storage: false, is_3d: false, limit: "storage buffers" },
-  { name: "texture", has_format: true, is_storage: false, is_3d: false, limit: "sampled textures" },
-  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false, limit: "sampled textures" },
-  { name: "sampler", has_format: false, is_storage: false, is_3d: false, limit: "samplers" },
-  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false, limit: "samplers" },
-  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false, limit: "storage textures" },
-  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true, limit: "sampled textures" },
-  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true, limit: "storage textures" },
+  { name: "read", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "storage buffers" },
+  { name: "read_write", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "storage buffers" },
+  { name: "texture", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "2d", limit: "sampled textures" },
+  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false, is_depth: true, dimension: "2d", limit: "sampled textures" },
+  { name: "sampler", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "samplers" },
+  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "samplers" },
+  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false, is_depth: false, dimension: "2d", limit: "storage textures" },
+  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true, is_depth: false, dimension: "3d", limit: "sampled textures" },
+  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true, is_depth: false, dimension: "3d", limit: "storage textures" },
+  { name: "texture_2d_array", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "2d-array", limit: "sampled textures" },
+  { name: "texture_cube", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "cube", limit: "sampled textures" },
+  { name: "depth_texture_2d_array", has_format: false, is_storage: false, is_3d: false, is_depth: true, dimension: "2d-array", limit: "sampled textures" },
+  { name: "storage_texture_2d_array", has_format: true, is_storage: true, is_3d: false, is_depth: false, dimension: "2d-array", limit: "storage textures" },
 ] as const;
 /** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a
  * shader stage may have. */
@@ -232,7 +283,7 @@ export const MAX_STORAGE_BUFFERS_PER_STAGE = 8;
 export const MAX_UNIFORM_BUFFER_BINDING_SIZE = 65536;
 export const MAX_BINDINGS_PER_GROUP = 1000;
 /** WebGPU's default limits, in `wrela.limit`'s order (runtime/abi `Limits`). */
-export const DEFAULT_LIMITS = [8192, 134217728, 8, 65536, 16384, 256, 256, 256, 64, 65535];
+export const DEFAULT_LIMITS = [8192, 134217728, 8, 65536, 16384, 256, 256, 256, 64, 65535, 2048, 0, 0];
 
 export const FNV_OFFSET = 0xcbf29ce484222325n;
 export const FNV_PRIME = 0x00000100000001b3n;

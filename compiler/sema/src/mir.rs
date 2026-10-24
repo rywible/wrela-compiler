@@ -330,8 +330,12 @@ pub struct Draw {
     pub args: Vec<(usize, usize, Place, Span)>,
     /// The buffer (or span) holding the counts, in place of `vertices` and `instances`.
     pub indirect: Option<(Place, Span)>,
-    /// An indexed draw's indices (with `indirect`).
+    /// An indexed draw's indices (with `indirect`, or direct).
     pub indices: Option<(Place, Span)>,
+    /// A direct indexed draw's first index, base vertex and first instance (`thir::Draw`'s).
+    pub more: Vec<Operand>,
+    /// Several indirect draws, `vertices` of them.
+    pub multi: bool,
     pub state: crate::thir::RenderState,
 }
 
@@ -415,6 +419,7 @@ impl Rvalue {
             Rvalue::Draw(d) => {
                 f(&d.vertices);
                 f(&d.instances);
+                d.more.iter().for_each(&mut *f);
             }
             Rvalue::Discriminant(_)
             | Rvalue::Len(_)

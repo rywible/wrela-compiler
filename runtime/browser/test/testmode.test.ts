@@ -22,6 +22,7 @@ test("reads every parameter", () => {
     live: 9,
     timestamps: 0,
     input: "",
+    features: null,
     latency: 0,
     keylatency: 0,
     nohash: 0,

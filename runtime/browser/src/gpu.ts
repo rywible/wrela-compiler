@@ -24,12 +24,26 @@
 // - A destroyed buffer or texture is released after the next flush: work recorded before it
 //   still uses it.
 
-import { NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
-import { bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
+import { BLENDS, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
+import { blockOf, bytesOf, bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { is3d, isStorage, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
-import { type Binding, type Bytes, type Command, joins, type OpcodeName, type Pass, type TextureFormat } from "./stream.ts";
+import { type Blend, dimensionOf, isDepthBinding, isStorage, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
+import {
+  type Binding,
+  type Bytes,
+  type Command,
+  type DrawCommand,
+  isDraw,
+  joins,
+  onePass,
+  onScreen,
+  type OpcodeName,
+  type Pass,
+  type TexelRect,
+  type TextureFormat,
+  type TextureKind,
+} from "./stream.ts";
 
 const RING_START = 64 * 1024;
 
@@ -53,14 +67,14 @@ interface RenderParts {
   layout: GPUPipelineLayout;
   vertex: string;
   fragment: string;
-  /** Its colour is drawn over the target's (the manifest's `blend`). */
-  blend: boolean;
+  /** How each colour output meets its target's (the manifest's `blends`). */
+  blends: Blend[];
   /** The manifest's `cull` and `depth_bias`. */
   cull: GPUCullMode;
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
-  /** By target formats: `colour|depth`, each a format or `none`. */
+  /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
 
@@ -73,6 +87,11 @@ export interface BuiltPipeline {
   bindings: ResourceBinding[];
   /** A debug build's: where its bounds checks' flag is bound. */
   debugFlag: number | null;
+}
+
+/** Whether `device` can do a capability of the format table: always, or with its feature. */
+function can(device: GPUDevice, yes: boolean, needs: string | null): boolean {
+  return yes && (needs === null || device.features.has(needs));
 }
 
 /** Where passes on the screen draw. */
@@ -103,18 +122,12 @@ function compilationMessages(info: GPUCompilationInfo): string | null {
 }
 
 /** The key of a render pipeline's variant for these target formats. */
-const targetsKey = (color: GPUTextureFormat | null, depth: GPUTextureFormat | null) => `${color ?? "none"}|${depth ?? "none"}`;
-
-/** Straight alpha, over what's there (the manifest's `blend`). */
-const OVER: GPUBlendState = {
-  color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-};
+const targetsKey = (colors: readonly GPUTextureFormat[], depth: GPUTextureFormat | null) => `${colors.length === 0 ? "none" : colors.join(",")}|${depth ?? "none"}`;
 
 function renderDescriptor(
   name: string,
   parts: RenderParts,
-  color: GPUTextureFormat | null,
+  colors: readonly GPUTextureFormat[],
   depth: GPUTextureFormat | null,
 ): GPURenderPipelineDescriptor {
   return {
@@ -138,7 +151,10 @@ function renderDescriptor(
     fragment: {
       module: parts.module,
       entryPoint: parts.fragment,
-      targets: color === null ? [] : [{ format: color, ...(parts.blend ? { blend: OVER } : {}) }],
+      targets: colors.map((format, c) => {
+        const blend = BLENDS[parts.blends[c] ?? "replace"];
+        return blend === null ? { format } : { format, blend: blend as GPUBlendState };
+      }),
     },
   };
 }
@@ -198,12 +214,15 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       case "texture":
       case "depth_texture":
       case "texture_3d":
+      case "texture_2d_array":
+      case "texture_cube":
+      case "depth_texture_2d_array":
         entries.push({
           binding: b.binding,
           visibility: seen,
           texture: {
-            sampleType: b.kind === "depth_texture" ? "depth" : sampleType(colourFormat(b)),
-            viewDimension: is3d(b.kind) ? "3d" : "2d",
+            sampleType: isDepthBinding(b.kind) ? "depth" : sampleType(colourFormat(b)),
+            viewDimension: dimensionOf(b.kind) as GPUTextureViewDimension,
           },
         });
         break;
@@ -218,19 +237,26 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       // Only a kernel writes a texture's texels.
       case "storage_texture":
       case "storage_texture_3d":
+      case "storage_texture_2d_array":
         entries.push({
           binding: b.binding,
           visibility: GPUShaderStage.COMPUTE,
           storageTexture: {
             access: "write-only",
             format: colourFormat(b),
-            viewDimension: is3d(b.kind) ? "3d" : "2d",
+            viewDimension: dimensionOf(b.kind) as GPUTextureViewDimension,
           },
         });
         break;
     }
   }
 
+  // A shader that needs a feature this device hasn't isn't built: the checker refuses a command
+  // that records it, naming the feature.
+  if (p.requires.some((f) => !device.features.has(f))) {
+    const layout = device.createBindGroupLayout({ label: p.name, entries: [] });
+    return { name: p.name, layout, compute: null, render: null, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
+  }
   // Pipelines build at the same time and share the device's error scope stack, so the scope is
   // popped before anything awaits. The async creations below report through their promises.
   device.pushErrorScope("validation");
@@ -257,7 +283,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         layout: pipelineLayout,
         vertex: p.vertex_entry,
         fragment: p.fragment_entry,
-        blend: p.blend,
+        blends: p.blends,
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
@@ -266,11 +292,14 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       // A variant for each of its targets (the passes the program draws it in, which the
       // compiler knows), side by side: a shader's errors come at load, and no frame waits to
       // compile one. The screen and a texture of its format share one.
-      const targets = new Map<string, [GPUTextureFormat | null, GPUTextureFormat | null]>();
+      const targets = new Map<string, [GPUTextureFormat[], GPUTextureFormat | null]>();
       for (const t of p.targets) {
-        const color = t.screen ? screenFormat : t.color;
+        // A target the device can't draw into (rg11b10ufloat without its feature) is one the
+        // checker refuses a pass of.
+        if (t.colors.some((c) => { const f = TEXTURE_FORMATS.find((x) => x.name === c)!; return !can(device, f.renderable, f.needs.render); })) continue;
+        const colors = t.screen ? [screenFormat] : (t.colors as GPUTextureFormat[]);
         const depth = t.depth ? "depth32float" : null;
-        targets.set(targetsKey(color, depth), [color, depth]);
+        targets.set(targetsKey(colors, depth), [colors, depth]);
       }
       const made = await Promise.all(
         [...targets.values()].map(([c, d]) => device.createRenderPipelineAsync(renderDescriptor(p.name, render!, c, d))),
@@ -388,14 +417,42 @@ export function buildPipelines(
   return built;
 }
 
-/** A draw waiting for its pass to end, with its own copy of its uniform bytes. */
-type PendingDraw = Extract<Command, { op: "Draw" | "DrawIndirect" | "DrawIndexedIndirect" }>;
+/** What a pass records, waiting for it to end: draws, with their own copies of their uniform
+ * bytes, and the scissors and viewports set between them. */
+type PendingDraw = DrawCommand | Extract<Command, { op: "SetScissor" | "SetViewport" }>;
+
+/** A live texture: its views, by what each holds and its dimension, made once each. */
+type TextureResource = {
+  kind: "texture";
+  texture: GPUTexture;
+  format: TextureFormat;
+  textureKind: TextureKind;
+  levels: number;
+  bytes: number;
+  views: Map<string, GPUTextureView>;
+};
 
 /** A live resource the program made. */
-type Resource =
-  | { kind: "buffer"; buffer: GPUBuffer }
-  | { kind: "texture"; texture: GPUTexture; view: GPUTextureView; format: TextureFormat; bytes: number }
-  | { kind: "sampler"; sampler: GPUSampler };
+type Resource = { kind: "buffer"; buffer: GPUBuffer } | TextureResource | { kind: "sampler"; sampler: GPUSampler };
+
+/** A view of `t`'s levels and layers in `dimension`: `level` and `layer` one each, or null for
+ * all (`storage`: one level, the first if it names none, as a storage binding takes). */
+function viewOf(t: TextureResource, level: number | null, layer: number | null, dimension: GPUTextureViewDimension, storage: boolean): GPUTextureView {
+  const key = `${level}:${layer}:${dimension}:${storage}`;
+  let v = t.views.get(key);
+  if (v === undefined) {
+    const lv = level ?? (storage ? 0 : null);
+    v = t.texture.createView({
+      dimension,
+      baseMipLevel: lv ?? 0,
+      ...(lv === null ? {} : { mipLevelCount: 1 }),
+      baseArrayLayer: layer ?? 0,
+      ...(layer === null ? {} : { arrayLayerCount: 1 }),
+    });
+    t.views.set(key, v);
+  }
+  return v;
+}
 
 /** A cached group owns its binding ranges: commands may reuse or change their bindings. */
 type CachedBindGroup = { group: GPUBindGroup; pipeline: number; handles: number[]; ranges: number[] };
@@ -419,7 +476,10 @@ function copied(cmd: Command): Command {
     case "DispatchIndirect":
     case "Draw":
     case "DrawIndirect":
+    case "DrawIndexed":
     case "DrawIndexedIndirect":
+    case "MultiDrawIndirect":
+    case "MultiDrawIndexedIndirect":
       return { ...cmd, bindings: cmd.bindings.slice(), uniforms: cmd.uniforms.slice() };
     default:
       return cmd;
@@ -999,24 +1059,31 @@ export class GpuExecutor {
         return;
       case "CreateTexture": {
         const depth = isDepth(cmd.format);
-        // A 3D texture (`cmd.depth` texels deep) is sampled and written by kernels, never drawn
-        // into.
-        const three = cmd.depth > 0;
+        // A 3D texture (`cmd.layers` texels deep) is sampled and written by kernels, never drawn
+        // into; a 2D texture, an array and a cube are 2D textures of `cmd.layers` layers.
+        const three = cmd.kind === "3d";
+        const info = TEXTURE_FORMATS.find((f) => f.name === cmd.format)!;
+        const renderable = !three && can(this.device, info.renderable, info.needs.render);
         const texture = this.device.createTexture({
           label: `texture ${cmd.handle}`,
-          size: three ? [cmd.width, cmd.height, cmd.depth] : [cmd.width, cmd.height],
+          size: [cmd.width, cmd.height, cmd.layers],
           dimension: three ? "3d" : "2d",
-          format: cmd.format,
+          mipLevelCount: cmd.levels,
+          format: cmd.format as GPUTextureFormat,
           usage:
             GPUTextureUsage.TEXTURE_BINDING |
-            (three ? 0 : GPUTextureUsage.RENDER_ATTACHMENT) |
+            (renderable ? GPUTextureUsage.RENDER_ATTACHMENT : 0) |
             GPUTextureUsage.COPY_SRC |
             (depth ? 0 : GPUTextureUsage.COPY_DST) |
             // Only where kernels write it: a storage texture may give up the GPU's compression.
             (cmd.writable ? GPUTextureUsage.STORAGE_BINDING : 0),
+          // A cube's whole view is a cube (WebGPU's compatibility mode asks it be said).
+          ...(cmd.kind === "cube" ? { textureBindingViewDimension: "cube" as GPUTextureViewDimension } : {}),
         });
-        const bytes = cmd.width * cmd.height * Math.max(cmd.depth, 1) * bytesPerTexel(cmd.format);
-        this.#resources.set(cmd.handle, { kind: "texture", texture, view: texture.createView(), format: cmd.format, bytes });
+        let bytes = 0;
+        for (let l = 0; l < cmd.levels; l++) bytes += bytesOf(cmd.format, Math.max(1, cmd.width >> l), Math.max(1, cmd.height >> l));
+        bytes *= cmd.layers;
+        this.#resources.set(cmd.handle, { kind: "texture", texture, format: cmd.format, textureKind: cmd.kind, levels: cmd.levels, bytes, views: new Map() });
         this.#allocated(bytes);
         return;
       }
@@ -1030,7 +1097,8 @@ export class GpuExecutor {
           addressModeW: address,
           magFilter: filter,
           minFilter: filter,
-          mipmapFilter: "nearest",
+          mipmapFilter: cmd.mipLinear ? "linear" : "nearest",
+          maxAnisotropy: cmd.anisotropy,
           ...(cmd.compare === null ? {} : { compare: cmd.compare }),
         });
         this.#resources.set(cmd.handle, { kind: "sampler", sampler });
@@ -1059,17 +1127,45 @@ export class GpuExecutor {
         this.#dispatch(cmd.op, cmd.pipeline, { buffer: cmd.arguments, offset: cmd.offset }, cmd.bindings, cmd.uniforms);
         return;
       case "BeginScreenPass":
-        this.#begin({ color: SCREEN, keepColor: false, join: false, clear: cmd.clear, depth: NONE, keepDepth: false, clearDepth: 1 });
+        this.#begin(onePass(SCREEN, false, cmd.clear));
         return;
       case "BeginPass":
         this.#begin(cmd.pass);
         return;
       case "Draw":
       case "DrawIndirect":
+      case "DrawIndexed":
       case "DrawIndexedIndirect":
+      case "MultiDrawIndirect":
+      case "MultiDrawIndexedIndirect":
         // Immediate commands view the program's memory; queued commands already own a copy.
         this.#pass?.draws.push({ ...cmd, uniforms: ownedUniforms ? cmd.uniforms : cmd.uniforms.slice() });
         return;
+      case "SetScissor":
+      case "SetViewport":
+        this.#pass?.draws.push(cmd);
+        return;
+      case "CopyTexture": {
+        const { source: s, destination: d } = cmd;
+        this.#encoderNow().copyTextureToTexture(
+          { texture: this.#texture(s.texture).texture, mipLevel: s.level, origin: { x: s.x, y: s.y, z: s.layer } },
+          { texture: this.#texture(d.texture).texture, mipLevel: d.level, origin: { x: d.x, y: d.y, z: d.layer } },
+          { width: s.width, height: s.height },
+        );
+        return;
+      }
+      case "CopyTextureToBuffer":
+      case "CopyBufferToTexture": {
+        const r = cmd.op === "CopyTextureToBuffer" ? cmd.source : cmd.destination;
+        const t = this.#texture(r.texture);
+        const rows = Math.ceil(r.height / blockOf(t.format));
+        const image = { texture: t.texture, mipLevel: r.level, origin: { x: r.x, y: r.y, z: r.layer } };
+        const buffer = { buffer: this.#buffer(cmd.buffer), offset: cmd.offset, bytesPerRow: cmd.bytesPerRow, rowsPerImage: rows };
+        const size = { width: r.width, height: r.height };
+        if (cmd.op === "CopyTextureToBuffer") this.#encoderNow().copyTextureToBuffer(image, buffer, size);
+        else this.#encoderNow().copyBufferToTexture(buffer, image, size);
+        return;
+      }
       case "Present":
         this.presented = true;
         this.#endPass(cmd.op);
@@ -1243,30 +1339,32 @@ export class GpuExecutor {
     return at;
   }
 
-  /** Texture copies share the buffer upload ring, with the row alignment WebGPU requires. */
+  /** Texture copies share the buffer upload ring, with the row alignment WebGPU requires. Rows
+   * of a compressed format are rows of blocks. */
   #writeTexture(cmd: Extract<Command, { op: "WriteTexture" }>): void {
     if (cmd.data.length === 0) return;
     const t = this.#texture(cmd.handle);
-    const target = { texture: t.texture, origin: { x: cmd.x, y: cmd.y } };
+    const target = { texture: t.texture, mipLevel: cmd.level, origin: { x: cmd.x, y: cmd.y, z: cmd.layer } };
     const size = { width: cmd.width, height: cmd.height };
-    const row = cmd.data.length / cmd.height;
+    const rows = Math.ceil(cmd.height / blockOf(t.format));
+    const row = cmd.data.length / rows;
     const padded = alignTo(row, 256);
-    const len = padded * cmd.height;
+    const len = padded * rows;
     if (len > UPLOAD_MAX) {
       this.flush();
-      this.device.queue.writeTexture(target, cmd.data, { bytesPerRow: row, rowsPerImage: cmd.height }, size);
+      this.device.queue.writeTexture(target, cmd.data, { bytesPerRow: row, rowsPerImage: rows }, size);
       return;
     }
     const at = this.#reserveUpload(len, 256);
     const up = this.#uploads;
     if (row === padded) up.bytes.set(cmd.data, at);
     else {
-      for (let y = 0; y < cmd.height; y++) {
+      for (let y = 0; y < rows; y++) {
         up.bytes.set(cmd.data.subarray(y * row, (y + 1) * row), at + y * padded);
       }
     }
     this.#encoderNow().copyBufferToTexture(
-      { buffer: up.buffer, offset: at, bytesPerRow: padded, rowsPerImage: cmd.height },
+      { buffer: up.buffer, offset: at, bytesPerRow: padded, rowsPerImage: rows },
       target,
       size,
     );
@@ -1338,11 +1436,12 @@ export class GpuExecutor {
     bindings.forEach((b, i) => {
       const r = this.#resources.get(b.handle);
       if (r === undefined) throw new Error(`host bug: resource ${b.handle} passed the checks but doesn't exist`);
+      const slot = p.bindings[i]!;
       const resource: GPUBindingResource =
         r.kind === "buffer"
           ? { buffer: r.buffer, offset: b.offset, size: b.size }
           : r.kind === "texture"
-            ? r.view
+            ? viewOf(r, b.offset === 0 ? null : b.offset - 1, b.size === 0 ? null : b.size - 1, dimensionOf(slot.kind) as GPUTextureViewDimension, isStorage(slot.kind))
             : r.sampler;
       entries.push({ binding: p.bindings[i]!.binding, resource });
     });
@@ -1398,9 +1497,9 @@ export class GpuExecutor {
 
   /** The render pipeline of `index` for these targets: one of the manifest's for it, which the
    * checker checked, made at load. */
-  #variant(index: number, color: GPUTextureFormat | null, depth: GPUTextureFormat | null): GPURenderPipeline {
+  #variant(index: number, colors: readonly GPUTextureFormat[], depth: GPUTextureFormat | null): GPURenderPipeline {
     const p = this.#pipeline(index);
-    const v = p.render?.variants.get(targetsKey(color, depth));
+    const v = p.render?.variants.get(targetsKey(colors, depth));
     if (v === undefined) throw new Error(`host bug: pipeline ${index} has no variant for its pass's targets`);
     return v;
   }
@@ -1437,6 +1536,7 @@ export class GpuExecutor {
     };
     const lists = earlier.uses ? [next.draws] : [earlier.draws, next.draws];
     for (const draws of lists) for (const draw of draws) {
+      if (draw.op === "SetScissor" || draw.op === "SetViewport") continue;
       const pipeline = this.#pipeline(draw.pipeline);
       for (const [i, binding] of draw.bindings.entries()) {
         const kind = pipeline.bindings[i]!.kind;
@@ -1444,8 +1544,9 @@ export class GpuExecutor {
           if (!use(binding.handle, kind === "read_write" || isStorage(kind) ? 2 : 1)) return false;
         }
       }
-      if (draw.op !== "Draw" && !use(draw.arguments, 1)) return false;
-      if (draw.op === "DrawIndexedIndirect" && !use(draw.indices, 1)) return false;
+      if (draw.op !== "Draw" && draw.op !== "DrawIndexed" && !use(draw.arguments, 1)) return false;
+      if ((draw.op === "DrawIndexedIndirect" || draw.op === "DrawIndexed") && !use(draw.indices, 1)) return false;
+      if ((draw.op === "MultiDrawIndirect" || draw.op === "MultiDrawIndexedIndirect") && draw.indices !== null && !use(draw.indices[0], 1)) return false;
     }
     earlier.uses = usage;
     return true;
@@ -1461,55 +1562,64 @@ export class GpuExecutor {
   /** Records a pass's draws into one render pass. */
   #recordPass(op: OpcodeName, open: OpenPass): void {
     const pass = open.pass;
-    const onScreen = pass.color === SCREEN;
-    const color = onScreen || pass.color === NONE ? null : this.#texture(pass.color);
-    const colorView = onScreen ? this.screen.texture().createView() : (color?.view ?? null);
-    const colorFormat: GPUTextureFormat | null = onScreen ? this.screen.format : (color?.format ?? null);
+    const screen = onScreen(pass);
+    const colors = pass.colors.map((c) => {
+      if (c.texture === SCREEN) return { c, view: this.screen.texture().createView(), format: this.screen.format };
+      const t = this.#texture(c.texture);
+      return { c, view: viewOf(t, c.level, c.layer, "2d", false), format: t.format as GPUTextureFormat };
+    });
     const depth = pass.depth === NONE ? null : this.#texture(pass.depth);
+    const depthView = depth === null ? null : viewOf(depth, 0, pass.depthLayer, "2d", false);
+    const formats = colors.map((c) => c.format);
     // Everything that can flush happens before anything is recorded for this pass.
     this.#reserveTimestamps();
-    this.#reserve(op, open.draws.reduce((n, d) => n + alignTo(d.uniforms.length, this.#align), 0));
+    this.#reserve(op, open.draws.reduce((n, d) => n + (isDraw(d) ? alignTo(d.uniforms.length, this.#align) : 0), 0));
     // And everything that can throw: a pass begun is ended.
-    const draws = open.draws.map((d) => ({
-      draw: d,
-      pipeline: this.#variant(d.pipeline, colorFormat, depth?.format ?? null),
-      group: this.#bindGroup(d.pipeline, d.bindings),
-      args: d.op === "Draw" ? null : this.#buffer(d.arguments),
-      indices: d.op === "DrawIndexedIndirect" ? this.#buffer(d.indices) : null,
-    }));
-    const [r, g, b, a] = pass.clear;
-    const label = open.label ?? (onScreen ? "screen pass" : "pass");
+    const draws = open.draws.map((d) => {
+      if (!isDraw(d)) return { draw: d, pipeline: null, group: null, args: null, indices: null };
+      const indices = d.op === "DrawIndexedIndirect" || d.op === "DrawIndexed" ? this.#buffer(d.indices) : (d.op === "MultiDrawIndirect" || d.op === "MultiDrawIndexedIndirect") && d.indices !== null ? this.#buffer(d.indices[0]) : null;
+      return {
+        draw: d,
+        pipeline: this.#variant(d.pipeline, formats, (depth?.format as GPUTextureFormat | undefined) ?? null),
+        group: this.#bindGroup(d.pipeline, d.bindings),
+        args: d.op === "Draw" || d.op === "DrawIndexed" ? null : this.#buffer(d.arguments),
+        indices,
+      };
+    });
+    const label = open.label ?? (screen ? "screen pass" : "pass");
     const timed = this.#timestamps(label, open.at.frame);
     const encoder = this.#encoderNow();
     const rp = encoder.beginRenderPass({
       label,
       ...timed,
-      colorAttachments:
-        colorView === null
-          ? []
-          : [
-              {
-                view: colorView,
-                clearValue: { r, g, b, a },
-                loadOp: pass.keepColor ? "load" : "clear",
-                storeOp: "store",
-              },
-            ],
-      ...(depth === null
+      colorAttachments: colors.map(({ c, view }) => {
+        const [r, g, b, a] = c.clear;
+        return { view, clearValue: { r, g, b, a }, loadOp: c.keep ? "load" : "clear", storeOp: "store" };
+      }),
+      ...(depthView === null
         ? {}
         : {
             depthStencilAttachment: {
-              view: depth.view,
+              view: depthView,
               depthClearValue: pass.clearDepth,
               depthLoadOp: pass.keepDepth ? "load" : "clear",
               depthStoreOp: "store",
             },
           }),
     });
+    const multi = this.device.features.has("chromium-experimental-multi-draw-indirect");
     for (const { draw: d, pipeline, group, args, indices } of draws) {
+      if (d.op === "SetScissor") {
+        rp.setScissorRect(d.x, d.y, d.width, d.height);
+        continue;
+      }
+      if (d.op === "SetViewport") {
+        rp.setViewport(d.rect[0], d.rect[1], d.rect[2], d.rect[3], d.minDepth, d.maxDepth);
+        continue;
+      }
       const offsets = this.#push(d.uniforms);
-      rp.setPipeline(pipeline);
-      rp.setBindGroup(0, group, offsets);
+      rp.setPipeline(pipeline!);
+      rp.setBindGroup(0, group!, offsets);
       switch (d.op) {
         case "Draw":
           rp.draw(d.vertices, d.instances);
@@ -1521,10 +1631,35 @@ export class GpuExecutor {
           rp.setIndexBuffer(indices!, "uint32", d.index_offset, d.index_size);
           rp.drawIndexedIndirect(args!, d.offset);
           break;
+        case "DrawIndexed":
+          rp.setIndexBuffer(indices!, "uint32", d.index_offset, d.index_size);
+          rp.drawIndexed(d.index_count, d.instances, d.first_index, d.base_vertex, d.first_instance);
+          break;
+        case "MultiDrawIndirect":
+        case "MultiDrawIndexedIndirect": {
+          const indexed = d.indices !== null;
+          if (indexed) rp.setIndexBuffer(indices!, "uint32", d.indices![1], d.indices![2]);
+          // With the device's multi-draw, one call; without it, one draw each, which draws the
+          // same (the program doesn't change).
+          const encoder = rp as GPURenderPassEncoder & {
+            multiDrawIndirect?(b: GPUBuffer, o: number, n: number): void;
+            multiDrawIndexedIndirect?(b: GPUBuffer, o: number, n: number): void;
+          };
+          if (multi && indexed && encoder.multiDrawIndexedIndirect) encoder.multiDrawIndexedIndirect(args!, d.offset, d.count);
+          else if (multi && !indexed && encoder.multiDrawIndirect) encoder.multiDrawIndirect(args!, d.offset, d.count);
+          else {
+            const stride = indexed ? 20 : 16;
+            for (let k = 0; k < d.count; k++) {
+              if (indexed) rp.drawIndexedIndirect(args!, d.offset + k * stride);
+              else rp.drawIndirect(args!, d.offset + k * stride);
+            }
+          }
+          break;
+        }
       }
     }
     rp.end();
-    if (onScreen) {
+    if (screen) {
       this.screen.afterPass?.(encoder);
       this.flush();
     }

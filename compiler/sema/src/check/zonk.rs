@@ -103,6 +103,9 @@ pub(crate) fn for_each_child_mut(e: &mut Expr, f: &mut impl FnMut(&mut Expr)) {
             shader(&mut d.fragment, f);
             f(&mut d.vertices);
             f(&mut d.instances);
+            for m in &mut d.more {
+                f(m);
+            }
             for i in d.indirect.iter_mut().chain(&mut d.indices) {
                 f(i);
             }
@@ -210,6 +213,9 @@ pub fn walk_tys(e: &mut Expr, f: &mut impl FnMut(&mut TyId)) {
             shader_tys(&mut d.fragment, f);
             walk_tys(&mut d.vertices, f);
             walk_tys(&mut d.instances, f);
+            for m in &mut d.more {
+                walk_tys(m, f);
+            }
             for i in d.indirect.iter_mut().chain(&mut d.indices) {
                 walk_tys(i, f);
             }
@@ -747,6 +753,9 @@ impl Markers<'_> {
                 }
                 self.expr(&d.vertices, false, out);
                 self.expr(&d.instances, false, out);
+                for m in &d.more {
+                    self.expr(m, false, out);
+                }
                 for e in d.indirect.iter().chain(&d.indices) {
                     self.expr(e, false, out);
                 }
