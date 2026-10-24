@@ -78,6 +78,42 @@ def core_language(cfg, out):
         f.write("\n".join(keep) + "\n")
 
 
+# An agent's Read tool shows a long file a window at a time, so a large context file is given in
+# parts small enough to be read whole at once: each a run of its `## ` sections under this.
+PART_BYTES = 60_000
+
+
+def readable(path, run):
+    """`path`, or its parts in `run` when it's too large to read whole: split at its `## `
+    headings, in order, each part at most PART_BYTES where its sections allow."""
+    if os.path.getsize(path) <= PART_BYTES:
+        return [path]
+    with open(path) as f:
+        text = f.read()
+    sections, cur = [], []
+    for line in text.split("\n"):
+        if line.startswith("## ") and cur:
+            sections.append("\n".join(cur) + "\n")
+            cur = []
+        cur.append(line)
+    sections.append("\n".join(cur))
+    parts, part = [], ""
+    for sec in sections:
+        if part and len((part + sec).encode()) > PART_BYTES:
+            parts.append(part)
+            part = ""
+        part += sec
+    parts.append(part)
+    stem = os.path.splitext(os.path.basename(path))[0]
+    out = []
+    for i, text in enumerate(parts, 1):
+        p = os.path.join(run, f"{stem}-part{i}-of-{len(parts)}.md")
+        with open(p, "w") as f:
+            f.write(text)
+        out.append(p)
+    return out
+
+
 def brief(cfg, t, task_dir, context, attempt, wrela):
     return cfg["brief"].format(
         context=", ".join(context),
@@ -176,10 +212,12 @@ def main():
     with open(attempt, "w") as f:
         f.write(f'#!/usr/bin/env bash\nexec env WRELA_BIN={json.dumps(wrela)} {json.dumps(os.path.join(HERE, "attempt.sh"))} "$@"\n')
     os.chmod(attempt, 0o755)
-    context = [c.replace("{run}", run) if c.startswith("{run}") else os.path.join(ROOT, c)
-               for c in cfg["context_sets"][a.context]]
     if a.context == "core":
         core_language(cfg, os.path.join(run, "core-language.md"))
+    context = []
+    for c in cfg["context_sets"][a.context]:
+        path = c.replace("{run}", run) if c.startswith("{run}") else os.path.join(ROOT, c)
+        context.extend(readable(path, run))
 
     def one(job):
         t, task_dir, cmd = job

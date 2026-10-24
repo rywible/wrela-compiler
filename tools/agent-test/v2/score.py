@@ -40,6 +40,10 @@ def tokens_and_cost(usage):
 def main():
     run = sys.argv[1]
     tasks = read_json(os.path.join(HERE, "tasks.json"))
+    # The tasks the run ran (run.json says), else every task.
+    ran = read_json(os.path.join(run, "run.json"), {}).get("tasks")
+    if ran:
+        tasks = [t for t in tasks if t["id"] in ran]
     limit = read_json(os.path.join(HERE, "config.json"))["max_attempts"]
     per = []
     for t in tasks:
