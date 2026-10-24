@@ -187,9 +187,11 @@ interface FieldState {
   composeText: string;
 }
 
-/** Roles a person presses: a pointer reaches them where they're drawn, as it does a link with an
- * address. Every other node lets the pointer through to the canvas. */
-const PRESSED_ROLES = new Set<number>([Role.Button, Role.Checkbox, Role.Switch, Role.Option, Role.Tab, Role.MenuItem]);
+/** Roles a person presses, which a press activates: a pointer reaches them where they're drawn, as
+ * it does a link with an address. Every other node lets the pointer through to the canvas: an
+ * option or a tab is selected, and a pointer on one means what the program says (a search
+ * result's opens it). */
+const PRESSED_ROLES = new Set<number>([Role.Button, Role.Checkbox, Role.Switch, Role.MenuItem]);
 
 /** Whether node `n` takes the pointer where it's drawn. */
 const pressable = (n: Node) => PRESSED_ROLES.has(n.role) || (n.role === Role.Link && !!n.href);

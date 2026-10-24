@@ -6,9 +6,9 @@
 // node comes back as an event by its number (`Event::Assist`, `Event::Field`). The program says
 // what exists; the host owns how each kind behaves. The tree's structure and its geometry are
 // sent apart: the structure when it changes, the rectangles each frame they move. A pointer
-// presses the nodes a person presses (a link with an address, a button, a checkbox, a switch, an
-// option, a tab, a menu item) where they're drawn, and the keys stay the program's after it; over
-// every other node it reaches the canvas.
+// presses the nodes a press activates (a link with an address, a button, a checkbox, a switch, a
+// menu item) where they're drawn, and the keys stay the program's after it; over every other
+// node, an option or a tab too, it reaches the canvas.
 use std::input::Assist
 use std::serialize::{LoadError, Reader, Writer}
 
