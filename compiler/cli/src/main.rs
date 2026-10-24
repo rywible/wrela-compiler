@@ -11,7 +11,11 @@
 //!                                         --lift reads that package's literals from a
 //!                                         table the program can change (§23)
 //! wrela fmt <file-or-dir>... [--check]    format in place; --check only reports
-//! wrela fix <package-dir> [--json]        make every fix a tool can make, and report each
+//! wrela fix <package-dir> [--dry-run] [--json]
+//!                                         make every fix a tool can make, and report each
+//! wrela migrate <package-dir> [--dry-run] [--json]
+//!                                         make every migration's fix (a form the language
+//!                                         moved away from), and nothing else
 //! wrela edit <package-dir> [--edits <file>] [--dry-run] [--json]
 //!                                         write new values into literals (§23), from
 //!                                         JSON edits; refuses a file that has changed
@@ -88,6 +92,7 @@ mod explain;
 mod export;
 mod fix;
 mod fmt;
+mod migrate;
 mod pin;
 mod pipelines;
 mod primer;
@@ -108,7 +113,8 @@ pub(crate) fn usage() -> ExitCode {
         "wrela check <package-dir> [--json]",
         "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]",
         "wrela fmt <file-or-dir>... [--check]",
-        "wrela fix <package-dir> [--json]",
+        "wrela fix <package-dir> [--dry-run] [--json]",
+        "wrela migrate <package-dir> [--dry-run] [--json]",
         "wrela edit <package-dir> [--edits <file.json>] [--dry-run] [--json]",
         "wrela explain <code>",
         "wrela doc <item> [<package-dir>]",
@@ -160,6 +166,7 @@ fn main() -> ExitCode {
         "build" => build::run(rest),
         "fmt" => fmt::run(rest),
         "fix" => fix::run(rest),
+        "migrate" => migrate::run(rest),
         "edit" => edit::run(rest),
         "explain" => explain::run(rest),
         "doc" if rest.iter().any(|a| a == "--export") => export::run(rest),

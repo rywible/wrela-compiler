@@ -51,6 +51,25 @@ impl fmt::Display for Code {
 }
 
 /// Codes retired before release, with why: never reused for anything else.
+/// The migrations: warnings for a form the language moved away from, whose one fix a tool always
+/// makes (`wrela migrate`), each with the release since which it's a migration. A W01xx code is
+/// one too, whether listed here or not. When a form is removed, the error that replaces it
+/// carries the same fix and the warning is retired (docs/release.md, "Deprecations").
+pub const MIGRATIONS: &[(Code, &str)] = &[(W0004, "0.5.0")];
+
+impl Code {
+    /// Whether it's a migration ([`MIGRATIONS`]).
+    pub fn is_migration(self) -> bool {
+        self.as_str().starts_with("W01")
+            || MIGRATIONS.iter().any(|(c, _)| c.as_str() == self.as_str())
+    }
+
+    /// The release since which it's a migration, if it is one and that's recorded.
+    pub fn migration_since(self) -> Option<&'static str> {
+        MIGRATIONS.iter().find(|(c, _)| c.as_str() == self.as_str()).map(|&(_, v)| v)
+    }
+}
+
 pub const RETIRED: &[(&str, &str)] = &[
     ("E0316", "a constant that isn't a literal value: E0906 reports it (a tier-1 feature)"),
     ("E0321", "an unreachable match arm: W0002 reports it (a warning, not an error)"),
@@ -257,6 +276,8 @@ codes! {
     W0011 = "W0011", "a test of code that can't fail: nothing it runs asserts or panics";
     W0012 = "W0012", "a request polled in the call that made it, which is always `None`";
     W0013 = "W0013", "a `while` that counts an index over a run only to index it";
+
+    // ---- W01xx: forms the language moved away from (`MIGRATIONS`, `wrela migrate`) --------
 
     // ---- I0xxx: bugs in the compiler -------------------------------------------------------
     I0001 = "I0001", "an internal compiler error";

@@ -123,3 +123,23 @@ fn explanations_programs_do_what_they_say() {
         failures.join("\n\n")
     );
 }
+
+/// A migration's fix is one a tool always makes (`wrela migrate`): its explanation's program
+/// gives it with exactly one fix, which isn't the author's choice.
+#[test]
+fn every_migration_has_one_fix_a_tool_makes() {
+    let all = wrela_driver::explain::all();
+    let migrations: Vec<_> = codes::ALL.iter().filter(|c| c.is_migration()).collect();
+    assert!(!migrations.is_empty(), "no migrations: `codes::MIGRATIONS` lists them");
+    for c in migrations {
+        let e = all.iter().find(|e| e.code == c.as_str()).expect("an explanation");
+        let dir = scratch(&format!("explain/migration-{}", e.code));
+        for (path, text) in e.wrong.iter().filter(|(_, t)| !t.is_empty()) {
+            std::fs::write(dir.join(path), text).expect("write");
+        }
+        let (_, diags) = diagnose(e.code, &dir);
+        let d = diags.iter().find(|d| d.code == *c).expect("the program gives its code");
+        assert_eq!(d.fixes.len(), 1, "{}: a migration has one fix: {d:?}", e.code);
+        assert!(!d.fixes[0].choice, "{}: a migration's fix isn't a choice", e.code);
+    }
+}

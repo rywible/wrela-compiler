@@ -4,6 +4,7 @@ mod common;
 mod doc;
 mod drive;
 mod fix;
+mod migrate;
 mod pin;
 mod pipelines;
 mod profile;

@@ -365,7 +365,7 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
 /// it, so a reader sees the old file or the whole new one.
-pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // A temporary file of this write's own: several threads may write one file at once.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

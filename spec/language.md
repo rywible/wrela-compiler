@@ -1123,6 +1123,8 @@ Each error and warning has a code, whose number and meaning never change once re
 
 - **`wrela explain <code>`** gives a code's meaning, with a program that breaks the rule and the same program fixed.
 - **A diagnostic can carry fixes:** edits that a tool can make. `wrela fix` makes each fix that's the only one, unless it's the author's choice (§6.13).
+- **Every diagnostic has a next step:** a help or a fix of its own, or, where its code has nothing more to say there, a help that points at `wrela explain`.
+- **A migration** is a warning for a form the language moved away from, whose one fix a tool always makes; `wrela migrate` makes every one of a package's, and nothing else (§23.9). The old form compiles for at least two minor releases before the error that replaces it.
 - **`--json`** gives diagnostics for tools, in a versioned format: each has its code, severity, message, file, span, labels, notes, helps and fixes.
 
 ### 10.3 Failed asserts
@@ -2914,7 +2916,8 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela query <package> <query>...` | Answers a batch of queries with one check (below) |
 | `wrela context <item> [<package>] --budget n` | Gives the item's source, the types it names, what it calls, where it is called and its impls, in about `n` tokens. On a program with errors, it says at the end what the errors keep from being known |
 | `wrela refactor <package> <change>` | Makes a change across the package: `rename`, `move`, `add-param` or `change-mode` (below) |
-| `wrela fix <package-dir> [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13) |
+| `wrela fix <package-dir> [--dry-run] [--json]` | Makes every fix a tool can make, and reports each one; a fix that is the author's choice is listed, not made (§6.13). `--dry-run` prints the diff and writes nothing |
+| `wrela migrate <package-dir> [--dry-run] [--json]` | Makes every migration's fix and nothing else (§10.2): after a workspace moves its toolchain pin, one command brings each member to the new forms |
 | `wrela solve <package> --minimize <fn> --free <file>:<lines>` | Minimizes a function of no arguments over the literals on those lines, and rounds them to their decimals. It builds a program around the function that uses `std::lift::Minimize` (BFGS on `std::lift::gradient`). `--write` writes the literals through `wrela edit` |
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
