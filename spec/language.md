@@ -1483,7 +1483,7 @@ The compiler derives them from the function's body, and from every function it c
   - On the CPU, each rounded result is widened by its rounding: an ulp, or four for std's transcendentals.
   - On the GPU, each result is widened by twice its WGSL error bound, at least one ulp, plus 2⁻¹²⁶ for flushed subnormals.
   - A branch on the input that could go either way runs both sides and joins their results.
-  - A loop whose exit depends on the input cannot be bounded, and nor can a recursion that runs under a branch on the input (E0701).
+  - A loop runs its fixed count. A `break` or `continue` under a branch on the input is joined with the other passes, as a branch is: the rest of each pass runs where it didn't leave, and the result holds both. A loop whose own count depends on the input (a `while` on it, or a `loop` that only such a `break` leaves) cannot be bounded, and nor can a recursion that runs under a branch on the input (E0701).
   - Integers are exact when single-valued, and otherwise their type's whole range.
   - The test corpus encloses every sample of 10⁶ boxes per function, on both targets.
 - **What cannot be derived (E0700):**
@@ -3053,7 +3053,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `const.fuel` | `@fuel(n)` on a `const` or a test sets the work it may do, its threads' together | §13.1 |
 | `const.tests` | A `@test` is a free function of no parameters and no result, run as constants are; a tool test (`@test(tool)`) is one too, run on the tool host | §13.2 |
 | `derive.gradient` | `gradient` of a closure or function of an `f32` or a float vector | §14.2 |
-| `derive.interval` | `interval` over a box, of a function whose loops don't depend on its input | §14.2 |
+| `derive.interval` | `interval` over a box, of a function whose loops run a fixed count, whatever its input | §14.2 |
 | `gpu.roles` | A client build runs `init` and `frame`, a server build `serve_init` and `serve`, a tool build `tool`, and `@client`, `@server` and `@tool` code stays in its role | §15.3 |
 | `fn.jobs` | A `@job fn` runs over several frames, to each `yield`: `f.start(...)` takes its `take` parameters, and `job.resume(...)` its `borrow` and `mut` ones | §16.3 |
 | `fn.job-values` | A job's value is `Clone`, `StateHash` and `Serialize` when the locals it holds are | §16.3 |

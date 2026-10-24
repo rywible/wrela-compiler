@@ -3,9 +3,9 @@
 // block culling on the spike's grid, with the derived interval and with the spike's
 // hand-written Lipschitz bound. Also AC3's corpus (compiler/tests/tests/suite/derive.rs).
 use corpus::{
-    Branchy, Cells, Hyperbolic, Logs, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves, blob_,
-    blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_, oval_,
-    sphere_, sphere_tape, table_, tube_, waves_tape,
+    Branchy, Cells, Hyperbolic, Logs, March, Noise, Pieces, Powers, Rational, Trig, Vectors, Waves,
+    blob_, blob_spheres, blob_tape, closures_, cone_, creature, ellipsoid_, fbm_, grazer_, hoof_,
+    oval_, sphere_, sphere_tape, table_, tube_, waves_tape,
 }
 use grazer::{Grazer, P3, PARAM_FLOATS, bounds, grazer, grazer_from, p3, params}
 use std::derive::{Box3, interval}
@@ -386,7 +386,8 @@ fn with_function<V: Visit>(fi: u32, v: V) -> V::Out {
         20 => v.visit(closures_(5.0)),
         21 => v.visit(table_()),
         22 => v.visit(Hyperbolic { s: 1.7 }),
-        _ => v.visit(Powers { n: 2.4 }),
+        23 => v.visit(Powers { n: 2.4 }),
+        _ => v.visit(March { dir: vec3(0.0, 0.0, 1.0) }),
     }
 }
 

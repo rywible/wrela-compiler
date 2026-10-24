@@ -169,7 +169,7 @@ fn derive(
     no_gpu_work(&orig.body)?;
     let exit = single_exit(m, &orig);
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
-    let (func, result, act) = match exit {
+    let (mut func, result, mut act) = match exit {
         None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
         Some((func, result)) => {
             let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
@@ -178,6 +178,19 @@ fn derive(
             (func, result, act)
         }
     };
+    // A loop that leaves early on the input runs its own count instead, with flags
+    // (`exits.rs`); what's left is a loop whose own count depends on the input.
+    if act.active_loop_exit.is_some()
+        && let Some(flagged) = super::exits::flag_exits(&func, &mut m.types, &|v| act.value(v))
+    {
+        let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
+            effect(m, cache, g, mk, Mode::Interval)
+        });
+        if again.active_loop_exit.is_none() {
+            func = flagged;
+            act = again;
+        }
+    }
     if let Some(at) = act.active_loop_exit {
         return Err(Error::ActiveLoopExit(
             "a loop exits here depending on the input; an interval needs loops that run the \
