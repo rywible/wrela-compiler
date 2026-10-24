@@ -167,7 +167,7 @@ const STYLE = `
 .wrela-semantics input.wrela-node::-webkit-search-cancel-button,
 .wrela-semantics input.wrela-node::-webkit-search-decoration { appearance: none; display: none; }
 .wrela-semantics .wrela-holder { position: static; overflow: visible; }
-.wrela-semantics a.wrela-node.wrela-hit { pointer-events: auto; cursor: pointer; touch-action: pinch-zoom;
+.wrela-semantics .wrela-node.wrela-hit { pointer-events: auto; cursor: pointer; touch-action: pinch-zoom;
   -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
 .wrela-semantics .wrela-node:focus-visible, .wrela-semantics [role=listbox]:focus .wrela-active {
   outline: 3px solid #4766ff; outline-offset: 2px; border-radius: 4px; }
@@ -186,6 +186,13 @@ interface FieldState {
   composeStart: number;
   composeText: string;
 }
+
+/** Roles a person presses: a pointer reaches them where they're drawn, as it does a link with an
+ * address. Every other node lets the pointer through to the canvas. */
+const PRESSED_ROLES = new Set<number>([Role.Button, Role.Checkbox, Role.Switch, Role.Option, Role.Tab, Role.MenuItem]);
+
+/** Whether node `n` takes the pointer where it's drawn. */
+const pressable = (n: Node) => PRESSED_ROLES.has(n.role) || (n.role === Role.Link && !!n.href);
 
 /** Roles named by `aria-label` rather than by their text. */
 const NAMED = new Set<number>([...CONTAINERS, Role.Field, Role.Slider]);
@@ -377,8 +384,8 @@ export class Semantics implements Overlay {
       if (this.#places.get(el) === place) continue;
       this.#places.set(el, place);
       Object.assign(el.style, { left: `${x * sx}px`, top: `${y * sy}px`, width: `${w * sx}px`, height: `${h * sy}px` });
-      // A link takes the pointer only where it's drawn and can be seen.
-      el.classList.toggle("wrela-hit", w > 0 && h > 0);
+      // A link or a button takes the pointer only where it's drawn and can be seen.
+      el.classList.toggle("wrela-hit", pressable(n) && w > 0 && h > 0);
     }
   }
 
@@ -452,9 +459,27 @@ export class Semantics implements Overlay {
         this.#field(el as HTMLInputElement | HTMLTextAreaElement, n);
         break;
     }
+    if (pressable(n)) this.#pressedByPointer(el, n.role === Role.Link);
     el.addEventListener("focus", () => this.write(assistEvent(id, Action.Focus)));
     this.#els.set(n.id, el);
     return el;
+  }
+
+  /** A node a pointer presses leaves the keyboard's focus where it was, so the keys still reach
+   * the program: a mouse press doesn't focus it, and a pointer's click gives the canvas the focus
+   * if the node had taken it. A wheel and a hover over it are the program's, as over the canvas
+   * (a link forwards its own). A click from the keyboard or a screen reader keeps the focus. */
+  #pressedByPointer(el: HTMLElement, link: boolean) {
+    el.addEventListener("mousedown", (e) => {
+      if (e.button === 0) e.preventDefault();
+    });
+    el.addEventListener("click", (e) => {
+      if (e.detail > 0 && document.activeElement === el) this.canvas.focus({ preventScroll: true });
+    });
+    if (!link) {
+      el.addEventListener("wheel", (e) => this.#forward?.wheel(e), { passive: false });
+      el.addEventListener("pointermove", (e) => this.#forward?.move(e));
+    }
   }
 
   #tag(n: Node): string {
