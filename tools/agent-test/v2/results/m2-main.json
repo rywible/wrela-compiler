@@ -1,0 +1,464 @@
+{
+  "tasks": 30,
+  "first_try_correct": 30,
+  "first_try_correct_rate": 1.0,
+  "correct_eventually": 30,
+  "mean_attempts_to_correct": 1.0,
+  "first_try_builds": 30,
+  "built_eventually": 30,
+  "mean_tokens": 607450,
+  "mean_cost_usd": 0.7058,
+  "codes_met": {},
+  "per_task": [
+    {
+      "task": "01-area",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 637439,
+      "cost_usd": 0.7022,
+      "over_limit": []
+    },
+    {
+      "task": "02-particle",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 635212,
+      "cost_usd": 0.7088,
+      "over_limit": []
+    },
+    {
+      "task": "03-shapes",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638691,
+      "cost_usd": 0.7067,
+      "over_limit": []
+    },
+    {
+      "task": "04-traits",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 451256,
+      "cost_usd": 0.6912,
+      "over_limit": []
+    },
+    {
+      "task": "05-ownership",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 450731,
+      "cost_usd": 0.6891,
+      "over_limit": []
+    },
+    {
+      "task": "06-field",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 634878,
+      "cost_usd": 0.7083,
+      "over_limit": []
+    },
+    {
+      "task": "07-kernel",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639372,
+      "cost_usd": 0.7113,
+      "over_limit": []
+    },
+    {
+      "task": "08-sky",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639284,
+      "cost_usd": 0.7111,
+      "over_limit": []
+    },
+    {
+      "task": "09-normals",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638292,
+      "cost_usd": 0.7052,
+      "over_limit": []
+    },
+    {
+      "task": "10-interval",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 449981,
+      "cost_usd": 0.6843,
+      "over_limit": []
+    },
+    {
+      "task": "11-projection",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 634795,
+      "cost_usd": 0.7082,
+      "over_limit": []
+    },
+    {
+      "task": "12-closures",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638029,
+      "cost_usd": 0.7043,
+      "over_limit": []
+    },
+    {
+      "task": "13-arrays",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638478,
+      "cost_usd": 0.7062,
+      "over_limit": []
+    },
+    {
+      "task": "14-option",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 454765,
+      "cost_usd": 0.6874,
+      "over_limit": []
+    },
+    {
+      "task": "15-modules",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638991,
+      "cost_usd": 0.7082,
+      "over_limit": []
+    },
+    {
+      "task": "16-constants",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638087,
+      "cost_usd": 0.7038,
+      "over_limit": []
+    },
+    {
+      "task": "17-reflect",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 637753,
+      "cost_usd": 0.7033,
+      "over_limit": []
+    },
+    {
+      "task": "18-surface",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639220,
+      "cost_usd": 0.7096,
+      "over_limit": []
+    },
+    {
+      "task": "19-raymarch",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 640770,
+      "cost_usd": 0.7201,
+      "over_limit": []
+    },
+    {
+      "task": "20-uniforms",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639149,
+      "cost_usd": 0.7103,
+      "over_limit": []
+    },
+    {
+      "task": "21-vec-bag",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 454732,
+      "cost_usd": 0.6875,
+      "over_limit": []
+    },
+    {
+      "task": "22-arena",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 640295,
+      "cost_usd": 0.7132,
+      "over_limit": []
+    },
+    {
+      "task": "23-borrow-struct",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 634898,
+      "cost_usd": 0.7078,
+      "over_limit": []
+    },
+    {
+      "task": "24-enum-option",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 635360,
+      "cost_usd": 0.7099,
+      "over_limit": []
+    },
+    {
+      "task": "25-write-a-test",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639029,
+      "cost_usd": 0.7085,
+      "over_limit": []
+    },
+    {
+      "task": "26-modules-trait",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 640441,
+      "cost_usd": 0.7133,
+      "over_limit": []
+    },
+    {
+      "task": "27-certify",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 638773,
+      "cost_usd": 0.7096,
+      "over_limit": []
+    },
+    {
+      "task": "28-frame-script",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 831277,
+      "cost_usd": 0.7501,
+      "over_limit": []
+    },
+    {
+      "task": "29-gpu-uniform",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 639093,
+      "cost_usd": 0.7088,
+      "over_limit": []
+    },
+    {
+      "task": "30-interval",
+      "attempts": 1,
+      "built_at": 1,
+      "correct_at": 1,
+      "codes_per_attempt": [
+        []
+      ],
+      "graded": [
+        ""
+      ],
+      "tokens": 454428,
+      "cost_usd": 0.686,
+      "over_limit": []
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+use std::field::{Surface, sphere}
+
+/// Two spheres (radius 0.5 at the origin, radius 0.3 at (0.6, 0, 0)), smoothly united with k = 0.1.
+fn blob() -> Surface {
+    let big = sphere(radius: 0.5)
+    let small = sphere(radius: 0.3).translate(vec3(0.6, 0.0, 0.0))
+    big.smooth_union(small, k: 0.1)
+}
+
+/// The unit normal of the blob at (x, y, z), from the derived gradient.
+pub fn normal_at(x: f32, y: f32, z: f32) -> vec3 {
+    normalize(blob().gradient(vec3(x, y, z)))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

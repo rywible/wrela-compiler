@@ -1,0 +1,11 @@
+use std::derive::Box3
+use std::field::{Surface, certify_clear, sphere}
+
+/// Whether nothing of a unit sphere centred at (0, height, 0) is inside the box below y = 0.
+pub fn clear(height: f32) -> bool {
+    let ball = sphere(1.0).translate(vec3(0.0, height, 0.0))
+    let below = Box3 { lo: vec3(-2.0, -1.0, -2.0), hi: vec3(2.0, 0.0, 2.0) }
+    certify_clear(ball, below, depth: 5).holds()
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

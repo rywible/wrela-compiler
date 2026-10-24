@@ -1,0 +1,23 @@
+use std::field::{Surface, sphere}
+
+/// A box centred at the origin, `half` from its centre to each face.
+struct Cuboid: Copy + GpuData {
+    half: vec3,
+}
+
+impl Surface for Cuboid {
+    fn distance(self, p: vec3) -> f32 {
+        let q = abs(p) - self.half
+        length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0)
+    }
+}
+
+fn blob() -> Surface {
+    Cuboid { half: vec3(0.5, 0.3, 0.2) }.smooth_union(sphere(0.4).translate(vec3(0.5, 0.0, 0.0)), k: 0.05)
+}
+
+pub fn dist(x: f32, y: f32, z: f32) -> f32 {
+    blob().distance(vec3(x, y, z))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

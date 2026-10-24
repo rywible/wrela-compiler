@@ -1,0 +1,18 @@
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+/// Multiplies each element of `input` by `factor`, a uniform, into `out`.
+@compute(64)
+fn scale(input: [f32], factor: f32, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = input[id.x] * factor
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var input: GpuBuffer<f32> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
+    var values: [f32; 64] = [0.0; 64]
+    for i in 0..64 {
+        values[i] = f32(i)
+    }
+    write(mut input, 0, values)
+    dispatch(scale.bind(input, 2.0, mut out), groups: 1)
+}

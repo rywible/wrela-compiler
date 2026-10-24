@@ -1,0 +1,27 @@
+/// The index of the first negative element, if there is one.
+fn first_negative(xs: [f32]) -> Option<u32> {
+    for i in 0..xs.len() {
+        if xs[i] < 0.0 {
+            return Some(i)
+        }
+    }
+    None
+}
+
+pub fn where_negative() -> u32 {
+    let xs = [2.0, 7.0, -1.0, 3.0]
+    match first_negative(xs) {
+        Some(i) => i,
+        None => 99,
+    }
+}
+
+pub fn none_negative() -> u32 {
+    let xs = [2.0, 7.0, 1.0, 3.0]
+    match first_negative(xs) {
+        Some(i) => i,
+        None => 99,
+    }
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

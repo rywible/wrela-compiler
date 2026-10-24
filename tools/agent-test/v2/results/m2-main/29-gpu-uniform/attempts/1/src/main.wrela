@@ -1,0 +1,24 @@
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, write}
+
+struct Params: Copy + GpuData {
+    scale: f32,
+    offset: f32,
+}
+
+/// out[i] = in[i] * scale + offset, one element per invocation.
+@compute(64)
+fn affine(values: [f32], params: Params, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = values[id.x] * params.scale + params.offset
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var values: [f32; 64] = [0.0; 64]
+    for i in 0..64 {
+        values[i] = f32(i)
+    }
+    var input: GpuBuffer<f32> = buffer(64)
+    var out: GpuBuffer<f32> = buffer(64)
+    write(mut input, 0, values)
+    let params = Params { scale: 2.0, offset: 1.0 }
+    dispatch(affine.bind(input, params, mut out), groups: 1)
+}

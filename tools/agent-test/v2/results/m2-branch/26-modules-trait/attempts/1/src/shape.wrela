@@ -1,0 +1,4 @@
+/// Something with an area.
+pub trait Shape {
+    fn area(self) -> f32
+}

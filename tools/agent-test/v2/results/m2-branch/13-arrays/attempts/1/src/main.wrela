@@ -1,0 +1,25 @@
+/// The sum of a run.
+fn sum(xs: [f32]) -> f32 {
+    var total = 0.0
+    for x in xs {
+        total += x
+    }
+    total
+}
+
+/// The largest element of five.
+fn largest(xs: [f32; 5]) -> f32 {
+    var best = xs[0]
+    for x in xs {
+        best = max(best, x)
+    }
+    best
+}
+
+/// (sum, largest) of [3, -1, 4, 1, 5].
+pub fn stats() -> vec2 {
+    let xs: [f32; 5] = [3.0, -1.0, 4.0, 1.0, 5.0]
+    vec2(sum(xs), largest(xs))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

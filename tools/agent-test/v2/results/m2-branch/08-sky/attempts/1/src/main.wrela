@@ -1,0 +1,30 @@
+use std::gpu::{ClipPosition, FragCoord, VertexIndex, begin_screen_pass, draw}
+
+/// What the fragment shader reads: the screen's size in pixels.
+struct Screen: Copy + GpuData {
+    size: vec2,
+}
+
+/// One triangle that covers the screen.
+@vertex
+fn cover(vertex: VertexIndex) -> ClipPosition {
+    let x = f32(vertex.index % 2) * 4.0 - 1.0
+    let y = f32(vertex.index / 2) * 4.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.0, 1.0) }
+}
+
+/// Deep blue at the top of the screen (y = 0), white at the bottom.
+@fragment
+fn sky(pixel: FragCoord, screen: Screen) -> vec4 {
+    let t = clamp(pixel.position.y / screen.size.y, 0.0, 1.0)
+    let deep = vec3(0.02, 0.07, 0.35)
+    let white = vec3(1.0, 1.0, 1.0)
+    vec4(mix(deep, white, t), 1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let screen = begin_screen_pass(clear: vec4(0.0, 0.0, 0.0, 1.0))
+    let size = Screen { size: vec2(f32(width), f32(height)) }
+    draw(screen, cover, sky.bind(size), vertices: 3)
+    screen.present()
+}

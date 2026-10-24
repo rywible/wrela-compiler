@@ -1,0 +1,9 @@
+/// The smoothing kernel's weights, first to last.
+pub const WEIGHTS: [f32; 5] = [0.1, 0.2, 0.4, 0.2, 0.1]
+
+/// The weighted sum of the arguments, `a` taking the first weight.
+pub fn smooth(a: f32, b: f32, c: f32, d: f32, e: f32) -> f32 {
+    a * WEIGHTS[0] + b * WEIGHTS[1] + c * WEIGHTS[2] + d * WEIGHTS[3] + e * WEIGHTS[4]
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

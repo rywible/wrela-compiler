@@ -6,6 +6,7 @@ scored (score.py).
     tools/agent-test/v2/run.py <run-name> --wrela /abs/wrela [--validator /abs/wrela]
         [--model M] [--context full|core] [--tasks id,id] [--parallel n] [--dry-run]
     tools/agent-test/v2/run.py <run-name> --grade [--wrela /abs/wrela] [--validator ...]
+    tools/agent-test/v2/run.py <run-name> --resume
 
 The compiler is chosen once, explicitly: `--wrela` builds every attempt (through attempt.sh,
 which never builds a compiler), runs the hidden tests and answers the agent's `doc`, `explain`
@@ -13,7 +14,9 @@ and `primer`. `--validator` (default: `--wrela`) checks the criteria that depend
 they are the same in runs of different compilers that are compared. A run lives in
 `target/agent-test/<run-name>/` and is never written over: a run name that exists is refused.
 `run.json` records the date, model, context set, each compiler's path, SHA-256 and version, and
-the checkout's revision. Each task's directory holds `BRIEF.txt`, the agent's `pkg/`,
+the checkout's revision. `--resume` finishes a run that stopped (a full disk, an interrupt):
+each of its tasks without the CLI's report runs again from nothing, with the run's own
+compiler, which must still have the SHA-256 recorded. Each task's directory holds `BRIEF.txt`, the agent's `pkg/`,
 `attempts/N/` (attempt.sh's, each with its `graded.json`), `usage.json` (the CLI's report, with
 tokens and cost) and `report.md` (the agent's answer).
 
@@ -168,6 +171,7 @@ def main():
     p.add_argument("--parallel", type=int, default=2)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--grade", action="store_true", help="grade a finished run again")
+    p.add_argument("--resume", action="store_true", help="run a stopped run's unfinished tasks")
     a = p.parse_args()
     cfg = config()
     run = os.path.join(ROOT, "target", "agent-test", a.name)
@@ -179,11 +183,33 @@ def main():
         validator = compiler(a.validator or recorded["validator"]["path"], "--validator")
         grade_run(run, wrela, validator, ids)
         return
-    wrela = compiler(a.wrela, "--wrela")
-    validator = compiler(a.validator or wrela, "--validator")
-    if os.path.exists(run):
-        sys.exit(f"run.py: {run} exists: a run is never written over, so choose another name")
-    tasks = [t for t in grading.tasks() if not ids or t["id"] in ids]
+    if a.resume:
+        with open(os.path.join(run, "run.json")) as f:
+            recorded = json.load(f)
+        wrela, validator = recorded["wrela"]["path"], recorded["validator"]["path"]
+        for which in ("wrela", "validator"):
+            if sha256(recorded[which]["path"]) != recorded[which]["sha256"]:
+                sys.exit(f"run.py: the run's {which} has changed since it started; resume it with that one")
+        a.model, a.context = recorded["model"], recorded["context"]
+
+        def finished(id):
+            try:
+                with open(os.path.join(run, id, "usage.json")) as f:
+                    return isinstance(json.load(f), dict)
+            except (FileNotFoundError, json.JSONDecodeError):
+                return False
+
+        ids = [id for id in recorded["tasks"] if not finished(id)]
+        for id in ids:
+            shutil.rmtree(os.path.join(run, id), ignore_errors=True)
+        if not ids:
+            print("nothing to resume")
+    else:
+        wrela = compiler(a.wrela, "--wrela")
+        validator = compiler(a.validator or wrela, "--validator")
+        if os.path.exists(run):
+            sys.exit(f"run.py: {run} exists: a run is never written over, so choose another name")
+    tasks = [t for t in grading.tasks() if ids is None or t["id"] in ids]
     model = a.model or cfg["model"]
     attempt = os.path.join(run, "attempt")
     commands = []
@@ -195,6 +221,8 @@ def main():
             print(" ".join(json.dumps(c) if " " in c else c for c in cmd))
         print(f"{len(commands)} tasks; at most ${len(commands) * cfg['budget_usd']} at {cfg['budget_usd']} a task")
         return
+    if a.resume:
+        return run_tasks(a, cfg, run, commands, wrela, validator, attempt)
     os.makedirs(run)
     revision = subprocess.run(["git", "rev-parse", "HEAD"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
     record = {
@@ -212,6 +240,11 @@ def main():
     with open(attempt, "w") as f:
         f.write(f'#!/usr/bin/env bash\nexec env WRELA_BIN={json.dumps(wrela)} {json.dumps(os.path.join(HERE, "attempt.sh"))} "$@"\n')
     os.chmod(attempt, 0o755)
+    run_tasks(a, cfg, run, commands, wrela, validator, attempt)
+
+
+def run_tasks(a, cfg, run, commands, wrela, validator, attempt):
+    """Runs each task's agent, grades its attempts, and scores the run."""
     if a.context == "core":
         core_language(cfg, os.path.join(run, "core-language.md"))
     context = []

@@ -1,0 +1,9 @@
+use std::derive::{Interval, interval}
+
+/// The interval that `interval` derives for x * x - 2 * x over [lo, hi], as (low, high).
+pub fn bound(lo: f32, hi: f32) -> vec2 {
+    let r = interval(|x: f32| x * x - 2.0 * x, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

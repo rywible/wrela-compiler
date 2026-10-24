@@ -1,0 +1,11 @@
+use circle::Circle
+use square::Square
+
+/// The areas of a circle of radius 1 and of a square of side 1.
+pub fn areas() -> vec2 {
+    let c = Circle { r: 1.0 }
+    let s = Square { side: 1.0 }
+    vec2(c.area(), s.area())
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

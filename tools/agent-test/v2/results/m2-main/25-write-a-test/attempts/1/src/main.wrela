@@ -1,0 +1,26 @@
+/// The nth Fibonacci number: fib(0) = 0, fib(1) = 1.
+fn fib(n: u32) -> u32 {
+    var a: u32 = 0
+    var b: u32 = 1
+    for _ in 0..n {
+        let next = a.wrapping_add(b)
+        a = b
+        b = next
+    }
+    a
+}
+
+@test
+fn fib_is_right() {
+    assert(fib(0) == 0)
+    assert(fib(1) == 1)
+    assert(fib(2) == 1)
+    assert(fib(10) == 55)
+    assert(fib(20) == 6765)
+}
+
+pub fn fib_export(n: u32) -> u32 {
+    fib(n)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
