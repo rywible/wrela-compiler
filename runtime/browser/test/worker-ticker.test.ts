@@ -11,7 +11,7 @@ let scenarios = 0;
 
 async function tickerScenario(reloading: boolean, history = false, hz = 60, asynchronousFailure: "frame" | "results" | "report" | "readback" | null = null): Promise<void> {
   const globals = globalThis as unknown as Record<string, unknown>;
-  const saved = new Map(["self", "Worker", "fetch", "__tickerTest"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
+  const saved = new Map(["self", "fetch", "__tickerTest"].map(name => [name, Object.getOwnPropertyDescriptor(globalThis, name)]));
   const timers: ReturnType<typeof setInterval>[] = [];
   const targets: number[] = [];
   const origins: number[] = [];
@@ -35,11 +35,33 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
     createCommandEncoder: () => ({ copyTextureToBuffer() {}, finish() {} }),
     queue: { onSubmittedWorkDone: async () => {}, submit() {} },
   };
+  /** The ticker's thread, on its channel to the render worker: it runs whatever ticks the
+   * control asks for, and reports when it's stopped. */
+  const fakeTicker = (port: MessagePort) => {
+    port.onmessage = (e: MessageEvent<TickerStart>) => {
+      const start = e.data;
+      const control = new TickerControl(start.control);
+      startedAfter.push(start.framesBeforeStart);
+      let reported = false;
+      timers.push(setInterval(() => {
+        if (control.stopped) {
+          if (!reported) port.postMessage({
+            type: "ticks", report: { cpu_ms: [] }, log: null, replay: { upto: control.target, ticks: [], origin: control.origin },
+          });
+          reported = true;
+          return;
+        }
+        if (control.target > 0) { targets.push(control.target); origins.push(control.origin); control.ran(control.target); }
+      }, 1));
+    };
+  };
   const self = {
     location: { href: "https://site.example/worker.js" },
     onmessage: null as ((e: MessageEvent<ToWorker>) => void) | null,
-    postMessage(message: { type: string; message?: string }) {
+    postMessage(message: { type: string; message?: string; port?: MessagePort }) {
       if (message.type === "fatal") stopped.resolve(message.message!);
+      // The main thread starts the ticker's thread and hands it its channel (`spawn`).
+      if (message.type === "spawn") fakeTicker(message.port!);
       if (message.type === "load-query" && (asynchronousFailure === "results" || asynchronousFailure === "report")) {
         if (asynchronousFailure === "results") self.onmessage!({ data: { type: "audio-failed", message: "audio stopped during results" } } as MessageEvent<ToWorker>);
         self.onmessage!({ data: { type: "load", opened_ms: 0, resources: [] } } as unknown as MessageEvent<ToWorker>);
@@ -90,25 +112,6 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
       }
       return program;
     } };
-    globals.Worker = class {
-      onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
-      postMessage(start: TickerStart) {
-        const control = new TickerControl(start.control);
-        startedAfter.push(start.framesBeforeStart);
-        let reported = false;
-        timers.push(setInterval(() => {
-          if (control.stopped) {
-            if (!reported) this.onmessage?.(new MessageEvent("message", { data: {
-              type: "ticks", report: { cpu_ms: [] }, log: null, replay: { upto: control.target, ticks: [], origin: control.origin },
-            } }));
-            reported = true;
-            return;
-          }
-          if (control.target > 0) { targets.push(control.target); origins.push(control.origin); control.ran(control.target); }
-        }, 1));
-      }
-      terminate() {}
-    };
     const bundle = await Bun.build({ entrypoints: [new URL("../src/worker.ts", import.meta.url).pathname], target: "browser", format: "esm", plugins: [{
       name: "worker ticker dependencies", setup(build) {
         build.onResolve({ filter: /\/(loader|device|live)\.ts$|^\.\/(loader|device|live)\.ts$/ }, ({ path }) => ({ path, namespace: "ticker-test" }));
@@ -140,6 +143,8 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
       return;
     }
     expect(failure).toContain("stopped after three frames");
+    // The ticker's thread hears the render worker on a channel: let what's on it arrive.
+    await Bun.sleep(10);
     expect(frames).toBe(3);
     expect(targets).toEqual(history ? [1, 2, 3] : hz === 60 ? [1] : []);
     expect(origins).toEqual(history ? [0, 0, 0] : hz === 60 ? [2 / 60] : []);

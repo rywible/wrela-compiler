@@ -5,7 +5,10 @@
 // password managers, autofill and a link's menu work as on any page. What a person does to a
 // node comes back as an event by its number (`Event::Assist`, `Event::Field`). The program says
 // what exists; the host owns how each kind behaves. The tree's structure and its geometry are
-// sent apart: the structure when it changes, the rectangles each frame they move.
+// sent apart: the structure when it changes, the rectangles each frame they move. A pointer
+// presses the nodes a person presses (a link with an address, a button, a checkbox, a switch, an
+// option, a tab, a menu item) where they're drawn, and the keys stay the program's after it; over
+// every other node it reaches the canvas.
 use std::input::Assist
 use std::serialize::{LoadError, Reader, Writer}
 

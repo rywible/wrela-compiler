@@ -154,6 +154,41 @@ test("a link is an <a> to its address: a plain click is the program's, a modifie
   expect([el(1).style.left, el(1).style.top]).toEqual(["5px", "15px"]);
 }));
 
+test("a button, a menu item and the other pressed roles take a pointer where they're drawn, and leave the keys with the canvas", () => onPage((page) => {
+  const { o, events, forwarded, canvas, el } = overlay(page);
+  o.tree(tree([
+    { id: 1, role: Role.Button, label: "Resume" },
+    { id: 2, role: Role.Menu, label: "Paused" },
+    { id: 3, parent: 2, role: Role.MenuItem, label: "Restart" },
+    { id: 4, role: Role.Text, label: "Paused" },
+    { id: 5, role: Role.Link, label: "Run" },
+  ]));
+  o.geometry(geometry([[1, 0, 0, 20, 10], [3, 0, 20, 20, 10], [4, 0, 40, 20, 10], [5, 0, 60, 20, 10]]));
+  // Pressed roles take the pointer; text and a link without an address let it through.
+  expect([1, 3, 4, 5].map((id) => el(id).classes.has("wrela-hit"))).toEqual([true, true, false, false]);
+  // A mouse press doesn't take the focus from the canvas...
+  (canvas as unknown as FakeElement).focus();
+  const down = domEvent("mousedown", { button: 0 });
+  el(3).dispatchEvent(down);
+  expect(down.defaultPrevented).toBe(true);
+  // ...and the pointer's click is the item's, with the canvas keeping the keys even where the
+  // browser focused the item.
+  el(3).focus();
+  events.length = 0;
+  el(3).dispatchEvent(domEvent("click", { button: 0, detail: 1 }));
+  expect(events[0]).toEqual(assistEvent(3, Action.Activate));
+  expect(page.activeElement).toBe(canvas as unknown as FakeElement);
+  // A click from the keyboard or a screen reader (no pointer: detail 0) keeps the focus there.
+  el(1).focus();
+  el(1).click();
+  expect(page.activeElement).toBe(el(1));
+  // A wheel and a hover over a button are the program's, as over the canvas.
+  forwarded.length = 0;
+  el(1).dispatchEvent(domEvent("wheel"));
+  el(1).dispatchEvent(domEvent("pointermove"));
+  expect(forwarded).toEqual(["wheel", "move"]);
+}));
+
 test("a program cannot put executable URLs into real links", () => onPage((page) => {
   const { o, el } = overlay(page);
   o.tree(tree([{ id: 1, role: Role.Link, label: "Safe", href: "https://docs.example/page" }]));
