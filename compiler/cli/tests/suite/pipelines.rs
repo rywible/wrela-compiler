@@ -75,6 +75,27 @@ fn a_draw_under_a_runtime_condition_is_marked() {
         ),
         [false]
     );
+    // A loop's own test is no condition; an early exit the code wrote is.
+    assert_eq!(
+        conditional("loop-body", &format!("    for i in 0..4 {{\n        {DRAW}\n    }}")),
+        [false]
+    );
+    assert_eq!(
+        conditional(
+            "while-body",
+            &format!("    var i = 0\n    while i < 4 {{\n        {DRAW}\n        i += 1\n    }}")
+        ),
+        [false]
+    );
+    assert_eq!(
+        conditional(
+            "after-break",
+            &format!(
+                "    for i in 0..4 {{\n        if shown {{\n            break\n        }}\n        {DRAW}\n    }}"
+            )
+        ),
+        [true]
+    );
 }
 
 /// The report for people says it too.

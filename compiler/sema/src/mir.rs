@@ -76,6 +76,9 @@ pub struct FnBody {
     /// How the function returns its value (a closure's is always owned).
     pub ret_mode: RetMode,
     pub span: Span,
+    /// The blocks that end in a loop's own test of whether to go on (a `for`'s count, a
+    /// `while`'s condition), not one the code wrote.
+    pub loop_tests: Vec<BlockId>,
 }
 
 impl FnBody {

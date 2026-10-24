@@ -5,9 +5,9 @@
 //! Block `b` is under a condition when it is control dependent on a branch `x`: some successor
 //! of `x` is post-dominated by `b`, and `b` doesn't strictly post-dominate `x`. So code after an
 //! `if`/`else` joins again isn't under it, code after an early `return` is, and a conditional
-//! draw inside a loop is too (the other arm reaches it only on a later pass). Branches that are
-//! no condition of the program's are left out: one on a literal (`if true`), and a loop's own
-//! test of whether to go on, whose one arm only leaves the loop.
+//! draw inside a loop is too (the other arm reaches it only on a later pass), as is code after
+//! an `if c { break }`. Branches that are no condition of the program's are left out: one on a
+//! literal (`if true`), and a loop's own test of whether to go on (`FnBody::loop_tests`).
 
 use super::{BlockId, FnBody, OperandKind, TerminatorKind};
 
@@ -60,16 +60,9 @@ pub fn under_condition(f: &FnBody) -> Vec<bool> {
 }
 
 /// Whether block `x` ends in a branch that is a condition of the program's: an `if` on a value
-/// that isn't a literal, other than a loop's test of whether to go on.
+/// that isn't a literal, other than a loop's own test of whether to go on. An `if c { break }`
+/// the code wrote is one: what comes after it runs only while `c` doesn't hold.
 fn is_condition(f: &FnBody, x: BlockId) -> bool {
-    let TerminatorKind::If { cond, then, else_, .. } = &f.block(x).term.kind else { return false };
-    if matches!(cond.kind, OperandKind::Const(_)) {
-        return false;
-    }
-    let only_leaves = |b: BlockId| {
-        let d = f.block(b);
-        d.stmts.iter().all(|s| matches!(s.kind, super::StatementKind::Dead(_)))
-            && matches!(d.term.kind, TerminatorKind::Break(_))
-    };
-    !(only_leaves(*then) || only_leaves(*else_))
+    let TerminatorKind::If { cond, .. } = &f.block(x).term.kind else { return false };
+    !matches!(cond.kind, OperandKind::Const(_)) && !f.loop_tests.contains(&x)
 }
