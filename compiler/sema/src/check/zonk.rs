@@ -447,7 +447,11 @@ pub(super) fn finish_common(c: &mut Checker) {
             Ok(_) => {}
             Err(msg) => c.err(
                 Diagnostic::new(codes::E0305, span, msg)
-                    .with_note("a literal argument's type was inferred from how it's used later"),
+                    .with_note("a literal argument's type was inferred from how it's used later")
+                    .with_help(format!(
+                        "pass `{}` the kind of value it says; `wrela doc builtins` lists what each built-in takes",
+                        b.name()
+                    )),
             ),
         }
     }
@@ -469,7 +473,7 @@ pub(super) fn finish_common(c: &mut Checker) {
                     codes::E0305,
                     span,
                     format!("`**` doesn't apply to `{bs}` and `{es}`"),
-                )
+                ).with_help("convert the exponent: an integer's is a `u32` (`x ** u32(n)`), a float's its own type (`x ** f32(n)`)")
                 .with_note("an integer's exponent is a `u32`; a float's is the same float type"),
             );
         }
@@ -540,6 +544,10 @@ pub(super) fn finish_common(c: &mut Checker) {
                 span,
                 format!("this number is too large for an `{shown}`"),
             )
+            .with_help(format!(
+                "write a number that fits, or give it a wider type, as in `let x: {} = ...`",
+                if c.p.types.is_float(t) { "f64" } else { "u64" }
+            ))
             .with_note(format!("an `{shown}`'s largest value is about {largest}")),
         );
     }

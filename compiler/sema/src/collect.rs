@@ -283,6 +283,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         g.name.span,
                         format!("the generic parameter `{}` is declared twice", g.name.name),
                     )
+                    .with_help("rename one of them")
                     .with_secondary(prev.name.span, "first declared here"),
                 );
             }
@@ -1733,7 +1734,8 @@ impl<'d, 'u> Collector<'d, 'u> {
                 for (span, msg) in problems {
                     self.diags.push(
                         Diagnostic::new(codes::E0407, span, msg)
-                            .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)"),
+                            .with_note("a `Packed` struct's fields are `Bits<N>`, packed into one `u32`, the first in the low bits (§3)")
+                            .with_help("give each field a `Bits<N>` type, N from 1 to 32 and 32 bits in all, with no default; or don't declare `Packed`"),
                     );
                 }
                 continue;
@@ -1972,6 +1974,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                     t.name.span,
                     format!("`{name}` names traits, so it has no parameters"),
                 )
+                .with_help(
+                    "remove the generic arguments: a trait alias stands for its traits as they are",
+                )
                 .with_note("it names the one type a function returns (§4)"),
             );
             return self.p.types.error;
@@ -2107,7 +2112,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                     codes::E0222,
                     at,
                     "`@testing` marks an export, a `pub fn` of `main.wrela`, which only a test build has",
-                )
+                ).with_help("remove `@testing`, or put the function in `main.wrela` and make it `pub fn`")
                 .with_note("what only a test export calls is left out of a shipped build with it; elsewhere, `std::mem::test_build()` asks"),
             );
         }
@@ -2223,7 +2228,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0222,
                         span,
                         format!("a test's input `{name}` names {what}, not a constant"),
-                    )
+                    ).with_help("name a `std::input::Script` constant, or give the path of a file in the package as a string")
                     .with_note(INPUT_NOTE),
                 );
                 None
@@ -2385,7 +2390,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0411,
                         span,
                         format!("`{name}` can't be its own supertrait"),
-                    )
+                    ).with_help("remove it from its own supertraits; a trait's supertraits are other traits")
                 } else {
                     let through: Vec<String> = cycle[1..]
                         .iter()
@@ -2849,7 +2854,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         codes::E0410,
                         f.name.span,
                         format!("`{}` decides what `{}` names, so it can't be generic", f.name.name, a.name),
-                    )
+                    ).with_help("remove its generic parameters: what it names is the same for every use")
                     .with_note("an alias that names traits names one type: the first function in its module that returns it decides it (§4)"),
                 );
             } else {
@@ -2992,7 +2997,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                             "`type {name} = {}` holds itself through its fields, so it would be infinitely large",
                             self.p.display_ty(ty)
                         ),
-                    ));
+                    ).with_help("hold the inner values in a `Vec`, or an index into one, instead of the value itself"));
                     cyclic.push((i, name.clone()));
                 }
             }
@@ -3308,7 +3313,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                     codes::E0402,
                     imp.span,
                     format!("an inherent impl can't define the associated type `{name}`"),
-                )
+                ).with_help("put it in the impl of the trait that declares it, or use a `const` or a method here")
                 .with_note("associated types belong to traits"),
             );
         }
@@ -3341,7 +3346,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 codes::E0415,
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: {what} bound to its arguments has it", tr.name),
-            )
+            ).with_help("remove the `impl`: binding the entry point (`name.bind(...)`) gives the trait")
             .with_note("`name.bind(...)` makes a value of the entry point's bound type, which has the trait (§18)"),
         );
         return;
@@ -3353,7 +3358,7 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                 codes::E0415,
                 imp.span,
                 format!("`{}` isn't implemented with an `impl`: std's passes have it", tr.name),
-            )
+            ).with_help("remove the `impl`: std's passes have this trait already")
             .with_note("a draw draws into the pass a `begin_` function gives, and its type says the pass's targets (§18)"),
         );
         return;
@@ -3401,6 +3406,11 @@ fn check_impl(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplDef) {
                     ],
                 );
             }
+        } else {
+            d = d.with_help(format!(
+                "remove the `impl`: a struct or an enum declares `{}` where it's declared (`struct S: {}`)",
+                tr.name, tr.name
+            ));
         }
         diags.push(d);
         return;
@@ -3481,15 +3491,18 @@ fn check_members(
         let Some(&ty) = imp.assoc_types.get(&at.name) else { continue };
         let ty = crate::traits::normalize(p, ty, Some(imp));
         if let Some(cycle) = crate::traits::cyclic_projection(p, ty) {
-            diags.push(Diagnostic::new(
-                codes::E0318,
-                imp.span,
-                format!(
-                    "`type {}` is defined in terms of itself: `{}` never resolves to a type",
-                    at.name,
-                    p.display_ty(cycle)
-                ),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0318,
+                    imp.span,
+                    format!(
+                        "`type {}` is defined in terms of itself: `{}` never resolves to a type",
+                        at.name,
+                        p.display_ty(cycle)
+                    ),
+                )
+                .with_help("give the associated type a concrete type, as in `type Out = f32`"),
+            );
             continue;
         }
         for b in &at.bounds {
@@ -3509,7 +3522,7 @@ fn check_members(
                         p.display_trait_ref(&b),
                         tr.name
                     ),
-                ));
+                ).with_help("give it a type that implements the bound, or implement the trait for this type"));
             }
         }
     }
@@ -3613,6 +3626,7 @@ fn report_duplicate_methods(p: &Program, diags: &mut Vec<Diagnostic>, methods: &
                     d.name_span,
                     format!("`{}` is defined twice", d.name),
                 )
+                .with_help("rename one of them")
                 .with_secondary(ps, "first defined here"),
             );
         } else {
@@ -3646,7 +3660,7 @@ fn check_inherent_names(p: &Program, diags: &mut Vec<Diagnostic>) {
                                     d.name,
                                     p.display_ty(b.self_ty)
                                 ),
-                            )
+                            ).with_help("rename one of them, or remove one: a type has one item of each name across its impls")
                             .with_secondary(p.func(g).name_span, "first defined here"),
                         );
                     }
@@ -3844,7 +3858,7 @@ fn check_structural_opt_in(p: &Program, diags: &mut Vec<Diagnostic>, imp: &ImplD
                     codes::E0407,
                     imp.span,
                     format!("`{}` can't be `Fieldless`: {why}", adt.name),
-                )
+                ).with_help("`Fieldless` is declared by an enum whose variants hold nothing: remove it from this declaration, or remove the variants' fields")
                 .with_note("`Fieldless` is an enum's whose variants hold nothing: each is its discriminant (§3)"),
             );
         }
@@ -3953,7 +3967,7 @@ pub fn check_test_inputs(p: &Program, tys: &crate::check::ConstTypes) -> Vec<Dia
                         p.const_(*c).short(),
                         p.display_ty(t)
                     ),
-                )
+                ).with_help("make the constant a `std::input::Script`, or give the path of a file in the package as a string")
                 .with_note(INPUT_NOTE),
             );
         }

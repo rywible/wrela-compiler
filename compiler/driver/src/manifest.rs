@@ -317,7 +317,7 @@ pub fn parse(file: FileId, text: &str) -> Result<Manifest, Vec<Diagnostic>> {
                         (k, _) => {
                             other = true;
                             errors.push(
-                            Diagnostic::new(codes::E0219, kspan, format!("a dependency has a `path` or `workspace = true`, not `{k}`"))
+                            Diagnostic::new(codes::E0219, kspan, format!("a dependency has a `path` or `workspace = true`, not `{k}`")).with_help(format!("write `name = {{ path = \"../name\" }}`, or `name = {{ workspace = true }}` in a workspace; remove `{k}`"))
                                 .with_note("dependencies are local packages; versions and registries come later (#31)"),
                             )
                         }

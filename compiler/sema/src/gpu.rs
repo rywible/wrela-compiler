@@ -182,7 +182,7 @@ pub fn not_varying(p: &Program, field: &str, ty: TyId, span: Span) -> Diagnostic
             "the vertex output's `{field}` is a `{}`, which can't pass to the fragment shader",
             p.display_ty(ty)
         ),
-    )
+    ).with_help("pass numbers, vectors, matrices, or structs and tuples of those: an array's elements as fields of their own, a `bool` as a `u32`")
     .with_note(
         "WGSL passes numbers and vectors between stages (`f32`, `i32`, `u32`, `vec3`, `vec3i`, \
          `vec3u`), and wrela matrices and structs of them too, each interpolated or in a \
@@ -464,7 +464,8 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                      `WithDepth` of a `vec4` or a `u32` and a depth"
                 ),
             )
-            .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, a `u32` is an `R32Uint` texture's texel, and `std::gpu::WithDepth<C>` writes its `C` with a depth of its own"),
+            .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, a `u32` is an `R32Uint` texture's texel, and `std::gpu::WithDepth<C>` writes its `C` with a depth of its own")
+            .with_help("return one of those: `-> vec4` for a colour"),
             )
         }
         _ => {}
@@ -585,7 +586,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 codes::E0602,
                 ps.span,
                 format!("{stage} can't take `{}`: {why}", p.display_ty(ps.ty)),
-            ));
+            ).with_help("give it to a `@compute` kernel instead, or pass what the shader reads as a buffer it borrows"));
         }
     }
 }

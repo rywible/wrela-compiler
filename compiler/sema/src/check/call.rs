@@ -1040,15 +1040,22 @@ impl<'p> Checker<'p> {
                 let locals = def.params.clone();
                 let (params, ret, modes) = self.closure_sig(def);
                 if params.len() != ps.len() {
-                    self.err(Diagnostic::new(
-                        codes::E0301,
-                        e.span,
-                        format!(
-                            "this closure takes {} parameters, but {} are expected",
-                            params.len(),
-                            ps.len()
-                        ),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0301,
+                            e.span,
+                            format!(
+                                "this closure takes {} parameters, but {} are expected",
+                                params.len(),
+                                ps.len()
+                            ),
+                        )
+                        .with_help(format!(
+                            "write {} parameters, as in `|{}| ...`",
+                            ps.len(),
+                            (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
+                        )),
+                    );
                     return;
                 }
                 if let Some((i, mode)) =
@@ -1063,7 +1070,7 @@ impl<'p> Checker<'p> {
                             "this closure takes `{name}` as `{}`, but the function type passes it {want}",
                             mode.keyword()
                         ),
-                    ));
+                    ).with_help(format!("declare the parameter as the function type passes it: {want}")));
                     return;
                 }
                 for (l, &pt) in params.iter().zip(ps) {
@@ -1089,7 +1096,7 @@ impl<'p> Checker<'p> {
                                 p.name,
                                 p.mode.keyword()
                             ),
-                        )
+                        ).with_help(format!("declare `{}` as the function type passes it: {want}", p.name))
                         .with_help(format!("pass a closure that calls it: `|..| {fname}(..)`")),
                     );
                     return;
@@ -1409,11 +1416,14 @@ impl<'p> Checker<'p> {
                 Some(n) => match names.iter().position(|p| *p == n.name) {
                     Some(i) if slots[i].is_none() && !written.contains(&i) => i,
                     Some(_) => {
-                        self.err(Diagnostic::new(
-                            codes::E0304,
-                            n.span,
-                            format!("`{}` is given twice", n.name),
-                        ));
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0304,
+                                n.span,
+                                format!("`{}` is given twice", n.name),
+                            )
+                            .with_help("give each argument once: remove one of them"),
+                        );
                         ok = false;
                         continue;
                     }
@@ -1698,22 +1708,33 @@ impl<'p> Checker<'p> {
                 let col = self.p.types.vec(r);
                 let name = self.display(ty);
                 if args.len() != c as usize {
-                    self.err(Diagnostic::new(
-                        codes::E0323,
-                        span,
-                        format!("`{name}` is built from {c} column vectors, each a `vec{r}`"),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0323,
+                            span,
+                            format!("`{name}` is built from {c} column vectors, each a `vec{r}`"),
+                        )
+                        .with_help(format!(
+                            "pass {c} `vec{r}`s, or {} numbers, one column after another",
+                            c * r
+                        )),
+                    );
                     return self.error_expr(span);
                 }
                 let mut cols = Vec::new();
                 for a in args {
                     // Columns are positional: a name would read as a choice of column.
                     if let Some(label) = &a.name {
-                        self.err(Diagnostic::new(
-                            codes::E0302,
-                            label.span,
-                            format!("`{name}` takes its {c} columns as positional arguments"),
-                        ));
+                        self.err(
+                            Diagnostic::new(
+                                codes::E0302,
+                                label.span,
+                                format!("`{name}` takes its {c} columns as positional arguments"),
+                            )
+                            .with_help(format!(
+                                "remove the label: `{name}(c0, c1, ...)` takes its columns in order"
+                            )),
+                        );
                     }
                     cols.push(self.check_expect(&a.value, col));
                 }
@@ -1838,11 +1859,14 @@ impl<'p> Checker<'p> {
                 };
                 let x = self.check_expect(&a.value, comp);
                 if comps[i].is_some() {
-                    self.err(Diagnostic::new(
-                        codes::E0304,
-                        field.span,
-                        format!("`{}` is given twice", field.name),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0304,
+                            field.span,
+                            format!("`{}` is given twice", field.name),
+                        )
+                        .with_help("give each component once: remove one of them"),
+                    );
                     continue;
                 }
                 comps[i] = Some(x);
@@ -1979,11 +2003,14 @@ impl<'p> Checker<'p> {
             Assoc::Ambiguous => self.failed_call(args, span),
             Assoc::Missing => {
                 let shown = self.display(ty);
-                self.err(Diagnostic::new(
-                    codes::E0207,
-                    name.span,
-                    format!("`{shown}` has no associated function `{}`", name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0207,
+                        name.span,
+                        format!("`{shown}` has no associated function `{}`", name.name),
+                    )
+                    .with_help(format!("`wrela doc {shown}` lists what it has")),
+                );
                 self.failed_call(args, span)
             }
         }
@@ -3145,11 +3172,14 @@ impl<'p> Checker<'p> {
                 Lang::DrawArgs => "a draw's",
                 _ => "an indexed draw's",
             };
-            self.err(Diagnostic::new(
-                codes::E0603,
-                e.span,
-                format!("{what} arguments are {}, and these are {}", name(want), name(got)),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0603,
+                    e.span,
+                    format!("{what} arguments are {}, and these are {}", name(want), name(got)),
+                )
+                .with_help(format!("pass a buffer of {}", name(want))),
+            );
         }
     }
 
@@ -3336,11 +3366,16 @@ impl<'p> Checker<'p> {
             }
             let e = self.check_expr(&a.value, None);
             if groups.is_some() {
-                self.err(Diagnostic::new(
-                    codes::E0304,
-                    a.span,
-                    "`dispatch` takes `groups:` or `over:`, once",
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0304,
+                        a.span,
+                        "`dispatch` takes `groups:` or `over:`, once",
+                    )
+                    .with_help(
+                        "give one of them: `groups:` counts workgroups, `over:` counts invocations",
+                    ),
+                );
                 continue;
             }
             if a.name.as_ref().is_some_and(|n| n.name == "over") {
@@ -3414,7 +3449,7 @@ impl<'p> Checker<'p> {
                 codes::E0300,
                 e.span,
                 format!("`over:` is a count, a `(u32, u32)`, a `(u32, u32, u32)` or a texture, not `{shown}`"),
-            ));
+            ).with_help("pass the count of invocations (`over: n`), a size as a tuple (`over: (w, h)`), or the texture written"));
         }
         // A kernel known only as a bound kernel's type is checked when lowering knows it.
         let Some(kernel) = kernel else { return };
@@ -3552,7 +3587,7 @@ impl<'p> Checker<'p> {
                         codes::E0603,
                         x.span,
                         format!("this fragment shader takes `{takes}` from the vertex shader, which gives `{gives}`"),
-                    ));
+                    ).with_help(format!("make the fragment shader take `{gives}`, or the vertex shader give `{takes}`")));
                 }
             }
         }
@@ -3585,11 +3620,10 @@ impl<'p> Checker<'p> {
             // A count given twice is still checked, for its own errors.
             let twice = seen.contains(&n.name.as_str());
             if twice {
-                self.err(Diagnostic::new(
-                    codes::E0304,
-                    a.span,
-                    format!("`{}` is given twice", n.name),
-                ));
+                self.err(
+                    Diagnostic::new(codes::E0304, a.span, format!("`{}` is given twice", n.name))
+                        .with_help("give each argument once: remove one of them"),
+                );
             } else {
                 seen.push(&n.name);
             }
@@ -3674,7 +3708,7 @@ impl<'p> Checker<'p> {
                     codes::E0603,
                     span,
                     "an indexed draw takes its counts from `indirect:`",
-                )
+                ).with_help("pass `indirect:` with a buffer of `DrawIndexedArgs`, or draw without `indices:`")
                 .with_note("the buffer holds the index count, the instance count, the first index, the base vertex and the first instance"),
             );
         }
@@ -3733,7 +3767,8 @@ impl<'p> Checker<'p> {
                     e.span,
                     format!("`{name}:` takes {takes}, not a `{shown}`"),
                 )
-                .with_note(note),
+                .with_note(note)
+                .with_help(format!("pass `{name}:` {takes}")),
             );
         }
         e

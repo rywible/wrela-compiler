@@ -682,7 +682,7 @@ impl<'p> Checker<'p> {
                     codes::E0505,
                     place.span,
                     "can't assign to part of a temporary value",
-                )
+                ).with_help("bind the value to a `var` first (`var x = ...`), then change `x`'s part")
                 .with_note(format!("{name} returns a value, not a projection, so the change would be lost"))
             }
             ExprKind::Const(c) => Diagnostic::new(
@@ -691,7 +691,7 @@ impl<'p> Checker<'p> {
                 format!("can't assign to the constant `{}`", self.p.const_(*c).name),
             )
             .with_help("copy it into a `var` to change it"),
-            _ => Diagnostic::new(codes::E0505, place.span, "can't assign to a temporary value")
+            _ => Diagnostic::new(codes::E0505, place.span, "can't assign to a temporary value").with_help("assign to a `var` instead: bind the value first (`var x = ...`), then change `x`")
                 .with_note("an assignment's target is a place: a variable, or a field, component or element of one"),
         };
         self.err(d);
@@ -1318,9 +1318,15 @@ pub(crate) fn adt_bounds(p: &Program, ty: TyId, span: Span, out: &mut Vec<Diagno
                     "`{t}` doesn't implement `{tr}`, which `{}` in `{}` needs",
                     param.name, adt.name
                 );
+                let help = format!(
+                    "use a type that implements `{tr}` for `{}`, or implement it: `impl {tr} for {t}`",
+                    param.name
+                );
                 out.push(match p.custom_message(arg, &r) {
-                    Some(msg) => Diagnostic::new(codes::E0400, span, msg).with_note(default),
-                    None => Diagnostic::new(codes::E0400, span, default),
+                    Some(msg) => {
+                        Diagnostic::new(codes::E0400, span, msg).with_note(default).with_help(help)
+                    }
+                    None => Diagnostic::new(codes::E0400, span, default).with_help(help),
                 });
             }
         }
@@ -1382,7 +1388,7 @@ fn check_borrow_structs(p: &Program) -> Vec<Diagnostic> {
                         codes::E0327,
                         f.span,
                         format!("`{}` is a borrow struct, a projection, so it can't be a field of an ordinary type", p.display_ty(f.ty)),
-                    )
+                    ).with_help("make the outer type a borrow struct too (`borrow struct`), or hold the borrowed value's owner instead")
                     .with_note("a borrow struct lives only as long as the places it borrows (§6.6)"),
                 );
             }

@@ -1812,6 +1812,11 @@ impl<'a> FnCheck<'a> {
                         "an element can't be moved out on its own; the array would have a hole",
                     );
                     let d = self.clone_help(d, place, &what);
+                    let d = if d.help.is_empty() {
+                        d.with_help("`std::collections::replace(mut xs[i], value)` takes an element out and leaves another in its place")
+                    } else {
+                        d
+                    };
                     self.err(d);
                 }
                 return;

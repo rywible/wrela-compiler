@@ -2734,7 +2734,7 @@ fn span_read_on_cpu(span: Span, note: &str) -> Diagnostic {
         codes::E0607,
         span,
         "a `GpuSpan`'s elements are read in GPU code, and this is CPU code",
-    )
+    ).with_help("read it in a kernel or a shader, or read the buffer back with `std::gpu::read`, answered on a later frame (§17)")
     .with_note(note)
 }
 

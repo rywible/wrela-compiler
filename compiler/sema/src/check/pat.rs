@@ -192,7 +192,7 @@ impl<'p> Checker<'p> {
                             codes::E0320,
                             span,
                             format!("a tuple of {} doesn't match `{shown}`", ps.len()),
-                        ));
+                        ).with_help("match it with a pattern of its own type: a name, a literal, or the type's variants"));
                         return self.unmatched(pat, ty);
                     }
                 };
@@ -394,7 +394,7 @@ impl<'p> Checker<'p> {
                             codes::E0006,
                             lit.span,
                             "this integer is too large for any integer type",
-                        ));
+                        ).with_help("write a smaller number: the widest integers, `i64` and `u64`, hold 64 bits"));
                         return None;
                     }
                 };
@@ -412,7 +412,8 @@ impl<'p> Checker<'p> {
                                     lit.span,
                                     format!("`-` doesn't apply to `{shown}`"),
                                 )
-                                .with_note("unsigned integers can't be negative"),
+                                .with_note("unsigned integers can't be negative")
+                                .with_help("match a value it can hold, or make the matched value signed, such as `i32`"),
                             );
                             return None;
                         }
@@ -479,11 +480,14 @@ impl<'p> Checker<'p> {
             } else {
                 format!("`{} {{ .. }}`", variant.name)
             };
-            self.err(Diagnostic::new(
-                codes::E0320,
-                span,
-                format!("`{}` holds values; match it with {how}", variant.name),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0320,
+                    span,
+                    format!("`{}` holds values; match it with {how}", variant.name),
+                )
+                .with_help(format!("write {how}, `_` for each value it holds you don't need")),
+            );
         }
         Pat { ty, kind: PatKind::Adt { adt: a, args, variant: Some(v), fields: Vec::new() }, span }
     }
@@ -555,21 +559,27 @@ impl<'p> Checker<'p> {
         let mut out = Vec::new();
         for f in fields {
             let Some(i) = decls.iter().position(|d| d.name == f.name.name) else {
-                self.err(Diagnostic::new(
-                    codes::E0206,
-                    f.name.span,
-                    format!("`{}` has no field `{}`", self.p.adt(a).name, f.name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0206,
+                        f.name.span,
+                        format!("`{}` has no field `{}`", self.p.adt(a).name, f.name.name),
+                    )
+                    .with_help(format!("`wrela doc {}` lists its fields", self.p.adt(a).name)),
+                );
                 self.declare_unmatched_field(f);
                 continue;
             };
             // Exhaustiveness sees one pattern per field.
             if out.iter().any(|(j, _)| *j as usize == i) {
-                self.err(Diagnostic::new(
-                    codes::E0308,
-                    f.name.span,
-                    format!("the field `{}` is matched twice", f.name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0308,
+                        f.name.span,
+                        format!("the field `{}` is matched twice", f.name.name),
+                    )
+                    .with_help("match each field once: remove one of them"),
+                );
                 self.declare_unmatched_field(f);
                 continue;
             }

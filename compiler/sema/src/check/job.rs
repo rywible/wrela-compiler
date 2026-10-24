@@ -158,7 +158,7 @@ pub fn check_jobs(p: &crate::Program) -> Vec<Diagnostic> {
         };
         if let Some(why) = why {
             out.push(
-                Diagnostic::new(codes::E0336, at, format!("`{}` can't be a job: {why}", def.name))
+                Diagnostic::new(codes::E0336, at, format!("`{}` can't be a job: {why}", def.name)).with_help("a job is a free `@job fn` whose result is owned: make it one, or call this code from one")
                     .with_secondary(def.sig_span, "declared here"),
             );
         }

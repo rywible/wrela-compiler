@@ -150,7 +150,7 @@ impl<'p> Checker<'p> {
                             codes::E0300,
                             span,
                             format!("this array is `[_; {n}]`, and {} elements are written before its fill", xs.len()),
-                        ));
+                        ).with_help(format!("write at most {} elements before `..fill`, or make the array longer", n.saturating_sub(1))));
                         xs.len() as u32
                     }
                     None => {
@@ -305,7 +305,9 @@ impl<'p> Checker<'p> {
             }
         } else if !crate::traits::implements_builtin(self.p, t, Lang::Copy) {
             let shown = self.display(ty);
-            self.err(Diagnostic::new(codes::E0400, span, msg(&shown)));
+            self.err(Diagnostic::new(codes::E0400, span, msg(&shown)).with_help(format!(
+                "a `Copy` type declares it (`struct S: Copy`) and its fields are `Copy`; or write each value out, `{shown}`s made one by one"
+            )));
         }
     }
 
@@ -346,7 +348,7 @@ impl<'p> Checker<'p> {
                             codes::E0006,
                             span,
                             "this integer is too large for any integer type",
-                        ));
+                        ).with_help("write a smaller number: the widest integers, `i64` and `u64`, hold 64 bits; a float (`1.0e20`) holds larger"));
                         return self.error_expr(span);
                     }
                 };
@@ -634,7 +636,7 @@ impl<'p> Checker<'p> {
                             codes::E0606,
                             span,
                             format!("`{}` is a GPU entry point, not a value", def.name),
-                        )
+                        ).with_help("record it with `dispatch(name.bind(...), groups: n)` or a draw, or bind it to pass around: `name.bind(...)`")
                         .with_note("entry points run on the GPU and can't be called directly"),
                     );
                     return self.error_expr(span);
@@ -751,11 +753,18 @@ impl<'p> Checker<'p> {
                 if let Some(e) = self.associated_fn_value(ty, &name, generics, span) {
                     return e;
                 }
-                self.err(Diagnostic::new(
-                    codes::E0207,
-                    name.span,
-                    format!("`{}` has no associated function `{}`", self.display(ty), name.name),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0207,
+                        name.span,
+                        format!(
+                            "`{}` has no associated function `{}`",
+                            self.display(ty),
+                            name.name
+                        ),
+                    )
+                    .with_help(format!("`wrela doc {}` lists what it has", self.display(ty))),
+                );
                 self.error_expr(span)
             }
             ValueRes::TraitRelative(t, name) => {
@@ -918,6 +927,12 @@ impl<'p> Checker<'p> {
                 d = d
                     .with_note("unsigned integers can't be negative")
                     .with_help("use a signed type such as `i32`");
+            } else if op == UnOp::Neg && matches!(k, TyKind::Vec(VecElem::U32, _)) {
+                d = d.with_help("use a signed vector such as `vec3i`, or subtract from another");
+            } else if op == UnOp::Neg {
+                d = d.with_help("`-` takes a signed integer, a float, a vector or a matrix");
+            } else {
+                d = d.with_help("`!` takes a `bool`, or an integer to flip its bits");
             }
             self.err(d);
         }
@@ -1150,6 +1165,23 @@ impl<'p> Checker<'p> {
                 d = d.with_help(
                     "both sides must have the same integer type; convert one, as in `u32(x)`",
                 );
+            } else if op == BinOp::BitXor {
+                d = d.with_help("`^` is bitwise xor, which takes integers; a power is `x ** y`");
+            } else if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr) {
+                d = d.with_help(
+                    "bitwise operators and shifts take integers and integer vectors; convert first, as in `u32(x)`",
+                );
+            } else if op == BinOp::Mul
+                && (matches!(ka, TyKind::Mat(..)) || matches!(kb, TyKind::Mat(..)))
+            {
+                d = d.with_help(
+                    "`matCxR * vecC` is a `vecR`, `vecR * matCxR` a `vecC`, and `matCxR * matKxC` a `matKxR`",
+                );
+            } else {
+                d = d.with_help(format!(
+                    "`{}` takes two values of one number or vector type: convert one side to the other's",
+                    op.text()
+                ));
             }
             this.err(d);
             None
@@ -1435,11 +1467,20 @@ impl<'p> Checker<'p> {
             (TyKind::Tuple(ts), ast::FieldName::Index(i, s)) => match ts.get(*i as usize) {
                 Some(&t) => Expr { ty: t, span, kind: ExprKind::Field(Box::new(b), *i) },
                 None => {
-                    self.err(Diagnostic::new(
-                        codes::E0206,
-                        *s,
-                        format!("this tuple has {} elements, so `.{i}` doesn't exist", ts.len()),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0206,
+                            *s,
+                            format!(
+                                "this tuple has {} elements, so `.{i}` doesn't exist",
+                                ts.len()
+                            ),
+                        )
+                        .with_help(format!(
+                            "its elements are `.0` to `.{}`",
+                            ts.len().saturating_sub(1)
+                        )),
+                    );
                     self.error_expr(span)
                 }
             },
@@ -1551,6 +1592,10 @@ impl<'p> Checker<'p> {
                 if !names.is_empty() {
                     d = d.with_note(format!("its fields are {}", names.join(", ")));
                 }
+                d = d.with_help(format!(
+                    "name one of its fields: `wrela doc {}` lists them",
+                    self.p.adt(a).name
+                ));
             }
             self.err(d);
             return None;
@@ -1588,11 +1633,16 @@ impl<'p> Checker<'p> {
         };
         if self.p.adt(a).is_enum() {
             let name = self.p.adt(a).name.clone();
-            self.err(Diagnostic::new(
-                codes::E0206,
-                n.span,
-                format!("`{name}` has no field `{}`", n.name),
-            ));
+            self.err(
+                Diagnostic::new(
+                    codes::E0206,
+                    n.span,
+                    format!("`{name}` has no field `{}`", n.name),
+                )
+                .with_help(format!(
+                    "`{name}` is an enum: `match` on it to reach a variant's fields"
+                )),
+            );
             return self.error_expr(span);
         }
         let Some(i) = self.struct_field(a, n) else { return self.error_expr(span) };
@@ -1850,6 +1900,7 @@ impl<'p> Checker<'p> {
                         n.span,
                         format!("`{}` has no field `{}`", adt.name, n.name),
                     )
+                    .with_help(format!("`wrela doc {}` lists its fields", adt.name))
                     .with_note(format!("its fields: {}", names.join(", "))),
                 );
                 None
@@ -1966,11 +2017,18 @@ impl<'p> Checker<'p> {
                 if !missing.is_empty() {
                     let names: Vec<String> =
                         missing.iter().map(|v| format!("`{}`", v.name)).collect();
-                    self.err(Diagnostic::new(
-                        codes::E0307,
-                        span,
-                        format!("this `{}` is missing {}", self.p.adt(adt).name, names.join(", ")),
-                    ));
+                    self.err(
+                        Diagnostic::new(
+                            codes::E0307,
+                            span,
+                            format!(
+                                "this `{}` is missing {}",
+                                self.p.adt(adt).name,
+                                names.join(", ")
+                            ),
+                        )
+                        .with_help(format!("give {} too", names.join(", "))),
+                    );
                 }
                 word.unwrap_or_else(|| self.u32_lit(0, span))
             }
@@ -2096,6 +2154,11 @@ impl<'p> Checker<'p> {
                     resolve::closest(&f.name.name, decls.iter().map(|d| d.name.as_str()))
                 {
                     d = d.with_fix(format!("did you mean `{s}`?"), f.name.span, s);
+                } else {
+                    d = d.with_help(format!(
+                        "give only its fields: `wrela doc {}` lists them",
+                        self.p.adt(adt).name
+                    ));
                 }
                 self.err(d);
                 continue;
@@ -2417,7 +2480,7 @@ impl<'p> Checker<'p> {
                                 codes::E0400,
                                 x.span,
                                 format!("`{shown}` can't go in an f-string: it doesn't implement `Format`"),
-                            )
+                            ).with_help(format!("implement `std::fmt::Format` for `{shown}`, or put its fields in the f-string instead"))
                             .with_note("numbers, `bool`, vectors and text implement it (§4)"),
                         );
                         continue;
@@ -2545,7 +2608,7 @@ impl<'p> Checker<'p> {
                         codes::E0300,
                         x.span,
                         format!("`?` takes an `Option` or a `Result`, not `{shown}`"),
-                    )
+                    ).with_help("`?` goes after a call that gives an `Option` or a `Result`; match on other values instead")
                     .with_note("`x?` is `x`'s value, or a return of its `None` or `Err` (§10)"),
                 );
                 return self.error_expr(span);
@@ -2697,15 +2760,22 @@ impl<'p> Checker<'p> {
                 Some((ps.clone(), *r, *flags))
             }
             Some(TyKind::FnPtr(ps, _, _)) => {
-                self.err(Diagnostic::new(
-                    codes::E0301,
-                    span,
-                    format!(
-                        "this closure takes {} parameters, but {} are expected",
-                        params.len(),
-                        ps.len()
-                    ),
-                ));
+                self.err(
+                    Diagnostic::new(
+                        codes::E0301,
+                        span,
+                        format!(
+                            "this closure takes {} parameters, but {} are expected",
+                            params.len(),
+                            ps.len()
+                        ),
+                    )
+                    .with_help(format!(
+                        "write {} parameters, as in `|{}| ...`",
+                        ps.len(),
+                        (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
+                    )),
+                );
                 None
             }
             // Expected where a type failed (its error is reported): the closure's unannotated
@@ -2753,6 +2823,7 @@ impl<'p> Checker<'p> {
                         p.name.span,
                         format!("`{}` is a parameter of this closure twice", p.name.name),
                     )
+                    .with_help("give each parameter its own name")
                     .with_secondary(first.name.span, "first here"),
                 );
             }

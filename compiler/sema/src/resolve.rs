@@ -474,19 +474,23 @@ pub fn resolve_module_path_in(
                     if !final_pass {
                         return PathLookup::NotYet(m, seg.name.clone());
                     }
-                    let mut d = Diagnostic::new(
+                    let d = Diagnostic::new(
                         codes::E0200,
                         seg.span,
                         format!("`{}` has no item `{}`", module.name(), seg.name),
                     );
-                    let names: Vec<&str> = module
+                    let names = module
                         .scope
                         .keys()
                         .map(String::as_str)
-                        .chain(module.children.keys().map(String::as_str))
-                        .collect();
-                    if let Some(s) = closest(&seg.name, names.into_iter()) {
-                        d = d.with_fix(format!("did you mean `{s}`?"), seg.span, s);
+                        .chain(module.children.keys().map(String::as_str));
+                    let mut d = suggest_or_list(d, &seg.name, seg.span, names, "its items are");
+                    if d.help.is_empty() && d.fixes.is_empty() {
+                        d = d.with_help(format!(
+                            "`{}` has nothing in it yet: declare `{}` there",
+                            module.name(),
+                            seg.name
+                        ));
                     }
                     return PathLookup::Error(Box::new(d));
                 }
@@ -583,11 +587,17 @@ pub(crate) fn resolve_generic_arg(
             && let Some(g) = scope.param(&path.segments[0].ident.name)
             && p.param(g).is_const
         {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                arg.span,
-                format!("`{}` is a constant parameter, not a type", p.param(g).name),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    arg.span,
+                    format!("`{}` is a constant parameter, not a type", p.param(g).name),
+                )
+                .with_help(format!(
+                    "`{}` is a type parameter: pass a type here, such as `f32`",
+                    p.param(param).name
+                )),
+            );
             return p.types.error;
         }
         return resolve_type(p, diags, scope, arg, TyPos::Normal);
@@ -600,7 +610,10 @@ pub(crate) fn resolve_generic_arg(
             {
                 return p.types.intern(TyKind::ConstU32(v));
             }
-            diags.push(Diagnostic::new(codes::E0212, arg.span, "a const argument is a `u32`"));
+            diags.push(
+                Diagnostic::new(codes::E0212, arg.span, "a const argument is a `u32`")
+                    .with_help("pass a whole number from 0 to 4294967295"),
+            );
             return p.types.error;
         }
         ast::TypeExprKind::Path(path) => {
@@ -614,11 +627,20 @@ pub(crate) fn resolve_generic_arg(
                 if p.param(g).is_const {
                     return p.types.param(g);
                 }
-                diags.push(Diagnostic::new(
-                    codes::E0212,
-                    arg.span,
-                    format!("`{}` is a type parameter, not a constant", p.param(g).name),
-                ));
+                diags.push(
+                    Diagnostic::new(
+                        codes::E0212,
+                        arg.span,
+                        format!("`{}` is a type parameter, not a constant", p.param(g).name),
+                    )
+                    .with_help(format!(
+                        "`{}` is `const {}: u32`: pass a number, a `u32` constant or a const parameter, or declare `{}` as `const {}: u32`",
+                        p.param(param).name,
+                        p.param(param).name,
+                        p.param(g).name,
+                        p.param(g).name
+                    )),
+                );
                 return p.types.error;
             }
             if let Some(Res::Const(c)) = resolve_value_item(p, scope.module, path) {
@@ -632,11 +654,18 @@ pub(crate) fn resolve_generic_arg(
         }
         _ => {}
     }
-    diags.push(Diagnostic::new(
-        codes::E0212,
-        arg.span,
-        "a const argument is a number, a `u32` constant or a const parameter",
-    ));
+    diags.push(
+        Diagnostic::new(
+            codes::E0212,
+            arg.span,
+            "a const argument is a number, a `u32` constant or a const parameter",
+        )
+        .with_help(format!(
+            "`{}` is `const {}: u32`, a number, not a type: pass one such as `4`",
+            p.param(param).name,
+            p.param(param).name
+        )),
+    );
     p.types.error
 }
 
@@ -742,6 +771,7 @@ pub fn resolve_trait_ref(
                 te.span,
                 format!("{} isn't a trait", describe_res(p, res)),
             )
+            .with_help("name a trait here: `wrela doc` lists them")
             .with_note("a bound or an opt-in names a trait, such as `Copy` or `Surface`"),
         );
         return None;
@@ -901,11 +931,16 @@ pub fn resolve_type(
             p.types.intern(TyKind::FnPtr(ps, r, flags))
         }
         ast::TypeExprKind::Int(_) => {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                te.span,
-                "a number is a constant generic argument, not a type",
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    te.span,
+                    "a number is a constant generic argument, not a type",
+                )
+                .with_help(
+                    "a type goes here, such as `f32`; a number is for a `const N: u32` parameter",
+                ),
+            );
             p.types.error
         }
         ast::TypeExprKind::Path(path) => resolve_type_path(p, diags, scope, te, path, pos),
@@ -973,7 +1008,10 @@ pub fn length_error(p: &Program, module: ModuleId, len: &ast::Expr) -> Diagnosti
                     codes::E0200,
                     len.span,
                     format!("there's no constant `{name}` here"),
-                );
+                )
+                .with_help(format!(
+                    "declare it (`const {name}: u32 = 4`), or write the number itself"
+                ));
             }
         }
         ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Int(_), .. }) => {
@@ -1227,11 +1265,16 @@ fn resolve_type_path(
         }
     } else if let Some(id) = scope.param(first) {
         if p.param(id).is_const {
-            diags.push(Diagnostic::new(
-                codes::E0212,
-                segs[0].ident.span,
-                format!("`{first}` is a constant parameter, not a type"),
-            ));
+            diags.push(
+                Diagnostic::new(
+                    codes::E0212,
+                    segs[0].ident.span,
+                    format!("`{first}` is a constant parameter, not a type"),
+                )
+                .with_help(format!(
+                    "`{first}` is a number: use it as a length (`[f32; {first}]`) or a value, or declare a type parameter for the type"
+                )),
+            );
             return p.types.error;
         }
         Some(p.types.param(id))
@@ -1317,11 +1360,17 @@ fn resolve_type_path(
                     && let Some(Res::Fn(f)) = resolve_value_item(p, scope.module, path) =>
             {
                 if p.func(f).attrs.job.is_none() {
-                    diags.push(Diagnostic::new(
-                        codes::E0336,
-                        a.span,
-                        format!("`{}` isn't a job: `Job<F>` takes a `@job fn`", p.func(f).name),
-                    ));
+                    diags.push(
+                        Diagnostic::new(
+                            codes::E0336,
+                            a.span,
+                            format!("`{}` isn't a job: `Job<F>` takes a `@job fn`", p.func(f).name),
+                        )
+                        .with_help(format!(
+                            "mark it `@job` (`@job fn {}(...)`), or call it directly",
+                            p.func(f).name
+                        )),
+                    );
                     return p.types.error;
                 }
                 // A generic job's types: `Job<realize<Coat, Fawn>>`.
@@ -1540,7 +1589,7 @@ fn projection(
                     name.name,
                     p.display_ty(base)
                 ),
-            ));
+            ).with_help(format!("rename it in one of the traits, or bound `{}` by only the trait whose `{}` this is", p.display_ty(base), name.name)));
             p.types.error
         }
     }

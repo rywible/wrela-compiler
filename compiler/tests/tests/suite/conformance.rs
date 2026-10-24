@@ -76,8 +76,12 @@ fn load_case(path: &Path) -> Case {
     Case { name, files, accepts, rejects, expected }
 }
 
-/// The errors a case's package gets, through lowering: (file, line) -> codes.
-fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
+/// The codes of the errors at each place: (file, line) -> codes.
+type Errors = BTreeMap<(String, usize), Vec<String>>;
+
+/// The errors a case's package gets, through lowering; and those whose only next step is the
+/// general one (`wrela explain`), which an error a case meets mustn't be.
+fn errors(case: &Case) -> (Errors, Vec<String>) {
     let dir = scratch(&format!("conformance/{}", case.name));
     // An accepting case goes all the way: with a `frame` added if it has none (at the end, so
     // no line moves), and every function lowered and emitted, called or not.
@@ -91,13 +95,17 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
     }
     let built =
         if accepting { wrela_driver::build_every_fn(&dir) } else { wrela_driver::build(&dir) };
-    let mut out: BTreeMap<(String, usize), Vec<String>> = BTreeMap::new();
+    let mut out: Errors = BTreeMap::new();
+    let mut bare = Vec::new();
     // A case is about something else than `frame`, which a program must export: a case
     // without one isn't told so (`a_program_without_frame_is_rejected` is).
     let no_frame = |d: &wrela_diag::Diagnostic| {
         d.code == wrela_diag::codes::E0703 && d.span().is_some_and(|s| s.start == 0 && s.end == 0)
     };
     for d in built.diagnostics.iter().filter(|d| d.is_error() && !no_frame(d)) {
+        if d.has_only_general_help() {
+            bare.push(format!("{} {}", d.code.as_str(), d.message));
+        }
         let Some(span) = d.span() else {
             // An internal error: a case can't expect one.
             out.entry(("<internal>".into(), 0)).or_default().push(d.code.as_str().to_string());
@@ -112,7 +120,7 @@ fn errors(case: &Case) -> BTreeMap<(String, usize), Vec<String>> {
     for codes in out.values_mut() {
         codes.sort();
     }
-    out
+    (out, bare)
 }
 
 #[test]
@@ -124,11 +132,11 @@ fn conformance() {
     // The cases compiled at once; then their rules gathered, in order.
     let checked = par_map(&paths, |path| {
         let case = load_case(path);
-        let got = errors(&case);
-        (case, got)
+        let (got, bare) = errors(&case);
+        (case, got, bare)
     });
     let mut failures = Vec::new();
-    for (case, got) in checked {
+    for (case, got, bare) in checked {
         for r in case.accepts.iter().chain(&case.rejects) {
             assert!(known.contains(r.as_str()), "{}: unknown rule `{r}`", case.name);
         }
@@ -152,6 +160,10 @@ fn conformance() {
                 "{}:\n  expected {:?}\n  got      {:?}",
                 case.name, case.expected, got
             ));
+        }
+        // Every error says what to do about it, more than `wrela explain` (§10.2).
+        for d in bare {
+            failures.push(format!("{}: {d}: its only help is the general one", case.name));
         }
         accepted.extend(case.accepts.iter().cloned());
         rejected.extend(case.rejects.iter().cloned());
