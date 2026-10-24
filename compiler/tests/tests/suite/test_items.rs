@@ -756,3 +756,33 @@ fn the_gpu_reads_constants_that_hold_text() {
     let ran: Vec<_> = out.results.iter().map(|r| (r.name.as_str(), r.failure.is_none())).collect();
     assert_eq!(ran, [("the_gpu_reads_constants_that_hold_text", true)], "{:?}", out.results);
 }
+
+/// A frame test in another module than `main` takes the program's state too, whatever order
+/// the modules' files come in: `checks.wrela` is collected before `main.wrela`.
+#[test]
+fn a_frame_test_in_another_module_takes_the_state() {
+    let dir = package(
+        "test-items/frame-test-elsewhere",
+        "pub struct Game {
+    pub ticks: u32,
+}
+
+pub fn init() -> Game {
+    Game { ticks: 0 }
+}
+
+pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
+    state.ticks += 1
+}
+",
+    );
+    std::fs::write(
+        dir.join("checks.wrela"),
+        "use main::Game\n\n@test(frames: 30)\nfn counts(game: Game) {\n    assert(game.ticks == 30)\n}\n",
+    )
+    .expect("write checks.wrela");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    assert_eq!(out.results.len(), 1);
+    assert!(out.results[0].failure.is_none(), "{:?}", out.results[0].failure);
+}

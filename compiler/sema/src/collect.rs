@@ -1826,15 +1826,9 @@ impl<'d, 'u> Collector<'d, 'u> {
                     for &(fid, f) in methods {
                         self.fn_bounds(fid, f);
                         self.fn_signature(fid, f);
-                        self.test_signature(fid);
                     }
                 }
-                PendingItem::Fn(id, f) => {
-                    self.fn_signature(*id, f);
-                    self.test_signature(*id);
-                    self.test_input(*id);
-                    self.testing_export(*id);
-                }
+                PendingItem::Fn(id, f) => self.fn_signature(*id, f),
                 PendingItem::Adt(id, item) => self.adt_body(*m, *id, item),
                 PendingItem::Alias(..) | PendingItem::TraitSet(..) => {}
                 PendingItem::Const(id, c) => {
@@ -1845,6 +1839,24 @@ impl<'d, 'u> Collector<'d, 'u> {
                         self.p.consts[id.index()].ty = Some(ty);
                     }
                 }
+            }
+        }
+        // A test's signature names the program's state, which `init`'s signature gives, in any
+        // module of the package: so the tests are checked once every signature is resolved,
+        // whatever order the modules' files come in.
+        for (_, item) in &pending {
+            match item {
+                PendingItem::Trait(_, _, methods) | PendingItem::Impl(_, _, methods) => {
+                    for &(fid, _) in methods {
+                        self.test_signature(fid);
+                    }
+                }
+                PendingItem::Fn(id, _) => {
+                    self.test_signature(*id);
+                    self.test_input(*id);
+                    self.testing_export(*id);
+                }
+                _ => {}
             }
         }
     }
