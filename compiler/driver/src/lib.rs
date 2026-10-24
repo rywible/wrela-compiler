@@ -364,16 +364,24 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 }
 
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
-/// it, so a reader sees the old file or the whole new one.
+/// it, so a reader sees the old file or the whole new one. A file that was there keeps its
+/// permissions.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     // A temporary file of this write's own: several threads may write one file at once.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()));
-    std::fs::write(&tmp, bytes).and_then(|()| std::fs::rename(&tmp, path)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp);
-    })
+    let was = std::fs::metadata(path).ok().map(|m| m.permissions());
+    std::fs::write(&tmp, bytes)
+        .and_then(|()| match was {
+            Some(perms) => std::fs::set_permissions(&tmp, perms),
+            None => Ok(()),
+        })
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
 }
 
 /// A new, empty directory of this process's own in the system's temporary directory, named
