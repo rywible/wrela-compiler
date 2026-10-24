@@ -12,8 +12,8 @@
     "ratio": 1.0
   },
   "cells": {
-    "decided": 0.2539,
-    "ratio": 1669886208.0
+    "decided": 0.2734,
+    "ratio": 1659723392.0
   },
   "closures": {
     "decided": 0.9746,
@@ -21,15 +21,15 @@
   },
   "creature": {
     "decided": 0.9551,
-    "ratio": 2.2316
+    "ratio": 2.2023
   },
   "ellipsoid": {
     "decided": 0.9766,
     "ratio": 2.1113
   },
   "fbm": {
-    "decided": 0.9199,
-    "ratio": 2.9237
+    "decided": 0.9219,
+    "ratio": 2.7594
   },
   "grazer": {
     "decided": 0.9121,
@@ -84,8 +84,8 @@
     "ratio": 14.3268
   },
   "value noise": {
-    "decided": 0.2813,
-    "ratio": 2.3474
+    "decided": 0.2832,
+    "ratio": 2.2134
   },
   "vectors": {
     "decided": 0.8047,
