@@ -162,10 +162,13 @@ test("a button, a menu item and the other pressed roles take a pointer where the
     { id: 3, parent: 2, role: Role.MenuItem, label: "Restart" },
     { id: 4, role: Role.Text, label: "Paused" },
     { id: 5, role: Role.Link, label: "Run" },
+    { id: 6, role: Role.ListBox, label: "Results" },
+    { id: 7, parent: 6, role: Role.Option, label: "std::io" },
   ]));
-  o.geometry(geometry([[1, 0, 0, 20, 10], [3, 0, 20, 20, 10], [4, 0, 40, 20, 10], [5, 0, 60, 20, 10]]));
-  // Pressed roles take the pointer; text and a link without an address let it through.
-  expect([1, 3, 4, 5].map((id) => el(id).classes.has("wrela-hit"))).toEqual([true, true, false, false]);
+  o.geometry(geometry([[1, 0, 0, 20, 10], [3, 0, 20, 20, 10], [4, 0, 40, 20, 10], [5, 0, 60, 20, 10], [7, 0, 80, 20, 10]]));
+  // Pressed roles take the pointer; text, a link without an address and an option, which is
+  // selected rather than pressed, let it through to the program's canvas.
+  expect([1, 3, 4, 5, 7].map((id) => el(id).classes.has("wrela-hit"))).toEqual([true, true, false, false, false]);
   // A mouse press doesn't take the focus from the canvas...
   (canvas as unknown as FakeElement).focus();
   const down = domEvent("mousedown", { button: 0 });
