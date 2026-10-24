@@ -40,6 +40,10 @@
 //! wrela solve <package-dir> (--minimize <fn> | --spec) --free <file>:<lines>...
 //!                                         choose literals that minimize a function, or that
 //!                                         make the package's spec hold (§23)
+//! wrela same <package-dir> --against <build-dir> [--frames n] [--within x] [--no-gpu] [--json]
+//!                                         whether the package built now behaves as a saved
+//!                                         build does: the same commands each frame, the
+//!                                         same last frame within x, the same pipelines
 //! wrela trace <package-dir> --watch <export>,...
 //!                                         run frames and print what exports say after each
 //! wrela bisect <package-dir> --until "<export> <op> <number>"
@@ -100,6 +104,7 @@ mod profile;
 mod query;
 mod refactor;
 mod run;
+mod same;
 mod script;
 mod solve;
 mod suite;
@@ -131,6 +136,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",
+        "wrela same <package-dir> --against <build-dir> [--frames n] [--fps f] [--size WxH] [--input <script.json>] [--within x] [--no-gpu] [--json]",
         "wrela suite [fmt | allow | wrela::<package-path>::[<test-name>]] [--workspace <dir>]",
         "wrela tool (<package-dir> | <name>) [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]... [--net HOST]... [--allow-run NAME[=PATH]]... [--browser] [--timeout S] [--workers N] [--blob-budget B] [-- args...]",
         "wrela toolchain",
@@ -194,6 +200,7 @@ fn main() -> ExitCode {
         }
         "suite" => suite::run(rest),
         "run" => run::run(rest),
+        "same" => same::run(rest),
         "tool" => tool::run(rest),
         "solve" => solve::run(rest),
         "script" => script::run(rest),

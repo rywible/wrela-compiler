@@ -10,6 +10,7 @@ mod pipelines;
 mod profile;
 mod query;
 mod refactor;
+mod same;
 mod script;
 mod solve;
 mod suite;

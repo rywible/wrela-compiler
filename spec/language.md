@@ -2922,6 +2922,7 @@ These commands let an agent read what the compiler knows about a package, instea
 | `wrela run <package> [--port N]` | Serves the program lifted on 127.0.0.1 with hot reload (§23.2): a saved literal reaches the running program at its next frame, and any other edit swaps in a new build, in the same page |
 | `wrela trace <package> --watch <exports>` | Runs frames, in lockstep with the program's ticker if it has one (as `wrela-host` does), and prints what the exports say after each frame (`--csv`) |
 | `wrela bisect <package> --until "<export> <op> <number>"` | Finds the first frame at which a condition holds (`nan <export>` too) |
+| `wrela same <package> --against <build-dir>` | Whether the package built now behaves as a saved build of it does (below) |
 | `wrela profile <package> [--frames n]` | Shows where a frame's time goes on this machine (below) |
 | `wrela primer [area]` | Teaches the language area by area: each rule of the conformance suite, with a program that keeps it and one that breaks it |
 
@@ -2936,6 +2937,8 @@ These commands let an agent read what the compiler knows about a package, instea
 It also answers on a program with errors. A function whose body has an error has no memory IR, so what it calls, borrows and does is not known. An answer that such a function, or an error outside every body, could change lists those errors as `unsure`.
 
 **`wrela refactor`** plans the change and checks the new texts before it writes anything. It refuses the change, with the errors, if the program would not check, and refuses it if a call would quietly bind to another function. `--dry-run --json` gives a plan with each file's hash; `apply <plan>` refuses the plan if a file has changed since.
+
+**`wrela same`** runs a saved build (`wrela build -o <dir>`) and the package built now, from `init`, on one worker, each with storage of its own and the same input (`--input`), for `--frames` frames (60 unless said), numbered from 0. Two builds are the same when every command byte each submits is the same, frame by frame, their last frames are within a tolerance (`--within`, a mean over every channel in 8-bit steps, 0.5 unless said, as a golden is compared), and they reach the same pipelines. It reports the first frame whose commands differ, how far the last frames are apart, and the pipelines added or removed (`--json` for tools); with `--no-gpu`, or for a program with no pipelines, it compares the commands only. So a refactor, a change to std or a new toolchain can be checked to keep what a program does.
 
 **`wrela profile`** builds the program as `wrela build` builds it and runs it on the native host's GPU. It reports:
 
