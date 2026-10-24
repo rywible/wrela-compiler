@@ -1,0 +1,98 @@
+{
+  "blob": {
+    "decided": 0.9727,
+    "ratio": 1.2223
+  },
+  "blob (tape)": {
+    "decided": 0.9102,
+    "ratio": 1.0465
+  },
+  "branchy": {
+    "decided": 0.7188,
+    "ratio": 1.0
+  },
+  "cells": {
+    "decided": 0.2539,
+    "ratio": 1669886208.0
+  },
+  "closures": {
+    "decided": 0.9746,
+    "ratio": 1.0085
+  },
+  "creature": {
+    "decided": 0.9551,
+    "ratio": 2.2316
+  },
+  "ellipsoid": {
+    "decided": 0.9766,
+    "ratio": 2.1113
+  },
+  "fbm": {
+    "decided": 0.9199,
+    "ratio": 2.9237
+  },
+  "grazer": {
+    "decided": 0.9121,
+    "ratio": 1.4455
+  },
+  "hoof": {
+    "decided": 0.9961,
+    "ratio": 1.0052
+  },
+  "hyperbolic": {
+    "decided": 0.8477,
+    "ratio": 1.0
+  },
+  "logs": {
+    "decided": 0.9375,
+    "ratio": 1.1265
+  },
+  "pieces": {
+    "decided": 0.6855,
+    "ratio": 1.9496
+  },
+  "powers": {
+    "decided": 0.8555,
+    "ratio": 1.0599
+  },
+  "rational": {
+    "decided": 0.6875,
+    "ratio": 2.9827
+  },
+  "round cone": {
+    "decided": 0.9629,
+    "ratio": 1.5892
+  },
+  "sphere": {
+    "decided": 0.9629,
+    "ratio": 1.0
+  },
+  "sphere (tape)": {
+    "decided": 0.918,
+    "ratio": 1.0
+  },
+  "table": {
+    "decided": 0.9063,
+    "ratio": 3.2483
+  },
+  "trig": {
+    "decided": 0.6348,
+    "ratio": 14.3268
+  },
+  "value noise": {
+    "decided": 0.2813,
+    "ratio": 2.3474
+  },
+  "vectors": {
+    "decided": 0.8047,
+    "ratio": 2.9745
+  },
+  "waves": {
+    "decided": 0.6953,
+    "ratio": 1.0212
+  },
+  "waves (tape)": {
+    "decided": 0.6914,
+    "ratio": 1.024
+  }
+}
