@@ -68,6 +68,7 @@ pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
     run_bodies(p, body, None, &mut |diags, _| out.extend(diags));
     out.extend(unused_locals(p, body));
     out.extend(unchanged_vars(body));
+    out.extend(read_only_clones(p, body));
     out
 }
 
@@ -2321,6 +2322,135 @@ fn unchanged_vars(body: &Body) -> Vec<Diagnostic> {
             )
             .with_note("`let` owns a value that stays as it is; `var` says it will change (§6.3)")
             .with_fix("make it a `let`", kw, "let"),
+        );
+    }
+    out
+}
+
+/// W0010: `let x = place.clone()` where `x` is only ever read, and so is `place`: nothing
+/// assigns either again, writes through it, lends it `mut`, moves out of it, or captures it,
+/// and `x` isn't returned. Then `borrow x = place` reads the same values without copying them.
+/// Anything that could make the copy necessary keeps the warning away (a write to the source
+/// while the copy lives, a move of the copy), so the check is of whole bodies, not of where the
+/// copy is live. A `Copy` value's copy is cheap and isn't reported. It has no fix: whether a
+/// borrow is what's meant is the author's call.
+fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
+    let clone_trait = p.lang_trait(Lang::Clone);
+    let is_clone = |c: &Callee| match c {
+        Callee::Clone => true,
+        Callee::TraitMethod { method, .. } => {
+            matches!(p.func(*method).owner, crate::defs::FnOwner::Trait(t) if Some(t) == clone_trait)
+        }
+        _ => false,
+    };
+    let n = body.locals.len();
+    // What each projection local aliases (`Bind`), to find a clone's source by its own local.
+    let mut alias: HashMap<Local, Place> = HashMap::new();
+    // A temporary that holds a clone: the place cloned, and the call's and the place's spans.
+    let mut clone_of: HashMap<Local, (Place, Span, Span)> = HashMap::new();
+    // The candidates: a `let` local given a clone, with its source, call span and place span.
+    let mut copies: Vec<(Local, Place, Span, Span)> = Vec::new();
+    // Locals that something writes, moves, lends `mut`, captures or returns.
+    let mut touched = vec![false; n];
+    let mut assigned = vec![0u32; n];
+    let resolve = |alias: &HashMap<Local, Place>, place: &Place| -> Place {
+        let mut at = place.clone();
+        for _ in 0..16 {
+            match alias.get(&at.local) {
+                Some(a) => {
+                    let mut p = a.clone();
+                    p.proj.extend(at.proj.iter().cloned());
+                    at = p;
+                }
+                None => break,
+            }
+        }
+        at
+    };
+    let moved = |o: &Operand, touched: &mut Vec<bool>| {
+        if let OperandKind::Move(pl, _) = &o.kind {
+            touched[pl.local.index()] = true;
+        }
+    };
+    for f in &body.fns {
+        for b in &f.blocks {
+            for s in &b.stmts {
+                match &s.kind {
+                    StatementKind::Bind { local, place, mutable } => {
+                        alias.insert(*local, resolve(&alias, place));
+                        if *mutable {
+                            touched[place.local.index()] = true;
+                        }
+                    }
+                    StatementKind::Assign(place, r) => {
+                        if place.proj.is_empty() {
+                            assigned[place.local.index()] += 1;
+                        } else {
+                            touched[place.local.index()] = true;
+                        }
+                        rvalue_writes(r, &mut |w| touched[w.local.index()] = true);
+                        r.for_each_operand(&mut |o| moved(o, &mut touched));
+                        match r {
+                            Rvalue::Call(c) if is_clone(&c.callee) && place.proj.is_empty() => {
+                                if let [Arg::Borrow(src, at)] = c.args.as_slice() {
+                                    clone_of
+                                        .insert(place.local, (resolve(&alias, src), c.span, *at));
+                                }
+                            }
+                            Rvalue::Use(Operand { kind: OperandKind::Move(tmp, _), .. })
+                                if place.proj.is_empty() && tmp.proj.is_empty() =>
+                            {
+                                if let Some((src, call, at)) = clone_of.get(&tmp.local) {
+                                    copies.push((place.local, src.clone(), *call, *at));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    StatementKind::Eval(r) => {
+                        rvalue_writes(r, &mut |w| touched[w.local.index()] = true);
+                        r.for_each_operand(&mut |o| moved(o, &mut touched));
+                    }
+                    _ => {}
+                }
+            }
+            if let TerminatorKind::Return(Some(o)) = &b.term.kind {
+                // Returned: the copy leaves, which a borrow couldn't.
+                if let Some(pl) = o.place() {
+                    touched[pl.local.index()] = true;
+                }
+            }
+        }
+    }
+    for c in &body.closures {
+        for &(l, _) in &c.captures {
+            touched[l.index()] = true;
+        }
+    }
+    let named = |l: Local| matches!(body.local(l).kind, LocalKind::User(_));
+    let mut out = Vec::new();
+    for (x, src, call, at) in copies {
+        let d = body.local(x);
+        let only_let = matches!(d.kind, LocalKind::User(thir::LocalKind::Owned { mutable: false }));
+        if !only_let
+            || d.name.starts_with('_')
+            || assigned[x.index()] > 1
+            || touched[x.index()]
+            || touched[src.local.index()]
+            || !named(src.local)
+            || crate::traits::implements_builtin(p, d.ty, Lang::Copy)
+        {
+            continue;
+        }
+        let place = p.text(at).unwrap_or("the place").to_string();
+        out.push(
+            Diagnostic::new(
+                codes::W0010,
+                call,
+                format!("`{}` is a copy of `{place}`, and nothing changes either", d.name),
+            )
+            .with_note("`.clone()` copies the value, its heap memory too; a borrow reads it in place (§6.3)")
+            .with_help(format!("borrow it instead: `borrow {} = {place}`", d.name)),
         );
     }
     out

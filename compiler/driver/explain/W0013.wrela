@@ -1,0 +1,24 @@
+// A `while` that counts an index over a run only to index it. A `for` loop walks a run, an
+// array or a `Vec` itself: it can't index past the end, miscount or loop forever (§2.2).
+// ---- wrong
+fn total(xs: [f32]) -> f32 {
+    var sum = 0.0
+    var i = 0
+    while i < xs.len() {
+        sum += xs[i]
+        i += 1
+    }
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn total(xs: [f32]) -> f32 {
+    var sum = 0.0
+    for x in xs {
+        sum += x
+    }
+    sum
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

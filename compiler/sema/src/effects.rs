@@ -166,6 +166,31 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direc
         for (forbids, ctx) in contexts {
             out.extend(fx.report(root, forbids, &ctx, def.sig_span, codes::E0600));
         }
+        // W0011: a test of code passes unless it panics (§13.2), so one that reaches no panic
+        // (no `assert`, no `panic`, no index that can be past an end) passes whatever the code
+        // it runs computes. One that reaches a call whose effects only instantiation knows may
+        // panic there, and isn't reported; neither are frame, tick and tool tests, whose runs
+        // fail in the host too.
+        if def.attrs.test.is_some()
+            && def.attrs.test_run.is_none()
+            && def.attrs.test_tool.is_none()
+            && !fx.open.contains(&root)
+            && !fx.all.get(&root).is_some_and(|e| e.contains(&Effect::Panic))
+            && !p.is_std(def.module)
+        {
+            out.push(
+                Diagnostic::new(
+                    codes::W0011,
+                    def.name_span,
+                    format!(
+                        "the test `{}` can't fail: nothing it runs asserts or panics",
+                        def.name
+                    ),
+                )
+                .with_note("a test passes unless it panics, and a failed `assert` panics (§13.2)")
+                .with_help("assert what it computes: `assert(f(x) == expected)`"),
+            );
+        }
         for (callee, span) in derived_callables(p, f, body) {
             let ctx = "a derived interpretation derives it";
             out.extend(fx.report(callee, DERIVED, ctx, span, codes::E0700));

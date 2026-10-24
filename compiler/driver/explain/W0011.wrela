@@ -1,0 +1,30 @@
+// A test of code that can't fail: nothing it runs asserts or panics, so it passes whatever the
+// code computes. A test passes unless it panics, and a failed `assert` panics (§13.2).
+// ---- wrong
+fn fib(n: u32) -> u32 {
+    if n < 2 {
+        return n
+    }
+    fib(n - 1) + fib(n - 2)
+}
+
+@test
+fn fib_is_right() {
+    let _ten = fib(10)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+fn fib(n: u32) -> u32 {
+    if n < 2 {
+        return n
+    }
+    fib(n - 1) + fib(n - 2)
+}
+
+@test
+fn fib_is_right() {
+    assert(fib(10) == 55)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

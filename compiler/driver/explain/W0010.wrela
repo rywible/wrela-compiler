@@ -1,0 +1,33 @@
+// A copy of a place that nothing changes, where a `borrow` would read the same values in place.
+// `.clone()` copies the value and its heap memory; `borrow x = place` reads it where it is.
+// Neither the copy nor its source changes, so the borrow is as good, and costs nothing.
+// ---- wrong
+pub struct Flock {
+    pub heights: Vec<f32>,
+}
+
+fn tallest(f: Flock) -> f32 {
+    let heights = f.heights.clone()
+    var best = 0.0
+    for h in heights {
+        best = max(best, h)
+    }
+    best
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+// ---- fixed
+pub struct Flock {
+    pub heights: Vec<f32>,
+}
+
+fn tallest(f: Flock) -> f32 {
+    borrow heights = f.heights
+    var best = 0.0
+    for h in heights {
+        best = max(best, h)
+    }
+    best
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}

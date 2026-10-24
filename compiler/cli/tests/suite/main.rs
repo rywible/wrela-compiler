@@ -5,6 +5,7 @@ mod doc;
 mod drive;
 mod fix;
 mod pin;
+mod pipelines;
 mod profile;
 mod query;
 mod refactor;

@@ -1,0 +1,37 @@
+// A request polled in the call that made it. The host answers a request no sooner than the next
+// call (§17.1), so the poll is `None` every time. Keep the `Pending` in the program's state, and
+// poll it in a later frame.
+// ---- wrong
+use std::io::{Pending, load}
+
+pub struct Game {
+    pub size: u32,
+}
+
+pub fn init() -> Game {
+    var game = Game { size: 0 }
+    var save = load("save.bin")
+    if let Some(Ok(bytes)) = save.poll() {
+        game.size = bytes.len()
+    }
+    game
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {}
+// ---- fixed
+use std::io::{Pending, load}
+
+pub struct Game {
+    pub size: u32,
+    save: Pending<u8>,
+}
+
+pub fn init() -> Game {
+    Game { size: 0, save: load("save.bin") }
+}
+
+pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
+    if let Some(Ok(bytes)) = game.save.poll() {
+        game.size = bytes.len()
+    }
+}

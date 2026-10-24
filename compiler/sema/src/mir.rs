@@ -16,6 +16,7 @@
 //!   local a closure body uses is a capture.
 
 pub mod build;
+pub mod control;
 
 use crate::builtins::BuiltinFn;
 use crate::defs::{Mode, RetMode};

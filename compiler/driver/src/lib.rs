@@ -73,6 +73,9 @@ pub struct PipelineSummary {
     pub names: Vec<String>,
     /// Where CPU code dispatches or draws it, as `file:line:column`.
     pub sites: Vec<String>,
+    /// For each site, whether it runs only under a runtime condition of its function
+    /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
+    pub conditional: Vec<bool>,
 }
 
 impl Output {
@@ -933,6 +936,34 @@ fn finish_diagnostics(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<D
     std
 }
 
+/// Each dispatch and draw of the program, by its statement's span, and whether it runs only
+/// under a runtime condition of its function.
+fn conditional_commands(checked: &wrela_sema::Checked) -> std::collections::HashMap<Span, bool> {
+    use wrela_sema::mir::{Rvalue, StatementKind};
+    let command = |k: &StatementKind| {
+        matches!(
+            k,
+            StatementKind::Assign(_, Rvalue::Dispatch(_) | Rvalue::Draw(_))
+                | StatementKind::Eval(Rvalue::Dispatch(_) | Rvalue::Draw(_))
+        )
+    };
+    let mut out = std::collections::HashMap::new();
+    for body in checked.mir.values() {
+        for f in &body.fns {
+            if !f.blocks.iter().any(|b| b.stmts.iter().any(|s| command(&s.kind))) {
+                continue;
+            }
+            let under = wrela_sema::mir::control::under_condition(f);
+            for (i, b) in f.blocks.iter().enumerate() {
+                for s in b.stmts.iter().filter(|s| command(&s.kind)) {
+                    out.insert(s.span, under[i]);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// What the pipeline-count query reports of each pipeline (§18.9).
 fn summarize(
     checked: &wrela_sema::Checked,
@@ -948,6 +979,16 @@ fn summarize(
             let args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
             (format!("{name}::<{}>", args.join(", ")), name)
         }
+    };
+    let commands = conditional_commands(checked);
+    // A site is the span lowering recorded: the command's statement, or inside it.
+    let conditional = |s: &Span| {
+        commands.get(s).copied().unwrap_or_else(|| {
+            commands
+                .iter()
+                .find(|(k, _)| k.file == s.file && k.start <= s.start && s.end <= k.end)
+                .is_some_and(|(_, &c)| c)
+        })
     };
     lowered
         .pipelines
@@ -967,6 +1008,7 @@ fn summarize(
                 entries: parts.iter().map(|(e, _)| e.clone()).collect(),
                 names: parts.into_iter().map(|(_, n)| n).collect(),
                 sites,
+                conditional: out.sites.iter().map(conditional).collect(),
             }
         })
         .collect()
