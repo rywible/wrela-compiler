@@ -1,4 +1,4 @@
-//! # The command stream, version 11
+//! # The command stream, version 12
 //!
 //! A program records GPU work as commands in its own memory and hands them to the host in
 //! batches through `wrela.submit(ptr, len)` (D-099). The host decodes each batch in bulk into
@@ -80,7 +80,7 @@
 use std::fmt;
 
 /// The stream format's version. Bumped by any change a host could notice.
-pub const VERSION: u32 = 11;
+pub const VERSION: u32 = 12;
 pub const MAGIC: [u8; 4] = *b"WRCS";
 /// The batch header: magic, version, body length.
 pub const HEADER_LEN: usize = 12;
