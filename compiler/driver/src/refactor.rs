@@ -19,6 +19,10 @@
 //!   argument marked to match (`mut x`; `take x` where it passed a place of a type that isn't
 //!   `Copy`).
 //!
+//! - **extract-const**, **inline** and **extract-fn** (`extract.rs`): an expression of
+//!   literals and constants made a constant; a one-expression function's calls made its body;
+//!   whole lines of statements made a function and a call of it.
+//!
 //! A plan is each file's hash before, its new text and its hunks. It's checked with the new
 //! texts in place of the old: if the program wouldn't check, nothing is written and the errors
 //! say why. A file the formatter owned stays formatted. A plan made earlier (`apply`) is refused
@@ -70,6 +74,15 @@ impl From<String> for Refusal {
         Refusal { why, errors: None }
     }
 }
+
+impl From<&str> for Refusal {
+    fn from(why: &str) -> Refusal {
+        Refusal { why: why.to_string(), errors: None }
+    }
+}
+
+mod extract;
+pub use extract::{extract_const, extract_fn, inline};
 
 fn refuse<T>(why: impl Into<String>) -> Result<T, Refusal> {
     Err(Refusal::from(why.into()))

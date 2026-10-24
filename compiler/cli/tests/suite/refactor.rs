@@ -169,3 +169,168 @@ fn a_plan_applies_only_to_the_files_it_was_made_from() {
     assert_eq!(r["written"], true, "{r}");
     assert!(main_text(&dir).contains("fn head(g: Grid)") && checks(&dir));
 }
+
+/// A package of `main` alone, for the extract and inline refactors.
+fn program(tag: &str, main: &str) -> PathBuf {
+    common::package(
+        &format!("refactor-{tag}"),
+        &[("wrela.toml", &common::manifest("shapes")), ("main.wrela", main)],
+    )
+}
+
+/// Whether the package's tests pass: a refactor keeps what the code computes, not only that it
+/// checks, so each case's package asserts its values.
+fn tests_pass(dir: &Path) -> bool {
+    let out = common::wrela().arg("test").arg(dir).output().unwrap();
+    out.status.success()
+}
+
+const EXTRACTS: &str = "pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn area(w: f32, h: f32) -> f32 {
+    var total = 0.0
+    total += w * h * 0.5
+    total += 1.0
+    total
+}
+
+@test
+fn area_is_right() {
+    assert(area(2.0, 3.0) == 4.0)
+}
+";
+
+#[test]
+fn an_expression_of_literals_becomes_a_constant() {
+    let dir = program("extract-const", EXTRACTS);
+    let a = plan(&dir, &["extract-const", "main.wrela:5:22", "HALF", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    let text = main_text(&dir);
+    assert!(text.contains("const HALF: f32 = 0.5") && text.contains("w * h * HALF"), "{text}");
+    assert!(checks(&dir) && tests_pass(&dir));
+    // (The constant and a blank line now come first.) An expression with a local in it can't
+    // be a constant.
+    let r = plan(&dir, &["extract-const", "main.wrela:7:14", "ONE", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("a constant is")), "{r}");
+    // Nor can it take a name the module has.
+    let r = plan(&dir, &["extract-const", "main.wrela:8:14", "HALF", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("already")), "{r}");
+}
+
+#[test]
+fn lines_become_a_function_with_what_flows_in_and_out() {
+    let dir = program("extract-fn", EXTRACTS);
+    let a = plan(&dir, &["extract-fn", "main.wrela:4-6", "accumulate", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    let text = main_text(&dir);
+    assert!(text.contains("let total = accumulate(w, h)"), "{text}");
+    assert!(text.contains("fn accumulate(w: f32, h: f32) -> f32 {"), "{text}");
+    assert!(checks(&dir) && tests_pass(&dir));
+    // A parameter the lines change is lent `mut`.
+    let dir = program(
+        "extract-fn-mut",
+        "pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn fill(n: u32) -> u32 {
+    var v: Vec<u32> = Vec::new()
+    v.push(n)
+    v.push(n + 1)
+    v.len()
+}
+
+@test
+fn fills_two() {
+    assert(fill(3) == 2)
+}
+",
+    );
+    plan(&dir, &["extract-fn", "main.wrela:5-6", "push_two", "--json"]);
+    let text = main_text(&dir);
+    assert!(text.contains("push_two(mut v, n)") && text.contains("v: mut Vec<u32>"), "{text}");
+    assert!(checks(&dir) && tests_pass(&dir));
+    // Two values that flow out are refused, and so are lines that leave early.
+    let dir = program(
+        "extract-fn-refused",
+        "pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn two(x: f32) -> f32 {
+    let a = x + 1.0
+    let b = x + 2.0
+    if a > b {
+        return a
+    }
+    a + b
+}
+",
+    );
+    let r = plan(&dir, &["extract-fn", "main.wrela:4-5", "both", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("more than one value")), "{r}");
+    let r = plan(&dir, &["extract-fn", "main.wrela:6-8", "early", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("leave early")), "{r}");
+}
+
+const INLINES: &str = "pub fn frame(time: f32, width: u32, height: u32) {}
+
+fn half(x: f32) -> f32 {
+    x / 2
+}
+
+fn widen(x: f32) -> f64 {
+    f64(x)
+}
+
+fn minus(a: f32, b: f32) -> f32 {
+    a - b
+}
+
+fn twice(x: f32) -> f32 {
+    x + x
+}
+
+fn swapped(a: f32, b: f32) -> f32 {
+    b - a
+}
+
+fn unused(a: f32, b: f32) -> f32 {
+    a
+}
+
+fn uses() -> f32 {
+    let three: f32 = 3.0
+    let big: f32 = 16777217.0
+    let one: f32 = 1.0
+    let untyped = 4.0
+    half(three) + f32(widen(big) - 16777216.0) + minus(b: one, a: three) + twice(one) + swapped(one, three) + unused(one, three) + half(untyped) + half(2.0) + half(minus(one, one))
+}
+
+@test
+fn values_hold() {
+    assert(uses() == 1.5 + 0.0 + 2.0 + 2.0 + 2.0 + 1.0 + 2.0 + 1.0 + 0.0)
+}
+";
+
+#[test]
+fn a_call_becomes_the_body_where_nothing_about_it_can_change() {
+    let dir = program("inline", INLINES);
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    // Arguments that aren't typed locals: a literal, an untyped local, a call.
+    let r = plan(&dir, &["inline", "half", "--json"]);
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains("passes")), "{r}");
+    // A parameter used twice, or not at all, or out of order, is refused.
+    for (f, why) in
+        [("twice", "used 2 times"), ("unused", "used 0 times"), ("swapped", "another order")]
+    {
+        let r = plan(&dir, &["inline", f, "--json"]);
+        assert!(r["refused"].as_str().is_some_and(|w| w.contains(why)), "{f}: {r}");
+    }
+    // A conversion of a typed local keeps its value; a named argument maps to its parameter.
+    let a = plan(&dir, &["inline", "widen", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    assert!(main_text(&dir).contains("f64(big)") && !main_text(&dir).contains("fn widen"));
+    assert!(checks(&dir) && tests_pass(&dir));
+    // A named argument goes to its parameter: `minus(b: one, a: three)` is `three - one`.
+    let a = plan(&dir, &["inline", "minus", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    assert!(main_text(&dir).contains("(three - one)") && !main_text(&dir).contains("fn minus"));
+    assert!(checks(&dir) && tests_pass(&dir));
+}

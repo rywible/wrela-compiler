@@ -57,7 +57,8 @@
 //!                                         an item's source and what's around it, in a budget,
 //!                                         with errors too
 //! wrela refactor <package-dir> <change> [--dry-run] [--json]
-//!                                         rename, move, add-param, change-mode: checked
+//!                                         rename, move, add-param, change-mode,
+//!                                         extract-const, inline, extract-fn: checked
 //!                                         before written, refused on a stale plan
 //! wrela tool <package-dir> [--read NAME=DIR]... [--write NAME=DIR]... [--secret NAME]...
 //!     [--timeout S] [--workers N] [--blob-budget B] [-- args...]
@@ -132,7 +133,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela solve <package-dir> (--minimize <module>::<function> | --spec) --free <file>[:<lines>]... [--steps n] [--exact] [--write] [--json]",
         "wrela query <package-dir> [<query>...] [--json]",
         "wrela context <item> [<package-dir>] [--budget n]",
-        "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | apply <plan.json>) [--dry-run] [--json]",
+        "wrela refactor <package-dir> (rename <item> <new-name> | move <item> <module> | add-param <fn> \"<name>: <type>\" (--value <expr> | --default <expr>) | change-mode <fn> <param> <borrow|mut|take> | extract-const <file>:<line>:<col> <NAME> | inline <fn> | extract-fn <file>:<first>-<last> <name> | apply <plan.json>) [--dry-run] [--json]",
         "wrela trace <package-dir> --watch <export>[,<export>...] [--frames n] [--csv] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela bisect <package-dir> --until \"<export> <op> <number>\" [--frames n] [--json] [--fps f] [--size WxH] [--input <script.json>] [--release] [--no-gpu] [--workers N]",
         "wrela run <package-dir> [--port N] [--lift <package>]... [--debug]",

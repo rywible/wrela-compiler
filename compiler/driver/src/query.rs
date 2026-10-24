@@ -684,7 +684,7 @@ impl<'a> Index<'a> {
             .map_or_else(String::new, |doc| doc.trim().to_string())
     }
 
-    fn file(&self, name: &str) -> Result<FileId, String> {
+    pub(crate) fn file(&self, name: &str) -> Result<FileId, String> {
         let suffix = format!("/{name}");
         let found: Vec<(FileId, &str)> = self
             .sources
@@ -703,12 +703,12 @@ impl<'a> Index<'a> {
     }
 
     /// The function whose body holds byte `offset` of `file` (the innermost, for a method).
-    fn fn_at(&self, file: FileId, offset: u32) -> Option<FnId> {
+    pub(crate) fn fn_at(&self, file: FileId, offset: u32) -> Option<FnId> {
         innermost_of(self.p, self.checked.mir.keys().copied(), file, offset)
     }
 
     /// The byte offset of `line` and `column` (1-based, in characters) in `file`.
-    fn offset(&self, file: FileId, line: u32, column: u32) -> Result<u32, String> {
+    pub(crate) fn offset(&self, file: FileId, line: u32, column: u32) -> Result<u32, String> {
         let f = self.sources.file(file);
         let l = line as usize - 1;
         if l >= f.line_count() {
@@ -806,6 +806,20 @@ impl<'a> Index<'a> {
         let file = self.file(file)?;
         let offset = self.offset(file, line, column)?;
         let f = self.fn_at(file, offset).ok_or("no function's code is there")?;
+        let (span, ty, what) = self
+            .typed_spans(f)
+            .into_iter()
+            .filter(|(s, _, _)| {
+                s.file == file && s.start <= offset && offset < s.end.max(s.start + 1)
+            })
+            .min_by_key(|(s, _, _)| (s.end - s.start, s.start))
+            .ok_or("nothing with a type is there")?;
+        Ok((f, span, ty, what))
+    }
+
+    /// Every span of function `f` with a type, and what it is: its parameters, its locals, its
+    /// operands and what its statements assign.
+    pub(crate) fn typed_spans(&self, f: FnId) -> Vec<(Span, TyId, &'static str)> {
         let body = &self.checked.mir[&f];
         let def = self.p.func(f);
         // Every span with a type: parameters, locals, operands and what's assigned.
@@ -858,14 +872,7 @@ impl<'a> Index<'a> {
                 _ => {}
             }
         }
-        let (span, ty, what) = found
-            .into_iter()
-            .filter(|(s, _, _)| {
-                s.file == file && s.start <= offset && offset < s.end.max(s.start + 1)
-            })
-            .min_by_key(|(s, _, _)| (s.end - s.start, s.start))
-            .ok_or("nothing with a type is there")?;
-        Ok((f, span, ty, what))
+        found
     }
 
     /// Each use of `f`, by any function: the user, how and where.
