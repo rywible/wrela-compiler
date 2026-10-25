@@ -51,7 +51,8 @@ impl wrela_host::tool::Toolchain for Compiler {
         let mut out = wrela_driver::build_in(package, kind, options.simd, &options.lift, &scope)?;
         if options.optimize && !out.has_errors() {
             crate::build::optimized_with(&mut out.files, |wasm| {
-                wrela_driver::optimize::optimize_with(wasm, &mut |program, args| {
+                let level = wrela_driver::optimize::Level::DEFAULT;
+                wrela_driver::optimize::optimize_with(wasm, level, &mut |program, args| {
                     let (success, status, stdout, stderr) = job.run(program, args)?;
                     Ok(wrela_driver::optimize::Ran { success, status, stdout, stderr })
                 })

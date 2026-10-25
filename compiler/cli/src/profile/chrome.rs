@@ -29,8 +29,23 @@ fn run_page(
     };
     // Real time for the paced run, and the GPU's pipelines first: generous, but bounded.
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / 60.0 * 10.0).max(120.0));
-    wrela_host::pages::run(wrela_host::pages::Page { root, page, fragment, timeout, script: None })
-        .map_err(|why| format!("Chrome's run failed: {why}"))?;
+    let run = || {
+        wrela_host::pages::run(wrela_host::pages::Page {
+            root,
+            page,
+            fragment,
+            timeout,
+            script: None,
+        })
+    };
+    // A browser that quits under a long series of runs says nothing of the build: once, again.
+    if let Err(why) = run() {
+        if !why.contains("chrome exited") {
+            return Err(format!("Chrome's run failed: {why}"));
+        }
+        eprintln!("Chrome quit ({why}); running it again");
+        run().map_err(|why| format!("Chrome's run failed: {why}"))?;
+    }
     let results = built.join("results");
     files
         .iter()

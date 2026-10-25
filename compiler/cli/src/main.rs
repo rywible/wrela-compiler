@@ -117,7 +117,7 @@ mod trace;
 pub(crate) fn usage() -> ExitCode {
     let lines = [
         "wrela check <package-dir> [--json]",
-        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]",
+        "wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]",
         "wrela fmt <file-or-dir>... [--check]",
         "wrela fix <package-dir> [--dry-run] [--json]",
         "wrela migrate <package-dir> [--dry-run] [--json]",
@@ -126,7 +126,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--json]",
-        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--chrome [--features none|<list>] [--checked]] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
+        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--chrome [--features none|<list>] [--checked]] [--optimize size|speed] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",
@@ -249,9 +249,9 @@ pub(crate) struct PackageArgs {
     /// `--lift <package>`, which only `build` takes: the packages whose literals a lifted
     /// build lifts.
     pub lift: Vec<String>,
-    /// `--optimize`, which only `build` takes: the WASM through `wasm-opt`
-    /// (`wrela_driver::optimize`).
-    pub optimize: bool,
+    /// `--optimize [size|speed]`, which only `build` takes: the WASM through `wasm-opt`
+    /// (`wrela_driver::optimize`), for size or speed (alone, `Level::DEFAULT`).
+    pub optimize: Option<wrela_driver::optimize::Level>,
 }
 
 /// Reads the arguments of `check`, or of `build` (`takes_out`), and checks that the package is
@@ -259,9 +259,9 @@ pub(crate) struct PackageArgs {
 /// returned.
 pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageArgs, ExitCode> {
     let (mut dir, mut out, mut json, mut debug, mut testing) = (None, None, false, false, false);
-    let mut optimize = false;
+    let mut optimize = None;
     let mut lift = Vec::new();
-    let mut it = args.iter();
+    let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-o" | "--out" if takes_out => match it.next() {
@@ -271,7 +271,16 @@ pub(crate) fn package_args(args: &[String], takes_out: bool) -> Result<PackageAr
             "--json" => json = true,
             "--debug" if takes_out => debug = true,
             "--testing" if takes_out => testing = true,
-            "--optimize" if takes_out => optimize = true,
+            "--optimize" if takes_out => {
+                use wrela_driver::optimize::Level;
+                optimize = Some(match it.peek().and_then(|l| Level::parse(l)) {
+                    Some(level) => {
+                        it.next();
+                        level
+                    }
+                    None => Level::DEFAULT,
+                });
+            }
             "--lift" if takes_out => match it.next() {
                 Some(p) => lift.extend(p.split(',').map(String::from)),
                 None => return Err(usage()),

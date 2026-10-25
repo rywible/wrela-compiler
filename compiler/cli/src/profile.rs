@@ -24,6 +24,8 @@
 //! `--warmup`, `--workers` and `--pairs` control the replay; `--warmup 0` includes startup frames.
 //! Run benchmarks with other builds and GPU workloads idle.
 //!
+//! `--optimize size|speed` profiles the build `wasm-opt` made, as a shipped one is.
+//!
 //! Beside the times, each report has the executor's counters, each a frame's median: passes,
 //! dispatches, draws and draw calls, buffer and texture writes, bind groups and pipelines set
 //! (the physical half of a draw count). `--chrome` measures in headless Chrome instead
@@ -77,6 +79,8 @@ struct Args {
     features: Option<String>,
     /// Chrome's command checker on (`--checked`): off by default, as a release build plays.
     checked: bool,
+    /// The WASM through `wasm-opt` (`--optimize size|speed`), as a shipped build's is.
+    optimize: Option<wrela_driver::optimize::Level>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -96,6 +100,7 @@ fn parse(args: &[String]) -> Option<Args> {
         chrome: false,
         features: None,
         checked: false,
+        optimize: None,
     };
     let mut dir = None;
     let mut it = args.iter();
@@ -118,6 +123,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--serial" => a.serial = true,
             "--chrome" => a.chrome = true,
             "--checked" => a.checked = true,
+            "--optimize" => a.optimize = Some(wrela_driver::optimize::Level::parse(it.next()?)?),
             "--features" => {
                 let keep = it.next()?;
                 let plain =
@@ -286,7 +292,7 @@ fn run_report(a: &Args) -> Result<String, String> {
         workers: a.workers,
         ..Options::default()
     };
-    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options)?;
+    let (mut host, script, built) = load(&a.dir, a.input.as_deref(), &options, a.optimize)?;
     let environment = comparison::environment(&mut host)?;
     let workload = comparison::workload(a, &script);
     let frozen = comparison::build_hash(&built)?;
@@ -314,11 +320,22 @@ fn run_report(a: &Args) -> Result<String, String> {
     Ok(if a.json { json(a, &p, baseline.as_ref()) } else { text(a, &p, baseline.as_ref()) })
 }
 
-/// A package built as `wrela build` builds it, into `build/profile`.
-fn build_into(dir: &Path) -> Result<PathBuf, String> {
+/// A package built as `wrela build` builds it (`--optimize`d, if the profile is), into
+/// `build/profile`.
+fn build_into(
+    dir: &Path,
+    optimize: Option<wrela_driver::optimize::Level>,
+) -> Result<PathBuf, String> {
     let built = dir.join("build").join("profile");
     crate::generated_path(dir, &built)?;
-    let out = wrela_driver::build(dir);
+    let mut out = wrela_driver::build(dir);
+    if let Some(level) = optimize
+        && !out.has_errors()
+    {
+        crate::build::optimized_with(&mut out.files, |wasm| {
+            wrela_driver::optimize::optimize(wasm, level)
+        })?;
+    }
     crate::write_build(&out, &built)?;
     Ok(built)
 }
@@ -329,8 +346,9 @@ fn load(
     dir: &Path,
     input: Option<&Path>,
     options: &Options,
+    optimize: Option<wrela_driver::optimize::Level>,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let built = build_into(dir)?;
+    let built = build_into(dir, optimize)?;
     let script = crate::read_script(input)?;
     let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
     Ok((host, script, built))
@@ -338,7 +356,7 @@ fn load(
 
 /// `--chrome`'s report: the build measured in headless Chrome (`profile/chrome.rs`).
 fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String> {
-    let built = build_into(&a.dir)?;
+    let built = build_into(&a.dir, a.optimize)?;
     let script = crate::read_script(a.input.as_deref())?;
     let workload = comparison::workload(a, &script);
     // Test mode reads the script beside the page.
@@ -748,7 +766,7 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("package");
         std::fs::create_dir_all(&outside).expect("outside");
         std::os::unix::fs::symlink(&outside, dir.join("build")).expect("linked build");
-        assert!(load(&dir, None, &Options::default()).is_err());
+        assert!(load(&dir, None, &Options::default(), None).is_err());
         assert!(std::fs::read_dir(&outside).expect("outside directory").next().is_none());
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(outside);

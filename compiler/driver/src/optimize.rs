@@ -1,5 +1,6 @@
-//! An optimized build's WASM (`wrela build --optimize`): Binaryen's `wasm-opt -Oz` makes the
-//! code smaller, and the trap locations (`wrela_abi::lines`) go through it as a source map, so
+//! An optimized build's WASM (`wrela build --optimize [size|speed]`): Binaryen's `wasm-opt`
+//! makes the code smaller (`-Oz`) or faster (`-O3`), [`Level::DEFAULT`] unless the build says,
+//! and the trap locations (`wrela_abi::lines`) go through it as a source map, so
 //! a trap still says where it happened. The table leaves the module for a file of its own beside
 //! it ([`wrela_abi::lines::SIDECAR`]), which a host reads only when a trap needs it.
 //!
@@ -20,6 +21,37 @@ use wrela_abi::lines::{self, Lines};
 /// The Binaryen release a toolchain release ships: the oldest whose source maps keep segments
 /// with no location.
 pub const WASM_OPT_VERSION: u32 = 133;
+
+/// What `wasm-opt` optimizes for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Level {
+    /// `-Oz`: the smallest code.
+    Size,
+    /// `-O3`: the fastest, larger.
+    Speed,
+}
+
+impl Level {
+    /// What `--optimize` alone means: chosen by measurement (toolchain 0.6, §A15 of the
+    /// world-class plan): the frozen herd's and grazer's CPU frame time in Chrome and their
+    /// gzipped WASM, the commit that set it records the numbers.
+    pub const DEFAULT: Level = Level::Size;
+
+    pub fn parse(s: &str) -> Option<Level> {
+        match s {
+            "size" => Some(Level::Size),
+            "speed" => Some(Level::Speed),
+            _ => None,
+        }
+    }
+
+    fn flag(self) -> &'static str {
+        match self {
+            Level::Size => "-Oz",
+            Level::Speed => "-O3",
+        }
+    }
+}
 
 /// The features `wasm-opt` may use: exactly those the back end emits.
 const FEATURES: [&str; 6] = [
@@ -59,13 +91,18 @@ fn run_here(program: &std::path::Path, args: &[std::ffi::OsString]) -> Result<Ra
     })
 }
 
-/// `wasm`, optimized, without its lines table; and the table for its optimized code, encoded.
-pub fn optimize(wasm: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-    optimize_with(wasm, &mut run_here)
+/// `wasm`, optimized for `level`, without its lines table; and the table for its optimized
+/// code, encoded.
+pub fn optimize(wasm: &[u8], level: Level) -> Result<(Vec<u8>, Vec<u8>), String> {
+    optimize_with(wasm, level, &mut run_here)
 }
 
 /// [`optimize`], `wasm-opt` run by `run`.
-pub fn optimize_with(wasm: &[u8], run: &mut Runner) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn optimize_with(
+    wasm: &[u8],
+    level: Level,
+    run: &mut Runner,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     let program = wasm_opt(run)?;
     let (bare, payload) = wrela_wasm::without_custom_section(wasm, lines::SECTION)?;
     let table = match payload {
@@ -81,7 +118,7 @@ pub fn optimize_with(wasm: &[u8], run: &mut Runner) -> Result<(Vec<u8>, Vec<u8>)
     };
     write("in.wasm", &bare)?;
     write("in.map", table.source_map()?.as_bytes())?;
-    let mut args: Vec<std::ffi::OsString> = vec![path("in.wasm").into(), "-Oz".into()];
+    let mut args: Vec<std::ffi::OsString> = vec![path("in.wasm").into(), level.flag().into()];
     args.extend(FEATURES.iter().map(Into::into));
     for (flag, name) in
         [("--input-source-map", "in.map"), ("--output-source-map", "out.map"), ("-o", "out.wasm")]
