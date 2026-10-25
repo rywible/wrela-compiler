@@ -62,10 +62,43 @@ export function printed(memory: WebAssembly.Memory, ptr: number, len: number): s
   return line;
 }
 
-/** `wrela.phase(ptr, len)`: the browser host times no phases (`std::time::phase`); a page is
- * profiled in the browser's own tools. It still reads and validates the name, as the ABI does. */
-export function phaseImport(memory: WebAssembly.Memory): (ptr: number, len: number) => void {
-  return (ptr: number, len: number) => void text(memory, ptr, len, "phase");
+/** `wrela.phase(ptr, len)` on a thread whose phases aren't timed (a parallel job's, a voice's):
+ * it reads and validates the name, as the ABI does. The program's own thread times them
+ * ([`Phases`]). */
+export function phaseImport(memory: WebAssembly.Memory): (ptr: number, len: number) => string {
+  return (ptr: number, len: number) => text(memory, ptr, len, "phase");
+}
+
+/** The phases a thread times (`std::time::phase`), as the native host's trace does: a phase runs
+ * until the thread's next one, or until its call (`init`, `frame`) returns, and its time is summed
+ * by name over the call. `take` gives what the calls since the last `take` timed, ms by name. */
+export class Phases {
+  #current: string | null = null;
+  #since = 0;
+  #times = new Map<string, number>();
+
+  constructor(readonly now: () => number = () => performance.now()) {}
+
+  /** Starts phase `name`, ending the last; an empty name only ends it, as on the native host. */
+  begin(name: string): void {
+    this.end();
+    if (name === "") return;
+    this.#current = name;
+    this.#since = this.now();
+  }
+
+  end(): void {
+    if (this.#current === null) return;
+    const ms = this.now() - this.#since;
+    this.#times.set(this.#current, (this.#times.get(this.#current) ?? 0) + ms);
+    this.#current = null;
+  }
+
+  take(): Record<string, number> {
+    const out = Object.fromEntries(this.#times);
+    this.#times.clear();
+    return out;
+  }
 }
 
 /** The shared `memory`, and host functions that refuse to run: they throw a `Refusal` that says

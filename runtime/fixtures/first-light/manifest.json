@@ -1,6 +1,6 @@
 {
-  "manifest_version": 9,
-  "stream_version": 11,
+  "manifest_version": 10,
+  "stream_version": 12,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -9,9 +9,14 @@
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "outputs": [
+        "float"
+      ],
       "targets": [
         {
-          "color": "rgba8unorm",
+          "colors": [
+            "rgba8unorm"
+          ],
           "depth": false,
           "screen": true
         }

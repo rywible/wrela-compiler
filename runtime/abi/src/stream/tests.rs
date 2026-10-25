@@ -22,21 +22,21 @@ fn golden_bytes() {
         words(&[4, 16, 0, f(0.5), f(1.0), f(1.0)]), // BeginScreenPass
         words(&[5, 28, 1, 3, 1, 0, 8]),             // Draw
         vec![1, 0, 0, 0, 2, 0, 0, 0],
-        words(&[6, 0]),                     // Present
-        words(&[7, 4, 7]),                  // DestroyBuffer
-        words(&[8, 20, 1, 4, 2, 8, 12]),    // CopyBuffer
-        words(&[9, 16, 8, 2, 1, 0]),        // CreateTexture
-        words(&[10, 32, 8, 0, 0, 2, 1, 8]), // WriteTexture
+        words(&[6, 0]),                           // Present
+        words(&[7, 4, 7]),                        // DestroyBuffer
+        words(&[8, 20, 1, 4, 2, 8, 12]),          // CopyBuffer
+        words(&[9, 28, 8, 2, 1, 0, 0, 1, 1]),     // CreateTexture
+        words(&[10, 40, 8, 0, 0, 0, 0, 2, 1, 8]), // WriteTexture
         vec![1, 2, 3, 4, 5, 6, 7, 8],
-        words(&[11, 4, 8]),                                    // DestroyTexture
-        words(&[12, 16, 10, 1, 0, 1]),                         // CreateSampler
-        words(&[13, 4, 10]),                                   // DestroySampler
-        words(&[14, 36, 8, 0, 0, 0, 0, f(1.0), 9, 0, f(1.0)]), // BeginPass
-        words(&[15, 0]),                                       // EndPass
-        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]),              // DispatchIndirect
-        words(&[17, 20, 1, 3, 16, 0, 0]),                      // DrawIndirect
-        words(&[18, 16, 1, 3, 0, 8]),                          // ReadBuffer
-        words(&[19, 20, 2, 11]),                               // StorageRead
+        words(&[11, 4, 8]),                  // DestroyTexture
+        words(&[12, 24, 10, 1, 0, 1, 0, 1]), // CreateSampler
+        words(&[13, 4, 10]),                 // DestroySampler
+        words(&[14, 56, 1, 0, 8, 0, 0, 0, 0, 0, 0, f(1.0), 9, 0, 0, f(1.0)]), // BeginPass
+        words(&[15, 0]),                     // EndPass
+        words(&[16, 32, 0, 3, 4, 1, 5, 0, 0, 0]), // DispatchIndirect
+        words(&[17, 20, 1, 3, 16, 0, 0]),    // DrawIndirect
+        words(&[18, 16, 1, 3, 0, 8]),        // ReadBuffer
+        words(&[19, 20, 2, 11]),             // StorageRead
         b"saves/slot1\0".to_vec(),
         words(&[20, 28, 3, 7, 5]), // StorageWrite
         b"saves/a\0".to_vec(),
@@ -60,6 +60,14 @@ fn golden_bytes() {
         vec![3, 2, 1, 0],
         words(&[30, 16, 9, 7]), // Timed
         b"shadows\0".to_vec(),
+        words(&[31, 48, 8, 1, 0, 0, 0, 12, 0, 3, 4, 4, 2, 2]), // CopyTexture
+        words(&[32, 40, 8, 0, 0, 1, 1, 2, 2, 3, 256, 256]),    // CopyTextureToBuffer
+        words(&[33, 40, 3, 0, 256, 8, 2, 0, 0, 0, 4, 4]),      // CopyBufferToTexture
+        words(&[34, 16, 1, 2, 3, 4]),                          // SetScissor
+        words(&[35, 24, f(0.0), f(0.0), f(64.0), f(32.0), f(0.0), f(1.0)]), // SetViewport
+        words(&[36, 44, 1, 3, 0, 12, 6, 2, 1, u32::MAX, 4, 0, 0]), // DrawIndexed
+        words(&[37, 32, 1, 3, 16, 4, NONE, 0, 0, 0]),          // MultiDrawIndirect
+        words(&[38, 44, 1, 3, 0, 12, 5, 0, 2, 6, 8, 0, 0]),    // MultiDrawIndexedIndirect
     ]
     .concat();
     expected.extend(words(&[VERSION, body.len() as u32]));
@@ -115,7 +123,16 @@ fn texture_write_pads_only_the_command_payload() {
     let cmds = decode(&batch).expect("a two-byte texture write is word-aligned");
     assert_eq!(
         cmds[1],
-        Command::WriteTexture { handle: 1, x: 0, y: 0, width: 1, height: 1, data: &[0x00, 0x3c] }
+        Command::WriteTexture {
+            handle: 1,
+            level: 0,
+            layer: 0,
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            data: &[0x00, 0x3c]
+        }
     );
     assert_eq!(cmds[2], Command::DestroyTexture { handle: 1 });
     let mut checker = crate::check::Checker::new(&crate::Manifest::new("game.wasm"));
@@ -244,4 +261,69 @@ fn sequencing_rules() {
     assert_eq!(s.end_frame(), Err(StreamError::UnclosedPass));
     s.step(&Command::Present).expect("close");
     s.end_frame().expect("closed");
+}
+
+/// The format table's render target costs and alignments are WebGPU's ("Texture Format
+/// Capabilities", the render target pixel byte cost and component alignment columns), written
+/// out here from the specification rather than from the table.
+#[test]
+fn the_format_tables_target_costs_are_webgpus() {
+    use TextureFormat as F;
+    let spec = [
+        (F::Rgba8, 8, 1),
+        (F::Rgba16Float, 8, 2),
+        (F::R32Float, 4, 4),
+        (F::Rg32Float, 8, 4),
+        (F::Rgba32Float, 16, 4),
+        (F::R8, 1, 1),
+        (F::Rg8, 2, 1),
+        (F::Rgb10a2, 8, 4),
+        (F::Rg11b10Float, 8, 4),
+        (F::R32Uint, 4, 4),
+        (F::Rg32Uint, 8, 4),
+        (F::R16Float, 2, 2),
+        (F::Rg16Float, 4, 2),
+    ];
+    for (f, cost, align) in spec {
+        let i = f.info();
+        assert_eq!((i.target_cost, i.target_align), (cost, align), "{}", f.name());
+    }
+}
+
+/// The colour attachment limit is WebGPU's algorithm: the running total aligned to each
+/// format's component alignment, then its cost added, so target order matters.
+#[test]
+fn colour_attachment_bytes_follow_webgpus_algorithm() {
+    use TextureFormat as F;
+    let refused = [F::Rgba32Float, F::Rgba8, F::Rgba8, F::Rgba16Float];
+    assert_eq!(color_attachment_bytes(&refused), 40);
+    let accepted = [F::Rgba16Float, F::Rg16Float, F::R8, F::R32Uint];
+    assert_eq!(color_attachment_bytes(&accepted), 20);
+    assert_eq!(color_attachment_bytes(&[F::R8, F::R32Float]), 8);
+    assert_eq!(color_attachment_bytes(&[F::R32Float, F::R8]), 5);
+}
+
+/// What each capability needs, as WebGPU's core and its features say.
+#[test]
+fn each_formats_capabilities_name_the_feature_they_need() {
+    use TextureFormat as F;
+    for f in [F::R32Float, F::Rg32Float, F::Rgba32Float] {
+        assert_eq!(f.info().blendable, Can::With(FormatFeature::Float32Blendable), "{}", f.name());
+        assert_eq!(f.info().filterable, Can::With(FormatFeature::Float32Filterable));
+        assert!(f.storable() && f.renderable() && !f.filterable());
+    }
+    let rg11 = F::Rg11b10Float.info();
+    assert_eq!(rg11.renderable, Can::With(FormatFeature::Rg11b10Renderable));
+    assert_eq!(rg11.storable, Can::No);
+    for f in [F::R32Uint, F::Rg32Uint] {
+        assert!(f.is_uint() && !f.blendable() && !f.filterable());
+    }
+    for f in [F::Bc1, F::Bc4, F::Bc5, F::Bc7, F::Etc2Rgb8, F::Astc4x4] {
+        assert!(f.is_compressed() && f.filterable() && !f.renderable() && !f.storable());
+        assert_eq!(f.block(), 4);
+    }
+    assert_eq!(F::Bc7.bytes_of(10, 6), 3 * 2 * 16);
+    // Every name is WebGPU's spelling and appears once.
+    let names: std::collections::HashSet<_> = F::ALL.iter().map(|f| f.name()).collect();
+    assert_eq!(names.len(), F::ALL.len());
 }

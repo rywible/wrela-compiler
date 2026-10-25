@@ -13,7 +13,9 @@ use wrela_tests::{ChromeRun, chrome_failure, page};
 /// The build in `dir`, its WASM optimized and its trap locations beside it.
 fn optimize_in_place(dir: &Path) {
     let wasm = std::fs::read(dir.join("game.wasm")).expect("game.wasm");
-    let (code, lines) = wrela_driver::optimize::optimize(&wasm).expect("optimizes");
+    let (code, lines) =
+        wrela_driver::optimize::optimize(&wasm, wrela_driver::optimize::Level::Size)
+            .expect("optimizes");
     assert!(code.len() < wasm.len(), "optimized {} bytes into {}", wasm.len(), code.len());
     std::fs::write(dir.join("game.wasm"), code).expect("write game.wasm");
     std::fs::write(dir.join("game.lines"), lines).expect("write game.lines");

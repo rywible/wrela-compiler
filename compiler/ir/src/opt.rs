@@ -359,6 +359,7 @@ fn same_const(a: &Const, b: &Const) -> bool {
     match (a, b) {
         (Const::F32(x), Const::F32(y)) => x.to_bits() == y.to_bits(),
         (Const::F64(x), Const::F64(y)) => x.to_bits() == y.to_bits(),
+        (Const::F16(x), Const::F16(y)) => x.to_bits() == y.to_bits(),
         _ => a == b,
     }
 }
@@ -495,6 +496,7 @@ impl Hash for CseKey {
                 Const::Small(s, x) => (s, x).hash(h),
                 Const::F32(x) => x.to_bits().hash(h),
                 Const::F64(x) => x.to_bits().hash(h),
+                Const::F16(x) => x.to_bits().hash(h),
             },
             Expr::Zero(t) => t.hash(h),
             // The operation too, as `==` compares it: `a + b` and `a * b` hash apart.
@@ -1116,6 +1118,7 @@ fn outlined_with(
                     }
                     Expr::EntryInput(_)
                     | Expr::Barrier
+                    | Expr::Subgroup(..)
                     | Expr::Discard
                     | Expr::Atomic(..)
                     | Expr::Texture(..)
@@ -1475,8 +1478,11 @@ impl Copier<'_> {
 
 /// The size of a body, in statements once its own callees are inlined, that the CPU inlines at
 /// each of its calls; and at each of its calls in a loop, where a call costs the most (a
-/// fold's step over an array of parts, called once per part).
-const CPU_INLINE_SIZE: usize = 250;
+/// fold's step over an array of parts, called once per part). 125, not 0.5's 250: the frozen
+/// herd's gzipped WASM is 4% smaller and the grazer's 16%, and neither's frame is slower in
+/// Chrome or wasmtime (toolchain 0.6, §A15 of the world-class plan; the commit has the numbers).
+/// A call in a loop keeps its larger limit.
+const CPU_INLINE_SIZE: usize = 125;
 const CPU_LOOP_INLINE_SIZE: usize = 600;
 
 /// The most statements a CPU function grows to with what's inlined into it.

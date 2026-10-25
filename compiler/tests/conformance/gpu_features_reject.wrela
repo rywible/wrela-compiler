@@ -1,0 +1,41 @@
+// rejects: gpu.features
+// `f16` lives in GPU code; subgroup operations are a kernel's, in uniform control flow, of the
+// types WGSL's take.
+use std::gpu::{
+    FragCoord, GlobalId, GpuBuffer, Slots, dispatch, buffer, subgroup_add, subgroup_and,
+    begin_screen_pass, draw, ClipPosition, VertexIndex,
+}
+
+@compute(64)
+fn branchy(out: mut Slots<u32>, id: GlobalId) {
+    if id.x < 32 {
+        out[id] = subgroup_add(id.x) //~ E0610
+    }
+}
+
+@compute(64)
+fn floats(out: mut Slots<f32>, id: GlobalId) {
+    out[id] = subgroup_and(f32(id.x)) //~ E0607
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn shaded(p: FragCoord) -> vec4 {
+    vec4(subgroup_add(p.position.x)) //~ E0607
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let h: f16 = f16(time) //~ E0338
+    let _ = h
+    var out: GpuBuffer<u32> = buffer(64)
+    var floats_out: GpuBuffer<f32> = buffer(64)
+    dispatch(branchy.bind(mut out), groups: (1, 1, 1))
+    dispatch(floats.bind(mut floats_out), groups: (1, 1, 1))
+    let p = begin_screen_pass(clear: vec4(0.0))
+    draw(p, cover, shaded, vertices: 3)
+    p.present()
+}

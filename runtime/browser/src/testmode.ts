@@ -1,8 +1,12 @@
 // Test mode: `index.html#test&frames=60&width=1920&height=1080&fps=60&workers=4&audio=750` runs a
 // fixed number of frames at fixed times and canvas size, its parallel jobs on a fixed number of
 // threads (the program's own included), then saves the last frame, the state hash, the lines
-// the program printed (`log.txt`) and each frame's CPU time, when it began, and the frame each
-// printed line came in (`frames.json`) to `results/` for whoever runs the page (the compiler's
+// the program printed (`log.txt`), each frame's CPU time, when it began, the phases it timed
+// (`std::time::phase`, ms by name) and the frame each printed line came in (`frames.json`), and
+// what the executor did each frame below the stream (`counters.json`: passes, dispatches, draws
+// and draw calls, buffer and texture writes, bind groups and pipelines set), and the adapter and
+// the features the program saw (`device.json`) to `results/` for
+// whoever runs the page (the compiler's
 // tests' `wrela_host::pages`, a tool's browser). With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples (and how long
 // the render took, `audio-ms.json`); with `live=s`, it plays the voice in real time for s seconds
@@ -19,7 +23,11 @@
 // (`latency.json`); with `keylatency=n`, n presses of the right arrow key instead, at least
 // 250 ms apart; with `clip=n` (and `clipfrom=i`), the canvas recorded from frame i (0 unless
 // given) for n frames, as a video (`clip.webm`: the main thread's MediaRecorder; paced frames
-// play at their speed).
+// play at their speed). With `features=none` (or a comma list of the ones to keep), the program
+// sees only those optional device features (`std::gpu::features()`), though the device has them
+// all: its fallback paths, measured on a device that has the features. With `checks=0`, the
+// command checker is off, as in a release build's normal run, where WebGPU's own validation
+// (an `uncapturederror`) is what stops a wrong command: a profile's runs.
 //
 // A program with a ticker (`std::tick::start`) runs it on the lockstep schedule (#43 §2.3):
 // before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
@@ -69,6 +77,9 @@ export interface TestParams {
   snapfrom: number;
   /** A script of input events, relative to the page; "" for none. */
   input: string;
+  /** The optional features the program may see: null for all the device has, else `none` or a
+   * comma list. */
+  features: string | null;
   /** Pointer events to send through the DOM while the frames run (0: none). */
   latency: number;
   /** Key presses to send through the DOM while the frames run (0: none). */
@@ -86,6 +97,9 @@ export interface TestParams {
   /** Frames of the canvas to record as a video (0: none), and the frame it starts at. */
   clip: number;
   clipfrom: number;
+  /** 0: the checker off, as a release build plays (a profile's runs); 1, the default: on, so a
+   * test names the program's mistake. */
+  checks: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -103,6 +117,7 @@ export const TEST_DEFAULTS: TestParams = {
   snap: 0,
   snapfrom: 0,
   input: "",
+  features: null,
   latency: 0,
   keylatency: 0,
   paced: 0,
@@ -112,6 +127,7 @@ export const TEST_DEFAULTS: TestParams = {
   saturate: 0,
   clip: 0,
   clipfrom: 0,
+  checks: 1,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];
@@ -141,6 +157,18 @@ export function parseTestParams(hash: string): TestParams | null {
         throw new Error(`test parameter input=${value} must be a path relative to the page`);
       }
       params.input = value;
+      continue;
+    }
+    if (key === "checks") {
+      if (value !== "0" && value !== "1") throw new Error(`test parameter checks=${value} must be 0 or 1`);
+      params.checks = Number(value);
+      continue;
+    }
+    if (key === "features") {
+      if (value !== "none" && !/^[a-z0-9-]+(,[a-z0-9-]+)*$/.test(value)) {
+        throw new Error(`test parameter features=${value} must be none or a comma list of features`);
+      }
+      params.features = value;
       continue;
     }
     if (!KEYS.some((k) => k === key)) {

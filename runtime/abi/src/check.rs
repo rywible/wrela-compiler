@@ -31,8 +31,11 @@
 //! restores the checker's resources to those from before the call (language.md §18.3).
 
 use crate::Manifest;
-use crate::manifest::{BindingKind, RenderTarget, Stage};
-use crate::stream::{Binding, Command, MAX_TEXTURE_3D, NONE, Opcode, SCREEN, TextureFormat};
+use crate::manifest::{BindingKind, Blend, RenderTarget, Stage};
+use crate::stream::{
+    Binding, Can, Command, MAX_COLOR_ATTACHMENT_BYTES, MAX_LAYERS, MAX_TEXTURE_3D, NONE, Opcode,
+    Pass, SCREEN, TexelRect, TextureFormat, TextureKind, View,
+};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -94,6 +97,10 @@ struct Shape {
     bindings: Vec<(BindingKind, Option<TextureFormat>)>,
     /// A render pipeline's targets: the passes it may be drawn in.
     targets: Vec<RenderTarget>,
+    /// How each of its colour outputs blends.
+    blends: Vec<Blend>,
+    /// The device features its shader needs.
+    requires: Vec<String>,
 }
 
 /// A live texture.
@@ -101,11 +108,25 @@ struct Shape {
 struct Texture {
     width: u32,
     height: u32,
-    /// A 3D texture's depth, or 0 for a 2D texture.
-    depth: u32,
+    kind: TextureKind,
+    /// A 3D texture's depth, an array's layers (6 of a cube), 1 of a 2D texture.
+    layers: u32,
+    levels: u32,
     format: TextureFormat,
     /// Kernels may write it.
     writable: bool,
+}
+
+impl Texture {
+    /// Level `level`'s width and height.
+    fn size(&self, level: u32) -> (u32, u32) {
+        ((self.width >> level).max(1), (self.height >> level).max(1))
+    }
+
+    /// Its 2D layers: a 3D texture's whole depth is one subresource.
+    fn subresource_layers(&self) -> u32 {
+        if self.kind == TextureKind::D3 { 1 } else { self.layers }
+    }
 }
 
 /// A live resource.
@@ -126,34 +147,74 @@ impl Resource {
     }
 }
 
+/// A use of a buffer, or of a texture's levels `levels.0..levels.1` and layers `layers.0..
+/// layers.1`, in a usage scope (WebGPU tracks each subresource apart: two levels of one texture
+/// may be read and written in one dispatch).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Use {
+    levels: (u32, u32),
+    layers: (u32, u32),
+    write: bool,
+}
+
+impl Use {
+    const BUFFER: (u32, u32) = (0, 1);
+
+    fn overlaps(&self, other: &Use) -> bool {
+        let meet = |a: (u32, u32), b: (u32, u32)| a.0 < b.1 && b.0 < a.1;
+        meet(self.levels, other.levels) && meet(self.layers, other.layers)
+    }
+}
+
+/// A pass's attachment: a texture's level and layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Attachment {
+    handle: u32,
+    level: u32,
+    layer: u32,
+}
+
+/// What a scope remembers of a handle before a command changes it (for rollback).
+type Uses = Vec<Use>;
+
 pub struct Checker {
     limits: crate::Limits,
+    /// The device's optional features (WebGPU's names; `crate::FEATURES`).
+    features: Vec<String>,
     pipelines: Vec<Shape>,
     resources: HashMap<u32, Resource>,
     /// Successful creates and destroys in the current exported call, reversed if it traps.
     resource_undo: Vec<(u32, Option<Resource>)>,
     in_call: bool,
-    /// The current usage scope, a dispatch or the open pass: each buffer's or texture's use
-    /// so far, (read-only, read-write). Dispatches happen only outside a pass (the sequencer
-    /// checks), so the two kinds of scope never overlap and share this map.
-    scope: HashMap<u32, (bool, bool)>,
+    /// The current usage scope, a dispatch or the open pass: each buffer's or texture's uses so
+    /// far. Dispatches happen only outside a pass (the sequencer checks), so the two kinds of
+    /// scope never overlap and share this map.
+    scope: HashMap<u32, Uses>,
     /// An empty map for a new scope: the previous scope stays intact until the command passes.
-    spare_scope: HashMap<u32, (bool, bool)>,
+    spare_scope: HashMap<u32, Uses>,
     /// The uses a draw may change, kept for rollback and reused by the next command.
-    scope_undo: Vec<(u32, Option<(bool, bool)>)>,
+    scope_undo: Vec<(u32, Option<Uses>)>,
     /// The open pass's attachments.
-    attachments: Vec<u32>,
-    /// Read-write buffers in this command: reused across draws and dispatches.
-    written: Vec<u32>,
-    /// The open pass's targets (the screen or a texture's format or none, and a depth target or
+    attachments: Vec<Attachment>,
+    /// Read-write subresources in this command: reused across draws and dispatches.
+    written: Vec<(u32, Use)>,
+    /// The open pass's targets (the screen or its textures' formats, and a depth target or
     /// none): which pipelines its draws may draw with.
     targets: RenderTarget,
+    /// The open pass's size, for its scissors.
+    pass_size: Option<(u32, u32)>,
     /// The current frame's screen size, when the host has begun a frame.
     screen_size: Option<(u32, u32)>,
 }
 
+/// The most mip levels a `width` × `height` texture has.
+pub fn max_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
 impl Checker {
-    /// A checker for a device with WebGPU's default limits.
+    /// A checker for a device with WebGPU's default limits and no optional features (its
+    /// features are its limits' `features`).
     pub fn new(manifest: &Manifest) -> Checker {
         Checker::with_limits(manifest, crate::Limits::DEFAULT)
     }
@@ -164,9 +225,9 @@ impl Checker {
             .pipelines
             .iter()
             .map(|p| {
-                let targets = match &p.stage {
-                    Stage::Render { targets, .. } => targets.clone(),
-                    Stage::Compute { .. } => Vec::new(),
+                let (targets, blends) = match &p.stage {
+                    Stage::Render { targets, blends, .. } => (targets.clone(), blends.clone()),
+                    Stage::Compute { .. } => (Vec::new(), Vec::new()),
                 };
                 Shape {
                     name: p.name.clone(),
@@ -174,11 +235,14 @@ impl Checker {
                     uniform_size: p.uniform.as_ref().map_or(0, |u| u.size as usize),
                     bindings: p.bindings.iter().map(|b| (b.kind, b.format)).collect(),
                     targets,
+                    blends,
+                    requires: p.requires.clone(),
                 }
             })
             .collect();
         Checker {
             limits,
+            features: limits.feature_names().into_iter().map(String::from).collect(),
             pipelines,
             resources: HashMap::new(),
             resource_undo: Vec::new(),
@@ -189,8 +253,23 @@ impl Checker {
             attachments: Vec::new(),
             written: Vec::new(),
             targets: RenderTarget::default(),
+            pass_size: None,
             screen_size: None,
         }
+    }
+
+    /// The device's optional features (WebGPU's names), which a command may need.
+    pub fn set_features(&mut self, features: impl IntoIterator<Item = impl Into<String>>) {
+        self.features = features.into_iter().map(Into::into).collect();
+    }
+
+    fn has(&self, feature: &str) -> bool {
+        self.features.iter().any(|f| f == feature)
+    }
+
+    /// Whether the device has a capability `can` of the format table.
+    fn can(&self, can: Can) -> bool {
+        can.on(|f| self.has(f))
     }
 
     /// The screen's dimensions for the next frame's pass checks.
@@ -229,6 +308,7 @@ impl Checker {
         self.attachments.clear();
         self.written.clear();
         self.targets = RenderTarget::default();
+        self.pass_size = None;
     }
 
     /// Checks a command that has passed the [`crate::stream::Sequencer`], and records its
@@ -247,35 +327,41 @@ impl Checker {
             debug_assert!(self.spare_scope.is_empty());
             std::mem::swap(&mut self.scope, &mut self.spare_scope);
         }
-        let pass_state =
-            matches!(cmd, Command::BeginPass(_)).then(|| (self.attachments.clone(), self.targets));
+        let pass_state = matches!(cmd, Command::BeginPass(_))
+            .then(|| (self.attachments.clone(), self.targets, self.pass_size));
         debug_assert!(self.scope_undo.is_empty());
         {
-            let mut remember = |handle: u32| {
-                if !self.scope_undo.iter().any(|(h, _)| *h == handle) {
-                    self.scope_undo.push((handle, self.scope.get(&handle).copied()));
-                }
-            };
+            let mut handles: Vec<u32> = Vec::new();
             match cmd {
-                Command::Draw { bindings, .. } => {
-                    for b in bindings {
-                        remember(b.handle);
-                    }
-                }
+                Command::Draw { bindings, .. } => handles.extend(bindings.iter().map(|b| b.handle)),
                 Command::DrawIndirect { arguments, bindings, .. } => {
-                    for b in bindings {
-                        remember(b.handle);
-                    }
-                    remember(*arguments);
+                    handles.extend(bindings.iter().map(|b| b.handle));
+                    handles.push(*arguments);
                 }
                 Command::DrawIndexedIndirect { indices, arguments, bindings, .. } => {
-                    for b in bindings {
-                        remember(b.handle);
+                    handles.extend(bindings.iter().map(|b| b.handle));
+                    handles.extend([*indices, *arguments]);
+                }
+                Command::DrawIndexed { indices, bindings, .. } => {
+                    handles.extend(bindings.iter().map(|b| b.handle));
+                    handles.push(*indices);
+                }
+                Command::MultiDrawIndirect {
+                    indices, arguments, count_buffer, bindings, ..
+                } => {
+                    handles.extend(bindings.iter().map(|b| b.handle));
+                    handles.push(*arguments);
+                    handles.extend(indices.map(|i| i[0]));
+                    if *count_buffer != NONE {
+                        handles.push(*count_buffer);
                     }
-                    remember(*indices);
-                    remember(*arguments);
                 }
                 _ => {}
+            }
+            for handle in handles {
+                if !self.scope_undo.iter().any(|(h, _)| *h == handle) {
+                    self.scope_undo.push((handle, self.scope.get(&handle).cloned()));
+                }
             }
         }
         let result = self.check_in_place(cmd);
@@ -294,9 +380,10 @@ impl Checker {
                     }
                 }
             }
-            if let Some((attachments, targets)) = pass_state {
+            if let Some((attachments, targets, size)) = pass_state {
                 self.attachments = attachments;
                 self.targets = targets;
+                self.pass_size = size;
             }
         }
         if whole_scope {
@@ -317,22 +404,70 @@ impl Checker {
                 }
                 self.create(op, *handle, Resource::Buffer { size: *size })?;
             }
-            Command::CreateTexture { handle, width, height, format, writable, depth } => {
+            Command::CreateTexture {
+                handle,
+                width,
+                height,
+                format,
+                writable,
+                kind,
+                layers,
+                levels,
+            } => {
                 let max = self.limits.max_texture_size;
                 if *width > max || *height > max {
                     return err(format!(
                         "texture {handle} is {width}x{height}; the limit is {max} a side"
                     ));
                 }
-                if [*width, *height, *depth].iter().any(|&s| s > MAX_TEXTURE_3D) && *depth > 0 {
+                if *kind == TextureKind::D3
+                    && [*width, *height, *layers].iter().any(|&s| s > MAX_TEXTURE_3D)
+                {
                     return err(format!(
-                        "3D texture {handle} is {width}x{height}x{depth}; the limit is {MAX_TEXTURE_3D} a side"
+                        "3D texture {handle} is {width}x{height}x{layers}; the limit is {MAX_TEXTURE_3D} a side"
+                    ));
+                }
+                if *kind == TextureKind::Array && *layers > MAX_LAYERS {
+                    return err(format!(
+                        "texture array {handle} has {layers} layers; the limit is {MAX_LAYERS}"
+                    ));
+                }
+                let most = max_levels(*width, *height);
+                if *levels > most {
+                    return err(format!(
+                        "texture {handle} is {width}x{height}, which has at most {most} mip levels, not {levels}"
+                    ));
+                }
+                let info = format.info();
+                if format.is_compressed() {
+                    if !self.can(info.filterable) {
+                        let need = info.filterable.feature().map_or("", |f| f.name());
+                        return err(format!(
+                            "texture {handle} is {}, which needs the device feature `{need}`",
+                            format.name()
+                        ));
+                    }
+                    if width % info.block != 0 || height % info.block != 0 {
+                        return err(format!(
+                            "texture {handle} is {}, whose {}x{} blocks a {width}x{height} texture doesn't hold whole",
+                            format.name(),
+                            info.block,
+                            info.block
+                        ));
+                    }
+                }
+                if *writable && !self.can(info.storable) {
+                    return err(format!(
+                        "texture {handle} is made writable, and kernels can't write {} on this device",
+                        format.name()
                     ));
                 }
                 let t = Texture {
                     width: *width,
                     height: *height,
-                    depth: *depth,
+                    kind: *kind,
+                    layers: *layers,
+                    levels: *levels,
                     format: *format,
                     writable: *writable,
                 };
@@ -374,35 +509,88 @@ impl Checker {
                 self.range(op, *source, *source_offset, *size, "copying")?;
                 self.range(op, *destination, *destination_offset, *size, "copying")?;
             }
-            Command::WriteTexture { handle, x, y, width, height, data } => {
-                let Texture { width: w, height: h, depth, format, .. } =
-                    self.texture(op, *handle)?;
-                if depth > 0 {
+            Command::WriteTexture { handle, level, layer, x, y, width, height, data } => {
+                let t = self.texture(op, *handle)?;
+                if t.kind == TextureKind::D3 {
                     return err(format!(
                         "texture {handle} is a 3D texture, whose texels kernels write"
                     ));
                 }
-                if u64::from(*x) + u64::from(*width) > u64::from(w)
-                    || u64::from(*y) + u64::from(*height) > u64::from(h)
-                {
-                    return err(format!(
-                        "writing {width}x{height} texels at ({x}, {y}) overruns texture {handle} ({w}x{h})"
-                    ));
-                }
-                if format.is_depth() {
+                if t.format.is_depth() {
                     return err(format!(
                         "texture {handle} is a depth texture, which only a pass can write"
                     ));
                 }
-                let want =
-                    u64::from(*width) * u64::from(*height) * u64::from(format.bytes_per_texel());
+                let rect = TexelRect {
+                    texture: *handle,
+                    level: *level,
+                    layer: *layer,
+                    x: *x,
+                    y: *y,
+                    width: *width,
+                    height: *height,
+                };
+                self.rect(op, &t, &rect, "writing")?;
+                let want = t.format.bytes_of(*width, *height);
                 if data.len() as u64 != want {
                     return err(format!(
                         "{width}x{height} texels of {} are {want} bytes, not {}",
-                        format.name(),
+                        t.format.name(),
                         data.len()
                     ));
                 }
+            }
+            Command::CopyTexture { source, destination } => {
+                let s = self.texture(op, source.texture)?;
+                let d = self.texture(op, destination.texture)?;
+                if s.format != d.format {
+                    return err(format!(
+                        "texture {} is {} and texture {} is {}: a copy is between textures of one format",
+                        source.texture,
+                        s.format.name(),
+                        destination.texture,
+                        d.format.name()
+                    ));
+                }
+                if s.format.is_depth() || s.kind == TextureKind::D3 || d.kind == TextureKind::D3 {
+                    return err("a copy between textures is of 2D colour texels".into());
+                }
+                let at = TexelRect {
+                    texture: destination.texture,
+                    level: destination.level,
+                    layer: destination.layer,
+                    x: destination.x,
+                    y: destination.y,
+                    width: source.width,
+                    height: source.height,
+                };
+                self.rect(op, &s, source, "copying from")?;
+                self.rect(op, &d, &at, "copying to")?;
+                if source.texture == destination.texture
+                    && source.level == destination.level
+                    && source.layer == destination.layer
+                {
+                    return err(format!(
+                        "level {} and layer {} of texture {} is both the copy's source and its destination",
+                        source.level, source.layer, source.texture
+                    ));
+                }
+            }
+            Command::CopyTextureToBuffer { source, buffer, offset, bytes_per_row } => {
+                let t = self.texture(op, source.texture)?;
+                if t.kind == TextureKind::D3 {
+                    return err("a texture copied to a buffer is a 2D one".into());
+                }
+                self.rect(op, &t, source, "copying from")?;
+                self.buffer_rows(op, t.format, source, *buffer, *offset, *bytes_per_row)?;
+            }
+            Command::CopyBufferToTexture { buffer, offset, bytes_per_row, destination } => {
+                let t = self.texture(op, destination.texture)?;
+                if t.kind == TextureKind::D3 || t.format.is_depth() {
+                    return err("a buffer is copied into a 2D colour texture".into());
+                }
+                self.rect(op, &t, destination, "copying to")?;
+                self.buffer_rows(op, t.format, destination, *buffer, *offset, *bytes_per_row)?;
             }
             // A dispatch and a pass start from the empty scope `check` swapped in.
             Command::Dispatch { pipeline, groups, bindings, uniforms } => {
@@ -424,61 +612,20 @@ impl Checker {
                 self.scope.clear();
                 self.attachments.clear();
                 self.targets = RenderTarget::screen(false);
+                self.pass_size = self.screen_size;
             }
-            Command::BeginPass(pass) => {
-                self.clear_colour(op, &pass.clear)?;
-                if !pass.clear_depth.is_finite() {
-                    return err("the clear depth isn't a finite number".into());
-                }
-                if pass.depth != NONE
-                    && !pass.keep_depth
-                    && !(0.0..=1.0).contains(&pass.clear_depth)
+            Command::BeginPass(pass) => self.begin_pass(op, pass)?,
+            Command::SetScissor { x, y, width, height } => {
+                if let Some((w, h)) = self.pass_size
+                    && (u64::from(*x) + u64::from(*width) > u64::from(w)
+                        || u64::from(*y) + u64::from(*height) > u64::from(h))
                 {
-                    return err("the clear depth isn't from 0 to 1".into());
+                    return err(format!(
+                        "a scissor of {width}x{height} at ({x}, {y}) overruns the pass's {w}x{h} targets"
+                    ));
                 }
-                self.attachments.clear();
-                let mut size = if pass.color == SCREEN { self.screen_size } else { None };
-                for t in [pass.color, pass.depth] {
-                    let three =
-                        matches!(self.resources.get(&t), Some(Resource::Texture(x)) if x.depth > 0);
-                    if t != SCREEN && t != NONE && three {
-                        return err(format!(
-                            "texture {t} is a 3D texture, so it can't be a target"
-                        ));
-                    }
-                }
-                let mut colour = (pass.color == SCREEN).then_some(SCREEN_FORMAT);
-                if pass.color != SCREEN && pass.color != NONE {
-                    let t = self.texture(op, pass.color)?;
-                    if t.format.is_depth() {
-                        return err(format!(
-                            "texture {} is a depth texture, so it can't be a colour target",
-                            pass.color
-                        ));
-                    }
-                    size = Some((t.width, t.height));
-                    colour = Some(t.format);
-                    self.attachments.push(pass.color);
-                }
-                if pass.depth != NONE {
-                    let t = self.texture(op, pass.depth)?;
-                    if !t.format.is_depth() {
-                        return err(format!("texture {} isn't a depth texture", pass.depth));
-                    }
-                    if size.is_some_and(|s| s != (t.width, t.height)) {
-                        return err("the pass's colour and depth targets differ in size".into());
-                    }
-                    self.attachments.push(pass.depth);
-                }
-                if pass.color == NONE && pass.depth == NONE {
-                    return err("a pass needs a colour target or a depth target".into());
-                }
-                self.targets = RenderTarget {
-                    color: colour,
-                    depth: pass.depth != NONE,
-                    screen: pass.color == SCREEN,
-                };
             }
+            Command::SetViewport { .. } => {}
             Command::Draw { pipeline, bindings, uniforms, .. } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
             }
@@ -497,13 +644,64 @@ impl Checker {
                 uniforms,
             } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
-                if *index_size == 0 {
-                    return err(format!("the index range of buffer {indices} is empty"));
-                }
-                self.read_range(op, *indices, *index_offset, *index_size, "reading indices:")?;
+                self.indices(op, *indices, *index_offset, *index_size)?;
                 self.read_range(op, *arguments, *offset, 20, "reading arguments:")?;
             }
-            Command::Present | Command::EndPass => self.attachments.clear(),
+            Command::DrawIndexed {
+                pipeline,
+                indices,
+                index_offset,
+                index_size,
+                index_count,
+                first_index,
+                bindings,
+                uniforms,
+                ..
+            } => {
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                self.indices(op, *indices, *index_offset, *index_size)?;
+                let last = u64::from(*first_index) + u64::from(*index_count);
+                if last * 4 > u64::from(*index_size) {
+                    return err(format!(
+                        "indices {first_index} to {last} run past the {} bound",
+                        index_size / 4
+                    ));
+                }
+            }
+            Command::MultiDrawIndirect {
+                pipeline,
+                indices,
+                arguments,
+                offset,
+                count,
+                count_buffer,
+                count_offset: _,
+                bindings,
+                uniforms,
+            } => {
+                self.bindings(op, *pipeline, bindings, uniforms.len())?;
+                let stride = if indices.is_some() { 20 } else { 16 };
+                if let Some([handle, at, size]) = indices {
+                    self.indices(op, *handle, *at, *size)?;
+                }
+                let bytes = u64::from(*count) * stride;
+                if bytes > u64::from(u32::MAX) {
+                    return err(format!("{count} draws' arguments are more than a buffer holds"));
+                }
+                self.read_range(op, *arguments, *offset, bytes as u32, "reading arguments:")?;
+                // A count the GPU writes would mean what a device without multi-draw can't do
+                // (the host draws `count` draws one by one): not in 0.6. An unused draw has no
+                // instances instead.
+                if *count_buffer != NONE {
+                    return err(
+                        "a multi-draw's count buffer isn't supported: it draws `count` draws, so give the unused ones no instances".into(),
+                    );
+                }
+            }
+            Command::Present | Command::EndPass => {
+                self.attachments.clear();
+                self.pass_size = None;
+            }
             Command::StorageRead { path, .. } | Command::StorageWrite { path, .. } => {
                 if let Some(why) = path_problem(path) {
                     return err(format!("the storage path `{path}` {why}"));
@@ -534,6 +732,202 @@ impl Checker {
             }
         }
         Ok(())
+    }
+
+    /// A pass's attachments: each colour target a 2D level and layer of a colour texture the
+    /// device can draw into (or the screen), the depth target a depth texture's (or a depth
+    /// array's layer), all the same size, within WebGPU's 32 bytes a sample.
+    fn begin_pass(&mut self, op: Opcode, pass: &Pass) -> Result<()> {
+        let err = |why: String| Err(CommandError { opcode: op, why });
+        for c in pass.colors() {
+            self.clear_colour(op, &c.clear)?;
+        }
+        if !pass.clear_depth.is_finite() {
+            return err("the clear depth isn't a finite number".into());
+        }
+        if pass.depth != NONE && !pass.keep_depth && !(0.0..=1.0).contains(&pass.clear_depth) {
+            return err("the clear depth isn't from 0 to 1".into());
+        }
+        self.attachments.clear();
+        let mut size = None;
+        let mut formats = Vec::new();
+        let screen = pass.on_screen();
+        if screen {
+            size = self.screen_size;
+            formats.push(SCREEN_FORMAT);
+        }
+        for c in pass.colors().iter().filter(|c| c.texture != SCREEN) {
+            let t = self.texture(op, c.texture)?;
+            if t.kind == TextureKind::D3 {
+                return err(format!(
+                    "texture {} is a 3D texture, so it can't be a target",
+                    c.texture
+                ));
+            }
+            if t.format.is_depth() {
+                return err(format!(
+                    "texture {} is a depth texture, so it can't be a colour target",
+                    c.texture
+                ));
+            }
+            let renderable = t.format.info().renderable;
+            if !self.can(renderable) {
+                let why = match renderable.feature() {
+                    Some(f) => format!(
+                        "drawing into {} needs the device feature `{}`",
+                        t.format.name(),
+                        f.name()
+                    ),
+                    None => format!("a pass can't draw into {}", t.format.name()),
+                };
+                return err(format!("texture {}: {why}", c.texture));
+            }
+            self.subresource(op, &t, c.texture, c.level, c.layer)?;
+            let at = t.size(c.level);
+            if size.is_some_and(|s| s != at) {
+                return err("the pass's targets differ in size".into());
+            }
+            size = Some(at);
+            formats.push(t.format);
+            let a = Attachment { handle: c.texture, level: c.level, layer: c.layer };
+            if self.attachments.contains(&a) {
+                return err(format!(
+                    "level {} and layer {} of texture {} is two of the pass's targets",
+                    c.level, c.layer, c.texture
+                ));
+            }
+            self.attachments.push(a);
+        }
+        let bytes = crate::stream::color_attachment_bytes(&formats);
+        if bytes > MAX_COLOR_ATTACHMENT_BYTES {
+            let names: Vec<&str> = formats.iter().map(|f| f.name()).collect();
+            return err(format!(
+                "colour targets {} take {bytes} bytes a sample; WebGPU's limit is {MAX_COLOR_ATTACHMENT_BYTES}",
+                names.join(", ")
+            ));
+        }
+        if pass.depth != NONE {
+            let t = self.texture(op, pass.depth)?;
+            if !t.format.is_depth() {
+                return err(format!("texture {} isn't a depth texture", pass.depth));
+            }
+            self.subresource(op, &t, pass.depth, 0, pass.depth_layer)?;
+            if size.is_some_and(|s| s != t.size(0)) {
+                return err("the pass's colour and depth targets differ in size".into());
+            }
+            size = Some(t.size(0));
+            self.attachments.push(Attachment {
+                handle: pass.depth,
+                level: 0,
+                layer: pass.depth_layer,
+            });
+        }
+        if pass.count == 0 && pass.depth == NONE {
+            return err("a pass needs a colour target or a depth target".into());
+        }
+        self.targets = RenderTarget { screen, ..RenderTarget::of(&formats, pass.depth != NONE) };
+        self.pass_size = size;
+        Ok(())
+    }
+
+    /// That level `level` and layer `layer` of texture `handle` (`t`) exist.
+    fn subresource(
+        &self,
+        op: Opcode,
+        t: &Texture,
+        handle: u32,
+        level: u32,
+        layer: u32,
+    ) -> Result<()> {
+        if level >= t.levels || layer >= t.subresource_layers() {
+            return Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "texture {handle} has {} levels and {} layers: there's no level {level} of layer {layer}",
+                    t.levels,
+                    t.subresource_layers()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// That `r` is inside its texture `t`'s level and layer, and whole blocks of a compressed
+    /// one (but at the level's edge).
+    fn rect(&self, op: Opcode, t: &Texture, r: &TexelRect, doing: &str) -> Result<()> {
+        let err = |why: String| Err(CommandError { opcode: op, why });
+        self.subresource(op, t, r.texture, r.level, r.layer)?;
+        let (w, h) = t.size(r.level);
+        let (x, y, width, height, handle) = (r.x, r.y, r.width, r.height, r.texture);
+        if u64::from(x) + u64::from(width) > u64::from(w)
+            || u64::from(y) + u64::from(height) > u64::from(h)
+        {
+            return err(format!(
+                "{doing} {width}x{height} texels at ({x}, {y}) overruns level {} of texture {handle} ({w}x{h})",
+                r.level
+            ));
+        }
+        let b = t.format.block();
+        if b > 1 {
+            let whole = |at: u32, n: u32, side: u32| {
+                at.is_multiple_of(b) && (n.is_multiple_of(b) || at + n == side)
+            };
+            if !whole(x, width, w) || !whole(y, height, h) {
+                return err(format!(
+                    "{doing} {width}x{height} texels at ({x}, {y}) of texture {handle} cuts its {b}x{b} blocks"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// That a copy's rows of `r`'s texels fit in buffer `buffer` from `offset`, `bytes_per_row`
+    /// apart.
+    fn buffer_rows(
+        &self,
+        op: Opcode,
+        format: TextureFormat,
+        r: &TexelRect,
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+    ) -> Result<()> {
+        let b = format.block();
+        // WebGPU's rule: a copy's buffer offset is a whole number of the format's blocks.
+        let block_bytes = format.bytes_per_texel();
+        if !offset.is_multiple_of(block_bytes) {
+            return Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "the buffer's offset {offset} isn't a multiple of a {} block's {block_bytes} bytes",
+                    format.info().name
+                ),
+            });
+        }
+        let row = u64::from(r.width.div_ceil(b)) * u64::from(format.bytes_per_texel());
+        if u64::from(bytes_per_row) < row {
+            return Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "a row of {} texels is {row} bytes, more than {bytes_per_row} a row",
+                    r.width
+                ),
+            });
+        }
+        let rows = u64::from(r.height.div_ceil(b));
+        let bytes = if rows == 0 { 0 } else { (rows - 1) * u64::from(bytes_per_row) + row };
+        self.range(op, buffer, offset, bytes.min(u64::from(u32::MAX)) as u32, "copying")
+    }
+
+    /// An indexed draw's indices: a non-empty range of buffer `handle`, read.
+    fn indices(&mut self, op: Opcode, handle: u32, offset: u32, size: u32) -> Result<()> {
+        if size == 0 {
+            return Err(CommandError {
+                opcode: op,
+                why: format!("the index range of buffer {handle} is empty"),
+            });
+        }
+        self.read_range(op, handle, offset, size, "reading indices:")
     }
 
     fn clear_colour(&self, op: Opcode, clear: &[f32; 4]) -> Result<()> {
@@ -607,17 +1001,6 @@ impl Checker {
         }
     }
 
-    /// That texture `handle`, 3D or not (`is`), is 3D where the binding is (`three`), and 2D
-    /// where it isn't.
-    fn dimensions(op: Opcode, handle: u32, is: bool, three: bool) -> Result<()> {
-        if is == three {
-            return Ok(());
-        }
-        let (what, want) = if is { ("a 3D", "a 2D") } else { ("a 2D", "a 3D") };
-        let why = format!("texture {handle} is {what} texture, bound where {want} texture goes");
-        Err(CommandError { opcode: op, why })
-    }
-
     fn sampler(&self, op: Opcode, handle: u32) -> Result<bool> {
         match self.resources.get(&handle) {
             Some(Resource::Sampler { comparison }) => Ok(*comparison),
@@ -650,25 +1033,21 @@ impl Checker {
         doing: &str,
     ) -> Result<()> {
         self.range(op, handle, offset, size, doing)?;
-        Self::used(&mut self.scope, op, "buffer", handle, false)
+        let u = Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false };
+        Self::used(&mut self.scope, op, "buffer", handle, u)
     }
 
     /// Adds a use of a buffer or texture (`what`) to the usage scope. (A function of the scope
     /// alone, so a caller can hold a pipeline's shape meanwhile.)
     fn used(
-        scope: &mut HashMap<u32, (bool, bool)>,
+        scope: &mut HashMap<u32, Uses>,
         op: Opcode,
         what: &str,
         handle: u32,
-        write: bool,
+        u: Use,
     ) -> Result<()> {
-        let seen = scope.entry(handle).or_default();
-        if write {
-            seen.1 = true
-        } else {
-            seen.0 = true
-        }
-        if seen.0 && seen.1 {
+        let uses = scope.entry(handle).or_default();
+        if uses.iter().any(|o| o.write != u.write && o.overlaps(&u)) {
             let one = if matches!(op, Opcode::Dispatch | Opcode::DispatchIndirect) {
                 "dispatch"
             } else {
@@ -678,6 +1057,9 @@ impl Checker {
                 opcode: op,
                 why: format!("{what} {handle} is used both read-only and read-write in one {one}"),
             });
+        }
+        if !uses.contains(&u) {
+            uses.push(u);
         }
         Ok(())
     }
@@ -706,6 +1088,11 @@ impl Checker {
                 op.name()
             ));
         }
+        if let Some(missing) = p.requires.iter().find(|f| !self.features.contains(f)) {
+            return err(format!(
+                "pipeline {pipeline} ({name}) needs the device feature `{missing}`, which this device hasn't: check `std::gpu::features()` first"
+            ));
+        }
         // A draw's pass's targets are one of its pipeline's.
         let here = self.targets;
         if !dispatch && !p.targets.contains(&here) {
@@ -714,6 +1101,18 @@ impl Checker {
                 "`{name}` is drawn into {here}, which isn't one of its targets ({})",
                 theirs.join(", ")
             ));
+        }
+        if !dispatch {
+            for (c, f) in here.colors().enumerate() {
+                let blend = p.blends.get(c).copied().unwrap_or_default();
+                if blend != Blend::Replace && !self.can(f.info().blendable) {
+                    let need = f.info().blendable.feature().map_or("", |x| x.name());
+                    return err(format!(
+                        "`{name}` blends into {}, which needs the device feature `{need}`",
+                        f.name()
+                    ));
+                }
+            }
         }
         if bindings.len() != p.bindings.len() {
             let (want, got) = (p.bindings.len(), bindings.len());
@@ -729,18 +1128,6 @@ impl Checker {
         }
         self.written.clear();
         for (b, &(kind, format)) in bindings.iter().zip(&p.bindings) {
-            if self.attachments.contains(&b.handle) {
-                return err(format!(
-                    "texture {} is the pass's target, so its draws can't bind it",
-                    b.handle
-                ));
-            }
-            if !kind.is_buffer() && (b.offset != 0 || b.size != 0) {
-                return err(format!(
-                    "a texture or sampler binding has offset {} and size {}: both must be 0",
-                    b.offset, b.size
-                ));
-            }
             match kind {
                 BindingKind::Read | BindingKind::ReadWrite => {
                     self.range(op, b.handle, b.offset, b.size, "binding")?;
@@ -757,41 +1144,26 @@ impl Checker {
                         ));
                     }
                     let write = kind == BindingKind::ReadWrite;
+                    let u = Use { levels: Use::BUFFER, layers: Use::BUFFER, write };
                     if write {
-                        if self.written.contains(&b.handle) {
+                        if self.written.iter().any(|(h, _)| *h == b.handle) {
                             let one = if dispatch { "dispatch" } else { "draw" };
                             return err(format!(
                                 "buffer {} is bound read-write twice in one {one}",
                                 b.handle
                             ));
                         }
-                        self.written.push(b.handle);
+                        self.written.push((b.handle, u));
                     }
-                    Self::used(&mut self.scope, op, "buffer", b.handle, write)?;
-                }
-                BindingKind::Texture
-                | BindingKind::DepthTexture
-                | BindingKind::Texture3d
-                | BindingKind::StorageTexture
-                | BindingKind::StorageTexture3d => {
-                    let t = self.texture(op, b.handle)?;
-                    let write = kind.is_storage();
-                    if write && !t.writable {
-                        return err(format!(
-                            "texture {} is bound where a kernel writes it, but wasn't made writable",
-                            b.handle
-                        ));
-                    }
-                    let depth = kind == BindingKind::DepthTexture;
-                    if !write && t.format.is_depth() != depth {
-                        let want = if depth { "a depth texture" } else { "a colour texture" };
-                        return err(format!("texture {} is bound where {want} goes", b.handle));
-                    }
-                    Self::format(op, b.handle, t.format, format)?;
-                    Self::dimensions(op, b.handle, t.depth > 0, kind.is_3d())?;
-                    Self::used(&mut self.scope, op, "texture", b.handle, write)?;
+                    Self::used(&mut self.scope, op, "buffer", b.handle, u)?;
                 }
                 BindingKind::Sampler | BindingKind::ComparisonSampler => {
+                    if b.offset != 0 || b.size != 0 {
+                        return err(format!(
+                            "a sampler binding has offset {} and size {}: both must be 0",
+                            b.offset, b.size
+                        ));
+                    }
                     let comparison = self.sampler(op, b.handle)?;
                     if comparison != (kind == BindingKind::ComparisonSampler) {
                         let want = if comparison { "a filtering" } else { "a comparison" };
@@ -800,6 +1172,75 @@ impl Checker {
                             b.handle
                         ));
                     }
+                }
+                _ => {
+                    let t = self.texture(op, b.handle)?;
+                    let view = View::of_words(b.offset, b.size);
+                    let write = kind.is_storage();
+                    if write && !t.writable {
+                        return err(format!(
+                            "texture {} is bound where a kernel writes it, but wasn't made writable",
+                            b.handle
+                        ));
+                    }
+                    let depth = kind.is_depth();
+                    if !write && t.format.is_depth() != depth {
+                        let want = if depth { "a depth texture" } else { "a colour texture" };
+                        return err(format!("texture {} is bound where {want} goes", b.handle));
+                    }
+                    Self::format(op, b.handle, t.format, format)?;
+                    if !kind.takes(t.kind, view.layer.is_some()) {
+                        let shown = match view.layer {
+                            Some(l) => format!("layer {l} of a {} texture", t.kind.name()),
+                            None => format!("a {} texture", t.kind.name()),
+                        };
+                        return err(format!(
+                            "texture {} is {shown}, bound where a {} texture goes",
+                            b.handle,
+                            kind.dimension().unwrap_or("2d")
+                        ));
+                    }
+                    if view.level.is_some_and(|l| l >= t.levels)
+                        || view.layer.is_some_and(|l| l >= t.subresource_layers())
+                    {
+                        return err(format!(
+                            "texture {} has {} levels and {} layers, and its binding's view is {view:?}",
+                            b.handle,
+                            t.levels,
+                            t.subresource_layers()
+                        ));
+                    }
+                    // A storage view is one level: the one named, or the first.
+                    let levels = match (view.level, write) {
+                        (Some(l), _) => (l, l + 1),
+                        (None, true) => (0, 1),
+                        (None, false) => (0, t.levels),
+                    };
+                    let layers = match view.layer {
+                        Some(l) => (l, l + 1),
+                        None => (0, t.subresource_layers()),
+                    };
+                    let u = Use { levels, layers, write };
+                    if self.attachments.iter().any(|a| {
+                        a.handle == b.handle
+                            && (levels.0..levels.1).contains(&a.level)
+                            && (layers.0..layers.1).contains(&a.layer)
+                    }) {
+                        return err(format!(
+                            "texture {} is the pass's target, so its draws can't bind it",
+                            b.handle
+                        ));
+                    }
+                    if write {
+                        if self.written.iter().any(|(h, o)| *h == b.handle && o.overlaps(&u)) {
+                            return err(format!(
+                                "texture {} is bound for writing twice in one dispatch",
+                                b.handle
+                            ));
+                        }
+                        self.written.push((b.handle, u));
+                    }
+                    Self::used(&mut self.scope, op, "texture", b.handle, u)?;
                 }
             }
         }
@@ -824,7 +1265,9 @@ mod tests {
                 height: 8,
                 format: TextureFormat::Rgba8,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("texture");
         checker
@@ -833,6 +1276,8 @@ mod tests {
                 linear: true,
                 repeat: false,
                 compare: None,
+                mip_linear: false,
+                anisotropy: 1,
             })
             .expect("sampler");
 
@@ -851,7 +1296,9 @@ mod tests {
                 height: 8,
                 format: TextureFormat::Rgba8,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("replace sampler with target");
         checker.check(&Command::CreateBuffer { handle: 4, size: 16 }).expect("new buffer");
@@ -859,13 +1306,8 @@ mod tests {
         checker.check(&Command::DestroyBuffer { handle: 5 }).expect("drop temporary buffer");
         checker
             .check(&Command::BeginPass(Pass {
-                color: 3,
-                keep_color: false,
                 join: false,
-                clear: [0.0; 4],
-                depth: NONE,
-                keep_depth: false,
-                clear_depth: 1.0,
+                ..Pass::one(3, false, [0.0; 4]).with_depth(NONE, false, 1.0)
             }))
             .expect("unfinished pass");
         checker
@@ -924,7 +1366,9 @@ mod tests {
                 height: 1,
                 format: TextureFormat::Rgba8,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("texture");
         checker
@@ -933,6 +1377,8 @@ mod tests {
                 linear: true,
                 repeat: false,
                 compare: None,
+                mip_linear: false,
+                anisotropy: 1,
             })
             .expect("sampler");
         checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("pass");
@@ -949,13 +1395,17 @@ mod tests {
                         bindings,
                         uniforms: &[],
                     })
-                    .expect_err("a texture or sampler has no buffer range");
-                assert_eq!(
-                    error.why,
-                    format!(
-                        "a texture or sampler binding has offset {offset} and size {size}: both must be 0"
-                    )
-                );
+                    .expect_err("a sampler has no range, and texture 1 one level and layer");
+                if slot == 1 {
+                    assert_eq!(
+                        error.why,
+                        format!(
+                            "a sampler binding has offset {offset} and size {size}: both must be 0"
+                        )
+                    );
+                } else {
+                    assert!(error.why.contains("its binding's view is"), "{}", error.why);
+                }
             }
         }
         checker
@@ -979,18 +1429,13 @@ mod tests {
                 height: 8,
                 format: TextureFormat::Depth32Float,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("depth texture");
-        let pass = Pass {
-            color: SCREEN,
-            keep_color: false,
-            join: false,
-            clear: [0.0; 4],
-            depth: 1,
-            keep_depth: false,
-            clear_depth: 1.0,
-        };
+        let pass =
+            Pass { join: false, ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0) };
         for clear_depth in [-0.01, 1.01, f32::MIN, f32::MAX] {
             assert_eq!(
                 checker
@@ -1023,17 +1468,14 @@ mod tests {
                 height: 8,
                 format: TextureFormat::Depth32Float,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("depth texture");
         let pass = Command::BeginPass(Pass {
-            color: SCREEN,
-            keep_color: false,
             join: false,
-            clear: [0.0; 4],
-            depth: 1,
-            keep_depth: false,
-            clear_depth: 1.0,
+            ..Pass::one(SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0)
         });
         checker.set_screen_size(16, 8);
         assert_eq!(
@@ -1101,11 +1543,23 @@ mod tests {
         }
         checker.check(&dispatch([1; 3], 3, 4)).expect("a new scope after rejected dispatches");
         assert_eq!(checker.scope.len(), 2);
-        assert_eq!(checker.scope.get(&3), Some(&(true, false)));
-        assert_eq!(checker.scope.get(&4), Some(&(false, true)));
+        assert_eq!(
+            checker.scope.get(&3),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }])
+        );
+        assert_eq!(
+            checker.scope.get(&4),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }])
+        );
         checker.check(&dispatch([1; 3], 2, 1)).expect("the next dispatch can reverse uses");
-        assert_eq!(checker.scope.get(&1), Some(&(false, true)));
-        assert_eq!(checker.scope.get(&2), Some(&(true, false)));
+        assert_eq!(
+            checker.scope.get(&1),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: true }])
+        );
+        assert_eq!(
+            checker.scope.get(&2),
+            Some(&vec![Use { levels: Use::BUFFER, layers: Use::BUFFER, write: false }])
+        );
     }
 
     #[test]
@@ -1179,19 +1633,16 @@ mod tests {
                 height: 8,
                 format: TextureFormat::Rgba8,
                 writable: false,
-                depth: 0,
+                kind: TextureKind::D2,
+                layers: 1,
+                levels: 1,
             })
             .expect("texture");
         checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("screen pass");
         checker.check(&Command::Present).expect("end screen pass");
-        let bad_pass = Command::BeginPass(crate::stream::Pass {
-            color: 3,
-            keep_color: false,
+        let bad_pass = Command::BeginPass(Pass {
             join: false,
-            clear: [0.0; 4],
-            depth: 99,
-            keep_depth: false,
-            clear_depth: 1.0,
+            ..Pass::one(3, false, [0.0; 4]).with_depth(99, false, 1.0)
         });
         assert_eq!(
             checker.check(&bad_pass).expect_err("missing depth target").why,

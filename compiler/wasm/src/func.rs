@@ -1366,6 +1366,8 @@ impl<'m> Fe<'m> {
                     ir::Const::Small(_, x) => I::I32Const(*x as i32),
                     ir::Const::F32(x) => I::F32Const((*x).into()),
                     ir::Const::F64(x) => I::F64Const((*x).into()),
+                    // Lowering refuses `f16` in CPU code (E0338).
+                    ir::Const::F16(_) => return Err("an `f16` in CPU code".into()),
                 };
                 self.ins.extend([i, I::LocalSet(self.v(v))]);
             }
@@ -1559,7 +1561,10 @@ impl<'m> Fe<'m> {
             ir::Expr::Texture(..) | ir::Expr::TextureStore(..) => {
                 return Err("internal: a texture read or write in CPU code".into());
             }
-            ir::Expr::Atomic(..) | ir::Expr::Barrier | ir::Expr::Discard => {
+            ir::Expr::Atomic(..)
+            | ir::Expr::Barrier
+            | ir::Expr::Subgroup(..)
+            | ir::Expr::Discard => {
                 return Err("internal: an atomic or a barrier in CPU code".into());
             }
         }

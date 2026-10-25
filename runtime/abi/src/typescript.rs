@@ -16,10 +16,19 @@ pub fn typescript() -> String {
         .enumerate()
         .map(|(i, &f)| {
             assert_eq!(f as usize, i, "texture formats are numbered from 0");
-            let (name, bytes, depth) = (f.name(), f.bytes_per_texel(), f.is_depth());
-            let (storable, filterable, uint) = (f.storable(), f.filterable(), f.is_uint());
+            let i = f.info();
+            let (name, bytes, depth) = (i.name, i.block_bytes, i.depth);
+            let (storable, filterable, uint) = (f.storable(), f.filterable(), i.uint);
+            let (renderable, blendable) = (f.renderable(), f.blendable());
+            let (block, channels, cost, align) = (i.block, i.channels, i.target_cost, i.target_align);
+            let needs = |c: stream::Can| match c.feature() {
+                Some(feature) => format!("{:?}", feature.name()),
+                None => "null".to_string(),
+            };
+            let (nf, ns, nr, nb) =
+                (needs(i.filterable), needs(i.storable), needs(i.renderable), needs(i.blendable));
             format!(
-                "  {{ name: {name:?}, bytes: {bytes}, depth: {depth}, storable: {storable}, filterable: {filterable}, uint: {uint} }},\n"
+                "  {{ name: {name:?}, bytes: {bytes}, block: {block}, channels: {channels}, depth: {depth}, storable: {storable}, filterable: {filterable}, renderable: {renderable}, blendable: {blendable}, uint: {uint}, target_cost: {cost}, target_align: {align}, needs: {{ filter: {nf}, store: {ns}, render: {nr}, blend: {nb} }} }},\n"
             )
         })
         .collect();
@@ -41,7 +50,12 @@ pub fn typescript() -> String {
         .map(|k| {
             let (name, format, storage, three) = (k.name(), k.has_format(), k.is_storage(), k.is_3d());
             let limit = k.limit().name();
-            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_3d: {three}, limit: {limit:?} }},\n")
+            let dimension = match k.dimension() {
+                Some(d) => format!("{d:?}"),
+                None => "null".to_string(),
+            };
+            let depth = k.is_depth();
+            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_3d: {three}, is_depth: {depth}, dimension: {dimension}, limit: {limit:?} }},\n")
         })
         .collect();
     let host_functions: String = crate::HOST_FUNCTIONS
@@ -81,10 +95,29 @@ export const UPLOAD_MAX = {upload_max};
 export const Opcode = {{
 {opcodes}}} as const;
 
-/** A texture's format, by its number in the stream: WebGPU's name, the bytes of one texel, and
- * whether it's a depth format. */
+/** A texture's format, by its number in the stream: the format table (runtime/abi
+ * `TextureFormat::info`). WebGPU's name; the bytes of a block (a texel, or a compressed format's
+ * 4 × 4 texels) and its side; the channels GPU code reads; what it can do on every device
+ * (`filterable`) or on some (`storable`, `renderable`, `blendable`); its render target cost and
+ * alignment; and the device feature each capability needs, if one. */
 export const TEXTURE_FORMATS = [
 {texture_formats}] as const;
+/** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
+export const MAX_COLOR_ATTACHMENT_BYTES = {max_color_bytes};
+export const MAX_COLOR_ATTACHMENTS = {max_color_attachments};
+/** The most mip levels a texture has, layers an array has, and anisotropy a sampler takes;
+ * WebGPU's alignment of a copy's buffer offset and rows. */
+export const MAX_LEVELS = {max_levels};
+export const MAX_LAYERS = {max_layers};
+export const MAX_ANISOTROPY = {max_anisotropy};
+export const ROW_ALIGNMENT = {row_alignment};
+/** The optional features the hosts request and report, in `wrela.limit(10)`'s bit order
+ * (runtime/abi `FEATURES`). */
+export const FEATURES = [{features}] as const;
+/** The blends (runtime/abi `Blend`): each one's colour and alpha components, WebGPU's names
+ * (`null` for `replace`). */
+export const BLENDS = {{
+{blends}}} as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = {texture_writable};
 /** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
@@ -229,6 +262,23 @@ export const PANIC = {panic};
 export const PANIC_CAP = {panic_cap};
 "#,
         stream_version = stream::VERSION,
+        max_color_bytes = stream::MAX_COLOR_ATTACHMENT_BYTES,
+        max_levels = stream::MAX_LEVELS,
+        max_layers = stream::MAX_LAYERS,
+        max_anisotropy = stream::MAX_ANISOTROPY,
+        row_alignment = stream::ROW_ALIGNMENT,
+        features = list(crate::FEATURES.iter().map(|f| format!("{f:?}"))),
+        blends = manifest::Blend::ALL
+            .iter()
+            .map(|b| match b.components() {
+                None => format!("  {}: null,\n", b.name()),
+                Some((c, a)) => format!(
+                    "  {}: {{ color: {{ srcFactor: {:?}, dstFactor: {:?}, operation: {:?} }}, alpha: {{ srcFactor: {:?}, dstFactor: {:?}, operation: {:?} }} }},\n",
+                    b.name(), c.0, c.1, c.2, a.0, a.1, a.2
+                ),
+            })
+            .collect::<String>(),
+        max_color_attachments = stream::MAX_COLOR_ATTACHMENTS,
         manifest_version = manifest::VERSION,
         magic = u32::from_le_bytes(stream::MAGIC),
         header_len = stream::HEADER_LEN,

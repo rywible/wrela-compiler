@@ -665,7 +665,7 @@ impl<'a> Ivx<'a> {
         let s = self.elem(ty);
         let (lo, hi) = match s {
             Scalar::Bool => (Const::Bool(false), Const::Bool(true)),
-            Scalar::F32 | Scalar::F64 => {
+            Scalar::F32 | Scalar::F64 | Scalar::F16 => {
                 let inf = self.inf();
                 let lo = self.fc(out, ty, -inf);
                 let hi = self.fc(out, ty, inf);
@@ -1660,7 +1660,7 @@ impl<'a> Ivx<'a> {
                     "an interval can't go through a texture read: its texels are data, not code",
                 ));
             }
-            Expr::Atomic(..) | Expr::Barrier | Expr::Discard => {
+            Expr::Atomic(..) | Expr::Barrier | Expr::Subgroup(..) | Expr::Discard => {
                 return Err(Error::not_derivable(
                     "an interval can't go through an atomic or a barrier: derived code is pure",
                 ));
@@ -2755,7 +2755,7 @@ fn float_int_range(from: Scalar, to: Scalar) -> (f64, f64) {
         Scalar::U8 => (0.0, 255.0),
         Scalar::I16 => (-32768.0, 32767.0),
         Scalar::U16 => (0.0, 65535.0),
-        Scalar::Bool | Scalar::F32 | Scalar::F64 => (0.0, 0.0),
+        Scalar::Bool | Scalar::F32 | Scalar::F64 | Scalar::F16 => (0.0, 0.0),
     }
 }
 

@@ -288,6 +288,12 @@ pub struct Limits {
     pub max_workgroup_size: [u32; 3],
     /// `maxComputeWorkgroupsPerDimension`.
     pub max_workgroups_per_dimension: u32,
+    /// The device's optional features, a bit each in [`FEATURES`]' order ([`feature_bit`]).
+    pub features: u32,
+    /// The least and the most invocations a subgroup has (`subgroupMinSize`, `subgroupMaxSize`),
+    /// or 0 without `subgroups`.
+    pub subgroup_min_size: u32,
+    pub subgroup_max_size: u32,
 }
 
 impl Limits {
@@ -302,10 +308,24 @@ impl Limits {
         max_workgroup_invocations: 256,
         max_workgroup_size: [256, 256, 64],
         max_workgroups_per_dimension: 65_535,
+        // `indirect-first-instance` alone: what every host requires.
+        features: 1 << 11,
+        subgroup_min_size: 0,
+        subgroup_max_size: 0,
     };
 
     /// How many there are: `wrela.limit` gives 0 for an index past the last.
-    pub const COUNT: u32 = 10;
+    pub const COUNT: u32 = 13;
+
+    /// Whether the device has feature `name` (WebGPU's).
+    pub fn has(&self, name: &str) -> bool {
+        feature_bit(name).is_some_and(|b| self.features & b != 0)
+    }
+
+    /// The names of the device's features.
+    pub fn feature_names(&self) -> Vec<&'static str> {
+        FEATURES.iter().copied().filter(|f| self.has(f)).collect()
+    }
 
     /// The limit at `index`, as `wrela.limit` gives it.
     pub fn get(&self, index: u32) -> u32 {
@@ -318,9 +338,36 @@ impl Limits {
             5 => self.max_workgroup_invocations,
             6..=8 => self.max_workgroup_size[index as usize - 6],
             9 => self.max_workgroups_per_dimension,
+            10 => self.features,
+            11 => self.subgroup_min_size,
+            12 => self.subgroup_max_size,
             _ => 0,
         }
     }
+}
+
+/// The optional WebGPU features the hosts request when the adapter has them, and report to a
+/// program (`std::gpu::features`), in the order `wrela.features` sets their bits: WebGPU's names.
+/// None is required: a program checks before it records what needs one. A pipeline's manifest
+/// entry names the ones its shader needs (`requires`).
+pub const FEATURES: [&str; 12] = [
+    "shader-f16",
+    "subgroups",
+    "texture-compression-bc",
+    "texture-compression-etc2",
+    "texture-compression-astc",
+    "float32-filterable",
+    "float32-blendable",
+    "rg11b10ufloat-renderable",
+    "bgra8unorm-storage",
+    "timestamp-query",
+    "chromium-experimental-multi-draw-indirect",
+    "indirect-first-instance",
+];
+
+/// The bit of `wrela.features`' answer that says a device has feature `name` ([`FEATURES`]).
+pub fn feature_bit(name: &str) -> Option<u32> {
+    FEATURES.iter().position(|f| *f == name).map(|i| 1 << i)
 }
 
 /// The checked-in files generated from this crate, each as (path, contents): the browser

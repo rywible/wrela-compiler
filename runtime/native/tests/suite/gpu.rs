@@ -209,7 +209,7 @@ const STORE_PIPELINES: &str = r#"[
       "uniform": { "binding": 0, "size": 16, "space": "uniform" },
       "bindings": [{ "binding": 1, "kind": "read_write" }] },
     { "name": "cell", "shader": "cell.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
-      "targets": [{ "color": "rgba8unorm", "depth": false, "screen": true }],
+      "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 32, "space": "uniform" }, "bindings": [] }
   ]"#;
 
@@ -653,7 +653,7 @@ fn serial_draws_keep_pipeline_and_uniform_order() {
             format!(
                 r#"{{ "name": "{name}", "shader": "cell.wgsl", "kind": "render",
                     "vertex_entry": "vs", "fragment_entry": "fs",
-                    "targets": [{{ "color": "rgba8unorm", "depth": false, "screen": true }}],
+                    "targets": [{{ "colors": ["rgba8unorm"], "depth": false, "screen": true }}], "outputs": ["float"],
                     "uniform": {{ "binding": 0, "size": 32, "space": "uniform" }},
                     "bindings": [] }}"#
             )
@@ -805,22 +805,15 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
     let pipelines = r#"[
         { "name": "read", "shader": "read.wgsl", "kind": "render",
           "vertex_entry": "vs", "fragment_entry": "fs",
-          "targets": [{ "color": "rgba8unorm", "depth": false }],
+          "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
           "bindings": [{ "binding": 0, "kind": "read", "stage": "fragment" }] },
         { "name": "write", "shader": "write.wgsl", "kind": "render",
           "vertex_entry": "vs", "fragment_entry": "fs",
-          "targets": [{ "color": "rgba8unorm", "depth": false }],
+          "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
           "bindings": [{ "binding": 0, "kind": "read_write", "stage": "fragment" }] }
     ]"#;
-    let pass = Pass {
-        color: 2,
-        keep_color: false,
-        join: false,
-        clear: [0.0; 4],
-        depth: stream::NONE,
-        keep_depth: false,
-        clear_depth: 1.0,
-    };
+    let pass =
+        Pass { join: false, ..Pass::one(2, false, [0.0; 4]).with_depth(stream::NONE, false, 1.0) };
     let batch = Encoder::new()
         .create_buffer(1, 16)
         .write_buffer(1, 0, &words(&[0xffff_ffff, 0, 0, 0]))
@@ -828,10 +821,10 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
         .begin_pass(pass)
         .draw(0, 3, 1, &[Binding::range(1, 0, 16)], &[])
         .end_pass()
-        .begin_pass(Pass { keep_color: true, join: true, ..pass })
+        .begin_pass(Pass { join: true, ..pass.keeping_color(true) })
         .draw(0, 3, 1, &[Binding::range(1, 0, 16)], &[])
         .end_pass()
-        .begin_pass(Pass { keep_color: true, join: true, ..pass })
+        .begin_pass(Pass { join: true, ..pass.keeping_color(true) })
         .draw(1, 3, 1, &[Binding::range(1, 0, 16)], &[])
         .end_pass()
         .finish();
@@ -921,15 +914,15 @@ struct M { colour: u32, z: f32, _pad: vec2u }
 "#;
 const MESH_PIPELINES: &str = r#"[
     { "name": "plain", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
-      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
+      "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
     { "name": "biased", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back", "depth_bias": { "constant": -1000, "slope_scale": 0, "clamp": 0 },
-      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
+      "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] },
     { "name": "culled", "shader": "mesh.wgsl", "kind": "render", "vertex_entry": "vs", "fragment_entry": "fs",
       "cull": "back",
-      "targets": [{ "color": "rgba8unorm", "depth": true, "screen": true }],
+      "targets": [{ "colors": ["rgba8unorm"], "depth": true, "screen": true }], "outputs": ["float"],
       "uniform": { "binding": 0, "size": 16, "space": "uniform" }, "bindings": [{ "binding": 1, "kind": "read" }] }
   ]"#;
 
@@ -965,13 +958,8 @@ fn indexed_indirect_draws_cull_and_bias() {
         .write_buffer(3, 0, &words(&[12, 1, 0, 0, 0, 0, 0, 0]))
         .create_texture(9, w, h, TextureFormat::Depth32Float, false)
         .begin_pass(Pass {
-            color: stream::SCREEN,
-            keep_color: false,
             join: false,
-            clear: [0.0, 0.0, 0.0, 1.0],
-            depth: 9,
-            keep_depth: false,
-            clear_depth: 1.0,
+            ..Pass::one(stream::SCREEN, false, [0.0, 0.0, 0.0, 1.0]).with_depth(9, false, 1.0)
         });
     let pos = [Binding::range(1, 0, 64)];
     for (pipeline, colour) in [(0, 0xff00_00ff_u32), (1, 0xff00_ff00), (2, 0xffff_0000)] {
@@ -1005,7 +993,7 @@ fn indirect_draws_keep_their_first_instance() {
 "#;
     let pipelines = r#"[{ "name": "instance", "shader": "instance.wgsl", "kind": "render",
         "vertex_entry": "vs", "fragment_entry": "fs",
-        "targets": [{ "color": "rgba8unorm", "depth": false, "screen": true }], "bindings": [] }]"#;
+        "targets": [{ "colors": ["rgba8unorm"], "depth": false, "screen": true }], "outputs": ["float"], "bindings": [] }]"#;
     for indexed in [false, true] {
         let mut encoder = Encoder::new();
         encoder.create_buffer(1, 20).create_buffer(2, 12);

@@ -319,6 +319,11 @@ fn run_gpu(
     };
     let ran = run_gpu_frames(&mut host, dir, i, frames, &given, golden);
     let traced = host.trace().take();
+    // What it printed, shown as a CPU test's is (the host runs quiet): a feature's test that
+    // passed trivially says so.
+    for line in &traced.lines {
+        eprintln!("{line}");
+    }
     if ran.is_none() {
         gpu.0 = Some(host);
     }
@@ -483,9 +488,22 @@ fn against_chrome(
         return Err("its build has no directory Chrome can serve".into());
     };
     std::fs::write(dir.join("input.json"), json).map_err(|e| format!("its script: {e}"))?;
-    let fragment = format!(
+    let mut fragment = format!(
         "#test&frames={frames}&width={WIDTH}&height={HEIGHT}&fps={FPS}&workers=1&input=input.json"
     );
+    // The native host's feature mask (`WRELA_FEATURES`), given to Chrome's test mode too, so
+    // both run the program's fallback paths.
+    if let Ok(keep) = std::env::var("WRELA_FEATURES") {
+        if !keep
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ',' || c == '-')
+        {
+            return Err(format!(
+                "WRELA_FEATURES is `{keep}`: `none`, or a comma list of WebGPU feature names"
+            ));
+        }
+        fragment.push_str(&format!("&features={keep}"));
+    }
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / FPS * 3.0).max(120.0));
     wrela_host::pages::run(wrela_host::pages::Page {
         root,

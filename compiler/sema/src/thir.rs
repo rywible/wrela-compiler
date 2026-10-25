@@ -270,6 +270,9 @@ pub enum DrawCount {
     Instances,
     Indirect,
     Indices,
+    /// A direct indexed draw's first index (0), base vertex (1) or first instance (2):
+    /// `Draw::more`'s.
+    More(u8),
 }
 
 /// A draw's render state, which its pipeline holds: build-time constants (§18.7).
@@ -283,6 +286,11 @@ pub struct RenderState {
     pub bias_clamp: u32,
     /// `std::gpu::Depth`: how fragments' depths are tested, and whether they're written.
     pub depth: wrela_abi::manifest::DepthState,
+    /// `std::gpu::Blend`s: `blend:` for every target, or `blends:` for each (the first
+    /// `blend_count`), given or not (then `Replace`, or `Over` for a shader returning `Over`).
+    pub blends: [wrela_abi::manifest::Blend; 4],
+    pub blend_count: u8,
+    pub blend_given: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -301,6 +309,11 @@ pub struct Draw {
     /// An indexed draw's `u32` indices: a `GpuBuffer` or `GpuSpan` of `u32`s, or of structs of
     /// `u32` fields.
     pub indices: Option<Box<Expr>>,
+    /// A direct indexed draw's first index, base vertex (an `i32`) and first instance (their
+    /// defaults' literals where not given); its index count is `vertices` (`u32::MAX`: all of
+    /// them past the first). A multi-draw's (`multi`) count is `vertices`.
+    pub more: Vec<Expr>,
+    pub multi: bool,
     pub state: RenderState,
     /// Each shader's arguments, bound to it (§18), as (entry point: 0 the vertex shader, 1 the
     /// fragment shader; parameter index; argument), in the order written.
@@ -573,6 +586,7 @@ impl Expr {
                     .for_each(|v| f(Child::Expr(v)));
                 f(Child::Expr(&d.vertices));
                 f(Child::Expr(&d.instances));
+                d.more.iter().for_each(|m| f(Child::Expr(m)));
                 d.indirect.iter().chain(&d.indices).for_each(|i| f(Child::Expr(i)));
                 d.args.iter().for_each(|(_, _, a)| f(Child::Expr(a)));
             }

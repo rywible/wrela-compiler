@@ -93,10 +93,12 @@ fn entry_point_names(module: &naga::Module) -> Vec<String> {
 
 /// Validates a naga module as WebGPU will.
 pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
-    let mut v = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    );
+    // Half floats and subgroup operations validate here; the hosts create a pipeline that
+    // uses them only on a device with the feature (its manifest's `requires`).
+    let caps = naga::valid::Capabilities::SHADER_FLOAT16 | naga::valid::Capabilities::SUBGROUP;
+    let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps);
+    v.subgroup_stages(naga::valid::ShaderStages::COMPUTE);
+    v.subgroup_operations(naga::valid::SubgroupOperationSet::all());
     v.validate(module)
         .map_err(|e| format!("internal: the generated shader is invalid: {}", e.emit_to_string("")))
 }
@@ -135,6 +137,8 @@ fn scalar(s: ir::Scalar) -> R<Scalar> {
         ir::Scalar::I32 => Scalar::I32,
         ir::Scalar::U32 => Scalar::U32,
         ir::Scalar::F32 => Scalar::F32,
+        // naga writes `enable f16;` for a module that has one.
+        ir::Scalar::F16 => Scalar::F16,
         other => return Err(format!("internal: `{}` in GPU code", other.name())),
     })
 }
@@ -293,7 +297,7 @@ impl<'m> Cx<'m> {
             }
             ir::ResourceKind::Private => (AddressSpace::Private, self.ty(r.ty)?),
             ir::ResourceKind::Workgroup => (AddressSpace::WorkGroup, self.ty(r.ty)?),
-            ir::ResourceKind::Texture { depth, three, format } => {
+            ir::ResourceKind::Texture { depth, dim, format } => {
                 let class = if depth {
                     naga::ImageClass::Depth { multi: false }
                 } else {
@@ -303,23 +307,26 @@ impl<'m> Cx<'m> {
                     };
                     naga::ImageClass::Sampled { kind, multi: false }
                 };
-                let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
+                let (dim, arrayed) = image_dim(dim);
+                let inner = TypeInner::Image { dim, arrayed, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
-            ir::ResourceKind::StorageTexture { three, format } => {
+            ir::ResourceKind::StorageTexture { dim, format } => {
                 let format = match format {
                     ir::TextureFormat::Rgba8 => naga::StorageFormat::Rgba8Unorm,
                     ir::TextureFormat::Rgba16Float => naga::StorageFormat::Rgba16Float,
                     ir::TextureFormat::R32Float => naga::StorageFormat::R32Float,
                     ir::TextureFormat::R32Uint => naga::StorageFormat::R32Uint,
-                    f @ (ir::TextureFormat::R16Float
-                    | ir::TextureFormat::Rg16Float
-                    | ir::TextureFormat::Depth32Float) => {
+                    ir::TextureFormat::Rg32Float => naga::StorageFormat::Rg32Float,
+                    ir::TextureFormat::Rgba32Float => naga::StorageFormat::Rgba32Float,
+                    ir::TextureFormat::Rg32Uint => naga::StorageFormat::Rg32Uint,
+                    f => {
                         return Err(format!("internal: kernels can't write a {f:?} texture"));
                     }
                 };
                 let class = naga::ImageClass::Storage { format, access: StorageAccess::STORE };
-                let inner = TypeInner::Image { dim: image_dim(three), arrayed: false, class };
+                let (dim, arrayed) = image_dim(dim);
+                let inner = TypeInner::Image { dim, arrayed, class };
                 (AddressSpace::Handle, self.ty_inner(inner))
             }
             ir::ResourceKind::Sampler { comparison } => {
@@ -552,6 +559,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                 B::VertexIndex => BuiltIn::VertexIndex,
                 B::InstanceIndex => BuiltIn::InstanceIndex,
                 B::Position => BuiltIn::Position { invariant: false },
+                B::SubgroupInvocationId => BuiltIn::SubgroupInvocationId,
+                B::SubgroupSize => BuiltIn::SubgroupSize,
             };
             let inner = match b {
                 B::GlobalInvocationId
@@ -560,7 +569,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                 | B::NumWorkgroups => {
                     TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 }
                 }
-                B::VertexIndex | B::InstanceIndex => TypeInner::Scalar(Scalar::U32),
+                B::VertexIndex | B::InstanceIndex | B::SubgroupInvocationId | B::SubgroupSize => {
+                    TypeInner::Scalar(Scalar::U32)
+                }
                 B::Position => TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
             };
             let ty = self.cx.ty_inner(inner);
@@ -579,7 +590,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.func.result = Some(FunctionResult { ty: io, binding: None });
                 self.io = Some((io, varyings, rt));
             }
-            ir::Stage::Fragment { varyings, depth, uint } => {
+            ir::Stage::Fragment { varyings, outputs, depth } => {
                 if let Some((vt, map)) = varyings {
                     let io = self.cx.io_struct(*vt, map)?;
                     self.func.arguments.push(FunctionArgument {
@@ -590,49 +601,46 @@ impl<'a, 'm> Fb<'a, 'm> {
                     self.io = Some((io, map, *vt));
                     self.varying_paths = varying_paths(map);
                 }
-                let colour = Binding::Location {
-                    location: 0,
-                    interpolation: None,
-                    sampling: None,
-                    blend_src: None,
-                    per_primitive: false,
-                };
-                // A `u32` into an integer target, or a `vec4`.
-                let (ct, size) = if *uint {
-                    (self.cx.ty_inner(TypeInner::Scalar(Scalar::U32)), 4)
-                } else {
-                    let vec4 = TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 };
-                    (self.cx.ty_inner(vec4), 16)
-                };
-                if *depth {
-                    // A `WithDepth`: its colour, and its depth as the fragment's.
-                    let f = self.cx.ty_inner(TypeInner::Scalar(Scalar::F32));
-                    let members = vec![
-                        StructMember {
-                            name: Some("color".into()),
-                            ty: ct,
-                            binding: Some(colour),
-                            offset: 0,
-                        },
-                        StructMember {
-                            name: Some("depth".into()),
-                            ty: f,
-                            binding: Some(Binding::BuiltIn(BuiltIn::FragDepth)),
-                            offset: size,
-                        },
-                    ];
-                    let out = self.cx.out.types.insert(
-                        Type {
-                            name: Some(format!("{}_out", e.name)),
-                            inner: TypeInner::Struct { members, span: 2 * size },
-                        },
-                        Span::UNDEFINED,
-                    );
-                    self.frag_out = Some(out);
-                    self.func.result = Some(FunctionResult { ty: out, binding: None });
-                } else {
-                    self.func.result = Some(FunctionResult { ty: ct, binding: Some(colour) });
+                // Each colour at its location, as four of its scalar (what any target of its
+                // kind takes), then the depth: one output struct.
+                let mut members = Vec::new();
+                let mut offset = 0;
+                for (location, c) in outputs.iter().enumerate() {
+                    let scalar = scalar(c.scalar)?;
+                    let ty = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar });
+                    members.push(StructMember {
+                        name: Some(format!("color{location}")),
+                        ty,
+                        binding: Some(Binding::Location {
+                            location: location as u32,
+                            interpolation: None,
+                            sampling: None,
+                            blend_src: None,
+                            per_primitive: false,
+                        }),
+                        offset,
+                    });
+                    offset += 16;
                 }
+                if depth.is_some() {
+                    let f = self.cx.ty_inner(TypeInner::Scalar(Scalar::F32));
+                    members.push(StructMember {
+                        name: Some("depth".into()),
+                        ty: f,
+                        binding: Some(Binding::BuiltIn(BuiltIn::FragDepth)),
+                        offset,
+                    });
+                    offset += 16;
+                }
+                let out = self.cx.out.types.insert(
+                    Type {
+                        name: Some(format!("{}_out", e.name)),
+                        inner: TypeInner::Struct { members, span: offset.max(16) },
+                    },
+                    Span::UNDEFINED,
+                );
+                self.frag_out = Some(out);
+                self.func.result = Some(FunctionResult { ty: out, binding: None });
             }
         }
         Ok(())
@@ -912,9 +920,19 @@ impl<'a, 'm> Fb<'a, 'm> {
     /// `WithDepth`, as its output struct.
     fn output(&mut self, h: Handle<Expression>, out: &mut Block) -> R<Handle<Expression>> {
         if let Some(ty) = self.frag_out {
-            let components = (0..2)
-                .map(|index| self.expr(Expression::AccessIndex { base: h, index }, out))
-                .collect();
+            let Some(ir::EntryPoint { stage: ir::Stage::Fragment { outputs, depth, .. }, .. }) =
+                self.entry
+            else {
+                return Err("internal: a fragment output outside a fragment shader".into());
+            };
+            let mut components = Vec::new();
+            for c in outputs {
+                let part = self.part_at(h, &c.path, out);
+                components.push(self.widened(part, c, out)?);
+            }
+            if let Some(path) = depth {
+                components.push(self.part_at(h, path, out));
+            }
             return Ok(self.expr(Expression::Compose { ty, components }, out));
         }
         let Some((io, map, _)) = self.io else { return Ok(h) };
@@ -930,6 +948,52 @@ impl<'a, 'm> Fb<'a, 'm> {
             comps.push(part);
         }
         Ok(self.expr(Expression::Compose { ty: io, components: comps }, out))
+    }
+
+    /// The part of `h` at `path` (field indexes).
+    fn part_at(
+        &mut self,
+        h: Handle<Expression>,
+        path: &[u32],
+        out: &mut Block,
+    ) -> Handle<Expression> {
+        let mut part = h;
+        for &index in path {
+            part = self.expr(Expression::AccessIndex { base: part, index }, out);
+        }
+        part
+    }
+
+    /// A colour of `c.components` of `c.scalar` as four of it: missing colour channels 0, and a
+    /// float's missing alpha 1.
+    fn widened(
+        &mut self,
+        h: Handle<Expression>,
+        c: &ir::FragmentColour,
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        let scalar = scalar(c.scalar)?;
+        let four = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar });
+        if c.components == 4 {
+            return Ok(h);
+        }
+        let mut parts = Vec::new();
+        if c.components == 1 {
+            parts.push(h);
+        } else {
+            for index in 0..u32::from(c.components) {
+                parts.push(self.expr(Expression::AccessIndex { base: h, index }, out));
+            }
+        }
+        let fill = |k: u8| match (c.scalar, k) {
+            (ir::Scalar::U32, _) => Literal::U32(0),
+            (_, 3) => Literal::F32(1.0),
+            _ => Literal::F32(0.0),
+        };
+        for k in c.components..4 {
+            parts.push(self.lit(fill(k), out));
+        }
+        Ok(self.expr(Expression::Compose { ty: four, components: parts }, out))
     }
 
     /// The part at `path` of the fragment shader's input, of IR type `t`, rebuilt from the
@@ -977,8 +1041,23 @@ impl<'a, 'm> Fb<'a, 'm> {
                     out,
                 )
             }
+            ir::Expr::Const(ir::Const::F16(x)) if !x.is_finite() || x.abs() > 65504.0 => {
+                // Not a WGSL literal: the `f32` (its bits, made a float as it runs) converted.
+                let bits = self.lit(Literal::U32(x.to_bits()), out);
+                let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
+                let bits = self.through_variable(bits, u, out);
+                let f = self.expr(
+                    Expression::As { expr: bits, kind: ScalarKind::Float, convert: None },
+                    out,
+                );
+                self.expr(
+                    Expression::As { expr: f, kind: ScalarKind::Float, convert: Some(2) },
+                    out,
+                )
+            }
             ir::Expr::Const(c) => {
                 let l = match c {
+                    ir::Const::F16(x) => Literal::F16(half::f16::from_f32(*x)),
                     ir::Const::Bool(b) => Literal::Bool(*b),
                     ir::Const::I32(x) => {
                         self.ints.insert(v, (*x).into());
@@ -1068,6 +1147,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
+            ir::Expr::Subgroup(op, args) => self.subgroup(*op, args, t, out)?,
             ir::Expr::TextureStore(..) => return Err("internal: a texel write's value".into()),
             ir::Expr::Discard => return Err("internal: a discard's value".into()),
             ir::Expr::Call(g, args) => self
@@ -1327,6 +1407,64 @@ impl<'a, 'm> Fb<'a, 'm> {
         })
     }
 
+    /// A subgroup operation (`ir::Expr::Subgroup`): a statement naga writes as the call, its
+    /// result the value.
+    fn subgroup(
+        &mut self,
+        op: ir::SubgroupOp,
+        args: &[ir::ValueId],
+        t: ir::TypeId,
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        use ir::SubgroupOp as S;
+        use naga::{CollectiveOperation as C, GatherMode, SubgroupOperation as O};
+        let argument =
+            self.val(*args.first().ok_or("internal: a subgroup operation without its operand")?)?;
+        if op == S::Ballot {
+            let result =
+                self.func.expressions.append(Expression::SubgroupBallotResult, Span::UNDEFINED);
+            out.push(
+                Statement::SubgroupBallot { result, predicate: Some(argument) },
+                Span::UNDEFINED,
+            );
+            return Ok(result);
+        }
+        let ty = self.cx.ty(t)?;
+        let result = self
+            .func
+            .expressions
+            .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+        let collective = |o: O, c: C| Statement::SubgroupCollectiveOperation {
+            op: o,
+            collective_op: c,
+            argument,
+            result,
+        };
+        let s = match op {
+            S::Add => collective(O::Add, C::Reduce),
+            S::ExclusiveAdd => collective(O::Add, C::ExclusiveScan),
+            S::InclusiveAdd => collective(O::Add, C::InclusiveScan),
+            S::Min => collective(O::Min, C::Reduce),
+            S::Max => collective(O::Max, C::Reduce),
+            S::And => collective(O::And, C::Reduce),
+            S::Or => collective(O::Or, C::Reduce),
+            S::Xor => collective(O::Xor, C::Reduce),
+            S::Any => collective(O::Any, C::Reduce),
+            S::All => collective(O::All, C::Reduce),
+            S::BroadcastFirst => {
+                Statement::SubgroupGather { mode: GatherMode::BroadcastFirst, argument, result }
+            }
+            S::Shuffle => {
+                let from =
+                    self.val(*args.get(1).ok_or("internal: a shuffle without its source")?)?;
+                Statement::SubgroupGather { mode: GatherMode::Shuffle(from), argument, result }
+            }
+            S::Ballot => unreachable!("handled above"),
+        };
+        out.push(s, Span::UNDEFINED);
+        Ok(result)
+    }
+
     /// A texture read (`ir::Expr::Texture`). Images and samplers are their globals' handles.
     fn texture(
         &mut self,
@@ -1338,19 +1476,41 @@ impl<'a, 'm> Fb<'a, 'm> {
     ) -> R<Handle<Expression>> {
         use ir::TextureOp as T;
         let image = self.resource(tex, out)?;
+        let dim = match self.cx.m.resources[tex.index()].kind {
+            ir::ResourceKind::Texture { dim, .. } => dim,
+            _ => return Err("internal: a texture read of something that isn't a texture".into()),
+        };
         let arg = |fb: &Self, i: usize| -> R<Handle<Expression>> {
             fb.val(*args.get(i).ok_or("internal: a texture read without its arguments")?)
         };
+        // An array's layer, after the coordinates.
+        let layer_at = if op == T::Load { dim.texel() } else { 1 };
+        let array_index =
+            if dim.arrayed() && !op.is_query() { Some(arg(self, layer_at)?) } else { None };
+        let rest = layer_at + usize::from(array_index.is_some());
         Ok(match op {
-            T::Sample | T::SampleLevel | T::SampleCompare | T::SampleCompareLevel => {
+            T::Sample
+            | T::SampleLevel
+            | T::SampleGrad
+            | T::SampleBias
+            | T::SampleCompare
+            | T::SampleCompareLevel => {
                 let s = sampler.ok_or("internal: sampling without a sampler")?;
                 let sampler = self.resource(s, out)?;
                 let coordinate = arg(self, 0)?;
                 let (level, depth_ref) = match op {
                     T::Sample => (naga::SampleLevel::Auto, None),
-                    T::SampleLevel => (naga::SampleLevel::Exact(arg(self, 1)?), None),
-                    T::SampleCompare => (naga::SampleLevel::Auto, Some(arg(self, 1)?)),
-                    _ => (naga::SampleLevel::Zero, Some(arg(self, 1)?)),
+                    T::SampleLevel => (naga::SampleLevel::Exact(arg(self, rest)?), None),
+                    T::SampleBias => (naga::SampleLevel::Bias(arg(self, rest)?), None),
+                    T::SampleGrad => (
+                        naga::SampleLevel::Gradient {
+                            x: arg(self, rest)?,
+                            y: arg(self, rest + 1)?,
+                        },
+                        None,
+                    ),
+                    T::SampleCompare => (naga::SampleLevel::Auto, Some(arg(self, rest)?)),
+                    _ => (naga::SampleLevel::Zero, Some(arg(self, rest)?)),
                 };
                 self.expr(
                     Expression::ImageSample {
@@ -1358,7 +1518,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                         sampler,
                         gather: None,
                         coordinate,
-                        array_index: None,
+                        array_index,
                         offset: None,
                         level,
                         depth_ref,
@@ -1368,13 +1528,13 @@ impl<'a, 'm> Fb<'a, 'm> {
                 )
             }
             T::Load => {
-                let coordinate = self.texel(&args[..args.len().min(3)], out)?;
-                let level = self.lit(Literal::I32(0), out);
+                let coordinate = self.texel(&args[..dim.texel()], out)?;
+                let level = arg(self, rest)?;
                 self.expr(
                     Expression::ImageLoad {
                         image,
                         coordinate,
-                        array_index: None,
+                        array_index,
                         sample: None,
                         level: Some(level),
                     },
@@ -1390,6 +1550,12 @@ impl<'a, 'm> Fb<'a, 'm> {
                     _ => 2,
                 };
                 self.expr(Expression::AccessIndex { base: size, index }, out)
+            }
+            T::Layers => {
+                self.expr(Expression::ImageQuery { image, query: naga::ImageQuery::NumLayers }, out)
+            }
+            T::Levels => {
+                self.expr(Expression::ImageQuery { image, query: naga::ImageQuery::NumLevels }, out)
             }
         })
     }
@@ -1419,16 +1585,21 @@ impl<'a, 'm> Fb<'a, 'm> {
         out: &mut Block,
     ) -> R<()> {
         let image = self.resource(tex, out)?;
-        // The coordinates, then the value.
+        // The coordinates (then an array's layer), then the value.
         let Some((&value, xs)) = args.split_last() else {
             return Err("internal: a texel's write without its arguments".into());
         };
+        let arrayed = matches!(
+            self.cx.m.resources[tex.index()].kind,
+            ir::ResourceKind::StorageTexture { dim: ir::TexDim::D2Array, .. }
+        );
+        let (xs, array_index) = match (arrayed, xs.split_last()) {
+            (true, Some((&layer, xs))) => (xs, Some(self.val(layer)?)),
+            _ => (xs, None),
+        };
         let coordinate = self.texel(xs, out)?;
         let value = self.val(value)?;
-        out.push(
-            Statement::ImageStore { image, coordinate, array_index: None, value },
-            Span::UNDEFINED,
-        );
+        out.push(Statement::ImageStore { image, coordinate, array_index, value }, Span::UNDEFINED);
         Ok(())
     }
 
@@ -1555,8 +1726,14 @@ impl<'a, 'm> Fb<'a, 'm> {
 }
 
 /// A texture's dimension: 3D when `three`, else 2D.
-fn image_dim(three: bool) -> naga::ImageDimension {
-    if three { naga::ImageDimension::D3 } else { naga::ImageDimension::D2 }
+/// A texture binding's naga dimension, and whether it's arrayed.
+fn image_dim(dim: ir::TexDim) -> (naga::ImageDimension, bool) {
+    match dim {
+        ir::TexDim::D2 => (naga::ImageDimension::D2, false),
+        ir::TexDim::D2Array => (naga::ImageDimension::D2, true),
+        ir::TexDim::Cube => (naga::ImageDimension::Cube, false),
+        ir::TexDim::D3 => (naga::ImageDimension::D3, false),
+    }
 }
 
 #[cfg(test)]
@@ -1605,7 +1782,15 @@ mod tests {
         m.entry_points.push(ir::EntryPoint {
             name: "fragment".into(),
             function,
-            stage: ir::Stage::Fragment { varyings: Some((outer, map)), depth: false, uint: false },
+            stage: ir::Stage::Fragment {
+                varyings: Some((outer, map)),
+                outputs: vec![ir::FragmentColour {
+                    path: Vec::new(),
+                    scalar: ir::Scalar::F32,
+                    components: 4,
+                }],
+                depth: None,
+            },
             inputs: Vec::new(),
         });
         ir::verify(&m).expect("valid IR");

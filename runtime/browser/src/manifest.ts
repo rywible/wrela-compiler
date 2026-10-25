@@ -6,7 +6,11 @@
 import {
   BINDING_KIND_TRAITS,
   BINDING_KINDS,
+  BLENDS,
   COMPARES,
+  FEATURES,
+  MAX_COLOR_ATTACHMENT_BYTES,
+  MAX_COLOR_ATTACHMENTS,
   MANIFEST_VERSION,
   MAX_BINDINGS_PER_GROUP,
   MAX_UNIFORM_BUFFER_BINDING_SIZE,
@@ -35,6 +39,27 @@ export const hasFormat = (k: BindingKind) => traitsOf(k).has_format;
 export const isStorage = (k: BindingKind) => traitsOf(k).is_storage;
 /** Whether it's a 3D texture. */
 export const is3d = (k: BindingKind) => traitsOf(k).is_3d;
+/** Whether it's a texture of depths. */
+export const isDepthBinding = (k: BindingKind) => traitsOf(k).is_depth;
+/** A texture binding's view dimension (WebGPU's `viewDimension`); null for the rest. */
+export const dimensionOf = (k: BindingKind) => traitsOf(k).dimension;
+
+/** A blend's name (runtime/abi `Blend`). */
+export type Blend = keyof typeof BLENDS;
+const BLEND_NAMES = Object.keys(BLENDS) as Blend[];
+
+/** The colour attachments' bytes per sample of a pass drawing into `formats`, in order, by
+ * WebGPU's algorithm (runtime/abi `color_attachment_bytes`): the running total aligned to each
+ * format's component alignment, then its cost added. */
+export function colorAttachmentBytes(formats: readonly TextureFormat[]): number {
+  let total = 0;
+  for (const f of formats) {
+    const t = TEXTURE_FORMATS.find((x) => x.name === f)!;
+    const align = Math.max(t.target_align, 1);
+    total = Math.ceil(total / align) * align + t.target_cost;
+  }
+  return total;
+}
 /** The per-stage limit it counts against (`STAGE_LIMITS`). */
 export const limitOf = (k: BindingKind) => traitsOf(k).limit;
 
@@ -62,38 +87,42 @@ export type Stage =
       kind: "render";
       vertex_entry: string;
       fragment_entry: string;
-      blend: boolean;
+      /** How each colour output meets its target's: empty, all replace it. */
+      blends: Blend[];
       /** Which triangles it drops by facing. */
       cull: Cull;
       depth_bias: DepthBias;
       depth: DepthState;
       /** Gives each fragment its own depth: drawn only in a pass with a depth target. */
       writes_depth: boolean;
-      /** Its fragment shader returns a `u32`: drawn only into an `r32uint` target. */
-      uint: boolean;
+      /** What its fragment shader writes to each colour location. */
+      outputs: ("float" | "uint")[];
       /** Every combination of targets it's drawn into, first drawn first. */
       targets: RenderTarget[];
     };
 
-/** What a render pipeline draws into: a colour target's format (null in a pass that draws only
- * depths), and a depth target (`depth32float`) or none. The screen's says it's the screen: its
- * format is `SCREEN_FORMAT` here, and the canvas may be in another (`ScreenTarget.format`). */
+/** What a render pipeline draws into: its colour targets' formats in order (none in a pass
+ * that draws only depths), and a depth target (`depth32float`) or none. The screen's says it's
+ * the screen: its one colour is `SCREEN_FORMAT` here, and the canvas may be in another
+ * (`ScreenTarget.format`). */
 export interface RenderTarget {
-  color: TextureFormat | null;
+  colors: TextureFormat[];
   depth: boolean;
   screen: boolean;
 }
 
 /** Whether two targets are the same. */
 export const sameTarget = (a: RenderTarget, b: RenderTarget) =>
-  a.color === b.color && a.depth === b.depth && a.screen === b.screen;
+  a.colors.length === b.colors.length && a.colors.every((c, i) => c === b.colors[i]) && a.depth === b.depth && a.screen === b.screen;
 
-/** A target as errors name it: `rgba16float with depth`, `depth alone`, `the screen` (runtime/abi
- * `RenderTarget`'s `Display`). */
-export const targetName = (t: RenderTarget) =>
-  t.screen
-    ? t.depth ? "the screen with depth" : "the screen"
-    : t.color === null ? (t.depth ? "depth alone" : "nothing") : t.depth ? `${t.color} with depth` : t.color;
+/** A target as errors name it: `rgba16float with depth`, `rgba16float and r32uint`, `depth
+ * alone`, `the screen` (runtime/abi `RenderTarget`'s `Display`). */
+export const targetName = (t: RenderTarget) => {
+  if (t.screen) return t.depth ? "the screen with depth" : "the screen";
+  const names = t.colors.join(" and ");
+  if (names !== "") return t.depth ? `${names} with depth` : names;
+  return t.depth ? "depth alone" : "nothing";
+};
 
 export type Cull = "none" | "front" | "back";
 
@@ -118,6 +147,8 @@ export type Pipeline = Stage & {
   /** A debug build's: the binding of the flag its bounds checks set (the native host's
    * runtime/abi/src/manifest.rs says what it holds). */
   debug_flag: number | null;
+  /** The device features its shader needs (WebGPU's names). */
+  requires: string[];
 };
 
 export interface Manifest {
@@ -191,10 +222,15 @@ function renderTargets(o: Json, where: string): RenderTarget[] {
   return ts.map((v: unknown, k) => {
     const tw = `${where}.targets[${k}]`;
     const to = object(v, tw);
-    if (!("color" in to)) throw new ManifestError(`${tw}.color must be a format or null`);
-    const color = to["color"] === null ? null : (oneOf(to, "color", tw, FORMAT_NAMES) as TextureFormat);
+    const cs = to["colors"];
+    if (!Array.isArray(cs)) throw new ManifestError(`${tw}.colors must be an array of formats`);
+    if (cs.length > MAX_COLOR_ATTACHMENTS) throw new ManifestError(`${tw}.colors has more than four formats`);
+    const colors = cs.map((c: unknown, j) => {
+      if (!FORMAT_NAMES.includes(c as TextureFormat)) throw new ManifestError(`${tw}.colors[${j}] must be a format, not ${show(c)}`);
+      return c as TextureFormat;
+    });
     if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
-    return { color, depth: to["depth"], screen: flag(to, "screen", tw, false) };
+    return { colors, depth: to["depth"], screen: flag(to, "screen", tw, false) };
   });
 }
 
@@ -255,8 +291,16 @@ function pipeline(v: unknown, i: number): Pipeline {
   } else {
     const vertex_entry = str(o, "vertex_entry", where);
     const fragment_entry = str(o, "fragment_entry", where);
-    // A missing `blend` is false.
-    const b = flag(o, "blend", where, false);
+    // Missing `blends` all replace.
+    let blends: Blend[] = [];
+    if (o["blends"] !== undefined) {
+      const bs = o["blends"];
+      if (!Array.isArray(bs)) throw new ManifestError(`${where}.blends must be an array`);
+      blends = bs.map((b: unknown, k) => {
+        if (!BLEND_NAMES.includes(b as Blend)) throw new ManifestError(`${where}.blends[${k}] must be a blend, not ${show(b)}`);
+        return b as Blend;
+      });
+    }
     // A missing `cull` is none, and a missing `depth_bias` none.
     const cull = oneOfOr(o, "cull", where, ["none", "front", "back"] as const, "none");
     let depth_bias: DepthBias = { constant: 0, slope_scale: 0, clamp: 0 };
@@ -282,15 +326,32 @@ function pipeline(v: unknown, i: number): Pipeline {
       const compare = oneOfOr(d, "compare", dw, COMPARES.filter((c): c is Compare => c !== null), "less");
       depth = { compare, write: flag(d, "write", dw, true) };
     }
-    // A missing `writes_depth` is false, and a missing `uint`.
+    // A missing `writes_depth` is false.
     const writes_depth = flag(o, "writes_depth", where, false);
-    const uint = flag(o, "uint", where, false);
-    stage = { kind, vertex_entry, fragment_entry, blend: b, cull, depth_bias, depth, writes_depth, uint, targets: renderTargets(o, where) };
+    const os = field(o, "outputs", where);
+    if (!Array.isArray(os)) throw new ManifestError(`${where}.outputs must be an array`);
+    const outputs = os.map((x: unknown, k) => {
+      if (x !== "float" && x !== "uint") throw new ManifestError(`${where}.outputs[${k}] must be float or uint, not ${show(x)}`);
+      return x;
+    });
+    stage = { kind, vertex_entry, fragment_entry, blends, cull, depth_bias, depth, writes_depth, outputs, targets: renderTargets(o, where) };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;
   const debug_flag = d === null ? null : asU32(d, `${where}.debug_flag`);
-  return { ...stage, name, shader, uniform, bindings, debug_flag };
+  // Missing `requires` is none.
+  let requires: string[] = [];
+  if (o["requires"] !== undefined) {
+    const rs = o["requires"];
+    if (!Array.isArray(rs)) throw new ManifestError(`${where}.requires must be an array`);
+    requires = rs.map((r: unknown, k) => {
+      if (typeof r !== "string" || !(FEATURES as readonly string[]).includes(r)) {
+        throw new ManifestError(`${where}.requires[${k}] must be a feature this host knows, not ${show(r)}`);
+      }
+      return r;
+    });
+  }
+  return { ...stage, name, shader, uniform, bindings, debug_flag, requires };
 }
 
 /** Parses and validates a manifest; any other version is rejected. */
@@ -403,6 +464,10 @@ export function validateManifest(m: Manifest): void {
         ws[0] * ws[1] * ws[2] <= MAX_WORKGROUP_INVOCATIONS;
       if (!ok) throw err(`pipeline ${i}'s workgroup size [${ws.join(", ")}] is outside WebGPU's limits`);
     } else {
+      if (p.outputs.length > MAX_COLOR_ATTACHMENTS) throw err(`pipeline ${i} has more than four colour outputs`);
+      if (p.blends.length !== 0 && p.blends.length !== p.outputs.length) {
+        throw err(`pipeline ${i} has ${p.blends.length} blends for ${p.outputs.length} colour outputs`);
+      }
       if (p.vertex_entry === "" || p.fragment_entry === "") throw err(`pipeline ${i} is missing an entry point`);
       if (p.targets.length === 0) throw err(`pipeline ${i} names no targets`);
       p.targets.forEach((t, k) => {
@@ -410,26 +475,31 @@ export function validateManifest(m: Manifest): void {
         if (p.targets.slice(0, k).some((s) => sameTarget(s, t))) {
           throw err(`pipeline ${i} names the target ${name} twice`);
         }
-        const format = TEXTURE_FORMATS.find((f) => f.name === t.color);
-        const integer = format?.uint ?? false;
-        if (t.color === null && !t.depth) {
+        if (t.colors.length === 0 && !t.depth) {
           throw err(`pipeline ${i}'s target ${k} draws into nothing: a target has a colour, a depth, or both`);
         }
-        if (t.screen && t.color !== SCREEN_FORMAT) {
-          throw err(`pipeline ${i}'s target ${k} is the screen, whose colour is ${SCREEN_FORMAT}, not ${t.color ?? "none"}`);
+        if (t.screen && (t.colors.length !== 1 || t.colors[0] !== SCREEN_FORMAT)) {
+          throw err(`pipeline ${i}'s target ${k} is the screen, whose one colour is ${SCREEN_FORMAT}`);
         }
-        const why =
-          p.writes_depth && !t.depth
-            ? "its fragments give their depth, so a target has depth"
-            : p.uint && t.color !== null && !integer
-              ? "its fragment shader returns a `u32`, so a colour target is r32uint"
-              : !p.uint && integer
-                ? "its fragment shader returns a colour, which an r32uint target isn't"
-                : format?.depth
-                  ? "a colour target's format isn't a depth one"
-                  : p.blend && t.color !== null && !format?.filterable
-                    ? "its colour is blended, which this format doesn't support"
-                    : null;
+        const bytes = colorAttachmentBytes(t.colors);
+        let why: string | null = null;
+        if (p.writes_depth && !t.depth) why = "its fragments give their depth, so a target has depth";
+        else if (t.colors.length !== 0 && t.colors.length !== p.outputs.length) {
+          why = `its fragment shader writes ${p.outputs.length} colours, and it has ${t.colors.length}`;
+        } else if (bytes > MAX_COLOR_ATTACHMENT_BYTES) why = `its colours take ${bytes} bytes a sample, over WebGPU's 32`;
+        else {
+          for (const [c, f] of t.colors.entries()) {
+            const info = TEXTURE_FORMATS.find((x) => x.name === f)!;
+            const uint = p.outputs[c] === "uint";
+            const blend = p.blends[c] ?? "replace";
+            if (info.depth || info.block > 1 || !info.renderable) why = `a pass can't draw into ${f}`;
+            else if (uint !== info.uint) {
+              const what = (u: boolean) => (u ? "integers" : "floats");
+              why = `its fragment shader writes ${what(uint)} to colour ${c}, and ${f} holds ${what(info.uint)}`;
+            } else if (blend !== "replace" && !info.blendable) why = `colour ${c} blends, and ${f} doesn't blend`;
+            if (why !== null) break;
+          }
+        }
         if (why !== null) throw err(`pipeline ${i}'s target ${name} can't be one: ${why}`);
       });
     }

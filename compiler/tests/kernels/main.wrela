@@ -1,0 +1,440 @@
+// Toolchain 0.6's kernel capabilities (language.md §18.5, §18.10): a histogram of 65,536
+// values in workgroup atomics, a compaction by `workgroup_prefix_sum`, and the optional device
+// features: what `features()` reports, a subgroup scan against the workgroup one, a half-float
+// kernel, and a BC1 texture sampled. A feature's test passes, and prints that it passed
+// trivially, on a device without the feature: frame 0 records only what the device has.
+use std::gpu::{
+    Atomics, Bc1, ClipPosition, FragCoord, GlobalId, GpuBuffer, LocalId, Rgba8, Sampler, Shared,
+    SharedAtomics, SharedAtomicsI, Slots, SubgroupInvocation, SubgroupSize, Texture, TextureRead,
+    VertexIndex, WorkgroupId, begin_pass, buffer, buffer_of, dispatch, draw, features, read,
+    read_texture, sampler, subgroup_prefix_sum, texture, workgroup_prefix_sum, Features,
+}
+use std::io::{Pending, print}
+
+/// Value `i` of the histogram's input: a hash's top byte, so every bin is used and few equally.
+fn value(i: u32) -> u32 {
+    i.wrapping_mul(2654435761) >> 24
+}
+
+/// One workgroup's 256 values counted in workgroup memory, then added to the totals: 256
+/// global atomic additions a workgroup, not one a value.
+@compute(256)
+fn histogram(
+    values: [u32],
+    totals: mut Atomics<u32>,
+    bins: mut SharedAtomics<256>,
+    lid: LocalId,
+    id: GlobalId,
+) {
+    let _ = bins.add(values[id.x], 1)
+    bins.barrier()
+    let _ = totals.add(lid.x, bins.load(lid.x))
+}
+
+/// Each workgroup's least and greatest signed value (`value(i) - 128`), in signed workgroup
+/// atomics: element 0 the minimum, 1 the maximum, which its first invocation writes out.
+@compute(256)
+fn extremes(
+    values: [u32],
+    out: mut Atomics<i32>,
+    m: mut SharedAtomicsI<2>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    if lid.x == 0 {
+        m.store(0, 2147483647)
+        m.store(1, -2147483648)
+    }
+    m.barrier()
+    let v = i32(values[id.x]) - 128
+    let _ = m.min(0, v)
+    let _ = m.max(1, v)
+    m.barrier()
+    if lid.x == 0 {
+        out.store(2 * wid.x, m.load(0))
+        out.store(2 * wid.x + 1, m.load(1))
+    }
+}
+
+/// The odd values of each workgroup's 256, in order, from its first slot: where each goes is
+/// the count of odd values before it.
+@compute(256)
+fn compact(
+    values: [u32],
+    out: mut Atomics<u32>,
+    counts: mut Atomics<u32>,
+    scan: mut Shared<u32, 256>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    let v = values[id.x]
+    let keep = v % 2
+    let at = workgroup_prefix_sum(mut scan, lid, keep)
+    if keep == 1 {
+        out.store(wid.x * 256 + at, v)
+    }
+    if lid.x == 255 {
+        counts.store(wid.x, at + keep)
+    }
+}
+
+/// `compact`, scanned by subgroups.
+@compute(256)
+fn compact_subgroups(
+    values: [u32],
+    out: mut Atomics<u32>,
+    counts: mut Atomics<u32>,
+    scan: mut Shared<u32, 256>,
+    lid: LocalId,
+    lane: SubgroupInvocation,
+    width: SubgroupSize,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    let v = values[id.x]
+    let keep = v % 2
+    let at = subgroup_prefix_sum(mut scan, lid, keep)
+    if keep == 1 {
+        out.store(wid.x * 256 + at, v)
+    }
+    if lid.x == 255 {
+        counts.store(wid.x, at + keep)
+    }
+}
+
+/// Each invocation's place among a 40-invocation workgroup's kept values, by both scans: 40 is a
+/// full subgroup of 32 and a partial one of 8 on most GPUs, so the subgroup scan meets a
+/// subgroup with fewer invocations than its width. Slot 2i the workgroup scan's, 2i + 1 the
+/// subgroup scan's.
+@compute(40)
+fn partial_places(
+    values: [u32],
+    out: mut Atomics<u32>,
+    a: mut Shared<u32, 40>,
+    b: mut Shared<u32, 40>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    let keep = values[id.x] % 2
+    let w = workgroup_prefix_sum(mut a, lid, keep)
+    let g = subgroup_prefix_sum(mut b, lid, keep)
+    out.store(2 * id.x, w)
+    out.store(2 * id.x + 1, g)
+}
+
+/// Eight values summed in half floats: `x / 8` for `x` from `8i` to `8i + 7`.
+@compute(64)
+fn halves(out: mut Slots<f32>, id: GlobalId) {
+    var sum = f16(0.0)
+    for k in 0..8 {
+        sum += f16(f32(8 * id.x + k) / 8.0)
+    }
+    out[id] = f32(sum)
+}
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+/// The BC1 texture's centre.
+@fragment
+fn show(p: FragCoord, t: Texture<Bc1>, s: Sampler) -> vec4 {
+    t.sample_level(s, vec2(0.5), level: 0.0)
+}
+
+const VALUES: u32 = 65536
+const COMPACTED: u32 = 4096
+
+pub struct State {
+    frame: u32,
+    features: Features,
+    values: GpuBuffer<u32>,
+    totals: GpuBuffer<u32>,
+    compacted: GpuBuffer<u32>,
+    counts: GpuBuffer<u32>,
+    compacted_subgroups: GpuBuffer<u32>,
+    counts_subgroups: GpuBuffer<u32>,
+    halves: GpuBuffer<f32>,
+    partial: GpuBuffer<u32>,
+    partial_read: Option<Pending<u32>>,
+    got_partial: Vec<u32>,
+    extremes: GpuBuffer<i32>,
+    extremes_read: Option<Pending<i32>>,
+    got_extremes: Vec<i32>,
+    bc1: Option<Texture<Bc1>>,
+    bc1_out: Texture<Rgba8>,
+    linear: Sampler,
+    // The reads in flight, and what came back: totals, compacted, counts, the subgroups' two,
+    // halves.
+    reads: Vec<Pending<u32>>,
+    got: Vec<Vec<u32>>,
+    half_read: Option<Pending<f32>>,
+    half_got: Vec<f32>,
+    texel_read: Option<TextureRead>,
+    texel: Vec<u8>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        features: features(),
+        values: buffer_of(Vec::from_fn(VALUES, |i| value(i))),
+        totals: buffer(256),
+        compacted: buffer(COMPACTED),
+        counts: buffer(COMPACTED / 256),
+        compacted_subgroups: buffer(COMPACTED),
+        counts_subgroups: buffer(COMPACTED / 256),
+        halves: buffer(64),
+        partial: buffer(2 * 400),
+        partial_read: None,
+        got_partial: Vec::new(),
+        extremes: buffer(2 * COMPACTED / 256),
+        extremes_read: None,
+        got_extremes: Vec::new(),
+        bc1: None,
+        bc1_out: texture(width: 1, height: 1),
+        linear: sampler(),
+        reads: Vec::new(),
+        got: Vec::new(),
+        half_read: None,
+        half_got: Vec::new(),
+        texel_read: None,
+        texel: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        record(mut s)
+    } else {
+        var k = 0
+        while k < s.reads.len() {
+            if s.got.len() == k {
+                if let Some(Ok(v)) = s.reads[k].poll() {
+                    s.got.push(take v)
+                }
+            }
+            k += 1
+        }
+        match mut s.partial_read {
+            Some(p) => {
+                if s.got_partial.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.got_partial = take v
+                    }
+                }
+            },
+            None => {},
+        }
+        match mut s.extremes_read {
+            Some(p) => {
+                if s.got_extremes.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.got_extremes = take v
+                    }
+                }
+            },
+            None => {},
+        }
+        match mut s.half_read {
+            Some(p) => {
+                if s.half_got.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.half_got = take v
+                    }
+                }
+            },
+            None => {},
+        }
+        match mut s.texel_read {
+            Some(r) => {
+                if s.texel.len() == 0 {
+                    if let Some(Ok(v)) = r.poll() {
+                        s.texel = take v
+                    }
+                }
+            },
+            None => {},
+        }
+    }
+    s.frame += 1
+}
+
+fn record(s: mut State) {
+    dispatch(histogram.bind(s.values, mut s.totals), groups: (VALUES / 256, 1, 1))
+    s.reads.push(read(s.totals.items()))
+    let first = s.values.span(0, COMPACTED)
+    dispatch(compact.bind(first, mut s.compacted, mut s.counts), groups: (COMPACTED / 256, 1, 1))
+    s.reads.push(read(s.compacted.items()))
+    s.reads.push(read(s.counts.items()))
+    dispatch(extremes.bind(first, mut s.extremes), groups: (COMPACTED / 256, 1, 1))
+    s.extremes_read = Some(read(s.extremes.items()))
+    if s.features.subgroups {
+        dispatch(
+            compact_subgroups.bind(first, mut s.compacted_subgroups, mut s.counts_subgroups),
+            groups: (COMPACTED / 256, 1, 1),
+        )
+        s.reads.push(read(s.compacted_subgroups.items()))
+        s.reads.push(read(s.counts_subgroups.items()))
+    }
+    if s.features.subgroups {
+        dispatch(
+            partial_places.bind(s.values.span(start: 0, count: 400), mut s.partial),
+            groups: (10, 1, 1),
+        )
+        s.partial_read = Some(read(s.partial.items()))
+    }
+    if s.features.f16 {
+        dispatch(halves.bind(mut s.halves), over: 64)
+        s.half_read = Some(read(s.halves.items()))
+    }
+    if s.features.bc {
+        // One block: both end colours pure red (RGB565 0xF800), every index 0.
+        var t: Texture<Bc1> = texture(width: 4, height: 4)
+        t.write(x: 0, y: 0, width: 4, height: 4, bytes: [0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0])
+        let p = begin_pass(mut s.bc1_out)
+        draw(p, cover, show.bind(t, s.linear), vertices: 3)
+        p.end()
+        s.texel_read = Some(read_texture(s.bc1_out.level(0)))
+        s.bc1 = Some(take t)
+    }
+}
+
+/// The histogram's bins as the CPU counts them.
+fn expected_bins() -> Vec<u32> {
+    var bins = Vec::from_fn(256, |_| 0)
+    for i in 0..VALUES {
+        bins[value(i)] += 1
+    }
+    bins
+}
+
+@test(frames: 6, gpu: true)
+fn a_workgroup_histogram_counts_every_value(s: State) {
+    assert(s.got.len() >= 3)
+    let want = expected_bins()
+    for b in 0..256 {
+        assert(s.got[0][b] == want[b])
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_prefix_sum_compacts_each_workgroup_in_order(s: State) {
+    for g in 0..COMPACTED / 256 {
+        var n = 0
+        for i in 0..256 {
+            let v = value(256 * g + i)
+            if v % 2 == 1 {
+                assert(s.got[1][256 * g + n] == v)
+                n += 1
+            }
+        }
+        assert(s.got[2][g] == n)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn features_are_consistent(s: State) {
+    let f = s.features
+    assert(f.indirect_first_instance)
+    assert(!f.atomic64_min_max)
+    if f.subgroups {
+        assert(f.subgroup_min >= 1 && f.subgroup_min <= f.subgroup_max && f.subgroup_max <= 128)
+    } else {
+        assert(f.subgroup_min == 0 && f.subgroup_max == 0)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_subgroup_scan_compacts_as_the_workgroup_scan_does(s: State) {
+    if !s.features.subgroups {
+        print("no `subgroups` on this device: passed trivially")
+        return
+    }
+    assert(s.got.len() == 5)
+    for i in 0..COMPACTED {
+        assert(s.got[3][i] == s.got[1][i])
+    }
+    for g in 0..COMPACTED / 256 {
+        assert(s.got[4][g] == s.got[2][g])
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_half_float_kernel_sums_within_f16s_precision(s: State) {
+    if !s.features.f16 {
+        print("no `shader-f16` on this device: passed trivially")
+        return
+    }
+    assert(s.half_got.len() == 64)
+    for i in 0..64 {
+        // (8i + 0 + ... + 8i + 7) / 8 = 8i + 3.5; each step rounds to f16's 11 bits.
+        let want = 8.0 * f32(i) + 3.5
+        assert(abs(s.half_got[i] - want) <= want / 256.0)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_bc1_block_samples_as_its_colour(s: State) {
+    if !s.features.bc {
+        print("no `texture-compression-bc` on this device: passed trivially")
+        return
+    }
+    assert(s.texel.len() == 4)
+    assert(u32(s.texel[0]) == 255 && u32(s.texel[1]) == 0 && u32(s.texel[2]) == 0)
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn both_hosts_run_the_same_kernels(s: State) {}
+
+@test(frames: 6, gpu: true)
+fn signed_workgroup_atomics_find_each_workgroups_extremes(s: State) {
+    assert(s.got_extremes.len() == 2 * COMPACTED / 256)
+    for g in 0..COMPACTED / 256 {
+        var lo: i32 = 2147483647
+        var hi: i32 = -2147483648
+        for i in 0..256 {
+            let v = i32(value(256 * g + i)) - 128
+            lo = min(lo, v)
+            hi = max(hi, v)
+        }
+        assert(s.got_extremes[2 * g] == lo && s.got_extremes[2 * g + 1] == hi)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_subgroup_scan_with_a_partial_subgroup_gives_distinct_dense_places(s: State) {
+    if !s.features.subgroups {
+        print("no `subgroups` on this device: passed trivially")
+        return
+    }
+    assert(s.got_partial.len() == 800)
+    for g in 0..10 {
+        // The kept values' places, by the subgroup scan, are 0 to the count, each once.
+        var count = 0
+        var seen = Vec::from_fn(40, |_| false)
+        for i in 0..40 {
+            let id = 40 * g + i
+            if value(id) % 2 == 1 {
+                let place = s.got_partial[2 * id + 1]
+                assert(place < 40 && !seen[place], f"workgroup {g}: place {place} twice")
+                seen[place] = true
+                count += 1
+            }
+        }
+        for p in 0..count {
+            assert(seen[p], f"workgroup {g}: place {p} missing")
+        }
+        // Where subgroups are consecutive runs (this GPU), the scans agree.
+        for i in 0..40 {
+            let id = 40 * g + i
+            assert(s.got_partial[2 * id] == s.got_partial[2 * id + 1])
+        }
+    }
+}

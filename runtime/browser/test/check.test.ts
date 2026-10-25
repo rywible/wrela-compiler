@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import { Checker } from "../src/check.ts";
 import { NONE, SCREEN } from "../src/abi.gen.ts";
 import type { Binding, Command } from "../src/stream.ts";
-import { shapes } from "./fixtures.ts";
+import { shapes, passOf } from "./fixtures.ts";
 
 for (const op of ["Dispatch", "Draw"] as const) {
   test(`writable bindings are checked per ${op.toLowerCase()}, including after a rejection`, () => {
@@ -84,12 +84,12 @@ test("a rejected pass restores its prior attachments and usage scope", () => {
   const checker = new Checker(m);
   checker.check({ op: "CreateBuffer", handle: 2, size: 64 });
   for (const handle of [5, 6]) {
-    checker.check({ op: "CreateTexture", handle, width: 32, height: 32, depth: 0, format: "rgba8unorm", writable: false });
+    checker.check({ op: "CreateTexture", handle, width: 32, height: 32, kind: "2d", layers: 1, levels: 1, format: "rgba8unorm", writable: false });
   }
-  checker.check({ op: "CreateTexture", handle: 7, width: 32, height: 31, depth: 0, format: "depth32float", writable: false });
+  checker.check({ op: "CreateTexture", handle: 7, width: 32, height: 31, kind: "2d", layers: 1, levels: 1, format: "depth32float", writable: false });
   const pass = (color: number, depth: number): Command => ({
     op: "BeginPass",
-    pass: { color, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 },
+    pass: passOf({ color, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 }),
   });
   const draw = (texture: number, pipeline = 0): Command => ({
     op: "Draw", pipeline, vertices: 3, instances: 1,
@@ -155,11 +155,11 @@ test("draw rollback scratch preserves uses across successes, failures and passes
 test("a screen pass requires its depth target to fit the frame", () => {
   const checker = new Checker(shapes());
   checker.setScreenSize(640, 360);
-  checker.check({ op: "CreateTexture", handle: 3, width: 640, height: 359, depth: 0, format: "depth32float", writable: false });
-  checker.check({ op: "CreateTexture", handle: 4, width: 640, height: 360, depth: 0, format: "depth32float", writable: false });
+  checker.check({ op: "CreateTexture", handle: 3, width: 640, height: 359, kind: "2d", layers: 1, levels: 1, format: "depth32float", writable: false });
+  checker.check({ op: "CreateTexture", handle: 4, width: 640, height: 360, kind: "2d", layers: 1, levels: 1, format: "depth32float", writable: false });
   const pass = (depth: number): Command => ({
     op: "BeginPass",
-    pass: { color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 },
+    pass: passOf({ color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 }),
   });
   expect(() => checker.check(pass(3))).toThrow("the pass's colour and depth targets differ in size");
   expect(() => checker.check(pass(4))).not.toThrow();

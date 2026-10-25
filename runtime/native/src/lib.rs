@@ -44,7 +44,7 @@ mod trace;
 
 pub use error::{Error, Result};
 #[cfg(feature = "gpu")]
-pub use gpu::{GpuTiming, frame_spans, map_read, open_device, read_timestamps};
+pub use gpu::{Counters, GpuTiming, frame_spans, map_read, open_device, read_timestamps};
 pub use trace::{Phase, Trace, Traced};
 /// Chrome over the DevTools protocol, which the browser service and the page runs drive.
 pub use wrela_chrome as chrome;
@@ -1034,6 +1034,12 @@ impl Host {
     /// them with [`wrela_abi::stream::decode`].
     pub fn take_batches(&mut self) -> Vec<Vec<u8>> {
         self.p().take_batches()
+    }
+
+    /// What the executor did below the recorded stream since the last call (or load): passes,
+    /// dispatches, draws and draw calls, writes, bind groups and pipelines set.
+    pub fn take_counters(&mut self) -> Counters {
+        self.p().executor().take_counters()
     }
 
     /// The GPU durations recorded since the last call (or load), with [`Options::timing`]:

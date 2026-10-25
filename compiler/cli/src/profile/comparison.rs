@@ -52,6 +52,14 @@ pub(super) fn lease(path: &Path) -> Result<File, String> {
 }
 
 pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
+    let mut v = machine()?;
+    v["adapter"] = host.adapter().into();
+    Ok(v)
+}
+
+/// This machine, the CPUs it has, and the profiler measuring: a report's identity but its
+/// adapter's.
+pub(super) fn machine() -> Result<Value, String> {
     let machine = std::fs::read("/etc/machine-id")
         .or_else(|_| {
             let out = std::process::Command::new("hostname").output()?;
@@ -68,7 +76,7 @@ pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     Ok(value!({
         "machine_sha256": crate::sha256_hex(&machine), "os": std::env::consts::OS,
-        "arch": std::env::consts::ARCH, "adapter": host.adapter(),
+        "arch": std::env::consts::ARCH, "adapter": "",
         "logical_cpus": std::thread::available_parallelism().map_err(|e| e.to_string())?.get(),
         "host_sha256": crate::sha256_hex(&std::fs::read(executable).map_err(|e| e.to_string())?),
     }))
@@ -103,13 +111,21 @@ pub(super) fn compatible_hardware(before: &Value, after: &Value) -> Result<(), S
     compatible(&hardware(before), &hardware(after), "machine, GPU or driver")
 }
 
-/// Hash the manifest, WASM, shaders and packaged files, with their names and lengths.
+/// Hash the manifest, WASM, shaders, the browser runtime and packaged files, with their names
+/// and lengths.
 pub(crate) fn build_hash(dir: &Path) -> Result<String, String> {
     let manifest = std::fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?;
     let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let mut paths = vec![PathBuf::from("manifest.json"), PathBuf::from(m.wasm)];
     paths.extend(m.pipelines.into_iter().map(|p| PathBuf::from(p.shader)));
+    // The browser runtime a build carries is measured with it (`--chrome`): a change to it is a
+    // change of what's measured.
+    for runtime in ["index.html", "main.js", "worker.js", "worklet.js"] {
+        if dir.join(runtime).is_file() {
+            paths.push(PathBuf::from(runtime));
+        }
+    }
     fn files(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         for entry in std::fs::read_dir(root.join(rel)).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -180,13 +196,13 @@ fn metric(before: &[f64], after: &[f64]) -> Value {
         "paired_change_percent": paired, "median_change_percent": median(paired) })
 }
 
+/// `--compare`: `sample` measures a build's directory once (on the native host or in Chrome);
+/// `environment` names the hardware, once the samples are taken.
 pub(super) fn run(
     a: &Args,
-    host: &mut Host,
-    options: &Options,
-    script: &[Scripted],
+    sample: &mut dyn FnMut(&Path) -> Result<Profile, String>,
     built: &Path,
-    environment: &Value,
+    environment: &dyn Fn() -> Result<Value, String>,
     workload: &Value,
 ) -> Result<String, String> {
     let before = a.compare.as_deref().expect("comparison baseline");
@@ -196,12 +212,7 @@ pub(super) fn run(
     let mut sequence = Vec::new();
     for pair in 0..a.pairs {
         for which in order(pair) {
-            host.restart_in(dirs[which], options).map_err(|e| e.to_string())?;
-            // Restart has joined the old program's workers. Each deferred init sees empty storage.
-            let storage = options.storage.as_ref().expect("isolated profile storage");
-            std::fs::remove_dir_all(storage).map_err(|e| e.to_string())?;
-            std::fs::create_dir(storage).map_err(|e| e.to_string())?;
-            let p = measure(a, host, script, dirs[which], environment, workload)?;
+            let p = sample(dirs[which])?;
             if p.build_sha256 != hashes[which] {
                 return Err("build changed during measurement; discard this run".into());
             }
@@ -214,6 +225,7 @@ pub(super) fn run(
             return Err("build changed during measurement; discard this run".into());
         }
     }
+    let environment = &environment()?;
     let spans = |side: usize| {
         samples[side]
             .iter()
@@ -252,7 +264,8 @@ pub(super) fn run(
                 .collect()
         })
         .collect();
-    let report = value!({ "schema": 2, "environment": environment, "workload": workload,
+    let host = if a.chrome { "chrome" } else { "native" };
+    let report = value!({ "schema": 2, "host": host, "environment": environment, "workload": workload,
         "pairs": a.pairs, "order": sequence, "baseline_build_sha256": hashes[0],
         "candidate_build_sha256": hashes[1], "gpu_span": metric(&spans(0), &spans(1)),
         "cpu_frame_call": metric(&calls(0), &calls(1)), "labels": labels,
@@ -325,7 +338,7 @@ mod tests {
         let root = scratch.0.clone();
         std::fs::write(
             root.join("manifest.json"),
-            r#"{"manifest_version":9,"stream_version":11,"wasm":"game.wasm","pipelines":[]}"#,
+            r#"{"manifest_version":10,"stream_version":12,"wasm":"game.wasm","pipelines":[]}"#,
         )
         .unwrap();
         std::fs::write(root.join("game.wasm"), b"first program").unwrap();
@@ -338,6 +351,12 @@ mod tests {
         assert_ne!(changed, first);
         std::fs::write(root.join("game.wasm"), b"other program").unwrap();
         assert_ne!(build_hash(&root).unwrap(), changed);
+        let program = build_hash(&root).unwrap();
+        std::fs::write(root.join("worker.js"), b"a runtime").unwrap();
+        let with_runtime = build_hash(&root).unwrap();
+        assert_ne!(with_runtime, program);
+        std::fs::write(root.join("worker.js"), b"another runtime").unwrap();
+        assert_ne!(build_hash(&root).unwrap(), with_runtime);
         drop(scratch);
         assert!(!root.exists());
     }

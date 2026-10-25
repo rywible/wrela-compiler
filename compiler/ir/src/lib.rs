@@ -67,6 +67,8 @@ pub enum Const {
     Small(Scalar, i64),
     F32(f32),
     F64(f64),
+    /// A half float (GPU only), held as the `f32` it rounds from: WGSL writes it rounded.
+    F16(f32),
 }
 
 impl Const {
@@ -80,6 +82,7 @@ impl Const {
             Const::Small(s, _) => *s,
             Const::F32(_) => Scalar::F32,
             Const::F64(_) => Scalar::F64,
+            Const::F16(_) => Scalar::F16,
         }
     }
 }
@@ -352,20 +355,61 @@ pub enum HostOp {
     Print,
     /// `wrela.phase(address, length)`: this thread's time from now counts under that name.
     Phase,
-    /// Args: vertices, instances (or, `indirect`, the handle and byte offset of a buffer
-    /// holding the counts, after the index buffer's handle, byte offset and size when
-    /// `indexed`), each binding's handle, offset and size, then the uniform block value.
+    /// Args: the counts as `kind` says ([`DrawKind::counts`]), each binding's handle, offset
+    /// and size, then the uniform block value.
     Draw {
         pipeline: u32,
         bindings: u32,
         uniform: Option<TypeId>,
-        indirect: bool,
-        indexed: bool,
+        kind: DrawKind,
         /// What its pass draws into, as its type says: one of the pipeline's targets (the
         /// manifest's).
         target: RenderTarget,
     },
     Present,
+}
+
+/// How a draw gives its counts: the command it records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DrawKind {
+    /// Vertices and instances.
+    Direct,
+    /// A buffer's handle and the byte offset of its counts.
+    Indirect,
+    /// The index buffer's handle, byte offset and size, then the arguments' buffer and offset.
+    IndexedIndirect,
+    /// The index buffer's handle, byte offset and size, then the index count, the instances,
+    /// the first index, the base vertex (an `i32`) and the first instance.
+    Indexed,
+    /// The arguments' buffer and offset, the most draws, the count buffer (or `NONE`) and its
+    /// offset; indexed, after the index buffer's handle, byte offset and size.
+    Multi { indexed: bool },
+}
+
+impl DrawKind {
+    /// How many `u32` (or `i32`) counts come before the bindings.
+    pub fn counts(self) -> usize {
+        match self {
+            DrawKind::Direct | DrawKind::Indirect => 2,
+            DrawKind::IndexedIndirect => 5,
+            DrawKind::Indexed => 8,
+            DrawKind::Multi { indexed: false } => 5,
+            DrawKind::Multi { indexed: true } => 8,
+        }
+    }
+
+    /// The command it records.
+    pub fn opcode(self) -> wrela_abi::stream::Opcode {
+        use wrela_abi::stream::Opcode;
+        match self {
+            DrawKind::Direct => Opcode::Draw,
+            DrawKind::Indirect => Opcode::DrawIndirect,
+            DrawKind::IndexedIndirect => Opcode::DrawIndexedIndirect,
+            DrawKind::Indexed => Opcode::DrawIndexed,
+            DrawKind::Multi { indexed: false } => Opcode::MultiDrawIndirect,
+            DrawKind::Multi { indexed: true } => Opcode::MultiDrawIndexedIndirect,
+        }
+    }
 }
 
 /// Raw memory (CPU only): what std's unsafe core is built on (language.md §6.12). Addresses are
@@ -419,6 +463,52 @@ pub enum MemOp {
     RunTask,
 }
 
+/// What [`Expr::Subgroup`] does: an operation across the invocations of a subgroup (WGSL's
+/// `subgroups` extension), each reaching it together (uniform control flow, E0610).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubgroupOp {
+    /// The sum over the subgroup's active invocations (`subgroupAdd`).
+    Add,
+    /// The sum over the invocations before this one (`subgroupExclusiveAdd`).
+    ExclusiveAdd,
+    /// The sum over the invocations up to this one (`subgroupInclusiveAdd`).
+    InclusiveAdd,
+    Min,
+    Max,
+    And,
+    Or,
+    Xor,
+    /// Whether the `bool` is true in any, or all, of the invocations.
+    Any,
+    All,
+    /// A `vec4u` of a bit for each invocation, set where the `bool` is true.
+    Ballot,
+    /// The value of the subgroup's first active invocation (`subgroupBroadcastFirst`).
+    BroadcastFirst,
+    /// The value of invocation (the second argument) of the subgroup (`subgroupShuffle`).
+    Shuffle,
+}
+
+impl SubgroupOp {
+    pub fn wgsl_name(self) -> &'static str {
+        match self {
+            SubgroupOp::Add => "subgroupAdd",
+            SubgroupOp::ExclusiveAdd => "subgroupExclusiveAdd",
+            SubgroupOp::InclusiveAdd => "subgroupInclusiveAdd",
+            SubgroupOp::Min => "subgroupMin",
+            SubgroupOp::Max => "subgroupMax",
+            SubgroupOp::And => "subgroupAnd",
+            SubgroupOp::Or => "subgroupOr",
+            SubgroupOp::Xor => "subgroupXor",
+            SubgroupOp::Any => "subgroupAny",
+            SubgroupOp::All => "subgroupAll",
+            SubgroupOp::Ballot => "subgroupBallot",
+            SubgroupOp::BroadcastFirst => "subgroupBroadcastFirst",
+            SubgroupOp::Shuffle => "subgroupShuffle",
+        }
+    }
+}
+
 /// What [`Expr::Atomic`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtomicOp {
@@ -440,32 +530,91 @@ pub enum AtomicOp {
     CompareExchange,
 }
 
-/// What [`Expr::Texture`] reads. Coordinates are `vec2`s in [0, 1] for sampling, and `u32`s
-/// for a texel.
+/// What [`Expr::Texture`] reads. Every sampling op's arguments start with the coordinates (a
+/// `vec2` in [0, 1], or a `vec3`: a direction into a cube, or a 3D texture's place), then an
+/// array's layer (a `u32`); a load's, with the texel (`u32`s: x and y, and z of a 3D texture),
+/// then an array's layer, then the level (a `u32`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TextureOp {
     /// Args: the coordinates. A `vec4`; fragment shaders only (it uses derivatives).
     Sample,
     /// Args: the coordinates and the mip level (an `f32`). A `vec4`.
     SampleLevel,
+    /// Args: the coordinates and their derivatives along x and along y (each the coordinates'
+    /// type). A `vec4`; any stage.
+    SampleGrad,
+    /// Args: the coordinates and a bias added to the level the derivatives pick (an `f32`). A
+    /// `vec4`; fragment shaders only.
+    SampleBias,
     /// Of a depth texture, with a comparison sampler. Args: the coordinates and the reference
     /// depth. An `f32`, the fraction of texels that pass; fragment shaders only.
     SampleCompare,
     /// As `SampleCompare`, at level 0: any stage.
     SampleCompareLevel,
-    /// Args: x and y (and z, of a 3D texture). The texel at level 0: a `vec4`, or an `f32` of a
-    /// depth texture.
+    /// Args: the texel, and its level. A `vec4`, or an `f32` of a depth texture.
     Load,
     /// The width, height or depth (of a 3D texture), a `u32`.
     Width,
     Height,
     Depth,
+    /// An array's layers, a `u32`.
+    Layers,
+    /// Its mip levels, a `u32`.
+    Levels,
 }
 
 impl TextureOp {
     /// Whether it uses derivatives: fragment shaders only, in uniform control flow.
     pub fn uses_derivatives(self) -> bool {
-        matches!(self, TextureOp::Sample | TextureOp::SampleCompare)
+        matches!(self, TextureOp::Sample | TextureOp::SampleCompare | TextureOp::SampleBias)
+    }
+
+    /// Whether it asks a texture's size, levels or layers, with no arguments.
+    pub fn is_query(self) -> bool {
+        matches!(
+            self,
+            TextureOp::Width
+                | TextureOp::Height
+                | TextureOp::Depth
+                | TextureOp::Layers
+                | TextureOp::Levels
+        )
+    }
+
+    /// Whether it samples through a sampler.
+    pub fn is_sampled(self) -> bool {
+        !self.is_query() && self != TextureOp::Load
+    }
+}
+
+/// A texture binding's dimension: what GPU code reads it as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TexDim {
+    #[default]
+    D2,
+    /// A 2D array: sampled by layer.
+    D2Array,
+    /// A cube: sampled by direction.
+    Cube,
+    D3,
+}
+
+impl TexDim {
+    /// How many coordinates it's sampled at: 2, or 3 (a cube's direction, a 3D texture's place).
+    pub fn coordinates(self) -> u8 {
+        match self {
+            TexDim::D2 | TexDim::D2Array => 2,
+            TexDim::Cube | TexDim::D3 => 3,
+        }
+    }
+
+    /// How many `u32`s say a texel: x and y, and z of a 3D texture (an array's layer is apart).
+    pub fn texel(self) -> usize {
+        if self == TexDim::D3 { 3 } else { 2 }
+    }
+
+    pub fn arrayed(self) -> bool {
+        self == TexDim::D2Array
     }
 }
 
@@ -518,6 +667,9 @@ pub enum Expr {
     /// An atomic read-modify-write of the atomic at the place (GPU only): the value that was
     /// there. Args: the operand (for `CompareExchange`, the expected value then the new one).
     Atomic(AtomicOp, Place, Vec<ValueId>),
+    /// An operation across the subgroup (GPU only): the value it gives this invocation. Args:
+    /// the operand, and for `Shuffle` the invocation to read.
+    Subgroup(SubgroupOp, Vec<ValueId>),
     /// `workgroupBarrier()` (GPU only): no invocation of the workgroup goes on until all have
     /// reached it, and their workgroup memory writes are visible. In uniform control flow only.
     Barrier,
@@ -677,13 +829,13 @@ pub enum ResourceKind {
     Private,
     /// `var<workgroup>` holding `ty` (an array): one per workgroup, shared by its invocations.
     Workgroup,
-    /// `texture_2d<f32>` (`texture_2d<u32>` of a `u32` format), `texture_depth_2d`, or
-    /// `texture_3d<..>` when `three`. Sampled with a `vec2`, or a `vec3` when `three`. A depth
-    /// texture's `format` is `R32Float`, its depths'.
-    Texture { depth: bool, three: bool, format: TextureFormat },
-    /// `texture_storage_2d<format, write>`, or `texture_storage_3d` when `three`: a kernel's
-    /// texels to write.
-    StorageTexture { three: bool, format: TextureFormat },
+    /// `texture_2d<f32>` (`texture_2d<u32>` of a `u32` format), `texture_depth_2d`, an array or a
+    /// cube of them, or `texture_3d<..>`, as `dim` says. A depth texture's `format` is
+    /// `R32Float`, its depths'.
+    Texture { depth: bool, dim: TexDim, format: TextureFormat },
+    /// `texture_storage_2d<format, write>`, an array of them, or `texture_storage_3d`: a
+    /// kernel's texels to write.
+    StorageTexture { dim: TexDim, format: TextureFormat },
     /// `sampler`, or `sampler_comparison`.
     Sampler { comparison: bool },
 }
@@ -714,6 +866,9 @@ pub enum BuiltinInput {
     InstanceIndex,
     /// The fragment's position.
     Position,
+    /// The invocation's index in its subgroup, and the subgroup's size (`subgroups` only).
+    SubgroupInvocationId,
+    SubgroupSize,
 }
 
 /// How a GPU entry point's inputs and outputs map onto WGSL's.
@@ -728,13 +883,25 @@ pub enum Stage {
         varyings: Vec<Varying>,
     },
     /// Takes the vertex's output (if it reads it) as its last argument: its type, and its
-    /// members. Returns a vec4 colour, or with `uint` a `u32` (into an integer target); with
-    /// `depth`, a struct of that and an f32 depth (`@builtin(frag_depth)`).
+    /// members. Returns a value whose parts at `outputs`' paths are its colours, one for each
+    /// colour target in order (each written as four of its scalar: missing colour channels 0,
+    /// missing alpha 1), and at `depth`'s path, if it has one, its own depth
+    /// (`@builtin(frag_depth)`).
     Fragment {
         varyings: Option<(TypeId, Vec<Varying>)>,
-        depth: bool,
-        uint: bool,
+        outputs: Vec<FragmentColour>,
+        depth: Option<Vec<u32>>,
     },
+}
+
+/// One colour a fragment shader writes, to the location of its place in the list: where it is
+/// in the returned value (field indexes, none for the value itself), its scalar (`F32` or
+/// `U32`) and its components (1 to 4).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FragmentColour {
+    pub path: Vec<u32>,
+    pub scalar: Scalar,
+    pub components: u8,
 }
 
 /// A member of the struct a vertex shader passes to the fragment shader: the clip position,
@@ -842,6 +1009,9 @@ pub struct Module {
     /// so the module imports the tool host's functions (wrela_abi's `TOOL_FUNCTIONS`). Only a
     /// tool build does.
     pub tool: bool,
+    /// GPU only: whether its code uses subgroup operations (`std::gpu::subgroup`), so its WGSL
+    /// enables them and its pipeline needs the device's `subgroups`.
+    pub subgroups: bool,
 }
 
 impl Module {
@@ -923,6 +1093,27 @@ impl Module {
     pub fn add_function(&mut self, f: Function) -> FuncId {
         self.functions.push(f);
         FuncId(self.functions.len() as u32 - 1)
+    }
+
+    /// The device features a GPU module's WGSL needs (WebGPU's names): `shader-f16` for half
+    /// floats, `subgroups` for subgroup operations.
+    pub fn requires(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        let half = self.types.iter().any(|(_, d)| {
+            matches!(d, TypeDef::Scalar(Scalar::F16) | TypeDef::Vector(Scalar::F16, _))
+        });
+        if half {
+            out.push("shader-f16".to_string());
+        }
+        let lanes = self.entry_points.iter().any(|e| {
+            e.inputs.iter().any(|b| {
+                matches!(b, BuiltinInput::SubgroupInvocationId | BuiltinInput::SubgroupSize)
+            })
+        });
+        if self.subgroups || lanes {
+            out.push("subgroups".to_string());
+        }
+        out
     }
 
     pub fn add_resource(&mut self, r: Resource) -> ResourceId {

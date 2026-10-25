@@ -1,6 +1,7 @@
-//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize] [--lift <package>]... [--json]`: checks and builds a package, writing
+//! `wrela build <package-dir> [-o <out-dir>] [--debug] [--testing] [--optimize [size|speed]] [--lift <package>]... [--json]`: checks and builds a package, writing
 //! `game.wasm`, the WGSL, `manifest.json` and the runtime into the output directory (default
-//! `<package>/build`). With `--optimize`, `game.wasm` goes through Binaryen and its trap
+//! `<package>/build`). With `--optimize`, `game.wasm` goes through Binaryen (for size, `-Oz`, or
+//! speed, `-O3`; alone, `wrela_driver::optimize::Level::DEFAULT`) and its trap
 //! locations are written beside it, as `game.lines` (`wrela_driver::optimize`). The output is the same bytes for the same input (AC9). A file an earlier
 //! build wrote there and this one doesn't (every one, when the build fails) is removed; other
 //! files are left alone, and the build stops rather than replace one. `.wrela-build` there
@@ -34,9 +35,9 @@ pub fn run(args: &[String]) -> ExitCode {
         wrela_driver::build(dir)
     };
     let failed = crate::report(&output, args.json);
-    if args.optimize
+    if let Some(level) = args.optimize
         && !failed
-        && let Err(e) = optimized(&mut output.files)
+        && let Err(e) = optimized(&mut output.files, level)
     {
         eprintln!("error: {e}");
         return ExitCode::from(2);
@@ -96,8 +97,11 @@ pub fn run(args: &[String]) -> ExitCode {
 }
 
 /// The build's files with `game.wasm` optimized, and its trap locations beside it.
-fn optimized(files: &mut Vec<(String, Vec<u8>)>) -> Result<(), String> {
-    optimized_with(files, wrela_driver::optimize::optimize)
+fn optimized(
+    files: &mut Vec<(String, Vec<u8>)>,
+    level: wrela_driver::optimize::Level,
+) -> Result<(), String> {
+    optimized_with(files, |wasm| wrela_driver::optimize::optimize(wasm, level))
 }
 
 /// [`optimized`], with `optimize` making the optimized code and its table.

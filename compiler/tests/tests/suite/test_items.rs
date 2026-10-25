@@ -743,6 +743,49 @@ fn a_golden_is_blessed_from_the_screen() {
     assert!(wrela_driver::test(&dir, Some("the_ramp")).passed(), "and it passes after");
 }
 
+/// Toolchain 0.6's GPU capabilities (compiler/tests/capabilities): texture copies and readback,
+/// the new formats, a generated mip chain sampled trilinear, blend states, a pass of three
+/// targets, a scissor, texture arrays, a cube, a depth array, a direct indexed draw and a
+/// multi-draw, each read back and checked; and Chrome records the same frames.
+#[test]
+#[ignore = "needs a GPU"]
+fn every_gpu_capability_reads_back_what_it_drew() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/capabilities");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let failed: Vec<_> =
+        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
+    assert!(failed.is_empty(), "failed: {failed:?}");
+    assert_eq!(out.results.len(), 18);
+}
+
+/// Toolchain 0.6's kernel capabilities (compiler/tests/kernels): a histogram in workgroup
+/// atomics, a compaction by `workgroup_prefix_sum`, and the optional features (subgroups, half
+/// floats, BC1), each passing trivially on a device without it; Chrome agrees.
+#[test]
+#[ignore = "needs a GPU"]
+fn every_kernel_capability_computes_what_the_cpu_does() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/kernels");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let failed: Vec<_> =
+        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
+    assert!(failed.is_empty(), "failed: {failed:?}");
+    assert_eq!(out.results.len(), 9);
+}
+
+/// `std::gpu::memory()` (compiler/tests/memory): std counts the buffers and textures a
+/// program makes and drops, by their levels and layers.
+#[test]
+#[ignore = "needs a GPU"]
+fn std_counts_the_gpu_memory_a_program_holds() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/memory");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
+    assert_eq!(out.results.len(), 1);
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

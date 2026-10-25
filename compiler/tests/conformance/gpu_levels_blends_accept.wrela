@@ -1,0 +1,58 @@
+// accepts: gpu.draw-state gpu.textures
+// Blends are build-time constants, one for a draw or one for each of a pass's targets; a
+// texture's mip levels and an array's layers are views a pass or a kernel takes.
+use std::gpu::{
+    Blend, ClipPosition, Rgba16Float, Rgba8, Sampler, Targets2, Texels, Texture, TextureArray,
+    VertexIndex, GlobalId, begin_layer_pass, begin_pass, begin_pass2, dispatch, draw,
+    generate_mips, sampler, texture, texture_array, writable_texture, writable_texture_array,
+}
+
+const SOFT: Blend = Blend::Premultiplied
+
+@vertex
+fn cover(v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, 0.5, 1.0) }
+}
+
+@fragment
+fn tint() -> vec4 {
+    vec4(1.0, 0.5, 0.0, 0.5)
+}
+
+@fragment
+fn two() -> Targets2<vec4, vec4> {
+    Targets2 { first: vec4(1.0), second: vec4(0.5) }
+}
+
+@fragment
+fn level_two(t: Texture<Rgba16Float>, s: Sampler) -> vec4 {
+    t.sample_level(s, vec2(0.5), level: 2.0)
+}
+
+@compute(4, 4)
+fn fill(out: mut Texels<Rgba16Float>, id: GlobalId) {
+    out.store(id, vec4(1.0))
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var a: Texture<Rgba8> = texture(width: 4, height: 4)
+    var b: Texture<Rgba8> = texture(width: 4, height: 4)
+    let p = begin_pass2(mut a, mut b)
+    draw(p, cover, two, vertices: 3, blends: [Blend::Add, SOFT])
+    p.end()
+    var mipped: Texture<Rgba16Float> = writable_texture(width: 16, height: 16, levels: 5)
+    let s = sampler()
+    dispatch(fill.bind(mipped.level_mut(0)), groups: (4, 4, 1))
+    generate_mips(mut mipped, s)
+    let p = begin_pass(mut a, clear: vec4(0.0))
+    draw(p, cover, level_two.bind(mipped, s), vertices: 3, blend: Blend::Over)
+    p.end()
+    var layers: TextureArray<Rgba8> = texture_array(width: 4, height: 4, layers: 2)
+    let p = begin_layer_pass(mut layers, 1)
+    draw(p, cover, tint, vertices: 3, blend: SOFT)
+    p.end()
+    var written: TextureArray<Rgba16Float> = writable_texture_array(width: 4, height: 4, layers: 2)
+    dispatch(fill.bind(written.layer_mut(1)), groups: (1, 1, 1))
+}

@@ -337,6 +337,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                     | "allocations"
                     | "debug_build"
                     | "test_build"
+                    // std's own words of GPU accounting (`std::gpu::memory`), package-private.
+                    | "gpu_count"
+                    | "own_gpu_count"
+                    | "set_gpu_count"
             );
         self.p.fns.push(FnDef {
             name: f.name.name.clone(),

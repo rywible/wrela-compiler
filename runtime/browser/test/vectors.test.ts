@@ -11,7 +11,7 @@ import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
 import { carried, lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
-import { checker, type ErrorVector, shapes, vectors } from "./fixtures.ts";
+import { checker, type ErrorVector, shapes, vectors, passOf } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -102,13 +102,13 @@ test("texture and sampler bindings reject buffer ranges", () => {
     m.pipelines[1]!.bindings = [{ binding: 1, kind, stage: "both", format: kind === "texture" ? "rgba8unorm" : null }];
     const c = checker(m);
     c.check(kind === "texture"
-      ? { op: "CreateTexture", handle: 1, width: 1, height: 1, depth: 0, format: "rgba8unorm", writable: false }
-      : { op: "CreateSampler", handle: 1, linear: false, repeat: false, compare: null });
+      ? { op: "CreateTexture", handle: 1, width: 1, height: 1, kind: "2d", layers: 1, levels: 1, format: "rgba8unorm", writable: false }
+      : { op: "CreateSampler", handle: 1, linear: false, repeat: false, compare: null, mipLinear: false, anisotropy: 1 });
     for (const [offset, size] of [[4, 0], [0, 4], [4, 4]]) {
       expect(() => c.check({
         op: "Dispatch", pipeline: 1, groups: [1, 1, 1],
         bindings: [{ handle: 1, offset: offset!, size: size! }], uniforms: new Uint8Array(16),
-      })).toThrow(`a texture or sampler binding has offset ${offset} and size ${size}: both must be 0`);
+      })).toThrow(kind === "sampler" ? `a sampler binding has offset ${offset} and size ${size}: both must be 0` : "its binding's view is");
     }
     expect(() => c.check({
       op: "Dispatch", pipeline: 1, groups: [1, 1, 1],
@@ -157,22 +157,16 @@ test("rejected draws and passes leave checker state unchanged", () => {
     height: 8,
     format: "rgba8unorm",
     writable: false,
-    depth: 0,
+    kind: "2d",
+    layers: 1,
+    levels: 1,
   });
   c.check({ op: "BeginScreenPass", clear: [0, 0, 0, 0] });
   c.check({ op: "Present" });
   expect(() =>
     c.check({
       op: "BeginPass",
-      pass: {
-        color: 3,
-        keepColor: false,
-        join: false,
-        clear: [0, 0, 0, 0],
-        depth: 99,
-        keepDepth: false,
-        clearDepth: 1,
-      },
+      pass: passOf({ color: 3, keepColor: false, join: false, clear: [0, 0, 0, 0], depth: 99, keepDepth: false, clearDepth: 1 }),
     }),
   ).toThrow("there's no texture 99");
   expect(() =>

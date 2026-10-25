@@ -8,8 +8,8 @@ use crate::check::Checker;
 use crate::hash::StateHash;
 use crate::lines::Lines;
 use crate::manifest::{
-    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, Pipeline, RenderTarget,
-    ResourceBinding, Stage, UniformBlock, UniformSpace,
+    BindingKind, BindingStage, Blend, Cull, DepthBias, DepthState, Manifest, Output, Pipeline,
+    RenderTarget, ResourceBinding, Stage, UniformBlock, UniformSpace,
 };
 use crate::stream::{
     self, Binding, Command, Compare, Encoder, NONE, Pass, SCREEN, Sequencer, StreamError,
@@ -71,19 +71,34 @@ fn command(c: &Command) -> Value {
                 "destination": destination, "destinationOffset": destination_offset, "size": size,
             })
         }
-        Command::CreateTexture { handle, width, height, format, writable, depth } => json!({
-            "op": "CreateTexture", "handle": handle, "width": width, "height": height,
-            "format": format.name(), "writable": writable, "depth": depth,
-        }),
-        Command::WriteTexture { handle, x, y, width, height, data } => json!({
-            "op": "WriteTexture", "handle": handle, "x": x, "y": y, "width": width,
-            "height": height, "data": data,
+        Command::CreateTexture {
+            handle,
+            width,
+            height,
+            format,
+            writable,
+            kind,
+            layers,
+            levels,
+        } => {
+            json!({
+                "op": "CreateTexture", "handle": handle, "width": width, "height": height,
+                "format": format.name(), "writable": writable, "kind": kind.name(),
+                "layers": layers, "levels": levels,
+            })
+        }
+        Command::WriteTexture { handle, level, layer, x, y, width, height, data } => json!({
+            "op": "WriteTexture", "handle": handle, "level": level, "layer": layer, "x": x,
+            "y": y, "width": width, "height": height, "data": data,
         }),
         Command::DestroyTexture { handle } => json!({ "op": "DestroyTexture", "handle": handle }),
-        Command::CreateSampler { handle, linear, repeat, compare } => json!({
-            "op": "CreateSampler", "handle": handle, "linear": linear, "repeat": repeat,
-            "compare": compare.map(Compare::name),
-        }),
+        Command::CreateSampler { handle, linear, repeat, compare, mip_linear, anisotropy } => {
+            json!({
+                "op": "CreateSampler", "handle": handle, "linear": linear, "repeat": repeat,
+                "compare": compare.map(Compare::name), "mipLinear": mip_linear,
+                "anisotropy": anisotropy,
+            })
+        }
         Command::DestroySampler { handle } => json!({ "op": "DestroySampler", "handle": handle }),
         Command::BeginPass(p) => json!({ "op": "BeginPass", "pass": pass_json(p) }),
         Command::EndPass => json!({ "op": "EndPass" }),
@@ -139,7 +154,66 @@ fn command(c: &Command) -> Value {
         Command::HandOver { request, path } => {
             json!({ "op": "HandOver", "request": request, "path": path })
         }
+        Command::CopyTexture { source, destination: d } => json!({
+            "op": "CopyTexture", "source": rect_json(source),
+            "destination": { "texture": d.texture, "level": d.level, "layer": d.layer, "x": d.x, "y": d.y },
+        }),
+        Command::CopyTextureToBuffer { source, buffer, offset, bytes_per_row } => json!({
+            "op": "CopyTextureToBuffer", "source": rect_json(source), "buffer": buffer,
+            "offset": offset, "bytesPerRow": bytes_per_row,
+        }),
+        Command::CopyBufferToTexture { buffer, offset, bytes_per_row, destination } => json!({
+            "op": "CopyBufferToTexture", "buffer": buffer, "offset": offset,
+            "bytesPerRow": bytes_per_row, "destination": rect_json(destination),
+        }),
+        Command::SetScissor { x, y, width, height } => {
+            json!({ "op": "SetScissor", "x": x, "y": y, "width": width, "height": height })
+        }
+        Command::SetViewport { rect, min_depth, max_depth } => json!({
+            "op": "SetViewport", "rect": rect, "minDepth": min_depth, "maxDepth": max_depth,
+        }),
+        Command::DrawIndexed {
+            pipeline,
+            indices,
+            index_offset,
+            index_size,
+            index_count,
+            instances,
+            first_index,
+            base_vertex,
+            first_instance,
+            bindings: bs,
+            uniforms,
+        } => json!({
+            "op": "DrawIndexed", "pipeline": pipeline, "indices": indices,
+            "index_offset": index_offset, "index_size": index_size, "index_count": index_count,
+            "instances": instances, "first_index": first_index, "base_vertex": base_vertex,
+            "first_instance": first_instance, "bindings": bindings(bs), "uniforms": uniforms,
+        }),
+        Command::MultiDrawIndirect {
+            pipeline,
+            indices,
+            arguments,
+            offset,
+            count,
+            count_buffer,
+            count_offset,
+            bindings: bs,
+            uniforms,
+        } => json!({
+            "op": c.opcode().name(), "pipeline": pipeline, "indices": indices,
+            "arguments": arguments, "offset": offset, "count": count,
+            "count_buffer": count_buffer, "count_offset": count_offset,
+            "bindings": bindings(bs), "uniforms": uniforms,
+        }),
     }
+}
+
+fn rect_json(r: &stream::TexelRect) -> Value {
+    json!({
+        "texture": r.texture, "level": r.level, "layer": r.layer, "x": r.x, "y": r.y,
+        "width": r.width, "height": r.height,
+    })
 }
 
 /// A batch and what decoding it gives.
@@ -153,15 +227,7 @@ fn batch(name: &str, bytes: &[u8]) -> Value {
 
 /// An offscreen pass into texture 8, with depth texture 9.
 fn offscreen() -> Pass {
-    Pass {
-        color: 8,
-        keep_color: false,
-        join: false,
-        clear: [0.0, 0.0, 0.0, 1.0],
-        depth: 9,
-        keep_depth: false,
-        clear_depth: 1.0,
-    }
+    Pass::one(8, false, [0.0, 0.0, 0.0, 1.0]).with_depth(9, false, 1.0)
 }
 
 /// The golden batch: every command once.
@@ -196,6 +262,27 @@ pub(crate) fn golden_batch() -> Vec<u8> {
         .hand_over(7, "next")
         .host_request(8, "test/echo", &[3, 2, 1])
         .timed(9, "shadows")
+        .copy_texture(
+            stream::TexelRect { texture: 8, level: 1, layer: 0, x: 0, y: 0, width: 2, height: 2 },
+            stream::TexelAt { texture: 12, level: 0, layer: 3, x: 4, y: 4 },
+        )
+        .copy_texture_to_buffer(
+            stream::TexelRect { texture: 8, level: 0, layer: 0, x: 1, y: 1, width: 2, height: 2 },
+            3,
+            256,
+            256,
+        )
+        .copy_buffer_to_texture(
+            3,
+            0,
+            256,
+            stream::TexelRect { texture: 8, level: 2, layer: 0, x: 0, y: 0, width: 4, height: 4 },
+        )
+        .set_scissor(1, 2, 3, 4)
+        .set_viewport([0.0, 0.0, 64.0, 32.0], 0.0, 1.0)
+        .draw_indexed(1, [3, 0, 12], [6, 2, 1, -1i32 as u32, 4], &[], &[])
+        .multi_draw_indirect(1, None, [3, 16], [4, NONE, 0], &[], &[])
+        .multi_draw_indirect(1, Some([3, 0, 12]), [5, 0], [2, 6, 8], &[], &[])
         .finish()
 }
 
@@ -352,7 +439,7 @@ fn sequence(name: &str, bytes: &[u8]) -> Value {
 
 fn sequences() -> Vec<Value> {
     let e = Encoder::new;
-    let screen = Pass { color: SCREEN, depth: NONE, ..offscreen() };
+    let screen = Pass { depth: NONE, ..offscreen().with_color(SCREEN) };
     vec![
         sequence("in order", &golden_batch()),
         sequence("a draw outside a pass", &e().draw(0, 3, 1, &[], &[]).finish()),
@@ -437,6 +524,7 @@ pub fn check_manifest() -> Manifest {
         uniform: Some(UniformBlock { binding: 0, size: 16, space: UniformSpace::Uniform }),
         bindings: vec![bind(1, BindingKind::Read), bind(2, BindingKind::ReadWrite)],
         debug_flag: None,
+        requires: Vec::new(),
     };
     let render = target_bound(false, false);
     m.pipelines.push(shape("draw", render.clone()));
@@ -487,13 +575,12 @@ pub fn check_manifest() -> Manifest {
 /// (`writes_depth`) or whose fragment shader returns a `u32` (`uint`), with every target its
 /// kind takes.
 fn target_bound(writes_depth: bool, uint: bool) -> Stage {
-    let colors = TextureFormat::ALL.into_iter().filter(|f| !f.is_depth() && f.is_uint() == uint);
-    let mut targets: Vec<RenderTarget> = colors
-        .flat_map(|c| {
-            [false, true].map(|depth| RenderTarget { color: Some(c), depth, screen: false })
-        })
-        .collect();
-    targets.push(RenderTarget { color: None, depth: true, screen: false });
+    let colors = TextureFormat::ALL
+        .into_iter()
+        .filter(|f| !f.is_depth() && f.renderable() && f.is_uint() == uint);
+    let mut targets: Vec<RenderTarget> =
+        colors.flat_map(|c| [false, true].map(|depth| RenderTarget::of(&[c], depth))).collect();
+    targets.push(RenderTarget::of(&[], true));
     if !uint {
         targets.extend([false, true].map(RenderTarget::screen));
     }
@@ -506,12 +593,12 @@ fn render_stage(writes_depth: bool, uint: bool, targets: Vec<RenderTarget>) -> S
     Stage::Render {
         vertex_entry: "vs".into(),
         fragment_entry: "fs".into(),
-        blend: false,
+        blends: Vec::new(),
         cull: Cull::None,
         depth_bias: DepthBias::default(),
         depth: DepthState::default(),
         writes_depth,
-        uint,
+        outputs: vec![if uint { Output::Uint } else { Output::Float }],
         targets,
     }
 }
@@ -557,17 +644,40 @@ fn checks() -> Value {
     // Buffer 2 read, buffer 1 written.
     let rw = [Binding::range(2, 256, 4), b(1)];
     let tex = [Binding::of(8), Binding::of(10), Binding::of(9), Binding::of(11)];
-    let pass = Pass {
-        color: 8,
-        keep_color: false,
-        join: false,
-        clear: [0.0; 4],
-        depth: 9,
-        keep_depth: false,
-        clear_depth: 1.0,
-    };
+    let pass = Pass::one(8, false, [0.0; 4]).with_depth(9, false, 1.0);
     let max = crate::Limits::DEFAULT.max_buffer_size;
     let cases = vec![
+        check(
+            "a copy from a buffer at an offset that cuts the format's blocks",
+            &m,
+            &Encoder::new()
+                .create_buffer(1, 1024)
+                .create_texture(2, 4, 4, TextureFormat::Rgba32Float, false)
+                .copy_buffer_to_texture(
+                    1,
+                    8,
+                    256,
+                    stream::TexelRect {
+                        texture: 2,
+                        level: 0,
+                        layer: 0,
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                )
+                .finish(),
+        ),
+        check(
+            "a multi-draw with a count buffer",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4])
+                    .multi_draw_indirect(0, None, [2, 0], [2, 1, 0], &rw, &u)
+                    .present();
+            }),
+        ),
         check(
             "a texture write with a two-byte texel",
             &m,
@@ -590,7 +700,7 @@ fn checks() -> Value {
                     .draw(0, 3, 1, &ab, &u)
                     .draw(5, 3, 1, &tex, &[])
                     .present()
-                    .begin_pass(Pass { color: stream::NONE, ..pass })
+                    .begin_pass(pass.with_color(stream::NONE))
                     .draw_indirect(0, 2, 496, &[Binding::range(2, 256, 4), b(1)], &u)
                     .draw_indexed_indirect(
                         0,
@@ -895,11 +1005,8 @@ fn checks() -> Value {
             "a 3D texture as a pass's target",
             &m,
             &with_textures(&|e| {
-                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false).begin_pass(Pass {
-                    color: 13,
-                    depth: stream::NONE,
-                    ..pass
-                });
+                e.create_texture_3d(13, 4, 4, 4, TextureFormat::Rgba8, false)
+                    .begin_pass(Pass { depth: stream::NONE, ..pass.with_color(13) });
             }),
         ),
         check(
@@ -971,7 +1078,9 @@ fn checks() -> Value {
         check(
             "a depth texture as a colour target",
             &m,
-            &with_textures(&|e| _ = e.begin_pass(Pass { color: 9, depth: stream::NONE, ..pass })),
+            &with_textures(&|e| {
+                _ = e.begin_pass(Pass { depth: stream::NONE, ..pass.with_color(9) })
+            }),
         ),
         check(
             "a colour texture as a depth target",
@@ -983,14 +1092,14 @@ fn checks() -> Value {
             &m,
             &with_textures(&|e| {
                 e.create_texture(12, 2, 2, TextureFormat::Rgba8, false)
-                    .begin_pass(Pass { color: 12, ..pass });
+                    .begin_pass(pass.with_color(12));
             }),
         ),
         check(
             "a pass with no target",
             &m,
             &with_textures(&|e| {
-                _ = e.begin_pass(Pass { color: stream::NONE, depth: stream::NONE, ..pass })
+                _ = e.begin_pass(Pass { depth: stream::NONE, ..pass.with_color(stream::NONE) })
             }),
         ),
         check(
@@ -1003,7 +1112,7 @@ fn checks() -> Value {
             &m,
             &with_textures(&|e| {
                 e.begin_pass(pass).draw(7, 3, 1, &[], &[]).end_pass();
-                e.begin_pass(Pass { color: stream::NONE, ..pass }).draw(7, 3, 1, &[], &[]);
+                e.begin_pass(pass.with_color(stream::NONE)).draw(7, 3, 1, &[], &[]);
             }),
         ),
         check(
@@ -1016,7 +1125,7 @@ fn checks() -> Value {
             &m,
             &with_textures(&|e| {
                 e.create_texture(12, 4, 4, TextureFormat::R32Uint, false)
-                    .begin_pass(Pass { color: 12, ..pass })
+                    .begin_pass(pass.with_color(12))
                     .draw(8, 3, 1, &[], &[]);
             }),
         ),
@@ -1030,7 +1139,7 @@ fn checks() -> Value {
             &m,
             &with_textures(&|e| {
                 e.create_texture(12, 4, 4, TextureFormat::R32Uint, false)
-                    .begin_pass(Pass { color: 12, depth: stream::NONE, ..pass })
+                    .begin_pass(Pass { depth: stream::NONE, ..pass.with_color(12) })
                     .draw_indirect(0, 2, 0, &rw, &u);
             }),
         ),
@@ -1049,9 +1158,7 @@ fn checks() -> Value {
         check(
             "a pipeline drawn on the screen with depth, which isn't one of its targets",
             &m,
-            &with_textures(&|e| {
-                _ = e.begin_pass(Pass { color: SCREEN, ..pass }).draw(9, 3, 1, &[], &[])
-            }),
+            &with_textures(&|e| _ = e.begin_pass(pass.with_color(SCREEN)).draw(9, 3, 1, &[], &[])),
         ),
         check("a readback past the end", &m, &with_buffers(&|e| _ = e.read_buffer(0, 1, 256, 260))),
         check(
@@ -1117,6 +1224,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         uniform: Some(UniformBlock { binding: 0, size: 32, space: UniformSpace::Uniform }),
         bindings: vec![bind(1, BindingKind::ReadWrite)],
         debug_flag: None,
+        requires: Vec::new(),
     });
     m.pipelines.push(Pipeline {
         name: "cover+shade".into(),
@@ -1125,6 +1233,7 @@ pub(crate) fn sample_manifest() -> Manifest {
         uniform: None,
         bindings: vec![bind(0, BindingKind::Texture), bind(1, BindingKind::Sampler)],
         debug_flag: None,
+        requires: Vec::new(),
     });
     m
 }
@@ -1206,28 +1315,63 @@ fn manifests() -> Vec<Value> {
         manifest(
             "an unblendable integer target",
             edited(&|m| {
-                if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
-                    *blend = true;
-                    *uint = true;
-                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Uint), ..RenderTarget::default() }];
+                if let Stage::Render { blends, outputs, targets, .. } = &mut m.pipelines[1].stage {
+                    *blends = vec![Blend::Over];
+                    *outputs = vec![Output::Uint];
+                    *targets = vec![RenderTarget::of(&[TextureFormat::R32Uint], false)];
                 }
             }),
         ),
         manifest(
-            "an unblendable float32 target",
+            "a float32 target blended, which a device with `float32-blendable` takes",
             edited(&|m| {
-                if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
-                    *blend = true;
-                    *targets = vec![RenderTarget { color: Some(TextureFormat::R32Float), ..RenderTarget::default() }];
+                if let Stage::Render { blends, targets, .. } = &mut m.pipelines[1].stage {
+                    *blends = vec![Blend::Add];
+                    *targets = vec![RenderTarget::of(&[TextureFormat::R32Float], false)];
                 }
             }),
+        ),
+        manifest(
+            "three colour targets, within 32 bytes a sample",
+            edited(&|m| {
+                if let Stage::Render { blends, outputs, targets, .. } = &mut m.pipelines[1].stage {
+                    *blends = vec![Blend::Replace, Blend::Premultiplied, Blend::Replace];
+                    *outputs = vec![Output::Float, Output::Float, Output::Uint];
+                    let colors =
+                        [TextureFormat::Rgba16Float, TextureFormat::Rgb10a2, TextureFormat::R32Uint];
+                    *targets = vec![RenderTarget::of(&colors, true)];
+                }
+            }),
+        ),
+        manifest(
+            "four colour targets over 32 bytes a sample",
+            edited(&|m| {
+                if let Stage::Render { outputs, targets, .. } = &mut m.pipelines[1].stage {
+                    *outputs = vec![Output::Float; 4];
+                    let colors = [
+                        TextureFormat::Rgba32Float,
+                        TextureFormat::Rgba8,
+                        TextureFormat::Rgba8,
+                        TextureFormat::Rgba16Float,
+                    ];
+                    *targets = vec![RenderTarget::of(&colors, false)];
+                }
+            }),
+        ),
+        manifest(
+            "a pipeline that needs a feature",
+            edited(&|m| m.pipelines[0].requires = vec!["shader-f16".into()]),
+        ),
+        manifest(
+            "a pipeline that needs a feature no host knows",
+            edited(&|m| m.pipelines[0].requires = vec!["warp-drive".into()]),
         ),
         manifest(
             "a blend with only a depth target",
             edited(&|m| {
-                if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
-                    *blend = true;
-                    *targets = vec![RenderTarget { depth: true, ..RenderTarget::default() }];
+                if let Stage::Render { blends, targets, .. } = &mut m.pipelines[1].stage {
+                    *blends = vec![Blend::Over];
+                    *targets = vec![RenderTarget::of(&[], true)];
                 }
             }),
         ),
@@ -1270,13 +1414,13 @@ fn manifests() -> Vec<Value> {
         manifest(
             "a blended render pipeline",
             edited(&|m| {
-                if let Stage::Render { blend, .. } = &mut m.pipelines[1].stage {
-                    *blend = true;
+                if let Stage::Render { blends, .. } = &mut m.pipelines[1].stage {
+                    *blends = vec![Blend::Over];
                 }
             }),
         ),
-        manifest("a blend that isn't a bool", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": 1,")),
-        manifest("a blend that's null", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blend\": null,")),
+        manifest("a blend that isn't one", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blends\": [\"screen\"],")),
+        manifest("blends that aren't a list", golden.replace("\"fragment_entry\": \"fs\",", "\"fragment_entry\": \"fs\",\n      \"blends\": null,")),
         manifest(
             "a render pipeline with no targets",
             edited(&|m| {
@@ -1305,8 +1449,8 @@ fn manifests() -> Vec<Value> {
         manifest(
             "u32 fragments with a colour target",
             edited(&|m| {
-                if let Stage::Render { uint, .. } = &mut m.pipelines[1].stage {
-                    *uint = true;
+                if let Stage::Render { outputs, .. } = &mut m.pipelines[1].stage {
+                    *outputs = vec![Output::Uint];
                 }
             }),
         ),
@@ -1314,7 +1458,7 @@ fn manifests() -> Vec<Value> {
             "colour fragments with an r32uint target",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0] = RenderTarget { color: Some(TextureFormat::R32Uint), ..RenderTarget::default() };
+                    targets[0] = RenderTarget::of(&[TextureFormat::R32Uint], false);
                 }
             }),
         ),
@@ -1322,7 +1466,7 @@ fn manifests() -> Vec<Value> {
             "a target whose colour is a depth format",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0] = RenderTarget { color: Some(TextureFormat::Depth32Float), ..RenderTarget::default() };
+                    targets[0] = RenderTarget::of(&[TextureFormat::Depth32Float], false);
                 }
             }),
         ),
@@ -1330,7 +1474,7 @@ fn manifests() -> Vec<Value> {
             "a screen target whose colour isn't the screen's",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets[0].color = Some(TextureFormat::Rgba16Float);
+                    targets[0] = RenderTarget { screen: true, ..RenderTarget::of(&[TextureFormat::Rgba16Float], false) };
                 }
             }),
         ),
@@ -1338,7 +1482,7 @@ fn manifests() -> Vec<Value> {
             "a texture target of the screen's format beside the screen",
             edited(&|m| {
                 if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                    targets.push(RenderTarget { color: Some(TextureFormat::Rgba8), ..RenderTarget::default() });
+                    targets.push(RenderTarget::of(&[TextureFormat::Rgba8], false));
                 }
             }),
         ),
@@ -1802,30 +1946,33 @@ fn lockstep() -> Value {
 
 /// A pass as the browser runtime decodes it.
 fn pass_json(p: &Pass) -> Value {
+    let colors: Vec<Value> = p
+        .colors()
+        .iter()
+        .map(|c| {
+            json!({ "texture": c.texture, "level": c.level, "layer": c.layer, "keep": c.keep, "clear": c.clear })
+        })
+        .collect();
     json!({
-        "color": p.color, "keepColor": p.keep_color, "join": p.join, "clear": p.clear,
-        "depth": p.depth, "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
+        "colors": colors, "join": p.join, "depth": p.depth, "depthLayer": p.depth_layer,
+        "keepDepth": p.keep_depth, "clearDepth": p.clear_depth,
     })
 }
 
 /// Pairs of passes, one ended and the next beginning right after it: whether the next runs as
 /// part of the one before ([`Pass::joins`]).
 fn joins() -> Vec<Value> {
-    let ended = Pass { keep_color: true, keep_depth: true, ..offscreen() };
+    let ended = Pass { keep_depth: true, ..offscreen().keeping_color(true) };
     let next = Pass { join: true, ..ended };
     let pairs = [
         ("the same targets, kept", ended, next),
         ("one that may not join", ended, Pass { join: false, ..next }),
-        ("on the screen", Pass { color: SCREEN, ..ended }, Pass { color: SCREEN, ..next }),
-        ("another colour target", ended, Pass { color: 12, ..next }),
+        ("on the screen", ended.with_color(SCREEN), next.with_color(SCREEN)),
+        ("another colour target", ended, next.with_color(12)),
         ("another depth target", ended, Pass { depth: 12, ..next }),
-        ("its colour cleared", ended, Pass { keep_color: false, ..next }),
+        ("its colour cleared", ended, next.keeping_color(false)),
         ("its depth cleared", ended, Pass { keep_depth: false, ..next }),
-        (
-            "depth alone, kept",
-            Pass { color: NONE, ..ended },
-            Pass { color: NONE, keep_color: false, ..next },
-        ),
+        ("depth alone, kept", ended.with_color(NONE), next.with_color(NONE).keeping_color(false)),
         (
             "colour alone, kept",
             Pass { depth: NONE, ..ended },

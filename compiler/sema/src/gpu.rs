@@ -33,7 +33,12 @@ fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef>
 
 /// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
 pub fn shares_memory(p: &Program, f: FnId) -> bool {
-    p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty) == Some(Lang::Shared))
+    p.func(f).params.iter().any(|ps| {
+        matches!(
+            p.lang_of_ty(ps.ty),
+            Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI)
+        )
+    })
 }
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
@@ -78,7 +83,7 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
         let ty = ps.ty;
         let lang = p.lang_of_ty(ty);
         if BuiltinInput::of(p, ty).is_some()
-            || lang == Some(Lang::Shared)
+            || matches!(lang, Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI))
             || is_varyings(p, entry, ty)
         {
             continue;
@@ -98,6 +103,8 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
             }
             (_, Some(Lang::Texels)) => of(Lang::Texture, args).map(|t| (t, RetMode::Mut)),
             (_, Some(Lang::Texels3d)) => of(Lang::Texture3d, args).map(|t| (t, RetMode::Mut)),
+            (_, Some(Lang::TexelsArray)) => of(Lang::TextureArray, args).map(|t| (t, RetMode::Mut)),
+            (_, Some(Lang::MipStep)) => of(Lang::TextureStep, args).map(|t| (t, RetMode::Owned)),
             (_, Some(l)) if l.is_texture_or_sampler() => Some((ty, RetMode::Borrow)),
             _ if p.is_borrow_struct(ty) || crate::traits::implements_builtin(p, ty, Lang::Copy) => {
                 Some((ty, RetMode::Owned))
@@ -199,6 +206,8 @@ pub enum BuiltinInput {
     VertexIndex,
     InstanceIndex,
     FragCoord,
+    SubgroupInvocation,
+    SubgroupSize,
 }
 
 impl BuiltinInput {
@@ -211,6 +220,8 @@ impl BuiltinInput {
             Lang::VertexIndex => BuiltinInput::VertexIndex,
             Lang::InstanceIndex => BuiltinInput::InstanceIndex,
             Lang::FragCoord => BuiltinInput::FragCoord,
+            Lang::SubgroupInvocation => BuiltinInput::SubgroupInvocation,
+            Lang::SubgroupSize => BuiltinInput::SubgroupSize,
             _ => return None,
         })
     }
@@ -218,65 +229,107 @@ impl BuiltinInput {
     /// Whether an entry point of this stage receives the input.
     pub fn available(self, entry: Entry) -> bool {
         match self {
-            BuiltinInput::GlobalId | BuiltinInput::LocalId | BuiltinInput::WorkgroupId => {
-                matches!(entry, Entry::Compute(_))
-            }
+            BuiltinInput::GlobalId
+            | BuiltinInput::LocalId
+            | BuiltinInput::WorkgroupId
+            | BuiltinInput::SubgroupInvocation
+            | BuiltinInput::SubgroupSize => matches!(entry, Entry::Compute(_)),
             BuiltinInput::VertexIndex | BuiltinInput::InstanceIndex => entry == Entry::Vertex,
             BuiltinInput::FragCoord => entry == Entry::Fragment,
         }
     }
 }
 
-/// What a fragment shader writes, by its return type (language.md §18).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FragmentOutput {
-    /// A `vec4`: it replaces the target's texel.
-    Colour,
-    /// `Over`: a colour drawn over the target's (alpha blending).
-    Over,
-    /// A `u32`: an `R32Uint` target's texel.
-    Uint,
-    /// `WithDepth<C>`: `C` (a `vec4`, or with `uint` a `u32`) and the fragment's own depth.
-    WithDepth { uint: bool },
+/// One colour a fragment shader writes: integers (to an integer format's target) or floats,
+/// of 1 to 4 components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Colour {
+    pub uint: bool,
+    pub components: u8,
 }
 
+impl Colour {
+    /// The colour a value of type `t` is: an `f32`, `vec2`, `vec3` or `vec4`, or a `u32`,
+    /// `vec2u`, `vec3u` or `vec4u`.
+    pub fn of(p: &Program, t: TyId) -> Option<Colour> {
+        Some(match p.types.kind(t) {
+            TyKind::Float(FloatTy::F32) => Colour { uint: false, components: 1 },
+            TyKind::Int(IntTy::U32) => Colour { uint: true, components: 1 },
+            &TyKind::Vec(VecElem::F32, n) => Colour { uint: false, components: n },
+            &TyKind::Vec(VecElem::U32, n) => Colour { uint: true, components: n },
+            _ => return None,
+        })
+    }
+}
+
+/// What a fragment shader writes, by its return type (language.md §18): a colour for each of
+/// its pass's targets, in order, each where it is in the returned value (field indexes), and,
+/// from a `WithDepth`, its own depth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FragmentOutput {
+    /// The colours, each with its path in the returned value.
+    pub colours: Vec<(Colour, Vec<u32>)>,
+    /// The depth's path, from a `WithDepth`.
+    pub depth: Option<Vec<u32>>,
+    /// It returns `Over`: its colour is drawn over the target's unless the draw says otherwise.
+    pub over: bool,
+}
+
+/// A fragment shader's colours, each with its path in the returned value, and whether it
+/// returns `Over`.
+type Colours = (Vec<(Colour, Vec<u32>)>, bool);
+
 impl FragmentOutput {
-    /// What a fragment shader returning `t` writes; `None` if it can't return `t`.
+    /// What a fragment shader returning `t` writes; `None` if it can't return `t`: a colour
+    /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2`, `Targets3` or `Targets4`
+    /// of colours; or a `WithDepth` of any of those and a depth.
     pub fn of(p: &Program, t: TyId) -> Option<FragmentOutput> {
-        let colour = |t: TyId| {
-            if matches!(p.types.kind(t), TyKind::Vec(VecElem::F32, 4)) {
-                Some(false)
-            } else if t == p.types.u32 {
-                Some(true)
-            } else {
-                None
+        let colours = |t: TyId, at: Vec<u32>| -> Option<Colours> {
+            if let Some(c) = Colour::of(p, t) {
+                return Some((vec![(c, at)], false));
+            }
+            let TyKind::Adt(_, args) = p.types.kind(t) else { return None };
+            match p.lang_of_ty(t)? {
+                Lang::Over => Some((
+                    vec![(Colour { uint: false, components: 4 }, [at, vec![0]].concat())],
+                    true,
+                )),
+                Lang::Targets2 | Lang::Targets3 | Lang::Targets4 => {
+                    let mut out = Vec::new();
+                    for (k, &a) in args.iter().enumerate() {
+                        let c = Colour::of(p, a)?;
+                        out.push((c, [at.clone(), vec![k as u32]].concat()));
+                    }
+                    Some((out, false))
+                }
+                _ => None,
             }
         };
-        if let Some(uint) = colour(t) {
-            return Some(if uint { FragmentOutput::Uint } else { FragmentOutput::Colour });
+        if let Some((colours, over)) = colours(t, Vec::new()) {
+            return Some(FragmentOutput { colours, depth: None, over });
         }
         match (p.lang_of_ty(t)?, p.types.kind(t)) {
-            (Lang::Over, _) => Some(FragmentOutput::Over),
             (Lang::WithDepth, TyKind::Adt(_, args)) => {
-                Some(FragmentOutput::WithDepth { uint: colour(*args.first()?)? })
+                let (colours, over) = colours(*args.first()?, vec![0])?;
+                Some(FragmentOutput { colours, depth: Some(vec![1]), over })
             }
             _ => None,
         }
     }
 
-    /// Whether its colour is blended over the target's (`Over`).
-    pub fn blends(self) -> bool {
-        self == FragmentOutput::Over
+    /// Whether its colour is blended over the target's by default (`Over`).
+    pub fn blends(&self) -> bool {
+        self.over
     }
 
     /// Whether it gives the fragment's depth (`WithDepth`).
-    pub fn writes_depth(self) -> bool {
-        matches!(self, FragmentOutput::WithDepth { .. })
+    pub fn writes_depth(&self) -> bool {
+        self.depth.is_some()
     }
 
-    /// Whether its colour is a `u32`, an `R32Uint` texel.
-    pub fn uint(self) -> bool {
-        matches!(self, FragmentOutput::Uint | FragmentOutput::WithDepth { uint: true })
+    /// Whether its first colour is integers.
+    pub fn uint(&self) -> bool {
+        self.colours.first().is_some_and(|(c, _)| c.uint)
     }
 }
 
@@ -460,11 +513,13 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 codes::E0602,
                 def.sig_span,
                 format!(
-                    "{stage} returns a `vec4` colour, an `Over` colour to blend, a `u32`, or a \
-                     `WithDepth` of a `vec4` or a `u32` and a depth"
+                    "{stage} returns a colour (an `f32`, `vec2`, `vec3`, `vec4`, or for an integer \
+                     target a `u32`, `vec2u` or `vec4u`), an `Over` colour to blend, a \
+                     `Targets2`, `Targets3` or `Targets4` of colours, or a `WithDepth` of one of \
+                     those and a depth"
                 ),
             )
-            .with_note("it writes one colour to its target: a `vec4` replaces what's there, `std::gpu::Over` is drawn over it, a `u32` is an `R32Uint` texture's texel, and `std::gpu::WithDepth<C>` writes its `C` with a depth of its own")
+            .with_note("it writes a colour to each of its pass's targets: a colour replaces what's there unless the draw's `blend:` says otherwise, `std::gpu::Over` is drawn over it, a `Targets2` writes two targets, and `std::gpu::WithDepth<C>` writes its `C` with a depth of its own")
             .with_help("return one of those: `-> vec4` for a colour"),
             )
         }
@@ -575,9 +630,11 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::One) => "one invocation of a kernel writes it",
-                Some(Lang::Shared) => "workgroup memory is a kernel's",
+                Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI) => {
+                    "workgroup memory is a kernel's"
+                }
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
-                Some(Lang::Texels | Lang::Texels3d) => {
+                Some(Lang::Texels | Lang::Texels3d | Lang::TexelsArray | Lang::MipStep) => {
                     "texels are written by a kernel's `GlobalId`"
                 }
                 _ => "a draw's shaders don't write buffers yet",

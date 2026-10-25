@@ -4,10 +4,11 @@
 /// <reference lib="webworker" />
 
 import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
-import { GpuError, openDevice } from "./device.ts";
+import { featureNames } from "./check.ts";
+import { deviceLimits, GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
-import { alignTo, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
+import { alignTo, type Counters, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
 import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
@@ -392,7 +393,12 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextur
       device,
       b,
       screen,
-      { ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried), workers: normalWorkers() },
+      {
+        ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried),
+        workers: normalWorkers(),
+        // The checker's messages where a developer reads them: a debug build, hot reload.
+        checking: live !== null || b.manifest.pipelines.some((p) => p.debug_flag !== null),
+      },
       { cache: pipelineCache },
     );
   running = build;
@@ -523,6 +529,10 @@ interface TestRecord {
    * its submission), and when it began (ms since the epoch): `results/frames.json`. */
   cpu: number[];
   began_ms: number[];
+  /** Each frame's phases (`std::time::phase`), ms by name. */
+  phases: Record<string, number>[];
+  /** What the executor did each frame (`results/counters.json`). */
+  counters: Counters[];
   /** The latency test: when each frame started, and which events (by when they were sent) it got. */
   latency: { frames: number[]; delivered: { sent: number; frame: number }[] };
   /** How long the pipelines took to build. */
@@ -562,6 +572,19 @@ function runNext(program: Program, tickFrom: number | null, schedule: number, fp
   return r;
 }
 
+/** The adapter a test ran on and the optional features its program saw: what a profile's report
+ * names its hardware by (`results/device.json`). */
+function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: string[] } {
+  const info = (device as GPUDevice & { adapterInfo?: GPUAdapterInfo }).adapterInfo;
+  return {
+    vendor: info?.vendor ?? "",
+    architecture: info?.architecture ?? "",
+    device: info?.device ?? "",
+    description: info?.description ?? "",
+    features: featureNames(deviceLimits(device)[10] ?? 0),
+  };
+}
+
 async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build, params: TestParams, live: Live | null): Promise<void> {
   const { frames, width, height, fps } = params;
   const record: TestRecord = {
@@ -569,6 +592,8 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     printed_in: [],
     cpu: [],
     began_ms: [],
+    phases: [],
+    counters: [],
     latency: { frames: [], delivered: [] },
     pipelinesMs: null,
   };
@@ -620,6 +645,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
           carried,
         ),
         hash: hashes,
+        checking: params.checks !== 0,
         workers: params.workers,
         tickHashes,
         onPrint: print,
@@ -696,9 +722,11 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
       program.frame(frameTime(i, fps), width, height);
       if (params.framedelay > 0) holdFor(params.framedelay);
       record.cpu.push(performance.now() - began);
+      record.phases.push(program.takePhases());
     });
     // The frame's commands that wait for a pipeline being built run once it is.
     await executor.caughtUp();
+    record.counters.push(executor.takeCounters());
     if (timing === "serial") {
       // The serial timing mode runs the frame's passes now, one at a time.
       draining = draining.then(() => scoped(device, () => executor.drain()));
@@ -775,9 +803,11 @@ async function saveResults(
     putResult(base, "hash.txt", `${hash ? hash.hex() : "none"}\n`),
     putResult(base, "workers.txt", `${program.workerChunks()}\n`),
     putResult(base, "log.txt", printed.map((l) => `${l}\n`).join("")),
-    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in })),
+    putResult(base, "frames.json", JSON.stringify({ cpu_ms: cpu, began_ms, printed_in, phases: record.phases })),
     timing !== "off" ? executor.timings().then((t) => putResult(base, "timings.json", JSON.stringify(t))) : null,
     params.salt > 0 ? putResult(base, "pipelines.json", JSON.stringify({ ms: pipelinesMs, count: build.manifest.pipelines.length, each })) : null,
+    putResult(base, "counters.json", JSON.stringify(record.counters)),
+    putResult(base, "device.json", JSON.stringify(deviceInfo(device))),
     putResult(base, "memory.json", JSON.stringify({ gpu: executor.memory, wasm: program.memoryBytes })),
   ]);
   self.postMessage({ type: "load-query" } satisfies FromWorker);
@@ -868,7 +898,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       handed = new Handed(msg.given);
-      Promise.all([openDevice(fatal), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
+      Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
           handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);

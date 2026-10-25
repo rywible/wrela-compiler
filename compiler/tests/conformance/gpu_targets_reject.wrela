@@ -1,7 +1,6 @@
 // rejects: gpu.formats
 // A draw's pass takes what its fragment shader writes: a depth of its own (`WithDepth`) needs a
-// depth target, a `u32` an `R32Uint` texture, and a colour any target but that one. `Over`
-// needs a format that supports alpha blending.
+// depth target, a `u32` an `R32Uint` texture, and a colour any target but that one.
 use std::gpu::{
     ClipPosition, FragCoord, Over, R32Float, R32Uint, Rgba8, Texture, VertexIndex, WithDepth,
     begin_pass, begin_pass_with_depth, depth_texture, draw, texture,
@@ -54,8 +53,9 @@ pub fn frame(time: f32, width: u32, height: u32) {
     draw(c, cover, id, vertices: 3)
     draw(c, cover, deep_id, vertices: 3)
     c.end()
+    // A 32-bit float target blends where the device has `float32-blendable` (the host checks).
     var scalar: Texture<R32Float> = texture(width: 4, height: 4)
     let d = begin_pass(mut scalar, clear: vec4(0.0))
-    draw(d, cover, blended, vertices: 3) //~ E0603
+    draw(d, cover, blended, vertices: 3)
     d.end()
 }

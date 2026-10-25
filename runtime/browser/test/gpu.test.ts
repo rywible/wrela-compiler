@@ -2,13 +2,13 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError } from "../src/gpu.ts";
+import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError, shaderSource } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
 import { Encoder, words } from "./encoder.ts";
 import { type Event, FakeDevice, fakeTexture } from "./fake-gpu.ts";
-import { shapes } from "./fixtures.ts";
+import { shapes, passOf } from "./fixtures.ts";
 import type { ScreenTarget } from "../src/gpu.ts";
 
 const SHADER = "// fine\n";
@@ -124,23 +124,23 @@ test("each dispatch and draw gets its own aligned uniform slice", async () => {
 });
 
 test("small texture writes keep their order in one submission, with aligned copies of packed rows", async () => {
-  for (const format of TEXTURE_FORMATS.filter((f) => !f.depth)) {
+  for (const format of TEXTURE_FORMATS.filter((f) => !f.depth && f.block === 1)) {
     const { device, run, executor } = await setup();
     const bytes = Uint8Array.from({ length: 3 * 2 * format.bytes }, (_, i) => i + 1);
     const original = bytes.slice();
     run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 5, 4, format.name));
     run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(0)).writeBuffer(1, 0, words([7])));
-    executor.execute({ op: "WriteTexture", handle: 3, x: 1, y: 1, width: 3, height: 2, data: bytes });
+    executor.execute({ op: "WriteTexture", handle: 3, level: 0, layer: 0, x: 1, y: 1, width: 3, height: 2, data: bytes });
     bytes.fill(255); // The program may reuse its shared memory before the submission.
     run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(1)));
-    executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 0, height: 4, data: new Uint8Array(0) });
+    executor.execute({ op: "WriteTexture", handle: 3, level: 0, layer: 0, x: 0, y: 0, width: 0, height: 4, data: new Uint8Array(0) });
     executor.flush();
     expect(kinds(device.events)).toEqual([
       "dispatch", "copyBuffer", "copyBufferToTexture", "dispatch", "writeBuffer", "writeBuffer", "submit",
     ]);
     expect(device.events[2]).toEqual({
       kind: "copyBufferToTexture", from: "upload ring", fromOffset: 256, texture: "texture 3",
-      origin: { x: 1, y: 1 }, bytesPerRow: 256, rowsPerImage: 2, size: { width: 3, height: 2 },
+      origin: { x: 1, y: 1, z: 0 }, bytesPerRow: 256, rowsPerImage: 2, size: { width: 3, height: 2 },
     });
     const upload = device.events[5] as Extract<Event, { kind: "writeBuffer" }>;
     expect(upload.data.length).toBe(768);
@@ -155,7 +155,7 @@ test("texture writes flush and reuse a full upload ring", async () => {
   const data = new Uint8Array(UPLOAD_START / 2);
   run(new Encoder().createTexture(3, 128, 256, "rgba8unorm"));
   for (let i = 0; i < 3; i++) {
-    executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 128, height: 256, data });
+    executor.execute({ op: "WriteTexture", handle: 3, level: 0, layer: 0, x: 0, y: 0, width: 128, height: 256, data });
   }
   executor.flush();
   expect(kinds(device.events)).toEqual([
@@ -170,7 +170,7 @@ test("a texture write grows the upload ring after earlier work is submitted", as
   const { device, run, executor } = await setup();
   run(new Encoder().createBuffer(1, 64).writeBuffer(1, 0, words([7])).createTexture(3, 64, 1025, "rgba8unorm"));
   const data = new Uint8Array(256 * 1025);
-  executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width: 64, height: 1025, data });
+  executor.execute({ op: "WriteTexture", handle: 3, level: 0, layer: 0, x: 0, y: 0, width: 64, height: 1025, data });
   executor.flush();
   expect(kinds(device.events)).toEqual(["copyBuffer", "writeBuffer", "submit", "copyBufferToTexture", "writeBuffer", "submit"]);
   expect(device.buffers.filter((b) => b.label === "upload ring").map((b) => [b.size, b.destroyed])).toEqual([
@@ -194,7 +194,7 @@ test("texture uploads over the padded size cap still write through the queue aft
   const height = Math.floor(UPLOAD_MAX / 4352) + 1;
   run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, width, height, "r16float"));
   run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(0)));
-  executor.execute({ op: "WriteTexture", handle: 3, x: 0, y: 0, width, height, data: new Uint8Array(2 * width * height) });
+  executor.execute({ op: "WriteTexture", handle: 3, level: 0, layer: 0, x: 0, y: 0, width, height, data: new Uint8Array(2 * width * height) });
   expect(kinds(device.events)).toEqual(["dispatch", "writeBuffer", "submit", "writeTexture"]);
   expect(device.events[3]).toMatchObject({ bytesPerRow: 2 * width, size: { width, height } });
 });
@@ -379,14 +379,8 @@ function sampled(): Manifest {
   return m;
 }
 
-const offscreen = (color: number, depth: number, keep = false) => ({
-  color,
-  keepColor: keep, join: false,
-  clear: [0, 0, 0, 1] as [number, number, number, number],
-  depth,
-  keepDepth: false,
-  clearDepth: 1,
-});
+const offscreen = (color: number, depth: number, keep = false) =>
+  passOf({ color, keepColor: keep, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 });
 
 test("textures and samplers are made as the stream says, and bound as views and samplers", async () => {
   const { device, run } = await setup(sampled());
@@ -402,7 +396,7 @@ test("textures and samplers are made as the stream says, and bound as views and 
   );
   const [color, depth] = device.textures;
   const { TEXTURE_BINDING, RENDER_ATTACHMENT, COPY_SRC, COPY_DST } = GPUTextureUsage;
-  expect([color!.format, color!.size, color!.usage]).toEqual(["rgba16float", [4, 2], TEXTURE_BINDING | RENDER_ATTACHMENT | COPY_SRC | COPY_DST]);
+  expect([color!.format, color!.size, color!.usage]).toEqual(["rgba16float", [4, 2, 1], TEXTURE_BINDING | RENDER_ATTACHMENT | COPY_SRC | COPY_DST]);
   // A depth texture can't be written from the CPU.
   expect([depth!.format, depth!.usage]).toEqual(["depth32float", TEXTURE_BINDING | RENDER_ATTACHMENT | COPY_SRC]);
   expect(device.samplers[0]).toMatchObject({ magFilter: "linear", addressModeU: "repeat", compare: "less-equal" });
@@ -411,7 +405,7 @@ test("textures and samplers are made as the stream says, and bound as views and 
     from: "upload ring",
     fromOffset: 0,
     texture: "texture 3",
-    origin: { x: 1, y: 0 },
+    origin: { x: 1, y: 0, z: 0 },
     bytesPerRow: 256,
     rowsPerImage: 2,
     size: { width: 2, height: 2 },
@@ -474,8 +468,8 @@ test("a render pipeline's variants are its manifest's targets, made at load", as
   const draw = m.pipelines[0]!;
   if (draw.kind !== "render") throw new Error("the shapes' pipeline 0 renders");
   draw.targets = [
-    { color: "rgba16float", depth: true, screen: false },
-    { color: null, depth: true, screen: false },
+    { colors: ["rgba16float"], depth: true, screen: false },
+    { colors: [], depth: true, screen: false },
   ];
   await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
   expect(device.made).toEqual(["draw rgba16float|depth32float", "draw none|depth32float"]);
@@ -491,9 +485,9 @@ describe("the screen's format", () => {
     return m;
   };
   const targets = drawnInto([
-    { color: "rgba8unorm", depth: false, screen: true },
-    { color: "rgba8unorm", depth: false, screen: false },
-    { color: "rgba16float", depth: true, screen: false },
+    { colors: ["rgba8unorm"], depth: false, screen: true },
+    { colors: ["rgba8unorm"], depth: false, screen: false },
+    { colors: ["rgba16float"], depth: true, screen: false },
   ]);
 
   test("is the canvas's preferred format in a normal run, and SCREEN_FORMAT in test mode", () => {
@@ -521,7 +515,7 @@ describe("the screen's format", () => {
   });
 
   test("is what a screen pass draws in", async () => {
-    const m = drawnInto([{ color: "rgba8unorm", depth: false, screen: true }]);
+    const m = drawnInto([{ colors: ["rgba8unorm"], depth: false, screen: true }]);
     const { device, run, executor } = await setup(m, { format: "bgra8unorm", texture: () => fakeTexture("canvas") });
     expect(device.made).toEqual(["draw bgra8unorm|none"]);
     run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).beginScreenPass([0, 0, 0, 1]).draw(0, 3, 1, [1, 2], u(0)).present());
@@ -797,7 +791,9 @@ test("commands that wait for a pipeline keep their frame's label; the next frame
   const caughtUp = executor.caughtUp();
   later.resolve(compute!);
   await caughtUp;
-  expect(device.passLabels).toEqual(["look", "look", "compute"]);
+  // The last frame's two dispatches, both labelled, share a compute pass; the next frame's has
+  // its pipeline's name.
+  expect(device.passLabels).toEqual(["look", "compute"]);
 });
 
 test("texture passes waiting for a pipeline keep separate timings in their recorded frames", async () => {
@@ -1186,4 +1182,80 @@ test("in the serial mode, a label's time waits for its frame's drained passes", 
   await asked;
   expect(answered!.length).toBe(4);
   executor.destroyAll();
+});
+
+test("a shader that uses subgroups gets WGSL's `enable subgroups;`, which naga's text leaves out", () => {
+  const p = (requires: string[]) => ({ requires }) as unknown as Pipeline;
+  expect(shaderSource(p(["subgroups"]), "fn main() {}")).toBe("enable subgroups;\nfn main() {}");
+  expect(shaderSource(p(["shader-f16"]), "enable f16;\n")).toBe("enable f16;\n");
+  expect(shaderSource(p([]), "x")).toBe("x");
+});
+
+test("the executor counts what it did below the stream, until its counters are taken", async () => {
+  const { executor, run } = await setup();
+  const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).writeBuffer(1, 0, words([7, 8]));
+  for (let i = 0; i < 3; i++) e.dispatch(1, [1, 1, 1], [1, 2], u(i));
+  e.beginScreenPass([0, 0, 0, 1]);
+  for (let i = 3; i < 5; i++) e.draw(0, 3, 1, [1, 2], u(i));
+  run(e.present());
+  expect(executor.takeCounters()).toEqual({
+    // The three dispatches share a compute pass and its pipeline; each sets its bind group at
+    // its own uniform offset, as each draw does. The two draws share their pipeline.
+    compute_passes: 1,
+    render_passes: 1,
+    dispatches: 3,
+    draws: 2,
+    draw_calls: 2,
+    // The uniform ring and the upload ring, each one write of everything staged.
+    write_buffers: 2,
+    // Four 256-byte uniform slots and the last draw's 16 bytes, then the upload's 8.
+    write_buffer_bytes: 4 * 256 + 16 + 8,
+    write_textures: 0,
+    bind_groups: 5,
+    pipelines: 2,
+  });
+  expect(executor.takeCounters().draws).toBe(0);
+});
+
+test("a pipeline isn't made for a target the device can't blend into as it blends", async () => {
+  const build = async (features: string[]) => {
+    const device = new FakeDevice();
+    for (const f of features) device.features.add(f as GPUFeatureName);
+    const m = shapes();
+    const draw = m.pipelines[0]!;
+    if (draw.kind !== "render") throw new Error("the shapes' pipeline 0 renders");
+    draw.blends = ["add"];
+    draw.targets = [
+      { colors: ["r32float"], depth: false, screen: false },
+      { colors: ["rgba16float"], depth: false, screen: false },
+    ];
+    await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+    return device.made;
+  };
+  // Without float32-blendable, the r32float variant would fail the whole load.
+  expect(await build([])).toEqual(["draw rgba16float|none"]);
+  expect(await build(["float32-blendable"])).toEqual(["draw r32float|none", "draw rgba16float|none"]);
+});
+
+test("a pass that joins one with a scissor starts from the whole target again", async () => {
+  const { device, run, executor } = await setup();
+  const target = (keep: boolean) => passOf({ color: 3, keepColor: keep, join: keep });
+  run(
+    new Encoder()
+      .createBuffer(1, 64)
+      .createBuffer(2, 64)
+      .createTexture(3, 8, 4, "rgba8unorm")
+      .beginPass(target(false))
+      .scissor(0, 0, 2, 2)
+      .draw(0, 3, 1, [1, 2], u(0))
+      .endPass()
+      .beginPass(target(true))
+      .draw(0, 3, 1, [1, 2], u(1))
+      .endPass(),
+  );
+  executor.flush();
+  const ev = device.events.filter((e) => ["renderPass", "scissor", "viewport", "draw"].includes(e.kind));
+  expect(ev.map((e) => e.kind)).toEqual(["renderPass", "scissor", "draw", "scissor", "viewport", "draw"]);
+  expect(ev[3]).toEqual({ kind: "scissor", rect: [0, 0, 8, 4] });
+  expect(ev[4]).toEqual({ kind: "viewport", rect: [0, 0, 8, 4] });
 });

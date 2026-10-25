@@ -28,3 +28,22 @@ fn a_program_sees_the_adapters_limits() {
     assert_eq!(one_u32(&mut host, "wide", &[]), texture);
     eprintln!("the adapter's textures go to {texture} texels, its buffers to {buffer} bytes");
 }
+
+/// `std::gpu::memory()` is std's count, the host's `memory.json` its own: for a program that
+/// makes known resources and drops a buffer (compiler/tests/memory), Chrome's count at the end
+/// and at its most is the program's, buffers and textures together.
+#[test]
+#[ignore = "needs the runtime"]
+fn std_counts_the_gpu_memory_the_host_does() {
+    let (_, rel) = wrela_tests::page("compiler/tests/memory", "memory-browser");
+    let run = wrela_tests::run_in_chrome(&rel, 4, 64, 64, 60.0);
+    let last = run.printed.last().expect("a line each frame").1.clone();
+    let n: Vec<u64> =
+        last.split_whitespace().skip(1).map(|w| w.parse().expect("a count")).collect();
+    let [buffers, textures, peak_buffers, peak_textures] = n[..] else { panic!("{last}") };
+    let results = wrela_tests::repo_root().join(&rel).join("results");
+    let memory = wrela_tests::result_json(&results, "memory.json");
+    assert_eq!(memory["gpu"]["bytes"].as_u64(), Some(buffers + textures), "{memory}");
+    // The program's two most were held at once, before the buffer dropped.
+    assert_eq!(memory["gpu"]["peak"].as_u64(), Some(peak_buffers + peak_textures), "{memory}");
+}

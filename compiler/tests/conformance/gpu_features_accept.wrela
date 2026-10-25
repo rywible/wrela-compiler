@@ -1,0 +1,54 @@
+// accepts: gpu.features
+// Half floats and their vectors in GPU code, converted from and to `f32`; subgroup operations
+// in a kernel, in uniform control flow, its lane and size as parameters.
+use std::gpu::{
+    GlobalId, GpuBuffer, LocalId, Shared, Slots, SubgroupInvocation, SubgroupSize, buffer, dispatch,
+    features, subgroup_add, subgroup_all, subgroup_ballot, subgroup_broadcast_first,
+    subgroup_exclusive_add, subgroup_inclusive_add, subgroup_max, subgroup_min, subgroup_or,
+    subgroup_prefix_sum, subgroup_shuffle, workgroup_prefix_sum,
+}
+
+@compute(64)
+fn halves(out: mut Slots<f32>, id: GlobalId) {
+    let h = f16(f32(id.x)) * f16(0.5) + 1.0
+    let v: vec3h = vec3h(h, h * 2.0, 0.25)
+    out[id] = f32(v.x + v.y) + f32(dot(v, v))
+}
+
+@compute(64)
+fn lanes(out: mut Slots<u32>, lane: SubgroupInvocation, width: SubgroupSize, id: GlobalId) {
+    let sum = subgroup_add(id.x) + subgroup_exclusive_add(1) + subgroup_inclusive_add(lane.index)
+    let first = subgroup_broadcast_first(id.x) + subgroup_shuffle(id.x, 0)
+    let ballot = subgroup_ballot(id.x % 2 == 0)
+    let all = u32(subgroup_all(width.size > 0))
+    out[id] = sum +
+        first +
+        ballot.x +
+        all +
+        subgroup_min(id.x) +
+        subgroup_max(id.x) +
+        subgroup_or(lane.index)
+}
+
+@compute(64)
+fn scans(
+    out: mut Slots<u32>,
+    a: mut Shared<u32, 64>,
+    b: mut Shared<u32, 64>,
+    lid: LocalId,
+    lane: SubgroupInvocation,
+    width: SubgroupSize,
+    id: GlobalId,
+) {
+    out[id] = workgroup_prefix_sum(mut a, lid, 1) + subgroup_prefix_sum(mut b, lid, 1)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    var lanes_out: GpuBuffer<u32> = buffer(64)
+    dispatch(halves.bind(mut out), over: 64)
+    if features().subgroups {
+        dispatch(lanes.bind(mut lanes_out), groups: (1, 1, 1))
+        dispatch(scans.bind(mut lanes_out), groups: (1, 1, 1))
+    }
+}

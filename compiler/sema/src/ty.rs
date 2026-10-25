@@ -95,17 +95,19 @@ impl IntTy {
 }
 
 /// What a vector's components are (§4): `vecN`'s f32s, `vecNi`'s i32s, `vecNu`'s u32s, and on
-/// the CPU only, `vecNd`'s f64s.
+/// the CPU only, `vecNd`'s f64s, and on the GPU only, `vecNh`'s f16s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VecElem {
     F32,
     I32,
     U32,
     F64,
+    F16,
 }
 
 impl VecElem {
-    pub const ALL: [VecElem; 4] = [VecElem::F32, VecElem::I32, VecElem::U32, VecElem::F64];
+    pub const ALL: [VecElem; 5] =
+        [VecElem::F32, VecElem::I32, VecElem::U32, VecElem::F64, VecElem::F16];
 
     /// What follows `vecN` in the type's name.
     pub fn suffix(self) -> &'static str {
@@ -114,6 +116,7 @@ impl VecElem {
             VecElem::I32 => "i",
             VecElem::U32 => "u",
             VecElem::F64 => "d",
+            VecElem::F16 => "h",
         }
     }
 
@@ -124,16 +127,22 @@ impl VecElem {
             VecElem::I32 => TyKind::Int(IntTy::I32),
             VecElem::U32 => TyKind::Int(IntTy::U32),
             VecElem::F64 => TyKind::Float(FloatTy::F64),
+            VecElem::F16 => TyKind::Float(FloatTy::F16),
         }
     }
 
     pub fn is_float(self) -> bool {
-        matches!(self, VecElem::F32 | VecElem::F64)
+        matches!(self, VecElem::F32 | VecElem::F64 | VecElem::F16)
     }
 
     /// Whether WGSL has it: all but f64's.
     pub fn on_gpu(self) -> bool {
         self != VecElem::F64
+    }
+
+    /// Whether WASM has it: all but f16's.
+    pub fn on_cpu(self) -> bool {
+        self != VecElem::F16
     }
 }
 
@@ -141,6 +150,8 @@ impl VecElem {
 pub enum FloatTy {
     F32,
     F64,
+    /// A half float: GPU code only, on a device with `shader-f16` (§18.10).
+    F16,
 }
 
 impl FloatTy {
@@ -148,7 +159,18 @@ impl FloatTy {
         match self {
             FloatTy::F32 => "f32",
             FloatTy::F64 => "f64",
+            FloatTy::F16 => "f16",
         }
+    }
+
+    /// Whether WGSL has it: all but `f64`.
+    pub fn on_gpu(self) -> bool {
+        self != FloatTy::F64
+    }
+
+    /// Whether WASM has it: all but `f16`.
+    pub fn on_cpu(self) -> bool {
+        self != FloatTy::F16
     }
 }
 

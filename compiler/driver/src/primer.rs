@@ -311,17 +311,25 @@ pub const RULES: &[(&str, &str)] = &[
         "gpu.domains",
         "`over:` dispatches a kernel over a count, a size or a texture, its groups and bounds the compiler's",
     ),
-    ("gpu.draw-state", "a draw's cull mode, depth bias and depth test are build-time constants"),
+    (
+        "gpu.draw-state",
+        "a draw's cull mode, depth bias, depth test and blends are build-time constants",
+    ),
     // §18.8 textures, formats and passes
     (
         "gpu.textures",
-        "textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes",
+        "textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes, by their mip levels and layers",
     ),
     (
         "gpu.formats",
         "a texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into",
     ),
     // §18.9 pipelines
+    // §18.10 optional features
+    (
+        "gpu.features",
+        "half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature",
+    ),
     ("build.budget", "a shipped build's pipelines have at most 256 KiB of WGSL each"),
 ];
 

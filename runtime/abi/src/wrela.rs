@@ -22,6 +22,7 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("TICK_WANT_HASH", TICK_WANT_HASH, "Nonzero when the host wants the ticker's state hash."),
     ("TICK_HASH", TICK_HASH, "The state hash the ticker reported last, a `u64`."),
     ("TICK_ORIGIN", TICK_ORIGIN, "The sim clock's origin, an `f64`: when tick 0 was due."),
+    ("GPU_STATE", GPU_STATE, "std's count of the GPU's bytes: buffers, textures, and each's most."),
     ("THREADS", THREADS, "The most threads a program runs on."),
     ("THREAD_BLOCKS", THREAD_BLOCKS, "The threads' blocks, one after another."),
     ("THREAD_BLOCK_SIZE", THREAD_BLOCK_SIZE, "The bytes of each thread's block."),
@@ -76,11 +77,12 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         crate::stream::WRITABLE,
         "A texture's format code with this bit set: kernels write its texels.",
     ),
-    (
-        "PASS_JOIN",
-        crate::stream::PASS_JOIN,
-        "A pass's colour load word with this bit set: it may join the pass before it.",
-    ),
+    ("PASS_JOIN", crate::stream::PASS_JOIN, "A pass's join word: it may join the pass before it."),
+    ("KIND_2D", crate::stream::TextureKind::D2 as u32, "A 2D texture's kind."),
+    ("KIND_3D", crate::stream::TextureKind::D3 as u32, "A 3D texture's kind."),
+    ("KIND_ARRAY", crate::stream::TextureKind::Array as u32, "A 2D array's kind."),
+    ("KIND_CUBE", crate::stream::TextureKind::Cube as u32, "A cube's kind."),
+    ("MAX_LAYERS", crate::stream::MAX_LAYERS, "The most layers of a 2D array."),
 ];
 
 /// The same, for the `i32`s.
@@ -117,7 +119,7 @@ pub fn wrela() -> String {
             "\n/// The stream's code for the texture format `{name}`.\npub(package) const FORMAT_{n}: u32 = {code}\n"
         );
         out += &format!(
-            "\n/// The bytes of a texel of `{name}`.\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
+            "\n/// The bytes of a texel of `{name}` (of a compressed format, of a 4 × 4 block).\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
         );
     }
     for c in Compare::ALL {

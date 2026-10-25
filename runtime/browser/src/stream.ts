@@ -1,4 +1,4 @@
-// The command stream, version 4: decoding and sequencing. A line-for-line mirror of
+// The command stream, version 12: decoding and sequencing. A line-for-line mirror of
 // runtime/abi/src/stream.rs (`decode`, `Sequencer`, `StreamError`), with the same checks in the
 // same order and the same messages, so both hosts reject the same batches the same way. The
 // format's constants come from abi.gen.ts.
@@ -7,9 +7,12 @@ import {
   COMMAND_HEADER_LEN,
   COMPARES,
   HEADER_LEN,
+  MAX_ANISOTROPY,
+  MAX_COLOR_ATTACHMENTS,
+  MAX_LEVELS,
   NONE,
   Opcode,
-  PASS_JOIN,
+  ROW_ALIGNMENT,
   SCREEN,
   STREAM_MAGIC,
   STREAM_VERSION,
@@ -34,17 +37,37 @@ export type Compare = Exclude<(typeof COMPARES)[number], null>;
 /** One binding: a buffer's range, or a texture or sampler (offset and size 0). */
 export type Binding = { handle: number; offset: number; size: number };
 
+/** A texture's kind (runtime/abi `TextureKind`): WebGPU's dimension name. */
+export type TextureKind = "2d" | "3d" | "2d-array" | "cube";
+const KINDS: readonly TextureKind[] = ["2d", "3d", "2d-array", "cube"];
+
+/** One colour target of a pass: a texture's level and layer, or the screen. */
+export type ColorTarget = {
+  texture: number;
+  level: number;
+  layer: number;
+  keep: boolean;
+  clear: [number, number, number, number];
+};
+
 /** A pass's attachments (`BeginPass`). */
 export type Pass = {
-  color: number;
-  keepColor: boolean;
+  colors: ColorTarget[];
   /** It may run as part of the pass before it (`Pass::join`). */
   join: boolean;
-  clear: [number, number, number, number];
   depth: number;
+  depthLayer: number;
   keepDepth: boolean;
   clearDepth: number;
 };
+
+/** A pass into one colour target, `texture` (or SCREEN), with no depth. */
+export function onePass(texture: number, keep: boolean, clear: [number, number, number, number]): Pass {
+  return { colors: [{ texture, level: 0, layer: 0, keep, clear }], join: false, depth: NONE, depthLayer: 0, keepDepth: false, clearDepth: 1 };
+}
+
+/** Whether a pass draws on the screen. */
+export const onScreen = (p: Pass) => p.colors.some((c) => c.texture === SCREEN);
 
 /** Whether pass `next`, beginning right after `ended` ended, may run as part of it, as one
  * render pass (`Pass::joins`, which the vectors check): it may join, on the same targets, kept
@@ -52,13 +75,20 @@ export type Pass = {
 export function joins(next: Pass, ended: Pass): boolean {
   return (
     next.join &&
-    next.color !== SCREEN &&
-    next.color === ended.color &&
+    !onScreen(next) &&
+    next.colors.length === ended.colors.length &&
+    next.colors.every((c, i) => {
+      const e = ended.colors[i]!;
+      return c.keep && c.texture === e.texture && c.level === e.level && c.layer === e.layer;
+    }) &&
     next.depth === ended.depth &&
-    (next.color === NONE || next.keepColor) &&
+    next.depthLayer === ended.depthLayer &&
     (next.depth === NONE || next.keepDepth)
   );
 }
+
+/** A rectangle of texels at one level and layer of a texture (runtime/abi `TexelRect`). */
+export type TexelRect = { texture: number; level: number; layer: number; x: number; y: number; width: number; height: number };
 
 export type Command =
   | { op: "CreateBuffer"; handle: number; size: number }
@@ -76,12 +106,14 @@ export type Command =
       height: number;
       format: TextureFormat;
       writable: boolean;
-      /** A 3D texture's depth; 0 for a 2D texture. */
-      depth: number;
+      kind: TextureKind;
+      /** A 3D texture's depth, an array's layers (6 of a cube), 1 of a 2D texture. */
+      layers: number;
+      levels: number;
     }
-  | { op: "WriteTexture"; handle: number; x: number; y: number; width: number; height: number; data: Bytes }
+  | { op: "WriteTexture"; handle: number; level: number; layer: number; x: number; y: number; width: number; height: number; data: Bytes }
   | { op: "DestroyTexture"; handle: number }
-  | { op: "CreateSampler"; handle: number; linear: boolean; repeat: boolean; compare: Compare | null }
+  | { op: "CreateSampler"; handle: number; linear: boolean; repeat: boolean; compare: Compare | null; mipLinear: boolean; anisotropy: number }
   | { op: "DestroySampler"; handle: number }
   | { op: "BeginPass"; pass: Pass }
   | { op: "EndPass" }
@@ -108,7 +140,44 @@ export type Command =
   | { op: "Prepare"; request: number; path: string }
   | { op: "Unprepare"; path: string }
   | { op: "HandOver"; request: number; path: string }
-  | { op: "Timed"; request: number; label: string };
+  | { op: "Timed"; request: number; label: string }
+  | { op: "CopyTexture"; source: TexelRect; destination: { texture: number; level: number; layer: number; x: number; y: number } }
+  | { op: "CopyTextureToBuffer"; source: TexelRect; buffer: number; offset: number; bytesPerRow: number }
+  | { op: "CopyBufferToTexture"; buffer: number; offset: number; bytesPerRow: number; destination: TexelRect }
+  | { op: "SetScissor"; x: number; y: number; width: number; height: number }
+  | { op: "SetViewport"; rect: [number, number, number, number]; minDepth: number; maxDepth: number }
+  | {
+      op: "DrawIndexed";
+      pipeline: number;
+      indices: number;
+      index_offset: number;
+      index_size: number;
+      index_count: number;
+      instances: number;
+      first_index: number;
+      base_vertex: number;
+      first_instance: number;
+      bindings: Binding[];
+      uniforms: Bytes;
+    }
+  | {
+      op: "MultiDrawIndirect" | "MultiDrawIndexedIndirect";
+      pipeline: number;
+      /** An indexed one's index buffer: its handle, byte offset and size. */
+      indices: [number, number, number] | null;
+      arguments: number;
+      offset: number;
+      count: number;
+      count_buffer: number;
+      count_offset: number;
+      bindings: Binding[];
+      uniforms: Bytes;
+    };
+
+/** The draws: what happens inside a pass, with scissors and viewports. */
+export type DrawCommand = Extract<Command, { op: "Draw" | "DrawIndirect" | "DrawIndexed" | "DrawIndexedIndirect" | "MultiDrawIndirect" | "MultiDrawIndexedIndirect" }>;
+export const isDraw = (c: Command): c is DrawCommand =>
+  c.op === "Draw" || c.op === "DrawIndirect" || c.op === "DrawIndexed" || c.op === "DrawIndexedIndirect" || c.op === "MultiDrawIndirect" || c.op === "MultiDrawIndexedIndirect";
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -144,7 +213,10 @@ const EXPECTED: Readonly<Record<number, string>> = {
   2: "expected 2 words",
   4: "expected 4 words",
   5: "expected 5 words",
-  9: "expected 9 words",
+  6: "expected 6 words",
+  7: "expected 7 words",
+  10: "expected 10 words",
+  12: "expected 12 words",
 };
 
 /** `n` rounded up to a multiple of 4: text and data in a payload are padded to whole words. */
@@ -315,51 +387,140 @@ export function decode(batch: Bytes): Command[] {
         break;
       }
       case "CreateTexture": {
-        if (words !== 4 && words !== 5) throw bad("expected 4 or 5 words");
-        // A fifth word: a 3D texture's depth.
-        const depth = words === 5 ? w(4) : 0;
-        if (words === 5 && depth === 0) throw bad("a 3D texture's depth is positive");
+        exactly(7);
         // Bit 16 of the format word: kernels write it (a storage texture too).
         const writable = (w(3) & TEXTURE_WRITABLE) !== 0;
         const format = TEXTURE_FORMATS[w(3) & ~TEXTURE_WRITABLE];
         if (format === undefined) throw bad("unknown texture format");
-        if (w(1) === 0 || w(2) === 0) throw bad("a texture's width and height are positive");
-        if (writable && !format.storable) throw bad("kernels write only rgba8unorm, rgba16float, r32float and r32uint textures");
-        if (depth > 0 && format.depth) throw bad("a 3D texture holds colours");
-        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable, depth };
+        const kind = KINDS[w(4)];
+        if (kind === undefined) throw bad("unknown texture kind");
+        const layers = w(5);
+        const levels = w(6);
+        if (w(1) === 0 || w(2) === 0 || layers === 0) throw bad("a texture's width, height and depth or layers are positive");
+        if (levels === 0 || levels > MAX_LEVELS) throw bad("a texture has 1 to 14 mip levels");
+        if (writable && !format.storable) throw bad("kernels write only a format the format table says they can");
+        if (kind === "2d" && layers !== 1) throw bad("a 2D texture has one layer");
+        if (kind === "cube" && (layers !== 6 || w(1) !== w(2))) throw bad("a cube has six square layers");
+        if (kind === "3d" && (format.depth || format.block > 1)) throw bad("a 3D texture holds uncompressed colours");
+        if (kind === "3d" && levels !== 1) throw bad("a 3D texture has one level");
+        cmd = { op: name, handle: w(0), width: w(1), height: w(2), format: format.name, writable, kind, layers, levels };
         break;
       }
       case "WriteTexture": {
-        if (words < 6) throw bad("expected at least 6 words");
-        if (padded(w(5)) !== len - 24) throw bad("data length doesn't match the payload");
-        const data = batch.subarray(start + 24, start + 24 + w(5));
-        cmd = { op: name, handle: w(0), x: w(1), y: w(2), width: w(3), height: w(4), data };
+        if (words < 8) throw bad("expected at least 8 words");
+        if (padded(w(7)) !== len - 32) throw bad("data length doesn't match the payload");
+        const data = batch.subarray(start + 32, start + 32 + w(7));
+        cmd = { op: name, handle: w(0), level: w(1), layer: w(2), x: w(3), y: w(4), width: w(5), height: w(6), data };
         break;
       }
       case "CreateSampler": {
-        exactly(4);
-        if (w(1) > 1 || w(2) > 1) throw bad("a sampler's filter and address are 0 or 1");
+        exactly(6);
+        if (w(1) > 1 || w(2) > 1 || w(4) > 1) throw bad("a sampler's filters and address are 0 or 1");
+        if (w(5) === 0 || w(5) > MAX_ANISOTROPY) throw bad("a sampler's anisotropy is 1 to 16");
+        if (w(5) > 1 && (w(1) === 0 || w(4) === 0)) throw bad("an anisotropic sampler filters linearly, between levels too");
         let compare: Compare | null = null;
         if (w(3) !== 0) {
           compare = COMPARES[w(3)] ?? null;
           if (compare === null) throw bad("unknown comparison");
         }
-        cmd = { op: name, handle: w(0), linear: w(1) === 1, repeat: w(2) === 1, compare };
+        cmd = { op: name, handle: w(0), linear: w(1) === 1, repeat: w(2) === 1, compare, mipLinear: w(4) === 1, anisotropy: w(5) };
         break;
       }
       case "BeginPass": {
-        exactly(9);
-        if (w(1) > 3 || w(7) > 1) throw bad("a load is 0 (clear) or 1 (keep); the colour's may add 2 (join)");
-        const pass: Pass = {
-          color: w(0),
-          keepColor: (w(1) & 1) === 1,
-          join: (w(1) & PASS_JOIN) !== 0,
-          clear: [f(2), f(3), f(4), f(5)],
-          depth: w(6),
-          keepDepth: w(7) === 1,
-          clearDepth: f(8),
-        };
+        if (words < 2) throw bad("expected at least 2 words");
+        const n = w(0);
+        if (n > MAX_COLOR_ATTACHMENTS) throw bad("a pass has at most four colour targets");
+        if (words !== 2 + 8 * n + 4) throw bad("the colour targets don't fill the payload");
+        if (w(1) > 1) throw bad("the join word is 0 or 1");
+        const colors: ColorTarget[] = [];
+        for (let k = 0; k < n; k++) {
+          const c = 2 + 8 * k;
+          if (w(c + 3) > 1) throw bad("a load is 0 (clear) or 1 (keep)");
+          colors.push({ texture: w(c), level: w(c + 1), layer: w(c + 2), keep: w(c + 3) === 1, clear: [f(c + 4), f(c + 5), f(c + 6), f(c + 7)] });
+        }
+        if (colors.some((c) => c.texture === SCREEN) && n !== 1) throw bad("a pass on the screen has the screen as its one colour");
+        const d = 2 + 8 * n;
+        if (w(d + 2) > 1) throw bad("a load is 0 (clear) or 1 (keep)");
+        const pass: Pass = { colors, join: w(1) === 1, depth: w(d), depthLayer: w(d + 1), keepDepth: w(d + 2) === 1, clearDepth: f(d + 3) };
         cmd = { op: name, pass };
+        break;
+      }
+      case "CopyTexture": {
+        exactly(12);
+        cmd = {
+          op: name,
+          source: { texture: w(0), level: w(1), layer: w(2), x: w(3), y: w(4), width: w(10), height: w(11) },
+          destination: { texture: w(5), level: w(6), layer: w(7), x: w(8), y: w(9) },
+        };
+        break;
+      }
+      case "CopyTextureToBuffer": {
+        exactly(10);
+        if (w(8) % ROW_ALIGNMENT !== 0 || w(9) % ROW_ALIGNMENT !== 0 || w(9) === 0) throw bad("the buffer's offset and bytes per row are multiples of 256");
+        const source = { texture: w(0), level: w(1), layer: w(2), x: w(3), y: w(4), width: w(5), height: w(6) };
+        cmd = { op: name, source, buffer: w(7), offset: w(8), bytesPerRow: w(9) };
+        break;
+      }
+      case "CopyBufferToTexture": {
+        exactly(10);
+        if (w(1) % 4 !== 0 || w(2) % ROW_ALIGNMENT !== 0 || w(2) === 0) throw bad("the buffer's offset is a multiple of 4, its bytes per row of 256");
+        const destination = { texture: w(3), level: w(4), layer: w(5), x: w(6), y: w(7), width: w(8), height: w(9) };
+        cmd = { op: name, buffer: w(0), offset: w(1), bytesPerRow: w(2), destination };
+        break;
+      }
+      case "SetScissor": {
+        exactly(4);
+        cmd = { op: name, x: w(0), y: w(1), width: w(2), height: w(3) };
+        break;
+      }
+      case "SetViewport": {
+        exactly(6);
+        const rect: [number, number, number, number] = [f(0), f(1), f(2), f(3)];
+        const minDepth = f(4);
+        const maxDepth = f(5);
+        if (!rect.every(Number.isFinite) || rect[2] < 0 || rect[3] < 0) throw bad("a viewport is a finite rectangle of positive size");
+        if (!(minDepth >= 0 && minDepth <= 1) || !(maxDepth >= 0 && maxDepth <= 1) || minDepth > maxDepth) throw bad("a viewport's depths are in [0, 1], the least first");
+        cmd = { op: name, rect, minDepth, maxDepth };
+        break;
+      }
+      case "DrawIndexed": {
+        const [bindings, uniforms] = bound(9);
+        if (w(2) % 4 !== 0 || w(3) % 4 !== 0) throw bad("the indices' offset and size must be multiples of 4");
+        cmd = {
+          op: name,
+          pipeline: w(0),
+          indices: w(1),
+          index_offset: w(2),
+          index_size: w(3),
+          index_count: w(4),
+          instances: w(5),
+          first_index: w(6),
+          base_vertex: view.getInt32(start + 28, true),
+          first_instance: w(8),
+          bindings,
+          uniforms,
+        };
+        break;
+      }
+      case "MultiDrawIndirect":
+      case "MultiDrawIndexedIndirect": {
+        const indexed = name === "MultiDrawIndexedIndirect";
+        const at = indexed ? 4 : 1;
+        const [bindings, uniforms] = bound(at + 5);
+        if (indexed && (w(2) % 4 !== 0 || w(3) % 4 !== 0)) throw bad("the indices' offset and size must be multiples of 4");
+        if (w(at + 1) % 4 !== 0 || w(at + 4) % 4 !== 0) throw bad("the arguments' and the count's offsets must be multiples of 4");
+        cmd = {
+          op: name,
+          pipeline: w(0),
+          indices: indexed ? [w(1), w(2), w(3)] : null,
+          arguments: w(at),
+          offset: w(at + 1),
+          count: w(at + 2),
+          count_buffer: w(at + 3),
+          count_offset: w(at + 4),
+          bindings,
+          uniforms,
+        };
         break;
       }
       case "ReadBuffer": {
@@ -433,14 +594,21 @@ export class Sequencer {
       case "BeginScreenPass":
       case "BeginPass": {
         if (this.#at !== "outside") throw err("a pass is already open");
-        const screen = cmd.op === "BeginScreenPass" || cmd.pass.color === SCREEN;
+        const screen = cmd.op === "BeginScreenPass" || onScreen(cmd.pass);
         this.#at = screen ? "screen pass" : "pass";
         return;
       }
       case "Draw":
       case "DrawIndirect":
+      case "DrawIndexed":
       case "DrawIndexedIndirect":
+      case "MultiDrawIndirect":
+      case "MultiDrawIndexedIndirect":
         if (this.#at === "outside") throw err("a draw must come inside a pass");
+        return;
+      case "SetScissor":
+      case "SetViewport":
+        if (this.#at === "outside") throw err("a scissor or a viewport is set inside a pass");
         return;
       case "Present":
         if (this.#at !== "screen pass") throw err("Present must close a pass on the screen");
@@ -451,7 +619,7 @@ export class Sequencer {
         this.#at = "outside";
         return;
       default:
-        if (this.#at !== "outside") throw err("only draws can happen inside a pass");
+        if (this.#at !== "outside") throw err("only draws, scissors and viewports can happen inside a pass");
         return;
     }
   }

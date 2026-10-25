@@ -198,13 +198,8 @@ fn screen_pass_checks_depth_against_frame_dimensions() {
     let batch = Encoder::new()
         .create_texture(1, 8, 8, TextureFormat::Depth32Float, false)
         .begin_pass(Pass {
-            color: wrela_abi::stream::SCREEN,
-            keep_color: false,
             join: false,
-            clear: [0.0; 4],
-            depth: 1,
-            keep_depth: false,
-            clear_depth: 1.0,
+            ..Pass::one(wrela_abi::stream::SCREEN, false, [0.0; 4]).with_depth(1, false, 1.0)
         })
         .end_pass()
         .finish();

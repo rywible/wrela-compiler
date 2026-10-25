@@ -1,4 +1,4 @@
-//! # The manifest, version 9
+//! # The manifest, version 10
 //!
 //! `manifest.json` describes everything game-specific a host needs besides the WASM: each
 //! pipeline's shader, entry points and bindings (D-099). The runtime reads it at load; nothing
@@ -32,12 +32,17 @@
 //!   from each draw's pass: each a colour format (`null` in a pass that draws only depths; the
 //!   screen's is [`SCREEN_FORMAT`], with `"screen": true`) and whether there's a depth target
 //!   (`depth32float`), at least one. Hosts make one pipeline for each when the program loads, and refuse a draw into
-//!   any other. A render pipeline with `"blend": true` draws its colour over what's
-//!   in the target (alpha blending, straight alpha: `src × src.a + dst × (1 − src.a)` for the
-//!   colour, `src.a + dst.a × (1 − src.a)` for alpha); without it, its colour replaces it. One
-//!   with `"writes_depth": true` gives each fragment its own depth (WGSL's `frag_depth`), so its
-//!   targets all have depth; one with `"uint": true` returns a `u32`, so its targets' colour, if
-//!   they have one, is `r32uint`, which no other's is.
+//!   any other. A target's `"colors"` are its colour formats in order (none in a pass that
+//!   draws only depths; one, [`SCREEN_FORMAT`], for the screen), up to four, within WebGPU's 32
+//!   bytes per sample ([`crate::stream::color_attachment_bytes`]). A render pipeline's
+//!   `"outputs"` say what its fragment shader writes to each colour location, `"float"` or
+//!   `"uint"`, so a target's colours are as many, an integer format exactly where it's `"uint"`.
+//!   Its `"blends"` (one per output; all `"replace"` when it's left out) say how each colour
+//!   meets what's in its target ([`Blend`]). One with `"writes_depth": true` gives each fragment
+//!   its own depth (WGSL's `frag_depth`), so its targets all have depth.
+//! - A pipeline's `"requires"` lists the device features its shader needs (WebGPU's names:
+//!   `"shader-f16"`, `"subgroups"`): a host builds it only on a device with them, and a command
+//!   that records it on one without is an error that names the feature.
 //! - A render pipeline's `"cull"` drops triangles by facing (`"none"`, the default, `"front"`
 //!   or `"back"`; a triangle whose vertices run counter-clockwise on the target faces the
 //!   front). Its `"depth_bias"` moves each fragment's depth by `constant` steps of the depth
@@ -47,12 +52,12 @@
 
 use crate::Limits;
 pub use crate::stream::Compare;
-use crate::stream::TextureFormat;
+use crate::stream::{MAX_COLOR_ATTACHMENTS, TextureFormat, TextureKind};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 9;
+pub const VERSION: u32 = 10;
 /// The screen's texture format, in WebGPU's spelling: what a screen target's colour is, and
 /// the format of the bytes a host reads back from the screen.
 pub const SCREEN_FORMAT: &str = "rgba8unorm";
@@ -139,6 +144,9 @@ pub struct Pipeline {
     /// A debug build's: the binding of the flag its bounds checks set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub debug_flag: Option<u32>,
+    /// The device features its shader needs (WebGPU's names).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -151,9 +159,9 @@ pub enum Stage {
     Render {
         vertex_entry: String,
         fragment_entry: String,
-        /// Draws its colour over the target's (alpha blending) rather than replacing it.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        blend: bool,
+        /// How each colour output meets its target's: none means all replace it.
+        #[serde(skip_serializing_if = "Blend::all_replace")]
+        blends: Vec<Blend>,
         #[serde(skip_serializing_if = "Cull::is_none")]
         cull: Cull,
         #[serde(skip_serializing_if = "DepthBias::is_none")]
@@ -163,22 +171,22 @@ pub enum Stage {
         /// Gives each fragment its own depth: drawn only in a pass with a depth target.
         #[serde(skip_serializing_if = "std::ops::Not::not")]
         writes_depth: bool,
-        /// Its fragment shader returns a `u32`: drawn only into an `r32uint` target, which a
-        /// `vec4` colour isn't drawn into.
-        #[serde(skip_serializing_if = "std::ops::Not::not")]
-        uint: bool,
+        /// What its fragment shader writes to each colour location.
+        outputs: Vec<Output>,
         /// Every combination of targets it's drawn into, first drawn first.
         targets: Vec<RenderTarget>,
     },
 }
 
-/// What a render pipeline draws into: a colour target of a format (none in a pass that draws
-/// only depths), and a depth target (`depth32float`) or none. The screen's colour target says
-/// it's the screen (`"screen": true`, which a texture's leaves out): its format is
+/// What a render pipeline draws into: its colour targets' formats in order (none in a pass
+/// that draws only depths), and a depth target (`depth32float`) or none. The screen's says it's
+/// the screen (`"screen": true`, which a texture's leaves out): its one colour is
 /// [`SCREEN_FORMAT`] here, and a host may draw it in another (a browser's canvas).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RenderTarget {
-    pub color: Option<TextureFormat>,
+    /// The colours: the first `count`.
+    pub colors: [Option<TextureFormat>; MAX_COLOR_ATTACHMENTS],
+    pub count: u8,
     pub depth: bool,
     pub screen: bool,
 }
@@ -187,20 +195,54 @@ impl RenderTarget {
     /// The screen's target, with depth or without.
     pub fn screen(depth: bool) -> RenderTarget {
         let color = TextureFormat::ALL.into_iter().find(|f| f.name() == SCREEN_FORMAT);
-        RenderTarget { color, depth, screen: true }
+        RenderTarget {
+            screen: true,
+            ..RenderTarget::of(&color.into_iter().collect::<Vec<_>>(), depth)
+        }
+    }
+
+    /// Textures of these formats, with depth or without.
+    pub fn of(colors: &[TextureFormat], depth: bool) -> RenderTarget {
+        let mut all = [None; MAX_COLOR_ATTACHMENTS];
+        for (slot, &f) in all.iter_mut().zip(colors) {
+            *slot = Some(f);
+        }
+        RenderTarget {
+            colors: all,
+            count: colors.len().min(MAX_COLOR_ATTACHMENTS) as u8,
+            depth,
+            screen: false,
+        }
+    }
+
+    /// Its colour formats.
+    pub fn colors(&self) -> impl Iterator<Item = TextureFormat> + '_ {
+        self.colors[..usize::from(self.count)].iter().flatten().copied()
+    }
+
+    /// Its first colour's format, if it has one.
+    pub fn color(&self) -> Option<TextureFormat> {
+        self.colors().next()
     }
 }
 
 impl fmt::Display for RenderTarget {
-    /// As errors name it: `rgba16float with depth`, `depth alone`, `the screen`.
+    /// As errors name it: `rgba16float with depth`, `rgba16float and r32uint`, `depth alone`,
+    /// `the screen`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match (self.screen, self.color, self.depth) {
-            (true, _, true) => write!(f, "the screen with depth"),
-            (true, _, false) => write!(f, "the screen"),
-            (false, Some(c), true) => write!(f, "{} with depth", c.name()),
-            (false, Some(c), false) => write!(f, "{}", c.name()),
-            (false, None, true) => write!(f, "depth alone"),
-            (false, None, false) => write!(f, "nothing"),
+        if self.screen {
+            return write!(
+                f,
+                "{}",
+                if self.depth { "the screen with depth" } else { "the screen" }
+            );
+        }
+        let names: Vec<&str> = self.colors().map(TextureFormat::name).collect();
+        match (names.is_empty(), self.depth) {
+            (false, true) => write!(f, "{} with depth", names.join(" and ")),
+            (false, false) => write!(f, "{}", names.join(" and ")),
+            (true, true) => write!(f, "depth alone"),
+            (true, false) => write!(f, "nothing"),
         }
     }
 }
@@ -209,13 +251,98 @@ impl Serialize for RenderTarget {
     fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
         let mut o = s.serialize_struct("RenderTarget", 2 + usize::from(self.screen))?;
-        o.serialize_field("color", &self.color.map(TextureFormat::name))?;
+        let colors: Vec<&str> = self.colors().map(TextureFormat::name).collect();
+        o.serialize_field("colors", &colors)?;
         o.serialize_field("depth", &self.depth)?;
         if self.screen {
             o.serialize_field("screen", &true)?;
         }
         o.end()
     }
+}
+
+/// How a fragment shader's colour meets its target's (WebGPU's `GPUBlendState`): the colour
+/// and alpha components' factors and operations are [`Blend::components`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Blend {
+    /// It replaces what's there.
+    #[default]
+    Replace,
+    /// Straight alpha: colour `src × src.a + dst × (1 − src.a)`, alpha `src.a + dst.a × (1 −
+    /// src.a)`.
+    Over,
+    /// Premultiplied alpha: colour `src + dst × (1 − src.a)`, alpha likewise.
+    Premultiplied,
+    /// `src + dst`, each component.
+    Add,
+    /// `src × dst`, each component.
+    Multiply,
+    /// The least of `src` and `dst`, each component.
+    Min,
+    /// The greatest, each component.
+    Max,
+}
+
+/// One component of a blend: (source factor, destination factor, operation), WebGPU's names.
+pub type BlendComponent = (&'static str, &'static str, &'static str);
+
+impl Blend {
+    pub const ALL: [Blend; 7] = [
+        Blend::Replace,
+        Blend::Over,
+        Blend::Premultiplied,
+        Blend::Add,
+        Blend::Multiply,
+        Blend::Min,
+        Blend::Max,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Blend::Replace => "replace",
+            Blend::Over => "over",
+            Blend::Premultiplied => "premultiplied",
+            Blend::Add => "add",
+            Blend::Multiply => "multiply",
+            Blend::Min => "min",
+            Blend::Max => "max",
+        }
+    }
+
+    /// Its colour and alpha components, as WebGPU's `GPUBlendComponent`s; `None` for `Replace`,
+    /// which blends nothing.
+    pub fn components(self) -> Option<(BlendComponent, BlendComponent)> {
+        Some(match self {
+            Blend::Replace => return None,
+            Blend::Over => {
+                (("src-alpha", "one-minus-src-alpha", "add"), ("one", "one-minus-src-alpha", "add"))
+            }
+            Blend::Premultiplied => {
+                let c = ("one", "one-minus-src-alpha", "add");
+                (c, c)
+            }
+            Blend::Add => (("one", "one", "add"), ("one", "one", "add")),
+            Blend::Multiply => (("dst", "zero", "add"), ("dst-alpha", "zero", "add")),
+            Blend::Min => (("one", "one", "min"), ("one", "one", "min")),
+            Blend::Max => (("one", "one", "max"), ("one", "one", "max")),
+        })
+    }
+
+    /// Whether every one of `blends` replaces: the manifest leaves them out.
+    pub fn all_replace(blends: &[Blend]) -> bool {
+        blends.iter().all(|&b| b == Blend::Replace)
+    }
+}
+
+/// What a fragment shader writes to one colour location: floats, or unsigned integers (to an
+/// integer format's target).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Output {
+    #[default]
+    Float,
+    Uint,
 }
 
 /// How a render pipeline tests and writes depth, in a pass with a depth target: WebGPU's
@@ -318,10 +445,21 @@ pub enum BindingKind {
     /// A colour 3D texture a kernel writes.
     #[serde(rename = "storage_texture_3d")]
     StorageTexture3d,
+    /// A 2D array of colour textures, sampled by layer.
+    #[serde(rename = "texture_2d_array")]
+    TextureArray,
+    /// A cube of colour textures, sampled by direction.
+    TextureCube,
+    /// A 2D array of depth textures, for comparison sampling by layer.
+    #[serde(rename = "depth_texture_2d_array")]
+    DepthTextureArray,
+    /// A 2D array a kernel writes, each invocation its own layer's texel.
+    #[serde(rename = "storage_texture_2d_array")]
+    StorageTextureArray,
 }
 
 impl BindingKind {
-    pub const ALL: [BindingKind; 9] = [
+    pub const ALL: [BindingKind; 13] = [
         BindingKind::Read,
         BindingKind::ReadWrite,
         BindingKind::Texture,
@@ -331,6 +469,10 @@ impl BindingKind {
         BindingKind::StorageTexture,
         BindingKind::Texture3d,
         BindingKind::StorageTexture3d,
+        BindingKind::TextureArray,
+        BindingKind::TextureCube,
+        BindingKind::DepthTextureArray,
+        BindingKind::StorageTextureArray,
     ];
 
     pub fn is_buffer(self) -> bool {
@@ -345,12 +487,20 @@ impl BindingKind {
                 | BindingKind::Texture3d
                 | BindingKind::StorageTexture
                 | BindingKind::StorageTexture3d
+                | BindingKind::TextureArray
+                | BindingKind::TextureCube
+                | BindingKind::StorageTextureArray
         )
     }
 
     /// Whether kernels write it: a storage texture.
     pub fn is_storage(self) -> bool {
-        matches!(self, BindingKind::StorageTexture | BindingKind::StorageTexture3d)
+        matches!(
+            self,
+            BindingKind::StorageTexture
+                | BindingKind::StorageTexture3d
+                | BindingKind::StorageTextureArray
+        )
     }
 
     /// Whether it's a 3D texture.
@@ -358,17 +508,57 @@ impl BindingKind {
         matches!(self, BindingKind::Texture3d | BindingKind::StorageTexture3d)
     }
 
+    /// Whether it's a texture of depths.
+    pub fn is_depth(self) -> bool {
+        matches!(self, BindingKind::DepthTexture | BindingKind::DepthTextureArray)
+    }
+
+    /// Whether it's a texture of any kind.
+    pub fn is_texture(self) -> bool {
+        !self.is_buffer() && !matches!(self, BindingKind::Sampler | BindingKind::ComparisonSampler)
+    }
+
+    /// A texture binding's view dimension (WebGPU's `viewDimension`); `None` for the rest.
+    pub fn dimension(self) -> Option<&'static str> {
+        Some(match self {
+            BindingKind::Texture | BindingKind::DepthTexture | BindingKind::StorageTexture => "2d",
+            BindingKind::Texture3d | BindingKind::StorageTexture3d => "3d",
+            BindingKind::TextureArray
+            | BindingKind::DepthTextureArray
+            | BindingKind::StorageTextureArray => "2d-array",
+            BindingKind::TextureCube => "cube",
+            _ => return None,
+        })
+    }
+
+    /// The kinds of texture a binding of it may be given: a 2D view of any texture but a 3D
+    /// one (one layer of an array or a cube), an array's or a cube's whole layers, a 3D one.
+    pub fn takes(self, kind: TextureKind, one_layer: bool) -> bool {
+        match self.dimension() {
+            Some("2d") => kind == TextureKind::D2 || (one_layer && kind != TextureKind::D3),
+            Some("2d-array") => {
+                !one_layer && matches!(kind, TextureKind::Array | TextureKind::Cube)
+            }
+            Some("cube") => !one_layer && kind == TextureKind::Cube,
+            Some("3d") => kind == TextureKind::D3,
+            _ => false,
+        }
+    }
+
     /// The per-stage limit it counts against.
     pub fn limit(self) -> StageLimit {
         match self {
             BindingKind::Read | BindingKind::ReadWrite => StageLimit::StorageBuffers,
-            BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
-                StageLimit::SampledTextures
-            }
+            BindingKind::Texture
+            | BindingKind::DepthTexture
+            | BindingKind::Texture3d
+            | BindingKind::TextureArray
+            | BindingKind::TextureCube
+            | BindingKind::DepthTextureArray => StageLimit::SampledTextures,
             BindingKind::Sampler | BindingKind::ComparisonSampler => StageLimit::Samplers,
-            BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
-                StageLimit::StorageTextures
-            }
+            BindingKind::StorageTexture
+            | BindingKind::StorageTexture3d
+            | BindingKind::StorageTextureArray => StageLimit::StorageTextures,
         }
     }
 
@@ -384,6 +574,10 @@ impl BindingKind {
             BindingKind::StorageTexture => "storage_texture",
             BindingKind::Texture3d => "texture_3d",
             BindingKind::StorageTexture3d => "storage_texture_3d",
+            BindingKind::TextureArray => "texture_2d_array",
+            BindingKind::TextureCube => "texture_cube",
+            BindingKind::DepthTextureArray => "depth_texture_2d_array",
+            BindingKind::StorageTextureArray => "storage_texture_2d_array",
         }
     }
 }
@@ -607,11 +801,21 @@ impl Manifest {
                     vertex_entry,
                     fragment_entry,
                     writes_depth,
-                    uint,
-                    blend,
+                    outputs,
+                    blends,
                     targets,
                     ..
                 } => {
+                    if outputs.len() > MAX_COLOR_ATTACHMENTS {
+                        return err(format!("pipeline {i} has more than four colour outputs"));
+                    }
+                    if !blends.is_empty() && blends.len() != outputs.len() {
+                        return err(format!(
+                            "pipeline {i} has {} blends for {} colour outputs",
+                            blends.len(),
+                            outputs.len()
+                        ));
+                    }
                     if vertex_entry.is_empty() || fragment_entry.is_empty() {
                         return err(format!("pipeline {i} is missing an entry point"));
                     }
@@ -622,34 +826,56 @@ impl Manifest {
                         if targets[..k].contains(t) {
                             return err(format!("pipeline {i} names the target {t} twice"));
                         }
-                        if t.color.is_none() && !t.depth {
+                        if t.count == 0 && !t.depth {
                             return err(format!(
                                 "pipeline {i}'s target {k} draws into nothing: a target has a colour, a depth, or both"
                             ));
                         }
-                        if t.screen && t.color.map(TextureFormat::name) != Some(SCREEN_FORMAT) {
-                            let color = t.color.map_or("none", TextureFormat::name);
+                        if t.screen
+                            && (t.count != 1
+                                || t.color().map(TextureFormat::name) != Some(SCREEN_FORMAT))
+                        {
                             return err(format!(
-                                "pipeline {i}'s target {k} is the screen, whose colour is {SCREEN_FORMAT}, not {color}"
+                                "pipeline {i}'s target {k} is the screen, whose one colour is {SCREEN_FORMAT}"
                             ));
                         }
-                        let integer = t.color.is_some_and(|c| c.is_uint());
+                        let colors: Vec<TextureFormat> = t.colors().collect();
+                        let blend = |c: usize| blends.get(c).copied().unwrap_or_default();
                         let why = if *writes_depth && !t.depth {
-                            Some("its fragments give their depth, so a target has depth")
-                        } else if *uint && t.color.is_some() && !integer {
                             Some(
-                                "its fragment shader returns a `u32`, so a colour target is r32uint",
+                                "its fragments give their depth, so a target has depth".to_string(),
                             )
-                        } else if !*uint && integer {
-                            Some(
-                                "its fragment shader returns a colour, which an r32uint target isn't",
-                            )
-                        } else if t.color.is_some_and(|c| c.is_depth()) {
-                            Some("a colour target's format isn't a depth one")
-                        } else if *blend && t.color.is_some_and(|c| !c.filterable()) {
-                            Some("its colour is blended, which this format doesn't support")
+                        } else if !colors.is_empty() && colors.len() != outputs.len() {
+                            Some(format!(
+                                "its fragment shader writes {} colours, and it has {}",
+                                outputs.len(),
+                                colors.len()
+                            ))
+                        } else if crate::stream::color_attachment_bytes(&colors)
+                            > crate::stream::MAX_COLOR_ATTACHMENT_BYTES
+                        {
+                            Some(format!(
+                                "its colours take {} bytes a sample, over WebGPU's 32",
+                                crate::stream::color_attachment_bytes(&colors)
+                            ))
                         } else {
-                            None
+                            colors.iter().enumerate().find_map(|(c, f)| {
+                                let uint = outputs[c] == Output::Uint;
+                                if f.is_depth() || f.is_compressed() || !f.renderable() {
+                                    Some(format!("a pass can't draw into {}", f.name()))
+                                } else if uint != f.is_uint() {
+                                    Some(format!(
+                                        "its fragment shader writes {} to colour {c}, and {} holds {}",
+                                        if uint { "integers" } else { "floats" },
+                                        f.name(),
+                                        if f.is_uint() { "integers" } else { "floats" }
+                                    ))
+                                } else if blend(c) != Blend::Replace && !f.blendable() {
+                                    Some(format!("colour {c} blends, and {} doesn't blend", f.name()))
+                                } else {
+                                    None
+                                }
+                            })
                         };
                         if let Some(why) = why {
                             return err(format!("pipeline {i}'s target {t} can't be one: {why}"));
@@ -783,17 +1009,26 @@ mod read {
             .map(|(k, v)| {
                 let tp = format!("{place}.targets[{k}]");
                 let to = object(v, &tp)?;
-                let color = match to.get("color") {
-                    Some(Value::Null) => None,
-                    Some(_) => Some(one_of(to, "color", &tp, &names)?),
-                    None => return fail(format!("{tp}.color must be a format or null")),
+                let Some(Value::Array(cs)) = to.get("colors") else {
+                    return fail(format!("{tp}.colors must be an array of formats"));
                 };
+                if cs.len() > MAX_COLOR_ATTACHMENTS {
+                    return fail(format!("{tp}.colors has more than four formats"));
+                }
+                let mut colors = Vec::new();
+                for (c, f) in cs.iter().enumerate() {
+                    let fp = format!("{tp}.colors[{c}]");
+                    match names.iter().find(|(n, _)| f.as_str() == Some(n)) {
+                        Some(&(_, f)) => colors.push(f),
+                        None => return fail(format!("{fp} must be a format, not {}", show(f))),
+                    }
+                }
                 let depth = match to.get("depth") {
                     Some(Value::Bool(b)) => *b,
                     _ => return fail(format!("{tp}.depth must be true or false")),
                 };
                 let screen = flag(to, "screen", &tp, false)?;
-                Ok(RenderTarget { color, depth, screen })
+                Ok(RenderTarget { screen, ..RenderTarget::of(&colors, depth) })
             })
             .collect()
     }
@@ -891,8 +1126,24 @@ mod read {
             false => Stage::Render {
                 vertex_entry: string(o, "vertex_entry", &place)?,
                 fragment_entry: string(o, "fragment_entry", &place)?,
-                // A missing `blend` is false.
-                blend: flag(o, "blend", &place, false)?,
+                // Missing `blends` all replace.
+                blends: match o.get("blends") {
+                    None => Vec::new(),
+                    Some(Value::Array(bs)) => {
+                        let names = Blend::ALL.map(|b| (b.name(), b));
+                        bs.iter()
+                            .enumerate()
+                            .map(|(k, b)| match names.iter().find(|(n, _)| b.as_str() == Some(n)) {
+                                Some(&(_, b)) => Ok(b),
+                                None => fail(format!(
+                                    "{place}.blends[{k}] must be a blend, not {}",
+                                    show(b)
+                                )),
+                            })
+                            .collect::<Result<_>>()?
+                    }
+                    Some(_) => return fail(format!("{place}.blends must be an array")),
+                },
                 // A missing `cull` is none, and a missing `depth_bias` none.
                 cull: one_of_or(
                     o,
@@ -936,9 +1187,23 @@ mod read {
                         }
                     }
                 },
-                // A missing `writes_depth` is false, and a missing `uint`.
+                // A missing `writes_depth` is false.
                 writes_depth: flag(o, "writes_depth", &place, false)?,
-                uint: flag(o, "uint", &place, false)?,
+                outputs: match field(o, "outputs", &place)? {
+                    Value::Array(os) => os
+                        .iter()
+                        .enumerate()
+                        .map(|(k, x)| match x.as_str() {
+                            Some("float") => Ok(Output::Float),
+                            Some("uint") => Ok(Output::Uint),
+                            _ => fail(format!(
+                                "{place}.outputs[{k}] must be float or uint, not {}",
+                                show(x)
+                            )),
+                        })
+                        .collect::<Result<_>>()?,
+                    _ => return fail(format!("{place}.outputs must be an array")),
+                },
                 targets: render_targets(o, &place)?,
             },
         };
@@ -947,7 +1212,23 @@ mod read {
             Value::Null => None,
             v => Some(as_u32(v, &format!("{place}.debug_flag"))?),
         };
-        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag })
+        // Missing `requires` is none.
+        let requires = match o.get("requires") {
+            None => Vec::new(),
+            Some(Value::Array(fs)) => fs
+                .iter()
+                .enumerate()
+                .map(|(k, f)| match f.as_str() {
+                    Some(name) if crate::FEATURES.contains(&name) => Ok(name.to_string()),
+                    _ => fail(format!(
+                        "{place}.requires[{k}] must be a feature this host knows, not {}",
+                        show(f)
+                    )),
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => return fail(format!("{place}.requires must be an array")),
+        };
+        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag, requires })
     }
 
     /// A manifest whose version has been checked.
@@ -979,8 +1260,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 9,
-  "stream_version": 11,
+  "manifest_version": 10,
+  "stream_version": 12,
   "wasm": "game.wasm",
   "pipelines": [
     {
@@ -1011,9 +1292,14 @@ mod tests {
       "kind": "render",
       "vertex_entry": "vs",
       "fragment_entry": "fs",
+      "outputs": [
+        "float"
+      ],
       "targets": [
         {
-          "color": "rgba8unorm",
+          "colors": [
+            "rgba8unorm"
+          ],
           "depth": false,
           "screen": true
         }
@@ -1132,14 +1418,19 @@ mod tests {
             (TextureFormat::Rgba16Float, true),
             (TextureFormat::R16Float, true),
             (TextureFormat::Rg16Float, true),
-            (TextureFormat::R32Float, false),
+            (TextureFormat::R8, true),
+            (TextureFormat::Rgb10a2, true),
+            // Blendable with `float32-blendable`, which the host checks at the draw.
+            (TextureFormat::R32Float, true),
+            (TextureFormat::Rgba32Float, true),
             (TextureFormat::R32Uint, false),
+            (TextureFormat::Rg32Uint, false),
         ] {
             let mut m = sample();
-            if let Stage::Render { blend, uint, targets, .. } = &mut m.pipelines[1].stage {
-                *blend = true;
-                *uint = format.is_uint();
-                *targets = vec![RenderTarget { color: Some(format), ..RenderTarget::default() }];
+            if let Stage::Render { blends, outputs, targets, .. } = &mut m.pipelines[1].stage {
+                *blends = vec![Blend::Over];
+                *outputs = vec![if format.is_uint() { Output::Uint } else { Output::Float }];
+                *targets = vec![RenderTarget::of(&[format], false)];
             }
             let result = Manifest::parse(&m.to_json());
             if blendable {
@@ -1148,18 +1439,44 @@ mod tests {
                 assert_eq!(
                     result.expect_err("unblendable target").0,
                     format!(
-                        "pipeline 1's target {format} can't be one: its colour is blended, which this format doesn't support",
+                        "pipeline 1's target {format} can't be one: colour 0 blends, and {format} doesn't blend",
                         format = format.name()
                     )
                 );
             }
         }
         let mut m = sample();
-        if let Stage::Render { blend, targets, .. } = &mut m.pipelines[1].stage {
-            *blend = true;
-            *targets = vec![RenderTarget { depth: true, ..RenderTarget::default() }];
+        if let Stage::Render { blends, targets, .. } = &mut m.pipelines[1].stage {
+            *blends = vec![Blend::Over];
+            *targets = vec![RenderTarget::of(&[], true)];
         }
         Manifest::parse(&m.to_json()).expect("a depth-only variant has no colour blend");
+    }
+
+    /// A target's colours are as many as the fragment shader writes, an integer format where
+    /// it writes integers, within WebGPU's 32 bytes a sample (its algorithm: the running total
+    /// aligned to each format, then its cost added).
+    #[test]
+    fn several_colour_targets_match_the_outputs() {
+        use TextureFormat as F;
+        let with = |outputs: Vec<Output>, colors: &[F]| {
+            let mut m = sample();
+            if let Stage::Render { outputs: o, targets, .. } = &mut m.pipelines[1].stage {
+                *o = outputs;
+                *targets = vec![RenderTarget::of(colors, true)];
+            }
+            Manifest::parse(&m.to_json()).map(|_| ())
+        };
+        let f = Output::Float;
+        with(vec![f, f, f, Output::Uint], &[F::Rgba16Float, F::Rg16Float, F::R8, F::R32Uint])
+            .expect("20 bytes a sample");
+        let e = with(vec![f, f, f, f], &[F::Rgba32Float, F::Rgba8, F::Rgba8, F::Rgba16Float])
+            .expect_err("40 bytes a sample");
+        assert!(e.0.contains("40 bytes a sample, over WebGPU's 32"), "{}", e.0);
+        let e = with(vec![f, f], &[F::Rgba8]).expect_err("two outputs into one colour");
+        assert!(e.0.contains("writes 2 colours, and it has 1"), "{}", e.0);
+        let e = with(vec![f], &[F::R32Uint]).expect_err("floats into integers");
+        assert!(e.0.contains("writes floats to colour 0"), "{}", e.0);
     }
 
     #[test]
@@ -1167,7 +1484,7 @@ mod tests {
         // The screen and a texture of the screen's format are two targets: only the screen's
         // JSON says it's the screen.
         let mut m = sample();
-        let texture = RenderTarget { color: Some(TextureFormat::Rgba8), ..RenderTarget::default() };
+        let texture = RenderTarget::of(&[TextureFormat::Rgba8], false);
         if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
             targets.push(texture);
             targets.push(RenderTarget::screen(true));
@@ -1178,16 +1495,14 @@ mod tests {
         let Stage::Render { targets, .. } = &parsed.pipelines[1].stage else { panic!("render") };
         assert_eq!(targets, &[RenderTarget::screen(false), texture, RenderTarget::screen(true)]);
         // A screen target's colour is the screen's format.
-        for (color, name) in [(Some(TextureFormat::Rgba16Float), "rgba16float"), (None, "none")] {
+        for colors in [&[TextureFormat::Rgba16Float][..], &[]] {
             let mut m = sample();
             if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
-                targets[0] = RenderTarget { color, depth: true, screen: true };
+                targets[0] = RenderTarget { screen: true, ..RenderTarget::of(colors, true) };
             }
             assert_eq!(
                 Manifest::parse(&m.to_json()).expect_err("a screen of another format").0,
-                format!(
-                    "pipeline 1's target 0 is the screen, whose colour is rgba8unorm, not {name}"
-                )
+                "pipeline 1's target 0 is the screen, whose one colour is rgba8unorm"
             );
         }
     }

@@ -1,6 +1,6 @@
 import { expect, spyOn, test } from "bun:test";
 import { HOST_FUNCTIONS, IMPORT_CLOCK, IMPORT_MEMORY, IMPORT_MODULE, IMPORT_PHASE, IMPORT_PRINT } from "../src/abi.gen.ts";
-import { clockImport, printed } from "../src/imports.ts";
+import { clockImport, Phases, printed } from "../src/imports.ts";
 
 test("thread imports initialize and read strict UTF-8 without TextDecoder", async () => {
   const bundle = await Bun.build({ entrypoints: [new URL("../src/imports.ts", import.meta.url).pathname], target: "browser", format: "esm" });
@@ -79,4 +79,22 @@ test("consecutive printed lines decode independently, rejecting malformed text a
   } finally {
     log.mockRestore();
   }
+});
+
+test("a phase runs until the thread's next one or its call's end, its time summed by name", () => {
+  let now = 0;
+  const phases = new Phases(() => now);
+  phases.begin("sim");
+  now = 2;
+  phases.begin("draw");
+  now = 5;
+  phases.begin("sim");
+  now = 6;
+  phases.begin("");
+  now = 7;
+  phases.end();
+  now = 100;
+  phases.end();
+  expect(phases.take()).toEqual({ sim: 3, draw: 3 });
+  expect(phases.take()).toEqual({});
 });

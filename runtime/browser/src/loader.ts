@@ -1,7 +1,8 @@
 // Loads a build (manifest.json, the WASM, each pipeline's WGSL) and assembles a running program:
 // pipelines built up front, then the WASM instantiated against the decoder.
 
-import { Checker, limitsOf } from "./check.ts";
+import { Checker } from "./check.ts";
+import { deviceLimits } from "./device.ts";
 import { errorMessage } from "./errors.ts";
 import { buildPipelines, GpuExecutor, type PipelineCache, type ScreenTarget, type Timing } from "./gpu.ts";
 import { Lines, LINES_SIDECAR } from "./lines.ts";
@@ -201,7 +202,7 @@ export async function startProgram(
   const debug = build.manifest.pipelines.some((p) => p.debug_flag !== null);
   const executor = new GpuExecutor(device, pipelines, screen, gpu.timing, debug);
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
-  const checker = new Checker(build.manifest, limitsOf(device.limits));
+  const checker = new Checker(build.manifest, deviceLimits(device));
   try {
     return await Program.instantiate(compiled, checker, executor, options);
   } catch (e) {

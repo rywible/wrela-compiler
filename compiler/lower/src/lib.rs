@@ -17,6 +17,7 @@ mod derive;
 mod eval;
 mod glue;
 mod gpu;
+pub use gpu::blends_of;
 mod instance;
 mod job;
 mod lift;

@@ -40,10 +40,12 @@ use std::sync::{Arc, Mutex};
 use wgpu::util::align_to;
 use wrela_abi::hash::StateHash;
 use wrela_abi::manifest::{
-    BindingKind, BindingStage, Cull, DepthBias, DepthState, Manifest, ResourceBinding, Stage,
-    UniformSpace,
+    BindingKind, BindingStage, Blend, Cull, DepthBias, DepthState, Manifest, ResourceBinding,
+    Stage, UniformSpace,
 };
-use wrela_abi::stream::{self, Binding, Command, Compare, Opcode, Pass, TextureFormat};
+use wrela_abi::stream::{
+    self, Binding, Command, Compare, Opcode, Pass, TexelRect, TextureFormat, TextureKind, View,
+};
 
 /// The screen's format: `SCREEN_FORMAT` (rgba8unorm) in wgpu's spelling.
 const SCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -83,6 +85,18 @@ pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
     spans.into_iter().map(|(k, (a, b))| (k, (b - a) / 1e6)).collect()
 }
 
+/// A copy's extent in whole blocks of `format`: a rectangle of a compressed texture that reaches
+/// its level's edge (the checker allows no other part block) covers that edge's last block, which
+/// WebGPU counts in the level's physical size (a 4 × 4 BC level 1 is one 4 × 4 block).
+fn whole_blocks(format: TextureFormat, width: u32, height: u32) -> wgpu::Extent3d {
+    let b = format.block();
+    wgpu::Extent3d {
+        width: width.div_ceil(b) * b,
+        height: height.div_ceil(b) * b,
+        depth_or_array_layers: 1,
+    }
+}
+
 /// One texel of `format` (its bytes, little-endian) as RGBA8, as [`Gpu::read_target`] gives it.
 fn as_rgba8(format: TextureFormat, t: &[u8]) -> [u8; 4] {
     let unit = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -100,7 +114,38 @@ fn as_rgba8(format: TextureFormat, t: &[u8]) -> [u8; 4] {
             let g = unit(single(0));
             [g, g, g, 255]
         }
-        TextureFormat::R32Uint => [0, 0, 0, 255],
+        TextureFormat::R32Uint | TextureFormat::Rg32Uint => [0, 0, 0, 255],
+        TextureFormat::R8 => [t[0], t[0], t[0], 255],
+        TextureFormat::Rg8 => [t[0], t[1], 0, 255],
+        TextureFormat::Rgb10a2 => {
+            let w = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+            let c = |shift: u32| unit((w >> shift & 1023) as f32 / 1023.0);
+            [c(0), c(10), c(20), unit((w >> 30) as f32 / 3.0)]
+        }
+        TextureFormat::Rg32Float => [unit(single(0)), unit(single(4)), 0, 255],
+        TextureFormat::Rgba32Float => {
+            [unit(single(0)), unit(single(4)), unit(single(8)), unit(single(12))]
+        }
+        TextureFormat::Rg11b10Float => {
+            let w = u32::from_le_bytes([t[0], t[1], t[2], t[3]]);
+            let small = |bits: u32, mantissa: u32| {
+                let e = (bits >> mantissa) as i32;
+                let m = (bits & ((1 << mantissa) - 1)) as f32 / (1 << mantissa) as f32;
+                match e {
+                    0 => m * 2f32.powi(-14),
+                    31 => f32::INFINITY,
+                    e => (1.0 + m) * 2f32.powi(e - 15),
+                }
+            };
+            [unit(small(w & 2047, 6)), unit(small(w >> 11 & 2047, 6)), unit(small(w >> 22, 5)), 255]
+        }
+        // A compressed format is never a pass's target, which is what's read back.
+        TextureFormat::Bc1
+        | TextureFormat::Bc4
+        | TextureFormat::Bc5
+        | TextureFormat::Bc7
+        | TextureFormat::Etc2Rgb8
+        | TextureFormat::Astc4x4 => [0, 0, 0, 255],
     }
 }
 
@@ -127,6 +172,22 @@ fn wgpu_format(f: TextureFormat) -> wgpu::TextureFormat {
         TextureFormat::Rg16Float => wgpu::TextureFormat::Rg16Float,
         TextureFormat::R32Float => wgpu::TextureFormat::R32Float,
         TextureFormat::R32Uint => wgpu::TextureFormat::R32Uint,
+        TextureFormat::R8 => wgpu::TextureFormat::R8Unorm,
+        TextureFormat::Rg8 => wgpu::TextureFormat::Rg8Unorm,
+        TextureFormat::Rgb10a2 => wgpu::TextureFormat::Rgb10a2Unorm,
+        TextureFormat::Rg32Float => wgpu::TextureFormat::Rg32Float,
+        TextureFormat::Rgba32Float => wgpu::TextureFormat::Rgba32Float,
+        TextureFormat::Rg32Uint => wgpu::TextureFormat::Rg32Uint,
+        TextureFormat::Rg11b10Float => wgpu::TextureFormat::Rg11b10Ufloat,
+        TextureFormat::Bc1 => wgpu::TextureFormat::Bc1RgbaUnorm,
+        TextureFormat::Bc4 => wgpu::TextureFormat::Bc4RUnorm,
+        TextureFormat::Bc5 => wgpu::TextureFormat::Bc5RgUnorm,
+        TextureFormat::Bc7 => wgpu::TextureFormat::Bc7RgbaUnorm,
+        TextureFormat::Etc2Rgb8 => wgpu::TextureFormat::Etc2Rgb8Unorm,
+        TextureFormat::Astc4x4 => wgpu::TextureFormat::Astc {
+            block: wgpu::AstcBlock::B4x4,
+            channel: wgpu::AstcChannel::Unorm,
+        },
     }
 }
 
@@ -147,9 +208,85 @@ fn colour_format(b: &ResourceBinding) -> TextureFormat {
     b.format.expect("the manifest's parser gives every colour texture binding its format")
 }
 
-/// A texture binding's view: 3D or 2D.
+/// A texture binding's view dimension.
 fn view_dimension(kind: BindingKind) -> wgpu::TextureViewDimension {
-    if kind.is_3d() { wgpu::TextureViewDimension::D3 } else { wgpu::TextureViewDimension::D2 }
+    match kind.dimension() {
+        Some("3d") => wgpu::TextureViewDimension::D3,
+        Some("2d-array") => wgpu::TextureViewDimension::D2Array,
+        Some("cube") => wgpu::TextureViewDimension::Cube,
+        _ => wgpu::TextureViewDimension::D2,
+    }
+}
+
+/// A blend's components, in wgpu's terms (`Blend::components`, WebGPU's names).
+fn wgpu_blend(b: Blend) -> Option<wgpu::BlendState> {
+    let factor = |name: &str| match name {
+        "zero" => wgpu::BlendFactor::Zero,
+        "one" => wgpu::BlendFactor::One,
+        "src-alpha" => wgpu::BlendFactor::SrcAlpha,
+        "one-minus-src-alpha" => wgpu::BlendFactor::OneMinusSrcAlpha,
+        "dst" => wgpu::BlendFactor::Dst,
+        "dst-alpha" => wgpu::BlendFactor::DstAlpha,
+        other => unreachable!("Blend::components names no factor `{other}`"),
+    };
+    let operation = |name: &str| match name {
+        "add" => wgpu::BlendOperation::Add,
+        "min" => wgpu::BlendOperation::Min,
+        "max" => wgpu::BlendOperation::Max,
+        other => unreachable!("Blend::components names no operation `{other}`"),
+    };
+    let component = |(src, dst, op): wrela_abi::manifest::BlendComponent| wgpu::BlendComponent {
+        src_factor: factor(src),
+        dst_factor: factor(dst),
+        operation: operation(op),
+    };
+    b.components()
+        .map(|(color, alpha)| wgpu::BlendState { color: component(color), alpha: component(alpha) })
+}
+
+/// The wgpu feature of a WebGPU feature's name, for those the hosts request.
+pub(crate) fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
+    Some(match name {
+        "shader-f16" => wgpu::Features::SHADER_F16,
+        "subgroups" => wgpu::Features::SUBGROUP,
+        "texture-compression-bc" => wgpu::Features::TEXTURE_COMPRESSION_BC,
+        "texture-compression-etc2" => wgpu::Features::TEXTURE_COMPRESSION_ETC2,
+        "texture-compression-astc" => wgpu::Features::TEXTURE_COMPRESSION_ASTC,
+        "float32-filterable" => wgpu::Features::FLOAT32_FILTERABLE,
+        "float32-blendable" => wgpu::Features::FLOAT32_BLENDABLE,
+        "rg11b10ufloat-renderable" => wgpu::Features::RG11B10UFLOAT_RENDERABLE,
+        "bgra8unorm-storage" => wgpu::Features::BGRA8UNORM_STORAGE,
+        "timestamp-query" => wgpu::Features::TIMESTAMP_QUERY,
+        "indirect-first-instance" => wgpu::Features::INDIRECT_FIRST_INSTANCE,
+        // wgpu draws several indirect draws in one call on every backend.
+        "chromium-experimental-multi-draw-indirect" => wgpu::Features::empty(),
+        _ => return None,
+    })
+}
+
+/// Every optional feature the native host requests where the adapter has it.
+fn optional_features() -> wgpu::Features {
+    wrela_abi::FEATURES
+        .iter()
+        .filter_map(|f| wgpu_feature(f))
+        .fold(wgpu::Features::empty(), |a, b| a | b)
+}
+
+/// The feature bits a program sees (`wrela_abi::Limits::features`) of a device with these
+/// features, less any `masked` (test mode's mask: a program's fallback paths, measured).
+pub(crate) fn feature_bits(features: wgpu::Features, keep: Option<&[String]>) -> u32 {
+    wrela_abi::FEATURES
+        .iter()
+        .filter(|name| match wgpu_feature(name) {
+            Some(f) if f.is_empty() => true,
+            Some(f) => features.contains(f),
+            None => false,
+        })
+        .filter(|name| {
+            **name == "indirect-first-instance" || keep.is_none_or(|k| k.iter().any(|x| x == *name))
+        })
+        .filter_map(|name| wrela_abi::feature_bit(name))
+        .fold(0, |a, b| a | b)
 }
 
 /// How a shader reads a colour texture of format `f`: filtered floats, unfiltered floats, or
@@ -178,13 +315,54 @@ fn wgpu_compare(c: Compare) -> wgpu::CompareFunction {
 /// A live resource the program made.
 enum Resource {
     Buffer(wgpu::Buffer),
-    Texture { view: wgpu::TextureView, texture: wgpu::Texture, format: TextureFormat },
+    Texture(Texture),
     Sampler(wgpu::Sampler),
 }
 
-/// The target formats a render pipeline is made for: a colour format (or none), and a depth
-/// format (or none).
-type Targets = (Option<wgpu::TextureFormat>, Option<wgpu::TextureFormat>);
+/// A live texture, and the views of it that bindings and passes have asked for.
+struct Texture {
+    texture: wgpu::Texture,
+    format: TextureFormat,
+    /// Its views, by the view and its dimension: made once each.
+    views: std::cell::RefCell<HashMap<(View, wgpu::TextureViewDimension, bool), wgpu::TextureView>>,
+}
+
+impl Texture {
+    /// A view of `view`'s levels and layers in `dimension` (`storage`: one level, the first if
+    /// it names none, as a storage binding takes).
+    fn view(
+        &self,
+        view: View,
+        dimension: wgpu::TextureViewDimension,
+        storage: bool,
+    ) -> wgpu::TextureView {
+        let key = (view, dimension, storage);
+        if let Some(v) = self.views.borrow().get(&key) {
+            return v.clone();
+        }
+        let level = view.level.or(storage.then_some(0));
+        let made = self.texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(dimension),
+            base_mip_level: level.unwrap_or(0),
+            mip_level_count: level.map(|_| 1),
+            base_array_layer: view.layer.unwrap_or(0),
+            array_layer_count: view.layer.map(|_| 1),
+            ..Default::default()
+        });
+        self.views.borrow_mut().insert(key, made.clone());
+        made
+    }
+
+    /// The 2D view of one level and layer: a pass's target.
+    fn target(&self, level: u32, layer: u32) -> wgpu::TextureView {
+        let dimension = wgpu::TextureViewDimension::D2;
+        self.view(View { level: Some(level), layer: Some(layer) }, dimension, false)
+    }
+}
+
+/// The target formats a render pipeline is made for: its colour formats (none in a pass that
+/// draws only depths), and a depth format (or none).
+type Targets = (Vec<wgpu::TextureFormat>, Option<wgpu::TextureFormat>);
 
 pub(crate) struct Pipeline {
     name: String,
@@ -204,14 +382,17 @@ enum Kind {
         pipeline_layout: wgpu::PipelineLayout,
         vertex: String,
         fragment: String,
-        /// Its colour is drawn over the target's (the manifest's `blend`).
-        blend: bool,
+        /// How each colour output meets its target's (the manifest's `blends`).
+        blends: Vec<Blend>,
         /// The manifest's `cull`, `depth_bias` and `depth`.
         cull: Cull,
         depth_bias: DepthBias,
         depth: DepthState,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
+    /// Its shader needs device features this device hasn't (the manifest's `requires`): the
+    /// checker refuses a command that records it.
+    Unavailable,
 }
 
 /// A cached bind group: its pipeline, and the bindings it holds.
@@ -234,6 +415,31 @@ enum DrawHow {
         buffer: u32,
         offset: u32,
     },
+    Indexed {
+        indices: u32,
+        at: u32,
+        size: u32,
+        count: u32,
+        instances: u32,
+        first: u32,
+        base_vertex: i32,
+        first_instance: u32,
+    },
+    /// `count` indirect draws, their arguments one after another from `offset`, indexed when
+    /// it has `indices` (`[handle, at, size]`).
+    Multi {
+        indices: Option<[u32; 3]>,
+        buffer: u32,
+        offset: u32,
+        count: u32,
+    },
+}
+
+/// What a pass records, in order: draws, and the scissors and viewports set between them.
+enum PassItem {
+    Draw(PendingDraw),
+    Scissor([u32; 4]),
+    Viewport([f32; 6]),
 }
 
 struct PendingDraw {
@@ -246,7 +452,7 @@ struct PendingDraw {
 /// A pass between its beginning and `Present` or `EndPass`, and the name the program gave it.
 struct OpenPass {
     pass: Pass,
-    draws: Vec<PendingDraw>,
+    draws: Vec<PassItem>,
     label: Option<Arc<str>>,
     /// Built only when another pass asks to join; extended with each compatible join.
     uses: Option<HashMap<u32, bool>>,
@@ -303,9 +509,11 @@ impl Ring {
     }
 
     /// Writes this submission's staged bytes to the buffer.
-    fn write(&mut self, queue: &wgpu::Queue) {
+    fn write(&mut self, queue: &wgpu::Queue, counters: &mut Counters) {
         if !self.staging.is_empty() {
             queue.write_buffer(&self.buffer, 0, &self.staging);
+            counters.write_buffers += 1;
+            counters.write_buffer_bytes += self.staging.len() as u64;
             self.staging.clear();
         }
     }
@@ -338,7 +546,56 @@ struct Timed {
     label: String,
 }
 
+/// What the executor did below the recorded stream, since its counters were last taken: the
+/// physical half of a frame's draw count (G-draws), as the browser's `counters.json` has it. A
+/// multi-draw is one `draw_calls` and its `count` `draws` (wgpu draws it in one call).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub compute_passes: u32,
+    pub render_passes: u32,
+    pub dispatches: u32,
+    pub draws: u32,
+    pub draw_calls: u32,
+    pub write_buffers: u32,
+    pub write_buffer_bytes: u64,
+    pub write_textures: u32,
+    pub bind_groups: u32,
+    pub pipelines: u32,
+}
+
+impl Counters {
+    fn add(&mut self, o: &Counters) {
+        self.compute_passes += o.compute_passes;
+        self.render_passes += o.render_passes;
+        self.dispatches += o.dispatches;
+        self.draws += o.draws;
+        self.draw_calls += o.draw_calls;
+        self.write_buffers += o.write_buffers;
+        self.write_buffer_bytes += o.write_buffer_bytes;
+        self.write_textures += o.write_textures;
+        self.bind_groups += o.bind_groups;
+        self.pipelines += o.pipelines;
+    }
+
+    /// Its fields by name, in order: what reports and tests list.
+    pub fn fields(&self) -> [(&'static str, u64); 10] {
+        [
+            ("compute_passes", u64::from(self.compute_passes)),
+            ("render_passes", u64::from(self.render_passes)),
+            ("dispatches", u64::from(self.dispatches)),
+            ("draws", u64::from(self.draws)),
+            ("draw_calls", u64::from(self.draw_calls)),
+            ("write_buffers", u64::from(self.write_buffers)),
+            ("write_buffer_bytes", self.write_buffer_bytes),
+            ("write_textures", u64::from(self.write_textures)),
+            ("bind_groups", u64::from(self.bind_groups)),
+            ("pipelines", u64::from(self.pipelines)),
+        ]
+    }
+}
+
 pub(crate) struct Gpu {
+    counters: Counters,
     device: wgpu::Device,
     queue: wgpu::Queue,
     limits: wgpu::Limits,
@@ -390,6 +647,8 @@ pub(crate) struct Gpu {
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
     /// `debug_flag`), read after each frame.
     debug_flag: Option<DebugFlag>,
+    /// The optional features the program sees ([`feature_bits`]).
+    feature_bits: u32,
 }
 
 /// The flag a debug build's bounds checks set, and the buffer it's read back through, made
@@ -415,6 +674,7 @@ pub(crate) fn limits_of(l: &wgpu::Limits) -> wrela_abi::Limits {
             l.max_compute_workgroup_size_z,
         ],
         max_workgroups_per_dimension: l.max_compute_workgroups_per_dimension,
+        ..wrela_abi::Limits::DEFAULT
     }
 }
 
@@ -479,10 +739,29 @@ impl Gpu {
         if timestamps {
             features |= wgpu::Features::TIMESTAMP_QUERY;
         }
-        // Timestamps wherever the adapter has them: a program may ask for its work's time.
-        let (device, queue) =
-            open_device_with("wrela-host", features, wgpu::Features::TIMESTAMP_QUERY)?;
+        // Every optional feature wherever the adapter has it (timestamps too: a program may ask
+        // for its work's time). `WRELA_FEATURES` (`none`, or a comma list of the ones to keep)
+        // masks them, as test mode's `features=` does in a browser: the device is opened without
+        // the masked ones, so its pipelines and commands are a device's without them, though the
+        // adapter has them. Timestamps stay, which a profile's timing needs.
+        let keep: Option<Vec<String>> = std::env::var("WRELA_FEATURES").ok().map(|v| {
+            if v == "none" {
+                Vec::new()
+            } else {
+                v.split(',').map(|f| f.trim().to_string()).collect()
+            }
+        });
+        let optional = match &keep {
+            None => optional_features(),
+            Some(kept) => wrela_abi::FEATURES
+                .iter()
+                .filter(|f| **f == "timestamp-query" || kept.iter().any(|k| k == *f))
+                .filter_map(|f| wgpu_feature(f))
+                .fold(wgpu::Features::empty(), |a, b| a | b),
+        };
+        let (device, queue) = open_device_with("wrela-host", features, optional)?;
         let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let feature_bits = feature_bits(device.features(), keep.as_deref());
 
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -508,6 +787,7 @@ impl Gpu {
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
+            counters: Counters::default(),
             device,
             queue,
             limits,
@@ -536,6 +816,7 @@ impl Gpu {
             errors,
             frame: 0,
             debug_flag: None,
+            feature_bits,
         };
         gpu.take_pipelines(manifest, shaders)?;
         Ok(gpu)
@@ -792,8 +1073,13 @@ impl Builder {
                     };
                     (ty, visibility)
                 }
-                BindingKind::Texture | BindingKind::DepthTexture | BindingKind::Texture3d => {
-                    let sample_type = if b.kind == BindingKind::DepthTexture {
+                BindingKind::Texture
+                | BindingKind::DepthTexture
+                | BindingKind::Texture3d
+                | BindingKind::TextureArray
+                | BindingKind::TextureCube
+                | BindingKind::DepthTextureArray => {
+                    let sample_type = if b.kind.is_depth() {
                         wgpu::TextureSampleType::Depth
                     } else {
                         sample_type(colour_format(b))
@@ -812,7 +1098,9 @@ impl Builder {
                     (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), all)
                 }
                 // Only a kernel writes a texture's texels.
-                BindingKind::StorageTexture | BindingKind::StorageTexture3d => {
+                BindingKind::StorageTexture
+                | BindingKind::StorageTexture3d
+                | BindingKind::StorageTextureArray => {
                     let ty = wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu_format(colour_format(b)),
@@ -829,6 +1117,11 @@ impl Builder {
             });
         }
 
+        // A shader that needs a feature this device hasn't isn't built: the checker refuses a
+        // command that records it, naming the feature.
+        let features = self.device.features();
+        let unavailable =
+            p.requires.iter().any(|f| wgpu_feature(f).is_none_or(|w| !features.contains(w)));
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&p.name),
@@ -839,55 +1132,74 @@ impl Builder {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(&p.shader),
-            source: wgpu::ShaderSource::Wgsl(source.into()),
-        });
-        let kind = match &p.stage {
-            Stage::Compute { entry, .. } => Kind::Compute(self.device.create_compute_pipeline(
-                &wgpu::ComputePipelineDescriptor {
-                    label: Some(&p.name),
-                    layout: Some(&pipeline_layout),
-                    module: &module,
-                    entry_point: Some(entry),
-                    compilation_options: Default::default(),
-                    cache: None,
-                },
-            )),
-            Stage::Render {
-                vertex_entry,
-                fragment_entry,
-                blend,
-                cull,
-                depth_bias,
-                depth,
-                targets,
-                ..
-            } => {
-                let mut kind = Kind::Render {
-                    module,
-                    pipeline_layout,
-                    vertex: vertex_entry.clone(),
-                    fragment: fragment_entry.clone(),
-                    blend: *blend,
-                    cull: *cull,
-                    depth_bias: *depth_bias,
-                    depth: *depth,
-                    variants: HashMap::new(),
-                };
-                // A variant for each of its targets (the passes the program draws it in, which
-                // the compiler knows), now: a shader's errors come at load, and no pass waits to
-                // compile one.
-                for t in targets {
-                    let depth = t.depth.then_some(wgpu::TextureFormat::Depth32Float);
-                    render_variant(
-                        &self.device,
-                        &p.name,
-                        &mut kind,
-                        (t.color.map(wgpu_format), depth),
-                    );
+        let kind = if unavailable {
+            Kind::Unavailable
+        } else {
+            let module = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&p.shader),
+                source: wgpu::ShaderSource::Wgsl(source.into()),
+            });
+            match &p.stage {
+                Stage::Compute { entry, .. } => Kind::Compute(self.device.create_compute_pipeline(
+                    &wgpu::ComputePipelineDescriptor {
+                        label: Some(&p.name),
+                        layout: Some(&pipeline_layout),
+                        module: &module,
+                        entry_point: Some(entry),
+                        compilation_options: Default::default(),
+                        cache: None,
+                    },
+                )),
+                Stage::Render {
+                    vertex_entry,
+                    fragment_entry,
+                    blends,
+                    cull,
+                    depth_bias,
+                    depth,
+                    targets,
+                    ..
+                } => {
+                    let mut kind = Kind::Render {
+                        module,
+                        pipeline_layout,
+                        vertex: vertex_entry.clone(),
+                        fragment: fragment_entry.clone(),
+                        blends: blends.clone(),
+                        cull: *cull,
+                        depth_bias: *depth_bias,
+                        depth: *depth,
+                        variants: HashMap::new(),
+                    };
+                    // A variant for each of its targets (the passes the program draws it in, which
+                    // the compiler knows), now: a shader's errors come at load, and no pass waits to
+                    // compile one.
+                    for t in targets {
+                        // A target the device can't draw into (rg11b10ufloat without its feature)
+                        // is one the checker refuses a pass of.
+                        if t.colors().any(|c| {
+                            !c.info()
+                                .renderable
+                                .on(|f| wgpu_feature(f).is_some_and(|w| features.contains(w)))
+                        }) {
+                            continue;
+                        }
+                        // Nor one it can't blend into as the pipeline blends (a 32-bit float
+                        // target without float32-blendable): the checker refuses such a draw.
+                        if t.colors().enumerate().any(|(k, c)| {
+                            blends.get(k).is_some_and(|&b| b != Blend::Replace)
+                                && !c.info().blendable.on(|f: &str| {
+                                    wgpu_feature(f).is_some_and(|w| features.contains(w))
+                                })
+                        }) {
+                            continue;
+                        }
+                        let depth = t.depth.then_some(wgpu::TextureFormat::Depth32Float);
+                        let colors = t.colors().map(wgpu_format).collect();
+                        render_variant(&self.device, &p.name, &mut kind, (colors, depth));
+                    }
+                    kind
                 }
-                kind
             }
         };
         if let Some(e) = pollster::block_on(scope.pop()) {
@@ -937,6 +1249,11 @@ impl Gpu {
         self.label = None;
     }
 
+    /// What it did since the last take.
+    pub(crate) fn take_counters(&mut self) -> Counters {
+        std::mem::take(&mut self.counters)
+    }
+
     pub(crate) fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
         self.flush()?;
         self.collect()?;
@@ -976,10 +1293,20 @@ impl Gpu {
         }
     }
 
-    /// The texture `handle`, its view and its format.
-    fn texture(&self, handle: u32) -> (&wgpu::Texture, &wgpu::TextureView, TextureFormat) {
+    /// The texture `handle`.
+    /// A texture pass's targets' size: its first colour target's level, or its depth's.
+    fn pass_size(&self, pass: &Pass) -> (u32, u32) {
+        let (handle, level) = match pass.colors().first() {
+            Some(c) => (c.texture, c.level),
+            None => (pass.depth, 0),
+        };
+        let t = &self.texture(handle).texture;
+        ((t.width() >> level).max(1), (t.height() >> level).max(1))
+    }
+
+    fn texture(&self, handle: u32) -> &Texture {
         match &self.resources[&handle] {
-            Resource::Texture { texture, view, format } => (texture, view, *format),
+            Resource::Texture(t) => t,
             _ => unreachable!("the checker checked {handle} is a texture"),
         }
     }
@@ -990,6 +1317,8 @@ impl Gpu {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
+        // Texture bindings' views, made first: an entry borrows its view.
+        let mut views = Vec::new();
         let mut entries = Vec::with_capacity(
             bindings.len() + usize::from(p.uniform.is_some()) + usize::from(p.debug_flag.is_some()),
         );
@@ -1010,10 +1339,22 @@ impl Gpu {
                     offset: u64::from(b.offset),
                     size: NonZeroU64::new(u64::from(b.size)),
                 }),
-                Resource::Texture { view, .. } => wgpu::BindingResource::TextureView(view),
+                Resource::Texture(t) => {
+                    let view = View::of_words(b.offset, b.size);
+                    views.push(t.view(view, view_dimension(slot.kind), slot.kind.is_storage()));
+                    continue;
+                }
                 Resource::Sampler(s) => wgpu::BindingResource::Sampler(s),
             };
             entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
+        }
+        let mut view_at = views.iter();
+        for (b, slot) in bindings.iter().zip(&p.bindings) {
+            if matches!(self.resources[&b.handle], Resource::Texture(_)) {
+                let view = view_at.next().expect("a view for each texture binding");
+                let resource = wgpu::BindingResource::TextureView(view);
+                entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
+            }
         }
         if let (Some(binding), Some(flag)) = (p.debug_flag, &self.debug_flag) {
             let resource = flag.buffer.as_entire_binding();
@@ -1106,8 +1447,8 @@ impl Gpu {
             debug_assert!(self.ring.staging.is_empty() && self.upload.staging.is_empty());
             return Ok(());
         };
-        self.ring.write(&self.queue);
-        self.upload.write(&self.queue);
+        self.ring.write(&self.queue, &mut self.counters);
+        self.upload.write(&self.queue, &mut self.counters);
         self.queue.submit([encoder.finish()]);
         // The serial mode reads its timestamps once a frame (`collect`), so nothing waits
         // between its submissions and the GPU keeps its clocks.
@@ -1151,19 +1492,23 @@ impl Gpu {
         self.resources.insert(handle, Resource::Buffer(buffer));
     }
 
-    /// A texture `size[0]` × `size[1]`, and `size[2]` deep for a 3D one (0 for a 2D one). A 3D
-    /// one is never a pass's target.
+    /// A texture `size[0]` × `size[1]` of `kind`, `size[2]` deep (a 3D one) or layers (an
+    /// array's, a cube's 6, a 2D one's 1), with `levels` mip levels.
     fn create_texture(
         &mut self,
         handle: u32,
         size: [u32; 3],
         format: TextureFormat,
         writable: bool,
+        kind: TextureKind,
+        levels: u32,
     ) {
         let [width, height, depth] = size;
-        let three = depth > 0;
+        let three = kind == TextureKind::D3;
+        let features = self.device.features();
+        let has = |f: &str| wgpu_feature(f).is_some_and(|w| features.contains(w));
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
-        if !three {
+        if !three && format.info().renderable.on(has) {
             usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
         }
         if !format.is_depth() {
@@ -1177,15 +1522,15 @@ impl Gpu {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(&format!("texture {handle}")),
             size: wgpu::Extent3d { width, height, depth_or_array_layers: depth.max(1) },
-            mip_level_count: 1,
+            mip_level_count: levels,
             sample_count: 1,
             dimension: if three { wgpu::TextureDimension::D3 } else { wgpu::TextureDimension::D2 },
             format: wgpu_format(format),
             usage,
             view_formats: &[],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        self.resources.insert(handle, Resource::Texture { view, texture, format });
+        let views = std::cell::RefCell::new(HashMap::new());
+        self.resources.insert(handle, Resource::Texture(Texture { texture, format, views }));
     }
 
     fn create_sampler(
@@ -1194,6 +1539,8 @@ impl Gpu {
         linear: bool,
         repeat: bool,
         compare: Option<Compare>,
+        mip_linear: bool,
+        anisotropy: u32,
     ) {
         let filter = if linear { wgpu::FilterMode::Linear } else { wgpu::FilterMode::Nearest };
         let address =
@@ -1205,7 +1552,12 @@ impl Gpu {
             address_mode_w: address,
             mag_filter: filter,
             min_filter: filter,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: if mip_linear {
+                wgpu::MipmapFilterMode::Linear
+            } else {
+                wgpu::MipmapFilterMode::Nearest
+            },
+            anisotropy_clamp: anisotropy.clamp(1, 16) as u16,
             compare: compare.map(wgpu_compare),
             ..Default::default()
         });
@@ -1223,6 +1575,8 @@ impl Gpu {
             // Work recorded before this write must see the old contents.
             self.flush()?;
             self.queue.write_buffer(self.buffer(handle), u64::from(offset), data);
+            self.counters.write_buffers += 1;
+            self.counters.write_buffer_bytes += len;
             return Ok(());
         }
         let at = self.reserve_upload(len, 1)?;
@@ -1254,9 +1608,13 @@ impl Gpu {
         Ok(0)
     }
 
+    /// Texels into level `level`, layer `layer` of a texture: `size` texels from `origin`, rows
+    /// of blocks of a compressed format.
     fn write_texture(
         &mut self,
         handle: u32,
+        level: u32,
+        layer: u32,
         origin: [u32; 2],
         size: [u32; 2],
         data: &[u8],
@@ -1264,23 +1622,34 @@ impl Gpu {
         if data.is_empty() {
             return Ok(());
         }
-        let row = u64::from(size[0]) * u64::from(self.texture(handle).2.bytes_per_texel());
+        let format = self.texture(handle).format;
+        let block = format.block();
+        let row = u64::from(size[0].div_ceil(block)) * u64::from(format.bytes_per_texel());
+        let rows = size[1].div_ceil(block);
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let bytes = padded * u64::from(size[1]);
-        let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
-        let origin = wgpu::Origin3d { x: origin[0], y: origin[1], z: 0 };
+        let bytes = padded * u64::from(rows);
+        let extent = whole_blocks(format, size[0], size[1]);
+        let at_texel = wgpu::Origin3d { x: origin[0], y: origin[1], z: layer };
+        fn image(
+            t: &wgpu::Texture,
+            origin: wgpu::Origin3d,
+            level: u32,
+        ) -> wgpu::TexelCopyTextureInfo<'_> {
+            wgpu::TexelCopyTextureInfo { origin, mip_level: level, ..t.as_image_copy() }
+        }
         if bytes > u64::from(stream::UPLOAD_MAX) {
             self.flush()?;
             self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { origin, ..self.texture(handle).0.as_image_copy() },
+                image(&self.texture(handle).texture, at_texel, level),
                 data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(row as u32),
-                    rows_per_image: Some(size[1]),
+                    rows_per_image: Some(rows),
                 },
                 extent,
             );
+            self.counters.write_textures += 1;
             return Ok(());
         }
         let at = self.reserve_upload(bytes, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))?;
@@ -1297,21 +1666,79 @@ impl Gpu {
             }
         }
         let mut encoder = self.take_encoder();
-        let texture = self.texture(handle).0;
+        let texture = &self.texture(handle).texture;
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.upload.buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: at,
                     bytes_per_row: Some(padded as u32),
-                    rows_per_image: Some(size[1]),
+                    rows_per_image: Some(rows),
                 },
             },
-            wgpu::TexelCopyTextureInfo { origin, ..texture.as_image_copy() },
+            image(texture, at_texel, level),
             extent,
         );
         self.encoder = Some(encoder);
         Ok(())
+    }
+
+    /// One level and layer of a texture, as a copy names it, from its corner.
+    fn image_copy(
+        &self,
+        texture: u32,
+        level: u32,
+        layer: u32,
+        x: u32,
+        y: u32,
+    ) -> wgpu::TexelCopyTextureInfo<'_> {
+        wgpu::TexelCopyTextureInfo {
+            origin: wgpu::Origin3d { x, y, z: layer },
+            mip_level: level,
+            ..self.texture(texture).texture.as_image_copy()
+        }
+    }
+
+    fn copy_texture(&mut self, source: &TexelRect, destination: &stream::TexelAt) {
+        let mut encoder = self.take_encoder();
+        let extent = whole_blocks(self.texture(source.texture).format, source.width, source.height);
+        let (s, d) = (source, destination);
+        encoder.copy_texture_to_texture(
+            self.image_copy(s.texture, s.level, s.layer, s.x, s.y),
+            self.image_copy(d.texture, d.level, d.layer, d.x, d.y),
+            extent,
+        );
+        self.encoder = Some(encoder);
+    }
+
+    /// A copy between a texture's rectangle `r` and a buffer's rows from `offset`,
+    /// `bytes_per_row` apart: into the buffer (`to_buffer`), or out of it.
+    fn copy_rows(
+        &mut self,
+        r: &TexelRect,
+        buffer: u32,
+        offset: u32,
+        bytes_per_row: u32,
+        to_buffer: bool,
+    ) {
+        let mut encoder = self.take_encoder();
+        let extent = whole_blocks(self.texture(r.texture).format, r.width, r.height);
+        let rows = r.height.div_ceil(self.texture(r.texture).format.block());
+        let rows = wgpu::TexelCopyBufferInfo {
+            buffer: self.buffer(buffer),
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: u64::from(offset),
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows),
+            },
+        };
+        let image = self.image_copy(r.texture, r.level, r.layer, r.x, r.y);
+        if to_buffer {
+            encoder.copy_texture_to_buffer(image, rows, extent);
+        } else {
+            encoder.copy_buffer_to_texture(rows, image, extent);
+        }
+        self.encoder = Some(encoder);
     }
 
     fn copy_buffer(&mut self, from: u32, from_offset: u32, to: u32, to_offset: u32, size: u32) {
@@ -1357,6 +1784,10 @@ impl Gpu {
         });
         pass.set_pipeline(compute);
         pass.set_bind_group(0, &bind_group, offset.as_slice());
+        self.counters.compute_passes += 1;
+        self.counters.dispatches += 1;
+        self.counters.pipelines += 1;
+        self.counters.bind_groups += 1;
         match groups {
             Ok([x, y, z]) => pass.dispatch_workgroups(x, y, z),
             Err((buffer, at)) => {
@@ -1389,7 +1820,11 @@ impl Gpu {
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
         let draw =
             PendingDraw { pipeline, how, bindings: bindings.to_vec(), uniforms: uniforms.to_vec() };
-        self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(draw);
+        self.pass_item(PassItem::Draw(draw));
+    }
+
+    fn pass_item(&mut self, item: PassItem) {
+        self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(item);
     }
 
     /// Joining keeps WebGPU's resource usage scope too. Two individually valid passes may
@@ -1409,12 +1844,13 @@ impl Gpu {
         self.add_uses(&next.draws, ended.uses.as_mut().expect("built above"))
     }
 
-    fn add_uses(&self, draws: &[PendingDraw], uses: &mut HashMap<u32, bool>) -> bool {
+    fn add_uses(&self, draws: &[PassItem], uses: &mut HashMap<u32, bool>) -> bool {
         let mut compatible = |handle, write| match uses.insert(handle, write) {
             Some(before) => before == write,
             None => true,
         };
-        for draw in draws {
+        for item in draws {
+            let PassItem::Draw(draw) = item else { continue };
             for (binding, slot) in
                 draw.bindings.iter().zip(&self.pipelines[draw.pipeline as usize].bindings)
             {
@@ -1439,6 +1875,18 @@ impl Gpu {
                         return false;
                     }
                 }
+                DrawHow::Indexed { indices, .. } => {
+                    if !compatible(indices, false) {
+                        return false;
+                    }
+                }
+                DrawHow::Multi { indices, buffer, .. } => {
+                    if !compatible(buffer, false)
+                        || indices.is_some_and(|i| !compatible(i[0], false))
+                    {
+                        return false;
+                    }
+                }
             }
         }
         true
@@ -1455,6 +1903,19 @@ impl Gpu {
         if op == Opcode::EndPass && !serial {
             if let Some(mut ended) = self.ended.take() {
                 if self.can_join(&mut ended, &open) {
+                    // A pass begins with the whole target its scissor and viewport: where the
+                    // one it joins set either, the joined draws start from the whole target.
+                    if ended
+                        .draws
+                        .iter()
+                        .any(|d| matches!(d, PassItem::Scissor(_) | PassItem::Viewport(_)))
+                    {
+                        let (w, h) = self.pass_size(&ended.pass);
+                        ended.draws.push(PassItem::Scissor([0, 0, w, h]));
+                        ended
+                            .draws
+                            .push(PassItem::Viewport([0.0, 0.0, w as f32, h as f32, 0.0, 1.0]));
+                    }
                     ended.draws.append(&mut open.draws);
                     self.ended = Some(ended);
                     return Ok(());
@@ -1478,65 +1939,91 @@ impl Gpu {
     /// Records a pass's draws into one render pass.
     fn record_pass(&mut self, op: Opcode, open: OpenPass) -> Result<()> {
         let pass = open.pass;
-        let on_screen = pass.color == stream::SCREEN;
+        let on_screen = pass.on_screen();
         if on_screen && self.screen.is_none() {
             return Err(Error::command(
                 op,
                 "there's no screen: the host draws only while running frames",
             ));
         }
-        let format_of = |h: u32| wgpu_format(self.texture(h).2);
-        let color_format = match pass.color {
-            stream::SCREEN => Some(SCREEN_FORMAT),
-            stream::NONE => None,
-            h => Some(format_of(h)),
-        };
-        let depth_format = (pass.depth != stream::NONE).then(|| format_of(pass.depth));
+        let colors: Vec<wgpu::TextureFormat> = pass
+            .colors()
+            .iter()
+            .map(|c| {
+                if c.texture == stream::SCREEN {
+                    SCREEN_FORMAT
+                } else {
+                    wgpu_format(self.texture(c.texture).format)
+                }
+            })
+            .collect();
+        let depth_format =
+            (pass.depth != stream::NONE).then(|| wgpu_format(self.texture(pass.depth).format));
         // Each draw's pipeline has a variant for these targets, made at load: the checker
         // checked they're among its manifest's.
-        let formats = (color_format, depth_format);
+        let formats = (colors, depth_format);
         // Everything that can flush happens before anything is recorded for this pass.
-        let total = open.draws.iter().map(|d| self.aligned(d.uniforms.len())).sum();
+        let total = open
+            .draws
+            .iter()
+            .map(|d| match d {
+                PassItem::Draw(d) => self.aligned(d.uniforms.len()),
+                _ => 0,
+            })
+            .sum();
         self.reserve_uniforms(op, total)?;
         self.reserve_timestamps()?;
         let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
-        let target = match (pass.color, pass.depth) {
-            (stream::SCREEN, _) | (stream::NONE, stream::NONE) => None,
-            (stream::NONE, depth) => Some(depth),
-            (colour, _) => Some(colour),
+        let target = match (pass.colors().first(), pass.depth) {
+            (Some(c), _) if c.texture == stream::SCREEN => None,
+            (Some(c), _) => Some(c.texture),
+            (None, stream::NONE) => None,
+            (None, depth) => Some(depth),
         };
         if let (Some(name), Some(target)) = (&open.label, target) {
             self.labelled.insert(name.to_string(), target);
         }
         let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label));
-        let [r, g, b, a] = pass.clear.map(f64::from);
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
-            let offset = self.push_uniforms(&d.uniforms);
-            let bind_group = self.bind_group(d.pipeline, &d.bindings);
-            prepared.push((bind_group, offset));
+            if let PassItem::Draw(d) = d {
+                let offset = self.push_uniforms(&d.uniforms);
+                let bind_group = self.bind_group(d.pipeline, &d.bindings);
+                prepared.push((bind_group, offset));
+            }
         }
         let mut encoder = self.take_encoder();
-        let view_of = |h: u32| self.texture(h).1.clone();
-        let color_view = match pass.color {
-            stream::SCREEN => Some(self.screen.as_ref().expect("checked above").view.clone()),
-            stream::NONE => None,
-            h => Some(view_of(h)),
-        };
-        let depth_view = (pass.depth != stream::NONE).then(|| view_of(pass.depth));
-        let color_attachment = color_view.as_ref().map(|view| wgpu::RenderPassColorAttachment {
-            view,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: if pass.keep_color {
-                    wgpu::LoadOp::Load
-                } else {
-                    wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a })
-                },
-                store: wgpu::StoreOp::Store,
-            },
-        });
+        let color_views: Vec<wgpu::TextureView> = pass
+            .colors()
+            .iter()
+            .map(|c| match c.texture {
+                stream::SCREEN => self.screen.as_ref().expect("checked above").view.clone(),
+                h => self.texture(h).target(c.level, c.layer),
+            })
+            .collect();
+        let depth_view = (pass.depth != stream::NONE)
+            .then(|| self.texture(pass.depth).target(0, pass.depth_layer));
+        let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = pass
+            .colors()
+            .iter()
+            .zip(&color_views)
+            .map(|(c, view)| {
+                let [r, g, b, a] = c.clear.map(f64::from);
+                Some(wgpu::RenderPassColorAttachment {
+                    view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: if c.keep {
+                            wgpu::LoadOp::Load
+                        } else {
+                            wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a })
+                        },
+                        store: wgpu::StoreOp::Store,
+                    },
+                })
+            })
+            .collect();
         let depth_attachment =
             depth_view.as_ref().map(|view| wgpu::RenderPassDepthStencilAttachment {
                 view,
@@ -1550,9 +2037,11 @@ impl Gpu {
                 }),
                 stencil_ops: None,
             });
+        // Counted here, and added once the pass, which borrows the executor, has ended.
+        let mut counters = Counters { render_passes: 1, ..Counters::default() };
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
-            color_attachments: &[color_attachment],
+            color_attachments: &color_attachments,
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: timestamps.zip(self.timer.as_ref()).map(|(i, t)| {
                 wgpu::RenderPassTimestampWrites {
@@ -1564,28 +2053,77 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        for (d, (bind_group, offset)) in open.draws.iter().zip(&prepared) {
+        let mut prepared = prepared.iter();
+        for item in &open.draws {
+            let d = match item {
+                PassItem::Scissor([x, y, w, h]) => {
+                    rp.set_scissor_rect(*x, *y, *w, *h);
+                    continue;
+                }
+                PassItem::Viewport([x, y, w, h, min, max]) => {
+                    rp.set_viewport(*x, *y, *w, *h, *min, *max);
+                    continue;
+                }
+                PassItem::Draw(d) => d,
+            };
+            let (bind_group, offset) = prepared.next().expect("prepared for each draw");
             let Kind::Render { variants, .. } = &self.pipelines[d.pipeline as usize].kind else {
                 unreachable!("the checker checked the kind");
             };
             rp.set_pipeline(&variants[&formats]);
             rp.set_bind_group(0, bind_group, offset.as_slice());
+            counters.pipelines += 1;
+            counters.bind_groups += 1;
+            counters.draw_calls += 1;
+            counters.draws += match d.how {
+                DrawHow::Multi { count, .. } => count,
+                _ => 1,
+            };
+            let index = |rp: &mut wgpu::RenderPass<'_>, indices: u32, at: u32, size: u32| {
+                let range = u64::from(at)..u64::from(at) + u64::from(size);
+                rp.set_index_buffer(self.buffer(indices).slice(range), wgpu::IndexFormat::Uint32);
+            };
             match d.how {
                 DrawHow::Direct { vertices, instances } => rp.draw(0..vertices, 0..instances),
                 DrawHow::Indirect { buffer, offset } => {
                     rp.draw_indirect(self.buffer(buffer), u64::from(offset));
                 }
                 DrawHow::IndexedIndirect { indices, at, size, buffer, offset } => {
-                    let range = u64::from(at)..u64::from(at) + u64::from(size);
-                    rp.set_index_buffer(
-                        self.buffer(indices).slice(range),
-                        wgpu::IndexFormat::Uint32,
-                    );
+                    index(&mut rp, indices, at, size);
                     rp.draw_indexed_indirect(self.buffer(buffer), u64::from(offset));
                 }
+                DrawHow::Indexed {
+                    indices,
+                    at,
+                    size,
+                    count,
+                    instances,
+                    first,
+                    base_vertex,
+                    first_instance,
+                } => {
+                    index(&mut rp, indices, at, size);
+                    rp.draw_indexed(
+                        first..first + count,
+                        base_vertex,
+                        first_instance..first_instance + instances,
+                    );
+                }
+                DrawHow::Multi { indices, buffer, offset, count } => match indices {
+                    Some([h, at, size]) => {
+                        index(&mut rp, h, at, size);
+                        rp.multi_draw_indexed_indirect(
+                            self.buffer(buffer),
+                            u64::from(offset),
+                            count,
+                        );
+                    }
+                    None => rp.multi_draw_indirect(self.buffer(buffer), u64::from(offset), count),
+                },
             }
         }
         drop(rp);
+        self.counters.add(&counters);
         self.encoder = Some(encoder);
         if on_screen { self.flush() } else { self.alone() }
     }
@@ -1736,23 +2274,19 @@ impl Gpu {
             .labelled
             .get(label)
             .ok_or_else(|| Error::Gpu(format!("no pass labelled `{label}` drew into a texture")))?;
-        let Some(Resource::Texture { texture, format, .. }) = self.resources.get(&handle) else {
+        let Some(Resource::Texture(Texture { texture, format, .. })) = self.resources.get(&handle)
+        else {
             return Err(Error::Gpu(format!(
                 "the target of the pass labelled `{label}` was dropped after it"
             )));
         };
         let (width, height, format) = (texture.width(), texture.height(), *format);
-        let texel: u64 = match format {
-            TextureFormat::Rgba8 | TextureFormat::Rg16Float | TextureFormat::R32Float => 4,
-            TextureFormat::Depth32Float => 4,
-            TextureFormat::Rgba16Float => 8,
-            TextureFormat::R16Float => 2,
-            TextureFormat::R32Uint => {
-                return Err(Error::Gpu(format!(
-                    "the target of the pass labelled `{label}` holds integers, not an image"
-                )));
-            }
-        };
+        if format.is_uint() || format.is_compressed() {
+            return Err(Error::Gpu(format!(
+                "the target of the pass labelled `{label}` holds integers, not an image"
+            )));
+        }
+        let texel = u64::from(format.bytes_per_texel());
         let row = u64::from(width) * texel;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let staging = self.readback_buffer(padded * u64::from(height));
@@ -1836,27 +2370,109 @@ impl Executor for Gpu {
                 // A label names the passes after it, the next of which may yet continue this one.
                 Command::Label { .. } => {}
                 Command::BeginPass(next) if next.joins(&ended.pass) => {}
-                Command::Draw { .. }
-                | Command::DrawIndirect { .. }
-                | Command::DrawIndexedIndirect { .. }
-                | Command::EndPass
+                Command::SetScissor { .. } | Command::SetViewport { .. } | Command::EndPass
                     if self.pass.is_some() => {}
+                c if c.opcode().is_draw() && self.pass.is_some() => {}
                 _ => self.record_ended()?,
             }
         }
         match cmd {
             Command::CreateBuffer { handle, size } => self.create_buffer(*handle, *size),
-            Command::CreateTexture { handle, width, height, format, writable, depth } => {
-                self.create_texture(*handle, [*width, *height, *depth], *format, *writable)
-            }
-            Command::CreateSampler { handle, linear, repeat, compare } => {
-                self.create_sampler(*handle, *linear, *repeat, *compare)
+            Command::CreateTexture {
+                handle,
+                width,
+                height,
+                format,
+                writable,
+                kind,
+                layers,
+                levels,
+            } => self.create_texture(
+                *handle,
+                [*width, *height, *layers],
+                *format,
+                *writable,
+                *kind,
+                *levels,
+            ),
+            Command::CreateSampler { handle, linear, repeat, compare, mip_linear, anisotropy } => {
+                self.create_sampler(*handle, *linear, *repeat, *compare, *mip_linear, *anisotropy)
             }
             Command::WriteBuffer { handle, offset, data } => {
                 return self.write_buffer(*handle, *offset, data);
             }
-            Command::WriteTexture { handle, x, y, width, height, data } => {
-                return self.write_texture(*handle, [*x, *y], [*width, *height], data);
+            Command::WriteTexture { handle, level, layer, x, y, width, height, data } => {
+                return self.write_texture(
+                    *handle,
+                    *level,
+                    *layer,
+                    [*x, *y],
+                    [*width, *height],
+                    data,
+                );
+            }
+            Command::CopyTexture { source, destination } => self.copy_texture(source, destination),
+            Command::CopyTextureToBuffer { source, buffer, offset, bytes_per_row } => {
+                self.copy_rows(source, *buffer, *offset, *bytes_per_row, true)
+            }
+            Command::CopyBufferToTexture { buffer, offset, bytes_per_row, destination } => {
+                self.copy_rows(destination, *buffer, *offset, *bytes_per_row, false)
+            }
+            Command::SetScissor { x, y, width, height } => {
+                self.pass_item(PassItem::Scissor([*x, *y, *width, *height]))
+            }
+            Command::SetViewport { rect: [x, y, w, h], min_depth, max_depth } => {
+                self.pass_item(PassItem::Viewport([*x, *y, *w, *h, *min_depth, *max_depth]))
+            }
+            Command::DrawIndexed {
+                pipeline,
+                indices,
+                index_offset,
+                index_size,
+                index_count,
+                instances,
+                first_index,
+                base_vertex,
+                first_instance,
+                bindings,
+                uniforms,
+            } => {
+                let how = DrawHow::Indexed {
+                    indices: *indices,
+                    at: *index_offset,
+                    size: *index_size,
+                    count: *index_count,
+                    instances: *instances,
+                    first: *first_index,
+                    base_vertex: *base_vertex,
+                    first_instance: *first_instance,
+                };
+                self.draw(*pipeline, how, bindings, uniforms);
+            }
+            Command::MultiDrawIndirect {
+                pipeline,
+                indices,
+                arguments,
+                offset,
+                count,
+                count_buffer,
+                bindings,
+                uniforms,
+                ..
+            } => {
+                if *count_buffer != stream::NONE {
+                    return Err(Error::command(
+                        cmd.opcode(),
+                        "a draw count read from a buffer isn't supported: give the count",
+                    ));
+                }
+                let how = DrawHow::Multi {
+                    indices: *indices,
+                    buffer: *arguments,
+                    offset: *offset,
+                    count: *count,
+                };
+                self.draw(*pipeline, how, bindings, uniforms);
             }
             Command::CopyBuffer {
                 source,
@@ -1873,15 +2489,9 @@ impl Executor for Gpu {
             Command::DispatchIndirect { pipeline, arguments, offset, bindings, uniforms } => {
                 return self.dispatch(*pipeline, Err((*arguments, *offset)), bindings, uniforms);
             }
-            Command::BeginScreenPass { clear } => self.begin_pass(Pass {
-                color: stream::SCREEN,
-                keep_color: false,
-                join: false,
-                clear: *clear,
-                depth: stream::NONE,
-                keep_depth: false,
-                clear_depth: 1.0,
-            }),
+            Command::BeginScreenPass { clear } => {
+                self.begin_pass(Pass::one(stream::SCREEN, false, *clear))
+            }
             Command::BeginPass(pass) => self.begin_pass(*pass),
             Command::Draw { pipeline, vertices, instances, bindings, uniforms } => {
                 let how = DrawHow::Direct { vertices: *vertices, instances: *instances };
@@ -1973,7 +2583,14 @@ impl Executor for Gpu {
     }
 
     fn limits(&self) -> wrela_abi::Limits {
-        limits_of(&self.limits)
+        let mut l = limits_of(&self.limits);
+        l.features = self.feature_bits;
+        if l.has("subgroups") {
+            let info = self.device.adapter_info();
+            l.subgroup_min_size = info.subgroup_min_size;
+            l.subgroup_max_size = info.subgroup_max_size;
+        }
+        l
     }
 
     /// Finishes the old build's work, forgets its resources, and takes the new build's
@@ -1991,7 +2608,7 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         pipeline_layout,
         vertex,
         fragment,
-        blend,
+        blends,
         cull,
         depth_bias,
         depth,
@@ -2004,24 +2621,18 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
     if variants.contains_key(&targets) {
         return;
     }
-    // Straight alpha, over what's there (the manifest's `blend`).
-    let over = wgpu::BlendState {
-        color: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::SrcAlpha,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-        alpha: wgpu::BlendComponent {
-            src_factor: wgpu::BlendFactor::One,
-            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-            operation: wgpu::BlendOperation::Add,
-        },
-    };
-    let color = targets.0.map(|format| wgpu::ColorTargetState {
-        format,
-        blend: blend.then_some(over),
-        write_mask: wgpu::ColorWrites::ALL,
-    });
+    let colors: Vec<Option<wgpu::ColorTargetState>> = targets
+        .0
+        .iter()
+        .enumerate()
+        .map(|(c, &format)| {
+            Some(wgpu::ColorTargetState {
+                format,
+                blend: wgpu_blend(blends.get(c).copied().unwrap_or_default()),
+                write_mask: wgpu::ColorWrites::ALL,
+            })
+        })
+        .collect();
     let depth_stencil = targets.1.map(|format| wgpu::DepthStencilState {
         format,
         depth_write_enabled: Some(depth.write),
@@ -2057,7 +2668,7 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
             module,
             entry_point: Some(fragment),
             compilation_options: Default::default(),
-            targets: &[color],
+            targets: &colors,
         }),
         multiview_mask: None,
         cache: None,
@@ -2341,6 +2952,7 @@ mod tests {
                 format: None,
             }],
             debug_flag: None,
+            requires: Vec::new(),
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
                       @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
@@ -2395,6 +3007,7 @@ mod tests {
                 format: None,
             }],
             debug_flag: None,
+            requires: Vec::new(),
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
                       @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
@@ -2441,7 +3054,7 @@ mod tests {
         let buffer = gpu.readback_buffer(u64::from(row) * u64::from(height));
         let mut encoder = gpu.take_encoder();
         encoder.copy_texture_to_buffer(
-            gpu.texture(handle).0.as_image_copy(),
+            gpu.texture(handle).texture.as_image_copy(),
             wgpu::TexelCopyBufferInfo {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
@@ -2473,15 +3086,15 @@ mod tests {
             TextureFormat::R32Uint,
         ] {
             let texel = format.bytes_per_texel() as usize;
-            gpu.create_texture(1, [5, 4, 0], format, false);
+            gpu.create_texture(1, [5, 4, 1], format, false, TextureKind::D2, 1);
             let original: Vec<u8> = (0..5 * 4 * texel).map(|i| (i % 251) as u8).collect();
             gpu.write_buffer(2, 0, &[1, 2, 3, 4]).unwrap();
-            gpu.write_texture(1, [0, 0], [5, 4], &original).unwrap();
+            gpu.write_texture(1, 0, 0, [0, 0], [5, 4], &original).unwrap();
             let before = snapshot_texture(&mut gpu, 1, 5, 4, format);
             let replacement: Vec<u8> = (0..3 * 2 * texel).map(|i| 255 - i as u8).collect();
             gpu.write_buffer(2, 0, &[5, 6, 7, 8]).unwrap();
-            gpu.write_texture(1, [1, 1], [3, 2], &replacement).unwrap();
-            gpu.write_texture(1, [0, 0], [0, 4], &[]).unwrap();
+            gpu.write_texture(1, 0, 0, [1, 1], [3, 2], &replacement).unwrap();
+            gpu.write_texture(1, 0, 0, [0, 0], [0, 4], &[]).unwrap();
             let after = snapshot_texture(&mut gpu, 1, 5, 4, format);
             gpu.flush().unwrap();
             let read = |buffer: &wgpu::Buffer| {
@@ -2505,10 +3118,10 @@ mod tests {
         // Padding makes a narrow upload larger than the ring's starting capacity. Growing
         // it must first submit the buffer write already staged there.
         let height = stream::UPLOAD_START / wgpu::COPY_BYTES_PER_ROW_ALIGNMENT + 1;
-        gpu.create_texture(1, [1, height, 0], TextureFormat::Rgba8, false);
+        gpu.create_texture(1, [1, height, 1], TextureFormat::Rgba8, false, TextureKind::D2, 1);
         let original: Vec<u8> = (0..height * 4).map(|i| (i % 251) as u8).collect();
         gpu.write_buffer(2, 0, &[9, 10, 11, 12]).unwrap();
-        gpu.write_texture(1, [0, 0], [1, height], &original).unwrap();
+        gpu.write_texture(1, 0, 0, [0, 0], [1, height], &original).unwrap();
         let snapshot = snapshot_texture(&mut gpu, 1, 1, height, TextureFormat::Rgba8);
         gpu.flush().unwrap();
         let read: Vec<u8> = map_read(&gpu.device, &snapshot)
@@ -2532,6 +3145,7 @@ mod tests {
             uniform: None,
             bindings: Vec::new(),
             debug_flag: None,
+            requires: Vec::new(),
         };
         let key = pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() {}");
         assert_eq!(key, pipeline_key(&p("pipeline_3.wgsl", "main"), "fn main() {}"));
