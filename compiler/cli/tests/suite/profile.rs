@@ -3,6 +3,10 @@
 
 use crate::common;
 
+/// One profiler runs at a time on a machine (its lock), so this file's tests take turns: the
+/// checks run the ignored Chrome test beside the native one.
+static PROFILER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const WORK: &str = "use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch, label}
 use std::time::phase
 
@@ -36,6 +40,7 @@ pub fn frame(w: mut Work, time: f32, width: u32, height: u32) {
 
 #[test]
 fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
+    let _turn = PROFILER.lock().unwrap_or_else(|e| e.into_inner());
     let dir = common::package(
         "profile-work",
         &[("wrela.toml", &common::manifest("work")), ("main.wrela", WORK)],
@@ -190,6 +195,7 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
 #[test]
 #[ignore = "needs a GPU and Chrome"]
 fn profile_in_chrome_reports_what_the_native_report_does() {
+    let _turn = PROFILER.lock().unwrap_or_else(|e| e.into_inner());
     let dir = common::package(
         "profile-chrome",
         &[("wrela.toml", &common::manifest("work")), ("main.wrela", WORK)],
