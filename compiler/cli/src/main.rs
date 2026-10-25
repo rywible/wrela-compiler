@@ -126,7 +126,7 @@ pub(crate) fn usage() -> ExitCode {
         "wrela doc <item> [<package-dir>]",
         "wrela doc --export <dir> [--commit <sha>] [<package-dir>...]",
         "wrela pipelines <package-dir> [--json]",
-        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--chrome [--features none|<list>]] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
+        "wrela profile <package-dir> [--frames n] [--warmup n] [--workers n] [--size WxH] [--input <script.json>] [--scenario name] [--serial] [--chrome [--features none|<list>] [--checked]] [--json] [--baseline <report.json> | --compare <build-dir> [--pairs n]]",
         "wrela test <package-dir> [<filter>] [--exact] [--std] [--bless] [--json]",
         "wrela script <package-dir> <module>::<NAME> [-o <file>]",
         "wrela primer [area]",

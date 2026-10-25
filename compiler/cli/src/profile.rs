@@ -75,6 +75,8 @@ struct Args {
     /// Measure in headless Chrome (`--chrome`), with test mode's feature mask (`--features`).
     chrome: bool,
     features: Option<String>,
+    /// Chrome's command checker on (`--checked`): off by default, as a release build plays.
+    checked: bool,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -93,6 +95,7 @@ fn parse(args: &[String]) -> Option<Args> {
         scenario: String::new(),
         chrome: false,
         features: None,
+        checked: false,
     };
     let mut dir = None;
     let mut it = args.iter();
@@ -114,6 +117,7 @@ fn parse(args: &[String]) -> Option<Args> {
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
             "--serial" => a.serial = true,
             "--chrome" => a.chrome = true,
+            "--checked" => a.checked = true,
             "--features" => {
                 let keep = it.next()?;
                 let plain =
@@ -132,7 +136,7 @@ fn parse(args: &[String]) -> Option<Args> {
     a.dir = dir?;
     a.frames.checked_add(a.warmup)?;
     // The native host's mask is `WRELA_FEATURES`, read as it opens its device.
-    if a.features.is_some() && !a.chrome {
+    if (a.features.is_some() || a.checked) && !a.chrome {
         return None;
     }
     if a.baseline.is_some() && a.compare.is_some() {

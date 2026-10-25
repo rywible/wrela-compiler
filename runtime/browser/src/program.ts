@@ -350,6 +350,11 @@ export interface ProgramOptions {
   /** Keep the state hash of every submitted byte (test mode reads it; it costs a pass over
    * each batch, so a game running normally doesn't keep it). */
   hash?: boolean;
+  /** Check each command against WebGPU's rules before the executor runs it (the default), so
+   * an error names the program's mistake: test mode, debug builds and hot reload. A release
+   * build's normal run doesn't: WebGPU validates, and its `uncapturederror` is fatal. The
+   * sequencer (a pass's commands inside it) checks either way. */
+  checking?: boolean;
   /** Where storage and fetch requests go; without it, they fail. */
   io?: Io;
   /** The builds the program may hand over to; without it, those requests fail. */
@@ -401,6 +406,7 @@ export class Program {
   #pending: Command[] = [];
   /** The phases its own thread times (`std::time::phase`). */
   readonly #phases = new Phases();
+  readonly #checking: boolean;
   #memory: WebAssembly.Memory | null = null;
   /** The memory's maximum, in bytes: what the program reserves. */
   #reserved = 0;
@@ -444,6 +450,7 @@ export class Program {
     options: ProgramOptions,
   ) {
     this.hash = options.hash ? new StateHash() : null;
+    this.#checking = options.checking ?? true;
     this.#io = options.io ?? null;
     this.#builds = options.builds ?? null;
     this.#startVoice = options.startVoice ?? null;
@@ -604,14 +611,10 @@ export class Program {
       if (this.#failed !== null) {
         throw new CommandError(cmd.op, `the host failed to carry out an earlier command (${this.#failed})`);
       }
-      const before = this.#sequencer.copy();
+      // A command the sequencer or the checker refuses fails the call, which puts the
+      // sequencer back as it was before the call (`#call`).
       this.#sequencer.step(cmd);
-      try {
-        this.checker.check(cmd);
-      } catch (e) {
-        this.#sequencer = before;
-        throw e;
-      }
+      if (this.#checking) this.checker.check(cmd);
       if (cmd.op === "HostRequest" && this.#net && cmd.service.startsWith("net/")) {
         this.#netCommand(cmd.service, cmd.body, false);
       } else if ("request" in cmd) {

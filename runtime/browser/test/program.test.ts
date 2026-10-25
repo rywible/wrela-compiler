@@ -1462,3 +1462,85 @@ describe("input", () => {
     expect(inbox.take(8).length).toBe(1);
   });
 });
+
+describe("the checker in release and in test mode", () => {
+  // Writing to a buffer that doesn't exist: the checker's error names it; without the checker
+  // the command reaches the executor, where WebGPU's validation (an `uncapturederror`, fatal
+  // through `openDevice`'s handler as a `GpuError`) stops it.
+  const wrong = new Encoder().writeBuffer(3, 0, new Uint8Array(4)).finish();
+
+  test("checked, as in test mode, a usage error is the checker's message", async () => {
+    const [op, message] = await commandError(wrong);
+    expect(op).toBe("WriteBuffer");
+    expect(message).toContain("3");
+  });
+
+  test("unchecked, as a release build plays, the command goes to WebGPU, whose error is fatal", async () => {
+    const executor = new Recorder();
+    const program = await Program.load(batchProgram([[wrong]]), checker(), executor, { checking: false });
+    expect(() => program.frame(0, 64, 64)).not.toThrow();
+    expect(executor.log).toEqual(["WriteBuffer", "end"]);
+    const { openDevice, GpuError } = await import("../src/device.ts");
+    let failed: Error | null = null;
+    const listeners: ((e: { error: { message: string } }) => void)[] = [];
+    const device = { addEventListener: (_: string, f: (e: { error: { message: string } }) => void) => listeners.push(f), lost: new Promise(() => {}), limits: {} };
+    const original = Object.getOwnPropertyDescriptor(navigator, "gpu");
+    Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter: async () => ({
+      info: { isFallbackAdapter: false }, limits: {}, features: new Set(["indirect-first-instance"]), requestDevice: async () => device,
+    }) } });
+    try {
+      await openDevice((e) => (failed = e));
+      listeners[0]!({ error: { message: "Buffer with '' label is invalid" } });
+      expect(failed).toBeInstanceOf(GpuError);
+      expect(failed!.message).toContain("is invalid");
+    } finally {
+      if (original) Object.defineProperty(navigator, "gpu", original);
+      else delete (navigator as unknown as Record<string, unknown>).gpu;
+    }
+  });
+
+  test("the sequencer checks either way", async () => {
+    const program = await Program.load(batchProgram([[new Encoder().draw(0, 3, 1, [], U16).finish()]]), checker(), new Recorder(), { checking: false });
+    expect(() => program.frame(0, 64, 64)).toThrow("out of sequence");
+  });
+});
+
+test("several uploads in one call each reach their buffer, though the program overwrites its command memory before returning", async () => {
+  const { FakeDevice, fakeTexture } = await import("./fake-gpu.ts");
+  const { buildPipelines, GpuExecutor } = await import("../src/gpu.ts");
+  const { SCREEN_FORMAT } = await import("../src/abi.gen.ts");
+  const device = new FakeDevice();
+  const m = shapes();
+  const pipelines = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => "// fine\n"), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, pipelines, { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  // Two small writes (staged) and a big one (written to the ring from the batch) between them.
+  const want = [
+    Uint8Array.from({ length: 8 }, (_, i) => i + 1),
+    Uint8Array.from({ length: 8192 }, (_, i) => (i * 7) & 255),
+    Uint8Array.from({ length: 12 }, (_, i) => 200 + i),
+  ];
+  const batch = new Encoder().createBuffer(1, 8).createBuffer(2, 8192).createBuffer(3, 12)
+    .writeBuffer(1, 0, want[0]!).writeBuffer(2, 0, want[1]!).writeBuffer(3, 0, want[2]!).finish();
+  // submit(16, len), then memory.fill(16, 0, len): the command memory zeroed before return.
+  const fill = [...op.i32(16), ...op.i32(0), ...op.i32(batch.length), 0xfc, 0x0b, 0x00];
+  const program = await Program.load(buildModule({ imports: [SUBMIT], memory: 1, funcs: [{
+    type: FRAME_TYPE, export: "frame", body: [...op.i32(16), ...op.i32(batch.length), ...op.call(0), ...fill],
+  }], data: [{ offset: 16, bytes: batch }] }), checker(), executor);
+  program.frame(0, 64, 64);
+  // The queue's timeline: a queue write lands when it's made, an encoder's copies at submit.
+  const memory = new Map<string, Uint8Array>();
+  const at = (label: string) => memory.get(label) ?? memory.set(label, new Uint8Array(16384)).get(label)!;
+  let recorded: Extract<(typeof device.events)[number], { kind: "copyBuffer" }>[] = [];
+  for (const e of device.events) {
+    if (e.kind === "writeBuffer") at(e.buffer).set(e.data, e.offset);
+    else if (e.kind === "copyBuffer") recorded.push(e);
+    else if (e.kind === "submit") {
+      for (const c of recorded) at(c.to).set(at(c.from).subarray(c.fromOffset, c.fromOffset + c.size), c.toOffset);
+      recorded = [];
+    }
+  }
+  want.forEach((bytes, i) => expect(at(`buffer ${i + 1}`).subarray(0, bytes.length)).toEqual(bytes));
+  // The big write went to the ring straight from the batch: the staged write before it, it, and
+  // the one after, three queue writes.
+  expect(device.events.filter((e) => e.kind === "writeBuffer" && e.buffer === "upload ring")).toHaveLength(3);
+});

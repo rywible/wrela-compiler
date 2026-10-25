@@ -37,6 +37,7 @@ test("reads every parameter", () => {
     saturate: 0,
     clip: 0,
     clipfrom: 0,
+    checks: 1,
   });
   expect(parseTestParams("#test&clip=600&clipfrom=300")).toEqual({ ...TEST_DEFAULTS, clip: 600, clipfrom: 300 });
   expect(parseTestParams("#test&input=scripts/a.json&latency=40")).toEqual({ ...TEST_DEFAULTS, input: "scripts/a.json", latency: 40 });
@@ -107,4 +108,10 @@ test("test results stay at the page's result endpoint", async () => {
       init: { method: "PUT", body: "private result", redirect: "error" },
     });
   } finally { globalThis.fetch = saved; }
+});
+
+test("checks=0 turns the checker off, as a release build plays; anything but 0 or 1 is refused", () => {
+  expect(parseTestParams("#test&checks=0")!.checks).toBe(0);
+  expect(parseTestParams("#test")!.checks).toBe(1);
+  expect(() => parseTestParams("#test&checks=2")).toThrow("checks=2 must be 0 or 1");
 });

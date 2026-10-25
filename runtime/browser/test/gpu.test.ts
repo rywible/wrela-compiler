@@ -791,7 +791,9 @@ test("commands that wait for a pipeline keep their frame's label; the next frame
   const caughtUp = executor.caughtUp();
   later.resolve(compute!);
   await caughtUp;
-  expect(device.passLabels).toEqual(["look", "look", "compute"]);
+  // The last frame's two dispatches, both labelled, share a compute pass; the next frame's has
+  // its pipeline's name.
+  expect(device.passLabels).toEqual(["look", "compute"]);
 });
 
 test("texture passes waiting for a pipeline keep separate timings in their recorded frames", async () => {
@@ -1197,7 +1199,9 @@ test("the executor counts what it did below the stream, until its counters are t
   for (let i = 3; i < 5; i++) e.draw(0, 3, 1, [1, 2], u(i));
   run(e.present());
   expect(executor.takeCounters()).toEqual({
-    compute_passes: 3,
+    // The three dispatches share a compute pass and its pipeline; each sets its bind group at
+    // its own uniform offset, as each draw does. The two draws share their pipeline.
+    compute_passes: 1,
     render_passes: 1,
     dispatches: 3,
     draws: 2,
@@ -1208,7 +1212,7 @@ test("the executor counts what it did below the stream, until its counters are t
     write_buffer_bytes: 4 * 256 + 16 + 8,
     write_textures: 0,
     bind_groups: 5,
-    pipelines: 5,
+    pipelines: 2,
   });
   expect(executor.takeCounters().draws).toBe(0);
 });

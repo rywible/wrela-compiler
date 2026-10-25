@@ -25,7 +25,9 @@
 // given) for n frames, as a video (`clip.webm`: the main thread's MediaRecorder; paced frames
 // play at their speed). With `features=none` (or a comma list of the ones to keep), the program
 // sees only those optional device features (`std::gpu::features()`), though the device has them
-// all: its fallback paths, measured on a device that has the features.
+// all: its fallback paths, measured on a device that has the features. With `checks=0`, the
+// command checker is off, as in a release build's normal run, where WebGPU's own validation
+// (an `uncapturederror`) is what stops a wrong command: a profile's runs.
 //
 // A program with a ticker (`std::tick::start`) runs it on the lockstep schedule (#43 §2.3):
 // before frame i, the ticks up to ⌊(i + 1)·hz/fps⌋ run, and the frame waits for them, as on
@@ -95,6 +97,9 @@ export interface TestParams {
   /** Frames of the canvas to record as a video (0: none), and the frame it starts at. */
   clip: number;
   clipfrom: number;
+  /** 0: the checker off, as a release build plays (a profile's runs); 1, the default: on, so a
+   * test names the program's mistake. */
+  checks: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -122,6 +127,7 @@ export const TEST_DEFAULTS: TestParams = {
   saturate: 0,
   clip: 0,
   clipfrom: 0,
+  checks: 1,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];
@@ -151,6 +157,11 @@ export function parseTestParams(hash: string): TestParams | null {
         throw new Error(`test parameter input=${value} must be a path relative to the page`);
       }
       params.input = value;
+      continue;
+    }
+    if (key === "checks") {
+      if (value !== "0" && value !== "1") throw new Error(`test parameter checks=${value} must be 0 or 1`);
+      params.checks = Number(value);
       continue;
     }
     if (key === "features") {

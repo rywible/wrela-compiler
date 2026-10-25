@@ -393,7 +393,12 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextur
       device,
       b,
       screen,
-      { ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried), workers: normalWorkers() },
+      {
+        ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried),
+        workers: normalWorkers(),
+        // The checker's messages where a developer reads them: a debug build, hot reload.
+        checking: live !== null || b.manifest.pipelines.some((p) => p.debug_flag !== null),
+      },
       { cache: pipelineCache },
     );
   running = build;
@@ -640,6 +645,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
           carried,
         ),
         hash: hashes,
+        checking: params.checks !== 0,
         workers: params.workers,
         tickHashes,
         onPrint: print,

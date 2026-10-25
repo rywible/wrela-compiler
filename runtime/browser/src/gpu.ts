@@ -531,8 +531,11 @@ function doubled(capacity: number, n: number): number {
 class Ring {
   buffer: GPUBuffer;
   bytes: Bytes;
-  /** The bytes staged so far. */
+  /** The bytes reserved so far this submission. */
   used = 0;
+  /** Where the bytes staged in `bytes` and not yet written begin: a direct write (`direct`)
+   * writes those before it, so a later `write` doesn't write over it. */
+  staged = 0;
 
   constructor(
     readonly device: GPUDevice,
@@ -555,13 +558,30 @@ class Ring {
 
   /** Writes the staged bytes to the buffer, and starts again from 0. */
   write(queue: GPUQueue, counters?: Counters): void {
-    if (this.used === 0) return;
-    queue.writeBuffer(this.buffer, 0, this.bytes, 0, this.used);
+    this.#writeStaged(queue, this.used, counters);
+    this.used = 0;
+    this.staged = 0;
+  }
+
+  /** Writes `data` at `at` (reserved, past every staged byte) straight from where it is, not
+   * through `bytes`: the staged bytes before it first. A queue write is ordered after the work
+   * already submitted and before the submission whose copies read it, as the staged ones are. */
+  direct(queue: GPUQueue, at: number, data: Bytes, counters: Counters): void {
+    this.#writeStaged(queue, at, counters);
+    queue.writeBuffer(this.buffer, at, data);
+    counters.write_buffers++;
+    counters.write_buffer_bytes += data.length;
+    this.staged = at + data.length;
+  }
+
+  #writeStaged(queue: GPUQueue, end: number, counters?: Counters): void {
+    if (end <= this.staged) return;
+    queue.writeBuffer(this.buffer, this.staged, this.bytes, this.staged, end - this.staged);
     if (counters) {
       counters.write_buffers++;
-      counters.write_buffer_bytes += this.used;
+      counters.write_buffer_bytes += end - this.staged;
     }
-    this.used = 0;
+    this.staged = end;
   }
 }
 
@@ -593,6 +613,20 @@ export const noCounters = (): Counters => ({
   bind_groups: 0,
   pipelines: 0,
 });
+
+/** An upload at least this big is written to the ring straight from its batch, not staged: the
+ * copy saved outweighs a queue write's call (§A13: measured on herd and grazer). */
+const DIRECT_UPLOAD = 4096;
+
+/** A compute pass a run of dispatches shares, and what it last set. */
+type OpenCompute = { pass: GPUComputePassEncoder; label: string; pipeline: GPUComputePipeline | null; group: GPUBindGroup | null; offsets: number[] };
+
+/** Whether two dynamic offset lists are the same. */
+function sameOffsets(a: readonly number[], b: readonly number[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
 
 /** Most passes timed in one submission: more flush first. */
 const TIMED_PASSES = 256;
@@ -739,6 +773,9 @@ export class GpuExecutor {
    * `Ring`). */
   readonly #uploads: Ring;
   #encoder: GPUCommandEncoder | null = null;
+  /** The compute pass a run of dispatches shares (untimed: a timed dispatch is its own pass,
+   * for its timestamps), and what it last set; ended by anything else the encoder records. */
+  #compute: OpenCompute | null = null;
   #pass: OpenPass | null = null;
   /** A pass that ended, not yet recorded: the next pass in its frame continues it if it may join
    * it, on the same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
@@ -1240,6 +1277,7 @@ export class GpuExecutor {
    * resources the program destroyed (WebGPU waits for submitted work that uses them). */
   flush(): void {
     this.#recordEnded();
+    this.#endCompute();
     if (this.#encoder !== null) {
       this.#uniforms.write(this.device.queue, this.#counters);
       this.#uploads.write(this.device.queue, this.#counters);
@@ -1371,8 +1409,11 @@ export class GpuExecutor {
     }
     const at = this.#reserveUpload(len, 4);
     const up = this.#uploads;
-    // The bytes are a view into the program's memory: copied now.
-    up.bytes.set(data, at);
+    // The bytes are a view of the batch the program submitted, which the runtime copied out of
+    // its memory and keeps until its commands have run. A big write goes to the ring straight
+    // from it; small ones are staged, so a frame of them is one queue write.
+    if (len >= DIRECT_UPLOAD) up.direct(this.device.queue, at, data, this.#counters);
+    else up.bytes.set(data, at);
     this.#encoderNow().copyBufferToBuffer(up.buffer, at, this.#buffer(handle), offset, len);
   }
 
@@ -1421,10 +1462,31 @@ export class GpuExecutor {
     );
   }
 
+  /** The encoder, for anything but a dispatch: a run of dispatches' compute pass ends first. */
   #encoderNow(): GPUCommandEncoder {
+    this.#endCompute();
     this.#encoder ??= this.device.createCommandEncoder();
     return this.#encoder;
   }
+
+  #endCompute(): void {
+    if (this.#compute === null) return;
+    this.#compute.pass.end();
+    this.#compute = null;
+  }
+
+  /** The compute pass for a dispatch: untimed, the open one a run of dispatches of one label shares (each
+   * dispatch is its own usage scope inside it, so WebGPU orders their memory as across passes);
+   * timed, a pass of its own for its timestamps. */
+  #computePass(label: string, timed: { timestampWrites?: GPUComputePassTimestampWrites }): OpenCompute {
+    // A label names its passes: a dispatch under another opens its own.
+    if (this.#compute !== null && this.#compute.label === label && timed.timestampWrites === undefined) return this.#compute;
+    const pass = this.#encoderNow().beginComputePass({ label, ...timed });
+    this.#counters.compute_passes++;
+    this.#compute = { pass, label, pipeline: null, group: null, offsets: [] };
+    return this.#compute;
+  }
+
 
   /** Makes room for `bytes` more uniform bytes (counted aligned) in this submission, flushing
    * first or growing the ring if it must. Call before recording the work that uses them. */
@@ -1538,16 +1600,26 @@ export class GpuExecutor {
     const bindGroup = this.#bindGroup(index, bindings);
     const label = this.#label ?? p.name;
     const timed = this.#timestamps(label);
-    const pass = this.#encoderNow().beginComputePass({ label, ...timed });
-    pass.setPipeline(p.compute);
-    pass.setBindGroup(0, bindGroup, offsets);
-    this.#counters.compute_passes++;
+    const c = this.#computePass(label, timed);
+    const pass = c.pass;
+    // What the pass has set already isn't set again.
+    if (c.pipeline !== p.compute) {
+      pass.setPipeline(p.compute);
+      c.pipeline = p.compute;
+      this.#counters.pipelines++;
+    }
+    if (c.group !== bindGroup || !sameOffsets(c.offsets, offsets)) {
+      pass.setBindGroup(0, bindGroup, offsets);
+      c.group = bindGroup;
+      c.offsets = offsets;
+      this.#counters.bind_groups++;
+    }
     this.#counters.dispatches++;
-    this.#counters.pipelines++;
-    this.#counters.bind_groups++;
+    const indirect = Array.isArray(groups) ? null : this.#buffer(groups.buffer);
     if (Array.isArray(groups)) pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
-    else pass.dispatchWorkgroupsIndirect(this.#buffer(groups.buffer), groups.offset);
-    pass.end();
+    else pass.dispatchWorkgroupsIndirect(indirect!, groups.offset);
+    // A timed dispatch's pass ends with it, its timestamps around it alone.
+    if (timed.timestampWrites !== undefined) this.#endCompute();
   }
 
   /** The render pipeline of `index` for these targets: one of the manifest's for it, which the
@@ -1665,6 +1737,9 @@ export class GpuExecutor {
     const multi = this.device.features.has("chromium-experimental-multi-draw-indirect");
     const counted = this.#counters;
     counted.render_passes++;
+    let lastPipeline: GPURenderPipeline | null | undefined;
+    let lastGroup: GPUBindGroup | null | undefined;
+    let lastOffsets: number[] = [];
     for (const { draw: d, pipeline, group, args, indices } of draws) {
       if (d.op === "SetScissor") {
         rp.setScissorRect(d.x, d.y, d.width, d.height);
@@ -1675,10 +1750,19 @@ export class GpuExecutor {
         continue;
       }
       const offsets = this.#push(d.uniforms);
-      rp.setPipeline(pipeline!);
-      rp.setBindGroup(0, group!, offsets);
-      counted.pipelines++;
-      counted.bind_groups++;
+      // What the pass has set already isn't set again: consecutive draws of a pipeline, and of a
+      // bind group at the same offsets.
+      if (pipeline !== lastPipeline) {
+        rp.setPipeline(pipeline!);
+        lastPipeline = pipeline;
+        counted.pipelines++;
+      }
+      if (group !== lastGroup || !sameOffsets(lastOffsets, offsets)) {
+        rp.setBindGroup(0, group!, offsets);
+        lastGroup = group;
+        lastOffsets = offsets;
+        counted.bind_groups++;
+      }
       const many = d.op === "MultiDrawIndirect" || d.op === "MultiDrawIndexedIndirect";
       counted.draws += many ? d.count : 1;
       counted.draw_calls += many && !multi ? d.count : 1;

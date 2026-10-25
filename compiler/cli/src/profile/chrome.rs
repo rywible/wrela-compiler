@@ -2,11 +2,13 @@
 //! (runtime/browser `testmode.ts`). Two runs of the build, each its warmup and measured frames:
 //! - saturated (`timestamps=1&saturate=1&nohash=1`, or `timestamps=2` with `--serial`): each
 //!   frame starts once the last is recorded, at most two on the GPU, so the GPU's times are its
-//!   work; each frame's CPU time (the program's `frame`, its commands checked and encoded, up to
-//!   submission), its phases, and the executor's counters;
-//! - paced (`paced=1&inflight=2&nohash=1`): frames at their times, two in flight, as a player's
-//!   are; the intervals between them.
+//!   work; and the executor's counters;
+//! - paced (`paced=1&inflight=2&nohash=1`): frames at their times, two in flight, no timestamp
+//!   queries, as a player's are: each frame's CPU time (the program's `frame`, its commands
+//!   encoded, up to submission), its phases, and the intervals between frames.
 //!
+//! Both run with the command checker off (`checks=0`), as a release build plays, unless
+//! `--checked` keeps it (to compare with a build whose runtime predates `checks`).
 //! `--features` passes test mode's mask (`features=none`, or a comma list to keep). Chrome's
 //! timestamps are full resolution under the developer flag `runtime/chrome` sets.
 
@@ -54,6 +56,9 @@ fn common(a: &Args, input: bool) -> Result<String, String> {
     if let Some(keep) = &a.features {
         s.push_str(&format!("&features={keep}"));
     }
+    if !a.checked {
+        s.push_str("&checks=0");
+    }
     Ok(s)
 }
 
@@ -70,13 +75,17 @@ pub(super) fn measure(a: &Args, built: &Path, input: bool) -> Result<(Profile, V
     let timestamps = if a.serial { 2 } else { 1 };
     let fragment =
         format!("#test{}&timestamps={timestamps}&saturate=1&nohash=1", common(a, input)?);
-    let [timings, framed, counters, device] = <[Value; 4]>::try_from(run_page(
+    let [timings, _, counters, device] = <[Value; 4]>::try_from(run_page(
         built,
         &fragment,
         frames,
         &["timings.json", "frames.json", "counters.json", "device.json"],
     )?)
     .map_err(|_| "Chrome's results are incomplete")?;
+    // The paced run: CPU times, phases and frame intervals as a player sees them.
+    let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a, input)?);
+    let [framed] = <[Value; 1]>::try_from(run_page(built, &fragment, frames, &["frames.json"])?)
+        .map_err(|_| "Chrome's paced results are incomplete")?;
     let warmup = a.warmup as usize;
     let timings: Vec<wrela_host::GpuTiming> = timings
         .as_array()
@@ -127,11 +136,6 @@ pub(super) fn measure(a: &Args, built: &Path, input: bool) -> Result<(Profile, V
             (name, median(xs).unwrap_or(0.0))
         })
         .collect();
-    // The paced run: frame intervals as a player sees them.
-    let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a, input)?);
-    let [paced] = <[Value; 1]>::try_from(run_page(built, &fragment, frames, &["frames.json"])?)
-        .map_err(|_| "Chrome's paced results are incomplete")?;
-    let began = numbers(&paced["began_ms"], 0);
     let intervals: Vec<f64> =
         began.windows(2).skip(warmup.saturating_sub(1)).map(|w| w[1] - w[0]).collect();
     let labels: Vec<Label> = by_label(&timings);
@@ -181,10 +185,12 @@ mod tests {
         let mut a = super::super::parse(&["scene".into(), "--chrome".into()]).unwrap();
         assert_eq!(
             common(&a, false).unwrap(),
-            format!("&frames=180&width=1280&height=720&fps=60&workers={}", a.workers)
+            format!("&frames=180&width=1280&height=720&fps=60&workers={}&checks=0", a.workers)
         );
         a.features = Some("none".into());
-        assert!(common(&a, true).unwrap().ends_with("&input=input.json&features=none"));
+        assert!(common(&a, true).unwrap().ends_with("&input=input.json&features=none&checks=0"));
+        a.checked = true;
+        assert!(common(&a, true).unwrap().ends_with("&features=none"));
         assert!(
             super::super::parse(&["scene".into(), "--features".into(), "none".into()]).is_none()
         );
