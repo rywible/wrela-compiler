@@ -32,9 +32,10 @@ pub enum Level {
 }
 
 impl Level {
-    /// What `--optimize` alone means: chosen by measurement (toolchain 0.6, §A15 of the
-    /// world-class plan): the frozen herd's and grazer's CPU frame time in Chrome and their
-    /// gzipped WASM, the commit that set it records the numbers.
+    /// What `--optimize` alone means, chosen by measurement (toolchain 0.6, §A15 of the
+    /// world-class plan): `-O3` was 2.0% faster on the Last Green's CPU frame in Chrome (7
+    /// pairs, inconclusive), under the 3% that would take it, at the same gzipped size; on the
+    /// frozen herd and grazer it was within noise.
     pub const DEFAULT: Level = Level::Size;
 
     pub fn parse(s: &str) -> Option<Level> {

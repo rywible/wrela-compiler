@@ -1513,7 +1513,7 @@ test("several uploads in one call each reach their buffer, though the program ov
   const m = shapes();
   const pipelines = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => "// fine\n"), SCREEN_FORMAT));
   const executor = new GpuExecutor(device.gpu, pipelines, { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
-  // Two small writes (staged) and a big one (written to the ring from the batch) between them.
+  // Two small writes and a big one between them.
   const want = [
     Uint8Array.from({ length: 8 }, (_, i) => i + 1),
     Uint8Array.from({ length: 8192 }, (_, i) => (i * 7) & 255),
@@ -1540,7 +1540,6 @@ test("several uploads in one call each reach their buffer, though the program ov
     }
   }
   want.forEach((bytes, i) => expect(at(`buffer ${i + 1}`).subarray(0, bytes.length)).toEqual(bytes));
-  // The big write went to the ring straight from the batch: the staged write before it, it, and
-  // the one after, three queue writes.
-  expect(device.events.filter((e) => e.kind === "writeBuffer" && e.buffer === "upload ring")).toHaveLength(3);
+  // The uploads were staged: one queue write of the ring.
+  expect(device.events.filter((e) => e.kind === "writeBuffer" && e.buffer === "upload ring")).toHaveLength(1);
 });

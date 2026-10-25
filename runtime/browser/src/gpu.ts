@@ -531,11 +531,8 @@ function doubled(capacity: number, n: number): number {
 class Ring {
   buffer: GPUBuffer;
   bytes: Bytes;
-  /** The bytes reserved so far this submission. */
+  /** The bytes staged so far. */
   used = 0;
-  /** Where the bytes staged in `bytes` and not yet written begin: a direct write (`direct`)
-   * writes those before it, so a later `write` doesn't write over it. */
-  staged = 0;
 
   constructor(
     readonly device: GPUDevice,
@@ -558,30 +555,13 @@ class Ring {
 
   /** Writes the staged bytes to the buffer, and starts again from 0. */
   write(queue: GPUQueue, counters?: Counters): void {
-    this.#writeStaged(queue, this.used, counters);
-    this.used = 0;
-    this.staged = 0;
-  }
-
-  /** Writes `data` at `at` (reserved, past every staged byte) straight from where it is, not
-   * through `bytes`: the staged bytes before it first. A queue write is ordered after the work
-   * already submitted and before the submission whose copies read it, as the staged ones are. */
-  direct(queue: GPUQueue, at: number, data: Bytes, counters: Counters): void {
-    this.#writeStaged(queue, at, counters);
-    queue.writeBuffer(this.buffer, at, data);
-    counters.write_buffers++;
-    counters.write_buffer_bytes += data.length;
-    this.staged = at + data.length;
-  }
-
-  #writeStaged(queue: GPUQueue, end: number, counters?: Counters): void {
-    if (end <= this.staged) return;
-    queue.writeBuffer(this.buffer, this.staged, this.bytes, this.staged, end - this.staged);
+    if (this.used === 0) return;
+    queue.writeBuffer(this.buffer, 0, this.bytes, 0, this.used);
     if (counters) {
       counters.write_buffers++;
-      counters.write_buffer_bytes += end - this.staged;
+      counters.write_buffer_bytes += this.used;
     }
-    this.staged = end;
+    this.used = 0;
   }
 }
 
@@ -613,10 +593,6 @@ export const noCounters = (): Counters => ({
   bind_groups: 0,
   pipelines: 0,
 });
-
-/** An upload at least this big is written to the ring straight from its batch, not staged: the
- * copy saved outweighs a queue write's call (§A13: measured on herd and grazer). */
-const DIRECT_UPLOAD = 4096;
 
 /** A compute pass a run of dispatches shares, and what it last set. */
 type OpenCompute = { pass: GPUComputePassEncoder; label: string; pipeline: GPUComputePipeline | null; group: GPUBindGroup | null; offsets: number[] };
@@ -1409,11 +1385,10 @@ export class GpuExecutor {
     }
     const at = this.#reserveUpload(len, 4);
     const up = this.#uploads;
-    // The bytes are a view of the batch the program submitted, which the runtime copied out of
-    // its memory and keeps until its commands have run. A big write goes to the ring straight
-    // from it; small ones are staged, so a frame of them is one queue write.
-    if (len >= DIRECT_UPLOAD) up.direct(this.device.queue, at, data, this.#counters);
-    else up.bytes.set(data, at);
+    // The bytes are a view of the batch the program submitted: staged, so a frame's uploads are
+    // one queue write. (Writing a big one to the ring straight from the batch saved nothing
+    // measurable on the Last Green, §A13 of the world-class plan, and cost queue calls.)
+    up.bytes.set(data, at);
     this.#encoderNow().copyBufferToBuffer(up.buffer, at, this.#buffer(handle), offset, len);
   }
 
