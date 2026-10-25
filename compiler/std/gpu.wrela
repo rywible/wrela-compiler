@@ -3285,10 +3285,11 @@ fn read_buffer_command(request: u32, handle: u32, offset: u32, size: u32) {}
 /// The GPU time of the passes and dispatches labelled `name` (`label`), in microseconds: a
 /// request, answered with their time in the first frame from this one on that runs one, summed,
 /// once the host has read it. It fails on a host that can't time GPU work (the CPU host, or a
-/// GPU without timestamp queries). A host times a program's work only once it asks, so the
-/// first answer may wait a frame. It's `nondet`: the time is the device's. A program measures
-/// its own costs with it (a planner's, say); a test can check that a cost was measured, but no
-/// test asserts how small it is.
+/// GPU without timestamp queries). A host times only the work of a label asked for and not yet
+/// answered, from the ask on in the order it was recorded, and none of the rest (whose passes
+/// and dispatches then cost nothing more): to time a frame's work, ask before recording it. It's
+/// `nondet`: the time is the device's. A program measures its own costs with it (a planner's,
+/// say); a test can check that a cost was measured, but no test asserts how small it is.
 pub fn timed(name: str) -> Pending<f32> {
     let request = next_request()
     timed_command(request, name)
