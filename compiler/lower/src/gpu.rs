@@ -1965,10 +1965,13 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let sampled = op.is_sampled();
     let sampler = if sampled { Some(resource_arg(fl, c, 1, msg)?) } else { None };
     let mut vals = fl.arg_values(&c.args[1 + usize::from(sampled)..])?;
-    // A mip step samples the one level its view holds.
+    // A mip step reads the one level its view holds: its sample and its load name level 0.
     if l == Lang::MipStepSample {
         let f = fl.mb.m.types.f32();
         vals.push(fl.value(f, ir::Expr::Const(ir::Const::F32(0.0))));
+    }
+    if l == Lang::MipStepLoad {
+        vals.push(fl.u32c(0));
     }
     let t = fl.ty(ty?, span)?;
     // A colour texel is read as four of its format's scalar: the format's texel is their first.
