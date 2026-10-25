@@ -1188,3 +1188,27 @@ test("a shader that uses subgroups gets WGSL's `enable subgroups;`, which naga's
   expect(shaderSource(p(["shader-f16"]), "enable f16;\n")).toBe("enable f16;\n");
   expect(shaderSource(p([]), "x")).toBe("x");
 });
+
+test("the executor counts what it did below the stream, until its counters are taken", async () => {
+  const { executor, run } = await setup();
+  const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).writeBuffer(1, 0, words([7, 8]));
+  for (let i = 0; i < 3; i++) e.dispatch(1, [1, 1, 1], [1, 2], u(i));
+  e.beginScreenPass([0, 0, 0, 1]);
+  for (let i = 3; i < 5; i++) e.draw(0, 3, 1, [1, 2], u(i));
+  run(e.present());
+  expect(executor.takeCounters()).toEqual({
+    compute_passes: 3,
+    render_passes: 1,
+    dispatches: 3,
+    draws: 2,
+    draw_calls: 2,
+    // The uniform ring and the upload ring, each one write of everything staged.
+    write_buffers: 2,
+    // Four 256-byte uniform slots and the last draw's 16 bytes, then the upload's 8.
+    write_buffer_bytes: 4 * 256 + 16 + 8,
+    write_textures: 0,
+    bind_groups: 5,
+    pipelines: 5,
+  });
+  expect(executor.takeCounters().draws).toBe(0);
+});

@@ -502,6 +502,8 @@ impl TextureFormat {
         use FormatFeature as F;
         // name, block bytes, block side, channels, filter, store, render, blend, uint, depth,
         // target cost, target alignment
+        // A row of the table, its columns in order: a struct literal would name each again.
+        #[allow(clippy::too_many_arguments)]
         const fn row(
             name: &'static str,
             block_bytes: u32,

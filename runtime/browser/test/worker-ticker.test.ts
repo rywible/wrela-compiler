@@ -25,7 +25,7 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
   const reported = Promise.withResolvers<void>();
   const done: string[] = [];
   const configured: GPUTextureFormat[] = [];
-  const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {} };
+  const executor = { built: Promise.resolve(), frame: 0, presented: false, caughtUp: async () => {}, checkDebugFlag: async () => {}, destroyAll() {}, takeCounters: () => ({}) };
   const device = {
     createTexture: () => ({ width: 1, height: 1 }), pushErrorScope() {}, popErrorScope: async () => null,
     createBuffer: () => ({
@@ -93,7 +93,7 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
       const memory = new WebAssembly.Memory({ initial: 20, maximum: 16384, shared: true });
       const program = {
         executor, ticker: null as { hz: number } | null, inbox: new Inbox(), queueInput() {},
-        keeping: new Uint8Array(), shutdown() {}, workerChunks: () => 0,
+        keeping: new Uint8Array(), shutdown() {}, workerChunks: () => 0, takePhases: () => ({}),
         frame() {
           if (asynchronousFailure === "frame" && frames === 0) queueMicrotask(() => self.onmessage!({ data: {
             type: "audio-failed", message: "audio stopped during the frame",
@@ -116,7 +116,7 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
       name: "worker ticker dependencies", setup(build) {
         build.onResolve({ filter: /\/(loader|device|live)\.ts$|^\.\/(loader|device|live)\.ts$/ }, ({ path }) => ({ path, namespace: "ticker-test" }));
         build.onLoad({ filter: /.*/, namespace: "ticker-test" }, ({ path }) => ({ loader: "js", contents: path.endsWith("device.ts")
-          ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; }"
+          ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; } export function deviceLimits() { return []; }"
           : path.endsWith("live.ts") ? "export class Live { start() {} take() { return globalThis.__tickerTest.takeReload(); } swapped() {} drawn() {} }"
           : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export class Handed { give() {} fetch(f) { return f; } } export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
       },

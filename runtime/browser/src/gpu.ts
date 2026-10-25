@@ -554,12 +554,45 @@ class Ring {
   }
 
   /** Writes the staged bytes to the buffer, and starts again from 0. */
-  write(queue: GPUQueue): void {
+  write(queue: GPUQueue, counters?: Counters): void {
     if (this.used === 0) return;
     queue.writeBuffer(this.buffer, 0, this.bytes, 0, this.used);
+    if (counters) {
+      counters.write_buffers++;
+      counters.write_buffer_bytes += this.used;
+    }
     this.used = 0;
   }
 }
+
+/** What an executor did below the recorded stream, since its counters were last taken: the
+ * physical half of a frame's draw count (G-draws). A multi-draw the device runs in one call is one
+ * `draw_calls` and its `count` `draws`; without the feature each draw is a call. */
+export interface Counters {
+  compute_passes: number;
+  render_passes: number;
+  dispatches: number;
+  draws: number;
+  draw_calls: number;
+  write_buffers: number;
+  write_buffer_bytes: number;
+  write_textures: number;
+  bind_groups: number;
+  pipelines: number;
+}
+
+export const noCounters = (): Counters => ({
+  compute_passes: 0,
+  render_passes: 0,
+  dispatches: 0,
+  draws: 0,
+  draw_calls: 0,
+  write_buffers: 0,
+  write_buffer_bytes: 0,
+  write_textures: 0,
+  bind_groups: 0,
+  pipelines: 0,
+});
 
 /** Most passes timed in one submission: more flush first. */
 const TIMED_PASSES = 256;
@@ -686,6 +719,7 @@ class Timer {
 export class GpuExecutor {
   readonly #align: number;
   readonly #resources = new Map<number, Resource>();
+  #counters: Counters = noCounters();
   /** The bytes of the program's buffers and textures now, and at most so far. */
   #bytes = 0;
   #peak = 0;
@@ -1207,8 +1241,8 @@ export class GpuExecutor {
   flush(): void {
     this.#recordEnded();
     if (this.#encoder !== null) {
-      this.#uniforms.write(this.device.queue);
-      this.#uploads.write(this.device.queue);
+      this.#uniforms.write(this.device.queue, this.#counters);
+      this.#uploads.write(this.device.queue, this.#counters);
       const read = this.#timer?.resolve(this.#encoder) ?? null;
       this.device.queue.submit([this.#encoder.finish()]);
       this.#encoder = null;
@@ -1252,6 +1286,13 @@ export class GpuExecutor {
 
   /** The program's buffers and textures, in bytes: now, and at most so far (test mode's
    * `memory.json`). */
+  /** What it did since the last take (test mode's `counters.json`, a frame each). */
+  takeCounters(): Counters {
+    const out = this.#counters;
+    this.#counters = noCounters();
+    return out;
+  }
+
   get memory(): { bytes: number; peak: number } {
     return { bytes: this.#bytes, peak: this.#peak };
   }
@@ -1324,6 +1365,8 @@ export class GpuExecutor {
       // Work recorded before this write must see the old contents.
       this.flush();
       this.device.queue.writeBuffer(this.#buffer(handle), offset, data);
+      this.#counters.write_buffers++;
+      this.#counters.write_buffer_bytes += len;
       return;
     }
     const at = this.#reserveUpload(len, 4);
@@ -1360,6 +1403,7 @@ export class GpuExecutor {
     if (len > UPLOAD_MAX) {
       this.flush();
       this.device.queue.writeTexture(target, cmd.data, { bytesPerRow: row, rowsPerImage: rows }, size);
+      this.#counters.write_textures++;
       return;
     }
     const at = this.#reserveUpload(len, 256);
@@ -1497,6 +1541,10 @@ export class GpuExecutor {
     const pass = this.#encoderNow().beginComputePass({ label, ...timed });
     pass.setPipeline(p.compute);
     pass.setBindGroup(0, bindGroup, offsets);
+    this.#counters.compute_passes++;
+    this.#counters.dispatches++;
+    this.#counters.pipelines++;
+    this.#counters.bind_groups++;
     if (Array.isArray(groups)) pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
     else pass.dispatchWorkgroupsIndirect(this.#buffer(groups.buffer), groups.offset);
     pass.end();
@@ -1615,6 +1663,8 @@ export class GpuExecutor {
           }),
     });
     const multi = this.device.features.has("chromium-experimental-multi-draw-indirect");
+    const counted = this.#counters;
+    counted.render_passes++;
     for (const { draw: d, pipeline, group, args, indices } of draws) {
       if (d.op === "SetScissor") {
         rp.setScissorRect(d.x, d.y, d.width, d.height);
@@ -1627,6 +1677,11 @@ export class GpuExecutor {
       const offsets = this.#push(d.uniforms);
       rp.setPipeline(pipeline!);
       rp.setBindGroup(0, group!, offsets);
+      counted.pipelines++;
+      counted.bind_groups++;
+      const many = d.op === "MultiDrawIndirect" || d.op === "MultiDrawIndexedIndirect";
+      counted.draws += many ? d.count : 1;
+      counted.draw_calls += many && !multi ? d.count : 1;
       switch (d.op) {
         case "Draw":
           rp.draw(d.vertices, d.instances);

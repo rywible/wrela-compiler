@@ -183,3 +183,36 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("would be overwritten"));
     assert_eq!(std::fs::read(generated.join("manifest.json")).unwrap(), manifest);
 }
+
+/// `--chrome`: the same report from headless Chrome (`"host": "chrome"`), with its frame
+/// intervals, the executor's counters (two dispatches in the first frame, one after), and the
+/// phases the browser timed.
+#[test]
+#[ignore = "needs a GPU and Chrome"]
+fn profile_in_chrome_reports_what_the_native_report_does() {
+    let dir = common::package(
+        "profile-chrome",
+        &[("wrela.toml", &common::manifest("work")), ("main.wrela", WORK)],
+    );
+    let d = dir.to_str().unwrap();
+    let out = common::wrela()
+        .args(["profile", d, "--chrome", "--frames", "30", "--warmup", "2", "--json"])
+        .output()
+        .expect("run wrela");
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    let p: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    assert_eq!(p["host"], "chrome");
+    assert_eq!(p["environment"]["host"], "chrome");
+    assert!(p["environment"]["adapter"].as_str().unwrap().starts_with("Chrome: "), "{text}");
+    assert_eq!(p["frames"], 30);
+    assert!(p["cpu"]["frame_interval_ms"].as_f64().unwrap() > 0.0, "{text}");
+    assert_eq!(p["counters"]["dispatches"], 1.0, "{text}");
+    assert_eq!(p["counters"]["compute_passes"], 1.0, "{text}");
+    let phases = p["cpu"]["phases"].as_array().unwrap();
+    assert_eq!(phases.len(), 1, "{text}");
+    assert_eq!(phases[0]["name"], "record");
+    assert_eq!(phases[0]["times"], 30);
+    assert!(p["gpu"]["labels"].as_array().unwrap().iter().any(|l| l["label"] == "each frame"));
+    assert_eq!(p["wgsl"][0]["pipeline"], "fill");
+}

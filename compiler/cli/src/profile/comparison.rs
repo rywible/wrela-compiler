@@ -52,6 +52,14 @@ pub(super) fn lease(path: &Path) -> Result<File, String> {
 }
 
 pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
+    let mut v = machine()?;
+    v["adapter"] = host.adapter().into();
+    Ok(v)
+}
+
+/// This machine, the CPUs it has, and the profiler measuring: a report's identity but its
+/// adapter's.
+pub(super) fn machine() -> Result<Value, String> {
     let machine = std::fs::read("/etc/machine-id")
         .or_else(|_| {
             let out = std::process::Command::new("hostname").output()?;
@@ -68,7 +76,7 @@ pub(super) fn environment(host: &mut Host) -> Result<Value, String> {
     let executable = std::env::current_exe().map_err(|e| e.to_string())?;
     Ok(value!({
         "machine_sha256": crate::sha256_hex(&machine), "os": std::env::consts::OS,
-        "arch": std::env::consts::ARCH, "adapter": host.adapter(),
+        "arch": std::env::consts::ARCH, "adapter": "",
         "logical_cpus": std::thread::available_parallelism().map_err(|e| e.to_string())?.get(),
         "host_sha256": crate::sha256_hex(&std::fs::read(executable).map_err(|e| e.to_string())?),
     }))
@@ -180,13 +188,13 @@ fn metric(before: &[f64], after: &[f64]) -> Value {
         "paired_change_percent": paired, "median_change_percent": median(paired) })
 }
 
+/// `--compare`: `sample` measures a build's directory once (on the native host or in Chrome);
+/// `environment` names the hardware, once the samples are taken.
 pub(super) fn run(
     a: &Args,
-    host: &mut Host,
-    options: &Options,
-    script: &[Scripted],
+    sample: &mut dyn FnMut(&Path) -> Result<Profile, String>,
     built: &Path,
-    environment: &Value,
+    environment: &dyn Fn() -> Result<Value, String>,
     workload: &Value,
 ) -> Result<String, String> {
     let before = a.compare.as_deref().expect("comparison baseline");
@@ -196,12 +204,7 @@ pub(super) fn run(
     let mut sequence = Vec::new();
     for pair in 0..a.pairs {
         for which in order(pair) {
-            host.restart_in(dirs[which], options).map_err(|e| e.to_string())?;
-            // Restart has joined the old program's workers. Each deferred init sees empty storage.
-            let storage = options.storage.as_ref().expect("isolated profile storage");
-            std::fs::remove_dir_all(storage).map_err(|e| e.to_string())?;
-            std::fs::create_dir(storage).map_err(|e| e.to_string())?;
-            let p = measure(a, host, script, dirs[which], environment, workload)?;
+            let p = sample(dirs[which])?;
             if p.build_sha256 != hashes[which] {
                 return Err("build changed during measurement; discard this run".into());
             }
@@ -214,6 +217,7 @@ pub(super) fn run(
             return Err("build changed during measurement; discard this run".into());
         }
     }
+    let environment = &environment()?;
     let spans = |side: usize| {
         samples[side]
             .iter()
@@ -252,7 +256,8 @@ pub(super) fn run(
                 .collect()
         })
         .collect();
-    let report = value!({ "schema": 2, "environment": environment, "workload": workload,
+    let host = if a.chrome { "chrome" } else { "native" };
+    let report = value!({ "schema": 2, "host": host, "environment": environment, "workload": workload,
         "pairs": a.pairs, "order": sequence, "baseline_build_sha256": hashes[0],
         "candidate_build_sha256": hashes[1], "gpu_span": metric(&spans(0), &spans(1)),
         "cpu_frame_call": metric(&calls(0), &calls(1)), "labels": labels,
@@ -325,7 +330,7 @@ mod tests {
         let root = scratch.0.clone();
         std::fs::write(
             root.join("manifest.json"),
-            r#"{"manifest_version":9,"stream_version":11,"wasm":"game.wasm","pipelines":[]}"#,
+            r#"{"manifest_version":10,"stream_version":12,"wasm":"game.wasm","pipelines":[]}"#,
         )
         .unwrap();
         std::fs::write(root.join("game.wasm"), b"first program").unwrap();

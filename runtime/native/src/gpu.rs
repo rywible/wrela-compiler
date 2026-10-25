@@ -497,9 +497,11 @@ impl Ring {
     }
 
     /// Writes this submission's staged bytes to the buffer.
-    fn write(&mut self, queue: &wgpu::Queue) {
+    fn write(&mut self, queue: &wgpu::Queue, counters: &mut Counters) {
         if !self.staging.is_empty() {
             queue.write_buffer(&self.buffer, 0, &self.staging);
+            counters.write_buffers += 1;
+            counters.write_buffer_bytes += self.staging.len() as u64;
             self.staging.clear();
         }
     }
@@ -532,7 +534,56 @@ struct Timed {
     label: String,
 }
 
+/// What the executor did below the recorded stream, since its counters were last taken: the
+/// physical half of a frame's draw count (G-draws), as the browser's `counters.json` has it. A
+/// multi-draw is one `draw_calls` and its `count` `draws` (wgpu draws it in one call).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Counters {
+    pub compute_passes: u32,
+    pub render_passes: u32,
+    pub dispatches: u32,
+    pub draws: u32,
+    pub draw_calls: u32,
+    pub write_buffers: u32,
+    pub write_buffer_bytes: u64,
+    pub write_textures: u32,
+    pub bind_groups: u32,
+    pub pipelines: u32,
+}
+
+impl Counters {
+    fn add(&mut self, o: &Counters) {
+        self.compute_passes += o.compute_passes;
+        self.render_passes += o.render_passes;
+        self.dispatches += o.dispatches;
+        self.draws += o.draws;
+        self.draw_calls += o.draw_calls;
+        self.write_buffers += o.write_buffers;
+        self.write_buffer_bytes += o.write_buffer_bytes;
+        self.write_textures += o.write_textures;
+        self.bind_groups += o.bind_groups;
+        self.pipelines += o.pipelines;
+    }
+
+    /// Its fields by name, in order: what reports and tests list.
+    pub fn fields(&self) -> [(&'static str, u64); 10] {
+        [
+            ("compute_passes", u64::from(self.compute_passes)),
+            ("render_passes", u64::from(self.render_passes)),
+            ("dispatches", u64::from(self.dispatches)),
+            ("draws", u64::from(self.draws)),
+            ("draw_calls", u64::from(self.draw_calls)),
+            ("write_buffers", u64::from(self.write_buffers)),
+            ("write_buffer_bytes", self.write_buffer_bytes),
+            ("write_textures", u64::from(self.write_textures)),
+            ("bind_groups", u64::from(self.bind_groups)),
+            ("pipelines", u64::from(self.pipelines)),
+        ]
+    }
+}
+
 pub(crate) struct Gpu {
+    counters: Counters,
     device: wgpu::Device,
     queue: wgpu::Queue,
     limits: wgpu::Limits,
@@ -715,6 +766,7 @@ impl Gpu {
         let upload = Ring::new(&device, "upload ring", usage, u64::from(stream::UPLOAD_START));
         let timer = timestamps.then(|| Timer::new(&device, timing == Timing::Serial, true));
         let mut gpu = Gpu {
+            counters: Counters::default(),
             device,
             queue,
             limits,
@@ -1166,6 +1218,11 @@ impl Gpu {
         self.label = None;
     }
 
+    /// What it did since the last take.
+    pub(crate) fn take_counters(&mut self) -> Counters {
+        std::mem::take(&mut self.counters)
+    }
+
     pub(crate) fn take_timings(&mut self) -> Result<Vec<GpuTiming>> {
         self.flush()?;
         self.collect()?;
@@ -1349,8 +1406,8 @@ impl Gpu {
             debug_assert!(self.ring.staging.is_empty() && self.upload.staging.is_empty());
             return Ok(());
         };
-        self.ring.write(&self.queue);
-        self.upload.write(&self.queue);
+        self.ring.write(&self.queue, &mut self.counters);
+        self.upload.write(&self.queue, &mut self.counters);
         self.queue.submit([encoder.finish()]);
         // The serial mode reads its timestamps once a frame (`collect`), so nothing waits
         // between its submissions and the GPU keeps its clocks.
@@ -1477,6 +1534,8 @@ impl Gpu {
             // Work recorded before this write must see the old contents.
             self.flush()?;
             self.queue.write_buffer(self.buffer(handle), u64::from(offset), data);
+            self.counters.write_buffers += 1;
+            self.counters.write_buffer_bytes += len;
             return Ok(());
         }
         let at = self.reserve_upload(len, 1)?;
@@ -1549,6 +1608,7 @@ impl Gpu {
                 },
                 extent,
             );
+            self.counters.write_textures += 1;
             return Ok(());
         }
         let at = self.reserve_upload(bytes, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))?;
@@ -1684,6 +1744,10 @@ impl Gpu {
         });
         pass.set_pipeline(compute);
         pass.set_bind_group(0, &bind_group, offset.as_slice());
+        self.counters.compute_passes += 1;
+        self.counters.dispatches += 1;
+        self.counters.pipelines += 1;
+        self.counters.bind_groups += 1;
         match groups {
             Ok([x, y, z]) => pass.dispatch_workgroups(x, y, z),
             Err((buffer, at)) => {
@@ -1920,6 +1984,8 @@ impl Gpu {
                 }),
                 stencil_ops: None,
             });
+        // Counted here, and added once the pass, which borrows the executor, has ended.
+        let mut counters = Counters { render_passes: 1, ..Counters::default() };
         let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments: &color_attachments,
@@ -1953,6 +2019,13 @@ impl Gpu {
             };
             rp.set_pipeline(&variants[&formats]);
             rp.set_bind_group(0, bind_group, offset.as_slice());
+            counters.pipelines += 1;
+            counters.bind_groups += 1;
+            counters.draw_calls += 1;
+            counters.draws += match d.how {
+                DrawHow::Multi { count, .. } => count,
+                _ => 1,
+            };
             let index = |rp: &mut wgpu::RenderPass<'_>, indices: u32, at: u32, size: u32| {
                 let range = u64::from(at)..u64::from(at) + u64::from(size);
                 rp.set_index_buffer(self.buffer(indices).slice(range), wgpu::IndexFormat::Uint32);
@@ -1997,6 +2070,7 @@ impl Gpu {
             }
         }
         drop(rp);
+        self.counters.add(&counters);
         self.encoder = Some(encoder);
         if on_screen { self.flush() } else { self.alone() }
     }

@@ -330,7 +330,7 @@ impl Blend {
     }
 
     /// Whether every one of `blends` replaces: the manifest leaves them out.
-    pub fn all_replace(blends: &Vec<Blend>) -> bool {
+    pub fn all_replace(blends: &[Blend]) -> bool {
         blends.iter().all(|&b| b == Blend::Replace)
     }
 }

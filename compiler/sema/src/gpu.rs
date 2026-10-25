@@ -273,12 +273,16 @@ pub struct FragmentOutput {
     pub over: bool,
 }
 
+/// A fragment shader's colours, each with its path in the returned value, and whether it
+/// returns `Over`.
+type Colours = (Vec<(Colour, Vec<u32>)>, bool);
+
 impl FragmentOutput {
     /// What a fragment shader returning `t` writes; `None` if it can't return `t`: a colour
     /// ([`Colour::of`]); an `Over` (a `vec4` to blend); a `Targets2`, `Targets3` or `Targets4`
     /// of colours; or a `WithDepth` of any of those and a depth.
     pub fn of(p: &Program, t: TyId) -> Option<FragmentOutput> {
-        let colours = |t: TyId, at: Vec<u32>| -> Option<(Vec<(Colour, Vec<u32>)>, bool)> {
+        let colours = |t: TyId, at: Vec<u32>| -> Option<Colours> {
             if let Some(c) = Colour::of(p, t) {
                 return Some((vec![(c, at)], false));
             }

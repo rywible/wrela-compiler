@@ -12,6 +12,9 @@
 //!   hash.
 //! - `wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]`: a tick log's ticks,
 //!   each with its records, checking each state hash; it fails at the first that differs.
+//! - `wrela-host --compare-ticks <a.ticks> <b.ticks>`: two tick logs, two builds' runs of one
+//!   input: "equal", or the first tick whose state hash differs (G-sim). Unlike `--replay` it
+//!   doesn't compare the logs' WASM hashes.
 //! - `wrela-host --version`: its release and source revision.
 //!
 //! A build of this binary without the `gpu` feature has the last two only (an x86-64 build run
@@ -26,6 +29,7 @@ const USAGE: &str = "usage:
   wrela-host <build-dir> --until TEXT [--input script.json] [--frames N] [--fps F] [--size WxH] --png out.png [--workers N]
   wrela-host --no-gpu <build-dir> --ticks N [--input script.json] [--log out.ticks] [--workers N]
   wrela-host --replay <log> [--no-gpu] <build-dir> [--workers N]
+  wrela-host --compare-ticks <a.ticks> <b.ticks>
 
 With a GPU: runs the build's frame(i / fps, width, height) for i in 0..N (default 1 frame at 60
 fps, 640x360), its ticker (if it starts one) in lockstep, then prints the state hash: FNV-1a 64
@@ -42,7 +46,9 @@ first start to its last end); --serial runs each pass and dispatch alone, so eac
 --no-gpu runs the ticker's ticks alone, with no GPU and no frames, and prints the first world's
 state hash and each tick's (`tick K HASH`). --log writes the ticks as a tick log (runtime/abi
 `ticks`). --replay runs a tick log's ticks with their records, checks each state hash, and fails
-at the first that differs, naming it. --workers sets the threads that run parallel work (the
+at the first that differs, naming it. --compare-ticks reads two tick logs (two builds run on the
+same input) and prints `equal`, or the first tick whose state hash differs; it exits 1 if they
+differ. --workers sets the threads that run parallel work (the
 program's own among them).";
 
 struct Args {
@@ -169,6 +175,29 @@ fn read_script(args: &Args) -> Result<Vec<wrela_host::Scripted>, wrela_host::Err
 
 fn write_log(path: &PathBuf, log: &TickLog) -> Result<(), wrela_host::Error> {
     std::fs::write(path, log.encode()).map_err(|e| wrela_host::Error::io(path, e))
+}
+
+/// `--compare-ticks`: two tick logs' first difference, or `equal` (exit 0).
+fn compare_ticks(a: &str, b: &str) -> ExitCode {
+    let read = |path: &str| -> Result<TickLog, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        TickLog::decode(&bytes).map_err(|e| format!("{path}: {e}"))
+    };
+    match (read(a), read(b)) {
+        (Ok(x), Ok(y)) => {
+            let c = wrela_abi::ticks::TickComparison::of(&x, &y);
+            println!("{c}");
+            if matches!(c, wrela_abi::ticks::TickComparison::Equal { .. }) {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("error: {e}");
+            ExitCode::from(2)
+        }
+    }
 }
 
 /// `--replay`: a tick log's ticks, each hash checked.
@@ -299,6 +328,12 @@ fn run(args: &Args) -> Result<(), Failure> {
 }
 
 fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let [flag, a, b] = argv.as_slice()
+        && flag == "--compare-ticks"
+    {
+        return compare_ticks(a, b);
+    }
     if std::env::args().skip(1).eq(["--version"]) {
         let revision = option_env!("WRELA_REVISION").unwrap_or("development build");
         println!("wrela-host {} ({revision})", env!("CARGO_PKG_VERSION"));

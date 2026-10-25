@@ -212,6 +212,77 @@ impl TickLog {
     }
 }
 
+/// How two tick logs compare: two builds' runs of one input (G-sim). Unlike a replay it doesn't
+/// look at their WASM hashes, which differ when the builds do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TickComparison {
+    /// Every tick's state hash is the same, as are the first world's.
+    Equal { ticks: usize },
+    /// The ticks run at different rates.
+    Rate { a: u32, b: u32 },
+    /// The first worlds (after `init`) differ.
+    First { a: u64, b: u64 },
+    /// Tick `tick`'s records differ: the runs didn't have the same input.
+    Records { tick: usize },
+    /// Tick `tick`'s state hash differs: the first that does.
+    Hash { tick: usize, a: u64, b: u64 },
+    /// One log is longer: the `equal` ticks both have agree.
+    Length { equal: usize, a: usize, b: usize },
+}
+
+impl TickComparison {
+    pub fn of(a: &TickLog, b: &TickLog) -> TickComparison {
+        if a.hz != b.hz {
+            return TickComparison::Rate { a: a.hz, b: b.hz };
+        }
+        if a.first != b.first {
+            return TickComparison::First { a: a.first, b: b.first };
+        }
+        for (tick, (x, y)) in a.ticks.iter().zip(&b.ticks).enumerate() {
+            if x.records != y.records {
+                return TickComparison::Records { tick };
+            }
+            if x.hash != y.hash {
+                return TickComparison::Hash { tick, a: x.hash, b: y.hash };
+            }
+        }
+        if a.ticks.len() != b.ticks.len() {
+            let equal = a.ticks.len().min(b.ticks.len());
+            return TickComparison::Length { equal, a: a.ticks.len(), b: b.ticks.len() };
+        }
+        TickComparison::Equal { ticks: a.ticks.len() }
+    }
+}
+
+impl fmt::Display for TickComparison {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let hex = crate::hash::hex;
+        match *self {
+            TickComparison::Equal { ticks } => {
+                write!(f, "equal: {ticks} ticks, each state hash the same")
+            }
+            TickComparison::Rate { a, b } => write!(f, "the ticks run at {a} Hz and {b} Hz"),
+            TickComparison::First { a, b } => {
+                write!(f, "the first worlds differ: {} and {}", hex(a), hex(b))
+            }
+            TickComparison::Records { tick } => {
+                write!(f, "tick {tick}'s records differ: the runs didn't have the same input")
+            }
+            TickComparison::Hash { tick, a, b } => {
+                write!(
+                    f,
+                    "tick {tick} is the first whose state hash differs: {} and {}",
+                    hex(a),
+                    hex(b)
+                )
+            }
+            TickComparison::Length { equal, a, b } => {
+                write!(f, "the first {equal} ticks are equal, and the logs have {a} and {b} ticks")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,6 +296,33 @@ mod tests {
             hash: 0xffff_0000_ffff_0000,
         });
         log
+    }
+
+    /// Two builds' logs compare by state hash, not WASM hash: the first tick that differs.
+    #[test]
+    fn two_logs_compare_by_their_first_differing_tick() {
+        let a = sample();
+        let mut b = a.clone();
+        b.wasm_hash = 1;
+        assert_eq!(TickComparison::of(&a, &b), TickComparison::Equal { ticks: 2 });
+        b.ticks[1].hash = 9;
+        assert_eq!(
+            TickComparison::of(&a, &b),
+            TickComparison::Hash { tick: 1, a: 0xffff_0000_ffff_0000, b: 9 }
+        );
+        assert!(TickComparison::of(&a, &b).to_string().starts_with("tick 1 is the first"));
+        let mut c = a.clone();
+        c.ticks[0].records.push(Event::text('b').bytes());
+        assert_eq!(TickComparison::of(&a, &c), TickComparison::Records { tick: 0 });
+        let mut d = a.clone();
+        d.ticks.pop();
+        assert_eq!(TickComparison::of(&a, &d), TickComparison::Length { equal: 1, a: 2, b: 1 });
+        let mut e = a.clone();
+        e.first = 0;
+        assert!(matches!(TickComparison::of(&a, &e), TickComparison::First { .. }));
+        let mut f = a.clone();
+        f.hz = 30;
+        assert_eq!(TickComparison::of(&a, &f), TickComparison::Rate { a: 60, b: 30 });
     }
 
     /// The format is part of the contract: golden bytes.

@@ -65,7 +65,7 @@ import {
 import { type Checker, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { CALLED_WHILE_STARTING, clockImport, phaseImport, printed, refusingImports } from "./imports.ts";
+import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports } from "./imports.ts";
 import { Lines, LINES_SECTION, unlocated, wasmOffsets } from "./lines.ts";
 import { Inbox, type Net } from "./net.ts";
 import type { Scripted } from "./input.ts";
@@ -399,6 +399,8 @@ export class Program {
   #sequencer = new Sequencer();
   /** Validated commands wait for the export to return successfully before execution. */
   #pending: Command[] = [];
+  /** The phases its own thread times (`std::time::phase`). */
+  readonly #phases = new Phases();
   #memory: WebAssembly.Memory | null = null;
   /** The memory's maximum, in bytes: what the program reserves. */
   #reserved = 0;
@@ -522,7 +524,7 @@ export class Program {
         },
         [IMPORT_PHASE]: (ptr: number, len: number) => {
           program.#starting();
-          phase(ptr, len);
+          program.#phases.begin(phase(ptr, len));
         },
       },
     };
@@ -944,6 +946,11 @@ export class Program {
     this.#call(() => this.#frame!(time, width, height));
   }
 
+  /** The phases its calls timed since the last take (`std::time::phase`), ms by name. */
+  takePhases(): Record<string, number> {
+    return this.#phases.take();
+  }
+
   /** Its memory, in bytes: the maximum it reserves, and what it has grown to. */
   get memoryBytes(): { reserved: number; used: number } {
     return { reserved: this.#reserved, used: this.#memory?.buffer.byteLength ?? 0 };
@@ -984,6 +991,8 @@ export class Program {
       this.checker.endCall(false);
       throw e;
     } finally {
+      // A phase ends with its call, as on the native host.
+      this.#phases.end();
       this.#inbox.endCall();
       this.#requests.endCall();
       this.#netPlan = null;

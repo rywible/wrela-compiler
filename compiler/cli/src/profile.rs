@@ -23,6 +23,14 @@
 //! Use `--scenario` to name the scene; seeds and quality remain fixed by its program/input.
 //! `--warmup`, `--workers` and `--pairs` control the replay; `--warmup 0` includes startup frames.
 //! Run benchmarks with other builds and GPU workloads idle.
+//!
+//! Beside the times, each report has the executor's counters, each a frame's median: passes,
+//! dispatches, draws and draw calls, buffer and texture writes, bind groups and pipelines set
+//! (the physical half of a draw count). `--chrome` measures in headless Chrome instead
+//! (`profile/chrome.rs`): the same report, `"host": "chrome"`, with the paced frame interval a
+//! player sees; `--features none` (or a comma list to keep) hides the device's optional
+//! features from the program there, so its fallback paths are measured. `--baseline` and
+//! `--compare` take Chrome reports and builds as they take native ones.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,7 +39,23 @@ use std::time::Instant;
 use wrela_abi::input::Scripted;
 use wrela_host::{GpuTiming, Host, Options, Timing};
 
+mod chrome;
 mod comparison;
+
+/// The executor's counters, in the order reports list them (`wrela_host::Counters`, and the
+/// browser's `counters.json`).
+const COUNTERS: [&str; 10] = [
+    "compute_passes",
+    "render_passes",
+    "dispatches",
+    "draws",
+    "draw_calls",
+    "write_buffers",
+    "write_buffer_bytes",
+    "write_textures",
+    "bind_groups",
+    "pipelines",
+];
 
 pub(crate) use comparison::build_hash;
 
@@ -48,6 +72,9 @@ struct Args {
     workers: u32,
     pairs: u32,
     scenario: String,
+    /// Measure in headless Chrome (`--chrome`), with test mode's feature mask (`--features`).
+    chrome: bool,
+    features: Option<String>,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -64,6 +91,8 @@ fn parse(args: &[String]) -> Option<Args> {
         workers: wrela_host::default_workers(),
         pairs: 5,
         scenario: String::new(),
+        chrome: false,
+        features: None,
     };
     let mut dir = None;
     let mut it = args.iter();
@@ -84,6 +113,16 @@ fn parse(args: &[String]) -> Option<Args> {
             "--size" => a.size = crate::parse_size(it.next()?)?,
             "--input" => a.input = Some(PathBuf::from(it.next()?)),
             "--serial" => a.serial = true,
+            "--chrome" => a.chrome = true,
+            "--features" => {
+                let keep = it.next()?;
+                let plain =
+                    |c: char| c.is_ascii_lowercase() || c.is_ascii_digit() || c == ',' || c == '-';
+                if keep.is_empty() || !keep.chars().all(plain) {
+                    return None;
+                }
+                a.features = Some(keep.clone());
+            }
             "--json" => a.json = true,
             "--baseline" => a.baseline = Some(PathBuf::from(it.next()?)),
             _ if dir.is_none() && !x.starts_with('-') => dir = Some(PathBuf::from(x)),
@@ -92,6 +131,10 @@ fn parse(args: &[String]) -> Option<Args> {
     }
     a.dir = dir?;
     a.frames.checked_add(a.warmup)?;
+    // The native host's mask is `WRELA_FEATURES`, read as it opens its device.
+    if a.features.is_some() && !a.chrome {
+        return None;
+    }
     if a.baseline.is_some() && a.compare.is_some() {
         return None;
     }
@@ -110,6 +153,8 @@ fn parse(args: &[String]) -> Option<Args> {
 
 /// What a profile found.
 struct Profile {
+    /// `native` or `chrome`.
+    host: &'static str,
     environment: serde_json::Value,
     workload: serde_json::Value,
     build_sha256: String,
@@ -120,6 +165,10 @@ struct Profile {
     span: Option<Times>,
     /// A frame call's time on the CPU, ms: the median and the 95th percentile.
     frame: Times,
+    /// Chrome's: the interval between paced frames, ms, as a player sees them.
+    interval: Option<Times>,
+    /// Each executor counter's median a frame, in [`COUNTERS`]' order.
+    counters: Vec<(&'static str, f64)>,
     phases: wrela_host::Traced,
     /// Each pipeline's name and WGSL bytes, the largest first.
     wgsl: Vec<(String, u64)>,
@@ -221,6 +270,9 @@ fn run_report(a: &Args) -> Result<String, String> {
     }
     // A lock coordinates profiler instances on this machine; ordinary builds must be idle too.
     let _lease = comparison::lease(&std::env::temp_dir().join("wrela-profile.lock"))?;
+    if a.chrome {
+        return chrome_report(a, baseline.as_ref());
+    }
     let storage = comparison::Storage::new()?;
     let options = Options {
         storage: Some(storage.0.clone()),
@@ -239,13 +291,32 @@ fn run_report(a: &Args) -> Result<String, String> {
         comparison::compatible(&b.workload, &workload, "workload")?;
     }
     if a.compare.is_some() {
-        return comparison::run(a, &mut host, &options, &script, &built, &environment, &workload);
+        let mut sample = |dir: &Path| -> Result<Profile, String> {
+            host.restart_in(dir, &options).map_err(|e| e.to_string())?;
+            // Restart has joined the old program's workers. Each deferred init sees empty
+            // storage.
+            let storage = options.storage.as_ref().expect("isolated profile storage");
+            std::fs::remove_dir_all(storage).map_err(|e| e.to_string())?;
+            std::fs::create_dir(storage).map_err(|e| e.to_string())?;
+            measure(a, &mut host, &script, dir, &environment, &workload)
+        };
+        let env = environment.clone();
+        return comparison::run(a, &mut sample, &built, &|| Ok(env.clone()), &workload);
     }
     let p = measure(a, &mut host, &script, &built, &environment, &workload)?;
     if p.build_sha256 != frozen {
         return Err("build changed during measurement; discard this run".into());
     }
     Ok(if a.json { json(a, &p, baseline.as_ref()) } else { text(a, &p, baseline.as_ref()) })
+}
+
+/// A package built as `wrela build` builds it, into `build/profile`.
+fn build_into(dir: &Path) -> Result<PathBuf, String> {
+    let built = dir.join("build").join("profile");
+    crate::generated_path(dir, &built)?;
+    let out = wrela_driver::build(dir);
+    crate::write_build(&out, &built)?;
+    Ok(built)
 }
 
 /// A package built as `wrela build` builds it (into `build/profile`) and loaded on the native
@@ -255,13 +326,57 @@ fn load(
     input: Option<&Path>,
     options: &Options,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let built = dir.join("build").join("profile");
-    crate::generated_path(dir, &built)?;
-    let out = wrela_driver::build(dir);
-    crate::write_build(&out, &built)?;
+    let built = build_into(dir)?;
     let script = crate::read_script(input)?;
     let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
     Ok((host, script, built))
+}
+
+/// `--chrome`'s report: the build measured in headless Chrome (`profile/chrome.rs`).
+fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String> {
+    let built = build_into(&a.dir)?;
+    let script = crate::read_script(a.input.as_deref())?;
+    let workload = comparison::workload(a, &script);
+    // Test mode reads the script beside the page.
+    let place_input = |dir: &Path| -> Result<(), String> {
+        match &a.input {
+            Some(from) => std::fs::copy(from, dir.join("input.json"))
+                .map(|_| ())
+                .map_err(|e| format!("can't copy the input script: {e}")),
+            None => Ok(()),
+        }
+    };
+    let input = a.input.is_some();
+    let frozen = comparison::build_hash(&built)?;
+    if a.compare.is_some() {
+        let device = std::cell::RefCell::new(serde_json::Value::Null);
+        let mut sample = |dir: &Path| -> Result<Profile, String> {
+            place_input(dir)?;
+            let (p, d) = chrome::measure(a, dir, input)?;
+            *device.borrow_mut() = d;
+            Ok(p)
+        };
+        return comparison::run(
+            a,
+            &mut sample,
+            &built,
+            &|| chrome::environment(&device.borrow()),
+            &workload,
+        );
+    }
+    place_input(&built)?;
+    let (mut p, device) = chrome::measure(a, &built, input)?;
+    let environment = chrome::environment(&device)?;
+    if let Some(b) = baseline {
+        comparison::compatible_hardware(&b.environment, &environment)?;
+        comparison::compatible(&b.workload, &workload, "workload")?;
+    }
+    p.environment = environment;
+    p.workload = workload;
+    if p.build_sha256 != frozen || comparison::build_hash(&built)? != frozen {
+        return Err("build changed during measurement; discard this run".into());
+    }
+    Ok(if a.json { json(a, &p, baseline) } else { text(a, &p, baseline) })
 }
 
 fn measure(
@@ -281,17 +396,31 @@ fn measure(
     }
     host.take_timings().map_err(|e| e.to_string())?;
     host.trace().take();
+    host.take_counters();
     let init_warmup_ms = started.elapsed().as_secs_f64() * 1e3;
     let mut calls = Vec::with_capacity(a.frames as usize);
+    let mut counted: Vec<wrela_host::Counters> = Vec::with_capacity(a.frames as usize);
     for k in a.warmup..a.warmup + a.frames {
         let t = Instant::now();
         host.lockstep_frame(k, 60.0, w, h, script).map_err(|e| format!("in frame {k}: {e}"))?;
         calls.push(t.elapsed().as_secs_f64() * 1e3);
+        counted.push(host.take_counters());
     }
+    let counters = COUNTERS
+        .iter()
+        .enumerate()
+        .map(|(i, &name)| {
+            let xs = counted.iter().map(|c| c.fields()[i].1 as f64).collect();
+            (name, median(xs).unwrap_or(0.0))
+        })
+        .collect();
     let timings = host.take_timings().map_err(|e| e.to_string())?;
     let phases = host.trace().take();
     let spans: Vec<f64> = wrela_host::frame_spans(&timings).into_iter().map(|(_, ms)| ms).collect();
     Ok(Profile {
+        host: "native",
+        interval: None,
+        counters,
         environment: environment.clone(),
         workload: workload.clone(),
         build_sha256: comparison::build_hash(built)?,
@@ -395,7 +524,7 @@ fn was(baseline: Option<&Baseline>, then: Option<f64>, now: f64) -> String {
 /// The report for people.
 fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     let (w, h) = a.size;
-    let mut s = format!("`{}`: {} frames at {w}×{h}\n", a.dir.display(), a.frames);
+    let mut s = format!("`{}`: {} frames at {w}×{h}, on {}\n", a.dir.display(), a.frames, p.host);
     s.push_str(&format!(
         "{}\nwarmup: {} frames; init and warmup: {:.3} ms\n",
         p.environment["adapter"].as_str().unwrap_or(""),
@@ -456,8 +585,18 @@ fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
         p.frame.p95,
         was(baseline, baseline.and_then(|b| b.frame), p.frame.median)
     ));
+    if let Some(i) = p.interval {
+        s.push_str(&format!(
+            "  {:<32} {:>9.3} ms {:>9.3} ms (paced, two frames in flight: as a player sees them)\n",
+            "the interval between frames", i.median, i.p95
+        ));
+    }
     if !p.phases.phases.is_empty() {
         s.push_str(&format!("  phases over the run: {}\n", p.phases.phases_line()));
+    }
+    s.push_str("\nthe executor, each frame's median\n");
+    for (name, v) in &p.counters {
+        s.push_str(&format!("  {:<32} {:>9}\n", name.replace('_', " "), v));
     }
     let total: u64 = p.wgsl.iter().map(|(_, b)| b).sum();
     s.push_str(&format!(
@@ -506,8 +645,11 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     let wgsl: Vec<_> =
         p.wgsl.iter().map(|(n, b)| serde_json::json!({ "pipeline": n, "bytes": b })).collect();
     let span = p.span.filter(|_| !a.serial);
+    let counters: serde_json::Map<String, serde_json::Value> =
+        p.counters.iter().map(|(k, v)| ((*k).to_string(), (*v).into())).collect();
     let mut all = serde_json::json!({
         "schema": 2,
+        "host": p.host,
         "environment": p.environment,
         "workload": p.workload,
         "build_sha256": p.build_sha256,
@@ -522,8 +664,13 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
             "labels": labels,
         },
         "cpu": { "frame_ms": p.frame.median, "frame_p95_ms": p.frame.p95, "phases": phases },
+        "counters": counters,
         "wgsl": wgsl,
     });
+    if let Some(i) = p.interval {
+        all["cpu"]["frame_interval_ms"] = i.median.into();
+        all["cpu"]["frame_interval_p95_ms"] = i.p95.into();
+    }
     if let Some(b) = baseline {
         if let Some(then) = b.span {
             all["gpu"]["was_span_ms"] = then.into();

@@ -864,7 +864,9 @@ impl Checker {
         }
         let b = t.format.block();
         if b > 1 {
-            let whole = |at: u32, n: u32, side: u32| at % b == 0 && (n % b == 0 || at + n == side);
+            let whole = |at: u32, n: u32, side: u32| {
+                at.is_multiple_of(b) && (n.is_multiple_of(b) || at + n == side)
+            };
             if !whole(x, width, w) || !whole(y, height, h) {
                 return err(format!(
                     "{doing} {width}x{height} texels at ({x}, {y}) of texture {handle} cuts its {b}x{b} blocks"

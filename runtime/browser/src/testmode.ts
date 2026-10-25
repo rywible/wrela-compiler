@@ -1,8 +1,12 @@
 // Test mode: `index.html#test&frames=60&width=1920&height=1080&fps=60&workers=4&audio=750` runs a
 // fixed number of frames at fixed times and canvas size, its parallel jobs on a fixed number of
 // threads (the program's own included), then saves the last frame, the state hash, the lines
-// the program printed (`log.txt`) and each frame's CPU time, when it began, and the frame each
-// printed line came in (`frames.json`) to `results/` for whoever runs the page (the compiler's
+// the program printed (`log.txt`), each frame's CPU time, when it began, the phases it timed
+// (`std::time::phase`, ms by name) and the frame each printed line came in (`frames.json`), and
+// what the executor did each frame below the stream (`counters.json`: passes, dispatches, draws
+// and draw calls, buffer and texture writes, bind groups and pipelines set), and the adapter and
+// the features the program saw (`device.json`) to `results/` for
+// whoever runs the page (the compiler's
 // tests' `wrela_host::pages`, a tool's browser). With `audio`, the main thread also renders that many
 // quanta of the program's voice offline, in an AudioWorklet, and saves the samples (and how long
 // the render took, `audio-ms.json`); with `live=s`, it plays the voice in real time for s seconds
