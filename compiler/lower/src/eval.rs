@@ -221,6 +221,7 @@ pub(crate) fn zero_scalar(s: ir::Scalar) -> ir::Const {
         ir::Scalar::U64 => ir::Const::U64(0),
         ir::Scalar::F32 => ir::Const::F32(0.0),
         ir::Scalar::F64 => ir::Const::F64(0.0),
+        ir::Scalar::F16 => ir::Const::F16(0.0),
         s => ir::Const::Small(s, 0),
     }
 }
@@ -652,6 +653,7 @@ fn read_scalar(mem: &Memory, s: ir::Scalar, at: u32) -> Result<ir::Const, String
         ir::Scalar::U64 => ir::Const::U64(u64::from_le_bytes(b(8)?.try_into().expect("8"))),
         ir::Scalar::F32 => ir::Const::F32(f32::from_le_bytes(b(4)?.try_into().expect("4"))),
         ir::Scalar::F64 => ir::Const::F64(f64::from_le_bytes(b(8)?.try_into().expect("8"))),
+        ir::Scalar::F16 => return Err("an `f16` is GPU-only: the build doesn't compute one".into()),
         ir::Scalar::I8 => ir::Const::Small(s, i64::from(b(1)?[0] as i8)),
         ir::Scalar::U8 => ir::Const::Small(s, i64::from(b(1)?[0])),
         ir::Scalar::I16 => {

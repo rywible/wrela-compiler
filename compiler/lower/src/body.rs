@@ -2749,8 +2749,10 @@ pub(crate) fn lit_const(types: &ir::Types, l: Lit, ty: ir::TypeId) -> Option<ir:
         (Lit::Int(v), ir::Scalar::U64) => ir::Const::U64(v as u64),
         (Lit::Int(v), ir::Scalar::F32) => ir::Const::F32(v as f32),
         (Lit::Int(v), ir::Scalar::F64) => ir::Const::F64(v as f64),
+        (Lit::Int(v), ir::Scalar::F16) => ir::Const::F16(v as f32),
         (Lit::Int(v), s) => ir::Const::Small(s, v as i64),
         (Lit::Float(_, f), ir::Scalar::F32) => ir::Const::F32(f),
+        (Lit::Float(_, f), ir::Scalar::F16) => ir::Const::F16(f),
         (Lit::Float(v, _), _) => ir::Const::F64(v),
     })
 }

@@ -365,6 +365,7 @@ impl Ad<'_> {
     fn fc(&mut self, out: &mut Block, ty: TypeId, x: f64) -> ValueId {
         let (t, c) = match self.m.types.element_scalar(ty) {
             Some(Scalar::F64) => (self.m.types.scalar(Scalar::F64), Const::F64(x)),
+            Some(Scalar::F16) => (self.m.types.scalar(Scalar::F16), Const::F16(x as f32)),
             _ => (self.m.types.f32(), Const::F32(x as f32)),
         };
         self.emit(out, t, Expr::Const(c))
@@ -975,7 +976,7 @@ impl Ad<'_> {
                     "can't differentiate through a texture read: its texels are data, not code",
                 ));
             }
-            Expr::Atomic(..) | Expr::Barrier | Expr::Discard => {
+            Expr::Atomic(..) | Expr::Barrier | Expr::Subgroup(..) | Expr::Discard => {
                 return Err(Error::not_derivable(
                     "can't differentiate through an atomic or a barrier: derived code is pure",
                 ));

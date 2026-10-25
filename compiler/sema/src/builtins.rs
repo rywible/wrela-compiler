@@ -31,6 +31,7 @@ impl BuiltinTy {
             "u64" => BuiltinTy::Int(IntTy::U64),
             "f32" => BuiltinTy::Float(FloatTy::F32),
             "f64" => BuiltinTy::Float(FloatTy::F64),
+            "f16" => BuiltinTy::Float(FloatTy::F16),
             "mat2" => BuiltinTy::Mat(2, 2),
             "mat3" => BuiltinTy::Mat(3, 3),
             "mat4" => BuiltinTy::Mat(4, 4),

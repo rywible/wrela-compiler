@@ -11,8 +11,11 @@ use std::abi::{
     FORMAT_R8UNORM_BYTES, FORMAT_RG8UNORM, FORMAT_RG8UNORM_BYTES, FORMAT_RGB10A2UNORM,
     FORMAT_RGB10A2UNORM_BYTES, FORMAT_RG32FLOAT, FORMAT_RG32FLOAT_BYTES, FORMAT_RGBA32FLOAT,
     FORMAT_RGBA32FLOAT_BYTES, FORMAT_RG32UINT, FORMAT_RG32UINT_BYTES, FORMAT_RG11B10UFLOAT,
-    FORMAT_RG11B10UFLOAT_BYTES, KIND_2D, KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D,
-    TEXTURE_WRITABLE,
+    FORMAT_RG11B10UFLOAT_BYTES, FORMAT_BC1_RGBA_UNORM, FORMAT_BC1_RGBA_UNORM_BYTES,
+    FORMAT_BC4_R_UNORM, FORMAT_BC4_R_UNORM_BYTES, FORMAT_BC5_RG_UNORM, FORMAT_BC5_RG_UNORM_BYTES,
+    FORMAT_BC7_RGBA_UNORM, FORMAT_BC7_RGBA_UNORM_BYTES, FORMAT_ETC2_RGB8UNORM,
+    FORMAT_ETC2_RGB8UNORM_BYTES, FORMAT_ASTC_4X4_UNORM, FORMAT_ASTC_4X4_UNORM_BYTES, KIND_2D,
+    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE,
 }
 use std::io::{IoError, Pending, next_request}
 use std::mem::{Drop, size_of}
@@ -193,6 +196,18 @@ pub struct VertexIndex: Copy {
 /// A vertex shader's instance number.
 pub struct InstanceIndex: Copy {
     pub index: u32,
+}
+
+/// A kernel invocation's index in its subgroup, from 0 to `SubgroupSize`'s less one: a kernel's
+/// parameter, on a device with `features().subgroups` (§18.10).
+pub struct SubgroupInvocation: Copy {
+    pub index: u32,
+}
+
+/// How many invocations the kernel's subgroups have: between `features().subgroup_min` and
+/// `subgroup_max`, the same for every subgroup of a dispatch. A kernel's parameter.
+pub struct SubgroupSize: Copy {
+    pub size: u32,
 }
 
 /// A fragment's window position: pixel centres are at half-integers.
@@ -762,6 +777,134 @@ impl Filtered for Rg11b10Float {}
 
 impl Target for Rg11b10Float {}
 
+/// BC1: 4 × 4 texels of RGB (and 1-bit alpha) in 8 bytes. A texture of it exists only on a device
+/// with `features().bc`; its texels are written as blocks (a kernel encodes them into a buffer,
+/// `copy_buffer_to_texture` moves them, or `write` takes rows of blocks), and shaders sample it.
+pub struct Bc1 {}
+
+/// BC4: 4 × 4 texels of one channel in 8 bytes (`features().bc`).
+pub struct Bc4 {}
+
+/// BC5: 4 × 4 texels of two channels in 16 bytes: normals (`features().bc`).
+pub struct Bc5 {}
+
+/// BC7: 4 × 4 texels of RGBA in 16 bytes (`features().bc`).
+pub struct Bc7 {}
+
+/// ETC2: 4 × 4 texels of RGB in 8 bytes (`features().etc2`).
+pub struct Etc2Rgb8 {}
+
+/// ASTC: 4 × 4 texels of RGBA in 16 bytes (`features().astc`).
+pub struct Astc4x4 {}
+
+impl Format for Bc1 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_BC1_RGBA_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC1_RGBA_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc1 {}
+
+impl Format for Bc4 {
+    type Texel = f32
+    fn code() -> u32 {
+        FORMAT_BC4_R_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC4_R_UNORM_BYTES
+    }
+    fn rgba(t: f32) -> vec4 {
+        vec4(t, 0.0, 0.0, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc4 {}
+
+impl Format for Bc5 {
+    type Texel = vec2
+    fn code() -> u32 {
+        FORMAT_BC5_RG_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC5_RG_UNORM_BYTES
+    }
+    fn rgba(t: vec2) -> vec4 {
+        vec4(t, 0.0, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc5 {}
+
+impl Format for Bc7 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_BC7_RGBA_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_BC7_RGBA_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Bc7 {}
+
+impl Format for Etc2Rgb8 {
+    type Texel = vec3
+    fn code() -> u32 {
+        FORMAT_ETC2_RGB8UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_ETC2_RGB8UNORM_BYTES
+    }
+    fn rgba(t: vec3) -> vec4 {
+        vec4(t, 1.0)
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Etc2Rgb8 {}
+
+impl Format for Astc4x4 {
+    type Texel = vec4
+    fn code() -> u32 {
+        FORMAT_ASTC_4X4_UNORM
+    }
+    fn bytes() -> u32 {
+        FORMAT_ASTC_4X4_UNORM_BYTES
+    }
+    fn rgba(t: vec4) -> vec4 {
+        t
+    }
+    fn block() -> u32 {
+        4
+    }
+}
+
+impl Filtered for Astc4x4 {}
+
 /// A 2D colour texture on the GPU, its texels of format `F`: an owned value, like a
 /// `GpuBuffer`. CPU code makes one, writes texels into it, draws into it in a pass and passes
 /// it to shaders, which read it. Dropping it releases it. It has `levels` mip levels, each half
@@ -1135,8 +1278,9 @@ fn level_side(side: u32, level: u32) -> u32 {
     max(1, side >> level)
 }
 
-/// Writes `bytes` (rows top to bottom, `F::bytes()` a texel) into the rectangle of level
-/// `level`, layer `layer` of texture `handle`, whose level is `w` × `h`.
+/// Writes `bytes` (rows top to bottom, `row` bytes each: a row of texels, or of a compressed
+/// format's `block` × `block` blocks) into the rectangle of level `level`, layer `layer` of
+/// texture `handle`, whose level is `w` × `h`.
 fn write_rows(
     handle: u32,
     w: u32,
@@ -1149,21 +1293,38 @@ fn write_rows(
     height: u32,
     bytes: [u8],
     row: u32,
+    block: u32,
 ) {
     if x > w || width > w - x || y > h || height > h - y {
         panic("write: the rectangle runs past the texture's edge")
     }
-    if bytes.len() != row * height {
-        panic("write: the bytes aren't `width * height` texels")
+    let rows = blocks(height, block)
+    if bytes.len() != row * rows {
+        panic(
+            "write: the bytes aren't the rectangle's texels (rows of blocks, for a compressed format)",
+        )
     }
     if row == 0 || height == 0 {
         return
     }
-    let rows = max(1, TEXTURE_WRITE_BYTES / row)
+    let fit = max(1, TEXTURE_WRITE_BYTES / row)
     var done = 0
-    while done < height {
-        let n = min(rows, height - done)
-        write_texture_rows(handle, level, layer, x, y + done, width, n, bytes, done * row, n * row)
+    while done < rows {
+        let n = min(fit, rows - done)
+        // In texels: a block's rows, but at the rectangle's last, which may be short.
+        let texel_rows = min(n * block, height - done * block)
+        write_texture_rows(
+            handle,
+            level,
+            layer,
+            x,
+            y + done * block,
+            width,
+            texel_rows,
+            bytes,
+            done * row,
+            n * row,
+        )
         done += n
     }
 }
@@ -1194,7 +1355,8 @@ impl<F: Format> Texture<F> {
             panic("write: the texture has no such level")
         }
         let (w, h) = (level_side(self.width, level), level_side(self.height, level))
-        write_rows(self.handle, w, h, level, 0, x, y, width, height, bytes, width * F::bytes())
+        let row = blocks(width, F::block()) * F::bytes()
+        write_rows(self.handle, w, h, level, 0, x, y, width, height, bytes, row, F::block())
     }
 
     /// The texel at (`x`, `y`) of level `level`, unfiltered: any GPU code.
@@ -1317,7 +1479,8 @@ impl<F: Format> TextureArray<F> {
             panic("write: the array has no such layer or level")
         }
         let (w, h) = (level_side(self.width, level), level_side(self.height, level))
-        write_rows(self.handle, w, h, level, layer, x, y, width, height, bytes, width * F::bytes())
+        let row = blocks(width, F::block()) * F::bytes()
+        write_rows(self.handle, w, h, level, layer, x, y, width, height, bytes, row, F::block())
     }
 
     /// The texel at (`x`, `y`) of layer `layer`'s level `level`, unfiltered: any GPU code.
@@ -2901,6 +3064,66 @@ pub fn limits() -> Limits {
 @intrinsic
 fn limit(index: u32) -> u32 {}
 
+/// The GPU's optional features (§18.10): the hosts open the device with every one the adapter
+/// has, and a program checks before it records what needs one (a format's capability, a kernel
+/// that uses subgroups), keeping a path for a device without it. None is required. It's
+/// `nondet`: another GPU gives other answers. (Test mode's `features=none` shows a program a
+/// device without them, so its fallback paths run on a device that has them.)
+pub struct Features: Copy {
+    /// Half floats in GPU code (`shader-f16`).
+    pub f16: bool,
+    /// Subgroup operations (`subgroups`): `subgroup_add` and the rest, and `SubgroupId`.
+    pub subgroups: bool,
+    /// The least and the most invocations a subgroup has (0 without `subgroups`).
+    pub subgroup_min: u32,
+    pub subgroup_max: u32,
+    /// BC compressed textures (`texture-compression-bc`): `Bc1`, `Bc4`, `Bc5`, `Bc7`.
+    pub bc: bool,
+    /// ETC2 compressed textures: `Etc2Rgb8`.
+    pub etc2: bool,
+    /// ASTC compressed textures: `Astc4x4`.
+    pub astc: bool,
+    /// `R32Float`, `Rg32Float` and `Rgba32Float` filtered (`float32-filterable`).
+    pub float32_filterable: bool,
+    /// Draws blending into `R32Float`, `Rg32Float` and `Rgba32Float` (`float32-blendable`).
+    pub float32_blendable: bool,
+    /// Passes drawing into `Rg11b10Float` (`rg11b10ufloat-renderable`).
+    pub rg11b10_renderable: bool,
+    pub bgra8_storage: bool,
+    /// GPU timing (`timestamp-query`): `timed`.
+    pub timestamps: bool,
+    /// Several indirect draws in one call (`draw_multi` draws them one by one without it).
+    pub multi_draw_indirect: bool,
+    /// Always true: every host requires it.
+    pub indirect_first_instance: bool,
+    /// 64-bit atomic minimum and maximum: false on every host, since neither WebGPU's core nor
+    /// a shipped browser has them yet (docs/toolchain-gaps.md in rywible/wrela).
+    pub atomic64_min_max: bool,
+}
+
+/// The GPU's optional features.
+pub fn features() -> Features {
+    let bits = limit(10)
+    let has = |i: u32| (bits & (1 << i)) != 0
+    Features {
+        f16: has(0),
+        subgroups: has(1),
+        subgroup_min: limit(11),
+        subgroup_max: limit(12),
+        bc: has(2),
+        etc2: has(3),
+        astc: has(4),
+        float32_filterable: has(5),
+        float32_blendable: has(6),
+        rg11b10_renderable: has(7),
+        bgra8_storage: has(8),
+        timestamps: has(9),
+        multi_draw_indirect: has(10),
+        indirect_first_instance: has(11),
+        atomic64_min_max: false,
+    }
+}
+
 // ---- workgroup memory, atomics, appending and maps (§18.4, §18.5) -------------------------------
 
 /// Workgroup memory: `N` `T`s that all of a workgroup's invocations share, as a kernel's
@@ -2968,6 +3191,211 @@ impl<T, const N: u32> Shared<T, N> {
 /// workgroup's invocations together, so it's in uniform control flow (E0608).
 pub fn barrier<T, const N: u32>(shared: mut Shared<T, N>) {
     workgroup_barrier(mut shared)
+}
+
+/// Workgroup memory of `N` `u32`s that any of a workgroup's invocations may change at once,
+/// each operation whole (a kernel's `mut SharedAtomics<N>` parameter; CPU code doesn't pass
+/// it): a histogram's bins, a compaction's counters, a scatter to any index. Its elements start
+/// zeroed. Its own operations need no barrier between them; a barrier (`atomics.barrier()`)
+/// before reading what every invocation added sees all of it.
+pub struct SharedAtomics<const N: u32> {
+    unused: u32,
+}
+
+impl<const N: u32> SharedAtomics<N> {
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> u32 {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`: a scatter that can't race.
+    pub fn store(mut self, i: u32, value: u32) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: u32) -> u32 {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: u32) -> u32 {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: u32) -> u32 {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: u32) -> u32 {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: u32) -> u32 {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: u32) -> u32 {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: u32) -> u32 {
+        atomic_exchange(mut self, i, value)
+    }
+
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: u32, new: u32) -> u32 {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+
+    /// Waits until every invocation of the workgroup has reached it: what each added before it
+    /// is in every element read after it. In uniform control flow (E0608).
+    pub fn barrier(mut self) {
+        atomics_barrier(mut self)
+    }
+}
+
+@intrinsic
+fn atomics_barrier<const N: u32>(shared: mut SharedAtomics<N>) {}
+
+/// The sum of `value` over the invocations of the workgroup before this one (by `LocalId`'s
+/// index: an exclusive prefix sum), the building block of a compaction: each invocation's place
+/// in a list of what's kept. `shared` holds one element for each of the workgroup's
+/// invocations (`N` its size); after the call, element `N - 1` plus the last invocation's
+/// `value` is the workgroup's total, and the scan's last step leaves each element its inclusive
+/// sum. A Hillis–Steele scan: log2(N) steps, each a barrier apart, so every invocation reaches it
+/// (uniform control flow). `subgroup_prefix_sum` gives the same results on a device with
+/// `subgroups`.
+pub fn workgroup_prefix_sum<const N: u32>(
+    shared: mut Shared<u32, N>,
+    lid: LocalId,
+    value: u32,
+) -> u32 {
+    let c = shared.chunk(lid)
+    let i = c.index(0)
+    shared.write(c, 0, value)
+    barrier(mut shared)
+    var sum = value
+    var offset = 1
+    while offset < N {
+        let add = if i >= offset { shared.get(i - offset) } else { 0 }
+        barrier(mut shared)
+        sum += add
+        shared.write(c, 0, sum)
+        barrier(mut shared)
+        offset = offset * 2
+    }
+    sum - value
+}
+
+// ---- subgroups (§18.10) --------------------------------------------------------------------------
+//
+// A subgroup is a set of a kernel's invocations that run in lockstep (a SIMD group: 32 on
+// most GPUs, 4 to 128 on others): its operations combine their values without workgroup
+// memory or barriers. Kernels only, on a device with `features().subgroups`; a pipeline that
+// uses one needs the feature, and its program keeps a path without (`workgroup_prefix_sum`
+// for `subgroup_prefix_sum`). Each is called by all of the workgroup's invocations together
+// (uniform control flow, E0610). They take an `i32`, `u32`, `f32` or `f16`, or a vector of
+// them, unless they say otherwise.
+
+/// The sum of `x` over the subgroup.
+@intrinsic
+pub fn subgroup_add<T>(x: T) -> T {}
+
+/// The sum of `x` over the invocations of the subgroup before this one (0 for the first).
+@intrinsic
+pub fn subgroup_exclusive_add<T>(x: T) -> T {}
+
+/// The sum of `x` over the invocations of the subgroup up to this one.
+@intrinsic
+pub fn subgroup_inclusive_add<T>(x: T) -> T {}
+
+/// The least `x` of the subgroup.
+@intrinsic
+pub fn subgroup_min<T>(x: T) -> T {}
+
+/// The greatest `x` of the subgroup.
+@intrinsic
+pub fn subgroup_max<T>(x: T) -> T {}
+
+/// The bitwise and of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_and<T>(x: T) -> T {}
+
+/// The bitwise or of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_or<T>(x: T) -> T {}
+
+/// The bitwise exclusive or of `x` (an `i32` or `u32`) over the subgroup.
+@intrinsic
+pub fn subgroup_xor<T>(x: T) -> T {}
+
+/// Whether `b` is true for any invocation of the subgroup.
+@intrinsic
+pub fn subgroup_any(b: bool) -> bool {}
+
+/// Whether `b` is true for every invocation of the subgroup.
+@intrinsic
+pub fn subgroup_all(b: bool) -> bool {}
+
+/// A bit for each invocation of the subgroup, set where `b` is true: invocation `i`'s is bit
+/// `i % 32` of component `i / 32`.
+@intrinsic
+pub fn subgroup_ballot(b: bool) -> vec4u {}
+
+/// `x` of the subgroup's first active invocation.
+@intrinsic
+pub fn subgroup_broadcast_first<T>(x: T) -> T {}
+
+/// `x` of invocation `from` of the subgroup.
+@intrinsic
+pub fn subgroup_shuffle<T>(x: T, from: u32) -> T {}
+
+/// `workgroup_prefix_sum`'s results with subgroup operations: each subgroup scans its own
+/// values, writes its total, and adds the totals of the subgroups before it: one barrier, not
+/// `workgroup_prefix_sum`'s 2 log2(N) + 1. `shared` holds one element for each of the
+/// workgroup's invocations (`N` its size, as for `workgroup_prefix_sum`, which it replaces where
+/// `features().subgroups`); after the call each element holds its subgroup's total. A
+/// subgroup is a run of consecutive `LocalId` indices (as every GPU forms them for a
+/// one-dimensional workgroup: the results are `workgroup_prefix_sum`'s exactly then). Uniform
+/// control flow.
+pub fn subgroup_prefix_sum<const N: u32>(
+    shared: mut Shared<u32, N>,
+    lid: LocalId,
+    lane: SubgroupInvocation,
+    width: SubgroupSize,
+    value: u32,
+) -> u32 {
+    let c = shared.chunk(lid)
+    let i = c.index(0)
+    let mine = subgroup_exclusive_add(value)
+    shared.write(c, 0, subgroup_add(value))
+    barrier(mut shared)
+    // Subgroup `g`'s total is at its first element, `g * width`: add those before this one's,
+    // a subgroup's width of them at a time.
+    let n = width.size
+    let g = i / n
+    let groups = (N + n - 1) / n
+    var before = 0
+    var base = 0
+    while base < groups {
+        let k = base + lane.index
+        let theirs = if k < g { shared.get(k * n) } else { 0 }
+        before += subgroup_add(theirs)
+        base += n
+    }
+    before + mine
 }
 
 /// An indirect draw's arguments (`draw(pass, vs, fs, indirect: buf)`, of a `GpuBuffer` or span of

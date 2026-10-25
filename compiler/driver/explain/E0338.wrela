@@ -1,0 +1,12 @@
+// A type only GPU code has, in CPU code: `f16` and its vectors (`vec2h`, `vec3h`, `vec4h`). WASM
+// has no half floats: CPU code computes in `f32`, a kernel converts with `f16(x)` and `f32(h)`,
+// and buffers hold half floats packed two to a `u32` (`std::gpu::Half2`).
+// ---- wrong
+pub fn frame(time: f32, width: u32, height: u32) {
+    let half = f16(time)
+    let _ = f32(half) * 2.0
+}
+// ---- fixed
+pub fn frame(time: f32, width: u32, height: u32) {
+    let _ = time * 2.0
+}

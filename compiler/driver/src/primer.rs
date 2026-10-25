@@ -322,6 +322,11 @@ pub const RULES: &[(&str, &str)] = &[
         "a texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into",
     ),
     // §18.9 pipelines
+    // §18.10 optional features
+    (
+        "gpu.features",
+        "half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature",
+    ),
     ("build.budget", "a shipped build's pipelines have at most 256 KiB of WGSL each"),
 ];
 

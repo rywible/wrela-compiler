@@ -3803,6 +3803,7 @@ dependencies = [
 name = "wrela-wgsl"
 version = "0.6.0"
 dependencies = [
+ "half",
  "naga",
  "wrela-ir",
 ]

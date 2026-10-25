@@ -1,5 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
-import { openDevice } from "../src/device.ts";
+import { featureNames } from "../src/check.ts";
+import { deviceLimits, openDevice } from "../src/device.ts";
 import { UnsupportedError } from "../src/errors.ts";
 
 const original = Object.getOwnPropertyDescriptor(navigator, "gpu");
@@ -45,4 +46,21 @@ test("an adapter without indirect first instances fails before requesting a devi
   await expect(openDevice(() => {})).rejects.toThrow("indirect-first-instance");
   await expect(openDevice(() => {})).rejects.toBeInstanceOf(UnsupportedError);
   expect(requestDevice).not.toHaveBeenCalled();
+});
+
+test("features=none hides every optional feature from the program, as the native host's mask does", async () => {
+  const device = { addEventListener: mock(() => {}), lost: new Promise(() => {}), limits: {} };
+  const requestDevice = mock(async (_descriptor: GPUDeviceDescriptor) => device);
+  const has = ["shader-f16", "subgroups", "texture-compression-bc", "timestamp-query", "indirect-first-instance"];
+  const requestAdapter = mock(async () => ({ info: { isFallbackAdapter: false, subgroupMinSize: 32, subgroupMaxSize: 32 }, limits: {},
+    features: new Set(has), requestDevice }));
+  Object.defineProperty(navigator, "gpu", { configurable: true, value: { requestAdapter } });
+  const all = await openDevice(() => {});
+  expect(featureNames(deviceLimits(all)[10]!)).toEqual(["shader-f16", "subgroups", "texture-compression-bc", "timestamp-query", "indirect-first-instance"]);
+  expect(deviceLimits(all)[11]).toBe(32);
+  const none = await openDevice(() => {}, "none");
+  expect(featureNames(deviceLimits(none)[10]!)).toEqual(["indirect-first-instance"]);
+  expect(deviceLimits(none)[12]).toBe(0);
+  const some = await openDevice(() => {}, "subgroups");
+  expect(featureNames(deviceLimits(some)[10]!)).toEqual(["subgroups", "indirect-first-instance"]);
 });

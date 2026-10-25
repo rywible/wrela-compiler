@@ -29,6 +29,8 @@ pub enum Collective {
     SampleCompare,
     /// `workgroupBarrier`: for all the invocations of a workgroup.
     Barrier,
+    /// A subgroup operation: for all the invocations of a subgroup.
+    Subgroup(crate::SubgroupOp),
 }
 
 impl Collective {
@@ -41,6 +43,7 @@ impl Collective {
             Collective::Sample => "textureSample",
             Collective::SampleCompare => "textureSampleCompare",
             Collective::Barrier => "workgroupBarrier",
+            Collective::Subgroup(op) => op.wgsl_name(),
         }
     }
 }
@@ -357,7 +360,11 @@ impl Fa<'_, '_> {
             Expr::EntryInput(i) => {
                 cf || !matches!(
                     self.an.inputs.get(*i as usize),
-                    Some(BuiltinInput::WorkgroupId | BuiltinInput::NumWorkgroups)
+                    Some(
+                        BuiltinInput::WorkgroupId
+                            | BuiltinInput::NumWorkgroups
+                            | BuiltinInput::SubgroupSize
+                    )
                 )
             }
             Expr::Param(i) => cf || st.params[*i as usize],
@@ -375,6 +382,12 @@ impl Fa<'_, '_> {
             Expr::Barrier => {
                 self.collective(Collective::Barrier, v, cf);
                 false
+            }
+            // Every invocation of the subgroup must reach it together; what it gives differs
+            // between subgroups (and, for a scan or a shuffle, between invocations).
+            Expr::Subgroup(op, _) => {
+                self.collective(Collective::Subgroup(*op), v, cf);
+                true
             }
             // Another invocation may have changed what's there.
             Expr::Atomic(..) => true,

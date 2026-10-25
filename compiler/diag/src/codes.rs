@@ -189,6 +189,7 @@ codes! {
     E0335 = "E0335", "`yield` outside a job";
     E0336 = "E0336", "a `@job fn` that can't be a job, or a job used as a function";
     E0337 = "E0337", "a walk over `fields(self)` outside a `@fieldwise` trait, or one it can't unroll";
+    E0338 = "E0338", "a GPU-only type (`f16`, `vecNh`) in CPU code";
 
     // ---- E04xx: traits and generics --------------------------------------------------------
     E0400 = "E0400", "a type that doesn't implement a trait";
@@ -247,7 +248,7 @@ codes! {
     E0607 = "E0607", "a GPU feature where it doesn't exist";
         E0608 = "E0608", "a derivative in non-uniform control flow";
     E0609 = "E0609", "workgroup memory read and written with no barrier between";
-    E0610 = "E0610", "a barrier in non-uniform control flow";
+    E0610 = "E0610", "a barrier or a subgroup operation in non-uniform control flow";
 
     // ---- E07xx: derived interpretations and back ends --------------------------------------
     E0700 = "E0700", "a function that can't be derived";

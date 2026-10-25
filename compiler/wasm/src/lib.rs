@@ -510,6 +510,7 @@ fn write_const(
             ir::Const::U64(x) => put(&x.to_le_bytes()),
             ir::Const::F32(x) => put(&x.to_le_bytes()),
             ir::Const::F64(x) => put(&x.to_le_bytes()),
+            ir::Const::F16(_) => return Err("an `f16` constant in CPU data".into()),
             // 8- and 16-bit integers: their low bytes.
             ir::Const::Small(_, x) => put(&x.to_le_bytes()[..s.bytes() as usize]),
         },

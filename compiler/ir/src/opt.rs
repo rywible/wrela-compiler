@@ -359,6 +359,7 @@ fn same_const(a: &Const, b: &Const) -> bool {
     match (a, b) {
         (Const::F32(x), Const::F32(y)) => x.to_bits() == y.to_bits(),
         (Const::F64(x), Const::F64(y)) => x.to_bits() == y.to_bits(),
+        (Const::F16(x), Const::F16(y)) => x.to_bits() == y.to_bits(),
         _ => a == b,
     }
 }
@@ -495,6 +496,7 @@ impl Hash for CseKey {
                 Const::Small(s, x) => (s, x).hash(h),
                 Const::F32(x) => x.to_bits().hash(h),
                 Const::F64(x) => x.to_bits().hash(h),
+                Const::F16(x) => x.to_bits().hash(h),
             },
             Expr::Zero(t) => t.hash(h),
             // The operation too, as `==` compares it: `a + b` and `a * b` hash apart.
@@ -1116,6 +1118,7 @@ fn outlined_with(
                     }
                     Expr::EntryInput(_)
                     | Expr::Barrier
+                    | Expr::Subgroup(..)
                     | Expr::Discard
                     | Expr::Atomic(..)
                     | Expr::Texture(..)

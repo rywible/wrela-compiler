@@ -285,6 +285,7 @@ fn scalar_tag(s: ir::Scalar) -> u8 {
         S::U64 => 8,
         S::F32 => 9,
         S::F64 => 10,
+        S::F16 => 11,
     }
 }
 
@@ -302,6 +303,7 @@ fn scalar_of(t: u8) -> Option<ir::Scalar> {
         8 => S::U64,
         9 => S::F32,
         10 => S::F64,
+        11 => S::F16,
         _ => return None,
     })
 }
@@ -337,6 +339,10 @@ fn put_const(out: &mut Vec<u8>, c: &ir::Const) {
         }
         ir::Const::F64(x) => {
             out.push(7);
+            out.extend_from_slice(&x.to_bits().to_le_bytes());
+        }
+        ir::Const::F16(x) => {
+            out.push(8);
             out.extend_from_slice(&x.to_bits().to_le_bytes());
         }
     }
@@ -417,6 +423,7 @@ impl Reader<'_> {
             }
             6 => ir::Const::F32(f32::from_bits(self.u32()?)),
             7 => ir::Const::F64(f64::from_bits(self.u64()?)),
+            8 => ir::Const::F16(f32::from_bits(self.u32()?)),
             _ => return None,
         })
     }

@@ -33,7 +33,10 @@ fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef>
 
 /// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
 pub fn shares_memory(p: &Program, f: FnId) -> bool {
-    p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty) == Some(Lang::Shared))
+    p.func(f)
+        .params
+        .iter()
+        .any(|ps| matches!(p.lang_of_ty(ps.ty), Some(Lang::Shared | Lang::SharedAtomics)))
 }
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
@@ -78,7 +81,7 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
         let ty = ps.ty;
         let lang = p.lang_of_ty(ty);
         if BuiltinInput::of(p, ty).is_some()
-            || lang == Some(Lang::Shared)
+            || matches!(lang, Some(Lang::Shared | Lang::SharedAtomics))
             || is_varyings(p, entry, ty)
         {
             continue;
@@ -201,6 +204,8 @@ pub enum BuiltinInput {
     VertexIndex,
     InstanceIndex,
     FragCoord,
+    SubgroupInvocation,
+    SubgroupSize,
 }
 
 impl BuiltinInput {
@@ -213,6 +218,8 @@ impl BuiltinInput {
             Lang::VertexIndex => BuiltinInput::VertexIndex,
             Lang::InstanceIndex => BuiltinInput::InstanceIndex,
             Lang::FragCoord => BuiltinInput::FragCoord,
+            Lang::SubgroupInvocation => BuiltinInput::SubgroupInvocation,
+            Lang::SubgroupSize => BuiltinInput::SubgroupSize,
             _ => return None,
         })
     }
@@ -220,9 +227,11 @@ impl BuiltinInput {
     /// Whether an entry point of this stage receives the input.
     pub fn available(self, entry: Entry) -> bool {
         match self {
-            BuiltinInput::GlobalId | BuiltinInput::LocalId | BuiltinInput::WorkgroupId => {
-                matches!(entry, Entry::Compute(_))
-            }
+            BuiltinInput::GlobalId
+            | BuiltinInput::LocalId
+            | BuiltinInput::WorkgroupId
+            | BuiltinInput::SubgroupInvocation
+            | BuiltinInput::SubgroupSize => matches!(entry, Entry::Compute(_)),
             BuiltinInput::VertexIndex | BuiltinInput::InstanceIndex => entry == Entry::Vertex,
             BuiltinInput::FragCoord => entry == Entry::Fragment,
         }
@@ -615,7 +624,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::One) => "one invocation of a kernel writes it",
-                Some(Lang::Shared) => "workgroup memory is a kernel's",
+                Some(Lang::Shared | Lang::SharedAtomics) => "workgroup memory is a kernel's",
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
                 Some(Lang::Texels | Lang::Texels3d | Lang::TexelsArray | Lang::MipStep) => {
                     "texels are written by a kernel's `GlobalId`"

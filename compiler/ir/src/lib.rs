@@ -67,6 +67,8 @@ pub enum Const {
     Small(Scalar, i64),
     F32(f32),
     F64(f64),
+    /// A half float (GPU only), held as the `f32` it rounds from: WGSL writes it rounded.
+    F16(f32),
 }
 
 impl Const {
@@ -80,6 +82,7 @@ impl Const {
             Const::Small(s, _) => *s,
             Const::F32(_) => Scalar::F32,
             Const::F64(_) => Scalar::F64,
+            Const::F16(_) => Scalar::F16,
         }
     }
 }
@@ -460,6 +463,52 @@ pub enum MemOp {
     RunTask,
 }
 
+/// What [`Expr::Subgroup`] does: an operation across the invocations of a subgroup (WGSL's
+/// `subgroups` extension), each reaching it together (uniform control flow, E0610).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SubgroupOp {
+    /// The sum over the subgroup's active invocations (`subgroupAdd`).
+    Add,
+    /// The sum over the invocations before this one (`subgroupExclusiveAdd`).
+    ExclusiveAdd,
+    /// The sum over the invocations up to this one (`subgroupInclusiveAdd`).
+    InclusiveAdd,
+    Min,
+    Max,
+    And,
+    Or,
+    Xor,
+    /// Whether the `bool` is true in any, or all, of the invocations.
+    Any,
+    All,
+    /// A `vec4u` of a bit for each invocation, set where the `bool` is true.
+    Ballot,
+    /// The value of the subgroup's first active invocation (`subgroupBroadcastFirst`).
+    BroadcastFirst,
+    /// The value of invocation (the second argument) of the subgroup (`subgroupShuffle`).
+    Shuffle,
+}
+
+impl SubgroupOp {
+    pub fn wgsl_name(self) -> &'static str {
+        match self {
+            SubgroupOp::Add => "subgroupAdd",
+            SubgroupOp::ExclusiveAdd => "subgroupExclusiveAdd",
+            SubgroupOp::InclusiveAdd => "subgroupInclusiveAdd",
+            SubgroupOp::Min => "subgroupMin",
+            SubgroupOp::Max => "subgroupMax",
+            SubgroupOp::And => "subgroupAnd",
+            SubgroupOp::Or => "subgroupOr",
+            SubgroupOp::Xor => "subgroupXor",
+            SubgroupOp::Any => "subgroupAny",
+            SubgroupOp::All => "subgroupAll",
+            SubgroupOp::Ballot => "subgroupBallot",
+            SubgroupOp::BroadcastFirst => "subgroupBroadcastFirst",
+            SubgroupOp::Shuffle => "subgroupShuffle",
+        }
+    }
+}
+
 /// What [`Expr::Atomic`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtomicOp {
@@ -618,6 +667,9 @@ pub enum Expr {
     /// An atomic read-modify-write of the atomic at the place (GPU only): the value that was
     /// there. Args: the operand (for `CompareExchange`, the expected value then the new one).
     Atomic(AtomicOp, Place, Vec<ValueId>),
+    /// An operation across the subgroup (GPU only): the value it gives this invocation. Args:
+    /// the operand, and for `Shuffle` the invocation to read.
+    Subgroup(SubgroupOp, Vec<ValueId>),
     /// `workgroupBarrier()` (GPU only): no invocation of the workgroup goes on until all have
     /// reached it, and their workgroup memory writes are visible. In uniform control flow only.
     Barrier,
@@ -814,6 +866,9 @@ pub enum BuiltinInput {
     InstanceIndex,
     /// The fragment's position.
     Position,
+    /// The invocation's index in its subgroup, and the subgroup's size (`subgroups` only).
+    SubgroupInvocationId,
+    SubgroupSize,
 }
 
 /// How a GPU entry point's inputs and outputs map onto WGSL's.
@@ -1044,7 +1099,18 @@ impl Module {
     /// floats, `subgroups` for subgroup operations.
     pub fn requires(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if self.subgroups {
+        let half = self.types.iter().any(|(_, d)| {
+            matches!(d, TypeDef::Scalar(Scalar::F16) | TypeDef::Vector(Scalar::F16, _))
+        });
+        if half {
+            out.push("shader-f16".to_string());
+        }
+        let lanes = self.entry_points.iter().any(|e| {
+            e.inputs.iter().any(|b| {
+                matches!(b, BuiltinInput::SubgroupInvocationId | BuiltinInput::SubgroupSize)
+            })
+        });
+        if self.subgroups || lanes {
             out.push("subgroups".to_string());
         }
         out

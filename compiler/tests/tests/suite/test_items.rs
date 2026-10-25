@@ -753,9 +753,25 @@ fn every_gpu_capability_reads_back_what_it_drew() {
     let dir = wrela_tests::repo_root().join("compiler/tests/capabilities");
     let out = wrela_driver::test(&dir, None);
     assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
-    let failed: Vec<_> = out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
+    let failed: Vec<_> =
+        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
     assert!(failed.is_empty(), "failed: {failed:?}");
     assert_eq!(out.results.len(), 13);
+}
+
+/// Toolchain 0.6's kernel capabilities (compiler/tests/kernels): a histogram in workgroup
+/// atomics, a compaction by `workgroup_prefix_sum`, and the optional features (subgroups, half
+/// floats, BC1), each passing trivially on a device without it; Chrome agrees.
+#[test]
+#[ignore = "needs a GPU"]
+fn every_kernel_capability_computes_what_the_cpu_does() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/kernels");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    let failed: Vec<_> =
+        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
+    assert!(failed.is_empty(), "failed: {failed:?}");
+    assert_eq!(out.results.len(), 7);
 }
 
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a

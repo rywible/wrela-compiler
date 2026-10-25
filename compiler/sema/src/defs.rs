@@ -273,6 +273,7 @@ macro_rules! lang_items {
                     Lang::Slots
                         | Lang::One
                         | Lang::Shared
+                        | Lang::SharedAtomics
                         | Lang::Atomics
                         | Lang::Append
                         | Lang::AtomicMap
@@ -365,6 +366,8 @@ lang_items! {
     WorkgroupId = "std::gpu::WorkgroupId",
     VertexIndex = "std::gpu::VertexIndex",
     InstanceIndex = "std::gpu::InstanceIndex",
+    SubgroupInvocation = "std::gpu::SubgroupInvocation",
+    SubgroupSize = "std::gpu::SubgroupSize",
     FragCoord = "std::gpu::FragCoord",
     ClipPosition = "std::gpu::ClipPosition",
     Flat = "std::gpu::Flat",
@@ -431,6 +434,12 @@ lang_items! {
     Rgba32Float = "std::gpu::Rgba32Float",
     Rg32Uint = "std::gpu::Rg32Uint",
     Rg11b10Float = "std::gpu::Rg11b10Float",
+    Bc1 = "std::gpu::Bc1",
+    Bc4 = "std::gpu::Bc4",
+    Bc5 = "std::gpu::Bc5",
+    Bc7 = "std::gpu::Bc7",
+    Etc2Rgb8 = "std::gpu::Etc2Rgb8",
+    Astc4x4 = "std::gpu::Astc4x4",
     Sampler = "std::gpu::Sampler",
     ComparisonSampler = "std::gpu::ComparisonSampler",
     CreateTexture = "std::gpu::create_texture_of",
@@ -504,6 +513,21 @@ lang_items! {
     HandOverCommand = "std::reload::hand_over_command",
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
+    SharedAtomics = "std::gpu::SharedAtomics",
+    AtomicsBarrier = "std::gpu::atomics_barrier",
+    SubgroupAdd = "std::gpu::subgroup_add",
+    SubgroupExclusiveAdd = "std::gpu::subgroup_exclusive_add",
+    SubgroupInclusiveAdd = "std::gpu::subgroup_inclusive_add",
+    SubgroupMin = "std::gpu::subgroup_min",
+    SubgroupMax = "std::gpu::subgroup_max",
+    SubgroupAnd = "std::gpu::subgroup_and",
+    SubgroupOr = "std::gpu::subgroup_or",
+    SubgroupXor = "std::gpu::subgroup_xor",
+    SubgroupAny = "std::gpu::subgroup_any",
+    SubgroupAll = "std::gpu::subgroup_all",
+    SubgroupBallot = "std::gpu::subgroup_ballot",
+    SubgroupBroadcastFirst = "std::gpu::subgroup_broadcast_first",
+    SubgroupShuffle = "std::gpu::subgroup_shuffle",
     Atomics = "std::gpu::Atomics",
     One = "std::gpu::One",
     OneGet = "std::gpu::one_get",

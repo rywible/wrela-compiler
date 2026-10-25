@@ -520,6 +520,11 @@ pub(super) fn finish_common(c: &mut Checker) {
                         let x = v as f64;
                         x < TWO_64 && x as u64 == v
                     }
+                    // 11 significant bits, and at most f16's largest, 65504.
+                    FloatTy::F16 => {
+                        let bits = 64 - v.leading_zeros();
+                        v <= 65504 && (bits <= 11 || v.trailing_zeros() >= bits - 11)
+                    }
                 };
                 if !exact {
                     c.err(

@@ -371,7 +371,7 @@ fn records_commands() {}
                 let render = pipelines.iter().find(|p| p["kind"] == "render").expect("render");
                 assert_eq!(
                     render["targets"],
-                    serde_json::json!([{ "color": "rgba8unorm", "depth": false, "screen": true }])
+                    serde_json::json!([{ "colors": ["rgba8unorm"], "depth": false, "screen": true }])
                 );
             }
         })

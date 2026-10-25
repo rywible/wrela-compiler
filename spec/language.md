@@ -3079,4 +3079,5 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `gpu.draw-state` | A draw's cull mode, depth bias and depth test are build-time constants | §18.7 |
 | `gpu.textures` | Textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes | §18.8 |
 | `gpu.formats` | A texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into | §18.8 |
+| `gpu.features` | Half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature | §18.10 |
 | `build.budget` | A shipped build's pipelines have at most 256 KiB of WGSL each | §18.9 |

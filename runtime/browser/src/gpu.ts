@@ -166,6 +166,13 @@ function colourFormat(b: ResourceBinding): TextureFormat {
 }
 
 /** Builds pipeline `p` from its WGSL; its screen targets' variants draw in `screenFormat`. */
+/** A shader's WGSL as this browser takes it: the compiler's (naga's, which wgpu's front end
+ * parses without the directive) with `enable subgroups;` first when it uses them, which the WGSL
+ * spec requires. `enable f16;` the compiler writes itself. */
+export function shaderSource(p: Pipeline, source: string): string {
+  return p.requires.includes("subgroups") ? `enable subgroups;\n${source}` : source;
+}
+
 async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, screenFormat: GPUTextureFormat): Promise<BuiltPipeline> {
   const fail = (message: string) => new ShaderError(p.name, p.shader, message);
   const visibility =
@@ -262,7 +269,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
   device.pushErrorScope("validation");
   const layout = device.createBindGroupLayout({ label: p.name, entries });
   const pipelineLayout = device.createPipelineLayout({ label: p.name, bindGroupLayouts: [layout] });
-  const module = device.createShaderModule({ label: p.shader, code: source });
+  const module = device.createShaderModule({ label: p.shader, code: shaderSource(p, source) });
   const scope = device.popErrorScope();
   const compiled = compilationMessages(await module.getCompilationInfo());
   if (compiled !== null) throw fail(compiled);

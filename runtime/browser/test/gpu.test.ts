@@ -2,7 +2,7 @@
 // the same behaviour on a real GPU).
 
 import { describe, expect, spyOn, test } from "bun:test";
-import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError } from "../src/gpu.ts";
+import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError, shaderSource } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
 import { decode } from "../src/stream.ts";
@@ -1180,4 +1180,11 @@ test("in the serial mode, a label's time waits for its frame's drained passes", 
   await asked;
   expect(answered!.length).toBe(4);
   executor.destroyAll();
+});
+
+test("a shader that uses subgroups gets WGSL's `enable subgroups;`, which naga's text leaves out", () => {
+  const p = (requires: string[]) => ({ requires }) as unknown as Pipeline;
+  expect(shaderSource(p(["subgroups"]), "fn main() {}")).toBe("enable subgroups;\nfn main() {}");
+  expect(shaderSource(p(["shader-f16"]), "enable f16;\n")).toBe("enable f16;\n");
+  expect(shaderSource(p([]), "x")).toBe("x");
 });

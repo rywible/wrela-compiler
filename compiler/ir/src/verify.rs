@@ -154,6 +154,22 @@ impl Verifier<'_> {
             },
             Expr::Addr(p) => types.lookup(&TypeDef::Ptr(self.place(p)?)),
             Expr::Barrier | Expr::Discard => return Ok(None),
+            Expr::Subgroup(op, xs) => {
+                let n = if *op == SubgroupOp::Shuffle { 2 } else { 1 };
+                let Some(&x) = xs.first().filter(|_| xs.len() == n) else {
+                    return Err(bug(format!("{op:?} with the wrong arguments")));
+                };
+                match op {
+                    SubgroupOp::Any | SubgroupOp::All => {
+                        types.lookup(&TypeDef::Scalar(Scalar::Bool))
+                    }
+                    SubgroupOp::Ballot => {
+                        let u = types.lookup(&TypeDef::Scalar(Scalar::U32));
+                        u.and_then(|_| types.lookup(&TypeDef::Vector(Scalar::U32, 4)))
+                    }
+                    _ => Some(self.ty(x)),
+                }
+            }
             Expr::Atomic(op, p, xs) => {
                 let t = self.place(p)?;
                 let TypeDef::Atomic(s) = *self.def(t) else {

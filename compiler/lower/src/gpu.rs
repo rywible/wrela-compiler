@@ -143,10 +143,12 @@ pub(crate) enum ParamClass {
     Append {
         elem: TyId,
     },
-    /// A `Shared<T, N>`: workgroup memory, not bound.
+    /// A `Shared<T, N>`, or a `SharedAtomics<N>` of atomic `u32`s (`atomic`): workgroup memory,
+    /// not bound.
     Workgroup {
         elem: TyId,
         len: u32,
+        atomic: bool,
     },
     /// A texture of any kind (`dim`), bound by its handle and view; or a kernel's `Texels`,
     /// `TexelsArray` or `Texels3d` (`storage`), bound by its texture's. Its texels' format (a
@@ -191,6 +193,8 @@ fn classify(cx: &Cx, f: FnId, param: usize, ty: TyId, varyings: Option<TyId>) ->
             BuiltinInput::VertexIndex => ir::BuiltinInput::VertexIndex,
             BuiltinInput::InstanceIndex => ir::BuiltinInput::InstanceIndex,
             BuiltinInput::FragCoord => ir::BuiltinInput::Position,
+            BuiltinInput::SubgroupInvocation => ir::BuiltinInput::SubgroupInvocationId,
+            BuiltinInput::SubgroupSize => ir::BuiltinInput::SubgroupSize,
         });
     }
     class_of(cx, ty, p.func(f).params[param].mode, varyings)
@@ -233,7 +237,14 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
                 TyKind::ConstU32(n) => *n,
                 _ => 0,
             };
-            ParamClass::Workgroup { elem: args[0], len }
+            ParamClass::Workgroup { elem: args[0], len, atomic: false }
+        }
+        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::SharedAtomics) => {
+            let len = match p.types.kind(args[0]) {
+                TyKind::ConstU32(n) => *n,
+                _ => 0,
+            };
+            ParamClass::Workgroup { elem: p.types.u32, len, atomic: true }
         }
         TyKind::Adt(..) if Some(ty) == varyings => ParamClass::Varyings,
         TyKind::Slice(e) => {
@@ -1133,6 +1144,12 @@ fn format_of_lang(l: Option<Lang>) -> Option<ir::TextureFormat> {
         Lang::Rgba32Float => ir::TextureFormat::Rgba32Float,
         Lang::Rg32Uint => ir::TextureFormat::Rg32Uint,
         Lang::Rg11b10Float => ir::TextureFormat::Rg11b10Float,
+        Lang::Bc1 => ir::TextureFormat::Bc1,
+        Lang::Bc4 => ir::TextureFormat::Bc4,
+        Lang::Bc5 => ir::TextureFormat::Bc5,
+        Lang::Bc7 => ir::TextureFormat::Bc7,
+        Lang::Etc2Rgb8 => ir::TextureFormat::Etc2Rgb8,
+        Lang::Astc4x4 => ir::TextureFormat::Astc4x4,
         _ => return None,
     })
 }
@@ -1442,6 +1459,7 @@ pub(crate) fn intrinsic(
             | Lang::SharedGet
             | Lang::SharedSet
             | Lang::WorkgroupBarrier
+            | Lang::AtomicsBarrier
             | Lang::AtomicLen
             | Lang::AtomicLoad
             | Lang::AtomicStore
@@ -1462,6 +1480,21 @@ pub(crate) fn intrinsic(
             | Lang::OneGet
             | Lang::OneSet),
         ) => shared_op(fl, l, c, ty),
+        Some(
+            l @ (Lang::SubgroupAdd
+            | Lang::SubgroupExclusiveAdd
+            | Lang::SubgroupInclusiveAdd
+            | Lang::SubgroupMin
+            | Lang::SubgroupMax
+            | Lang::SubgroupAnd
+            | Lang::SubgroupOr
+            | Lang::SubgroupXor
+            | Lang::SubgroupAny
+            | Lang::SubgroupAll
+            | Lang::SubgroupBallot
+            | Lang::SubgroupBroadcastFirst
+            | Lang::SubgroupShuffle),
+        ) => subgroup_op(fl, l, name, c, ty),
         Some(Lang::Discard) => {
             let at = user_span(fl, c.span);
             let ok = fragment_only(fl, None, at, |what| {
@@ -1620,6 +1653,75 @@ fn resource_arg(fl: &mut Fl, c: &mir::Call, i: usize, msg: &str) -> Option<ir::R
     }
 }
 
+/// A subgroup operation (`std::gpu::subgroup_add` and the rest, §18.10): kernels only, of the
+/// types WGSL's take (E0607). The module then needs the device's `subgroups`.
+fn subgroup_op(
+    fl: &mut Fl,
+    l: Lang,
+    name: &str,
+    c: &mir::Call,
+    ty: Option<TyId>,
+) -> Option<ir::ValueId> {
+    use ir::SubgroupOp as S;
+    let at = user_span(fl, c.span);
+    let stage = fl.mb.gpu.as_ref().map(|g| g.stage);
+    // A `@gpu` function checked on its own has no stage: its callers' pipelines check it.
+    if !matches!(stage, Some(None | Some(Entry::Compute(_)))) {
+        let what = fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()).to_string();
+        let d = Diagnostic::new(
+            codes::E0607,
+            at,
+            format!("`{name}` is for kernels, and this is {what}"),
+        )
+        .with_note("a subgroup is a kernel's invocations that run in lockstep (§18.10)")
+        .with_help("call it in a `@compute` function, on a device with `features().subgroups`");
+        fl.cx.err(with_call_chain(fl, d));
+        return None;
+    }
+    let op = match l {
+        Lang::SubgroupAdd => S::Add,
+        Lang::SubgroupExclusiveAdd => S::ExclusiveAdd,
+        Lang::SubgroupInclusiveAdd => S::InclusiveAdd,
+        Lang::SubgroupMin => S::Min,
+        Lang::SubgroupMax => S::Max,
+        Lang::SubgroupAnd => S::And,
+        Lang::SubgroupOr => S::Or,
+        Lang::SubgroupXor => S::Xor,
+        Lang::SubgroupAny => S::Any,
+        Lang::SubgroupAll => S::All,
+        Lang::SubgroupBallot => S::Ballot,
+        Lang::SubgroupBroadcastFirst => S::BroadcastFirst,
+        _ => S::Shuffle,
+    };
+    let args = fl.arg_values(&c.args)?;
+    let x = *args.first()?;
+    let elem = fl.mb.m.types.element_scalar(fl.f.value_ty(x));
+    let ok = match op {
+        S::Any | S::All | S::Ballot => elem == Some(ir::Scalar::Bool),
+        S::And | S::Or | S::Xor => matches!(elem, Some(ir::Scalar::I32 | ir::Scalar::U32)),
+        _ => matches!(
+            elem,
+            Some(ir::Scalar::I32 | ir::Scalar::U32 | ir::Scalar::F32 | ir::Scalar::F16)
+        ),
+    };
+    if !ok {
+        let want = match op {
+            S::Any | S::All | S::Ballot => "a `bool`",
+            S::And | S::Or | S::Xor => "an `i32` or a `u32` (or a vector of them)",
+            _ => "an `i32`, `u32`, `f32` or `f16` (or a vector of them)",
+        };
+        let shown = fl.mb.m.types.display(fl.f.value_ty(x));
+        let d = Diagnostic::new(codes::E0607, at, format!("`{name}` takes {want}, not `{shown}`"))
+            .with_note("WGSL's subgroup operations take these types (the `subgroups` extension)")
+            .with_help("convert the value first: `u32(x)` for the bitwise operations, `x != 0` for a `bool`");
+        fl.cx.err(with_call_chain(fl, d));
+        return None;
+    }
+    fl.mb.m.subgroups = true;
+    let t = fl.cx.lower_ty(fl.mb, ty?, c.span)?;
+    Some(fl.value(t, ir::Expr::Subgroup(op, args)))
+}
+
 /// Workgroup memory, barriers, atomics and appends (`std::gpu`'s kernel `mut` parameters):
 /// GPU code only (E0607).
 fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
@@ -1657,7 +1759,7 @@ fn shared_op(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir
             let s = fl.value(u, ir::Expr::Binary(ir::BinOp::Add, x, yx));
             Some(fl.value(u, ir::Expr::Binary(ir::BinOp::Add, s, zxy)))
         }
-        Lang::WorkgroupBarrier => {
+        Lang::WorkgroupBarrier | Lang::AtomicsBarrier => {
             resource_arg(fl, c, 0, msg)?;
             fl.emit(ir::Stmt::Eval(ir::Expr::Barrier));
             None
@@ -1968,17 +2070,31 @@ fn check_workgroup(
     inputs: &[ir::BuiltinInput],
 ) {
     let found = ir::uniformity::collectives_in_non_uniform_flow(&mb.m, entry, inputs);
-    for n in found.into_iter().filter(|n| n.op == Collective::Barrier) {
+    for n in found {
         let Some(at) = n.at else { continue };
-        let d = Diagnostic::new(
-            codes::E0610,
-            user_span_in(cx, mb, n.func, at),
-            "`barrier` is called where the workgroup's invocations may have taken different branches",
-        )
-        .with_note("a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)");
-        cx.err(with_path(mb, &n, d).with_help(
-            "call it outside the branch, or make the branch's condition the same for the whole workgroup (from `WorkgroupId` or uniforms)",
-        ));
+        let d = match n.op {
+            Collective::Barrier => Diagnostic::new(
+                codes::E0610,
+                user_span_in(cx, mb, n.func, at),
+                "`barrier` is called where the workgroup's invocations may have taken different branches",
+            )
+            .with_note("a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)"),
+            Collective::Subgroup(op) => Diagnostic::new(
+                codes::E0610,
+                user_span_in(cx, mb, n.func, at),
+                format!("`{}` is called where the workgroup's invocations may have taken different branches", subgroup_name(op)),
+            )
+            .with_note("a subgroup operation combines its subgroup's invocations, so all of them must reach it together (WGSL's uniformity rule)"),
+            _ => continue,
+        };
+        // Over a domain, the compiler's bounds check is the branch: invocations past the
+        // domain's end return first.
+        let help = if mb.gpu.as_ref().is_some_and(|g| g.iface.over) {
+            "dispatch the kernel by `groups:`, not `over:`: over a domain, invocations past its end return before it; check its `GlobalId` against what it covers after the call"
+        } else {
+            "call it outside the branch, or make the branch's condition the same for the whole workgroup (from `WorkgroupId` or uniforms)"
+        };
+        cx.err(with_path(mb, &n, d).with_help(help));
     }
     for h in ir::workgroup::hazards(&mb.m, entry) {
         let Some(at) = h.at else { continue };
@@ -1997,6 +2113,26 @@ fn check_workgroup(
             .with_note("between barriers, workgroup memory is written (each invocation its own chunk) or read, not both (§18.5)")
             .with_help(format!("call `barrier(mut {name})` between the writes and the reads")),
         );
+    }
+}
+
+/// A subgroup operation's name in std.
+fn subgroup_name(op: ir::SubgroupOp) -> &'static str {
+    use ir::SubgroupOp as S;
+    match op {
+        S::Add => "subgroup_add",
+        S::ExclusiveAdd => "subgroup_exclusive_add",
+        S::InclusiveAdd => "subgroup_inclusive_add",
+        S::Min => "subgroup_min",
+        S::Max => "subgroup_max",
+        S::And => "subgroup_and",
+        S::Or => "subgroup_or",
+        S::Xor => "subgroup_xor",
+        S::Any => "subgroup_any",
+        S::All => "subgroup_all",
+        S::Ballot => "subgroup_ballot",
+        S::BroadcastFirst => "subgroup_broadcast_first",
+        S::Shuffle => "subgroup_shuffle",
     }
 }
 
@@ -2168,12 +2304,14 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
     let mut workgroup_bytes = 0u32;
     for (e, entry) in iface.entries.iter().enumerate() {
         for (i, (_, class)) in entry.params.iter().enumerate() {
-            let ParamClass::Workgroup { elem, len } = *class else { continue };
+            let ParamClass::Workgroup { elem, len, atomic } = *class else { continue };
             let param = &program.func(entry.func).params[i];
             let Some(et) = cx.lower_ty(&mut mb, elem, param.span) else {
                 cx.holds_nothing("workgroup memory", elem, param.span);
                 continue;
             };
+            let et =
+                if atomic { mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32)) } else { et };
             if len == 0 {
                 let d =
                     Diagnostic::new(codes::E0602, param.span, "workgroup memory of no elements");
@@ -3012,8 +3150,9 @@ fn stand_in(
         return None;
     }
     let class = class_of(cx, t, mode, None);
-    if let ParamClass::Workgroup { elem, len } = class {
+    if let ParamClass::Workgroup { elem, len, atomic } = class {
         let et = cx.lower_ty(mb, elem, span)?;
+        let et = if atomic { mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32)) } else { et };
         let ty = mb.m.types.intern(ir::TypeDef::Array(et, len.max(1)));
         let kind = ir::ResourceKind::Workgroup;
         let res = ir::Resource { name: name.to_string(), binding: u32::MAX, kind, ty };

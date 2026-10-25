@@ -16,11 +16,13 @@ pub enum Scalar {
     U64,
     F32,
     F64,
+    /// A half float: GPU code only.
+    F16,
 }
 
 impl Scalar {
     pub fn is_float(self) -> bool {
-        matches!(self, Scalar::F32 | Scalar::F64)
+        matches!(self, Scalar::F32 | Scalar::F64 | Scalar::F16)
     }
     pub fn is_int(self) -> bool {
         !self.is_float() && self != Scalar::Bool
@@ -32,7 +34,7 @@ impl Scalar {
         match self {
             Scalar::Bool => 1,
             Scalar::I8 | Scalar::U8 => 8,
-            Scalar::I16 | Scalar::U16 => 16,
+            Scalar::I16 | Scalar::U16 | Scalar::F16 => 16,
             Scalar::I32 | Scalar::U32 | Scalar::F32 => 32,
             Scalar::I64 | Scalar::U64 | Scalar::F64 => 64,
         }
@@ -41,7 +43,7 @@ impl Scalar {
     pub fn bytes(self) -> u32 {
         match self {
             Scalar::I8 | Scalar::U8 => 1,
-            Scalar::I16 | Scalar::U16 => 2,
+            Scalar::I16 | Scalar::U16 | Scalar::F16 => 2,
             Scalar::Bool | Scalar::I32 | Scalar::U32 | Scalar::F32 => 4,
             Scalar::I64 | Scalar::U64 | Scalar::F64 => 8,
         }
@@ -58,12 +60,17 @@ impl Scalar {
             Scalar::I64 => "i64",
             Scalar::U64 => "u64",
             Scalar::F32 => "f32",
+            Scalar::F16 => "f16",
             Scalar::F64 => "f64",
         }
     }
     /// Whether WGSL has it.
     pub fn on_gpu(self) -> bool {
-        matches!(self, Scalar::Bool | Scalar::I32 | Scalar::U32 | Scalar::F32)
+        matches!(self, Scalar::Bool | Scalar::I32 | Scalar::U32 | Scalar::F32 | Scalar::F16)
+    }
+    /// Whether WASM has it: all but `f16`.
+    pub fn on_cpu(self) -> bool {
+        self != Scalar::F16
     }
 }
 

@@ -93,10 +93,12 @@ fn entry_point_names(module: &naga::Module) -> Vec<String> {
 
 /// Validates a naga module as WebGPU will.
 pub fn validate(module: &naga::Module) -> R<naga::valid::ModuleInfo> {
-    let mut v = naga::valid::Validator::new(
-        naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
-    );
+    // Half floats and subgroup operations validate here; the hosts create a pipeline that
+    // uses them only on a device with the feature (its manifest's `requires`).
+    let caps = naga::valid::Capabilities::SHADER_FLOAT16 | naga::valid::Capabilities::SUBGROUP;
+    let mut v = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps);
+    v.subgroup_stages(naga::valid::ShaderStages::COMPUTE);
+    v.subgroup_operations(naga::valid::SubgroupOperationSet::all());
     v.validate(module)
         .map_err(|e| format!("internal: the generated shader is invalid: {}", e.emit_to_string("")))
 }
@@ -135,6 +137,8 @@ fn scalar(s: ir::Scalar) -> R<Scalar> {
         ir::Scalar::I32 => Scalar::I32,
         ir::Scalar::U32 => Scalar::U32,
         ir::Scalar::F32 => Scalar::F32,
+        // naga writes `enable f16;` for a module that has one.
+        ir::Scalar::F16 => Scalar::F16,
         other => return Err(format!("internal: `{}` in GPU code", other.name())),
     })
 }
@@ -555,6 +559,8 @@ impl<'a, 'm> Fb<'a, 'm> {
                 B::VertexIndex => BuiltIn::VertexIndex,
                 B::InstanceIndex => BuiltIn::InstanceIndex,
                 B::Position => BuiltIn::Position { invariant: false },
+                B::SubgroupInvocationId => BuiltIn::SubgroupInvocationId,
+                B::SubgroupSize => BuiltIn::SubgroupSize,
             };
             let inner = match b {
                 B::GlobalInvocationId
@@ -563,7 +569,9 @@ impl<'a, 'm> Fb<'a, 'm> {
                 | B::NumWorkgroups => {
                     TypeInner::Vector { size: VectorSize::Tri, scalar: Scalar::U32 }
                 }
-                B::VertexIndex | B::InstanceIndex => TypeInner::Scalar(Scalar::U32),
+                B::VertexIndex | B::InstanceIndex | B::SubgroupInvocationId | B::SubgroupSize => {
+                    TypeInner::Scalar(Scalar::U32)
+                }
                 B::Position => TypeInner::Vector { size: VectorSize::Quad, scalar: Scalar::F32 },
             };
             let ty = self.cx.ty_inner(inner);
@@ -1033,8 +1041,23 @@ impl<'a, 'm> Fb<'a, 'm> {
                     out,
                 )
             }
+            ir::Expr::Const(ir::Const::F16(x)) if !x.is_finite() || x.abs() > 65504.0 => {
+                // Not a WGSL literal: the `f32` (its bits, made a float as it runs) converted.
+                let bits = self.lit(Literal::U32(x.to_bits()), out);
+                let u = self.cx.ty_inner(TypeInner::Scalar(Scalar::U32));
+                let bits = self.through_variable(bits, u, out);
+                let f = self.expr(
+                    Expression::As { expr: bits, kind: ScalarKind::Float, convert: None },
+                    out,
+                );
+                self.expr(
+                    Expression::As { expr: f, kind: ScalarKind::Float, convert: Some(2) },
+                    out,
+                )
+            }
             ir::Expr::Const(c) => {
                 let l = match c {
+                    ir::Const::F16(x) => Literal::F16(half::f16::from_f32(*x)),
                     ir::Const::Bool(b) => Literal::Bool(*b),
                     ir::Const::I32(x) => {
                         self.ints.insert(v, (*x).into());
@@ -1124,6 +1147,7 @@ impl<'a, 'm> Fb<'a, 'm> {
                 self.atomic(*op, p, args, Some(t), out)?.ok_or("internal: an atomic's value")?
             }
             ir::Expr::Barrier => return Err("internal: a barrier's value".into()),
+            ir::Expr::Subgroup(op, args) => self.subgroup(*op, args, t, out)?,
             ir::Expr::TextureStore(..) => return Err("internal: a texel write's value".into()),
             ir::Expr::Discard => return Err("internal: a discard's value".into()),
             ir::Expr::Call(g, args) => self
@@ -1381,6 +1405,64 @@ impl<'a, 'm> Fb<'a, 'm> {
             }
             (r, _, _) => r,
         })
+    }
+
+    /// A subgroup operation (`ir::Expr::Subgroup`): a statement naga writes as the call, its
+    /// result the value.
+    fn subgroup(
+        &mut self,
+        op: ir::SubgroupOp,
+        args: &[ir::ValueId],
+        t: ir::TypeId,
+        out: &mut Block,
+    ) -> R<Handle<Expression>> {
+        use ir::SubgroupOp as S;
+        use naga::{CollectiveOperation as C, GatherMode, SubgroupOperation as O};
+        let argument =
+            self.val(*args.first().ok_or("internal: a subgroup operation without its operand")?)?;
+        if op == S::Ballot {
+            let result =
+                self.func.expressions.append(Expression::SubgroupBallotResult, Span::UNDEFINED);
+            out.push(
+                Statement::SubgroupBallot { result, predicate: Some(argument) },
+                Span::UNDEFINED,
+            );
+            return Ok(result);
+        }
+        let ty = self.cx.ty(t)?;
+        let result = self
+            .func
+            .expressions
+            .append(Expression::SubgroupOperationResult { ty }, Span::UNDEFINED);
+        let collective = |o: O, c: C| Statement::SubgroupCollectiveOperation {
+            op: o,
+            collective_op: c,
+            argument,
+            result,
+        };
+        let s = match op {
+            S::Add => collective(O::Add, C::Reduce),
+            S::ExclusiveAdd => collective(O::Add, C::ExclusiveScan),
+            S::InclusiveAdd => collective(O::Add, C::InclusiveScan),
+            S::Min => collective(O::Min, C::Reduce),
+            S::Max => collective(O::Max, C::Reduce),
+            S::And => collective(O::And, C::Reduce),
+            S::Or => collective(O::Or, C::Reduce),
+            S::Xor => collective(O::Xor, C::Reduce),
+            S::Any => collective(O::Any, C::Reduce),
+            S::All => collective(O::All, C::Reduce),
+            S::BroadcastFirst => {
+                Statement::SubgroupGather { mode: GatherMode::BroadcastFirst, argument, result }
+            }
+            S::Shuffle => {
+                let from =
+                    self.val(*args.get(1).ok_or("internal: a shuffle without its source")?)?;
+                Statement::SubgroupGather { mode: GatherMode::Shuffle(from), argument, result }
+            }
+            S::Ballot => unreachable!("handled above"),
+        };
+        out.push(s, Span::UNDEFINED);
+        Ok(result)
     }
 
     /// A texture read (`ir::Expr::Texture`). Images and samplers are their globals' handles.

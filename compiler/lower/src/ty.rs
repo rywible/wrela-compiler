@@ -43,6 +43,7 @@ fn scalar_of(k: &TyKind) -> Option<ir::Scalar> {
         TyKind::Int(IntTy::U64) => ir::Scalar::U64,
         TyKind::Float(FloatTy::F32) => ir::Scalar::F32,
         TyKind::Float(FloatTy::F64) => ir::Scalar::F64,
+        TyKind::Float(FloatTy::F16) => ir::Scalar::F16,
         _ => return None,
     })
 }
@@ -95,11 +96,17 @@ impl<'a> Cx<'a> {
                 if gpu && !s.on_gpu() {
                     self.cpu_only(mb, s.name(), span);
                 }
+                if !gpu && !s.on_cpu() {
+                    self.gpu_only(s.name(), span);
+                }
                 mb.m.types.scalar(s)
             }),
             &TyKind::Vec(e, n) => scalar_of(&e.kind()).map(|s| {
                 if gpu && !e.on_gpu() {
                     self.cpu_only(mb, &format!("vec{n}{}", e.suffix()), span);
+                }
+                if !gpu && !e.on_cpu() {
+                    self.gpu_only(&format!("vec{n}{}", e.suffix()), span);
                 }
                 mb.m.types.vector_of(s, n)
             }),
@@ -292,6 +299,15 @@ impl<'a> Cx<'a> {
     fn cpu_only(&mut self, mb: &ModuleBuilder, name: &str, span: Span) {
         let note = "WGSL has `bool`, `i32`, `u32` and `f32`; 64-bit and 8/16-bit types exist only on the CPU (language.md §4)";
         self.not_on_gpu(mb, name, note, span);
+    }
+
+    /// E0338: a GPU-only type (`f16`, `vecNh`) in CPU code.
+    fn gpu_only(&mut self, name: &str, span: Span) {
+        self.err(
+            Diagnostic::new(codes::E0338, span, format!("`{name}` is GPU-only, and this is CPU code"))
+                .with_help("compute in `f32` on the CPU; a kernel converts with `f16(x)` and `f32(h)`, and buffers hold half floats packed (`Half2`)")
+                .with_note("WASM has no half floats: `f16` lives in GPU code, on a device with `shader-f16` (language.md §18.10)"),
+        );
     }
 
     /// E0702: a run or a buffer of `elem`, a type whose values hold nothing (`()`, a struct
