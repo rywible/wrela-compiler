@@ -2188,6 +2188,10 @@ The rules:
 - A barrier must be in uniform control flow, as WGSL requires (E0610).
 - Workgroup memory starts zeroed. A pipeline has at most 16 KiB of it (E0602).
 
+**Workgroup atomics:** a kernel's `mut SharedAtomics<N>` is `N` `u32`s of workgroup memory that any invocation changes at once, each operation whole: `load`, `store`, `add`, `min`, `max`, `and`, `or`, `xor`, `exchange` and `compare_exchange`, as `Atomics<T>` has them. Its operations need no barrier between them. `atomics.barrier()` before reading what every invocation added sees all of it, in uniform control flow (E0610). A histogram counts a workgroup's values in workgroup atomics and adds each bin to the global count once, not once a value.
+
+**Prefix sums:** `workgroup_prefix_sum(mut shared, lid, value)` gives each invocation the sum of `value` over the invocations before it by `LocalId`'s index, an exclusive scan, over a `Shared<u32, N>` of the workgroup's size. It is the building block of a compaction: each kept value's place in the list of what's kept. It is a Hillis–Steele scan, log2(N) steps a barrier apart, so every invocation calls it. `subgroup_prefix_sum` gives the same results with subgroup operations (§18.10).
+
 ### 18.6 Bindings and groups
 
 Each parameter of an entry point is a binding, and WebGPU limits how many bindings each shader stage has; a group gathers bindings into one parameter.
@@ -2281,6 +2285,21 @@ Another command's arguments are E0603. A buffer of structs that hold arguments i
 
 The draw state is part of the draw's pipeline, which the host makes when the program loads. So each state is a build-time constant, written at the draw or in a `const` it names (E0603 otherwise). For example, a card's shading after its depth prepass draws with `depth: Depth { compare: Compare::Equal, write: false }`.
 
+**Blends:** `blend:` is a draw's blend state, a `Blend`, and `blends: [...]` gives one for each of a pass's targets. Each is a build-time constant, part of the pipeline:
+
+- `Replace` (the default) writes the fragment's colour.
+- `Over` blends a straight-alpha colour over the target's; a fragment shader that returns `Over` asks for it.
+- `Premultiplied` adds the colour to the target's times one less its alpha.
+- `Add` adds, `Multiply` multiplies, and `Min` and `Max` keep the smaller or larger of each channel.
+
+A blend needs a format that blends: an integer format never does, and the 32-bit float formats do only on a device with `float32-blendable` (`features()`, §18.10), which the host checks.
+
+**Direct indexed draws:** `draw(pass, vs, fs, indices: buf, index_count: n)` draws `n` indices of a `GpuBuffer<u32>`, with `first_index:`, `base_vertex:`, `instances:` and `first_instance:` if the draw says. Its counts are the CPU's, as a plain draw's are.
+
+**Multi-draws:** `draw_multi(pass, vs, fs, indirect: buf, count: n)` draws `n` indirect draws whose arguments are consecutive in `buf`, as one command; with `indices:` they are indexed. A device with Chrome's multi-draw feature runs them as one call; without it, the host draws them one by one, which draws the same.
+
+**Scissors and viewports:** `pass.scissor(x, y, width, height)` keeps the pass's later draws inside a rectangle of its targets, and `pass.viewport(x, y, width, height, min_depth, max_depth)` maps clip space onto one. Each lasts until the next, or the pass's end. Both are a pass's methods, through `RenderPass`.
+
 ### 18.8 Textures, formats and passes
 
 Textures and samplers are owned GPU values that shaders read and passes draw into; a texture's format is a type.
@@ -2291,9 +2310,22 @@ Textures and samplers are owned GPU values that shaders read and passes draw int
 - `writable_texture::<F>(width, height)` makes a colour texture that can also be a kernel's `Texels<F>`. The hosts give a texture storage usage only then, because storage can cost a drawn texture its compression.
 - `depth_texture(width, height)` makes a depth texture.
 - `texture3d::<F>(width, height, depth)` makes a 3D texture, each side 1 to 2048 texels.
-- `sampler(filter, address)` and `comparison_sampler(compare)` make the ways to read them.
+- `texture_array::<F>(width, height, layers)` (and `writable_texture_array`) makes `layers` 2D textures of one size and format, 1 to 256 of them; `depth_texture_array(width, height, layers)` makes depths' (a shadow map's cascades).
+- `cubemap::<F>(side)` (and `writable_cubemap`) makes six square faces, in WebGPU's order (+x, −x, +y, −y, +z, −z), sampled by a direction.
+- `sampler(filter, address, mip, anisotropy)` and `comparison_sampler(compare)` make the ways to read them. `mip` says whether a sample between two levels blends them (trilinear, the default) or takes the nearer; `anisotropy` (1 to 16) samples a slanted surface along its slant.
 
-Each is an owned value, released when dropped, like a buffer. `tex.write(x, y, width, height, bytes)` copies texels in. A shader takes textures and samplers as parameters, and CPU code passes them by name. CPU code cannot read texels (E0607).
+Each is an owned value, released when dropped, like a buffer. `tex.write(x, y, width, height, bytes, level)` copies texels in (an array's and a cube's take the layer or face too).
+
+**Mip levels:** a texture, array or cube has `levels` mip levels (1 by default), each half its predecessor's side, rounded down, to 1 texel: `mip_levels(width, height)` is the whole chain's count. `generate_mips(mut tex, sampler)` fills levels 1 on from level 0, each the mean of the level before. A kernel makes a chain of its own with a `MipStep<F>` (`tex.mip_step(i)`): it reads level `i − 1` and writes level `i` in one dispatch, because WebGPU tracks each level apart.
+
+**Views:** a part of a texture is a view, a borrow struct:
+
+- `tex.level(i)` is one level to read, and `tex.level_mut(i)` one to write (a kernel's `Texels<F>`, a copy's destination, a pass's target with `begin_pass(..., level: i)`).
+- `arr.layer(i)` is one layer of an array or a cube's face, all its levels, read as a 2D texture; `arr.layer_mut(i, level)` writes one of its levels.
+
+Two views of one texture bound together don't overlap when their levels or layers don't, so a kernel reads one level and writes another, or one layer and another.
+
+**Copies and readback:** `copy_texture(from, to)` copies a rectangle between textures of one format, in recorded order; `copy_texture_to_buffer` and `copy_buffer_to_texture` move texels to and from a `GpuBuffer<u32>`, a row of texels (of blocks, for a compressed format) a row, each row padded to 256 bytes as WebGPU requires. `read_texture(view)` is readback, a request (§17.1) whose answer is the texels' bytes, unpadded. Each takes a texture's level or an array's layer. A shader takes textures and samplers as parameters, and CPU code passes them by name. CPU code cannot read texels (E0607).
 
 #### Reading textures
 
@@ -2303,26 +2335,33 @@ Each is an owned value, released when dropped, like a buffer. `tex.write(x, y, w
 
 **Formats are types.** A colour texture is a `Texture<F>` (and a `Texture3d<F>`, a `Texels<F>`), with `F` its format:
 
-- `Rgba8`: four 8-bit channels, read as floats in [0, 1];
-- `Rgba16Float`, `R16Float`, `Rg16Float` and `R32Float`;
-- `R32Uint`: integer texels, whole to 32 bits, drawn into by a fragment shader that returns a `u32`.
+- `Rgba8`, `Rg8` and `R8`: 8-bit channels, read as floats in [0, 1];
+- `Rgb10a2`: 10 bits for each colour and 2 for alpha;
+- `Rgba16Float`, `Rg16Float`, `R16Float` and `Rg11b10Float` (three small floats, no alpha);
+- `Rgba32Float`, `Rg32Float` and `R32Float`;
+- `R32Uint` and `Rg32Uint`: integer texels, whole to 32 bits, drawn into by a fragment shader that returns `u32`s;
+- the compressed formats `Bc1`, `Bc4`, `Bc5`, `Bc7`, `Etc2Rgb8` and `Astc4x4`: blocks of 4 × 4 texels, each 8 or 16 bytes. A compressed texture is only sampled. Its texels are written in rows of blocks, and it exists only on a device with the format's feature (`features()`, §18.10), so a program checks first.
 
 Each format says what a texel is in GPU code (`F::Texel`): a `vec4`, a `vec2`, an `f32` or a `u32`. `load`, `sample` and `store` give and take that type. The channels a format lacks are not written, and GPU code never pads them. Code generic over formats reads a texel as four channels with `F::rgba(texel)`: a channel the format lacks reads 0, and a missing alpha reads 1, as WGSL reads them.
 
 What else a format can do is a trait it has or lacks, as WebGPU's core formats allow:
 
-- `Filtered` formats are sampled (`sample`, `sample_level`). `R32Float` and `R32Uint` are not; GPU code `load`s them.
-- `Storage` formats are written by kernels (`writable_texture`, `texture3d`, `Texels`). `R16Float` and `Rg16Float` are not.
-- `Target` formats are drawn into: all six formats.
+- `Filtered` formats are sampled (`sample`, `sample_level`). The integer formats are not; GPU code `load`s them. The 32-bit float formats are filtered only on a device with `float32-filterable`, which the host checks.
+- `Storage` formats are written by kernels (`writable_texture`, `texture3d`, `Texels`): `Rgba8`, `Rgba16Float`, `R32Float`, `Rg32Float`, `Rgba32Float`, `R32Uint` and `Rg32Uint`.
+- `Target` formats are drawn into: every uncompressed format (`Rg11b10Float` on a device with `rg11b10ufloat-renderable`).
 
 A missing trait is E0400 where it is needed. Each binding in the manifest names its texture's format, and the hosts check that the bound texture has that format. Each format holds what was written, in both hosts.
 
 **Passes:** these functions start a pass, as `begin_screen_pass` does (§18.7):
 
-- `begin_pass(mut tex)`;
+- `begin_pass(mut tex)`, `begin_pass(mut tex, level: i)` for one of its levels;
 - `begin_pass_with_depth(mut tex, mut depth)`;
-- `begin_depth_pass(mut depth)`;
+- `begin_depth_pass(mut depth)`, and `begin_depth_layer_pass(mut depths, layer)` for a layer of a depth array;
+- `begin_layer_pass(mut arr, layer)` and `begin_face_pass(mut cube, face)`, with or without depth;
+- `begin_pass2`, `begin_pass3` and `begin_pass4`, with or without depth, for two to four colour targets of one size;
 - `begin_screen_pass_with_depth(mut depth)`.
+
+**Several targets:** a fragment shader for a pass of several targets returns a `Targets2`, `Targets3` or `Targets4` of its colours, each one's channels its target's format's: floats or `u32`s, one to four of them. A pass's colours take at most 32 bytes a pixel together, counted as WebGPU counts them (each target's cost, aligned), and at most four targets (E0602).
 
 Each gives a value that borrows its targets until `end()` (or `present()`), so the pass's draws cannot bind them (E0506). A frame can have any number of passes. A pass with depth keeps the nearest fragment, unless a draw's depth state says otherwise.
 
@@ -2356,9 +2395,9 @@ fn cull<F: Surface>(field: F, grid: Grid, live: mut Slots<u32>, id: GlobalId) {
 }
 ```
 
-### 18.10 Timing and limits
+### 18.10 Timing, limits and features
 
-The hosts can time each pass and dispatch on the GPU, and they open the GPU with its own limits.
+The hosts can time each pass and dispatch on the GPU, they open the GPU with its own limits and every optional feature it has, and std counts the GPU memory a program holds.
 
 **Labels:** `std::gpu::label(name)` names the passes and dispatches after it in the hosts' timings, up to the next label or the frame's end. So a system's helper dispatches are timed with it. Before a frame's first label, a pass is named `pass` (`screen pass` on the screen), and a dispatch is named by its kernel's pipeline.
 
@@ -2374,6 +2413,15 @@ The hosts can time each pass and dispatch on the GPU, and they open the GPU with
 
 - `std::gpu::limits()` gives the limits, so a program can make a texture or a buffer as large as the GPU allows. It has the `nondet` effect, because another GPU gives other numbers.
 - Pipelines are compiled for the default limits.
+
+**Optional features:** both hosts open the device with every optional feature the adapter has, and none is required. `std::gpu::features()` says which the device has: half floats (`f16`), subgroups (with the least and most invocations a subgroup has), the compressed formats (`bc`, `etc2`, `astc`), the 32-bit float formats filtered and blended, `Rg11b10Float` drawn into, timestamps, and multi-draws. It has the `nondet` effect. A program checks it before it records what needs a feature, and keeps a path without. Test mode's `features=none` (and `WRELA_FEATURES=none` for the native host) shows a program a device without them, so its fallback paths run on a device that has them.
+
+- **A pipeline that uses a feature requires it.** The compiler sees what a shader uses: one with half floats requires `shader-f16`, and one with subgroup operations `subgroups`, in its manifest entry. The hosts make such a pipeline only on a device with the feature, and refuse a command that records it otherwise, naming the feature.
+- **Half floats:** `f16` and `vec2h`, `vec3h` and `vec4h` are GPU code's, converted with `f16(x)` and `f32(h)`. CPU code has none (E0338): a buffer holds half floats packed, two to a `u32` (`Half2`).
+- **Subgroups:** a subgroup is the invocations of a kernel that run in lockstep. `subgroup_add`, `subgroup_exclusive_add`, `subgroup_inclusive_add`, `subgroup_min`, `subgroup_max`, the bitwise `subgroup_and`, `subgroup_or` and `subgroup_xor`, `subgroup_any`, `subgroup_all`, `subgroup_ballot`, `subgroup_broadcast_first` and `subgroup_shuffle` combine their values without workgroup memory. A kernel takes its invocation's place in its subgroup as a `SubgroupInvocation` and the subgroup's size as a `SubgroupSize`. They are kernels' only (E0607 elsewhere, and for a type WGSL's don't take), in uniform control flow (E0610), so such a kernel is dispatched by `groups:`.
+- 64-bit atomics are not in toolchain 0.6: neither WebGPU's core nor a shipped browser has them.
+
+**Memory:** `std::gpu::memory()` gives the bytes of the program's buffers and textures, now and at their most. std counts them as it makes and drops each (a texture by its levels' blocks and its layers), so it is the program's own arithmetic, which `@deterministic` code may read. Test mode's `memory.json` is the host's count, the same numbers.
 
 ## 19. Rooms
 
@@ -3076,8 +3124,8 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `gpu.dispatch` | `dispatch` and `draw` bind their entry points' arguments; an entry point isn't called | §18.7 |
 | `gpu.bound` | `k.bind(...)` is a value that a command takes, and code is generic over `Kernel`, `VertexShader<V>` and `FragmentShader<V>` | §18.7 |
 | `gpu.domains` | `over:` dispatches a kernel over a count, a size or a texture, its groups and bounds the compiler's | §18.7 |
-| `gpu.draw-state` | A draw's cull mode, depth bias and depth test are build-time constants | §18.7 |
-| `gpu.textures` | Textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes | §18.8 |
+| `gpu.draw-state` | A draw's cull mode, depth bias, depth test and blends are build-time constants | §18.7 |
+| `gpu.textures` | Textures are sampled in fragment shaders, read anywhere on the GPU, and drawn into in passes, by their mip levels and layers | §18.8 |
 | `gpu.formats` | A texture's format is a type: its texel, and whether it's filtered, written by kernels and drawn into | §18.8 |
 | `gpu.features` | Half floats are GPU code's, and subgroup operations a kernel's, in uniform control flow, on a device with the feature | §18.10 |
 | `build.budget` | A shipped build's pipelines have at most 256 KiB of WGSL each | §18.9 |

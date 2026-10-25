@@ -1209,7 +1209,9 @@ pub(crate) fn intrinsic(
     match lang {
         Some(Lang::Buffer) => {
             let Some(elem) = fl.cx.lower_ty(fl.mb, substs[0], span) else {
-                fl.cx.holds_nothing("GPU buffer", substs[0], span);
+                // At the program's call to `buffer`, std's wrapper of this intrinsic.
+                let at = user_span(fl, span);
+                fl.cx.holds_nothing("GPU buffer", substs[0], at);
                 return None;
             };
             let elem_size = ir::layout::array_stride(&fl.mb.m.types, elem);

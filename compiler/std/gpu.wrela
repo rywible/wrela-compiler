@@ -1897,12 +1897,14 @@ pub fn copy_buffer_to_texture<F: Format, T: TexelTarget<F>>(from: GpuSpan<u32>, 
 /// of a texture (`tex.level(i)`), or level 0 of an array's layer or a cube's face
 /// (`arr.layer(i)`).
 pub trait TexelSource<F: Format> {
+    /// The level, the layer and their size.
     fn source(self) -> TexelPlace
 }
 
 /// Where a copy writes texels (`copy_texture`, `copy_buffer_to_texture`): a level of a texture
 /// (`tex.level_mut(i)`), or a level of an array's layer (`arr.layer_mut(i, level)`).
 pub trait TexelTarget<F: Format> {
+    /// The level, the layer and their size.
     fn target(self) -> TexelPlace
 }
 
