@@ -4,12 +4,38 @@
 // kernel, and a BC1 texture sampled. A feature's test passes, and prints that it passed
 // trivially, on a device without the feature: frame 0 records only what the device has.
 use std::gpu::{
-    Atomics, Bc1, ClipPosition, FragCoord, GlobalId, GpuBuffer, LocalId, Rgba8, Sampler, Shared,
-    SharedAtomics, SharedAtomicsI, Slots, SubgroupInvocation, SubgroupSize, Texture, TextureRead,
-    VertexIndex, WorkgroupId, begin_pass, buffer, buffer_of, dispatch, draw, features, read,
-    read_texture, sampler, subgroup_prefix_sum, texture, workgroup_prefix_sum, Features,
+    Atomics, Bc1, ClipPosition, FragCoord, GlobalId, GpuBuffer, LocalId, MipStep, R32Float, Rgba8,
+    Sampler, Shared, SharedAtomics, SharedAtomicsI, Slots, SubgroupInvocation, SubgroupSize,
+    Texture, TextureRead, VertexIndex, WorkgroupId, begin_pass, buffer, buffer_of, dispatch, draw,
+    features, mip_levels, read, read_texture, sampler, subgroup_prefix_sum, texture,
+    workgroup_prefix_sum, writable_texture, Features,
 }
 use std::io::{Pending, print}
+
+/// A level's texel `id`: the least of the (up to) four texels under it in the level before, read
+/// unfiltered through the mip step (`MipStep::load`): a depth pyramid's step.
+@compute(8, 8)
+fn least(step: mut MipStep<R32Float>, id: GlobalId) {
+    let src = step.source_size()
+    if id.x >= max(src.x / 2, 1) || id.y >= max(src.y / 2, 1) {
+        return
+    }
+    var m = 1.0e9
+    for y in 2 * id.y..min(2 * id.y + 2, src.y) {
+        for x in 2 * id.x..min(2 * id.x + 2, src.x) {
+            m = min(m, step.load(x: x, y: y))
+        }
+    }
+    step.store(id, m)
+}
+
+/// Levels 1's two texels and level 2's one, to read back.
+@compute(1)
+fn levels_of(t: Texture<R32Float>, out: mut Slots<f32>, id: GlobalId) {
+    out[id] = if id.x == 0 { t.load(x: 0, y: 0, level: 1) } else if id.x == 1 {
+        t.load(x: 1, y: 0, level: 1)
+    } else { t.load(x: 0, y: 0, level: 2) }
+}
 
 /// Value `i` of the histogram's input: a hash's top byte, so every bin is used and few equally.
 fn value(i: u32) -> u32 {
@@ -176,6 +202,8 @@ pub struct State {
     got: Vec<Vec<u32>>,
     half_read: Option<Pending<f32>>,
     half_got: Vec<f32>,
+    mips_read: Option<Pending<f32>>,
+    mips_got: Vec<f32>,
     texel_read: Option<TextureRead>,
     texel: Vec<u8>,
 }
@@ -204,6 +232,8 @@ pub fn init() -> State {
         got: Vec::new(),
         half_read: None,
         half_got: Vec::new(),
+        mips_read: None,
+        mips_got: Vec::new(),
         texel_read: None,
         texel: Vec::new(),
     }
@@ -242,6 +272,16 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
             },
             None => {},
         }
+        match mut s.mips_read {
+            Some(p) => {
+                if s.mips_got.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.mips_got = take v
+                    }
+                }
+            },
+            None => {},
+        }
         match mut s.half_read {
             Some(p) => {
                 if s.half_got.len() == 0 {
@@ -268,6 +308,25 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
 
 fn record(s: mut State) {
     dispatch(histogram.bind(s.values, mut s.totals), groups: (VALUES / 256, 1, 1))
+    // A 5 × 3 chain of `R32Float` (texel (x, y) holds 10y + x + 1), each level the least of the
+    // texels under it, by kernels reading the level before through a mip step.
+    var chain = writable_texture::<R32Float>(width: 5, height: 3, levels: mip_levels(5, 3))
+    var bytes: Vec<u8> = Vec::new()
+    for y in 0..3 {
+        for x in 0..5 {
+            let b = bitcast_u32(f32(10 * y + x + 1))
+            bytes.push(u8(b & 255))
+            bytes.push(u8((b >> 8) & 255))
+            bytes.push(u8((b >> 16) & 255))
+            bytes.push(u8(b >> 24))
+        }
+    }
+    chain.write(x: 0, y: 0, width: 5, height: 3, bytes: bytes)
+    dispatch(least.bind(step: chain.mip_step(1)), over: (2, 1))
+    dispatch(least.bind(step: chain.mip_step(2)), over: (1, 1))
+    var mips: GpuBuffer<f32> = buffer(3)
+    dispatch(levels_of.bind(chain, out: mut mips), groups: 3)
+    s.mips_read = Some(read(mips.items()))
     s.reads.push(read(s.totals.items()))
     let first = s.values.span(0, COMPACTED)
     dispatch(compact.bind(first, mut s.compacted, mut s.counts), groups: (COMPACTED / 256, 1, 1))
@@ -388,6 +447,15 @@ fn a_bc1_block_samples_as_its_colour(s: State) {
     }
     assert(s.texel.len() == 4)
     assert(u32(s.texel[0]) == 255 && u32(s.texel[1]) == 0 && u32(s.texel[2]) == 0)
+}
+
+/// A kernel reads a mip chain's level before through `MipStep::load` (unfiltered), and writes the
+/// next: level 1 holds the least of each 2 × 2 under it (1 and 3), level 2 the least of level 1.
+@test(frames: 6, gpu: true)
+fn a_mip_step_reads_the_level_before(s: State) {
+    assert(s.mips_got.len() == 3, "the chain's levels didn't come back")
+    assert(s.mips_got[0] == 1.0 && s.mips_got[1] == 3.0, "level 1 isn't the least of level 0")
+    assert(s.mips_got[2] == 1.0, "level 2 isn't the least of level 1")
 }
 
 @test(frames: 4, gpu: true, hosts: both)
