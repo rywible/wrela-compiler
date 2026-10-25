@@ -5,7 +5,7 @@
       "file": "main.wrela",
       "fixes": [],
       "help": [
-        "use `sample_level` (or `sample_compare_level`), which any GPU code can call"
+        "use `sample_level` or `sample_grad` (or `sample_compare_level`), which any GPU code can call"
       ],
       "internal": false,
       "label": null,

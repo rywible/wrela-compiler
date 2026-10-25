@@ -85,6 +85,18 @@ pub fn frame_spans(timings: &[GpuTiming]) -> Vec<(usize, f64)> {
     spans.into_iter().map(|(k, (a, b))| (k, (b - a) / 1e6)).collect()
 }
 
+/// A copy's extent in whole blocks of `format`: a rectangle of a compressed texture that reaches
+/// its level's edge (the checker allows no other part block) covers that edge's last block, which
+/// WebGPU counts in the level's physical size (a 4 × 4 BC level 1 is one 4 × 4 block).
+fn whole_blocks(format: TextureFormat, width: u32, height: u32) -> wgpu::Extent3d {
+    let b = format.block();
+    wgpu::Extent3d {
+        width: width.div_ceil(b) * b,
+        height: height.div_ceil(b) * b,
+        depth_or_array_layers: 1,
+    }
+}
+
 /// One texel of `format` (its bytes, little-endian) as RGBA8, as [`Gpu::read_target`] gives it.
 fn as_rgba8(format: TextureFormat, t: &[u8]) -> [u8; 4] {
     let unit = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
@@ -729,10 +741,9 @@ impl Gpu {
         }
         // Every optional feature wherever the adapter has it (timestamps too: a program may ask
         // for its work's time). `WRELA_FEATURES` (`none`, or a comma list of the ones to keep)
-        // masks what the program sees, as test mode's `features=` does in a browser: a
-        // program's fallback paths, measured on a device that has the features.
-        let (device, queue) = open_device_with("wrela-host", features, optional_features())?;
-        let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        // masks them, as test mode's `features=` does in a browser: the device is opened without
+        // the masked ones, so its pipelines and commands are a device's without them, though the
+        // adapter has them. Timestamps stay, which a profile's timing needs.
         let keep: Option<Vec<String>> = std::env::var("WRELA_FEATURES").ok().map(|v| {
             if v == "none" {
                 Vec::new()
@@ -740,6 +751,16 @@ impl Gpu {
                 v.split(',').map(|f| f.trim().to_string()).collect()
             }
         });
+        let optional = match &keep {
+            None => optional_features(),
+            Some(kept) => wrela_abi::FEATURES
+                .iter()
+                .filter(|f| **f == "timestamp-query" || kept.iter().any(|k| k == *f))
+                .filter_map(|f| wgpu_feature(f))
+                .fold(wgpu::Features::empty(), |a, b| a | b),
+        };
+        let (device, queue) = open_device_with("wrela-host", features, optional)?;
+        let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         let feature_bits = feature_bits(device.features(), keep.as_deref());
 
         let errors = Arc::new(Mutex::new(Vec::new()));
@@ -1163,6 +1184,16 @@ impl Builder {
                         }) {
                             continue;
                         }
+                        // Nor one it can't blend into as the pipeline blends (a 32-bit float
+                        // target without float32-blendable): the checker refuses such a draw.
+                        if t.colors().enumerate().any(|(k, c)| {
+                            blends.get(k).is_some_and(|&b| b != Blend::Replace)
+                                && !c.info().blendable.on(|f: &str| {
+                                    wgpu_feature(f).is_some_and(|w| features.contains(w))
+                                })
+                        }) {
+                            continue;
+                        }
                         let depth = t.depth.then_some(wgpu::TextureFormat::Depth32Float);
                         let colors = t.colors().map(wgpu_format).collect();
                         render_variant(&self.device, &p.name, &mut kind, (colors, depth));
@@ -1263,6 +1294,16 @@ impl Gpu {
     }
 
     /// The texture `handle`.
+    /// A texture pass's targets' size: its first colour target's level, or its depth's.
+    fn pass_size(&self, pass: &Pass) -> (u32, u32) {
+        let (handle, level) = match pass.colors().first() {
+            Some(c) => (c.texture, c.level),
+            None => (pass.depth, 0),
+        };
+        let t = &self.texture(handle).texture;
+        ((t.width() >> level).max(1), (t.height() >> level).max(1))
+    }
+
     fn texture(&self, handle: u32) -> &Texture {
         match &self.resources[&handle] {
             Resource::Texture(t) => t,
@@ -1587,7 +1628,7 @@ impl Gpu {
         let rows = size[1].div_ceil(block);
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let bytes = padded * u64::from(rows);
-        let extent = wgpu::Extent3d { width: size[0], height: size[1], depth_or_array_layers: 1 };
+        let extent = whole_blocks(format, size[0], size[1]);
         let at_texel = wgpu::Origin3d { x: origin[0], y: origin[1], z: layer };
         fn image(
             t: &wgpu::Texture,
@@ -1660,8 +1701,7 @@ impl Gpu {
 
     fn copy_texture(&mut self, source: &TexelRect, destination: &stream::TexelAt) {
         let mut encoder = self.take_encoder();
-        let extent =
-            wgpu::Extent3d { width: source.width, height: source.height, depth_or_array_layers: 1 };
+        let extent = whole_blocks(self.texture(source.texture).format, source.width, source.height);
         let (s, d) = (source, destination);
         encoder.copy_texture_to_texture(
             self.image_copy(s.texture, s.level, s.layer, s.x, s.y),
@@ -1682,7 +1722,7 @@ impl Gpu {
         to_buffer: bool,
     ) {
         let mut encoder = self.take_encoder();
-        let extent = wgpu::Extent3d { width: r.width, height: r.height, depth_or_array_layers: 1 };
+        let extent = whole_blocks(self.texture(r.texture).format, r.width, r.height);
         let rows = r.height.div_ceil(self.texture(r.texture).format.block());
         let rows = wgpu::TexelCopyBufferInfo {
             buffer: self.buffer(buffer),
@@ -1863,6 +1903,19 @@ impl Gpu {
         if op == Opcode::EndPass && !serial {
             if let Some(mut ended) = self.ended.take() {
                 if self.can_join(&mut ended, &open) {
+                    // A pass begins with the whole target its scissor and viewport: where the
+                    // one it joins set either, the joined draws start from the whole target.
+                    if ended
+                        .draws
+                        .iter()
+                        .any(|d| matches!(d, PassItem::Scissor(_) | PassItem::Viewport(_)))
+                    {
+                        let (w, h) = self.pass_size(&ended.pass);
+                        ended.draws.push(PassItem::Scissor([0, 0, w, h]));
+                        ended
+                            .draws
+                            .push(PassItem::Viewport([0.0, 0.0, w as f32, h as f32, 0.0, 1.0]));
+                    }
                     ended.draws.append(&mut open.draws);
                     self.ended = Some(ended);
                     return Ok(());

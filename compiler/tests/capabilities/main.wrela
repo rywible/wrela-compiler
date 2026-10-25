@@ -4,17 +4,18 @@
 // indexed draws and multi-draws. Frame 0 records the work and asks for each texture back;
 // later frames take the answers; each test checks one.
 use std::gpu::{
-    Blend, ClipPosition, Cubemap, DepthTextureArray, DrawArgs, FragCoord, GlobalId, GpuBuffer,
-    R32Uint, R8, Rg32Float, Rg32Uint, Rg8, Rgb10a2, Rgba16Float, Rgba32Float, Rgba8, Sampler,
-    Targets3, Texels, TextureArray, TextureRead, VertexIndex, begin_depth_layer_pass,
-    begin_face_pass, begin_layer_pass, begin_pass, begin_pass3, buffer_of, comparison_sampler,
-    copy_texture, cubemap, depth_texture_array, dispatch, draw, draw_multi, generate_mips,
-    read_texture, sampler, texture, texture_array, writable_texture, writable_texture_array, Filter,
-    Address, ComparisonSampler,
+    Bc1, Features, Rg11b10Float, features, Blend, ClipPosition, Cubemap, DepthTextureArray,
+    DrawArgs, FragCoord, GlobalId, GpuBuffer, R32Uint, R8, Rg32Float, Rg32Uint, Rg8, Rgb10a2,
+    Rgba16Float, Rgba32Float, Rgba8, Sampler, Targets3, Texels, TextureArray, TextureRead,
+    VertexIndex, begin_depth_layer_pass, begin_face_pass, begin_layer_pass, begin_pass, begin_pass3,
+    buffer_of, comparison_sampler, copy_texture, cubemap, depth_texture_array, dispatch, draw,
+    draw_multi, generate_mips, read_texture, sampler, texture, texture_array, writable_texture,
+    writable_texture_array, Filter, Address, ComparisonSampler,
 }
 
 pub struct State {
     frame: u32,
+    feats: Features,
     // The textures, kept until their reads come back.
     copied: Texture<Rgba8>,
     mipped: Texture<Rgba16Float>,
@@ -40,6 +41,7 @@ pub struct State {
 }
 
 use std::gpu::Texture
+use std::io::print
 
 /// One triangle that covers the target.
 @vertex
@@ -145,6 +147,7 @@ fn face_colour(i: u32) -> vec4 {
 pub fn init() -> State {
     State {
         frame: 0,
+        feats: features(),
         copied: texture(width: 4, height: 4),
         mipped: writable_texture(width: 16, height: 16, levels: 5),
         mipped_out: texture(width: 4, height: 4),
@@ -317,6 +320,58 @@ fn record(s: mut State) {
     s.reads.push(read_texture(s.multi.level(0)))
     // 18: an array's layer read back.
     s.reads.push(read_texture(s.layered.layer(1)))
+    // 19–22: the other blends, over the same clear as 7 and 8: Over, Multiply, Min, Max.
+    for b in 0..4 {
+        var t: Texture<Rgba16Float> = texture(width: 1, height: 1)
+        let p = begin_pass(mut t, clear: vec4(0.25, 0.25, 0.25, 0.5))
+        let c = colour.bind(vec4(0.5, 0.25, 0.0, 0.5))
+        if b == 0 {
+            draw(p, cover, c, vertices: 3, blend: Blend::Over)
+        } else if b == 1 {
+            draw(p, cover, c, vertices: 3, blend: Blend::Multiply)
+        } else if b == 2 {
+            draw(p, cover, c, vertices: 3, blend: Blend::Min)
+        } else {
+            draw(p, cover, c, vertices: 3, blend: Blend::Max)
+        }
+        p.end()
+        s.reads.push(read_texture(t.level(0)))
+        s.blended.push(take t)
+    }
+    // 23: four 32-bit floats.
+    var f32x4: Texture<Rgba32Float> = texture(width: 1, height: 1)
+    let p = begin_pass(mut f32x4)
+    draw(p, cover, colour.bind(vec4(1.5, -2.25, 3.0, 0.125)), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(f32x4.level(0)))
+    // 24: three small floats, where the device draws into them.
+    var small: Texture<Rg11b10Float> = texture(width: 1, height: 1)
+    if s.feats.rg11b10_renderable {
+        let p = begin_pass(mut small)
+        draw(p, cover, colour.bind(vec4(1.0, 1.0, 1.0, 1.0)), vertices: 3)
+        p.end()
+    }
+    s.reads.push(read_texture(small.level(0)))
+    // 25–26: BC1 mip tails, smaller than a block: level 1 (2 × 2) written, read, and copied
+    // into another BC1 texture's level 1, which is read too.
+    if s.feats.bc {
+        var a: Texture<Bc1> = texture(width: 4, height: 4, levels: 3)
+        var b: Texture<Bc1> = texture(width: 4, height: 4, levels: 3)
+        a.write(
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+            bytes: [0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0],
+            level: 1,
+        )
+        s.reads.push(read_texture(a.level(1)))
+        copy_texture(a.level(1), b.level_mut(1))
+        s.reads.push(read_texture(b.level(1)))
+    } else {
+        s.reads.push(read_texture(f32x4.level(0)))
+        s.reads.push(read_texture(f32x4.level(0)))
+    }
 }
 
 /// The little-endian `u32` at byte `i` of `b`.
@@ -336,8 +391,8 @@ fn close(d: f32) -> bool {
 
 @test(frames: 6, gpu: true)
 fn every_read_came_back(s: State) {
-    assert(s.got.len() == 19)
-    for k in 0..19 {
+    assert(s.got.len() == 27)
+    for k in 0..27 {
         assert(s.got[k].len() > 0)
     }
 }
@@ -451,4 +506,46 @@ fn an_arrays_layer_reads_back(s: State) {
     // Layer 1's kernel wrote 0.5 in red, at every texel of its 4 × 4.
     assert(s.got[18].len() == 4 * 4 * 8)
     assert(close(half(s.got[18], 0) - 0.5) && close(half(s.got[18], 4 * 15) - 0.5))
+}
+
+@test(frames: 6, gpu: true)
+fn every_other_blend_is_its_arithmetic(s: State) {
+    // Over: colour src × 0.5 + dst × 0.5, alpha 0.5 + 0.5 × 0.5.
+    assert(close(half(s.got[19], 0) - 0.375) && close(half(s.got[19], 1) - 0.25))
+    assert(close(half(s.got[19], 2) - 0.125) && close(half(s.got[19], 3) - 0.75))
+    // Multiply: src × dst, and its alphas multiplied.
+    assert(close(half(s.got[20], 0) - 0.125) && close(half(s.got[20], 1) - 0.0625))
+    assert(close(half(s.got[20], 2) - 0.0) && close(half(s.got[20], 3) - 0.25))
+    // Min and Max, each channel.
+    assert(close(half(s.got[21], 0) - 0.25) && close(half(s.got[21], 2) - 0.0))
+    assert(close(half(s.got[22], 0) - 0.5) && close(half(s.got[22], 2) - 0.25))
+}
+
+@test(frames: 6, gpu: true)
+fn four_32_bit_floats_hold_what_was_drawn(s: State) {
+    assert(bitcast_f32(word(s.got[23], 0)) == 1.5 && bitcast_f32(word(s.got[23], 4)) == -2.25)
+    assert(bitcast_f32(word(s.got[23], 8)) == 3.0 && bitcast_f32(word(s.got[23], 12)) == 0.125)
+}
+
+@test(frames: 6, gpu: true)
+fn three_small_floats_hold_ones(s: State) {
+    if !s.feats.rg11b10_renderable {
+        print("no `rg11b10ufloat-renderable` on this device: passed trivially")
+        return
+    }
+    // 1.0 in 11 bits (5 of exponent, bias 15) is 0x3C0; in 10 bits, 0x1E0.
+    assert(word(s.got[24], 0) == (0x3C0 | (0x3C0 << 11) | (0x1E0 << 22)))
+}
+
+@test(frames: 6, gpu: true)
+fn a_compressed_mip_tail_is_written_read_and_copied_as_a_whole_block(s: State) {
+    if !s.feats.bc {
+        print("no `texture-compression-bc` on this device: passed trivially")
+        return
+    }
+    let block = [0x00, 0xF8, 0x00, 0xF8, 0, 0, 0, 0]
+    assert(s.got[25].len() == 8 && s.got[26].len() == 8)
+    for k in 0..8 {
+        assert(u32(s.got[25][k]) == block[k] && u32(s.got[26][k]) == block[k])
+    }
 }

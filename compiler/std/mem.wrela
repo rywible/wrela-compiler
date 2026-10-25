@@ -2,7 +2,7 @@
 // nothing here is checked: a wrong address or size breaks the program's memory. Each function
 // can be called only inside `unsafe`, which only std's core uses.
 
-use std::abi::{PANIC, THREAD_BLOCKS, THREAD_BLOCK_SIZE}
+use std::abi::{GPU_STATE, PANIC, THREAD_BLOCKS, THREAD_BLOCK_SIZE}
 
 /// A destructor: what dropping a value does besides dropping its fields. Only std's core
 /// implements it (§21), for types that own memory or host resources, such as `Vec`, `Box`,
@@ -279,3 +279,23 @@ pub fn tool_join(slot: u32) {}
 @tool
 @intrinsic
 pub fn tool_done() {}
+
+/// std's count of the GPU's bytes (`std::gpu::memory`): word `i` of the four at the ABI's
+/// `GPU_STATE` (the buffers', the textures', and the most of each). `nondet`: the program's
+/// thread changes them as it records GPU work, so another thread (a ticker's) reading them would
+/// see them at a time timing chooses.
+@effects(nondet)
+pub(package) fn gpu_count(i: u32) -> u64 {
+    own_gpu_count(i)
+}
+
+/// `gpu_count` for std's own bookkeeping, on the thread that records GPU work (the program's),
+/// where nothing else changes the words: no effect.
+pub(package) fn own_gpu_count(i: u32) -> u64 {
+    unsafe { read::<u64>(GPU_STATE + 8 * i) }
+}
+
+/// Sets word `i` of std's count of the GPU's bytes.
+pub(package) fn set_gpu_count(i: u32, value: u64) {
+    unsafe { write::<u64>(GPU_STATE + 8 * i, value) }
+}

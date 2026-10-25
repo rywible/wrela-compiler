@@ -24,7 +24,7 @@
         "line": 11,
         "start": 360
       },
-      "title": "a barrier in non-uniform control flow"
+      "title": "a barrier or a subgroup operation in non-uniform control flow"
     },
     {
       "code": "E0609",

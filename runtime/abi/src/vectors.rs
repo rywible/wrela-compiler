@@ -648,6 +648,37 @@ fn checks() -> Value {
     let max = crate::Limits::DEFAULT.max_buffer_size;
     let cases = vec![
         check(
+            "a copy from a buffer at an offset that cuts the format's blocks",
+            &m,
+            &Encoder::new()
+                .create_buffer(1, 1024)
+                .create_texture(2, 4, 4, TextureFormat::Rgba32Float, false)
+                .copy_buffer_to_texture(
+                    1,
+                    8,
+                    256,
+                    stream::TexelRect {
+                        texture: 2,
+                        level: 0,
+                        layer: 0,
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    },
+                )
+                .finish(),
+        ),
+        check(
+            "a multi-draw with a count buffer",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4])
+                    .multi_draw_indirect(0, None, [2, 0], [2, 1, 0], &rw, &u)
+                    .present();
+            }),
+        ),
+        check(
             "a texture write with a two-byte texel",
             &m,
             &Encoder::new()

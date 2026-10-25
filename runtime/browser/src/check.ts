@@ -471,7 +471,9 @@ export class Checker {
         const bytes = cmd.count * stride;
         if (bytes > 0xffff_ffff) throw err(`${cmd.count} draws' arguments are more than a buffer holds`);
         this.#readRange(op, cmd.arguments, cmd.offset, bytes, "reading arguments:");
-        if (cmd.count_buffer !== NONE) this.#readRange(op, cmd.count_buffer, cmd.count_offset, 4, "reading the count:");
+        // A count the GPU writes would mean what a device without multi-draw can't do (the host
+        // draws `count` draws one by one): not in 0.6. An unused draw has no instances instead.
+        if (cmd.count_buffer !== NONE) throw new CommandError(op, "a multi-draw's count buffer isn't supported: it draws `count` draws, so give the unused ones no instances");
         return;
       }
       case "Present":
@@ -595,6 +597,9 @@ export class Checker {
    * apart. */
   #bufferRows(op: OpcodeName, format: TextureFormat, r: TexelRect, buffer: number, offset: number, bytesPerRow: number): void {
     const b = blockOf(format);
+    // WebGPU's rule: a copy's buffer offset is a whole number of the format's blocks.
+    const blockBytes = bytesPerTexel(format);
+    if (offset % blockBytes !== 0) throw new CommandError(op, `the buffer's offset ${offset} isn't a multiple of a ${format} block's ${blockBytes} bytes`);
     const row = Math.ceil(r.width / b) * bytesPerTexel(format);
     if (bytesPerRow < row) throw new CommandError(op, `a row of ${r.width} texels is ${row} bytes, more than ${bytesPerRow} a row`);
     const rows = Math.ceil(r.height / b);

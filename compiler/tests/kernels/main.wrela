@@ -5,9 +5,9 @@
 // trivially, on a device without the feature: frame 0 records only what the device has.
 use std::gpu::{
     Atomics, Bc1, ClipPosition, FragCoord, GlobalId, GpuBuffer, LocalId, Rgba8, Sampler, Shared,
-    SharedAtomics, Slots, SubgroupInvocation, SubgroupSize, Texture, TextureRead, VertexIndex,
-    WorkgroupId, begin_pass, buffer, buffer_of, dispatch, draw, features, read, read_texture,
-    sampler, subgroup_prefix_sum, texture, workgroup_prefix_sum, Features,
+    SharedAtomics, SharedAtomicsI, Slots, SubgroupInvocation, SubgroupSize, Texture, TextureRead,
+    VertexIndex, WorkgroupId, begin_pass, buffer, buffer_of, dispatch, draw, features, read,
+    read_texture, sampler, subgroup_prefix_sum, texture, workgroup_prefix_sum, Features,
 }
 use std::io::{Pending, print}
 
@@ -29,6 +29,32 @@ fn histogram(
     let _ = bins.add(values[id.x], 1)
     bins.barrier()
     let _ = totals.add(lid.x, bins.load(lid.x))
+}
+
+/// Each workgroup's least and greatest signed value (`value(i) - 128`), in signed workgroup
+/// atomics: element 0 the minimum, 1 the maximum, which its first invocation writes out.
+@compute(256)
+fn extremes(
+    values: [u32],
+    out: mut Atomics<i32>,
+    m: mut SharedAtomicsI<2>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    if lid.x == 0 {
+        m.store(0, 2147483647)
+        m.store(1, -2147483648)
+    }
+    m.barrier()
+    let v = i32(values[id.x]) - 128
+    let _ = m.min(0, v)
+    let _ = m.max(1, v)
+    m.barrier()
+    if lid.x == 0 {
+        out.store(2 * wid.x, m.load(0))
+        out.store(2 * wid.x + 1, m.load(1))
+    }
 }
 
 /// The odd values of each workgroup's 256, in order, from its first slot: where each goes is
@@ -114,6 +140,9 @@ pub struct State {
     compacted_subgroups: GpuBuffer<u32>,
     counts_subgroups: GpuBuffer<u32>,
     halves: GpuBuffer<f32>,
+    extremes: GpuBuffer<i32>,
+    extremes_read: Option<Pending<i32>>,
+    got_extremes: Vec<i32>,
     bc1: Option<Texture<Bc1>>,
     bc1_out: Texture<Rgba8>,
     linear: Sampler,
@@ -138,6 +167,9 @@ pub fn init() -> State {
         compacted_subgroups: buffer(COMPACTED),
         counts_subgroups: buffer(COMPACTED / 256),
         halves: buffer(64),
+        extremes: buffer(2 * COMPACTED / 256),
+        extremes_read: None,
+        got_extremes: Vec::new(),
         bc1: None,
         bc1_out: texture(width: 1, height: 1),
         linear: sampler(),
@@ -162,6 +194,16 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
                 }
             }
             k += 1
+        }
+        match mut s.extremes_read {
+            Some(p) => {
+                if s.got_extremes.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.got_extremes = take v
+                    }
+                }
+            },
+            None => {},
         }
         match mut s.half_read {
             Some(p) => {
@@ -194,6 +236,8 @@ fn record(s: mut State) {
     dispatch(compact.bind(first, mut s.compacted, mut s.counts), groups: (COMPACTED / 256, 1, 1))
     s.reads.push(read(s.compacted.items()))
     s.reads.push(read(s.counts.items()))
+    dispatch(extremes.bind(first, mut s.extremes), groups: (COMPACTED / 256, 1, 1))
+    s.extremes_read = Some(read(s.extremes.items()))
     if s.features.subgroups {
         dispatch(
             compact_subgroups.bind(first, mut s.compacted_subgroups, mut s.counts_subgroups),
@@ -304,3 +348,18 @@ fn a_bc1_block_samples_as_its_colour(s: State) {
 
 @test(frames: 4, gpu: true, hosts: both)
 fn both_hosts_run_the_same_kernels(s: State) {}
+
+@test(frames: 6, gpu: true)
+fn signed_workgroup_atomics_find_each_workgroups_extremes(s: State) {
+    assert(s.got_extremes.len() == 2 * COMPACTED / 256)
+    for g in 0..COMPACTED / 256 {
+        var lo: i32 = 2147483647
+        var hi: i32 = -2147483648
+        for i in 0..256 {
+            let v = i32(value(256 * g + i)) - 128
+            lo = min(lo, v)
+            hi = max(hi, v)
+        }
+        assert(s.got_extremes[2 * g] == lo && s.got_extremes[2 * g + 1] == hi)
+    }
+}

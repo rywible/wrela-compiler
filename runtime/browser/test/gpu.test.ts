@@ -1216,3 +1216,46 @@ test("the executor counts what it did below the stream, until its counters are t
   });
   expect(executor.takeCounters().draws).toBe(0);
 });
+
+test("a pipeline isn't made for a target the device can't blend into as it blends", async () => {
+  const build = async (features: string[]) => {
+    const device = new FakeDevice();
+    for (const f of features) device.features.add(f as GPUFeatureName);
+    const m = shapes();
+    const draw = m.pipelines[0]!;
+    if (draw.kind !== "render") throw new Error("the shapes' pipeline 0 renders");
+    draw.blends = ["add"];
+    draw.targets = [
+      { colors: ["r32float"], depth: false, screen: false },
+      { colors: ["rgba16float"], depth: false, screen: false },
+    ];
+    await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+    return device.made;
+  };
+  // Without float32-blendable, the r32float variant would fail the whole load.
+  expect(await build([])).toEqual(["draw rgba16float|none"]);
+  expect(await build(["float32-blendable"])).toEqual(["draw r32float|none", "draw rgba16float|none"]);
+});
+
+test("a pass that joins one with a scissor starts from the whole target again", async () => {
+  const { device, run, executor } = await setup();
+  const target = (keep: boolean) => passOf({ color: 3, keepColor: keep, join: keep });
+  run(
+    new Encoder()
+      .createBuffer(1, 64)
+      .createBuffer(2, 64)
+      .createTexture(3, 8, 4, "rgba8unorm")
+      .beginPass(target(false))
+      .scissor(0, 0, 2, 2)
+      .draw(0, 3, 1, [1, 2], u(0))
+      .endPass()
+      .beginPass(target(true))
+      .draw(0, 3, 1, [1, 2], u(1))
+      .endPass(),
+  );
+  executor.flush();
+  const ev = device.events.filter((e) => ["renderPass", "scissor", "viewport", "draw"].includes(e.kind));
+  expect(ev.map((e) => e.kind)).toEqual(["renderPass", "scissor", "draw", "scissor", "viewport", "draw"]);
+  expect(ev[3]).toEqual({ kind: "scissor", rect: [0, 0, 8, 4] });
+  expect(ev[4]).toEqual({ kind: "viewport", rect: [0, 0, 8, 4] });
+});

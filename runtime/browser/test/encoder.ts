@@ -110,6 +110,10 @@ export class Encoder {
     return this.#command(Opcode.EndPass, []);
   }
 
+  scissor(x: number, y: number, width: number, height: number): this {
+    return this.#command(Opcode.SetScissor, [x, y, width, height]);
+  }
+
   /** Any command, its payload's words as given. */
   words(op: number, ws: number[]): this {
     return this.#command(op, ws);

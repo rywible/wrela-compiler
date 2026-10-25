@@ -15,11 +15,11 @@ use std::abi::{
     FORMAT_BC4_R_UNORM, FORMAT_BC4_R_UNORM_BYTES, FORMAT_BC5_RG_UNORM, FORMAT_BC5_RG_UNORM_BYTES,
     FORMAT_BC7_RGBA_UNORM, FORMAT_BC7_RGBA_UNORM_BYTES, FORMAT_ETC2_RGB8UNORM,
     FORMAT_ETC2_RGB8UNORM_BYTES, FORMAT_ASTC_4X4_UNORM, FORMAT_ASTC_4X4_UNORM_BYTES, KIND_2D,
-    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE, GPU_STATE,
+    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE,
     FORMAT_DEPTH32FLOAT_BYTES,
 }
 use std::io::{IoError, Pending, next_request}
-use std::mem::{Drop, size_of}
+use std::mem::{Drop, gpu_count, own_gpu_count, set_gpu_count, size_of}
 
 /// A buffer of `T`s on the GPU: an owned value, which CPU code creates, writes into and passes
 /// to kernels and shaders, but can't read through. Dropping it releases it; the host
@@ -34,7 +34,7 @@ impl<T> Drop for GpuBuffer<T> {
     fn drop(mut self) {
         if self.handle != 0 {
             destroy_buffer(self.handle)
-            count_memory(0, buffer_bytes::<T>(self.count), false)
+            count_memory(0, buffer_bytes::<T>(self.count), add: false)
         }
     }
 }
@@ -255,7 +255,7 @@ pub struct Flat<T>: Copy {
 /// Creates a GPU buffer of `count` elements, zeroed.
 pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {
     let b: GpuBuffer<T> = new_buffer(count)
-    count_memory(0, buffer_bytes::<T>(count), true)
+    count_memory(0, buffer_bytes::<T>(count), add: true)
     b
 }
 
@@ -271,9 +271,10 @@ fn buffer_bytes<T>(count: u32) -> u64 {
 
 /// What the program holds on the GPU (§18.10): the bytes of its buffers and textures now, and
 /// the most of each it has held at once. std counts them as it creates and drops each (a
-/// texture by its levels' blocks and its layers), so it's the program's own arithmetic, and
-/// `@deterministic` code may read it; test mode's `memory.json` is the host's count, the same
-/// numbers. A budget a game sets for itself is checked against it.
+/// texture by its levels' blocks and its layers), the program's own arithmetic; test mode's
+/// `memory.json` is the host's count, the same numbers. A budget a game sets for itself is
+/// checked against it. It's `nondet`: a ticker reading it would see the frames' count at a time
+/// timing chooses, so `@deterministic` code takes it as data.
 pub struct Memory: Copy {
     pub buffers: u64,
     pub textures: u64,
@@ -283,27 +284,22 @@ pub struct Memory: Copy {
 
 /// What the program holds on the GPU.
 pub fn memory() -> Memory {
-    unsafe {
-        Memory {
-            buffers: std::mem::read::<u64>(GPU_STATE),
-            textures: std::mem::read::<u64>(GPU_STATE + 8),
-            peak_buffers: std::mem::read::<u64>(GPU_STATE + 16),
-            peak_textures: std::mem::read::<u64>(GPU_STATE + 24),
-        }
+    Memory {
+        buffers: gpu_count(0),
+        textures: gpu_count(1),
+        peak_buffers: gpu_count(2),
+        peak_textures: gpu_count(3),
     }
 }
 
 /// Adds `bytes` to (`add`) or takes them from the buffers' count (`which` 0) or the textures'
 /// (1), and raises the peak.
 fn count_memory(which: u32, bytes: u64, add: bool) {
-    let at = GPU_STATE + 8 * which
-    unsafe {
-        let now = std::mem::read::<u64>(at)
-        let next = if add { now + bytes } else if bytes > now { 0 } else { now - bytes }
-        std::mem::write::<u64>(at, next)
-        if next > std::mem::read::<u64>(at + 16) {
-            std::mem::write::<u64>(at + 16, next)
-        }
+    let now = own_gpu_count(which)
+    let next = if add { now + bytes } else if bytes > now { 0 } else { now - bytes }
+    set_gpu_count(which, next)
+    if next > own_gpu_count(which + 2) {
+        set_gpu_count(which + 2, next)
     }
 }
 
@@ -994,7 +990,14 @@ impl Drop for DepthTexture {
         if self.handle != 0 {
             drop_texture(
                 self.handle,
-                texture_bytes(self.width, self.height, 1, 1, FORMAT_DEPTH32FLOAT_BYTES, 1),
+                texture_bytes(
+                    width: self.width,
+                    height: self.height,
+                    layers: 1,
+                    levels: 1,
+                    bytes: FORMAT_DEPTH32FLOAT_BYTES,
+                    block: 1,
+                ),
             )
         }
     }
@@ -1076,12 +1079,12 @@ impl Drop for DepthTextureArray {
             drop_texture(
                 self.handle,
                 texture_bytes(
-                    self.width,
-                    self.height,
-                    self.layers,
-                    1,
-                    FORMAT_DEPTH32FLOAT_BYTES,
-                    1,
+                    width: self.width,
+                    height: self.height,
+                    layers: self.layers,
+                    levels: 1,
+                    bytes: FORMAT_DEPTH32FLOAT_BYTES,
+                    block: 1,
                 ),
             )
         }
@@ -1335,12 +1338,12 @@ pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
     let handle = create_texture_of(
         width,
         height,
-        FORMAT_DEPTH32FLOAT,
-        KIND_2D,
-        1,
-        1,
-        FORMAT_DEPTH32FLOAT_BYTES,
-        1,
+        format: FORMAT_DEPTH32FLOAT,
+        kind: KIND_2D,
+        layers: 1,
+        levels: 1,
+        bytes: FORMAT_DEPTH32FLOAT_BYTES,
+        block: 1,
     )
     DepthTexture { handle, width, height }
 }
@@ -1352,12 +1355,12 @@ pub fn depth_texture_array(width: u32, height: u32, layers: u32) -> DepthTexture
     let handle = create_texture_of(
         width,
         height,
-        FORMAT_DEPTH32FLOAT,
-        KIND_ARRAY,
-        layers,
-        1,
-        FORMAT_DEPTH32FLOAT_BYTES,
-        1,
+        format: FORMAT_DEPTH32FLOAT,
+        kind: KIND_ARRAY,
+        layers: layers,
+        levels: 1,
+        bytes: FORMAT_DEPTH32FLOAT_BYTES,
+        block: 1,
     )
     DepthTextureArray { handle, width, height, layers }
 }
@@ -1388,7 +1391,15 @@ pub fn sampler(
     if anisotropy > 1 && (linear == 0 || mip_linear == 0) {
         panic("sampler: an anisotropic sampler filters linearly, within and between levels")
     }
-    Sampler { handle: create_sampler(linear, repeat, 0, mip_linear, anisotropy) }
+    Sampler {
+        handle: create_sampler(
+            linear,
+            repeat,
+            compare: 0,
+            mip_linear: mip_linear,
+            anisotropy: anisotropy,
+        ),
+    }
 }
 
 /// A new comparison sampler: linear, so each comparison blends four texels' results.
@@ -1403,7 +1414,9 @@ pub fn comparison_sampler(compare: Compare = Compare::LessEqual) -> ComparisonSa
         Compare::Always => COMPARE_ALWAYS,
         Compare::Never => COMPARE_NEVER,
     }
-    ComparisonSampler { handle: create_sampler(1, 0, code, 0, 1) }
+    ComparisonSampler {
+        handle: create_sampler(linear: 1, repeat: 0, compare: code, mip_linear: 0, anisotropy: 1),
+    }
 }
 
 /// The most bytes one texture write command carries: writes are split into rows that fit.
@@ -1830,18 +1843,18 @@ pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
         panic("copy_texture: the rectangle runs past the destination's edge")
     }
     copy_texture_command(
-        a.handle,
-        a.level,
-        a.layer,
-        x,
-        y,
-        b.handle,
-        b.level,
-        b.layer,
-        to_x,
-        to_y,
-        w,
-        h,
+        from: a.handle,
+        from_level: a.level,
+        from_layer: a.layer,
+        x: x,
+        y: y,
+        to: b.handle,
+        to_level: b.level,
+        to_layer: b.layer,
+        to_x: to_x,
+        to_y: to_y,
+        width: w,
+        height: h,
     )
 }
 
@@ -1856,16 +1869,16 @@ pub fn copy_texture_to_buffer<F: Format, S: TexelSource<F>>(from: S, to: mut Gpu
         panic("copy_texture_to_buffer: the buffer is smaller than the texture's padded rows")
     }
     copy_texture_to_buffer_command(
-        a.handle,
-        a.level,
-        a.layer,
-        0,
-        0,
-        a.width,
-        a.height,
-        to.handle,
-        0,
-        row,
+        texture: a.handle,
+        level: a.level,
+        layer: a.layer,
+        x: 0,
+        y: 0,
+        width: a.width,
+        height: a.height,
+        buffer: to.handle,
+        offset: 0,
+        bytes_per_row: row,
     )
 }
 
@@ -1879,17 +1892,22 @@ pub fn copy_buffer_to_texture<F: Format, T: TexelTarget<F>>(from: GpuSpan<u32>, 
     if from.count * 4 < row * bh {
         panic("copy_buffer_to_texture: the span is smaller than the texture's padded rows")
     }
+    if (from.start * 4) % F::bytes() != 0 {
+        panic(
+            "copy_buffer_to_texture: the span starts inside a texel block (WebGPU copies whole blocks)",
+        )
+    }
     copy_buffer_to_texture_command(
-        from.buffer.handle,
-        from.start * 4,
-        row,
-        b.handle,
-        b.level,
-        b.layer,
-        0,
-        0,
-        b.width,
-        b.height,
+        buffer: from.buffer.handle,
+        offset: from.start * 4,
+        bytes_per_row: row,
+        texture: b.handle,
+        level: b.level,
+        layer: b.layer,
+        x: 0,
+        y: 0,
+        width: b.width,
+        height: b.height,
     )
 }
 
@@ -1985,16 +2003,16 @@ pub fn read_texture<F: Format, S: TexelSource<F>>(from: S) -> TextureRead {
     let row = padded_row(bw * F::bytes())
     var staging: GpuBuffer<u32> = buffer(row * bh / 4)
     copy_texture_to_buffer_command(
-        a.handle,
-        a.level,
-        a.layer,
-        0,
-        0,
-        a.width,
-        a.height,
-        staging.handle,
-        0,
-        row,
+        texture: a.handle,
+        level: a.level,
+        layer: a.layer,
+        x: 0,
+        y: 0,
+        width: a.width,
+        height: a.height,
+        buffer: staging.handle,
+        offset: 0,
+        bytes_per_row: row,
     )
     let pending = read(staging.items())
     TextureRead { staging, pending, row, packed: bw * F::bytes(), height: bh }
@@ -2292,20 +2310,20 @@ pub fn begin_pass<F: Target>(
         panic("begin_pass: the target has no such level")
     }
     begin_pass1_command(
-        1,
-        0,
-        target.handle,
-        level,
-        0,
-        u32(keep),
-        clear.x,
-        clear.y,
-        clear.z,
-        clear.w,
-        NO_TARGET,
-        0,
-        0,
-        1.0,
+        count: 1,
+        join: 0,
+        t0: target.handle,
+        level0: level,
+        layer0: 0,
+        keep0: u32(keep),
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: NO_TARGET,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: 1.0,
     )
     Pass { target: mut target }
 }
@@ -2331,20 +2349,20 @@ pub fn begin_pass_with_depth<F: Target>(
     }
     let (c, d) = (target.handle, depth.handle)
     begin_pass1_command(
-        1,
-        u32(join),
-        c,
-        level,
-        0,
-        u32(keep),
-        clear.x,
-        clear.y,
-        clear.z,
-        clear.w,
-        d,
-        0,
-        u32(keep_depth),
-        clear_depth,
+        count: 1,
+        join: u32(join),
+        t0: c,
+        level0: level,
+        layer0: 0,
+        keep0: u32(keep),
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: d,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
     )
     DepthPass { target: mut target, depth: mut depth }
 }
@@ -2355,7 +2373,14 @@ pub fn begin_depth_pass(
     clear_depth: f32 = 1.0,
     keep_depth: bool = false,
 ) -> DepthOnlyPass {
-    begin_pass0_command(0, 0, depth.handle, 0, u32(keep_depth), clear_depth)
+    begin_pass0_command(
+        count: 0,
+        join: 0,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
     DepthOnlyPass { depth: mut depth }
 }
 
@@ -2369,7 +2394,14 @@ pub fn begin_depth_layer_pass(
     if layer >= depth.layers {
         panic("begin_depth_layer_pass: the array has no such layer")
     }
-    begin_pass0_command(0, 0, depth.handle, layer, u32(keep_depth), clear_depth)
+    begin_pass0_command(
+        count: 0,
+        join: 0,
+        depth: depth.handle,
+        depth_layer: layer,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
+    )
     DepthLayerPass { depth: mut depth }
 }
 
@@ -2385,20 +2417,20 @@ pub fn begin_layer_pass<F: Target>(
         panic("begin_layer_pass: the array has no such layer or level")
     }
     begin_pass1_command(
-        1,
-        0,
-        target.handle,
-        level,
-        layer,
-        u32(keep),
-        clear.x,
-        clear.y,
-        clear.z,
-        clear.w,
-        NO_TARGET,
-        0,
-        0,
-        1.0,
+        count: 1,
+        join: 0,
+        t0: target.handle,
+        level0: level,
+        layer0: layer,
+        keep0: u32(keep),
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: NO_TARGET,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: 1.0,
     )
     LayerPass { target: mut target }
 }
@@ -2419,20 +2451,20 @@ pub fn begin_layer_pass_with_depth<F: Target>(
     }
     let (c, d) = (target.handle, depth.handle)
     begin_pass1_command(
-        1,
-        0,
-        c,
-        level,
-        layer,
-        u32(keep),
-        clear.x,
-        clear.y,
-        clear.z,
-        clear.w,
-        d,
-        0,
-        u32(keep_depth),
-        clear_depth,
+        count: 1,
+        join: 0,
+        t0: c,
+        level0: level,
+        layer0: layer,
+        keep0: u32(keep),
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: d,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
     )
     LayerDepthPass { target: mut target, depth: mut depth }
 }
@@ -2474,28 +2506,28 @@ pub fn begin_pass2<A: Target, B: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass2_command(
-        2,
-        0,
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        NO_TARGET,
-        0,
-        0,
-        1.0,
+        count: 2,
+        join: 0,
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        depth: NO_TARGET,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: 1.0,
     )
     Pass2 { first: mut first, second: mut second }
 }
@@ -2514,28 +2546,28 @@ pub fn begin_pass2_with_depth<A: Target, B: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass2_command(
-        2,
-        u32(join),
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        depth.handle,
-        0,
-        u32(keep_depth),
-        clear_depth,
+        count: 2,
+        join: u32(join),
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
     )
     DepthPass2 { first: mut first, second: mut second, depth: mut depth }
 }
@@ -2551,36 +2583,36 @@ pub fn begin_pass3<A: Target, B: Target, C: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass3_command(
-        3,
-        0,
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        third.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        NO_TARGET,
-        0,
-        0,
-        1.0,
+        count: 3,
+        join: 0,
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: third.handle,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        depth: NO_TARGET,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: 1.0,
     )
     Pass3 { first: mut first, second: mut second, third: mut third }
 }
@@ -2600,36 +2632,36 @@ pub fn begin_pass3_with_depth<A: Target, B: Target, C: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass3_command(
-        3,
-        u32(join),
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        third.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        depth.handle,
-        0,
-        u32(keep_depth),
-        clear_depth,
+        count: 3,
+        join: u32(join),
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: third.handle,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
     )
     DepthPass3 { first: mut first, second: mut second, third: mut third, depth: mut depth }
 }
@@ -2646,44 +2678,44 @@ pub fn begin_pass4<A: Target, B: Target, C: Target, D: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass4_command(
-        4,
-        0,
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        third.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        fourth.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        NO_TARGET,
-        0,
-        0,
-        1.0,
+        count: 4,
+        join: 0,
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: third.handle,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: fourth.handle,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        depth: NO_TARGET,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: 1.0,
     )
     Pass4 { first: mut first, second: mut second, third: mut third, fourth: mut fourth }
 }
@@ -2704,44 +2736,44 @@ pub fn begin_pass4_with_depth<A: Target, B: Target, C: Target, D: Target>(
     let k = u32(keep)
     let (x, y, z, w) = (clear.x, clear.y, clear.z, clear.w)
     begin_pass4_command(
-        4,
-        u32(join),
-        first.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        second.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        third.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        fourth.handle,
-        0,
-        0,
-        k,
-        x,
-        y,
-        z,
-        w,
-        depth.handle,
-        0,
-        u32(keep_depth),
-        clear_depth,
+        count: 4,
+        join: u32(join),
+        t0: first.handle,
+        level0: 0,
+        layer0: 0,
+        keep0: k,
+        r0: x,
+        g0: y,
+        b0: z,
+        a0: w,
+        t1: second.handle,
+        level1: 0,
+        layer1: 0,
+        keep1: k,
+        r1: x,
+        g1: y,
+        b1: z,
+        a1: w,
+        t2: third.handle,
+        level2: 0,
+        layer2: 0,
+        keep2: k,
+        r2: x,
+        g2: y,
+        b2: z,
+        a2: w,
+        t3: fourth.handle,
+        level3: 0,
+        layer3: 0,
+        keep3: k,
+        r3: x,
+        g3: y,
+        b3: z,
+        a3: w,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: u32(keep_depth),
+        clear_depth: clear_depth,
     )
     DepthPass4 {
         first: mut first,
@@ -2761,20 +2793,20 @@ pub fn begin_screen_pass_with_depth(
     clear_depth: f32 = 1.0,
 ) -> ScreenDepthPass {
     begin_pass1_command(
-        1,
-        0,
-        SCREEN_TARGET,
-        0,
-        0,
-        0,
-        clear.x,
-        clear.y,
-        clear.z,
-        clear.w,
-        depth.handle,
-        0,
-        0,
-        clear_depth,
+        count: 1,
+        join: 0,
+        t0: SCREEN_TARGET,
+        level0: 0,
+        layer0: 0,
+        keep0: 0,
+        r0: clear.x,
+        g0: clear.y,
+        b0: clear.z,
+        a0: clear.w,
+        depth: depth.handle,
+        depth_layer: 0,
+        keep_depth: 0,
+        clear_depth: clear_depth,
     )
     ScreenDepthPass { depth: mut depth }
 }
@@ -2865,7 +2897,7 @@ fn create_texture_of(
     block: u32,
 ) -> u32 {
     let handle = new_texture(width, height, format, kind, layers, levels)
-    count_memory(1, texture_bytes(width, height, layers, levels, bytes, block), true)
+    count_memory(1, texture_bytes(width, height, layers, levels, bytes, block), add: true)
     handle
 }
 
@@ -2884,7 +2916,7 @@ fn texture_bytes(width: u32, height: u32, layers: u32, levels: u32, bytes: u32, 
 /// Destroys texture `handle`, its bytes uncounted from `memory()`.
 fn drop_texture(handle: u32, bytes: u64) {
     destroy_texture(handle)
-    count_memory(1, bytes, false)
+    count_memory(1, bytes, add: false)
 }
 
 @intrinsic
@@ -3321,7 +3353,8 @@ pub struct Features: Copy {
     pub etc2: bool,
     /// ASTC compressed textures: `Astc4x4`.
     pub astc: bool,
-    /// `R32Float`, `Rg32Float` and `Rgba32Float` filtered (`float32-filterable`).
+    /// Whether the device could filter `R32Float`, `Rg32Float` and `Rgba32Float`
+    /// (`float32-filterable`). Toolchain 0.6 doesn't sample them yet: they aren't `Filtered`.
     pub float32_filterable: bool,
     /// Draws blending into `R32Float`, `Rg32Float` and `Rgba32Float` (`float32-blendable`).
     pub float32_blendable: bool,
@@ -3504,8 +3537,79 @@ impl<const N: u32> SharedAtomics<N> {
     }
 }
 
+/// `SharedAtomics<N>` of `i32`s: workgroup memory any invocation changes at once, each operation
+/// whole, for signed counts and a signed minimum or maximum.
+pub struct SharedAtomicsI<const N: u32> {
+    unused: u32,
+}
+
+impl<const N: u32> SharedAtomicsI<N> {
+    /// `N`.
+    pub fn len(self) -> u32 {
+        N
+    }
+
+    /// Element `i`.
+    pub fn load(self, i: u32) -> i32 {
+        atomic_load(self, i)
+    }
+
+    /// Sets element `i` to `value`: a scatter that can't race.
+    pub fn store(mut self, i: u32, value: i32) {
+        atomic_store(mut self, i, value)
+    }
+
+    /// Adds `value` to element `i`; the element's old value.
+    pub fn add(mut self, i: u32, value: i32) -> i32 {
+        atomic_add(mut self, i, value)
+    }
+
+    /// Sets element `i` to the smaller of it and `value`; the element's old value.
+    pub fn min(mut self, i: u32, value: i32) -> i32 {
+        atomic_min(mut self, i, value)
+    }
+
+    /// Sets element `i` to the larger of it and `value`; the element's old value.
+    pub fn max(mut self, i: u32, value: i32) -> i32 {
+        atomic_max(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise and with `value`; the element's old value.
+    pub fn and(mut self, i: u32, value: i32) -> i32 {
+        atomic_and(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise or with `value`; the element's old value.
+    pub fn or(mut self, i: u32, value: i32) -> i32 {
+        atomic_or(mut self, i, value)
+    }
+
+    /// Sets element `i` to its bitwise exclusive or with `value`; the element's old value.
+    pub fn xor(mut self, i: u32, value: i32) -> i32 {
+        atomic_xor(mut self, i, value)
+    }
+
+    /// Sets element `i` to `value`; the element's old value.
+    pub fn exchange(mut self, i: u32, value: i32) -> i32 {
+        atomic_exchange(mut self, i, value)
+    }
+
+    /// Stores `new` if element `i` is `expected`: the old value, which is `expected` exactly
+    /// when it stored.
+    pub fn compare_exchange(mut self, i: u32, expected: i32, new: i32) -> i32 {
+        strong_compare_exchange(mut self, i, expected, new)
+    }
+
+    /// Waits until every invocation of the workgroup has reached it: what each added before it
+    /// is in every element read after it. In uniform control flow (E0608).
+    pub fn barrier(mut self) {
+        atomics_barrier(mut self)
+    }
+}
+
+/// A barrier on workgroup atomics (`SharedAtomics<N>`, `SharedAtomicsI<N>`).
 @intrinsic
-fn atomics_barrier<const N: u32>(shared: mut SharedAtomics<N>) {}
+fn atomics_barrier<A>(shared: mut A) {}
 
 /// The sum of `value` over the invocations of the workgroup before this one (by `LocalId`'s
 /// index: an exclusive prefix sum), the building block of a compaction: each invocation's place

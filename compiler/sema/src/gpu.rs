@@ -33,10 +33,12 @@ fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef>
 
 /// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
 pub fn shares_memory(p: &Program, f: FnId) -> bool {
-    p.func(f)
-        .params
-        .iter()
-        .any(|ps| matches!(p.lang_of_ty(ps.ty), Some(Lang::Shared | Lang::SharedAtomics)))
+    p.func(f).params.iter().any(|ps| {
+        matches!(
+            p.lang_of_ty(ps.ty),
+            Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI)
+        )
+    })
 }
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
@@ -81,7 +83,7 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
         let ty = ps.ty;
         let lang = p.lang_of_ty(ty);
         if BuiltinInput::of(p, ty).is_some()
-            || matches!(lang, Some(Lang::Shared | Lang::SharedAtomics))
+            || matches!(lang, Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI))
             || is_varyings(p, entry, ty)
         {
             continue;
@@ -628,7 +630,9 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::One) => "one invocation of a kernel writes it",
-                Some(Lang::Shared | Lang::SharedAtomics) => "workgroup memory is a kernel's",
+                Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI) => {
+                    "workgroup memory is a kernel's"
+                }
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
                 Some(Lang::Texels | Lang::Texels3d | Lang::TexelsArray | Lang::MipStep) => {
                     "texels are written by a kernel's `GlobalId`"

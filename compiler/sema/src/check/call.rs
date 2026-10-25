@@ -3036,7 +3036,7 @@ impl<'p> Checker<'p> {
     /// builtin input, or workgroup memory.
     pub(crate) fn is_gpu_builtin(&self, t: TyId) -> bool {
         crate::gpu::BuiltinInput::of(self.p, t).is_some()
-            || matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::Shared) || self.p.is_lang_adt(a, Lang::SharedAtomics))
+            || matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::Shared) || self.p.is_lang_adt(a, Lang::SharedAtomics) || self.p.is_lang_adt(a, Lang::SharedAtomicsI))
     }
 
     /// How `wrela doc` names type `t`'s page: a struct's or an enum's name, `[T]` for a run,

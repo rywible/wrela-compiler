@@ -34,10 +34,13 @@ export async function openDevice(fatal: (error: Error) => void, keep: string | n
   // Every optional feature wherever the adapter has it (timestamps too: a program may ask for its
   // work's time, `std::gpu::timed`, and a timed run times every pass). None is required: a
   // program checks `std::gpu::features()` before it records what needs one.
-  const requiredFeatures = FEATURES.filter((f) => adapter.features.has(f)) as GPUFeatureName[];
-  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+  // A mask (test mode's `features=`) holds for the device itself, so pipeline creation and the
+  // executor see what the program sees; timestamps stay, which a profile's timing needs.
   const kept = keep === null ? null : keep === "none" ? [] : keep.split(",");
-  const features = requiredFeatures.filter((f) => f === "indirect-first-instance" || kept === null || kept.includes(f));
+  const wanted = (f: string) => f === "indirect-first-instance" || kept === null || kept.includes(f);
+  const requiredFeatures = FEATURES.filter((f) => adapter.features.has(f) && (wanted(f) || f === "timestamp-query")) as GPUFeatureName[];
+  const device = await adapter.requestDevice({ requiredLimits, requiredFeatures });
+  const features = requiredFeatures.filter(wanted);
   const info = adapter.info as GPUAdapterInfo & { subgroupMinSize?: number; subgroupMaxSize?: number };
   const subgroups: [number, number] = features.includes("subgroups") ? [info.subgroupMinSize ?? 0, info.subgroupMaxSize ?? 0] : [0, 0];
   SEEN.set(device, { features, subgroups });

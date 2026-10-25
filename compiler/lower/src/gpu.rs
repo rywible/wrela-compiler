@@ -239,12 +239,19 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
             };
             ParamClass::Workgroup { elem: args[0], len, atomic: false }
         }
-        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::SharedAtomics) => {
+        TyKind::Adt(_, args)
+            if matches!(p.lang_of_ty(ty), Some(Lang::SharedAtomics | Lang::SharedAtomicsI)) =>
+        {
             let len = match p.types.kind(args[0]) {
                 TyKind::ConstU32(n) => *n,
                 _ => 0,
             };
-            ParamClass::Workgroup { elem: p.types.u32, len, atomic: true }
+            let elem = if p.lang_of_ty(ty) == Some(Lang::SharedAtomicsI) {
+                p.types.i32
+            } else {
+                p.types.u32
+            };
+            ParamClass::Workgroup { elem, len, atomic: true }
         }
         TyKind::Adt(..) if Some(ty) == varyings => ParamClass::Varyings,
         TyKind::Slice(e) => {
@@ -2312,8 +2319,7 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                 cx.holds_nothing("workgroup memory", elem, param.span);
                 continue;
             };
-            let et =
-                if atomic { mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32)) } else { et };
+            let et = if atomic { atomic_of(&mut mb, et) } else { et };
             if len == 0 {
                 let d =
                     Diagnostic::new(codes::E0602, param.span, "workgroup memory of no elements");
@@ -3154,7 +3160,7 @@ fn stand_in(
     let class = class_of(cx, t, mode, None);
     if let ParamClass::Workgroup { elem, len, atomic } = class {
         let et = cx.lower_ty(mb, elem, span)?;
-        let et = if atomic { mb.m.types.intern(ir::TypeDef::Atomic(ir::Scalar::U32)) } else { et };
+        let et = if atomic { atomic_of(mb, et) } else { et };
         let ty = mb.m.types.intern(ir::TypeDef::Array(et, len.max(1)));
         let kind = ir::ResourceKind::Workgroup;
         let res = ir::Resource { name: name.to_string(), binding: u32::MAX, kind, ty };
@@ -3163,6 +3169,12 @@ fn stand_in(
     let (id, kinds) = add_bound(cx, mb, &class, name, *next, span)?;
     *next += kinds.len() as u32;
     Some(Bound::One(id))
+}
+
+/// The atomic of a workgroup atomics' element type (`u32` or `i32`).
+fn atomic_of(mb: &mut ModuleBuilder, et: ir::TypeId) -> ir::TypeId {
+    let s = mb.m.types.as_scalar(et).unwrap_or(ir::Scalar::U32);
+    mb.m.types.intern(ir::TypeDef::Atomic(s))
 }
 
 /// A GPU entry point or `@gpu` function that nothing dispatches: lowered for the GPU anyway

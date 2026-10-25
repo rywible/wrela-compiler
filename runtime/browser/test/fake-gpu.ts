@@ -37,6 +37,8 @@ export type Event =
   | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndexedIndirect"; pipeline: string; buffer: string; offset: number; indices: string }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
+  | { kind: "scissor"; rect: [number, number, number, number] }
+  | { kind: "viewport"; rect: [number, number, number, number] }
   | { kind: "copy"; from: string; to: string };
 
 export interface FakeBindGroup {
@@ -121,6 +123,8 @@ export class FakeDevice {
       label,
       format: desc.format,
       size: Array.from(desc.size as number[]),
+      width: (desc.size as number[])[0] ?? 1,
+      height: (desc.size as number[])[1] ?? 1,
       usage: desc.usage,
       destroyed: false,
       destroy() {
@@ -248,6 +252,12 @@ export class FakeDevice {
         },
         drawIndexedIndirect(b: FakeBuffer, offset: number) {
           events.push({ kind: "drawIndexedIndirect", pipeline, buffer: b.label, offset, indices });
+        },
+        setScissorRect(x: number, y: number, w: number, h: number) {
+          events.push({ kind: "scissor", rect: [x, y, w, h] });
+        },
+        setViewport(x: number, y: number, w: number, h: number) {
+          events.push({ kind: "viewport", rect: [x, y, w, h] });
         },
         end() {},
       };

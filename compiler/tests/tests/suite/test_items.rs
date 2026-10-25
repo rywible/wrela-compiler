@@ -771,7 +771,7 @@ fn every_kernel_capability_computes_what_the_cpu_does() {
     let failed: Vec<_> =
         out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
     assert!(failed.is_empty(), "failed: {failed:?}");
-    assert_eq!(out.results.len(), 7);
+    assert_eq!(out.results.len(), 8);
 }
 
 /// `std::gpu::memory()` (compiler/tests/memory): std counts the buffers and textures a

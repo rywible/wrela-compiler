@@ -60,6 +60,8 @@ test("features=none hides every optional feature from the program, as the native
   expect(deviceLimits(all)[11]).toBe(32);
   const none = await openDevice(() => {}, "none");
   expect(featureNames(deviceLimits(none)[10]!)).toEqual(["indirect-first-instance"]);
+  // The device itself is opened without them (timestamps stay, for a profile's timing).
+  expect(requestDevice.mock.calls[1]![0]!.requiredFeatures).toEqual(["timestamp-query", "indirect-first-instance"]);
   expect(deviceLimits(none)[12]).toBe(0);
   const some = await openDevice(() => {}, "subgroups");
   expect(featureNames(deviceLimits(some)[10]!)).toEqual(["subgroups", "indirect-first-instance"]);

@@ -111,13 +111,21 @@ pub(super) fn compatible_hardware(before: &Value, after: &Value) -> Result<(), S
     compatible(&hardware(before), &hardware(after), "machine, GPU or driver")
 }
 
-/// Hash the manifest, WASM, shaders and packaged files, with their names and lengths.
+/// Hash the manifest, WASM, shaders, the browser runtime and packaged files, with their names
+/// and lengths.
 pub(crate) fn build_hash(dir: &Path) -> Result<String, String> {
     let manifest = std::fs::read(dir.join("manifest.json")).map_err(|e| e.to_string())?;
     let m = wrela_abi::Manifest::parse(std::str::from_utf8(&manifest).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
     let mut paths = vec![PathBuf::from("manifest.json"), PathBuf::from(m.wasm)];
     paths.extend(m.pipelines.into_iter().map(|p| PathBuf::from(p.shader)));
+    // The browser runtime a build carries is measured with it (`--chrome`): a change to it is a
+    // change of what's measured.
+    for runtime in ["index.html", "main.js", "worker.js", "worklet.js"] {
+        if dir.join(runtime).is_file() {
+            paths.push(PathBuf::from(runtime));
+        }
+    }
     fn files(root: &Path, rel: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
         for entry in std::fs::read_dir(root.join(rel)).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -343,6 +351,12 @@ mod tests {
         assert_ne!(changed, first);
         std::fs::write(root.join("game.wasm"), b"other program").unwrap();
         assert_ne!(build_hash(&root).unwrap(), changed);
+        let program = build_hash(&root).unwrap();
+        std::fs::write(root.join("worker.js"), b"a runtime").unwrap();
+        let with_runtime = build_hash(&root).unwrap();
+        assert_ne!(with_runtime, program);
+        std::fs::write(root.join("worker.js"), b"another runtime").unwrap();
+        assert_ne!(build_hash(&root).unwrap(), with_runtime);
         drop(scratch);
         assert!(!root.exists());
     }

@@ -304,6 +304,13 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         // A target the device can't draw into (rg11b10ufloat without its feature) is one the
         // checker refuses a pass of.
         if (t.colors.some((c) => { const f = TEXTURE_FORMATS.find((x) => x.name === c)!; return !can(device, f.renderable, f.needs.render); })) continue;
+        // Nor one it can't blend into as the pipeline blends (a 32-bit float target without
+        // float32-blendable): the program checks `features()` first, and the checker refuses a
+        // draw that doesn't.
+        if (t.colors.some((c, k) => {
+          const f = TEXTURE_FORMATS.find((x) => x.name === c)!;
+          return (p.blends[k] ?? "replace") !== "replace" && !can(device, f.blendable, f.needs.blend);
+        })) continue;
         const colors = t.screen ? [screenFormat] : (t.colors as GPUTextureFormat[]);
         const depth = t.depth ? "depth32float" : null;
         targets.set(targetsKey(colors, depth), [colors, depth]);
@@ -593,6 +600,14 @@ export const noCounters = (): Counters => ({
   bind_groups: 0,
   pipelines: 0,
 });
+
+/** A copy's extent in whole blocks of `format`: a rectangle of a compressed texture that reaches
+ * its level's edge (the checker allows no other part block) covers that edge's last block, which
+ * WebGPU counts in the level's physical size (a 4 × 4 BC level 1 is one 4 × 4 block). */
+function wholeBlocks(format: TextureFormat, width: number, height: number): GPUExtent3DDict {
+  const b = blockOf(format);
+  return { width: alignTo(width, b), height: alignTo(height, b) };
+}
 
 /** A compute pass a run of dispatches shares, and what it last set. */
 type OpenCompute = { pass: GPUComputePassEncoder; label: string; pipeline: GPUComputePipeline | null; group: GPUBindGroup | null; offsets: number[] };
@@ -1201,10 +1216,11 @@ export class GpuExecutor {
         return;
       case "CopyTexture": {
         const { source: s, destination: d } = cmd;
+        const from = this.#texture(s.texture);
         this.#encoderNow().copyTextureToTexture(
-          { texture: this.#texture(s.texture).texture, mipLevel: s.level, origin: { x: s.x, y: s.y, z: s.layer } },
+          { texture: from.texture, mipLevel: s.level, origin: { x: s.x, y: s.y, z: s.layer } },
           { texture: this.#texture(d.texture).texture, mipLevel: d.level, origin: { x: d.x, y: d.y, z: d.layer } },
-          { width: s.width, height: s.height },
+          wholeBlocks(from.format, s.width, s.height),
         );
         return;
       }
@@ -1215,7 +1231,7 @@ export class GpuExecutor {
         const rows = Math.ceil(r.height / blockOf(t.format));
         const image = { texture: t.texture, mipLevel: r.level, origin: { x: r.x, y: r.y, z: r.layer } };
         const buffer = { buffer: this.#buffer(cmd.buffer), offset: cmd.offset, bytesPerRow: cmd.bytesPerRow, rowsPerImage: rows };
-        const size = { width: r.width, height: r.height };
+        const size = wholeBlocks(t.format, r.width, r.height);
         if (cmd.op === "CopyTextureToBuffer") this.#encoderNow().copyTextureToBuffer(image, buffer, size);
         else this.#encoderNow().copyBufferToTexture(buffer, image, size);
         return;
@@ -1358,6 +1374,14 @@ export class GpuExecutor {
     return r.buffer;
   }
 
+  /** A texture pass's targets' size: its first colour target's level, or its depth's. */
+  #passSize(pass: Pass): [number, number] {
+    const c = pass.colors[0];
+    const t = this.#texture(c === undefined ? pass.depth : c.texture).texture;
+    const level = c?.level ?? 0;
+    return [Math.max(1, t.width >> level), Math.max(1, t.height >> level)];
+  }
+
   #texture(handle: number): Extract<Resource, { kind: "texture" }> {
     const r = this.#resources.get(handle);
     if (r?.kind !== "texture") throw new Error(`host bug: texture ${handle} passed the checks but doesn't exist`);
@@ -1411,7 +1435,7 @@ export class GpuExecutor {
     if (cmd.data.length === 0) return;
     const t = this.#texture(cmd.handle);
     const target = { texture: t.texture, mipLevel: cmd.level, origin: { x: cmd.x, y: cmd.y, z: cmd.layer } };
-    const size = { width: cmd.width, height: cmd.height };
+    const size = wholeBlocks(t.format, cmd.width, cmd.height);
     const rows = Math.ceil(cmd.height / blockOf(t.format));
     const row = cmd.data.length / rows;
     const padded = alignTo(row, 256);
@@ -1615,6 +1639,13 @@ export class GpuExecutor {
     const ended = this.#ended;
     if (ended !== null) {
       if (op === "EndPass" && open.at.generation === ended.at.generation && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
+        // A pass begins with the whole target its scissor and viewport: where the one it joins
+        // set either, the joined draws start from the whole target again.
+        if (ended.draws.some((d) => d.op === "SetScissor" || d.op === "SetViewport")) {
+          const [width, height] = this.#passSize(ended.pass);
+          ended.draws.push({ op: "SetScissor", x: 0, y: 0, width, height });
+          ended.draws.push({ op: "SetViewport", rect: [0, 0, width, height], minDepth: 0, maxDepth: 1 });
+        }
         for (const draw of open.draws) ended.draws.push(draw);
         return;
       }

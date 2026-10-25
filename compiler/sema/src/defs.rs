@@ -274,6 +274,7 @@ macro_rules! lang_items {
                         | Lang::One
                         | Lang::Shared
                         | Lang::SharedAtomics
+                        | Lang::SharedAtomicsI
                         | Lang::Atomics
                         | Lang::Append
                         | Lang::AtomicMap
@@ -514,6 +515,7 @@ lang_items! {
     Limit = "std::gpu::limit",
     Shared = "std::gpu::Shared",
     SharedAtomics = "std::gpu::SharedAtomics",
+    SharedAtomicsI = "std::gpu::SharedAtomicsI",
     AtomicsBarrier = "std::gpu::atomics_barrier",
     SubgroupAdd = "std::gpu::subgroup_add",
     SubgroupExclusiveAdd = "std::gpu::subgroup_exclusive_add",

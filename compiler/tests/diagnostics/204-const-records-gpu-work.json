@@ -10,9 +10,9 @@
       "internal": false,
       "label": null,
       "labels": [],
-      "message": "this `buffer` records GPU work, and `SIZE` is a constant, which the build computes, which can't `host`",
+      "message": "`buffer` records GPU work, and `SIZE` is a constant, which the build computes, which can't `host`",
       "notes": [
-        "the call chain: SIZE → make",
+        "the call chain: SIZE → make → buffer",
         "recording GPU work is the `host` effect; see language.md §8 for what each context forbids"
       ],
       "severity": "error",

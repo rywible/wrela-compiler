@@ -675,7 +675,7 @@ impl Checker {
                 offset,
                 count,
                 count_buffer,
-                count_offset,
+                count_offset: _,
                 bindings,
                 uniforms,
             } => {
@@ -689,8 +689,13 @@ impl Checker {
                     return err(format!("{count} draws' arguments are more than a buffer holds"));
                 }
                 self.read_range(op, *arguments, *offset, bytes as u32, "reading arguments:")?;
+                // A count the GPU writes would mean what a device without multi-draw can't do
+                // (the host draws `count` draws one by one): not in 0.6. An unused draw has no
+                // instances instead.
                 if *count_buffer != NONE {
-                    self.read_range(op, *count_buffer, *count_offset, 4, "reading the count:")?;
+                    return err(
+                        "a multi-draw's count buffer isn't supported: it draws `count` draws, so give the unused ones no instances".into(),
+                    );
                 }
             }
             Command::Present | Command::EndPass => {
@@ -888,6 +893,17 @@ impl Checker {
         bytes_per_row: u32,
     ) -> Result<()> {
         let b = format.block();
+        // WebGPU's rule: a copy's buffer offset is a whole number of the format's blocks.
+        let block_bytes = format.bytes_per_texel();
+        if !offset.is_multiple_of(block_bytes) {
+            return Err(CommandError {
+                opcode: op,
+                why: format!(
+                    "the buffer's offset {offset} isn't a multiple of a {} block's {block_bytes} bytes",
+                    format.info().name
+                ),
+            });
+        }
         let row = u64::from(r.width.div_ceil(b)) * u64::from(format.bytes_per_texel());
         if u64::from(bytes_per_row) < row {
             return Err(CommandError {
