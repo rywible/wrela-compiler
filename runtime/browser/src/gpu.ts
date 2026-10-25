@@ -913,7 +913,9 @@ export class GpuExecutor {
 
   /** The GPU time of the passes and dispatches labelled `label` in the first frame from this
    * one on that runs one, summed: an `f32` of microseconds, once read back. The first ask starts
-   * a timer, on a device with "timestamp-query"; without it, this rejects. */
+   * a timer, on a device with "timestamp-query"; without it, this rejects. Outside a timed run,
+   * only the work of a label asked for and not yet answered is timed (its passes from the ask
+   * on, in the stream's order): the rest runs as untimed, its dispatches sharing a pass. */
   timeLabel(label: string): Promise<Bytes> {
     if (this.#timer === null) {
       if (!this.device.features.has("timestamp-query")) {
@@ -967,9 +969,12 @@ export class GpuExecutor {
     if (this.#timer?.full) this.flush();
   }
 
-  /** The timestamp writes for a pass about to be recorded; never flushes. */
+  /** The timestamp writes for a pass about to be recorded, if it's timed: in a timed run every
+   * pass, else only one whose label the program has asked for and not yet had; never flushes. */
   #timestamps(label: string, frame = this.#running?.frame ?? this.frame): { timestampWrites?: GPUComputePassTimestampWrites } {
-    return this.#timer === null ? {} : { timestampWrites: this.#timer.next(frame, label) };
+    const timer = this.#timer;
+    if (timer === null || !(timer.keep || this.#asked.some((a) => a.label === label))) return {};
+    return { timestampWrites: timer.next(frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it

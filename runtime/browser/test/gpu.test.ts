@@ -1150,6 +1150,32 @@ test("a program's ask for a label's time is answered once its frame has ended an
   executor.destroyAll();
 });
 
+test("an ask times only its own label's work: the rest runs untimed, its dispatches sharing a pass", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const m = shapes();
+  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const twice = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [1, 2], u(1));
+  const asked = executor.timeLabel("look");
+  run(twice(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("other")));
+  executor.flush();
+  // Untimed, the two dispatches share one compute pass.
+  expect(executor.takeCounters().compute_passes).toBe(1);
+  run(twice(new Encoder().label("look")));
+  executor.flush();
+  // Timed, each is a pass of its own, for its timestamps.
+  expect(executor.takeCounters().compute_passes).toBe(2);
+  executor.frame = 1;
+  await asked;
+  // Answered, the label's work runs untimed again.
+  run(twice(new Encoder().label("look")));
+  executor.flush();
+  expect(executor.takeCounters().compute_passes).toBe(1);
+  executor.destroyAll();
+});
+
 test("a GPU without timestamp queries refuses an ask for a time", async () => {
   const device = new FakeDevice();
   const m = shapes();

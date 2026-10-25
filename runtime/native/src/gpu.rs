@@ -1768,7 +1768,16 @@ impl Gpu {
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label));
+        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
+        let timed = self
+            .timer
+            .as_ref()
+            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
+        let timestamps = if timed {
+            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
+        } else {
+            None
+        };
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1983,7 +1992,16 @@ impl Gpu {
         if let (Some(name), Some(target)) = (&open.label, target) {
             self.labelled.insert(name.to_string(), target);
         }
-        let timestamps = self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label));
+        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
+        let timed = self
+            .timer
+            .as_ref()
+            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
+        let timestamps = if timed {
+            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
+        } else {
+            None
+        };
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
             if let PassItem::Draw(d) = d {
@@ -2554,6 +2572,9 @@ impl Executor for Gpu {
         self.check_debug_flag()
     }
 
+    /// A program's ask for `label`'s time (`std::gpu::timed`): from it on, until it's answered,
+    /// the passes and dispatches labelled `label` are timed, and nothing else is (outside a run
+    /// timed from its start), so a frame that times nothing doesn't wait for its timestamps.
     fn ask_time(&mut self, request: u32, label: &str) -> std::result::Result<(), String> {
         if self.timer.is_none() {
             if !self.can_time {
@@ -2987,7 +3008,8 @@ mod tests {
     }
 
     /// A program's ask for a label's time (`std::gpu::timed`) is answered once, after a call
-    /// that ran the label's work, with its microseconds; a build that retires drops its asks, so
+    /// that ran the label's work, with its microseconds, and times no other label's work (outside
+    /// a run timed from its start); a build that retires drops its asks, so
     /// the next build's request numbers get no stale answer; and a run timed from its start still
     /// keeps every timing beside a program's asks.
     #[test]
@@ -3022,6 +3044,13 @@ mod tests {
             };
             gpu.ask_time(1, "count").unwrap();
             assert!(gpu.times().is_empty(), "answered before the work ran");
+            // Outside a timed run, an ask times its own label's work alone.
+            gpu.create_buffer(3, 4);
+            gpu.execute(&Command::Label { name: "other" }).unwrap();
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(3, 0, 4)], &[]).unwrap();
+            gpu.end_frame().unwrap();
+            let other = gpu.timer.as_ref().unwrap().latest.contains_key("other");
+            assert_eq!(other, timing == Timing::Span, "an unasked label was timed");
             run(&mut gpu);
             let answered = gpu.times();
             assert_eq!(answered.len(), 1);
@@ -3031,7 +3060,7 @@ mod tests {
             run(&mut gpu);
             assert!(gpu.times().is_empty(), "answered twice");
             if timing == Timing::Span {
-                assert_eq!(gpu.take_timings().unwrap().len(), 2, "the profiled run's timings");
+                assert_eq!(gpu.take_timings().unwrap().len(), 3, "the profiled run's timings");
             }
             gpu.ask_time(2, "count").unwrap();
             gpu.reload(&manifest, &shaders).unwrap();
