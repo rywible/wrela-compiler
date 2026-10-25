@@ -3,7 +3,7 @@
 
     tools/agent-test/v2/score.py <run-dir>
 
-<run-dir> holds one directory per task, each with attempts/N/{status, diagnostics.json,
+`report(run_dir)` gives the same report, as a dict. <run-dir> holds one directory per task, each with attempts/N/{status, diagnostics.json,
 graded.json} and the CLI's usage.json. Prints the report as JSON: per task, the attempt that
 first built, the attempt that was first correct (its graded.json says so), the codes met, the
 tokens and the cost; overall, the first-try correct and build rates, the means, and the codes
@@ -17,6 +17,8 @@ import sys
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import grading  # noqa: E402
 
 
 def read_json(path, default=None):
@@ -37,9 +39,9 @@ def tokens_and_cost(usage):
     return tokens, float(usage.get("total_cost_usd") or 0.0)
 
 
-def main():
-    run = sys.argv[1]
-    tasks = read_json(os.path.join(HERE, "tasks.json"))
+def report(run):
+    """The report of the run in the directory `run`."""
+    tasks = grading.tasks()
     # The tasks the run ran (run.json says), else every task.
     ran = read_json(os.path.join(run, "run.json"), {}).get("tasks")
     if ran:
@@ -76,7 +78,7 @@ def main():
     n = max(len(per), 1)
     correct = [p for p in per if p["correct_at"] is not None]
     built = [p for p in per if p["built_at"] is not None]
-    report = {
+    return {
         "tasks": len(per),
         "first_try_correct": sum(1 for p in per if p["correct_at"] == 1),
         "first_try_correct_rate": round(sum(1 for p in per if p["correct_at"] == 1) / n, 3),
@@ -89,7 +91,10 @@ def main():
         "codes_met": dict(Counter(c for p in per for cs in p["codes_per_attempt"] for c in cs).most_common()),
         "per_task": per,
     }
-    print(json.dumps(report, indent=2))
+
+
+def main():
+    print(json.dumps(report(sys.argv[1]), indent=2))
 
 
 if __name__ == "__main__":

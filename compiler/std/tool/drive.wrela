@@ -604,8 +604,7 @@ fn read_recorded(r: mut Reader) -> Option<Recorded> {
     }
     let bindings = read_list(mut r, read_bound)?
     let Ok(target) = r.read_string() else { return None }
-    let Ok(len) = r.read_u32() else { return None }
-    let Ok(bytes) = r.read_bytes(len) else { return None }
+    let Ok(bytes) = r.read_counted() else { return None }
     Some(Recorded { kind, label, pipeline, groups, bindings, target, bytes })
 }
 

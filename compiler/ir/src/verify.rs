@@ -163,10 +163,7 @@ impl Verifier<'_> {
                     SubgroupOp::Any | SubgroupOp::All => {
                         types.lookup(&TypeDef::Scalar(Scalar::Bool))
                     }
-                    SubgroupOp::Ballot => {
-                        let u = types.lookup(&TypeDef::Scalar(Scalar::U32));
-                        u.and_then(|_| types.lookup(&TypeDef::Vector(Scalar::U32, 4)))
-                    }
+                    SubgroupOp::Ballot => types.lookup(&TypeDef::Vector(Scalar::U32, 4)),
                     _ => Some(self.ty(x)),
                 }
             }
@@ -224,14 +221,15 @@ impl Verifier<'_> {
                 let (f32_, u32_) = (TypeDef::Scalar(Scalar::F32), TypeDef::Scalar(Scalar::U32));
                 let at = TypeDef::Vector(Scalar::F32, dim.coordinates());
                 let mut want: Vec<TypeDef> = Vec::new();
-                if op.is_query() {
-                } else if *op == TextureOp::Load {
-                    want.extend(vec![u32_.clone(); dim.texel()]);
-                } else {
-                    want.push(at.clone());
-                }
-                if dim.arrayed() && !op.is_query() {
-                    want.push(u32_.clone());
+                if !op.is_query() {
+                    if *op == TextureOp::Load {
+                        want.extend(std::iter::repeat_n(u32_.clone(), dim.texel()));
+                    } else {
+                        want.push(at.clone());
+                    }
+                    if dim.arrayed() {
+                        want.push(u32_.clone());
+                    }
                 }
                 match op {
                     TextureOp::SampleLevel

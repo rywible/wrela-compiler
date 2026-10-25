@@ -241,11 +241,7 @@ impl Program {
         let mut s = String::new();
         self.write_ty(t, &mut s);
         if s.len() > MAX_TYPE_TEXT {
-            let mut cut = MAX_TYPE_TEXT;
-            while !s.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            s.truncate(cut);
+            s.truncate(s.floor_char_boundary(MAX_TYPE_TEXT));
             s.push('…');
         }
         s

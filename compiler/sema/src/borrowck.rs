@@ -67,8 +67,9 @@ pub fn check(p: &Program, body: &Body) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     run_bodies(p, body, None, &mut |diags, _| out.extend(diags));
     out.extend(unused_locals(p, body));
-    out.extend(unchanged_vars(body));
-    out.extend(read_only_clones(p, body));
+    let effects = LocalEffects::of(body);
+    out.extend(unchanged_vars(body, &effects));
+    out.extend(read_only_clones(p, body, &effects));
     out
 }
 
@@ -2284,40 +2285,59 @@ fn rvalue_places(body: &Body, r: &Rvalue, add: &mut dyn FnMut(&Place, bool)) {
     }
 }
 
-/// W0006: a `var` that never changes after it's bound: nothing assigns it again, writes
-/// through it, lends it `mut`, or captures it to write. It's a `let`.
-fn unchanged_vars(body: &Body) -> Vec<Diagnostic> {
-    let n = body.locals.len();
-    let mut changed = vec![false; n];
-    // Assignments of a whole local: its binding is one.
-    let mut whole = vec![0u32; n];
-    let mark = |p: &Place, changed: &mut Vec<bool>| changed[p.local.index()] = true;
-    for f in &body.fns {
-        for b in &f.blocks {
-            for s in &b.stmts {
-                match &s.kind {
-                    StatementKind::Assign(place, r) => {
-                        if place.proj.is_empty() {
-                            whole[place.local.index()] += 1;
-                        } else {
+/// What a body does to each of its locals, for the warnings of a local that never changes.
+struct LocalEffects {
+    /// How many assignments give it a whole value: its binding is one.
+    whole: Vec<u32>,
+    /// Whether anything else changes it: writes through it, lends it `mut` (a `mut` binding
+    /// too), or captures it to write.
+    changed: Vec<bool>,
+}
+
+impl LocalEffects {
+    fn of(body: &Body) -> LocalEffects {
+        let n = body.locals.len();
+        let mut changed = vec![false; n];
+        let mut whole = vec![0u32; n];
+        let mark = |p: &Place, changed: &mut Vec<bool>| changed[p.local.index()] = true;
+        for f in &body.fns {
+            for b in &f.blocks {
+                for s in &b.stmts {
+                    match &s.kind {
+                        StatementKind::Assign(place, r) => {
+                            if place.proj.is_empty() {
+                                whole[place.local.index()] += 1;
+                            } else {
+                                mark(place, &mut changed);
+                            }
+                            rvalue_writes(r, &mut |p| mark(p, &mut changed));
+                        }
+                        StatementKind::Eval(r) => {
+                            rvalue_writes(r, &mut |p| mark(p, &mut changed));
+                        }
+                        StatementKind::Bind { place, mutable: true, .. } => {
                             mark(place, &mut changed);
                         }
-                        rvalue_writes(r, &mut |p| mark(p, &mut changed));
+                        _ => {}
                     }
-                    StatementKind::Eval(r) => rvalue_writes(r, &mut |p| mark(p, &mut changed)),
-                    StatementKind::Bind { place, mutable: true, .. } => mark(place, &mut changed),
-                    _ => {}
                 }
             }
         }
-    }
-    for c in &body.closures {
-        for &(l, writes) in &c.captures {
-            if writes {
-                changed[l.index()] = true;
+        for c in &body.closures {
+            for &(l, writes) in &c.captures {
+                if writes {
+                    changed[l.index()] = true;
+                }
             }
         }
+        LocalEffects { whole, changed }
     }
+}
+
+/// W0006: a `var` that never changes after it's bound: nothing assigns it again, writes
+/// through it, lends it `mut`, or captures it to write. It's a `let`.
+fn unchanged_vars(body: &Body, effects: &LocalEffects) -> Vec<Diagnostic> {
+    let LocalEffects { whole, changed } = effects;
     let mut out = Vec::new();
     for (i, d) in body.locals.iter().enumerate() {
         let var = matches!(d.kind, LocalKind::User(thir::LocalKind::Owned { mutable: true }));
@@ -2345,7 +2365,7 @@ fn unchanged_vars(body: &Body) -> Vec<Diagnostic> {
 /// while the copy lives, a move of the copy), so the check is of whole bodies, not of where the
 /// copy is live. A `Copy` value's copy is cheap and isn't reported. It has no fix: whether a
 /// borrow is what's meant is the author's call.
-fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
+fn read_only_clones(p: &Program, body: &Body, effects: &LocalEffects) -> Vec<Diagnostic> {
     let clone_trait = p.lang_trait(Lang::Clone);
     let is_clone = |c: &Callee| match c {
         Callee::Clone => true,
@@ -2354,30 +2374,15 @@ fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
         }
         _ => false,
     };
-    let n = body.locals.len();
     // What each projection local aliases (`Bind`), to find a clone's source by its own local.
-    let mut alias: HashMap<Local, Place> = HashMap::new();
+    let mut alias = Aliases::default();
     // A temporary that holds a clone: the place cloned, and the call's and the place's spans.
     let mut clone_of: HashMap<Local, (Place, Span, Span)> = HashMap::new();
     // The candidates: a `let` local given a clone, with its source, call span and place span.
     let mut copies: Vec<(Local, Place, Span, Span)> = Vec::new();
-    // Locals that something writes, moves, lends `mut`, captures or returns.
-    let mut touched = vec![false; n];
-    let mut assigned = vec![0u32; n];
-    let resolve = |alias: &HashMap<Local, Place>, place: &Place| -> Place {
-        let mut at = place.clone();
-        for _ in 0..16 {
-            match alias.get(&at.local) {
-                Some(a) => {
-                    let mut p = a.clone();
-                    p.proj.extend(at.proj.iter().cloned());
-                    at = p;
-                }
-                None => break,
-            }
-        }
-        at
-    };
+    // Locals that something changes (as W0006 has it), moves, captures or returns.
+    let mut touched = effects.changed.clone();
+    let assigned = &effects.whole;
     let moved = |o: &Operand, touched: &mut Vec<bool>| {
         if let OperandKind::Move(pl, _) = &o.kind {
             touched[pl.local.index()] = true;
@@ -2387,25 +2392,13 @@ fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
         for b in &f.blocks {
             for s in &b.stmts {
                 match &s.kind {
-                    StatementKind::Bind { local, place, mutable } => {
-                        alias.insert(*local, resolve(&alias, place));
-                        if *mutable {
-                            touched[place.local.index()] = true;
-                        }
-                    }
+                    StatementKind::Bind { local, place, .. } => alias.bind(*local, place),
                     StatementKind::Assign(place, r) => {
-                        if place.proj.is_empty() {
-                            assigned[place.local.index()] += 1;
-                        } else {
-                            touched[place.local.index()] = true;
-                        }
-                        rvalue_writes(r, &mut |w| touched[w.local.index()] = true);
                         r.for_each_operand(&mut |o| moved(o, &mut touched));
                         match r {
                             Rvalue::Call(c) if is_clone(&c.callee) && place.proj.is_empty() => {
                                 if let [Arg::Borrow(src, at)] = c.args.as_slice() {
-                                    clone_of
-                                        .insert(place.local, (resolve(&alias, src), c.span, *at));
+                                    clone_of.insert(place.local, (alias.resolve(src), c.span, *at));
                                 }
                             }
                             Rvalue::Use(Operand { kind: OperandKind::Move(tmp, _), .. })
@@ -2418,10 +2411,7 @@ fn read_only_clones(p: &Program, body: &Body) -> Vec<Diagnostic> {
                             _ => {}
                         }
                     }
-                    StatementKind::Eval(r) => {
-                        rvalue_writes(r, &mut |w| touched[w.local.index()] = true);
-                        r.for_each_operand(&mut |o| moved(o, &mut touched));
-                    }
+                    StatementKind::Eval(r) => r.for_each_operand(&mut |o| moved(o, &mut touched)),
                     _ => {}
                 }
             }

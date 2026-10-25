@@ -9,6 +9,7 @@
 
 use std::host::request
 use std::io::Pending
+use std::serialize::Writer
 
 /// The most bytes `random` gives at once.
 pub const MAX_RANDOM: u32 = 1024
@@ -29,25 +30,25 @@ pub enum Signature: Copy + Eq {
 @server
 pub fn random(n: u32) -> Pending<u8> {
     assert(n <= MAX_RANDOM, "at most 1024 random bytes at once")
-    var body: Vec<u8> = Vec::new()
-    word(mut body, n)
-    request("crypto/random", body)
+    var w = Writer::new()
+    w.write_u32(n)
+    request("crypto/random", take w.into_bytes())
 }
 
 /// Asks whether `signature` is `key`'s over `message`, by `algorithm`: `verified` reads the
 /// answer.
 @server
 pub fn verify(algorithm: Signature, key: [u8], message: [u8], signature: [u8]) -> Pending<u8> {
-    var body: Vec<u8> = Vec::with_capacity(key.len() + message.len() + signature.len() + 13)
-    body.push(match algorithm {
+    var w = Writer::new()
+    w.write_u8(match algorithm {
         Signature::Es256 => 1,
         Signature::Ed25519 => 2,
         Signature::Rs256 => 3,
     })
-    chunk(mut body, key)
-    chunk(mut body, message)
-    chunk(mut body, signature)
-    request("crypto/verify", body)
+    w.write_counted(key)
+    w.write_counted(message)
+    w.write_counted(signature)
+    request("crypto/verify", take w.into_bytes())
 }
 
 /// Whether a `verify`'s answer says the signature is the key's.
@@ -72,23 +73,10 @@ pub fn p256_key(x: [u8], y: [u8]) -> Vec<u8> {
 /// An RSA key as `verify` takes it, from its modulus and exponent (big-endian, as COSE gives
 /// them).
 pub fn rsa_key(modulus: [u8], exponent: [u8]) -> Vec<u8> {
-    var out: Vec<u8> = Vec::with_capacity(modulus.len() + exponent.len() + 8)
-    chunk(mut out, modulus)
-    chunk(mut out, exponent)
-    out
-}
-
-fn word(body: mut Vec<u8>, x: u32) {
-    for k in 0..4 {
-        body.push(u8((x >> (8 * k)) & 255))
-    }
-}
-
-fn chunk(body: mut Vec<u8>, bytes: [u8]) {
-    word(mut body, bytes.len())
-    for b in bytes {
-        body.push(b)
-    }
+    var w = Writer::new()
+    w.write_counted(modulus)
+    w.write_counted(exponent)
+    take w.into_bytes()
 }
 
 // ---- tests -------------------------------------------------------------------------------------

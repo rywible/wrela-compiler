@@ -1,8 +1,9 @@
 //! AC13: `wrela explain <code>` covers every code. Each explanation's wrong program gives its
 //! code, and its fixed program compiles with no diagnostic at all. Every error the wrong
 //! program gives carries a next step of its own (a help or a fix), not only the general one
-//! that points back here (`Diagnostic::with_next_step`). A code no program
-//! can show says why (`// ---- untested:`); the list of those is pinned here.
+//! that points back here (`Diagnostic::with_next_step`), and a migration's has the one fix a
+//! tool makes (`wrela migrate`). A code no program can show says why (`// ---- untested:`); the
+//! list of those is pinned here.
 
 use crate::scratch;
 use wrela_diag::codes;
@@ -65,6 +66,11 @@ fn every_code_is_explained() {
 fn explanations_programs_do_what_they_say() {
     let all: Vec<_> =
         wrela_driver::explain::all().into_iter().filter(|e| e.untested.is_none()).collect();
+    let is_migration = |code: &str| codes::Code::lookup(code).is_some_and(|c| c.is_migration());
+    let migrations = codes::ALL.iter().filter(|c| c.is_migration()).count();
+    assert!(migrations > 0, "no migrations: `codes::MIGRATIONS` lists them");
+    let shown = all.iter().filter(|e| is_migration(e.code)).count();
+    assert_eq!(shown, migrations, "every migration's explanation has programs");
     let failures = std::sync::Mutex::new(Vec::new());
     wrela_tests::par_each(
         &all,
@@ -90,12 +96,19 @@ fn explanations_programs_do_what_they_say() {
                     wrela_diag::render::render_all(&wrong.0, &wrong.1)
                 ));
             }
-            for d in wrong.1.iter().filter(|d| d.is_error() && d.has_only_general_help()) {
-                problems.push(format!(
-                    "{} has no help or fix of its own: {}",
-                    d.code.as_str(),
-                    d.message
-                ));
+            for b in wrela_tests::without_own_help(&wrong.1) {
+                problems.push(format!("no help or fix of its own: {b}"));
+            }
+            // A migration's fix is one a tool always makes (`wrela migrate`): exactly one, and
+            // not the author's choice.
+            if is_migration(e.code)
+                && let Some(d) = wrong.1.iter().find(|d| d.code.as_str() == e.code)
+            {
+                if d.fixes.len() != 1 {
+                    problems.push(format!("a migration has one fix: {d:?}"));
+                } else if d.fixes[0].choice {
+                    problems.push("a migration's fix isn't a choice".to_string());
+                }
             }
             let mut fixed = diagnose(e.code, &write("fixed", &e.fixed));
             // No diagnostic at all: a warning in a fixed program would teach the wrong thing.
@@ -122,24 +135,4 @@ fn explanations_programs_do_what_they_say() {
         failures.len(),
         failures.join("\n\n")
     );
-}
-
-/// A migration's fix is one a tool always makes (`wrela migrate`): its explanation's program
-/// gives it with exactly one fix, which isn't the author's choice.
-#[test]
-fn every_migration_has_one_fix_a_tool_makes() {
-    let all = wrela_driver::explain::all();
-    let migrations: Vec<_> = codes::ALL.iter().filter(|c| c.is_migration()).collect();
-    assert!(!migrations.is_empty(), "no migrations: `codes::MIGRATIONS` lists them");
-    for c in migrations {
-        let e = all.iter().find(|e| e.code == c.as_str()).expect("an explanation");
-        let dir = scratch(&format!("explain/migration-{}", e.code));
-        for (path, text) in e.wrong.iter().filter(|(_, t)| !t.is_empty()) {
-            std::fs::write(dir.join(path), text).expect("write");
-        }
-        let (_, diags) = diagnose(e.code, &dir);
-        let d = diags.iter().find(|d| d.code == *c).expect("the program gives its code");
-        assert_eq!(d.fixes.len(), 1, "{}: a migration has one fix: {d:?}", e.code);
-        assert!(!d.fixes[0].choice, "{}: a migration's fix isn't a choice", e.code);
-    }
 }

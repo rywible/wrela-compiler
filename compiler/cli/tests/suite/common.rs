@@ -121,6 +121,15 @@ pub fn answer(command: &mut Command) -> serde_json::Value {
     serde_json::from_str(&stdout(command)).expect("JSON")
 }
 
+/// Runs `wrela` with `args`: its exit code, its standard output, and its standard output and
+/// error together.
+pub fn outputs(args: &[&str]) -> (Option<i32>, String, String) {
+    let out = wrela().args(args).output().expect("run wrela");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let all = stdout.clone() + &String::from_utf8_lossy(&out.stderr);
+    (out.status.code(), stdout, all)
+}
+
 /// Runs `command`: its exit code, and its standard output and error together.
 pub fn run(command: &mut Command) -> (Option<i32>, String) {
     let out = command.output().expect("run wrela");

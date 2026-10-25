@@ -7,19 +7,27 @@ use crate::common;
 
 use std::path::{Path, PathBuf};
 
+/// A package `shapes` of `files` (each a path in it and its text), for the refactors.
+fn program(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+    let manifest = common::manifest("shapes");
+    let all = [&[("wrela.toml", manifest.as_str())], files].concat();
+    common::package(&format!("refactor-{tag}"), &all)
+}
+
+/// A package of [`common::SHAPES`] and an empty module `util`.
 fn package(tag: &str) -> PathBuf {
-    common::package(
-        &format!("refactor-{tag}"),
-        &[
-            ("wrela.toml", &common::manifest("shapes")),
-            ("main.wrela", common::SHAPES),
-            ("util.wrela", "// Helpers.\n"),
-        ],
-    )
+    program(tag, &[("main.wrela", common::SHAPES), ("util.wrela", "// Helpers.\n")])
 }
 
 fn plan(dir: &Path, args: &[&str]) -> serde_json::Value {
     common::json(common::wrela().arg("refactor").arg(dir).args(args))
+}
+
+/// Asserts that the refactor `args` of the package in `dir` is refused, for a reason that
+/// contains `why`.
+fn refused(dir: &Path, args: &[&str], why: &str) {
+    let r = plan(dir, &[args, &["--json"]].concat());
+    assert!(r["refused"].as_str().is_some_and(|w| w.contains(why)), "{args:?}: {r}");
 }
 
 fn checks(dir: &Path) -> bool {
@@ -64,8 +72,7 @@ fn a_rename_reaches_every_reference_and_nothing_else() {
 fn a_rename_is_refused_where_it_would_change_what_code_means() {
     let dir = package("rename-refused");
     // A name the module has already.
-    let a = plan(&dir, &["rename", "first", "total", "--json"]);
-    assert!(a["refused"].as_str().unwrap().contains("already a name"), "{a}");
+    refused(&dir, &["rename", "first", "total"], "already a name");
     // A function named like a built-in: without it, its call would go to the built-in.
     std::fs::write(
         dir.join("main.wrela"),
@@ -73,8 +80,7 @@ fn a_rename_is_refused_where_it_would_change_what_code_means() {
     )
     .unwrap();
     let before = main_text(&dir);
-    let a = plan(&dir, &["rename", "min", "smallest", "--json"]);
-    assert!(a["refused"].as_str().unwrap().contains("another function"), "{a}");
+    refused(&dir, &["rename", "min", "smallest"], "another function");
     assert_eq!(main_text(&dir), before, "nothing written");
 }
 
@@ -159,8 +165,7 @@ fn a_plan_applies_only_to_the_files_it_was_made_from() {
     let edited =
         main_text(&dir).replace("/// A row of heights.", "/// A row of heights, in metres.");
     std::fs::write(dir.join("main.wrela"), &edited).unwrap();
-    let r = plan(&dir, &["apply", saved.to_str().unwrap(), "--json"]);
-    assert!(r["refused"].as_str().unwrap().contains("has changed since the plan was made"), "{r}");
+    refused(&dir, &["apply", saved.to_str().unwrap()], "has changed since the plan was made");
     assert_eq!(main_text(&dir), edited);
     // Made again, it applies.
     let a = plan(&dir, &["rename", "first", "head", "--dry-run", "--json"]);
@@ -168,14 +173,6 @@ fn a_plan_applies_only_to_the_files_it_was_made_from() {
     let r = plan(&dir, &["apply", saved.to_str().unwrap(), "--json"]);
     assert_eq!(r["written"], true, "{r}");
     assert!(main_text(&dir).contains("fn head(g: Grid)") && checks(&dir));
-}
-
-/// A package of `main` alone, for the extract and inline refactors.
-fn program(tag: &str, main: &str) -> PathBuf {
-    common::package(
-        &format!("refactor-{tag}"),
-        &[("wrela.toml", &common::manifest("shapes")), ("main.wrela", main)],
-    )
 }
 
 /// Whether the package's tests pass: a refactor keeps what the code computes, not only that it
@@ -202,7 +199,7 @@ fn area_is_right() {
 
 #[test]
 fn an_expression_of_literals_becomes_a_constant() {
-    let dir = program("extract-const", EXTRACTS);
+    let dir = program("extract-const", &[("main.wrela", EXTRACTS)]);
     let a = plan(&dir, &["extract-const", "main.wrela:5:22", "HALF", "--json"]);
     assert_eq!(a["written"], true, "{a}");
     let text = main_text(&dir);
@@ -210,16 +207,14 @@ fn an_expression_of_literals_becomes_a_constant() {
     assert!(checks(&dir) && tests_pass(&dir));
     // (The constant and a blank line now come first.) An expression with a local in it can't
     // be a constant.
-    let r = plan(&dir, &["extract-const", "main.wrela:7:14", "ONE", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("a constant is")), "{r}");
+    refused(&dir, &["extract-const", "main.wrela:7:14", "ONE"], "a constant is");
     // Nor can it take a name the module has.
-    let r = plan(&dir, &["extract-const", "main.wrela:8:14", "HALF", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("already")), "{r}");
+    refused(&dir, &["extract-const", "main.wrela:8:14", "HALF"], "already");
 }
 
 #[test]
 fn lines_become_a_function_with_what_flows_in_and_out() {
-    let dir = program("extract-fn", EXTRACTS);
+    let dir = program("extract-fn", &[("main.wrela", EXTRACTS)]);
     let a = plan(&dir, &["extract-fn", "main.wrela:4-6", "accumulate", "--json"]);
     assert_eq!(a["written"], true, "{a}");
     let text = main_text(&dir);
@@ -229,7 +224,9 @@ fn lines_become_a_function_with_what_flows_in_and_out() {
     // A parameter the lines change is lent `mut`.
     let dir = program(
         "extract-fn-mut",
-        "pub fn frame(time: f32, width: u32, height: u32) {}
+        &[(
+            "main.wrela",
+            "pub fn frame(time: f32, width: u32, height: u32) {}
 
 fn fill(n: u32) -> u32 {
     var v: Vec<u32> = Vec::new()
@@ -243,6 +240,7 @@ fn fills_two() {
     assert(fill(3) == 2)
 }
 ",
+        )],
     );
     plan(&dir, &["extract-fn", "main.wrela:5-6", "push_two", "--json"]);
     let text = main_text(&dir);
@@ -251,7 +249,9 @@ fn fills_two() {
     // Two values that flow out are refused, and so are lines that leave early.
     let dir = program(
         "extract-fn-refused",
-        "pub fn frame(time: f32, width: u32, height: u32) {}
+        &[(
+            "main.wrela",
+            "pub fn frame(time: f32, width: u32, height: u32) {}
 
 fn two(x: f32) -> f32 {
     let a = x + 1.0
@@ -262,15 +262,13 @@ fn two(x: f32) -> f32 {
     a + b
 }
 ",
+        )],
     );
-    let r = plan(&dir, &["extract-fn", "main.wrela:4-5", "both", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("more than one value")), "{r}");
-    let r = plan(&dir, &["extract-fn", "main.wrela:6-8", "early", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("leave early")), "{r}");
+    refused(&dir, &["extract-fn", "main.wrela:4-5", "both"], "more than one value");
+    refused(&dir, &["extract-fn", "main.wrela:6-8", "early"], "leave early");
     // The call would be a local's (`b`) or a built-in's (`sqrt`), not the new function's.
     for name in ["b", "sqrt"] {
-        let r = plan(&dir, &["extract-fn", "main.wrela:4-4", name, "--json"]);
-        assert!(r["refused"].as_str().is_some_and(|w| w.contains("has already")), "{name}: {r}");
+        refused(&dir, &["extract-fn", "main.wrela:4-4", name], "has already");
     }
 }
 
@@ -316,10 +314,9 @@ fn values_hold() {
 
 #[test]
 fn an_inlined_body_names_what_it_named_in_its_function() {
-    let dir = common::package(
-        "refactor-inline-names",
+    let dir = program(
+        "inline-names",
         &[
-            ("wrela.toml", &common::manifest("shapes")),
             (
                 "main.wrela",
                 "use util::{made, shift}
@@ -373,30 +370,25 @@ fn values_hold() {
     assert!(tests_pass(&dir), "the fixture's own test passes");
     let before = main_text(&dir);
     // `K` in `shift` is util's; where it's called, `K` is main's.
-    let r = plan(&dir, &["inline", "shift", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("names something else")), "{r}");
+    refused(&dir, &["inline", "shift"], "names something else");
     // `unit` in `grow` is the function; where it's called, `unit` is a local closure.
     // `S` in `made`'s struct literal is util's; where it's called, main's.
-    let r = plan(&dir, &["inline", "made", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("`S` names something else")), "{r}");
-    let r = plan(&dir, &["inline", "grow", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("would name the local")), "{r}");
+    refused(&dir, &["inline", "made"], "`S` names something else");
+    refused(&dir, &["inline", "grow"], "would name the local");
     assert_eq!(main_text(&dir), before, "nothing written");
 }
 
 #[test]
 fn a_call_becomes_the_body_where_nothing_about_it_can_change() {
-    let dir = program("inline", INLINES);
+    let dir = program("inline", &[("main.wrela", INLINES)]);
     assert!(tests_pass(&dir), "the fixture's own test passes");
     // Arguments that aren't typed locals: a literal, an untyped local, a call.
-    let r = plan(&dir, &["inline", "half", "--json"]);
-    assert!(r["refused"].as_str().is_some_and(|w| w.contains("passes")), "{r}");
+    refused(&dir, &["inline", "half"], "passes");
     // A parameter used twice, or not at all, or out of order, is refused.
     for (f, why) in
         [("twice", "used 2 times"), ("unused", "used 0 times"), ("swapped", "another order")]
     {
-        let r = plan(&dir, &["inline", f, "--json"]);
-        assert!(r["refused"].as_str().is_some_and(|w| w.contains(why)), "{f}: {r}");
+        refused(&dir, &["inline", f], why);
     }
     // A conversion of a typed local keeps its value; a named argument maps to its parameter.
     let a = plan(&dir, &["inline", "widen", "--json"]);

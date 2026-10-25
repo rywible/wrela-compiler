@@ -38,6 +38,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, HERE)
 import grading  # noqa: E402
+import score  # noqa: E402
 
 
 def config():
@@ -148,16 +149,20 @@ def claude_command(cfg, model, task_dir, attempt, wrela):
 def grade_run(run, wrela, validator, ids=None):
     """Grades every attempt of the run's tasks: each attempt's `graded.json`."""
     for t in grading.tasks():
-        if ids and t["id"] not in ids:
-            continue
-        attempts = os.path.join(run, t["id"], "attempts")
-        if not os.path.isdir(attempts):
-            continue
-        for n in sorted((d for d in os.listdir(attempts) if d.isdigit()), key=int):
-            a = os.path.join(attempts, n)
-            g = grading.grade(t, os.path.join(a, "src"), wrela, validator)
-            with open(os.path.join(a, "graded.json"), "w") as f:
-                json.dump(g, f, indent=2)
+        if not ids or t["id"] in ids:
+            grade_task(run, t, wrela, validator)
+
+
+def grade_task(run, t, wrela, validator):
+    """Grades every attempt of the run's task `t`: each attempt's `graded.json`."""
+    attempts = os.path.join(run, t["id"], "attempts")
+    if not os.path.isdir(attempts):
+        return
+    for n in sorted((d for d in os.listdir(attempts) if d.isdigit()), key=int):
+        a = os.path.join(attempts, n)
+        g = grading.grade(t, os.path.join(a, "src"), wrela, validator)
+        with open(os.path.join(a, "graded.json"), "w") as f:
+            json.dump(g, f, indent=2)
 
 
 def main():
@@ -266,15 +271,15 @@ def run_tasks(a, cfg, run, commands, wrela, validator, attempt):
             report = out.stdout + out.stderr
         with open(os.path.join(task_dir, "report.md"), "w") as f:
             f.write(report or "")
-        grade_run(run, wrela, validator, [t["id"]])
+        grade_task(run, t, wrela, validator)
         print(f"{t['id']}: done", flush=True)
 
     with ThreadPoolExecutor(max(1, a.parallel)) as ex:
         list(ex.map(one, commands))
-    out = subprocess.run([sys.executable, os.path.join(HERE, "score.py"), run], capture_output=True, text=True)
+    text = json.dumps(score.report(run), indent=2) + "\n"
     with open(os.path.join(run, "score.json"), "w") as f:
-        f.write(out.stdout)
-    print(out.stdout)
+        f.write(text)
+    print(text)
 
 
 if __name__ == "__main__":

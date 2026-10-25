@@ -100,11 +100,7 @@ pub fn registration(
     }
     at += n
     let (algorithm, key) = cose_key(data, mut at)?
-    var owned: Vec<u8> = Vec::with_capacity(id.len())
-    for b in id {
-        owned.push(b)
-    }
-    Ok(Credential { id: owned, algorithm, key, counter })
+    Ok(Credential { id: Vec::from(id), algorithm, key, counter })
 }
 
 /// What an assertion's signature must cover, if every other check passes, against the credential
@@ -123,10 +119,7 @@ pub fn assertion(
         return Err("the signature counter didn't go up: the passkey may have been copied")
     }
     let hash = sha256(client_data)
-    var message: Vec<u8> = Vec::with_capacity(authenticator_data.len() + 32)
-    for b in authenticator_data {
-        message.push(b)
-    }
+    var message = Vec::from(authenticator_data)
     for b in hash {
         message.push(b)
     }
@@ -183,29 +176,26 @@ pub fn base64url(bytes: [u8]) -> String {
 /// Checks the client's data: its type, its challenge, its origin, and that it wasn't made inside
 /// another site's frame.
 fn check_client(client_data: [u8], kind: str, expected: Expected) -> Result<(), Text> {
-    var copy: Vec<u8> = Vec::with_capacity(client_data.len())
-    for b in client_data {
-        copy.push(b)
-    }
-    let Some(text) = String::from_utf8(take copy) else {
+    let Some(text) = String::from_utf8(Vec::from(client_data)) else {
         return Err("the client's data isn't UTF-8")
     }
     let Some(doc) = parse(text.as_str()) else { return Err("the client's data isn't JSON") }
     if doc.kind(TOP) != Kind::Obj {
         return Err("the client's data isn't a JSON object")
     }
-    let field = |name: str| -> Option<String> {
-        let n = doc.get(TOP, name)?
-        if doc.kind(n) != Kind::Text { return None }
-        doc.text(n)
+    // Whether the field `name` is the text `want`.
+    let has = |name: str, want: str| -> bool {
+        let Some(n) = doc.get(TOP, name) else { return false }
+        let Some(t) = doc.text(n) else { return false }
+        t.as_str() == want
     }
-    if field("type") != Some(String::from(kind)) {
+    if !has("type", kind) {
         return Err("the client's data is for another ceremony")
     }
-    if field("challenge") != Some(base64url(expected.challenge)) {
+    if !has("challenge", base64url(expected.challenge).as_str()) {
         return Err("the client's data is over another challenge")
     }
-    if field("origin") != Some(expected.origin.clone()) {
+    if !has("origin", expected.origin.as_str()) {
         return Err("the client's data is from another origin")
     }
     if let Some(n) = doc.get(TOP, "crossOrigin") {
@@ -256,13 +246,11 @@ fn head(b: [u8], at: mut u32) -> Option<(u32, u64)> {
     if info < 24 {
         return Some((first >> 5, u64(info)))
     }
-    let n = if info == 24 {
-        1
-    } else if info == 25 {
-        2
-    } else if info == 26 {
-        4
-    } else if info == 27 { 8 } else { return None }
+    if info > 27 {
+        return None
+    }
+    // 24 to 27: an argument of 1, 2, 4 or 8 bytes.
+    let n = 1 << (info - 24)
     if b.len() - at < n {
         return None
     }

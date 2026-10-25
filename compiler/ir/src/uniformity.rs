@@ -33,21 +33,6 @@ pub enum Collective {
     Subgroup(crate::SubgroupOp),
 }
 
-impl Collective {
-    /// The operation, as WGSL names it: `dpdx`, `textureSample`, ...
-    pub fn wgsl_name(self) -> &'static str {
-        match self {
-            Collective::Dpdx => "dpdx",
-            Collective::Dpdy => "dpdy",
-            Collective::Fwidth => "fwidth",
-            Collective::Sample => "textureSample",
-            Collective::SampleCompare => "textureSampleCompare",
-            Collective::Barrier => "workgroupBarrier",
-            Collective::Subgroup(op) => op.wgsl_name(),
-        }
-    }
-}
-
 /// A collective operation in non-uniform control flow.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NonUniform {

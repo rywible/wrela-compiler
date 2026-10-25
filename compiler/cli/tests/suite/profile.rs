@@ -46,13 +46,9 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
         &[("wrela.toml", &common::manifest("work")), ("main.wrela", WORK)],
     );
     let d = dir.to_str().unwrap();
-    let out = common::wrela()
-        .args(["profile", d, "--frames", "4", "--warmup", "0", "--json"])
-        .output()
-        .expect("run wrela");
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
-    let p: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let p = common::answer(
+        common::wrela().args(["profile", d, "--frames", "4", "--warmup", "0", "--json"]),
+    );
     assert_eq!(p["frames"], 4);
     let label = |name: &str| {
         p["gpu"]["labels"]
@@ -60,23 +56,23 @@ fn profile_reports_the_gpu_by_label_the_cpu_and_the_wgsl() {
             .unwrap()
             .iter()
             .find(|l| l["label"] == name)
-            .unwrap_or_else(|| panic!("no `{name}` in {text}"))
+            .unwrap_or_else(|| panic!("no `{name}` in {p}"))
             .clone()
     };
     assert_eq!(label("each frame")["frames"], 4);
     assert_eq!(label("setup")["frames"], 1);
     assert!(label("each frame")["median_ms"].as_f64().unwrap() >= 0.0);
     let phases = p["cpu"]["phases"].as_array().unwrap();
-    assert_eq!(phases.len(), 1, "{text}");
+    assert_eq!(phases.len(), 1, "{p}");
     assert_eq!(phases[0]["name"], "record");
     assert_eq!(phases[0]["times"], 4);
     let wgsl = p["wgsl"].as_array().unwrap();
-    assert_eq!(wgsl.len(), 1, "{text}");
+    assert_eq!(wgsl.len(), 1, "{p}");
     assert_eq!(wgsl[0]["pipeline"], "fill");
     assert!(wgsl[0]["bytes"].as_u64().unwrap() > 0);
     // The slow frames beside the median: a 95th percentile is never under it.
     let each = label("each frame");
-    assert!(each["p95_ms"].as_f64().unwrap() >= each["median_ms"].as_f64().unwrap(), "{text}");
+    assert!(each["p95_ms"].as_f64().unwrap() >= each["median_ms"].as_f64().unwrap(), "{p}");
     assert!(p["cpu"]["frame_p95_ms"].as_f64().unwrap() >= p["cpu"]["frame_ms"].as_f64().unwrap());
 
     // Compared with a baseline, each time says what it was, and a label the baseline ran that
@@ -201,22 +197,19 @@ fn profile_in_chrome_reports_what_the_native_report_does() {
         &[("wrela.toml", &common::manifest("work")), ("main.wrela", WORK)],
     );
     let d = dir.to_str().unwrap();
-    let out = common::wrela()
-        .args(["profile", d, "--chrome", "--frames", "30", "--warmup", "2", "--json"])
-        .output()
-        .expect("run wrela");
-    let text = String::from_utf8_lossy(&out.stdout).to_string();
-    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
-    let p: serde_json::Value = serde_json::from_str(&text).expect("JSON");
+    let p = common::answer(
+        common::wrela()
+            .args(["profile", d, "--chrome", "--frames", "30", "--warmup", "2", "--json"]),
+    );
     assert_eq!(p["host"], "chrome");
     assert_eq!(p["environment"]["host"], "chrome");
-    assert!(p["environment"]["adapter"].as_str().unwrap().starts_with("Chrome: "), "{text}");
+    assert!(p["environment"]["adapter"].as_str().unwrap().starts_with("Chrome: "), "{p}");
     assert_eq!(p["frames"], 30);
-    assert!(p["cpu"]["frame_interval_ms"].as_f64().unwrap() > 0.0, "{text}");
-    assert_eq!(p["counters"]["dispatches"], 1.0, "{text}");
-    assert_eq!(p["counters"]["compute_passes"], 1.0, "{text}");
+    assert!(p["cpu"]["frame_interval_ms"].as_f64().unwrap() > 0.0, "{p}");
+    assert_eq!(p["counters"]["dispatches"], 1.0, "{p}");
+    assert_eq!(p["counters"]["compute_passes"], 1.0, "{p}");
     let phases = p["cpu"]["phases"].as_array().unwrap();
-    assert_eq!(phases.len(), 1, "{text}");
+    assert_eq!(phases.len(), 1, "{p}");
     assert_eq!(phases[0]["name"], "record");
     assert_eq!(phases[0]["times"], 30);
     assert!(p["gpu"]["labels"].as_array().unwrap().iter().any(|l| l["label"] == "each frame"));

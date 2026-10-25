@@ -5,10 +5,11 @@ use serde_json::{Value, json as value};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 
-pub(super) struct Storage(pub PathBuf);
+/// A new, empty storage directory of its own, removed when dropped: each run starts with none.
+pub(crate) struct Storage(pub PathBuf);
 
 impl Storage {
-    pub(super) fn new() -> Result<Self, String> {
+    pub(crate) fn new() -> Result<Self, String> {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
@@ -28,13 +29,19 @@ impl Drop for Storage {
 
 pub(super) fn validate_saved_build(package: &Path, before: &Path) -> Result<(), String> {
     let before = before.canonicalize().map_err(|e| format!("can't read baseline build: {e}"))?;
-    let generated = package.canonicalize().map_err(|e| e.to_string())?.join("build/profile");
-    let generated = generated.canonicalize().unwrap_or(generated);
-    if before.starts_with(&generated) || generated.starts_with(&before) {
+    if overwritten_by(package, "profile", &before)? {
         return Err("baseline build would be overwritten; save it outside build/profile with `wrela build -o <dir>`".into());
     }
     build_hash(&before)?;
     Ok(())
+}
+
+/// Whether building into `<package>/build/<subdir>` would overwrite the saved build `saved`
+/// (canonical): that directory is it, inside it, or around it.
+pub(crate) fn overwritten_by(package: &Path, subdir: &str, saved: &Path) -> Result<bool, String> {
+    let generated = package.canonicalize().map_err(|e| e.to_string())?.join("build").join(subdir);
+    let generated = generated.canonicalize().unwrap_or(generated);
+    Ok(saved.starts_with(&generated) || generated.starts_with(saved))
 }
 
 pub(super) fn lease(path: &Path) -> Result<File, String> {
@@ -121,7 +128,7 @@ pub(crate) fn build_hash(dir: &Path) -> Result<String, String> {
     paths.extend(m.pipelines.into_iter().map(|p| PathBuf::from(p.shader)));
     // The browser runtime a build carries is measured with it (`--chrome`): a change to it is a
     // change of what's measured.
-    for runtime in ["index.html", "main.js", "worker.js", "worklet.js"] {
+    for (runtime, _) in wrela_driver::build::RUNTIME_FILES {
         if dir.join(runtime).is_file() {
             paths.push(PathBuf::from(runtime));
         }

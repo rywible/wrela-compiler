@@ -353,6 +353,25 @@ pub(crate) fn generated_path(package: &Path, path: &Path) -> Result<(), String> 
         .map_err(|e| format!("can't use `{}`: {e}", path.display()))
 }
 
+/// The package in `dir` built as `wrela build` builds it (its `game.wasm` through `wasm-opt`,
+/// if `optimize` says so), into `<dir>/build/<name>`: where it is.
+pub(crate) fn build_into(
+    dir: &Path,
+    name: &str,
+    optimize: Option<wrela_driver::optimize::Level>,
+) -> Result<PathBuf, String> {
+    let built = dir.join("build").join(name);
+    generated_path(dir, &built)?;
+    let mut out = wrela_driver::build(dir);
+    if let Some(level) = optimize
+        && !out.has_errors()
+    {
+        build::optimized(&mut out.files, level)?;
+    }
+    write_build(&out, &built)?;
+    Ok(built)
+}
+
 /// The last line of `logs` that starts `{`: a program's JSON answer.
 pub(crate) fn last_json(logs: &[String]) -> Option<&str> {
     logs.iter().rev().find(|l| l.starts_with('{')).map(String::as_str)

@@ -70,6 +70,12 @@ impl Writer {
             self.bytes.push(b)
         }
     }
+
+    /// Writes a byte count, then `bytes`: how a host service's or a tool's request carries bytes.
+    pub(package) fn write_counted(mut self, bytes: [u8]) {
+        self.write_u32(bytes.len())
+        self.write_bytes(bytes)
+    }
 }
 
 /// Why bytes couldn't be loaded: where, and what was wrong.
@@ -156,6 +162,12 @@ impl Reader {
             bytes.push(self.bytes[at + i])
         }
         Ok(bytes)
+    }
+
+    /// Bytes written by `write_counted`: a byte count, then that many bytes.
+    pub(package) fn read_counted(mut self) -> Result<Vec<u8>, LoadError> {
+        let n = self.read_u32()?
+        self.read_bytes(n)
     }
 
     /// Text written by `write_str`: it must be UTF-8.

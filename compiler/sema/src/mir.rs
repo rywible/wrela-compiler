@@ -23,6 +23,7 @@ use crate::defs::{Mode, RetMode};
 use crate::program::Program;
 use crate::thir::{self, Lit};
 use crate::ty::*;
+use std::collections::HashMap;
 use wrela_diag::Span;
 use wrela_syntax::ast::{BinOp, UnOp};
 
@@ -204,6 +205,46 @@ impl Place {
         let mut proj = self.proj.clone();
         proj.push(p);
         Place { local: self.local, proj }
+    }
+}
+
+/// What each projection local aliases, as the [`StatementKind::Bind`]s seen so far say, each
+/// place followed through the projection locals it names when it's bound.
+#[derive(Default)]
+pub struct Aliases(HashMap<Local, Place>);
+
+impl Aliases {
+    /// `local` starts aliasing `place`.
+    pub fn bind(&mut self, local: Local, place: &Place) {
+        let at = self.resolve(place);
+        self.0.insert(local, at);
+    }
+
+    /// Whether `l` is a projection local bound so far.
+    pub fn contains(&self, l: Local) -> bool {
+        self.0.contains_key(&l)
+    }
+
+    /// The place `place` is, through the projection locals it names (at most 16 deep: a
+    /// local bound later may alias one an earlier place was followed to).
+    pub fn resolve(&self, place: &Place) -> Place {
+        let mut at = place.clone();
+        for _ in 0..16 {
+            match self.0.get(&at.local) {
+                Some(a) => {
+                    let mut p = a.clone();
+                    p.proj.extend(at.proj.iter().cloned());
+                    at = p;
+                }
+                None => break,
+            }
+        }
+        at
+    }
+
+    /// The local that local `l` is reached through.
+    pub fn root(&self, l: Local) -> Local {
+        self.resolve(&Place::local(l)).local
     }
 }
 

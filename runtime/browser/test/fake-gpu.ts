@@ -1,6 +1,10 @@
 // A fake WebGPU device that records what the runtime asks of it, for testing the decoder's
 // mapping to WebGPU without a GPU. Only what the runtime uses is implemented.
 
+import { SCREEN_FORMAT } from "../src/abi.gen.ts";
+import { buildPipelines, type ScreenTarget } from "../src/gpu.ts";
+import type { Manifest } from "../src/manifest.ts";
+
 export interface FakeBuffer {
   label: string;
   size: number;
@@ -307,3 +311,13 @@ export class FakeDevice {
 export function fakeTexture(label: string): GPUTexture {
   return { label, createView: () => ({ label }) } as unknown as GPUTexture;
 }
+
+/** A shader the fake device compiles (it fails one with `ERROR` in it). */
+export const SHADER = "// fine\n";
+
+/** The screen in `SCREEN_FORMAT`, a fake texture labelled `screen`. */
+export const SCREEN_TARGET: ScreenTarget = { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") };
+
+/** Every pipeline of `m`, built on `device` from `SHADER`, its screen targets in `SCREEN_FORMAT`. */
+export const buildAll = (device: FakeDevice, m: Manifest) =>
+  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));

@@ -10,7 +10,7 @@ use crate::built;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
-use wrela_tests::{Rng, one_f32, one_u32, par_each, u32s, worse};
+use wrela_tests::{Rng, one_f32, one_u32, par_each, par_map_with, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
 const NAMES: [&str; 25] = [
@@ -243,9 +243,9 @@ fn intervals_stay_as_tight_as_recorded() {
     let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
     let boxes = 512;
     let path = wrela_tests::repo_root().join("compiler/tests/fields/tightness.json");
-    let measured: Mutex<Vec<(usize, f64, f64)>> = Mutex::new(Vec::new());
     let fis: Vec<usize> = (0..NAMES.len()).collect();
-    par_each(
+    // Each function's median ratio and share decided, in `NAMES`' order.
+    let measured = par_map_with(
         &fis,
         || corpus.start().expect("start the corpus"),
         |host, &fi| {
@@ -259,18 +259,16 @@ fn intervals_stay_as_tight_as_recorded() {
                 decided += f64::from(d);
             }
             ratios.sort_by(f64::total_cmp);
-            let median = ratios[boxes / 2];
-            measured.lock().unwrap().push((fi, median, decided / boxes as f64));
+            (ratios[boxes / 2], decided / boxes as f64)
         },
     );
-    let mut measured = measured.into_inner().unwrap();
-    measured.sort_by_key(|m| m.0);
-    let now: serde_json::Map<String, serde_json::Value> = measured
+    let now: serde_json::Map<String, serde_json::Value> = NAMES
         .iter()
-        .map(|&(fi, ratio, decided)| {
+        .zip(measured)
+        .map(|(name, (ratio, decided))| {
             let round = |x: f64| if x.is_finite() { (x * 1e4).round() / 1e4 } else { 1e30 };
             (
-                NAMES[fi].to_string(),
+                name.to_string(),
                 serde_json::json!({ "ratio": round(ratio), "decided": round(decided) }),
             )
         })

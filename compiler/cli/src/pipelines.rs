@@ -11,7 +11,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(a) => a,
         Err(status) => return status,
     };
-    let out = wrela_driver::check(&args.dir);
+    let out = wrela_driver::check_pipelines(&args.dir);
     if out.has_errors() {
         crate::report(&out, args.json);
         return ExitCode::from(1);

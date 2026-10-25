@@ -46,6 +46,7 @@ struct Pending {
 }
 
 /// What the threads and the callers share.
+#[derive(Default)]
 struct Shared {
     pending: Mutex<HashMap<u64, Pending>>,
     /// Each session's channel, with the tag of the route it came from.
@@ -85,11 +86,7 @@ impl Connection {
         to: impl Write + Send + 'static,
         from: impl Read + Send + 'static,
     ) -> Result<Connection, String> {
-        let shared = Arc::new(Shared {
-            pending: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            ended: Mutex::new(None),
-        });
+        let shared = Arc::new(Shared::default());
         let (out, queued) = mpsc::channel::<Vec<u8>>();
         let s = shared.clone();
         let writer = std::thread::Builder::new()
@@ -145,13 +142,36 @@ impl Connection {
     }
 
     /// Calls `method` with `params` in `session` (`None`: the browser's), waiting for its answer
-    /// until `deadline`: its result, or why there's none.
+    /// until `deadline`: its result, or why there's none. Its reply is at most
+    /// [`MOST_ORDINARY_MESSAGE`] bytes.
     pub fn call(
         &self,
         session: Option<&str>,
         method: &str,
         params: Value,
         deadline: Instant,
+    ) -> Result<Value, String> {
+        self.request(session, method, params, deadline, false)
+    }
+
+    /// Calls `Page.captureScreenshot` with `params` in `session`, as [`Connection::call`] does:
+    /// its reply, a `data` string, may take up to [`MOST_MESSAGE`] bytes.
+    pub fn call_screenshot(
+        &self,
+        session: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, String> {
+        self.request(Some(session), "Page.captureScreenshot", params, deadline, true)
+    }
+
+    fn request(
+        &self,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+        screenshot: bool,
     ) -> Result<Value, String> {
         if let Some(why) = self.ended() {
             return Err(format!("{method}: {why}"));
@@ -162,8 +182,7 @@ impl Connection {
             message["sessionId"] = Value::String(s.to_string());
         }
         let (reply, answer) = mpsc::channel();
-        lock(&self.shared.pending)
-            .insert(id, Pending { reply, screenshot: method == "Page.captureScreenshot" });
+        lock(&self.shared.pending).insert(id, Pending { reply, screenshot });
         // The connection may have ended between the check and the insert: it drained `pending`.
         if let Some(why) = self.ended() {
             lock(&self.shared.pending).remove(&id);
@@ -549,11 +568,7 @@ mod tests {
 
     #[test]
     fn a_page_cannot_queue_unbounded_events() {
-        let shared = Shared {
-            pending: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            ended: Mutex::new(None),
-        };
+        let shared = Shared::default();
         let (to, events) = mpsc::sync_channel(MOST_EVENTS);
         lock(&shared.routes).insert("s".into(), (1, to));
         let event = br#"{"sessionId":"s","method":"Runtime.consoleAPICalled","params":{}}"#;
@@ -568,11 +583,7 @@ mod tests {
 
     #[test]
     fn a_large_page_event_cannot_use_the_screenshot_message_limit() {
-        let shared = Shared {
-            pending: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            ended: Mutex::new(None),
-        };
+        let shared = Shared::default();
         let (reply, _answer) = mpsc::channel();
         lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
         let mut event =
@@ -588,11 +599,7 @@ mod tests {
 
     #[test]
     fn a_screenshot_reply_may_exceed_the_ordinary_message_limit() {
-        let shared = Shared {
-            pending: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            ended: Mutex::new(None),
-        };
+        let shared = Shared::default();
         let (reply, answer) = mpsc::channel();
         lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
         let mut message = b"{\"id\":7,\"result\":{\"data\":\"".to_vec();
@@ -605,11 +612,7 @@ mod tests {
 
     #[test]
     fn a_screenshot_reply_may_put_its_id_after_its_data() {
-        let shared = Shared {
-            pending: Mutex::new(HashMap::new()),
-            routes: Mutex::new(HashMap::new()),
-            ended: Mutex::new(None),
-        };
+        let shared = Shared::default();
         let (reply, answer) = mpsc::channel();
         lock(&shared.pending).insert(7, Pending { reply, screenshot: true });
         let mut message = b"{\"sessionId\":\"s\",\"result\":{\"data\":\"".to_vec();

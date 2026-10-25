@@ -722,9 +722,7 @@ impl Caps {
             return Err(format!("`{path}` isn't a regular file reached without a link"));
         }
         let (at, name) = self.parent_nofollow(path, false)?;
-        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = format!(".{name}.tmp-{}-{n}", std::process::id());
+        let tmp = crate::confined::temp_name(&name);
         let written = (|| {
             let mut file = crate::confined::open_file(&at, &tmp, true)?;
             file.set_len(0)?;
@@ -944,9 +942,7 @@ impl Caps {
             }
             None => None,
         };
-        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp_name = format!(".{name}.tmp-{}-{n}", std::process::id());
+        let tmp_name = crate::confined::temp_name(name);
         let tmp = match parent {
             Some(parent) => format!("{parent}/{tmp_name}"),
             None => tmp_name,

@@ -33,12 +33,7 @@ fn clip_position_fields(p: &Program, t: TyId) -> impl Iterator<Item = &FieldDef>
 
 /// Whether kernel `f` shares workgroup memory (a `Shared` parameter).
 pub fn shares_memory(p: &Program, f: FnId) -> bool {
-    p.func(f).params.iter().any(|ps| {
-        matches!(
-            p.lang_of_ty(ps.ty),
-            Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI)
-        )
-    })
+    p.func(f).params.iter().any(|ps| p.lang_of_ty(ps.ty).is_some_and(Lang::is_workgroup_memory))
 }
 
 /// E0603: kernel `f`, which shares workgroup memory ([`shares_memory`]), dispatched over a
@@ -83,7 +78,7 @@ pub fn bound_fields(p: &Program, f: FnId) -> Vec<BoundField> {
         let ty = ps.ty;
         let lang = p.lang_of_ty(ty);
         if BuiltinInput::of(p, ty).is_some()
-            || matches!(lang, Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI))
+            || lang.is_some_and(Lang::is_workgroup_memory)
             || is_varyings(p, entry, ty)
         {
             continue;
@@ -317,19 +312,9 @@ impl FragmentOutput {
         }
     }
 
-    /// Whether its colour is blended over the target's by default (`Over`).
-    pub fn blends(&self) -> bool {
-        self.over
-    }
-
     /// Whether it gives the fragment's depth (`WithDepth`).
     pub fn writes_depth(&self) -> bool {
         self.depth.is_some()
-    }
-
-    /// Whether its first colour is integers.
-    pub fn uint(&self) -> bool {
-        self.colours.first().is_some_and(|(c, _)| c.uint)
     }
 }
 
@@ -630,9 +615,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
             let why = match lang {
                 Some(Lang::Slots) => "slots are indexed by a kernel's `GlobalId`",
                 Some(Lang::One) => "one invocation of a kernel writes it",
-                Some(Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI) => {
-                    "workgroup memory is a kernel's"
-                }
+                Some(l) if l.is_workgroup_memory() => "workgroup memory is a kernel's",
                 Some(Lang::Atomics) => "WebGPU gives a vertex shader no writable buffers",
                 Some(Lang::Texels | Lang::Texels3d | Lang::TexelsArray | Lang::MipStep) => {
                     "texels are written by a kernel's `GlobalId`"

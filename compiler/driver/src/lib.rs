@@ -75,6 +75,7 @@ pub struct PipelineSummary {
     pub sites: Vec<String>,
     /// For each site, whether it runs only under a runtime condition of its function
     /// (`wrela_sema::mir::control`): its pipeline is in the build however rarely it holds.
+    /// Empty unless the compile was [`check_pipelines`].
     pub conditional: Vec<bool>,
 }
 
@@ -154,6 +155,13 @@ pub const STACK_SIZE: usize = 256 << 20;
 /// Checks the package at `root`: every diagnostic, including those lowering finds.
 pub fn check(root: &Path) -> Output {
     on_compiler_thread(|| compile(root, Mode::CHECK, wrela_lower::Roots::of, &[]))
+}
+
+/// [`check`], with whether each pipeline site runs only under a condition
+/// ([`PipelineSummary::conditional`]): what `wrela pipelines` reports (§18.9).
+pub fn check_pipelines(root: &Path) -> Output {
+    let mode = Mode { conditions: true, ..Mode::CHECK };
+    on_compiler_thread(|| compile(root, mode, wrela_lower::Roots::of, &[]))
 }
 
 /// Files' texts that stand in for what's on disk, by their canonical paths: for checking a
@@ -278,7 +286,8 @@ pub fn build_in(
                 ));
             }
         }
-        let mode = Mode { debug: kind.debug, testing: kind.testing, no_simd: !simd, emit: true };
+        let mode =
+            Mode { debug: kind.debug, testing: kind.testing, no_simd: !simd, ..Mode::RELEASE };
         compile_loaded_in(root, mode, wrela_lower::Roots::of, lift, loaded, scope)
     })
 }
@@ -365,23 +374,47 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
 /// it, so a reader sees the old file or the whole new one. A file that was there keeps its
-/// permissions.
+/// permissions. The write goes through a handle of `path`'s directory.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} isn't a file's path", path.display()),
+        ));
+    };
+    let parent = if parent.as_os_str().is_empty() { Path::new(".") } else { parent };
+    let dir = cap_std::fs::Dir::open_ambient_dir(parent, cap_std::ambient_authority())?;
+    write_atomic_in(&dir, Path::new(name), bytes)
+}
+
+/// [`write_atomic`] of `path` in `dir`, through its handle: the temporary file is a new one
+/// (created, never opened), and the rename stays within `dir`.
+pub(crate) fn write_atomic_in(
+    dir: &cap_std::fs::Dir,
+    path: &Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
     // A temporary file of this write's own: several threads may write one file at once.
     static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let tmp = path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()));
-    let was = std::fs::metadata(path).ok().map(|m| m.permissions());
-    std::fs::write(&tmp, bytes)
-        .and_then(|()| match was {
-            Some(perms) => std::fs::set_permissions(&tmp, perms),
-            None => Ok(()),
-        })
-        .and_then(|()| std::fs::rename(&tmp, path))
-        .inspect_err(|_| {
-            let _ = std::fs::remove_file(&tmp);
-        })
+    let was = dir.metadata(path).ok().map(|m| m.permissions());
+    let result = (|| {
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = dir.open_with(&tmp, &options)?;
+        std::io::Write::write_all(&mut file, bytes)?;
+        if let Some(perms) = was {
+            file.set_permissions(perms)?;
+        }
+        drop(file);
+        dir.rename(&tmp, dir, path)
+    })();
+    if result.is_err() {
+        let _ = dir.remove_file(&tmp);
+    }
+    result
 }
 
 /// A new, empty directory of this process's own in the system's temporary directory, named
@@ -535,6 +568,11 @@ pub fn builtin_methods(ty: &str) -> Vec<(&'static str, usize)> {
         .filter(|b| b.is_method() && b.arity() >= 1 && b.result(&p, &vec![t; b.arity()]).is_ok())
         .map(|b| (b.name(), b.arity()))
         .collect()
+}
+
+/// Every built-in type's name (language.md §4), as sema looks them up, for `wrela doc`.
+pub fn builtin_type_names() -> Vec<String> {
+    wrela_sema::builtins::BuiltinTy::names().collect()
 }
 
 /// What running a package's tests found (`wrela test`, §13).
@@ -734,10 +772,13 @@ struct Mode {
     no_simd: bool,
     /// A test build (§9), with the program's `@testing` exports.
     testing: bool,
+    /// Each pipeline site's [`PipelineSummary::conditional`] worked out.
+    conditions: bool,
 }
 
 impl Mode {
-    const CHECK: Mode = Mode { emit: false, debug: false, no_simd: false, testing: false };
+    const CHECK: Mode =
+        Mode { emit: false, debug: false, no_simd: false, testing: false, conditions: false };
     const RELEASE: Mode = Mode { emit: true, ..Mode::CHECK };
 }
 
@@ -851,7 +892,7 @@ fn compile_loaded_in(
             let ok = !has_errors(&d);
             diagnostics.extend(d);
             if role == wrela_sema::defs::Role::Client {
-                pipelines = summarize(&checked, &sources, &lowered);
+                pipelines = summarize(&checked, &sources, &lowered, mode.conditions);
             }
             if !ok || !mode.emit {
                 continue;
@@ -966,9 +1007,13 @@ fn finish_diagnostics(sources: &SourceMap, diags: &mut Vec<Diagnostic>) -> Vec<D
     std
 }
 
-/// Each dispatch and draw of the program, by its statement's span, and whether it runs only
-/// under a runtime condition of its function.
-fn conditional_commands(checked: &wrela_sema::Checked) -> std::collections::HashMap<Span, bool> {
+/// Each dispatch and draw of the functions that hold one of `sites`, by its statement's span,
+/// and whether it runs only under a runtime condition of its function. A site is a span lowering
+/// recorded: a command's statement, or inside it.
+fn conditional_commands(
+    checked: &wrela_sema::Checked,
+    sites: &[Span],
+) -> std::collections::HashMap<Span, bool> {
     use wrela_sema::mir::{Rvalue, StatementKind};
     let command = |k: &StatementKind| {
         matches!(
@@ -977,28 +1022,40 @@ fn conditional_commands(checked: &wrela_sema::Checked) -> std::collections::Hash
                 | StatementKind::Eval(Rvalue::Dispatch(_) | Rvalue::Draw(_))
         )
     };
+    let holds = |k: Span| sites.iter().any(|s| holds_site(k, s));
     let mut out = std::collections::HashMap::new();
     for body in checked.mir.values() {
         for f in &body.fns {
-            if !f.blocks.iter().any(|b| b.stmts.iter().any(|s| command(&s.kind))) {
+            // Each command, with its block.
+            let commands: Vec<(usize, Span)> = (f.blocks.iter().enumerate())
+                .flat_map(|(i, b)| {
+                    b.stmts.iter().filter(|s| command(&s.kind)).map(move |s| (i, s.span))
+                })
+                .collect();
+            if !commands.iter().any(|&(_, k)| holds(k)) {
                 continue;
             }
             let under = wrela_sema::mir::control::under_condition(f);
-            for (i, b) in f.blocks.iter().enumerate() {
-                for s in b.stmts.iter().filter(|s| command(&s.kind)) {
-                    out.insert(s.span, under[i]);
-                }
+            for (i, k) in commands {
+                out.insert(k, under[i]);
             }
         }
     }
     out
 }
 
-/// What the pipeline-count query reports of each pipeline (§18.9).
+/// Whether the command whose statement is at `command` holds the site `site`.
+fn holds_site(command: Span, site: &Span) -> bool {
+    command.file == site.file && command.start <= site.start && site.end <= command.end
+}
+
+/// What the pipeline-count query reports of each pipeline (§18.9), each site's `conditional`
+/// only if `conditions`.
 fn summarize(
     checked: &wrela_sema::Checked,
     sources: &SourceMap,
     lowered: &wrela_lower::Lowered,
+    conditions: bool,
 ) -> Vec<PipelineSummary> {
     let p = &checked.program;
     let entry = |f: wrela_sema::ty::FnId, substs: &[wrela_sema::ty::TyId]| {
@@ -1010,15 +1067,15 @@ fn summarize(
             (format!("{name}::<{}>", args.join(", ")), name)
         }
     };
-    let commands = conditional_commands(checked);
-    // A site is the span lowering recorded: the command's statement, or inside it.
-    let conditional = |s: &Span| {
-        commands.get(s).copied().unwrap_or_else(|| {
-            commands
-                .iter()
-                .find(|(k, _)| k.file == s.file && k.start <= s.start && s.end <= k.end)
-                .is_some_and(|(_, &c)| c)
-        })
+    let commands = conditions.then(|| {
+        let sites: Vec<Span> =
+            lowered.pipelines.iter().flat_map(|p| p.sites.iter().copied()).collect();
+        conditional_commands(checked, &sites)
+    });
+    let conditional = |c: &std::collections::HashMap<Span, bool>, s: &Span| {
+        c.get(s)
+            .copied()
+            .unwrap_or_else(|| c.iter().find(|&(&k, _)| holds_site(k, s)).is_some_and(|(_, &u)| u))
     };
     lowered
         .pipelines
@@ -1038,7 +1095,9 @@ fn summarize(
                 entries: parts.iter().map(|(e, _)| e.clone()).collect(),
                 names: parts.into_iter().map(|(_, n)| n).collect(),
                 sites,
-                conditional: out.sites.iter().map(conditional).collect(),
+                conditional: commands.as_ref().map_or_else(Vec::new, |c| {
+                    out.sites.iter().map(|s| conditional(c, s)).collect()
+                }),
             }
         })
         .collect()

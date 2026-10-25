@@ -32,6 +32,10 @@ pub fn typescript() -> String {
             )
         })
         .collect();
+    let texture_kinds = list(stream::TextureKind::ALL.iter().enumerate().map(|(i, &k)| {
+        assert_eq!(k as usize, i, "texture kinds are numbered from 0");
+        format!("{:?}", k.name())
+    }));
     let compares: String = stream::Compare::ALL
         .iter()
         .enumerate()
@@ -48,14 +52,14 @@ pub fn typescript() -> String {
     let binding_kind_traits: String = manifest::BindingKind::ALL
         .iter()
         .map(|k| {
-            let (name, format, storage, three) = (k.name(), k.has_format(), k.is_storage(), k.is_3d());
+            let (name, format, storage) = (k.name(), k.has_format(), k.is_storage());
             let limit = k.limit().name();
             let dimension = match k.dimension() {
                 Some(d) => format!("{d:?}"),
                 None => "null".to_string(),
             };
             let depth = k.is_depth();
-            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_3d: {three}, is_depth: {depth}, dimension: {dimension}, limit: {limit:?} }},\n")
+            format!("  {{ name: {name:?}, has_format: {format}, is_storage: {storage}, is_depth: {depth}, dimension: {dimension}, limit: {limit:?} }},\n")
         })
         .collect();
     let host_functions: String = crate::HOST_FUNCTIONS
@@ -71,7 +75,6 @@ pub fn typescript() -> String {
     let assist_actions = list(input::ASSIST_ACTIONS.iter().map(|a| format!("{a:?}")));
     let compose_max = input::COMPOSE_MAX;
     let texture_writable = stream::WRITABLE;
-    let pass_join = stream::PASS_JOIN;
     let max_texture_3d = stream::MAX_TEXTURE_3D;
     let [size_x, size_y, size_z] = manifest::MAX_WORKGROUP_SIZE;
     format!(
@@ -102,6 +105,9 @@ export const Opcode = {{
  * alignment; and the device feature each capability needs, if one. */
 export const TEXTURE_FORMATS = [
 {texture_formats}] as const;
+/** A texture's kind, by its number in the stream (runtime/abi `TextureKind`): WebGPU's dimension
+ * name. */
+export const TEXTURE_KINDS = [{texture_kinds}] as const;
 /** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
 export const MAX_COLOR_ATTACHMENT_BYTES = {max_color_bytes};
 export const MAX_COLOR_ATTACHMENTS = {max_color_attachments};
@@ -120,8 +126,6 @@ export const BLENDS = {{
 {blends}}} as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = {texture_writable};
-/** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
-export const PASS_JOIN = {pass_join};
 /** The most texels a side of a 3D texture. */
 export const MAX_TEXTURE_3D = {max_texture_3d};
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
@@ -235,8 +239,8 @@ export const SCREEN_FORMAT = {screen_format:?};
 /** What a pipeline binds at a binding, as the manifest names it. */
 export const BINDING_KINDS = [{binding_kinds}] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
- * format; a texture kernels write (a storage texture); a 3D texture; and the per-stage limit it
- * counts against. */
+ * format; a texture kernels write (a storage texture); a texture of depths; its view dimension;
+ * and the per-stage limit it counts against. */
 export const BINDING_KIND_TRAITS = [
 {binding_kind_traits}] as const;
 /** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a

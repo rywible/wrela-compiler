@@ -4,9 +4,9 @@ and the score counts attempts to a correct program.
 
     python3 -m unittest discover -s tools/tests
 
-The references are graded with the compiler at `WRELA_BIN` (an absolute path), checking lint
-criteria with `WRELA_VALIDATOR` (default `WRELA_BIN`); without `WRELA_BIN`, this checkout's
-release compiler, built first.
+The references are graded with the compiler at `WRELA_BIN` (an absolute path; `tools/check.sh`
+gives the release compiler it builds), checking lint criteria with `WRELA_VALIDATOR` (default
+`WRELA_BIN`); without `WRELA_BIN`, this checkout's release compiler, built first.
 """
 
 import json

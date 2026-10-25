@@ -116,9 +116,9 @@ async function tickerScenario(reloading: boolean, history = false, hz = 60, asyn
       name: "worker ticker dependencies", setup(build) {
         build.onResolve({ filter: /\/(loader|device|live)\.ts$|^\.\/(loader|device|live)\.ts$/ }, ({ path }) => ({ path, namespace: "ticker-test" }));
         build.onLoad({ filter: /.*/, namespace: "ticker-test" }, ({ path }) => ({ loader: "js", contents: path.endsWith("device.ts")
-          ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; } export function deviceLimits() { return []; }"
+          ? "export class GpuError extends Error {} export async function openDevice() { return globalThis.__tickerTest.device; } export function deviceFeatures() { return []; }"
           : path.endsWith("live.ts") ? "export class Live { start() {} take() { return globalThis.__tickerTest.takeReload(); } swapped() {} drawn() {} }"
-          : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export class Handed { give() {} fetch(f) { return f; } } export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
+          : "export async function loadBuild() { return { wasm: new Uint8Array(), manifest: { pipelines: [] } }; } export async function loadLines() { return null; } export async function loadScript() { return []; } export function browserIo() { return {}; } export class Handed { give() {} fetch(f) { return f; } } export function networkFetch() {} export async function startProgram(_d, _b, _s, options) { return globalThis.__tickerTest.makeProgram(options); }" }));
       },
     }] });
     expect(bundle.success).toBe(true);

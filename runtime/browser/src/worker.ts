@@ -4,14 +4,13 @@
 /// <reference lib="webworker" />
 
 import { MAX_WORKERS, SCREEN_FORMAT, TICK_ORIGIN } from "./abi.gen.ts";
-import { featureNames } from "./check.ts";
-import { deviceLimits, GpuError, openDevice } from "./device.ts";
+import { deviceFeatures, GpuError, openDevice } from "./device.ts";
 import { errorMessage, UnsupportedError } from "./errors.ts";
 import { fitSize, frameSeconds, VisibleClock } from "./frame.ts";
 import { alignTo, type Counters, type GpuExecutor, type PipelineCache, screenFormat, type ScreenTarget, type Timing, timeEachPipeline } from "./gpu.ts";
 import { arrivals, epochNow, InputRing, type Scripted } from "./input.ts";
 import { type Asked, HandOvers } from "./handover.ts";
-import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, startProgram } from "./loader.ts";
+import { browserIo, type Build, Handed, loadBuild, loadLines, loadScript, networkFetch, startProgram } from "./loader.ts";
 import { locate } from "./lines.ts";
 import { Live } from "./live.ts";
 import { type Inbox, Net } from "./net.ts";
@@ -574,14 +573,14 @@ function runNext(program: Program, tickFrom: number | null, schedule: number, fp
 
 /** The adapter a test ran on and the optional features its program saw: what a profile's report
  * names its hardware by (`results/device.json`). */
-function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: string[] } {
+function deviceInfo(device: GPUDevice): { vendor: string; architecture: string; device: string; description: string; features: readonly string[] } {
   const info = (device as GPUDevice & { adapterInfo?: GPUAdapterInfo }).adapterInfo;
   return {
     vendor: info?.vendor ?? "",
     architecture: info?.architecture ?? "",
     device: info?.device ?? "",
     description: info?.description ?? "",
-    features: featureNames(deviceLimits(device)[10] ?? 0),
+    features: deviceFeatures(device),
   };
 }
 
@@ -898,7 +897,7 @@ function receive(msg: ToWorker, reply: (message: FromTicker | FromHelper) => voi
       const live = msg.live !== null ? new Live(base, msg.live) : null;
       live?.start();
       handed = new Handed(msg.given);
-      Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch((url, init) => fetch(url, init)))])
+      Promise.all([openDevice(fatal, test?.features ?? null), loadBuild(base, handed.fetch(networkFetch))])
         .then(([device, build]) => {
           const format = screenFormat(test !== null);
           handOvers = new HandOvers(device, format, () => buildBase, () => [pipelineCache, leftovers]);

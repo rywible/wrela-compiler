@@ -50,7 +50,6 @@ impl fmt::Display for Code {
     }
 }
 
-/// Codes retired before release, with why: never reused for anything else.
 /// The migrations: warnings for a form the language moved away from, whose one fix a tool always
 /// makes (`wrela migrate`), each with the release since which it's a migration. A W01xx code is
 /// one too, whether listed here or not. When a form is removed, the error that replaces it
@@ -60,16 +59,16 @@ pub const MIGRATIONS: &[(Code, &str)] = &[(W0004, "0.5.0")];
 impl Code {
     /// Whether it's a migration ([`MIGRATIONS`]).
     pub fn is_migration(self) -> bool {
-        self.as_str().starts_with("W01")
-            || MIGRATIONS.iter().any(|(c, _)| c.as_str() == self.as_str())
+        self.as_str().starts_with("W01") || MIGRATIONS.iter().any(|(c, _)| *c == self)
     }
 
     /// The release since which it's a migration, if it is one and that's recorded.
     pub fn migration_since(self) -> Option<&'static str> {
-        MIGRATIONS.iter().find(|(c, _)| c.as_str() == self.as_str()).map(|&(_, v)| v)
+        MIGRATIONS.iter().find(|(c, _)| *c == self).map(|&(_, v)| v)
     }
 }
 
+/// Codes retired before release, with why: never reused for anything else.
 pub const RETIRED: &[(&str, &str)] = &[
     ("E0316", "a constant that isn't a literal value: E0906 reports it (a tier-1 feature)"),
     ("E0321", "an unreachable match arm: W0002 reports it (a warning, not an error)"),

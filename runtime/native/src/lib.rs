@@ -22,7 +22,6 @@
 //! A [`CpuHost`] runs only the WASM: it checks what the program submits but executes none
 //! of it, so export tests need no GPU.
 
-mod cache;
 pub mod code;
 mod confined;
 mod error;
@@ -286,8 +285,8 @@ struct Build {
     driven: Option<(String, std::sync::Arc<BuildDir>)>,
 }
 
-/// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. An
-/// loaded build's compiled code is kept in the host's private cache (`cache`): the loads that
+/// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. A
+/// loaded build's compiled code is kept in the host's private cache ([`code`]): the loads that
 /// follow read it back.
 fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
     compile_build_with_shaders(dir, fuel, true)

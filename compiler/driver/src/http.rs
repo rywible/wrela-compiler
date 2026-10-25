@@ -9,7 +9,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use wrela_host::loopback;
+use wrela_host::loopback::{self, DeadlineIo};
 
 pub(crate) use wrela_host::loopback::{listen, respond};
 
@@ -19,22 +19,32 @@ const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 /// A local client cannot make the live server spawn an unbounded number of threads.
 const MAX_ACTIVE: usize = 64;
 
-/// `/live/shown` contains only a sequence and a frame number.
-const MAX_LIVE_REPORT: usize = 64 << 10;
-
-/// A request: its method, its path and query, and its body.
+/// A request: its method, its path and query, and its body, not yet read: the reader (with
+/// what it read past the head) and the body's length.
 pub(crate) struct Request {
     pub method: String,
     pub path: String,
     pub query: String,
-    pub body: Vec<u8>,
-    pending_put: Option<(BufReader<DeadlineReader>, usize)>,
+    body: Option<(BufReader<DeadlineIo>, usize)>,
 }
 
 impl Request {
     /// The value of `key` in the query (`?key=value&...`).
     pub fn param(&self, key: &str) -> Option<&str> {
         self.query.split('&').find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+    }
+
+    /// The body, read whole: `None` if it's longer than `max` bytes (none of it is read), or
+    /// was taken already.
+    pub fn read_body(&mut self, max: usize) -> io::Result<Option<Vec<u8>>> {
+        match self.body.take() {
+            Some((mut reader, length)) if length <= max => {
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body)?;
+                Ok(Some(body))
+            }
+            _ => Ok(None),
+        }
     }
 }
 
@@ -109,58 +119,34 @@ pub(crate) fn read(stream: &TcpStream, port: u16) -> std::io::Result<Option<Requ
     read_with_timeout(stream, port, REQUEST_DEADLINE)
 }
 
-struct DeadlineReader {
-    stream: TcpStream,
-    deadline: Instant,
-}
-
-impl Read for DeadlineReader {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "request deadline elapsed"));
-        }
-        self.stream.set_read_timeout(Some(left))?;
-        self.stream.read(bytes)
-    }
-}
-
 fn read_with_timeout(
     stream: &TcpStream,
     port: u16,
     timeout: Duration,
 ) -> io::Result<Option<Request>> {
-    let input = DeadlineReader { stream: stream.try_clone()?, deadline: Instant::now() + timeout };
+    let input = DeadlineIo {
+        stream: stream.try_clone()?,
+        due: Instant::now() + timeout,
+        idle: Duration::MAX,
+    };
     let mut reader = BufReader::new(input);
     let mut out = stream.try_clone()?;
     let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(None) };
-    let mut body = Vec::new();
-    let pending_put = if head.method == "PUT" {
-        // Results may be 256 MiB. Keep the reader (including bytes already buffered while
-        // reading the head), and copy the body straight into the result's temporary file.
-        Some((reader, head.length))
-    } else {
-        if head.method == "POST" && head.path == "/live/shown" {
-            if head.length > MAX_LIVE_REPORT {
-                respond(&mut out, 413, "text/plain", b"a live report is at most 64 KiB")?;
-                return Ok(None);
-            }
-            body.resize(head.length, 0);
-            reader.read_exact(&mut body)?;
-        }
-        None
-    };
-    Ok(Some(Request { method: head.method, path: head.path, query: head.query, body, pending_put }))
+    // The body is read, or refused, by what answers the request.
+    let body = Some((reader, head.length));
+    Ok(Some(Request { method: head.method, path: head.path, query: head.query, body }))
 }
 
 /// Writes a test-mode result (`PUT /results/<name>`) under `root`: a plain file name only.
+/// Results may be 256 MiB, so the body is copied from the request straight into the result's
+/// temporary file.
 pub(crate) fn put_result(
     out: &mut TcpStream,
     root: &cap_std::fs::Dir,
     name: &str,
     request: &mut Request,
 ) -> std::io::Result<()> {
-    let Some((reader, length)) = request.pending_put.as_mut() else {
+    let Some((reader, length)) = request.body.as_mut() else {
         return respond(out, 400, "text/plain", b"a result needs a PUT body");
     };
     put_result_from(out, root, name, reader, *length as u64)
@@ -220,7 +206,6 @@ mod tests {
         });
         let (mut stream, _) = listener.accept().expect("accept");
         let mut request = read(&stream, port).expect("request").expect("allowed");
-        assert!(request.body.is_empty(), "a PUT is not held as a byte vector");
         put_result(&mut stream, &root_dir, "shoot.txt", &mut request).expect("write result");
         drop(request);
         drop(stream);
@@ -243,32 +228,13 @@ mod tests {
             .expect("request head");
         });
         let (stream, _) = listener.accept().expect("accept");
-        let request = read(&stream, port).expect("request").expect("allowed");
-        assert!(request.body.is_empty());
-        assert_eq!(request.pending_put.as_ref().map(|(_, n)| *n), Some(loopback::MAX_RESULT));
+        let mut request = read(&stream, port).expect("request").expect("allowed");
+        assert_eq!(request.body.as_ref().map(|(_, n)| *n), Some(loopback::MAX_RESULT));
+        assert!(
+            request.read_body(loopback::MAX_RESULT - 1).expect("refused").is_none(),
+            "a body over its limit isn't read"
+        );
         client.join().expect("client");
-    }
-
-    #[test]
-    fn oversized_live_reports_are_refused_before_reading_the_body() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("listen");
-        let port = listener.local_addr().expect("port").port();
-        let client = std::thread::spawn(move || {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-            write!(
-                stream,
-                "POST /live/shown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n",
-                MAX_LIVE_REPORT + 1
-            )
-            .expect("request head");
-            let mut response = String::new();
-            stream.read_to_string(&mut response).expect("response");
-            response
-        });
-        let (stream, _) = listener.accept().expect("accept");
-        assert!(read(&stream, port).expect("read").is_none());
-        drop(stream);
-        assert!(client.join().expect("response").starts_with("HTTP/1.1 413"));
     }
 
     #[test]
@@ -364,6 +330,8 @@ mod tests {
             let request = read(&stream, port).expect("read request").expect("allowed request");
             get_file(&mut stream, &build_dir, request.path.trim_start_matches('/'), str::to_string)
                 .expect("answer GET");
+            // The request's unread body holds the connection open too.
+            drop(request);
             drop(stream);
             client.join().expect("response")
         };

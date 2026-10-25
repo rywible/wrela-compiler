@@ -1298,8 +1298,7 @@ impl<'d, 'u> Collector<'d, 'u> {
         let both = match named("hosts").map(|x| &x.value.kind) {
             None => Ok(false),
             Some(ast::ExprKind::Path(p))
-                if p.is_single()
-                    && p.segments[0].ident.name == "both"
+                if p.single_name() == Some("both")
                     && gpu == Ok(true)
                     && named("hold").is_none() =>
             {
@@ -3917,7 +3916,6 @@ fn is_job(p: &Program, t: TyId) -> bool {
 /// What a test's input is (§13.2), for its errors.
 const INPUT_NOTE: &str = "a test's input is a `std::input::Script` constant (`input: SCRIPT`), or a file in the package (`input: \"path\"`): a script in runtime/abi `input`'s format, or with `ticks` a tick log";
 
-/// The text of `e`, a string literal.
 /// A frame or tick test's options, as `@test(frames: n, ...)` gives them (`test_run`).
 #[derive(Default)]
 struct FrameTest {
@@ -3929,6 +3927,7 @@ struct FrameTest {
     both: bool,
 }
 
+/// The text of `e`, a string literal.
 fn str_lit(e: &ast::Expr) -> Option<String> {
     match &e.kind {
         ast::ExprKind::Lit(l) if l.kind == ast::LitKind::Str => {

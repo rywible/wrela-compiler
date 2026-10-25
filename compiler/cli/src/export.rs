@@ -151,21 +151,11 @@ pub(crate) fn files_of(
     let mut items: Vec<Value> = Vec::new();
     for m in 0..index.modules.len() {
         let first = index.modules[m].path.first();
-        let builtins = first.is_some_and(|p| p == crate::builtin_types::MODULE);
-        let in_std = builtins || first.is_some_and(|p| p == "std");
-        let (mut page, mut records) =
+        let in_std = first.is_some_and(|p| p == crate::builtin_types::MODULE || p == "std");
+        let (page, mut records) =
             module_page(&index, m, if in_std { &std_source } else { &source });
         if page.text.is_empty() {
             continue;
-        }
-        if builtins {
-            page.title = "Built-in types and functions".to_string();
-            page.text = page.text.replacen(
-                &format!("# {}\n", crate::builtin_types::MODULE),
-                &format!("# {}\n", page.title),
-                1,
-            );
-            page.text.push_str(&builtin_functions());
         }
         items.append(&mut records);
         pages.push(page);
@@ -451,12 +441,12 @@ fn sections_of(page: &Page) -> Vec<Section> {
 /// empty page, which isn't written.
 fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
     let module = &index.modules[m];
-    let name = module.path.join("::");
     // The built-in types' page is std's, beside its modules', with the built-in functions.
-    let path = if module.path == [crate::builtin_types::MODULE] {
-        "std/builtins.md".to_string()
+    let builtins = module.path == [crate::builtin_types::MODULE];
+    let (path, title) = if builtins {
+        ("std/builtins.md".to_string(), "Built-in types and functions".to_string())
     } else {
-        format!("{}.md", module.path.join("/"))
+        (format!("{}.md", module.path.join("/")), module.path.join("::"))
     };
     let top: Vec<usize> = (0..index.entries.len())
         .filter(|&i| {
@@ -468,7 +458,7 @@ fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
         .collect();
     let mut page = Page {
         path: path.clone(),
-        title: name.clone(),
+        title: title.clone(),
         summary: first_sentence(&module.intro).replace("language.md §", "§"),
         kind: "module",
         text: String::new(),
@@ -477,9 +467,9 @@ fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
         return (page, Vec::new());
     }
     let mut anchors = Anchors::default();
-    // The page's own title takes its slug first, so an item named as the module gets `-2`.
-    anchors.of(&name);
-    let mut text = format!("# {name}\n\n");
+    // The page's own title takes its slug first, so an item named as the title gets `-2`.
+    anchors.of(&title);
+    let mut text = format!("# {title}\n\n");
     if !module.intro.is_empty() {
         text.push_str(&format!("{}\n\n", module.intro));
     }
@@ -499,6 +489,9 @@ fn module_page(index: &Index, m: usize, source: &str) -> (Page, Vec<Value>) {
             write_entry(&mut text, me, source);
             records.push(record(me, &path, &anchor));
         }
+    }
+    if builtins {
+        text.push_str(&builtin_functions());
     }
     page.text = text;
     (page, records)

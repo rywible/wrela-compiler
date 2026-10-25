@@ -139,11 +139,6 @@ impl VecElem {
     pub fn on_gpu(self) -> bool {
         self != VecElem::F64
     }
-
-    /// Whether WASM has it: all but f16's.
-    pub fn on_cpu(self) -> bool {
-        self != VecElem::F16
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -161,16 +156,6 @@ impl FloatTy {
             FloatTy::F64 => "f64",
             FloatTy::F16 => "f16",
         }
-    }
-
-    /// Whether WGSL has it: all but `f64`.
-    pub fn on_gpu(self) -> bool {
-        self != FloatTy::F64
-    }
-
-    /// Whether WASM has it: all but `f16`.
-    pub fn on_cpu(self) -> bool {
-        self != FloatTy::F16
     }
 }
 
@@ -312,11 +297,9 @@ pub enum TyKind {
 pub struct Types {
     kinds: FrozenVec<Box<TyKind>>,
     map: RefCell<HashMap<TyKind, TyId>>,
-    /// Each type's size: the nodes of its tree, shared parts counted each time they appear
-    /// (saturating).
-    sizes: RefCell<Vec<u32>>,
-    /// Whether each immutable type mentions variables, parameters or projections.
-    flags: RefCell<Vec<u8>>,
+    /// Each type's size, the nodes of its tree with shared parts counted each time they appear
+    /// (saturating); and its flags, whether it mentions variables, parameters or projections.
+    facts: RefCell<Vec<(u32, u8)>>,
     pub bool: TyId,
     pub i32: TyId,
     pub u32: TyId,
@@ -341,8 +324,7 @@ impl Types {
         let mut t = Types {
             kinds: FrozenVec::new(),
             map: RefCell::new(HashMap::new()),
-            sizes: RefCell::new(Vec::new()),
-            flags: RefCell::new(Vec::new()),
+            facts: RefCell::new(Vec::new()),
             bool: TyId(0),
             i32: TyId(0),
             u32: TyId(0),
@@ -391,16 +373,13 @@ impl Types {
             TyKind::Projection { .. } => HAS_PARAMS | HAS_PROJECTIONS,
             _ => 0,
         };
-        {
-            let sizes = self.sizes.borrow();
-            let child_flags = self.flags.borrow();
-            children(new.key(), &mut |c| {
-                size = size.saturating_add(sizes[c.index()]);
-                flags |= child_flags[c.index()];
-            });
-        }
-        self.sizes.borrow_mut().push(size);
-        self.flags.borrow_mut().push(flags);
+        let mut facts = self.facts.borrow_mut();
+        children(new.key(), &mut |c| {
+            let (child_size, child_flags) = facts[c.index()];
+            size = size.saturating_add(child_size);
+            flags |= child_flags;
+        });
+        facts.push((size, flags));
         self.kinds.push(Box::new(new.key().clone()));
         new.insert(id);
         id
@@ -419,7 +398,7 @@ impl Types {
     /// what a walk over it that doesn't remember where it's been would visit. See
     /// [`MAX_TYPE_SIZE`].
     pub fn size(&self, t: TyId) -> u32 {
-        self.sizes.borrow()[t.index()]
+        self.facts.borrow()[t.index()].0
     }
 
     /// How many types there are.
@@ -483,17 +462,17 @@ impl Types {
 
     /// Whether a type mentions inference variables.
     pub fn has_vars(&self, t: TyId) -> bool {
-        self.flags.borrow()[t.index()] & HAS_VARS != 0
+        self.facts.borrow()[t.index()].1 & HAS_VARS != 0
     }
 
     /// Whether a type mentions generic parameters or projections.
     pub fn has_params(&self, t: TyId) -> bool {
-        self.flags.borrow()[t.index()] & HAS_PARAMS != 0
+        self.facts.borrow()[t.index()].1 & HAS_PARAMS != 0
     }
 
     /// Whether a type mentions projections.
     pub fn has_projections(&self, t: TyId) -> bool {
-        self.flags.borrow()[t.index()] & HAS_PROJECTIONS != 0
+        self.facts.borrow()[t.index()].1 & HAS_PROJECTIONS != 0
     }
 
     /// Whether any part of `t` satisfies `f`, a test of the part alone.

@@ -751,12 +751,7 @@ fn a_golden_is_blessed_from_the_screen() {
 #[ignore = "needs a GPU"]
 fn every_gpu_capability_reads_back_what_it_drew() {
     let dir = wrela_tests::repo_root().join("compiler/tests/capabilities");
-    let out = wrela_driver::test(&dir, None);
-    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
-    let failed: Vec<_> =
-        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
-    assert!(failed.is_empty(), "failed: {failed:?}");
-    assert_eq!(out.results.len(), 18);
+    assert_eq!(crate::tests_pass(&dir), 18);
 }
 
 /// Toolchain 0.6's kernel capabilities (compiler/tests/kernels): a histogram in workgroup
@@ -766,12 +761,7 @@ fn every_gpu_capability_reads_back_what_it_drew() {
 #[ignore = "needs a GPU"]
 fn every_kernel_capability_computes_what_the_cpu_does() {
     let dir = wrela_tests::repo_root().join("compiler/tests/kernels");
-    let out = wrela_driver::test(&dir, None);
-    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
-    let failed: Vec<_> =
-        out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
-    assert!(failed.is_empty(), "failed: {failed:?}");
-    assert_eq!(out.results.len(), 10);
+    assert_eq!(crate::tests_pass(&dir), 10);
 }
 
 /// `std::gpu::memory()` (compiler/tests/memory): std counts the buffers and textures a
@@ -780,10 +770,7 @@ fn every_kernel_capability_computes_what_the_cpu_does() {
 #[ignore = "needs a GPU"]
 fn std_counts_the_gpu_memory_a_program_holds() {
     let dir = wrela_tests::repo_root().join("compiler/tests/memory");
-    let out = wrela_driver::test(&dir, None);
-    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
-    assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
-    assert_eq!(out.results.len(), 1);
+    assert_eq!(crate::tests_pass(&dir), 1);
 }
 
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
@@ -824,8 +811,5 @@ pub fn frame(state: mut Game, time: f32, width: u32, height: u32) {
         "use main::Game\n\n@test(frames: 30)\nfn counts(game: Game) {\n    assert(game.ticks == 30)\n}\n",
     )
     .expect("write checks.wrela");
-    let out = wrela_driver::test(&dir, None);
-    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
-    assert_eq!(out.results.len(), 1);
-    assert!(out.results[0].failure.is_none(), "{:?}", out.results[0].failure);
+    assert_eq!(crate::tests_pass(&dir), 1);
 }

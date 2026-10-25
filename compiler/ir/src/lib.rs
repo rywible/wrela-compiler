@@ -489,26 +489,6 @@ pub enum SubgroupOp {
     Shuffle,
 }
 
-impl SubgroupOp {
-    pub fn wgsl_name(self) -> &'static str {
-        match self {
-            SubgroupOp::Add => "subgroupAdd",
-            SubgroupOp::ExclusiveAdd => "subgroupExclusiveAdd",
-            SubgroupOp::InclusiveAdd => "subgroupInclusiveAdd",
-            SubgroupOp::Min => "subgroupMin",
-            SubgroupOp::Max => "subgroupMax",
-            SubgroupOp::And => "subgroupAnd",
-            SubgroupOp::Or => "subgroupOr",
-            SubgroupOp::Xor => "subgroupXor",
-            SubgroupOp::Any => "subgroupAny",
-            SubgroupOp::All => "subgroupAll",
-            SubgroupOp::Ballot => "subgroupBallot",
-            SubgroupOp::BroadcastFirst => "subgroupBroadcastFirst",
-            SubgroupOp::Shuffle => "subgroupShuffle",
-        }
-    }
-}
-
 /// What [`Expr::Atomic`] does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AtomicOp {

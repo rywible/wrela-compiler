@@ -2,8 +2,10 @@
 //! (`Clone` declared beside `Copy`), W0005 (a bare literal by position where a swap would
 //! compile, or a `select` by position), W0006 (a `var` that never changes), W0007 (a `GpuData`
 //! struct's padding that another order saves), W0008 (a private function or constant that
-//! nothing uses) and W0009 (`take` before a local in a struct literal). The conformance suite
-//! checks errors only.
+//! nothing uses), W0009 (`take` before a local in a struct literal), W0010 (a copy of a place
+//! that is only read), W0011 (a test of code that can't fail), W0012 (a request polled in the
+//! call that made it) and W0013 (a counted `while` that only indexes a run). The conformance
+//! suite checks errors only.
 
 use crate::package;
 
@@ -26,6 +28,11 @@ fn all_warnings(name: &str, text: &str) -> Vec<(String, usize)> {
         .collect()
 }
 
+/// The lines of the warnings `w` with the code `code`, in order.
+fn lines(w: &[(String, usize)], code: &str) -> Vec<usize> {
+    w.iter().filter(|(c, _)| c == code).map(|(_, l)| *l).collect()
+}
+
 #[test]
 fn unused_locals_are_reported_once_each() {
     let src = "fn f(unused_param: i32) -> i32 {
@@ -44,9 +51,8 @@ fn unused_locals_are_reported_once_each() {
     b + e + h(1)
 }";
     let w = warnings("unused", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0001").map(|(_, l)| *l).collect();
     // `a`, `c` (assigned, never read), `d`, `k`.
-    assert_eq!(lines, [2, 4, 7, 8], "{w:?}");
+    assert_eq!(lines(&w, "W0001"), [2, 4, 7, 8], "{w:?}");
 }
 
 /// A `var` that nothing changes is W0006, with a fix that makes it a `let`; one that's assigned,
@@ -251,8 +257,7 @@ struct D: Copy {
 }
 ";
     let w = warnings("clone-copy", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0004").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [3, 5, 9, 13]);
+    assert_eq!(lines(&w, "W0004"), [3, 5, 9, 13]);
     let out = wrela_driver::check(&package("warnings/clone-copy-fix", src));
     let main = out.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
     let fixed = wrela_tests::apply_fixes(src, main.expect("main.wrela"), &out.diagnostics);
@@ -292,8 +297,7 @@ fn f(w: f32) -> f32 {
 }
 ";
     let w = warnings("bare-literals", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0005").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [14, 17]);
+    assert_eq!(lines(&w, "W0005"), [14, 17]);
     let out = wrela_driver::check(&package("warnings/bare-literals-fix", src));
     let main = out.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
     let fixed = wrela_tests::apply_fixes(src, main.expect("main.wrela"), &out.diagnostics);
@@ -316,8 +320,7 @@ fn a_positional_select_is_reported_and_named() {
 }
 ";
     let w = warnings("select", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0005").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [2]);
+    assert_eq!(lines(&w, "W0005"), [2]);
     let out = wrela_driver::check(&package("warnings/select-fix", src));
     let main = out.sources.files().find(|(_, f)| f.name.ends_with("main.wrela")).map(|(id, _)| id);
     let fixed = wrela_tests::apply_fixes(src, main.expect("main.wrela"), &out.diagnostics);
@@ -397,9 +400,7 @@ pub fn frame(time: f32, width: u32, height: u32) {
 }
 ";
     let w = all_warnings("unused-items", src);
-    let found: Vec<(&str, usize)> =
-        w.iter().filter(|(c, _)| c == "W0008").map(|(c, l)| (c.as_str(), *l)).collect();
-    assert_eq!(found, [("W0008", 2), ("W0008", 12), ("W0008", 16)], "{w:?}");
+    assert_eq!(lines(&w, "W0008"), [2, 12, 16], "{w:?}");
 }
 
 /// A `GpuData` struct whose fields another order would lay out in fewer bytes is W0007, with
@@ -496,8 +497,7 @@ fn _uses() -> f32 {
     a + b[0] + f32(copies_a_number(f)) + replaces_the_source() + replaces_a_parameter(mut f.hs)
 }";
     let w = warnings("copy-read", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0010").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [7], "{w:?}");
+    assert_eq!(lines(&w, "W0010"), [7], "{w:?}");
 }
 
 /// W0011: a test of code that reaches no `assert` and no panic passes whatever it computes; one
@@ -528,8 +528,7 @@ fn reaches_a_panic() {
     let _y = checked(1.0)
 }";
     let w = warnings("test-cant-fail", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0011").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [11], "{w:?}");
+    assert_eq!(lines(&w, "W0011"), [11], "{w:?}");
 }
 
 /// W0012: a request's handle polled in the call that made it is `None` every time; one kept in
@@ -570,8 +569,7 @@ pub fn frame(game: mut Game, time: f32, width: u32, height: u32) {
     }
 }";
     let w = warnings("polled-at-once", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0012").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [12], "{w:?}");
+    assert_eq!(lines(&w, "W0012"), [12], "{w:?}");
 }
 
 /// W0013: a counted `while` over a run that only indexes it is a `for` loop; one whose index
@@ -603,6 +601,5 @@ fn _uses() -> f32 {
     total([1.0]) + f32(first_negative([1.0]))
 }";
     let w = warnings("counted-while", src);
-    let lines: Vec<usize> = w.iter().filter(|(c, _)| c == "W0013").map(|(_, l)| *l).collect();
-    assert_eq!(lines, [4], "{w:?}");
+    assert_eq!(lines(&w, "W0013"), [4], "{w:?}");
 }

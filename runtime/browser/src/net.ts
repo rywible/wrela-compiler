@@ -156,7 +156,6 @@ export class Frames {
           continue;
         }
         if (this.#length > MAX_FRAME) throw new Error(`a frame of ${this.#length} bytes, past ${MAX_FRAME}`);
-        if (held + this.#length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
         // Allocate once per frame: each chunk copies only the bytes it adds, and a delivered
         // frame keeps its own storage when the stream reuses its chunk or the next frame starts.
         this.#body = new Uint8Array(this.#length);
@@ -165,7 +164,8 @@ export class Frames {
         this.#used = 0;
       }
       const body = this.#body;
-      // Other connections may have used the budget since this frame's prefix arrived.
+      // Within the budget, which other connections may have used since this frame's prefix
+      // arrived.
       if (held + body.length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
       const n = Math.min(body.length - this.#used, chunk.length - at);
       body.set(chunk.subarray(at, at + n), this.#used);

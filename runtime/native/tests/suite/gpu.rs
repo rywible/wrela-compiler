@@ -841,6 +841,49 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
     assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
 }
 
+/// A pass begins with the whole target its scissor: one that joins a pass that set a scissor
+/// (here the second of three joined passes, after a first that set none) draws on all of it.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_pass_that_joins_after_a_scissor_draws_on_the_whole_target() {
+    let fill = r#"
+        @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+            let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+            return vec4f(corners[i], 0, 1);
+        }
+        @fragment fn fs() -> @location(0) vec4f { return vec4f(1, 1, 1, 1); }
+    "#;
+    let pipelines = r#"[
+        { "name": "fill", "shader": "fill.wgsl", "kind": "render",
+          "vertex_entry": "vs", "fragment_entry": "fs",
+          "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
+          "bindings": [] }
+    ]"#;
+    let pass = Pass::one(2, false, [0.0; 4]);
+    let joined = Pass { join: true, ..pass.keeping_color(true) };
+    let batch = Encoder::new()
+        .create_texture(2, 4, 4, TextureFormat::Rgba8, false)
+        .label("filled")
+        .begin_pass(pass)
+        .end_pass()
+        .begin_pass(joined)
+        .set_scissor(0, 0, 1, 1)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .begin_pass(joined)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .finish();
+    let dir = program_build("scissor-pass-join", pipelines, &[("fill.wgsl", fill)], &[vec![batch]]);
+    let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
+        .expect("loads");
+    host.frame(0.0, 4, 4).expect("runs");
+    assert_eq!(host.take_timings().unwrap().len(), 1, "the three passes join");
+    let (width, height, rgba) = host.read_target("filled").expect("the joined pass's target");
+    assert_eq!((width, height), (4, 4));
+    assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn times_dispatches_and_passes_with_timestamps() {

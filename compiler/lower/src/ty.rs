@@ -93,21 +93,11 @@ impl<'a> Cx<'a> {
         let out = match k {
             TyKind::Bool => Some(mb.m.types.bool()),
             TyKind::Int(_) | TyKind::Float(_) => scalar_of(k).map(|s| {
-                if gpu && !s.on_gpu() {
-                    self.cpu_only(mb, s.name(), span);
-                }
-                if !gpu && !s.on_cpu() {
-                    self.gpu_only(s.name(), span);
-                }
+                self.check_side(mb, gpu, s, || s.name().to_string(), span);
                 mb.m.types.scalar(s)
             }),
             &TyKind::Vec(e, n) => scalar_of(&e.kind()).map(|s| {
-                if gpu && !e.on_gpu() {
-                    self.cpu_only(mb, &format!("vec{n}{}", e.suffix()), span);
-                }
-                if !gpu && !e.on_cpu() {
-                    self.gpu_only(&format!("vec{n}{}", e.suffix()), span);
-                }
+                self.check_side(mb, gpu, s, || format!("vec{n}{}", e.suffix()), span);
                 mb.m.types.vector_of(s, n)
             }),
             TyKind::Mat(c, r) => Some(mb.m.types.intern(ir::TypeDef::Matrix(*c, *r))),
@@ -294,6 +284,23 @@ impl<'a> Cx<'a> {
                 .with_note(format!("a WGSL type is at most {max} bytes"))
                 .with_help("keep the data in a `GpuBuffer` and pass the GPU a span of it"),
         );
+    }
+
+    /// E0326 or E0338 for a type of scalar `s` (named by `name`) that the side its code runs on
+    /// (`gpu`) doesn't have.
+    fn check_side(
+        &mut self,
+        mb: &ModuleBuilder,
+        gpu: bool,
+        s: ir::Scalar,
+        name: impl FnOnce() -> String,
+        span: Span,
+    ) {
+        if gpu && !s.on_gpu() {
+            self.cpu_only(mb, &name(), span);
+        } else if !gpu && !s.on_cpu() {
+            self.gpu_only(&name(), span);
+        }
     }
 
     fn cpu_only(&mut self, mb: &ModuleBuilder, name: &str, span: Span) {

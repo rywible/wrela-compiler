@@ -5,7 +5,9 @@
 //! linted.
 
 use crate::defs::FnOwner;
-use crate::mir::{Arg, Body, Callee, Local, LocalKind, OperandKind, Place, Rvalue, StatementKind};
+use crate::mir::{
+    Aliases, Arg, Body, Callee, Local, LocalKind, OperandKind, Rvalue, StatementKind,
+};
 use crate::program::Program;
 use crate::thir;
 use crate::ty::{FnId, TyKind};
@@ -25,7 +27,7 @@ pub fn lint_fn(p: &Program, f: FnId, body: &Body) -> Vec<Diagnostic> {
         out.extend(polled_at_once(p, body));
     }
     if let Some(b) = &def.body {
-        each_block(b, &mut |block| out.extend(counted_whiles(p, block)));
+        b.for_each_block(&mut |block| out.extend(counted_whiles(p, block)));
     }
     out
 }
@@ -55,32 +57,22 @@ fn is_poll(p: &Program, f: FnId) -> bool {
 /// a request made earlier.
 fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
     // What each projection local aliases, and which temporaries hold a call's result.
-    let mut alias: HashMap<Local, Place> = HashMap::new();
+    let mut alias = Aliases::default();
     let mut from_call: Vec<Local> = Vec::new();
     // Each `let` or `var` of a handle: where it's first given a request made here, and whether
     // anything else could have given it its value.
     let mut made: HashMap<Local, Span> = HashMap::new();
     let mut other = HashSet::new();
-    let root = |alias: &HashMap<Local, Place>, mut l: Local| {
-        for _ in 0..16 {
-            match alias.get(&l) {
-                Some(pl) => l = pl.local,
-                None => break,
-            }
-        }
-        l
-    };
     let handle = |x: Local| is_pending(p, body.local(x).ty) && is_user_owned(body, x);
     // The poll a call is, and its receiver's local.
-    let polled =
-        |alias: &HashMap<Local, Place>, c: &crate::mir::Call| match (&c.callee, c.args.first()) {
-            (Callee::Fn { func, .. }, Some(Arg::Mut(recv, _) | Arg::Borrow(recv, _)))
-                if is_poll(p, *func) =>
-            {
-                Some(root(alias, recv.local))
-            }
-            _ => None,
-        };
+    let polled = |alias: &Aliases, c: &crate::mir::Call| match (&c.callee, c.args.first()) {
+        (Callee::Fn { func, .. }, Some(Arg::Mut(recv, _) | Arg::Borrow(recv, _)))
+            if is_poll(p, *func) =>
+        {
+            Some(alias.root(recv.local))
+        }
+        _ => None,
+    };
     // A request std makes (`load`, `std::gpu::read`): a function of std's declared to return a
     // `Pending`, which makes one. Not one declared to return a `T` that's a `Pending` here
     // (`replace`, `remove`, `unwrap`), which gives back one made earlier; nor one of the
@@ -108,19 +100,17 @@ fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
                     }
                     for a in &c.args {
                         if let Arg::Mut(pl, _) = a
-                            && poll != Some(root(&alias, pl.local))
+                            && poll != Some(alias.root(pl.local))
                         {
-                            other.insert(root(&alias, pl.local));
+                            other.insert(alias.root(pl.local));
                         }
                     }
                 }
                 match &s.kind {
-                    StatementKind::Bind { local, place, .. } => {
-                        alias.insert(*local, place.clone());
-                    }
+                    StatementKind::Bind { local, place, .. } => alias.bind(*local, place),
                     // Through a `mut` projection: what it aliases is given another value.
-                    StatementKind::Assign(place, _) if alias.contains_key(&place.local) => {
-                        other.insert(root(&alias, place.local));
+                    StatementKind::Assign(place, _) if alias.contains(place.local) => {
+                        other.insert(alias.root(place.local));
                     }
                     StatementKind::Assign(place, r) if place.proj.is_empty() => {
                         let x = place.local;
@@ -144,7 +134,7 @@ fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
                         }
                     }
                     StatementKind::Assign(place, _) => {
-                        other.insert(root(&alias, place.local));
+                        other.insert(alias.root(place.local));
                     }
                     _ => {}
                 }
@@ -154,7 +144,7 @@ fn polled_at_once(p: &Program, body: &Body) -> Vec<Diagnostic> {
     polls
         .into_iter()
         .filter(|(r, _)| !other.contains(r))
-        .filter_map(|(r, at)| made.get(&r).map(|&m| poll_warning(p, body, r, m, at)))
+        .filter_map(|(r, at)| made.get(&r).map(|&m| poll_warning(body, r, m, at)))
         .collect()
 }
 
@@ -163,7 +153,7 @@ fn is_user_owned(body: &Body, x: Local) -> bool {
     matches!(body.local(x).kind, LocalKind::User(thir::LocalKind::Owned { .. }))
 }
 
-fn poll_warning(_p: &Program, body: &Body, x: Local, made: Span, poll: Span) -> Diagnostic {
+fn poll_warning(body: &Body, x: Local, made: Span, poll: Span) -> Diagnostic {
     let name = &body.local(x).name;
     Diagnostic::new(
         codes::W0012,
@@ -177,65 +167,9 @@ fn poll_warning(_p: &Program, body: &Body, x: Local, made: Span, poll: Span) -> 
 
 // ---- W0013 --------------------------------------------------------------------------------
 
-/// Calls `f` on `b` and on every block inside it, each once.
-fn each_block<'a>(b: &'a ast::Block, f: &mut dyn FnMut(&'a ast::Block)) {
-    f(b);
-    for s in &b.stmts {
-        match &s.kind {
-            StmtKind::Let { init, else_, .. } => {
-                expr_blocks(init, f);
-                if let Some(e) = else_ {
-                    each_block(e, f);
-                }
-            }
-            StmtKind::Var { init, .. } => expr_blocks(init, f),
-            StmtKind::Assign { target, value, .. } => {
-                expr_blocks(target, f);
-                expr_blocks(value, f);
-            }
-            StmtKind::Expr(e) => expr_blocks(e, f),
-            StmtKind::While { cond, body, .. } => {
-                expr_blocks(cond, f);
-                each_block(body, f);
-            }
-            StmtKind::Loop { body } => each_block(body, f),
-            StmtKind::For { iter, body, .. } => {
-                match iter {
-                    ast::ForIter::Range { start, end, .. } => {
-                        expr_blocks(start, f);
-                        expr_blocks(end, f);
-                    }
-                    ast::ForIter::Expr(e) => expr_blocks(e, f),
-                }
-                each_block(body, f);
-            }
-        }
-    }
-}
-
-/// Calls `f` on each block in expression `e`, each once.
-fn expr_blocks<'a>(e: &'a ast::Expr, f: &mut dyn FnMut(&'a ast::Block)) {
-    match &e.kind {
-        ExprKind::Block(b) | ExprKind::Unsafe(b) => each_block(b, f),
-        ExprKind::If { cond, then, else_, .. } => {
-            expr_blocks(cond, f);
-            each_block(then, f);
-            if let Some(e) = else_ {
-                expr_blocks(e, f);
-            }
-        }
-        _ => e.for_each_child(&mut |c| expr_blocks(c, f)),
-    }
-}
-
-/// Every expression in `b`'s statements, nested ones included.
-fn each_expr(b: &ast::Block, f: &mut impl FnMut(&ast::Expr)) {
-    b.for_each_expr(&mut |e| e.walk(&mut |x| f(x)));
-}
-
-/// Whether `e` is the name `name` alone.
-fn is_name(e: &ast::Expr, name: &str) -> bool {
-    matches!(&e.kind, ExprKind::Path(p) if p.is_single() && p.segments[0].ident.name == name)
+/// Every expression in statement `s`, nested ones included.
+fn each_expr(s: &ast::Stmt, f: &mut impl FnMut(&ast::Expr)) {
+    s.for_each_expr(&mut |e| e.walk(&mut |x| f(x)));
 }
 
 /// W0013 in block `b`: `var i = 0`, then `while i < xs.len() { ...xs[i]... i += 1 }`, where `i`
@@ -247,11 +181,7 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
     for (k, s) in b.stmts.iter().enumerate() {
         let StmtKind::While { pat: None, cond, body } = &s.kind else { continue };
         let ExprKind::Binary(BinOp::Lt, i, len) = &cond.kind else { continue };
-        let ExprKind::Path(ip) = &i.kind else { continue };
-        if !ip.is_single() {
-            continue;
-        }
-        let name = ip.segments[0].ident.name.as_str();
+        let Some(name) = i.single_name() else { continue };
         let ExprKind::MethodCall { receiver: xs, name: m, args, .. } = &len.kind else { continue };
         if m.name != "len" || !args.is_empty() {
             continue;
@@ -262,7 +192,7 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
             StmtKind::Var { name: n, init, .. } if n.name == name => {
                 Some(matches!(&init.kind, ExprKind::Lit(l) if p.text(l.span) == Some("0")))
             }
-            StmtKind::Assign { target, .. } if is_name(target, name) => Some(false),
+            StmtKind::Assign { target, .. } if target.single_name() == Some(name) => Some(false),
             _ => None,
         });
         if starts_at_zero != Some(true) {
@@ -271,7 +201,7 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
         // Stepped by one, last.
         let Some(last) = body.stmts.last() else { continue };
         let stepped = matches!(&last.kind, StmtKind::Assign { target, op: AssignOp::Add, value }
-            if is_name(target, name) && p.text(value.span) == Some("1"));
+            if target.single_name() == Some(name) && p.text(value.span) == Some("1"));
         if !stepped {
             continue;
         }
@@ -285,13 +215,12 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
         let mut leaves = false;
         let mut writes = false;
         let mut assigns_i = 0;
-        let rest =
-            ast::Block { stmts: body.stmts[..body.stmts.len() - 1].to_vec(), span: body.span };
-        each_expr(&rest, &mut |e| match &e.kind {
-            ExprKind::Path(_) if is_name(e, name) => uses += 1,
-            ExprKind::Path(_) if is_name(e, &root) => root_named += 1,
+        let rest = &body.stmts[..body.stmts.len() - 1];
+        let mut count = |e: &ast::Expr| match &e.kind {
+            ExprKind::Path(_) if e.single_name() == Some(name) => uses += 1,
+            ExprKind::Path(_) if e.single_name() == Some(root.as_str()) => root_named += 1,
             ExprKind::Index { base, index }
-                if is_name(index, name) && p.text(base.span) == Some(seq) =>
+                if index.single_name() == Some(name) && p.text(base.span) == Some(seq) =>
             {
                 indexing += 1;
                 seq_indexed += 1;
@@ -301,26 +230,28 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
             }
             _ if p.text(e.span) == Some(seq) => seq_named += 1,
             _ => {}
-        });
-        each_block(&rest, &mut |blk| {
-            for s in &blk.stmts {
+        };
+        rest.iter().for_each(|s| each_expr(s, &mut count));
+        let mut assigns = |stmts: &[ast::Stmt]| {
+            for s in stmts {
                 if let StmtKind::Assign { target, .. } = &s.kind {
-                    if is_name(target, name) {
+                    if target.single_name() == Some(name) {
                         assigns_i += 1;
                     }
                     if matches!(&target.kind, ExprKind::Index { base, index }
-                        if is_name(index, name) && p.text(base.span) == Some(seq))
+                        if index.single_name() == Some(name) && p.text(base.span) == Some(seq))
                     {
                         writes = true;
                     }
                 }
             }
-        });
+        };
+        assigns(rest);
+        rest.iter().for_each(|s| s.for_each_block(&mut |blk| assigns(&blk.stmts)));
         // `xs[i]` also counts as a use of `xs` and of `i` among the expressions walked.
         let named_after = b.stmts[k + 1..].iter().any(|s| {
-            let blk = ast::Block { stmts: vec![s.clone()], span: s.span };
             let mut found = false;
-            each_expr(&blk, &mut |e| found |= is_name(e, name));
+            each_expr(s, &mut |e| found |= e.single_name() == Some(name));
             found
         });
         // Each `seq[i]` names the root once; any other naming of it is a use the loop has.

@@ -13,13 +13,13 @@ import {
   NONE,
   SCREEN,
   SCREEN_FORMAT,
-  TEXTURE_FORMATS,
 } from "./abi.gen.ts";
 import {
   type BindingKind,
   type Blend,
   colorAttachmentBytes,
   dimensionOf,
+  formatOf,
   isDepthBinding,
   isStorage,
   type Manifest,
@@ -28,7 +28,19 @@ import {
   targetName,
 } from "./manifest.ts";
 import { buildPathProblem, pathProblem } from "./path.ts";
-import { type Binding, type Command, isDraw, onScreen, type OpcodeName, type Pass, type TexelRect, type TextureFormat, type TextureKind } from "./stream.ts";
+import {
+  argumentsOf,
+  type Binding,
+  type Command,
+  indicesOf,
+  isDraw,
+  onScreen,
+  type OpcodeName,
+  type Pass,
+  type TexelRect,
+  type TextureFormat,
+  type TextureKind,
+} from "./stream.ts";
 
 /** The limits a program sees, in `wrela.limit`'s order (runtime/abi `Limits`). */
 export type Limits = number[];
@@ -51,7 +63,7 @@ export const LIMIT_SOURCES = [
 
 /** The device's limits, in `wrela.limit`'s order: at most `u32::MAX` each; then its features'
  * bits (`FEATURES`, as `features` names them) and its subgroups' least and greatest sizes. */
-export function limitsOf(l: GPUSupportedLimits, features: readonly string[] = ["indirect-first-instance"], subgroups: [number, number] = [0, 0]): Limits {
+export function limitsOf(l: GPUSupportedLimits, features: readonly string[], subgroups: [number, number]): Limits {
   const bits = FEATURES.reduce((a, f, i) => (features.includes(f) ? a | (1 << i) : a), 0);
   return [...LIMIT_SOURCES.map((names) => Math.min(...names.map((n) => l[n]), 0xffff_ffff)), bits >>> 0, ...subgroups];
 }
@@ -67,7 +79,6 @@ export class CommandError extends Error {
   }
 }
 
-const formatOf = (f: TextureFormat) => TEXTURE_FORMATS.find((t) => t.name === f)!;
 /** That texture `handle`, of format `got`, is of the format its binding names. */
 function sameFormat(err: (why: string) => Error, handle: number, got: TextureFormat, want: TextureFormat | null): void {
   if (want !== null && want !== got) throw err(`texture ${handle} is ${got}, and it's bound where a ${want} texture goes`);
@@ -96,6 +107,9 @@ const NO_TARGET: RenderTarget = { colors: [], depth: false, screen: false };
 
 /** The most mip levels a `width` × `height` texture has (runtime/abi `max_levels`). */
 export const maxLevels = (width: number, height: number) => 32 - Math.clz32(Math.max(width, height, 1));
+/** The width and height of level `level` of a `width` × `height` texture (runtime/abi
+ * `level_size`). */
+export const levelSize = (width: number, height: number, level: number): [number, number] => [Math.max(1, width >> level), Math.max(1, height >> level)];
 
 /** The names of the features a device has, by the bits `wrela.limit(10)` gives. */
 export const featureNames = (bits: number): string[] => FEATURES.filter((_, i) => (bits & (1 << i)) !== 0);
@@ -127,8 +141,6 @@ type Texture = {
   writable: boolean;
 };
 
-/** Level `level`'s width and height. */
-const sizeOf = (t: Texture, level: number): [number, number] => [Math.max(1, t.width >> level), Math.max(1, t.height >> level)];
 /** Its 2D layers: a 3D texture's whole depth is one subresource. */
 const subresourceLayers = (t: Texture) => (t.textureKind === "3d" ? 1 : t.layers);
 
@@ -139,6 +151,9 @@ type Resource = { kind: "buffer"; size: number } | Texture | { kind: "sampler"; 
  * subresource apart): `[from, to)` each. */
 type Use = { levels: [number, number]; layers: [number, number]; write: boolean };
 const BUFFER: [number, number] = [0, 1];
+/** A buffer's use, read-only or read-write; no `Use` changes once made. */
+const BUFFER_READ: Use = { levels: BUFFER, layers: BUFFER, write: false };
+const BUFFER_WRITE: Use = { levels: BUFFER, layers: BUFFER, write: true };
 const overlaps = (a: Use, b: Use) =>
   a.levels[0] < b.levels[1] && b.levels[0] < a.levels[1] && a.layers[0] < b.layers[1] && b.layers[0] < a.layers[1];
 const sameUse = (a: Use, b: Use) =>
@@ -159,8 +174,10 @@ export class Checker {
   #scope = new Map<number, Use[]>();
   /** An empty map for the next fresh scope; a rejected command restores the current one. */
   #spareScope = new Map<number, Use[]>();
-  /** A draw's prior uses, reused and cleared after each check, whether it passes or fails. */
-  readonly #beforeDraw = new Map<number, Use[] | undefined>();
+  /** Each handle a draw may add uses to, and how many it had before (-1: no entry), reused and
+   * cleared after each check, whether it passes or fails. A command only adds uses, so rollback
+   * truncates. */
+  readonly #beforeDraw = new Map<number, number>();
   /** Read-write subresources in this command, reused across draws and dispatches. */
   readonly #written: [number, Use][] = [];
   /** The open pass's attachments. */
@@ -266,23 +283,20 @@ export class Checker {
       this.#check(cmd);
       return;
     }
-    // A draw can only change the entries it names, so keep only those prior uses.
+    // A draw can only add uses to the entries it names, so keep only how many each had.
     const entries = this.#beforeDraw;
     for (const binding of cmd.bindings) this.#rememberUse(binding.handle);
-    if (cmd.op === "DrawIndirect" || cmd.op === "DrawIndexedIndirect" || cmd.op === "MultiDrawIndirect" || cmd.op === "MultiDrawIndexedIndirect") {
-      this.#rememberUse(cmd.arguments);
-    }
-    if (cmd.op === "DrawIndexedIndirect" || cmd.op === "DrawIndexed") this.#rememberUse(cmd.indices);
-    if (cmd.op === "MultiDrawIndirect" || cmd.op === "MultiDrawIndexedIndirect") {
-      if (cmd.indices !== null) this.#rememberUse(cmd.indices[0]);
-      if (cmd.count_buffer !== NONE) this.#rememberUse(cmd.count_buffer);
-    }
+    const args = argumentsOf(cmd);
+    if (args !== null) this.#rememberUse(args);
+    const indices = indicesOf(cmd);
+    if (indices !== null) this.#rememberUse(indices);
+    // A multi-draw's count buffer adds no use: a command with one is rejected.
     try {
       this.#check(cmd);
     } catch (e) {
-      for (const [handle, used] of entries) {
-        if (used === undefined) this.#scope.delete(handle);
-        else this.#scope.set(handle, used);
+      for (const [handle, n] of entries) {
+        if (n < 0) this.#scope.delete(handle);
+        else this.#scope.get(handle)!.length = n;
       }
       throw e;
     } finally {
@@ -291,10 +305,7 @@ export class Checker {
   }
 
   #rememberUse(handle: number): void {
-    if (!this.#beforeDraw.has(handle)) {
-      const u = this.#scope.get(handle);
-      this.#beforeDraw.set(handle, u === undefined ? undefined : [...u]);
-    }
+    if (!this.#beforeDraw.has(handle)) this.#beforeDraw.set(handle, this.#scope.get(handle)?.length ?? -1);
   }
 
   #check(cmd: Command): void {
@@ -540,7 +551,7 @@ export class Checker {
         throw err(`texture ${c.texture}: ${why}`);
       }
       this.#subresource(op, t, c.texture, c.level, c.layer);
-      const at = sizeOf(t, c.level);
+      const at = levelSize(t.width, t.height, c.level);
       if (size !== undefined && (size[0] !== at[0] || size[1] !== at[1])) throw err("the pass's targets differ in size");
       size = at;
       formats.push(t.format);
@@ -557,7 +568,7 @@ export class Checker {
       const t = this.#texture(op, pass.depth);
       if (!isDepth(t.format)) throw err(`texture ${pass.depth} isn't a depth texture`);
       this.#subresource(op, t, pass.depth, 0, pass.depthLayer);
-      const at = sizeOf(t, 0);
+      const at = levelSize(t.width, t.height, 0);
       if (size !== undefined && (size[0] !== at[0] || size[1] !== at[1])) throw err("the pass's colour and depth targets differ in size");
       size = at;
       this.#attachments.push({ handle: pass.depth, level: 0, layer: pass.depthLayer });
@@ -579,7 +590,7 @@ export class Checker {
   #rect(op: OpcodeName, t: Texture, r: TexelRect, doing: string): void {
     const err = (why: string) => new CommandError(op, why);
     this.#subresource(op, t, r.texture, r.level, r.layer);
-    const [w, h] = sizeOf(t, r.level);
+    const [w, h] = levelSize(t.width, t.height, r.level);
     const { x, y, width, height, texture: handle } = r;
     if (x + width > w || y + height > h) {
       throw err(`${doing} ${width}x${height} texels at (${x}, ${y}) overruns level ${r.level} of texture ${handle} (${w}x${h})`);
@@ -660,7 +671,7 @@ export class Checker {
    * its indices). */
   #readRange(op: OpcodeName, handle: number, offset: number, size: number, doing: string): void {
     this.#range(op, handle, offset, size, doing);
-    this.#used(op, "buffer", handle, { levels: BUFFER, layers: BUFFER, write: false });
+    this.#used(op, "buffer", handle, BUFFER_READ);
   }
 
   /** Adds a use of a buffer or texture (`what`) to the usage scope. */
@@ -730,7 +741,7 @@ export class Checker {
             );
           }
           const write = kind === "read_write";
-          const u: Use = { levels: BUFFER, layers: BUFFER, write };
+          const u = write ? BUFFER_WRITE : BUFFER_READ;
           if (write) {
             if (written.some(([h]) => h === b.handle)) {
               throw err(`buffer ${b.handle} is bound read-write twice in one ${dispatch ? "dispatch" : "draw"}`);

@@ -14,6 +14,14 @@ pub(crate) fn linked_elsewhere(file: &impl std::os::fd::AsFd) -> bool {
     rustix::fs::fstat(file).is_ok_and(|st| st.st_nlink > 1)
 }
 
+/// A name for a new file beside the file `name`, which no other write of this process takes:
+/// `.NAME.tmp-PID-N`. A write goes to it, which then takes `name`'s place.
+pub(crate) fn temp_name(name: &str) -> String {
+    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!(".{name}.tmp-{}-{n}", std::process::id())
+}
+
 /// `path`'s parts, `/` between them, none empty, `.` or `..`.
 pub(crate) fn parts(path: &str) -> Result<Vec<&str>, String> {
     if path.is_empty() || path.contains(['\\', '\0']) {

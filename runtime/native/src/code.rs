@@ -20,7 +20,6 @@
 
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use wasmtime::{Engine, Module};
 
 /// The environment variable that names the cache's directory; `off` turns the cache off.
@@ -91,6 +90,18 @@ pub fn load(engine: &Engine, bytes: &[u8]) -> Result<Module, String> {
     // which no tool can write (see the module's documentation), or sent by the tool host that
     // compiled or read them. Wasmtime refuses code from another version or configuration.
     unsafe { Module::deserialize(engine, bytes) }.map_err(|e| format!("{e:#}"))
+}
+
+/// A loaded build's module of `wasm` for `engine`, its code from the cache or kept there. A
+/// build's files are untrusted, so executable code is kept only in the host's private cache,
+/// never read from beside the build's WASM (a build may hold any files there). If the cache
+/// can't be used, compiling the WASM directly is safe and still lets the build run.
+pub(crate) fn module(engine: &Engine, wasm: &[u8]) -> crate::error::Result<Module> {
+    use crate::error::Error;
+    if let Ok(Some(cache)) = cache_dir().and_then(|dir| dir.map(Cache::open).transpose()) {
+        return cache.module(engine, wasm).map_err(Error::Program);
+    }
+    Module::new(engine, wasm).map_err(|e| Error::Program(format!("{e:#}")))
 }
 
 /// The cache of compiled code: its directory, opened once, and its path (which names it).
@@ -175,10 +186,9 @@ impl Cache {
     /// the name's place.
     pub fn put(&self, engine: &Engine, sha: &[u8; 32], bytes: &[u8]) {
         use rustix::fs::{Mode, OFlags};
-        static WRITES: AtomicU64 = AtomicU64::new(0);
         let name = Cache::name(engine, sha);
-        let n = WRITES.fetch_add(1, Ordering::Relaxed);
-        let tmp = format!("{name}.{}-{n}.tmp", std::process::id());
+        // Its name ends `.tmp`, which `remove_stale` looks for.
+        let tmp = format!("{}.tmp", crate::confined::temp_name(&name));
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let written =

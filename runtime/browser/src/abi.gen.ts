@@ -82,6 +82,9 @@ export const TEXTURE_FORMATS = [
   { name: "etc2-rgb8unorm", bytes: 8, block: 4, channels: 3, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-etc2", store: null, render: null, blend: null } },
   { name: "astc-4x4-unorm", bytes: 16, block: 4, channels: 4, depth: false, storable: false, filterable: true, renderable: false, blendable: false, uint: false, target_cost: 0, target_align: 0, needs: { filter: "texture-compression-astc", store: null, render: null, blend: null } },
 ] as const;
+/** A texture's kind, by its number in the stream (runtime/abi `TextureKind`): WebGPU's dimension
+ * name. */
+export const TEXTURE_KINDS = ["2d", "3d", "2d-array", "cube"] as const;
 /** WebGPU's default `maxColorAttachmentBytesPerSample` and `maxColorAttachments`. */
 export const MAX_COLOR_ATTACHMENT_BYTES = 32;
 export const MAX_COLOR_ATTACHMENTS = 4;
@@ -107,8 +110,6 @@ export const BLENDS = {
 } as const;
 /** `CreateTexture`'s format word with this bit set: kernels write the texture. */
 export const TEXTURE_WRITABLE = 65536;
-/** `BeginPass`'s colour load word with this bit set: the pass may join the one before it. */
-export const PASS_JOIN = 1;
 /** The most texels a side of a 3D texture. */
 export const MAX_TEXTURE_3D = 2048;
 /** A comparison sampler's test, by its number in the stream: WebGPU's name (0 is a sampler that
@@ -250,22 +251,22 @@ export const SCREEN_FORMAT = "rgba8unorm";
 /** What a pipeline binds at a binding, as the manifest names it. */
 export const BINDING_KINDS = ["read", "read_write", "texture", "depth_texture", "sampler", "comparison_sampler", "storage_texture", "texture_3d", "storage_texture_3d", "texture_2d_array", "texture_cube", "depth_texture_2d_array", "storage_texture_2d_array"] as const;
 /** What each binding kind is (runtime/abi `BindingKind`): a colour texture, which names its
- * format; a texture kernels write (a storage texture); a 3D texture; and the per-stage limit it
- * counts against. */
+ * format; a texture kernels write (a storage texture); a texture of depths; its view dimension;
+ * and the per-stage limit it counts against. */
 export const BINDING_KIND_TRAITS = [
-  { name: "read", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "storage buffers" },
-  { name: "read_write", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "storage buffers" },
-  { name: "texture", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "2d", limit: "sampled textures" },
-  { name: "depth_texture", has_format: false, is_storage: false, is_3d: false, is_depth: true, dimension: "2d", limit: "sampled textures" },
-  { name: "sampler", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "samplers" },
-  { name: "comparison_sampler", has_format: false, is_storage: false, is_3d: false, is_depth: false, dimension: null, limit: "samplers" },
-  { name: "storage_texture", has_format: true, is_storage: true, is_3d: false, is_depth: false, dimension: "2d", limit: "storage textures" },
-  { name: "texture_3d", has_format: true, is_storage: false, is_3d: true, is_depth: false, dimension: "3d", limit: "sampled textures" },
-  { name: "storage_texture_3d", has_format: true, is_storage: true, is_3d: true, is_depth: false, dimension: "3d", limit: "storage textures" },
-  { name: "texture_2d_array", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "2d-array", limit: "sampled textures" },
-  { name: "texture_cube", has_format: true, is_storage: false, is_3d: false, is_depth: false, dimension: "cube", limit: "sampled textures" },
-  { name: "depth_texture_2d_array", has_format: false, is_storage: false, is_3d: false, is_depth: true, dimension: "2d-array", limit: "sampled textures" },
-  { name: "storage_texture_2d_array", has_format: true, is_storage: true, is_3d: false, is_depth: false, dimension: "2d-array", limit: "storage textures" },
+  { name: "read", has_format: false, is_storage: false, is_depth: false, dimension: null, limit: "storage buffers" },
+  { name: "read_write", has_format: false, is_storage: false, is_depth: false, dimension: null, limit: "storage buffers" },
+  { name: "texture", has_format: true, is_storage: false, is_depth: false, dimension: "2d", limit: "sampled textures" },
+  { name: "depth_texture", has_format: false, is_storage: false, is_depth: true, dimension: "2d", limit: "sampled textures" },
+  { name: "sampler", has_format: false, is_storage: false, is_depth: false, dimension: null, limit: "samplers" },
+  { name: "comparison_sampler", has_format: false, is_storage: false, is_depth: false, dimension: null, limit: "samplers" },
+  { name: "storage_texture", has_format: true, is_storage: true, is_depth: false, dimension: "2d", limit: "storage textures" },
+  { name: "texture_3d", has_format: true, is_storage: false, is_depth: false, dimension: "3d", limit: "sampled textures" },
+  { name: "storage_texture_3d", has_format: true, is_storage: true, is_depth: false, dimension: "3d", limit: "storage textures" },
+  { name: "texture_2d_array", has_format: true, is_storage: false, is_depth: false, dimension: "2d-array", limit: "sampled textures" },
+  { name: "texture_cube", has_format: true, is_storage: false, is_depth: false, dimension: "cube", limit: "sampled textures" },
+  { name: "depth_texture_2d_array", has_format: false, is_storage: false, is_depth: true, dimension: "2d-array", limit: "sampled textures" },
+  { name: "storage_texture_2d_array", has_format: true, is_storage: true, is_depth: false, dimension: "2d-array", limit: "storage textures" },
 ] as const;
 /** WebGPU's default per-stage limits (runtime/abi `StageLimit`): what each counts, and the most a
  * shader stage may have. */

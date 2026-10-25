@@ -22,6 +22,9 @@ export interface Build {
 
 export type Fetch = (url: URL, init?: RequestInit) => Promise<Response>;
 
+/** The browser's own `fetch`, to the network. */
+export const networkFetch: Fetch = (url, init) => fetch(url, init);
+
 async function get(fetchFn: Fetch, url: URL): Promise<Response> {
   let response: Response;
   try {
@@ -47,7 +50,7 @@ async function getText(fetchFn: Fetch, url: URL): Promise<string> {
 }
 
 /** Loads a test's input script, with the native host's text and input rules. */
-export async function loadScript(url: URL, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Scripted[]> {
+export async function loadScript(url: URL, fetchFn: Fetch = networkFetch): Promise<Scripted[]> {
   return parseScript(await getText(fetchFn, url));
 }
 
@@ -83,13 +86,15 @@ export class Handed {
       if (handed === undefined || handed.taken) return fetchFn(url, init);
       handed.taken = true;
       const bytes = await handed.bytes;
+      // Taken once: the worker keeps no copy of its bytes.
+      this.#files.delete(url.href);
       return bytes === null ? fetchFn(url, init) : new Response(bytes);
     };
   }
 }
 
 /** Fetches and validates a build; its files resolve against `base`. */
-export async function loadBuild(base: string, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Build> {
+export async function loadBuild(base: string, fetchFn: Fetch = networkFetch): Promise<Build> {
   const manifest = parseManifest(await getText(fetchFn, new URL("manifest.json", base)));
   const [wasm, shaders] = await Promise.all([
     get(fetchFn, new URL(manifest.wasm, base)).then(async (r) => new Uint8Array(await r.arrayBuffer())),
@@ -100,7 +105,7 @@ export async function loadBuild(base: string, fetchFn: Fetch = (url, init) => fe
 
 /** An optimized build's trap locations, from beside its WASM (`game.lines` for `game.wasm`);
  * null if it has none or they don't arrive. */
-export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = (url, init) => fetch(url, init)): Promise<Lines | null> {
+export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch = networkFetch): Promise<Lines | null> {
   const name = manifest.wasm.replace(/\.wasm$/, "") + "." + LINES_SIDECAR;
   try {
     return Lines.decode(new Uint8Array(await (await get(fetchFn, new URL(name, base))).arrayBuffer()));
@@ -117,7 +122,7 @@ export async function loadLines(base: string, manifest: Manifest, fetchFn: Fetch
  */
 export function browserIo(
   base: string,
-  fetchFn: Fetch = (url, init) => fetch(url, init),
+  fetchFn: Fetch = networkFetch,
   files: string = base,
   hostRequest?: (service: string, body: Bytes) => Promise<Bytes>,
   storage: string | null = null,

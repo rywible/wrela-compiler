@@ -334,6 +334,12 @@ macro_rules! lang_items {
                 )
             }
 
+            /// Whether it's workgroup memory: what the invocations of a kernel's workgroup share
+            /// (§18.5).
+            pub fn is_workgroup_memory(self) -> bool {
+                matches!(self, Lang::Shared | Lang::SharedAtomics | Lang::SharedAtomicsI)
+            }
+
             /// Where each lang item lives in std.
             pub const PATHS: &'static [(Lang, &'static str)] = &[$( (Lang::$v, $path), )*];
 

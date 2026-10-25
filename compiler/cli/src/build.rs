@@ -97,7 +97,7 @@ pub fn run(args: &[String]) -> ExitCode {
 }
 
 /// The build's files with `game.wasm` optimized, and its trap locations beside it.
-fn optimized(
+pub(crate) fn optimized(
     files: &mut Vec<(String, Vec<u8>)>,
     level: wrela_driver::optimize::Level,
 ) -> Result<(), String> {

@@ -17,8 +17,9 @@
 //! The services' bytes are std's: each request's and answer's layout is in its std function's
 //! comment (`std::store`, `std::crypto`), and every number in them is a little-endian `u32`.
 
+use rusqlite::OptionalExtension;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 /// The longest key.
 pub const MAX_KEY: usize = 1024;
@@ -62,6 +63,11 @@ impl Services {
         Ok(Services { store: Mutex::new(db) })
     }
 
+    /// The store's connection, for one request or one transaction.
+    fn db(&self) -> Result<MutexGuard<'_, rusqlite::Connection>, String> {
+        self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())
+    }
+
     /// The answer to request `service` with `body`: its bytes, or why there are none.
     pub fn answer(&self, service: &str, body: &[u8]) -> Result<Vec<u8>, String> {
         match service {
@@ -79,28 +85,18 @@ impl Services {
         for b in batches {
             ops.extend(writes(b.as_ref())?);
         }
-        let mut db = self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())?;
+        let mut db = self.db()?;
         let tx = db.transaction().map_err(|e| e.to_string())?;
-        {
-            let mut put = None;
-            let mut delete = None;
-            for (key, value) in ops {
-                match value {
-                    Some(v) => put
-                        .get_or_insert_with(|| {
-                            tx.prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
-                        })
-                        .as_mut()
-                        .map_err(|e| e.to_string())?
-                        .execute((key, v)),
-                    None => delete
-                        .get_or_insert_with(|| tx.prepare("DELETE FROM kv WHERE key = ?1"))
-                        .as_mut()
-                        .map_err(|e| e.to_string())?
-                        .execute((key,)),
-                }
-                .map_err(|e| e.to_string())?;
+        for (key, value) in ops {
+            match value {
+                Some(v) => tx
+                    .prepare_cached("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)")
+                    .and_then(|mut put| put.execute((key, v))),
+                None => tx
+                    .prepare_cached("DELETE FROM kv WHERE key = ?1")
+                    .and_then(|mut delete| delete.execute((key,))),
             }
+            .map_err(|e| e.to_string())?;
         }
         tx.commit().map_err(|e| e.to_string())
     }
@@ -108,19 +104,17 @@ impl Services {
     /// `store/get`: the key → 1 then the value, or 0 if it has none.
     fn get(&self, body: &[u8]) -> Result<Vec<u8>, String> {
         let key = key(body)?;
-        let db = self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())?;
-        db.query_row("SELECT value FROM kv WHERE key = ?1", (key,), |row| {
-            let value = blob(row, 0)?;
-            let mut out = Vec::with_capacity(value.len() + 1);
-            out.push(1);
-            out.extend_from_slice(value);
-            Ok(out)
-        })
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(vec![0]),
-            e => Err(e),
-        })
-        .map_err(|e| e.to_string())
+        self.db()?
+            .query_row("SELECT value FROM kv WHERE key = ?1", (key,), |row| {
+                let value = blob(row, 0)?;
+                let mut out = Vec::with_capacity(value.len() + 1);
+                out.push(1);
+                out.extend_from_slice(value);
+                Ok(out)
+            })
+            .optional()
+            .map(|out| out.unwrap_or_else(|| vec![0]))
+            .map_err(|e| e.to_string())
     }
 
     /// `store/scan`: from (a key), to (a key; empty: no end), at most `limit` entries, and 1 to go
@@ -137,16 +131,18 @@ impl Services {
         if from.len() > MAX_KEY || to.len() > MAX_KEY {
             return Err(format!("a key is longer than {MAX_KEY} bytes"));
         }
-        let order = if down { "DESC" } else { "ASC" };
-        let sql = if to.is_empty() {
-            format!("SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key {order} LIMIT ?2")
-        } else {
-            format!(
-                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?3 ORDER BY key {order} LIMIT ?2"
-            )
+        let sql = match (to.is_empty(), down) {
+            (true, false) => "SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key ASC LIMIT ?2",
+            (true, true) => "SELECT key, value FROM kv WHERE key >= ?1 ORDER BY key DESC LIMIT ?2",
+            (false, false) => {
+                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?3 ORDER BY key ASC LIMIT ?2"
+            }
+            (false, true) => {
+                "SELECT key, value FROM kv WHERE key >= ?1 AND key < ?3 ORDER BY key DESC LIMIT ?2"
+            }
         };
-        let db = self.store.lock().map_err(|_| "the store's lock is poisoned".to_string())?;
-        let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
+        let db = self.db()?;
+        let mut stmt = db.prepare_cached(sql).map_err(|e| e.to_string())?;
         let mut rows =
             if to.is_empty() { stmt.query((from, limit)) } else { stmt.query((from, limit, to)) }
                 .map_err(|e| e.to_string())?;

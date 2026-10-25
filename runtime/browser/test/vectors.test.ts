@@ -7,11 +7,11 @@ import { StateHash } from "../src/hash.ts";
 import { Lines } from "../src/lines.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { parseScript } from "../src/input.ts";
-import { decode, joins, Sequencer, StreamError } from "../src/stream.ts";
+import { decode, joins, onePass, Sequencer, StreamError } from "../src/stream.ts";
 import { frameTime } from "../src/testmode.ts";
 import { carried, lockstepTicks } from "../src/ticker.ts";
 import { TickLogWriter, wasmHash } from "../src/ticks.ts";
-import { checker, type ErrorVector, shapes, vectors, passOf } from "./fixtures.ts";
+import { checker, type ErrorVector, shapes, vectors } from "./fixtures.ts";
 
 const bytes = (hex: string) => Uint8Array.from(hex.match(/../g) ?? [], (b) => Number.parseInt(b, 16));
 const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -166,7 +166,7 @@ test("rejected draws and passes leave checker state unchanged", () => {
   expect(() =>
     c.check({
       op: "BeginPass",
-      pass: passOf({ color: 3, keepColor: false, join: false, clear: [0, 0, 0, 0], depth: 99, keepDepth: false, clearDepth: 1 }),
+      pass: { ...onePass(3, false, [0, 0, 0, 0]), depth: 99 },
     }),
   ).toThrow("there's no texture 99");
   expect(() =>

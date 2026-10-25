@@ -179,7 +179,13 @@
     "id": "25-write-a-test",
     "task": "Write `fn fib(n: u32) -> u32`, the Fibonacci numbers (fib(0) = 0, fib(1) = 1), and a test `@test fn fib_is_right()` that asserts at least three of its values. Export `pub fn fib_export(n: u32) -> u32`, which returns `fib(n)`.",
     "grade": {
-      "tests": true
+      "tests": true,
+      "passing": [
+        "fib_is_right"
+      ],
+      "without": {
+        "W0011": "its test can't fail (W0011): it asserts nothing"
+      }
     }
   },
   {

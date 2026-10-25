@@ -6,11 +6,11 @@ import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
 import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError, trapMessage } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
-import { type Command, StreamError } from "../src/stream.ts";
+import { type Command, onePass, StreamError } from "../src/stream.ts";
 import { Lines, locate, wasmOffsets } from "../src/lines.ts";
 import { Net } from "../src/net.ts";
 import { Encoder } from "./encoder.ts";
-import { checker, Recorder, readFixture, readFixtureText, shapes, passOf } from "./fixtures.ts";
+import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, type Import, op, SUBMIT } from "./wasm-builder.ts";
 
 const U16 = new Uint8Array(16);
@@ -720,7 +720,7 @@ test("runs without the state hash unless asked", async () => {
 });
 
 test("a frame checks a screen depth target against its current size", async () => {
-  const pass = passOf({ color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 3, keepDepth: false, clearDepth: 1 });
+  const pass = { ...onePass(SCREEN, false, [0, 0, 0, 1]), depth: 3 };
   const batch = new Encoder().createTexture(3, 64, 63, "depth32float").beginPass(pass).present().finish();
   const p = await load(batchProgram([[batch]]));
   expect(() => p.frame(0, 64, 64)).toThrow("the pass's colour and depth targets differ in size");
@@ -1506,13 +1506,11 @@ describe("the checker in release and in test mode", () => {
 });
 
 test("several uploads in one call each reach their buffer, though the program overwrites its command memory before returning", async () => {
-  const { FakeDevice, fakeTexture } = await import("./fake-gpu.ts");
-  const { buildPipelines, GpuExecutor } = await import("../src/gpu.ts");
-  const { SCREEN_FORMAT } = await import("../src/abi.gen.ts");
+  const { buildAll, FakeDevice, SCREEN_TARGET } = await import("./fake-gpu.ts");
+  const { GpuExecutor } = await import("../src/gpu.ts");
   const device = new FakeDevice();
-  const m = shapes();
-  const pipelines = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => "// fine\n"), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, pipelines, { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const pipelines = await buildAll(device, shapes());
+  const executor = new GpuExecutor(device.gpu, pipelines, SCREEN_TARGET);
   // Two small writes and a big one between them.
   const want = [
     Uint8Array.from({ length: 8 }, (_, i) => i + 1),

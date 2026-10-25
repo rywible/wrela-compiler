@@ -514,13 +514,13 @@ pub fn create_passkey(
     var w = Writer::new()
     w.write_str(rp_id)
     w.write_str(rp_name)
-    write_bytes(mut w, user.id)
+    w.write_counted(user.id)
     w.write_str(user.name.as_str())
     w.write_str(user.display_name.as_str())
-    write_bytes(mut w, challenge)
+    w.write_counted(challenge)
     w.write_u32(exclude.len())
     for id in exclude {
-        write_bytes(mut w, id)
+        w.write_counted(id)
     }
     w.write_u32(timeout_ms)
     request("passkey/create", take w.into_bytes())
@@ -538,9 +538,9 @@ pub struct NewPasskey: Clone {
 /// Reads a `create_passkey` answer.
 pub fn read_new_passkey(bytes: [u8]) -> Option<NewPasskey> {
     var r = Reader::new(Vec::from(bytes))
-    let id = read_bytes(mut r)?
-    let client_data = read_bytes(mut r)?
-    let attestation = read_bytes(mut r)?
+    let id = r.read_counted().ok()?
+    let client_data = r.read_counted().ok()?
+    let attestation = r.read_counted().ok()?
     if !r.at_end() {
         return None
     }
@@ -554,10 +554,10 @@ pub fn read_new_passkey(bytes: [u8]) -> Option<NewPasskey> {
 pub fn use_passkey(rp_id: str, challenge: [u8], allow: [Vec<u8>], timeout_ms: u32) -> Pending<u8> {
     var w = Writer::new()
     w.write_str(rp_id)
-    write_bytes(mut w, challenge)
+    w.write_counted(challenge)
     w.write_u32(allow.len())
     for id in allow {
-        write_bytes(mut w, id)
+        w.write_counted(id)
     }
     w.write_u32(timeout_ms)
     request("passkey/get", take w.into_bytes())
@@ -577,36 +577,15 @@ pub struct PasskeyUse: Clone {
 /// Reads a `use_passkey` answer.
 pub fn read_passkey_use(bytes: [u8]) -> Option<PasskeyUse> {
     var r = Reader::new(Vec::from(bytes))
-    let id = read_bytes(mut r)?
-    let client_data = read_bytes(mut r)?
-    let authenticator_data = read_bytes(mut r)?
-    let signature = read_bytes(mut r)?
-    let user = read_bytes(mut r)?
+    let id = r.read_counted().ok()?
+    let client_data = r.read_counted().ok()?
+    let authenticator_data = r.read_counted().ok()?
+    let signature = r.read_counted().ok()?
+    let user = r.read_counted().ok()?
     if !r.at_end() {
         return None
     }
     Some(PasskeyUse { id, client_data, authenticator_data, signature, user })
-}
-
-/// Bytes as a service takes them: their length, then them.
-fn write_bytes(w: mut Writer, bytes: [u8]) {
-    w.write_u32(bytes.len())
-    for b in bytes {
-        w.write_u8(b)
-    }
-}
-
-/// Bytes as `write_bytes` wrote them, or none if the answer ends early.
-fn read_bytes(r: mut Reader) -> Option<Vec<u8>> {
-    let n = r.read_u32().ok()?
-    if r.left() < n {
-        return None
-    }
-    var out: Vec<u8> = Vec::with_capacity(n)
-    for _ in 0..n {
-        out.push(r.read_u8().ok()?)
-    }
-    Some(out)
 }
 
 @test

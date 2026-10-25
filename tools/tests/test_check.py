@@ -92,11 +92,12 @@ class Selection(unittest.TestCase):
             check.step('tools', Path('wrela'), Path('logs'))
         self.assertEqual(run.call_args.args[0], [sys.executable, 'tools/runner.py', '--tools-tests'])
         self.assertEqual(run.call_args.kwargs['cwd'], check.ROOT)
+        self.assertEqual(run.call_args.kwargs['env']['WRELA_BIN'], 'wrela')
 
     def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
         original = Path.cwd()
         try:
-            for arguments in ([], ['wrela::compiler/std::alpha']):
+            for arguments in ([], ['wrela::compiler/std::alpha'], ['tools']):
                 with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary).resolve()
                     target = root / 'target'

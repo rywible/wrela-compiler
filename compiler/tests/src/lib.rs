@@ -16,7 +16,7 @@ use wrela_host::{CpuHost, GpuTiming, Host, TickLog, Timing, Value, map_read};
 
 /// SplitMix64, for tests' random inputs.
 pub use wrela_grammar::rng::Rng;
-pub use wrela_grammar::testing::{files_under, par_each, par_map, repo_root};
+pub use wrela_grammar::testing::{files_under, par_each, par_map, par_map_with, repo_root};
 
 /// Where this process writes its test files. The gate gives each isolated test an absolute
 /// `WRELA_TEST_TMPDIR`, so processes never remove or overwrite each other's builds. Outside
@@ -173,6 +173,16 @@ pub fn apply_fixes(text: &str, file: FileId, diags: &[Diagnostic]) -> String {
     edits.sort_by_key(|e| (e.span.start, e.span.end));
     edits.dedup_by(|a, b| a.span == b.span && a.replacement == b.replacement);
     wrela_diag::apply_edits(text, edits)
+}
+
+/// The errors among `diags` whose only next step is the general one (`wrela explain`), each as
+/// `code: message`: an error must say what to do about it (`Diagnostic::with_next_step`).
+pub fn without_own_help<'a>(diags: impl IntoIterator<Item = &'a Diagnostic>) -> Vec<String> {
+    diags
+        .into_iter()
+        .filter(|d| d.is_error() && d.has_only_general_help())
+        .map(|d| format!("{}: {}", d.code.as_str(), d.message))
+        .collect()
 }
 
 /// A loaded program whose exports a test calls: a [`CpuHost`] or a [`Host`].

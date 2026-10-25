@@ -210,11 +210,11 @@ fn colour_format(b: &ResourceBinding) -> TextureFormat {
 
 /// A texture binding's view dimension.
 fn view_dimension(kind: BindingKind) -> wgpu::TextureViewDimension {
-    match kind.dimension() {
-        Some("3d") => wgpu::TextureViewDimension::D3,
-        Some("2d-array") => wgpu::TextureViewDimension::D2Array,
-        Some("cube") => wgpu::TextureViewDimension::Cube,
-        _ => wgpu::TextureViewDimension::D2,
+    match kind.view_kind() {
+        Some(TextureKind::D3) => wgpu::TextureViewDimension::D3,
+        Some(TextureKind::Array) => wgpu::TextureViewDimension::D2Array,
+        Some(TextureKind::Cube) => wgpu::TextureViewDimension::Cube,
+        Some(TextureKind::D2) | None => wgpu::TextureViewDimension::D2,
     }
 }
 
@@ -245,7 +245,7 @@ fn wgpu_blend(b: Blend) -> Option<wgpu::BlendState> {
 }
 
 /// The wgpu feature of a WebGPU feature's name, for those the hosts request.
-pub(crate) fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
+fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
     Some(match name {
         "shader-f16" => wgpu::Features::SHADER_F16,
         "subgroups" => wgpu::Features::SUBGROUP,
@@ -264,28 +264,22 @@ pub(crate) fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
     })
 }
 
-/// Every optional feature the native host requests where the adapter has it.
-fn optional_features() -> wgpu::Features {
-    wrela_abi::FEATURES
-        .iter()
-        .filter_map(|f| wgpu_feature(f))
-        .fold(wgpu::Features::empty(), |a, b| a | b)
+/// Whether a device with these features has the WebGPU feature `name`.
+fn device_has(features: wgpu::Features, name: &str) -> bool {
+    wgpu_feature(name).is_some_and(|w| features.contains(w))
 }
 
 /// The feature bits a program sees (`wrela_abi::Limits::features`) of a device with these
-/// features, less any `masked` (test mode's mask: a program's fallback paths, measured).
-pub(crate) fn feature_bits(features: wgpu::Features, keep: Option<&[String]>) -> u32 {
+/// features: the required ones, and the rest only where `kept` (test mode's mask: a program's
+/// fallback paths, measured).
+fn feature_bits(features: wgpu::Features, kept: impl Fn(&str) -> bool) -> u32 {
     wrela_abi::FEATURES
         .iter()
-        .filter(|name| match wgpu_feature(name) {
-            Some(f) if f.is_empty() => true,
-            Some(f) => features.contains(f),
-            None => false,
+        .filter(|name| device_has(features, name))
+        .filter_map(|name| {
+            let bit = wrela_abi::feature_bit(name)?;
+            (bit & wrela_abi::REQUIRED_FEATURES != 0 || kept(name)).then_some(bit)
         })
-        .filter(|name| {
-            **name == "indirect-first-instance" || keep.is_none_or(|k| k.iter().any(|x| x == *name))
-        })
-        .filter_map(|name| wrela_abi::feature_bit(name))
         .fold(0, |a, b| a | b)
 }
 
@@ -336,21 +330,21 @@ impl Texture {
         dimension: wgpu::TextureViewDimension,
         storage: bool,
     ) -> wgpu::TextureView {
-        let key = (view, dimension, storage);
-        if let Some(v) = self.views.borrow().get(&key) {
-            return v.clone();
-        }
-        let level = view.level.or(storage.then_some(0));
-        let made = self.texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(dimension),
-            base_mip_level: level.unwrap_or(0),
-            mip_level_count: level.map(|_| 1),
-            base_array_layer: view.layer.unwrap_or(0),
-            array_layer_count: view.layer.map(|_| 1),
-            ..Default::default()
-        });
-        self.views.borrow_mut().insert(key, made.clone());
-        made
+        self.views
+            .borrow_mut()
+            .entry((view, dimension, storage))
+            .or_insert_with(|| {
+                let level = view.level.or(storage.then_some(0));
+                self.texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(dimension),
+                    base_mip_level: level.unwrap_or(0),
+                    mip_level_count: level.map(|_| 1),
+                    base_array_layer: view.layer.unwrap_or(0),
+                    array_layer_count: view.layer.map(|_| 1),
+                    ..Default::default()
+                })
+            })
+            .clone()
     }
 
     /// The 2D view of one level and layer: a pass's target.
@@ -456,6 +450,8 @@ struct OpenPass {
     label: Option<Arc<str>>,
     /// Built only when another pass asks to join; extended with each compatible join.
     uses: Option<HashMap<u32, bool>>,
+    /// Whether its draws set a scissor or a viewport.
+    rect_set: bool,
 }
 
 struct Screen {
@@ -627,13 +623,12 @@ pub(crate) struct Gpu {
     screen: Option<Screen>,
     /// Reused between buffer reads: mapping is finished before the next copy uses it.
     buffer_readback: Option<wgpu::Buffer>,
-    /// Reused between screen captures: mapping is finished before the next copy uses it.
-    screen_readback: Option<wgpu::Buffer>,
+    /// Reused between captures of the screen and of passes' targets: mapping is finished before
+    /// the next copy uses it.
+    image_readback: Option<wgpu::Buffer>,
     /// Each label's pass's target, the last pass of that label that drew into a texture: its
     /// colour, else its depth ([`Gpu::read_target`], a test's golden of a pass).
-    labelled: HashMap<String, u32>,
-    /// Whether the device has timestamp queries, so a program may ask for its work's time.
-    can_time: bool,
+    labelled: HashMap<Arc<str>, u32>,
     /// The program's asks for a label's time (`std::gpu::timed`): each request, its label and
     /// the call it was asked in.
     asked: Vec<(u32, String, usize)>,
@@ -647,8 +642,9 @@ pub(crate) struct Gpu {
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
     /// `debug_flag`), read after each frame.
     debug_flag: Option<DebugFlag>,
-    /// The optional features the program sees ([`feature_bits`]).
-    feature_bits: u32,
+    /// The limits the program sees (`wrela.limit`), with its optional features
+    /// ([`feature_bits`]) and, with subgroups, their sizes.
+    program_limits: wrela_abi::Limits,
 }
 
 /// The flag a debug build's bounds checks set, and the buffer it's read back through, made
@@ -751,17 +747,13 @@ impl Gpu {
                 v.split(',').map(|f| f.trim().to_string()).collect()
             }
         });
-        let optional = match &keep {
-            None => optional_features(),
-            Some(kept) => wrela_abi::FEATURES
-                .iter()
-                .filter(|f| **f == "timestamp-query" || kept.iter().any(|k| k == *f))
-                .filter_map(|f| wgpu_feature(f))
-                .fold(wgpu::Features::empty(), |a, b| a | b),
-        };
+        let kept = |name: &str| keep.as_ref().is_none_or(|k| k.iter().any(|x| x == name));
+        let optional = wrela_abi::FEATURES
+            .iter()
+            .filter(|f| **f == "timestamp-query" || kept(f))
+            .filter_map(|f| wgpu_feature(f))
+            .fold(wgpu::Features::empty(), |a, b| a | b);
         let (device, queue) = open_device_with("wrela-host", features, optional)?;
-        let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let feature_bits = feature_bits(device.features(), keep.as_deref());
 
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -774,6 +766,13 @@ impl Gpu {
         });
 
         let limits = device.limits();
+        let mut program_limits = limits_of(&limits);
+        program_limits.features = feature_bits(device.features(), kept);
+        if program_limits.has("subgroups") {
+            let info = device.adapter_info();
+            program_limits.subgroup_min_size = info.subgroup_min_size;
+            program_limits.subgroup_max_size = info.subgroup_max_size;
+        }
         let align = u64::from(
             limits
                 .min_uniform_buffer_offset_alignment
@@ -806,9 +805,8 @@ impl Gpu {
             ended: None,
             screen: None,
             buffer_readback: None,
-            screen_readback: None,
+            image_readback: None,
             labelled: HashMap::new(),
-            can_time: device_times,
             asked: Vec::new(),
             calls: 0,
             timer,
@@ -816,7 +814,7 @@ impl Gpu {
             errors,
             frame: 0,
             debug_flag: None,
-            feature_bits,
+            program_limits,
         };
         gpu.take_pipelines(manifest, shaders)?;
         Ok(gpu)
@@ -833,7 +831,7 @@ impl Gpu {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 }),
-                readback: self.readback_buffer(4),
+                readback: readback_buffer(&self.device, 4),
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
@@ -1120,8 +1118,7 @@ impl Builder {
         // A shader that needs a feature this device hasn't isn't built: the checker refuses a
         // command that records it, naming the feature.
         let features = self.device.features();
-        let unavailable =
-            p.requires.iter().any(|f| wgpu_feature(f).is_none_or(|w| !features.contains(w)));
+        let unavailable = p.requires.iter().any(|f| !device_has(features, f));
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&p.name),
@@ -1177,20 +1174,15 @@ impl Builder {
                     for t in targets {
                         // A target the device can't draw into (rg11b10ufloat without its feature)
                         // is one the checker refuses a pass of.
-                        if t.colors().any(|c| {
-                            !c.info()
-                                .renderable
-                                .on(|f| wgpu_feature(f).is_some_and(|w| features.contains(w)))
-                        }) {
+                        if t.colors().any(|c| !c.info().renderable.on(|f| device_has(features, f)))
+                        {
                             continue;
                         }
                         // Nor one it can't blend into as the pipeline blends (a 32-bit float
                         // target without float32-blendable): the checker refuses such a draw.
                         if t.colors().enumerate().any(|(k, c)| {
                             blends.get(k).is_some_and(|&b| b != Blend::Replace)
-                                && !c.info().blendable.on(|f: &str| {
-                                    wgpu_feature(f).is_some_and(|w| features.contains(w))
-                                })
+                                && !c.info().blendable.on(|f| device_has(features, f))
                         }) {
                             continue;
                         }
@@ -1301,7 +1293,7 @@ impl Gpu {
             None => (pass.depth, 0),
         };
         let t = &self.texture(handle).texture;
-        ((t.width() >> level).max(1), (t.height() >> level).max(1))
+        stream::level_size(t.width(), t.height(), level)
     }
 
     fn texture(&self, handle: u32) -> &Texture {
@@ -1317,8 +1309,22 @@ impl Gpu {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
-        // Texture bindings' views, made first: an entry borrows its view.
-        let mut views = Vec::new();
+        // Each binding's resource, with a texture's view made first: an entry borrows its view.
+        let resources: Vec<(&Resource, Option<wgpu::TextureView>)> = bindings
+            .iter()
+            .zip(&p.bindings)
+            .map(|(b, slot)| {
+                let resource = &self.resources[&b.handle];
+                let view = match resource {
+                    Resource::Texture(t) => {
+                        let view = View::of_words(b.offset, b.size);
+                        Some(t.view(view, view_dimension(slot.kind), slot.kind.is_storage()))
+                    }
+                    _ => None,
+                };
+                (resource, view)
+            })
+            .collect();
         let mut entries = Vec::with_capacity(
             bindings.len() + usize::from(p.uniform.is_some()) + usize::from(p.debug_flag.is_some()),
         );
@@ -1332,29 +1338,20 @@ impl Gpu {
                 }),
             });
         }
-        for (b, slot) in bindings.iter().zip(&p.bindings) {
-            let resource = match &self.resources[&b.handle] {
-                Resource::Buffer(buffer) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer,
-                    offset: u64::from(b.offset),
-                    size: NonZeroU64::new(u64::from(b.size)),
-                }),
-                Resource::Texture(t) => {
-                    let view = View::of_words(b.offset, b.size);
-                    views.push(t.view(view, view_dimension(slot.kind), slot.kind.is_storage()));
-                    continue;
+        for ((b, slot), (resource, view)) in bindings.iter().zip(&p.bindings).zip(&resources) {
+            let resource = match (resource, view) {
+                (_, Some(view)) => wgpu::BindingResource::TextureView(view),
+                (Resource::Buffer(buffer), None) => {
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: u64::from(b.offset),
+                        size: NonZeroU64::new(u64::from(b.size)),
+                    })
                 }
-                Resource::Sampler(s) => wgpu::BindingResource::Sampler(s),
+                (Resource::Sampler(s), None) => wgpu::BindingResource::Sampler(s),
+                (Resource::Texture(_), None) => unreachable!("a texture's view is made above"),
             };
             entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
-        }
-        let mut view_at = views.iter();
-        for (b, slot) in bindings.iter().zip(&p.bindings) {
-            if matches!(self.resources[&b.handle], Resource::Texture(_)) {
-                let view = view_at.next().expect("a view for each texture binding");
-                let resource = wgpu::BindingResource::TextureView(view);
-                entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
-            }
         }
         if let (Some(binding), Some(flag)) = (p.debug_flag, &self.debug_flag) {
             let resource = flag.buffer.as_entire_binding();
@@ -1506,9 +1503,8 @@ impl Gpu {
         let [width, height, depth] = size;
         let three = kind == TextureKind::D3;
         let features = self.device.features();
-        let has = |f: &str| wgpu_feature(f).is_some_and(|w| features.contains(w));
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
-        if !three && format.info().renderable.on(has) {
+        if !three && format.info().renderable.on(|f| device_has(features, f)) {
             usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
         }
         if !format.is_depth() {
@@ -1623,24 +1619,16 @@ impl Gpu {
             return Ok(());
         }
         let format = self.texture(handle).format;
-        let block = format.block();
-        let row = u64::from(size[0].div_ceil(block)) * u64::from(format.bytes_per_texel());
-        let rows = size[1].div_ceil(block);
+        let row = format.bytes_of(size[0], 1);
+        let rows = size[1].div_ceil(format.block());
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let bytes = padded * u64::from(rows);
         let extent = whole_blocks(format, size[0], size[1]);
-        let at_texel = wgpu::Origin3d { x: origin[0], y: origin[1], z: layer };
-        fn image(
-            t: &wgpu::Texture,
-            origin: wgpu::Origin3d,
-            level: u32,
-        ) -> wgpu::TexelCopyTextureInfo<'_> {
-            wgpu::TexelCopyTextureInfo { origin, mip_level: level, ..t.as_image_copy() }
-        }
+        let [x, y] = origin;
         if bytes > u64::from(stream::UPLOAD_MAX) {
             self.flush()?;
             self.queue.write_texture(
-                image(&self.texture(handle).texture, at_texel, level),
+                self.image_copy(handle, level, layer, x, y),
                 data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
@@ -1666,7 +1654,6 @@ impl Gpu {
             }
         }
         let mut encoder = self.take_encoder();
-        let texture = &self.texture(handle).texture;
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.upload.buffer,
@@ -1676,7 +1663,7 @@ impl Gpu {
                     rows_per_image: Some(rows),
                 },
             },
-            image(texture, at_texel, level),
+            self.image_copy(handle, level, layer, x, y),
             extent,
         );
         self.encoder = Some(encoder);
@@ -1722,8 +1709,9 @@ impl Gpu {
         to_buffer: bool,
     ) {
         let mut encoder = self.take_encoder();
-        let extent = whole_blocks(self.texture(r.texture).format, r.width, r.height);
-        let rows = r.height.div_ceil(self.texture(r.texture).format.block());
+        let format = self.texture(r.texture).format;
+        let extent = whole_blocks(format, r.width, r.height);
+        let rows = r.height.div_ceil(format.block());
         let rows = wgpu::TexelCopyBufferInfo {
             buffer: self.buffer(buffer),
             layout: wgpu::TexelCopyBufferLayout {
@@ -1768,16 +1756,8 @@ impl Gpu {
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
-        let timed = self
-            .timer
-            .as_ref()
-            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
-        let timestamps = if timed {
-            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
-        } else {
-            None
-        };
+        let timestamps =
+            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1823,7 +1803,7 @@ impl Gpu {
     /// Opens `pass`, named by the label in force.
     fn begin_pass(&mut self, pass: Pass) {
         let label = self.label.clone();
-        self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None });
+        self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None, rect_set: false });
     }
 
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
@@ -1833,7 +1813,9 @@ impl Gpu {
     }
 
     fn pass_item(&mut self, item: PassItem) {
-        self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(item);
+        let open = self.pass.as_mut().expect("the sequencer checked a pass is open");
+        open.rect_set |= matches!(item, PassItem::Scissor(_) | PassItem::Viewport(_));
+        open.draws.push(item);
     }
 
     /// Joining keeps WebGPU's resource usage scope too. Two individually valid passes may
@@ -1914,11 +1896,7 @@ impl Gpu {
                 if self.can_join(&mut ended, &open) {
                     // A pass begins with the whole target its scissor and viewport: where the
                     // one it joins set either, the joined draws start from the whole target.
-                    if ended
-                        .draws
-                        .iter()
-                        .any(|d| matches!(d, PassItem::Scissor(_) | PassItem::Viewport(_)))
-                    {
+                    if ended.rect_set {
                         let (w, h) = self.pass_size(&ended.pass);
                         ended.draws.push(PassItem::Scissor([0, 0, w, h]));
                         ended
@@ -1926,6 +1904,7 @@ impl Gpu {
                             .push(PassItem::Viewport([0.0, 0.0, w as f32, h as f32, 0.0, 1.0]));
                     }
                     ended.draws.append(&mut open.draws);
+                    ended.rect_set |= open.rect_set;
                     self.ended = Some(ended);
                     return Ok(());
                 }
@@ -1990,18 +1969,10 @@ impl Gpu {
             (None, depth) => Some(depth),
         };
         if let (Some(name), Some(target)) = (&open.label, target) {
-            self.labelled.insert(name.to_string(), target);
+            self.labelled.insert(name.clone(), target);
         }
-        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
-        let timed = self
-            .timer
-            .as_ref()
-            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
-        let timestamps = if timed {
-            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
-        } else {
-            None
-        };
+        let timestamps =
+            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
             if let PassItem::Draw(d) = d {
@@ -2152,22 +2123,14 @@ impl Gpu {
         let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
             return Err(Error::Gpu(format!("there's no buffer {handle}")));
         };
-        let size_bytes = u64::from(size.max(4));
-        let staging = match &self.buffer_readback {
-            Some(buffer) if buffer.size() >= size_bytes => buffer.clone(),
-            _ => {
-                let buffer = self.readback_buffer(size_bytes);
-                self.buffer_readback = Some(buffer.clone());
-                buffer
-            }
-        };
+        let staging = staging(&self.device, &mut self.buffer_readback, u64::from(size.max(4)));
         let bytes = self.copy_back(buffer, u64::from(offset), u64::from(size), &staging)?;
         self.check_errors()?;
         Ok(bytes)
     }
 
     /// Copies `source`'s bytes `offset..offset + size` to the CPU through `staging`, a
-    /// readback buffer at least `size` bytes long (waits for the GPU).
+    /// readback buffer at least `size` bytes long, and at least 4 (waits for the GPU).
     fn copy_back(
         &self,
         source: &wgpu::Buffer,
@@ -2179,7 +2142,9 @@ impl Gpu {
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_buffer_to_buffer(source, offset, staging, 0, size);
         self.queue.submit([encoder.finish()]);
-        map_read_with(&self.device, staging, |bytes| bytes[..size as usize].to_vec())
+        // A mapped range is whole words, and at least one.
+        let mapped = align_to(size, wgpu::COPY_BUFFER_ALIGNMENT).clamp(4, staging.size());
+        map_read_with(&self.device, staging, mapped, |bytes| bytes[..size as usize].to_vec())
     }
 
     /// The handles of the buffers that exist, oldest first: for tests.
@@ -2238,14 +2203,7 @@ impl Gpu {
         let row = u64::from(width) * 4;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let size = padded * u64::from(height);
-        let staging = match &self.screen_readback {
-            Some(buffer) if buffer.size() >= size => buffer.clone(),
-            _ => {
-                let buffer = self.readback_buffer(size);
-                self.screen_readback = Some(buffer.clone());
-                buffer
-            }
-        };
+        let staging = staging(&self.device, &mut self.image_readback, size);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
@@ -2266,8 +2224,7 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let frame = map_read_with(&self.device, &staging, |bytes| {
-            let bytes = &bytes[..size as usize];
+        let frame = map_read_with(&self.device, &staging, size, |bytes| {
             if padded == row {
                 return bytes.to_vec();
             }
@@ -2307,7 +2264,8 @@ impl Gpu {
         let texel = u64::from(format.bytes_per_texel());
         let row = u64::from(width) * texel;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let staging = self.readback_buffer(padded * u64::from(height));
+        let size = padded * u64::from(height);
+        let staging = staging(&self.device, &mut self.image_readback, size);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let aspect = if format == TextureFormat::Depth32Float {
@@ -2333,7 +2291,7 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let rgba = map_read_with(&self.device, &staging, |bytes| {
+        let rgba = map_read_with(&self.device, &staging, size, |bytes| {
             let mut out = Vec::with_capacity(width as usize * height as usize * 4);
             for y in 0..height as usize {
                 let at = y * padded as usize;
@@ -2366,14 +2324,22 @@ impl Gpu {
              call before it); WGSL then reads or writes an element in range, or a zero"
         )))
     }
+}
 
-    fn readback_buffer(&self, size: u64) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+fn readback_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The readback buffer kept in `slot` if it holds `size` bytes, else a new one that replaces it.
+fn staging(device: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, size: u64) -> wgpu::Buffer {
+    match slot {
+        Some(buffer) if buffer.size() >= size => buffer.clone(),
+        _ => slot.insert(readback_buffer(device, size)).clone(),
     }
 }
 
@@ -2388,9 +2354,8 @@ impl Executor for Gpu {
                 // A label names the passes after it, the next of which may yet continue this one.
                 Command::Label { .. } => {}
                 Command::BeginPass(next) if next.joins(&ended.pass) => {}
-                Command::SetScissor { .. } | Command::SetViewport { .. } | Command::EndPass
-                    if self.pass.is_some() => {}
-                c if c.opcode().is_draw() && self.pass.is_some() => {}
+                Command::EndPass if self.pass.is_some() => {}
+                c if c.opcode().in_pass() && self.pass.is_some() => {}
                 _ => self.record_ended()?,
             }
         }
@@ -2577,7 +2542,7 @@ impl Executor for Gpu {
     /// timed from its start), so a frame that times nothing doesn't wait for its timestamps.
     fn ask_time(&mut self, request: u32, label: &str) -> std::result::Result<(), String> {
         if self.timer.is_none() {
-            if !self.can_time {
+            if !self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
                 return Err("this GPU can't time its work: it has no timestamp queries".into());
             }
             self.timer = Some(Timer::new(&self.device, false, false));
@@ -2604,14 +2569,7 @@ impl Executor for Gpu {
     }
 
     fn limits(&self) -> wrela_abi::Limits {
-        let mut l = limits_of(&self.limits);
-        l.features = self.feature_bits;
-        if l.has("subgroups") {
-            let info = self.device.adapter_info();
-            l.subgroup_min_size = info.subgroup_min_size;
-            l.subgroup_max_size = info.subgroup_max_size;
-        }
-        l
+        self.program_limits
     }
 
     /// Finishes the old build's work, forgets its resources, and takes the new build's
@@ -2699,14 +2657,16 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
 
 /// Maps a `MAP_READ` buffer and copies it out, waiting for the GPU.
 pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
-    map_read_with(device, buffer, <[u8]>::to_vec)
+    map_read_with(device, buffer, buffer.size(), <[u8]>::to_vec)
 }
 
-/// Converts mapped bytes before unmapping, so callers can copy just the pixels or words they
-/// need without first copying the whole mapped range to a temporary byte vector.
+/// Maps a `MAP_READ` buffer's first `len` bytes (whole words) and converts them before
+/// unmapping, so callers can copy just the pixels or words they need without first copying the
+/// mapped range to a temporary byte vector, nor mapping more of a reused buffer than they read.
 fn map_read_with<T>(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,
+    len: u64,
     read: impl FnOnce(&[u8]) -> T,
 ) -> Result<T> {
     struct UnmapOnExit<'a>(&'a wgpu::Buffer);
@@ -2716,7 +2676,7 @@ fn map_read_with<T>(
         }
     }
 
-    let slice = buffer.slice(..);
+    let slice = buffer.slice(..len);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -2752,11 +2712,21 @@ impl Timer {
         }
     }
 
-    /// Notes a pass about to be timed; returns the first of its two query indices.
-    /// [`Gpu::reserve_timestamps`] must have made room.
-    fn next(&mut self, frame: usize, call: usize, label: &str) -> u32 {
+    /// Notes a pass or dispatch about to be timed, if it is, and returns the first of its two
+    /// query indices: a timed run times every one; a program's asks (`asked`, `ask_time`) only
+    /// their labels'. [`Gpu::reserve_timestamps`] must have made room.
+    fn next_if(
+        &mut self,
+        asked: &[(u32, String, usize)],
+        frame: usize,
+        call: usize,
+        label: &str,
+    ) -> Option<u32> {
+        if !self.keep && !asked.iter().any(|(_, l, _)| l == label) {
+            return None;
+        }
         self.pending.push(Timed { frame, call, label: label.to_string() });
-        (self.pending.len() as u32 - 1) * 2
+        Some((self.pending.len() as u32 - 1) * 2)
     }
 
     /// Reads back the timestamps of the submissions made since the last call. The span mode
@@ -2871,11 +2841,8 @@ fn resolve(
     encoder.resolve_query_set(queries, 0..n, resolved, 0);
     encoder.copy_buffer_to_buffer(resolved, 0, readback, 0, size);
     queue.submit([encoder.finish()]);
-    map_read_with(device, readback, |bytes| {
-        bytes[..size as usize]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
-            .collect()
+    map_read_with(device, readback, size, |bytes| {
+        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
     })
 }
 
@@ -3080,7 +3047,7 @@ mod tests {
         format: TextureFormat,
     ) -> wgpu::Buffer {
         let row = align_to(width * format.bytes_per_texel(), wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = gpu.readback_buffer(u64::from(row) * u64::from(height));
+        let buffer = readback_buffer(&gpu.device, u64::from(row) * u64::from(height));
         let mut encoder = gpu.take_encoder();
         encoder.copy_texture_to_buffer(
             gpu.texture(handle).texture.as_image_copy(),

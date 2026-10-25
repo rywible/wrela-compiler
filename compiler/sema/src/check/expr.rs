@@ -2760,22 +2760,7 @@ impl<'p> Checker<'p> {
                 Some((ps.clone(), *r, *flags))
             }
             Some(TyKind::FnPtr(ps, _, _)) => {
-                self.err(
-                    Diagnostic::new(
-                        codes::E0301,
-                        span,
-                        format!(
-                            "this closure takes {} parameters, but {} are expected",
-                            params.len(),
-                            ps.len()
-                        ),
-                    )
-                    .with_help(format!(
-                        "write {} parameters, as in `|{}| ...`",
-                        ps.len(),
-                        (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
-                    )),
-                );
+                self.err(closure_arity(span, params.len(), ps.len()));
                 None
             }
             // Expected where a type failed (its error is reported): the closure's unannotated
@@ -2848,6 +2833,19 @@ impl<'p> Checker<'p> {
             None => Vec::new(),
         }
     }
+}
+
+/// E0301: a closure with `have` parameters where a function type of `want` is expected.
+pub(super) fn closure_arity(span: Span, have: usize, want: usize) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0301,
+        span,
+        format!("this closure takes {have} parameters, but {want} are expected"),
+    )
+    .with_help(format!(
+        "write {want} parameters, as in `|{}| ...`",
+        (0..want).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// A value of variant `v` of the enum `adt`, with `fields` in declared order.

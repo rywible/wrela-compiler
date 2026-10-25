@@ -204,14 +204,17 @@ def step(name, wrela, logs, out=None):
         "doc": ["cargo", "test", "-q", "--release", "--workspace", "--doc"],
         "wgsl": [sys.executable, "tools/wgsl_budgets.py", str(wrela)],
     }
+    # The tools' tests grade the agent test's references with the compiler at `WRELA_BIN`.
     if name == "tools":
         # In a process of its own: the tools' tests patch modules, the environment and the
         # working directory.
-        call([sys.executable, "tools/runner.py", "--tools-tests"], cwd=ROOT, **into(out))
+        call([sys.executable, "tools/runner.py", "--tools-tests"], cwd=ROOT,
+             env={**os.environ, "WRELA_BIN": str(wrela)}, **into(out))
     elif name.startswith("tools::"):
         selected = name[len("tools::"):]
         if selected not in tools_ids():
             raise ValueError(f"unknown tools test {selected!r}")
+        os.environ["WRELA_BIN"] = str(wrela)
         passed, output = runner._tool_test(selected, str(ROOT / "tools/tests"))
         print(output, end="", flush=True)
         if not passed:
@@ -329,7 +332,7 @@ def main(arguments):
         if name is None:
             status = suite(wrela, logs)
         elif name in STEPS or name.startswith(("tools::", "browser::")):
-            if name in ("wrela-fmt", "wgsl"):
+            if name in ("wrela-fmt", "wgsl", "tools") or name.startswith("tools::"):
                 call(["cargo", "build", "-q", "--release", "-p", "wrela", "--bin", "wrela"])
             step(name, wrela, logs)
         else:

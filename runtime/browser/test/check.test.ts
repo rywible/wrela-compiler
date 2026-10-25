@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { Checker } from "../src/check.ts";
 import { NONE, SCREEN } from "../src/abi.gen.ts";
-import type { Binding, Command } from "../src/stream.ts";
-import { shapes, passOf } from "./fixtures.ts";
+import { type Binding, type Command, onePass } from "../src/stream.ts";
+import { shapes } from "./fixtures.ts";
 
 for (const op of ["Dispatch", "Draw"] as const) {
   test(`writable bindings are checked per ${op.toLowerCase()}, including after a rejection`, () => {
@@ -89,7 +89,7 @@ test("a rejected pass restores its prior attachments and usage scope", () => {
   checker.check({ op: "CreateTexture", handle: 7, width: 32, height: 31, kind: "2d", layers: 1, levels: 1, format: "depth32float", writable: false });
   const pass = (color: number, depth: number): Command => ({
     op: "BeginPass",
-    pass: passOf({ color, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 }),
+    pass: { ...onePass(color, false, [0, 0, 0, 1]), depth },
   });
   const draw = (texture: number, pipeline = 0): Command => ({
     op: "Draw", pipeline, vertices: 3, instances: 1,
@@ -159,7 +159,7 @@ test("a screen pass requires its depth target to fit the frame", () => {
   checker.check({ op: "CreateTexture", handle: 4, width: 640, height: 360, kind: "2d", layers: 1, levels: 1, format: "depth32float", writable: false });
   const pass = (depth: number): Command => ({
     op: "BeginPass",
-    pass: passOf({ color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 }),
+    pass: { ...onePass(SCREEN, false, [0, 0, 0, 1]), depth },
   });
   expect(() => checker.check(pass(3))).toThrow("the pass's colour and depth targets differ in size");
   expect(() => checker.check(pass(4))).not.toThrow();

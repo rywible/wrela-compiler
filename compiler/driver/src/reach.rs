@@ -72,6 +72,29 @@ impl Kind {
     }
 }
 
+/// The bytes of the file at `rel` in `dir`, opened without waiting (`O_NONBLOCK`): `None` if
+/// the opened handle isn't a regular file.
+pub(crate) fn read_regular(dir: &Dir, rel: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let mut file = dir.open_with(rel, &options)?;
+    if !file.metadata()?.is_file() {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+
+/// `bytes` as text, or the error reading a file that isn't UTF-8 gives.
+pub(crate) fn utf8(bytes: Vec<u8>) -> std::io::Result<String> {
+    String::from_utf8(bytes).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "stream did not contain valid UTF-8")
+    })
+}
+
 /// A read refused because it leaves the roots.
 fn outside(path: &Path) -> std::io::Error {
     std::io::Error::new(
@@ -145,17 +168,8 @@ impl Reach {
         let Some(roots) = &self.roots else { return std::fs::read(path) };
         let canonical = path.canonicalize()?;
         let (root, rel) = self.locate(roots, &canonical).ok_or_else(|| outside(path))?;
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-        let mut file = root.dir.open_with(&rel, &options)?;
-        if !file.metadata()?.is_file() {
-            return Err(std::io::Error::other("it isn't a regular file"));
-        }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        Ok(bytes)
+        read_regular(&root.dir, &rel)?
+            .ok_or_else(|| std::io::Error::other("it isn't a regular file"))
     }
 
     /// The text of the regular file at `path`, which must be UTF-8.
@@ -163,12 +177,7 @@ impl Reach {
         if self.roots.is_none() {
             return std::fs::read_to_string(path);
         }
-        String::from_utf8(self.read(path)?).map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "stream did not contain valid UTF-8",
-            )
-        })
+        utf8(self.read(path)?)
     }
 
     /// What's at `path`, following a final link if `follow`: `Ok(None)` if nothing is there. A

@@ -8,7 +8,11 @@ need for a frame test outside main to take the state) or by the pipelines it mus
 
 `src` is a directory of the program's .wrela files (an attempt's snapshot); it is copied, never
 changed. `wrela` builds and runs it; `validator`, a fixed compiler, checks the criteria that
-depend on a lint (task 25's W0011), so they are the same whichever compiler is under test.
+depend on a lint, so they are the same whichever compiler is under test.
+
+A task's `grade` in tasks.json says how: `pipelines`, the kinds it must reach; or `tests`, its
+hidden tests, with `passing`, the program's own tests that must run and pass, and `without`, the
+lints (each with why it fails) the program must not give once the hidden tests are taken out.
 """
 
 import json
@@ -25,10 +29,6 @@ GRADE = "zgrade.wrela"
 def tasks():
     with open(os.path.join(HERE, "tasks.json")) as f:
         return json.load(f)
-
-
-def task(id):
-    return next(t for t in tasks() if t["id"] == id)
 
 
 def _copy(src, dst):
@@ -102,15 +102,18 @@ def grade(task, src, wrela, validator=None):
         if failed:
             result["why"] = "tests failed: " + ", ".join(failed)
             return result
-        if task["id"] == "25-write-a-test":
-            if not any(t["name"] == "fib_is_right" and t["passed"] for t in ran):
-                result["why"] = "no passing test named `fib_is_right`"
+        for name in task["grade"].get("passing", []):
+            if not any(t["name"] == name and t["passed"] for t in ran):
+                result["why"] = f"no passing test named `{name}`"
                 return result
+        without = task["grade"].get("without", {})
+        if without:
             os.remove(os.path.join(pkg, GRADE))
             code, out, _ = _run([validator, "check", pkg, "--json"])
             codes = [d["code"] for d in json.loads(out or "{}").get("diagnostics", [])]
-            if "W0011" in codes:
-                result["why"] = "its test can't fail (W0011): it asserts nothing"
-                return result
+            for lint, why in without.items():
+                if lint in codes:
+                    result["why"] = why
+                    return result
         result["correct"] = True
         return result

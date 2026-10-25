@@ -12,7 +12,8 @@
 
 use cap_std::fs::Dir;
 use std::io::{BufRead, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
+use std::time::{Duration, Instant};
 
 /// The largest request body a server takes (a test's frame, an edit's JSON), but a put's.
 pub const MAX_BODY: usize = 16 << 20;
@@ -23,6 +24,43 @@ pub const MAX_RESULT: usize = 256 << 20;
 
 /// The most bytes a request's head (its line and headers) may have.
 const MAX_HEAD: u64 = 64 << 10;
+
+/// A connection whose reads and writes stop at `due`, even when its peer keeps making progress,
+/// and whose each wait for the peer stops after `idle`.
+pub struct DeadlineIo {
+    pub stream: TcpStream,
+    pub due: Instant,
+    pub idle: Duration,
+}
+
+impl DeadlineIo {
+    fn left(&self) -> std::io::Result<Duration> {
+        let left = self.due.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline elapsed"))
+        } else {
+            Ok(left.min(self.idle))
+        }
+    }
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.left()?))?;
+        self.stream.read(bytes)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.left()?))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
 
 /// A request's head: its method, its path and query, its body's length (read after it), and
 /// the browser session a tool's browser's proxy named it with ([`wrela_chrome::proxy::SESSION_HEADER`]).
@@ -285,9 +323,7 @@ pub fn put_result(
         return refused(out).map(|()| false);
     };
     // A file of this put's own: several pages may put one result at once.
-    static PUTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = PUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = format!(".{name}.tmp-{}-{n}", std::process::id());
+    let tmp = crate::confined::temp_name(name);
     let written = (|| {
         let mut file = crate::confined::open_file(&results, &tmp, true)?;
         file.set_len(0)?;

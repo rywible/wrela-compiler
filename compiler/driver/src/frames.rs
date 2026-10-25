@@ -355,6 +355,8 @@ fn run_gpu_frames(
             return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
     }
+    // The screen, once read for the golden: Chrome's run is compared with it too.
+    let mut screen = None;
     if let Some((g, root, bless, reach)) = golden {
         let after = format!("after {frames} frames");
         let image = match &g.pass {
@@ -368,11 +370,14 @@ fn run_gpu_frames(
         if let Err(why) = against_golden(g, root, (w, h, &image), bless, reach) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
+        if g.pass.is_none() {
+            screen = Some(image);
+        }
     }
     if let Some(json) = both {
         let after = format!("after {frames} frames");
         let within = golden.map_or(wrela_sema::defs::GOLDEN_WITHIN, |g| g.0.within);
-        if let Err(why) = against_chrome(host, dir, frames, json, within) {
+        if let Err(why) = against_chrome(host, screen, dir, frames, json, within) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
     }
@@ -469,20 +474,24 @@ fn shown_beside(
     }
 }
 
-/// The native host's last frame and state hash after `frames` frames against Chrome's: the
-/// same build (in `dir`) run in headless Chrome's test mode with the same frames, screen, rate,
-/// one worker and the script `json`, whose state hash must be the same and whose last frame
-/// must be within `within` (a mean difference in 8-bit steps) of the native host's (§13,
-/// `hosts: both`).
+/// The native host's last frame (`screen`, if it was read already) and state hash after
+/// `frames` frames against Chrome's: the same build (in `dir`) run in headless Chrome's test
+/// mode with the same frames, screen, rate, one worker and the script `json`, whose state hash
+/// must be the same and whose last frame must be within `within` (a mean difference in 8-bit
+/// steps) of the native host's (§13, `hosts: both`).
 #[cfg(feature = "gpu")]
 fn against_chrome(
     host: &mut wrela_host::Host,
+    screen: Option<Vec<u8>>,
     dir: &Path,
     frames: u32,
     json: &str,
     within: f64,
 ) -> Result<(), String> {
-    let screen = host.read_screen().map_err(|e| e.to_string())?;
+    let screen = match screen {
+        Some(s) => s,
+        None => host.read_screen().map_err(|e| e.to_string())?,
+    };
     let hash = format!("{:016x}", host.hash());
     let (Some(root), Some(page)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
         return Err("its build has no directory Chrome can serve".into());

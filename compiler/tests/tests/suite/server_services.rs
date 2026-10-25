@@ -4,9 +4,11 @@
 //! before the call's sends go, a call that traps commits none, the store outlives the build that
 //! wrote it, and a passkey's assertion, signed here as an authenticator signs it, checks out.
 
+use crate::rooms::limits;
+use std::path::PathBuf;
 use std::sync::Arc;
 use wrela_host::rooms::{Out, RoomHost};
-use wrela_host::server::{Limits, ServerBuild};
+use wrela_host::server::ServerBuild;
 use wrela_host::services::Services;
 
 /// A server that does what each message asks, and answers on the same connection with the op's
@@ -149,10 +151,28 @@ pub fn serve(s: mut Server, time: f32) {
 }
 "#;
 
-/// The server program's module, built once for both tests.
-fn wasm() -> &'static [u8] {
-    static WASM: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    WASM.get_or_init(|| super::rooms::server_wasm("services-program", PROGRAM))
+/// The server program's build and its module's hash, made once for the tests.
+fn build() -> &'static (Arc<ServerBuild>, u64) {
+    static BUILD: std::sync::OnceLock<(Arc<ServerBuild>, u64)> = std::sync::OnceLock::new();
+    BUILD.get_or_init(|| {
+        let wasm = super::rooms::server_wasm("services-program", PROGRAM);
+        let build = ServerBuild::from_wasm(&wasm).expect("a server build");
+        (Arc::new(build), wrela_abi::ticks::wasm_hash(&wasm))
+    })
+}
+
+/// Room "a" of the server in a fresh scratch directory `name`, on a store there, with
+/// connection 1 connected; and the store and the directory.
+fn room(name: &str) -> (RoomHost, Arc<Services>, PathBuf) {
+    let dir = crate::scratch_root().join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    let services = Arc::new(Services::open(&dir.join("store.sqlite")).expect("the store"));
+    let (build, hash) = build();
+    let mut room =
+        RoomHost::open(build.clone(), *hash, &dir.join("a"), "a", limits(), Some(services.clone()))
+            .expect("open");
+    room.connect(1);
+    (room, services, dir)
 }
 
 fn chunk(b: &[u8]) -> Vec<u8> {
@@ -185,26 +205,9 @@ fn ask(room: &mut RoomHost, message: Vec<u8>) -> Vec<u8> {
     out.remove(0)
 }
 
-fn limits() -> Limits {
-    Limits {
-        memory: 64 << 20,
-        deadline: std::time::Duration::from_millis(500),
-        ..Limits::default()
-    }
-}
-
 #[test]
 fn a_server_keeps_reads_and_scans_its_store_and_the_store_outlives_its_build() {
-    let wasm = wasm();
-    let dir = crate::scratch_root().join("server-services");
-    let _ = std::fs::remove_dir_all(&dir);
-    let services = Arc::new(Services::open(&dir.join("store.sqlite")).expect("the store"));
-    let build = Arc::new(ServerBuild::from_wasm(wasm).expect("a server build"));
-    let hash = wrela_abi::ticks::wasm_hash(wasm);
-    let mut room =
-        RoomHost::open(build.clone(), hash, &dir.join("a"), "a", limits(), Some(services.clone()))
-            .expect("open");
-    room.connect(1);
+    let (mut room, services, dir) = room("server-services");
     for (k, v) in [(&b"lb/2"[..], &b"two"[..]), (b"lb/1", b"one"), (b"other", b"x")] {
         room.receive(1, put(1, k, v));
     }
@@ -232,8 +235,10 @@ fn a_server_keeps_reads_and_scans_its_store_and_the_store_outlives_its_build() {
     // Another build of the server (here, the same module under another hash) doesn't read the
     // first build's journal, but the store is the server's: what was put is still there.
     drop(room);
-    let mut later = RoomHost::open(build, hash ^ 1, &dir.join("b"), "a", limits(), Some(services))
-        .expect("open again");
+    let (build, hash) = build();
+    let mut later =
+        RoomHost::open(build.clone(), hash ^ 1, &dir.join("b"), "a", limits(), Some(services))
+            .expect("open again");
     later.connect(1);
     assert_eq!(
         ask(&mut later, [&[2u8][..], &chunk(b"lb/1")].concat()),
@@ -245,15 +250,7 @@ fn a_server_keeps_reads_and_scans_its_store_and_the_store_outlives_its_build() {
 #[test]
 fn a_server_checks_a_signature_and_refuses_another_message() {
     use p256::ecdsa::signature::Signer;
-    let wasm = wasm();
-    let dir = crate::scratch_root().join("server-signatures");
-    let _ = std::fs::remove_dir_all(&dir);
-    let services = Arc::new(Services::open(&dir.join("store.sqlite")).expect("the store"));
-    let build = Arc::new(ServerBuild::from_wasm(wasm).expect("a server build"));
-    let hash = wrela_abi::ticks::wasm_hash(wasm);
-    let mut room =
-        RoomHost::open(build, hash, &dir.join("a"), "a", limits(), Some(services)).expect("open");
-    room.connect(1);
+    let (mut room, _, dir) = room("server-signatures");
     let key = p256::ecdsa::SigningKey::from_slice(&[11u8; 32]).expect("a key");
     let public = key.verifying_key().to_encoded_point(false);
     let sig: p256::ecdsa::Signature = key.sign(b"an assertion");
@@ -287,14 +284,7 @@ fn base64url(bytes: &[u8]) -> String {
 fn a_server_checks_a_passkeys_assertion_as_an_authenticator_signs_it() {
     use p256::ecdsa::signature::Signer;
     use sha2::Digest;
-    let dir = crate::scratch_root().join("server-assertions");
-    let _ = std::fs::remove_dir_all(&dir);
-    let services = Arc::new(Services::open(&dir.join("store.sqlite")).expect("the store"));
-    let build = Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build"));
-    let hash = wrela_abi::ticks::wasm_hash(wasm());
-    let mut room =
-        RoomHost::open(build, hash, &dir.join("a"), "a", limits(), Some(services)).expect("open");
-    room.connect(1);
+    let (mut room, _, dir) = room("server-assertions");
     // The authenticator's key, and what it signs: its data for wrela.dev (present and verified,
     // counter 1), then the SHA-256 of the client's data.
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).expect("a key");

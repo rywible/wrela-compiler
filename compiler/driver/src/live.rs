@@ -503,15 +503,14 @@ fn results_file(path: &str) -> Option<&str> {
 /// How long a long poll waits for a change before it answers that there's none.
 const LONG_POLL: Duration = Duration::from_secs(15);
 
+/// `/live/shown` contains only a sequence and a frame number.
+const MAX_LIVE_REPORT: usize = 64 << 10;
+
 /// A single error may contain many source diagnostics. Bound its live wire form.
 const MAX_LIVE_ERROR_BYTES: usize = 64 << 10;
 
 fn short_error(error: &str) -> &str {
-    let mut end = error.len().min(MAX_LIVE_ERROR_BYTES);
-    while !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    &error[..end]
+    &error[..error.floor_char_boundary(MAX_LIVE_ERROR_BYTES)]
 }
 
 /// Each poll advances through a bounded part of the retained history.
@@ -561,7 +560,15 @@ fn handle(
             http::respond(&mut out, 200, "application/json", &body)
         }
         ("POST", "/live/shown") => {
-            let v: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let Some(body) = req.read_body(MAX_LIVE_REPORT)? else {
+                return http::respond(
+                    &mut out,
+                    413,
+                    "text/plain",
+                    b"a live report is at most 64 KiB",
+                );
+            };
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let (Some(seq), Some(frame)) = (v["seq"].as_u64(), v["frame"].as_u64()) else {
                 return http::respond(&mut out, 403, "text/plain", b"a report is {seq, frame}");
             };
@@ -842,6 +849,34 @@ mod tests {
             serde_json::from_slice(&event_batch(&events, after as usize)).expect("second");
         assert_eq!(second.first().and_then(|event| event["seq"].as_u64()), Some(after + 1));
         assert_eq!(second.last().and_then(|event| event["seq"].as_u64()), Some(40));
+    }
+
+    #[test]
+    fn oversized_live_reports_are_refused_before_reading_the_body() {
+        let out = crate::Scratch::new("wrela-live-report").expect("scratch");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen");
+        let port = listener.local_addr().expect("address").port();
+        let state = State {
+            out: Dir::open_ambient_dir(&out.0, cap_std::ambient_authority()).expect("output"),
+            port,
+            live: Mutex::new(Live { version: 1, events: Vec::new(), shown: Vec::new(), polls: 0 }),
+            changed: Condvar::new(),
+        };
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            write!(
+                stream,
+                "POST /live/shown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n",
+                MAX_LIVE_REPORT + 1
+            )
+            .expect("request head");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept");
+        handle(stream, &state, &AtomicBool::new(false), true).expect("refuse the report");
+        assert!(client.join().expect("response").starts_with("HTTP/1.1 413"));
     }
 
     /// A page opened after a literal-only edit loads the newest build, then receives that edit:

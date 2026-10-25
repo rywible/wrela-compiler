@@ -5,15 +5,13 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { type BuiltPipeline, buildPipelines, preparePipelines, GpuExecutor, type PipelineCache, screenFormat, ShaderError, shaderSource } from "../src/gpu.ts";
 import type { Manifest, Pipeline } from "../src/manifest.ts";
 import { NONE, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "../src/abi.gen.ts";
-import { decode } from "../src/stream.ts";
+import { decode, onePass, type Pass } from "../src/stream.ts";
 import { Encoder, words } from "./encoder.ts";
-import { type Event, FakeDevice, fakeTexture } from "./fake-gpu.ts";
-import { shapes, passOf } from "./fixtures.ts";
+import { buildAll, type Event, FakeDevice, fakeTexture, SCREEN_TARGET, SHADER } from "./fake-gpu.ts";
+import { shapes } from "./fixtures.ts";
 import type { ScreenTarget } from "../src/gpu.ts";
 
-const SHADER = "// fine\n";
-
-async function setup(manifest: Manifest = shapes(), screen: ScreenTarget = { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }) {
+async function setup(manifest: Manifest = shapes(), screen: ScreenTarget = SCREEN_TARGET) {
   const device = new FakeDevice();
   const pipelines = await Promise.all(buildPipelines(device.gpu, manifest, manifest.pipelines.map(() => SHADER), screen.format));
   const executor = new GpuExecutor(device.gpu, pipelines, screen);
@@ -379,8 +377,12 @@ function sampled(): Manifest {
   return m;
 }
 
-const offscreen = (color: number, depth: number, keep = false) =>
-  passOf({ color, keepColor: keep, join: false, clear: [0, 0, 0, 1], depth, keepDepth: false, clearDepth: 1 });
+/** A pass into texture `color` (none if NONE), its colour cleared unless `keep`, and `depth`
+ * (or NONE), cleared. */
+const offscreen = (color: number, depth: number, keep = false): Pass => {
+  const pass = onePass(color, keep, [0, 0, 0, 1]);
+  return { ...pass, colors: color === NONE ? [] : pass.colors, depth };
+};
 
 test("textures and samplers are made as the stream says, and bound as views and samplers", async () => {
   const { device, run } = await setup(sampled());
@@ -471,7 +473,7 @@ test("a render pipeline's variants are its manifest's targets, made at load", as
     { colors: ["rgba16float"], depth: true, screen: false },
     { colors: [], depth: true, screen: false },
   ];
-  await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  await buildAll(device, m);
   expect(device.made).toEqual(["draw rgba16float|depth32float", "draw none|depth32float"]);
 });
 
@@ -661,9 +663,9 @@ test("a failed readback releases its staging buffer", async () => {
 test("a command whose pipeline is still being built waits for it, and the commands after it wait behind it", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET);
   const e = new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).writeBuffer(1, 0, words([7]));
   for (const cmd of decode(e.finish())) executor.execute(cmd);
   const answer = executor.readBack(2, 0, 4);
@@ -684,10 +686,10 @@ test("a command backlog advances across staggered pipelines and keeps writes and
   const device = new FakeDevice();
   const m = shapes();
   m.pipelines.push({ ...m.pipelines[1]!, name: "another compute" });
-  const [draw, compute, another] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute, another] = await buildAll(device, m);
   const first = Promise.withResolvers<BuiltPipeline>();
   const second = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, first.promise, second.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, first.promise, second.promise], SCREEN_TARGET);
   const run = (e: Encoder) => {
     for (const cmd of decode(e.finish())) executor.execute(cmd);
   };
@@ -715,9 +717,9 @@ test("a command backlog advances across staggered pipelines and keeps writes and
 test.each(["waiting", "serial"] as const)("a %s draw keeps one uniform copy until its pass ends", async (mode) => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [mode === "waiting" ? later.promise : draw!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, mode === "serial" ? "serial" : "off");
+  const executor = new GpuExecutor(device.gpu, [mode === "waiting" ? later.promise : draw!, compute!], SCREEN_TARGET, mode === "serial" ? "serial" : "off");
   const batch = new Encoder().createBuffer(1, 64).createBuffer(2, 64).beginScreenPass([0, 0, 0, 1]).draw(0, 3, 1, [1, 2], u(7)).finish();
   const commands = decode(batch);
   const slice = spyOn(Uint8Array.prototype, "slice");
@@ -744,7 +746,7 @@ test.each(["waiting", "serial"] as const)("a %s draw keeps one uniform copy unti
 test("a reentrant immediate draw owns its uniforms while a queued screen pass finishes", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const later = Promise.withResolvers<BuiltPipeline>();
   const reentrant = decode(new Encoder().beginScreenPass([0, 0, 0, 1]).draw(0, 3, 1, [1, 2], u(9)).finish());
   const reentrantDraw = reentrant[1]!;
@@ -777,9 +779,9 @@ test("a reentrant immediate draw owns its uniforms while a queued screen pass fi
 test("commands that wait for a pipeline keep their frame's label; the next frame's start with none", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET);
   const run = (e: Encoder) => {
     for (const cmd of decode(e.finish())) executor.execute(cmd);
   };
@@ -801,9 +803,9 @@ test("texture passes waiting for a pipeline keep separate timings in their recor
     const device = new FakeDevice();
     device.features.add("timestamp-query");
     const m = shapes();
-    const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+    const [draw, compute] = await buildAll(device, m);
     const later = Promise.withResolvers<BuiltPipeline>();
-    const executor = new GpuExecutor(device.gpu, [later.promise, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "span");
+    const executor = new GpuExecutor(device.gpu, [later.promise, compute!], SCREEN_TARGET, "span");
     const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
     run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createTexture(3, 8, 8, "rgba8unorm")
       .label("first").beginPass(offscreen(3, NONE)).draw(0, 3, 1, [1, 2], u(0)).endPass());
@@ -823,9 +825,9 @@ test("texture passes waiting for a pipeline keep separate timings in their recor
 test("a command that waited for a pipeline, then fails, fails the program", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET);
   // Buffers that don't exist: what no checked command binds, so it fails when it runs.
   for (const cmd of decode(new Encoder().dispatch(1, [1, 1, 1], [8, 9], u(0)).finish())) executor.execute(cmd);
   const caughtUp = executor.caughtUp().then(
@@ -840,10 +842,10 @@ test("a command that waited for a pipeline, then fails, fails the program", asyn
 test("a failed waiting queue does not submit recorded work when another pipeline finishes", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, m);
   const first = Promise.withResolvers<BuiltPipeline>();
   const unused = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, first.promise, unused.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, first.promise, unused.promise], SCREEN_TARGET);
   const batch = new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).destroyBuffer(8);
   for (const cmd of decode(batch.finish())) executor.execute(cmd);
   const caughtUp = executor.caughtUp();
@@ -875,9 +877,9 @@ test("a hot reload keeps the pipelines whose entries and WGSL are the same, wher
 test("a pipeline that can't be built fails the program: caughtUp and built reject", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [draw] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw] = await buildAll(device, m);
   const failing = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, failing.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, failing.promise], SCREEN_TARGET);
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) {
     executor.execute(cmd);
   }
@@ -893,7 +895,7 @@ test("a late pipeline success runs no commands after another pipeline failed", a
   const device = new FakeDevice();
   const failed = Promise.withResolvers<BuiltPipeline>();
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [failed.promise, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [failed.promise, later.promise], SCREEN_TARGET);
   const compute: BuiltPipeline = {
     name: "compute",
     layout: {} as GPUBindGroupLayout,
@@ -918,7 +920,7 @@ test("a late pipeline success runs no commands after another pipeline failed", a
 test("a retired executor runs no commands when a pipeline finishes late", async () => {
   const device = new FakeDevice();
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [later.promise], SCREEN_TARGET);
   const compute: BuiltPipeline = {
     name: "compute",
     layout: {} as GPUBindGroupLayout,
@@ -951,7 +953,7 @@ test("retiring an executor records an ended texture pass before releasing its re
 
 test("retiring an executor releases its upload uniform and debug buffers", () => {
   const device = new FakeDevice();
-  const executor = new GpuExecutor(device.gpu, [], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "off", true);
+  const executor = new GpuExecutor(device.gpu, [], SCREEN_TARGET, "off", true);
   expect(device.buffers.map((b) => b.label).sort()).toEqual(["debug flag", "readback", "uniform ring", "upload ring"]);
   executor.destroyAll();
   expect(device.buffers.every((b) => b.destroyed)).toBe(true);
@@ -960,7 +962,7 @@ test("retiring an executor releases its upload uniform and debug buffers", () =>
 
 test("retiring an executor waits for a debug read before releasing its mapped buffer", async () => {
   const device = new FakeDevice();
-  const executor = new GpuExecutor(device.gpu, [], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "off", true);
+  const executor = new GpuExecutor(device.gpu, [], SCREEN_TARGET, "off", true);
   const readback = device.buffers.find((buffer) => buffer.label === "readback")!;
   const mapped = Promise.withResolvers<void>();
   readback.mapAsync = () => mapped.promise;
@@ -976,7 +978,7 @@ test("a failed timestamp read releases its staging buffer and retirement release
   const device = new FakeDevice();
   device.features.add("timestamp-query");
   const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, pipelines, { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "span");
+  const executor = new GpuExecutor(device.gpu, pipelines, SCREEN_TARGET, "span");
   const create = device.createBuffer.bind(device);
   device.createBuffer = (descriptor) => {
     const buffer = create(descriptor);
@@ -1003,7 +1005,7 @@ test("a pipeline failure rejects readbacks already taken by a serial drain", asy
   const m = shapes();
   const [draw] = await Promise.all(buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT));
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "serial");
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET, "serial");
   void executor.built.catch(() => {});
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
     .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
@@ -1019,7 +1021,7 @@ test("retirement cancels readbacks and commands already taken by a serial drain"
   const device = new FakeDevice();
   const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT));
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [pipelines[0]!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "serial");
+  const executor = new GpuExecutor(device.gpu, [pipelines[0]!, later.promise], SCREEN_TARGET, "serial");
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
     .dispatch(1, [1, 1, 1], [1, 2], u(0)).finish())) executor.execute(cmd);
   const answer = executor.readBack(2, 0, 4).catch((error: Error) => error.message);
@@ -1034,10 +1036,10 @@ test("retirement cancels readbacks and commands already taken by a serial drain"
 test.each(["failed", "retired"] as const)("a partly drained backlog rejects readbacks when its executor is %s", async (mode) => {
   const device = new FakeDevice();
   const m = shapes();
-  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [, compute] = await buildAll(device, m);
   const first = Promise.withResolvers<BuiltPipeline>();
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [first.promise, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [first.promise, later.promise], SCREEN_TARGET);
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64).dispatch(0, [1, 1, 1], [1, 2], u(0)).dispatch(1, [2, 1, 1], [1, 2], u(1)).finish())) {
     executor.execute(cmd);
   }
@@ -1127,8 +1129,8 @@ test("a program's ask for a label's time is answered once its frame has ended an
   const device = new FakeDevice();
   device.features.add("timestamp-query");
   const m = shapes();
-  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const [, compute] = await buildAll(device, m);
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
   expect(executor.timed).toBe(false);
   let answered: Uint8Array | null = null;
   const asked = executor.timeLabel("look").then((b) => (answered = b));
@@ -1154,8 +1156,8 @@ test("an ask times only its own label's work: the rest runs untimed, its dispatc
   const device = new FakeDevice();
   device.features.add("timestamp-query");
   const m = shapes();
-  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const [, compute] = await buildAll(device, m);
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
   const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
   const twice = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [1, 2], u(1));
   const asked = executor.timeLabel("look");
@@ -1179,8 +1181,8 @@ test("an ask times only its own label's work: the rest runs untimed, its dispatc
 test("a GPU without timestamp queries refuses an ask for a time", async () => {
   const device = new FakeDevice();
   const m = shapes();
-  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const [, compute] = await buildAll(device, m);
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
   await expect(executor.timeLabel("look")).rejects.toThrow("no timestamp queries");
 });
 
@@ -1188,8 +1190,8 @@ test("in the serial mode, a label's time waits for its frame's drained passes", 
   const device = new FakeDevice();
   device.features.add("timestamp-query");
   const m = shapes();
-  const [, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, [compute!, compute!], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") }, "serial");
+  const [, compute] = await buildAll(device, m);
+  const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET, "serial");
   let answered: Uint8Array | null = null;
   const asked = executor.timeLabel("look").then((b) => (answered = b));
   const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
@@ -1255,7 +1257,7 @@ test("a pipeline isn't made for a target the device can't blend into as it blend
       { colors: ["r32float"], depth: false, screen: false },
       { colors: ["rgba16float"], depth: false, screen: false },
     ];
-    await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+    await buildAll(device, m);
     return device.made;
   };
   // Without float32-blendable, the r32float variant would fail the whole load.
@@ -1265,7 +1267,7 @@ test("a pipeline isn't made for a target the device can't blend into as it blend
 
 test("a pass that joins one with a scissor starts from the whole target again", async () => {
   const { device, run, executor } = await setup();
-  const target = (keep: boolean) => passOf({ color: 3, keepColor: keep, join: keep });
+  const target = (keep: boolean): Pass => ({ ...onePass(3, keep, [0, 0, 0, 1]), join: keep });
   run(
     new Encoder()
       .createBuffer(1, 64)
