@@ -28,6 +28,9 @@ pub(package) const TICK_HASH: u32 = 520
 /// The sim clock's origin, an `f64`: when tick 0 was due.
 pub(package) const TICK_ORIGIN: u32 = 528
 
+/// std's count of the GPU's bytes: buffers, textures, and each's most.
+pub(package) const GPU_STATE: u32 = 2048
+
 /// The most threads a program runs on.
 pub(package) const THREADS: u32 = 11
 

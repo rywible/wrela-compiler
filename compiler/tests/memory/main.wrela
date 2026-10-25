@@ -1,0 +1,51 @@
+// `std::gpu::memory()` (language.md §18.10): std's own count of the program's GPU bytes, which
+// a program reads as its own arithmetic. This one makes known resources in `init`, drops a
+// buffer in frame 2, and prints its count each frame; its test checks the numbers, and the
+// suite's `std_counts_the_gpu_memory_the_host_does` that Chrome's `memory.json` agrees.
+use std::gpu::{
+    DepthTexture, GpuBuffer, R32Float, Rgba8, Texture, TextureArray, buffer, depth_texture, memory,
+    texture, texture_array, Memory,
+}
+use std::io::print
+
+pub struct State {
+    frame: u32,
+    points: Option<GpuBuffer<f32>>,
+    image: Texture<Rgba8>,
+    layers: TextureArray<R32Float>,
+    depth: DepthTexture,
+    seen: Vec<Memory>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        // 100 f32s: 400 bytes.
+        points: Some(buffer(100)),
+        // 16 × 16 with 5 levels: (256 + 64 + 16 + 4 + 1) texels of 4 bytes, 1,364.
+        image: texture(width: 16, height: 16, levels: 5),
+        // 3 layers of 8 × 8 f32s: 768.
+        layers: texture_array(width: 8, height: 8, layers: 3),
+        // 4 × 4 depths: 64.
+        depth: depth_texture(width: 4, height: 4),
+        seen: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 2 {
+        s.points = None
+    }
+    let m = memory()
+    print(f"memory {m.buffers} {m.textures} {m.peak_buffers} {m.peak_textures}")
+    s.seen.push(m)
+    s.frame += 1
+}
+
+@test(frames: 4, gpu: true)
+fn std_counts_what_it_made_and_dropped(s: State) {
+    let textures: u64 = 1364 + 768 + 64
+    assert(s.seen[0].buffers == 400 && s.seen[0].textures == textures)
+    assert(s.seen[3].buffers == 0 && s.seen[3].peak_buffers == 400)
+    assert(s.seen[3].textures == textures && s.seen[3].peak_textures == textures)
+}

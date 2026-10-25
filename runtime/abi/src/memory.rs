@@ -8,7 +8,8 @@
 //! | [`DATA_READY`] – 15 | whether the constants are in place (the module's start function's) |
 //! | [`ALLOC_STATE`] – 255 | the allocator's state (std's own) |
 //! | [`PAR_STATE`] – 511 | the helpers' shared words (std's own; hosts write [`PAR_SHUTDOWN`] and [`PAR_HOLD`]) |
-//! | [`TICK_STATE`] – 4095 | the ticker's words, which hosts and std's `std::tick` share |
+//! | [`TICK_STATE`] – 2047 | the ticker's words, which hosts and std's `std::tick` share |
+//! | [`GPU_STATE`] – 4095 | std's count of the GPU memory the program holds (`std::gpu::memory`) |
 //! | [`CMD_BASE`] – | the command buffer: a batch header, then up to [`CMD_CAP`] bytes |
 //! | [`THREAD_BLOCKS`] – | a block for each thread ([`THREADS`] of them, [`THREAD_BLOCK_SIZE`] bytes each) |
 //! | [`TASK_SLOTS`] – | the tasks in flight (`std::par::spawn`), [`TASK_SLOT_COUNT`] slots |
@@ -105,6 +106,12 @@ pub const TICK_HASH: u32 = TICK_STATE + 8;
 /// The sim clock's origin, an `f64`: the frame time, in seconds, at which tick 0 was due. The
 /// host writes it, and moves it forward when it drops ticks or the page was hidden.
 pub const TICK_ORIGIN: u32 = TICK_STATE + 16;
+
+/// std's count of what the program holds on the GPU (`std::gpu::memory`): four `u64`s, the
+/// bytes of its buffers, of its textures, and the most of each it has held. The program's
+/// thread alone records GPU work, so only it writes them; hosts don't read them (test mode's
+/// `memory.json` is the host's own count, which the two are tested to agree with).
+pub const GPU_STATE: u32 = 2048;
 
 /// The command buffer: a batch header, then commands.
 pub const CMD_BASE: u32 = 4096;

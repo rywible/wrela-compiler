@@ -774,6 +774,18 @@ fn every_kernel_capability_computes_what_the_cpu_does() {
     assert_eq!(out.results.len(), 7);
 }
 
+/// `std::gpu::memory()` (compiler/tests/memory): std counts the buffers and textures a
+/// program makes and drops, by their levels and layers.
+#[test]
+#[ignore = "needs a GPU"]
+fn std_counts_the_gpu_memory_a_program_holds() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/memory");
+    let out = wrela_driver::test(&dir, None);
+    assert!(out.diagnostics.iter().all(|d| !d.is_error()), "{:?}", out.diagnostics);
+    assert!(out.results.iter().all(|r| r.failure.is_none()), "{:?}", out.results);
+    assert_eq!(out.results.len(), 1);
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

@@ -37,7 +37,7 @@ SOURCES = ("compiler/std", "compiler/tests/fields", "compiler/tests/math", "comp
            "compiler/tests/texels", "compiler/tests/shader_params", "compiler/tests/unroll",
            "compiler/tests/tool_tests", "compiler/tests/held", "compiler/tests/timed",
            "compiler/tests/gpu-frames", "compiler/tests/capabilities",
-           "compiler/tests/kernels")
+           "compiler/tests/kernels", "compiler/tests/memory")
 # Clippy and the doc tests hold Cargo's lock and many cores, so they run before the lanes.
 CARGO_STEPS = ("clippy", "doc")
 LIGHT_STEPS = ("rustfmt", "wrela-fmt", "tools", "browser-types", "browser-dist", "browser-size",

@@ -15,7 +15,8 @@ use std::abi::{
     FORMAT_BC4_R_UNORM, FORMAT_BC4_R_UNORM_BYTES, FORMAT_BC5_RG_UNORM, FORMAT_BC5_RG_UNORM_BYTES,
     FORMAT_BC7_RGBA_UNORM, FORMAT_BC7_RGBA_UNORM_BYTES, FORMAT_ETC2_RGB8UNORM,
     FORMAT_ETC2_RGB8UNORM_BYTES, FORMAT_ASTC_4X4_UNORM, FORMAT_ASTC_4X4_UNORM_BYTES, KIND_2D,
-    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE,
+    KIND_3D, KIND_ARRAY, KIND_CUBE, MAX_LAYERS, MAX_TEXTURE_3D, TEXTURE_WRITABLE, GPU_STATE,
+    FORMAT_DEPTH32FLOAT_BYTES,
 }
 use std::io::{IoError, Pending, next_request}
 use std::mem::{Drop, size_of}
@@ -33,6 +34,7 @@ impl<T> Drop for GpuBuffer<T> {
     fn drop(mut self) {
         if self.handle != 0 {
             destroy_buffer(self.handle)
+            count_memory(0, buffer_bytes::<T>(self.count), false)
         }
     }
 }
@@ -251,8 +253,59 @@ pub struct Flat<T>: Copy {
 }
 
 /// Creates a GPU buffer of `count` elements, zeroed.
+pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {
+    let b: GpuBuffer<T> = new_buffer(count)
+    count_memory(0, buffer_bytes::<T>(count), true)
+    b
+}
+
 @intrinsic
-pub fn buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
+fn new_buffer<T: GpuData>(count: u32) -> GpuBuffer<T> {}
+
+/// A buffer's bytes, as its creation asks for: `count` elements, or one for an empty buffer
+/// (WebGPU binds no less), and at least 4.
+fn buffer_bytes<T>(count: u32) -> u64 {
+    let n = u64(size_of::<T>())
+    if count == 0 { u64(max(size_of::<T>(), 4)) } else { u64(count) * n }
+}
+
+/// What the program holds on the GPU (§18.10): the bytes of its buffers and textures now, and
+/// the most of each it has held at once. std counts them as it creates and drops each (a
+/// texture by its levels' blocks and its layers), so it's the program's own arithmetic, and
+/// `@deterministic` code may read it; test mode's `memory.json` is the host's count, the same
+/// numbers. A budget a game sets for itself is checked against it.
+pub struct Memory: Copy {
+    pub buffers: u64,
+    pub textures: u64,
+    pub peak_buffers: u64,
+    pub peak_textures: u64,
+}
+
+/// What the program holds on the GPU.
+pub fn memory() -> Memory {
+    unsafe {
+        Memory {
+            buffers: std::mem::read::<u64>(GPU_STATE),
+            textures: std::mem::read::<u64>(GPU_STATE + 8),
+            peak_buffers: std::mem::read::<u64>(GPU_STATE + 16),
+            peak_textures: std::mem::read::<u64>(GPU_STATE + 24),
+        }
+    }
+}
+
+/// Adds `bytes` to (`add`) or takes them from the buffers' count (`which` 0) or the textures'
+/// (1), and raises the peak.
+fn count_memory(which: u32, bytes: u64, add: bool) {
+    let at = GPU_STATE + 8 * which
+    unsafe {
+        let now = std::mem::read::<u64>(at)
+        let next = if add { now + bytes } else if bytes > now { 0 } else { now - bytes }
+        std::mem::write::<u64>(at, next)
+        if next > std::mem::read::<u64>(at + 16) {
+            std::mem::write::<u64>(at + 16, next)
+        }
+    }
+}
 
 /// Creates a GPU buffer holding `values`, at least `at_least` elements long (the rest zeroed: a
 /// list that can be empty still makes a buffer that can be bound, with `at_least: 1`), and
@@ -920,7 +973,10 @@ pub struct Texture<F: Format> {
 impl<F: Format> Drop for Texture<F> {
     fn drop(mut self) {
         if self.handle != 0 {
-            destroy_texture(self.handle)
+            drop_texture(
+                self.handle,
+                texture_bytes(self.width, self.height, 1, self.levels, F::bytes(), F::block()),
+            )
         }
     }
 }
@@ -936,7 +992,10 @@ pub struct DepthTexture {
 impl Drop for DepthTexture {
     fn drop(mut self) {
         if self.handle != 0 {
-            destroy_texture(self.handle)
+            drop_texture(
+                self.handle,
+                texture_bytes(self.width, self.height, 1, 1, FORMAT_DEPTH32FLOAT_BYTES, 1),
+            )
         }
     }
 }
@@ -954,7 +1013,10 @@ pub struct Texture3d<F: Storage> {
 impl<F: Storage> Drop for Texture3d<F> {
     fn drop(mut self) {
         if self.handle != 0 {
-            destroy_texture(self.handle)
+            drop_texture(
+                self.handle,
+                texture_bytes(self.width, self.height, self.depth, 1, F::bytes(), F::block()),
+            )
         }
     }
 }
@@ -975,7 +1037,17 @@ pub struct TextureArray<F: Format> {
 impl<F: Format> Drop for TextureArray<F> {
     fn drop(mut self) {
         if self.handle != 0 {
-            destroy_texture(self.handle)
+            drop_texture(
+                self.handle,
+                texture_bytes(
+                    self.width,
+                    self.height,
+                    self.layers,
+                    self.levels,
+                    F::bytes(),
+                    F::block(),
+                ),
+            )
         }
     }
 }
@@ -1001,7 +1073,17 @@ pub struct DepthTextureArray {
 impl Drop for DepthTextureArray {
     fn drop(mut self) {
         if self.handle != 0 {
-            destroy_texture(self.handle)
+            drop_texture(
+                self.handle,
+                texture_bytes(
+                    self.width,
+                    self.height,
+                    self.layers,
+                    1,
+                    FORMAT_DEPTH32FLOAT_BYTES,
+                    1,
+                ),
+            )
         }
     }
 }
@@ -1128,7 +1210,16 @@ fn check_texture_size(width: u32, height: u32, levels: u32) {
 /// chain), which `generate_mips` fills, or a kernel or a pass each.
 pub fn texture<F: Format>(width: u32, height: u32, levels: u32 = 1) -> Texture<F> {
     check_texture_size(width, height, levels)
-    let handle = create_texture_of(width, height, F::code(), KIND_2D, 1, levels)
+    let handle = create_texture_of(
+        width,
+        height,
+        F::code(),
+        KIND_2D,
+        1,
+        levels,
+        F::bytes(),
+        F::block(),
+    )
     Texture { handle, width, height, levels }
 }
 
@@ -1139,7 +1230,7 @@ pub fn writable_texture<F: Storage>(width: u32, height: u32, levels: u32 = 1) ->
     check_texture_size(width, height, levels)
     let code = F::code() | TEXTURE_WRITABLE
     Texture {
-        handle: create_texture_of(width, height, code, KIND_2D, 1, levels),
+        handle: create_texture_of(width, height, code, KIND_2D, 1, levels, F::bytes(), F::block()),
         width,
         height,
         levels,
@@ -1155,7 +1246,7 @@ pub fn texture3d<F: Storage>(width: u32, height: u32, depth: u32) -> Texture3d<F
     }
     let code = F::code() | TEXTURE_WRITABLE
     Texture3d {
-        handle: create_texture_of(width, height, code, KIND_3D, depth, 1),
+        handle: create_texture_of(width, height, code, KIND_3D, depth, 1, F::bytes(), F::block()),
         width,
         height,
         depth,
@@ -1172,7 +1263,16 @@ pub fn texture_array<F: Format>(
 ) -> TextureArray<F> {
     check_texture_size(width, height, levels)
     check_layers(layers)
-    let handle = create_texture_of(width, height, F::code(), KIND_ARRAY, layers, levels)
+    let handle = create_texture_of(
+        width,
+        height,
+        F::code(),
+        KIND_ARRAY,
+        layers,
+        levels,
+        F::bytes(),
+        F::block(),
+    )
     TextureArray { handle, width, height, layers, levels }
 }
 
@@ -1186,7 +1286,16 @@ pub fn writable_texture_array<F: Storage>(
     check_texture_size(width, height, levels)
     check_layers(layers)
     let code = F::code() | TEXTURE_WRITABLE
-    let handle = create_texture_of(width, height, code, KIND_ARRAY, layers, levels)
+    let handle = create_texture_of(
+        width,
+        height,
+        code,
+        KIND_ARRAY,
+        layers,
+        levels,
+        F::bytes(),
+        F::block(),
+    )
     TextureArray { handle, width, height, layers, levels }
 }
 
@@ -1199,7 +1308,16 @@ fn check_layers(layers: u32) {
 /// A new cube of six `side` × `side` faces of format `F`, zeroed, each with `levels` levels.
 pub fn cubemap<F: Format>(side: u32, levels: u32 = 1) -> Cubemap<F> {
     check_texture_size(side, side, levels)
-    let handle = create_texture_of(side, side, F::code(), KIND_CUBE, 6, levels)
+    let handle = create_texture_of(
+        side,
+        side,
+        F::code(),
+        KIND_CUBE,
+        6,
+        levels,
+        F::bytes(),
+        F::block(),
+    )
     Cubemap { array: TextureArray { handle, width: side, height: side, layers: 6, levels } }
 }
 
@@ -1207,14 +1325,23 @@ pub fn cubemap<F: Format>(side: u32, levels: u32 = 1) -> Cubemap<F> {
 pub fn writable_cubemap<F: Storage>(side: u32, levels: u32 = 1) -> Cubemap<F> {
     check_texture_size(side, side, levels)
     let code = F::code() | TEXTURE_WRITABLE
-    let handle = create_texture_of(side, side, code, KIND_CUBE, 6, levels)
+    let handle = create_texture_of(side, side, code, KIND_CUBE, 6, levels, F::bytes(), F::block())
     Cubemap { array: TextureArray { handle, width: side, height: side, layers: 6, levels } }
 }
 
 /// A new depth texture, zeroed.
 pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
     check_texture_size(width, height, 1)
-    let handle = create_texture_of(width, height, FORMAT_DEPTH32FLOAT, KIND_2D, 1, 1)
+    let handle = create_texture_of(
+        width,
+        height,
+        FORMAT_DEPTH32FLOAT,
+        KIND_2D,
+        1,
+        1,
+        FORMAT_DEPTH32FLOAT_BYTES,
+        1,
+    )
     DepthTexture { handle, width, height }
 }
 
@@ -1222,7 +1349,16 @@ pub fn depth_texture(width: u32, height: u32) -> DepthTexture {
 pub fn depth_texture_array(width: u32, height: u32, layers: u32) -> DepthTextureArray {
     check_texture_size(width, height, 1)
     check_layers(layers)
-    let handle = create_texture_of(width, height, FORMAT_DEPTH32FLOAT, KIND_ARRAY, layers, 1)
+    let handle = create_texture_of(
+        width,
+        height,
+        FORMAT_DEPTH32FLOAT,
+        KIND_ARRAY,
+        layers,
+        1,
+        FORMAT_DEPTH32FLOAT_BYTES,
+        1,
+    )
     DepthTextureArray { handle, width, height, layers }
 }
 
@@ -2640,6 +2776,10 @@ pub fn generate_mips<F: Storage + Filtered>(tex: mut Texture<F>, s: Sampler) {
 }
 
 @intrinsic
+fn new_texture(width: u32, height: u32, format: u32, kind: u32, layers: u32, levels: u32) -> u32 {}
+
+/// A texture of `format` (whose blocks are `block` texels square, `bytes` each), counted in
+/// `memory()`.
 fn create_texture_of(
     width: u32,
     height: u32,
@@ -2647,7 +2787,31 @@ fn create_texture_of(
     kind: u32,
     layers: u32,
     levels: u32,
-) -> u32 {}
+    bytes: u32,
+    block: u32,
+) -> u32 {
+    let handle = new_texture(width, height, format, kind, layers, levels)
+    count_memory(1, texture_bytes(width, height, layers, levels, bytes, block), true)
+    handle
+}
+
+/// A texture's bytes as the hosts count them: each level's blocks, for each layer (a 3D
+/// texture's depth counts as its layers).
+fn texture_bytes(width: u32, height: u32, layers: u32, levels: u32, bytes: u32, block: u32) -> u64 {
+    var total: u64 = 0
+    for l in 0..levels {
+        let w = blocks(level_side(width, l), block)
+        let h = blocks(level_side(height, l), block)
+        total += u64(w) * u64(h) * u64(bytes)
+    }
+    total * u64(layers)
+}
+
+/// Destroys texture `handle`, its bytes uncounted from `memory()`.
+fn drop_texture(handle: u32, bytes: u64) {
+    destroy_texture(handle)
+    count_memory(1, bytes, false)
+}
 
 @intrinsic
 fn write_texture_rows(

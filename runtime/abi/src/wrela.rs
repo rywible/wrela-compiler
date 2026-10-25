@@ -22,6 +22,7 @@ const NUMBERS: &[(&str, u32, &str)] = &[
     ("TICK_WANT_HASH", TICK_WANT_HASH, "Nonzero when the host wants the ticker's state hash."),
     ("TICK_HASH", TICK_HASH, "The state hash the ticker reported last, a `u64`."),
     ("TICK_ORIGIN", TICK_ORIGIN, "The sim clock's origin, an `f64`: when tick 0 was due."),
+    ("GPU_STATE", GPU_STATE, "std's count of the GPU's bytes: buffers, textures, and each's most."),
     ("THREADS", THREADS, "The most threads a program runs on."),
     ("THREAD_BLOCKS", THREAD_BLOCKS, "The threads' blocks, one after another."),
     ("THREAD_BLOCK_SIZE", THREAD_BLOCK_SIZE, "The bytes of each thread's block."),
