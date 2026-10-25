@@ -1133,9 +1133,11 @@ test("a program's ask for a label's time is answered once its frame has ended an
   const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
   expect(executor.timed).toBe(false);
   let answered: Uint8Array | null = null;
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  // As a program asks: its `Timed` command runs, then its request starts.
+  run(new Encoder().timed(1, "look"));
   const asked = executor.timeLabel("look").then((b) => (answered = b));
   expect(executor.timed).toBe(true);
-  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
   const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
   // Frame 0's labelled work spans two submissions.
   run(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look")));
@@ -1160,6 +1162,7 @@ test("an ask times only its own label's work: the rest runs untimed, its dispatc
   const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
   const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
   const twice = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [1, 2], u(1));
+  run(new Encoder().timed(1, "look"));
   const asked = executor.timeLabel("look");
   run(twice(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("other")));
   executor.flush();
@@ -1178,6 +1181,30 @@ test("an ask times only its own label's work: the rest runs untimed, its dispatc
   executor.destroyAll();
 });
 
+test("an ask made while commands wait for a pipeline times only the work recorded after it", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const m = shapes();
+  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const later = Promise.withResolvers<BuiltPipeline>();
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  // Two dispatches of the label, then the ask, then one more: all wait for the pipeline.
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look").dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [1, 2], u(1)).timed(1, "look"));
+  const asked = executor.timeLabel("look");
+  run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(2)));
+  expect(executor.waiting).toBe(true);
+  const caughtUp = executor.caughtUp();
+  later.resolve(compute!);
+  await caughtUp;
+  executor.flush();
+  // The two before the ask share an untimed pass; the one after it is timed, a pass of its own.
+  expect(executor.takeCounters().compute_passes).toBe(2);
+  executor.frame = 1;
+  await asked;
+  executor.destroyAll();
+});
+
 test("a GPU without timestamp queries refuses an ask for a time", async () => {
   const device = new FakeDevice();
   const m = shapes();
@@ -1193,8 +1220,9 @@ test("in the serial mode, a label's time waits for its frame's drained passes", 
   const [, compute] = await buildAll(device, m);
   const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET, "serial");
   let answered: Uint8Array | null = null;
-  const asked = executor.timeLabel("look").then((b) => (answered = b));
   const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  run(new Encoder().timed(1, "look"));
+  const asked = executor.timeLabel("look").then((b) => (answered = b));
   const dispatch = (e: Encoder) => e.dispatch(1, [1, 1, 1], [1, 2], u(0));
   run(dispatch(dispatch(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look"))));
   // The drain waits after its first dispatch, while the next frame begins.
