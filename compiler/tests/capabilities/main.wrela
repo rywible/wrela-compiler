@@ -315,6 +315,8 @@ fn record(s: mut State) {
     draw_multi(p, cover, colour.bind(vec4(0.0, 0.0, 1.0, 1.0)), indirect: s.args, count: 2)
     p.end()
     s.reads.push(read_texture(s.multi.level(0)))
+    // 18: an array's layer read back.
+    s.reads.push(read_texture(s.layered.layer(1)))
 }
 
 /// The little-endian `u32` at byte `i` of `b`.
@@ -334,8 +336,8 @@ fn close(d: f32) -> bool {
 
 @test(frames: 6, gpu: true)
 fn every_read_came_back(s: State) {
-    assert(s.got.len() == 18)
-    for k in 0..18 {
+    assert(s.got.len() == 19)
+    for k in 0..19 {
         assert(s.got[k].len() > 0)
     }
 }
@@ -443,3 +445,10 @@ fn a_multi_draw_draws_each_of_its_draws(s: State) {
 
 @test(frames: 4, gpu: true, hosts: both)
 fn both_hosts_record_the_same_capabilities(s: State) {}
+
+@test(frames: 6, gpu: true)
+fn an_arrays_layer_reads_back(s: State) {
+    // Layer 1's kernel wrote 0.5 in red, at every texel of its 4 × 4.
+    assert(s.got[18].len() == 4 * 4 * 8)
+    assert(close(half(s.got[18], 0) - 0.5) && close(half(s.got[18], 4 * 15) - 0.5))
+}

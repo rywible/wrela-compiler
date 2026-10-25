@@ -1810,9 +1810,9 @@ impl<F: Storage + Filtered> Texture3d<F> {
 /// in recorded order with dispatches and draws: two textures of one format, each at the level
 /// it names (`tex.level(i)`, `other.level_mut(j)`), or whole (level 0). A rectangle past either
 /// level's edge panics.
-pub fn copy_texture<F: Format>(
-    from: TextureLevel<F>,
-    to: TextureLevelMut<F>,
+pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
+    from: S,
+    to: T,
     x: u32 = 0,
     y: u32 = 0,
     width: u32 = 0,
@@ -1820,24 +1820,24 @@ pub fn copy_texture<F: Format>(
     to_x: u32 = 0,
     to_y: u32 = 0,
 ) {
-    let (fw, fh) = (from.width(), from.height())
-    let w = if width == 0 { fw } else { width }
-    let h = if height == 0 { fh } else { height }
-    if x > fw || w > fw - x || y > fh || h > fh - y {
+    let (a, b) = (from.source(), to.target())
+    let w = if width == 0 { a.width } else { width }
+    let h = if height == 0 { a.height } else { height }
+    if x > a.width || w > a.width - x || y > a.height || h > a.height - y {
         panic("copy_texture: the rectangle runs past the source's edge")
     }
-    if to_x > to.width() || w > to.width() - to_x || to_y > to.height() || h > to.height() - to_y {
+    if to_x > b.width || w > b.width - to_x || to_y > b.height || h > b.height - to_y {
         panic("copy_texture: the rectangle runs past the destination's edge")
     }
     copy_texture_command(
-        from.texture.handle,
-        from.level,
-        0,
+        a.handle,
+        a.level,
+        a.layer,
         x,
         y,
-        to.texture.handle,
-        to.level,
-        0,
+        b.handle,
+        b.level,
+        b.layer,
         to_x,
         to_y,
         w,
@@ -1848,20 +1848,21 @@ pub fn copy_texture<F: Format>(
 /// Copies a level of a texture into a buffer of its texels, row by row: `to` must hold
 /// `rows_of(width) * height` `u32`s, each row padded to 256 bytes (WebGPU's rule); `read_texture`
 /// unpads them. In recorded order.
-pub fn copy_texture_to_buffer<F: Format>(from: TextureLevel<F>, to: mut GpuBuffer<u32>) {
-    let (w, h) = (from.width(), from.height())
-    let row = padded_row(w * F::bytes())
-    if to.len() * 4 < row * h {
+pub fn copy_texture_to_buffer<F: Format, S: TexelSource<F>>(from: S, to: mut GpuBuffer<u32>) {
+    let a = from.source()
+    let (bw, bh) = (blocks(a.width, F::block()), blocks(a.height, F::block()))
+    let row = padded_row(bw * F::bytes())
+    if to.len() * 4 < row * bh {
         panic("copy_texture_to_buffer: the buffer is smaller than the texture's padded rows")
     }
     copy_texture_to_buffer_command(
-        from.texture.handle,
-        from.level,
+        a.handle,
+        a.level,
+        a.layer,
         0,
         0,
-        0,
-        w,
-        h,
+        a.width,
+        a.height,
         to.handle,
         0,
         row,
@@ -1871,9 +1872,9 @@ pub fn copy_texture_to_buffer<F: Format>(from: TextureLevel<F>, to: mut GpuBuffe
 /// Copies a buffer of texels into a level of a texture, row by row (rows padded to 256 bytes,
 /// as `copy_texture_to_buffer` writes them): what a kernel encoded (compressed blocks too, a
 /// row of blocks a row) becomes a texture. In recorded order.
-pub fn copy_buffer_to_texture<F: Format>(from: GpuSpan<u32>, to: TextureLevelMut<F>) {
-    let (w, h) = (to.width(), to.height())
-    let (bw, bh) = (blocks(w, F::block()), blocks(h, F::block()))
+pub fn copy_buffer_to_texture<F: Format, T: TexelTarget<F>>(from: GpuSpan<u32>, to: T) {
+    let b = to.target()
+    let (bw, bh) = (blocks(b.width, F::block()), blocks(b.height, F::block()))
     let row = padded_row(bw * F::bytes())
     if from.count * 4 < row * bh {
         panic("copy_buffer_to_texture: the span is smaller than the texture's padded rows")
@@ -1882,14 +1883,84 @@ pub fn copy_buffer_to_texture<F: Format>(from: GpuSpan<u32>, to: TextureLevelMut
         from.buffer.handle,
         from.start * 4,
         row,
-        to.texture.handle,
-        to.level,
+        b.handle,
+        b.level,
+        b.layer,
         0,
         0,
-        0,
-        w,
-        h,
+        b.width,
+        b.height,
     )
+}
+
+/// Where a copy reads texels (`copy_texture`, `copy_texture_to_buffer`, `read_texture`): a level
+/// of a texture (`tex.level(i)`), or level 0 of an array's layer or a cube's face
+/// (`arr.layer(i)`).
+pub trait TexelSource<F: Format> {
+    fn source(self) -> TexelPlace
+}
+
+/// Where a copy writes texels (`copy_texture`, `copy_buffer_to_texture`): a level of a texture
+/// (`tex.level_mut(i)`), or a level of an array's layer (`arr.layer_mut(i, level)`).
+pub trait TexelTarget<F: Format> {
+    fn target(self) -> TexelPlace
+}
+
+/// One level of one layer of a texture, and its size: what a copy reads or writes.
+pub struct TexelPlace: Copy {
+    handle: u32,
+    level: u32,
+    layer: u32,
+    width: u32,
+    height: u32,
+}
+
+impl<F: Format> TexelSource<F> for TextureLevel<F> {
+    fn source(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.texture.handle,
+            level: self.level,
+            layer: 0,
+            width: self.width(),
+            height: self.height(),
+        }
+    }
+}
+
+impl<F: Format> TexelSource<F> for TextureLayer<F> {
+    fn source(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.array.handle,
+            level: 0,
+            layer: self.layer,
+            width: self.array.width,
+            height: self.array.height,
+        }
+    }
+}
+
+impl<F: Format> TexelTarget<F> for TextureLevelMut<F> {
+    fn target(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.texture.handle,
+            level: self.level,
+            layer: 0,
+            width: self.width(),
+            height: self.height(),
+        }
+    }
+}
+
+impl<F: Format> TexelTarget<F> for TextureLayerMut<F> {
+    fn target(self) -> TexelPlace {
+        TexelPlace {
+            handle: self.array.handle,
+            level: self.level,
+            layer: self.layer,
+            width: level_side(self.array.width, self.level),
+            height: level_side(self.array.height, self.level),
+        }
+    }
 }
 
 /// `n` texels in blocks of `b`.
@@ -1906,24 +1977,25 @@ fn padded_row(bytes: u32) -> u32 {
 /// texels' bytes, rows top to bottom, `F::bytes()` a texel, unpadded. A request, answered on a
 /// later call (§17.1), and `nondet` as `read` is. It records a copy into a buffer it makes,
 /// which it releases once it's read.
-pub fn read_texture<F: Format>(from: TextureLevel<F>) -> TextureRead {
-    let (w, h) = (from.width(), from.height())
-    let row = padded_row(w * F::bytes())
-    var staging: GpuBuffer<u32> = buffer(row * h / 4)
+pub fn read_texture<F: Format, S: TexelSource<F>>(from: S) -> TextureRead {
+    let a = from.source()
+    let (bw, bh) = (blocks(a.width, F::block()), blocks(a.height, F::block()))
+    let row = padded_row(bw * F::bytes())
+    var staging: GpuBuffer<u32> = buffer(row * bh / 4)
     copy_texture_to_buffer_command(
-        from.texture.handle,
-        from.level,
+        a.handle,
+        a.level,
+        a.layer,
         0,
         0,
-        0,
-        w,
-        h,
+        a.width,
+        a.height,
         staging.handle,
         0,
         row,
     )
     let pending = read(staging.items())
-    TextureRead { staging, pending, row, packed: w * F::bytes(), height: h }
+    TextureRead { staging, pending, row, packed: bw * F::bytes(), height: bh }
 }
 
 /// A texture's texels on their way back to the CPU (`read_texture`).

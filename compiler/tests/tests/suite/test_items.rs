@@ -756,7 +756,7 @@ fn every_gpu_capability_reads_back_what_it_drew() {
     let failed: Vec<_> =
         out.results.iter().filter(|r| r.failure.is_some()).map(|r| &r.name).collect();
     assert!(failed.is_empty(), "failed: {failed:?}");
-    assert_eq!(out.results.len(), 13);
+    assert_eq!(out.results.len(), 14);
 }
 
 /// Toolchain 0.6's kernel capabilities (compiler/tests/kernels): a histogram in workgroup
