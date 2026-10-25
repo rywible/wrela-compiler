@@ -20,5 +20,8 @@ wtransport = { version = "0.7", features = ["quinn", "self-signed"] }
 tokio = { version = "1", features = ["io-util", "rt-multi-thread", "macros", "sync", "time"] }
 url = "2.5"
 
+[dev-dependencies]
+wat = "1.260"
+
 [lints]
 workspace = true

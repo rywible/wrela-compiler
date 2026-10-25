@@ -534,10 +534,10 @@ test("a pass that may join the one before, on the same targets kept, runs as par
       .createBuffer(2, 64)
       .createTexture(3, 8, 8, "rgba8unorm")
       .createTexture(4, 8, 8, "depth32float")
+      .label("joins")
       .beginPass(offscreen(3, 4))
       .draw(0, 3, 1, [1, 2], u(0))
       .endPass()
-      .label("joins")
       .beginPass({ ...offscreen(3, 4, true), keepDepth: true, join: true })
       .draw(0, 3, 1, [1, 2], u(1))
       .endPass()
@@ -549,6 +549,45 @@ test("a pass that may join the one before, on the same targets kept, runs as par
   // The second runs in the first's render pass; the third, which may not join, is its own.
   expect(device.events.filter((e) => e.kind === "renderPass").length).toBe(2);
   expect(device.events.filter((e) => e.kind === "draw").length).toBe(3);
+});
+
+test("a pass joins only one of its own label: a label between them records the one before", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET);
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const joining = { ...offscreen(3, NONE, true), join: true };
+  run(new Encoder().timed(1, "B"));
+  const asked = executor.timeLabel("B").then(() => "answered");
+  run(
+    new Encoder()
+      .createBuffer(1, 64)
+      .createBuffer(2, 64)
+      .createTexture(3, 8, 8, "rgba8unorm")
+      .label("A")
+      .beginPass(offscreen(3, NONE))
+      .draw(0, 3, 1, [1, 2], u(0))
+      .endPass()
+      .label("B")
+      .beginPass(joining)
+      .draw(0, 3, 1, [1, 2], u(1))
+      .endPass()
+      // The same name given again still records the pass before; the pass after it joins.
+      .label("B")
+      .beginPass(joining)
+      .draw(0, 3, 1, [1, 2], u(2))
+      .endPass()
+      .beginPass(joining)
+      .draw(0, 3, 1, [1, 2], u(3))
+      .endPass(),
+  );
+  executor.flush();
+  expect(device.passLabels).toEqual(["A", "B", "B"]);
+  expect(device.events.filter((e) => e.kind === "draw")).toHaveLength(4);
+  // B's work is B's, so its ask is answered.
+  executor.frame = 1;
+  expect(await Promise.race([asked, Bun.sleep(100).then(() => "pending")])).toBe("answered");
+  executor.destroyAll();
 });
 
 test("passes with conflicting buffer access stay separate even when their targets may join", async () => {
@@ -680,6 +719,19 @@ test("a command whose pipeline is still being built waits for it, and the comman
   // The readback after them copies once they're submitted.
   expect(kinds(device.events)).toEqual(["dispatch", "copyBuffer", "writeBuffer", "writeBuffer", "submit", "copyBuffer", "submit"]);
   expect((await answer).length).toBe(4);
+});
+
+test.each(["off", "serial"] as const)("unchecked, a dispatch or draw of a pipeline the manifest doesn't have fails at once (timing %s)", async (timing) => {
+  const device = new FakeDevice();
+  const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET, timing);
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64));
+  expect(() => run(new Encoder().dispatch(2, [1, 1, 1], [1, 2], u(0)))).toThrow("Dispatch failed: there's no pipeline 2 (the manifest has 2)");
+  expect(() => run(new Encoder().beginScreenPass([0, 0, 0, 1]).draw(7, 3, 1, [1, 2], u(0)))).toThrow("Draw failed: there's no pipeline 7 (the manifest has 2)");
+  // Neither waits for a pipeline that will never be built.
+  expect(executor.waiting).toBe(false);
+  await executor.drain();
+  executor.destroyAll();
 });
 
 test("a command backlog advances across staggered pipelines and keeps writes and readbacks in order", async () => {
@@ -977,8 +1029,7 @@ test("retiring an executor waits for a debug read before releasing its mapped bu
 test("a failed timestamp read releases its staging buffer and retirement releases its queries", async () => {
   const device = new FakeDevice();
   device.features.add("timestamp-query");
-  const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, pipelines, SCREEN_TARGET, "span");
+  const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET, "span");
   const create = device.createBuffer.bind(device);
   device.createBuffer = (descriptor) => {
     const buffer = create(descriptor);
@@ -1002,8 +1053,7 @@ test("a failed timestamp read releases its staging buffer and retirement release
 
 test("a pipeline failure rejects readbacks already taken by a serial drain", async () => {
   const device = new FakeDevice();
-  const m = shapes();
-  const [draw] = await Promise.all(buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT));
+  const [draw] = await buildAll(device, shapes());
   const later = Promise.withResolvers<BuiltPipeline>();
   const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET, "serial");
   void executor.built.catch(() => {});
@@ -1019,7 +1069,7 @@ test("a pipeline failure rejects readbacks already taken by a serial drain", asy
 
 test("retirement cancels readbacks and commands already taken by a serial drain", async () => {
   const device = new FakeDevice();
-  const pipelines = await Promise.all(buildPipelines(device.gpu, shapes(), [SHADER, SHADER], SCREEN_FORMAT));
+  const pipelines = await buildAll(device, shapes());
   const later = Promise.withResolvers<BuiltPipeline>();
   const executor = new GpuExecutor(device.gpu, [pipelines[0]!, later.promise], SCREEN_TARGET, "serial");
   for (const cmd of decode(new Encoder().createBuffer(1, 64).createBuffer(2, 64)
@@ -1184,10 +1234,9 @@ test("an ask times only its own label's work: the rest runs untimed, its dispatc
 test("an ask made while commands wait for a pipeline times only the work recorded after it", async () => {
   const device = new FakeDevice();
   device.features.add("timestamp-query");
-  const m = shapes();
-  const [draw, compute] = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));
+  const [draw, compute] = await buildAll(device, shapes());
   const later = Promise.withResolvers<BuiltPipeline>();
-  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const executor = new GpuExecutor(device.gpu, [draw!, later.promise], SCREEN_TARGET);
   const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
   // Two dispatches of the label, then the ask, then one more: all wait for the pipeline.
   run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look").dispatch(1, [1, 1, 1], [1, 2], u(0)).dispatch(1, [1, 1, 1], [1, 2], u(1)).timed(1, "look"));
@@ -1205,12 +1254,63 @@ test("an ask made while commands wait for a pipeline times only the work recorde
   executor.destroyAll();
 });
 
+test("an ask times only its label's work recorded after it, also in the frame it was asked in", async () => {
+  const device = new FakeDevice();
+  device.features.add("timestamp-query");
+  const create = device.createBuffer.bind(device);
+  device.createBuffer = (descriptor) => {
+    const buffer = create(descriptor);
+    // The two dispatches' timestamps: X1 takes 2 µs, X2 7 µs.
+    if (descriptor.label === "timestamps" && (descriptor.usage & GPUBufferUsage.MAP_READ) !== 0) {
+      buffer.contents = new Uint8Array(new BigUint64Array([1000n, 3000n, 5000n, 12000n]).buffer);
+    }
+    return buffer;
+  };
+  const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET);
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  const micros = (bytes: Uint8Array) => new Float32Array(bytes.buffer)[0];
+  // As a program asks: each `Timed` command runs, then its request starts.
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).label("look").timed(1, "look"));
+  const first = executor.timeLabel("look").then(micros);
+  run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(0)).timed(2, "look"));
+  const second = executor.timeLabel("look").then(micros);
+  run(new Encoder().dispatch(1, [1, 1, 1], [1, 2], u(1)));
+  executor.flush();
+  executor.frame = 1;
+  // The first ask gets X1 + X2; the second, made after X1, gets X2 alone.
+  expect(await first).toBe(9);
+  expect(await second).toBe(7);
+  executor.destroyAll();
+});
+
 test("a GPU without timestamp queries refuses an ask for a time", async () => {
   const device = new FakeDevice();
   const m = shapes();
   const [, compute] = await buildAll(device, m);
   const executor = new GpuExecutor(device.gpu, [compute!, compute!], SCREEN_TARGET);
-  await expect(executor.timeLabel("look")).rejects.toThrow("no timestamp queries");
+  // Each ask uses up its `Timed` command, refused or not: what waits for an ask is kept from
+  // that command to its ask, and doesn't pile up frame after frame.
+  const kept: string[] = [];
+  const [set, remove] = [Map.prototype.set, Map.prototype.delete];
+  const spies = [
+    spyOn(Map.prototype, "set").mockImplementation(function (this: Map<unknown, unknown>, key, value) {
+      if (key === "look") kept.push(`set ${JSON.stringify(value)}`);
+      return set.call(this, key, value);
+    }),
+    spyOn(Map.prototype, "delete").mockImplementation(function (this: Map<unknown, unknown>, key) {
+      if (key === "look") kept.push("delete");
+      return remove.call(this, key);
+    }),
+  ];
+  try {
+    for (let i = 0; i < 3; i++) {
+      for (const cmd of decode(new Encoder().timed(i, "look").finish())) executor.execute(cmd);
+      await expect(executor.timeLabel("look")).rejects.toThrow("no timestamp queries");
+    }
+  } finally {
+    for (const spy of spies) spy.mockRestore();
+  }
+  expect(kept).toEqual(["set [0]", "delete", "set [0]", "delete", "set [0]", "delete"]);
 });
 
 test("in the serial mode, a label's time waits for its frame's drained passes", async () => {
@@ -1271,6 +1371,33 @@ test("the executor counts what it did below the stream, until its counters are t
     pipelines: 2,
   });
   expect(executor.takeCounters().draws).toBe(0);
+});
+
+test.each([true, false])("a multi-draw is one call with the device's multi-draw (%p), else one draw each", async (multi) => {
+  const device = new FakeDevice();
+  if (multi) device.features.add("chromium-experimental-multi-draw-indirect" as GPUFeatureName);
+  const executor = new GpuExecutor(device.gpu, await buildAll(device, shapes()), SCREEN_TARGET);
+  const run = (e: Encoder) => { for (const cmd of decode(e.finish())) executor.execute(cmd); };
+  run(new Encoder().createBuffer(1, 64).createBuffer(2, 64).createBuffer(3, 256).createBuffer(4, 64).beginScreenPass([0, 0, 0, 1]));
+  const drawn = { pipeline: 0, bindings: [1, 2].map((handle) => ({ handle, offset: 0, size: 64 })), uniforms: u(0) };
+  const multiDrawn = { ...drawn, arguments: 3, count_buffer: NONE, count_offset: 0 };
+  executor.execute({ ...drawn, op: "DrawIndexed", indices: 4, index_offset: 0, index_size: 64, index_count: 6, instances: 2, first_index: 1, base_vertex: -1, first_instance: 3 });
+  executor.execute({ ...multiDrawn, op: "MultiDrawIndirect", indices: null, offset: 16, count: 3 });
+  executor.execute({ ...multiDrawn, op: "MultiDrawIndexedIndirect", indices: [4, 0, 64], offset: 0, count: 2 });
+  run(new Encoder().present());
+  const args = { pipeline: "draw", buffer: "buffer 3" };
+  const expected: Event[] = [{ kind: "drawIndexed", pipeline: "draw", count: 6, instances: 2, first: 1, base: -1, firstInstance: 3, indices: "buffer 4" }];
+  if (multi) {
+    expected.push({ kind: "multiDrawIndirect", ...args, offset: 16, count: 3 });
+    expected.push({ kind: "multiDrawIndexedIndirect", ...args, offset: 0, count: 2, indices: "buffer 4" });
+  } else {
+    // One draw each, at its arguments' stride: 16 bytes, or 20 indexed.
+    for (const offset of [16, 32, 48]) expected.push({ kind: "drawIndirect", ...args, offset });
+    for (const offset of [0, 20]) expected.push({ kind: "drawIndexedIndirect", ...args, offset, indices: "buffer 4" });
+  }
+  expect(device.events.filter((e) => e.kind.startsWith("draw") || e.kind.startsWith("multi"))).toEqual(expected);
+  const counted = executor.takeCounters();
+  expect({ draws: counted.draws, draw_calls: counted.draw_calls }).toEqual({ draws: 6, draw_calls: multi ? 3 : 6 });
 });
 
 test("a pipeline isn't made for a target the device can't blend into as it blends", async () => {

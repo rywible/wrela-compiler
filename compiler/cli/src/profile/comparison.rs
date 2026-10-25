@@ -14,9 +14,18 @@ impl Storage {
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_nanos();
+        Self::at(nonce)
+    }
+
+    /// Named by the process, the time (`nonce`) and a count of this process's, so two made in
+    /// one tick of the clock are two.
+    fn at(nonce: u128) -> Result<Self, String> {
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
-            .join(format!("wrela-profile-storage-{}-{nonce}", std::process::id()));
-        std::fs::create_dir(&path).map_err(|e| e.to_string())?;
+            .join(format!("wrela-profile-storage-{}-{nonce}-{n}", std::process::id()));
+        std::fs::create_dir(&path)
+            .map_err(|e| format!("can't make the storage {}: {e}", path.display()))?;
         Ok(Self(path))
     }
 }
@@ -39,7 +48,10 @@ pub(super) fn validate_saved_build(package: &Path, before: &Path) -> Result<(), 
 /// Whether building into `<package>/build/<subdir>` would overwrite the saved build `saved`
 /// (canonical): that directory is it, inside it, or around it.
 pub(crate) fn overwritten_by(package: &Path, subdir: &str, saved: &Path) -> Result<bool, String> {
-    let generated = package.canonicalize().map_err(|e| e.to_string())?.join("build").join(subdir);
+    let generated = (package.canonicalize())
+        .map_err(|e| format!("can't read the package `{}`: {e}", package.display()))?
+        .join("build")
+        .join(subdir);
     let generated = generated.canonicalize().unwrap_or(generated);
     Ok(saved.starts_with(&generated) || generated.starts_with(saved))
 }
@@ -325,6 +337,20 @@ pub(super) fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storages_made_in_one_tick_are_each_their_own() {
+        let a = Storage::at(7).expect("a storage");
+        let b = Storage::at(7).expect("another in the same tick");
+        assert_ne!(a.0, b.0);
+    }
+
+    #[test]
+    fn a_missing_package_is_named() {
+        let missing = std::env::temp_dir().join("wrela-no-such-package");
+        let e = overwritten_by(&missing, "same", Path::new("/")).expect_err("no package");
+        assert!(e.contains("wrela-no-such-package"), "{e}");
+    }
 
     #[test]
     fn comparisons_report_noise_zero_cost_and_missing_work_without_a_timing_gate() {

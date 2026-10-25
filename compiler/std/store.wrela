@@ -20,8 +20,9 @@ use std::serialize::{Reader, Writer}
 
 /// The longest key (bytes).
 pub const MAX_KEY: u32 = 1024
-/// The longest value (bytes).
-pub const MAX_VALUE: u32 = 1048576
+/// The longest value (bytes): 1020 KiB, so a put of the longest key and value fits in one host
+/// request (1 MiB less its words).
+pub const MAX_VALUE: u32 = 1044480
 
 /// Asks for the value of `key`: `value` reads the answer.
 @server
@@ -80,11 +81,11 @@ pub fn entries(answer: [u8]) -> Option<Vec<Entry>> {
     Some(out)
 }
 
-/// Sets `key`'s value to `value` when the call returns.
+/// Sets `key`'s value to `value` when the call returns. A value longer than `MAX_VALUE` panics.
 @server
 pub fn put(key: [u8], value: [u8]) {
     check_key(key)
-    assert(value.len() <= MAX_VALUE, "a store value is at most 1 MiB")
+    assert(value.len() <= MAX_VALUE, "a store value is at most 1020 KiB")
     var w = Writer::new()
     w.write_u8(1)
     w.write_counted(key)

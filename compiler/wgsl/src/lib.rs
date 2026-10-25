@@ -1725,7 +1725,6 @@ impl<'a, 'm> Fb<'a, 'm> {
     }
 }
 
-/// A texture's dimension: 3D when `three`, else 2D.
 /// A texture binding's naga dimension, and whether it's arrayed.
 fn image_dim(dim: ir::TexDim) -> (naga::ImageDimension, bool) {
     match dim {

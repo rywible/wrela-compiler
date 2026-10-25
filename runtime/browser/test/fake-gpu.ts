@@ -40,6 +40,9 @@ export type Event =
   | { kind: "dispatchIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndexedIndirect"; pipeline: string; buffer: string; offset: number; indices: string }
+  | { kind: "drawIndexed"; pipeline: string; count: number; instances: number; first: number; base: number; firstInstance: number; indices: string }
+  | { kind: "multiDrawIndirect"; pipeline: string; buffer: string; offset: number; count: number }
+  | { kind: "multiDrawIndexedIndirect"; pipeline: string; buffer: string; offset: number; count: number; indices: string }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
   | { kind: "scissor"; rect: [number, number, number, number] }
   | { kind: "viewport"; rect: [number, number, number, number] }
@@ -256,6 +259,16 @@ export class FakeDevice {
         },
         drawIndexedIndirect(b: FakeBuffer, offset: number) {
           events.push({ kind: "drawIndexedIndirect", pipeline, buffer: b.label, offset, indices });
+        },
+        drawIndexed(count: number, instances: number, first: number, base: number, firstInstance: number) {
+          events.push({ kind: "drawIndexed", pipeline, count, instances, first, base, firstInstance, indices });
+        },
+        // Chromium's multi-draw: the executor uses it only on a device with its feature.
+        multiDrawIndirect(b: FakeBuffer, offset: number, count: number) {
+          events.push({ kind: "multiDrawIndirect", pipeline, buffer: b.label, offset, count });
+        },
+        multiDrawIndexedIndirect(b: FakeBuffer, offset: number, count: number) {
+          events.push({ kind: "multiDrawIndexedIndirect", pipeline, buffer: b.label, offset, count, indices });
         },
         setScissorRect(x: number, y: number, w: number, h: number) {
           events.push({ kind: "scissor", rect: [x, y, w, h] });

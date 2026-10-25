@@ -6,7 +6,8 @@
 //! `results/console.log` as it comes.
 //!
 //! **The server** is this run's own, on a free port of 127.0.0.1, over the directory it's given
-//! (the repository), with the toolchain's servers' rules (`crate::loopback`): a request must
+//! (the repository, or a build's directory that is the page itself, so that nothing beside it is
+//! served), with the toolchain's servers' rules (`crate::loopback`): a request must
 //! name this machine, every answer is cross-origin isolated, a file is reached one part at a
 //! time following no link, nothing under `.git` is served, and a `PUT` goes only to a plain file
 //! name in a `results/` directory. [`run_url`] runs a page that another server serves (`wrela
@@ -47,9 +48,10 @@ const MOST_CONNECTIONS: usize = 64;
 
 /// A page to run.
 pub struct Page<'a> {
-    /// The directory the server serves: the repository.
+    /// The directory the server serves: the repository, or the page's own directory.
     pub root: &'a Path,
-    /// The page's directory, from `root`, with `/` between its parts.
+    /// The page's directory, from `root`, with `/` between its parts; empty: `root` itself is
+    /// the page, at `/`, so nothing beside it is served.
     pub page: &'a str,
     /// The URL's fragment: `#test&frames=...`.
     pub fragment: &'a str,
@@ -149,18 +151,27 @@ fn fresh_results(dir: &Path, opened: &Dir) -> Result<PathBuf, String> {
 /// Runs `page` in Chrome: `Ok` if it put `ok` in `results/DONE` (and its script finished), else
 /// why not.
 pub fn run(page: Page) -> Result<(), String> {
-    if !page.page.split('/').all(|p| !p.is_empty() && p != "." && p != "..") {
-        return Err(format!("a page's directory is a plain path from the root, not {}", page.page));
-    }
-    let dir = page.root.join(page.page);
     let root = Dir::open_ambient_dir(page.root, cap_std::ambient_authority())
         .map_err(|e| format!("{}: {e}", page.root.display()))?;
-    let parts = confined::parts(page.page)?;
-    let opened = confined::open_dir(&root, &parts, false)
-        .map_err(|e| format!("no plain page directory at {}: {e}", dir.display()))?;
+    let (dir, opened, path) = if page.page.is_empty() {
+        let opened = root.try_clone().map_err(|e| format!("{}: {e}", page.root.display()))?;
+        (page.root.to_path_buf(), opened, String::new())
+    } else {
+        if !page.page.split('/').all(|p| !p.is_empty() && p != "." && p != "..") {
+            return Err(format!(
+                "a page's directory is a plain path from the root, not {}",
+                page.page
+            ));
+        }
+        let dir = page.root.join(page.page);
+        let parts = confined::parts(page.page)?;
+        let opened = confined::open_dir(&root, &parts, false)
+            .map_err(|e| format!("no plain page directory at {}: {e}", dir.display()))?;
+        (dir, opened, format!("{}/", page.page))
+    };
     let results = fresh_results(&dir, &opened)?;
     let server = Server::start(root, page.page)?;
-    let url = format!("http://127.0.0.1:{}/{}/{}", server.port, page.page, page.fragment);
+    let url = format!("http://127.0.0.1:{}/{path}{}", server.port, page.fragment);
     let done = server.done.clone();
     drive(&url, &results, page.timeout, page.script, &|| locked(&done).clone())
 }
@@ -299,7 +310,8 @@ struct ServerState {
 }
 
 impl Server {
-    /// Serves the root `dir` on a free port, watching for `page/results/DONE`.
+    /// Serves the root `dir` on a free port, watching for `page/results/DONE` (`results/DONE`
+    /// with an empty `page`: the root is the page).
     fn start(dir: Dir, page: &str) -> Result<Server, String> {
         Self::start_with(dir, page, MOST_CONNECTIONS, REQUEST_DEADLINE)
     }
@@ -435,7 +447,10 @@ fn connection(
                 )
             };
             let [above @ .., "results", name] = parts.as_slice() else { return refused(&mut out) };
-            if above.is_empty() || above.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+            // The root's own `results/` only when the root is the page.
+            if (above.is_empty() && !page.is_empty())
+                || above.iter().any(|p| p.is_empty() || *p == "." || *p == "..")
+            {
                 return refused(&mut out);
             }
             let Ok(at) = crate::confined::open_dir(dir, above, false) else {
@@ -616,6 +631,7 @@ mod tests {
             )
         };
         assert!(put("/p/notes.txt", "x").starts_with("HTTP/1.1 403"), "only into results/");
+        assert!(put("/results/x", "x").starts_with("HTTP/1.1 403"), "the root isn't the page");
         assert!(put("/p/results/frame.json", "{}").starts_with("HTTP/1.1 201"));
         assert_eq!(std::fs::read_to_string(root.join("p/results/frame.json")).expect("put"), "{}");
         assert!(locked(&server.done).is_none());
@@ -624,5 +640,43 @@ mod tests {
         drop(server);
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "its port is closed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A root that is the page (an empty `page`, as a build's checks run it) is served at `/`,
+    /// takes its results and hears their `DONE`, and serves nothing beside it.
+    #[test]
+    fn a_root_that_is_the_page_serves_nothing_beside_it() {
+        let base = std::env::temp_dir().join(format!("wrela-pages-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let build = base.join("build");
+        std::fs::create_dir_all(build.join("results")).expect("dirs");
+        std::fs::write(build.join("index.html"), "<p>hi</p>").expect("page");
+        std::fs::write(base.join("beside.txt"), "secret").expect("beside");
+        std::fs::create_dir_all(base.join("other/results")).expect("other");
+        let server = Server::start(root_dir(&build), "").expect("serve");
+        let port = server.port;
+        let ask = |method: &str, path: &str, body: &str| {
+            exchange(
+                port,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let page = ask("GET", "/", "");
+        assert!(page.starts_with("HTTP/1.1 200") && page.ends_with("<p>hi</p>"), "{page}");
+        for path in ["/../beside.txt", "/%2e%2e/beside.txt", "/..%2fbeside.txt"] {
+            let got = ask("GET", path, "");
+            assert!(!got.starts_with("HTTP/1.1 2") && !got.contains("secret"), "{path}: {got}");
+        }
+        for path in ["/../other/results/x", "/%2e%2e/other/results/x"] {
+            assert!(!ask("PUT", path, "x").starts_with("HTTP/1.1 2"), "{path}");
+        }
+        assert!(!base.join("other/results/x").exists(), "nothing is put beside the page");
+        assert!(ask("PUT", "/results/DONE", "ok\n").starts_with("HTTP/1.1 201"));
+        assert_eq!(locked(&server.done).as_deref(), Some("ok"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

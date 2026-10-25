@@ -477,18 +477,25 @@ pub fn resolve_module_path_in(
                         seg.span,
                         format!("`{}` has no item `{}`", module.name(), seg.name),
                     );
+                    // Only what this module may name: not another module's private items and
+                    // imports, nor another package's `pub(package)` ones (E0203).
+                    let visible = |b: &Binding| {
+                        m == from || (b.public && (!b.package_only || p.same_package(m, from)))
+                    };
                     let names = module
                         .scope
-                        .keys()
-                        .map(String::as_str)
+                        .iter()
+                        .filter(|(_, b)| visible(b))
+                        .map(|(n, _)| n.as_str())
                         .chain(module.children.keys().map(String::as_str));
                     let mut d = suggest_or_list(d, &seg.name, seg.span, names, "its items are");
                     if d.help.is_empty() && d.fixes.is_empty() {
-                        d = d.with_help(format!(
-                            "`{}` has nothing in it yet: declare `{}` there",
-                            module.name(),
-                            seg.name
-                        ));
+                        let (m, x) = (module.name(), &seg.name);
+                        d = d.with_help(if module.scope.is_empty() && module.children.is_empty() {
+                            format!("`{m}` has nothing in it yet: declare `{x}` there")
+                        } else {
+                            format!("nothing in `{m}` is visible here: declare `{x}` there, marked `pub`")
+                        });
                     }
                     return PathLookup::Error(Box::new(d));
                 }
@@ -1596,6 +1603,17 @@ fn projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A missing item's help lists only what the using module may name: `std::quat`'s private
+    /// imports and functions aren't among them.
+    #[test]
+    fn a_missing_items_help_lists_only_visible_items() {
+        let source = "pub fn f() -> u32 {\n    std::quat::zzzzzz()\n}\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        let d = diagnostics.iter().find(|d| d.code == codes::E0200).expect("E0200");
+        assert_eq!(d.help, ["its items are `Quat`"], "{diagnostics:#?}");
+    }
 
     #[test]
     fn array_lengths_accept_integer_constant_expressions() {

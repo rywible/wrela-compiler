@@ -1545,7 +1545,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if words != 2 + 8 * n + 4 {
                     return Err(bad("the colour targets don't fill the payload"));
                 }
-                if w(1) > 1 {
+                if w(1) > PASS_JOIN {
                     return Err(bad("the join word is 0 or 1"));
                 }
                 let mut colors = Vec::with_capacity(n);
@@ -1570,7 +1570,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("a load is 0 (clear) or 1 (keep)"));
                 }
                 let mut pass = Pass::new(&colors);
-                pass.join = w(1) == 1;
+                pass.join = w(1) == PASS_JOIN;
                 pass.depth = w(d);
                 pass.depth_layer = w(d + 1);
                 pass.keep_depth = w(d + 2) == 1;
@@ -1625,7 +1625,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 let f = |i: usize| f32::from_bits(w(i));
                 let (rect, min_depth, max_depth) = ([f(0), f(1), f(2), f(3)], f(4), f(5));
                 if !rect.iter().all(|x| x.is_finite()) || rect[2] < 0.0 || rect[3] < 0.0 {
-                    return Err(bad("a viewport is a finite rectangle of positive size"));
+                    return Err(bad("a viewport is a finite rectangle of non-negative size"));
                 }
                 if !(0.0..=1.0).contains(&min_depth)
                     || !(0.0..=1.0).contains(&max_depth)
@@ -2155,7 +2155,7 @@ impl Encoder {
     }
 
     pub fn begin_pass(&mut self, pass: Pass) -> &mut Self {
-        let mut words = vec![pass.count, u32::from(pass.join)];
+        let mut words = vec![pass.count, if pass.join { PASS_JOIN } else { 0 }];
         for c in pass.colors() {
             words.extend([c.texture, c.level, c.layer, u32::from(c.keep)]);
             words.extend(c.clear.map(f32::to_bits));

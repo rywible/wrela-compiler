@@ -1995,7 +1995,7 @@ impl<'p> Checker<'p> {
                         name.span,
                         format!("`{shown}` has no associated function `{}`", name.name),
                     )
-                    .with_help(format!("`wrela doc {shown}` lists what it has")),
+                    .with_help(format!("`wrela doc {}` lists what it has", self.doc_name(ty))),
                 );
                 self.failed_call(args, span)
             }
@@ -2981,16 +2981,16 @@ impl<'p> Checker<'p> {
     /// arguments among the call's own. With a fix that binds them, when the source is at hand
     /// and each argument has one place to go.
     fn unbound_gpu_call(&mut self, call: &str, rewrite: Option<(Span, String)>, span: Span) {
-        let (form, note) = if call == "dispatch" {
-            (
+        let shaders = "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone";
+        let (form, note) = match call {
+            "dispatch" => (
                 "`dispatch(kernel.bind(...), groups: n)`",
                 "a kernel's arguments go in its `.bind(...)`, matched as a call's are",
-            )
-        } else {
-            (
-                "`draw(pass, vs.bind(...), fs.bind(...), vertices: n)`",
-                "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone",
-            )
+            ),
+            "draw_multi" => {
+                ("`draw_multi(pass, vs.bind(...), fs.bind(...), indirect: buf, count: n)`", shaders)
+            }
+            _ => ("`draw(pass, vs.bind(...), fs.bind(...), vertices: n)`", shaders),
         };
         let mut d = Diagnostic::new(
             codes::E0603,
@@ -3037,7 +3037,7 @@ impl<'p> Checker<'p> {
 
     /// How `wrela doc` names type `t`'s page: a struct's or an enum's name, `[T]` for a run,
     /// `[T; N]` for an array, and a built-in type's own name.
-    fn doc_name(&self, t: TyId) -> String {
+    pub(crate) fn doc_name(&self, t: TyId) -> String {
         match self.kind(t) {
             TyKind::Adt(a, _) => self.p.adt(*a).name.clone(),
             TyKind::Slice(_) => "[T]".into(),
@@ -3529,6 +3529,7 @@ impl<'p> Checker<'p> {
     /// state, `cull:`, `depth_bias:`, `depth:` and `blend:` (or `blends:`), build-time
     /// constants. `draw_multi` (`multi`) takes `indirect:` and `count:`, the number of draws.
     fn check_draw(&mut self, args: &[ast::Arg], multi: bool, span: Span) -> Expr {
+        let callee = if multi { "draw_multi" } else { "draw" };
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
         let i32_ty = self.p.types.i32;
@@ -3583,12 +3584,17 @@ impl<'p> Checker<'p> {
                 let last = args[args.len() - 1].span;
                 Some((Span::new(first.file, first.start, last.end), parts.join(", ")))
             })();
-            self.unbound_gpu_call("draw", rewrite, span);
+            self.unbound_gpu_call(callee, rewrite, span);
             self.check_args_alone(&args[3..]);
             return self.error_expr(span);
         }
         if args.len() < 3 || args[..3].iter().any(|a| a.name.is_some()) {
-            self.err(Diagnostic::new(codes::E0603, span, "`draw` takes the pass, then the vertex and fragment shaders: `draw(pass, vs, fs.bind(...), vertices: n)`"));
+            let counts = if multi { "indirect: buf, count: n" } else { "vertices: n" };
+            self.err(Diagnostic::new(
+                codes::E0603,
+                span,
+                format!("`{callee}` takes the pass, then the vertex and fragment shaders: `{callee}(pass, vs, fs.bind(...), {counts})`"),
+            ));
             self.check_args_alone(args);
             return self.error_expr(span);
         }
@@ -3873,12 +3879,15 @@ impl<'p> Checker<'p> {
             (None, None) if direct_indexed => {
                 index_count.unwrap_or(lit(i128::from(u32::MAX), u32_ty))
             }
+            // `draw_multi` without `indirect:` is reported above.
             (None, None) => {
-                self.err(Diagnostic::new(
-                    codes::E0603,
-                    span,
-                    "`draw` needs `vertices:`, how many vertices to draw",
-                ));
+                if !multi {
+                    self.err(Diagnostic::new(
+                        codes::E0603,
+                        span,
+                        "`draw` needs `vertices:`, how many vertices to draw",
+                    ));
+                }
                 return self.error_expr(span);
             }
         };
@@ -4006,10 +4015,11 @@ impl<'p> Checker<'p> {
     }
 }
 
-/// A `const` of a draw's state type (`Lang::Cull`, `Lang::DepthBias` or `Lang::Depth`, the ADT
-/// `a`), as its declaration writes it: a variant, a struct of number literals, maybe negated,
-/// or a `Depth` of a `Compare` variant and a bool, its defaults filling what it leaves out
-/// (`render_constant`).
+/// A `const` of a draw's state type (`Lang::Cull`, `Lang::Blend`, `Lang::DepthBias` or
+/// `Lang::Depth`, the ADT `a`), as its declaration writes it: a variant, a struct of number
+/// literals, maybe negated, or a `Depth` of a `Compare` variant and a bool, its defaults filling
+/// what it leaves out (`render_constant`). A variant is the one its path resolves to where the
+/// constant is declared, whatever a `use ... as` names it.
 fn declared_render_constant(
     p: &crate::Program,
     c: ConstId,
@@ -4027,25 +4037,26 @@ fn declared_render_constant(
         }
     }
     let adt = p.adt(a);
+    let module = p.const_(c).module;
+    // The index of the variant of enum `e` that `path` names.
+    let variant =
+        |path: &ast::Path, e: AdtId| match crate::resolve::resolve_value_item(p, module, path)? {
+            Res::Variant(x, v) if x == e => Some(f64::from(v)),
+            _ => None,
+        };
     match (&p.const_(c).value.kind, lang) {
         (ast::ExprKind::Path(path), Lang::Cull | Lang::Blend) => {
-            let name = &path.segments.last()?.ident.name;
-            let v = adt.variants().iter().position(|v| &v.name == name)?;
-            Some([v as f64, 0.0, 0.0])
+            Some([variant(path, a)?, 0.0, 0.0])
         }
         (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::Depth) => {
             // `Compare`: the type of the field that's an enum.
             let compare = adt.fields().iter().find_map(|f| match p.types.kind(f.ty) {
-                &TyKind::Adt(e, _) if p.adt(e).is_enum() => Some(p.adt(e)),
+                &TyKind::Adt(e, _) if p.adt(e).is_enum() => Some(e),
                 _ => None,
             })?;
             // A `Compare` variant's index, or a bool literal as 0 or 1.
             let plain = |e: &ast::Expr| match &e.kind {
-                ast::ExprKind::Path(path) => {
-                    let name = &path.segments.last()?.ident.name;
-                    let v = compare.variants().iter().position(|v| &v.name == name)?;
-                    Some(v as f64)
-                }
+                ast::ExprKind::Path(path) => variant(path, compare),
                 ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
                     Some(if *b { 1.0 } else { 0.0 })
                 }

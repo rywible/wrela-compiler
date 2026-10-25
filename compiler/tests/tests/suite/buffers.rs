@@ -175,6 +175,50 @@ fn an_empty_buffer_has_room_for_one_element() {
     assert_eq!(sizes, [16, 4, 48]);
 }
 
+/// An indexed draw's default count is the indices past its first: none where the buffer is
+/// empty (its room for one isn't an index), or where the first is past them all, which the host
+/// then refuses by name rather than the call trapping. A count it's given is its count.
+#[test]
+fn an_indexed_draw_counts_only_the_indices_past_its_first() {
+    let src =
+        "use std::gpu::{ClipPosition, GpuBuffer, VertexIndex, begin_screen_pass, buffer, draw}
+
+@vertex
+fn corner(v: VertexIndex) -> ClipPosition {
+    ClipPosition { position: vec4(f32(v.index), 0.0, 0.0, 1.0) }
+}
+
+@fragment
+fn flat() -> vec4 {
+    vec4(1.0)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    let six: GpuBuffer<u32> = buffer(6)
+    let none: GpuBuffer<u32> = buffer(0)
+    let screen = begin_screen_pass(clear: vec4(0.0))
+    draw(screen, corner, flat, indices: six, first_index: width)
+    draw(screen, corner, flat, indices: six, first_index: width, index_count: height)
+    draw(screen, corner, flat, indices: none)
+    screen.present()
+}
+";
+    let mut host = load("indexed-draw-counts", src);
+    let mut counts = |width: u32, height: u32| {
+        host.frame(0.0, width, height).expect("frame");
+        commands(&mut host, |c| match c {
+            Command::DrawIndexed { index_count, first_index, .. } => {
+                Some((index_count, first_index))
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(counts(2, 3), [(4, 2), (3, 2), (0, 0)]);
+    assert_eq!(counts(6, 0), [(0, 6), (0, 6), (0, 0)]);
+    let past = host.frame(0.0, 10, 0).expect_err("a first index past the indices");
+    assert!(format!("{past:?}").contains("indices 10 to 10 run past the 6 bound"), "{past:?}");
+}
+
 #[test]
 fn a_unit_argument_keeps_the_dispatch() {
     // A `()` argument is a value with nothing in it: the dispatch it's part of is recorded.

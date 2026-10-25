@@ -114,6 +114,50 @@ export const levelSize = (width: number, height: number, level: number): [number
 /** The names of the features a device has, by the bits `wrela.limit(10)` gives. */
 export const featureNames = (bits: number): string[] => FEATURES.filter((_, i) => (bits & (1 << i)) !== 0);
 
+/** The rules a host keeps whether or not it checks commands against WebGPU's, which checks none
+ * of them (a release build's normal run checks only these): a request stays inside the
+ * program's storage, its build's directory beside its siblings, and its origin (runtime/abi
+ * `path_problem` and `build_path_problem`); a timed label names something; and a multi-draw
+ * has no count buffer, which a device without multi-draw couldn't honour. */
+export function checkHostRules(cmd: Command): void {
+  const err = (why: string) => new CommandError(cmd.op, why);
+  switch (cmd.op) {
+    case "StorageRead":
+    case "StorageWrite": {
+      const why = pathProblem(cmd.path);
+      if (why !== undefined) throw err(`the storage path \`${cmd.path}\` ${why}`);
+      return;
+    }
+    case "Fetch":
+    case "Post": {
+      const why = pathProblem(cmd.url);
+      if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
+      return;
+    }
+    case "Timed":
+      if (cmd.label === "") throw err("a timed label is empty: it names no pass or dispatch");
+      return;
+    case "Prepare":
+    case "Unprepare":
+    case "HandOver": {
+      const why = buildPathProblem(cmd.path);
+      if (why !== undefined) throw err(`the build path \`${cmd.path}\` ${why}`);
+      return;
+    }
+    case "HostRequest": {
+      const why = pathProblem(cmd.service);
+      if (why !== undefined) throw err(`the host service \`${cmd.service}\` ${why}`);
+      return;
+    }
+    // A count the GPU writes would mean what a device without multi-draw can't do (the host
+    // draws `count` draws one by one): not in 0.6. An unused draw has no instances instead.
+    case "MultiDrawIndirect":
+    case "MultiDrawIndexedIndirect":
+      if (cmd.count_buffer !== NONE) throw err("a multi-draw's count buffer isn't supported: it draws `count` draws, so give the unused ones no instances");
+      return;
+  }
+}
+
 interface Shape {
   name: string;
   compute: boolean;
@@ -411,8 +455,14 @@ export class Checker {
       case "CopyTextureToBuffer": {
         const t = this.#texture(op, cmd.source.texture);
         if (t.textureKind === "3d") throw err("a texture copied to a buffer is a 2D one");
-        this.#rect(op, t, cmd.source, "copying from");
-        this.#bufferRows(op, t.format, cmd.source, cmd.buffer, cmd.offset, cmd.bytesPerRow);
+        const s = cmd.source;
+        this.#rect(op, t, s, "copying from");
+        // WebGPU copies a depth texture's texels only by whole levels.
+        const [w, h] = levelSize(t.width, t.height, s.level);
+        if (isDepth(t.format) && (s.x !== 0 || s.y !== 0 || s.width !== w || s.height !== h)) {
+          throw err(`texture ${s.texture} is a depth texture, copied only whole: all ${w}x${h} texels of level ${s.level} from (0, 0)`);
+        }
+        this.#bufferRows(op, t.format, s, cmd.buffer, cmd.offset, cmd.bytesPerRow);
         return;
       }
       case "CopyBufferToTexture": {
@@ -451,8 +501,18 @@ export class Checker {
         }
         return;
       }
-      case "SetViewport":
+      case "SetViewport": {
+        // WebGPU's bounds, compared in f32 as wgpu does: a side at most the largest texture's,
+        // the edges within twice that of the origin.
+        const [x, y, width, height] = cmd.rect;
+        const max = this.#limits[0]!;
+        if (width > Math.fround(max) || height > Math.fround(max)) throw err(`a viewport is at most ${max}x${max}, the device's largest texture`);
+        const range = 2 * max;
+        if (x < -Math.fround(range) || y < -Math.fround(range) || Math.fround(x + width) > Math.fround(range - 1) || Math.fround(y + height) > Math.fround(range - 1)) {
+          throw err(`a viewport's edges are from -${range} to ${range - 1}, twice the device's largest texture`);
+        }
         return;
+      }
       case "Draw":
         this.#bindings(op, cmd.pipeline, cmd.bindings, cmd.uniforms.length);
         return;
@@ -472,6 +532,10 @@ export class Checker {
         if (last * 4 > cmd.index_size) {
           throw err(`indices ${cmd.first_index} to ${last} run past the ${Math.floor(cmd.index_size / 4)} bound`);
         }
+        const lastInstance = cmd.first_instance + cmd.instances;
+        if (lastInstance > 0xffff_ffff) {
+          throw err(`instances ${cmd.first_instance} to ${lastInstance} run past ${0xffff_ffff}, the largest u32`);
+        }
         return;
       }
       case "MultiDrawIndirect":
@@ -482,9 +546,7 @@ export class Checker {
         const bytes = cmd.count * stride;
         if (bytes > 0xffff_ffff) throw err(`${cmd.count} draws' arguments are more than a buffer holds`);
         this.#readRange(op, cmd.arguments, cmd.offset, bytes, "reading arguments:");
-        // A count the GPU writes would mean what a device without multi-draw can't do (the host
-        // draws `count` draws one by one): not in 0.6. An unused draw has no instances instead.
-        if (cmd.count_buffer !== NONE) throw new CommandError(op, "a multi-draw's count buffer isn't supported: it draws `count` draws, so give the unused ones no instances");
+        checkHostRules(cmd);
         return;
       }
       case "Present":
@@ -493,32 +555,16 @@ export class Checker {
         this.#passSize = undefined;
         return;
       case "StorageRead":
-      case "StorageWrite": {
-        const why = pathProblem(cmd.path);
-        if (why !== undefined) throw err(`the storage path \`${cmd.path}\` ${why}`);
-        return;
-      }
+      case "StorageWrite":
       case "Fetch":
-      case "Post": {
-        const why = pathProblem(cmd.url);
-        if (why !== undefined) throw err(`the URL \`${cmd.url}\` ${why}`);
-        return;
-      }
+      case "Post":
       case "Timed":
-        if (cmd.label === "") throw err("a timed label is empty: it names no pass or dispatch");
-        return;
       case "Prepare":
       case "Unprepare":
-      case "HandOver": {
-        const why = buildPathProblem(cmd.path);
-        if (why !== undefined) throw err(`the build path \`${cmd.path}\` ${why}`);
+      case "HandOver":
+      case "HostRequest":
+        checkHostRules(cmd);
         return;
-      }
-      case "HostRequest": {
-        const why = pathProblem(cmd.service);
-        if (why !== undefined) throw err(`the host service \`${cmd.service}\` ${why}`);
-        return;
-      }
       case "Label":
         return;
     }

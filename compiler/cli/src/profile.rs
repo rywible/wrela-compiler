@@ -324,25 +324,33 @@ fn load(
     Ok((host, script, built))
 }
 
+/// Copies the input script `from` (`--input`), if there's one, to `dir/input.json`, where test
+/// mode reads it beside the page: as a new file, so a link there is replaced, never followed.
+fn place_input(from: Option<&Path>, dir: &Path) -> Result<(), String> {
+    let Some(from) = from else { return Ok(()) };
+    let bytes = std::fs::read(from)
+        .map_err(|e| format!("can't read the input script {}: {e}", from.display()))?;
+    let to = dir.join("input.json");
+    let cant = |e: std::io::Error| format!("can't copy the input script to {}: {e}", to.display());
+    match std::fs::remove_file(&to) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(cant(e)),
+        _ => {}
+    }
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&to).map_err(cant)?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(cant)
+}
+
 /// `--chrome`'s report: the build measured in headless Chrome (`profile/chrome.rs`).
 fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String> {
     let built = crate::build_into(&a.dir, "profile", a.optimize)?;
     let script = crate::read_script(a.input.as_deref())?;
     let workload = comparison::workload(a, &script);
-    // Test mode reads the script beside the page.
-    let place_input = |dir: &Path| -> Result<(), String> {
-        match &a.input {
-            Some(from) => std::fs::copy(from, dir.join("input.json"))
-                .map(|_| ())
-                .map_err(|e| format!("can't copy the input script: {e}")),
-            None => Ok(()),
-        }
-    };
     let frozen = comparison::build_hash(&built)?;
     if a.compare.is_some() {
         let device = std::cell::RefCell::new(serde_json::Value::Null);
         let mut sample = |dir: &Path| -> Result<Profile, String> {
-            place_input(dir)?;
+            place_input(a.input.as_deref(), dir)?;
             let (p, d) = chrome::measure(a, dir)?;
             *device.borrow_mut() = d;
             Ok(p)
@@ -355,7 +363,7 @@ fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String
             &workload,
         );
     }
-    place_input(&built)?;
+    place_input(a.input.as_deref(), &built)?;
     let (mut p, device) = chrome::measure(a, &built)?;
     let environment = chrome::environment(&device)?;
     if let Some(b) = baseline {
@@ -680,6 +688,23 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_input_script_replaces_a_link_and_leaves_where_it_led() {
+        let d = std::env::temp_dir().join(format!("wrela-profile-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("baseline")).expect("baseline");
+        std::fs::write(d.join("replay.json"), "[]").expect("script");
+        std::fs::write(d.join("other.json"), "keep").expect("other file");
+        let to = d.join("baseline/input.json");
+        std::os::unix::fs::symlink(d.join("other.json"), &to).expect("link");
+        place_input(Some(&d.join("replay.json")), &d.join("baseline")).expect("placed");
+        assert_eq!(std::fs::read_to_string(d.join("other.json")).expect("other file"), "keep");
+        assert!(!std::fs::symlink_metadata(&to).expect("input").file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&to).expect("input"), "[]");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn baseline(serial: bool) -> Baseline {
         Baseline {

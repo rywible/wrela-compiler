@@ -89,8 +89,7 @@ export class Phases {
 
   end(): void {
     if (this.#current === null) return;
-    const ms = this.now() - this.#since;
-    this.#times.set(this.#current, (this.#times.get(this.#current) ?? 0) + ms);
+    this.#times.set(this.#current, (this.#times.get(this.#current) ?? 0) + this.now() - this.#since);
     this.#current = null;
   }
 

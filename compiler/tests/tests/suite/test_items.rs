@@ -743,15 +743,16 @@ fn a_golden_is_blessed_from_the_screen() {
     assert!(wrela_driver::test(&dir, Some("the_ramp")).passed(), "and it passes after");
 }
 
-/// Toolchain 0.6's GPU capabilities (compiler/tests/capabilities): texture copies and readback,
-/// the new formats, a generated mip chain sampled trilinear, blend states, a pass of three
-/// targets, a scissor, texture arrays, a cube, a depth array, a direct indexed draw and a
-/// multi-draw, each read back and checked; and Chrome records the same frames.
+/// Toolchain 0.6's GPU capabilities (compiler/tests/capabilities): texture copies (one from an
+/// offset, at its default size) and readback, the new formats, a generated mip chain sampled
+/// trilinear, blend states, a pass of three targets, a scissor, texture arrays, a cube, a depth
+/// array, the depth targets of passes into several targets, a layer and a face, a direct indexed
+/// draw and a multi-draw, each read back and checked; and Chrome records the same frames.
 #[test]
 #[ignore = "needs a GPU"]
 fn every_gpu_capability_reads_back_what_it_drew() {
     let dir = wrela_tests::repo_root().join("compiler/tests/capabilities");
-    assert_eq!(crate::tests_pass(&dir), 18);
+    assert_eq!(crate::tests_pass(&dir), 21);
 }
 
 /// Toolchain 0.6's kernel capabilities (compiler/tests/kernels): a histogram in workgroup

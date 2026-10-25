@@ -4,7 +4,7 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, RUNNING, SCREEN, STREAM_VERSION, TASK_SLOTS, THREAD_BLOCK_SIZE, THREAD_BLOCKS, THREAD_HELPER0, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError, trapMessage } from "../src/program.ts";
+import { checkAbi, otherInstance, Program, ProgramError, type ProgramOptions, runWorker, TrapError, trapMessage } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
 import { type Command, onePass, StreamError } from "../src/stream.ts";
 import { Lines, locate, wasmOffsets } from "../src/lines.ts";
@@ -1283,9 +1283,9 @@ test("printed lines are strict UTF-8 and keep a byte-order mark", async () => {
   }
 });
 
-test("a phase validates its memory range and UTF-8 name even though the browser doesn't time it", async () => {
+test("a phase validates its memory range and UTF-8 name, and is timed only when the options ask", async () => {
   const PHASE: Import = { module: "wrela", name: "phase", kind: "func", type: { params: ["i32", "i32"], results: [] } };
-  const program = (ptr: number, len: number, data: Uint8Array[] = []) =>
+  const program = (ptr: number, len: number, data: Uint8Array[] = [], options: ProgramOptions = {}) =>
     Program.load(
       buildModule({
         imports: [PHASE],
@@ -1295,7 +1295,16 @@ test("a phase validates its memory range and UTF-8 name even though the browser 
       }),
       checker(),
       new Recorder(),
+      options,
     );
+  const named = (options: ProgramOptions) => program(16, 3, [new TextEncoder().encode("sim")], options);
+  // A normal run keeps no phases, however many names it makes; test mode keeps them.
+  const normal = await named({});
+  normal.frame(0, 1, 1);
+  expect(normal.takePhases()).toEqual({});
+  const timed = await named({ phases: true });
+  timed.frame(0, 1, 1);
+  expect(Object.keys(timed.takePhases())).toEqual(["sim"]);
   const past = await program(-1, 1);
   expect(() => past.frame(0, 1, 1)).toThrow("phase(4294967295, 1) reaches past the end of the program's memory");
   const malformed = await program(16, 1, [Uint8Array.of(0xff)]);
@@ -1496,6 +1505,25 @@ describe("the checker in release and in test mode", () => {
     } finally {
       if (original) Object.defineProperty(navigator, "gpu", original);
       else delete (navigator as unknown as Record<string, unknown>).gpu;
+    }
+  });
+
+  test("unchecked, a request still stays in its build, its storage and its origin, and a multi-draw has no count buffer", async () => {
+    const { Opcode } = await import("../src/abi.gen.ts");
+    const cases = [
+      [new Encoder().fetch(1, "../../x").finish(), "Fetch failed: the URL `../../x` has an empty, `.` or `..` part"],
+      [new Encoder().post(1, "//attacker.example/x", new Uint8Array(1)).finish(), "Post failed: the URL `//attacker.example/x` must be relative"],
+      [new Encoder().storageRead(1, "../etc").finish(), "StorageRead failed: the storage path `../etc` has an empty"],
+      [new Encoder().handOver(1, "../../../b").finish(), "HandOver failed: the build path `../../../b` climbs more than one directory"],
+      [new Encoder().hostRequest(1, "net/../x", new Uint8Array(4)).finish(), "HostRequest failed: the host service `net/../x` has an empty"],
+      // Arguments in buffer 2, one draw, its count in buffer 2: the buffers needn't exist.
+      [new Encoder().beginScreenPass([0, 0, 0, 1]).words(Opcode.MultiDrawIndirect, [0, 2, 0, 1, 2, 0, 0, 0]).present().finish(), "MultiDrawIndirect failed: a multi-draw's count buffer isn't supported"],
+    ] as const;
+    for (const [batch, message] of cases) {
+      const executor = new Recorder();
+      const program = await Program.load(batchProgram([[batch]]), checker(), executor, { checking: false });
+      expect(() => program.frame(0, 64, 64)).toThrow(message);
+      expect(executor.log).toEqual([]);
     }
   });
 

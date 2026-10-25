@@ -433,6 +433,12 @@ impl RoomHost {
         self.incoming.len()
     }
 
+    /// Whether its last call's requests (a store's read, randomness) were answered: they wait
+    /// for its next call, so it should be woken though no event waits.
+    pub fn answered(&self) -> bool {
+        self.room.as_ref().is_some_and(Room::answered)
+    }
+
     fn fail_at_limits(&mut self) {
         self.room = None;
         self.failures += 1;
@@ -548,7 +554,7 @@ impl RoomHost {
             return Err(Fail::Room(f));
         }
         let commands = room.take_commands();
-        self.carry_out(commands).map_err(Fail::Journal)?;
+        self.carry_out(commands)?;
         self.failures = 0;
         Ok(())
     }
@@ -557,8 +563,10 @@ impl RoomHost {
     /// its sends and closes. If the writes or the records can't be kept, nothing is released and
     /// the room starts again from its journal. Writes are committed first: a crash between them
     /// and the records leaves the writes kept and the call's event not settled, so its peer sends
-    /// it again, and a program's writes should be the same when they are made again.
-    fn carry_out(&mut self, commands: Vec<Net>) -> Result<(), Failure> {
+    /// it again, and a program's writes should be the same when they are made again. A write the
+    /// program got wrong (a malformed body, a key or a value too long), or one on a server with
+    /// no store, fails the call, as the program's: it would fail the same way again.
+    fn carry_out(&mut self, commands: Vec<Net>) -> Result<(), Fail> {
         let mut records = Vec::new();
         let mut held = Vec::new();
         let mut tags = Vec::new();
@@ -566,13 +574,20 @@ impl RoomHost {
             .iter()
             .filter_map(|c| if let Net::Write(w) = c { Some(w.as_slice()) } else { None })
             .collect();
-        let mut kept = if writes.is_empty() {
-            Ok(())
-        } else {
-            match &self.services {
-                Some(s) => s.write(&writes).map_err(std::io::Error::other),
-                None => Err(std::io::Error::other("this server has no store")),
-            }
+        let refused = match &self.services {
+            _ if writes.is_empty() => None,
+            Some(_) => writes.iter().find_map(|w| crate::services::writes(w).err()),
+            None => Some("this server has no store".to_string()),
+        };
+        if let Some(why) = refused {
+            // What the call asked for is dropped with its instance, as a trap's is.
+            self.room = None;
+            return Err(Fail::Room(Failure::Program(format!("its store write: {why}"))));
+        }
+        // What's left to fail is the store's own: the host's.
+        let mut kept = match &self.services {
+            Some(s) if !writes.is_empty() => s.write(&writes).map_err(std::io::Error::other),
+            _ => Ok(()),
         };
         for c in commands {
             match c {
@@ -598,7 +613,7 @@ impl RoomHost {
             self.room = None;
             self.status = Status::Unavailable(0);
             self.close_all();
-            return Err(host(format!("the journal: {e}")));
+            return Err(Fail::Journal(host(format!("the journal: {e}"))));
         }
         for (conn, tag) in tags {
             for c in &mut self.conns {
@@ -707,6 +722,51 @@ mod tests {
             matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
             "an alias bypassed the journal lock"
         );
+    }
+
+    /// A store write the program got wrong (here a write of kind 9), or any on a server with no
+    /// store, fails its call, as the program's own failure: the room goes on, its peers stay, and
+    /// the store keeps nothing.
+    #[test]
+    fn a_write_the_program_got_wrong_fails_the_call_and_keeps_the_peers() {
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("wrela-room-bad-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let services =
+            Arc::new(crate::services::Services::open(&dir.join("store.sqlite")).expect("store"));
+        // A put of key `k` to `v` (each a length, then bytes) after the malformed entry.
+        let malformed =
+            [&[9u8, 1, 0, 0, 0][..], b"k", &[1, 1, 0, 0, 0], b"k", &[1, 0, 0, 0], b"v"].concat();
+        for (name, services, body) in
+            [("no-store", None, Vec::new()), ("malformed", Some(services.clone()), malformed)]
+        {
+            let write =
+                wrela_abi::stream::Encoder::new().host_request(1, "store/write", &body).finish();
+            let escaped: String = write.iter().map(|b| format!("\\{b:02x}")).collect();
+            // Every call reads its events and makes the write.
+            let wasm = wat::parse_str(format!(
+                r#"(module
+                    (import "wrela" "input" (func $input (param i32 i32) (result i32)))
+                    (import "wrela" "submit" (func $submit (param i32 i32)))
+                    (memory (export "memory") 1)
+                    (data (i32.const 4096) "{escaped}")
+                    (func (export "serve") (param f32)
+                        (drop (call $input (i32.const 0) (i32.const 64)))
+                        (call $submit (i32.const 4096) (i32.const {}))))"#,
+                write.len()
+            ))
+            .expect("server module");
+            let build = Arc::new(super::ServerBuild::from_wasm(&wasm).expect("server build"));
+            let limits = super::Limits::default();
+            let mut room = super::RoomHost::open(build, 1, &dir.join(name), "a", limits, services)
+                .expect("the room");
+            room.connect(1);
+            room.wake(0.0).expect("the connection's event is the program's to fail");
+            assert_eq!(room.status(), &super::Status::Live, "{name}");
+            assert!(room.take_outbox().is_empty(), "{name}: no peer is let go");
+        }
+        assert_eq!(services.answer("store/get", b"k").expect("a read"), [0], "nothing is kept");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The check value every CRC-32C implementation gives.

@@ -23,8 +23,8 @@ use std::sync::{Mutex, MutexGuard};
 
 /// The longest key.
 pub const MAX_KEY: usize = 1024;
-/// The longest value.
-pub const MAX_VALUE: usize = 1 << 20;
+/// The longest value: 1020 KiB, so a put of the longest key and value fits in one host request.
+pub const MAX_VALUE: usize = 1020 << 10;
 /// The most bytes of keys and values a scan answers with: past them it stops early.
 pub const MAX_SCAN: usize = 1 << 20;
 /// The most randomness one request asks for.
@@ -180,8 +180,9 @@ fn blob<'a>(row: &'a rusqlite::Row<'_>, index: usize) -> rusqlite::Result<&'a [u
 /// A write to one key: its new value, or none to delete it.
 type Write<'a> = (&'a [u8], Option<&'a [u8]>);
 
-/// A write's body: entries, each a kind (1 put, 2 delete), a key, and for a put its value.
-fn writes(body: &[u8]) -> Result<Vec<Write<'_>>, String> {
+/// A write's body: entries, each a kind (1 put, 2 delete), a key, and for a put its value. An
+/// error is the program's: the body is malformed, or a key or a value is too long.
+pub(crate) fn writes(body: &[u8]) -> Result<Vec<Write<'_>>, String> {
     let mut r = Bytes(body);
     let mut ops = Vec::new();
     while !r.0.is_empty() {
@@ -419,12 +420,22 @@ mod tests {
     fn a_scan_keeps_its_first_entry_at_and_past_the_byte_limit() {
         let d = dir("scan-limit");
         let s = Services::open(&d.join("store.sqlite")).expect("open");
+        // Values this long are past `MAX_VALUE`, so no write makes them; a store kept under a
+        // larger limit may hold one, and reads still give it.
+        let insert = |k: &[u8], v: &[u8]| {
+            s.db()
+                .expect("the store")
+                .execute("INSERT OR REPLACE INTO kv (key, value) VALUES (?1, ?2)", (k, v))
+                .expect("insert");
+        };
         let mut value = vec![7u8; MAX_SCAN - 1];
-        s.write(&[[put(b"a", &value), put(b"b", b"")].concat()]).expect("write");
+        assert!(s.write(&[put(b"a", &value)]).is_err(), "longer than a write takes");
+        insert(b"a", &value);
+        s.write(&[put(b"b", b"")]).expect("write");
         assert_eq!(scan(&s, b"", b"", 10, false), vec![(b"a".to_vec(), value.clone())]);
         assert_eq!(scan(&s, b"b", b"", 10, false), vec![(b"b".to_vec(), Vec::new())]);
         value.push(8);
-        s.write(&[put(b"a", &value)]).expect("largest value");
+        insert(b"a", &value);
         assert_eq!(scan(&s, b"", b"", 10, false), vec![(b"a".to_vec(), value)]);
         let _ = std::fs::remove_dir_all(&d);
     }

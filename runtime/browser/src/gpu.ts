@@ -625,17 +625,28 @@ const TIMED_PASSES = 256;
 /** What `#timestamps` gives an untimed pass: no timestamp writes. */
 const UNTIMED: { timestampWrites?: GPUComputePassTimestampWrites } = Object.freeze({});
 
+/** A program's ask for a label's time (`std::gpu::timed`). */
+interface Ask {
+  label: string;
+  /** Where its `Timed` command ran among the passes and dispatches timed (`Timer.noted` then),
+   * or null until it has run: it times only its label's work after that, in the stream's order. */
+  from: number | null;
+  /** Its answer, once some of that work is read back: the first frame that ran some, and its
+   * nanoseconds there, summed. */
+  time: { frame: number; nanos: number } | null;
+  answer: (bytes: Bytes) => void;
+}
+
 /** Timestamps at each pass's start and end ("timestamp-query"), read back after each
  * submission. */
 class Timer {
   readonly #queries: GPUQuerySet;
   readonly #resolve: GPUBuffer;
-  /** The passes timed in the submission being recorded: their frame and label. */
-  #pending: { frame: number; label: string }[] = [];
+  /** The passes timed in the submission being recorded: their frame, label and place (`noted`). */
+  #pending: { frame: number; label: string; at: number }[] = [];
   /** The first timestamp read, which the others are measured from. */
   #origin: bigint | null = null;
-  /** Each label's latest time: the frame it ran in and its nanoseconds there, summed. */
-  readonly latest = new Map<string, { frame: number; nanos: number }>();
+  #noted = 0;
   /** Called after each readback: what waits for a label's time looks again. */
   onRead: (() => void) | null = null;
   /** The submissions timed so far. */
@@ -649,9 +660,10 @@ class Timer {
   readonly results: GpuTiming[] = [];
 
   /** `keep`: every timing is kept (`settled`), for a run timed from its start; a timer the
-   * program started (`std::gpu::timed`) keeps only each label's latest. */
+   * program started (`std::gpu::timed`) keeps only what answers its `asks`. */
   constructor(
     readonly device: GPUDevice,
+    readonly asks: readonly Ask[],
     readonly keep = true,
   ) {
     this.#queries = device.createQuerySet({ label: "timestamps", type: "timestamp", count: 2 * TIMED_PASSES });
@@ -666,10 +678,15 @@ class Timer {
     return this.#pending.length === TIMED_PASSES;
   }
 
+  /** The passes and dispatches timed so far: where an ask starts (`Ask.from`). */
+  get noted(): number {
+    return this.#noted;
+  }
+
   /** The writes for the next pass. */
   next(frame: number, label: string): GPUComputePassTimestampWrites {
     const i = this.#pending.length;
-    this.#pending.push({ frame, label });
+    this.#pending.push({ frame, label, at: this.#noted++ });
     return { querySet: this.#queries, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 };
   }
 
@@ -695,10 +712,14 @@ class Timer {
           // An end before its start (a clock that wrapped) is taken as the start.
           const end = Math.max(start, Number(b - this.#origin));
           const nanos = end - start;
-          const l = this.latest.get(p.label);
-          if (l === undefined || l.frame < p.frame) this.latest.set(p.label, { frame: p.frame, nanos });
-          else if (l.frame === p.frame) l.nanos += nanos;
-          if (this.keep) this.results.push({ ...p, nanos, start, end, submission });
+          // It counts for each ask of its label made before it, in the first frame with some of
+          // that ask's work (an earlier frame's, read back later, would replace a later one's).
+          for (const ask of this.asks) {
+            if (ask.label !== p.label || ask.from === null || ask.from > p.at) continue;
+            if (ask.time === null || p.frame < ask.time.frame) ask.time = { frame: p.frame, nanos };
+            else if (p.frame === ask.time.frame) ask.time.nanos += nanos;
+          }
+          if (this.keep) this.results.push({ frame: p.frame, label: p.label, nanos, start, end, submission });
         });
         staging.unmap();
       }).finally(() => {
@@ -769,17 +790,16 @@ export class GpuExecutor {
   #compute: OpenCompute | null = null;
   #pass: OpenPass | null = null;
   /** A pass that ended, not yet recorded: the next pass in its frame continues it if it may join
-   * it, on the same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
+   * it, on the same targets, keeping them (`joins`), under the same label (a `Label` between
+   * them records this one). Not in the serial mode, which times each alone. */
   #ended: OpenPass | null = null;
   #timer: Timer | null;
-  /** The program's asks for a label's time (`std::gpu::timed`): each one's label, the frame it
-   * was asked in, its answer's resolver, and whether its `Timed` command has run (`active`):
-   * work behind a pipeline being built runs late, and an ask times only what's recorded after
-   * it. */
-  readonly #asked: { label: string; from: number; answer: (bytes: Bytes) => void; active: boolean }[] = [];
+  /** The program's asks for a label's time (`std::gpu::timed`) not yet answered. Each starts
+   * where its `Timed` command runs, which work behind a pipeline being built does late. */
+  readonly #asked: Ask[] = [];
   /** `Timed` commands that ran before their asks arrived (commands run, then their requests
-   * start), by label. */
-  readonly #early = new Map<string, number>();
+   * start), by label: where each ran (`Timer.noted`), oldest first. */
+  readonly #early = new Map<string, number[]>();
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
@@ -878,7 +898,7 @@ export class GpuExecutor {
       RING_START,
     );
     this.#uploads = new Ring(device, "upload ring", GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UPLOAD_START);
-    this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device) : null;
+    this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device, this.#asked) : null;
     this.#debugFlag = debug
       ? {
           buffer: device.createBuffer({ label: "debug flag", size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
@@ -917,24 +937,26 @@ export class GpuExecutor {
     return this.#timer !== null;
   }
 
-  /** The GPU time of the passes and dispatches labelled `label` in the first frame from this
-   * one on that runs one, summed: an `f32` of microseconds, once read back. The first ask starts
-   * a timer, on a device with "timestamp-query"; without it, this rejects. Outside a timed run,
-   * only the work of a label asked for and not yet answered is timed (its passes from the ask's
-   * `Timed` command on, in the stream's order, also while commands wait for a pipeline): the
-   * rest runs as untimed, its dispatches sharing a pass. */
+  /** The GPU time of the passes and dispatches labelled `label` that the stream records after
+   * the ask's `Timed` command, in the first frame that runs one, summed: an `f32` of
+   * microseconds, once read back. Work before the command doesn't count, even in its frame, as
+   * on the native host. The first ask starts a timer, on a device with "timestamp-query";
+   * without it, this rejects. Outside a timed run, only the work of a label asked for and not
+   * yet answered is timed (also while commands wait for a pipeline): the rest runs as untimed,
+   * its dispatches sharing a pass. */
   timeLabel(label: string): Promise<Bytes> {
+    // The ask uses up its `Timed` command, if that ran first, even when it's refused.
+    const early = this.#early.get(label);
+    const from = early?.shift() ?? null;
+    if (early?.length === 0) this.#early.delete(label);
     if (this.#timer === null) {
       if (!this.device.features.has("timestamp-query")) {
         return Promise.reject(new Error("this GPU can't time its work: it has no timestamp queries"));
       }
-      this.#timer = new Timer(this.device, false);
+      this.#timer = new Timer(this.device, this.#asked, false);
     }
     this.#timer.onRead ??= () => this.#answerTimes();
-    const early = this.#early.get(label) ?? 0;
-    if (early > 1) this.#early.set(label, early - 1);
-    else this.#early.delete(label);
-    return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer, active: early > 0 }));
+    return new Promise((answer) => this.#asked.push({ label, from, time: null, answer }));
   }
 
   /** Whether a command recorded in frame `frame` or earlier still waits to run (behind a
@@ -953,18 +975,18 @@ export class GpuExecutor {
     return false;
   }
 
-  /** Answers each ask whose label has been timed in a frame from the one it was asked in, once
-   * that frame has ended and all its timestamps are read: its whole time, not a submission's. */
+  /** Answers each ask some of whose work has been read back (`Ask.time`), once that work's frame
+   * has ended, all its timestamps are read and none of its commands waits: the frame's whole
+   * time, not a submission's. */
   #answerTimes(): void {
     const timer = this.#timer;
     if (timer === null) return;
     for (let i = this.#asked.length - 1; i >= 0; i--) {
       const ask = this.#asked[i]!;
-      if (!ask.active) continue;
-      const l = timer.latest.get(ask.label);
-      if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame) || this.#holds(l.frame)) continue;
+      const t = ask.time;
+      if (t === null || t.frame >= this.#frame || !timer.complete(t.frame) || this.#holds(t.frame)) continue;
       this.#asked.splice(i, 1);
-      ask.answer(new Uint8Array(new Float32Array([l.nanos / 1000]).buffer));
+      ask.answer(new Uint8Array(new Float32Array([t.nanos / 1000]).buffer));
     }
   }
 
@@ -984,15 +1006,19 @@ export class GpuExecutor {
    * pass, else only one whose label the program has asked for and not yet had; never flushes. */
   #timestamps(label: string, frame = this.#running?.frame ?? this.frame): { timestampWrites?: GPUComputePassTimestampWrites } {
     const timer = this.#timer;
-    if (timer === null || !(timer.keep || this.#asked.some((a) => a.active && a.label === label))) return UNTIMED;
+    if (timer === null || !(timer.keep || this.#asked.some((a) => a.from !== null && a.label === label))) return UNTIMED;
     return { timestampWrites: timer.next(frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
    * for `drain` in the serial mode. Requests are the program's business, except a readback's
-   * copy (`readBack`). */
+   * copy (`readBack`). A pipeline past the manifest's fails at once, unchecked too: a command
+   * that waited for it would wait forever. */
   execute(cmd: Command): void {
     if (this.#retired) throw new Error("host bug: a retired GPU executor received a command");
+    if ("pipeline" in cmd && cmd.pipeline >= this.#pipelines.length) {
+      throw new CommandError(cmd.op, `there's no pipeline ${cmd.pipeline} (the manifest has ${this.#pipelines.length})`);
+    }
     const queue = this.#deferred ?? (this.#waitingAt < this.#waiting.length || !this.#ready(cmd) ? this.#waiting : null);
     if (queue !== null) queue.push({ cmd: copied(cmd), at: { frame: this.#frame, generation: this.#generation } });
     else this.#run(cmd);
@@ -1121,7 +1147,8 @@ export class GpuExecutor {
       const mayJoin = cmd.op === "BeginPass" && generation === this.#ended.at.generation && joins(cmd.pass, this.#ended.pass);
       // Keep both passes until their draws say whether their resource usage scopes can
       // share one WebGPU pass. A kept target alone doesn't make read/write uses compatible.
-      if (!mayJoin && this.#pass === null && cmd.op !== "Label") {
+      // A `Label` records it too, since a pass joins only one of its own label.
+      if (!mayJoin && this.#pass === null) {
         this.#recordEnded();
       }
     }
@@ -1268,10 +1295,14 @@ export class GpuExecutor {
         this.#label = cmd.name;
         return;
       case "Timed": {
-        // The ask times its label's work from here on in the stream (`timeLabel`).
-        const ask = this.#asked.find((a) => !a.active && a.label === cmd.label);
-        if (ask !== undefined) ask.active = true;
-        else this.#early.set(cmd.label, (this.#early.get(cmd.label) ?? 0) + 1);
+        // The ask times its label's work from here on in the stream (`timeLabel`). Before a
+        // timer, nothing has been timed, and a timer starts its count at 0.
+        const from = this.#timer?.noted ?? 0;
+        const ask = this.#asked.find((a) => a.from === null && a.label === cmd.label);
+        const early = this.#early.get(cmd.label);
+        if (ask !== undefined) ask.from = from;
+        else if (early !== undefined) early.push(from);
+        else this.#early.set(cmd.label, [from]);
         return;
       }
       case "ReadBuffer":
@@ -1650,14 +1681,16 @@ export class GpuExecutor {
   }
 
   /** Ends the open pass: on the screen (Present) it's recorded; into textures (EndPass), it
-   * waits for the next command, which may continue it (`joins`), unless the mode is serial. */
+   * waits for the next command, which may continue it (`joins`, the same label), unless the
+   * mode is serial. A pass joins only one of its own label, so its time is that label's. */
   #endPass(op: OpcodeName): void {
     const open = this.#pass;
     this.#pass = null;
     if (open === null) throw new Error(`host bug: ${op} without a pass`);
     const ended = this.#ended;
     if (ended !== null) {
-      if (op === "EndPass" && open.at.generation === ended.at.generation && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
+      const sameFrame = open.at.generation === ended.at.generation;
+      if (op === "EndPass" && sameFrame && open.label === ended.label && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
         // A pass begins with the whole target its scissor and viewport: where the one it joins
         // set either, the joined draws start from the whole target again.
         if (ended.draws.some((d) => !isDraw(d))) {

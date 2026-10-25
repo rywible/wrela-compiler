@@ -49,12 +49,13 @@ fn a_dry_run_shows_the_diff_and_writes_nothing() {
 }
 
 #[test]
-fn a_package_with_errors_is_left_alone() {
+fn an_error_is_left_and_the_migration_made() {
     let main = OLD.replace("let _p = P { x: time }", "let _p = P { x: tiem }");
     let dir = package("migrate-errors", &main);
     let (code, _, report) = outputs(&["migrate", dir.to_str().unwrap()]);
     // The migration is still made; the error isn't a migration, so it's reported and left.
     assert_eq!(code, Some(1), "{report}");
+    assert!(report.contains("migrated W0004") && report.contains("E0200"), "{report}");
     let text = std::fs::read_to_string(dir.join("main.wrela")).unwrap();
-    assert!(text.contains("x: tiem"), "{text}");
+    assert!(text.contains("struct P: Copy {") && text.contains("x: tiem"), "{text}");
 }

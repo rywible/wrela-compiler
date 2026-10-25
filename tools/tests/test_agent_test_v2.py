@@ -9,6 +9,7 @@ gives the release compiler it builds), checking lint criteria with `WRELA_VALIDA
 `WRELA_BIN`); without `WRELA_BIN`, this checkout's release compiler, built first.
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -107,6 +108,116 @@ class Runner(unittest.TestCase):
 def write(path, text):
     with open(path, "w") as f:
         f.write(text)
+
+
+def script(path, body):
+    """A shell script at `path` that runs `body`."""
+    write(path, "#!/bin/sh\n" + body + "\n")
+    os.chmod(path, 0o755)
+    return path
+
+
+# A compiler whose every test run reports the grade's test and the program's own passing.
+PASSING = """echo '{"diagnostics": [], "tests": [{"name": "grade_x", "passed": true}, {"name": "fib_is_right", "passed": true}]}'"""
+
+
+class Validator(unittest.TestCase):
+    def test_a_validator_that_fails_leaves_the_attempt_not_correct(self):
+        task = next(t for t in grading.tasks() if t["grade"].get("without"))
+        lint = next(iter(task["grade"]["without"]))
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.makedirs(src)
+            write(os.path.join(src, "main.wrela"), "pub fn frame(time: f32, width: u32, height: u32) {}\n")
+            wrela = script(os.path.join(tmp, "wrela"), PASSING)
+            for name, body in [("crashes", "exit 3"), ("silent", "exit 0"),
+                               ("garbled", "echo not json; exit 1"),
+                               ("unreported", "echo '{\"version\": 2}'; exit 0")]:
+                g = grading.grade(task, src, wrela, script(os.path.join(tmp, name), body))
+                self.assertFalse(g["correct"], name)
+                self.assertTrue(g["why"].startswith("validator failed"), (name, g["why"]))
+            clean = script(os.path.join(tmp, "clean"), """echo '{"diagnostics": []}'; exit 0""")
+            self.assertTrue(grading.grade(task, src, wrela, clean)["correct"])
+            linted = script(os.path.join(tmp, "linted"),
+                            f"""echo '{{"diagnostics": [{{"code": "{lint}"}}]}}'; exit 1""")
+            g = grading.grade(task, src, wrela, linted)
+            self.assertEqual((g["correct"], g["why"]), (False, task["grade"]["without"][lint]))
+
+
+class RunState(unittest.TestCase):
+    """run.py's `--grade` and `--resume` on a run made here, with a compiler that passes every
+    test, so no agent runs."""
+
+    def run_dir(self, tmp, tasks):
+        """A run of `tasks` at `tmp`/run with the passing compiler; its path."""
+        run = os.path.join(tmp, "run")
+        os.makedirs(run)
+        wrela = script(os.path.join(tmp, "wrela"), PASSING)
+        with open(wrela, "rb") as f:
+            digest = hashlib.sha256(f.read()).hexdigest()
+        compiler = {"path": wrela, "sha256": digest, "version": "stub"}
+        write(os.path.join(run, "run.json"), json.dumps(
+            {"model": "m", "context": "full", "wrela": compiler, "validator": compiler, "tasks": tasks}))
+        return run
+
+    def finished(self, run, task):
+        """Marks `task`'s agent finished: the CLI's report is there."""
+        os.makedirs(os.path.join(run, task), exist_ok=True)
+        write(os.path.join(run, task, "usage.json"), "{}")
+
+    def attempt(self, run, task, n, graded=None):
+        """Attempt `n` of `task`, which built; with `graded`, its grade already written."""
+        a = os.path.join(run, task, "attempts", str(n))
+        os.makedirs(os.path.join(a, "src"))
+        write(os.path.join(a, "src", "main.wrela"), "pub fn frame(time: f32, width: u32, height: u32) {}\n")
+        write(os.path.join(a, "status"), "0")
+        if graded is not None:
+            write(os.path.join(a, "graded.json"), json.dumps(graded))
+        return a
+
+    def run_py(self, *args):
+        out = subprocess.run([sys.executable, os.path.join(V2, "run.py"), *args],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        return out.stdout
+
+    def test_grading_again_writes_the_score_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dir(tmp, ["01-area"])
+            a = self.attempt(run, "01-area", 1)
+            # A run's name is a path under target/agent-test, so an absolute one is itself.
+            self.run_py(run, "--grade")
+            with open(os.path.join(a, "graded.json")) as f:
+                self.assertTrue(json.load(f)["correct"])
+            with open(os.path.join(run, "score.json")) as f:
+                self.assertEqual(json.load(f)["per_task"][0]["correct_at"], 1)
+
+    def test_a_dry_resume_deletes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dir(tmp, ["01-area", "13-arrays"])
+            self.finished(run, "01-area")
+            self.attempt(run, "01-area", 1, graded={"correct": True})
+            unfinished = os.path.join(run, "13-arrays", "pkg", "main.wrela")
+            os.makedirs(os.path.dirname(unfinished))
+            write(unfinished, "// the agent's work so far\n")
+            out = self.run_py(run, "--resume", "--dry-run")
+            self.assertEqual(len(out.strip().splitlines()), 2, out)
+            self.assertTrue(os.path.isfile(unfinished))
+
+    def test_a_resume_grades_the_attempts_left_ungraded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = self.run_dir(tmp, ["01-area"])
+            self.finished(run, "01-area")
+            first = self.attempt(run, "01-area", 1)
+            kept = {"built": True, "correct": False, "why": "graded before the stop", "failed": []}
+            second = self.attempt(run, "01-area", 2, graded=kept)
+            self.run_py(run, "--resume")
+            with open(os.path.join(first, "graded.json")) as f:
+                self.assertTrue(json.load(f)["correct"], "the attempt left ungraded is graded")
+            with open(os.path.join(second, "graded.json")) as f:
+                self.assertEqual(json.load(f), kept, "a graded attempt isn't graded again")
+            with open(os.path.join(run, "score.json")) as f:
+                self.assertEqual(json.load(f)["per_task"][0]["correct_at"], 1)
 
 
 class Score(unittest.TestCase):

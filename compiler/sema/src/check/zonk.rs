@@ -540,12 +540,15 @@ pub(super) fn finish_common(c: &mut Checker) {
             _ => {}
         }
     }
-    // Float literals must be finite in their types (rounding is accepted).
+    // Float literals must be finite in their types (rounding is accepted). An f16 rounds from
+    // the number written (its f64 value, as lowering does); from 65520 up, halfway past its
+    // largest (65504), it rounds to infinity.
     for (ty, v, f, span) in std::mem::take(&mut c.float_literals) {
         let t = c.infer.resolve(&c.p.types, ty);
-        let largest = match c.p.types.kind(t) {
-            TyKind::Float(FloatTy::F32) if !f.is_finite() => "3.4e38",
-            TyKind::Float(FloatTy::F64) if !v.is_finite() => "1.8e308",
+        let (largest, wider) = match c.p.types.kind(t) {
+            TyKind::Float(FloatTy::F16) if v.is_nan() || v >= 65520.0 => ("65504", "f32"),
+            TyKind::Float(FloatTy::F32) if !f.is_finite() => ("about 3.4e38", "f64"),
+            TyKind::Float(FloatTy::F64) if !v.is_finite() => ("about 1.8e308", "f64"),
             _ => continue,
         };
         let shown = c.p.display_ty(t);
@@ -556,10 +559,9 @@ pub(super) fn finish_common(c: &mut Checker) {
                 format!("this number is too large for an `{shown}`"),
             )
             .with_help(format!(
-                "write a number that fits, or give it a wider type, as in `let x: {} = ...`",
-                if c.p.types.is_float(t) { "f64" } else { "u64" }
+                "write a number that fits, or give it a wider type, as in `let x: {wider} = ...`"
             ))
-            .with_note(format!("an `{shown}`'s largest value is about {largest}")),
+            .with_note(format!("an `{shown}`'s largest value is {largest}")),
         );
     }
     // Bounds.

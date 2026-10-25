@@ -41,7 +41,7 @@ let loads = 0;
 
 /** Loads main.ts on a page at `url`, hidden or not, whose ResizeObserver may lack
  * `device-pixel-content-box` (as Safari's does). */
-async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean; preload?: string[] } = {}): Promise<Page> {
+async function load(url: string, options: { hidden?: boolean; devicePixelBox?: boolean; focused?: boolean; gpu?: boolean; alternate?: string; links?: { href: string; text: string }[]; text?: boolean; preload?: string[]; refuseThreads?: boolean } = {}): Promise<Page> {
   const page: Page = { posted: [], puts: [], shown: [], observed: [], mediaListeners: [], visibilityListeners: [], canvasEvents: new Map(), worker: null, text: [], classes: [] };
   // The page's own text records a box put before it, and its removal.
   const own = options.text ? {
@@ -90,7 +90,9 @@ async function load(url: string, options: { hidden?: boolean; devicePixelBox?: b
     class {
       onmessage: ((event: MessageEvent<FromWorker>) => void) | null = null;
       onerror = null;
-      constructor() {
+      constructor(_url: URL, init?: WorkerOptions) {
+        // A page's policy may refuse a worker at once, as a CSP does.
+        if (options.refuseThreads && init?.name !== "wrela render") throw new DOMException("the page's policy refuses workers", "SecurityError");
         page.worker = this;
       }
       postMessage(m: ToWorker) {
@@ -187,6 +189,13 @@ test("a machine without a hardware adapter is told the same; other failures stil
   const failed = await load("https://example.com/game/");
   failed.worker!.onmessage!(new MessageEvent("message", { data: { type: "fatal", message: "device lost", unsupported: false } satisfies FromWorker }));
   expect(failed.shown).toEqual(["wrela stopped: device lost"]);
+});
+
+test("a thread the page refuses at once fails in the render worker, which would wait for it", async () => {
+  const page = await load("https://example.com/game/", { refuseThreads: true });
+  const spawn = { type: "spawn", id: 3, name: "wrela ticker", port: {} as MessagePort } satisfies FromWorker;
+  page.worker!.onmessage!(new MessageEvent("message", { data: spawn }));
+  expect(page.posted.at(-1)).toEqual({ type: "thread-failed", id: 3, message: "the page's policy refuses workers" });
 });
 
 test("the worker learns the page's visibility at once, and on each change", async () => {

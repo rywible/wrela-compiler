@@ -7,18 +7,22 @@
 //! - **inline `<fn>`**: each call of a free function whose body is one expression becomes that
 //!   expression, and the function goes if nothing else names it. It keeps what each call means
 //!   only where nothing about the call can be observed to move: so every parameter is used
-//!   exactly once, in parameter order, and every argument is a local whose type is written
-//!   where it's declared (a literal takes its type from where it lands, and an untyped local from
-//!   its uses, so either could change type in the body); a body with a bare number keeps it typed
-//!   by wrapping the expression in a conversion to the function's (scalar) result.
+//!   exactly once, in parameter order, the body binds no parameter's name again, and every
+//!   argument is a local whose type is written where it's declared (a literal takes its type
+//!   from where it lands, and an untyped local from its uses, so either could change type in
+//!   the body). The expression is the value of a binding typed as the function's result, in a
+//!   block of its own (`{ let f: T = body; f }`): its numbers keep their types, and its
+//!   temporaries end where they ended in the function.
 //! - **extract-fn `<file>:<first>-<last>` `<name>`**: those whole lines, statements of one block,
 //!   become a function after the one they're in, which takes the locals they use that are bound
 //!   before them and returns the one bound in them that's used after (two or more are refused),
 //!   and the lines a call of it. A parameter is `borrow` unless the lines move it (`take`) or the
-//!   check says it's changed (then `mut`, and the call lends it `mut`).
+//!   check says it's changed (then `mut`, and the call lends it `mut`). Lines that bind a value
+//!   that owns something (a buffer, a `Vec`) and isn't used after are refused unless they end
+//!   their block: the new function would drop it sooner.
 
 use super::*;
-use wrela_syntax::ast::{self, ExprKind, LitKind, StmtKind};
+use wrela_syntax::ast::{self, ExprKind, StmtKind};
 
 /// `file:line:column`, each from 1.
 fn parse_place(at: &str) -> Result<(String, u32, u32), Refusal> {
@@ -66,6 +70,17 @@ fn leaves<'a>(stmts: impl IntoIterator<Item = &'a ast::Stmt>) -> bool {
 /// A function's locals as written, its parameters among them: none the compiler made.
 fn user_locals(body: &wrela_sema::mir::Body) -> impl Iterator<Item = &wrela_sema::mir::LocalDecl> {
     body.locals.iter().filter(|l| matches!(l.kind, wrela_sema::mir::LocalKind::User(_)))
+}
+
+/// Calls `f` with each name that `x` reads itself: `x`, if it's a single name, and each field
+/// of a struct literal written as shorthand (`S { x }` reads `x`).
+fn each_name(x: &ast::Expr, f: &mut impl FnMut(&str)) {
+    if let Some(n) = x.single_name() {
+        f(n);
+    }
+    if let ExprKind::StructLit { fields, .. } = &x.kind {
+        fields.iter().filter(|i| i.value.is_none()).for_each(|i| f(&i.name.name));
+    }
 }
 
 // ---- extract-const ----------------------------------------------------------------------------
@@ -131,19 +146,17 @@ pub fn extract_const(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal>
         let source = &sources.file(fid).text;
         let text = p.text(e.span).unwrap_or_default().to_string();
         let decl = format!("const {name}: {ty} = {text}");
-        // After the file's imports, or else after the comment it opens with.
+        // After the file's imports, or else after the comment it opens with and the blank lines
+        // after that: before the first item and its comments.
         let (at, insertion) = match use_statements(source).last() {
             Some(&(_, end)) => (end as u32, format!("\n{decl}\n")),
             None => {
-                let mut at = 0;
-                for l in source.split_inclusive('\n') {
-                    if l.trim_start().starts_with("//") || l.trim().is_empty() {
-                        at += l.len();
-                    } else {
-                        break;
-                    }
-                }
-                (at as u32, format!("{decl}\n\n"))
+                let intro = intro_end(source);
+                let blank: usize = (source[intro..].split_inclusive('\n'))
+                    .take_while(|l| l.trim().is_empty())
+                    .map(str::len)
+                    .sum();
+                ((intro + blank) as u32, format!("{decl}\n\n"))
             }
         };
         Ok((rel, at, insertion, e.span, text, ty))
@@ -194,6 +207,24 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
                 x.name
             ));
         }
+        if def.ret_mode != ast::RetMode::Owned || def.opaque.is_some() {
+            return refuse(format!(
+                "`{path}` returns a projection or a type that names traits: only a value of a written type is inlined"
+            ));
+        }
+        // A name the body binds again (a `let`, a pattern, a closure's parameter) would be the
+        // argument where it's inlined.
+        if let Some(l) = user_locals(&checked.mir[&f]).find(|l| {
+            !matches!(
+                l.kind,
+                wrela_sema::mir::LocalKind::User(wrela_sema::thir::LocalKind::Param(_))
+            ) && def.params.iter().any(|q| q.name == l.name)
+        }) {
+            return refuse(format!(
+                "the body binds `{}` again, which its parameter names: rename one first",
+                l.name
+            ));
+        }
         let Some(body) = &def.body else { return refuse(format!("`{path}` has no body")) };
         let [stmt] = body.stmts.as_slice() else {
             return refuse(format!("`{path}`'s body isn't one expression"));
@@ -213,18 +244,26 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
         }
         // Each parameter used exactly once, in the parameter order.
         let mut uses: Vec<Vec<Span>> = vec![Vec::new(); def.params.len()];
-        let mut numbers = false;
+        let mut shorthand = None;
         tail.walk(&mut |x| {
             if let Some(n) = x.single_name()
                 && let Some(i) = def.params.iter().position(|q| q.name == n)
             {
                 uses[i].push(x.span);
             }
-            if let ExprKind::Lit(l) = &x.kind {
-                numbers |=
-                    matches!(l.kind, LitKind::Int(_) | LitKind::Float(_) | LitKind::Suffixed);
+            if let ExprKind::StructLit { fields, .. } = &x.kind
+                && let Some(i) = fields
+                    .iter()
+                    .find(|i| i.value.is_none() && def.params.iter().any(|q| q.name == i.name.name))
+            {
+                shorthand = Some(i.name.name.clone());
             }
         });
+        if let Some(n) = shorthand {
+            return refuse(format!(
+                "the body passes `{n}` as a struct literal's shorthand field: write `{n}: {n}` first"
+            ));
+        }
         if let Some(i) = uses.iter().position(|u| u.len() != 1) {
             return refuse(format!(
                 "`{}` is used {} times in the body: each argument would be evaluated a different number of times",
@@ -238,21 +277,10 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
                 "the body uses its parameters in another order than they're declared: the arguments would be evaluated in another order",
             );
         }
-        // A bare number takes its type from where it is: kept by a conversion to the result.
-        let convert = if numbers {
-            match p.types.kind(def.ret) {
-                wrela_sema::ty::TyKind::Int(_) | wrela_sema::ty::TyKind::Float(_) => {
-                    Some(p.display_ty(def.ret))
-                }
-                _ => {
-                    return refuse(format!(
-                        "`{path}`'s body has a number whose type would come from where it's inlined"
-                    ));
-                }
-            }
-        } else {
-            None
-        };
+        // The body is the value of a binding of the function's result type, in a block of its
+        // own: its numbers take their types from that type, as they took them from the result,
+        // and its temporaries end with the binding's statement, as they ended with the function.
+        let ret = p.display_ty(def.ret);
         let body_text = p.text(tail.span).unwrap_or_default();
         // The other names the body uses, each must name the same where it's inlined: every name
         // that starts a path, a struct literal's or a type's too, read off the tokens so none is
@@ -338,10 +366,10 @@ pub fn inline(root: &Path, func: &str) -> Result<Plan, Refusal> {
                 pos = s.end;
             }
             out.push_str(&body_text[(pos - tail.span.start) as usize..]);
-            let expr = match &convert {
-                Some(t) => format!("{t}({out})"),
-                None => format!("({out})"),
-            };
+            // The function's name, which the body can't use (it would call itself, or be a
+            // value), so the binding hides nothing the body names.
+            let n = &def.name;
+            let expr = format!("{{ let {n}: {ret} = {out}; {n} }}");
             edits.push((call.file.clone(), call.span.start, call.span.end, expr));
         }
         // The function goes when it's private: every use was a call, and each is inlined.
@@ -450,9 +478,10 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
             });
             let whole = inside.first().is_some_and(|s| s.span.start == cs)
                 && inside.last().is_some_and(|s| s.span.end == ce);
-            (whole && !partly).then_some(inside)
+            let ends_block = b.stmts.last().is_some_and(|s| s.span.end == ce);
+            (whole && !partly).then_some((inside, ends_block))
         });
-        let Some(stmts) = found else {
+        let Some((stmts, ends_block)) = found else {
             return refuse("the lines aren't whole statements of one block");
         };
         if leaves(stmts.iter().copied()) {
@@ -467,11 +496,11 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
         for s in &stmts {
             s.for_each_expr(&mut |e| {
                 e.walk(&mut |x| {
-                    if let Some(n) = x.single_name()
-                        && !used.iter().any(|u| u == n)
-                    {
-                        used.push(n.to_string());
-                    }
+                    each_name(x, &mut |n| {
+                        if !used.iter().any(|u| u == n) {
+                            used.push(n.to_string());
+                        }
+                    });
                     if let ExprKind::Take(inner) = &x.kind
                         && let Some(n) = inner.single_name()
                     {
@@ -517,9 +546,9 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
             walked_to = s.span.end;
             s.for_each_expr(&mut |e| {
                 e.walk(&mut |x| {
-                    if let Some(n) = x.single_name() {
+                    each_name(x, &mut |n| {
                         after_uses.insert(n.to_string());
-                    }
+                    });
                     if let ExprKind::MutArg(inner) = &x.kind
                         && let Some(n) = root_name(inner)
                     {
@@ -529,6 +558,11 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
             });
         }
         let user: Vec<&wrela_sema::mir::LocalDecl> = user_locals(&checked.mir[&f]).collect();
+        // The blocks inside the lines: what's bound in one ends there, in the function too.
+        let mut nested: Vec<Span> = Vec::new();
+        for s in &stmts {
+            s.for_each_block(&mut |b| nested.push(b.span));
+        }
         let mut params = Vec::new();
         let mut result = None;
         for n in &used {
@@ -544,6 +578,21 @@ pub fn extract_fn(root: &Path, at: &str, name: &str) -> Result<Plan, Refusal> {
         }
         for d in &user {
             let bound_inside = d.span.start >= cs && d.span.start < ce;
+            // A value that owns something (a buffer, a `Vec`) the lines bind for the rest of
+            // their block would be dropped when the new function returns, before the code after
+            // the lines runs: what that code observes (`std::gpu::memory()`) would change.
+            let owns = matches!(
+                d.kind,
+                wrela_sema::mir::LocalKind::User(wrela_sema::thir::LocalKind::Owned { .. })
+            ) && d.closure.is_none()
+                && !nested.iter().any(|b| b.start <= d.span.start && d.span.end <= b.end)
+                && wrela_sema::traits::may_need_drop(p, d.ty);
+            if bound_inside && owns && !ends_block && !after_uses.contains(&d.name) {
+                return refuse(format!(
+                    "`{}` owns what it holds to the end of its block, and would be dropped where the new function returns: extract the lines to the end of the block",
+                    d.name
+                ));
+            }
             if bound_inside && after_uses.contains(&d.name) {
                 if result.is_some() {
                     return refuse(

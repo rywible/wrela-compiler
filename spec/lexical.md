@@ -84,8 +84,9 @@ Error codes come from the lexical range E0001–E0099.
   A float has digits on both sides of its `.`: `1.` is `1` then `.`, and `.5` is `.` then `5`.
   There are no negative literals: `-1` is unary minus applied to `1`.
   A literal must fit the type it takes (E0006): an integer is in its type's range, a float is
-  finite (it may round), and an integer that becomes a float is exact (`16777217` isn't an
-  `f32`; `16777217.0` rounds).
+  finite (it may round, to its type's nearest value: an `f16` from the number written, not
+  from an `f32`), and an integer that becomes a float is exact (`16777217` isn't an `f32`;
+  `16777217.0` rounds).
 
 ## String literals
 

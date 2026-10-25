@@ -213,6 +213,35 @@ fn an_expression_of_literals_becomes_a_constant() {
 }
 
 #[test]
+fn a_constant_goes_after_the_files_comment_and_before_the_first_items_doc() {
+    let dir = program(
+        "extract-const-doc",
+        &[(
+            "main.wrela",
+            "// Areas.
+
+/// The area, halved.
+fn area(w: f32, h: f32) -> f32 {
+    w * h * 0.5
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+",
+        )],
+    );
+    let a = plan(&dir, &["extract-const", "main.wrela:5:13", "HALF", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    let text = main_text(&dir);
+    assert!(
+        text.starts_with(
+            "// Areas.\n\nconst HALF: f32 = 0.5\n\n/// The area, halved.\nfn area(w: f32, h: f32)"
+        ),
+        "{text}"
+    );
+    assert!(checks(&dir));
+}
+
+#[test]
 fn lines_become_a_function_with_what_flows_in_and_out() {
     let dir = program("extract-fn", &[("main.wrela", EXTRACTS)]);
     let a = plan(&dir, &["extract-fn", "main.wrela:4-6", "accumulate", "--json"]);
@@ -270,6 +299,106 @@ fn two(x: f32) -> f32 {
     for name in ["b", "sqrt"] {
         refused(&dir, &["extract-fn", "main.wrela:4-4", name], "has already");
     }
+}
+
+#[test]
+fn lines_of_a_method_become_a_function_after_its_impl() {
+    let dir = program(
+        "extract-fn-impl",
+        &[(
+            "main.wrela",
+            "pub fn frame(time: f32, width: u32, height: u32) {}
+
+struct Board {
+    w: f32,
+}
+
+impl Board {
+    fn scaled(self, k: f32) -> f32 {
+        let twice = k * 2.0
+        self.w * twice
+    }
+}
+
+@test
+fn scales() {
+    assert(Board { w: 3.0 }.scaled(2.0) == 12.0)
+}
+",
+        )],
+    );
+    let a = plan(&dir, &["extract-fn", "main.wrela:9-9", "double", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    let text = main_text(&dir);
+    assert!(text.contains("        let twice = double(k)\n"), "{text}");
+    assert!(text.contains("    }\n}\n\nfn double(k: f32) -> f32 {\n"), "{text}");
+    assert!(checks(&dir) && tests_pass(&dir));
+}
+
+#[test]
+fn a_struct_literals_shorthand_field_is_a_use_the_function_takes() {
+    let dir = program(
+        "extract-fn-shorthand",
+        &[(
+            "main.wrela",
+            "pub fn frame(time: f32, width: u32, height: u32) {}
+
+const x: f32 = 1.0
+
+struct S: Copy {
+    x: f32,
+}
+
+fn made(x: f32) -> f32 {
+    let s = S { x }
+    s.x
+}
+
+@test
+fn made_holds() {
+    assert(made(2.0) == 2.0)
+}
+",
+        )],
+    );
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    // The parameter `x`, not the constant: the new function takes it.
+    let a = plan(&dir, &["extract-fn", "main.wrela:10-10", "build", "--json"]);
+    assert_eq!(a["written"], true, "{a}");
+    assert!(main_text(&dir).contains("let s = build(x)"), "{}", main_text(&dir));
+    assert!(checks(&dir) && tests_pass(&dir));
+}
+
+#[test]
+fn lines_that_would_drop_what_they_own_sooner_are_refused() {
+    let dir = program(
+        "extract-fn-owner",
+        &[(
+            "main.wrela",
+            "use std::gpu::{buffer, memory}
+
+pub struct State {
+    seen: Vec<u64>,
+}
+
+pub fn init() -> State {
+    State { seen: Vec::new() }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    let b = buffer::<u32>(16)
+    s.seen.push(memory().buffers)
+}
+
+@test(frames: 1, gpu: true)
+fn the_buffer_lives_to_the_end_of_its_block(s: State) {
+    assert(s.seen[0] == 64)
+}
+",
+        )],
+    );
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    refused(&dir, &["extract-fn", "main.wrela:12-12", "make"], "owns what it holds");
 }
 
 const INLINES: &str = "pub fn frame(time: f32, width: u32, height: u32) {}
@@ -398,6 +527,108 @@ fn a_call_becomes_the_body_where_nothing_about_it_can_change() {
     // A named argument goes to its parameter: `minus(b: one, a: three)` is `three - one`.
     let a = plan(&dir, &["inline", "minus", "--json"]);
     assert_eq!(a["written"], true, "{a}");
-    assert!(main_text(&dir).contains("(three - one)") && !main_text(&dir).contains("fn minus"));
+    let text = main_text(&dir);
+    assert!(text.contains("{ let minus: f32 = three - one; minus }"), "{text}");
+    assert!(!text.contains("fn minus"), "{text}");
     assert!(checks(&dir) && tests_pass(&dir));
+}
+
+#[test]
+fn an_inlined_body_keeps_its_numbers_types_and_its_temporaries_lives() {
+    let dir = program(
+        "inline-context",
+        &[(
+            "main.wrela",
+            "use std::gpu::{GpuBuffer, buffer, memory}
+
+pub struct State {
+    seen: Vec<u64>,
+}
+
+pub fn init() -> State {
+    State { seen: Vec::new() }
+}
+
+fn half() -> f32 {
+    1 / 2
+}
+
+fn measure(_b: GpuBuffer<u32>) -> u64 {
+    memory().buffers
+}
+
+fn sized() -> u64 {
+    measure(buffer::<u32>(16))
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    s.seen.push(sized() + memory().buffers)
+}
+
+fn halved() -> f32 {
+    half()
+}
+
+@test
+fn numbers_keep_their_types() {
+    assert(halved() == 0.5)
+}
+
+@test(frames: 1, gpu: true)
+fn temporaries_end_with_the_function(s: State) {
+    assert(s.seen[0] == 64)
+}
+",
+        )],
+    );
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    for f in ["half", "sized"] {
+        let a = plan(&dir, &["inline", f, "--json"]);
+        assert_eq!(a["written"], true, "{a}");
+        assert!(checks(&dir) && tests_pass(&dir), "{f}: {}", main_text(&dir));
+    }
+}
+
+#[test]
+fn a_body_that_binds_a_parameters_name_again_is_not_inlined() {
+    let dir = program(
+        "inline-shadow",
+        &[(
+            "main.wrela",
+            "pub fn frame(time: f32, width: u32, height: u32) {}
+
+struct S: Copy {
+    x: f32,
+}
+
+fn chosen(x: u32) -> u32 {
+    {
+        let x: u32 = 2
+        x
+    }
+}
+
+fn made(x: f32) -> f32 {
+    x + S { x }.x
+}
+
+fn calls() -> f32 {
+    let five: u32 = 5
+    let one: f32 = 1.0
+    let x: f32 = 5.0
+    f32(chosen(five)) + made(one) + x
+}
+
+@test
+fn values_hold() {
+    assert(calls() == 2.0 + 2.0 + 5.0)
+}
+",
+        )],
+    );
+    assert!(tests_pass(&dir), "the fixture's own test passes");
+    let before = main_text(&dir);
+    refused(&dir, &["inline", "chosen"], "binds `x` again");
+    refused(&dir, &["inline", "made"], "shorthand");
+    assert_eq!(main_text(&dir), before, "nothing written");
 }

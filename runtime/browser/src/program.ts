@@ -62,7 +62,7 @@ import {
   REQUEST_MISSING,
   REQUEST_PENDING,
 } from "./abi.gen.ts";
-import { type Checker, CommandError } from "./check.ts";
+import { type Checker, checkHostRules, CommandError } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
 import { CALLED_WHILE_STARTING, clockImport, phaseImport, Phases, printed, refusingImports } from "./imports.ts";
@@ -353,8 +353,12 @@ export interface ProgramOptions {
   /** Check each command against WebGPU's rules before the executor runs it (the default), so
    * an error names the program's mistake: test mode, debug builds and hot reload. A release
    * build's normal run doesn't: WebGPU validates, and its `uncapturederror` is fatal. The
-   * sequencer (a pass's commands inside it) checks either way. */
+   * sequencer (a pass's commands inside it) and the rules WebGPU doesn't know (`checkHostRules`:
+   * a request's path stays in its storage, build or origin) check either way. */
   checking?: boolean;
+  /** Time its own thread's phases (`std::time::phase`) for `takePhases`: test mode takes them
+   * after each frame. A normal run doesn't keep them, so names made without end cost nothing. */
+  phases?: boolean;
   /** Where storage and fetch requests go; without it, they fail. */
   io?: Io;
   /** The builds the program may hand over to; without it, those requests fail. */
@@ -404,8 +408,8 @@ export class Program {
   #sequencer = new Sequencer();
   /** Validated commands wait for the export to return successfully before execution. */
   #pending: Command[] = [];
-  /** The phases its own thread times (`std::time::phase`). */
-  readonly #phases = new Phases();
+  /** The phases its own thread times (`std::time::phase`), when the options ask for them. */
+  readonly #phases: Phases | null;
   readonly #checking: boolean;
   #memory: WebAssembly.Memory | null = null;
   /** The memory's maximum, in bytes: what the program reserves. */
@@ -450,6 +454,7 @@ export class Program {
     options: ProgramOptions,
   ) {
     this.hash = options.hash ? new StateHash() : null;
+    this.#phases = options.phases ? new Phases() : null;
     this.#checking = options.checking ?? true;
     this.#io = options.io ?? null;
     this.#builds = options.builds ?? null;
@@ -531,7 +536,9 @@ export class Program {
         },
         [IMPORT_PHASE]: (ptr: number, len: number) => {
           program.#starting();
-          program.#phases.begin(phase(ptr, len));
+          // The name is read and checked whether or not phases are timed.
+          const name = phase(ptr, len);
+          program.#phases?.begin(name);
         },
       },
     };
@@ -615,6 +622,7 @@ export class Program {
       // sequencer back as it was before the call (`#call`).
       this.#sequencer.step(cmd);
       if (this.#checking) this.checker.check(cmd);
+      else checkHostRules(cmd);
       if (cmd.op === "HostRequest" && this.#net && cmd.service.startsWith("net/")) {
         this.#netCommand(cmd.service, cmd.body, false);
       } else if ("request" in cmd) {
@@ -949,9 +957,10 @@ export class Program {
     this.#call(() => this.#frame!(time, width, height));
   }
 
-  /** The phases its calls timed since the last take (`std::time::phase`), ms by name. */
+  /** The phases its calls timed since the last take (`std::time::phase`), ms by name; none
+   * unless the options asked for them. */
   takePhases(): Record<string, number> {
-    return this.#phases.take();
+    return this.#phases?.take() ?? {};
   }
 
   /** Its memory, in bytes: the maximum it reserves, and what it has grown to. */
@@ -995,7 +1004,7 @@ export class Program {
       throw e;
     } finally {
       // A phase ends with its call, as on the native host.
-      this.#phases.end();
+      this.#phases?.end();
       this.#inbox.endCall();
       this.#requests.endCall();
       this.#netPlan = null;

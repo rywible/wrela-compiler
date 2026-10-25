@@ -441,8 +441,8 @@ pub fn frame(time: f32, width: u32, height: u32) {}
 }
 
 /// W0010: a copy that nothing changes, of a place nothing changes, is a borrow's job; a copy
-/// that's changed, moved, returned, or taken while its source changes (or is replaced) isn't
-/// reported, and neither is a `Copy` value's.
+/// that's changed, moved, returned, taken while its source changes (or is replaced), or that
+/// outlives its source isn't reported, and neither is a `Copy` value's.
 #[test]
 fn a_copy_only_read_is_reported() {
     let src = "pub struct F {
@@ -490,18 +490,28 @@ fn replaces_a_parameter(hs: mut Vec<f32>) -> f32 {
     first[0]
 }
 
+fn outlives_the_source() -> f32 {
+    let copied = {
+        let source = Vec::from([1.0])
+        source.clone()
+    }
+    copied[0]
+}
+
 fn _uses() -> f32 {
     var f = F { hs: Vec::from([1.0]), n: 1 }
     let a = read(f) + changes_the_copy(f) + changes_the_source(mut f)
     let b = returns_it(f)
-    a + b[0] + f32(copies_a_number(f)) + replaces_the_source() + replaces_a_parameter(mut f.hs)
+    let c = outlives_the_source()
+    a + b[0] + c + f32(copies_a_number(f)) + replaces_the_source() + replaces_a_parameter(mut f.hs)
 }";
     let w = warnings("copy-read", src);
     assert_eq!(lines(&w, "W0010"), [7], "{w:?}");
 }
 
-/// W0011: a test of code that reaches no `assert` and no panic passes whatever it computes; one
-/// that asserts, or that reaches a panic through what it calls, isn't reported.
+/// W0011: a test of code that reaches no `assert`, no panic and no trap passes whatever it
+/// computes; one that asserts, that reaches a panic through what it calls, or that indexes an
+/// array or divides integers where that can trap, isn't reported.
 #[test]
 fn a_test_that_cant_fail_is_reported() {
     let src = "fn double(x: f32) -> f32 {
@@ -526,9 +536,34 @@ fn asserts() {
 @test
 fn reaches_a_panic() {
     let _y = checked(1.0)
+}
+
+fn one() -> u32 {
+    1
+}
+
+@test
+fn indexes_an_array() {
+    let a = [1, 2]
+    let _k = a[one()]
+}
+
+@test
+fn divides() {
+    let _q = 7 / one()
+}
+
+@test
+fn takes_a_remainder() {
+    let _r = 7 % one()
+}
+
+@test
+fn halves() {
+    let _h = one() / 2
 }";
     let w = warnings("test-cant-fail", src);
-    assert_eq!(lines(&w, "W0011"), [11], "{w:?}");
+    assert_eq!(lines(&w, "W0011"), [11, 46], "{w:?}");
 }
 
 /// W0012: a request's handle polled in the call that made it is `None` every time; one kept in

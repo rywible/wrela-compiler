@@ -493,7 +493,7 @@ export function decode(batch: Bytes): Command[] {
         const rect: [number, number, number, number] = [f(0), f(1), f(2), f(3)];
         const minDepth = f(4);
         const maxDepth = f(5);
-        if (!rect.every(Number.isFinite) || rect[2] < 0 || rect[3] < 0) throw bad("a viewport is a finite rectangle of positive size");
+        if (!rect.every(Number.isFinite) || rect[2] < 0 || rect[3] < 0) throw bad("a viewport is a finite rectangle of non-negative size");
         if (!(minDepth >= 0 && minDepth <= 1) || !(maxDepth >= 0 && maxDepth <= 1) || minDepth > maxDepth) throw bad("a viewport's depths are in [0, 1], the least first");
         cmd = { op: name, rect, minDepth, maxDepth };
         break;

@@ -110,12 +110,20 @@ impl Texts {
         Ok(self.now.get_mut(file).expect("read"))
     }
 
-    /// Replaces each `(start, end)` of `file` (offsets in its text now) with its text.
+    /// Replaces each `(start, end)` of `file` (offsets in its text now) with its text. The same
+    /// edit twice is made once; two edits that start at one offset, or overlap, are refused,
+    /// as no order of them is the one meant.
     fn replace(&mut self, file: &str, mut edits: Vec<(u32, u32, String)>) -> Result<(), Refusal> {
-        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-        edits.dedup_by_key(|e| e.0);
+        edits.sort();
+        edits.dedup();
+        if let Some(w) = edits.windows(2).find(|w| w[1].0 == w[0].0 || w[1].0 < w[0].1) {
+            return refuse(format!(
+                "two changes of {file} meet, at {}..{} and {}..{}: nothing is changed",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            ));
+        }
         let text = self.get(file)?;
-        for (s, e, new) in edits {
+        for (s, e, new) in edits.into_iter().rev() {
             text.replace_range(s as usize..e as usize, &new);
         }
         Ok(())
@@ -515,12 +523,18 @@ fn use_statements(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Where a new import goes: after the file's last top-level `use` (its end, for one over
-/// several lines), else after its first comment block.
+/// several lines), else after the comment it opens with.
 fn import_at(text: &str) -> usize {
-    use_statements(text).last().map_or_else(
-        || text.split_inclusive('\n').take_while(|l| l.starts_with("//")).map(str::len).sum(),
-        |&(_, end)| end,
-    )
+    use_statements(text).last().map_or_else(|| intro_end(text), |&(_, end)| end)
+}
+
+/// Where the `//` comment a file opens with ends: what its module is for, as `wrela doc` reads
+/// it. A `///` line is the first item's doc comment, so it ends the comment.
+fn intro_end(text: &str) -> usize {
+    (text.split_inclusive('\n'))
+        .take_while(|l| l.starts_with("//") && !l.starts_with("///"))
+        .map(str::len)
+        .sum()
 }
 
 /// `text` with `name` taken out of the top-level `use` that imports it (the whole `use`, if
@@ -1537,6 +1551,28 @@ mod tests {
     }
 
     #[test]
+    fn edits_that_meet_are_refused_and_the_same_edit_is_made_once() {
+        let dir = std::env::temp_dir().join(format!("wrela-refactor-edits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        std::fs::write(dir.join("a.wrela"), "abcdef").expect("source");
+        let edit = |s: u32, e: u32, t: &str| (s, e, t.to_string());
+        for edits in [
+            vec![edit(1, 1, "x"), edit(1, 1, "y")],
+            vec![edit(1, 3, "x"), edit(1, 1, "y")],
+            vec![edit(1, 4, "x"), edit(3, 5, "y")],
+        ] {
+            let mut texts = Texts::new(&dir);
+            assert!(texts.replace("a.wrela", edits.clone()).is_err(), "{edits:?}");
+        }
+        let mut texts = Texts::new(&dir);
+        let edits = vec![edit(4, 4, "Y"), edit(1, 4, "X"), edit(1, 4, "X"), edit(0, 0, "_")];
+        texts.replace("a.wrela", edits).expect("edits apart");
+        assert_eq!(texts.now["a.wrela"], "_aXYef");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn hunks_are_the_lines_that_changed() {
         let h = hunks("a\nb\nc\nd\n", "a\nB\nc\nd\ne\n");
         assert_eq!(
@@ -1554,6 +1590,7 @@ mod tests {
         let text = "// A module.\n\nuse a::b\nuse c::{d,\n    e}\n\nfn f() {}\n";
         assert_eq!(&text[..import_at(text)], "// A module.\n\nuse a::b\nuse c::{d,\n    e}\n");
         assert_eq!(import_at("// Only a comment.\nfn f() {}\n"), 19);
+        assert_eq!(import_at("// A module.\n/// An item.\nfn f() {}\n"), 13);
         assert_eq!(without_import("use a::b\nfn f() {}\n", "b").as_deref(), Some("fn f() {}\n"));
         assert_eq!(without_import("use c::{d, e}\n", "d").as_deref(), Some("use c::{e}\n"));
         assert_eq!(without_import("use c::{d}\n", "d").as_deref(), Some(""));

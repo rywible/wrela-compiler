@@ -499,7 +499,7 @@ fn check_entry(p: &Program, f: FnId, entry: Entry, out: &mut Vec<Diagnostic>) {
                 def.sig_span,
                 format!(
                     "{stage} returns a colour (an `f32`, `vec2`, `vec3`, `vec4`, or for an integer \
-                     target a `u32`, `vec2u` or `vec4u`), an `Over` colour to blend, a \
+                     target a `u32`, `vec2u`, `vec3u` or `vec4u`), an `Over` colour to blend, a \
                      `Targets2`, `Targets3` or `Targets4` of colours, or a `WithDepth` of one of \
                      those and a depth"
                 ),
@@ -685,6 +685,23 @@ mod tests {
         );
         assert!(
             errors.iter().any(|d| d.code == codes::E0602 && d.message.contains("20 values")),
+            "{errors:#?}"
+        );
+    }
+
+    /// E0602 lists the integer colours that a fragment shader may return: each is accepted.
+    #[test]
+    fn fragment_colours_are_the_ones_listed() {
+        for colour in ["u32", "vec2u", "vec3u", "vec4u"] {
+            let errors = signature_errors(&format!(
+                "@fragment\nfn fragment() -> {colour} {{ {colour}(1) }}\n"
+            ));
+            assert!(errors.is_empty(), "{colour}: {errors:#?}");
+        }
+        let errors = signature_errors("@fragment\nfn fragment() -> i32 { 1 }\n");
+        assert!(
+            errors.iter().any(|d| d.code == codes::E0602
+                && d.message.contains("a `u32`, `vec2u`, `vec3u` or `vec4u`")),
             "{errors:#?}"
         );
     }

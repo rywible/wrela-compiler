@@ -15,8 +15,11 @@
 //!   (WebGPU's default `minStorageBufferOffsetAlignment`), and exactly the uniform block's size
 //!   in uniform bytes; a dispatch's group counts are within the limit; an indirect command's
 //!   arguments fit in their buffer; an indexed draw's indices are a non-empty range of `u32`s
-//!   inside their buffer; a draw's pass's targets are one of its pipeline's (the manifest's
-//!   `targets`).
+//!   inside their buffer, and its instances a range a `u32` counts; a draw's pass's targets are
+//!   one of its pipeline's (the manifest's `targets`).
+//! - **Copies out of a depth texture** take a whole level.
+//! - **Viewports:** a side at most the device's largest texture's, the edges within twice that
+//!   of the origin (WebGPU's bounds).
 //! - **Usage scopes** (WebGPU's rule): no buffer or texture is used both read-only and
 //!   read-write in one dispatch or one pass, none is bound read-write twice by one command, and
 //!   a pass's attachments aren't bound by its draws. An indirect command's arguments buffer and
@@ -24,7 +27,8 @@
 //! - **Passes:** the clear colour and depth are finite; a pass's attachments exist, the colour
 //!   one isn't a depth texture and the depth one is, and they're the same size.
 //! - **Requests:** a storage path or a URL is relative, `/`-separated, with no empty, `.` or
-//!   `..` parts ([`path_problem`]).
+//!   `..` parts ([`path_problem`]). The browser runtime checks these, and that a multi-draw has
+//!   no count buffer, even where it leaves the rest to WebGPU (`checkHostRules`).
 //!
 //! A host that holds an exported call's commands until it returns brackets its checks with
 //! [`Checker::begin_call`] and [`Checker::end_call`]. A trapped call discards its commands and
@@ -557,6 +561,16 @@ impl Checker {
                     return err("a texture copied to a buffer is a 2D one".into());
                 }
                 self.rect(op, &t, source, "copying from")?;
+                // WebGPU copies a depth texture's texels only by whole levels.
+                let (w, h) = t.size(source.level);
+                if t.format.is_depth()
+                    && (source.x, source.y, source.width, source.height) != (0, 0, w, h)
+                {
+                    return err(format!(
+                        "texture {} is a depth texture, copied only whole: all {w}x{h} texels of level {} from (0, 0)",
+                        source.texture, source.level
+                    ));
+                }
                 self.buffer_rows(op, t.format, source, *buffer, *offset, *bytes_per_row)?;
             }
             Command::CopyBufferToTexture { buffer, offset, bytes_per_row, destination } => {
@@ -600,7 +614,24 @@ impl Checker {
                     ));
                 }
             }
-            Command::SetViewport { .. } => {}
+            // WebGPU's bounds, compared in f32 as wgpu does: a side at most the largest
+            // texture's, the edges within twice that of the origin.
+            Command::SetViewport { rect: [x, y, width, height], .. } => {
+                let max = self.limits.max_texture_size;
+                if *width > max as f32 || *height > max as f32 {
+                    return err(format!(
+                        "a viewport is at most {max}x{max}, the device's largest texture"
+                    ));
+                }
+                let range = 2 * u64::from(max);
+                let (low, high) = (-(range as f32), (range - 1) as f32);
+                if *x < low || *y < low || x + width > high || y + height > high {
+                    return err(format!(
+                        "a viewport's edges are from -{range} to {}, twice the device's largest texture",
+                        range - 1
+                    ));
+                }
+            }
             Command::Draw { pipeline, bindings, uniforms, .. } => {
                 self.bindings(op, *pipeline, bindings, uniforms.len())?;
             }
@@ -629,6 +660,8 @@ impl Checker {
                 index_size,
                 index_count,
                 first_index,
+                instances,
+                first_instance,
                 bindings,
                 uniforms,
                 ..
@@ -640,6 +673,13 @@ impl Checker {
                     return err(format!(
                         "indices {first_index} to {last} run past the {} bound",
                         index_size / 4
+                    ));
+                }
+                let last = u64::from(*first_instance) + u64::from(*instances);
+                if last > u64::from(u32::MAX) {
+                    return err(format!(
+                        "instances {first_instance} to {last} run past {}, the largest u32",
+                        u32::MAX
                     ));
                 }
             }
@@ -1559,5 +1599,135 @@ mod tests {
         );
         assert!(checker.attachments.is_empty());
         assert_eq!(checker.targets, RenderTarget::screen(false));
+    }
+
+    #[test]
+    fn a_rejected_draw_truncates_the_uses_it_added_to_a_texture() {
+        // Pipeline 5 samples a texture with a sampler; pipeline 10 writes a texture.
+        let mut m = crate::vectors::check_manifest();
+        m.pipelines[5].bindings.truncate(2);
+        let mut write = m.pipelines[5].clone();
+        write.bindings = vec![crate::manifest::ResourceBinding {
+            kind: BindingKind::StorageTexture,
+            format: Some(TextureFormat::Rgba8),
+            ..write.bindings[0].clone()
+        }];
+        m.pipelines.push(write);
+        let mut checker = Checker::new(&m);
+        let texture = Command::CreateTexture {
+            handle: 1,
+            width: 4,
+            height: 4,
+            format: TextureFormat::Rgba8,
+            writable: true,
+            kind: TextureKind::D2,
+            layers: 1,
+            levels: 2,
+        };
+        checker.check(&texture).expect("texture");
+        checker
+            .check(&Command::CreateSampler {
+                handle: 2,
+                linear: true,
+                repeat: false,
+                compare: None,
+                mip_linear: false,
+                anisotropy: 1,
+            })
+            .expect("sampler");
+        // A binding's offset names its view's level, plus 1.
+        let level = |l: u32| Binding { handle: 1, offset: l + 1, size: 0 };
+        let sample = |l: u32, sampler: u32| Command::Draw {
+            pipeline: 5,
+            vertices: 3,
+            instances: 1,
+            bindings: vec![level(l), Binding::of(sampler)],
+            uniforms: &[],
+        };
+        checker.check(&Command::BeginScreenPass { clear: [0.0; 4] }).expect("pass");
+        checker.check(&sample(0, 2)).expect("level 0 sampled");
+        let before = checker.scope.clone();
+        assert_eq!(
+            checker.check(&sample(1, 99)).expect_err("level 1, then no sampler").why,
+            "there's no sampler 99"
+        );
+        assert_eq!(checker.scope, before, "the rejected draw's read of level 1 is gone");
+        let write = Command::Draw {
+            pipeline: 10,
+            vertices: 3,
+            instances: 1,
+            bindings: vec![level(1)],
+            uniforms: &[],
+        };
+        checker.check(&write).expect("level 1 written in the pass that samples level 0");
+    }
+
+    #[test]
+    fn a_device_with_features_takes_what_they_allow() {
+        let mut m = crate::vectors::check_manifest();
+        m.pipelines[4].requires = vec!["shader-f16".into()];
+        // Pipeline 0 blends its colour.
+        if let Stage::Render { blends, .. } = &mut m.pipelines[0].stage {
+            *blends = vec![Blend::Over];
+        }
+        let bc = TextureFormat::Bc1;
+        let blended = Command::CreateTexture {
+            handle: 3,
+            width: 4,
+            height: 4,
+            format: TextureFormat::R32Float,
+            writable: false,
+            kind: TextureKind::D2,
+            layers: 1,
+            levels: 1,
+        };
+        let draw = Command::Draw {
+            pipeline: 0,
+            vertices: 3,
+            instances: 1,
+            bindings: vec![Binding::range(1, 0, 64), Binding::range(2, 0, 64)],
+            uniforms: &[0; 16],
+        };
+        let commands = [
+            texture_2d(4, 4, 4, bc),
+            Command::Dispatch { pipeline: 4, groups: [1; 3], bindings: Vec::new(), uniforms: &[] },
+            Command::CreateBuffer { handle: 1, size: 64 },
+            Command::CreateBuffer { handle: 2, size: 64 },
+            blended,
+            Command::BeginPass(Pass::one(3, false, [0.0; 4])),
+            draw,
+        ];
+        let need = ["texture-compression-bc", "shader-f16", "", "", "", "", "float32-blendable"];
+        // Without the features, each command that needs one names it.
+        let mut checker = Checker::new(&m);
+        for (c, need) in commands.iter().zip(need) {
+            match checker.check(c) {
+                Err(e) => assert!(!need.is_empty() && e.why.contains(need), "{c:?}: {e}"),
+                Ok(()) => assert!(need.is_empty(), "{c:?} needs `{need}`"),
+            }
+        }
+        let features =
+            need.iter().filter(|f| !f.is_empty()).fold(crate::REQUIRED_FEATURES, |a, f| {
+                a | crate::feature_bit(f).expect("a known feature")
+            });
+        let limits = crate::Limits { features, ..crate::Limits::DEFAULT };
+        let mut checker = Checker::with_limits(&m, limits);
+        for c in &commands {
+            checker.check(c).unwrap_or_else(|e| panic!("{c:?}: {e}"));
+        }
+    }
+
+    /// A feature without a bit is one no device has: [`crate::Limits::has`] never finds it.
+    #[test]
+    fn every_format_feature_has_a_feature_bit() {
+        for f in TextureFormat::ALL {
+            let i = f.info();
+            for feature in [i.filterable, i.storable, i.renderable, i.blendable]
+                .iter()
+                .filter_map(|c| c.feature())
+            {
+                assert!(crate::feature_bit(feature.name()).is_some(), "{}", feature.name());
+            }
+        }
     }
 }

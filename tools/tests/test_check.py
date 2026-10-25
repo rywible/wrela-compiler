@@ -38,7 +38,8 @@ class Selection(unittest.TestCase):
                 patch.object(check, 'step') as step, \
                 patch.object(check, 'rust_run', return_value=1) as run, \
                 patch.dict(os.environ, {'WRELA_BLESS': '1', 'WRELA_RUN_ONLY': 'missing',
-                                        'WRELA_CONST_CACHE': '0'}), \
+                                        'WRELA_CONST_CACHE': '0',
+                                        'WRELA_VALIDATOR': '/elsewhere/wrela'}), \
                 contextlib.redirect_stdout(io.StringIO()):
             cwd = Path.cwd()
             try:
@@ -46,6 +47,8 @@ class Selection(unittest.TestCase):
                 self.assertEqual([c.args[0] for c in step.call_args_list], list(check.STEPS))
                 self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two'])
                 self.assertFalse(set(check.CONTROLS) & os.environ.keys())
+                # The agent test's references are checked with the compiler built here.
+                self.assertNotIn('WRELA_VALIDATOR', os.environ)
             finally:
                 os.chdir(cwd)
 

@@ -165,3 +165,29 @@ test("a screen pass requires its depth target to fit the frame", () => {
   expect(() => checker.check(pass(4))).not.toThrow();
   checker.check({ op: "Present" });
 });
+
+test("a rejected draw truncates the uses it added to a texture", () => {
+  const m = shapes();
+  const sampled = m.pipelines.push({
+    ...m.pipelines[0]!, name: "sample", uniform: null,
+    bindings: [{ binding: 0, kind: "texture", stage: "both", format: "rgba8unorm" }, { binding: 1, kind: "sampler", stage: "both", format: null }],
+  }) - 1;
+  const written = m.pipelines.push({
+    ...m.pipelines[0]!, name: "write", uniform: null,
+    bindings: [{ binding: 0, kind: "storage_texture", stage: "both", format: "rgba8unorm" }],
+  }) - 1;
+  const checker = new Checker(m);
+  checker.check({ op: "CreateTexture", handle: 1, width: 4, height: 4, kind: "2d", layers: 1, levels: 2, format: "rgba8unorm", writable: true });
+  checker.check({ op: "CreateSampler", handle: 2, linear: true, repeat: false, compare: null, mipLinear: false, anisotropy: 1 });
+  // A binding's offset names its view's level, plus 1.
+  const level = (l: number): Binding => ({ handle: 1, offset: l + 1, size: 0 });
+  const sampler = (handle: number): Binding => ({ handle, offset: 0, size: 0 });
+  const draw = (pipeline: number, bindings: Binding[]): Command => ({ op: "Draw", pipeline, vertices: 3, instances: 1, bindings, uniforms: new Uint8Array(0) });
+  checker.check({ op: "BeginScreenPass", clear: [0, 0, 0, 1] });
+  checker.check(draw(sampled, [level(0), sampler(2)]));
+  // Level 1's read is added before the missing sampler rejects the draw.
+  expect(() => checker.check(draw(sampled, [level(1), sampler(99)]))).toThrow("there's no sampler 99");
+  // The scope is as it was: level 0 is still read, and level 1 isn't.
+  expect(() => checker.check(draw(written, [level(0)]))).toThrow("texture 1 is used both read-only and read-write in one pass");
+  expect(() => checker.check(draw(written, [level(1)]))).not.toThrow();
+});

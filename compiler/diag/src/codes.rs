@@ -273,7 +273,7 @@ codes! {
     W0008 = "W0008", "a private function or constant that nothing uses";
     W0009 = "W0009", "`take` before a local in a struct literal, which moves it anyway";
     W0010 = "W0010", "a copy of a place that is only read, where a borrow would do";
-    W0011 = "W0011", "a test of code that can't fail: nothing it runs asserts or panics";
+    W0011 = "W0011", "a test of code that can't fail: nothing it runs asserts, panics or traps";
     W0012 = "W0012", "a request polled in the call that made it, which is always `None`";
     W0013 = "W0013", "a `while` that counts an index over a run only to index it";
 

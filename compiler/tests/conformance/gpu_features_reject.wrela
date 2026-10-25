@@ -1,9 +1,10 @@
 // rejects: gpu.features
-// `f16` lives in GPU code; subgroup operations are a kernel's, in uniform control flow, of the
-// types WGSL's take.
+// `f16` lives in GPU code, and not in an enum's payload in workgroup memory, which holds
+// payloads as words; subgroup operations are a kernel's, in uniform control flow, of the types
+// WGSL's take; a subgroup invocation's index is a one-dimensional workgroup's.
 use std::gpu::{
-    FragCoord, GlobalId, GpuBuffer, Slots, dispatch, buffer, subgroup_add, subgroup_and,
-    begin_screen_pass, draw, ClipPosition, VertexIndex,
+    FragCoord, GlobalId, GpuBuffer, Shared, Slots, SubgroupInvocation, dispatch, buffer,
+    subgroup_add, subgroup_and, begin_screen_pass, draw, ClipPosition, VertexIndex,
 }
 
 @compute(64)
@@ -16,6 +17,27 @@ fn branchy(out: mut Slots<u32>, id: GlobalId) {
 @compute(64)
 fn floats(out: mut Slots<f32>, id: GlobalId) {
     out[id] = subgroup_and(f32(id.x)) //~ E0607
+}
+
+@compute(64)
+fn matrices(out: mut Slots<f32>, id: GlobalId) {
+    let m = subgroup_add(mat2(vec2(f32(id.x), 0.0), vec2(0.0, 1.0))) //~ E0607
+    out[id] = m[0].x
+}
+
+@compute(8, 8)
+fn tiles(out: mut Slots<u32>, lane: SubgroupInvocation, id: GlobalId) { //~ E0602
+    out[id] = lane.index
+}
+
+enum HalfValue: Copy {
+    Value(f16),
+    Empty,
+}
+
+@compute(64)
+fn half_cache(out: mut Slots<f32>, cache: mut Shared<HalfValue, 1>, id: GlobalId) { //~ E0602
+    out[id] = 0.0
 }
 
 @vertex
@@ -35,6 +57,9 @@ pub fn frame(time: f32, width: u32, height: u32) {
     var floats_out: GpuBuffer<f32> = buffer(64)
     dispatch(branchy.bind(mut out), groups: (1, 1, 1))
     dispatch(floats.bind(mut floats_out), groups: (1, 1, 1))
+    dispatch(matrices.bind(mut floats_out), groups: (1, 1, 1))
+    dispatch(tiles.bind(mut out), groups: (1, 1, 1))
+    dispatch(half_cache.bind(mut floats_out), groups: (1, 1, 1))
     let p = begin_screen_pass(clear: vec4(0.0))
     draw(p, cover, shaded, vertices: 3)
     p.present()

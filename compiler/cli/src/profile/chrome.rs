@@ -23,16 +23,14 @@ fn run_page(
     frames: u32,
     files: &[&str],
 ) -> Result<Vec<Value>, String> {
-    let (Some(root), Some(page)) = (built.parent(), built.file_name().and_then(|n| n.to_str()))
-    else {
-        return Err("the build has no directory Chrome can serve".into());
-    };
+    let built = std::path::absolute(built).map_err(|e| format!("{}: {e}", built.display()))?;
     // Real time for the paced run, and the GPU's pipelines first: generous, but bounded.
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / 60.0 * 10.0).max(120.0));
+    // The build's directory alone is served: it is the page.
     let run = || {
         wrela_host::pages::run(wrela_host::pages::Page {
-            root,
-            page,
+            root: &built,
+            page: "",
             fragment,
             timeout,
             script: None,

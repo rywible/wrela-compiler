@@ -419,6 +419,14 @@ fn batches() -> Vec<Value> {
         ),
         batch("a label that isn't UTF-8", &edit(Encoder::new().label("ok").finish(), h + 12, 0xFF)),
         batch(
+            "a viewport of no size",
+            &Encoder::new().set_viewport([1.0, 2.0, 0.0, 0.0], 0.0, 1.0).finish(),
+        ),
+        batch(
+            "a viewport of negative width",
+            &Encoder::new().set_viewport([0.0, 0.0, -1.0, 4.0], 0.0, 1.0).finish(),
+        ),
+        batch(
             "an unaligned indirect offset",
             &edit(Encoder::new().draw_indirect(0, 1, 0, &[], &[]).finish(), h + 8 + 8, 2),
         ),
@@ -730,6 +738,70 @@ fn checks() -> Value {
                     &rw,
                     &u,
                 );
+            }),
+        ),
+        check(
+            "instances past the largest u32",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4])
+                    .draw_indexed(0, [2, 256, 4], [1, 1, 0, 0, u32::MAX - 1], &rw, &u)
+                    .draw_indexed(0, [2, 256, 4], [1, 1, 0, 0, u32::MAX], &rw, &u);
+            }),
+        ),
+        check(
+            "viewports at WebGPU's bounds",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4])
+                    .set_viewport([-16_384.0, -16_384.0, 8192.0, 8192.0], 0.0, 1.0)
+                    .set_viewport([8191.0, 8191.0, 8192.0, 8192.0], 0.0, 1.0)
+                    .set_viewport([0.0, 0.0, 0.0, 0.0], 0.0, 1.0)
+                    .present();
+            }),
+        ),
+        check(
+            "a viewport wider than the largest texture",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).set_viewport([0.0, 0.0, 8193.0, 1.0], 0.0, 1.0);
+            }),
+        ),
+        check(
+            "a viewport past twice the largest texture",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).set_viewport([16_000.0, 0.0, 384.0, 1.0], 0.0, 1.0);
+            }),
+        ),
+        check(
+            "a viewport before twice the largest texture",
+            &m,
+            &with_buffers(&|e| {
+                e.begin_screen_pass([0.0; 4]).set_viewport([0.0, -16_385.0, 1.0, 1.0], 0.0, 1.0);
+            }),
+        ),
+        check(
+            "a depth texture copied to a buffer, whole and then in part",
+            &m,
+            &with_textures(&|e| {
+                let whole = stream::TexelRect {
+                    texture: 9,
+                    level: 0,
+                    layer: 0,
+                    x: 0,
+                    y: 0,
+                    width: 4,
+                    height: 4,
+                };
+                e.create_buffer(3, 1024)
+                    .copy_texture_to_buffer(whole, 3, 0, 256)
+                    .copy_texture_to_buffer(
+                        stream::TexelRect { x: 2, width: 2, ..whole },
+                        3,
+                        0,
+                        256,
+                    );
             }),
         ),
         check(

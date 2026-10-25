@@ -24,8 +24,10 @@ pub enum Collective {
     Dpdx,
     Dpdy,
     Fwidth,
-    /// `textureSample`, and `textureSampleCompare`: they take derivatives to pick the detail.
+    /// `textureSample`, `textureSampleBias` and `textureSampleCompare`: they take derivatives
+    /// to pick the detail.
     Sample,
+    SampleBias,
     SampleCompare,
     /// `workgroupBarrier`: for all the invocations of a workgroup.
     Barrier,
@@ -377,10 +379,10 @@ impl Fa<'_, '_> {
             // Another invocation may have changed what's there.
             Expr::Atomic(..) => true,
             Expr::Texture(op, ..) if op.uses_derivatives() => {
-                let op = if *op == TextureOp::Sample {
-                    Collective::Sample
-                } else {
-                    Collective::SampleCompare
+                let op = match op {
+                    TextureOp::Sample => Collective::Sample,
+                    TextureOp::SampleBias => Collective::SampleBias,
+                    _ => Collective::SampleCompare,
                 };
                 self.collective(op, v, cf);
                 operands(self)

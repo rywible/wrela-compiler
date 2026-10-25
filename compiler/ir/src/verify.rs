@@ -6,7 +6,8 @@
 //!   locals, parameters, resources and callees exist.
 //! - **Types:** each value's declared type is the one its expression makes; a store writes a
 //!   value of its place's type; a call passes what its callee's parameters take, each the way
-//!   the parameter is passed; a return returns the function's type; a condition is a `bool`.
+//!   the parameter is passed; a return returns the function's type; a condition is a `bool`;
+//!   a subgroup operation takes the types WGSL's does.
 
 use crate::*;
 
@@ -159,6 +160,26 @@ impl Verifier<'_> {
                 let Some(&x) = xs.first().filter(|_| xs.len() == n) else {
                     return Err(bug(format!("{op:?} with the wrong arguments")));
                 };
+                // WGSL's operand types: a `bool` to vote with, an integer for the bitwise
+                // ones, and a scalar or vector of `i32`, `u32`, `f32` or `f16` for the rest; a
+                // shuffle's invocation an `i32` or a `u32`.
+                use Scalar::{Bool, F16, F32, I32, U32};
+                let takes: &[Scalar] = match op {
+                    SubgroupOp::Any | SubgroupOp::All | SubgroupOp::Ballot => &[Bool],
+                    SubgroupOp::And | SubgroupOp::Or | SubgroupOp::Xor => &[I32, U32],
+                    _ => &[I32, U32, F32, F16],
+                };
+                let shape = match self.def(self.ty(x)) {
+                    TypeDef::Scalar(s) => Some(*s),
+                    TypeDef::Vector(s, _) if *s != Bool => Some(*s),
+                    _ => None,
+                };
+                let index_ok =
+                    xs.get(1).is_none_or(|&i| matches!(self.scalar(self.ty(i)), Some(I32 | U32)));
+                if !shape.is_some_and(|s| takes.contains(&s)) || !index_ok {
+                    let shown: Vec<String> = xs.iter().map(|&v| self.show(self.ty(v))).collect();
+                    return Err(bug(format!("{op:?} of `{}`", shown.join("`, `"))));
+                }
                 match op {
                     SubgroupOp::Any | SubgroupOp::All => {
                         types.lookup(&TypeDef::Scalar(Scalar::Bool))
@@ -702,5 +723,50 @@ mod tests {
 
         let error = verify(&m).expect_err("the definition names no value");
         assert!(error.message().contains("v99 doesn't exist"), "{error}");
+    }
+
+    /// A subgroup operation takes WGSL's operand types: a `bool` to vote with, an integer for
+    /// the bitwise ones, a scalar or vector of numbers for the rest, and an integer invocation
+    /// to shuffle from.
+    #[test]
+    fn subgroup_operands_are_wgsls_types() {
+        let check = |op: SubgroupOp, args: &[TypeDef], ret: TypeDef| {
+            let mut m = Module::default();
+            let ret = m.types.intern(ret);
+            let mut f = Function::new("k", Vec::new(), None);
+            let mut body = Vec::new();
+            let xs = args
+                .iter()
+                .map(|t| {
+                    let t = m.types.intern(t.clone());
+                    f.let_(&mut body, t, Expr::Zero(t))
+                })
+                .collect();
+            f.let_(&mut body, ret, Expr::Subgroup(op, xs));
+            f.body = body;
+            m.add_function(f);
+            verify(&m)
+        };
+        let (f32_, u32_, bool_) = (
+            TypeDef::Scalar(Scalar::F32),
+            TypeDef::Scalar(Scalar::U32),
+            TypeDef::Scalar(Scalar::Bool),
+        );
+        let (vec3, matrix) = (TypeDef::Vector(Scalar::F32, 3), TypeDef::Matrix(4, 4));
+        for (op, args, ret, ok) in [
+            (SubgroupOp::Add, vec![vec3.clone()], vec3, true),
+            (SubgroupOp::Shuffle, vec![f32_.clone(), u32_.clone()], f32_.clone(), true),
+            (SubgroupOp::Any, vec![bool_.clone()], bool_.clone(), true),
+            (SubgroupOp::Add, vec![matrix.clone()], matrix, false),
+            (SubgroupOp::Add, vec![bool_.clone()], bool_.clone(), false),
+            (SubgroupOp::Xor, vec![f32_.clone()], f32_.clone(), false),
+            (SubgroupOp::Any, vec![u32_], bool_, false),
+            (SubgroupOp::Shuffle, vec![f32_.clone(), f32_.clone()], f32_, false),
+        ] {
+            match check(op, &args, ret) {
+                Ok(()) => assert!(ok, "{op:?} of {args:?} passed"),
+                Err(e) => assert!(!ok && e.message().contains(&format!("{op:?} of")), "{e}"),
+            }
+        }
     }
 }

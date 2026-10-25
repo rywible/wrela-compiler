@@ -1,16 +1,19 @@
 // Toolchain 0.6's GPU capabilities, each used once and read back (language.md §18.8): texture
 // copies and readback, the new formats, mip chains (`generate_mips`, trilinear sampling), blend
-// states, several colour targets, scissors, texture arrays, cubes, depth arrays, and direct
-// indexed draws and multi-draws. Frame 0 records the work and asks for each texture back;
-// later frames take the answers; each test checks one.
+// states, several colour targets, scissors, texture arrays, cubes, depth arrays, the depth
+// targets of passes into several targets, a layer and a face, and direct indexed draws and
+// multi-draws. Frame 0 records the work and asks for each texture back; later frames take the
+// answers; each test checks one.
 use std::gpu::{
     Bc1, Features, Rg11b10Float, features, Blend, ClipPosition, Cubemap, DepthTextureArray,
     DrawArgs, FragCoord, GlobalId, GpuBuffer, R32Uint, R8, Rg32Float, Rg32Uint, Rg8, Rgb10a2,
-    Rgba16Float, Rgba32Float, Rgba8, Sampler, Targets3, Texels, TextureArray, TextureRead,
-    VertexIndex, begin_depth_layer_pass, begin_face_pass, begin_layer_pass, begin_pass, begin_pass3,
-    buffer_of, comparison_sampler, copy_texture, cubemap, depth_texture_array, dispatch, draw,
-    draw_multi, generate_mips, read_texture, sampler, texture, texture_array, writable_texture,
-    writable_texture_array, Filter, Address, ComparisonSampler,
+    Rgba16Float, Rgba32Float, Rgba8, Sampler, Targets2, Targets3, Targets4, Texels, TextureArray,
+    TextureRead, VertexIndex, begin_depth_layer_pass, begin_face_pass, begin_face_pass_with_depth,
+    begin_layer_pass, begin_layer_pass_with_depth, begin_pass, begin_pass2_with_depth, begin_pass3,
+    begin_pass3_with_depth, begin_pass4_with_depth, buffer_of, comparison_sampler, copy_texture,
+    cubemap, depth_texture, depth_texture_array, dispatch, draw, draw_multi, generate_mips,
+    read_texture, sampler, texture, texture_array, writable_texture, writable_texture_array, Filter,
+    Address, ComparisonSampler,
 }
 
 pub struct State {
@@ -51,6 +54,14 @@ fn cover(v: VertexIndex) -> ClipPosition {
     ClipPosition { position: vec4(x, y, 0.5, 1.0) }
 }
 
+/// One triangle that covers the target at depth `z`.
+@vertex
+fn cover_at(z: f32, v: VertexIndex) -> ClipPosition {
+    let x = f32((v.index << 1) & 2) * 2.0 - 1.0
+    let y = f32(v.index & 2) * 2.0 - 1.0
+    ClipPosition { position: vec4(x, y, z, 1.0) }
+}
+
 /// A square of half the target's side, at its centre: two triangles of six indices.
 @vertex
 fn square(corners: [vec2], v: VertexIndex) -> ClipPosition {
@@ -81,6 +92,21 @@ fn rg32() -> vec2 {
 @fragment
 fn rg32u() -> vec2u {
     vec2u(7, 4000000000)
+}
+
+@fragment
+fn colour2(c: vec4) -> Targets2<vec4, vec4> {
+    Targets2 { first: c, second: c }
+}
+
+@fragment
+fn colour3(c: vec4) -> Targets3<vec4, vec4, vec4> {
+    Targets3 { first: c, second: c, third: c }
+}
+
+@fragment
+fn colour4(c: vec4) -> Targets4<vec4, vec4, vec4, vec4> {
+    Targets4 { first: c, second: c, third: c, fourth: c }
 }
 
 @fragment
@@ -372,11 +398,109 @@ fn record(s: mut State) {
         s.reads.push(read_texture(f32x4.level(0)))
         s.reads.push(read_texture(f32x4.level(0)))
     }
+    depths(mut s)
+    // 39: an 8 × 4 texture, red with its right half green, copied from x = 4 at the copy's
+    // default size: the rest of each row, its green half.
+    var wide: Texture<Rgba8> = texture(width: 8, height: 4)
+    let p = begin_pass(mut wide, clear: RED)
+    p.scissor(x: 4, y: 0, width: 4, height: 4)
+    draw(p, cover, colour.bind(GREEN), vertices: 3)
+    p.end()
+    var right: Texture<Rgba8> = texture(width: 4, height: 4)
+    copy_texture(wide.level(0), right.level_mut(0), x: 4)
+    s.reads.push(read_texture(right.level(0)))
+}
+
+const RED: vec4 = vec4(1.0, 0.0, 0.0, 1.0)
+const GREEN: vec4 = vec4(0.0, 1.0, 0.0, 1.0)
+const BLUE: vec4 = vec4(0.0, 0.0, 1.0, 1.0)
+
+/// 27–38: passes into several targets, a layer and a face, each with a depth target cleared to
+/// a depth other than 1 or kept, all 2 × 2 and cleared to black. A pass that clears to 0.25
+/// draws red at 0.5, which fails the test, then green at 0.125 in the right column; one that
+/// keeps that depth draws blue at 0.1875, which passes only in the left column.
+fn depths(s: mut State) {
+    var d = depth_texture(width: 2, height: 2)
+    // 27–28: two targets, cleared to 0.25.
+    var a2: Texture<Rgba8> = texture(width: 2, height: 2)
+    var b2: Texture<Rgba8> = texture(width: 2, height: 2)
+    let p = begin_pass2_with_depth(mut a2, mut b2, mut d, clear_depth: 0.25)
+    draw(p, cover_at.bind(0.5), colour2.bind(RED), vertices: 3)
+    p.scissor(x: 1, y: 0, width: 1, height: 2)
+    draw(p, cover_at.bind(0.125), colour2.bind(GREEN), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(a2.level(0)))
+    s.reads.push(read_texture(b2.level(0)))
+    // 29–31: three targets, the depth kept.
+    var a3: Texture<Rgba8> = texture(width: 2, height: 2)
+    var b3: Texture<Rgba8> = texture(width: 2, height: 2)
+    var c3: Texture<Rgba8> = texture(width: 2, height: 2)
+    let p = begin_pass3_with_depth(mut a3, mut b3, mut c3, mut d, keep_depth: true)
+    draw(p, cover_at.bind(0.1875), colour3.bind(BLUE), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(a3.level(0)))
+    s.reads.push(read_texture(b3.level(0)))
+    s.reads.push(read_texture(c3.level(0)))
+    // 32–35: four targets, cleared to 0.75: red at 0.875 fails, green at 0.5 in the left
+    // column passes.
+    var a4: Texture<Rgba8> = texture(width: 2, height: 2)
+    var b4: Texture<Rgba8> = texture(width: 2, height: 2)
+    var c4: Texture<Rgba8> = texture(width: 2, height: 2)
+    var d4: Texture<Rgba8> = texture(width: 2, height: 2)
+    let p = begin_pass4_with_depth(mut a4, mut b4, mut c4, mut d4, mut d, clear_depth: 0.75)
+    draw(p, cover_at.bind(0.875), colour4.bind(RED), vertices: 3)
+    p.scissor(x: 0, y: 0, width: 1, height: 2)
+    draw(p, cover_at.bind(0.5), colour4.bind(GREEN), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(a4.level(0)))
+    s.reads.push(read_texture(b4.level(0)))
+    s.reads.push(read_texture(c4.level(0)))
+    s.reads.push(read_texture(d4.level(0)))
+    // 36–37: layer 1 cleared to 0.25, then layer 0 with the depth kept.
+    var arr: TextureArray<Rgba8> = texture_array(width: 2, height: 2, layers: 2)
+    let p = begin_layer_pass_with_depth(mut arr, 1, mut d, clear_depth: 0.25)
+    draw(p, cover_at.bind(0.5), colour.bind(RED), vertices: 3)
+    p.scissor(x: 1, y: 0, width: 1, height: 2)
+    draw(p, cover_at.bind(0.125), colour.bind(GREEN), vertices: 3)
+    p.end()
+    let p = begin_layer_pass_with_depth(mut arr, 0, mut d, keep_depth: true)
+    draw(p, cover_at.bind(0.1875), colour.bind(BLUE), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(arr.layer(1)))
+    s.reads.push(read_texture(arr.layer(0)))
+    // 38: a cube's face 3, cleared to 0.25.
+    var cube: Cubemap<Rgba8> = cubemap(side: 2)
+    let p = begin_face_pass_with_depth(mut cube, 3, mut d, clear_depth: 0.25)
+    draw(p, cover_at.bind(0.5), colour.bind(RED), vertices: 3)
+    p.scissor(x: 1, y: 0, width: 1, height: 2)
+    draw(p, cover_at.bind(0.125), colour.bind(GREEN), vertices: 3)
+    p.end()
+    s.reads.push(read_texture(cube.face(3)))
 }
 
 /// The little-endian `u32` at byte `i` of `b`.
 fn word(b: [u8], i: u32) -> u32 {
     u32(b[i]) | (u32(b[i + 1]) << 8) | (u32(b[i + 2]) << 16) | (u32(b[i + 3]) << 24)
+}
+
+/// Green and blue as `rgb` gives them.
+const GREEN_RGB: u32 = 0xFF00
+const BLUE_RGB: u32 = 0xFF0000
+
+/// Pixel `i` of an RGBA8 texture's bytes, its red, green and blue: red the low byte.
+fn rgb(b: [u8], i: u32) -> u32 {
+    u32(b[4 * i]) | (u32(b[4 * i + 1]) << 8) | (u32(b[4 * i + 2]) << 16)
+}
+
+/// Whether reads `from` to `to` (not included) each show `left` in row 0's pixel 0 and `right`
+/// in its pixel 1.
+fn shows(s: State, from: u32, to: u32, left: u32, right: u32) -> bool {
+    for k in from..to {
+        if rgb(s.got[k], 0) != left || rgb(s.got[k], 1) != right {
+            return false
+        }
+    }
+    true
 }
 
 /// Half float `i` (its bytes from `2i`) of `b`.
@@ -391,9 +515,31 @@ fn close(d: f32) -> bool {
 
 @test(frames: 6, gpu: true)
 fn every_read_came_back(s: State) {
-    assert(s.got.len() == 27)
-    for k in 0..27 {
+    assert(s.got.len() == 40)
+    for k in 0..40 {
         assert(s.got[k].len() > 0)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn passes_into_several_targets_clear_and_keep_their_depth(s: State) {
+    assert(shows(s, from: 27, to: 29, left: 0, right: GREEN_RGB), "two targets, cleared to 0.25")
+    assert(shows(s, from: 29, to: 32, left: BLUE_RGB, right: 0), "three targets, the depth kept")
+    assert(shows(s, from: 32, to: 36, left: GREEN_RGB, right: 0), "four targets, cleared to 0.75")
+}
+
+@test(frames: 6, gpu: true)
+fn a_layer_pass_and_a_face_pass_clear_and_keep_their_depth(s: State) {
+    assert(shows(s, from: 36, to: 37, left: 0, right: GREEN_RGB), "a layer, cleared to 0.25")
+    assert(shows(s, from: 37, to: 38, left: BLUE_RGB, right: 0), "a layer, the depth kept")
+    assert(shows(s, from: 38, to: 39, left: 0, right: GREEN_RGB), "a face, cleared to 0.25")
+}
+
+@test(frames: 6, gpu: true)
+fn a_copy_from_an_offset_takes_the_rest_of_each_row(s: State) {
+    assert(s.got[39].len() == 64)
+    for t in 0..16 {
+        assert(rgb(s.got[39], t) == GREEN_RGB)
     }
 }
 

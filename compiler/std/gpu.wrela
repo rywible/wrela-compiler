@@ -201,7 +201,8 @@ pub struct InstanceIndex: Copy {
 }
 
 /// A kernel invocation's index in its subgroup, from 0 to `SubgroupSize`'s less one: a kernel's
-/// parameter, on a device with `features().subgroups` (§18.10).
+/// parameter, on a device with `features().subgroups` (§18.10), whose workgroup has one
+/// dimension (`@compute(n)`, or trailing sizes of 1); WebGPU numbers no other's (E0602).
 pub struct SubgroupInvocation: Copy {
     pub index: u32,
 }
@@ -1401,7 +1402,7 @@ fn write_rows<F: Format>(
     }
     let (row, block) = (row_bytes::<F>(width), F::block())
     let rows = blocks(height, block)
-    if bytes.len() != row * rows {
+    if u64(bytes.len()) != u64(row) * u64(rows) {
         panic(
             "write: the bytes aren't the rectangle's texels (rows of blocks, for a compressed format)",
         )
@@ -1781,8 +1782,9 @@ impl<F: Storage + Filtered> Texture3d<F> {
 
 /// Copies a `width` × `height` rectangle at (`x`, `y`) of `from` into `to` at (`to_x`, `to_y`),
 /// in recorded order with dispatches and draws: two textures of one format, each at the level
-/// it names (`tex.level(i)`, `other.level_mut(j)`), or whole (level 0). A rectangle past either
-/// level's edge panics.
+/// it names (`tex.level(i)`, `other.level_mut(j)`), or whole (level 0). A `width` or `height` of
+/// 0 (the default) reaches the source's edge from `x` or `y`. A rectangle past either level's
+/// edge panics.
 pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
     from: S,
     to: T,
@@ -1794,9 +1796,12 @@ pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
     to_y: u32 = 0,
 ) {
     let (a, b) = (from.source(), to.target())
-    let w = if width == 0 { a.width } else { width }
-    let h = if height == 0 { a.height } else { height }
-    if x > a.width || w > a.width - x || y > a.height || h > a.height - y {
+    if x > a.width || y > a.height {
+        panic("copy_texture: the rectangle runs past the source's edge")
+    }
+    let w = if width == 0 { a.width - x } else { width }
+    let h = if height == 0 { a.height - y } else { height }
+    if w > a.width - x || h > a.height - y {
         panic("copy_texture: the rectangle runs past the source's edge")
     }
     if to_x > b.width || w > b.width - to_x || to_y > b.height || h > b.height - to_y {
@@ -1818,13 +1823,13 @@ pub fn copy_texture<F: Format, S: TexelSource<F>, T: TexelTarget<F>>(
     )
 }
 
-/// Copies a level of a texture into a buffer of its texels, row by row: `to` must hold
-/// `rows_of(width) * height` `u32`s, each row padded to 256 bytes (WebGPU's rule); `read_texture`
-/// unpads them. In recorded order.
+/// Copies a level of a texture into a buffer of its texels, row by row, each row padded to 256
+/// bytes (WebGPU's rule): `to` must hold a padded row's bytes / 4 `u32`s for each row of texels
+/// (of blocks, for a compressed format). `read_texture` unpads them. In recorded order.
 pub fn copy_texture_to_buffer<F: Format, S: TexelSource<F>>(from: S, to: mut GpuBuffer<u32>) {
     let a = from.source()
     let (row, bh) = padded_rows::<F>(a)
-    if to.len() * 4 < row * bh {
+    if u64(to.len()) * 4 < u64(row) * u64(bh) {
         panic("copy_texture_to_buffer: the buffer is smaller than the texture's padded rows")
     }
     record_to_buffer(a, to.handle, row)
@@ -1836,17 +1841,21 @@ pub fn copy_texture_to_buffer<F: Format, S: TexelSource<F>>(from: S, to: mut Gpu
 pub fn copy_buffer_to_texture<F: Format, T: TexelTarget<F>>(from: GpuSpan<u32>, to: T) {
     let b = to.target()
     let (row, bh) = padded_rows::<F>(b)
-    if from.count * 4 < row * bh {
+    if u64(from.count) * 4 < u64(row) * u64(bh) {
         panic("copy_buffer_to_texture: the span is smaller than the texture's padded rows")
     }
-    if (from.start * 4) % F::bytes() != 0 {
+    let offset = u64(from.start) * 4
+    if offset > 4294967295 {
+        panic("copy_buffer_to_texture: the span starts 4 GiB or more into its buffer")
+    }
+    if offset % u64(F::bytes()) != 0 {
         panic(
             "copy_buffer_to_texture: the span starts inside a texel block (WebGPU copies whole blocks)",
         )
     }
     copy_buffer_to_texture_command(
         buffer: from.buffer.handle,
-        offset: from.start * 4,
+        offset: u32(offset),
         bytes_per_row: row,
         texture: b.handle,
         level: b.level,
@@ -1970,15 +1979,21 @@ fn record_to_buffer(p: TexelPlace, buffer: u32, row: u32) {
 /// Reads a level of a texture back to the CPU, once the GPU work recorded before is done: its
 /// texels' bytes, rows top to bottom, `F::bytes()` a texel, unpadded. A request, answered on a
 /// later call (§17.1), and `nondet` as `read` is. It records a copy into a buffer it makes,
-/// which it releases once it's read.
+/// which the `TextureRead` holds until it's dropped: a program drops a read once it has its
+/// bytes. A level of 4 GiB or more of padded rows panics.
 pub fn read_texture<F: Format, S: TexelSource<F>>(from: S) -> TextureRead {
     let a = from.source()
     let (row, bh) = padded_rows::<F>(a)
-    var staging: GpuBuffer<u32> = buffer(row * bh / 4)
+    let total = u64(row) * u64(bh)
+    if total > 4294967295 {
+        panic("read_texture: the level's padded rows are 4 GiB or more, more than one read carries")
+    }
+    let bytes = u32(total)
+    var staging: GpuBuffer<u32> = buffer(bytes / 4)
     record_to_buffer(a, staging.handle, row)
     // The staging buffer's bytes, as `read` would ask for its elements.
     let request = next_request()
-    read_buffer_command(request, staging.handle, 0, row * bh)
+    read_buffer_command(request, staging.handle, 0, bytes)
     TextureRead {
         staging,
         pending: Pending::new(request),
@@ -1988,7 +2003,8 @@ pub fn read_texture<F: Format, S: TexelSource<F>>(from: S) -> TextureRead {
     }
 }
 
-/// A texture's texels on their way back to the CPU (`read_texture`).
+/// A texture's texels on their way back to the CPU (`read_texture`). It holds the buffer the
+/// texels are copied into until it's dropped, after its answer as before it.
 pub struct TextureRead {
     staging: GpuBuffer<u32>,
     pending: Pending<u8>,
@@ -1999,7 +2015,7 @@ pub struct TextureRead {
 
 impl TextureRead {
     /// Its texels' bytes, once they've come back: `None` until then, and `Some(Err)` if the read
-    /// failed.
+    /// failed. Its buffer stays until the read is dropped.
     pub fn poll(mut self) -> Option<Result<Vec<u8>, IoError>> {
         match self.pending.poll() {
             None => None,
@@ -3505,11 +3521,10 @@ fn atomics_barrier<A>(shared: mut A) {}
 /// The sum of `value` over the invocations of the workgroup before this one (by `LocalId`'s
 /// index: an exclusive prefix sum), the building block of a compaction: each invocation's place
 /// in a list of what's kept. `shared` holds one element for each of the workgroup's
-/// invocations (`N` its size); after the call, element `N - 1` plus the last invocation's
-/// `value` is the workgroup's total, and the scan's last step leaves each element its inclusive
-/// sum. A Hillis–Steele scan: log2(N) steps, each a barrier apart, so every invocation reaches it
-/// (uniform control flow). `subgroup_prefix_sum` gives the same results on a device with
-/// `subgroups`.
+/// invocations (`N` its size); after the call, each element holds its invocation's inclusive
+/// sum, so element `N - 1` is the workgroup's total. A Hillis–Steele scan: log2(N) steps, each a
+/// barrier apart, so every invocation reaches it (uniform control flow). `subgroup_prefix_sum`
+/// gives the same results on a device with `subgroups`.
 pub fn workgroup_prefix_sum<const N: u32>(
     shared: mut Shared<u32, N>,
     lid: LocalId,

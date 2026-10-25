@@ -32,14 +32,14 @@ use crate::*;
 use std::collections::HashSet;
 
 /// `f`, with every loop whose `break` or `continue` sits under a condition `active` holds
-/// (one that depends on the input) rewritten with flags; `None` if no loop changed.
+/// (one that depends on the input) rewritten with flags of type `bool_ty`; `None` if no loop
+/// changed.
 pub(crate) fn flag_exits(
     f: &Function,
-    types: &mut Types,
+    bool_ty: TypeId,
     active: &dyn Fn(ValueId) -> bool,
 ) -> Option<Function> {
     let mut g = f.clone();
-    let bool_ty = types.bool();
     let mut body = std::mem::take(&mut g.body);
     let mut changed = false;
     // Loops inside first: each takes its own `break` and `continue`.

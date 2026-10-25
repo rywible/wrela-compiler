@@ -402,11 +402,12 @@ pub fn serve(
     mut built: impl FnMut(&Path) + Send + 'static,
 ) -> Result<Server, String> {
     check_output_path(pkg, out)?;
+    // The port first: a server already on it keeps its output.
+    let (listener, port) = http::listen(port)?;
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     built(&watcher.dir());
     let output = watcher.out_dir.try_clone().map_err(|e| format!("can't hold live output: {e}"))?;
-    let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
         out: output,
         port,
@@ -799,6 +800,32 @@ mod tests {
         }
         assert!(out.join("2/marked").exists(), "a build is given to `built` before it's shown");
         server.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A second server on a port that's taken fails before it touches the output, so the first
+    /// goes on serving its build.
+    #[test]
+    fn a_second_server_on_a_taken_port_leaves_the_first_ones_output() {
+        let root = std::env::temp_dir().join(format!("wrela-live-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("program");
+        std::fs::create_dir_all(&pkg).expect("program directory");
+        std::fs::write(pkg.join("wrela.toml"), "[package]\nname = \"program\"\n")
+            .expect("manifest");
+        std::fs::write(
+            pkg.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("program");
+        let out = root.join("out");
+        let kind = crate::BuildKind::default();
+        let first = serve(&pkg, &out, 0, &[], kind, true, |_: &Path| {}).expect("serve");
+        std::fs::write(out.join("1/marked"), b"").expect("mark");
+        let second = serve(&pkg, &out, first.port, &[], kind, true, |_: &Path| {});
+        assert!(second.is_err_and(|e| e.contains("can't listen")));
+        assert!(out.join("1/marked").exists(), "the first server's build is where it was");
+        first.stop();
         let _ = std::fs::remove_dir_all(root);
     }
 

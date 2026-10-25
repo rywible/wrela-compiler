@@ -20,7 +20,7 @@ always makes, listed in `compiler/diag/src/codes.rs`'s `MIGRATIONS` with the rel
 minor releases. When it is removed, the error that replaces it carries the same fix, and the
 warning's code is retired (`RETIRED`). A workspace moves its pin, runs `wrela migrate` on each
 member, and commits the result; `wrela migrate --dry-run` shows the diff first. The explain
-suite's `every_migration_has_one_fix_a_tool_makes` holds every migration to one fix that isn't
+suite's `explanations_programs_do_what_they_say` holds every migration to one fix that isn't
 the author's choice.
 
 ## 2. Bump the version in a pull request

@@ -156,6 +156,7 @@ export class Frames {
           continue;
         }
         if (this.#length > MAX_FRAME) throw new Error(`a frame of ${this.#length} bytes, past ${MAX_FRAME}`);
+        if (held + this.#length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
         // Allocate once per frame: each chunk copies only the bytes it adds, and a delivered
         // frame keeps its own storage when the stream reuses its chunk or the next frame starts.
         this.#body = new Uint8Array(this.#length);

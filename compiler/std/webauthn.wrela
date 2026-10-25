@@ -7,16 +7,17 @@
 // - the client's data is a `webauthn.create`, over the server's challenge, from the expected
 //   origin, and not from inside another site's frame;
 // - the authenticator's data is for the relying party's ID (its SHA-256), says the person was
-//   present and verified, and holds the credential the browser named, with a public key of
-//   ES256, Ed25519 or RS256.
+//   present and verified, says a backup only of a passkey eligible for one, and holds the
+//   credential the browser named, with a public key of ES256, Ed25519 or RS256 (of 2048 bits or
+//   more).
 // Its attestation is not checked: the host asks for none (a statement of the authenticator's
 // make), so the key is taken on trust at registration, as a password would be.
 //
 // An assertion (a sign-in) is accepted when its client's data is a `webauthn.get` over the
 // challenge from the origin, its authenticator's data is for the relying party and says the person
-// was present and verified, its signature counter went up (or both it and the stored one are 0,
-// as a synced passkey's are), and its signature is the stored key's over the authenticator's data
-// and the client's data's SHA-256 (`Signed::message`).
+// was present and verified (and a backup only if eligible), its signature counter went up (or
+// both it and the stored one are 0, as a synced passkey's are), and its signature is the stored
+// key's over the authenticator's data and the client's data's SHA-256 (`Signed::message`).
 
 use std::crypto::{Signature, p256_key, rsa_key}
 use std::hash::sha256::sha256
@@ -60,6 +61,8 @@ pub struct Signed: Clone {
 /// The authenticator's data's flags (WebAuthn §6.1).
 const PRESENT: u32 = 1
 const VERIFIED: u32 = 4
+const BACKUP_ELIGIBLE: u32 = 8
+const BACKED_UP: u32 = 16
 const ATTESTED: u32 = 64
 
 /// The longest credential ID (WebAuthn §5.8.3).
@@ -206,7 +209,8 @@ fn check_client(client_data: [u8], kind: str, expected: Expected) -> Result<(), 
     Ok(())
 }
 
-/// Checks the authenticator's data's relying party and flags: its flags, if they pass.
+/// Checks the authenticator's data's relying party and flags: its flags, if they pass. A passkey
+/// backed up must be eligible for backup (WebAuthn §6.1.3).
 fn check_auth(data: [u8], expected: Expected) -> Result<u32, Text> {
     if data.len() < 37 {
         return Err("the authenticator's data ends early")
@@ -223,6 +227,9 @@ fn check_auth(data: [u8], expected: Expected) -> Result<u32, Text> {
     }
     if flags & VERIFIED == 0 {
         return Err("the person wasn't verified")
+    }
+    if flags & BACKED_UP != 0 && flags & BACKUP_ELIGIBLE == 0 {
+        return Err("the authenticator's data says backed up but not eligible for backup")
     }
     Ok(flags)
 }
@@ -322,6 +329,10 @@ fn auth_data(attestation: [u8]) -> Option<Vec<u8>> {
     if m != 5 {
         return None
     }
+    // Each entry is at least two bytes, so a count past the bytes left can't be one.
+    if n > u64(attestation.len() - at) {
+        return None
+    }
     var found: Option<Vec<u8>> = None
     for _ in 0..u32(n) {
         let key = string(attestation, mut at, 3)?
@@ -371,8 +382,9 @@ fn cose_key(b: [u8], at: mut u32) -> Result<(i32, Vec<u8>), Text> {
     if alg == -8 && kty == 1 && crv == 6 && c.len() == 32 {
         return Ok((alg, c))
     }
-    if alg == -257 && kty == 3 && a.len() >= 256 && c.len() > 0 {
-        // An RSA key's modulus is label -1 and its exponent -2.
+    if alg == -257 && kty == 3 && a.len() >= 256 && a[0] != 0 && c.len() > 0 {
+        // An RSA key's modulus is label -1 and its exponent -2, each in its fewest bytes (RFC
+        // 8230 §4): a modulus of 2048 bits or more is 256 bytes or more, the first not 0.
         return Ok((alg, rsa_key(a, c)))
     }
     Err("the credential's key isn't ES256, Ed25519 or RS256 of 2048 bits or more")
@@ -462,6 +474,26 @@ fn attested(id: [u8]) -> Vec<u8> {
     out
 }
 
+/// A credential's attested data: no GUID, `id`, and an RS256 key of `modulus` and exponent 65537.
+fn rsa_attested(id: [u8], modulus: [u8]) -> Vec<u8> {
+    var out: Vec<u8> = Vec::filled(16, u8(0))
+    out.push(0)
+    out.push(u8(id.len()))
+    for b in id {
+        out.push(b)
+    }
+    cbor(mut out, major: 5, n: 4)
+    cbor(mut out, major: 0, n: 1)
+    cbor(mut out, major: 0, n: 3)
+    cbor(mut out, major: 0, n: 3)
+    cbor(mut out, major: 1, n: 256)
+    cbor(mut out, major: 1, n: 0)
+    cbor_bytes(mut out, 2, modulus)
+    cbor(mut out, major: 1, n: 1)
+    cbor_bytes(mut out, 2, [1, 0, 1])
+    out
+}
+
 fn client(kind: str, challenge: str, origin: str) -> Vec<u8> {
     let text = f"{{\"type\":\"{kind}\",\"challenge\":\"{challenge}\",\"origin\":\"{origin}\",\"crossOrigin\":false}}"
     Vec::from(text.as_bytes())
@@ -538,4 +570,86 @@ fn an_assertion_gives_what_its_signature_covers_and_its_counter_must_go_up() {
         "both 0: a synced passkey",
     )
     assert(assertion(cd, data("wrela.dev", PRESENT, 5, []), e, stored).is_err(), "not verified")
+}
+
+@test
+fn a_backup_needs_eligibility_for_one() {
+    let e = expected()
+    let challenge = base64url(e.challenge)
+    let cd = client("webauthn.get", challenge.as_str(), "https://wrela.dev")
+    let stored = Credential { id: Vec::from([1]), algorithm: -7, key: Vec::new(), counter: 0 }
+    let base = PRESENT | VERIFIED
+    for flags in [base | BACKUP_ELIGIBLE, base | BACKUP_ELIGIBLE | BACKED_UP] {
+        assert(assertion(cd, data("wrela.dev", flags, 0, []), e, stored).is_ok(), "eligible")
+    }
+    assert(
+        assertion(cd, data("wrela.dev", base | BACKED_UP, 0, []), e, stored).is_err(),
+        "backed up, not eligible",
+    )
+    let id = [5, 6, 7]
+    let made = client("webauthn.create", challenge.as_str(), "https://wrela.dev")
+    let auth = data("wrela.dev", base | ATTESTED | BACKED_UP, 0, attested(id))
+    assert(registration(id, made, attestation(auth), e).is_err(), "a new passkey too")
+}
+
+@test
+fn an_rsa_key_needs_256_bytes_of_modulus_past_its_leading_zeros() {
+    let e = expected()
+    let made = client("webauthn.create", base64url(e.challenge).as_str(), "https://wrela.dev")
+    let id = [5, 6, 7]
+    let flags = PRESENT | VERIFIED | ATTESTED
+    var modulus: Vec<u8> = Vec::filled(256, u8(255))
+    let full = attestation(data("wrela.dev", flags, 0, rsa_attested(id, modulus)))
+    let Ok(c) = registration(id, made, full, e) else { panic("a 2048-bit key") }
+    assert(c.algorithm == -257 && c.signature() == Signature::Rs256)
+    modulus[0] = 0
+    let short = attestation(data("wrela.dev", flags, 0, rsa_attested(id, modulus)))
+    assert(registration(id, made, short, e).is_err(), "2040 bits in 256 bytes")
+}
+
+@test
+fn a_cbor_head_takes_one_to_eight_bytes_of_argument_and_nothing_else() {
+    var at = 0
+    let Some((m, x)) = head([0x1a, 1, 2, 3, 4, 9], mut at) else { panic("four bytes") }
+    assert(m == 0 && x == 0x01020304 && at == 5, "four bytes")
+    at = 0
+    let Some((m, x)) = head([0x3b, 1, 2, 3, 4, 5, 6, 7, 8], mut at) else { panic("eight bytes") }
+    assert(m == 1 && x == 0x0102030405060708 && at == 9, "eight bytes")
+    for b in [[0x1b, 1, 2, 3], [0x1c, 0, 0, 0], [0x5f, 0x41, 0, 0xff]] {
+        at = 0
+        assert(head(b, mut at).is_none(), "an argument cut short, a reserved one, or no length")
+    }
+}
+
+@test
+fn an_attestation_map_counts_no_more_entries_than_its_bytes_hold() {
+    let auth = data("wrela.dev", PRESENT | VERIFIED, 0, [])
+    var one: Vec<u8> = Vec::new()
+    cbor(mut one, major: 5, n: 1)
+    cbor_bytes(mut one, 3, bytes_of("authData"))
+    cbor_bytes(mut one, 2, auth)
+    assert(auth_data(one).is_some(), "one entry")
+    // The same entry under a count of 2^32 + 1, whose low 32 bits are 1.
+    var many: Vec<u8> = Vec::from([0xbb, 0, 0, 0, 1, 0, 0, 0, 1])
+    cbor_bytes(mut many, 3, bytes_of("authData"))
+    cbor_bytes(mut many, 2, auth)
+    assert(auth_data(many).is_none(), "more entries than bytes")
+}
+
+@test
+fn the_clients_data_must_hold_texts_and_not_come_from_another_sites_frame() {
+    let e = expected()
+    let c = base64url(e.challenge)
+    let o = "\"origin\":\"https://wrela.dev\""
+    let alone = f"{{\"type\":\"webauthn.get\",\"challenge\":\"{c}\",{o}}}"
+    assert(check_client(alone.as_bytes(), "webauthn.get", e).is_ok(), "crossOrigin left out")
+    let refused = [
+        f"{{\"type\":1,\"challenge\":\"{c}\",{o}}}",
+        f"{{\"type\":\"webauthn.get\",\"challenge\":[1,2,3],{o}}}",
+        f"{{\"type\":\"webauthn.get\",\"challenge\":\"{c}\",\"origin\":null}}",
+        f"{{\"type\":\"webauthn.get\",\"challenge\":\"{c}\",{o},\"crossOrigin\":true}}",
+    ]
+    for text in refused {
+        assert(check_client(text.as_bytes(), "webauthn.get", e).is_err(), "refused")
+    }
 }

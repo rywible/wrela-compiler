@@ -2363,8 +2363,10 @@ fn unchanged_vars(body: &Body, effects: &LocalEffects) -> Vec<Diagnostic> {
 /// and `x` isn't returned. Then `borrow x = place` reads the same values without copying them.
 /// Anything that could make the copy necessary keeps the warning away (a write to the source
 /// while the copy lives, a move of the copy), so the check is of whole bodies, not of where the
-/// copy is live. A `Copy` value's copy is cheap and isn't reported. It has no fix: whether a
-/// borrow is what's meant is the author's call.
+/// copy is live. A source whose scope ends before the copy's starts (`let x = { let s = ...;
+/// s.clone() }`) can't be borrowed for the copy's life, and isn't reported either. A `Copy`
+/// value's copy is cheap and isn't reported. It has no fix: whether a borrow is what's meant is
+/// the author's call.
 fn read_only_clones(p: &Program, body: &Body, effects: &LocalEffects) -> Vec<Diagnostic> {
     let clone_trait = p.lang_trait(Lang::Clone);
     let is_clone = |c: &Callee| match c {
@@ -2390,9 +2392,20 @@ fn read_only_clones(p: &Program, body: &Body, effects: &LocalEffects) -> Vec<Dia
     };
     for f in &body.fns {
         for b in &f.blocks {
+            // The locals whose scope this block has ended (dropped or dead), so far.
+            let mut ended: HashSet<Local> = HashSet::new();
             for s in &b.stmts {
                 match &s.kind {
                     StatementKind::Bind { local, place, .. } => alias.bind(*local, place),
+                    StatementKind::Live(l) => {
+                        ended.remove(l);
+                    }
+                    StatementKind::Dead(l) => {
+                        ended.insert(*l);
+                    }
+                    StatementKind::Drop(place) if place.proj.is_empty() => {
+                        ended.insert(place.local);
+                    }
                     StatementKind::Assign(place, r) => {
                         r.for_each_operand(&mut |o| moved(o, &mut touched));
                         match r {
@@ -2404,7 +2417,9 @@ fn read_only_clones(p: &Program, body: &Body, effects: &LocalEffects) -> Vec<Dia
                             Rvalue::Use(Operand { kind: OperandKind::Move(tmp, _), .. })
                                 if place.proj.is_empty() && tmp.proj.is_empty() =>
                             {
-                                if let Some((src, call, at)) = clone_of.get(&tmp.local) {
+                                if let Some((src, call, at)) = clone_of.get(&tmp.local)
+                                    && !ended.contains(&src.local)
+                                {
                                     copies.push((place.local, src.clone(), *call, *at));
                                 }
                             }

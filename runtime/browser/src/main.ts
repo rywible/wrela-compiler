@@ -319,7 +319,15 @@ function start(): void {
     worker.onmessage = (event: MessageEvent<FromWorker>) => {
       const msg = event.data;
       if (msg.type === "spawn") {
-        const thread = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: msg.name });
+        let thread: Worker;
+        try {
+          thread = new Worker(new URL(workerUrl, import.meta.url), { type: "module", name: msg.name });
+        } catch (e) {
+          // The page's policy can refuse a worker at once (a CSP's SecurityError): the render
+          // worker hears it as it hears a thread that couldn't start, not waiting for it.
+          threadFailed(msg.id, errorMessage(e));
+          return;
+        }
         threads.set(msg.id, thread);
         thread.onerror = (e) => {
           e.preventDefault();

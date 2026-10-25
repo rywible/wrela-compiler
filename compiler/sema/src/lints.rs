@@ -13,7 +13,7 @@ use crate::thir;
 use crate::ty::{FnId, TyKind};
 use std::collections::{HashMap, HashSet};
 use wrela_diag::{Diagnostic, Span, codes};
-use wrela_syntax::ast::{self, AssignOp, BinOp, ExprKind, StmtKind};
+use wrela_syntax::ast::{self, AssignOp, BinOp, ExprKind, StmtKind, VarKind};
 
 /// Every lint of function `f`, whose memory IR is `body`.
 pub fn lint_fn(p: &Program, f: FnId, body: &Body) -> Vec<Diagnostic> {
@@ -172,6 +172,38 @@ fn each_expr(s: &ast::Stmt, f: &mut impl FnMut(&ast::Expr)) {
     s.for_each_expr(&mut |e| e.walk(&mut |x| f(x)));
 }
 
+/// How many fields of struct literal `e` are the shorthand `S { name }`, which names `name`
+/// where no expression shows it. (0 when `e` isn't a struct literal.)
+fn shorthand(e: &ast::Expr, name: &str) -> usize {
+    match &e.kind {
+        ExprKind::StructLit { fields, .. } => {
+            fields.iter().filter(|f| f.value.is_none() && f.name.name == name).count()
+        }
+        _ => 0,
+    }
+}
+
+/// Whether statement `s` may change local `name` anywhere inside it: an assignment to it, or a
+/// `mut` or `take` of it (an argument, a `mut` binding or a `match mut`).
+fn may_change(s: &ast::Stmt, name: &str) -> bool {
+    let is = |e: &ast::Expr| e.single_name() == Some(name);
+    let assigns = |s: &ast::Stmt| match &s.kind {
+        StmtKind::Assign { target, .. } => is(target),
+        StmtKind::Var { kind: VarKind::Mut, init, .. } => is(init),
+        _ => false,
+    };
+    let mut changes = assigns(s);
+    s.for_each_block(&mut |b| changes |= b.stmts.iter().any(assigns));
+    each_expr(s, &mut |e| {
+        changes |= match &e.kind {
+            ExprKind::Assign { target: x, .. } | ExprKind::MutArg(x) | ExprKind::Take(x) => is(x),
+            ExprKind::Match { mutable: true, scrutinee, .. } => is(scrutinee),
+            _ => false,
+        }
+    });
+    changes
+}
+
 /// W0013 in block `b`: `var i = 0`, then `while i < xs.len() { ...xs[i]... i += 1 }`, where `i`
 /// is used only to index `xs`, and nowhere after the loop, and nothing in the body leaves it
 /// early or names `xs` but to index it. That's `for x in xs`, which can't index past the end,
@@ -187,15 +219,17 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
             continue;
         }
         let Some(seq) = p.text(xs.span) else { continue };
-        // Counted from 0: the last statement before the loop that names `i` is `var i = 0`.
-        let starts_at_zero = b.stmts[..k].iter().rev().find_map(|s| match &s.kind {
-            StmtKind::Var { name: n, init, .. } if n.name == name => {
-                Some(matches!(&init.kind, ExprKind::Lit(l) if p.text(l.span) == Some("0")))
-            }
-            StmtKind::Assign { target, .. } if target.single_name() == Some(name) => Some(false),
-            _ => None,
+        // Counted from 0: the last `var i` before the loop is `var i = 0`, and nothing between
+        // them, nested statements included, may change `i`.
+        let decl = b.stmts[..k]
+            .iter()
+            .rposition(|s| matches!(&s.kind, StmtKind::Var { name: n, .. } if n.name == name));
+        let starts_at_zero = decl.is_some_and(|j| {
+            matches!(&b.stmts[j].kind, StmtKind::Var { init, .. }
+                if matches!(&init.kind, ExprKind::Lit(l) if p.text(l.span) == Some("0")))
+                && !b.stmts[j + 1..k].iter().any(|s| may_change(s, name))
         });
-        if starts_at_zero != Some(true) {
+        if !starts_at_zero {
             continue;
         }
         // Stepped by one, last.
@@ -219,6 +253,11 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
         let mut count = |e: &ast::Expr| match &e.kind {
             ExprKind::Path(_) if e.single_name() == Some(name) => uses += 1,
             ExprKind::Path(_) if e.single_name() == Some(root.as_str()) => root_named += 1,
+            // `P { i }` names `i` as its field's value.
+            ExprKind::StructLit { .. } => {
+                uses += shorthand(e, name);
+                root_named += shorthand(e, &root);
+            }
             ExprKind::Index { base, index }
                 if index.single_name() == Some(name) && p.text(base.span) == Some(seq) =>
             {
@@ -251,7 +290,7 @@ fn counted_whiles(p: &Program, b: &ast::Block) -> Vec<Diagnostic> {
         // `xs[i]` also counts as a use of `xs` and of `i` among the expressions walked.
         let named_after = b.stmts[k + 1..].iter().any(|s| {
             let mut found = false;
-            each_expr(s, &mut |e| found |= e.single_name() == Some(name));
+            each_expr(s, &mut |e| found |= e.single_name() == Some(name) || shorthand(e, name) > 0);
             found
         });
         // Each `seq[i]` names the root once; any other naming of it is a use the loop has.
@@ -290,6 +329,7 @@ mod tests {
     fn warnings(source: &str) -> Vec<(String, String)> {
         let mut diagnostics = Vec::new();
         crate::check_program(crate::test_units(source), &mut diagnostics);
+        assert!(!diagnostics.iter().any(|d| d.is_error()), "{diagnostics:?}");
         diagnostics
             .into_iter()
             .filter(|d| matches!(d.code.as_str(), "W0012" | "W0013"))
@@ -328,9 +368,19 @@ mod tests {
             "var t = 0.0\n    var i = 0\n    while i < w.xs.len() {\n        t += w.xs[i]\n        w.n += 1\n        i += 1\n    }\n    t",
             // It steps by two.
             "var t = 0.0\n    var i = 0\n    while i < xs.len() {\n        t += xs[i]\n        i += 2\n    }\n    t",
+            // An earlier loop moves the start, nested in its body.
+            "var t = 0.0\n    var i = 0\n    while i < 3 {\n        i += 1\n    }\n    while i < xs.len() {\n        t += xs[i]\n        i += 1\n    }\n    t",
+            // A branch moves the start.
+            "var t = 0.0\n    var i = 0\n    if w.n > 0 {\n        i = 3\n    }\n    while i < xs.len() {\n        t += xs[i]\n        i += 1\n    }\n    t",
+            // A call moves the start through `mut i`.
+            "var t = 0.0\n    var i = 0\n    bump(mut i)\n    while i < xs.len() {\n        t += xs[i]\n        i += 1\n    }\n    t",
+            // A shorthand field keeps the index.
+            "var t = 0.0\n    var i = 0\n    while i < xs.len() {\n        t += xs[i]\n        w.at = At { i }\n        i += 1\n    }\n    t",
+            // A shorthand field keeps the index after the loop.
+            "var t = 0.0\n    var i = 0\n    while i < xs.len() {\n        t += xs[i]\n        i += 1\n    }\n    w.at = At { i }\n    t",
         ] {
             let w = warnings(&format!(
-                "pub struct W {{ pub xs: Vec<f32>, pub n: u32 }}\npub fn f(xs: [f32], w: mut W) -> f32 {{\n    {body}\n}}\n"
+                "pub struct At {{ pub i: u32 }}\npub struct W {{ pub xs: Vec<f32>, pub n: u32, pub at: At }}\npub fn bump(i: mut u32) {{\n    i += 1\n}}\npub fn f(xs: [f32], w: mut W) -> f32 {{\n    {body}\n}}\n"
             ));
             assert!(w.is_empty(), "{body}: {w:?}");
         }

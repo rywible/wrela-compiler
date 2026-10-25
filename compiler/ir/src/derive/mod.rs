@@ -671,12 +671,23 @@ pub(super) fn effect(
     }
     cache.effects.insert(key.clone(), None);
     let mut assumed = false;
-    let a = activity(m, func, &key.2, mode, &mut |g, mk| {
+    let mut callee = |g: FuncId, mk: Vec<Bits>| {
         assumed |= matches!(cache.effects.get(&(mode, g, mk.clone())), Some(None));
         effect(m, cache, g, mk, mode)
-    });
-    let returns = a.returns & ret_bits;
-    let writes = func.params.iter().zip(&a.params).map(|(p, w)| p.mutable && *w != 0).collect();
+    };
+    let a = activity(m, func, &key.2, mode, &mut callee);
+    // An interval runs a loop that leaves early on the input with flags (`exits.rs`), and the
+    // flags carry the input into what the loop writes: a call does what the flagged body does.
+    // (A body that can't be flagged can't be derived, and its call is E0701 anyway.)
+    let bool_ty = m.types.lookup(&TypeDef::Scalar(Scalar::Bool));
+    let flagged = bool_ty
+        .filter(|_| mode == Mode::Interval && a.active_loop_exit.is_some())
+        .and_then(|b| exits::flag_exits(func, b, &|v| a.value(v)))
+        .map(|g| activity(m, &g, &key.2, mode, &mut callee))
+        .filter(|again| again.active_loop_exit.is_none());
+    let done = flagged.as_ref().unwrap_or(&a);
+    let returns = done.returns & ret_bits;
+    let writes = func.params.iter().zip(&done.params).map(|(p, w)| p.mutable && *w != 0).collect();
     let e = Effect { returns, writes };
     cache.effects.insert(key.clone(), Some(e.clone()));
     // An activity that took no answer from a function still being analyzed is final: deriving

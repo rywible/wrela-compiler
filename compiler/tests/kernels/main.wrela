@@ -106,7 +106,9 @@ fn compact(
     }
 }
 
-/// `compact`, scanned by subgroups.
+/// `compact`, scanned by subgroups: each workgroup's odd values from its first slot, in the
+/// order its subgroups give them (which may not be `LocalId`'s), and their count the largest
+/// place past one, which no order changes.
 @compute(256)
 fn compact_subgroups(
     values: [u32],
@@ -125,9 +127,7 @@ fn compact_subgroups(
     if keep == 1 {
         out.store(wid.x * 256 + at, v)
     }
-    if lid.x == 255 {
-        counts.store(wid.x, at + keep)
-    }
+    let _ = counts.max(wid.x, at + keep)
 }
 
 /// Each invocation's place among a 40-invocation workgroup's kept values, by both scans: 40 is a
@@ -411,17 +411,34 @@ fn features_are_consistent(s: State) {
 }
 
 @test(frames: 6, gpu: true)
-fn a_subgroup_scan_compacts_as_the_workgroup_scan_does(s: State) {
+fn a_subgroup_scan_compacts_each_workgroups_kept_values(s: State) {
     if !s.features.subgroups {
         print("no `subgroups` on this device: passed trivially")
         return
     }
     assert(s.got.len() == 5)
-    for i in 0..COMPACTED {
-        assert(s.got[3][i] == s.got[1][i])
-    }
     for g in 0..COMPACTED / 256 {
-        assert(s.got[4][g] == s.got[2][g])
+        // Each kept value in a place of its own, from 0 to their count, in whatever order the
+        // GPU's subgroups give: as many of each value as the workgroup kept, and nothing after.
+        var left = Vec::from_fn(256, |_| 0)
+        var n = 0
+        for i in 0..256 {
+            let v = value(256 * g + i)
+            if v % 2 == 1 {
+                left[v] += 1
+                n += 1
+            }
+        }
+        assert(s.got[4][g] == n, f"workgroup {g}: its count")
+        for k in 0..256 {
+            let v = s.got[3][256 * g + k]
+            if k < n {
+                assert(v % 2 == 1 && left[v] > 0, f"workgroup {g}: {v} at place {k}")
+                left[v] -= 1
+            } else {
+                assert(v == 0, f"workgroup {g}: a value past its count, at place {k}")
+            }
+        }
     }
 }
 
@@ -484,11 +501,13 @@ fn a_subgroup_scan_with_a_partial_subgroup_gives_distinct_dense_places(s: State)
     }
     assert(s.got_partial.len() == 800)
     for g in 0..10 {
-        // The kept values' places, by the subgroup scan, are 0 to the count, each once.
+        // The kept values' places, by the subgroup scan, are 0 to the count, each once, in
+        // whatever order the GPU's subgroups give; by the workgroup scan, in `LocalId`'s.
         var count = 0
         var seen = Vec::from_fn(40, |_| false)
         for i in 0..40 {
             let id = 40 * g + i
+            assert(s.got_partial[2 * id] == count, f"workgroup {g}: the workgroup scan at {i}")
             if value(id) % 2 == 1 {
                 let place = s.got_partial[2 * id + 1]
                 assert(place < 40 && !seen[place], f"workgroup {g}: place {place} twice")
@@ -498,11 +517,6 @@ fn a_subgroup_scan_with_a_partial_subgroup_gives_distinct_dense_places(s: State)
         }
         for p in 0..count {
             assert(seen[p], f"workgroup {g}: place {p} missing")
-        }
-        // Where subgroups are consecutive runs (this GPU), the scans agree.
-        for i in 0..40 {
-            let id = 40 * g + i
-            assert(s.got_partial[2 * id] == s.got_partial[2 * id + 1])
         }
     }
 }

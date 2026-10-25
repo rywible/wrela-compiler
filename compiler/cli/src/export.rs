@@ -128,7 +128,11 @@ pub(crate) fn files_of(
             .map_err(|e| format!("`{}` isn't a package: {e}", dir.display()))?;
         let name = package_name(&manifest)
             .ok_or_else(|| format!("`{}`'s wrela.toml has no valid package name", dir.display()))?;
-        if name.eq_ignore_ascii_case("std") || name.eq_ignore_ascii_case("spec") {
+        // Their pages are the toolchain's: a package's modules would take their paths and links.
+        if ["std", "spec", crate::builtin_types::MODULE]
+            .iter()
+            .any(|r| name.eq_ignore_ascii_case(r))
+        {
             return Err(format!("`{name}` is reserved by the toolchain's reference docs"));
         }
         if names.iter().any(|prior: &String| prior.eq_ignore_ascii_case(&name)) {

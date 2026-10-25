@@ -395,7 +395,8 @@ async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextur
       {
         ...programOptions(b, { ...NORMAL_TICKS, replayable: live !== null }, carried),
         workers: normalWorkers(),
-        // The checker's messages where a developer reads them: a debug build, hot reload.
+        // The checker's messages where a developer reads them: a debug build, hot reload. A
+        // release build checks only the rules WebGPU doesn't know (`checkHostRules`).
         checking: live !== null || b.manifest.pipelines.some((p) => p.debug_flag !== null),
       },
       { cache: pipelineCache },
@@ -644,6 +645,7 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
           carried,
         ),
         hash: hashes,
+        phases: true,
         checking: params.checks !== 0,
         workers: params.workers,
         tickHashes,
@@ -725,15 +727,18 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
     });
     // The frame's commands that wait for a pipeline being built run once it is.
     await executor.caughtUp();
-    record.counters.push(executor.takeCounters());
     if (timing === "serial") {
-      // The serial timing mode runs the frame's passes now, one at a time.
-      draining = draining.then(() => scoped(device, () => executor.drain()));
+      // The serial timing mode runs the frame's passes now, one at a time: what they did is
+      // known once they've run.
+      draining = draining.then(() => scoped(device, () => executor.drain())).then(() => {
+        record.counters.push(executor.takeCounters());
+      });
       draining.catch(fatal);
-      // At most two frames' passes waiting to run: recording stays near the GPU.
+      // The next frame is recorded once this one's drain has begun (the last one's has ended),
+      // while it runs: each drain takes exactly its own frame's commands, and so its counters.
       drains.push(draining);
-      if (drains.length > 2) await drains.shift()!.catch(() => {});
-    }
+      if (drains.length > 1) await drains.shift()!.catch(() => {});
+    } else record.counters.push(executor.takeCounters());
     if (params.saturate > 0 || params.inflight > 0) {
       inFlight.push(device.queue.onSubmittedWorkDone());
       if (inFlight.length > (params.saturate > 0 ? 2 : params.inflight)) await inFlight.shift();

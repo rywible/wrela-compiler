@@ -143,8 +143,8 @@ pub(crate) enum ParamClass {
     Append {
         elem: TyId,
     },
-    /// A `Shared<T, N>`, or a `SharedAtomics<N>` of atomic `u32`s (`atomic`): workgroup memory,
-    /// not bound.
+    /// A `Shared<T, N>`, or a `SharedAtomics<N>` or `SharedAtomicsI<N>` of atomic `u32`s or
+    /// `i32`s (`atomic`): workgroup memory, not bound.
     Workgroup {
         elem: TyId,
         len: u32,
@@ -628,6 +628,17 @@ fn buffer_binding(
     elem: TyId,
     span: Span,
 ) -> Option<[ir::ValueId; 3]> {
+    buffer_binding_sized(fl, arg, elem, span).map(|(b, _)| b)
+}
+
+/// [`buffer_binding`], and the bytes its elements take: its size, but 0 for a whole buffer of
+/// no elements.
+fn buffer_binding_sized(
+    fl: &mut Fl,
+    arg: &mir::Place,
+    elem: TyId,
+    span: Span,
+) -> Option<([ir::ValueId; 3], ir::ValueId)> {
     let elem = fl.concrete(elem);
     let et = fl.cx.lower_ty(fl.mb, elem, span)?;
     let stride = ir::layout::array_stride(&fl.mb.m.types, et);
@@ -647,22 +658,22 @@ fn buffer_binding(
         let start = fl.value(u, ir::Expr::Extract(v, 1));
         if lang == Some(Lang::GpuField) {
             // One element (or a field of one): its byte offset, and its size.
-            return Some([handle, start, stride_v]);
+            return Some(([handle, start, stride_v], stride_v));
         }
         // A span: its first element and its count.
         let count = fl.value(u, ir::Expr::Extract(v, 2));
         let offset = mul(fl, start);
         let size = mul(fl, count);
-        return Some([handle, offset, size]);
+        return Some(([handle, offset, size], size));
     }
     let handle = fl.value(u, ir::Expr::Extract(v, 0));
     let count = fl.value(u, ir::Expr::Extract(v, 1));
-    let size = mul(fl, count);
+    let bytes = mul(fl, count);
     let zero = fl.u32c(0);
     let b = fl.mb.m.types.bool();
     let empty = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, count, zero));
-    let size = fl.value(u, ir::Expr::Select { cond: empty, if_true: stride_v, if_false: size });
-    Some([handle, zero, size])
+    let size = fl.value(u, ir::Expr::Select { cond: empty, if_true: stride_v, if_false: bytes });
+    Some(([handle, zero, size], bytes))
 }
 
 /// The elements of the buffer at `place`: its first type argument (`u32` words, structs of
@@ -928,11 +939,11 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
     // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
-    let mut index_size = None;
+    let mut index_bytes = None;
     if let Some((place, at)) = &d.indices {
         let elem = buffer_elem(fl, place);
-        let b = buffer_binding(fl, place, elem, *at)?;
-        index_size = Some(b[2]);
+        let (b, bytes) = buffer_binding_sized(fl, place, elem, *at)?;
+        index_bytes = Some(bytes);
         counts.extend(b);
     }
     match kind {
@@ -940,16 +951,20 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
             counts.extend([fl.operand(&d.vertices)?, fl.operand(&d.instances)?]);
         }
         ir::DrawKind::Indexed => {
-            // The index count (`u32::MAX`: all the indices past the first), the instances, the
-            // first index, the base vertex and the first instance.
+            // The index count (`u32::MAX`: all the indices past the first, none if the first
+            // is past them all), the instances, the first index, the base vertex and the first
+            // instance. Both sides of the select are worked out, so the rest can't trap.
             let given = fl.operand(&d.vertices)?;
             let first = fl.operand(&d.more[0])?;
-            let size = index_size?;
+            let bytes = index_bytes?;
             let four = fl.u32c(4);
-            let all = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, size, four));
-            let rest = fl.value(u, ir::Expr::Binary(ir::BinOp::Sub, all, first));
-            let max = fl.u32c(u32::MAX);
+            let all = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, bytes, four));
             let b = fl.mb.m.types.bool();
+            let past = fl.value(b, ir::Expr::Binary(ir::BinOp::Ge, first, all));
+            let left = fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, all, first));
+            let zero = fl.u32c(0);
+            let rest = fl.value(u, ir::Expr::Select { cond: past, if_true: zero, if_false: left });
+            let max = fl.u32c(u32::MAX);
             let every = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, given, max));
             let count =
                 fl.value(u, ir::Expr::Select { cond: every, if_true: rest, if_false: given });
@@ -1680,7 +1695,11 @@ fn subgroup_op(
     let &(_, op) = SUBGROUP_OPS.iter().find(|&&(k, _)| k == l)?;
     let args = fl.arg_values(&c.args)?;
     let x = *args.first()?;
-    let elem = fl.mb.m.types.element_scalar(fl.f.value_ty(x));
+    // A scalar or a vector: WGSL's take no matrix.
+    let elem = match fl.mb.m.types.get(fl.f.value_ty(x)) {
+        ir::TypeDef::Scalar(s) | ir::TypeDef::Vector(s, _) => Some(*s),
+        _ => None,
+    };
     let (takes, want): (&[T], _) = match op {
         S::Any | S::All | S::Ballot => (&[T::Bool], "a `bool`"),
         S::And | S::Or | S::Xor => (&[T::I32, T::U32], "an `i32` or a `u32` (or a vector of them)"),
@@ -1911,12 +1930,16 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
             let field = match (op, lang) {
                 (T::Width, _) => 1,
                 (T::Height, _) => 2,
-                (T::Depth | T::Levels | T::Layers, Some(Lang::Texture | Lang::Texture3d)) => 3,
+                (T::Levels, Some(Lang::Texture)) | (T::Depth, Some(Lang::Texture3d)) => 3,
                 (T::Layers, Some(Lang::TextureArray | Lang::DepthTextureArray)) => 3,
                 (T::Levels, Some(Lang::TextureArray)) => 4,
-                // A depth texture has one level.
+                // A depth texture, and a 3D one, have one level.
                 (T::Levels, _) => return Some(fl.u32c(1)),
-                _ => 3,
+                _ => {
+                    let what = format!("a texture's {op:?} asked of a `{lang:?}`");
+                    fl.cx.err(Diagnostic::internal(what));
+                    return None;
+                }
             };
             let v = fl.arg_value(&c.args[0])?;
             return Some(fl.value(u, ir::Expr::Extract(v, field)));
@@ -1956,8 +1979,8 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
     let v = narrow(fl, v, t);
     if op.uses_derivatives() {
-        // `sample` and `sample_compare` pick a texture's detail from neighbouring pixels, as
-        // derivatives do.
+        // `sample`, `sample_bias` and `sample_compare` pick a texture's detail from neighbouring
+        // pixels, as derivatives do.
         let at = user_span(fl, span);
         fragment_only(fl, Some(v), at, |ctx| {
             Diagnostic::new(
@@ -2143,6 +2166,7 @@ fn check_uniformity(
             Collective::Dpdy => "dpdy",
             Collective::Fwidth => "fwidth",
             Collective::Sample => "sample",
+            Collective::SampleBias => "sample_bias",
             Collective::SampleCompare => "sample_compare",
             Collective::Barrier => "workgroupBarrier",
             Collective::Subgroup(op) => subgroup_name(op),
@@ -2300,6 +2324,20 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                 cx.holds_nothing("workgroup memory", elem, param.span);
                 continue;
             };
+            if let Some(e) = half_payload(&mb.m.types, et) {
+                let shown = mb.m.types.display(e);
+                let d = Diagnostic::new(
+                    codes::E0602,
+                    param.span,
+                    format!("workgroup memory can't hold `{shown}`: it has an `f16` in a payload"),
+                )
+                .with_note(
+                    "memory holds an enum's payloads as 32-bit words, and an `f16` is half of one",
+                )
+                .with_help("make the payload an `f32`, converting with `f16(x)` where it's read");
+                cx.err(d);
+                continue;
+            }
             let et = if atomic { atomic_of(&mut mb, et) } else { et };
             if len == 0 {
                 let d =
@@ -2641,6 +2679,39 @@ fn stage_name(cx: &Cx, iface: &Interface, e: usize) -> String {
     }
 }
 
+/// E0602: a kernel takes a `SubgroupInvocation` though its workgroup, `wg`, has more than one
+/// row or layer. WebGPU's shader compilers number a subgroup's invocations only in a workgroup
+/// of one dimension.
+fn check_subgroup_invocation(cx: &mut Cx, iface: &Interface, wg: [u32; 3]) {
+    if wg[1..].iter().all(|&n| n <= 1) {
+        return;
+    }
+    let entry = &iface.entries[0];
+    let func = cx.checked.program.func(entry.func);
+    for (i, (_, class)) in entry.params.iter().enumerate() {
+        if *class != ParamClass::Builtin(ir::BuiltinInput::SubgroupInvocationId) {
+            continue;
+        }
+        let [x, y, z] = wg;
+        let d = Diagnostic::new(
+            codes::E0602,
+            func.params[i].span,
+            format!(
+                "a `SubgroupInvocation` is for a kernel of one-dimensional workgroups, and `{}`'s \
+                 are {x} by {y} by {z}",
+                func.name
+            ),
+        )
+        .with_note("WebGPU numbers a subgroup's invocations only in a workgroup of one dimension")
+        .with_help(format!(
+            "make the workgroup one row, `@compute({})`, and work out each invocation's place \
+             from its `LocalId`",
+            x.saturating_mul(y).saturating_mul(z)
+        ));
+        cx.err(d);
+    }
+}
+
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
@@ -2653,6 +2724,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     check_recursion(cx, &mb);
     let inputs = entry_inputs(&iface.entries[0], true, iface.over);
     check_workgroup(cx, &mb, entry, &inputs);
+    check_subgroup_invocation(cx, &iface, wg);
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(name),
         stage: ir::Stage::Compute { workgroup_size: wg },
@@ -3158,6 +3230,30 @@ fn atomic_of(mb: &mut ModuleBuilder, et: ir::TypeId) -> ir::TypeId {
     mb.m.types.intern(ir::TypeDef::Atomic(s))
 }
 
+/// The first enum in `t` (`t` itself, or one in a field or element) with an `f16` in a payload.
+/// Memory holds a payload as `u32` words (`ir::gpu_memory`), which a 16-bit float isn't.
+fn half_payload(types: &ir::Types, t: ir::TypeId) -> Option<ir::TypeId> {
+    fn half(types: &ir::Types, t: ir::TypeId) -> bool {
+        match types.get(t) {
+            ir::TypeDef::Scalar(s) | ir::TypeDef::Vector(s, _) => *s == ir::Scalar::F16,
+            ir::TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| half(types, *f)),
+            ir::TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, p)| p.is_some_and(|p| half(types, p)))
+            }
+            ir::TypeDef::Array(e, _) => half(types, *e),
+            _ => false,
+        }
+    }
+    match types.get(t) {
+        ir::TypeDef::Enum { .. } => half(types, t).then_some(t),
+        ir::TypeDef::Struct { fields, .. } => {
+            fields.iter().find_map(|(_, f)| half_payload(types, *f))
+        }
+        ir::TypeDef::Array(e, _) => half_payload(types, *e),
+        _ => None,
+    }
+}
+
 /// A GPU entry point or `@gpu` function that nothing dispatches: lowered for the GPU anyway
 /// (a generic `@gpu` function with `substs`, stand-ins for its generics), so its effects are
 /// checked where it's defined. Only to check: the module isn't emitted, so it isn't flattened.
@@ -3176,6 +3272,9 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
                 .find(|&t| wrela_sema::gpu::is_vertex_output(&checked.program, t))
                 .filter(|_| stage == Entry::Fragment);
             let iface = Rc::new(Interface::of(cx, &[(f, &[])], None, varyings));
+            if let Entry::Compute(wg) = stage {
+                check_subgroup_invocation(cx, &iface, wg);
+            }
             let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage);
             let ret = match stage {
                 Entry::Compute(_) => None,
@@ -3511,5 +3610,65 @@ pub fn frame(time: f32, width: u32, height: u32) {
             })
             .expect("dispatch");
         assert_eq!(constant_u32(groups, &lets), 67_108_864);
+    }
+
+    /// A kernel of two-dimensional workgroups can't take a `SubgroupInvocation` (WebGPU numbers
+    /// them only in one dimension), though nothing dispatches it; its `SubgroupSize` it can.
+    #[test]
+    fn a_subgroup_invocation_is_a_one_dimensional_workgroups() {
+        let source = r#"
+use std::gpu::{GlobalId, Slots, SubgroupInvocation, SubgroupSize}
+
+@compute(8, 8)
+fn tiles(out: mut Slots<u32>, lane: SubgroupInvocation, id: GlobalId) {
+    out[id] = lane.index
+}
+
+@compute(8, 8)
+fn widths(out: mut Slots<u32>, width: SubgroupSize, id: GlobalId) {
+    out[id] = width.size
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, codes::E0602);
+        assert!(errors[0].message.contains("are 8 by 8 by 1"), "{errors:?}");
+    }
+
+    /// An `f16` literal is the half nearest the number written, rounded once: 1.0004883 is
+    /// nearer 1 + 2⁻¹⁰ than 1, though the `f32` it rounds to is halfway between them.
+    #[test]
+    fn half_literals_round_once_to_the_nearest_half() {
+        let source = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn halves(out: mut Slots<f32>, id: GlobalId) {
+    let a: f16 = 1.0004883
+    let b: f16 = 0.000030517578125
+    let c: f16 = 2049.0
+    out[id] = f32(a) + f32(b) + f32(c)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(halves.bind(mut out), groups: 1)
+}
+"#;
+        let (lowered, errors) = lower_source(source);
+        assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+        let mut halves = Vec::new();
+        for f in lowered.pipelines.iter().flat_map(|p| &p.module.functions) {
+            ir::visit::walk(&f.body, &mut |s| {
+                if let ir::Stmt::Let(_, ir::Expr::Const(ir::Const::F16(x))) = s {
+                    halves.push(*x);
+                }
+            });
+        }
+        // 2⁻¹⁵, a subnormal half, is exact; 2049 is a tie, to the even 2048.
+        assert_eq!(halves, [1.0 + 1.0 / 1024.0, 1.0 / 32768.0, 2048.0]);
     }
 }

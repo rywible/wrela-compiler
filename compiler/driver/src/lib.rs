@@ -374,8 +374,16 @@ pub fn inputs(root: &Path) -> Result<Inputs, String> {
 
 /// Writes `bytes` to `path` atomically: through a hidden temporary file beside it, renamed over
 /// it, so a reader sees the old file or the whole new one. A file that was there keeps its
-/// permissions. The write goes through a handle of `path`'s directory.
+/// permissions. A `path` that's a symbolic link stays one: the file it links to is replaced
+/// (an error if there's none). The write goes through a handle of the replaced file's directory.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let linked;
+    let path = if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        linked = std::fs::canonicalize(path)?;
+        linked.as_path()
+    } else {
+        path
+    };
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1644,6 +1652,30 @@ mod tests {
             assert!(out.diagnostics[0].message.contains("isn't a directory"));
         }
         let _ = std::fs::remove_file(&d);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_atomic_write_through_a_link_replaces_its_file_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d =
+            std::env::temp_dir().join(format!("wrela-driver-atomic-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("game")).expect("package");
+        std::fs::create_dir_all(d.join("shared")).expect("shared directory");
+        let target = d.join("shared/x.wrela");
+        std::fs::write(&target, "fn x() {}\n").expect("shared module");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).expect("mode");
+        let link = d.join("game/x.wrela");
+        std::os::unix::fs::symlink("../shared/x.wrela", &link).expect("link");
+
+        write_atomic(&link, b"fn x() { }\n").expect("write through the link");
+        assert!(std::fs::symlink_metadata(&link).expect("link").file_type().is_symlink());
+        assert_eq!(std::fs::read(&target).expect("shared module"), b"fn x() { }\n");
+        let mode = std::fs::metadata(&target).expect("shared module").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[cfg(unix)]

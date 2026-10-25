@@ -331,6 +331,24 @@ fn open_file(dir: &Dir, rel: &str, path: &str, write: bool) -> Result<File, Stri
     } else {
         options.read(true);
     }
+    let file = open_checked(dir, rel, path, options, write)?;
+    // Emptied only once it's known to be a file.
+    if write {
+        file.set_len(0).map_err(|e| failed(path, e))?;
+    }
+    Ok(file)
+}
+
+/// Opens the file `rel` of `dir` (`path`, as the tool names it) with `options`, which `write`
+/// says open it for writing, without waiting on it: a regular file, and one to write has no
+/// other names, or an error.
+fn open_checked(
+    dir: &Dir,
+    rel: &str,
+    path: &str,
+    mut options: OpenOptions,
+    write: bool,
+) -> Result<File, String> {
     #[cfg(unix)]
     cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
     let file = dir.open_with(rel, &options).map_err(|e| failed(path, e))?;
@@ -341,10 +359,6 @@ fn open_file(dir: &Dir, rel: &str, path: &str, write: bool) -> Result<File, Stri
     // A file with another name (a hard link) isn't written: its other names would change too.
     if write && crate::confined::linked_elsewhere(&file) {
         return Err(format!("`{path}` has other names (hard links), so it isn't written"));
-    }
-    // Emptied only once it's known to be a file.
-    if write {
-        file.set_len(0).map_err(|e| failed(path, e))?;
     }
     Ok(file)
 }
@@ -904,8 +918,10 @@ impl Caps {
     /// Writes the whole file at `path` from `write`, which is given the file to write to, making
     /// the directories it needs. The bytes go to a new file beside it, which then takes its
     /// place with the old one's permissions, so a reader sees the old file or the whole new one,
-    /// and a write that fails leaves the old one. A link at `path` is written through, in place:
-    /// a new file in its place would replace the link.
+    /// and a write that fails leaves the old one. The old one must be what a write in place
+    /// could write: a regular file, open to writing (not necessarily to reading), with no other
+    /// names. A link at `path` is written through, in place: a new file in its place would
+    /// replace the link.
     pub(crate) fn write_with(
         &self,
         path: &str,
@@ -928,27 +944,32 @@ impl Caps {
             let mut file = open_file(dir, rel, path, true)?;
             return write(&mut file).map_err(|e| failed(path, e));
         }
-        // What's there is checked as a write in place would check it: a regular file, with no
-        // other names.
+        // What's there is checked as a write in place would check it: a regular file that may
+        // be written, with no other names. It's opened to write, neither made nor emptied.
         let permissions = match &there {
             Some(meta) => {
-                let file = open_file(dir, rel, path, false)?;
-                if crate::confined::linked_elsewhere(&file) {
-                    return Err(format!(
-                        "`{path}` has other names (hard links), so it isn't written"
-                    ));
-                }
+                let mut options = OpenOptions::new();
+                options.write(true);
+                open_checked(dir, rel, path, options, true)?;
                 Some(meta.permissions())
             }
             None => None,
         };
-        let tmp_name = crate::confined::temp_name(name);
-        let tmp = match parent {
-            Some(parent) => format!("{parent}/{tmp_name}"),
-            None => tmp_name,
+        // A new file of this call's own: a name that's taken (a write that died left it) is
+        // passed over, not removed.
+        let (tmp, mut file) = loop {
+            let tmp_name = crate::confined::temp_name(name);
+            let tmp = match parent {
+                Some(parent) => format!("{parent}/{tmp_name}"),
+                None => tmp_name,
+            };
+            match dir.open_with(&tmp, OpenOptions::new().write(true).create_new(true)) {
+                Ok(file) => break (tmp, file),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(failed(path, e)),
+            }
         };
         let written = (|| {
-            let mut file = dir.open_with(&tmp, OpenOptions::new().write(true).create_new(true))?;
             if let Some(p) = permissions {
                 file.set_permissions(p)?;
             }
@@ -1083,6 +1104,48 @@ mod tests {
         let refused = caps.write("w/two.txt", b"2").expect_err("a hard link");
         assert!(refused.contains("other names"), "{refused}");
         assert_eq!(std::fs::read(dir.join("one.txt")).expect("read"), b"1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the tool may write but not read is written, as a write in place would write it,
+    /// and keeps its permissions.
+    #[cfg(unix)]
+    #[test]
+    fn a_write_needs_no_permission_to_read_the_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("write-only");
+        std::fs::write(dir.join("w.txt"), "old").expect("write");
+        std::fs::set_permissions(dir.join("w.txt"), std::fs::Permissions::from_mode(0o200))
+            .expect("chmod");
+        let caps = Caps::open(&Grants::default().root("w", &dir, true), |_| None).expect("opened");
+        caps.write("w/w.txt", b"new").expect("written");
+        let meta = std::fs::metadata(dir.join("w.txt")).expect("stat");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o200, "its permissions kept");
+        std::fs::set_permissions(dir.join("w.txt"), std::fs::Permissions::from_mode(0o600))
+            .expect("chmod");
+        assert_eq!(std::fs::read(dir.join("w.txt")).expect("read"), b"new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A new file a write would take that's already there (a write that died left it) is passed
+    /// over, and kept.
+    #[test]
+    fn a_write_keeps_a_stale_file_beside_it() {
+        let dir = scratch("stale");
+        // The next writes' names, whichever of them this write takes first.
+        let next = crate::confined::temp_name("a.txt");
+        let (stem, n) = next.rsplit_once('-').expect("a counter");
+        let n: u64 = n.parse().expect("a number");
+        let stale: Vec<String> = (n + 1..n + 65).map(|k| format!("{stem}-{k}")).collect();
+        for name in &stale {
+            std::fs::write(dir.join(name), "stale").expect("a stale file");
+        }
+        let caps = Caps::open(&Grants::default().root("w", &dir, true), |_| None).expect("opened");
+        caps.write("w/a.txt", b"new").expect("written");
+        assert_eq!(std::fs::read(dir.join("a.txt")).expect("read"), b"new");
+        for name in &stale {
+            assert_eq!(std::fs::read(dir.join(name)).expect("kept"), b"stale", "{name}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

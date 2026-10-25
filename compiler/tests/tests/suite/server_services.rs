@@ -248,6 +248,21 @@ fn a_server_keeps_reads_and_scans_its_store_and_the_store_outlives_its_build() {
 }
 
 #[test]
+fn a_server_puts_and_gets_the_longest_key_and_value() {
+    use wrela_host::services::{MAX_KEY, MAX_VALUE};
+    let (mut room, _, dir) = room("server-longest");
+    let key = vec![b'k'; MAX_KEY];
+    let value: Vec<u8> = (0..MAX_VALUE).map(|i| (i % 251) as u8).collect();
+    room.receive(1, put(1, &key, &value));
+    room.wake(0.0).expect("the put");
+    assert_eq!(sent(&mut room), vec![vec![1u8]], "the put's answer, once it's kept");
+    let got = ask(&mut room, [&[2u8][..], &chunk(&key)].concat());
+    assert_eq!(got.len(), 2 + MAX_VALUE);
+    assert!(got[..2] == [2, 1] && got[2..] == value[..], "the value, whole");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_server_checks_a_signature_and_refuses_another_message() {
     use p256::ecdsa::signature::Signer;
     let (mut room, _, dir) = room("server-signatures");

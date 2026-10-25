@@ -1,6 +1,6 @@
 import { afterEach, expect, mock, test } from "bun:test";
 import { featureNames } from "../src/check.ts";
-import { deviceLimits, openDevice } from "../src/device.ts";
+import { deviceFeatures, deviceLimits, openDevice } from "../src/device.ts";
 import { UnsupportedError } from "../src/errors.ts";
 
 const original = Object.getOwnPropertyDescriptor(navigator, "gpu");
@@ -65,4 +65,19 @@ test("features=none hides every optional feature from the program, as the native
   expect(deviceLimits(none)[12]).toBe(0);
   const some = await openDevice(() => {}, "subgroups");
   expect(featureNames(deviceLimits(some)[10]!)).toEqual(["subgroups", "indirect-first-instance"]);
+});
+
+test("deviceFeatures names what the program sees of a device: all, none or some of its optional features", async () => {
+  // A device of its own each time: what a program sees is kept by device.
+  const requestDevice = mock(async () => ({ addEventListener: () => {}, lost: new Promise(() => {}), limits: {} }));
+  const has = ["timestamp-query", "subgroups", "indirect-first-instance", "shader-f16"];
+  Object.defineProperty(navigator, "gpu", { configurable: true, value: {
+    requestAdapter: async () => ({ info: { isFallbackAdapter: false }, limits: {}, features: new Set(has), requestDevice }),
+  } });
+  // In `FEATURES`' order, whatever order the adapter gives them in.
+  expect(deviceFeatures(await openDevice(() => {}))).toEqual(["shader-f16", "subgroups", "timestamp-query", "indirect-first-instance"]);
+  expect(deviceFeatures(await openDevice(() => {}, "none"))).toEqual(["indirect-first-instance"]);
+  expect(deviceFeatures(await openDevice(() => {}, "timestamp-query,shader-f16,bgra8unorm-storage"))).toEqual(["shader-f16", "timestamp-query", "indirect-first-instance"]);
+  // A device it didn't open: only the feature every device has.
+  expect(deviceFeatures({} as GPUDevice)).toEqual(["indirect-first-instance"]);
 });

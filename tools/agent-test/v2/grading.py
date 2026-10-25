@@ -8,7 +8,9 @@ need for a frame test outside main to take the state) or by the pipelines it mus
 
 `src` is a directory of the program's .wrela files (an attempt's snapshot); it is copied, never
 changed. `wrela` builds and runs it; `validator`, a fixed compiler, checks the criteria that
-depend on a lint, so they are the same whichever compiler is under test.
+depend on a lint, so they are the same whichever compiler is under test. A validator that exits
+with neither 0 nor 1, or gives no JSON report, leaves the attempt not correct ("validator
+failed").
 
 A task's `grade` in tasks.json says how: `pipelines`, the kinds it must reach; or `tests`, its
 hidden tests, with `passing`, the program's own tests that must run and pass, and `without`, the
@@ -109,8 +111,16 @@ def grade(task, src, wrela, validator=None):
         without = task["grade"].get("without", {})
         if without:
             os.remove(os.path.join(pkg, GRADE))
-            code, out, _ = _run([validator, "check", pkg, "--json"])
-            codes = [d["code"] for d in json.loads(out or "{}").get("diagnostics", [])]
+            code, out, err = _run([validator, "check", pkg, "--json"])
+            try:
+                report = json.loads(out) if code in (0, 1) else None
+            except json.JSONDecodeError:
+                report = None
+            if not isinstance(report, dict) or not isinstance(report.get("diagnostics"), list):
+                status = "timed out" if code is None else f"exit status {code}"
+                result["why"] = f"validator failed ({status}): " + (err or out)[-600:]
+                return result
+            codes = [d["code"] for d in report["diagnostics"]]
             for lint, why in without.items():
                 if lint in codes:
                     result["why"] = why

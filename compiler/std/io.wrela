@@ -178,7 +178,8 @@ pub fn print(line: str) {
 @intrinsic
 pub(package) fn next_request() -> u32 {}
 
-/// -1 while request `request` is pending, -2 if it failed, else its answer's length in bytes.
+/// -1 while request `request` is pending, -2 if it failed, -3 if a load found nothing stored, else
+/// its answer's length in bytes.
 @intrinsic
 pub(package) fn request_status(request: u32) -> i32 {}
 

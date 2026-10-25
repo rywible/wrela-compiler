@@ -29,12 +29,12 @@
 //!   compares with what's there for it to be kept (WebGPU's names, `"less"` by default), and
 //!   `"write"`, whether it replaces it (`true` by default). A render pipeline's `"targets"`
 //!   are every combination of targets the program draws it into, as the compiler knows them
-//!   from each draw's pass: each a colour format (`null` in a pass that draws only depths; the
-//!   screen's is [`SCREEN_FORMAT`], with `"screen": true`) and whether there's a depth target
-//!   (`depth32float`), at least one. Hosts make one pipeline for each when the program loads, and refuse a draw into
-//!   any other. A target's `"colors"` are its colour formats in order (none in a pass that
-//!   draws only depths; one, [`SCREEN_FORMAT`], for the screen), up to four, within WebGPU's 32
-//!   bytes per sample ([`crate::stream::color_attachment_bytes`]). A render pipeline's
+//!   from each draw's pass, at least one: each its `"colors"`, whether there's a depth target
+//!   (`"depth"`, `depth32float`), and whether it's the screen (`"screen": true`). Hosts make one
+//!   pipeline for each when the program loads, and refuse a draw into any other. A target's
+//!   `"colors"` are its colour formats in order (none in a pass that draws only depths; one,
+//!   [`SCREEN_FORMAT`], for the screen), up to four, within WebGPU's 32 bytes per sample
+//!   ([`crate::stream::color_attachment_bytes`]). A render pipeline's
 //!   `"outputs"` say what its fragment shader writes to each colour location, `"float"` or
 //!   `"uint"`, so a target's colours are as many, an integer format exactly where it's `"uint"`.
 //!   Its `"blends"` (one per output; all `"replace"` when it's left out) say how each colour
@@ -580,8 +580,9 @@ pub struct ResourceBinding {
     /// Which of a render pipeline's shaders reads it; both, if not given.
     #[serde(skip_serializing_if = "BindingStage::is_both")]
     pub stage: BindingStage,
-    /// A colour texture's format (`texture`, `texture_3d`, `storage_texture`,
-    /// `storage_texture_3d`): what its texels are read as, and a storage texture's format.
+    /// A colour texture's format (`texture`, `texture_3d`, `texture_2d_array`, `texture_cube`,
+    /// `storage_texture`, `storage_texture_3d`, `storage_texture_2d_array`: those whose kind
+    /// [`BindingKind::has_format`]): what its texels are read as, and a storage texture's format.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<TextureFormat>,
 }
@@ -822,6 +823,12 @@ impl Manifest {
                                 "pipeline {i}'s target {k} draws into nothing: a target has a colour, a depth, or both"
                             ));
                         }
+                        // Its colours are those before the first `None`: none may follow one.
+                        if t.colors.iter().skip_while(|c| c.is_some()).any(Option::is_some) {
+                            return err(format!(
+                                "pipeline {i}'s target {k} has a colour after a missing one: its colours come first"
+                            ));
+                        }
                         if t.screen
                             && (t.colors().count() != 1 || t.color() != Some(SCREEN_TEXTURE))
                         {
@@ -972,10 +979,17 @@ mod read {
         }
     }
 
+    /// The option that `o`'s `key` names, as [`named`]; its error, which lists every option, is
+    /// made only when there's none.
     fn one_of<T: Copy>(o: &Json, key: &str, place: &str, options: &[(&str, T)]) -> Result<T> {
         let v = field(o, key, place)?;
-        let names: Vec<&str> = options.iter().map(|(n, _)| *n).collect();
-        named(v, &format!("{place}.{key}"), &format!("one of {}", names.join(", ")), options)
+        match options.iter().find(|(name, _)| v.as_str() == Some(name)) {
+            Some(&(_, t)) => Ok(t),
+            None => {
+                let names: Vec<&str> = options.iter().map(|(n, _)| *n).collect();
+                fail(format!("{place}.{key} must be one of {}, not {}", names.join(", "), show(v)))
+            }
+        }
     }
 
     /// An array, each item read by `item` from its place (`pipelines[0].outputs[1]`) and value.
@@ -1012,8 +1026,8 @@ mod read {
         if o.contains_key(key) { one_of(o, key, place, options) } else { Ok(default) }
     }
 
-    /// A render pipeline's `targets`: each a colour format or `null`, whether it has depth, and
-    /// whether it's the screen (`false` where the key is missing).
+    /// A render pipeline's `targets`: each its `colors` (up to four formats), whether it has
+    /// depth, and whether it's the screen (`false` where the key is missing).
     fn render_targets(o: &Json, place: &str) -> Result<Vec<RenderTarget>> {
         let Some(Value::Array(ts)) = o.get("targets") else {
             return fail(format!("{place}.targets must be an array"));
@@ -1444,6 +1458,21 @@ mod tests {
         assert!(e.0.contains("writes 2 colours, and it has 1"), "{}", e.0);
         let e = with(vec![f], &[F::R32Uint]).expect_err("floats into integers");
         assert!(e.0.contains("writes floats to colour 0"), "{}", e.0);
+    }
+
+    /// A target's colours are those before its first `None`: one after a gap is refused, not
+    /// dropped.
+    #[test]
+    fn a_target_with_a_gap_in_its_colours_is_refused() {
+        let mut m = sample();
+        if let Stage::Render { targets, .. } = &mut m.pipelines[1].stage {
+            targets[0].colors =
+                [Some(TextureFormat::Rgba8), None, Some(TextureFormat::Rgba8), None];
+        }
+        assert_eq!(
+            m.validate().expect_err("a colour after a gap").0,
+            "pipeline 1's target 0 has a colour after a missing one: its colours come first"
+        );
     }
 
     #[test]
