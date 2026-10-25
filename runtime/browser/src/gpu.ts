@@ -773,8 +773,13 @@ export class GpuExecutor {
   #ended: OpenPass | null = null;
   #timer: Timer | null;
   /** The program's asks for a label's time (`std::gpu::timed`): each one's label, the frame it
-   * was asked in, and its answer's resolver. */
-  readonly #asked: { label: string; from: number; answer: (bytes: Bytes) => void }[] = [];
+   * was asked in, its answer's resolver, and whether its `Timed` command has run (`active`):
+   * work behind a pipeline being built runs late, and an ask times only what's recorded after
+   * it. */
+  readonly #asked: { label: string; from: number; answer: (bytes: Bytes) => void; active: boolean }[] = [];
+  /** `Timed` commands that ran before their asks arrived (commands run, then their requests
+   * start), by label. */
+  readonly #early = new Map<string, number>();
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
@@ -914,8 +919,9 @@ export class GpuExecutor {
   /** The GPU time of the passes and dispatches labelled `label` in the first frame from this
    * one on that runs one, summed: an `f32` of microseconds, once read back. The first ask starts
    * a timer, on a device with "timestamp-query"; without it, this rejects. Outside a timed run,
-   * only the work of a label asked for and not yet answered is timed (its passes from the ask
-   * on, in the stream's order): the rest runs as untimed, its dispatches sharing a pass. */
+   * only the work of a label asked for and not yet answered is timed (its passes from the ask's
+   * `Timed` command on, in the stream's order, also while commands wait for a pipeline): the
+   * rest runs as untimed, its dispatches sharing a pass. */
   timeLabel(label: string): Promise<Bytes> {
     if (this.#timer === null) {
       if (!this.device.features.has("timestamp-query")) {
@@ -924,7 +930,10 @@ export class GpuExecutor {
       this.#timer = new Timer(this.device, false);
     }
     this.#timer.onRead ??= () => this.#answerTimes();
-    return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer }));
+    const early = this.#early.get(label) ?? 0;
+    if (early > 1) this.#early.set(label, early - 1);
+    else this.#early.delete(label);
+    return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer, active: early > 0 }));
   }
 
   /** Whether a command recorded in frame `frame` or earlier still waits to run (behind a
@@ -950,6 +959,7 @@ export class GpuExecutor {
     if (timer === null) return;
     for (let i = this.#asked.length - 1; i >= 0; i--) {
       const ask = this.#asked[i]!;
+      if (!ask.active) continue;
       const l = timer.latest.get(ask.label);
       if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame) || this.#holds(l.frame)) continue;
       this.#asked.splice(i, 1);
@@ -973,7 +983,7 @@ export class GpuExecutor {
    * pass, else only one whose label the program has asked for and not yet had; never flushes. */
   #timestamps(label: string, frame = this.#running?.frame ?? this.frame): { timestampWrites?: GPUComputePassTimestampWrites } {
     const timer = this.#timer;
-    if (timer === null || !(timer.keep || this.#asked.some((a) => a.label === label))) return {};
+    if (timer === null || !(timer.keep || this.#asked.some((a) => a.active && a.label === label))) return {};
     return { timestampWrites: timer.next(frame, label) };
   }
 
@@ -1256,11 +1266,17 @@ export class GpuExecutor {
       case "Label":
         this.#label = cmd.name;
         return;
+      case "Timed": {
+        // The ask times its label's work from here on in the stream (`timeLabel`).
+        const ask = this.#asked.find((a) => !a.active && a.label === cmd.label);
+        if (ask !== undefined) ask.active = true;
+        else this.#early.set(cmd.label, (this.#early.get(cmd.label) ?? 0) + 1);
+        return;
+      }
       case "ReadBuffer":
       case "StorageRead":
       case "StorageWrite":
       case "Fetch":
-      case "Timed":
         return;
     }
   }
