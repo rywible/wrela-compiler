@@ -6,7 +6,8 @@
 //! `results/console.log` as it comes.
 //!
 //! **The server** is this run's own, on a free port of 127.0.0.1, over the directory it's given
-//! (the repository), with the toolchain's servers' rules (`crate::loopback`): a request must
+//! (the repository, or a build's directory that is the page itself, so that nothing beside it is
+//! served), with the toolchain's servers' rules (`crate::loopback`): a request must
 //! name this machine, every answer is cross-origin isolated, a file is reached one part at a
 //! time following no link, nothing under `.git` is served, and a `PUT` goes only to a plain file
 //! name in a `results/` directory. [`run_url`] runs a page that another server serves (`wrela
@@ -21,9 +22,10 @@
 //! **A script** ([`wrela_chrome::script`]) gives the page trusted input while it runs, and the run
 //! passes only once the script has finished too; a step that fails fails the run.
 
+use crate::loopback::DeadlineIo;
 use crate::{confined, locked, loopback};
 use cap_std::fs::Dir;
-use std::io::{BufReader, Read, Write};
+use std::io::BufReader;
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -46,9 +48,10 @@ const MOST_CONNECTIONS: usize = 64;
 
 /// A page to run.
 pub struct Page<'a> {
-    /// The directory the server serves: the repository.
+    /// The directory the server serves: the repository, or the page's own directory.
     pub root: &'a Path,
-    /// The page's directory, from `root`, with `/` between its parts.
+    /// The page's directory, from `root`, with `/` between its parts; empty: `root` itself is
+    /// the page, at `/`, so nothing beside it is served.
     pub page: &'a str,
     /// The URL's fragment: `#test&frames=...`.
     pub fragment: &'a str,
@@ -148,18 +151,27 @@ fn fresh_results(dir: &Path, opened: &Dir) -> Result<PathBuf, String> {
 /// Runs `page` in Chrome: `Ok` if it put `ok` in `results/DONE` (and its script finished), else
 /// why not.
 pub fn run(page: Page) -> Result<(), String> {
-    if !page.page.split('/').all(|p| !p.is_empty() && p != "." && p != "..") {
-        return Err(format!("a page's directory is a plain path from the root, not {}", page.page));
-    }
-    let dir = page.root.join(page.page);
     let root = Dir::open_ambient_dir(page.root, cap_std::ambient_authority())
         .map_err(|e| format!("{}: {e}", page.root.display()))?;
-    let parts = confined::parts(page.page)?;
-    let opened = confined::open_dir(&root, &parts, false)
-        .map_err(|e| format!("no plain page directory at {}: {e}", dir.display()))?;
+    let (dir, opened, path) = if page.page.is_empty() {
+        let opened = root.try_clone().map_err(|e| format!("{}: {e}", page.root.display()))?;
+        (page.root.to_path_buf(), opened, String::new())
+    } else {
+        if !page.page.split('/').all(|p| !p.is_empty() && p != "." && p != "..") {
+            return Err(format!(
+                "a page's directory is a plain path from the root, not {}",
+                page.page
+            ));
+        }
+        let dir = page.root.join(page.page);
+        let parts = confined::parts(page.page)?;
+        let opened = confined::open_dir(&root, &parts, false)
+            .map_err(|e| format!("no plain page directory at {}: {e}", dir.display()))?;
+        (dir, opened, format!("{}/", page.page))
+    };
     let results = fresh_results(&dir, &opened)?;
-    let server = Server::start(page.root, page.page)?;
-    let url = format!("http://127.0.0.1:{}/{}/{}", server.port, page.page, page.fragment);
+    let server = Server::start(root, page.page)?;
+    let url = format!("http://127.0.0.1:{}/{path}{}", server.port, page.fragment);
     let done = server.done.clone();
     drive(&url, &results, page.timeout, page.script, &|| locked(&done).clone())
 }
@@ -285,8 +297,9 @@ struct Server {
 /// The connections open, by number: what the server's end shuts.
 type Conns = Arc<Mutex<std::collections::HashMap<u64, TcpStream>>>;
 
+/// What every connection's thread shares.
 struct ServerState {
-    dir: Arc<Dir>,
+    dir: Dir,
     port: u16,
     page: String,
     done: Arc<Mutex<Option<String>>>,
@@ -297,26 +310,25 @@ struct ServerState {
 }
 
 impl Server {
-    /// Serves `root` on a free port, watching for `page/results/DONE`.
-    fn start(root: &Path, page: &str) -> Result<Server, String> {
-        Self::start_with(root, page, MOST_CONNECTIONS, REQUEST_DEADLINE)
+    /// Serves the root `dir` on a free port, watching for `page/results/DONE` (`results/DONE`
+    /// with an empty `page`: the root is the page).
+    fn start(dir: Dir, page: &str) -> Result<Server, String> {
+        Self::start_with(dir, page, MOST_CONNECTIONS, REQUEST_DEADLINE)
     }
 
     fn start_with(
-        root: &Path,
+        dir: Dir,
         page: &str,
         most_connections: usize,
         request_deadline: Duration,
     ) -> Result<Server, String> {
-        let dir = Dir::open_ambient_dir(root, cap_std::ambient_authority())
-            .map_err(|e| format!("{}: {e}", root.display()))?;
         let (listener, port) = loopback::listen(0)?;
         listener.set_nonblocking(true).map_err(|e| e.to_string())?;
         let done = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
         let conns = Conns::default();
-        let state = ServerState {
-            dir: Arc::new(dir),
+        let state = Arc::new(ServerState {
+            dir,
             port,
             page: page.to_string(),
             done: done.clone(),
@@ -324,7 +336,7 @@ impl Server {
             conns: conns.clone(),
             most_connections,
             request_deadline,
-        };
+        });
         let thread = std::thread::Builder::new()
             .name("wrela-pages-server".into())
             .spawn(move || accept(&listener, state))
@@ -345,7 +357,7 @@ impl Drop for Server {
     }
 }
 
-fn accept(listener: &TcpListener, state: ServerState) {
+fn accept(listener: &TcpListener, state: Arc<ServerState>) {
     let mut threads: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let mut next = 0u64;
     while !state.stopping.load(Ordering::Acquire) {
@@ -361,19 +373,14 @@ fn accept(listener: &TcpListener, state: ServerState) {
                 let id = next;
                 open.insert(id, kept);
                 drop(open);
-                let (dir, done, page, open) = (
-                    state.dir.clone(),
-                    state.done.clone(),
-                    state.page.clone(),
-                    state.conns.clone(),
-                );
                 let due = Instant::now() + state.request_deadline;
-                let port = state.port;
+                let shared = state.clone();
                 let spawned =
                     std::thread::Builder::new().name("wrela-pages-conn".into()).spawn(move || {
-                        let _ = connection(stream, &dir, port, &page, &done, due);
+                        let s = &shared;
+                        let _ = connection(stream, &s.dir, s.port, &s.page, &s.done, due);
                         // One request a connection: its end is the response's.
-                        if let Some(c) = locked(&open).remove(&id) {
+                        if let Some(c) = locked(&s.conns).remove(&id) {
                             let _ = c.shutdown(Shutdown::Write);
                         }
                     });
@@ -395,41 +402,6 @@ fn accept(listener: &TcpListener, state: ServerState) {
     }
 }
 
-/// A connection whose reads and writes stop at `due`, even when its peer keeps making progress.
-struct DeadlineIo {
-    stream: TcpStream,
-    due: Instant,
-}
-
-impl DeadlineIo {
-    fn left(&self) -> std::io::Result<Duration> {
-        let left = self.due.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "request deadline elapsed"))
-        } else {
-            Ok(left.min(IDLE))
-        }
-    }
-}
-
-impl Read for DeadlineIo {
-    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
-        self.stream.set_read_timeout(Some(self.left()?))?;
-        self.stream.read(bytes)
-    }
-}
-
-impl Write for DeadlineIo {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.stream.set_write_timeout(Some(self.left()?))?;
-        self.stream.write(bytes)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.stream.flush()
-    }
-}
-
 /// Answers one request: a GET of a file, or a PUT of a page's result.
 fn connection(
     stream: TcpStream,
@@ -440,8 +412,8 @@ fn connection(
     due: Instant,
 ) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
-    let mut reader = BufReader::new(DeadlineIo { stream: stream.try_clone()?, due });
-    let mut out = DeadlineIo { stream, due };
+    let mut reader = BufReader::new(DeadlineIo { stream: stream.try_clone()?, due, idle: IDLE });
+    let mut out = DeadlineIo { stream, due, idle: IDLE };
     let Some(head) = loopback::read_head(&mut reader, &mut out, port)? else { return Ok(()) };
     let path = head.path.trim_start_matches('/');
     let Some(decoded) = loopback::decode_path(path) else {
@@ -475,7 +447,10 @@ fn connection(
                 )
             };
             let [above @ .., "results", name] = parts.as_slice() else { return refused(&mut out) };
-            if above.is_empty() || above.iter().any(|p| p.is_empty() || *p == "." || *p == "..") {
+            // The root's own `results/` only when the root is the page.
+            if (above.is_empty() && !page.is_empty())
+                || above.iter().any(|p| p.is_empty() || *p == "." || *p == "..")
+            {
                 return refused(&mut out);
             }
             let Ok(at) = crate::confined::open_dir(dir, above, false) else {
@@ -502,6 +477,10 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
 
+    fn root_dir(root: &Path) -> Dir {
+        Dir::open_ambient_dir(root, cap_std::ambient_authority()).expect("the root")
+    }
+
     fn wait_for_connections(server: &Server, count: usize) {
         let until = Instant::now() + Duration::from_secs(2);
         while locked(&server.conns).len() != count && Instant::now() < until {
@@ -515,7 +494,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("wrela-pages-cap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("p")).expect("page");
-        let server = Server::start_with(&root, "p", 2, Duration::from_secs(2)).expect("server");
+        let server =
+            Server::start_with(root_dir(&root), "p", 2, Duration::from_secs(2)).expect("server");
         let first = TcpStream::connect(("127.0.0.1", server.port)).expect("first");
         let second = TcpStream::connect(("127.0.0.1", server.port)).expect("second");
         wait_for_connections(&server, 2);
@@ -543,7 +523,8 @@ mod tests {
             std::env::temp_dir().join(format!("wrela-pages-deadline-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("p")).expect("page");
-        let server = Server::start_with(&root, "p", 2, Duration::from_millis(100)).expect("server");
+        let server = Server::start_with(root_dir(&root), "p", 2, Duration::from_millis(100))
+            .expect("server");
         let mut slow = TcpStream::connect(("127.0.0.1", server.port)).expect("connect");
         wait_for_connections(&server, 1);
         for _ in 0..12 {
@@ -631,7 +612,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".git")).expect("dirs");
         std::fs::write(root.join("p/index.html"), "<p>hi</p>").expect("page");
         std::fs::write(root.join(".git/config"), "secret").expect("git");
-        let server = Server::start(&root, "p").expect("serve");
+        let server = Server::start(root_dir(&root), "p").expect("serve");
         let port = server.port;
         let get = |path: &str| {
             exchange(port, &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n"))
@@ -650,6 +631,7 @@ mod tests {
             )
         };
         assert!(put("/p/notes.txt", "x").starts_with("HTTP/1.1 403"), "only into results/");
+        assert!(put("/results/x", "x").starts_with("HTTP/1.1 403"), "the root isn't the page");
         assert!(put("/p/results/frame.json", "{}").starts_with("HTTP/1.1 201"));
         assert_eq!(std::fs::read_to_string(root.join("p/results/frame.json")).expect("put"), "{}");
         assert!(locked(&server.done).is_none());
@@ -658,5 +640,43 @@ mod tests {
         drop(server);
         assert!(TcpStream::connect(("127.0.0.1", port)).is_err(), "its port is closed");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A root that is the page (an empty `page`, as a build's checks run it) is served at `/`,
+    /// takes its results and hears their `DONE`, and serves nothing beside it.
+    #[test]
+    fn a_root_that_is_the_page_serves_nothing_beside_it() {
+        let base = std::env::temp_dir().join(format!("wrela-pages-own-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let build = base.join("build");
+        std::fs::create_dir_all(build.join("results")).expect("dirs");
+        std::fs::write(build.join("index.html"), "<p>hi</p>").expect("page");
+        std::fs::write(base.join("beside.txt"), "secret").expect("beside");
+        std::fs::create_dir_all(base.join("other/results")).expect("other");
+        let server = Server::start(root_dir(&build), "").expect("serve");
+        let port = server.port;
+        let ask = |method: &str, path: &str, body: &str| {
+            exchange(
+                port,
+                &format!(
+                    "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ),
+            )
+        };
+        let page = ask("GET", "/", "");
+        assert!(page.starts_with("HTTP/1.1 200") && page.ends_with("<p>hi</p>"), "{page}");
+        for path in ["/../beside.txt", "/%2e%2e/beside.txt", "/..%2fbeside.txt"] {
+            let got = ask("GET", path, "");
+            assert!(!got.starts_with("HTTP/1.1 2") && !got.contains("secret"), "{path}: {got}");
+        }
+        for path in ["/../other/results/x", "/%2e%2e/other/results/x"] {
+            assert!(!ask("PUT", path, "x").starts_with("HTTP/1.1 2"), "{path}");
+        }
+        assert!(!base.join("other/results/x").exists(), "nothing is put beside the page");
+        assert!(ask("PUT", "/results/DONE", "ok\n").starts_with("HTTP/1.1 201"));
+        assert_eq!(locked(&server.done).as_deref(), Some("ok"));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

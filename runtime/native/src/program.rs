@@ -1202,7 +1202,7 @@ pub(crate) fn compile_with(wasm: &[u8], fuel: Option<u64>) -> Result<Compiled> {
     compiled(module, wasm, fuel, None)
 }
 
-/// [`compile_with`], with compiled code kept in the host's private cache (`crate::cache`).
+/// [`compile_with`], with compiled code kept in the host's private cache ([`crate::code`]).
 /// `sidecar` is an optimized build's trap locations, read from beside its WASM
 /// ([`lines::SIDECAR`]).
 pub(crate) fn compile_cached(
@@ -1210,7 +1210,7 @@ pub(crate) fn compile_cached(
     fuel: Option<u64>,
     sidecar: Option<&[u8]>,
 ) -> Result<Compiled> {
-    compiled(crate::cache::module(engine_for(fuel), wasm)?, wasm, fuel, sidecar)
+    compiled(crate::code::module(engine_for(fuel), wasm)?, wasm, fuel, sidecar)
 }
 
 /// A program the tool host drives, whose code `module` is, compiled for [`driven_engine`] from

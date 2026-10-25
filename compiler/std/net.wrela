@@ -496,9 +496,9 @@ impl<S: Reduce<T> + Clone + Pack, T: Clone + Pack> Room<S, T> {
         let id = self.peers[i].id
         if session > self.peers[i].session {
             self.journal(mut out, Record::Session { peer: id, session })
-        } else if !self.ack(i, acked) {
-            self.refuse(mut out, conn, BAD_ACK)
-            return
+        } else {
+            // The checks above leave `acked` below the peer's next counter: `ack` takes it.
+            let _ = self.ack(i, acked)
         }
         // One live connection a peer: an older one is closed.
         self.attach(mut out, conn, i)

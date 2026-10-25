@@ -17,6 +17,7 @@ import {
   STREAM_MAGIC,
   STREAM_VERSION,
   TEXTURE_FORMATS,
+  TEXTURE_KINDS,
   TEXTURE_WRITABLE,
 } from "./abi.gen.ts";
 import { UTF8 } from "./wasm.ts";
@@ -38,8 +39,7 @@ export type Compare = Exclude<(typeof COMPARES)[number], null>;
 export type Binding = { handle: number; offset: number; size: number };
 
 /** A texture's kind (runtime/abi `TextureKind`): WebGPU's dimension name. */
-export type TextureKind = "2d" | "3d" | "2d-array" | "cube";
-const KINDS: readonly TextureKind[] = ["2d", "3d", "2d-array", "cube"];
+export type TextureKind = (typeof TEXTURE_KINDS)[number];
 
 /** One colour target of a pass: a texture's level and layer, or the screen. */
 export type ColorTarget = {
@@ -178,6 +178,21 @@ export type Command =
 export type DrawCommand = Extract<Command, { op: "Draw" | "DrawIndirect" | "DrawIndexed" | "DrawIndexedIndirect" | "MultiDrawIndirect" | "MultiDrawIndexedIndirect" }>;
 export const isDraw = (c: Command): c is DrawCommand =>
   c.op === "Draw" || c.op === "DrawIndirect" || c.op === "DrawIndexed" || c.op === "DrawIndexedIndirect" || c.op === "MultiDrawIndirect" || c.op === "MultiDrawIndexedIndirect";
+/** The buffer an indirect draw reads its arguments from; null for a direct draw. */
+export const argumentsOf = (d: DrawCommand): number | null => (d.op === "Draw" || d.op === "DrawIndexed" ? null : d.arguments);
+/** The buffer an indexed draw reads its indices from; null for a draw that isn't indexed. */
+export function indicesOf(d: DrawCommand): number | null {
+  switch (d.op) {
+    case "DrawIndexed":
+    case "DrawIndexedIndirect":
+      return d.indices;
+    case "MultiDrawIndirect":
+    case "MultiDrawIndexedIndirect":
+      return d.indices === null ? null : d.indices[0];
+    default:
+      return null;
+  }
+}
 
 const NAMES = new Map<number, OpcodeName>(
   (Object.entries(Opcode) as [OpcodeName, number][]).map(([name, value]) => [value, name]),
@@ -392,7 +407,7 @@ export function decode(batch: Bytes): Command[] {
         const writable = (w(3) & TEXTURE_WRITABLE) !== 0;
         const format = TEXTURE_FORMATS[w(3) & ~TEXTURE_WRITABLE];
         if (format === undefined) throw bad("unknown texture format");
-        const kind = KINDS[w(4)];
+        const kind = TEXTURE_KINDS[w(4)];
         if (kind === undefined) throw bad("unknown texture kind");
         const layers = w(5);
         const levels = w(6);
@@ -478,7 +493,7 @@ export function decode(batch: Bytes): Command[] {
         const rect: [number, number, number, number] = [f(0), f(1), f(2), f(3)];
         const minDepth = f(4);
         const maxDepth = f(5);
-        if (!rect.every(Number.isFinite) || rect[2] < 0 || rect[3] < 0) throw bad("a viewport is a finite rectangle of positive size");
+        if (!rect.every(Number.isFinite) || rect[2] < 0 || rect[3] < 0) throw bad("a viewport is a finite rectangle of non-negative size");
         if (!(minDepth >= 0 && minDepth <= 1) || !(maxDepth >= 0 && maxDepth <= 1) || minDepth > maxDepth) throw bad("a viewport's depths are in [0, 1], the least first");
         cmd = { op: name, rect, minDepth, maxDepth };
         break;

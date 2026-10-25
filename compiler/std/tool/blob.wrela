@@ -49,8 +49,7 @@ pub(package) fn write_data(w: mut Writer, data: Data) {
                 panic("more than 512 KiB of bytes in one request: put them in a blob")
             }
             w.write_u8(0)
-            w.write_u32(b.len())
-            w.write_bytes(b)
+            w.write_counted(b)
         },
         Data::Blob(blob) => {
             w.write_u8(1)
@@ -64,8 +63,7 @@ pub(package) fn write_data(w: mut Writer, data: Data) {
 pub(package) fn read_data(r: mut Reader) -> Option<Data> {
     match r.read_u8() {
         Ok(0) => {
-            let Ok(n) = r.read_u32() else { return None }
-            let Ok(bytes) = r.read_bytes(n) else { return None }
+            let Ok(bytes) = r.read_counted() else { return None }
             Some(Data::Bytes(bytes))
         },
         Ok(1) => {

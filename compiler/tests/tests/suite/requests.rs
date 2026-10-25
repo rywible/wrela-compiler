@@ -111,6 +111,45 @@ fn render(level: mut f32, out: mut [f32]) {
     assert!(errors[0].message.contains("`render`"), "{}", errors[0].message);
 }
 
+/// A passkey request names at most 64 credentials (`std::host::MAX_CREDENTIALS`), as many as the
+/// browser host takes: one more panics in the program, saying so, rather than fail in the host.
+#[test]
+fn a_passkey_request_names_at_most_64_credentials() {
+    let text = "use std::host::{PasskeyUser, create_passkey, use_passkey}
+
+fn ids(n: u32) -> Vec<Vec<u8>> {
+    var out: Vec<Vec<u8>> = Vec::new()
+    for i in 0..n {
+        out.push(Vec::from([u8(i)]))
+    }
+    out
+}
+
+pub fn create(n: u32) {
+    let user = PasskeyUser { id: Vec::from([1]), name: String::from(\"a\"), display_name: String::from(\"A\") }
+    let _ = create_passkey(\"wrela.dev\", \"Wrela\", user, [1, 2, 3], ids(n), 1000)
+}
+
+pub fn sign(n: u32) {
+    let _ = use_passkey(\"wrela.dev\", [1, 2, 3], ids(n), 1000)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+";
+    let dir = crate::package("requests-passkeys", text);
+    let out = dir.join("build");
+    wrela_tests::must_build(&dir, &out);
+    for (export, why) in [
+        ("create", "create_passkey: at most 64 credentials to exclude"),
+        ("sign", "use_passkey: at most 64 credentials to allow"),
+    ] {
+        let mut host = wrela_host::CpuHost::load(&out).expect("load");
+        host.call_export(export, &[wrela_host::Value::I32(64)]).expect("64 credentials");
+        let err = host.call_export(export, &[wrela_host::Value::I32(65)]).expect_err("65");
+        assert!(format!("{err:#}").contains(why), "{err:#}");
+    }
+}
+
 /// The clock (`std::time`, M6): it never goes back, and work takes time on it. In a constant it's
 /// the `nondet` effect's error (and in `@deterministic` code: `eff.clock`; parallel work can't
 /// read it either, as it can't be `nondet`).

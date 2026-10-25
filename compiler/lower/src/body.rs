@@ -2752,9 +2752,25 @@ pub(crate) fn lit_const(types: &ir::Types, l: Lit, ty: ir::TypeId) -> Option<ir:
         (Lit::Int(v), ir::Scalar::F16) => ir::Const::F16(v as f32),
         (Lit::Int(v), s) => ir::Const::Small(s, v as i64),
         (Lit::Float(_, f), ir::Scalar::F32) => ir::Const::F32(f),
-        (Lit::Float(_, f), ir::Scalar::F16) => ir::Const::F16(f),
+        (Lit::Float(v, _), ir::Scalar::F16) => ir::Const::F16(nearest_f16(v)),
         (Lit::Float(v, _), _) => ir::Const::F64(v),
     })
+}
+
+/// The half float nearest `v` (ties to even), as the `f32` that holds it exactly. Rounded from
+/// `v` itself: rounding to `f32` first could land on a tie between two halves that `v` isn't
+/// on (1.0004883 rounds to the `f32` halfway between 1 and 1 + 2⁻¹⁰, then to 1). Sema refuses
+/// a literal that would round past the largest half, 65504.
+fn nearest_f16(v: f64) -> f32 {
+    if !v.is_finite() || v == 0.0 {
+        return v as f32;
+    }
+    // The step between halves near `v`: a half has 11 significant bits, so it's 2⁻¹⁰ of the
+    // power of two at or below `v`, and 2⁻²⁴ below the least normal half (2⁻¹⁴). Scaling by a
+    // power of two is exact.
+    let exponent = ((v.abs().to_bits() >> 52) as i32 - 1023).max(-14);
+    let step = 2f64.powi(exponent - 10);
+    ((v / step).round_ties_even() * step) as f32
 }
 
 /// What a built-in function lowers to.

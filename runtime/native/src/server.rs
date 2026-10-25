@@ -252,6 +252,8 @@ pub struct Room {
     serve: TypedFunc<f32, ()>,
     memory: wasmtime::Memory,
     limits: Limits,
+    /// Whether its last call's requests were answered: its next call can read them.
+    answered: bool,
 }
 
 impl Room {
@@ -289,7 +291,7 @@ impl Room {
         let memory = instance
             .get_memory(&mut store, EXPORT_MEMORY)
             .ok_or_else(|| Failure::Host("the program has no memory export".into()))?;
-        let mut room = Room { store, serve, memory, limits };
+        let mut room = Room { store, serve, memory, limits, answered: false };
         if instance.get_export(&mut room.store, EXPORT_SERVE_INIT).is_some() {
             let init = instance
                 .get_typed_func::<(), ()>(&mut room.store, EXPORT_SERVE_INIT)
@@ -319,6 +321,12 @@ impl Room {
     /// How many events wait for its next call.
     pub fn queued(&self) -> usize {
         self.store.data().input.len()
+    }
+
+    /// Whether requests its last call made were answered: its next call can read them, so it
+    /// should come though no event waits.
+    pub fn answered(&self) -> bool {
+        self.answered
     }
 
     /// The network commands of its calls since the last call to this, in order.
@@ -353,6 +361,7 @@ impl Room {
         // messages it was given lose their bytes.
         let s = self.store.data_mut();
         let arriving = std::mem::take(&mut s.arriving);
+        self.answered = !arriving.is_empty();
         s.answered.extend(arriving);
         s.input.end_call();
         result

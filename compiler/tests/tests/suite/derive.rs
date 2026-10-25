@@ -10,7 +10,7 @@ use crate::built;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use wrela_host::{CpuBuild, CpuHost, Host, Value};
-use wrela_tests::{Rng, one_f32, one_u32, par_each, u32s, worse};
+use wrela_tests::{Rng, one_f32, one_u32, par_each, par_map_with, u32s, worse};
 
 /// The corpus, in the order of `with_function` in compiler/tests/fields/main.wrela.
 const NAMES: [&str; 25] = [
@@ -236,16 +236,17 @@ fn the_interval_of_a_vector_is_its_components_on_the_gpu() {
 /// looser than recorded in compiler/tests/fields/tightness.json. `ratio` is the median, over
 /// the boxes, of the interval's width over the spread of the 16 sampled values (1 is as tight
 /// as sampling shows), and `decided` the share of boxes whose interval excludes 0. A ratio that
-/// grows by more than 5%, or a share that falls by more than 0.01, fails; `WRELA_BLESS=1`
-/// records the numbers as they are (after a change that makes them better, say so).
+/// grows by more than 5%, or a share that falls by more than 0.01, fails, as does a record of
+/// other functions than the corpus's; `WRELA_BLESS=1` records the numbers as they are (after a
+/// change that makes them better, say so).
 #[test]
 fn intervals_stay_as_tight_as_recorded() {
     let corpus = CpuBuild::load(built("fields")).expect("load the corpus");
     let boxes = 512;
     let path = wrela_tests::repo_root().join("compiler/tests/fields/tightness.json");
-    let measured: Mutex<Vec<(usize, f64, f64)>> = Mutex::new(Vec::new());
     let fis: Vec<usize> = (0..NAMES.len()).collect();
-    par_each(
+    // Each function's median ratio and share decided, in `NAMES`' order.
+    let measured = par_map_with(
         &fis,
         || corpus.start().expect("start the corpus"),
         |host, &fi| {
@@ -259,18 +260,16 @@ fn intervals_stay_as_tight_as_recorded() {
                 decided += f64::from(d);
             }
             ratios.sort_by(f64::total_cmp);
-            let median = ratios[boxes / 2];
-            measured.lock().unwrap().push((fi, median, decided / boxes as f64));
+            (ratios[boxes / 2], decided / boxes as f64)
         },
     );
-    let mut measured = measured.into_inner().unwrap();
-    measured.sort_by_key(|m| m.0);
-    let now: serde_json::Map<String, serde_json::Value> = measured
+    let now: serde_json::Map<String, serde_json::Value> = NAMES
         .iter()
-        .map(|&(fi, ratio, decided)| {
+        .zip(measured)
+        .map(|(name, (ratio, decided))| {
             let round = |x: f64| if x.is_finite() { (x * 1e4).round() / 1e4 } else { 1e30 };
             (
-                NAMES[fi].to_string(),
+                name.to_string(),
                 serde_json::json!({ "ratio": round(ratio), "decided": round(decided) }),
             )
         })
@@ -288,12 +287,14 @@ fn intervals_stay_as_tight_as_recorded() {
     let recorded: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&path).expect("tightness.json; bless it"))
             .expect("JSON");
+    // Exactly the corpus's functions are recorded: one renamed or removed isn't left behind.
+    let names: std::collections::BTreeSet<&str> = NAMES.iter().copied().collect();
+    let kept: std::collections::BTreeSet<&str> =
+        recorded.as_object().expect("an object").keys().map(String::as_str).collect();
+    assert_eq!(kept, names, "tightness.json records other functions; bless with WRELA_BLESS=1");
     let mut worse_than = Vec::new();
     for (name, v) in &now {
-        let Some(was) = recorded.get(name) else {
-            worse_than.push(format!("{name}: not recorded; bless with WRELA_BLESS=1"));
-            continue;
-        };
+        let was = &recorded[name];
         let (r, d) = (v["ratio"].as_f64().unwrap(), v["decided"].as_f64().unwrap());
         let (r0, d0) = (was["ratio"].as_f64().unwrap(), was["decided"].as_f64().unwrap());
         if r > r0 * 1.05 + 1e-9 {
@@ -308,4 +309,55 @@ fn intervals_stay_as_tight_as_recorded() {
         "intervals are looser than recorded:\n{}",
         worse_than.join("\n")
     );
+}
+
+/// A loop that leaves early on the input runs its count with flags (§14.2), and the flags carry
+/// the input into what the loop writes: the count it returns is a range, 0 where `x > 0` leaves
+/// at once to 4 where it never does, called directly or through another function.
+#[test]
+fn what_a_loop_counts_before_an_early_exit_is_a_range() {
+    let src = "use std::derive::{Interval, interval}
+
+fn count(x: f32) -> f32 {
+    var n = 0.0
+    for _ in 0..4 {
+        if x > 0.0 {
+            break
+        }
+        n += 1.0
+    }
+    n
+}
+
+pub fn direct(lo: f32, hi: f32) -> vec2 {
+    let r = interval(count, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+
+pub fn called(lo: f32, hi: f32) -> vec2 {
+    let r = interval(|x: f32| count(x) * 2.0, Interval { lo, hi })
+    vec2(r.lo, r.hi)
+}
+";
+    let dir = crate::package("derive-early-exit", src);
+    wrela_tests::must_build(&dir, &dir.join("build"));
+    let mut host = CpuBuild::load(dir.join("build")).expect("load").start().expect("start");
+    let mut range = |name: &str, lo: f32, hi: f32| match host
+        .call_export(name, &[Value::F32(lo), Value::F32(hi)])
+        .expect(name)[..]
+    {
+        [Value::F32(lo), Value::F32(hi)] => (f64::from(lo), f64::from(hi)),
+        ref other => panic!("{name} returned {other:?}"),
+    };
+    // Each bound within a hundredth of the counts it holds.
+    let near = |(lo, hi): (f64, f64), (a, b): (f64, f64)| {
+        lo <= a && hi >= b && lo > a - 0.01 && hi < b + 0.01
+    };
+    for (name, k) in [("direct", 1.0), ("called", 2.0)] {
+        let (both, leaves, stays) =
+            (range(name, -1.0, 1.0), range(name, 0.5, 1.0), range(name, -1.0, -0.5));
+        assert!(near(both, (0.0, 4.0 * k)), "{name} over [-1, 1]: {both:?}");
+        assert!(near(leaves, (0.0, 0.0)), "{name} over [0.5, 1]: {leaves:?}");
+        assert!(near(stays, (4.0 * k, 4.0 * k)), "{name} over [-1, -0.5]: {stays:?}");
+    }
 }

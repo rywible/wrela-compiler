@@ -32,6 +32,7 @@ fn start_build(
     start_build_with_origins(name, server, runtime, bounds, wrela_serve::Origins::Local)
 }
 
+/// [`start_build`], taking sessions from the browser origins `origins`.
 fn start_build_with_origins(
     name: &str,
     server: &[u8],
@@ -39,6 +40,22 @@ fn start_build_with_origins(
     bounds: wrela_serve::Bounds,
     origins: wrela_serve::Origins,
 ) -> (u16, [u8; 32], wrela_serve::Server) {
+    let (config, hash) = config(name, server, bounds, origins);
+    let port = config.port;
+    let server = wrela_serve::start_local(config, runtime).expect("the server starts");
+    assert!(server.local_addr().ip().is_loopback(), "the development socket is local");
+    (port, hash, server)
+}
+
+/// The configuration of a server of the server build `server` (its WASM) on a free port, with
+/// `bounds` and `origins` and its data in a fresh directory for `name`; and its development
+/// certificate's hash.
+fn config(
+    name: &str,
+    server: &[u8],
+    bounds: wrela_serve::Bounds,
+    origins: wrela_serve::Origins,
+) -> (wrela_serve::Config, [u8; 32]) {
     let data = crate::scratch_root().join(format!("transport-{name}"));
     let _ = std::fs::remove_dir_all(&data);
     let port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -58,9 +75,7 @@ fn start_build_with_origins(
         bounds,
         origins,
     };
-    let server = wrela_serve::start_local(config, runtime).expect("the server starts");
-    assert!(server.local_addr().ip().is_loopback(), "the development socket is local");
-    (port, hash, server)
+    (config, hash)
 }
 
 /// A peer's session and its stream.
@@ -373,18 +388,8 @@ fn a_browser_origin_must_be_allowed_before_it_joins_a_room() {
 #[test]
 fn an_opaque_browser_origin_cannot_be_configured() {
     let runtime = tokio::runtime::Runtime::new().expect("a runtime");
-    let (identity, _) = wrela_serve::dev_identity().expect("a certificate");
-    let config = wrela_serve::Config {
-        build: Arc::new(ServerBuild::from_wasm(wasm()).expect("a server build")),
-        build_hash: wrela_abi::ticks::wasm_hash(wasm()),
-        data: crate::scratch_root().join("transport-invalid-origin"),
-        services: None,
-        port: 0,
-        identity,
-        limits: Limits::default(),
-        bounds: wrela_serve::Bounds::default(),
-        origins: wrela_serve::Origins::Exact(vec!["null".to_string()]),
-    };
+    let null = wrela_serve::Origins::Exact(vec!["null".to_string()]);
+    let (config, _) = config("invalid-origin", wasm(), wrela_serve::Bounds::default(), null);
     let error = wrela_serve::start(config, &runtime).err().expect("invalid origin is rejected");
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }

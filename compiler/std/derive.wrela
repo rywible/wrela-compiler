@@ -57,13 +57,16 @@ impl Box2 {
         self.lo.x <= p.x && p.x <= self.hi.x && self.lo.y <= p.y && p.y <= self.hi.y
     }
 
-    /// Its four quarters, halved along each axis: lower x and y first, then x before y.
+    /// Its four quarters, halved along each axis at its centre: lower x and y first, then x
+    /// before y. Each quarter's corners are the box's own or its centre, so together they cover
+    /// the box exactly, even one only an `f32` step wide.
     pub fn split(self) -> [Box2; 4] {
-        let h = self.half()
+        let m = self.center()
         var out = [self; 4]
         for j in 0..4 {
-            let o = vec2(f32(j & 1), f32((j >> 1) & 1)) * h
-            out[j] = Box2 { lo: self.lo + o, hi: self.lo + o + h }
+            let (lx, hx) = if j & 1 == 0 { (self.lo.x, m.x) } else { (m.x, self.hi.x) }
+            let (ly, hy) = if j & 2 == 0 { (self.lo.y, m.y) } else { (m.y, self.hi.y) }
+            out[j] = Box2 { lo: vec2(lx, ly), hi: vec2(hx, hy) }
         }
         out
     }
@@ -100,14 +103,18 @@ impl Box3 {
             p.z <= self.hi.z
     }
 
-    /// Its eight octants, halved along each axis: octant `j` is above the centre along x where
-    /// bit 0 of `j` is set, along y where bit 1 is, and along z where bit 2 is.
+    /// Its eight octants, halved along each axis at its centre: octant `j` is above the centre
+    /// along x where bit 0 of `j` is set, along y where bit 1 is, and along z where bit 2 is.
+    /// Each octant's corners are the box's own or its centre, so together they cover the box
+    /// exactly, even one only an `f32` step wide.
     pub fn split(self) -> [Box3; 8] {
-        let h = self.half()
+        let m = self.center()
         var out = [self; 8]
         for j in 0..8 {
-            let o = vec3(f32(j & 1), f32((j >> 1) & 1), f32((j >> 2) & 1)) * h
-            out[j] = Box3 { lo: self.lo + o, hi: self.lo + o + h }
+            let (lx, hx) = if j & 1 == 0 { (self.lo.x, m.x) } else { (m.x, self.hi.x) }
+            let (ly, hy) = if j & 2 == 0 { (self.lo.y, m.y) } else { (m.y, self.hi.y) }
+            let (lz, hz) = if j & 4 == 0 { (self.lo.z, m.z) } else { (m.z, self.hi.z) }
+            out[j] = Box3 { lo: vec3(lx, ly, lz), hi: vec3(hx, hy, hz) }
         }
         out
     }
@@ -462,4 +469,21 @@ fn a_box_splits_into_what_it_holds() {
     assert(q.center() == vec2(1.0, 2.0) && q.half() == vec2(1.0, 2.0))
     assert(q.split()[3].lo == q.center() && q.split()[0].hi == q.center())
     assert(q.contains(vec2(2.0, 4.0)) && !q.contains(vec2(-0.1, 0.0)))
+}
+
+@test
+fn a_box_one_step_wide_splits_into_children_that_keep_its_ends() {
+    // 1 and the next f32 up: halfway between them rounds to 1, so the upper half is the whole step.
+    let next = bitcast_f32(bitcast_u32(1.0) + 1)
+    let b = Box3 { lo: vec3(1.0, 0.0, 0.0), hi: vec3(next, 2.0, 2.0) }
+    let octants = b.split()
+    for j in 0..8 {
+        let o = octants[j]
+        assert(o.lo.x == if j & 1 == 0 { 1.0 } else { b.center().x }, "an octant's low x")
+        assert(o.hi.x == if j & 1 == 0 { b.center().x } else { next }, "an octant's high x")
+    }
+    assert(octants[7].hi == b.hi && octants[0].lo == b.lo)
+    let q = Box2 { lo: vec2(0.0, 1.0), hi: vec2(2.0, next) }
+    let quarters = q.split()
+    assert(quarters[3].hi == q.hi && quarters[2].hi.y == next && quarters[0].lo == q.lo)
 }

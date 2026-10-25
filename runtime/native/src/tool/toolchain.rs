@@ -353,10 +353,7 @@ pub(crate) fn bounded_to(text: &str, most: usize) -> String {
     if text.len() <= most {
         return text.to_string();
     }
-    let mut end = most;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
+    let end = text.floor_char_boundary(most);
     format!("{}… ({} more bytes)", &text[..end], text.len() - end)
 }
 

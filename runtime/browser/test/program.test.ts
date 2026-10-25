@@ -4,13 +4,13 @@ import { describe, expect, spyOn, test } from "bun:test";
 import { AUDIO_CHANNELS, AUDIO_OUT, AUDIO_QUANTUM, EVENT_SIZE, MAX_TICK_RECORDS, PANIC, PAR_SHUTDOWN, RUNNING, SCREEN, STREAM_VERSION, TASK_SLOTS, THREAD_BLOCK_SIZE, THREAD_BLOCKS, THREAD_HELPER0, TICK_RECORDS } from "../src/abi.gen.ts";
 import { CommandError } from "../src/check.ts";
 import { parseManifest } from "../src/manifest.ts";
-import { checkAbi, otherInstance, Program, ProgramError, runWorker, TrapError, trapMessage } from "../src/program.ts";
+import { checkAbi, otherInstance, Program, ProgramError, type ProgramOptions, runWorker, TrapError, trapMessage } from "../src/program.ts";
 import { StateHash } from "../src/hash.ts";
-import { type Command, StreamError } from "../src/stream.ts";
+import { type Command, onePass, StreamError } from "../src/stream.ts";
 import { Lines, locate, wasmOffsets } from "../src/lines.ts";
 import { Net } from "../src/net.ts";
 import { Encoder } from "./encoder.ts";
-import { checker, Recorder, readFixture, readFixtureText, shapes, passOf } from "./fixtures.ts";
+import { checker, Recorder, readFixture, readFixtureText, shapes } from "./fixtures.ts";
 import { batchProgram, buildModule, FRAME_TYPE, type Import, op, SUBMIT } from "./wasm-builder.ts";
 
 const U16 = new Uint8Array(16);
@@ -720,7 +720,7 @@ test("runs without the state hash unless asked", async () => {
 });
 
 test("a frame checks a screen depth target against its current size", async () => {
-  const pass = passOf({ color: SCREEN, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 3, keepDepth: false, clearDepth: 1 });
+  const pass = { ...onePass(SCREEN, false, [0, 0, 0, 1]), depth: 3 };
   const batch = new Encoder().createTexture(3, 64, 63, "depth32float").beginPass(pass).present().finish();
   const p = await load(batchProgram([[batch]]));
   expect(() => p.frame(0, 64, 64)).toThrow("the pass's colour and depth targets differ in size");
@@ -1283,9 +1283,9 @@ test("printed lines are strict UTF-8 and keep a byte-order mark", async () => {
   }
 });
 
-test("a phase validates its memory range and UTF-8 name even though the browser doesn't time it", async () => {
+test("a phase validates its memory range and UTF-8 name, and is timed only when the options ask", async () => {
   const PHASE: Import = { module: "wrela", name: "phase", kind: "func", type: { params: ["i32", "i32"], results: [] } };
-  const program = (ptr: number, len: number, data: Uint8Array[] = []) =>
+  const program = (ptr: number, len: number, data: Uint8Array[] = [], options: ProgramOptions = {}) =>
     Program.load(
       buildModule({
         imports: [PHASE],
@@ -1295,7 +1295,16 @@ test("a phase validates its memory range and UTF-8 name even though the browser 
       }),
       checker(),
       new Recorder(),
+      options,
     );
+  const named = (options: ProgramOptions) => program(16, 3, [new TextEncoder().encode("sim")], options);
+  // A normal run keeps no phases, however many names it makes; test mode keeps them.
+  const normal = await named({});
+  normal.frame(0, 1, 1);
+  expect(normal.takePhases()).toEqual({});
+  const timed = await named({ phases: true });
+  timed.frame(0, 1, 1);
+  expect(Object.keys(timed.takePhases())).toEqual(["sim"]);
   const past = await program(-1, 1);
   expect(() => past.frame(0, 1, 1)).toThrow("phase(4294967295, 1) reaches past the end of the program's memory");
   const malformed = await program(16, 1, [Uint8Array.of(0xff)]);
@@ -1499,6 +1508,25 @@ describe("the checker in release and in test mode", () => {
     }
   });
 
+  test("unchecked, a request still stays in its build, its storage and its origin, and a multi-draw has no count buffer", async () => {
+    const { Opcode } = await import("../src/abi.gen.ts");
+    const cases = [
+      [new Encoder().fetch(1, "../../x").finish(), "Fetch failed: the URL `../../x` has an empty, `.` or `..` part"],
+      [new Encoder().post(1, "//attacker.example/x", new Uint8Array(1)).finish(), "Post failed: the URL `//attacker.example/x` must be relative"],
+      [new Encoder().storageRead(1, "../etc").finish(), "StorageRead failed: the storage path `../etc` has an empty"],
+      [new Encoder().handOver(1, "../../../b").finish(), "HandOver failed: the build path `../../../b` climbs more than one directory"],
+      [new Encoder().hostRequest(1, "net/../x", new Uint8Array(4)).finish(), "HostRequest failed: the host service `net/../x` has an empty"],
+      // Arguments in buffer 2, one draw, its count in buffer 2: the buffers needn't exist.
+      [new Encoder().beginScreenPass([0, 0, 0, 1]).words(Opcode.MultiDrawIndirect, [0, 2, 0, 1, 2, 0, 0, 0]).present().finish(), "MultiDrawIndirect failed: a multi-draw's count buffer isn't supported"],
+    ] as const;
+    for (const [batch, message] of cases) {
+      const executor = new Recorder();
+      const program = await Program.load(batchProgram([[batch]]), checker(), executor, { checking: false });
+      expect(() => program.frame(0, 64, 64)).toThrow(message);
+      expect(executor.log).toEqual([]);
+    }
+  });
+
   test("the sequencer checks either way", async () => {
     const program = await Program.load(batchProgram([[new Encoder().draw(0, 3, 1, [], U16).finish()]]), checker(), new Recorder(), { checking: false });
     expect(() => program.frame(0, 64, 64)).toThrow("out of sequence");
@@ -1506,13 +1534,11 @@ describe("the checker in release and in test mode", () => {
 });
 
 test("several uploads in one call each reach their buffer, though the program overwrites its command memory before returning", async () => {
-  const { FakeDevice, fakeTexture } = await import("./fake-gpu.ts");
-  const { buildPipelines, GpuExecutor } = await import("../src/gpu.ts");
-  const { SCREEN_FORMAT } = await import("../src/abi.gen.ts");
+  const { buildAll, FakeDevice, SCREEN_TARGET } = await import("./fake-gpu.ts");
+  const { GpuExecutor } = await import("../src/gpu.ts");
   const device = new FakeDevice();
-  const m = shapes();
-  const pipelines = await Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => "// fine\n"), SCREEN_FORMAT));
-  const executor = new GpuExecutor(device.gpu, pipelines, { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") });
+  const pipelines = await buildAll(device, shapes());
+  const executor = new GpuExecutor(device.gpu, pipelines, SCREEN_TARGET);
   // Two small writes and a big one between them.
   const want = [
     Uint8Array.from({ length: 8 }, (_, i) => i + 1),

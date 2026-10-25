@@ -17,10 +17,12 @@ use crate::builtins::BuiltinFn;
 use crate::defs::*;
 use crate::mir::{self, Body, Callee, Rvalue, StatementKind, TerminatorKind};
 use crate::program::Program;
+use crate::thir;
 use crate::traits;
 use crate::ty::*;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use wrela_diag::{Diagnostic, Span, codes};
+use wrela_syntax::ast::BinOp;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Effect {
@@ -90,6 +92,8 @@ struct Node {
     /// It calls something whose effects depend on what's instantiated (a trait method of a
     /// generic parameter, a closure or a function passed in): lowering knows them, not this.
     open: bool,
+    /// It can trap where nothing panics ([`may_trap`]).
+    traps: bool,
 }
 
 /// The effect graph of a program's bodies.
@@ -100,6 +104,8 @@ pub struct Effects<'p> {
     all: HashMap<BodyId, Vec<Effect>>,
     /// The bodies that reach a call whose effects aren't known here ([`Node::open`]).
     open: HashSet<BodyId>,
+    /// The bodies that reach a trap ([`Node::traps`]).
+    traps: HashSet<BodyId>,
 }
 
 /// Each body's own effects: where each happens, and what it is. Lowering checks them again for
@@ -166,15 +172,16 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direc
         for (forbids, ctx) in contexts {
             out.extend(fx.report(root, forbids, &ctx, def.sig_span, codes::E0600));
         }
-        // W0011: a test of code passes unless it panics (§13.2), so one that reaches no panic
-        // (no `assert`, no `panic`, no index that can be past an end) passes whatever the code
-        // it runs computes. One that reaches a call whose effects only instantiation knows may
-        // panic there, and isn't reported; neither are frame, tick and tool tests, whose runs
-        // fail in the host too.
+        // W0011: a test of code passes unless it panics or traps (§13.2), so one that reaches
+        // neither (no `assert`, no `panic`, no index that can be past an end, no integer `/` or
+        // `%` that can trap) passes whatever the code it runs computes. One that reaches a call
+        // whose effects only instantiation knows may panic there, and isn't reported; neither
+        // are frame, tick and tool tests, whose runs fail in the host too.
         if def.attrs.test.is_some()
             && def.attrs.test_run.is_none()
             && def.attrs.test_tool.is_none()
             && !fx.open.contains(&root)
+            && !fx.traps.contains(&root)
             && !fx.all.get(&root).is_some_and(|e| e.contains(&Effect::Panic))
             && !p.is_std(def.module)
         {
@@ -183,7 +190,7 @@ pub fn check(p: &Program, mir: &BTreeMap<FnId, Body>) -> (Vec<Diagnostic>, Direc
                     codes::W0011,
                     def.name_span,
                     format!(
-                        "the test `{}` can't fail: nothing it runs asserts or panics",
+                        "the test `{}` can't fail: nothing it runs asserts, panics or traps",
                         def.name
                     ),
                 )
@@ -578,7 +585,13 @@ impl<'p> Effects<'p> {
 
     fn of(p: &'p Program, nodes: BTreeMap<BodyId, Node>) -> Effects<'p> {
         // std functions without bodies here (intrinsics) have their effects by what they are.
-        let mut fx = Effects { p, nodes, all: HashMap::new(), open: Default::default() };
+        let mut fx = Effects {
+            p,
+            nodes,
+            all: HashMap::new(),
+            open: Default::default(),
+            traps: Default::default(),
+        };
         fx.mark_recursion();
         fx.propagate();
         fx
@@ -620,14 +633,15 @@ impl<'p> Effects<'p> {
     }
 
     fn propagate(&mut self) {
-        // Send newly found effects back to callers. Each of the seven effects, and openness,
-        // can reach a body only once; a long chain doesn't require rescanning every body.
+        // Send newly found effects back to callers. Each of the seven effects, openness and a
+        // trap can reach a body only once; a long chain doesn't require rescanning every body.
         // A call to a body that isn't here (an intrinsic) contributes neither.
         let ids: Vec<BodyId> = self.nodes.keys().copied().collect();
         let index: HashMap<BodyId, usize> = ids.iter().enumerate().map(|(i, &b)| (b, i)).collect();
         let mut callers = vec![Vec::new(); ids.len()];
         let mut effects = vec![0u8; ids.len()];
         let mut open = vec![false; ids.len()];
+        let mut traps = vec![false; ids.len()];
         let mut queued = vec![false; ids.len()];
         let mut work = VecDeque::new();
         for (i, b) in ids.iter().enumerate() {
@@ -636,7 +650,8 @@ impl<'p> Effects<'p> {
                 effects[i] |= 1 << e as u8;
             }
             open[i] = node.open;
-            if effects[i] != 0 || open[i] {
+            traps[i] = node.traps;
+            if effects[i] != 0 || open[i] || traps[i] {
                 work.push_back(i);
                 queued[i] = true;
             }
@@ -651,9 +666,11 @@ impl<'p> Effects<'p> {
             for &b in &callers[c] {
                 let combined = effects[b] | effects[c];
                 let is_open = open[b] || open[c];
-                if combined != effects[b] || is_open != open[b] {
+                let trap = traps[b] || traps[c];
+                if combined != effects[b] || is_open != open[b] || trap != traps[b] {
                     effects[b] = combined;
                     open[b] = is_open;
+                    traps[b] = trap;
                     if !queued[b] {
                         queued[b] = true;
                         work.push_back(b);
@@ -670,6 +687,7 @@ impl<'p> Effects<'p> {
             })
             .collect();
         self.open = ids.iter().enumerate().filter(|(i, _)| open[*i]).map(|(_, &b)| b).collect();
+        self.traps = ids.iter().enumerate().filter(|(i, _)| traps[*i]).map(|(_, &b)| b).collect();
     }
 
     /// `f`'s effects, each with why it has it, and whether it calls something whose effects
@@ -937,7 +955,15 @@ fn node(
         }
     }
     for (block_idx, b) in code.blocks.iter().enumerate() {
+        n.traps |= match &b.term.kind {
+            TerminatorKind::ReturnPlace(place) => indexes_may_trap(p, body, place),
+            TerminatorKind::Return(Some(o)) | TerminatorKind::If { cond: o, .. } => {
+                o.place().is_some_and(|place| indexes_may_trap(p, body, place))
+            }
+            _ => false,
+        };
         for (stmt_idx, s) in b.stmts.iter().enumerate() {
+            n.traps |= may_trap(p, body, &s.kind);
             let r = match &s.kind {
                 StatementKind::Assign(place, r) => {
                     index_panics(p, body, place, s.span, &mut n);
@@ -1073,6 +1099,53 @@ fn index_panics(p: &Program, body: &Body, place: &mir::Place, span: Span, n: &mu
         }
         t = mir::proj_ty(p, t, &mut variant, proj);
     }
+}
+
+/// Whether statement `s` can trap where nothing panics (§11.3): an index into an array, a run, a
+/// vector or a matrix, which can be out of range, or an integer `/` or `%`, which traps on 0 and
+/// overflows on -1. A trap isn't an effect (§8.1); W0011 counts it as a way that a test fails.
+fn may_trap(p: &Program, body: &Body, s: &StatementKind) -> bool {
+    let indexes = |place: &mir::Place| indexes_may_trap(p, body, place);
+    let rvalue = |r: &Rvalue| {
+        let mut traps = match r {
+            Rvalue::Binary(BinOp::Div | BinOp::Rem, a, b) => {
+                let int = matches!(
+                    p.types.kind(a.ty),
+                    TyKind::Int(_) | TyKind::Vec(VecElem::I32 | VecElem::U32, _)
+                );
+                // A literal divisor (never negative: a negation is a `Unary`) other than 0
+                // can't trap.
+                let safe = matches!(&b.kind, mir::OperandKind::Const(thir::Lit::Int(v)) if *v > 0);
+                int && !safe
+            }
+            Rvalue::Discriminant(place) | Rvalue::Len(place) => indexes(place),
+            Rvalue::Call(mir::Call { args, .. }) | Rvalue::BorrowStruct { fields: args, .. } => {
+                args.iter().any(|a| a.place().is_some_and(indexes))
+            }
+            _ => false,
+        };
+        r.for_each_operand(&mut |o| traps |= o.place().is_some_and(indexes));
+        traps
+    };
+    match s {
+        StatementKind::Assign(place, r) => indexes(place) || rvalue(r),
+        StatementKind::Eval(r) => rvalue(r),
+        StatementKind::Bind { place, .. } | StatementKind::Check(place) => indexes(place),
+        _ => false,
+    }
+}
+
+/// Whether `place` indexes something whose index out of range traps: anything indexed but a
+/// `Vec` or an arena, whose index panics instead ([`index_panics`]).
+fn indexes_may_trap(p: &Program, body: &Body, place: &mir::Place) -> bool {
+    let mut t = body.local(place.local).ty;
+    let mut variant = None;
+    place.proj.iter().any(|proj| {
+        let traps = matches!(proj, mir::Proj::Index(_))
+            && !matches!(p.lang_of_ty(t), Some(Lang::Vec | Lang::Arena));
+        t = mir::proj_ty(p, t, &mut variant, proj);
+        traps
+    })
 }
 
 /// Whether a value of type `t` may own heap memory.
@@ -1312,7 +1385,11 @@ pub fn inspect() -> f64 {
         for seed in 0..48u32 {
             let mut nodes = BTreeMap::new();
             for i in 0..24u32 {
-                let mut node = Node { open: (i + seed) % 13 == 0, ..Node::default() };
+                let mut node = Node {
+                    open: (i + seed) % 13 == 0,
+                    traps: (i + seed) % 11 == 0,
+                    ..Node::default()
+                };
                 for (j, e) in Effect::ALL.into_iter().enumerate() {
                     if (i * 17 + seed * 7 + j as u32).is_multiple_of(23) {
                         node.direct.push((e, span, String::new()));
@@ -1326,13 +1403,19 @@ pub fn inspect() -> f64 {
                 }
                 nodes.insert(id(i), node);
             }
-            let mut fx = Effects { p: &p, nodes, all: HashMap::new(), open: HashSet::new() };
+            let mut fx = Effects {
+                p: &p,
+                nodes,
+                all: HashMap::new(),
+                open: HashSet::new(),
+                traps: HashSet::new(),
+            };
             fx.propagate();
             for &root in fx.nodes.keys() {
                 let mut seen = HashSet::new();
                 let mut work = vec![root];
                 let mut expected = Vec::new();
-                let mut open = false;
+                let (mut open, mut traps) = (false, false);
                 while let Some(b) = work.pop() {
                     if !seen.insert(b) {
                         continue;
@@ -1340,6 +1423,7 @@ pub fn inspect() -> f64 {
                     if let Some(node) = fx.nodes.get(&b) {
                         expected.extend(node.direct.iter().map(|d| d.0));
                         open |= node.open;
+                        traps |= node.traps;
                         work.extend(node.calls.iter().map(|c| c.0));
                     }
                 }
@@ -1347,6 +1431,7 @@ pub fn inspect() -> f64 {
                 expected.dedup();
                 assert_eq!(fx.all[&root], expected, "seed {seed}, root {root:?}");
                 assert_eq!(fx.open.contains(&root), open, "seed {seed}, root {root:?}");
+                assert_eq!(fx.traps.contains(&root), traps, "seed {seed}, root {root:?}");
             }
         }
     }
@@ -1370,7 +1455,13 @@ pub fn inspect() -> f64 {
                 (id(i), node)
             })
             .collect();
-        let mut fx = Effects { p: &p, nodes, all: HashMap::new(), open: HashSet::new() };
+        let mut fx = Effects {
+            p: &p,
+            nodes,
+            all: HashMap::new(),
+            open: HashSet::new(),
+            traps: HashSet::new(),
+        };
         fx.propagate();
         assert_eq!(fx.open.len(), 256);
         assert!(fx.all.values().all(|effects| effects == &[Effect::Panic]));

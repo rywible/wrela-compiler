@@ -24,16 +24,18 @@
 // - A destroyed buffer or texture is released after the next flush: work recorded before it
 //   still uses it.
 
-import { BLENDS, NONE, SCREEN, SCREEN_FORMAT, TEXTURE_FORMATS, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
-import { blockOf, bytesOf, bytesPerTexel, CommandError, isDepth, sampleType } from "./check.ts";
+import { BLENDS, NONE, SCREEN, SCREEN_FORMAT, UPLOAD_MAX, UPLOAD_START } from "./abi.gen.ts";
+import { blockOf, bytesOf, CommandError, isDepth, levelSize, sampleType } from "./check.ts";
 import { errorMessage } from "./errors.ts";
 import { StateHash } from "./hash.ts";
-import { type Blend, dimensionOf, isDepthBinding, isStorage, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
+import { type Blend, dimensionOf, formatOf, isDepthBinding, isStorage, type Manifest, type Pipeline, type ResourceBinding, type UniformBlock } from "./manifest.ts";
 import {
+  argumentsOf,
   type Binding,
   type Bytes,
   type Command,
   type DrawCommand,
+  indicesOf,
   isDraw,
   joins,
   onePass,
@@ -165,7 +167,6 @@ function colourFormat(b: ResourceBinding): TextureFormat {
   return b.format;
 }
 
-/** Builds pipeline `p` from its WGSL; its screen targets' variants draw in `screenFormat`. */
 /** A shader's WGSL as this browser takes it: the compiler's (naga's, which wgpu's front end
  * parses without the directive) with `enable subgroups;` first when it uses them, which the WGSL
  * spec requires. `enable f16;` the compiler writes itself. */
@@ -173,6 +174,7 @@ export function shaderSource(p: Pipeline, source: string): string {
   return p.requires.includes("subgroups") ? `enable subgroups;\n${source}` : source;
 }
 
+/** Builds pipeline `p` from its WGSL; its screen targets' variants draw in `screenFormat`. */
 async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, screenFormat: GPUTextureFormat): Promise<BuiltPipeline> {
   const fail = (message: string) => new ShaderError(p.name, p.shader, message);
   const visibility =
@@ -303,12 +305,12 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       for (const t of p.targets) {
         // A target the device can't draw into (rg11b10ufloat without its feature) is one the
         // checker refuses a pass of.
-        if (t.colors.some((c) => { const f = TEXTURE_FORMATS.find((x) => x.name === c)!; return !can(device, f.renderable, f.needs.render); })) continue;
+        if (t.colors.some((c) => { const f = formatOf(c); return !can(device, f.renderable, f.needs.render); })) continue;
         // Nor one it can't blend into as the pipeline blends (a 32-bit float target without
         // float32-blendable): the program checks `features()` first, and the checker refuses a
         // draw that doesn't.
         if (t.colors.some((c, k) => {
-          const f = TEXTURE_FORMATS.find((x) => x.name === c)!;
+          const f = formatOf(c);
           return (p.blends[k] ?? "replace") !== "replace" && !can(device, f.blendable, f.needs.blend);
         })) continue;
         const colors = t.screen ? [screenFormat] : (t.colors as GPUTextureFormat[]);
@@ -560,14 +562,12 @@ class Ring {
     this.bytes = new Uint8Array(capacity);
   }
 
-  /** Writes the staged bytes to the buffer, and starts again from 0. */
-  write(queue: GPUQueue, counters?: Counters): void {
+  /** Writes the staged bytes to the buffer, counted in `counters`, and starts again from 0. */
+  write(queue: GPUQueue, counters: Counters): void {
     if (this.used === 0) return;
     queue.writeBuffer(this.buffer, 0, this.bytes, 0, this.used);
-    if (counters) {
-      counters.write_buffers++;
-      counters.write_buffer_bytes += this.used;
-    }
+    counters.write_buffers++;
+    counters.write_buffer_bytes += this.used;
     this.used = 0;
   }
 }
@@ -622,17 +622,31 @@ function sameOffsets(a: readonly number[], b: readonly number[]): boolean {
 /** Most passes timed in one submission: more flush first. */
 const TIMED_PASSES = 256;
 
+/** What `#timestamps` gives an untimed pass: no timestamp writes. */
+const UNTIMED: { timestampWrites?: GPUComputePassTimestampWrites } = Object.freeze({});
+
+/** A program's ask for a label's time (`std::gpu::timed`). */
+interface Ask {
+  label: string;
+  /** Where its `Timed` command ran among the passes and dispatches timed (`Timer.noted` then),
+   * or null until it has run: it times only its label's work after that, in the stream's order. */
+  from: number | null;
+  /** Its answer, once some of that work is read back: the first frame that ran some, and its
+   * nanoseconds there, summed. */
+  time: { frame: number; nanos: number } | null;
+  answer: (bytes: Bytes) => void;
+}
+
 /** Timestamps at each pass's start and end ("timestamp-query"), read back after each
  * submission. */
 class Timer {
   readonly #queries: GPUQuerySet;
   readonly #resolve: GPUBuffer;
-  /** The passes timed in the submission being recorded: their frame and label. */
-  #pending: { frame: number; label: string }[] = [];
+  /** The passes timed in the submission being recorded: their frame, label and place (`noted`). */
+  #pending: { frame: number; label: string; at: number }[] = [];
   /** The first timestamp read, which the others are measured from. */
   #origin: bigint | null = null;
-  /** Each label's latest time: the frame it ran in and its nanoseconds there, summed. */
-  readonly latest = new Map<string, { frame: number; nanos: number }>();
+  #noted = 0;
   /** Called after each readback: what waits for a label's time looks again. */
   onRead: (() => void) | null = null;
   /** The submissions timed so far. */
@@ -646,9 +660,10 @@ class Timer {
   readonly results: GpuTiming[] = [];
 
   /** `keep`: every timing is kept (`settled`), for a run timed from its start; a timer the
-   * program started (`std::gpu::timed`) keeps only each label's latest. */
+   * program started (`std::gpu::timed`) keeps only what answers its `asks`. */
   constructor(
     readonly device: GPUDevice,
+    readonly asks: readonly Ask[],
     readonly keep = true,
   ) {
     this.#queries = device.createQuerySet({ label: "timestamps", type: "timestamp", count: 2 * TIMED_PASSES });
@@ -663,10 +678,15 @@ class Timer {
     return this.#pending.length === TIMED_PASSES;
   }
 
+  /** The passes and dispatches timed so far: where an ask starts (`Ask.from`). */
+  get noted(): number {
+    return this.#noted;
+  }
+
   /** The writes for the next pass. */
   next(frame: number, label: string): GPUComputePassTimestampWrites {
     const i = this.#pending.length;
-    this.#pending.push({ frame, label });
+    this.#pending.push({ frame, label, at: this.#noted++ });
     return { querySet: this.#queries, beginningOfPassWriteIndex: 2 * i, endOfPassWriteIndex: 2 * i + 1 };
   }
 
@@ -692,10 +712,14 @@ class Timer {
           // An end before its start (a clock that wrapped) is taken as the start.
           const end = Math.max(start, Number(b - this.#origin));
           const nanos = end - start;
-          const l = this.latest.get(p.label);
-          if (l === undefined || l.frame < p.frame) this.latest.set(p.label, { frame: p.frame, nanos });
-          else if (l.frame === p.frame) l.nanos += nanos;
-          if (this.keep) this.results.push({ ...p, nanos, start, end, submission });
+          // It counts for each ask of its label made before it, in the first frame with some of
+          // that ask's work (an earlier frame's, read back later, would replace a later one's).
+          for (const ask of this.asks) {
+            if (ask.label !== p.label || ask.from === null || ask.from > p.at) continue;
+            if (ask.time === null || p.frame < ask.time.frame) ask.time = { frame: p.frame, nanos };
+            else if (p.frame === ask.time.frame) ask.time.nanos += nanos;
+          }
+          if (this.keep) this.results.push({ frame: p.frame, label: p.label, nanos, start, end, submission });
         });
         staging.unmap();
       }).finally(() => {
@@ -734,15 +758,12 @@ class Timer {
     for (const f of this.#outstanding.keys()) if (f <= frame) return false;
     return true;
   }
-
-  /** How many readbacks are under way. */
-  get reading(): number {
-    return this.#reading.size;
-  }
 }
 
 export class GpuExecutor {
   readonly #align: number;
+  /** Whether the device draws a multi-draw in one call ("chromium-experimental-multi-draw-indirect"). */
+  readonly #multiDraw: boolean;
   readonly #resources = new Map<number, Resource>();
   #counters: Counters = noCounters();
   /** The bytes of the program's buffers and textures now, and at most so far. */
@@ -769,17 +790,16 @@ export class GpuExecutor {
   #compute: OpenCompute | null = null;
   #pass: OpenPass | null = null;
   /** A pass that ended, not yet recorded: the next pass in its frame continues it if it may join
-   * it, on the same targets, keeping them (`joins`). Not in the serial mode, which times each alone. */
+   * it, on the same targets, keeping them (`joins`), under the same label (a `Label` between
+   * them records this one). Not in the serial mode, which times each alone. */
   #ended: OpenPass | null = null;
   #timer: Timer | null;
-  /** The program's asks for a label's time (`std::gpu::timed`): each one's label, the frame it
-   * was asked in, its answer's resolver, and whether its `Timed` command has run (`active`):
-   * work behind a pipeline being built runs late, and an ask times only what's recorded after
-   * it. */
-  readonly #asked: { label: string; from: number; answer: (bytes: Bytes) => void; active: boolean }[] = [];
+  /** The program's asks for a label's time (`std::gpu::timed`) not yet answered. Each starts
+   * where its `Timed` command runs, which work behind a pipeline being built does late. */
+  readonly #asked: Ask[] = [];
   /** `Timed` commands that ran before their asks arrived (commands run, then their requests
-   * start), by label. */
-  readonly #early = new Map<string, number>();
+   * start), by label: where each ran (`Timer.noted`), oldest first. */
+  readonly #early = new Map<string, number[]>();
   /** A debug build's: the flag its pipelines' bounds checks set (the manifest's `debug_flag`),
    * and the buffer it's read back through, made once. */
   readonly #debugFlag: { buffer: GPUBuffer; readback: GPUBuffer } | null;
@@ -870,6 +890,7 @@ export class GpuExecutor {
     });
     const l = device.limits;
     this.#align = Math.max(l.minUniformBufferOffsetAlignment, l.minStorageBufferOffsetAlignment);
+    this.#multiDraw = device.features.has("chromium-experimental-multi-draw-indirect");
     this.#uniforms = new Ring(
       device,
       "uniform ring",
@@ -877,7 +898,7 @@ export class GpuExecutor {
       RING_START,
     );
     this.#uploads = new Ring(device, "upload ring", GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, UPLOAD_START);
-    this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device) : null;
+    this.#timer = timing !== "off" && device.features.has("timestamp-query") ? new Timer(device, this.#asked) : null;
     this.#debugFlag = debug
       ? {
           buffer: device.createBuffer({ label: "debug flag", size: 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC }),
@@ -916,24 +937,26 @@ export class GpuExecutor {
     return this.#timer !== null;
   }
 
-  /** The GPU time of the passes and dispatches labelled `label` in the first frame from this
-   * one on that runs one, summed: an `f32` of microseconds, once read back. The first ask starts
-   * a timer, on a device with "timestamp-query"; without it, this rejects. Outside a timed run,
-   * only the work of a label asked for and not yet answered is timed (its passes from the ask's
-   * `Timed` command on, in the stream's order, also while commands wait for a pipeline): the
-   * rest runs as untimed, its dispatches sharing a pass. */
+  /** The GPU time of the passes and dispatches labelled `label` that the stream records after
+   * the ask's `Timed` command, in the first frame that runs one, summed: an `f32` of
+   * microseconds, once read back. Work before the command doesn't count, even in its frame, as
+   * on the native host. The first ask starts a timer, on a device with "timestamp-query";
+   * without it, this rejects. Outside a timed run, only the work of a label asked for and not
+   * yet answered is timed (also while commands wait for a pipeline): the rest runs as untimed,
+   * its dispatches sharing a pass. */
   timeLabel(label: string): Promise<Bytes> {
+    // The ask uses up its `Timed` command, if that ran first, even when it's refused.
+    const early = this.#early.get(label);
+    const from = early?.shift() ?? null;
+    if (early?.length === 0) this.#early.delete(label);
     if (this.#timer === null) {
       if (!this.device.features.has("timestamp-query")) {
         return Promise.reject(new Error("this GPU can't time its work: it has no timestamp queries"));
       }
-      this.#timer = new Timer(this.device, false);
+      this.#timer = new Timer(this.device, this.#asked, false);
     }
     this.#timer.onRead ??= () => this.#answerTimes();
-    const early = this.#early.get(label) ?? 0;
-    if (early > 1) this.#early.set(label, early - 1);
-    else this.#early.delete(label);
-    return new Promise((answer) => this.#asked.push({ label, from: this.#frame, answer, active: early > 0 }));
+    return new Promise((answer) => this.#asked.push({ label, from, time: null, answer }));
   }
 
   /** Whether a command recorded in frame `frame` or earlier still waits to run (behind a
@@ -952,18 +975,18 @@ export class GpuExecutor {
     return false;
   }
 
-  /** Answers each ask whose label has been timed in a frame from the one it was asked in, once
-   * that frame has ended and all its timestamps are read: its whole time, not a submission's. */
+  /** Answers each ask some of whose work has been read back (`Ask.time`), once that work's frame
+   * has ended, all its timestamps are read and none of its commands waits: the frame's whole
+   * time, not a submission's. */
   #answerTimes(): void {
     const timer = this.#timer;
     if (timer === null) return;
     for (let i = this.#asked.length - 1; i >= 0; i--) {
       const ask = this.#asked[i]!;
-      if (!ask.active) continue;
-      const l = timer.latest.get(ask.label);
-      if (l === undefined || l.frame < ask.from || l.frame >= this.#frame || !timer.complete(l.frame) || this.#holds(l.frame)) continue;
+      const t = ask.time;
+      if (t === null || t.frame >= this.#frame || !timer.complete(t.frame) || this.#holds(t.frame)) continue;
       this.#asked.splice(i, 1);
-      ask.answer(new Uint8Array(new Float32Array([l.nanos / 1000]).buffer));
+      ask.answer(new Uint8Array(new Float32Array([t.nanos / 1000]).buffer));
     }
   }
 
@@ -983,15 +1006,19 @@ export class GpuExecutor {
    * pass, else only one whose label the program has asked for and not yet had; never flushes. */
   #timestamps(label: string, frame = this.#running?.frame ?? this.frame): { timestampWrites?: GPUComputePassTimestampWrites } {
     const timer = this.#timer;
-    if (timer === null || !(timer.keep || this.#asked.some((a) => a.active && a.label === label))) return {};
+    if (timer === null || !(timer.keep || this.#asked.some((a) => a.from !== null && a.label === label))) return UNTIMED;
     return { timestampWrites: timer.next(frame, label) };
   }
 
   /** Carries out a command that has been decoded, sequenced and checked, or keeps a copy of it
    * for `drain` in the serial mode. Requests are the program's business, except a readback's
-   * copy (`readBack`). */
+   * copy (`readBack`). A pipeline past the manifest's fails at once, unchecked too: a command
+   * that waited for it would wait forever. */
   execute(cmd: Command): void {
     if (this.#retired) throw new Error("host bug: a retired GPU executor received a command");
+    if ("pipeline" in cmd && cmd.pipeline >= this.#pipelines.length) {
+      throw new CommandError(cmd.op, `there's no pipeline ${cmd.pipeline} (the manifest has ${this.#pipelines.length})`);
+    }
     const queue = this.#deferred ?? (this.#waitingAt < this.#waiting.length || !this.#ready(cmd) ? this.#waiting : null);
     if (queue !== null) queue.push({ cmd: copied(cmd), at: { frame: this.#frame, generation: this.#generation } });
     else this.#run(cmd);
@@ -1120,7 +1147,8 @@ export class GpuExecutor {
       const mayJoin = cmd.op === "BeginPass" && generation === this.#ended.at.generation && joins(cmd.pass, this.#ended.pass);
       // Keep both passes until their draws say whether their resource usage scopes can
       // share one WebGPU pass. A kept target alone doesn't make read/write uses compatible.
-      if (!mayJoin && this.#pass === null && cmd.op !== "Label") {
+      // A `Label` records it too, since a pass joins only one of its own label.
+      if (!mayJoin && this.#pass === null) {
         this.#recordEnded();
       }
     }
@@ -1146,7 +1174,7 @@ export class GpuExecutor {
         // A 3D texture (`cmd.layers` texels deep) is sampled and written by kernels, never drawn
         // into; a 2D texture, an array and a cube are 2D textures of `cmd.layers` layers.
         const three = cmd.kind === "3d";
-        const info = TEXTURE_FORMATS.find((f) => f.name === cmd.format)!;
+        const info = formatOf(cmd.format);
         const renderable = !three && can(this.device, info.renderable, info.needs.render);
         const texture = this.device.createTexture({
           label: `texture ${cmd.handle}`,
@@ -1165,7 +1193,7 @@ export class GpuExecutor {
           ...(cmd.kind === "cube" ? { textureBindingViewDimension: "cube" as GPUTextureViewDimension } : {}),
         });
         let bytes = 0;
-        for (let l = 0; l < cmd.levels; l++) bytes += bytesOf(cmd.format, Math.max(1, cmd.width >> l), Math.max(1, cmd.height >> l));
+        for (let l = 0; l < cmd.levels; l++) bytes += bytesOf(cmd.format, ...levelSize(cmd.width, cmd.height, l));
         bytes *= cmd.layers;
         this.#resources.set(cmd.handle, { kind: "texture", texture, format: cmd.format, textureKind: cmd.kind, levels: cmd.levels, bytes, views: new Map() });
         this.#allocated(bytes);
@@ -1267,10 +1295,14 @@ export class GpuExecutor {
         this.#label = cmd.name;
         return;
       case "Timed": {
-        // The ask times its label's work from here on in the stream (`timeLabel`).
-        const ask = this.#asked.find((a) => !a.active && a.label === cmd.label);
-        if (ask !== undefined) ask.active = true;
-        else this.#early.set(cmd.label, (this.#early.get(cmd.label) ?? 0) + 1);
+        // The ask times its label's work from here on in the stream (`timeLabel`). Before a
+        // timer, nothing has been timed, and a timer starts its count at 0.
+        const from = this.#timer?.noted ?? 0;
+        const ask = this.#asked.find((a) => a.from === null && a.label === cmd.label);
+        const early = this.#early.get(cmd.label);
+        if (ask !== undefined) ask.from = from;
+        else if (early !== undefined) early.push(from);
+        else this.#early.set(cmd.label, [from]);
         return;
       }
       case "ReadBuffer":
@@ -1335,8 +1367,6 @@ export class GpuExecutor {
     return this.device.createBuffer({ label: "readback", size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   }
 
-  /** The program's buffers and textures, in bytes: now, and at most so far (test mode's
-   * `memory.json`). */
   /** What it did since the last take (test mode's `counters.json`, a frame each). */
   takeCounters(): Counters {
     const out = this.#counters;
@@ -1344,6 +1374,8 @@ export class GpuExecutor {
     return out;
   }
 
+  /** The program's buffers and textures, in bytes: now, and at most so far (test mode's
+   * `memory.json`). */
   get memory(): { bytes: number; peak: number } {
     return { bytes: this.#bytes, peak: this.#peak };
   }
@@ -1399,8 +1431,7 @@ export class GpuExecutor {
   #passSize(pass: Pass): [number, number] {
     const c = pass.colors[0];
     const t = this.#texture(c === undefined ? pass.depth : c.texture).texture;
-    const level = c?.level ?? 0;
-    return [Math.max(1, t.width >> level), Math.max(1, t.height >> level)];
+    return levelSize(t.width, t.height, c?.level ?? 0);
   }
 
   #texture(handle: number): Extract<Resource, { kind: "texture" }> {
@@ -1576,7 +1607,7 @@ export class GpuExecutor {
           : r.kind === "texture"
             ? viewOf(r, b.offset === 0 ? null : b.offset - 1, b.size === 0 ? null : b.size - 1, dimensionOf(slot.kind) as GPUTextureViewDimension, isStorage(slot.kind))
             : r.sampler;
-      entries.push({ binding: p.bindings[i]!.binding, resource });
+      entries.push({ binding: slot.binding, resource });
     });
     if (p.debugFlag !== null && this.#debugFlag !== null) {
       entries.push({ binding: p.debugFlag, resource: { buffer: this.#debugFlag.buffer } });
@@ -1635,34 +1666,34 @@ export class GpuExecutor {
       this.#counters.bind_groups++;
     }
     this.#counters.dispatches++;
-    const indirect = Array.isArray(groups) ? null : this.#buffer(groups.buffer);
     if (Array.isArray(groups)) pass.dispatchWorkgroups(groups[0], groups[1], groups[2]);
-    else pass.dispatchWorkgroupsIndirect(indirect!, groups.offset);
+    else pass.dispatchWorkgroupsIndirect(this.#buffer(groups.buffer), groups.offset);
     // A timed dispatch's pass ends with it, its timestamps around it alone.
     if (timed.timestampWrites !== undefined) this.#endCompute();
   }
 
-  /** The render pipeline of `index` for these targets: one of the manifest's for it, which the
-   * checker checked, made at load. */
-  #variant(index: number, colors: readonly GPUTextureFormat[], depth: GPUTextureFormat | null): GPURenderPipeline {
-    const p = this.#pipeline(index);
-    const v = p.render?.variants.get(targetsKey(colors, depth));
+  /** The render pipeline of `index` for the targets `key` names (`targetsKey`): one of the
+   * manifest's for it, which the checker checked, made at load. */
+  #variant(index: number, key: string): GPURenderPipeline {
+    const v = this.#pipeline(index).render?.variants.get(key);
     if (v === undefined) throw new Error(`host bug: pipeline ${index} has no variant for its pass's targets`);
     return v;
   }
 
   /** Ends the open pass: on the screen (Present) it's recorded; into textures (EndPass), it
-   * waits for the next command, which may continue it (`joins`), unless the mode is serial. */
+   * waits for the next command, which may continue it (`joins`, the same label), unless the
+   * mode is serial. A pass joins only one of its own label, so its time is that label's. */
   #endPass(op: OpcodeName): void {
     const open = this.#pass;
     this.#pass = null;
     if (open === null) throw new Error(`host bug: ${op} without a pass`);
     const ended = this.#ended;
     if (ended !== null) {
-      if (op === "EndPass" && open.at.generation === ended.at.generation && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
+      const sameFrame = open.at.generation === ended.at.generation;
+      if (op === "EndPass" && sameFrame && open.label === ended.label && joins(open.pass, ended.pass) && this.#compatible(ended, open)) {
         // A pass begins with the whole target its scissor and viewport: where the one it joins
         // set either, the joined draws start from the whole target again.
-        if (ended.draws.some((d) => d.op === "SetScissor" || d.op === "SetViewport")) {
+        if (ended.draws.some((d) => !isDraw(d))) {
           const [width, height] = this.#passSize(ended.pass);
           ended.draws.push({ op: "SetScissor", x: 0, y: 0, width, height });
           ended.draws.push({ op: "SetViewport", rect: [0, 0, width, height], minDepth: 0, maxDepth: 1 });
@@ -1690,7 +1721,7 @@ export class GpuExecutor {
     };
     const lists = earlier.uses ? [next.draws] : [earlier.draws, next.draws];
     for (const draws of lists) for (const draw of draws) {
-      if (draw.op === "SetScissor" || draw.op === "SetViewport") continue;
+      if (!isDraw(draw)) continue;
       const pipeline = this.#pipeline(draw.pipeline);
       for (const [i, binding] of draw.bindings.entries()) {
         const kind = pipeline.bindings[i]!.kind;
@@ -1698,9 +1729,10 @@ export class GpuExecutor {
           if (!use(binding.handle, kind === "read_write" || isStorage(kind) ? 2 : 1)) return false;
         }
       }
-      if (draw.op !== "Draw" && draw.op !== "DrawIndexed" && !use(draw.arguments, 1)) return false;
-      if ((draw.op === "DrawIndexedIndirect" || draw.op === "DrawIndexed") && !use(draw.indices, 1)) return false;
-      if ((draw.op === "MultiDrawIndirect" || draw.op === "MultiDrawIndexedIndirect") && draw.indices !== null && !use(draw.indices[0], 1)) return false;
+      const args = argumentsOf(draw);
+      if (args !== null && !use(args, 1)) return false;
+      const indices = indicesOf(draw);
+      if (indices !== null && !use(indices, 1)) return false;
     }
     earlier.uses = usage;
     return true;
@@ -1724,19 +1756,21 @@ export class GpuExecutor {
     });
     const depth = pass.depth === NONE ? null : this.#texture(pass.depth);
     const depthView = depth === null ? null : viewOf(depth, 0, pass.depthLayer, "2d", false);
-    const formats = colors.map((c) => c.format);
+    const key = targetsKey(colors.map((c) => c.format), depth?.format ?? null);
     // Everything that can flush happens before anything is recorded for this pass.
     this.#reserveTimestamps();
     this.#reserve(op, open.draws.reduce((n, d) => n + (isDraw(d) ? alignTo(d.uniforms.length, this.#align) : 0), 0));
     // And everything that can throw: a pass begun is ended.
     const draws = open.draws.map((d) => {
       if (!isDraw(d)) return { draw: d, pipeline: null, group: null, args: null, indices: null };
-      const indices = d.op === "DrawIndexedIndirect" || d.op === "DrawIndexed" ? this.#buffer(d.indices) : (d.op === "MultiDrawIndirect" || d.op === "MultiDrawIndexedIndirect") && d.indices !== null ? this.#buffer(d.indices[0]) : null;
+      const i = indicesOf(d);
+      const indices = i === null ? null : this.#buffer(i);
+      const a = argumentsOf(d);
       return {
         draw: d,
-        pipeline: this.#variant(d.pipeline, formats, (depth?.format as GPUTextureFormat | undefined) ?? null),
+        pipeline: this.#variant(d.pipeline, key),
         group: this.#bindGroup(d.pipeline, d.bindings),
-        args: d.op === "Draw" || d.op === "DrawIndexed" ? null : this.#buffer(d.arguments),
+        args: a === null ? null : this.#buffer(a),
         indices,
       };
     });
@@ -1761,7 +1795,9 @@ export class GpuExecutor {
             },
           }),
     });
-    const multi = this.device.features.has("chromium-experimental-multi-draw-indirect");
+    // The device's multi-draw, which WebGPU's types don't have yet; null without it.
+    const maybe = rp as Partial<MultiDrawPass>;
+    const multi = this.#multiDraw && maybe.multiDrawIndirect && maybe.multiDrawIndexedIndirect ? (rp as MultiDrawPass) : null;
     const counted = this.#counters;
     counted.render_passes++;
     let lastPipeline: GPURenderPipeline | null | undefined;
@@ -1792,7 +1828,7 @@ export class GpuExecutor {
       }
       const many = d.op === "MultiDrawIndirect" || d.op === "MultiDrawIndexedIndirect";
       counted.draws += many ? d.count : 1;
-      counted.draw_calls += many && !multi ? d.count : 1;
+      counted.draw_calls += many && multi === null ? d.count : 1;
       switch (d.op) {
         case "Draw":
           rp.draw(d.vertices, d.instances);
@@ -1814,12 +1850,8 @@ export class GpuExecutor {
           if (indexed) rp.setIndexBuffer(indices!, "uint32", d.indices![1], d.indices![2]);
           // With the device's multi-draw, one call; without it, one draw each, which draws the
           // same (the program doesn't change).
-          const encoder = rp as GPURenderPassEncoder & {
-            multiDrawIndirect?(b: GPUBuffer, o: number, n: number): void;
-            multiDrawIndexedIndirect?(b: GPUBuffer, o: number, n: number): void;
-          };
-          if (multi && indexed && encoder.multiDrawIndexedIndirect) encoder.multiDrawIndexedIndirect(args!, d.offset, d.count);
-          else if (multi && !indexed && encoder.multiDrawIndirect) encoder.multiDrawIndirect(args!, d.offset, d.count);
+          if (multi !== null && indexed) multi.multiDrawIndexedIndirect(args!, d.offset, d.count);
+          else if (multi !== null) multi.multiDrawIndirect(args!, d.offset, d.count);
           else {
             const stride = indexed ? 20 : 16;
             for (let k = 0; k < d.count; k++) {
@@ -1838,6 +1870,12 @@ export class GpuExecutor {
     }
   }
 }
+
+/** A render pass with Chromium's multi-draw ("chromium-experimental-multi-draw-indirect"). */
+type MultiDrawPass = GPURenderPassEncoder & {
+  multiDrawIndirect(b: GPUBuffer, o: number, n: number): void;
+  multiDrawIndexedIndirect(b: GPUBuffer, o: number, n: number): void;
+};
 
 /** A pass between its beginning and `Present` or `EndPass`, its name and the frame it belongs to. */
 type OpenPass = { pass: Pass; draws: PendingDraw[]; label: string | null; at: RecordedIn; uses?: Map<number, number> };

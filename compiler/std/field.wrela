@@ -92,7 +92,7 @@ pub trait Surface: Copy + GpuData {
             return x
         }
         let r = l * 0.5 * length(b.hi - b.lo)
-        let d = self.distance(0.5 * (b.lo + b.hi))
+        let d = self.distance(b.center())
         Interval { lo: max(x.lo, d - r), hi: min(x.hi, d + r) }
     }
 
@@ -357,7 +357,7 @@ pub fn back<S: Surface>(field: S, x: f32, y: f32) -> f32 {
 /// is that point's; where the surface fills the region's edge, it's the edge. -10⁹ if the
 /// region holds no surface.
 pub fn farthest<S: Surface>(field: S, dir: vec3, region: Box3) -> f32 {
-    let c = 0.5 * (region.lo + region.hi)
+    let c = region.center()
     let e = region.hi - region.lo
     let reach = length(e)
     // Two axes across `dir`.

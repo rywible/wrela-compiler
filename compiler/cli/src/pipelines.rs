@@ -11,7 +11,7 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(a) => a,
         Err(status) => return status,
     };
-    let out = wrela_driver::check(&args.dir);
+    let out = wrela_driver::check_pipelines(&args.dir);
     if out.has_errors() {
         crate::report(&out, args.json);
         return ExitCode::from(1);
@@ -39,7 +39,8 @@ fn by_entry(pipelines: &[PipelineSummary]) -> Vec<(&str, Vec<&PipelineSummary>)>
     out
 }
 
-/// The report for people.
+/// The report for people. A site with no [`PipelineSummary::conditional`] (a compile other than
+/// `check_pipelines`) is shown without one.
 pub fn text(pipelines: &[PipelineSummary]) -> String {
     let entries = by_entry(pipelines);
     let mut s = format!(
@@ -58,10 +59,11 @@ pub fn text(pipelines: &[PipelineSummary]) -> String {
                 "  {} ({}), {verb} at {}\n",
                 p.entries.join(" + "),
                 p.kind,
-                p.sites
-                    .iter()
-                    .zip(&p.conditional)
-                    .map(|(s, &c)| if c { format!("{s} (under a condition)") } else { s.clone() })
+                (p.sites.iter().enumerate())
+                    .map(|(i, s)| match p.conditional.get(i) {
+                        Some(true) => format!("{s} (under a condition)"),
+                        _ => s.clone(),
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -92,4 +94,23 @@ pub fn json(pipelines: &[PipelineSummary]) -> String {
         .map(|(n, ps)| format!("{{\"name\": {}, \"instantiations\": {}}}", q(n), ps.len()))
         .collect();
     format!("{{\"pipelines\": [{}], \"entry_points\": [{}]}}\n", ps.join(", "), es.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sites_show_without_their_conditions() {
+        let p = PipelineSummary {
+            kind: "compute",
+            entries: vec!["fill".into()],
+            names: vec!["fill".into()],
+            sites: vec!["main.wrela:3:5".into(), "main.wrela:9:5".into()],
+            conditional: Vec::new(),
+        };
+        assert!(text(std::slice::from_ref(&p)).contains("at main.wrela:3:5, main.wrela:9:5\n"));
+        let p = PipelineSummary { conditional: vec![false, true], ..p };
+        assert!(text(&[p]).contains("at main.wrela:3:5, main.wrela:9:5 (under a condition)\n"));
+    }
 }

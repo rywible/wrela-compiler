@@ -10,16 +10,19 @@
 
 use std::abi::{REQUEST_FAILED, REQUEST_MISSING, REQUEST_PENDING}
 
+// `IoError::message`'s words.
+const MISSING: Text = "nothing is stored there"
+const FAILED: Text = "the host couldn't answer the request"
+
 /// Why a request failed.
 pub struct IoError: Clone {
-    message: String,
     missing: bool,
 }
 
 impl IoError {
-    /// What the host said, in its words.
+    /// What went wrong, in words.
     pub fn message(self) -> borrow str {
-        self.message
+        if self.missing { MISSING } else { FAILED }
     }
 
     /// Whether it was a `load` of a path that holds nothing: nothing was ever stored there. Any
@@ -59,11 +62,7 @@ impl<T: Plain> Pending<T> {
         if status == REQUEST_FAILED || status == REQUEST_MISSING {
             // Forgets the request.
             let _gone: Vec<u8> = Vec::from_answer(self.request, 0)
-            let missing = status == REQUEST_MISSING
-            let message = if missing { "nothing is stored there" } else {
-                "the host couldn't answer the request"
-            }
-            return Some(Err(IoError { message: String::from(message), missing }))
+            return Some(Err(IoError { missing: status == REQUEST_MISSING }))
         }
         Some(Ok(Vec::from_answer(self.request, u32(status))))
     }
@@ -179,7 +178,8 @@ pub fn print(line: str) {
 @intrinsic
 pub(package) fn next_request() -> u32 {}
 
-/// -1 while request `request` is pending, -2 if it failed, else its answer's length in bytes.
+/// -1 while request `request` is pending, -2 if it failed, -3 if a load found nothing stored, else
+/// its answer's length in bytes.
 @intrinsic
 pub(package) fn request_status(request: u32) -> i32 {}
 

@@ -105,6 +105,26 @@ describe("frames", () => {
     // Another connection can consume the remaining budget while this frame is incomplete.
     expect(() => partial.push(Uint8Array.of(8, 9), OVERHEAD + 2)).toThrow(`more than ${HELD} bytes`);
   });
+
+  test("a frame past the budget is refused at its length, before its body is allocated", () => {
+    const prefix = frame(new Uint8Array(MAX_FRAME)).subarray(0, 3);
+    const allocated: number[] = [];
+    const Bytes = globalThis.Uint8Array;
+    globalThis.Uint8Array = new Proxy(Bytes, {
+      construct(target, args) {
+        if (typeof args[0] === "number") allocated.push(args[0]);
+        return Reflect.construct(target, args);
+      },
+    });
+    try {
+      expect(() => new Frames().push(prefix, OVERHEAD + MAX_FRAME - 1)).toThrow(`more than ${HELD} bytes`);
+      expect(allocated).not.toContain(MAX_FRAME);
+      expect(new Frames().push(prefix, OVERHEAD + MAX_FRAME)).toEqual([]);
+      expect(allocated).toContain(MAX_FRAME);
+    } finally {
+      globalThis.Uint8Array = Bytes;
+    }
+  });
 });
 
 describe("connections", () => {

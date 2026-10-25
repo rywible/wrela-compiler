@@ -294,14 +294,14 @@ fn the_export_rejects_package_names_that_escape_its_directory() {
 }
 
 #[test]
-fn the_export_reserves_spec_and_std_on_case_insensitive_filesystems() {
+fn the_export_reserves_spec_std_and_builtins_on_case_insensitive_filesystems() {
     let root = shapes("doc-export-spec-name");
     std::fs::write(
         root.join("fixture/lexical.wrela"),
         "/// A package page with the spec's path.\npub fn example() -> u32 { 1 }\n",
     )
     .expect("package page");
-    for name in ["spec", "Spec", "std", "Std"] {
+    for name in ["spec", "Spec", "std", "Std", "builtins", "Builtins"] {
         std::fs::write(root.join("fixture/wrela.toml"), common::manifest(name))
             .expect("package manifest");
         let out = export(&root, "out", &[]);

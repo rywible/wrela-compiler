@@ -44,22 +44,13 @@ use wrela_host::{GpuTiming, Host, Options, Timing};
 mod chrome;
 mod comparison;
 
-/// The executor's counters, in the order reports list them (`wrela_host::Counters`, and the
-/// browser's `counters.json`).
-const COUNTERS: [&str; 10] = [
-    "compute_passes",
-    "render_passes",
-    "dispatches",
-    "draws",
-    "draw_calls",
-    "write_buffers",
-    "write_buffer_bytes",
-    "write_textures",
-    "bind_groups",
-    "pipelines",
-];
+/// The executor's counters' names, in the order reports list them (`wrela_host::Counters`, and
+/// the browser's `counters.json`).
+fn counter_names() -> impl Iterator<Item = &'static str> {
+    wrela_host::Counters::default().fields().into_iter().map(|(name, _)| name)
+}
 
-pub(crate) use comparison::build_hash;
+pub(crate) use comparison::{Storage, build_hash, overwritten_by};
 
 struct Args {
     dir: PathBuf,
@@ -177,7 +168,7 @@ struct Profile {
     frame: Times,
     /// Chrome's: the interval between paced frames, ms, as a player sees them.
     interval: Option<Times>,
-    /// Each executor counter's median a frame, in [`COUNTERS`]' order.
+    /// Each executor counter's median a frame, in [`counter_names`]' order.
     counters: Vec<(&'static str, f64)>,
     phases: wrela_host::Traced,
     /// Each pipeline's name and WGSL bytes, the largest first.
@@ -310,34 +301,13 @@ fn run_report(a: &Args) -> Result<String, String> {
             std::fs::create_dir(storage).map_err(|e| e.to_string())?;
             measure(a, &mut host, &script, dir, &environment, &workload)
         };
-        let env = environment.clone();
-        return comparison::run(a, &mut sample, &built, &|| Ok(env.clone()), &workload);
+        return comparison::run(a, &mut sample, &built, &|| Ok(environment.clone()), &workload);
     }
     let p = measure(a, &mut host, &script, &built, &environment, &workload)?;
     if p.build_sha256 != frozen {
         return Err("build changed during measurement; discard this run".into());
     }
     Ok(if a.json { json(a, &p, baseline.as_ref()) } else { text(a, &p, baseline.as_ref()) })
-}
-
-/// A package built as `wrela build` builds it (`--optimize`d, if the profile is), into
-/// `build/profile`.
-fn build_into(
-    dir: &Path,
-    optimize: Option<wrela_driver::optimize::Level>,
-) -> Result<PathBuf, String> {
-    let built = dir.join("build").join("profile");
-    crate::generated_path(dir, &built)?;
-    let mut out = wrela_driver::build(dir);
-    if let Some(level) = optimize
-        && !out.has_errors()
-    {
-        crate::build::optimized_with(&mut out.files, |wasm| {
-            wrela_driver::optimize::optimize(wasm, level)
-        })?;
-    }
-    crate::write_build(&out, &built)?;
-    Ok(built)
 }
 
 /// A package built as `wrela build` builds it (into `build/profile`) and loaded on the native
@@ -348,33 +318,40 @@ fn load(
     options: &Options,
     optimize: Option<wrela_driver::optimize::Level>,
 ) -> Result<(Host, Vec<Scripted>, PathBuf), String> {
-    let built = build_into(dir, optimize)?;
+    let built = crate::build_into(dir, "profile", optimize)?;
     let script = crate::read_script(input)?;
     let host = Host::load_with(&built, options).map_err(|e| e.to_string())?;
     Ok((host, script, built))
 }
 
+/// Copies the input script `from` (`--input`), if there's one, to `dir/input.json`, where test
+/// mode reads it beside the page: as a new file, so a link there is replaced, never followed.
+fn place_input(from: Option<&Path>, dir: &Path) -> Result<(), String> {
+    let Some(from) = from else { return Ok(()) };
+    let bytes = std::fs::read(from)
+        .map_err(|e| format!("can't read the input script {}: {e}", from.display()))?;
+    let to = dir.join("input.json");
+    let cant = |e: std::io::Error| format!("can't copy the input script to {}: {e}", to.display());
+    match std::fs::remove_file(&to) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(cant(e)),
+        _ => {}
+    }
+    let mut file =
+        std::fs::OpenOptions::new().write(true).create_new(true).open(&to).map_err(cant)?;
+    std::io::Write::write_all(&mut file, &bytes).map_err(cant)
+}
+
 /// `--chrome`'s report: the build measured in headless Chrome (`profile/chrome.rs`).
 fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String> {
-    let built = build_into(&a.dir, a.optimize)?;
+    let built = crate::build_into(&a.dir, "profile", a.optimize)?;
     let script = crate::read_script(a.input.as_deref())?;
     let workload = comparison::workload(a, &script);
-    // Test mode reads the script beside the page.
-    let place_input = |dir: &Path| -> Result<(), String> {
-        match &a.input {
-            Some(from) => std::fs::copy(from, dir.join("input.json"))
-                .map(|_| ())
-                .map_err(|e| format!("can't copy the input script: {e}")),
-            None => Ok(()),
-        }
-    };
-    let input = a.input.is_some();
     let frozen = comparison::build_hash(&built)?;
     if a.compare.is_some() {
         let device = std::cell::RefCell::new(serde_json::Value::Null);
         let mut sample = |dir: &Path| -> Result<Profile, String> {
-            place_input(dir)?;
-            let (p, d) = chrome::measure(a, dir, input)?;
+            place_input(a.input.as_deref(), dir)?;
+            let (p, d) = chrome::measure(a, dir)?;
             *device.borrow_mut() = d;
             Ok(p)
         };
@@ -386,8 +363,8 @@ fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String
             &workload,
         );
     }
-    place_input(&built)?;
-    let (mut p, device) = chrome::measure(a, &built, input)?;
+    place_input(a.input.as_deref(), &built)?;
+    let (mut p, device) = chrome::measure(a, &built)?;
     let environment = chrome::environment(&device)?;
     if let Some(b) = baseline {
         comparison::compatible_hardware(&b.environment, &environment)?;
@@ -395,7 +372,7 @@ fn chrome_report(a: &Args, baseline: Option<&Baseline>) -> Result<String, String
     }
     p.environment = environment;
     p.workload = workload;
-    if p.build_sha256 != frozen || comparison::build_hash(&built)? != frozen {
+    if p.build_sha256 != frozen {
         return Err("build changed during measurement; discard this run".into());
     }
     Ok(if a.json { json(a, &p, baseline) } else { text(a, &p, baseline) })
@@ -428,10 +405,9 @@ fn measure(
         calls.push(t.elapsed().as_secs_f64() * 1e3);
         counted.push(host.take_counters());
     }
-    let counters = COUNTERS
-        .iter()
+    let counters = counter_names()
         .enumerate()
-        .map(|(i, &name)| {
+        .map(|(i, name)| {
             let xs = counted.iter().map(|c| c.fields()[i].1 as f64).collect();
             (name, median(xs).unwrap_or(0.0))
         })
@@ -712,6 +688,23 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_input_script_replaces_a_link_and_leaves_where_it_led() {
+        let d = std::env::temp_dir().join(format!("wrela-profile-input-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("baseline")).expect("baseline");
+        std::fs::write(d.join("replay.json"), "[]").expect("script");
+        std::fs::write(d.join("other.json"), "keep").expect("other file");
+        let to = d.join("baseline/input.json");
+        std::os::unix::fs::symlink(d.join("other.json"), &to).expect("link");
+        place_input(Some(&d.join("replay.json")), &d.join("baseline")).expect("placed");
+        assert_eq!(std::fs::read_to_string(d.join("other.json")).expect("other file"), "keep");
+        assert!(!std::fs::symlink_metadata(&to).expect("input").file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(&to).expect("input"), "[]");
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     fn baseline(serial: bool) -> Baseline {
         Baseline {

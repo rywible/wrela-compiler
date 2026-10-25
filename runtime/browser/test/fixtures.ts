@@ -2,7 +2,7 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { MANIFEST_VERSION, NONE, SCREEN_FORMAT, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
+import { MANIFEST_VERSION, SCREEN_FORMAT, STREAM_VERSION, TEXTURE_FORMATS } from "../src/abi.gen.ts";
 import { Checker } from "../src/check.ts";
 import { type Manifest, type RenderTarget, validateManifest } from "../src/manifest.ts";
 import type { Executor } from "../src/program.ts";
@@ -52,20 +52,6 @@ export function everyTarget(): RenderTarget[] {
     { colors: [], depth: true, screen: false },
     ...[false, true].map((depth): RenderTarget => ({ colors: [SCREEN_FORMAT], depth, screen: true })),
   ];
-}
-
-/** A pass into one colour target, as the old tests wrote them: `color` (or SCREEN or NONE),
- * cleared to `clear` or kept, and `depth` (or NONE). */
-export function passOf(o: { color: number; keepColor?: boolean; join?: boolean; clear?: [number, number, number, number]; depth?: number; keepDepth?: boolean; clearDepth?: number }): Pass {
-  const clear = o.clear ?? [0, 0, 0, 1];
-  return {
-    colors: o.color === NONE ? [] : [{ texture: o.color, level: 0, layer: 0, keep: o.keepColor ?? false, clear }],
-    join: o.join ?? false,
-    depth: o.depth ?? NONE,
-    depthLayer: 0,
-    keepDepth: o.keepDepth ?? false,
-    clearDepth: o.clearDepth ?? 1,
-  };
 }
 
 /** Pipeline 0 renders and pipeline 1 computes; each takes 16 uniform bytes and binds a read-only

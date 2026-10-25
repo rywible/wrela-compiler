@@ -266,18 +266,20 @@ fn unpack_with_limit(bytes: &[u8], dir: &Path, limit: u64) -> Result<(), String>
     std::fs::create_dir_all(dir).map_err(|e| format!("can't make `{}`: {e}", dir.display()))?;
     let gz = flate2::read::GzDecoder::new(bytes);
     let mut archive = tar::Archive::new(gz.take(limit + 1));
-    let unpacked = archive.unpack(dir);
+    let unpacked =
+        archive.unpack(dir).map_err(|e| format!("can't unpack the toolchain's tarball: {e}"));
     let mut remaining = archive.into_inner();
+    // What follows the archive must be gzip too. A drain that reaches the limit stops there
+    // without an error, so one check of the limit covers the unpack and the drain.
+    let drained = unpacked.and_then(|()| {
+        std::io::copy(&mut remaining, &mut std::io::sink())
+            .map(drop)
+            .map_err(|e| format!("the toolchain's tarball isn't gzip: {e}"))
+    });
     if remaining.limit() == 0 {
         return Err("the toolchain's tarball expands beyond the size limit".into());
     }
-    unpacked.map_err(|e| format!("can't unpack the toolchain's tarball: {e}"))?;
-    std::io::copy(&mut remaining, &mut std::io::sink())
-        .map_err(|e| format!("the toolchain's tarball isn't gzip: {e}"))?;
-    if remaining.limit() == 0 {
-        return Err("the toolchain's tarball expands beyond the size limit".into());
-    }
-    Ok(())
+    drained
 }
 
 /// Builds the checkout `dir`'s toolchain with Cargo: its `wrela`.

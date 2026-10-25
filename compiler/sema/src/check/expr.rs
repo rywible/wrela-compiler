@@ -763,7 +763,7 @@ impl<'p> Checker<'p> {
                             name.name
                         ),
                     )
-                    .with_help(format!("`wrela doc {}` lists what it has", self.display(ty))),
+                    .with_help(format!("`wrela doc {}` lists what it has", self.doc_name(ty))),
                 );
                 self.error_expr(span)
             }
@@ -1467,19 +1467,21 @@ impl<'p> Checker<'p> {
             (TyKind::Tuple(ts), ast::FieldName::Index(i, s)) => match ts.get(*i as usize) {
                 Some(&t) => Expr { ty: t, span, kind: ExprKind::Field(Box::new(b), *i) },
                 None => {
+                    let (has, help) = match ts.len() {
+                        0 => ("no elements".into(), format!("`()` holds nothing: remove `.{i}`")),
+                        1 => ("1 element".into(), "its only element is `.0`".into()),
+                        n => (
+                            format!("{n} elements"),
+                            format!("its elements are `.0` to `.{}`", n - 1),
+                        ),
+                    };
                     self.err(
                         Diagnostic::new(
                             codes::E0206,
                             *s,
-                            format!(
-                                "this tuple has {} elements, so `.{i}` doesn't exist",
-                                ts.len()
-                            ),
+                            format!("this tuple has {has}, so `.{i}` doesn't exist"),
                         )
-                        .with_help(format!(
-                            "its elements are `.0` to `.{}`",
-                            ts.len().saturating_sub(1)
-                        )),
+                        .with_help(help),
                     );
                     self.error_expr(span)
                 }
@@ -2760,22 +2762,7 @@ impl<'p> Checker<'p> {
                 Some((ps.clone(), *r, *flags))
             }
             Some(TyKind::FnPtr(ps, _, _)) => {
-                self.err(
-                    Diagnostic::new(
-                        codes::E0301,
-                        span,
-                        format!(
-                            "this closure takes {} parameters, but {} are expected",
-                            params.len(),
-                            ps.len()
-                        ),
-                    )
-                    .with_help(format!(
-                        "write {} parameters, as in `|{}| ...`",
-                        ps.len(),
-                        (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
-                    )),
-                );
+                self.err(closure_arity(span, params.len(), ps.len()));
                 None
             }
             // Expected where a type failed (its error is reported): the closure's unannotated
@@ -2848,6 +2835,19 @@ impl<'p> Checker<'p> {
             None => Vec::new(),
         }
     }
+}
+
+/// E0301: a closure with `have` parameters where a function type of `want` is expected.
+pub(super) fn closure_arity(span: Span, have: usize, want: usize) -> Diagnostic {
+    Diagnostic::new(
+        codes::E0301,
+        span,
+        format!("this closure takes {have} parameters, but {want} are expected"),
+    )
+    .with_help(format!(
+        "write {want} parameters, as in `|{}| ...`",
+        (0..want).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
+    ))
 }
 
 /// A value of variant `v` of the enum `adt`, with `fields` in declared order.
@@ -3016,6 +3016,95 @@ mod tests {
                 diagnostics.iter().any(|d| d.code.as_str() == "E0325"),
                 "used the shadowed constant in {source}: {diagnostics:#?}"
             );
+        }
+    }
+
+    /// The errors `check_program` gives `source`.
+    fn errors(source: &str) -> Vec<wrela_diag::Diagnostic> {
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        diagnostics.into_iter().filter(|d| d.is_error()).collect()
+    }
+
+    /// A draw's shaders, for the cases below.
+    const SHADERS: &str = "use std::gpu::{Blend, ClipPosition, VertexIndex, begin_screen_pass, draw, draw_multi}\n\
+        @vertex\n\
+        fn cover(v: VertexIndex) -> ClipPosition { ClipPosition { position: vec4(0.0, 0.0, 0.0, 1.0) } }\n\
+        @fragment\n\
+        fn white() -> vec4 { vec4(1.0) }\n";
+
+    /// `draw_multi` without `indirect:` is one error, which names `draw_multi`; so is its
+    /// arity error.
+    #[test]
+    fn draw_multi_errors_name_draw_multi() {
+        let e = errors(&format!(
+            "{SHADERS}pub fn frame(time: f32, width: u32, height: u32) {{\n\
+                 let s = begin_screen_pass(clear: vec4(0.0))\n\
+                 draw_multi(s, cover, white, count: 2)\n\
+                 s.present()\n\
+             }}\n"
+        ));
+        let messages: Vec<&str> = e.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(messages.len(), 1, "{messages:#?}");
+        assert!(messages[0].starts_with("`draw_multi` takes `indirect:`"), "{messages:#?}");
+        let e = errors(&format!(
+            "{SHADERS}pub fn frame(time: f32, width: u32, height: u32) {{\n\
+                 let s = begin_screen_pass(clear: vec4(0.0))\n\
+                 draw_multi(s, cover)\n\
+                 s.present()\n\
+             }}\n"
+        ));
+        assert!(e.iter().any(|d| d.message.starts_with("`draw_multi` takes the pass")), "{e:#?}");
+    }
+
+    /// A `blend:` constant is the variant its value resolves to, not the one its name spells.
+    #[test]
+    fn a_blend_constant_is_the_variant_it_names() {
+        let source = format!(
+            "{SHADERS}use std::gpu::Blend::Multiply as Add\n\
+             const BLEND: Blend = Add\n\
+             pub fn frame(time: f32, width: u32, height: u32) {{\n\
+                 let s = begin_screen_pass(clear: vec4(0.0))\n\
+                 draw(s, cover, white, vertices: 3, blend: BLEND)\n\
+                 s.present()\n\
+             }}\n"
+        );
+        let mut diagnostics = Vec::new();
+        let checked = crate::check_program(crate::test_units(&source), &mut diagnostics);
+        assert!(!wrela_diag::has_errors(&diagnostics), "{diagnostics:#?}");
+        let blends: Vec<_> = checked
+            .mir
+            .values()
+            .flat_map(|b| &b.fns)
+            .flat_map(|f| &f.blocks)
+            .flat_map(|b| &b.stmts)
+            .filter_map(|s| match &s.kind {
+                crate::mir::StatementKind::Eval(crate::mir::Rvalue::Draw(d))
+                | crate::mir::StatementKind::Assign(_, crate::mir::Rvalue::Draw(d)) => {
+                    Some(d.state.blends[0])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(blends, [wrela_abi::manifest::Blend::Multiply]);
+    }
+
+    /// `().0`'s help doesn't name an element `()` doesn't have.
+    #[test]
+    fn an_empty_tuples_index_names_no_element() {
+        let e = errors("pub fn f() -> u32 {\n    let _x = ().0\n    1\n}\n");
+        let d = e.iter().find(|d| d.code.as_str() == "E0206").expect("E0206");
+        assert!(!d.help.iter().any(|h| h.contains("`.0` to")), "{d:#?}");
+        assert_eq!(d.message, "this tuple has no elements, so `.0` doesn't exist");
+    }
+
+    /// E0207's help names the page `wrela doc` has: a generic type's by its name alone.
+    #[test]
+    fn a_missing_associated_function_names_its_doc_page() {
+        for call in ["Vec::<f32>::nope()", "let _f = Vec::<f32>::nope"] {
+            let e = errors(&format!("pub fn f() {{\n    {call}\n}}\n"));
+            let d = e.iter().find(|d| d.code.as_str() == "E0207").expect("E0207");
+            assert_eq!(d.help, ["`wrela doc Vec` lists what it has"], "{call}: {d:#?}");
         }
     }
 }

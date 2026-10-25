@@ -22,7 +22,6 @@
 //! A [`CpuHost`] runs only the WASM: it checks what the program submits but executes none
 //! of it, so export tests need no GPU.
 
-mod cache;
 pub mod code;
 mod confined;
 mod error;
@@ -286,8 +285,8 @@ struct Build {
     driven: Option<(String, std::sync::Arc<BuildDir>)>,
 }
 
-/// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. An
-/// loaded build's compiled code is kept in the host's private cache (`cache`): the loads that
+/// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. A
+/// loaded build's compiled code is kept in the host's private cache ([`code`]): the loads that
 /// follow read it back.
 fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
     compile_build_with_shaders(dir, fuel, true)
@@ -992,8 +991,9 @@ impl Host {
         self.p().executor().read_screen_region([x, y], [width, height])
     }
 
-    /// The target of the last pass labelled `label` that drew into a texture, as RGBA8 (floats
-    /// clamped, depth grey), and its width and height: a test's golden of a pass (§13.2).
+    /// The target of the last pass labelled `label` that drew into a texture (the level and layer
+    /// it drew into), as RGBA8 (floats clamped, depth grey), and that level's width and height: a
+    /// test's golden of a pass (§13.2).
     pub fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
         self.p().executor().read_target(label)
     }

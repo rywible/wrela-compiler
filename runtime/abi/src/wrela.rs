@@ -77,7 +77,6 @@ const NUMBERS: &[(&str, u32, &str)] = &[
         crate::stream::WRITABLE,
         "A texture's format code with this bit set: kernels write its texels.",
     ),
-    ("PASS_JOIN", crate::stream::PASS_JOIN, "A pass's join word: it may join the pass before it."),
     ("KIND_2D", crate::stream::TextureKind::D2 as u32, "A 2D texture's kind."),
     ("KIND_3D", crate::stream::TextureKind::D3 as u32, "A 3D texture's kind."),
     ("KIND_ARRAY", crate::stream::TextureKind::Array as u32, "A 2D array's kind."),
@@ -113,13 +112,14 @@ pub fn wrela() -> String {
     // WebGPU names them (`rgba8unorm` is `FORMAT_RGBA8UNORM`, `less-equal` `COMPARE_LESS_EQUAL`).
     let upper = |name: &str| name.replace('-', "_").to_uppercase();
     for f in TextureFormat::ALL {
-        let (name, code, bytes) = (f.name(), f as u32, f.bytes_per_texel());
+        let (name, code, bytes, b) = (f.name(), f as u32, f.bytes_per_texel(), f.block());
         let n = upper(name);
         out += &format!(
             "\n/// The stream's code for the texture format `{name}`.\npub(package) const FORMAT_{n}: u32 = {code}\n"
         );
+        let of = if b > 1 { format!("a {b} × {b} block") } else { "a texel".into() };
         out += &format!(
-            "\n/// The bytes of a texel of `{name}` (of a compressed format, of a 4 × 4 block).\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
+            "\n/// The bytes of {of} of `{name}`.\npub(package) const FORMAT_{n}_BYTES: u32 = {bytes}\n"
         );
     }
     for c in Compare::ALL {

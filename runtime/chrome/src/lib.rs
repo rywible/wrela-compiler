@@ -687,15 +687,30 @@ struct ConsoleFile {
 
 #[derive(Default)]
 struct Seen {
-    console: Vec<String>,
-    printed: Vec<String>,
-    console_bytes: usize,
-    printed_bytes: usize,
-    /// The lines past [`MOST_LINES`] or [`MOST_CONSOLE_BYTES`] that weren't kept.
-    console_dropped: usize,
-    printed_dropped: usize,
+    console: Kept,
+    printed: Kept,
     crashed: bool,
     size: Option<(u32, u32)>,
+}
+
+/// Lines a tab keeps, at most [`MOST_LINES`] of them and [`MOST_CONSOLE_BYTES`] of text.
+#[derive(Default)]
+struct Kept {
+    lines: Vec<String>,
+    bytes: usize,
+    /// The lines past either bound that weren't kept.
+    dropped: usize,
+}
+
+impl Kept {
+    fn push(&mut self, line: String) {
+        if self.lines.len() < MOST_LINES && line.len() <= MOST_CONSOLE_BYTES - self.bytes {
+            self.bytes += line.len();
+            self.lines.push(line);
+        } else {
+            self.dropped += 1;
+        }
+    }
 }
 
 /// The most console lines a tab keeps: past them, an observation of the console or a wait for a
@@ -737,21 +752,9 @@ impl TabState {
         }
         let mut seen = lock(&self.seen);
         if let Some(p) = text.strip_prefix("wrela: ") {
-            if seen.printed.len() < MOST_LINES && p.len() <= MOST_CONSOLE_BYTES - seen.printed_bytes
-            {
-                seen.printed_bytes += p.len();
-                seen.printed.push(p.to_string());
-            } else {
-                seen.printed_dropped += 1;
-            }
+            seen.printed.push(p.to_string());
         }
-        if seen.console.len() < MOST_LINES && text.len() <= MOST_CONSOLE_BYTES - seen.console_bytes
-        {
-            seen.console_bytes += text.len();
-            seen.console.push(text);
-        } else {
-            seen.console_dropped += 1;
-        }
+        seen.console.push(text);
         drop(seen);
         self.changed.notify_all();
     }
@@ -907,26 +910,26 @@ impl Tab {
     /// a tab keeps (100 000 lines or 16 MiB), rather than some of them.
     pub fn console(&self) -> Result<Vec<String>, String> {
         let seen = lock(&self.state.seen);
-        if seen.console_dropped > 0 {
+        if seen.console.dropped > 0 {
             return Err(format!(
                 "the console exceeded {MOST_LINES} lines or {MOST_CONSOLE_BYTES} bytes: {} more weren't kept",
-                seen.console_dropped
+                seen.console.dropped
             ));
         }
-        Ok(seen.console.clone())
+        Ok(seen.console.lines.clone())
     }
 
     /// The lines the program printed (`std::io::print`, which the browser runtime shows on the
     /// console as `wrela: <line>`): an error if there were more than a tab keeps.
     pub fn printed(&self) -> Result<Vec<String>, String> {
         let seen = lock(&self.state.seen);
-        if seen.printed_dropped > 0 {
+        if seen.printed.dropped > 0 {
             return Err(format!(
                 "the program printed more than {MOST_LINES} lines or {MOST_CONSOLE_BYTES} bytes: {} more weren't kept",
-                seen.printed_dropped
+                seen.printed.dropped
             ));
         }
-        Ok(seen.printed.clone())
+        Ok(seen.printed.lines.clone())
     }
 
     /// What the page put in `results/DONE`, once its server has kept it (or why it can't be
@@ -959,8 +962,8 @@ impl Tab {
     /// The page's screen, as a PNG at most `most` bytes long: the viewport at its size.
     pub fn screenshot(&self, most: usize, deadline: Instant) -> Result<Vec<u8>, String> {
         let (w, h) = self.size();
-        let shot = self.call(
-            "Page.captureScreenshot",
+        let shot = self.inner.conn.call_screenshot(
+            &self.session,
             json!({"format": "png", "fromSurface": true, "captureBeyondViewport": false,
                    "clip": {"x": 0, "y": 0, "width": w, "height": h, "scale": 1}}),
             deadline,
@@ -1143,18 +1146,18 @@ mod tests {
         state.line("x".repeat(MOST_CONSOLE_BYTES));
         state.line("y".into());
         let seen = lock(&state.seen);
-        assert_eq!(seen.console_bytes, MOST_CONSOLE_BYTES);
-        assert_eq!(seen.console.len(), 1);
-        assert_eq!(seen.console_dropped, 1);
+        assert_eq!(seen.console.bytes, MOST_CONSOLE_BYTES);
+        assert_eq!(seen.console.lines.len(), 1);
+        assert_eq!(seen.console.dropped, 1);
         drop(seen);
 
         let printed = TabState::new(None).expect("a tab");
         printed.line(format!("wrela: {}", "x".repeat(MOST_CONSOLE_BYTES)));
         printed.line("wrela: y".into());
         let seen = lock(&printed.seen);
-        assert_eq!(seen.printed_bytes, MOST_CONSOLE_BYTES);
-        assert_eq!(seen.printed.len(), 1);
-        assert_eq!(seen.printed_dropped, 1);
+        assert_eq!(seen.printed.bytes, MOST_CONSOLE_BYTES);
+        assert_eq!(seen.printed.lines.len(), 1);
+        assert_eq!(seen.printed.dropped, 1);
     }
 
     #[test]

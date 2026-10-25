@@ -83,7 +83,7 @@ fn parse(args: &[String], bisect: bool) -> Option<Args> {
 }
 
 /// A program running, on the GPU or the CPU.
-enum Runner {
+pub(crate) enum Runner {
     Gpu(Box<Host>),
     Cpu(Box<CpuHost>),
 }
@@ -92,7 +92,7 @@ impl Runner {
     /// Frame `i` at `fps`, `script`'s events for it first, in lockstep with the ticker if the
     /// program started one (its ticks due by the frame's time run before it), as `wrela-host`
     /// and frame tests run frames.
-    fn frame(
+    pub(crate) fn frame(
         &mut self,
         i: u32,
         fps: f64,
@@ -104,6 +104,14 @@ impl Runner {
             Runner::Cpu(h) => h.lockstep_frame(i, fps, size.0, size.1, script),
         }
         .map_err(|e| e.to_string())
+    }
+
+    /// The host's state hash: FNV-1a 64 of every byte the program has submitted since it loaded.
+    pub(crate) fn hash(&mut self) -> u64 {
+        match self {
+            Runner::Gpu(h) => h.hash(),
+            Runner::Cpu(h) => h.hash(),
+        }
     }
 
     fn call(&mut self, name: &str) -> Result<Vec<Value>, String> {

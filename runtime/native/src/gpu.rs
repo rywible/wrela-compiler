@@ -9,10 +9,11 @@
 //!   copies from an upload ring. Each dispatch gets its own compute pass.
 //! - A pass's draws are collected and recorded into one render pass when it ends (`Present` or
 //!   `EndPass`), since a pass can span batches. A pass that may join the one before (`join`), and
-//!   begins right after it ended on the same targets, keeping what's in them, runs as part of
-//!   it, unless the timing is serial: on a tile-based GPU each pass stores its targets to memory
-//!   and the next loads them back. Only a pass the program marks: a pass's geometry is binned
-//!   before its tiles are drawn, so two heavy passes made one wait longer than they save.
+//!   begins right after it ended on the same targets, keeping what's in them, under the same
+//!   label (a `Label` between ends the first), runs as part of it, unless the timing is serial:
+//!   on a tile-based GPU each pass stores its targets to memory and the next loads them back.
+//!   Only a pass the program marks: a pass's geometry is binned before its tiles are drawn, so
+//!   two heavy passes made one wait longer than they save.
 //! - A render pipeline is made at load for each of its manifest's `targets` (the passes the
 //!   program draws it in): the screen's or a texture's colour format, and a depth format or
 //!   none. With depth, a fragment is kept where its depth is less than what's there, which it
@@ -210,11 +211,11 @@ fn colour_format(b: &ResourceBinding) -> TextureFormat {
 
 /// A texture binding's view dimension.
 fn view_dimension(kind: BindingKind) -> wgpu::TextureViewDimension {
-    match kind.dimension() {
-        Some("3d") => wgpu::TextureViewDimension::D3,
-        Some("2d-array") => wgpu::TextureViewDimension::D2Array,
-        Some("cube") => wgpu::TextureViewDimension::Cube,
-        _ => wgpu::TextureViewDimension::D2,
+    match kind.view_kind() {
+        Some(TextureKind::D3) => wgpu::TextureViewDimension::D3,
+        Some(TextureKind::Array) => wgpu::TextureViewDimension::D2Array,
+        Some(TextureKind::Cube) => wgpu::TextureViewDimension::Cube,
+        Some(TextureKind::D2) | None => wgpu::TextureViewDimension::D2,
     }
 }
 
@@ -245,7 +246,7 @@ fn wgpu_blend(b: Blend) -> Option<wgpu::BlendState> {
 }
 
 /// The wgpu feature of a WebGPU feature's name, for those the hosts request.
-pub(crate) fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
+fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
     Some(match name {
         "shader-f16" => wgpu::Features::SHADER_F16,
         "subgroups" => wgpu::Features::SUBGROUP,
@@ -264,28 +265,22 @@ pub(crate) fn wgpu_feature(name: &str) -> Option<wgpu::Features> {
     })
 }
 
-/// Every optional feature the native host requests where the adapter has it.
-fn optional_features() -> wgpu::Features {
-    wrela_abi::FEATURES
-        .iter()
-        .filter_map(|f| wgpu_feature(f))
-        .fold(wgpu::Features::empty(), |a, b| a | b)
+/// Whether a device with these features has the WebGPU feature `name`.
+fn device_has(features: wgpu::Features, name: &str) -> bool {
+    wgpu_feature(name).is_some_and(|w| features.contains(w))
 }
 
 /// The feature bits a program sees (`wrela_abi::Limits::features`) of a device with these
-/// features, less any `masked` (test mode's mask: a program's fallback paths, measured).
-pub(crate) fn feature_bits(features: wgpu::Features, keep: Option<&[String]>) -> u32 {
+/// features: the required ones, and the rest only where `kept` (test mode's mask: a program's
+/// fallback paths, measured).
+fn feature_bits(features: wgpu::Features, kept: impl Fn(&str) -> bool) -> u32 {
     wrela_abi::FEATURES
         .iter()
-        .filter(|name| match wgpu_feature(name) {
-            Some(f) if f.is_empty() => true,
-            Some(f) => features.contains(f),
-            None => false,
+        .filter(|name| device_has(features, name))
+        .filter_map(|name| {
+            let bit = wrela_abi::feature_bit(name)?;
+            (bit & wrela_abi::REQUIRED_FEATURES != 0 || kept(name)).then_some(bit)
         })
-        .filter(|name| {
-            **name == "indirect-first-instance" || keep.is_none_or(|k| k.iter().any(|x| x == *name))
-        })
-        .filter_map(|name| wrela_abi::feature_bit(name))
         .fold(0, |a, b| a | b)
 }
 
@@ -336,21 +331,21 @@ impl Texture {
         dimension: wgpu::TextureViewDimension,
         storage: bool,
     ) -> wgpu::TextureView {
-        let key = (view, dimension, storage);
-        if let Some(v) = self.views.borrow().get(&key) {
-            return v.clone();
-        }
-        let level = view.level.or(storage.then_some(0));
-        let made = self.texture.create_view(&wgpu::TextureViewDescriptor {
-            dimension: Some(dimension),
-            base_mip_level: level.unwrap_or(0),
-            mip_level_count: level.map(|_| 1),
-            base_array_layer: view.layer.unwrap_or(0),
-            array_layer_count: view.layer.map(|_| 1),
-            ..Default::default()
-        });
-        self.views.borrow_mut().insert(key, made.clone());
-        made
+        self.views
+            .borrow_mut()
+            .entry((view, dimension, storage))
+            .or_insert_with(|| {
+                let level = view.level.or(storage.then_some(0));
+                self.texture.create_view(&wgpu::TextureViewDescriptor {
+                    dimension: Some(dimension),
+                    base_mip_level: level.unwrap_or(0),
+                    mip_level_count: level.map(|_| 1),
+                    base_array_layer: view.layer.unwrap_or(0),
+                    array_layer_count: view.layer.map(|_| 1),
+                    ..Default::default()
+                })
+            })
+            .clone()
     }
 
     /// The 2D view of one level and layer: a pass's target.
@@ -456,6 +451,8 @@ struct OpenPass {
     label: Option<Arc<str>>,
     /// Built only when another pass asks to join; extended with each compatible join.
     uses: Option<HashMap<u32, bool>>,
+    /// Whether its draws set a scissor or a viewport.
+    rect_set: bool,
 }
 
 struct Screen {
@@ -528,10 +525,10 @@ struct Timer {
     pending: Vec<Timed>,
     results: Vec<GpuTiming>,
     /// Whether every timing is kept for [`Gpu::take_timings`] (a run timed from its start): a
-    /// timer the program started (`std::gpu::timed`) keeps only each label's latest.
+    /// timer the program started (`std::gpu::timed`) keeps only what answers its asks.
     keep: bool,
-    /// Each label's latest time: the call it ran in and its nanoseconds there, summed.
-    latest: HashMap<String, (usize, f64)>,
+    /// The passes and dispatches timed so far: where an ask starts ([`Ask::from`]).
+    noted: u64,
     /// Each pass and dispatch submitted and waited for alone, so none overlaps another: each
     /// one's own time (the serial mode).
     serial: bool,
@@ -539,11 +536,25 @@ struct Timer {
     submissions: usize,
 }
 
-/// A pass or dispatch timed in this submission, the frame and the call it's in.
+/// A pass or dispatch timed in this submission, the frame and the call it's in, and its place
+/// among those timed ([`Timer::noted`] before it).
 struct Timed {
     frame: usize,
     call: usize,
     label: String,
+    at: u64,
+}
+
+/// A program's ask for a label's time (`std::gpu::timed`).
+struct Ask {
+    request: u32,
+    label: String,
+    /// The passes and dispatches timed before it ([`Timer::noted`]): it times only its label's
+    /// after it, in the order the program recorded them.
+    from: u64,
+    /// Its answer, once some of that work is read back: the first call that ran some, and its
+    /// nanoseconds in that call, summed.
+    time: Option<(usize, f64)>,
 }
 
 /// What the executor did below the recorded stream, since its counters were last taken: the
@@ -551,16 +562,16 @@ struct Timed {
 /// multi-draw is one `draw_calls` and its `count` `draws` (wgpu draws it in one call).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Counters {
-    pub compute_passes: u32,
-    pub render_passes: u32,
-    pub dispatches: u32,
-    pub draws: u32,
-    pub draw_calls: u32,
-    pub write_buffers: u32,
+    pub compute_passes: u64,
+    pub render_passes: u64,
+    pub dispatches: u64,
+    pub draws: u64,
+    pub draw_calls: u64,
+    pub write_buffers: u64,
     pub write_buffer_bytes: u64,
-    pub write_textures: u32,
-    pub bind_groups: u32,
-    pub pipelines: u32,
+    pub write_textures: u64,
+    pub bind_groups: u64,
+    pub pipelines: u64,
 }
 
 impl Counters {
@@ -580,16 +591,16 @@ impl Counters {
     /// Its fields by name, in order: what reports and tests list.
     pub fn fields(&self) -> [(&'static str, u64); 10] {
         [
-            ("compute_passes", u64::from(self.compute_passes)),
-            ("render_passes", u64::from(self.render_passes)),
-            ("dispatches", u64::from(self.dispatches)),
-            ("draws", u64::from(self.draws)),
-            ("draw_calls", u64::from(self.draw_calls)),
-            ("write_buffers", u64::from(self.write_buffers)),
+            ("compute_passes", self.compute_passes),
+            ("render_passes", self.render_passes),
+            ("dispatches", self.dispatches),
+            ("draws", self.draws),
+            ("draw_calls", self.draw_calls),
+            ("write_buffers", self.write_buffers),
             ("write_buffer_bytes", self.write_buffer_bytes),
-            ("write_textures", u64::from(self.write_textures)),
-            ("bind_groups", u64::from(self.bind_groups)),
-            ("pipelines", u64::from(self.pipelines)),
+            ("write_textures", self.write_textures),
+            ("bind_groups", self.bind_groups),
+            ("pipelines", self.pipelines),
         ]
     }
 }
@@ -622,21 +633,21 @@ pub(crate) struct Gpu {
     encoder: Option<wgpu::CommandEncoder>,
     pass: Option<OpenPass>,
     /// A pass that ended, not yet recorded: the next pass continues it if it begins on the same
-    /// targets and keeps them (`Pass::joins`).
+    /// targets, keeps them (`Pass::joins`) and has the same label, with no `Label` between.
     ended: Option<OpenPass>,
     screen: Option<Screen>,
-    /// Reused between buffer reads: mapping is finished before the next copy uses it.
+    /// Reused between buffer reads: mapping is finished before the next copy uses it. A build
+    /// that retires lets it go.
     buffer_readback: Option<wgpu::Buffer>,
-    /// Reused between screen captures: mapping is finished before the next copy uses it.
-    screen_readback: Option<wgpu::Buffer>,
+    /// Reused between captures of the screen and of passes' targets: mapping is finished before
+    /// the next copy uses it. A build that retires lets it go.
+    image_readback: Option<wgpu::Buffer>,
     /// Each label's pass's target, the last pass of that label that drew into a texture: its
-    /// colour, else its depth ([`Gpu::read_target`], a test's golden of a pass).
-    labelled: HashMap<String, u32>,
-    /// Whether the device has timestamp queries, so a program may ask for its work's time.
-    can_time: bool,
-    /// The program's asks for a label's time (`std::gpu::timed`): each request, its label and
-    /// the call it was asked in.
-    asked: Vec<(u32, String, usize)>,
+    /// colour, else its depth, as (texture, level, layer) ([`Gpu::read_target`], a test's
+    /// golden of a pass).
+    labelled: HashMap<Arc<str>, (u32, u32, u32)>,
+    /// The program's asks for a label's time (`std::gpu::timed`) not yet answered.
+    asked: Vec<Ask>,
     /// The calls ended so far: a timing's call, and an ask's.
     calls: usize,
     timer: Option<Timer>,
@@ -647,8 +658,9 @@ pub(crate) struct Gpu {
     /// A debug build's: the flag its pipelines' bounds checks set (the manifest's
     /// `debug_flag`), read after each frame.
     debug_flag: Option<DebugFlag>,
-    /// The optional features the program sees ([`feature_bits`]).
-    feature_bits: u32,
+    /// The limits the program sees (`wrela.limit`), with its optional features
+    /// ([`feature_bits`]) and, with subgroups, their sizes.
+    program_limits: wrela_abi::Limits,
 }
 
 /// The flag a debug build's bounds checks set, and the buffer it's read back through, made
@@ -751,17 +763,13 @@ impl Gpu {
                 v.split(',').map(|f| f.trim().to_string()).collect()
             }
         });
-        let optional = match &keep {
-            None => optional_features(),
-            Some(kept) => wrela_abi::FEATURES
-                .iter()
-                .filter(|f| **f == "timestamp-query" || kept.iter().any(|k| k == *f))
-                .filter_map(|f| wgpu_feature(f))
-                .fold(wgpu::Features::empty(), |a, b| a | b),
-        };
+        let kept = |name: &str| keep.as_ref().is_none_or(|k| k.iter().any(|x| x == name));
+        let optional = wrela_abi::FEATURES
+            .iter()
+            .filter(|f| **f == "timestamp-query" || kept(f))
+            .filter_map(|f| wgpu_feature(f))
+            .fold(wgpu::Features::empty(), |a, b| a | b);
         let (device, queue) = open_device_with("wrela-host", features, optional)?;
-        let device_times = device.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-        let feature_bits = feature_bits(device.features(), keep.as_deref());
 
         let errors = Arc::new(Mutex::new(Vec::new()));
         let sink = errors.clone();
@@ -774,6 +782,13 @@ impl Gpu {
         });
 
         let limits = device.limits();
+        let mut program_limits = limits_of(&limits);
+        program_limits.features = feature_bits(device.features(), kept);
+        if program_limits.has("subgroups") {
+            let info = device.adapter_info();
+            program_limits.subgroup_min_size = info.subgroup_min_size;
+            program_limits.subgroup_max_size = info.subgroup_max_size;
+        }
         let align = u64::from(
             limits
                 .min_uniform_buffer_offset_alignment
@@ -806,9 +821,8 @@ impl Gpu {
             ended: None,
             screen: None,
             buffer_readback: None,
-            screen_readback: None,
+            image_readback: None,
             labelled: HashMap::new(),
-            can_time: device_times,
             asked: Vec::new(),
             calls: 0,
             timer,
@@ -816,7 +830,7 @@ impl Gpu {
             errors,
             frame: 0,
             debug_flag: None,
-            feature_bits,
+            program_limits,
         };
         gpu.take_pipelines(manifest, shaders)?;
         Ok(gpu)
@@ -833,7 +847,7 @@ impl Gpu {
                     usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                     mapped_at_creation: false,
                 }),
-                readback: self.readback_buffer(4),
+                readback: readback_buffer(&self.device, 4),
             });
         }
         let old_keys = std::mem::take(&mut self.pipeline_keys);
@@ -895,6 +909,9 @@ impl Gpu {
         // build's requests reuse its numbers, and its handles name other resources.
         self.asked.clear();
         self.labelled.clear();
+        // Its largest read sized these; the next build makes its own as it reads.
+        self.buffer_readback = None;
+        self.image_readback = None;
         Ok(())
     }
 
@@ -1120,8 +1137,7 @@ impl Builder {
         // A shader that needs a feature this device hasn't isn't built: the checker refuses a
         // command that records it, naming the feature.
         let features = self.device.features();
-        let unavailable =
-            p.requires.iter().any(|f| wgpu_feature(f).is_none_or(|w| !features.contains(w)));
+        let unavailable = p.requires.iter().any(|f| !device_has(features, f));
         let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some(&p.name),
@@ -1177,20 +1193,15 @@ impl Builder {
                     for t in targets {
                         // A target the device can't draw into (rg11b10ufloat without its feature)
                         // is one the checker refuses a pass of.
-                        if t.colors().any(|c| {
-                            !c.info()
-                                .renderable
-                                .on(|f| wgpu_feature(f).is_some_and(|w| features.contains(w)))
-                        }) {
+                        if t.colors().any(|c| !c.info().renderable.on(|f| device_has(features, f)))
+                        {
                             continue;
                         }
                         // Nor one it can't blend into as the pipeline blends (a 32-bit float
                         // target without float32-blendable): the checker refuses such a draw.
                         if t.colors().enumerate().any(|(k, c)| {
                             blends.get(k).is_some_and(|&b| b != Blend::Replace)
-                                && !c.info().blendable.on(|f: &str| {
-                                    wgpu_feature(f).is_some_and(|w| features.contains(w))
-                                })
+                                && !c.info().blendable.on(|f| device_has(features, f))
                         }) {
                             continue;
                         }
@@ -1301,7 +1312,7 @@ impl Gpu {
             None => (pass.depth, 0),
         };
         let t = &self.texture(handle).texture;
-        ((t.width() >> level).max(1), (t.height() >> level).max(1))
+        stream::level_size(t.width(), t.height(), level)
     }
 
     fn texture(&self, handle: u32) -> &Texture {
@@ -1317,8 +1328,22 @@ impl Gpu {
             return bg.clone();
         }
         let p = &self.pipelines[pipeline as usize];
-        // Texture bindings' views, made first: an entry borrows its view.
-        let mut views = Vec::new();
+        // Each binding's resource, with a texture's view made first: an entry borrows its view.
+        let resources: Vec<(&Resource, Option<wgpu::TextureView>)> = bindings
+            .iter()
+            .zip(&p.bindings)
+            .map(|(b, slot)| {
+                let resource = &self.resources[&b.handle];
+                let view = match resource {
+                    Resource::Texture(t) => {
+                        let view = View::of_words(b.offset, b.size);
+                        Some(t.view(view, view_dimension(slot.kind), slot.kind.is_storage()))
+                    }
+                    _ => None,
+                };
+                (resource, view)
+            })
+            .collect();
         let mut entries = Vec::with_capacity(
             bindings.len() + usize::from(p.uniform.is_some()) + usize::from(p.debug_flag.is_some()),
         );
@@ -1332,29 +1357,20 @@ impl Gpu {
                 }),
             });
         }
-        for (b, slot) in bindings.iter().zip(&p.bindings) {
-            let resource = match &self.resources[&b.handle] {
-                Resource::Buffer(buffer) => wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer,
-                    offset: u64::from(b.offset),
-                    size: NonZeroU64::new(u64::from(b.size)),
-                }),
-                Resource::Texture(t) => {
-                    let view = View::of_words(b.offset, b.size);
-                    views.push(t.view(view, view_dimension(slot.kind), slot.kind.is_storage()));
-                    continue;
+        for ((b, slot), (resource, view)) in bindings.iter().zip(&p.bindings).zip(&resources) {
+            let resource = match (resource, view) {
+                (_, Some(view)) => wgpu::BindingResource::TextureView(view),
+                (Resource::Buffer(buffer), None) => {
+                    wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer,
+                        offset: u64::from(b.offset),
+                        size: NonZeroU64::new(u64::from(b.size)),
+                    })
                 }
-                Resource::Sampler(s) => wgpu::BindingResource::Sampler(s),
+                (Resource::Sampler(s), None) => wgpu::BindingResource::Sampler(s),
+                (Resource::Texture(_), None) => unreachable!("a texture's view is made above"),
             };
             entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
-        }
-        let mut view_at = views.iter();
-        for (b, slot) in bindings.iter().zip(&p.bindings) {
-            if matches!(self.resources[&b.handle], Resource::Texture(_)) {
-                let view = view_at.next().expect("a view for each texture binding");
-                let resource = wgpu::BindingResource::TextureView(view);
-                entries.push(wgpu::BindGroupEntry { binding: slot.binding, resource });
-            }
         }
         if let (Some(binding), Some(flag)) = (p.debug_flag, &self.debug_flag) {
             let resource = flag.buffer.as_entire_binding();
@@ -1463,7 +1479,7 @@ impl Gpu {
         if let Some(timer) = &mut self.timer
             && !timer.pending.is_empty()
         {
-            timer.collect(&self.device, &self.queue)?;
+            timer.collect(&self.device, &self.queue, &mut self.asked)?;
         }
         Ok(())
     }
@@ -1506,9 +1522,8 @@ impl Gpu {
         let [width, height, depth] = size;
         let three = kind == TextureKind::D3;
         let features = self.device.features();
-        let has = |f: &str| wgpu_feature(f).is_some_and(|w| features.contains(w));
         let mut usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
-        if !three && format.info().renderable.on(has) {
+        if !three && format.info().renderable.on(|f| device_has(features, f)) {
             usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
         }
         if !format.is_depth() {
@@ -1623,24 +1638,16 @@ impl Gpu {
             return Ok(());
         }
         let format = self.texture(handle).format;
-        let block = format.block();
-        let row = u64::from(size[0].div_ceil(block)) * u64::from(format.bytes_per_texel());
-        let rows = size[1].div_ceil(block);
+        let row = format.bytes_of(size[0], 1);
+        let rows = size[1].div_ceil(format.block());
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let bytes = padded * u64::from(rows);
         let extent = whole_blocks(format, size[0], size[1]);
-        let at_texel = wgpu::Origin3d { x: origin[0], y: origin[1], z: layer };
-        fn image(
-            t: &wgpu::Texture,
-            origin: wgpu::Origin3d,
-            level: u32,
-        ) -> wgpu::TexelCopyTextureInfo<'_> {
-            wgpu::TexelCopyTextureInfo { origin, mip_level: level, ..t.as_image_copy() }
-        }
+        let [x, y] = origin;
         if bytes > u64::from(stream::UPLOAD_MAX) {
             self.flush()?;
             self.queue.write_texture(
-                image(&self.texture(handle).texture, at_texel, level),
+                self.image_copy(handle, level, layer, x, y),
                 data,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
@@ -1666,7 +1673,6 @@ impl Gpu {
             }
         }
         let mut encoder = self.take_encoder();
-        let texture = &self.texture(handle).texture;
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: &self.upload.buffer,
@@ -1676,7 +1682,7 @@ impl Gpu {
                     rows_per_image: Some(rows),
                 },
             },
-            image(texture, at_texel, level),
+            self.image_copy(handle, level, layer, x, y),
             extent,
         );
         self.encoder = Some(encoder);
@@ -1722,8 +1728,9 @@ impl Gpu {
         to_buffer: bool,
     ) {
         let mut encoder = self.take_encoder();
-        let extent = whole_blocks(self.texture(r.texture).format, r.width, r.height);
-        let rows = r.height.div_ceil(self.texture(r.texture).format.block());
+        let format = self.texture(r.texture).format;
+        let extent = whole_blocks(format, r.width, r.height);
+        let rows = r.height.div_ceil(format.block());
         let rows = wgpu::TexelCopyBufferInfo {
             buffer: self.buffer(buffer),
             layout: wgpu::TexelCopyBufferLayout {
@@ -1768,16 +1775,8 @@ impl Gpu {
         let mut encoder = self.take_encoder();
         let p = &self.pipelines[pipeline as usize];
         let label = self.label.as_deref().unwrap_or(&p.name);
-        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
-        let timed = self
-            .timer
-            .as_ref()
-            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
-        let timestamps = if timed {
-            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
-        } else {
-            None
-        };
+        let timestamps =
+            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
         let Kind::Compute(compute) = &p.kind else {
             unreachable!("the checker checked the kind");
         };
@@ -1823,7 +1822,7 @@ impl Gpu {
     /// Opens `pass`, named by the label in force.
     fn begin_pass(&mut self, pass: Pass) {
         let label = self.label.clone();
-        self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None });
+        self.pass = Some(OpenPass { pass, draws: Vec::new(), label, uses: None, rect_set: false });
     }
 
     fn draw(&mut self, pipeline: u32, how: DrawHow, bindings: &[Binding], uniforms: &[u8]) {
@@ -1833,14 +1832,17 @@ impl Gpu {
     }
 
     fn pass_item(&mut self, item: PassItem) {
-        self.pass.as_mut().expect("the sequencer checked a pass is open").draws.push(item);
+        let open = self.pass.as_mut().expect("the sequencer checked a pass is open");
+        open.rect_set |= matches!(item, PassItem::Scissor(_) | PassItem::Viewport(_));
+        open.draws.push(item);
     }
 
-    /// Joining keeps WebGPU's resource usage scope too. Two individually valid passes may
-    /// disagree on whether a buffer is read-only or read-write, including indirect arguments
-    /// and indices, which are read-only. Decide after both passes' draws are known.
+    /// A pass joins one of the same label, so its time and target are that label's. Joining
+    /// keeps WebGPU's resource usage scope too. Two individually valid passes may disagree on
+    /// whether a buffer is read-only or read-write, including indirect arguments and indices,
+    /// which are read-only. Decide after both passes' draws are known.
     fn can_join(&self, ended: &mut OpenPass, next: &OpenPass) -> bool {
-        if !next.pass.joins(&ended.pass) {
+        if !next.pass.joins(&ended.pass) || next.label != ended.label {
             return false;
         }
         if ended.uses.is_none() {
@@ -1902,8 +1904,8 @@ impl Gpu {
     }
 
     /// Ends the open pass: on the screen (`Present`) it's recorded; into textures (`EndPass`),
-    /// it waits for the next command, which may continue it (`Pass::joins`), unless the timing is
-    /// serial.
+    /// it waits for the next command, which may continue it (`Pass::joins`, the same label),
+    /// unless the timing is serial.
     fn end_pass(&mut self, op: Opcode) -> Result<()> {
         let Some(mut open) = self.pass.take() else {
             unreachable!("the sequencer checked a pass is open");
@@ -1914,11 +1916,7 @@ impl Gpu {
                 if self.can_join(&mut ended, &open) {
                     // A pass begins with the whole target its scissor and viewport: where the
                     // one it joins set either, the joined draws start from the whole target.
-                    if ended
-                        .draws
-                        .iter()
-                        .any(|d| matches!(d, PassItem::Scissor(_) | PassItem::Viewport(_)))
-                    {
+                    if ended.rect_set {
                         let (w, h) = self.pass_size(&ended.pass);
                         ended.draws.push(PassItem::Scissor([0, 0, w, h]));
                         ended
@@ -1926,6 +1924,7 @@ impl Gpu {
                             .push(PassItem::Viewport([0.0, 0.0, w as f32, h as f32, 0.0, 1.0]));
                     }
                     ended.draws.append(&mut open.draws);
+                    ended.rect_set |= open.rect_set;
                     self.ended = Some(ended);
                     return Ok(());
                 }
@@ -1985,23 +1984,15 @@ impl Gpu {
         let label = open.label.as_deref().unwrap_or(if on_screen { "screen pass" } else { "pass" });
         let target = match (pass.colors().first(), pass.depth) {
             (Some(c), _) if c.texture == stream::SCREEN => None,
-            (Some(c), _) => Some(c.texture),
+            (Some(c), _) => Some((c.texture, c.level, c.layer)),
             (None, stream::NONE) => None,
-            (None, depth) => Some(depth),
+            (None, depth) => Some((depth, 0, pass.depth_layer)),
         };
         if let (Some(name), Some(target)) = (&open.label, target) {
-            self.labelled.insert(name.to_string(), target);
+            self.labelled.insert(name.clone(), target);
         }
-        // A timed run times every pass; a program's asks only their labels' (`ask_time`).
-        let timed = self
-            .timer
-            .as_ref()
-            .is_some_and(|t| t.keep || self.asked.iter().any(|(_, l, _)| l == label));
-        let timestamps = if timed {
-            self.timer.as_mut().map(|t| t.next(self.frame, self.calls, label))
-        } else {
-            None
-        };
+        let timestamps =
+            self.timer.as_mut().and_then(|t| t.next_if(&self.asked, self.frame, self.calls, label));
         let mut prepared = Vec::with_capacity(open.draws.len());
         for d in &open.draws {
             if let PassItem::Draw(d) = d {
@@ -2094,7 +2085,7 @@ impl Gpu {
             counters.bind_groups += 1;
             counters.draw_calls += 1;
             counters.draws += match d.how {
-                DrawHow::Multi { count, .. } => count,
+                DrawHow::Multi { count, .. } => u64::from(count),
                 _ => 1,
             };
             let index = |rp: &mut wgpu::RenderPass<'_>, indices: u32, at: u32, size: u32| {
@@ -2152,22 +2143,14 @@ impl Gpu {
         let Some(Resource::Buffer(buffer)) = self.resources.get(&handle) else {
             return Err(Error::Gpu(format!("there's no buffer {handle}")));
         };
-        let size_bytes = u64::from(size.max(4));
-        let staging = match &self.buffer_readback {
-            Some(buffer) if buffer.size() >= size_bytes => buffer.clone(),
-            _ => {
-                let buffer = self.readback_buffer(size_bytes);
-                self.buffer_readback = Some(buffer.clone());
-                buffer
-            }
-        };
+        let staging = staging(&self.device, &mut self.buffer_readback, u64::from(size.max(4)));
         let bytes = self.copy_back(buffer, u64::from(offset), u64::from(size), &staging)?;
         self.check_errors()?;
         Ok(bytes)
     }
 
     /// Copies `source`'s bytes `offset..offset + size` to the CPU through `staging`, a
-    /// readback buffer at least `size` bytes long (waits for the GPU).
+    /// readback buffer at least `size` bytes long, and at least 4 (waits for the GPU).
     fn copy_back(
         &self,
         source: &wgpu::Buffer,
@@ -2179,7 +2162,9 @@ impl Gpu {
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_buffer_to_buffer(source, offset, staging, 0, size);
         self.queue.submit([encoder.finish()]);
-        map_read_with(&self.device, staging, |bytes| bytes[..size as usize].to_vec())
+        // A mapped range is whole words, and at least one.
+        let mapped = align_to(size, wgpu::COPY_BUFFER_ALIGNMENT).clamp(4, staging.size());
+        map_read_with(&self.device, staging, mapped, |bytes| bytes[..size as usize].to_vec())
     }
 
     /// The handles of the buffers that exist, oldest first: for tests.
@@ -2238,14 +2223,7 @@ impl Gpu {
         let row = u64::from(width) * 4;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
         let size = padded * u64::from(height);
-        let staging = match &self.screen_readback {
-            Some(buffer) if buffer.size() >= size => buffer.clone(),
-            _ => {
-                let buffer = self.readback_buffer(size);
-                self.screen_readback = Some(buffer.clone());
-                buffer
-            }
-        };
+        let staging = staging(&self.device, &mut self.image_readback, size);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         encoder.copy_texture_to_buffer(
@@ -2266,8 +2244,7 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let frame = map_read_with(&self.device, &staging, |bytes| {
-            let bytes = &bytes[..size as usize];
+        let frame = map_read_with(&self.device, &staging, size, |bytes| {
             if padded == row {
                 return bytes.to_vec();
             }
@@ -2282,13 +2259,13 @@ impl Gpu {
     }
 
     /// The target of the last pass labelled `label` (`std::gpu::label`) that drew into a texture
-    /// (its colour, else its depth), copied back as RGBA8 rows top to bottom: an 8-bit texture as
-    /// it is; a float one's channels clamped to 0 to 1, one channel grey, two red and green, its
-    /// alpha opaque unless it has one; a depth texture's depth grey. Its width and height too.
-    /// Waits for the GPU.
+    /// (its colour, else its depth: the level and layer it drew into), copied back as RGBA8 rows
+    /// top to bottom: an 8-bit texture as it is; a float one's channels clamped to 0 to 1, one
+    /// channel grey, two red and green, its alpha opaque unless it has one; a depth texture's
+    /// depth grey. That level's width and height too. Waits for the GPU.
     pub(crate) fn read_target(&mut self, label: &str) -> Result<(u32, u32, Vec<u8>)> {
         self.flush()?;
-        let handle = *self
+        let (handle, level, layer) = *self
             .labelled
             .get(label)
             .ok_or_else(|| Error::Gpu(format!("no pass labelled `{label}` drew into a texture")))?;
@@ -2298,7 +2275,8 @@ impl Gpu {
                 "the target of the pass labelled `{label}` was dropped after it"
             )));
         };
-        let (width, height, format) = (texture.width(), texture.height(), *format);
+        let (width, height) = stream::level_size(texture.width(), texture.height(), level);
+        let format = *format;
         if format.is_uint() || format.is_compressed() {
             return Err(Error::Gpu(format!(
                 "the target of the pass labelled `{label}` holds integers, not an image"
@@ -2307,7 +2285,8 @@ impl Gpu {
         let texel = u64::from(format.bytes_per_texel());
         let row = u64::from(width) * texel;
         let padded = align_to(row, u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
-        let staging = self.readback_buffer(padded * u64::from(height));
+        let size = padded * u64::from(height);
+        let staging = staging(&self.device, &mut self.image_readback, size);
         let mut encoder =
             self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         let aspect = if format == TextureFormat::Depth32Float {
@@ -2318,8 +2297,8 @@ impl Gpu {
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
+                mip_level: level,
+                origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
                 aspect,
             },
             wgpu::TexelCopyBufferInfo {
@@ -2333,7 +2312,7 @@ impl Gpu {
             wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
         );
         self.queue.submit([encoder.finish()]);
-        let rgba = map_read_with(&self.device, &staging, |bytes| {
+        let rgba = map_read_with(&self.device, &staging, size, |bytes| {
             let mut out = Vec::with_capacity(width as usize * height as usize * 4);
             for y in 0..height as usize {
                 let at = y * padded as usize;
@@ -2366,14 +2345,22 @@ impl Gpu {
              call before it); WGSL then reads or writes an element in range, or a zero"
         )))
     }
+}
 
-    fn readback_buffer(&self, size: u64) -> wgpu::Buffer {
-        self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        })
+fn readback_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("readback"),
+        size,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+/// The readback buffer kept in `slot` if it holds `size` bytes, else a new one that replaces it.
+fn staging(device: &wgpu::Device, slot: &mut Option<wgpu::Buffer>, size: u64) -> wgpu::Buffer {
+    match slot {
+        Some(buffer) if buffer.size() >= size => buffer.clone(),
+        _ => slot.insert(readback_buffer(device, size)).clone(),
     }
 }
 
@@ -2383,14 +2370,13 @@ impl Executor for Gpu {
     }
 
     fn execute(&mut self, cmd: &Command<'_>) -> Result<()> {
+        // A pass that ended waits only for one that may continue it: a `Label` records it too,
+        // since a pass joins only one of its own label.
         if let Some(ended) = &self.ended {
             match cmd {
-                // A label names the passes after it, the next of which may yet continue this one.
-                Command::Label { .. } => {}
                 Command::BeginPass(next) if next.joins(&ended.pass) => {}
-                Command::SetScissor { .. } | Command::SetViewport { .. } | Command::EndPass
-                    if self.pass.is_some() => {}
-                c if c.opcode().is_draw() && self.pass.is_some() => {}
+                Command::EndPass if self.pass.is_some() => {}
+                c if c.opcode().in_pass() && self.pass.is_some() => {}
                 _ => self.record_ended()?,
             }
         }
@@ -2455,6 +2441,25 @@ impl Executor for Gpu {
                 bindings,
                 uniforms,
             } => {
+                // Its ranges' ends are `u32`s, as wgpu's draw takes them.
+                if first_instance.checked_add(*instances).is_none() {
+                    return Err(Error::command(
+                        cmd.opcode(),
+                        format!(
+                            "{instances} instances from {first_instance} run past instance {}",
+                            u32::MAX
+                        ),
+                    ));
+                }
+                if first_index.checked_add(*index_count).is_none() {
+                    return Err(Error::command(
+                        cmd.opcode(),
+                        format!(
+                            "{index_count} indices from {first_index} run past index {}",
+                            u32::MAX
+                        ),
+                    ));
+                }
                 let how = DrawHow::Indexed {
                     indices: *indices,
                     at: *index_offset,
@@ -2575,23 +2580,30 @@ impl Executor for Gpu {
     /// A program's ask for `label`'s time (`std::gpu::timed`): from it on, until it's answered,
     /// the passes and dispatches labelled `label` are timed, and nothing else is (outside a run
     /// timed from its start), so a frame that times nothing doesn't wait for its timestamps.
+    /// Its answer is that work's alone, in the first call that has some: what the program
+    /// recorded before the ask doesn't count, even in the same call.
     fn ask_time(&mut self, request: u32, label: &str) -> std::result::Result<(), String> {
-        if self.timer.is_none() {
-            if !self.can_time {
-                return Err("this GPU can't time its work: it has no timestamp queries".into());
+        let timer = match &mut self.timer {
+            Some(t) => t,
+            None => {
+                if !self.device.features().contains(wgpu::Features::TIMESTAMP_QUERY) {
+                    return Err("this GPU can't time its work: it has no timestamp queries".into());
+                }
+                self.timer.insert(Timer::new(&self.device, false, false))
             }
-            self.timer = Some(Timer::new(&self.device, false, false));
-        }
-        self.asked.push((request, label.to_string(), self.calls));
+        };
+        let ask = Ask { request, label: label.to_string(), from: timer.noted, time: None };
+        self.asked.push(ask);
         Ok(())
     }
 
     fn times(&mut self) -> Vec<(u32, std::result::Result<Vec<u8>, String>)> {
-        let Some(timer) = &self.timer else { return Vec::new() };
         let mut answered = Vec::new();
-        self.asked.retain(|(request, label, from)| match timer.latest.get(label) {
-            Some(&(call, nanos)) if call >= *from => {
-                answered.push((*request, Ok(((nanos / 1000.0) as f32).to_le_bytes().to_vec())));
+        // A call's work is all read back once it has ended.
+        let ended = self.calls;
+        self.asked.retain(|ask| match ask.time {
+            Some((call, nanos)) if call < ended => {
+                answered.push((ask.request, Ok(((nanos / 1000.0) as f32).to_le_bytes().to_vec())));
                 false
             }
             _ => true,
@@ -2604,14 +2616,7 @@ impl Executor for Gpu {
     }
 
     fn limits(&self) -> wrela_abi::Limits {
-        let mut l = limits_of(&self.limits);
-        l.features = self.feature_bits;
-        if l.has("subgroups") {
-            let info = self.device.adapter_info();
-            l.subgroup_min_size = info.subgroup_min_size;
-            l.subgroup_max_size = info.subgroup_max_size;
-        }
-        l
+        self.program_limits
     }
 
     /// Finishes the old build's work, forgets its resources, and takes the new build's
@@ -2699,14 +2704,16 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
 
 /// Maps a `MAP_READ` buffer and copies it out, waiting for the GPU.
 pub fn map_read(device: &wgpu::Device, buffer: &wgpu::Buffer) -> Result<Vec<u8>> {
-    map_read_with(device, buffer, <[u8]>::to_vec)
+    map_read_with(device, buffer, buffer.size(), <[u8]>::to_vec)
 }
 
-/// Converts mapped bytes before unmapping, so callers can copy just the pixels or words they
-/// need without first copying the whole mapped range to a temporary byte vector.
+/// Maps a `MAP_READ` buffer's first `len` bytes (whole words) and converts them before
+/// unmapping, so callers can copy just the pixels or words they need without first copying the
+/// mapped range to a temporary byte vector, nor mapping more of a reused buffer than they read.
 fn map_read_with<T>(
     device: &wgpu::Device,
     buffer: &wgpu::Buffer,
+    len: u64,
     read: impl FnOnce(&[u8]) -> T,
 ) -> Result<T> {
     struct UnmapOnExit<'a>(&'a wgpu::Buffer);
@@ -2716,7 +2723,7 @@ fn map_read_with<T>(
         }
     }
 
-    let slice = buffer.slice(..);
+    let slice = buffer.slice(..len);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |r| {
         let _ = tx.send(r);
@@ -2738,7 +2745,7 @@ impl Timer {
         Timer {
             serial,
             keep,
-            latest: HashMap::new(),
+            noted: 0,
             queries: device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("timestamps"),
                 ty: wgpu::QueryType::Timestamp,
@@ -2752,17 +2759,28 @@ impl Timer {
         }
     }
 
-    /// Notes a pass about to be timed; returns the first of its two query indices.
-    /// [`Gpu::reserve_timestamps`] must have made room.
-    fn next(&mut self, frame: usize, call: usize, label: &str) -> u32 {
-        self.pending.push(Timed { frame, call, label: label.to_string() });
-        (self.pending.len() as u32 - 1) * 2
+    /// Notes a pass or dispatch about to be timed, if it is, and returns the first of its two
+    /// query indices: a timed run times every one; a program's asks (`asked`, `ask_time`) only
+    /// their labels'. [`Gpu::reserve_timestamps`] must have made room.
+    fn next_if(&mut self, asked: &[Ask], frame: usize, call: usize, label: &str) -> Option<u32> {
+        if !self.keep && !asked.iter().any(|a| a.label == label) {
+            return None;
+        }
+        self.pending.push(Timed { frame, call, label: label.to_string(), at: self.noted });
+        self.noted += 1;
+        Some((self.pending.len() as u32 - 1) * 2)
     }
 
-    /// Reads back the timestamps of the submissions made since the last call. The span mode
-    /// calls it at every flush, so it measures GPU durations, not throughput; the serial mode,
-    /// which waits after each pass anyway, once a frame.
-    fn collect(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) -> Result<()> {
+    /// Reads back the timestamps of the submissions made since the last call, adding each to
+    /// the answers of the asks before it. The span mode calls it at every flush, so it measures
+    /// GPU durations, not throughput; the serial mode, which waits after each pass anyway, once
+    /// a frame.
+    fn collect(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        asked: &mut [Ask],
+    ) -> Result<()> {
         let times = read_timestamp_spans(
             device,
             queue,
@@ -2772,14 +2790,14 @@ impl Timer {
             self.pending.len() as u32,
         )?;
         for (timed, (start, end)) in self.pending.drain(..).zip(times) {
-            let Timed { frame, call, label } = timed;
+            let Timed { frame, call, label, at } = timed;
             let submission = self.submissions;
             let nanos = end - start;
-            match self.latest.get_mut(&label) {
-                Some(l) if l.0 == call => l.1 += nanos,
-                Some(l) if l.0 > call => {}
-                _ => {
-                    self.latest.insert(label.clone(), (call, nanos));
+            for ask in asked.iter_mut().filter(|a| a.label == label && a.from <= at) {
+                match &mut ask.time {
+                    None => ask.time = Some((call, nanos)),
+                    Some((c, n)) if *c == call => *n += nanos,
+                    Some(_) => {}
                 }
             }
             if self.keep {
@@ -2871,11 +2889,8 @@ fn resolve(
     encoder.resolve_query_set(queries, 0..n, resolved, 0);
     encoder.copy_buffer_to_buffer(resolved, 0, readback, 0, size);
     queue.submit([encoder.finish()]);
-    map_read_with(device, readback, |bytes| {
-        bytes[..size as usize]
-            .chunks_exact(8)
-            .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
-            .collect()
+    map_read_with(device, readback, size, |bytes| {
+        bytes.chunks_exact(8).map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes"))).collect()
     })
 }
 
@@ -2957,9 +2972,8 @@ mod tests {
         gpu.check_errors().unwrap();
     }
 
-    #[test]
-    #[ignore = "needs a GPU"]
-    fn timestamp_collections_reuse_buffers_and_return_only_current_passes() {
+    /// A build of one compute pipeline, `increment`, that adds one to its buffer's first word.
+    fn increment() -> (Manifest, [String; 1]) {
         let mut manifest = Manifest::new("game.wasm");
         manifest.pipelines.push(Pipeline {
             name: "increment".into(),
@@ -2977,8 +2991,15 @@ mod tests {
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
                       @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
+        (manifest, [shader.to_string()])
+    }
+
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn timestamp_collections_reuse_buffers_and_return_only_current_passes() {
+        let (manifest, shaders) = increment();
         for timing in [Timing::Span, Timing::Serial] {
-            let mut gpu = Gpu::new(&manifest, &[shader.into()], timing).unwrap();
+            let mut gpu = Gpu::new(&manifest, &shaders, timing).unwrap();
             gpu.create_buffer(1, 4);
             let timer = gpu.timer.as_ref().unwrap();
             let resolved = timer.resolved.clone();
@@ -3016,24 +3037,7 @@ mod tests {
     #[ignore = "needs a GPU"]
     fn a_timed_ask_is_answered_once_and_a_retired_build_drops_its_asks() {
         use crate::program::Executor;
-        let mut manifest = Manifest::new("game.wasm");
-        manifest.pipelines.push(Pipeline {
-            name: "increment".into(),
-            shader: "increment.wgsl".into(),
-            stage: Stage::Compute { entry: "increment".into(), workgroup_size: [1, 1, 1] },
-            uniform: None,
-            bindings: vec![ResourceBinding {
-                binding: 0,
-                kind: BindingKind::ReadWrite,
-                stage: BindingStage::Both,
-                format: None,
-            }],
-            debug_flag: None,
-            requires: Vec::new(),
-        });
-        let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
-                      @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
-        let shaders = [shader.to_string()];
+        let (manifest, shaders) = increment();
         for timing in [Timing::Off, Timing::Span] {
             let mut gpu = Gpu::new(&manifest, &shaders, timing).unwrap();
             let run = |gpu: &mut Gpu| {
@@ -3049,7 +3053,7 @@ mod tests {
             gpu.execute(&Command::Label { name: "other" }).unwrap();
             gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(3, 0, 4)], &[]).unwrap();
             gpu.end_frame().unwrap();
-            let other = gpu.timer.as_ref().unwrap().latest.contains_key("other");
+            let other = gpu.timer.as_ref().unwrap().noted == 1;
             assert_eq!(other, timing == Timing::Span, "an unasked label was timed");
             run(&mut gpu);
             let answered = gpu.times();
@@ -3070,6 +3074,81 @@ mod tests {
         }
     }
 
+    /// An ask times only its label's work recorded after it, in the stream's order: one made
+    /// after that work in a call is answered by a later call's.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_timed_ask_times_only_work_recorded_after_it_in_the_same_call() {
+        use crate::program::Executor;
+        let (manifest, shaders) = increment();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off).unwrap();
+        gpu.create_buffer(1, 4);
+        let requests = |gpu: &mut Gpu| gpu.times().into_iter().map(|(r, _)| r).collect::<Vec<_>>();
+        let count = |gpu: &mut Gpu| {
+            gpu.execute(&Command::Label { name: "count" }).unwrap();
+            gpu.dispatch(0, Ok([1, 1, 1]), &[Binding::range(1, 0, 4)], &[]).unwrap();
+        };
+        gpu.ask_time(1, "count").unwrap();
+        count(&mut gpu);
+        gpu.ask_time(2, "count").unwrap();
+        gpu.end_frame().unwrap();
+        assert_eq!(requests(&mut gpu), [1], "the second ask came after the call's work");
+        gpu.end_frame().unwrap();
+        assert!(requests(&mut gpu).is_empty(), "a call without the label's work answers none");
+        count(&mut gpu);
+        gpu.end_frame().unwrap();
+        assert_eq!(requests(&mut gpu), [2]);
+        gpu.check_errors().unwrap();
+    }
+
+    /// An indexed draw whose instance or index range runs past the last `u32` is the command's
+    /// error, not a panic when its pass is recorded.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn an_indexed_draw_past_the_last_instance_fails_its_command() {
+        use crate::program::Executor;
+        let mut gpu = Gpu::new(&Manifest::new("game.wasm"), &[], Timing::Off).unwrap();
+        gpu.create_texture(2, [4, 4, 1], TextureFormat::Rgba8, false, TextureKind::D2, 1);
+        gpu.execute(&Command::BeginPass(Pass::one(2, false, [0.0; 4]))).unwrap();
+        let draw = |instances: u32, first_instance: u32, index_count: u32, first_index: u32| {
+            Command::DrawIndexed {
+                pipeline: 0,
+                indices: 1,
+                index_offset: 0,
+                index_size: 12,
+                index_count,
+                instances,
+                first_index,
+                base_vertex: 0,
+                first_instance,
+                bindings: Vec::new(),
+                uniforms: &[],
+            }
+        };
+        let error = gpu.execute(&draw(2, u32::MAX, 3, 0)).unwrap_err().to_string();
+        assert!(error.contains("run past instance"), "{error}");
+        let error = gpu.execute(&draw(1, 0, 2, u32::MAX)).unwrap_err().to_string();
+        assert!(error.contains("run past index"), "{error}");
+        gpu.execute(&Command::EndPass).unwrap();
+        gpu.flush().unwrap();
+        gpu.check_errors().unwrap();
+    }
+
+    /// A build that retires lets its readback buffers go: they're as large as its largest read.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_retired_build_lets_its_readback_buffers_go() {
+        use crate::program::Executor;
+        let (manifest, shaders) = increment();
+        let mut gpu = Gpu::new(&manifest, &shaders, Timing::Off).unwrap();
+        gpu.create_buffer(1, 1 << 16);
+        gpu.read_range(1, 0, 1 << 16).unwrap();
+        assert!(gpu.buffer_readback.is_some());
+        gpu.reload(&manifest, &shaders).unwrap();
+        assert!(gpu.buffer_readback.is_none() && gpu.image_readback.is_none());
+        gpu.check_errors().unwrap();
+    }
+
     /// Copies a texture before a later write can replace it, leaving the copy in the current
     /// encoder so the test checks ordering within and between submissions.
     fn snapshot_texture(
@@ -3080,7 +3159,7 @@ mod tests {
         format: TextureFormat,
     ) -> wgpu::Buffer {
         let row = align_to(width * format.bytes_per_texel(), wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let buffer = gpu.readback_buffer(u64::from(row) * u64::from(height));
+        let buffer = readback_buffer(&gpu.device, u64::from(row) * u64::from(height));
         let mut encoder = gpu.take_encoder();
         encoder.copy_texture_to_buffer(
             gpu.texture(handle).texture.as_image_copy(),

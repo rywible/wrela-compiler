@@ -165,7 +165,8 @@ export class Frames {
         this.#used = 0;
       }
       const body = this.#body;
-      // Other connections may have used the budget since this frame's prefix arrived.
+      // Within the budget, which other connections may have used since this frame's prefix
+      // arrived.
       if (held + body.length + OVERHEAD > available) throw new Error(`more than ${HELD} bytes wait for the program`);
       const n = Math.min(body.length - this.#used, chunk.length - at);
       body.set(chunk.subarray(at, at + n), this.#used);

@@ -14,12 +14,19 @@ export class GpuError extends Error {
  * subgroups' sizes. */
 const SEEN = new WeakMap<GPUDevice, { features: string[]; subgroups: [number, number] }>();
 
+/** What a program sees of a device `openDevice` didn't open: no optional feature but the one every
+ * device has, and no subgroups. */
+const UNSEEN = { features: ["indirect-first-instance"], subgroups: [0, 0] as [number, number] };
+
 /** The limits a program sees of `device` (`wrela.limit`): its own, then its features' bits and
  * its subgroups' sizes. */
 export function deviceLimits(device: GPUDevice): Limits {
-  const seen = SEEN.get(device) ?? { features: ["indirect-first-instance"], subgroups: [0, 0] as [number, number] };
+  const seen = SEEN.get(device) ?? UNSEEN;
   return limitsOf(device.limits, seen.features, seen.subgroups);
 }
+
+/** The names of the optional features a program sees of `device`, in `FEATURES`' order. */
+export const deviceFeatures = (device: GPUDevice): readonly string[] => (SEEN.get(device) ?? UNSEEN).features;
 
 /** Opens a hardware adapter with its own limits and every optional feature it has, as the native
  * host does. `keep` (test mode's `features=`) is what the program may see of them: null all,

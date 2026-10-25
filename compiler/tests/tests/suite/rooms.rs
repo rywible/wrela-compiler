@@ -217,7 +217,8 @@ fn build(name: &str) -> (std::sync::Arc<ServerBuild>, u64, PathBuf) {
     (build, wrela_abi::ticks::wasm_hash(wasm()), dir)
 }
 
-fn limits() -> Limits {
+/// The limits the rooms' tests open them with: 64 MiB, and half a second a call.
+pub(crate) fn limits() -> Limits {
     Limits {
         memory: 64 << 20,
         deadline: std::time::Duration::from_millis(500),
@@ -225,10 +226,20 @@ fn limits() -> Limits {
     }
 }
 
+/// Room "a" of `build` in `dir`, opened with `limits` and no services.
+fn open(
+    build: &std::sync::Arc<ServerBuild>,
+    hash: u64,
+    dir: &Path,
+    limits: Limits,
+) -> Result<RoomHost, Failure> {
+    RoomHost::open(build.clone(), hash, dir, "a", limits, None)
+}
+
 /// Room "a" of `build`, opened with `limits`, with peer 1 connected and greeted: what it sent
 /// taken.
 fn greeted(build: &std::sync::Arc<ServerBuild>, hash: u64, dir: &Path, limits: Limits) -> RoomHost {
-    let mut room = RoomHost::open(build.clone(), hash, dir, "a", limits, None).expect("open");
+    let mut room = open(build, hash, dir, limits).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -242,8 +253,7 @@ fn greeted(build: &std::sync::Arc<ServerBuild>, hash: u64, dir: &Path, limits: L
 fn what_a_room_commits_survives_a_restart() {
     let (build, hash, dir) = build("restart");
     {
-        let mut room =
-            RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+        let mut room = open(&build, hash, &dir, limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.receive(1, propose(1, 1, 1, 3));
@@ -263,7 +273,7 @@ fn what_a_room_commits_survives_a_restart() {
     }
     // A new host process: the journal is read back first, and a peer that has nothing gets
     // the log; the proposals go on from where they were.
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("reopen");
+    let mut room = open(&build, hash, &dir, limits()).expect("reopen");
     room.connect(2);
     room.receive(2, hello(5, 1, 3, 0));
     room.receive(2, propose(1, 1, 4, 8));
@@ -308,8 +318,7 @@ fn nothing_is_sent_before_its_records_are_kept() {
 fn a_torn_last_record_is_cut_from_the_journal() {
     let (build, hash, dir) = build("torn");
     {
-        let mut room =
-            RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+        let mut room = open(&build, hash, &dir, limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.receive(1, propose(1, 1, 1, 3));
@@ -325,7 +334,7 @@ fn a_torn_last_record_is_cut_from_the_journal() {
         .expect("open")
         .set_len(len - 3)
         .expect("cut");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("reopen");
+    let mut room = open(&build, hash, &dir, limits()).expect("reopen");
     assert_eq!(room.journal().expect("journal").len(), 3, "the torn commit is gone");
     room.connect(2);
     room.receive(2, hello(9, 1, 0, 0));
@@ -341,13 +350,12 @@ fn a_torn_last_record_is_cut_from_the_journal() {
 fn another_builds_journal_isnt_read() {
     let (build, hash, dir) = build("other");
     {
-        let mut room =
-            RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+        let mut room = open(&build, hash, &dir, limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.wake(0.1).expect("wake");
     }
-    match RoomHost::open(build.clone(), hash ^ 1, &dir, "a", limits(), None) {
+    match open(&build, hash ^ 1, &dir, limits()) {
         Err(Failure::Host(why)) => assert!(why.contains("isn't this room's journal"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("another build's journal was read"),
@@ -357,7 +365,7 @@ fn another_builds_journal_isnt_read() {
 #[test]
 fn a_proposal_that_traps_the_room_is_refused_and_the_rest_go_on() {
     let (build, hash, dir) = build("poison");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+    let mut room = open(&build, hash, &dir, limits()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.receive(1, propose(1, 1, 1, 3));
@@ -442,8 +450,7 @@ fn a_compaction_that_fails_leaves_the_old_journal() {
 fn a_journal_its_program_cant_read_quarantines_the_room() {
     let (build, hash, dir) = build("quarantine");
     {
-        let mut room =
-            RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+        let mut room = open(&build, hash, &dir, limits()).expect("open");
         room.connect(1);
         room.receive(1, hello(5, 1, 0, 0));
         room.wake(0.1).expect("wake");
@@ -456,7 +463,7 @@ fn a_journal_its_program_cant_read_quarantines_the_room() {
     bytes.extend_from_slice(&wrela_host::rooms::crc32c(&record).to_le_bytes());
     bytes.extend_from_slice(&record);
     std::fs::write(&path, bytes).expect("write");
-    match RoomHost::open(build.clone(), hash, &dir, "a", limits(), None) {
+    match open(&build, hash, &dir, limits()) {
         Err(Failure::Program(why)) => assert!(why.contains("journal record"), "{why}"),
         Err(other) => panic!("{other:?}"),
         Ok(_) => panic!("it opened"),
@@ -476,7 +483,7 @@ fn proposals(room: &mut RoomHost, conn: u32, from: u32, n: u32) {
 
 /// How many entries room `dir`/`a` has, read back by a new host process.
 fn entries_after_a_restart(build: &std::sync::Arc<ServerBuild>, hash: u64, dir: &Path) -> u64 {
-    let mut room = RoomHost::open(build.clone(), hash, dir, "a", roomy(), None).expect("reopen");
+    let mut room = open(build, hash, dir, roomy()).expect("reopen");
     room.connect(9);
     room.receive(9, hello(77, 1, 0, 0));
     room.wake(9.0).expect("wake");
@@ -494,7 +501,7 @@ fn roomy() -> Limits {
 #[test]
 fn a_journal_compacted_while_its_read_back_keeps_what_it_hadnt_read() {
     let (build, hash, dir) = build("long-journal");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", roomy(), None).expect("open");
+    let mut room = open(&build, hash, &dir, roomy()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -526,7 +533,7 @@ fn a_journal_compacted_while_its_read_back_keeps_what_it_hadnt_read() {
 #[test]
 fn a_wake_past_a_calls_bytes_gives_the_room_all_of_it() {
     let (build, hash, dir) = build("long-wake");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+    let mut room = open(&build, hash, &dir, limits()).expect("open");
     room.connect(1);
     room.connect(2);
     room.receive(1, hello(5, 1, 0, 0));
@@ -595,7 +602,7 @@ fn a_server_that_doesnt_read_its_events_is_quarantined() {
     let _ = std::fs::remove_dir_all(&dir);
     let build = std::sync::Arc::new(ServerBuild::from_wasm(&wasm).expect("a server build"));
     let hash = wrela_abi::ticks::wasm_hash(&wasm);
-    let mut room = RoomHost::open(build, hash, &dir, "a", limits(), None).expect("open");
+    let mut room = open(&build, hash, &dir, limits()).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     assert!(matches!(room.wake(0.1), Err(Failure::Program(_))));
@@ -632,7 +639,7 @@ fn an_event_past_the_hosts_limits_while_isolating_waits_with_those_after_it() {
 fn a_call_past_the_command_cap_is_taken_one_event_at_a_time() {
     let (build, hash, dir) = build("command-cap");
     let capped = Limits { commands: 8 << 10, ..limits() };
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", capped, None).expect("open");
+    let mut room = open(&build, hash, &dir, capped).expect("open");
     room.connect(1);
     room.receive(1, hello(5, 1, 0, 0));
     room.wake(0.1).expect("hello");
@@ -661,7 +668,7 @@ fn a_call_past_the_command_cap_is_taken_one_event_at_a_time() {
 #[test]
 fn one_room_host_at_a_time_holds_a_journal() {
     let (build, hash, dir) = build("held");
-    let mut first = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+    let mut first = open(&build, hash, &dir, limits()).expect("open");
     first.connect(1);
     first.receive(1, hello(5, 1, 0, 0));
     first.receive(1, propose(1, 1, 1, 3));
@@ -670,7 +677,7 @@ fn one_room_host_at_a_time_holds_a_journal() {
     let (b, d) = (build.clone(), dir.clone());
     let second = std::thread::spawn(move || {
         let started = std::time::Instant::now();
-        let mut room = RoomHost::open(b, hash, &d, "a", limits(), None).expect("opens once free");
+        let mut room = open(&b, hash, &d, limits()).expect("opens once free");
         room.connect(2);
         room.receive(2, hello(5, 2, 1, 0));
         room.wake(0.2).expect("wake");
@@ -689,7 +696,7 @@ fn one_room_host_at_a_time_holds_a_journal() {
 #[test]
 fn a_room_that_keeps_nothing_leaves_no_journal() {
     let (build, hash, dir) = build("nothing");
-    let mut room = RoomHost::open(build.clone(), hash, &dir, "a", limits(), None).expect("open");
+    let mut room = open(&build, hash, &dir, limits()).expect("open");
     room.connect(1);
     room.receive(1, vec![255; 3]);
     room.wake(0.1).expect("wake");

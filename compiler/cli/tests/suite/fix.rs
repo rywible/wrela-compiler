@@ -3,7 +3,7 @@
 //! changes nothing. Only the package's own files change, and every place the report names is
 //! in the files as they are after.
 
-use crate::common;
+use crate::common::{self, outputs};
 
 use std::path::{Path, PathBuf};
 
@@ -87,14 +87,6 @@ fn lines(w: World) -> u32 {
 pub fn frame(time: f32, width: u32, height: u32) {}
 ";
 
-/// Runs `wrela`: its exit status, its stdout, and its stdout and stderr together.
-fn wrela(args: &[&str]) -> (Option<i32>, String, String) {
-    let out = common::wrela().args(args).output().expect("run wrela");
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    let text = stdout.clone() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.code(), stdout, text)
-}
-
 /// A new package `name` whose `main.wrela` is `text`.
 fn package(name: &str, text: &str) -> PathBuf {
     common::package(name, &[("main.wrela", text)])
@@ -111,9 +103,9 @@ fn read(p: &Path) -> String {
 #[test]
 fn fix_makes_a_rusty_package_build() {
     let dir = package("fix-rusty", RUSTY);
-    let (code, _, before) = wrela(&["check", s(&dir)]);
+    let (code, _, before) = outputs(&["check", s(&dir)]);
     assert_eq!(code, Some(1), "it doesn't build before:\n{before}");
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     assert_eq!(code, Some(0), "after `wrela fix` it still has errors:\n{report}");
     for code in ["E0106", "E0114", "E0115", "E0207", "E0415"] {
         assert!(report.contains(&format!("fixed {code}")), "no {code} fix in:\n{report}");
@@ -136,11 +128,11 @@ fn fix_makes_a_rusty_package_build() {
         let line: usize = at.split(':').nth(1).and_then(|n| n.parse().ok()).expect(at);
         assert!(lines[line - 1].contains(want), "`{at}` isn't at `{want}` in:\n{fixed}");
     }
-    let (code, _, checked) = wrela(&["check", s(&dir)]);
+    let (code, _, checked) = outputs(&["check", s(&dir)]);
     assert_eq!(code, Some(0), "it doesn't check:\n{checked}");
-    let (code, _, fmt) = wrela(&["fmt", "--check", s(&dir)]);
+    let (code, _, fmt) = outputs(&["fmt", "--check", s(&dir)]);
     assert_eq!(code, Some(0), "it isn't formatted:\n{fmt}");
-    let (code, _, again) = wrela(&["fix", s(&dir)]);
+    let (code, _, again) = outputs(&["fix", s(&dir)]);
     assert!(code == Some(0) && again.contains("nothing to fix"), "a second run:\n{again}");
     assert_eq!(read(&dir.join("main.wrela")), fixed);
 }
@@ -149,7 +141,7 @@ fn fix_makes_a_rusty_package_build() {
 #[test]
 fn fix_leaves_choices_alone() {
     let dir = package("fix-choice", CHOICE);
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     assert_eq!(code, Some(1), "{report}");
     assert!(report.contains("has fixes to choose from"), "{report}");
     assert_eq!(read(&dir.join("main.wrela")), CHOICE);
@@ -172,13 +164,13 @@ fn go(v: Vec<Vec<u32>>) -> u32 {
 pub fn frame(time: f32, width: u32, height: u32) {}
 ";
     let dir = package("fix-lone-clone", text);
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     assert_eq!(code, Some(1), "{report}");
     assert!(report.contains("fixed E0100"), "the mode's place is mechanical:\n{report}");
     assert!(report.contains("E0502's fix is yours to choose"), "{report}");
     let fixed = read(&dir.join("main.wrela"));
     assert!(fixed.contains("keep(v[0])") && !fixed.contains(".clone()"), "{fixed}");
-    let (_, json, _) = wrela(&["check", "--json", s(&dir)]);
+    let (_, json, _) = outputs(&["check", "--json", s(&dir)]);
     let v: serde_json::Value = serde_json::from_str(&json).expect(&json);
     let fix = &v["diagnostics"][0]["fixes"][0];
     assert_eq!(
@@ -195,7 +187,7 @@ fn fix_json_reports_places_in_the_fixed_files() {
     let text = CHOICE.replace("\n\n", "\n\n\n\n")
         + "\nfn show(time: f32) {\n    println!(\"t {}\", time)\n}\n";
     let dir = package("fix-json", &text);
-    let (code, json, report) = wrela(&["fix", "--json", s(&dir)]);
+    let (code, json, report) = outputs(&["fix", "--json", s(&dir)]);
     assert_eq!(code, Some(1), "{report}");
     let v: serde_json::Value = serde_json::from_str(&json).expect(&json);
     let fixed = read(&dir.join("main.wrela"));
@@ -235,7 +227,7 @@ fn fix_changes_only_the_package() {
     let kit = "pub fn total() -> f32 {\n    var t = 0.0\n    for v in [1.0, 2.0].iter() {\n        t += v\n    }\n    t\n}\n";
     std::fs::write(dir.join("kit/sum.wrela"), kit).expect("write");
     let main = read(&dir.join("main.wrela"));
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     assert_eq!(code, Some(1), "{report}");
     assert!(report.contains("E0207's fix wasn't made: it edits `[kit] sum.wrela`"), "{report}");
     assert!(report.contains("no fix made; 1 error left"), "{report}");
@@ -262,7 +254,7 @@ fn fix_reports_a_file_it_cant_write() {
         // As root, a read-only file can be written: there's nothing to test.
         return;
     }
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     std::fs::set_permissions(&util, writable).expect("chmod");
     assert_eq!(code, Some(2), "{report}");
     assert!(report.contains("can't write") && report.contains("1 fix in 1 file"), "{report}");
@@ -281,7 +273,7 @@ fn a_fixed_file_keeps_its_permissions() {
     );
     let main = dir.join("main.wrela");
     std::fs::set_permissions(&main, std::fs::Permissions::from_mode(0o600)).expect("chmod");
-    let (code, _, report) = wrela(&["fix", s(&dir)]);
+    let (code, _, report) = outputs(&["fix", s(&dir)]);
     assert_eq!(code, Some(0), "{report}");
     assert!(read(&main).contains("print(f\"a {time}\")"), "{report}");
     let mode = std::fs::metadata(&main).expect("metadata").permissions().mode();

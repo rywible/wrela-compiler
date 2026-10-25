@@ -1,6 +1,6 @@
 //! Calls: functions, methods, built-ins, constructors, conversions, and the GPU intrinsics.
 
-use super::expr::{ValueRes, variant_expr};
+use super::expr::{ValueRes, closure_arity, variant_expr};
 use super::{Checker, zonk};
 use crate::builtins::{self, BuiltinFn, BuiltinTy};
 use crate::defs::*;
@@ -1041,22 +1041,7 @@ impl<'p> Checker<'p> {
                 let locals = def.params.clone();
                 let (params, ret, modes) = self.closure_sig(def);
                 if params.len() != ps.len() {
-                    self.err(
-                        Diagnostic::new(
-                            codes::E0301,
-                            e.span,
-                            format!(
-                                "this closure takes {} parameters, but {} are expected",
-                                params.len(),
-                                ps.len()
-                            ),
-                        )
-                        .with_help(format!(
-                            "write {} parameters, as in `|{}| ...`",
-                            ps.len(),
-                            (0..ps.len()).map(|i| format!("x{i}")).collect::<Vec<_>>().join(", ")
-                        )),
-                    );
+                    self.err(closure_arity(e.span, params.len(), ps.len()));
                     return;
                 }
                 if let Some((i, mode)) =
@@ -2010,7 +1995,7 @@ impl<'p> Checker<'p> {
                         name.span,
                         format!("`{shown}` has no associated function `{}`", name.name),
                     )
-                    .with_help(format!("`wrela doc {shown}` lists what it has")),
+                    .with_help(format!("`wrela doc {}` lists what it has", self.doc_name(ty))),
                 );
                 self.failed_call(args, span)
             }
@@ -2139,20 +2124,13 @@ impl<'p> Checker<'p> {
     fn builtin_method(&mut self, ty: TyId, name: &str, span: Span) -> Inherent {
         let p = self.p;
         let receiver = self.infer.resolve(&p.types, ty);
-        for &i in &p.builtin_inherent {
-            let imp = p.impl_(i);
-            if matches!(p.types.kind(imp.self_ty), TyKind::Str) {
-                continue;
-            }
+        // Variables are made only for an impl that could fit: one left unbound would be
+        // reported as a type that can't be inferred.
+        for imp in self.builtin_impls_for(receiver) {
             let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == name) else {
                 continue;
             };
-            if !p.func(f).public && p.func(f).module != self.scope.module {
-                continue;
-            }
-            // Variables are made only for an impl that could fit: one left unbound would be
-            // reported as a type that can't be inferred.
-            if !traits::could_unify(p, imp.self_ty, receiver) {
+            if !self.visible(f) {
                 continue;
             }
             let vars: Vec<TyId> =
@@ -2170,18 +2148,36 @@ impl<'p> Checker<'p> {
     /// Method `name` of std's `impl str`.
     fn str_method(&self, name: &str) -> Inherent {
         let p = self.p;
-        for &i in &p.builtin_inherent {
-            let imp = p.impl_(i);
-            if !matches!(p.types.kind(imp.self_ty), TyKind::Str) {
-                continue;
-            }
+        for imp in self.builtin_impls_for(p.types.intern(TyKind::Str)) {
             if let Some(f) = imp.methods.iter().copied().find(|&f| p.func(f).name == name)
-                && (p.func(f).public || p.func(f).module == self.scope.module)
+                && self.visible(f)
             {
                 return Inherent::Method(f, Vec::new());
             }
         }
         Inherent::Missing
+    }
+
+    /// Std's impls of built-in types whose methods a value of type `t` may have: `impl str`
+    /// for a `str`, and for any other type each other impl (a run's, an array's) whose type
+    /// could be `t`.
+    fn builtin_impls_for(&self, t: TyId) -> impl Iterator<Item = &'p ImplDef> + use<'p> {
+        let p = self.p;
+        let is_str = matches!(self.kind(t), TyKind::Str);
+        p.builtin_inherent.iter().map(|&i| p.impl_(i)).filter(move |imp| {
+            if matches!(p.types.kind(imp.self_ty), TyKind::Str) {
+                is_str
+            } else {
+                !is_str && traits::could_unify(p, imp.self_ty, t)
+            }
+        })
+    }
+
+    /// Whether code being checked can see function `f` of an impl: it's public, or this
+    /// module's own.
+    fn visible(&self, f: FnId) -> bool {
+        let def = self.p.func(f);
+        def.public || def.module == self.scope.module
     }
 
     /// Whether code being checked can see trait `t`: it's this module's own, or its visibility
@@ -2985,16 +2981,16 @@ impl<'p> Checker<'p> {
     /// arguments among the call's own. With a fix that binds them, when the source is at hand
     /// and each argument has one place to go.
     fn unbound_gpu_call(&mut self, call: &str, rewrite: Option<(Span, String)>, span: Span) {
-        let (form, note) = if call == "dispatch" {
-            (
+        let shaders = "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone";
+        let (form, note) = match call {
+            "dispatch" => (
                 "`dispatch(kernel.bind(...), groups: n)`",
                 "a kernel's arguments go in its `.bind(...)`, matched as a call's are",
-            )
-        } else {
-            (
-                "`draw(pass, vs.bind(...), fs.bind(...), vertices: n)`",
-                "each shader's arguments go in its own `.bind(...)`, matched as a call's are; one that takes nothing is named alone",
-            )
+            ),
+            "draw_multi" => {
+                ("`draw_multi(pass, vs.bind(...), fs.bind(...), indirect: buf, count: n)`", shaders)
+            }
+            _ => ("`draw(pass, vs.bind(...), fs.bind(...), vertices: n)`", shaders),
         };
         let mut d = Diagnostic::new(
             codes::E0603,
@@ -3036,12 +3032,12 @@ impl<'p> Checker<'p> {
     /// builtin input, or workgroup memory.
     pub(crate) fn is_gpu_builtin(&self, t: TyId) -> bool {
         crate::gpu::BuiltinInput::of(self.p, t).is_some()
-            || matches!(self.kind(t), &TyKind::Adt(a, _) if self.p.is_lang_adt(a, Lang::Shared) || self.p.is_lang_adt(a, Lang::SharedAtomics) || self.p.is_lang_adt(a, Lang::SharedAtomicsI))
+            || self.p.lang_of_ty(self.shallow(t)).is_some_and(Lang::is_workgroup_memory)
     }
 
     /// How `wrela doc` names type `t`'s page: a struct's or an enum's name, `[T]` for a run,
     /// `[T; N]` for an array, and a built-in type's own name.
-    fn doc_name(&self, t: TyId) -> String {
+    pub(crate) fn doc_name(&self, t: TyId) -> String {
         match self.kind(t) {
             TyKind::Adt(a, _) => self.p.adt(*a).name.clone(),
             TyKind::Slice(_) => "[T]".into(),
@@ -3060,20 +3056,10 @@ impl<'p> Checker<'p> {
     fn method_names(&self, t: TyId) -> Vec<String> {
         let p = self.p;
         let mut out = Vec::new();
-        let is_str = matches!(self.kind(t), TyKind::Str);
-        for &i in &p.builtin_inherent {
-            let imp = p.impl_(i);
-            let fits = if matches!(p.types.kind(imp.self_ty), TyKind::Str) {
-                is_str
-            } else {
-                !is_str && traits::could_unify(p, imp.self_ty, t)
-            };
-            if !fits {
-                continue;
-            }
+        for imp in self.builtin_impls_for(t) {
             for &f in &imp.methods {
                 let def = p.func(f);
-                if def.has_self() && (def.public || def.module == self.scope.module) {
+                if def.has_self() && self.visible(f) {
                     out.push(def.name.clone());
                 }
             }
@@ -3196,6 +3182,22 @@ impl<'p> Checker<'p> {
         }
     }
 
+    /// E0503 for `e`, an argument the GPU writes through, if it's a place not passed `mut ...`;
+    /// `name` is its parameter's.
+    fn require_mut_arg(&mut self, e: &Expr, name: &str) {
+        if !matches!(e.kind, ExprKind::MutArg(_)) && e.is_place() {
+            self.err(
+                Diagnostic::new(
+                    codes::E0503,
+                    e.span,
+                    format!("`{name}` is written by the GPU, so it's passed `mut ...`"),
+                )
+                .with_note("every mutation is visible where it happens (§6.2, §18.3)")
+                .with_fix("add `mut`", e.span.shrink_to_start(), "mut "),
+            );
+        }
+    }
+
     /// A dispatch's or draw's argument for an entry point's parameter `p` (§18.3). A buffer
     /// parameter takes a `GpuBuffer<T>` or a span of one: for `[T]`, the buffer borrowed or a
     /// `GpuSpan<T>`; for `mut Slots<T>` (or `mut [T]`), `mut buf` or a `GpuSpanMut<T>`. Any
@@ -3203,66 +3205,37 @@ impl<'p> Checker<'p> {
     fn gpu_arg(&mut self, p: &CallParam, value: &ast::Expr) -> Expr {
         // A texture parameter takes part of one too: a `Texture<F>` a level or a layer to read,
         // a `Texels<F>` one to write, a `MipStep<F>` a texture's step (§18.8).
-        if let TyKind::Adt(s, args) = self.kind(p.ty).clone() {
-            let lang = self.p.adt(s).lang;
-            let (whole, views): (Option<Lang>, &[Lang]) = match lang {
-                Some(Lang::Texture) => {
-                    (Some(Lang::Texture), &[Lang::TextureLevel, Lang::TextureLayer])
-                }
-                Some(Lang::Texels) => {
-                    (Some(Lang::Texture), &[Lang::TextureLevelMut, Lang::TextureLayerMut])
-                }
-                Some(Lang::MipStep) => (None, &[Lang::TextureStep]),
-                _ => (None, &[]),
-            };
-            if !views.is_empty() {
-                let e = self.check_expr(value, None);
-                let t = self.infer.resolve(&self.p.types, e.ty);
-                let given = match self.kind(t) {
-                    TyKind::Adt(a, _) => self.p.adt(*a).lang,
-                    _ => None,
-                };
-                let of = |this: &mut Self, l: Lang| {
-                    this.p
-                        .lang_adt(l)
-                        .map_or(this.p.types.error, |g| this.p.types.adt(g, args.clone()))
-                };
-                match given {
-                    Some(v) if views.contains(&v) => {
-                        let want = of(self, v);
-                        self.expect(e.ty, want, e.span);
-                    }
-                    _ => {
-                        let want = match whole {
-                            Some(w) => of(self, w),
-                            None => of(self, views[0]),
-                        };
-                        self.expect(e.ty, want, e.span);
-                        let written = lang == Some(Lang::Texels);
-                        if written && !matches!(e.kind, ExprKind::MutArg(_)) && e.is_place() {
-                            self.err(
-                                Diagnostic::new(
-                                    codes::E0503,
-                                    e.span,
-                                    format!(
-                                        "`{}` is written by the GPU, so it's passed `mut ...`",
-                                        p.name
-                                    ),
-                                )
-                                .with_note(
-                                    "every mutation is visible where it happens (§6.2, §18.3)",
-                                )
-                                .with_fix(
-                                    "add `mut`",
-                                    e.span.shrink_to_start(),
-                                    "mut ",
-                                ),
-                            );
-                        }
-                    }
-                }
-                return e;
+        let lang = self.p.lang_of_ty(self.shallow(p.ty));
+        let (whole, views): (Option<Lang>, &[Lang]) = match lang {
+            Some(Lang::Texture) => (Some(Lang::Texture), &[Lang::TextureLevel, Lang::TextureLayer]),
+            Some(Lang::Texels) => {
+                (Some(Lang::Texture), &[Lang::TextureLevelMut, Lang::TextureLayerMut])
             }
+            Some(Lang::MipStep) => (None, &[Lang::TextureStep]),
+            _ => (None, &[]),
+        };
+        if !views.is_empty()
+            && let TyKind::Adt(_, args) = self.kind(p.ty)
+        {
+            let e = self.check_expr(value, None);
+            let t = self.infer.resolve(&self.p.types, e.ty);
+            let of = |this: &mut Self, l: Lang| {
+                this.p.lang_adt(l).map_or(this.p.types.error, |g| this.p.types.adt(g, args.clone()))
+            };
+            match self.p.lang_of_ty(t) {
+                Some(v) if views.contains(&v) => {
+                    let want = of(self, v);
+                    self.expect(e.ty, want, e.span);
+                }
+                _ => {
+                    let want = of(self, whole.unwrap_or(views[0]));
+                    self.expect(e.ty, want, e.span);
+                    if lang == Some(Lang::Texels) {
+                        self.require_mut_arg(&e, p.name);
+                    }
+                }
+            }
+            return e;
         }
         // An `Append<T>` takes `mut` an `AppendBuffer<T>`, an `AtomicMap` an `AtomicMapBuffer`.
         let container = match self.kind(p.ty) {
@@ -3285,17 +3258,7 @@ impl<'p> Checker<'p> {
         if let Some((l, args)) = container {
             let want = self.p.lang_adt(l).map_or(self.p.types.error, |g| self.p.types.adt(g, args));
             let e = self.check_expect(value, want);
-            if !matches!(e.kind, ExprKind::MutArg(_)) && e.is_place() {
-                self.err(
-                    Diagnostic::new(
-                        codes::E0503,
-                        e.span,
-                        format!("`{}` is written by the GPU, so it's passed `mut ...`", p.name),
-                    )
-                    .with_note("every mutation is visible where it happens (§6.2, §18.3)")
-                    .with_fix("add `mut`", e.span.shrink_to_start(), "mut "),
-                );
-            }
+            self.require_mut_arg(&e, p.name);
             return e;
         }
         let elem = match self.kind(p.ty) {
@@ -3316,11 +3279,7 @@ impl<'p> Checker<'p> {
             this.p.lang_adt(l).map_or(this.p.types.error, |g| this.p.types.adt(g, vec![elem]))
         };
         let t = self.infer.resolve(&self.p.types, e.ty);
-        let lang = match self.kind(t) {
-            TyKind::Adt(a, _) => self.p.adt(*a).lang,
-            _ => None,
-        };
-        match lang {
+        match self.p.lang_of_ty(t) {
             Some(Lang::GpuSpanMut) => {
                 let want = of(self, Lang::GpuSpanMut);
                 self.expect(e.ty, want, e.span);
@@ -3570,9 +3529,10 @@ impl<'p> Checker<'p> {
     /// state, `cull:`, `depth_bias:`, `depth:` and `blend:` (or `blends:`), build-time
     /// constants. `draw_multi` (`multi`) takes `indirect:` and `count:`, the number of draws.
     fn check_draw(&mut self, args: &[ast::Arg], multi: bool, span: Span) -> Expr {
+        let callee = if multi { "draw_multi" } else { "draw" };
         let unit = self.p.types.unit;
         let u32_ty = self.p.types.u32;
-        let i32_ty = self.p.types.intern(TyKind::Int(crate::ty::IntTy::I32));
+        let i32_ty = self.p.types.i32;
         // `draw`'s own named arguments.
         const OWN: [&str; 14] = [
             "vertices",
@@ -3624,12 +3584,17 @@ impl<'p> Checker<'p> {
                 let last = args[args.len() - 1].span;
                 Some((Span::new(first.file, first.start, last.end), parts.join(", ")))
             })();
-            self.unbound_gpu_call("draw", rewrite, span);
+            self.unbound_gpu_call(callee, rewrite, span);
             self.check_args_alone(&args[3..]);
             return self.error_expr(span);
         }
         if args.len() < 3 || args[..3].iter().any(|a| a.name.is_some()) {
-            self.err(Diagnostic::new(codes::E0603, span, "`draw` takes the pass, then the vertex and fragment shaders: `draw(pass, vs, fs.bind(...), vertices: n)`"));
+            let counts = if multi { "indirect: buf, count: n" } else { "vertices: n" };
+            self.err(Diagnostic::new(
+                codes::E0603,
+                span,
+                format!("`{callee}` takes the pass, then the vertex and fragment shaders: `{callee}(pass, vs, fs.bind(...), {counts})`"),
+            ));
             self.check_args_alone(args);
             return self.error_expr(span);
         }
@@ -3754,9 +3719,7 @@ impl<'p> Checker<'p> {
                 }
                 "blend" => {
                     if let Some(c) = self.render_constant(&a.value, Lang::Blend) {
-                        let b = wrela_abi::manifest::Blend::ALL
-                            [(c[0] as usize).min(wrela_abi::manifest::Blend::ALL.len() - 1)];
-                        state.blends = [b; 4];
+                        state.blends = [nth(&wrela_abi::manifest::Blend::ALL, c[0]); 4];
                         state.blend_given = true;
                     }
                 }
@@ -3782,8 +3745,7 @@ impl<'p> Checker<'p> {
                     }
                     for (k, item) in items.iter().enumerate().take(4) {
                         if let Some(c) = self.render_constant(item, Lang::Blend) {
-                            state.blends[k] = wrela_abi::manifest::Blend::ALL
-                                [(c[0] as usize).min(wrela_abi::manifest::Blend::ALL.len() - 1)];
+                            state.blends[k] = nth(&wrela_abi::manifest::Blend::ALL, c[0]);
                         }
                     }
                     state.blend_count = items.len().min(4) as u8;
@@ -3836,7 +3798,7 @@ impl<'p> Checker<'p> {
                         use wrela_abi::manifest::{Compare, DepthState};
                         // `std::gpu::Compare`'s variants, in the order std declares them (as
                         // the manifest's), then the write flag.
-                        let compare = Compare::ALL[(c[0] as usize).min(Compare::ALL.len() - 1)];
+                        let compare = nth(&Compare::ALL, c[0]);
                         state.depth = DepthState { compare, write: c[1] != 0.0 };
                     }
                 }
@@ -3917,12 +3879,15 @@ impl<'p> Checker<'p> {
             (None, None) if direct_indexed => {
                 index_count.unwrap_or(lit(i128::from(u32::MAX), u32_ty))
             }
+            // `draw_multi` without `indirect:` is reported above.
             (None, None) => {
-                self.err(Diagnostic::new(
-                    codes::E0603,
-                    span,
-                    "`draw` needs `vertices:`, how many vertices to draw",
-                ));
+                if !multi {
+                    self.err(Diagnostic::new(
+                        codes::E0603,
+                        span,
+                        "`draw` needs `vertices:`, how many vertices to draw",
+                    ));
+                }
                 return self.error_expr(span);
             }
         };
@@ -4050,10 +4015,11 @@ impl<'p> Checker<'p> {
     }
 }
 
-/// A `const` of a draw's state type (`Lang::Cull`, `Lang::DepthBias` or `Lang::Depth`, the ADT
-/// `a`), as its declaration writes it: a variant, a struct of number literals, maybe negated,
-/// or a `Depth` of a `Compare` variant and a bool, its defaults filling what it leaves out
-/// (`render_constant`).
+/// A `const` of a draw's state type (`Lang::Cull`, `Lang::Blend`, `Lang::DepthBias` or
+/// `Lang::Depth`, the ADT `a`), as its declaration writes it: a variant, a struct of number
+/// literals, maybe negated, or a `Depth` of a `Compare` variant and a bool, its defaults filling
+/// what it leaves out (`render_constant`). A variant is the one its path resolves to where the
+/// constant is declared, whatever a `use ... as` names it.
 fn declared_render_constant(
     p: &crate::Program,
     c: ConstId,
@@ -4071,25 +4037,26 @@ fn declared_render_constant(
         }
     }
     let adt = p.adt(a);
+    let module = p.const_(c).module;
+    // The index of the variant of enum `e` that `path` names.
+    let variant =
+        |path: &ast::Path, e: AdtId| match crate::resolve::resolve_value_item(p, module, path)? {
+            Res::Variant(x, v) if x == e => Some(f64::from(v)),
+            _ => None,
+        };
     match (&p.const_(c).value.kind, lang) {
         (ast::ExprKind::Path(path), Lang::Cull | Lang::Blend) => {
-            let name = &path.segments.last()?.ident.name;
-            let v = adt.variants().iter().position(|v| &v.name == name)?;
-            Some([v as f64, 0.0, 0.0])
+            Some([variant(path, a)?, 0.0, 0.0])
         }
         (ast::ExprKind::StructLit { fields, base: None, .. }, Lang::Depth) => {
             // `Compare`: the type of the field that's an enum.
             let compare = adt.fields().iter().find_map(|f| match p.types.kind(f.ty) {
-                &TyKind::Adt(e, _) if p.adt(e).is_enum() => Some(p.adt(e)),
+                &TyKind::Adt(e, _) if p.adt(e).is_enum() => Some(e),
                 _ => None,
             })?;
             // A `Compare` variant's index, or a bool literal as 0 or 1.
             let plain = |e: &ast::Expr| match &e.kind {
-                ast::ExprKind::Path(path) => {
-                    let name = &path.segments.last()?.ident.name;
-                    let v = compare.variants().iter().position(|v| &v.name == name)?;
-                    Some(v as f64)
-                }
+                ast::ExprKind::Path(path) => variant(path, compare),
                 ast::ExprKind::Lit(ast::Lit { kind: ast::LitKind::Bool(b), .. }) => {
                     Some(if *b { 1.0 } else { 0.0 })
                 }
@@ -4144,6 +4111,12 @@ struct BoundValue {
     stage: Entry,
     func: Option<FnId>,
     varyings: Option<TyId>,
+}
+
+/// Variant `c` of a draw's state, a render constant's index into `all`, its variants in std's
+/// order; the last for an index past the end.
+fn nth<T: Copy>(all: &[T], c: f64) -> T {
+    all[(c as usize).min(all.len() - 1)]
 }
 
 /// How a function type passes a parameter of mode `m`, for a message: "by borrow", "as `mut`".

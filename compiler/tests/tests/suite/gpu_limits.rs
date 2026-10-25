@@ -29,6 +29,63 @@ fn a_program_sees_the_adapters_limits() {
     eprintln!("the adapter's textures go to {texture} texels, its buffers to {buffer} bytes");
 }
 
+/// A level as wide and tall as the adapter allows can hold more bytes than a `u32` counts (16384
+/// × 16384 `Rgba32Float` texels are 4 GiB): std counts a write's, a copy's and a read's bytes in
+/// `u64`, and one that can't hold them panics, saying why, rather than overflow.
+#[test]
+#[ignore = "needs a GPU"]
+fn the_largest_levels_bytes_are_counted_past_4_gib() {
+    let text = "use std::gpu::{
+    GpuBuffer, Rgba32Float, Texture, buffer, copy_buffer_to_texture, copy_texture_to_buffer,
+    limits, read_texture, texture,
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+
+pub fn side() -> u32 {
+    limits().max_texture_size
+}
+
+fn largest() -> Texture<Rgba32Float> {
+    texture(width: 16384, height: 16384)
+}
+
+pub fn write() {
+    var t = largest()
+    t.write(x: 0, y: 0, width: 16384, height: 16384, bytes: [u8(0); 16])
+}
+
+pub fn to_buffer() {
+    var b: GpuBuffer<u32> = buffer(64)
+    copy_texture_to_buffer(largest().level(0), mut b)
+}
+
+pub fn from_buffer() {
+    let b: GpuBuffer<u32> = buffer(64)
+    var t = largest()
+    copy_buffer_to_texture(b.span(start: 0, count: 64), t.level_mut(0))
+}
+
+pub fn read() {
+    let _ = read_texture(largest().level(0))
+}
+";
+    let dir = crate::package("gpu-limits-largest", text);
+    wrela_tests::must_build(&dir, &dir.join("build"));
+    let mut host = Host::load(dir.join("build")).expect("load");
+    let side = one_u32(&mut host, "side", &[]);
+    assert!(side >= 16384, "the adapter's textures go to {side} texels; this needs 16384");
+    for (export, why) in [
+        ("write", "write: the bytes aren't the rectangle's texels"),
+        ("to_buffer", "copy_texture_to_buffer: the buffer is smaller than the texture's"),
+        ("from_buffer", "copy_buffer_to_texture: the span is smaller than the texture's"),
+        ("read", "read_texture: the level's padded rows are 4 GiB or more"),
+    ] {
+        let err = host.call_export(export, &[]).expect_err(export);
+        assert!(format!("{err:#}").contains(why), "{export}: {err:#}");
+    }
+}
+
 /// `std::gpu::memory()` is std's count, the host's `memory.json` its own: for a program that
 /// makes known resources and drops a buffer (compiler/tests/memory), Chrome's count at the end
 /// and at its most is the program's, buffers and textures together.

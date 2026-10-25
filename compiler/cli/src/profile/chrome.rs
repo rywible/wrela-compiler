@@ -12,7 +12,7 @@
 //! `--features` passes test mode's mask (`features=none`, or a comma list to keep). Chrome's
 //! timestamps are full resolution under the developer flag `runtime/chrome` sets.
 
-use super::{Args, Label, Profile, Times, by_label, median, percentile};
+use super::{Args, Label, Profile, Times, by_label, median};
 use serde_json::Value;
 use std::path::Path;
 
@@ -23,16 +23,14 @@ fn run_page(
     frames: u32,
     files: &[&str],
 ) -> Result<Vec<Value>, String> {
-    let (Some(root), Some(page)) = (built.parent(), built.file_name().and_then(|n| n.to_str()))
-    else {
-        return Err("the build has no directory Chrome can serve".into());
-    };
+    let built = std::path::absolute(built).map_err(|e| format!("{}: {e}", built.display()))?;
     // Real time for the paced run, and the GPU's pipelines first: generous, but bounded.
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / 60.0 * 10.0).max(120.0));
+    // The build's directory alone is served: it is the page.
     let run = || {
         wrela_host::pages::run(wrela_host::pages::Page {
-            root,
-            page,
+            root: &built,
+            page: "",
             fragment,
             timeout,
             script: None,
@@ -58,14 +56,14 @@ fn run_page(
 }
 
 /// The fragment's parameters every run shares.
-fn common(a: &Args, input: bool) -> Result<String, String> {
+fn common(a: &Args) -> String {
     let (w, h) = a.size;
     let mut s = format!(
         "&frames={}&width={w}&height={h}&fps=60&workers={}",
         a.warmup + a.frames,
         a.workers
     );
-    if input {
+    if a.input.is_some() {
         s.push_str("&input=input.json");
     }
     if let Some(keep) = &a.features {
@@ -74,7 +72,7 @@ fn common(a: &Args, input: bool) -> Result<String, String> {
     if !a.checked {
         s.push_str("&checks=0");
     }
-    Ok(s)
+    s
 }
 
 /// The numbers of `v` (a JSON array) from index `from`.
@@ -85,20 +83,19 @@ fn numbers(v: &Value, from: usize) -> Vec<f64> {
 
 /// What Chrome measured of the build at `built` (its input script, if any, beside it as
 /// `input.json`), and the adapter it ran on (`device.json`).
-pub(super) fn measure(a: &Args, built: &Path, input: bool) -> Result<(Profile, Value), String> {
+pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String> {
     let frames = a.warmup + a.frames;
     let timestamps = if a.serial { 2 } else { 1 };
-    let fragment =
-        format!("#test{}&timestamps={timestamps}&saturate=1&nohash=1", common(a, input)?);
-    let [timings, _, counters, device] = <[Value; 4]>::try_from(run_page(
+    let fragment = format!("#test{}&timestamps={timestamps}&saturate=1&nohash=1", common(a));
+    let [timings, counters, device] = <[Value; 3]>::try_from(run_page(
         built,
         &fragment,
         frames,
-        &["timings.json", "frames.json", "counters.json", "device.json"],
+        &["timings.json", "counters.json", "device.json"],
     )?)
     .map_err(|_| "Chrome's results are incomplete")?;
     // The paced run: CPU times, phases and frame intervals as a player sees them.
-    let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a, input)?);
+    let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a));
     let [framed] = <[Value; 1]>::try_from(run_page(built, &fragment, frames, &["frames.json"])?)
         .map_err(|_| "Chrome's paced results are incomplete")?;
     let warmup = a.warmup as usize;
@@ -144,9 +141,8 @@ pub(super) fn measure(a: &Args, built: &Path, input: bool) -> Result<(Profile, V
         }
     }
     let per_frame: Vec<&Value> = counters.as_array().into_iter().flatten().skip(warmup).collect();
-    let counters = super::COUNTERS
-        .iter()
-        .map(|&name| {
+    let counters = super::counter_names()
+        .map(|name| {
             let xs: Vec<f64> = per_frame.iter().filter_map(|c| c[name].as_f64()).collect();
             (name, median(xs).unwrap_or(0.0))
         })
@@ -164,10 +160,7 @@ pub(super) fn measure(a: &Args, built: &Path, input: bool) -> Result<(Profile, V
             labels,
             span: Times::of(spans),
             frame: Times::of(calls).unwrap_or_default(),
-            interval: Some(Times {
-                median: median(intervals.clone()).unwrap_or(0.0),
-                p95: percentile(&intervals, 95).unwrap_or(0.0),
-            }),
+            interval: Some(Times::of(intervals).unwrap_or_default()),
             counters,
             phases: wrela_host::Traced { lines: Vec::new(), phases },
             wgsl: super::wgsl(built)?,
@@ -199,13 +192,14 @@ mod tests {
     fn its_runs_pass_the_feature_mask_and_the_input() {
         let mut a = super::super::parse(&["scene".into(), "--chrome".into()]).unwrap();
         assert_eq!(
-            common(&a, false).unwrap(),
+            common(&a),
             format!("&frames=180&width=1280&height=720&fps=60&workers={}&checks=0", a.workers)
         );
         a.features = Some("none".into());
-        assert!(common(&a, true).unwrap().ends_with("&input=input.json&features=none&checks=0"));
+        a.input = Some("input.json".into());
+        assert!(common(&a).ends_with("&input=input.json&features=none&checks=0"));
         a.checked = true;
-        assert!(common(&a, true).unwrap().ends_with("&features=none"));
+        assert!(common(&a).ends_with("&features=none"));
         assert!(
             super::super::parse(&["scene".into(), "--features".into(), "none".into()]).is_none()
         );

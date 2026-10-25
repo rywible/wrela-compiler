@@ -972,11 +972,11 @@ impl<'a, 'm> Fb<'a, 'm> {
         c: &ir::FragmentColour,
         out: &mut Block,
     ) -> R<Handle<Expression>> {
-        let scalar = scalar(c.scalar)?;
-        let four = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar });
         if c.components == 4 {
             return Ok(h);
         }
+        let scalar = scalar(c.scalar)?;
+        let four = self.cx.ty_inner(TypeInner::Vector { size: VectorSize::Quad, scalar });
         let mut parts = Vec::new();
         if c.components == 1 {
             parts.push(h);
@@ -1591,7 +1591,7 @@ impl<'a, 'm> Fb<'a, 'm> {
         };
         let arrayed = matches!(
             self.cx.m.resources[tex.index()].kind,
-            ir::ResourceKind::StorageTexture { dim: ir::TexDim::D2Array, .. }
+            ir::ResourceKind::StorageTexture { dim, .. } if dim.arrayed()
         );
         let (xs, array_index) = match (arrayed, xs.split_last()) {
             (true, Some((&layer, xs))) => (xs, Some(self.val(layer)?)),
@@ -1725,7 +1725,6 @@ impl<'a, 'm> Fb<'a, 'm> {
     }
 }
 
-/// A texture's dimension: 3D when `three`, else 2D.
 /// A texture binding's naga dimension, and whether it's arrayed.
 fn image_dim(dim: ir::TexDim) -> (naga::ImageDimension, bool) {
     match dim {

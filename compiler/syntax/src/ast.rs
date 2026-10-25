@@ -208,6 +208,10 @@ impl Path {
     pub fn last(&self) -> &Ident {
         &self.segments[self.segments.len() - 1].ident
     }
+    /// The name this path is, if it is one name with no generic arguments.
+    pub fn single_name(&self) -> Option<&str> {
+        self.is_single().then(|| self.segments[0].ident.name.as_str())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -915,42 +919,99 @@ impl Expr {
         f(self);
         self.for_each_child(&mut |c| c.walk(f));
     }
+
+    /// The name this expression is, if it is a single name.
+    pub fn single_name(&self) -> Option<&str> {
+        match &self.kind {
+            ExprKind::Path(p) => p.single_name(),
+            _ => None,
+        }
+    }
+
+    /// Calls `f` on each block inside this expression, nested ones included, outermost first.
+    pub fn for_each_block<'a>(&'a self, f: &mut impl FnMut(&'a Block)) {
+        match &self.kind {
+            ExprKind::Block(b) | ExprKind::Unsafe(b) => b.for_each_block(f),
+            ExprKind::If { cond, then, else_, .. } => {
+                cond.for_each_block(f);
+                then.for_each_block(f);
+                if let Some(e) = else_ {
+                    e.for_each_block(f);
+                }
+            }
+            _ => self.for_each_child(&mut |c| c.for_each_block(f)),
+        }
+    }
+}
+
+/// An expression or a block directly in a statement.
+enum StmtPart<'a> {
+    Expr(&'a Expr),
+    Block(&'a Block),
+}
+
+impl Stmt {
+    /// Calls `f` on each expression and block directly in the statement, in source order.
+    fn for_each_part<'a>(&'a self, f: &mut impl FnMut(StmtPart<'a>)) {
+        match &self.kind {
+            StmtKind::Let { init, else_, .. } => {
+                f(StmtPart::Expr(init));
+                if let Some(b) = else_ {
+                    f(StmtPart::Block(b));
+                }
+            }
+            StmtKind::Var { init, .. } => f(StmtPart::Expr(init)),
+            StmtKind::Assign { target, value, .. } => {
+                f(StmtPart::Expr(target));
+                f(StmtPart::Expr(value));
+            }
+            StmtKind::Expr(e) => f(StmtPart::Expr(e)),
+            StmtKind::While { cond, body, .. } => {
+                f(StmtPart::Expr(cond));
+                f(StmtPart::Block(body));
+            }
+            StmtKind::Loop { body } => f(StmtPart::Block(body)),
+            StmtKind::For { iter, body, .. } => {
+                match iter {
+                    ForIter::Range { start, end, .. } => {
+                        f(StmtPart::Expr(start));
+                        f(StmtPart::Expr(end));
+                    }
+                    ForIter::Expr(e) => f(StmtPart::Expr(e)),
+                }
+                f(StmtPart::Block(body));
+            }
+        }
+    }
+
+    /// Calls `f` on each expression directly in the statement, and directly in the statements
+    /// of its blocks.
+    pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
+        self.for_each_part(&mut |part| match part {
+            StmtPart::Expr(e) => f(e),
+            StmtPart::Block(b) => b.for_each_expr(f),
+        });
+    }
+
+    /// Calls `f` on each block inside the statement, nested ones included, outermost first.
+    pub fn for_each_block<'a>(&'a self, f: &mut impl FnMut(&'a Block)) {
+        self.for_each_part(&mut |part| match part {
+            StmtPart::Expr(e) => e.for_each_block(f),
+            StmtPart::Block(b) => b.for_each_block(f),
+        });
+    }
 }
 
 impl Block {
     /// Calls `f` on each expression directly in the block's statements.
     pub fn for_each_expr<'a>(&'a self, f: &mut impl FnMut(&'a Expr)) {
-        for s in &self.stmts {
-            match &s.kind {
-                StmtKind::Let { init, else_, .. } => {
-                    f(init);
-                    if let Some(b) = else_ {
-                        b.for_each_expr(f);
-                    }
-                }
-                StmtKind::Var { init, .. } => f(init),
-                StmtKind::Assign { target, value, .. } => {
-                    f(target);
-                    f(value);
-                }
-                StmtKind::Expr(e) => f(e),
-                StmtKind::While { cond, body, .. } => {
-                    f(cond);
-                    body.for_each_expr(f);
-                }
-                StmtKind::Loop { body } => body.for_each_expr(f),
-                StmtKind::For { iter, body, .. } => {
-                    match iter {
-                        ForIter::Range { start, end, .. } => {
-                            f(start);
-                            f(end);
-                        }
-                        ForIter::Expr(e) => f(e),
-                    }
-                    body.for_each_expr(f);
-                }
-            }
-        }
+        self.stmts.iter().for_each(|s| s.for_each_expr(f));
+    }
+
+    /// Calls `f` on this block and each block inside it, nested ones included, outermost first.
+    pub fn for_each_block<'a>(&'a self, f: &mut impl FnMut(&'a Block)) {
+        f(self);
+        self.stmts.iter().for_each(|s| s.for_each_block(f));
     }
 }
 

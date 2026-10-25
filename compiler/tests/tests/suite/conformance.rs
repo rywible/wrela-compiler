@@ -96,16 +96,13 @@ fn errors(case: &Case) -> (Errors, Vec<String>) {
     let built =
         if accepting { wrela_driver::build_every_fn(&dir) } else { wrela_driver::build(&dir) };
     let mut out: Errors = BTreeMap::new();
-    let mut bare = Vec::new();
     // A case is about something else than `frame`, which a program must export: a case
     // without one isn't told so (`a_program_without_frame_is_rejected` is).
     let no_frame = |d: &wrela_diag::Diagnostic| {
         d.code == wrela_diag::codes::E0703 && d.span().is_some_and(|s| s.start == 0 && s.end == 0)
     };
+    let bare = wrela_tests::without_own_help(built.diagnostics.iter().filter(|d| !no_frame(d)));
     for d in built.diagnostics.iter().filter(|d| d.is_error() && !no_frame(d)) {
-        if d.has_only_general_help() {
-            bare.push(format!("{} {}", d.code.as_str(), d.message));
-        }
         let Some(span) = d.span() else {
             // An internal error: a case can't expect one.
             out.entry(("<internal>".into(), 0)).or_default().push(d.code.as_str().to_string());

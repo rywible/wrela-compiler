@@ -38,24 +38,21 @@ fn ball(name: &str, source: &str) -> std::path::PathBuf {
 
 /// `wrela same`'s exit status and its JSON report (or its error).
 fn same(dir: &std::path::Path, against: &std::path::Path, extra: &[&str]) -> (Option<i32>, String) {
-    let out = common::wrela()
-        .arg("same")
-        .arg(dir)
-        .arg("--against")
-        .arg(against)
-        .args(["--no-gpu", "--json"])
-        .args(extra)
-        .output()
-        .expect("run wrela");
-    let text =
-        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
-    (out.status.code(), text)
+    common::run(
+        common::wrela()
+            .arg("same")
+            .arg(dir)
+            .arg("--against")
+            .arg(against)
+            .args(["--no-gpu", "--json"])
+            .args(extra),
+    )
 }
 
+/// A saved build of the package in `dir`, beside it as `name`.
 fn saved(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     let to = dir.parent().unwrap().join(name);
-    let out = common::wrela().arg("build").arg(dir).arg("-o").arg(&to).output().expect("build");
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    common::stdout(common::wrela().arg("build").arg(dir).arg("-o").arg(&to));
     to
 }
 

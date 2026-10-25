@@ -75,11 +75,7 @@ fn compile(name: &str, text: &str, dir: Option<&std::path::Path>) -> Outcome {
     let fixed = main.map(|id| apply_fixes(text, id, &errors));
     Outcome {
         codes: errors.iter().map(|d| d.code.as_str().to_string()).collect(),
-        bare: errors
-            .iter()
-            .filter(|d| d.has_only_general_help())
-            .map(|d| format!("{}: {}", d.code.as_str(), d.message))
-            .collect(),
+        bare: wrela_tests::without_own_help(&errors),
         json: wrela_diag::json::to_json_string(&built.sources, &errors),
         text: wrela_diag::render::render_all(&built.sources, &errors),
         fixed: fixed.filter(|f| f != text),

@@ -1,5 +1,5 @@
-// A test of code that can't fail: nothing it runs asserts or panics, so it passes whatever the
-// code computes. A test passes unless it panics, and a failed `assert` panics (§13.2).
+// A test of code that can't fail: nothing it runs asserts, panics or traps, so it passes whatever
+// the code computes. A test passes unless it panics or traps, and a failed `assert` panics (§13.2).
 // ---- wrong
 fn fib(n: u32) -> u32 {
     if n < 2 {

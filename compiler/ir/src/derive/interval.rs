@@ -180,8 +180,10 @@ fn derive(
     };
     // A loop that leaves early on the input runs its own count instead, with flags
     // (`exits.rs`); what's left is a loop whose own count depends on the input.
+    // (What a call of `f` does, its `effect`, is the flagged loop's too.)
+    let bool_ty = m.types.bool();
     if act.active_loop_exit.is_some()
-        && let Some(flagged) = super::exits::flag_exits(&func, &mut m.types, &|v| act.value(v))
+        && let Some(flagged) = super::exits::flag_exits(&func, bool_ty, &|v| act.value(v))
     {
         let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
             effect(m, cache, g, mk, Mode::Interval)
@@ -200,6 +202,7 @@ fn derive(
         ));
     }
     no_write_through_mut(&func, &act, &mask, "a range")?;
+    no_half_ranges(m, &func, &act)?;
     let mut nf = func.clone_signature();
     nf.name = format!("{}_iv", func.name);
     nf.interval = true;
@@ -285,6 +288,42 @@ fn derive(
     nf.body = body;
     m.functions[id.index()] = nf;
     Ok(id)
+}
+
+/// E0700 for a range of half floats: the widening (an ulp of 2⁻²³, a tiny of 2⁻¹⁴⁹ or 2⁻¹²⁶,
+/// and the GPU's largest float, `f32::MAX`) is `f32`'s, which an `f16` rounds away, so its
+/// bounds wouldn't hold. At the first value that would be one, if there is one.
+fn no_half_ranges(m: &Module, f: &Function, act: &Activity) -> R<()> {
+    fn half(types: &Types, t: TypeId) -> bool {
+        match types.get(t) {
+            TypeDef::Scalar(s) | TypeDef::Vector(s, _) => *s == Scalar::F16,
+            TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| half(types, *f)),
+            TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, p)| p.is_some_and(|p| half(types, p)))
+            }
+            TypeDef::Array(e, _) | TypeDef::RuntimeArray(e) | TypeDef::Run(e) | TypeDef::Ptr(e) => {
+                half(types, *e)
+            }
+            TypeDef::Matrix(..) | TypeDef::Atomic(_) => false,
+        }
+    }
+    let (mut at, mut found) = (None, None);
+    visit::walk(&f.body, &mut |s| match s {
+        Stmt::At(span) => at = Some(*span),
+        Stmt::Let(v, _) if found.is_none() && act.value(*v) && half(&m.types, f.value_ty(*v)) => {
+            found = Some(at)
+        }
+        _ => {}
+    });
+    let local = f.locals.iter().zip(&act.locals).any(|(l, &b)| b != 0 && half(&m.types, l.ty));
+    match found.or(local.then_some(None)) {
+        Some(at) => Err(Error::not_derivable(
+            "an interval can't go through `f16` arithmetic: its error bounds are `f32`'s, which \
+             a half float rounds away",
+        )
+        .at(at)),
+        None => Ok(()),
+    }
 }
 
 /// What narrowing changed for a branch, to put back after it.
@@ -958,13 +997,13 @@ impl<'a> Ivx<'a> {
 
     /// `v = floor(x)`, then `rest` (to the end of the block, but for a final `return`), derived
     /// once and run for each case of which integer each component's floor is, and joined. Where a
-    /// component's range crosses exactly one integer plane, its floor isn't one integer, and
+    /// component's range crosses one or two integer planes, its floor isn't one integer, and
     /// what's computed from it (value noise's hashed lattice values) would get its whole range
     /// (spike 13); in each case it's exact, and `x - floor(x)` is as narrow as the box. A
-    /// component that crosses no plane, or more than one, isn't split. Up to 2³ cases; each
-    /// writes the same roots, and the join is their hull, of the cases whose components all
-    /// cross where they're split. `tail`, the block's `return`, may return a value `rest`
-    /// computes: that's joined too.
+    /// component that crosses no plane, or more than two, isn't split. Up to 3ⁿ cases for `n`
+    /// components (81 for a `vec4`); each writes the same roots, and the join is their hull, of
+    /// the cases whose components all hold the floor the case gives them. `tail`, the block's
+    /// `return`, may return a value `rest` computes: that's joined too.
     fn split_floor(
         &mut self,
         v: ValueId,

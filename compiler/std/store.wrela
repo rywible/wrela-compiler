@@ -16,16 +16,18 @@
 
 use std::host::request
 use std::io::Pending
+use std::serialize::{Reader, Writer}
 
 /// The longest key (bytes).
 pub const MAX_KEY: u32 = 1024
-/// The longest value (bytes).
-pub const MAX_VALUE: u32 = 1048576
+/// The longest value (bytes): 1020 KiB, so a put of the longest key and value fits in one host
+/// request (1 MiB less its words).
+pub const MAX_VALUE: u32 = 1044480
 
 /// Asks for the value of `key`: `value` reads the answer.
 @server
 pub fn get(key: [u8]) -> Pending<u8> {
-    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
+    check_key(key)
     request("store/get", key)
 }
 
@@ -47,13 +49,14 @@ pub fn value(answer: [u8]) -> Option<Vec<u8>> {
 /// next scan starts after the last key it gave.
 @server
 pub fn scan(from: [u8], to: [u8], limit: u32, down: bool = false) -> Pending<u8> {
-    assert(from.len() <= MAX_KEY && to.len() <= MAX_KEY, "a store key is at most 1024 bytes")
-    var body: Vec<u8> = Vec::with_capacity(from.len() + to.len() + 13)
-    chunk(mut body, from)
-    chunk(mut body, to)
-    word(mut body, limit)
-    body.push(if down { 1 } else { 0 })
-    request("store/scan", body)
+    check_key(from)
+    check_key(to)
+    var w = Writer::new()
+    w.write_counted(from)
+    w.write_counted(to)
+    w.write_u32(limit)
+    w.write_u8(if down { 1 } else { 0 })
+    request("store/scan", take w.into_bytes())
 }
 
 /// A key and its value.
@@ -64,40 +67,40 @@ pub struct Entry: Clone {
 
 /// The entries a `scan` answered with, in its order, or none if the answer isn't one.
 pub fn entries(answer: [u8]) -> Option<Vec<Entry>> {
-    var at = 0
-    let n = read_word(answer, mut at)?
+    var r = Reader::new(Vec::from(answer))
+    let n = r.read_u32().ok()?
     var out: Vec<Entry> = Vec::new()
     for _ in 0..n {
-        let key = read_chunk(answer, mut at)?
-        let value = read_chunk(answer, mut at)?
+        let key = r.read_counted().ok()?
+        let value = r.read_counted().ok()?
         out.push(Entry { key, value })
     }
-    if at != answer.len() {
+    if !r.at_end() {
         return None
     }
     Some(out)
 }
 
-/// Sets `key`'s value to `value` when the call returns.
+/// Sets `key`'s value to `value` when the call returns. A value longer than `MAX_VALUE` panics.
 @server
 pub fn put(key: [u8], value: [u8]) {
-    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
-    assert(value.len() <= MAX_VALUE, "a store value is at most 1 MiB")
-    var body: Vec<u8> = Vec::with_capacity(key.len() + value.len() + 9)
-    body.push(1)
-    chunk(mut body, key)
-    chunk(mut body, value)
-    let _ = request("store/write", body)
+    check_key(key)
+    assert(value.len() <= MAX_VALUE, "a store value is at most 1020 KiB")
+    var w = Writer::new()
+    w.write_u8(1)
+    w.write_counted(key)
+    w.write_counted(value)
+    let _ = request("store/write", take w.into_bytes())
 }
 
 /// Removes `key` and its value when the call returns.
 @server
 pub fn delete(key: [u8]) {
-    assert(key.len() <= MAX_KEY, "a store key is at most 1024 bytes")
-    var body: Vec<u8> = Vec::with_capacity(key.len() + 5)
-    body.push(2)
-    chunk(mut body, key)
-    let _ = request("store/write", body)
+    check_key(key)
+    var w = Writer::new()
+    w.write_u8(2)
+    w.write_counted(key)
+    let _ = request("store/write", take w.into_bytes())
 }
 
 /// `key` with `x` at its end, big-endian, so keys sort by it as a number.
@@ -117,10 +120,7 @@ pub fn append_u64(key: mut Vec<u8>, x: u64) {
 /// The key just past every key that starts with `prefix`: a scan from `prefix` to it gives the
 /// keys that start with `prefix`. None if there's none (`prefix` is all 255s).
 pub fn past(prefix: [u8]) -> Option<Vec<u8>> {
-    var out: Vec<u8> = Vec::new()
-    for b in prefix {
-        out.push(b)
-    }
+    var out = Vec::from(prefix)
     while out.len() > 0 {
         let last = out[out.len() - 1]
         if last < 255 {
@@ -132,42 +132,9 @@ pub fn past(prefix: [u8]) -> Option<Vec<u8>> {
     None
 }
 
-fn word(body: mut Vec<u8>, x: u32) {
-    for k in 0..4 {
-        body.push(u8((x >> (8 * k)) & 255))
-    }
-}
-
-fn chunk(body: mut Vec<u8>, bytes: [u8]) {
-    word(mut body, bytes.len())
-    for b in bytes {
-        body.push(b)
-    }
-}
-
-fn read_word(bytes: [u8], at: mut u32) -> Option<u32> {
-    if bytes.len() < at + 4 {
-        return None
-    }
-    var x = 0
-    for k in 0..4 {
-        x = x | (u32(bytes[at + k]) << (8 * k))
-    }
-    at += 4
-    Some(x)
-}
-
-fn read_chunk(bytes: [u8], at: mut u32) -> Option<Vec<u8>> {
-    let n = read_word(bytes, mut at)?
-    if bytes.len() - at < n {
-        return None
-    }
-    var out: Vec<u8> = Vec::with_capacity(n)
-    for i in 0..n {
-        out.push(bytes[at + i])
-    }
-    at += n
-    Some(out)
+/// Panics if `key` is longer than `MAX_KEY`.
+fn check_key(key: [u8]) {
+    assert(key.len() <= MAX_KEY, f"a store key is at most {MAX_KEY} bytes")
 }
 
 // ---- tests -------------------------------------------------------------------------------------

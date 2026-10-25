@@ -21,18 +21,9 @@ struct Builtin {
     /// What the family is, for `wrela doc builtins`' list.
     summary: &'static str,
     signature: &'static str,
-    takes: Takes,
-}
-
-/// Which built-in functions take a type as their receiver (`x.f()`), by the type's kind.
-#[derive(Clone, Copy, PartialEq)]
-enum Takes {
-    Float,
-    FloatVector,
-    Integer,
-    IntegerVector,
-    Sequence,
-    Nothing,
+    /// The type whose built-in methods (`x.f()`) the family's page lists, as sema takes them
+    /// on it: `f32` for the floats, `[f32]` for runs; none for a family that takes none.
+    methods_on: Option<&'static str>,
 }
 
 const SCALARS: &str = "### 4.1 Scalars and conversions";
@@ -45,7 +36,7 @@ const TYPES: &[Builtin] = &[
         heading: SCALARS,
         summary: "true or false",
         signature: "true, false; a == b, !a, a && b, a || b",
-        takes: Takes::Nothing,
+        methods_on: None,
     },
     Builtin {
         names: &["u32", "i32", "u8", "i8", "u16", "i16", "u64", "i64"],
@@ -53,7 +44,7 @@ const TYPES: &[Builtin] = &[
         heading: SCALARS,
         summary: "the integers, 8 to 64 bits, signed and unsigned",
         signature: "7, u32(x), i32(x); + - * / % (overflow traps on the CPU), & | ^ << >>",
-        takes: Takes::Integer,
+        methods_on: Some("u32"),
     },
     Builtin {
         names: &["f32", "f64"],
@@ -61,7 +52,7 @@ const TYPES: &[Builtin] = &[
         heading: SCALARS,
         summary: "the floats",
         signature: "1.5, 2e3, 15cm (a unit suffix, in SI), f32(n); + - * / %",
-        takes: Takes::Float,
+        methods_on: Some("f32"),
     },
     Builtin {
         names: &["vec3", "vec2", "vec4"],
@@ -69,7 +60,7 @@ const TYPES: &[Builtin] = &[
         heading: VECTORS,
         summary: "vectors of `f32`",
         signature: "vec3(x, y, z), vec3(v.xy, z), vec3(s); v.x, v.zyx, c.rgb, v[i]; + - * / by a vector or an f32",
-        takes: Takes::FloatVector,
+        methods_on: Some("vec3"),
     },
     Builtin {
         names: &["vec3d", "vec2d", "vec4d"],
@@ -77,7 +68,7 @@ const TYPES: &[Builtin] = &[
         heading: VECTORS,
         summary: "vectors of `f64`, CPU only",
         signature: "vec3d(x, y, z), vec3d(v); v.x, v.zyx, v[i] (CPU only)",
-        takes: Takes::FloatVector,
+        methods_on: Some("vec3"),
     },
     Builtin {
         names: &["vec3u", "vec2u", "vec4u", "vec3i", "vec2i", "vec4i"],
@@ -85,7 +76,15 @@ const TYPES: &[Builtin] = &[
         heading: VECTORS,
         summary: "vectors of `u32` and `i32`",
         signature: "vec3u(x, y, z), vec3u(p / cell); v.x, v.zyx, v[i]; arithmetic, bit operators, shifts",
-        takes: Takes::IntegerVector,
+        methods_on: Some("vec3u"),
+    },
+    Builtin {
+        names: &["f16", "vec3h", "vec2h", "vec4h"],
+        aliases: &[],
+        heading: "### 18.10 Timing, limits and features",
+        summary: "half floats and their vectors: GPU code's, on a device with `shader-f16`",
+        signature: "f16(x), f32(h), vec3h(x, y, z); + - * /; GPU code only (E0338 in CPU code)",
+        methods_on: None,
     },
     Builtin {
         names: &[
@@ -95,7 +94,7 @@ const TYPES: &[Builtin] = &[
         heading: VECTORS,
         summary: "matrices of `f32`, columns of rows",
         signature: "mat3(c0, c1, c2) from column vectors; m[i] is a column; M * v, v * M, A * B",
-        takes: Takes::Nothing,
+        methods_on: None,
     },
     Builtin {
         names: &["str"],
@@ -103,7 +102,7 @@ const TYPES: &[Builtin] = &[
         heading: "### 4.6 Text and bytes",
         summary: "a borrowed run of UTF-8",
         signature: "\"text\" passes as a str; s.len() in bytes",
-        takes: Takes::Nothing,
+        methods_on: None,
     },
     Builtin {
         names: &["[T]"],
@@ -111,7 +110,7 @@ const TYPES: &[Builtin] = &[
         heading: "### 4.4 Runs and tuples",
         summary: "a run: a borrowed view of elements",
         signature: "xs: [T], mut [T]; xs[i], xs.len(), for x in xs, for mut x in xs; an array or a Vec passes as one",
-        takes: Takes::Sequence,
+        methods_on: Some("[f32]"),
     },
     Builtin {
         names: &["[T; N]"],
@@ -119,24 +118,17 @@ const TYPES: &[Builtin] = &[
         heading: "### 4.3 Arrays",
         summary: "an array of N elements",
         signature: "[a, b, c], [x; N], [a, ..fill]; xs[i], xs.len(), for x in xs",
-        takes: Takes::Sequence,
+        methods_on: Some("[f32]"),
     },
 ];
 
-/// The built-in functions called as methods of a type of kind `takes`, as their calls: those
-/// sema takes on the kind's first type (`f32` for the floats), so the list is the checker's.
-fn methods_of(takes: Takes) -> Vec<String> {
+/// The built-in functions called as methods of type `ty`, as their calls: those sema takes on
+/// it, so the list is the checker's. No type, no methods.
+fn methods_of(ty: Option<&str>) -> Vec<String> {
     // Called as functions, not methods, though they can be: the derivatives are a fragment
     // shader's.
     const NOT_METHODS: &[&str] = &["dpdx", "dpdy", "fwidth"];
-    let ty = match takes {
-        Takes::Float => "f32",
-        Takes::FloatVector => "vec3",
-        Takes::Integer => "u32",
-        Takes::IntegerVector => "vec3u",
-        Takes::Sequence => "[f32]",
-        Takes::Nothing => return Vec::new(),
-    };
+    let Some(ty) = ty else { return Vec::new() };
     wrela_driver::builtin_methods(ty)
         .into_iter()
         .filter(|(name, _)| !NOT_METHODS.contains(name))
@@ -167,7 +159,7 @@ pub(crate) fn add(index: &mut Index) {
     for t in TYPES {
         let (doc, line) = section(t.heading);
         let section_number = t.heading.trim_start_matches('#').trim();
-        let methods = methods_of(t.takes);
+        let methods = methods_of(t.methods_on);
         let mut signature = t.signature.to_string();
         if !methods.is_empty() {
             signature.push_str(&format!("\n\nbuilt-in methods: {}", methods.join(", ")));
@@ -216,17 +208,39 @@ mod tests {
 
     #[test]
     fn methods_go_to_the_kinds_they_take() {
-        assert!(methods_of(Takes::Sequence).contains(&"x.len()".to_string()));
-        assert!(methods_of(Takes::Float).contains(&"x.sqrt()".to_string()));
-        assert!(!methods_of(Takes::Float).contains(&"x.count_ones()".to_string()));
-        assert!(methods_of(Takes::Integer).contains(&"x.count_ones()".to_string()));
-        assert!(!methods_of(Takes::Integer).contains(&"x.sqrt()".to_string()));
-        assert!(methods_of(Takes::Nothing).is_empty());
+        assert!(methods_of(Some("[f32]")).contains(&"x.len()".to_string()));
+        assert!(methods_of(Some("f32")).contains(&"x.sqrt()".to_string()));
+        assert!(!methods_of(Some("f32")).contains(&"x.count_ones()".to_string()));
+        assert!(methods_of(Some("u32")).contains(&"x.count_ones()".to_string()));
+        assert!(!methods_of(Some("u32")).contains(&"x.sqrt()".to_string()));
+        assert!(methods_of(None).is_empty());
         // Only what sema takes on the type: no vector function on a scalar, no free function.
         for not in ["x.cross(y)", "x.normalize()", "x.bitcast_u32()", "x.select(y, z)"] {
-            assert!(!methods_of(Takes::Float).contains(&not.to_string()), "{not}");
+            assert!(!methods_of(Some("f32")).contains(&not.to_string()), "{not}");
         }
-        assert!(methods_of(Takes::FloatVector).contains(&"x.cross(y)".to_string()));
-        assert!(methods_of(Takes::FloatVector).contains(&"x.normalize()".to_string()));
+        assert!(methods_of(Some("vec3")).contains(&"x.cross(y)".to_string()));
+        assert!(methods_of(Some("vec3")).contains(&"x.normalize()".to_string()));
+        // Each family's type takes methods: a name `builtin_methods` doesn't know gives none.
+        for t in TYPES {
+            if let Some(ty) = t.methods_on {
+                assert!(!methods_of(Some(ty)).is_empty(), "{ty}");
+            }
+        }
+    }
+
+    /// The families list every type sema has, so none drifts out of the reference, and only
+    /// those (besides runs and arrays, which aren't names).
+    #[test]
+    fn every_builtin_type_has_a_family() {
+        let sema = wrela_driver::builtin_type_names();
+        for name in &sema {
+            assert!(TYPES.iter().any(|t| t.names.contains(&name.as_str())), "{name} has no family");
+        }
+        for name in TYPES.iter().flat_map(|t| t.names) {
+            assert!(
+                name.starts_with('[') || sema.iter().any(|s| s == name),
+                "{name} isn't a built-in type"
+            );
+        }
     }
 }

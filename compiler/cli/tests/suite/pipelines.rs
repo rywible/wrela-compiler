@@ -37,65 +37,54 @@ const DRAW: &str = "std::gpu::draw(screen, cover, colour, vertices: 3)";
 
 #[test]
 fn a_draw_under_a_runtime_condition_is_marked() {
-    assert_eq!(conditional("arm", &format!("    if shown {{\n        {DRAW}\n    }}")), [true]);
-    assert_eq!(
-        conditional(
+    for (name, body, want) in [
+        ("arm", format!("    if shown {{\n        {DRAW}\n    }}"), true),
+        (
             "joined",
-            &format!(
+            format!(
                 "    var n = 0\n    if shown {{\n        n = 1\n    }} else {{\n        n = 2\n    }}\n    {DRAW}"
-            )
+            ),
+            false,
         ),
-        [false]
-    );
-    assert_eq!(
-        conditional(
+        (
             "guard",
-            &format!(
+            format!(
                 "    if shown {{\n        screen.present()\n        return\n    }}\n    {DRAW}"
-            )
+            ),
+            true,
         ),
-        [true]
-    );
-    assert_eq!(conditional("literal", &format!("    if true {{\n        {DRAW}\n    }}")), [false]);
-    assert_eq!(
-        conditional(
+        ("literal", format!("    if true {{\n        {DRAW}\n    }}"), false),
+        (
             "in-loop",
-            &format!(
+            format!(
                 "    for i in 0..4 {{\n        if shown && i > 1 {{\n            {DRAW}\n        }}\n    }}"
-            )
+            ),
+            true,
         ),
-        [true]
-    );
-    assert_eq!(
-        conditional(
+        (
             "after-loop",
-            &format!(
+            format!(
                 "    for i in 0..4 {{\n        if shown && i > 1 {{\n            let _x = i\n        }}\n    }}\n    {DRAW}"
-            )
+            ),
+            false,
         ),
-        [false]
-    );
-    // A loop's own test is no condition; an early exit the code wrote is.
-    assert_eq!(
-        conditional("loop-body", &format!("    for i in 0..4 {{\n        {DRAW}\n    }}")),
-        [false]
-    );
-    assert_eq!(
-        conditional(
+        // A loop's own test is no condition; an early exit the code wrote is.
+        ("loop-body", format!("    for i in 0..4 {{\n        {DRAW}\n    }}"), false),
+        (
             "while-body",
-            &format!("    var i = 0\n    while i < 4 {{\n        {DRAW}\n        i += 1\n    }}")
+            format!("    var i = 0\n    while i < 4 {{\n        {DRAW}\n        i += 1\n    }}"),
+            false,
         ),
-        [false]
-    );
-    assert_eq!(
-        conditional(
+        (
             "after-break",
-            &format!(
+            format!(
                 "    for i in 0..4 {{\n        if shown {{\n            break\n        }}\n        {DRAW}\n    }}"
-            )
+            ),
+            true,
         ),
-        [true]
-    );
+    ] {
+        assert_eq!(conditional(name, &body), [want], "{name}");
+    }
 }
 
 /// The report for people says it too.

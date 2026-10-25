@@ -1,6 +1,10 @@
 // A fake WebGPU device that records what the runtime asks of it, for testing the decoder's
 // mapping to WebGPU without a GPU. Only what the runtime uses is implemented.
 
+import { SCREEN_FORMAT } from "../src/abi.gen.ts";
+import { buildPipelines, type ScreenTarget } from "../src/gpu.ts";
+import type { Manifest } from "../src/manifest.ts";
+
 export interface FakeBuffer {
   label: string;
   size: number;
@@ -36,6 +40,9 @@ export type Event =
   | { kind: "dispatchIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndirect"; pipeline: string; buffer: string; offset: number }
   | { kind: "drawIndexedIndirect"; pipeline: string; buffer: string; offset: number; indices: string }
+  | { kind: "drawIndexed"; pipeline: string; count: number; instances: number; first: number; base: number; firstInstance: number; indices: string }
+  | { kind: "multiDrawIndirect"; pipeline: string; buffer: string; offset: number; count: number }
+  | { kind: "multiDrawIndexedIndirect"; pipeline: string; buffer: string; offset: number; count: number; indices: string }
   | { kind: "draw"; pipeline: string; vertices: number; instances: number; offsets: number[]; bindGroup: FakeBindGroup }
   | { kind: "scissor"; rect: [number, number, number, number] }
   | { kind: "viewport"; rect: [number, number, number, number] }
@@ -253,6 +260,16 @@ export class FakeDevice {
         drawIndexedIndirect(b: FakeBuffer, offset: number) {
           events.push({ kind: "drawIndexedIndirect", pipeline, buffer: b.label, offset, indices });
         },
+        drawIndexed(count: number, instances: number, first: number, base: number, firstInstance: number) {
+          events.push({ kind: "drawIndexed", pipeline, count, instances, first, base, firstInstance, indices });
+        },
+        // Chromium's multi-draw: the executor uses it only on a device with its feature.
+        multiDrawIndirect(b: FakeBuffer, offset: number, count: number) {
+          events.push({ kind: "multiDrawIndirect", pipeline, buffer: b.label, offset, count });
+        },
+        multiDrawIndexedIndirect(b: FakeBuffer, offset: number, count: number) {
+          events.push({ kind: "multiDrawIndexedIndirect", pipeline, buffer: b.label, offset, count, indices });
+        },
         setScissorRect(x: number, y: number, w: number, h: number) {
           events.push({ kind: "scissor", rect: [x, y, w, h] });
         },
@@ -307,3 +324,13 @@ export class FakeDevice {
 export function fakeTexture(label: string): GPUTexture {
   return { label, createView: () => ({ label }) } as unknown as GPUTexture;
 }
+
+/** A shader the fake device compiles (it fails one with `ERROR` in it). */
+export const SHADER = "// fine\n";
+
+/** The screen in `SCREEN_FORMAT`, a fake texture labelled `screen`. */
+export const SCREEN_TARGET: ScreenTarget = { format: SCREEN_FORMAT, texture: () => fakeTexture("screen") };
+
+/** Every pipeline of `m`, built on `device` from `SHADER`, its screen targets in `SCREEN_FORMAT`. */
+export const buildAll = (device: FakeDevice, m: Manifest) =>
+  Promise.all(buildPipelines(device.gpu, m, m.pipelines.map(() => SHADER), SCREEN_FORMAT));

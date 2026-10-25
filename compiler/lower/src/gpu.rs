@@ -143,8 +143,8 @@ pub(crate) enum ParamClass {
     Append {
         elem: TyId,
     },
-    /// A `Shared<T, N>`, or a `SharedAtomics<N>` of atomic `u32`s (`atomic`): workgroup memory,
-    /// not bound.
+    /// A `Shared<T, N>`, or a `SharedAtomics<N>` or `SharedAtomicsI<N>` of atomic `u32`s or
+    /// `i32`s (`atomic`): workgroup memory, not bound.
     Workgroup {
         elem: TyId,
         len: u32,
@@ -206,55 +206,43 @@ fn class_of(cx: &Cx, ty: TyId, mode: Mode, varyings: Option<TyId>) -> ParamClass
     if let Some(class) = resource_class(cx, ty) {
         return class;
     }
-    // A kernel's texels to write (the textures it reads are `resource_class`'s).
-    if let Some(l @ (Lang::Texels | Lang::Texels3d | Lang::TexelsArray)) = p.lang_of_ty(ty) {
-        let dim = match l {
-            Lang::Texels3d => ir::TexDim::D3,
-            Lang::TexelsArray => ir::TexDim::D2Array,
-            _ => ir::TexDim::D2,
-        };
-        let format = texture_format(cx, ty);
-        return ParamClass::Texture { depth: false, storage: true, dim, format };
-    }
-    if p.lang_of_ty(ty) == Some(Lang::MipStep) {
-        return ParamClass::MipStep { format: texture_format(cx, ty) };
-    }
-    match p.types.kind(ty) {
-        TyKind::Adt(_, args) if matches!(p.lang_of_ty(ty), Some(Lang::Slots | Lang::One)) => {
+    match (p.lang_of_ty(ty), p.types.kind(ty)) {
+        // A kernel's texels to write (the textures it reads are `resource_class`'s).
+        (Some(l @ (Lang::Texels | Lang::Texels3d | Lang::TexelsArray)), _) => {
+            let dim = match l {
+                Lang::Texels3d => ir::TexDim::D3,
+                Lang::TexelsArray => ir::TexDim::D2Array,
+                _ => ir::TexDim::D2,
+            };
+            let format = texture_format(cx, ty);
+            ParamClass::Texture { depth: false, storage: true, dim, format }
+        }
+        (Some(Lang::MipStep), _) => ParamClass::MipStep { format: texture_format(cx, ty) },
+        (Some(Lang::Slots | Lang::One), TyKind::Adt(_, args)) => {
             ParamClass::Buffer { elem: args[0], read_write: true, atomic: false }
         }
-        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Atomics) => {
+        (Some(Lang::Atomics), TyKind::Adt(_, args)) => {
             ParamClass::Buffer { elem: args[0], read_write: true, atomic: true }
         }
-        TyKind::Adt(..) if p.lang_of_ty(ty) == Some(Lang::AtomicMap) => {
+        (Some(Lang::AtomicMap), _) => {
             ParamClass::Buffer { elem: p.types.u32, read_write: true, atomic: true }
         }
-        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Append) => {
-            ParamClass::Append { elem: args[0] }
-        }
-        TyKind::Adt(_, args) if p.lang_of_ty(ty) == Some(Lang::Shared) => {
-            let len = match p.types.kind(args[1]) {
+        (Some(Lang::Append), TyKind::Adt(_, args)) => ParamClass::Append { elem: args[0] },
+        (Some(l), TyKind::Adt(_, args)) if l.is_workgroup_memory() => {
+            // `Shared<T, N>`; `SharedAtomics<N>` and `SharedAtomicsI<N>`, of `u32` and `i32`.
+            let (elem, len, atomic) = match l {
+                Lang::Shared => (args[0], args[1], false),
+                Lang::SharedAtomicsI => (p.types.i32, args[0], true),
+                _ => (p.types.u32, args[0], true),
+            };
+            let len = match p.types.kind(len) {
                 TyKind::ConstU32(n) => *n,
                 _ => 0,
             };
-            ParamClass::Workgroup { elem: args[0], len, atomic: false }
+            ParamClass::Workgroup { elem, len, atomic }
         }
-        TyKind::Adt(_, args)
-            if matches!(p.lang_of_ty(ty), Some(Lang::SharedAtomics | Lang::SharedAtomicsI)) =>
-        {
-            let len = match p.types.kind(args[0]) {
-                TyKind::ConstU32(n) => *n,
-                _ => 0,
-            };
-            let elem = if p.lang_of_ty(ty) == Some(Lang::SharedAtomicsI) {
-                p.types.i32
-            } else {
-                p.types.u32
-            };
-            ParamClass::Workgroup { elem, len, atomic: true }
-        }
-        TyKind::Adt(..) if Some(ty) == varyings => ParamClass::Varyings,
-        TyKind::Slice(e) => {
+        (_, TyKind::Adt(..)) if Some(ty) == varyings => ParamClass::Varyings,
+        (_, TyKind::Slice(e)) => {
             ParamClass::Buffer { elem: *e, read_write: mode == Mode::Mut, atomic: false }
         }
         _ if wrela_sema::gpu::is_group(p, ty) => ParamClass::Group,
@@ -545,39 +533,35 @@ fn handle_binding(fl: &mut Fl, arg: &mir::Place) -> Option<Vec<ir::ValueId>> {
     let v = fl.read(arg)?;
     let zero = fl.u32c(0);
     let one = fl.u32c(1);
-    // The handle of the texture a view's field 0 borrows.
-    let through = |fl: &mut Fl| -> Option<ir::ValueId> {
+    if let Some(
+        view @ (Lang::TextureLevel
+        | Lang::TextureLevelMut
+        | Lang::TextureLayer
+        | Lang::TextureLayerMut
+        | Lang::TextureStep),
+    ) = lang
+    {
+        // The handle of the texture the view's field 0 borrows, and its level or layer.
         let pt = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
         let ptr = fl.value(pt, ir::Expr::Extract(v, 0));
         let at = ir::Place { root: ir::PlaceRoot::Ptr(ptr), path: vec![ir::Proj::Field(0)] };
-        Some(fl.value(u, ir::Expr::Load(at)))
-    };
-    let plus_one =
-        |fl: &mut Fl, x: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Add, x, one));
+        let handle = fl.value(u, ir::Expr::Load(at));
+        let word = fl.value(u, ir::Expr::Extract(v, 1));
+        let plus_one =
+            |fl: &mut Fl, x: ir::ValueId| fl.value(u, ir::Expr::Binary(ir::BinOp::Add, x, one));
+        return Some(match view {
+            Lang::TextureLevel | Lang::TextureLevelMut => vec![handle, plus_one(fl, word), zero],
+            Lang::TextureLayer => vec![handle, zero, plus_one(fl, word)],
+            Lang::TextureLayerMut => {
+                let level = fl.value(u, ir::Expr::Extract(v, 2));
+                vec![handle, plus_one(fl, level), plus_one(fl, word)]
+            }
+            // The level before (read: its word is `level`, one more than `level - 1`), then
+            // the level (written).
+            _ => vec![handle, word, zero, handle, plus_one(fl, word), zero],
+        });
+    }
     Some(match lang {
-        Some(Lang::TextureLevel | Lang::TextureLevelMut) => {
-            let handle = through(fl)?;
-            let level = fl.value(u, ir::Expr::Extract(v, 1));
-            vec![handle, plus_one(fl, level), zero]
-        }
-        Some(Lang::TextureLayer) => {
-            let handle = through(fl)?;
-            let layer = fl.value(u, ir::Expr::Extract(v, 1));
-            vec![handle, zero, plus_one(fl, layer)]
-        }
-        Some(Lang::TextureLayerMut) => {
-            let handle = through(fl)?;
-            let layer = fl.value(u, ir::Expr::Extract(v, 1));
-            let level = fl.value(u, ir::Expr::Extract(v, 2));
-            vec![handle, plus_one(fl, level), plus_one(fl, layer)]
-        }
-        // The level before (read: its word is `level`, one more than `level - 1`), then the
-        // level (written).
-        Some(Lang::TextureStep) => {
-            let handle = through(fl)?;
-            let level = fl.value(u, ir::Expr::Extract(v, 1));
-            vec![handle, level, zero, handle, plus_one(fl, level), zero]
-        }
         Some(Lang::Cubemap) => {
             let at = fl.mb.m.types.field(fl.f.value_ty(v), 0)?;
             let array = fl.value(at, ir::Expr::Extract(v, 0));
@@ -644,6 +628,17 @@ fn buffer_binding(
     elem: TyId,
     span: Span,
 ) -> Option<[ir::ValueId; 3]> {
+    buffer_binding_sized(fl, arg, elem, span).map(|(b, _)| b)
+}
+
+/// [`buffer_binding`], and the bytes its elements take: its size, but 0 for a whole buffer of
+/// no elements.
+fn buffer_binding_sized(
+    fl: &mut Fl,
+    arg: &mir::Place,
+    elem: TyId,
+    span: Span,
+) -> Option<([ir::ValueId; 3], ir::ValueId)> {
     let elem = fl.concrete(elem);
     let et = fl.cx.lower_ty(fl.mb, elem, span)?;
     let stride = ir::layout::array_stride(&fl.mb.m.types, et);
@@ -663,22 +658,22 @@ fn buffer_binding(
         let start = fl.value(u, ir::Expr::Extract(v, 1));
         if lang == Some(Lang::GpuField) {
             // One element (or a field of one): its byte offset, and its size.
-            return Some([handle, start, stride_v]);
+            return Some(([handle, start, stride_v], stride_v));
         }
         // A span: its first element and its count.
         let count = fl.value(u, ir::Expr::Extract(v, 2));
         let offset = mul(fl, start);
         let size = mul(fl, count);
-        return Some([handle, offset, size]);
+        return Some(([handle, offset, size], size));
     }
     let handle = fl.value(u, ir::Expr::Extract(v, 0));
     let count = fl.value(u, ir::Expr::Extract(v, 1));
-    let size = mul(fl, count);
+    let bytes = mul(fl, count);
     let zero = fl.u32c(0);
     let b = fl.mb.m.types.bool();
     let empty = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, count, zero));
-    let size = fl.value(u, ir::Expr::Select { cond: empty, if_true: stride_v, if_false: size });
-    Some([handle, zero, size])
+    let size = fl.value(u, ir::Expr::Select { cond: empty, if_true: stride_v, if_false: bytes });
+    Some(([handle, zero, size], bytes))
 }
 
 /// The elements of the buffer at `place`: its first type argument (`u32` words, structs of
@@ -944,11 +939,11 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
     // An indexed draw's indices: their buffer's handle, and the byte offset and size, by its
     // elements' stride (`u32`s, or structs of them).
     let mut counts = Vec::new();
-    let mut index_size = None;
+    let mut index_bytes = None;
     if let Some((place, at)) = &d.indices {
         let elem = buffer_elem(fl, place);
-        let b = buffer_binding(fl, place, elem, *at)?;
-        index_size = Some(b[2]);
+        let (b, bytes) = buffer_binding_sized(fl, place, elem, *at)?;
+        index_bytes = Some(bytes);
         counts.extend(b);
     }
     match kind {
@@ -956,16 +951,20 @@ fn record_draw(fl: &mut Fl, d: &mir::Draw, span: Span) -> Option<()> {
             counts.extend([fl.operand(&d.vertices)?, fl.operand(&d.instances)?]);
         }
         ir::DrawKind::Indexed => {
-            // The index count (`u32::MAX`: all the indices past the first), the instances, the
-            // first index, the base vertex and the first instance.
+            // The index count (`u32::MAX`: all the indices past the first, none if the first
+            // is past them all), the instances, the first index, the base vertex and the first
+            // instance. Both sides of the select are worked out, so the rest can't trap.
             let given = fl.operand(&d.vertices)?;
             let first = fl.operand(&d.more[0])?;
-            let size = index_size?;
+            let bytes = index_bytes?;
             let four = fl.u32c(4);
-            let all = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, size, four));
-            let rest = fl.value(u, ir::Expr::Binary(ir::BinOp::Sub, all, first));
-            let max = fl.u32c(u32::MAX);
+            let all = fl.value(u, ir::Expr::Binary(ir::BinOp::Div, bytes, four));
             let b = fl.mb.m.types.bool();
+            let past = fl.value(b, ir::Expr::Binary(ir::BinOp::Ge, first, all));
+            let left = fl.value(u, ir::Expr::Binary(ir::BinOp::WrappingSub, all, first));
+            let zero = fl.u32c(0);
+            let rest = fl.value(u, ir::Expr::Select { cond: past, if_true: zero, if_false: left });
+            let max = fl.u32c(u32::MAX);
             let every = fl.value(b, ir::Expr::Binary(ir::BinOp::Eq, given, max));
             let count =
                 fl.value(u, ir::Expr::Select { cond: every, if_true: rest, if_false: given });
@@ -1300,14 +1299,7 @@ pub(crate) fn intrinsic(
                 _ => (Opcode::EndPass, 0, false),
             };
             let args = fl.arg_values(&c.args)?;
-            if matches!(
-                l,
-                Lang::BeginPass0
-                    | Lang::BeginPass1
-                    | Lang::BeginPass2
-                    | Lang::BeginPass3
-                    | Lang::BeginPass4
-            ) {
+            if opcode == Opcode::BeginPass {
                 fl.upload_literals();
             }
             let op = ir::HostOp::Command { opcode: opcode as u32, words, runs: 0, handle };
@@ -1662,6 +1654,23 @@ fn resource_arg(fl: &mut Fl, c: &mir::Call, i: usize, msg: &str) -> Option<ir::R
     }
 }
 
+/// The subgroup operations, by their lang items in std.
+const SUBGROUP_OPS: [(Lang, ir::SubgroupOp); 13] = [
+    (Lang::SubgroupAdd, ir::SubgroupOp::Add),
+    (Lang::SubgroupExclusiveAdd, ir::SubgroupOp::ExclusiveAdd),
+    (Lang::SubgroupInclusiveAdd, ir::SubgroupOp::InclusiveAdd),
+    (Lang::SubgroupMin, ir::SubgroupOp::Min),
+    (Lang::SubgroupMax, ir::SubgroupOp::Max),
+    (Lang::SubgroupAnd, ir::SubgroupOp::And),
+    (Lang::SubgroupOr, ir::SubgroupOp::Or),
+    (Lang::SubgroupXor, ir::SubgroupOp::Xor),
+    (Lang::SubgroupAny, ir::SubgroupOp::Any),
+    (Lang::SubgroupAll, ir::SubgroupOp::All),
+    (Lang::SubgroupBallot, ir::SubgroupOp::Ballot),
+    (Lang::SubgroupBroadcastFirst, ir::SubgroupOp::BroadcastFirst),
+    (Lang::SubgroupShuffle, ir::SubgroupOp::Shuffle),
+];
+
 /// A subgroup operation (`std::gpu::subgroup_add` and the rest, §18.10): kernels only, of the
 /// types WGSL's take (E0607). The module then needs the device's `subgroups`.
 fn subgroup_op(
@@ -1671,54 +1680,35 @@ fn subgroup_op(
     c: &mir::Call,
     ty: Option<TyId>,
 ) -> Option<ir::ValueId> {
+    use ir::Scalar as T;
     use ir::SubgroupOp as S;
     let at = user_span(fl, c.span);
-    let stage = fl.mb.gpu.as_ref().map(|g| g.stage);
-    // A `@gpu` function checked on its own has no stage: its callers' pipelines check it.
-    if !matches!(stage, Some(None | Some(Entry::Compute(_)))) {
-        let what = fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()).to_string();
-        let d = Diagnostic::new(
-            codes::E0607,
-            at,
-            format!("`{name}` is for kernels, and this is {what}"),
-        )
-        .with_note("a subgroup is a kernel's invocations that run in lockstep (§18.10)")
-        .with_help("call it in a `@compute` function, on a device with `features().subgroups`");
-        fl.cx.err(with_call_chain(fl, d));
+    let kernel = |s| matches!(s, Entry::Compute(_));
+    let ok = stage_only(fl, kernel, None, at, |what| {
+        Diagnostic::new(codes::E0607, at, format!("`{name}` is for kernels, and this is {what}"))
+            .with_note("a subgroup is a kernel's invocations that run in lockstep (§18.10)")
+            .with_help("call it in a `@compute` function, on a device with `features().subgroups`")
+    });
+    if !ok {
         return None;
     }
-    let op = match l {
-        Lang::SubgroupAdd => S::Add,
-        Lang::SubgroupExclusiveAdd => S::ExclusiveAdd,
-        Lang::SubgroupInclusiveAdd => S::InclusiveAdd,
-        Lang::SubgroupMin => S::Min,
-        Lang::SubgroupMax => S::Max,
-        Lang::SubgroupAnd => S::And,
-        Lang::SubgroupOr => S::Or,
-        Lang::SubgroupXor => S::Xor,
-        Lang::SubgroupAny => S::Any,
-        Lang::SubgroupAll => S::All,
-        Lang::SubgroupBallot => S::Ballot,
-        Lang::SubgroupBroadcastFirst => S::BroadcastFirst,
-        _ => S::Shuffle,
-    };
+    let &(_, op) = SUBGROUP_OPS.iter().find(|&&(k, _)| k == l)?;
     let args = fl.arg_values(&c.args)?;
     let x = *args.first()?;
-    let elem = fl.mb.m.types.element_scalar(fl.f.value_ty(x));
-    let ok = match op {
-        S::Any | S::All | S::Ballot => elem == Some(ir::Scalar::Bool),
-        S::And | S::Or | S::Xor => matches!(elem, Some(ir::Scalar::I32 | ir::Scalar::U32)),
-        _ => matches!(
-            elem,
-            Some(ir::Scalar::I32 | ir::Scalar::U32 | ir::Scalar::F32 | ir::Scalar::F16)
+    // A scalar or a vector: WGSL's take no matrix.
+    let elem = match fl.mb.m.types.get(fl.f.value_ty(x)) {
+        ir::TypeDef::Scalar(s) | ir::TypeDef::Vector(s, _) => Some(*s),
+        _ => None,
+    };
+    let (takes, want): (&[T], _) = match op {
+        S::Any | S::All | S::Ballot => (&[T::Bool], "a `bool`"),
+        S::And | S::Or | S::Xor => (&[T::I32, T::U32], "an `i32` or a `u32` (or a vector of them)"),
+        _ => (
+            &[T::I32, T::U32, T::F32, T::F16],
+            "an `i32`, `u32`, `f32` or `f16` (or a vector of them)",
         ),
     };
-    if !ok {
-        let want = match op {
-            S::Any | S::All | S::Ballot => "a `bool`",
-            S::And | S::Or | S::Xor => "an `i32` or a `u32` (or a vector of them)",
-            _ => "an `i32`, `u32`, `f32` or `f16` (or a vector of them)",
-        };
+    if !elem.is_some_and(|s| takes.contains(&s)) {
         let shown = fl.mb.m.types.display(fl.f.value_ty(x));
         let d = Diagnostic::new(codes::E0607, at, format!("`{name}` takes {want}, not `{shown}`"))
             .with_note("WGSL's subgroup operations take these types (the `subgroups` extension)")
@@ -1940,12 +1930,16 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
             let field = match (op, lang) {
                 (T::Width, _) => 1,
                 (T::Height, _) => 2,
-                (T::Depth | T::Levels | T::Layers, Some(Lang::Texture | Lang::Texture3d)) => 3,
+                (T::Levels, Some(Lang::Texture)) | (T::Depth, Some(Lang::Texture3d)) => 3,
                 (T::Layers, Some(Lang::TextureArray | Lang::DepthTextureArray)) => 3,
                 (T::Levels, Some(Lang::TextureArray)) => 4,
-                // A depth texture has one level.
+                // A depth texture, and a 3D one, have one level.
                 (T::Levels, _) => return Some(fl.u32c(1)),
-                _ => 3,
+                _ => {
+                    let what = format!("a texture's {op:?} asked of a `{lang:?}`");
+                    fl.cx.err(Diagnostic::internal(what));
+                    return None;
+                }
             };
             let v = fl.arg_value(&c.args[0])?;
             return Some(fl.value(u, ir::Expr::Extract(v, field)));
@@ -1967,8 +1961,7 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let mut vals = fl.arg_values(&c.args[1 + usize::from(sampled)..])?;
     // A mip step reads the one level its view holds: its sample and its load name level 0.
     if l == Lang::MipStepSample {
-        let f = fl.mb.m.types.f32();
-        vals.push(fl.value(f, ir::Expr::Const(ir::Const::F32(0.0))));
+        vals.push(fl.konst(ir::Const::F32(0.0)));
     }
     if l == Lang::MipStepLoad {
         vals.push(fl.u32c(0));
@@ -1986,8 +1979,8 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
     let v = fl.value(read, ir::Expr::Texture(op, texture, sampler, vals));
     let v = narrow(fl, v, t);
     if op.uses_derivatives() {
-        // `sample` and `sample_compare` pick a texture's detail from neighbouring pixels, as
-        // derivatives do.
+        // `sample`, `sample_bias` and `sample_compare` pick a texture's detail from neighbouring
+        // pixels, as derivatives do.
         let at = user_span(fl, span);
         fragment_only(fl, Some(v), at, |ctx| {
             Diagnostic::new(
@@ -2056,16 +2049,32 @@ fn fragment_only(
     span: Span,
     err: impl FnOnce(&str) -> Diagnostic,
 ) -> bool {
+    stage_only(fl, |s| s == Entry::Fragment, v, span, err)
+}
+
+/// An operation for the stages `allowed` holds only (defining `v`, at `span`): in a fragment
+/// shader, `v` is noted for E0608; in a stage it doesn't hold, or CPU code, the error `err`
+/// makes from what the code is. Whether the code may do it.
+fn stage_only(
+    fl: &mut Fl,
+    allowed: impl Fn(Entry) -> bool,
+    v: Option<ir::ValueId>,
+    span: Span,
+    err: impl FnOnce(&str) -> Diagnostic,
+) -> bool {
     // A `@gpu` function checked on its own has no stage: its callers' decide, and each
     // pipeline that calls it checks it there.
-    if fl.mb.gpu.as_ref().is_some_and(|g| g.stage.is_none()) {
-        return true;
-    }
-    if fl.mb.gpu.as_ref().is_some_and(|g| g.stage == Some(Entry::Fragment)) {
-        if let Some(v) = v {
-            fl.mb.derivatives.insert((fl.id, v), span);
+    match fl.mb.gpu.as_ref().map(|g| g.stage) {
+        Some(None) => return true,
+        Some(Some(stage)) if allowed(stage) => {
+            if stage == Entry::Fragment
+                && let Some(v) = v
+            {
+                fl.mb.derivatives.insert((fl.id, v), span);
+            }
+            return true;
         }
-        return true;
+        _ => {}
     }
     let d = err(fl.mb.gpu.as_ref().map_or("CPU code", |g| g.what.as_str()));
     fl.cx.err(with_call_chain(fl, d));
@@ -2084,21 +2093,23 @@ fn check_workgroup(
     let found = ir::uniformity::collectives_in_non_uniform_flow(&mb.m, entry, inputs);
     for n in found {
         let Some(at) = n.at else { continue };
-        let d = match n.op {
-            Collective::Barrier => Diagnostic::new(
-                codes::E0610,
-                user_span_in(cx, mb, n.func, at),
-                "`barrier` is called where the workgroup's invocations may have taken different branches",
-            )
-            .with_note("a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)"),
-            Collective::Subgroup(op) => Diagnostic::new(
-                codes::E0610,
-                user_span_in(cx, mb, n.func, at),
-                format!("`{}` is called where the workgroup's invocations may have taken different branches", subgroup_name(op)),
-            )
-            .with_note("a subgroup operation combines its subgroup's invocations, so all of them must reach it together (WGSL's uniformity rule)"),
+        let (name, note) = match n.op {
+            Collective::Barrier => (
+                "barrier",
+                "a barrier waits for every invocation of the workgroup, so all of them must reach it together (WGSL's uniformity rule)",
+            ),
+            Collective::Subgroup(op) => (
+                subgroup_name(op),
+                "a subgroup operation combines its subgroup's invocations, so all of them must reach it together (WGSL's uniformity rule)",
+            ),
             _ => continue,
         };
+        let d = Diagnostic::new(
+            codes::E0610,
+            user_span_in(cx, mb, n.func, at),
+            format!("`{name}` is called where the workgroup's invocations may have taken different branches"),
+        )
+        .with_note(note);
         // Over a domain, the compiler's bounds check is the branch: invocations past the
         // domain's end return first.
         let help = if mb.gpu.as_ref().is_some_and(|g| g.iface.over) {
@@ -2128,24 +2139,10 @@ fn check_workgroup(
     }
 }
 
-/// A subgroup operation's name in std.
+/// A subgroup operation's name in std: its lang item's (`subgroup_add`, ...).
 fn subgroup_name(op: ir::SubgroupOp) -> &'static str {
-    use ir::SubgroupOp as S;
-    match op {
-        S::Add => "subgroup_add",
-        S::ExclusiveAdd => "subgroup_exclusive_add",
-        S::InclusiveAdd => "subgroup_inclusive_add",
-        S::Min => "subgroup_min",
-        S::Max => "subgroup_max",
-        S::And => "subgroup_and",
-        S::Or => "subgroup_or",
-        S::Xor => "subgroup_xor",
-        S::Any => "subgroup_any",
-        S::All => "subgroup_all",
-        S::Ballot => "subgroup_ballot",
-        S::BroadcastFirst => "subgroup_broadcast_first",
-        S::Shuffle => "subgroup_shuffle",
-    }
+    let path = SUBGROUP_OPS.iter().find(|&&(_, o)| o == op).map_or("", |(l, _)| l.path());
+    path.rsplit("::").next().unwrap_or(path)
 }
 
 /// E0608: the derivatives the fragment shader `entry` reaches in non-uniform control flow,
@@ -2163,11 +2160,16 @@ fn check_uniformity(
         let at = mb.derivatives.get(&(n.func, n.value)).copied().or(n.at);
         let Some(span) = at else { continue };
         let span = user_span_in(cx, mb, n.func, span);
-        // The texture methods by their names in the language.
+        // The operations by their names in the language (a barrier as WGSL names it).
         let name = match n.op {
+            Collective::Dpdx => "dpdx",
+            Collective::Dpdy => "dpdy",
+            Collective::Fwidth => "fwidth",
             Collective::Sample => "sample",
+            Collective::SampleBias => "sample_bias",
             Collective::SampleCompare => "sample_compare",
-            op => op.wgsl_name(),
+            Collective::Barrier => "workgroupBarrier",
+            Collective::Subgroup(op) => subgroup_name(op),
         };
         let d = Diagnostic::new(
             codes::E0608,
@@ -2322,6 +2324,20 @@ fn entry_module(cx: &mut Cx, iface: Rc<Interface>, stage: Entry) -> EntryModule 
                 cx.holds_nothing("workgroup memory", elem, param.span);
                 continue;
             };
+            if let Some(e) = half_payload(&mb.m.types, et) {
+                let shown = mb.m.types.display(e);
+                let d = Diagnostic::new(
+                    codes::E0602,
+                    param.span,
+                    format!("workgroup memory can't hold `{shown}`: it has an `f16` in a payload"),
+                )
+                .with_note(
+                    "memory holds an enum's payloads as 32-bit words, and an `f16` is half of one",
+                )
+                .with_help("make the payload an `f32`, converting with `f16(x)` where it's read");
+                cx.err(d);
+                continue;
+            }
             let et = if atomic { atomic_of(&mut mb, et) } else { et };
             if len == 0 {
                 let d =
@@ -2663,6 +2679,39 @@ fn stage_name(cx: &Cx, iface: &Interface, e: usize) -> String {
     }
 }
 
+/// E0602: a kernel takes a `SubgroupInvocation` though its workgroup, `wg`, has more than one
+/// row or layer. WebGPU's shader compilers number a subgroup's invocations only in a workgroup
+/// of one dimension.
+fn check_subgroup_invocation(cx: &mut Cx, iface: &Interface, wg: [u32; 3]) {
+    if wg[1..].iter().all(|&n| n <= 1) {
+        return;
+    }
+    let entry = &iface.entries[0];
+    let func = cx.checked.program.func(entry.func);
+    for (i, (_, class)) in entry.params.iter().enumerate() {
+        if *class != ParamClass::Builtin(ir::BuiltinInput::SubgroupInvocationId) {
+            continue;
+        }
+        let [x, y, z] = wg;
+        let d = Diagnostic::new(
+            codes::E0602,
+            func.params[i].span,
+            format!(
+                "a `SubgroupInvocation` is for a kernel of one-dimensional workgroups, and `{}`'s \
+                 are {x} by {y} by {z}",
+                func.name
+            ),
+        )
+        .with_note("WebGPU numbers a subgroup's invocations only in a workgroup of one dimension")
+        .with_help(format!(
+            "make the workgroup one row, `@compute({})`, and work out each invocation's place \
+             from its `LocalId`",
+            x.saturating_mul(y).saturating_mul(z)
+        ));
+        cx.err(d);
+    }
+}
+
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
@@ -2675,6 +2724,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     check_recursion(cx, &mb);
     let inputs = entry_inputs(&iface.entries[0], true, iface.over);
     check_workgroup(cx, &mb, entry, &inputs);
+    check_subgroup_invocation(cx, &iface, wg);
     mb.m.entry_points.push(ir::EntryPoint {
         name: ir::ident(name),
         stage: ir::Stage::Compute { workgroup_size: wg },
@@ -3180,6 +3230,30 @@ fn atomic_of(mb: &mut ModuleBuilder, et: ir::TypeId) -> ir::TypeId {
     mb.m.types.intern(ir::TypeDef::Atomic(s))
 }
 
+/// The first enum in `t` (`t` itself, or one in a field or element) with an `f16` in a payload.
+/// Memory holds a payload as `u32` words (`ir::gpu_memory`), which a 16-bit float isn't.
+fn half_payload(types: &ir::Types, t: ir::TypeId) -> Option<ir::TypeId> {
+    fn half(types: &ir::Types, t: ir::TypeId) -> bool {
+        match types.get(t) {
+            ir::TypeDef::Scalar(s) | ir::TypeDef::Vector(s, _) => *s == ir::Scalar::F16,
+            ir::TypeDef::Struct { fields, .. } => fields.iter().any(|(_, f)| half(types, *f)),
+            ir::TypeDef::Enum { variants, .. } => {
+                variants.iter().any(|(_, p)| p.is_some_and(|p| half(types, p)))
+            }
+            ir::TypeDef::Array(e, _) => half(types, *e),
+            _ => false,
+        }
+    }
+    match types.get(t) {
+        ir::TypeDef::Enum { .. } => half(types, t).then_some(t),
+        ir::TypeDef::Struct { fields, .. } => {
+            fields.iter().find_map(|(_, f)| half_payload(types, *f))
+        }
+        ir::TypeDef::Array(e, _) => half_payload(types, *e),
+        _ => None,
+    }
+}
+
 /// A GPU entry point or `@gpu` function that nothing dispatches: lowered for the GPU anyway
 /// (a generic `@gpu` function with `substs`, stand-ins for its generics), so its effects are
 /// checked where it's defined. Only to check: the module isn't emitted, so it isn't flattened.
@@ -3198,6 +3272,9 @@ pub(crate) fn check_standalone(cx: &mut Cx, f: FnId, entry: Option<Entry>, subst
                 .find(|&t| wrela_sema::gpu::is_vertex_output(&checked.program, t))
                 .filter(|_| stage == Entry::Fragment);
             let iface = Rc::new(Interface::of(cx, &[(f, &[])], None, varyings));
+            if let Entry::Compute(wg) = stage {
+                check_subgroup_invocation(cx, &iface, wg);
+            }
             let EntryModule { mut mb, keys, .. } = entry_module(cx, iface.clone(), stage);
             let ret = match stage {
                 Entry::Compute(_) => None,
@@ -3533,5 +3610,65 @@ pub fn frame(time: f32, width: u32, height: u32) {
             })
             .expect("dispatch");
         assert_eq!(constant_u32(groups, &lets), 67_108_864);
+    }
+
+    /// A kernel of two-dimensional workgroups can't take a `SubgroupInvocation` (WebGPU numbers
+    /// them only in one dimension), though nothing dispatches it; its `SubgroupSize` it can.
+    #[test]
+    fn a_subgroup_invocation_is_a_one_dimensional_workgroups() {
+        let source = r#"
+use std::gpu::{GlobalId, Slots, SubgroupInvocation, SubgroupSize}
+
+@compute(8, 8)
+fn tiles(out: mut Slots<u32>, lane: SubgroupInvocation, id: GlobalId) {
+    out[id] = lane.index
+}
+
+@compute(8, 8)
+fn widths(out: mut Slots<u32>, width: SubgroupSize, id: GlobalId) {
+    out[id] = width.size
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {}
+"#;
+        let (_, errors) = lower_source(source);
+        let errors: Vec<_> = errors.into_iter().filter(Diagnostic::is_error).collect();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].code, codes::E0602);
+        assert!(errors[0].message.contains("are 8 by 8 by 1"), "{errors:?}");
+    }
+
+    /// An `f16` literal is the half nearest the number written, rounded once: 1.0004883 is
+    /// nearer 1 + 2⁻¹⁰ than 1, though the `f32` it rounds to is halfway between them.
+    #[test]
+    fn half_literals_round_once_to_the_nearest_half() {
+        let source = r#"
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn halves(out: mut Slots<f32>, id: GlobalId) {
+    let a: f16 = 1.0004883
+    let b: f16 = 0.000030517578125
+    let c: f16 = 2049.0
+    out[id] = f32(a) + f32(b) + f32(c)
+}
+
+pub fn frame(time: f32, width: u32, height: u32) {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(halves.bind(mut out), groups: 1)
+}
+"#;
+        let (lowered, errors) = lower_source(source);
+        assert!(!wrela_diag::has_errors(&errors), "lowering: {errors:?}");
+        let mut halves = Vec::new();
+        for f in lowered.pipelines.iter().flat_map(|p| &p.module.functions) {
+            ir::visit::walk(&f.body, &mut |s| {
+                if let ir::Stmt::Let(_, ir::Expr::Const(ir::Const::F16(x))) = s {
+                    halves.push(*x);
+                }
+            });
+        }
+        // 2⁻¹⁵, a subnormal half, is exact; 2049 is a tie, to the even 2048.
+        assert_eq!(halves, [1.0 + 1.0 / 1024.0, 1.0 / 32768.0, 2048.0]);
     }
 }

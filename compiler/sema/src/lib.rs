@@ -10,7 +10,7 @@ pub mod effects;
 pub mod fieldwise;
 pub mod gpu;
 mod graph;
-pub mod lints;
+mod lints;
 pub mod mir;
 pub mod program;
 pub mod resolve;

@@ -16,6 +16,7 @@
 //!
 //! Exit status: 0 the same, 1 different, 2 a usage error or a build that won't load.
 
+use crate::trace::Runner;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use wrela_host::{CpuBuild, Host, Options};
@@ -75,7 +76,7 @@ pub fn run(args: &[String]) -> ExitCode {
             if a.json {
                 println!("{}", serde_json::to_string_pretty(&report.json()).unwrap_or_default());
             } else {
-                println!("{}", report.text(&a));
+                println!("{}", report.text());
             }
             if report.same() { ExitCode::SUCCESS } else { ExitCode::from(1) }
         }
@@ -128,8 +129,8 @@ impl Report {
         })
     }
 
-    fn text(&self, a: &Args) -> String {
-        let against = a.against.display();
+    fn text(&self) -> String {
+        let against = self.against.0.display();
         let screen = match self.screen {
             Some(d) if d.mean <= self.within => {
                 format!("last frame within {:.2} (of {})", d.mean, self.within)
@@ -158,38 +159,6 @@ impl Report {
     }
 }
 
-/// A new, empty storage directory of its own, removed when dropped: each run starts with none.
-struct Storage(PathBuf);
-
-impl Storage {
-    fn new(which: &str) -> Result<Storage, String> {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("wrela-same-{which}-{}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir(&path).map_err(|e| e.to_string())?;
-        Ok(Storage(path))
-    }
-}
-
-impl Drop for Storage {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// `path`, made absolute without touching it: canonical where it exists, else its nearest
-/// existing ancestor's canonical path with the rest joined on.
-fn absolute(path: &Path) -> Result<PathBuf, String> {
-    if let Ok(p) = path.canonicalize() {
-        return Ok(p);
-    }
-    let parent = path.parent().ok_or_else(|| format!("`{}` has no parent", path.display()))?;
-    let name = path.file_name().ok_or_else(|| format!("`{}` has no name", path.display()))?;
-    Ok(absolute(parent)?.join(name))
-}
-
 fn same(a: &Args) -> Result<Report, String> {
     // Before anything is written: the saved build must be one, and the candidate's directory
     // must be neither it nor inside it, nor around it.
@@ -197,8 +166,7 @@ fn same(a: &Args) -> Result<Report, String> {
         .against
         .canonicalize()
         .map_err(|e| format!("can't read the build `{}`: {e}", a.against.display()))?;
-    let out_dir = absolute(&a.dir.join("build").join("same"))?;
-    if against.starts_with(&out_dir) || out_dir.starts_with(&against) {
+    if crate::profile::overwritten_by(&a.dir, "same", &against)? {
         return Err(format!(
             "`{}` would be overwritten by the build to compare; save it outside `build/same` with `wrela build -o <dir>`",
             a.against.display()
@@ -212,10 +180,7 @@ fn same(a: &Args) -> Result<Report, String> {
     let before = manifest(&against)?;
     let script = crate::read_script(a.input.as_deref())?;
     // The candidate, as `wrela build` builds it.
-    let out = wrela_driver::build(&a.dir);
-    let built = a.dir.join("build").join("same");
-    crate::generated_path(&a.dir, &built)?;
-    crate::write_build(&out, &built)?;
+    let built = crate::build_into(&a.dir, "same", None)?;
     let after = manifest(&built)?;
     let names = |m: &wrela_abi::Manifest| -> Vec<String> {
         let mut v: Vec<String> = m.pipelines.iter().map(|p| p.name.clone()).collect();
@@ -253,29 +218,26 @@ fn run_build(
     script: &[wrela_abi::input::Scripted],
     gpu: bool,
 ) -> Result<Run, String> {
-    let storage = Storage::new(if dir.ends_with("same") { "candidate" } else { "against" })?;
+    let storage = crate::profile::Storage::new()?;
     let what = |e: &dyn std::fmt::Display| format!("`{}`: {e}", dir.display());
-    let mut hashes = Vec::with_capacity(a.frames as usize);
-    if gpu {
+    let mut runner = if gpu {
         let options =
             Options { workers: 1, storage: Some(storage.0.clone()), ..Options::default() };
-        let mut host = Host::load_with(dir, &options).map_err(|e| what(&e))?;
-        for i in 0..a.frames {
-            host.lockstep_frame(i, a.fps, a.size.0, a.size.1, script)
-                .map_err(|e| what(&format!("frame {i}: {e}")))?;
-            hashes.push(host.hash());
-        }
-        let screen = host.read_screen().map_err(|e| what(&e))?;
-        Ok(Run { hashes, screen: Some(screen) })
+        Runner::Gpu(Box::new(Host::load_with(dir, &options).map_err(|e| what(&e))?))
     } else {
         let build = CpuBuild::load_cpu(dir).map_err(|e| what(&e))?;
         let mut host = build.instantiate_in(1, Some(&storage.0)).map_err(|e| what(&e))?;
         host.init().map_err(|e| what(&e))?;
-        for i in 0..a.frames {
-            host.lockstep_frame(i, a.fps, a.size.0, a.size.1, script)
-                .map_err(|e| what(&format!("frame {i}: {e}")))?;
-            hashes.push(host.hash());
-        }
-        Ok(Run { hashes, screen: None })
+        Runner::Cpu(Box::new(host))
+    };
+    let mut hashes = Vec::with_capacity(a.frames as usize);
+    for i in 0..a.frames {
+        runner.frame(i, a.fps, a.size, script).map_err(|e| what(&format!("frame {i}: {e}")))?;
+        hashes.push(runner.hash());
     }
+    let screen = match &mut runner {
+        Runner::Gpu(host) => Some(host.read_screen().map_err(|e| what(&e))?),
+        Runner::Cpu(_) => None,
+    };
+    Ok(Run { hashes, screen })
 }

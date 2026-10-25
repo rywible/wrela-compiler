@@ -841,6 +841,138 @@ fn adjacent_passes_with_different_buffer_access_do_not_join() {
     assert_eq!(host.read_buffer(1).unwrap()[..4], 42u32.to_le_bytes());
 }
 
+/// A render pipeline, `fill`, whose one triangle covers an rgba8unorm target with white.
+const FILL_PIPELINES: &str = r#"[
+    { "name": "fill", "shader": "fill.wgsl", "kind": "render",
+      "vertex_entry": "vs", "fragment_entry": "fs",
+      "targets": [{ "colors": ["rgba8unorm"], "depth": false }], "outputs": ["float"],
+      "bindings": [] }
+]"#;
+const FILL_WGSL: &str = r#"
+    @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f {
+        let corners = array(vec2f(-1, -1), vec2f(3, -1), vec2f(-1, 3));
+        return vec4f(corners[i], 0, 1);
+    }
+    @fragment fn fs() -> @location(0) vec4f { return vec4f(1, 1, 1, 1); }
+"#;
+
+/// A program with the `fill` pipeline that submits `batch` in its one frame, run once with
+/// every pass timed. The build's directory comes first, as [`store_host`]'s.
+fn fill_host(name: &str, batch: Vec<u8>) -> (TempDir, Host) {
+    let dir = program_build(name, FILL_PIPELINES, &[("fill.wgsl", FILL_WGSL)], &[vec![batch]]);
+    let mut host = Host::load_with(&dir, &Options { timing: Timing::Span, ..Options::default() })
+        .expect("loads");
+    host.frame(0.0, 4, 4).expect("runs");
+    (dir, host)
+}
+
+/// A pass begins with the whole target its scissor: one that joins a pass that set a scissor
+/// (here the second of three joined passes, after a first that set none) draws on all of it.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_pass_that_joins_after_a_scissor_draws_on_the_whole_target() {
+    let pass = Pass::one(2, false, [0.0; 4]);
+    let joined = Pass { join: true, ..pass.keeping_color(true) };
+    let batch = Encoder::new()
+        .create_texture(2, 4, 4, TextureFormat::Rgba8, false)
+        .label("filled")
+        .begin_pass(pass)
+        .end_pass()
+        .begin_pass(joined)
+        .set_scissor(0, 0, 1, 1)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .begin_pass(joined)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .finish();
+    let (_dir, mut host) = fill_host("scissor-pass-join", batch);
+    assert_eq!(host.take_timings().unwrap().len(), 1, "the three passes join");
+    let (width, height, rgba) = host.read_target("filled").expect("the joined pass's target");
+    assert_eq!((width, height), (4, 4));
+    assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
+}
+
+/// A pass begins with the whole target its viewport too: one that joins a pass that set a
+/// one-texel viewport draws on all of it.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_pass_that_joins_after_a_viewport_draws_on_the_whole_target() {
+    let pass = Pass::one(2, false, [0.0; 4]);
+    let joined = Pass { join: true, ..pass.keeping_color(true) };
+    let batch = Encoder::new()
+        .create_texture(2, 4, 4, TextureFormat::Rgba8, false)
+        .label("filled")
+        .begin_pass(pass)
+        .set_viewport([0.0, 0.0, 1.0, 1.0], 0.0, 1.0)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .begin_pass(joined)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .finish();
+    let (_dir, mut host) = fill_host("viewport-pass-join", batch);
+    assert_eq!(host.take_timings().unwrap().len(), 1, "the two passes join");
+    let (width, height, rgba) = host.read_target("filled").expect("the joined pass's target");
+    assert_eq!((width, height), (4, 4));
+    assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
+}
+
+/// A pass joins only a pass of its own label: a `Label` ends the pass that waits, so the next
+/// label's pass is timed, and its target read, under its own name.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_pass_joins_only_a_pass_of_its_own_label() {
+    let pass = Pass::one(2, false, [0.0; 4]);
+    let joined = Pass { join: true, ..pass.keeping_color(true) };
+    let batch = Encoder::new()
+        .create_texture(2, 4, 4, TextureFormat::Rgba8, false)
+        .label("first")
+        .begin_pass(pass)
+        .end_pass()
+        .label("second")
+        .begin_pass(joined)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .begin_pass(joined)
+        .draw(0, 3, 1, &[], &[])
+        .end_pass()
+        .finish();
+    let (_dir, mut host) = fill_host("labelled-pass-join", batch);
+    let timings = host.take_timings().unwrap();
+    let labels: Vec<&str> = timings.iter().map(|t| t.label.as_str()).collect();
+    assert_eq!(labels, ["first", "second"], "the second label's two passes join, apart");
+    let (width, height, rgba) = host.read_target("second").expect("the second label's target");
+    assert_eq!((width, height), (4, 4));
+    assert!(rgba.chunks_exact(4).all(|p| p == [255; 4]), "every texel is drawn: {rgba:?}");
+}
+
+/// A labelled pass's target is the level and layer it drew into: what's read back is that
+/// subresource, at that level's size.
+#[test]
+#[ignore = "needs a GPU"]
+fn a_labelled_passs_target_is_the_level_and_layer_it_drew_into() {
+    let green = [0.0, 1.0, 0.0, 1.0];
+    let corner = stream::ColorTarget { texture: 2, level: 2, layer: 1, keep: false, clear: green };
+    let kind = stream::TextureKind::Array;
+    let batch = Encoder::new()
+        .create_texture_of(2, [8, 8, 2], TextureFormat::Rgba8, false, kind, 3)
+        .label("whole")
+        .begin_pass(Pass::one(2, false, [1.0, 0.0, 0.0, 1.0]))
+        .end_pass()
+        .label("corner")
+        .begin_pass(Pass::new(&[corner]))
+        .end_pass()
+        .finish();
+    let (_dir, mut host) = fill_host("labelled-level-layer", batch);
+    let (width, height, rgba) = host.read_target("corner").expect("the corner's target");
+    assert_eq!((width, height), (2, 2), "level 2 of 8x8");
+    assert!(rgba.chunks_exact(4).all(|p| p == [0, 255, 0, 255]), "layer 1's green: {rgba:?}");
+    let (width, height, rgba) = host.read_target("whole").expect("the whole target");
+    assert_eq!((width, height), (8, 8));
+    assert!(rgba.chunks_exact(4).all(|p| p == [255, 0, 0, 255]), "layer 0's red: {rgba:?}");
+}
+
 #[test]
 #[ignore = "needs a GPU"]
 fn times_dispatches_and_passes_with_timestamps() {

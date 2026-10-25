@@ -31,10 +31,9 @@
 use crate::query::{Index, Item};
 use crate::{Overlay, SourceMap};
 use cap_std::ambient_authority;
-use cap_std::fs::{Dir, OpenOptions};
+use cap_std::fs::Dir;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use wrela_diag::{Diagnostic, SourceFile, Span};
 use wrela_sema::Checked;
@@ -111,12 +110,20 @@ impl Texts {
         Ok(self.now.get_mut(file).expect("read"))
     }
 
-    /// Replaces each `(start, end)` of `file` (offsets in its text now) with its text.
+    /// Replaces each `(start, end)` of `file` (offsets in its text now) with its text. The same
+    /// edit twice is made once; two edits that start at one offset, or overlap, are refused,
+    /// as no order of them is the one meant.
     fn replace(&mut self, file: &str, mut edits: Vec<(u32, u32, String)>) -> Result<(), Refusal> {
-        edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-        edits.dedup_by_key(|e| e.0);
+        edits.sort();
+        edits.dedup();
+        if let Some(w) = edits.windows(2).find(|w| w[1].0 == w[0].0 || w[1].0 < w[0].1) {
+            return refuse(format!(
+                "two changes of {file} meet, at {}..{} and {}..{}: nothing is changed",
+                w[0].0, w[0].1, w[1].0, w[1].1
+            ));
+        }
         let text = self.get(file)?;
-        for (s, e, new) in edits {
+        for (s, e, new) in edits.into_iter().rev() {
             text.replace_range(s as usize..e as usize, &new);
         }
         Ok(())
@@ -516,12 +523,18 @@ fn use_statements(text: &str) -> Vec<(usize, usize)> {
 }
 
 /// Where a new import goes: after the file's last top-level `use` (its end, for one over
-/// several lines), else after its first comment block.
+/// several lines), else after the comment it opens with.
 fn import_at(text: &str) -> usize {
-    use_statements(text).last().map_or_else(
-        || text.split_inclusive('\n').take_while(|l| l.starts_with("//")).map(str::len).sum(),
-        |&(_, end)| end,
-    )
+    use_statements(text).last().map_or_else(|| intro_end(text), |&(_, end)| end)
+}
+
+/// Where the `//` comment a file opens with ends: what its module is for, as `wrela doc` reads
+/// it. A `///` line is the first item's doc comment, so it ends the comment.
+fn intro_end(text: &str) -> usize {
+    (text.split_inclusive('\n'))
+        .take_while(|l| l.starts_with("//") && !l.starts_with("///"))
+        .map(str::len)
+        .sum()
 }
 
 /// `text` with `name` taken out of the top-level `use` that imports it (the whole `use`, if
@@ -861,71 +874,70 @@ fn param_list(text: &str, after: usize) -> Option<(u32, u32)> {
     None
 }
 
-fn calls_of(root: &Path, func: &str) -> Result<Calls, Refusal> {
-    inspect(root, |checked, sources| {
-        let ix = Index::new(checked, sources);
-        let p = ix.p;
-        let (it, path) = ix.one(func)?;
-        let Item::Fn(f) = it else { return refuse(format!("`{path}` isn't a function")) };
-        if let FnOwner::Impl(im) = p.func(f).owner
-            && p.impl_(im).trait_ref.is_some()
-        {
-            return refuse(format!("`{path}` implements a trait's method: change the trait's"));
-        }
-        let fns = ix.with_impls(f);
-        let mut defs = Vec::new();
-        for &g in &fns {
-            let d = p.func(g);
-            let file = program_file(sources, d.span)
-                .ok_or_else(|| format!("`{}` isn't the program's own", ix.fn_path(g)))?;
-            let text = &sources.file(d.span.file).text;
-            let (open, close) = param_list(text, d.name_span.end as usize)
-                .ok_or_else(|| format!("can't find `{}`'s parameters", ix.fn_path(g)))?;
-            let params = d
-                .params
-                .iter()
-                .map(|x| (x.name.clone(), x.span, x.mode, x.default.is_some()))
-                .collect();
-            defs.push(Def { implements: g != f, file, params, open, close });
-        }
-        let mut calls = Vec::new();
-        let mut values = Vec::new();
-        for body in checked.mir.values() {
-            for (s, r) in wrela_sema::mir::rvalues(body) {
-                match r {
-                    Rvalue::Call(c) => {
-                        let hit = match &c.callee {
-                            Callee::Fn { func, .. } => fns.contains(func),
-                            Callee::TraitMethod { method, .. } => *method == f,
-                            _ => false,
-                        };
-                        if !hit {
-                            continue;
-                        }
-                        let Some(file) = program_file(sources, c.span) else { continue };
-                        let args = c
-                            .args
-                            .iter()
-                            .map(|a| {
-                                let needs_take = match a {
-                                    Arg::Borrow(pl, _) | Arg::Mut(pl, _) => {
-                                        let ty = wrela_sema::mir::place_ty(p, &body.locals, pl);
-                                        !wrela_sema::traits::implements_builtin(p, ty, Lang::Copy)
-                                    }
-                                    Arg::Take(_) => false,
-                                };
-                                (a.span(), needs_take)
-                            })
-                            .collect();
-                        calls.push(CallSite { file, span: c.span, args });
+/// The definitions and calls of the function at `func` in the checked program.
+fn calls_in(checked: &Checked, sources: &SourceMap, func: &str) -> Result<Calls, Refusal> {
+    let ix = Index::new(checked, sources);
+    let p = ix.p;
+    let (it, path) = ix.one(func)?;
+    let Item::Fn(f) = it else { return refuse(format!("`{path}` isn't a function")) };
+    if let FnOwner::Impl(im) = p.func(f).owner
+        && p.impl_(im).trait_ref.is_some()
+    {
+        return refuse(format!("`{path}` implements a trait's method: change the trait's"));
+    }
+    let fns = ix.with_impls(f);
+    let mut defs = Vec::new();
+    for &g in &fns {
+        let d = p.func(g);
+        let file = program_file(sources, d.span)
+            .ok_or_else(|| format!("`{}` isn't the program's own", ix.fn_path(g)))?;
+        let text = &sources.file(d.span.file).text;
+        let (open, close) = param_list(text, d.name_span.end as usize)
+            .ok_or_else(|| format!("can't find `{}`'s parameters", ix.fn_path(g)))?;
+        let params = d
+            .params
+            .iter()
+            .map(|x| (x.name.clone(), x.span, x.mode, x.default.is_some()))
+            .collect();
+        defs.push(Def { implements: g != f, file, params, open, close });
+    }
+    let mut calls = Vec::new();
+    let mut values = Vec::new();
+    for body in checked.mir.values() {
+        for (s, r) in wrela_sema::mir::rvalues(body) {
+            match r {
+                Rvalue::Call(c) => {
+                    let hit = match &c.callee {
+                        Callee::Fn { func, .. } => fns.contains(func),
+                        Callee::TraitMethod { method, .. } => *method == f,
+                        _ => false,
+                    };
+                    if !hit {
+                        continue;
                     }
-                    Rvalue::FnRef(g, _) if fns.contains(g) => values.push(ix.at(s.span)),
-                    _ => {}
+                    let Some(file) = program_file(sources, c.span) else { continue };
+                    let args = c
+                        .args
+                        .iter()
+                        .map(|a| {
+                            let needs_take = match a {
+                                Arg::Borrow(pl, _) | Arg::Mut(pl, _) => {
+                                    let ty = wrela_sema::mir::place_ty(p, &body.locals, pl);
+                                    !wrela_sema::traits::implements_builtin(p, ty, Lang::Copy)
+                                }
+                                Arg::Take(_) => false,
+                            };
+                            (a.span(), needs_take)
+                        })
+                        .collect();
+                    calls.push(CallSite { file, span: c.span, args });
                 }
+                Rvalue::FnRef(g, _) if fns.contains(g) => values.push(ix.at(s.span)),
+                _ => {}
             }
         }
-        Ok(Calls { path, defs, calls, values })
-    })
+    }
+    Ok(Calls { path, defs, calls, values })
 }
 
 /// The `(` that the `)` at `close` closes.
@@ -982,7 +994,7 @@ pub fn add_param(
             "give `--value <expr>` (each call passes it) or `--default <expr>` (the parameter has it)",
         );
     }
-    let c = calls_of(root, func)?;
+    let c = inspect(root, |checked, sources| calls_in(checked, sources, func))?;
     if !c.values.is_empty() && value.is_some() {
         return refuse(format!(
             "`{}` is used as a value at {}: a new parameter changes its type",
@@ -1046,7 +1058,7 @@ pub fn change_mode(root: &Path, func: &str, param: &str, mode: &str) -> Result<P
     if param == "self" {
         return refuse("`self`'s mode is the method's: change it by hand");
     }
-    let c = calls_of(root, func)?;
+    let c = inspect(root, |checked, sources| calls_in(checked, sources, func))?;
     if !c.values.is_empty() {
         return refuse(format!(
             "`{}` is used as a value at {}: its parameter's mode is part of its type",
@@ -1301,19 +1313,13 @@ pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
         source_path(root, &f.file, &files)?;
     }
     for f in &plan.files {
-        let mut options = OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        cap_std::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
-        let mut file = dir
-            .open_with(&f.file, &options)
-            .map_err(|e| format!("can't read {} before writing the plan: {e}", f.file))?;
-        if !file.metadata().is_ok_and(|m| m.is_file()) {
+        let cant =
+            |e: std::io::Error| format!("can't read {} before writing the plan: {e}", f.file);
+        let Some(bytes) = crate::reach::read_regular(&dir, Path::new(&f.file)).map_err(cant)?
+        else {
             return refuse(format!("{} isn't a regular source file", f.file));
-        }
-        let mut now = String::new();
-        file.read_to_string(&mut now)
-            .map_err(|e| format!("can't read {} before writing the plan: {e}", f.file))?;
+        };
+        let now = crate::reach::utf8(bytes).map_err(cant)?;
         if now != f.old {
             return refuse(format!(
                 "{} changed while the plan was made: nothing is written",
@@ -1322,31 +1328,10 @@ pub fn write(root: &Path, plan: &Plan) -> Result<(), Refusal> {
         }
     }
     for f in &plan.files {
-        write_atomic_in(&dir, Path::new(&f.file), f.new.as_bytes())
+        crate::write_atomic_in(&dir, Path::new(&f.file), f.new.as_bytes())
             .map_err(|e| format!("can't write {}: {e}", f.file))?;
     }
     Ok(())
-}
-
-/// Writes a plan's source through the package handle. The temporary name must be new even if
-/// another process knows it, and the final rename stays within the opened directory.
-fn write_atomic_in(dir: &Dir, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.tmp-{}-{n}", std::process::id()));
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = dir.open_with(&tmp, &options)?;
-        file.write_all(bytes)?;
-        drop(file);
-        dir.rename(&tmp, dir, path)
-    })();
-    if result.is_err() {
-        let _ = dir.remove_file(&tmp);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -1440,7 +1425,7 @@ mod tests {
         std::fs::rename(root.join("module"), root.join("old-module"))
             .expect("replace source directory");
         std::os::unix::fs::symlink(&outside, root.join("module")).expect("replacement link");
-        assert!(write_atomic_in(&held, Path::new("module/a.wrela"), b"changed").is_err());
+        assert!(crate::write_atomic_in(&held, Path::new("module/a.wrela"), b"changed").is_err());
         assert_eq!(std::fs::read(outside.join("a.wrela")).expect("outside source"), b"outside");
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
@@ -1510,6 +1495,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// What code after the lines uses and changes is found in its nested blocks too.
+    #[test]
+    fn extracted_lines_return_what_nested_code_after_them_uses_and_changes() {
+        let dir = std::env::temp_dir()
+            .join(format!("wrela-refactor-extract-nested-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        let source = "pub fn frame(time: f32, width: u32, height: u32) {}\n\nfn total(n: u32) -> u32 {\n    var t = n\n    t += 1\n    var r: u32 = 0\n    if n > 2 {\n        r = t\n        t += 1\n    }\n    r\n}\n";
+        std::fs::write(dir.join("main.wrela"), source).expect("source");
+        let plan = extract_fn(&dir, "main.wrela:4-5", "start").expect("extract plan");
+        let text = &plan.files[0].new;
+        assert!(text.contains("var t = start(n)"), "{text}");
+        assert!(text.contains("fn start(n: u32) -> u32 {"), "{text}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn parameter_delimiters_ignore_strings_and_comments() {
         for text in [
@@ -1550,6 +1551,28 @@ mod tests {
     }
 
     #[test]
+    fn edits_that_meet_are_refused_and_the_same_edit_is_made_once() {
+        let dir = std::env::temp_dir().join(format!("wrela-refactor-edits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("directory");
+        std::fs::write(dir.join("a.wrela"), "abcdef").expect("source");
+        let edit = |s: u32, e: u32, t: &str| (s, e, t.to_string());
+        for edits in [
+            vec![edit(1, 1, "x"), edit(1, 1, "y")],
+            vec![edit(1, 3, "x"), edit(1, 1, "y")],
+            vec![edit(1, 4, "x"), edit(3, 5, "y")],
+        ] {
+            let mut texts = Texts::new(&dir);
+            assert!(texts.replace("a.wrela", edits.clone()).is_err(), "{edits:?}");
+        }
+        let mut texts = Texts::new(&dir);
+        let edits = vec![edit(4, 4, "Y"), edit(1, 4, "X"), edit(1, 4, "X"), edit(0, 0, "_")];
+        texts.replace("a.wrela", edits).expect("edits apart");
+        assert_eq!(texts.now["a.wrela"], "_aXYef");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn hunks_are_the_lines_that_changed() {
         let h = hunks("a\nb\nc\nd\n", "a\nB\nc\nd\ne\n");
         assert_eq!(
@@ -1567,6 +1590,7 @@ mod tests {
         let text = "// A module.\n\nuse a::b\nuse c::{d,\n    e}\n\nfn f() {}\n";
         assert_eq!(&text[..import_at(text)], "// A module.\n\nuse a::b\nuse c::{d,\n    e}\n");
         assert_eq!(import_at("// Only a comment.\nfn f() {}\n"), 19);
+        assert_eq!(import_at("// A module.\n/// An item.\nfn f() {}\n"), 13);
         assert_eq!(without_import("use a::b\nfn f() {}\n", "b").as_deref(), Some("fn f() {}\n"));
         assert_eq!(without_import("use c::{d, e}\n", "d").as_deref(), Some("use c::{e}\n"));
         assert_eq!(without_import("use c::{d}\n", "d").as_deref(), Some(""));

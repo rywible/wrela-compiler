@@ -18,32 +18,46 @@ pub enum BuiltinTy {
 }
 
 impl BuiltinTy {
+    /// The prelude's type names but the vectors' ([`BuiltinTy::vec`]), each with its type.
+    const NAMED: &[(&str, BuiltinTy)] = &[
+        ("bool", BuiltinTy::Bool),
+        ("i8", BuiltinTy::Int(IntTy::I8)),
+        ("u8", BuiltinTy::Int(IntTy::U8)),
+        ("i16", BuiltinTy::Int(IntTy::I16)),
+        ("u16", BuiltinTy::Int(IntTy::U16)),
+        ("i32", BuiltinTy::Int(IntTy::I32)),
+        ("u32", BuiltinTy::Int(IntTy::U32)),
+        ("i64", BuiltinTy::Int(IntTy::I64)),
+        ("u64", BuiltinTy::Int(IntTy::U64)),
+        ("f32", BuiltinTy::Float(FloatTy::F32)),
+        ("f64", BuiltinTy::Float(FloatTy::F64)),
+        ("f16", BuiltinTy::Float(FloatTy::F16)),
+        ("mat2", BuiltinTy::Mat(2, 2)),
+        ("mat3", BuiltinTy::Mat(3, 3)),
+        ("mat4", BuiltinTy::Mat(4, 4)),
+        ("mat2x3", BuiltinTy::Mat(2, 3)),
+        ("mat2x4", BuiltinTy::Mat(2, 4)),
+        ("mat3x2", BuiltinTy::Mat(3, 2)),
+        ("mat3x4", BuiltinTy::Mat(3, 4)),
+        ("mat4x2", BuiltinTy::Mat(4, 2)),
+        ("mat4x3", BuiltinTy::Mat(4, 3)),
+        ("str", BuiltinTy::Str),
+    ];
+
     pub fn lookup(name: &str) -> Option<BuiltinTy> {
-        Some(match name {
-            "bool" => BuiltinTy::Bool,
-            "i8" => BuiltinTy::Int(IntTy::I8),
-            "u8" => BuiltinTy::Int(IntTy::U8),
-            "i16" => BuiltinTy::Int(IntTy::I16),
-            "u16" => BuiltinTy::Int(IntTy::U16),
-            "i32" => BuiltinTy::Int(IntTy::I32),
-            "u32" => BuiltinTy::Int(IntTy::U32),
-            "i64" => BuiltinTy::Int(IntTy::I64),
-            "u64" => BuiltinTy::Int(IntTy::U64),
-            "f32" => BuiltinTy::Float(FloatTy::F32),
-            "f64" => BuiltinTy::Float(FloatTy::F64),
-            "f16" => BuiltinTy::Float(FloatTy::F16),
-            "mat2" => BuiltinTy::Mat(2, 2),
-            "mat3" => BuiltinTy::Mat(3, 3),
-            "mat4" => BuiltinTy::Mat(4, 4),
-            "mat2x3" => BuiltinTy::Mat(2, 3),
-            "mat2x4" => BuiltinTy::Mat(2, 4),
-            "mat3x2" => BuiltinTy::Mat(3, 2),
-            "mat3x4" => BuiltinTy::Mat(3, 4),
-            "mat4x2" => BuiltinTy::Mat(4, 2),
-            "mat4x3" => BuiltinTy::Mat(4, 3),
-            "str" => BuiltinTy::Str,
-            _ => return Self::vec(name),
-        })
+        match Self::NAMED.iter().find(|(n, _)| *n == name) {
+            Some(&(_, t)) => Some(t),
+            None => Self::vec(name),
+        }
+    }
+
+    /// Every type name in the prelude, as [`BuiltinTy::lookup`] takes it: `wrela doc` lists
+    /// them.
+    pub fn names() -> impl Iterator<Item = String> {
+        let vectors = VecElem::ALL
+            .into_iter()
+            .flat_map(|e| (2..=4).map(move |n| format!("vec{n}{}", e.suffix())));
+        Self::NAMED.iter().map(|(n, _)| n.to_string()).chain(vectors)
     }
 
     /// `vecN` with its element's suffix (`vec3i`), for N from 2 to 4.
@@ -431,5 +445,19 @@ mod tests {
         assert_eq!(BuiltinFn::lookup("wrapping_add"), None);
         assert_eq!(BuiltinFn::lookup_method("select"), None);
         assert_eq!(BuiltinFn::lookup_method("len"), Some(BuiltinFn::Len));
+    }
+
+    #[test]
+    fn every_builtin_type_name_is_found_once() {
+        let names: Vec<String> = BuiltinTy::names().collect();
+        for name in &names {
+            assert!(BuiltinTy::lookup(name).is_some(), "{name} isn't found");
+        }
+        let mut distinct = names.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), names.len());
+        assert!(names.iter().any(|n| n == "vec3h") && names.iter().any(|n| n == "vec2d"));
+        assert_eq!(BuiltinTy::lookup("vec5"), None);
     }
 }

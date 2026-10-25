@@ -1,5 +1,6 @@
 // rejects: derive.gradient derive.interval eff.derived
 use std::derive::{Interval, gradient, interval}
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
 
 
 fn wobble(t: f32) -> f32 {
@@ -125,4 +126,16 @@ fn spread(x: f32) -> f32 {
 
 pub fn spread_slope(x: f32) -> f32 {
     gradient(spread, x)
+}
+
+// A range of half floats: its widening is `f32`'s, which an `f16` rounds away.
+@compute(64)
+fn halves(out: mut Slots<f32>, id: GlobalId) {
+    let r = interval(|x: f32| f32(f16(x) + f16(1.0)), Interval { lo: 0.0, hi: f32(id.x) }) //~ E0700
+    out[id] = r.hi
+}
+
+pub fn halves_frame() {
+    var out: GpuBuffer<f32> = buffer(64)
+    dispatch(halves.bind(mut out), groups: 1)
 }

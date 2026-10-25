@@ -2,8 +2,9 @@
 //!
 //! - `wrela-serve <build-dir> [--port N] [--data DIR] --cert CERT.pem --key KEY.pem --origin PAGE_ORIGIN [--origin PAGE_ORIGIN ...]`
 //! - `wrela-serve <build-dir> [--port N] [--data DIR] --dev`: a development certificate, whose
-//!   address and hash it writes to `<build-dir>/net.json` for the client build beside it. This
-//!   server listens on loopback addresses only; a certificate server listens on all interfaces.
+//!   address and hash it writes to `<build-dir>/net.json` for the client build beside it, once
+//!   it listens (so `--port 0`, a free port, gives the port it has). This server listens on
+//!   loopback addresses only; a certificate server listens on all interfaces.
 //!
 //! `<build-dir>` is a `wrela build` of a program with a server role: its `server/game.wasm`.
 //! Rooms' journals go in `--data` (default `<build-dir>/rooms`), each server build's in a
@@ -72,17 +73,18 @@ fn main() -> ExitCode {
     };
     let runtime = tokio::runtime::Runtime::new().expect("an async runtime");
     let result: std::io::Result<()> = (|| {
-        let (identity, origin_policy) = match (cert, key, dev) {
+        // A development certificate's hash goes in `net.json`.
+        let (identity, origin_policy, dev_hash) = match (cert, key, dev) {
             (Some(c), Some(k), false) if !origins.is_empty() => (
                 runtime
                     .block_on(wtransport::Identity::load_pemfiles(c, k))
                     .map_err(std::io::Error::other)?,
                 wrela_serve::Origins::Exact(origins),
+                None,
             ),
             (None, None, true) if origins.is_empty() => {
                 let (identity, hash) = wrela_serve::dev_identity()?;
-                std::fs::write(dir.join("net.json"), wrela_serve::net_json(port, Some(&hash)))?;
-                (identity, wrela_serve::Origins::Local)
+                (identity, wrela_serve::Origins::Local, Some(hash))
             }
             _ => return Err(std::io::Error::other("give --cert, --key and --origin, or --dev")),
         };
@@ -100,11 +102,11 @@ fn main() -> ExitCode {
             bounds: wrela_serve::Bounds::default(),
             origins: origin_policy,
         };
-        let _server = if dev {
-            wrela_serve::start_local(config, &runtime)?
-        } else {
-            wrela_serve::start(config, &runtime)?
+        let server = match dev_hash {
+            Some(hash) => wrela_serve::start_dev(config, &hash, &dir.join("net.json"), &runtime)?,
+            None => wrela_serve::start(config, &runtime)?,
         };
+        let port = server.local_addr().port();
         eprintln!("wrela-serve: rooms of {} on port {port}", dir.display());
         runtime.block_on(std::future::pending::<()>());
         Ok(())

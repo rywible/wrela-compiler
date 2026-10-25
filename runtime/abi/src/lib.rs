@@ -308,8 +308,7 @@ impl Limits {
         max_workgroup_invocations: 256,
         max_workgroup_size: [256, 256, 64],
         max_workgroups_per_dimension: 65_535,
-        // `indirect-first-instance` alone: what every host requires.
-        features: 1 << 11,
+        features: REQUIRED_FEATURES,
         subgroup_min_size: 0,
         subgroup_max_size: 0,
     };
@@ -320,11 +319,6 @@ impl Limits {
     /// Whether the device has feature `name` (WebGPU's).
     pub fn has(&self, name: &str) -> bool {
         feature_bit(name).is_some_and(|b| self.features & b != 0)
-    }
-
-    /// The names of the device's features.
-    pub fn feature_names(&self) -> Vec<&'static str> {
-        FEATURES.iter().copied().filter(|f| self.has(f)).collect()
     }
 
     /// The limit at `index`, as `wrela.limit` gives it.
@@ -370,6 +364,10 @@ pub fn feature_bit(name: &str) -> Option<u32> {
     FEATURES.iter().position(|f| *f == name).map(|i| 1 << i)
 }
 
+/// The features every host requires of its device, as [`feature_bit`]s:
+/// `indirect-first-instance` alone.
+pub const REQUIRED_FEATURES: u32 = 1 << 11;
+
 /// The checked-in files generated from this crate, each as (path, contents): the browser
 /// runtime's constants ([`typescript`]), std's ([`wrela`]) and the test vectors ([`vectors`]).
 /// `cargo run -p wrela-abi --bin generate` writes them.
@@ -403,6 +401,12 @@ mod tests {
         assert_eq!(super::read_pair(b"not a module"), None);
         // The ids of the two roles' modules differ by which is which.
         assert_ne!(super::pair_id(Some(b"a"), None), super::pair_id(None, Some(b"a")));
+    }
+
+    /// The required features' bit is `indirect-first-instance`'s, in [`super::FEATURES`]' order.
+    #[test]
+    fn required_features_are_indirect_first_instance() {
+        assert_eq!(super::feature_bit("indirect-first-instance"), Some(super::REQUIRED_FEATURES));
     }
 
     #[test]

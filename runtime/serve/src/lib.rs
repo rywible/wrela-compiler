@@ -204,8 +204,17 @@ struct Link {
 }
 
 impl Link {
-    /// Tells its session to close even when its outbound queue is full.
-    fn close(&self) {
+    /// Tells its session, connection `conn`'s, to close once it has sent what's queued: a close
+    /// behind its sends, or, when its queue is full, at once.
+    fn close(&self, conn: u32) {
+        if self.tx.try_send((Out::Close(conn), None)).is_err() {
+            self.cut();
+        }
+    }
+
+    /// Tells its session to close at once, dropping what's queued, even when its queue is full:
+    /// a connection that can't take what it's sent fast enough.
+    fn cut(&self) {
         self.stop.send_replace(true);
     }
 }
@@ -392,7 +401,9 @@ fn run(
     let mut last_conn = Instant::now();
     loop {
         let mut batch = std::mem::take(&mut carried);
-        if batch.is_empty() {
+        // Answers to its last call's requests wait for its next call, which comes at once.
+        let answered = room.as_ref().is_some_and(RoomHost::answered);
+        if batch.is_empty() && !answered {
             match rx.recv_timeout(TICK) {
                 Ok(e) => batch.push(e),
                 Err(RecvTimeoutError::Timeout) => {}
@@ -406,10 +417,10 @@ fn run(
             }
         }
         if stop.load(Ordering::Acquire) || batch.iter().any(|e| matches!(e, ToRoom::Stop)) {
-            outs.values().for_each(Link::close);
+            outs.iter().for_each(|(&conn, link)| link.close(conn));
             for e in batch {
-                if let ToRoom::Opened(_, link) = e {
-                    link.close();
+                if let ToRoom::Opened(conn, link) = e {
+                    link.close(conn);
                 }
             }
             return;
@@ -419,8 +430,8 @@ fn run(
             // once nothing does.
             let mut joined = false;
             for e in batch {
-                if let ToRoom::Opened(_, link) = e {
-                    link.close();
+                if let ToRoom::Opened(conn, link) = e {
+                    link.close(conn);
                     joined = true;
                 }
             }
@@ -430,7 +441,7 @@ fn run(
             continue;
         };
         // A room with events waiting (a call past the host's limits) tries again each tick.
-        let mut woken = !batch.is_empty() || host.waiting() > 0;
+        let mut woken = !batch.is_empty() || host.waiting() > 0 || host.answered();
         for e in batch {
             match e {
                 ToRoom::Opened(conn, link) => {
@@ -487,7 +498,7 @@ fn run(
                 };
                 if !sent {
                     // It can't take what it's sent fast enough: it goes, and comes back.
-                    link.close();
+                    link.cut();
                     outs.remove(&conn);
                     host.disconnect(conn);
                 }
@@ -495,7 +506,7 @@ fn run(
             if let Status::Quarantined(why) = host.status() {
                 // Its connections were closed (above): it takes no more, until it opens again.
                 eprintln!("wrela-serve: room {name} is quarantined: {why}");
-                outs.drain().for_each(|(_, link)| link.close());
+                outs.drain().for_each(|(conn, link)| link.close(conn));
                 shares.clear();
                 room = None;
             }
@@ -679,6 +690,20 @@ pub fn start_local(config: Config, runtime: &tokio::runtime::Runtime) -> std::io
     start_with_bind(config, runtime, IpBindConfig::LocalDual)
 }
 
+/// Starts a development server ([`start_local`]) whose development certificate's hash is
+/// `hash` ([`dev_identity`]), then writes what a client build reads to find it ([`net_json`]) to
+/// `net`, with the port it has: a `config.port` of 0 takes a free one.
+pub fn start_dev(
+    config: Config,
+    hash: &[u8; 32],
+    net: &std::path::Path,
+    runtime: &tokio::runtime::Runtime,
+) -> std::io::Result<Server> {
+    let server = start_local(config, runtime)?;
+    std::fs::write(net, net_json(server.local_addr().port(), Some(hash)))?;
+    Ok(server)
+}
+
 fn transport_config() -> QuicTransportConfig {
     let mut transport = QuicTransportConfig::default();
     // HTTP/3 uses a CONNECT stream and control streams. The room uses one more bidirectional
@@ -776,12 +801,151 @@ mod tests {
         tx.try_send((wrela_host::rooms::Out::Send(1, vec![0]), None))
             .expect("fill the outbound queue");
         let link = super::Link { tx, stop, held: Arc::new(AtomicUsize::new(0)) };
-        link.close();
+        link.close(1);
         tokio::time::timeout(Duration::from_secs(1), stopped.changed())
             .await
             .expect("shutdown signal is not queued")
             .expect("shutdown sender remains open");
         assert!(*stopped.borrow());
+    }
+
+    /// A room's close follows what it sent: its session sends that, then finishes its stream.
+    #[test]
+    fn a_close_goes_behind_the_sends_queued_before_it() {
+        use wrela_host::rooms::Out;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        tx.try_send((Out::Send(1, vec![7]), None)).expect("a send");
+        let link = super::Link { tx, stop, held: Arc::new(AtomicUsize::new(0)) };
+        link.close(1);
+        assert!(!stopped.has_changed().expect("the link is open"), "nothing is dropped");
+        assert_eq!(rx.try_recv().expect("the send").0, Out::Send(1, vec![7]));
+        assert_eq!(rx.try_recv().expect("the close").0, Out::Close(1));
+    }
+
+    /// A server build of `wat`.
+    fn build(wat: &str) -> Arc<wrela_host::server::ServerBuild> {
+        let wasm = wat::parse_str(wat).expect("server module");
+        Arc::new(wrela_host::server::ServerBuild::from_wasm(&wasm).expect("server build"))
+    }
+
+    /// A fresh directory for `name`.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("wrela-serve-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The answers to a room's requests are read on its next call, which comes though nothing
+    /// else does: a store read's answer reaches its peer with no other traffic.
+    #[test]
+    fn a_rooms_answers_wake_it_with_no_other_traffic() {
+        use super::{Link, Rooms, State, ToRoom};
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use std::time::Instant;
+        use wrela_abi::stream::Encoder;
+        use wrela_host::rooms::Out;
+        let get = Encoder::new().host_request(7, "store/get", b"key").finish();
+        let send = Encoder::new().host_request(8, "net/send", &[1, 0, 0, 0, 42]).finish();
+        let escaped = |b: &[u8]| b.iter().map(|b| format!("\\{b:02x}")).collect::<String>();
+        // Its first call asks for a key; the call that has the answer sends 42 to connection 1.
+        let build = build(&format!(
+            r#"(module
+                (import "wrela" "input" (func $input (param i32 i32) (result i32)))
+                (import "wrela" "submit" (func $submit (param i32 i32)))
+                (import "wrela" "request_status" (func $status (param i32) (result i32)))
+                (memory (export "memory") 1)
+                (data (i32.const 4096) "{}")
+                (data (i32.const 8192) "{}")
+                (global $step (mut i32) (i32.const 0))
+                (func (export "serve") (param f32)
+                    (drop (call $input (i32.const 0) (i32.const 64)))
+                    (if (i32.eqz (global.get $step))
+                        (then
+                            (call $submit (i32.const 4096) (i32.const {}))
+                            (global.set $step (i32.const 1)))
+                        (else (if (i32.and
+                                (i32.eq (global.get $step) (i32.const 1))
+                                (i32.ge_s (call $status (i32.const 7)) (i32.const 0)))
+                            (then
+                                (call $submit (i32.const 8192) (i32.const {}))
+                                (global.set $step (i32.const 2))))))))"#,
+            escaped(&get),
+            escaped(&send),
+            get.len(),
+            send.len()
+        ));
+        let dir = scratch("answers");
+        let services =
+            wrela_host::services::Services::open(&dir.join("store.sqlite")).expect("the store");
+        let rooms = Rooms {
+            state: std::sync::Mutex::new(State {
+                build: build.clone(),
+                hash: 1,
+                rooms: std::collections::HashMap::new(),
+            }),
+            data: dir.clone(),
+            services: Some(Arc::new(services)),
+            limits: wrela_host::server::Limits::default(),
+            bounds: super::Bounds::default(),
+            origins: super::Origins::Local,
+            next_conn: AtomicU32::new(1),
+            started: Instant::now(),
+            sessions: Arc::new(AtomicUsize::new(0)),
+            running: Arc::new(AtomicUsize::new(0)),
+            queued: Arc::new(AtomicUsize::new(0)),
+        };
+        let (to_room, rx) = std::sync::mpsc::sync_channel(super::QUEUE);
+        let (tx, mut from_room) = tokio::sync::mpsc::channel(super::QUEUE);
+        let (stop, _stopped) = tokio::sync::watch::channel(false);
+        let link = Link { tx, stop, held: Arc::new(AtomicUsize::new(0)) };
+        to_room.send(ToRoom::Opened(1, link)).expect("the room's queue");
+        let thread = std::thread::spawn(move || {
+            super::run(&rooms, build, 1, "a", &rx, &Arc::new(AtomicBool::new(false)));
+        });
+        let until = Instant::now() + Duration::from_secs(5);
+        let sent = loop {
+            match from_room.try_recv() {
+                Ok((out, _)) => break Some(out),
+                Err(_) if Instant::now() < until => std::thread::sleep(Duration::from_millis(5)),
+                Err(_) => break None,
+            }
+        };
+        to_room.send(ToRoom::Stop).expect("the room's queue");
+        thread.join().expect("the room's thread");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(sent, Some(Out::Send(1, vec![42])), "the answer's call came on its own");
+    }
+
+    /// A development server on a free port says the port it has in its `net.json`.
+    #[test]
+    fn a_dev_server_on_a_free_port_writes_the_port_it_has() {
+        let dir = scratch("dev-port");
+        std::fs::create_dir_all(&dir).expect("the build's directory");
+        let (identity, hash) = super::dev_identity().expect("a certificate");
+        let config = super::Config {
+            build: build(
+                r#"(module (memory (export "memory") 1) (func (export "serve") (param f32)))"#,
+            ),
+            build_hash: 1,
+            data: dir.join("rooms"),
+            services: None,
+            port: 0,
+            identity,
+            limits: wrela_host::server::Limits::default(),
+            bounds: super::Bounds::default(),
+            origins: super::Origins::Local,
+        };
+        let runtime = tokio::runtime::Runtime::new().expect("a runtime");
+        let net = dir.join("net.json");
+        let server = super::start_dev(config, &hash, &net, &runtime).expect("the server starts");
+        let port = server.local_addr().port();
+        assert_ne!(port, 0);
+        let written = std::fs::read_to_string(&net).expect("net.json");
+        assert_eq!(written, super::net_json(port, Some(&hash)));
+        drop(server);
+        drop(runtime);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

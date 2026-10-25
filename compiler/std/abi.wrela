@@ -145,9 +145,6 @@ pub(package) const MAX_TEXTURE_3D: u32 = 2048
 /// A texture's format code with this bit set: kernels write its texels.
 pub(package) const TEXTURE_WRITABLE: u32 = 65536
 
-/// A pass's join word: it may join the pass before it.
-pub(package) const PASS_JOIN: u32 = 1
-
 /// A 2D texture's kind.
 pub(package) const KIND_2D: u32 = 0
 
@@ -175,121 +172,121 @@ pub(package) const REQUEST_MISSING: i32 = -3
 /// The stream's code for the texture format `rgba8unorm`.
 pub(package) const FORMAT_RGBA8UNORM: u32 = 0
 
-/// The bytes of a texel of `rgba8unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rgba8unorm`.
 pub(package) const FORMAT_RGBA8UNORM_BYTES: u32 = 4
 
 /// The stream's code for the texture format `rgba16float`.
 pub(package) const FORMAT_RGBA16FLOAT: u32 = 1
 
-/// The bytes of a texel of `rgba16float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rgba16float`.
 pub(package) const FORMAT_RGBA16FLOAT_BYTES: u32 = 8
 
 /// The stream's code for the texture format `depth32float`.
 pub(package) const FORMAT_DEPTH32FLOAT: u32 = 2
 
-/// The bytes of a texel of `depth32float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `depth32float`.
 pub(package) const FORMAT_DEPTH32FLOAT_BYTES: u32 = 4
 
 /// The stream's code for the texture format `r16float`.
 pub(package) const FORMAT_R16FLOAT: u32 = 3
 
-/// The bytes of a texel of `r16float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `r16float`.
 pub(package) const FORMAT_R16FLOAT_BYTES: u32 = 2
 
 /// The stream's code for the texture format `rg16float`.
 pub(package) const FORMAT_RG16FLOAT: u32 = 4
 
-/// The bytes of a texel of `rg16float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rg16float`.
 pub(package) const FORMAT_RG16FLOAT_BYTES: u32 = 4
 
 /// The stream's code for the texture format `r32float`.
 pub(package) const FORMAT_R32FLOAT: u32 = 5
 
-/// The bytes of a texel of `r32float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `r32float`.
 pub(package) const FORMAT_R32FLOAT_BYTES: u32 = 4
 
 /// The stream's code for the texture format `r32uint`.
 pub(package) const FORMAT_R32UINT: u32 = 6
 
-/// The bytes of a texel of `r32uint` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `r32uint`.
 pub(package) const FORMAT_R32UINT_BYTES: u32 = 4
 
 /// The stream's code for the texture format `r8unorm`.
 pub(package) const FORMAT_R8UNORM: u32 = 7
 
-/// The bytes of a texel of `r8unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `r8unorm`.
 pub(package) const FORMAT_R8UNORM_BYTES: u32 = 1
 
 /// The stream's code for the texture format `rg8unorm`.
 pub(package) const FORMAT_RG8UNORM: u32 = 8
 
-/// The bytes of a texel of `rg8unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rg8unorm`.
 pub(package) const FORMAT_RG8UNORM_BYTES: u32 = 2
 
 /// The stream's code for the texture format `rgb10a2unorm`.
 pub(package) const FORMAT_RGB10A2UNORM: u32 = 9
 
-/// The bytes of a texel of `rgb10a2unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rgb10a2unorm`.
 pub(package) const FORMAT_RGB10A2UNORM_BYTES: u32 = 4
 
 /// The stream's code for the texture format `rg32float`.
 pub(package) const FORMAT_RG32FLOAT: u32 = 10
 
-/// The bytes of a texel of `rg32float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rg32float`.
 pub(package) const FORMAT_RG32FLOAT_BYTES: u32 = 8
 
 /// The stream's code for the texture format `rgba32float`.
 pub(package) const FORMAT_RGBA32FLOAT: u32 = 11
 
-/// The bytes of a texel of `rgba32float` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rgba32float`.
 pub(package) const FORMAT_RGBA32FLOAT_BYTES: u32 = 16
 
 /// The stream's code for the texture format `rg32uint`.
 pub(package) const FORMAT_RG32UINT: u32 = 12
 
-/// The bytes of a texel of `rg32uint` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rg32uint`.
 pub(package) const FORMAT_RG32UINT_BYTES: u32 = 8
 
 /// The stream's code for the texture format `rg11b10ufloat`.
 pub(package) const FORMAT_RG11B10UFLOAT: u32 = 13
 
-/// The bytes of a texel of `rg11b10ufloat` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a texel of `rg11b10ufloat`.
 pub(package) const FORMAT_RG11B10UFLOAT_BYTES: u32 = 4
 
 /// The stream's code for the texture format `bc1-rgba-unorm`.
 pub(package) const FORMAT_BC1_RGBA_UNORM: u32 = 14
 
-/// The bytes of a texel of `bc1-rgba-unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `bc1-rgba-unorm`.
 pub(package) const FORMAT_BC1_RGBA_UNORM_BYTES: u32 = 8
 
 /// The stream's code for the texture format `bc4-r-unorm`.
 pub(package) const FORMAT_BC4_R_UNORM: u32 = 15
 
-/// The bytes of a texel of `bc4-r-unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `bc4-r-unorm`.
 pub(package) const FORMAT_BC4_R_UNORM_BYTES: u32 = 8
 
 /// The stream's code for the texture format `bc5-rg-unorm`.
 pub(package) const FORMAT_BC5_RG_UNORM: u32 = 16
 
-/// The bytes of a texel of `bc5-rg-unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `bc5-rg-unorm`.
 pub(package) const FORMAT_BC5_RG_UNORM_BYTES: u32 = 16
 
 /// The stream's code for the texture format `bc7-rgba-unorm`.
 pub(package) const FORMAT_BC7_RGBA_UNORM: u32 = 17
 
-/// The bytes of a texel of `bc7-rgba-unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `bc7-rgba-unorm`.
 pub(package) const FORMAT_BC7_RGBA_UNORM_BYTES: u32 = 16
 
 /// The stream's code for the texture format `etc2-rgb8unorm`.
 pub(package) const FORMAT_ETC2_RGB8UNORM: u32 = 18
 
-/// The bytes of a texel of `etc2-rgb8unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `etc2-rgb8unorm`.
 pub(package) const FORMAT_ETC2_RGB8UNORM_BYTES: u32 = 8
 
 /// The stream's code for the texture format `astc-4x4-unorm`.
 pub(package) const FORMAT_ASTC_4X4_UNORM: u32 = 19
 
-/// The bytes of a texel of `astc-4x4-unorm` (of a compressed format, of a 4 × 4 block).
+/// The bytes of a 4 × 4 block of `astc-4x4-unorm`.
 pub(package) const FORMAT_ASTC_4X4_UNORM_BYTES: u32 = 16
 
 /// The stream's code for the comparison `less`.

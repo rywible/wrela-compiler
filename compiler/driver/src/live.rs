@@ -402,11 +402,12 @@ pub fn serve(
     mut built: impl FnMut(&Path) + Send + 'static,
 ) -> Result<Server, String> {
     check_output_path(pkg, out)?;
+    // The port first: a server already on it keeps its output.
+    let (listener, port) = http::listen(port)?;
     let _ = std::fs::remove_dir_all(out);
     let mut watcher = Watcher::start(pkg, out, lift, kind)?;
     built(&watcher.dir());
     let output = watcher.out_dir.try_clone().map_err(|e| format!("can't hold live output: {e}"))?;
-    let (listener, port) = http::listen(port)?;
     let state = Arc::new(State {
         out: output,
         port,
@@ -503,15 +504,14 @@ fn results_file(path: &str) -> Option<&str> {
 /// How long a long poll waits for a change before it answers that there's none.
 const LONG_POLL: Duration = Duration::from_secs(15);
 
+/// `/live/shown` contains only a sequence and a frame number.
+const MAX_LIVE_REPORT: usize = 64 << 10;
+
 /// A single error may contain many source diagnostics. Bound its live wire form.
 const MAX_LIVE_ERROR_BYTES: usize = 64 << 10;
 
 fn short_error(error: &str) -> &str {
-    let mut end = error.len().min(MAX_LIVE_ERROR_BYTES);
-    while !error.is_char_boundary(end) {
-        end -= 1;
-    }
-    &error[..end]
+    &error[..error.floor_char_boundary(MAX_LIVE_ERROR_BYTES)]
 }
 
 /// Each poll advances through a bounded part of the retained history.
@@ -561,7 +561,15 @@ fn handle(
             http::respond(&mut out, 200, "application/json", &body)
         }
         ("POST", "/live/shown") => {
-            let v: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            let Some(body) = req.read_body(MAX_LIVE_REPORT)? else {
+                return http::respond(
+                    &mut out,
+                    413,
+                    "text/plain",
+                    b"a live report is at most 64 KiB",
+                );
+            };
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
             let (Some(seq), Some(frame)) = (v["seq"].as_u64(), v["frame"].as_u64()) else {
                 return http::respond(&mut out, 403, "text/plain", b"a report is {seq, frame}");
             };
@@ -795,6 +803,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// A second server on a port that's taken fails before it touches the output, so the first
+    /// goes on serving its build.
+    #[test]
+    fn a_second_server_on_a_taken_port_leaves_the_first_ones_output() {
+        let root = std::env::temp_dir().join(format!("wrela-live-taken-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let pkg = root.join("program");
+        std::fs::create_dir_all(&pkg).expect("program directory");
+        std::fs::write(pkg.join("wrela.toml"), "[package]\nname = \"program\"\n")
+            .expect("manifest");
+        std::fs::write(
+            pkg.join("main.wrela"),
+            "pub fn frame(time: f32, width: u32, height: u32) {}\n",
+        )
+        .expect("program");
+        let out = root.join("out");
+        let kind = crate::BuildKind::default();
+        let first = serve(&pkg, &out, 0, &[], kind, true, |_: &Path| {}).expect("serve");
+        std::fs::write(out.join("1/marked"), b"").expect("mark");
+        let second = serve(&pkg, &out, first.port, &[], kind, true, |_: &Path| {});
+        assert!(second.is_err_and(|e| e.contains("can't listen")));
+        assert!(out.join("1/marked").exists(), "the first server's build is where it was");
+        first.stop();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     use std::io::{Read, Write};
 
     #[test]
@@ -842,6 +876,34 @@ mod tests {
             serde_json::from_slice(&event_batch(&events, after as usize)).expect("second");
         assert_eq!(second.first().and_then(|event| event["seq"].as_u64()), Some(after + 1));
         assert_eq!(second.last().and_then(|event| event["seq"].as_u64()), Some(40));
+    }
+
+    #[test]
+    fn oversized_live_reports_are_refused_before_reading_the_body() {
+        let out = crate::Scratch::new("wrela-live-report").expect("scratch");
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("listen");
+        let port = listener.local_addr().expect("address").port();
+        let state = State {
+            out: Dir::open_ambient_dir(&out.0, cap_std::ambient_authority()).expect("output"),
+            port,
+            live: Mutex::new(Live { version: 1, events: Vec::new(), shown: Vec::new(), polls: 0 }),
+            changed: Condvar::new(),
+        };
+        let client = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            write!(
+                stream,
+                "POST /live/shown HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nOrigin: http://127.0.0.1:{port}\r\nContent-Length: {}\r\n\r\n",
+                MAX_LIVE_REPORT + 1
+            )
+            .expect("request head");
+            let mut response = String::new();
+            stream.read_to_string(&mut response).expect("response");
+            response
+        });
+        let (stream, _) = listener.accept().expect("accept");
+        handle(stream, &state, &AtomicBool::new(false), true).expect("refuse the report");
+        assert!(client.join().expect("response").starts_with("HTTP/1.1 413"));
     }
 
     /// A page opened after a literal-only edit loads the newest build, then receives that edit:

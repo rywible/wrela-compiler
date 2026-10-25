@@ -17,8 +17,9 @@
 //!   doesn't compare the logs' WASM hashes.
 //! - `wrela-host --version`: its release and source revision.
 //!
-//! A build of this binary without the `gpu` feature has the last two only (an x86-64 build run
-//! under Rosetta, say, which checks the sim's bits on x86's code generation).
+//! A build of this binary without the `gpu` feature runs ticks only, with `--no-gpu` or
+//! `--replay` (an x86-64 build run under Rosetta, say, which checks the sim's bits on x86's code
+//! generation); `--compare-ticks` and `--version` work in either build.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -334,12 +335,12 @@ fn main() -> ExitCode {
     {
         return compare_ticks(a, b);
     }
-    if std::env::args().skip(1).eq(["--version"]) {
+    if argv == ["--version"] {
         let revision = option_env!("WRELA_REVISION").unwrap_or("development build");
         println!("wrela-host {} ({revision})", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
-    let args = match parse(std::env::args().skip(1)) {
+    let args = match parse(argv.into_iter()) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("{message}");

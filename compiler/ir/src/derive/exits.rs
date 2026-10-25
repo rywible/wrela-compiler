@@ -32,46 +32,30 @@ use crate::*;
 use std::collections::HashSet;
 
 /// `f`, with every loop whose `break` or `continue` sits under a condition `active` holds
-/// (one that depends on the input) rewritten with flags; `None` if no loop changed.
+/// (one that depends on the input) rewritten with flags of type `bool_ty`; `None` if no loop
+/// changed.
 pub(crate) fn flag_exits(
     f: &Function,
-    types: &mut Types,
+    bool_ty: TypeId,
     active: &dyn Fn(ValueId) -> bool,
 ) -> Option<Function> {
     let mut g = f.clone();
-    let bool_ty = types.bool();
     let mut body = std::mem::take(&mut g.body);
-    let changed = rewrite(&mut g, &mut body, bool_ty, active);
-    g.body = body;
-    changed.then_some(g)
-}
-
-/// Rewrites the loops in `block` and the blocks nested in it.
-fn rewrite(
-    g: &mut Function,
-    block: &mut Block,
-    bool_ty: TypeId,
-    active: &dyn Fn(ValueId) -> bool,
-) -> bool {
     let mut changed = false;
-    let mut out = Vec::with_capacity(block.len());
-    for mut s in std::mem::take(block) {
-        // Loops inside first: each takes its own `break` and `continue`.
-        for inner in s.blocks_mut() {
-            changed |= rewrite(g, inner, bool_ty, active);
-        }
+    // Loops inside first: each takes its own `break` and `continue`.
+    visit::expand(&mut body, &mut |mut s, out| {
         if let Stmt::Loop { body, continuing } = &mut s
-            && let Some((done, new_body)) = flag_loop(g, body, continuing, bool_ty, active)
+            && let Some((done, new_body)) = flag_loop(&mut g, body, continuing, bool_ty, active)
         {
-            let f = g.let_(&mut out, bool_ty, Expr::Const(Const::Bool(false)));
+            let f = g.let_(out, bool_ty, Expr::Const(Const::Bool(false)));
             out.push(Stmt::Store(Place::local(done), f));
             *body = new_body;
             changed = true;
         }
         out.push(s);
-    }
-    *block = out;
-    changed
+    });
+    g.body = body;
+    changed.then_some(g)
 }
 
 /// The loop's body with its exits under conditions on the input made flags, and the local of a
@@ -84,9 +68,6 @@ fn flag_loop(
     bool_ty: TypeId,
     active: &dyn Fn(ValueId) -> bool,
 ) -> Option<(LocalId, Block)> {
-    if !has_active_exit(body, false, active) {
-        return None;
-    }
     // The head: up to the loop's own exit test, the last `break` before an exit on the input.
     let first_exit =
         body.iter().position(|s| has_active_exit(std::slice::from_ref(s), false, active))?;
@@ -177,14 +158,10 @@ fn flag(
     let mut rest = block.into_iter();
     while let Some(s) = rest.next() {
         match s {
-            Stmt::Break if under => {
+            Stmt::Break | Stmt::Continue if under => {
+                let flag = if matches!(s, Stmt::Break) { done } else { skip };
                 let t = g.let_(&mut out, bool_ty, Expr::Const(Const::Bool(true)));
-                out.push(Stmt::Store(Place::local(done), t));
-                sets = true;
-            }
-            Stmt::Continue if under => {
-                let t = g.let_(&mut out, bool_ty, Expr::Const(Const::Bool(true)));
-                out.push(Stmt::Store(Place::local(skip), t));
+                out.push(Stmt::Store(Place::local(flag), t));
                 sets = true;
             }
             Stmt::If { cond, then, else_ } => {

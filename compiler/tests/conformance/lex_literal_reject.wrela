@@ -26,3 +26,11 @@ fn floats() -> f64 {
     let rounds: f32 = 16777217.0
     f64(a + b + e + rounds) + c + d
 }
+
+// An f16 rounds to its largest, 65504, below 65520, and to infinity from there.
+@compute(64)
+fn halves(out: mut std::gpu::Slots<f32>, id: std::gpu::GlobalId) {
+    let big: f16 = 65520.0 //~ E0006
+    let rounds: f16 = 65519.0
+    out[id] = f32(big + rounds)
+}

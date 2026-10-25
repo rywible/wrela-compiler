@@ -252,6 +252,11 @@ impl Opcode {
                 | Opcode::MultiDrawIndexedIndirect
         )
     }
+
+    /// Whether it happens only inside a pass: a draw, a scissor or a viewport.
+    pub fn in_pass(self) -> bool {
+        self.is_draw() || matches!(self, Opcode::SetScissor | Opcode::SetViewport)
+    }
 }
 
 /// `CreateTexture`'s format word with this bit set: kernels write the texture's texels.
@@ -263,6 +268,17 @@ pub const PASS_JOIN: u32 = 1;
 /// The most mip levels a texture has: a side of WebGPU's largest 2D texture, 8192 texels, halved
 /// 13 times.
 pub const MAX_LEVELS: u32 = 14;
+
+/// The most mip levels a `width` × `height` texture has.
+pub fn max_levels(width: u32, height: u32) -> u32 {
+    32 - width.max(height).max(1).leading_zeros()
+}
+
+/// The width and height of level `level` of a `width` × `height` texture.
+pub fn level_size(width: u32, height: u32, level: u32) -> (u32, u32) {
+    ((width >> level).max(1), (height >> level).max(1))
+}
+
 /// The most layers of a 2D array: WebGPU's default `maxTextureArrayLayers`.
 pub const MAX_LAYERS: u32 = 256;
 /// The most anisotropy a sampler takes (WebGPU's `maxAnisotropy` is clamped to 16).
@@ -314,18 +330,10 @@ pub struct View {
 }
 
 impl View {
-    pub const WHOLE: View = View { level: None, layer: None };
-
     /// A binding's view, from its two words: 0 all, else one more than the one level or layer.
     pub fn of_words(level: u32, layer: u32) -> View {
         let one = |w: u32| w.checked_sub(1);
         View { level: one(level), layer: one(layer) }
-    }
-
-    /// The two words that say it.
-    pub fn words(self) -> (u32, u32) {
-        let word = |x: Option<u32>| x.map_or(0, |x| x + 1);
-        (word(self.level), word(self.layer))
     }
 }
 
@@ -783,11 +791,6 @@ impl ColorTarget {
         ColorTarget { texture, level: 0, layer: 0, keep, clear }
     }
 
-    /// The screen, cleared to `clear`.
-    pub fn screen(clear: [f32; 4]) -> ColorTarget {
-        ColorTarget::of(SCREEN, false, clear)
-    }
-
     /// Whether it draws into the same texel as `other` (the same texture, level and layer).
     pub fn same_place(&self, other: &ColorTarget) -> bool {
         (self.texture, self.level, self.layer) == (other.texture, other.level, other.layer)
@@ -846,30 +849,15 @@ impl Pass {
     pub fn with_color(self, texture: u32) -> Pass {
         let first =
             self.colors().first().copied().unwrap_or(ColorTarget::of(NONE, false, [0.0; 4]));
-        let colors =
-            if texture == NONE { Vec::new() } else { vec![ColorTarget { texture, ..first }] };
-        Pass {
-            join: self.join,
-            depth: self.depth,
-            depth_layer: self.depth_layer,
-            keep_depth: self.keep_depth,
-            clear_depth: self.clear_depth,
-            ..Pass::new(&colors)
-        }
+        let one = ColorTarget { texture, ..first };
+        let fresh = Pass::new(if texture == NONE { &[] } else { std::slice::from_ref(&one) });
+        Pass { colors: fresh.colors, count: fresh.count, ..self }
     }
 
     /// With every colour target kept (or cleared).
     pub fn keeping_color(mut self, keep: bool) -> Pass {
         for c in &mut self.colors {
             c.keep = keep;
-        }
-        self
-    }
-
-    /// With every colour target cleared to `clear`.
-    pub fn clearing_to(mut self, clear: [f32; 4]) -> Pass {
-        for c in &mut self.colors {
-            c.clear = clear;
         }
         self
     }
@@ -1121,6 +1109,18 @@ pub struct TexelRect {
     pub height: u32,
 }
 
+impl TexelRect {
+    /// From its words in the stream, in [`TexelRect::words`]' order.
+    pub fn of_words([texture, level, layer, x, y, width, height]: [u32; 7]) -> TexelRect {
+        TexelRect { texture, level, layer, x, y, width, height }
+    }
+
+    /// Its words in the stream: the texture, level, layer, x, y, width and height.
+    pub fn words(&self) -> [u32; 7] {
+        [self.texture, self.level, self.layer, self.x, self.y, self.width, self.height]
+    }
+}
+
 /// Where a texture-to-texture copy writes: a texture's level and layer, and the corner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TexelAt {
@@ -1129,6 +1129,14 @@ pub struct TexelAt {
     pub layer: u32,
     pub x: u32,
     pub y: u32,
+}
+
+impl TexelAt {
+    /// The `width` × `height` rectangle from this corner.
+    pub fn with_size(self, width: u32, height: u32) -> TexelRect {
+        let TexelAt { texture, level, layer, x, y } = self;
+        TexelRect { texture, level, layer, x, y, width, height }
+    }
 }
 
 impl Command<'_> {
@@ -1537,7 +1545,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if words != 2 + 8 * n + 4 {
                     return Err(bad("the colour targets don't fill the payload"));
                 }
-                if w(1) > 1 {
+                if w(1) > PASS_JOIN {
                     return Err(bad("the join word is 0 or 1"));
                 }
                 let mut colors = Vec::with_capacity(n);
@@ -1562,7 +1570,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                     return Err(bad("a load is 0 (clear) or 1 (keep)"));
                 }
                 let mut pass = Pass::new(&colors);
-                pass.join = w(1) == 1;
+                pass.join = w(1) == PASS_JOIN;
                 pass.depth = w(d);
                 pass.depth_layer = w(d + 1);
                 pass.keep_depth = w(d + 2) == 1;
@@ -1572,15 +1580,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
             Opcode::CopyTexture => {
                 exactly(12)?;
                 Command::CopyTexture {
-                    source: TexelRect {
-                        texture: w(0),
-                        level: w(1),
-                        layer: w(2),
-                        x: w(3),
-                        y: w(4),
-                        width: w(10),
-                        height: w(11),
-                    },
+                    source: TexelRect::of_words([w(0), w(1), w(2), w(3), w(4), w(10), w(11)]),
                     destination: TexelAt {
                         texture: w(5),
                         level: w(6),
@@ -1595,17 +1595,8 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 if w(8) % ROW_ALIGNMENT != 0 || w(9) % ROW_ALIGNMENT != 0 || w(9) == 0 {
                     return Err(bad("the buffer's offset and bytes per row are multiples of 256"));
                 }
-                let source = TexelRect {
-                    texture: w(0),
-                    level: w(1),
-                    layer: w(2),
-                    x: w(3),
-                    y: w(4),
-                    width: w(5),
-                    height: w(6),
-                };
                 Command::CopyTextureToBuffer {
-                    source,
+                    source: TexelRect::of_words(std::array::from_fn(w)),
                     buffer: w(7),
                     offset: w(8),
                     bytes_per_row: w(9),
@@ -1618,20 +1609,11 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                         "the buffer's offset is a multiple of 4, its bytes per row of 256",
                     ));
                 }
-                let destination = TexelRect {
-                    texture: w(3),
-                    level: w(4),
-                    layer: w(5),
-                    x: w(6),
-                    y: w(7),
-                    width: w(8),
-                    height: w(9),
-                };
                 Command::CopyBufferToTexture {
                     buffer: w(0),
                     offset: w(1),
                     bytes_per_row: w(2),
-                    destination,
+                    destination: TexelRect::of_words(std::array::from_fn(|i| w(3 + i))),
                 }
             }
             Opcode::SetScissor => {
@@ -1643,7 +1625,7 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 let f = |i: usize| f32::from_bits(w(i));
                 let (rect, min_depth, max_depth) = ([f(0), f(1), f(2), f(3)], f(4), f(5));
                 if !rect.iter().all(|x| x.is_finite()) || rect[2] < 0.0 || rect[3] < 0.0 {
-                    return Err(bad("a viewport is a finite rectangle of positive size"));
+                    return Err(bad("a viewport is a finite rectangle of non-negative size"));
                 }
                 if !(0.0..=1.0).contains(&min_depth)
                     || !(0.0..=1.0).contains(&max_depth)
@@ -1824,18 +1806,13 @@ impl Sequencer {
             (Command::BeginScreenPass { .. } | Command::BeginPass(_), _) => {
                 err("a pass is already open")
             }
-            (_, at) if op.is_draw() => {
-                if at == Place::Outside {
+            (_, at) if op.in_pass() => {
+                if at != Place::Outside {
+                    Ok(())
+                } else if op.is_draw() {
                     err("a draw must come inside a pass")
                 } else {
-                    Ok(())
-                }
-            }
-            (Command::SetScissor { .. } | Command::SetViewport { .. }, at) => {
-                if at == Place::Outside {
                     err("a scissor or a viewport is set inside a pass")
-                } else {
-                    Ok(())
                 }
             }
             (Command::Present, Place::ScreenPass) => {
@@ -2066,18 +2043,7 @@ impl Encoder {
         offset: u32,
         bytes_per_row: u32,
     ) -> &mut Self {
-        let words = [
-            s.texture,
-            s.level,
-            s.layer,
-            s.x,
-            s.y,
-            s.width,
-            s.height,
-            buffer,
-            offset,
-            bytes_per_row,
-        ];
+        let words = [&s.words()[..], &[buffer, offset, bytes_per_row]].concat();
         self.command(Opcode::CopyTextureToBuffer, &words, &[]);
         self
     }
@@ -2089,18 +2055,7 @@ impl Encoder {
         bytes_per_row: u32,
         d: TexelRect,
     ) -> &mut Self {
-        let words = [
-            buffer,
-            offset,
-            bytes_per_row,
-            d.texture,
-            d.level,
-            d.layer,
-            d.x,
-            d.y,
-            d.width,
-            d.height,
-        ];
+        let words = [&[buffer, offset, bytes_per_row][..], &d.words()].concat();
         self.command(Opcode::CopyBufferToTexture, &words, &[]);
         self
     }
@@ -2200,7 +2155,7 @@ impl Encoder {
     }
 
     pub fn begin_pass(&mut self, pass: Pass) -> &mut Self {
-        let mut words = vec![pass.count, u32::from(pass.join)];
+        let mut words = vec![pass.count, if pass.join { PASS_JOIN } else { 0 }];
         for c in pass.colors() {
             words.extend([c.texture, c.level, c.layer, u32::from(c.keep)]);
             words.extend(c.clear.map(f32::to_bits));

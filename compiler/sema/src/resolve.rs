@@ -213,40 +213,38 @@ pub fn listed(what: &str, names: &[&str]) -> Option<String> {
 /// The closest of `candidates` to `name` by edit distance, if it's close enough to suggest.
 pub fn closest<'a>(name: &str, candidates: impl Iterator<Item = &'a str>) -> Option<&'a str> {
     let limit = (name.len() / 3).max(1);
+    let chars: Vec<char> = name.chars().collect();
     candidates
         .filter(|c| *c != name)
-        .map(|c| (edit_distance(name, c), c))
+        .map(|c| (edit_distance(&chars, c), c))
         .filter(|(d, _)| *d <= limit)
         .min()
         .map(|(_, c)| c)
 }
 
-/// Optimal string alignment distance: Levenshtein's, where swapping two neighbouring characters
-/// costs one edit too, so the commonest typos (`widht`, `aera`) are one edit from the name.
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
+/// Optimal string alignment distance from the characters `a` to `b`: Levenshtein's, where
+/// swapping two neighbouring characters costs one edit too, so the commonest typos (`widht`,
+/// `aera`) are one edit from the name.
+fn edit_distance(a: &[char], b: &str) -> usize {
     let b: Vec<char> = b.chars().collect();
-    let w = b.len() + 1;
-    let mut d = vec![0usize; (a.len() + 1) * w];
-    for i in 0..=a.len() {
-        d[i * w] = i;
-    }
-    for (j, cell) in d.iter_mut().take(w).enumerate() {
-        *cell = j;
-    }
+    // Rows i - 2, i - 1 and i of the table of distances between prefixes.
+    let mut prev2 = vec![0usize; b.len() + 1];
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0usize; b.len() + 1];
     for i in 1..=a.len() {
+        cur[0] = i;
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
-            let mut best = (d[(i - 1) * w + j] + 1)
-                .min(d[i * w + j - 1] + 1)
-                .min(d[(i - 1) * w + j - 1] + cost);
+            let mut best = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
             if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
-                best = best.min(d[(i - 2) * w + j - 2] + 1);
+                best = best.min(prev2[j - 2] + 1);
             }
-            d[i * w + j] = best;
+            cur[j] = best;
         }
+        std::mem::swap(&mut prev2, &mut prev);
+        std::mem::swap(&mut prev, &mut cur);
     }
-    d[a.len() * w + b.len()]
+    prev[b.len()]
 }
 
 /// The std prelude's module, once std is loaded.
@@ -479,18 +477,25 @@ pub fn resolve_module_path_in(
                         seg.span,
                         format!("`{}` has no item `{}`", module.name(), seg.name),
                     );
+                    // Only what this module may name: not another module's private items and
+                    // imports, nor another package's `pub(package)` ones (E0203).
+                    let visible = |b: &Binding| {
+                        m == from || (b.public && (!b.package_only || p.same_package(m, from)))
+                    };
                     let names = module
                         .scope
-                        .keys()
-                        .map(String::as_str)
+                        .iter()
+                        .filter(|(_, b)| visible(b))
+                        .map(|(n, _)| n.as_str())
                         .chain(module.children.keys().map(String::as_str));
                     let mut d = suggest_or_list(d, &seg.name, seg.span, names, "its items are");
                     if d.help.is_empty() && d.fixes.is_empty() {
-                        d = d.with_help(format!(
-                            "`{}` has nothing in it yet: declare `{}` there",
-                            module.name(),
-                            seg.name
-                        ));
+                        let (m, x) = (module.name(), &seg.name);
+                        d = d.with_help(if module.scope.is_empty() && module.children.is_empty() {
+                            format!("`{m}` has nothing in it yet: declare `{x}` there")
+                        } else {
+                            format!("nothing in `{m}` is visible here: declare `{x}` there, marked `pub`")
+                        });
                     }
                     return PathLookup::Error(Box::new(d));
                 }
@@ -1599,6 +1604,17 @@ fn projection(
 mod tests {
     use super::*;
 
+    /// A missing item's help lists only what the using module may name: `std::quat`'s private
+    /// imports and functions aren't among them.
+    #[test]
+    fn a_missing_items_help_lists_only_visible_items() {
+        let source = "pub fn f() -> u32 {\n    std::quat::zzzzzz()\n}\n";
+        let mut diagnostics = Vec::new();
+        crate::check_program(crate::test_units(source), &mut diagnostics);
+        let d = diagnostics.iter().find(|d| d.code == codes::E0200).expect("E0200");
+        assert_eq!(d.help, ["its items are `Quat`"], "{diagnostics:#?}");
+    }
+
     #[test]
     fn array_lengths_accept_integer_constant_expressions() {
         let source = "\
@@ -1731,14 +1747,14 @@ mod tests {
             for b in words {
                 let ac: Vec<_> = a.chars().collect();
                 let bc: Vec<_> = b.chars().collect();
-                assert_eq!(edit_distance(a, b), reference(&ac, &bc), "{a:?}, {b:?}");
+                assert_eq!(edit_distance(&ac, b), reference(&ac, &bc), "{a:?}, {b:?}");
             }
         }
         assert_eq!(closest("cat", ["cut", "bat", "cat"].into_iter()), Some("bat"));
         assert_eq!(closest("αβ", ["αa", "αβ"].into_iter()), Some("αa"));
         assert_eq!(closest("cat", ["different"].into_iter()), None);
         // A swap of two neighbours is one edit, so short names' transpositions are suggested.
-        assert_eq!(edit_distance("ab", "ba"), 1);
+        assert_eq!(edit_distance(&['a', 'b'], "ba"), 1);
         assert_eq!(closest("widht", ["width", "height"].into_iter()), Some("width"));
         assert_eq!(closest("aera", ["area", "perimeter"].into_iter()), Some("area"));
         assert_eq!(closest("lenght", ["length"].into_iter()), Some("length"));

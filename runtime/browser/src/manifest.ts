@@ -31,14 +31,15 @@ export type BindingKind = (typeof BINDING_KINDS)[number];
 
 /** Every texture format's name, as the manifest gives one. */
 const FORMAT_NAMES = TEXTURE_FORMATS.map((t) => t.name);
+const FORMATS = new Map(TEXTURE_FORMATS.map((t) => [t.name, t] as const));
+/** A texture format's row of the format table (`TEXTURE_FORMATS`). */
+export const formatOf = (f: TextureFormat) => FORMATS.get(f)!;
 
 const traitsOf = (k: BindingKind) => BINDING_KIND_TRAITS.find((t) => t.name === k)!;
 /** Whether a binding is a colour texture, which names its format. */
 export const hasFormat = (k: BindingKind) => traitsOf(k).has_format;
 /** Whether kernels write it: a storage texture. */
 export const isStorage = (k: BindingKind) => traitsOf(k).is_storage;
-/** Whether it's a 3D texture. */
-export const is3d = (k: BindingKind) => traitsOf(k).is_3d;
 /** Whether it's a texture of depths. */
 export const isDepthBinding = (k: BindingKind) => traitsOf(k).is_depth;
 /** A texture binding's view dimension (WebGPU's `viewDimension`); null for the rest. */
@@ -54,7 +55,7 @@ const BLEND_NAMES = Object.keys(BLENDS) as Blend[];
 export function colorAttachmentBytes(formats: readonly TextureFormat[]): number {
   let total = 0;
   for (const f of formats) {
-    const t = TEXTURE_FORMATS.find((x) => x.name === f)!;
+    const t = formatOf(f);
     const align = Math.max(t.target_align, 1);
     total = Math.ceil(total / align) * align + t.target_cost;
   }
@@ -201,12 +202,24 @@ function object(v: unknown, where: string): Json {
   return v;
 }
 
-function oneOf<T extends string>(o: Json, key: string, where: string, options: readonly T[]): T {
-  const v = field(o, key, where);
-  if (!options.includes(v as T)) {
-    throw new ManifestError(`${where}.${key} must be one of ${options.join(", ")}, not ${show(v)}`);
-  }
+/** The option that `v`, a string, names; else an error that `place` must be `what` (`a
+ * format`). */
+function named<T extends string>(v: unknown, place: string, what: string, options: readonly T[]): T {
+  if (!options.includes(v as T)) throw new ManifestError(`${place} must be ${what}, not ${show(v)}`);
   return v as T;
+}
+
+function oneOf<T extends string>(o: Json, key: string, where: string, options: readonly T[]): T {
+  return named(field(o, key, where), `${where}.${key}`, `one of ${options.join(", ")}`, options);
+}
+
+/** An array of options, each `named` from its place (`pipelines[0].outputs[1]`); none where the
+ * key is missing, if it's `optional`. */
+function names<T extends string>(o: Json, key: string, where: string, options: readonly T[], what: string, optional: boolean): T[] {
+  if (optional && o[key] === undefined) return [];
+  const vs = field(o, key, where);
+  if (!Array.isArray(vs)) throw new ManifestError(`${where}.${key} must be an array`);
+  return vs.map((v: unknown, k) => named(v, `${where}.${key}[${k}]`, what, options));
 }
 
 /** `oneOf`, or `fallback` where the key is missing. */
@@ -225,10 +238,7 @@ function renderTargets(o: Json, where: string): RenderTarget[] {
     const cs = to["colors"];
     if (!Array.isArray(cs)) throw new ManifestError(`${tw}.colors must be an array of formats`);
     if (cs.length > MAX_COLOR_ATTACHMENTS) throw new ManifestError(`${tw}.colors has more than four formats`);
-    const colors = cs.map((c: unknown, j) => {
-      if (!FORMAT_NAMES.includes(c as TextureFormat)) throw new ManifestError(`${tw}.colors[${j}] must be a format, not ${show(c)}`);
-      return c as TextureFormat;
-    });
+    const colors = cs.map((c: unknown, j) => named(c, `${tw}.colors[${j}]`, "a format", FORMAT_NAMES));
     if (typeof to["depth"] !== "boolean") throw new ManifestError(`${tw}.depth must be true or false`);
     return { colors, depth: to["depth"], screen: flag(to, "screen", tw, false) };
   });
@@ -270,7 +280,7 @@ function pipeline(v: unknown, i: number): Pipeline {
     if (!hasFormat(kind)) {
       if (bo["format"] !== undefined) throw new ManifestError(`${bw}: only a colour texture has a \`format\``);
     } else {
-      const f = TEXTURE_FORMATS.find((t) => t.name === oneOf(bo, "format", bw, FORMAT_NAMES))!;
+      const f = formatOf(oneOf(bo, "format", bw, FORMAT_NAMES));
       if (f.depth) throw new ManifestError(`${bw}: a colour texture's format isn't a depth one`);
       if (isStorage(kind) && !f.storable) {
         throw new ManifestError(`${bw}: kernels can't write ${f.name} textures`);
@@ -292,15 +302,7 @@ function pipeline(v: unknown, i: number): Pipeline {
     const vertex_entry = str(o, "vertex_entry", where);
     const fragment_entry = str(o, "fragment_entry", where);
     // Missing `blends` all replace.
-    let blends: Blend[] = [];
-    if (o["blends"] !== undefined) {
-      const bs = o["blends"];
-      if (!Array.isArray(bs)) throw new ManifestError(`${where}.blends must be an array`);
-      blends = bs.map((b: unknown, k) => {
-        if (!BLEND_NAMES.includes(b as Blend)) throw new ManifestError(`${where}.blends[${k}] must be a blend, not ${show(b)}`);
-        return b as Blend;
-      });
-    }
+    const blends = names(o, "blends", where, BLEND_NAMES, "a blend", true);
     // A missing `cull` is none, and a missing `depth_bias` none.
     const cull = oneOfOr(o, "cull", where, ["none", "front", "back"] as const, "none");
     let depth_bias: DepthBias = { constant: 0, slope_scale: 0, clamp: 0 };
@@ -328,29 +330,14 @@ function pipeline(v: unknown, i: number): Pipeline {
     }
     // A missing `writes_depth` is false.
     const writes_depth = flag(o, "writes_depth", where, false);
-    const os = field(o, "outputs", where);
-    if (!Array.isArray(os)) throw new ManifestError(`${where}.outputs must be an array`);
-    const outputs = os.map((x: unknown, k) => {
-      if (x !== "float" && x !== "uint") throw new ManifestError(`${where}.outputs[${k}] must be float or uint, not ${show(x)}`);
-      return x;
-    });
+    const outputs = names(o, "outputs", where, ["float", "uint"] as const, "float or uint", false);
     stage = { kind, vertex_entry, fragment_entry, blends, cull, depth_bias, depth, writes_depth, outputs, targets: renderTargets(o, where) };
   }
   // A missing `debug_flag` is read as null.
   const d = o["debug_flag"] ?? null;
   const debug_flag = d === null ? null : asU32(d, `${where}.debug_flag`);
   // Missing `requires` is none.
-  let requires: string[] = [];
-  if (o["requires"] !== undefined) {
-    const rs = o["requires"];
-    if (!Array.isArray(rs)) throw new ManifestError(`${where}.requires must be an array`);
-    requires = rs.map((r: unknown, k) => {
-      if (typeof r !== "string" || !(FEATURES as readonly string[]).includes(r)) {
-        throw new ManifestError(`${where}.requires[${k}] must be a feature this host knows, not ${show(r)}`);
-      }
-      return r;
-    });
-  }
+  const requires: string[] = names(o, "requires", where, FEATURES, "a feature this host knows", true);
   return { ...stage, name, shader, uniform, bindings, debug_flag, requires };
 }
 
@@ -489,7 +476,7 @@ export function validateManifest(m: Manifest): void {
         } else if (bytes > MAX_COLOR_ATTACHMENT_BYTES) why = `its colours take ${bytes} bytes a sample, over WebGPU's 32`;
         else {
           for (const [c, f] of t.colors.entries()) {
-            const info = TEXTURE_FORMATS.find((x) => x.name === f)!;
+            const info = formatOf(f);
             const uint = p.outputs[c] === "uint";
             const blend = p.blends[c] ?? "replace";
             if (info.depth || info.block > 1 || !info.renderable) why = `a pass can't draw into ${f}`;

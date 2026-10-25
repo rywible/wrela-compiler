@@ -4,13 +4,14 @@
 import { expect, test } from "bun:test";
 import { NONE } from "../src/abi.gen.ts";
 import { Encoder } from "./encoder.ts";
-import { vectors, passOf } from "./fixtures.ts";
+import { vectors } from "./fixtures.ts";
 import { Opcode } from "../src/abi.gen.ts";
 import { f32bits } from "./encoder.ts";
+import { onePass } from "../src/stream.ts";
 
 test("the test encoder writes the vectors' golden batch", () => {
   const golden = vectors.batches.find((b) => b.name === "golden")!.bytes;
-  const offscreen = passOf({ color: 8, keepColor: false, join: false, clear: [0, 0, 0, 1] as [number, number, number, number], depth: 9, keepDepth: false, clearDepth: 1 });
+  const offscreen = { ...onePass(8, false, [0, 0, 0, 1]), depth: 9 };
   const batch = new Encoder()
     .createBuffer(7, 16)
     .writeBuffer(7, 4, Uint8Array.of(1, 2, 3, 4, 5, 6, 7, 8))

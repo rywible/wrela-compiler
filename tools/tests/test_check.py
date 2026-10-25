@@ -38,7 +38,8 @@ class Selection(unittest.TestCase):
                 patch.object(check, 'step') as step, \
                 patch.object(check, 'rust_run', return_value=1) as run, \
                 patch.dict(os.environ, {'WRELA_BLESS': '1', 'WRELA_RUN_ONLY': 'missing',
-                                        'WRELA_CONST_CACHE': '0'}), \
+                                        'WRELA_CONST_CACHE': '0',
+                                        'WRELA_VALIDATOR': '/elsewhere/wrela'}), \
                 contextlib.redirect_stdout(io.StringIO()):
             cwd = Path.cwd()
             try:
@@ -46,6 +47,8 @@ class Selection(unittest.TestCase):
                 self.assertEqual([c.args[0] for c in step.call_args_list], list(check.STEPS))
                 self.assertEqual([c.args[0] for c in run.call_args_list], ['one', 'two'])
                 self.assertFalse(set(check.CONTROLS) & os.environ.keys())
+                # The agent test's references are checked with the compiler built here.
+                self.assertNotIn('WRELA_VALIDATOR', os.environ)
             finally:
                 os.chdir(cwd)
 
@@ -92,11 +95,12 @@ class Selection(unittest.TestCase):
             check.step('tools', Path('wrela'), Path('logs'))
         self.assertEqual(run.call_args.args[0], [sys.executable, 'tools/runner.py', '--tools-tests'])
         self.assertEqual(run.call_args.kwargs['cwd'], check.ROOT)
+        self.assertEqual(run.call_args.kwargs['env']['WRELA_BIN'], 'wrela')
 
     def test_wrela_checks_rebuild_the_normal_cli_before_using_it(self):
         original = Path.cwd()
         try:
-            for arguments in ([], ['wrela::compiler/std::alpha']):
+            for arguments in ([], ['wrela::compiler/std::alpha'], ['tools']):
                 with self.subTest(arguments=arguments), tempfile.TemporaryDirectory() as temporary:
                     root = Path(temporary).resolve()
                     target = root / 'target'

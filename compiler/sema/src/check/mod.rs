@@ -63,12 +63,7 @@ impl Env {
     /// Forgets the names declared after the first `len`.
     fn truncate(&mut self, len: usize) {
         for (name, _) in self.names.drain(len..) {
-            if let Some(ids) = self.by_name.get_mut(&name) {
-                ids.pop();
-                if ids.is_empty() {
-                    self.by_name.remove(&name);
-                }
-            }
+            Self::unindex(&mut self.by_name, &name);
         }
     }
 
@@ -76,14 +71,19 @@ impl Env {
     fn split_off(&mut self, len: usize) -> Vec<(String, LocalId)> {
         let gone = self.names.split_off(len);
         for (name, _) in &gone {
-            if let Some(ids) = self.by_name.get_mut(name) {
-                ids.pop();
-                if ids.is_empty() {
-                    self.by_name.remove(name);
-                }
-            }
+            Self::unindex(&mut self.by_name, name);
         }
         gone
+    }
+
+    /// Takes the innermost local named `name` out of the index by name.
+    fn unindex(by_name: &mut HashMap<String, Vec<LocalId>>, name: &str) {
+        if let Some(ids) = by_name.get_mut(name) {
+            ids.pop();
+            if ids.is_empty() {
+                by_name.remove(name);
+            }
+        }
     }
 
     /// The innermost local named `name`.

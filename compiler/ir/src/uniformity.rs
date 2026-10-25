@@ -24,28 +24,15 @@ pub enum Collective {
     Dpdx,
     Dpdy,
     Fwidth,
-    /// `textureSample`, and `textureSampleCompare`: they take derivatives to pick the detail.
+    /// `textureSample`, `textureSampleBias` and `textureSampleCompare`: they take derivatives
+    /// to pick the detail.
     Sample,
+    SampleBias,
     SampleCompare,
     /// `workgroupBarrier`: for all the invocations of a workgroup.
     Barrier,
     /// A subgroup operation: for all the invocations of a subgroup.
     Subgroup(crate::SubgroupOp),
-}
-
-impl Collective {
-    /// The operation, as WGSL names it: `dpdx`, `textureSample`, ...
-    pub fn wgsl_name(self) -> &'static str {
-        match self {
-            Collective::Dpdx => "dpdx",
-            Collective::Dpdy => "dpdy",
-            Collective::Fwidth => "fwidth",
-            Collective::Sample => "textureSample",
-            Collective::SampleCompare => "textureSampleCompare",
-            Collective::Barrier => "workgroupBarrier",
-            Collective::Subgroup(op) => op.wgsl_name(),
-        }
-    }
 }
 
 /// A collective operation in non-uniform control flow.
@@ -392,10 +379,10 @@ impl Fa<'_, '_> {
             // Another invocation may have changed what's there.
             Expr::Atomic(..) => true,
             Expr::Texture(op, ..) if op.uses_derivatives() => {
-                let op = if *op == TextureOp::Sample {
-                    Collective::Sample
-                } else {
-                    Collective::SampleCompare
+                let op = match op {
+                    TextureOp::Sample => Collective::Sample,
+                    TextureOp::SampleBias => Collective::SampleBias,
+                    _ => Collective::SampleCompare,
                 };
                 self.collective(op, v, cf);
                 operands(self)

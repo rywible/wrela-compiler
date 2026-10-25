@@ -355,6 +355,8 @@ fn run_gpu_frames(
             return failed(e, host.last_failure(), format!("in frame {k} of {frames}"));
         }
     }
+    // The screen, once read for the golden: Chrome's run is compared with it too.
+    let mut screen = None;
     if let Some((g, root, bless, reach)) = golden {
         let after = format!("after {frames} frames");
         let image = match &g.pass {
@@ -368,11 +370,14 @@ fn run_gpu_frames(
         if let Err(why) = against_golden(g, root, (w, h, &image), bless, reach) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
+        if g.pass.is_none() {
+            screen = Some(image);
+        }
     }
     if let Some(json) = both {
         let after = format!("after {frames} frames");
         let within = golden.map_or(wrela_sema::defs::GOLDEN_WITHIN, |g| g.0.within);
-        if let Err(why) = against_chrome(host, dir, frames, json, within) {
+        if let Err(why) = against_chrome(host, screen, dir, frames, json, within) {
             return Some(Failed { why: Why::Golden(why), fault: None, phase: after });
         }
     }
@@ -433,7 +438,8 @@ fn against_golden(
 /// difference times 8, opaque), written under the package's `build/goldens/` beside the
 /// golden's own path (`frame.actual.png`, `frame.diff.png`) for `wrela test` run on the
 /// package: the failure's words for them. Not under a tool's roots (a confined compile writes
-/// nothing beside a package), and nothing if the writes fail.
+/// nothing beside a package), nothing through a symbolic link (it could lead out of the
+/// package), and nothing if the writes fail.
 #[cfg(feature = "gpu")]
 fn shown_beside(
     root: &Path,
@@ -446,9 +452,12 @@ fn shown_beside(
         return String::new();
     }
     let stem = path.strip_suffix(".png").unwrap_or(path);
+    let Ok(root) = root.canonicalize() else { return String::new() };
     let at = root.join("build/goldens");
     let (actual, diff) =
         (at.join(format!("{stem}.actual.png")), at.join(format!("{stem}.diff.png")));
+    // No link on the way to either file, or at it, before and after making their directories.
+    let plain = || [&actual, &diff].iter().all(|p| crate::ensure_no_symlink_path(&root, p).is_ok());
     let difference: Vec<u8> = seen
         .chunks_exact(4)
         .zip(want.chunks_exact(4))
@@ -457,7 +466,9 @@ fn shown_beside(
             [d(0), d(1), d(2), 255]
         })
         .collect();
-    let written = actual.parent().map_or(Ok(()), std::fs::create_dir_all).is_ok()
+    let written = plain()
+        && actual.parent().map_or(Ok(()), std::fs::create_dir_all).is_ok()
+        && plain()
         && wrela_host::image::write_png(&actual, width, height, seen).is_ok()
         && wrela_host::image::write_png(&diff, width, height, &difference).is_ok();
     if written {
@@ -469,24 +480,25 @@ fn shown_beside(
     }
 }
 
-/// The native host's last frame and state hash after `frames` frames against Chrome's: the
-/// same build (in `dir`) run in headless Chrome's test mode with the same frames, screen, rate,
-/// one worker and the script `json`, whose state hash must be the same and whose last frame
-/// must be within `within` (a mean difference in 8-bit steps) of the native host's (§13,
-/// `hosts: both`).
+/// The native host's last frame (`screen`, if it was read already) and state hash after
+/// `frames` frames against Chrome's: the same build (in `dir`) run in headless Chrome's test
+/// mode with the same frames, screen, rate, one worker and the script `json`, whose state hash
+/// must be the same and whose last frame must be within `within` (a mean difference in 8-bit
+/// steps) of the native host's (§13, `hosts: both`).
 #[cfg(feature = "gpu")]
 fn against_chrome(
     host: &mut wrela_host::Host,
+    screen: Option<Vec<u8>>,
     dir: &Path,
     frames: u32,
     json: &str,
     within: f64,
 ) -> Result<(), String> {
-    let screen = host.read_screen().map_err(|e| e.to_string())?;
-    let hash = format!("{:016x}", host.hash());
-    let (Some(root), Some(page)) = (dir.parent(), dir.file_name().and_then(|n| n.to_str())) else {
-        return Err("its build has no directory Chrome can serve".into());
+    let screen = match screen {
+        Some(s) => s,
+        None => host.read_screen().map_err(|e| e.to_string())?,
     };
+    let hash = format!("{:016x}", host.hash());
     std::fs::write(dir.join("input.json"), json).map_err(|e| format!("its script: {e}"))?;
     let mut fragment = format!(
         "#test&frames={frames}&width={WIDTH}&height={HEIGHT}&fps={FPS}&workers=1&input=input.json"
@@ -505,9 +517,10 @@ fn against_chrome(
         fragment.push_str(&format!("&features={keep}"));
     }
     let timeout = std::time::Duration::from_secs_f64((f64::from(frames) / FPS * 3.0).max(120.0));
+    // The build's directory alone is served: it is the page.
     wrela_host::pages::run(wrela_host::pages::Page {
-        root,
-        page,
+        root: dir,
+        page: "",
         fragment: &fragment,
         timeout,
         script: None,
@@ -728,6 +741,28 @@ mod tests {
             golden_path(&pkg, "goldens/frame.png").expect("ordinary path"),
             pkg.canonicalize().expect("canonical package").join("goldens/frame.png")
         );
+    }
+
+    /// A failed golden's pictures go beside the package's goldens, never through a link there.
+    #[cfg(all(unix, feature = "gpu"))]
+    #[test]
+    fn a_failed_goldens_pictures_are_not_written_through_a_link() {
+        let scratch = crate::Scratch::new("wrela-test").expect("a scratch directory");
+        let (pkg, outside) = (scratch.0.join("package"), scratch.0.join("outside.png"));
+        std::fs::create_dir_all(pkg.join("build/goldens/goldens")).expect("package");
+        std::fs::write(&outside, b"keep").expect("outside file");
+        let actual = pkg.join("build/goldens/goldens/frame.actual.png");
+        std::os::unix::fs::symlink(&outside, &actual).expect("a link out");
+        let (seen, want) = (&[0u8; 16][..], &[255u8; 16][..]);
+        let reach = crate::reach::Reach::anywhere();
+        let shown = shown_beside(&pkg, "goldens/frame.png", (2, 2, seen), want, &reach);
+        assert_eq!(shown, "");
+        assert_eq!(std::fs::read(&outside).expect("outside file"), b"keep");
+        // Without the link, both are written.
+        std::fs::remove_file(&actual).expect("the link");
+        let shown = shown_beside(&pkg, "goldens/frame.png", (2, 2, seen), want, &reach);
+        assert!(shown.contains("frame.diff.png"), "{shown}");
+        assert!(actual.is_file() && pkg.join("build/goldens/goldens/frame.diff.png").is_file());
     }
 
     /// In a tool's toolchain, a golden is read through the roots' handles: a package swapped for
