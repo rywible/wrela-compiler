@@ -95,13 +95,34 @@ fn compact_subgroups(
 ) {
     let v = values[id.x]
     let keep = v % 2
-    let at = subgroup_prefix_sum(mut scan, lid, lane, width, keep)
+    let at = subgroup_prefix_sum(mut scan, lid, keep)
     if keep == 1 {
         out.store(wid.x * 256 + at, v)
     }
     if lid.x == 255 {
         counts.store(wid.x, at + keep)
     }
+}
+
+/// Each invocation's place among a 40-invocation workgroup's kept values, by both scans: 40 is a
+/// full subgroup of 32 and a partial one of 8 on most GPUs, so the subgroup scan meets a
+/// subgroup with fewer invocations than its width. Slot 2i the workgroup scan's, 2i + 1 the
+/// subgroup scan's.
+@compute(40)
+fn partial_places(
+    values: [u32],
+    out: mut Atomics<u32>,
+    a: mut Shared<u32, 40>,
+    b: mut Shared<u32, 40>,
+    lid: LocalId,
+    wid: WorkgroupId,
+    id: GlobalId,
+) {
+    let keep = values[id.x] % 2
+    let w = workgroup_prefix_sum(mut a, lid, keep)
+    let g = subgroup_prefix_sum(mut b, lid, keep)
+    out.store(2 * id.x, w)
+    out.store(2 * id.x + 1, g)
 }
 
 /// Eight values summed in half floats: `x / 8` for `x` from `8i` to `8i + 7`.
@@ -140,6 +161,9 @@ pub struct State {
     compacted_subgroups: GpuBuffer<u32>,
     counts_subgroups: GpuBuffer<u32>,
     halves: GpuBuffer<f32>,
+    partial: GpuBuffer<u32>,
+    partial_read: Option<Pending<u32>>,
+    got_partial: Vec<u32>,
     extremes: GpuBuffer<i32>,
     extremes_read: Option<Pending<i32>>,
     got_extremes: Vec<i32>,
@@ -167,6 +191,9 @@ pub fn init() -> State {
         compacted_subgroups: buffer(COMPACTED),
         counts_subgroups: buffer(COMPACTED / 256),
         halves: buffer(64),
+        partial: buffer(2 * 400),
+        partial_read: None,
+        got_partial: Vec::new(),
         extremes: buffer(2 * COMPACTED / 256),
         extremes_read: None,
         got_extremes: Vec::new(),
@@ -194,6 +221,16 @@ pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
                 }
             }
             k += 1
+        }
+        match mut s.partial_read {
+            Some(p) => {
+                if s.got_partial.len() == 0 {
+                    if let Some(Ok(v)) = p.poll() {
+                        s.got_partial = take v
+                    }
+                }
+            },
+            None => {},
         }
         match mut s.extremes_read {
             Some(p) => {
@@ -245,6 +282,13 @@ fn record(s: mut State) {
         )
         s.reads.push(read(s.compacted_subgroups.items()))
         s.reads.push(read(s.counts_subgroups.items()))
+    }
+    if s.features.subgroups {
+        dispatch(
+            partial_places.bind(s.values.span(start: 0, count: 400), mut s.partial),
+            groups: (10, 1, 1),
+        )
+        s.partial_read = Some(read(s.partial.items()))
     }
     if s.features.f16 {
         dispatch(halves.bind(mut s.halves), over: 64)
@@ -361,5 +405,36 @@ fn signed_workgroup_atomics_find_each_workgroups_extremes(s: State) {
             hi = max(hi, v)
         }
         assert(s.got_extremes[2 * g] == lo && s.got_extremes[2 * g + 1] == hi)
+    }
+}
+
+@test(frames: 6, gpu: true)
+fn a_subgroup_scan_with_a_partial_subgroup_gives_distinct_dense_places(s: State) {
+    if !s.features.subgroups {
+        print("no `subgroups` on this device: passed trivially")
+        return
+    }
+    assert(s.got_partial.len() == 800)
+    for g in 0..10 {
+        // The kept values' places, by the subgroup scan, are 0 to the count, each once.
+        var count = 0
+        var seen = Vec::from_fn(40, |_| false)
+        for i in 0..40 {
+            let id = 40 * g + i
+            if value(id) % 2 == 1 {
+                let place = s.got_partial[2 * id + 1]
+                assert(place < 40 && !seen[place], f"workgroup {g}: place {place} twice")
+                seen[place] = true
+                count += 1
+            }
+        }
+        for p in 0..count {
+            assert(seen[p], f"workgroup {g}: place {p} missing")
+        }
+        // Where subgroups are consecutive runs (this GPU), the scans agree.
+        for i in 0..40 {
+            let id = 40 * g + i
+            assert(s.got_partial[2 * id] == s.got_partial[2 * id + 1])
+        }
     }
 }

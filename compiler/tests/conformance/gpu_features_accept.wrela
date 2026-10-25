@@ -40,7 +40,7 @@ fn scans(
     width: SubgroupSize,
     id: GlobalId,
 ) {
-    out[id] = workgroup_prefix_sum(mut a, lid, 1) + subgroup_prefix_sum(mut b, lid, lane, width, 1)
+    out[id] = workgroup_prefix_sum(mut a, lid, 1) + subgroup_prefix_sum(mut b, lid, 1)
 }
 
 pub fn frame(time: f32, width: u32, height: u32) {

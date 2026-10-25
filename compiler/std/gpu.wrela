@@ -3712,37 +3712,37 @@ pub fn subgroup_shuffle<T>(x: T, from: u32) -> T {}
 /// are runs of consecutive indices (every GPU this toolchain has run on forms them so for a
 /// one-dimensional workgroup), the results are `workgroup_prefix_sum`'s exactly; a compaction
 /// that must keep `LocalId` order uses that one. One barrier, not `workgroup_prefix_sum`'s
-/// 2 log2(N) + 1, and a read of workgroup memory for each subgroup's worth of invocations.
+/// 2 log2(N) + 1.
 /// `shared` holds one element for each of the workgroup's invocations (`N` its size); after the
 /// call, each subgroup's first invocation's element holds its subgroup's total and the others
-/// 0. Uniform control flow.
+/// 0. Uniform control flow. Its subgroups may be partial (a workgroup size that isn't a multiple
+/// of theirs): each reads `N` divided by its own invocations' count.
 pub fn subgroup_prefix_sum<const N: u32>(
     shared: mut Shared<u32, N>,
     lid: LocalId,
-    lane: SubgroupInvocation,
-    width: SubgroupSize,
     value: u32,
 ) -> u32 {
     let c = shared.chunk(lid)
     let i = c.index(0)
     let mine = subgroup_exclusive_add(value)
     let total = subgroup_add(value)
-    // The subgroup's first invocation: every invocation is active here (uniform control flow).
+    // The subgroup's invocations, ranked among those it has: a subgroup may have fewer than its
+    // width (the workgroup's last), and WGSL doesn't say which lanes they are. Rank 0 is the
+    // lowest lane, whose index `subgroup_broadcast_first` gives, and it writes the total there.
+    let rank = subgroup_exclusive_add(1)
+    let count = subgroup_add(1)
     let first = subgroup_broadcast_first(i)
-    shared.write(c, 0, if lane.index == 0 { total } else { 0 })
+    shared.write(c, 0, if rank == 0 { total } else { 0 })
     barrier(mut shared)
-    // The totals of the subgroups whose first invocation comes before this one's: the
-    // elements before `first`, a subgroup's width of them at a time.
-    let n = width.size
-    var before = 0
-    var base = 0
-    while base < N {
-        let k = base + lane.index
-        let theirs = if k < first { shared.get(k) } else { 0 }
-        before += subgroup_add(theirs)
-        base += n
+    // The totals of the subgroups whose first invocation comes before this one's: every element
+    // below `first`, each rank taking every `count`th, then summed across the subgroup.
+    var partial = 0
+    var k = rank
+    while k < first {
+        partial += shared.get(k)
+        k += count
     }
-    before + mine
+    subgroup_add(partial) + mine
 }
 
 /// An indirect draw's arguments (`draw(pass, vs, fs, indirect: buf)`, of a `GpuBuffer` or span of
