@@ -1,0 +1,123 @@
+// `gather` (language.md §18.8): a kernel gathers a 2 × 2 colour texture's four texels, one
+// component of each, and a 2 × 2 depth texture's four depths and their comparisons with a
+// reference, in one fetch each; the test reads them back in WGSL's order, on both hosts.
+use std::gpu::{
+    ClipPosition, Compare, DepthTexture, GlobalId, GpuBuffer, Rgba16Float, Sampler, Slots, Texels,
+    Texture, VertexIndex, buffer, begin_depth_pass, comparison_sampler, depth_texture, dispatch,
+    draw, read, sampler, writable_texture, ComparisonSampler,
+}
+use std::io::Pending
+
+/// Texel (x, y)'s number: 1 to 4.
+fn number(x: u32, y: u32) -> f32 {
+    f32(1 + x + 2 * y)
+}
+
+/// Texel (x, y), component c: its number plus 4c.
+@compute(2, 2)
+fn fill(out: mut Texels<Rgba16Float>, id: GlobalId) {
+    let n = number(id.x, id.y)
+    out.store(id, vec4(n, n + 4.0, n + 8.0, n + 12.0))
+}
+
+/// Texel (x, y) of the 2 × 2 depth target, at depth `number / 8`.
+@vertex
+fn texel(v: VertexIndex) -> ClipPosition {
+    let corners = [
+        vec2(0.0, 0.0),
+        vec2(1.0, 0.0),
+        vec2(0.0, 1.0),
+        vec2(0.0, 1.0),
+        vec2(1.0, 0.0),
+        vec2(1.0, 1.0),
+    ]
+    let k = v.index / 6
+    let (x, y) = (k % 2, k / 2)
+    // Row 0 is the top: clip y from 1 down.
+    let p = vec2(-1.0 + f32(x), -f32(y)) + corners[v.index % 6]
+    ClipPosition { position: vec4(p, number(x, y) / 8.0, 1.0) }
+}
+
+@fragment
+fn none() -> vec4 {
+    vec4(0.0)
+}
+
+/// The four gathers, an invocation each, at the middle of the 2 × 2, where a bilinear sample
+/// reads all four texels.
+@compute(4)
+fn probe(
+    t: Texture<Rgba16Float>,
+    d: DepthTexture,
+    s: Sampler,
+    cs: ComparisonSampler,
+    out: mut Slots<vec4>,
+    id: GlobalId,
+) {
+    let uv = vec2(0.5, 0.5)
+    out[id] = if id.x == 0 {
+        t.gather(s, uv)
+    } else if id.x == 1 {
+        t.gather(s, uv, component: 1)
+    } else if id.x == 2 {
+        d.gather(s, uv)
+    } else {
+        d.gather_compare(cs, uv, reference: 0.3)
+    }
+}
+
+pub struct State {
+    frame: u32,
+    colour: Texture<Rgba16Float>,
+    depth: DepthTexture,
+    out: GpuBuffer<vec4>,
+    pending: Option<Pending<vec4>>,
+    seen: Vec<vec4>,
+}
+
+pub fn init() -> State {
+    State {
+        frame: 0,
+        colour: writable_texture::<Rgba16Float>(width: 2, height: 2),
+        depth: depth_texture(width: 2, height: 2),
+        out: buffer(4),
+        pending: None,
+        seen: Vec::new(),
+    }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    if s.frame == 0 {
+        dispatch(fill.bind(mut s.colour), groups: 1)
+        let pass = begin_depth_pass(mut s.depth, clear_depth: 1.0)
+        draw(pass, texel, none, vertices: 24)
+        pass.end()
+        let nearest = sampler(filter: std::gpu::Filter::Nearest, mip: std::gpu::Filter::Nearest)
+        // `LessEqual`: a texel passes where the reference is at most its depth.
+        let cs = comparison_sampler(compare: Compare::LessEqual)
+        dispatch(probe.bind(t: s.colour, d: s.depth, s: nearest, cs: cs, out: mut s.out), groups: 1)
+        s.pending = Some(read(s.out.items()))
+    }
+    match mut s.pending {
+        Some(p) => {
+            if s.seen.len() == 0 {
+                if let Some(Ok(v)) = p.poll() {
+                    s.seen = take v
+                }
+            }
+        },
+        None => {},
+    }
+    s.frame += 1
+}
+
+@test(frames: 4, gpu: true, hosts: both)
+fn the_quad_comes_back_in_wgsls_order(s: State) {
+    assert(s.seen.len() == 4, "the gathers came back")
+    // (min u, max v), (max u, max v), (max u, min v), (min u, min v): texels (0, 1), (1, 1),
+    // (1, 0) and (0, 0), numbered 3, 4, 2 and 1.
+    assert(s.seen[0] == vec4(3.0, 4.0, 2.0, 1.0), f"component 0: {s.seen[0]}")
+    assert(s.seen[1] == vec4(7.0, 8.0, 6.0, 5.0), f"component 1: {s.seen[1]}")
+    assert(s.seen[2] == vec4(0.375, 0.5, 0.25, 0.125), f"depths: {s.seen[2]}")
+    assert(s.seen[3] == vec4(1.0, 1.0, 0.0, 0.0), f"against 0.3: {s.seen[3]}")
+}

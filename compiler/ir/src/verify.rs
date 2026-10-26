@@ -217,8 +217,12 @@ impl Verifier<'_> {
                 let Some(ResourceKind::Texture { depth, dim, format }) = kind(t) else {
                     return Err(bug("a texture read of something that isn't a texture"));
                 };
-                let comparison =
-                    matches!(op, TextureOp::SampleCompare | TextureOp::SampleCompareLevel);
+                let comparison = matches!(
+                    op,
+                    TextureOp::SampleCompare
+                        | TextureOp::SampleCompareLevel
+                        | TextureOp::GatherCompare
+                );
                 let sampled = op.is_sampled();
                 if (depth && dim == TexDim::D3) || (*op == TextureOp::Depth && dim != TexDim::D3) {
                     return Err(bug(format!("{op:?} of a {dim:?} texture")));
@@ -240,7 +244,9 @@ impl Verifier<'_> {
                         if c == comparison => {}
                     _ => return Err(bug(format!("{op:?} with the wrong sampler"))),
                 }
-                if comparison != (depth && sampled) {
+                // A depth texture is sampled with a comparison, or gathered.
+                let gathered = matches!(op, TextureOp::Gather(_));
+                if comparison && !depth || depth && sampled && !comparison && !gathered {
                     return Err(bug(format!("{op:?} of a texture that's depth: {depth}")));
                 }
                 let (f32_, u32_) = (TypeDef::Scalar(Scalar::F32), TypeDef::Scalar(Scalar::U32));
@@ -260,7 +266,8 @@ impl Verifier<'_> {
                     TextureOp::SampleLevel
                     | TextureOp::SampleBias
                     | TextureOp::SampleCompare
-                    | TextureOp::SampleCompareLevel => want.push(f32_),
+                    | TextureOp::SampleCompareLevel
+                    | TextureOp::GatherCompare => want.push(f32_),
                     TextureOp::SampleGrad => want.extend([at.clone(), at]),
                     TextureOp::Load => want.push(u32_),
                     _ => {}
@@ -276,6 +283,9 @@ impl Verifier<'_> {
                         TypeDef::Scalar(Scalar::F32)
                     }
                     TextureOp::Load if depth => TypeDef::Scalar(Scalar::F32),
+                    TextureOp::Gather(_) | TextureOp::GatherCompare if depth => {
+                        TypeDef::Vector(Scalar::F32, 4)
+                    }
                     _ => TypeDef::Vector(crate::texel_scalar(format), 4),
                 };
                 types.lookup(&out)

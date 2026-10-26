@@ -531,6 +531,14 @@ pub enum TextureOp {
     SampleCompare,
     /// As `SampleCompare`, at level 0: any stage.
     SampleCompareLevel,
+    /// The four texels a bilinear sample at the coordinates would read, one component of each
+    /// (0 to 3; a depth texture's depth): a `vec4`, in WGSL's order (`textureGather`). Args: the
+    /// coordinates. Any stage.
+    Gather(u8),
+    /// Of a depth texture, with a comparison sampler: the four texels' comparisons with the
+    /// reference depth, each 1 or 0 (`textureGatherCompare`). Args: the coordinates and the
+    /// reference. Any stage.
+    GatherCompare,
     /// Args: the texel, and its level. A `vec4`, or an `f32` of a depth texture.
     Load,
     /// The width, height or depth (of a 3D texture), a `u32`.

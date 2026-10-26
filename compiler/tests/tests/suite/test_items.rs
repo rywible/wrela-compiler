@@ -814,6 +814,31 @@ fn tape_operations_match_their_twins_and_a_full_tape_runs() {
     }
 }
 
+/// `gather` (language.md §18.8): a 2 × 2 colour texture's texels, one component of each, and a
+/// 2 × 2 depth texture's depths and their comparisons, each in one fetch and in WGSL's order, on
+/// both hosts (compiler/tests/gather).
+#[test]
+#[ignore = "needs a GPU"]
+fn gathers_read_four_texels_in_wgsls_order() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/gather");
+    assert_eq!(crate::tests_pass(&dir), 1);
+}
+
+/// A gather is one WGSL fetch: `textureGather`, and `textureGatherCompare` of a depth texture.
+#[test]
+fn a_gather_is_one_fetch_in_the_wgsl() {
+    let dir = wrela_tests::repo_root().join("compiler/tests/gather");
+    let built = wrela_tests::build(&dir).unwrap_or_else(|e| panic!("doesn't build:\n{e}"));
+    let wgsl: String = built
+        .files
+        .iter()
+        .filter(|(n, _)| n.ends_with(".wgsl"))
+        .map(|(_, bytes)| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    assert_eq!(wgsl.matches("textureGather(").count(), 3, "two of colour, one of depth");
+    assert_eq!(wgsl.matches("textureGatherCompare(").count(), 1);
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

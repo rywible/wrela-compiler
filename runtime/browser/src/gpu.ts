@@ -246,10 +246,13 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         break;
       case "sampler":
       case "comparison_sampler":
+      case "non_filtering_sampler":
         entries.push({
           binding: b.binding,
           visibility: seen,
-          sampler: { type: b.kind === "sampler" ? "filtering" : "comparison" },
+          sampler: {
+            type: b.kind === "sampler" ? "filtering" : b.kind === "comparison_sampler" ? "comparison" : "non-filtering",
+          },
         });
         break;
       // Only a kernel writes a texture's texels.
@@ -1781,7 +1784,7 @@ export class GpuExecutor {
       const pipeline = this.#pipeline(draw.pipeline);
       for (const [i, binding] of draw.bindings.entries()) {
         const kind = pipeline.bindings[i]!.kind;
-        if (kind !== "sampler" && kind !== "comparison_sampler") {
+        if (kind !== "sampler" && kind !== "comparison_sampler" && kind !== "non_filtering_sampler") {
           if (!use(binding.handle, kind === "read_write" || isStorage(kind) ? 2 : 1)) return false;
         }
       }

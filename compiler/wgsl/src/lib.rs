@@ -1523,7 +1523,9 @@ impl<'a, 'm> Fb<'a, 'm> {
             | T::SampleGrad
             | T::SampleBias
             | T::SampleCompare
-            | T::SampleCompareLevel => {
+            | T::SampleCompareLevel
+            | T::Gather(_)
+            | T::GatherCompare => {
                 let s = sampler.ok_or("internal: sampling without a sampler")?;
                 let sampler = self.resource(s, out)?;
                 let coordinate = arg(self, 0)?;
@@ -1539,13 +1541,24 @@ impl<'a, 'm> Fb<'a, 'm> {
                         None,
                     ),
                     T::SampleCompare => (naga::SampleLevel::Auto, Some(arg(self, rest)?)),
+                    T::Gather(_) => (naga::SampleLevel::Zero, None),
                     _ => (naga::SampleLevel::Zero, Some(arg(self, rest)?)),
+                };
+                let gather = match op {
+                    T::Gather(c) => Some(match c {
+                        0 => naga::SwizzleComponent::X,
+                        1 => naga::SwizzleComponent::Y,
+                        2 => naga::SwizzleComponent::Z,
+                        _ => naga::SwizzleComponent::W,
+                    }),
+                    T::GatherCompare => Some(naga::SwizzleComponent::X),
+                    _ => None,
                 };
                 self.expr(
                     Expression::ImageSample {
                         image,
                         sampler,
-                        gather: None,
+                        gather,
                         coordinate,
                         array_index,
                         offset: None,

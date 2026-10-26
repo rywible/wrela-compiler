@@ -1562,6 +1562,12 @@ pub(crate) fn intrinsic(
             | Lang::TextureSampleBias
             | Lang::TextureSampleCompare
             | Lang::TextureSampleCompareLevel
+            | Lang::TextureGather
+            | Lang::ArrayGather
+            | Lang::DepthGather
+            | Lang::DepthGatherCompare
+            | Lang::DepthArrayGather
+            | Lang::DepthArrayGatherCompare
             | Lang::TextureLoad
             | Lang::DepthLoad
             | Lang::Texture3dSampleLevel
@@ -1584,7 +1590,7 @@ pub(crate) fn intrinsic(
             | Lang::TextureDepth
             | Lang::TextureLevels
             | Lang::TextureLayers),
-        ) => texture_read(fl, l, c, ty),
+        ) => texture_read(fl, l, substs, c, ty),
         // A field of what a `GpuField` names: its offset moved by the field's in the struct's
         // layout. CPU code only (GPU code doesn't name buffers).
         Some(Lang::GpuFieldAt) => {
@@ -1937,11 +1943,29 @@ fn user_span_in(cx: &Cx, mb: &ModuleBuilder, id: ir::FuncId, span: Span) -> Span
 
 /// A texture read (`Texture::sample` and the rest), in GPU code. On the CPU a texture's size
 /// is its fields; its texels are E0607.
-fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option<ir::ValueId> {
+fn texture_read(
+    fl: &mut Fl,
+    l: Lang,
+    substs: &[TyId],
+    c: &mir::Call,
+    ty: Option<TyId>,
+) -> Option<ir::ValueId> {
     use ir::TextureOp as T;
     let span = c.span;
     let u = fl.mb.m.types.u32();
     let op = match l {
+        // A colour gather's component is its first generic (`texture_gather::<1, F>`).
+        Lang::TextureGather | Lang::ArrayGather => {
+            match fl.cx.checked.program.types.kind(substs[0]) {
+                TyKind::ConstU32(k) if *k < 4 => T::Gather(*k as u8),
+                _ => {
+                    fl.cx.err(Diagnostic::internal("a gather's component isn't 0 to 3"));
+                    return None;
+                }
+            }
+        }
+        Lang::DepthGather | Lang::DepthArrayGather => T::Gather(0),
+        Lang::DepthGatherCompare | Lang::DepthArrayGatherCompare => T::GatherCompare,
         Lang::TextureSample | Lang::ArraySample | Lang::CubeSample => T::Sample,
         Lang::TextureSampleLevel
         | Lang::Texture3dSampleLevel
@@ -2016,6 +2040,8 @@ fn texture_read(fl: &mut Fl, l: Lang, c: &mir::Call, ty: Option<TyId>) -> Option
         _ => None,
     };
     let read = match colour {
+        // A gather reads one component of four texels: the result is all four.
+        Some(_) if matches!(op, T::Gather(_)) => t,
         Some(f) if !op.is_query() => fl.mb.m.types.vector_of(ir::texel_scalar(f), 4),
         _ => t,
     };
@@ -2790,12 +2816,35 @@ fn check_subgroup_invocation(cx: &mut Cx, iface: &Interface, wg: [u32; 3]) {
     }
 }
 
+/// Each sampler that gathers a depth texture's depths binds as one that doesn't filter: WebGPU
+/// pairs a depth texture with comparison samplers and non-filtering ones only.
+fn non_filtering(m: &ir::Module, bindings: &mut [ResourceBinding]) {
+    let mut gathering = Vec::new();
+    for f in &m.functions {
+        ir::visit::walk(&f.body, &mut |s| {
+            if let ir::Stmt::Let(_, ir::Expr::Texture(ir::TextureOp::Gather(_), t, Some(s), _)) = s
+                && matches!(
+                    m.resources[t.index()].kind,
+                    ir::ResourceKind::Texture { depth: true, .. }
+                )
+            {
+                gathering.push(m.resources[s.index()].binding);
+            }
+        });
+    }
+    for b in bindings {
+        if b.kind == BindingKind::Sampler && gathering.contains(&b.binding) {
+            b.kind = BindingKind::NonFilteringSampler;
+        }
+    }
+}
+
 fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let kernel = iface.entries[0].func;
     let Some(Entry::Compute(wg)) = cx.entry_of(kernel) else { return None };
     let checked = cx.checked;
     let name = &checked.program.func(kernel).name;
-    let EntryModule { mut mb, keys, bindings, uniform } =
+    let EntryModule { mut mb, keys, mut bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Compute(wg));
     let entry = entry_function(&mut mb, &keys[0], name, None, None);
     cx.drain(&mut mb);
@@ -2810,6 +2859,7 @@ fn lower_compute(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
         inputs,
     });
     verify(cx, &mut mb, name)?;
+    non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
         name: name.clone(),
@@ -2837,7 +2887,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     let vret = iface.vertex_ret?;
     let vdef = checked.program.func(vertex.func);
     let fdef = checked.program.func(fragment.func);
-    let EntryModule { mut mb, keys, bindings, uniform } =
+    let EntryModule { mut mb, keys, mut bindings, uniform } =
         entry_module(cx, iface.clone(), Entry::Vertex);
     let vret_ir = cx.lower_ty(&mut mb, vret, vdef.sig_span)?;
     let ventry = entry_function(&mut mb, &keys[0], &vdef.name, Some(vret_ir), None);
@@ -2893,6 +2943,7 @@ fn lower_render(cx: &mut Cx, iface: Rc<Interface>) -> Option<PipelineOut> {
     });
     let name = format!("{}_{}", ir::ident(&vdef.name), ir::ident(&fdef.name));
     verify(cx, &mut mb, &name)?;
+    non_filtering(&mb.m, &mut bindings);
     let instances = mb.fn_instances();
     Some(PipelineOut {
         name: format!("{}+{}", vdef.name, fdef.name),

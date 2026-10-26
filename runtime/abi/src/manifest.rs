@@ -497,6 +497,9 @@ pub enum BindingKind {
     Sampler,
     /// A comparison sampler.
     ComparisonSampler,
+    /// A sampler that gathers a depth texture's depths (`DepthTexture::gather`): WebGPU binds
+    /// it as one that doesn't filter, so the sampler's filters are nearest.
+    NonFilteringSampler,
     /// A colour texture a kernel writes, of its `format` (a storage texture, written only).
     StorageTexture,
     /// A colour 3D texture.
@@ -519,7 +522,7 @@ pub enum BindingKind {
 }
 
 impl BindingKind {
-    pub const ALL: [BindingKind; 13] = [
+    pub const ALL: [BindingKind; 14] = [
         BindingKind::Read,
         BindingKind::ReadWrite,
         BindingKind::Texture,
@@ -533,6 +536,7 @@ impl BindingKind {
         BindingKind::TextureCube,
         BindingKind::DepthTextureArray,
         BindingKind::StorageTextureArray,
+        BindingKind::NonFilteringSampler,
     ];
 
     pub fn is_buffer(self) -> bool {
@@ -614,7 +618,9 @@ impl BindingKind {
             | BindingKind::TextureArray
             | BindingKind::TextureCube
             | BindingKind::DepthTextureArray => StageLimit::SampledTextures,
-            BindingKind::Sampler | BindingKind::ComparisonSampler => StageLimit::Samplers,
+            BindingKind::Sampler
+            | BindingKind::ComparisonSampler
+            | BindingKind::NonFilteringSampler => StageLimit::Samplers,
             BindingKind::StorageTexture
             | BindingKind::StorageTexture3d
             | BindingKind::StorageTextureArray => StageLimit::StorageTextures,
@@ -630,6 +636,7 @@ impl BindingKind {
             BindingKind::DepthTexture => "depth_texture",
             BindingKind::Sampler => "sampler",
             BindingKind::ComparisonSampler => "comparison_sampler",
+            BindingKind::NonFilteringSampler => "non_filtering_sampler",
             BindingKind::StorageTexture => "storage_texture",
             BindingKind::Texture3d => "texture_3d",
             BindingKind::StorageTexture3d => "storage_texture_3d",

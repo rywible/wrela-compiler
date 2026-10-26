@@ -1116,6 +1116,9 @@ impl Builder {
                 BindingKind::ComparisonSampler => {
                     (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison), all)
                 }
+                BindingKind::NonFilteringSampler => {
+                    (wgpu::BindingType::Sampler(wgpu::SamplerBindingType::NonFiltering), all)
+                }
                 // Only a kernel writes a texture's texels.
                 BindingKind::StorageTexture
                 | BindingKind::StorageTexture3d
@@ -1874,12 +1877,15 @@ impl Gpu {
             for (binding, slot) in
                 draw.bindings.iter().zip(&self.pipelines[draw.pipeline as usize].bindings)
             {
-                if !matches!(slot.kind, BindingKind::Sampler | BindingKind::ComparisonSampler)
-                    && !compatible(
-                        binding.handle,
-                        slot.kind == BindingKind::ReadWrite || slot.kind.is_storage(),
-                    )
-                {
+                if !matches!(
+                    slot.kind,
+                    BindingKind::Sampler
+                        | BindingKind::ComparisonSampler
+                        | BindingKind::NonFilteringSampler
+                ) && !compatible(
+                    binding.handle,
+                    slot.kind == BindingKind::ReadWrite || slot.kind.is_storage(),
+                ) {
                     return false;
                 }
             }

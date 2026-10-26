@@ -1168,7 +1168,9 @@ impl Checker {
                     }
                     Self::used(&mut self.scope, op, "buffer", b.handle, u)?;
                 }
-                BindingKind::Sampler | BindingKind::ComparisonSampler => {
+                BindingKind::Sampler
+                | BindingKind::ComparisonSampler
+                | BindingKind::NonFilteringSampler => {
                     if b.offset != 0 || b.size != 0 {
                         return err(format!(
                             "a sampler binding has offset {} and size {}: both must be 0",
