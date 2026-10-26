@@ -60,6 +60,7 @@ test("parses the Rust crate's golden manifest", () => {
         debug_flag: null,
         requires: [],
         conditional: false,
+        constants: [],
       },
       {
         kind: "render",
@@ -82,6 +83,7 @@ test("parses the Rust crate's golden manifest", () => {
         debug_flag: null,
         requires: [],
         conditional: false,
+        constants: [],
       },
     ],
   });

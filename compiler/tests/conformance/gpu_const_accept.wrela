@@ -1,0 +1,36 @@
+// accepts: gpu.const
+// A kernel's `const` parameters, given literals, a negated literal and a `const` item where it's
+// dispatched: each set of values is a pipeline of its own.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+const TAPS: u32 = 4
+const GAIN: f32 = 0.5
+
+@compute(64)
+fn blur(
+    out: mut Slots<f32>,
+    id: GlobalId,
+    taps: const u32,
+    gain: const f32,
+    wide: const bool,
+    shift: const i32,
+) {
+    var x = 0.0
+    for i in 0..taps {
+        x += f32(i) * gain
+    }
+    out[id] = if wide { x * 2.0 } else { x + f32(shift) }
+}
+
+pub struct State {
+    out: GpuBuffer<f32>,
+}
+
+pub fn init() -> State {
+    State { out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(blur.bind(out: mut s.out, taps: TAPS, gain: GAIN, wide: true, shift: -3), groups: 1)
+    dispatch(blur.bind(out: mut s.out, taps: 2, gain: -1.5, wide: false, shift: 0), groups: 1)
+}

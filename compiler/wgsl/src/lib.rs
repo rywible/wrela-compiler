@@ -32,6 +32,9 @@ pub struct Wgsl {
     /// Each entry point's name in `text`, in the module's order. The WGSL writer renames
     /// identifiers that are WGSL keywords or builtins, end in a digit, or are used twice.
     pub entry_points: Vec<String>,
+    /// Each pipeline-overridable constant's name in `text`, in `ir::Module::overrides`' order:
+    /// the name its pipeline sets it by.
+    pub overrides: Vec<String>,
 }
 
 /// Writes a GPU module as validated WGSL.
@@ -42,11 +45,14 @@ pub fn emit(m: &ir::Module) -> R<Wgsl> {
         naga::back::wgsl::write_string(&module, &info, naga::back::wgsl::WriterFlags::empty())
             .map_err(|e| format!("internal: writing WGSL failed: {e}"))?;
     let text = unindented(&text);
-    let entry_points = entry_point_names(&module);
+    let (entry_points, overrides) = names(&module);
     if let Some(n) = entry_points.iter().find(|n| !text.contains(&format!("fn {n}("))) {
         return Err(format!("internal: the WGSL writer didn't name an entry point `{n}`"));
     }
-    Ok(Wgsl { text, entry_points })
+    if let Some(n) = overrides.iter().find(|n| !text.contains(&format!("override {n}:"))) {
+        return Err(format!("internal: the WGSL writer didn't name an override `{n}`"));
+    }
+    Ok(Wgsl { text, entry_points, overrides })
 }
 
 /// A struct's name in WGSL: its type's, cut to 32 characters. A creature's nested types'
@@ -73,9 +79,10 @@ fn unindented(text: &str) -> String {
     out
 }
 
-/// The names naga's WGSL writer gives a module's entry points: its namer, set up as the writer
-/// sets it up (naga 30's `back::wgsl::Writer::reset`). `emit` checks them against the text.
-fn entry_point_names(module: &naga::Module) -> Vec<String> {
+/// The names naga's WGSL writer gives a module's entry points and its overrides: its namer, set
+/// up as the writer sets it up (naga 30's `back::wgsl::Writer::reset`). `emit` checks them
+/// against the text.
+fn names(module: &naga::Module) -> (Vec<String>, Vec<String>) {
     use naga::keywords::wgsl::{BUILTIN_IDENTIFIER_SET, RESERVED_SET};
     let mut names = naga::FastHashMap::default();
     naga::proc::Namer::default().reset(
@@ -86,9 +93,15 @@ fn entry_point_names(module: &naga::Module) -> Vec<String> {
         &["__", "_naga"],
         &mut names,
     );
-    (0..module.entry_points.len())
+    let entries = (0..module.entry_points.len())
         .map(|i| names.get(&naga::proc::NameKey::EntryPoint(i as _)).cloned().unwrap_or_default())
-        .collect()
+        .collect();
+    let overrides = module
+        .overrides
+        .iter()
+        .map(|(h, _)| names.get(&naga::proc::NameKey::Override(h)).cloned().unwrap_or_default())
+        .collect();
+    (entries, overrides)
 }
 
 /// Validates a naga module as WebGPU will.
@@ -153,6 +166,8 @@ struct Cx<'m> {
     fns: HashMap<ir::FuncId, Handle<Function>>,
     /// Module constants for long float literals, by their bits.
     float_consts: HashMap<u32, Handle<naga::Constant>>,
+    /// The module's pipeline-overridable constants, by `ir::Module::overrides`' index.
+    overrides: Vec<Handle<naga::Override>>,
 }
 
 pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
@@ -164,7 +179,16 @@ pub fn to_naga(m: &ir::Module) -> R<naga::Module> {
         globals: Vec::new(),
         fns: HashMap::new(),
         float_consts: HashMap::new(),
+        overrides: Vec::new(),
     };
+    // Each without an `@id`: the hosts set it by its name (WGSL §7.2.2 keys a pipeline's
+    // constants by id or by name, not both).
+    for (name, s) in &m.overrides {
+        let ty = cx.ty_inner(TypeInner::Scalar(scalar(*s)?));
+        let o = naga::Override { name: Some(ir::ident(name)), id: None, ty, init: None };
+        let h = cx.out.overrides.append(o, Span::UNDEFINED);
+        cx.overrides.push(h);
+    }
     for r in &m.resources {
         let g = cx.global(r)?;
         cx.globals.push(g);
@@ -1100,6 +1124,11 @@ impl<'a, 'm> Fb<'a, 'm> {
                 } else {
                     arg
                 }
+            }
+            ir::Expr::Override(i) => {
+                let h =
+                    *self.cx.overrides.get(*i as usize).ok_or("internal: a missing override")?;
+                self.expr(Expression::Override(h), out)
             }
             ir::Expr::EntryInput(i) => {
                 let arg = match self.inputs.get(*i as usize) {

@@ -1089,15 +1089,23 @@ fn summarize(
     conditions: bool,
 ) -> Vec<PipelineSummary> {
     let p = &checked.program;
-    let entry = |f: wrela_sema::ty::FnId, substs: &[wrela_sema::ty::TyId]| {
+    // An instantiation: its type arguments, then its `const` parameters' values (§18.1).
+    let entry = |f: wrela_sema::ty::FnId,
+                 substs: &[wrela_sema::ty::TyId],
+                 consts: Vec<(usize, wrela_sema::thir::ConstArg)>| {
         let name = p.fn_display_name(f);
-        if substs.is_empty() {
+        let mut args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
+        args.extend(consts.iter().map(|(i, c)| format!("{} = {c}", p.func(f).params[*i].name)));
+        if args.is_empty() {
             (name.clone(), name)
         } else {
-            let args: Vec<String> = substs.iter().map(|&t| p.display_ty(t)).collect();
             (format!("{name}::<{}>", args.join(", ")), name)
         }
     };
+    let consts_of =
+        |key: &wrela_lower::PipelineKey, e: usize| -> Vec<(usize, wrela_sema::thir::ConstArg)> {
+            key.consts().iter().filter(|c| c.0 == e).map(|&(_, i, c)| (i, c)).collect()
+        };
     let commands = conditions.then(|| {
         let sites: Vec<Span> =
             lowered.pipelines.iter().flat_map(|p| p.sites.iter().copied()).collect();
@@ -1114,11 +1122,15 @@ fn summarize(
         .map(|out| {
             let (kind, parts) = match &out.key {
                 wrela_lower::PipelineKey::Compute { kernel, substs, .. } => {
-                    ("compute", vec![entry(*kernel, substs)])
+                    ("compute", vec![entry(*kernel, substs, consts_of(&out.key, 0))])
                 }
-                wrela_lower::PipelineKey::Render { vertex, fragment, .. } => {
-                    ("render", vec![entry(vertex.0, &vertex.1), entry(fragment.0, &fragment.1)])
-                }
+                wrela_lower::PipelineKey::Render { vertex, fragment, .. } => (
+                    "render",
+                    vec![
+                        entry(vertex.0, &vertex.1, consts_of(&out.key, 0)),
+                        entry(fragment.0, &fragment.1, consts_of(&out.key, 1)),
+                    ],
+                ),
             };
             let sites = out.sites.iter().map(|s| sources.file(s.file).location(s.start)).collect();
             PipelineSummary {

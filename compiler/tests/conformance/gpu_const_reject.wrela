@@ -1,0 +1,33 @@
+// rejects: gpu.const
+// A `const` parameter's value is a build-time constant written where the kernel is dispatched;
+// only an entry point has one, of a scalar WGSL can override.
+use std::gpu::{GlobalId, GpuBuffer, Slots, buffer, dispatch}
+
+@compute(64)
+fn fill(out: mut Slots<u32>, id: GlobalId, value: const u32) {
+    out[id] = value
+}
+
+@compute(64)
+fn wide(out: mut Slots<u32>, id: GlobalId, at: const vec2) { //~ E0602
+    out[id] = u32(at.x)
+}
+
+fn helper(x: const u32) -> u32 { //~ E0602
+    x
+}
+
+pub struct State {
+    n: u32,
+    out: GpuBuffer<u32>,
+}
+
+pub fn init() -> State {
+    State { n: 3, out: buffer(64) }
+}
+
+pub fn frame(s: mut State, time: f32, width: u32, height: u32) {
+    dispatch(fill.bind(out: mut s.out, value: s.n), groups: 1) //~ E0603
+    let bound = fill.bind(out: mut s.out, value: 4) //~ E0603
+    let _ = helper(2)
+}

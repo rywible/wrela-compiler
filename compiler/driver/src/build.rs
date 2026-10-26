@@ -212,6 +212,23 @@ fn emit_in(
                 "move work that its own pass can do there, or keep a big function a call (`ir::opt`)",
             ));
         }
+        // Each override's name as the WGSL writer wrote it, with its value from the pipeline's
+        // key; a CPU build's, as the module names it.
+        let names: Vec<String> = wgsl.as_ref().map_or_else(
+            || p.module.overrides.iter().map(|(n, _)| wrela_ir::ident(n)).collect(),
+            |w| w.overrides.clone(),
+        );
+        let constants = names
+            .into_iter()
+            .zip(&p.constants)
+            .map(|(name, &c)| {
+                let value = match c {
+                    wrela_sema::thir::ConstArg::Bool(b) => wrela_abi::manifest::Constant::Bool(b),
+                    c => wrela_abi::manifest::Constant::Number(c.number()),
+                };
+                (name, value)
+            })
+            .collect();
         if let Some(wgsl) = wgsl {
             files.push((shader.clone(), wgsl.text.into_bytes()));
         }
@@ -233,6 +250,7 @@ fn emit_in(
             debug_flag: p.debug_flag,
             requires,
             conditional: conditional.get(i).copied().unwrap_or(false),
+            constants,
         });
     }
     if let Err(e) = manifest.validate() {

@@ -266,6 +266,10 @@ pub const RULES: &[(&str, &str)] = &[
         "gpu.entry",
         "an entry point takes builtins, uniforms, buffers, textures, groups and outputs, and returns what its stage does",
     ),
+    (
+        "gpu.const",
+        "an entry point's `const` parameter is a `bool`, `u32`, `i32` or `f32` whose value is a build-time constant, written where it's dispatched or drawn",
+    ),
     ("gpu.cpu", "GPU builtins, derivatives and sampling only in GPU code"),
     ("gpu.workgroup", "a workgroup's size is within WebGPU's limits"),
     ("gpu.discard", "`discard()` drops a fragment, in fragment shaders only"),

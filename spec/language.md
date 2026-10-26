@@ -2115,6 +2115,23 @@ An entry point is a kernel or shader, marked `@compute(x, y, z)`, `@vertex` or `
 - a kernel's outputs (§18.4);
 - for a fragment shader, the vertex shader's output, and `mut Atomics<T>`, for example to count what it shades in a test. WebGPU gives a vertex shader no writable buffers, so a vertex shader's `mut Atomics<T>` is E0602.
 
+**`const` parameters** (rule `gpu.const`): an entry point's parameter may be `const`, a `bool`, `u32`, `i32` or `f32` written `taps: const u32`. Its value is the pipeline's, not the command's: each set of values an entry point is recorded with is a pipeline of its own, and its value is a WGSL pipeline-overridable constant (`override taps: u32;`, without an `@id`), which the host sets by name when it makes the pipeline (the manifest's `"constants": {"taps": 4}`). Inside the entry point it's an ordinary value, and a branch on it is a branch on a constant, which the driver's compiler drops where it makes the pipeline: a `Quality` switch that's a `const` parameter costs its shader nothing when off. The argument is a literal, a negated literal or a `const` item that holds one, written where the entry point is bound for the command, `dispatch(blur.bind(out: mut o, taps: 4), groups: n)` (E0603 for any other value, and for binding the entry point to a value of its own, `let k = blur.bind(...)`: the command names its pipeline). Only an entry point's parameter is `const`, and only of those four types (E0602). `wrela pipelines` lists each set as an instantiation, `blur::<taps = 4>`.
+
+```wrela
+@compute(64)
+pub fn blur(src: [f32], out: mut Slots<f32>, taps: const u32, id: GlobalId) {
+    var sum = 0.0
+    for k in 0..taps {
+        sum += src[min(id.x + k, src.len() - 1)]
+    }
+    out[id] = sum / f32(taps)
+}
+
+fn smooth(a: GpuBuffer<f32>, o: mut GpuBuffer<f32>) {
+    dispatch(blur.bind(src: a.items(), out: mut o, taps: 4), over: o.len()) // a pipeline per `taps`
+}
+```
+
 A fragment shader that writes a buffer runs before the depth test, because WGSL has no early fragment tests. So it also writes for fragments that the depth test then drops. To count what passes, the shader compares the fragment's depth itself.
 
 **Discard:** `std::gpu::discard()` drops the fragment that a fragment shader is shading. The fragment writes no colour and no depth, so a shader can cut leaves and grass from cards (an alpha test). The invocation goes on as a helper, so derivatives stay defined (WGSL's demotion). Anywhere but a fragment shader, or a function that only a fragment shader calls, it is E0607: a kernel, a vertex shader and CPU code have no fragment to drop.
@@ -3118,6 +3135,7 @@ Each rule of the conformance suite (`compiler/tests/conformance`), with what it 
 | `eff.clock` | Reading the clock is `nondet`, so `@deterministic` code takes its time as data | §17.3 |
 | `gpu.data` | Data that crosses to the GPU is `GpuData` | §18 |
 | `gpu.entry` | An entry point takes builtins, uniforms, buffers, textures, groups and outputs, and returns what its stage does | §18.1 |
+| `gpu.const` | An entry point's `const` parameter is a `bool`, `u32`, `i32` or `f32` whose value is a build-time constant, written where it's dispatched or drawn | §18.1 |
 | `gpu.cpu` | GPU builtins, derivatives and sampling only in GPU code | §18.1 |
 | `gpu.workgroup` | A workgroup's size is within WebGPU's limits | §18.1 |
 | `gpu.discard` | `discard()` drops a fragment, in fragment shaders only | §18.1 |

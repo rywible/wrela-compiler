@@ -383,6 +383,8 @@ enum Kind {
         cull: Cull,
         depth_bias: DepthBias,
         depth: DepthState,
+        /// Its pipeline-overridable constants (the manifest's `constants`), for each variant.
+        constants: Vec<(String, f64)>,
         variants: HashMap<Targets, wgpu::RenderPipeline>,
     },
     /// Its shader needs device features this device hasn't (the manifest's `requires`): the
@@ -1155,6 +1157,9 @@ impl Builder {
                 label: Some(&p.shader),
                 source: wgpu::ShaderSource::Wgsl(source.into()),
             });
+            let constants: Vec<(String, f64)> =
+                p.constants.iter().map(|(k, v)| (k.clone(), v.number())).collect();
+            let named: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
             match &p.stage {
                 Stage::Compute { entry, .. } => Kind::Compute(self.device.create_compute_pipeline(
                     &wgpu::ComputePipelineDescriptor {
@@ -1162,7 +1167,10 @@ impl Builder {
                         layout: Some(&pipeline_layout),
                         module: &module,
                         entry_point: Some(entry),
-                        compilation_options: Default::default(),
+                        compilation_options: wgpu::PipelineCompilationOptions {
+                            constants: &named,
+                            ..Default::default()
+                        },
                         cache: None,
                     },
                 )),
@@ -1185,6 +1193,7 @@ impl Builder {
                         cull: *cull,
                         depth_bias: *depth_bias,
                         depth: *depth,
+                        constants: constants.clone(),
                         variants: HashMap::new(),
                     };
                     // A variant for each of its targets (the passes the program draws it in, which
@@ -2638,12 +2647,14 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         cull,
         depth_bias,
         depth,
+        constants,
         variants,
         ..
     } = kind
     else {
         return;
     };
+    let named: Vec<(&str, f64)> = constants.iter().map(|(k, v)| (k.as_str(), *v)).collect();
     if variants.contains_key(&targets) {
         return;
     }
@@ -2676,7 +2687,10 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         vertex: wgpu::VertexState {
             module,
             entry_point: Some(vertex),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &named,
+                ..Default::default()
+            },
             buffers: &[],
         },
         // Triangle list, counter-clockwise front faces: WebGPU's defaults.
@@ -2693,7 +2707,10 @@ fn render_variant(device: &wgpu::Device, name: &str, kind: &mut Kind, targets: T
         fragment: Some(wgpu::FragmentState {
             module,
             entry_point: Some(fragment),
-            compilation_options: Default::default(),
+            compilation_options: wgpu::PipelineCompilationOptions {
+                constants: &named,
+                ..Default::default()
+            },
             targets: &colors,
         }),
         multiview_mask: None,
@@ -2989,6 +3006,7 @@ mod tests {
             debug_flag: None,
             requires: Vec::new(),
             conditional: false,
+            constants: Vec::new(),
         });
         let shader = "@group(0) @binding(0) var<storage, read_write> count: array<u32>;\n\
                       @compute @workgroup_size(1) fn increment() { count[0] += 1u; }";
@@ -3256,6 +3274,7 @@ mod tests {
             debug_flag: None,
             requires: Vec::new(),
             conditional: false,
+            constants: Vec::new(),
         };
         let key = pipeline_key(&p("pipeline_0.wgsl", "main"), "fn main() {}");
         assert_eq!(key, pipeline_key(&p("pipeline_3.wgsl", "main"), "fn main() {}"));

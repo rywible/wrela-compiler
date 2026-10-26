@@ -77,6 +77,11 @@ const CONTEXTS: &[Context] = &[
         ..NONE
     },
     Context { first: "use std::derive::Box3", ..NONE },
+    Context {
+        first: "@compute(64)",
+        items: "use std::gpu::{GlobalId, GpuBuffer, Slots, dispatch}",
+        ..NONE
+    },
     Context { first: "use std::input::{Key, Mods, Script}", ..NONE },
     Context { first: "pub struct Game {", ..NONE },
     Context { first: "pub enum Edit: Copy {", ..NONE },

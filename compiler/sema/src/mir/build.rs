@@ -1436,7 +1436,7 @@ impl<'a> Builder<'a> {
     /// where they're held.
     fn shader(&mut self, s: &thir::Shader) -> Option<Shader> {
         Some(match s {
-            thir::Shader::Named(f, args) => Shader::Named(*f, args.clone()),
+            thir::Shader::Named(f, args, consts) => Shader::Named(*f, args.clone(), consts.clone()),
             thir::Shader::Value(e) => Shader::Value(self.borrowed_place(e)?, e.span),
         })
     }

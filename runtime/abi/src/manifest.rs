@@ -182,6 +182,41 @@ pub struct Pipeline {
     /// (or at once, when a command needs it first).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub conditional: bool,
+    /// Its shaders' pipeline-overridable constants, each by its name in the WGSL: what the host
+    /// sets when it creates the pipeline (WebGPU's `constants`).
+    #[serde(skip_serializing_if = "Vec::is_empty", serialize_with = "constants_map")]
+    pub constants: Vec<(String, Constant)>,
+}
+
+/// A pipeline-overridable constant's value: a `bool`, or a number (a `u32`, `i32` or `f32`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Constant {
+    Bool(bool),
+    Number(f64),
+}
+
+impl Constant {
+    /// Its value as WebGPU's `constants` and wgpu's take it: a number, a bool 0 or 1.
+    pub fn number(self) -> f64 {
+        match self {
+            Constant::Bool(b) => f64::from(u8::from(b)),
+            Constant::Number(x) => x,
+        }
+    }
+}
+
+/// `constants` as a JSON object, in order.
+fn constants_map<S: serde::Serializer>(
+    constants: &[(String, Constant)],
+    s: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut m = s.serialize_map(Some(constants.len()))?;
+    for (k, v) in constants {
+        m.serialize_entry(k, v)?;
+    }
+    m.end()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1245,7 +1280,34 @@ mod read {
         })?;
         // A missing `conditional` is tier 0.
         let conditional = flag(o, "conditional", &place, false)?;
-        Ok(Pipeline { name, shader, stage, uniform, bindings, debug_flag, requires, conditional })
+        // Missing `constants` are none.
+        let constants = match o.get("constants") {
+            None => Vec::new(),
+            Some(v) => {
+                let cp = format!("{place}.constants");
+                let co = object(v, &cp)?;
+                co.iter()
+                    .map(|(k, v)| match v {
+                        Value::Bool(b) => Ok((k.clone(), Constant::Bool(*b))),
+                        Value::Number(n) if n.as_f64().is_some_and(f64::is_finite) => {
+                            Ok((k.clone(), Constant::Number(n.as_f64().unwrap_or(0.0))))
+                        }
+                        _ => fail(format!("{cp}.{k} must be true, false or a number")),
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            }
+        };
+        Ok(Pipeline {
+            name,
+            shader,
+            stage,
+            uniform,
+            bindings,
+            debug_flag,
+            requires,
+            conditional,
+            constants,
+        })
     }
 
     /// A manifest whose version has been checked.
@@ -1390,6 +1452,24 @@ mod tests {
 "#;
         assert_eq!(json, expected);
         assert_eq!(Manifest::parse(&json).expect("valid"), sample());
+    }
+
+    /// `constants` are optional, and round-trip as a JSON object.
+    #[test]
+    fn a_pipeline_may_set_constants() {
+        let mut m = sample();
+        m.pipelines[0].constants =
+            vec![("ambient".into(), Constant::Bool(true)), ("taps".into(), Constant::Number(4.0))];
+        let json = m.to_json();
+        assert!(
+            json.contains(
+                "\"constants\": {\n        \"ambient\": true,\n        \"taps\": 4.0\n      }"
+            ),
+            "{json}"
+        );
+        assert_eq!(Manifest::parse(&json).expect("valid"), m);
+        let bad = json.replace("\"taps\": 4.0", "\"taps\": \"4\"");
+        assert!(Manifest::parse(&bad).unwrap_err().to_string().contains("constants.taps"));
     }
 
     /// `conditional` (tier 1) is optional: a manifest without it is tier 0 throughout.

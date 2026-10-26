@@ -1472,3 +1472,17 @@ describe("pipeline tiers", () => {
     await executor.built;
   });
 });
+
+describe("pipeline constants", () => {
+  test("a compute pipeline and each stage of a render pipeline are made with the manifest's constants, by name", async () => {
+    const device = new FakeDevice();
+    const m = shapes();
+    m.pipelines[0] = { ...m.pipelines[0]!, constants: [["wide", true], ["taps", 4]] };
+    m.pipelines[1] = { ...m.pipelines[1]!, constants: [["gain", -1.5]] };
+    await Promise.all(buildPipelines(device.gpu, m, [SHADER, SHADER], SCREEN_FORMAT).each);
+    expect(device.computes[0]!.compute.constants).toEqual({ gain: -1.5 });
+    const desc = device.renders.find((r) => r.label === "draw");
+    expect(desc?.vertex.constants).toEqual({ wide: 1, taps: 4 });
+    expect(desc?.fragment?.constants).toEqual({ wide: 1, taps: 4 });
+  });
+});

@@ -2778,9 +2778,10 @@ impl<'d, 'u> Collector<'d, 'u> {
                         default: None,
                         span: *span,
                         is_self: true,
+                        is_const: false,
                     });
                 }
-                ast::Param::Named { name, mode, ty, default, span } => {
+                ast::Param::Named { name, mode, konst, ty, default, span } => {
                     if let Some(prev) = params.iter().find(|q| q.name == name.name) {
                         let ps = prev.span;
                         self.diags.push(
@@ -2820,6 +2821,7 @@ impl<'d, 'u> Collector<'d, 'u> {
                         default,
                         span: *span,
                         is_self: false,
+                        is_const: *konst,
                     });
                 }
             }

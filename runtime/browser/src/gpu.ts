@@ -76,6 +76,9 @@ interface RenderParts {
   depthBias: { constant: number; slope_scale: number; clamp: number };
   /** The manifest's `depth`: how fragments' depths are tested, and whether they're kept. */
   depth: { compare: GPUCompareFunction; write: boolean };
+  /** The pipeline-overridable constants each stage is created with (the manifest's
+   * `constants`, by name). */
+  constants: Record<string, number>;
   /** By target formats: `colours|depth`, the colours joined by commas, each a format or `none`. */
   variants: Map<string, GPURenderPipeline>;
 }
@@ -135,7 +138,7 @@ function renderDescriptor(
   return {
     label: name,
     layout: parts.layout,
-    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [] },
+    vertex: { module: parts.module, entryPoint: parts.vertex, buffers: [], constants: parts.constants },
     // Triangle list, counter-clockwise front faces (the default).
     primitive: { topology: "triangle-list", cullMode: parts.cull },
     ...(depth === null
@@ -153,12 +156,18 @@ function renderDescriptor(
     fragment: {
       module: parts.module,
       entryPoint: parts.fragment,
+      constants: parts.constants,
       targets: colors.map((format, c) => {
         const blend = BLENDS[parts.blends[c] ?? "replace"];
         return blend === null ? { format } : { format, blend: blend as GPUBlendState };
       }),
     },
   };
+}
+
+/** A pipeline's constants as WebGPU takes them: each a number by its name (a bool 0 or 1). */
+export function pipelineConstants(p: Pipeline): Record<string, number> {
+  return Object.fromEntries(p.constants.map(([name, v]) => [name, typeof v === "boolean" ? Number(v) : v]));
 }
 
 /** A colour texture binding's format, which the manifest's parser requires of it. */
@@ -284,7 +293,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
       compute = await device.createComputePipelineAsync({
         label: p.name,
         layout: pipelineLayout,
-        compute: { module, entryPoint: p.entry },
+        compute: { module, entryPoint: p.entry, constants: pipelineConstants(p) },
       });
     } else {
       render = {
@@ -296,6 +305,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
         cull: p.cull,
         depthBias: p.depth_bias,
         depth: p.depth,
+        constants: pipelineConstants(p),
         variants: new Map(),
       };
       // A variant for each of its targets (the passes the program draws it in, which the

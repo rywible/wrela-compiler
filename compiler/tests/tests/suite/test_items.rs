@@ -788,6 +788,20 @@ fn a_mostly_zero_constant_costs_its_bytes_only() {
     assert!(bytes < 65_536 / 4, "{bytes} bytes of data");
 }
 
+/// `const` parameters (compiler/tests/overrides, language.md §18.1): a kernel dispatched with
+/// two sets of constants is two pipelines, each made with its own, and both hosts compute what
+/// each set says; the microbench (compiler/tests/override_bench) times the `const` form and a
+/// uniform-branch twin. And pipeline tiers (compiler/tests/tiers): a tier-1 pipeline a frame
+/// needs first is made at once, on both hosts.
+#[test]
+#[ignore = "needs a GPU"]
+fn const_parameters_and_tiers_run_on_both_hosts() {
+    for (pkg, n) in [("overrides", 1), ("override_bench", 1), ("tiers", 1)] {
+        let dir = wrela_tests::repo_root().join("compiler/tests").join(pkg);
+        assert_eq!(crate::tests_pass(&dir), n, "{pkg}");
+    }
+}
+
 /// Constants that hold `Text`, read by GPU code (M6, AC15): compiler/tests/gpu-constants has a
 /// kernel read a table of sites, each a place, a height and a name, written as a literal and
 /// computed by the build; it reads back what the CPU computes from the same tables. Spike 17

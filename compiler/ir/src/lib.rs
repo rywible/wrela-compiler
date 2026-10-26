@@ -659,6 +659,9 @@ pub enum Expr {
     /// A GPU builtin input of the entry point (`@builtin(...)`), by index into the entry's
     /// inputs, as the std struct that holds it (`GlobalId`, `FragCoord`, ...).
     EntryInput(u32),
+    /// A pipeline-overridable constant of the module (GPU only), by index into
+    /// [`Module::overrides`]: an entry point's `const` parameter, whose value the pipeline sets.
+    Override(u32),
     /// A by-value parameter.
     Param(u32),
 }
@@ -935,6 +938,9 @@ pub struct Module {
     pub types: Types,
     pub functions: Vec<Function>,
     pub resources: Vec<Resource>,
+    /// GPU only: the pipeline-overridable constants (WGSL's `override`), each its name and
+    /// scalar type, which the pipeline sets by name.
+    pub overrides: Vec<(String, Scalar)>,
     pub entry_points: Vec<EntryPoint>,
     /// CPU only: functions exported from the WASM, by name.
     pub exports: Vec<(String, FuncId)>,

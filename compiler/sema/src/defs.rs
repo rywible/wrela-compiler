@@ -817,6 +817,9 @@ pub struct ParamSig {
     pub span: Span,
     /// The receiver, `self`.
     pub is_self: bool,
+    /// `name: const T`: a GPU entry point's build-time constant, a pipeline-overridable
+    /// constant of its pipeline (§18.1).
+    pub is_const: bool,
 }
 
 /// Which host runs a build (language.md §15.3): a client's (the browser's, with a screen), a

@@ -48,7 +48,7 @@ generic_param    ::= IDENT (":" bounds)? | "const" IDENT ":" type
 bounds           ::= bound ("+" bound)*
 bound            ::= path_type | fn_type
 params           ::= param ("," param)* ","?
-param            ::= mode? "self" | IDENT ":" mode? trait_type ("=" expr)?
+param            ::= mode? "self" | IDENT ":" "const"? mode? trait_type ("=" expr)?
 mode             ::= "mut" | "take"
 ret_type         ::= "->" ("borrow" | "mut")? trait_type
 # Where a trait names a type (a parameter's or a return type), traits can be joined with `+`.

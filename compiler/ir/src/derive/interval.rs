@@ -1681,7 +1681,11 @@ impl<'a> Ivx<'a> {
                     (self.select(out, *cond, t.0, f.0), self.select(out, *cond, t.1, f.1))
                 }
             }
-            Expr::Const(_) | Expr::Zero(_) | Expr::EntryInput(_) | Expr::ArrayLength(_) => {
+            Expr::Const(_)
+            | Expr::Zero(_)
+            | Expr::EntryInput(_)
+            | Expr::Override(_)
+            | Expr::ArrayLength(_) => {
                 return Err(Error::internal("a constant marked active"));
             }
             Expr::Call(..) => unreachable!("calls are handled in `call_fn`"),
