@@ -49,6 +49,8 @@ p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"]
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 rsa = { version = "0.9", default-features = false, features = ["std", "sha2"] }
 getrandom = "0.3"
+# The servers' gzip at serve time (`loopback::get_file`): already the CLI's, for toolchains.
+flate2 = "1"
 wgpu = { version = "30", default-features = false, features = ["std", "parking_lot", "metal", "vulkan", "dx12", "wgsl"], optional = true }
 pollster = { version = "0.4", optional = true }
 

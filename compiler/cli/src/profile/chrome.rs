@@ -96,8 +96,12 @@ pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String
     .map_err(|_| "Chrome's results are incomplete")?;
     // The paced run: CPU times, phases and frame intervals as a player sees them.
     let fragment = format!("#test{}&paced=1&inflight=2&nohash=1", common(a));
-    let [framed] = <[Value; 1]>::try_from(run_page(built, &fragment, frames, &["frames.json"])?)
-        .map_err(|_| "Chrome's paced results are incomplete")?;
+    let [framed, load] =
+        <[Value; 2]>::try_from(run_page(built, &fragment, frames, &["frames.json", "load.json"])?)
+            .map_err(|_| "Chrome's paced results are incomplete")?;
+    // What the page loaded, as the wire carried it (`transferSize`: compressed where served so).
+    let resources = load["resources"].as_array().cloned().unwrap_or_default();
+    let loaded = (resources.iter().filter_map(|r| r["bytes"].as_u64()).sum(), resources.len());
     let warmup = a.warmup as usize;
     let timings: Vec<wrela_host::GpuTiming> = timings
         .as_array()
@@ -164,6 +168,7 @@ pub(super) fn measure(a: &Args, built: &Path) -> Result<(Profile, Value), String
             counters,
             phases: wrela_host::Traced { lines: Vec::new(), phases },
             wgsl: super::wgsl(built)?,
+            loaded: Some(loaded),
         },
         device,
     ))

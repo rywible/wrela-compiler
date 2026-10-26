@@ -446,6 +446,7 @@ fn connection(
                 crate::loopback::Caching::Revalidate {
                     if_none_match: head.if_none_match.as_deref(),
                 },
+                head.gzip,
             )
         }
         "PUT" => match head.path.strip_prefix("/results/") {

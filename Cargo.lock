@@ -3693,6 +3693,7 @@ version = "0.8.0"
 dependencies = [
  "cap-std",
  "ed25519-dalek",
+ "flate2",
  "getrandom 0.3.4",
  "libc",
  "p256",

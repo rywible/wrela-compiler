@@ -73,6 +73,8 @@ pub struct Head {
     pub session: Option<String>,
     /// The request's `If-None-Match`: the tag of the copy the browser holds.
     pub if_none_match: Option<String>,
+    /// Whether the request's `Accept-Encoding` lists `gzip`.
+    pub gzip: bool,
 }
 
 impl Head {
@@ -123,6 +125,7 @@ pub fn read_head(
     let (mut host, mut origin, mut framed) = (String::new(), None::<String>, false);
     let mut session = None;
     let mut if_none_match = None;
+    let mut gzip = false;
     loop {
         let Some(h) = line(reader)? else {
             too_long(out)?;
@@ -145,6 +148,8 @@ pub fn read_head(
                 session = Some(v.to_string());
             } else if k.eq_ignore_ascii_case("if-none-match") {
                 if_none_match = Some(v.to_string());
+            } else if k.eq_ignore_ascii_case("accept-encoding") {
+                gzip = accepts_gzip(v);
             }
         }
     }
@@ -177,6 +182,7 @@ pub fn read_head(
         length,
         session,
         if_none_match,
+        gzip,
     }))
 }
 
@@ -246,6 +252,7 @@ fn head_with(
     kind: &str,
     len: u64,
     tag: Option<&str>,
+    gzipped: bool,
 ) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
@@ -262,10 +269,13 @@ fn head_with(
         504 => "Gateway Timeout",
         _ => "Error",
     };
-    let cache = match tag {
+    let mut cache = match tag {
         Some(tag) => format!("Cache-Control: no-cache\r\nETag: {tag}"),
         None => "Cache-Control: no-store".to_string(),
     };
+    if gzipped {
+        cache.push_str("\r\nContent-Encoding: gzip\r\nVary: Accept-Encoding");
+    }
     write!(
         out,
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {kind}\r\nContent-Length: {len}\r\n{cache}\r\nCross-Origin-Opener-Policy: same-origin\r\nCross-Origin-Embedder-Policy: require-corp\r\nCross-Origin-Resource-Policy: same-origin\r\nConnection: close\r\n\r\n",
@@ -273,7 +283,97 @@ fn head_with(
 }
 
 fn head(out: &mut dyn Write, status: u16, kind: &str, len: u64) -> std::io::Result<()> {
-    head_with(out, status, kind, len, None)
+    head_with(out, status, kind, len, None, false)
+}
+
+/// Whether an `Accept-Encoding` value lists gzip (and doesn't refuse it with `q=0`).
+fn accepts_gzip(value: &str) -> bool {
+    value.split(',').any(|coding| {
+        let mut parts = coding.split(';').map(str::trim);
+        let named = parts.next().is_some_and(|c| c.eq_ignore_ascii_case("gzip") || c == "*");
+        let refused = parts.any(|p| {
+            p.strip_prefix("q=").is_some_and(|q| q.parse::<f32>().is_ok_and(|q| q == 0.0))
+        });
+        named && !refused
+    })
+}
+
+/// Whether a response of this media type is worth compressing: the build's code, shaders and
+/// data (WASM, text, JSON, scripts), not images, which are compressed already.
+fn compressible(kind: &str) -> bool {
+    kind == "application/wasm" || kind == "application/json" || kind.starts_with("text/")
+}
+
+/// The most bytes of compressed files [`gzipped`] keeps, across every server in the process.
+const MAX_COMPRESSED: usize = 256 << 20;
+
+/// A file's identity and version: its device, its inode, its length and when it changed.
+type Version = (u64, u64, u64, u128);
+
+/// The compressed files kept, by the file's identity and version, oldest first; their bytes.
+#[derive(Default)]
+struct Compressed {
+    files: std::collections::VecDeque<(Version, std::sync::Arc<Vec<u8>>)>,
+    bytes: usize,
+}
+
+static COMPRESSED: std::sync::Mutex<Compressed> =
+    std::sync::Mutex::new(Compressed { files: std::collections::VecDeque::new(), bytes: 0 });
+
+/// How many times a server has compressed a file (a test's counter).
+static COMPRESSIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many times the process's servers have compressed a file.
+pub fn compressions() -> u64 {
+    COMPRESSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `bytes` compressed with gzip at level 6.
+fn gzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+    COMPRESSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut encoder = flate2::write::GzEncoder::new(
+        Vec::with_capacity(bytes.len() / 3),
+        flate2::Compression::new(6),
+    );
+    encoder.write_all(bytes)?;
+    encoder.finish()
+}
+
+/// The file `file` (whose metadata is `meta`, at most `len` bytes of it read), gzipped: from
+/// the process's cache when the same file at the same version was compressed before, so a
+/// second load costs no compression. Nothing is written to disk.
+fn gzipped(
+    file: &mut dyn Read,
+    meta: &std::fs::Metadata,
+    len: u64,
+) -> std::io::Result<std::sync::Arc<Vec<u8>>> {
+    use std::os::unix::fs::MetadataExt;
+    let written = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos());
+    let key = (meta.dev(), meta.ino(), len, written);
+    let lock = || COMPRESSED.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((_, bytes)) = lock().files.iter().find(|(k, _)| *k == key) {
+        return Ok(bytes.clone());
+    }
+    let mut plain = Vec::with_capacity(len as usize);
+    file.take(len).read_to_end(&mut plain)?;
+    if (plain.len() as u64) < len {
+        return Err(std::io::Error::other("the file was cut short as it was read"));
+    }
+    let bytes = std::sync::Arc::new(gzip(&plain)?);
+    let mut kept = lock();
+    if bytes.len() <= MAX_COMPRESSED {
+        kept.bytes += bytes.len();
+        kept.files.push_back((key, bytes.clone()));
+        while kept.bytes > MAX_COMPRESSED {
+            let Some((_, old)) = kept.files.pop_front() else { break };
+            kept.bytes -= old.len();
+        }
+    }
+    Ok(bytes)
 }
 
 /// A file's version, as an entity tag: its length and when it was last written.
@@ -304,6 +404,7 @@ pub fn get_file(
     rel: &str,
     page: Option<&dyn Fn(&str) -> String>,
     caching: Caching,
+    gzip_ok: bool,
 ) -> std::io::Result<()> {
     let not_found = |out: &mut dyn Write| respond(out, 404, "text/plain", b"not found");
     // Decoded once before it's checked or opened: checking the encoded spelling would let
@@ -316,11 +417,18 @@ pub fn get_file(
     let (name, above) = parts.split_last().expect("a path has a part");
     let file = crate::confined::open_dir(dir, above, false)
         .and_then(|at| crate::confined::open_file(&at, name, false));
-    let Ok(file) = file else { return not_found(out) };
+    let Ok(mut file) = file else { return not_found(out) };
     if let (Some(page), "index.html") = (page, rel.as_str()) {
         let mut bytes = Vec::new();
         file.take(MAX_BODY as u64).read_to_end(&mut bytes)?;
-        return respond(out, 200, mime(&rel), page(&String::from_utf8_lossy(&bytes)).as_bytes());
+        let body = page(&String::from_utf8_lossy(&bytes)).into_bytes();
+        if gzip_ok {
+            let body = gzip(&body)?;
+            head_with(out, 200, mime(&rel), body.len() as u64, None, true)?;
+            out.write_all(&body)?;
+            return out.flush();
+        }
+        return respond(out, 200, mime(&rel), &body);
     }
     let meta = file.metadata()?;
     let len = meta.len();
@@ -329,13 +437,20 @@ pub fn get_file(
         Caching::Revalidate { if_none_match } => {
             let tag = tag_of(&meta);
             if if_none_match.is_some_and(|held| held.split(',').any(|t| t.trim() == tag)) {
-                head_with(out, 304, mime(&rel), 0, Some(&tag))?;
+                head_with(out, 304, mime(&rel), 0, Some(&tag), false)?;
                 return out.flush();
             }
             Some(tag)
         }
     };
-    head_with(out, 200, mime(&rel), len, tag.as_deref())?;
+    // Compressed as it's served, never as a file: the release's edge compresses the same types.
+    if gzip_ok && compressible(mime(&rel)) {
+        let body = gzipped(&mut file, &meta, len)?;
+        head_with(out, 200, mime(&rel), body.len() as u64, tag.as_deref(), true)?;
+        out.write_all(&body)?;
+        return out.flush();
+    }
+    head_with(out, 200, mime(&rel), len, tag.as_deref(), false)?;
     // At most the length the head gave, though the file grows meanwhile.
     let sent = std::io::copy(&mut file.take(len), out)?;
     if sent < len {
@@ -457,9 +572,61 @@ mod tests {
     }
 
     fn get(dir: &Dir, rel: &str, caching: Caching) -> String {
+        String::from_utf8_lossy(&get_bytes(dir, rel, caching, false)).into_owned()
+    }
+
+    fn get_bytes(dir: &Dir, rel: &str, caching: Caching, gzip: bool) -> Vec<u8> {
         let mut out = Vec::new();
-        get_file(&mut out, dir, rel, None, caching).expect("answered");
-        String::from_utf8_lossy(&out).into_owned()
+        get_file(&mut out, dir, rel, None, caching, gzip).expect("answered");
+        out
+    }
+
+    /// A response's head and body.
+    fn split(response: &[u8]) -> (String, &[u8]) {
+        let at = response.windows(4).position(|w| w == b"\r\n\r\n").expect("a head") + 4;
+        (String::from_utf8_lossy(&response[..at]).into_owned(), &response[at..])
+    }
+
+    /// A request that accepts gzip gets the file gzipped, with its inner type, `Vary` and the
+    /// compressed length; one that doesn't gets the plain bytes; an image is never compressed;
+    /// and a second load of the same file at the same version compresses nothing.
+    #[test]
+    fn files_are_gzipped_at_serve_time_where_the_request_accepts_it() {
+        use std::io::Read;
+        let wasm: Vec<u8> = (0..200_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+        let (root, dir) = served("gzip", "game.wasm", &wasm);
+        std::fs::write(root.join("a.png"), b"not really a png").expect("png");
+        let before = compressions();
+        let caching = Caching::Revalidate { if_none_match: None };
+        let response = get_bytes(&dir, "game.wasm", caching, true);
+        let (head, body) = split(&response);
+        assert!(head.contains("Content-Encoding: gzip\r\n"), "{head}");
+        assert!(head.contains("Vary: Accept-Encoding\r\n"), "{head}");
+        assert!(head.contains("Content-Type: application/wasm\r\n"), "{head}");
+        assert!(head.contains(&format!("Content-Length: {}\r\n", body.len())), "{head}");
+        assert!(body.len() < wasm.len() / 3, "{} of {} bytes", body.len(), wasm.len());
+        let mut plain = Vec::new();
+        flate2::read::GzDecoder::new(body).read_to_end(&mut plain).expect("gunzips");
+        assert_eq!(plain, wasm);
+        let again = get_bytes(&dir, "game.wasm", caching, true);
+        assert_eq!(split(&again).1, body);
+        assert_eq!(compressions() - before, 1, "the second load is compressed from the cache");
+        let unasked = get_bytes(&dir, "game.wasm", caching, false);
+        let (head, body) = split(&unasked);
+        assert!(!head.contains("Content-Encoding"), "{head}");
+        assert_eq!(body, wasm);
+        let image = get_bytes(&dir, "a.png", caching, true);
+        assert!(!split(&image).0.contains("Content-Encoding"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accept_encoding_is_read_with_its_weights() {
+        assert!(accepts_gzip("gzip, deflate, br, zstd"));
+        assert!(accepts_gzip("br;q=1.0, gzip;q=0.8"));
+        assert!(accepts_gzip("*"));
+        assert!(!accepts_gzip("gzip;q=0, br"));
+        assert!(!accepts_gzip("br, identity"));
     }
 
     /// A file the browser may keep is sent with its tag, and asked for again with that tag it's

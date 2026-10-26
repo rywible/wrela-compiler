@@ -166,3 +166,15 @@ fn each_frozen_programs_manifest_states_its_wasm_interface() {
         assert_eq!(stated, Some(abi), "{name}, optimized");
     }
 }
+
+/// A build writes no compressed files: the toolchain's servers compress as they serve, and a
+/// release's edge does the same (plan D26).
+#[test]
+fn a_build_holds_no_compressed_files() {
+    let dir = built("frozen/hello-field");
+    let compressed: Vec<_> = wrela_tests::files_under(&dir, &[])
+        .into_iter()
+        .filter(|f| f.extension().is_some_and(|e| e == "br" || e == "gz"))
+        .collect();
+    assert!(compressed.is_empty(), "{compressed:?}");
+}

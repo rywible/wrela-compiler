@@ -465,6 +465,7 @@ fn connection(
                 &rel,
                 None,
                 loopback::Caching::Revalidate { if_none_match: head.if_none_match.as_deref() },
+                head.gzip,
             )
         }
         "PUT" => {

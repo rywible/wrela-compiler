@@ -173,6 +173,9 @@ struct Profile {
     phases: wrela_host::Traced,
     /// Each pipeline's name and WGSL bytes, the largest first.
     wgsl: Vec<(String, u64)>,
+    /// Chrome's: the bytes the page loaded over the wire (compressed where the server
+    /// compressed them), and how many files.
+    loaded: Option<(u64, usize)>,
 }
 
 /// A time over the frames, ms: the median and the 95th percentile.
@@ -428,6 +431,7 @@ fn measure(
         frame: Times::of(calls).unwrap_or_default(),
         phases,
         wgsl: wgsl(built)?,
+        loaded: None,
     })
 }
 
@@ -596,6 +600,9 @@ fn text(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
     for (name, v) in &p.counters {
         s.push_str(&format!("  {:<32} {:>9}\n", name.replace('_', " "), v));
     }
+    if let Some((bytes, files)) = p.loaded {
+        s.push_str(&format!("\nloaded: {} over the wire, in {files} files\n", kib(bytes)));
+    }
     let total: u64 = p.wgsl.iter().map(|(_, b)| b).sum();
     s.push_str(&format!(
         "\nWGSL: {}, {} in all\n",
@@ -665,6 +672,9 @@ fn json(a: &Args, p: &Profile, baseline: Option<&Baseline>) -> String {
         "counters": counters,
         "wgsl": wgsl,
     });
+    if let Some((bytes, files)) = p.loaded {
+        all["loaded"] = serde_json::json!({ "bytes": bytes, "files": files });
+    }
     if let Some(i) = p.interval {
         all["cpu"]["frame_interval_ms"] = i.median.into();
         all["cpu"]["frame_interval_p95_ms"] = i.p95.into();
