@@ -73,6 +73,7 @@ struct Args {
     log: Option<PathBuf>,
     replay: Option<PathBuf>,
     workers: u32,
+    relaxed: bool,
 }
 
 fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
@@ -95,6 +96,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
         log: None,
         replay: None,
         workers: 0,
+        relaxed: false,
     };
     while let Some(arg) = argv.next() {
         let mut value = |flag: &str| argv.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -130,7 +132,7 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--timestamps" => args.timestamps = true,
             "--serial" => args.serial = true,
             "--no-gpu" => args.no_gpu = true,
-            "--relaxed" => wrela_host::load_relaxed_simd(),
+            "--relaxed" => args.relaxed = true,
             "-h" | "--help" => return Err(USAGE.into()),
             flag if flag.starts_with("--") => {
                 return Err(format!("unknown option {flag}\n\n{USAGE}"));
@@ -210,7 +212,7 @@ fn replay(args: &Args, path: &PathBuf) -> Result<(), Failure> {
     let bytes = std::fs::read(path).map_err(|e| wrela_host::Error::io(path, e))?;
     let log = TickLog::decode(&bytes)
         .map_err(|e| wrela_host::Error::Program(format!("{}: {e}", path.display())))?;
-    let built = CpuBuild::load(&args.dir)?;
+    let built = CpuBuild::load_choosing(&args.dir, args.relaxed)?;
     let n = built.replay(&log, args.workers).map_err(Failure::Replay)?;
     println!("{n} ticks replayed: every state hash is the log's");
     Ok(())
@@ -219,7 +221,7 @@ fn replay(args: &Args, path: &PathBuf) -> Result<(), Failure> {
 /// `--no-gpu`: the ticks alone.
 fn ticks_alone(args: &Args) -> Result<(), Failure> {
     let script = read_script(args)?;
-    let built = CpuBuild::load(&args.dir)?;
+    let built = CpuBuild::load_choosing(&args.dir, args.relaxed)?;
     let log = built.record_ticks(args.ticks.unwrap_or(0), &script, args.workers)?;
     println!("first {}", wrela_abi::hash::hex(log.first));
     for (k, t) in log.ticks.iter().enumerate() {
@@ -236,7 +238,8 @@ fn ticks_alone(args: &Args) -> Result<(), Failure> {
 fn still(args: &Args, until: &str) -> Result<(), Failure> {
     use wrela_host::{Host, Options};
     let script = read_script(args)?;
-    let options = Options { workers: args.workers, ..Options::default() };
+    let options =
+        Options { workers: args.workers, relaxed_simd: args.relaxed, ..Options::default() };
     let mut host = Host::load_with(&args.dir, &options)?;
     let (w, h) = args.size;
     let run = host.run_lockstep_until(args.frames, args.fps, w, h, &script, until)?;
@@ -267,7 +270,13 @@ fn frames(args: &Args) -> Result<(), Failure> {
         // --serial says how --timestamps times: alone, it asks for nothing.
         (false, _) => Timing::Off,
     };
-    let options = Options { timing, workers: args.workers, defer_init: true, ..Options::default() };
+    let options = Options {
+        timing,
+        workers: args.workers,
+        defer_init: true,
+        relaxed_simd: args.relaxed,
+        ..Options::default()
+    };
     let mut host = Host::load_with(&args.dir, &options)?;
     let logging = args.log.is_some();
     host.want_hashes(logging);

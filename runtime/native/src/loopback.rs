@@ -366,12 +366,7 @@ fn gzipped(
     len: u64,
 ) -> std::io::Result<std::sync::Arc<Vec<u8>>> {
     use std::os::unix::fs::MetadataExt;
-    let written = meta
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    let key = (meta.dev(), meta.ino(), len, written);
+    let key = (meta.dev(), meta.ino(), len, written(meta));
     let lock = || COMPRESSED.lock().unwrap_or_else(|p| p.into_inner());
     if let Some((_, bytes)) = lock().files.iter().find(|(k, _)| *k == key) {
         return Ok(bytes.clone());
@@ -396,12 +391,16 @@ fn gzipped(
 
 /// A file's version, as an entity tag: its length and when it was last written.
 fn tag_of(meta: &std::fs::Metadata) -> String {
-    let written = meta
-        .modified()
+    format!("\"{:x}-{:x}\"", meta.len(), written(meta))
+}
+
+/// When a file was last written, in nanoseconds since 1970 (0 if the system can't say): its
+/// version, with its length, for the gzip cache and the entity tag alike.
+fn written(meta: &std::fs::Metadata) -> u128 {
+    meta.modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or(0, |d| d.as_nanos());
-    format!("\"{:x}-{written:x}\"", meta.len())
+        .map_or(0, |d| d.as_nanos())
 }
 
 /// An HTTP response of `body`.
@@ -441,10 +440,7 @@ pub fn get_file(
         file.take(MAX_BODY as u64).read_to_end(&mut bytes)?;
         let body = page(&String::from_utf8_lossy(&bytes)).into_bytes();
         if gzip_ok {
-            let body = gzip(&body)?;
-            head_with(out, 200, mime(&rel), body.len() as u64, None, true)?;
-            out.write_all(&body)?;
-            return out.flush();
+            return send_gzipped(out, mime(&rel), &gzip(&body)?, None);
         }
         return respond(out, 200, mime(&rel), &body);
     }
@@ -463,10 +459,7 @@ pub fn get_file(
     };
     // Compressed as it's served, never as a file: the release's edge compresses the same types.
     if gzip_ok && compressible(mime(&rel)) {
-        let body = gzipped(&mut file, &meta, len)?;
-        head_with(out, 200, mime(&rel), body.len() as u64, tag.as_deref(), true)?;
-        out.write_all(&body)?;
-        return out.flush();
+        return send_gzipped(out, mime(&rel), &gzipped(&mut file, &meta, len)?, tag.as_deref());
     }
     head_with(out, 200, mime(&rel), len, tag.as_deref(), false)?;
     // At most the length the head gave, though the file grows meanwhile.
@@ -474,6 +467,18 @@ pub fn get_file(
     if sent < len {
         return Err(std::io::Error::other("the file was cut short as it was sent"));
     }
+    out.flush()
+}
+
+/// A 200 of `body`, gzipped, of type `kind`, with its entity tag if it has one.
+fn send_gzipped(
+    out: &mut dyn Write,
+    kind: &str,
+    body: &[u8],
+    tag: Option<&str>,
+) -> std::io::Result<()> {
+    head_with(out, 200, kind, body.len() as u64, tag, true)?;
+    out.write_all(body)?;
     out.flush()
 }
 

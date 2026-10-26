@@ -928,6 +928,8 @@ export class GpuExecutor {
   /** How the screen is shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it: bit 0 HDR, bit 1
    * Display P3. It changes once a `ConfigureScreen` is done. */
   screenState = 0;
+  /** The screen a `ConfigureScreen` under way changes to, if one is. */
+  #screenWanted: number | undefined;
 
   /** A variant of each render pipeline that draws the screen, in `format`: what showing the
    * screen in another format needs first. Every pipeline is started, so none is built later in
@@ -1364,6 +1366,9 @@ export class GpuExecutor {
         if (show === undefined) return;
         const format: GPUTextureFormat = cmd.hdr ? "rgba16float" : show.sdr;
         const want = (cmd.hdr ? 1 : 0) | (cmd.gamut === 1 ? 2 : 0);
+        // Asked again for what it shows, or what it's changing to: nothing to do.
+        if (want === (this.#screenWanted ?? this.screenState)) return;
+        this.#screenWanted = want;
         // The frames go on in the old format until every pipeline that draws the screen can
         // draw it in the new one; then, between frames, the canvas changes.
         this.screenVariants(format).then(() => {
@@ -1372,6 +1377,7 @@ export class GpuExecutor {
             this.screen.format = format;
             this.screenState = want;
           }
+          if (this.#screenWanted === want) this.#screenWanted = undefined;
         }, (e: unknown) => this.#fail(e));
         return;
       }

@@ -222,24 +222,9 @@ impl Op {
 }
 
 fn precision(a: &Args) -> Result<serde_json::Value, String> {
-    let dir = &a.dir;
-    let package = wrela_driver::manifest::name_in(dir)
-        .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
-    let glue_dir = dir.join("build").join("precision");
-    crate::generated_path(dir, &glue_dir)?;
-    wrela_driver::ensure_no_symlinks(&glue_dir, ["wrela.toml", "main.wrela"])
-        .map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
-    std::fs::write(
-        glue_dir.join("wrela.toml"),
-        format!(
-            "[package]\nname = \"precision\"\n\n[dependencies]\n{package} = {{ path = \"../..\" }}\n"
-        ),
-    )
-    .map_err(|e| e.to_string())?;
     let dims = a.boxes[0].len();
-    std::fs::write(glue_dir.join("main.wrela"), glue(&package, &a.function, dims))
-        .map_err(|e| e.to_string())?;
+    let (glue_dir, _) =
+        crate::glue_package(&a.dir, "precision", |package| glue(package, &a.function, dims))?;
     let out = wrela_driver::build(&glue_dir);
     let built = glue_dir.join("out");
     crate::write_build(&out, &built)?;
@@ -430,7 +415,8 @@ pub fn corners(t: f32) -> f32 {
             (&hash["verdict"], &hash["why"], &hash["integer"]),
             (&"unsafe".into(), &"range".into(), &true.into())
         );
-        assert!(hash["at"].as_str().unwrap().starts_with("<std::field>:"), "{hash}");
+        // `hash_u32` in std::field, and `pcg`, which it ends with, in std::hash.
+        assert!(hash["at"].as_str().unwrap().starts_with("<std::"), "{hash}");
         // A mix rounds three times, each against |a| + |b| (up to 2 here): 4 ulps of that,
         // 3.9e-3 at a half float's, is `watch` at 1e-3 and `safe` at 5e-3.
         let r = report("corners", "shapes::corners", &["0..1"]);

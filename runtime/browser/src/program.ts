@@ -205,8 +205,11 @@ const IMPORTS = new Map<string, string>(HOST_FUNCTIONS);
 export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): MemoryLimits {
   if (abi === null) throw new ProgramError("its manifest doesn't state its WASM's interface (`wasm_abi`)");
   const imported = WebAssembly.Module.imports(module);
-  const exported = WebAssembly.Module.exports(module).filter((e) => e.kind === "function");
-  const kindOf = (ty: string) => (ty.startsWith("(") ? "function" : ty);
+  const all = WebAssembly.Module.exports(module);
+  const exported = all.filter((e) => e.kind === "function");
+  // A function's type is written `(i32, i32) -> ()`; another import's is its kind.
+  const isFunction = (ty: string) => ty.startsWith("(");
+  const kindOf = (ty: string) => (isFunction(ty) ? "function" : ty);
   const same =
     imported.length === abi.imports.length &&
     imported.every((imp, i) => {
@@ -216,21 +219,18 @@ export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): Memor
     exported.length === abi.exports.length &&
     exported.every((e, i) => e.name === abi.exports[i]![0]);
   if (!same) throw new ProgramError("its manifest's `wasm_abi` doesn't describe its WASM");
-  const types = {
-    imports: abi.imports.map(([, , ty]) => (ty.startsWith("(") ? ty : null)),
-    exports: new Map(abi.exports.map(([name, ty]) => [name, ty])),
-    memories: new Map<number, MemoryLimits>(),
+  const importType = (i: number) => {
+    const ty = abi.imports[i]![2];
+    return isFunction(ty) ? ty : null;
   };
-  imported.forEach((imp, i) => {
-    if (imp.module === IMPORT_MODULE && imp.name === IMPORT_MEMORY && abi.memory !== null) types.memories.set(i, abi.memory);
-  });
+  const exportTypes = new Map(abi.exports.map(([name, ty]) => [name, ty]));
   let memory: MemoryLimits | null = null;
-  WebAssembly.Module.imports(module).forEach((imp, i) => {
+  imported.forEach((imp, i) => {
     const name = `${imp.module}.${imp.name}`;
     if (imp.module === IMPORT_MODULE && imp.name === IMPORT_MEMORY) {
-      const limits = types.memories.get(i);
+      const limits = abi.memory;
       if (imp.kind !== "memory" || !limits?.shared) {
-        const what = imp.kind === "function" ? `a function ${types.imports[i]}` : `a ${imp.kind}`;
+        const what = imp.kind === "function" ? `a function ${importType(i)}` : `a ${imp.kind}`;
         throw new ProgramError(`its import \`${name}\` must be a shared memory, not ${what}`);
       }
       memory = limits;
@@ -241,7 +241,7 @@ export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): Memor
       const all = [IMPORT_MEMORY, ...IMPORTS.keys()].map((n) => `\`${IMPORT_MODULE}.${n}\``).join(", ");
       throw new ProgramError(`it imports \`${name}\`, which isn't one of the host's: ${all}`);
     }
-    const ty = types.imports[i];
+    const ty = importType(i);
     if (imp.kind !== "function" || ty !== want) {
       const what = imp.kind === "function" ? `a function ${ty}` : `a ${imp.kind}`;
       throw new ProgramError(`its import \`${name}\` must be a function ${want}, not ${what}`);
@@ -250,14 +250,14 @@ export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): Memor
   if (memory === null) {
     throw new ProgramError(`it doesn't import its memory, shared, as \`${IMPORT_MODULE}.${IMPORT_MEMORY}\``);
   }
-  const exports = new Map(WebAssembly.Module.exports(module).map((e) => [e.name, e.kind]));
+  const exports = new Map(all.map((e) => [e.name, e.kind]));
   if (exports.get(EXPORT_MEMORY) !== "memory") {
     throw new ProgramError(`it doesn't export its memory as \`${EXPORT_MEMORY}\``);
   }
-  if (exports.get(EXPORT_FRAME) !== "function" || types.exports.get(EXPORT_FRAME) !== "(f32, i32, i32) -> ()") {
+  if (exports.get(EXPORT_FRAME) !== "function" || exportTypes.get(EXPORT_FRAME) !== "(f32, i32, i32) -> ()") {
     throw new ProgramError(`it must export \`${EXPORT_FRAME}(time: f32, width: i32, height: i32)\` with no results`);
   }
-  if (exports.has(EXPORT_INIT) && (exports.get(EXPORT_INIT) !== "function" || types.exports.get(EXPORT_INIT) !== "() -> ()")) {
+  if (exports.has(EXPORT_INIT) && (exports.get(EXPORT_INIT) !== "function" || exportTypes.get(EXPORT_INIT) !== "() -> ()")) {
     throw new ProgramError(`its \`${EXPORT_INIT}\` export must be a function with no parameters and no results`);
   }
   const threadEntries = [
@@ -266,7 +266,7 @@ export function checkAbi(module: WebAssembly.Module, abi: WasmAbi | null): Memor
     [EXPORT_TICK, "(i32, i32, i32, i32) -> ()"],
   ] as const;
   for (const [name, want] of threadEntries) {
-    if (exports.has(name) && (exports.get(name) !== "function" || types.exports.get(name) !== want)) {
+    if (exports.has(name) && (exports.get(name) !== "function" || exportTypes.get(name) !== want)) {
       throw new ProgramError(`its \`${name}\` export must be a function ${want}`);
     }
   }

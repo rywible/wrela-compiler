@@ -337,11 +337,9 @@ fn run_report(a: &Args) -> Result<String, String> {
         quiet: true,
         defer_init: true,
         workers: a.workers,
+        relaxed_simd: a.relaxed_simd,
         ..Options::default()
     };
-    if a.relaxed_simd {
-        wrela_host::load_relaxed_simd();
-    }
     let (mut host, script, built) =
         load(&a.dir, a.input.as_deref(), &options, a.optimize, a.relaxed_simd)?;
     let environment = comparison::environment(&mut host)?;
@@ -862,8 +860,7 @@ mod tests {
         );
     }
 
-    /// The 95th percentile by nearest rank: of 120 frames the seventh slowest, of one frame
-    /// that frame, of none nothing.
+    /// `--worst`: the slowest frames first, each with its parts largest first.
     #[test]
     fn the_slowest_frames_come_first_with_their_largest_parts() {
         let f = |frame, cpu: f64, labels: Vec<(&str, f64)>| Worst {
@@ -918,6 +915,8 @@ mod tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    /// The 95th percentile by nearest rank: of 120 frames the seventh slowest, of one frame
+    /// that frame, of none nothing.
     #[test]
     fn percentiles_are_by_nearest_rank() {
         let frames: Vec<f64> = (1..=120).rev().map(f64::from).collect();

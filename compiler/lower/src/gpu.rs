@@ -47,9 +47,7 @@ impl PipelineKey {
             PipelineKey::Compute { consts, .. } | PipelineKey::Render { consts, .. } => consts,
         }
     }
-}
 
-impl PipelineKey {
     pub fn mentions(&self, f: FnId) -> bool {
         match self {
             PipelineKey::Compute { kernel, .. } => *kernel == f,
@@ -2297,10 +2295,10 @@ pub(crate) fn lower_pipeline(
     targets: Vec<ir::RenderTarget>,
 ) -> Option<PipelineOut> {
     let mut out = match key {
-        PipelineKey::Compute { .. } => lower_compute(cx, iface),
-        PipelineKey::Render { .. } => lower_render(cx, iface),
+        PipelineKey::Compute { .. } => lower_compute(cx, iface.clone()),
+        PipelineKey::Render { .. } => lower_render(cx, iface.clone()),
     }?;
-    out.constants = iface_consts(cx, key, &out.module);
+    out.constants = iface_consts(&iface, key, &out.module);
     out.key = key.clone();
     out.sites = sites;
     out.targets = targets;
@@ -2309,8 +2307,7 @@ pub(crate) fn lower_pipeline(
 
 /// Each of `module`'s overrides' values, from `key`'s `const` arguments (the interface's
 /// `consts` order, which the module's overrides follow).
-fn iface_consts(cx: &Cx, key: &PipelineKey, module: &ir::Module) -> Vec<ConstArg> {
-    let Some((_, iface)) = cx.pipelines.iter().find(|(k, _)| k == key) else { return Vec::new() };
+fn iface_consts(iface: &Interface, key: &PipelineKey, module: &ir::Module) -> Vec<ConstArg> {
     let values = key.consts();
     let out: Vec<ConstArg> = (iface.consts.iter())
         .map(|l| {

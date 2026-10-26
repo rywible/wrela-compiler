@@ -511,11 +511,6 @@ fn drop_restores(fe: &mut Fe) {
     });
 }
 
-/// For each statement, the values whose locals are free once it's emitted: those its block
-/// defines and last uses in it (or in the blocks nested in it). A value is only visible in the
-/// block that defines it (`ir::verify` checks), so that's where it dies; a use in a nested loop
-/// counts as a use by the loop's whole statement, so a value read on every iteration lives
-/// until the loop ends.
 /// A vector `a * b + c` (or `c - a * b`, `negate`) to emit as one relaxed fused multiply-add.
 pub(super) struct Fused {
     pub a: ir::ValueId,
@@ -598,6 +593,11 @@ fn fusions(
     (fused, away)
 }
 
+/// For each statement, the values whose locals are free once it's emitted: those its block
+/// defines and last uses in it (or in the blocks nested in it). A value is only visible in the
+/// block that defines it (`ir::verify` checks), so that's where it dies; a use in a nested loop
+/// counts as a use by the loop's whole statement, so a value read on every iteration lives
+/// until the loop ends.
 fn releases(f: &ir::Function, out: &mut HashMap<*const ir::Stmt, Vec<ir::ValueId>>) {
     // Each value records its defining scope and the last statement there that uses it.
     // A nested use belongs to that scope's current ancestor statement: a value used by a loop

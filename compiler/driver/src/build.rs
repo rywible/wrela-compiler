@@ -101,6 +101,28 @@ pub(crate) fn emit_for_cpu(l: &Lowered, sources: &SourceMap, simd: bool) -> Buil
     emit_in(l, sources, wrela_wasm::Options { simd, ..Default::default() }, false, false, &[])
 }
 
+/// Where each of a module's code offsets came from (`wrela_wasm::Emitted::lines`).
+type CodeLines = Vec<(u32, Option<wrela_diag::Span>)>;
+
+/// The program's module with `options`: its bytes, its trap locations in a section of their
+/// own; the locations; and its interface.
+fn module(
+    l: &Lowered,
+    sources: &SourceMap,
+    options: wrela_wasm::Options,
+) -> Result<(Vec<u8>, CodeLines, wrela_abi::manifest::WasmAbi), String> {
+    let out = wrela_wasm::emit_with(&l.cpu, options)
+        .map_err(|e| format!("the WASM back end failed: {e}"))?;
+    let section = code_lines_section(&out.lines, sources);
+    let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &section);
+    let abi = wrela_wasm::interface(&wasm)
+        .map_err(|e| format!("the WASM back end's module doesn't read: {e}"))?;
+    if options.relaxed {
+        wrela_wasm::check_relaxed_only_in(&wasm, wrela_abi::EXPORT_FRAME)?;
+    }
+    Ok((wasm, out.lines, abi))
+}
+
 fn emit_in(
     l: &Lowered,
     sources: &SourceMap,
@@ -116,38 +138,18 @@ fn emit_in(
     let mut relaxed = None;
     if options.relaxed {
         // The presentation code with relaxed SIMD, beside the standard module.
-        match wrela_wasm::emit_with(&l.cpu, options) {
-            Ok(out) => {
-                let lines = code_lines_section(&out.lines, sources);
-                let wasm =
-                    wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
-                match wrela_wasm::interface(&wasm) {
-                    Ok(abi) => relaxed = Some((wasm, abi)),
-                    Err(e) => diagnostics.push(Diagnostic::internal(format!(
-                        "the WASM back end's relaxed module doesn't read: {e}"
-                    ))),
-                }
-            }
-            Err(e) => diagnostics.push(Diagnostic::internal(format!(
-                "the WASM back end failed with relaxed SIMD: {e}"
-            ))),
+        match module(l, sources, options) {
+            Ok((wasm, _, abi)) => relaxed = Some((wasm, abi)),
+            Err(e) => diagnostics.push(Diagnostic::internal(format!("its relaxed module: {e}"))),
         }
     }
-    let options = wrela_wasm::Options { relaxed: false, ..options };
-    match wrela_wasm::emit_with(&l.cpu, options) {
-        Ok(out) => {
-            let lines = code_lines_section(&out.lines, sources);
-            let wasm = wrela_wasm::with_custom_section(out.wasm, wrela_abi::lines::SECTION, &lines);
-            code_lines = out.lines;
-            match wrela_wasm::interface(&wasm) {
-                Ok(abi) => wasm_abi = Some(abi),
-                Err(e) => diagnostics.push(Diagnostic::internal(format!(
-                    "the WASM back end's module doesn't read: {e}"
-                ))),
-            }
+    match module(l, sources, wrela_wasm::Options { relaxed: false, ..options }) {
+        Ok((wasm, lines, abi)) => {
+            code_lines = lines;
+            wasm_abi = Some(abi);
             files.push(("game.wasm".to_string(), wasm));
         }
-        Err(e) => diagnostics.push(Diagnostic::internal(format!("the WASM back end failed: {e}"))),
+        Err(e) => diagnostics.push(Diagnostic::internal(e)),
     }
     let mut manifest = wrela_abi::Manifest::new("game.wasm");
     manifest.wasm_abi = wasm_abi;

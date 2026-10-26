@@ -34,7 +34,6 @@
 //! is skipped).
 
 use super::*;
-use crate::single_exit::single_exit;
 use std::collections::HashMap;
 
 type R<T> = Result<T>;
@@ -183,32 +182,8 @@ fn derive(
     }
     let orig = m.functions[f.index()].clone();
     no_gpu_work(&orig.body)?;
-    let exit = single_exit(m, &orig);
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
-    let (mut func, result, mut act) = match exit {
-        None => (orig, None, body_activity(m, cache, f, &mask, Mode::Interval)),
-        Some((func, result)) => {
-            let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
-                effect(m, cache, g, mk, Mode::Interval)
-            });
-            (func, result, act)
-        }
-    };
-    // A loop that leaves early on the input runs its own count instead, with flags
-    // (`exits.rs`); what's left is a loop whose own count depends on the input.
-    // (What a call of `f` does, its `effect`, is the flagged loop's too.)
-    let bool_ty = m.types.bool();
-    if act.active_loop_exit.is_some()
-        && let Some(flagged) = super::exits::flag_exits(&func, bool_ty, &|v| act.value(v))
-    {
-        let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
-            effect(m, cache, g, mk, Mode::Interval)
-        });
-        if again.active_loop_exit.is_none() {
-            func = flagged;
-            act = again;
-        }
-    }
+    let (func, result, act) = super::one_exit(m, cache, f, orig, &mask);
     if let Some(at) = act.active_loop_exit {
         return Err(Error::ActiveLoopExit(
             "a loop exits here depending on the input; an interval needs loops that run the \
@@ -284,7 +259,6 @@ fn derive(
         speculative: 0,
         track: Track::default(),
         report,
-        at: None,
     };
     let mut body = Vec::new();
     let built = (|| -> R<()> {
@@ -417,8 +391,6 @@ struct Ivx<'a> {
     speculative: u32,
     track: Track,
     report: Option<Report>,
-    /// Where the statement being derived is, for a report's notes.
-    at: Option<wrela_diag::Span>,
 }
 
 impl Builder for Ivx<'_> {
@@ -573,7 +545,7 @@ impl<'a> Ivx<'a> {
     /// operation's name (12 bytes of it, little-endian), and the range's hull over its
     /// components, as `f32`s. Loads, constructions and projections aren't operations.
     fn note(&mut self, out: &mut Block, e: &Expr, r: Iv) {
-        let (Some(report), Some(at)) = (self.report, self.at) else { return };
+        let (Some(report), Some(at)) = (self.report, self.track.at) else { return };
         let op = match e {
             Expr::Binary(op, ..) => format!("{op:?}"),
             Expr::Unary(op, _) => format!("{op:?}"),
@@ -1280,9 +1252,6 @@ impl<'a> Ivx<'a> {
     }
 
     fn stmt(&mut self, s: &Stmt, out: &mut Block) -> R<()> {
-        if let Stmt::At(span) = s {
-            self.at = Some(*span);
-        }
         self.track.before(s);
         let r = self.stmt_inner(s, out);
         self.track.after(s, r)

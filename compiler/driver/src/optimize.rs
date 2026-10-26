@@ -143,10 +143,11 @@ pub fn optimize_with(
     let read =
         |name: &str| std::fs::read(path(name)).map_err(|e| format!("can't read {name}: {e}"));
     let optimized = read("out.wasm")?;
-    // A relaxed module's relaxed SIMD is the back end's, outside deterministic code; `wasm-opt`
-    // only moves code that deterministic code calls into code that it doesn't (inlining), never
-    // back.
-    if !relaxed {
+    // A relaxed module keeps its relaxed SIMD where only `frame` reaches it, whatever
+    // `wasm-opt` inlined or merged.
+    if relaxed {
+        wrela_wasm::check_relaxed_only_in(&optimized, wrela_abi::EXPORT_FRAME)?;
+    } else {
         wrela_wasm::check_no_relaxed_simd(&optimized)?;
     }
     // Binaryen keeps a module's custom sections; the pair id must survive (`read_pair`).

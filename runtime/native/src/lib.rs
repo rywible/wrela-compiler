@@ -121,6 +121,9 @@ pub struct Options {
     /// The host may hot reload ([`Host::reload`]): it keeps each tick's records for the new
     /// build to run again. (Without it, nothing grows tick by tick.)
     pub reloadable: bool,
+    /// Load a relaxed-SIMD build's relaxed module (`wrela build --relaxed-simd`), as a browser
+    /// that runs relaxed SIMD does; wasmtime runs relaxed SIMD (`wrela-host --relaxed`).
+    pub relaxed_simd: bool,
 }
 
 impl Options {
@@ -289,13 +292,18 @@ struct Build {
 /// Reads the build in `dir` and compiles its WASM, each call given `fuel` if it's metered. A
 /// loaded build's compiled code is kept in the host's private cache ([`code`]): the loads that
 /// follow read it back.
-fn compile_build(dir: &Path, fuel: Option<u64>) -> Result<Build> {
-    compile_build_with_shaders(dir, fuel, true)
+fn compile_build(dir: &Path, fuel: Option<u64>, relaxed: bool) -> Result<Build> {
+    compile_build_with_shaders(dir, fuel, true, relaxed)
 }
 
 /// CPU frame tests emit only the manifest and WASM; other builds still check every file.
-fn compile_build_with_shaders(dir: &Path, fuel: Option<u64>, shaders: bool) -> Result<Build> {
-    let (manifest, wasm, shaders) = read_build(dir, shaders)?;
+fn compile_build_with_shaders(
+    dir: &Path,
+    fuel: Option<u64>,
+    shaders: bool,
+    relaxed: bool,
+) -> Result<Build> {
+    let (manifest, wasm, shaders) = read_build(dir, shaders, relaxed)?;
     let wasm_hash = wrela_abi::ticks::wasm_hash(&wasm);
     // An optimized build keeps its trap locations beside its WASM; without them, a trap gives
     // its code offset.
@@ -341,7 +349,7 @@ fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build
     let text = |bytes: Vec<u8>, name: &str| {
         String::from_utf8(bytes).map_err(|_| Error::Program(format!("{name} isn't UTF-8")))
     };
-    let manifest = chosen(Manifest::parse(&text(file("manifest.json")?, "manifest.json")?)?);
+    let manifest = Manifest::parse(&text(file("manifest.json")?, "manifest.json")?)?;
     let wasm = file(&manifest.wasm)?;
     let shaders = if shaders {
         manifest
@@ -360,19 +368,11 @@ fn driven_build(build: &BuildDir, shaders: bool, code: &CodeFor) -> Result<Build
     Ok(Build { manifest, shaders, wasm_hash, compiled, driven: None })
 }
 
-/// Whether builds load their relaxed-SIMD module where they have one (`wrela-host --relaxed`).
-static RELAXED_SIMD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// From now on, a relaxed-SIMD build (`wrela build --relaxed-simd`) loads its relaxed module, as a
-/// browser that runs relaxed SIMD does (runtime/browser `chooseWasm`); wasmtime runs relaxed SIMD.
-pub fn load_relaxed_simd() {
-    RELAXED_SIMD.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// `manifest` as this process loads it: its relaxed module, after [`load_relaxed_simd`].
-fn chosen(manifest: Manifest) -> Manifest {
+/// `manifest` as the host loads it: its relaxed module, if it has one, with `relaxed`
+/// ([`Options::relaxed_simd`]).
+fn chosen(manifest: Manifest, relaxed: bool) -> Manifest {
     match &manifest.wasm_relaxed {
-        Some(wasm) if RELAXED_SIMD.load(std::sync::atomic::Ordering::Relaxed) => {
+        Some(wasm) if relaxed => {
             Manifest { wasm: wasm.clone(), wasm_abi: manifest.wasm_relaxed_abi.clone(), ..manifest }
         }
         _ => manifest,
@@ -380,9 +380,13 @@ fn chosen(manifest: Manifest) -> Manifest {
 }
 
 /// Reads a build's manifest, WASM and WGSL from `dir`.
-fn read_build(dir: &Path, shaders: bool) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
+fn read_build(
+    dir: &Path,
+    shaders: bool,
+    relaxed: bool,
+) -> Result<(Manifest, Vec<u8>, Vec<String>)> {
     let text = |name: &str| read_file(dir, name, |path| std::fs::read_to_string(path));
-    let manifest = chosen(Manifest::parse(&text("manifest.json")?)?);
+    let manifest = chosen(Manifest::parse(&text("manifest.json")?)?, relaxed);
     let wasm = read_file(dir, &manifest.wasm, |path| std::fs::read(path))?;
     let shaders = if shaders {
         manifest.pipelines.iter().map(|p| text(&p.shader)).collect::<Result<Vec<_>>>()?
@@ -549,7 +553,7 @@ impl Host {
     pub fn reload(&mut self, dir: Option<&Path>) -> Result<()> {
         assert!(self.options.reloadable, "a hot reload needs a host loaded `reloadable`");
         let dir = dir.map_or_else(|| self.dir.clone(), Path::to_path_buf);
-        let build = compile_build(&dir, None)?;
+        let build = compile_build(&dir, None, self.options.relaxed_simd)?;
         let old = self.program.take().expect("the host has a program");
         let old_init_done = old.init_done();
         let carried = old.retire();
@@ -585,7 +589,7 @@ impl Host {
     pub fn restart_in(&mut self, dir: impl AsRef<Path>, options: &Options) -> Result<()> {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
-        let build = compile_build(dir, None)?;
+        let build = compile_build(dir, None, options.relaxed_simd)?;
         let same_device = options.timing == self.options.timing;
         // A preparation belongs to the retiring program. On the same device, finish its GPU
         // work before resetting resources. With a new device, keep it until the replacement
@@ -665,7 +669,7 @@ impl Host {
     pub fn load_with(dir: impl AsRef<Path>, options: &Options) -> Result<Host> {
         let dir = dir.as_ref();
         let options = &options.homed(dir);
-        let build = compile_build(dir, None)?;
+        let build = compile_build(dir, None, options.relaxed_simd)?;
         Host::start(build, dir, options, true)
     }
 
@@ -1127,14 +1131,20 @@ impl CpuBuild {
     /// Loads the build in `dir`; its shaders must exist but aren't compiled. Its compiled code
     /// is kept in the host's private cache, as a [`Host`]'s is.
     pub fn load(dir: impl AsRef<Path>) -> Result<CpuBuild> {
-        CpuBuild::load_compiled(dir.as_ref(), None)
+        CpuBuild::load_compiled(dir.as_ref(), None, false)
+    }
+
+    /// [`CpuBuild::load`], a relaxed-SIMD build's relaxed module with `relaxed`
+    /// ([`Options::relaxed_simd`]).
+    pub fn load_choosing(dir: impl AsRef<Path>, relaxed: bool) -> Result<CpuBuild> {
+        CpuBuild::load_compiled(dir.as_ref(), None, relaxed)
     }
 
     /// A partial build for CPU tools: manifest and WASM only. No shader files are needed;
     /// submitted GPU commands are checked against the manifest and then discarded.
     pub fn load_cpu(dir: impl AsRef<Path>) -> Result<CpuBuild> {
         let dir = dir.as_ref();
-        let build = compile_build_with_shaders(dir, None, false)?;
+        let build = compile_build_with_shaders(dir, None, false, false)?;
         Ok(Self::from_build(dir, build))
     }
 
@@ -1143,7 +1153,7 @@ impl CpuBuild {
     /// same work on every machine. For tests that run a program's frames, whose build is made
     /// for the run: its compiled code is kept in the host's private cache, if available.
     pub fn load_metered(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
-        CpuBuild::load_compiled(dir.as_ref(), Some(fuel))
+        CpuBuild::load_compiled(dir.as_ref(), Some(fuel), false)
     }
 
     /// A CPU frame test's partial build: only manifest and WASM, with no emitted shader
@@ -1151,12 +1161,12 @@ impl CpuBuild {
     /// no shader runs. The compiler checks shader source before emitting this build.
     pub fn load_metered_cpu(dir: impl AsRef<Path>, fuel: u64) -> Result<CpuBuild> {
         let dir = dir.as_ref();
-        let build = compile_build_with_shaders(dir, Some(fuel), false)?;
+        let build = compile_build_with_shaders(dir, Some(fuel), false, false)?;
         Ok(Self::from_build(dir, build))
     }
 
-    fn load_compiled(dir: &Path, fuel: Option<u64>) -> Result<CpuBuild> {
-        Ok(Self::from_build(dir, compile_build(dir, fuel)?))
+    fn load_compiled(dir: &Path, fuel: Option<u64>, relaxed: bool) -> Result<CpuBuild> {
+        Ok(Self::from_build(dir, compile_build(dir, fuel, relaxed)?))
     }
 
     /// The build in the directory `build`, which goes by `dir` (a name: it's never opened), to

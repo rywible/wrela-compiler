@@ -404,9 +404,8 @@ fn lower_in(
     cx.make_table(&mut cpu);
     let role = data.role;
     let mut has_entry = false;
-    // Where the code that may use relaxed SIMD can't be reached from (`mark_relaxable`): every
-    // entry point but a client's `frame`.
-    let mut strict = Vec::new();
+    // What else the host runs (`mark_relaxable` keeps it strict).
+    let mut also = Vec::new();
     for &f in &roots.also {
         // A job's body is lowered as its `resume` (§16.3).
         let key = if checked.program.func(f).attrs.job.is_some() {
@@ -414,7 +413,7 @@ fn lower_in(
         } else {
             InstanceKey::plain(f, Vec::new())
         };
-        strict.push(cx.instance(&mut cpu, key, None));
+        also.push(cx.instance(&mut cpu, key, None));
     }
     // The program's state (§15): what `init` returns (a server's `serve_init`), which the
     // other exports take first. A tool has none: `tool` runs the whole tool (§15.5).
@@ -469,10 +468,6 @@ fn lower_in(
         let key = InstanceKey::plain(f, Vec::new());
         let id = cx.instance(&mut cpu, key, None);
         has_entry |= name == entry_export(role);
-        let presents = role == wrela_sema::defs::Role::Client && name == wrela_abi::EXPORT_FRAME;
-        if !presents {
-            strict.push(id);
-        }
         if cx.check_export(f, state.map(|s| s.1)) {
             let id = enum_wrapper(&cx, &mut cpu, f, id);
             let id = match (cpu.m.state, state) {
@@ -482,20 +477,15 @@ fn lower_in(
                 }
                 _ => id,
             };
-            if !presents {
-                strict.push(id);
-            }
             cpu.m.exports.push((name.clone(), id));
         }
     }
     for (i, &f) in roots.tests.iter().enumerate() {
         let id = cx.instance(&mut cpu, InstanceKey::plain(f, Vec::new()), None);
-        strict.push(id);
         let id = match (cpu.m.state, checked.program.func(f).params.is_empty()) {
             (Some(d), false) => state_wrapper(&mut cpu, id, d, false),
             _ => id,
         };
-        strict.push(id);
         cpu.m.exports.push((format!("test.{i}"), id));
     }
     if !has_entry && role == wrela_sema::defs::Role::Client {
@@ -505,7 +495,7 @@ fn lower_in(
     rewrite_cpu_math(&mut cx, &mut cpu);
     cx.drain(&mut cpu);
     check_deterministic(&mut cx, &cpu);
-    mark_relaxable(&cx, &mut cpu, strict);
+    mark_relaxable(&cx, &mut cpu, role, also);
     thread_entries(&mut cx, &mut cpu);
     mark_counted(&mut cx, &mut cpu);
     if data.debug {
@@ -1038,13 +1028,22 @@ impl<'a> Cx<'a> {
 }
 
 /// Marks the CPU functions only a client's `frame` reaches relaxable (`--relaxed-simd`, §11.2):
-/// presentation, whose results reach the simulation only as recorded input. What any other entry
-/// point reaches (`strict`: `init`, whose world the simulation starts from, the tests, the jobs),
-/// or an `@deterministic` function, an `@audio` entry point, a job's resume or a task, must be bit
-/// for bit the same on every engine, and stays strict. The calls are the bodies' own, the math
-/// `rewrite_cpu_math` called in among them. A function inlined later keeps its caller's flag.
-fn mark_relaxable(cx: &Cx, mb: &mut ModuleBuilder, mut strict: Vec<ir::FuncId>) {
+/// presentation, whose results reach the simulation only as recorded input. What any other export
+/// reaches (`init`, whose world the simulation starts from, the tests), what the host runs
+/// besides (`also`: the jobs), an `@deterministic` function, an `@audio` entry point, a job's
+/// resume or a task must be bit for bit the same on every engine, and stays strict. The calls
+/// are the bodies' own, the math `rewrite_cpu_math` called in among them. A function inlined
+/// later keeps its caller's flag.
+fn mark_relaxable(
+    cx: &Cx,
+    mb: &mut ModuleBuilder,
+    role: wrela_sema::defs::Role,
+    mut strict: Vec<ir::FuncId>,
+) {
     let p = &cx.checked.program;
+    let presents =
+        |name: &str| role == wrela_sema::defs::Role::Client && name == wrela_abi::EXPORT_FRAME;
+    strict.extend(mb.m.exports.iter().filter(|(name, _)| !presents(name)).map(|&(_, id)| id));
     strict.extend(mb.instances.iter().filter_map(|(k, &id)| match k {
         InstanceKey::Fn { func, .. } => {
             let a = &p.func(*func).attrs;

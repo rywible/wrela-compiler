@@ -804,6 +804,65 @@ pub fn check_no_relaxed_simd(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
+/// Fails if relaxed SIMD is reachable from anything but the export `presents`: a relaxed
+/// module's rule (language.md §11.2), checked on the module itself, so it holds after `wasm-opt`
+/// too. Reachable: every other export, the start function and every function a table holds (a
+/// task, called by index), and what they call.
+pub fn check_relaxed_only_in(bytes: &[u8], presents: &str) -> Result<(), String> {
+    use wasmparser::{ElementItems, Operator, Payload};
+    let (mut imported, mut roots, mut bodies) = (0u32, Vec::new(), Vec::new());
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        match payload.map_err(|e| e.to_string())? {
+            Payload::ImportSection(s) => {
+                for i in s.into_imports() {
+                    if matches!(i.map_err(|e| e.to_string())?.ty, wasmparser::TypeRef::Func(_)) {
+                        imported += 1;
+                    }
+                }
+            }
+            Payload::ExportSection(s) => {
+                for e in s {
+                    let e = e.map_err(|e| e.to_string())?;
+                    if e.kind == wasmparser::ExternalKind::Func && e.name != presents {
+                        roots.push(e.index);
+                    }
+                }
+            }
+            Payload::StartSection { func, .. } => roots.push(func),
+            Payload::ElementSection(s) => {
+                for e in s {
+                    if let ElementItems::Functions(fs) = e.map_err(|e| e.to_string())?.items {
+                        for f in fs {
+                            roots.push(f.map_err(|e| e.to_string())?);
+                        }
+                    }
+                }
+            }
+            Payload::CodeSectionEntry(body) => bodies.push(body),
+            _ => {}
+        }
+    }
+    let mut seen = vec![false; bodies.len()];
+    while let Some(f) = roots.pop() {
+        let Some(k) = f.checked_sub(imported).map(|k| k as usize) else { continue };
+        if k >= bodies.len() || std::mem::replace(&mut seen[k], true) {
+            continue;
+        }
+        no_relaxed_simd(&bodies[k])
+            .map_err(|e| format!("{e}, where `{presents}` isn't all that reaches it"))?;
+        let mut ops = bodies[k].get_operators_reader().map_err(|e| e.to_string())?;
+        while !ops.eof() {
+            match ops.read().map_err(|e| e.to_string())? {
+                Operator::Call { function_index } | Operator::RefFunc { function_index } => {
+                    roots.push(function_index)
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
 /// How many SIMD instructions (those with the `0xfd` prefix) a WASM module's code has.
 pub fn simd_instructions(bytes: &[u8]) -> Result<usize, String> {
     let mut n = 0;
@@ -920,6 +979,23 @@ mod tests {
         assert_eq!(nonzero_runs(&bytes), [(10, 91), (2000, 1), (4095, 1)]);
         assert_eq!(nonzero_runs(&[0; 600]), []);
         assert_eq!(nonzero_runs(&[7, 0, 7]), [(0, 3)]);
+    }
+
+    #[test]
+    fn relaxed_simd_is_reached_only_from_frame() {
+        let module = |caller: &str| {
+            wat::parse_str(format!(
+                "(module (func $fused (result v128) v128.const i64x2 0 0 v128.const i64x2 0 0 \
+                 v128.const i64x2 0 0 f32x4.relaxed_madd) \
+                 (func $plain (result v128) v128.const i64x2 0 0) \
+                 (func (export \"frame\") (drop (call $fused))) \
+                 (func (export \"init\") (drop (call {caller}))))"
+            ))
+            .expect("wat")
+        };
+        assert_eq!(check_relaxed_only_in(&module("$plain"), "frame"), Ok(()));
+        let e = check_relaxed_only_in(&module("$fused"), "frame").expect_err("init reaches it");
+        assert!(e.contains("F32x4RelaxedMadd"), "{e}");
     }
 
     #[test]

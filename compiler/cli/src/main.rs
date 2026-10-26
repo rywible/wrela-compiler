@@ -377,6 +377,29 @@ pub(crate) fn generated_path(package: &Path, path: &Path) -> Result<(), String> 
         .map_err(|e| format!("can't use `{}`: {e}", path.display()))
 }
 
+/// A program written around the package in `dir` (`wrela solve`'s, `wrela precision`'s):
+/// `<dir>/build/<name>/`, a package named `name` that depends on it, with `main(package)` as its
+/// `main.wrela`. Its directory, and the package's name.
+pub(crate) fn glue_package(
+    dir: &Path,
+    name: &str,
+    main: impl FnOnce(&str) -> String,
+) -> Result<(PathBuf, String), String> {
+    let package = wrela_driver::manifest::name_in(dir)
+        .ok_or_else(|| format!("`{}` has no wrela.toml with a package name", dir.display()))?;
+    let glue_dir = dir.join("build").join(name);
+    generated_path(dir, &glue_dir)?;
+    wrela_driver::ensure_no_symlinks(&glue_dir, ["wrela.toml", "main.wrela"])
+        .map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&glue_dir).map_err(|e| e.to_string())?;
+    let toml = format!(
+        "[package]\nname = \"{name}\"\n\n[dependencies]\n{package} = {{ path = \"../..\" }}\n"
+    );
+    std::fs::write(glue_dir.join("wrela.toml"), toml).map_err(|e| e.to_string())?;
+    std::fs::write(glue_dir.join("main.wrela"), main(&package)).map_err(|e| e.to_string())?;
+    Ok((glue_dir, package))
+}
+
 /// The package in `dir` built as `wrela build` builds it (its `game.wasm` through `wasm-opt`,
 /// if `optimize` says so), into `<dir>/build/<name>`: where it is.
 pub(crate) fn build_into(

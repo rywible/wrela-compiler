@@ -220,7 +220,8 @@ fn relaxed_simd_fuses_only_in_presentation_code() {
     let wasm = plain.files.iter().find(|(f, _)| f == "game.wasm").expect("game.wasm");
     assert!(wasm.1 == read("game.wasm"), "the standard module is the plain build's");
     let mut a = CpuHost::load(&dir).expect("load");
-    let mut b = CpuHost::load(as_relaxed(&dir)).expect("load the relaxed module");
+    let relaxed_build = wrela_host::CpuBuild::load_choosing(&dir, true);
+    let mut b = relaxed_build.and_then(|b| b.start()).expect("load the relaxed module");
     let mut fused = 0;
     for seed in 0..3 {
         let args = [Value::I32(seed)];
@@ -237,34 +238,16 @@ fn relaxed_simd_fuses_only_in_presentation_code() {
     assert_eq!(fused, 3, "the relaxed module's `loose` fuses its multiply-add");
 }
 
-/// The build in `dir` with its relaxed module as `game.wasm` is: what a host that runs relaxed SIMD
-/// loads (runtime/browser `chooseWasm`), in a directory of its own.
-fn as_relaxed(dir: &Path) -> std::path::PathBuf {
-    let text = std::fs::read_to_string(dir.join("manifest.json")).expect("the manifest");
-    let mut manifest = wrela_abi::Manifest::parse(&text).expect("the manifest");
-    let to = dir.join("as-relaxed");
-    std::fs::create_dir_all(&to).expect("dir");
-    manifest.wasm = manifest.wasm_relaxed.take().expect("a relaxed module");
-    manifest.wasm_abi = manifest.wasm_relaxed_abi.take();
-    std::fs::write(to.join("manifest.json"), manifest.to_json()).expect("manifest");
-    let files =
-        manifest.pipelines.iter().map(|p| p.shader.as_str()).chain([manifest.wasm.as_str()]);
-    for name in files {
-        std::fs::copy(dir.join(name), to.join(name)).expect(name);
-    }
-    to
-}
-
 /// The herd's ticks with its relaxed module: the same world, tick by tick. What `init` reaches,
 /// and the math `rewrite_cpu_math` calls in, stay strict (language.md §11.2).
 #[test]
 fn a_relaxed_build_ticks_the_same_world() {
     let (dir, _) = wrela_tests::relaxed_page("compiler/tests/frozen/herd", "relaxed-herd");
-    let ticks = |d: &Path| {
-        let built = wrela_host::CpuBuild::load(d).expect("load");
+    let ticks = |relaxed: bool| {
+        let built = wrela_host::CpuBuild::load_choosing(&dir, relaxed).expect("load");
         built.record_ticks(120, &[], 2).expect("ticks")
     };
-    let (a, b) = (ticks(&dir), ticks(&as_relaxed(&dir)));
+    let (a, b) = (ticks(false), ticks(true));
     let c = wrela_abi::ticks::TickComparison::of(&a, &b);
     assert!(matches!(c, wrela_abi::ticks::TickComparison::Equal { .. }), "{c}");
 }

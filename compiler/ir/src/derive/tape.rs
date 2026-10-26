@@ -12,7 +12,6 @@
 //! The opcodes are `std::stage`'s (`stage.wrela`), which `std::stage`'s tests read back.
 
 use super::*;
-use crate::single_exit::single_exit;
 use std::collections::{HashMap, HashSet};
 
 // `std::stage`'s opcodes.
@@ -289,12 +288,16 @@ enum Push {
     New(OpArgs),
 }
 
+/// The scalar type `s`, which the module has.
+fn scalar_id(types: &Types, s: Scalar) -> Result<TypeId> {
+    types.lookup(&TypeDef::Scalar(s)).ok_or_else(|| Error::internal(format!("no {s:?}")))
+}
+
 /// An operation's arguments to std's `push_*`: its code (the third register in its high 16
 /// bits), its registers and its constant.
 fn op_values(g: &mut Function, types: &Types, out: &mut Block, op: OpArgs) -> Result<[ValueId; 4]> {
-    let u = types.lookup(&TypeDef::Scalar(Scalar::U32)).ok_or_else(|| Error::internal("no u32"))?;
-    let f32 =
-        types.lookup(&TypeDef::Scalar(Scalar::F32)).ok_or_else(|| Error::internal("no f32"))?;
+    let u = scalar_id(types, Scalar::U32)?;
+    let f32 = scalar_id(types, Scalar::F32)?;
     let mut code = g.let_(out, u, Expr::Const(Const::U32(op.code)));
     if let Some(t) = op.t {
         let sixteen = g.let_(out, u, Expr::Const(Const::U32(16)));
@@ -323,8 +326,7 @@ fn emit(
     lay: Layout,
     push: Push,
 ) -> Result<ValueId> {
-    let f32 =
-        types.lookup(&TypeDef::Scalar(Scalar::F32)).ok_or_else(|| Error::internal("no f32"))?;
+    let f32 = scalar_id(types, Scalar::F32)?;
     let (func, ops) = match push {
         Push::One(op) => (lay.fns.one, vec![op]),
         Push::Two(first, second) => (lay.fns.two, vec![first, second]),
@@ -356,9 +358,8 @@ fn slot(
     i: ValueId,
     cap: u32,
 ) -> Result<Place> {
-    let u = types.lookup(&TypeDef::Scalar(Scalar::U32)).ok_or_else(|| Error::internal("no u32"))?;
-    let b =
-        types.lookup(&TypeDef::Scalar(Scalar::Bool)).ok_or_else(|| Error::internal("no bool"))?;
+    let u = scalar_id(types, Scalar::U32)?;
+    let b = scalar_id(types, Scalar::Bool)?;
     let n = g.let_(out, u, Expr::Const(Const::U32(cap)));
     let last = g.let_(out, u, Expr::Const(Const::U32(cap.saturating_sub(1))));
     let fits = g.let_(out, b, Expr::Binary(BinOp::Lt, i, n));
@@ -514,27 +515,7 @@ pub(super) fn derive(
     let returns = returns_active(m, cache, f, mask.clone(), Mode::Interval) != 0;
     // As an interval does: one exit, so a `return` under a branch on the point is a store both
     // sides can make, and a loop that leaves early on the point runs its count with flags.
-    let (mut func, mut act) = match single_exit(m, &orig) {
-        None => (orig, body_activity(m, cache, f, &mask, Mode::Interval)),
-        Some((func, _)) => {
-            let act = activity(m, &func, &mask, Mode::Interval, &mut |g, mk| {
-                effect(m, cache, g, mk, Mode::Interval)
-            });
-            (func, act)
-        }
-    };
-    let bool_ty = m.types.bool();
-    if act.active_loop_exit.is_some()
-        && let Some(flagged) = super::exits::flag_exits(&func, bool_ty, &|v| act.value(v))
-    {
-        let again = activity(m, &flagged, &mask, Mode::Interval, &mut |g, mk| {
-            effect(m, cache, g, mk, Mode::Interval)
-        });
-        if again.active_loop_exit.is_none() {
-            func = flagged;
-            act = again;
-        }
-    }
+    let (func, _, act) = super::one_exit(m, cache, f, orig, &mask);
     if let Some(at) = act.active_loop_exit {
         return Err(Error::not_tapeable(
             "a tape can't hold a loop that leaves early on what depends on the point",
@@ -1952,7 +1933,6 @@ impl Tp<'_> {
 /// What kind of expression `e` is, for an error.
 fn expr_kind(e: &Expr) -> &'static str {
     match e {
-        Expr::Bitcast(..) => "a bitcast",
         Expr::Variant(..) => "an enum's variant",
         Expr::Run(_) => "a run of an array",
         Expr::Addr(_) => "a reference",

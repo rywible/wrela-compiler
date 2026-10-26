@@ -760,6 +760,43 @@ pub(super) fn effect(
     e
 }
 
+/// `orig` (function `f`) ready to derive as an interval or a tape does, with active parameters
+/// `mask`: with one exit (`single_exit`: a `return` under a branch on the input becomes a store
+/// that both sides can make), and a loop that leaves early on the input given its own count with
+/// flags (`exits.rs`) where that leaves no loop exit active. The function, the local its result
+/// is stored in (if `single_exit` made one), and its activity; a loop exit still active is the
+/// caller's to refuse.
+pub(super) fn one_exit(
+    m: &mut Module,
+    cache: &mut DeriveCache,
+    f: FuncId,
+    orig: Function,
+    mask: &[Bits],
+) -> (Function, Option<LocalId>, Activity) {
+    let (mut func, result, mut act) = match crate::single_exit::single_exit(m, &orig) {
+        None => (orig, None, body_activity(m, cache, f, mask, Mode::Interval)),
+        Some((func, result)) => {
+            let act = activity(m, &func, mask, Mode::Interval, &mut |g, mk| {
+                effect(m, cache, g, mk, Mode::Interval)
+            });
+            (func, result, act)
+        }
+    };
+    let bool_ty = m.types.bool();
+    if act.active_loop_exit.is_some()
+        && let Some(flagged) = exits::flag_exits(&func, bool_ty, &|v| act.value(v))
+    {
+        let again = activity(m, &flagged, mask, Mode::Interval, &mut |g, mk| {
+            effect(m, cache, g, mk, Mode::Interval)
+        });
+        if again.active_loop_exit.is_none() {
+            func = flagged;
+            act = again;
+        }
+    }
+    (func, result, act)
+}
+
 /// The activity of `f`'s body with active parameters `mask`: the one [`effect`] kept, if it
 /// did.
 pub(super) fn body_activity(

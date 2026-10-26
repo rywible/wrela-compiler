@@ -1520,32 +1520,18 @@ pub fn inline_cpu(m: &mut Module) -> Result<()> {
     inline_by_size(m)?;
     // Inlined, a predicate whose body folded to a constant is that constant in its caller: the
     // branch on it folds now, and with it what only that branch reached (a pipeline among it).
-    let mut rounds = 0;
-    while rounds < FOLD_ROUNDS {
-        let mut changed = false;
-        for i in 0..m.functions.len() {
-            let mut func = std::mem::take(&mut m.functions[i]);
-            if fold_constant_branches(&mut func) {
-                tidy(m, &mut func);
-                changed = true;
-            }
-            m.functions[i] = func;
+    // A fold can make another branch's condition known through a local it settled, in the same
+    // function: each function folds until nothing does. Each fold removes a branch, so it ends.
+    for i in 0..m.functions.len() {
+        let mut func = std::mem::take(&mut m.functions[i]);
+        while fold_constant_branches(&mut func) {
+            tidy(m, &mut func);
         }
-        rounds += 1;
-        if !changed {
-            break;
-        }
-    }
-    if std::env::var_os("WRELA_FOLD_ROUNDS").is_some() {
-        eprintln!("wrela: the fold after inlining ran {rounds} rounds");
+        m.functions[i] = func;
     }
     remove_unreached(m);
     Ok(())
 }
-
-/// The most rounds of folding after inlining: a fold can make another branch's condition known
-/// only through a local an earlier round settled.
-const FOLD_ROUNDS: usize = 4;
 
 /// [`inline_cpu`]'s inlining, callees first.
 fn inline_by_size(m: &mut Module) -> Result<()> {
@@ -1976,6 +1962,18 @@ fn fold_constant_branches(f: &mut Function) -> bool {
     fold.changed
 }
 
+/// An integer constant's value, widened, with its scalar.
+fn int_const(c: &Const) -> Option<(Scalar, i128)> {
+    Some(match *c {
+        Const::I32(x) => (Scalar::I32, i128::from(x)),
+        Const::U32(x) => (Scalar::U32, i128::from(x)),
+        Const::I64(x) => (Scalar::I64, i128::from(x)),
+        Const::U64(x) => (Scalar::U64, i128::from(x)),
+        Const::Small(s, x) => (s, i128::from(x)),
+        _ => return None,
+    })
+}
+
 /// What [`fold_constant_branches`] knows: the `bool` values known, the integer constants (by
 /// value, as `i128`, with their scalar), and whether it folded anything.
 struct Fold {
@@ -2009,21 +2007,7 @@ impl Fold {
             _ => return None,
         })
     }
-}
 
-/// An integer constant's value, widened, with its scalar.
-fn int_const(c: &Const) -> Option<(Scalar, i128)> {
-    Some(match *c {
-        Const::I32(x) => (Scalar::I32, i128::from(x)),
-        Const::U32(x) => (Scalar::U32, i128::from(x)),
-        Const::I64(x) => (Scalar::I64, i128::from(x)),
-        Const::U64(x) => (Scalar::U64, i128::from(x)),
-        Const::Small(s, x) => (s, i128::from(x)),
-        _ => return None,
-    })
-}
-
-impl Fold {
     /// Folds `b`. `self.values` are the `bool` values known; `locals` the `bool` each local
     /// holds where that's known (a local whose address isn't `taken`, which only its own stores
     /// write).
@@ -2035,8 +2019,8 @@ impl Fold {
                     self.values.insert(v, c);
                     out.push(Stmt::Let(v, Expr::Const(Const::Bool(c))));
                 }
-                Stmt::Let(v, Expr::Const(c)) if int_const(&c).is_some() => {
-                    self.ints.extend(int_const(&c).map(|k| (v, k)));
+                Stmt::Let(v, Expr::Const(c)) if let Some(k) = int_const(&c) => {
+                    self.ints.insert(v, k);
                     out.push(Stmt::Let(v, Expr::Const(c)));
                 }
                 Stmt::Let(v, Expr::Binary(op, a, b)) if let Some(c) = self.binary(op, a, b) => {
