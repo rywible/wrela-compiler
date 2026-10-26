@@ -1,11 +1,12 @@
 // What a tape must take as compiled code does (language.md §14.4), each found by the 0.8.0
 // council: a branch on the point whose sides write through a call's `mut` argument; a value
 // only part of which depends on the point; an integer table with values past 2²⁴; `lattice`
-// and `lattice_coord` past `i32`'s range; one function taped at two sizes in one program; and a
-// pruned tape of `tape_with`, which keeps its channels.
+// and `lattice_coord` past `i32`'s range; one function taped at two sizes in one program; a
+// pruned tape of `tape_with`, which keeps its channels; and box-filtered value noise (0.9.0), one
+// operation, whose interval holds every value it takes.
 // Each tape is interpreted at points on both sides of what it branches on, against the field.
 use std::derive::{Box3, tape, tape_sized, tape_with}
-use std::field::{lattice, lattice_coord}
+use std::field::{lattice, lattice_coord, value_noise_box}
 use std::stage::{Taped, interpret, interpret_with}
 
 pub fn frame(time: f32, width: u32, height: u32) {}
@@ -48,6 +49,12 @@ fn lattices(p: vec3) -> f32 {
     f32((lattice_coord(p.x) >> 8) & 255) + lattice(2147483647, lattice_coord(p.y), 16777217)
 }
 
+/// A sphere roughened by value noise averaged over a box whose width grows with x: a filtered
+/// field's noise, its loops as many as its box is wide.
+fn filtered(p: vec3) -> f32 {
+    length(p) - 1.0 + 0.2 * value_noise_box(p * 3.0, vec3(0.05 + 0.4 * abs(p.x)))
+}
+
 fn sphere(p: vec3) -> f32 {
     length(p) - 1.0
 }
@@ -88,6 +95,20 @@ fn lattices_past_an_i32_are_the_compiled_codes() {
 fn one_function_tapes_at_two_sizes() {
     let small: Taped<64, 64> = tape_sized(sphere)
     assert(worst(tape(sphere), sphere, 2.0) < 1.0e-6 && worst(small, sphere, 2.0) < 1.0e-6)
+}
+
+@test
+fn box_filtered_noise_is_one_operation() {
+    let t = tape(filtered)
+    assert(worst(t, filtered, 2.0) < 1.0e-6, "the box noise's value")
+    let over = Box3 { lo: vec3(0.2, -0.4, 0.1), hi: vec3(0.9, 0.3, 0.6) }
+    let iv = t.interval(over)
+    for i in 0..27 {
+        let u = vec3(f32(i % 3), f32((i / 3) % 3), f32(i / 9)) * 0.5
+        let v = filtered(over.lo + (over.hi - over.lo) * u)
+        assert(v >= iv.lo && v <= iv.hi, f"{v} outside [{iv.lo}, {iv.hi}]")
+    }
+    assert(worst(t.prune(over), filtered, 0.5) < 1.0e-6, "pruned, its value within the box")
 }
 
 /// A distance and a channel beside it.

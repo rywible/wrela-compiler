@@ -766,6 +766,8 @@ pub enum Known {
     Smin,
     /// `std::field::value_noise(p)`: `NOISE3`.
     ValueNoise,
+    /// `std::field::value_noise_box(p, half)`: `BOXNOISE3`.
+    ValueNoiseBox,
     /// `std::field::lattice_coord(x)`: `F2I`, `x` toward zero, wrapped past `i32`'s range.
     LatticeCoord,
     /// `std::hash::pcg(h)`: `PCG`.

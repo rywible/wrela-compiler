@@ -71,6 +71,7 @@ const F2I: u32 = 58;
 const F2U: u32 = 59;
 const PCG: u32 = 60;
 const IMAD: u32 = 61;
+const BOXNOISE3: u32 = 62;
 
 /// What a tape is of: a function of its captures (`ncap` of them) and the point, returning an
 /// `f32` (with `with`, an `(f32, T)`), into a tape of type `tape`, built by `fns`.
@@ -1144,6 +1145,11 @@ impl Tp<'_> {
                 }
                 // `F2I` is `lattice_coord`: toward zero, wrapped to the low 32 bits past `i32`'s
                 // range, 0 for an infinity or NaN.
+                // Its point and its half widths, three registers in a row each.
+                Known::ValueNoiseBox => {
+                    let (p, half) = (self.in_a_row(out, regs[0])?, self.in_a_row(out, regs[1])?);
+                    self.op(out, BOXNOISE3, &[p, half], None)?
+                }
                 Known::LatticeCoord => self.int_op(out, F2I, &[regs[0], regs[0]])?,
                 Known::Pcg => self.int_op(out, PCG, &[regs[0], regs[0]])?,
             };
