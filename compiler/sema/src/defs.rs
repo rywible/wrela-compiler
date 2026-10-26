@@ -606,7 +606,7 @@ lang_items! {
     ValueNoise = "std::field::value_noise",
     Lattice = "std::field::lattice",
     LatticeCoord = "std::field::lattice_coord",
-    Pcg = "std::field::pcg",
+    Pcg = "std::hash::pcg",
     LiftGradient = "std::lift::gradient",
     LiftReads = "std::lift::reads",
     LiftCount = "std::lift::literal_count",

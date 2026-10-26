@@ -13,7 +13,8 @@
 
 use std::derive::{Box2, Box3, Interval, interval}
 use std::math::is_finite
-use std::field::{Surface, lattice, lattice_coord, pcg, smin, value_noise}
+use std::field::{Surface, lattice, lattice_coord, smin, value_noise}
+use std::hash::pcg
 
 /// The most operations a `Tape` holds, and the most constants in its table.
 pub const TAPE_LEN: u32 = 4096
@@ -160,7 +161,7 @@ pub const U2F: u32 = 57
 pub const F2I: u32 = 58
 /// Float register `a` as a `u32`, toward zero (0 out of range): half `c` of it.
 pub const F2U: u32 = 59
-/// `std::field::pcg(a)`, of an integer: a lattice hash's last steps.
+/// `std::hash::pcg(a)`, of an integer: a lattice hash's last steps.
 pub const PCG: u32 = 60
 /// `a * b + t` of integers (wrapping; `t` the third register's pair): a hash's mixing.
 pub const IMAD: u32 = 61

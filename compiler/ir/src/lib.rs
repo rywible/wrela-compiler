@@ -770,7 +770,7 @@ pub enum Known {
     Lattice,
     /// `std::field::lattice_coord(x)`: `x` toward zero, as `HASH` takes it.
     LatticeCoord,
-    /// `std::field::pcg(h)`: `PCG`.
+    /// `std::hash::pcg(h)`: `PCG`.
     Pcg,
 }
 
