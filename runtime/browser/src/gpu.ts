@@ -88,6 +88,9 @@ export interface BuiltPipeline {
   layout: GPUBindGroupLayout;
   compute: GPUComputePipeline | null;
   render: RenderParts | null;
+  /** The depth formats of its screen targets (null: none): what a variant for another screen
+   * format takes (`GpuExecutor.screenVariants`). */
+  screenDepths: (GPUTextureFormat | null)[];
   uniform: UniformBlock | null;
   bindings: ResourceBinding[];
   /** A debug build's: where its bounds checks' flag is bound. */
@@ -106,11 +109,15 @@ export interface ScreenTarget {
    * bytes as `SCREEN_FORMAT` in another order), `SCREEN_FORMAT` in test mode, which reads the
    * screen back. Every program of a worker draws the screen in one format, so the pipelines a
    * hot reload or a hand-over keeps (`PipelineCache`) are built in it. */
-  readonly format: GPUTextureFormat;
+  format: GPUTextureFormat;
   /** The texture this frame's screen pass renders into, of `format`. */
   texture(): GPUTexture;
   /** Called after a screen pass is recorded, with its encoder, before it's submitted. */
   afterPass?(encoder: GPUCommandEncoder): void;
+  /** Shows the screen another way (`ConfigureScreen`): its SDR format, and what makes the canvas
+   * `format`, HDR or not, in a gamut (0 sRGB, 1 Display P3), whether it could. Without it (test
+   * mode's screen) the command changes nothing. */
+  show?: { sdr: GPUTextureFormat; apply(format: GPUTextureFormat, hdr: boolean, gamut: number): boolean };
 }
 
 /** The format the screen is drawn in. Test mode's is `SCREEN_FORMAT`, which it reads back and
@@ -276,7 +283,7 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
   // that records it, naming the feature.
   if (p.requires.some((f) => !device.features.has(f))) {
     const layout = device.createBindGroupLayout({ label: p.name, entries: [] });
-    return { name: p.name, layout, compute: null, render: null, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
+    return { name: p.name, layout, compute: null, render: null, screenDepths: [], uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
   }
   // Pipelines build at the same time and share the device's error scope stack, so the scope is
   // popped before anything awaits. The async creations below report through their promises.
@@ -338,7 +345,9 @@ async function buildPipeline(device: GPUDevice, p: Pipeline, source: string, scr
   } catch (e) {
     throw fail(errorMessage(e));
   }
-  return { name: p.name, layout, compute, render, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
+  const screenDepths =
+    p.kind === "compute" ? [] : p.targets.filter((t) => t.screen).map((t): GPUTextureFormat | null => (t.depth ? "depth32float" : null));
+  return { name: p.name, layout, compute, render, screenDepths, uniform: p.uniform, bindings: p.bindings, debugFlag: p.debug_flag };
 }
 
 /** How long building each pipeline of `manifest` alone took (ms), one after another: where a
@@ -916,6 +925,29 @@ export class GpuExecutor {
   readonly built: Promise<void>;
   /** Starts building pipeline `i` now, if it hasn't started (`Building.start`). */
   readonly #start: (i: number) => void;
+  /** How the screen is shown, as `wrela.limit`'s `SCREEN_LIMIT` gives it: bit 0 HDR, bit 1
+   * Display P3. It changes once a `ConfigureScreen` is done. */
+  screenState = 0;
+
+  /** A variant of each render pipeline that draws the screen, in `format`: what showing the
+   * screen in another format needs first. Every pipeline is started, so none is built later in
+   * the old format alone. */
+  async screenVariants(format: GPUTextureFormat): Promise<void> {
+    this.#building.forEach((_, i) => this.#start(i));
+    const built = await Promise.all(this.#building);
+    await Promise.all(
+      built.flatMap((b) => {
+        const render = b.render;
+        if (render === null) return [];
+        return b.screenDepths.map(async (depth) => {
+          const key = targetsKey([format], depth);
+          if (render.variants.has(key)) return;
+          const made = await this.device.createRenderPipelineAsync(renderDescriptor(b.name, render, [format], depth));
+          render.variants.set(key, made);
+        });
+      }),
+    );
+  }
 
   /** Timed, on a device with "timestamp-query", each pass's GPU time is recorded (`timings`); in
    * the serial mode each pass and dispatch runs alone, so its time is its own (the program's
@@ -1327,6 +1359,22 @@ export class GpuExecutor {
       case "SetViewport":
         this.#pass?.draws.push(cmd);
         return;
+      case "ConfigureScreen": {
+        const show = this.screen.show;
+        if (show === undefined) return;
+        const format: GPUTextureFormat = cmd.hdr ? "rgba16float" : show.sdr;
+        const want = (cmd.hdr ? 1 : 0) | (cmd.gamut === 1 ? 2 : 0);
+        // The frames go on in the old format until every pipeline that draws the screen can
+        // draw it in the new one; then, between frames, the canvas changes.
+        this.screenVariants(format).then(() => {
+          if (this.#retired) return;
+          if (show.apply(format, cmd.hdr, cmd.gamut)) {
+            this.screen.format = format;
+            this.screenState = want;
+          }
+        }, (e: unknown) => this.#fail(e));
+        return;
+      }
       case "CopyTexture": {
         const { source: s, destination: d } = cmd;
         const from = this.#texture(s.texture);

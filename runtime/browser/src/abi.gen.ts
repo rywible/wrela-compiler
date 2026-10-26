@@ -10,6 +10,8 @@ export const COMMAND_HEADER_LEN = 8;
 /** A pass's attachment that isn't there, and a pass's colour attachment that is the screen. */
 export const NONE = 0xffffffff;
 export const SCREEN = 0xfffffffe;
+/** `wrela.limit`'s index of how the host shows the screen (`std::gpu::screen_is`). */
+export const SCREEN_LIMIT = 13;
 /** The upload ring's starting size, and the largest write it takes: a bigger one goes through
  * the queue, between submissions. */
 export const UPLOAD_START = 262144;
@@ -53,6 +55,7 @@ export const Opcode = {
   DrawIndexed: 36,
   MultiDrawIndirect: 37,
   MultiDrawIndexedIndirect: 38,
+  ConfigureScreen: 39,
 } as const;
 
 /** A texture's format, by its number in the stream: the format table (runtime/abi

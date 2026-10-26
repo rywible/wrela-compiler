@@ -50,6 +50,7 @@ import {
   IMPORT_PRINT,
   IMPORT_LIMIT,
   IMPORT_MODULE,
+  SCREEN_LIMIT,
   IMPORT_REQUEST_STATUS,
   IMPORT_REQUEST_TAKE,
   IMPORT_SUBMIT,
@@ -102,6 +103,9 @@ export interface Executor {
   /** The GPU time of the work labelled `label` from this frame on, for a `Timed` request: an
    * `f32` of microseconds, once read back. An executor without a GPU doesn't have it. */
   timeLabel?(label: string): Promise<Bytes>;
+  /** How the screen is shown (`SCREEN_LIMIT`): 0, SDR in sRGB, for an executor that can't change
+   * it. */
+  readonly screenState?: number;
 }
 
 /** Where a program's requests read and write: its storage (bytes at paths) and its build, and
@@ -555,6 +559,7 @@ export class Program {
         // One of the device's limits, a u32's bits; 0 past the last.
         [IMPORT_LIMIT]: (index: number) => {
           program.#starting();
+          if (index >>> 0 === SCREEN_LIMIT) return (program.executor.screenState ?? 0) | 0;
           return (checker.limits[index >>> 0] ?? 0) | 0;
         },
         [IMPORT_AUDIO]: (task: number, context: number) => program.#audioImport(task >>> 0, context >>> 0),

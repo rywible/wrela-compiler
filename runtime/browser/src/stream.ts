@@ -145,6 +145,7 @@ export type Command =
   | { op: "CopyTextureToBuffer"; source: TexelRect; buffer: number; offset: number; bytesPerRow: number }
   | { op: "CopyBufferToTexture"; buffer: number; offset: number; bytesPerRow: number; destination: TexelRect }
   | { op: "SetScissor"; x: number; y: number; width: number; height: number }
+  | { op: "ConfigureScreen"; hdr: boolean; gamut: number }
   | { op: "SetViewport"; rect: [number, number, number, number]; minDepth: number; maxDepth: number }
   | {
       op: "DrawIndexed";
@@ -486,6 +487,12 @@ export function decode(batch: Bytes): Command[] {
       case "SetScissor": {
         exactly(4);
         cmd = { op: name, x: w(0), y: w(1), width: w(2), height: w(3) };
+        break;
+      }
+      case "ConfigureScreen": {
+        exactly(2);
+        if (w(0) > 1 || w(1) > 1) throw bad("a screen's `hdr` is 0 or 1, and its gamut 0 (sRGB) or 1 (Display P3)");
+        cmd = { op: name, hdr: w(0) === 1, gamut: w(1) };
         break;
       }
       case "SetViewport": {

@@ -321,7 +321,9 @@ impl Limits {
         feature_bit(name).is_some_and(|b| self.features & b != 0)
     }
 
-    /// The limit at `index`, as `wrela.limit` gives it.
+    /// The limit at `index`, as `wrela.limit` gives it. [`SCREEN_LIMIT`] is no limit of the
+    /// device's but how the host shows the screen, which a host with nothing to configure (the
+    /// native host draws offscreen) gives as 0: SDR, sRGB.
     pub fn get(&self, index: u32) -> u32 {
         match index {
             0 => self.max_texture_size,
@@ -339,6 +341,11 @@ impl Limits {
         }
     }
 }
+
+/// `wrela.limit`'s index of how the host shows the screen (`std::gpu::screen_is`): bit 0, HDR
+/// (an `rgba16float` canvas, tone mapped `extended`); bit 1, Display P3. It changes when the host
+/// has done what a `ConfigureScreen` asked.
+pub const SCREEN_LIMIT: u32 = 13;
 
 /// The optional WebGPU features the hosts request when the adapter has them, and report to a
 /// program (`std::gpu::features`), in the order `wrela.features` sets their bits: WebGPU's names.

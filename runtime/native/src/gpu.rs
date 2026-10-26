@@ -2440,6 +2440,9 @@ impl Executor for Gpu {
             Command::SetScissor { x, y, width, height } => {
                 self.pass_item(PassItem::Scissor([*x, *y, *width, *height]))
             }
+            // The native host draws offscreen, to no surface it could show another way: the
+            // screen stays SDR in sRGB, which `SCREEN_LIMIT` says (`Limits::get`).
+            Command::ConfigureScreen { .. } => {}
             Command::SetViewport { rect: [x, y, w, h], min_depth, max_depth } => {
                 self.pass_item(PassItem::Viewport([*x, *y, *w, *h, *min_depth, *max_depth]))
             }

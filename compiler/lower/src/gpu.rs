@@ -1320,7 +1320,8 @@ pub(crate) fn intrinsic(
             | Lang::CopyTextureToBufferCommand
             | Lang::CopyBufferToTextureCommand
             | Lang::ScissorCommand
-            | Lang::ViewportCommand),
+            | Lang::ViewportCommand
+            | Lang::ScreenCommand),
         ) => {
             // (opcode, payload words, whether the first is a new handle)
             let (opcode, words, handle) = match l {
@@ -1339,6 +1340,7 @@ pub(crate) fn intrinsic(
                 Lang::CopyBufferToTextureCommand => (Opcode::CopyBufferToTexture, 10, false),
                 Lang::ScissorCommand => (Opcode::SetScissor, 4, false),
                 Lang::ViewportCommand => (Opcode::SetViewport, 6, false),
+                Lang::ScreenCommand => (Opcode::ConfigureScreen, 2, false),
                 _ => (Opcode::EndPass, 0, false),
             };
             let args = fl.arg_values(&c.args)?;

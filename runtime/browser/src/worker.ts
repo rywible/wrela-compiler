@@ -122,6 +122,25 @@ function context(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureF
   return ctx;
 }
 
+/** Shows `ctx`'s canvas in `format` (`rgba16float` for HDR, tone mapped `extended` so values past
+ * 1 are brighter than SDR white where the display can), in sRGB or Display P3 (`gamut` 1):
+ * whether the browser took it. */
+function showCanvas(ctx: GPUCanvasContext, device: GPUDevice, usage: number, format: GPUTextureFormat, hdr: boolean, gamut: number): boolean {
+  try {
+    ctx.configure({
+      device,
+      format,
+      usage,
+      alphaMode: "opaque",
+      colorSpace: gamut === 1 ? "display-p3" : "srgb",
+      toneMapping: { mode: hdr ? "extended" : "standard" },
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---- The ticker's thread ----
 
 /** Visible time, which frames and ticks count (frame.ts). */
@@ -384,9 +403,14 @@ const normalWorkers = () => Math.max(0, Math.min((navigator.hardwareConcurrency 
 /** Runs the program, drawing the screen straight into the canvas in `format`. */
 async function run(canvas: OffscreenCanvas, device: GPUDevice, format: GPUTextureFormat, build: Build, live: Live | null): Promise<void> {
   self.postMessage({ type: "screen-limit", max: device.limits.maxTextureDimension2D } satisfies FromWorker);
-  const ctx = context(canvas, device, format, GPUTextureUsage.RENDER_ATTACHMENT);
+  const usage = GPUTextureUsage.RENDER_ATTACHMENT;
+  const ctx = context(canvas, device, format, usage);
   clock.startAt(epochNow());
-  const screen = { format, texture: () => ctx.getCurrentTexture() };
+  const screen: ScreenTarget = {
+    format,
+    texture: () => ctx.getCurrentTexture(),
+    show: { sdr: format, apply: (f, hdr, gamut) => showCanvas(ctx, device, usage, f, hdr, gamut) },
+  };
   const start: Start = (b, carried) =>
     startProgram(
       device,
@@ -501,8 +525,26 @@ async function scoped(device: GPUDevice, f: () => void | Promise<void>): Promise
 
 /** Copies a texture back: RGBA8, rows top to bottom, no padding. */
 async function readTexture(device: GPUDevice, texture: GPUTexture): Promise<Uint8Array<ArrayBuffer>> {
+  if (texture.format !== "rgba16float") return readTexels(device, texture, 4);
+  // An HDR screen's texels, as 8 bits a channel: each clamped to [0, 1].
+  const halves = new Uint16Array((await readTexels(device, texture, 8)).buffer);
+  return Uint8Array.from(halves, (h) => Math.round(Math.min(Math.max(halfToFloat(h), 0), 1) * 255));
+}
+
+/** An IEEE half float's value. */
+export function halfToFloat(h: number): number {
+  const sign = h & 0x8000 ? -1 : 1;
+  const exponent = (h >> 10) & 0x1f;
+  const fraction = h & 0x3ff;
+  if (exponent === 0) return sign * fraction * 2 ** -24;
+  if (exponent === 31) return fraction === 0 ? sign * Infinity : NaN;
+  return sign * (1 + fraction / 1024) * 2 ** (exponent - 15);
+}
+
+/** `texture`'s texels, `bytes` each, row after row. */
+async function readTexels(device: GPUDevice, texture: GPUTexture, bytes: number): Promise<Uint8Array<ArrayBuffer>> {
   const { width, height } = texture;
-  const row = width * 4;
+  const row = width * bytes;
   const padded = alignTo(row, 256);
   const staging = device.createBuffer({ size: padded * height, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
   try {
@@ -603,15 +645,18 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   let frameNow = 0;
   canvas.width = width;
   canvas.height = height;
-  const ctx = context(canvas, device, SCREEN_FORMAT, GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST);
+  const canvasUsage = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST;
+  const ctx = context(canvas, device, SCREEN_FORMAT, canvasUsage);
   // Screen passes render into a texture that can be read back; each is also copied to the
   // canvas so the page shows what ran.
-  const screen = device.createTexture({
-    label: "screen",
-    size: [width, height],
-    format: SCREEN_FORMAT,
-    usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-  });
+  const screenOf = (format: GPUTextureFormat) =>
+    device.createTexture({
+      label: "screen",
+      size: [width, height],
+      format,
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    });
+  let screen = screenOf(SCREEN_FORMAT);
   const script: Scripted[] = params.input ? await loadScript(inputUrl(base, params.input)) : [];
   const frameEvents = arrivals(script).frames;
   const hashes = params.nohash === 0;
@@ -626,8 +671,21 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   const target: ScreenTarget = {
     format: SCREEN_FORMAT,
     texture: () => screen,
-      // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
-      // pace the frames by the display's.
+    // A test shows the screen another way only when it asks (`hdr=1`): otherwise its screen,
+    // and so its goldens and hashes, stay `SCREEN_FORMAT`'s.
+    ...(params.hdr > 0 && {
+      show: {
+        sdr: SCREEN_FORMAT,
+        apply: (format: GPUTextureFormat, hdr: boolean, gamut: number) => {
+          if (!showCanvas(ctx, device, canvasUsage, format, hdr, gamut)) return false;
+          screen.destroy();
+          screen = screenOf(format);
+          return true;
+        },
+      },
+    }),
+    // Saturated, the canvas is left alone: it shows a frame per display refresh, and would
+    // pace the frames by the display's.
     afterPass: (encoder: GPUCommandEncoder) => {
       if (params.saturate === 0) {
         encoder.copyTextureToTexture({ texture: screen }, { texture: ctx.getCurrentTexture() }, [width, height]);
@@ -766,6 +824,17 @@ async function runTest(canvas: OffscreenCanvas, device: GPUDevice, build: Build,
   }
   await draining;
   if (failed) return;
+  if (params.hdr > 0) {
+    // How the canvas is shown, and the screen's middle texel as its values: an HDR white past 1
+    // stays past it.
+    const c = ctx.getConfiguration();
+    const at = (Math.floor(height / 2) * width + Math.floor(width / 2)) * 4;
+    const middle = screen.format === "rgba16float"
+      ? [...new Uint16Array((await readTexels(device, screen, 8)).buffer).slice(at, at + 4)].map(halfToFloat)
+      : [...(await readTexels(device, screen, 4)).slice(at, at + 4)].map((b) => b / 255);
+    const configuration = { format: c?.format, colorSpace: c?.colorSpace, toneMapping: c?.toneMapping?.mode ?? "standard" };
+    await putResult(base, "screen.json", JSON.stringify({ configuration, middle, state: (r.program.executor as GpuExecutor).screenState }));
+  }
   await saveResults(device, build, params, r, screen, timing, record, salted.compiled);
 }
 

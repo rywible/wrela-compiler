@@ -103,6 +103,10 @@ export interface TestParams {
   /** 1: at the end, draw the run's summary over the canvas and leave it there, for a device
    * that can't put its results (a phone on the LAN). */
   show: number;
+  /** 1: the program may show the screen another way (`std::gpu::screen`): HDR, or Display P3.
+   * Otherwise test mode keeps it `SCREEN_FORMAT`, so goldens and hashes don't change; with it the
+   * run writes `screen.json` (the canvas's configuration, the screen's middle texel). */
+  hdr: number;
 }
 
 export const TEST_DEFAULTS: TestParams = {
@@ -132,6 +136,7 @@ export const TEST_DEFAULTS: TestParams = {
   clipfrom: 0,
   checks: 1,
   show: 0,
+  hdr: 0,
 };
 /** Every parameter's name, in order. */
 const NAMES = Object.keys(TEST_DEFAULTS) as (keyof TestParams)[];

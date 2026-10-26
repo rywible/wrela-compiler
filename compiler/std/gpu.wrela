@@ -3336,6 +3336,48 @@ pub fn limits() -> Limits {
 @intrinsic
 fn limit(index: u32) -> u32 {}
 
+// ---- the screen ---------------------------------------------------------------------------------
+
+/// The colours a screen shows: sRGB's, or Display P3's wider ones.
+pub enum Gamut: Copy + Eq {
+    Srgb,
+    DisplayP3,
+}
+
+/// How the screen is shown (§18.8): HDR (a canvas of half floats, tone mapped `extended`, where
+/// 1.0 is SDR white and brighter is brighter where the display can), and its gamut.
+pub struct Screen: Copy + Eq {
+    pub hdr: bool,
+    pub gamut: Gamut,
+}
+
+/// Shows the screen `hdr` or not, in `gamut`, from a later frame on: once every pipeline that
+/// draws the screen is built for its new format, the host swaps it in between frames (until
+/// then, the frames go on as they were). A host that can't (the native host, which draws
+/// offscreen; a display that refuses) keeps the screen as it was, which `screen_is` says. In
+/// HDR a screen pass's fragments are linear values with headroom: a program's tone map gives
+/// them its own roll-off, not an SDR curve. Test mode keeps its screen as it was unless the
+/// test asks (`hdr=1`).
+pub fn screen(hdr: bool = false, gamut: Gamut = Gamut::Srgb) {
+    let p3 = match gamut {
+        Gamut::Srgb => 0,
+        Gamut::DisplayP3 => 1,
+    }
+    screen_command(u32(hdr), p3)
+}
+
+/// How the host shows the screen: what it did of the last `screen` it could. Nondeterministic:
+/// the display decides.
+pub fn screen_is() -> Screen {
+    let bits = limit(13)
+    Screen { hdr: (bits & 1) != 0, gamut: if (bits & 2) != 0 { Gamut::DisplayP3 } else {
+        Gamut::Srgb
+    } }
+}
+
+@intrinsic
+fn screen_command(hdr: u32, gamut: u32) {}
+
 /// The GPU's optional features (§18.10): the hosts open the device with every one the adapter
 /// has, and a program checks before it records what needs one (a format's capability, a kernel
 /// that uses subgroups), keeping a path for a device without it. None is required. It's

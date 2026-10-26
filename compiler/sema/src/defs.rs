@@ -214,6 +214,7 @@ macro_rules! lang_items {
                         | Lang::CopyBufferToTextureCommand
                         | Lang::ScissorCommand
                         | Lang::ViewportCommand
+                        | Lang::ScreenCommand
                         | Lang::LabelCommand
                         | Lang::ReadBufferCommand
                         | Lang::TimedCommand
@@ -463,6 +464,7 @@ lang_items! {
     CopyTextureToBufferCommand = "std::gpu::copy_texture_to_buffer_command",
     CopyBufferToTextureCommand = "std::gpu::copy_buffer_to_texture_command",
     ScissorCommand = "std::gpu::scissor_command",
+    ScreenCommand = "std::gpu::screen_command",
     ViewportCommand = "std::gpu::viewport_command",
     LabelCommand = "std::gpu::label_command",
     EndPass = "std::gpu::end_pass_command",

@@ -56,6 +56,7 @@
 //! | 36 | `DrawIndexed` | `pipeline`, `index buffer`, `index offset`, `index size` (as `DrawIndexedIndirect`'s), `indices`, `instances`, `first index`, `base vertex` (an `i32`), `first instance`, the bindings, the uniforms |
 //! | 37 | `MultiDrawIndirect` | `pipeline`, `arguments buffer`, `offset`, `count` (the most draws: `DrawArgs` one after another there), `count buffer` (a `u32` there holds how many of them to draw, or [`NONE`]: all of them), `count offset`, the bindings, the uniforms |
 //! | 38 | `MultiDrawIndexedIndirect` | `pipeline`, `index buffer`, `index offset`, `index size`, `arguments buffer`, `offset`, `count`, `count buffer`, `count offset` (as `MultiDrawIndirect`'s, of `DrawIndexedArgs`), the bindings, the uniforms |
+//! | 39 | `ConfigureScreen` | `hdr` (0 or 1), `gamut` (0: sRGB, 1: Display P3): how the screen is shown, from a later frame on; a host that can't, or test mode, keeps it as it was. What the host did, `wrela.limit`'s [`SCREEN_LIMIT`] says. |
 //!
 //! **Requests** (language.md §17.1) are answered on a later call: the program polls each with
 //! the imports `wrela.request_status(request) -> i32` (-1 while it's pending, -2 if it failed,
@@ -151,10 +152,11 @@ pub enum Opcode {
     DrawIndexed = 36,
     MultiDrawIndirect = 37,
     MultiDrawIndexedIndirect = 38,
+    ConfigureScreen = 39,
 }
 
 impl Opcode {
-    pub const ALL: [Opcode; 37] = [
+    pub const ALL: [Opcode; 38] = [
         Opcode::CreateBuffer,
         Opcode::WriteBuffer,
         Opcode::Dispatch,
@@ -192,6 +194,7 @@ impl Opcode {
         Opcode::DrawIndexed,
         Opcode::MultiDrawIndirect,
         Opcode::MultiDrawIndexedIndirect,
+        Opcode::ConfigureScreen,
     ];
 
     pub fn from_u32(v: u32) -> Option<Opcode> {
@@ -237,6 +240,7 @@ impl Opcode {
             Opcode::DrawIndexed => "DrawIndexed",
             Opcode::MultiDrawIndirect => "MultiDrawIndirect",
             Opcode::MultiDrawIndexedIndirect => "MultiDrawIndexedIndirect",
+            Opcode::ConfigureScreen => "ConfigureScreen",
         }
     }
 
@@ -1062,6 +1066,11 @@ pub enum Command<'a> {
         width: u32,
         height: u32,
     },
+    ConfigureScreen {
+        hdr: bool,
+        /// 0: sRGB; 1: Display P3.
+        gamut: u32,
+    },
     SetViewport {
         rect: [f32; 4],
         min_depth: f32,
@@ -1175,6 +1184,7 @@ impl Command<'_> {
             Command::CopyTextureToBuffer { .. } => Opcode::CopyTextureToBuffer,
             Command::CopyBufferToTexture { .. } => Opcode::CopyBufferToTexture,
             Command::SetScissor { .. } => Opcode::SetScissor,
+            Command::ConfigureScreen { .. } => Opcode::ConfigureScreen,
             Command::SetViewport { .. } => Opcode::SetViewport,
             Command::DrawIndexed { .. } => Opcode::DrawIndexed,
             Command::MultiDrawIndirect { indices: None, .. } => Opcode::MultiDrawIndirect,
@@ -1620,6 +1630,15 @@ pub fn decode(batch: &[u8]) -> Result<Vec<Command<'_>>, StreamError> {
                 exactly(4)?;
                 Command::SetScissor { x: w(0), y: w(1), width: w(2), height: w(3) }
             }
+            Opcode::ConfigureScreen => {
+                exactly(2)?;
+                if w(0) > 1 || w(1) > 1 {
+                    return Err(bad(
+                        "a screen's `hdr` is 0 or 1, and its gamut 0 (sRGB) or 1 (Display P3)",
+                    ));
+                }
+                Command::ConfigureScreen { hdr: w(0) == 1, gamut: w(1) }
+            }
             Opcode::SetViewport => {
                 exactly(6)?;
                 let f = |i: usize| f32::from_bits(w(i));
@@ -2057,6 +2076,11 @@ impl Encoder {
     ) -> &mut Self {
         let words = [&[buffer, offset, bytes_per_row][..], &d.words()].concat();
         self.command(Opcode::CopyBufferToTexture, &words, &[]);
+        self
+    }
+
+    pub fn configure_screen(&mut self, hdr: bool, gamut: u32) -> &mut Self {
+        self.command(Opcode::ConfigureScreen, &[u32::from(hdr), gamut], &[]);
         self
     }
 
