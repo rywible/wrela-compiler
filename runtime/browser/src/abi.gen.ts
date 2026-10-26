@@ -1,8 +1,8 @@
 // Generated from the wrela-abi crate (runtime/abi): the one definition of the
 // command stream and manifest. Don't edit; run `cargo run -p wrela-abi --bin generate`.
 
-export const STREAM_VERSION = 12;
-export const MANIFEST_VERSION = 10;
+export const STREAM_VERSION = 13;
+export const MANIFEST_VERSION = 11;
 /** The bytes `WRCS`, read as a little-endian u32. */
 export const STREAM_MAGIC = 0x53435257;
 export const HEADER_LEN = 12;

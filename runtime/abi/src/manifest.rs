@@ -57,7 +57,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use std::fmt;
 
-pub const VERSION: u32 = 10;
+pub const VERSION: u32 = 11;
 /// The screen's texture format: what a screen target's colour is, and the format of the bytes a
 /// host reads back from the screen.
 pub const SCREEN_TEXTURE: TextureFormat = TextureFormat::Rgba8;
@@ -1241,8 +1241,8 @@ mod tests {
     fn golden_json() {
         let json = sample().to_json();
         let expected = r#"{
-  "manifest_version": 10,
-  "stream_version": 12,
+  "manifest_version": 11,
+  "stream_version": 13,
   "wasm": "game.wasm",
   "pipelines": [
     {

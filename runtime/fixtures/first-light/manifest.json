@@ -1,6 +1,6 @@
 {
-  "manifest_version": 10,
-  "stream_version": 12,
+  "manifest_version": 11,
+  "stream_version": 13,
   "wasm": "game.wasm",
   "pipelines": [
     {
