@@ -217,7 +217,11 @@ export async function startProgram(
   executor.built.then(() => gpu.onPipelines?.(performance.now() - started), () => {});
   const checker = new Checker(build.manifest, deviceLimits(device));
   try {
-    return await Program.instantiate(compiled, checker, executor, options);
+    const instantiating = performance.now();
+    const program = await Program.instantiate(compiled, checker, executor, options);
+    // Its start function and `init`, where a lazily compiled module compiles what they call.
+    compiled.instantiate_ms ??= performance.now() - instantiating;
+    return program;
   } catch (e) {
     executor.destroyAll();
     throw e;

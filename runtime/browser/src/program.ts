@@ -278,6 +278,8 @@ export interface Compiled {
   /** How long the compile took (ms), and whether it streamed. */
   compile_ms: number;
   streamed: boolean;
+  /** How long its first instantiation took, with its `init` (ms), once it has been. */
+  instantiate_ms?: number;
 }
 
 /** A line printed by any of a program's threads, after that thread has shown it on its console. */

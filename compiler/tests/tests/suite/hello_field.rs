@@ -119,26 +119,44 @@ fn the_browser_matches_the_golden_and_the_native_host() {
     eprintln!("Chrome against the native host: mean {:.4}/255, max {}/255", diff.mean, diff.max);
 }
 
-/// A second open of the build in the same browser profile compiles its WASM from the browser's
-/// code cache: the WASM streams in (the server says it's `application/wasm`, and the page hands
-/// it over by its URL), and the second compile takes at most half the first's time.
+/// A second open of a build in the same browser profile (the frozen grazer: a module big
+/// enough for the browser to keep its compiled code) streams its WASM again and takes it from
+/// the browser's cache: the server answers the browser's copy with 304, so it crosses the wire
+/// as a header, and the compiled code V8 keeps beside a cached response can be found. Both
+/// opens' compile, instantiation and first-frame times are printed: with V8's lazy compilation
+/// the streamed compile only validates, so the times record what a warm open costs rather than
+/// prove the code cache was read.
 #[test]
 #[ignore = "needs the runtime"]
-fn a_second_open_compiles_the_wasm_from_the_code_cache() {
-    let (dir, rel) = page("warm");
-    let fragment = format!("#test&frames=30&width={WIDTH}&height={HEIGHT}&fps=60");
+fn a_second_open_streams_the_wasm_from_the_browsers_cache() {
+    let (dir, rel) = wrela_tests::page("compiler/tests/frozen/grazer", "grazer-warm");
+    let fragment = format!("#test&frames=240&width={WIDTH}&height={HEIGHT}&fps=60");
     wrela_tests::run_page_twice(&rel, &fragment, 120).expect("both opens pass");
-    let compile = |results: &str| {
+    let open = |results: &str| {
         let load = std::fs::read_to_string(dir.join(results).join("load.json")).expect("load.json");
         let load: serde_json::Value = serde_json::from_str(&load).expect("JSON");
         let wasm = &load["wasm"];
         assert_eq!(wasm["streamed"], true, "{results}: {wasm}");
-        wasm["compile_ms"].as_f64().expect("compile_ms")
+        let wire: u64 = load["resources"]
+            .as_array()
+            .expect("resources")
+            .iter()
+            .filter(|r| r["name"].as_str().is_some_and(|n| n.ends_with("game.wasm")))
+            .filter_map(|r| r["bytes"].as_u64())
+            .sum();
+        let first_frame = load["first_frame_ms"].as_f64().unwrap_or(0.0)
+            - load["opened_ms"].as_f64().unwrap_or(0.0);
+        eprintln!(
+            "{results}: compile {:.1} ms, instantiate and init {:.1} ms, first frame at {first_frame:.0} ms, the WASM {wire} bytes on the wire",
+            wasm["compile_ms"].as_f64().unwrap_or(0.0),
+            wasm["instantiate_ms"].as_f64().unwrap_or(0.0)
+        );
+        wire
     };
-    let (cold, warm) = (compile("results-first"), compile("results"));
-    eprintln!("WASM compile: first open {cold:.1} ms, second {warm:.1} ms");
+    let (cold, warm) = (open("results-first"), open("results"));
+    assert!(cold > 100_000, "the first open fetched the WASM: {cold} bytes");
     assert!(
-        warm <= cold / 2.0,
-        "the second open's compile ({warm:.1} ms) is over half the first's ({cold:.1} ms)"
+        warm < 4096,
+        "the second open's WASM came from the browser's cache: {warm} bytes on the wire"
     );
 }

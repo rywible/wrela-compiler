@@ -820,7 +820,7 @@ async function saveResults(
   const resources = [...page.resources, ...loaded(["resource"])];
   // How the WASM compiled: a second open of the same build streams it from the code cache.
   const compiled = build.compiled;
-  const wasm = compiled ? { compile_ms: compiled.compile_ms, streamed: compiled.streamed } : null;
+  const wasm = compiled ? { compile_ms: compiled.compile_ms, instantiate_ms: compiled.instantiate_ms ?? null, streamed: compiled.streamed } : null;
   const load = { opened_ms: page.opened_ms, first_frame_ms: began_ms[0] ?? null, wasm, resources };
   await putResult(base, "load.json", JSON.stringify(load));
   // An asynchronous device or voice failure may arrive while results are being saved. Its
